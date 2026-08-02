@@ -46,12 +46,35 @@
 // handled — see that function for the per-kind reasoning. Discarding a build agent still cascades to
 // its workers; what is refused is naming a worker as the target.
 //
-// CLOUD SPAWN IS DELIBERATELY NOT SUPPORTED HERE. A cloud agent bills per running minute; the human
-// path for one is a dialog that collects a goal + repo first. Rather than spend the user's money
-// from a tool call, a cloud spawn returns a typed "not supported" (classified `costs-money`).
+// A CLOUD SPAWN RUNS THE HUMAN'S OWN SEQUENCE (design 2026-08-01 §Decision 7). It used to return a
+// blanket "not supported", whose stated reasons were *"it bills per minute"* and *"it needs a goal
+// and a repo up front"* — and those are REQUIREMENTS, not objections, so each one is now satisfied
+// rather than used as grounds to refuse:
+//   • bills per minute → `evaluateCloudGate` (the same pure gate `NewCloudAgentDialog` uses) runs
+//     FIRST, and its `message` + `deepLink` are returned VERBATIM. A gate message is user-facing
+//     copy that names the one fix; paraphrasing it here would be a second copy that can drift.
+//     The op stays classified `costs-money`, so it goes through the same approval surface as before.
+//   • needs a repo → `projectRepoUrl(project.rootPath)`, refusing when there is no GitHub remote.
+//     The sandbox CLONES it; sending a bad URL surfaces minutes later as an opaque clone failure.
+//   • needs a goal → the `prompt` IS the goal. A cloud agent's goal is delivered by the runner via
+//     stdin at start, so there is nothing to send afterwards and nothing to infer — a spawn with no
+//     prompt is REFUSED rather than given an invented one.
+// Everything below the gate is `createCloudAgent` + `ensureCloudProjectId`, the same calls the
+// dialog makes, with the same injected store deps. Nothing new is invented here.
 
 import { useProjectStore } from "../../stores/projectStore";
 import { useRuntimeStore } from "../../stores/runtimeStore";
+import { useAuthStore } from "../../stores/authStore";
+import { useCloudAuthStore } from "../../stores/cloudAuthStore";
+import { useUiStore } from "../../stores/uiStore";
+import { cloudApi } from "../cloudAgents/api";
+import { createCloudAgent } from "../cloudAgents/create";
+import { evaluateCloudGate } from "../cloudAgents/gating";
+import { projectBindingSets } from "../cloudAgents/projectBinding";
+import { ensureCloudProjectId } from "../cloudAgents/projectLink";
+import { projectRepoUrl } from "../cloudAgents/repoUrl";
+import { classifyStartError } from "../cloudAgents/startError";
+import type { CategoryId } from "../../stores/uiStore";
 import { localAgentCapacity, type CapacityReading } from "../agentCapacity";
 import { shouldPromptOnClose } from "../../engine/closeAgent";
 import { resolveStage, stageIndex, type WorkflowStageId } from "../../engine/workflowStage";
@@ -109,7 +132,9 @@ export const LIFECYCLE_RISK: Record<LifecycleOp, LifecycleRisk> = {
   // Creating a local agent is cheap and undoable (close it) — but it does consume a worker slot,
   // which is why the spawn is capacity-gated rather than unclassified-and-unbounded.
   spawn_build_agent: "routine",
-  // Never actually performed here; classified so the refusal itself carries the honest reason.
+  // Really performed now, which is what makes this classification load-bearing rather than
+  // decorative: a sandbox bills for every running minute, so the op goes through the ask tier's
+  // approval surface before anything is started.
   spawn_cloud_build_agent: "costs-money",
   preview_close: "routine",
   preview_discard: "routine",
@@ -142,7 +167,13 @@ export type LifecycleRefusalReason =
   | "not-a-worker" //           a worker-only operation aimed at something else
   | "not-a-build-agent" //      ship/save/discard aimed at a worker or a shell (see `requireBuild`)
   | "at-capacity" //            the machine's agent budget is full (NOT queued); see agentCapacity
-  | "cloud-spawn-unsupported" // a cloud spawn bills per minute — refused, not silently spent
+  | "cloud-blocked" //          the cloud gate says no (signed out / unpaid / no auth / no credits).
+  //                            `message` is the GATE's own sentence, verbatim, and `deepLink` names
+  //                            the Settings section that fixes it.
+  | "cloud-goal-required" //    a cloud agent's goal is delivered by the runner at start and cannot
+  //                            be sent afterwards, so a spawn with no `prompt` is refused rather
+  //                            than given one this layer invented
+  | "cloud-no-repo" //          the project has no GitHub remote for the sandbox to clone
   | "needs-decision" //         closing would put work at risk: the human picks ship/save/discard
   | "intent-required" //        discard was called without a well-formed DiscardIntent
   | "intent-mismatch" //        the intent names a different agent than the one targeted
@@ -166,6 +197,16 @@ export interface LifecycleRefused {
   message: string;
   /** Present on `needs-decision`: what closing this agent WOULD do, so the refusal is actionable. */
   preview?: ClosePreview;
+  /**
+   * The Settings section that FIXES this refusal, when one does (the cloud gate's own `deepLink`,
+   * or the server's, forwarded unchanged).
+   *
+   * Carried as a field rather than folded into `message` because the two are read by different
+   * things: the sentence is what the concierge says, and this is what a surface can turn into a
+   * button. The dialog already renders exactly this pair ("Add Claude auth" / "Open credits"), so
+   * dropping it here would leave the tool path saying "add credits" with no way to get there.
+   */
+  deepLink?: CategoryId;
 }
 
 export type LifecycleResult<T> = LifecycleOk<T> | LifecycleRefused;
@@ -188,6 +229,18 @@ function refuse(
     message,
     ...(preview ? { preview } : {}),
   };
+}
+
+/** A refusal that carries a self-serve fix. Separate from `refuse` so the deep link can only be
+ *  attached deliberately — a `deepLink` naming the wrong Settings section is a button that takes
+ *  the user somewhere that cannot fix what they were told about. */
+function refuseWithFix(
+  op: LifecycleOp,
+  reason: LifecycleRefusalReason,
+  message: string,
+  deepLink?: CategoryId,
+): LifecycleRefused {
+  return { ...refuse(op, reason, message), ...(deepLink ? { deepLink } : {}) };
 }
 
 // ── Capacity ────────────────────────────────────────────────────────────────────────────────────
@@ -336,10 +389,45 @@ export interface SpawnedBuildAgent {
   model: string;
 }
 
+/**
+ * A cloud agent that really started. A DIFFERENT shape from {@link SpawnedBuildAgent}, deliberately:
+ * most of that type's fields are observations of a LOCAL launch (`briefDelivery`, the capacity
+ * reading, the mode/model that were applied to a `claude` argv) and a cloud start observes none of
+ * them. Reusing it would have meant filling them in with plausible values — which is precisely how
+ * `briefed` became a lie the first time (see `SpawnedBuildAgent.briefed`).
+ */
+export interface SpawnedCloudBuildAgent {
+  /** The tab id, which IS the server session id — one id for the store, the relay and the phone. */
+  agentId: string;
+  projectId: string;
+  /** Spelled out so the reply's reader (a language model) can see it rather than infer it. */
+  runtime: "cloud";
+  /** The row's name RIGHT NOW. Provisional for the same reason the local spawn's is — omitted
+   *  entirely when the caller supplied no name, since there is nothing yet to quote. */
+  provisionalName?: string;
+  nameIsProvisional: boolean;
+  /**
+   * What the goal did, stated as what was OBSERVED and no more.
+   *
+   * `"accepted-by-server"` means: `POST /sessions/start` returned a session id for a request that
+   * carried this goal, and the runner seeds Claude Code with it via stdin. It deliberately does NOT
+   * claim the equivalent of the local path's `briefed: true`, which is an observation of the launch
+   * that carried the brief — nothing on this side sees the sandbox's launch.
+   */
+  goalDelivery: "accepted-by-server";
+  /** The goal the session was started with, echoed so a reply can be checked against it. */
+  goal: string;
+  /** The https URL the sandbox clones. */
+  repoUrl: string;
+  /** Always true. A cloud sandbox bills for every running minute, and a flag the model can see
+   *  beats a risk class it has to look up. */
+  billsWhileRunning: true;
+}
+
 export interface SpawnBuildAgentInput {
   /** Defaults to the selected project. */
   projectId?: string;
-  /** Defaults to "local". "cloud" is refused — see the file header. */
+  /** "local" (the default) or "cloud" — see the file header for what a cloud spawn requires. */
   runtime?: Runtime;
   /**
    * The agent's opening brief, delivered ATOMICALLY with the spawn.
@@ -369,15 +457,8 @@ export interface SpawnBuildAgentInput {
  */
 export async function spawnBuildAgent(
   input: SpawnBuildAgentInput = {},
-): Promise<LifecycleResult<SpawnedBuildAgent>> {
-  if (input.runtime === "cloud") {
-    return refuse(
-      "spawn_cloud_build_agent",
-      "cloud-spawn-unsupported",
-      "I can't start a cloud agent from here — it bills per minute while it runs, and it needs a goal " +
-        "and a repo up front. Use the Cloud option on “+ New Build Agent” and I'll take it from there.",
-    );
-  }
+): Promise<LifecycleResult<SpawnedBuildAgent | SpawnedCloudBuildAgent>> {
+  if (input.runtime === "cloud") return spawnCloudBuildAgent(input);
   const state = useProjectStore.getState();
   const projectId = input.projectId ?? state.selectedProjectId;
   const project = projectId ? state.projects.find((p) => p.id === projectId) : undefined;
@@ -583,6 +664,172 @@ export async function spawnBuildAgent(
     mode: input.mode === "plan" ? "plan" : "build",
     model: isDefaultModel(input.model) ? DEFAULT_MODEL_ID : input.model!,
   });
+}
+
+/**
+ * The cloud gate, read from the two stores that hold its inputs — the SAME assembly `useCloudGate`
+ * does for the dialog, minus React. It is not shared with that hook because the hook is a set of
+ * `useStore` subscriptions; the DECISION it feeds (`evaluateCloudGate`) is shared, which is the half
+ * that must not have two copies.
+ *
+ * `cloudAuthStore` is deliberately NOT persisted (a stale "auth configured" would wave a start
+ * through into a guaranteed 400), so a cold store reads `method: null` — which the gate correctly
+ * calls "no auth". For a HUMAN that is fine: the dialog probes on open, and the person is looking at
+ * the result. A tool call has no such moment, so it probes here, once, before deciding. Without this
+ * the first cloud spawn of every launch would be refused with "add your Claude authentication" for
+ * an account that has it.
+ */
+async function readCloudGate() {
+  const cloudAuth = useCloudAuthStore.getState();
+  if (!cloudAuth.loaded) await cloudAuth.refresh(); // never throws; sets `error` and leaves method
+  const auth = useAuthStore.getState();
+  return evaluateCloudGate({
+    featureEnabled: auth.me?.cloudAgentsEnabled === true,
+    signedIn: auth.tokenPresent,
+    entitled: auth.me?.entitled === true,
+    // Re-read AFTER the await: the refresh above is the whole point of asking.
+    authConfigured: useCloudAuthStore.getState().method != null,
+    balanceCents: auth.me?.balanceCents ?? 0,
+  });
+}
+
+/**
+ * Start a CLOUD build agent — the exact sequence `NewCloudAgentDialog.start()` runs, reached from a
+ * tool call. See the file header for why each of the old refusal's stated reasons is satisfied here
+ * rather than used as grounds to refuse.
+ *
+ * The order of the three preconditions is not arbitrary. The GATE runs first because it is the only
+ * one that can say "this account may not do this at all", and because its refusal is the one with a
+ * self-serve fix attached; asking for a goal or probing `gh` first would make a signed-out user
+ * answer two questions before learning they cannot start one anyway. The goal is checked before the
+ * repo lookup because it is free and the lookup shells out to `gh`.
+ */
+async function spawnCloudBuildAgent(
+  input: SpawnBuildAgentInput,
+): Promise<LifecycleResult<SpawnedCloudBuildAgent>> {
+  const op: LifecycleOp = "spawn_cloud_build_agent";
+  const state = useProjectStore.getState();
+  const projectId = input.projectId ?? state.selectedProjectId;
+  const project = projectId ? state.projects.find((p) => p.id === projectId) : undefined;
+  if (!project) {
+    return refuse(
+      op,
+      "no-project",
+      projectId
+        ? `I couldn't find an open project with id ${projectId}.`
+        : "There's no project open, so there's nothing to start a cloud agent for.",
+    );
+  }
+
+  // ══ THE GATE'S MESSAGE IS RETURNED VERBATIM ═════════════════════════════════════════════════════
+  // Not paraphrased, not wrapped in a friendlier sentence. Each of those strings names the ONE thing
+  // that unblocks the user ("Add your Claude authentication…", "…require a paid account. Upgrade…"),
+  // it is already the copy the dialog shows for the identical block, and it ships beside the
+  // `deepLink` that reaches the fix. A second wording here would be a second copy that can drift
+  // from the one the dialog shows for the same state — and this repo treats a remedy string as code.
+  const gate = await readCloudGate();
+  if (!gate.ok) return refuseWithFix(op, "cloud-blocked", gate.message, gate.deepLink);
+
+  // ══ THE GOAL IS REQUIRED, AND IS NEVER INVENTED ═════════════════════════════════════════════════
+  // A cloud agent's goal is delivered by the runner via stdin as the session starts; there is no
+  // "spawn it empty and tell it later" for one. The concierge's `prompt` IS that goal. Refusing is
+  // the only honest option: a spawn that made one up would bill the user by the minute for work
+  // nobody asked for, and the local path's own history (`SpawnedBuildAgent.briefed`) is what a
+  // briefless agent costs even when it is free.
+  const goal = input.prompt?.trim() ?? "";
+  if (!goal) {
+    return refuse(
+      op,
+      "cloud-goal-required",
+      "A cloud agent is started with its goal — the sandbox seeds Claude Code with it as it comes " +
+        "up, so there's no way to tell it afterwards the way there is with a local agent. Tell me " +
+        "what it should do and I'll start it.",
+    );
+  }
+
+  // The sandbox CLONES the repo. Null means we genuinely could not determine it (no gh, no remote,
+  // not a GitHub repo) — refuse rather than send a bad URL and let the user discover it as an opaque
+  // server-side clone failure minutes into a billing sandbox.
+  let repoUrl: string | null;
+  try {
+    repoUrl = await projectRepoUrl(project.rootPath);
+  } catch {
+    repoUrl = null; // projectRepoUrl is documented never to throw; belt for a future change.
+  }
+  if (!repoUrl) {
+    return refuse(
+      op,
+      "cloud-no-repo",
+      `A cloud agent clones the repo into its sandbox, and I couldn't work out ${project.name}'s ` +
+        `GitHub repository — it needs a GitHub remote (and the gh CLI signed in). A local agent ` +
+        `works on this project without one.`,
+    );
+  }
+
+  try {
+    // A cloud session is keyed to the ORCHESTRATION project row, not this project's locally-minted
+    // id. Same call, same injected binding sets as the dialog — the rules about which server row a
+    // project may adopt live in projectLink/projectBinding and must not be re-derived here.
+    const cloudProjectId = await ensureCloudProjectId(project, {
+      api: cloudApi,
+      remember: (localId, cloudId) => useProjectStore.getState().setCloudProjectId(localId, cloudId),
+      ...projectBindingSets(project.id),
+    });
+
+    const ps = useProjectStore.getState();
+    const res = await createCloudAgent(
+      {
+        projectId: cloudProjectId,
+        goal,
+        repoUrl,
+        ...(project.defaultBranch ? { baseBranch: project.defaultBranch } : {}),
+        ...(input.name?.trim() ? { name: input.name.trim() } : {}),
+      },
+      {
+        // The store deps ignore the id they're handed for the same reason the dialog's do:
+        // `createCloudAgent` passes the id it sent to the SERVER, while the tab belongs to the LOCAL
+        // project record.
+        api: cloudApi,
+        addAgent: (_serverProjectId, opts) => ps.addAgent(project.id, opts),
+        selectAgent: (_serverProjectId, agentId) => ps.selectAgent(project.id, agentId),
+        open: (agentId) => useRuntimeStore.getState().open(agentId),
+        reveal: (agentId) => useUiStore.getState().requestRevealAgent(agentId),
+      },
+    );
+
+    if (!res.ok) {
+      // The SERVER's refusal, forwarded with its own fix. `orphanedSessionId` means the start
+      // SUCCEEDED and only the tab failed — the sandbox is running and billing — and
+      // `startedUntrackedGuidance` is the message that says so. Retrying would start a second one,
+      // so this must never read as "nothing happened" (roborev 46278).
+      return refuseWithFix(op, "action-failed", res.guidance.message, res.guidance.deepLink);
+    }
+
+    log.debug("concierge-lifecycle", "started a cloud build agent", {
+      agentId: res.id,
+      projectId: project.id,
+    });
+    const named = input.name?.trim();
+    return ok(op, {
+      agentId: res.id,
+      projectId: project.id,
+      runtime: "cloud",
+      // Only when the caller named it. An auto-named row has no name yet, and the local path's own
+      // history says a spawn-time placeholder quoted as identity is worse than no name at all.
+      ...(named ? { provisionalName: named } : {}),
+      nameIsProvisional: !named,
+      goalDelivery: "accepted-by-server",
+      goal,
+      repoUrl,
+      billsWhileRunning: true,
+    });
+  } catch (err) {
+    // Everything the project-link or the start threw (offline, signed out, server error) goes
+    // through the SAME classifier the dialog uses, so one failure gets one set of fixes wherever it
+    // is surfaced.
+    const guidance = classifyStartError(err);
+    return refuseWithFix(op, "action-failed", guidance.message, guidance.deepLink);
+  }
 }
 
 // ── Previews (read-only) ────────────────────────────────────────────────────────────────────────

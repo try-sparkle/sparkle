@@ -40,6 +40,10 @@ vi.mock("../closeAgentActions", () => ({
 }));
 vi.mock("../closeBuildAgent", () => ({ closeBuildAgent: vi.fn(async () => {}) }));
 vi.mock("../cloudAgents/terminate", () => ({ terminateIfCloud: vi.fn(async () => {}) }));
+// A cloud spawn is a real, BILLING start. The repo probe is stubbed to "no remote" so the cloud
+// route can be exercised through the registry without any chance of one being opened — and the
+// resulting `cloud-no-repo` refusal is itself the discriminator the forwarding test needs (see it).
+vi.mock("../cloudAgents/repoUrl", () => ({ projectRepoUrl: async () => null }));
 vi.mock("../workerSpawn", async (orig) => ({
   ...(await orig<typeof import("../workerSpawn")>()),
   spinDownWorker: vi.fn(async () => {}),
@@ -137,6 +141,8 @@ import {
   type ToolPolicyQuery,
 } from "./registry";
 import { DISCARD_CONFIRM_TOKEN } from "./lifecycle";
+import { useAuthStore } from "../../stores/authStore";
+import { useCloudAuthStore } from "../../stores/cloudAuthStore";
 import { useProjectStore } from "../../stores/projectStore";
 import { SPARKLE_AGENT_ID } from "../sparkleAgent";
 import { takePendingSends, resetPendingSends } from "../pendingSends";
@@ -1748,6 +1754,69 @@ describe("spawn_build_agent — atomic brief, name, model and mode", () => {
     expect(takePendingSends(agent.id).due).toEqual([]);
     expect(hasUndeliveredBrief(agent.id)).toBe(false);
     expect(r.ok && (r.data as { briefDelivery: string }).briefDelivery).toBe("submitted");
+  });
+
+  // ══ THE CLOUD ROUTE MUST FORWARD `prompt`, AND THIS IS THE ONLY THING THAT SAYS SO ═════════════
+  // `spawn_cloud_build_agent` used to pass `{ projectId, runtime: "cloud" }` and nothing else, which
+  // was harmless while the op was a guaranteed refusal — lifecycle never read the arguments. It
+  // performs a real start now, and a cloud agent's GOAL is its `prompt` (the runner seeds Claude
+  // Code with it via stdin as the sandbox comes up; there is no way to send it afterwards). Drop it
+  // here and every cloud spawn lands on `cloud-goal-required` however carefully the brief was
+  // written — with nothing in any other suite to notice, because lifecycle's own tests call it
+  // directly.
+  //
+  // The assertion is a DISCRIMINATOR, not a mock call-check: with the repo probe stubbed to "no
+  // remote", a forwarded prompt gets past the goal gate and stops at `cloud-no-repo`, while a
+  // dropped one stops earlier at `cloud-goal-required`. Two different codes, one for each state.
+  it("spawn_cloud_build_agent forwards `prompt` — the cloud agent's goal", async () => {
+    const projectId = seedProject();
+    useAuthStore.setState({
+      tokenPresent: true,
+      me: { cloudAgentsEnabled: true, entitled: true, balanceCents: 5_000 },
+    } as never);
+    useCloudAuthStore.setState({ method: "byok", loaded: true } as never);
+
+    const withGoal = await dispatchConciergeTool(
+      call({
+        domain: "lifecycle",
+        op: "spawn_cloud_build_agent",
+        args: { projectId, prompt: "fix the flaky checkout test" },
+      }),
+    );
+    expect(refusal(withGoal).code).toBe("cloud-no-repo");
+
+    const withoutGoal = await dispatchConciergeTool(
+      call({ domain: "lifecycle", op: "spawn_cloud_build_agent", args: { projectId } }),
+    );
+    expect(refusal(withoutGoal).code).toBe("cloud-goal-required");
+  });
+
+  // A refusal with a self-serve fix must keep the fix across the reply boundary: `deepLink` is a
+  // structured field on LifecycleRefused and the reply arm has no slot for one, so `fromLifecycle`
+  // folds the route into the sentence. Dropping it leaves the concierge saying "you don't have
+  // enough credits" with no way to get to Credits — the dead end the dialog's button removes.
+  it("a cloud-gate refusal carries the Settings route the user needs, alongside the gate's own words", async () => {
+    const projectId = seedProject();
+    useAuthStore.setState({
+      tokenPresent: true,
+      me: { cloudAgentsEnabled: true, entitled: true, balanceCents: 0 },
+    } as never);
+    useCloudAuthStore.setState({ method: "byok", loaded: true } as never);
+    const r = await dispatchConciergeTool(
+      call({
+        domain: "lifecycle",
+        op: "spawn_cloud_build_agent",
+        args: { projectId, prompt: "ship it" },
+      }),
+    );
+    const { code, message } = refusal(r);
+    expect(code).toBe("cloud-blocked");
+    // The gate's sentence, verbatim…
+    expect(message).toContain(
+      "You don't have enough credits to start a cloud agent. Add credits to continue.",
+    );
+    // …plus the route, which is what the structured deepLink would otherwise have carried.
+    expect(message).toContain("Settings → Credits");
   });
 
   // The store field is inert unless the launcher reads it, and build agents take a DIFFERENT spawn

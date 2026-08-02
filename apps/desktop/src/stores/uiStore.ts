@@ -71,6 +71,10 @@ const TRANSIENT_UI_KEYS = [
   // Restoring one on the next launch would put a "Move to cloud" button in front of a user who
   // never opened it, against a preflight read from a worktree that has moved on since.
   "promoteAgentId",
+  // Same reasoning in the other direction, and the stakes are higher: restoring a "Bring down to
+  // local" dialog on the next launch would put a button in front of a user who never opened it
+  // whose first act is to DELETE a running sandbox.
+  "demoteAgentId",
   "zeroCreditBannerDismissed",
   "zeroCreditBannerDismissedFor",
 ] as const satisfies readonly (keyof UiState)[];
@@ -378,6 +382,14 @@ interface UiState {
   promoteAgentId: string | null;
   openPromoteToCloud: (agentId: string) => void;
   closePromoteToCloud: () => void;
+  // Which agent has its "Bring down to local" confirm dialog open (cloud→local demotion). The
+  // mirror of `promoteAgentId` in every respect — column-owned mount, project-scoped, transient —
+  // and a SEPARATE id rather than one shared "runtime switch" field: an agent is either local or
+  // cloud, so the two dialogs can never be open for the same agent, but a shared field would let a
+  // stale id from one direction mount the dialog for the other.
+  demoteAgentId: string | null;
+  openDemoteToLocal: (agentId: string) => void;
+  closeDemoteToLocal: () => void;
   // Focus request for the concierge compose box: a component anywhere (e.g. the drag-vision pill)
   // asks the ONE compose surface to take the caret. A monotonically increasing token, not a bool,
   // so repeat requests re-focus. Transient — NOT persisted.
@@ -630,6 +642,9 @@ export const useUiStore = create<UiState>()(
       promoteAgentId: null,
       openPromoteToCloud: (agentId) => set({ promoteAgentId: agentId }),
       closePromoteToCloud: () => set({ promoteAgentId: null }),
+      demoteAgentId: null,
+      openDemoteToLocal: (agentId) => set({ demoteAgentId: agentId }),
+      closeDemoteToLocal: () => set({ demoteAgentId: null }),
       composeFocusSeq: 0,
       // EVERY caller of this is the user asking for the caret — the drop pill's "go to compose"
       // button, a file drop, spawning an agent, the capture-window handoff. ComposeBox's effect

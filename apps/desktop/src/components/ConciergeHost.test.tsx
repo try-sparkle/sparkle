@@ -124,6 +124,7 @@ vi.mock("../services/conciergeDispatch", () => ({
   dispatchConciergeAnswer: h.dispatchConciergeAnswer,
   flushPendingSends: vi.fn(async () => []),
   agentCanAcceptInput: h.agentCanAcceptInput,
+  agentCanAcceptPrompt: h.agentCanAcceptInput,
   liveOptionsFor: vi.fn(() => []),
   isTerseAnswer: vi.fn(() => false),
   matchAnswerToOption: vi.fn(() => null),
@@ -561,7 +562,14 @@ describe("ConciergeHost", () => {
   // fragment; the pair of exact-string tests below pin that sharing instead.
   it.each([
     ["agent-failed", /I couldn't send the approval — open its pane and hit Retry/],
-    ["cloud-agent", /relay the approval/],
+    // NARROWED to answers (design 2026-08-01 §Decision 7): prompting a cloud agent works now, so
+    // the remedy is no longer "the feature isn't wired" — it is "an approval belongs where the
+    // question is". The old /relay the approval/ pattern would still have matched a line that
+    // claimed prompting was unwired, which is exactly the stale copy this row must now exclude.
+    ["cloud-agent", /an approval has to be given where the question is/],
+    // Its sibling, and NOT the same fact: the agent is fine, the connection isn't. Distinct
+    // remedies, so both mappings are pinned rather than one standing in for the other.
+    ["cloud-offline", /I've lost the connection to the cloud/],
     ["pty-gone", /I couldn't send the approval\./],
     ["ambiguous-picker", /open it to choose/],
     // PATH-unique ("prompts waiting to start") AND voice-unique ("then approve again") together:
@@ -576,7 +584,9 @@ describe("ConciergeHost", () => {
     expect(await findInThread(remedy)).toBeTruthy();
     // …and NOT the generic dead end, nor any prompt-voice phrasing bleeding across.
     expect(queryInThread(/^I couldn't send the approval to/)).toBeNull();
-    expect(queryInThread(/then send again|isn't wired up yet|pass it along/)).toBeNull();
+    // "isn't wired up yet" is GONE from the codebase with Decision 7, so it could no longer fail
+    // — replaced by a phrase the prompt voice actually still uses.
+    expect(queryInThread(/then send again|your message is back in the box|pass it along/)).toBeNull();
   });
 
   it("an Approve refused as trial-spent says EXACTLY the shared trial line", async () => {
@@ -808,10 +818,15 @@ describe("ConciergeHost — routed prompt → the selected agent", () => {
     expect(h.startConciergeTurn).not.toHaveBeenCalled();
   });
 
-  // The dispatcher refuses cloud agents outright, so asking it UP FRONT turns a guaranteed
-  // delivery failure into a useful chat answer. `canAcceptInput` is required on RouteAgent for
-  // exactly this reason — a caller that doesn't know must not be able to route at a terminal.
-  it("tells the router a cloud agent can't accept input", async () => {
+  // Asking the dispatcher's own precondition UP FRONT turns a guaranteed delivery failure into a
+  // useful chat answer. `canAcceptInput` is required on RouteAgent for exactly this reason — a
+  // caller that doesn't know must not be able to route at a terminal.
+  //
+  // The predicate is `agentCanAcceptPrompt` now, not `agentCanAcceptInput` (design 2026-08-01
+  // §Decision 7): a cloud agent CAN take a message, so the false case this pins is an agent the
+  // store has never heard of, not a cloud one. The mock wires both names to one spy, so toggling
+  // it here still drives the host.
+  it("tells the router an unreachable agent can't accept input", async () => {
     h.agentCanAcceptInput.mockReturnValue(false);
     renderWithTarget();
     await send("anything");
@@ -926,7 +941,11 @@ describe("ConciergeHost — routed prompt → the selected agent", () => {
   // fall-through to the generic line is a failure, not a pass.
   it.each([
     ["agent-failed", /hit Retry/],
-    ["cloud-agent", /use its own pane for now/],
+    // Was /use its own pane for now/ — the line that told the user prompting a cloud agent "isn't
+    // wired up yet". It is, so that copy would now be an instruction to work around a working
+    // feature (AGENTS.md: user-facing copy is code). What is left is the ANSWER refusal.
+    ["cloud-agent", /I can't answer that for it from here/],
+    ["cloud-offline", /so that didn't reach/],
     // NOT /open it and pick/ any more: `addressed-at-picker` was split out of this path and its
     // copy contains that phrase too, so the pattern stopped being path-unique and swapping the two
     // `case` bodies would still have passed — the exact drift class this table exists to catch.

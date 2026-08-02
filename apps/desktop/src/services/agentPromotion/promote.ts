@@ -27,13 +27,17 @@
 //   5. NOTHING after the cut may turn the promotion into a failure. Every failure message here ends
 //      with "your agent is still running locally", and past the cut that is false — so a store flip
 //      or a nudge that throws is reported as a promotion that HAPPENED and needs reconciling.
+//   6. The transcript is NEVER fatal — including when the SERVER refuses it for its size. A start
+//      that fails as too large is re-issued exactly once with the transcript omitted, so an
+//      oversized conversation costs the conversation and not the move. Once, not a loop: a second
+//      refusal is about something other than the transcript. Every other start failure refuses.
 //
 // `awaitFirstFrame` is a DEP, not something implemented here: the real one attaches a
 // CloudTransport and waits for the first `agent_output` frame (see live.ts). Keeping it behind the
 // seam is what lets every case below be tested with no Tauri, no network and no relay.
 
 import type { StartSessionInput } from "../cloudAgents/api";
-import { classifyStartError } from "../cloudAgents/startError";
+import { classifyStartError, isTranscriptTooLarge } from "../cloudAgents/startError";
 import { handoffNudge, WIP_COMMIT_MESSAGE, type DirtyPolicy } from "./plan";
 import type { PromotionPreflight, PromotionTranscript, PushOutcome } from "./rust";
 
@@ -294,32 +298,64 @@ export async function promoteAgentToCloud(
     });
     transcript = null;
   }
-  const transcriptMoved = transcript !== null;
-
   // ── start ────────────────────────────────────────────────────────────────────────────────────
   // `goal` is required and non-empty server-side, but the runner deliberately does NOT write it to
   // a promoted session's stdin (contract B) — the session comes up idle, which is what closes the
   // two-Claudes window. So this is a recorded label, not an instruction.
   note(deps, "start");
   const goal = input.goal?.trim() || `Continue the work in progress on ${branch}.`;
+  const startBody = (t: PromotionTranscript | null): StartSessionInput => ({
+    projectId: input.cloudProjectId,
+    goal,
+    repoUrl: input.repoUrl,
+    name: input.agentName,
+    promotion: {
+      sessionId: input.agentId,
+      branch,
+      ...(t ? { transcript: { sessionId: t.sessionId, jsonl: t.jsonl } } : {}),
+    },
+  });
   let sessionId: string;
   try {
-    ({ sessionId } = await deps.startSession({
-      projectId: input.cloudProjectId,
-      goal,
-      repoUrl: input.repoUrl,
-      name: input.agentName,
-      promotion: {
-        sessionId: input.agentId,
-        branch,
-        ...(transcript
-          ? { transcript: { sessionId: transcript.sessionId, jsonl: transcript.jsonl } }
-          : {}),
-      },
-    }));
+    ({ sessionId } = await deps.startSession(startBody(transcript)));
   } catch (e) {
-    return { ok: false, step: "start", message: `${classifyStartError(e).message}${STILL_LOCAL}` };
+    // THE ONE TRANSCRIPT RETRY (plan contract A + D; bead sparkle-nit44). The transcript is "never
+    // fatal" everywhere else in this file, and without this it is fatal HERE — the one place the
+    // user's conversation is big enough to be refused. So an oversized transcript must cost the
+    // conversation, not the move, and the users it hits are exactly the ones with the most to lose.
+    //
+    // Two conditions, both required:
+    //   • the failure is a size refusal (`isTranscriptTooLarge` — status 413 OR our code; see there
+    //     for why it cannot be code-only), and
+    //   • we actually SENT a transcript. With none, the second call would be byte-identical to the
+    //     first, so a 413 is about the rest of the payload and a retry could only fail the same way.
+    // Any other failure still refuses: retrying a start that failed for an unrelated reason would
+    // strip the user's conversation for nothing.
+    if (!transcript || !isTranscriptTooLarge(e)) {
+      return { ok: false, step: "start", message: `${classifyStartError(e).message}${STILL_LOCAL}` };
+    }
+    console.warn("[promotion] transcript refused as too large; retrying without it", {
+      agentId: input.agentId,
+      bytes: transcript.bytes,
+      records: transcript.records,
+    });
+    // Drop it for the REST of the machine, not just this call: `transcriptMoved`, the truncation
+    // flag and the handoff nudge all read from here, and a nudge still claiming the conversation
+    // travelled would leave the cloud Claude asserting a memory it does not have.
+    transcript = null;
+    try {
+      ({ sessionId } = await deps.startSession(startBody(null)));
+    } catch (e2) {
+      // EXACTLY ONCE, not a loop. The transcript is already gone, so a second refusal is about
+      // something else — and saying so is the point: the retry just PROVED the conversation wasn't
+      // the problem, while the server's own code ("transcript_too_large") would claim it was.
+      const message = isTranscriptTooLarge(e2)
+        ? "The cloud service rejected the request as too large, even without your conversation."
+        : classifyStartError(e2).message;
+      return { ok: false, step: "start", message: `${message}${STILL_LOCAL}` };
+    }
   }
+  const transcriptMoved = transcript !== null;
 
   // The server is supposed to ECHO the id we supplied (spec Decision 3). If it minted a different
   // one we have a split identity — two keys for one agent — which is worse than a refusal. Abandon

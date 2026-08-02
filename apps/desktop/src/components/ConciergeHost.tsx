@@ -96,7 +96,7 @@ import {
   surfacedDigest,
 } from "../services/conciergeProactive";
 import {
-  agentCanAcceptInput,
+  agentCanAcceptPrompt,
   dispatchConciergeAnswer,
   onDeferredSendOutcome,
   type ConciergeDispatchPath,
@@ -379,10 +379,24 @@ function refusalCopy(path: RefusedPath | null, agent: ReferencableAgent, voice: 
       return approving
         ? line`${a} couldn't start, so I couldn't send the approval — open its pane and hit Retry.`
         : line`${a} couldn't start, so that didn't send — open its pane and hit Retry (or finish installing Claude Code), then send again.`;
+    // NARROWED TO ANSWERS (design 2026-08-01 §Decision 7). Prompting a cloud agent from here IS
+    // wired now — the dispatcher relays it to the sandbox's stdin — so the old prompt line ("isn't
+    // wired up yet — use its own pane for now") became an instruction to work around a working
+    // feature. What still refuses is an ANSWER to a question on the agent's own screen: an approval
+    // gesture, or any send made while a picker is live. Both remedies point at the same place, and
+    // that place is where the question is actually readable.
     case "cloud-agent":
       return approving
-        ? line`${a} runs in the cloud — I can't relay the approval from here yet; answer it in its own pane.`
-        : line`${a} runs in the cloud, and prompting cloud agents from here isn't wired up yet — use its own pane for now.`;
+        ? line`${a} runs in the cloud — an approval has to be given where the question is, so open its pane and answer it there.`
+        : line`${a} runs in the cloud and it's waiting on something on screen — I can't answer that for it from here. Open its pane and answer it there; your message is back in the box.`;
+    // NOT the same fact as `cloud-agent`, and the difference is what the user should do next: the
+    // agent is fine and the message is sendable, but this Mac has no live relay connection to hand
+    // it over on — so the remedy is to get connected, not to go and type in its pane (which is
+    // streamed over the very connection that is missing, and would be just as empty).
+    case "cloud-offline":
+      return approving
+        ? line`I've lost the connection to the cloud, so the approval for ${a} didn't go anywhere. It'll reconnect on its own — try again in a moment.`
+        : line`I've lost the connection to the cloud, so that didn't reach ${a}. It'll reconnect on its own — your message is back in the box, try again in a moment.`;
     case "pty-gone":
       return approving
         ? line`${a}'s terminal has closed — I couldn't send the approval.`
@@ -1281,7 +1295,7 @@ export function ConciergeHost({
         projectName: a.projectName,
         band: a.band,
         since: a.since,
-        canAcceptInput: agentCanAcceptInput(a.id),
+        canAcceptInput: agentCanAcceptPrompt(a.id),
       })),
     [feed],
   );
@@ -2740,10 +2754,16 @@ export function ConciergeHost({
       // routing at it would report a delivery that cannot happen. Gone → the safe direction.
       const aim = submitted && agentStillExists(submitted.agentId) ? submitted : null;
       const status = aim ? useRuntimeStore.getState().status[aim.agentId] : undefined;
-      // The DISPATCHER's own precondition, asked up front: it refuses cloud agents outright, so
-      // telling the router turns a guaranteed delivery failure into a useful chat answer. One
-      // shared predicate rather than a copy here, so the two can't drift.
-      const canAcceptInput = aim ? agentCanAcceptInput(aim.agentId) : false;
+      // The DISPATCHER's own precondition, asked up front, so a guaranteed delivery failure becomes
+      // a useful chat answer instead. One shared predicate rather than a copy here, so the two
+      // can't drift.
+      //
+      // `agentCanAcceptPrompt`, NOT `agentCanAcceptInput` — the two answer different questions and
+      // this send is a MESSAGE. `agentCanAcceptInput` is the local-PTY question (false for cloud),
+      // and it stays that way for the raw-keystroke callers; a compose send that asked it would
+      // refuse every cloud agent with "can't take a message right now" over a path the dispatcher
+      // now delivers on (design 2026-08-01 §Decision 7).
+      const canAcceptInput = aim ? agentCanAcceptPrompt(aim.agentId) : false;
       // ══ AN ADDRESSED MESSAGE, AND THE TWO WAYS IT CAN STILL FAIL ════════════════════════════
       // `aim` and `canAcceptInput` above are the same two checks every send makes, so a mention
       // that named an agent which has since closed — or one that can never take a prompt at all,

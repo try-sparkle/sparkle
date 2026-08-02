@@ -180,9 +180,9 @@ describe("command wrappers", () => {
   it("caps the transcript below the encoded body limit, not at it", async () => {
     // The 8 MB bodyLimit applies to the JSON-ENCODED body while the cap is measured on RAW JSONL,
     // and JSON string-escaping of a Claude transcript expands it ~1.3–2×. The cap has to leave room
-    // for that factor plus the rest of the start payload, or the longest conversations 413 — which
-    // fails the whole `start` step rather than degrading to the transcript-less path (the retry is
-    // specified but NOT built — bead sparkle-nit44).
+    // for that factor plus the rest of the start payload, or the longest conversations 413. That is
+    // survivable now — `promote.ts` retries once without the transcript (bead sparkle-nit44) — but
+    // it still costs the user their entire conversation, so the margin remains the real protection.
     const BODY_LIMIT = 8 * 1024 * 1024;
     expect(DEFAULT_TRANSCRIPT_MAX_BYTES * TRANSCRIPT_ENCODE_EXPANSION).toBeLessThan(BODY_LIMIT);
   });

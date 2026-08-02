@@ -9,9 +9,19 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { SuggestionButton } from "./suggestions/types";
 
-vi.mock("../pty", () => {
+vi.mock("../pty", async () => {
   class PtyGoneError extends Error {}
-  return { writePtyChainedStrict: vi.fn(async () => {}), submitPrompt: vi.fn(async () => {}), PtyGoneError };
+  // The paste framing is REAL — the cloud path builds its wire payload from it, and a stub would
+  // make that payload assert nothing.
+  const actual = await vi.importActual<typeof import("../pty")>("../pty");
+  return {
+    PASTE_START: actual.PASTE_START,
+    PASTE_END: actual.PASTE_END,
+    stripPasteMarkers: actual.stripPasteMarkers,
+    writePtyChainedStrict: vi.fn(async () => {}),
+    submitPrompt: vi.fn(async () => {}),
+    PtyGoneError,
+  };
 });
 vi.mock("./terminalScrollback", () => ({ getAgentScrollback: vi.fn(() => "SCREEN") }));
 vi.mock("./suggestions/heuristics", () => ({
@@ -634,8 +644,14 @@ describe("abandonPendingSends — a hold the PTY will never satisfy (roborev 464
   });
 });
 
-describe("cloud agents have no local PTY (roborev 46916)", () => {
-  it("refused up front — ok:false, no write, no keystroke, no screen read, no debit", async () => {
+// A CLOUD AGENT IS NOT REFUSED UP FRONT ANY MORE (design 2026-08-01 §Decision 7). It leaves this
+// module's local-PTY machinery for `getTransport`, and the delivery itself is pinned in
+// conciergeDispatch.cloud.test.ts, which fakes the relay socket and asserts the `agent_input` emit.
+// What is pinned HERE is the half this suite owns: none of the LOCAL primitives and none of the
+// local side-effects run for one. With no relay socket in this suite the honest outcome is
+// `cloud-offline`, which is itself the assertion that nothing was silently reported as delivered.
+describe("cloud agents never touch the local PTY path (roborev 46916 / Decision 7)", () => {
+  it("refused as cloud-offline with no relay — no write, no keystroke, no debit, no history", async () => {
     const { useProjectStore } = await import("../stores/projectStore");
     const base = useProjectStore.getState().projects[0]!;
     useProjectStore.setState({
@@ -644,14 +660,19 @@ describe("cloud agents have no local PTY (roborev 46916)", () => {
         { ...base, id: "p-cloud", agents: [{ ...base.agents[0]!, id: "cloudy", runtime: "cloud" as const }] },
       ],
     });
-    const r = await dispatchConciergeAnswer("cloudy", "yes", { authority: TEST_AUTHORITY, userPrompt: true });
+    const r = await dispatchConciergeAnswer("cloudy", "unrelated instruction", {
+      authority: TEST_AUTHORITY,
+      userPrompt: true,
+    });
     expect(r.ok).toBe(false);
-    expect(r.path).toBe("cloud-agent");
-    // The refusal short-circuits BEFORE the screen is even read: no PTY write, no keystroke,
-    // no picker detection — there is no terminal to detect against — and nothing is charged.
+    // Not `cloud-agent`: the send is a message and the agent could have taken it — what is missing
+    // is the connection. Reporting the wrong one of the two would send the user to a pane that is
+    // streamed over the very socket that is absent.
+    expect(r.path).toBe("cloud-offline");
+    // NOTHING local ran: no PTY write, no keystroke, and nothing was charged for a send that never
+    // left the machine.
     expect(writePtyChainedStrict).not.toHaveBeenCalled();
     expect(submitPrompt).not.toHaveBeenCalled();
-    expect(detectTerminalPrompts).not.toHaveBeenCalled();
     expect(recordTrialSend).not.toHaveBeenCalled();
     // …and the STORE-mutating side-effects are skipped too. The runtime check sits above the
     // composer block; a regression that moved it below `appendPrompt`/`maybeAutoName` would still

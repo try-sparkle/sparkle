@@ -56,14 +56,40 @@
 // A send that overflows that bound is refused as `queue-full`: "too many prompts are already
 // waiting" is a different fact from "the terminal is gone", and only one of them asks the user to
 // restart anything.
+//
+// CLOUD AGENTS (design 2026-08-01 §Decision 7, bead sparkle-1g0r). This module used to refuse every
+// cloud agent outright — honestly, because every write primitive above targets a LOCAL PTY and there
+// was no cloud input path to reach. There is one now, and it has been there all along, simply
+// unreachable from here: `CloudTransport.write` → `agent_input` → the relay's `writeInput` → the
+// sandbox PTY's stdin. So a PROMPT to a cloud agent is delivered through `getTransport({id, runtime})`
+// — the same selector the terminal uses — and only the framing differs (see `frameCloudSubmit`).
+//
+// WHAT DOES NOT FOLLOW, and must not be quietly assumed: an APPROVAL. An approval is not a
+// keystroke — it is an answer to a specific prompt whose UI state lives with the agent, and sending
+// it blind down `agent_input` is the "remedy that does the unsafe thing" failure AGENTS.md names.
+// Two shapes are therefore still refused for a cloud agent, both with the `cloud-agent` path:
+//   • an approval GESTURE (the nudge card's Approve — see `ANSWERS_AGENTS_PROMPT`), and
+//   • any send made while a PICKER is live on the agent's screen, because that is the send this
+//     module would otherwise collapse into a bare `y\r` keystroke.
+// A cloud agent's picker is answered in its own pane, where the person can read the question.
 
-import { PtyGoneError, submitPrompt, writePtyChainedStrict } from "../pty";
+import {
+  PASTE_END,
+  PASTE_START,
+  PtyGoneError,
+  stripPasteMarkers,
+  submitPrompt,
+  writePtyChainedStrict,
+} from "../pty";
 import {
   describeAuthority,
   isDispatchAuthority,
   isHumanAuthored,
   type DispatchAuthority,
+  type DispatchAuthorityKind,
 } from "./dispatchAuthority";
+import { getTransport } from "./agentTransport";
+import { getRelaySocket } from "./relayClient";
 import { frameSubmit } from "./relayGate";
 import { log } from "../logger";
 import { getAgentScrollback } from "./terminalScrollback";
@@ -95,7 +121,14 @@ export type ConciergeDispatchPath =
   | "expired" // held too long waiting for a PTY that never came up (NOT delivered)
   | "abandoned" // the pane closed or errored while the send was held (NOT delivered)
   | "agent-failed" // the pane GAVE UP (spawn error / Claude missing) — Retry is the remedy (NOT delivered)
-  | "cloud-agent" // the target runs in the cloud — there is no local PTY to write to (NOT delivered)
+  | "cloud-agent" // the target runs in the cloud and this send is an ANSWER to its on-screen prompt
+                  // (an approval gesture, or any send made while a picker is live) — that has to be
+                  // answered in its own pane, where the question is readable (NOT delivered).
+                  // A cloud PROMPT is delivered; see the cloud note in this file's header.
+  | "cloud-offline" // the target runs in the cloud and the relay socket isn't connected, so there is
+                    // nothing to emit `agent_input` on (NOT delivered). Its own path rather than a
+                    // silent ok: `CloudTransport.write` no-ops on a null socket, and reporting that
+                    // as a delivery is the one lie this module exists to prevent.
   | "alternate-screen" // a full-screen app (vim/less/htop) owns the screen, which would EXECUTE the
                        // write as commands (refused — see the guard in dispatchConciergeAnswer)
   | "unauthorized" // no valid DispatchAuthority — nobody declared why this may be sent (NOT delivered)
@@ -284,6 +317,42 @@ function isCloudAgent(agentId: string): boolean {
 }
 
 /**
+ * Does this authority kind mean the send is an ANSWER to a prompt on the agent's own screen, rather
+ * than a message TO the agent?
+ *
+ * The distinction only matters for cloud agents (see the header): a message is deliverable over
+ * `agent_input`, an answer is not, because the UI state it answers lives with the agent and this
+ * side cannot press its button on the user's behalf.
+ *
+ * A TOTAL `Record`, not a `Set` or a `switch` — the same shape and the same reason as
+ * `dispatchAuthority`'s `HUMAN_AUTHORED`: adding an arm to `DispatchAuthority` is a compile error
+ * here until someone decides which side of the line it sits on, and "message" is the permissive
+ * answer, so default-by-omission is exactly the wrong default.
+ */
+const ANSWERS_AGENTS_PROMPT: Record<DispatchAuthorityKind, boolean> = {
+  // The nudge card's Approve exists to answer a permission prompt the agent has on screen. It is
+  // THE approval gesture, and the one this narrowing is about.
+  "nudge-approve": true,
+  // Everything else is a message the user (or the concierge) composed FOR the agent.
+  mention: false,
+  // Approving a block of text the concierge PROPOSED is approving a message, not answering the
+  // agent's question — the thing being approved is what we are about to send, not what it asked.
+  approval: false,
+  countdown: false,
+  redirect: false,
+  // A TERMINAL-kind suggestion pill writes its keystroke straight to the PTY and never reaches this
+  // module (see `applySuggestion`); anything that does reach here is prose.
+  suggestion: false,
+  "concierge-tool": false,
+  "goal-continue": false,
+};
+
+/** Is this dispatch an approval GESTURE — the nudge card's Approve? See `ANSWERS_AGENTS_PROMPT`. */
+function isApprovalGesture(opts: ConciergeDispatchOptions): boolean {
+  return ANSWERS_AGENTS_PROMPT[opts.authority.kind] === true;
+}
+
+/**
  * Am I CONFIDENT this agent can receive a message? The router's gate — a different question from
  * `isCloudAgent`, and it fails the other way on purpose.
  *
@@ -292,10 +361,32 @@ function isCloudAgent(agentId: string): boolean {
  * an agent absent from the store usually means the project was unloaded or the agent removed,
  * which is precisely when delivery is least likely to work. So "not found" is FALSE here and does
  * not trigger a refusal there. Exported so the router asks this instead of copying the lookup.
+ *
+ * ══ THIS IS THE LOCAL-PTY QUESTION, AND IT STAYS FALSE FOR CLOUD ════════════════════════════════
+ * A cloud agent can now take a PROMPT (see the header), so "can it receive a message" is no longer
+ * what this predicate answers. It is left alone on purpose: its callers outside the compose box —
+ * `sendControlKey`, dictation, the API-recovery ping — all write RAW BYTES to a local PTY, and a
+ * cloud agent has none. Flipping it would send those writes into `writePtyChainedStrict` for a PTY
+ * that does not exist. Use {@link agentCanAcceptPrompt} for the "can I send it a message" question.
  */
 export function agentCanAcceptInput(agentId: string): boolean {
   const agent = findAgent(agentId);
   return !!agent && agent.runtime !== "cloud";
+}
+
+/**
+ * Can this agent be sent a PROMPT — a message, as opposed to a keystroke?
+ *
+ * True for a cloud agent, which is the whole difference from {@link agentCanAcceptInput}: the
+ * dispatcher delivers a cloud prompt over the transport (header), so a surface that gates a compose
+ * send on "can it take a message" must ask THIS or it will refuse a send that would have worked.
+ *
+ * Fails closed on an unknown id for the same reason `agentCanAcceptInput` does — a surface asking
+ * this is about to aim an irreversible write, and "the store has never heard of it" is precisely
+ * when delivery is least likely to work.
+ */
+export function agentCanAcceptPrompt(agentId: string): boolean {
+  return findAgent(agentId) !== undefined;
 }
 
 /** Read the agent's current terminal, detecting any live prompt options (empty if none on screen). */
@@ -367,10 +458,6 @@ export async function dispatchConciergeAnswer(
     authority: opts.authority.kind,
   });
   if (text.trim() === "") return { ok: false, path: "empty", agentId };
-  // A CLOUD agent has no local PTY — every write primitive here targets one, so refusing up
-  // front with its own path beats the lie "its terminal has closed" (roborev 46916). Wiring a
-  // cloud input path is tracked separately; until then the box is honest about the limit.
-  if (isCloudAgent(agentId)) return { ok: false, path: "cloud-agent", agentId };
   // ══ THE SCREEN GUARD LIVES HERE, NOT IN EACH CALLER ═════════════════════════════════════════════
   // Every door into a local PTY in this app comes through this function — the concierge composer's
   // two gestures, the concierge's own `send_to_agent_terminal` tool, the nudge Approve relay, and
@@ -396,6 +483,14 @@ export async function dispatchConciergeAnswer(
     return { ok: false, path: "alternate-screen", agentId };
   }
   const options = liveOptionsFor(agentId);
+
+  // ══ A CLOUD AGENT LEAVES THE LOCAL-PTY PATH HERE ════════════════════════════════════════════════
+  // Read the screen FIRST (above) rather than short-circuiting on the runtime the way the old
+  // blanket refusal did: whether a picker is live is exactly what decides between "this is a
+  // message I can relay" and "this is an answer only its own pane can give". Everything below this
+  // line — the picker collapse, the pending-send queue, `submitPrompt` — is local-PTY machinery a
+  // cloud agent has no counterpart for.
+  if (isCloudAgent(agentId)) return deliverCloudPrompt(agentId, text, opts, options);
 
   if (options.length > 0) {
     // ══ THE DECLARED DISPOSITION IS CHECKED FIRST, BEFORE THE MATCH ═════════════════════════════
@@ -557,6 +652,76 @@ export async function dispatchConciergeAnswer(
     }
     throw err;
   }
+}
+
+/**
+ * The wire form of a cloud submit: one bracketed paste plus the carriage return that sends it.
+ *
+ * ONE STRING, NOT TWO WRITES, and that is the difference from the local `deliverSubmit` rather than
+ * an omission. Locally the paste and the CR are two `pty_write` calls with a beat between them so
+ * the CLI finishes ingesting the paste first. Over the relay each `write` is a separate
+ * `agent_input` event whose SERVER handler is `async` and awaits an ownership lookup before it
+ * touches stdin — so two emits can reach `sandbox.pty.sendInput` in either order, and a CR that
+ * overtakes its paste submits an empty line and leaves the prompt sitting in the composer. A single
+ * emit is one `writeInput` call and cannot be reordered against itself.
+ *
+ * Marker-stripped exactly as every other paste this app frames: the text here is user- and
+ * model-authored, and an embedded `ESC[201~` would close paste mode mid-payload and have the tail
+ * read as KEYSTROKES (pty.ts's note on roborev 2197/54397 — the sandbox runs the same CLI).
+ */
+export function frameCloudSubmit(text: string): string {
+  return `${PASTE_START}${stripPasteMarkers(text)}${PASTE_END}\r`;
+}
+
+/**
+ * Deliver a concierge send to a CLOUD agent, or refuse it with the specific reason.
+ *
+ * The three refusals, in the order they are asked:
+ *   1. An ANSWER to the agent's own screen — an approval gesture, or any send made while a picker
+ *      is live. See the header: this is the one thing that does not follow from the wire existing.
+ *      Returns the live `options` when there are any, so the caller can say what it is waiting on.
+ *   2. The free trial is spent — the same pre-delivery gate the local free-text path applies, for
+ *      the same reason, and scoped the same way (USER prompts only).
+ *   3. No relay socket — `CloudTransport.write` silently no-ops on a null socket, so without this
+ *      a dropped prompt would come back `ok: true`.
+ *
+ * On delivery it runs the SAME `recordPromptSideEffects` a local free-text send runs. That is not
+ * incidental: the pinned prompt header, the history dropdown, auto-naming, the ghost-text corpus and
+ * the trial debit all key on it, and a cloud prompt that skipped them would leave every one of those
+ * surfaces blind to an agent the user is actively driving.
+ *
+ * There is no QUEUE arm here and there should not be: a cloud session is already running
+ * server-side before its tab exists, so "the terminal isn't up yet" — the state `pendingSends`
+ * exists for — has no cloud counterpart.
+ */
+async function deliverCloudPrompt(
+  agentId: string,
+  text: string,
+  opts: ConciergeDispatchOptions,
+  options: SuggestionButton[],
+): Promise<ConciergeDispatchResult> {
+  if (isApprovalGesture(opts) || options.length > 0) {
+    log.debug("concierge", "refused an answer aimed at a cloud agent's own screen", { agentId });
+    return {
+      ok: false,
+      path: "cloud-agent",
+      agentId,
+      ...(options.length > 0 ? { options } : {}),
+    };
+  }
+  if (opts.userPrompt && !trialSendAllowed()) return { ok: false, path: "trial-spent", agentId };
+  // Asked BEFORE the write, not after: the transport has no failure channel to read afterwards.
+  if (!getRelaySocket()) {
+    log.warn("concierge", "cloud prompt not sent — no relay connection", { agentId });
+    return { ok: false, path: "cloud-offline", agentId };
+  }
+  getTransport({ id: agentId, runtime: "cloud" }).write(frameCloudSubmit(text));
+  const display = opts.display ?? text;
+  if (opts.userPrompt) recordPromptSideEffects(agentId, text, opts, isHumanAuthored(opts.authority));
+  // `free-text`, the same path a local prompt takes — the caller's question is "did my message go
+  // to the agent", and the answer is yes by the same route it would have been for a local one.
+  // `sent` is the TEXT, not the framed payload, exactly as the local free-text return does.
+  return { ok: true, path: "free-text", agentId, sent: text, display };
 }
 
 /** Listeners for outcomes the USER didn't directly await — i.e. everything that happens to a

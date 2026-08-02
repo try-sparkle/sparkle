@@ -5,7 +5,7 @@ import { promoteAgentToCloud, type PromoteDeps, type PromoteInput,
 import { WIP_COMMIT_MESSAGE } from "./plan";
 import { normalizePreflight } from "./rust";
 import type { PromotionPreflight, PromotionTranscript, PushOutcome } from "./rust";
-import type { StartSessionInput } from "../cloudAgents/api";
+import { CloudApiError, type StartSessionInput } from "../cloudAgents/api";
 
 const TAB_ID = "tab-1";
 
@@ -276,6 +276,173 @@ describe("promoteAgentToCloud — the transcript is never fatal", () => {
     expect(r.ok && r.transcriptMoved).toBe(false);
     expect(h.log).toContain("startSession");
     expect(h.log).toContain("killLocalPty");
+  });
+});
+
+// ── the ONE transcript retry (plan contract A + D; bead sparkle-nit44) ──────────────────────────
+//
+// "Never fatal" above covers a transcript we could not READ. This covers one the SERVER refuses for
+// its size, which arrives at the only step where a transcript failure could still cost the whole
+// promotion — and it lands on the users with the most conversation to lose. The rule is exactly
+// once, on that trigger only: a second rejection is about something other than the transcript, so
+// retrying again would just burn start calls against a body that is over the limit for another
+// reason.
+
+/** A `startSession` behavior that throws `errors[n]` on call n and succeeds once they run out.
+ *  Per-call, because the whole point is what the SECOND call is handed. */
+function startFailingWith(...errors: unknown[]) {
+  let calls = 0;
+  return () => {
+    const e = errors[calls++];
+    if (e !== undefined) throw e;
+    return { sessionId: TAB_ID };
+  };
+}
+
+/** What the desktop actually receives from the route's error handler. */
+const tooLarge = () => new CloudApiError(413, "transcript_too_large", "transcript_too_large");
+
+describe("promoteAgentToCloud — the transcript-too-large retry", () => {
+  it("retries ONCE without the transcript and completes the promotion", async () => {
+    const h = harness({ startSession: startFailingWith(tooLarge()) });
+    const r = await promoteAgentToCloud(input(), h.deps);
+
+    // The promotion HAPPENS — the whole point is that an oversized conversation costs the user the
+    // conversation, not the move.
+    expect(r).toMatchObject({ ok: true, sessionId: TAB_ID, transcriptMoved: false });
+    expect(h.kills).toEqual([TAB_ID]);
+
+    // Exactly two starts, and the SECOND one carries no transcript — the side effect, not the
+    // precondition. The first one did carry it, which is what makes this a retry rather than a
+    // client that stopped sending transcripts.
+    expect(h.started).toHaveLength(2);
+    expect(h.started[0]!.promotion!.transcript).toEqual({
+      sessionId: TRANSCRIPT.sessionId,
+      jsonl: TRANSCRIPT.jsonl,
+    });
+    expect(h.started[1]!.promotion!.transcript).toBeUndefined();
+    // Everything else about the start is unchanged — the retry drops the transcript and nothing else.
+    expect(h.started[1]!.promotion!.branch).toBe(h.started[0]!.promotion!.branch);
+    expect(h.started[1]!.promotion!.sessionId).toBe(TAB_ID);
+    expect(h.started[1]!.goal).toBe(h.started[0]!.goal);
+
+    // …and the agent is TOLD its conversation didn't travel. A nudge still claiming the transcript
+    // came along would leave the cloud Claude asserting a memory it does not have.
+    expect(h.handoffs[0]!.text).toMatch(/did NOT come with you/);
+    expect(h.handoffs[0]!.text).not.toMatch(/conversation came with you/i);
+  });
+
+  it("reports transcriptTruncated: false after the retry — nothing was transferred to truncate", async () => {
+    // The read DID truncate, so the pre-retry state says "truncated". Once the retry drops the
+    // transcript entirely there is nothing truncated to report, and a UI line saying "some of your
+    // conversation moved" would be false.
+    const h = harness({
+      readTranscript: () => ({ ...TRANSCRIPT, truncated: true }),
+      startSession: startFailingWith(tooLarge()),
+    });
+    const r = await promoteAgentToCloud(input(), h.deps);
+    expect(r).toMatchObject({ ok: true, transcriptMoved: false, transcriptTruncated: false });
+  });
+
+  it("fires on a BARE 413 with no code of ours (Fastify bodyLimit / a proxy)", async () => {
+    // The largest transcripts die at the bodyLimit, which carries FST_ERR_CTP_BODY_TOO_LARGE, not
+    // our code. If the trigger were code-only the retry would be dark for exactly this case.
+    const h = harness({ startSession: startFailingWith(new CloudApiError(413, null, "too large")) });
+    const r = await promoteAgentToCloud(input(), h.deps);
+    expect(r).toMatchObject({ ok: true, transcriptMoved: false });
+    expect(h.started).toHaveLength(2);
+  });
+
+  it("does NOT retry any other start failure", async () => {
+    for (const err of [
+      new CloudApiError(402, "insufficient_credits", "out of credits"),
+      new CloudApiError(403, "cloud_agents_disabled", "off"),
+      new CloudApiError(400, "bad_request", "bad_request"),
+      new CloudApiError(500, null, "sandbox provisioning failed"),
+      new Error("boom"),
+    ]) {
+      const h = harness({ startSession: startFailingWith(err, err) });
+      const r = await promoteAgentToCloud(input(), h.deps);
+      expect(r).toMatchObject({ ok: false, step: "start" });
+      // ONE call. Retrying a start that failed for an unrelated reason would strip the user's
+      // conversation for nothing — and, for a failure the second call might survive, would move
+      // promotion off a transcript the server never objected to.
+      expect(h.started).toHaveLength(1);
+      expect(h.kills).toEqual([]);
+      if (r.ok) throw new Error("unreachable");
+      expect(r.message).toContain("still running locally");
+    }
+  });
+
+  it("does NOT retry a 413 when there was no transcript to drop", async () => {
+    // Nothing to remove, so the second call would be byte-identical to the first. A 413 here is
+    // about the rest of the payload and a retry could only fail the same way.
+    const h = harness({
+      readTranscript: () => null,
+      startSession: startFailingWith(tooLarge(), tooLarge()),
+    });
+    const r = await promoteAgentToCloud(input(), h.deps);
+    expect(r).toMatchObject({ ok: false, step: "start" });
+    expect(h.started).toHaveLength(1);
+    expect(h.kills).toEqual([]);
+    if (r.ok) throw new Error("unreachable");
+    // …and it does not tell a user who sent NO conversation that their conversation was too big.
+    // The route's body is code-only, so the naive "surface the server's message" path would print
+    // the bare token `transcript_too_large` at them (roborev 57566).
+    expect(r.message).not.toMatch(/transcript_too_large/);
+    expect(r.message).not.toMatch(/conversation|transcript/i);
+    expect(r.message).toContain("too large");
+  });
+
+  it("does NOT retry AGAIN when the transcript-less start is also refused", async () => {
+    // Not a loop. The transcript is already gone, so a second 413 is about something else.
+    const h = harness({ startSession: startFailingWith(tooLarge(), tooLarge(), tooLarge()) });
+    const r = await promoteAgentToCloud(input(), h.deps);
+    expect(r).toMatchObject({ ok: false, step: "start" });
+    expect(h.started).toHaveLength(2);
+    expect(h.started[1]!.promotion!.transcript).toBeUndefined();
+    // Nothing was cut, and no session exists to clean up — the start never returned one.
+    expect(h.kills).toEqual([]);
+    expect(h.deleted).toEqual([]);
+    if (r.ok) throw new Error("unreachable");
+    // The user is told the size problem is NOT their conversation — the retry already proved that,
+    // and the raw server code ("transcript_too_large") would say the opposite.
+    expect(r.message).toMatch(/even without/i);
+    expect(r.message).not.toMatch(/transcript_too_large/);
+    expect(r.message).toContain("still running locally");
+  });
+
+  it("refuses a retry that mints a different session id, as the first start would", async () => {
+    // The retried call goes through the SAME id check — a split identity is worse than a refusal
+    // whichever call produced it, and the session it did start gets abandoned rather than left
+    // billing.
+    let calls = 0;
+    const h = harness({
+      startSession: () => {
+        if (calls++ === 0) throw tooLarge();
+        return { sessionId: "some-other-id" };
+      },
+    });
+    const r = await promoteAgentToCloud(input(), h.deps);
+    expect(r).toMatchObject({ ok: false, step: "start" });
+    expect(h.deleted).toEqual(["some-other-id"]);
+    expect(h.kills).toEqual([]);
+  });
+
+  it("still announces `start` exactly once — the retry is one step, not two", async () => {
+    const h = harness({ startSession: startFailingWith(tooLarge()) });
+    const steps: PromotionStep[] = [];
+    const r = await promoteAgentToCloud(input(), { ...h.deps, onStep: (s) => steps.push(s) });
+    expect(r.ok).toBe(true);
+    expect(steps).toEqual([
+      "preflight",
+      "commit",
+      "push",
+      "transcript",
+      "start",
+      "await_live",
+      "cutover",
+    ]);
   });
 });
 

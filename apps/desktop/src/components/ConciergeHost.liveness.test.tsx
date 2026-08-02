@@ -77,6 +77,7 @@ vi.mock("../services/conciergeDispatch", () => ({
   dispatchConciergeAnswer: vi.fn(async () => ({ ok: true })),
   flushPendingSends: vi.fn(async () => []),
   agentCanAcceptInput: () => true,
+  agentCanAcceptPrompt: () => true,
   liveOptionsFor: () => [],
   isTerseAnswer: () => false,
   matchAnswerToOption: () => null,

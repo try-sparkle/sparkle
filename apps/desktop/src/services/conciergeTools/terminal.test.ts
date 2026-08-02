@@ -675,13 +675,17 @@ describe("sendToAgentTerminal — refusals, none of which may reach the PTY", ()
     expect(writePtyChainedStrict).not.toHaveBeenCalled();
   });
 
-  // There is no cloud input path, and inventing one here would be a lie. The dispatcher already
-  // owns this refusal, so the send goes through it and comes back with the EXISTING label.
-  it("returns the existing honest cloud-agent refusal for a cloud agent", async () => {
+  // A cloud send FALLS THROUGH to the dispatcher rather than being refused here, and that is what
+  // makes it work now (design 2026-08-01 §Decision 7): the dispatcher relays it to the sandbox's
+  // stdin over the relay socket. This suite has no relay socket, so the honest verdict is
+  // `cloud-offline` — which is the assertion worth having either way, because what this module
+  // must never do is write a cloud send into a LOCAL PTY.
+  it("hands a cloud agent to the dispatcher and never touches a local PTY", async () => {
     seedAgent("cloud");
     const r = await sendToAgentTerminal(AGENT, "hello", ALLOWED);
     expect(r.ok).toBe(false);
-    expect(r.path).toBe("cloud-agent");
+    expect(r.path).toBe("cloud-offline");
+    expect(r.detail.length).toBeGreaterThan(0);
     expect(submitPrompt).not.toHaveBeenCalled();
     expect(writePtyChainedStrict).not.toHaveBeenCalled();
   });

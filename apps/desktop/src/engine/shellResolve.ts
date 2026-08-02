@@ -67,13 +67,16 @@ export function decidePromptTarget(
   if (!project || !activeAgentId) return { target: null };
   const agent: AgentTab | undefined = project.agents.find((a) => a.id === activeAgentId);
   if (!agent) return { target: null };
-  // Cloud agents have no local PTY (AgentPane.prepare returns early for runtime "cloud"), and the
-  // dispatch layer writes through submitPrompt/writePty — a "target" here would accept the user's
-  // prompt and then strand it as pty-gone. Until dispatch routes through getTransport, the compose
-  // box stays Sparkle-only for a cloud tab; the terminal (which IS transport-backed) still works.
-  if (agent.runtime === "cloud") {
-    return { target: null, refusal: "Cloud agents take prompts in the terminal for now" };
-  }
+  // NO CLOUD REFUSAL HERE ANY MORE, and its removal is the point rather than a simplification.
+  // This used to return `{ target: null, refusal: "Cloud agents take prompts in the terminal for
+  // now" }`, which was true only because `dispatchConciergeAnswer` wrote exclusively through
+  // `submitPrompt`/`writePty` — so a cloud target would have accepted the user's prompt and then
+  // stranded it. The dispatcher now routes a cloud PROMPT through `getTransport({id, runtime})` to
+  // the sandbox's stdin (services/conciergeDispatch's cloud note), so the copy that told the user to
+  // use the terminal instead would now be advice to work around a feature that works. What a cloud
+  // agent still cannot take from here is an ANSWER to a prompt on its own screen; that refusal lives
+  // at the dispatcher, where the screen is actually read, and not in this resolver, which cannot see
+  // one (AGENTS.md: user-facing copy is code — a refusal string outlives the limit it described).
   return {
     target: { projectId: project.id, agentId: agent.id, name: agentDisplayName(agent) },
   };

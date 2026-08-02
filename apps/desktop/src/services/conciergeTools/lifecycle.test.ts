@@ -32,6 +32,21 @@ const terminateIfCloudMock = vi.fn(async () => {});
 vi.mock("../cloudAgents/terminate", () => ({
   terminateIfCloud: (...a: unknown[]) => terminateIfCloudMock(...(a as [])),
 }));
+// A cloud SPAWN is a real, billing start now (see lifecycle.cloudSpawn.test.ts, which owns that
+// path end to end). Here it is only ever exercised in its REFUSED form, so the API is stubbed to
+// fail loudly: if a change ever let one of these tests reach the network, the stub says so rather
+// than the suite quietly opening a sandbox.
+const startSessionMock = vi.fn(async () => {
+  throw new Error("no cloud session may be started from this suite");
+});
+vi.mock("../cloudAgents/api", () => ({
+  cloudApi: {
+    startSession: () => startSessionMock(),
+    listProjects: async () => [],
+    createProject: async (name: string) => ({ id: "cloud-p", name }),
+    getClaudeAuth: async () => null,
+  },
+}));
 const spinDownWorkerMock = vi.fn(async () => {});
 vi.mock("../workerSpawn", async (orig) => ({
   ...(await orig<typeof import("../workerSpawn")>()),
@@ -49,6 +64,8 @@ vi.mock("../buildAgentSpawn", async (orig) => {
   };
 });
 
+import { useAuthStore } from "../../stores/authStore";
+import { useCloudAuthStore } from "../../stores/cloudAuthStore";
 import { useProjectStore } from "../../stores/projectStore";
 import { useRuntimeStore } from "../../stores/runtimeStore";
 import { useSettingsStore } from "../../stores/settingsStore";
@@ -431,14 +448,27 @@ describe("spawnBuildAgent", () => {
     expect(useProjectStore.getState().projects[0]!.agents).toHaveLength(0);
   });
 
-  it("returns a typed 'not supported' for a CLOUD spawn rather than spending the user's money", async () => {
+  // The blanket "cloud-spawn-unsupported" refusal is gone — a cloud spawn now runs the dialog's own
+  // sequence (design 2026-08-01 §Decision 7). What survives from that test is the property it was
+  // really protecting: this op must never spend the user's money by accident. With no `prompt` there
+  // is no goal, and a cloud agent's goal cannot be sent after the start, so it refuses — and, more
+  // to the point, starts nothing. The full matrix lives in lifecycle.cloudSpawn.test.ts.
+  it("refuses a CLOUD spawn with no goal rather than spending the user's money", async () => {
     const pid = seedProject();
+    // Let the gate through, so the refusal under test is the GOAL one and not the account one —
+    // the gate runs first by design (its refusal is the one with a self-serve fix attached).
+    useAuthStore.setState({
+      tokenPresent: true,
+      me: { cloudAgentsEnabled: true, entitled: true, balanceCents: 5_000 },
+    } as never);
+    useCloudAuthStore.setState({ method: "byok", loaded: true } as never);
     const r = await spawnBuildAgent({ projectId: pid, runtime: "cloud" });
     expect(r.ok).toBe(false);
     if (r.ok) return;
     expect(r.op).toBe("spawn_cloud_build_agent");
-    expect(r.reason).toBe("cloud-spawn-unsupported");
+    expect(r.reason).toBe("cloud-goal-required");
     expect(r.risk).toBe("costs-money");
+    expect(startSessionMock).not.toHaveBeenCalled();
     expect(useProjectStore.getState().projects[0]!.agents).toHaveLength(0);
   });
 });

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { classifyStartError, parseStartError } from "./startError";
+import { classifyStartError, isTranscriptTooLarge, parseStartError } from "./startError";
 import { CloudApiError } from "./api";
 
 describe("parseStartError", () => {
@@ -184,5 +184,96 @@ describe("classifyStartError", () => {
     const g = classifyStartError({ status: 500, message: "x".repeat(500) });
     expect(g.reason).toBe("generic");
     expect(g.message).toBe("Couldn't start the cloud agent — try again.");
+  });
+
+  it("never renders a bare MACHINE CODE as the user's error line", () => {
+    // A route that answers `{ error: "<code>" }` and nothing else makes `ensureOk` fold that one
+    // token into BOTH code and message, and the generic branch's "prefer the server's message" rule
+    // would then print snake_case at the user. The live case: a 413 whose only body is
+    // `transcript_too_large`, shown to someone who sent no transcript (roborev 57566).
+    const g = classifyStartError(new CloudApiError(413, "transcript_too_large", "transcript_too_large"));
+    expect(g.message).not.toMatch(/transcript_too_large/);
+    expect(g.message).toBe("That request was too large for the cloud service.");
+
+    // The rule is about the code/message COLLISION, not about 413 — any such body gets the written
+    // sentence instead of the token.
+    const h = classifyStartError({ status: 500, code: "sandbox_boot_failed", message: "sandbox_boot_failed" });
+    expect(h.message).toBe("Couldn't start the cloud agent — try again.");
+    // Casing differences are still the same token.
+    expect(
+      classifyStartError({ status: 500, code: "boot_failed", message: "BOOT_FAILED" }).message,
+    ).toBe("Couldn't start the cloud agent — try again.");
+  });
+
+  it("still prefers a real PROSE message that merely accompanies a code", () => {
+    // The suppression must not swallow genuine server prose — that would undo the whole point of
+    // surfacing the server's own words on a generic failure.
+    const g = classifyStartError({ status: 500, code: "boot_failed", message: "the sandbox never booted" });
+    expect(g.message).toBe("the sandbox never booted");
+  });
+
+  it("gives a 413 its own line — 'try again' is wrong advice for a request that won't shrink", () => {
+    expect(classifyStartError({ status: 413 }).message).toBe(
+      "That request was too large for the cloud service.",
+    );
+    // Neutral about WHAT was too large: createCloudAgent sends no transcript, so naming the
+    // conversation here would be a guess — and telling a user their conversation was too big when
+    // none was sent is the exact defect this replaced.
+    expect(classifyStartError({ status: 413 }).message).not.toMatch(/conversation|transcript/i);
+  });
+});
+
+// ── the ONE trigger for the promotion transcript retry (bead sparkle-nit44) ─────────────────────
+//
+// This predicate is deliberately NOT a `StartErrorReason`: the only caller that can act on it is
+// `promote.ts`, which is the only caller that ever SENDS a transcript. `createCloudAgent` never
+// does, so a 413 there is an oversized something-else and must keep reading as `generic` rather
+// than telling a user their conversation was too big when no conversation was sent.
+describe("isTranscriptTooLarge", () => {
+  it("fires on the route's own signal: 413 { error: 'transcript_too_large' }", () => {
+    // What the desktop actually receives: `ensureOk` folds the body's `error` into `code`.
+    expect(isTranscriptTooLarge(new CloudApiError(413, "transcript_too_large", "transcript_too_large"))).toBe(
+      true,
+    );
+  });
+
+  it("fires on a BARE 413 with no code of ours — Fastify's bodyLimit, and any proxy in front of it", () => {
+    // The case that matters most, and the reason the trigger cannot be code-only: a body that dies
+    // at the transport/bodyLimit boundary carries FST_ERR_CTP_BODY_TOO_LARGE (or nothing at all
+    // from a proxy), never our code. A classifier keyed only on the code would go dark for exactly
+    // the largest transcripts.
+    expect(isTranscriptTooLarge(new CloudApiError(413, null, "Request failed (413)"))).toBe(true);
+    expect(isTranscriptTooLarge({ status: 413 })).toBe(true);
+    expect(isTranscriptTooLarge(new CloudApiError(413, "FST_ERR_CTP_BODY_TOO_LARGE", "too big"))).toBe(
+      true,
+    );
+    expect(isTranscriptTooLarge('{"status":413}')).toBe(true);
+  });
+
+  it("fires on the code even when the status is NOT 413 (either half suffices)", () => {
+    expect(isTranscriptTooLarge({ status: 400, code: "transcript_too_large" })).toBe(true);
+    expect(isTranscriptTooLarge({ code: "transcript_too_large" })).toBe(true);
+  });
+
+  it("does NOT fire on any other start failure", () => {
+    // Every other bucket the classifier knows about, plus the shapes that carry no status at all.
+    expect(isTranscriptTooLarge(new CloudApiError(402, "insufficient_credits", "broke"))).toBe(false);
+    expect(isTranscriptTooLarge(new CloudApiError(403, "cloud_agents_disabled", "off"))).toBe(false);
+    expect(isTranscriptTooLarge(new CloudApiError(401, null, "signed out"))).toBe(false);
+    expect(isTranscriptTooLarge(new CloudApiError(400, "bad_request", "bad_request"))).toBe(false);
+    expect(isTranscriptTooLarge(new CloudApiError(500, null, "sandbox provisioning failed"))).toBe(
+      false,
+    );
+    expect(isTranscriptTooLarge(new Error("Failed to fetch"))).toBe(false);
+    expect(isTranscriptTooLarge(undefined)).toBe(false);
+  });
+
+  it("does NOT fire on prose that merely MENTIONS the code (code-only match, like CODE_HINTS)", () => {
+    // Same split the rest of this module enforces: a free-text message never classifies. A 500 whose
+    // body quotes the code must not make the promotion silently drop the user's conversation.
+    expect(
+      isTranscriptTooLarge({ status: 500, message: "internal: transcript_too_large check threw" }),
+    ).toBe(false);
+    expect(isTranscriptTooLarge("transcript_too_large happened once")).toBe(false);
   });
 });

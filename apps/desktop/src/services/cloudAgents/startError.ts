@@ -150,7 +150,42 @@ export function classifyStartError(raw: unknown): StartGuidance {
             ? "offline"
             : "generic");
 
-  return guidanceFor(reason, e.message ?? undefined);
+  // A MACHINE CODE IS NOT USER COPY. When a route answers `{ error: "<code>" }` and nothing else,
+  // `ensureOk` folds that one string into BOTH `code` and `message` — so the generic branch's
+  // "surface the server's own message" rule would render a bare snake_case token as the user's
+  // error line. `413 { error: "transcript_too_large" }` is the live example: a user who sent no
+  // transcript at all would read "transcript_too_large" and be told their conversation was too big
+  // (roborev 57566). Dropping the override here sends those to the reason's own written sentence,
+  // which is what the `code`-shaped body was always classified into anyway.
+  const prose = e.message != null && e.message.toLowerCase() !== code ? e.message : undefined;
+  return guidanceFor(reason, prose, e.status);
+}
+
+/**
+ * True when a failed start is the server refusing the body for its SIZE — the one trigger for
+ * promotion's single transcript retry (plan contract A + D; bead `sparkle-nit44`).
+ *
+ * The trigger is **status 413 OR the code**, and it must accept either, because the two halves cover
+ * different failures and the code-only half misses the case that matters most:
+ *
+ *   • `code` — the route's own answer, `413 { error: "transcript_too_large" }`, which `ensureOk`
+ *     folds into `CloudApiError.code`. This is the deliberate, validated rejection.
+ *   • `status` alone — Fastify's `bodyLimit` aborts the request with `FST_ERR_CTP_BODY_TOO_LARGE`
+ *     (and a proxy in front of it may send a bare 413 with no JSON at all), so the LARGEST
+ *     transcripts — precisely the ones the retry exists for — never carry our code.
+ *
+ * Deliberately NOT a {@link StartErrorReason}: the only caller that can act on it is `promote.ts`,
+ * the only caller that ever sends a transcript. `createCloudAgent` sends none, so a 413 there is an
+ * oversized something-else and must keep classifying as `generic` rather than telling a user their
+ * conversation was too large when no conversation was sent.
+ *
+ * Matched against the machine `code` only, never free text — same rule as `CODE_HINTS`, and for the
+ * same reason: a 500 whose prose quotes the code must not make a promotion silently drop the user's
+ * conversation. Substring, so a namespaced code still fires.
+ */
+export function isTranscriptTooLarge(raw: unknown): boolean {
+  const e = parseStartError(raw);
+  return e.status === 413 || (e.code ?? "").toLowerCase().includes("transcript_too_large");
 }
 
 /**
@@ -167,7 +202,11 @@ export function startedUntrackedGuidance(): StartGuidance {
   };
 }
 
-function guidanceFor(reason: StartErrorReason, serverMessage?: string): StartGuidance {
+function guidanceFor(
+  reason: StartErrorReason,
+  serverMessage?: string,
+  status?: number | null,
+): StartGuidance {
   switch (reason) {
     case "feature_disabled":
       return { reason, message: "Cloud agents aren't available on your account yet." };
@@ -207,13 +246,19 @@ function guidanceFor(reason: StartErrorReason, serverMessage?: string): StartGui
       return startedUntrackedGuidance();
     case "generic":
     default:
-      // Surface the server's own message when it's short + safe; else a plain retry line.
+      // Surface the server's own message when it's short + safe; else a plain retry line. A 413
+      // gets its own line first: it is the one status whose bodies are routinely code-only (see the
+      // note in classifyStartError), and "try again" is actively wrong advice for a request that
+      // will be the same size next time. Kept deliberately neutral about WHAT was too large —
+      // `createCloudAgent` sends no transcript, so naming the conversation here would be a guess.
       return {
         reason: "generic",
         message:
           serverMessage && serverMessage.length > 0 && serverMessage.length <= 200
             ? serverMessage
-            : "Couldn't start the cloud agent — try again.",
+            : status === 413
+              ? "That request was too large for the cloud service."
+              : "Couldn't start the cloud agent — try again.",
       };
   }
 }

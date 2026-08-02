@@ -40,6 +40,7 @@ mod crash;
 mod config;
 mod connectivity;
 mod delivery;
+mod demotion;
 mod deps_bootstrap;
 mod dev_identity;
 mod dictation;
@@ -632,6 +633,10 @@ pub fn run() {
             promotion::promotion_commit_dirty,
             promotion::promotion_push_branch,
             promotion::promotion_read_transcript,
+            // Demotion's two halves. BOTH must be here: a missing registration fails at invoke
+            // time, mid-demotion, with a live sandbox billing — the worst place to find out.
+            demotion::demotion_land_branch,
+            demotion::demotion_write_transcript,
             worktree::markdown_changed_since,
             worktree::refresh_agent_branch,
             worktree::read_worker_result,

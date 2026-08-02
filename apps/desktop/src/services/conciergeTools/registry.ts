@@ -74,6 +74,7 @@
 // against Claude Code 2.1.220: a tool absent from the allowlist still executed). That makes the gate
 // below THE gate, not defence in depth. Everything here fails closed for that reason.
 import { z } from "zod";
+import type { CategoryId } from "../../stores/uiStore";
 
 import {
   DISCARD_CONFIRM_TOKEN,
@@ -451,8 +452,26 @@ function route<T>(
  *  becomes the code. A `needs-decision` refusal also carries a `preview`; the wire reply has no room
  *  for it, but the message already states what closing would risk, and `preview_close` returns the
  *  full preview as its own op. */
+/**
+ * A refusal that carries a SELF-SERVE FIX must carry it across this boundary.
+ *
+ * `LifecycleRefused.deepLink` names the Settings section that unblocks the user (the cloud gate's
+ * own, or the server's, forwarded unchanged), and `ConciergeToolReply`'s refusal arm has no slot for
+ * a structured one — so the route is folded into the sentence rather than dropped, exactly as
+ * `fromWorkflow` folds in its conflicted `files`. Without this the concierge relays "you don't have
+ * enough credits to start a cloud agent" and stops there, leaving the user to find Credits
+ * themselves: the dead end the creation dialog's button exists to remove, re-created on the tool
+ * path. The gate's own sentence stays VERBATIM and untouched; this is a second sentence after it.
+ */
+const SETTINGS_ROUTE: Partial<Record<CategoryId, string>> = {
+  credits: "You can add credits in Settings → Credits.",
+  cloudauth: "You can add it in Settings → Cloud auth.",
+};
+
 function fromLifecycle<T>(ctx: OpContext, r: LifecycleResult<T>): ConciergeToolReply {
-  return r.ok ? ok(ctx, r.data) : err(ctx, r.reason, r.message);
+  if (r.ok) return ok(ctx, r.data);
+  const route = r.deepLink ? SETTINGS_ROUTE[r.deepLink] : undefined;
+  return err(ctx, r.reason, route ? `${r.message} ${route}` : r.message);
 }
 
 /** review: same convention as board. The domain's own refusal codes (`roborev-daemon-down`,
@@ -649,10 +668,27 @@ const LIFECYCLE_ROUTES: Record<LifecycleOp, Handler> = {
       }),
     ),
   ),
-  // Routed rather than omitted so the model gets lifecycle's honest "this bills per minute and needs
-  // a goal up front" refusal instead of an `unknown-op` that reads like a bug.
+  // ══ `prompt` AND `name` ARE FORWARDED, AND `prompt` IS THE POINT ════════════════════════════════
+  // This route used to pass `{ projectId, runtime: "cloud" }` and nothing else, which was harmless
+  // only while the op was a guaranteed refusal — lifecycle threw the arguments away before reading
+  // them. It performs a real start now (design 2026-08-01 §Decision 7), and a cloud agent's GOAL is
+  // its `prompt`: the runner seeds Claude Code with it via stdin as the sandbox comes up, and there
+  // is no way to send it afterwards. Dropping it here would turn every call into lifecycle's
+  // `cloud-goal-required` refusal, however carefully the model had written the brief.
+  //
+  // `model`/`mode` are deliberately NOT forwarded: `POST /sessions/start` takes neither, so passing
+  // them would let a caller believe a choice was applied that nothing ever read. The schema still
+  // ACCEPTS them (it is shared with the local spawn) — lifecycle ignores them for a cloud start.
   spawn_cloud_build_agent: route(spawnArgs, async (a, ctx) =>
-    fromLifecycle(ctx, await spawnBuildAgent({ projectId: a.projectId, runtime: "cloud" })),
+    fromLifecycle(
+      ctx,
+      await spawnBuildAgent({
+        projectId: a.projectId,
+        runtime: "cloud",
+        prompt: a.prompt,
+        name: a.name,
+      }),
+    ),
   ),
   preview_close: route(agentOnly, (a, ctx) => fromLifecycle(ctx, previewClose(a.agentId))),
   preview_discard: route(agentOnly, (a, ctx) => fromLifecycle(ctx, previewDiscard(a.agentId))),

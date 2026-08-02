@@ -74,9 +74,13 @@ export const SANDBOX_REPO_CWD = "/home/user/repo";
  * the encoded size runs roughly 1.3–2× the raw size.
  *
  * Sized so that even the pessimistic factor fits: 3 MiB × 2 ≈ 6 MiB, leaving ~2 MB for the rest of
- * the start payload. At the old 4 MiB a long conversation could encode past 8 MB and 413 — and a
- * 413 is NOT the graceful transcript-less fallback, it fails the whole `start` step, so the users it
- * would hit are exactly the ones with the most conversation to lose.
+ * the start payload. At the old 4 MiB a long conversation could encode past 8 MB and 413.
+ *
+ * A 413 is now GRACEFUL — `promote.ts` re-issues the start exactly once with the transcript omitted
+ * (bead `sparkle-nit44`), so it costs the conversation rather than the whole promotion. That is a
+ * fallback, not a licence to raise this number: the margin is still what keeps the users with the
+ * most conversation from silently losing all of it, and raising it is a separate decision with its
+ * own measurement. Do not change this without changing `START_BODY_LIMIT_BYTES` with it.
  */
 export const TRANSCRIPT_ENCODE_EXPANSION = 2;
 export const DEFAULT_TRANSCRIPT_MAX_BYTES = 3 * 1024 * 1024;

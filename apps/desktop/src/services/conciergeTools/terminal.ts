@@ -804,8 +804,14 @@ function sendDetail(path: ConciergeSendPath, agentId: string): string {
       return "Not sent: the agent closed while the message was waiting.";
     case "agent-failed":
       return "Not sent: the agent gave up starting. It needs a Retry.";
+    // NARROWED with the dispatcher (design 2026-08-01 §Decision 7): a cloud agent DOES take a
+    // prompt now — it goes to the sandbox's stdin over the relay — so this path no longer means
+    // "there is no terminal to type into". It means the send was an ANSWER to something on the
+    // agent's own screen, which only its own pane can give.
     case "cloud-agent":
-      return "Not sent: that agent runs in the cloud and has no terminal to type into.";
+      return "Not sent: that agent runs in the cloud and is waiting on something on screen — that has to be answered in its own pane.";
+    case "cloud-offline":
+      return "Not sent: that agent runs in the cloud and there's no live connection to it right now.";
     case "unauthorized":
       return "Not sent: nothing authorized this write.";
     case "pty-gone":
@@ -856,9 +862,11 @@ function sendDetail(path: ConciergeSendPath, agentId: string): string {
  *    the same reasoning `agentCanAcceptInput` encodes, which is why the gate asks it rather than
  *    restating it.
  *
- * A CLOUD agent falls THROUGH to the dispatcher instead of being refused here, so the user gets the
- * existing honest `cloud-agent` refusal from the one place that owns it. There is no cloud input
- * path; this module does not invent one.
+ * A CLOUD agent falls THROUGH to the dispatcher instead of being refused here, and that is now what
+ * makes a cloud send WORK rather than what makes the refusal consistent: the dispatcher relays a
+ * prompt to the sandbox's stdin, and refuses only an answer to the agent's own on-screen prompt
+ * (design 2026-08-01 §Decision 7). Either way the verdict comes from the one place that owns it —
+ * this module still invents no cloud path of its own.
  */
 export async function sendToAgentTerminal(
   agentId: string,

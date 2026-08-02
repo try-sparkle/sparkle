@@ -13,6 +13,8 @@
 //   POST   /sessions/start  { project_id, goal, repo_url, base_branch?, name?, promotion? }
 //                                                                                → { session_id }
 //   GET    /sessions?project_id=…                                               → { sessions: [...] }
+//   POST   /sessions/:id/handoff                                                 → HandoffResult
+//   GET    /sessions/:id/head                                                    → { head_sha }
 //   GET    /claude-auth                                                          → { method } | null
 //   PUT    /claude-auth     { method, secret }                                   → 200
 //   DELETE /claude-auth                                                          → 200
@@ -44,6 +46,29 @@ export interface StartPromotion {
   /** The transferred Claude Code session. ABSENT ⇒ no conversation travels and the cloud agent
    *  starts from a handoff briefing instead (spec Decision 2). */
   transcript?: { sessionId: string; jsonl: string };
+}
+
+/**
+ * What `POST /sessions/:id/handoff` reports (plan W1.4). The DEMOTION mirror of {@link StartPromotion}:
+ * the sandbox commits whatever is dirty, pushes the session's own branch, and reads back a bounded
+ * tail of its Claude transcript.
+ *
+ * `pushedSha` is load-bearing beyond "what landed on origin": it is the BASELINE the desktop's cut
+ * guard compares the sandbox's HEAD against immediately before `DELETE /sessions/:id`
+ * (services/agentDemotion/demote.ts). A HEAD read taken any earlier would bake a commit made inside
+ * the copy window into the baseline and wave through exactly the loss the guard exists to catch —
+ * which is why the sha travels with the handoff rather than being re-derived by the caller.
+ */
+export interface SessionHandoff {
+  /** The branch the runner pushed — read from the SESSION ROW, never from the sandbox's HEAD. */
+  branch: string;
+  /** The sha now on `origin/<branch>`. Never empty (a handoff that cannot name it is a failure). */
+  pushedSha: string;
+  /** The sandbox's Claude conversation, whole JSONL records only. `null` when it did not travel —
+   *  which is NOT a failure (spec Decision 4): demotion proceeds and the local agent is briefed. */
+  transcript: { sessionId: string; jsonl: string; truncated: boolean; bytes: number } | null;
+  /** Why the transcript did not travel; `null` when it did. Reported, not hidden. */
+  transcriptError: string | null;
 }
 
 export interface StartSessionInput {
@@ -222,6 +247,92 @@ export function makeCloudApi(deps: CloudApiDeps = defaultDeps) {
           name: typeof s.name === "string" ? s.name : null,
           goal: typeof s.goal === "string" ? s.goal : null,
         }));
+    },
+
+    /**
+     * Prepare a running cloud session for DEMOTION: commit + push the session's branch, then read
+     * back a bounded tail of its Claude transcript (plan W1.4/W1.6).
+     *
+     * READ-BUT-MUTATING: it writes to the user's repository. It is therefore never speculative —
+     * only the demotion machine calls it, after the user has confirmed a dialog that says so.
+     *
+     * Throws {@link CloudApiError} on 409 `session_not_live` (a redeploy moved the session, or it
+     * already ended) and 502 `push_failed`. A transcript problem is NOT a throw: it comes back as
+     * `transcript: null` + `transcriptError`, because losing the conversation must not cost the
+     * user their work (spec Decision 4).
+     */
+    async sessionHandoff(sessionId: string): Promise<SessionHandoff> {
+      const res = await ensureOk(
+        await deps.fetch(url(`/sessions/${encodeURIComponent(sessionId)}/handoff`), {
+          method: "POST",
+          headers: await authHeaders(deps),
+        }),
+      );
+      const body = (await res.json()) as Record<string, unknown>;
+      const branch = body?.branch;
+      const pushedSha = body?.pushed_sha ?? body?.pushedSha;
+      // Both are REQUIRED. An empty/absent `pushed_sha` would flow straight into the cut guard as
+      // the baseline, where it can only ever compare unequal — turning a working demotion into a
+      // permanent "the sandbox moved" refusal that no retry clears. Fail here, where the message
+      // names the real problem, rather than there, where it names a fiction.
+      if (typeof branch !== "string" || branch.length === 0) {
+        throw new CloudApiError(502, "bad_response", "Handoff did not name the session's branch");
+      }
+      if (typeof pushedSha !== "string" || pushedSha.length === 0) {
+        throw new CloudApiError(502, "bad_response", "Handoff did not report a pushed commit");
+      }
+      const t = body?.transcript;
+      const rawTranscript = t && typeof t === "object" ? (t as Record<string, unknown>) : null;
+      const tSessionId = rawTranscript?.session_id ?? rawTranscript?.sessionId;
+      const tJsonl = rawTranscript?.jsonl;
+      // A transcript we cannot key by session id cannot be resumed, and one with no records is
+      // nothing to write — both are "it did not travel", which is a supported outcome, not an error.
+      const transcript =
+        typeof tSessionId === "string" &&
+        tSessionId.length > 0 &&
+        typeof tJsonl === "string" &&
+        tJsonl.length > 0
+          ? {
+              sessionId: tSessionId,
+              jsonl: tJsonl,
+              truncated: rawTranscript?.truncated === true,
+              bytes: typeof rawTranscript?.bytes === "number" ? rawTranscript.bytes : tJsonl.length,
+            }
+          : null;
+      const err = body?.transcript_error ?? body?.transcriptError;
+      return {
+        branch,
+        pushedSha,
+        transcript,
+        transcriptError:
+          typeof err === "string" && err.length > 0
+            ? err
+            : // The server said nothing, yet nothing usable arrived. Say so rather than reporting
+              // `transcriptError: null`, which the UI reads as "the conversation came across".
+              transcript === null
+              ? "the server returned no usable transcript"
+              : null,
+      };
+    },
+
+    /** The sandbox's CURRENT `git rev-parse HEAD` (plan W1.5). The cut guard's live reading —
+     *  compared against the handoff's `pushedSha`, never against an earlier head. */
+    async sessionHead(sessionId: string): Promise<string> {
+      const res = await ensureOk(
+        await deps.fetch(url(`/sessions/${encodeURIComponent(sessionId)}/head`), {
+          method: "GET",
+          headers: await authHeaders(deps),
+        }),
+      );
+      const body = (await res.json()) as Record<string, unknown>;
+      const head = body?.head_sha ?? body?.headSha;
+      // An unreadable head must REJECT, never resolve to "". An empty string compares unequal to the
+      // pushed sha and would read as "the sandbox moved" — a refusal that blames the user's agent
+      // for a response-parsing failure.
+      if (typeof head !== "string" || head.length === 0) {
+        throw new CloudApiError(502, "bad_response", "Server did not report the sandbox's HEAD");
+      }
+      return head;
     },
 
     /** Current Claude-auth method for the caller, or null when none is saved. The secret is NEVER

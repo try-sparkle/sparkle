@@ -27,6 +27,7 @@ import {
   FiCheckCircle,
   FiRepeat,
   FiTarget,
+  FiDownloadCloud,
   FiUploadCloud,
   FiClock,
   FiAlertOctagon,
@@ -65,6 +66,7 @@ import { spinDownWorker } from "../services/workerSpawn";
 import { terminateIfCloud } from "../services/cloudAgents/terminate";
 import { useCloudAgentsEnabled, useCloudGate } from "../hooks/useCloudAgents";
 import { PromoteToCloudDialog, promoteDialogDeps } from "./PromoteToCloudDialog";
+import { DemoteToLocalDialog, demoteDialogDeps } from "./DemoteToLocalDialog";
 import { killPty } from "../pty";
 import { refreshAgentBranch, landAgentBranch } from "../services/branchStatus";
 import type { BranchStatus } from "../services/branchStatus";
@@ -1373,6 +1375,18 @@ export function AgentSidebar({
           })
         : null,
     [project, promoteAgent, promoteGate, promoteWorkerCount],
+  );
+
+  // ── Bring down to local (demotion, plan §W4) ───────────────────────────────────────────────────
+  // The mirror of the block above, scoped to this column's project for the same reason. NOTHING
+  // here consults `useCloudGate`: a user whose credits ran out is exactly the user who needs to
+  // bring work down, and a gate that hides the exit is a trap.
+  const demoteAgentId = useUiStore((s) => s.demoteAgentId);
+  const closeDemoteToLocal = useUiStore((s) => s.closeDemoteToLocal);
+  const demoteAgent = project?.agents.find((a) => a.id === demoteAgentId) ?? null;
+  const demoteDeps = useMemo(
+    () => (project && demoteAgent ? demoteDialogDeps({ project, agent: demoteAgent }) : null),
+    [project, demoteAgent],
   );
 
   // Ship it: push + open a PR (review, not straight to main); local-land fallback when remoteless.
@@ -2787,6 +2801,17 @@ export function AgentSidebar({
         />
       )}
 
+      {/* "Bring down to local" — the demotion confirm surface (plan §W4). Mounted by the COLUMN for
+          the same reason its sibling above is: a half-made decision about shutting down a running
+          sandbox must not vanish when a memoized row unmounts underneath it. */}
+      {demoteAgent && demoteDeps && (
+        <DemoteToLocalDialog
+          agent={demoteAgent}
+          deps={demoteDeps}
+          onClose={closeDemoteToLocal}
+        />
+      )}
+
       {/* What that choice actually DID, when it wasn't what the button promised (roborev 54225):
           a ship that landed nowhere (agent kept), a push with no PR behind it, a save that never
           reached the remote. Same ModalShell chrome + zIndex as the prompt it replaces, so the
@@ -4009,6 +4034,8 @@ const AgentRow = memo(function AgentRow({
   // AND signed in — exactly what the creation flow gates its Cloud option on.
   const cloudOfferable = useCloudAgentsEnabled();
   const openPromoteToCloud = useUiStore((s) => s.openPromoteToCloud);
+  // The OTHER direction. Deliberately NOT gated on `cloudOfferable` (see the button below).
+  const openDemoteToLocal = useUiStore((s) => s.openDemoteToLocal);
   const sidebarScroll = useContext(SidebarScrollContext);
   // The two halves of the rendered card — measured to decide whether (and how far) to auto-scroll.
   const stripRef = useRef<HTMLDivElement>(null);
@@ -5094,6 +5121,45 @@ const AgentRow = memo(function AgentRow({
           >
             <FiUploadCloud size={12} />
             Move to cloud…
+          </button>
+        </div>
+      )}
+      {/* "BRING DOWN TO LOCAL" — demotion, the mirror of the item above (plan §W4).
+
+          TWO CONDITIONS, AND ONLY TWO:
+            • `runtime === "cloud"` — there is nothing to bring down from an agent already here;
+            • `kind === "build"` — a shell agent has no conversation and no branch (spec §Not in scope).
+
+          What is deliberately ABSENT from that list is the point. There is no `cloudOfferable`
+          check: a cloud tab cannot exist unless the feature was on when it was made, so re-asking
+          would only strand agents if the flag ever went off. And there is no `evaluateCloudGate`
+          check: a user whose credits ran out is exactly the user who needs to bring work down, and
+          a gate that hides the exit is a trap. */}
+      {a.runtime === "cloud" && a.kind === "build" && (
+        <div style={{ marginTop: 8 }}>
+          <button
+            type="button"
+            data-testid="demote-to-local"
+            onClick={(e) => {
+              e.stopPropagation(); // the card's own onClick re-selects the agent
+              openDemoteToLocal(a.id);
+            }}
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 6,
+              background: "transparent",
+              color: C.cream,
+              border: `1px solid ${C.muted}`,
+              borderRadius: RADIUS.sm,
+              padding: "4px 9px",
+              cursor: "pointer",
+              fontSize: 12,
+              fontFamily: FONT_UI,
+            }}
+          >
+            <FiDownloadCloud size={12} />
+            Bring down to local…
           </button>
         </div>
       )}
