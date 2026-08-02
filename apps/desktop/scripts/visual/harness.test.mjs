@@ -239,6 +239,7 @@ describe("surface registry", () => {
       "agent-sidebar",
       "concierge-column",
       "settings-dialog",
+      "open-pr-menu-narrow",
     ]);
     expect(THEMES).toEqual(["light", "dark"]);
   });
@@ -248,10 +249,30 @@ describe("surface registry", () => {
   // and this surface photographs the unwired app — which is exactly what it did for its whole life.
   it("asks the fixture for the second pair on the surface that needs it", () => {
     expect(surfaceByName("workspace-wired-left").query).toBe("pairs=2");
-    // …and no other surface opens a second pair, or every other baseline would move.
+    // …and NO OTHER SURFACE OPENS A SECOND PAIR, which is the invariant — a second pair re-lays-out
+    // the whole shell, so every other baseline would move.
+    //
+    // Asserted on the `pairs` PARAMETER, not on `query` being absent entirely, which is what this
+    // checked first. That was a fair proxy while `pairs` was the only parameter in existence and
+    // stopped being one the moment a second was added: `open-pr-menu-narrow` carries `prs` and
+    // `concierge`, neither of which opens a pair, and the proxy would have refused it. Guard the
+    // fact, not the shape it happened to have.
     for (const s of SURFACES.filter((x) => x.name !== "workspace-wired-left")) {
-      expect(s.query, `${s.name} must not change the fixture`).toBeUndefined();
+      const pairs = new URLSearchParams(s.query ?? "").get("pairs");
+      expect(pairs, `${s.name} must not open a second pair`).toBeNull();
     }
+  });
+
+  // A SURFACE'S PARAMETERS ARE ITS ONLY WAY TO REACH STATE THE FIXTURE MUST SEED BEFORE MOUNT, so
+  // a typo in one is silent: the app boots in its DEFAULT state and the capture is filed under a
+  // name claiming otherwise. That is the mislabelled-screenshot failure this harness has hit twice
+  // (the `data-wired` attribute, and the theme write that observed itself). Pin the two the PR-menu
+  // surface depends on — without `prs` there is no badge to click, and without `concierge` the
+  // column is at its comfortable 380px default, which is the width the bug is invisible at.
+  it("asks for the PRs and the narrow column the open-PR surface is about", () => {
+    const q = new URLSearchParams(surfaceByName("open-pr-menu-narrow").query);
+    expect(q.get("prs")).toBe("1");
+    expect(Number(q.get("concierge"))).toBeLessThan(380);
   });
 
   it("gives every surface app steps, and a mock half or an explicit null", () => {

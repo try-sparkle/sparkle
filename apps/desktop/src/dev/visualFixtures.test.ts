@@ -7,10 +7,13 @@ import { resolve } from "node:path";
 import { DEV_BYPASS_AUTH_FLAG } from "./devBypassAuth";
 import {
   FIXTURE_NOW,
+  FIXTURE_PRS,
   FIXTURE_PROJECT_ID,
   applyVisualFixtures,
   buildVisualFixture,
+  visualConciergeWidth,
   visualFixturesRequested,
+  visualPrsRequested,
 } from "./visualFixtures";
 import { PROJECTS_PERSIST_DEBOUNCE_MS, PROJECTS_PERSIST_KEY, debouncedProjectsStorage, flushProjectsPersist, useProjectStore } from "../stores/projectStore";
 import { RUNTIME_PERSIST_KEY, useRuntimeStore } from "../stores/runtimeStore";
@@ -341,5 +344,64 @@ describe("the pinned clock", () => {
     const m = src.match(/const FIXED = (\d+);/);
     expect(m, "FROZEN_CLOCK's `const FIXED = <epoch ms>;` line was not found").toBeTruthy();
     expect(Number(m![1])).toBe(FIXTURE_NOW);
+  });
+});
+
+// ── THE OPT-IN PARAMETERS THE OPEN-PR SURFACE NEEDS ───────────────────────────────────────────
+//
+// Both exist because a whole class of chrome bug is invisible at a comfortable width: the open-PR
+// menu shipped clipped to its column (bead sparkle-8g4qh) and no capture could have caught it,
+// since every surface photographs the concierge at its 380px default. Parsing is asserted here
+// rather than only in the browser because a parameter that silently fails to parse produces a
+// capture of the DEFAULT state filed under a name claiming otherwise — the mislabelled-screenshot
+// failure this harness has already hit twice.
+describe("the concierge-width parameter", () => {
+  it("reads a width the shell would accept", () => {
+    expect(visualConciergeWidth("?visual=1&concierge=190")).toBe(190);
+    expect(visualConciergeWidth("?visual=1&concierge=50")).toBe(50);
+    expect(visualConciergeWidth("?visual=1&concierge=1400")).toBe(1400);
+  });
+
+  it("is absent by default, so every existing surface keeps its baseline", () => {
+    expect(visualConciergeWidth("?visual=1")).toBeNull();
+    expect(visualConciergeWidth("")).toBeNull();
+  });
+
+  // FAILS CLOSED. A width the shell would refuse gets clamped away at render, so honouring it here
+  // would seed a value the capture cannot actually show — a picture of the default under another
+  // name. Null means "use the app's own default", which is at least true.
+  it("refuses anything the shell would clamp or cannot read", () => {
+    for (const bad of ["49", "1401", "0", "-200", "abc", "", "190.5", "1e3px"]) {
+      expect(visualConciergeWidth(`?visual=1&concierge=${bad}`), bad).toBeNull();
+    }
+  });
+});
+
+describe("the open-PR parameter", () => {
+  it("is opt-in — absent, the PR chip stays out of every other capture", () => {
+    expect(visualPrsRequested("?visual=1")).toBe(false);
+    expect(visualPrsRequested("?visual=1&prs=0")).toBe(false);
+    expect(visualPrsRequested("")).toBe(false);
+  });
+
+  it("accepts the same two spellings every other flag here does", () => {
+    expect(visualPrsRequested("?visual=1&prs=1")).toBe(true);
+    expect(visualPrsRequested("?visual=1&prs=true")).toBe(true);
+  });
+
+  // THE ROWS MUST EXERCISE WHAT TRUNCATES. A fixture of three short green PRs reproduces none of
+  // the four elisions the bug was reported as, so the capture would be green on a broken build.
+  it("seeds rows that would show the elisions the bug was reported as", () => {
+    // A red PR whose blocking reason is a multi-word string — this is the field that truncated to
+    // "1 c…", and the one the founder could not read before pressing Merge.
+    const red = FIXTURE_PRS.find((p) => p.checks === "failing");
+    expect(red, "no failing PR — the blocking-reason row is what this surface is for").toBeTruthy();
+    expect(red!.failingChecks!.length).toBeGreaterThan(1);
+    // More than one green, so the primary action reads "Merge all ready (N)" — the long form that
+    // was sliced to "Merge all re", not the short one.
+    expect(FIXTURE_PRS.filter((p) => p.checks === "passing").length).toBeGreaterThan(1);
+    // A subject and a branch long enough to have somewhere to truncate TO.
+    expect(Math.max(...FIXTURE_PRS.map((p) => p.title.length))).toBeGreaterThan(50);
+    expect(Math.max(...FIXTURE_PRS.map((p) => p.headRefName.length))).toBeGreaterThan(25);
   });
 });

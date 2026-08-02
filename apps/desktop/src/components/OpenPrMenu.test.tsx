@@ -16,7 +16,11 @@ import {
   OpenPrMenu,
   agentLinkForBranch,
   agentLinkForPr,
+  panelPlacement,
   prBadgeTitle,
+  PANEL_ANCHOR_GAP,
+  PANEL_EDGE_MARGIN,
+  PANEL_MAX_W,
   type PrAgentLink,
 } from "./OpenPrMenu";
 import type { PrRow } from "../services/openPrs";
@@ -736,18 +740,110 @@ describe("OpenPrMenu, compact", () => {
     expect(badge.textContent ?? "").not.toMatch(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}]/u);
   });
 
-  // CONTAINMENT. The concierge is a ~380px column that the user can dock to either side, so a panel
-  // hung off this badge's own edge would leave the window on one of them. Compact therefore takes
-  // its positioning from the header instead: the wrapper contributes none, and the panel spans.
-  it("anchors its panel to the header, spanning it, rather than to the badge", async () => {
+  // CONTAINMENT — and the panel is no longer contained by the COLUMN, which is the whole fix
+  // (bead sparkle-8g4qh). It used to span the concierge header (`left: 8; right: 8`), so every
+  // field in it was as narrow as a column: the primary button read "Merge all re" and the reason a
+  // PR was red read "1 c…". It is placed against the WINDOW now and is deliberately wider.
+  it("pins its panel in window coordinates, not to the header it used to span", async () => {
     stubList([PASS]);
     render(compact());
     await openMenu();
     const panel = await screen.findByTestId("open-pr-panel");
-    expect(panel.style.left).toBe("8px");
-    expect(panel.style.right).toBe("8px");
+    expect(panel.style.position).toBe("fixed");
+    // `left: 8px; right: 8px` was the OLD spanning anchor. A width and a left is the new pin — a
+    // `right` here at all would mean the panel is being stretched between two edges again.
+    expect(panel.style.right).toBe("");
+    expect(panel.style.width).not.toBe("");
     // The wrapper must NOT be the positioned ancestor, or the panel anchors to the badge after all.
     expect(screen.getByTestId("open-pr-menu").style.position).toBe("static");
+  });
+
+  // THE PORTAL IS LOAD-BEARING, not tidiness. `ConciergeColumn`'s root section is `position:
+  // relative; z-index: CONCIERGE_LIFT_Z` (3) — a stacking context — so a panel rendered inside it
+  // has its 41 capped at 3, and `ColumnPullTab`'s rail (4) and a floated Build column (25) paint
+  // straight over it. A panel that crosses columns and renders UNDER them is not fixed.
+  it("portals the panel out of its host so its layer means what it says", async () => {
+    stubList([PASS]);
+    render(compact());
+    await openMenu();
+    const panel = await screen.findByTestId("open-pr-panel");
+    const host = screen.getByTestId("open-pr-menu");
+    expect(host.contains(panel)).toBe(false);
+    expect(panel.parentElement).toBe(document.body);
+  });
+
+  // …and the WIDE form must NOT be portaled: it is positioned off its own wrapper, so moving it to
+  // the body would strand it at the top-left corner. The two forms differ here and only here.
+  it("leaves the wide form where it is", async () => {
+    stubList([PASS]);
+    render(<OpenPrMenu rootPath="/repo" projectId="p1" resolveAgent={noAgent} onOpenAgent={noop} />);
+    await openMenu();
+    const panel = await screen.findByTestId("open-pr-panel");
+    expect(screen.getByTestId("open-pr-menu").contains(panel)).toBe(true);
+  });
+
+  // THE CHICLET. The founder asked for the count "in a little chiclet which is not right now — it
+  // used to be": in v0.74.0 it was green but bare, which reads as loose text next to the needs-you
+  // chip rather than as a control. It takes `.pill`'s box, shared with that chip.
+  it("draws the green count as a chiclet, and drops the edge when nothing is green", async () => {
+    stubList([PASS, PR_944]);
+    const { unmount } = render(compact());
+    const green = await screen.findByTestId("open-pr-badge");
+    expect(green.textContent).toBe("1");
+    // A real edge, and `.pill`'s squared 3px box rather than the old 6px chip.
+    expect(green.style.border).not.toBe("");
+    expect(green.style.border).not.toMatch(/transparent/);
+    expect(green.style.borderRadius).toBe("3px");
+    expect(green.style.height).toBe("19px");
+    unmount();
+
+    // CALM STAYS CALM. A chiclet drawn around "nothing to merge" is a box asking to be looked at,
+    // and this header's standing rule is that the calm state says nothing beside the wordmark. The
+    // border goes TRANSPARENT rather than away, so the row does not shift when a PR goes green.
+    stubList([PR_944]);
+    render(compact());
+    const quiet = await screen.findByTestId("open-pr-badge");
+    expect(quiet.textContent).toBe("");
+    expect(quiet.style.border).toMatch(/transparent/);
+    expect(quiet.style.borderRadius).toBe("3px");
+  });
+
+  // ── THE HARD CONSTRAINT: THE PRIMARY ACTION NEVER TRUNCATES ─────────────────────────────────
+  // `whiteSpace: nowrap` — which these buttons already had — stops the text WRAPPING and does
+  // nothing whatever to stop the BOX being shrunk under it and the text clipped. A flex item's
+  // default `flex-shrink` is 1, and the count label beside them could not shrink below its
+  // min-content width without `minWidth: 0`, so the browser took the space out of the BUTTONS.
+  // That is precisely how the founder was shown a primary action reading "Merge all re".
+  it("makes the buttons unshrinkable and the count label the thing that yields", async () => {
+    stubList([PASS, FAILING]);
+    render(compact());
+    await openMenu();
+    for (const id of ["merge-all", "pr-refresh"]) {
+      expect(screen.getByTestId(id).style.flex, `${id} must not shrink`).toBe("0 0 auto");
+    }
+    const label = screen.getByTestId("pr-count-label");
+    expect(label.style.minWidth).toBe("0");
+    expect(label.style.textOverflow).toBe("ellipsis");
+  });
+
+  // …AND NEITHER DOES THE REASON A PR IS RED. This menu exists to answer "what can I merge, and why
+  // not the rest"; being asked to press "Merge anyway" on a PR whose failure you cannot read is the
+  // actual damage in the bug report. The line used to be one text node with one ellipsis, which
+  // elides left-to-right — and the state label comes FIRST, so a narrow panel gave "1 c…" and
+  // neither fact. The branch is what yields now.
+  it("pins the blocking reason and lets the BRANCH be the thing that elides", async () => {
+    stubList([PASS, FAILING]);
+    render(compact());
+    await openMenu();
+    const reason = await screen.findByTestId(`pr-state-${FAILING.number}`);
+    expect(reason.textContent).toMatch(/checks failing/i);
+    expect(reason.style.flex).toBe("0 0 auto");
+    // No ellipsis on the reason at all — it is pinned, not merely preferred.
+    expect(reason.style.textOverflow).toBe("");
+    const branch = screen.getByTestId(`pr-branch-${FAILING.number}`);
+    expect(branch.textContent).toBe(FAILING.headRefName);
+    expect(branch.style.textOverflow).toBe("ellipsis");
+    expect(branch.style.minWidth).toBe("0");
   });
 
   it("keeps the wide pill and its own containment clamps when NOT compact", async () => {
@@ -1215,5 +1311,91 @@ describe("OpenPrMenu — switching away and BACK is not the same as switching aw
     await waitFor(() =>
       expect((screen.getByTestId("pr-refresh") as HTMLButtonElement).disabled).toBe(false),
     );
+  });
+});
+
+// ── THE COMPACT PANEL'S PLACEMENT, AS ARITHMETIC ──────────────────────────────────────────────
+//
+// jsdom computes no layout, so a CSS `min()`/`calc()` clamp can only ever be asserted as a STRING
+// there — the wide form's clamps are pinned that way above, and that is the best available for
+// them. The compact panel's containment is real arithmetic instead, so it can be asserted as the
+// thing it actually claims: the box lands inside the window, at both extremes, at every width.
+//
+// The geometry below is the real shell's: a ~380px concierge column that the user can dock to
+// EITHER side, and (bead sparkle-t3tr, Per Column Zoom) can squeeze to a 50px floor.
+describe("panelPlacement — the one clamping rule", () => {
+  const HEADER_BOTTOM = 44;
+  /** A badge sitting `inset` px in from the column's right edge. */
+  const badgeAt = (right: number) => ({ right, bottom: HEADER_BOTTOM });
+
+  it("hangs off the badge and floats LEFT across the neighbouring columns when docked right", () => {
+    const vw = 1440;
+    const column = { left: 1060, right: 1440 };
+    const p = panelPlacement(badgeAt(column.right - 20), { width: vw });
+    expect(p.width).toBe(PANEL_MAX_W);
+    // The right edge meets the badge; the left edge is well INSIDE the column's left edge, i.e.
+    // the panel is over the columns beside the concierge. That overhang IS the fix.
+    expect(p.left + p.width).toBe(column.right - 20);
+    expect(p.left).toBeLessThan(column.left);
+    expect(p.width).toBeGreaterThan(column.right - column.left);
+  });
+
+  it("floats RIGHT instead when the concierge is docked left — same formula, no branch", () => {
+    const vw = 1440;
+    const column = { left: 0, right: 380 };
+    const p = panelPlacement(badgeAt(column.right - 20), { width: vw });
+    // Right-hanging would put the left edge at -280. The clamp catches it at the margin and the
+    // panel spills the other way instead, across the columns to the RIGHT of the concierge.
+    expect(p.left).toBe(PANEL_EDGE_MARGIN);
+    expect(p.left + p.width).toBeGreaterThan(column.right);
+    expect(p.left + p.width).toBeLessThanOrEqual(vw - PANEL_EDGE_MARGIN);
+  });
+
+  it("survives the 50px column floor at BOTH docks — the menu outgrows its column, on purpose", () => {
+    const vw = 1440;
+    // Docked right, squeezed to 50px: the column is [1390, 1440].
+    const right = panelPlacement(badgeAt(1420), { width: vw });
+    expect(right.width).toBe(PANEL_MAX_W);
+    expect(right.left).toBeGreaterThanOrEqual(PANEL_EDGE_MARGIN);
+    expect(right.left + right.width).toBeLessThanOrEqual(vw - PANEL_EDGE_MARGIN);
+    // Docked left, squeezed to 50px: the badge is at x≈30 and right-hanging is far off-screen.
+    const left = panelPlacement(badgeAt(30), { width: vw });
+    expect(left.left).toBe(PANEL_EDGE_MARGIN);
+    expect(left.left + left.width).toBeLessThanOrEqual(vw - PANEL_EDGE_MARGIN);
+    // Neither one shrank WITH the column. A menu the width of a 50px column is the reported bug.
+    expect(right.width).toBe(left.width);
+    expect(left.width).toBeGreaterThan(50);
+  });
+
+  it("shrinks to the window when the window is narrower than the panel wants to be", () => {
+    // Below the app's enforced 900px floor, i.e. the backstop rather than a reachable state.
+    const vw = 400;
+    const p = panelPlacement(badgeAt(vw - 20), { width: vw });
+    expect(p.width).toBe(vw - PANEL_EDGE_MARGIN * 2);
+    expect(p.left).toBe(PANEL_EDGE_MARGIN);
+  });
+
+  // THE INVARIANT, swept rather than sampled: whatever the window and wherever the badge, the box
+  // is inside the window. This is the assertion that fails if either clamp is deleted or inverted.
+  it("never leaves the window, at any viewport width or anchor position", () => {
+    for (const vw of [320, 640, 900, 1024, 1280, 1440, 1920, 3440]) {
+      // Anchors from off the left edge to past the right edge, including both extremes.
+      for (let right = -50; right <= vw + 50; right += 37) {
+        const p = panelPlacement(badgeAt(right), { width: vw });
+        expect(p.width, `width @ vw=${vw} right=${right}`).toBeGreaterThanOrEqual(0);
+        expect(p.width, `width @ vw=${vw} right=${right}`).toBeLessThanOrEqual(vw);
+        expect(p.left, `left @ vw=${vw} right=${right}`).toBeGreaterThanOrEqual(PANEL_EDGE_MARGIN);
+        expect(
+          p.left + p.width,
+          `right edge @ vw=${vw} right=${right}`,
+        ).toBeLessThanOrEqual(vw - PANEL_EDGE_MARGIN);
+      }
+    }
+  });
+
+  it("drops below the badge rather than over it", () => {
+    const p = panelPlacement(badgeAt(1000), { width: 1440 });
+    expect(p.top).toBe(HEADER_BOTTOM + PANEL_ANCHOR_GAP);
+    expect(p.top).toBeGreaterThan(HEADER_BOTTOM);
   });
 });

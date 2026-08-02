@@ -90,6 +90,95 @@ export function visualPairCount(search: string): 1 | 2 {
   return new URLSearchParams(search).get(VISUAL_PAIRS_PARAM) === "2" ? 2 : 1;
 }
 
+/** The query parameter that narrows the concierge column: `?concierge=<px>`. */
+export const VISUAL_CONCIERGE_WIDTH_PARAM = "concierge";
+
+/**
+ * The concierge width a capture asks for, or null for the app's own default.
+ *
+ * OPT-IN for the reason every parameter here is (see {@link visualPairCount}): the width is the
+ * layout's biggest lever, so seeding one unconditionally would re-lay-out and invalidate every
+ * existing surface's baseline.
+ *
+ * WHY A CAPTURE WOULD WANT THIS AT ALL — a whole class of chrome bug is INVISIBLE at a comfortable
+ * width and only appears when a column is squeezed. The open-PR menu shipped clipped to its column
+ * (bead sparkle-8g4qh) and no capture could have caught it, because every surface photographs the
+ * concierge at its 380px default where the panel still looks fine.
+ *
+ * Bounds are the app's own (`COLUMN_MIN_WIDTH` … 1400): a value the shell would refuse is not a
+ * state worth photographing, and returning it would produce a capture of the DEFAULT width under a
+ * filename claiming otherwise — the mislabelled-screenshot failure this harness has hit before.
+ */
+export function visualConciergeWidth(search: string): number | null {
+  const raw = new URLSearchParams(search).get(VISUAL_CONCIERGE_WIDTH_PARAM);
+  if (raw === null) return null;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n)) return null;
+  return n >= 50 && n <= 1400 ? n : null;
+}
+
+/** The query parameter that seeds open pull requests: `?prs=1`. */
+export const VISUAL_PRS_PARAM = "prs";
+
+/** Whether this capture wants the PR chip populated. Opt-in — see {@link FIXTURE_PRS}. */
+export function visualPrsRequested(search: string): boolean {
+  const v = new URLSearchParams(search).get(VISUAL_PRS_PARAM);
+  return v === "1" || v === "true";
+}
+
+/**
+ * The rows `project_open_prs` answers with under `?prs=1`.
+ *
+ * CHOSEN TO EXERCISE THE THINGS THAT TRUNCATE, not to look tidy. The bug this exists to photograph
+ * was reported as four separate elisions, and a fixture of three short green PRs would reproduce
+ * none of them. So: a long real-world subject, a long branch name, a red PR whose blocking reason
+ * is a multi-word string ("3 checks failing"), and enough green rows that the primary action reads
+ * "Merge all ready (2)" rather than a narrow "Merge all ready".
+ *
+ * `mergeStateStatus: "blocked"` on the failing row keeps it out of the two-step override path, so
+ * the row renders the disabled Merge rather than an armed "Merge anyway?" — deterministic either
+ * way, but the disabled form is the one the founder screenshotted.
+ */
+export const FIXTURE_PRS = [
+  {
+    number: 1095,
+    title: "feat(concierge): give the header its own quiet state and keep goals visible",
+    headRefName: "sparkle/header-quiet-and-goals-visible",
+    url: "https://github.com/o/r/pull/1095",
+    checks: "passing",
+    mergeable: "mergeable",
+  },
+  {
+    number: 1088,
+    title: "fix(pr-menu): stop clipping the merge panel to the concierge column",
+    headRefName: "sparkle/pr-menu-spans-the-window",
+    url: "https://github.com/o/r/pull/1088",
+    checks: "failing",
+    mergeable: "mergeable",
+    mergeStateStatus: "blocked",
+    failingChecks: ["CI / test (node)", "CI / typecheck", "secret-scan"],
+    pendingChecks: [],
+  },
+  {
+    number: 1072,
+    title: "chore(ci): gate the shell-syntax check on the changed files only",
+    headRefName: "sparkle/shell-syntax-gate",
+    url: "https://github.com/o/r/pull/1072",
+    checks: "pending",
+    mergeable: "mergeable",
+    failingChecks: [],
+    pendingChecks: ["CI / build (macos)"],
+  },
+  {
+    number: 1070,
+    title: "fix(voice): plumb the push-to-talk held state through to the tray",
+    headRefName: "sparkle/voice-fill-and-kbd",
+    url: "https://github.com/o/r/pull/1070",
+    checks: "passing",
+    mergeable: "mergeable",
+  },
+] as const;
+
 /** One agent row's worth of fixture, flattened so the table below reads as a spec. */
 interface Row {
   id: string;
@@ -420,6 +509,9 @@ export function detachPersistence(): void {
   }
 }
 
+/** The shim's own signature, so wrapping it below stays typed rather than casting to `any`. */
+type InvokeFn = (cmd: string, args?: unknown) => Promise<unknown>;
+
 export function applyVisualFixtures(
   search: string = window.location.search,
   // Injectable for the same reason devBypassAuthEnabled's is: a test must be able to exercise the
@@ -479,6 +571,49 @@ export function applyVisualFixtures(
   // with no reachable probe endpoint always shows it. The mock has no such banner, so leaving it
   // in would score as a layout-wide diff on every surface. Forced online.
   useConnectionStore.setState({ isOnline: true, browserOnline: true, probeOk: true });
+
+  // ── A NARROWED CONCIERGE, FOR THE SURFACES THAT NEED ONE ────────────────────────────────────
+  //
+  // Written to LOCALSTORAGE rather than to a store, because that is where `Workspace` reads it:
+  // `conciergeWidths` is a `useState` initialiser over `sparkle-concierge-width`, and an initialiser
+  // runs ONCE at first render. This file is called from main.tsx before `createRoot`, so the value
+  // is in place in time — a store write after mount would be re-clobbered by nothing, but would
+  // also never be read, since nothing re-runs that initialiser.
+  //
+  // Deliberately NOT routed through `detachPersistence`: that turns off the zustand stores' own
+  // persistence so the fixture cannot overwrite a developer's real profile, and this key is not a
+  // zustand-persisted one. It IS a developer's real key, so it is only ever touched when a width
+  // was explicitly asked for, and the capture harness always launches with a fresh user-data-dir.
+  const conciergeWidth = visualConciergeWidth(search);
+  if (conciergeWidth !== null && typeof localStorage !== "undefined") {
+    localStorage.setItem("sparkle-concierge-width", String(conciergeWidth));
+    localStorage.setItem("sparkle-concierge-width:2", String(conciergeWidth));
+  }
+
+  // ── OPEN PULL REQUESTS, ANSWERED AT THE IPC BOUNDARY ────────────────────────────────────────
+  //
+  // The ONE fixture here that cannot be a store write. `OpenPrMenu` has no store — it calls
+  // `invoke("project_open_prs")` on mount and on a 3-minute poll — so seeding it means answering
+  // the command. The transport shim (scripts/visual/serve.mjs) resolves every unknown command to
+  // null, which is why the PR chip is absent from every existing capture.
+  //
+  // WRAPPING the shim rather than editing it keeps the opt-in property: the shim is installed for
+  // every page, so an answer added there would put a PR chip in the concierge header of EVERY
+  // surface and invalidate all of their baselines. This is behind `?prs=1` like the rest.
+  //
+  // It also stays inside this file's gates (DEV build AND auth-bypass AND `?visual=1`), which the
+  // shim is not, so it cannot exist in a shipped app.
+  if (visualPrsRequested(search) && typeof window !== "undefined") {
+    const internals = (window as unknown as { __TAURI_INTERNALS__?: { invoke?: InvokeFn } })
+      .__TAURI_INTERNALS__;
+    const inner = internals?.invoke;
+    if (internals && inner) {
+      internals.invoke = (cmd: string, args?: unknown) =>
+        cmd === "project_open_prs"
+          ? Promise.resolve(FIXTURE_PRS as unknown)
+          : inner(cmd, args);
+    }
+  }
 
   // ── A HANDLE ON THE CABLE, FOR THE CAPTURE HARNESS ──────────────────────────────────────────
   //

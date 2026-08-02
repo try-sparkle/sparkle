@@ -127,6 +127,41 @@ export const SURFACES = [
     // than silently scoring it against something it isn't.
     mock: null,
   },
+  {
+    // THE OPEN-PR MENU AT A HOSTILE WIDTH — the state the bug was reported in (bead sparkle-8g4qh)
+    // and the one no existing surface could photograph.
+    //
+    // BOTH query parameters are the point. `prs=1` populates the chip at all: `OpenPrMenu` reads
+    // `invoke("project_open_prs")`, the transport shim answers null, and a menu with no PRs renders
+    // no badge — so without it this surface is a picture of an empty header. `concierge=190` then
+    // squeezes the column to half its default, which is what the founder was looking at.
+    //
+    // 190px, not the 50px floor: at 50 the column is a sliver with no visible header content to
+    // anchor the eye, and the shot stops being readable as evidence. Half the default is a width a
+    // user really works at, and the panel is 640px — so the picture answers "does the menu escape
+    // its column" at a glance. The floor itself is covered by arithmetic instead, in
+    // `panelPlacement`'s unit tests, which is the right tool for an extreme.
+    name: "open-pr-menu-narrow",
+    query: "prs=1&concierge=190",
+    description: "The open-PR merge menu, opened over a HALF-WIDTH concierge column.",
+    app: {
+      steps: [
+        { waitFor: "[data-testid=workspace-shell]" },
+        { cable: "off" },
+        { waitFor: "[data-testid=open-pr-badge]" },
+        { click: "[data-testid=open-pr-badge]" },
+        { waitFor: "[data-testid=open-pr-panel]" },
+      ],
+      // FULL VIEWPORT, deliberately, and it is the only honest clip for this surface. Clipping to
+      // the panel would crop away the very thing under test — where the panel sits RELATIVE to the
+      // column that spawned it. A shot of the panel alone looks identical whether it is contained
+      // or overflowing.
+      clip: null,
+    },
+    // rev4 predates this menu; there is nothing to score it against. Explicitly null so compare.mjs
+    // says "no reference" instead of quietly matching it to an unrelated mock.
+    mock: null,
+  },
 ];
 
 export const THEMES = ["light", "dark"];

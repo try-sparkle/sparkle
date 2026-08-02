@@ -15,7 +15,7 @@
 import { useMemo } from "react";
 import { CONCIERGE_COLUMN_DND_TARGET } from "../../services/dndTargets";
 import { BLUEPRINT } from "../../theme/blueprintSpec";
-import { C, FONT_WEIGHT } from "../../theme/colors";
+import { C } from "../../theme/colors";
 import { useResolvedTheme } from "../../theme/theme";
 import { bandColor } from "../../engine/statusBandLabels";
 import { BalanceBadge } from "../BalanceBadge";
@@ -35,6 +35,7 @@ import { MountedNotice } from "./MountedNotice";
 import { ConciergeTopRight } from "./KebabMenu";
 import { AgentPillProvider, type AgentPillContextValue } from "./AgentPill";
 import { KeyPill } from "./KeyPill";
+import { pillStyle } from "./pillStyle";
 import { wordmarkRamp } from "./wordmarkRamp";
 import type { ConciergeAnnouncement, ConciergeColumnProps } from "./types";
 import { FONT_UI, TYPE } from "../../theme/scale";
@@ -71,25 +72,8 @@ export const CONCIERGE_LIFT_Z = 3;
  *  reworded. See its render site for why it is gated and not merely styled. */
 export const CONCIERGE_UNMOUNT_HINT_TESTID = "concierge-unmount-hint";
 
-/** rev4's `.pill`: a squared 19px chip, not a capsule. The direction draws boxes. */
-const pillStyle = (edge: string) =>
-  ({
-    display: "inline-flex",
-    alignItems: "center",
-    gap: 4,
-    flex: "0 0 auto",
-    height: 19,
-    padding: "0 6px",
-    borderRadius: 3,
-    border: `1px solid ${edge}`,
-    background: "transparent",
-    font: "inherit",
-    fontSize: 10,
-    fontWeight: FONT_WEIGHT.bold,
-    lineHeight: 1,
-    color: C.conciergeMuted,
-    cursor: "pointer",
-  }) as const;
+// rev4's `.pill` MOVED to ./pillStyle — the PR badge one slot over needs the same box, and the
+// founder asked for it as a chiclet matching this one rather than as a second chip shape.
 
 /**
  * THE 8-DOT DRAG GRIP — `.grip` in MAPPING.md, 4×2 dots.
@@ -340,10 +324,17 @@ export function ConciergeColumn({
           gap: 7,
           height: HEADER_H,
           flex: "0 0 auto",
-          // The containing block for anything a header slot drops BELOW the row — today the PR
-          // menu's panel. It anchors to the header rather than to the chip so it can span the
-          // column's full width: the concierge is ~380px and docks to either side, so a panel
-          // anchored to a chip near the right edge would hang off the window on one of them.
+          // The containing block for anything a header slot drops BELOW the row.
+          //
+          // THE PR MENU'S PANEL IS NO LONGER SUCH A THING, and this says so rather than leaving the
+          // claim to rot. It used to anchor here and span the header (`left: 8; right: 8`), which
+          // is what made every field in it — the Merge button, the branch, the reason a PR is red —
+          // narrower than the column. It portals to the root layer and clamps to the WINDOW now
+          // (see `panelPlacement` in ../OpenPrMenu.tsx), so it neither reads this box nor is
+          // contained by it. Two consequences worth stating: this `position: relative` is kept for
+          // any FUTURE slot rather than because something needs it today, and the column's own
+          // `zIndex: CONCIERGE_LIFT_Z` stacking context no longer caps that panel's layer — which
+          // it silently did, at 3, for as long as the panel lived in here.
           position: "relative",
           // Asymmetric, per the mock: the right edge keeps clearance so the kebab never sits under
           // the column's pull tab.
