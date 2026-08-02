@@ -22,11 +22,15 @@
 // with four separate JS wrappers. EVERY one of them calls `noteAiServiceFailure(err)` — recording at
 // each wrapper is what makes the banner truthful for whichever feature fails first.
 //
-// SUCCESS is asymmetric. Only `chatOnce` reports it, because the other three run `cacheable: true`
-// and claude_oneshot serves a cache hit without touching the CLI — a success from one would prove
-// nothing and would zero the run this store exists to accumulate. That leaves recovery under-fed,
-// which is why SERVICE_DEGRADED_MAX_AGE_MS exists; the durable fix is to make the cache hit
-// observable so those three can report a success on a real spawn.
+// SUCCESS is asymmetric in WHERE IT COMES FROM, not in who benefits. `chatOnce` reports its own,
+// because it is `cacheable: false` and every reply is a real spawn. The other three run
+// `cacheable: true`, and claude_oneshot serves a cache hit without touching the CLI — a success
+// reported from one would prove nothing and would zero the run this store exists to accumulate, so
+// their wrappers still report failures only. Their recovery arrives out of band instead: Rust knows
+// whether it spawned (`claude_oneshot::OneShotReply.spawned`), emits `ai://spawn-ok` only for a
+// real child, and `services/aiServiceHealthListener.ts` turns that into one noteSuccess(). That is
+// the durable fix this comment used to describe as future work; SERVICE_DEGRADED_MAX_AGE_MS is no
+// longer the only way back from a cache-only session.
 //
 // WHAT IT DELIBERATELY DOES NOT COUNT, so a user is never double-warned or mislabelled:
 //   • `insufficient_credits*` (the USER's $0 balance → ZeroCreditBanner) and `ai_unconfigured*` (the
@@ -61,19 +65,22 @@ export const AI_SERVICE_DEGRADED_THRESHOLD = 4;
  * How long a degradation may be asserted without fresh evidence.
  *
  * Mirrors `aiProviderStore.OUTAGE_MAX_AGE_MS`, and this store needs it for a reason that store does
- * not: RECOVERY IS UNDER-REPORTED. See the table on {@link AiServiceHealth} for the full set of
+ * not: RECOVERY IS REPORTED NARROWLY. See the table on {@link AiServiceHealth} for the full set of
  * things that clear `degraded` — do not restate it here. The one that matters for THIS constant is
- * the success, because it is the only clearer a healthy CLI produces on its own, and after the
- * Claude Code migration only the UNCACHED `chatOnce` may report one: judge, naming and attention all
- * run `cacheable: true`, and a cache hit never touches the CLI, so reporting healthy from one would
- * mask a wedged CLI (see anthropic.ts's contract block).
+ * the success, because it is the only clearer a healthy CLI produces on its own.
  *
- * `chatOnce` has exactly one caller — the learned-suggestions tier — which a user can switch off.
- * Without an expiry, that user could drive the banner up through naming/judge/attention, fix their
- * CLI, and be left waiting on a recovery signal that never comes: the one wrapper allowed to report
- * success is never called in that configuration. (The other clearers still exist — a `yield` and the
- * run-gap fold — but neither is something a user can produce by fixing their CLI, which is the case
- * this expiry is for.)
+ * THE HOLE THIS WAS ADDED FOR IS NOW CLOSED, and the constant is kept anyway. Originally only the
+ * UNCACHED `chatOnce` could report a success — judge, naming and attention all run
+ * `cacheable: true`, and a cache hit never touches the CLI, so reporting healthy from one would
+ * mask a wedged CLI. `chatOnce` has exactly one caller (the learned-suggestions tier) which a user
+ * can switch off, so that user could drive the banner up through naming/judge/attention, fix their
+ * CLI, and be left waiting on a recovery signal that never came. Those three now DO report
+ * recovery, on a real spawn only, via `ai://spawn-ok` and `services/aiServiceHealthListener.ts`.
+ *
+ * So this is no longer the last line of defence — but it is still the bound on a claim asserted
+ * without fresh evidence, which is a different job and one nothing else does. Keep it: an app that
+ * never calls the CLI again (every AI feature off, no agents running) still produces no success of
+ * any kind, and a banner must not outlive its evidence just because the machine went quiet.
  *
  * THIS expiry bounds the CLAIM only — the banner stops being displayed. The DISMISSAL is bounded by
  * {@link RUN_MAX_GAP_MS} (or a success, or a `yield`) instead, and that split is deliberate: clearing the

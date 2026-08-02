@@ -314,6 +314,9 @@ fn interpret_reply(text: &str) -> Result<AgentName, String> {
 /// silently keep the existing name.
 #[tauri::command]
 pub async fn generate_agent_name(
+    // INJECTED BY TAURI — the JS call signature is unchanged. It carries the health signal for a
+    // real spawn back to `aiServiceHealthStore`; see `claude_oneshot::AI_SPAWN_OK_EVENT`.
+    app: tauri::AppHandle,
     prompt: String,
     // Display name of the project this agent belongs to. Diagnostic only now — it used to attribute
     // a credit debit, and there is no longer a debit to attribute.
@@ -328,9 +331,11 @@ pub async fn generate_agent_name(
     // runtime's worker threads, exactly as the proxy call it replaced did. The Sparkle bearer read
     // and its "not signed in" precondition are gone: naming runs on the user's own Claude Code
     // login, so it works whether or not they have a Sparkle account.
-    tauri::async_runtime::spawn_blocking(move || call_naming(&prompt, project.as_deref()))
-        .await
-        .map_err(|e| format!("join error: {e}"))?
+    let outcome =
+        tauri::async_runtime::spawn_blocking(move || call_naming(&prompt, project.as_deref()))
+            .await
+            .map_err(|e| format!("join error: {e}"))?;
+    crate::claude_oneshot::finish_cacheable(&app, outcome)
 }
 
 /// Build the request. Split out so the encoded decisions are testable — each compiles fine when
@@ -358,14 +363,58 @@ fn naming_request<'a>(
     }
 }
 
-fn call_naming(prompt: &str, project: Option<&str>) -> Result<AgentName, String> {
-    let text = crate::claude_oneshot::run(naming_request(prompt, project))?;
-    interpret_reply(&text)
+/// Returns the parsed name AND whether a real `claude` child produced it.
+///
+/// The pair is `(Result, bool)` rather than `Result<(..), ..>` ON PURPOSE: the spawn evidence must
+/// survive a PARSE failure. See `claude_oneshot::finish_cacheable`, which is where that evidence is
+/// acted on, and roborev 57507 for the latched-banner bug the old shape caused.
+fn call_naming(prompt: &str, project: Option<&str>) -> (Result<AgentName, String>, bool) {
+    match crate::claude_oneshot::run(naming_request(prompt, project)) {
+        // The run itself failed — no health to report; the JS wrapper records the failure instead.
+        Err(e) => (Err(e), false),
+        Ok(reply) => interpret_naming_reply(reply),
+    }
+}
+
+/// Split out from `call_naming` so the "spawn evidence outlives a parse failure" rule is testable
+/// without a `claude` CLI — the rule compiles fine when broken and produces no visible error.
+fn interpret_naming_reply(
+    reply: crate::claude_oneshot::OneShotReply,
+) -> (Result<AgentName, String>, bool) {
+    let spawned = reply.spawned;
+    (interpret_reply(&reply.text), spawned)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::claude_oneshot::OneShotReply;
+
+    #[test]
+    fn a_real_spawn_still_reports_health_when_the_reply_will_not_parse() {
+        // roborev 57507. `interpret_reply` rejects prose that isn't the JSON name object, and the
+        // old shape (`Result<(AgentName, bool)>`) discarded the spawn evidence with it. The
+        // resulting JS error falls through classifyServiceFailure to `ignore`, which resets the run
+        // but does NOT clear `degraded` — so a user who fixed a wedged CLI, whose naming calls then
+        // kept coming back as unparseable prose, would watch the latched banner survive to the
+        // expiry while the CLI was demonstrably answering. That is the hole this mechanism exists
+        // to close, reopened one layer up.
+        // The SKIP sentinel: the model DID answer, and its answer was "this prompt does not deserve
+        // a name". `interpret_reply` returns Err so the caller keeps the existing name — and that
+        // is the COMMON case, not an exotic one, because every operational or low-content prompt
+        // takes it. So the old shape discarded spawn evidence routinely, not rarely.
+        let (result, spawned) =
+            interpret_naming_reply(OneShotReply { text: "SKIP".into(), spawned: true });
+        assert!(result.is_err(), "SKIP is still not a name");
+        assert!(spawned, "but the spawn evidence must survive the parse failure");
+
+        // A cache hit must still report nothing, or the guard is gone.
+        let (_, cached) = interpret_naming_reply(OneShotReply {
+            text: r#"{"title":"Login Page","description":"Builds the login page."}"#.into(),
+            spawned: false,
+        });
+        assert!(!cached);
+    }
 
     #[test]
     fn naming_runs_in_the_background_tier_and_caches() {

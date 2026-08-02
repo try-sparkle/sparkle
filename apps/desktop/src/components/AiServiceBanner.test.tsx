@@ -29,20 +29,20 @@ describe("AiServiceBanner", () => {
     expect(container.innerHTML).toBe("");
   });
 
-  it("shows the unavailable message with the 'unreachable' cause once degraded", () => {
+  it("says the AI-Enhanced features are affected once degraded", () => {
     useAiServiceHealthStore.setState({ degraded: true, degradedAt: Date.now(), reason: "unreachable" });
     render(<AiServiceBanner />);
     const text = screen.getByRole("status").textContent ?? "";
-    expect(text).toContain("AI-Enhanced features are temporarily unavailable");
-    expect(text).toContain("unreachable");
+    expect(text).toContain("AI-Enhanced features are paused");
+    expect(text).toContain("Claude Code");
   });
 
   it("names the rate-limited cause distinctly", () => {
     useAiServiceHealthStore.setState({ degraded: true, degradedAt: Date.now(), reason: "rate_limited" });
     render(<AiServiceBanner />);
     const text = screen.getByRole("status").textContent ?? "";
-    expect(text).toContain("rate-limited");
-    expect(text).not.toContain("unreachable");
+    expect(text).toContain("rate-limiting");
+    expect(text).not.toContain("Claude Code");
   });
 
   it("carries no raw error, no refill affordance, and does not blame the user's balance or network", () => {
@@ -50,6 +50,23 @@ describe("AiServiceBanner", () => {
     render(<AiServiceBanner />);
     const text = screen.getByRole("status").textContent ?? "";
     expect(text).not.toMatch(/HTTP \d|502|refill|top up|upgrade|balance|offline|your network/i);
+  });
+
+  it("NEVER attributes the failure to a Sparkle-hosted service, for either reason", () => {
+    // THE 2026-08-02 COPY BUG. Both sentences said "the AI service is …", which is a leftover from
+    // the retired server-side proxy. These calls run on the user's OWN `claude` CLI now, so there
+    // is no Sparkle AI service in this path that CAN be down — and a user whose own Claude
+    // allowance was spent read that sentence as "Sparkle is broken" and filed a P0 against a
+    // backend that answered 200 on every probe for the entire window.
+    for (const reason of ["unreachable", "rate_limited"] as const) {
+      cleanup();
+      useAiServiceHealthStore.setState({ degraded: true, degradedAt: Date.now(), reason });
+      render(<AiServiceBanner />);
+      const text = screen.getByRole("status").textContent ?? "";
+      expect(text).not.toMatch(/the AI service|Sparkle is (down|broken|unavailable)|our service/i);
+      // …and it must still name the thing that IS failing, or it says nothing useful at all.
+      expect(text).toMatch(/Claude/);
+    }
   });
 
   it("is dismissible, and stays hidden for the episode once dismissed", () => {

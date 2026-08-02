@@ -10,7 +10,7 @@
 // (useAttentionNotifications) falls back to the existing generic body, so the feature is a no-op
 // rather than a blank banner.
 
-use crate::claude_oneshot::{run, OneShot, Tier, CLASSIFY_TIMEOUT};
+use crate::claude_oneshot::{run, OneShot, OneShotReply, Tier, CLASSIFY_TIMEOUT};
 
 /// Cheapest current Claude model — a one-line summary needs nothing more. (claude-api skill:
 /// claude-haiku-4-5 is $1/$5 per MTok; the bare alias is complete, no date suffix.) Pinning it also
@@ -68,6 +68,9 @@ fn clean_summary(s: &str) -> String {
 /// error, parse) so the caller degrades to the generic notification body.
 #[tauri::command]
 pub async fn summarize_attention(
+    // INJECTED BY TAURI — the JS call signature is unchanged. It carries the health signal for a
+    // real spawn back to `aiServiceHealthStore`; see `claude_oneshot::AI_SPAWN_OK_EVENT`.
+    app: tauri::AppHandle,
     screen: String,
     // Display name of the project whose agent is asking. Diagnostic only now — it used to attribute
     // a credit debit, and there is no longer a debit to attribute.
@@ -83,9 +86,11 @@ pub async fn summarize_attention(
     // Spawning the CLI and waiting out its wall clock is blocking work — keep it off the async
     // runtime's worker threads, exactly as the proxy call it replaced did. The Sparkle bearer read
     // and its "not signed in" precondition are gone: this runs on the user's own Claude Code login.
-    tauri::async_runtime::spawn_blocking(move || call_summarize(&screen, project.as_deref()))
-        .await
-        .map_err(|e| format!("join error: {e}"))?
+    let outcome =
+        tauri::async_runtime::spawn_blocking(move || call_summarize(&screen, project.as_deref()))
+            .await
+            .map_err(|e| format!("join error: {e}"))?;
+    crate::claude_oneshot::finish_cacheable(&app, outcome)
 }
 
 /// Build the request. Split out so the encoded decisions are testable — each compiles fine when
@@ -108,13 +113,27 @@ fn summary_request<'a>(screen: &'a str, project: Option<&'a str>) -> OneShot<'a>
     }
 }
 
-fn call_summarize(screen: &str, project: Option<&str>) -> Result<String, String> {
-    let text = run(summary_request(screen, project))?;
-    let cleaned = clean_summary(&text);
-    if cleaned.is_empty() {
-        return Err("summarize returned empty text".into());
+/// Returns the cleaned body AND whether a real `claude` child produced it.
+///
+/// The pair is `(Result, bool)` rather than `Result<(..), ..>` ON PURPOSE: the spawn evidence must
+/// survive an EMPTY-summary rejection. See `claude_oneshot::finish_cacheable` and roborev 57507.
+fn call_summarize(screen: &str, project: Option<&str>) -> (Result<String, String>, bool) {
+    match run(summary_request(screen, project)) {
+        // The run itself failed — no health to report; the JS wrapper records the failure instead.
+        Err(e) => (Err(e), false),
+        Ok(reply) => interpret_summary_reply(reply),
     }
-    Ok(cleaned)
+}
+
+/// Split out from `call_summarize` so the "spawn evidence outlives an unusable reply" rule is
+/// testable without a `claude` CLI.
+fn interpret_summary_reply(reply: OneShotReply) -> (Result<String, String>, bool) {
+    let spawned = reply.spawned;
+    let cleaned = clean_summary(&reply.text);
+    if cleaned.is_empty() {
+        return (Err("summarize returned empty text".into()), spawned);
+    }
+    (Ok(cleaned), spawned)
 }
 
 #[cfg(test)]
@@ -129,6 +148,25 @@ mod tests {
         assert_eq!(req.tier, crate::claude_oneshot::Tier::Background);
         assert!(req.cacheable);
         assert_eq!(req.model, "claude-haiku-4-5");
+    }
+
+    #[test]
+    fn a_real_spawn_still_reports_health_when_the_reply_is_unusable() {
+        // roborev 57507. A child that RAN and answered proves the transport works even when what it
+        // said was useless to us — and the old shape (`Result<(String, bool)>`) threw that evidence
+        // away on the empty-summary arm. The resulting JS error falls through classifyServiceFailure
+        // to `ignore`, which resets the run but does NOT clear `degraded`: so a user who fixed a
+        // wedged CLI, whose agent then kept producing whitespace-only summaries, would watch the
+        // latched banner survive to the expiry with a demonstrably healthy CLI.
+        let (result, spawned) =
+            interpret_summary_reply(OneShotReply { text: "   \n  ".into(), spawned: true });
+        assert!(result.is_err(), "an empty summary is still rejected as a reply");
+        assert!(spawned, "but the spawn evidence must survive the rejection");
+
+        // A cache hit must still report nothing, or the guard is gone.
+        let (_, cached) =
+            interpret_summary_reply(OneShotReply { text: "Wants a go-ahead".into(), spawned: false });
+        assert!(!cached);
     }
 
     #[test]

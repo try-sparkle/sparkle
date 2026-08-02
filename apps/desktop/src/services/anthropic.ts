@@ -144,18 +144,25 @@ export class AiTransientError extends Error {
  * hides a live outage and, worse, leaves a false one on screen after recovery — applies in full to
  * the FAILURE half: every wrapper owes it, always.
  *
- * The SUCCESS half is different. `judge`, `naming` and `attention` all run `cacheable: true`, and
- * `claude_oneshot` serves a cache hit BEFORE acquiring a permit or spawning anything — so a hit
- * proves nothing about the CLI's current state. Reporting healthy from one would zero
- * `consecutiveFailures`, the counter the `neutral` outcome exists to protect, and a persistent
- * unanswered prompt hits the cache on every tick, so a wedged CLI could be masked indefinitely.
- * Those three therefore report FAILURES ONLY.
+ * The SUCCESS half is different, and it is reported from a DIFFERENT PLACE. `judge`, `naming` and
+ * `attention` all run `cacheable: true`, and `claude_oneshot` serves a cache hit BEFORE acquiring a
+ * permit or spawning anything — so a hit proves nothing about the CLI's current state. Reporting
+ * healthy from one would zero `consecutiveFailures`, the counter the `neutral` outcome exists to
+ * protect, and a persistent unanswered prompt hits the cache on every tick, so a wedged CLI could
+ * be masked indefinitely. Those three therefore still report FAILURES ONLY *from their wrappers*.
  *
- * That leaves `chatOnce` — uncached, always a real call — as the sole reporter of RECOVERY, which
- * is a real limitation: its only caller is the learned-suggestions tier, which the user can switch
- * off. `aiServiceHealthStore.SERVICE_DEGRADED_MAX_AGE_MS` is what stops that becoming an
- * unclearable banner; the durable fix is to make the cache hit observable so the cached wrappers
- * can report recovery on a real spawn.
+ * Their RECOVERY now arrives out of band: Rust distinguishes a real spawn from a cache hit
+ * (`claude_oneshot::OneShotReply.spawned`) and emits `ai://spawn-ok` only for the former, which
+ * `services/aiServiceHealthListener.ts` turns into a single `noteAiServiceHealthy()`. So the cached
+ * callers do clear a degraded banner — on evidence a hit cannot fake — without any wrapper here
+ * having to decide. `chatOnce` keeps reporting its own success directly below, because it is
+ * `cacheable: false` and every one of its replies is a real spawn by construction.
+ *
+ * That closes the gap this block used to describe: `chatOnce`'s only caller is the
+ * learned-suggestions tier, which the user can switch off, and before the listener existed a user
+ * in that configuration had nothing left that could retire the banner except
+ * `aiServiceHealthStore.SERVICE_DEGRADED_MAX_AGE_MS` — a bound on a STALE claim, not a recovery
+ * signal.
  */
 export function noteAiProviderHealthy(): void {
   useAiProviderStore.getState().noteHealthy();

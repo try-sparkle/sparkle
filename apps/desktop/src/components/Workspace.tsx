@@ -101,6 +101,7 @@ import { focusSatellite, reclaimProject, reconcileSatellites } from "../services
 import { startPresenceTracking } from "../stores/presenceStore";
 import { startOrchestrationListener } from "../services/orchestrationListener";
 import { startControlListener } from "../services/controlListener";
+import { startAiServiceHealthListener } from "../services/aiServiceHealthListener";
 import { closeScopeProjectNames, killAllOpenAgents, planWindowClose } from "../services/windowClose";
 import { clearWindowProject } from "../services/windowRegistry";
 import { clearWindowRoster } from "../services/attention";
@@ -824,6 +825,30 @@ export function Workspace() {
         else cleanup = c;
       })
       .catch((e: unknown) => console.error("[control] listener failed to start:", e));
+    return () => {
+      unmounted = true;
+      cleanup?.();
+    };
+  }, [isMainWindow]);
+
+  // Start the AI service-health listener: the RECOVERY half of the AiServiceBanner signal, which
+  // the three `cacheable: true` wrappers cannot supply themselves (see the module header). Mirrors
+  // the two above — own singleton guard for StrictMode/HMR, `unmounted` flag for the start race.
+  //
+  // MAIN-WINDOW ONLY, same reasoning as the control listener: Tauri emits app-globally, and a
+  // second webview would clear the same latch twice. Harmless in effect (reduceSuccess is
+  // idempotent and returns the same reference when already healthy) but it would leave a live
+  // subscription behind on teardown.
+  useEffect(() => {
+    if (!isMainWindow) return;
+    let cleanup: (() => void) | undefined;
+    let unmounted = false;
+    void startAiServiceHealthListener()
+      .then((c) => {
+        if (unmounted) c();
+        else cleanup = c;
+      })
+      .catch((e: unknown) => console.error("[ai-health] listener failed to start:", e));
     return () => {
       unmounted = true;
       cleanup?.();

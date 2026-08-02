@@ -11,17 +11,25 @@
 // of service failures (never a lone blip).
 //
 // HOW IT RETIRES — and this is NOT simply "the instant any call succeeds", which is what this
-// comment used to claim. Only the UNCACHED `chatOnce` may report a success: judge, naming and
-// attention run `cacheable: true`, and a cache hit never touches the CLI, so a success from one
-// would prove nothing (see anthropic.ts's contract block). `chatOnce`'s only caller is the
-// learned-suggestions tier, which the user can switch off — so the banner also retires on a
-// TIME-BASED expiry (SERVICE_DEGRADED_MAX_AGE_MS), re-evaluated on the ticker below. That expiry
-// retires the DISPLAY only; the dismissal below lives with the failure RUN, not with this claim.
+// comment once claimed. A success must come from a REAL `claude` spawn: judge, naming and attention
+// run `cacheable: true`, and a cache hit never touches the CLI, so a success inferred from one
+// would prove nothing (see anthropic.ts's contract block). Rust makes that distinction and emits
+// `ai://spawn-ok` only for a real child, so all four callers can retire this banner — not just the
+// uncached `chatOnce`. The banner ALSO retires on a TIME-BASED expiry
+// (SERVICE_DEGRADED_MAX_AGE_MS), re-evaluated on the ticker below, which covers a session that
+// simply stops calling the CLI at all. That expiry retires the DISPLAY only; the dismissal below
+// lives with the failure RUN, not with this claim.
 //
 // Copy rules, learned from the sibling banners:
 //   • name no PII and no raw error — the store only ever holds a coarse reason;
 //   • don't blame the user's network (OfflineBanner's job) or balance (ZeroCreditBanner's);
-//   • say the feature is affected, plainly — a silent degrade is what made the outage invisible.
+//   • say the feature is affected, plainly — a silent degrade is what made the outage invisible;
+//   • DO NOT SAY "the AI service". That phrase is a leftover from the proxy era and it is now
+//     false: since the Claude Code migration these calls run on the USER'S OWN `claude` CLI, and
+//     there is no Sparkle-hosted AI service in this path to be down. On 2026-08-02 a user whose own
+//     Claude allowance was spent read "the AI service is rate-limited" as "Sparkle is broken" and
+//     filed a P0 against a backend that was answering 200 on every probe for the whole window.
+//     Name the thing that is actually failing — Claude Code, on their machine, on their account.
 // Unlike ProviderUnavailableBanner it IS dismissible: the user cannot fix this, but the retry path
 // keeps working underneath, so a ✕ that hides the nag for the episode is reasonable. A later,
 // DISTINCT outage re-arms it. What ends an episode is stated once, as a table, on `AiServiceHealth`
@@ -42,12 +50,13 @@ import {
 } from "../stores/aiServiceHealthStore";
 
 /** One sentence per coarse reason. Both open with the same plain statement that the features are
- *  affected, then add the coarse cause without a raw status or any PII. */
+ *  affected, then add the coarse cause without a raw status or any PII — and both attribute it to
+ *  Claude Code rather than to a Sparkle service, per the attribution rule in the header. */
 const WARNING: Record<AiServiceReason, string> = {
   unreachable:
-    "AI-Enhanced features are temporarily unavailable — the AI service is unreachable right now. We keep retrying automatically",
+    "AI-Enhanced features are paused — Sparkle isn't getting a reply from Claude Code right now. We keep retrying automatically",
   rate_limited:
-    "AI-Enhanced features are temporarily unavailable — the AI service is rate-limited right now. We keep retrying automatically",
+    "AI-Enhanced features are paused — Claude is rate-limiting Sparkle's requests right now. We keep retrying automatically",
 };
 
 // Brand amber is the theme-CONSTANT caution fill, so its ink is the constant brand navy (matching

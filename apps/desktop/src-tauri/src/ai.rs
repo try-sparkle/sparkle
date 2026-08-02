@@ -76,6 +76,10 @@ pub async fn anthropic_chat(
 
     // Spawning the CLI and waiting out its wall clock is blocking work — keep it off the async
     // runtime's worker threads, exactly as the proxy call it replaced did.
+    // No `finish_cacheable`/`report_health` here, and no AppHandle: this sink is `cacheable: false`,
+    // so every reply is a real spawn by construction and `chatOnce` already reports the success from
+    // JS on return. (Naming the surviving symbols on purpose — this is the one comment explaining
+    // why this caller opts out of the health mechanism, so it has to stay greppable from it.)
     tauri::async_runtime::spawn_blocking(move || {
         crate::claude_oneshot::run(chat_request(
             &system,
@@ -85,6 +89,7 @@ pub async fn anthropic_chat(
             project.as_deref(),
             background.unwrap_or(false),
         ))
+        .map(|reply| reply.text)
     })
     .await
     .map_err(|e| format!("join error: {e}"))?

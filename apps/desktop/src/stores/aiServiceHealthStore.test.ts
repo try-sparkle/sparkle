@@ -91,6 +91,40 @@ describe("classifyServiceFailure", () => {
     expect(classifyServiceFailure("ai_unconfigured:provider_unfunded")).toEqual({ kind: "yield" });
     expect(classifyServiceFailure("ai_unconfigured:provider_key_rejected")).toEqual({ kind: "yield" });
   });
+
+  it("YIELDS on the user's OWN account state — a spent allowance is not a service outage", () => {
+    // The 2026-08-02 shape, and the one the whole incident turned on. A spent Claude subscription
+    // allowance is a fact about the USER'S account, exactly like a $0 Sparkle balance: it has its
+    // own banner (ProviderUnavailableBanner: "Claude usage limit reached — resumes when it resets")
+    // which names the cause and says it clears itself. This store must step aside, never accumulate
+    // it toward "the product is failing".
+    expect(classifyServiceFailure("claude_usage_limit")).toEqual({ kind: "yield" });
+    expect(classifyServiceFailure("claude_not_authenticated")).toEqual({ kind: "yield" });
+  });
+
+  it("a run of account-state rejections can NEVER light this banner", () => {
+    // The end-to-end statement of the bug: for ~40 minutes every call came back as the user's own
+    // allowance being spent, and each one was counted as a service failure. Whatever the run
+    // length, account state must leave this detector at rest.
+    let s: AiServiceHealth = { ...HEALTHY_SERVICE };
+    for (let i = 0; i < AI_SERVICE_DEGRADED_THRESHOLD * 3; i += 1) {
+      s = reduceFailure(s, classifyServiceFailure("claude_usage_limit"), NOW + i * 1_000);
+    }
+    expect(s.degraded).toBe(false);
+    expect(s.consecutiveFailures).toBe(0);
+    expect(s).toEqual(HEALTHY_SERVICE);
+  });
+
+  it("an account-state rejection RETIRES a banner an earlier real outage had lit", () => {
+    // The recovery direction, and the one that mattered on the day: the CLI genuinely wedged, THEN
+    // the account hit its limit. The vague "it keeps failing" bar must hand over to the specific,
+    // actionable one rather than sitting on top of it.
+    let s: AiServiceHealth = failTimes(AI_SERVICE_DEGRADED_THRESHOLD, "unreachable");
+    expect(s.degraded).toBe(true);
+    s = reduceFailure(s, classifyServiceFailure("claude_usage_limit"), NOW);
+    expect(s.degraded).toBe(false);
+    expect(s).toEqual(HEALTHY_SERVICE);
+  });
 });
 
 describe("reduceFailure — the sustained-failure detector", () => {

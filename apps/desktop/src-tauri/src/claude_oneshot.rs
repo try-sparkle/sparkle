@@ -191,6 +191,115 @@ enum CliOutcome {
     Failed(String),
 }
 
+/// One reply, plus THE ONE FACT THE HEALTH DETECTOR NEEDS THAT THE TEXT CANNOT CARRY: did this
+/// answer cost a real `claude` child, or was it served from the reply cache?
+///
+/// `aiServiceHealthStore` accumulates a run of failures and lights an app-shell banner; only a
+/// success retires it. Before this existed, the three `cacheable: true` callers (judge, naming,
+/// attention) were forbidden from EVER reporting a success, because a cache hit is served before a
+/// permit is even acquired and so proves nothing about the CLI's current state — reporting healthy
+/// from one would let a wedged CLI hide behind its own stale answers indefinitely. That left
+/// `chatOnce` as the sole reporter of recovery, and its only caller is the learned-suggestions
+/// tier, which the user can switch off. A user in that configuration could drive the banner up
+/// through naming/judge/attention, fix their CLI, and have nothing left that could clear it.
+///
+/// Distinguishing the two answers that question without weakening it: a hit still reports nothing,
+/// a REAL SPAWN reports health, and every caller gets to do it.
+#[derive(Debug)]
+pub(crate) struct OneShotReply {
+    pub text: String,
+    /// TRUE iff a `claude` child actually ran and answered for this reply.
+    pub spawned: bool,
+}
+
+/// Event the frontend listens on to learn that the user's CLI is demonstrably working right now.
+///
+/// An EVENT rather than a field on each command's reply, deliberately. The alternative was widening
+/// four commands' `Ok` types and updating four JS wrappers — which is precisely the shape that
+/// broke this detector once already (roborev 54761: wiring only some wrappers left a wedged CLI
+/// producing almost no health input at all).
+///
+/// HONEST SCOPE, corrected after roborev 57507: there is ONE listener and ONE decision (see
+/// `finish_cacheable`), but there is a call site per cacheable command, so a NEW `run` caller does
+/// still have to route its result through `finish_cacheable` — it does not get this for free.
+/// What it cannot do is get the *rule* wrong, because the rule is not written at the call sites.
+pub(crate) const AI_SPAWN_OK_EVENT: &str = "ai://spawn-ok";
+
+/// Where a health signal goes.
+///
+/// A trait purely so THE GATE ITSELF is reachable from a test. The first attempt at this extracted
+/// the predicate instead (`should_report_health(spawned) -> bool`), which was the identity function
+/// on `bool` — so its test asserted something true by definition and could only fail if someone
+/// edited that one line. The decision that actually matters lives in the `if` below, and deleting
+/// that `if` reinstates the cache-hit masking bug verbatim (a persistent unanswered prompt hits the
+/// cache every tick, so a wedged CLI reports itself healthy forever) while the whole suite stays
+/// green. That is the repo's stated #1 shape: an assertion that would have passed before the
+/// change. A counting fake makes the `if` a real mutation target. (roborev 57515)
+pub(crate) trait HealthSink {
+    fn emit_health(&self);
+}
+
+impl HealthSink for tauri::AppHandle {
+    /// Errors are swallowed: this is an advisory health signal, and a webview that has gone away
+    /// must never turn a working AI call into a failed one.
+    fn emit_health(&self) {
+        use tauri::Emitter as _;
+        let _ = self.emit(AI_SPAWN_OK_EVENT, ());
+    }
+}
+
+/// THE GATE. Report health iff a real child answered — never for a cache hit, which is served
+/// before a permit is acquired and proves nothing about the CLI's current state.
+pub(crate) fn report_health<S: HealthSink>(sink: &S, spawned: bool) {
+    if spawned {
+        sink.emit_health();
+    }
+}
+
+/// Finish a cacheable command: report health if a real child answered, THEN hand back the result.
+///
+/// THE ORDER IS THE WHOLE POINT, and getting it wrong was roborev 57507. `naming` and `attention`
+/// both post-process the reply text (`interpret_reply`, `clean_summary`) and can reject it — a
+/// malformed JSON name, an empty summary. Emitting after `?`-propagating that error threw the spawn
+/// evidence away, and the resulting JS error falls through `classifyServiceFailure` to `ignore`,
+/// which resets the run but does NOT clear `degraded`. So: a user drives the banner to threshold
+/// with a wedged CLI, fixes it, naming then answers with prose the parser rejects every time — the
+/// CLI is demonstrably healthy, nothing ever emits, and the latched banner survives to the expiry.
+/// That is precisely the hole this whole mechanism exists to close.
+///
+/// A real child that ANSWERED proves the transport works even when what it said was useless to us.
+/// The store's own default arm already says so: "the CLI answered something this layer has no
+/// opinion about, which is evidence the transport works."
+///
+/// TWO KNOWN COVERAGE GAPS, both stated rather than papered over. An earlier version of this block
+/// named only one of them after the `HealthSink` seam landed, which read as if the seam had closed
+/// the other — it did not, it MOVED it.
+///
+///  1. Nothing asserts that a COMMAND calls this. Deleting the `finish_cacheable` call from
+///     `generate_agent_name` / `judge_turn_followup` / `summarize_attention` still compiles green.
+///  2. Nothing asserts the `AppHandle` ADAPTER — `<AppHandle as HealthSink>::emit_health` is the
+///     only place the signal is really sent, and emptying its body or changing the event string it
+///     carries leaves `cargo test --lib` fully green (the gate test counts a FAKE sink), while the
+///     frontend listener never fires and a latched banner survives forever with a healthy CLI.
+///
+/// Both need `tauri::test::mock_app`, i.e. tauri's `test` feature — a dependency change nobody has
+/// taken. The cheap half of #2 IS taken: `AI_SPAWN_OK_EVENT` is pinned to its literal on both sides
+/// (here and in `aiServiceHealthListener.test.ts`), since that string is a cross-language contract
+/// with no shared source and a rename would otherwise drift in silence.
+///
+/// What IS covered, against a fake sink rather than by assertion-about-an-identity: the gate itself
+/// (`report_health` — a spawn emits exactly once, a hit emits zero times) and `(Result, bool)`
+/// carrying spawn evidence past a post-processing rejection in `naming::interpret_naming_reply` /
+/// `attention_summary::interpret_summary_reply`.
+pub(crate) fn finish_cacheable<T>(
+    app: &tauri::AppHandle,
+    outcome: (Result<T, String>, bool),
+) -> Result<T, String> {
+    let (result, spawned) = outcome;
+    report_health(app, spawned);
+    result
+}
+
 /// Build the argv for one call. Pure, and every flag below is load-bearing.
 ///
 /// ORDERING CONSTRAINT: `-p <user>` must come FIRST. `--tools`, `--mcp-config` and `--allowedTools`
@@ -280,10 +389,34 @@ fn classify_result_json(v: &serde_json::Value) -> CliOutcome {
     CliOutcome::Text(trimmed.to_string())
 }
 
+/// Does this body say the ACCOUNT'S ALLOWANCE IS SPENT — as opposed to the vendor being busy?
+///
+/// ANCHORED ON THE SENTENCES THE CLI ACTUALLY EMITS, never on a bare word, and that restraint is
+/// the whole design. `result_text` is the CLI's error body, which `classify_cli_failure`'s contract
+/// says can quote the REQUEST back — and Sparkle's own prompts are agent terminal output, judge
+/// inputs and attention screens, which are full of words like "quota". A loose match would be
+/// WORSE than the bug it fixes, not merely imprecise: `claude_usage_limit` YIELDS in
+/// `classifyServiceFailure`, and a yield RESETS the consecutive-failure run — so prose that keeps
+/// recurring would hold a genuine sustained outage permanently below threshold, trading the false
+/// positive this fixes for a false NEGATIVE in the exact case the detector exists for. It would
+/// also light the non-dismissible ProviderUnavailableBanner with a specific, false claim about the
+/// user's account.
+///
+/// Each phrase here is multi-word and is a fragment of a real message, verified against captures:
+/// the subscription window limit, the spend cap (seen verbatim in this machine's own roborev logs
+/// as "You've hit your monthly spend limit"), and the API credit balance.
+fn is_account_limit(lower: &str) -> bool {
+    lower.contains("usage limit reached")
+        || lower.contains("limit resets at")
+        || lower.contains("spend limit")
+        || lower.contains("credit balance is too low")
+}
+
 /// Map a failed run to a typed sentinel the JS layer can branch on.
 ///
 /// NEVER echoes the whole `result` body — it can be arbitrarily long and can quote the request back.
-/// Same rule `ai::classify_proxy_error` followed for the vendor's response body.
+/// Same rule `ai::classify_proxy_error` followed for the vendor's response body. `log_outcome` does
+/// NOT persist the sentinel this builds either; see `loggable_sentinel`.
 ///
 /// Deliberately absent: `insufficient_credits` (there is no Sparkle balance left to exhaust on this
 /// path) and `ai_unreachable`. The latter matters: that sentinel makes the JS layer call
@@ -291,17 +424,43 @@ fn classify_result_json(v: &serde_json::Value) -> CliOutcome {
 /// the global offline banner. A local CLI stall under a 50-agent storm is not evidence of that, and
 /// flipping the banner from it would make every unrelated feature defer for the wrong reason.
 fn classify_cli_failure(result_text: &str, api_error_status: Option<u16>) -> String {
-    // Vendor-side overload/rate-limit comes back as a status, so check it before any prose match.
+    let lower = result_text.to_lowercase();
+
+    // AN ACCOUNT-STATE SENTENCE BEATS A BARE STATUS.
+    //
+    // This ordering is the fix for 2026-08-02, and the previous ordering — status first, "so we
+    // check it before any prose match" — is what caused it. A spent SUBSCRIPTION allowance is
+    // delivered as a 429 carrying "Claude usage limit reached", identical in status to the vendor
+    // briefly overloading. Reading the status alone collapsed the two, and they are opposites for
+    // every consumer downstream:
+    //
+    //   • `claude_usage_limit` YIELDS in `classifyServiceFailure` — a more specific banner
+    //     (ProviderUnavailableBanner) owns it and says the true, actionable thing: the user's own
+    //     Claude allowance is spent and resumes when it resets.
+    //   • `ai_rate_limited` DEGRADES — it accumulates toward the app-shell AiServiceBanner, whose
+    //     copy tells the user Sparkle's AI features are failing.
+    //
+    // So ~40 minutes of one user's exhausted allowance re-stamped a banner announcing that the
+    // PRODUCT was down, while Sparkle's own service was healthy on every probe.
+    if is_account_limit(&lower) {
+        return "claude_usage_limit".to_string();
+    }
+
+    // Vendor-side overload / transient throttle: no account condition was named above, so a 429/529
+    // here really is "try again shortly".
     if matches!(api_error_status, Some(429) | Some(529)) {
         return "ai_rate_limited".to_string();
     }
-    let lower = result_text.to_lowercase();
     if lower.contains("not logged in")
         || lower.contains("/login")
         || lower.contains("invalid api key")
     {
         return "claude_not_authenticated".to_string();
     }
+    // The status-LESS prose path, unchanged from before this fix. It keeps the loose `quota` /
+    // `rate limit` words because with no status to contradict them there is nothing else to go on,
+    // and because the arm below it (`ai request failed`) also degrades — so a false match here
+    // costs specificity, not a reset of a run that a 429 would otherwise be building.
     if lower.contains("usage limit") || lower.contains("rate limit") || lower.contains("quota") {
         // The subscription analogue of the old `insufficient_credits`: the user still has an
         // account, they have simply spent this window's allowance.
@@ -516,7 +675,7 @@ fn scrub_anthropic_env(cmd: &mut Command) {
 }
 
 /// Run one call and return the model's reply text. `Err` on every failure so callers degrade.
-pub(crate) fn run(req: OneShot<'_>) -> Result<String, String> {
+pub(crate) fn run(req: OneShot<'_>) -> Result<OneShotReply, String> {
     let claude_path = crate::preflight::cached_claude_path().ok_or_else(|| {
         // Reuses the existing sentinel: the JS layer already maps `ai_unconfigured` to "this is
         // doomed until something changes, defer without burning retry budget", which is exactly
@@ -547,7 +706,7 @@ pub(crate) fn run(req: OneShot<'_>) -> Result<String, String> {
 pub(crate) fn run_with(
     req: OneShot<'_>,
     spawn: &dyn Fn(&[String]) -> Result<String, String>,
-) -> Result<String, String> {
+) -> Result<OneShotReply, String> {
     run_with_pool(req, spawn, &INFLIGHT, &WAITING)
 }
 
@@ -556,7 +715,7 @@ pub(crate) fn run_with_pool(
     spawn: &dyn Fn(&[String]) -> Result<String, String>,
     inflight: &AtomicUsize,
     waiting: &AtomicUsize,
-) -> Result<String, String> {
+) -> Result<OneShotReply, String> {
     if req.user.len() > MAX_PROMPT_BYTES || req.system.len() > MAX_PROMPT_BYTES {
         return Err("ai_prompt_too_large".to_string());
     }
@@ -566,7 +725,20 @@ pub(crate) fn run_with_pool(
         let seq = CACHE_SEQ.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut cache) = reply_cache().lock() {
             if let Some(hit) = cache_lookup(&mut cache, key, seq) {
-                return Ok(hit);
+                // OBSERVABLE ON PURPOSE. A hit used to log nothing at all, and that silence made
+                // the log actively misleading rather than merely incomplete: the only lines present
+                // said "completed", so a reader diagnosing 2026-08-02 reasonably concluded the
+                // all-zero-token ones were cache hits. They were failures (see `log_outcome`).
+                // A hit and a failure are the two things this log most needs to tell apart, because
+                // they are the two that spend nothing and look identical from outside.
+                tracing::info!(
+                    purpose = req.purpose,
+                    project = req.project.unwrap_or("-"),
+                    "claude one-shot served from cache"
+                );
+                // `spawned: false` — nothing was asked of the CLI, so this reply is evidence of
+                // neither health nor failure. See `OneShotReply`.
+                return Ok(OneShotReply { text: hit, spawned: false });
             }
         }
     }
@@ -585,9 +757,12 @@ pub(crate) fn run_with_pool(
         format!("ai request failed: unparseable CLI output ({e}): {head}")
     })?;
 
-    log_usage(&json, req.purpose, req.project);
+    // CLASSIFY FIRST, THEN LOG. The log line must state what actually happened, and it takes the
+    // outcome as an argument so it is not POSSIBLE to call it without knowing — see `log_outcome`.
+    let outcome = classify_result_json(&json);
+    log_outcome(&json, req.purpose, req.project, &outcome);
 
-    let text = match classify_result_json(&json) {
+    let text = match outcome {
         CliOutcome::Text(t) => t,
         CliOutcome::Failed(sentinel) => return Err(sentinel),
     };
@@ -614,10 +789,39 @@ pub(crate) fn run_with_pool(
             cache_store(&mut cache, key, text.clone(), seq, CACHE_CAP);
         }
     }
-    Ok(text)
+    // A real child ran and answered — the one thing that proves the user's CLI works right now.
+    Ok(OneShotReply { text, spawned: true })
 }
 
-/// Emit what the call cost, on ONE line.
+/// A bounded, NON-ECHOING discriminator for the log line.
+///
+/// Every classified case is a fixed typed string, but the fall-through arm of
+/// `classify_cli_failure` builds `ai request failed: <first 200 chars of the CLI's result body>` —
+/// and that body can quote the REQUEST back (its own doc says so, which is why it never echoes the
+/// whole thing). The 200-char clamp bounded what crosses into JS as an error string; it is not
+/// consent to PERSIST it. This line lands in the daily rolling file that `support::read_recent_logs`
+/// tails and `crash.rs` uploads with consent, and `support::redact_secrets` redacts by SHAPE (keys,
+/// bearers, tokens) rather than free-form prose — so a prompt fragment would pass straight through.
+///
+/// `concierge_lint_log::record_violation` already encodes exactly this rule for exactly this reason
+/// (roborev 55693); this follows it. The allow-list is the point: anything not on it collapses to
+/// its prefix, so a sentinel shape added later fails CLOSED rather than leaking by default.
+fn loggable_sentinel(sentinel: &str) -> &str {
+    match sentinel {
+        "claude_usage_limit"
+        | "claude_not_authenticated"
+        | "ai_rate_limited"
+        | "ai_timeout"
+        | "ai_busy"
+        | "ai_empty_reply"
+        | "ai_unconfigured"
+        | "ai_prompt_too_large"
+        | "ai_unreachable" => sentinel,
+        _ => "ai request failed",
+    }
+}
+
+/// Emit what the call cost AND WHETHER IT WORKED, on ONE line.
 ///
 /// This is the successor to `ai::Metering`, and it deliberately does not write a ledger row.
 /// Metering's entire documented contract was "the server records these in the credit ledger row's
@@ -627,22 +831,60 @@ pub(crate) fn run_with_pool(
 /// anyway, and `purpose`/`project` stay READ rather than becoming dead fields.
 ///
 /// `total_cost_usd` is NOTIONAL on a subscription: the user spends quota, not dollars.
-fn log_usage(json: &serde_json::Value, purpose: &str, project: Option<&str>) {
+///
+/// IT TAKES THE OUTCOME, AND THAT PARAMETER IS THE POINT. The previous version was called BEFORE
+/// `classify_result_json` and said "claude one-shot completed" unconditionally — so every failed
+/// run was logged as a completion, with all-zero usage because a failed payload carries no usage.
+/// On 2026-08-02 that produced a log in which 40 minutes of solid `ai_rate_limited` rejections read
+/// as a quiet run of successful cache hits, and the incident was diagnosed backwards from it: the
+/// conclusion drawn was "the service is fine and recovery is under-fed", when the truth was "every
+/// call is failing and saying so". A log that reports failures as successes is worse than no log,
+/// because it is trusted. Passing the outcome makes the honest version the only one that compiles.
+fn log_outcome(
+    json: &serde_json::Value,
+    purpose: &str,
+    project: Option<&str>,
+    outcome: &CliOutcome,
+) {
     let usage = json.get("usage");
     let get = |k: &str| usage.and_then(|u| u.get(k)).and_then(serde_json::Value::as_u64);
-    tracing::info!(
-        purpose,
-        project = project.unwrap_or("-"),
-        input_tokens = get("input_tokens").unwrap_or(0),
-        output_tokens = get("output_tokens").unwrap_or(0),
-        cache_read_tokens = get("cache_read_input_tokens").unwrap_or(0),
-        notional_cost_usd = json
-            .get("total_cost_usd")
-            .and_then(serde_json::Value::as_f64)
-            .unwrap_or(0.0),
-        duration_ms = json.get("duration_ms").and_then(serde_json::Value::as_u64).unwrap_or(0),
-        "claude one-shot completed"
-    );
+    let project = project.unwrap_or("-");
+    let input_tokens = get("input_tokens").unwrap_or(0);
+    let output_tokens = get("output_tokens").unwrap_or(0);
+    let cache_read_tokens = get("cache_read_input_tokens").unwrap_or(0);
+    let notional_cost_usd = json
+        .get("total_cost_usd")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0);
+    let duration_ms = json.get("duration_ms").and_then(serde_json::Value::as_u64).unwrap_or(0);
+    match outcome {
+        CliOutcome::Text(_) => tracing::info!(
+            purpose,
+            project,
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            notional_cost_usd,
+            duration_ms,
+            "claude one-shot completed"
+        ),
+        // WARN, not info: a run that spent the user's quota and produced nothing usable is the
+        // event someone reading this log at 1am is looking for. `sentinel` is the typed string the
+        // JS layer branches on, so the log and the banner can be reconciled without guessing.
+        CliOutcome::Failed(sentinel) => tracing::warn!(
+            purpose,
+            project,
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            notional_cost_usd,
+            duration_ms,
+            // NOT the raw sentinel — its fall-through form carries CLI output. See
+            // `loggable_sentinel`; this file's log is support-uploadable.
+            sentinel = loggable_sentinel(sentinel),
+            "claude one-shot FAILED"
+        ),
+    }
 }
 
 /// Does this stdout carry a RESULT OBJECT we can classify?
@@ -766,6 +1008,14 @@ mod tests {
         r: OneShot<'_>,
         spawn: &dyn Fn(&[String]) -> Result<String, String>,
     ) -> Result<String, String> {
+        run_isolated_reply(r, spawn).map(|reply| reply.text)
+    }
+
+    /// As `run_isolated`, but keeps the whole reply so a test can assert on `spawned`.
+    fn run_isolated_reply(
+        r: OneShot<'_>,
+        spawn: &dyn Fn(&[String]) -> Result<String, String>,
+    ) -> Result<OneShotReply, String> {
         let inflight = AtomicUsize::new(0);
         let waiting = AtomicUsize::new(0);
         run_with_pool(r, spawn, &inflight, &waiting)
@@ -876,6 +1126,94 @@ mod tests {
             classify_cli_failure("You have hit your usage limit for this window", None),
             "claude_usage_limit"
         );
+    }
+
+    #[test]
+    fn a_subscription_usage_limit_is_account_state_even_though_it_arrives_as_a_429() {
+        // THE 2026-08-02 BUG. A spent subscription allowance comes back as a 429 carrying
+        // usage-limit prose. With the status read first, every one of those was `ai_rate_limited` —
+        // which `classifyServiceFailure` counts as a SERVICE failure, so ~40 minutes of the user's
+        // own Claude quota being exhausted lit the app-shell "AI-Enhanced features are temporarily
+        // unavailable — the AI service is rate-limited" banner and re-stamped it on every retry.
+        // Sparkle's own service was healthy throughout; the banner told the user the product was
+        // broken because THEIR account was out of allowance.
+        //
+        // `claude_usage_limit` YIELDS in that classifier and drives ProviderUnavailableBanner
+        // instead, which names the real cause and the fact that it resets on its own.
+        for prose in [
+            "Claude usage limit reached. Your limit resets at 5:00pm.",
+            "Claude usage limit reached",
+            "You've hit your monthly spend limit · raise it at claude.ai/settings/usage",
+            "Your credit balance is too low to access the Anthropic API",
+        ] {
+            assert_eq!(
+                classify_cli_failure(prose, Some(429)),
+                "claude_usage_limit",
+                "a 429 whose prose names the account allowance is NOT a transient throttle: {prose:?}"
+            );
+        }
+        // …and the genuine transient must be untouched: an overload 429/529 names no account
+        // condition, so it stays the retryable sentinel that legitimately feeds the service banner.
+        assert_eq!(classify_cli_failure("Overloaded", Some(529)), "ai_rate_limited");
+        assert_eq!(classify_cli_failure("rate_limit_error: too many requests", Some(429)), "ai_rate_limited");
+    }
+
+    #[test]
+    fn a_429_that_merely_quotes_prompt_text_is_still_a_transient() {
+        // roborev 57501 (Medium). The account-state check runs BEFORE the status now, and
+        // `result_text` can quote the request back — so matching a bare word would let Sparkle's
+        // own prompt content decide the classification. That is worse than the bug it fixes:
+        // `claude_usage_limit` yields, a yield RESETS the failure run, and recurring prose would
+        // hold a genuine sustained outage permanently below threshold. These are the shapes an
+        // agent's terminal output, a judge input or an attention screen really can contain.
+        for echoed in [
+            "Overloaded (request was: 'check the quota logic in pusherFleet.ts')",
+            "Overloaded: rate limit handling for the usage limit banner",
+            "Overloaded — prompt mentioned quota, spend, and credit balance separately",
+        ] {
+            assert_eq!(
+                classify_cli_failure(echoed, Some(429)),
+                "ai_rate_limited",
+                "echoed prompt text must not decide the account verdict: {echoed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_failure_log_never_carries_the_clis_own_result_body() {
+        // roborev 57501 (Medium), and a NEW exposure introduced by logging the sentinel at all.
+        // The fall-through sentinel is `ai request failed: <200 chars of the CLI's result body>`,
+        // and that body can quote the request back. This line reaches the daily rolling file that
+        // support uploads, and redact_secrets works by SHAPE (keys/bearers/tokens), not prose — so
+        // a prompt fragment would survive. Asserting on the EMITTED OUTPUT, the way
+        // concierge_lint_log does, is the only thing that turns red if the clamp is removed.
+        let secret = "Left-Pair-attachment-path-fragment-9f3a";
+        let body = format!(r#"{{"is_error":true,"result":"exec failed while handling {secret}"}}"#);
+        let logged = captured_logs(|| {
+            let err = run_isolated(req("leak-probe", Tier::Background, false), &|_| Ok(body.clone()))
+                .unwrap_err();
+            // The JS layer still receives the detail — that is a bounded in-memory string, and it
+            // is what makes a modal say something useful. Only the PERSISTED copy is clamped.
+            assert!(err.contains(secret), "the caller still gets the detail: {err}");
+        });
+        assert!(!logged.is_empty(), "nothing captured — the harness is broken");
+        assert!(
+            !logged.contains(secret),
+            "the CLI's result body reached the support-uploadable log: {logged}"
+        );
+        assert!(logged.contains("ai request failed"), "the shape must still be named: {logged}");
+    }
+
+    #[test]
+    fn loggable_sentinel_passes_typed_values_and_collapses_everything_else() {
+        // Both directions, because a version that returned the input unchanged would satisfy the
+        // first half alone — and that is exactly the leak.
+        for typed in ["claude_usage_limit", "ai_rate_limited", "ai_timeout", "ai_empty_reply"] {
+            assert_eq!(loggable_sentinel(typed), typed);
+        }
+        assert_eq!(loggable_sentinel("ai request failed: claude exited Some(1): /Users/x/secret"), "ai request failed");
+        // Fails CLOSED: an unrecognised shape collapses rather than passing through.
+        assert_eq!(loggable_sentinel("some_future_sentinel_with_detail: xyz"), "ai request failed");
     }
 
     #[test]
@@ -1209,6 +1547,71 @@ mod tests {
     }
 
     #[test]
+    fn a_cache_hit_reports_no_spawn_while_a_real_call_does() {
+        // THE DISTINCTION THAT LETS THE CACHED WRAPPERS REPORT RECOVERY AT ALL. `spawned` is the
+        // whole reason judge/naming/attention can now clear a degraded banner: they may report
+        // health from a REAL child, and must stay silent on a hit — a hit is served before a permit
+        // is even acquired, so a wedged CLI would otherwise hide behind its own stale answers.
+        // Both directions, because reporting `true` unconditionally would compile, pass any
+        // single-direction test, and reinstate exactly that masking bug.
+        let user = "spawned-probe: only this test uses this exact string";
+        let spawn = |_: &[String]| Ok(OK_JSON.to_string());
+
+        let first = run_isolated_reply(req(user, Tier::Background, true), &spawn).unwrap();
+        assert!(first.spawned, "a cache MISS ran a real child and must say so");
+
+        let second = run_isolated_reply(req(user, Tier::Background, true), &spawn).unwrap();
+        assert_eq!(second.text, first.text, "same answer");
+        assert!(!second.spawned, "a cache HIT asked the CLI nothing and must not claim health");
+    }
+
+    #[test]
+    fn the_health_gate_emits_for_a_spawn_and_stays_silent_for_a_cache_hit() {
+        // roborev 57507 then 57515. The FIRST version of this test asserted
+        // `should_report_health(true) == true` — the identity function on bool, i.e. true by
+        // definition, which is the repo's #1 vacuous shape and left the real `if` unpinned. This
+        // one drives the gate through a counting sink, so deleting the `if` in `report_health`
+        // fails it. That deletion is not hypothetical: it reinstates the cache-hit masking bug the
+        // `spawned` flag exists to prevent, where a persistent unanswered prompt hits the cache
+        // every tick and a wedged CLI reports itself healthy forever.
+        struct Counting(std::cell::Cell<usize>);
+        impl HealthSink for Counting {
+            fn emit_health(&self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+
+        let sink = Counting(std::cell::Cell::new(0));
+        report_health(&sink, false);
+        assert_eq!(sink.0.get(), 0, "a cache hit asked the CLI nothing and must not report health");
+        report_health(&sink, true);
+        assert_eq!(sink.0.get(), 1, "a real child that answered must report health exactly once");
+    }
+
+    #[test]
+    fn the_event_name_is_pinned_because_it_is_a_cross_language_contract() {
+        // `AI_SPAWN_OK_EVENT` is matched by a string literal in TS
+        // (services/aiServiceHealthListener.ts), with no shared source between the two. A rename on
+        // either side is SILENT — the listener simply stops firing and a latched banner survives
+        // forever with a healthy CLI. Pinned to the literal on both sides so a rename has to break
+        // a test rather than a user's afternoon. This is the cheap half of the untested-adapter gap
+        // documented on `finish_cacheable`; the emit itself still needs tauri's `test` feature.
+        assert_eq!(AI_SPAWN_OK_EVENT, "ai://spawn-ok");
+    }
+
+    #[test]
+    fn an_uncacheable_call_always_reports_a_spawn() {
+        // The chat sink is `cacheable: false`, so it can never be served from cache — which is why
+        // `chatOnce` is allowed to report success from JS with no flag to consult.
+        let spawn = |_: &[String]| Ok(OK_JSON.to_string());
+        for _ in 0..2 {
+            let reply =
+                run_isolated_reply(req("uncached-probe", Tier::Background, false), &spawn).unwrap();
+            assert!(reply.spawned);
+        }
+    }
+
+    #[test]
     fn a_failed_call_is_never_cached() {
         let user = "failure-probe: only this test uses this exact string";
         let calls = std::sync::atomic::AtomicUsize::new(0);
@@ -1220,6 +1623,112 @@ mod tests {
         assert!(run_isolated(req(user, Tier::Background, true), &spawn).is_err());
         // The user fixing their login must take effect on the very next call, not after a restart.
         assert_eq!(calls.load(Ordering::SeqCst), 2, "a failure must not stick to the prompt");
+    }
+
+    /// A real capture of the 2026-08-02 shape: the subscription's allowance is spent, so the CLI
+    /// exits 0 with `is_error` set, a 429, and no usage numbers at all.
+    const USAGE_LIMIT_JSON: &str = r#"{"is_error":true,"subtype":"success",
+        "terminal_reason":"api_error","api_error_status":429,
+        "result":"Claude usage limit reached. Your limit resets at 5:00pm.",
+        "total_cost_usd":0,"duration_ms":427,
+        "usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0}}"#;
+
+    /// Run `body` with a subscriber capturing everything, and return what was emitted. Same
+    /// `MakeWriter`-over-a-shared-buffer pattern `concierge_lint_log` uses, and for the same reason:
+    /// the property under test is what actually reached the log, which nothing else can observe.
+    fn captured_logs(body: impl FnOnce()) -> String {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Shared(Arc<Mutex<Vec<u8>>>);
+        impl Write for Shared {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Shared {
+            type Writer = Shared;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(Shared(Arc::clone(&buf)))
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        tracing::subscriber::with_default(subscriber, body);
+        let guard = buf.lock().unwrap_or_else(|e| e.into_inner());
+        let out = String::from_utf8_lossy(&guard).to_string();
+        drop(guard);
+        out
+    }
+
+    #[test]
+    fn a_failed_run_is_logged_as_a_failure_not_as_a_completion() {
+        // THE ASSERTION THAT GUARDS THE MISLEADING LOG. `log_outcome` used to be called before
+        // classification, so this exact payload emitted "claude one-shot completed" with all-zero
+        // usage. That line is why 2026-08-02 was diagnosed as "cache hits, service healthy,
+        // recovery under-fed" when in fact every call was being rejected. Asserting on the EMITTED
+        // OUTPUT is the only thing that turns red if the call is moved back above the classifier.
+        let logged = captured_logs(|| {
+            let err = run_isolated(req("log-probe-failed", Tier::Background, false), &|_| {
+                Ok(USAGE_LIMIT_JSON.to_string())
+            })
+            .unwrap_err();
+            assert_eq!(err, "claude_usage_limit");
+        });
+
+        assert!(!logged.is_empty(), "nothing captured — the harness is broken, so this would pass vacuously");
+        assert!(
+            !logged.contains("claude one-shot completed"),
+            "a run that returned an error must NOT be logged as a completion: {logged}"
+        );
+        assert!(logged.contains("claude one-shot FAILED"), "the failure must be logged: {logged}");
+        assert!(
+            logged.contains("claude_usage_limit"),
+            "the typed sentinel is what reconciles the log with the banner: {logged}"
+        );
+    }
+
+    #[test]
+    fn a_successful_run_is_still_logged_as_a_completion() {
+        // The other direction, so the fix above cannot be "log FAILED for everything".
+        let logged = captured_logs(|| {
+            assert_eq!(
+                run_isolated(req("log-probe-ok", Tier::Background, false), &|_| Ok(
+                    OK_JSON.to_string()
+                ))
+                .unwrap(),
+                "DONE"
+            );
+        });
+        assert!(logged.contains("claude one-shot completed"), "{logged}");
+        assert!(!logged.contains("claude one-shot FAILED"), "{logged}");
+    }
+
+    #[test]
+    fn a_cache_hit_says_so_instead_of_logging_nothing() {
+        // A hit used to be invisible, which is what made "all-zero usage" ambiguous between a hit
+        // and a failure — the single ambiguity that misdirected the 2026-08-02 diagnosis. The two
+        // spend nothing and look alike from outside, so the log has to name which one happened.
+        let user = "log-probe-cache: only this test uses this exact string";
+        let logged = captured_logs(|| {
+            let spawn = |_: &[String]| Ok(OK_JSON.to_string());
+            assert_eq!(run_isolated(req(user, Tier::Background, true), &spawn).unwrap(), "DONE");
+            assert_eq!(run_isolated(req(user, Tier::Background, true), &spawn).unwrap(), "DONE");
+        });
+        assert!(
+            logged.contains("claude one-shot served from cache"),
+            "the second call was served from cache and must say so: {logged}"
+        );
     }
 
     #[test]
@@ -1237,7 +1746,8 @@ mod tests {
             project: None,
         })
         .expect("live call should succeed");
-        assert!(out.to_uppercase().contains("DONE"), "got {out:?}");
+        assert!(out.text.to_uppercase().contains("DONE"), "got {out:?}");
+        assert!(out.spawned, "an uncached live call must report a real spawn");
     }
 }
 

@@ -96,6 +96,9 @@ fn build_user_message(task: &str, response: &str) -> String {
 /// Sparkle account.
 #[tauri::command]
 pub async fn judge_turn_followup(
+    // INJECTED BY TAURI — the JS call signature is unchanged. It carries the health signal for a
+    // real spawn back to `aiServiceHealthStore`; see `claude_oneshot::AI_SPAWN_OK_EVENT`.
+    app: tauri::AppHandle,
     task: String,
     response: String,
     // Display name of the project whose agent produced this turn. Diagnostic only now — it used to
@@ -111,11 +114,12 @@ pub async fn judge_turn_followup(
 
     // Spawning the CLI and waiting out its wall clock is blocking work — keep it off the async
     // runtime's worker threads, exactly as the proxy call it replaced did.
-    tauri::async_runtime::spawn_blocking(move || {
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
         call_judge(&task, &response, project.as_deref())
     })
     .await
-    .map_err(|e| format!("join error: {e}"))?
+    .map_err(|e| format!("join error: {e}"))?;
+    crate::claude_oneshot::finish_cacheable(&app, outcome)
 }
 
 /// Build the request. Split out from `call_judge` so the three decisions encoded here are TESTABLE:
@@ -141,9 +145,18 @@ fn judge_request<'a>(user: &'a str, project: Option<&'a str>) -> OneShot<'a> {
     }
 }
 
-fn call_judge(task: &str, response: &str, project: Option<&str>) -> Result<String, String> {
+/// Returns the verdict text AND whether a real `claude` child produced it — the caller emits the
+/// health signal from the latter. See `claude_oneshot::OneShotReply`.
+/// Same `(Result, bool)` shape as naming/attention so all three funnel through
+/// `claude_oneshot::finish_cacheable`. The judge has no post-processing that can reject a reply, so
+/// the two shapes are equivalent HERE — it is written this way so the three call sites are
+/// identical and a reader cannot mistake this one for the exception.
+fn call_judge(task: &str, response: &str, project: Option<&str>) -> (Result<String, String>, bool) {
     let user = build_user_message(task, response);
-    run(judge_request(&user, project))
+    match run(judge_request(&user, project)) {
+        Err(e) => (Err(e), false),
+        Ok(reply) => (Ok(reply.text), reply.spawned),
+    }
 }
 
 #[cfg(test)]
