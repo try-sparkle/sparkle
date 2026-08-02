@@ -33,6 +33,7 @@
 
 import { emit, listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
+import { safeUnlisten } from "./safeUnlisten";
 import type { KV } from "./windowRegistry";
 
 /**
@@ -280,8 +281,10 @@ export function onSatellitesChange(cb: () => void): () => void {
     void listen(SATELLITES_CHANGED_EVENT, () => cb())
       .then((u) => {
         // A handle that resolves AFTER teardown must unlisten itself rather than leak for the life
-        // of the webview (the crossWindowSync `isTorndown` idiom).
-        if (torndown) u();
+        // of the webview (the crossWindowSync `isTorndown` idiom). Through safeUnlisten: Tauri's
+        // unlisten is async, so a raw `u()` returns a REJECTED promise (not a throw) once the
+        // listeners map is torn down, leaking an app-level unhandled rejection (sparkle-6csa).
+        if (torndown) void safeUnlisten(u);
         else unlisten = u;
       })
       .catch(() => {});
@@ -290,7 +293,7 @@ export function onSatellitesChange(cb: () => void): () => void {
     torndown = true;
     window.removeEventListener(LOCAL_CHANGE_EVENT, onLocal);
     window.removeEventListener("storage", onStorage);
-    unlisten?.();
+    void safeUnlisten(unlisten);
   };
 }
 

@@ -1,5 +1,17 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+
+// Controllable Tauri event module: `satListen` is what onSatellitesChange's `listen(...)` resolves
+// from, so a test can make the returned unlisten fn reject with the teardown race (sparkle-6csa).
+const { satListen, satUnlisten } = vi.hoisted(() => {
+  const satUnlisten = vi.fn();
+  return { satUnlisten, satListen: vi.fn(() => Promise.resolve(satUnlisten)) };
+});
+vi.mock("@tauri-apps/api/event", () => ({
+  emit: vi.fn(() => Promise.resolve()),
+  listen: satListen,
+}));
+
 import {
   SATELLITE_REGISTRY_KEY,
   claimSatellite,
@@ -124,6 +136,66 @@ describe("onSatellitesChange", () => {
     window.dispatchEvent(new StorageEvent("storage", { key: SATELLITE_REGISTRY_KEY }));
     expect(cb).toHaveBeenCalledTimes(1);
     off();
+  });
+});
+
+// ── sparkle-6csa: the Tauri unlisten is routed through safeUnlisten ──────────────────────────────
+// onSatellitesChange called Tauri's unlisten RAW in two spots — the "resolved after teardown"
+// branch and the returned disposer. Tauri's unlisten is async, so once the listeners map is torn
+// down it returns a REJECTED promise rather than throwing; a raw, un-awaited call leaks it as an
+// app-level unhandled rejection. safeUnlisten awaits + swallows only that benign race.
+//
+// Non-vacuity: the unlisten fn is forced to reject with the real teardown-race message and the test
+// asserts no such rejection escapes unhandled. Revert either call site to a raw `u()`/`unlisten?.()`
+// and the un-awaited rejected promise surfaces on `process`'s unhandledRejection → test fails.
+describe("onSatellitesChange teardown routes the Tauri unlisten through safeUnlisten (sparkle-6csa)", () => {
+  // A REJECTING unlisten mimicking Tauri's async unlisten on a torn-down listeners map. PLAIN fn,
+  // not a vi.fn: a vi.fn attaches its own handler to the promise it returns (for `mock.results`),
+  // marking the rejection HANDLED — so a raw dropped call to one never reaches `unhandledRejection`
+  // and the test would be vacuous. A plain fn's dropped rejection surfaces, which is the leak.
+  // The `as unknown as typeof satUnlisten` cast is compile-time ONLY (the `listen` mock slot is
+  // typed `Mock`); it must stay a plain arrow at runtime — do NOT replace it with a vi.fn.
+  const rejectingUnlisten = (() =>
+    Promise.reject(
+      new Error("undefined is not an object (evaluating 'listeners[eventId].handlerId')"),
+    )) as unknown as typeof satUnlisten;
+
+  beforeEach(() => {
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+    satListen.mockImplementation(() => Promise.resolve(rejectingUnlisten));
+  });
+  afterEach(() => {
+    delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+    satListen.mockImplementation(() => Promise.resolve(satUnlisten));
+  });
+
+  async function teardownRaceRejections(trigger: () => void): Promise<unknown[]> {
+    const seen: unknown[] = [];
+    const handler = (reason: unknown) => seen.push(reason);
+    process.on("unhandledRejection", handler);
+    try {
+      trigger();
+      await new Promise((r) => setTimeout(r, 50));
+    } finally {
+      process.off("unhandledRejection", handler);
+    }
+    return seen.filter((r) => (r instanceof Error ? r.message : String(r)).includes("handlerId"));
+  }
+
+  it("disposer swallows an async teardown-race unlisten", async () => {
+    const off = onSatellitesChange(() => {});
+    await Promise.resolve(); // let the listen resolve so `unlisten` is stored
+    expect(await teardownRaceRejections(() => off())).toHaveLength(0);
+  });
+
+  it("teardown-before-listen-resolves swallows an async teardown-race unlisten", async () => {
+    // Tear down BEFORE listen's .then runs → the `if (torndown)` branch unlistens the late handle.
+    expect(
+      await teardownRaceRejections(() => {
+        const off = onSatellitesChange(() => {});
+        off();
+      }),
+    ).toHaveLength(0);
   });
 });
 

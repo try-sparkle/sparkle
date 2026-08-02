@@ -35,6 +35,7 @@ import {
   onPtyExit,
   ignorePtyGone,
 } from "../pty";
+import { safeUnlisten } from "./safeUnlisten";
 import { getRelaySocket } from "./relayClient";
 
 /** A chunk of terminal output delivered to a transport subscriber. `bytes` is the authoritative
@@ -116,13 +117,16 @@ export class LocalTransport implements AgentTransport {
     let cancelled = false;
     const p = onPtyOutput(this.id, (e) => cb({ chunk: e.chunk, bytes: e.bytes })).then((u) => {
       // Unlistened before the subscribe resolved — tear the just-registered listener straight down.
-      if (cancelled) u();
+      // Through safeUnlisten: Tauri's unlisten is async, so a raw `u()` here returns a REJECTED
+      // promise (not a throw) when the listeners map is already torn down, and it floats free as an
+      // app-level unhandled rejection (sparkle-6csa). safeUnlisten awaits+swallows that race.
+      if (cancelled) void safeUnlisten(u);
       else un = u;
     });
     this.ready.push(p.catch(() => {}));
     return () => {
       cancelled = true;
-      un?.();
+      void safeUnlisten(un);
       un = null;
     };
   }
@@ -135,13 +139,15 @@ export class LocalTransport implements AgentTransport {
     const p = onPtyExit((e) => {
       if (e.id === this.id) cb({});
     }).then((u) => {
-      if (cancelled) u();
+      // Same teardown-race guard as onOutput (sparkle-6csa): route the inner unlisten through
+      // safeUnlisten so a late-resolving listen's raw unlisten can't leak an unhandled rejection.
+      if (cancelled) void safeUnlisten(u);
       else un = u;
     });
     this.ready.push(p.catch(() => {}));
     return () => {
       cancelled = true;
-      un?.();
+      void safeUnlisten(un);
       un = null;
     };
   }

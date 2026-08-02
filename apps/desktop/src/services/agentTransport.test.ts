@@ -171,6 +171,85 @@ describe("LocalTransport delegation to pty.ts", () => {
   });
 });
 
+// ── sparkle-6csa: inner unlisten routed through safeUnlisten ─────────────────────────────────────
+// LocalTransport's onOutput/onExit each called Tauri's unlisten RAW in two spots — the
+// "cancelled before the listen resolved" branch and the returned disposer. Tauri's unlisten is
+// async, so once the webview's listeners map is torn down it returns a REJECTED promise rather than
+// throwing; a raw, un-awaited call leaks it as an app-level unhandled rejection (the ~37
+// "…handlerId" rejections in the bug). Routing through safeUnlisten awaits + swallows that race.
+//
+// Non-vacuity: each test forces the unlisten fn to reject with the real teardown-race message and
+// asserts NO such rejection escapes unhandled. Revert any call site to a raw `u()`/`un?.()` and the
+// un-awaited rejected promise surfaces on `process`'s unhandledRejection — the filtered array is
+// non-empty and the test fails.
+describe("LocalTransport teardown routes inner unlisten through safeUnlisten (sparkle-6csa)", () => {
+  // A REJECTING unlisten that mimics Tauri's async unlisten hitting a torn-down listeners map.
+  // Deliberately a PLAIN function, NOT a vi.fn: a vi.fn attaches its own handler to the promise it
+  // returns (for `mock.results`), which marks the rejection HANDLED — so a raw, dropped call to a
+  // vi.fn would never surface on `unhandledRejection` and the test would be vacuous. A plain fn's
+  // dropped rejection reaches node's handler, which is exactly the leak this fix prevents.
+  // The `as unknown as typeof outUnlisten` cast is compile-time ONLY (the onPty* mock slots are
+  // typed `Mock`); it must stay a plain arrow at runtime — do NOT replace it with a vi.fn.
+  const rejectingUnlisten = (() =>
+    Promise.reject(
+      new Error("undefined is not an object (evaluating 'listeners[eventId].handlerId')"),
+    )) as unknown as typeof outUnlisten;
+
+  /** Run `trigger`, then wait past node's macrotask so any un-awaited rejection is reported; return
+   *  only the teardown-race ("handlerId") rejections so unrelated noise can't flip the assertion. */
+  async function teardownRaceRejections(trigger: () => void): Promise<unknown[]> {
+    const seen: unknown[] = [];
+    const handler = (reason: unknown) => seen.push(reason);
+    process.on("unhandledRejection", handler);
+    try {
+      trigger();
+      await new Promise((r) => setTimeout(r, 50));
+    } finally {
+      process.off("unhandledRejection", handler);
+    }
+    return seen.filter((r) => (r instanceof Error ? r.message : String(r)).includes("handlerId"));
+  }
+
+  it("onOutput disposer swallows an async teardown-race unlisten", async () => {
+    onPtyOutput.mockImplementationOnce(() => Promise.resolve(rejectingUnlisten));
+    const t = new LocalTransport("agent-1");
+    const off = t.onOutput(() => {});
+    await Promise.resolve(); // let the listen resolve so `un` is stored
+    expect(await teardownRaceRejections(() => off())).toHaveLength(0);
+  });
+
+  it("onOutput cancel-before-listen-resolves swallows an async teardown-race unlisten", async () => {
+    onPtyOutput.mockImplementationOnce(() => Promise.resolve(rejectingUnlisten));
+    const t = new LocalTransport("agent-1");
+    // Dispose BEFORE the listen promise's .then runs → the `if (cancelled)` branch tears it down.
+    expect(
+      await teardownRaceRejections(() => {
+        const off = t.onOutput(() => {});
+        off();
+      }),
+    ).toHaveLength(0);
+  });
+
+  it("onExit disposer swallows an async teardown-race unlisten", async () => {
+    onPtyExit.mockImplementationOnce(() => Promise.resolve(rejectingUnlisten));
+    const t = new LocalTransport("agent-1");
+    const off = t.onExit(() => {});
+    await Promise.resolve();
+    expect(await teardownRaceRejections(() => off())).toHaveLength(0);
+  });
+
+  it("onExit cancel-before-listen-resolves swallows an async teardown-race unlisten", async () => {
+    onPtyExit.mockImplementationOnce(() => Promise.resolve(rejectingUnlisten));
+    const t = new LocalTransport("agent-1");
+    expect(
+      await teardownRaceRejections(() => {
+        const off = t.onExit(() => {});
+        off();
+      }),
+    ).toHaveLength(0);
+  });
+});
+
 // ── CloudTransport against a fake socket ────────────────────────────────────────────────────────
 
 function fakeSocket() {
