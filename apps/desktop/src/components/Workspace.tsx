@@ -57,10 +57,12 @@ import { focusedZoomColumn, installColumnFocusTracker } from "../services/column
 import { useColumnZoom } from "../hooks/useZoomColumn";
 import { useWindowWidth } from "../hooks/useWindowWidth";
 import {
-  COLUMN_HARD_MAX,
-  COLUMN_MIN_WIDTH,
-  CONCIERGE_PAIRED_HARD_MAX,
+  CONCIERGE_MAX_WIDTH,
+  CONCIERGE_MIN_WIDTH,
+  // CONCIERGE_PAIRED_HARD_MAX is no longer read here — `acceptsStoredConciergeWidth` owns the
+  // choice between the two ceilings now, which is the point of it being a predicate.
   CONCIERGE_WIDTH_VAR,
+  acceptsStoredConciergeWidth,
   conciergePairedMax,
   windowAwareMax,
 } from "../engine/columnResize";
@@ -448,14 +450,11 @@ export function Pair({
  *  default. */
 export { CONCIERGE_WIDTH_KEY, CONCIERGE_WIDTH_KEY_PAIRED } from "../engine/columnResize";
 import { CONCIERGE_WIDTH_KEY, CONCIERGE_WIDTH_KEY_PAIRED } from "../engine/columnResize";
-/** The shared 50px floor every column now answers to — see `COLUMN_MIN_WIDTH` in engine/columnResize.
- *  Was 280, which on a ~890px window put this column's ceiling AT its floor (`min 280, max 280` in the
- *  log) and left the seam dead through three consecutive drags. */
-const CONCIERGE_MIN_WIDTH = COLUMN_MIN_WIDTH;
-/** The single-pair ceiling. Now the shared sanity cap rather than a bare 560: the founder's rule is
- *  that only the 50px floors narrow a column, and `windowAwareMax` below still keeps the seam inside
- *  the window. */
-const CONCIERGE_MAX_WIDTH = COLUMN_HARD_MAX;
+// THE CONCIERGE'S BOUNDS LIVE IN engine/columnResize NOW, not as private aliases here. They were
+// `const CONCIERGE_MIN_WIDTH = COLUMN_MIN_WIDTH` / `= COLUMN_HARD_MAX` — private, so the ONE other
+// place that has to agree with them (`dev/visualFixtures`, which seeds this column's stored width
+// for the capture harness) could only bound itself on the column constants and hope the aliases
+// stayed identity. See `acceptsStoredConciergeWidth`, which is what both call now.
 // Re-exported from engine/columnResize, which owns the sibling column widths and is importable
 // from a node-environment test without pulling this module's store/Tauri graph in (roborev 56223).
 export { CONCIERGE_DEFAULT_WIDTH } from "../engine/columnResize";
@@ -549,16 +548,17 @@ export function Workspace() {
   // user did in between.
   const [conciergeWidths, setConciergeWidthsRaw] = useState<Record<1 | 2, number>>(() => {
     const rawSingle = Number(localStorage.getItem(CONCIERGE_WIDTH_KEY));
-    const single =
-      rawSingle >= CONCIERGE_MIN_WIDTH && rawSingle <= CONCIERGE_MAX_WIDTH
-        ? rawSingle
-        : CONCIERGE_DEFAULT_WIDTH;
+    // THROUGH THE SHARED PREDICATE, not an inline comparison against two local constants. This is
+    // the app's definition of "a stored concierge width we will honour", and anything that WRITES
+    // that storage has to agree with it — see `acceptsStoredConciergeWidth`.
+    const single = acceptsStoredConciergeWidth(rawSingle, { paired: false })
+      ? rawSingle
+      : CONCIERGE_DEFAULT_WIDTH;
     // VALIDATED AGAINST THE HARD CEILING, not the window-aware one: the live clamp happens at render
     // (`renderedConciergeWidth`), so a width chosen on a three-display span is KEPT while docked to a
     // laptop and restored on the way back — the same preference-survival rule the build columns have.
     const rawPaired = Number(localStorage.getItem(CONCIERGE_WIDTH_KEY_PAIRED));
-    const paired =
-      rawPaired >= CONCIERGE_MIN_WIDTH && rawPaired <= CONCIERGE_PAIRED_HARD_MAX ? rawPaired : single;
+    const paired = acceptsStoredConciergeWidth(rawPaired, { paired: true }) ? rawPaired : single;
     return { 1: single, 2: paired };
   });
   // NOT PERSISTED PER PIXEL, and not re-created per render. Both halves are on the drag's hot path.

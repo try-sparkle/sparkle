@@ -19,10 +19,12 @@ import { PROJECTS_PERSIST_DEBOUNCE_MS, PROJECTS_PERSIST_KEY, debouncedProjectsSt
 import { RUNTIME_PERSIST_KEY, useRuntimeStore } from "../stores/runtimeStore";
 import { DICTATION_PERSIST_KEY, useDictationStore } from "../stores/dictationStore";
 import {
-  COLUMN_HARD_MAX,
-  COLUMN_MIN_WIDTH,
+  CONCIERGE_MAX_WIDTH,
+  CONCIERGE_MIN_WIDTH,
+  CONCIERGE_PAIRED_HARD_MAX,
   CONCIERGE_WIDTH_KEY,
   CONCIERGE_WIDTH_KEY_PAIRED,
+  acceptsStoredConciergeWidth,
 } from "../engine/columnResize";
 import { goalStateOf } from "../engine/agentGoal";
 import type { Project } from "../types";
@@ -410,11 +412,57 @@ describe("the concierge-width parameter", () => {
   // very failure the block comment above says this parser exists to prevent (roborev 57518).
   it("reads a width the shell would accept, across its whole real range", () => {
     expect(visualConciergeWidth("?visual=1&concierge=190")).toBe(190);
-    expect(visualConciergeWidth(`?visual=1&concierge=${COLUMN_MIN_WIDTH}`)).toBe(COLUMN_MIN_WIDTH);
-    expect(visualConciergeWidth(`?visual=1&concierge=${COLUMN_HARD_MAX}`)).toBe(COLUMN_HARD_MAX);
+    expect(visualConciergeWidth(`?visual=1&concierge=${CONCIERGE_MIN_WIDTH}`)).toBe(
+      CONCIERGE_MIN_WIDTH,
+    );
+    // THE CONCIERGE'S OWN CEILING, not the generic column one. They are the same number today and
+    // that is exactly the trap: `Workspace` validates against the concierge bounds, so a test
+    // written against the column bounds tracks the wrong thing the moment they part (roborev 57514).
+    expect(visualConciergeWidth(`?visual=1&concierge=${CONCIERGE_MAX_WIDTH}`)).toBe(
+      CONCIERGE_MAX_WIDTH,
+    );
     // The width the paired-key docblock names as a real founder layout. It sits above the old
     // literal ceiling, which is the concrete case that ceiling was silently refusing.
     expect(visualConciergeWidth("?visual=1&concierge=1920")).toBe(1920);
+  });
+
+  // ── THE PARSER AGREES WITH THE SHARED PREDICATE ──────────────────────────────────────────────
+  //
+  // SCOPED HONESTLY. This file is NODE-environment and never imports `Workspace`, so NOTHING here
+  // can observe the shell — an earlier version of this block claimed it could, and the claim was
+  // false in the way that matters: dropping the initialiser's validation left it green. What it
+  // pins is one link: the parser's verdict tracks `acceptsStoredConciergeWidth`, which matters
+  // because the parser is free to add bounds of its own (it already adds an integer check) and a
+  // second bound bolted on here would silently narrow what the harness can ask for.
+  //
+  // THE COUPLING TO THE APP is asserted where it can actually be seen — `Workspace.resize.test.tsx`
+  // seeds through `applyVisualFixtures` and mounts the real shell, so it goes red if the fixture
+  // writes a key nobody reads or the initialiser refuses a width the fixture would seed.
+  //
+  // Swept rather than sampled, across every bound in both directions — INCLUDING the paired ceiling,
+  // which the parser deliberately does NOT consult. That is the point of probing it: the initialiser
+  // falls back from a refused paired width to the SINGLE width rather than to the default, so such a
+  // width is still KEPT at that width, and a parser that rejected it would write no key and land on
+  // the 360px default — mislabelling the capture it was guarding (roborev 57533). These probes fail
+  // if someone re-adds the paired arm once the two ceilings part.
+  //
+  // KEPT, not PAINTED: in the two-pair layout paint is clamped by `conciergePairedMax`, so a width
+  // between the two ceilings really does photograph narrow there. That hazard is real and belongs to
+  // the per-surface paint guard in Workspace.resize.test.tsx, which mounts each surface in its own
+  // layout — not to this bound (roborev 57534).
+  it("accepts exactly what acceptsStoredConciergeWidth accepts — the parser adds no second bound", () => {
+    const edges = [
+      CONCIERGE_MIN_WIDTH,
+      CONCIERGE_MAX_WIDTH,
+      CONCIERGE_PAIRED_HARD_MAX,
+      Math.min(CONCIERGE_MAX_WIDTH, CONCIERGE_PAIRED_HARD_MAX),
+    ];
+    const probes = new Set<number>([190, 360, 1000, 1920]);
+    for (const e of edges) for (const d of [-1, 0, 1]) probes.add(e + d);
+    for (const n of probes) {
+      const honoured = acceptsStoredConciergeWidth(n, { paired: false });
+      expect(visualConciergeWidth(`?visual=1&concierge=${n}`) !== null, `width ${n}`).toBe(honoured);
+    }
   });
 
   it("is absent by default, so every existing surface keeps its baseline", () => {
@@ -429,8 +477,8 @@ describe("the concierge-width parameter", () => {
     // Both rejected bounds are expressed as the shell's constants ± 1, so this test cannot drift
     // from the shell the way the literal `1401` did.
     const bad = [
-      String(COLUMN_MIN_WIDTH - 1),
-      String(COLUMN_HARD_MAX + 1),
+      String(CONCIERGE_MIN_WIDTH - 1),
+      String(CONCIERGE_MAX_WIDTH + 1),
       "0",
       "-200",
       "abc",

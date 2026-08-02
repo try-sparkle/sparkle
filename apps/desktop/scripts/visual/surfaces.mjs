@@ -20,6 +20,19 @@
  * FIXTURE must seed before mount (the two-pair cockpit) and which therefore cannot come from a step.
  */
 
+/**
+ * THE CAPTURE VIEWPORT — part of the registry's contract, not capture.mjs's private business.
+ *
+ * A surface's steps and its viewport are one description of a state: `?concierge=190` means a very
+ * different picture at 1600 than at 900, and the shell CLAMPS a column to what the window can paint,
+ * so a width the app happily stores can still photograph narrower than the filename claims. Living
+ * here means a test can check that pairing without importing capture.mjs, which pulls in node
+ * built-ins and cannot load in a jsdom suite (`Workspace.resize.test.tsx` is where that check runs,
+ * because answering it needs the real shell's paint path). capture.mjs re-exports it, so its own
+ * `--width` / `--height` defaults are unchanged.
+ */
+export const DEFAULT_VIEWPORT = { width: 1600, height: 1000 };
+
 /** Everything in the mock page that is scaffolding rather than design, hidden before capture. */
 export const MOCK_CHROME_SELECTORS = ["#bar", ".bar", "#cap", ".cap", "#why", ".note"];
 

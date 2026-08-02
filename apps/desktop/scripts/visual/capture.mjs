@@ -11,9 +11,18 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { launch } from "./cdp.mjs";
 import { startDevServer, TAURI_SHIM, FROZEN_CLOCK } from "./serve.mjs";
-import { SURFACES, THEMES, artifactName, selectSurfaces, stepToExpression } from "./surfaces.mjs";
+import {
+  DEFAULT_VIEWPORT,
+  SURFACES,
+  THEMES,
+  artifactName,
+  selectSurfaces,
+  stepToExpression,
+} from "./surfaces.mjs";
 
-export const DEFAULT_VIEWPORT = { width: 1600, height: 1000 };
+// Re-exported so every existing importer (and the `--width`/`--height` defaults below) is
+// unchanged; it LIVES in the registry now — see the note there.
+export { DEFAULT_VIEWPORT };
 
 /** `--key=value` and bare `--flag` into an object. Pure, so the CLI contract is testable. */
 export function parseArgs(argv) {

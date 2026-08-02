@@ -48,10 +48,9 @@ import { useDictationStore } from "../stores/dictationStore";
 // node-environment test — clear of the Workspace graph. See `visualConciergeWidth` for why a
 // re-spelled key is not a cosmetic issue here but a silently mislabelled screenshot.
 import {
-  COLUMN_HARD_MAX,
-  COLUMN_MIN_WIDTH,
   CONCIERGE_WIDTH_KEY,
   CONCIERGE_WIDTH_KEY_PAIRED,
+  acceptsStoredConciergeWidth,
 } from "../engine/columnResize";
 import { devBypassAuthEnabled } from "./devBypassAuth";
 
@@ -115,10 +114,37 @@ export const VISUAL_CONCIERGE_WIDTH_PARAM = "concierge";
  * (bead sparkle-8g4qh) and no capture could have caught it, because every surface photographs the
  * concierge at its 380px default where the panel still looks fine.
  *
- * Bounds are the app's own — `COLUMN_MIN_WIDTH` … `COLUMN_HARD_MAX`, both imported rather than
- * re-spelled: a value the shell would refuse is not a state worth photographing, and returning it
- * would produce a capture of the DEFAULT width under a filename claiming otherwise — the
- * mislabelled-screenshot failure this harness has hit before.
+ * BOUNDED BY THE APP'S OWN PREDICATE, not by constants this file compares for itself.
+ * `acceptsStoredConciergeWidth` is what `Workspace`'s state initialiser calls on exactly these two
+ * keys, so "a width the initialiser will keep" has ONE definition and this cannot drift out of step
+ * with it. Bounding on the COLUMN constants — even imported ones, as this did — was not enough:
+ * `Workspace` validates against the CONCIERGE's bounds, which merely alias them today, and that
+ * ceiling was 560 until recently. Tighten either and a value accepted here is rejected there, the
+ * app silently falls back to `CONCIERGE_DEFAULT_WIDTH`, and `open-pr-menu-narrow` files a 360px
+ * capture under a name claiming otherwise. Sharing the bounds would still leave two call sites free
+ * to compare them differently; sharing the predicate leaves nothing to drift (roborev 57514).
+ *
+ * ONLY THE SINGLE-PAIR ARM, and the reasoning is worth spelling out because two earlier versions of
+ * this paragraph got it wrong in opposite directions (roborev 57533, 57534). The seeder writes both
+ * keys, so requiring both ceilings looks right. It is not, and the reason is the initialiser's
+ * fallback chain: `paired = accepts(rawPaired, {paired:true}) ? rawPaired : single`. A rejected
+ * PAIRED value falls back to the SINGLE width rather than to the default, so a width the single
+ * ceiling accepts and the paired one refuses is still KEPT at that width by the initialiser in both
+ * layouts. Refusing it here instead writes NO key, which lands on `CONCIERGE_DEFAULT_WIDTH` — a 360px
+ * capture under a name claiming otherwise, i.e. the guard causing the very failure it exists to
+ * prevent.
+ *
+ * KEPT IS NOT PAINTED, and that distinction is the whole of what this bound does not cover. In the
+ * two-pair layout the paint ceiling is `conciergePairedMax`, which never exceeds
+ * `CONCIERGE_PAIRED_HARD_MAX` — so once the two ceilings part, a `pairs=2` surface asking for a `W`
+ * between them is stored at `W` and PAINTED at the paired cap. That is a real hazard and it is
+ * simply not this function's to catch: the backstop is the per-surface paint guard in
+ * `Workspace.resize.test.tsx`, which mounts each surface in ITS OWN layout (which is exactly why it
+ * replays the surface's whole query rather than the width alone). See also the scope note below.
+ *
+ * The reverse direction really does diverge at the initialiser — a width above the single ceiling
+ * but under the paired one gives `single = DEFAULT` and `paired = W` — and that is the case the
+ * `{paired: false}` arm refuses. One arm, because one of the two is this function's problem.
  *
  * THE CEILING WAS A LITERAL `1400` AND THAT WAS THE SAME BUG AT THE OTHER END (roborev 57518). The
  * shell's real cap is `COLUMN_HARD_MAX`, so 1400 rejected widths the app accepts and persists —
@@ -126,13 +152,30 @@ export const VISUAL_CONCIERGE_WIDTH_PARAM = "concierge";
  * own docblock. A surface asking for `?concierge=1920` parsed to null, wrote no key, and would have
  * photographed the default column under a filename claiming a wide one. A bound that is a second
  * spelling of the app's bound is a bound that can silently disagree with it.
+ *
+ * ── WHAT THIS DOES *NOT* GUARANTEE, stated plainly because an earlier version of this note claimed
+ * otherwise (roborev 57522) ──────────────────────────────────────────────────────────────────────
+ * The predicate answers the STORED-WIDTH half only: will the initialiser keep this number. The
+ * shell clamps again at PAINT time — `renderedConciergeWidth = min(width, conciergeMax)`, and
+ * `conciergeMax` is window-aware — so a width accepted here can still photograph NARROWER than the
+ * filename claims once it exceeds what the capture viewport can paint. At the harness's 1600px
+ * viewport that ceiling is ~1234, far below the 8000 this predicate allows.
+ *
+ * That is deliberately NOT fixed by a branch here. It would make this parser viewport-dependent for
+ * a case no surface is anywhere near — the parameter exists to photograph NARROW columns, which is
+ * the opposite end — and it is a surface-authoring mistake rather than a runtime condition. It is
+ * guarded where it can be observed instead: `Workspace.resize.test.tsx` mounts the real shell at
+ * the real capture viewport for every surface that asks for a width, and fails if the painted width
+ * is not the one requested.
  */
 export function visualConciergeWidth(search: string): number | null {
   const raw = new URLSearchParams(search).get(VISUAL_CONCIERGE_WIDTH_PARAM);
   if (raw === null) return null;
   const n = Number(raw);
-  if (!Number.isFinite(n) || !Number.isInteger(n)) return null;
-  return n >= COLUMN_MIN_WIDTH && n <= COLUMN_HARD_MAX ? n : null;
+  // Integers only — a fractional or exponent-suffixed width is a typo, not a state to photograph.
+  // This is a query-string concern rather than a stored-width one, so it stays here.
+  if (!Number.isInteger(n)) return null;
+  return acceptsStoredConciergeWidth(n, { paired: false }) ? n : null;
 }
 
 /** The query parameter that seeds open pull requests: `?prs=1`. */

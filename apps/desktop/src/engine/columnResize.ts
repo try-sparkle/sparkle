@@ -365,6 +365,44 @@ export function conciergePairedReserve(): number {
  *  window. Shares `COLUMN_HARD_MAX` so no column carries a tighter sanity cap than any other. */
 export const CONCIERGE_PAIRED_HARD_MAX = COLUMN_HARD_MAX;
 
+/** The concierge's own floor — the shared 50px floor every column answers to. It was 280, which on
+ *  a ~890px window put this column's ceiling AT its floor (`min 280, max 280` in the log) and left
+ *  the seam dead through three consecutive drags. */
+export const CONCIERGE_MIN_WIDTH = COLUMN_MIN_WIDTH;
+/** The single-pair ceiling. The shared sanity cap rather than a bare 560: the founder's rule is that
+ *  only the 50px floors narrow a column, and the window-aware max keeps the seam inside the window. */
+export const CONCIERGE_MAX_WIDTH = COLUMN_HARD_MAX;
+
+/**
+ * Whether a width read back from storage is one this app will HONOUR — the single authority, called
+ * by everyone who needs the answer.
+ *
+ * A PREDICATE RATHER THAN THREE EXPORTED BOUNDS, and the difference is the whole point. `Workspace`
+ * validated a stored width inline against two PRIVATE aliases of the column constants, while
+ * `dev/visualFixtures` — which SEEDS that storage for the capture harness — bounded its own
+ * parameter on the column constants directly. Those agree only because the aliases are currently
+ * identity, which nothing enforces and which has already been false once: this ceiling was 560 until
+ * recently. Tighten either and the fixture accepts a width the app then rejects — `?concierge=1000`
+ * is written to both keys, the initialiser refuses it, the app falls back to
+ * `CONCIERGE_DEFAULT_WIDTH`, and `open-pr-menu-narrow` files a 360px capture under a name claiming
+ * 1000. Sharing the BOUNDS would still leave two call sites free to compare them differently; a
+ * shared PREDICATE leaves nothing to drift.
+ *
+ * `paired` picks the ceiling: the two-pair shell stores its width separately and answers to
+ * {@link CONCIERGE_PAIRED_HARD_MAX}, because in that layout the concierge is the ANCHOR rather than
+ * a reading column. A non-finite input (an absent key reads back as `NaN` or `0`) is refused by the
+ * comparisons anyway; it is named so the intent is not left to coercion.
+ *
+ * NOTE ON SCOPE, because a comment elsewhere once claimed more: this answers "will the state
+ * initialiser KEEP this number". The shell clamps AGAIN at paint time against a window-aware max,
+ * so a width accepted here can still be painted narrower on a small window.
+ */
+export function acceptsStoredConciergeWidth(width: number, opts: { paired: boolean }): boolean {
+  if (!Number.isFinite(width)) return false;
+  const max = opts.paired ? CONCIERGE_PAIRED_HARD_MAX : CONCIERGE_MAX_WIDTH;
+  return width >= CONCIERGE_MIN_WIDTH && width <= max;
+}
+
 /** The widest the concierge may be dragged in a TWO-PAIR row: whatever the window leaves once every
  *  other column keeps its 50px floor and both rails keep theirs, and never below `min`. */
 export function conciergePairedMax(windowWidth: number, min: number): number {

@@ -100,9 +100,14 @@ import {
 import {
   COLUMN_HARD_MAX,
   COLUMN_MIN_WIDTH,
+  CONCIERGE_DEFAULT_WIDTH,
+  CONCIERGE_MAX_WIDTH,
+  CONCIERGE_MIN_WIDTH,
   CONCIERGE_WIDTH_VAR,
   windowAwareMax,
 } from "../engine/columnResize";
+import { applyVisualFixtures } from "../dev/visualFixtures";
+import { DEV_BYPASS_AUTH_FLAG } from "../dev/devBypassAuth";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
@@ -1010,7 +1015,12 @@ describe("dragging the concierge seam moves the column", () => {
     // the initializer deliberately keeps a width chosen on a bigger display and clamps it at PAINT
     // (see `renderedConciergeWidth`), so seeding one past the learned window max would be restored
     // on purpose and this row would be asserting the opposite of the contract.
-    ["above the maximum", () => COLUMN_HARD_MAX + 1],
+    // THE CONCIERGE'S ceiling, not the shared column one. They are the same number today, which is
+    // exactly why this drifted: the initialiser validates through `acceptsStoredConciergeWidth`,
+    // which reads `CONCIERGE_MAX_WIDTH`, so seeding `COLUMN_HARD_MAX + 1` stops being "one step
+    // outside the real bound" the moment the two part — still green, no longer probing anything
+    // (roborev 57533, and the same drift this change closes elsewhere).
+    ["above the maximum", () => CONCIERGE_MAX_WIDTH + 1],
     ["below the minimum", (g: { min: number; max: number }) => g.min - 1],
   ])("ignores a persisted width %s rather than restoring it", async (_label, seedFor) => {
     const geo = learnGeometry();
@@ -1024,5 +1034,118 @@ describe("dragging the concierge seam moves the column", () => {
 
     render(<Workspace />);
     expect(Number(conciergeWidthAttr())).toBe(geo.start);
+  });
+});
+
+// ── THE CAPTURE HARNESS'S SEED IS HONOURED BY THE REAL SHELL ───────────────────────────────────
+//
+// `dev/visualFixtures` seeds a concierge width for the `open-pr-menu-narrow` surface, and it bounds
+// what it will seed with `acceptsStoredConciergeWidth` — the same predicate this component's state
+// initialiser calls. Two rounds of review went into making those agree, and the test that was
+// supposed to pin it lives in a NODE-environment file that never imports `Workspace`: it computed
+// the expected verdict with the parser's own expression and compared it to the parser, so it
+// restated the implementation and could not have gone red if the shell had stopped honouring the
+// seed at all (roborev 57522, and the reviewer was right — verified by dropping the initialiser's
+// validation and watching that test stay green).
+//
+// This is the assertion that observes BOTH sides. It seeds through the real fixture entry point and
+// mounts the real shell, so it fails if either half moves: the fixture writing a key nobody reads,
+// or the initialiser refusing a width the fixture was willing to seed. Either failure is silent in
+// production and shows up as a screenshot of the DEFAULT width filed under a name claiming
+// otherwise — which is the whole failure mode the parameter's own docs say it exists to prevent.
+describe("a width seeded by the visual fixtures survives into the rendered shell", () => {
+  const ON = { DEV: true, [DEV_BYPASS_AUTH_FLAG]: "1" };
+
+  it("renders at the seeded width, not at the default", () => {
+    // 190 is the width `open-pr-menu-narrow` actually asks for, so this pins the live surface.
+    expect(applyVisualFixtures("?visual=1&concierge=190", ON)).toBe(true);
+    render(<Workspace />);
+    expect(conciergeWidth()).toBe(190);
+    // …and specifically NOT the fallback, which is what a broken seed silently produces.
+    expect(conciergeWidth()).not.toBe(CONCIERGE_DEFAULT_WIDTH);
+  });
+
+  it("honours the floor the predicate accepts", () => {
+    expect(applyVisualFixtures(`?visual=1&concierge=${CONCIERGE_MIN_WIDTH}`, ON)).toBe(true);
+    render(<Workspace />);
+    expect(conciergeWidth()).toBe(CONCIERGE_MIN_WIDTH);
+  });
+
+  it("falls back to the default when the parameter names a width the shell would refuse", () => {
+    // Below the floor: the fixture must decline to seed, and the shell must then use its default —
+    // a capture at the default is wrong, but a capture at a width nothing agreed on is worse.
+    expect(applyVisualFixtures(`?visual=1&concierge=${CONCIERGE_MIN_WIDTH - 1}`, ON)).toBe(true);
+    render(<Workspace />);
+    expect(conciergeWidth()).toBe(CONCIERGE_DEFAULT_WIDTH);
+  });
+
+  it("leaves the default alone when no width is asked for", () => {
+    expect(applyVisualFixtures("?visual=1", ON)).toBe(true);
+    render(<Workspace />);
+    expect(conciergeWidth()).toBe(CONCIERGE_DEFAULT_WIDTH);
+  });
+});
+
+// ── EVERY CAPTURE SURFACE'S SEEDED WIDTH IS ONE THE CAPTURE VIEWPORT CAN ACTUALLY PAINT ────────
+//
+// `acceptsStoredConciergeWidth` answers "will the state initialiser KEEP this number" and nothing
+// more. It is not the whole story, and the doc block that once implied it was has been corrected:
+// the shell also clamps at PAINT time (`renderedConciergeWidth = min(width, conciergeMax)`, where
+// `conciergeMax` is window-aware), so a width the initialiser happily stores can still be painted
+// narrower. At the harness's 1600px viewport the widest paintable single-pair concierge is a good
+// deal under the 8000 the predicate allows — so `?concierge=2000` would parse, store, survive the
+// initialiser, and photograph clamped, under a filename claiming 2000 (roborev 57522).
+//
+// That is latent today (the one surface asks for 190, far under any ceiling) and it is a
+// SURFACE-AUTHORING mistake rather than a runtime condition, so the guard belongs here rather than
+// as a branch in the parser: it reads the real registry, seeds through the real fixture, mounts the
+// real shell at the real capture viewport, and asserts the painted width is the one asked for.
+//
+// IT REPLAYS EACH SURFACE'S WHOLE QUERY, not just the `concierge` parameter it is asking about, and
+// that is load-bearing rather than tidy (roborev 57531). The first version rebuilt the search as
+// `?visual=1&concierge=<n>`, silently dropping every other parameter — including `pairs`, which
+// selects a DIFFERENT paint ceiling: the two-pair shell uses `conciergePairedMax` (~1388 at 1600),
+// the single-pair one `windowAwareMax` with a bigger reserve (~1234). A `pairs=2` surface already
+// exists in the registry, so `query: "pairs=2&concierge=1300"` was one edit away from failing here
+// against a layout the capture never uses — a FALSE red on a legitimate surface, which is how a
+// guard gets weakened by the next person rather than trusted. Replaying the real query also means
+// any future fixture parameter that moves the ceiling is covered without touching this test.
+describe("the visual surfaces ask for widths the capture viewport can paint", () => {
+  const ON = { DEV: true, [DEV_BYPASS_AUTH_FLAG]: "1" };
+  const realWidth = window.innerWidth;
+  afterEach(() => {
+    Object.defineProperty(window, "innerWidth", { value: realWidth, configurable: true });
+  });
+
+  it("paints each surface's requested concierge width unclamped, in that surface's own layout", async () => {
+    // The REGISTRY for both — capture.mjs pulls in node built-ins and cannot load here.
+    const { SURFACES, DEFAULT_VIEWPORT } = await import("../../scripts/visual/surfaces.mjs");
+    // The `concierge` value decides WHETHER a surface participates and what to compare against; the
+    // full `query` is what gets replayed.
+    const asking = SURFACES.map((s) => ({
+      name: s.name,
+      query: s.query ?? "",
+      width: new URLSearchParams(s.query ?? "").get("concierge"),
+    })).filter((s): s is { name: string; query: string; width: string } => s.width !== null);
+    // NON-VACUITY. If the parameter is ever renamed, this loop would silently iterate nothing and
+    // read as green — the exact shape this repo keeps re-learning.
+    expect(asking.length, "no surface asks for a concierge width — has the param been renamed?")
+      .toBeGreaterThan(0);
+
+    for (const { name, query, width } of asking) {
+      Object.defineProperty(window, "innerWidth", {
+        value: DEFAULT_VIEWPORT.width,
+        configurable: true,
+      });
+      localStorage.clear();
+      // THE SURFACE'S OWN QUERY, verbatim — see the note above.
+      expect(applyVisualFixtures(`?visual=1&${query}`, ON), name).toBe(true);
+      const { unmount } = render(<Workspace />);
+      // The PAINTED width, which is what the screenshot records — not the stored one.
+      expect(conciergeWidth(), `${name} captures clamped, not at the ${width}px it asks for`).toBe(
+        Number(width),
+      );
+      unmount();
+    }
   });
 });
