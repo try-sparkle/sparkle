@@ -77,15 +77,16 @@ export const TRAY_GEOMETRY = {
 /**
  * The widest full label's rendered width, in px, at `TYPE.small`.
  *
- * AN ESTIMATE, and deliberately the PESSIMISTIC end of one: "Push to talk" renders semibold when
- * unselected and BOLD when selected, and `TYPE.small` is a CSS variable a theme may enlarge. Two
- * independent readings put it at ~72px and ~86px; the larger is used, because erring wide costs a
- * needlessly-short label while erring narrow costs a silently clipped word.
+ * MEASURED, not estimated. This was 86 — the larger of two eyeballed readings, taken as the
+ * "pessimistic" choice — and the pessimism had a cost: every threshold derived from it sat ~15px
+ * high, pushing the user into a lower tier at widths where the words actually fit. Measured in real
+ * WebKit (the WKWebView engine) at 12px: "Push to talk" is 69.7px semibold and **71.3px bold** —
+ * bold being the selected state, i.e. the wider one. Rounded up to 72.
  *
- * It cannot be measured in a test — jsdom has no layout engine — so it is stated here as the one
- * genuinely unverifiable input rather than buried inside the arithmetic.
+ * jsdom cannot lay out, so this cannot be measured by the unit suite — but it CAN be measured, with
+ * a headless WebKit page. Re-measure that way rather than guessing if the font or the scale moves.
  */
-export const WIDEST_LABEL_PX = 86;
+export const WIDEST_LABEL_PX = 72;
 
 /**
  * The tray width at which the FULL labels stop fitting.
@@ -110,11 +111,11 @@ export function fullLabelsFitAtPx(): number {
  * "Speak" is the longest of `SEND_MODE_LABEL_SHORT` at five characters. Derived from
  * `WIDEST_LABEL_PX` rather than guessed independently, so the two estimates cannot drift: that is a
  * 12-character string ("Push to talk") measured pessimistically at 86px, i.e. ~7.2px per character,
- * and 5 characters at that rate is ~36px. Rounded UP to 44 for the same reason `WIDEST_LABEL_PX`
+ * and 5 characters at that rate is ~36px. Rounded UP to 38 for the same reason `WIDEST_LABEL_PX`
  * takes the larger of its two readings — erring wide costs an icon shown a notch early, erring
  * narrow costs a silently clipped word, which is the exact defect this tier exists to delete.
  */
-export const WIDEST_SHORT_LABEL_PX = 44;
+export const WIDEST_SHORT_LABEL_PX = 38;
 
 /** An icon-only pill's glyph box, in px. RETAINED ONLY FOR THE MIC/CHICLET SLOTS — the tray itself
  *  no longer has an icon tier; see `wordPillMinPx`. */
@@ -122,6 +123,47 @@ export const TRAY_ICON_PX = 16;
 
 /** "Speak" at the FLOOR tier's smaller type: 31.7px measured in WebKit at 10px bold, rounded up. */
 export const WIDEST_SHORT_LABEL_TIGHT_PX = 32;
+
+/**
+ * WHAT EACH RUNG ACTUALLY NEEDS — derived, so the ladder cannot disagree with the pills again.
+ *
+ * ── THE BUG THIS CLOSES ────────────────────────────────────────────────────────────────────────
+ * The ladder's thresholds shipped as bare literals in voice/sendMode (281 / 179 / 131), computed by
+ * hand from label widths that were RE-MEASURED at the same time — but only the thresholds were
+ * ported, not the measurements. Main kept `WIDEST_LABEL_PX = 86` and `WIDEST_SHORT_LABEL_PX = 44`
+ * (eyeballed, deliberately pessimistic), against which `fullTight` really needs 323 and `short`
+ * really needs 197. Both were set BELOW that, so between 281–323px and 179–197px the ladder selected
+ * a label that does not fit and the founder's "Se… Pu… Sp…" was still reachable.
+ *
+ * Two things went wrong and both are fixed here: the measured widths are now the ones that ship
+ * (71.3px and 37.4px in WebKit at 12px bold, rounded up), and the thresholds are DERIVED from them
+ * rather than restated, so a change to any pill constant moves the ladder with it. A hand-copied
+ * bound going stale while its guard stays green is this module's documented recurring failure
+ * (roborev 56213/56223/56301) — this was the same shape, one file over.
+ */
+export function trayFullNoChicletMinPx(): number {
+  const g = TRAY_GEOMETRY;
+  return (
+    TRAY_PILL_COUNT * (WIDEST_LABEL_PX + 2 * g.pillPadX + 2 * g.pillBorder) +
+    (TRAY_PILL_COUNT - 1) * g.trayGap
+  );
+}
+
+export function trayShortNoChicletMinPx(): number {
+  const g = TRAY_GEOMETRY;
+  return (
+    TRAY_PILL_COUNT * (WIDEST_SHORT_LABEL_PX + 2 * g.pillPadX + 2 * g.pillBorder) +
+    (TRAY_PILL_COUNT - 1) * g.trayGap
+  );
+}
+
+export function trayShortTightMinPx(): number {
+  const g = TRAY_GEOMETRY;
+  return (
+    TRAY_PILL_COUNT * (WIDEST_SHORT_LABEL_TIGHT_PX + 2 * g.pillPadXTight + 2 * g.pillBorder) +
+    (TRAY_PILL_COUNT - 1) * g.trayGap
+  );
+}
 
 /** What the tray needs for the SHORT words once the keycap slot is dropped. Measured: 179. */
 export function shortLabelsNoChicletFitAtPx(): number {

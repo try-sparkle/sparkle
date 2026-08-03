@@ -15,6 +15,10 @@ import { describe, expect, it } from "vitest";
 
 import { CONFIDENCE_THRESHOLD_MS } from "./confidence";
 import {
+  fullLabelsFitAtPx,
+  trayFullNoChicletMinPx,
+  trayShortNoChicletMinPx,
+  trayShortTightMinPx,
 } from "../components/Concierge/trayGeometry";
 import {
   SEND_MODES,
@@ -189,6 +193,38 @@ describe("the keycap chip cannot lie about the keystroke", () => {
   // Push, Speak when the column is not in its very wide open state."
   //
   // So an ELLIPSISED LABEL IS THE ONE OUTCOME RULED OUT, and these pin that no tier produces one.
+  // ── EVERY THRESHOLD IS PINNED TO WHAT ITS TIER ACTUALLY NEEDS ───────────────────────────────
+  //
+  // THE BUG THIS CLOSES, and it shipped. The ladder's thresholds live in this module as literals
+  // (they must — `trayGeometry` imports `SEND_MODES` from here, so importing it back would be a
+  // cycle), and they were computed by hand from label widths RE-MEASURED at the same time. Only the
+  // thresholds were ported. `trayGeometry` kept `WIDEST_LABEL_PX = 86` / `WIDEST_SHORT_LABEL_PX =
+  // 44`, against which `fullTight` really needed 323 and `short` really needed 197 — both were set
+  // BELOW that, so between 281–323px and 179–197px the ladder chose a label that does not fit and
+  // the founder's "Se… Pu… Sp…" was still reachable.
+  //
+  // A literal that has drifted from its derivation is this module's documented recurring failure
+  // (roborev 56213/56223/56301). `TRAY_SHORT_LABEL_MAX_PX` already had a guard of exactly this
+  // shape; the three new rungs shipped without one. They have one now, so the cycle stays broken
+  // AND the numbers cannot drift silently again.
+  //
+  // `>=`, not `===`: erring HIGH is safe (a shorter label a notch early), erring LOW is the clipped
+  // word this whole ladder exists to delete.
+  describe("the ladder's thresholds cannot drift from the pill geometry", () => {
+    it("gives each rung at least what its own tier needs", () => {
+      expect(TRAY_SHORT_LABEL_MAX_PX).toBeGreaterThanOrEqual(fullLabelsFitAtPx());
+      expect(TRAY_FULL_NO_CHICLET_MIN_PX).toBeGreaterThanOrEqual(trayFullNoChicletMinPx());
+      expect(TRAY_SHORT_NO_CHICLET_MIN_PX).toBeGreaterThanOrEqual(trayShortNoChicletMinPx());
+      expect(TRAY_SHORT_TIGHT_MIN_PX).toBeGreaterThanOrEqual(trayShortTightMinPx());
+    });
+
+    it("keeps the rungs strictly ordered, so none is unreachable", () => {
+      expect(TRAY_SHORT_LABEL_MAX_PX).toBeGreaterThan(TRAY_FULL_NO_CHICLET_MIN_PX);
+      expect(TRAY_FULL_NO_CHICLET_MIN_PX).toBeGreaterThan(TRAY_SHORT_NO_CHICLET_MIN_PX);
+      expect(TRAY_SHORT_NO_CHICLET_MIN_PX).toBeGreaterThan(TRAY_SHORT_TIGHT_MIN_PX);
+    });
+  });
+
   describe("the words-first density ladder", () => {
     it("descends full → fullTight → short → shortTight → floor as the tray narrows", () => {
       expect(trayDensityFor(TRAY_SHORT_LABEL_MAX_PX)).toBe("full");
