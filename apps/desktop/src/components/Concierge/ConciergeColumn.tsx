@@ -26,7 +26,6 @@ import { WAVE_HEIGHT } from "../waveGeometry";
 import { SparkleLogoLink } from "../SparkleLogoLink";
 import { ComposeBox } from "./ComposeBox";
 import { ConciergeAiLocked } from "./ConciergeAiLocked";
-import { FleetNotices } from "./FleetNotices";
 import { ConciergeUnavailable } from "./ConciergeUnavailable";
 import { useConciergeAiLock } from "./conciergeAiLock";
 import { ConciergeThread } from "./ConciergeThread";
@@ -566,23 +565,42 @@ export function ConciergeColumn({
           GATED ON THE AI LOCK for the same reason the thread is: when the paid half is switched off,
           unbought, or out of credits, there is no brain to be unresponsive and ConciergeAiLocked has
           already said the true thing about why. */}
-      {/* WHAT IS WRONG ACROSS THE FLEET — quota walls, shutdown casualties, escalated goals, agents
-          safe to retire, and standing duties that have stopped. Every one of those was already
-          detected somewhere and none of it was aggregated, so answering "which agents are stuck"
-          meant reading rows one at a time (Concierge/FleetNoticeCard).
+      {/* THE "ACROSS THE FLEET" BOX USED TO MOUNT HERE, AND WAS DELETED ON PURPOSE (bead
+          sparkle-d43bf). Do not reinstate this shape without reading that bead first.
 
-          Mounted DIRECTLY, like `ConciergeUnavailable` below and `PresenceSlider`, because it takes
-          no data from the host — it reads its own stores.
+          It aggregated quota walls, shutdown casualties, escalated goals, retirable agents and
+          stalled standing duties into one card. The aggregation was the right instinct; the
+          PRESENTATION was not. With nine goals escalated it rendered nine near-identical
+          paragraphs, each repeating the agent name, "Auto-continued 3 times with no sign of
+          progress", the goal text IN FULL, and "Something is blocking it that restarting cannot
+          fix" — per-item boilerplate longer than the one fact that differed, and taller than the
+          screen. The founder's verdict: "This isn't helpful and takes up too much space."
 
-          NOT gated on the AI lock, unlike everything else in this stack. It needs no model and no
-          network, so it is the one row here that still works when the paid half is off, unbought or
-          out of credits — which is exactly the state a quota-blocked fleet is in. Gating it would
-          hide the report precisely when it is the only report available.
+          The deeper reason a smaller version of the same card is NOT the fix: the escalation signal
+          feeding it is largely FALSE. Agents that had shipped and said so on their own activity line
+          were still listed as escalated, and one was escalated for a failure that lived entirely in
+          the reporting channel — a bridge timeout stopped it marking its goal met while the
+          auto-continue counter kept advancing. Nine escalations, most spurious, trains a reader to
+          dismiss the box, and the one real escalation goes with them.
 
-          FIRST in this stack, i.e. furthest from the composer: the rows below get more immediate as
-          they approach it ("may I do this at all?" then "this is about to go out"), and a briefing
-          about the fleet is the least immediate thing here. It renders null when nothing is wrong. */}
-      <FleetNotices />
+          Whatever replaces this must fix the SIGNAL first: these goals carry `verify:landed`, so
+          "did it actually land" is answerable from git ancestry without asking the agent anything.
+
+          AND IT MUST WIRE THE BINDING, NOT JUST DRAW A CARD. The decision logic survives — the
+          evaluator, the report layer and the runner all still exist and are still tested — but this
+          display was the only PRODUCTION caller of any of it. With it gone the whole path is
+          dormant: `services/pusherRunner.ts` and `services/pusherSnapshots.ts` are both carried in
+          `scripts/dormant-modules.allow`, so nothing in a running app computes or sends a fleet
+          condition today. Do not build a replacement expecting live data to be flowing already.
+
+          ONE THING WENT WITH IT THAT WAS NOT THE POINT: the improvement pass's "why the hourly pass
+          is held / the pane is wedged" report (PRD/sparkle/pane-wedged-hold.md). `improvementHoldText`
+          lived in the deleted binding and was the only thing turning `passHoldReason` into a
+          rendered `PASS_HOLD_TEXT` sentence, so that report now has no surface anywhere and
+          `improvementPass.paneBusySinceAt` is reachable only from its own tests. The pass itself is
+          unaffected — `shouldRunImprovementPass` still calls `passHoldReason` — it is the REPORTING
+          that is gone. A replacement surface owes this back, or `paneBusySinceAt` should go; bead
+          sparkle-yo08a holds that decision. */}
       {!aiLock && <ConciergeUnavailable />}
       {approvalSlot}
       {/* Armed sends counting down (Concierge/CountdownBanner), directly above the box — the last

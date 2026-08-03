@@ -16,7 +16,6 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("../../useFleetNotices", () => ({ useFleetNotices: vi.fn(() => []) }));
 vi.mock("../LogoWaveform", () => ({ LogoWaveform: () => null }));
 vi.mock("../BalanceBadge", () => ({ BalanceBadge: () => null }));
 // AiLockedNotice's checkout rails reach for Tauri; its own test owns that behavior.
@@ -29,8 +28,6 @@ vi.mock("../../services/creditsMenuApi", () => ({
   lastCheckoutUrl: vi.fn(() => null),
 }));
 
-import { useFleetNotices } from "../../useFleetNotices";
-import { evaluateFleetConditions } from "@sparkle/core";
 import { ConciergeColumn } from "./ConciergeColumn";
 import { CONCIERGE_AI_PITCH } from "./ConciergeAiLocked";
 import { CONCIERGE_UNAVAILABLE_TESTID } from "./ConciergeUnavailable";
@@ -77,10 +74,6 @@ function shutTheGate() {
 beforeEach(() => {
   shutTheGate();
   _resetConciergeLivenessForTests();
-  // Reset the fleet notice to "nothing wrong". Vitest is not configured to clear mocks between
-  // tests here, so a `mockReturnValue` set in one case would otherwise leave a quota-blocked notice
-  // mounted for every case after it (roborev 57483).
-  vi.mocked(useFleetNotices).mockReturnValue([]);
 });
 afterEach(() => cleanup());
 
@@ -93,63 +86,19 @@ function makeConciergeUnavailable() {
 }
 
 describe("ConciergeColumn with AI enhancements locked — the FREE half stays live", () => {
-  // THE FLEET NOTICE IS FREE TOO, and it matters most in exactly this state. Its neighbours in that
-  // stack (ConciergeUnavailable, MountedNotice) render only when the gate is OPEN, because with no
-  // brain there is nothing to be unresponsive about. This row needs no model and no network, so it
-  // is the one thing in the column that still reports when the paid half is off, unbought, or out
-  // of credits — which is the same condition a quota-blocked fleet is in. Gating it would hide the
-  // report precisely when it is the only report available.
-  it("still renders the fleet notice, which needs no brain to compute", () => {
-    vi.mocked(useFleetNotices).mockReturnValue(
-      evaluateFleetConditions(
-        [
-          {
-            agentId: "a",
-            label: "Agent a",
-            quota: {
-              message: "You've hit your weekly limit · resets Aug 4 at 11pm (America/Bogota)",
-              resetAt: Date.now() + 4 * 60 * 60 * 1000,
-              resetParsed: true,
-            },
-          },
-        ],
-        Date.now(),
-      ),
-    );
-    render(<ConciergeColumn model={model} controller={controller()} />);
-    expect(screen.getByTestId("fleet-notice")).toBeTruthy();
-    expect(screen.getByText(/Restarting them does not help/)).toBeTruthy();
-  });
-
-  // THE FLEX DECLARATIONS ON THE CARD ONLY MEAN ANYTHING IF THE CARD IS THE FLEX ITEM (roborev
-  // 57485). Wrap `<FleetNotices />` in a padding div — the pattern already used for `searchSlot` —
-  // or return a wrapper from `FleetNotices`, and the card's own `flex`/`minHeight`/`overflowY` go
-  // inert: the default-`0 1 auto` wrapper becomes the shock absorber, its content is unbounded, and
-  // the paint-over bug returns with the card's own suite still green. So the RELATIONSHIP is pinned
-  // here, at the only level that can see it.
-  it("mounts the notice as a DIRECT child of the column's flex stack", () => {
-    vi.mocked(useFleetNotices).mockReturnValue(
-      evaluateFleetConditions(
-        [
-          {
-            agentId: "a",
-            label: "Agent a",
-            quota: {
-              message: "You've hit your weekly limit · resets Aug 4 at 11pm (America/Bogota)",
-              resetAt: Date.now() + 4 * 60 * 60 * 1000,
-              resetParsed: true,
-            },
-          },
-        ],
-        Date.now(),
-      ),
-    );
-    render(<ConciergeColumn model={model} controller={controller()} />);
-    const parent = screen.getByTestId("fleet-notice").parentElement;
-    expect(parent).toBeTruthy();
-    // The column root declares its own flex stack inline; an intervening wrapper would not.
-    expect(parent!.getAttribute("style") ?? "").toMatch(/flex-direction:\s*column/);
-  });
+  // THE "ACROSS THE FLEET" BOX IS GONE ON PURPOSE (bead sparkle-d43bf), and the two cases that
+  // pinned it here went with it: one asserted the card still rendered with the paid half locked,
+  // the other that it was a DIRECT child of the flex stack. Both described a card that no longer
+  // exists.
+  //
+  // NOTHING REPLACES THEM HERE, DELIBERATELY. The obvious substitute — assert `fleet-notice` is
+  // absent — is vacuous in every reachable world: this suite defaulted the conditions to `[]`, and
+  // the card rendered null on an empty list, so the assertion passed before the change, passes
+  // after it, and would keep passing if the card were re-added verbatim. That is the exact shape
+  // AGENTS.md calls the #1 fleet-wide finding, and writing it would leave a test that reads like a
+  // guard while guarding nothing (roborev 57666). The removal is proven where it can be: the
+  // modules are deleted, so a re-add cannot typecheck, and the `concierge-column` visual capture
+  // shows the same fixture rendering the box before and not after.
 
   it("still renders the status readout: the needs-you count, on the red pill", () => {
     render(<ConciergeColumn model={model} controller={controller()} />);
