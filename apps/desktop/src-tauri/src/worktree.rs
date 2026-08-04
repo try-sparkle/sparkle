@@ -6422,16 +6422,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// Spawn `sh -c <script>` in a PTY with the given cwd, read stdout to EOF, return it.
-    /// Mirrors how the app spawns each agent (portable-pty), so it exercises the real
-    /// mechanism behind every tab.
+    /// Program + run-a-command flag for spawning a shell script string in a PTY, per platform.
+    /// Unix has `sh -c <script>`; Windows has no `sh`, so the port runs through `cmd /C <script>`
+    /// (ConPTY). Returned as a pair so the selection lives in ONE `#[cfg]`-gated place a test can
+    /// assert against, instead of a bare `CommandBuilder::new("sh")` that fails to spawn on Windows
+    /// (sparkle-xmxv). This governs the PTY test helper below; the production agent-spawn path
+    /// (`pty.rs`) already takes a caller-supplied command, so it is not affected.
+    fn pty_shell() -> (&'static str, &'static str) {
+        #[cfg(windows)]
+        {
+            ("cmd", "/C")
+        }
+        #[cfg(not(windows))]
+        {
+            ("sh", "-c")
+        }
+    }
+
+    /// Spawn `<shell> <flag> <script>` (`sh -c` on unix, `cmd /C` on Windows) in a PTY with the
+    /// given cwd, read stdout to EOF, return it. Mirrors how the app spawns each agent
+    /// (portable-pty), so it exercises the real mechanism behind every tab.
     fn pty_run(cwd: &str, script: &str) -> String {
         use portable_pty::{native_pty_system, CommandBuilder, PtySize};
         let pair = native_pty_system()
             .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
             .unwrap();
-        let mut cmd = CommandBuilder::new("sh");
-        cmd.args(["-c", script]);
+        let (program, flag) = pty_shell();
+        let mut cmd = CommandBuilder::new(program);
+        cmd.args([flag, script]);
         cmd.cwd(cwd);
         let mut child = pair.slave.spawn_command(cmd).unwrap();
         drop(pair.slave); // so the master sees EOF when the child exits
@@ -6441,6 +6459,26 @@ mod tests {
         let status = child.wait().expect("pty child wait");
         assert!(status.success(), "pty child exited non-zero: {status:?}");
         out
+    }
+
+    /// `pty_shell` must select a shell that actually EXISTS on the host, not a hardcoded `sh` the
+    /// Windows port has no way to spawn (sparkle-xmxv). Asserts the chosen program/flag per
+    /// platform — the side effect callers depend on — so a regression to a bare `("sh", "-c")`
+    /// under `#[cfg(windows)]` fails the build's own test rather than only surfacing at runtime
+    /// when a Windows PTY spawn dies with "sh: not found".
+    #[test]
+    fn pty_shell_selects_a_shell_that_exists_on_this_platform() {
+        let (program, flag) = pty_shell();
+        #[cfg(windows)]
+        {
+            assert_eq!(program, "cmd", "Windows has no `sh`; the PTY must spawn `cmd`");
+            assert_eq!(flag, "/C", "`cmd` runs a command string with /C, not -c");
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(program, "sh", "unix spawns the POSIX shell");
+            assert_eq!(flag, "-c", "`sh` runs a command string with -c");
+        }
     }
 
     /// Minimal git repo on `main` with one commit, for branch-delete tests.
