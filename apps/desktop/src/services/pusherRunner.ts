@@ -52,6 +52,7 @@ import {
   fleetObservationMemory,
   isQuotaWalled,
   observeFleet,
+  type ConflictingPr,
   type FleetMemory,
   type FleetSnapshot,
   type StandingDuty,
@@ -106,6 +107,19 @@ export interface PusherRunnerDeps {
    * cadence later. Read per sweep so a duty that starts or stops is picked up without a restart.
    */
   duties(): readonly StandingDuty[];
+  /**
+   * Open PRs that cannot merge, for the `pr-conflicting` condition — or `undefined` for WE DID NOT
+   * LOOK.
+   *
+   * SYNCHRONOUS, exactly like `snapshots()`: it reads a store that a listener and a poller keep
+   * current, so the sweep is not made to await another IPC round-trip it would then have to bound.
+   * `inboxUsage` is the only awaited input and it stays that way.
+   *
+   * The `undefined` arm is the fail-closed one and it is not decorative: before the conflict probe
+   * has ever answered — which includes an older backend with no such command at all — there is no
+   * evidence, and an empty list would say "we checked, every PR is fine".
+   */
+  conflicts(): readonly ConflictingPr[] | undefined;
   /** Structured record of every decision, sent or refused. */
   record(entry: PusherLogEntry): void;
 }
@@ -235,6 +249,16 @@ export async function sweepPushers(
 
   // Read ONCE per sweep, so every project's report describes the same moment.
   const allDuties = deps.duties();
+
+  // ...and the same for the conflict evidence, which is APP-GLOBAL in the same way and for a
+  // sharper reason: a `ConflictingPr` carries no projectId at all, so there is nothing to split it
+  // by. It therefore rides with the duties — assigned to exactly one project below, because
+  // threading one app-global list into every project's report is what produced the duplicated
+  // "the hourly improvement pass is 9h overdue" paragraph (roborev 57400).
+  //
+  // `undefined` is passed through as `undefined`, never coerced to `[]`: the whole point of the
+  // three-valued rule is that the sweep must be able to say "nothing has looked yet".
+  const allConflicts = deps.conflicts();
 
   // ...AND ASSIGNED TO EXACTLY ONE PROJECT (roborev 57400). A duty is APP-GLOBAL — the hourly pass
   // belongs to the app, not to a project — but the report loop below is per project, each with its
@@ -421,6 +445,11 @@ export async function sweepPushers(
         partners,
         // Only the owning project carries the app-global duties; the rest report agents only.
         projectId === dutyOwner ? allDuties : [],
+        // The same owner carries the app-global conflict evidence. A non-owner is handed `[]` —
+        // "we looked, nothing for you" — rather than `undefined`, because the difference the
+        // fail-closed rule protects is about whether the PROBE ran, and it did; this project simply
+        // is not the one that reports its result.
+        projectId === dutyOwner ? allConflicts : [],
       ),
     );
   }
@@ -453,6 +482,7 @@ async function reportFleet(
   everyone: readonly (FleetSnapshot & { projectId: string })[],
   partners: Map<string, PartnerMemory>,
   duties: readonly StandingDuty[],
+  conflicts: readonly ConflictingPr[] | undefined,
 ): Promise<FleetMemory> {
   // NO RECIPIENT, NO REPORT — BUT THE SIGHTING STILL ADVANCES. This is rule 1 from `pusherDecide`'s
   // header applied to the report channel, and it is easy to get backwards: returning `memory`
@@ -463,7 +493,7 @@ async function reportFleet(
   // The budget does not advance, because nothing was sent — but the cooldowns DO expire, which is
   // why this goes through `fleetObservationMemory` rather than spreading `lastConditions` by hand.
   if (recipient === undefined) {
-    return fleetObservationMemory(memory, evaluateFleetConditions(owned, now, duties));
+    return fleetObservationMemory(memory, evaluateFleetConditions(owned, now, duties, conflicts));
   }
 
   // A QUOTA-WALLED RECIPIENT CANNOT READ THE REPORT EITHER, and the argument is verbatim the one the
@@ -480,7 +510,7 @@ async function reportFleet(
       reason: "recipient-quota-blocked",
       scope: "fleet",
     });
-    return fleetObservationMemory(memory, evaluateFleetConditions(owned, now, duties));
+    return fleetObservationMemory(memory, evaluateFleetConditions(owned, now, duties, conflicts));
   }
 
   const used = usage.get(recipient);
@@ -515,6 +545,7 @@ async function reportFleet(
     policy: deps.policy(),
     snapshots: owned,
     duties,
+    conflicts,
     memory: { ...memory, budget: shared },
     inbox,
     now,

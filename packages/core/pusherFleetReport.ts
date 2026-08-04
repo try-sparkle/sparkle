@@ -67,6 +67,7 @@ import {
   evaluateFleetConditions,
   persistedConditions,
   type StandingDuty,
+  type ConflictingPr,
   type FleetCondition,
   type FleetConditionId,
   type FleetSnapshot,
@@ -190,6 +191,17 @@ export interface FleetReportInput {
    * error at every call site instead of a condition that can never fire.
    */
   duties: readonly StandingDuty[];
+  /**
+   * Open PRs that cannot merge, for the `pr-conflicting` condition — or `undefined` for WE DID NOT
+   * LOOK.
+   *
+   * REQUIRED BUT NULLABLE, which is the shape the three-valued rule needs at a call site. Making it
+   * optional would let a caller that simply forgot compile into the same state as one that genuinely
+   * could not read `gh`, and the two are different facts (roborev 57323 made `duties` required for
+   * the weaker version of this: an omission that silently becomes a condition which can never fire).
+   * Here the omission is worse, because it is indistinguishable from an all-clear.
+   */
+  conflicts: readonly ConflictingPr[] | undefined;
   memory: FleetMemory;
   /** The RECIPIENT's mailbox — the surface the report is delivered to, not any partner's. */
   inbox: InboxReading;
@@ -203,9 +215,9 @@ export interface FleetReportInput {
  * path and `memoryOnDelivered` only once the transport confirms.
  */
 export function decideFleetReport(input: FleetReportInput): FleetReportDecision {
-  const { policy, snapshots, duties, memory, inbox, now } = input;
+  const { policy, snapshots, duties, conflicts, memory, inbox, now } = input;
 
-  const current = evaluateFleetConditions(snapshots, now, duties);
+  const current = evaluateFleetConditions(snapshots, now, duties, conflicts);
 
   // COMPUTED FIRST AND UNCONDITIONALLY, exactly as `decidePusherAction` does it: every early return
   // below carries this sweep's sighting, so there is no path on which the two-observation rule loses

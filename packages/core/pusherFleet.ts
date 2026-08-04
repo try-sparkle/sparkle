@@ -83,6 +83,8 @@ export type FleetConditionId =
   | "goals-escalated"
   /** A standing recurring duty that has silently stopped running. */
   | "duty-overdue"
+  /** An open PR that cannot merge — and therefore has never run CI at all. */
+  | "pr-conflicting"
   /** Goal met, nothing unlanded — occupying a slot for no reason. */
   | "done-not-retired";
 
@@ -129,11 +131,70 @@ export interface StandingDuty {
 export const DUTY_OVERDUE_FACTOR = 2;
 
 /**
+ * One open pull request that cannot merge, or can but is drifting.
+ *
+ * ── WHAT NOTHING WAS WATCHING ────────────────────────────────────────────────────────────────────
+ * A PR goes DIRTY and simply sits there. Five did: ~220 commits behind main, each carrying exactly
+ * one commit of work — every one of them a rebase somebody could have done in a minute, and none of
+ * them visible on any surface the founder looks at. An agent's row says nothing, because the agent
+ * is fine; the PR page says "conflicts", which reads as a merge chore.
+ *
+ * ── AND WHY "CONFLICTS" IS THE WRONG WORD FOR IT ─────────────────────────────────────────────────
+ * A CONFLICTING PR NEVER FIRES GITHUB'S `pull_request` EVENT, SO IT GETS NO CI AT ALL. There is no
+ * merge commit to build, so no run is ever created: its checks are not failing, they are ABSENT. A
+ * reader who sees "conflicts" thinks about a rebase; a reader who is told "conflicting — and
+ * therefore untested" understands that the branch's correctness is unknown and has been for as long
+ * as the conflict has stood. That is the fact this class exists to carry, and it is one fact rather
+ * than two — which is why {@link conflictCondition} never says the first half without the second.
+ *
+ * ── A FROZEN CONTRACT ────────────────────────────────────────────────────────────────────────────
+ * These field names are the wire shape the Rust side produces (`conflict_flags` + the
+ * `conflict://detected` event, serde camelCase). Renaming one here silently empties the detector
+ * rather than failing a build, because the payload crosses an `invoke` boundary that TypeScript
+ * cannot check. Treat it as fixed.
+ */
+export interface ConflictingPr {
+  /** The PR number, as GitHub numbers it. Quoted in the report, so it is citable. */
+  pr: number;
+  /** The head branch, VERBATIM — quoted, so `quotedNumbers` whitelists whatever digits it carries. */
+  branch: string;
+  /**
+   * The agent that owns this PR, or `null` for UNRESOLVED — never "no agent".
+   *
+   * Ownership is RECORDED (`pr_owner.rs`, `pr-owners.json`), not parsed out of the branch name; the
+   * five PRs this class was built for are all on descriptive branches, so a branch-name reading would
+   * have resolved none of them. An unresolved owner still has to reach somebody, so it is reported
+   * AS unresolved rather than dropped or guessed — a wrong id opens the wrong agent and the reader
+   * cannot tell, which is strictly worse than no id at all.
+   */
+  ownerAgentId: string | null;
+  /** `conflicting` = cannot merge. `stale` = can merge, but is behind. Only the first is untested. */
+  kind: "conflicting" | "stale";
+  /** How far behind the base branch. The number that says whether this is a minute or an afternoon. */
+  commitsBehind: number;
+  /** Has CI never run on this PR? See the header — for a conflicting PR this is the mechanism. */
+  untested: boolean;
+  /** How long it has been in this state, as the producer measured it. Not recomputed here. */
+  unresolvedSecs: number;
+  /** Whatever the producer knows is holding it, quoted verbatim. Absent when nothing is recorded. */
+  blockedBy?: string;
+}
+
+/**
  * What one sweep knows about one agent, for the fleet report.
  *
  * Every field is optional and three-valued in the same way `PartnerSnapshot`'s are: present-and-true,
  * present-and-false, or ABSENT meaning WE DID NOT LOOK. `undefined` never satisfies anything here —
  * see `pusherObserve`'s header for why an absent input must not manufacture a claim.
+ *
+ * ── WHAT IS DELIBERATELY *NOT* HERE: {@link ConflictingPr} ───────────────────────────────────────
+ * A conflicting PR is not a property of an agent, and putting it here would have quietly discarded
+ * the exact cases the class was built for. This structure is keyed by `agentId`, so every entry
+ * needs an agent to hang off — and the five PRs that motivated this class resolve to
+ * `ownerAgentId: null`. They would have had nowhere to live, and the detector would have reported
+ * an all-clear about the very PRs it was written to find. A parallel input (like `StandingDuty`,
+ * for the same reason: it describes a CAPABILITY rather than an agent) has no such requirement, and
+ * it also lets one agent own several PRs without inventing a shape for that.
  */
 export interface FleetSnapshot {
   agentId: string;
@@ -371,11 +432,39 @@ export function overdueDuties(
  * to be sitting there unnoticed (every victim's row says "errored" independently, so nothing on any
  * surface says they are the same event). Escalated follows: a dead end, but one that needs a
  * judgement per agent. Done-not-retired is last: waste, but nothing is stuck behind it.
+ *
+ * ── WHERE `pr-conflicting` SITS, AND WHY ─────────────────────────────────────────────────────────
+ * Between `duty-overdue` and `goals-escalated`. Three comparisons decide it:
+ *
+ *   • BELOW quota and shared-failure, which is not close. Those agents cannot execute at all; a
+ *     conflicting PR is work that has already been done. Nothing is stuck behind it — it is rotting,
+ *     which is a different and lesser urgency.
+ *   • BELOW duty-overdue, narrowly. A stopped duty means a capability the product promises is off
+ *     for ALL future work; a conflicting PR is a bounded amount of past work that cannot land.
+ *   • ABOVE goals-escalated, which is the contested one. An escalated goal is worse in the moment —
+ *     an agent is stuck now — so the case rests on two properties escalation does not have. It
+ *     DECAYS: every merge to main widens the gap, so the same PR costs more to rescue each hour,
+ *     while an escalated goal is latched and no harder to clear tomorrow. And it is INVISIBLE: an
+ *     escalated goal paints its own row, so a human scanning the fleet can find it, whereas nothing
+ *     anywhere says a PR has stopped being tested. That is the same argument that earns
+ *     `duty-overdue` its place — "nothing looks wrong anywhere" is what makes a condition worth
+ *     aggregating.
+ *   • ABOVE done-not-retired, which is not close either: that is housekeeping, and this is untested
+ *     work whose correctness nobody knows.
+ *
+ * The counter-argument, recorded because it is real: an escalated goal is the app admitting it has
+ * given up, and one could rank "we surrendered" above "this will get harder". If that is ever taken,
+ * the only thing that changes is which paragraph leads the report and which id keys the gate's
+ * cooldown — both classes are still batched into the same message.
  */
 export function evaluateFleetConditions(
   snapshots: readonly FleetSnapshot[],
   now: number,
   duties: readonly StandingDuty[] = [],
+  // NO DEFAULT, unlike `duties`. `undefined` is not "none" here — it is WE DID NOT LOOK, and it is
+  // the value a caller genuinely has whenever the conflict probe has not run or could not read `gh`.
+  // Defaulting it to `[]` would erase the distinction at the one seam where it is load-bearing.
+  conflicts?: readonly ConflictingPr[],
 ): FleetCondition[] {
   const out: FleetCondition[] = [];
 
@@ -387,6 +476,13 @@ export function evaluateFleetConditions(
 
   const overdue = overdueDuties(duties, now);
   if (overdue.length > 0) out.push(dutyCondition(overdue));
+
+  // FAIL CLOSED. `undefined` (never looked, or the probe failed) and `[]` (looked, nothing wrong)
+  // both report nothing — but only one of them is allowed to be manufactured by a caller, and it is
+  // not this one. The producer is where the two must not be conflated; see `conflictFlags.ts`.
+  if (conflicts !== undefined && conflicts.length > 0) {
+    out.push(conflictCondition(conflicts, snapshots));
+  }
 
   const escalated = snapshots.filter((s) => s.escalation !== undefined);
   if (escalated.length > 0) out.push(escalationCondition(escalated));
@@ -518,6 +614,132 @@ function dutyCondition(
     text:
       `${n} standing ${plural} stopped running. Nothing is visibly wrong — every agent looks ` +
       `fine, which is why this goes unnoticed:\n${lines.join("\n")}`,
+  };
+}
+
+/**
+ * How the report names the owner of one PR. Four answers, and the last three are all the same point.
+ *
+ * An id is never quoted (see the note above {@link SHARED_FAILURE_WINDOW_MINUTES}'s neighbours), so
+ * a resolved owner can only be named by its LABEL — and there are two ways to have an id and no
+ * label: the agent is not in this window's roster, or it has no name. Each says so rather than
+ * printing something that reads like a name. What none of them does is omit the PR, because a PR
+ * nobody is told about is exactly the state this class exists to end.
+ */
+/** The commits-behind count as the report may quote it — see the clamp's note in {@link conflictCondition}. */
+function behindOf(c: ConflictingPr): number {
+  return Math.max(0, Math.trunc(c.commitsBehind));
+}
+
+function ownerPhrase(c: ConflictingPr, labels: ReadonlyMap<string, string | undefined>): string {
+  if (c.ownerAgentId === null) return "Owner unresolved";
+  if (!labels.has(c.ownerAgentId)) return "Owner recorded, but not an agent this window can see";
+  const label = labels.get(c.ownerAgentId);
+  return label === undefined ? "Owner recorded, but that agent has no name" : `Owner: ${label}`;
+}
+
+/**
+ * Open PRs that cannot merge, and the ones drifting toward it.
+ *
+ * ── THE HEADLINE FACT IS COMPOUND, AND IS NEVER SPLIT ────────────────────────────────────────────
+ * Every conflicting line says "conflicting — and therefore untested" together, because said apart
+ * the first half is a merge chore and the reader stops reading. See {@link ConflictingPr}'s header
+ * for the mechanism (no `pull_request` event → no run ever created → checks ABSENT, not failing).
+ *
+ * ── STALE ENTRIES ARE REPORTED, AND ARE NEVER CALLED UNTESTED ────────────────────────────────────
+ * `untested` is claimed for `kind: "conflicting"` only. A mergeable-but-behind PR has had CI; its
+ * problem is that the rebase gets more expensive, not that its correctness is unknown, and blurring
+ * the two would cost the headline exactly the credibility it is built on. They are still reported,
+ * because the moment a drifting PR goes conflicting is the moment it is too late to have noticed.
+ *
+ * ── WHAT IS NOT DECIDED HERE ─────────────────────────────────────────────────────────────────────
+ * `kind` and `untested` are the producer's classification and are taken as given. Re-deriving either
+ * from `commitsBehind` would be a second opinion about the same PR, invisible to the tests that
+ * cover the producer — the failure `fleetVerdict` names and `pusherSnapshots` refuses for the same
+ * reason. This module composes sentences from evidence; it does not re-judge it.
+ */
+export function conflictCondition(
+  conflicts: readonly ConflictingPr[],
+  snapshots: readonly FleetSnapshot[],
+): FleetCondition {
+  // PRESENCE and NAME are separate facts here, so the map holds `undefined` for a roster agent with
+  // no label rather than collapsing it into `nameOf`'s "an unnamed agent" fallback — which would
+  // have produced the sentence "owner an unnamed agent".
+  const labels = new Map(snapshots.map((s) => [s.agentId, s.label?.trim() || undefined] as const));
+
+  // Conflicting before stale, then furthest-behind first — the order the reader should act in, and
+  // fixed rather than incidental so the same evidence always produces the same bytes.
+  const ordered = [...conflicts].sort((a, b) => {
+    if (a.kind !== b.kind) return a.kind === "conflicting" ? -1 : 1;
+    return b.commitsBehind - a.commitsBehind;
+  });
+  const conflicting = ordered.filter((c) => c.kind === "conflicting");
+  const stale = ordered.filter((c) => c.kind === "stale");
+
+  const ages = ordered.map((c) => splitHoursMinutes(Math.max(0, c.unresolvedSecs) * 1000));
+
+  const lines = ordered.map((c, i) => {
+    const { h, m } = ages[i]!;
+    const held = c.blockedBy ? ` Blocked by: ${c.blockedBy}.` : "";
+    const who = ownerPhrase(c, labels);
+    // CLAMPED AT ZERO, and this is a citation-safety rule rather than cosmetics. A negative count
+    // renders as `-5`, from which `numbersIn` reads `5` — while `measured` would hold `-5`. The two
+    // never match, so `gateChallenge` refuses the WHOLE report as `fabricated-citation`, and that
+    // refusal presents as silence. One nonsensical field from the producer would therefore mute the
+    // detector entirely. The parser rejects negatives at the boundary too; this is the half that
+    // holds for any caller.
+    const behind = `${behindOf(c)} commits behind main`;
+    if (c.kind === "conflicting") {
+      // The compound fact, in one clause, on every line. `untested` is affirmative evidence that no
+      // run exists; without it the mechanism still holds — GitHub creates no NEW run for a PR it
+      // cannot merge — so the weaker sentence states that instead of guessing at history.
+      const testing = c.untested
+        ? "conflicting, and therefore untested — no CI has ever run on it"
+        : "conflicting, and therefore untested from here on — GitHub creates no new run for a PR it cannot merge";
+      return `  - #${c.pr} ${c.branch} — ${testing}. ${behind}, unresolved for ${h}h ${m}m. ${who}.${held}`;
+    }
+    return `  - #${c.pr} ${c.branch} — mergeable, but ${behind} and drifting further with every merge. Unresolved for ${h}h ${m}m. ${who}.${held}`;
+  });
+
+  const nC = conflicting.length;
+  const nS = stale.length;
+  const head =
+    nC > 0
+      ? `${nC} open ${nC === 1 ? "PR cannot" : "PRs cannot"} merge — and that means ${nC === 1 ? "it has" : "they have"} never been tested. ` +
+        `A conflicting PR never fires GitHub's pull_request event, so no CI run is ever created for it: the checks ` +
+        `are not failing, they are ABSENT. Conflicting and untested are one fact, not two.` +
+        (nS > 0 ? ` ${nS} more can still merge, but ${nS === 1 ? "is" : "are"} drifting behind main.` : "")
+      : `${nS} open ${nS === 1 ? "PR is" : "PRs are"} behind main and drifting further with every merge. ` +
+        `Each can still merge today; what grows is the rebase.`;
+
+  // Only when there IS a conflict to resolve. A remedy sentence about conflicts appended to a
+  // stale-only report is advice about a situation the report just said does not hold.
+  const remedy =
+    nC > 0
+      ? `\nA conflict on a branch that is only one commit ahead of main is usually resolvable without ` +
+        `judgement: rebase onto main and push, and the CI run it has never had arrives with it.`
+      : "";
+
+  return {
+    id: "pr-conflicting",
+    // RESOLVED OWNERS ONLY. `null` is UNRESOLVED, and this list is what the surface turns into agent
+    // pills — a placeholder here would open the wrong agent. The unresolved PRs are not lost: they
+    // are named in the text, and said to be unresolved, which is the whole reason the text carries
+    // them rather than leaving the reader to infer them from a list of ids.
+    agentIds: [...new Set(ordered.map((c) => c.ownerAgentId).filter((id): id is string => id !== null))],
+    measured: [
+      String(nC),
+      String(nS),
+      ...ordered.flatMap((c) => [String(c.pr), String(behindOf(c))]),
+      ...ages.flatMap(({ h, m }) => [String(h), String(m)]),
+      // Branch names, labels and hold reasons are reproduced character-for-character, so whatever
+      // digits they carry are quoted rather than computed — the widening this module's header names.
+      ...quotedNumbers(
+        ...ordered.flatMap((c) => [c.branch, c.blockedBy]),
+        ...ordered.map((c) => (c.ownerAgentId === null ? undefined : labels.get(c.ownerAgentId))),
+      ),
+    ],
+    text: `${head}\n${lines.join("\n")}${remedy}`,
   };
 }
 

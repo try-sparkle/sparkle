@@ -49,6 +49,7 @@ function fakeDeps(over: Partial<PusherRunnerDeps> = {}) {
     // fleet report has its own block at the bottom of this file, which supplies one.
     reportRecipient: () => undefined,
     duties: () => [],
+    conflicts: () => undefined,
     send: async (agentId, text) => {
       sent.push({ agentId, text });
       return true;
@@ -367,6 +368,7 @@ describe("the fleet report", () => {
       snapshots: () => [{ ...expired(), ...walledSnap("a") }],
       reportRecipient: () => undefined,
     duties: () => [],
+    conflicts: () => undefined,
     });
     await sweepTimes(deps, 3);
     expect(sent.filter((s) => s.agentId === "a")).toEqual([]);
@@ -391,6 +393,7 @@ describe("the fleet report", () => {
       snapshots: () => [walledSnap("q1")],
       reportRecipient: () => undefined,
     duties: () => [],
+    conflicts: () => undefined,
     });
     await sweepTimes(deps, 3);
     expect(sent).toEqual([]);
@@ -798,6 +801,7 @@ describe("machine-shutdown casualties", () => {
       snapshots: () => [{ ...expired(), ...died("a") }, died("b")],
       reportRecipient: () => undefined,
     duties: () => [],
+    conflicts: () => undefined,
     });
     await sweepTimes(deps, 2);
     expect(sent.map((s) => s.agentId)).toEqual(["a"]);
@@ -821,6 +825,7 @@ describe("standing duties reach the report through the sweep", () => {
       // A healthy agent: no quota wall, no failure, no escalation, nothing to retire.
       snapshots: () => [{ agentId: "a", projectId: "p", label: "Agent A" }],
       duties: () => [overdue],
+      conflicts: () => undefined,
       reportRecipient: () => "boss",
     });
     await sweepTimes(deps, 2);
@@ -834,6 +839,7 @@ describe("standing duties reach the report through the sweep", () => {
     const { deps, sent } = fakeDeps({
       snapshots: () => [{ agentId: "a", projectId: "p", label: "Agent A" }],
       duties: () => [{ ...overdue, lastRunAt: T0 - 10 * MIN }],
+      conflicts: () => undefined,
       reportRecipient: () => "boss",
     });
     await sweepTimes(deps, 2);
@@ -851,6 +857,7 @@ describe("standing duties reach the report through the sweep", () => {
         { agentId: "b", projectId: "p2", label: "Agent B" },
       ],
       duties: () => [overdue],
+      conflicts: () => undefined,
       reportRecipient: () => "boss", // both projects report to the same person
     });
     await sweepTimes(deps, 2);
@@ -865,6 +872,7 @@ describe("standing duties reach the report through the sweep", () => {
         { agentId: "b", projectId: "p2", label: "Agent B" },
       ],
       duties: () => [overdue],
+      conflicts: () => undefined,
       reportRecipient: (projectId) => `boss-${projectId}`, // distinct recipients
     });
     await sweepTimes(deps, 2);
@@ -883,6 +891,7 @@ describe("standing duties reach the report through the sweep", () => {
     const { deps, sent } = fakeDeps({
       snapshots: () => (flipped ? [...rows].reverse() : rows),
       duties: () => [overdue],
+      conflicts: () => undefined,
       reportRecipient: (projectId) => `boss-${projectId}`,
     });
     let st = emptyPusherState();
@@ -910,6 +919,7 @@ describe("standing duties reach the report through the sweep", () => {
         { agentId: "b", projectId: "p2", label: "Agent B" },
       ],
       duties: () => [overdue],
+      conflicts: () => undefined,
       reportRecipient: (projectId) => (projectId === "p2" ? "boss" : undefined),
     });
     await sweepTimes(deps, 2);
@@ -930,6 +940,7 @@ describe("standing duties reach the report through the sweep", () => {
             ]
           : [{ agentId: "b", projectId: "p2", label: "Agent B" }],
       duties: () => [overdue],
+      conflicts: () => undefined,
       reportRecipient: (projectId) => `boss-${projectId}`,
     });
     let st = emptyPusherState();
@@ -950,6 +961,7 @@ describe("standing duties reach the report through the sweep", () => {
     const { deps, sent } = fakeDeps({
       snapshots: () => [{ agentId: "a", projectId: "p", label: "Agent A" }],
       duties: () => list,
+      conflicts: () => undefined,
       reportRecipient: () => "boss",
     });
     let st = emptyPusherState();
@@ -959,5 +971,72 @@ describe("standing duties reach the report through the sweep", () => {
     await sweepPushers(deps, st);
     expect(sent).toHaveLength(1);
     expect(sent[0]!.text).toContain("logs + beads backlog");
+  });
+});
+
+// THE WIRING HALF of `pr-conflicting`, and the same lesson as the duties above: the evaluator's
+// `conflicts` parameter has no default, so a sweep that never threaded it would compile and the
+// condition could never fire in production. The pure tests cannot see that gap; only a sweep can.
+describe("conflicting PRs reach the report through the sweep", () => {
+  const conflict = {
+    pr: 1091,
+    branch: "sparkle/roborev-backlog-notice-collapse",
+    ownerAgentId: null,
+    kind: "conflicting" as const,
+    commitsBehind: 220,
+    untested: true,
+    unresolvedSecs: 4 * 60 * 60,
+  };
+
+  it("reports a conflicting PR to the recipient with the untested fact intact", async () => {
+    const { deps, sent } = fakeDeps({
+      // A completely healthy fleet: nothing here is what produces the report.
+      snapshots: () => [{ agentId: "a", projectId: "p", label: "Agent A" }],
+      conflicts: () => [conflict],
+      reportRecipient: () => "boss",
+    });
+    await sweepTimes(deps, 2);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.agentId).toBe("boss");
+    expect(sent[0]!.text).toContain("#1091");
+    expect(sent[0]!.text).toContain("conflicting, and therefore untested");
+    expect(sent[0]!.text).toContain("Owner unresolved");
+  });
+
+  // FAIL CLOSED THROUGH THE WIRING. `undefined` is what `conflicts()` returns on every build whose
+  // Rust probe has not landed, and on any window where it has not answered yet.
+  it("says nothing when the probe has not looked", async () => {
+    const { deps, sent } = fakeDeps({
+      snapshots: () => [{ agentId: "a", projectId: "p", label: "Agent A" }],
+      conflicts: () => undefined,
+      reportRecipient: () => "boss",
+    });
+    await sweepTimes(deps, 2);
+    expect(sent).toEqual([]);
+  });
+
+  it("says nothing when the probe looked and found none", async () => {
+    const { deps, sent } = fakeDeps({
+      snapshots: () => [{ agentId: "a", projectId: "p", label: "Agent A" }],
+      conflicts: () => [],
+      reportRecipient: () => "boss",
+    });
+    await sweepTimes(deps, 2);
+    expect(sent).toEqual([]);
+  });
+
+  // APP-GLOBAL, exactly like a duty: a `ConflictingPr` carries no projectId, so threading the same
+  // list into every project's report would tell one shared recipient the same thing twice.
+  it("tells a shared recipient about a conflicting PR exactly ONCE", async () => {
+    const { deps, sent } = fakeDeps({
+      snapshots: () => [
+        { agentId: "a", projectId: "p1", label: "Agent A" },
+        { agentId: "b", projectId: "p2", label: "Agent B" },
+      ],
+      conflicts: () => [conflict],
+      reportRecipient: () => "boss",
+    });
+    await sweepTimes(deps, 2);
+    expect(sent.filter((s) => s.text.includes("#1091"))).toHaveLength(1);
   });
 });

@@ -96,6 +96,11 @@ mod notes;
 mod nudge_gate;
 mod nudge_ladder;
 mod nudger;
+// The deterministic conflicting/stale-PR detector (bead sparkle-zss67). Same two-file split as the
+// nudger above and for the same reason: `conflict_ladder` is the pure decision, `conflict_watch`
+// owns the thread, the `gh` probe and the flags. Neither makes a model call on any path.
+mod conflict_ladder;
+mod conflict_watch;
 mod concierge;
 mod concierge_guidelines;
 mod concierge_lint_log;
@@ -158,6 +163,10 @@ pub fn run() {
         // so a test can stand one up in isolation.
         .manage(nudger::Observers::default())
         .manage(nudger::NudgeFlags::default())
+        // The conflicting/stale-PR detector's raised flags. Managed state for the same reasons the
+        // nudger's are: the watcher thread reaches them from an `AppHandle`, the frontend PULLS
+        // them with `conflict_flags`, and a test can stand one up in isolation.
+        .manage(conflict_watch::ConflictFlags::default())
         .manage(frontmost::FrontmostState::default())
         .manage(helper::HelperVitals::default())
         // PR claims live in the Rust process, not a window store, so an agent's "I am landing this
@@ -275,6 +284,11 @@ pub fn run() {
             // path, which is the whole point — it is what remains when a provider-wide 529 has
             // taken out every agent, the concierge, and the pusher at once.
             nudger::start(app.handle());
+            // The conflicting/stale-PR detector (sparkle-zss67). Same category as the nudger above
+            // and started beside it for the same reason: a plain OS thread that makes NO model call
+            // on any path, so a provider-wide 529 can never blind us to a PR that has gone DIRTY —
+            // and therefore, since GitHub never fires `pull_request` for one, UNTESTED.
+            conflict_watch::start(app.handle());
             // Stand up the local history store (prompts + responses, FTS5) in the app-data dir.
             // A failure here must not stop the app from booting — capture/search just won't work.
             match dev_identity::app_data_dir(app.handle()) {
@@ -550,6 +564,9 @@ pub fn run() {
             pty::pty_ack,
             nudger::nudger_flags,
             nudger::nudger_clear_flag,
+            conflict_watch::conflict_flags,
+            conflict_watch::conflict_clear_flag,
+            conflict_watch::conflict_probe_status,
             memwatch::memory_admission,
             memwatch::agent_memory_watchdog,
             preflight::claude_preflight,

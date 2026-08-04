@@ -18,6 +18,7 @@ import {
   persistedConditions,
   quotedNumbers,
   retirableAgents,
+  type ConflictingPr,
   type FleetSnapshot,
 } from "./pusherFleet";
 import { checkCitations } from "./pusherGate";
@@ -478,5 +479,213 @@ describe("duty overdue", () => {
 
   it("says nothing when every duty is on time", () => {
     expect(evaluateFleetConditions([], T0, [duty({ lastRunAt: T0 - 10 * MIN })])).toEqual([]);
+  });
+});
+
+// THE HEADLINE FACT, AND THE FAIL-CLOSED RULE THAT GUARDS IT.
+//
+// Every assertion here is on the EMITTED TEXT, never on the fixture that produced it — a test that
+// checked the input object would pass against a `conflictCondition` that returned an empty string.
+// The one that matters most is the compound claim: "conflicting" and "untested" have to arrive
+// together, because said apart the first reads as a merge chore and the reader stops there.
+describe("pr-conflicting", () => {
+  const pr = (over: Partial<ConflictingPr> = {}): ConflictingPr => ({
+    pr: 1091,
+    branch: "sparkle/roborev-backlog-notice-collapse",
+    ownerAgentId: null,
+    kind: "conflicting",
+    commitsBehind: 220,
+    untested: true,
+    unresolvedSecs: 3 * 60 * 60 + 5 * 60,
+    ...over,
+  });
+
+  it("fires for a DIRTY pr and names it, with the untested fact attached to it", () => {
+    const [c] = evaluateFleetConditions([], T0, [], [pr()]);
+    expect(c!.id).toBe("pr-conflicting");
+    expect(c!.text).toContain("#1091");
+    // The compound claim, in one clause. Split across two sentences this would still pass a naive
+    // `toContain("untested")`, which is why the phrase is pinned rather than the word.
+    expect(c!.text).toContain("conflicting, and therefore untested");
+    expect(c!.text).toContain("no CI has ever run on it");
+    expect(c!.text).toContain("220 commits behind main");
+  });
+
+  it("explains WHY there is no CI, in the report the founder actually reads", () => {
+    const [c] = evaluateFleetConditions([], T0, [], [pr()]);
+    // Not "checks failed". The mechanism — no event, so no run was ever created — is the half that
+    // makes "conflicts" stop reading as a merge problem.
+    expect(c!.text).toContain("never fires GitHub's pull_request event");
+    expect(c!.text).toMatch(/ABSENT/);
+  });
+
+  it("says a one-commit conflict is resolvable without judgement", () => {
+    const [c] = evaluateFleetConditions([], T0, [], [pr()]);
+    expect(c!.text).toMatch(/only one commit ahead of main is usually resolvable without judgement/);
+  });
+
+  // THE GATE EATS AN UNCITED REPORT SILENTLY — the failure presents as a healthy-looking fleet, not
+  // as an error. Every number the text quotes must be in `measured` or nothing is ever delivered.
+  it("passes the citation gate, including the digits in the branch name", () => {
+    const [c] = evaluateFleetConditions(
+      [],
+      T0,
+      [],
+      [pr(), pr({ pr: 806, branch: "sparkle/left-pair-2", commitsBehind: 41, kind: "stale" })],
+    );
+    expect(citable(c!.text, c!.measured)).toBe(true);
+    expect(c!.measured).toContain("1091");
+    expect(c!.measured).toContain("220");
+    // Quoted, never computed: the trailing digit of the branch name.
+    expect(c!.measured).toContain("2");
+  });
+
+  it("cites the hold reason's digits when one is recorded", () => {
+    const [c] = evaluateFleetConditions([], T0, [], [pr({ blockedBy: "waiting on 3 approvals" })]);
+    expect(c!.text).toContain("Blocked by: waiting on 3 approvals.");
+    expect(citable(c!.text, c!.measured)).toBe(true);
+  });
+
+  // FAIL CLOSED. These are different facts about the world and only one of them may ever be
+  // manufactured by a caller — see `conflictFlags.ts` for the seam where conflating them would make
+  // an unauthenticated `gh` read as an all-clear.
+  it("says NOTHING when we did not look (undefined)", () => {
+    expect(evaluateFleetConditions([], T0, [], undefined)).toEqual([]);
+  });
+
+  it("says nothing when we DID look and there are none ([])", () => {
+    expect(evaluateFleetConditions([], T0, [], [])).toEqual([]);
+  });
+
+  // A PR whose owner is unresolved is the case this class was built for: all five of the real ones
+  // are on descriptive branches, so nothing resolves them. Dropping them would have made the
+  // detector silent about exactly its own motivating evidence.
+  it("reports an UNRESOLVED owner as unresolved rather than dropping or guessing it", () => {
+    const [c] = evaluateFleetConditions([], T0, [], [pr({ ownerAgentId: null })]);
+    expect(c!.text).toContain("#1091");
+    expect(c!.text).toContain("Owner unresolved");
+    // No pill: an id here would open some agent, and the reader could not tell it was the wrong one.
+    expect(c!.agentIds).toEqual([]);
+  });
+
+  it("names a resolved owner by the label the rest of the app uses", () => {
+    const [c] = evaluateFleetConditions(
+      [{ agentId: "a1", label: "Cockpit Resize" }],
+      T0,
+      [],
+      [pr({ ownerAgentId: "a1" })],
+    );
+    expect(c!.text).toContain("Owner: Cockpit Resize");
+    expect(c!.agentIds).toEqual(["a1"]);
+  });
+
+  it("says so when an owner is recorded but not visible from this window", () => {
+    const [c] = evaluateFleetConditions([], T0, [], [pr({ ownerAgentId: "gone" })]);
+    expect(c!.text).toContain("Owner recorded, but not an agent this window can see");
+  });
+
+  // THE ONE THAT KEEPS THE HEADLINE HONEST. `untested` is claimed for conflicting PRs only; a
+  // mergeable-but-behind PR has had CI, and blurring the two costs the headline its credibility.
+  it("never calls a STALE pr untested", () => {
+    const [c] = evaluateFleetConditions(
+      [],
+      T0,
+      [],
+      [pr({ pr: 1050, kind: "stale", untested: false, commitsBehind: 40 })],
+    );
+    const line = c!.text.split("\n").find((l) => l.includes("#1050"));
+    expect(line).toBeDefined();
+    expect(line).not.toMatch(/untested/i);
+    expect(line).not.toMatch(/no CI/i);
+    expect(line).toContain("mergeable, but 40 commits behind main");
+  });
+
+  it("does not offer the conflict remedy in a stale-only report", () => {
+    const [c] = evaluateFleetConditions([], T0, [], [pr({ kind: "stale", untested: false })]);
+    expect(c!.text).not.toMatch(/resolvable without judgement/);
+    expect(c!.text).not.toMatch(/untested/i);
+    expect(citable(c!.text, c!.measured)).toBe(true);
+  });
+
+  it("leads with the conflicting prs and reports the stale ones behind them", () => {
+    const [c] = evaluateFleetConditions(
+      [],
+      T0,
+      [],
+      [pr({ pr: 700, kind: "stale", untested: false }), pr({ pr: 800 })],
+    );
+    expect(c!.text.indexOf("#800")).toBeLessThan(c!.text.indexOf("#700"));
+    expect(c!.text).toContain("1 more can still merge");
+  });
+
+  // PRIORITY. Quota still outranks it — an agent that cannot execute at all beats work that has
+  // already been done and is merely rotting.
+  it("ranks below quota-blocked and above done-not-retired", () => {
+    const ids = evaluateFleetConditions(
+      [{ agentId: "c", goalMetAt: T0, hasUnlandedWork: false }, walled("q")],
+      T0,
+      [],
+      [pr()],
+    ).map((c) => c.id);
+    expect(ids).toEqual(["quota-blocked", "pr-conflicting", "done-not-retired"]);
+  });
+
+  it("ranks below duty-overdue and above goals-escalated", () => {
+    const ids = evaluateFleetConditions(
+      [{ agentId: "e", label: "Esc", escalation: { reason: "gave up" } }],
+      T0,
+      [{ name: "the hourly improvement pass", intervalMs: HOUR, lastRunAt: T0 - 9 * HOUR }],
+      [pr()],
+    ).map((c) => c.id);
+    expect(ids).toEqual(["duty-overdue", "pr-conflicting", "goals-escalated"]);
+  });
+});
+
+// An owner that IS on the roster but carries no name is a fourth case, and it must not borrow
+// `nameOf`'s "an unnamed agent" fallback — "owner an unnamed agent" reads like a name.
+describe("pr-conflicting owner naming", () => {
+  it("distinguishes an unnamed roster agent from one this window cannot see", () => {
+    const base: ConflictingPr = {
+      pr: 900,
+      branch: "sparkle/x",
+      ownerAgentId: "nameless",
+      kind: "conflicting",
+      commitsBehind: 3,
+      untested: true,
+      unresolvedSecs: 60,
+    };
+    const [c] = evaluateFleetConditions([{ agentId: "nameless" }], T0, [], [base]);
+    expect(c!.text).toContain("Owner recorded, but that agent has no name");
+    expect(c!.text).not.toContain("an unnamed agent");
+    expect(c!.agentIds).toEqual(["nameless"]);
+    expect(citable(c!.text, c!.measured)).toBe(true);
+  });
+});
+
+// A NONSENSICAL COUNT MUST NOT MUTE THE DETECTOR. `-5` renders as `-5` and `numbersIn` reads `5`, so
+// an unclamped count would put a number in the text that is not in `measured` — and `gateChallenge`
+// refuses the WHOLE report as `fabricated-citation`, silently. One bad field from the producer would
+// take the class down entirely, which is the failure shape this whole class exists to end.
+describe("pr-conflicting citation safety", () => {
+  it("stays citable when the producer sends a negative commits-behind", () => {
+    const [c] = evaluateFleetConditions(
+      [],
+      T0,
+      [],
+      [
+        {
+          pr: 12,
+          branch: "sparkle/x",
+          ownerAgentId: null,
+          kind: "conflicting",
+          commitsBehind: -5,
+          untested: true,
+          unresolvedSecs: -1,
+        },
+      ],
+    );
+    expect(citable(c!.text, c!.measured)).toBe(true);
+    expect(c!.text).toContain("0 commits behind main");
+    expect(c!.text).not.toContain("-5");
   });
 });

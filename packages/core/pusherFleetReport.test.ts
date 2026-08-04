@@ -13,7 +13,12 @@ import {
   type FleetReportDecision,
   type FleetReportInput,
 } from "./pusherFleetReport";
-import { evaluateFleetConditions, type FleetConditionId, type FleetSnapshot } from "./pusherFleet";
+import {
+  evaluateFleetConditions,
+  type ConflictingPr,
+  type FleetConditionId,
+  type FleetSnapshot,
+} from "./pusherFleet";
 
 /** A stamp recording that `id` was reported at `at`, covering exactly `snapshots`. */
 function stamp(snapshots: readonly FleetSnapshot[], id: FleetConditionId, at: number) {
@@ -52,6 +57,7 @@ function decide(over: Partial<FleetReportInput> = {}): FleetReportDecision {
     snapshots: [walled("a")],
     memory: emptyFleetMemory(),
     duties: [],
+    conflicts: undefined,
     inbox: { used: 0, capacity: 50 },
     now: T0,
     ...over,
@@ -349,6 +355,57 @@ describe("standing duties reach the report", () => {
 
   it("stays silent when no duty is supplied", () => {
     expect(decide({ snapshots: [], duties: [] })).toMatchObject({
+      action: "quiet",
+      reason: "no-condition",
+    });
+  });
+});
+
+// A CONFLICTING PR REACHING THE REPORT, THROUGH THE REAL GATE. The evaluator's own tests prove the
+// sentence is composed and citable; this proves it survives `gateChallenge` and is DELIVERED. The
+// distinction is not academic — every failure this path has is silent, and a `fabricated-citation`
+// refusal presents as a fleet that looks healthy rather than as an error anyone would see.
+describe("conflicting PRs reach the report", () => {
+  const conflict: ConflictingPr = {
+    pr: 1091,
+    branch: "sparkle/roborev-backlog-notice-collapse",
+    ownerAgentId: null,
+    kind: "conflicting",
+    commitsBehind: 220,
+    untested: true,
+    unresolvedSecs: 4 * 60 * 60,
+  };
+
+  it("delivers the untested fact and the PR number, with every number cited", () => {
+    const d = decide({
+      snapshots: [],
+      conflicts: [conflict],
+      memory: {
+        ...emptyFleetMemory(),
+        lastConditions: evaluateFleetConditions([], T0, [], [conflict]),
+      },
+    });
+    if (d.action !== "send") throw new Error("expected a send");
+    expect(d.conditionIds).toEqual(["pr-conflicting"]);
+    expect(d.text).toContain("#1091");
+    expect(d.text).toContain("conflicting, and therefore untested");
+    // The gate hands back what it verified; every number in the delivered text is one of these.
+    expect(d.cited).toContain("1091");
+    expect(d.cited).toContain("220");
+    expect(numbersIn(d.text).every((n) => d.cited.includes(n))).toBe(true);
+  });
+
+  // FAIL CLOSED, at the level that ships. `undefined` is the value a caller genuinely holds while
+  // the probe has never answered, and it must not become an all-clear on the way through.
+  it("says nothing when the probe has not looked", () => {
+    expect(decide({ snapshots: [], conflicts: undefined })).toMatchObject({
+      action: "quiet",
+      reason: "no-condition",
+    });
+  });
+
+  it("says nothing when the probe looked and found none", () => {
+    expect(decide({ snapshots: [], conflicts: [] })).toMatchObject({
       action: "quiet",
       reason: "no-condition",
     });

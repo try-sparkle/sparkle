@@ -50,9 +50,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { log } from "../logger";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
+import { useConflictStore } from "../stores/conflictStore";
 import { useSettingsStore } from "../stores/settingsStore";
 import { quotaBlockForAgent, lastFailureForAgent } from "../engine/engineRegistry";
 import { getConfig, onConfigChanged } from "./config";
+import { startConflictFlags } from "./conflictFlags";
 import { ownsProjectInThisWindow } from "./goalContinuationRunner";
 import { notifyConcierge } from "./conciergeNotifier";
 import { IMPROVEMENT_INTERVAL_MS } from "./improvementPass";
@@ -214,6 +216,10 @@ export function buildPusherDeps(): PusherRunnerDeps {
         now: Date.now(),
       }),
     inboxUsage,
+    // READ FROM THE STORE, SYNCHRONOUSLY, and `undefined` until the probe has answered even once —
+    // which is the honest reading on a build whose Rust side has no `conflict_flags` command at all.
+    // `conflictFlags.ts` is the only writer, and it never writes an empty list it did not receive.
+    conflicts: () => useConflictStore.getState().flags,
     // THE ASK RIDES THE CHALLENGE. `decidePusherAction` has already measured why this partner is
     // being spoken to; appending `BLOCKER_ASK` turns a statement into a question whose answer is
     // machine-readable, which is what closes the loop — otherwise the challenge lands, the agent
@@ -277,9 +283,22 @@ export function startPusher(): () => void {
   // from a policy that had not loaded yet would be stuck at the default for the life of the window.
   const stopRunner = startPusherRunner(buildPusherDeps(), MIN_TICK_MS);
 
+  // THE EVIDENCE FEED FOR `pr-conflicting`, started here because the Pusher is its only consumer.
+  // Best-effort in the same way the config read is: a probe that cannot start leaves the store at
+  // `undefined`, the condition never fires, and nothing else about the sweep changes. That is the
+  // fail-closed direction — a conflict detector that cannot look says nothing rather than all-clear.
+  let stopConflicts: (() => void) | undefined;
+  void startConflictFlags()
+    .then((stop) => {
+      if (stopped) stop();
+      else stopConflicts = stop;
+    })
+    .catch((e) => log.warn("pusher", "conflict probe failed to start", { error: String(e) }));
+
   return () => {
     stopped = true;
     stopRunner();
+    stopConflicts?.();
     unlisten?.();
   };
 }
