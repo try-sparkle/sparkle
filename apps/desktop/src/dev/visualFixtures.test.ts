@@ -414,15 +414,53 @@ describe("seeding never reaches disk", () => {
         enabled: boolean;
         status?: string;
         phase?: string;
-      }) => { enabled: boolean; status: string; phase: string };
+        interim?: string;
+        voiceSurface?: string;
+      }) => {
+        enabled: boolean;
+        status: string;
+        phase: string;
+        interim: string;
+        voiceSurface: string;
+      };
       expect(typeof mic).toBe("function");
 
       const live = mic({ enabled: true, status: "listening", phase: "active" });
       // It reports the STORE — read back independently, so a handle that echoed its argument would
-      // still have to have written it.
-      expect(live).toEqual({ enabled: true, status: "listening", phase: "active" });
+      // still have to have written it. `interim`/`voiceSurface` are reported even when unstated,
+      // which is what lets the capture step hold an UNSTATED term to whatever the store actually
+      // has rather than to what was asked for.
+      expect(live).toEqual({
+        enabled: true,
+        status: "listening",
+        phase: "active",
+        interim: "",
+        voiceSurface: "concierge",
+      });
       expect(useDictationStore.getState().status).toBe("listening");
       expect(useDictationStore.getState().phase).toBe("active");
+
+      // THE `composer-interim` FORM. Both fields must reach the STORE, not just the return value:
+      // the composer reads them from the store, so a handle that reported them without writing
+      // would photograph an empty box while claiming success.
+      const preview = mic({
+        enabled: true,
+        status: "listening",
+        phase: "active",
+        voiceSurface: "concierge",
+        interim: "still provisional",
+      });
+      expect(preview.interim).toBe("still provisional");
+      expect(preview.voiceSurface).toBe("concierge");
+      expect(useDictationStore.getState().interim).toBe("still provisional");
+      expect(useDictationStore.getState().voiceSurface).toBe("concierge");
+
+      // An UNSTATED interim is LEFT ALONE, exactly as an unstated phase is — the seed says nothing
+      // about it, so it must not be silently cleared out from under a surface that set it.
+      const untouched = mic({ enabled: true, status: "listening" });
+      expect(untouched.interim).toBe("still provisional");
+      // …and an explicit "" is how a surface CLEARS it, which must still work.
+      expect(mic({ enabled: true, status: "listening", interim: "" }).interim).toBe("");
 
       // The `{enabled:false}` form every pre-existing caller uses: status DEFAULTS to idle rather
       // than inheriting whatever the previous surface left behind, which is the cross-surface leak

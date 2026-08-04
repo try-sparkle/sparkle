@@ -1140,19 +1140,42 @@ export function applyVisualFixtures(
     // it asked for actually landed instead of only that this function was called. That distinction
     // is the one the `cable` step had to learn the hard way (see stepToExpression): calling the
     // setter is a precondition, not the effect.
+    // `interim` and `voiceSurface` are here for the ONE state that had no picture at all: the live
+    // Deepgram preview, painted italic at the end of the draft (Concierge/MentionMirror). It is the
+    // most-reported voice surface and the least photographable — it exists only for the fraction of
+    // a second between a partial arriving and the segment settling, and only while a cloud relay is
+    // streaming, so no capture could ever land on it by timing. Seeding the store is the only way to
+    // hold it still.
+    //
+    // `voiceSurface` matters as much as the text: the concierge only paints the ghost while it OWNS
+    // dictation (useConciergeDictation gates on `micLive`, which is `enabled && phase === "active"
+    // && voiceSurface === "concierge"`), so a seed that set `interim` alone would photograph an
+    // empty box and read as "the italics are broken" when it only meant "nobody claimed the mic".
+    // That is the exact confusion this surface exists to settle, so the handle must be able to
+    // express the whole state a push-to-talk hold produces, not half of it.
     (
       window as unknown as {
         __sparkleMic?: (s: {
           enabled: boolean;
           status?: "idle" | "listening" | "error";
           phase?: "passive" | "active";
-        }) => { enabled: boolean; status: string; phase: string };
+          interim?: string;
+          voiceSurface?: "concierge" | "agent";
+        }) => {
+          enabled: boolean;
+          status: string;
+          phase: string;
+          interim: string;
+          voiceSurface: string;
+        };
       }
     ).__sparkleMic = (s) => {
       useDictationStore.setState({
         enabled: s.enabled,
         status: s.status ?? "idle",
         ...(s.phase ? { phase: s.phase } : {}),
+        ...(s.interim === undefined ? {} : { interim: s.interim }),
+        ...(s.voiceSurface ? { voiceSurface: s.voiceSurface } : {}),
         // The tracker writes this too, but only on a window transition — and a headless page may
         // never see one, which would leave the pause reading as "window" and mask the terminal case.
         windowFocused: true,
@@ -1160,7 +1183,13 @@ export function applyVisualFixtures(
         modelProgress: null,
       });
       const d = useDictationStore.getState();
-      return { enabled: d.enabled, status: d.status, phase: d.phase };
+      return {
+        enabled: d.enabled,
+        status: d.status,
+        phase: d.phase,
+        interim: d.interim,
+        voiceSurface: d.voiceSurface,
+      };
     };
   }
 

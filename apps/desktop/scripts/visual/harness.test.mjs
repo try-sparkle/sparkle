@@ -248,6 +248,10 @@ describe("surface registry", () => {
       "settings-voice",
       "send-tray-speak",
       "send-tray-ptt",
+      // The live Deepgram preview, mid-utterance — the state a push-to-talk HOLD produces, as
+      // opposed to `send-tray-ptt`'s between-holds rest. It is the only surface that photographs
+      // provisional (italic) transcript ink.
+      "composer-interim",
       "send-tray-send",
       "settings-dialog",
       "open-pr-menu-narrow",
@@ -442,7 +446,18 @@ describe("the mic step's comparison — asserted by EVALUATING it, not by readin
     enabled: s.enabled,
     status: s.status ?? "idle",
     phase: s.phase ?? "passive",
+    interim: s.interim ?? "",
+    voiceSurface: s.voiceSurface ?? "concierge",
   });
+
+  /** What `composer-interim` asks for: a held push-to-talk painting a live preview. */
+  const ASKED_INTERIM = {
+    enabled: true,
+    status: "listening",
+    phase: "active",
+    voiceSurface: "concierge",
+    interim: "these words are still provisional",
+  };
 
   it("passes when the store reports back the state that was requested", () => {
     expect(runMic({ mic: ASKED }, honest)).toBe(true);
@@ -469,6 +484,40 @@ describe("the mic step's comparison — asserted by EVALUATING it, not by readin
       status: "idle",
       phase: "active",
     }))).toBe(true);
+  });
+
+  it("passes when the store echoes the requested interim and voice surface", () => {
+    expect(runMic({ mic: ASKED_INTERIM }, honest)).toBe(true);
+  });
+
+  it("FAILS when the interim or the voice surface came back different", () => {
+    // THE TWO TERMS THE `composer-interim` SURFACE RESTS ON, and they fail differently.
+    //
+    // An empty `interim` is the realistic wrong answer: it is the store's own default and what
+    // every other surface leaves behind, so a broken term here would let the surface photograph an
+    // EMPTY composer under a filename claiming italics — the precise silent-green failure this
+    // whole block exists to prevent.
+    expect(runMic({ mic: ASKED_INTERIM }, () => ({ ...honest(ASKED_INTERIM), interim: "" })))
+      .toBe(false);
+    // A different `voiceSurface` is subtler and worse: the concierge only paints while it OWNS
+    // dictation, so `"agent"` means the ghost is being drawn in a DIFFERENT box than the one being
+    // clipped. The capture would time out rather than lie — but only because this term is checked.
+    expect(
+      runMic({ mic: ASKED_INTERIM }, () => ({ ...honest(ASKED_INTERIM), voiceSurface: "agent" })),
+    ).toBe(false);
+  });
+
+  it("leaves an UNSTATED interim or voice surface alone rather than forcing one", () => {
+    // Every pre-existing mic surface names neither, so an unstated term must be waved through or
+    // `send-tray-*` would start failing on whatever the previous surface left in the store.
+    for (const interim of ["", "leftover words"]) {
+      for (const voiceSurface of ["concierge", "agent"]) {
+        expect(
+          runMic({ mic: ASKED }, () => ({ ...honest(ASKED), interim, voiceSurface })),
+          `interim=${JSON.stringify(interim)} voiceSurface=${voiceSurface}`,
+        ).toBe(true);
+      }
+    }
   });
 
   it("leaves an UNSTATED phase alone rather than forcing one", () => {

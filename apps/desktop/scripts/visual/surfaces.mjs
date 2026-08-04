@@ -204,6 +204,51 @@ export const SURFACES = [
     mock: null,
   },
   {
+    // ── THE LIVE DEEPGRAM PREVIEW, MID-UTTERANCE ──────────────────────────────────────────────
+    // The provisional words painted italic at the end of the draft (Concierge/MentionMirror), which
+    // is what the founder means by "Deepgram italics". It had NO coverage of any kind — not a
+    // visual surface, not a screenshot — because it exists only between a partial arriving and the
+    // segment settling, over a live cloud relay. So "the italics are gone" could not be answered by
+    // looking at anything; it took a Deepgram probe and a log correlation to even establish which
+    // half of the pipe was at fault (bead sparkle-phdw2).
+    //
+    // The seed is the state a PUSH-TO-TALK HOLD produces, and every field is load-bearing:
+    // `phase: "active"` + `voiceSurface: "concierge"` are what `useConciergeDictation` requires
+    // before it will pass `interim` down at all, so a surface that seeded the text alone would
+    // photograph an empty composer and read as a regression when nothing was broken.
+    name: "composer-interim",
+    description: "The concierge composer mid-utterance: provisional Deepgram words, italic.",
+    app: {
+      steps: [
+        { waitFor: 'section[aria-label="Sparkle concierge"]' },
+        { clickText: { sel: 'section[aria-label="Sparkle concierge"] button', t: "Push to talk" } },
+        { waitFor: "[data-testid=send-mode-tray][data-mode=ptt]" },
+        {
+          mic: {
+            enabled: true,
+            status: "listening",
+            phase: "active",
+            voiceSurface: "concierge",
+            interim: "these words are still provisional",
+          },
+        },
+        // The ASSERTION, not decoration: the ghost span only exists while the composer is actually
+        // painting a preview, so waiting on it is what makes this surface fail loudly if the
+        // italics ever stop rendering — rather than quietly capturing an empty box.
+        { waitFor: "[data-testid=concierge-interim]" },
+        // …AND THEN THE PRESENTATION READ, because every mic surface must end on one (see the
+        // registry rule in harness.test.mjs). The two prove different halves and both are wanted:
+        // the ghost proves the provisional ink is painted, this proves the mic state the app
+        // DERIVED for it is the live one. A held push-to-talk is `activeListening` — same
+        // derivation as Speak, since `deriveMicPresentation` reads `phase`, not the tray position —
+        // which is exactly what distinguishes this surface from `send-tray-ptt`'s `passiveWaiting`.
+        { waitFor: "[data-mic-presentation=activeListening]" },
+      ],
+      clip: 'section[aria-label="Sparkle concierge"]',
+    },
+    mock: null,
+  },
+  {
     // Send: the mic is released. The composer makes no voice promise and falls back to its own
     // "what this box is for" copy — the `captionKind === "none"` branch.
     name: "send-tray-send",
@@ -451,7 +496,9 @@ export function stepToExpression(step) {
       if (!got) return false;
       return got.enabled === ${JSON.stringify(want.enabled)}
         && got.status === ${JSON.stringify(want.status ?? "idle")}
-        && (${JSON.stringify(want.phase ?? null)} === null || got.phase === ${JSON.stringify(want.phase ?? null)}); })()`;
+        && (${JSON.stringify(want.phase ?? null)} === null || got.phase === ${JSON.stringify(want.phase ?? null)})
+        && (${JSON.stringify(want.interim ?? null)} === null || got.interim === ${JSON.stringify(want.interim ?? null)})
+        && (${JSON.stringify(want.voiceSurface ?? null)} === null || got.voiceSurface === ${JSON.stringify(want.voiceSurface ?? null)}); })()`;
   }
   throw new Error(`Unrecognised step: ${JSON.stringify(step)}`);
 }

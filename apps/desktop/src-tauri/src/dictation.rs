@@ -57,12 +57,74 @@ pub(crate) fn emit_partial(app: &AppHandle, source: &str, seg: String) {
     let _ = app.emit("dictation://partial", seg);
 }
 
+/// How many interims pass between log lines. Interims arrive several times a second, so logging
+/// every one would swamp the file; every 25th is roughly one line per spoken phrase, which is the
+/// same order as `emit partial` and cheap enough to leave on in shipped builds.
+const INTERIM_LOG_EVERY: u64 = 25;
+
+/// Interims emitted since the CURRENT dictation attempt began — not since process start, and the
+/// difference is the whole value of the line.
+///
+/// `should_log_interim` always logs the 0th, so that "always" is only worth anything if the counter
+/// goes back to 0 when a new attempt starts. A process-lifetime counter would give the very first
+/// interim of the app's life a line and then sample every 25th forever, so a later push-to-talk
+/// hold producing a handful of interims could log NOTHING — exactly the intermittent attempt
+/// someone is reading the log to understand. `start_cloud_stream` resets it on every
+/// passive→active edge (including warm socket reuse) via [`reset_interim_log_sampling`].
+static INTERIM_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Restart interim log sampling for a new dictation attempt — see [`INTERIM_SEQ`].
+pub(crate) fn reset_interim_log_sampling() {
+    INTERIM_SEQ.store(0, Ordering::Relaxed);
+}
+
 /// Emit a live, *volatile* interim transcript (the cloud path's word-by-word preview). Unlike a
 /// committed partial this is replaced in place on the frontend and is NOT routed through the
-/// wake-word machine. Privacy: interim text changes many times per second and is never logged —
-/// we emit it to the webview and keep nothing.
+/// wake-word machine.
+///
+/// ── WHY THIS LOGS AT ALL, WHEN IT DELIBERATELY DID NOT ────────────────────────────────────────
+/// The old contract here was "we emit it to the webview and keep nothing", and for the TEXT that
+/// still holds — see the privacy note below. But keeping nothing at all made a whole class of bug
+/// undiagnosable: when the founder reported that the italic provisional preview never appeared
+/// (bead sparkle-phdw2), his log carried 635 `emit partial source="deepgram"` lines and *no*
+/// evidence either way about interims, because this function was silent. "Deepgram is live" and
+/// "interims are reaching the webview" are different facts, and only the first was observable — so
+/// the investigation could not tell a backend that never emitted from a frontend that never
+/// painted, and had to reach for a live Deepgram probe to make any progress at all.
+///
+/// A COUNT is the whole fix. It distinguishes those two cases from one line in a user's log, and
+/// it is the one thing that was missing.
+///
+/// PRIVACY IS UNCHANGED, and stricter than `emit_partial`'s: no transcript text, no fingerprint,
+/// and no length. A fingerprint is defensible for committed segments (one per phrase, and it is
+/// what makes duplicates diagnosable), but interims are the SAME phrase re-sent word by word as it
+/// grows, so a stream of fingerprints over a lengthening prefix is a far better reversal oracle
+/// than the isolated digests `emit_partial` writes. Only the running count is recorded.
+/// Claim this interim's 0-based index within the current dictation attempt, advancing the counter.
+/// Split out so the reset contract is testable without an `AppHandle` (which no unit test can
+/// build) — the thing worth proving is that a new attempt starts back at 0, and that is invisible
+/// from `should_log_interim` alone.
+fn next_interim_index() -> u64 {
+    INTERIM_SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
 pub(crate) fn emit_interim(app: &AppHandle, seg: String) {
+    let n = next_interim_index();
+    if should_log_interim(n) {
+        tracing::info!(target: "dictation", count = n + 1, "emit interim");
+    }
     let _ = app.emit("dictation://interim", seg);
+}
+
+/// Does the `n`-th interim (0-based) get a log line? The FIRST one always does, then every
+/// [`INTERIM_LOG_EVERY`]-th after it.
+///
+/// Logging the first is the load-bearing half, and the reason this is a named function rather than
+/// an inline `%`: a plain every-25th sample would stay SILENT through a session that emitted 24
+/// interims and then stopped — which is precisely the failing session someone would be reading the
+/// log to understand. The bug this whole line exists to make diagnosable would still be invisible.
+fn should_log_interim(n: u64) -> bool {
+    n % INTERIM_LOG_EVERY == 0
 }
 
 /// THE SPEAKER STOPPED — the auto-send rail's silence signal (PRD §4).
@@ -2620,6 +2682,12 @@ pub async fn start_cloud_stream(
     // attributable in the Credits history. Metering-only; None when the caller doesn't know.
     project: Option<String>,
 ) -> Result<bool, ()> {
+    // A NEW DICTATION ATTEMPT — restart the interim log sampling, so THIS attempt logs its own
+    // first interim. Here rather than at socket open because this command runs on every
+    // passive→active edge INCLUDING warm reuse, and warm reuse is the common case: without it a
+    // hold that reuses a standby socket and produces a handful of interims could log nothing at
+    // all, which is precisely the intermittent attempt someone is reading the log to understand.
+    reset_interim_log_sampling();
     // Capture, under one lock, the state we need to (a) decide whether to open a stream and
     // (b) safely install it after the blocking handshake. The Arcs are captured by IDENTITY so we
     // can later confirm (via ptr_eq) the session generation didn't change.
@@ -3087,7 +3155,7 @@ mod tests {
         missing_tick, build_suppresses_watch, BUILD_STALL_GRACE, DictationSession, MISSING_CAPTURE_TICKS, watchdog_emission, WatchdogEmission,
         begin_start_decision, capture_should_be_live, choose_engine, cloud_reuse, frame_on_device_speech, frame_speaking, segment_cloud_latch, park_cloud_for_blur, plan_capture,
         apply_decode_plan, plan_decode_emit, DecodeEmitPlan, DecodeEmitSink, DecodeOutcome,
-        segment_fingerprint, should_emit_blur, should_install_cloud, should_keep_warm_on_stop,
+        segment_fingerprint, should_emit_blur, should_install_cloud, should_keep_warm_on_stop, should_log_interim, INTERIM_LOG_EVERY, next_interim_index, reset_interim_log_sampling,
         should_resume_on_focus, should_standby_on_blur, start_after_load, stop_is_noop, unpark_cloud_for_focus, BeginStart, CapturePlan,
         CloudReuse, DeepgramSession, DictationState, Engine, Installed, ReconcileStep, StartAfterLoad,
         raced_stream_disposition, RacedStream, park_raced_stream, install_live_stream, CloudAudioSender,
@@ -5209,6 +5277,66 @@ mod tests {
         assert_eq!(choose_engine(true, false, true), Engine::Local, "signed out (no bearer)");
         assert_eq!(choose_engine(true, true, false), Engine::Local, "no credits");
         assert_eq!(choose_engine(false, false, false), Engine::Local);
+    }
+
+    /// Serializes the tests that touch the process-global `INTERIM_SEQ`. Rust runs unit tests on
+    /// parallel threads by default, so two of them advancing one atomic would interleave.
+    static SEQ_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn the_very_first_interim_is_always_logged() {
+        // THE POINT OF THE WHOLE LINE. The bug that motivated it (bead sparkle-phdw2) presents as
+        // "no interims reached the webview", and the only thing that can distinguish that from
+        // "interims flowed but nothing painted them" is evidence that at least ONE was emitted.
+        // A sample that skipped the first would go silent on exactly the short/aborted sessions
+        // someone is reading the log to understand.
+        assert!(should_log_interim(0), "the first interim must always be logged");
+    }
+
+    #[test]
+    fn interims_are_sampled_rather_than_logged_every_time() {
+        // Interims arrive several times a second; logging each would swamp the file and push the
+        // `emit partial` lines beside them out of any practical tail. So the ones BETWEEN samples
+        // must stay silent — this is the half that keeps the line cheap enough to ship enabled.
+        for n in 1..INTERIM_LOG_EVERY {
+            assert!(!should_log_interim(n), "interim {n} must not log");
+        }
+        assert!(should_log_interim(INTERIM_LOG_EVERY), "the sample boundary must log");
+        assert!(should_log_interim(INTERIM_LOG_EVERY * 7), "sampling must keep going");
+        assert!(
+            !should_log_interim(INTERIM_LOG_EVERY * 7 + 1),
+            "…and still stay quiet between samples late in a session"
+        );
+    }
+
+    #[test]
+    fn a_new_dictation_attempt_restarts_the_interim_sampling() {
+        // THE HALF `should_log_interim` CANNOT SEE, and the one that makes the log line worth
+        // shipping. "The first interim always logs" is only true per-ATTEMPT if the counter goes
+        // back to zero when an attempt begins; with a process-lifetime counter, the app's very
+        // first interim gets a line and then a later push-to-talk hold producing a handful of
+        // interims logs NOTHING — precisely the intermittent attempt someone reads the log to
+        // understand. `start_cloud_stream` calls the reset on every passive→active edge.
+        //
+        // Serialized against the other counter test via SEQ_LOCK: these share one process-global
+        // atomic, and vitest-style parallel test threads would otherwise interleave the two and
+        // make both flaky.
+        let _g = SEQ_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_interim_log_sampling();
+        assert_eq!(next_interim_index(), 0, "a fresh attempt starts at 0");
+        // Burn past the first sample boundary, so a missing reset would be visible below.
+        for _ in 0..INTERIM_LOG_EVERY {
+            next_interim_index();
+        }
+        assert!(next_interim_index() > 0, "the counter really did advance");
+
+        reset_interim_log_sampling();
+        let first_of_next_attempt = next_interim_index();
+        assert_eq!(first_of_next_attempt, 0, "a NEW attempt must start at 0 again");
+        assert!(
+            should_log_interim(first_of_next_attempt),
+            "…so the new attempt logs its own first interim",
+        );
     }
 
     #[test]
