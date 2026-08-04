@@ -76,8 +76,25 @@ export function visualFixturesRequested(search: string): boolean {
 
 export const FIXTURE_PROJECT_ID = "visual-fixture-project";
 
+/**
+ * The primary project's root path.
+ *
+ * A CONSTANT RATHER THAN A LITERAL because it is now a KEY as well as a field: `project_open_prs`
+ * is answered per root path (see {@link FIXTURE_PRS_BY_ROOT}), so the string the project carries and
+ * the string the lookup is keyed on are the same fact. Spelled twice, a one-character drift makes
+ * the probe resolve to `null` — "we could not ask" — and the menu renders NOTHING, which
+ * photographs as a perfectly plausible empty header rather than as a failure.
+ */
+export const FIXTURE_PROJECT_ROOT = "/Users/dev/Projects/sparkle";
+
 /** The second project, seeded onto the LEFT pair only when `?pairs=2` is asked for. */
 export const FIXTURE_LEFT_PROJECT_ID = "visual-fixture-project-left";
+
+/** The second OPEN-TAB project, seeded only when `?projects=2` is asked for. */
+export const FIXTURE_SECOND_PROJECT_ID = "visual-fixture-project-website";
+
+/** Its root path — the second key in {@link FIXTURE_PRS_BY_ROOT}. See {@link FIXTURE_PROJECT_ROOT}. */
+export const FIXTURE_SECOND_PROJECT_ROOT = "/Users/dev/Projects/drodio-website";
 
 /** The left project's selected row — the one whose seam a left-pair capture is taken to inspect. */
 const LEFT_SELECTED_ROW_ID = "vfx-left-agent-1";
@@ -103,7 +120,14 @@ export function visualPairCount(search: string): 1 | 2 {
 export const VISUAL_CONCIERGE_WIDTH_PARAM = "concierge";
 
 /**
- * The concierge width a capture asks for, or null for the app's own default.
+ * The concierge width a capture asks for, or null for "this surface names no width".
+ *
+ * NULL DOES NOT MEAN "the app's own default" BY ITSELF — it did not, for as long as this docblock
+ * said so. `localStorage` is origin-scoped and survives navigation, and the harness runs every
+ * surface in one browser, so a width-less surface inherited whatever the last one wrote. Under the
+ * harness (`visualCaptureRun`) the seeder now CLEARS the keys on this path, which is what finally
+ * makes null mean the default; outside it, null still means "leave the developer's own width alone"
+ * (roborev 57717).
  *
  * OPT-IN for the reason every parameter here is (see {@link visualPairCount}): the width is the
  * layout's biggest lever, so seeding one unconditionally would re-lay-out and invalidate every
@@ -178,6 +202,30 @@ export function visualConciergeWidth(search: string): number | null {
   return acceptsStoredConciergeWidth(n, { paired: false }) ? n : null;
 }
 
+/** The query parameter the CAPTURE HARNESS adds to every surface: `?capture=1`. */
+export const VISUAL_CAPTURE_PARAM = "capture";
+
+/**
+ * Whether the visual-capture harness is driving this page, as opposed to a developer who typed
+ * `?visual=1` at their own dev server.
+ *
+ * A SEPARATE CLAIM FROM `?visual=1`, and the difference decides whether the fixture may RESET state
+ * rather than only seed it. The harness gives each surface a fresh page but runs them all in ONE
+ * browser, and `localStorage` is origin-scoped — so anything a surface does not set is inherited
+ * from whichever surface ran before it, and a capture's meaning comes to depend on the order the
+ * run happened to take. Clearing the keys the fixture owns fixes that.
+ *
+ * It is gated on this rather than on `?visual=1` because the concierge widths are NOT
+ * zustand-persisted, so `detachPersistence` does not cover them: they are a real preference on a
+ * real machine, and wiping them because someone opened their own dev server with `?visual=1` would
+ * be the fixture destroying user data. The harness's own profile is a throwaway user-data-dir, so
+ * there it costs nothing.
+ */
+export function visualCaptureRun(search: string): boolean {
+  const v = new URLSearchParams(search).get(VISUAL_CAPTURE_PARAM);
+  return v === "1" || v === "true";
+}
+
 /** The query parameter that seeds open pull requests: `?prs=1`. */
 export const VISUAL_PRS_PARAM = "prs";
 
@@ -185,6 +233,34 @@ export const VISUAL_PRS_PARAM = "prs";
 export function visualPrsRequested(search: string): boolean {
   const v = new URLSearchParams(search).get(VISUAL_PRS_PARAM);
   return v === "1" || v === "true";
+}
+
+/** The query parameter that opens a SECOND project tab: `?projects=2`. */
+export const VISUAL_PROJECTS_PARAM = "projects";
+
+/**
+ * How many projects the capture wants OPEN AS TABS. Default 1 — the single-project workspace every
+ * existing surface is baselined against, which must not move.
+ *
+ * OPT-IN for the same reason {@link visualPairCount} is, and it is a genuinely different axis from
+ * that one. `?pairs=2` opens a second COLUMN PAIR (a project projected onto the left side of the
+ * cockpit, which is how the wired-left cable reaches a far end); this opens a second TAB in the one
+ * pair that is already there. A capture can ask for both, or for either alone.
+ *
+ * WHY A CAPTURE WOULD WANT THIS — the open-PR menu is a MULTI-REPO surface the moment more than one
+ * project is open: two repos' PR lists have to be told apart by section, and PR numbers are only
+ * unique within a repo, so `#1088` can legitimately name two different pull requests at once. None
+ * of that is photographable against a workspace holding a single project, which is why the fixture
+ * seeds a second one with a DIFFERENT PR list (see {@link FIXTURE_PRS_BY_ROOT}) rather than a second
+ * copy of the same rows.
+ *
+ * A COUNT rather than a boolean, mirroring `visualPairCount`, because the parameter's value IS a
+ * count and the two read as a pair at every call site. Only `2` turns it on; anything else — absent,
+ * `1`, `3`, a typo — leaves the default single-project seed untouched, so a malformed parameter can
+ * never half-apply.
+ */
+export function visualProjectCount(search: string): 1 | 2 {
+  return new URLSearchParams(search).get(VISUAL_PROJECTS_PARAM) === "2" ? 2 : 1;
 }
 
 /**
@@ -239,6 +315,100 @@ export const FIXTURE_PRS = [
     mergeable: "mergeable",
   },
 ] as const;
+
+/**
+ * The SECOND project's rows — a different repo, answered under `?projects=2`.
+ *
+ * DELIBERATELY SHORT, AND DELIBERATELY COLLIDING. Short because its job is not to re-photograph the
+ * truncation cases {@link FIXTURE_PRS} already covers: two lists of four look like one long list and
+ * would make the section boundary the hardest thing in the picture to find. Three rows against four
+ * makes the grouping legible at a glance.
+ *
+ * The collision is the load-bearing part. `#1088` is ALSO a pull request in the primary project's
+ * list, and that is not an accident to be tidied away: a PR number is unique within a repo and
+ * nowhere else, so a grouped menu that keys anything — a row, a selection, a merge, a React `key` —
+ * on the number alone is silently wrong the moment two repos are open. A fixture without a collision
+ * cannot photograph that mistake; with one, the picture either shows two distinct rows or shows the
+ * bug. Its title, branch and URL all differ from #1088's in the other list, so the two are
+ * distinguishable BY EYE in the capture rather than only in the DOM.
+ *
+ * AND THEIR STATUSES ARE OPPOSITE, which is what makes the picture decisive rather than merely
+ * suggestive. #1088 in the primary list is the RED, blocked row; #1088 here is green and ready. A
+ * menu that resolves a row by number alone therefore renders a wrong DOT and a wrong merge
+ * affordance — visible at a glance in a screenshot — instead of a subtly wrong link that a reader
+ * would have to open to catch.
+ *
+ * Two greens here, on top of the primary list's two, also make any cross-repo "Merge all ready (N)"
+ * count read 4 rather than 2 — a number that is wrong in a visible way if the grouping mis-scopes it.
+ */
+export const FIXTURE_SECOND_PRS = [
+  {
+    // THE COLLIDING NUMBER. Same `number` as a row in FIXTURE_PRS, different everything else.
+    number: 1088,
+    title: "feat(pricing): rebuild the credits table around the new tiers",
+    headRefName: "site/pricing-credits-table",
+    url: "https://github.com/o/site/pull/1088",
+    checks: "passing",
+    mergeable: "mergeable",
+  },
+  {
+    number: 964,
+    title: "chore(deps): take the security patch for the markdown renderer",
+    headRefName: "site/markdown-security-patch",
+    url: "https://github.com/o/site/pull/964",
+    checks: "passing",
+    mergeable: "mergeable",
+  },
+  {
+    number: 42,
+    title: "fix(nav): keep the mobile menu open while a submenu has focus",
+    headRefName: "site/mobile-nav-focus",
+    url: "https://github.com/o/site/pull/42",
+    checks: "pending",
+    mergeable: "mergeable",
+    failingChecks: [],
+    pendingChecks: ["Preview / build"],
+  },
+] as const;
+
+/**
+ * `project_open_prs`, ANSWERED PER ROOT PATH.
+ *
+ * The shim used to answer every call with one array regardless of its `root` argument, which was
+ * fine while exactly one project existed and becomes a lie the moment two do: a grouped menu asking
+ * "what is open in THIS repo" would get the same four rows for both and photograph a state the app
+ * can never actually be in — two sections, identical contents, identical PR numbers throughout. The
+ * capture would look like working grouping and prove nothing.
+ *
+ * Keyed on the ROOT PATH rather than the project id because `root` is what the command is invoked
+ * with (`invoke("project_open_prs", { root, projectId })`) — `fetchOpenPrs`'s first argument is the
+ * project's `rootPath`. Keying on the id would mean reading a field the command does not promise to
+ * carry.
+ */
+export const FIXTURE_PRS_BY_ROOT = {
+  [FIXTURE_PROJECT_ROOT]: FIXTURE_PRS,
+  [FIXTURE_SECOND_PROJECT_ROOT]: FIXTURE_SECOND_PRS,
+} as const;
+
+/**
+ * The rows for one root, or `null` for a root the fixture has never heard of.
+ *
+ * NULL IS "UNKNOWN", NOT "EMPTY", and preserving that distinction is the whole reason this is a
+ * function rather than an index expression. `fetchOpenPrs` collapses every failure — no `gh`,
+ * unauthed, offline, no remote — into `null`, and `OpenPrMenu` deliberately renders nothing for both
+ * null and `[]` while treating them differently everywhere else: a confident "no PRs" on a probe
+ * that never ran is exactly the false reassurance the badge exists to prevent. An unknown root here
+ * is the same fact, so it answers the same way the shim it wraps does.
+ *
+ * `hasOwnProperty` rather than `in` / a bare index: `root` arrives from the caller, and every
+ * `Object.prototype` member ("toString", "constructor") is otherwise a "known" key that resolves to
+ * a function the menu would try to iterate.
+ */
+export function fixturePrsForRoot(root: unknown): readonly unknown[] | null {
+  if (typeof root !== "string") return null;
+  if (!Object.prototype.hasOwnProperty.call(FIXTURE_PRS_BY_ROOT, root)) return null;
+  return (FIXTURE_PRS_BY_ROOT as Record<string, readonly unknown[]>)[root] ?? null;
+}
 
 /** One agent row's worth of fixture, flattened so the table below reads as a spec. */
 interface Row {
@@ -466,7 +636,8 @@ export function buildVisualFixture(): {
   const project: Project = {
     id: FIXTURE_PROJECT_ID,
     name: "sparkle",
-    rootPath: "/Users/dev/Projects/sparkle",
+    // The constant, not the string — it is also the key `project_open_prs` is answered on.
+    rootPath: FIXTURE_PROJECT_ROOT,
     defaultBranch: "main",
     createdAt: iso,
     lastOpenedAt: iso,
@@ -527,6 +698,75 @@ export function buildLeftPairFixture(): {
 }
 
 /**
+ * The SECOND OPEN TAB's project — a different repo, seeded under `?projects=2`.
+ *
+ * Its `name` and its `rootPath` are both load-bearing rather than flavour. The name is what a
+ * grouped open-PR menu renders as a SECTION HEADER, so it is in the photograph: "sparkle" and
+ * "drodio-website" are two words a reader can tell apart at a glance and at any width, which two
+ * near-identical fixture names would not be. The rootPath is the KEY the per-root PR lookup answers
+ * on — {@link FIXTURE_SECOND_PROJECT_ROOT} is used here and there, so they cannot drift into a
+ * project whose PR probe silently resolves to "unknown".
+ *
+ * Two rows, and small on purpose for the same reason {@link buildLeftPairFixture} is: this project's
+ * job is to be REAL (a project with agents, so its tab and its pane are not degenerate), not to
+ * re-photograph a sidebar that the primary project already covers in full.
+ *
+ * Ids are prefixed so they cannot collide with either other project's. A duplicate AGENT id would
+ * put two rows in the roster under one key and make the capture quietly wrong rather than fail —
+ * note the deliberate contrast with the PR NUMBERS, which collide on purpose (see
+ * {@link FIXTURE_SECOND_PRS}): a PR number is unique per repo and an agent id is unique globally,
+ * so a collision is a fixture bug in one case and the thing under test in the other.
+ */
+export function buildSecondProjectFixture(): {
+  project: Project;
+  status: Record<string, AgentTabStatus>;
+  workflowStage: Record<string, WorkflowStageId>;
+} {
+  const iso = new Date(FIXTURE_NOW).toISOString();
+  const rows: Row[] = [
+    {
+      id: "vfx-web-agent-1",
+      name: "Pricing page credits table",
+      kind: "build",
+      parentId: null,
+      status: "idle",
+      elapsedMin: 12,
+      stage: "pull_request",
+      lastPrompt: "Rebuild the credits table around the new tiers",
+    },
+    {
+      id: "vfx-web-agent-2",
+      name: "Mobile nav focus trap",
+      kind: "build",
+      parentId: null,
+      status: "working",
+      elapsedMin: 4,
+      stage: "building_saved",
+      activity: "Keeping the submenu open while it holds focus",
+      lastPrompt: "Keep the mobile menu open while a submenu has focus",
+    },
+  ];
+  const project: Project = {
+    id: FIXTURE_SECOND_PROJECT_ID,
+    name: "drodio-website",
+    rootPath: FIXTURE_SECOND_PROJECT_ROOT,
+    defaultBranch: "main",
+    createdAt: iso,
+    lastOpenedAt: iso,
+    agents: rows.map(toAgent),
+    selectedAgentId: rows[0]!.id,
+    freshBuildAgentId: rows[0]!.id,
+  };
+  const status: Record<string, AgentTabStatus> = {};
+  const workflowStage: Record<string, WorkflowStageId> = {};
+  for (const r of rows) {
+    status[r.id] = r.status;
+    workflowStage[r.id] = r.stage;
+  }
+  return { project, status, workflowStage };
+}
+
+/**
  * Seed the stores. No-op unless the dev auth bypass is on, so a normal dev session can never be
  * clobbered by fixtures just because the URL carried a stray parameter.
  *
@@ -565,7 +805,16 @@ export function detachPersistence(): void {
   // makes the developer's next ordinary launch do both. And DICTATION_PERSIST_KEY is watched by the
   // cross-window sync service on the browser `storage` event, so a harness tab could arm the mic in
   // another window the developer has open right now. (roborev 56045)
-  for (const store of [useProjectStore, useRuntimeStore, useDictationStore]) {
+  //
+  // useUiStore IS IN THIS LIST FOR THE SAME KIND OF REASON. It persists under "sparkle-ui" with a
+  // partialize that keeps everything except a short transient list — `openProjectIds`,
+  // `pairAssignment` and `leftProjectId` are all on the persisted side, and all three are written
+  // below whenever a capture asks for a second pair or a second tab. Undetached, `?pairs=2` or
+  // `?projects=2` would rewrite a developer's real OPEN-TAB SET on disk: their tab strip comes back
+  // holding two projects they have never opened and missing the ones they had, which reads as data
+  // loss rather than as a fixture. It has no exported persist-key constant, so the test that proves
+  // this reads the key off the store's own persist options rather than re-spelling it.
+  for (const store of [useProjectStore, useRuntimeStore, useDictationStore, useUiStore]) {
     (store as unknown as PersistApi).persist?.setOptions({ storage: noop });
   }
 }
@@ -585,6 +834,11 @@ export function applyVisualFixtures(
   const { project, status, workflowStage } = buildVisualFixture();
   // The second pair is OPT-IN (`?pairs=2`); see `visualPairCount` for why it cannot be the default.
   const left = visualPairCount(search) === 2 ? buildLeftPairFixture() : null;
+  // The second TAB is a separate opt-in (`?projects=2`) on a separate axis — see
+  // `visualProjectCount`. A capture may ask for both, so everything below composes them as a LIST
+  // rather than branching on one or the other.
+  const second = visualProjectCount(search) === 2 ? buildSecondProjectFixture() : null;
+  const extras = [left, second].filter((x): x is NonNullable<typeof x> => x !== null);
 
   // FIRST — before a single write. See "SAFETY, PART TWO" at the top of this file.
   detachPersistence();
@@ -593,28 +847,45 @@ export function applyVisualFixtures(
   // the non-determinism the fixture exists to avoid. Replaces `projects` outright so a persisted
   // localStorage profile from an earlier run can't leak extra rows into the capture.
   useProjectStore.setState({
-    // The RIGHT project stays first and stays `selectedProjectId`, so the single-pair layout — and
-    // every surface baselined against it — is untouched when `?pairs=2` is absent.
-    projects: left ? [project, left.project] : [project],
+    // The PRIMARY project stays first and stays `selectedProjectId`, so the single-project,
+    // single-pair layout — and every surface baselined against it — is untouched when neither
+    // `?pairs=2` nor `?projects=2` is asked for.
+    projects: [project, ...extras.map((e) => e.project)],
     selectedProjectId: project.id,
     removedIds: {},
   });
 
-  // ── THE SECOND PAIR ────────────────────────────────────────────────────────────────────────
+  // ── THE TAB SET AND THE PAIR ASSIGNMENT — WRITTEN UNCONDITIONALLY ───────────────────────────
   //
-  // Three ui values, and all three are load-bearing: `pairAssignment` is what `pairCountFor` reads
-  // to decide there are two pairs at all, and `leftProjectId` is what `useEffectiveWired` resolves
-  // the LEFT side's selected agent through — without it, `patch("left")` is a no-op as far as the
-  // shell is concerned and the capture silently photographs an unwired app. That is the exact bug
-  // that let `workspace-wired-left` score the wrong state for its whole life; the harness's `cable`
-  // step now verifies `data-wired` agrees, so this being wrong fails loudly instead.
-  if (left) {
-    useUiStore.setState({
-      openProjectIds: [project.id, left.project.id],
-      pairAssignment: { [left.project.id]: "left" },
-      leftProjectId: left.project.id,
-    });
-  }
+  // `openProjectIds` is what gates which projects get a TAB (engine/openProjects: `null` means
+  // "every project is open", an array means exactly these). For `?projects=2` it is the whole
+  // mechanism: a second project sitting in the store with no tab is invisible to the tab strip, and
+  // a grouped open-PR menu that scopes itself to the OPEN set would then have exactly one group to
+  // render — the fixture would look like it worked and photograph the single-project state.
+  //
+  // NOT GATED ON THE OPT-INS, and that is the correction rather than the tidy-up (roborev 57710).
+  // Written only on the second-project path, the DEFAULT path left all three keys exactly as
+  // rehydrated from `sparkle-ui` — which is the more consequential case: a persisted
+  // `openProjectIds` that is a real array NOT containing the fixture project gives the seeded
+  // project no tab at all (`isProjectOpen` is false for a non-null set that omits it), and a stale
+  // `pairAssignment` opens a second pair under a filename claiming a single-pair layout. `projects`
+  // is replaced outright one block above for precisely this reason; these are the same fact about
+  // the same capture. In the single-project case `[project.id]` is behaviourally identical to the
+  // `null` the store starts at, so no existing baseline moves.
+  //
+  // `pairAssignment` is what `pairCountFor` reads to decide there are two pairs at all, and
+  // `leftProjectId` is what `useEffectiveWired` resolves the LEFT side's selected agent through —
+  // without it, `patch("left")` is a no-op as far as the shell is concerned and the capture silently
+  // photographs an unwired app. That is the exact bug that let `workspace-wired-left` score the
+  // wrong state for its whole life; the harness's `cable` step now verifies `data-wired` agrees, so
+  // this being wrong fails loudly instead. They belong to the PAIR opt-in alone: a capture that did
+  // not ask for a second pair gets them CLEARED, never inherited.
+  useUiStore.setState({
+    openProjectIds: [project.id, ...extras.map((e) => e.project.id)],
+    ...(left
+      ? { pairAssignment: { [left.project.id]: "left" }, leftProjectId: left.project.id }
+      : { pairAssignment: {}, leftProjectId: null }),
+  });
 
   // `status` is the only live-only key here — it is never persisted, so it must be written on every
   // boot or the rows render with no dot at all. `workflowStage` and `openAgentIds` ARE persisted
@@ -623,8 +894,13 @@ export function applyVisualFixtures(
   // loop on the strength of a "live-only" reading of this line — that restores the clobber, this
   // time of the developer's stage watermarks. (roborev 54756)
   useRuntimeStore.setState({
-    status: left ? { ...status, ...left.status } : status,
-    workflowStage: left ? { ...workflowStage, ...left.workflowStage } : workflowStage,
+    status: extras.reduce<Record<string, AgentTabStatus>>((all, e) => ({ ...all, ...e.status }), {
+      ...status,
+    }),
+    workflowStage: extras.reduce<Record<string, WorkflowStageId>>(
+      (all, e) => ({ ...all, ...e.workflowStage }),
+      { ...workflowStage },
+    ),
     openAgentIds: [],
   });
 
@@ -643,12 +919,45 @@ export function applyVisualFixtures(
   //
   // Deliberately NOT routed through `detachPersistence`: that turns off the zustand stores' own
   // persistence so the fixture cannot overwrite a developer's real profile, and this key is not a
-  // zustand-persisted one. It IS a developer's real key, so it is only ever touched when a width
-  // was explicitly asked for, and the capture harness always launches with a fresh user-data-dir.
+  // zustand-persisted one. It IS a developer's real key, so it is only ever touched under the gates
+  // above, and the capture harness always launches with a fresh user-data-dir.
+  //
+  // ── THE ELSE BRANCH IS THE LOAD-BEARING HALF (roborev 57717) ────────────────────────────────
+  //
+  // Writing only when a width is asked for looks harmless and is not. The harness gives each
+  // surface a fresh PAGE but ONE BROWSER, and `localStorage` is origin-scoped — so it survives
+  // every navigation in the run. A surface that wrote nothing therefore did not get "the app's own
+  // default"; it INHERITED whatever the previously-captured surface left behind, which made a
+  // capture's meaning depend on the order it happened to be taken in.
+  //
+  // That was not hypothetical. `THEMES` is the outer loop with the surfaces nested inside, so every
+  // width-less surface — `workspace-unwired`, both `workspace-wired-*`, `agent-sidebar`,
+  // `concierge-column`, `settings-dialog` — booted its DARK capture carrying the last light-pass
+  // width. And `selectSurfaces` preserves argument order, so `--surfaces=open-pr-menu-narrow,
+  // concierge-column` reproduced it on demand. The grouped PR pair hit the visible version of this
+  // (two byte-identical PNGs, one of them filed as "wide"), but patching those two surfaces to name
+  // their widths only moved the inherited value from 190 to 360; it did not stop the inheriting.
+  //
+  // Clearing makes "no `?concierge=`" mean the app's own default, and makes every capture
+  // independent of the order the run happened to take.
+  //
+  // WHAT PROTECTS THE DEVELOPER HERE IS `capture=1`, NOT `?visual=1`. These two keys are not
+  // zustand-persisted, so `detachPersistence` does not cover them — they are a real preference on a
+  // real machine, and a developer who opens their own dev server with `?visual=1` (to reproduce a
+  // capture by hand) satisfies every other gate in this file. Only the harness marker keeps the
+  // clear off their profile, which is why the `visualCaptureRun(search)` condition below is
+  // load-bearing rather than redundant, and why collapsing it would destroy user data.
   const conciergeWidth = visualConciergeWidth(search);
-  if (conciergeWidth !== null && typeof localStorage !== "undefined") {
-    localStorage.setItem(CONCIERGE_WIDTH_KEY, String(conciergeWidth));
-    localStorage.setItem(CONCIERGE_WIDTH_KEY_PAIRED, String(conciergeWidth));
+  if (typeof localStorage !== "undefined") {
+    if (conciergeWidth !== null) {
+      localStorage.setItem(CONCIERGE_WIDTH_KEY, String(conciergeWidth));
+      localStorage.setItem(CONCIERGE_WIDTH_KEY_PAIRED, String(conciergeWidth));
+    } else if (visualCaptureRun(search)) {
+      // ONLY UNDER THE HARNESS — see `visualCaptureRun`. A developer's own `?visual=1` must leave
+      // these alone; a capture run must not inherit the previous surface's column.
+      localStorage.removeItem(CONCIERGE_WIDTH_KEY);
+      localStorage.removeItem(CONCIERGE_WIDTH_KEY_PAIRED);
+    }
   }
 
   // ── OPEN PULL REQUESTS, ANSWERED AT THE IPC BOUNDARY ────────────────────────────────────────
@@ -664,6 +973,14 @@ export function applyVisualFixtures(
   //
   // It also stays inside this file's gates (DEV build AND auth-bypass AND `?visual=1`), which the
   // shim is not, so it cannot exist in a shipped app.
+  //
+  // ANSWERED PER `root`, NOT WITH ONE LIST FOR EVERYONE. The command is invoked as
+  // `invoke("project_open_prs", { root, projectId })` and `root` is the project's `rootPath`, so a
+  // workspace with two projects open asks this twice with two different roots. Replying with the
+  // same rows both times would photograph a state the app cannot reach — two sections, identical
+  // contents, identical PR numbers — i.e. a picture that looks like working multi-repo grouping
+  // whatever the component actually does. `fixturePrsForRoot` also keeps the shim's own null
+  // behaviour for a root the fixture does not know: NULL IS "we could not ask", not "no PRs".
   if (visualPrsRequested(search) && typeof window !== "undefined") {
     const internals = (window as unknown as { __TAURI_INTERNALS__?: { invoke?: InvokeFn } })
       .__TAURI_INTERNALS__;
@@ -671,7 +988,9 @@ export function applyVisualFixtures(
     if (internals && inner) {
       internals.invoke = (cmd: string, args?: unknown) =>
         cmd === "project_open_prs"
-          ? Promise.resolve(FIXTURE_PRS as unknown)
+          ? Promise.resolve(
+              fixturePrsForRoot((args as { root?: unknown } | undefined)?.root) as unknown,
+            )
           : inner(cmd, args);
     }
   }

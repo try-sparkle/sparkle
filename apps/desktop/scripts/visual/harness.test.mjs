@@ -12,6 +12,8 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { CONCIERGE_DEFAULT_WIDTH } from "../../src/engine/columnResize.ts";
+import { visualCaptureRun, visualFixturesRequested } from "../../src/dev/visualFixtures.ts";
 import { decodePng, encodePng } from "./png.mjs";
 import { blank, blit, compareImages, diffImage, sideBySide } from "./diff.mjs";
 import {
@@ -22,7 +24,7 @@ import {
   stepToExpression,
   surfaceByName,
 } from "./surfaces.mjs";
-import { numericArg, parseArgs } from "./capture.mjs";
+import { numericArg, parseArgs, surfaceUrl } from "./capture.mjs";
 import { MOCK_REL, mockChromeCss, resolveMock, viewportFromManifest } from "./compare.mjs";
 import { compareDirs, shouldKeep } from "./verify-stable.mjs";
 import {
@@ -240,6 +242,8 @@ describe("surface registry", () => {
       "concierge-column",
       "settings-dialog",
       "open-pr-menu-narrow",
+      "open-pr-menu-grouped-narrow",
+      "open-pr-menu-grouped-wide",
     ]);
     expect(THEMES).toEqual(["light", "dark"]);
   });
@@ -273,6 +277,62 @@ describe("surface registry", () => {
     const q = new URLSearchParams(surfaceByName("open-pr-menu-narrow").query);
     expect(q.get("prs")).toBe("1");
     expect(Number(q.get("concierge"))).toBeLessThan(380);
+  });
+
+  // THE GROUPED PAIR ASKS FOR THE SECOND PROJECT, AND ONLY THEY DO. Same reasoning as the test
+  // above: a parameter a surface forgets to carry is silent — the app boots single-project, the
+  // menu has one section, and the capture is filed under a name promising a grouped one.
+  //
+  // BOTH SURFACES NAME THEIR COLUMN WIDTH. This block used to say the opposite — that the wide shot
+  // must NOT carry a `concierge` width, since writing nothing yields the app's default — and that
+  // reasoning is what produced two byte-identical PNGs. `localStorage` outlives a navigation, so a
+  // width-less surface inherited the previous one's column instead. The fixture now clears the keys
+  // when no width is asked for, so "nothing" means the default again; naming both widths anyway is
+  // the belt to that braces, and keeps each surface's meaning legible from its own query.
+  //
+  // The pair only separates CONTAINMENT (the panel escapes a squeezed column) from CONTENT (the
+  // groups read correctly with room) if the two widths are genuinely far apart, so both ends are
+  // bounded below — narrow squeezed, wide at least the app's own default.
+  it("asks for a second project on the two grouped open-PR surfaces, and nowhere else", () => {
+    const grouped = ["open-pr-menu-grouped-narrow", "open-pr-menu-grouped-wide"];
+    for (const name of grouped) {
+      const q = new URLSearchParams(surfaceByName(name).query);
+      expect(q.get("projects"), `${name} must open the second project`).toBe("2");
+      expect(q.get("prs"), `${name} needs PRs to have a badge to click`).toBe("1");
+    }
+    for (const s of SURFACES.filter((x) => !grouped.includes(x.name))) {
+      const projects = new URLSearchParams(s.query ?? "").get("projects");
+      expect(projects, `${s.name} must not open a second project`).toBeNull();
+    }
+    // ── BOTH MUST NAME A WIDTH, AND THE NARROW ONE MUST BE NARROWER ───────────────────────────
+    //
+    // This assertion used to require the WIDE surface to carry NO `concierge` parameter, on the
+    // reasoning that writing nothing yields the app's own default. That is true only of a cold
+    // profile, and the capture harness drives every surface through ONE browser context — so
+    // `sparkle-concierge-width` survives from surface to surface and a width-less surface inherits
+    // whatever the previously-captured one left behind. Captured straight after the narrow surface,
+    // the "wide" one photographed a 190px column and the two PNGs came out BYTE-IDENTICAL: a pair
+    // that is supposed to isolate containment from content, silently testing one width twice.
+    //
+    // So the invariant is not "one states a width and one does not". It is that BOTH state one, so
+    // neither depends on capture order, and that they are genuinely different widths.
+    const widthOf = (name) => {
+      const raw = new URLSearchParams(surfaceByName(name).query).get("concierge");
+      expect(raw, `${name} must state its concierge width rather than inherit one`).not.toBeNull();
+      return Number(raw);
+    };
+    const [narrowW, wideW] = [widthOf(grouped[0]), widthOf(grouped[1])];
+    expect(narrowW, "the narrow surface must be squeezed").toBeLessThan(380);
+    expect(narrowW, "the pair is pointless at one width").toBeLessThan(wideW);
+    // A LOWER BOUND ON THE WIDE END, because "they differ" is not the property this pair needs.
+    // narrow=190 / wide=200 satisfies both lines above and is two squeezed captures — the panel
+    // clipped in each — with one of them still filed as "at the default concierge width". Sourced
+    // from the app's own constant rather than re-spelled as a literal, for the reason
+    // `visualConciergeWidth`'s docblock already argues: a second spelling of a bound is a bound
+    // that can silently disagree with the first.
+    expect(wideW, "the wide surface must be at a comfortable width").toBeGreaterThanOrEqual(
+      CONCIERGE_DEFAULT_WIDTH,
+    );
   });
 
   it("gives every surface app steps, and a mock half or an explicit null", () => {
@@ -844,5 +904,35 @@ describe("crop", () => {
 
   it("refuses a region that falls outside the image", () => {
     expect(() => crop(blank(4, 4), { x0: 0, x1: 9, y0: 0, y1: 1 })).toThrow(/outside/);
+  });
+});
+
+// ── THE HARNESS ACTUALLY SENDS THE MARKER THE FIXTURE REACTS TO (roborev 57726) ───────────────
+//
+// The cross-surface reset in `visualFixtures` is gated on `capture=1`. Every test over there hand-
+// builds "?visual=1&capture=1", so they prove the REACTION and not the SENDING — drop the marker
+// from the driver and the reset silently goes dead while captures keep succeeding and the suite
+// keeps passing. These assertions cross the boundary: the driver's URL is fed to the APP'S OWN
+// predicate, so the two spellings cannot drift apart.
+describe("surfaceUrl — the driver's contract with the fixture", () => {
+  it("marks every registry surface as a capture run, per the app's own predicate", () => {
+    for (const s of SURFACES) {
+      const search = new URL(surfaceUrl("http://localhost:1234", s)).search;
+      expect(visualCaptureRun(search), `${s.name} must be marked as a capture run`).toBe(true);
+      expect(visualFixturesRequested(search), `${s.name} must turn fixtures on`).toBe(true);
+    }
+  });
+
+  it("carries the surface's OWN query through untouched", () => {
+    const url = new URL(surfaceUrl("http://localhost:1234", { query: "prs=1&concierge=190" }));
+    expect(url.searchParams.get("prs")).toBe("1");
+    expect(url.searchParams.get("concierge")).toBe("190");
+    expect(visualCaptureRun(url.search)).toBe(true);
+  });
+
+  it("is well-formed for a surface with no query of its own", () => {
+    const url = new URL(surfaceUrl("http://localhost:1234", {}));
+    expect(url.pathname).toBe("/");
+    expect(visualCaptureRun(url.search)).toBe(true);
   });
 });

@@ -35,6 +35,30 @@ export function parseArgs(argv) {
 }
 
 /**
+ * The URL one surface is captured at.
+ *
+ * EXPORTED SO IT CAN BE TESTED, which is the whole reason it is a function rather than the inline
+ * template it used to be. `capture=1` is what tells the fixture the harness is driving, and the
+ * fixture's whole cross-surface reset hangs off it — but every fixture-side test hand-builds
+ * "?visual=1&capture=1", so they prove the REACTION to the marker while nothing proved it was ever
+ * SENT. Drop or misspell it in an inline template and the reset goes dead: captures still succeed,
+ * still exit 0, and quietly go back to producing order-dependent PNGs with a fully green suite.
+ * `harness.test.mjs` now runs every registry surface through this and asserts the app's own
+ * `visualCaptureRun` accepts the result, so the two spellings are pinned across the boundary.
+ *
+ * Why the marker is separate from `visual=1`: "fixtures on" and "the harness is driving" are
+ * different claims. Every surface gets a fresh PAGE but they share ONE BROWSER, and localStorage is
+ * origin-scoped — so state a surface does not set is inherited from whichever ran before it. The
+ * fixture resets the keys it owns when it sees `capture=1`. It must NOT do that for a developer who
+ * merely opens their own dev server with `?visual=1`: those are real preferences on a real machine
+ * and nothing else protects them. See `visualCaptureRun` in src/dev/visualFixtures.ts.
+ */
+export function surfaceUrl(baseUrl, surface) {
+  const extra = surface.query ? `&${surface.query}` : "";
+  return `${baseUrl}/?visual=1&capture=1${extra}`;
+}
+
+/**
  * Run one surface's steps against a page. Exported (and driven by the registry rather than
  * hardcoded) so compare.mjs replays the mock's steps through exactly the same interpreter.
  */
@@ -138,7 +162,17 @@ async function main() {
           // `?visual=1`, PLUS whatever extra state this surface needs the FIXTURE to seed. A
           // surface that needs two pairs (`workspace-wired-left`) cannot get them from a step —
           // steps run after mount, and the pair layout is decided by the seed — so it asks here.
-          await page.navigate(`${server.url}/?visual=1${surface.query ? `&${surface.query}` : ""}`);
+          //
+          // `capture=1` SAYS THE HARNESS IS DRIVING, which is a different claim from `visual=1` and
+          // is why it is a separate parameter. Every surface gets a fresh PAGE but they all share
+          // ONE BROWSER, and `localStorage` is origin-scoped — so state a surface does not set is
+          // not "the app's default", it is whatever the previous surface left. The fixture resets
+          // the non-zustand keys it owns (the concierge widths) when it sees this, which makes a
+          // capture independent of the order the run took. It must NOT do that for a developer who
+          // merely opens their own dev server with `?visual=1`: those are real preferences on a
+          // real machine and nothing else protects them. See `visualCaptureRun` in
+          // src/dev/visualFixtures.ts.
+          await page.navigate(surfaceUrl(server.url, surface));
           // Media emulation FIRST (the app reads prefers-color-scheme as it mounts), then the
           // steps that wait for the shell, and only then applyTheme — which asserts the attribute
           // holds. See applyTheme's docblock for why the old order could not have worked.

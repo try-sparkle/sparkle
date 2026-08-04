@@ -1,20 +1,32 @@
 // The fixtures exist to make screenshots byte-stable, so what is worth asserting is DETERMINISM
 // and the guards — not the specific agent names, which are free to change as long as they stay
 // constants.
-import { describe, expect, it, beforeEach, vi } from "vitest";
+import { describe, expect, it, afterEach, beforeEach, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { DEV_BYPASS_AUTH_FLAG } from "./devBypassAuth";
 import {
   FIXTURE_NOW,
   FIXTURE_PRS,
+  FIXTURE_PRS_BY_ROOT,
   FIXTURE_PROJECT_ID,
+  FIXTURE_PROJECT_ROOT,
+  FIXTURE_SECOND_PRS,
+  FIXTURE_SECOND_PROJECT_ID,
+  FIXTURE_SECOND_PROJECT_ROOT,
   applyVisualFixtures,
+  buildSecondProjectFixture,
   buildVisualFixture,
+  fixturePrsForRoot,
   visualConciergeWidth,
   visualFixturesRequested,
+  visualPairCount,
+  visualProjectCount,
+  visualCaptureRun,
   visualPrsRequested,
 } from "./visualFixtures";
+import { useUiStore } from "../stores/uiStore";
+import { isProjectOpen } from "../engine/openProjects";
 import { PROJECTS_PERSIST_DEBOUNCE_MS, PROJECTS_PERSIST_KEY, debouncedProjectsStorage, flushProjectsPersist, useProjectStore } from "../stores/projectStore";
 import { RUNTIME_PERSIST_KEY, useRuntimeStore } from "../stores/runtimeStore";
 import { DICTATION_PERSIST_KEY, useDictationStore } from "../stores/dictationStore";
@@ -234,6 +246,49 @@ describe("applyVisualFixtures", () => {
     expect(localStorage.getItem(CONCIERGE_WIDTH_KEY_PAIRED)).toBe("1337");
   });
 
+  // ── THE HARNESS RESETS WHAT IT DOES NOT SET (roborev 57717) ─────────────────────────────────
+  //
+  // Every surface gets a fresh PAGE but they share ONE BROWSER, and `localStorage` is origin-scoped.
+  // So a surface that names no width did not get the app's default — it inherited the previous
+  // surface's. `THEMES` is the outer loop, so the six width-less surfaces booted their DARK capture
+  // carrying the last light-pass width, and `--surfaces=a,b` could reproduce it on demand. That is
+  // how two grouped open-PR captures came out BYTE-IDENTICAL with one of them filed as "wide".
+  it("CLEARS an inherited concierge width when the harness names none", () => {
+    localStorage.setItem(CONCIERGE_WIDTH_KEY, "190");
+    localStorage.setItem(CONCIERGE_WIDTH_KEY_PAIRED, "190");
+    expect(applyVisualFixtures("?visual=1&capture=1", ON)).toBe(true);
+    expect(localStorage.getItem(CONCIERGE_WIDTH_KEY)).toBeNull();
+    expect(localStorage.getItem(CONCIERGE_WIDTH_KEY_PAIRED)).toBeNull();
+  });
+
+  it("still honours a width the harness DOES name", () => {
+    localStorage.setItem(CONCIERGE_WIDTH_KEY, "190");
+    expect(applyVisualFixtures("?visual=1&capture=1&concierge=360", ON)).toBe(true);
+    expect(localStorage.getItem(CONCIERGE_WIDTH_KEY)).toBe("360");
+    expect(localStorage.getItem(CONCIERGE_WIDTH_KEY_PAIRED)).toBe("360");
+  });
+
+  // The clear is gated on the HARNESS, not on `?visual=1`, because these keys are not
+  // zustand-persisted — `detachPersistence` does not cover them, so they are a real preference on a
+  // real machine. Wiping them because a developer opened their own dev server would be the fixture
+  // destroying user data to tidy up after itself.
+  it("does NOT clear a developer's width just because fixtures are on", () => {
+    localStorage.setItem(CONCIERGE_WIDTH_KEY, "421");
+    localStorage.setItem(CONCIERGE_WIDTH_KEY_PAIRED, "1337");
+    expect(applyVisualFixtures("?visual=1", ON)).toBe(true);
+    expect(localStorage.getItem(CONCIERGE_WIDTH_KEY)).toBe("421");
+    expect(localStorage.getItem(CONCIERGE_WIDTH_KEY_PAIRED)).toBe("1337");
+  });
+
+  it("reads the capture marker strictly, and only from its own parameter", () => {
+    expect(visualCaptureRun("?capture=1")).toBe(true);
+    expect(visualCaptureRun("?capture=true")).toBe(true);
+    expect(visualCaptureRun("")).toBe(false);
+    expect(visualCaptureRun("?capture=0")).toBe(false);
+    expect(visualCaptureRun("?capture=")).toBe(false);
+    expect(visualCaptureRun("?visual=1")).toBe(false);
+  });
+
   it("leaves it alone for a width the shell itself would refuse", () => {
     // A value out of bounds parses to null, and null must mean "write nothing" rather than "write
     // the default" — otherwise an out-of-range parameter clobbers the real preference AND produces
@@ -264,7 +319,12 @@ describe("seeding never reaches disk", () => {
   beforeEach(() => {
     flushProjectsPersist(); // drain anything an earlier test left pending
     const live = createJSONStorage(() => localStorage);
-    for (const store of [useProjectStore, useRuntimeStore, useDictationStore]) {
+    // useUiStore is in this loop for the same reason it is in detachPersistence's: the fixture
+    // writes its PERSISTED `openProjectIds` whenever a capture asks for a second pair or tab. An
+    // earlier test in this file has already detached it, so without re-attaching, the assertion
+    // below would hold no matter what applyVisualFixtures did — the vacuousness this block's own
+    // header warns about.
+    for (const store of [useProjectStore, useRuntimeStore, useDictationStore, useUiStore]) {
       (store as unknown as { persist: { setOptions: (o: unknown) => void } }).persist.setOptions({
         storage: live,
       });
@@ -327,6 +387,49 @@ describe("seeding never reaches disk", () => {
     } finally {
       localStorage.removeItem(DICTATION_PERSIST_KEY);
       useDictationStore.setState({ enabled: false });
+    }
+  });
+
+  it("leaves the persisted UI blob untouched — ?projects=2 writes the OPEN-TAB set", () => {
+    // `openProjectIds` is on uiStore's PERSISTED side, and the fixture now writes it for
+    // `?projects=2` as well as `?pairs=2`. Undetached, a developer who opened their own dev server
+    // with one of those parameters would get their real tab strip rewritten on disk: two projects
+    // they have never opened, and their own ones closed. That reads as data loss, not as a fixture.
+    //
+    // THE KEY IS READ OFF THE STORE, NOT RE-SPELLED. uiStore has no exported persist-key constant
+    // (the other three stores do), and a hardcoded "sparkle-ui" here would keep passing while
+    // asserting an unrelated key stayed untouched if the store ever renamed its blob — a test that
+    // cannot fail. Asking the persist middleware for its own `name` cannot drift.
+    const UI_KEY = (
+      useUiStore as unknown as { persist: { getOptions: () => { name?: string } } }
+    ).persist.getOptions().name;
+    expect(UI_KEY, "uiStore's persist options carry no name — the key below would be undefined")
+      .toBeTruthy();
+    const key = UI_KEY as string;
+    localStorage.removeItem(key);
+    try {
+      // CONTROL FIRST, for the reason the debounced test below spells out: "the blob is untouched"
+      // is satisfied just as well by a store that is not wired to storage at all. Prove a plain
+      // mutation DOES reach disk through this key before asserting that the fixture's does not.
+      useUiStore.setState({ composerHeight: 321 });
+      const wrote = localStorage.getItem(key);
+      const why = "control failed: uiStore is not wired to localStorage, so the claim below is vacuous";
+      expect(wrote, why).not.toBeNull();
+      expect(JSON.parse(wrote as string), why).toMatchObject({ state: expect.any(Object) });
+
+      const REAL = JSON.stringify({ state: { openProjectIds: ["the-developers-real-project"] } });
+      localStorage.setItem(key, REAL);
+      expect(applyVisualFixtures("?visual=1&projects=2", ON)).toBe(true);
+      // In memory the second tab is open, which is the whole point of the parameter...
+      expect(useUiStore.getState().openProjectIds).toEqual([
+        FIXTURE_PROJECT_ID,
+        FIXTURE_SECOND_PROJECT_ID,
+      ]);
+      // ...and none of it reached storage.
+      expect(localStorage.getItem(key)).toBe(REAL);
+    } finally {
+      localStorage.removeItem(key);
+      useUiStore.setState({ openProjectIds: null });
     }
   });
 
@@ -518,5 +621,303 @@ describe("the open-PR parameter", () => {
     // A subject and a branch long enough to have somewhere to truncate TO.
     expect(Math.max(...FIXTURE_PRS.map((p) => p.title.length))).toBeGreaterThan(50);
     expect(Math.max(...FIXTURE_PRS.map((p) => p.headRefName.length))).toBeGreaterThan(25);
+  });
+});
+
+// ── THE SECOND-PROJECT PARAMETER, AND THE PER-ROOT PR LOOKUP IT EXISTS FOR ────────────────────
+//
+// The open-PR menu becomes a MULTI-REPO surface the moment two projects are open, and none of what
+// that adds — section headers, per-repo scoping, PR numbers that are unique only within a repo —
+// is photographable against a workspace holding one project. Same opt-in discipline as every other
+// parameter here: a capture that does not ask for it must be byte-identical to what it was.
+describe("the second-project parameter", () => {
+  it("is opt-in — absent, every existing surface keeps its single-project baseline", () => {
+    expect(visualProjectCount("?visual=1")).toBe(1);
+    expect(visualProjectCount("")).toBe(1);
+    expect(visualProjectCount("?visual=1&prs=1&concierge=190")).toBe(1);
+  });
+
+  it("opens the second project for exactly `2`", () => {
+    expect(visualProjectCount("?visual=1&projects=2")).toBe(2);
+    expect(visualProjectCount("?projects=2&visual=1")).toBe(2);
+  });
+
+  it("fails closed on anything else, so a typo cannot half-apply", () => {
+    // A malformed value must land on the DEFAULT seed rather than on a partly-seeded workspace: a
+    // capture of "one project but the menu asked for two" is the mislabelled-screenshot failure.
+    for (const v of ["", "0", "1", "3", "two", "true", "2.0", " 2"]) {
+      expect(visualProjectCount(`?visual=1&projects=${v}`), v).toBe(1);
+    }
+  });
+
+  it("is a DIFFERENT axis from ?pairs=2 — neither parameter implies the other", () => {
+    // They are easy to conflate and they do different things: `pairs` opens a second COLUMN PAIR
+    // (a project projected onto the left of the cockpit), `projects` opens a second TAB in the pair
+    // that is already there. A surface asking for one must not silently get the other, because a
+    // second pair re-lays-out the entire shell.
+    expect(visualProjectCount("?visual=1&pairs=2")).toBe(1);
+    expect(visualPairCount("?visual=1&projects=2")).toBe(1);
+  });
+});
+
+describe("the per-root open-PR lookup", () => {
+  it("answers each project's OWN rows, keyed on the root the command is invoked with", () => {
+    // The shim used to answer every call with one array regardless of `root`. With two projects
+    // open that photographs two identical sections — a picture that looks like working grouping
+    // whatever the component does.
+    expect(fixturePrsForRoot(FIXTURE_PROJECT_ROOT)).toBe(FIXTURE_PRS);
+    expect(fixturePrsForRoot(FIXTURE_SECOND_PROJECT_ROOT)).toBe(FIXTURE_SECOND_PRS);
+    expect(fixturePrsForRoot(FIXTURE_PROJECT_ROOT)).not.toBe(
+      fixturePrsForRoot(FIXTURE_SECOND_PROJECT_ROOT),
+    );
+  });
+
+  it("resolves an unknown root to NULL — unknown, not empty", () => {
+    // `fetchOpenPrs` collapses every probe failure into null, and null and `[]` are different facts:
+    // a confident "no PRs" on a probe that never ran is the false reassurance the badge exists to
+    // prevent. An unknown root must answer the way the shim it wraps does.
+    expect(fixturePrsForRoot("/Users/dev/Projects/never-seeded")).toBeNull();
+    expect(fixturePrsForRoot("")).toBeNull();
+    expect(fixturePrsForRoot(undefined)).toBeNull();
+    expect(fixturePrsForRoot(null)).toBeNull();
+    expect(fixturePrsForRoot(42)).toBeNull();
+  });
+
+  it("does not treat Object.prototype members as known roots", () => {
+    // `root` arrives from the caller, so a bare index would make "toString" a known key resolving
+    // to a function the menu would then try to iterate.
+    for (const k of ["toString", "constructor", "hasOwnProperty", "__proto__"]) {
+      expect(fixturePrsForRoot(k), k).toBeNull();
+    }
+  });
+
+  it("keys the lookup on the rootPaths the seeded projects actually carry", () => {
+    // THE COUPLING THAT SILENTLY BREAKS EVERYTHING. If a project's `rootPath` and its lookup key
+    // drift by one character, the probe resolves to null, the menu renders NOTHING, and the capture
+    // is a perfectly plausible-looking empty header rather than a failure.
+    const { project } = buildVisualFixture();
+    const second = buildSecondProjectFixture().project;
+    expect(Object.keys(FIXTURE_PRS_BY_ROOT).sort()).toEqual(
+      [project.rootPath, second.rootPath].sort(),
+    );
+    expect(fixturePrsForRoot(project.rootPath)).toBeTruthy();
+    expect(fixturePrsForRoot(second.rootPath)).toBeTruthy();
+  });
+
+  it("puts a COLLIDING PR number in both lists, because that is what grouping has to survive", () => {
+    // A PR number is unique within a repo and nowhere else, so a grouped menu that keys a row, a
+    // selection, a merge or a React `key` on the number alone is wrong the moment two repos are
+    // open. Without a collision in the fixture the capture cannot show that mistake.
+    const first = new Set<number>(FIXTURE_PRS.map((p) => p.number));
+    const shared = FIXTURE_SECOND_PRS.filter((p) => first.has(p.number));
+    expect(shared.length, "no PR number is shared — the grouping bug would be unphotographable")
+      .toBeGreaterThan(0);
+    // …and the colliding rows must be TELLABLE APART by eye, or the picture proves nothing either.
+    for (const dup of shared) {
+      const other = FIXTURE_PRS.find((p) => p.number === dup.number)!;
+      expect(dup.title).not.toBe(other.title);
+      expect(dup.headRefName).not.toBe(other.headRefName);
+      expect(dup.url).not.toBe(other.url);
+      // OPPOSITE STATUSES, which is what makes the shot decisive rather than suggestive: a menu
+      // resolving a row by number alone renders a wrong DOT and a wrong merge affordance — visible
+      // at a glance — instead of a subtly wrong link a reader would have to open to catch.
+      expect(dup.checks, `#${dup.number} carries the same status in both repos`).not.toBe(
+        other.checks,
+      );
+    }
+  });
+
+  it("keeps the second list SHORTER, so the section boundary is the legible thing", () => {
+    expect(FIXTURE_SECOND_PRS.length).toBeGreaterThanOrEqual(2);
+    expect(FIXTURE_SECOND_PRS.length).toBeLessThan(FIXTURE_PRS.length);
+  });
+});
+
+describe("applyVisualFixtures with a second project", () => {
+  beforeEach(() => {
+    useProjectStore.setState({ projects: [], selectedProjectId: null });
+    useUiStore.setState({ openProjectIds: null, pairAssignment: {}, leftProjectId: null });
+  });
+
+  it("opens a second TAB, not a second PAIR", () => {
+    // The two opt-ins are a pair of parameters it is easy to conflate, and getting it wrong is
+    // expensive: a second pair re-lays-out the entire shell, so a `?projects=2` capture that
+    // accidentally opened one would be a picture of a different layout under this surface's name.
+    // A stale persisted assignment could do it on its own, which is why the seed CLEARS both rather
+    // than leaving them alone.
+    useUiStore.setState({
+      pairAssignment: { [FIXTURE_SECOND_PROJECT_ID]: "left" },
+      leftProjectId: FIXTURE_SECOND_PROJECT_ID,
+    });
+    expect(applyVisualFixtures("?visual=1&projects=2", ON)).toBe(true);
+    expect(useUiStore.getState().pairAssignment).toEqual({});
+    expect(useUiStore.getState().leftProjectId).toBeNull();
+  });
+
+  it("seeds two DISTINCT projects, both with a tab, when ?projects=2 is asked for", () => {
+    expect(applyVisualFixtures("?visual=1&projects=2", ON)).toBe(true);
+    const projects = useProjectStore.getState().projects;
+    expect(projects.map((p) => p.id)).toEqual([FIXTURE_PROJECT_ID, FIXTURE_SECOND_PROJECT_ID]);
+    // DISTINCT names and root paths: the name is rendered as a section header, so two near-identical
+    // ones would make the capture unreadable as evidence, and two identical roots would collapse the
+    // per-root lookup back into one list.
+    expect(new Set(projects.map((p) => p.name)).size).toBe(2);
+    expect(new Set(projects.map((p) => p.rootPath)).size).toBe(2);
+    // OPEN — and asserted as an EXPLICIT SET, not only through the predicate. `isProjectOpen`
+    // answers true for every project when the set is `null`, so a fixture that never wrote the set
+    // at all would satisfy the predicate alone and leave this test unable to fail (the vacuous-test
+    // trap). The written array is what makes the tab survive a stale persisted set, so assert it
+    // directly, then run the app's own predicate over it rather than re-implementing the null rule.
+    const open = useUiStore.getState().openProjectIds;
+    expect(open, "the open-tab set must be written explicitly, not left as null").toEqual([
+      FIXTURE_PROJECT_ID,
+      FIXTURE_SECOND_PROJECT_ID,
+    ]);
+    for (const p of projects) expect(isProjectOpen(p.id, open), p.id).toBe(true);
+    // The PRIMARY project stays selected, so the pane under the panel is the one every other
+    // open-PR surface photographs.
+    expect(useProjectStore.getState().selectedProjectId).toBe(FIXTURE_PROJECT_ID);
+  });
+
+  it("gives the second project's agents a status and a stage too", () => {
+    expect(applyVisualFixtures("?visual=1&projects=2", ON)).toBe(true);
+    const { status, workflowStage } = useRuntimeStore.getState();
+    const all = useProjectStore.getState().projects.flatMap((p) => p.agents);
+    expect(all.length).toBeGreaterThan(buildVisualFixture().project.agents.length);
+    for (const a of all) {
+      expect(status[a.id], a.id).toBeTruthy();
+      expect(workflowStage[a.id], a.id).toBeTruthy();
+    }
+  });
+
+  it("uses agent ids that cannot collide with the other projects'", () => {
+    // Unlike the PR numbers, an agent id collision is a fixture BUG: two rows under one key make the
+    // capture quietly wrong rather than fail.
+    expect(applyVisualFixtures("?visual=1&projects=2&pairs=2", ON)).toBe(true);
+    const ids = useProjectStore.getState().projects.flatMap((p) => p.agents.map((a) => a.id));
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it("composes with ?pairs=2 rather than replacing it", () => {
+    // Both opt-ins at once: three projects, all open, and the LEFT pair still assigned — a capture
+    // may legitimately want a two-pair cockpit whose right pair holds two tabs.
+    expect(applyVisualFixtures("?visual=1&projects=2&pairs=2", ON)).toBe(true);
+    const projects = useProjectStore.getState().projects;
+    expect(projects).toHaveLength(3);
+    const ui = useUiStore.getState();
+    expect(ui.openProjectIds).toHaveLength(3);
+    expect(ui.leftProjectId).toBeTruthy();
+  });
+
+  it("changes NOTHING when it is not asked for — the byte-identical baseline", () => {
+    // The whole opt-in discipline in one assertion: without the parameter the store holds exactly
+    // one project, and its tab set names exactly that project — behaviourally identical to the
+    // store's own `null` ("everything is open") for a one-project workspace, so every existing
+    // surface's baseline is untouched.
+    expect(applyVisualFixtures("?visual=1&prs=1&concierge=190", ON)).toBe(true);
+    expect(useProjectStore.getState().projects.map((p) => p.id)).toEqual([FIXTURE_PROJECT_ID]);
+    expect(useUiStore.getState().openProjectIds).toEqual([FIXTURE_PROJECT_ID]);
+  });
+
+  it("gives the seeded project a tab even against a HOSTILE persisted open set", () => {
+    // roborev 57710. The tab set used to be written only when a second project or pair was asked
+    // for, so on the default path all three ui keys were whatever `sparkle-ui` rehydrated. A
+    // persisted `openProjectIds` that is a real array NOT naming the fixture project makes
+    // `isProjectOpen` false — the seeded project gets NO TAB — and a stale `pairAssignment` opens a
+    // second pair under a filename claiming a single-pair layout. Both are silent: the capture is a
+    // plausible-looking picture of the wrong workspace.
+    useUiStore.setState({
+      openProjectIds: ["someone-elses-project"],
+      pairAssignment: { "someone-elses-project": "left" },
+      leftProjectId: "someone-elses-project",
+    });
+    expect(applyVisualFixtures("?visual=1&prs=1", ON)).toBe(true);
+    const ui = useUiStore.getState();
+    expect(ui.openProjectIds).toEqual([FIXTURE_PROJECT_ID]);
+    expect(isProjectOpen(FIXTURE_PROJECT_ID, ui.openProjectIds)).toBe(true);
+    expect(ui.pairAssignment).toEqual({});
+    expect(ui.leftProjectId).toBeNull();
+  });
+});
+
+// ── THE SHIM ITSELF, NOT JUST THE LOOKUP IT CALLS ─────────────────────────────────────────────
+//
+// roborev 57710. The headline behaviour — `project_open_prs` answered PER ROOT — lives at the
+// `__TAURI_INTERNALS__.invoke` wrapper, and this file runs in the NODE environment where
+// `typeof window !== "undefined"` is false, so that block never executed in any test. Testing
+// `fixturePrsForRoot` in isolation therefore left the CALL SITE unverified: passing
+// `FIXTURE_PROJECT_ROOT` instead of the command's own `root`, or reading `projectId` by mistake,
+// collapses both projects back onto one list — the "two identical sections that look like working
+// grouping" failure this whole change exists to prevent — with the suite still green.
+//
+// A hand-stubbed `globalThis.window` rather than a jsdom docblock: the block under test needs
+// exactly one thing from a browser (an object at `window.__TAURI_INTERNALS__` it can wrap), and
+// moving the whole file to jsdom would change the environment every other test here runs in.
+describe("the project_open_prs shim", () => {
+  const g = globalThis as unknown as { window?: unknown };
+  const HAD_WINDOW = "window" in g;
+  const REAL_WINDOW = g.window;
+
+  afterEach(() => {
+    if (HAD_WINDOW) g.window = REAL_WINDOW;
+    else delete g.window;
+  });
+
+  /** Install a fake IPC boundary and return both it and the spy the shim must fall through to. */
+  function stubWindow() {
+    const inner = vi.fn((cmd: string, args?: unknown) => Promise.resolve(`inner:${cmd}:${!!args}`));
+    g.window = { __TAURI_INTERNALS__: { invoke: inner } };
+    return {
+      inner,
+      invoke: () =>
+        (g.window as { __TAURI_INTERNALS__: { invoke: (c: string, a?: unknown) => Promise<unknown> } })
+          .__TAURI_INTERNALS__.invoke,
+    };
+  }
+
+  it("answers each root with ITS OWN rows, reading `root` off the command's arguments", async () => {
+    const { inner, invoke } = stubWindow();
+    expect(applyVisualFixtures("?visual=1&prs=1&projects=2", ON)).toBe(true);
+    // The exact argument shape `fetchOpenPrs` sends, `projectId` included — a shim reading the
+    // wrong field would still find a string there and answer confidently with null.
+    await expect(
+      invoke()("project_open_prs", { root: FIXTURE_PROJECT_ROOT, projectId: FIXTURE_PROJECT_ID }),
+    ).resolves.toBe(FIXTURE_PRS);
+    await expect(
+      invoke()("project_open_prs", {
+        root: FIXTURE_SECOND_PROJECT_ROOT,
+        projectId: FIXTURE_SECOND_PROJECT_ID,
+      }),
+    ).resolves.toBe(FIXTURE_SECOND_PRS);
+    // UNKNOWN, NOT EMPTY — the same answer the transport shim gives for a command it cannot serve.
+    await expect(invoke()("project_open_prs", { root: "/Users/dev/Projects/nope" })).resolves.toBeNull();
+    await expect(invoke()("project_open_prs", {})).resolves.toBeNull();
+    // None of that reached the real transport…
+    expect(inner).not.toHaveBeenCalled();
+    // …and every OTHER command still does, unchanged.
+    await expect(invoke()("some_other_command", { a: 1 })).resolves.toBe(
+      "inner:some_other_command:true",
+    );
+    expect(inner).toHaveBeenCalledWith("some_other_command", { a: 1 });
+  });
+
+  it("is not installed at all without ?prs=1", () => {
+    // Opt-in at the IPC boundary too: the shim is installed for every page, so an answer that
+    // leaked outside `?prs=1` would put a PR chip in every other surface's header.
+    const { inner, invoke } = stubWindow();
+    expect(applyVisualFixtures("?visual=1&projects=2", ON)).toBe(true);
+    expect(invoke()).toBe(inner);
+  });
+
+  it("sends the argument name services/openPrs.ts actually invokes with", () => {
+    // The coupling that no assertion in this file can otherwise see, pinned the way the FROZEN_CLOCK
+    // test pins serve.mjs: read the real call site's source. If `fetchOpenPrs` ever renames `root`,
+    // every root here resolves to null, the menu renders nothing, and the capture is a plausible
+    // empty header rather than a failure.
+    const src = readFileSync(resolve(__dirname, "../services/openPrs.ts"), "utf8");
+    expect(
+      src,
+      "fetchOpenPrs no longer invokes project_open_prs with a `root` argument — the shim's key is stale",
+    ).toMatch(/invoke<[^>]*>\(\s*"project_open_prs",\s*\{\s*root\b/);
   });
 });

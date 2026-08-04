@@ -158,7 +158,7 @@ import { usePendingAttachmentsStore } from "../stores/pendingAttachmentsStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useMountedThread } from "../stores/mountedThreadStore";
 import { useAgentTranscript } from "../hooks/useAgentTranscript";
-import { OpenPrMenu, agentLinkForPr } from "./OpenPrMenu";
+import { OpenPrMenu, agentLinkForPr, type PrScope } from "./OpenPrMenu";
 // The SELECTED project id, for the header's "here" segment. A scalar selector, deliberately — it
 // re-renders this host only when the selection actually changes, which is the narrow subscription
 // the note above rules the whole `projects` array out in favour of.
@@ -824,48 +824,42 @@ function LivenessAnnouncer({ announce }: { announce: (text: string) => void }) {
 }
 
 /**
- * WHICH repo the concierge's PR chip lists, given both pairs' selections.
+ * WHICH repos the concierge's PR chip lists: ALL of the open ones, in tab order.
  *
- * There used to be an `OpenPrMenu` in EACH project tab strip, and each was scoped to its own side —
- * so the left pair's PRs were reachable from the left strip and the right pair's from the right.
- * Collapsing that to one chip means one of those scopes has to win, and reading only the store's
- * `selectedProjectId` picks the RIGHT pair every time: `ProjectTabsBar` documents that selecting on
- * the left writes only `uiStore.leftProjectId` and deliberately does not move the global one. Left
- * pair on `mobile`, right on `sparkle`, and `mobile`'s PRs would be unreachable from anywhere.
+ * THIS USED TO BE A PRECEDENCE RULE (`prChipProject`) that picked exactly one project — the global
+ * selection, else the left pair's, else the first open one — and it was the wrong shape twice over.
  *
- * So the precedence is explicit, and every candidate is validated against the OPEN projects — the
- * strip did that too (`resolveSideSelection`), and without it the chip can list a project that has
- * no tab anywhere:
- *   1. the global selection, when it is open — the app-wide "current project", the right answer
- *      whenever there is only one pair, which is the overwhelmingly common case;
- *   2. the LEFT pair's slot, when it is open — this is what covers "nothing selected on the right",
- *      e.g. only a left-pair project is open, where reading the global id alone yields `null` and
- *      the app ends up with NO pull-request affordance at all;
- *   3. any open project, so a chip exists whenever there is a repo to ask about.
+ * The old note recorded its own known limit: "with two pairs holding DIFFERENT projects this still
+ * lists only one of them. Listing both means `OpenPrMenu` fetching per repo and keying its merge
+ * state by repo+number instead of number (PR numbers collide across repos)." That is exactly what
+ * happened — `OpenPrMenu` is repo-keyed throughout now — so the precedence has nothing left to
+ * decide, and the limit is gone rather than documented.
  *
- * KNOWN LIMIT, recorded rather than papered over: with two pairs holding DIFFERENT projects this
- * still lists only one of them. Listing both means `OpenPrMenu` fetching per repo and keying its
- * merge state by repo+number instead of number (PR numbers collide across repos), which is a real
- * change to that component rather than to this resolution — tracked separately. Rule 2 is what
- * keeps the single-pair and left-only arrangements correct today.
+ * The second failure was worse than a limit, because picking one project meant sometimes picking
+ * NONE. The founder's concierge was scoped to a project with no pull requests while all ten of his
+ * lived in another, and a resolution that came back null unmounted the app's ONLY pull-request
+ * affordance (bead sparkle-lcx8y). Selecting a project is not a statement about which PRs you want
+ * to see; it is a statement about which agents you are looking at.
  *
- * Pure and exported so the precedence is tested without mounting the host.
+ * So there is no selection here at all — the answer is every open tab, and the menu groups by name.
+ * `leftProjectId` is deliberately no longer read: with every open project listed, which pair
+ * selected what stopped being able to hide anything.
+ *
+ * Pure and exported so the mapping is tested without mounting the host.
  */
-export function prChipProject<T extends { id: string }>(
-  openProjects: readonly T[],
-  globalSelectedProjectId: string | null,
-  leftProjectId: string | null,
-): T | null {
-  return (
-    openProjects.find((p) => p.id === globalSelectedProjectId) ??
-    openProjects.find((p) => p.id === leftProjectId) ??
-    openProjects[0] ??
-    null
-  );
+export function prChipScopes(
+  openProjects: readonly { id: string; name: string; rootPath?: string | null }[],
+): PrScope[] {
+  return openProjects.map((p) => ({
+    projectId: p.id,
+    projectName: p.name,
+    rootPath: p.rootPath ?? null,
+  }));
 }
 
 /**
- * The concierge header's PR chip — the app's ONE pull-request affordance.
+ * The concierge header's PR chip — the app's ONE pull-request affordance, listing EVERY open
+ * project tab.
  *
  * It used to be a wide bordered "3 PRs waiting" pill over in the project tab strip, and the
  * concierge header carried a second, DEAD one (a `prsReady` number that nothing ever passed). This
@@ -874,25 +868,29 @@ export function prChipProject<T extends { id: string }>(
  *
  * The wiring it needs is repo state — which is why the presentational `Concierge/` directory takes
  * it as a slot rather than growing a store read (see `ConciergeColumnProps.prSlot`). Scope comes
- * from {@link prChipProject}; `resolveAgent` still searches EVERY project, so a PR belonging to the
- * other pair's agent still offers "Open agent" and routes there.
+ * from {@link prChipScopes}; `resolveAgent` searches EVERY project, so a PR belonging to another
+ * pair's agent still offers "Open agent" and routes there.
+ *
+ * THERE IS NO EARLY RETURN HERE ANY MORE, and that is the fix (bead sparkle-lcx8y). This component
+ * used to be `if (!project) return null` — so a concierge scoped to a project the resolution could
+ * not place removed the app's only way to see, let alone merge, a pull request. `OpenPrMenu` owns
+ * the one remaining case where nothing renders (no open project tab at all, i.e. the app's
+ * "open a project with +" state), and it can no longer be reached by a scope, a count of zero, or a
+ * failed probe.
  */
 function ConciergePrChip() {
   const projects = useProjectStore((s) => s.projects);
   const selectedProjectId = useProjectStore((s) => s.selectedProjectId);
   const openProjectIds = useUiStore((s) => s.openProjectIds);
-  const leftProjectId = useUiStore((s) => s.leftProjectId);
-  const project = prChipProject(
-    openProjectsOf(projects, openProjectIds),
-    selectedProjectId,
-    leftProjectId,
-  );
-  if (!project) return null;
+  // A fresh array every render, and deliberately not memoized here: `OpenPrMenu` keys its polling
+  // on the scope SET's value (`scopeSetKey`), not on this array's identity, precisely so a caller
+  // reading two stores does not have to get a memo's dependencies exactly right to avoid
+  // re-probing GitHub on every unrelated store write.
+  const scopes = prChipScopes(openProjectsOf(projects, openProjectIds));
   return (
     <OpenPrMenu
       compact
-      rootPath={project.rootPath ?? null}
-      projectId={project.id}
+      scopes={scopes}
       resolveAgent={(pr) => agentLinkForPr(pr, projects, selectedProjectId)}
       onOpenAgent={(link) => openProjectTab(link.projectId, link.agentId)}
     />

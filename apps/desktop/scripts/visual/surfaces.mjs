@@ -175,6 +175,76 @@ export const SURFACES = [
     // says "no reference" instead of quietly matching it to an unrelated mock.
     mock: null,
   },
+  {
+    // ── THE GROUPED MENU, SQUEEZED ──────────────────────────────────────────────────────────────
+    //
+    // The same hostile width as `open-pr-menu-narrow`, but with TWO repos' PRs in the panel. It is
+    // a separate surface rather than a wider fixture on that one because they answer different
+    // questions and must be able to fail independently: that one asks "does the panel escape a
+    // half-width column", this one asks "does it still escape once the rows carry a repo as well".
+    // Grouping adds section headers and pushes every row's own content along, so a panel that was
+    // comfortably contained can start clipping at exactly the width where nobody is looking.
+    //
+    // THREE parameters, each doing something no other can. `prs=1` populates the chip at all (the
+    // transport shim answers `project_open_prs` with null otherwise, so there is no badge to click);
+    // `projects=2` opens the SECOND PROJECT TAB, which is what makes the menu multi-repo — the
+    // fixture answers per root path, so the two projects return different PR lists, one of which
+    // deliberately reuses a PR NUMBER from the other; `concierge=190` squeezes the column to half
+    // its default, the width the original clipping bug was reported at (bead sparkle-8g4qh).
+    name: "open-pr-menu-grouped-narrow",
+    query: "prs=1&projects=2&concierge=190",
+    description: "The open-PR menu grouped by project, over a HALF-WIDTH concierge column.",
+    app: {
+      steps: [
+        { waitFor: "[data-testid=workspace-shell]" },
+        { cable: "off" },
+        { waitFor: "[data-testid=open-pr-badge]" },
+        { click: "[data-testid=open-pr-badge]" },
+        { waitFor: "[data-testid=open-pr-panel]" },
+      ],
+      // FULL VIEWPORT for the same reason `open-pr-menu-narrow` is: the thing under test is where
+      // the panel sits RELATIVE to the column that spawned it, and a shot of the panel alone looks
+      // identical whether it is contained or overflowing.
+      clip: null,
+    },
+    // No rev4 reference — the mock predates the menu entirely, let alone a grouped one. Explicitly
+    // null so compare.mjs reports "no reference" rather than scoring it against something it isn't.
+    mock: null,
+  },
+  {
+    // ── THE GROUPED MENU AT A COMFORTABLE WIDTH ─────────────────────────────────────────────────
+    //
+    // The narrow shot is evidence about CONTAINMENT (the panel escapes its column); this one is
+    // evidence about the CONTENT: that the section headers name their projects, that the two repos'
+    // rows read as two groups rather than one run of eight, and that a PR number appearing in both
+    // groups still resolves to two distinguishable rows. Judging that off a squeezed capture would
+    // confound "the grouping is wrong" with "the column is too narrow to show it", which is exactly
+    // the pair a single surface cannot separate.
+    //
+    // `concierge=360` IS THE APP'S DEFAULT (`CONCIERGE_DEFAULT_WIDTH`), STATED RATHER THAN IMPLIED,
+    // and it has to be. This surface first shipped with no `concierge` parameter at all, on the
+    // reasoning that writing nothing yields the app's own default — and that is true only of a cold
+    // profile. The capture harness drives every surface through ONE browser context, so
+    // `sparkle-concierge-width` survives from surface to surface; a surface that writes no width
+    // inherits whatever the previously-captured one left there. Running this straight after
+    // `open-pr-menu-grouped-narrow` therefore photographed a 190px column under a filename claiming
+    // a comfortable one, and the two PNGs came out BYTE-IDENTICAL. Naming the width makes the
+    // surface independent of capture order, which is the only property that makes it evidence.
+    name: "open-pr-menu-grouped-wide",
+    query: "prs=1&projects=2&concierge=360",
+    description: "The open-PR menu grouped by project, at the default (360px) concierge width.",
+    app: {
+      steps: [
+        { waitFor: "[data-testid=workspace-shell]" },
+        { cable: "off" },
+        { waitFor: "[data-testid=open-pr-badge]" },
+        { click: "[data-testid=open-pr-badge]" },
+        { waitFor: "[data-testid=open-pr-panel]" },
+      ],
+      clip: null,
+    },
+    mock: null,
+  },
 ];
 
 export const THEMES = ["light", "dark"];

@@ -1,51 +1,65 @@
-// WHICH repo the concierge's single PR chip lists, across both pairs.
+// WHICH repos the concierge's PR chip lists: all the open ones, and the SELECTION IS NOT AN INPUT.
 //
-// The app used to carry an `OpenPrMenu` in EACH project tab strip, each scoped to its own side. One
-// chip means one of those scopes wins, and the naive answer — the project store's
-// `selectedProjectId` — is documented by `ProjectTabsBar` as the RIGHT pair's: selecting on the left
-// writes only `uiStore.leftProjectId` and deliberately does not move the global id. Reading it alone
-// made the left pair's pull requests unreachable from anywhere, and produced NO affordance at all
-// when nothing was selected on the right (roborev 56141).
+// This file used to test a precedence rule (`prChipProject`) that picked exactly ONE project — the
+// global selection, else the left pair's slot, else the first open project. Every case below that
+// still exists is here to prove that rule is gone rather than merely reordered, because the rule's
+// failure mode is what the founder hit (bead sparkle-lcx8y): his concierge was scoped to a project
+// with no pull requests while all ten of his lived in another, so the one control that would have
+// surfaced them listed the wrong repo — and when the precedence resolved to nothing at all, the
+// control unmounted entirely.
 //
-// This is the precedence, tested as the pure function it is — no host mount, no stores.
+// Tested as the pure function it is — no host mount, no stores.
 import { describe, expect, it } from "vitest";
-import { prChipProject } from "./ConciergeHost";
+import { prChipScopes } from "./ConciergeHost";
 
-const P = (id: string) => ({ id });
+const P = (id: string, name = id, rootPath: string | null = `/code/${id}`) => ({
+  id,
+  name,
+  rootPath,
+});
 const [mobile, sparkle, docs] = [P("mobile"), P("sparkle"), P("docs")];
 const open = [mobile, sparkle, docs];
 
-describe("prChipProject", () => {
-  it("prefers the global selection — the right answer whenever there is one pair", () => {
-    expect(prChipProject(open, "sparkle", "mobile")).toBe(sparkle);
+describe("prChipScopes", () => {
+  it("lists EVERY open project, not one of them", () => {
+    // The whole bead in one assertion. Three open tabs used to produce one scope.
+    expect(prChipScopes(open).map((s) => s.projectId)).toEqual(["mobile", "sparkle", "docs"]);
   });
 
-  // The case that used to yield NO PR affordance in the whole app: only a left-pair project is open,
-  // so the global selection is null and reading it alone returns null.
-  it("falls back to the LEFT pair's slot when nothing is selected on the right", () => {
-    expect(prChipProject(open, null, "mobile")).toBe(mobile);
+  it("preserves tab order, so the menu's sections read like the tab strip", () => {
+    expect(prChipScopes([docs, mobile]).map((s) => s.projectId)).toEqual(["docs", "mobile"]);
   });
 
-  // The strip validated its selection against the projects it actually held (`resolveSideSelection`).
-  // Without that the chip can list a project that has no tab anywhere — closed, or moved away.
-  it("ignores a selection that is not open, on either side", () => {
-    expect(prChipProject([sparkle], "mobile", null)).toBe(sparkle);
-    expect(prChipProject([sparkle], null, "mobile")).toBe(sparkle);
+  it("carries each project's NAME, because the name is the section header the founder asked for", () => {
+    const scopes = prChipScopes([P("p1", "sparkle"), P("p2", "drodio-website")]);
+    expect(scopes.map((s) => s.projectName)).toEqual(["sparkle", "drodio-website"]);
   });
 
-  it("still finds a repo when neither slot names an open project", () => {
-    expect(prChipProject(open, null, null)).toBe(mobile);
-    expect(prChipProject(open, "gone", "also-gone")).toBe(mobile);
+  it("binds each scope to its OWN rootPath — the repo every merge in that group is addressed to", () => {
+    // A row that inherited an ambient rootPath would merge the right NUMBER in the WRONG REPO, and
+    // PR numbers collide across repos. The pairing has to survive this mapping intact.
+    const scopes = prChipScopes([P("a", "a", "/code/a"), P("b", "b", "/code/b")]);
+    expect(scopes).toEqual([
+      { projectId: "a", projectName: "a", rootPath: "/code/a" },
+      { projectId: "b", projectName: "b", rootPath: "/code/b" },
+    ]);
   });
 
-  // Nothing open is the one case with no answer, and it must be null rather than a stale project —
-  // the chip renders nothing at all, which is correct for a shell with no repo to ask about.
-  it("returns null only when nothing is open", () => {
-    expect(prChipProject([], "sparkle", "mobile")).toBeNull();
+  it("keeps a project with no rootPath as a scope, normalising the absence to null", () => {
+    // The tab exists, so it is listed; the menu declines to probe or merge a null path itself.
+    expect(prChipScopes([P("p1", "p1", null)])).toEqual([
+      { projectId: "p1", projectName: "p1", rootPath: null },
+    ]);
+    expect(prChipScopes([{ id: "p2", name: "p2" }])).toEqual([
+      { projectId: "p2", projectName: "p2", rootPath: null },
+    ]);
   });
 
-  // The precedence must be an ORDER, not a preference for whichever happens to be first in the list.
-  it("takes the global selection even when the left slot sorts earlier", () => {
-    expect(prChipProject([mobile, sparkle], "sparkle", "mobile")).toBe(sparkle);
+  // The one case that yields nothing: a shell with no project tab at all — the app's "open a project
+  // with +" state, where there is no repo in the app to have a pull request in. That is the ONLY
+  // remaining route to an absent chip, and it cannot be reached by a selection, a count of zero, or
+  // a failed probe. Before this change, all three could.
+  it("is empty only when nothing is open", () => {
+    expect(prChipScopes([])).toEqual([]);
   });
 });
