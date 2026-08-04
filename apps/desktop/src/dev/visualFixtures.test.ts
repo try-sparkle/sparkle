@@ -35,6 +35,9 @@ import { isProjectOpen } from "../engine/openProjects";
 import { PROJECTS_PERSIST_DEBOUNCE_MS, PROJECTS_PERSIST_KEY, debouncedProjectsStorage, flushProjectsPersist, useProjectStore } from "../stores/projectStore";
 import { RUNTIME_PERSIST_KEY, useRuntimeStore } from "../stores/runtimeStore";
 import { DICTATION_PERSIST_KEY, useDictationStore } from "../stores/dictationStore";
+// The badge's and the thread's OWN derivations, so a drifted fixture fails here rather than
+// shipping a screenshot of an empty row — see the inbox test below.
+import { inFlight, pendingCount, useInboxStore } from "../stores/inboxStore";
 import {
   CONCIERGE_MAX_WIDTH,
   CONCIERGE_MIN_WIDTH,
@@ -212,6 +215,38 @@ describe("applyVisualFixtures", () => {
     // Status is live-only (never persisted), so it has to be written on every boot or the rows
     // render with no dot at all.
     expect(Object.keys(useRuntimeStore.getState().status)).toHaveLength(seeded.agents.length);
+  });
+
+  // ── THE QUEUED INBOX, WHICH ONLY A REAL RENDER CAN VERIFY ───────────────────────────────────
+  //
+  // The pending badge and the thread's queued bubbles (bead sparkle-zm0c8) were verified in jsdom,
+  // and jsdom neither lays out nor paints — so the visual harness is the only place in this repo
+  // that can show the founder's fix is actually VISIBLE. That only holds if the fixture really
+  // seeds the store the components read: an unseeded `inboxStore` renders NOTHING (the badge
+  // returns null on a zero count), so a capture would photograph an empty row under a filename
+  // claiming otherwise. Exactly the failure the concierge-width test above exists to prevent.
+  //
+  // Asserts what the COMPONENTS derive, through their own helpers, rather than re-reading the
+  // literal back out of the store — `pendingCount` is what the badge shows and `inFlight` is what
+  // the thread lists, so a fixture whose stages drifted would fail here instead of shipping a
+  // screenshot that proves nothing.
+  it("seeds a queued inbox on the selected row, with one message at each lifecycle stage", () => {
+    expect(applyVisualFixtures("?visual=1", ON)).toBe(true);
+    const rowId = useProjectStore.getState().projects[0]!.agents[0]!.id;
+    const entries = useInboxStore.getState().byAgent[rowId] ?? [];
+
+    expect(entries).toHaveLength(3);
+    expect(entries.map((e) => e.state)).toEqual(["pending", "delivered", "acknowledged"]);
+    // The BADGE counts pending only — a mark that never goes away stops being read.
+    expect(pendingCount(entries)).toBe(1);
+    // The THREAD lists everything not yet acknowledged.
+    expect(inFlight(entries).map((e) => e.id)).toEqual(["vfx-inbox-1", "vfx-inbox-2"]);
+    // Every message carries real text, because the whole point of the surface is showing it.
+    expect(entries.every((e) => e.text.trim().length > 0)).toBe(true);
+
+    // DETERMINISM, the property this whole file exists for: a wall-clock `ts` would drift the 12h
+    // expiry boundary between runs and make the baseline unstable.
+    expect(entries.every((e) => e.ts < FIXTURE_NOW && e.ts > FIXTURE_NOW - 60 * 60_000)).toBe(true);
   });
 
   it("replaces any pre-existing project rather than appending to them", () => {

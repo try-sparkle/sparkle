@@ -44,6 +44,7 @@ import { useConnectionStore } from "../stores/connectionStore";
 import { useCableStore } from "../stores/cableStore";
 import { useUiStore } from "../stores/uiStore";
 import { useDictationStore } from "../stores/dictationStore";
+import { useInboxStore } from "../stores/inboxStore";
 // THE APP'S OWN KEYS AND FLOOR, imported rather than re-spelled. `engine/columnResize` is a true
 // leaf (no imports at all), so this costs nothing at module scope and keeps this file — and its
 // node-environment test — clear of the Workspace graph. See `visualConciergeWidth` for why a
@@ -1064,6 +1065,71 @@ export function applyVisualFixtures(
       { ...workflowStage },
     ),
     openAgentIds: [],
+  });
+
+  // ── A QUEUED INBOX, SO THE PENDING BADGE IS ACTUALLY ON SCREEN ──────────────────────────────
+  //
+  // WHY THIS FIXTURE EXISTS AT ALL. The pending-instruction badge (components/AgentInboxBadge) and
+  // the mounted thread's queued bubbles were shipped for bead sparkle-zm0c8 — a queued concierge
+  // message that appeared NOWHERE, which made "I sent it" impossible for the founder to check. They
+  // were verified in jsdom, and jsdom neither lays out nor paints (docs/jsdom-test-caveats.md), so
+  // nothing in the repo could show that the fix he asked for is VISIBLE. That is a poor place to
+  // leave a fix whose entire purpose is being seen.
+  //
+  // WHY A STORE WRITE AND NOT A MOCKED COMMAND. `inboxStore` reads through `invoke("inbox_peek")`,
+  // which no-ops in a plain browser — the exact reason this whole file exists. Seeding the store is
+  // the same move every other fixture here makes, and it exercises the real components: the badge
+  // derives its count with `pendingCount`, the thread filters with `inFlight`, and both read the
+  // shared copy in `components/inboxCopy`. Nothing is stubbed but the transport.
+  //
+  // NOT IN `detachPersistence`'s LIST, and that is correct rather than an omission: `inboxStore` is
+  // deliberately live-only (no `persist` middleware — the queue's truth is a JSONL file under
+  // app-data, and a cached copy that outlived the tab would be the stale-badge failure the store's
+  // own header argues against). There is therefore nothing to detach and no developer state to
+  // clobber.
+  //
+  // THREE MESSAGES ON ONE ROW, ONE PER STAGE, on purpose: the badge must be shown counting ONLY the
+  // pending one (a mark that never goes away stops being read), while the popover and the thread
+  // show all three — so a capture proves the count rule and the three-stage vocabulary at once. The
+  // timestamps are offsets from FIXTURE_NOW like everything else here, because a wall-clock `ts`
+  // would move the 12h expiry boundary between runs and make the baseline unstable.
+  useInboxStore.setState({
+    byAgent: {
+      [SELECTED_ROW_ID]: Object.freeze([
+        {
+          id: "vfx-inbox-1",
+          ts: FIXTURE_NOW - 2 * MINUTE,
+          from: "concierge",
+          text: "main has moved — rebase onto origin/main before you verify, or you will chase failures that are already fixed.",
+          severity: "act" as const,
+          state: "pending" as const,
+          ackedAt: null,
+          ackNote: null,
+        },
+        {
+          id: "vfx-inbox-2",
+          ts: FIXTURE_NOW - 9 * MINUTE,
+          from: "concierge",
+          text: "The picker spec settled on option B; the addressed-at column is authoritative.",
+          severity: "fyi" as const,
+          state: "delivered" as const,
+          ackedAt: null,
+          ackNote: null,
+        },
+        {
+          id: "vfx-inbox-3",
+          ts: FIXTURE_NOW - 21 * MINUTE,
+          from: "concierge",
+          text: "Another agent owns src/theme/colors.ts this pass — leave it alone.",
+          severity: "act" as const,
+          state: "acknowledged" as const,
+          ackedAt: FIXTURE_NOW - 19 * MINUTE,
+          ackNote: "read",
+        },
+      ]),
+    },
+    polledAgents: { [SELECTED_ROW_ID]: true },
+    error: null,
   });
 
   // The offline banner is real UI that pushes the whole workspace down, and a headless browser
