@@ -41,6 +41,10 @@ import { useRuntimeStore } from "../stores/runtimeStore";
 import { submitPrompt } from "../pty";
 import { log } from "../logger";
 import type { AgentTabStatus } from "../types";
+import { routeSilence } from "@sparkle/core";
+import { useProjectStore } from "../stores/projectStore";
+import { agentDisplayName } from "../engine/agentDisplayName";
+import { notifyConcierge } from "./conciergeNotifier";
 
 /** How often the sweep runs. The ladder's own rungs decide WHEN a ping is due (the engine compares
  *  wall-clock instants), so this only bounds how late a due rung can fire — it is not the cadence.
@@ -481,7 +485,19 @@ export interface ReviveDeps {
   /** Types the retry into the agent's terminal. Rejects if it did not land. */
   submit: (agentId: string, text: string) => Promise<void>;
   /** Called once per episode when the human has to take over. */
-  onEscalate: (agentId: string, reason: string, episode: Readonly<ReviveEpisode>) => void;
+  /**
+   * `retriesSpent` is the number of pings actually spent, when the caller knows it better than the
+   * episode does — which on the BUDGET path it always does (roborev 57761). The budget is charged
+   * across PRIOR ladders, and it is checked before `episode.attempts` is assigned, so the common
+   * case there is a brand-new episode escalating with `attempts === 0` while `pingLog` holds the
+   * real spend. Omitted elsewhere, where `episode.attempts` is the truth.
+   */
+  onEscalate: (
+    agentId: string,
+    reason: string,
+    episode: Readonly<ReviveEpisode>,
+    retriesSpent?: number,
+  ) => void;
   /** Master gate — false means "do not type on my behalf" and no ping is sent. */
   enabled: () => boolean;
 }
@@ -593,7 +609,7 @@ export async function sweepApiRecovery(deps: ReviveDeps): Promise<SweepOutcome[]
           pings: pinged.length,
           windowMs: PING_BUDGET_WINDOW_MS,
         });
-        deps.onEscalate(agentId, BUDGET_SPENT_REASON, episode);
+        deps.onEscalate(agentId, BUDGET_SPENT_REASON, episode, pinged.length);
       }
       episode.escalated = true;
       continue;
@@ -641,6 +657,21 @@ export function nextRetryDueAt(now: number): number | null {
   return soonest;
 }
 
+/**
+ * The agent's display name, or its id when the roster cannot answer.
+ *
+ * `agentDisplayName` is the SHARED naming rule on purpose: a report that names an agent something
+ * the sidebar does not call it is a report the human cannot act on. Falling back to the raw id is
+ * still better than omitting the subject — an escalation about an unnamed agent is unactionable.
+ */
+function labelForAgent(agentId: string): string {
+  const agent = useProjectStore
+    .getState()
+    .projects.flatMap((p) => p.agents)
+    .find((a) => a.id === agentId);
+  return agent === undefined ? agentId : agentDisplayName(agent);
+}
+
 /** The real-world dependency set. Split out so the hook and any manual trigger share one wiring. */
 export function liveDeps(now: number): ReviveDeps {
   return {
@@ -657,11 +688,59 @@ export function liveDeps(now: number): ReviveDeps {
     // machine send that cleared it would repaint the row green and hide the block. See
     // StatusEngine.noteUserInput, which draws exactly that line.
     submit: (id, text) => submitPrompt(id, text, { machine: true }),
-    onEscalate: () => {
-      // The row is ALREADY red and `errored` is already in engine/attention's set, so the dock badge,
-      // the system notification and the concierge's proactive push all fire without anything more
-      // from here. Escalating therefore means STOP PINGING and leave it red — deliberately not a
-      // second notification channel, which would double-page the human for one event.
+    // ── THE LADDER'S TERMINUS NOW REACHES SOMEBODY (sparkle-4cd0x) ─────────────────────────────
+    //
+    // This was a deliberate no-op, on reasoning that was correct when it was written: the row is
+    // already red, `errored` is already in `engine/attention`'s set, so the dock badge, the system
+    // notification and the concierge's proactive push all fire without anything more from here, and
+    // a second channel would double-page the human for one event.
+    //
+    // The gap is WHICH event each of those announces. Every one of them fires when the row TURNS
+    // red — a change in the needs-you digest. Giving up is a different fact arriving up to an hour
+    // and a half later, and it moves no digest at all: the row has been red the whole time, so the
+    // proactive channel has nothing to notice and stays silent by design. Nothing anywhere marked
+    // the moment retrying stopped. The founder's report is exactly that shape — an agent that died
+    // on a 529 after 21 minutes of good work and "has sat `errored` ever since", with the ladder
+    // having already run and quit hours earlier.
+    //
+    // So this is not a second page for the same event; it is the first and only report of a
+    // different one. It goes to the CONCIERGE rather than to the founder because a dead agent is
+    // something the concierge can act on — restart it, or take its branch over — which is the
+    // preference order the Pusher work established: agent, then concierge, then the human.
+    //
+    // `notifyConcierge` returns false when no window is listening. That is honest rather than
+    // ignorable, but there is deliberately nothing to retry here: `escalated` has already latched,
+    // and the condition is a standing one the Pusher's own sweep re-observes every minute. Logged,
+    // not re-queued.
+    onEscalate: (agentId, reason, episode, retriesSpent) => {
+      // READ FROM THE EPISODE, NOT ASSUMED (roborev 57761). An earlier version hardcoded
+      // `transient: true` on the reasoning that a terminal account limit escalates without ever
+      // pinging, so anything reaching here must have been retried. That is false: `decideRevive`
+      // answers `failure === "terminal"` with `{action:"escalate"}` BEFORE any ping arm, and the
+      // sweep routes every escalate decision through this callback — so an agent behind a spend cap
+      // or session window arrives here with `attempts === 0`.
+      //
+      // Two harms, and the second is the one that matters. The count would have been a false claim
+      // ("retried 0 times and stayed dead" about an agent never retried), and the REMEDY would have
+      // been wrong: restarting an agent whose account limit has not reset just re-fails. That is
+      // exactly the distinction `routeSilence`'s non-transient branch exists to draw — "read its
+      // terminal, then restart it" rather than "it was retried N times and stayed dead".
+      const transient = episode.failure !== "terminal";
+      // The budget path knows the real spend; every other path's truth is on the episode.
+      const retries = retriesSpent ?? episode.attempts;
+      const route = routeSilence({
+        label: labelForAgent(agentId),
+        transient,
+        retries,
+        // Equal, which is what makes `routeSilence` report `transient-retries-exhausted` rather than
+        // hold its tongue: reaching this callback IS the exhaustion.
+        retryLimit: retries,
+        message: reason,
+      });
+      if (route.target !== "concierge") return;
+      if (!notifyConcierge(route.text)) {
+        log.warn("apiRecovery", "gave up on an agent and could not tell the concierge", { agentId });
+      }
     },
     enabled: () => aiFeatureVisibleNow("autoApprove"),
   };
