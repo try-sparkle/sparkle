@@ -48,6 +48,9 @@ import type { ConciergeMountedAgent } from "./Concierge/types";
 // pure module (no React, no stores) so the inference is unit-testable without mounting this file, and
 // so the stub that draws an anchor reads the same declaration the host writes.
 import { pendingAnchors, type ReplyAnchor } from "./Concierge/replyAnchors";
+// The linter's findings, projected to the metadata-only shape a message carries, plus the wording
+// rule the mounted-column notice below reuses so the banner and the inline mark say ONE thing.
+import { lintMarkText, toLintMarks, type MessageLintMark } from "./Concierge/lintMarks";
 import { ConciergeSuggestions } from "./Concierge/ConciergeSuggestions";
 // The two ALARM controls the card draws (Mute, [x]). Imported rather than re-spelled: the card
 // fires them and this file handles them, and a literal on each side is a silent no-op waiting to
@@ -117,6 +120,8 @@ import { ConciergeApprovals } from "./Concierge/ConciergeApprovals";
 import { CountdownBanner } from "./Concierge/CountdownBanner";
 import { flat, line, plain, ref } from "./Concierge/conciergeLine";
 import type { Line, ReferencableAgent } from "./Concierge/conciergeLine";
+import { actionReceiptLine } from "./Concierge/actionReceiptLine";
+import { claimReceiptForDisplay, onConciergeActionReceipt } from "../services/conciergeReceipts";
 import { routeMessage } from "../services/conciergeRouter";
 import {
   mentionFreeText,
@@ -1936,14 +1941,21 @@ export function ConciergeHost({
       const answers = pendingAnchors(prev);
       return answers.length ? { answers } : {};
     };
-    const upsert = (id: string, text: string, replace: boolean) => {
+    // `lint` IS ONLY EVER PASSED BY THE `done` PATH, and the omission is load-bearing on the delta
+    // path rather than merely tidy: the field is spread from `cur`, so leaving it out PRESERVES what
+    // is already on the bubble. Passing `undefined` on every streamed token would erase a mark the
+    // moment a straggling delta landed after `done`.
+    const upsert = (id: string, text: string, replace: boolean, lint?: MessageLintMark[]) => {
       const prior = brainTextRef.current[id] ?? "";
       brainTextRef.current[id] = replace ? text : prior + text;
       setChat((prev) => {
         const k = key(id);
         const i = prev.findIndex((m) => m.id === k);
         if (i === -1)
-          return [...prev, { id: k, kind: "sparkle", text, ...pushFields(id), ...answerFields(prev, id) }];
+          return [
+            ...prev,
+            { id: k, kind: "sparkle", text, ...(lint ? { lint } : {}), ...pushFields(id), ...answerFields(prev, id) },
+          ];
         const next = prev.slice();
         const cur = next[i]!;
         next[i] = {
@@ -1953,6 +1965,7 @@ export function ConciergeHost({
           // but the union now contains a variant with no `text` at all (the recap card), so the
           // narrowing has to be explicit rather than a defensive `?? ""`.
           text: replace ? text : (cur.kind === "sparkle" ? cur.text : "") + text,
+          ...(lint ? { lint } : {}),
           ...pushFields(id),
         };
         return next;
@@ -2021,7 +2034,38 @@ export function ConciergeHost({
             policy: lintPolicyRef.current,
           })
         : null;
-      if (e.text) upsert(e.id, linted?.text ?? e.text, true);
+      // ══ AND ITS FINDINGS RIDE ONTO THE BUBBLE (bead sparkle-kr2jz, part A) ═════════════════════
+      // Until now `runReplyLint`'s `violations` were dropped here — only `.text` was read — so every
+      // finding reached an in-memory counter nothing displays and a JSONL only a CLI reads. The
+      // detection worked and was invisible, which for the founder is the same as absent.
+      //
+      // Attached to the `replace: true` upsert that already existed, exactly as the linted text is:
+      // the final text overwrites the streamed bubble wholesale, so the marks need no new render
+      // mechanism and cannot land on a bubble other than the one they were found in. They inherit
+      // the SAME accepted limitation the comment above states — deltas paint live, so an unmarked
+      // reply is briefly visible before this replaces it.
+      //
+      // `toLintMarks` narrows each violation to metadata (check / severity / detail) and drops
+      // `span`; see Concierge/lintMarks for why that boundary is enforced by the type.
+      const marks = toLintMarks(linted?.violations);
+      if (e.text) upsert(e.id, linted?.text ?? e.text, true, marks);
+      // ══ AND THE MOUNTED COLUMN, WHICH CANNOT SHOW A THREAD ROW AT ALL (roborev 57360's problem) ═
+      // Display-mounted, `ConciergeColumn` renders the agent's transcript and does NOT render
+      // `ConciergeThread` — so the mark, which lives inside a thread row, is written off screen
+      // along with the reply it annotates. That is the same hole `MountedNotice` was added for, so
+      // it gets the same compensation rather than a second mechanism.
+      //
+      // `info`, never `warn`: `warn` is reserved for a refusal, where nothing was sent and the
+      // founder's words are back in the box waiting on him. A lint finding is an observation about a
+      // reply that was delivered — it asks for a glance, not an action — and borrowing the refusal's
+      // register would cry wolf over the one tone that must stay urgent.
+      //
+      // Keyed on the DISPLAY mount (`displayMountedRef`), not the routing one, for the reason that
+      // ref's own comment gives: whether the thread is hidden is what decides this, and gating on
+      // routing both suppresses the notice in the display-mounted-but-unroutable state and paints a
+      // banner over a perfectly visible thread when nothing is mounted at all.
+      const lintLine = lintMarkText(marks);
+      if (lintLine && displayMountedRef.current) noteMounted(lintLine, "info");
       // THE TURN FINISHED — recorded on the bubble, because "a left-aligned bubble exists" and "the
       // brain finished answering" are different facts and the reply-anchor rule needs the second one
       // (see Concierge/types `ConciergeSparkleMessage.settled`). Kept OUT of the upsert above: that
@@ -2151,7 +2195,10 @@ export function ConciergeHost({
       offError();
       offReset();
     };
-  }, [announce]);
+    // `noteMounted` is `useCallback(…, [])`, so naming it here satisfies the lint rule without
+    // making the brain subscription tear down and re-listen — which is the thing this array has to
+    // keep true, since a resubscribe mid-turn would drop the events still arriving for it.
+  }, [announce, noteMounted]);
 
   // ══ AN INHERITED TURN IS DISCARDED, NOT MERELY SILENCED ══════════════════════════════════════
   //
@@ -2710,6 +2757,52 @@ export function ConciergeHost({
         else postSparkle(line`${who} didn't take the message I was holding${plain(quoted)}.`, collapsed);
       }),
     [postSparkle, takeHeldAttachments, restoreAttachments],
+  );
+
+  // ══ ACTION RECEIPTS — the concierge's OWN actions, posted where the founder can check them ═════
+  //
+  // `controlListener` mints a receipt for every write-tier `concierge_tool` call (see
+  // services/conciergeReceiptClassifier); this is the subscriber that turns one into a line. Without
+  // it the whole path is inert — the receipt is emitted into an empty listener set and nothing is
+  // drawn, which is precisely the state this feature exists to end.
+  //
+  // WHY IT POSTS TO THE THREAD AND NOT A NEW SURFACE: the founder's complaint is that "I sent it"
+  // and "I imagined sending it" look identical the moment a turn ends. `ThinkingIndicator` already
+  // narrates a call WHILE it runs and then erases it. The durable answer has to live where he is
+  // already reading, next to the claim it corroborates — and the ABSENCE of a receipt beside a
+  // claim is then itself the evidence.
+  //
+  // MOUNT-SCOPED, and that is the correct lifetime: a listener belongs to this component, and the
+  // returned unsubscribe is what `useEffect` tears down. It is deliberately NOT cleared on identity
+  // change — see the note on `_resetConciergeReceiptsForTests`, which exists so nobody wires this
+  // set into the sign-out reset and silently stops every later receipt from rendering.
+  useEffect(
+    () =>
+      onConciergeActionReceipt((receipt) => {
+        // DEDUPE ON THE RECEIPT ID — this is what `ConciergeActionReceipt.id` exists for, and it is
+        // load-bearing rather than defensive. `onConciergeActionReceipt` REPLAYS recent receipts to
+        // every new subscriber (roborev 57866: this host unmounts whenever no project is open, and a
+        // receipt fanned out to an empty listener set was lost permanently — which manufactures
+        // false "it never happened" evidence in a feature whose contract is that a missing receipt
+        // IS evidence). Replay means a remount re-delivers lines this thread may already show, so
+        // the id is what stops one action becoming two.
+        //
+        // OUTLIVES THIS MOUNT, and a test caught why. It was a `useRef` first — per component
+        // INSTANCE — so the unmount/remount cycle the replay exists to serve rebuilt it empty and
+        // posted every replayed line twice.
+        // Dedupe lives in the SERVICE (roborev 57905) so the sign-out reset can clear it without a
+        // service importing this React module. `claimReceiptForDisplay` returns false for an id
+        // already drawn — which is what makes the replay safe on remount.
+        if (!claimReceiptForDisplay(receipt.id)) return;
+        // Resolved through the FEED, exactly as the deferred-outcome arm above does, so a pill's id
+        // is one the app can actually open. `actionReceiptLine` degrades to words on its own when
+        // the agent is gone, rather than inventing a reference.
+        const l = actionReceiptLine(receipt, resolveAgent);
+        // `null` means "this receipt has no sentence the app can stand behind" — an unknown kind.
+        // Posting nothing is the safe failure: a receipt line means the thing happened.
+        if (l) postSparkle(l);
+      }),
+    [postSparkle, resolveAgent],
   );
 
   /** The `you` bubble whose answer is currently outstanding, or null. Paired with the liveness

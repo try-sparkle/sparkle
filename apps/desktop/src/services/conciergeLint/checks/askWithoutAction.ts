@@ -246,8 +246,12 @@ const VIEW_ONLY_OP_SET = new Set(VIEW_ONLY_OPS);
 
 /** The dispatcher domain a call belongs to (`sparkle_lifecycle` → `lifecycle`), or null when the
  *  call is not a Sparkle dispatcher at all. Derived from the same name {@link catalogNameFor}
- *  reduces, so the two cannot disagree about which call is a dispatcher. */
-function dispatcherDomain(call: LintToolCall): string | null {
+ *  reduces, so the two cannot disagree about which call is a dispatcher.
+ *
+ *  EXPORTED for sibling checks (`unbackedClaim`) that also need to ask `conciergeOpWrites` about a
+ *  call. Copying these four lines is how the two would eventually disagree about which call is a
+ *  dispatcher, which is the drift `catalogNameFor`'s own header is about. */
+export function dispatcherDomain(call: LintToolCall): string | null {
   const raw = (call?.name ?? "").trim().toLowerCase();
   const bare = raw.startsWith("mcp__") ? (raw.split("__").pop() ?? raw) : raw;
   return bare.startsWith("sparkle_") ? bare.slice("sparkle_".length) : null;

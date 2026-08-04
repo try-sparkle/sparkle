@@ -55,7 +55,21 @@ function ledgerEntry(over: Partial<ConciergeApproval> = {}): ConciergeApproval {
 
 function fakeDeps(reply: unknown = { ok: true, domain: "terminal", op: "send_to_agent_terminal", data: {} }) {
   const dispatch = vi.fn(async () => reply as never);
-  return { deps: { dispatch, policy: () => ({ tier: "allow" as const }) } as ApprovalResumeDeps, dispatch };
+  const settleReceipt = vi.fn();
+  const auditSettle = vi.fn();
+  const noteAudit = vi.fn(() => auditSettle);
+  return {
+    deps: {
+      dispatch,
+      policy: () => ({ tier: "allow" as const }),
+      settleReceipt,
+      noteAudit,
+    } as ApprovalResumeDeps,
+    dispatch,
+    settleReceipt,
+    noteAudit,
+    auditSettle,
+  };
 }
 
 beforeEach(() => clearConciergeApprovals());
@@ -205,5 +219,120 @@ describe("describeResumeOutcome — the receipt the thread shows", () => {
     expect(describeResumeOutcome({ domain: "app", op: "set_config" }, { kind: "not-replayable" })).toBe(
       "Approved app.set_config. Tell me to go ahead and I'll run it.",
     );
+  });
+});
+
+// ══ THE APPROVED CALL MUST LEAVE A RECORD (roborev 57852, High) ═════════════════════════════════
+// This dispatch bypasses `handleConciergeTool`, which is where every other concierge action mints
+// its receipt. Before this, an ask-tier `merge_pr` recorded a permanent `ok:false` "needs your
+// go-ahead" on the first dispatch, the human approved it, the call RAN here — and nothing was ever
+// recorded. The PR merged and the durable record said it was refused: a false negative on exactly
+// the question the receipt exists to answer.
+describe("the receipt for a call the human approved", () => {
+  it("settles a SUCCESS receipt when the approved call runs", async () => {
+    const { deps, settleReceipt } = fakeDeps({
+      ok: true,
+      domain: "workflow",
+      op: "merge_pr",
+      data: { prNumber: 753 },
+    });
+
+    await resumeApprovedCall(
+      ledgerEntry({ domain: "workflow", op: "merge_pr", rawArgs: { prNumber: 753 } }),
+      deps,
+    );
+
+    expect(settleReceipt).toHaveBeenCalledWith(
+      "workflow",
+      "merge_pr",
+      { prNumber: 753 },
+      true,
+      { prNumber: 753 },
+      undefined,
+      undefined,
+    );
+  });
+
+  it("settles a REFUSAL when the approved call is declined by the tool's own guards", async () => {
+    // A tool the human approved and that then refused itself is a real outcome they are owed —
+    // the module header says so, and the receipt has to carry it too.
+    const { deps, settleReceipt } = fakeDeps({
+      ok: false,
+      domain: "workflow",
+      op: "merge_pr",
+      code: "conflict",
+      message: "the branch has conflicts",
+    });
+
+    await resumeApprovedCall(ledgerEntry({ domain: "workflow", op: "merge_pr" }), deps);
+
+    expect(settleReceipt).toHaveBeenCalledWith(
+      "workflow",
+      "merge_pr",
+      expect.anything(),
+      false,
+      undefined,
+      "the branch has conflicts",
+      "conflict",
+    );
+  });
+
+  it("settles NOTHING when the grant lapsed — that call did not run", async () => {
+    // The positive control for the two rows above: `needs-approval` here means the grant expired
+    // between the click and the dispatch, so no action occurred and no receipt may claim one.
+    const { deps, settleReceipt } = fakeDeps({
+      ok: false,
+      domain: "workflow",
+      op: "merge_pr",
+      code: "needs-approval",
+      message: "merge_pr needs your go-ahead.",
+    });
+
+    const outcome = await resumeApprovedCall(ledgerEntry({ domain: "workflow", op: "merge_pr" }), deps);
+
+    expect(outcome).toEqual({ kind: "unauthorized" });
+    expect(settleReceipt).not.toHaveBeenCalled();
+  });
+
+  it("settles NOTHING for an app-domain op, which is never dispatched here", async () => {
+    const { deps, settleReceipt } = fakeDeps();
+    await resumeApprovedCall(ledgerEntry({ domain: "app", op: "set_config" }), deps);
+    expect(settleReceipt).not.toHaveBeenCalled();
+  });
+});
+
+// ══ BOTH DURABLE RECORDS, AND NEITHER MAY UN-HAPPEN THE CALL (roborev 57895) ═══════════════════
+describe("the approved call's audit entry", () => {
+  it("settles the AUDIT entry too, not just the receipt", () => {
+    // Repairing only the receipt relocates the false negative to ConciergeAuditPane — the surface
+    // whose own header says it exists to answer "why didn't it do the thing I asked for".
+    const { deps, noteAudit, auditSettle } = fakeDeps({
+      ok: true,
+      domain: "workflow",
+      op: "merge_pr",
+      data: { prNumber: 753 },
+    });
+
+    return resumeApprovedCall(
+      ledgerEntry({ domain: "workflow", op: "merge_pr" }),
+      deps,
+    ).then(() => {
+      expect(noteAudit).toHaveBeenCalledTimes(1);
+      expect(auditSettle).toHaveBeenCalledWith({ ok: true });
+    });
+  });
+
+  it("still reports the call as RAN when a settler throws", async () => {
+    // The settle used to sit inside the dispatch's try, so a throw became `unauthorized`, which the
+    // column renders as "so nothing happened" — a flat denial of a merge that did happen. Minting a
+    // record may never reach back into the outcome of the call it records.
+    const { deps, settleReceipt } = fakeDeps({ ok: true, domain: "workflow", op: "merge_pr" });
+    settleReceipt.mockImplementation(() => {
+      throw new Error("classifier blew up");
+    });
+
+    const outcome = await resumeApprovedCall(ledgerEntry({ domain: "workflow", op: "merge_pr" }), deps);
+
+    expect(outcome.kind).toBe("ran");
   });
 });

@@ -61,6 +61,7 @@ import { resetConciergeSession } from "./concierge";
 import { clearConciergeApprovals } from "../stores/conciergeApprovals";
 import { clearConciergeEventLog } from "../stores/conciergeEventLog";
 import { clearConciergeThread } from "../stores/conciergeThreadStore";
+import { clearConciergeReceiptBacklog, clearPostedReceiptIds } from "./conciergeReceipts";
 
 /**
  * Drop every piece of concierge state that belongs to the human who is signing out.
@@ -74,5 +75,17 @@ export function resetConciergeIdentityState(): void {
   clearConciergeApprovals();
   clearConciergeEventLog();
   clearConciergeThread();
+  // AND THE FIFTH (roborev 57888). The receipt REPLAY BUFFER holds agent names, PR numbers, bead ids
+  // and the tool's verbatim refusal text — an index of what the previous human's concierge did — and
+  // its whole purpose is a replay path into the next subscriber's thread. A receipt never posted
+  // (the unmounted-host case the replay exists for, and sign-out is a moment the host is likely
+  // unmounted) would otherwise be delivered into the NEXT human's conversation on their first mount.
+  // Found by exactly the grep this header describes, one commit after the buffer was added.
+  clearConciergeReceiptBacklog();
+  // Its companion: the ids of receipts already drawn. Not sensitive, and NOT a collision risk —
+  // `nextReceiptId` counts on a process-lifetime counter no reset touches, so a post-sign-out id can
+  // never equal a pre-sign-out one. They simply name receipts that no longer exist once the backlog
+  // above is dropped, and keeping them is pointless residue.
+  clearPostedReceiptIds();
   resetConciergeSession();
 }

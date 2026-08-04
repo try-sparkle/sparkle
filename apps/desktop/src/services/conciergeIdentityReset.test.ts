@@ -10,9 +10,14 @@
 // EVERY ASSERTION IS ON STORE CONTENTS, never on a spy. A spy proves the call happened; it does not
 // prove the store is empty, and "the reset was invoked" is the claim that was already true of both
 // stores for months while nothing called them.
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 
 import { resetConciergeIdentityState } from "./conciergeIdentityReset";
+import {
+  onConciergeActionReceipt,
+  recordConciergeActionReceipt,
+  _resetConciergeReceiptsForTests,
+} from "./conciergeReceipts";
 import {
   noteConciergeAuditCall,
   useConciergeAudit,
@@ -94,11 +99,42 @@ function seedOneHumansSession(): void {
 }
 
 beforeEach(() => {
+  _resetConciergeReceiptsForTests();
   _resetConciergeAuditForTests();
   clearConciergeApprovals();
   _resetConciergeEventLogForTests();
   clearConciergeThread();
   _resetConciergeForTests();
+});
+
+// ══ THE FIFTH STORE (roborev 57888) ══════════════════════════════════════════════════════════════
+// The receipt replay buffer holds agent names, PR numbers, bead ids and verbatim refusal text, and
+// its whole purpose is a replay path into the NEXT subscriber's thread — so an unposted receipt
+// would land in the next human's conversation on their first mount. Asserted through the REPLAY,
+// not through the array, because the replay is the actual leak path.
+describe("the receipt backlog is per-human state too", () => {
+  it("does not replay the previous human's receipts to the next subscriber", () => {
+    recordConciergeActionReceipt({
+      id: "receipt-leak",
+      kind: "merged",
+      ok: true,
+      prNumber: 753,
+      at: 1,
+      op: "workflow.merge_pr",
+    });
+    // The seed is real: a subscriber BEFORE the reset does receive it, so the assertion after the
+    // reset cannot pass vacuously.
+    const before = vi.fn();
+    const off = onConciergeActionReceipt(before);
+    expect(before).toHaveBeenCalledTimes(1);
+    off();
+
+    resetConciergeIdentityState();
+
+    const next = vi.fn();
+    onConciergeActionReceipt(next);
+    expect(next).not.toHaveBeenCalled();
+  });
 });
 
 describe("resetConciergeIdentityState", () => {

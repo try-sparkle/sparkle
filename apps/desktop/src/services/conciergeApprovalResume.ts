@@ -55,6 +55,8 @@ import {
   type DispatchOptions,
 } from "./conciergeTools/registry";
 import { configuredToolPolicy } from "./conciergeTools/policyBinding";
+import { settleConciergeReceipt } from "./conciergeReceiptSettle";
+import { noteConciergeAuditCall } from "./conciergeAudit";
 import type { ConciergeApproval } from "../stores/conciergeApprovals";
 
 /**
@@ -79,17 +81,61 @@ export type ApprovalResumeOutcome =
 export interface ApprovalResumeDeps {
   dispatch: (call: ConciergeToolCall, opts: DispatchOptions) => Promise<ConciergeToolReply>;
   policy: DispatchOptions["policy"];
+  /** Mint the action receipt for a call that ran here. INJECTED rather than imported at the call
+   *  site so a test can assert the receipt WITHOUT standing up the classifier and the registry —
+   *  and so "the approved call left no record" is an assertable fact rather than a hope. */
+  settleReceipt: (
+    domain: string,
+    op: string,
+    args: unknown,
+    ok: boolean,
+    data: unknown,
+    reason: string | undefined,
+    code?: string,
+  ) => void;
+  /** Open an AUDIT entry for the call, returning its settler. The audit pane is the surface whose
+   *  own header says it exists to answer "why didn't it do the thing I asked for" — so repairing
+   *  only the receipt would relocate the false negative here rather than remove it (roborev 57895). */
+  noteAudit: (
+    toolCallId: string,
+    domain: string,
+    op: string,
+    args: unknown,
+  ) => (reply: { ok: boolean; code?: string; message?: string }) => void;
 }
 
 const REAL_DEPS: ApprovalResumeDeps = {
   dispatch: dispatchConciergeTool,
   policy: configuredToolPolicy,
+  settleReceipt: settleConciergeReceipt,
+  noteAudit: noteConciergeAuditCall,
 };
 
 /** Can this entry's op actually be dispatched? Only the four registry domains can; see the header
  *  for why `app` cannot. */
 export function isReplayable(entry: Pick<ConciergeApproval, "domain">): boolean {
   return (CONCIERGE_TOOL_DOMAINS as readonly string[]).includes(entry.domain);
+}
+
+/** Open the audit entry, tolerating a settler that throws. Returns a no-op settler on failure so
+ *  the caller never has to branch — a broken audit sink must not be able to change what happened. */
+function safeNoteAudit(
+  deps: ApprovalResumeDeps,
+  entry: ConciergeApproval,
+): (reply: { ok: boolean; code?: string; message?: string }) => void {
+  try {
+    const settle = deps.noteAudit(entry.id, entry.domain, entry.op, entry.rawArgs);
+    return (reply) => {
+      try {
+        settle(reply);
+      } catch (err) {
+        console.warn("conciergeApprovalResume: audit settle failed", err);
+      }
+    };
+  } catch (err) {
+    console.warn("conciergeApprovalResume: opening the audit entry failed", err);
+    return () => {};
+  }
 }
 
 /**
@@ -108,6 +154,11 @@ export async function resumeApprovedCall(
   deps: ApprovalResumeDeps = REAL_DEPS,
 ): Promise<ApprovalResumeOutcome> {
   if (!isReplayable(entry)) return { kind: "not-replayable" };
+  /** The reply, once the dispatch has committed. Held so the settlers can run OUTSIDE the try. */
+  let ran: ConciergeToolReply;
+  // Opened BEFORE the dispatch, exactly as `handleConciergeTool` does, so the entry records the
+  // ATTEMPT and its `startedAt` is the moment the call actually began.
+  const settleAudit = safeNoteAudit(deps, entry);
   try {
     const reply = await deps.dispatch(
       {
@@ -124,12 +175,48 @@ export async function resumeApprovedCall(
     // `needs-approval` coming back here means the grant lapsed between the click and the dispatch.
     // Report it as such: "it needs approval" would be nonsense to someone who just approved it.
     if (!reply.ok && reply.code === "needs-approval") return { kind: "unauthorized" };
-    return { kind: "ran", reply };
+    ran = reply;
   } catch {
     // dispatchConciergeTool is documented total, so this is belt-and-braces. Treat an impossible
     // throw as "we cannot say it ran", which is the safe direction to be wrong in.
+    settleAudit({ ok: false, code: "internal-error", message: "the dispatch threw" });
     return { kind: "unauthorized" };
   }
+
+  // ══ THE DURABLE RECORDS FOR A CALL THE HUMAN APPROVED ═══════════════════════════════════════
+  // This dispatch BYPASSES `handleConciergeTool`, which is where every other concierge action
+  // settles its records — so without this an approved call left no trace at all, while its earlier
+  // ask-tier reply used to leave a permanent `ok: false`. For `merge_pr` (`mutates-main`, therefore
+  // `ask` by default) that meant the flagship case ended with the PR merged and the record saying
+  // it was refused (roborev 57852).
+  //
+  // BOTH records, not just the receipt (roborev 57895): `handleConciergeTool` settles the audit
+  // entry too, and repairing one while leaving the other merely RELOCATES the false negative to
+  // `ConciergeAuditPane` — the surface whose own header says it exists to answer "why didn't it do
+  // the thing I asked for".
+  //
+  // OUTSIDE THE `try`, AND GUARDED SEPARATELY. Inside it, a throw from either settler would be
+  // caught above and reported as `unauthorized`, which the column renders as "so nothing happened"
+  // — a flat denial of a merge that DID happen, which is the exact false-negative class this work
+  // exists to remove. It also violates the settler's own stated invariant: nothing about minting a
+  // record may reach back into the outcome of the call it records.
+  try {
+    deps.settleReceipt(
+      entry.domain,
+      entry.op,
+      entry.rawArgs,
+      ran.ok,
+      ran.ok ? ran.data : undefined,
+      ran.ok ? undefined : ran.message,
+      ran.ok ? undefined : ran.code,
+    );
+    settleAudit(
+      ran.ok ? { ok: true } : { ok: false, code: ran.code, message: ran.message },
+    );
+  } catch (err) {
+    console.warn("conciergeApprovalResume: settling the approved call's records failed", err);
+  }
+  return { kind: "ran", reply: ran };
 }
 
 /**

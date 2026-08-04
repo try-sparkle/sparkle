@@ -19,6 +19,11 @@ import {
   LIVE_THUMBNAIL_MAX_CHARS,
   LIVE_THUMBNAIL_TOTAL_CHARS,
 } from "./conciergeThreadStore";
+import {
+  LINT_CHECK_MAX_LEN,
+  LINT_DETAIL_MAX_LEN,
+  MAX_LINT_MARKS,
+} from "../components/Concierge/lintMarks";
 import type { ConciergeMessage } from "../components/Concierge/types";
 
 const STORAGE_KEY = "sparkle-concierge-thread";
@@ -522,6 +527,120 @@ describe("conciergeThreadStore", () => {
         kind: "you",
         receipt: { target: "agent", agentName: "CI Hardening", agentId: "a1" },
       });
+    });
+  });
+
+  // ══ LINT MARKS SURVIVE A RESTART — THE DECISION, PINNED (bead sparkle-kr2jz) ═══════════════════
+  // This is the fork in the road the field had to be walked through deliberately, and these rows are
+  // what stop it being re-decided by accident in either direction.
+  //
+  // KEPT, unlike `ConciergeFailureMessage` — the deliberate counter-example, held off PERSISTED_KINDS
+  // entirely because "you've hit your session limit · resets 8:40am" is a claim about NOW that has
+  // expired by the next launch. A lint mark is not that kind of claim: "this reply offered to act and
+  // no action ran in it" is a closed observation about a turn that has ended, and the reply text it
+  // annotates is persisted verbatim beside it. Dropping it would also undo the point, since what the
+  // founder is trying to see is a PATTERN across turns.
+  //
+  // BOUNDED AND RE-VALIDATED on both boundaries, because "it survives" is the easy half — every
+  // rebuild in this module is a spread, so the field would have come back whether or not anyone had
+  // thought about it.
+  describe("a reply's lint marks", () => {
+    const marked = (lint: unknown): ConciergeMessage =>
+      ({ id: "s1", kind: "sparkle", text: "Say go and I'll spawn it.", lint }) as ConciergeMessage;
+
+    it("SURVIVES a simulated reload", () => {
+      setChat([marked([{ check: "ask-without-action", severity: "block", detail: "offered to act" }])]);
+      expect(persisted()[0]).toMatchObject({
+        lint: [{ check: "ask-without-action", severity: "block", detail: "offered to act" }],
+      });
+      // …and comes back off the restore path still attached, which is the half that actually reaches
+      // a renderer. `rehydrateThread` is what a fresh page runs on the payload above.
+      expect(rehydrateThread(persisted())[0]).toMatchObject({
+        id: `${RESTORED_ID_PREFIX}0`,
+        lint: [{ check: "ask-without-action" }],
+      });
+    });
+
+    it("leaves a CLEAN reply with no lint field — the positive control", () => {
+      // Without this, the row above passes against a store that stamps every restored message with
+      // an empty array, which would make a restored thread claim findings nothing produced.
+      setChat([sparkle("s1", "Spawned it.")]);
+      expect(persisted()[0]).not.toHaveProperty("lint");
+      expect(rehydrateThread(persisted())[0]).toMatchObject({ lint: undefined });
+    });
+
+    it("caps a runaway array on the way to disk", () => {
+      // `hedge-words` reports one violation PER WORD, so this is the realistic case. Unbounded, it is
+      // the same quota failure stripDataUrls and the collapsed-payload budget exist to prevent,
+      // reaching through a field the text cap cannot see.
+      const many = Array.from({ length: 40 }, () => ({ check: "hedge-words", severity: "warn", detail: "d" }));
+      const [out] = persistableThread([marked(many)]);
+      expect((out as { lint?: unknown[] }).lint!.length).toBeLessThanOrEqual(MAX_LINT_MARKS);
+    });
+
+    // ══ THE WRITE-SIDE BOUND WAS A NO-OP (roborev 57878/57851, Medium) ═══════════════════════
+    // `boundLintMarks` normalized the marks and then discarded the result unless the array LENGTH
+    // changed — and clipping `detail`, clipping `check` and coercing `severity` all leave the length
+    // alone. So the only thing it actually enforced on the way to disk was MAX_LINT_MARKS, and the
+    // original over-long payload was persisted. The existing clip assertion in this file goes through
+    // `rehydrateThread` (the RESTORE path, which always worked), so nothing covered the write side.
+    it("clips an over-long detail ON THE WAY OUT, not only on the way back in", () => {
+      const [out] = persistableThread([
+        marked([{ check: "hedge-words", severity: "warn", detail: "z".repeat(9000) }]),
+      ]);
+      expect((out as { lint?: { detail: string }[] }).lint![0]!.detail).toHaveLength(
+        LINT_DETAIL_MAX_LEN,
+      );
+    });
+
+    it("coerces a NON-STRING severity on the way out — also a same-length change", () => {
+      // Non-string specifically: `sanitize` deliberately passes an unknown STRING tier through, on
+      // the stated grounds that a mark whose only consumer is a `data-` attribute must not be the
+      // one place that hard-rejects a newly added severity. Only a wrong TYPE is coerced.
+      const [out] = persistableThread([
+        marked([{ check: "hedge-words", severity: 7, detail: "d" }]),
+      ]);
+      expect((out as { lint?: { severity: string }[] }).lint![0]!.severity).toBe("warn");
+    });
+
+    // roborev 57898: `check` was type-checked but never bounded, so a hand-edited localStorage
+    // payload with a multi-megabyte check id survived every round trip — rehydrate re-validated it
+    // and persistableThread wrote it straight back. The element-wise comparison made it subtler
+    // still: the long value compared EQUAL to its unnormalized self, so the write path concluded
+    // "nothing needed changing" for a payload nothing had bounded.
+    it("clips an over-long CHECK id on the way out too", () => {
+      const [out] = persistableThread([
+        marked([{ check: "c".repeat(9000), severity: "warn", detail: "d" }]),
+      ]);
+      expect((out as { lint?: { check: string }[] }).lint![0]!.check).toHaveLength(
+        LINT_CHECK_MAX_LEN,
+      );
+    });
+
+    it("clips an over-long CHECK id on the way back in", () => {
+      const restored = rehydrateThread([
+        marked([{ check: "c".repeat(9000), severity: "warn", detail: "d" }]),
+      ]);
+      expect((restored[0] as { lint?: { check: string }[] }).lint![0]!.check).toHaveLength(
+        LINT_CHECK_MAX_LEN,
+      );
+    });
+
+    it("still preserves identity when nothing needed changing — the positive control", () => {
+      // Without this, the two rows above would pass against a `boundLintMarks` that simply rebuilt
+      // every message, which is the re-render cost the identity shortcut exists to avoid.
+      const msg = marked([{ check: "hedge-words", severity: "warn", detail: "short" }]);
+      expect(persistableThread([msg])[0]).toBe(msg);
+    });
+
+    it("throws away a hand-edited localStorage payload that is not marks at all", () => {
+      // The restore path takes untrusted input: this JSON was written by whatever build ran last and
+      // is editable by hand. A junk `lint` must not reach the renderer.
+      expect(rehydrateThread([marked("not-an-array")])[0]).toMatchObject({ lint: undefined });
+      expect(rehydrateThread([marked([null, 7, "x"])])[0]).toMatchObject({ lint: undefined });
+      // …while a forged over-long detail is clipped rather than the whole record discarded.
+      const forged = rehydrateThread([marked([{ check: "hedge-words", severity: "warn", detail: "z".repeat(9000) }])]);
+      expect((forged[0] as { lint?: { detail: string }[] }).lint![0]!.detail).toHaveLength(LINT_DETAIL_MAX_LEN);
     });
   });
 });

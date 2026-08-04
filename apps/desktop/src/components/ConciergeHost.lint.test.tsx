@@ -114,6 +114,8 @@ vi.mock("../stores/sparklePrefsStore", () => ({
 }));
 
 import { ConciergeHost } from "./ConciergeHost";
+import { LINT_MARK_TESTID } from "./Concierge/LintMark";
+import { useConciergeThreadStore } from "../stores/conciergeThreadStore";
 import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
 import type { ConciergeFeed } from "../useConciergeFeed";
 import type { StatusBand } from "../engine/buildSections";
@@ -148,6 +150,10 @@ function feed(): ConciergeFeed {
 }
 
 beforeEach(() => {
+  // The thread is a MODULE-LEVEL persisted store, so it outlives `cleanup()` — a row that asserts
+  // the ABSENCE of something (no lint mark on a clean turn) would otherwise be reading the previous
+  // row's marked reply and passing or failing for a reason that has nothing to do with it.
+  useConciergeThreadStore.setState({ chat: [] });
   enableAiEnhancementsForTests();
   h.runReplyLint.mockImplementation((input) => ({
     text: input.text,
@@ -360,6 +366,73 @@ describe("the concierge reply linter is mounted", () => {
     const second = h.runReplyLint.mock.calls.at(-1)![0];
     expect(second.text).toBe("Second answer.");
     expect(second.prevReply).toBe("First answer.");
+  });
+
+  // ══ THE FINDINGS REACH THE HUMAN, NOT JUST A COUNTER (bead sparkle-kr2jz) ══════════════════════
+  // `runReplyLint` has always returned `violations`; this handler read only `.text` and dropped
+  // them, so every finding landed in an in-memory counter nothing renders and a JSONL only a CLI
+  // reads. The rows above prove the linter RUNS. These prove its output is SEEN — which is a
+  // different claim, and the one that was false.
+  //
+  // Asserted on the rendered thread rather than on a call, because "runReplyLint was called" was
+  // already true while the founder could see nothing: that assertion is the vacuous shape AGENTS.md
+  // names as this repo's #1 finding.
+  const PROMISE = "Say go and I'll spawn the worker.";
+  const flagged = (checks: string[]) => ({
+    text: PROMISE,
+    violations: checks.map((check) => ({ check, severity: "warn", detail: "offered to act", span: 12, action: "warned" })),
+    blocked: false,
+  });
+
+  it("shows a MARK on the reply whose turn produced a violation", async () => {
+    h.runReplyLint.mockImplementation(() => flagged(["ask-without-action"]) as never);
+    await turn({ id: "1", sessionId: "s", text: PROMISE, toolCalls: [] });
+    const el = screen.getByTestId(LINT_MARK_TESTID);
+    // The founder's own complaint read back, not the check id — the whole point of the surface.
+    expect(el.textContent).toContain("Said it would do it");
+    expect(el.textContent).not.toContain("ask-without-action");
+    // And the reply itself is untouched: the mark never blocks, hides or rewrites (bead constraint).
+    expect(threadText()).toContain(PROMISE);
+  });
+
+  it("shows NO mark when the turn was clean — the positive control", async () => {
+    // The default mock returns no violations. Without this row the one above passes against a host
+    // that marks every reply, which would make the affordance worthless.
+    await turn({ id: "1", sessionId: "s", text: "Spawned the worker.", toolCalls: [] });
+    expect(screen.queryByTestId(LINT_MARK_TESTID)).toBeNull();
+  });
+
+  it("collapses a turn's several findings into ONE mark carrying the count", async () => {
+    h.runReplyLint.mockImplementation(() => flagged(["ask-without-action", "hedge-words", "naked-file-ref"]) as never);
+    await turn({ id: "1", sessionId: "s", text: PROMISE, toolCalls: [] });
+    expect(screen.getAllByTestId(LINT_MARK_TESTID)).toHaveLength(1);
+    expect(screen.getByTestId(LINT_MARK_TESTID).getAttribute("data-count")).toBe("3");
+  });
+
+  it("carries METADATA ONLY onto the message — never the reply text or a matched span", async () => {
+    // The rule `services/conciergeLint/types.ts` states for the violation log, enforced at the seam
+    // that writes to localStorage. A mark that spread the violation through would carry whatever a
+    // future check adds to it — including matched text — straight to disk.
+    h.runReplyLint.mockImplementation(() => flagged(["ask-without-action"]) as never);
+    await turn({ id: "1", sessionId: "s", text: PROMISE, toolCalls: [] });
+    const reply = useConciergeThreadStore
+      .getState()
+      .chat.find((m): m is Extract<typeof m, { kind: "sparkle" }> => m.kind === "sparkle" && !!m.lint);
+    expect(reply!.lint).toEqual([
+      { check: "ask-without-action", severity: "warn", detail: "offered to act" },
+    ]);
+  });
+
+  it("does not let a straggling delta erase a mark the done handler just wrote", async () => {
+    // The delta path calls the same upsert and passes no marks. If that were `lint: undefined`
+    // rather than an omitted key, one late token would silently wipe the finding off the bubble.
+    h.runReplyLint.mockImplementation(() => flagged(["ask-without-action"]) as never);
+    await turn({ id: "1", sessionId: "s", text: PROMISE, toolCalls: [] });
+    await act(async () => {
+      h.brain.delta?.({ id: "1", text: " (and a late token)" });
+    });
+    await flush();
+    expect(screen.getByTestId(LINT_MARK_TESTID)).toBeTruthy();
   });
 
   it("renders the reply unlinted rather than losing it when the linter returns nothing usable", async () => {

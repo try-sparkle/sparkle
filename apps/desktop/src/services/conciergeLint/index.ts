@@ -35,6 +35,7 @@ import { askWithoutActionCheck } from "./checks/askWithoutAction";
 import { hedgeWordsCheck } from "./checks/hedgeWords";
 import { nakedFileRefCheck } from "./checks/nakedFileRef";
 import { restatedStateCheck } from "./checks/restatedState";
+import { unbackedClaimCheck } from "./checks/unbackedClaim";
 
 export type {
   Check,
@@ -67,6 +68,9 @@ export const CHECKS: Check[] = [
   // First because it is the only one here that BLOCKS: when a reply both offers to act and hedges,
   // the offer is the finding worth surfacing — the hedge is a symptom of the same passivity.
   askWithoutActionCheck,
+  // Second because it is the other half of the same pair: `ask-without-action` catches the reply
+  // that took no action and said so, this catches the reply that took no action and said it did.
+  unbackedClaimCheck,
   hedgeWordsCheck,
   nakedFileRefCheck,
   restatedStateCheck,

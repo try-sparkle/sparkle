@@ -44,11 +44,14 @@ afterEach(() => {
 });
 
 describe("lintReply — the registry", () => {
-  it("ships exactly the four checks, with the blocking one first", () => {
+  it("ships exactly the built-in checks, with the blocking one first", () => {
     // `ask-without-action` leads deliberately: it is the only check here that BLOCKS, and when a
     // reply both offers to act and hedges, the offer is the finding worth surfacing.
+    // `unbacked-claim` sits second because it is the other half of the same pair — took no action
+    // and said so, versus took no action and said it did.
     expect(CHECKS.map((c) => c.id)).toEqual([
       "ask-without-action",
+      "unbacked-claim",
       "hedge-words",
       "naked-file-ref",
       "restated-state",

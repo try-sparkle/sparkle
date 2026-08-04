@@ -31,6 +31,10 @@ import type { ConciergeMention, MentionAgent } from "./mentions";
 // what an anchor is (./replyAnchors — no React, no stores), so the reply that records one and the
 // stub that draws it cannot drift about what one is.
 import type { ReplyAnchor } from "./replyAnchors";
+// Same rule again: the shape lives with the pure module that owns the WORDING rule (./lintMarks —
+// no React, no stores), so the host that records a finding and the line that draws it cannot drift
+// about what a finding is.
+import type { MessageLintMark } from "./lintMarks";
 // The rail's view-model lives with the component that RENDERS it, for the same reason `Attachment`
 // lives with the composer's model and the mention shapes live with ./mentions: one declaration, so
 // the host that builds a rail state and the strip that draws it cannot drift about what one is.
@@ -58,6 +62,7 @@ export interface ProjectNeedsYou {
 
 export type { ConciergeMention, MentionAgent };
 export type { ReplyAnchor };
+export type { MessageLintMark };
 export type { SendTrayModel };
 export type { MountedNoticeModel };
 
@@ -205,6 +210,37 @@ export interface ConciergeSparkleMessage {
    * restart is still streaming.
    */
   settled?: true;
+  /**
+   * WHAT THE REPLY LINTER CAUGHT IN THIS TURN (bead sparkle-kr2jz, part A).
+   *
+   * `services/conciergeLint/` runs on every `concierge:done` and its findings used to go two places
+   * the app cannot show anyone: an in-memory counter nothing reads, and a JSONL only a CLI script
+   * reads. So `ask-without-action` — "say go and I'll spawn it" instead of spawning it, the founder's
+   * single most-repeated complaint, 35 of 45 first-person promises never carried out across 1,490
+   * measured turns — fired correctly and invisibly. This field is what makes it visible: the turn's
+   * violations ride on the bubble they were found in, and ./LintMark draws one quiet line from them.
+   *
+   * METADATA ONLY, and the type enforces it: {@link MessageLintMark} is a narrowing of the linter's
+   * `Violation` that drops `span` (a character COUNT, never the matched text) and carries only the
+   * check id, the severity, and the check's own short reason. Reply text and matched spans must
+   * never land here — see `services/conciergeLint/types.ts`'s `Violation` doc comment, and
+   * `services/conciergeAudit.ts`'s standing decision against putting concierge prose on disk. This
+   * field IS written to disk (below), which is what makes that rule load-bearing rather than tidy.
+   *
+   * IT SURVIVES A RESTART, unlike {@link ConciergeFailureMessage} — the deliberate counter-example,
+   * kept off `PERSISTED_KINDS` because "you've hit your session limit · resets 8:40am" restored
+   * tomorrow morning is a claim about NOW that has expired. A lint mark is not that kind of claim.
+   * It is a closed observation about a turn that is over: "this reply said it would act and no
+   * action ran in it" was true when it was recorded and cannot become false later, and the reply
+   * text it annotates is persisted verbatim right beside it. Dropping it on restart would also undo
+   * the point — the founder's complaint is a PATTERN across turns, and a mark that evaporates
+   * nightly rebuilds exactly the invisibility this field exists to end.
+   *
+   * Bounded and re-validated at both persistence boundaries rather than trusted: see
+   * `stores/conciergeThreadStore`'s `persistableThread` and `rehydrateThread`, and `MAX_LINT_MARKS`
+   * in ./lintMarks. `undefined` on a clean reply, matching every other optional field here.
+   */
+  lint?: MessageLintMark[];
 }
 
 /** A thin centered divider line ("All projects calm · nothing needs you"). */

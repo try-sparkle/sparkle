@@ -49,6 +49,12 @@ import { dispatchConciergeTool, type ConciergeToolReply } from "./conciergeTools
 import { noteConciergeToolCall, useConciergeActivityStore } from "./conciergeActivity";
 import { conciergeActivityLine } from "../engine/conciergeActivityLine";
 import { noteConciergeAuditCall } from "./conciergeAudit";
+// The DURABLE half of "here is what I actually did" (bead sparkle-kr2jz). The thinking indicator
+// renders one line and erases it when the turn ends, so the moment a reply lands "I sent it" and "I
+// imagined sending it" look identical. A receipt outlives the turn; the classifier decides which
+// calls earn one.
+import { settleConciergeReceipt } from "./conciergeReceiptSettle";
+import { CONCIERGE_RECEIPT_APP_OPS } from "./conciergeReceiptClassifier";
 import { conciergeToolConfigPath } from "./conciergeTools/policy";
 import { appOpPolicy, configuredToolPolicy } from "./conciergeTools/policyBinding";
 import { APP_TOOL_NAMES, type AppToolName } from "./conciergeTools/policy";
@@ -1745,6 +1751,21 @@ async function handleConciergeTool(req: ControlRequest): Promise<ConciergeToolRe
   } finally {
     settleActivity(ok, okData);
     settleAudit(auditReply);
+    // `okData` for the same reason the indicator takes it: a SPAWN's subject does not exist until
+    // the call returns, so its agent id is in the reply and nowhere else. `auditReply.message` is
+    // the refusal in the tool's own words — already human-fit at the registry — and is undefined on
+    // success, which is exactly when a receipt must not carry a reason.
+    // `auditReply.code` is what distinguishes a REFUSAL from a DEFERRAL — see the guard at the top
+    // of the settler (roborev 57852). Without it, an ask-tier call records a permanent "refused".
+    settleConciergeReceipt(
+      domain,
+      op,
+      req.payload.args,
+      ok,
+      okData,
+      auditReply.message,
+      auditReply.code,
+    );
   }
 }
 
@@ -1898,6 +1919,37 @@ async function dispatch(req: ControlRequest): Promise<void> {
         break;
       default:
         result = { error: `unknown op ${req.op}` };
+    }
+    // A RECEIPT FOR THE ONE ACTION THAT DOES NOT TRAVEL THROUGH `concierge_tool`.
+    //
+    // `set_agent_goal` is a top-level control op, not a registry tool, so `handleConciergeTool`'s
+    // settler never sees it — and it is the op behind one of the founder's recorded frustration
+    // turns verbatim: *"I don't see the goal … so I don't think I believe you."* Without this the
+    // `goal` arm of the vocabulary would have no producer at all.
+    //
+    // GATED ON THE RESERVED CONCIERGE ID, which is what keeps it honest. This op is free-tier and
+    // every agent sets its OWN goal through it constantly; those are not the concierge acting on the
+    // human's behalf and have no business in the human's concierge thread. The id is not a claim —
+    // Rust mints it from WHICH SOCKET the request arrived on (`bridge.rs resolve_control_caller`) —
+    // so this is the same proof-of-origin check `handleConciergeTool` opens with.
+    //
+    // `targetAgentId` is folded in as `agentId` so the classifier reads one spelling: `resolveTargetId`
+    // is where "which agent" is actually decided, and re-deriving it from the raw payload downstream
+    // would be a second answer to a question this file already answers.
+    //
+    // KNOWN GAP, stated rather than hidden: a policy `deny`/`ask` refusal returns above this line, so
+    // those get no receipt. That is the one case where the human is not left guessing — an ask-tier
+    // refusal puts an approval request in their column, which is a louder surface than a receipt.
+    if (req.callerAgentId === CONCIERGE_CALLER_AGENT_ID && CONCIERGE_RECEIPT_APP_OPS.includes(req.op)) {
+      const r = (result ?? {}) as Record<string, unknown>;
+      settleConciergeReceipt(
+        "app",
+        req.op,
+        { ...req.payload, agentId: resolveTargetId(req) },
+        isControlOpSuccess(result),
+        result,
+        typeof r.error === "string" ? r.error : undefined,
+      );
     }
     reportControlOpSuccess(req, result);
     await respond(req.reqId, result);

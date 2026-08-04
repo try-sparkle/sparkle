@@ -21,6 +21,10 @@ import { countLines, type Attachment } from "../components/composer/attachments"
 // The anchor-id rewrite lives with the module that owns what an anchor IS, for the same reason
 // `countLines` is imported rather than re-derived: the rule and its persistence must not drift.
 import { remapAnchors } from "../components/Concierge/replyAnchors";
+// Same rule as `remapAnchors` and `countLines`: the RULE for what a lint mark is — and what bounds
+// it — lives with the pure module that owns the wording, imported rather than re-derived so the
+// live path and the persisted copy cannot disagree about it.
+import { normalizeLintMarks } from "../components/Concierge/lintMarks";
 
 // Keep the thread bounded so localStorage can't grow without limit, exactly as
 // promptHistoryStore.PROMPT_HISTORY_MAX does. 200 messages is far more than anyone scrolls back
@@ -85,6 +89,56 @@ function stripDataUrls(m: Conversation): Conversation {
     ...m,
     attachments: m.attachments.map(withoutPreview),
   };
+}
+
+/**
+ * Bound a reply's LINT MARKS on the way to disk — the fourth size axis, and the newest.
+ *
+ * ══ THE PERSISTENCE DECISION, STATED ONCE ═══════════════════════════════════════════════════════
+ * A lint mark SURVIVES a restart. That is a deliberate call, and the opposite of the one
+ * `ConciergeFailureMessage` gets — that kind is kept off {@link PERSISTED_KINDS} entirely because
+ * "You've hit your session limit · resets 8:40am" is a claim about NOW, and restoring it tomorrow
+ * morning would have the app assert something stale on its own initiative.
+ *
+ * A mark is not that kind of claim. It is a closed observation about a turn that has ended — "this
+ * reply offered to act and no action ran in it" was true when it was recorded, and no later event
+ * can make it false. The reply it annotates is persisted verbatim beside it, so the mark and its
+ * subject age together or not at all. And the thing the founder is actually trying to see is a
+ * PATTERN across turns (35 of 45 promises unkept over 1,490 turns); a mark that evaporated on every
+ * relaunch would rebuild the invisibility the field exists to end.
+ *
+ * ══ SO IT IS BOUNDED, LIKE EVERY OTHER PERSISTED PAYLOAD ════════════════════════════════════════
+ * `hedge-words` reports one violation PER HEDGING WORD, so a waffly reply can carry dozens, and the
+ * rendered line collapses to one sentence plus a count regardless. Unbounded, that is the same
+ * failure {@link CONCIERGE_MSG_MAX_LEN} and {@link stripDataUrls} exist to prevent, reaching through
+ * a field the text cap cannot see: the persist write throws, zustand silently stops persisting the
+ * WHOLE store, and the symptom shows up long after the reply that caused it.
+ *
+ * `normalizeLintMarks` is the same function {@link rehydrateThread} runs on the way back IN, so the
+ * written copy and the restored copy are bounded by one rule rather than two that can drift.
+ */
+function boundLintMarks(m: Conversation): Conversation {
+  if (m.kind !== "sparkle" || !m.lint?.length) return m;
+  const lint = normalizeLintMarks(m.lint);
+  // Identity preserved when nothing changed — the common case — for the reason `boundLiveThumbnails`
+  // states: bubbles are memoised on identity, and rebuilding an untouched message re-renders it.
+  //
+  // COMPARED BY CONTENT, NOT BY LENGTH (roborev 57878/57851, Medium). `normalizeLintMarks` clips
+  // `detail`, clips `check` and coerces a non-string `severity` — none of which change the array's
+  // LENGTH. (An unrecognized STRING severity is deliberately passed through; see `sanitize`.) So a length-only shortcut computed the normalized copy and then threw it away, persisting
+  // the ORIGINAL: the write-side bound was a no-op for every normalization except the count cap, which
+  // contradicts this function's own reason for existing (one rule for the written and restored copies
+  // rather than two that can drift) and left the restore path as the only real boundary.
+  const unchanged =
+    !!lint &&
+    lint.length === m.lint.length &&
+    lint.every((x, i) => {
+      const before = m.lint![i]!;
+      return (
+        x.check === before.check && x.detail === before.detail && x.severity === before.severity
+      );
+    });
+  return unchanged ? m : { ...m, lint };
 }
 
 /** Strip one attachment's preview, keeping the record that names it. Shared by the persistence cap
@@ -263,7 +317,7 @@ export function boundCollapsedPayloads(chat: ConciergeMessage[]): ConciergeMessa
  * this is a transcript, and reversing it would render the conversation backwards.)
  */
 export function persistableThread(chat: ConciergeMessage[]): ConciergeMessage[] {
-  const conversation = chat.filter(isConversation).map(clip).map(stripDataUrls);
+  const conversation = chat.filter(isConversation).map(clip).map(stripDataUrls).map(boundLintMarks);
   // Trim from the FRONT: drop the oldest turns, keep the tail the user is actually looking at.
   const kept =
     conversation.length > CONCIERGE_THREAD_MAX
@@ -327,8 +381,21 @@ export function rehydrateThread(chat: ConciergeMessage[]): ConciergeMessage[] {
     // two directions of the error are not symmetric: erring this way makes a new reply claim FEWER
     // of last session's messages, while the other way would have it claim a stranger's conversation.
     // Under-claiming is the honest side of a fact the persisted thread cannot answer.
+    // LINT MARKS ARE RE-VALIDATED, NOT MERELY LET THROUGH. They survive a restart on purpose (see
+    // {@link boundLintMarks} for the decision and why it differs from `ConciergeFailureMessage`'s),
+    // and "survives" is the easy half: every rebuild in this module is a spread, so the field would
+    // have come back whether or not anyone had thought about it. What it needs is the deliberate
+    // half. This payload came off localStorage — written by whatever build ran last, and
+    // hand-editable — so a malformed or oversized `lint` array must not reach the renderer. Same
+    // posture this function already takes for ids and anchors, and the same function the write side
+    // runs, so the two boundaries cannot drift.
     if (next.kind === "sparkle")
-      return { ...next, settled: true, answers: remapAnchors(next.answers, idMap) };
+      return {
+        ...next,
+        settled: true,
+        answers: remapAnchors(next.answers, idMap),
+        lint: normalizeLintMarks(next.lint),
+      };
     return next.kind === "you" && next.receipt?.redirectable
       ? { ...next, receipt: { ...next.receipt, redirectable: false } }
       : next;

@@ -91,10 +91,37 @@ vi.mock("./mergeGuard/prClaims", async (importOriginal) => {
   };
 });
 
-vi.mock("./conciergeTools/registry", () => ({
-  dispatchConciergeTool: (...a: unknown[]) =>
-    dispatchConciergeToolMock(...(a as [ToolCallOnTheWire, { policy?: unknown }?])),
-}));
+// Only `dispatchConciergeTool` is replaced. The rest of the module passes through, and that is not
+// tidiness: the receipt classifier asks the registry's OWN `conciergeOpWrites` whether an op changes
+// the world, and a factory that returned dispatch alone left that import `undefined` — every receipt
+// then died inside the seam's guard, and three of the cases below "passed" by asserting a silence
+// that had nothing to do with the rule they were about.
+vi.mock("./conciergeTools/registry", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./conciergeTools/registry")>();
+  return {
+    ...actual,
+    dispatchConciergeTool: (...a: unknown[]) =>
+      dispatchConciergeToolMock(...(a as [ToolCallOnTheWire, { policy?: unknown }?])),
+  };
+});
+
+// The receipt CLASSIFIER, wrapped rather than replaced. It delegates to the real implementation by
+// default — the receipt cases below assert what actually reaches a subscriber, and a hand-written
+// stub would let the real classifier rot while they stayed green. The wrapper exists for one case:
+// making it THROW, to prove a classifier bug cannot fail the tool call it is a record of.
+// `vi.hoisted`, not a plain `const`: this factory reaches the spy in its BODY (to install the real
+// implementation as the default), and the factory runs while `controlListener` is being imported —
+// which is before an ordinary module-level const has initialised. The other mocks in this file only
+// touch their spies inside an arrow, so they get away with it; this one would be a TDZ error.
+const { classifyReceiptMock } = vi.hoisted(() => ({ classifyReceiptMock: vi.fn() }));
+vi.mock("./conciergeReceiptClassifier", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./conciergeReceiptClassifier")>();
+  classifyReceiptMock.mockImplementation(actual.classifyConciergeActionReceipt);
+  return {
+    ...actual,
+    classifyConciergeActionReceipt: (...a: unknown[]) => classifyReceiptMock(...a),
+  };
+});
 
 import { configuredToolPolicy } from "./conciergeTools/policyBinding";
 import { useSettingsStore } from "../stores/settingsStore";
@@ -117,6 +144,14 @@ import {
   useConciergeActivityStore,
 } from "./conciergeActivity";
 import { useConciergeAudit, _resetConciergeAuditForTests } from "./conciergeAudit";
+// The DURABLE record of what the concierge did (bead sparkle-kr2jz). Asserted here because this
+// file owns the one seam that publishes it — the store and the classifier both keep working
+// perfectly if the wiring is deleted, and nothing else would notice.
+import {
+  onConciergeActionReceipt,
+  _resetConciergeReceiptsForTests,
+  type ConciergeActionReceipt,
+} from "./conciergeReceipts";
 import type { ConciergeToolReply } from "./conciergeTools/registry";
 
 
@@ -3504,6 +3539,215 @@ describe("controlListener", () => {
       fire({ reqId: "t6", op: "rename_agent", callerAgentId: callerId, payload: { name: "Still Fine" } });
       await flush();
       expect(lastReply()).toEqual({ ok: true });
+    });
+
+    // ── ACTION RECEIPTS (bead sparkle-kr2jz) ─────────────────────────────────────────────────────
+    //
+    // The third settler at this seam, beside the thinking indicator and the audit log. What it adds
+    // is DURABILITY: the indicator renders one line and erases it when the turn ends, so the moment
+    // a reply lands "I sent it" and "I imagined sending it" look identical.
+    //
+    // Asserted on what reaches a SUBSCRIBER, never on "the classifier was called". A test of the
+    // latter would pass against a seam whose `recordConciergeActionReceipt` line had been deleted —
+    // which is exactly the silent failure mode, since the classifier and the store both keep working.
+    describe("action receipts", () => {
+      let received: ConciergeActionReceipt[];
+      let unsubscribe: (() => void) | undefined;
+
+      beforeEach(() => {
+        received = [];
+        unsubscribe = onConciergeActionReceipt((r) => received.push(r));
+      });
+      afterEach(() => {
+        unsubscribe?.();
+        unsubscribe = undefined;
+        // Module-level listener set: a case that threw before its unsubscribe would otherwise leak
+        // a subscriber pushing into a dead array for the rest of the file.
+        _resetConciergeReceiptsForTests();
+        classifyReceiptMock.mockClear();
+      });
+
+      it("publishes exactly one receipt for a spawn, carrying the id from the REPLY", async () => {
+        dispatchConciergeToolMock.mockImplementationOnce(async () => ({
+          ok: true,
+          domain: "lifecycle",
+          op: "spawn_build_agent",
+          data: { agentId: "agent-new", projectId: "p1", provisionalName: "Kraken Auth" },
+        }));
+        fire({
+          reqId: "r1",
+          op: "concierge_tool",
+          callerAgentId: CONCIERGE_CALLER_AGENT_ID,
+          payload: {
+            domain: "lifecycle",
+            op: "spawn_build_agent",
+            args: { projectId: "p1", prompt: "go" },
+            toolCallId: "tc-r1",
+          },
+        });
+        await flush();
+
+        // EXACTLY ONE. A second settler (or a settle that also ran on the way in) would double every
+        // line in the human's thread.
+        expect(received).toHaveLength(1);
+        expect(received[0]).toMatchObject({
+          kind: "spawned",
+          ok: true,
+          // From the reply's `data` — the args carry only the project. This is the wiring that
+          // silently regresses: `settleConciergeReceipt(…, okData, …)` losing `okData` leaves the
+          // receipt correct in every other respect and un-clickable.
+          agentId: "agent-new",
+          agentName: "Kraken Auth",
+          op: "lifecycle.spawn_build_agent",
+        });
+        expect(received[0]!.id).toBeTruthy();
+        expect(received[0]!.at).toBeGreaterThan(0);
+      });
+
+      // THE REPLY'S OWN `ok` DECIDES, and dispatch is total — a denial is an ordinary resolved
+      // reply. Assuming success here is what reported a refused merge as "Merged PR #753".
+      //
+      // Uses a GENUINE refusal code. This row was written with `needs-approval` and asserted a
+      // recorded refusal — which is the defect roborev 57852 found, pinned as if it were the
+      // contract: `needs-approval` is a DEFERRAL, and the row below now asserts it records nothing.
+      it("publishes a REFUSED call as a receipt with ok:false and the tool's reason", async () => {
+        dispatchConciergeToolMock.mockImplementationOnce(async () => ({
+          ok: false,
+          domain: "workflow",
+          op: "merge_pr",
+          code: "conflict",
+          message: "the branch has conflicts.",
+        }));
+        fire({
+          reqId: "r2",
+          op: "concierge_tool",
+          callerAgentId: CONCIERGE_CALLER_AGENT_ID,
+          payload: {
+            domain: "workflow",
+            op: "merge_pr",
+            args: { projectId: "p1", number: 753 },
+            toolCallId: "tc-r2",
+          },
+        });
+        await flush();
+
+        expect(received).toHaveLength(1);
+        expect(received[0]).toMatchObject({
+          kind: "merged",
+          ok: false,
+          prNumber: 753,
+          reason: "the branch has conflicts.",
+        });
+      });
+
+      // ══ A DEFERRAL IS NOT A REFUSAL (roborev 57852, High) ══════════════════════════════════
+      // `merge_pr` is `mutates-main`, whose default decision is `ask`, so this was the flagship
+      // path: the first dispatch recorded a permanent "refused", the human then approved it, the
+      // approval RAN the call through `resumeApprovedCall` (which bypasses this seam), and no
+      // success receipt was ever minted. The PR merged and the durable record said it was refused.
+      it("publishes NOTHING for an ask-tier call awaiting approval — it has not been refused", async () => {
+        dispatchConciergeToolMock.mockImplementationOnce(async () => ({
+          ok: false,
+          domain: "workflow",
+          op: "merge_pr",
+          code: "needs-approval",
+          message: "merge_pr needs your go-ahead.",
+        }));
+        fire({
+          reqId: "r2b",
+          op: "concierge_tool",
+          callerAgentId: CONCIERGE_CALLER_AGENT_ID,
+          payload: {
+            domain: "workflow",
+            op: "merge_pr",
+            args: { projectId: "p1", number: 753 },
+            toolCallId: "tc-r2b",
+          },
+        });
+        await flush();
+
+        expect(received).toHaveLength(0);
+      });
+
+      // A read is not an action. The concierge reads constantly; one receipt per read would bury the
+      // lines that matter.
+      it("publishes nothing for a read-only op", async () => {
+        fire({
+          reqId: "r3",
+          op: "concierge_tool",
+          callerAgentId: CONCIERGE_CALLER_AGENT_ID,
+          payload: toolPayload, // workspace.list_projects
+        });
+        await flush();
+        expect(lastReply()).toMatchObject({ ok: true });
+        expect(received).toHaveLength(0);
+      });
+
+      // FIRE-AND-FORGET. A receipt records something that ALREADY HAPPENED, so nothing about minting
+      // it may reach back into the reply the concierge is waiting on — the classifier is new code
+      // reading untrusted reply shapes on the return path of a call that already succeeded.
+      it("does not fail the tool call when the classifier throws", async () => {
+        classifyReceiptMock.mockImplementationOnce(() => {
+          throw new Error("classifier bug");
+        });
+        fire({
+          reqId: "r4",
+          op: "concierge_tool",
+          callerAgentId: CONCIERGE_CALLER_AGENT_ID,
+          payload: {
+            domain: "lifecycle",
+            op: "close_agent",
+            args: { agentId: otherId },
+            toolCallId: "tc-r4",
+          },
+        });
+        await flush();
+
+        // The reply is the registry's, verbatim and successful — the throw never surfaced.
+        expect(lastReply()).toMatchObject({ ok: true });
+        expect(received).toHaveLength(0);
+        // …and the seam's OTHER settlers still ran, which is what proves the guard is scoped to the
+        // receipt rather than swallowing the whole `finally`.
+        expect(useConciergeAudit.getState().entries).toHaveLength(1);
+      });
+
+      // `set_agent_goal` is a TOP-LEVEL control op, not a registry tool, so it never passes through
+      // `handleConciergeTool` — and it is the op behind "I don't see the goal … so I don't think I
+      // believe you." Without its own settle the `goal` arm would have no producer at all.
+      it("publishes a receipt for the concierge's set_agent_goal", async () => {
+        fire({
+          reqId: "r5",
+          op: "set_agent_goal",
+          callerAgentId: CONCIERGE_CALLER_AGENT_ID,
+          payload: { targetAgentId: callerId, goal: "PR #900 is merged into main" },
+        });
+        await flush();
+
+        expect(lastReply()).toMatchObject({ ok: true });
+        expect(received).toHaveLength(1);
+        expect(received[0]).toMatchObject({
+          kind: "goal",
+          ok: true,
+          agentId: callerId,
+          op: "app.set_agent_goal",
+        });
+      });
+
+      // THE CONTROL for the case above, and the reason it is gated on the reserved id: this op is
+      // free-tier and every agent sets its OWN goal through it constantly. Those are not the
+      // concierge acting on the human's behalf and have no business in the human's thread.
+      it("publishes NOTHING when an ordinary agent sets its own goal", async () => {
+        fire({
+          reqId: "r6",
+          op: "set_agent_goal",
+          callerAgentId: callerId,
+          payload: { goal: "PR #900 is merged into main" },
+        });
+        await flush();
+
+        expect(lastReply()).toMatchObject({ ok: true });
+        expect(received).toHaveLength(0);
+      });
     });
   });
 });

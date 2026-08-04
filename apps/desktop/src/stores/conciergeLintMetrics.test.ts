@@ -115,6 +115,12 @@ describe("useConciergeLintMetrics — session-scoped increments", () => {
         // check never fires". `conciergeLintRegistry.test.ts` now derives this requirement from the
         // linter's own registry, so a future check cannot go uncounted the same way.
         "ask-without-action",
+        // The other half of that pair: `ask-without-action` catches a reply that OFFERS instead of
+        // acting, `unbacked-claim` catches one that says it ALREADY acted when the turn made no
+        // such call. Added here in the same change that added it to `LINT_CHECK_IDS` — this list is
+        // hand-maintained, so a check added to the store and not to this row is uncounted exactly
+        // the way the comment above describes.
+        "unbacked-claim",
         "bare-agent-name",
         "bare-pr-number",
         "fat-pill-label",

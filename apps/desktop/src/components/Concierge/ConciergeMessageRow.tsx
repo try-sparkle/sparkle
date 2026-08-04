@@ -27,6 +27,7 @@ import { CopyAnswerButton } from "./CopyAnswerButton";
 import { NudgeCard } from "./NudgeCard";
 import { RecapCard } from "./RecapCard";
 import { RoutingReceipt } from "./RoutingReceipt";
+import { LintMark } from "./LintMark";
 import { AttachmentStrip } from "../composer/AttachmentStrip";
 import { TextPill } from "../composer/TextPill";
 import { splitMentionText, type ConciergeMention } from "./mentions";
@@ -425,6 +426,10 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
         {/* A push is still an ANSWER — the same words, arrived unasked — so it gets the same copy
             affordance. Copying its markdown source, like the branch below. */}
         <CopyAnswerButton text={m.text} onCopied={onAnswerCopied} />
+        {/* …and it is linted like one: a push streams over the same events and reaches the same
+            `concierge:done`, so a promise made in an unprompted line is exactly as checkable as one
+            made in a reply. Omitting it here would have left a whole channel unmarked. */}
+        <LintMark marks={m.lint} />
       </div>
     );
   return (
@@ -448,6 +453,12 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
           ConciergeThread.copy.test are what stops this glyph spreading to every card. Copies
           `m.text`, the markdown SOURCE, so a table stays a table on paste (see CopyAnswerButton). */}
       <CopyAnswerButton text={m.text} onCopied={onAnswerCopied} />
+      {/* WHAT THE LINTER CAUGHT IN THIS REPLY (bead sparkle-kr2jz) — one quiet line, or nothing.
+          LAST, under the copy glyph, mirroring the `you` arm's order: the words, then the control
+          that acts on them, then the annotations ABOUT them (there: the routing receipt and the
+          answered marker). It renders unasked, which is the bead's explicit requirement — a finding
+          the founder has to go looking for is the invisible counter this replaces. */}
+      <LintMark marks={m.lint} />
     </div>
   );
 });

@@ -478,6 +478,22 @@ const DEFAULT_CONCIERGE_CHECKS: &[DefaultCheck] = &[
         words: None,
     },
     // ══ IMPLEMENTED AND LIVE ═══════════════════════════════════════════════════════════════════
+    // Said it DID something — sent, spawned, closed, filed, merged, set a goal — while the turn made
+    // no tool call that could have done it. The other half of `ask-without-action`, and the more
+    // expensive half: an unverifiable receipt retires the task in the human's head, so they stop
+    // watching. Deterministic; the reply's claims are reconciled against the turn's own tool calls,
+    // with no model in the path.
+    //
+    // `warn`, and never autofix. The compliant form of a true positive is not a rewrite at all — it
+    // is the tool call that was not made — and the compliant form of a false positive is a sentence
+    // only the model can write.
+    DefaultCheck {
+        id: "unbacked-claim",
+        severity: "warn",
+        autofix: false,
+        threshold: None,
+        words: None,
+    },
     DefaultCheck {
         id: "hedge-words",
         severity: "warn",
@@ -3343,6 +3359,16 @@ severity  = "off"
 autofix   = false
 
 # --- Implemented and live ---------------------------------------------------------------
+# Said it DID something — "I sent that to it", "I spawned an agent", "I closed it", "I filed
+# the bead", "I merged it" — while the turn made no tool call that could have done it. The
+# reply's claims are reconciled against the turn's own tool calls; no model is involved.
+# A FUTURE tense ("I'll send it") is a promise about a later turn and is never flagged here,
+# and neither is an offer ("I'm sending it if you confirm"), a phrase inside a noun phrase
+# ("the agent I spawned"), or a sentence scoped to an earlier turn ("I closed one today").
+[concierge.checks.unbacked-claim]
+enabled   = true
+severity  = "warn"
+autofix   = false
 [concierge.checks.hedge-words]
 enabled   = true
 severity  = "warn"
@@ -6217,6 +6243,7 @@ quit_app = 42
         ("naked-file-ref", "warn", false, None, None),
         ("relay-paste", "off", false, Some(240), None),
         ("restated-state", "warn", false, Some(200), None),
+        ("unbacked-claim", "warn", false, None, None),
         ("unreported-refusal", "off", false, None, None),
         ("unresolved-agent-pill", "off", false, None, None),
     ];
@@ -6234,7 +6261,7 @@ quit_app = 42
 
         let ids: Vec<&str> = c.checks.keys().map(String::as_str).collect();
         let expected: Vec<&str> = EXPECTED_CHECKS.iter().map(|e| e.0).collect();
-        assert_eq!(ids, expected, "the ten shipped checks, no more and no fewer");
+        assert_eq!(ids, expected, "the shipped checks, no more and no fewer");
         for (id, severity, autofix, threshold, words) in EXPECTED_CHECKS {
             let got = c.checks.get(*id).unwrap_or_else(|| panic!("no shipped policy for {id}"));
             assert!(got.enabled, "{id} must ship enabled");
