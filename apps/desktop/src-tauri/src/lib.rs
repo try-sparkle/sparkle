@@ -91,6 +91,9 @@ mod trial_remote;
 mod watchdog;
 mod worktree;
 mod notes;
+mod nudge_gate;
+mod nudge_ladder;
+mod nudger;
 mod concierge;
 mod concierge_guidelines;
 mod concierge_lint_log;
@@ -148,6 +151,11 @@ pub fn run() {
         .manage(accounts::AccountsLock::default())
         .manage(trial::TrialLock::default())
         .manage(roster::RosterState::default())
+        // The deterministic nudger's per-session observers and its raised flags. Both are managed
+        // state rather than module statics so `pty.rs` can reach them from a command signature and
+        // so a test can stand one up in isolation.
+        .manage(nudger::Observers::default())
+        .manage(nudger::NudgeFlags::default())
         .manage(frontmost::FrontmostState::default())
         .manage(helper::HelperVitals::default())
         // PR claims live in the Rust process, not a window store, so an agent's "I am landing this
@@ -259,6 +267,12 @@ pub fn run() {
             // is still happening. Started early: the stalls worth catching include startup ones,
             // and nothing here depends on the rest of setup succeeding (see watchdog.rs).
             watchdog::start(app.handle());
+            // The deterministic non-LLM nudger (sparkle-a94sr). Started next to the watchdog and
+            // for the same reason: it is a plain OS thread that must be running before anything
+            // it observes, and it depends on nothing else in setup. It makes NO model call on any
+            // path, which is the whole point — it is what remains when a provider-wide 529 has
+            // taken out every agent, the concierge, and the pusher at once.
+            nudger::start(app.handle());
             // Stand up the local history store (prompts + responses, FTS5) in the app-data dir.
             // A failure here must not stop the app from booting — capture/search just won't work.
             match dev_identity::app_data_dir(app.handle()) {
@@ -531,6 +545,8 @@ pub fn run() {
             pty::pty_kill,
             pty::pty_set_paused,
             pty::pty_ack,
+            nudger::nudger_flags,
+            nudger::nudger_clear_flag,
             memwatch::memory_admission,
             memwatch::agent_memory_watchdog,
             preflight::claude_preflight,

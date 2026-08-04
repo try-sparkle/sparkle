@@ -92,6 +92,22 @@ tauri-plugin-global-shortcut = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
+# Headless VT emulator, so RUST can render a terminal screen (nudger.rs / nudge_gate.rs).
+#
+# WHY A TERMINAL EMULATOR IN THE BACKEND AT ALL. The deterministic nudger (sparkle-a94sr) must
+# decide whether a screen is safe to type into — a picker, a `[sudo] password for …:` prompt and a
+# `vim` buffer are only distinguishable AFTER the escape sequences have been applied, and the raw
+# byte stream is not a picture (in-place redraws, no newlines). Until now the app's only emulator
+# was xterm.js, in the WebView; but the nudger exists precisely to keep working when the WebView is
+# wedged and every model is returning 529, so a guard reachable only through the frontend is not a
+# guard. This parses the same bytes the PTY reader thread already decodes, in-process.
+#
+# `vt100` specifically because it gives the two things the gate needs and little else:
+# `screen().contents()` (the rendered grid, the analogue of xterm's snapshotScreen) and
+# `screen().alternate_screen()` (the DECSET 1049 flag that keeps full-screen apps safe). Pure Rust
+# on top of `vte`, no C dependency, no async runtime. A caret pin, not `=`: there is no cross-crate
+# ABI coupling here, so ordinary semver updates are welcome.
+vt100 = "0.16.2"
 
 # ── Platform-specific dependencies ──────────────────────────────────────────────────────────
 # macOS: native Keychain backend for `keyring`, plus mac-notification-sys for clickable

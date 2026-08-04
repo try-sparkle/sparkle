@@ -666,6 +666,13 @@ pub async fn pty_spawn(
     let read_pause = session.pause.clone();
     let inflight = session.inflight.clone();
     let read_inflight = inflight.clone();
+    // Start observing this session for the deterministic nudger (nudger.rs). The handle is captured
+    // by the reader thread below so the hot path costs no map lookup per read. This is the ONLY
+    // record of PTY output that exists outside the WebView: `PtySession` retains nothing, and
+    // xterm's scrollback dies with the pane — which is precisely why the nudger could not read a
+    // screen before this.
+    let observer = app.state::<crate::nudger::Observers>().attach(&id, cols, rows);
+    let read_observer = observer.clone();
     app.state::<PtyManager>()
         .sessions
         .lock()
@@ -715,6 +722,11 @@ pub async fn pty_spawn(
             if out.is_empty() {
                 return;
             }
+            // Observe BEFORE the flusher handoff, not inside `run_flusher`: the flusher can park on
+            // the credit gate for up to PTY_INFLIGHT_STALL (3s) while the frontend is behind on
+            // acks, so a tail fed there would lag under exactly the load that makes an agent look
+            // stalled. Here it is fed once per read(), on the same schedule as the bytes arriving.
+            read_observer.ingest(&out);
             let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
             guard.text.push_str(&out);
             cvar.notify_one();
@@ -724,6 +736,14 @@ pub async fn pty_spawn(
             // above the high-water mark). Not read()ing lets the kernel PTY buffer fill so the child
             // blocks on its next write — bounding memory end-to-end (). Returns instantly
             // when not paused, so interactive output is unaffected.
+            //
+            // Tell the nudger's observer we are about to park. BOTH gates here sit UPSTREAM of
+            // read(), so while either holds, the observer is fed nothing: its tail stops changing
+            // (which reads as the agent going silent) and its VT grid stops advancing (so the
+            // safety gate would judge a stale screen). A wedged WebView stops acking and latches
+            // exactly these gates, so without this flag the nudger goes blind in the very outage it
+            // exists to survive. See `PtyObserver::reader_parked`.
+            read_observer.set_reader_parked(true);
             read_pause.wait_while_paused();
             // Second gate, same principle but driven by the PRODUCER's own accounting rather than
             // the frontend's: park while the frontend is behind on acks. Without this the flusher's
@@ -731,6 +751,8 @@ pub async fn pty_spawn(
             // this side) instead of bounding it. Gating the READ is what makes the backpressure
             // end-to-end: the kernel PTY buffer fills and the child blocks on its next write().
             read_inflight.acquire(PTY_INFLIGHT_HIGH_WATER_BYTES, PTY_INFLIGHT_STALL);
+            // Both gates cleared: the observer is being fed again, so its screen is live.
+            read_observer.set_reader_parked(false);
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
@@ -795,6 +817,11 @@ pub async fn pty_spawn(
         let _ = flusher.join();
         // Reap the session on natural exit (pty_kill also removes it).
         read_app.state::<PtyManager>().remove(&read_id);
+        // Stop observing too, or a long-lived app accumulates one 4KB tail and one VT grid per
+        // agent that has ever run. The nudger also keys its ladder state off the live observer set,
+        // so a dead session left here would climb rungs forever and eventually escalate a terminal
+        // that no longer exists.
+        read_app.state::<crate::nudger::Observers>().detach(&read_id);
         let _ = read_app.emit("pty:exit", PtyEnd { id: read_id.clone() });
     });
 
@@ -814,11 +841,48 @@ fn acquire_writer(
 
 /// Write to a PTY's stdin — e.g. an approval decision ("y\n" / "n\n") or user input.
 #[tauri::command]
-pub fn pty_write(manager: State<PtyManager>, id: String, data: String) -> Result<(), String> {
+pub fn pty_write(
+    manager: State<PtyManager>,
+    observers: State<crate::nudger::Observers>,
+    id: String,
+    data: String,
+) -> Result<(), String> {
+    // Tell the nudger somebody else is typing here, BEFORE the write rather than after: the stamp
+    // must already be in place while the bytes are in flight, or a nudger tick landing between the
+    // write and the stamp would see a quiet terminal and add its own keystroke.
+    //
+    // This is what closes a hazard that has no analogue on the JS side. Every JS write goes through
+    // `chainPtyOp` (pty.ts), which serializes a bracketed paste and its trailing carriage return as
+    // ONE operation; a Rust write bypasses that chain entirely, so a byte landing inside another
+    // writer's 60ms paste→CR window would append to — and then SUBMIT — a prompt the user never
+    // sent (roborev 54369/54375). The nudger stands down for 5s after this stamp.
+    if let Some(observer) = observers.get(&id) {
+        observer.note_foreign_write();
+    }
     // Take this session's OWN writer handle, releasing the global `sessions` lock BEFORE the write.
     // A large paste into a stalled child then blocks only this writer, leaving spawn/write/resize/
     // kill for every other terminal responsive (sparkle-4orh).
     let writer = acquire_writer(&manager.sessions, &id)?;
+    let mut writer = writer.lock().unwrap_or_else(|e| e.into_inner());
+    writer.write_all(data.as_bytes()).map_err(|e| e.to_string())?;
+    writer.flush().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Write to a PTY's stdin from INSIDE Rust, without the `note_foreign_write` stamp `pty_write`
+/// applies.
+///
+/// The nudger is the only caller and the omission is the point: this write is the nudger's own, so
+/// stamping it would make the module stand itself down. Everything else about the path is identical
+/// — same `acquire_writer`, same lock discipline (sparkle-4orh), same `NO_SUCH_PTY` error, which the
+/// frontend substring-matches, so it must keep its exact wording.
+pub fn write_session<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    id: &str,
+    data: &str,
+) -> Result<(), String> {
+    let manager = app.try_state::<PtyManager>().ok_or(NO_SUCH_PTY)?;
+    let writer = acquire_writer(&manager.sessions, id)?;
     let mut writer = writer.lock().unwrap_or_else(|e| e.into_inner());
     writer.write_all(data.as_bytes()).map_err(|e| e.to_string())?;
     writer.flush().map_err(|e| e.to_string())?;
@@ -852,6 +916,7 @@ pub fn pty_ack(manager: State<PtyManager>, id: String, bytes: usize) -> Result<(
 #[tauri::command]
 pub fn pty_resize(
     manager: State<PtyManager>,
+    observers: State<crate::nudger::Observers>,
     id: String,
     cols: u16,
     rows: u16,
@@ -859,6 +924,13 @@ pub fn pty_resize(
     // Backstop against the thin-column bug (see guard_resize_size): never shrink a live PTY below
     // the plausible floor, whatever the frontend sent.
     let (cols, rows) = guard_resize_size(&id, cols, rows);
+    // Keep the nudger's VT grid the same shape as the real one. Width is not cosmetic here: a
+    // prompt longer than the grid hard-wraps onto its own rendered row, which splits the word from
+    // its colon and silently stops the gate's credential patterns matching — the width-dependent
+    // miss `dictationTerminalRoute.ts` had to grow a wrap-tolerant arm for.
+    if let Some(observer) = observers.get(&id) {
+        observer.resize(cols, rows);
+    }
     let sessions = manager.sessions.lock().unwrap_or_else(|e| e.into_inner());
     let session = sessions.get(&id).ok_or(NO_SUCH_PTY)?;
     session
