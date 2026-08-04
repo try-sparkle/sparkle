@@ -75,13 +75,19 @@ pub fn init<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,sparkle_lib=debug,ui=debug"));
 
+    // SINK-LEVEL REDACTION (bead ): wrap BOTH sink writers so every formatted event is
+    // scrubbed of secrets/tokens/bearers before it hits disk or stderr — regardless of which call
+    // site emitted it. This is defense-in-depth on top of the per-call-site redaction in
+    // crash.rs/support.rs/github.rs, which stays in place. See `redacting_writer` for why redacting
+    // per-write is safe for line structure (fmt emits one `write_all` per event).
     let file_layer = tracing_subscriber::fmt::layer()
         .with_ansi(false)
         .with_target(true)
-        .with_writer(file_appender);
+        .with_writer(crate::redacting_writer::RedactingMakeWriter::new(file_appender));
 
-    // Mirror to stderr so `pnpm tauri dev` shows logs live in the terminal.
-    let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
+    // Mirror to stderr so `pnpm tauri dev` shows logs live in the terminal — redacted at the sink too.
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_writer(crate::redacting_writer::RedactingMakeWriter::new(std::io::stderr));
 
     // `try_init` rather than `init` so a double-call (e.g. test harness) is a no-op, not a panic.
     let _ = tracing_subscriber::registry()

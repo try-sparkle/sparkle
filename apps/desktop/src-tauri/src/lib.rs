@@ -71,6 +71,7 @@ mod proc;
 mod promotion;
 mod project_window;
 mod pty;
+mod redacting_writer;
 mod retention;
 mod review_cmd;
 mod roborev_probe;
