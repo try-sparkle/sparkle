@@ -68,6 +68,37 @@ export async function startDevServer({ port, quiet = true } = {}) {
 }
 
 /**
+ * Wipes the origin's web storage before ANY app module runs, on every new document.
+ *
+ * A fresh PAGE is not a fresh STORE. Every surface gets its own page, but the whole run shares one
+ * browser and one profile, and `localStorage` is origin-scoped — so a key a surface never sets is
+ * not "the app's default", it is whatever the surface captured before it left behind. That already
+ * cost one real capture: a "wide" surface inherited the previous surface's narrow column and the
+ * two PNGs came out byte-identical, with the suite green the whole time.
+ *
+ * The per-key answer to that lives in the fixture, which resets the concierge widths when it sees
+ * `capture=1`. This is the general one: it covers EVERY key, including ones a fixture written next
+ * month will store, so a future surface cannot reintroduce the same order-dependence by simply not
+ * knowing about this rule. Keep both — the fixture's reset is what makes a width-less surface mean
+ * "the default" mid-run, and this is what makes the whole origin start each document from cold.
+ *
+ * MUST BE THE FIRST init script installed (see INIT_SCRIPTS in capture.mjs). Ordered after a shim
+ * that seeds storage it would erase that shim's writes, which is why the ordering has a test of its
+ * own rather than resting on the order the calls happen to appear in.
+ *
+ * The access is guarded: reading `localStorage` throws outright when a browser has storage disabled
+ * for the origin, and a throw here runs before the app and would blank every surface. A harness that
+ * cannot clear storage should still capture — the bleed it is preventing cannot happen on an origin
+ * that has no storage to bleed.
+ */
+export const CLEAR_STORAGE = `
+  (() => {
+    try { localStorage.clear(); } catch {}
+    try { sessionStorage.clear(); } catch {}
+  })();
+`;
+
+/**
  * The Tauri IPC shim. The renderer reads `window.__TAURI_INTERNALS__` for every backend call;
  * outside a Tauri webview it is absent and those calls THROW, which is what pins the app on a
  * blank screen in a plain browser. Resolving them to null instead lets the tree mount — the

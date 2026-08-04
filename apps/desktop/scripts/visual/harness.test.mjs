@@ -8,6 +8,7 @@
 
 import { describe, expect, it } from "vitest";
 import { deflateSync } from "node:zlib";
+import { Script, createContext } from "node:vm";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -24,7 +25,8 @@ import {
   stepToExpression,
   surfaceByName,
 } from "./surfaces.mjs";
-import { numericArg, parseArgs, surfaceUrl } from "./capture.mjs";
+import { INIT_SCRIPTS, numericArg, parseArgs, surfaceUrl } from "./capture.mjs";
+import { CLEAR_STORAGE } from "./serve.mjs";
 import { MOCK_REL, mockChromeCss, resolveMock, viewportFromManifest } from "./compare.mjs";
 import { compareDirs, shouldKeep } from "./verify-stable.mjs";
 import {
@@ -934,5 +936,84 @@ describe("surfaceUrl — the driver's contract with the fixture", () => {
     const url = new URL(surfaceUrl("http://localhost:1234", {}));
     expect(url.pathname).toBe("/");
     expect(visualCaptureRun(url.search)).toBe(true);
+  });
+});
+
+// ── EVERY DOCUMENT STARTS FROM A COLD ORIGIN ──────────────────────────────────────────────────
+//
+// A fresh page is not a fresh store: the run shares one browser and one profile, and `localStorage`
+// is origin-scoped, so a key a surface never writes holds whatever the surface before it left. That
+// shipped once already — a "wide" capture inherited the previous narrow column and the pair came
+// out byte-identical with the suite green.
+//
+// No unit test can watch two real page loads, so these run the REAL init sources against a storage
+// stub instead. That is the only place the property is observable at this level: the sources are
+// strings, so a mistake in them is invisible to the module graph, to typechecking, and to every
+// screenshot the harness produces.
+//
+// ONE FIXTURE PER PROPERTY, deliberately. Removing the clear and re-ordering it after the shims are
+// different defects, and a single combined test would have passed under either mutation alone.
+describe("the capture driver's init scripts", () => {
+  // Enough of a browser for the three real sources to run: they touch `window`, build a <style>,
+  // and reach for the two storages. Anything they do not use is left out on purpose — a stub that
+  // answers more than the code asks for hides the day the code starts asking for something else.
+  const runInitScripts = (sources, { storageThrows = false } = {}) => {
+    const makeStorage = (seed = {}) => {
+      const map = new Map(Object.entries(seed));
+      return {
+        clear: () => map.clear(),
+        getItem: (k) => (map.has(k) ? map.get(k) : null),
+        setItem: (k, v) => map.set(k, String(v)),
+        get size() {
+          return map.size;
+        },
+      };
+    };
+    const local = makeStorage({ "sparkle-concierge-width": "190", "some-future-key": "stale" });
+    const session = makeStorage({ "scroll-pos": "400" });
+    const ctx = {
+      window: {},
+      document: {
+        documentElement: { appendChild: () => {} },
+        createElement: () => ({ textContent: "" }),
+        addEventListener: () => {},
+      },
+    };
+    // A storage that THROWS on access is a real browser state (storage disabled for the origin),
+    // and these scripts run before the app — an escaping throw would blank every surface.
+    if (storageThrows) {
+      const boom = () => {
+        throw new Error("storage is disabled for this origin");
+      };
+      Object.defineProperty(ctx, "localStorage", { get: boom });
+      Object.defineProperty(ctx, "sessionStorage", { get: boom });
+    } else {
+      ctx.localStorage = local;
+      ctx.sessionStorage = session;
+    }
+    createContext(ctx);
+    for (const source of sources) new Script(source).runInContext(ctx);
+    return { local, session };
+  };
+
+  it("leaves the previous surface's localStorage EMPTY before any app code runs", () => {
+    const { local, session } = runInitScripts(INIT_SCRIPTS);
+    expect(local.size, "a key from the previous surface survived into this document").toBe(0);
+    expect(session.size, "sessionStorage bleeds across surfaces the same way").toBe(0);
+  });
+
+  // THE CLEAR MUST BE FIRST, not merely present. Ordered after a shim that seeds storage it would
+  // erase that shim's writes — the opposite failure, and just as invisible. Standing in for such a
+  // shim here rather than asserting `INIT_SCRIPTS[0] === CLEAR_STORAGE` keeps this a statement about
+  // what the sequence DOES: move the clear to the end and the seeded value is gone.
+  it("clears BEFORE the other init scripts, so their own writes survive", () => {
+    const seeder = `localStorage.setItem("seeded-by-a-later-init-script", "kept");`;
+    const withSeeder = [INIT_SCRIPTS[0], seeder, ...INIT_SCRIPTS.slice(1)];
+    const { local } = runInitScripts(withSeeder);
+    expect(local.getItem("seeded-by-a-later-init-script")).toBe("kept");
+  });
+
+  it("does not throw when the origin has storage disabled", () => {
+    expect(() => runInitScripts([CLEAR_STORAGE], { storageThrows: true })).not.toThrow();
   });
 });

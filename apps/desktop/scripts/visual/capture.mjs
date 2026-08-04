@@ -10,7 +10,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { launch } from "./cdp.mjs";
-import { startDevServer, TAURI_SHIM, FROZEN_CLOCK } from "./serve.mjs";
+import { startDevServer, CLEAR_STORAGE, TAURI_SHIM, FROZEN_CLOCK } from "./serve.mjs";
 import {
   DEFAULT_VIEWPORT,
   SURFACES,
@@ -57,6 +57,21 @@ export function surfaceUrl(baseUrl, surface) {
   const extra = surface.query ? `&${surface.query}` : "";
   return `${baseUrl}/?visual=1&capture=1${extra}`;
 }
+
+/**
+ * Everything installed on a surface's page before its first byte of app code runs, IN ORDER.
+ *
+ * A list rather than three `addInitScript` calls because the ORDER is load-bearing and a sequence
+ * of statements has nothing to assert against. `CLEAR_STORAGE` must come first: it wipes the origin
+ * so a surface cannot inherit the previous one's `localStorage` (see its docblock — that bug shipped
+ * two byte-identical PNGs), and anything it is ordered AFTER that seeds storage would have its
+ * writes erased. Neither half of that is visible in a screenshot, so both are pinned by tests in
+ * harness.test.mjs.
+ *
+ * Append to this rather than adding a fourth call at the call site, or the ordering guarantee is
+ * only true of the entries that happen to be in here.
+ */
+export const INIT_SCRIPTS = [CLEAR_STORAGE, TAURI_SHIM, FROZEN_CLOCK];
 
 /**
  * Run one surface's steps against a page. Exported (and driven by the registry rather than
@@ -157,8 +172,7 @@ async function main() {
         const record = { surface: surface.name, theme, file: artifactName(surface.name, theme) };
         try {
           await page.setViewport({ width, height, deviceScaleFactor: scale });
-          await page.addInitScript(TAURI_SHIM);
-          await page.addInitScript(FROZEN_CLOCK);
+          for (const source of INIT_SCRIPTS) await page.addInitScript(source);
           // `?visual=1`, PLUS whatever extra state this surface needs the FIXTURE to seed. A
           // surface that needs two pairs (`workspace-wired-left`) cannot get them from a step —
           // steps run after mount, and the pair layout is decided by the seed — so it asks here.
@@ -166,9 +180,13 @@ async function main() {
           // `capture=1` SAYS THE HARNESS IS DRIVING, which is a different claim from `visual=1` and
           // is why it is a separate parameter. Every surface gets a fresh PAGE but they all share
           // ONE BROWSER, and `localStorage` is origin-scoped — so state a surface does not set is
-          // not "the app's default", it is whatever the previous surface left. The fixture resets
-          // the non-zustand keys it owns (the concierge widths) when it sees this, which makes a
-          // capture independent of the order the run took. It must NOT do that for a developer who
+          // not "the app's default", it is whatever the previous surface left. Two things answer
+          // that, and they are not redundant: CLEAR_STORAGE (installed above, before any app code)
+          // empties the whole origin per document, so no key a future fixture invents can bleed;
+          // the fixture then resets the non-zustand keys it owns (the concierge widths) when it
+          // sees this marker, which is what makes a width-less surface mean "the app's default"
+          // rather than "whatever this page load happened to write". It must NOT do that for a
+          // developer who
           // merely opens their own dev server with `?visual=1`: those are real preferences on a
           // real machine and nothing else protects them. See `visualCaptureRun` in
           // src/dev/visualFixtures.ts.
