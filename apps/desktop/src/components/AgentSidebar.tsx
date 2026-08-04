@@ -3581,8 +3581,49 @@ function ElapsedTimer({ since, now, color }: { since: number; now: number; color
  * order (scrolled past its header, or pulled up in a filtered view) and because the two disagree
  * for a head whose stage rolls up from its workers.
  */
-function StageChip({ stage, active }: { stage: WorkflowStageId; active: boolean }) {
+/**
+ * The stage meta a ROW may honestly render, given the rung it was filed under.
+ *
+ * THE CONTRADICTION THIS EXISTS TO KILL (roborev 57842, sparkle-biezi). `sectionOfRow` files a
+ * clean, commit-free row under `local_none` ("Local: Nothing Yet — nothing here is at risk"), but
+ * the row itself is still at stage `building_unsaved`, whose meta reads "Unsaved" with the tooltip
+ * "Building locally: unsaved changes — closing now loses this work." So the founder's original
+ * complaint — copy claiming work will be lost about a row holding nothing — survived one component
+ * below the heading I had just fixed, and the fixture row added to PROVE the fix was rendering the
+ * contradiction in the very capture meant to demonstrate it. I photographed it and did not read it.
+ *
+ * ONLY `building_unsaved` IS OVERRIDDEN, and that is the point rather than a shortcut. It is the one
+ * stage whose meta asserts something the `local_none` reading has just falsified. The other three
+ * stages that share this rung — `thought` / `specd` / `planned` — describe planning that genuinely
+ * happened and say nothing about the worktree, so a `Planned` chip under "Nothing Yet" is two true
+ * statements at different altitudes, not a contradiction. Overriding those would erase real
+ * information.
+ *
+ * Returns `stageMeta(stage)` untouched for every other row, so nothing outside this one cell moves.
+ */
+function honestStageMeta(stage: WorkflowStageId, section?: BuildSectionId) {
   const meta = stageMeta(stage);
+  if (section !== "local_none" || stage !== "building_unsaved") return meta;
+  return {
+    ...meta,
+    label: "Nothing Built Yet",
+    short: "Empty",
+    detail: "No commits and no edits in the working tree — nothing here is at risk.",
+  };
+}
+
+function StageChip({
+  stage,
+  active,
+  section,
+}: {
+  stage: WorkflowStageId;
+  active: boolean;
+  /** The rung this row was FILED under. Only consulted to catch the one case where the stage's own
+   *  copy contradicts it — see `honestStageMeta`. */
+  section?: BuildSectionId;
+}) {
+  const meta = honestStageMeta(stage, section);
   return (
     <span
       data-testid="row-stage-chip"
@@ -5049,7 +5090,7 @@ const AgentRow = memo(function AgentRow({
               {/* FEEDBACK pill sits to the LEFT of the stage chip (the row's rightmost status pill),
                   so the row reads dot · el · nm · [feedback] · stg · close. */}
               {feedbackPill}
-              {trackerStage && <StageChip stage={trackerStage} active={isActive} />}
+              {trackerStage && <StageChip stage={trackerStage} active={isActive} section={rowSection} />}
             </div>
           )}
           {/* The agent's live first-person "what I'm building now" narration, self-reported via the

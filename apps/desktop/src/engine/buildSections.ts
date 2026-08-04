@@ -181,8 +181,29 @@ export function sectionOfStage(stage: WorkflowStageId): BuildSectionId {
  * `engine/workflowStage.uncommittedWorkEvidence`, which already returns exactly these three values
  * and already applies the parked-worktree gate.
  *
- * Only the `local_uncommitted` rung is ever re-routed. A row at any other stage has committed work
- * by definition, so its worktree's cleanliness says nothing about which rung it belongs on.
+ * Only the `local_uncommitted` rung is ever re-routed. For every rung BELOW it the row has committed
+ * work by definition, so its worktree's cleanliness cannot change where it belongs.
+ *
+ * ⚠️ THAT SENTENCE USED TO READ "a row at any other stage has committed work by definition", which is
+ * FALSE and was called out (roborev 57842): `thought` / `specd` / `planned` sit in this rung
+ * PRECISELY BECAUSE they have no commits, and a `planned` row reaches it with a spotless tree
+ * routinely — the beads store is gitignored, so filing a bead dirties nothing. So those three ARE
+ * re-routed by the gate below, and that is a decision, not an oversight:
+ *
+ *   • Leaving them behind would strand them under `local_uncommitted`, whose copy states flatly that
+ *     "edits exist only in the working tree — closing this agent loses them". For a spotless planned
+ *     row that is definitively false — the same lie this whole change exists to remove, just aimed at
+ *     a different row.
+ *   • `local_none`'s DETAIL ("no commits and no edits in the working tree") is literally true of
+ *     them, and its rung is about how far the code got, which for a planned row is nowhere.
+ *   • The reviewer's alternative — gating on `stage !== "building_unsaved"` — was considered and
+ *     declined for exactly that reason. It trades a false claim about planning rows for a different
+ *     false claim about them.
+ *
+ * What the label alone does under-state is that planning DID happen. That is answered one component
+ * down rather than here: the row keeps its own `Planned` / `Spec'd` / `Thought` stage chip, which is
+ * true and non-alarming, and `honestStageMeta` overrides ONLY `building_unsaved` — the one stage
+ * whose copy this rung's reading actually falsifies.
  */
 export function sectionOfRow(
   stage: WorkflowStageId,

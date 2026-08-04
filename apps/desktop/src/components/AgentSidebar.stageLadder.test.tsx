@@ -413,3 +413,71 @@ describe("AgentSidebar — selection never lands on a filtered-out row", () => {
     expect(screen.getByTestId("status-chip-running").getAttribute("data-on")).toBe("false");
   });
 });
+
+describe("the `local_none` rung is actually WIRED to the column (roborev 57842)", () => {
+  // WHY THIS BLOCK EXISTS. `holdsWorkOf` is OPTIONAL on both `groupAgentsByStage` and
+  // `firstLadderRowId`, so deleting the argument from any production call site is not a type error.
+  // Before these tests, `local_none` appeared only in pure-function unit tests — every component
+  // test here seeds `branchStatus: {}`, so every row read `undefined` and the whole rung was
+  // invisible to the suite. It could have been silently removed from the UI with everything green,
+  // which is precisely the drift the comments on `groupAgentsByStage` and `ladderSelection` claim is
+  // impossible.
+
+  /** A worktree reading as Rust sends it. `worktreeOnBranch: true` is required — a parked tree reads
+   *  `undefined` and would put the row straight back in `local_uncommitted`. */
+  const bs = (dirty: boolean) => ({
+    ahead: 0, behind: 0, dirty, filesChanged: 0, insertions: 0, deletions: 0,
+    worktreeOnBranch: true, dirtyFiles: dirty ? ["src/x.ts"] : [], dirtyCount: dirty ? 1 : 0,
+  });
+
+  it("files a CLEAN pre-commit row under `local_none` and a DIRTY one under `local_uncommitted`", () => {
+    const project = seed([mkAgent("a1", "Cleanly"), mkAgent("a2", "Dirty")]);
+    setStages({ a1: "building_unsaved", a2: "building_unsaved" });
+    setStatuses({ a1: "idle", a2: "idle" });
+    useRuntimeStore.setState({ branchStatus: { a1: bs(false), a2: bs(true) } } as never);
+    render(<AgentSidebar project={project} />);
+
+    expect(screen.getByTestId("stage-header-local_none")).toBeTruthy();
+    expect(screen.getByTestId("stage-header-local_uncommitted")).toBeTruthy();
+    // …and the clean one sorts ABOVE the dirty one, which is the ordering the selection path shares.
+    expect(renderedNames(["Cleanly", "Dirty"])).toEqual(["Cleanly", "Dirty"]);
+  });
+
+  it("keeps an UNREAD row in `local_uncommitted` — no branchStatus, no calmer heading", () => {
+    // The conservative arm, asserted through the real column rather than the pure function: with the
+    // store empty (as every other test in this file leaves it) the rung must not appear at all.
+    const project = seed([mkAgent("a1", "Alpha")]);
+    setStages({ a1: "building_unsaved" });
+    render(<AgentSidebar project={project} />);
+    expect(screen.queryByTestId("stage-header-local_none")).toBeNull();
+    expect(screen.getByTestId("stage-header-local_uncommitted")).toBeTruthy();
+  });
+
+  it("does not claim a `local_none` row has unsaved changes — the row's OWN chip", () => {
+    // The contradiction roborev 57842 found: the heading said "nothing here is at risk" while the
+    // row beneath it rendered the `building_unsaved` chip, whose tooltip reads "closing now loses
+    // this work". Assert the SIDE EFFECT (what the chip says), not merely that the header exists.
+    const project = seed([mkAgent("a1", "Cleanly")]);
+    setStages({ a1: "building_unsaved" });
+    setStatuses({ a1: "idle" });
+    useRuntimeStore.setState({ branchStatus: { a1: bs(false) } } as never);
+    render(<AgentSidebar project={project} />);
+
+    const chip = screen.getByTestId("row-stage-chip");
+    expect(chip.getAttribute("title")).not.toMatch(/loses this work/);
+    expect(chip.getAttribute("title")).toMatch(/nothing here is at risk/);
+    expect(chip.textContent).not.toBe("Unsaved");
+  });
+
+  it("STILL says unsaved on a genuinely dirty row — the override is not blanket", () => {
+    const project = seed([mkAgent("a1", "Dirty")]);
+    setStages({ a1: "building_unsaved" });
+    setStatuses({ a1: "idle" });
+    useRuntimeStore.setState({ branchStatus: { a1: bs(true) } } as never);
+    render(<AgentSidebar project={project} />);
+
+    const chip = screen.getByTestId("row-stage-chip");
+    expect(chip.textContent).toBe("Unsaved");
+    expect(chip.getAttribute("title")).toMatch(/loses this work/);
+  });
+});

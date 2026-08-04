@@ -346,6 +346,29 @@ describe("listBuildRows", () => {
     expect(row("b1").section).toBe("local_uncommitted");
   });
 
+  it("reports `local_none` for a clean pre-commit row — the concierge sees what the column shows", () => {
+    // roborev 57842: this view exists to tell the concierge what the Build column is rendering, so a
+    // row it files under a different rung than the column does is a lie about the screen. Nothing
+    // asserted the wiring — every case here seeds `branchStatus: {}`, so every row read `undefined`
+    // and `local_none` was unreachable from this surface regardless of whether it worked.
+    useRuntimeStore.setState({
+      branchStatus: {
+        b1: { ahead: 0, behind: 0, dirty: false, filesChanged: 0, insertions: 0, deletions: 0, worktreeOnBranch: true },
+        b2: { ahead: 0, behind: 0, dirty: true, filesChanged: 0, insertions: 0, deletions: 0, worktreeOnBranch: true },
+      },
+    } as never);
+    const row = rowsById(value(listBuildRows()));
+    expect(row("b1").section).toBe("local_none");
+    // The control: same stage, dirty tree, stays put. Without it this would pass on a blanket rename.
+    expect(row("b2").section).toBe("local_uncommitted");
+  });
+
+  it("keeps an UNREAD row in `local_uncommitted` from this surface too", () => {
+    useRuntimeStore.setState({ branchStatus: {} } as never);
+    const row = rowsById(value(listBuildRows()));
+    expect(row("b1").section).toBe("local_uncommitted");
+  });
+
   it("refuses rather than returning an empty list when no project is scoped", () => {
     useProjectStore.setState({ selectedProjectId: null } as never);
     const r = listBuildRows();
