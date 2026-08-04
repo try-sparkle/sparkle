@@ -16,6 +16,51 @@ function queuedPoll(chunks: { lines: string[]; offset: number; truncated?: boole
 const flush = () => new Promise((r) => setTimeout(r, 0));
 
 describe("watchHookEvents", () => {
+  it("keeps dispatching the rest of a chunk when one consumer throws, and survives (sparkle-u4od)", async () => {
+    // `offset` advances past the WHOLE chunk before dispatch, so a throw on the 2nd of 5 events
+    // used to take the outer catch and lose lines 3-5 forever (the next poll resumes past them).
+    const { poll } = queuedPoll([
+      {
+        lines: [
+          JSON.stringify({ event: "UserPromptSubmit" }),
+          JSON.stringify({ event: "Stop" }), // the consumer throws on this one
+          JSON.stringify({ event: "UserPromptSubmit" }),
+          JSON.stringify({ event: "Stop" }),
+          JSON.stringify({ event: "UserPromptSubmit" }),
+        ],
+        offset: 100,
+      },
+      // A later chunk proves the watcher is still alive after the mid-chunk throw.
+      { lines: [JSON.stringify({ event: "Stop" })], offset: 130 },
+    ]);
+    const seen: HookEvent[] = [];
+    let threw = false;
+    const w = watchHookEvents(
+      "/log",
+      (e) => {
+        if (e.event === "Stop" && !threw) {
+          threw = true;
+          throw new Error("consumer blew up on the first Stop");
+        }
+        seen.push(e);
+      },
+      { intervalMs: 1, poll },
+    );
+
+    // 5 chunk-1 events minus the one that threw = 4 delivered, then the 2nd chunk's event = 5.
+    // Against the pre-fix code this stalls at 2 (only the first event, then the next chunk).
+    await vi.waitFor(() => expect(seen.length).toBe(5));
+    w.stop();
+
+    expect(seen.map((e) => e.event)).toEqual([
+      "UserPromptSubmit",
+      "UserPromptSubmit",
+      "Stop",
+      "UserPromptSubmit",
+      "Stop",
+    ]);
+  });
+
   it("parses appended lines into events in order and resumes from the returned offset", async () => {
     const { poll, calls } = queuedPoll([
       { lines: [JSON.stringify({ event: "UserPromptSubmit" })], offset: 30 },

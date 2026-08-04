@@ -75,7 +75,17 @@ export function watchHookEvents(
       if (!skipped) {
         for (const line of chunk.lines) {
           const ev = parseHookLine(line);
-          if (ev) onEvent(ev);
+          if (!ev) continue;
+          // Per-event guard, INSIDE the loop. `offset` has already advanced past this whole chunk
+          // (above), so a consumer that throws on one event would otherwise take the outer catch and
+          // lose every LATER line in the chunk forever — the next poll resumes from the advanced
+          // offset and never replays them. Swallow-and-continue keeps the rest of the chunk flowing;
+          // the offending event is already parsed, so there is nothing to retry. (sparkle-u4od)
+          try {
+            onEvent(ev);
+          } catch {
+            // one bad consumer must not drop the other events in this chunk
+          }
         }
       }
       behind = chunk.truncated === true;
