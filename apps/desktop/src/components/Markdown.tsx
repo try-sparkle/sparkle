@@ -22,6 +22,9 @@ import { C } from "../theme/colors";
 import { FONT_MONO, FONT_UI } from "../theme/scale";
 import { parseAgentRefHref } from "./Concierge/agentRefs";
 import { AgentPill } from "./Concierge/AgentPill";
+import { parseBeadRefHref } from "./Concierge/beadRefs";
+import { remarkBeadRefs } from "./Concierge/remarkBeadRefs";
+import { BeadPill } from "./Concierge/BeadPill";
 
 const MONO = FONT_MONO;
 
@@ -123,7 +126,11 @@ function CodeBlock({ children }: { children?: ReactNode }) {
 
 // Hoisted so ReactMarkdown receives a STABLE plugin-array reference across renders (a fresh
 // `[remarkGfm]` literal each render defeats react-markdown's own memoization of the parse).
-const REMARK_PLUGINS = [remarkGfm];
+//
+// ORDER IS LOAD-BEARING: `remarkBeadRefs` runs AFTER `remarkGfm` so that GFM's autolink literals
+// are already `link` nodes when the bead linkifier walks the tree, and their text is therefore
+// protected by the same in-a-link guard as a hand-written link's. See remarkBeadRefs' header.
+const REMARK_PLUGINS = [remarkGfm, remarkBeadRefs];
 
 /**
  * react-markdown sanitizes every href BEFORE our `components.a` override ever sees it, blanking any
@@ -143,9 +150,17 @@ const REMARK_PLUGINS = [remarkGfm];
  * The tests in Concierge/AgentPill.test.tsx pin both halves: the pill resolves, and the dangerous
  * schemes stay inert. Do not replace this with `urlTransform={(u) => u}`, which is the "simpler"
  * version of this line and disables the sanitizer for every link in the app.
+ *
+ * `sparkle-bead:` is the SECOND exception, on identical terms and for the same reason — it is gated
+ * on `parseBeadRefHref`'s conservative id class, and `ExternalLink` returns a `<button>` for it so
+ * no `href` ever reaches the DOM. It has to be here even though most bead references are synthesized
+ * by `remarkBeadRefs` rather than written: `urlTransform` runs on every link the renderer sees,
+ * whatever produced it, so without this line the linkifier's own output would be blanked.
  */
 function urlTransform(url: string): string {
-  return parseAgentRefHref(url) !== null ? url : defaultUrlTransform(url);
+  if (parseAgentRefHref(url) !== null) return url;
+  if (parseBeadRefHref(url) !== null) return url;
+  return defaultUrlTransform(url);
 }
 
 // Subtle tint for inline code / blockquote / table chrome, derived from the accent so it
@@ -234,6 +249,18 @@ function ExternalLink({ href, children }: { href?: string; children?: ReactNode 
   const agentId = parseAgentRefHref(href);
   if (agentId !== null) {
     return <AgentPill agentId={agentId} fallbackName={linkText(children)} />;
+  }
+  // A bead reference is not a link either. Checked BEFORE the scheme allowlist for the same reason:
+  // `sparkle-bead:` is deliberately not on it, so outside a provider (SupportModal, an agent's own
+  // reply) the reference falls through to the inert-text path below and reads as the bare id —
+  // which is exactly the intended degradation, since the id is what the pill would have shown.
+  //
+  // NO `fallbackName` COUNTERPART. `AgentPill` needs the written label because an agent's readable
+  // handle is its NAME; a bead's readable handle is the id itself, which is already in the href. See
+  // BeadPill's docstring for why the label is discarded rather than preferred.
+  const beadId = parseBeadRefHref(href);
+  if (beadId !== null) {
+    return <BeadPill beadId={beadId} />;
   }
   const safe = isSafeLinkHref(href);
   return (

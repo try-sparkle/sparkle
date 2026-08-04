@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { flat, hasAgentRef, line, plain, ref } from "./conciergeLine";
+import { bead, flat, hasAgentRef, line, plain, ref } from "./conciergeLine";
 import { parseAgentRefHref, stripAgentRefs, stripMentionSigil } from "./agentRefs";
+import { parseBeadRefHref, stripBeadRefs } from "./beadRefs";
 import { fromMarkdown } from "mdast-util-from-markdown";
 
 const KRAKEN = { id: "9f3c-aaaa-1111", name: "Kraken Auth" };
@@ -154,5 +155,63 @@ describe("the type-level gate", () => {
       "agentObjectIsRejected",
       "refAndPlainAreAccepted",
     ]);
+  });
+});
+
+// ── BEAD REFERENCES ─────────────────────────────────────────────────────────────────────────────
+//
+// The bead slot exists for the SPOKEN half. `remarkBeadRefs` already linkifies a bare id in the
+// markdown, so `md` would draw a pill either way — but the linkifier operates on the parsed tree and
+// the live region reads `.spoken`, which it never touches. A bare id there is read aloud character
+// by character with no way to scroll past it.
+describe("bead()", () => {
+  it("emits a reference the renderer will draw as a pill", () => {
+    const l = line`recorded on ${bead({ id: "sparkle-17hm1" })}`;
+    expect(linksIn(l.md)).toEqual([
+      { url: "sparkle-bead:sparkle-17hm1", label: "sparkle-17hm1" },
+    ]);
+  });
+
+  // THE REASON THIS SLOT EXISTS. Without a title the listener hears the raw id; with one they hear
+  // what the bead IS and can stop attending before the handle.
+  it("speaks the title when it has one, and the id when it does not", () => {
+    expect(line`see ${bead({ id: "sparkle-17hm1", title: "Clickable bead ids" })}`.spoken).toBe(
+      "see Clickable bead ids (sparkle-17hm1)",
+    );
+    expect(line`see ${bead({ id: "sparkle-17hm1" })}`.spoken).toBe("see sparkle-17hm1");
+  });
+
+  it("never speaks the markdown syntax", () => {
+    const l = line`recorded on ${bead({ id: "sparkle-17hm1", title: "A bead" })}`;
+    expect(l.spoken).not.toContain("sparkle-bead:");
+    expect(l.spoken).not.toContain("[");
+  });
+
+  // The WRITER's trust boundary is the PARSER's own predicate, so a reference this composes can
+  // always be read back. An id that fails degrades to plain text: the reader loses a click, never
+  // the id — and critically, no dead link carrying it reaches the clipboard.
+  it("degrades a malformed id to plain text rather than writing a dead link", () => {
+    const l = line`recorded on ${bead({ id: "../etc/passwd" })}`;
+    expect(linksIn(l.md)).toEqual([]);
+    expect(l.spoken).toBe("recorded on ../etc/passwd");
+  });
+
+  it("accepts a child id, which the AGENT class would reject", () => {
+    expect(linksIn(line`${bead({ id: "sparkle-hiju.4" })}`.md)).toEqual([
+      { url: "sparkle-bead:sparkle-hiju.4", label: "sparkle-hiju.4" },
+    ]);
+  });
+
+  // Round-trips through the parser the renderer actually uses.
+  it("composes an href parseBeadRefHref reads back", () => {
+    const [link] = linksIn(line`${bead({ id: "sparkle-t6wje" })}`.md);
+    expect(parseBeadRefHref(link!.url)).toBe("sparkle-t6wje");
+  });
+
+  // The clipboard tax: an explicit reference must flatten to the words the reader saw.
+  it("flattens for the clipboard", () => {
+    expect(stripBeadRefs(line`recorded on ${bead({ id: "sparkle-t6wje" })}`.md)).toBe(
+      "recorded on sparkle-t6wje",
+    );
   });
 });

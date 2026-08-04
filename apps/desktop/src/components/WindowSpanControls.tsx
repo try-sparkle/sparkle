@@ -1,20 +1,10 @@
-import { useCallback, useEffect, useState, type CSSProperties } from "react";
+import { type CSSProperties } from "react";
 import { FiAlertTriangle } from "react-icons/fi";
 import { C, ON_BRAND_FILL } from "../theme/colors";
 import { FONT_UI, TYPE } from "../theme/scale";
 import { useSettingsStore } from "../stores/settingsStore";
-import { safeUnlisten } from "../services/safeUnlisten";
-import {
-  describeSpanTarget,
-  fitWindowToCurrentDisplay,
-  getDisplayLayout,
-  modesAgree,
-  onDisplaysChanged,
-  resetWindowSize,
-  spanWindow,
-  type DisplayLayout,
-  type SpanMode,
-} from "../services/displaySpan";
+import { useWindowSpan } from "../hooks/useWindowSpan";
+import { describeSpanTarget, modesAgree, type SpanMode } from "../services/displaySpan";
 
 // The Appearance → Window group: run Sparkle as one wide window across every attached display.
 //
@@ -22,6 +12,12 @@ import {
 // desktop with one window straddling all of them. See src-tauri/src/display_span.rs for why the
 // SHAPE of that window is the hard part (displays of different heights don't union into a
 // rectangle) and what the two modes actually differ on.
+//
+// THE ACTIONS THEMSELVES LIVE IN hooks/useWindowSpan.ts, not here. The concierge header carries a
+// shortcut to the same span/fit toggle (Concierge/WindowSpanButton.tsx, bead sparkle-6b96h), and
+// `windowIsSpanned` is a flag `useDisplayRespan` gates on — so a second copy of this sequence would
+// be a second opinion about whether the window is spanned. This pane owns the LAYOUT and the copy;
+// the hook owns what happens on click.
 
 const SPAN_MODES: Array<{ value: SpanMode; label: string; hint: string }> = [
   {
@@ -37,74 +33,23 @@ const SPAN_MODES: Array<{ value: SpanMode; label: string; hint: string }> = [
 ];
 
 export function WindowSpanControls() {
-  const spanMode = useSettingsStore((s) => s.windowSpanMode);
   const setSpanMode = useSettingsStore((s) => s.setWindowSpanMode);
   const autoRespan = useSettingsStore((s) => s.windowAutoRespan);
   const setAutoRespan = useSettingsStore((s) => s.setWindowAutoRespan);
-  const setIsSpanned = useSettingsStore((s) => s.setWindowIsSpanned);
 
-  const [layout, setLayout] = useState<DisplayLayout | null>(null);
-  // Read failures and action failures are tracked apart so the user can tell "I can't see your
-  // displays" from "that button didn't work" — folding them into one string made a failed action
-  // look like a second copy of the read error.
-  const [readError, setReadError] = useState<string | null>(null);
-  const [actionError, setActionError] = useState<string | null>(null);
+  const {
+    layout,
+    readError,
+    actionError,
+    displayCount,
+    noLayout,
+    blockedBySpaces,
+    spanMode,
+    span,
+    fit,
+    reset,
+  } = useWindowSpan();
 
-  const refresh = useCallback(async () => {
-    try {
-      setLayout(await getDisplayLayout());
-      setReadError(null);
-    } catch (e) {
-      // A layout we can't read is the one state where guessing would be worst: the buttons would
-      // claim a geometry that isn't real. Say so instead.
-      setReadError(e instanceof Error ? e.message : String(e));
-    }
-  }, []);
-
-  useEffect(() => {
-    void refresh();
-    // Keep the readout honest while the pane is open — the numbers under the Span button are a
-    // claim about the user's actual hardware.
-    //
-    // The `.catch` is load-bearing, not defensive noise: `listen` REJECTS when there is no Tauri
-    // IPC (a jsdom render, a window mid-teardown), and this promise isn't awaited until the
-    // cleanup runs — so without it the rejection surfaces as an app-level unhandled error. Losing
-    // live refresh in that situation is the correct degradation; the pane still renders.
-    const pending = onDisplaysChanged(() => void refresh()).catch(() => undefined);
-    return () => void safeUnlisten(pending);
-  }, [refresh]);
-
-  /**
-   * Run one window action and record whether the window is now spanned.
-   *
-   * `spanned` comes from WHICH action ran, not from measuring the result. Measuring is impossible
-   * synchronously — macOS applies window geometry on the main dispatch queue, so a read-back
-   * reports the pre-action frame (see src-tauri/src/display_span.rs). Two attempts to verify made
-   * every span read as clamped, which left the flag permanently false and silently killed
-   * auto-respan. The known cost of trusting the action: resize the window by hand afterwards and
-   * the flag is stale until the next Fit/Reset.
-   */
-  const run = useCallback(
-    async (action: () => Promise<unknown>, spanned: boolean) => {
-      try {
-        await action();
-        setIsSpanned(spanned);
-        setActionError(null);
-        await refresh();
-      } catch (e) {
-        setActionError(e instanceof Error ? e.message : String(e));
-      }
-    },
-    [refresh, setIsSpanned],
-  );
-
-  const displayCount = layout?.displays.length ?? 0;
-  // Nothing is actionable until we know what displays exist: acting on a null layout just produces
-  // a second error next to the one that caused it.
-  const noLayout = !layout || displayCount === 0;
-  // With one display "spanning" is just maximizing, which works regardless of the Spaces setting —
-  // so only warn (and only block) when there is actually more than one display to span across.
-  const blockedBySpaces = !!layout && !layout.spanning_enabled && displayCount > 1;
   const agree = !!layout && modesAgree(layout);
 
   return (
@@ -125,7 +70,7 @@ export function WindowSpanControls() {
           type="button"
           disabled={blockedBySpaces || noLayout}
           aria-label="Span the Sparkle window across every attached display"
-          onClick={() => void run(() => spanWindow(spanMode), true)}
+          onClick={() => void span()}
           style={{
             ...action,
             background: blockedBySpaces ? "transparent" : C.teal,
@@ -146,7 +91,7 @@ export function WindowSpanControls() {
           type="button"
           disabled={noLayout}
           aria-label="Fit the window to the display it is currently on"
-          onClick={() => void run(fitWindowToCurrentDisplay, false)}
+          onClick={() => void fit()}
           style={{ ...action, flex: 1, cursor: noLayout ? "not-allowed" : "pointer" }}
         >
           Fit to current display
@@ -155,7 +100,7 @@ export function WindowSpanControls() {
           type="button"
           disabled={noLayout}
           aria-label="Reset the window to its default size, centered on the main display"
-          onClick={() => void run(resetWindowSize, false)}
+          onClick={() => void reset()}
           style={{ ...action, flex: 1, cursor: noLayout ? "not-allowed" : "pointer" }}
         >
           Reset to default size

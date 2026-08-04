@@ -33,7 +33,14 @@ beforeEach(() => {
 
 afterEach(() => {
   // Make sure no interval leaks between cases.
-  useBeadsStore.getState().stopPolling("p1");
+  //
+  // RELEASED REPEATEDLY, because polling is REFERENCE-COUNTED (see beadsStore.refcount.test.ts): a
+  // case that claims twice needs two releases, and a single one would leave the timer armed and the
+  // NEXT case's `startPolling` taking the "already polling" early return — so its immediate refresh
+  // never fires and it fails on an assertion that has nothing to do with what it is testing.
+  // Over-releasing is deliberately safe (the store tears down at zero or below), so draining past
+  // the actual count costs nothing.
+  for (let i = 0; i < 3; i++) useBeadsStore.getState().stopPolling("p1");
   vi.useRealTimers();
   // Restore the tools gate so a case that flipped it off can't leak into the next test.
   useSettingsStore.setState({ beadsEnabled: true });
@@ -141,7 +148,10 @@ describe("polling", () => {
     // immediate refresh
     expect(listBeads).toHaveBeenCalledTimes(1);
 
-    // a second start is a no-op (one timer per project)
+    // A second start arms no SECOND timer (one timer per project) — but it is a second CLAIM on the
+    // one that exists, and the immediate refresh is skipped along with it. The claim half is what
+    // beadsStore.refcount.test.ts covers; here the point is only that the `bd` spawn rate does not
+    // double when two viewers watch one project.
     useBeadsStore.getState().startPolling("p1", "/proj", 5000);
     expect(listBeads).toHaveBeenCalledTimes(1);
 

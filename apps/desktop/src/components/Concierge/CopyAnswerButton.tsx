@@ -27,6 +27,7 @@ import { FiCheck, FiCopy } from "react-icons/fi";
 import { C } from "../../theme/colors";
 import { copyToClipboard } from "../../clipboard";
 import { stripAgentRefs } from "./agentRefs";
+import { stripBeadRefs } from "./beadRefs";
 import { COPY_TOAST_MS } from "./useCopyOnSelection";
 
 /** Resting opacity — present, findable, and quiet enough not to compete with the answer. */
@@ -123,7 +124,16 @@ export function CopyAnswerButton({
           // today. Running it anyway costs one parse of a short string and means the day a fourth
           // consumer starts encoding into user text, an internal uuid still cannot reach the
           // clipboard by way of the one path that copies source verbatim.
-          void copyToClipboard(stripAgentRefs(text)).then((ok) => {
+          // BEAD REFERENCES ARE FLATTENED TOO, on the same terms — `./beadRefs`' header explains why
+          // this consumer is charged twice rather than once. Two passes rather than one combined
+          // walk because each is a parse of a short string and keeping them separate means neither
+          // module has to know the other exists.
+          //
+          // AUTO-LINKIFIED IDS NEED NOTHING HERE and get nothing: `remarkBeadRefs` transforms the
+          // parsed TREE, so `text` still holds the bare `sparkle-17hm1` the model wrote and it
+          // copies through untouched. This is for the EXPLICIT `[…](sparkle-bead:…)` form, which
+          // `conciergeLine.bead()` composes and which model-authored text can carry verbatim.
+          void copyToClipboard(stripBeadRefs(stripAgentRefs(text))).then((ok) => {
             // Never claim a copy that didn't happen — no check mark, no announcement.
             if (!ok || !alive.current) return;
             setCopied(true);

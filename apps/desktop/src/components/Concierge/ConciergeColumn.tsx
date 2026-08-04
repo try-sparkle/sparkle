@@ -32,7 +32,9 @@ import { ConciergeThread } from "./ConciergeThread";
 import { MountedAgentThread } from "./MountedAgentThread";
 import { MountedNotice } from "./MountedNotice";
 import { ConciergeTopRight } from "./KebabMenu";
+import { WindowSpanButton } from "./WindowSpanButton";
 import { AgentPillProvider, type AgentPillContextValue } from "./AgentPill";
+import { BeadPillHost } from "./BeadPill";
 import { KeyPill } from "./KeyPill";
 import { pillStyle } from "./pillStyle";
 import { wordmarkRamp } from "./wordmarkRamp";
@@ -289,7 +291,7 @@ export function ConciergeColumn({
       }}
     >
       {/* ── `.ahd` — ONE ROW ────────────────────────────────────────────────────────────────────
-          wordmark · 8-dot grip · needs-you pill · PR/merge slot · avatar · kebab.
+          wordmark · 8-dot grip · needs-you pill · PR/merge slot · span shortcut · avatar · kebab.
 
           The founder asked for this consolidation explicitly, and the reason it is worth a whole
           restructure is that the shell used to SCATTER these: the credit pill shared a row with the
@@ -427,6 +429,14 @@ export function ConciergeColumn({
             list, merge from it, and jump to the owning agent — so the integration layer hands the
             real menu in through here instead, and this directory stays presentational. */}
         {prSlot}
+        {/* THE SPAN-ALL-DISPLAYS SHORTCUT, and its position here is the founder's literal ask:
+            "Give me a little icon next to the three dot menu… Between the PR button and the three
+            dot menu" (bead sparkle-6b96h). It is a shortcut to Settings → Appearance → Window's
+            "Span all displays", sharing that pane's action path via hooks/useWindowSpan so the two
+            cannot disagree about whether the window is spanned — a flag `useDisplayRespan` gates
+            on. Icon only, and it hides itself when there is nothing to span across, so the calm
+            row stays calm. */}
+        <WindowSpanButton />
         {/* The signed-in avatar + the kebab, as one cluster. `ConciergeTopRight` is the same export
             the project tabs bar mounts today; the cockpit's tabs belong to a PAIR, and this cluster
             is about the human rather than about a project, so its home is this header. */}
@@ -528,22 +538,28 @@ export function ConciergeColumn({
           onReachTop={mountedAgent.onReachTop}
         />
       ) : (
-        <AgentPillProvider value={agentPills}>
-          <ConciergeThread
-            wired={isWired}
-            messages={model.messages}
-            typing={model.typing}
-            onNudgeClick={controller.onNudgeClick}
-            onRevealAgent={controller.onRevealAgent}
-            onNudgeAction={controller.onNudgeAction}
-            onRedirect={controller.onRedirect}
-            onDigestClick={controller.onDigestClick}
-            copyOnSelection={copyOnSelection}
-            // Straight through to the host, which speaks it into the ONE live region below. The
-            // thread deliberately owns no announcer of its own.
-            onCopied={controller.onCopied}
-          />
-        </AgentPillProvider>
+        // `BeadPillHost` supplies the LIVE beads board to every bead id in the thread, and keeps it
+        // polling — see its docstring for why it has to start the poller itself. It wraps rather
+        // than sits beside `AgentPillProvider` for no deeper reason than that both contexts must
+        // cover the same subtree; neither depends on the other.
+        <BeadPillHost>
+          <AgentPillProvider value={agentPills}>
+            <ConciergeThread
+              wired={isWired}
+              messages={model.messages}
+              typing={model.typing}
+              onNudgeClick={controller.onNudgeClick}
+              onRevealAgent={controller.onRevealAgent}
+              onNudgeAction={controller.onNudgeAction}
+              onRedirect={controller.onRedirect}
+              onDigestClick={controller.onDigestClick}
+              copyOnSelection={copyOnSelection}
+              // Straight through to the host, which speaks it into the ONE live region below. The
+              // thread deliberately owns no announcer of its own.
+              onCopied={controller.onCopied}
+            />
+          </AgentPillProvider>
+        </BeadPillHost>
       )}
       {/* NO RECOMMENDED-ACTION ROW HERE any more. It used to sit in a `suggestionsSlot` directly
           above the compose box; it now renders over the terminal itself, pinned bottom-right on the

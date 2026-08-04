@@ -33,6 +33,7 @@
 // takes `.spoken` because that is the only field it is offered. `.spoken` is exactly the sentence
 // the app used to produce, so what a screen-reader user hears is unchanged by this feature.
 import { AGENT_REF_SCHEME, agentRefHref } from "./agentRefs";
+import { beadRefHref, isWellFormedBeadId } from "./beadRefs";
 
 /** The minimum an agent must be to be referenced: an id to open, a name to read. Structural so a
  *  feed agent, a roster agent and a test fixture all satisfy it without a shared nominal type. */
@@ -66,7 +67,11 @@ interface PlainSlot {
 }
 
 /** What `line` will interpolate. `string` is deliberately NOT a member — that exclusion is the
- *  whole mechanism, so widening this type reopens the bug. */
+ *  whole mechanism, so widening this type reopens the bug.
+ *
+ *  A BEAD reference reuses `AgentSlot`'s shape rather than adding a third variant, because the two
+ *  carry the same thing: markdown for the renderer and a flat sentence for the live region. The
+ *  slot's kind is about what `renderSlot` must DO, and it does the same thing to both. */
 export type Slot = AgentSlot | PlainSlot;
 
 /**
@@ -79,6 +84,15 @@ export type Slot = AgentSlot | PlainSlot;
  * An id that fails here degrades to plain text: the reader loses a click, never the name.
  */
 const WRITABLE_AGENT_ID = /^[A-Za-z0-9_-]{1,128}$/;
+
+/** The bead equivalent, and note it is the PARSER's own predicate rather than a mirrored literal.
+ *
+ *  Mirroring is what `WRITABLE_AGENT_ID` above does, and it is a standing hazard: two regexes that
+ *  must agree, in two files, with nothing failing when they drift. Bead ids admit a `.` that agent
+ *  ids refuse (`sparkle-hiju.4` is real), so the two classes are genuinely different and a copied
+ *  literal here would be a third spelling of a rule that already has two. `isWellFormedBeadId` is
+ *  exported from `./beadRefs` for exactly this — the writer asks the parser what it will accept. */
+const isWritableBeadId = isWellFormedBeadId;
 
 /**
  * Escape a display name for use as a markdown link LABEL.
@@ -122,6 +136,40 @@ export function ref(agent: ReferencableAgent): Slot {
     kind: AGENT_SLOT,
     md: `[@${escapeLabel(name)}](${agentRefHref(agent.id)})`,
     spoken: name,
+  };
+}
+
+/**
+ * Reference a BEAD — the unit of work, rather than the agent doing it.
+ *
+ * ══ WHY THIS EXISTS WHEN THE LINKIFIER WOULD HAVE CAUGHT IT ANYWAY ══════════════════════════════
+ * `remarkBeadRefs` finds bare ids in prose, so `flat(\`recorded on \${id}\`)` would already render a
+ * pill. Two things it cannot do, and both are the reason this is here:
+ *
+ *   • THE SPOKEN RENDERING. `postSparkle` announces every line through the column's ONE live region,
+ *     and the linkifier never touches `.spoken` — it operates on the parsed markdown tree, which the
+ *     announcer does not read. A bare id therefore gets read aloud CHARACTER BY CHARACTER
+ *     ("s-p-a-r-k-l-e dash one seven h m one") with no way to scroll past it. Passing the title lets
+ *     the sentence say what the bead IS and keep the id for the eye. This is the third-consumer tax
+ *     `agentRefs.ts` warns about, paid here for the same reason it is paid there for agents.
+ *   • THE WRITER'S TRUST BOUNDARY. An id the parser would reject must never be written, or the
+ *     clipboard carries a dead `[…](sparkle-bead:bad id)`. An id that fails degrades to plain text:
+ *     the reader loses a click, never the id.
+ *
+ * `title` is optional because the caller often has only an id — a bead it just filed, a bead named
+ * in a tool result. Without one the spoken form is the id, which is exactly what the app said before
+ * this existed, so nothing regresses by omitting it.
+ */
+export function bead(target: { id: string; title?: string }): Slot {
+  const id = target.id.trim();
+  if (!isWritableBeadId(id)) return { kind: PLAIN_SLOT, text: id };
+  const title = target.title?.trim();
+  return {
+    kind: AGENT_SLOT,
+    md: `[${escapeLabel(id)}](${beadRefHref(id)})`,
+    // The id LAST when there is a title, so a listener hears the meaning before the handle and can
+    // stop attending once they have it.
+    spoken: title === undefined || title === "" ? id : `${title} (${id})`,
   };
 }
 
