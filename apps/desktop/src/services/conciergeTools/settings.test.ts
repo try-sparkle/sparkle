@@ -279,7 +279,7 @@ describe("setProjectConfig", () => {
   // `parse_layer`, which "ignores unknown keys, errors on bad types/syntax" (config.rs:2056). So an
   // unhonored key is `ok` for a setting that does not move, which is exactly the GAP-2 failure this
   // module exists to prevent, turned on itself. Hence an ALLOWLIST, refused here.
-  it.each(["workers.max_concurrent", "ai.auto_approve", "tools.roborev", "voice.wake_word", "onepassword.vault_id"])(
+  it.each(["workers.max_concurrent", "ai.auto_approve", "tools.roborev", "voice.input_device_uid", "onepassword.vault_id"])(
     "refuses to SET %s at project scope — that section is machine-wide",
     async (key) => {
       const set = await setProjectConfig(ROOT, key, true, { confirm: true }, deps);

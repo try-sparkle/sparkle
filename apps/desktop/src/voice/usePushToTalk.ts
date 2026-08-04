@@ -35,8 +35,12 @@
 
 import { useEffect, useRef } from "react";
 
-/** The key that means "talk". `⌘` on this platform; held as a constant so the tray's chiclet
- *  (./sendMode `chicletFor`) and this listener are talking about the same key. */
+/** The key that means "talk", as `KeyboardEvent.key` reports it. Held as a constant so the tray's
+ *  chiclet (./sendMode `chicletFor`) and this listener are talking about the same key.
+ *
+ *  Its HUMAN-READABLE form is `./sendMode` `TALK_KEY_GLYPH` ("⌘") — a separate constant because the
+ *  copy that names this key ("Hold ⌘ to talk", ./dictationCopy) must not import a React hook module
+ *  to say so. The pair is one fact; change one and change the other. */
 export const TALK_KEY = "Meta";
 
 export interface UsePushToTalkArgs {

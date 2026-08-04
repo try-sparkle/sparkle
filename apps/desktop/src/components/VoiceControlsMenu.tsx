@@ -1,32 +1,40 @@
-import { useState, type CSSProperties } from "react";
-import { C, ON_BRAND_FILL } from "../theme/colors";
-import { SettingCheckbox } from "./SettingCheckbox";
-import { useSettingsStore } from "../stores/settingsStore";
-import { useDictationStore } from "../stores/dictationStore";
+import type { CSSProperties } from "react";
+import { C } from "../theme/colors";
 import { FONT_UI } from "../theme/scale";
-import {
-  setWakeWord,
-  setStopWord,
-  setPauseOnSubmit,
-  resetVoiceSettings,
-} from "../services/configActions";
-import {
-  DEFAULT_WAKE_WORD,
-  DEFAULT_STOP_WORD,
-} from "../voice/voiceDefaults";
+import { SEND_MODE_LABEL, TALK_KEY_GLYPH } from "../voice/sendMode";
 
-// "Voice controls" pane for the ⋯ settings dialog. Surfaces the always-listening mic toggle
-// (dictationStore.enabled — the same master used everywhere else), lets the user remap the wake
-// and stop words, and pick whether submitting a prompt keeps or pauses listening. Writes go to
-// config.toml via configActions (optimistic store update → file write → hydrate), matching the
-// other config-backed panes. The mic toggle stays in dictationStore (localStorage), not [voice].
+// "Voice controls" pane for the ⋯ settings dialog.
+//
+// ── WHAT THIS PANE NO LONGER CONTAINS, AND WHY ──────────────────────────────────────────────────
+// It used to open with an always-listening mic CHECKBOX ("Sparkle listens for your wake word
+// on-device and starts dictating when it hears it"), a WAKE WORD field, a STOP WORD field, a
+// "when you submit a prompt" Keep-listening/Pause-listening segment, and a reset button for the
+// four of them. All of it is gone, on the founder's instruction: "We're no longer doing the wake
+// word. This section should be removed. We now have push to talk or speak buttons; SPEAK SHOULD BE
+// ALWAYS ON."
+//
+// Every one of those controls existed to configure a wake word or to work around not having one:
+//  • the checkbox armed the always-listening loop — the tray's Push to talk / Speak positions ARE
+//    that arm now, and they say which mode they arm rather than only that something is on;
+//  • the two word fields configured phrases the matcher no longer looks for;
+//  • pause-on-submit dropped dictation back to "waiting for the wake word" after each message,
+//    which with no wake word would have left the mic unable to resume — it would have silently
+//    broken always-on Speak on the first send, which is the opposite of what was asked for.
+//
+// WHAT REPLACES IT IS NOT A SETTING. The three-position send tray in the concierge column is the
+// mic control, so the pane explains it rather than duplicating it: a control that exists in two
+// places is the two-controls-disagreeing failure voice/useSendMode was written to delete.
+//
+// The MICROPHONE PICKER still lives in this pane — it is rendered by SettingsDialog alongside this
+// component (see `AudioInputPicker`), and it is the one genuinely configurable thing left about
+// voice: which input device capture binds to.
 
-const label: CSSProperties = {
+const heading: CSSProperties = {
   display: "block",
   fontSize: 13,
   fontWeight: 600,
   color: C.cream,
-  marginBottom: 4,
+  marginBottom: 6,
   fontFamily: FONT_UI,
 };
 
@@ -38,172 +46,35 @@ const caption: CSSProperties = {
   fontFamily: FONT_UI,
 };
 
-const input: CSSProperties = {
-  width: "100%",
-  boxSizing: "border-box",
-  background: "transparent",
-  border: `1px solid ${C.muted}`,
-  borderRadius: 6,
-  padding: "6px 8px",
+const term: CSSProperties = {
+  fontWeight: 600,
   color: C.cream,
-  fontSize: 13,
-  fontFamily: FONT_UI,
 };
-
-const seg: CSSProperties = {
-  flex: 1,
-  display: "flex",
-  alignItems: "center",
-  justifyContent: "center",
-  border: `1px solid ${C.muted}`,
-  borderRadius: 6,
-  padding: "6px 0",
-  fontSize: 13,
-  fontFamily: FONT_UI,
-  cursor: "pointer",
-};
-
-/** A labeled word field that edits a LOCAL draft and only persists on blur, snapping back to the
- *  resolved (default-on-empty) value so the box never shows a blank the matcher wouldn't honor. */
-function WordField({
-  fieldLabel,
-  value,
-  fallback,
-  onCommit,
-  hint,
-}: {
-  fieldLabel: string;
-  value: string;
-  fallback: string;
-  onCommit: (word: string) => void;
-  hint?: string;
-}) {
-  const [draft, setDraft] = useState(value);
-  // Keep the draft in sync when the store value changes underneath us (e.g. Reset, live config edit).
-  const [lastValue, setLastValue] = useState(value);
-  if (value !== lastValue) {
-    setLastValue(value);
-    setDraft(value);
-  }
-  const commit = () => {
-    const resolved = draft.trim() || fallback;
-    setDraft(resolved);
-    onCommit(resolved);
-  };
-  const id = `voice-${fieldLabel.toLowerCase().replace(/\s+/g, "-")}`;
-  return (
-    <div style={{ marginTop: 12 }}>
-      <label htmlFor={id} style={label}>
-        {fieldLabel}
-      </label>
-      <input
-        id={id}
-        aria-label={fieldLabel}
-        type="text"
-        value={draft}
-        onChange={(e) => setDraft(e.target.value)}
-        onBlur={commit}
-        onKeyDown={(e) => {
-          if (e.key === "Enter") e.currentTarget.blur();
-        }}
-        style={input}
-        spellCheck={false}
-      />
-      {hint ? <div style={caption}>{hint}</div> : null}
-    </div>
-  );
-}
-
-/** The Keep listening | Pause listening segmented control. Pause (true) is the default. */
-function SubmitModeSegment({ pause, onChange }: { pause: boolean; onChange: (pause: boolean) => void }) {
-  const segStyle = (active: boolean): CSSProperties => ({
-    ...seg,
-    background: active ? C.teal : "transparent",
-    color: active ? ON_BRAND_FILL : C.muted,
-    borderColor: active ? C.teal : C.muted,
-  });
-  return (
-    <div role="group" aria-label="On submit" style={{ display: "flex", alignItems: "center", gap: 6 }}>
-      <button
-        type="button"
-        aria-pressed={!pause}
-        onClick={() => onChange(false)}
-        style={segStyle(!pause)}
-      >
-        Keep listening
-      </button>
-      <button
-        type="button"
-        aria-pressed={pause}
-        onClick={() => onChange(true)}
-        style={segStyle(pause)}
-      >
-        Pause listening
-      </button>
-    </div>
-  );
-}
 
 export function VoiceControlsMenu() {
-  const enabled = useDictationStore((s) => s.enabled);
-  const setEnabled = useDictationStore((s) => s.setEnabled);
-  const wakeWord = useSettingsStore((s) => s.wakeWord);
-  const stopWord = useSettingsStore((s) => s.stopWord);
-  const pauseOnSubmit = useSettingsStore((s) => s.pauseOnSubmit);
-
   return (
-    <div>
-      <SettingCheckbox
-        label="Voice dictation (always-listening mic)"
-        checked={enabled}
-        onToggle={() => setEnabled(!enabled)}
-      />
+    /* The testid is the visual harness's proof that the VOICE pane is the one on screen — its
+       `settings-voice` surface waits on this rather than on the dialog, which is open for every
+       category and would let a failed rail click photograph the wrong pane under this name. */
+    <div data-testid="settings-voice-pane">
+      <span style={heading}>How Sparkle listens</span>
       <div style={caption}>
-        When on, Sparkle listens for your wake word on-device and starts dictating when it hears it.
+        The send tray under the concierge message box is the microphone control. Its position
+        decides everything — there is nothing to say to start it and nothing to say to stop it.
       </div>
-
-      <WordField
-        fieldLabel="Wake word"
-        value={wakeWord}
-        fallback={DEFAULT_WAKE_WORD}
-        onCommit={setWakeWord}
-        hint="What you say to start talking to Sparkle. A distinctive, multi-syllable phrase is recognized most reliably; very short words work less well."
-      />
-      <WordField
-        fieldLabel="Stop word"
-        value={stopWord}
-        fallback={DEFAULT_STOP_WORD}
-        onCommit={setStopWord}
-        hint="What you say to stop active dictation."
-      />
-
-      <div style={{ marginTop: 14 }}>
-        <span style={label}>When you submit a prompt</span>
-        <SubmitModeSegment pause={pauseOnSubmit} onChange={setPauseOnSubmit} />
-        <div style={caption}>
-          {pauseOnSubmit
-            ? "Sparkle stops dictating after you submit and waits for your wake word again."
-            : "Sparkle keeps listening after you submit, so you can keep talking."}
-        </div>
-      </div>
-
-      <button
-        type="button"
-        onClick={() => void resetVoiceSettings()}
-        style={{
-          marginTop: 16,
-          background: "transparent",
-          border: `1px solid ${C.muted}`,
-          borderRadius: 6,
-          padding: "6px 10px",
-          color: C.muted,
-          fontSize: 12,
-          fontFamily: FONT_UI,
-          cursor: "pointer",
-        }}
-      >
-        Reset voice settings to defaults
-      </button>
+      <ul style={{ ...caption, margin: "10px 0 0", paddingLeft: 18 }}>
+        <li style={{ marginBottom: 6 }}>
+          <span style={term}>{SEND_MODE_LABEL.speak}</span> — the microphone is on continuously.
+          Just talk; pause when you&rsquo;re done and Sparkle sends it.
+        </li>
+        <li style={{ marginBottom: 6 }}>
+          <span style={term}>{SEND_MODE_LABEL.ptt}</span> — Hold {TALK_KEY_GLYPH} anywhere in the
+          window to talk, then let go to send.
+        </li>
+        <li>
+          <span style={term}>{SEND_MODE_LABEL.send}</span> — the microphone is off.
+        </li>
+      </ul>
     </div>
   );
 }

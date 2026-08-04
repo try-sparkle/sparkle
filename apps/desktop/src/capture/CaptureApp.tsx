@@ -17,8 +17,7 @@ import { useAuthStore } from "../stores/authStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { StatusDot } from "../components/StatusDot";
 import { SparkleWordmark } from "../components/SparkleWordmark";
-import { micHotPlaceholder, wakePlaceholder } from "../voice/dictationCopy";
-import { useSettingsStore } from "../stores/settingsStore";
+import { LIVE_COMPOSER_PLACEHOLDER } from "../voice/dictationCopy";
 import { subscribeToCrossWindowSync } from "../services/crossWindowSync";
 import { safeUnlisten } from "../services/safeUnlisten";
 import { chooseLayout } from "./captureLayout";
@@ -120,11 +119,13 @@ export function CaptureApp() {
 
   // ---- Voice dictation wiring (mirrors ThinkPanel's composer) ----------------------
   const audioActive = useDictationStore((s) => active && s.status === "listening");
-  const phase = useDictationStore((s) => s.phase);
-  const liveActive = audioActive && phase === "active";
-  const livePassive = audioActive && phase === "passive";
-  const wakeWord = useSettingsStore((s) => s.wakeWord);
-  const stopWord = useSettingsStore((s) => s.stopWord);
+  // CAPTURE IS LIVE — one fact, not two. `phase` used to split this into "dictating" and "waiting
+  // for the wake word" so each could get its own sentence; with the wake word retired the split has
+  // nothing to say, and a push-to-talk HOLD lands on the same side as Speak anyway.
+  const voiceLive = audioActive;
+  // NOT keyed on the concierge tray — see the note beside LIVE_COMPOSER_PLACEHOLDER. This window
+  // has no auto-send and is not where a push-to-talk hold routes, so the tray's two sentences would
+  // both be false here (roborev 57785).
   const interim = useDictationStore((s) => (active ? s.interim : ""));
 
   useEffect(() => {
@@ -323,10 +324,8 @@ export function CaptureApp() {
             onChange={(e) => setText(e.target.value)}
             rows={3}
             placeholder={
-              liveActive
-                ? micHotPlaceholder(stopWord)
-                : livePassive
-                ? wakePlaceholder(wakeWord)
+              voiceLive
+                ? LIVE_COMPOSER_PLACEHOLDER
                 : "Narrate what you captured, or type it here…"
             }
             style={{

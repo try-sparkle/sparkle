@@ -31,6 +31,11 @@ import { Composer } from "./Composer";
 import { useDictationStore } from "../stores/dictationStore";
 import { focusQuietly, resetProgrammaticFocusForTest } from "../services/programmaticFocus";
 import { useUiStore } from "../stores/uiStore";
+import {
+  LIVE_COMPOSER_PLACEHOLDER,
+  PTT_COMPOSER_PLACEHOLDER,
+  SPEAK_COMPOSER_PLACEHOLDER,
+} from "../voice/dictationCopy";
 import { usePromptHistoryStore } from "../stores/promptHistoryStore";
 
 beforeEach(() => {
@@ -47,6 +52,9 @@ beforeEach(() => {
   });
   resetProgrammaticFocusForTest(); // module state outlives a component tree
   useUiStore.getState().setComposerMinimized(false);
+  // Left at the DEFAULT (`send`) on purpose. This is an AGENT's composer, and its voice copy must
+  // not depend on the concierge tray at all — see the cases below.
+  useUiStore.getState().setConciergeSendMode("send");
   usePromptHistoryStore.setState({ history: [] });
 });
 afterEach(() => cleanup());
@@ -295,33 +303,43 @@ describe("Composer — auto-grow sizing baseline", () => {
 });
 
 describe("Composer — placeholder reflects audio state", () => {
-  // The mic-hot copy keys off ACTUAL capture (status === "listening") AND the ACTIVE phase, not
-  // the armed/mute intent (`enabled`) — see the audioActive regression test below.
-  it("invites the user to just start talking while ACTIVELY dictating (listening + active)", () => {
+  // The live copy keys off ACTUAL capture (status === "listening"), not the armed/mute intent
+  // (`enabled`) — see the audioActive regression test below — and names the MODE from the tray.
+  // THE MIC IS HOT AND THE TRAY IS ON SEND — the state this composer used to go SILENT in. Reading
+  // the concierge tray meant `micCaptionKind` returned "none" here, so an agent composer with a
+  // microphone armed from the header ring painted an empty placeholder and gave the user no cue at
+  // all that they were being recorded (roborev 57785). The default `send` in the fixture above is
+  // what makes this case real rather than contrived.
+  it("says the mic is hot even with the concierge tray on Send", () => {
     act(() => useDictationStore.setState({ enabled: true, status: "listening", phase: "active" }));
     renderComposer();
     const body = document.body.textContent ?? "";
-    expect(body).toContain("I'm listening, so just start talking.");
-    expect(body).toContain("Sparkle, pause"); // the cyan→blue gradient stop cue
-    expect(body).toContain("to finish.");
+    expect(body).toContain(LIVE_COMPOSER_PLACEHOLDER);
     expect(body).not.toContain("Hey Sparkle");
-  });
-
-  // Bug fix (voice-status): capturing but still PASSIVE (waiting for the wake word) must NOT claim
-  // active dictation. It shows the honest wake-word copy that mirrors the sidebar caption.
-  it("shows the wake-word copy when capturing but still passive (not yet dictating)", () => {
-    act(() => useDictationStore.setState({ enabled: true, status: "listening", phase: "passive" }));
-    renderComposer();
-    const body = document.body.textContent ?? "";
-    expect(body).toContain("Mic paused.");
-    expect(body).toContain("Hey Sparkle");
-    expect(body).toContain("or you can type here instead");
-    // It must NOT read as active dictation.
-    expect(body).not.toContain("I'm listening, so just start talking.");
     expect(body).not.toContain("Sparkle, pause");
   });
 
-  it("keeps the mic-hot copy on focus (it subsumes the typing hint)", () => {
+  // …AND IT IS THE SAME SENTENCE WHATEVER THE TRAY SAYS. This box has no auto-send (`useAutoSend` is
+  // mounted only by ConciergeHost) and is not where a push-to-talk hold routes (a hold claims
+  // `voiceSurface: "concierge"`), so BOTH tray sentences would be false here — "pause when you're
+  // done" promises a dispatch that never comes, and "Hold ⌘ to talk" points at a gesture that fills
+  // a different column.
+  it("never borrows the tray's copy, in any position or live phase", () => {
+    for (const mode of ["send", "ptt", "speak"] as const) {
+      for (const phase of ["passive", "active"] as const) {
+        act(() => useUiStore.getState().setConciergeSendMode(mode));
+        act(() => useDictationStore.setState({ enabled: true, status: "listening", phase }));
+        renderComposer();
+        const body = document.body.textContent ?? "";
+        expect(body, `${mode}/${phase}`).toContain(LIVE_COMPOSER_PLACEHOLDER);
+        expect(body, `${mode}/${phase}`).not.toContain(PTT_COMPOSER_PLACEHOLDER);
+        expect(body, `${mode}/${phase}`).not.toContain(SPEAK_COMPOSER_PLACEHOLDER);
+        cleanup();
+      }
+    }
+  });
+
+  it("keeps the live copy on focus (it subsumes the typing hint)", () => {
     act(() => useDictationStore.setState({ enabled: true, status: "listening", phase: "active" }));
     renderComposer();
     const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
@@ -331,8 +349,8 @@ describe("Composer — placeholder reflects audio state", () => {
     fireEvent.focus(ta);
     expect(document.activeElement).toBe(ta);
     const body = document.body.textContent ?? "";
-    // Mic-hot copy stays put on focus; the muted focused hint must NOT appear.
-    expect(body).toContain("I'm listening, so just start talking.");
+    // The live copy stays put on focus; the muted focused hint must NOT appear.
+    expect(body).toContain(LIVE_COMPOSER_PLACEHOLDER);
     expect(body).not.toContain("or type your command here");
   });
 

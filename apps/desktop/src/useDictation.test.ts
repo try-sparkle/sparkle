@@ -5,7 +5,6 @@
  * Tauri APIs are mocked so the test runs in a plain Node/jsdom environment.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { advance } from "./voice/wakeMachine";
 
 // ---------------------------------------------------------------------------
 // Tauri mocks — must be set up before importing the modules under test
@@ -46,7 +45,11 @@ vi.mock("@tauri-apps/api/core", () => ({
 import { useDictationStore } from "./stores/dictationStore";
 import { useAuthStore } from "./stores/authStore";
 import { useUiStore } from "./stores/uiStore";
-import { createDictationController, cloudStreamCommandFor } from "./useDictation";
+import {
+  createDictationController,
+  cloudStreamCommandFor,
+  IDLE_RELAY_PARK_MS,
+} from "./useDictation";
 import type { FocusOwner } from "./voice/dictationFocus";
 
 /** A minimal signed-in `me` for the credits-pill tests. */
@@ -893,53 +896,30 @@ describe("dictation://speech-end (the auto-send rail's silence signal)", () => {
   });
 });
 
-describe("cloudStreamCommandFor (local gate, then stream)", () => {
-  it("opens the cloud stream when transitioning to ACTIVE (wake word)", () => {
-    expect(cloudStreamCommandFor({ phase: "active", insert: null, transitioned: true })).toBe(
-      "start_cloud_stream",
-    );
+// The relay's lifetime now hangs off the PHASE EDGE rather than off a wake/stop transition, because
+// segments cannot move the phase any more — the tray is its only writer. Keyed on the old shape this
+// would never fire again, i.e. Speak would arm a microphone whose cloud stream never opened.
+describe("cloudStreamCommandFor (the phase edge owns the relay)", () => {
+  it("opens the cloud stream on passive → active (entering Speak, or a push-to-talk hold)", () => {
+    expect(cloudStreamCommandFor("passive", "active")).toBe("start_cloud_stream");
   });
 
-  it("closes the cloud stream when transitioning to PASSIVE (stop word)", () => {
-    expect(cloudStreamCommandFor({ phase: "passive", insert: null, transitioned: true })).toBe(
-      "stop_cloud_stream",
-    );
+  it("closes it on active → passive (leaving Speak, or the hold ending)", () => {
+    expect(cloudStreamCommandFor("active", "passive")).toBe("stop_cloud_stream");
   });
 
-  it("does nothing for a non-transition (text inserted mid-dictation keeps the stream open)", () => {
-    expect(cloudStreamCommandFor({ phase: "active", insert: "more words", transitioned: false })).toBeNull();
-    expect(cloudStreamCommandFor({ phase: "passive", insert: null, transitioned: false })).toBeNull();
-  });
-});
-
-describe("ambient segment routing via the phase machine", () => {
-  beforeEach(() => {
-    useDictationStore.setState({ phase: "passive", insertTarget: null, enabled: true });
-  });
-
-  it("passive: wake segment flips phase to active and inserts the remainder", () => {
-    const inserted: string[] = [];
-    useDictationStore.getState().registerInsert((t) => inserted.push(t));
-
-    // Simulate what the ambient onSegment does (the hook wires this to dictation://partial):
-    const seg = "hey sparkle open the settings";
-    const r = advance(useDictationStore.getState().phase, seg);
-    useDictationStore.getState().setPhase(r.phase);
-    if (r.insert) useDictationStore.getState().insert(r.insert);
-
-    expect(useDictationStore.getState().phase).toBe("active");
-    expect(inserted).toEqual(["open the settings"]);
-  });
-
-  it("passive: non-wake speech does not insert", () => {
-    const inserted: string[] = [];
-    useDictationStore.getState().registerInsert((t) => inserted.push(t));
-    const r = advance("passive", "just talking to a colleague");
-    if (r.insert) useDictationStore.getState().insert(r.insert);
-    expect(inserted).toEqual([]);
-    expect(r.phase).toBe("passive");
+  it("does nothing when the phase did not actually change", () => {
+    // Load-bearing: this subscriber runs on EVERY store update (levels arrive ~25x/sec), so a
+    // re-observation of an unchanged phase must not re-handshake the billable relay.
+    expect(cloudStreamCommandFor("active", "active")).toBeNull();
+    expect(cloudStreamCommandFor("passive", "passive")).toBeNull();
   });
 });
+
+// NOTE: the real routing gate is exercised end-to-end through `useAmbientVoice` in
+// useDictation.arm.test.tsx. What used to sit here re-implemented the wake machine inline (calling
+// `advance` and applying its result by hand), which proved nothing about the hook — see the header
+// on that file's terminal-path block, and roborev 56056 for the mutation it let through.
 
 describe("multiple mounted composers (regression: dictation must not leak across agents)", () => {
   // Repro for the bug where dictating into one agent's composer also filled a
@@ -1372,12 +1352,17 @@ describe("dictation follows focus — the caret in a TERMINAL redirects routing"
     ctrl.cleanup();
   });
 
-  // ══ THE PHASE EDGE MUST NOT TOUCH THE STREAM (roborev 56061) ═══════════════════════════════
-  // Reconciling the status through the whole focus handler also re-entered the resume path, and the
-  // wake transition is the exact moment that guard starts passing: `setPhase("active")` fired a
-  // resume synchronously, then `onSegment` opened the relay again — two handshakes in one tick, and
-  // the relay debits a first minute UP FRONT, so the user paid twice for one wake word.
-  it("opens the billable relay ONCE on a wake, not twice", async () => {
+  // ══ THE PHASE EDGE OPENS THE RELAY — EXACTLY ONCE (roborev 56061, re-aimed) ════════════════
+  // This case used to assert the OPPOSITE: that a phase edge must NOT touch the stream. That was
+  // right while the SEGMENT HANDLER opened the relay on the wake word, because reconciling through
+  // the focus handler re-entered the resume path in the same tick — two handshakes, and the relay
+  // debits a first minute UP FRONT, so the user paid twice for one wake word.
+  //
+  // With the wake word retired, segments cannot move the phase at all, so there is no second opener
+  // left to race — and if this edge stayed inert the relay would never open at all: Speak would arm
+  // a microphone with no cloud stream behind it. The edge is now the single opener, and what still
+  // has to hold is that it fires ONCE per edge, not once per store update (levels arrive ~25x/sec).
+  it("opens the billable relay exactly ONCE per phase edge", async () => {
     useDictationStore.setState({
       enabled: true,
       status: "listening",
@@ -1394,15 +1379,310 @@ describe("dictation follows focus — the caret in a TERMINAL redirects routing"
       isWindowActive: () => true,
       focusOwner: () => "other",
     });
-    // Arm the latch the app-level blur handler sets unconditionally — the ordinary state after any
-    // tab-away while the mic is armed-but-passive, which is what made the resume guard start passing.
-    emit("dictation://focus", false);
     onResumeActive.mockClear();
-    // The wake transition itself. `onSegment` (in the hook) opens the relay for this transition; if
-    // the phase edge ALSO resumes, that is the second open and the second first-minute debit.
+    // Entering Speak (or beginning a push-to-talk hold): the mic intent writes the phase, and that
+    // edge is what opens the relay.
     useDictationStore.getState().setPhase("active");
-    expect(onResumeActive).not.toHaveBeenCalled();
+    expect(onResumeActive).toHaveBeenCalledTimes(1);
+    // Further store updates that do NOT change the phase must not re-handshake it. `setLevel` is the
+    // realistic one: it fires ~25x/sec for the whole capturing window, through this same subscriber.
+    useDictationStore.getState().setLevel(0.4);
+    useDictationStore.getState().setLevel(0.7);
+    useDictationStore.getState().setPhase("active");
+    expect(onResumeActive).toHaveBeenCalledTimes(1);
     ctrl.cleanup();
+  });
+
+  // ══ THE CLOSE SIDE OF THE PHASE EDGE, AND ITS WINDOW GUARD (roborev 57785) ═════════════════
+  // The open side had a case; the close side had none, and neither did the `isWindowActive()` term
+  // on it — so deleting that guard, or the whole `else if` branch, left the suite green while a
+  // background window closed the relay the focused one had just opened. That is exactly the
+  // "a guard whose removal no test can detect" pattern useDictation.ts warns about two paragraphs
+  // above the code these cover.
+  it("closes the billable relay when the phase leaves ACTIVE", async () => {
+    useDictationStore.setState({
+      enabled: true,
+      status: "listening",
+      phase: "active",
+      focusOwner: "other",
+    });
+    const ctrl = await createDictationController({
+      onSegment: vi.fn(),
+      isWindowActive: () => true,
+      focusOwner: () => "other",
+    });
+    invoke.mockClear();
+    useDictationStore.getState().setPhase("passive");
+    expect(invoke).toHaveBeenCalledWith("stop_cloud_stream");
+    ctrl.cleanup();
+  });
+
+  it("does NOT close it from a window that is not the focused dictation target", async () => {
+    // `phase` is persisted and CROSS-WINDOW SYNCED, so one tray gesture in ONE window runs this
+    // subscriber in EVERY window. Without the guard, a background window calls `stop_cloud_stream`
+    // on the single global relay the focused window owns.
+    useDictationStore.setState({
+      enabled: true,
+      status: "listening",
+      phase: "active",
+      focusOwner: "other",
+    });
+    const ctrl = await createDictationController({
+      onSegment: vi.fn(),
+      isWindowActive: () => false,
+      focusOwner: () => "other",
+    });
+    invoke.mockClear();
+    useDictationStore.getState().setPhase("passive");
+    expect(invoke).not.toHaveBeenCalledWith("stop_cloud_stream");
+    ctrl.cleanup();
+  });
+
+  // ══ THE IDLE PARK — SILENCE MUST NOT KEEP PAYING FOR A SOCKET (roborev 57785, High) ═════════
+  // Both closers of the relay went with the wake word (the stop word, and pause-on-submit), so
+  // "Speak is always on" left the billable socket open through arbitrary silence — metered per
+  // ELAPSED minute, debited up front. These pin the replacement.
+  it("parks the relay after a minute of silence, without disarming the mic", async () => {
+    vi.useFakeTimers();
+    try {
+      useDictationStore.setState({
+        enabled: true,
+        status: "listening",
+        phase: "active",
+        focusOwner: "other",
+        speaking: true,
+      });
+      const ctrl = await createDictationController({
+        onSegment: vi.fn(),
+        isWindowActive: () => true,
+        focusOwner: () => "other",
+      });
+      invoke.mockClear();
+      // The user stops talking. Nothing should happen yet — a pause is not the end of a session.
+      useDictationStore.getState().setSpeaking(false);
+      vi.advanceTimersByTime(IDLE_RELAY_PARK_MS - 1_000);
+      expect(invoke).not.toHaveBeenCalledWith("stop_cloud_stream");
+      // …and then the clock runs out.
+      vi.advanceTimersByTime(2_000);
+      expect(invoke).toHaveBeenCalledWith("stop_cloud_stream");
+      // THE MICROPHONE IS UNTOUCHED, which is the whole point: "always on" is about the mic, not
+      // the socket. Asserting this is what stops a future "fix" from parking by disarming.
+      const st = useDictationStore.getState();
+      expect(st.enabled).toBe(true);
+      expect(st.phase).toBe("active");
+      ctrl.cleanup();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a word before the minute is up cancels the park entirely", async () => {
+    vi.useFakeTimers();
+    try {
+      useDictationStore.setState({
+        enabled: true,
+        status: "listening",
+        phase: "active",
+        focusOwner: "other",
+        speaking: true,
+      });
+      const ctrl = await createDictationController({
+        onSegment: vi.fn(),
+        isWindowActive: () => true,
+        focusOwner: () => "other",
+      });
+      invoke.mockClear();
+      useDictationStore.getState().setSpeaking(false);
+      vi.advanceTimersByTime(IDLE_RELAY_PARK_MS - 5_000);
+      // He starts talking again mid-thought. An ordinary pause must not cost him the socket.
+      useDictationStore.getState().setSpeaking(true);
+      vi.advanceTimersByTime(IDLE_RELAY_PARK_MS * 2);
+      expect(invoke).not.toHaveBeenCalledWith("stop_cloud_stream");
+      ctrl.cleanup();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("re-arms the park when a resume reopens the relay — the alt-tab path", async () => {
+    vi.useFakeTimers();
+    try {
+      useDictationStore.setState({
+        enabled: true,
+        status: "listening",
+        phase: "active",
+        focusOwner: "other",
+        speaking: true,
+      });
+      const ctrl = await createDictationController({
+        onSegment: vi.fn(),
+        onResumeActive: vi.fn(),
+        isWindowActive: () => true,
+        focusOwner: () => "other",
+      });
+      // Speak, go quiet, let the park fire.
+      useDictationStore.getState().setSpeaking(false);
+      vi.advanceTimersByTime(IDLE_RELAY_PARK_MS + 1_000);
+      expect(invoke).toHaveBeenCalledWith("stop_cloud_stream");
+
+      // Alt-tab away and back. THE RELAY REOPENS — and `speaking` is ALREADY false, so no VAD edge
+      // can ever fire again. Without a re-arm here the socket bills indefinitely while the user
+      // reads, which is the very High the park exists to close (roborev 57795).
+      ctrl.notifyWindowFocus(false);
+      ctrl.notifyWindowFocus(true);
+      invoke.mockClear();
+      vi.advanceTimersByTime(IDLE_RELAY_PARK_MS + 1_000);
+      expect(invoke).toHaveBeenCalledWith("stop_cloud_stream");
+      ctrl.cleanup();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a park pending in a BACKGROUND window never closes the focused window's relay", async () => {
+    vi.useFakeTimers();
+    try {
+      useDictationStore.setState({
+        enabled: true,
+        status: "listening",
+        phase: "active",
+        focusOwner: "other",
+        speaking: true,
+      });
+      // This controller stands in for window A, which goes to the background.
+      let focused = true;
+      const ctrl = await createDictationController({
+        onSegment: vi.fn(),
+        isWindowActive: () => focused,
+        focusOwner: () => "other",
+      });
+      // A blurs. Its teardown writes `speaking: false`, which is what used to ARM a timer inside a
+      // window that no longer owns anything — `phase` is cross-window synced and RETAINED through a
+      // blur, so that timer would later find its own phase still "active".
+      ctrl.notifyWindowFocus(false);
+      focused = false;
+      invoke.mockClear();
+      // Meanwhile window B opens a session on the single global relay. A's stale timer must not
+      // reach out and close it.
+      vi.advanceTimersByTime(IDLE_RELAY_PARK_MS * 3);
+      expect(invoke).not.toHaveBeenCalledWith("stop_cloud_stream");
+      ctrl.cleanup();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a NON-ROUTABLE terminal teardown cancels the pending park in the same window", async () => {
+    // The path my first decline got wrong (roborev 57802). A terminal teardown RETAINS
+    // `phase: "active"`, so `tearDownOwnedStream`'s own early-return never fires here — and the
+    // window stays focused, so the timer's `isWindowActive()` guard passes too. Both of the guards
+    // I claimed covered this path are bypassed, and the teardown would run a second time.
+    //
+    // The terminal is made non-routable through `status: "error"` — `terminalRoutingArmed` is
+    // false when the mic is faulted — which is what turns the caret landing there from a
+    // DESTINATION into a teardown. (My first attempt at this test used a healthy mic, where a
+    // terminal is a destination and no teardown happens at all.)
+    vi.useFakeTimers();
+    try {
+      useDictationStore.setState({
+        enabled: true,
+        status: "listening",
+        phase: "active",
+        focusOwner: "other",
+        speaking: true,
+      });
+      let owner: FocusOwner = "other";
+      const ctrl = await createDictationController({
+        onSegment: vi.fn(),
+        isWindowActive: () => true,
+        focusOwner: () => owner,
+      });
+      // Quiet — the park is now pending.
+      useDictationStore.getState().setSpeaking(false);
+      // The mic faults and the caret lands in a terminal: not a destination, so the relay closes.
+      useDictationStore.setState({ status: "error" });
+      owner = "terminal";
+      invoke.mockClear();
+      ctrl.notifyFocusOwner("terminal");
+      const closes = () => invoke.mock.calls.filter((c) => c[0] === "stop_cloud_stream").length;
+      expect(closes()).toBe(1);
+      // The pending park must have gone with the relay — no SECOND close a minute later.
+      vi.advanceTimersByTime(IDLE_RELAY_PARK_MS * 2);
+      expect(closes()).toBe(1);
+      ctrl.cleanup();
+    } finally {
+      vi.useRealTimers();
+      useDictationStore.setState({ status: "idle" });
+    }
+  });
+
+  it("a teardown while the user is MID-UTTERANCE does not arm a park behind itself", async () => {
+    // THE SIBLING OF THE CASE ABOVE, and the one that catches an ordering bug it cannot
+    // (roborev 57804). That case goes quiet BEFORE the teardown, so the `setSpeaking(false)` inside
+    // `tearDownOwnedStream` is a value no-op and the subscriber's own edge guard filters it. Here
+    // the room is still noisy at teardown, so that write is a real falling edge — and it used to
+    // re-arm the park the teardown had just cancelled, five lines earlier.
+    //
+    // Reachable exactly as set up here: `dictation://error` writes `status: "error"` and never
+    // clears `speaking`, so a mic that faults mid-word leaves `speaking: true`; the caret then
+    // landing in a terminal that can no longer receive is a teardown with the room still noisy.
+    vi.useFakeTimers();
+    try {
+      useDictationStore.setState({
+        enabled: true,
+        status: "listening",
+        phase: "active",
+        focusOwner: "other",
+        speaking: true,
+      });
+      let owner: FocusOwner = "other";
+      const ctrl = await createDictationController({
+        onSegment: vi.fn(),
+        isWindowActive: () => true,
+        focusOwner: () => owner,
+      });
+      // NO `setSpeaking(false)` here — that is the whole difference from the case above.
+      useDictationStore.setState({ status: "error" });
+      owner = "terminal";
+      invoke.mockClear();
+      ctrl.notifyFocusOwner("terminal");
+      const closes = () => invoke.mock.calls.filter((c) => c[0] === "stop_cloud_stream").length;
+      expect(closes()).toBe(1);
+      // A park armed by the teardown's own `setSpeaking(false)` would fire here and close again.
+      vi.advanceTimersByTime(IDLE_RELAY_PARK_MS * 2);
+      expect(closes()).toBe(1);
+      ctrl.cleanup();
+    } finally {
+      vi.useRealTimers();
+      useDictationStore.setState({ status: "idle", speaking: false });
+    }
+  });
+
+  it("does not leave a park timer running after the controller is torn down", async () => {
+    vi.useFakeTimers();
+    try {
+      useDictationStore.setState({
+        enabled: true,
+        status: "listening",
+        phase: "active",
+        focusOwner: "other",
+        speaking: true,
+      });
+      const ctrl = await createDictationController({
+        onSegment: vi.fn(),
+        isWindowActive: () => true,
+        focusOwner: () => "other",
+      });
+      useDictationStore.getState().setSpeaking(false);
+      ctrl.cleanup();
+      invoke.mockClear();
+      // A timer that survived teardown would fire against a store the NEXT controller owns, parking
+      // a relay this one never opened.
+      vi.advanceTimersByTime(IDLE_RELAY_PARK_MS * 2);
+      expect(invoke).not.toHaveBeenCalledWith("stop_cloud_stream");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   // ══ A BACKGROUND WINDOW MUST NOT TEAR DOWN THE FOCUSED WINDOW'S RELAY ══════════════════════

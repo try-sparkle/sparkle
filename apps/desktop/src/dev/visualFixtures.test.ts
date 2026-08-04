@@ -394,6 +394,50 @@ describe("seeding never reaches disk", () => {
     }
   });
 
+  // ── THE HANDLE'S RETURN VALUE IS THE HARNESS'S ONLY PROOF (roborev 57793) ────────────────────
+  // The `mic` capture step verifies its effect by comparing what this returns against what it asked
+  // for — the post-fix shape the `cable` step had to learn. That comparison is worth nothing if the
+  // handle reports the request back instead of the STORE, so this drives the real handle and reads
+  // the store independently.
+  //
+  // `window` is stubbed because this suite runs in the NODE environment and the handles are
+  // deliberately installed behind a `typeof window` guard. Stubbing it is what lets the real
+  // installed function be called at all, rather than re-implementing it here — which would test a
+  // copy and leave the shipped one uncovered.
+  it("__sparkleMic returns the state it actually wrote, not the state it was asked for", () => {
+    const win: Record<string, unknown> = {};
+    vi.stubGlobal("window", win);
+    try {
+      expect(applyVisualFixtures("?visual=1", ON)).toBe(true);
+      const mic = win.__sparkleMic as (s: {
+        enabled: boolean;
+        status?: string;
+        phase?: string;
+      }) => { enabled: boolean; status: string; phase: string };
+      expect(typeof mic).toBe("function");
+
+      const live = mic({ enabled: true, status: "listening", phase: "active" });
+      // It reports the STORE — read back independently, so a handle that echoed its argument would
+      // still have to have written it.
+      expect(live).toEqual({ enabled: true, status: "listening", phase: "active" });
+      expect(useDictationStore.getState().status).toBe("listening");
+      expect(useDictationStore.getState().phase).toBe("active");
+
+      // The `{enabled:false}` form every pre-existing caller uses: status DEFAULTS to idle rather
+      // than inheriting whatever the previous surface left behind, which is the cross-surface leak
+      // the capture harness's whole reset exists to stop.
+      const off = mic({ enabled: false });
+      expect(off.status).toBe("idle");
+      expect(useDictationStore.getState().status).toBe("idle");
+      // …and an unstated phase is LEFT ALONE rather than reset, which is why the step makes its
+      // phase comparison conditional.
+      expect(off.phase).toBe("active");
+    } finally {
+      vi.unstubAllGlobals();
+      useDictationStore.setState({ enabled: false, status: "idle", phase: "passive" });
+    }
+  });
+
   it("leaves the persisted UI blob untouched — ?projects=2 writes the OPEN-TAB set", () => {
     // `openProjectIds` is on uiStore's PERSISTED side, and the fixture now writes it for
     // `?projects=2` as well as `?pairs=2`. Undetached, a developer who opened their own dev server

@@ -165,7 +165,6 @@ import { OpenPrMenu, agentLinkForPr, type PrScope } from "./OpenPrMenu";
 import { useCurrentProjectId } from "../windowContext";
 import { describePaths } from "../services/logSafePaths";
 import { log } from "../logger";
-import { maybePauseOnSubmit } from "../services/dictationControls";
 import { useConciergeDictation } from "../useConciergeDictation";
 import { useAutoSend, notifyManualSend } from "../voice/useAutoSend";
 import { useSendMode } from "../voice/useSendMode";
@@ -3292,17 +3291,21 @@ export function ConciergeHost({
       // class of bug needing a general fallback. The resolvable-but-unreachable case (agent closed or
       // cloud) does have a voice: `deliver`'s `addressed && !addressable` explains it by name.
       // Same courtesy the agent composer extends: honor the pause-on-submit voice setting so the
-      // mic does not keep transcribing the room while the send is handled.
+      // ── NOTHING PAUSES THE MIC ON SUBMIT ANY MORE ───────────────────────────────────────────
+      // A submit used to call `maybePauseOnSubmit()`, which dropped dictation from active back to
+      // "waiting for the wake word" — on by default, and skipped for auto-fires precisely because
+      // doing it there "would have the feature undo itself", making the user re-say the wake word
+      // after every hands-free send.
       //
-      // NOT ON AN AUTO-FIRE, and this is a decision rather than an oversight. The rail reaches
-      // `send` through the composer's own submit, so it would inherit a path that until now only
-      // ever ran behind a deliberate button press. `DEFAULT_PAUSE_ON_SUBMIT` is true, so every
-      // auto-send would drop dictation active → passive, clear the interim and close the Deepgram
-      // stream — making the user re-say the wake word after each one, on the shipped defaults. That
-      // is precisely the hands-free loop the rail exists to create, so pausing here would have the
-      // feature undo itself. A MANUAL press still pauses: the user took their hands to the keyboard,
-      // which is the gesture the setting was written for.
-      if (!autoFiringRef.current) maybePauseOnSubmit();
+      // With the wake word retired there is no phrase to resume with, so that pause would leave the
+      // microphone unable to come back at all: Speak would go quiet after the first message and stay
+      // quiet until the user moved the tray. "SPEAK SHOULD BE ALWAYS ON" is the requirement, and the
+      // tray is now the only thing that starts or stops dictation — a send is not a mic gesture.
+      //
+      // It was also producing the wrong state elsewhere. `pauseActiveDictation` wrote `phase` while
+      // capture stayed LIVE, so the composer painted "Listening paused" over a backend still
+      // emitting partials seconds later — a second writer of the phase, which is exactly what
+      // voice/dictationPhase now documents as having exactly one.
       const id = nextId("you");
       // A named agent OVERRIDES what happens to be selected — that is the whole point of naming one.
       // `addressedAgent` folds in the Improve-Sparkle mount (above), which resolves to the same

@@ -78,7 +78,6 @@ vi.mock("../stores/sparklePrefsStore", () => ({
 vi.mock("../useConciergeDictation", () => ({
   useConciergeDictation: () => ({ interim: "", toggleMic: vi.fn(), registerInsert: vi.fn() }),
 }));
-vi.mock("../services/dictationControls", () => ({ maybePauseOnSubmit: vi.fn() }));
 // The recommended-action row mounts a real metered engine; this suite is about the compose box, so
 // it is stubbed out entirely rather than fed a stage to portal into.
 vi.mock("./Concierge/ConciergeSuggestions", () => ({ ConciergeSuggestions: () => null }));

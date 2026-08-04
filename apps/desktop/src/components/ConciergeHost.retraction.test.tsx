@@ -65,7 +65,6 @@ vi.mock("./Concierge/ConciergeSuggestions", () => ({ ConciergeSuggestions: () =>
 vi.mock("../useConciergeDictation", () => ({
   useConciergeDictation: () => ({ interim: "", toggleMic: vi.fn(), registerInsert: vi.fn() }),
 }));
-vi.mock("../services/dictationControls", () => ({ maybePauseOnSubmit: vi.fn() }));
 
 import { ConciergeHost } from "./ConciergeHost";
 import { useUiStore } from "../stores/uiStore";

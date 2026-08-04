@@ -386,7 +386,7 @@ const PROJECT_IGNORED_SECTIONS: Record<string, string> = {
   roborev: "the roborev consent flag is machine-wide",
   onepassword: "the vault belongs to your 1Password account, not to one repo",
   capture: "the capture shortcut is machine-wide",
-  voice: "the wake/stop words are a machine-wide preference",
+  voice: "the microphone selection is machine-wide, not per-repo",
 };
 
 /**

@@ -22,8 +22,23 @@ import { BACKEND_MIC_DENIED } from "../voice/backendVoiceErrors";
 import { useDictationStore } from "../stores/dictationStore";
 import { useAuthStore } from "../stores/authStore";
 import { useUiStore } from "../stores/uiStore";
-import { PAUSED_WINDOW_CAPTION } from "../voice/dictationCopy";
+import {
+  PAUSED_WINDOW_CAPTION,
+  PTT_CAPTION_ACTION,
+  PTT_CAPTION_HEADLINE,
+  SPEAK_CAPTION_ACTION,
+  SPEAK_CAPTION_HEADLINE,
+} from "../voice/dictationCopy";
 import { C } from "../theme/colors";
+
+// Both LINES of the push-to-talk caption, so it cannot be satisfied by a stray word turning up in an
+// aria-label or title. Module-scoped because two separate describe blocks assert on it — the caption
+// block and the mic-indicator block, which is where the founder's original bug showed. It is a DIV,
+// not a button: the caption used to toggle phase on click, which was a second mic control.
+const pttHint = () => {
+  const t = document.body.textContent?.replace(/\s+/g, " ") ?? "";
+  return t.includes(PTT_CAPTION_HEADLINE) && t.includes(PTT_CAPTION_ACTION) ? t : null;
+};
 
 // jsdom has no rAF by the time the effect runs in some setups; stub a no-op so the live
 // loop can schedule without throwing. We assert on the rendered caption, not animation frames.
@@ -179,25 +194,70 @@ describe("LogoWaveform — the first-run model download caption", () => {
   });
 });
 
+// ── THE VISUAL HARNESS'S CONTRACT, PINNED HERE ────────────────────────────────────────────────
+// `data-mic-presentation` is what the three `send-tray-*` capture surfaces wait on to prove the app
+// actually reached the state their filenames claim (scripts/visual/surfaces.mjs). Nothing else in
+// the TS suite mentions it, so without this block a rename of a `MicPresentation` member — a
+// type-safe refactor that updates every TS caller — or a routine move of the root <div> would leave
+// the whole suite green while the harness waited on a string nothing produces. That failure would
+// surface only as a 30s timeout the next time someone ran the capture by hand, and the visual
+// harness is in no CI workflow, so "weeks later" is realistic (roborev 57803).
+//
+// Its siblings are pinned exactly this way: `data-wired` by Workspace.conciergeMount.test.tsx,
+// `data-mode` by SendModeTray.test.tsx.
+describe("LogoWaveform — the data-mic-presentation the capture harness reads", () => {
+  const attr = () =>
+    screen.getByTestId("logo-waveform").getAttribute("data-mic-presentation");
+
+  it("publishes the exact three values the send-tray surfaces wait on", () => {
+    // Speak, live and routing → what `send-tray-speak` waits for.
+    useUiStore.setState({ conciergeSendMode: "speak" });
+    useDictationStore.setState({ enabled: true, status: "listening", phase: "active" });
+    render(<LogoWaveform />);
+    expect(attr()).toBe("activeListening");
+    cleanup();
+
+    // Push to talk at rest: armed and capturing, routing nothing → `send-tray-ptt`.
+    useUiStore.setState({ conciergeSendMode: "ptt" });
+    useDictationStore.setState({ enabled: true, status: "listening", phase: "passive" });
+    render(<LogoWaveform />);
+    expect(attr()).toBe("passiveWaiting");
+    cleanup();
+
+    // Mic released → `send-tray-send`.
+    useUiStore.setState({ conciergeSendMode: "send" });
+    useDictationStore.setState({ enabled: false, status: "idle", phase: "passive" });
+    render(<LogoWaveform />);
+    expect(attr()).toBe("off");
+  });
+
+  it("reports the DERIVED state, not the raw store — a paused mic is not a listening one", () => {
+    // The whole reason the harness waits on this rather than trusting its own store write: the
+    // attribute has to be what `deriveMicPresentation` concluded. `enabled` + `phase: "active"` with
+    // capture NOT live is the case that separates the two.
+    useUiStore.setState({ conciergeSendMode: "speak" });
+    useDictationStore.setState({ enabled: true, status: "idle", phase: "active" });
+    render(<LogoWaveform />);
+    expect(attr()).toBe("focusPaused");
+  });
+});
+
 describe("LogoWaveform — honest listening", () => {
   // The live caption splits across TWO lines / many nodes ("Mic paused." + "Say" /
   // <span>Hey Sparkle</span> / "to activate"), so match the element whose text carries both the
   // status line and the wake phrase — a stable signal that can't be fooled by the bare word
   // "Sparkle" turning up elsewhere (an aria-label or title). It is a DIV now, not a button: the
   // caption used to toggle phase on click, which was a second mic control.
-  const wakeHint = () => {
-    const t = document.body.textContent?.replace(/\s+/g, " ") ?? "";
-    return /Mic paused\./.test(t) && /Hey Sparkle/.test(t) ? t : null;
-  };
-
-  it("armed + actually listening → shows the live wake hint, not 'Listening paused'", () => {
+  it("armed + actually listening → shows the live tray hint, not 'Listening paused'", () => {
+    useUiStore.setState({ conciergeSendMode: "ptt" });
     useDictationStore.setState({ enabled: true, status: "listening", phase: "passive" });
     render(<LogoWaveform />);
-    expect(wakeHint()).not.toBeNull();
+    expect(pttHint()).not.toBeNull();
     expect(screen.queryByText(/Listening paused/)).toBeNull();
   });
 
-  it("armed but paused (not listening) → 'Listening paused' hint, not the wake hint", () => {
+  it("armed but paused (not listening) → 'Listening paused' hint, not the live hint", () => {
+    useUiStore.setState({ conciergeSendMode: "ptt" });
     useDictationStore.setState({ enabled: true, status: "idle", phase: "passive" });
     render(<LogoWaveform />);
     expect(
@@ -205,19 +265,21 @@ describe("LogoWaveform — honest listening", () => {
         "Listening paused: Will auto-resume when you re-focus on this project.",
       ),
     ).toBeTruthy();
-    // The wake-hint caption must NOT render when paused.
-    expect(wakeHint()).toBeNull();
+    // The live caption must NOT render when paused.
+    expect(pttHint()).toBeNull();
   });
 
-  it("Speak + listening → 'Actively listening' status with the Sparkle, pause command", () => {
+  it("Speak + listening → its own two-line caption, naming no phrase to say", () => {
     useUiStore.setState({ conciergeSendMode: "speak" });
     useDictationStore.setState({ enabled: true, status: "listening", phase: "active" });
     render(<LogoWaveform />);
     const t = document.body.textContent?.replace(/\s+/g, " ") ?? "";
-    expect(t).toMatch(/Actively listening/);
-    expect(t).toMatch(/Sparkle, pause/);
-    // The passive wake hint must NOT show while actively dictating.
-    expect(wakeHint()).toBeNull();
+    expect(t).toContain(SPEAK_CAPTION_HEADLINE);
+    expect(t).toContain(SPEAK_CAPTION_ACTION);
+    // Push to talk's caption must not show, and neither retired phrase may reappear.
+    expect(pttHint()).toBeNull();
+    expect(t).not.toMatch(/Hey Sparkle/);
+    expect(t).not.toMatch(/Sparkle,\s*pause/);
   });
 
   it("muted → no caption at all", () => {
@@ -225,7 +287,7 @@ describe("LogoWaveform — honest listening", () => {
     useDictationStore.setState({ enabled: false, status: "idle" });
     render(<LogoWaveform />);
     expect(screen.queryByText(/Listening paused/)).toBeNull();
-    expect(wakeHint()).toBeNull();
+    expect(pttHint()).toBeNull();
   });
 });
 
@@ -295,8 +357,10 @@ describe("LogoWaveform — the mic indicator is a read-out of the send tray", ()
     expect(ring().style.color).toBe(ORANGE);
     expect(ring().style.color).not.toBe(GREEN);
     // …and the caption agrees with it, rather than announcing a dictation the tray never entered.
-    expect(document.body.textContent).toMatch(/Mic paused\./);
-    expect(document.body.textContent).not.toMatch(/Actively listening/);
+    // THE FOUNDER'S BUG: this used to read "Mic paused. Say Hey Sparkle to activate" here, because
+    // push-to-talk had no caption of its own and fell through to the wake-word copy.
+    expect(pttHint()).not.toBeNull();
+    expect(document.body.textContent).not.toContain(SPEAK_CAPTION_HEADLINE);
   });
 
   it("is not a control: no button role, no click handler, no hover pill", () => {

@@ -11,7 +11,7 @@
 // Pure + exported so the precedence is unit-tested directly (this codebase's convention — cf.
 // deriveMicState, classifyVoiceError), and the two components import the RESULT rather than each
 // re-deriving it.
-import type { Phase } from "./wakeMachine";
+import type { Phase } from "./dictationPhase";
 import type { PauseReason } from "./dictationFocus";
 import { micIntentForMode, type SendMode } from "./sendMode";
 import { deriveMicState, type MicState } from "../components/MicButton";
@@ -25,8 +25,8 @@ export type MicPresentation =
   | "error" // dictation failed — show the error notice (real cause + remedy)
   | "preparing" // the one-time voice-model download is in flight — armed but not usable yet
   | "focusPaused" // armed, but capture is NOT live (window unfocused, muted, or not yet started)
-  | "activeListening" // armed, capturing, wake word heard — actively dictating
-  | "passiveWaiting"; // armed, capturing, still listening for the wake word
+  | "activeListening" // armed, capturing, and routing speech — actively dictating
+  | "passiveWaiting"; // armed, capturing, routing nothing (Push to talk between holds)
 
 export interface MicPresentationInput {
   /** The mic is armed (user intent). False = master-muted/off. */
@@ -35,7 +35,7 @@ export interface MicPresentationInput {
    *  Set optimistically/asynchronously relative to `enabled`, and per-window — which is exactly why
    *  each surface must read it through THIS one function rather than gating on it independently. */
   status: "idle" | "listening" | "error";
-  /** "active" = dictating (wake word heard); "passive" = waiting for the wake word. */
+  /** "active" = routing speech; "passive" = armed but routing nothing. See ./dictationPhase. */
   phase: Phase;
   /** Non-null ONLY while the one-time voice-model download is running (a warm install never emits
    *  it). Its presence is what distinguishes "armed but the model is still coming down" from a ready
@@ -77,7 +77,7 @@ export interface MicPresentationInput {
  *    2. error        — a failed mic reports the failure, never a stale download/live state.
  *    3. off          — disarmed: no download is "preparing", nothing is "listening".
  *    4. preparing    — armed, but the model is still downloading (can't dictate yet).
- *    5. focusPaused  — armed, not capturing: honest "paused", never a wake/active invitation.
+ *    5. focusPaused  — armed, not capturing: honest "paused", never an invitation to speak.
  *    6. active/passive — armed AND actually capturing, split by phase. */
 /** Is the mic, as the SURFACES present it, actually hearing the user right now?
  *
@@ -120,11 +120,13 @@ export function deriveMicPresentation(i: MicPresentationInput): MicPresentation 
 // WHY DERIVE RATHER THAN SYNC. The indicator used to read the dictation STORE (`enabled` × `status`
 // × `phase`) while the tray read `uiStore.conciergeSendMode`, with the tray's setter pushing the
 // mic through `micIntentForMode`. That is two states kept in step by a write, and a write can be
-// missed: the wake word moves `phase` on its own, so saying "Hey Sparkle" in Push to talk flipped
-// the mic glyph GREEN while the tray still read "Push to talk" — the same shape as the desync
-// useVoicePlaceholder's header describes ("the sidebar says Actively listening, composer says Mic
-// paused"). Reading the position directly removes the second state instead of adding a third
-// reconciler.
+// missed: the WAKE MATCHER moved `phase` on its own, so saying "Hey Sparkle" in Push to talk
+// flipped the mic glyph GREEN while the tray still read "Push to talk" — the same shape as the
+// desync useVoicePlaceholder's header describes ("the sidebar says Actively listening, composer
+// says Mic paused"). Reading the position directly removes the second state instead of adding a
+// third reconciler. The matcher has since been deleted outright (./dictationPhase), so the tray is
+// now the ONLY writer of `phase` — this derivation and that one agree by construction rather than
+// by this function defending against the other.
 //
 // `micIntentForMode` is REUSED, not re-implemented, and that is the whole point: it is the very
 // function the tray's setter drives the microphone with, so "what the tray did to the mic" and
@@ -153,7 +155,7 @@ export function deriveMicPresentation(i: MicPresentationInput): MicPresentation 
 // are composed in ONE ordered function ({@link micIndicatorFor}) rather than reconciled by the
 // component, and the composition is directional — every hardware input can only DEMOTE the claim,
 // never promote it. That is what preserves the original fix: nothing but the tray reaching `speak`
-// can put the ring on the live green mic, so the wake word still cannot turn Push to talk green.
+// can put the ring on the live green mic.
 
 /** What the sidebar mic indicator shows. */
 export interface MicIndicator {
@@ -211,7 +213,7 @@ export interface MicIndicatorInput {
    * they cannot disagree: `armedStatus` keeps `status: "listening"`, `dictationPauseReason` returns
    * null, and `deriveMicPresentation` yields `activeListening`. Demoting unconditionally therefore
    * painted a grey struck-through ring named "Microphone: off" directly beneath the live caption
-   * "Actively listening — just say <stop> to finish", over a waveform sweeping with real audio —
+   * "Actively listening", over a waveform sweeping with real audio —
    * the mic denying hardware that was at that moment transcribing the user's speech.
    *
    * The founder's rule is scoped to "when listening is PAUSED because my caret is in a terminal".
@@ -226,7 +228,8 @@ export interface MicIndicatorInput {
   enabled: boolean;
   /** Whether the backend is ACTUALLY capturing. */
   status: "idle" | "listening" | "error";
-  /** Which phase the wake machine is in. Read ONLY to describe a mic the tray does not govern. */
+  /** Whether the mic is routing (./dictationPhase). Read ONLY to describe a mic the tray does not
+   *  govern — the stand-down case below. */
   phase: Phase;
   /** Non-null only while the one-time voice-model download is running. */
   modelProgress: { done: number; total: number | null } | null;
@@ -242,7 +245,7 @@ export interface MicIndicatorInput {
  *      governing this microphone, so the ring reports the MIC (via the shipped `deriveMicState`)
  *      rather than a position that is not describing it. This is the one path that can reach a
  *      green mic without the tray saying Speak, and only when capture is genuinely live and the
- *      wake machine is genuinely in the active phase — i.e. only when it is simply true.
+ *      mic is genuinely routing (phase active) — i.e. only when it is simply true.
  *   3. the tray is armed (ptt/speak) but capture is NOT live — focus-paused, or an error. Amber,
  *      never green: green claims we are hearing you and nothing is being heard.
  *   4. otherwise the position, unmodified.
@@ -271,28 +274,37 @@ function indicatorState(mode: SendMode, i: MicIndicatorInput): MicState {
 }
 
 /** Which caption the sidebar shows under the waveform, once the health ladder above has been
- *  cleared (no error, no download, capture live). */
+ *  cleared (no error, no download, capture live). ONE KIND PER ARMED POSITION — see below. */
 export type MicCaptionKind =
-  | "none" // the mic is released — the sidebar promises nothing
-  | "wakeInvite" // armed, not routing: "Mic paused. Say <wake> to activate"
-  | "dictating"; // routing: "Actively listening. Just say <stop> to finish"
+  | "none" // the mic is released (tray on Send) — the sidebar promises nothing
+  | "pushToTalk" // tray on Push to talk: "Hold ⌘ to talk"
+  | "dictating"; // tray on Speak: "Actively listening. Just pause when you're done"
 
 /**
  * The caption follows the tray, and ONLY the tray — the same one input the glyph takes.
  *
- * IT DELIBERATELY DOES NOT TAKE "is dictation in flight right now". That was tried, on the
- * reasoning that a push-to-talk hold routes speech without moving the tray, so a caption pinned to
- * the position alone reads "Mic paused" at someone mid-sentence. But the promotion fires for the
- * WAKE WORD too — the matcher moves `phase` with no gesture anywhere — and the result is the ring
- * sitting amber under a caption announcing "Actively listening": two adjacent elements
- * contradicting each other, which is the precise failure this module exists to delete. A caption
- * that is merely coarse is a smaller fault than one that argues with the glyph beside it.
+ * ── THE BUG THIS BRANCH TABLE EXISTED TO CAUSE, AND HOW IT WAS ACTUALLY FIXED ───────────────────
+ * There used to be two kinds, `wakeInvite` and `dictating`, selected as
+ * `mode === "speak" ? "dictating" : "wakeInvite"`. Speak got its own copy and EVERYTHING ELSE —
+ * push-to-talk included — fell through to the wake-word invitation. PTT had no caption of its own,
+ * so it borrowed Speak's opposite, and the founder was shown "Mic paused. Say Hey Sparkle to
+ * activate" with the tray sitting on PUSH TO TALK, a mode that never had a wake word. He reported
+ * it three times; the module's own docblock had parked the fix as "a COPY question, waiting until
+ * that copy is agreed", and nobody ever put the question to him.
  *
- * The push-to-talk wording is the right place to fix the coarseness, and it is a COPY question:
- * a sentence that is true whether or not the key is down ("Hold ⌘ to talk") needs no live input at
- * all. Until that copy is agreed, this stays a pure function of the position.
+ * It was NOT fixed by adding a third kind. The wake word itself was retired ("We're no longer
+ * doing the wake word … SPEAK SHOULD BE ALWAYS ON"), which deletes `wakeInvite` outright — so the
+ * table is still two armed positions wide, with each position now naming ITSELF instead of one of
+ * them describing a feature that no longer exists.
+ *
+ * IT STILL DELIBERATELY DOES NOT TAKE "is dictation in flight right now". That was tried, on the
+ * reasoning that a push-to-talk hold routes speech without moving the tray, so a caption pinned to
+ * the position alone reads the same mid-sentence as at rest. The answer is the COPY, not a live
+ * input: "Hold ⌘ to talk" is true whether or not the key is down, so there is nothing left for a
+ * liveness term to correct — and a caption that took one could argue with the glyph beside it,
+ * which is the precise failure this module exists to delete.
  */
 export function micCaptionKind(mode: SendMode): MicCaptionKind {
   if (micIntentForMode(mode) === "off") return "none";
-  return mode === "speak" ? "dictating" : "wakeInvite";
+  return mode === "speak" ? "dictating" : "pushToTalk";
 }

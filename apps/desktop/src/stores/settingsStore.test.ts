@@ -509,7 +509,6 @@ describe("hydrateFromConfig — reflect config.toml into the store", () => {
           require_fresh_branch: true,
         },
         capture: { popover_shortcut: "ctrl+shift+r" },
-        voice: { wake_word: "Hey Jarvis", stop_word: "Jarvis, halt", pause_on_submit: false },
         done: { description: null, criteria: [] },
         delivered: {
           description: null,
@@ -534,10 +533,6 @@ describe("hydrateFromConfig — reflect config.toml into the store", () => {
     expect(s.driftChangedLines).toBe(5);
     expect([s.aiAutoRename, s.cloudDictation, s.aiComposer]).toEqual([false, false, true]);
     expect(s.configWarnings).toEqual(["w1", "w2"]);
-    // Voice mirror
-    expect(s.wakeWord).toBe("Hey Jarvis");
-    expect(s.stopWord).toBe("Jarvis, halt");
-    expect(s.pauseOnSubmit).toBe(false);
   });
 
   describe("[plugins] mirror", () => {
@@ -677,9 +672,20 @@ describe("hydrateFromConfig — reflect config.toml into the store", () => {
     });
   });
 
-  it("falls back to the default voice words when the config has no [voice] block", () => {
-    // Simulate an older backend that predates the [voice] section (voice omitted at runtime).
-    const eff = {
+  // ── THE UPGRADE PATH: A CONFIG THAT STILL CARRIES THE RETIRED [voice] KEYS ────────────────────
+  // The wake word, the stop word and pause-on-submit were removed from this store when the wake
+  // word itself was retired. Every installed client still has them written into its config.toml,
+  // so hydration must simply ignore them — not throw, and not disturb the settings around them.
+  //
+  // The payload is cast because `voice` is no longer part of `SparkleConfig`. That cast IS the
+  // point of the test: it reproduces the shape a real upgraded install sends at RUNTIME, which the
+  // type can no longer describe. Asserting the surviving siblings (rather than only "it did not
+  // throw") is what stops this passing vacuously.
+  it("ignores a persisted [voice] block carrying the retired wake/stop keys", () => {
+    // Deliberately built as a RUNTIME payload and cast, because `voice` is no longer part of
+    // `SparkleConfig`. That cast is the point: this is the exact shape an upgraded install still
+    // sends, which the type can no longer describe.
+    const withRetiredKeys = {
       config: {
         workflow: {
           require_pr: true,
@@ -704,6 +710,8 @@ describe("hydrateFromConfig — reflect config.toml into the store", () => {
           require_fresh_branch: true,
         },
         capture: { popover_shortcut: "ctrl+shift+r" },
+        // The three retired keys, exactly as an existing config.toml still carries them.
+        voice: { wake_word: "Hey Jarvis", stop_word: "Jarvis, halt", pause_on_submit: false },
         done: { description: null, criteria: [] },
         delivered: {
           description: null,
@@ -715,71 +723,21 @@ describe("hydrateFromConfig — reflect config.toml into the store", () => {
         },
       },
       warnings: [],
-    } satisfies EffectiveConfig; // `voice` is optional, so omitting it typechecks (older backend)
-    useSettingsStore.getState().hydrateFromConfig(eff);
+    } as unknown as EffectiveConfig;
+    expect(() => useSettingsStore.getState().hydrateFromConfig(withRetiredKeys)).not.toThrow();
     const s = useSettingsStore.getState();
-    expect(s.wakeWord).toBe("Hey Sparkle");
-    expect(s.stopWord).toBe("Sparkle, pause");
-    expect(s.pauseOnSubmit).toBe(true);
-  });
-
-  it("treats an empty/whitespace configured word as the default", () => {
-    useSettingsStore.getState().hydrateFromConfig({
-      config: {
-        workflow: {
-          require_pr: true,
-          worktree_isolation: true,
-          default_branch: "",
-          born_fresh_from_base: true,
-          delete_merged_branch: true,
-          drift: { behind_nudge: 10, ahead_nudge: 15, changed_lines: 1000 },
-        },
-        workers: { max_concurrent: 5 },
-        ai: {
-          auto_rename: true,
-          voice_dictation: true,
-          composer: true,
-          suggested_actions: true,
-          auto_approve: true,
-        },
-        roborev: { consent_prompted: false },
-        freshness: {
-          staleness_warn_commits: 25,
-          stale_build_block_commits: 25,
-          require_fresh_branch: true,
-        },
-        capture: { popover_shortcut: "ctrl+shift+r" },
-        voice: { wake_word: "   ", stop_word: "", pause_on_submit: false },
-        done: { description: null, criteria: [] },
-        delivered: {
-          description: null,
-          detected_method: null,
-          confidence: null,
-          confidence_note: null,
-          learned: false,
-          criteria: [],
-        },
-      },
-      warnings: [],
-    });
-    const s = useSettingsStore.getState();
-    expect(s.wakeWord).toBe("Hey Sparkle"); // whitespace-only → default
-    expect(s.stopWord).toBe("Sparkle, pause"); // empty → default
-    expect(s.pauseOnSubmit).toBe(false); // a real boolean is still honored
+    // The retired keys did not poison their neighbours: everything ELSE still hydrated. This is the
+    // non-vacuous half — "it did not throw" alone would pass against a hydrate that did nothing.
+    expect(s.requirePr).toBe(true);
+    expect(s.maxConcurrentWorkers).toBe(5);
+    expect(s.driftBehindNudge).toBe(10);
+    // …and nothing resurrected them on the store.
+    expect("wakeWord" in s).toBe(false);
+    expect("stopWord" in s).toBe(false);
+    expect("pauseOnSubmit" in s).toBe(false);
   });
 });
 
-describe("voice setters", () => {
-  it("setWakeWord / setStopWord / setPauseOnSubmit update the store", () => {
-    useSettingsStore.getState().setWakeWord("Computer");
-    useSettingsStore.getState().setStopWord("Computer, stop");
-    useSettingsStore.getState().setPauseOnSubmit(false);
-    const s = useSettingsStore.getState();
-    expect(s.wakeWord).toBe("Computer");
-    expect(s.stopWord).toBe("Computer, stop");
-    expect(s.pauseOnSubmit).toBe(false);
-  });
-});
 
 describe("1Password env backup — config hydration", () => {
   // A minimal effective config with no [tools] and no [onepassword] section: exactly what an

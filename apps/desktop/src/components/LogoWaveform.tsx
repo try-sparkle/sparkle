@@ -4,7 +4,6 @@ import { FiAlertTriangle } from "react-icons/fi";
 // constants. Import from ../theme/colors — like Composer — so the waveform stays legible in
 // light mode (the @sparkle/ui C.muted is a dark-mode-only literal).
 import { C, FONT_WEIGHT } from "../theme/colors";
-import type { Phase } from "../voice/wakeMachine";
 import { terminalRoutingArmed } from "../voice/dictationFocus";
 import {
   deriveMicPresentation,
@@ -12,11 +11,12 @@ import {
   micIndicatorFor,
 } from "../voice/micPresentation";
 import { useDictationStore } from "../stores/dictationStore";
-import { useSettingsStore } from "../stores/settingsStore";
 import { useUiStore } from "../stores/uiStore";
 import {
-  WAKE_PHRASE,
-  STOP_PHRASE,
+  SPEAK_CAPTION_HEADLINE,
+  SPEAK_CAPTION_ACTION,
+  PTT_CAPTION_HEADLINE,
+  PTT_CAPTION_ACTION,
   modelPercent,
   preparingCaption,
   voiceErrorNotice,
@@ -91,33 +91,33 @@ export function nextBars(
 }
 
 /**
- * The hint caption under the waveform. Two DISTINCT "paused-like" states are worded on purpose so
- * they never collapse into one another:
- *  - Muted (mic released) → null.
- *  - Armed AND actually capturing, PASSIVE phase (hearing, waiting for the wake word) → the product
- *    copy "Mic paused. Say <wake> to activate". "Paused" here means "not actively dictating yet",
- *    NOT "mic off" — the wake phrase in the same line makes clear the mic is live and listening.
- *  - Armed AND actually capturing, ACTIVE phase → the "Actively listening… <stop> to finish" hint.
- *  - Armed but NOT capturing (focus-paused) → the honest "Listening paused…" line for whatever took
- *    focus — deliberately different wording ("Listening paused" vs "Mic paused") so a focus-paused
- *    mic is never confused with the live wake-word state, and we never claim "Say Hey Sparkle…"
- *    when the backend isn't actually hearing anything. WHICH paused line is chosen by the cause
- *    (`pauseReason`), not by this function: a window and a terminal pause for different reasons and
- *    resume by different gestures, so one sentence cannot be true of both.
+ * The FOCUS-PAUSED caption under the waveform — "armed, but the backend is not capturing".
+ *
+ * ── WHAT THIS FUNCTION LOST, AND WHY THAT IS THE FIX ────────────────────────────────────────────
+ * It used to answer for the LIVE states too, keyed on `phase`: passive returned "Mic paused. Say
+ * <wake> to activate" and active returned "Actively listening… <stop> to finish". That was a SECOND
+ * derivation of a caption the render already computes from `micCaptionKind(sendMode)` — two paths to
+ * one sentence, which is exactly the shape voice/useVoicePlaceholder's header warns about, and the
+ * live branch here answered from `phase` while the render answered from the TRAY. Both are now gone
+ * with the wake and stop words they named, leaving this with the one job the render genuinely
+ * delegates to it.
+ *
+ * `null` when the mic is released: a disarmed mic makes no promise. WHICH paused line is chosen by
+ * the CAUSE (`pauseReason`), not by this function — a window and a terminal pause for different
+ * reasons and resume by different gestures, so one sentence cannot be true of both.
+ *
+ * `listening` is the caller's ALREADY-DEMOTED capture fact (`status === "listening" && no pause`),
+ * not raw status. Kept as a parameter rather than read here so this stays pure and unit-testable.
  */
 export function captionFor(
-  phase: Phase,
   enabled: boolean,
   listening: boolean,
-  wakeWord: string = WAKE_PHRASE,
-  stopWord: string = STOP_PHRASE,
   pauseReason: PauseReason | null = null,
 ): string | null {
   if (!enabled) return null;
   if (!listening) return pausedCaption(pauseReason);
-  return phase === "passive"
-    ? `Mic paused. Say ${wakeWord} to activate`
-    : `Actively listening: Just say ${stopWord} to finish`;
+  // Capture is live: the live caption is the render's, from the tray position. Nothing to say here.
+  return null;
 }
 
 /**
@@ -134,8 +134,6 @@ export function captionFor(
  */
 export function LogoWaveform() {
   const phase = useDictationStore((s) => s.phase);
-  const wakeWord = useSettingsStore((s) => s.wakeWord);
-  const stopWord = useSettingsStore((s) => s.stopWord);
   const enabled = useDictationStore((s) => s.enabled);
   const status = useDictationStore((s) => s.status);
   const error = useDictationStore((s) => s.error);
@@ -279,7 +277,7 @@ export function LogoWaveform() {
   // the state to `pausedCaption("window")`. The routing-terminal case is unaffected, because
   // `pauseReason` is already null there.
   const capturing = listening && pauseReason === null;
-  const caption = captionFor(phase, enabled, capturing, wakeWord, stopWord, pauseReason);
+  const caption = captionFor(enabled, capturing, pauseReason);
   // The ONE voice-state decision, shared with the composer (deriveMicPresentation). Both surfaces
   // switch their caption/placeholder on this, so the top-left mic and the composer mic can never
   // disagree about which state we're in. The wording each renders is still surface-local; only the
@@ -380,7 +378,19 @@ export function LogoWaveform() {
     : [C.muted, grayLight, grayDark];
 
   return (
-    <div style={{ padding: "0 14px 8px", userSelect: "none" }}>
+    // `data-mic-presentation` is the RENDERED read of the state every caption on this surface is
+    // derived from — the `data-wired` / `data-mode` equivalent for the microphone. The visual
+    // harness's `mic` step seeds the store's observations, and its own read-back happens INSIDE that
+    // `setState`: before React commits and before the app's own derivation, which demonstrably
+    // rewrites the same fields (`useDictation`'s `enabled` effect overwrites `status` via
+    // `armedStatus`). So the step could only ever observe its own write, and the mic surfaces were
+    // right by accident. Waiting on this attribute makes them wait on what the app actually
+    // concluded (roborev 57798).
+    <div
+      data-testid="logo-waveform"
+      data-mic-presentation={presentation}
+      style={{ padding: "0 14px 8px", userSelect: "none" }}
+    >
       {/* Waveform stage. Bars mirror about the vertical center (grow up + down); a
           mic ring floats in the middle with the bars popping behind it. */}
       <div style={{ position: "relative", height: WAVE_HEIGHT }}>
@@ -615,14 +625,17 @@ export function LogoWaveform() {
         captionKind !== "none" ? (
         // Live. Plain text, not a button: it used to toggle phase on click, which is the same
         // second mic control the waveform strip was. WHICH of the two sentences shows is decided by
-        // the tray position (voice/micPresentation `micCaptionKind`), NOT by `phase` — the wake word
-        // moves `phase` on its own, so keying off it is what let this caption read "Actively
-        // listening" under a tray parked on Push to talk.
+        // the tray position (voice/micPresentation `micCaptionKind`), NOT by `phase`.
+        //
+        // Both sentences are true of the POSITION ALONE, which is what lets this stay a pure read of
+        // the tray: "Hold ⌘ to talk" is as true between holds as during one. The pair it replaces
+        // was not — Push to talk had no caption of its own and borrowed Speak's opposite, so the
+        // founder was shown wake-word copy in a mode that never had a wake word.
         //
         // `captionKind === "none"` (the tray is on Send) suppresses it entirely, even though the
         // presentation says the mic is live: that happens when the mic was armed from a surface
-        // this column does not govern — an agent composer's own mic — and inviting "Say Hey
-        // Sparkle" here would promise this box speech that is routed to that one.
+        // this column does not govern — an agent composer's own mic — and promising anything here
+        // would claim speech that is routed to that one.
         <div
           style={{
             display: "block",
@@ -633,24 +646,14 @@ export function LogoWaveform() {
             fontSize: 12,
           }}
         >
-          {/* Line 1 — current status. Same slot/styling in both states. */}
+          {/* Line 1 — what the mic is doing. Same slot/styling in both states. */}
           <span style={{ display: "block", fontWeight: 600 }}>
-            {captionKind === "wakeInvite" ? "Mic paused." : "Actively listening"}
+            {captionKind === "pushToTalk" ? PTT_CAPTION_HEADLINE : SPEAK_CAPTION_HEADLINE}
           </span>
-          {/* Line 2 — the spoken command, with the key phrase in the waveform gradient. */}
-          <span style={{ display: "block" }}>
-            {captionKind === "wakeInvite" ? "Say" : "Just say"}{" "}
-            <span
-              style={{
-                fontWeight: 600,
-                // Solid brand blue (C.teal #2f6bff) — no gradient fade (matches the composer's
-                // "Hey Sparkle"). The cyan→blue fade was dropped per design feedback.
-                color: C.tealInk,
-              }}
-            >
-              {captionKind === "wakeInvite" ? wakeWord : stopWord}
-            </span>{" "}
-            {captionKind === "wakeInvite" ? "to activate" : "to finish"}
+          {/* Line 2 — how the user works it. Emphasised in solid brand blue (C.tealInk), the same
+              treatment the retired wake phrase carried, so the caption keeps its two-line shape. */}
+          <span style={{ display: "block", fontWeight: 600, color: C.tealInk }}>
+            {captionKind === "pushToTalk" ? PTT_CAPTION_ACTION : SPEAK_CAPTION_ACTION}
           </span>
         </div>
       ) : presentation === "focusPaused" ? (

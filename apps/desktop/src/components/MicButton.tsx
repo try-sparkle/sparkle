@@ -6,7 +6,7 @@ import { useDictationStore, type VoiceSurface } from "../stores/dictationStore";
 import { useAuthStore } from "../stores/authStore";
 import { hasAiCredits } from "../services/aiGate";
 import type { Me } from "../services/entitlement";
-import type { Phase } from "../voice/wakeMachine";
+import type { Phase } from "../voice/dictationPhase";
 import { RADIUS } from "../theme/scale";
 
 /** Should an attempt to ARM the mic be refused because the user is out of credits? Voice spends

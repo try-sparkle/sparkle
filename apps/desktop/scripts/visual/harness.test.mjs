@@ -242,6 +242,13 @@ describe("surface registry", () => {
       "workspace-wired-right",
       "agent-sidebar",
       "concierge-column",
+      // The voice surfaces, added when the wake word was retired. `settings-voice` photographs the
+      // Settings section the founder asked to have emptied; the three `send-tray-*` ones photograph
+      // each tray position's own copy, which is what the retirement rewrote.
+      "settings-voice",
+      "send-tray-speak",
+      "send-tray-ptt",
+      "send-tray-send",
       "settings-dialog",
       "open-pr-menu-narrow",
       "open-pr-menu-grouped-narrow",
@@ -412,6 +419,168 @@ describe("the cable step asserts the SHELL agrees, not just that it called the s
     expect(stepToExpression({ cable: "left" })).toMatch(/data-wired[\s\S]*"left"/);
     // `off` is a projected value like any other — it must be verified, not exempted.
     expect(stepToExpression({ cable: "off" })).toMatch(/data-wired[\s\S]*"off"/);
+  });
+});
+
+describe("the mic step's comparison — asserted by EVALUATING it, not by reading its source", () => {
+  // WHY THESE EVALUATE. The first version of this block matched the generated SOURCE with
+  // `[\s\S]*`-joined regexes, which cannot detect the two mutations that actually break the step:
+  // flip `got.status === …` to `!==` and the regex still matches; change the `&&` chain to `||` and
+  // all of them still match. In both cases the step would pass precisely when the mic is NOT in the
+  // requested state, and every mic surface would go back to photographing whatever it found — with
+  // a green suite. These tests guard a COMPARISON, so the thing that must be falsifiable is the
+  // comparison's RESULT (roborev 57798). Same rule as "assert the side effect, not the
+  // precondition", one level up.
+
+  /** Run a compiled step against a stubbed `window.__sparkleMic` and return what it evaluates to. */
+  const runMic = (step, handle) =>
+    new Function("window", `return ${stepToExpression(step)}`)({ __sparkleMic: handle });
+
+  const ASKED = { enabled: true, status: "listening", phase: "active" };
+  /** A handle that reports exactly the state it was asked for — the passing case. */
+  const honest = (s) => ({
+    enabled: s.enabled,
+    status: s.status ?? "idle",
+    phase: s.phase ?? "passive",
+  });
+
+  it("passes when the store reports back the state that was requested", () => {
+    expect(runMic({ mic: ASKED }, honest)).toBe(true);
+  });
+
+  it("FAILS when any single requested field came back different", () => {
+    // One case per field, because a comparison chain can be broken one term at a time.
+    expect(runMic({ mic: ASKED }, () => ({ ...honest(ASKED), enabled: false }))).toBe(false);
+    expect(runMic({ mic: ASKED }, () => ({ ...honest(ASKED), status: "idle" }))).toBe(false);
+    expect(runMic({ mic: ASKED }, () => ({ ...honest(ASKED), phase: "passive" }))).toBe(false);
+  });
+
+  it("FAILS on a mic left listening by the PREVIOUS surface when this one asked for idle", () => {
+    // `{enabled:false}` is the `send-tray-send` form. The harness runs every surface in one browser,
+    // so "whatever the last surface left behind" is the realistic wrong answer — an unstated status
+    // must be held to the default, not waved through.
+    expect(runMic({ mic: { enabled: false } }, () => ({
+      enabled: false,
+      status: "listening",
+      phase: "active",
+    }))).toBe(false);
+    expect(runMic({ mic: { enabled: false } }, () => ({
+      enabled: false,
+      status: "idle",
+      phase: "active",
+    }))).toBe(true);
+  });
+
+  it("leaves an UNSTATED phase alone rather than forcing one", () => {
+    // The one genuinely optional term: a caller naming no phase must pass whatever the phase is.
+    for (const phase of ["passive", "active"]) {
+      expect(runMic({ mic: { enabled: true, status: "listening" } }, () => ({
+        enabled: true,
+        status: "listening",
+        phase,
+      }))).toBe(true);
+    }
+  });
+
+  it("FAILS closed when the handle is missing or returns nothing", () => {
+    // Not "the source contains a guard" — the step must EVALUATE to false, so a fixture that never
+    // installed the handle fails the run instead of capturing whatever is on screen.
+    expect(new Function("window", `return ${stepToExpression({ mic: ASKED })}`)({})).toBe(false);
+    expect(runMic({ mic: ASKED }, () => undefined)).toBe(false);
+  });
+});
+
+describe("a mic surface must END ON A RENDERED READ, not on the step's own write", () => {
+  // THE INVARIANT, as a registry rule rather than as three hand-written surfaces that happen to
+  // follow it. `__sparkleMic` reads the store back inside its own `setState`, so the step observes
+  // only its own write — before React commits and before the app's derivation, which rewrites the
+  // same fields. Waiting on `data-mic-presentation` is what makes the capture prove the app actually
+  // reached the state its filename claims.
+  //
+  // Without this case a FOURTH mic surface could be added with the seed and no read, silently
+  // reverting to the behaviour the read was introduced to end — the same way `send-tray-send` was
+  // right only by accident before the tray got its `data-mode` check (roborev 57803).
+  const micSurfaces = SURFACES.filter((s) => (s.app?.steps ?? []).some((st) => st.mic));
+
+  it("covers the mic surfaces that exist (so this rule cannot pass by matching nothing)", () => {
+    expect(micSurfaces.length).toBeGreaterThan(0);
+  });
+
+  // Keyed on the LAST mic step and on the FINAL step, not on the first seed and "some later read".
+  // The looser version did not enforce its own title: `findIndex` takes the earliest seed and any
+  // read after it satisfied the scan, so the natural shape for a transition capture —
+  // seed, read, SEED AGAIN, shoot — passed while the state the screenshot actually claims went back
+  // to being verified by the mic step's own inside-`setState` read-back. That is precisely the
+  // failure the rendered read was introduced to end, reported green by the rule meant to make it
+  // unrepeatable. The same slack let a `click` follow the read, so the capture no longer ended on it
+  // either (roborev 57805).
+  // THE READ MUST NAME A PRESENTATION, not merely mention the attribute. `data-mic-presentation` is
+  // rendered UNCONDITIONALLY on the waveform div — only its value varies — and a `waitFor` compiles
+  // to a bare `querySelector`, so `[data-mic-presentation]` resolves on the first poll whatever the
+  // app derived. A substring predicate accepted that, which put the fourth surface right back to
+  // being verified by the mic step's own inside-`setState` read-back: the same vacuity this rule
+  // exists to prevent, one level down (roborev 57808).
+  //
+  // A MISMATCHED value is safe by contrast — it times out at capture — so the missing-value case is
+  // the only one worth gating here. The name is checked against the union too, so a typo fails at
+  // the registry instead of surfacing as a 30s timeout weeks later.
+  // ALL THREE ATTRIBUTE-SELECTOR FORMS, because this registry genuinely uses more than one:
+  // `[data-mode=speak]` bare, `[aria-label="Settings"]` quoted. A predicate accepting only the bare
+  // form fails CLOSED on a correct quoted read — not a vacuity, but the message would tell the
+  // author their surface "never reads a NAMED presentation back" while the working read is right
+  // there as the final step, and the first person it fires on is the one adding the fourth surface,
+  // i.e. the one with the least context to guess that quoting is the cause (roborev 57809).
+  const READ = /\[data-mic-presentation\s*=\s*(?:"([A-Za-z]+)"|'([A-Za-z]+)'|([A-Za-z]+))\s*\]/;
+  const presentationRead = (sel) => {
+    const m = READ.exec(sel);
+    return m === null ? null : (m[1] ?? m[2] ?? m[3]);
+  };
+  const PRESENTATIONS = [
+    "off",
+    "outOfCredits",
+    "error",
+    "preparing",
+    "focusPaused",
+    "activeListening",
+    "passiveWaiting",
+  ];
+  const readsAPresentation = (st) => {
+    if (typeof st.waitFor !== "string") return false;
+    const name = presentationRead(st.waitFor);
+    return name !== null && PRESENTATIONS.includes(name);
+  };
+
+  it("accepts every legitimate spelling of the read, and only rejects the value-less one", () => {
+    // Bare, double-quoted and single-quoted are all valid CSS and all resolve identically through
+    // `document.querySelector` — only a read that names NO value proves nothing.
+    for (const sel of [
+      "[data-mic-presentation=activeListening]",
+      '[data-mic-presentation="activeListening"]',
+      "[data-mic-presentation='activeListening']",
+      "[data-mic-presentation = activeListening]",
+    ]) {
+      expect(readsAPresentation({ waitFor: sel }), sel).toBe(true);
+    }
+    expect(readsAPresentation({ waitFor: "[data-mic-presentation]" })).toBe(false);
+    // …and a value that is not a real MicPresentation, which would otherwise only surface as a
+    // capture timeout.
+    expect(readsAPresentation({ waitFor: "[data-mic-presentation=passiveWating]" })).toBe(false);
+  });
+
+  it("ENDS on a rendered read that NAMES a presentation — after the LAST mic step", () => {
+    for (const surface of micSurfaces) {
+      const steps = surface.app.steps;
+      const lastSeed = steps.reduce((acc, st, i) => (st.mic ? i : acc), -1);
+      expect(
+        steps.slice(lastSeed + 1).some(readsAPresentation),
+        `${surface.name} seeds the mic and never reads a NAMED presentation back after the LAST seed`,
+      ).toBe(true);
+      // …and it is the last thing the surface does, so nothing can run after the state was proven.
+      expect(
+        readsAPresentation(steps[steps.length - 1]),
+        `${surface.name} does not END on a rendered read naming a presentation`,
+      ).toBe(true);
+    }
   });
 });
 

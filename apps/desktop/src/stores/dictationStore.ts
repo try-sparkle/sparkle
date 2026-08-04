@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
-import type { Phase } from "../voice/wakeMachine";
+import type { Phase } from "../voice/dictationPhase";
 import type { FocusOwner } from "../voice/dictationFocus";
 
 /** localStorage key for the persisted slice (only `enabled`). Exported so the cross-window

@@ -84,7 +84,6 @@ vi.mock("../useConciergeDictation", () => ({
     registerInsert: vi.fn(),
   }),
 }));
-vi.mock("../services/dictationControls", () => ({ maybePauseOnSubmit: vi.fn() }));
 vi.mock("../services/conciergeAttach", async (orig) => {
   const real = (await orig()) as Record<string, unknown>;
   return { ...real, pickAttachments: h.pick, loadAttachmentPaths: h.loadPaths };

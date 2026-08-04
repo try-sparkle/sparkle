@@ -64,7 +64,6 @@ vi.mock("../useConciergeDictation", () => ({
     registerInsert: vi.fn(),
   }),
 }));
-vi.mock("../services/dictationControls", () => ({ maybePauseOnSubmit: vi.fn() }));
 
 // The suggestion engine's leaves — everything BELOW useSuggestions. The hook itself is REAL.
 const { SuggestionOfflineError, AiUnavailableError, AiUnreachableError } = vi.hoisted(() => {

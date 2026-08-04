@@ -350,8 +350,21 @@ export function chordSends(mode: SendMode, chord: SendChord, e: ChordKey): boole
  * and Push to talk shows `⌘` (the gesture that mode actually has) rather than a send chord that is
  * inert there.
  */
+/**
+ * How the push-to-talk key is DRAWN. The key itself is `usePushToTalk.TALK_KEY` ("Meta"); this is
+ * the same fact rendered for a human, and the two are documented as a pair there.
+ *
+ * ONE LITERAL, because three surfaces now name this key: the tray's keycap chiclet (below), the mic
+ * caption, and the composer placeholder (both in ./dictationCopy). Push-to-talk copy exists at all
+ * because the wake word was retired and PTT could no longer borrow Speak's opposite — so the copy
+ * arrived on two surfaces at once, which is exactly the shape that drifts when each spells the
+ * glyph out itself. The binding is not remappable today; if it ever becomes so, this constant is
+ * the single place that has to start reading it.
+ */
+export const TALK_KEY_GLYPH = "⌘";
+
 export function chicletFor(mode: SendMode, chord: SendChord): string {
-  if (mode === "ptt") return "⌘";
+  if (mode === "ptt") return TALK_KEY_GLYPH;
   // ↩ (U+21A9), not ↵ (U+21B5). The prototype drew ↵; the app already spells the Return glyph ↩ in
   // five places, and two different arrows for one key across one window is a difference a reader
   // has to decide is meaningless before they can ignore it.

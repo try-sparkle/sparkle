@@ -28,7 +28,6 @@ const h = vi.hoisted(() => ({
     micLive: false,
     registerInsert: vi.fn(),
   },
-  maybePauseOnSubmit: vi.fn(),
   route: vi.fn(async () => ({ target: "sparkle" as "sparkle" | "agent", reason: "test", source: "heuristic" as const })),
 }));
 
@@ -87,13 +86,11 @@ vi.mock("../stores/sparklePrefsStore", () => ({
   useSparklePrefsStore: { getState: () => ({ setInterruptPreference: vi.fn() }) },
 }));
 vi.mock("../useConciergeDictation", () => ({ useConciergeDictation: () => h.dictation }));
-vi.mock("../services/dictationControls", () => ({ maybePauseOnSubmit: h.maybePauseOnSubmit }));
 
 import { ConciergeHost } from "./ConciergeHost";
 import type { ConciergeFeed } from "../useConciergeFeed";
 import { armedIntents, clearAllIntents, fireIntent } from "../services/dispatchIntent";
 import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
-import { useUiStore } from "../stores/uiStore";
 import { useDictationStore } from "../stores/dictationStore";
 
 // PRECONDITION, stated rather than inherited: this suite's subject is the concierge CONVERSATION,
@@ -354,41 +351,38 @@ describe("ConciergeHost — dictated input", () => {
     expect(h.startConciergeTurn).not.toHaveBeenCalled();
   });
 
-  it("submitting honors the pause-on-submit voice setting", async () => {
-    const c = mount();
-    c.dictate("status?");
-    await c.send();
-    expect(h.maybePauseOnSubmit).toHaveBeenCalled();
-  });
-
-  it("an AUTO-send does NOT pause the mic — that would end the hands-free loop it exists for", async () => {
-    // The guard is one word (`if (!autoFiringRef.current) maybePauseOnSubmit()`), and without a row
-    // here deleting it leaves the whole suite green: the case above passes either way, because a
-    // MANUAL press pauses in both versions. What breaks silently is the flagship path — the rail
-    // fires, the mic pauses itself, and the next sentence goes nowhere because nothing is listening.
-    // "Auto-send" that stops listening after one message is not hands-free.
-    vi.useFakeTimers();
+  // ══ SPEAK IS ALWAYS ON — A SUBMIT IS NOT A MIC GESTURE ═══════════════════════════════════════
+  // Two cases used to live here, both about `maybePauseOnSubmit`: a MANUAL send dropped dictation
+  // from active back to "waiting for the wake word" (on by default), and an AUTO-send deliberately
+  // did not, because — in that test's own words — "auto-send that stops listening after one message
+  // is not hands-free."
+  //
+  // That reasoning now applies to BOTH paths. With the wake word retired there is no phrase to
+  // resume with, so pausing on submit would leave the mic unable to come back at all: Speak would go
+  // quiet after the first message and stay quiet until the user moved the tray. The mechanism is
+  // gone, and what replaces both cases is one that asserts the property the founder asked for.
+  it("a submit does not touch the microphone — what makes always-on Speak possible", async () => {
+    // The state a live dictation session is in: armed, capturing, routing. The TRAY is left where
+    // the other cases put it, deliberately: in `speak` the tray's own Send pill takes the
+    // accessible name "Send", so `c.send()` would move the tray instead of submitting and this
+    // would pass for the wrong reason. What is under test is the SUBMIT PATH, which is shared.
+    useDictationStore.setState({ enabled: true, status: "listening", phase: "active" });
     try {
-      useUiStore.setState({ conciergeSendMode: "speak" });
-      useDictationStore.setState({ speechEndSeq: 0 });
-      h.dictation.micLive = true;
       const c = mount();
-      c.dictate("Deploy the staging branch."); // a finished sentence → `high` → a 1s threshold
-      act(() => {
-        useDictationStore.getState().noteSpeechEnd();
-      });
-      await act(async () => {
-        vi.advanceTimersByTime(1_500);
-        for (let i = 0; i < 8; i++) await Promise.resolve();
-      });
-
-      // It really did send — otherwise "did not pause" would pass for the wrong reason.
+      c.dictate("status?");
+      await c.send();
+      // It really did send — otherwise the mic assertions below would pass vacuously.
       expect(h.startConciergeTurn).toHaveBeenCalled();
-      expect(h.maybePauseOnSubmit).not.toHaveBeenCalled();
+      // …and the microphone is exactly where it was. This is what FAILS against the previous
+      // behaviour, where the submit path called `maybePauseOnSubmit()` → `setPhase("passive")`
+      // and cleared the interim. With no wake word to resume with, that pause had become
+      // unrecoverable: the mic would go quiet after one message and stay quiet.
+      const s = useDictationStore.getState();
+      expect(s.phase).toBe("active");
+      expect(s.enabled).toBe(true);
+      expect(s.status).toBe("listening");
     } finally {
-      vi.useRealTimers();
-      useUiStore.setState({ conciergeSendMode: "send" });
-      useDictationStore.setState({ speechEndSeq: 0 });
+      useDictationStore.setState({ enabled: false, status: "idle", phase: "passive" });
     }
   });
 });

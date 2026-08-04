@@ -1,49 +1,67 @@
-// Mic-hot ("audio is active") copy, kept in ONE place so every composer that surfaces the voice
-// affordance reads identically. The global dictation pipeline is shared across the build Composer
-// and the Think composer, so the placeholder wording must not drift between them.
+// Voice copy, kept in ONE place so every composer that surfaces the voice affordance reads
+// identically. The global dictation pipeline is shared across the build Composer and the Think
+// composer, so the placeholder wording must not drift between them.
 //
-// STOP_PHRASE is the spoken command that ends active dictation (the wake matcher in
-// voice/wakeWords.ts recognizes it). The build Composer paints it as a teal→cyan gradient in its
-// styled overlay; the native-textarea fallback and the Think composer use the assembled
-// MIC_HOT_PLACEHOLDER string verbatim.
+// ── EVERY SENTENCE HERE IS TRUE OF THE TRAY POSITION ALONE ──────────────────────────────────────
+// This module used to assemble its live copy around two SPOKEN PHRASES — a wake word to start
+// dictation and a stop word to end it. Both are gone (the founder: "We're no longer doing the wake
+// word. We now have push to talk or speak buttons; SPEAK SHOULD BE ALWAYS ON"), and with them the
+// class of defect they produced: `micCaptionKind` had only two branches, so PUSH TO TALK — a mode
+// with no wake word at all — fell through to the wake copy and told the founder "Mic paused. Say
+// Hey Sparkle to activate" while he was holding the talk key. He reported it three times.
 //
-// The default phrases are re-exported from voiceDefaults.ts — the SINGLE source of the built-in
-// words shared with the matcher, store, and configActions — so the on-screen copy defaults can
-// never drift from the actually-recognized words.
-import { DEFAULT_WAKE_WORD, DEFAULT_STOP_WORD } from "./voiceDefaults";
+// The constraint that replaces them is voice/micPresentation's own rule: the caption follows the
+// TRAY POSITION and nothing else, so every string below must be true whether or not the key is
+// held and whether or not anything is being said right now. "Hold ⌘ to talk" is true at rest and
+// mid-hold; "Say Hey Sparkle to activate" was true in neither. That is what stops a caption
+// contradicting the glyph beside it, which is the invariant this whole file family protects.
+//
 // The advanced opt-in's own label, single-sourced. This module INSTRUCTS the user to turn that
 // control on, and a remedy naming a control by a label it no longer carries is exactly the dead end
 // the no-device branch below exists to fix.
 import { ALLOW_VIRTUAL_LABEL, INPUT_PICKER_LOCATION } from "../services/audioInputs";
+import { TALK_KEY_GLYPH } from "./sendMode";
 import type { PauseReason } from "./dictationFocus";
-export const STOP_PHRASE = DEFAULT_STOP_WORD;
-// ACTIVE phase (the wake word was heard; dictation is live). Only show this when the backend is
-// BOTH capturing (status "listening") AND in the active phase — never while merely waiting for
-// the wake word, or the composer lies about being in dictation mode (sparkle voice-status bug).
-export const MIC_HOT_PREFIX = "I'm listening, so just start talking. Say ";
-export const MIC_HOT_SUFFIX = " to finish.";
-/** Assemble the mic-hot placeholder around the CONFIGURED stop phrase. Defaults to STOP_PHRASE so
- *  `micHotPlaceholder()` === the old MIC_HOT_PLACEHOLDER constant (back-compat). */
-export function micHotPlaceholder(stopPhrase: string = STOP_PHRASE): string {
-  return `${MIC_HOT_PREFIX}${stopPhrase}${MIC_HOT_SUFFIX}`;
-}
-export const MIC_HOT_PLACEHOLDER = micHotPlaceholder();
 
-// PASSIVE phase (capturing, but listening for the wake word — NOT yet dictating). Mirrors the
-// sidebar caption so the composer's status is honest: it is not in active dictation, it is waiting
-// for "Hey Sparkle", which reads as "Mic paused. Say Hey Sparkle to activate." Here "paused" means
-// "not actively dictating yet", not "mic off" — the live wake phrase in the same line makes that
-// clear. The "(or you can type here instead)" tail subsumes the typing hint,
-// like the mic-hot copy does, so it stays put on focus.
-export const WAKE_PHRASE = DEFAULT_WAKE_WORD;
-export const WAKE_PREFIX = "Mic paused. Say ";
-export const WAKE_SUFFIX = " to activate (or you can type here instead).";
-/** Assemble the passive placeholder around the CONFIGURED wake word. Defaults to WAKE_PHRASE so
- *  `wakePlaceholder()` === the old WAKE_PLACEHOLDER constant (back-compat). */
-export function wakePlaceholder(wakeWord: string = WAKE_PHRASE): string {
-  return `${WAKE_PREFIX}${wakeWord}${WAKE_SUFFIX}`;
-}
-export const WAKE_PLACEHOLDER = wakePlaceholder();
+// ── SPEAK (the tray is on Speak: dictation is ON, continuously) ─────────────────────────────────
+// No spoken command starts it and none ends it. What ends an UTTERANCE is silence — Speak is the
+// one position that runs the auto-send countdown (voice/sendMode `modeCountsDown`, voice/useAutoSend),
+// so stopping talking is what dispatches the message. What ends DICTATION is moving the tray. Both
+// sentences below say the first of those, because that is the one the user is about to do.
+export const SPEAK_CAPTION_HEADLINE = "Actively listening";
+export const SPEAK_CAPTION_ACTION = "Just pause when you're done";
+export const SPEAK_COMPOSER_PLACEHOLDER =
+  "I'm listening, so just start talking — pause when you're done.";
+
+// ── PUSH TO TALK (the tray is on Push to talk) ──────────────────────────────────────────────────
+// The copy sparkle-yx7o7 proposed and was blocked waiting on: "a sentence that is true whether or
+// not the key is down needs no live input at all." Both of these are, so the caption stays a pure
+// function of the position and nothing has to be threaded in to keep it honest mid-hold.
+//
+// The glyph comes from `TALK_KEY_GLYPH`, never a literal, so this copy and the tray's own keycap
+// chiclet cannot name different keys.
+export const PTT_CAPTION_HEADLINE = "Push to talk";
+export const PTT_CAPTION_ACTION = `Hold ${TALK_KEY_GLYPH} to talk`;
+export const PTT_COMPOSER_PLACEHOLDER = `Hold ${TALK_KEY_GLYPH} to talk — or type here instead.`;
+
+// ── EVERY OTHER COMPOSER (an agent's own box, the capture window) ───────────────────────────────
+// THE TRAY GOVERNS THE CONCIERGE BOX, AND ONLY IT. The two sentences above are true there and
+// nowhere else, for two separate reasons:
+//
+//  1. AUTO-SEND. `useAutoSend` is mounted exactly once, by ConciergeHost. "Pause when you're done"
+//     is a promise that stopping talking DISPATCHES the message — false in an agent composer and in
+//     the capture window, where the draft would just sit in the box. Telling someone to stop talking
+//     and then not sending is the same class of defect this whole change exists to delete: copy
+//     describing a mode the surface is not in.
+//  2. WHERE A HOLD ROUTES. The push-to-talk gesture is bound by `useSendMode`, which claims
+//     `voiceSurface: "concierge"` on the same action that arms the mic — so a hold's speech goes to
+//     the concierge box, never to the agent composer reading this. Offering "Hold ⌘ to talk" here
+//     would point at a gesture that fills a different column.
+//
+// So these surfaces get ONE sentence, true whenever capture is live and independent of the tray:
+// it says the mic is hot and nothing else. It deliberately names no send gesture — each of these
+// composers has its own, and this slot is about the microphone.
+export const LIVE_COMPOSER_PLACEHOLDER = "I'm listening, so just start talking.";
 
 // FOCUS-PAUSED (armed, but the backend is NOT capturing). ONE state, but it now has a REASON, and
 // the reason is the whole point: "paused" with no cause is what left the terminal case reading as a

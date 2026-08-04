@@ -88,7 +88,6 @@ vi.mock("../useConciergeDictation", () => ({
     registerInsert: vi.fn(),
   }),
 }));
-vi.mock("../services/dictationControls", () => ({ maybePauseOnSubmit: vi.fn() }));
 // The REAL attachedPayload/attachedDisplay — only the picker seam is stubbed.
 vi.mock("../services/conciergeAttach", async (orig) => {
   const real = (await orig()) as Record<string, unknown>;

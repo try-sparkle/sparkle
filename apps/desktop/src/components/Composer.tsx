@@ -84,16 +84,8 @@ import { useKeybindingsStore } from "../stores/keybindingsStore";
 import { arrowOverflowDirection } from "./composerArrowOverflow";
 import { useDictationStore } from "../stores/dictationStore";
 import { focusQuietly, focusQuietlyUnlessTypingElsewhere, isProgrammaticFocus } from "../services/programmaticFocus";
-import { useSettingsStore } from "../stores/settingsStore";
-import { maybePauseOnSubmit } from "../services/dictationControls";
 import {
-  STOP_PHRASE,
-  MIC_HOT_PREFIX,
-  MIC_HOT_SUFFIX,
-  WAKE_PREFIX,
-  WAKE_SUFFIX,
-  micHotPlaceholder,
-  wakePlaceholder,
+  LIVE_COMPOSER_PLACEHOLDER,
   preparingPlaceholder,
   PREPARING_PREFIX,
   PREPARING_SUFFIX,
@@ -113,16 +105,10 @@ import { FONT_UI, RADIUS } from "../theme/scale";
 
 const maxComposerHeight = () => Math.max(COMPOSER_MIN, window.innerHeight - 140);
 
-// Mic-hot ("audio is active") copy lives in voice/dictationCopy.ts so the Think composer reads
-// the exact same wording (single source of truth). The overlay below paints the stop phrase as a
-// styled span; the native-textarea fallback reuses micHotPlaceholder(stopWord) verbatim.
-
-/** The stop phrase (default "Sparkle, pause", or the user's custom word) in solid brand blue
- *  (C.teal #2f6bff), matching the wake phrase. (The cyan→blue gradient fade was dropped per
- *  design feedback.) */
-function StopPhrase({ phrase = STOP_PHRASE }: { phrase?: string }) {
-  return <span style={{ fontWeight: FONT_WEIGHT.bold, color: C.tealInk }}>{phrase}</span>;
-}
+// Voice copy lives in voice/dictationCopy.ts so the concierge box reads the exact same wording
+// (single source of truth). Both the styled overlay below and the native-textarea fallback use the
+// SAME assembled sentence — the two used to differ (an emphasised span here, a plain string there),
+// which is only safe while they are built from one constant.
 
 /** The one-time voice-model download, shown in the composer's placeholder slot. Deliberately quiet
  *  (same muted placeholder voice as the wake-word copy it replaces) — this is a wait, not a
@@ -380,10 +366,14 @@ export function Composer({
   // under the terminal that causes the terminal pause, so it is the surface most likely to be read
   // at the moment the caret is in one.
   const pauseReason = useDictationPauseReason();
-  // Configured wake/stop words so every dictation hint reflects a user's remap (default words
-  // reproduce the original copy exactly).
-  const wakeWord = useSettingsStore((s) => s.wakeWord);
-  const stopWord = useSettingsStore((s) => s.stopWord);
+  // THE LIVE VOICE HINT — deliberately NOT keyed on the concierge tray. See the note beside
+  // LIVE_COMPOSER_PLACEHOLDER: the tray's two sentences promise auto-send and a push-to-talk
+  // gesture, and neither is true of THIS box (`useAutoSend` is mounted only by ConciergeHost, and a
+  // hold claims `voiceSurface: "concierge"`). An earlier revision of this file did read the tray
+  // here, which had two consequences worth recording: with the tray on its default `send` this
+  // composer rendered NOTHING while the mic was hot — armed from the header ring, dictating, and no
+  // cue at all — and with it on Speak it told the user to stop talking and then never sent
+  // (roborev 57785). One sentence, true whenever capture is live, is the honest answer.
 
   // Inline ghost-text autocomplete. `history` is the global list of past prompts; `caretAtEnd`
   // gates the suggestion so it only appears when the caret is at the very end of the text
@@ -1092,9 +1082,6 @@ export function Composer({
     // entitled users). Fire-and-forget: awaiting the round-trip here would put a network wait in
     // front of the user's Enter key.
     void recordTrialSend();
-    // "Pause listening on submit" (default): if actively dictating, drop back to passive wake-word
-    // listening now that the prompt is sent. No-op under "Keep listening" or when not dictating.
-    maybePauseOnSubmit();
   };
 
   const send = async () => {
@@ -1733,10 +1720,11 @@ export function Composer({
                   ? `${errorNotice.headline} ${errorNotice.detail}`
                   : micPresentation === "preparing"
                   ? preparingPlaceholder(modelPercent(modelProgress))
-                  : micPresentation === "activeListening"
-                  ? micHotPlaceholder(stopWord)
-                  : micPresentation === "passiveWaiting"
-                  ? wakePlaceholder(wakeWord)
+                  : micPresentation === "activeListening" || micPresentation === "passiveWaiting"
+                  // CAPTURE IS LIVE — one sentence for both. The two live states differ only in
+                  // whether speech is routing at this instant, which is not what this slot needs to
+                  // say; that the mic is hot is.
+                  ? LIVE_COMPOSER_PLACEHOLDER
                   : micPresentation === "focusPaused"
                   ? pausedComposerPlaceholder(pauseReason) // armed but not capturing — honest, mirrors the sidebar, and names the cause
                   : "" // mic off (master mute) — no voice prompt at all
@@ -1861,23 +1849,14 @@ export function Composer({
                 // The one-time model download. Honest + quiet: it names the wait, shows progress
                 // when the backend gives a total, and points at the box the user can still type in.
                 <ComposerPreparingNotice pct={modelPercent(modelProgress)} />
-              ) : micPresentation === "activeListening" ? (
-                // The mic-hot copy intentionally subsumes the typing hint ("…or start typing
-                // here instead"), so it stays put on focus rather than swapping to a muted hint.
-                <>
-                  {MIC_HOT_PREFIX}
-                  <StopPhrase phrase={stopWord} />
-                  {MIC_HOT_SUFFIX}
-                </>
-              ) : micPresentation === "passiveWaiting" ? (
-                // Capturing but waiting for the wake word: tell the truth (not "I'm listening").
-                // Mirrors the sidebar caption; the "(or you can type here instead)" tail subsumes
-                // the typing hint, so like the mic-hot copy it stays put on focus.
-                <>
-                  {WAKE_PREFIX}
-                  <span style={{ fontWeight: FONT_WEIGHT.bold, color: C.tealInk }}>{wakeWord}</span>
-                  {WAKE_SUFFIX}
-                </>
+              ) : micPresentation === "activeListening" || micPresentation === "passiveWaiting" ? (
+                // CAPTURE IS LIVE. Both states share one arm because what separates them — is
+                // speech routing right now — is not what this slot needs to say.
+                //
+                // THE SAME STRING the native fallback uses, deliberately. These two arms used to
+                // build the copy differently (emphasised span vs assembled string) around shared
+                // fragments; with one constant there is nothing left to drift.
+                <>{LIVE_COMPOSER_PLACEHOLDER}</>
               ) : micPresentation === "focusPaused" ? (
                 // Armed but NOT capturing (another window, the caret in a terminal, muted, or
                 // capture not started yet). The mic can't hear anything, so — exactly like the

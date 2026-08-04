@@ -8,8 +8,9 @@
 // `services/autoSendTuner` for where Haiku's opinion goes instead (out of band, recorded, never in
 // the loop).
 //
-// Modelled on ./wakeMachine: a pure verdict function with its own unit-test file, importable by the
-// timer, the rail UI and a test alike without any of them dragging in the others.
+// A pure verdict function with its own unit-test file, importable by the timer, the rail UI and a
+// test alike without any of them dragging in the others — this codebase's convention for a decision
+// several surfaces must not disagree about (cf. ./sendMode, ./micPresentation).
 //
 // THE TIERS ARE THRESHOLDS, NOT DELAYS. The rail does not "wait 3 seconds"; it accumulates elapsed
 // silence and compares it to whatever threshold the LATEST chunk implies. So a sentence that starts

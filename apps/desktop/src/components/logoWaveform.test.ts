@@ -1,29 +1,27 @@
 import { describe, it, expect } from "vitest";
 import { captionFor, barFraction, nextBars } from "./LogoWaveform";
 
-describe("captionFor", () => {
-  // `enabled` = mic armed (user intent). `listening` = capture actually live (a
-  // Sparkle window is focused). The two can disagree — armed but focus-paused — and
-  // the caption must stay honest rather than claim we're hearing the user when we're not.
-  it("passive + enabled + listening → wake hint", () =>
-    expect(captionFor("passive", true, true)).toBe(
-      "Mic paused. Say Hey Sparkle to activate",
-    ));
-  it("active + enabled + listening → stop hint", () =>
-    expect(captionFor("active", true, true)).toBe(
-      "Actively listening: Just say Sparkle, pause to finish",
-    ));
-  it("muted → no caption", () =>
-    expect(captionFor("passive", false, false)).toBeNull());
+describe("captionFor — the FOCUS-PAUSED caption, and only that", () => {
+  // `enabled` = mic armed (user intent). `listening` = capture actually live AND not focus-paused.
+  // The two can disagree — armed but focus-paused — and the caption must stay honest rather than
+  // claim we're hearing the user when we're not.
+  //
+  // THIS FUNCTION NO LONGER ANSWERS FOR THE LIVE STATES. It used to take `phase` and return the
+  // wake hint for passive and the stop hint for active — a SECOND derivation of a caption the
+  // component already computes from the tray (`micCaptionKind`), keyed on a different input. Both
+  // hints went with the words they named; what is left is the one state the render delegates here.
+  it("capture live → null, because the live caption is the render's, from the tray", () =>
+    expect(captionFor(true, true)).toBeNull());
+  it("muted → no caption", () => expect(captionFor(false, false)).toBeNull());
   it("muted stays null even if status briefly reads listening", () =>
-    expect(captionFor("passive", false, true)).toBeNull());
+    expect(captionFor(false, true)).toBeNull());
   it("armed but paused (not listening) → honest 'Listening paused' auto-resume hint", () =>
-    expect(captionFor("passive", true, false)).toBe(
+    expect(captionFor(true, false)).toBe(
       "Listening paused: Will auto-resume when you re-focus on this project.",
     ));
-  it("armed but paused while active phase → still the 'Listening paused' hint", () =>
-    expect(captionFor("active", true, false)).toBe(
-      "Listening paused: Will auto-resume when you re-focus on this project.",
+  it("a terminal pause names the terminal, not the window", () =>
+    expect(captionFor(true, false, "terminal")).toBe(
+      "Listening paused: Your cursor is in a terminal. Click the message box to resume.",
     ));
 });
 

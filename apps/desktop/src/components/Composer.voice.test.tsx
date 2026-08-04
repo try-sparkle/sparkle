@@ -41,10 +41,10 @@ import { BACKEND_MIC_DENIED } from "../voice/backendVoiceErrors";
 import { useDictationStore } from "../stores/dictationStore";
 import { useUiStore } from "../stores/uiStore";
 import { usePromptHistoryStore } from "../stores/promptHistoryStore";
-import { WAKE_PHRASE } from "../voice/dictationCopy";
+import { LIVE_COMPOSER_PLACEHOLDER } from "../voice/dictationCopy";
 
-// Mid-download: the optimistic "listening" status + passive phase is EXACTLY the state that used to
-// render the wake-word invitation. modelProgress is what distinguishes it from a ready mic.
+// Mid-download: the optimistic "listening" status is EXACTLY the state that used to render an
+// invitation to speak. modelProgress is what distinguishes it from a ready mic.
 const DOWNLOADING = { done: 241_000_000, total: 482_000_000 };
 
 beforeEach(() => {
@@ -59,6 +59,9 @@ beforeEach(() => {
     outOfCreditsNotice: false,
   });
   useUiStore.getState().setComposerMinimized(false);
+  // Left at the default. This is an AGENT composer: its voice copy is independent of the concierge
+  // tray by design (see Composer.dictation.test.tsx), so these cases must not depend on a position.
+  useUiStore.getState().setConciergeSendMode("send");
   usePromptHistoryStore.setState({ history: [] });
 });
 afterEach(() => cleanup());
@@ -70,12 +73,12 @@ const textarea = () => screen.getByRole("textbox") as HTMLTextAreaElement;
 const composerText = () => `${document.body.textContent ?? ""} ${textarea().placeholder}`;
 
 describe("Composer — the voice model is still downloading (first run)", () => {
-  it("does NOT invite the user to say the wake word while the model is downloading", () => {
+  it("does NOT invite the user to speak while the model is downloading", () => {
     useDictationStore.setState({ modelProgress: DOWNLOADING });
     renderComposer();
     // THE bug: "Mic paused. Say Hey Sparkle to activate (or you can type here instead)."
     expect(composerText()).not.toContain("to activate");
-    expect(composerText()).not.toMatch(new RegExp(`Say\\s+${WAKE_PHRASE}`));
+    expect(composerText()).not.toContain(LIVE_COMPOSER_PLACEHOLDER);
   });
 
   it("says the voice model is being set up, with progress", () => {
@@ -95,7 +98,7 @@ describe("Composer — the voice model is still downloading (first run)", () => 
   it("still tells the user they can type meanwhile (the composer stays usable)", () => {
     useDictationStore.setState({ modelProgress: DOWNLOADING });
     renderComposer();
-    // Specifically the preparing copy's tail — the old wake-word placeholder also contains the
+    // Specifically the preparing copy's tail — the old live placeholder also contains the
     // words "type here", so a loose match here would pass against the very bug being fixed.
     expect(composerText()).toMatch(/type here meanwhile/i);
     expect(textarea().disabled).toBe(false);
@@ -110,11 +113,11 @@ describe("Composer — the voice model is still downloading (first run)", () => 
 
   // THE regression guard for the warm/founder install: model on disk → no progress events → the
   // composer must read exactly as it always has.
-  it("WARM start (no download) shows the ordinary wake-word prompt, never a setting-up state", () => {
+  it("WARM start (no download) shows the ordinary live voice prompt, never a setting-up state", () => {
     useDictationStore.setState({ modelProgress: null });
     renderComposer();
     expect(composerText()).not.toMatch(/setting up voice/i);
-    expect(composerText()).toContain(WAKE_PHRASE);
+    expect(composerText()).toContain(LIVE_COMPOSER_PLACEHOLDER);
   });
 
   it("WARM + active phase still shows the mic-hot copy untouched", () => {
@@ -124,7 +127,7 @@ describe("Composer — the voice model is still downloading (first run)", () => 
     expect(composerText()).not.toMatch(/setting up voice/i);
   });
 
-  it("the download finishing hands back to the normal wake-word prompt", () => {
+  it("the download finishing hands back to the normal live voice prompt", () => {
     useDictationStore.setState({ modelProgress: DOWNLOADING });
     const { rerender } = renderComposer();
     expect(composerText()).toMatch(/setting up voice/i);
@@ -132,7 +135,7 @@ describe("Composer — the voice model is still downloading (first run)", () => 
     useDictationStore.setState({ modelProgress: null });
     rerender(<Composer agentId="a1" active onSubmitPrompt={vi.fn()} />);
     expect(composerText()).not.toMatch(/setting up voice/i);
-    expect(composerText()).toContain(WAKE_PHRASE);
+    expect(composerText()).toContain(LIVE_COMPOSER_PLACEHOLDER);
   });
 });
 

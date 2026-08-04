@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { deriveMicState, shouldBlockMicArm, type MicState } from "./MicButton";
 import { useDictationStore, OUT_OF_CREDITS_NOTICE_MS } from "../stores/dictationStore";
 import type { Me } from "../services/entitlement";
-import type { Phase } from "../voice/wakeMachine";
+import type { Phase } from "../voice/dictationPhase";
 
 const me = (balanceCents: number): Me => ({
   clerkUserId: "u1",

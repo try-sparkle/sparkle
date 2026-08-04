@@ -166,13 +166,11 @@ export interface FreshnessConfig {
   stale_build_block_commits: number;
   require_fresh_branch: boolean;
 }
-/** Voice controls (machine-wide; ignored in a per-project file). The wake/stop words and the
- *  submit-listening behavior, editable in the ⋯ Settings → "Voice controls" pane. */
-export interface VoiceConfig {
-  wake_word: string;
-  stop_word: string;
-  pause_on_submit: boolean;
-}
+// NOTE: there is no `VoiceConfig` mirror here any more. It described exactly three keys — the wake
+// word, the stop word and pause-on-submit — and all three were retired with the wake word itself.
+// What remains in Rust's `[voice]` (the microphone UID and the virtual-input opt-in) has never been
+// read through this shape: it goes through its own Tauri commands (services/audioInputs), so adding
+// an empty interface back would only invite a second, drifting source for the same settings.
 /** Menu-bar capture flow (machine-wide; ignored in a per-project file). */
 export interface CaptureConfig {
   popover_shortcut: string;
@@ -224,7 +222,6 @@ export interface SparkleConfig {
   capture: CaptureConfig;
   // Optional so callers must guard: an older Rust backend (predating [voice]) omits it at runtime.
   // The current backend always sends it, but the type stays honest about the config-changed payload.
-  voice?: VoiceConfig;
   /** Per-category Sparkle Auto-Approve rules. Optional so callers guard: an older Rust backend
    *  (predating [approvals]) omits it; the current backend always sends it. */
   approvals?: ApprovalsConfig;

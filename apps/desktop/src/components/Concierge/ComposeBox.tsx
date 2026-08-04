@@ -155,6 +155,7 @@ import { TERM_BODY_BASE_SIZE, TERM_BODY_FONT } from "../terminalChrome";
 import { MentionMirror, MENTION_MIRROR_SKIP_ATTR } from "./MentionMirror";
 import { SendModeTray, type SendTrayModel } from "./SendModeTray";
 import { DEFAULT_SEND_CHORD, chordSends, type SendChord, type SendMode } from "../../voice/sendMode";
+import { micCaptionKind } from "../../voice/micPresentation";
 
 const line = `color-mix(in srgb, ${C.muted} 25%, transparent)`;
 
@@ -763,8 +764,11 @@ export function ComposeBox({
   // store snapshot, and a second path to it through this component's prop contract is exactly how
   // the "sidebar says Actively listening, composer says Mic paused" desync comes back. See
   // voice/useVoicePlaceholder.
-  const { micPresentation, wakeWord, stopWord, modelProgress, errorNotice, pauseReason } =
-    useVoicePlaceholder();
+  const { micPresentation, modelProgress, errorNotice, pauseReason } = useVoicePlaceholder();
+  // WHICH live sentence the placeholder shows, from the TRAY — the same pure function the sidebar
+  // caption uses, so the two surfaces cannot name different modes for one position. The presentation
+  // above still selects WHICH state is rendered; this only decides the words for the live ones.
+  const captionKind = micCaptionKind(sendMode);
   // The overlay stands in for a native placeholder, so it shows on exactly the same terms one
   // would: an empty textarea. Staged attachments render in their OWN row above the textarea (see
   // below), so they never compete for this slot.
@@ -1355,8 +1359,7 @@ export function ComposeBox({
     micPresentation,
     errorNotice,
     modelProgress,
-    wakeWord,
-    stopWord,
+    captionKind,
   ]);
 
   /**
@@ -2074,8 +2077,7 @@ export function ComposeBox({
             >
               <VoicePlaceholderCopy
                 micPresentation={micPresentation}
-                wakeWord={wakeWord}
-                stopWord={stopWord}
+                captionKind={captionKind}
                 modelProgress={modelProgress}
                 // WHY the mic is paused, so the `focusPaused` copy can name the cause rather than
                 // saying "paused" and leaving the user to guess (they guessed "broken").

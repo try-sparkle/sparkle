@@ -8,7 +8,7 @@
 
 import { isEditableElement } from "../engine/focusGuard";
 import { log } from "../logger";
-import type { Phase } from "../voice/wakeMachine";
+import type { Phase } from "../voice/dictationPhase";
 
 /** A PII-safe descriptor of a focus/event target: STRUCTURAL identity only — tag, id, filtered
  *  class tokens, data-testid, role, contentEditable. NEVER value or textContent. Pure, so the

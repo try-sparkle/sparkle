@@ -1,11 +1,12 @@
 import { describe, it, expect } from "vitest";
 import {
-  WAKE_PHRASE,
-  STOP_PHRASE,
-  WAKE_PLACEHOLDER,
-  MIC_HOT_PLACEHOLDER,
-  wakePlaceholder,
-  micHotPlaceholder,
+  LIVE_COMPOSER_PLACEHOLDER,
+  PTT_CAPTION_HEADLINE,
+  PTT_CAPTION_ACTION,
+  PTT_COMPOSER_PLACEHOLDER,
+  SPEAK_CAPTION_HEADLINE,
+  SPEAK_CAPTION_ACTION,
+  SPEAK_COMPOSER_PLACEHOLDER,
   preparingCaption,
   preparingPlaceholder,
   modelPercent,
@@ -23,26 +24,72 @@ import {
 // The advanced opt-in's own label, imported rather than retyped: the no-device remedy tells the user
 // to turn it on, and an instruction naming a control by a stale label is worse than none.
 import { ALLOW_VIRTUAL_LABEL, INPUT_PICKER_LOCATION } from "../services/audioInputs";
+import { TALK_KEY_GLYPH } from "./sendMode";
 
-describe("dictationCopy — dynamic placeholders", () => {
-  it("called with no arg reproduces the default constants (back-compat)", () => {
-    expect(wakePlaceholder()).toBe(WAKE_PLACEHOLDER);
-    expect(micHotPlaceholder()).toBe(MIC_HOT_PLACEHOLDER);
+// Every live sentence this module ships, so a new one cannot skip the invariants below by being
+// added without being listed here.
+const LIVE_COPY = [
+  LIVE_COMPOSER_PLACEHOLDER,
+  PTT_CAPTION_HEADLINE,
+  PTT_CAPTION_ACTION,
+  PTT_COMPOSER_PLACEHOLDER,
+  SPEAK_CAPTION_HEADLINE,
+  SPEAK_CAPTION_ACTION,
+  SPEAK_COMPOSER_PLACEHOLDER,
+];
+
+describe("dictationCopy — the retired wake and stop words", () => {
+  // THE FOUNDER'S BUG, as an assertion. He was shown "Mic paused. Say Hey Sparkle to activate" with
+  // the tray on PUSH TO TALK, and separately "say Sparkle, pause to finish" in the same mode. Both
+  // phrases came from this module. Nothing it ships may name either one again — and note this would
+  // FAIL against the previous version of this file, where four of the six constants below did not
+  // exist and the copy they replace contained these very strings.
+  it("no live sentence names a wake word, a stop word, or any phrase to say", () => {
+    for (const line of LIVE_COPY) {
+      expect(line).not.toMatch(/Hey Sparkle/i);
+      expect(line).not.toMatch(/Sparkle,\s*(pause|stop)/i);
+      // The shape, not just the shipped literals: no sentence tells the user to SAY something.
+      expect(line).not.toMatch(/\bsay\b/i);
+    }
   });
 
-  it("wakePlaceholder embeds the given wake word between the fixed prefix/suffix", () => {
-    const p = wakePlaceholder("Hey Jarvis");
-    expect(p).toContain("Hey Jarvis");
-    expect(p).not.toContain(WAKE_PHRASE); // the default phrase is gone
-    // Same framing as the default, just a different phrase.
-    expect(p.startsWith("Mic paused. Say")).toBe(true);
+  it("push-to-talk copy names the talk key through the shared glyph, never a literal", () => {
+    expect(PTT_CAPTION_ACTION).toContain(TALK_KEY_GLYPH);
+    expect(PTT_COMPOSER_PLACEHOLDER).toContain(TALK_KEY_GLYPH);
   });
 
-  it("micHotPlaceholder embeds the given stop phrase", () => {
-    const p = micHotPlaceholder("Jarvis, halt");
-    expect(p).toContain("Jarvis, halt");
-    expect(p).not.toContain(STOP_PHRASE);
-    expect(p.startsWith("I'm listening")).toBe(true);
+  // The constraint voice/micPresentation states: the caption follows the TRAY POSITION alone, so it
+  // must read true whether or not the key is down. A sentence in the present continuous ("I'm
+  // listening") is true only mid-hold; the push-to-talk copy must be in the imperative.
+  it("push-to-talk copy is an instruction, so it is true at rest AND mid-hold", () => {
+    expect(PTT_CAPTION_ACTION.startsWith("Hold")).toBe(true);
+    expect(PTT_COMPOSER_PLACEHOLDER.startsWith("Hold")).toBe(true);
+  });
+
+  // Speak is always on, so its copy must not promise a way to stop that no longer exists; what ends
+  // an utterance is silence, and the copy says so.
+  it("Speak copy names silence — not a phrase — as what finishes an utterance", () => {
+    expect(SPEAK_CAPTION_ACTION).toMatch(/pause/i);
+    expect(SPEAK_COMPOSER_PLACEHOLDER).toMatch(/pause when you/i);
+  });
+
+  // THE SURFACES WITHOUT A TRAY. `useAutoSend` is mounted only by ConciergeHost and a push-to-talk
+  // hold claims `voiceSurface: "concierge"`, so an agent composer and the capture window can honour
+  // neither of the tray's two promises. Their sentence must therefore name no send gesture at all —
+  // reading the tray there told the user to stop talking and then never sent (roborev 57785).
+  it("the tray-less surfaces' sentence promises no send gesture", () => {
+    expect(LIVE_COMPOSER_PLACEHOLDER).not.toMatch(/pause when you/i);
+    expect(LIVE_COMPOSER_PLACEHOLDER).not.toContain(TALK_KEY_GLYPH);
+    expect(LIVE_COMPOSER_PLACEHOLDER).not.toMatch(/\bsend\b/i);
+    // …and it is still a positive statement that the mic is hot, not an empty string. That half is
+    // what stops it being "fixed" by rendering nothing, which is the other half of the same bug.
+    expect(LIVE_COMPOSER_PLACEHOLDER).toMatch(/listening/i);
+  });
+
+  it("the two modes never share a sentence — that borrowing IS the defect", () => {
+    expect(PTT_CAPTION_ACTION).not.toBe(SPEAK_CAPTION_ACTION);
+    expect(PTT_COMPOSER_PLACEHOLDER).not.toBe(SPEAK_COMPOSER_PLACEHOLDER);
+    expect(PTT_CAPTION_HEADLINE).not.toBe(SPEAK_CAPTION_HEADLINE);
   });
 });
 
@@ -74,10 +121,12 @@ describe("modelPercent / preparing copy — the first-run download", () => {
     expect(preparingPlaceholder(42)).toMatch(/type here meanwhile/);
   });
 
-  it("never invites the wake word (the bug: this state used to render wakePlaceholder)", () => {
+  it("never borrows a live-capture sentence (the bug: this state used to invite the wake word)", () => {
     for (const pct of [null, 0, 50, 100]) {
-      expect(preparingPlaceholder(pct)).not.toContain(WAKE_PHRASE);
-      expect(preparingPlaceholder(pct)).not.toContain("to activate");
+      // It must not claim capture is usable while the model is still coming down — so none of the
+      // live-state sentences may leak into this slot.
+      for (const live of LIVE_COPY) expect(preparingPlaceholder(pct)).not.toContain(live);
+      expect(preparingPlaceholder(pct)).not.toMatch(/\bsay\b/i);
     }
   });
 });

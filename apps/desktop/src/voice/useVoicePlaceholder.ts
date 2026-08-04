@@ -10,7 +10,6 @@
 // live in dictationCopy, so this hook is purely "gather the inputs".
 import { useMemo } from "react";
 import { useDictationStore } from "../stores/dictationStore";
-import { useSettingsStore } from "../stores/settingsStore";
 import { voiceErrorNotice, type VoiceErrorNotice } from "./dictationCopy";
 import { deriveMicPresentation, type MicPresentation } from "./micPresentation";
 import { useDictationPauseReason } from "./useDictationPauseReason";
@@ -20,9 +19,6 @@ export interface VoicePlaceholderState {
   /** THE voice state, shared with the sidebar caption. Surfaces switch on this and supply only
    *  their own words. */
   micPresentation: MicPresentation;
-  /** The CONFIGURED wake/stop phrases, so a user's remap shows up in every hint. */
-  wakeWord: string;
-  stopWord: string;
   /** Non-null only while the one-time voice-model download is in flight. */
   modelProgress: { done: number; total: number | null } | null;
   /** The mapped dictation failure (headline + remedy), or null when voice is healthy. Surfaced by
@@ -52,8 +48,6 @@ export function useVoicePlaceholder(): VoicePlaceholderState {
   const modelProgress = useDictationStore((s) => s.modelProgress);
   const voiceError = useDictationStore((s) => s.error);
   const outOfCreditsNotice = useDictationStore((s) => s.outOfCreditsNotice);
-  const wakeWord = useSettingsStore((s) => s.wakeWord);
-  const stopWord = useSettingsStore((s) => s.stopWord);
   const errorNotice = useMemo(() => voiceErrorNotice(voiceError), [voiceError]);
   // Read through the SAME hook the sidebar uses, off the SAME pure decision the routing gate makes
   // (voice/dictationFocus). That is what keeps "we stopped transcribing because you're in a
@@ -74,8 +68,6 @@ export function useVoicePlaceholder(): VoicePlaceholderState {
   });
   return {
     micPresentation,
-    wakeWord,
-    stopWord,
     modelProgress,
     errorNotice,
     outOfCreditsNotice,

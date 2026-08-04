@@ -1012,20 +1012,16 @@ pub struct CaptureConfig {
     pub popover_shortcut: String,
 }
 
-/// Voice controls. Machine-wide (like [workers]/[ai]/[capture]): the wake/stop words and the
-/// submit-listening behavior are per-user preferences, so a per-project value is ignored with a
-/// warning. The DEFAULT words drive the tuned "sparkle" wake engine byte-for-byte; a custom word
-/// switches the matcher to a generic fuzzy path (see voice/wakeWords.ts).
+/// Voice controls: which MICROPHONE Sparkle captures from, and nothing else. Machine-wide (like
+/// [workers]/[ai]/[capture]) because a microphone belongs to the machine, not to a repo — a
+/// per-project value is ignored with a warning.
+///
+/// The wake word is retired. Dictation is started and stopped by the send tray (Send / Push to
+/// talk / Speak), so there are no spoken start/stop phrases and no submit-listening preference to
+/// configure; `wake_word`, `stop_word` and `pause_on_submit` used to live here and are gone.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct VoiceConfig {
-    /// Spoken phrase that wakes dictation (default "Hey Sparkle").
-    pub wake_word: String,
-    /// Spoken phrase that ends active dictation (default "Sparkle, pause").
-    pub stop_word: String,
-    /// When a prompt is submitted, drop from active dictation back to passive wake-word listening
-    /// (the mic stays on). Default true = pause listening on submit.
-    pub pause_on_submit: bool,
     /// The stable CoreAudio `kAudioDevicePropertyDeviceUID` of the microphone to capture from.
     /// `None` (the default) = choose automatically, preferring real hardware — see
     /// `audio_devices::select_device`.
@@ -1207,13 +1203,7 @@ impl Default for SparkleConfig {
             // Pre-warm a small pool by default so the common fan-out spawn skips `git worktree add`.
             worktree_pool: WorktreePoolConfig { enabled: true, size: 2 },
             capture: CaptureConfig { popover_shortcut: "ctrl+shift+r".into() },
-            voice: VoiceConfig {
-                wake_word: "Hey Sparkle".into(),
-                stop_word: "Sparkle, pause".into(),
-                pause_on_submit: true,
-                input_device_uid: None,
-                allow_virtual_input: false,
-            },
+            voice: VoiceConfig { input_device_uid: None, allow_virtual_input: false },
             // Undefined by default: every project starts with no Done/Delivered definition until
             // the user defines one (see the Definable Done & Delivered feature).
             done: DoneConfig { description: None, criteria: Vec::new() },
@@ -1490,9 +1480,10 @@ struct PartialCapture {
 
 #[derive(Debug, Default, Deserialize)]
 struct PartialVoice {
-    wake_word: Option<String>,
-    stop_word: Option<String>,
-    pause_on_submit: Option<bool>,
+    // No `deny_unknown_fields` here (nor on any enclosing partial) ON PURPOSE: an install upgrading
+    // from before the wake word was retired still has `wake_word` / `stop_word` /
+    // `pause_on_submit` on disk. Serde's default is to IGNORE unknown keys, so those lines are
+    // inert instead of failing the whole load and resetting every surviving setting.
     input_device_uid: Option<String>,
     allow_virtual_input: Option<bool>,
 }
@@ -1642,15 +1633,6 @@ fn apply_capture(into: &mut CaptureConfig, p: Option<PartialCapture>) {
 
 fn apply_voice(into: &mut VoiceConfig, p: Option<PartialVoice>) {
     let Some(p) = p else { return };
-    if let Some(v) = p.wake_word {
-        into.wake_word = v;
-    }
-    if let Some(v) = p.stop_word {
-        into.stop_word = v;
-    }
-    if let Some(v) = p.pause_on_submit {
-        into.pause_on_submit = v;
-    }
     // An empty string in the file means "automatic" — the same normalization
     // `DeviceChoice::from_config` applies, so a hand-edited config behaves like the picker's
     // "Automatic" entry rather than trying to bind a device whose UID is "".
@@ -2122,16 +2104,6 @@ const MIN_AGENT_RSS_THRESHOLD_MB: u32 = 1536;
 /// machine-derived. Installs carrying exactly this value are migrated to AUTO (see `validate`):
 /// the app wrote it for them, so it is not a choice we would be discarding.
 const LEGACY_DEFAULT_MAX_CONCURRENT: u32 = 20;
-
-/// The `stop_word` the app used to ship as its default, before the displayed phrase became
-/// "Sparkle, pause". Installs carrying exactly this value are migrated back to the default (see
-/// `migrate_global` v2): the template wrote it for them, so it is not a choice we would discard.
-///
-/// This is the RETIRED DISPLAY STRING, not a retired command — the recogniser still accepts
-/// "stop" as an undisplayed alias (see `STOP_VARIANTS` in `voice/wakeWords.ts`), and that alias is
-/// deliberately permanent. Removing this line from a config changes what the UI SAYS, never what
-/// the microphone answers to. Mirrors `LEGACY_STOP_WORD` in `voice/voiceDefaults.ts`.
-const LEGACY_DEFAULT_STOP_WORD: &str = "Sparkle, stop";
 
 /// V8's own default old-space ceiling on a 64-bit machine with plenty of RAM (~4 GiB — the machines
 /// in the incident reported 4.09 GiB). Used as the per-agent budget when the user opts OUT of our
@@ -2843,8 +2815,9 @@ fn build_effective(
                 }
                 if p.voice.is_some() {
                     warnings.push(
-                        "[voice] in a per-project .sparkle/config.toml is ignored — the wake/stop \
-                         words are a machine-wide preference; set them in the global config.toml"
+                        "[voice] in a per-project .sparkle/config.toml is ignored — the \
+                         microphone Sparkle captures from is a machine-wide setting, not a \
+                         repo-scoped one; set it in the global config.toml"
                             .to_string(),
                     );
                 }
@@ -3499,19 +3472,24 @@ consent_prompted = false   # set true once the one-time "review your commits?" p
 popover_shortcut = "ctrl+shift+r"
 
 # --- Voice controls (per-machine; ignored in a project file) ----------------------------
-# The spoken wake/stop words and what happens to dictation when you submit a prompt. Edit these
-# here or in the ⋯ Settings → "Voice controls" pane. The DEFAULT words below run Sparkle's tuned
-# "Hey Sparkle" recognition engine; changing them switches to a generic fuzzy matcher (a
-# distinctive, multi-syllable phrase recognizes best).
+# Which microphone Sparkle captures from. A microphone belongs to the machine, not to a repo, so
+# this lives in the global config only. Edit it here or in the ⋯ Settings → "Voice controls" pane.
+# Dictation is started and stopped from the send tray (Send / Push to talk / Speak) — there is no
+# spoken wake word.
 [voice]
-# Spoken phrase that starts dictation.
-wake_word = "Hey Sparkle"
-# Spoken phrase that ends active dictation.
-stop_word = "Sparkle, pause"
-# true  = submitting a prompt drops from active dictation back to passive wake-word listening
-#         (the mic stays on; say the wake word again to resume).
-# false = keep listening — stay in active dictation after a submit.
-pause_on_submit = true
+# Both keys below are COMMENTED OUT on purpose. Their defaults mean "decide automatically", and a
+# stamped literal would read as a pinned CHOICE on every later load — which is the exact trap the
+# v1/v3 migrations above exist to undo. Uncomment one only to override it.
+#
+# The stable CoreAudio device UID of the microphone to capture from — never a name, and never the
+# numeric AudioDeviceID (that is reassigned whenever an audio plug-in loads). Unset or empty =
+# choose automatically, preferring real hardware. The ⋯ Settings picker writes this for you.
+# input_device_uid = "AppleUSBAudioEngine:Blue:Yeti:1"
+#
+# ADVANCED / PRIVACY. Several audio plug-ins publish system OUTPUT as an input device, so a virtual
+# input can carry anything playing on this machine — a call, a video, a stream — into your
+# transcript. Off means automatic selection binds real hardware only.
+# allow_virtual_input = false
 
 # --- Branch/build freshness guardrails (repo-scoped; overridable in a project file) ----
 # These stop work from being done on — or a DMG from being shipped from — a branch that has
@@ -3750,50 +3728,15 @@ pub fn migrate_global(app_data: &Path) -> Result<(), String> {
         );
     }
 
-    // v2 — drop the RETIRED STOP WORD for installs still carrying it as a stamped default.
+    // v2 — DELETED. It rewrote a stamped `stop_word = "Sparkle, stop"` to the then-current display
+    // phrase. The wake word is retired outright now (dictation runs off the send tray), so
+    // `stop_word` is not a key anything reads and migrating its VALUE would be migrating nothing.
+    // A leftover line on disk is simply ignored — `PartialVoice` does not deny unknown fields, and
+    // no unknown-key warning covers `[voice]` — so removing this block costs the user nothing.
     //
-    // Same shape as v1, and the same root cause: `[voice]` is uncommented in DEFAULT_TEMPLATE and
-    // `load_document` falls back to that template, so the first `set_value` on an install with no
-    // config file writes the WHOLE template — including whichever `stop_word` line shipped that
-    // day. From PR #375 until the rename it read "Sparkle, stop".
-    //
-    // Renaming the phrase therefore only reached FRESH installs. `hydrateFromConfig` cannot tell a
-    // stamped default from a deliberate choice, so everyone else keeps seeing the retired phrase in
-    // the composer placeholder, the waveform caption and the Voice-controls field — with no
-    // migration and nothing on screen explaining it (roborev 55507). Removing the LINE is what
-    // makes it stick: the next load sees no key and falls back to the current default, and a phrase
-    // the user sets LATER survives, because by then the recorded revision has moved past this.
-    //
-    // Scope check, because this one is easy to over-apply: it changes only what the UI DISPLAYS.
-    // The recogniser still answers to "stop" as a permanent undisplayed alias, so no user loses a
-    // working voice command — see the retained-alias note beside `STOP_VARIANTS`.
-    let is_legacy_stop_word = applied < 2
-        && doc
-        .get("voice")
-        .and_then(|v| v.get("stop_word"))
-        .and_then(|v| v.as_str())
-        == Some(LEGACY_DEFAULT_STOP_WORD);
-    if is_legacy_stop_word {
-        // `as_table_like_mut` for the same reason as `workers`: it covers both the `[voice]` header
-        // and a hand-written inline `voice = { … }`, where `unset_dotted`'s traversal would refuse
-        // and strand that user on the retired phrase forever.
-        let Some(t) = doc.get_mut("voice").and_then(|v| v.as_table_like_mut()) else {
-            return Err(
-                "[voice] is not a table; migration deferred until config.toml is fixed".into()
-            );
-        };
-        t.remove("stop_word");
-        // Don't leave a dangling `[voice]` behind when that was its only key — same reasoning as
-        // `[workers]`: the user opens this file in the Advanced editor and an empty stanza
-        // attributable to nothing is clutter.
-        if doc.get("voice").and_then(|v| v.as_table_like()).is_some_and(|t| t.is_empty()) {
-            doc.remove("voice");
-        }
-        tracing::debug!(
-            "config migration v2: removing the retired \
-             stop_word = {LEGACY_DEFAULT_STOP_WORD:?} (a default, not a choice)"
-        );
-    }
+    // The revision NUMBER is deliberately not reused or renumbered: `applied < 3` below still means
+    // exactly what it meant, and an install already stamped `config_version = 2` must not be walked
+    // back through anything.
 
     // v3 — the RETIRED `[pushers].model` key, removed for the same reason v1 and v2 exist: the app
     // WROTE this line, so removing it discards nothing the user chose.
@@ -3863,18 +3806,11 @@ pub fn migrate_global(app_data: &Path) -> Result<(), String> {
     parse_layer(&text)
         .map_err(|e| format!("rejected: the migration would make config.toml invalid: {e}"))?;
     write_atomic(&path, &text)?;
-    // Announced only after the write lands — the three exits above persist nothing.
+    // Announced only after the write lands — the error exits above persist nothing.
     if is_legacy_default {
         tracing::info!(
             "config migration v1: adopted automatic worker concurrency (removed the legacy \
              max_concurrent = {LEGACY_DEFAULT_MAX_CONCURRENT}, which was a default, not a choice)"
-        );
-    }
-    if is_legacy_stop_word {
-        tracing::info!(
-            "config migration v2: adopted the current spoken stop phrase (removed the retired \
-             stop_word = {LEGACY_DEFAULT_STOP_WORD:?}, which was a default, not a choice). The \
-             recogniser still answers to the old phrase."
         );
     }
     Ok(())
@@ -5493,55 +5429,16 @@ quit_app = 42
         }
     }
 
-    // ---- v2: the retired stop word ------------------------------------------------------------
-    //
-    // roborev 55507 (High). The UPGRADE path is the whole point of these: renaming the displayed
-    // stop word to "Sparkle, pause" only reached FRESH installs. `[voice]` is uncommented in
-    // DEFAULT_TEMPLATE and `load_document` falls back to that template, so the first `set_value` on
-    // an install with no config file stamps the WHOLE template — including the `stop_word` line of
-    // the day. From PR #375 until the rename, that line read "Sparkle, stop". `hydrateFromConfig`
-    // cannot tell a stamped default from a deliberate choice, so every one of those installs keeps
-    // displaying the retired phrase forever, in the composer placeholder, the waveform caption and
-    // the Voice-controls field.
-    //
-    // A fresh-install test cannot see any of this — which is exactly how it shipped. Each test here
-    // therefore starts from a config file that ALREADY CARRIES the old value.
-
-    #[test]
-    fn a_config_carrying_the_retired_stop_word_migrates_to_the_new_default() {
-        // The shape a real upgrading install has: the whole [voice] stanza as the template stamped
-        // it, and `config_version = 1` because the v1 migration already ran here.
-        let dir = app_data_with(
-            "[voice]\n\
-             wake_word = \"Hey Sparkle\"\n\
-             stop_word = \"Sparkle, stop\"\n\
-             pause_on_submit = true\n\
-             \n[meta]\nconfig_version = 1\n",
-        );
-        migrate_global(dir.path()).unwrap();
-        let text = global_text(&dir);
-
-        // The LINE goes, not just the value — the next load must see no key at all, so the Rust
-        // default supplies the new phrase.
-        let doc = text.parse::<toml_edit::DocumentMut>().expect("still valid TOML");
-        let voice = doc.get("voice").and_then(|v| v.as_table_like()).expect("[voice] kept");
-        assert!(voice.get("stop_word").is_none(), "the retired key is removed: {text}");
-        assert!(voice.get("wake_word").is_some(), "its siblings stay: {text}");
-        assert!(voice.get("pause_on_submit").is_some(), "its siblings stay: {text}");
-
-        // THE user-visible outcome this migration exists to produce. Asserting the parsed config —
-        // not the file text — is what makes this the side effect rather than the precondition:
-        // it is the exact value `hydrateFromConfig` reads and every caption renders.
-        let (cfg, _, _) = effective(Some(&text), None);
-        assert_eq!(
-            cfg.voice.stop_word, "Sparkle, pause",
-            "the upgraded install now displays the CURRENT phrase, not the retired one"
-        );
-    }
+    // The v2 migration (rewriting a stamped `stop_word = "Sparkle, stop"` to the then-current
+    // display phrase) and its six tests are GONE with the wake word itself: `stop_word` is not a
+    // key anything reads any more, so there is no value left to migrate. The upgrade path those
+    // tests guarded is now covered from the other side, by
+    // `a_config_carrying_the_retired_wake_word_keys_still_loads` below — the retired lines must be
+    // INERT rather than migrated.
 
     // roborev 55804 (High): EVERY VERSION BUMP RE-ARMED EVERY EARLIER MIGRATION. The gate
     // `if applied >= CONFIG_MIGRATION_VERSION` guards the whole function body, so raising the
-    // constant to 2 put every install sitting at `config_version = 1` — precisely the population
+    // constant put every install sitting at an earlier `config_version` — precisely the population
     // an upgrade touches — back through the v1 block. A user migrated by v1 who then DELIBERATELY
     // re-pinned `max_concurrent = 20` (a real choice; 20 was the old default and the ⋯ Advanced
     // editor can produce it) had that line silently deleted again, breaking the guarantee v1's own
@@ -5549,26 +5446,25 @@ quit_app = 42
     // has moved past this migration."
     //
     // Nothing existing could catch it: every other migration test starts from a config with no
-    // `[meta]` (or from `reset`, which stamps the current max), so the `applied == 1` path was
-    // never exercised, and the v2 tests fixture `config_version = 1` with no `[workers]` key.
+    // `[meta]` (or from `reset`, which stamps the current max), so the already-applied path was
+    // never exercised. This test therefore fixtures an install stamped PAST v1 but short of v3,
+    // and asserts the pending migration runs while the applied one stays put.
     #[test]
     fn a_version_bump_does_not_re_arm_an_already_applied_migration() {
         // The exact shape of an upgrading install: v1 already ran, the user then chose 20 back,
-        // and the retired stop word is still on disk waiting for v2.
+        // and the retired [pushers].model line is still on disk waiting for v3.
         let dir = app_data_with(
             "[workers]\nmax_concurrent = 20\n\
-             \n[voice]\nstop_word = \"Sparkle, stop\"\n\
+             \n[pushers]\nmodel = \"claude-haiku-4-5\"\nenabled = true\n\
              \n[meta]\nconfig_version = 1\n",
         );
         migrate_global(dir.path()).unwrap();
         let text = global_text(&dir);
         let (cfg, _, _) = effective(Some(&text), None);
 
-        // v2 must run…
-        assert_eq!(
-            cfg.voice.stop_word, "Sparkle, pause",
-            "the pending v2 migration still applies: {text}"
-        );
+        // The still-pending migration must run…
+        assert!(!text.contains("model ="), "the pending v3 migration still applies: {text}");
+        assert!(text.contains("enabled = true"), "and only takes its own key: {text}");
         // …and v1 must NOT run again. This is the assertion that fails without per-migration
         // gating: the user's deliberate 20 is silently reverted to auto.
         assert_eq!(
@@ -5577,78 +5473,6 @@ quit_app = 42
             "an ALREADY-APPLIED migration must not re-run and eat a later choice: {text}"
         );
         assert!(text.contains("max_concurrent = 20"), "the line itself survives: {text}");
-    }
-
-    #[test]
-    fn a_deliberately_chosen_stop_word_survives_the_migration() {
-        // The counterpart risk: this migration must never eat a phrase someone actually picked.
-        // "Sparkle, pause" is in the list on purpose — a user who typed the new default by hand
-        // keeps a real (if redundant) line, and removing it would still be correct behaviour, so
-        // the assertion below is on the EFFECTIVE value rather than the file text.
-        for chosen in ["Jarvis, halt", "Computer, enough", "Sparkle, pause", "stop"] {
-            let dir = app_data_with(&format!(
-                "[voice]\nstop_word = \"{chosen}\"\n\n[meta]\nconfig_version = 1\n"
-            ));
-            migrate_global(dir.path()).unwrap();
-            let (cfg, _, _) = effective(Some(&global_text(&dir)), None);
-            assert_eq!(cfg.voice.stop_word, chosen, "kept {chosen:?}");
-        }
-    }
-
-    #[test]
-    fn the_stop_word_migration_runs_at_most_once_so_a_later_choice_is_the_users_to_keep() {
-        let dir = app_data_with(
-            "[voice]\nstop_word = \"Sparkle, stop\"\n\n[meta]\nconfig_version = 1\n",
-        );
-        migrate_global(dir.path()).unwrap();
-
-        // The user now DELIBERATELY types the retired phrase back — they liked it, or they are on
-        // a team that still says it. Every later launch re-runs migrations; this must not fire
-        // again, or the phrase becomes permanently unsettable.
-        set_value(dir.path(), "voice.stop_word", &serde_json::json!("Sparkle, stop")).unwrap();
-        migrate_global(dir.path()).unwrap();
-        migrate_global(dir.path()).unwrap();
-
-        let (cfg, _, _) = effective(Some(&global_text(&dir)), None);
-        assert_eq!(cfg.voice.stop_word, "Sparkle, stop", "a chosen phrase survives forever");
-    }
-
-    #[test]
-    fn an_emptied_voice_stanza_is_removed_and_an_inline_one_migrates_too() {
-        // Mirrors the `workers` handling: a stanza whose only key we removed is clutter in the
-        // Advanced editor, and the inline shape is the one a dotted-key traversal cannot touch —
-        // routing through that would strand an inline-table user on the retired phrase forever.
-        for src in [
-            "[voice]\nstop_word = \"Sparkle, stop\"\n\n[meta]\nconfig_version = 1\n",
-            "voice = { stop_word = \"Sparkle, stop\" }\n\n[meta]\nconfig_version = 1\n",
-        ] {
-            let dir = app_data_with(src);
-            migrate_global(dir.path()).unwrap();
-            let text = global_text(&dir);
-            let doc = text.parse::<toml_edit::DocumentMut>().expect("still valid TOML");
-            assert!(doc.get("voice").is_none(), "the emptied container goes ({src:?}): {text}");
-            let (cfg, _, _) = effective(Some(&text), None);
-            assert_eq!(cfg.voice.stop_word, "Sparkle, pause", "and the phrase updates ({src:?})");
-        }
-    }
-
-    #[test]
-    fn a_project_level_stop_word_is_never_touched_by_the_migration() {
-        // Same rationale as the `workers` case: "the app wrote this, the user never chose it" is
-        // only ever true of the GLOBAL file. A per-project override is always deliberate.
-        let dir = app_data_with(
-            "[voice]\nstop_word = \"Sparkle, stop\"\n\n[meta]\nconfig_version = 1\n",
-        );
-        let project = dir.path().join("some-repo");
-        std::fs::create_dir_all(project.join(".sparkle")).unwrap();
-        let project_file = project.join(".sparkle").join("config.toml");
-        let original = "[voice]\nstop_word = \"Sparkle, stop\"\n";
-        std::fs::write(&project_file, original).unwrap();
-
-        migrate_global(dir.path()).unwrap();
-
-        assert_eq!(std::fs::read_to_string(&project_file).unwrap(), original, "project untouched");
-        assert!(!global_text(&dir).contains("Sparkle, stop"), "global migrated");
     }
 
     // roborev 53140 (Medium): `validate` sees the MERGED config, so migrating there also erased a
@@ -6054,32 +5878,90 @@ quit_app = 42
 
     #[test]
     fn voice_defaults_and_overrides() {
-        // Absent [voice] section → the built-in wake/stop words + pause-on-submit default.
+        // Absent [voice] section → automatic device selection, hardware inputs only.
         let (cfg, _, _) = effective(None, None);
-        assert_eq!(cfg.voice.wake_word, "Hey Sparkle");
-        assert_eq!(cfg.voice.stop_word, "Sparkle, pause");
-        assert!(cfg.voice.pause_on_submit);
+        assert_eq!(cfg.voice.input_device_uid, None);
+        assert!(!cfg.voice.allow_virtual_input);
 
         // Global layer overrides each field independently.
         let g = r#"
             [voice]
-            wake_word = "Hey Jarvis"
-            stop_word = "Jarvis, halt"
-            pause_on_submit = false
+            input_device_uid = "AppleUSBAudioEngine:Blue:Yeti:1"
+            allow_virtual_input = true
         "#;
         let (cfg, warns, hard) = effective(Some(g), None);
         assert!(!hard);
         assert!(warns.is_empty());
-        assert_eq!(cfg.voice.wake_word, "Hey Jarvis");
-        assert_eq!(cfg.voice.stop_word, "Jarvis, halt");
-        assert!(!cfg.voice.pause_on_submit);
+        assert_eq!(cfg.voice.input_device_uid.as_deref(), Some("AppleUSBAudioEngine:Blue:Yeti:1"));
+        assert!(cfg.voice.allow_virtual_input);
 
-        // A partial override leaves the untouched fields at their defaults.
-        let g2 = "[voice]\nwake_word = \"Computer\"\n";
+        // A partial override leaves the untouched field at its default.
+        let g2 = "[voice]\nallow_virtual_input = true\n";
         let (cfg, _, _) = effective(Some(g2), None);
-        assert_eq!(cfg.voice.wake_word, "Computer");
-        assert_eq!(cfg.voice.stop_word, "Sparkle, pause");
-        assert!(cfg.voice.pause_on_submit);
+        assert_eq!(cfg.voice.input_device_uid, None);
+        assert!(cfg.voice.allow_virtual_input);
+
+        // An empty string means "automatic", not "bind a device whose UID is empty".
+        let g3 = "[voice]\ninput_device_uid = \"  \"\n";
+        let (cfg, _, _) = effective(Some(g3), None);
+        assert_eq!(cfg.voice.input_device_uid, None);
+    }
+
+    // THE UPGRADE PATH for retiring the wake word (requirement 5). Every install that ever opened
+    // the ⋯ Advanced editor or toggled an AI feature has the whole DEFAULT_TEMPLATE stamped to
+    // disk, so `wake_word` / `stop_word` / `pause_on_submit` are sitting in real users' config
+    // files right now. Those keys no longer exist in `PartialVoice`.
+    //
+    // The failure this guards is not hypothetical: `#[serde(deny_unknown_fields)]` on `PartialVoice`
+    // (or on any struct enclosing it) would turn each of those lines into a WHOLE-LAYER parse
+    // error, which `build_effective` reports as a hard error and answers by discarding the entire
+    // global layer — so a user upgrading would silently lose their microphone choice and every
+    // other global setting, because of three lines the app itself wrote for them. Serde's default
+    // is to ignore unknown fields; this test is what keeps that default from being "tightened"
+    // later by someone who does not know it is load-bearing.
+    #[test]
+    fn a_config_carrying_the_retired_wake_word_keys_still_loads() {
+        let g = r#"
+            [voice]
+            wake_word = "Hey Sparkle"
+            stop_word = "Sparkle, pause"
+            pause_on_submit = true
+            input_device_uid = "ABC123"
+
+            [workflow]
+            require_pr = false
+        "#;
+        let (cfg, warns, hard) = effective(Some(g), None);
+
+        // 1. The load SUCCEEDS. A hard error here means the layer was thrown away wholesale.
+        assert!(!hard, "retired [voice] keys must not fail the load");
+
+        // 2. And it succeeds SILENTLY. This pins the second half of the "no cleanup migration is
+        //    needed" rationale, which is otherwise only a comment: `[pushers]` and
+        //    `[concierge.checks]` both have unknown-key catch-alls that warn "… has no effect",
+        //    and the v3 migration exists precisely because one of them fired forever on a line the
+        //    app itself wrote. `[voice]` has no such catch-all. If someone adds one, these three
+        //    keys — sitting in every upgraded install's config.toml — would emit a permanent
+        //    warning per load with no migration left to remove them, so that change must break
+        //    here and be made to clean the lines up instead.
+        assert!(
+            warns.is_empty(),
+            "a retired [voice] key must be inert, not a permanent per-load warning: {warns:?}"
+        );
+
+        // 3. The retired keys do not poison their surviving sibling in the SAME table — this is the
+        //    assertion that actually fails under `deny_unknown_fields`, since the whole `[voice]`
+        //    table (and with it `input_device_uid`) would never be applied.
+        assert_eq!(
+            cfg.voice.input_device_uid.as_deref(),
+            Some("ABC123"),
+            "the surviving sibling key is still read"
+        );
+
+        // 4. Nor do they poison an unrelated table, or the untouched defaults.
+        assert!(!cfg.workflow.require_pr, "an unrelated table still applies");
+        assert!(!cfg.voice.allow_virtual_input, "an unset [voice] key keeps its default");
+        assert!(cfg.ai.voice_dictation, "a default outside [voice] is intact");
     }
 
     #[test]

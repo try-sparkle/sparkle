@@ -21,11 +21,6 @@ import type { SpanMode } from "../services/displaySpan";
 // that loop; `import type` is erased, so it can't.
 import type { PolicyDecision, ToolPolicyOverrides } from "../services/conciergeTools/policy";
 import {
-  DEFAULT_WAKE_WORD,
-  DEFAULT_STOP_WORD,
-  DEFAULT_PAUSE_ON_SUBMIT,
-} from "../voice/voiceDefaults";
-import {
   toApprovalMap,
   asResumeRule,
   DEFAULT_RESUME_RULE,
@@ -495,15 +490,6 @@ interface SettingsState {
   driftBehindNudge: number;
   driftAheadNudge: number;
   driftChangedLines: number;
-  /** Custom wake word (default "Hey Sparkle"). Mirrors [voice].wake_word; the always-listening
-   *  matcher (useDictation → wakeMachine) uses it. Config-mirrored, NOT persisted — re-read from
-   *  the file each launch. */
-  wakeWord: string;
-  /** Custom stop word (default "Sparkle, pause"). Mirrors [voice].stop_word. */
-  stopWord: string;
-  /** When true (default), submitting a prompt drops active dictation back to passive wake-word
-   *  listening (mic stays on). When false, dictation keeps listening. Mirrors [voice].pause_on_submit. */
-  pauseOnSubmit: boolean;
   /** Usage analytics + masked session replay (PostHog). Off → analytics.ts sends nothing. Mirrors
    *  [tools].analytics. Config-backed, NOT persisted — re-read from the file each launch. */
   analyticsEnabled: boolean;
@@ -634,12 +620,6 @@ interface SettingsState {
   setGlobalResume: (rule: ResumeRule) => void;
   /** Bulk-set every AI feature (the All / Off segments). */
   setAllAiFeatures: (on: boolean) => void;
-  /** Optimistically set the custom wake word (configActions persists it to [voice].wake_word). */
-  setWakeWord: (word: string) => void;
-  /** Optimistically set the custom stop word (configActions persists it to [voice].stop_word). */
-  setStopWord: (word: string) => void;
-  /** Optimistically set the pause-on-submit toggle (configActions persists [voice].pause_on_submit). */
-  setPauseOnSubmit: (on: boolean) => void;
   /** Optimistically toggle one [tools] flag; configActions persists it to config.toml. */
   setToolEnabled: (key: ToolKey, on: boolean) => void;
   /** Optimistically toggle one [plugins] flag; configActions persists it to config.toml. */
@@ -724,9 +704,6 @@ export const useSettingsStore = create<SettingsState>()(
       driftBehindNudge: 10,
       driftAheadNudge: 15,
       driftChangedLines: 1000,
-      wakeWord: DEFAULT_WAKE_WORD,
-      stopWord: DEFAULT_STOP_WORD,
-      pauseOnSubmit: DEFAULT_PAUSE_ON_SUBMIT,
       analyticsEnabled: true,
       beadsEnabled: true,
       githubEnabled: true,
@@ -798,9 +775,6 @@ export const useSettingsStore = create<SettingsState>()(
         }),
       replaceConciergeToolPolicies: (next) => set({ conciergeToolPolicy: { ...next } }),
       setGlobalResume: (rule) => set({ resumeRule: asResumeRule(rule) }),
-      setWakeWord: (wakeWord) => set({ wakeWord }),
-      setStopWord: (stopWord) => set({ stopWord }),
-      setPauseOnSubmit: (pauseOnSubmit) => set({ pauseOnSubmit }),
       setToolEnabled: (key, on) => set({ [TOOL_FIELD[key]]: on } as Partial<SettingsState>),
       setPluginEnabled: (key, on) =>
         set((s) => ({ pluginsEnabled: { ...s.pluginsEnabled, [key]: on } })),
@@ -917,12 +891,6 @@ export const useSettingsStore = create<SettingsState>()(
           driftBehindNudge: config.workflow.drift.behind_nudge,
           driftAheadNudge: config.workflow.drift.ahead_nudge,
           driftChangedLines: config.workflow.drift.changed_lines,
-          // Voice controls. Trim + `|| default` treats an absent [voice] block (older backend) AND
-          // an empty/whitespace word alike — a blank custom word would otherwise take the generic
-          // matcher's custom path with an empty phrase and never wake.
-          wakeWord: (config.voice?.wake_word ?? "").trim() || DEFAULT_WAKE_WORD,
-          stopWord: (config.voice?.stop_word ?? "").trim() || DEFAULT_STOP_WORD,
-          pauseOnSubmit: config.voice?.pause_on_submit ?? DEFAULT_PAUSE_ON_SUBMIT,
           // Tools flags. `?? true` treats an absent [tools] block (older backend) as the on-by-default
           // state, matching SparkleConfig::default() — a new install ships every tool on.
           analyticsEnabled: config.tools?.analytics ?? true,

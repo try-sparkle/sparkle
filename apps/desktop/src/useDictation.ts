@@ -2,14 +2,13 @@ import { useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useDictationStore } from "./stores/dictationStore";
-import { useSettingsStore } from "./stores/settingsStore";
 import { useAiFeature, aiFeatureNow } from "./services/aiGate";
 import { useAuthStore } from "./stores/authStore";
-import { advance, type Advance } from "./voice/wakeMachine";
 import { openCloudDictationWindow, nextBalanceCents } from "./services/cloudDictation";
 import { safeUnlisten } from "./services/safeUnlisten";
 import { selectedProjectName } from "./services/creditProject";
 import { classifyVoiceError } from "./voice/dictationCopy";
+import type { Phase } from "./voice/dictationPhase";
 import { routeDictationToTerminal } from "./services/dictationTerminalSink";
 import {
   armedStatus,
@@ -21,16 +20,44 @@ import {
 } from "./voice/dictationFocus";
 
 /**
- * The cloud-stream command (if any) a wake-machine transition implies. Pure so the
- * "local gate, then stream" wiring is unit-testable without the hook: only a *transition*
- * acts — entering ACTIVE opens the Deepgram stream, returning to PASSIVE closes it. A segment
- * that merely inserts text (no phase change) leaves the stream as-is.
+ * How long the room may stay quiet before this window PARKS its billable relay.
+ *
+ * Not a UX delay — a COST bound. See the idle-park block in `createDictationController` for the full
+ * story; in short, the relay bills per elapsed minute and nothing else closes it now that the stop
+ * word and pause-on-submit are gone. The microphone is unaffected: it stays armed, the tray never
+ * moves, and the next word reopens the socket through the same warm-standby resume a window refocus
+ * uses.
+ *
+ * 60s is chosen against the BILLING GRANULARITY rather than against human pause length. The relay
+ * debits a first minute up front, so parking sooner cannot recover money already spent on the
+ * current minute — it only risks paying a fresh first minute for someone who was merely thinking
+ * mid-sentence. Waiting a full minute makes the park free by construction and still bounds an idle
+ * Speak session at one minute of charge instead of an unbounded number.
+ */
+export const IDLE_RELAY_PARK_MS = 60_000;
+
+/**
+ * The cloud-stream command (if any) a PHASE EDGE implies. Pure so the "local gate, then stream"
+ * wiring is unit-testable without the hook: only a real CHANGE acts — entering ACTIVE opens the
+ * Deepgram relay, returning to PASSIVE closes it, and a re-observation of an unchanged phase
+ * leaves the stream alone.
+ *
+ * ── WHAT MOVED, AND WHY IT HAD TO ───────────────────────────────────────────────────────────────
+ * This used to take a wake-machine `Advance` and fire on the transition a SPOKEN PHRASE caused: the
+ * wake word opened the relay, the stop word closed it. Both phrases are gone (voice/dictationPhase),
+ * so segments no longer move the phase at all and a decision keyed on them would never fire again —
+ * i.e. Speak would arm a microphone whose cloud relay never opened.
+ *
+ * The phase still moves, on exactly the edges that matter, and now for a better reason: the tray is
+ * its only writer. Entering Speak, and each push-to-talk hold, IS the edge. So the relay's lifetime
+ * is keyed on the phase itself rather than on the thing that used to change it.
  */
 export function cloudStreamCommandFor(
-  r: Advance,
+  prevPhase: Phase,
+  nextPhase: Phase,
 ): "start_cloud_stream" | "stop_cloud_stream" | null {
-  if (!r.transitioned) return null;
-  return r.phase === "active" ? "start_cloud_stream" : "stop_cloud_stream";
+  if (prevPhase === nextPhase) return null;
+  return nextPhase === "active" ? "start_cloud_stream" : "stop_cloud_stream";
 }
 
 // ---------------------------------------------------------------------------
@@ -42,17 +69,17 @@ export function cloudStreamCommandFor(
 
 interface DictationOptions {
   /**
-   * Hand a COMMITTED segment to the phase (wake/stop) machine.
+   * Hand a COMMITTED segment to its destination.
    *
-   * `ctx.terminal` says where the surviving text is bound. For the composer the callee inserts it
-   * and returns nothing; for a terminal it returns the text to type, or null/undefined when the
-   * phrase was consumed entirely by a wake/stop word. Routing the destination through the ONE
-   * machine — rather than short-circuiting past it — is what keeps the stop word working when the
-   * caret is in a terminal (roborev 56038).
+   * `ctx.terminal` says where the text is bound. For the composer the callee inserts it and returns
+   * nothing; for a terminal it returns the text to type, or null when the mic is not routing. It
+   * used to run a wake/stop MATCHER first and hand back only the words that survived the stripping;
+   * with both phrases retired every committed word is the user's, so nothing is consumed.
    */
   onSegment: (text: string, ctx: { terminal: boolean }) => string | null | void;
-  /** Called on focus REGAIN when a dictation session is still ACTIVE (phase === "active"), so the
-   *  cloud stream resumes without the user re-saying the wake word. Optional (tests may omit it). */
+  /** Called when this window's cloud relay should be OPEN — on a passive→active phase edge, and on
+   *  focus REGAIN while a session is still ACTIVE, so moving away and back does not cost the user
+   *  their dictation session. Optional (tests may omit it). */
   onResumeActive?: () => void;
   /** True when THIS window is the active/focused OS window. The backend broadcasts every
    *  `dictation://*` event to ALL Sparkle windows (focus is tracked app-globally — see
@@ -123,10 +150,10 @@ export async function createDictationController(
   // A terminal used to be a place dictation STOPPED. It is now a place dictation GOES: a committed
   // phrase is typed at the focused agent's own input line (services/dictationTerminalSink).
   //
-  // THE WAKE GATE IS PART OF THIS, DELIBERATELY. Typing into a live agent is a much sharper action
-  // than filling a compose box the user can read and edit before sending, so it requires that
-  // dictation was actually WOKEN (`phase === "active"`), not merely left armed. An armed-but-passive
-  // mic near an open terminal must stay inert.
+  // THE ROUTING GATE IS PART OF THIS, DELIBERATELY. Typing into a live agent is a much sharper
+  // action than filling a compose box the user can read and edit before sending, so it requires that
+  // the mic is actually ROUTING (`phase === "active"`), not merely left armed. An armed-but-passive
+  // mic near an open terminal — Push to talk between holds — must stay inert.
   const terminalRoutingArmed = (): boolean => {
     const s = useDictationStore.getState();
     return terminalRoutingArmedFor({
@@ -156,7 +183,7 @@ export async function createDictationController(
   // terminal is taking the phrase is what keeps this a widening, not a silent narrowing elsewhere.
   const isRoutable = () =>
     isWindowActive() && focusPauseReason() === null && !isTerminalRoutable();
-  /** MAY A PHRASE BE TYPED INTO THE FOCUSED TERMINAL? Requires the caret AND the wake gate. */
+  /** MAY A PHRASE BE TYPED INTO THE FOCUSED TERMINAL? Requires the caret AND the routing gate. */
   const isTerminalRoutable = () =>
     isWindowActive() && focusOwnerNow() === "terminal" && terminalRoutingArmed();
   /** Is the mic feeding EITHER destination? The relay's lifetime and the live meters key on this —
@@ -173,12 +200,13 @@ export async function createDictationController(
 
   // --- Per-window cloud-stream ownership (sparkle-ozvr) ------------------------------------------
   // The billable Deepgram relay is a single backend resource, but it is logically OWNED by the one
-  // window that drove the wake word — i.e. the window whose OWN per-window store has `phase: "active"`.
+  // window that put the mic into dictation — i.e. the window whose OWN per-window store has
+  // `phase: "active"`.
   // Committed partials route by focus (isWindowActive), but ownership lived only in the old window's
   // store, and `dictation://focus` fires only on APP-level focus flips — never on a window-to-window
-  // switch (dictation.rs keeps `focused` true while any Sparkle window is up). So saying "Hey Sparkle"
-  // in window A then switching to window B left A's relay streaming (and billing) until a stop word or
-  // timeout, while B (still PASSIVE) inserted nothing. Fix: tie the relay's lifetime to whether the
+  // switch (dictation.rs keeps `focused` true while any Sparkle window is up). So starting dictation
+  // in window A then switching to window B left A's relay streaming (and billing) until it was ended
+  // or timed out, while B (still PASSIVE) inserted nothing. Fix: tie the relay's lifetime to whether the
   // owner window is the focused dictation target — tear it down when the owner loses focus, and resume
   // it when the owner regains focus (the session follows its window).
   //
@@ -188,10 +216,31 @@ export async function createDictationController(
 
   // Close THIS window's relay when it stops being the focused dictation target. Only the OWNER (its own
   // phase is ACTIVE) has a billable stream to close; a passive/background window is a no-op. Phase is
-  // intentionally RETAINED so refocusing the owner resumes without a re-said wake word.
+  // intentionally RETAINED so refocusing the owner resumes the same session rather than dropping it.
   const tearDownOwnedStream = () => {
     const store = useDictationStore.getState();
     if (store.phase !== "active") return;
+    // THE PARK'S LIFETIME IS THE RELAY'S — cancel it here, where the relay closes.
+    //
+    // I DECLINED THIS ONCE, on the reasoning that both teardown callers were already covered by the
+    // timer's own guards ("a blur by `isWindowActive()`, a non-routable terminal by the
+    // `phase !== "active"` early-return above"). THAT WAS WRONG FOR THE TERMINAL PATH, and the
+    // correction is worth keeping because the false version was written into this file as fact: a
+    // terminal teardown deliberately RETAINS `phase: "active"` (see the note on `notifyFocusOwner`;
+    // `reconcileStatusForOwner` writes interim/level/speaking/status and never `phase`), so that
+    // early-return is never reached there.
+    //
+    // The sequence it misses: quiet on Speak arms a park; the caret then moves into a NON-routable
+    // terminal, which closes the relay and leaves the park pending; the timer fires in the SAME
+    // still-focused window, so `isWindowActive()` passes too, and the whole teardown runs a second
+    // time — a redundant `stop_cloud_stream` on the single global relay. It is benign today only
+    // because of an invariant nothing stated: both reopen paths now re-arm, and DOM focus is
+    // exclusive across webviews. A future reopen path that does not re-arm turns it into the exact
+    // cross-window kill the timer's guard exists to prevent (roborev 57802).
+    //
+    // Falsifiable, unlike the version I first argued against: without this line, the errored-
+    // terminal case in useDictation.test.ts sees a second close ~60s later.
+    clearIdlePark();
     invoke("stop_cloud_stream").catch(() => {});
     streamTornDown = true;
     store.setInterim("");
@@ -229,6 +278,64 @@ export async function createDictationController(
     streamTornDown = false;
     store.setStatus("listening");
     onResumeActive?.();
+    // ARM THE CLOCK WHERE THE SOCKET OPENS. The idle park was originally armed only on the VAD's
+    // falling edge and on the phase edge, which left the commonest re-entry uncovered: once a park
+    // has fired, `speaking` is ALREADY false, so no VAD edge can fire again — and every resume path
+    // (a window refocus, `dictation://focus`, leaving a terminal) reopened the billable relay with
+    // no timer behind it. Dictate, go quiet, park at 60s, alt-tab away and back, and the relay took
+    // a fresh first-minute debit and then billed indefinitely while the user read. That is the exact
+    // High this park exists to close, surviving on the most-travelled path (roborev 57795).
+    armIdlePark();
+  };
+
+  // ── THE IDLE PARK: A LIVE MICROPHONE IS NOT A REASON TO KEEP PAYING FOR A SOCKET ───────────────
+  //
+  // THE COST BUG THIS EXISTS TO CLOSE (roborev 57785, High). The relay's lifetime is now the tray
+  // position (see the phase-edge branch below), and BOTH things that used to close it went with the
+  // wake word: the stop word, and pause-on-submit — which defaulted to true and shut the socket
+  // after every message. Nothing replaced them, so "Speak is always on" meant the billable socket
+  // was too. Metering is per ELAPSED minute, debited up front (apps/orchestration relay
+  // `firstMinuteCents`), and the backend only parks on blur — never on silence. So sitting in a
+  // focused window on Speak, reading the thread and saying nothing, drained credits for zero
+  // transcription.
+  //
+  // "ALWAYS ON" IS ABOUT THE MICROPHONE, NOT THE SOCKET, and that distinction is the whole fix. The
+  // mic stays armed and the tray never moves; only the paid relay parks, and the very next word
+  // brings it back. What the user was promised is preserved exactly — they never touch anything.
+  //
+  // IT REUSES THE WARM-STANDBY PATH RATHER THAN INVENTING ONE. `tearDownOwnedStream` /
+  // `maybeResumeOwnedStream` already do precisely this for a window blur, including the
+  // `streamTornDown` latch that stops a resume firing without a real teardown and the guard that
+  // keeps a background window from grabbing the single global stream. Silence is just another
+  // reason to park, so it goes through the same two functions — which also means it cannot drift
+  // from the focus path's rules.
+  //
+  // THE SIGNAL IS THE VAD, NOT THE TRANSCRIPT. `speaking` is the raw Silero flag on BOTH capture
+  // paths (dictation.rs `frame_speaking` ignores `cloud_active`), so it is true of a user who is
+  // talking regardless of whether anything has been recognised yet — which is what makes it safe to
+  // park on its absence. Keying on committed segments instead would park mid-utterance whenever
+  // recognition lagged, which is the truncation failure `useSendMode`'s drain exists to prevent.
+  let idlePark: ReturnType<typeof setTimeout> | null = null;
+  const clearIdlePark = () => {
+    if (idlePark !== null) clearTimeout(idlePark);
+    idlePark = null;
+  };
+  const armIdlePark = () => {
+    clearIdlePark();
+    idlePark = setTimeout(() => {
+      idlePark = null;
+      // Re-read rather than trusting the state that armed the timer: a minute is a long time, and
+      // the mic may have been released, faulted or moved off Speak since. `tearDownOwnedStream`
+      // early-returns unless this window's phase is still ACTIVE, so a park that is no longer
+      // wanted is a no-op rather than a wrong teardown.
+      if (useDictationStore.getState().speaking) return armIdlePark();
+      // THE SAME OWNERSHIP GUARD THE PHASE EDGE CARRIES, and for the same reason: `phase` is
+      // cross-window synced, so `tearDownOwnedStream`'s own `phase !== "active"` test cannot tell
+      // "this window owns the relay" from "some window does". Closing the socket from a background
+      // window is the roborev-56061 failure, reached here by a timer instead of by a store event.
+      if (!isWindowActive()) return;
+      tearDownOwnedStream();
+    }, IDLE_RELAY_PARK_MS);
   };
 
   // Per-WINDOW OS-focus transition (DOM window focus/blur), the signal the app-level event misses on a
@@ -243,19 +350,23 @@ export async function createDictationController(
   // the keyboard, so Sparkle stops listening until they come back to the box.
   //
   // What it does NOT touch, exactly as the window path doesn't: `enabled` (the mic stays armed —
-  // this is a gate on top of the mute toggle, not the toggle) and `phase` (an ACTIVE "Hey Sparkle"
-  // session must survive clicking into a terminal and back without re-saying the wake word).
+  // this is a gate on top of the mute toggle, not the toggle) and `phase` (an ACTIVE Speak session
+  // must survive clicking into a terminal and back without the user touching the tray).
   /**
    * Bring `status` (and the live-UI fields that go with it) into line with the caret — and NOTHING
    * else. Split out of {@link notifyFocusOwner} because a PHASE edge needs exactly this and must not
-   * touch the stream (roborev 56061): reconciling through the whole handler also re-entered
-   * `maybeResumeOwnedStream`, and the wake transition is the precise moment that guard starts
-   * passing, so `setPhase("active")` fired a resume synchronously and then `onSegment` opened the
-   * relay again — two `start_cloud_stream` invokes in one tick, two relay handshakes, and two
-   * first-minute debits for one wake word.
+   * re-enter the FOCUS handler (roborev 56061): reconciling through the whole handler also
+   * re-entered `maybeResumeOwnedStream`, so the phase edge fired a resume synchronously and then
+   * the segment handler opened the relay again — two `start_cloud_stream` invokes in one tick, two
+   * relay handshakes, and two first-minute debits for one session.
    *
-   * A focus change still goes through `notifyFocusOwner`, which owns the stream decisions, because
-   * "the caret left" genuinely is a reason to close or resume one. "The phase flipped" is not.
+   * THE PHASE EDGE DOES NOW OWN THE RELAY, and that is not a reversal of the above. What was wrong
+   * was TWO openers racing in one tick, and the segment handler is no longer one of them: segments
+   * cannot move the phase since the wake word was retired (voice/dictationPhase), so the phase edge
+   * is the SINGLE opener and the double-open warned about here is structurally unreachable. The
+   * stream calls still sit in the subscriber beside this function rather than inside it, so "what
+   * the caret implies" and "what the phase implies" stay separable — see the subscriber for the
+   * per-window ownership guard the stream calls need and this status decision deliberately does not.
    */
   const reconcileStatusForOwner = (owner: FocusOwner) => {
     const store = useDictationStore.getState();
@@ -332,14 +443,13 @@ export async function createDictationController(
         // question on this rather than on the composer's text, which cannot tell a transcript from a
         // keystroke (roborev 57295).
         useDictationStore.getState().noteCommittedSegment();
-        // ══ THE WAKE/STOP MACHINE RUNS FIRST, ON THIS PATH TOO ═══════════════════════════════
-        // `onSegment` is the ONLY driver of the phase machine. An earlier version returned before
-        // calling it, which meant that with the caret in a terminal the STOP WORD was typed onto the
-        // agent's command line instead of ending the session — while the composer placeholder was
-        // simultaneously instructing the user to say it ("Say <stop word> to finish"), and `phase`
-        // could never return to passive, so the billable relay had no voice way to close (roborev
-        // 56038). Passing `{ terminal: true }` keeps ONE machine and lets the hook hand back only the
-        // text that survived the wake/stop stripping — null when the phrase was purely a stop word.
+        // ══ ONE HANDLER, BOTH DESTINATIONS ═══════════════════════════════════════════════════
+        // `onSegment` decides delivery for the composer and the terminal alike, and passing
+        // `{ terminal: true }` is what makes it hand the text BACK rather than insert it. Keeping
+        // one handler (rather than short-circuiting past it here) is why the routing gate cannot
+        // apply to one destination and not the other — the shape that let a spoken command be typed
+        // onto an agent's command line instead of being acted on, back when segments carried
+        // commands at all (roborev 56038).
         const toType = onSegment(e.payload, { terminal: true });
         if (!toType) return;
         // Fire-and-forget: the write is chained per-agent inside the sink, so ordering is preserved
@@ -384,7 +494,7 @@ export async function createDictationController(
     }),
 
     // Cloud-only: Deepgram interim results — the live, word-by-word preview. Volatile; replaced in
-    // place and never routed through the wake machine (that only acts on committed segments).
+    // place and never routed through the segment handler (that only acts on committed segments).
     listen<string>("dictation://interim", (e) => {
       // Same ONE GATE as the partial path: only a window dictation may route into paints the live
       // ghost. Anywhere else clears any stale preview it might still be showing and ignores the
@@ -400,7 +510,7 @@ export async function createDictationController(
     // The cloud (relay) worker exited — clean close, a mid-stream failure, OR the relay signalling
     // out-of-credits (payload `exhausted`). Clear the stale interim ghost and call stop_cloud_stream,
     // which flips cloud_active off so the capture callback resumes routing frames to the on-device
-    // model (seamless fallback; on a mid-stream death the on-device wake/stop-word path resumes
+    // model (seamless fallback; on a mid-stream death the on-device path resumes
     // instead of dictation getting stranded). Idempotent on the normal stop path (cloud already torn
     // down). Metering is server-side now, so there's no client meter to stop here.
     listen<boolean>("dictation://cloud-ended", (e) => {
@@ -573,7 +683,7 @@ export async function createDictationController(
     // the Deepgram socket so tabbing away mid-dictation can't keep billing, and clear the live
     // preview/level. We deliberately DON'T touch `enabled` (the mic stays armed) NOR `phase`: an
     // ACTIVE "Hey Sparkle" session must survive tabbing away and back so the user never has to
-    // re-say the wake word — it simply stops writing/billing while unfocused. `true` = focus
+    // move the tray — it simply stops writing/billing while unfocused. `true` = focus
     // returned: reflect listening again, and resume the cloud stream if we were mid-dictation.
     listen<boolean>("dictation://focus", (e) => {
       const store = useDictationStore.getState();
@@ -596,7 +706,7 @@ export async function createDictationController(
         // to the app with the caret parked in a terminal would flip the UI back to "listening"
         // while the gate above keeps discarding every event — the exact half-state this fixes.
         store.setStatus("listening");
-        // Mid-dictation when focus left → resume the cloud stream now, no wake word needed. Routed
+        // Mid-dictation when focus left → resume the cloud stream now, no tray gesture needed. Routed
         // through the owner guard so only the FOCUSED window (not a background stale-active one)
         // reopens the single stream, and so it can't double-open with the DOM-focus signal.
         maybeResumeOwnedStream();
@@ -632,38 +742,66 @@ export async function createDictationController(
   // store update.
   //
   // ══ PHASE IS AN INPUT TO THE STATUS, SO IT MUST WAKE THIS TOO (roborev 56057/56056) ═══════════
-  // Making a terminal a destination made `status` a function of `phase`, via the wake gate inside
+  // Making a terminal a destination made `status` a function of `phase`, via the routing gate inside
   // `terminalRoutingArmed`. But the only two writers of `status` were the arm effect (deps
   // `[enabled]`) and this subscriber (focus only) — so a PHASE change with the caret sitting still
   // left the copy pinned to whatever the last arm or focus event claimed, and it lied in BOTH
   // directions:
-  //   passive → active (the mic pill's `setActive()`, which does not touch `enabled` when the mic
-  //     was already armed): the sink starts typing into the PTY while every surface still paints
-  //     "Listening paused: Your cursor is in a terminal".
-  //   active → passive (the stop word, on the path this branch added): the gates both shut, but
-  //     `status` stays "listening", so the surfaces paint "Mic paused. Say Hey Sparkle to activate"
-  //     over a pipeline that discards every word — including that wake word.
+  //   passive → active (a push-to-talk hold, or the tray moving to Speak — `setActive()` does not
+  //     touch `enabled` when the mic was already armed): the sink starts typing into the PTY while
+  //     every surface still paints "Listening paused: Your cursor is in a terminal".
+  //   active → passive (the hold ending, or the tray leaving Speak): the gates both shut, but
+  //     `status` stays "listening", so the surfaces paint a live-capture invitation over a pipeline
+  //     that discards every word.
   //
   // THE TWO EDGES CARRY DIFFERENT AUTHORITY, and an earlier version of this fix got that wrong by
-  // routing both through `notifyFocusOwner` (roborev 56061). A FOCUS change owns stream lifetime —
-  // "the caret left" really is a reason to close or resume a relay — so it goes through the full
-  // handler. A PHASE change owns nothing but the status, and re-entering the handler for it opened
-  // the billable relay a second time on every wake word. They share ONE status decision
-  // (`reconcileStatusForOwner`) and differ only in the stream calls layered on top.
+  // routing both through `notifyFocusOwner` (roborev 56061). A FOCUS change owns stream lifetime AND
+  // the resume guard — "the caret left" really is a reason to close or resume a relay — so it goes
+  // through the full handler. A PHASE change owns the status and the relay's open/close, but NOT the
+  // torn-down/resume bookkeeping, so it is written out separately below rather than re-entering that
+  // handler. They share ONE status decision (`reconcileStatusForOwner`) and differ in what else they
+  // are allowed to touch.
   const unsubscribeFocusOwner = useDictationStore.subscribe((s, prev) => {
+    // ── THE IDLE PARK'S TWO EDGES, checked before anything else and independent of the branches
+    // below: they are about the ROOM, not about the caret or the tray.
+    if (s.speaking !== prev.speaking) {
+      if (s.speaking) {
+        // A word. Cancel any pending park, and bring the relay back if the last one already fired —
+        // `maybeResumeOwnedStream` no-ops unless `streamTornDown` is set, so this cannot double-open
+        // a socket that never parked.
+        clearIdlePark();
+        maybeResumeOwnedStream();
+      } else if (!streamTornDown) {
+        // Quiet. Start the clock; it re-arms itself if the room is noisy again when it expires.
+        //
+        // `!streamTornDown` IS THE POINT, not a defensive extra: A PARK IS MEANINGLESS WHILE THE
+        // RELAY IS ALREADY TORN DOWN. Without it, `tearDownOwnedStream` re-armed the very park it
+        // had just cancelled — it writes `setSpeaking(false)` a few lines after `clearIdlePark()`,
+        // and zustand notifies synchronously, so a teardown that happened while the user was
+        // MID-UTTERANCE ended with a fresh 60s timer armed against a socket it had just closed.
+        // A minute later that timer ran the whole teardown again in the same still-focused window
+        // (the terminal path retains `phase: "active"`), emitting the redundant `stop_cloud_stream`
+        // the cancel exists to prevent (roborev 57804).
+        //
+        // Reachable exactly there: `dictation://error` sets `status: "error"` and never clears
+        // `speaking`, so a mic that faults mid-word leaves `speaking: true`; the caret then landing
+        // in a now-unroutable terminal tears down with the room still "noisy".
+        //
+        // Stated as the invariant rather than fixed by moving the `clearIdlePark()` line below the
+        // write: ordering inside the teardown would then be load-bearing and silently breakable by
+        // the next field added to it, whereas this holds however that function is rearranged.
+        armIdlePark();
+      }
+    }
     if (s.focusOwner !== prev.focusOwner) {
       // A focus CHANGE: the store field IS the event, so it is the honest input here.
       notifyFocusOwner(s.focusOwner);
     } else if (s.phase !== prev.phase) {
-      // A PHASE change with the caret sitting still. STATUS ONLY, never the stream — see
-      // reconcileStatusForOwner. Routing this through the full handler double-opened the billable
-      // relay on every wake word, and let a background window (phase is a CROSS-WINDOW SYNCED slice)
-      // call `stop_cloud_stream` on the single global relay the FOCUSED window had just opened
-      // (roborev 56061). Both were the same root cause: reusing a handler that owns stream lifetime
-      // for an edge that has no business touching it.
+      // A PHASE change with the caret sitting still. TWO separate consequences, and they take
+      // DIFFERENT guards — which is the whole reason they are written out here rather than folded
+      // into one call.
       //
-      // NO `isWindowActive()` TERM HERE, deliberately. The obvious extra guard — "only reconcile in
-      // the focused window" — is unfalsifiable once the stream calls are gone: what remains writes
+      // (a) THE STATUS, unguarded. NO `isWindowActive()` TERM, deliberately: what this writes is
       // this window's OWN status, and a background window whose caret is in a terminal is already
       // described by the `window` pause term, which outranks `terminal`. A guard whose removal no
       // test can detect is the thing this branch keeps getting caught adding (roborev 55812).
@@ -672,10 +810,49 @@ export async function createDictationController(
       // written only by the app-root focus tracker, so it can lag, and reconciling a stale value
       // leaves the status exactly as wrong as no reconciliation at all.
       reconcileStatusForOwner(focusOwnerNow());
+
+      // (b) THE BILLABLE RELAY, guarded by per-window ownership — and this is NEW on this edge.
+      //
+      // It used to be forbidden here, for a reason that has since expired. The prohibition existed
+      // because the SEGMENT HANDLER already opened the relay on the wake word, so doing it here too
+      // double-opened it (two handshakes, two first-minute debits), and because a background window
+      // could call `stop_cloud_stream` on the single global relay the FOCUSED window had just
+      // opened (roborev 56061). With the wake word retired, segments cannot move the phase at all —
+      // so there is no second opener left to race, and if this edge did nothing the relay would
+      // simply never open: Speak would arm a microphone with no cloud stream behind it.
+      //
+      // THE SECOND HALF OF THAT ROBOREV STILL BITES, so it keeps its guard. `phase` is a
+      // CROSS-WINDOW SYNCED slice (dictationStore), so this subscriber runs in EVERY open window
+      // for one tray gesture in one of them. `isCapturable()` is the same predicate the event
+      // listeners use — it contains `isWindowActive()` — so only the window that can actually
+      // consume the transcript touches the stream. Without it, a background window would close the
+      // relay the focused one just opened, which is precisely the bug quoted above.
+      const cmd = cloudStreamCommandFor(prev.phase, s.phase);
+      if (cmd === "start_cloud_stream") {
+        if (isCapturable()) {
+          onResumeActive?.();
+          // Start the idle clock WITH the socket. Without this, a user who selects Speak and never
+          // says anything at all is the one case the VAD edges cannot cover — `speaking` never
+          // changes, so no edge ever fires and the relay would bill indefinitely on the exact path
+          // the park exists for.
+          armIdlePark();
+        }
+      } else if (cmd === "stop_cloud_stream") {
+        // Leaving the routing phase closes the socket outright, so there is nothing left to park.
+        clearIdlePark();
+        // Closing is gated on window ownership only, NOT on `isCapturable()`: dropping to passive
+        // is itself one of the things that makes this window uncapturable (the routing gate reads
+        // `phase`), so requiring capturability here would mean the relay could be opened but never
+        // closed — a socket that bills until something else happens to tear it down.
+        if (isWindowActive()) invoke("stop_cloud_stream").catch(() => {});
+      }
     }
   });
 
   const cleanup = () => {
+    // The park timer outlives nothing: a controller torn down mid-wait would otherwise fire against
+    // a store the next controller owns, parking a relay it never opened.
+    clearIdlePark();
     // safeUnlisten (not a bare `u()`): a window-close during teardown can tear down Tauri's
     // listeners map first, and a raw unlisten then throws the benign "handlerId" race. Routing
     // each call through it also means a throw can't abort the loop and leak the remaining
@@ -709,8 +886,9 @@ export async function createDictationController(
       // read as paused-with-a-reason, not as an invitation to talk into a gate that drops everything.
       state.setStatus(armedStatus(focusOwnerNow(), terminalRoutingArmed()));
       try {
-        // The cloud-dictation preference is read LIVE at the wake→active transition (start_cloud_stream),
-        // not frozen here, so toggling the menu mid-session takes effect without restarting.
+        // The cloud-dictation preference is read LIVE at the passive→active phase edge
+        // (start_cloud_stream), not frozen here, so toggling the menu mid-session takes effect
+        // without restarting.
         await invoke("start_dictation");
       } catch (e) {
         state.setModelProgress(null);
@@ -727,12 +905,11 @@ export async function createDictationController(
 // ---------------------------------------------------------------------------
 
 /**
- * App-level always-listening controller. Mount ONCE at the app root.
+ * App-level dictation controller. Mount ONCE at the app root.
  *
- * Wires the on-device dictation pipeline to the wake-word phase machine:
- * every closed VAD segment runs through advance(); in PASSIVE we only watch
- * for the wake word, in ACTIVE we route speech into the active composer.
- * `enabled` (the mute toggle) starts/stops the underlying mic capture.
+ * Wires the on-device dictation pipeline to the send tray's mic intent: every closed VAD segment is
+ * routed into the active destination while the mic is ACTIVE (Speak, or a push-to-talk hold) and
+ * dropped while it is PASSIVE. `enabled` (the mute toggle) starts/stops the underlying capture.
  */
 export function useAmbientVoice(): void {
   const enabled = useDictationStore((s) => s.enabled);
@@ -740,9 +917,9 @@ export function useAmbientVoice(): void {
   const aiComposer = useAiFeature("composer");
 
   // If the user turns voice dictation OR the composer off WHILE a cloud stream is open, close it
-  // immediately rather than waiting for the stop word — otherwise a billable relay socket lingers
+  // immediately rather than waiting for the tray to move — otherwise a billable relay socket lingers
   // (and, with the composer off, streams into a sink that no longer renders). Closing the socket
-  // stops the server-side meter. Idempotent; re-enabling reopens on the next wake.
+  // stops the server-side meter. Idempotent; re-enabling reopens on the next phase edge.
   useEffect(() => {
     // Only when the mic is hot can a cloud stream be open, so gate on `enabled` to avoid a backend
     // round-trip on mount / benign re-renders when nothing is streaming.
@@ -752,9 +929,9 @@ export function useAmbientVoice(): void {
     }
   }, [enabled, cloudDictation, aiComposer]);
 
-  // Open the cloud (relay) dictation window. Shared by BOTH the wake→active transition AND
-  // focus-regain resume, so a "Hey Sparkle" session stays active across tabbing away and back
-  // without re-saying the wake word. Gated on the live cloud-dictation prefs — a no-op when off, so
+  // Open the cloud (relay) dictation window. Shared by BOTH the passive→active phase edge AND
+  // focus-regain resume, so a Speak session stays active across tabbing away and back without the
+  // user touching the tray. Gated on the live cloud-dictation prefs — a no-op when off, so
   // a signed-out / composer-off user never opens a stream. Metering + entitlement/affordability are
   // enforced SERVER-side by the relay: start_cloud_stream returns false when it refuses (stay
   // on-device), and mid-stream out-of-credits arrives via the cloud-ended event. Balance updates
@@ -775,39 +952,37 @@ export function useAmbientVoice(): void {
     });
   });
 
-  // Stable segment handler: runs the phase machine against the live store phase.
-  const lastTransitionAt = useRef(0);
+  /**
+   * Stable segment handler: deliver a COMMITTED segment to whichever destination is bound.
+   *
+   * ── THIS USED TO BE A STATE MACHINE. IT IS NOW A GATE ───────────────────────────────────────────
+   * Every committed segment ran through `wakeMachine.advance`, which could START dictation (a wake
+   * word in a passive segment), END it (a stop word in an active one), and STRIP the matched phrase
+   * out of the text before delivering the remainder. That is all gone with the wake word, and what
+   * survives is the one branch that was doing the real work: route the words when the mic is
+   * routing, drop them when it is not.
+   *
+   * TWO THINGS WENT WITH IT, deliberately, because neither has anything left to guard:
+   *  - the 750ms transition cooldown, which debounced two spoken transitions landing back to back.
+   *    Phase edges now come from a tray gesture or a key hold, which the user cannot emit at that
+   *    rate — and if they somehow did, `usePushToTalk`'s own `repeat`/`held` guards already own it.
+   *  - the phase write itself. A segment moving the phase is exactly the "something changed the
+   *    microphone behind the user's back" defect the retirement exists to delete; the tray is the
+   *    only writer now (voice/dictationPhase).
+   *
+   * WHAT IS NOT DROPPED: the destination split. A terminal-bound segment is handed BACK for the
+   * caller to type — it owns the danger guards for writing into a live PTY — rather than inserted
+   * here. Reaching this function at all already means the routing gate passed.
+   */
   const onSegment = useRef((seg: string, ctx: { terminal: boolean } = { terminal: false }) => {
     const store = useDictationStore.getState();
-    // Read the configured words fresh each segment so a remap in Settings takes effect live.
-    const { wakeWord, stopWord } = useSettingsStore.getState();
-    const now = Date.now();
-    const r = advance(store.phase, seg, { wakeWord, stopWord });
-    // 750ms cooldown: ignore a *transition* that lands right after another one,
-    // but still route inserts that don't change phase.
-    if (r.transitioned && now - lastTransitionAt.current < 750) return;
-    if (r.transitioned) {
-      lastTransitionAt.current = now;
-      store.setPhase(r.phase);
-      // "Local gate, then stream": the wake word fires from the on-device model (passive). On
-      // entering ACTIVE, meter + open the Deepgram stream; on returning to PASSIVE (stop word),
-      // stop billing + close it and resume on-device wake-word listening.
-      const cmd = cloudStreamCommandFor(r);
-      if (cmd === "start_cloud_stream") {
-        openCloud.current();
-      } else if (cmd === "stop_cloud_stream") {
-        // Closing the relay socket stops server-side metering; the trailing final still commits.
-        invoke("stop_cloud_stream").catch(() => {});
-      }
-      if (r.phase === "passive") store.setInterim("");
-    }
-    // ONE MACHINE, TWO DESTINATIONS. Everything above — the cooldown, the phase transition, the
-    // cloud-stream start/stop — is destination-independent and must stay that way: the stop word has
-    // to end the session whether the user is looking at the composer or at a terminal. Only the
-    // delivery of the SURVIVING text differs, and a terminal-bound segment is handed back for the
-    // caller to type (it owns the danger guards), rather than inserted here.
-    if (ctx.terminal) return r.insert ?? null;
-    if (r.insert) store.insert(r.insert);
+    // The mic is armed but not routing — Push to talk between holds. The words are not addressed to
+    // anything, so they are dropped rather than inserted somewhere the user is not looking.
+    if (store.phase !== "active") return ctx.terminal ? null : undefined;
+    const text = seg.trim();
+    if (!text) return ctx.terminal ? null : undefined;
+    if (ctx.terminal) return text;
+    store.insert(text);
     return null;
   });
 

@@ -725,18 +725,22 @@ export interface DictatedAddress {
  *   • "the sparkle desktop app is slow"                → unchanged, plain prose           ✅ no pill
  *   • "…and tell sparkle about it" appended to a draft → unchanged, plain prose           ✅ no pill
  *
- * ══ WHY THE WAKE AND STOP PHRASES CANNOT COLLIDE WITH THIS ═════════════════════════════════════
- * This is the part worth checking before touching the rule, because it looks like a collision and is
- * not. The shipped wake phrase is "Hey Sparkle" and the stop phrase is "Sparkle, stop"
- * (voice/voiceDefaults), and BOTH are consumed by `voice/wakeMachine.advance` — which strips the
- * matched phrase and hands on only the remainder — BEFORE anything reaches a composer's insert
- * target. So by the time a segment arrives here, "Hey Sparkle, move it 5px" is already "move it 5px",
- * and "Sparkle, stop" is already "" (and dictation has gone passive). Neither can be seen by this
- * function, so neither can be turned into a pill.
+ * ══ THE WAKE AND STOP PHRASES USED TO BE STRIPPED BEFORE THIS. THEY ARE NOT ANY MORE ═══════════
+ * This section used to argue that the two phrases could never collide with the rule, because
+ * `voice/wakeMachine.advance` consumed them — stripping the matched words and handing on only the
+ * remainder — before anything reached a composer's insert target. "Hey Sparkle, move it 5px" arrived
+ * here as "move it 5px", so there was nothing for the rule to see.
  *
- * The one residual gap is a user who REBINDS their wake word to a bare "Sparkle": `advance` would
- * then strip it as the wake phrase and no pill would be inserted. That is a degradation to today's
- * behaviour, not a corruption of it, and it is the wake word doing its job.
+ * THAT MACHINERY IS GONE (voice/dictationPhase): the wake word was retired, so no phrase is stripped
+ * and every committed word arrives verbatim. A user who says "Hey Sparkle…" out of habit therefore
+ * now inserts those words literally, and the leading "Sparkle" can take a pill.
+ *
+ * That is NOT a new class of defect — it is the SAME false positive the section below already
+ * accepts and defends ("an utterance that BEGINS with 'Sparkle' used as a noun"), reached by one
+ * more route. It is visible in the composer before anything is sent and cheap to undo, which is the
+ * trade that was already made deliberately. It is called out here rather than left implied because
+ * the argument above was load-bearing for anyone touching this rule, and an argument resting on a
+ * deleted module is worse than none.
  *
  * ══ THE REMAINING FALSE POSITIVE, AND WHY IT IS THE SAFE ONE ═══════════════════════════════════
  * An utterance that BEGINS with "Sparkle" used as a noun — "Sparkle desktop needs a fix" as the first

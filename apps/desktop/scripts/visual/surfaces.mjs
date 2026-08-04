@@ -15,6 +15,7 @@
  *   { clickText: {sel,t} } click the first match whose textContent is exactly `t` (trimmed)
  *   { setAttr: {sel,name,value} }  set an attribute (how MOCK states are reached)
  *   { cable: "off"|"left"|"right" } patch the real cable store (how APP states are reached)
+ *   { mic: {enabled,status?,phase?} } seed the dictation store's OBSERVATIONS (see below)
  *
  * A surface may also carry `query`: extra URL parameters appended after `?visual=1`, for state the
  * FIXTURE must seed before mount (the two-pair cockpit) and which therefore cannot come from a step.
@@ -120,6 +121,110 @@ export const SURFACES = [
     },
   },
   {
+    // ── THE SETTINGS PANE THE FOUNDER ASKED TO HAVE EMPTIED ───────────────────────────────────
+    // "We're no longer doing the wake word. This section should be removed." What this photographs
+    // is the ABSENCE of the always-listening checkbox, the WAKE WORD field and the STOP WORD field
+    // — so it clips the dialog with the Voice pane SELECTED, which the generic `settings-dialog`
+    // surface does not do (that one lands on the default category and would show none of this
+    // either way, for the wrong reason).
+    name: "settings-voice",
+    description: "Settings → Voice controls: the microphone picker and the send-tray explainer.",
+    app: {
+      steps: [
+        // ONE CLICK, not a menu. The 3-dot control was a dropdown whose only remaining entry was
+        // "Settings", so it was consolidated into a plain button — and the two surfaces that still
+        // walked the old menu path (this one and `settings-dialog`) have been failing their
+        // `waitFor` ever since, which is why neither had a current baseline.
+        { waitFor: 'button[aria-label="Settings"]' },
+        { click: 'button[aria-label="Settings"]' },
+        { waitFor: '[role=dialog][aria-label="Settings"]' },
+        { clickText: { sel: '[role=dialog][aria-label="Settings"] button', t: "Voice controls" } },
+        // The PANE'S OWN heading — proof the rail click LANDED, not merely that a dialog is open.
+        // Without it a failed click photographs whichever pane happened to be selected and the file
+        // is still named "settings-voice". Assert the side effect, never the precondition.
+        { waitFor: '[data-testid=settings-voice-pane]' },
+      ],
+      clip: '[role=dialog][aria-label="Settings"]',
+    },
+    // rev4 has no settings dialog at all — recorded as an explicit null so compare.mjs reports "no
+    // reference" rather than scoring it against something it isn't.
+    mock: null,
+  },
+  {
+    // ── THE SEND TRAY, ONE SURFACE PER POSITION ───────────────────────────────────────────────
+    // The tray is now the ONLY mic control, so each position's own copy is the thing to look at.
+    // The mic step is what makes these meaningful: without it `status` never leaves "idle" in a
+    // headless browser and all three would photograph the identical focus-paused state, which is
+    // exactly the "three surfaces, one picture" trap workspace-wired-left fell into.
+    //
+    // Speak: armed AND routing — the state its "Actively listening / Just pause when you're done"
+    // caption and composer copy describe.
+    name: "send-tray-speak",
+    description: "The concierge with the tray on Speak — always-on dictation, live.",
+    app: {
+      steps: [
+        { waitFor: 'section[aria-label="Sparkle concierge"]' },
+        { clickText: { sel: 'section[aria-label="Sparkle concierge"] button', t: "Speak" } },
+        // THE TRAY ACTUALLY MOVED — the `data-wired` equivalent, and the same lesson: `clickText`
+        // returns true the moment `.click()` is called, which is a precondition, not the effect. The
+        // copy that distinguishes these three pictures is derived from state the `mic` step SEEDS,
+        // so without this a click that lands on a same-text button (or on a pill whose handler
+        // declines) still yields a green run and a screenshot showing one mode's caption over a tray
+        // parked in another (roborev 57793).
+        { waitFor: "[data-testid=send-mode-tray][data-mode=speak]" },
+        { mic: { enabled: true, status: "listening", phase: "active" } },
+        // …AND THEN A RENDERED READ, for the same reason the tray click gets one. The `mic` step's
+        // own comparison happens inside its `setState` — before React commits and before the app's
+        // derivation, which rewrites `status` on the arm path — so it can only observe its own
+        // write. This waits on what `deriveMicPresentation` actually concluded (roborev 57798).
+        { waitFor: "[data-mic-presentation=activeListening]" },
+      ],
+      clip: 'section[aria-label="Sparkle concierge"]',
+    },
+    mock: null,
+  },
+  {
+    // Push to talk AT REST: armed, capturing, routing nothing. This is the state the founder was
+    // shown wake-word copy in — "Mic paused. Say Hey Sparkle to activate" under a tray reading PUSH
+    // TO TALK — so it is the single most important picture in this set.
+    name: "send-tray-ptt",
+    description: "The concierge with the tray on Push to talk, between holds.",
+    app: {
+      steps: [
+        { waitFor: 'section[aria-label="Sparkle concierge"]' },
+        { clickText: { sel: 'section[aria-label="Sparkle concierge"] button', t: "Push to talk" } },
+        { waitFor: "[data-testid=send-mode-tray][data-mode=ptt]" },
+        { mic: { enabled: true, status: "listening", phase: "passive" } },
+        // Push to talk AT REST is `passiveWaiting` — armed and capturing, routing nothing. Naming
+        // the exact presentation is what stops this surface passing while showing Speak's picture.
+        { waitFor: "[data-mic-presentation=passiveWaiting]" },
+      ],
+      clip: 'section[aria-label="Sparkle concierge"]',
+    },
+    mock: null,
+  },
+  {
+    // Send: the mic is released. The composer makes no voice promise and falls back to its own
+    // "what this box is for" copy — the `captionKind === "none"` branch.
+    name: "send-tray-send",
+    description: "The concierge with the tray on Send — the microphone is off.",
+    app: {
+      steps: [
+        { waitFor: 'section[aria-label="Sparkle concierge"]' },
+        { clickText: { sel: 'section[aria-label="Sparkle concierge"] button', t: "Send" } },
+        // LOAD-BEARING HERE ABOVE ALL, because this is the surface where the click provably does
+        // nothing: `send` is uiStore's default, so the pill is ALREADY selected and its handler
+        // early-returns. The picture is right only by accident of that default, and this is what
+        // turns "by accident" into "checked".
+        { waitFor: "[data-testid=send-mode-tray][data-mode=send]" },
+        { mic: { enabled: false } },
+        { waitFor: "[data-mic-presentation=off]" },
+      ],
+      clip: 'section[aria-label="Sparkle concierge"]',
+    },
+    mock: null,
+  },
+  {
     name: "settings-dialog",
     description: "The settings modal, opened from the ⋯ menu.",
     app: {
@@ -127,10 +232,10 @@ export const SURFACES = [
       // also proves the path a user takes still works. Both selectors are pre-existing ARIA, so no
       // component needed a new hook.
       steps: [
-        { waitFor: 'button[aria-label="Sparkle menu"]' },
-        { click: 'button[aria-label="Sparkle menu"]' },
-        { waitFor: '[role=menu][aria-label="Sparkle menu"]' },
-        { clickText: { sel: "[role=menuitem]", t: "Settings" } },
+        // See `settings-voice` above: the 3-dot dropdown became a one-click Settings button, and
+        // this surface's `waitFor` on the old menu had been timing out ever since.
+        { waitFor: 'button[aria-label="Settings"]' },
+        { click: 'button[aria-label="Settings"]' },
         { waitFor: '[role=dialog][aria-label="Settings"]' },
       ],
       clip: '[role=dialog][aria-label="Settings"]',
@@ -325,6 +430,28 @@ export function stepToExpression(step) {
       f(${JSON.stringify(step.cable)});
       const shell = document.querySelector("[data-testid=workspace-shell]");
       return shell != null && shell.getAttribute("data-wired") === ${JSON.stringify(step.cable)}; })()`;
+  }
+  if (step.mic) {
+    // THE MICROPHONE'S OBSERVATIONS, seeded through the dev-only handle visualFixtures installs.
+    //
+    // Needed because the live voice states cannot otherwise be photographed at all: `status` only
+    // reaches "listening" when a real backend opens a device and downloads a model, neither of which
+    // exists in a headless browser — so every mic surface would capture the focus-paused copy no
+    // matter which tray position it asked for. This writes only what the app OBSERVES (armed,
+    // capturing, routing) and lets the app's own derivation (voice/micPresentation) do the rest, so
+    // a capture cannot show a state the real derivation would not produce.
+    //
+    // It VERIFIES rather than trusting the call, exactly as the `cable` step above had to learn to:
+    // the handle returns the resulting snapshot and this compares it against what was asked for, so
+    // a missing handle or a rejected write fails the step loudly instead of quietly photographing a
+    // mic in whatever state the previous surface left it in.
+    const want = step.mic;
+    return `(() => { const f = window.__sparkleMic; if (!f) return false;
+      const got = f(${JSON.stringify(want)});
+      if (!got) return false;
+      return got.enabled === ${JSON.stringify(want.enabled)}
+        && got.status === ${JSON.stringify(want.status ?? "idle")}
+        && (${JSON.stringify(want.phase ?? null)} === null || got.phase === ${JSON.stringify(want.phase ?? null)}); })()`;
   }
   throw new Error(`Unrecognised step: ${JSON.stringify(step)}`);
 }

@@ -93,7 +93,6 @@ vi.mock("../stores/sparklePrefsStore", () => ({
 vi.mock("../useConciergeDictation", () => ({
   useConciergeDictation: () => ({ interim: "", toggleMic: vi.fn(), registerInsert: vi.fn() }),
 }));
-vi.mock("../services/dictationControls", () => ({ maybePauseOnSubmit: vi.fn() }));
 vi.mock("./Concierge/ConciergeSuggestions", () => ({ ConciergeSuggestions: () => null }));
 vi.mock("../services/aiGate", () => ({
   useAiFeature: () => true,

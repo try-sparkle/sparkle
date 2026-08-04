@@ -1054,16 +1054,37 @@ export function applyVisualFixtures(
     // would capture a notice the real focus path can no longer produce — which is how a surface
     // ends up "verified" in a state the app cannot actually reach. Focus a terminal-marked element
     // and the tracker classifies it, exactly as it does for a real xterm pane.
-    (window as unknown as { __sparkleMic?: (s: { enabled: boolean }) => void }).__sparkleMic = (s) => {
+    // `status` and `phase` are OPTIONAL and default to the disarmed-looking pair this started with,
+    // so every existing caller keeps its exact meaning. They are here because without them the mic
+    // can only ever be photographed PAUSED: `status` only becomes "listening" when a real backend
+    // opens a device, so the live captions — the ones the wake-word retirement rewrote — had no way
+    // to be captured at all.
+    //
+    // It RETURNS the resulting snapshot rather than void, so the harness step can assert the state
+    // it asked for actually landed instead of only that this function was called. That distinction
+    // is the one the `cable` step had to learn the hard way (see stepToExpression): calling the
+    // setter is a precondition, not the effect.
+    (
+      window as unknown as {
+        __sparkleMic?: (s: {
+          enabled: boolean;
+          status?: "idle" | "listening" | "error";
+          phase?: "passive" | "active";
+        }) => { enabled: boolean; status: string; phase: string };
+      }
+    ).__sparkleMic = (s) => {
       useDictationStore.setState({
         enabled: s.enabled,
-        status: "idle",
+        status: s.status ?? "idle",
+        ...(s.phase ? { phase: s.phase } : {}),
         // The tracker writes this too, but only on a window transition — and a headless page may
         // never see one, which would leave the pause reading as "window" and mask the terminal case.
         windowFocused: true,
         error: null,
         modelProgress: null,
       });
+      const d = useDictationStore.getState();
+      return { enabled: d.enabled, status: d.status, phase: d.phase };
     };
   }
 

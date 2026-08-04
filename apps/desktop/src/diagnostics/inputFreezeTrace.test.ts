@@ -12,7 +12,7 @@ import {
   traceGates,
 } from "./inputFreezeTrace";
 import { log } from "../logger";
-import type { Phase } from "../voice/wakeMachine";
+import type { Phase } from "../voice/dictationPhase";
 
 /** The mic hot AND routing speech. */
 const ACTIVE = () => ({ enabled: true, active: true });

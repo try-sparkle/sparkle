@@ -124,9 +124,11 @@ describe("SettingsDialog", () => {
     render(<SettingsDialog onClose={vi.fn()} onManageAccounts={vi.fn()} initialCategory="voice" />);
     const picker = screen.getByRole("group", { name: "Microphone input device" });
     // LEADS is the load-bearing word: "which microphone am I on, and can it hear my calls" is the
-    // question people open this pane with, so it precedes the wake/stop-word controls.
-    const onSubmit = screen.getByRole("group", { name: "On submit" });
-    expect(picker.compareDocumentPosition(onSubmit) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // question people open this pane with, so it precedes the explanation of the send tray. The
+    // wake/stop-word controls this used to be measured against are gone (VoiceControlsMenu), so the
+    // anchor is now the copy that replaced them — still a real element, still positional.
+    const trayCopy = screen.getByText("How Sparkle listens");
+    expect(picker.compareDocumentPosition(trayCopy) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
   it("marks the selected rail item with aria-current", () => {
@@ -398,14 +400,16 @@ describe("SettingsDialog — rail search", () => {
 
   it("matches a MULTI-WORD query per term, not as one adjacent phrase", () => {
     render(<SettingsDialog onClose={vi.fn()} onManageAccounts={vi.fn()} />);
-    // "wake" and "microphone" both live in Voice controls' keywords but not next to each other, so
+    // "talk" and "microphone" both live in Voice controls' keywords but not next to each other, so
     // the old raw-substring match found nothing and the user got "No settings match" for a query
-    // that describes exactly one category.
-    fireEvent.change(search(), { target: { value: "wake microphone" } });
+    // that describes exactly one category. (This used to be spelled with "wake", a term the pane no
+    // longer carries now that the wake word is retired — the SEARCH behaviour under test is
+    // unchanged; only the words that reach it are.)
+    fireEvent.change(search(), { target: { value: "talk microphone" } });
     expect(railButton("Voice controls")).toBeTruthy();
     expect(railButton("Workers")).toBeNull();
     // Every term is still REQUIRED — this is a filter, not a fuzzy any-of.
-    fireEvent.change(search(), { target: { value: "wake keyboard" } });
+    fireEvent.change(search(), { target: { value: "talk keyboard" } });
     expect(railButton("Voice controls")).toBeNull();
   });
 
@@ -416,7 +420,7 @@ describe("SettingsDialog — rail search", () => {
     // whose pane doesn't filter rows.
     for (const [q, label] of [
       ["mobile pair", "Mobile"],
-      ["voice wake", "Voice controls"],
+      ["voice dictation", "Voice controls"],
       ["shortcuts hotkeys", "Shortcuts"],
     ] as const) {
       fireEvent.change(search(), { target: { value: q } });

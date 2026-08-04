@@ -25,12 +25,19 @@ import {
 import { SUGGESTION_PILL_ZONE } from "../composer/SuggestionRow";
 import { placeholderRightInset } from "../composer/RichPlaceholder";
 import { useDictationStore } from "../../stores/dictationStore";
-import { useSettingsStore } from "../../stores/settingsStore";
-import { DEFAULT_WAKE_WORD, DEFAULT_STOP_WORD } from "../../voice/voiceDefaults";
+import {
+  PTT_COMPOSER_PLACEHOLDER,
+  SPEAK_COMPOSER_PLACEHOLDER,
+} from "../../voice/dictationCopy";
+import type { SendMode } from "../../voice/sendMode";
 
-function setup(over: { interim?: string } = {}) {
+// `sendMode` defaults to "speak" here, NOT to the component's own "send" default. The live voice
+// copy follows the TRAY, and on Send the box deliberately promises nothing (the mic, if on at all,
+// is governed by another surface) — so a fixture left on the component default would render the
+// fallback for every live-mic row and pass its negative assertions vacuously.
+function setup(over: { interim?: string; sendMode?: SendMode } = {}) {
   return render(
-    <ComposeBox onSend={vi.fn()} onAttach={vi.fn()} {...over} />,
+    <ComposeBox onSend={vi.fn()} onAttach={vi.fn()} sendMode="speak" {...over} />,
   );
 }
 
@@ -66,9 +73,6 @@ beforeEach(() => {
       focusOwner: "other",
     }),
   );
-  act(() =>
-    useSettingsStore.setState({ wakeWord: DEFAULT_WAKE_WORD, stopWord: DEFAULT_STOP_WORD }),
-  );
 });
 afterEach(() => cleanup());
 
@@ -85,7 +89,9 @@ describe("ComposeBox — the rich placeholder replaced the empty one", () => {
   // rich placeholder is exactly the kind of change that invites putting it back "since there's
   // room now".
   it("does NOT reintroduce a (⌘↩ to send) tail", () => {
-    setup();
+    // `send` explicitly: in Push to talk the chiclet is the TALK key (⌘), not a send chord, so the
+    // fixture default (`speak`) would make the title assertion below about a different question.
+    setup({ sendMode: "send" });
     expect(bodyText()).not.toContain("⌘↩ to send");
     expect(bodyText()).not.toContain("to send)");
     // …and the hint is still where PR #631 put it.
@@ -109,47 +115,56 @@ describe("ComposeBox — the rich placeholder replaced the empty one", () => {
   });
 });
 
-// THE reason the overlay exists. A native placeholder cannot style a substring, so if these
-// assertions can be satisfied by plain text the overlay is pointless.
-describe("ComposeBox — the wake phrase is a styled substring", () => {
-  it("renders the wake word bold and in brand blue inside muted copy", () => {
-    act(() => useDictationStore.setState(mic.passive()));
-    setup();
-    expect(bodyText()).toContain("Mic paused. Say ");
-    expect(bodyText()).toContain("to activate (or you can type here instead).");
-    // The wake phrase is its OWN element, styled — not part of the surrounding sentence.
-    const phrase = screen.getByText(DEFAULT_WAKE_WORD);
-    expect(phrase.tagName).toBe("SPAN");
-    expect(phrase.style.fontWeight).toBeTruthy();
-    expect(phrase.style.color).toBeTruthy();
-    // …and it is genuinely a SUBSTRING: the muted copy around it is not inside that span.
-    expect(phrase.textContent).toBe(DEFAULT_WAKE_WORD);
-    expect(overlay()?.textContent).toContain(`Mic paused. Say ${DEFAULT_WAKE_WORD} to activate`);
+// THE LIVE COPY FOLLOWS THE TRAY, NOT THE PHASE. This is the founder's bug, at the composer: he was
+// shown wake-word copy ("Mic paused. Say Hey Sparkle to activate") with the tray on PUSH TO TALK.
+// The wake word is gone, so the failure to guard against now is the same shape one step over — a
+// push-to-talk HOLD reaches `activeListening` exactly as Speak does, so copy keyed on the phase
+// would tell someone holding the key to "pause when you're done" instead of to let go.
+describe("ComposeBox — the live sentence names the MODE, not the phase", () => {
+  it("Push to talk says 'Hold ⌘ to talk' in BOTH live phases — held and at rest", () => {
+    for (const phase of ["passive", "active"] as const) {
+      act(() => useDictationStore.setState(phase === "active" ? mic.active() : mic.passive()));
+      setup({ sendMode: "ptt" });
+      expect(bodyText()).toContain(PTT_COMPOSER_PLACEHOLDER);
+      // The decisive half: it must NOT borrow Speak's sentence just because speech is routing.
+      expect(bodyText()).not.toContain(SPEAK_COMPOSER_PLACEHOLDER);
+      cleanup();
+    }
   });
 
-  it("uses the CONFIGURED wake word, not the built-in default", () => {
-    act(() => useSettingsStore.setState({ wakeWord: "Yo Computer" }));
-    act(() => useDictationStore.setState(mic.passive()));
-    setup();
-    expect(screen.getByText("Yo Computer")).toBeTruthy();
-    expect(bodyText()).not.toContain(DEFAULT_WAKE_WORD);
-  });
-
-  it("styles the STOP phrase the same way while actively dictating", () => {
+  it("Speak says its own sentence, and never push-to-talk's", () => {
     act(() => useDictationStore.setState(mic.active()));
-    setup();
-    expect(bodyText()).toContain("I'm listening, so just start talking.");
-    const phrase = screen.getByText(DEFAULT_STOP_WORD);
-    expect(phrase.style.fontWeight).toBeTruthy();
-    expect(bodyText()).not.toContain(DEFAULT_WAKE_WORD);
+    setup({ sendMode: "speak" });
+    expect(bodyText()).toContain(SPEAK_COMPOSER_PLACEHOLDER);
+    expect(bodyText()).not.toContain(PTT_COMPOSER_PLACEHOLDER);
   });
 
-  it("says 'Listening paused' — never invites the wake word — when armed but not capturing", () => {
+  it("no live sentence ever names a wake or stop word again", () => {
+    for (const sendMode of ["ptt", "speak"] as const) {
+      act(() => useDictationStore.setState(mic.active()));
+      setup({ sendMode });
+      expect(bodyText()).not.toMatch(/Hey Sparkle/i);
+      expect(bodyText()).not.toMatch(/Sparkle,\s*(pause|stop)/i);
+      cleanup();
+    }
+  });
+
+  // The tray on Send means the mic — if on at all — belongs to another surface, so this box makes
+  // no voice promise and yields the slot to its own "what I'm for" copy.
+  it("Send promises nothing about voice, even with a live mic armed elsewhere", () => {
+    act(() => useDictationStore.setState(mic.active()));
+    setup({ sendMode: "send" });
+    expect(bodyText()).not.toContain(SPEAK_COMPOSER_PLACEHOLDER);
+    expect(bodyText()).not.toContain(PTT_COMPOSER_PLACEHOLDER);
+    expect(bodyText()).toContain(CONCIERGE_PLACEHOLDER);
+  });
+
+  it("says 'Listening paused' — never a live sentence — when armed but not capturing", () => {
     act(() => useDictationStore.setState(mic.focusPaused()));
     setup();
     expect(bodyText()).toContain("Listening paused");
-    expect(bodyText()).not.toContain(DEFAULT_WAKE_WORD);
-    expect(bodyText()).not.toContain("I'm listening, so just start talking.");
+    expect(bodyText()).not.toContain(SPEAK_COMPOSER_PLACEHOLDER);
+    expect(bodyText()).not.toContain(PTT_COMPOSER_PLACEHOLDER);
   });
 
   // THE TERMINAL PAUSE IS A TWO-LINE, CENTERED NOTICE (founder's copy), and every assertion below
@@ -261,8 +276,8 @@ describe("ComposeBox — the wake phrase is a styled substring", () => {
     setup();
     expect(bodyText()).toContain("Setting up voice");
     expect(bodyText()).toContain("(50%)");
-    // Never the wake-word invitation over a model that isn't there yet.
-    expect(bodyText()).not.toContain(DEFAULT_WAKE_WORD);
+    // Never a live-capture sentence over a model that isn't there yet.
+    expect(bodyText()).not.toContain(SPEAK_COMPOSER_PLACEHOLDER);
   });
 });
 
@@ -276,7 +291,7 @@ describe("ComposeBox — the failure states take the slot over, never the fallba
     setup();
     expect(bodyText()).toContain("No microphone found.");
     expect(bodyText()).not.toContain(CONCIERGE_PLACEHOLDER);
-    expect(bodyText()).not.toContain(DEFAULT_WAKE_WORD);
+    expect(bodyText()).not.toContain(SPEAK_COMPOSER_PLACEHOLDER);
     // The decorative overlay renders nothing in this state, so the two can't double up.
     expect(overlay()?.textContent).toBe("");
   });
@@ -405,12 +420,12 @@ describe("the fixture leaves no pause behind", () => {
   // actively-dictating mic, which renders `focusPaused` instead of `activeListening` under a leaked
   // pause, failing for a reason that has nothing to do with its subject.
   //
-  // It asserts POSITIVELY (the mic-hot copy is present) rather than only the absence of the wake
-  // word, because the negative half is exactly what would pass vacuously under the leak.
+  // It asserts POSITIVELY (the live copy is present) rather than only its absence, because the
+  // negative half is exactly what would pass vacuously under the leak.
   it("an actively-dictating mic still reads as live when declared after a paused row", () => {
     act(() => useDictationStore.setState(mic.active()));
-    setup();
-    expect(bodyText()).toContain("I'm listening, so just start talking.");
+    setup({ sendMode: "speak" });
+    expect(bodyText()).toContain(SPEAK_COMPOSER_PLACEHOLDER);
     expect(bodyText()).not.toContain("Listening paused");
   });
 });

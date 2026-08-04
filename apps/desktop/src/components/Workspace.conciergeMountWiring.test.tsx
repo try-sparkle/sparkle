@@ -86,7 +86,6 @@ vi.mock("../services/conciergeDispatch", async (orig) => ({
   ...(await orig<typeof import("../services/conciergeDispatch")>()),
   dispatchConciergeAnswer: disp.dispatchConciergeAnswer,
 }));
-vi.mock("../services/dictationControls", () => ({ maybePauseOnSubmit: vi.fn() }));
 // The concierge's PAID brain — stubbed because nothing here sends anything. The column itself still
 // renders in full (thread + composer), which is the point, and the first case below ASSERTS that
 // rather than assuming it.

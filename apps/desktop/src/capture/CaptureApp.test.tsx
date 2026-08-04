@@ -25,6 +25,14 @@ vi.mock("../useDictation", () => ({ useAmbientVoice: () => {} }));
 
 import { CaptureApp } from "./CaptureApp";
 import { useProjectStore } from "../stores/projectStore";
+import { useDictationStore } from "../stores/dictationStore";
+import { useUiStore } from "../stores/uiStore";
+import {
+  LIVE_COMPOSER_PLACEHOLDER,
+  PTT_COMPOSER_PLACEHOLDER,
+  SPEAK_COMPOSER_PLACEHOLDER,
+} from "../voice/dictationCopy";
+import type { SendMode } from "../voice/sendMode";
 import { useAuthStore } from "../stores/authStore";
 import { LAST_FOCUSED_PROJECT_KEY } from "./lastFocusedProject";
 import { LOGO_SRC } from "../components/SparkleWordmark";
@@ -307,7 +315,7 @@ describe("CaptureApp", () => {
 
     fireShot({ path: "/tmp/shot2.png", dataUrl: "data:image/png;base64,BBBB" });
 
-    const ta = screen.getByPlaceholderText(/listening|Narrate|wake word/i) as HTMLTextAreaElement;
+    const ta = screen.getByPlaceholderText(/listening|Narrate/i) as HTMLTextAreaElement;
     expect(ta.value).toBe("keep this thought");
     expect((screen.getByAltText("Captured screenshot") as HTMLImageElement).src).toContain("BBBB");
   });
@@ -337,3 +345,55 @@ describe("CaptureApp", () => {
     expect((screen.getByLabelText("Project") as HTMLSelectElement).value).toBe("proj-1");
   });
 });
+
+describe("CaptureApp — the live voice copy is the capture window's own, never the tray's", () => {
+  // THE GAP THIS CLOSES (roborev 57795). This window briefly rendered the concierge tray's copy,
+  // and both of that copy's promises are false here: it has no auto-send (`useAutoSend` is mounted
+  // only by ConciergeHost), so "pause when you're done" promises a dispatch that never comes; and a
+  // push-to-talk hold claims `voiceSurface: "concierge"`, so "Hold ⌘ to talk" points at a gesture
+  // that fills a different column.
+  //
+  // The only live-copy assertion this file had was `getByPlaceholderText(/listening|Narrate|wake
+  // word/i)` — a regex satisfied by the old tray-keyed strings, the new sentence AND the muted
+  // fallback alike, so reverting either half of the fix left it green. These pin both halves: WHICH
+  // sentence, and the CONDITION (a hot mic paints it whatever the tray says, where the tray-keyed
+  // version fell through to the muted fallback on the default `send`).
+  const liveMic = () =>
+    act(() => {
+      useDictationStore.setState({ enabled: true, status: "listening", phase: "active" });
+    });
+
+  afterEach(() => {
+    act(() => {
+      useDictationStore.setState({ enabled: false, status: "idle", phase: "passive" });
+      useUiStore.getState().setConciergeSendMode("send");
+    });
+  });
+
+  it("says the mic is hot in EVERY tray position, and never borrows the tray's sentence", () => {
+    for (const mode of ["send", "ptt", "speak"] as SendMode[]) {
+      act(() => useUiStore.getState().setConciergeSendMode(mode));
+      render(<CaptureApp />);
+      fireShot();
+      liveMic();
+      const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
+      expect(ta.placeholder, mode).toBe(LIVE_COMPOSER_PLACEHOLDER);
+      expect(ta.placeholder, mode).not.toBe(PTT_COMPOSER_PLACEHOLDER);
+      expect(ta.placeholder, mode).not.toBe(SPEAK_COMPOSER_PLACEHOLDER);
+      // The muted fallback is what the tray-keyed version fell through to on the default `send`,
+      // leaving a live microphone with no cue at all.
+      expect(ta.placeholder, mode).not.toMatch(/Narrate what you captured/);
+      cleanup();
+    }
+  });
+
+  it("falls back to its own muted copy when the mic is NOT live", () => {
+    // The other half: without this, "always shows the live sentence" would also pass.
+    render(<CaptureApp />);
+    fireShot();
+    const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
+    expect(ta.placeholder).toMatch(/Narrate what you captured/);
+    expect(ta.placeholder).not.toBe(LIVE_COMPOSER_PLACEHOLDER);
+  });
+});
+

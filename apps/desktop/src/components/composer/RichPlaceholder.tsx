@@ -21,19 +21,17 @@ import { useDictationStore } from "../../stores/dictationStore";
 import { SUGGESTION_PILL_ZONE } from "./SuggestionRow";
 import {
   MICROPHONE_SETTINGS_URL,
-  MIC_HOT_PREFIX,
-  MIC_HOT_SUFFIX,
   PAUSED_TERMINAL_ACTION,
   PAUSED_TERMINAL_HEADLINE,
   PREPARING_PREFIX,
   PREPARING_SUFFIX,
-  WAKE_PREFIX,
-  WAKE_SUFFIX,
+  PTT_COMPOSER_PLACEHOLDER,
+  SPEAK_COMPOSER_PLACEHOLDER,
   modelPercent,
   pausedComposerPlaceholder,
   type VoiceErrorNotice,
 } from "../../voice/dictationCopy";
-import type { MicPresentation } from "../../voice/micPresentation";
+import type { MicCaptionKind, MicPresentation } from "../../voice/micPresentation";
 import type { PauseReason } from "../../voice/dictationFocus";
 
 /** How much room the overlay must leave at the textarea's TRAILING-RIGHT edge.
@@ -256,15 +254,28 @@ export function ComposerVoiceError({ notice }: { notice: VoiceErrorNotice }) {
  *  silently-wrong) slot in whichever composer forgot about it. */
 export function VoicePlaceholderCopy({
   micPresentation,
-  wakeWord,
-  stopWord,
+  captionKind,
   modelProgress,
   pauseReason = null,
   fallback = null,
 }: {
   micPresentation: MicPresentation;
-  wakeWord: string;
-  stopWord: string;
+  /**
+   * WHICH live sentence to show, from the TRAY POSITION — the same value, from the same function
+   * (voice/micPresentation `micCaptionKind`), that the sidebar caption renders from.
+   *
+   * ── WHY THE PRESENTATION IS NOT ENOUGH ON ITS OWN ─────────────────────────────────────────────
+   * `micPresentation` answers "what is the microphone DOING" and it is still what selects the arm.
+   * But the two LIVE arms need a second fact it cannot carry: WHICH MODE the user is working in.
+   * `activeListening` is reached both by Speak and by a push-to-talk HOLD, and the true sentence
+   * differs — Speak ends an utterance when you stop talking, a hold ends when you let go. Keyed on
+   * the presentation alone, a hold was shown Speak's "pause when you're done", which is the same
+   * defect that had push-to-talk showing wake-word copy: a caption describing the wrong mode.
+   *
+   * Taken as a PROP rather than read from the store here so this component stays pure (it renders
+   * words, it decides nothing) — the caller reads it, exactly as it reads `micPresentation`.
+   */
+  captionKind: MicCaptionKind;
   modelProgress: { done: number; total: number | null } | null;
   /** WHY the mic is paused, for the `focusPaused` arm alone. A pause with no stated cause is what
    *  left the terminal case reading as a bug, so the arm names what took the keyboard. Defaults to
@@ -287,24 +298,23 @@ export function VoicePlaceholderCopy({
       // at the box the user can still type in.
       return <PreparingNotice pct={modelPercent(modelProgress)} />;
     case "activeListening":
-      // The mic-hot copy intentionally subsumes the typing hint ("…or start typing here instead"),
-      // so it stays put on focus rather than swapping to a muted hint.
-      return (
-        <>
-          {MIC_HOT_PREFIX}
-          <PlaceholderEmphasis phrase={stopWord} />
-          {MIC_HOT_SUFFIX}
-        </>
-      );
     case "passiveWaiting":
-      // Capturing but waiting for the wake word: tell the truth (not "I'm listening"). Mirrors the
-      // sidebar caption; the "(or you can type here instead)" tail subsumes the typing hint, so
-      // like the mic-hot copy it stays put on focus.
+      // CAPTURE IS LIVE. Both live states share one arm because what separates them — is speech
+      // routing at this instant — is NOT what the user needs the sentence to tell them. The mode is.
+      // A push-to-talk hold (activeListening) and the same tray between holds (passiveWaiting) get
+      // the same sentence, and it is true in both: "Hold ⌘ to talk". Splitting them by phase is what
+      // made this slot flicker between two different promises mid-utterance.
+      //
+      // Each sentence subsumes the typing hint ("…or type here instead" / "pause when you're done")
+      // so the slot stays put on focus rather than swapping to a muted hint.
+      //
+      // `none` means the tray is on Send while some OTHER surface holds the mic — this box is not
+      // where that speech is going, so it promises nothing and yields the slot to the caller's own
+      // words, exactly as the sidebar suppresses its caption in the same state.
+      if (captionKind === "none") return <>{fallback}</>;
       return (
         <>
-          {WAKE_PREFIX}
-          <PlaceholderEmphasis phrase={wakeWord} />
-          {WAKE_SUFFIX}
+          {captionKind === "pushToTalk" ? PTT_COMPOSER_PLACEHOLDER : SPEAK_COMPOSER_PLACEHOLDER}
         </>
       );
     case "focusPaused":

@@ -63,7 +63,6 @@ vi.mock("../stores/sparklePrefsStore", () => ({
 vi.mock("../useConciergeDictation", () => ({
   useConciergeDictation: () => ({ interim: "", micLive: false, registerInsert: vi.fn() }),
 }));
-vi.mock("../services/dictationControls", () => ({ maybePauseOnSubmit: vi.fn() }));
 vi.mock("./Concierge/ConciergeSuggestions", () => ({ ConciergeSuggestions: () => null }));
 // The mic REFUSES TO ARM while out of credits (components/MicButton `shouldBlockMicArm`), and the
 // default test user is the anonymous trial. Without a stocked balance every row here would assert

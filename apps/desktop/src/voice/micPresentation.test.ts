@@ -11,7 +11,7 @@ import {
 import { micIntentForMode, SEND_MODES, type SendMode } from "./sendMode";
 import { micVisual } from "../components/MicButton";
 import { C } from "../theme/colors";
-import type { Phase } from "./wakeMachine";
+import type { Phase } from "./dictationPhase";
 
 // deriveMicPresentation is THE single source of truth for WHICH voice state each mic surface is in.
 // Both the sidebar (LogoWaveform) caption and the composer placeholder render by switching on the
@@ -89,7 +89,7 @@ describe("deriveMicPresentation — the shared voice-state decision", () => {
     expect(deriveMicPresentation(base({ status: "listening", phase: "active" }))).toBe<MicPresentation>("activeListening");
   });
 
-  it("armed + capturing + passive phase → PASSIVE WAITING (hearing, waiting for the wake word)", () => {
+  it("armed + capturing + passive phase → PASSIVE WAITING (hearing, routing nothing)", () => {
     expect(deriveMicPresentation(base({ status: "listening", phase: "passive" }))).toBe<MicPresentation>("passiveWaiting");
   });
 });
@@ -137,7 +137,7 @@ describe("deriveMicPresentation — total and deterministic over every input", (
 // That is what makes "the mic and the slider are the same green" a fact rather than a coincidence:
 // if either table is retuned alone, this goes red.
 /** A healthy mic that agrees with whatever position is being tested: armed, capturing, no download.
- *  `phase` is deliberately `active` in the default so the wake-word case is the DEFAULT rather than
+ *  `phase` is deliberately `active` in the default so the routing case is the DEFAULT rather than
  *  a special one — the derivation must not consult it except where documented. */
 /** Every distinct focus situation the indicator must be total over: not in a terminal, in one that
  *  is paused, and in one that is actively receiving the phrase. */
@@ -217,8 +217,8 @@ describe("micIndicatorFor — the tray position, with the hardware able only to 
 
   // ── THE DEMOTIONS. Each is a state where the position is not a true statement about the mic. ──
 
-  it("Push to talk stays AMBER after the wake word moves the phase — the original defect", () => {
-    // `live()` already has `phase: "active"` and `status: "listening"`, i.e. the wake matcher has
+  it("Push to talk stays AMBER when the phase is active — the original defect", () => {
+    // `live()` already has `phase: "active"` and `status: "listening"`, i.e. something has
     // fired with nothing about the tray having changed. Green here is what this whole change exists
     // to prevent, and no demotion may accidentally re-enable it.
     expect(micVisual(micIndicatorFor("ptt", live()).state, false)).toEqual({
@@ -294,7 +294,7 @@ describe("micIndicatorFor — the tray position, with the hardware able only to 
               // And the green came from one of exactly two places: the tray said Speak, or the tray
               // had released the mic and something else armed it into the active phase. `phase` is
               // consulted ONLY on that second path — on the Speak path it is deliberately ignored,
-              // since reading it is what let the wake word repaint a position the user had chosen.
+              // since reading it is what let the phase repaint a position the user had chosen.
               expect(
                 mode === "speak" || (micIntentForMode(mode) === "off" && enabled && phase === "active"),
               ).toBe(true);
@@ -323,10 +323,24 @@ describe("micIndicatorFor — the tray position, with the hardware able only to 
 });
 
 describe("micCaptionKind — the caption takes the SAME one input as the glyph", () => {
-  it("Speak invites the stop phrase; Push to talk invites the wake phrase; Send says nothing", () => {
+  // THE DEFECT THIS TABLE CAUSED, pinned as its own case. `ptt` used to fall through to
+  // `"wakeInvite"` because there were only two kinds and Speak owned one of them — so push-to-talk
+  // borrowed Speak's OPPOSITE and the founder was shown wake-word copy in a mode that never had a
+  // wake word. This assertion fails against that version by construction: `"pushToTalk"` did not
+  // exist as a MicCaptionKind member.
+  it("EVERY armed position names ITSELF — push to talk no longer borrows Speak's opposite", () => {
     expect(micCaptionKind("speak")).toBe("dictating");
-    expect(micCaptionKind("ptt")).toBe("wakeInvite");
+    expect(micCaptionKind("ptt")).toBe("pushToTalk");
     expect(micCaptionKind("send")).toBe("none");
+  });
+
+  // The structural version of the same thing: no two armed positions may share a kind. That is what
+  // makes "a caption describing the wrong mode" unreachable rather than merely absent today.
+  it("no two armed positions share a caption kind", () => {
+    const armed = SEND_MODES.filter((m) => micIntentForMode(m) !== "off");
+    const kinds = armed.map(micCaptionKind);
+    expect(new Set(kinds).size).toBe(armed.length);
+    expect(kinds).not.toContain("none");
   });
 
   it("says 'we are hearing you' in EXACTLY the position whose glyph is green, and no other", () => {
