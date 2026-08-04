@@ -122,9 +122,24 @@ export const SURFACES = [
     // capture that only waited for the badge would photograph one digit and prove nothing about the
     // thing that was invisible.
     //
-    // Clipped to the POPOVER rather than the column: it is a fixed-position portal on `document.body`
-    // (it closes on scroll, so it cannot be anchored inside a scrolling column), which means a column
-    // clip would cut it off entirely.
+    // FULL VIEWPORT (`clip: null`), and the reason is geometric rather than aesthetic. The popover is
+    // a fixed-position portal on `document.body` at `top: anchor.bottom + 6` (AgentInboxBadge), so its
+    // box begins strictly BELOW the badge — clipping to the popover excludes the badge by
+    // construction. A column clip is no better: the portal is outside the column's subtree entirely.
+    //
+    // That matters more than it looks, because the seed is now opt-in: this is the ONLY surface that
+    // seeds an inbox, so a clip that cuts the badge out leaves the on-row chip photographed NOWHERE.
+    // And the chip is the primary artifact — "which of my agents are holding instructions right now"
+    // is a COLUMN question (AgentInboxBadge's own header), which is why the badge exists at all.
+    // Gating the seed was right; dropping the badge's only capture with it was not (roborev 58024).
+    // One frame holds both: the chip in the row, and the panel it opens.
+    //
+    // WHAT THIS SURFACE DOES NOT COVER, stated rather than left as an omission: the MOUNTED THREAD's
+    // queued bubbles (`mounted-queued-block`) — the surface the founder was actually looking at when
+    // he filed sparkle-zm0c8. Photographing it needs a mounted agent, which is a different fixture
+    // axis (the concierge mount) than an inbox seed, so it is deliberately deferred rather than
+    // bundled here. Until it lands, that block's rendering is asserted only in jsdom — which cannot
+    // lay out or paint, and is exactly the gap this surface exists to close for the badge.
     name: "inbox-popover",
     description:
       "The queued-instruction badge on an agent row, opened: pending/delivered/acknowledged with text.",
@@ -135,7 +150,7 @@ export const SURFACES = [
         { click: "[data-testid=row-inbox]" },
         { waitFor: "[data-testid=row-inbox-popover]" },
       ],
-      clip: "[data-testid=row-inbox-popover]",
+      clip: null,
     },
     // NO MOCK REACH. The rev4 mock predates this affordance and has no inbox anything, so pairing it
     // against `#assist` would score a 100% diff on every run and say nothing about fidelity. An
