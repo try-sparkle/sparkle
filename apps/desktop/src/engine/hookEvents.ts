@@ -52,6 +52,20 @@ export interface HookEvent {
 // working in the background showing as if it were blocking on you).
 const PERMISSION_RE = /\b(permission|approve|allow)\b/i;
 
+// A handful of tools BLOCK the turn on the user rather than doing work: their PreToolUse fires and
+// then Claude sits waiting for an answer, with NO Stop and — unlike a permission request — NO
+// Notification (sparkle-t2up). So a PreToolUse for one of these is a real mid-turn "answer me", not
+// the agent working, and must go red. AskUserQuestion is a question menu → `waiting` ("your turn");
+// ExitPlanMode presents a plan for you to approve → `approval`. Every OTHER tool (Bash, Read, Edit,
+// Task, …) is the agent working. This is the only place the tool name changes the status; the
+// matching PostToolUse maps back to `working` (below), so the red self-clears the instant Claude
+// resumes — no screen signal involved, so the status-router's mid-turn hook authority (and the
+// founder's false-handback protection) is untouched.
+const BLOCKING_TOOL_STATUS: Record<string, AgentTabStatus> = {
+  AskUserQuestion: "waiting",
+  ExitPlanMode: "approval",
+};
+
 /** Pure map from a single hook event to a status, or null when the event shouldn't change it.
  *  Latest-event-wins: Claude's lifecycle is linear (prompt → tools → stop), so each event
  *  fully determines the current state without needing history. */
@@ -64,8 +78,11 @@ export function hookEventToStatus(ev: HookEvent): AgentTabStatus | null {
     // turn") is the truthful resting state; the very next UserPromptSubmit flips it to green.
     case "SessionStart":
       return "idle";
-    case "UserPromptSubmit":
+    // A PreToolUse for a BLOCKING tool (AskUserQuestion / ExitPlanMode) is a mid-turn picker → red;
+    // every other tool is the agent working. See BLOCKING_TOOL_STATUS above.
     case "PreToolUse":
+      return BLOCKING_TOOL_STATUS[ev.tool ?? ""] ?? "working";
+    case "UserPromptSubmit":
     case "PostToolUse":
     // A subagent finishing doesn't end the main turn — Claude keeps working.
     // falls through

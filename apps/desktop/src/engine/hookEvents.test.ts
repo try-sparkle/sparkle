@@ -18,6 +18,17 @@ describe("hookEventToStatus", () => {
     }
   });
 
+  it("maps a PreToolUse for a BLOCKING tool to red — the mid-turn picker (sparkle-t2up)", () => {
+    // AskUserQuestion / ExitPlanMode block the turn on the user with no Stop and no Notification,
+    // so their PreToolUse must read as "answer me" (red), not the agent working. A non-blocking
+    // tool's PreToolUse (and a PreToolUse with no tool) still maps to working (green).
+    expect(hookEventToStatus({ event: "PreToolUse", tool: "AskUserQuestion" })).toBe("waiting");
+    expect(hookEventToStatus({ event: "PreToolUse", tool: "ExitPlanMode" })).toBe("approval");
+    expect(hookEventToStatus({ event: "PreToolUse", tool: "Bash" })).toBe("working");
+    expect(hookEventToStatus({ event: "PreToolUse", tool: "Read" })).toBe("working");
+    expect(hookEventToStatus({ event: "PreToolUse" })).toBe("working");
+  });
+
   it("maps SessionStart (spawn/resume, no turn yet) to idle (gray, NOT green)", () => {
     // Regression: a resumed session on app launch fires SessionStart with no Stop after it, so
     // mapping it to "working" left every agent stuck green. A starting session is idle until the
@@ -136,6 +147,31 @@ describe("HookStatusEngine", () => {
     engine.ingest({ event: "PostToolUse", tool: "Bash" });
     engine.ingest({ event: "Stop" });
     expect(onStatus).toHaveBeenLastCalledWith("idle");
+  });
+
+  it("a mid-turn blocking-tool picker goes red, then self-clears on its PostToolUse (sparkle-t2up)", () => {
+    // The founder's mid-turn-picker bug, at the engine level: Claude renders an AskUserQuestion
+    // picker mid-turn (PreToolUse, no Stop) — the row must go red — and returns to green the instant
+    // the user answers (PostToolUse). No screen signal is involved, so the status router's hook
+    // authority is untouched.
+    const onStatus = vi.fn();
+    const engine = new HookStatusEngine({ agentId: "a1", onStatus });
+    engine.ingest({ event: "UserPromptSubmit" }); // turn opens → working
+    engine.ingest({ event: "PreToolUse", tool: "Bash" }); // real work → still working (deduped)
+    engine.ingest({ event: "PreToolUse", tool: "AskUserQuestion" }); // picker → red
+    expect(onStatus).toHaveBeenLastCalledWith("waiting");
+    engine.ingest({ event: "PostToolUse", tool: "AskUserQuestion" }); // answered → back to working
+    expect(onStatus).toHaveBeenLastCalledWith("working");
+  });
+
+  it("a mid-turn ExitPlanMode picker goes to approval (red), then self-clears (sparkle-t2up)", () => {
+    const onStatus = vi.fn();
+    const engine = new HookStatusEngine({ agentId: "a1", onStatus });
+    engine.ingest({ event: "UserPromptSubmit" });
+    engine.ingest({ event: "PreToolUse", tool: "ExitPlanMode" }); // plan approval → red
+    expect(onStatus).toHaveBeenLastCalledWith("approval");
+    engine.ingest({ event: "PostToolUse", tool: "ExitPlanMode" }); // approved → working
+    expect(onStatus).toHaveBeenLastCalledWith("working");
   });
 
   it("a resumed session with no new turn settles idle (gray), not working (green)", () => {
