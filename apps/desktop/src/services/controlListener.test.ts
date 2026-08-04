@@ -2658,6 +2658,35 @@ describe("controlListener", () => {
       expect(dispatchConciergeToolMock).not.toHaveBeenCalled();
     });
 
+    // The refusal's REMEDY, which is the half a refused agent actually acts on. For every domain but
+    // `screenshot` the ordinary control ops are the answer; for `screenshot` they are not, because no
+    // control op takes a picture. Both directions are asserted so the branch cannot collapse to one
+    // sentence in either direction and stay green.
+    it("points a refused CAPTURE caller at the visual harness, not at the control ops", async () => {
+      fire({
+        reqId: "t7",
+        op: "concierge_tool",
+        callerAgentId: callerId,
+        payload: { domain: "screenshot", op: "capture_window", args: {}, toolCallId: "tc-cap" },
+      });
+      await flush();
+      const message = String(lastReply().message);
+      expect(message).toContain("visual:capture");
+      // The limitation travels WITH the remedy: an agent that follows it must not report a
+      // fixture-rendered surface as the live window.
+      expect(message).toContain("NOT the live window");
+      expect(message).not.toContain("ordinary sparkle-control ops");
+      expect(dispatchConciergeToolMock).not.toHaveBeenCalled();
+    });
+
+    it("still points a refused NON-capture caller at the ordinary control ops", async () => {
+      fire({ reqId: "t8", op: "concierge_tool", callerAgentId: callerId, payload: toolPayload });
+      await flush();
+      const message = String(lastReply().message);
+      expect(message).toContain("ordinary sparkle-control ops");
+      expect(message).not.toContain("visual:capture");
+    });
+
     it("does not weaken the OTHER ops for anyone: an ordinary agent can still rename itself", async () => {
       fire({ reqId: "t6", op: "rename_agent", callerAgentId: callerId, payload: { name: "Still Fine" } });
       await flush();

@@ -175,6 +175,9 @@ export type LifecycleRefusalReason =
   //                            than given one this layer invented
   | "cloud-no-repo" //          the project has no GitHub remote for the sandbox to clone
   | "needs-decision" //         closing would put work at risk: the human picks ship/save/discard
+  | "uncommitted-work" //       a worker spin-down would delete a dirty worktree; the branch is kept
+  //                            but uncommitted files are NOT, so this is refused until they are
+  //                            committed (or the caller passes an explicit discard confirmation)
   | "intent-required" //        discard was called without a well-formed DiscardIntent
   | "intent-mismatch" //        the intent names a different agent than the one targeted
   | "unknown-model" //          a spawn named a model this app does not offer (never downgraded)
@@ -1311,9 +1314,23 @@ export async function discardAgent(
 
 /** Spin a WORKER down: its tab and runtime entry go immediately, then its PTY and worktree are
  *  reaped; its branch is kept. Refuses anything that isn't a worker — `spinDownWorker` is a no-op
- *  for other kinds, and silently doing nothing would read as success. */
+ *  for other kinds, and silently doing nothing would read as success.
+ *
+ *  ALSO refuses a worker whose worktree is DIRTY. "The branch is kept" makes this read like a
+ *  lossless operation, and for committed work it is — but the teardown removes the checkout with
+ *  `--force`, so anything uncommitted (including files the worker never staged) is destroyed with
+ *  no salvage ref and no undo. The caller is an orchestrator that cannot see the worktree, so it
+ *  spins a worker down believing "branch kept" covers the work; it does not. The dirty reading is
+ *  the SAME one the close flow already trusts (`runtimeStore.branchStatus`), and unknown counts as
+ *  dirty for the same reason `shouldPromptOnClose` treats it that way: an unpolled or parked
+ *  worktree cannot be ruled out, and the cost of being wrong is unrecoverable.
+ *
+ *  `discardUncommitted` is the explicit escape hatch, and it is deliberately shaped like the other
+ *  destructive confirmations in this module: optional, so the REFUSAL (with its sentence naming what
+ *  would be lost) is what an omitted flag produces, never a silent teardown. */
 export async function spinDownWorkerAgent(
   workerId: string,
+  opts: { discardUncommitted?: boolean } = {},
 ): Promise<LifecycleResult<ClosedAgents>> {
   const found = locate(workerId);
   if (!found) return refuse("spin_down_worker", "unknown-agent", unknownAgent(workerId));
@@ -1324,12 +1341,33 @@ export async function spinDownWorkerAgent(
       `“${found.agent.name}” is a ${found.agent.kind} agent, not a worker — closing it is a different operation with different consequences.`,
     );
   }
+  if (!opts.discardUncommitted && workerHasUncommittedWork(workerId)) {
+    return refuse(
+      "spin_down_worker",
+      "uncommitted-work",
+      `“${found.agent.name}” has uncommitted changes in its worktree. Spinning it down keeps the branch but deletes the checkout, so those changes would be gone for good. Ask the worker to commit first, then spin it down.`,
+    );
+  }
   await spinDownWorker({ projectId: found.project.id, workerId });
   return ok("spin_down_worker", {
     agentIds: [workerId],
     projectId: found.project.id,
     outcome: "spin-down",
   });
+}
+
+/** Does this worker's worktree hold changes that a spin-down would destroy?
+ *
+ *  Reads the same live `branchStatus` the close flow reads, and answers with the same safety bias as
+ *  `previewClose.uncommittedChanges` — but the DEFAULT is inverted, because the consequence is. No
+ *  reading yet (`undefined`) means the poll hasn't landed, and a worktree parked on another branch
+ *  still physically holds whatever was uncommitted when it was moved; in both cases we cannot rule
+ *  out work at risk, and here the fallback for "cannot rule out" is deletion. So both count as
+ *  dirty. `ahead` is NOT consulted: committed work survives on the branch, which the teardown keeps. */
+function workerHasUncommittedWork(workerId: string): boolean {
+  const bs = useRuntimeStore.getState().branchStatus[workerId];
+  if (!bs) return true;
+  return bs.dirty || bs.worktreeOnBranch === false;
 }
 
 // ── Small shared bits ───────────────────────────────────────────────────────────────────────────

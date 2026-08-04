@@ -1067,6 +1067,26 @@ describe("orchestrationListener", () => {
     expect(lastResult().workerId).toBe(first.workerId);
   });
 
+  it("the deduped reply is MARKED reused, so a dropped task cannot read as a successful spawn", async () => {
+    // Idempotency means "don't spawn twice"; it does not mean "let the caller believe its task ran".
+    // The returned worker is executing the task from the FIRST request — "fix the P0" — and the
+    // second request's task is discarded. Without this marker the two replies are
+    // indistinguishable, so an orchestrator re-dispatching a bead with a corrected task reads a
+    // handle, assumes dispatch, and waits on work nobody is doing.
+    fire({ reqId: "m1", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "fix the P0", beadId: "sparkle-mark" } });
+    await flush();
+    // A genuine spawn carries NO marker — otherwise "reused" would be true of everything and mean
+    // nothing, and this assertion would hold against the old code.
+    expect(lastResult().reused).toBeUndefined();
+
+    fire({ reqId: "m2", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "fix the P0 differently", beadId: "sparkle-mark" } });
+    await flush();
+    expect(lastResult().reused).toBe(true);
+    // Still the same single worker, still running the ORIGINAL task.
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(1);
+    expect(spawnWorkerMock.mock.calls[0]![0]).toMatchObject({ task: "fix the P0" });
+  });
+
   it("two spawns for one bead RACING (before the first resolves) still yield one worker", async () => {
     // The store-only check is not sufficient: runSpawn awaits spawnWorker, so the worker record does
     // not exist yet when a second request arrives in the same tick. Both would pass a store check

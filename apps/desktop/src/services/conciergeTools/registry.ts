@@ -652,6 +652,16 @@ const discardArgs = z
   })
   .strict();
 
+const spinDownArgs = z
+  .object({
+    agentId: agentIdArg,
+    /** Acknowledge that the worker's UNCOMMITTED changes are about to be deleted. Same shape and
+     *  same reasoning as `confirmArg`: optional so the domain refuses (naming the loss) rather than
+     *  this layer erroring on bad args, and absent can never read as consent. */
+    discardUncommitted: confirmArg,
+  })
+  .strict();
+
 const LIFECYCLE_ROUTES: Record<LifecycleOp, Handler> = {
   spawn_build_agent: route(spawnArgs, async (a, ctx) =>
     fromLifecycle(
@@ -701,8 +711,11 @@ const LIFECYCLE_ROUTES: Record<LifecycleOp, Handler> = {
     // `intent-required`, not on a crash and not on a delete.
     fromLifecycle(ctx, await discardAgent(a.agentId, a.intent as Parameters<typeof discardAgent>[1])),
   ),
-  spin_down_worker: route(agentOnly, async (a, ctx) =>
-    fromLifecycle(ctx, await spinDownWorkerAgent(a.agentId)),
+  // Not `agentOnly`: a spin-down deletes the worker's checkout, so it carries the same optional
+  // confirmation the other destructive ops do — omitted reads as "no", and the DOMAIN produces the
+  // refusal that names the uncommitted work rather than this layer inventing a sentence.
+  spin_down_worker: route(spinDownArgs, async (a, ctx) =>
+    fromLifecycle(ctx, await spinDownWorkerAgent(a.agentId, { discardUncommitted: a.discardUncommitted })),
   ),
 };
 

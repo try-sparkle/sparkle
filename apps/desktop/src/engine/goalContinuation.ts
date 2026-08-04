@@ -261,7 +261,11 @@ export function decideContinuation(input: ContinuationInput): ContinuationDecisi
   // attempt 2. A runner surfacing "auto-continue attempt N" printed 3 then 2 for consecutive
   // restarts of a healthy agent, and could print a number above the limit while the streak was
   // zero. (roborev 55252.)
-  return { action: "continue", prompt: continuePrompt(live), attempt: consecutive + 1 };
+  // ONE expression feeds both fields. `attempt` was already correct here and the prompt simply did
+  // not receive it, which is how the agent came to be the only party in the loop that could not
+  // tell its second resume from its first. Computing it twice would let them drift.
+  const attempt = consecutive + 1;
+  return { action: "continue", prompt: continuePrompt(live, attempt), attempt };
 }
 
 /** The resting statuses an auto-continue may act on. See the note at the `not-idle` gate for why
@@ -284,6 +288,20 @@ function isRestingStatus(status: AgentTabStatus): boolean {
  * op that marks the goal met makes finishing a thing the agent can do, so the common case ends
  * cleanly instead of by exhaustion.
  *
+ * IT SAYS WHICH RESUME THIS IS, and that is the difference between a banner an agent acts on and
+ * one it answers. Until it did, every resume for one goal was BYTE-IDENTICAL, so an agent reading
+ * its own transcript saw the same text two and three times over with nothing to distinguish the
+ * copies — which reads exactly like a human repeating themselves, and the courteous response to a
+ * human repeating themselves is to restate your status, not to do more work. That is the observed
+ * failure: three identical banners, three status reports, no progress, on a goal whose work was
+ * finished and ready to land the whole time. The banner already knew the attempt number —
+ * `decideContinuation` computes it for the runner — it just never told the one party who needed it.
+ *
+ * The extra line is emitted from the SECOND attempt on, because that is when the ambiguity starts;
+ * a first resume has nothing to be confused with. It states the fact the agent cannot otherwise
+ * see (nothing Sparkle can observe moved since the last one), the inference it should draw (an
+ * identical banner is this timer, not the human), and the ceiling it is heading for.
+ *
  * IT OPENS WITH A SHARED CONSTANT, and that is load-bearing rather than tidiness. This string is
  * SYSTEM-AUTHORED: no human and no agent chose to send it, a timer did — so `engine/agentThrash`
  * must not count it as a repeated command and this module must not count it as progress (see
@@ -293,11 +311,12 @@ function isRestingStatus(status: AgentTabStatus): boolean {
  * the alternative is the detector going silently blind, which is how agent 0bf08c64 came to be
  * badged "It is looping, not working" through 46 minutes of real work.
  */
-export function continuePrompt(goal: AgentGoal): string {
+export function continuePrompt(goal: AgentGoal, attempt = 1): string {
   return (
     `${RESUME_PROMPT_MARKER} automatically. ` +
     `Do not stop to acknowledge this — pick up exactly where you left off and keep working.\n\n` +
     `GOAL: ${goal.text}\n\n` +
+    repeatedResumeLine(attempt) +
     // NAME THE OP THAT EXISTS. This said `set_agent_goal with met: true`, which cannot work:
     // `set_agent_goal`'s schema is `{ targetAgentId?, goal, ttlMs? }` — there is no `met`, and
     // `goal` is required. An agent that obeyed either failed zod validation or, if it invented a
@@ -309,6 +328,38 @@ export function continuePrompt(goal: AgentGoal): string {
     `If the goal IS in fact met, say so and mark it met (sparkle-control: set_agent_goal_met with ` +
     `met: true) so you stop being resumed. If you are blocked on something only the human can ` +
     `resolve, say what you need — do not sit idle.`
+  );
+}
+
+/**
+ * The paragraph that tells a repeated resume apart from the first one. Empty for attempt 1.
+ *
+ * WHY IT NAMES A NUMBER RATHER THAN JUST SAYING "AGAIN". "You are being resumed again" is still the
+ * same sentence on the second attempt and the third, so two consecutive turns remain
+ * indistinguishable in a transcript — the exact property that produced the bug. A count is the
+ * cheapest thing that is genuinely different on every attempt, and it doubles as the agent's
+ * distance to the escalation it wants to avoid.
+ *
+ * THE CEILING IS DERIVED, NOT SPELLED. `MAX_CONTINUES_WITHOUT_PROGRESS` is the bound
+ * `decideContinuation` actually escalates on, so interpolating it means retuning the bound cannot
+ * leave this prose promising the old one — the sibling-literal failure that has bitten this repo
+ * before.
+ *
+ * The claim about progress is precise rather than rhetorical: `attempt` is `consecutive + 1`, and
+ * `consecutive` counts continues across which `progressMark` did NOT move. So from attempt 2 on,
+ * "nothing observable changed since the last resume" is a fact the caller has already established,
+ * not a guess. It is scoped to what Sparkle can SEE — an agent may well have been thinking — which
+ * is why the line says so instead of accusing the agent of idling.
+ */
+function repeatedResumeLine(attempt: number): string {
+  if (attempt < 2) return "";
+  return (
+    `THIS IS AUTO-RESUME ${attempt} OF ${MAX_CONTINUES_WITHOUT_PROGRESS} on this goal. Nothing ` +
+    `Sparkle can observe has changed since resume ${attempt - 1}. An identical message arriving ` +
+    `twice is NOT the human repeating themselves — it is this timer firing again, so restating ` +
+    `your status will not clear it and does not count as progress. Take the next concrete step, ` +
+    `mark the goal met, or name what is blocking you. At ${MAX_CONTINUES_WITHOUT_PROGRESS} this ` +
+    `stops and escalates to a human.\n\n`
   );
 }
 

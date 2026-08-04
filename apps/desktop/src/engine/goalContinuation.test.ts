@@ -10,6 +10,7 @@ import {
   noteContinue,
   resetGoalRetries,
 } from "./agentGoal";
+import { isSystemAuthoredPrompt } from "./agentOriginated";
 import {
   IDLE_SETTLE_MS,
   MAX_CONTINUES_TOTAL,
@@ -248,6 +249,70 @@ describe("bounds — the loop cannot spin forever", () => {
       goal = noteContinue(goal, "stuck");
     }
     expect(attempts).toEqual([1, 2, 3]);
+  });
+
+  // -------------------------------------------------------------------------------------------
+  // A REPEATED RESUME HAS TO BE READABLE AS A REPEAT.
+  //
+  // The bug: every resume for one goal was byte-identical, so an agent reading its transcript saw
+  // one message three times with nothing to tell the copies apart — which is what a human repeating
+  // themselves looks like, and the reply to that is a status report, not more work. Three of those
+  // were measured against a goal whose work was finished and ready to land.
+  //
+  // These drive the REAL loop and assert on `d.prompt` — the text the agent actually receives —
+  // rather than calling `continuePrompt` with a hand-picked number, because the defect was in the
+  // WIRING (the attempt existed and was not passed), and a test that supplies the argument itself
+  // would have passed against the broken code.
+  // -------------------------------------------------------------------------------------------
+
+  it("gives a resumed agent a prompt that DIFFERS from the one before it", () => {
+    let goal = newGoal("stuck", T0);
+    const prompts: string[] = [];
+    for (let i = 0; i < MAX_CONTINUES_WITHOUT_PROGRESS; i++) {
+      const d = decideContinuation(ready({ goal, mark: "stuck" }));
+      if (d.action !== "continue") throw new Error("expected continue");
+      prompts.push(d.prompt);
+      goal = noteContinue(goal, "stuck");
+    }
+    // The whole point: no two resumes in one streak are the same text.
+    expect(new Set(prompts).size).toBe(prompts.length);
+    // And the FIRST carries no repeat banner — there is nothing yet to be confused with, so the
+    // line must not be unconditional (which would make every resume identical all over again).
+    expect(prompts[0]).not.toMatch(/AUTO-RESUME/);
+    expect(prompts[1]).toContain(`AUTO-RESUME 2 OF ${MAX_CONTINUES_WITHOUT_PROGRESS}`);
+  });
+
+  it("a repeat banner names the ceiling it derives from, not a literal that can go stale", () => {
+    // Pinned as the constant ±0 rather than "3": retuning the bound must not leave the prose
+    // promising the old one. A literal here would keep passing while the copy lied.
+    const prompt = continuePrompt(newGoal("g", T0), 2);
+    expect(prompt).toContain(`OF ${MAX_CONTINUES_WITHOUT_PROGRESS}`);
+    expect(prompt).not.toContain(`OF ${MAX_CONTINUES_WITHOUT_PROGRESS + 1}`);
+    // It must tell the agent the thing it cannot otherwise know: an identical banner is the timer,
+    // not the human. Without this the count alone reads as noise.
+    expect(prompt).toMatch(/not the human repeating themselves/i);
+  });
+
+  it("a progressed agent is never told it is repeating itself", () => {
+    // The false-accusation guard. `attempt` resets to 1 when the mark moves, so an agent that is
+    // working must never see the repeat banner however many times it has been resumed.
+    let goal = newGoal("long but healthy", T0);
+    for (let i = 0; i < MAX_CONTINUES_WITHOUT_PROGRESS + 2; i++) {
+      const d = decideContinuation(ready({ goal, mark: `m${i}` }));
+      if (d.action !== "continue") throw new Error("expected continue");
+      expect(d.prompt).not.toMatch(/AUTO-RESUME/);
+      goal = noteContinue(goal, `m${i}`);
+    }
+  });
+
+  it("stays system-authored at every attempt, so the loop detector does not go blind", () => {
+    // Varying the tail is only safe because `isSystemAuthoredPrompt` matches the PREFIX. If a
+    // future edit moved the banner above the marker, `agentThrash` would start counting Sparkle's
+    // own sends as an agent repeating a command — the exact false "it is looping, not working"
+    // badge that exclusion exists to prevent.
+    for (let attempt = 1; attempt <= MAX_CONTINUES_WITHOUT_PROGRESS; attempt++) {
+      expect(isSystemAuthoredPrompt(continuePrompt(newGoal("g", T0), attempt))).toBe(true);
+    }
   });
 
   it("still stops at the per-goal ceiling even while progress keeps resetting the streak", () => {

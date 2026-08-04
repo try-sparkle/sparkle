@@ -382,8 +382,15 @@ function handleSpawn(req: OrchestrationRequest): void {
       // MCP client's malformed-reply guard. That surfaces as an error the orchestrator may retry —
       // defeating the idempotency this path exists for. So when the record is mid-relocation we
       // still REFUSE (the claim holds), we just can't name it yet.
+      //
+      // Mark the reply REUSED. Idempotency is about not spawning twice; it is not a licence to let
+      // the caller believe its task was dispatched. This worker is executing the task it was
+      // ORIGINALLY spawned with — the task in THIS request was dropped on the floor. Without a
+      // marker the reply is byte-indistinguishable from a fresh spawn, so an orchestrator that
+      // re-dispatches a bead with a corrected or expanded task reads a successful handle and waits
+      // forever on work nobody is doing.
       if (existing.branch && existing.worktree) {
-        void respond(req.reqId, existing);
+        void respond(req.reqId, { ...existing, reused: true });
       } else {
         void respond(req.reqId, {
           error: `bead ${beadId} is already claimed by worker ${existing.workerId}, whose worktree is not currently resolvable`,

@@ -125,7 +125,12 @@ function seedBuild(
   return id;
 }
 
-function seedWorker(projectId: string, parentId: string, beadId?: string): string {
+function seedWorker(
+  projectId: string,
+  parentId: string,
+  beadId?: string,
+  bs?: BranchStatus,
+): string {
   const store = useProjectStore.getState();
   const id = store.addAgent(projectId, {
     kind: "worker",
@@ -136,6 +141,7 @@ function seedWorker(projectId: string, parentId: string, beadId?: string): strin
     select: false,
   })!;
   store.setAgentWorktree(projectId, id, `/wt/${id}`, `sparkle/agent-${id}`);
+  if (bs) useRuntimeStore.setState((s) => ({ branchStatus: { ...s.branchStatus, [id]: bs } }));
   return id;
 }
 
@@ -787,10 +793,24 @@ describe("closeAgent", () => {
   it("routes a WORKER to spinDownWorker (its own teardown, branch kept)", async () => {
     const pid = seedProject();
     const build = seedBuild(pid, { bs: CLEAN });
-    const worker = seedWorker(pid, build);
+    const worker = seedWorker(pid, build, undefined, CLEAN);
     const r = await closeAgent(worker);
     expect(r.ok).toBe(true);
     expect(spinDownWorkerMock).toHaveBeenCalledWith({ projectId: pid, workerId: worker });
+    expect(spinDownGitMock).not.toHaveBeenCalled();
+  });
+
+  // close_agent has no confirmation argument at all, so the worker guard is absolute on this path:
+  // it can only ever destroy uncommitted work by being routed somewhere that can confirm.
+  it("refuses to close a WORKER whose worktree is dirty, and tears nothing down", async () => {
+    const pid = seedProject();
+    const build = seedBuild(pid, { bs: CLEAN });
+    const worker = seedWorker(pid, build, undefined, DIRTY);
+    const r = await closeAgent(worker);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toBe("uncommitted-work");
+    expect(spinDownWorkerMock).not.toHaveBeenCalled();
     expect(spinDownGitMock).not.toHaveBeenCalled();
   });
 });
@@ -1003,7 +1023,45 @@ describe("spinDownWorkerAgent", () => {
   it("spins a worker down through the existing worker teardown", async () => {
     const pid = seedProject();
     const build = seedBuild(pid, { bs: CLEAN });
-    const worker = seedWorker(pid, build);
+    const worker = seedWorker(pid, build, undefined, CLEAN);
+    const r = await spinDownWorkerAgent(worker);
+    expect(r.ok).toBe(true);
+    expect(spinDownWorkerMock).toHaveBeenCalledWith({ projectId: pid, workerId: worker });
+  });
+
+  // The teardown removes the checkout with --force, so "the branch is kept" does NOT cover
+  // uncommitted files. Each case asserts the TEARDOWN DID NOT RUN — the refusal object alone would
+  // pass even if the worktree had already been deleted underneath it.
+  it.each([
+    ["a dirty worktree", DIRTY],
+    ["a worktree parked on another branch, which still holds the files", { ...CLEAN, worktreeOnBranch: false }],
+    ["no branch reading yet, which cannot rule the changes out", undefined],
+  ])("refuses to spin a worker down with %s", async (_label, bs) => {
+    const pid = seedProject();
+    const build = seedBuild(pid, { bs: CLEAN });
+    const worker = seedWorker(pid, build, undefined, bs);
+    const r = await spinDownWorkerAgent(worker);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toBe("uncommitted-work");
+    expect(spinDownWorkerMock).not.toHaveBeenCalled();
+  });
+
+  it("spins a dirty worker down when the caller explicitly confirms the discard", async () => {
+    const pid = seedProject();
+    const build = seedBuild(pid, { bs: CLEAN });
+    const worker = seedWorker(pid, build, undefined, DIRTY);
+    const r = await spinDownWorkerAgent(worker, { discardUncommitted: true });
+    expect(r.ok).toBe(true);
+    expect(spinDownWorkerMock).toHaveBeenCalledWith({ projectId: pid, workerId: worker });
+  });
+
+  // Committed work survives on the branch the teardown keeps, so `ahead` must not gate the
+  // spin-down — an orchestrator that merged the branch would otherwise never reclaim the slot.
+  it("spins down a worker with commits ahead but a clean tree", async () => {
+    const pid = seedProject();
+    const build = seedBuild(pid, { bs: CLEAN });
+    const worker = seedWorker(pid, build, undefined, AHEAD);
     const r = await spinDownWorkerAgent(worker);
     expect(r.ok).toBe(true);
     expect(spinDownWorkerMock).toHaveBeenCalledWith({ projectId: pid, workerId: worker });

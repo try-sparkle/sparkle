@@ -1580,7 +1580,40 @@ function handleNavigate(req: ControlRequest): Record<string, unknown> {
  * The refusal is shaped like every other reply on this op (`{ ok:false, domain, op, code, message }`)
  * so the concierge — an LLM reading a tool result — can branch on `code` rather than pattern-match
  * prose, exactly as it does for `unknown-op` or `bad-args`.
+ *
+ * The refusal's PROSE half is not one fixed sentence, because "use the ordinary sparkle-control ops"
+ * is false for one domain — see {@link refusedCallerRemedy}.
  */
+/**
+ * WHAT A REFUSED CALLER SHOULD DO INSTEAD — derived from the tool it asked for, not fixed prose.
+ *
+ * The generic half ("drive the app through the ordinary sparkle-control ops") is true for every
+ * domain but ONE. There is no ordinary control op that photographs anything: the `screenshot`
+ * domain (`capture_window`, `capture_agent`) exists only behind `concierge_tool`. So an agent asked
+ * for a before/after screenshot read a refusal that named a remedy which does not exist for what it
+ * wanted, and had to go find the real path by reading the scripts directory.
+ *
+ * Naming the visual harness closes that. It is safe under the SAME condition that produced the
+ * refusal — the harness renders app surfaces in a headless browser inside the caller's own checkout,
+ * so it reaches neither the human's screen nor the running app, which is the whole reason
+ * `capture_window` is concierge-only (it photographs a screen region; see conciergeTools/screenshot).
+ *
+ * And it says what the harness CANNOT do. A remedy is an instruction the reader will follow, so an
+ * agent told "capture the app" that silently gets fixture-rendered surfaces would report live state
+ * it never saw. The limitation belongs in the sentence, not in the README it may not open.
+ */
+function refusedCallerRemedy(domain: string, op: string): string {
+  const wantsAPicture =
+    domain === "screenshot" || op === "capture_window" || op === "capture_agent";
+  return wantsAPicture
+    ? "No ordinary control op takes a picture, so there is nothing here to fall back to. The " +
+        "supported path for an agent is the visual harness — `pnpm --filter @sparkle/desktop " +
+        "visual:capture` (see apps/desktop/scripts/visual/README.md). Note what it is: it renders " +
+        "the app's surfaces in a headless browser from its own fixtures, so it shows what the code " +
+        "draws, NOT the live window or the human's screen. Do not report its output as live state."
+    : "Agents drive the app through the ordinary sparkle-control ops.";
+}
+
 async function handleConciergeTool(req: ControlRequest): Promise<ConciergeToolReply> {
   // Read defensively: this payload was assembled by a model's MCP client, and the reply has to name
   // the domain/op it was asked about even when they arrive as the wrong type.
@@ -1604,8 +1637,7 @@ async function handleConciergeTool(req: ControlRequest): Promise<ConciergeToolRe
       domain,
       op,
       code: "forbidden",
-      message:
-        "concierge_tool is only callable by the concierge. Agents drive the app through the ordinary sparkle-control ops.",
+      message: `concierge_tool is only callable by the concierge. ${refusedCallerRemedy(domain, op)}`,
     };
   }
   // `toolCallId` is minted by the MCP server, never by the model. A blank one is not rejected here:
