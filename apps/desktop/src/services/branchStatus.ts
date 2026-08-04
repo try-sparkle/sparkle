@@ -260,6 +260,10 @@ export interface AgentStatusResult {
   changed: boolean;
   branch: BranchStatus | null;
   workflow: WorkflowState | null;
+  /** true ⇒ this agent's worktree directory is GONE / no longer a git repo (a permanent condition).
+   *  The caller latches it into the dead-worktree skip-set and stops polling it, so the batch stops
+   *  re-shelling `git status` against a dead path every tick (). */
+  gone?: boolean;
 }
 
 /** Branch + workflow status for ALL of a project's agents in ONE Rust call (sparkle-zlic): shared

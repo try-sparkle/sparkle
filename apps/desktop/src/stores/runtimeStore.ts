@@ -883,6 +883,15 @@ export const useRuntimeStore = create<RuntimeState>()(
           console.debug("pollProjectStatus failed for", projectId, e);
           return;
         }
+        // Latch any agent the batch reports as GONE (worktree dir deleted / no longer a git repo) so
+        // the NEXT poll's `live` filter drops it — otherwise the batch re-shells `git status` against
+        // the dead path every tick and floods the log with "not a git repository" (). The
+        // per-agent `pollBranchStatus` path already latched these via `isWorktreeGoneError`, but the
+        // batched Rust path swallowed the failure into `changed:false`, so TS never learned the path
+        // was dead. Rust now surfaces it as `gone` for exactly this prune.
+        for (const r of results) {
+          if (r.gone) deadWorktrees.add(r.agentId);
+        }
         // Mark forced only on EVIDENCE the recompute actually landed (roborev 54843): either this
         // poll produced a fresh read (`r.changed`), or a prior poll already established
         // `branchStatus` for the agent. Marking the whole batch unconditionally — the previous fix

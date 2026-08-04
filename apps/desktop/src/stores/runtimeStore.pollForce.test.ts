@@ -233,3 +233,71 @@ describe("pollProjectStatus — the closed sweep drives no lifecycle (roborev 54
     expect(settings.useSettingsStore.getState().roborevConsentOpen).toBe(true);
   });
 });
+
+/**
+ * : a deleted worktree path was re-polled forever. The per-agent `pollBranchStatus` path
+ * already latched a gone worktree into a skip-set via `isWorktreeGoneError`, but the BATCHED
+ * `pollProjectStatus` path swallowed the Rust failure into `changed:false`, so TS never learned the
+ * path was dead and re-shelled `git status` against it every tick — flooding the log with
+ * "not a git repository". Rust now surfaces the permanent failure as `gone:true`; TS prunes on it.
+ */
+describe("pollProjectStatus — prunes a GONE worktree from the poll set ()", () => {
+  it("stops re-polling a dead path after Rust flags it gone, while a live agent keeps polling", async () => {
+    const { runtime, projects } = await freshWindow();
+    const pid = projects.useProjectStore.getState().addProject("Sparkle-Desktop", "/root");
+
+    // Record the agent ids the batch is asked to poll on each tick. The SIDE EFFECT under test is
+    // that the dead path DROPS OUT of the poll set after the first tick — not merely that a log fired.
+    const polledIds: string[][] = [];
+    projectAgentsStatus.mockImplementation(
+      async (_r: string, _p: string, agents: AgentStatusInput[]): Promise<AgentStatusResult[]> => {
+        polledIds.push(agents.map((a) => a.agentId));
+        return agents.map((a) =>
+          a.agentId === "dead1"
+            ? // The worktree dir was deleted: Rust can no longer `git status` it and reports it gone.
+              { agentId: a.agentId, changed: false, branch: null, workflow: null, gone: true }
+            : { agentId: a.agentId, changed: true, branch: bs(2), workflow: ws() },
+        );
+      },
+    );
+
+    const poll = runtime.useRuntimeStore.getState().pollProjectStatus;
+    const agents = [toInput("dead1", "build"), toInput("live1", "build")];
+
+    // Three identical ticks, exactly as the sidebar re-issues them every poll interval.
+    await poll("/root", pid, agents, false);
+    await poll("/root", pid, agents, false);
+    await poll("/root", pid, agents, false);
+
+    // Tick 1 polled both; every LATER tick polls ONLY the live agent — the dead path is pruned and
+    // never re-shelled again (before the fix, `dead1` appeared in every tick's list forever).
+    expect(polledIds[0]).toEqual(["dead1", "live1"]);
+    expect(polledIds[1]).toEqual(["live1"]);
+    expect(polledIds[2]).toEqual(["live1"]);
+    // The live agent keeps receiving a real status; the dead one never lands one.
+    expect(runtime.useRuntimeStore.getState().branchStatus.live1?.ahead).toBe(2);
+    expect(runtime.useRuntimeStore.getState().branchStatus.dead1).toBeUndefined();
+  });
+
+  it("does NOT prune on a transient error (Rust reports changed:false, gone unset)", async () => {
+    const { runtime, projects } = await freshWindow();
+    const pid = projects.useProjectStore.getState().addProject("Sparkle-Desktop", "/root");
+
+    const polledIds: string[][] = [];
+    projectAgentsStatus.mockImplementation(
+      async (_r: string, _p: string, agents: AgentStatusInput[]): Promise<AgentStatusResult[]> => {
+        polledIds.push(agents.map((a) => a.agentId));
+        // A transient git hiccup surfaces as changed:false with `gone` UNSET — must keep polling.
+        return agents.map((a) => ({ agentId: a.agentId, changed: false, branch: null, workflow: null }));
+      },
+    );
+
+    const poll = runtime.useRuntimeStore.getState().pollProjectStatus;
+    await poll("/root", pid, [toInput("flaky1", "build")], false);
+    await poll("/root", pid, [toInput("flaky1", "build")], false);
+
+    // A transient failure is retried, not latched: the agent is present on BOTH ticks.
+    expect(polledIds[0]).toEqual(["flaky1"]);
+    expect(polledIds[1]).toEqual(["flaky1"]);
+  });
+});

@@ -4241,6 +4241,12 @@ pub struct AgentStatusResult {
     changed: bool,
     branch: Option<BranchStatus>,
     workflow: Option<WorkflowState>,
+    /// true ⇒ this agent's worktree directory is GONE / no longer a git repo — a PERMANENT condition
+    /// (ids are unique and torn-down worktrees never return at the same path). Distinct from a
+    /// transient git error, which stays `false`. The frontend latches these into its dead-worktree
+    /// skip-set and stops polling them, instead of re-shelling `git status` against a dead path every
+    /// tick and re-logging "not a git repository" for the app's lifetime ().
+    gone: bool,
 }
 
 /// The cheap change-detection key for one agent. When every component is unchanged since the last
@@ -4467,6 +4473,18 @@ fn workflow_state_shared(
     }
 }
 
+/// Does this branch-status error mean the agent's worktree directory is GONE (vs. a transient git
+/// hiccup)? Mirrors the frontend's `isWorktreeGoneError`: match ONLY the structural signatures git
+/// emits when its CWD/worktree no longer exists or isn't a repo — `not a git repository` (the exact
+/// fatal a deleted worktree floods the log with) or `cannot change to <dir>` (git's chdir-to-CWD
+/// failure). Deliberately NOT a bare "no such file or directory", which an unrelated missing
+/// pathspec could trip. A false negative costs one more failed poll; a false positive would prune a
+/// live agent, so this stays narrow ().
+fn branch_status_error_is_worktree_gone(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("not a git repository") || lower.contains("cannot change to")
+}
+
 /// Core (AppHandle-free, testable): compute branch + workflow status for EVERY agent of a project in
 /// one pass, sharing repo discovery and skipping fingerprint-unchanged idle agents (sparkle-zlic).
 pub fn project_agents_status_at(
@@ -4516,6 +4534,16 @@ pub fn project_agents_status_at(
         changed: false,
         branch: None,
         workflow: None,
+        gone: false,
+    };
+    // Like `skipped`, but flags the agent's worktree as permanently GONE so the frontend prunes it
+    // from the poll set (). `changed` stays false — there is no fresh status to apply.
+    let gone = |id: &str| AgentStatusResult {
+        agent_id: id.to_string(),
+        changed: false,
+        branch: None,
+        workflow: None,
+        gone: true,
     };
     for a in agents {
         // think/shell have no git workflow — report unchanged so the frontend leaves them alone.
@@ -4608,6 +4636,21 @@ pub fn project_agents_status_at(
         ) {
             Ok(bs) => bs,
             Err(e) => {
+                // Distinguish a PERMANENT gone-worktree failure from a transient git error. The
+                // former (the worktree dir survives but is no longer a git repo — the exact case that
+                // makes `git status` emit "fatal: not a git repository") will never recover at this
+                // path, so flag it `gone` for the frontend to prune — otherwise the batch re-shells
+                // `git status` against the dead path every tick and re-logs that fatal for the app's
+                // lifetime (). A genuinely transient error stays `skipped` and is retried
+                // next tick. (A FULLY-removed dir doesn't reach here: `DirtyReading::read` treats a
+                // non-existent worktree as clean-and-empty, so it never errors — hence match the
+                // error signature rather than `!wt.exists()`, which would risk pruning a
+                // being-created worktree on an unrelated transient error.)
+                if branch_status_error_is_worktree_gone(&e) {
+                    tracing::debug!(agent = %a.agent_id, error = %e, "branch status: worktree gone, pruning from poll set");
+                    out.push(gone(&a.agent_id));
+                    continue;
+                }
                 tracing::debug!(agent = %a.agent_id, error = %e, "batch branch status failed");
                 out.push(skipped(&a.agent_id));
                 continue;
@@ -4636,6 +4679,7 @@ pub fn project_agents_status_at(
             changed: true,
             branch: Some(branch_status),
             workflow: Some(workflow),
+            gone: false,
         });
     }
     out
@@ -7619,6 +7663,69 @@ mod tests {
         let after = project_agents_status_at(&r, "p1", &[input(false)], false, &app_data);
         assert!(after[0].changed, "a new commit re-evaluates");
         assert_eq!(after[0].branch.as_ref().unwrap().ahead, 2);
+    }
+
+    // : a worktree whose directory SURVIVES but is no longer a git repo makes the batch's
+    // `git status` fail with "fatal: not a git repository" every tick — the exact flood the bead
+    // reports. That PERMANENT failure must be surfaced as `gone` (so the frontend prunes the path),
+    // distinct from a transient error, while a healthy agent in the same batch still computes.
+    #[test]
+    fn batch_status_flags_a_non_git_worktree_as_gone() {
+        let r = init_repo("batch-gone");
+        let app_data = unique_root("batch-gone-appdata");
+
+        // A healthy agent with one commit → 1 ahead.
+        let live = create_worktree_at(&r, "p1", "live", "main", &app_data).unwrap().path;
+        std::fs::write(format!("{live}/w.txt"), "work").unwrap();
+        git(&live, &["add", "."]).unwrap();
+        git(&live, &["commit", "-q", "-m", "work"]).unwrap();
+
+        // A second agent whose worktree DIR remains but is no longer a git repo: drop its `.git` link
+        // so `git status` there fails with "fatal: not a git repository".
+        let dead = create_worktree_at(&r, "p1", "dead", "main", &app_data).unwrap().path;
+        std::fs::remove_file(format!("{dead}/.git")).unwrap();
+        // Precondition: the directory still exists (only the git linkage is gone), so this is the
+        // dir-survives-but-not-a-repo case, NOT a fully-removed worktree.
+        assert!(Path::new(&dead).exists(), "worktree dir must survive for this case");
+
+        let input = |id: &str| AgentStatusInput {
+            agent_id: id.into(),
+            base_branch: "main".into(),
+            parent_branch: String::new(),
+            kind: "build".into(),
+            force: true, // force so neither is fingerprint-skipped
+        };
+        let results =
+            project_agents_status_at(&r, "p1", &[input("live"), input("dead")], false, &app_data);
+
+        let live_r = results.iter().find(|x| x.agent_id == "live").unwrap();
+        let dead_r = results.iter().find(|x| x.agent_id == "dead").unwrap();
+
+        // The healthy agent is unaffected: normal status, NOT flagged gone.
+        assert!(live_r.changed, "live agent still computes");
+        assert_eq!(live_r.branch.as_ref().unwrap().ahead, 1);
+        assert!(!live_r.gone, "a live worktree is never flagged gone");
+
+        // The broken worktree is flagged gone (permanent) so the frontend prunes it, with no status.
+        assert!(dead_r.gone, "a non-git worktree must be reported gone");
+        assert!(!dead_r.changed, "a gone agent carries no fresh status");
+        assert!(dead_r.branch.is_none());
+    }
+
+    #[test]
+    fn worktree_gone_error_matches_only_structural_signatures() {
+        // The exact fatal a deleted/broken worktree floods the log with, and git's chdir failure.
+        assert!(branch_status_error_is_worktree_gone(
+            "git --no-optional-locks status --porcelain failed: fatal: not a git repository"
+        ));
+        assert!(branch_status_error_is_worktree_gone(
+            "fatal: cannot change to '/x': No such file or directory"
+        ));
+        // A transient / unrelated error must NOT be mistaken for a gone worktree (it should retry).
+        assert!(!branch_status_error_is_worktree_gone(
+            "fatal: ambiguous argument 'main...x': unknown revision"
+        ));
+        assert!(!branch_status_error_is_worktree_gone("error: No such file or directory"));
     }
 
     // sparkle-prpb: an idle agent whose git fingerprint never moves must still get its PR state
