@@ -22,6 +22,7 @@ vi.mock("./worktree", async (orig) => ({
 
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
+import { useStaleBuildStore } from "./staleBuildService";
 import { spawnWorker, spinDownWorker } from "./workerSpawn";
 import { __resetTracesForTest, openTraceKinds } from "../perfTrace";
 
@@ -40,6 +41,9 @@ describe("spawnWorker", () => {
     // own waterfall, which never happens here — so without this, one case's `close:`/`switch:` trace
     // leaks into the next one's openTraceKinds().
     __resetTracesForTest();
+    // The stale-build store is module-scoped too: default not-stale, and clear() after any test that
+    // sets it so the stale-build guard doesn't reject an unrelated spawn in a later case.
+    useStaleBuildStore.getState().clear();
   });
 
   it("creates a worker tab under the parent, cuts a worktree from the parent branch, and persists it", async () => {
@@ -330,6 +334,53 @@ describe("spawnWorker", () => {
     const buildId = store.addAgent(projectId, { kind: "build" })!;
     await expect(spawnWorker({ projectId, parentAgentId: buildId, task: "x" }))
       .rejects.toThrow(/branch/);
+  });
+
+  // sparkle-cmtg — a STALE running build serving old orchestration code repeatedly mis-derived a
+  // live parent's branch as empty and then threw the "no branch yet" error, sending the operator
+  // hunting for a branch problem that did not exist. The stale-build guard must fire FIRST and say
+  // so accurately. THE SIDE EFFECT: the SAME no-branch input that throws /branch/ above now throws a
+  // stale/restart error and NOT the branch error — so reverting the guard (falling through to the
+  // branch throw) flips this from stale→branch and fails the assertion (non-vacuous).
+  it("reports a stale build instead of the misleading 'no branch' error", async () => {
+    const store = useProjectStore.getState();
+    const projectId = store.addProject("Demo", "/tmp/demo");
+    // Parent has NO branch — the exact input that yields "no branch yet" on a current build.
+    const buildId = store.addAgent(projectId, { kind: "build" })!;
+    // The running build is older than the one installed on disk (staleBuildService).
+    useStaleBuildStore.getState().setStale("0.99.0");
+
+    const err = await spawnWorker({ projectId, parentAgentId: buildId, task: "x" }).then(
+      () => null,
+      (e: Error) => e,
+    );
+    expect(err).toBeInstanceOf(Error);
+    expect(err!.message).toMatch(/stale|restart/i);
+    expect(err!.message).toContain("0.99.0"); // the installed version the operator must restart into
+    // The accurate failure REPLACES the branch red herring — the operator is not sent hunting.
+    expect(err!.message).not.toMatch(/no branch yet — open it first/);
+  });
+
+  // The guard gates the spawn on staleness itself, not merely the no-branch path: a stale build must
+  // not spawn workers from orchestration code that no longer matches what shipped, branch or not.
+  it("refuses to spawn on a stale build even when the parent HAS a branch", async () => {
+    const store = useProjectStore.getState();
+    const projectId = store.addProject("Demo", "/tmp/demo");
+    const buildId = store.addAgent(projectId, { kind: "build" })!;
+    store.setAgentWorktree(projectId, buildId, "/wt/build", "sparkle/agent-build1");
+    useStaleBuildStore.getState().setStale("0.99.0");
+
+    // A valid-branch spawn would normally cut a worktree; on a stale build it must be refused up
+    // front, so create_worker_worktree is never even invoked.
+    invokeMock.mockImplementation((cmd: string) =>
+      cmd === "create_worker_worktree"
+        ? Promise.resolve({ path: "/wt/worker", branch: "sparkle/agent-w" })
+        : Promise.resolve(undefined),
+    );
+
+    await expect(spawnWorker({ projectId, parentAgentId: buildId, task: "x" }))
+      .rejects.toThrow(/stale|restart/i);
+    expect(invokeMock).not.toHaveBeenCalledWith("create_worker_worktree", expect.anything());
   });
 
   it("rolls back the worker tab if worktree creation fails (no orphan)", async () => {

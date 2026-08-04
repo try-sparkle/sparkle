@@ -7,6 +7,7 @@ import { prepareWorkerWorkspace, removeAgentWorkspace, writeWorkerManifest } fro
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { maybeAutoName } from "./agentNaming";
 import { aiFeatureNow } from "./aiGate";
+import { useStaleBuildStore } from "./staleBuildService";
 
 /** The authoritative identity of a freshly-spawned worker. Returned straight from the worktree
  *  cut (createWorkerWorktree) — NOT re-derived from a later store read — so callers (the
@@ -38,6 +39,26 @@ export async function spawnWorker(args: {
   if (!project) throw new Error(`unknown project ${args.projectId}`);
   const parent = project.agents.find((a) => a.id === args.parentAgentId);
   if (!parent) throw new Error(`unknown parent agent ${args.parentAgentId}`);
+
+  // STALE-BUILD GUARD (sparkle-cmtg) — fail loudly and accurately BEFORE the "no branch" throw.
+  // The app embeds the orchestrator and does NOT hot-reload (staleBuildService), so a running build
+  // that is older than the one installed on disk is serving stale orchestration code. That stale
+  // code repeatedly mis-derived a live parent's branch as empty and then threw the branch error
+  // below — sending the operator hunting for a branch problem that did not exist (the founder repro
+  // in the bead). Checking staleness here means a stale build says so directly and tells the human
+  // to restart, instead of emitting a misleading "no branch" error we would then have to debug. A
+  // stale build must not spawn workers from code that no longer matches what shipped, branch or not.
+  const staleBuild = useStaleBuildStore.getState();
+  if (staleBuild.stale) {
+    const v = staleBuild.installedVersion;
+    throw new Error(
+      `the running app is a STALE build${
+        v ? ` — version ${v} is installed but not yet running` : ""
+      } — RESTART the app to finish updating, then spawn again. Spawning from stale orchestration ` +
+        `code can misreport agent state (for example, a live branch as "no branch yet").`,
+    );
+  }
+
   if (!parent.branch) throw new Error("parent agent has no branch yet — open it first");
 
   // DON'T STEAL THE TAB. `select: false` — a spawn is MCP-driven, so moving the user's terminal to
