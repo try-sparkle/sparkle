@@ -225,3 +225,54 @@ describe("actionReceiptLine", () => {
     expect(actionReceiptLine({} as ConciergeActionReceipt, resolve)).toBeNull();
   });
 });
+
+// ══ COPY THAT HAS TO SURVIVE THE REAL STRINGS (roborev 57951) ══════════════════════════════════
+describe("the spawn shortfall reads as prose, not a spliced clause", () => {
+  // VERBATIM from lifecycle.ts. The synthetic short clause the first test used ("its terminal never
+  // came up") is exactly the fixture-divergence this branch was opened to fix, reintroduced in the
+  // fix for it.
+  const LAUNCH_FAILED = 'I created the agent, but its terminal didn\'t start — the pty never came up — so its opening brief hasn\'t gone in yet. Its brief is still attached, so "Start again" on that agent will send it; nothing needs re-typing.';
+
+  it("renders a multi-sentence briefFailure as its own sentence", () => {
+    const l = actionReceiptLine(
+      receipt({ kind: "spawned", ok: true, reason: LAUNCH_FAILED }),
+      resolve,
+    );
+    expect(l?.spoken).toBe(`Spawned Left Pair. ${LAUNCH_FAILED}`);
+    // The specific regression: "— but I created the agent, but its terminal didn't start" is not a
+    // sentence, and it is the shape the previous template produced.
+    expect(l?.spoken).not.toContain("— but I created");
+  });
+
+  it("a clean spawn is still one short sentence — the positive control", () => {
+    expect(actionReceiptLine(receipt({ kind: "spawned" }), resolve)?.spoken).toBe(
+      "Spawned Left Pair.",
+    );
+  });
+});
+
+describe("a picker press is not described as a message", () => {
+  it("says it answered the prompt", () => {
+    const l = actionReceiptLine(
+      receipt({ channel: "terminal", viaPicker: true }),
+      resolve,
+    );
+    expect(l?.spoken).toBe("Answered Left Pair's prompt.");
+    expect(l?.spoken).not.toContain("Sent to");
+  });
+});
+
+// ══ THE TERMINAL FAN-OUT GUARD, RESTORED (roborev 57926) ═══════════════════════════════════════
+// The row asserting a terminal send is never pluralised was DELETED rather than moved when the
+// inbox-singular row replaced it in place. The count arm is channel-agnostic and runs first, so
+// nothing guarded the terminal channel against it.
+describe("the terminal channel is never pluralised", () => {
+  it("ignores counts on a terminal receipt", () => {
+    const l = actionReceiptLine(
+      receipt({ channel: "terminal", queued: 5, failed: 0 }),
+      resolve,
+    );
+    expect(l?.spoken).toBe("Sent to Left Pair's terminal.");
+    expect(l?.spoken).not.toContain("agents");
+  });
+});

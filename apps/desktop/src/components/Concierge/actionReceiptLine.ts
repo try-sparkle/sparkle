@@ -104,9 +104,14 @@ export function actionReceiptLine(
       // — and then says what did not happen. An agent that starts unbriefed sits there doing nothing
       // ("every agent I spawn starts dead until I go type into it"), and this is the only place the
       // founder would learn it without opening the terminal (roborev 57862).
+      // A SEPARATE SENTENCE, not a spliced clause (roborev 57951). `briefFailure` is a
+      // multi-sentence, capitalised, first-person paragraph — "I created the agent, but its
+      // terminal didn't start — … Its brief is still attached, so \"Start again\" … will send it."
+      // Splicing that after "— but " produced "Spawned X — but I created the agent, but …", which is
+      // broken copy in the one module whose output is meant to be trusted at a glance.
       const shortfall = receipt.reason?.trim();
       return shortfall
-        ? line`Spawned ${subject} — but ${plain(shortfall)}`
+        ? line`Spawned ${subject}. ${plain(shortfall)}`
         : line`Spawned ${subject}.`;
     }
 
@@ -130,6 +135,11 @@ export function actionReceiptLine(
       // A broadcast with NO counts — its refusal arms carry no data — still reads plural, because
       // `fanout` came from the op rather than from the absent subject. A single `inbox_send` whose
       // args were refused is subject-less too, and it correctly stays singular (roborev 57905).
+      // A PICKER PRESS IS NOT A MESSAGE. It really did write to the PTY, so it gets a receipt — but
+      // "Sent to X's terminal" would describe something the concierge did not do.
+      if (receipt.viaPicker) {
+        return line`Answered ${subject}'s prompt.`;
+      }
       // HELD, not delivered: the PTY was not up, so the message is queued and will go in when the
       // agent is ready — or expire. Saying "Sent to X's terminal" here is the sent-versus-visible
       // ambiguity the channel field exists to remove (roborev 57862).

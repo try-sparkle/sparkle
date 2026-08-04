@@ -480,11 +480,6 @@ export function classifyConciergeActionReceipt(
   // send collapsed onto pressing a button — which is not a message at all, and which
   // `TERMINAL_RULES` already refuses to describe as one for `select_picker_option`.
   const sendPath = pathOf(input.data);
-  if (rule.kind === "sent" && rule.channel === "terminal" && input.ok) {
-    // Pressing a picker button is not "sent a message to X"; emitting one would describe something
-    // the concierge did not do.
-    if (sendPath === "picker-option") return null;
-  }
   const isBroadcast = domain === "fleet" && op === "inbox_broadcast";
   const counts = isBroadcast ? countsOf(input.data) : undefined;
   const prNumber = kind === "merged" ? prNumberOf(input.args, input.data) : undefined;
@@ -497,6 +492,12 @@ export function classifyConciergeActionReceipt(
     ok: input.ok && spawnTrouble?.fatal !== true,
     ...(agentId ? { agentId } : {}),
     ...(agentName ? { agentName } : {}),
+    // A picker press really did write to the PTY, so it earns a receipt — it just gets its own
+    // sentence rather than "sent a message" (roborev 57951). Suppressing it, as the first version
+    // did, hid an action that happened.
+    ...(rule.kind === "sent" && input.ok && sendPath === "picker-option"
+      ? { viaPicker: true as const }
+      : {}),
     ...(rule.kind === "sent"
       ? {
           channel:

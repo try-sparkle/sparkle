@@ -83,6 +83,12 @@ export interface ConciergeActionReceipt {
    *  so a subject-less inbox receipt is just as likely to be a single send whose args were refused.
    *  Present without {@link queued}/{@link failed} on a broadcast REFUSAL, which carries no data. */
   fanout?: true;
+  /** This `sent` receipt was a PICKER PRESS, not a message. `send_to_agent_terminal` can collapse
+   *  onto pressing a button on the human's behalf (`path: "picker-option"`), which really does write
+   *  to the PTY — so suppressing the receipt entirely would hide an action that happened, the false
+   *  negative this module exists to prevent. It just must not be described as "sent a message"
+   *  (roborev 57951). */
+  viaPicker?: true;
   /** How many inboxes actually took the message, and how many refused it. `inboxBroadcast` reports
    *  a PARTIAL failure as an OK reply holding these — so a line keyed on `ok` alone would state flat
    *  delivery for a broadcast some inboxes rejected, a claim the tool never made. */
@@ -224,6 +230,11 @@ export function _resetConciergeReceiptsForTests(): void {
   listeners.clear();
   // The replay buffer too, or one test's receipts are replayed into the next test's subscriber.
   recent.length = 0;
+  // …and the posted-id set, which is the THIRD piece of module state here (roborev 57926). Every
+  // receipts suite calls this reset and none of them knew to clear that separately, so a test
+  // recording a receipt whose id a previous test had already "posted" would silently see it
+  // suppressed — a leak that gets harder to spot the more suites use the module.
+  postedReceiptIds.clear();
 }
 
 /**

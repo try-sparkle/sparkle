@@ -14,6 +14,7 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 
 import { resetConciergeIdentityState } from "./conciergeIdentityReset";
 import {
+  claimReceiptForDisplay,
   onConciergeActionReceipt,
   recordConciergeActionReceipt,
   _resetConciergeReceiptsForTests,
@@ -134,6 +135,20 @@ describe("the receipt backlog is per-human state too", () => {
     const next = vi.fn();
     onConciergeActionReceipt(next);
     expect(next).not.toHaveBeenCalled();
+  });
+
+  // roborev 57926: the LAYERING half of the earlier finding was fixed and the test half was not.
+  // The obstacle that excused it is gone — the set lives in a pure service now, so this is three
+  // lines with no React graph.
+  it("drops the posted-id set, so the next human's receipts are not deduped against the last one's", () => {
+    // Seeded through the real path: draw a receipt, which records its id as posted.
+    expect(claimReceiptForDisplay("receipt-leak")).toBe(true);
+    expect(claimReceiptForDisplay("receipt-leak")).toBe(false); // the seed is real
+
+    resetConciergeIdentityState();
+
+    // Claimable again — otherwise a legitimate line for the next human is silently swallowed.
+    expect(claimReceiptForDisplay("receipt-leak")).toBe(true);
   });
 });
 

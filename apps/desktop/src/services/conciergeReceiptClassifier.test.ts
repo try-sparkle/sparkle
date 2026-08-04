@@ -407,10 +407,11 @@ describe("a receipt never claims more than the spawn reply said", () => {
       agentId: "agent-77",
       agentExists: true,
       briefed: false,
-      briefFailure: "its terminal never came up",
+      briefFailure: 'I created the agent, but its terminal didn\'t start — the pty never came up — so its opening brief hasn\'t gone in yet. Its brief is still attached, so "Start again" on that agent will send it; nothing needs re-typing.'.replace(/^/, ""),
     });
     expect(r?.ok).toBe(true);
-    expect(r?.reason).toBe("its terminal never came up");
+    // The REAL paragraph, carried through unchanged — the renderer is what makes it read as prose.
+    expect(r?.reason).toContain("I created the agent, but its terminal didn't start");
   });
 
   it("a clean spawn carries no caveat — the positive control", () => {
@@ -443,8 +444,48 @@ describe("a terminal send never claims delivery the dispatch did not make", () =
     expect(send({ path: "free-text", agentId: "a1" })?.channel).toBe("terminal");
   });
 
-  it("a PICKER-OPTION send earns no receipt — it pressed a button, it did not send a message", () => {
-    // TERMINAL_RULES already refuses a receipt for select_picker_option on exactly this ground.
-    expect(send({ path: "picker-option", agentId: "a1" })).toBeNull();
+  it("a PICKER-OPTION send is still recorded — it wrote to the PTY", () => {
+    // CORRECTED (roborev 57951). The first version returned null here, which over-corrected: the
+    // path returns ok and really does press a button on the human's behalf, so suppressing the
+    // receipt hid an action that happened. It is flagged instead, and worded differently.
+    const r = send({ path: "picker-option", agentId: "a1" });
+    expect(r).not.toBeNull();
+    expect(r?.viaPicker).toBe(true);
+  });
+});
+
+// ══ THE PICKER PRESS EARNS A RECEIPT (roborev 57951) ═══════════════════════════════════════════
+// The first fix suppressed it entirely, which was an over-correction: `path: "picker-option"`
+// returns ok and really does write to the PTY (it presses a button on the human's behalf). Hiding
+// an action that happened is the false negative this module exists to prevent — it just must not be
+// called "sent a message".
+describe("a picker press is recorded, and is not called a message", () => {
+  it("emits a receipt flagged viaPicker", () => {
+    const r = classifyConciergeActionReceipt({
+      domain: "terminal",
+      op: "send_to_agent_terminal",
+      args: { agentId: "a1", text: "yes" },
+      ok: true,
+      data: { path: "picker-option", agentId: "a1" },
+      reason: undefined,
+      id: "receipt-1",
+      at: 1,
+    });
+    expect(r).not.toBeNull();
+    expect(r).toMatchObject({ kind: "sent", viaPicker: true });
+  });
+
+  it("an ordinary send is NOT flagged — the positive control", () => {
+    const r = classifyConciergeActionReceipt({
+      domain: "terminal",
+      op: "send_to_agent_terminal",
+      args: { agentId: "a1", text: "hi" },
+      ok: true,
+      data: { path: "free-text", agentId: "a1" },
+      reason: undefined,
+      id: "receipt-2",
+      at: 1,
+    });
+    expect(r?.viaPicker).toBeUndefined();
   });
 });
