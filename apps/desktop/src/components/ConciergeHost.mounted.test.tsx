@@ -108,10 +108,39 @@ const RUNTIME = {
   workflowState: {},
   branchStatus: {},
 };
+// ══ THE APP-OWNED SPARKLE AGENT HAS TO BE RESOLVABLE (beads sparkle-k5kit / sparkle-l6mgg) ══════
+// Without this, nothing in this file can test the Improve-Sparkle row at all — and three attempts to
+// do so silently measured the fixture instead of the code.
+//
+// That agent is DELIBERATELY never a member of any project's `agents` array (knownAgents.ts), so it
+// cannot be put in `FEED`. `isPromptableTarget` reaches it through a second arm — `findKnownAgent(id)
+// ?.source === "sparkle"` — and `agentStillExists` follows the same path. Unmocked, both say "no such
+// agent", so a send aimed at it is reduced to "no usable aim" BEFORE any routing decision matters:
+// `addressable` is false either way and every assertion passes with the fix reverted.
+//
+// `importOriginal` rather than a hand-written module: only `findKnownAgent` needs steering, and
+// stubbing the rest would silently change `knownAgentLiveness`/`openAgentIdSet` for every other row
+// in this file.
+vi.mock("../services/knownAgents", async (importOriginal) => {
+  const real = await importOriginal<typeof import("../services/knownAgents")>();
+  return {
+    ...real,
+    findKnownAgent: (agentId: string) =>
+      agentId.startsWith("__sparkle_self__")
+        ? { id: agentId, name: "Sparkle", source: "sparkle" as const }
+        : real.findKnownAgent(agentId),
+  };
+});
+
 vi.mock("../stores/runtimeStore", () => ({
   useRuntimeStore: Object.assign((sel: (s: typeof RUNTIME) => unknown) => sel(RUNTIME), {
     getState: () => RUNTIME,
   }),
+  // Both are reached only once a SPARKLE-namespace agent is the selected target — that pane
+  // registers itself into the shared open-agent set on mount. No row asserts on them; they are here
+  // so the component can render that state at all, which it could not before.
+  mergeOpenAgentIds: vi.fn(),
+  readPersistedOpenAgentIds: vi.fn(() => []),
 }));
 
 import { ConciergeHost, type ConciergePromptTarget } from "./ConciergeHost";
@@ -123,6 +152,7 @@ import { useProjectStore } from "../stores/projectStore";
 import { MOUNTED_THREAD_TESTID } from "./Concierge/MountedAgentThread";
 import { MOUNTED_NOTICE_TESTID } from "./Concierge/MountedNotice";
 import { CONCIERGE_THREAD_TESTID } from "../engine/composeBoxHeight";
+import { SPARKLE_AGENT_ID, SPARKLE_AGENT_NAME } from "../services/sparkleAgent";
 
 function agent(id: string, name: string) {
   return {
@@ -251,6 +281,75 @@ async function elapse() {
 function mount() {
   return render(<ConciergeHost feed={FEED} promptTarget={MOUNTED} />);
 }
+
+/** The APP-OWNED Improve-Sparkle agent as the SELECTED row. Real constants, imported rather than
+ *  spelled out, because the bug is a consequence of those exact values: `isSparkleAgentId` matches
+ *  the id, and the name is the literal "Sparkle". */
+const SPARKLE_TARGET: ConciergePromptTarget = {
+  projectId: "sparkle-self",
+  agentId: SPARKLE_AGENT_ID,
+  name: SPARKLE_AGENT_NAME,
+};
+
+function selectSparkleRow() {
+  return render(<ConciergeHost feed={FEED} promptTarget={SPARKLE_TARGET} />);
+}
+
+// ══ FOCUS IS NOT A MOUNT (beads sparkle-k5kit, sparkle-l6mgg) ═══════════════════════════════════
+//
+// The founder worked this out himself: *"Why did I just get this? '@Sparkle has a full-screen app
+// open, so I didn't type that into it.' I THINK IT'S BECAUSE I HAD MY CURSOR IN THE IMPROVE SPARKLE
+// ROW."* — and proved it by moving the cursor out and finding Sparkle reachable again.
+//
+// NOTHING WAS MOUNTED. `mountAddress` fired on `isSparkleAgentId(targetRef.current.agentId)` alone,
+// with no cable check, so merely SELECTING that row built an aim at it and `deliver` read ITS screen.
+// Improve Sparkle is always-on, so his cursor resting there cost him the concierge entirely.
+//
+// THE INVARIANT: once the destination resolves to the concierge there is no screen to check — it has
+// no PTY and no alternate buffer — so that refusal must be UNREACHABLE, not merely rare.
+describe("ConciergeHost — a concierge-bound message is never screen-checked", () => {
+  /** A screen that genuinely BLOCKS a write — vim on the alternate buffer.
+   *
+   *  NOT a busy Claude Code, deliberately. PR #1143 taught the guard to recognise Claude Code, so a
+   *  busy one no longer refuses at all: a fixture built from the founder's own screenshot makes these
+   *  rows VACUOUS, which a first cut of them did. His exact symptom is therefore already mitigated for
+   *  a RECOGNISED Claude Code; what survives is the structural defect underneath — the screen check is
+   *  aimed by FOCUS rather than by the mount — and it still bites on every screen that does block. */
+  const BLOCKING = { text: "~\n~\n~\n:", alternateBuffer: true };
+
+  it("reaches the concierge with the cursor in a blocked Improve Sparkle row and nothing mounted", async () => {
+    h.wired.mockReturnValue("off");
+    selectSparkleRow();
+    h.viewport.mockReturnValue(BLOCKING);
+    await send("here is a long thought for you about the roadmap");
+    await elapse();
+    expect(h.dispatchConciergeAnswer).not.toHaveBeenCalled();
+    expect(h.startConciergeTurn).toHaveBeenCalledTimes(1);
+  });
+
+  it("says nothing about a full-screen app, since the concierge has no screen", async () => {
+    h.wired.mockReturnValue("off");
+    selectSparkleRow();
+    h.viewport.mockReturnValue(BLOCKING);
+    await send("here is a long thought for you about the roadmap");
+    await elapse();
+    expect(screen.getByTestId(CONCIERGE_THREAD_TESTID).textContent ?? "").not.toContain(
+      "full-screen app",
+    );
+  });
+
+  // THE OTHER HALF — sparkle-0rf5 must survive. That pane has no composer of its own and
+  // `routeMessage` never aims at a PTY, so while it IS mounted the concierge box is the only way into
+  // its terminal. The cable gate must narrow `mountAddress` to the mount, not remove it.
+  it("still routes into Improve Sparkle's terminal while it IS mounted", async () => {
+    h.wired.mockReturnValue("left");
+    selectSparkleRow();
+    await send("carry on with the retry work");
+    await elapse();
+    expect(h.dispatchConciergeAnswer).toHaveBeenCalledTimes(1);
+    expect(h.dispatchConciergeAnswer.mock.calls[0]![0]).toBe(SPARKLE_AGENT_ID);
+  });
+});
 
 // ══ THE PRECONDITION EVERY OTHER ROW RESTS ON ═══════════════════════════════════════════════════
 // Asserted FIRST and on its own, because the first cut of this suite silently failed it: the column
