@@ -82,6 +82,24 @@ interface BeadsState {
 // One interval per project, kept out of store state so timers never serialize / re-render.
 const timers = new Map<string, ReturnType<typeof setInterval>>();
 /**
+ * Projects with a `refresh` currently in flight — the per-project CONCURRENCY-1 guard.
+ *
+ * ══ WHY: THE LOCK CONVOY ═══════════════════════════════════════════════════════════════════════
+ * `refresh` shells out to `bd list --all` + `bd blocked`, which read the shared embedded store.
+ * When a scan takes LONGER than the poll interval — the store is under write contention and has
+ * grown large — the next tick would fire anyway and spawn ANOTHER overlapping pair. Those contend
+ * on the store's single lock, so each slows the others, scan time grows, and more ticks stack: a
+ * self-sustaining convoy that can pile up dozens of `bd` subprocesses and wedge the store for the
+ * whole app AND every CLI sharing it.
+ *
+ * The guard caps the poll path at one in-flight refresh per project. Polling is idempotent, so an
+ * overlapping tick is DROPPED, not queued — the next un-blocked tick reads the latest state anyway.
+ * Placed here in `refresh` (the single CLI chokepoint) so every caller — immediate fire, interval,
+ * and the visibility-refresh listener — is covered by one guard rather than three. Kept out of
+ * store state for the same reason as `timers`: bookkeeping, not rendered data.
+ */
+const refreshInFlight = new Set<string>();
+/**
  * How many mounted viewers currently want each project polled.
  *
  * ══ WHY COUNTING, AND NOT JUST "ONE TIMER PER PROJECT" ══════════════════════════════════════════
@@ -150,6 +168,12 @@ export const useBeadsStore = create<BeadsState>()((set) => ({
       }));
       return;
     }
+    // IN-FLIGHT GUARD (see `refreshInFlight`): at most one refresh per project at a time. A poll
+    // tick that fires while a prior refresh is still shelling out to `bd` is DROPPED here, not
+    // queued — polling is idempotent, so the next un-blocked tick reads the latest state. This is
+    // what breaks the Dolt lock convoy: overlapping ticks can no longer stack `bd list --all`s.
+    if (refreshInFlight.has(projectId)) return;
+    refreshInFlight.add(projectId);
     set((s) => ({ loading: { ...s.loading, [projectId]: true } }));
     try {
       // CONCURRENTLY, not in sequence. `list_beads` is the 5s-poll hot path the perf work in
@@ -209,6 +233,11 @@ export const useBeadsStore = create<BeadsState>()((set) => ({
         loading: { ...s.loading, [projectId]: false },
         error: { ...s.error, [projectId]: e instanceof Error ? e.message : String(e) },
       }));
+    } finally {
+      // Release the guard whether the poll succeeded, failed, or self-healed. The `return`s inside
+      // the catch still run this, so a failed scan can never leave a project permanently blocked
+      // from ever refreshing again.
+      refreshInFlight.delete(projectId);
     }
   },
 
@@ -263,6 +292,14 @@ export const useBeadsStore = create<BeadsState>()((set) => ({
       return;
     }
     viewers.delete(projectId);
+    // Release any in-flight refresh claim on full teardown. `bd` reads are UNBOUNDED (run_bd is a
+    // bare Command::output with no timeout), so a scan blocked on the wedged store's lock can never
+    // settle — its `finally` never runs and the guard would stay latched for the app session. Only
+    // the last viewer leaving clears it (the timer is gone too, so no tick can overlap): a board
+    // remount then fires a fresh refresh and recovers, instead of the project staying frozen. This
+    // also keeps the module-scope guard from leaking a latched id between test cases, since the
+    // afterEach drains via stopPolling.
+    refreshInFlight.delete(projectId);
     const timer = timers.get(projectId);
     if (timer !== undefined) {
       clearInterval(timer);

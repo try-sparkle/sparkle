@@ -41,9 +41,18 @@ import { useSettingsStore } from "./settingsStore";
 /** How many times `bd list` has been asked for, i.e. how many polls actually happened. */
 const polls = () => listBeads.mock.calls.length;
 
-/** Advance one full poll interval. */
-function tick() {
-  vi.advanceTimersByTime(BEADS_POLL_INTERVAL_MS);
+/** Advance one full poll interval.
+ *
+ * Awaits, and settles any in-flight refresh FIRST, because `refresh` now holds a per-project
+ * concurrency-1 guard (see `refreshInFlight` in beadsStore.ts): a tick that fires while the prior
+ * refresh is still awaiting `bd` is dropped. Real ticks are 5s apart and a scan settles in ms, so
+ * the guard is long released before the next one; a synchronous `advanceTimersByTime` never flushes
+ * that microtask, so it would leave the guard held and every tick after the first would be dropped.
+ * `advanceTimersByTimeAsync(0)` flushes the pending refresh (releasing the guard) before the real
+ * interval fires — modelling the real gap, not defeating the guard. */
+async function tick() {
+  await vi.advanceTimersByTimeAsync(0);
+  await vi.advanceTimersByTimeAsync(BEADS_POLL_INTERVAL_MS);
 }
 
 beforeEach(() => {
@@ -70,49 +79,49 @@ afterEach(() => {
 });
 
 describe("beadsStore — polling is reference counted", () => {
-  it("polls on a cadence for a single viewer", () => {
+  it("polls on a cadence for a single viewer", async () => {
     useBeadsStore.getState().startPolling("p1", "/proj");
     expect(polls()).toBe(1); // the immediate refresh
-    tick();
+    await tick();
     expect(polls()).toBe(2);
   });
 
-  it("arms only ONE timer no matter how many viewers claim it", () => {
+  it("arms only ONE timer no matter how many viewers claim it", async () => {
     useBeadsStore.getState().startPolling("p1", "/proj");
     useBeadsStore.getState().startPolling("p1", "/proj");
     // Two immediate refreshes (one per claim), but a single interval — so one tick adds one poll,
     // not two. A second timer would double the `bd` spawn rate for the life of the app.
     const before = polls();
-    tick();
+    await tick();
     expect(polls()).toBe(before + 1);
   });
 
   // THE REGRESSION. Before counting, this first release cleared the timer and the second viewer —
   // still mounted, still on screen — silently stopped receiving updates.
-  it("keeps polling when one of two viewers goes away", () => {
+  it("keeps polling when one of two viewers goes away", async () => {
     useBeadsStore.getState().startPolling("p1", "/proj");
     useBeadsStore.getState().startPolling("p1", "/proj");
     useBeadsStore.getState().stopPolling("p1");
     const before = polls();
-    tick();
+    await tick();
     expect(polls()).toBe(before + 1);
   });
 
-  it("stops once the LAST viewer goes away", () => {
+  it("stops once the LAST viewer goes away", async () => {
     useBeadsStore.getState().startPolling("p1", "/proj");
     useBeadsStore.getState().startPolling("p1", "/proj");
     useBeadsStore.getState().stopPolling("p1");
     useBeadsStore.getState().stopPolling("p1");
     const before = polls();
-    tick();
+    await tick();
     expect(polls()).toBe(before);
   });
 
-  it("a single viewer's release still stops it", () => {
+  it("a single viewer's release still stops it", async () => {
     useBeadsStore.getState().startPolling("p1", "/proj");
     useBeadsStore.getState().stopPolling("p1");
     const before = polls();
-    tick();
+    await tick();
     expect(polls()).toBe(before);
   });
 
@@ -120,19 +129,19 @@ describe("beadsStore — polling is reference counted", () => {
   // double-unmount — drives the count negative. Treating that as "still claimed" would leave a timer
   // nothing could ever stop, so the store tears down at zero OR BELOW and a later claim re-arms
   // cleanly rather than being swallowed by a negative balance.
-  it("recovers from an unmatched release rather than wedging", () => {
+  it("recovers from an unmatched release rather than wedging", async () => {
     useBeadsStore.getState().stopPolling("p1");
     useBeadsStore.getState().stopPolling("p1");
     useBeadsStore.getState().startPolling("p1", "/proj");
     const before = polls();
-    tick();
+    await tick();
     expect(polls()).toBe(before + 1);
   });
 
-  it("does not arm anything when beads are switched off", () => {
+  it("does not arm anything when beads are switched off", async () => {
     useSettingsStore.setState({ beadsEnabled: false });
     useBeadsStore.getState().startPolling("p1", "/proj");
-    tick();
+    await tick();
     expect(polls()).toBe(0);
   });
 
@@ -142,7 +151,7 @@ describe("beadsStore — polling is reference counted", () => {
   // claim, so when the user switched them on and a board armed the timer, that first viewer's
   // unmount released a claim it never took and stopped the poller for the board still on screen —
   // the frozen-board bug, reintroduced through the disabled path (roborev 57655).
-  it("a viewer that mounted while beads were OFF cannot release another viewer's claim", () => {
+  it("a viewer that mounted while beads were OFF cannot release another viewer's claim", async () => {
     useSettingsStore.setState({ beadsEnabled: false });
     useBeadsStore.getState().startPolling("p1", "/proj"); // claims, arms nothing
     useSettingsStore.setState({ beadsEnabled: true });
@@ -151,7 +160,7 @@ describe("beadsStore — polling is reference counted", () => {
     // The first viewer goes away. The second is still mounted and must still be polling.
     useBeadsStore.getState().stopPolling("p1");
     const before = polls();
-    tick();
+    await tick();
     expect(polls()).toBe(before + 1);
   });
 
@@ -199,12 +208,12 @@ describe("beadsStore — polling is reference counted", () => {
     });
   });
 
-  it("counts each project separately", () => {
+  it("counts each project separately", async () => {
     useBeadsStore.getState().startPolling("p1", "/proj");
     useBeadsStore.getState().startPolling("p2", "/other");
     useBeadsStore.getState().stopPolling("p2");
     const before = polls();
-    tick();
+    await tick();
     // p1 still polls; p2 does not. One tick, one poll.
     expect(polls()).toBe(before + 1);
     useBeadsStore.getState().stopPolling("p1");

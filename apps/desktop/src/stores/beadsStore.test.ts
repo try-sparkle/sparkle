@@ -179,6 +179,58 @@ describe("polling", () => {
   });
 });
 
+describe("in-flight guard — overlapping poll ticks coalesce to concurrency 1", () => {
+  it("drops overlapping refreshes while one is in flight, then releases once it settles", async () => {
+    vi.useFakeTimers();
+    // First scan stays PENDING (simulates a slow bd list under lock contention that outruns the
+    // 5s interval). We hold the resolver so we can decide exactly when it settles.
+    let resolveFirst: (v: Bead[]) => void = () => {};
+    const firstScan = new Promise<Bead[]>((r) => (resolveFirst = r));
+    listBeads.mockReturnValueOnce(firstScan);
+    // Every later call resolves immediately.
+    listBeads.mockResolvedValue([bead({ id: "a" })]);
+
+    // Immediate fire spawns exactly one scan; that scan is now pending.
+    useBeadsStore.getState().startPolling("p1", "/proj", 5000);
+    expect(listBeads).toHaveBeenCalledTimes(1);
+
+    // Three more ticks fire while the first scan is still in flight. Each MUST be dropped — no new
+    // `bd` subprocess. This is the side effect that proves the convoy can't form: the invocation
+    // count stays at 1, it does not climb to 4.
+    await vi.advanceTimersByTimeAsync(5000);
+    await vi.advanceTimersByTimeAsync(5000);
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(listBeads).toHaveBeenCalledTimes(1);
+
+    // The slow scan finishes and the guard releases.
+    resolveFirst([bead({ id: "a" })]);
+    await vi.advanceTimersByTimeAsync(0);
+
+    // The NEXT tick is no longer blocked — a second scan now runs. Proves the guard released rather
+    // than latching the project shut forever.
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(listBeads).toHaveBeenCalledTimes(2);
+  });
+
+  it("stopPolling releases the guard so a remount recovers a scan that never settles", async () => {
+    vi.useFakeTimers();
+    // First scan HANGS forever — models `bd` blocked on the wedged store's lock (run_bd has no
+    // timeout), so the guard's `finally` never runs and the id would stay latched for the session.
+    listBeads.mockReturnValueOnce(new Promise<Bead[]>(() => {}));
+    listBeads.mockResolvedValue([bead({ id: "a" })]);
+
+    useBeadsStore.getState().startPolling("p1", "/proj", 5000);
+    expect(listBeads).toHaveBeenCalledTimes(1); // immediate scan, now hung + guard latched
+
+    // The board unmounts (last viewer) while that scan is still in flight, then remounts. Without
+    // the teardown releasing the guard this second immediate refresh would be DROPPED and the
+    // project would stay frozen; it must fire instead.
+    useBeadsStore.getState().stopPolling("p1");
+    useBeadsStore.getState().startPolling("p1", "/proj", 5000);
+    expect(listBeads).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe("tools gate — [tools].beads off means off", () => {
   it("refresh never shells out to bd and clears any prior snapshot when disabled", async () => {
     // Seed a stale snapshot (a real bucketed board), then disable Beads and refresh: no bd call,
