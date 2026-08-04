@@ -5,7 +5,8 @@
 // sits to its right, inked the color the line has reached at that stage. Stage logic lives in
 // engine/workflowStage.ts; this is purely presentational.
 import { memo } from "react";
-import { stageFraction, stageLineColor, stageMeta, LINE_FROM } from "../engine/workflowStage";
+import { stageFraction, stageLineColor, LINE_FROM } from "../engine/workflowStage";
+import { honestStageMeta, type BuildSectionId } from "../engine/buildSections";
 import type { WorkflowStageId } from "../engine/workflowStage";
 import { RADIUS } from "../theme/scale";
 
@@ -26,15 +27,25 @@ export const WorkflowLine = memo(function WorkflowLine({
   stage,
   expanded = false,
   height = 2,
+  section,
 }: {
   stage: WorkflowStageId;
   /** Row is hovered/expanded → reveal the status label to the right of the line. */
   expanded?: boolean;
   height?: number;
+  /**
+   * The rung this row was FILED under, so the line's copy cannot contradict its own header.
+   *
+   * NOT COSMETIC, and the expanded card is the case that matters most (roborev 57877): `StageChip`
+   * renders only in the COLLAPSED arm, so on the card — the row the user actually stopped on — this
+   * component is the sole stage copy, and it printed "closing now loses this work" verbatim under a
+   * header saying nothing is at risk. Passing it keeps both arms honest through one shared rule.
+   */
+  section?: BuildSectionId;
 }) {
   const frac = stageFraction(stage);
   const end = stageLineColor(stage); // the color the fill has reached (its rightmost pixel)
-  const meta = stageMeta(stage);
+  const meta = honestStageMeta(stage, section);
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 8, width: "100%", minWidth: 0 }}>
       <div

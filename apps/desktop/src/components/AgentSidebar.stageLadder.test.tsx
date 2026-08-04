@@ -431,15 +431,21 @@ describe("the `local_none` rung is actually WIRED to the column (roborev 57842)"
   });
 
   it("files a CLEAN pre-commit row under `local_none` and a DIRTY one under `local_uncommitted`", () => {
-    const project = seed([mkAgent("a1", "Cleanly"), mkAgent("a2", "Dirty")]);
+    // THE DIRTY ROW IS SEEDED FIRST, ON PURPOSE (roborev 57877). An earlier version of this test put
+    // "Cleanly" first in the array and asserted the rendered order was ["Cleanly", "Dirty"] — which
+    // `groupAgentsByStage` preserves input order within and across buckets, so that expectation was
+    // ALREADY TRUE before the split and stayed true with `holdsWorkOf` dropped entirely. It proved
+    // nothing about the claim its own comment made. With array order and section order in
+    // DISAGREEMENT, only the section split can produce the expected result.
+    const project = seed([mkAgent("a1", "Dirty"), mkAgent("a2", "Cleanly")]);
     setStages({ a1: "building_unsaved", a2: "building_unsaved" });
     setStatuses({ a1: "idle", a2: "idle" });
-    useRuntimeStore.setState({ branchStatus: { a1: bs(false), a2: bs(true) } } as never);
+    useRuntimeStore.setState({ branchStatus: { a1: bs(true), a2: bs(false) } } as never);
     render(<AgentSidebar project={project} />);
 
     expect(screen.getByTestId("stage-header-local_none")).toBeTruthy();
     expect(screen.getByTestId("stage-header-local_uncommitted")).toBeTruthy();
-    // …and the clean one sorts ABOVE the dirty one, which is the ordering the selection path shares.
+    // The clean row sorts ABOVE the dirty one despite being SECOND in the array.
     expect(renderedNames(["Cleanly", "Dirty"])).toEqual(["Cleanly", "Dirty"]);
   });
 
@@ -467,6 +473,38 @@ describe("the `local_none` rung is actually WIRED to the column (roborev 57842)"
     expect(chip.getAttribute("title")).not.toMatch(/loses this work/);
     expect(chip.getAttribute("title")).toMatch(/nothing here is at risk/);
     expect(chip.textContent).not.toBe("Unsaved");
+  });
+
+  it("the expanded CARD receives the section — the wiring, not just the rule", () => {
+    // roborev 57902. WorkflowLine's own tests cover the copy RULE, but nothing asserted that
+    // AgentSidebar actually passes `rowSection` to it: deleting the prop left the whole suite green.
+    // An unverified path is exactly how this lie survived two previous fixes, so the wiring gets its
+    // own end-to-end assertion, mutation-checked by removing the prop.
+    //
+    // The card opens on RIGHT click (`onContextMenu={openCard}`), not hover-in-jsdom.
+    const project = seed([mkAgent("a1", "Cleanly")]);
+    setStages({ a1: "building_unsaved" });
+    setStatuses({ a1: "idle" });
+    useRuntimeStore.setState({ branchStatus: { a1: bs(false) } } as never);
+    render(<AgentSidebar project={project} />);
+
+    fireEvent.contextMenu(screen.getByText("Cleanly"));
+    const line = screen.getByTestId("card-workflow-line");
+    expect(line.textContent).not.toMatch(/loses this work/);
+    expect(line.textContent).toMatch(/nothing here is at risk/);
+  });
+
+  it("…and the card still WARNS on a genuinely dirty row", () => {
+    // The control. Without it, dropping the copy for every card line would satisfy the case above
+    // while destroying the warning the dirty row actually needs.
+    const project = seed([mkAgent("a1", "Dirty")]);
+    setStages({ a1: "building_unsaved" });
+    setStatuses({ a1: "idle" });
+    useRuntimeStore.setState({ branchStatus: { a1: bs(true) } } as never);
+    render(<AgentSidebar project={project} />);
+
+    fireEvent.contextMenu(screen.getByText("Dirty"));
+    expect(screen.getByTestId("card-workflow-line").textContent).toMatch(/loses this work/);
   });
 
   it("STILL says unsaved on a genuinely dirty row — the override is not blanket", () => {

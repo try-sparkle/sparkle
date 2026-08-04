@@ -103,6 +103,8 @@ import {
   bandOfStatus,
   flattenSections,
   groupAgentsByStage,
+  honestStageMeta,
+  sectionOfRow,
   type BuildSectionId,
   type StatusBand,
 } from "../engine/buildSections";
@@ -159,7 +161,6 @@ import {
   rollupStages,
   stageFraction,
   stageIndex,
-  stageMeta,
   uncommittedWorkEvidence,
 } from "../engine/workflowStage";
 import type { WorkflowStageId } from "../engine/workflowStage";
@@ -2541,6 +2542,14 @@ export function AgentSidebar({
                 autoTitle: w.autoNameVariants?.title?.trim() || null,
                 description: w.autoNameVariants?.description?.trim() || "",
                 stage: stageOf(w.id) as WorkflowStageId | null,
+                // The worker's OWN rung, so its card line cannot claim unsaved work it does not have
+                // (roborev 57902). Computed here rather than in the renderer because both inputs are
+                // already in hand at this site — the head row's `rowSection` describes the HEAD, and
+                // handing that to a worker would be a different wrong answer.
+                section: sectionOfRow(
+                  stageOf(w.id) as WorkflowStageId,
+                  uncommittedWorkEvidence(branchStatus[w.id]),
+                ),
                 status: wst,
                 statusColor: wcolor,
                 branchStatus: branchStatus[w.id],
@@ -3581,37 +3590,6 @@ function ElapsedTimer({ since, now, color }: { since: number; now: number; color
  * order (scrolled past its header, or pulled up in a filtered view) and because the two disagree
  * for a head whose stage rolls up from its workers.
  */
-/**
- * The stage meta a ROW may honestly render, given the rung it was filed under.
- *
- * THE CONTRADICTION THIS EXISTS TO KILL (roborev 57842, sparkle-biezi). `sectionOfRow` files a
- * clean, commit-free row under `local_none` ("Local: Nothing Yet — nothing here is at risk"), but
- * the row itself is still at stage `building_unsaved`, whose meta reads "Unsaved" with the tooltip
- * "Building locally: unsaved changes — closing now loses this work." So the founder's original
- * complaint — copy claiming work will be lost about a row holding nothing — survived one component
- * below the heading I had just fixed, and the fixture row added to PROVE the fix was rendering the
- * contradiction in the very capture meant to demonstrate it. I photographed it and did not read it.
- *
- * ONLY `building_unsaved` IS OVERRIDDEN, and that is the point rather than a shortcut. It is the one
- * stage whose meta asserts something the `local_none` reading has just falsified. The other three
- * stages that share this rung — `thought` / `specd` / `planned` — describe planning that genuinely
- * happened and say nothing about the worktree, so a `Planned` chip under "Nothing Yet" is two true
- * statements at different altitudes, not a contradiction. Overriding those would erase real
- * information.
- *
- * Returns `stageMeta(stage)` untouched for every other row, so nothing outside this one cell moves.
- */
-function honestStageMeta(stage: WorkflowStageId, section?: BuildSectionId) {
-  const meta = stageMeta(stage);
-  if (section !== "local_none" || stage !== "building_unsaved") return meta;
-  return {
-    ...meta,
-    label: "Nothing Built Yet",
-    short: "Empty",
-    detail: "No commits and no edits in the working tree — nothing here is at risk.",
-  };
-}
-
 function StageChip({
   stage,
   active,
@@ -3696,6 +3674,8 @@ type WorkerDetail = {
   onLand: () => void;
   /** Select + open this worker (its inline named line and hover-card name are clickable). */
   onOpen: () => void;
+  /** The worker's own ladder rung, so its card line's copy matches its own worktree. */
+  section?: BuildSectionId;
 };
 
 // A worker's name inside the orchestrator's hover card. Clicking it opens the worker in the main
@@ -5126,8 +5106,12 @@ const AgentRow = memo(function AgentRow({
               re-encoding, in a 2px gradient, the thing the section header above it already states
               in words. Two renderings of one fact, the smaller one unreadable. */}
           {expanded && trackerStage && (
-            <div style={{ marginTop: 1 }}>
-              <WorkflowLine stage={trackerStage} expanded={expanded} />
+            // ANCHORED so an AgentSidebar-level test can prove the card actually RECEIVES
+            // `rowSection` (roborev 57902). WorkflowLine's own tests cover the copy rule, but nothing
+            // asserted the wiring — deleting `section={rowSection}` here left the whole suite green,
+            // and an unverified path is exactly how this lie survived the two previous fixes.
+            <div style={{ marginTop: 1 }} data-testid="card-workflow-line">
+              <WorkflowLine stage={trackerStage} expanded={expanded} section={rowSection} />
             </div>
           )}
           {/* NOTE: the per-worker progress lines no longer render in the collapsed column row — the
@@ -5321,7 +5305,7 @@ const AgentRow = memo(function AgentRow({
                   stage status label the orchestrator's bar gets. */}
               {w.stage && (
                 <div style={{ marginTop: 2 }}>
-                  <WorkflowLine stage={w.stage} expanded />
+                  <WorkflowLine stage={w.stage} expanded section={w.section} />
                 </div>
               )}
               <AgentDetailLines

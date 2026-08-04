@@ -12,7 +12,7 @@
 //
 // Kept free of React so it's unit-tested in isolation; the rendering lives in AgentSidebar.tsx.
 import type { AgentTabStatus } from "../types";
-import { type WorkflowStageId } from "./workflowStage";
+import { stageMeta, type WorkflowStageId, type WorkflowStageMeta } from "./workflowStage";
 
 // ── The ladder ───────────────────────────────────────────────────────────────────────────────
 export type BuildSectionId =
@@ -219,6 +219,46 @@ export function sectionOfRow(
 // it drove a "local only" row qualifier that would therefore have lied to exactly the users the
 // Local/Remote split exists to reassure. If you want that qualifier back, gate it on the PUSH signal
 // — `BranchStatus`/`WorkflowState`, which only the caller has — not on the stage id alone.
+
+/**
+ * The stage meta a ROW may honestly render, given the rung it was filed under.
+ *
+ * THE CONTRADICTION THIS EXISTS TO KILL (roborev 57842 / 57877, sparkle-biezi). `sectionOfRow` files
+ * a clean, commit-free row under `local_none` ("Local: Nothing Yet — nothing here is at risk"), but
+ * the row itself is still at stage `building_unsaved`, whose meta reads "Unsaved" with the detail
+ * "Building locally: unsaved changes — closing now loses this work." So the founder's original
+ * complaint — copy claiming work will be lost about a row holding nothing — kept surviving one
+ * component below whatever I had just fixed.
+ *
+ * IT TOOK THREE PASSES TO STOP MOVING, which is why this now lives in the engine rather than beside
+ * one component. First the section header was fixed and the collapsed row's `StageChip` still lied.
+ * Then the chip was fixed and the EXPANDED card's `WorkflowLine` still lied — in larger text, on the
+ * row the user had actually stopped on, and reached by a different code path that called
+ * `stageMeta` directly. A rule that two components must apply cannot live inside one of them.
+ * Every renderer of stage copy on a row goes through here.
+ *
+ * ONLY `building_unsaved` IS OVERRIDDEN, and that is the point rather than a shortcut. It is the one
+ * stage whose meta asserts something the `local_none` reading has just falsified. The other three
+ * stages sharing that rung — `thought` / `specd` / `planned` — describe planning that genuinely
+ * happened and say nothing about the worktree, so a `Planned` chip under "Nothing Yet" is two true
+ * statements at different altitudes, not a contradiction. Overriding those would erase real
+ * information.
+ *
+ * Returns `stageMeta(stage)` untouched for every other row, so nothing outside this one case moves.
+ */
+export function honestStageMeta(
+  stage: WorkflowStageId,
+  section?: BuildSectionId,
+): WorkflowStageMeta {
+  const meta = stageMeta(stage);
+  if (section !== "local_none" || stage !== "building_unsaved") return meta;
+  return {
+    ...meta,
+    label: "Nothing Built Yet",
+    short: "Empty",
+    detail: "No commits and no edits in the working tree — nothing here is at risk.",
+  };
+}
 
 // ── Status bands (the filter) ────────────────────────────────────────────────────────────────
 // The three buckets the filter chips toggle. These are EXACTLY the three color tiers in
