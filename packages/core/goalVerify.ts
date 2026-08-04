@@ -390,13 +390,16 @@ export interface GoalVerifyEvidence {
    * ── WHY TWO BITS AND NOT ONE (roborev 57827) ─────────────────────────────────────────────────
    * There are THREE populations, and collapsing them to a boolean is wrong in one direction or the
    * other whichever way you fold it:
-   *   1. chosen for this goal — a real sign-off. Never invite its removal.
-   *   2. carried across a RESTATEMENT of the same work — a real sign-off too, just re-worded.
-   *      Agents restate constantly (`continuePrompt` replays goal text), so this is the LARGEST
-   *      bucket, and treating it as un-chosen offered to drop a founder's approval one paraphrase in.
-   *   3. manufactured, or carried onto genuinely unrelated work — nobody chose it for what the agent
-   *      is doing. This is the sparkle-vfkqz population the take-back exists for.
+   *   1. chosen for THIS goal — a real sign-off, on this work. Never invite its removal.
+   *   2. carried over from a goal a caller DID choose it for. That earlier goal may be a paraphrase
+   *      of this one or unrelated work — **nothing records which** (`chargeGoalDebt` compares only
+   *      the inferred kind), so this arm must not claim either. It says the check stands unless it
+   *      does not fit, and still names the exit.
+   *   3. manufactured, or nothing recorded — nobody chose it at all.
    * `stated` separates 3 from 1+2; `chosenHere` separates 1 from 2. Both are needed.
+   *
+   * Arms 2 and 3 both name the concierge take-back, deliberately: withholding it from 2 on a guess
+   * about restatement is what swallowed the sparkle-vfkqz population (roborev 57832).
    */
   chosenHere?: boolean | undefined;
 }
@@ -505,25 +508,49 @@ export function selfMarkRefusal(verify: GoalVerify, evidence?: GoalVerifyEvidenc
       // toward its own removal.
       //
       // The caller holds the provenance the copy was asking the agent to guess, so it is passed in.
-      // The take-back is mentioned only when the check is NOT confirmed caller-chosen, and even then
-      // as the secondary exit.
+      // The take-back is withheld ONLY from a check chosen for THIS goal — the one case where a
+      // caller demonstrably bound itself to this work. Everywhere else it is named, always as the
+      // secondary exit behind reporting completion.
       const base =
         "This goal is verified by a person, so you cannot mark it met. Say what you finished and " +
         "why you believe it satisfies the goal, and leave it for the human to close — that report " +
         "is what closes it.";
-      // THREE POPULATIONS, THREE SENTENCES (roborev 57827). A single boolean got one of them wrong
-      // whichever way it folded: keyed on "ever chosen" it withheld the exit from inherited checks,
-      // and keyed on "chosen here" it offered to drop a founder's sign-off one PARAPHRASE later —
-      // and restating a goal is something agents do constantly.
+      // THREE POPULATIONS, THREE SENTENCES (roborev 57827, resolved by 57832). A single boolean got
+      // one of them wrong whichever way it folded — keyed on "ever chosen" it withheld the exit from
+      // inherited checks; keyed on "chosen here" it withheld nothing but over-claimed a restatement.
+      //
+      // WHERE THAT LANDED: arms 2 and 3 BOTH name the take-back, because restatement-vs-unrelated is
+      // not recorded anywhere (`chargeGoalDebt` compares only the inferred kind) and withholding an
+      // exit on that guess is what stranded the sparkle-vfkqz population. What still differs between
+      // them is only what each may honestly SAY about who chose the check.
       if (evidence?.chosenHere === true) return base;
       if (evidence?.stated === true) {
-        // Carried from a check a caller really did choose, across a restatement. Still a genuine
-        // sign-off, so no take-back is offered — only a way to flag a mismatch.
+        // CARRIED FROM A CHECK A CALLER CHOSE — for work that may or may not be this work.
+        //
+        // ⚠️ THIS ARM MAY NOT CLAIM "you restated it" (roborev 57832). Nothing records that:
+        // `chargeGoalDebt` compares only the inferred KIND, and an owed `human` inherits on any text
+        // that is not landing-shaped — a paraphrase and a completely unrelated goal alike. The first
+        // version asserted the restatement anyway AND withheld the take-back on the strength of it,
+        // which swallowed the sparkle-vfkqz population whole: an agent given genuinely new work
+        // under an inherited check was told its goal "restates" work it had never seen, and offered
+        // no door. A refusal that misdescribes the mechanism is worse than none.
+        //
+        // So it says only what is RECORDED — some CALLER chose this check for an earlier goal, not
+        // this one — and still names the exit. The distinction from the manufactured arm below is
+        // real but narrow: there, nobody chose the check at all.
+        //
+        // "a caller", NEVER "a person" (roborev 57840). Only `verifyStated` is recorded, and
+        // `set_agent_goal` is reachable by the agent itself and by an orchestrator over its own
+        // subtree — self-binding is an advertised path ("you may bind yourself harder"), so a
+        // stated `human` is often the agent's OWN choice. Asserting a person signed off is the same
+        // over-claim as "this goal restates", one clause down, and it is the sentence most likely to
+        // stop an agent asking for the take-back the next sentence offers.
         return (
           base +
-          " This check was chosen for earlier work that this goal restates, so it still stands. If " +
-          "it no longer fits what you are actually doing, say so in your report rather than " +
-          "assuming it carries over."
+          " This check was carried over from an earlier goal a caller chose it for — not this one — " +
+          "so it stands unless it does not fit what you are actually doing. If it does not, say so " +
+          "in your report and the concierge can drop it with `verify: null`. That take-back is " +
+          "theirs to make, not yours."
         );
       }
       return (

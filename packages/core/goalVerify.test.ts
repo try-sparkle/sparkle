@@ -157,20 +157,31 @@ describe("canSelfMarkMet — the self-report gate", () => {
   });
 
   it("the HUMAN refusal has THREE arms — one per provenance population", () => {
-    // roborev 57827. A single boolean is wrong in one direction whichever way it folds: keyed on
-    // "ever chosen" it withholds the exit from inherited checks (57825); keyed on "chosen here" it
-    // offers to drop a founder's sign-off one PARAPHRASE later, and restating a goal is something
-    // agents do constantly. So: chosen-here → nothing extra; carried across a restatement → say it
-    // still stands, no take-back offered; manufactured/unknown → offer the take-back.
+    // roborev 57827, resolved by 57832. The arms differ in what each may honestly SAY, not in
+    // whether the exit exists: chosen-here → nothing extra (a caller bound itself to THIS work);
+    // carried → say a caller chose it for an EARLIER goal, and still name the exit; manufactured or
+    // unknown → say nobody is recorded as choosing it, and name the exit. Only the first withholds,
+    // because restatement-vs-unrelated is not recorded and withholding on that guess strands the
+    // population the exit exists for.
     const here = selfMarkRefusal({ kind: "human" }, { stated: true, chosenHere: true });
     const carried = selfMarkRefusal({ kind: "human" }, { stated: true, chosenHere: false });
     const made = selfMarkRefusal({ kind: "human" }, { stated: false, chosenHere: false });
 
+    // Only the check chosen for THIS goal withholds the exit — the one case where a caller
+    // demonstrably bound itself to this work.
     expect(here).not.toMatch(/verify: null/);
-    // THE CASE THIS ARM EXISTS FOR: a real sign-off, merely re-worded, must not be routed toward
-    // its own removal.
-    expect(carried).not.toMatch(/verify: null/);
-    expect(carried).toMatch(/still stands/i);
+    // The carried arm NAMES the exit (roborev 57832): nothing records whether the earlier goal was
+    // a paraphrase or unrelated work, so withholding it on that guess swallows the population the
+    // exit exists for. It also must not CLAIM a restatement it cannot know.
+    expect(carried).toMatch(/verify: null/);
+    expect(carried).toMatch(/carried over from an earlier goal/i);
+    expect(carried).not.toMatch(/restates/i);
+    // …but it is still distinguishable from the manufactured arm: a caller did choose it, once.
+    expect(carried).not.toEqual(made);
+    // NEVER "a person" — only `verifyStated` is recorded, and an agent may bind itself, so claiming
+    // a human signed off is the same over-claim as "restates" one clause down (roborev 57840).
+    expect(carried).not.toMatch(/a person chose/i);
+    expect(made).not.toMatch(/a person chose/i);
     expect(made).toMatch(/verify: null/);
 
     // All three keep the ordinary path primary.
@@ -182,7 +193,7 @@ describe("canSelfMarkMet — the self-report gate", () => {
     expect(selfMarkRefusal({ kind: "human" })).toMatch(/verify: null/);
   });
 
-  it("the HUMAN refusal does NOT offer a take-back on a check a caller actually chose", () => {
+  it("the HUMAN refusal does NOT offer a take-back on a check chosen for THIS goal", () => {
     // roborev 57819. The take-back sentence used to be gated on "if this check was not one you
     // chose" — a question the agent provably cannot answer, and true for every worker under a
     // concierge-set sign-off. A remedy string is an instruction the agent will follow, so that

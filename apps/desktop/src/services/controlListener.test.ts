@@ -1396,13 +1396,15 @@ describe("controlListener", () => {
       expect(goalOf(callerId)!.verifyInherited).toBe(true); // …but not chosen for this goal.
       fire({ reqId: "sgZ2b", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
       await flush();
-      // roborev 57827: a check CARRIED from one a caller really chose is still a real sign-off, so
-      // this arm says it stands rather than inviting its removal — the take-back belongs to the
-      // manufactured population below. Offering it here would route a founder's approval toward
-      // being dropped one restatement after it was set.
+      // roborev 57832: this goal ("the parser cleanup…") is UNRELATED to the one the check was
+      // chosen for, and nothing in the system can tell that from a paraphrase — `chargeGoalDebt`
+      // compares only the inferred kind. So the carried arm must still name the exit, or the
+      // sparkle-vfkqz population is swallowed exactly here. An earlier version withheld it and
+      // claimed "this goal restates" the earlier work, which is false for this very fixture.
       const carried = String((lastReply() as { error?: string }).error);
-      expect(carried).not.toMatch(/verify: null/);
-      expect(carried).toMatch(/still stands/i);
+      expect(carried).toMatch(/verify: null/);
+      expect(carried).toMatch(/carried over from an earlier goal/i);
+      expect(carried).not.toMatch(/restates/i);
 
       // A MANUFACTURED (different-kind) fallback gets it too — the other half of the population.
       const other = useProjectStore.getState().addAgent(projectId, { kind: "build" })!;
