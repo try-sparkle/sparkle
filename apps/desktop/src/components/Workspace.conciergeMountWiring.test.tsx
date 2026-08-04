@@ -133,6 +133,9 @@ import { useSettingsStore } from "../stores/settingsStore";
 import { useConnectionStore } from "../stores/connectionStore";
 import { resetVisitedProjects } from "../services/sessionProjects";
 import { resetCable, useCableStore } from "../stores/cableStore";
+import { registerViewport, resetViewportRegistry } from "../services/terminalViewport";
+import { startConciergeTurn } from "../services/concierge";
+import { MOUNTED_THREAD_TESTID } from "./Concierge/MountedAgentThread";
 import { armedIntents, cancelIntent, fireIntent } from "../services/dispatchIntent";
 import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
 import type { AgentTab, Project } from "../types";
@@ -227,7 +230,12 @@ beforeEach(() => {
   enableAiEnhancementsForTests();
   resetVisitedProjects();
   resetCable();
+  // The viewport registry is a module singleton, so a screen left registered by one case would
+  // silently decide the guard's answer in the next — the exact class of cross-case leak the intent
+  // queue is cancelled for below.
+  resetViewportRegistry();
   disp.dispatchConciergeAnswer.mockClear();
+  vi.mocked(startConciergeTurn).mockClear();
 });
 afterEach(() => {
   // An armed countdown outlives its render (the intent registry is a module singleton) — cancel any
@@ -286,24 +294,53 @@ describe("the mount reaches the concierge column, through the real host", () => 
   });
 });
 
-// ══ THE ROUTING HALF THE MOUNT WIRING NEVER PINNED (bead sparkle-0rf5) ══════════════════════════
+// ══ THE ROUTING HALF THE MOUNT WIRING NEVER PINNED (beads sparkle-0rf5, sparkle-gw8yi) ══════════
 //
 // The suite above pins the PRESENTATIONAL wire and its own header disclaims the rest: "It does NOT
 // pin that a mounted message is ROUTED to the mounted agent … That is the unbuilt half, and … gets
 // its own coverage when the routing work lands." This is that coverage, for the Improve-Sparkle
-// surface specifically. Two facts the store getter cannot show, both asserted THROUGH the shell:
+// surface specifically.
 //
-//   1. the cable LIGHTS on the app-owned Sparkle mount even with ZERO build agents — the
-//      `project.agents === []` case the bead names, where the old projection forced the side back to
-//      "off" and the mount was a visual no-op;
-//   2. a send ROUTES into the Sparkle agent's terminal — asserted at the PTY dispatcher, the far end
-//      of the shell/dispatch path, not at any intermediate store.
+// ══ THE FOUR CELLS, AND WHY THEY ARE ALL HERE ═══════════════════════════════════════════════════
+// The founder's contract, both halves, verbatim: *"When that row is mounted … If I'm typing into
+// Sparkle with the row mounted, it should be going into that terminal JUST LIKE WITH ANY OTHER BUILD
+// AGENT"* and *"If I've escaped and unmounted out, but I can still see the row, then I should be able
+// to communicate with Sparkle."* Two of the four combinations were never covered, and that is how a
+// P0 survived six PRs on this cluster:
 //
-// The Sparkle pane is the active surface (`activeSpecial === "sparkle"`), its id is in the shared
-// open set so it resolves as a live local PTY (services/knownAgents), and the cable is patched — the
-// exact state `AgentSidebar.onSelectSparkle` leaves behind.
+//   MOUNTED, plain text          → the Sparkle agent's terminal
+//   MOUNTED, leading @Sparkle    → the concierge (the escape hatch)
+//   NOT MOUNTED, pane on screen  → the concierge   ← THE BUG HE PROVED HIMSELF
+//   NOT MOUNTED, looking away    → the concierge
+//
+// Two of them run with the agent's screen in a state the write-guard REFUSES (a `vim` alternate
+// buffer). That is not incidental: the defect was the guard being consulted for a message bound for
+// the concierge, and a cell that runs against a permissive screen cannot see it. The concierge is not
+// a PTY — it has no screen — so no screen state may change where these land.
+//
+// A VIEWPORT IS REGISTERED because the pane is on screen in every one of these states, and
+// `SparkleAgentPane` is stubbed to null in this file (so nothing else would register one). Without it
+// every mounted case refuses with `no-viewport` and the suite pins nothing about routing at all.
+//
+// WHICH CELL IS LOAD-BEARING, stated because the mutation says so and a reader should not have to
+// re-run it: restoring the removed `mountAddress` reddens CELL 3 and nothing else. Cell 2's escape
+// hatch sets `via: "address"`, which suppressed the old special case anyway, and cell 4 has no prompt
+// target to build one from — both are NON-REGRESSION guards, kept because they are two of the four
+// combinations the founder named and their silence is what a future change must not break.
 describe("the Improve-Sparkle mount routes to the Sparkle agent, through the real shell", () => {
-  function mountSparkle(agents: AgentTab[], selectedAgentId: string | null = null) {
+  /** A calm Claude Code prompt — the ordinary state, which the write-guard permits. */
+  const CLEAN_SCREEN = { text: "> \n", alternateBuffer: false };
+  /** A genuine full-screen app. `isClaudeCodeScreen` rejects it (none of its marker families are
+   *  drawn), so `terminalWriteRefusal` returns `alternate-screen` — a REAL refusal, not the
+   *  busy-Claude-Code false positive PR #1143 removed. */
+  const VIM_SCREEN = { text: '~\n~\n"notes.md" 12L, 340B', alternateBuffer: true };
+
+  function mountSparkle(
+    agents: AgentTab[],
+    selectedAgentId: string | null = null,
+    opts: { cable?: boolean; paneUp?: boolean; screen?: { text: string; alternateBuffer: boolean } } = {},
+  ) {
+    const { cable = true, paneUp = true, screen = CLEAN_SCREEN } = opts;
     useProjectStore.setState({
       projects: [mkProject("p1", "Alpha", agents, selectedAgentId)],
       selectedProjectId: "p1",
@@ -313,7 +350,7 @@ describe("the Improve-Sparkle mount routes to the Sparkle agent, through the rea
       status: {},
     } as never);
     useUiStore.setState({
-      activeSpecial: "sparkle",
+      activeSpecial: paneUp ? "sparkle" : null,
       workModeBySide: { left: "build", right: "build" },
       pinnedProjectId: null,
       openProjectIds: null,
@@ -321,8 +358,12 @@ describe("the Improve-Sparkle mount routes to the Sparkle agent, through the rea
       leftProjectId: null,
       collapsedOrchestrators: {},
     } as never);
-    // What the click leaves behind: the cable patched into the pair the row sits in.
-    act(() => useCableStore.getState().patch("right"));
+    // The pane's own terminal, which is what makes the screen readable at all.
+    registerViewport(SPARKLE_ID, () => screen);
+    // What the click leaves behind: the cable patched into the pair the row sits in. Omitted for the
+    // UNMOUNTED cells — Escape unpatches the cable and leaves the pane on screen, which is exactly
+    // the state the founder was in when he could no longer reach the concierge.
+    if (cable) act(() => useCableStore.getState().patch("right"));
     render(<Workspace />);
   }
 
@@ -343,6 +384,37 @@ describe("the Improve-Sparkle mount routes to the Sparkle agent, through the rea
     });
   }
 
+  /** Did anything on screen tell the founder his message was refused? The exact sentence he was
+   *  shown — *"@Sparkle has a full-screen app open"* — is `terminalRefusalLine`'s copy, and the
+   *  headline above it is the receipt's. Both are searched, because the refusal renders in two
+   *  places and covering one would let the other survive. */
+  const refusalOnScreen = () =>
+    /full-screen app|couldn't take it|can't take a message/i.test(
+      document.body.textContent ?? "",
+    );
+
+  // ── THE MOUNT MUST ALSO BE VISIBLE, NOT ONLY ROUTABLE (bead sparkle-gw8yi, half 1) ─────────────
+  // His words: *"When I click on the Improve Sparkle agent, I want it to MOUNT THE CONCIERGE INTO
+  // THAT AGENT just like it would a regular builder agent. THAT'S NOT HAPPENING RIGHT NOW"* — and
+  // earlier, that clicking it *"showed a mounted version of Concierge content, which is wrong."*
+  //
+  // The routing cases above cannot see this: the send reached the right terminal the whole time. What
+  // was broken is that `mountedRow` is a scan of `project.agents`, which this agent is deliberately
+  // never in, so the COLUMN never swapped and went on rendering the Sparkle conversation under a lit
+  // cable. Asserted on the mounted thread's own testid — the element that only exists when the host
+  // resolved a mounted agent.
+  it("swaps the column to the Sparkle agent's own conversation when mounted", () => {
+    mountSparkle([]);
+    expect(within(columnEl()).getByTestId(MOUNTED_THREAD_TESTID)).toBeTruthy();
+  });
+
+  it("swaps back to the concierge conversation once the cable is unpatched", () => {
+    // The other side of the same fact: unmounted, the founder is talking to Sparkle and must see the
+    // Sparkle thread. An always-on mounted view would be the reported bug pointing the other way.
+    mountSparkle([], null, { cable: false });
+    expect(within(columnEl()).queryByTestId(MOUNTED_THREAD_TESTID)).toBeNull();
+  });
+
   it("lights the cable with NO build agents — the visual no-op the bead names", () => {
     mountSparkle([]);
     // effectiveWired darkens the cable when the patched side has no selected agent; the Sparkle mount
@@ -351,6 +423,7 @@ describe("the Improve-Sparkle mount routes to the Sparkle agent, through the rea
     expect(columnWired()).toBe("right");
   });
 
+  // ── CELL 1: MOUNTED, plain text → that agent's terminal ────────────────────────────────────────
   it("routes a concierge send into the Sparkle agent's terminal, with NO build agents", async () => {
     mountSparkle([]);
     await sendToMount("tighten the retry backoff");
@@ -368,5 +441,68 @@ describe("the Improve-Sparkle mount routes to the Sparkle agent, through the rea
     await sendToMount("rename the flag");
     expect(disp.dispatchConciergeAnswer).toHaveBeenCalledTimes(1);
     expect(disp.dispatchConciergeAnswer.mock.calls[0]![0]).toBe(SPARKLE_ID);
+  });
+
+  // ── CELL 2: MOUNTED, leading @Sparkle → the concierge, WHATEVER the agent's screen shows ───────
+  it("takes the @Sparkle escape hatch out of the mount even with the agent in a full-screen app", async () => {
+    mountSparkle([], null, { screen: VIM_SCREEN });
+    await sendToMount("@Sparkle what is that agent stuck on?");
+    // The escape hatch exists FOR this state: mounted, and the founder wants the concierge instead.
+    // A screen check here is what made it unusable — the mounted agent's `vim` session vetoing a
+    // message that was never going to its terminal.
+    expect(disp.dispatchConciergeAnswer).not.toHaveBeenCalled();
+    expect(refusalOnScreen()).toBe(false);
+  });
+
+  // ── CELL 3: NOT MOUNTED, pane still on screen → the concierge. THE BUG HE PROVED. ──────────────
+  it("reaches the concierge when the pane is on screen but UNMOUNTED, however busy that agent is", async () => {
+    // Escape has unpatched the cable; the row is still visible and still the active surface. His
+    // words: *"If I've escaped and unmounted out, but I can still see the row, then I should be able
+    // to communicate with Sparkle. But I couldn't."*
+    mountSparkle([], null, { cable: false, screen: VIM_SCREEN });
+    await sendToMount("why did the last pass not open a PR?");
+    // BEFORE THE FIX: `mountAddress` was built from the prompt target, which this surface sets from
+    // `activeSpecial === "sparkle"` alone — so with no cable at all the message was still aimed at
+    // that agent's PTY, met the screen guard, and came back as "@Sparkle has a full-screen app open".
+    expect(disp.dispatchConciergeAnswer).not.toHaveBeenCalled();
+    expect(refusalOnScreen()).toBe(false);
+    // AND IT ACTUALLY REACHED THE BRAIN — "was not dispatched to a terminal" is only half the claim,
+    // and the half that a message silently dropped on the floor would also satisfy.
+    expect(vi.mocked(startConciergeTurn)).toHaveBeenCalled();
+  });
+
+  // ── AND CELL 3 REACHED THE WAY HE REACHED IT — through the real Escape handler ─────────────────
+  // The cell above SETS the unmounted state; this one ARRIVES at it. That gap is worth closing on
+  // its own: his sentence is *"If I've escaped and unmounted out, but I can still see the row"*, and
+  // a fix verified only against a hand-built state proves nothing about whether Escape produces it.
+  // So this presses the key and then asserts BOTH halves of his premise before sending — the cable is
+  // off, and the pane is still the surface he is looking at.
+  it("Escape unmounts the row but leaves it on screen — and the next message still reaches Sparkle", async () => {
+    mountSparkle([], null, { screen: VIM_SCREEN });
+    expect(columnWired()).toBe("right");
+    act(() => {
+      fireEvent.keyDown(window, { key: "Escape" });
+    });
+    expect(useCableStore.getState().wired).toBe("off");
+    // "…but I can still see the row" — Escape drops the cable, not the pane. If this ever stops
+    // holding, the case above is no longer testing the state he was in.
+    expect(useUiStore.getState().activeSpecial).toBe("sparkle");
+    await sendToMount("so what did the last improvement pass actually change?");
+    expect(disp.dispatchConciergeAnswer).not.toHaveBeenCalled();
+    expect(refusalOnScreen()).toBe(false);
+    expect(vi.mocked(startConciergeTurn)).toHaveBeenCalled();
+  });
+
+  // ── CELL 4: NOT MOUNTED, looking elsewhere → the concierge ─────────────────────────────────────
+  it("reaches the concierge when the founder is not looking at the pane at all", async () => {
+    mountSparkle([mkAgent("a1", "Stripe checkout retry")], "a1", {
+      cable: false,
+      paneUp: false,
+      screen: VIM_SCREEN,
+    });
+    await sendToMount("give me the fleet status");
+    expect(disp.dispatchConciergeAnswer).not.toHaveBeenCalled();
+    expect(refusalOnScreen()).toBe(false);
+    expect(vi.mocked(startConciergeTurn)).toHaveBeenCalled();
   });
 });

@@ -130,7 +130,11 @@ import type { MountedNoticeModel } from "./Concierge/MountedNotice";
 import { terminalWriteRefusal, type TerminalScreenRefusal } from "../voice/dictationTerminalRoute";
 import { getAgentViewport } from "../services/terminalViewport";
 import { buildDigest } from "../services/conciergeDigest";
-import { isSparkleAgentId } from "../services/sparkleAgent";
+import { isSparkleAgentId, SPARKLE_AGENT_NAME } from "../services/sparkleAgent";
+import {
+  agentTranscriptWorktree,
+  subscribeAgentTranscriptWorktrees,
+} from "../services/agentTranscriptRegistry";
 import { findKnownAgent } from "../services/knownAgents";
 import { createArrivalOrder, orderByArrival } from "../engine/conciergeStreamOrder";
 import { useEffectiveWired } from "../hooks/useEffectiveWired";
@@ -1215,8 +1219,33 @@ export function ConciergeHost({
       ? s.projects.flatMap((p) => p.agents).find((a) => a.id === mountedAgentId)
       : undefined,
   );
+  // ══ …AND THE ONE MOUNTABLE AGENT THAT HAS NO ROW (bead sparkle-gw8yi) ═══════════════════════════
+  // The scan above IS the roster, and the app-owned Improve-Sparkle agent is deliberately never in it
+  // (services/knownAgents' header). So `mountedRow` came back `undefined` for the one agent whose row
+  // the founder had just clicked, `mountedAgent` below stayed null, and the column went on rendering
+  // the SPARKLE CONVERSATION with the cable lit — his report, verbatim: *"when I clicked on the
+  // Improve Sparkle Build Agent, it showed a mounted version of Concierge content, which is wrong."*
+  // The mount was real (the cable is patched, and the send path routes at it); only the DISPLAY could
+  // not see it, which is the mount lying about where he is.
+  //
+  // TWO FACTS, FROM THE TWO PLACES THAT HOLD THEM, rather than a synthesized `AgentTab`: the NAME is
+  // a constant (`SPARKLE_AGENT_NAME`), and the WORKTREE is what `SparkleAgentPane.prepare()` writes
+  // to the transcript registry — the same worktree the concierge's own read chain resolves this
+  // agent's transcript from (services/sparkleTranscript tier (d)). Faking a row would put a second,
+  // partial answer to "what is this agent" in a file that already has one.
+  //
+  // `isSparkleAgentId` and not `findKnownAgent`: this is not asking whether the id is addressable
+  // (that question is `deliver`'s, and it is asked against the live store at send time). It is asking
+  // which of two places to read a name and a worktree from, and only the namespace decides that.
+  const mountedIsSparkle = !!mountedAgentId && isSparkleAgentId(mountedAgentId);
+  const sparkleWorktreePath = useSyncExternalStore(
+    subscribeAgentTranscriptWorktrees,
+    () => (mountedIsSparkle ? (agentTranscriptWorktree(mountedAgentId!) ?? null) : null),
+  );
+  const mountedName = mountedRow?.name ?? (mountedIsSparkle ? SPARKLE_AGENT_NAME : undefined);
+  const mountedWorktreePath = mountedRow?.worktreePath ?? sparkleWorktreePath;
   const mountedThread = useMountedThread(mountedAgentId);
-  const { pageBack } = useAgentTranscript(mountedAgentId, mountedRow?.worktreePath ?? null);
+  const { pageBack } = useAgentTranscript(mountedAgentId, mountedWorktreePath ?? null);
   // STAGED ATTACHMENTS FOLLOW THE DRAFT THEY WERE STAGED FOR.
   //
   // `ComposeBox.draftKey` swaps the typed text when the conversation changes, but attachments are
@@ -1303,17 +1332,21 @@ export function ConciergeHost({
     setMountedNotice(null);
   }, [mountedAgentId]);
 
+  // Gated on the NAME rather than on the row, because a name is what this needs and the roster is
+  // only one of the two places one can come from (see `mountedName`). Keeping `mountedRow` as the
+  // gate is what made the app-owned agent unmountable in the column while being mounted everywhere
+  // else.
   const mountedAgent = useMemo<ConciergeMountedAgent | null>(
     () =>
-      mountedAgentId && mountedRow
+      mountedAgentId && mountedName
         ? {
             agentId: mountedAgentId,
-            name: mountedRow.name,
+            name: mountedName,
             thread: mountedThread,
             onReachTop: pageBack,
           }
         : null,
-    [mountedAgentId, mountedRow, mountedThread, pageBack],
+    [mountedAgentId, mountedName, mountedThread, pageBack],
   );
 
   // ══ @-MENTIONS ═══════════════════════════════════════════════════════════════════════════════
@@ -3239,38 +3272,41 @@ export function ConciergeHost({
         route.kind === "agent" && route.via === "address"
           ? mentionAgentsRef.current.find((a) => a.id === route.agentId)
           : undefined;
-      // ══ THE IMPROVE-SPARKLE MOUNT IS ITS OWN ADDRESS (bead sparkle-0rf5) ═════════════════════════
-      // The app-owned Sparkle agent is the resolved routing target ONLY while its pane is mounted
-      // (Workspace derives the prompt target from `sparkleAgentId` then and never otherwise), and its
-      // own composer is gone — so the concierge box is the SOLE way into its terminal. `routeMessage`
-      // never aims at a PTY (only the user NAMING an agent may — see conciergeRouter's header), so an
-      // UNADDRESSED send would fall to the brain and never reach the agent the mount exists to talk
-      // to. Treat the mount as exactly that naming gesture: the sparkle target takes the SAME
-      // cancellable, picker-safe addressed path as an `@Name` (armed intent, countdown,
-      // `neverPickerAnswer`). Gated on `!named` so a message the user addressed elsewhere (`@Kraken`)
-      // or to the brain (`@Sparkle`, which sets `named`) is untouched. This is a special-case of the
-      // sparkle SURFACE, deliberately, not a change to what any other mount does — the general
-      // "mounted send routes to the mounted agent" work is now below, and is CABLE-gated.
+      // ══ THE IMPROVE-SPARKLE MOUNT IS NO LONGER ITS OWN ADDRESS (bead sparkle-gw8yi) ══════════════
+      // A `mountAddress` used to live here: if `targetRef.current` was the app-owned Sparkle agent and
+      // the user had not addressed anybody, the message was treated as if they had typed its name —
+      // the cancellable, picker-safe ADDRESSED path (sparkle-0rf5), justified by that pane having no
+      // composer of its own.
       //
-      // `!named` BECAME `route.via !== "address"`, and that is the same question asked properly. The
-      // old test was "is there a first mention at all", which is ordinal; the rule is now positional,
-      // so a name used mid-sentence as a SUBJECT no longer counts as addressing anybody (see
-      // Concierge/composerRoute). That is strictly more correct for this gate too: "ask Sparkle about
-      // the retry path" typed at a mounted Improve-Sparkle pane is a message FOR that pane, not a
-      // message addressed away from it.
-      const mountAim = targetRef.current;
-      const addressedByUser = route.via === "address";
-      const mountAddress =
-        !addressedByUser && mountAim && isSparkleAgentId(mountAim.agentId)
-          ? { id: mountAim.agentId, projectId: mountAim.projectId, name: mountAim.name }
-          : undefined;
-      const addressedAgent = mentionedAgent ?? mountAddress;
-      // ══ AND THE GENERAL RULE THE ABOVE WAS A SPECIAL CASE OF ════════════════════════════════════
-      // Any CABLE-MOUNTED build agent, not just the app-owned Sparkle one. The two coexist rather
-      // than one replacing the other, because they answer different questions: `mountAddress` fires
-      // on the Improve-Sparkle SURFACE whether or not a cable is patched (that pane has no other
-      // composer, so the concierge box is its only way in), while this fires on the cable. Where both
-      // are true the address arm wins below, which preserves sparkle-0rf5's shipped behaviour exactly.
+      // IT WAS BUILT FROM `targetRef.current`, AND THAT IS NOT THE MOUNT. `targetRef` is the prompt
+      // target, and for this agent Workspace sets it from `activeSpecial === "sparkle"` alone
+      // (`sparkleTarget`, Workspace.tsx) — the pane being the surface on screen, with NO reference to
+      // the cable. So the founder pressing Escape (cable off, `wired === "off"`, pane still visible)
+      // left `mountedAgentId` null while this still fired: his plain, unaddressed message was aimed at
+      // that agent's PTY, met the screen guard, and came back as *"@Sparkle has a full-screen app
+      // open"* — a sentence about an agent he was not talking to, refusing a message that was bound
+      // for the concierge. Improve Sparkle runs Claude Code and is long-running, so it holds the
+      // alternate buffer almost always: his cursor resting in that row silently cost him the ability
+      // to talk to Sparkle at all. He proved it himself — *"I just moved the cursor OUT of the Improve
+      // Sparkle row … and now it seems you're able to receive messages again."*
+      //
+      // NO REPLACEMENT, AND THAT IS THE POINT. The founder's requirement is that this agent behave
+      // like every other build row: *"When I click on the Improve Sparkle agent, I want it to MOUNT
+      // THE CONCIERGE INTO THAT AGENT just like it would a regular builder agent."* An ordinary build
+      // agent reaches its terminal through `mountRouted` below and through nothing else, and that is
+      // CABLE-gated — so this agent now does too. `AgentSidebar.onSelectSparkle` already patches the
+      // cable on click, which is what makes the click a mount rather than a selection; Escape unpatches
+      // it, and an unpatched cable means the concierge, exactly as it does for every other row.
+      //
+      // THE ONE THING THIS BUYS BEYOND THE REFUSAL: a concierge-bound message is now structurally
+      // incapable of being screen-checked here. `addressable` requires `mentionAim`, which requires
+      // `addressedAgent || mountRouted` — with this gone, neither can be true of a message routed to
+      // the concierge, so no screen check of any kind runs on one. There is no screen to check: the
+      // concierge is not a PTY.
+      const addressedAgent = mentionedAgent;
+      // ══ THE ONE RULE THAT AIMS A MOUNTED MESSAGE AT A TERMINAL ══════════════════════════════════
+      // Any CABLE-MOUNTED build agent, the app-owned Sparkle one included — one rule, not a general
+      // case with a special case beside it (see above for why the special case had to go).
       //
       // A MOUNT AIMS AT `targetRef`, NOT AT A ROSTER LOOKUP, and the two cannot disagree:
       // `routableMountedAgentId` is derived from that very target, so re-deriving the projectId/name
@@ -3382,11 +3418,13 @@ export function ConciergeHost({
           ? (() => {
               const wire = mentionFreeText(text, rosterFromMentions(mentions ?? []));
               return {
-                // `addressedAgent`, not `mentionedAgent`: the Improve-Sparkle mount (sparkle-0rf5)
-                // deliberately takes the ADDRESSED path — armed intent, countdown, `neverPickerAnswer`
-                // AND the concierge's follow-up turn — because that pane's whole purpose is a
-                // conversation the concierge is a party to. A cable mount is the other case: the
-                // founder talking straight to a build agent, where a brain turn per line is a tax.
+                // WHICH GESTURE CHOSE THIS TERMINAL, and the two are now the only two there are: the
+                // user typed a name, or the cable is patched. An address is relayed THROUGH the
+                // concierge so the conversation stays whole; a mount is the founder talking straight
+                // to a build agent, where billing a brain turn per line is a tax rather than a
+                // thought partner. The Improve-Sparkle surface used to take the ADDRESSED arm from a
+                // mount it built itself (sparkle-0rf5); it takes the `mount` arm now, like every
+                // other build row — see `addressedAgent` above for why that special case was removed.
                 via: addressedAgent ? ("address" as const) : ("mount" as const),
                 target: submitted,
                 payload: attachedPayload(wire, staged),

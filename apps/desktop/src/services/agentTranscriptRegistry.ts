@@ -34,6 +34,37 @@
 const transcriptPaths = new Map<string, string>();
 const transcriptWorktrees = new Map<string, string>();
 
+// ── WHY THIS MAP IS OBSERVABLE AND THE OTHER IS NOT ──────────────────────────────────────────────
+// A RENDER now depends on the worktree map. The concierge mounts to the app-owned Improve-Sparkle
+// agent like any build row, and that agent has no `projectStore` row to read a `worktreePath` off
+// (services/knownAgents' header: it is deliberately never a member of any project's `agents` array)
+// — so this registry is the only place its worktree is written down, and the column's mounted view
+// reads it here (see ConciergeHost's `mountedWorktreePath`).
+//
+// It is written by `SparkleAgentPane.prepare()`, which cuts the worktree BEFORE the pane can render
+// a terminal — i.e. after the concierge has already rendered against an empty registry. A plain
+// `getAgentTranscriptWorktree()` at memo time would therefore capture `undefined` and never see the
+// path arrive, leaving that agent's transcript permanently unreadable in the mounted column until
+// something unrelated re-rendered the host. That is precisely the subscribe-vs-getState mistake the
+// `mountedRow` selector beside it already documents for ordinary agents.
+//
+// A LISTENER SET, NOT A STORE, so this module keeps the property its header is about: no imports of
+// its own, hence nothing it can drag into anyone's module graph. `useSyncExternalStore` on the
+// consumer side needs exactly this shape.
+//
+// The PATH map (writer 1) has no render consumer and so gets no notification — deliberately, rather
+// than by omission. Add one here if that ever changes; do not let a reader poll it.
+const worktreeListeners = new Set<() => void>();
+
+/** Subscribe to changes in the WORKTREE map (writer 2). Returns an unsubscribe fn.
+ *  `useSyncExternalStore`-shaped: the callback takes no arguments and re-reads for itself. */
+export function subscribeAgentTranscriptWorktrees(onChange: () => void): () => void {
+  worktreeListeners.add(onChange);
+  return () => {
+    worktreeListeners.delete(onChange);
+  };
+}
+
 /** Remember where this agent's session transcript lives — writer (1), an exact session file. */
 export function noteAgentTranscriptPath(agentId: string, path: string): void {
   if (path.trim() === "") return;
@@ -50,7 +81,12 @@ export function noteAgentTranscriptPath(agentId: string, path: string): void {
  */
 export function noteAgentTranscriptWorktree(agentId: string, worktreePath: string): void {
   if (worktreePath.trim() === "") return;
+  // Only a CHANGE notifies. Both writers are on hot-ish paths (`prepare()` re-runs on every retry,
+  // and the project store registers on every worktree write), and a re-render per identical
+  // re-registration would be a render loop dressed as a subscription.
+  if (transcriptWorktrees.get(agentId) === worktreePath) return;
   transcriptWorktrees.set(agentId, worktreePath);
+  for (const listener of worktreeListeners) listener();
 }
 
 /** The exact session file registered for this agent, if any. */
@@ -67,5 +103,7 @@ export function agentTranscriptWorktree(agentId: string): string | undefined {
  *  used by tests resetting between cases, and available for a real agent-close seam when one exists. */
 export function forgetAgentTranscriptPath(agentId: string): void {
   transcriptPaths.delete(agentId);
-  transcriptWorktrees.delete(agentId);
+  if (transcriptWorktrees.delete(agentId)) {
+    for (const listener of worktreeListeners) listener();
+  }
 }
