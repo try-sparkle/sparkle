@@ -33,7 +33,10 @@ use crate::worktree::git;
 /// How many porcelain paths preflight hands to the UI. The confirm dialog lists them, so the cap
 /// bounds the dialog, not the truth: `dirty_count` stays the real total so the UI can say
 /// "…and 37 more" instead of quietly under-reporting what the WIP commit is about to sweep up.
-const DIRTY_FILES_CAP: usize = 50;
+/// How many porcelain paths the PREFLIGHT previews. Far larger than
+/// [`crate::worktree::STATUS_DIRTY_FILES_CAP`] on purpose: this is a one-shot read of a single agent
+/// the user is actively promoting, not a per-agent field on the 30s batch poll.
+pub(crate) const DIRTY_FILES_CAP: usize = 50;
 
 /// Everything the promote dialog needs to decide, gathered WITHOUT changing a thing.
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
@@ -84,31 +87,12 @@ pub struct PromotionTranscript {
 
 /// Parse `git status --porcelain` into (capped paths, TRUE total).
 ///
-/// Parsed tolerantly rather than by slicing a fixed 3-char offset, because [`git`] trims the whole
-/// capture: the very first porcelain line loses the leading space of a ` M path` status column, so
-/// a fixed offset would return `path` for every line but the first and `ath` for that one.
+/// DELEGATES to [`crate::worktree::parse_porcelain_capped`] — this used to be a second copy of that
+/// parser, which is precisely the shape this codebase keeps getting bitten by: both copies have to
+/// know that [`git`] trims the whole capture (so the first line loses its leading status space) and
+/// that a rename reads `R old -> new`. One of them would eventually not.
 fn parse_porcelain(out: &str) -> (Vec<String>, u32) {
-    let mut paths: Vec<String> = Vec::new();
-    let mut count: u32 = 0;
-    for raw in out.lines() {
-        let line = raw.trim_end_matches('\r');
-        if line.trim().is_empty() {
-            continue;
-        }
-        count = count.saturating_add(1);
-        if paths.len() >= DIRTY_FILES_CAP {
-            continue; // keep counting: `dirty_count` is the truth, `dirty_files` is the preview
-        }
-        let rest = line.trim_start();
-        let path = match rest.split_once(' ') {
-            Some((_, p)) => p.trim_start(),
-            None => rest,
-        };
-        // Rename/copy entries read `R  old -> new`; the file that exists on disk is the NEW one.
-        let path = path.rsplit(" -> ").next().unwrap_or(path);
-        paths.push(path.to_string());
-    }
-    (paths, count)
+    crate::worktree::parse_porcelain_capped(out, DIRTY_FILES_CAP)
 }
 
 /// The worktree's HEAD branch, plus whether it is DETACHED. Read once and used for both, since

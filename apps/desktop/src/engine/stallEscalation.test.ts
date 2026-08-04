@@ -51,7 +51,9 @@ describe("THE FOUNDER'S ACCEPTANCE TEST — gray is a terminal state", () => {
     ["an open unmerged PR", resting({ hasOpenPr: true })],
     ["committed work that never landed", resting({ hasUnlandedWork: true })],
     ["an escalated goal", resting({ goal: { ...newGoal("hard", T0), escalatedAt: T0 + 1 } })],
-    ["an expired goal", resting({ goal: newGoal("stale", T0, 1_000), now: T0 + 5_000 })],
+    // NOTE: "an expired goal" USED TO BE A CASE HERE and was removed on purpose (sparkle-biezi).
+    // Expiry is a fact about the clock, not about the work, so it is no longer sufficient on its own
+    // — see the `expiry is not an alarm` describe block below, which pins both halves of the rule.
   ];
 
   it.each(cases)("a row with %s does not render gray", (_label, input) => {
@@ -82,6 +84,76 @@ describe("THE FOUNDER'S ACCEPTANCE TEST — gray is a terminal state", () => {
       allAlive,
     );
     expect(AGENT_STATUS[out.a as AgentTabStatus].color).toBe(AGENT_STATUS.waiting.color);
+  });
+});
+
+describe("EXPIRY IS NOT AN ALARM — sparkle-biezi", () => {
+  /** The live state of agent 11a52157 ("Babysit PR 1104") in the founder's screenshot: idle, calm,
+   *  a spotless worktree, nothing unlanded — and a goal whose TTL had simply run out. */
+  const expiredAndDone = resting({ goal: newGoal("stale", T0, 1_000), now: T0 + 5_000 });
+
+  it("leaves a FINISHED agent whose goal merely expired GRAY, not red", () => {
+    const out = withStallAttention(AGENTS, { a: "idle" }, reportFor(expiredAndDone), allAlive);
+    // The side effect that was wrong: the row's rendered COLOUR. Asserted against the token table,
+    // not the status name, so a rename cannot satisfy the letter of this while breaking the rule.
+    expect(AGENT_STATUS[out.a as AgentTabStatus].color).toBe(AGENT_STATUS.idle.color);
+    expect(AGENT_STATUS[out.a as AgentTabStatus].color).not.toBe(AGENT_STATUS.waiting.color);
+    expect(out.a).toBe("idle");
+  });
+
+  it("does not escalate it from the `unmerged` band either", () => {
+    // Three of the four red rows were labelled MERGED TO MAIN. `unmerged` is the other calm band,
+    // and it is the one `ESCALATABLE` also covers, so the rule has to hold from both.
+    const out = withStallAttention(AGENTS, { a: "unmerged" }, reportFor(expiredAndDone), allAlive);
+    expect(out.a).toBe("unmerged");
+  });
+
+  it("mustLeaveCalm is false when `expired-goal` is the ONLY cause", () => {
+    const report = stallReport(expiredAndDone);
+    // The cause is still REPORTED — this is the "surfaced, never red" half. `agentStall` is
+    // untouched, so the "goal expired" chip and the amber "ran out of time" badge still render.
+    expect(report.verdict).toBe("stalled");
+    expect(report.causes).toEqual(["expired-goal"]);
+    // …it just no longer votes for red.
+    expect(mustLeaveCalm(report)).toBe(false);
+  });
+
+  it("STILL goes red when the expiry sits on top of UNLANDED work", () => {
+    // The other half of the founder's rule. The work-based causes are untouched, so a row that
+    // genuinely owes something keeps exactly the colour it had — on the strength of the work, not
+    // of the clock. Without this, the fix above would have silenced real stalls too.
+    const out = withStallAttention(
+      AGENTS,
+      { a: "idle" },
+      reportFor({ ...expiredAndDone, hasUnlandedWork: true }),
+      allAlive,
+    );
+    expect(out.a).toBe("blocked");
+    expect(stallReport({ ...expiredAndDone, hasUnlandedWork: true }).causes).toContain(
+      "expired-goal",
+    );
+  });
+
+  it("STILL goes red when the expiry sits on top of uncommitted changes", () => {
+    const out = withStallAttention(
+      AGENTS,
+      { a: "idle" },
+      reportFor({ ...expiredAndDone, hasUncommittedChanges: true }),
+      allAlive,
+    );
+    expect(out.a).toBe("blocked");
+  });
+
+  it("an ESCALATED goal is still red — auto-continue giving up is not a clock fact", () => {
+    // The neighbouring state, kept apart deliberately: escalation means the mechanism meant to keep
+    // this moving HANDED IT BACK, which is a human's problem. Expiry means a timer elapsed.
+    const out = withStallAttention(
+      AGENTS,
+      { a: "idle" },
+      reportFor(resting({ goal: { ...newGoal("hard", T0), escalatedAt: T0 + 1 } })),
+      allAlive,
+    );
+    expect(out.a).toBe("blocked");
   });
 });
 

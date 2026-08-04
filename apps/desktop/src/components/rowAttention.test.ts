@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 import {
   formatRemaining,
   goalBadgeFor,
+  namedDirtyFiles,
   stallChipFor,
   stallInputsFor,
   thrashChipLabel,
@@ -94,6 +95,77 @@ describe("stallInputsFor — evidence, never inference", () => {
       ws: { ...BARE_WS, prState: "merged" },
     });
     expect(stallReport(input).verdict).toBe("finished");
+  });
+});
+
+describe("stallChipFor — SAYING WHICH FILE (sparkle-biezi)", () => {
+  /** A dirty tree that knows its own paths — what a current Rust build sends. */
+  const dirtyBs = (files: string[], count = files.length): BranchStatus => ({
+    ...CLEAN_BS,
+    dirty: true,
+    dirtyFiles: files,
+    dirtyCount: count,
+  });
+  const chip = (bs: BranchStatus) => stallChipFor(stallReport(stallInputsFor("idle", NOW, undefined, { bs })), bs);
+
+  it("names the file instead of saying only 'uncommitted changes'", () => {
+    // The founder's complaint: "A row claiming uncommitted work without naming a file cannot be
+    // acted on — he cannot tell a forgotten fix from a leftover build artifact."
+    const c = chip(dirtyBs(["apps/desktop/src/vite.config.ts"]));
+    expect(c?.text).toBe("uncommitted: vite.config.ts");
+    // The bare label is what this replaces — assert it is GONE, not merely that a name is present.
+    expect(c?.text).not.toBe("uncommitted changes");
+  });
+
+  it("counts the +N from the TRUE total, not from the capped preview", () => {
+    // Rust caps the preview at 5 but always counts them all. Reading the array's length instead
+    // would under-report a big mess as exactly "+4" forever.
+    const c = chip(dirtyBs(["a.ts", "b.ts", "c.ts", "d.ts", "e.ts"], 12));
+    expect(c?.text).toBe("uncommitted: a.ts +11");
+  });
+
+  it("carries the FULL paths for the tooltip, while the chip shows a basename", () => {
+    const c = chip(dirtyBs(["apps/desktop/src/x.ts", "dist/bundle.js"], 2));
+    expect(c?.text).toBe("uncommitted: x.ts +1");
+    expect(c?.files).toEqual(["apps/desktop/src/x.ts", "dist/bundle.js"]);
+  });
+
+  it("falls back to the bare label when the Rust build does not send names", () => {
+    // `dirtyFiles: undefined` means "this build cannot tell you", NOT "no files". Inventing a name
+    // or claiming zero would both be worse than the unchanged label.
+    const c = chip({ ...CLEAN_BS, dirty: true });
+    expect(c?.text).toBe("uncommitted changes");
+    expect(c?.files).toEqual([]);
+  });
+
+  it("NEVER names a PARKED tree's files — they belong to another branch", () => {
+    // `worktreeOnBranch: false` already suppresses `dirty` as evidence (uncommittedEvidence). Naming
+    // the files anyway would pin another branch's work on this agent BY FILENAME, which is a
+    // confidently wrong claim rather than a quieter one.
+    //
+    // ASSERTED ON `namedDirtyFiles` DIRECTLY, and that is deliberate. Going through `stallChipFor`
+    // here is VACUOUS: a parked tree reports the `unknown` verdict, so the chip is null and the
+    // assertion passes whether or not the gate exists. (Confirmed by mutation — deleting the
+    // `worktreeOnBranch` check left the chip-level version of this test green.) The gate lives in
+    // this function, so this is where it has to be pinned.
+    const parked: BranchStatus = { ...dirtyBs(["someone/elses/file.ts"]), worktreeOnBranch: false };
+    expect(namedDirtyFiles(parked)).toEqual([]);
+    // …while the SAME reading on the agent's own tree does name it, so the empty answer above is
+    // the gate doing its job and not the fixture simply having nothing in it.
+    expect(namedDirtyFiles({ ...parked, worktreeOnBranch: true })).toEqual(["someone/elses/file.ts"]);
+    // `undefined` is an older Rust build, not a parked tree — it takes the normal path.
+    expect(namedDirtyFiles(dirtyBs(["mine.ts"]))).toEqual(["mine.ts"]);
+  });
+
+  it("when a MORE actionable cause heads the chip, the paths still reach the tooltip", () => {
+    // `causes` is ordered most-actionable-first, so unlanded commits outrank a dirty tree and the
+    // chip's one line goes to them — correctly, since landing the work is the bigger ask. The
+    // filenames are not lost, though: they ride `files`, which is what the row's tooltip renders.
+    // Naming the file in the chip here would have meant DROPPING the more important cause to do it.
+    const bs = { ...dirtyBs(["only.ts"]), ahead: 2 };
+    const c = stallChipFor(stallReport(stallInputsFor("idle", NOW, undefined, { bs })), bs);
+    expect(c?.text).toBe("work not landed +1");
+    expect(c?.files).toEqual(["only.ts"]);
   });
 });
 

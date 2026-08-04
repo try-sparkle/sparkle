@@ -27,6 +27,26 @@ export interface BranchStatus {
   // Read `false` as "not this branch's tree", and `undefined` as "unknown" — neither is
   // evidence the tree is clean.
   worktreeOnBranch?: boolean;
+  // WHICH files are uncommitted — porcelain paths, capped at Rust's STATUS_DIRTY_FILES_CAP (5),
+  // already .gitignore-filtered by `git status --porcelain` itself. Empty whenever `dirty` is false.
+  //
+  // WHY IT EXISTS (sparkle-biezi): "Local: Uncommitted" told the founder an agent was holding unsaved
+  // work and named no file, so a forgotten fix and a leftover build artifact read identically and the
+  // row could not be acted on without opening a terminal. A row that claims uncommitted work must be
+  // able to say which.
+  //
+  // Optional so a Rust build predating the field deserializes to undefined — and `undefined` means
+  // "this build cannot tell you", NOT "no files". Only an empty array on a `dirty: true` reading
+  // means "dirty but the names were capped away", which cannot happen (the cap is >= 1).
+  //
+  // SAME `worktreeOnBranch` CAVEAT AS `dirty`, and it bites harder here: a parked tree's files belong
+  // to whatever branch got checked out into it, so naming them on this row attributes another
+  // branch's work to this agent BY NAME. Filter on `worktreeOnBranch !== false` wherever you would
+  // have filtered `dirty`.
+  dirtyFiles?: string[];
+  // The TRUE number of uncommitted paths, which may exceed `dirtyFiles.length`. A "+N more"
+  // affordance must count from THIS; `dirtyFiles` is a preview, not an inventory.
+  dirtyCount?: number;
 }
 
 /** Land-to-green workflow signals for an agent branch (see Rust `agent_workflow_state`). All

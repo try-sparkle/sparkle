@@ -574,6 +574,29 @@ const ROWS: Row[] = [
     goal: GOAL_STATES.met,
   },
   {
+    // THE `sparkle-biezi` ROW: merged, finished, and its goal's TTL simply ran out.
+    //
+    // WHY IT HAD TO BE A NEW ROW rather than a tweak to `vfx-agent-4` (which is also idle with an
+    // expired goal). That one sits at stage `pull_request`, so `hasUnmergedCommittedWork` is true and
+    // it carries the `unlanded-work` cause — it renders red on the strength of the WORK and would go
+    // on doing so whatever the expiry rule said. It therefore cannot photograph the expiry fix: the
+    // shot would look identical before and after, which is the vacuous-capture failure the harness's
+    // own history is full of. This row's ONLY stall cause is `expired-goal`, so its colour is a
+    // direct readout of `stallEscalation.OUTSTANDING` membership.
+    //
+    // Modelled on the live agent in the founder's screenshot (11a52157, "Babysit PR 1104"): idle,
+    // calm, asking nothing, work merged to main, goal expired — and painted red. It must render GRAY.
+    id: "vfx-agent-8",
+    name: "Babysit the release PR",
+    kind: "build",
+    parentId: null,
+    status: "idle",
+    elapsedMin: 310,
+    stage: "merged",
+    lastPrompt: "Watch PR 1104 through review and reply to anything that comes back",
+    goal: GOAL_STATES.expired,
+  },
+  {
     // THE GOAL-LESS CONTROL, and it is a TOP-LEVEL BUILD row on purpose (roborev 57331). A control
     // has to differ from the rows it is compared against in the ONE variable under test, and every
     // goal above sits on a build row — so a goal-less WORKER could not serve: "has a goal" would be

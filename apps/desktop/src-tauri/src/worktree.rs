@@ -2337,6 +2337,94 @@ pub async fn park_worktree_on_base(
     .map_err(|e| format!("park_worktree_on_base task failed: {e}"))?
 }
 
+/// How many porcelain paths a BRANCH STATUS carries. Deliberately far smaller than
+/// [`crate::promotion::DIRTY_FILES_CAP`] (50), because the two have opposite cost profiles: the
+/// promotion preflight is a ONE-SHOT read of a SINGLE agent, while this rides the 30s batch poll for
+/// EVERY agent — a 50-path cap across a 50-agent fleet is 2,500 strings crossing the IPC boundary
+/// every tick to fill a row that has room for about three. The row says "and N more" from
+/// `dirty_count`, which is always the TRUE total, so nothing is hidden by the smaller budget.
+pub(crate) const STATUS_DIRTY_FILES_CAP: usize = 5;
+
+/// Parse `git status --porcelain` into (capped paths, TRUE total).
+///
+/// ONE IMPLEMENTATION, TWO CALLERS. This is the parser `promotion::promotion_preflight` uses and the
+/// one `agent_branch_status` uses; `cap` is the only thing that differs (see
+/// [`STATUS_DIRTY_FILES_CAP`]). A second copy would drift on exactly the two edge cases below, both
+/// of which are already-fixed bugs rather than hypotheticals.
+///
+/// Parsed tolerantly rather than by slicing a fixed 3-char offset, because [`git`] trims the whole
+/// capture: the very first porcelain line loses the leading space of a ` M path` status column, so a
+/// fixed offset would return `path` for every line but the first and `ath` for that one.
+///
+/// `git status --porcelain` honours `.gitignore` with no extra flag — ignored files are simply not
+/// listed — which is the founder's "respect .gitignore" requirement satisfied by the command itself
+/// rather than by a filter here that could fall out of step with the repo's ignore rules.
+pub(crate) fn parse_porcelain_capped(out: &str, cap: usize) -> (Vec<String>, u32) {
+    let mut paths: Vec<String> = Vec::new();
+    let mut count: u32 = 0;
+    for raw in out.lines() {
+        let line = raw.trim_end_matches('\r');
+        if line.trim().is_empty() {
+            continue;
+        }
+        count = count.saturating_add(1);
+        if paths.len() >= cap {
+            continue; // keep counting: `count` is the truth, `paths` is the preview
+        }
+        let rest = line.trim_start();
+        let path = match rest.split_once(' ') {
+            Some((_, p)) => p.trim_start(),
+            None => rest,
+        };
+        // Rename/copy entries read `R  old -> new`; the file that exists on disk is the NEW one.
+        let path = path.rsplit(" -> ").next().unwrap_or(path);
+        paths.push(path.to_string());
+    }
+    (paths, count)
+}
+
+/// A worktree's uncommitted-changes reading: the boolean every existing consumer wants, plus the
+/// NAMES that let a row say what it is holding.
+///
+/// WHY THE NAMES EXIST (sparkle-biezi). "Local: Uncommitted" told the founder an agent was holding
+/// unsaved work and named no file, so they could not tell a forgotten fix from a leftover build
+/// artifact without opening a terminal — which is the work this app exists to remove. A row that
+/// claims uncommitted work must be able to say WHICH.
+///
+/// IT COSTS NO EXTRA GIT CALL. Both status paths already ran `git status --porcelain` and threw the
+/// output away on `.is_empty()`; this keeps what was already in hand. That matters because the batch
+/// poll's per-agent cost is load-bearing (sparkle-zlic) — adding a second git invocation per agent
+/// per tick to answer this would not have been worth it.
+#[derive(Default, Clone)]
+pub(crate) struct DirtyReading {
+    pub dirty: bool,
+    pub files: Vec<String>,
+    pub count: u32,
+}
+
+impl DirtyReading {
+    /// Read a worktree's dirt. `exists: false` (no worktree on disk) is CLEAN-and-empty, matching the
+    /// long-standing behaviour of both call sites — there is no tree to hold anything.
+    ///
+    /// `no_optional_locks` mirrors the batch path's flag. ⚠️ It is a TOP-LEVEL git option and must
+    /// precede the subcommand; misplaced, git exits 129 with "unknown option" (the bug fleet.rs
+    /// records at its own porcelain call). Passing it as a separate arg here keeps that ordering in
+    /// one place instead of at every call site.
+    fn read(wt_str: &str, exists: bool, no_optional_locks: bool) -> Result<Self, String> {
+        if !exists {
+            return Ok(Self::default());
+        }
+        let args: &[&str] = if no_optional_locks {
+            &["--no-optional-locks", "status", "--porcelain"]
+        } else {
+            &["status", "--porcelain"]
+        };
+        let out = git(wt_str, args)?;
+        let (files, count) = parse_porcelain_capped(&out, STATUS_DIRTY_FILES_CAP);
+        Ok(Self { dirty: count > 0, files, count })
+    }
+}
+
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct BranchStatus {
@@ -2358,18 +2446,30 @@ pub struct BranchStatus {
     /// dirt and must not be asserted as such. Consumers must not apply the unsaved-edits stage
     /// floor on a false reading. Same unknown-vs-false shape as `hasRemote` in WorkflowState.
     worktree_on_branch: bool,
+    /// WHICH files are uncommitted — porcelain paths, capped at [`STATUS_DIRTY_FILES_CAP`], already
+    /// `.gitignore`-filtered by git itself. Empty whenever `dirty` is false.
+    ///
+    /// Carries the SAME caveat as `dirty`: only meaningful when `worktree_on_branch` is true, since a
+    /// parked tree's files belong to whatever branch got checked out into it. Consumers must apply
+    /// the same gate to both — reading the names while ignoring the gate would attribute another
+    /// branch's files to this agent BY NAME, which is a worse version of that mistake, not a lesser
+    /// one.
+    dirty_files: Vec<String>,
+    /// The TRUE number of uncommitted paths, which may exceed `dirty_files.len()`. A "+N more"
+    /// affordance must count from THIS; `dirty_files` is a preview, not an inventory.
+    dirty_count: u32,
 }
 
 /// Status for an agent branch whose base ref can't be resolved: there's no base to diverge from,
 /// so count the branch's OWN commits as `ahead` (behind 0) and skip the base diff. `dirty` is passed
 /// through from the caller's worktree read. Shared by both the single-agent and batched status paths
 /// so their unresolvable-base guards can't drift apart.
-fn ahead_only_status(root: &str, branch: &str, dirty: bool, worktree_on_branch: bool) -> BranchStatus {
+fn ahead_only_status(root: &str, branch: &str, d: &DirtyReading, worktree_on_branch: bool) -> BranchStatus {
     let ahead = git(root, &["rev-list", "--count", branch])
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0);
-    BranchStatus { ahead, behind: 0, dirty, files_changed: 0, insertions: 0, deletions: 0, worktree_on_branch }
+    BranchStatus { ahead, behind: 0, dirty: d.dirty, files_changed: 0, insertions: 0, deletions: 0, worktree_on_branch, dirty_files: d.files.clone(), dirty_count: d.count }
 }
 
 /// The branch an agent's worktree is actually checked out on, or "" when the tree is missing, the
@@ -2544,11 +2644,7 @@ pub fn agent_branch_status_at(
     // Zeroing it here would silently serve the first at the cost of the second, and the second
     // loses data (see shouldPromptOnClose, which already errs toward prompting on unknown).
     // So: report what is there, publish `worktree_on_branch`, and let each consumer decide.
-    let dirty = if wt.exists() {
-        !git(&wt_str, &["status", "--porcelain"])?.is_empty()
-    } else {
-        false
-    };
+    let d = DirtyReading::read(&wt_str, wt.exists(), false)?;
 
     // A brand-new or non-git agent (chat/think/shell, or one polled before its first commit) has no
     // `sparkle/agent-<id>` ref yet. `rev-list <base>...<missing>` then hard-fails with
@@ -2563,7 +2659,7 @@ pub fn agent_branch_status_at(
     )
     .is_err()
     {
-        return Ok(BranchStatus { ahead: 0, behind: 0, dirty, files_changed: 0, insertions: 0, deletions: 0, worktree_on_branch });
+        return Ok(BranchStatus { ahead: 0, behind: 0, dirty: d.dirty, files_changed: 0, insertions: 0, deletions: 0, worktree_on_branch, dirty_files: d.files.clone(), dirty_count: d.count });
     }
 
     // The agent branch exists, but its RESOLVED base may not: `effective_base` documents an
@@ -2574,7 +2670,7 @@ pub fn agent_branch_status_at(
     // branch's own commits as `ahead` (behind 0 — the born-off-nothing model), still reflecting the
     // worktree's dirty state, instead of erroring.
     if git(root, &["rev-parse", "--verify", "--quiet", &format!("{base}^{{commit}}")]).is_err() {
-        return Ok(ahead_only_status(root, &branch, dirty, worktree_on_branch));
+        return Ok(ahead_only_status(root, &branch, &d, worktree_on_branch));
     }
 
     // `--left-right --count A...B` emits "<left>\t<right>": left = base-only = behind,
@@ -2594,7 +2690,7 @@ pub fn agent_branch_status_at(
         deletions += cols.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     }
 
-    Ok(BranchStatus { ahead, behind, dirty, files_changed, insertions, deletions, worktree_on_branch })
+    Ok(BranchStatus { ahead, behind, dirty: d.dirty, files_changed, insertions, deletions, worktree_on_branch, dirty_files: d.files, dirty_count: d.count })
 }
 
 /// Live ahead/behind + dirty + size of an agent branch vs its (no-fetch) effective base.
@@ -4075,11 +4171,7 @@ fn branch_status_with_base(
     // Only agents the fingerprint did NOT skip reach here — which is exactly right for ownership:
     // a skipped agent is unchanged by definition, so its branch mapping cannot have moved either.
     observe_worktree_branch(app_data, project_id, agent_id, &head_branch);
-    let dirty = if wt.exists() {
-        !git(&wt_str, &["--no-optional-locks", "status", "--porcelain"])?.is_empty()
-    } else {
-        false
-    };
+    let d = DirtyReading::read(&wt_str, wt.exists(), true)?;
     // A brand-new/non-git agent polled before its first commit has no `sparkle/agent-<id>` ref yet;
     // `rev-list <base>...<missing>` then hard-fails with "ambiguous argument ... unknown revision",
     // which fails the WHOLE batch read for that agent and re-logs "batch branch status failed" every
@@ -4087,7 +4179,7 @@ fn branch_status_with_base(
     // the batch refactor): return a zeroed status — still reflecting the worktree's dirty state — when
     // the branch ref doesn't exist, so there's nothing to count against a ref that isn't there.
     if git(root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_err() {
-        return Ok(BranchStatus { ahead: 0, behind: 0, dirty, files_changed: 0, insertions: 0, deletions: 0, worktree_on_branch });
+        return Ok(BranchStatus { ahead: 0, behind: 0, dirty: d.dirty, files_changed: 0, insertions: 0, deletions: 0, worktree_on_branch, dirty_files: d.files.clone(), dirty_count: d.count });
     }
     // The branch exists, but the RESOLVED base may not (`effective_base`'s documented unborn/HEAD-less
     // fallback can return a name git can't resolve). `rev-list <unresolvable-base>...<branch>` then
@@ -4096,7 +4188,7 @@ fn branch_status_with_base(
     // diverge from when the base doesn't exist, so report the branch's own commits as `ahead` (behind 0)
     // instead of erroring — mirrors `agent_branch_status_at`'s base guard.
     if git(root, &["rev-parse", "--verify", "--quiet", &format!("{base_ref}^{{commit}}")]).is_err() {
-        return Ok(ahead_only_status(root, &branch, dirty, worktree_on_branch));
+        return Ok(ahead_only_status(root, &branch, &d, worktree_on_branch));
     }
     let counts = git(root, &["rev-list", "--left-right", "--count", &format!("{base_ref}...{branch}")])?;
     let mut it = counts.split_whitespace();
@@ -4110,7 +4202,7 @@ fn branch_status_with_base(
         insertions += cols.next().and_then(|s| s.parse().ok()).unwrap_or(0);
         deletions += cols.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     }
-    Ok(BranchStatus { ahead, behind, dirty, files_changed, insertions, deletions, worktree_on_branch })
+    Ok(BranchStatus { ahead, behind, dirty: d.dirty, files_changed, insertions, deletions, worktree_on_branch, dirty_files: d.files, dirty_count: d.count })
 }
 
 /// The agent's workflow state given ALREADY-RESOLVED shared inputs (default branch, origin presence)
@@ -9446,6 +9538,10 @@ mod tests {
         assert_eq!(st.ahead, 2, "two agent commits");
         assert_eq!(st.behind, 1, "one main commit (left/right mapping correct, not transposed)");
         assert!(!st.dirty, "clean tree");
+        // A CLEAN tree names nothing. `dirty_files` must never carry a stale preview, because a row
+        // that lists a file is telling the founder to go and deal with that file (sparkle-biezi).
+        assert!(st.dirty_files.is_empty(), "a clean tree holds no uncommitted paths");
+        assert_eq!(st.dirty_count, 0, "and counts none");
         // numstat parse: two new files added on the agent side, 3 inserted lines, 0 deletions.
         assert_eq!(st.files_changed, 2, "a.txt + b.txt");
         assert_eq!(st.insertions, 3, "2 + 1 inserted lines");
@@ -9455,6 +9551,37 @@ mod tests {
         std::fs::write(Path::new(&info.path).join("uncommitted.txt"), "u").unwrap();
         let st2 = agent_branch_status_at(&root_str, "p", "s1", "main", &app_data).unwrap();
         assert!(st2.dirty, "uncommitted file flips dirty");
+        // THE POINT OF THE FIELD: it says WHICH. "Local: Uncommitted" naming no file is what the
+        // founder could not act on — a forgotten fix and a leftover build artifact read identically.
+        assert_eq!(st2.dirty_files, vec!["uncommitted.txt".to_string()], "and names it");
+        assert_eq!(st2.dirty_count, 1);
+
+        // .gitignore IS RESPECTED, and by git itself rather than by a filter of ours that could fall
+        // out of step with the repo's rules. An ignored artifact must not make a finished agent look
+        // like it is holding work.
+        // Remove the untracked file FIRST: the `add -A` below would otherwise sweep it into the
+        // commit, and deleting a TRACKED file is itself dirt — which would make this assert pass or
+        // fail for a reason that has nothing to do with .gitignore.
+        std::fs::remove_file(Path::new(&info.path).join("uncommitted.txt")).unwrap();
+        std::fs::write(Path::new(&info.path).join(".gitignore"), "ignored.log\n").unwrap();
+        git(&info.path, &["add", "-A"]).unwrap();
+        git(&info.path, &["commit", "-m", "ignore rule"]).unwrap();
+        std::fs::write(Path::new(&info.path).join("ignored.log"), "noise").unwrap();
+        let st3 = agent_branch_status_at(&root_str, "p", "s1", "main", &app_data).unwrap();
+        assert!(!st3.dirty, "an ignored file is not uncommitted work");
+        assert!(st3.dirty_files.is_empty(), "and is never named");
+
+        // The preview is CAPPED but the count stays TRUE — a "+N more" affordance reads the count.
+        for i in 0..(STATUS_DIRTY_FILES_CAP + 3) {
+            std::fs::write(Path::new(&info.path).join(format!("f{i}.txt")), "x").unwrap();
+        }
+        let st4 = agent_branch_status_at(&root_str, "p", "s1", "main", &app_data).unwrap();
+        assert_eq!(st4.dirty_files.len(), STATUS_DIRTY_FILES_CAP, "preview is bounded");
+        assert_eq!(
+            st4.dirty_count as usize,
+            STATUS_DIRTY_FILES_CAP + 3,
+            "but the count is the whole truth, not the preview's length"
+        );
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&app_data);
     }

@@ -34,7 +34,10 @@
 // Two things keep it survivable, and if the wall returns, this is where to cut:
 //   • `OUTSTANDING` below is the whole predicate. Dropping "unlanded-work" from it restores the
 //     2026-07-26 behaviour for the 27/51 band while keeping the goal and dirty-worktree cases —
-//     one line, no other file involved.
+//     one line, no other file involved. That cut has already been made ONCE, for `expired-goal`
+//     (sparkle-biezi): a lapsed TTL is a fact about the clock, not about the work, and it was
+//     painting FINISHED agents red. The reasoning is on `OUTSTANDING` itself — read it before
+//     adding any cause back.
 //   • The escalation is NOT in the badge/banner set (see above), so a red dot here never becomes a
 //     notification storm.
 //
@@ -70,15 +73,46 @@ export const ESCALATED_STATUS: AgentTabStatus = "blocked";
 /**
  * The causes that mean "this row is not finished".
  *
- * Every `StallCause` is here today, which is the point of the founder's rule: each one is work that
- * exists and that nothing is coming to finish. Kept as an explicit set rather than "any cause at
- * all" so that adding a new cause to `agentStall` forces a decision here about whether it belongs
- * in the red tier, instead of silently recolouring rows.
+ * Kept as an explicit set rather than "any cause at all" so that adding a new cause to `agentStall`
+ * forces a decision here about whether it belongs in the red tier, instead of silently recolouring
+ * rows. Each member is work that EXISTS and that nothing is coming to finish — which is what the
+ * founder's rule licenses painting red.
+ *
+ * ── `expired-goal` IS DELIBERATELY ABSENT. EXPIRY IS NOT AN ALARM. ───────────────────────────────
+ * It was in this set and it was the single biggest source of false red on the fleet (sparkle-biezi).
+ * Verified live on agent 11a52157: status `idle`, `needsYou` false, thrash `healthy`, a spotless
+ * worktree, zero commits of its own — and `stallReport` returned `stalled` with the ONE cause
+ * `expired-goal`, so this set painted it "needs you to unstick it". Three more rows in the same
+ * screenshot were labelled MERGED TO MAIN and red for the same reason. Four rows at once, all of
+ * them finished, all of them wearing the loudest signal the app has.
+ *
+ * The distinction the old membership missed: every OTHER cause is a fact about the WORK (a goal
+ * nobody met, a PR nobody merged, commits that never landed, files nobody committed). Expiry is a
+ * fact about the CLOCK — `setAt + ttlMs` elapsed. `agentGoal.DEFAULT_GOAL_TTL_MS` bounds how long
+ * auto-continue may SPEND on a goal; it says nothing about whether the work got done, and it fires
+ * on a finished agent and an abandoned one identically. Attaching the strongest signal in the app to
+ * the weakest available cause is what taught the founder to read the column's red as noise — which
+ * costs more than every stall this module was commissioned to surface.
+ *
+ * WHAT THIS DOES NOT DO — and why no second rule was needed for the two halves of the founder's
+ * rule ("expired + landed = gray; expired + unlanded = surfaced, never red"):
+ *   • EXPIRED + LANDED → the expiry is the only cause, this set matches nothing, the row stays
+ *     calm. Gray, done. That is the four-row bug above.
+ *   • EXPIRED + UNLANDED → `open-pr` / `unlanded-work` / `uncommitted-changes` are still in this
+ *     set and still fire on their own evidence, so that row still leaves calm — on the strength of
+ *     the WORK, which is a claim that holds up, rather than on the strength of the clock.
+ * So the unlanded half keeps exactly the colour it had; only the clock stops voting.
+ *
+ * THE CAUSE ITSELF IS UNTOUCHED, and that is the whole "surfaced, never red" half. `agentStall`
+ * still reports `expired-goal`, so `rowAttention.stallChipFor` still renders the "goal expired" chip
+ * and `goalBadgeFor` still renders "ran out of time — never met" in amber. The reader still learns
+ * the TTL lapsed; they just no longer learn it in the colour reserved for "a human is blocking this".
+ * Do NOT fix a future "expiry is invisible" report by adding it back here — the affordance exists,
+ * one layer up.
  */
 const OUTSTANDING: ReadonlySet<StallCause> = new Set<StallCause>([
   "unmet-goal",
   "escalated-goal",
-  "expired-goal",
   "open-pr",
   "unlanded-work",
   "uncommitted-changes",

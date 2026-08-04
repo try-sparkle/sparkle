@@ -48,7 +48,26 @@ export const BUILD_SECTIONS: readonly BuildSectionMeta[] = [
   {
     id: "local_uncommitted",
     label: "Local: Uncommitted",
-    detail: "Changes exist only in the working tree — closing this agent loses them.",
+    // ⚠️ THIS RUNG IS A CATCH-ALL, SO ITS COPY MUST NOT ASSERT WHAT ONLY HALF OF IT MEANS.
+    // `sectionOfStage` folds FOUR stages in here — thought / specd / planned / building_unsaved —
+    // and `gitDerivedStage` returns `building_unsaved` for `ahead === 0` REGARDLESS of `dirty`. So
+    // this section holds two different rows: one with unsaved edits at risk, and one where nothing
+    // has happened yet at all.
+    //
+    // It used to read "Changes exist only in the working tree — closing this agent loses them." That
+    // is FALSE for the second kind, and it is the scariest copy in the column. Observed on agent
+    // 11a52157 (sparkle-biezi): spotless worktree, zero commits of its own, its whole job was
+    // babysitting somebody else's PR — and the column told the founder that closing it would lose
+    // work. Compounded with the false red from the expired goal, the row read "broken AND unsaved"
+    // about an agent that was finished.
+    //
+    // WHICH ROW IS WHICH IS ANSWERED ON THE ROW, NOT HERE: a genuinely dirty row carries the
+    // "uncommitted: <file>" chip (rowAttention.stallChipFor), naming what it is holding. A row with
+    // no chip is the "nothing yet" kind. The section says what is true of BOTH; the chip says what
+    // is true of ONE. Do not restore a sentence here that only one of them can honour.
+    detail:
+      "Nothing committed to a branch yet. Any edits in the working tree are lost if this agent " +
+      "closes — the row names them when there are any.",
   },
   {
     id: "local_committed",

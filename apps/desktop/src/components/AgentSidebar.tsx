@@ -4466,7 +4466,10 @@ const AgentRow = memo(function AgentRow({
   // the `unknown` verdict — idle with git state we never read — raises nothing. A stall claim that
   // fires on missing data trains the human to ignore the signal, which costs more than the stall.
   const goalBadge = goalBadgeFor(a.goal, clockNow);
-  const stallChip = isStalled(stall) ? stallChipFor(stall) : null;
+  // `bs` is passed so an "uncommitted changes" chip can NAME the file it is talking about
+  // (sparkle-biezi) — the same reading the stall question was built from, so the chip and the
+  // verdict can never describe different worktree states.
+  const stallChip = isStalled(stall) ? stallChipFor(stall, bs) : null;
   // `goalOutstanding` gates the no-progress alarm only (three tool-less turns are just a
   // conversation when nothing is outstanding). We genuinely know this — no goal means no goal work —
   // so `false` here is evidence, not a fabrication.
@@ -4583,7 +4586,13 @@ const AgentRow = memo(function AgentRow({
   const stallChipEl = stallChip ? (
     <span
       data-testid="row-stall"
-      title={stall.detail}
+      // The FULL paths ride the tooltip. The chip has room for one basename, which is enough to tell
+      // a forgotten fix from a build artifact at a glance; someone who needs the directory hovers.
+      title={
+        stallChip.files.length > 0
+          ? `${stall.detail}\n\nUncommitted:\n${stallChip.files.join("\n")}`
+          : stall.detail
+      }
       aria-label={stallChip.ariaLabel}
       style={{
         display: "inline-flex",

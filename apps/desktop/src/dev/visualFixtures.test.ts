@@ -25,6 +25,10 @@ import {
   visualCaptureRun,
   visualPrsRequested,
 } from "./visualFixtures";
+import { stallReport } from "../engine/agentStall";
+import { stallInputsFor } from "../components/rowAttention";
+import { bandOfStatus, sectionOfStage } from "../engine/buildSections";
+import type { AgentTabStatus } from "../types";
 import { useUiStore } from "../stores/uiStore";
 import { isProjectOpen } from "../engine/openProjects";
 import { PROJECTS_PERSIST_DEBOUNCE_MS, PROJECTS_PERSIST_KEY, debouncedProjectsStorage, flushProjectsPersist, useProjectStore } from "../stores/projectStore";
@@ -919,5 +923,77 @@ describe("the project_open_prs shim", () => {
       src,
       "fetchOpenPrs no longer invokes project_open_prs with a `root` argument — the shim's key is stale",
     ).toMatch(/invoke<[^>]*>\(\s*"project_open_prs",\s*\{\s*root\b/);
+  });
+});
+
+describe("the sparkle-biezi capture row — its ONE load-bearing property", () => {
+  // WHY THIS TEST EXISTS (roborev 57769). `vfx-agent-8` is the row that photographs the expiry
+  // colour fix, and its entire value rests on a property that was EMERGENT and pinned nowhere: that
+  // `expired-goal` is its ONLY stall cause, so its dot is a direct readout of
+  // `stallEscalation.OUTSTANDING` membership.
+  //
+  // That property falls out of three independent facts — `status: "idle"`, a `stage` that lands
+  // OUTSIDE `hasUnmergedCommittedWork`'s band, and no seeded PR/dirty-tree evidence. Any one of them
+  // can drift silently: move the row to `pull_request`, flip its status, or shift that band's upper
+  // bound in workflowStage.ts, and the row picks up `unlanded-work`, paints red for a reason that has
+  // nothing to do with expiry, and the capture goes vacuous — identical before and after — with the
+  // whole suite still green. That is the same failure the row's own comment warns about, and the same
+  // one that already bit this file twice (roborev 57429, 57331).
+  //
+  // Asserted through `stallInputsFor`, the PRODUCTION mapper, rather than a hand-built StallInput: a
+  // fixture whose evidence I assembled myself would prove my assembly, not the app's.
+  /** Every seeded row whose ONLY stall cause is `expired-goal`, as the harness would see it.
+   *
+   *  SHARED BY BOTH TESTS ON PURPOSE (roborev 57779). The second test used to re-find its subject by
+   *  a DIFFERENT predicate — "the row at stage `merged` that has a goal" — and then assert that row's
+   *  section is `remote_merged`, which is a tautology on a pure switch: it had selected the row BY
+   *  that stage. Worse, the two tests could drift onto different rows and both stay green while
+   *  neither described the row the capture actually photographs. Selecting once, by the property that
+   *  matters, is what makes the stage assertion below a real claim.
+   *
+   *  Built through `stallInputsFor`, the PRODUCTION mapper, so this proves the app's evidence
+   *  assembly rather than my restatement of it. The harness seeds the stage watermark and nothing
+   *  else, so branchStatus and workflowState are genuinely absent here, not defaulted. */
+  function soleExpiryRows() {
+    const { project, status, workflowStage } = buildVisualFixture();
+    const rows = project.agents.filter((a) => {
+      const report = stallReport(
+        stallInputsFor(status[a.id] as AgentTabStatus, FIXTURE_NOW, a.goal, {
+          stageOverride: workflowStage[a.id],
+        }),
+      );
+      return report.verdict === "stalled" && report.causes.length === 1 && report.causes[0] === "expired-goal";
+    });
+    return { rows, status, workflowStage };
+  }
+
+  it("has exactly one row whose ONLY stall cause is `expired-goal`", () => {
+    const { rows, status } = soleExpiryRows();
+    expect(
+      rows.map((a) => a.name),
+      "no fixture row has `expired-goal` as its sole stall cause — the agent-sidebar capture can no " +
+        "longer photograph the expiry colour fix, and would look identical with or without it",
+    ).toHaveLength(1);
+    // …and it must be CALM, since the whole claim is "a finished agent renders gray". A row that had
+    // drifted to `waiting`/`blocked` would report `active` above and never reach this line, but say it
+    // out loud so the intent survives a refactor of the filter.
+    expect(bandOfStatus(status[rows[0]!.id] as AgentTabStatus)).toBe("done");
+  });
+
+  it("and THAT row is the founder's actual case — merged to main, idle, goal expired", () => {
+    // Three of the four red rows in his screenshot were labelled MERGED TO MAIN. A row that proved
+    // the rule from some other stage would leave the reported case unphotographed.
+    //
+    // This asserts the stage of the row selected by CAUSE above, which is what stops it being the
+    // tautology roborev 57779 flagged: nothing here chose the row for its stage, so `merged` /
+    // `remote_merged` is a fact being checked rather than one being restated.
+    const { rows, status, workflowStage } = soleExpiryRows();
+    const row = rows[0];
+    expect(row, "no sole-expiry row to make claims about").toBeDefined();
+    expect(goalStateOf(row!.goal, FIXTURE_NOW)).toBe("expired");
+    expect(status[row!.id]).toBe("idle");
+    expect(workflowStage[row!.id]).toBe("merged");
+    // The band the founder read off the screen.
+    expect(sectionOfStage(workflowStage[row!.id]!)).toBe("remote_merged");
   });
 });

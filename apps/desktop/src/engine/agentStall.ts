@@ -184,6 +184,22 @@ export function stallReport(input: StallInput): StallReport {
   // is never continued and never escalated, so it reads `stalled` until 13:00 and then flips to
   // `finished` — and the 153-minute-class stalls this feature was commissioned for are the ones
   // most likely to cross the TTL.
+  //
+  // ⚠️ THE COLOUR HALF OF THAT ARGUMENT NO LONGER HOLDS, and this comment used to imply it did
+  // (roborev 57759, sparkle-biezi). `expired-goal` is NO LONGER in `stallEscalation.OUTSTANDING`, so
+  // it no longer paints the row red. Everything above is still true of THIS surface — the cause is
+  // still reported, the verdict is still `stalled`, and the row still renders the amber clock chip
+  // and the "ran out of time — never met" badge. What changed is only which SIGNAL carries it.
+  //
+  // BE HONEST ABOUT WHAT THAT COSTS, because `goalStateOf` is EXCLUSIVE — `unmet` and `expired` never
+  // coexist. So at `setAt + ttlMs` exactly, an agent that is genuinely stuck with a clean worktree and
+  // no commits stops contributing `unmet-goal` (red) and starts contributing `expired-goal` (amber),
+  // with nothing about its work having changed. That is a real de-escalation of the 09:00/09:30 case
+  // above, and it is DELIBERATE: the founder's rule of 2026-08-04 is that red is reserved for "a human
+  // is blocking this", and a lapsed timer is not that. The row does not go silent — it keeps the chip
+  // — it just stops shouting. The channel for "this genuinely needs a human now" is `escalated-goal`,
+  // which is still red; an agent that expires WITHOUT escalating is one auto-continue never engaged
+  // with, and the fix for that belongs in goalContinuation/turn-end authority, not in this colour.
   if (goalState === "expired") causes.push("expired-goal");
   if (hasOpenPr === true) causes.push("open-pr");
   // FOLDED INTO `open-pr` WHENEVER BOTH HOLD. An agent with an open PR has unlanded commits by

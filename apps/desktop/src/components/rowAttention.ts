@@ -141,6 +141,10 @@ export interface StallChip {
    *  is true: the mechanism meant to keep it moving has handed it back, so it is nobody's but the
    *  human's. Drives the chip's ink. */
   escalated: boolean;
+  /** The uncommitted paths this row is holding, FULL paths, capped by Rust. Empty when the tree is
+   *  clean, when nothing was read, or when the tree is parked (see {@link namedDirtyFiles}). The chip
+   *  shows one basename; these ride the tooltip, where someone who needs the directory looks. */
+  files: string[];
 }
 
 /**
@@ -153,17 +157,61 @@ export interface StallChip {
  * `causes` is ordered most-actionable-first by the engine, so the head is the right thing to name.
  * The "+N" is not decoration either — it tells the reader the tooltip holds more than the headline.
  */
-export function stallChipFor(report: StallReport): StallChip | null {
+export function stallChipFor(report: StallReport, bs?: BranchStatus | undefined): StallChip | null {
   if (report.verdict !== "stalled") return null;
   const first = report.causes[0];
   if (first === undefined) return null;
   const more = report.causes.length - 1;
-  const text = `${STALL_CAUSE_LABEL[first]}${more > 0 ? ` +${more}` : ""}`;
+  const label = first === "uncommitted-changes" ? uncommittedLabel(bs) : STALL_CAUSE_LABEL[first];
+  const text = `${label}${more > 0 ? ` +${more}` : ""}`;
   return {
     text,
     ariaLabel: `Stalled — ${text}`,
     escalated: report.causes.includes("escalated-goal"),
+    files: namedDirtyFiles(bs),
   };
+}
+
+/**
+ * The uncommitted-changes chip, NAMING the file when we know it.
+ *
+ * "uncommitted changes" on its own is the reading the founder could not act on (sparkle-biezi): a
+ * forgotten fix and a leftover build artifact produce the identical row, so every one of them costs a
+ * terminal read to tell apart. One basename is usually enough to make that call at a glance —
+ * `vite.config.ts` is a fix you forgot, `dist/bundle.js` is noise.
+ *
+ * Falls back to the bare label whenever we do not actually know: no reading yet, an older Rust build
+ * that does not send the field, or a PARKED tree whose files are not this branch's to name. Never
+ * invents a filename, and never claims a count it did not read.
+ */
+function uncommittedLabel(bs: BranchStatus | undefined): string {
+  const files = namedDirtyFiles(bs);
+  const head = files[0];
+  if (head === undefined) return STALL_CAUSE_LABEL["uncommitted-changes"];
+  // The TRUE total, not the preview's length — Rust caps the preview at 5 but always counts them all.
+  const total = bs?.dirtyCount ?? files.length;
+  const rest = total - 1;
+  return `uncommitted: ${basename(head)}${rest > 0 ? ` +${rest}` : ""}`;
+}
+
+/**
+ * The dirty paths we may attribute to THIS agent, or `[]`.
+ *
+ * The `worktreeOnBranch === false` gate is the same one `uncommittedEvidence` applies to `dirty`, and
+ * it matters more here: that tree's files belong to whatever branch got checked out into it, so
+ * naming them on this row would pin another branch's work on this agent by filename — a confidently
+ * wrong claim, which is worse than the silence.
+ */
+export function namedDirtyFiles(bs: BranchStatus | undefined): string[] {
+  if (bs === undefined || bs.worktreeOnBranch === false) return [];
+  return bs.dirtyFiles ?? [];
+}
+
+/** `apps/desktop/src/x.ts` → `x.ts`. The chip has room for a name, not a path; the full paths ride
+ *  along in `StallChip.files` for the tooltip, which is where someone who needs the directory looks. */
+function basename(path: string): string {
+  const cut = path.lastIndexOf("/");
+  return cut === -1 ? path : path.slice(cut + 1);
 }
 
 /** What is wrong, in one or two words. `healthy` has no entry — it gets no chip. */
