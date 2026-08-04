@@ -389,6 +389,33 @@ function prNumberOf(args: unknown, data: unknown): number | undefined {
   return a ? num(a.number) : undefined;
 }
 
+/** The dispatch `path` off a terminal-send reply, when it reads as a string. */
+function pathOf(data: unknown): string | undefined {
+  if (!data || typeof data !== "object") return undefined;
+  const p = (data as Record<string, unknown>).path;
+  return typeof p === "string" ? p : undefined;
+}
+
+/** What a spawn reply says went WRONG, when it says anything. `fatal` means the agent is not there:
+ *  no row, nothing to click, and no honest way to call the spawn a success. */
+function spawnShortfall(data: unknown): { fatal: boolean; reason: string } | undefined {
+  if (!data || typeof data !== "object") return undefined;
+  const d = data as Record<string, unknown>;
+  if (d.agentExists === false) {
+    return {
+      fatal: true,
+      reason:
+        typeof d.briefFailure === "string" && d.briefFailure.trim()
+          ? d.briefFailure
+          : "that agent is already gone",
+    };
+  }
+  if (d.briefed === false && typeof d.briefFailure === "string" && d.briefFailure.trim()) {
+    return { fatal: false, reason: d.briefFailure };
+  }
+  return undefined;
+}
+
 /** `{queued, failed}` off a broadcast reply, when both read as numbers. Absent rather than zeroed
  *  when the shape is unrecognized: a fabricated count is worse than no count, and the renderer's
  *  plural arm keys on presence. */
@@ -428,6 +455,13 @@ export function classifyConciergeActionReceipt(
 
   const { kind } = rule;
   const { agentId, agentName } = subjectOf(kind, input.args, input.data);
+  // A SPAWN CAN RETURN ok FOR AN AGENT THAT IS GONE OR NEVER STARTED (roborev 57862).
+  // `spawnBuildAgent` carries `agentExists` and `briefed` precisely because those states are real —
+  // "That agent is gone — it was closed before its opening brief went in", and a `launch-failed`
+  // terminal that never started. Reading only `agentId` minted a clean success carrying a
+  // clickable-looking id for a row the store no longer has: verbatim the complaint in this feature's
+  // header ("You said it's up. But I can't actually click on it").
+  const spawnTrouble = kind === "spawned" && input.ok ? spawnShortfall(input.data) : undefined;
   const beadId = kind === "filed" ? beadIdOf(input.data) : undefined;
   // A FAN-OUT IS NAMED BY THE OP, NOT GUESSED FROM MISSING DATA (roborev 57888). This is the one
   // place that sees `domain`/`op`, so plurality is decided here and carried; the renderer must not
@@ -441,6 +475,16 @@ export function classifyConciergeActionReceipt(
   // exactly like a broadcast and rendered "those agents" for one intended recipient — the same
   // rule-1 inversion just removed from the terminal channel. The op is the only thing that knows,
   // and it is known HERE.
+  // A TERMINAL SEND THAT WAS ONLY HELD IS NOT A DELIVERY (roborev 57862). `conciergeDispatch`
+  // returns ok with `path: "queued"` when the PTY is not up, and `path: "picker-option"` when the
+  // send collapsed onto pressing a button — which is not a message at all, and which
+  // `TERMINAL_RULES` already refuses to describe as one for `select_picker_option`.
+  const sendPath = pathOf(input.data);
+  if (rule.kind === "sent" && rule.channel === "terminal" && input.ok) {
+    // Pressing a picker button is not "sent a message to X"; emitting one would describe something
+    // the concierge did not do.
+    if (sendPath === "picker-option") return null;
+  }
   const isBroadcast = domain === "fleet" && op === "inbox_broadcast";
   const counts = isBroadcast ? countsOf(input.data) : undefined;
   const prNumber = kind === "merged" ? prNumberOf(input.args, input.data) : undefined;
@@ -449,10 +493,18 @@ export function classifyConciergeActionReceipt(
     id: input.id,
     kind,
     // RULE 3 — the reply's own verdict. A refused call is a receipt, not a silence.
-    ok: input.ok,
+    // A spawn whose agent does not exist did NOT succeed, whatever the transport said.
+    ok: input.ok && spawnTrouble?.fatal !== true,
     ...(agentId ? { agentId } : {}),
     ...(agentName ? { agentName } : {}),
-    ...(rule.kind === "sent" ? { channel: rule.channel } : {}),
+    ...(rule.kind === "sent"
+      ? {
+          channel:
+            rule.channel === "terminal" && input.ok && sendPath === "queued"
+              ? ("held" as const)
+              : rule.channel,
+        }
+      : {}),
     ...(beadId ? { beadId } : {}),
     ...(prNumber !== undefined ? { prNumber } : {}),
     ...(isBroadcast ? { fanout: true as const } : {}),
@@ -460,6 +512,11 @@ export function classifyConciergeActionReceipt(
     // Only when it FAILED. A reason on a success would be a caveat the reader has no use for, and
     // the field's own contract is "the refusal, when `ok` is false".
     ...(!input.ok && input.reason ? { reason: input.reason } : {}),
+    // A spawn that produced an agent but could not brief it is still a spawn — the row exists — so
+    // it stays ok and carries the shortfall as the reason. An agent that starts unbriefed is the
+    // observed "every agent I spawn starts dead until I go type into it" failure, and the receipt is
+    // the only place the founder would see it.
+    ...(spawnTrouble ? { reason: spawnTrouble.reason } : {}),
     at: input.at,
     op: `${domain}.${op}`,
   };

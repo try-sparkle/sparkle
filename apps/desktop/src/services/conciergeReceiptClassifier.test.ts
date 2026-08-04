@@ -376,3 +376,75 @@ describe("a broadcast's plurality and counts come from the classifier", () => {
     expect(r?.failed).toBeUndefined();
   });
 });
+
+// ══ THE REPLY SHAPES THE FIXTURES WERE HIDING (roborev 57862) ══════════════════════════════════
+// Every spawn/terminal case fed a hand-built `data` no real reply has, so no case exercised the
+// states the ops actually return `ok` in. These use the real fields.
+describe("a receipt never claims more than the spawn reply said", () => {
+  const spawn = (data: unknown) =>
+    classifyConciergeActionReceipt({
+      domain: "lifecycle",
+      op: "spawn_build_agent",
+      args: { projectId: "p1", task: "x" },
+      ok: true,
+      data,
+      reason: undefined,
+      id: "receipt-1",
+      at: 1,
+    });
+
+  it("a spawn whose agent is GONE is not a success", () => {
+    // spawnBuildAgent resolves ok with agentExists:false — "that agent is gone, it was closed before
+    // its opening brief went in". A clean success carrying its id is a clickable handle for a row
+    // the store no longer has.
+    const r = spawn({ agentId: "agent-77", agentExists: false, briefed: false });
+    expect(r?.ok).toBe(false);
+    expect(r?.reason).toBeTruthy();
+  });
+
+  it("a spawn that could not BRIEF the agent stays a spawn, and says so", () => {
+    const r = spawn({
+      agentId: "agent-77",
+      agentExists: true,
+      briefed: false,
+      briefFailure: "its terminal never came up",
+    });
+    expect(r?.ok).toBe(true);
+    expect(r?.reason).toBe("its terminal never came up");
+  });
+
+  it("a clean spawn carries no caveat — the positive control", () => {
+    const r = spawn({ agentId: "agent-77", agentExists: true, briefed: true });
+    expect(r?.ok).toBe(true);
+    expect(r?.reason).toBeUndefined();
+  });
+});
+
+describe("a terminal send never claims delivery the dispatch did not make", () => {
+  const send = (data: unknown) =>
+    classifyConciergeActionReceipt({
+      domain: "terminal",
+      op: "send_to_agent_terminal",
+      args: { agentId: "a1", text: "hi" },
+      ok: true,
+      data,
+      reason: undefined,
+      id: "receipt-1",
+      at: 1,
+    });
+
+  it("a QUEUED send is `held`, not `terminal`", () => {
+    // conciergeDispatch returns ok with path:"queued" when the PTY is not up — the common case for a
+    // just-spawned agent — and that entry can still expire.
+    expect(send({ path: "queued", agentId: "a1" })?.channel).toBe("held");
+  });
+
+  it("a delivered send is still `terminal` — the positive control", () => {
+    expect(send({ path: "free-text", agentId: "a1" })?.channel).toBe("terminal");
+  });
+
+  it("a PICKER-OPTION send earns no receipt — it pressed a button, it did not send a message", () => {
+    // TERMINAL_RULES already refuses a receipt for select_picker_option on exactly this ground.
+    expect(send({ path: "picker-option", agentId: "a1" })).toBeNull();
+  });
+});

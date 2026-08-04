@@ -99,8 +99,16 @@ export function actionReceiptLine(
   }
 
   switch (receipt.kind) {
-    case "spawned":
-      return line`Spawned ${subject}.`;
+    case "spawned": {
+      // A spawn that could not brief the agent still made the row, so the line still says "Spawned"
+      // — and then says what did not happen. An agent that starts unbriefed sits there doing nothing
+      // ("every agent I spawn starts dead until I go type into it"), and this is the only place the
+      // founder would learn it without opening the terminal (roborev 57862).
+      const shortfall = receipt.reason?.trim();
+      return shortfall
+        ? line`Spawned ${subject} — but ${plain(shortfall)}`
+        : line`Spawned ${subject}.`;
+    }
 
     case "sent": {
       // A BROADCAST HAS NO SINGLE RECIPIENT, and must not be described as though it did.
@@ -122,6 +130,12 @@ export function actionReceiptLine(
       // A broadcast with NO counts — its refusal arms carry no data — still reads plural, because
       // `fanout` came from the op rather than from the absent subject. A single `inbox_send` whose
       // args were refused is subject-less too, and it correctly stays singular (roborev 57905).
+      // HELD, not delivered: the PTY was not up, so the message is queued and will go in when the
+      // agent is ready — or expire. Saying "Sent to X's terminal" here is the sent-versus-visible
+      // ambiguity the channel field exists to remove (roborev 57862).
+      if (receipt.channel === "held") {
+        return line`Holding a message for ${subject} — it goes in when its terminal is ready.`;
+      }
       if (receipt.channel === "inbox") {
         // RULE 2. The inbox arm states the DELAY, because the delay is the whole reason the founder
         // could not find the message he had been told about.

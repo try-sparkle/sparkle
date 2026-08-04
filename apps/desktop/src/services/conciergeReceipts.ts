@@ -48,8 +48,16 @@ export type ConciergeActionKind =
  *  would make the receipt lie by omission: a TERMINAL write lands in the agent's PTY immediately,
  *  while an INBOX message sits queued until that agent's next turn boundary and is invisible until
  *  then (bead sparkle-zm0c8). "Sent to X" without saying which one is exactly the ambiguity the
- *  founder has been burned by. */
-export type ConciergeSendChannel = "terminal" | "inbox";
+ *  founder has been burned by.
+ *
+ *  `held` is the third, and it exists because `terminal` was documented as landing IMMEDIATELY while
+ *  the op returns ok on a path where it demonstrably does not: `conciergeDispatch` answers
+ *  `{ok: true, path: "queued"}` when the PTY is not up yet — "held and will be sent the moment it is
+ *  ready" — and that entry can still expire or be abandoned afterwards, which is the whole reason
+ *  `onDeferredSendOutcome` exists. Sending to an agent the concierge just spawned is the COMMON way
+ *  to hit it. A receipt reading "Sent to X's terminal" for a message merely held is the same
+ *  sent-versus-actually-visible ambiguity this field was added to remove (roborev 57862). */
+export type ConciergeSendChannel = "terminal" | "inbox" | "held";
 
 /** One thing the concierge did, as the human should be able to check it.
  *
