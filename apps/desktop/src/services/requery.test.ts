@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import type { AgentKind, AgentTab, Project } from "../types";
 import type { AgentTabStatus } from "@sparkle/ui";
+import { BLOCKER_ASK, MAX_SILENCE_MS } from "@sparkle/core";
 
 // Re-query talks to PTY agents via submitPrompt. Mock it so the dispatcher's
 // routing/filtering is what's under test.
@@ -17,12 +18,17 @@ vi.mock("../pty", () => ({
   },
 }));
 // Silence the failure log so a deliberately-rejecting agent doesn't print to the test output.
+const getAgentScrollback = vi.fn<(id: string) => string | null>(() => null);
+vi.mock("./terminalScrollback", () => ({
+  getAgentScrollback: (id: string) => getAgentScrollback(id),
+}));
 vi.mock("../logger", () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
 import {
   requeryOpenAgents,
+  _resetRequeryMemoryForTests,
   shouldRequery,
   claimReconnectRequery,
   requeryOnReconnect,
@@ -70,7 +76,10 @@ function seed(agents: AgentTab[], open: string[], status: Record<string, AgentTa
 }
 
 beforeEach(() => {
+  _resetRequeryMemoryForTests();
   submitPrompt.mockReset();
+  getAgentScrollback.mockReset();
+  getAgentScrollback.mockReturnValue(null);
   vi.mocked(log.error).mockClear();
   vi.mocked(log.debug).mockClear();
 });
@@ -269,5 +278,196 @@ describe("shouldRequery — only the offline→online edge fires", () => {
   });
   it("does not fire while staying offline", () => {
     expect(shouldRequery(false, false)).toBe(false);
+  });
+});
+
+describe("what the agent actually receives (sparkle-4cd0x)", () => {
+  // EVERY OTHER TEST IN THIS FILE USES `REQUERY_PROMPT` SYMBOLICALLY, so all of them passed against
+  // the wording that caused the bug: "can you give me a brief status update on where things stand?"
+  // — which four agents answered with a narrative before stopping, several asking a question back.
+  //
+  // ONE ASSERTION, NOT SIX (roborev 57702). `REQUERY_PROMPT` is a re-export of `BLOCKER_ASK`, so
+  // pinning its wording here would re-test `@sparkle/core`'s constant at a second site;
+  // `pusherBlocker.test.ts` already pins the content — that it names merging, forbids asking back,
+  // carries the fenced block, and contains no digits that could trip the citation gate — at the
+  // definition site where a change to it is actually made. What is requery's OWN behaviour, and what
+  // no other file can catch, is that this path still sends THAT text rather than reintroducing a
+  // status-report prompt of its own.
+  it("sends the shared blocker ask, not a status-report prompt of its own", () => {
+    expect(REQUERY_PROMPT).toBe(BLOCKER_ASK);
+  });
+});
+
+describe("the ask is composed, and sometimes it is silence (sparkle-4cd0x)", () => {
+  /** Seed one open, idle build agent with a goal state and a branch reading. */
+  function seedAgent(over: {
+    goalMetAt?: number;
+    ahead?: number;
+    behind?: number;
+    dirty?: boolean;
+    status?: AgentTabStatus;
+  }) {
+    const a = agent("b1", "build");
+    if (over.goalMetAt !== undefined) {
+      a.goal = {
+        text: "land it",
+        setAt: 0,
+        ttlMs: 3_600_000,
+        continues: 0,
+        totalContinues: 0,
+        metAt: over.goalMetAt,
+      };
+    }
+    seed([a], ["b1"], { b1: over.status ?? "idle" });
+    useRuntimeStore.setState({
+      branchStatus: {
+        b1: {
+          ahead: over.ahead ?? 0,
+          behind: over.behind ?? 0,
+          dirty: over.dirty ?? false,
+          filesChanged: 0,
+          insertions: 0,
+          deletions: 0,
+          worktreeOnBranch: true,
+        },
+      },
+    } as never);
+  }
+
+  it("ASKS NOTHING the second time, when the agent is finished and nothing has moved", async () => {
+    // THE WASTE CASE, end to end. The founder's example: an agent that had already reported
+    // done-and-landed, asked anyway, spending a full turn to say "same as last check".
+    //
+    // The agent's OWN "not-blocked" report is required, not just our inference that it looks
+    // finished — see the corroboration rule in `buildAsk` arm 1.
+    getAgentScrollback.mockReturnValue(
+      "```sparkle-blocker\nblocked: not-blocked\nnext: merged\n```",
+    );
+    seedAgent({ goalMetAt: 1, ahead: 0, dirty: false });
+
+    await requeryOpenAgents(); // first pass has no prior picture, so it asks once
+    expect(submitPrompt).toHaveBeenCalledTimes(1);
+
+    submitPrompt.mockClear();
+    await requeryOpenAgents(); // nothing changed, and it looked finished
+    expect(submitPrompt).not.toHaveBeenCalled();
+  });
+
+  it("asks again as soon as something actually moves, and leads with it", async () => {
+    getAgentScrollback.mockReturnValue(
+      "```sparkle-blocker\nblocked: not-blocked\nnext: merged\n```",
+    );
+    seedAgent({ goalMetAt: 1, ahead: 0, dirty: false });
+    await requeryOpenAgents();
+    submitPrompt.mockClear();
+
+    seedAgent({ goalMetAt: 1, ahead: 0, dirty: false, behind: 3 }); // main moved under it
+    await requeryOpenAgents();
+
+    expect(submitPrompt).toHaveBeenCalledTimes(1);
+    const [, sent] = submitPrompt.mock.calls[0]!;
+    expect(sent).toContain("main has moved since you last looked");
+  });
+
+  it("keeps asking an UNFINISHED agent even when nothing changed", async () => {
+    // Silence is only ever correct for the terminal case. An agent holding unlanded work is exactly
+    // the one worth asking, and going quiet on it would be the founder's own complaint inverted.
+    seedAgent({ ahead: 4, dirty: true });
+    await requeryOpenAgents();
+    submitPrompt.mockClear();
+    await requeryOpenAgents();
+    expect(submitPrompt).toHaveBeenCalledTimes(1);
+  });
+
+  it("asks an agent whose branch we cannot see — an unknown reading is never 'finished'", async () => {
+    // Fail-closed toward asking: the cost of a wrong 'terminal' is an agent that is genuinely stuck
+    // and never spoken to again, which is far worse than one wasted turn.
+    //
+    // EVERY OTHER REASON TO ASK IS REMOVED FIRST, so the branch reading is the only thing left
+    // holding the suppression open (roborev 57707). A met goal, and a corroborating "not-blocked"
+    // report, and a prior ask — without all three, `buildAsk` declines to go silent for a reason
+    // that has nothing to do with the branch, and mutating `ahead === 0 && dirty === false` leaves
+    // this green. It did, on the first attempt.
+    getAgentScrollback.mockReturnValue(
+      "```sparkle-blocker\nblocked: not-blocked\nnext: merged\n```",
+    );
+    const a = agent("b1", "build");
+    a.goal = { text: "land it", setAt: 0, ttlMs: 3_600_000, continues: 0, totalContinues: 0, metAt: 1 };
+    seed([a], ["b1"], { b1: "idle" });
+    useRuntimeStore.setState({ branchStatus: {} } as never);
+
+    await requeryOpenAgents(); // first contact: always asks, and stamps the silence clock
+    submitPrompt.mockClear();
+
+    // Second pass: corroborated, recent, goal met — and the branch is UNREADABLE. That alone must
+    // keep it being asked, because an unknown reading is not evidence of a finished agent.
+    await requeryOpenAgents();
+    expect(submitPrompt).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("reading the agent's previous answer back (roborev 57707)", () => {
+  const blockedReply =
+    "I looked at the failing job.\n\n```sparkle-blocker\nblocked: blocked-on-ci\n" +
+    "next: waiting for the lint shard\n```\n";
+
+  it("names the blocker the agent itself reported, instead of asking generically", async () => {
+    // The feature the change leads with — "reads the agent's previous answer back out of its
+    // terminal" — and it was reachable only in unit tests until this mock existed: no provider is
+    // registered without a mounted Terminal, so `getAgentScrollback` returned null for every case
+    // and arm 2 was never exercised through the production path.
+    getAgentScrollback.mockReturnValue(blockedReply);
+    seed([agent("b1", "build")], ["b1"], { b1: "idle" });
+
+    await requeryOpenAgents();
+
+    expect(getAgentScrollback).toHaveBeenCalledWith("b1");
+    const [, sent] = submitPrompt.mock.calls[0]!;
+    expect(sent).toContain("blocked-on-ci");
+    expect(sent).toContain("waiting for the lint shard");
+    expect(sent).not.toContain("What is BLOCKING you from merging");
+  });
+
+  it("falls back to the canned ask when there is no readable scrollback", async () => {
+    getAgentScrollback.mockReturnValue(null);
+    seed([agent("b1", "build")], ["b1"], { b1: "idle" });
+    await requeryOpenAgents();
+    expect(submitPrompt).toHaveBeenCalledWith("b1", BLOCKER_ASK, { machine: true });
+  });
+
+  it("BREAKS THE SILENCE after an hour, even on an agent that looked finished", async () => {
+    // The bound that stops a wrong `terminal` being permanent. A 529-killed agent presents exactly
+    // as finished — met goal, clean branch, nothing ever moving again — so without this it would
+    // never be spoken to again.
+    getAgentScrollback.mockReturnValue(
+      "```sparkle-blocker\nblocked: not-blocked\nnext: merged\n```",
+    );
+    const a = agent("b1", "build");
+    a.goal = { text: "land it", setAt: 0, ttlMs: 3_600_000, continues: 0, totalContinues: 0, metAt: 1 };
+    seed([a], ["b1"], { b1: "idle" });
+    useRuntimeStore.setState({
+      branchStatus: {
+        b1: { ahead: 0, behind: 0, dirty: false, filesChanged: 0, insertions: 0, deletions: 0, worktreeOnBranch: true },
+      },
+    } as never);
+
+    const realNow = Date.now;
+    try {
+      let clock = 1_000_000;
+      Date.now = () => clock; // installed BEFORE the first ask, so every stamp shares this clock
+
+      await requeryOpenAgents();
+      expect(submitPrompt).toHaveBeenCalledTimes(1); // first contact always asks
+
+      submitPrompt.mockClear();
+      await requeryOpenAgents();
+      expect(submitPrompt).not.toHaveBeenCalled(); // corroborated + recent -> silent
+
+      clock += MAX_SILENCE_MS;
+      await requeryOpenAgents();
+      expect(submitPrompt).toHaveBeenCalledTimes(1); // ...and the silence lapses
+    } finally {
+      Date.now = realNow;
+    }
   });
 });

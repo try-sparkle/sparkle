@@ -43,6 +43,7 @@ import { startUpdater } from "./services/updaterService";
 import { startStaleBuildWatch } from "./services/staleBuildService";
 import { startGoalContinuationRunner } from "./services/goalContinuationRunner";
 import { startFleetWatch } from "./services/fleetWatch";
+import { startPusher } from "./services/pusherMount";
 
 // The Workspace subtree pulls in the heavy authenticated UI — xterm, markdown rendering, modals,
 // the agent panes. Lazy-load it (code-split) so an unauthenticated / unpaid first-run user, who
@@ -157,6 +158,23 @@ function LimitSync() {
 // UI.
 function GoalContinuation() {
   useEffect(() => startGoalContinuationRunner(), []);
+  return null;
+}
+
+// THE PUSHER — the continuous sweep that decides, every minute, whether a build agent or the
+// concierge needs pushing (services/pusherMount, sparkle-4cd0x).
+//
+// MOUNTED HERE BECAUSE IT NEVER WAS. Its whole decision core has existed and been tested for weeks
+// in packages/core, and `pusherRunner` recorded in its own header that nothing in a running app had
+// ever called it. That is the mechanical reason the founder kept finding a fleet nobody was
+// cycling through: not a Pusher that judged badly, a Pusher that was never asked.
+//
+// Beside GoalContinuation deliberately — the two are siblings that must not collide. The goal
+// runner writes to the PTY and answers an expired goal with `{action:"none"}`; this writes to the
+// inbox and every one of its triggers sits in a gap the goal runner declines. Same single-owner
+// election, so a satellite window observes without double-pushing.
+function Pusher() {
+  useEffect(() => startPusher(), []);
   return null;
 }
 
@@ -425,6 +443,7 @@ export function App() {
       <FleetWatch />
       <LimitSync />
       <GoalContinuation />
+      <Pusher />
       <ApiRecovery />
       <DisplayRespan />
       <LastFocusedProjectTracker />

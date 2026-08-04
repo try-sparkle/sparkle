@@ -9,6 +9,7 @@ import {
   PROACTIVE_COALESCE_MS,
   PROACTIVE_MAX_PER_HOUR,
   PROACTIVE_MIN_INTERVAL_MS,
+  MAX_PENDING_NOTICES,
   accountedNeedsYou,
   buildProactivePrompt,
   createProactiveScheduler,
@@ -565,5 +566,217 @@ describe("markStaleProactive", () => {
   it("is idempotent — an already-stale push is not rewritten", () => {
     const chat = [push({ stale: true })];
     expect(markStaleProactive(chat, "D2")).toBe(chat);
+  });
+});
+
+describe("notify — the Pusher's second input (sparkle-4cd0x)", () => {
+  // Founder: "the build agent AND THE CONCIERGE are both just sitting silent… I'm wondering if the
+  // pusher can be the thing that does that." Nothing pushed the concierge about a measured fleet
+  // condition, because those move no roster digest — so the channel could only ever speak about
+  // needs-you churn, and the conditions worth escalating were invisible to it by construction.
+
+  it("speaks on its own, with no feed change behind it at all", () => {
+    // THE CASE THAT DID NOT EXIST. Before this, a scheduler that had never seen a digest change
+    // fired nothing, forever, however much the Pusher measured.
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    s.notify("Agent A has been quota-walled for 3h; its goal expires inside the wall.");
+    h.advance(PROACTIVE_COALESCE_MS);
+    expect(h.fired).toHaveLength(1);
+    expect(h.fired[0]!.prompt).toContain("quota-walled for 3h");
+  });
+
+  it("tells the concierge to ACT, rather than to relay it to the founder", () => {
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    s.notify("Agent A is blocked on CI");
+    h.advance(PROACTIVE_COALESCE_MS);
+    expect(h.fired[0]!.prompt).toMatch(/yours to act on/);
+    expect(h.fired[0]!.prompt).toMatch(/do not simply relay them to him/);
+  });
+
+  it("obeys the same coalescing window — several findings cost ONE turn, not one each", () => {
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    s.notify("one");
+    s.notify("two");
+    s.notify("three");
+    h.advance(PROACTIVE_COALESCE_MS);
+    expect(h.fired).toHaveLength(1);
+    for (const t of ["one", "two", "three"]) expect(h.fired[0]!.prompt).toContain(t);
+  });
+
+  it("obeys the two-minute floor and the six-an-hour cap", () => {
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    for (let i = 0; i < 20; i++) {
+      s.notify(`finding ${i}`);
+      h.advance(PROACTIVE_COALESCE_MS);
+      h.advance(PROACTIVE_MIN_INTERVAL_MS);
+    }
+    expect(h.fired.length).toBeLessThanOrEqual(PROACTIVE_MAX_PER_HOUR);
+  });
+
+  it("is idempotent while a finding is still owed — a sweep re-measuring costs nothing", () => {
+    // The Pusher re-measures the same fleet every five minutes, so the identical sentence arrives
+    // again and again while the condition holds. Re-arming on each would push the coalescing window
+    // out in front of itself and the finding would never be spoken.
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    for (let i = 0; i < 10; i++) {
+      s.notify("Agent A is blocked on CI");
+      h.advance(PROACTIVE_COALESCE_MS / 2);
+    }
+    h.advance(PROACTIVE_COALESCE_MS);
+    expect(h.fired).toHaveLength(1);
+    expect(h.fired[0]!.prompt.match(/Agent A is blocked on CI/g)).toHaveLength(1);
+  });
+
+  it("SURVIVES A DECLINE — an undelivered finding is still owed, unlike a digest", () => {
+    // The rule this whole feature turns on. A feed change is dropped when the fleet settles back;
+    // a finding is not, because "this agent has been walled for three hours" does not stop being
+    // true because the roster stopped moving.
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    h.decline();
+    s.notify("Agent A is blocked on CI");
+    h.advance(PROACTIVE_COALESCE_MS);
+    expect(h.fired).toHaveLength(1);
+
+    h.acceptAgain();
+    h.advance(PROACTIVE_MIN_INTERVAL_MS);
+    expect(h.fired).toHaveLength(2);
+    expect(h.fired[1]!.prompt).toContain("Agent A is blocked on CI");
+  });
+
+  it("is cleared by DELIVERY and only by delivery — it is not re-sent forever", () => {
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    s.notify("Agent A is blocked on CI");
+    h.advance(PROACTIVE_COALESCE_MS);
+    expect(h.fired).toHaveLength(1);
+
+    h.advance(PROACTIVE_MIN_INTERVAL_MS * 3);
+    expect(h.fired).toHaveLength(1);
+    expect(h.pending()).toBe(0);
+  });
+
+  it("is not dropped when the fleet flickers back to a state already spoken about", () => {
+    // `observe` calls `dropPending` on an unchanged digest. That is right for a digest and wrong for
+    // a finding, and getting it wrong would strand the finding until some unrelated change happened
+    // to re-arm the timer — on a quiet fleet, never.
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    const calm = feed([agent({ id: "a", status: "working", band: "running" })]);
+    s.observe(calm);
+    s.notify("Agent A has been pushed twice and has not moved.");
+    s.observe(calm);
+    h.advance(PROACTIVE_COALESCE_MS);
+    expect(h.fired).toHaveLength(1);
+    expect(h.fired[0]!.prompt).toContain("pushed twice");
+  });
+
+  it("rides an existing feed change rather than buying a second turn", () => {
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    s.observe(feed([agent({ id: "a", status: "working", band: "running" })]));
+    s.observe(feed([agent({ id: "a", status: "approval", band: "needs_you" })]));
+    s.notify("Agent B is blocked on CI");
+    h.advance(PROACTIVE_COALESCE_MS);
+    expect(h.fired).toHaveLength(1);
+    expect(h.fired[0]!.prompt).toContain("Agent B is blocked on CI");
+    expect(h.fired[0]!.prompt).toMatch(/needs you|Approve/i);
+  });
+
+  it("a declined feed change is STILL re-pended when a finding is also owed", () => {
+    // The regression this guards: the re-pend used to test `pendingSince === null`, and a finding
+    // now holds `pendingSince` non-null on purpose — so under the old test an owed finding would
+    // have swallowed the re-pend and the founder would never hear about the feed change.
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    s.observe(feed([agent({ id: "a", status: "working", band: "running" })]));
+    h.decline();
+    s.observe(feed([agent({ id: "a", status: "approval", band: "needs_you" })]));
+    s.notify("Agent B is blocked on CI");
+    h.advance(PROACTIVE_COALESCE_MS);
+    expect(h.fired).toHaveLength(1);
+
+    h.acceptAgain();
+    h.advance(PROACTIVE_MIN_INTERVAL_MS);
+    expect(h.fired).toHaveLength(2);
+    expect(h.fired[1]!.prompt).toMatch(/needs you|Approve/i);
+    expect(h.fired[1]!.prompt).toContain("Agent B is blocked on CI");
+  });
+
+  it("bounds what one turn carries, keeping the newest", () => {
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    for (let i = 0; i < MAX_PENDING_NOTICES + 4; i++) s.notify(`finding ${i}`);
+    h.advance(PROACTIVE_COALESCE_MS);
+    const prompt = h.fired[0]!.prompt;
+    expect(prompt).not.toContain("finding 0");
+    expect(prompt).toContain(`finding ${MAX_PENDING_NOTICES + 3}`);
+  });
+
+  it("ignores empty text and does nothing after dispose", () => {
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    s.notify("   ");
+    h.advance(PROACTIVE_COALESCE_MS);
+    expect(h.fired).toHaveLength(0);
+
+    s.dispose();
+    s.notify("too late");
+    h.advance(PROACTIVE_COALESCE_MS * 10);
+    expect(h.fired).toHaveLength(0);
+  });
+});
+
+describe("a delivered notice lowers the owed flag (roborev 57705)", () => {
+  it("still coalesces the NEXT feed change, instead of firing it with no window", () => {
+    // THE REGRESSION. `dropPending` keeps `pendingSince` alive while notices are owed, and `fire`
+    // runs it before the transport reports back — so nothing lowered it once the notices were
+    // delivered. `observe`'s `pendingSince ??=` then kept that stale origin, `dueAt` computed a
+    // coalescing deadline already in the past, and the next change fired instantly: a burst of
+    // roster ticks becomes several turns and spends the six-an-hour budget the window protects.
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    s.notify("Agent A is blocked on CI");
+    h.advance(PROACTIVE_COALESCE_MS);
+    expect(h.fired).toHaveLength(1);
+
+    // Well past the min-interval, so the ONLY thing that could hold the next turn is the coalescing
+    // window itself.
+    h.advance(PROACTIVE_MIN_INTERVAL_MS * 2);
+    s.observe(feed([agent({ id: "a", status: "working", band: "running" })]));
+    s.observe(feed([agent({ id: "a", status: "approval", band: "needs_you" })]));
+
+    h.advance(PROACTIVE_COALESCE_MS - 1);
+    expect(h.fired).toHaveLength(1); // ...still held
+    h.advance(1);
+    expect(h.fired).toHaveLength(2); // ...and fires exactly when the window closes
+  });
+
+  it("arms nothing once the notices are gone", () => {
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    s.notify("Agent A is blocked on CI");
+    h.advance(PROACTIVE_COALESCE_MS);
+    expect(h.fired).toHaveLength(1);
+    expect(h.pending()).toBe(0);
+  });
+
+  it("keeps the flag up when a notice arrived while the turn was in flight", () => {
+    // The invariant is "owed <-> flag", in both directions. Lowering it unconditionally would
+    // strand a notice that landed mid-turn.
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    s.notify("first");
+    h.advance(PROACTIVE_COALESCE_MS);
+    expect(h.fired).toHaveLength(1);
+    s.notify("second");
+    h.advance(PROACTIVE_MIN_INTERVAL_MS);
+    expect(h.fired).toHaveLength(2);
+    expect(h.fired[1]!.prompt).toContain("second");
   });
 });

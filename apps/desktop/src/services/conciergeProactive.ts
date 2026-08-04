@@ -98,10 +98,39 @@ export interface ProactiveDeps {
 export interface ProactiveScheduler {
   /** Feed one roster observation in. Cheap: the common case is a string compare. */
   observe(feed: ConciergeFeed): void;
+  /**
+   * Hand the concierge something the Pusher measured that no roster digest would ever show.
+   *
+   * Subject to every cost control `observe` is — the coalescing window, the two-minute floor, the
+   * six-an-hour cap — because a finding is an interruption exactly like a push is. What it is NOT
+   * subject to is the digest: a notice speaks on its own, which is the whole reason it exists.
+   *
+   * IDEMPOTENT ON TEXT. The Pusher re-measures the same fleet every sweep, so the identical
+   * sentence arrives repeatedly while the condition holds; re-sending it is a no-op until the one
+   * that is already owed has been delivered.
+   */
+  notify(text: string): void;
   /** Stop scheduling and drop any armed timer. */
   dispose(): void;
   stats(): ProactiveStats;
 }
+
+/**
+ * How the Pusher's findings are introduced to the concierge.
+ *
+ * Written as an INSTRUCTION rather than as a status line, because the failure being fixed is a
+ * concierge that reads something and does nothing. `pusherBlocker.routeBlocker` has already decided
+ * that each of these is a thing only the concierge can act on before it ever gets here — so the
+ * prompt says act, and names the escalation path for the one case where it genuinely cannot.
+ */
+export const PUSHER_NOTICE_PREAMBLE =
+  "The Pusher measured these and they are yours to act on — the agents involved cannot. " +
+  "Act on each one now (read the job, arbitrate, restart, or say the one thing the founder has to " +
+  "decide); do not simply relay them to him.\n";
+
+/** The most findings one turn will carry, newest kept. Beyond this the prompt stops being readable
+ *  and a concierge that is handed thirty items acts on none of them. */
+export const MAX_PENDING_NOTICES = 8;
 
 /** Every agent in the feed, across projects. */
 function allAgents(feed: ConciergeFeed): ConciergeAgent[] {
@@ -274,6 +303,26 @@ interface Due {
  * already handled, for free, by {@link markStaleProactive}.
  */
 export function createProactiveScheduler(deps: ProactiveDeps): ProactiveScheduler {
+  /**
+   * Findings from the Pusher that are owed to the concierge but not yet delivered.
+   *
+   * ── WHY THE SCHEDULER GREW A SECOND INPUT (sparkle-4cd0x) ──────────────────────────────────────
+   * Founder: *"the build agent AND THE CONCIERGE are both just sitting silent… I'm wondering if the
+   * pusher can be the thing that does that."* This channel already pushes the concierge, but only
+   * ever about ONE thing: a change in the needs-you digest. The conditions the Pusher measures —
+   * an agent quota-walled for hours, a goal escalated, an app duty overdue, several agents killed by
+   * one event, an agent pushed twice that did not move — move no digest, so nothing said anything
+   * about them and the concierge had no way to learn they existed. Every watchdog pointed at build
+   * agents; none pointed at the thing supposed to be watching them.
+   *
+   * ── WHY THEY LIVE IN THEIR OWN LIST AND NOT IN `pendingFeed` ───────────────────────────────────
+   * They must survive `dropPending`. A feed change is DISCARDED when the fleet flickers back to the
+   * state we already spoke about — correct for a digest, and wrong for a finding: "this agent has
+   * been walled for three hours" does not stop being true because the roster settled. So notices are
+   * cleared on exactly one event, DELIVERY, and a decline leaves them owed. That is the same
+   * "the change is still OWED" rule `fire`'s settle path already applies to a feed change.
+   */
+  let pendingNotices: string[] = [];
   /** The digest we last seeded or spoke about. */
   let baseline: string | null = null;
   /** The SURFACED projection of that same moment — what a push would actually have said about it.
@@ -323,9 +372,21 @@ export function createProactiveScheduler(deps: ProactiveDeps): ProactiveSchedule
     pendingFeed = null;
     pendingDigest = null;
     pendingSurfaced = null;
-    pendingSince = null;
     counted = new Set();
     clearTimer();
+    // AN UNDELIVERED NOTICE KEEPS THE CHANGE PENDING. `pendingSince` is the whole lifecycle's
+    // "something is owed" flag — `arm` and `onTimer` both bail on null — so clearing it while
+    // notices remain would strand them until some unrelated feed change happened to re-arm the
+    // timer, which on a quiet fleet is never. A dropped FEED change and an owed NOTICE are
+    // different facts, and this is the one line that has to tell them apart.
+    if (pendingNotices.length === 0) {
+      pendingSince = null;
+    } else {
+      // Re-armed through `arm` rather than by setting a timer here, so the notice is still held
+      // behind the min-interval and hourly cap and still counts the limiter that held it. A raw
+      // timer would make a notice the one thing in this module that can outrun its own budget.
+      arm();
+    }
   };
 
   const prune = (now: number) => {
@@ -366,8 +427,20 @@ export function createProactiveScheduler(deps: ProactiveDeps): ProactiveSchedule
     const feed = pendingFeed;
     const digest = pendingDigest;
     const surfaced = pendingSurfaced;
-    if (!feed || digest === null || surfaced === null) return;
-    const prompt = buildProactivePrompt(feed);
+    // Snapshotted BEFORE `dropPending`, and by value: `settle` runs after an await and must clear
+    // exactly the notices this turn carried, never ones that arrived while it was in flight.
+    const notices = pendingNotices.slice();
+    const hasFeedChange = feed !== null && digest !== null && surfaced !== null;
+    // A NOTICE ALONE IS ENOUGH TO SPEAK. This is the point of the second input: the Pusher's
+    // findings move no digest, so requiring a feed change here would mean they could only ever ride
+    // along with an unrelated one — i.e. exactly the silence being fixed.
+    if (!hasFeedChange && notices.length === 0) return;
+    const prompt = [
+      hasFeedChange ? buildProactivePrompt(feed) : null,
+      notices.length > 0 ? PUSHER_NOTICE_PREAMBLE + notices.map((n) => `• ${n}`).join("\n") : null,
+    ]
+      .filter((part): part is string => part !== null)
+      .join("\n\n");
     lastAttemptAt = now;
     dropPending();
 
@@ -378,29 +451,77 @@ export function createProactiveScheduler(deps: ProactiveDeps): ProactiveSchedule
       inFlight = false;
       if (disposed) return;
       if (delivered) {
-        baseline = digest;
-        baselineSurfaced = surfaced;
+        // Guarded: a notice-only turn advanced no digest, and writing `null` into the baseline
+        // would make the NEXT genuine feed change compare against nothing and re-seed silently.
+        if (hasFeedChange) {
+          baseline = digest;
+          baselineSurfaced = surfaced;
+        }
+        // THE ONLY PLACE NOTICES ARE CLEARED. Removed by identity rather than by truncating the
+        // list, so a notice that arrived while this turn was in flight is still owed afterwards.
+        const sent = new Set(notices);
+        pendingNotices = pendingNotices.filter((n) => !sent.has(n));
+        // ...AND THE "SOMETHING IS OWED" FLAG COMES BACK DOWN WITH THEM (roborev 57705).
+        //
+        // `dropPending` deliberately keeps `pendingSince` alive while notices are owed, and `fire`
+        // runs it BEFORE the transport reports back — so at that moment the notices are still owed
+        // and the flag is rightly held. Once they are delivered here, nothing else lowers it, and
+        // the scheduler is left in the one state this file treats as impossible: owed-with-nothing-
+        // owed.
+        //
+        // The visible cost is not the pointless timer. It is `observe`'s `pendingSince ??=`, which
+        // keeps the STALE origin, so `dueAt` computes a coalescing deadline already in the past and
+        // the next genuine feed change fires with NO window at all — turning a burst of roster ticks
+        // into several turns and spending the six-an-hour budget the window exists to protect.
+        //
+        // `counted` is reset with it: those skip reasons were counted against the change that has
+        // now been delivered, and carrying them forward would suppress the accounting for the next.
+        if (pendingNotices.length === 0 && pendingFeed === null) {
+          pendingSince = null;
+          counted = new Set();
+          // AND THE TIMER `dropPending` ALREADY ARMED HAS TO GO WITH IT. `arm()` below early-returns
+          // on a null `pendingSince` WITHOUT clearing, so lowering the flag alone would leave a live
+          // handle behind — it fires, `onTimer` bails, and the scheduler holds a timer per delivered
+          // notice for the life of the window. Cheap individually; unbounded over a long session.
+          clearTimer();
+        }
         firedAt.push(now);
         stats.fired++;
       } else {
         stats.skipped.declined++;
         // The change is still OWED. Re-pend it — unless a newer observation already did, in which
         // case that one supersedes this and the baseline (deliberately not advanced) still differs
-        // from it. `pendingSince = now` puts the re-armed attempt behind the min-interval floor.
-        if (pendingSince === null) {
+        // from it.
+        //
+        // Tested on `pendingFeed` rather than on `pendingSince` (which is what it used to read).
+        // The two were equivalent until notices existed — `dropPending` cleared both together — but
+        // a notice now holds `pendingSince` non-null on purpose, and under the old test that made an
+        // owed notice SWALLOW the re-pend of a declined feed change. `pendingFeed === null` asks the
+        // question that was always meant: did a newer observation supersede this one.
+        if (hasFeedChange && pendingFeed === null) {
           pendingFeed = feed;
           pendingDigest = digest;
           pendingSurfaced = surfaced;
-          pendingSince = deps.now();
           counted = new Set();
         }
+        // Puts the re-armed attempt behind the min-interval floor. Notices left in `pendingNotices`
+        // are re-armed by this too — they were never removed, so nothing has to be restored.
+        if (pendingSince === null) pendingSince = deps.now();
       }
       arm();
     };
 
     // The SURFACED digest travels with the turn, not the significant one: it is what the message
     // asserts, and therefore the only thing `markStaleProactive` can honestly score it against.
-    const outcome = deps.startTurn(prompt, surfaced);
+    //
+    // A NOTICE-ONLY TURN HAS NO DIGEST OF ITS OWN — it asserts something the surface does not show,
+    // which is why it exists — so it travels with the surface AS IT STOOD when we spoke. That makes
+    // it retractable on the same rule as every other push, and the direction of the residual error
+    // is the one this module already chose everywhere else: a finding that is still true may be
+    // struck early, rather than a finding that has stopped being true being left standing. This
+    // file's own rule is that the app volunteering something false is worse than having said
+    // nothing.
+    const outcome = deps.startTurn(prompt, surfaced ?? baselineSurfaced ?? "");
     if (typeof outcome === "boolean") {
       settle(outcome);
       return;
@@ -444,6 +565,24 @@ export function createProactiveScheduler(deps: ProactiveDeps): ProactiveSchedule
   }
 
   return {
+    notify(text) {
+      if (disposed) return;
+      const finding = text.trim();
+      if (finding === "") return;
+      // Already owed — see the idempotence note on the interface. Returning early rather than
+      // re-arming also means a Pusher sweeping every five minutes against a condition that lasts
+      // hours cannot keep pushing the coalescing window out in front of itself.
+      if (pendingNotices.includes(finding)) return;
+      pendingNotices.push(finding);
+      while (pendingNotices.length > MAX_PENDING_NOTICES) pendingNotices.shift();
+      // Opens the coalescing window if nothing else has. A finding that arrives while a feed change
+      // is already pending rides the same turn, which is the cheaper outcome for both.
+      if (pendingSince === null) {
+        pendingSince = deps.now();
+        counted = new Set();
+      }
+      arm();
+    },
     observe(feed) {
       if (disposed) return;
       const digest = significantDigest(feed);

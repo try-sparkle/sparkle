@@ -95,6 +95,7 @@ import {
   markStaleProactive,
   surfacedDigest,
 } from "../services/conciergeProactive";
+import { setConciergeNotifier, clearConciergeNotifier } from "../services/conciergeNotifier";
 import {
   agentCanAcceptPrompt,
   dispatchConciergeAnswer,
@@ -2126,7 +2127,15 @@ export function ConciergeHost({
       },
     });
     schedulerRef.current = s;
+    // THE PUSHER'S ROUTE TO THE CONCIERGE (sparkle-4cd0x). Registered here rather than exposed as a
+    // transport because this host is what makes a push retractable — it records each turn's digest
+    // so `markStaleProactive` can strike the message when the state moves past it. A caller reaching
+    // `concierge_proactive_turn` directly would get an unretractable push, which the scheduler's own
+    // header warns about. Handing over `s.notify` keeps every cost control and that guarantee here.
+    const notify = (text: string) => s.notify(text);
+    setConciergeNotifier(notify);
     return () => {
+      clearConciergeNotifier(notify);
       s.dispose();
       schedulerRef.current = null;
     };

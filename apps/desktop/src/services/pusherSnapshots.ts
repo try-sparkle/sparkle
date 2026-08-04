@@ -10,15 +10,15 @@
 // The stores and the engine registry arrive as arguments rather than being read from module scope,
 // which is what lets the mapping be tested without a running app.
 //
-// NOT YET WIRED, AND SAYING SO IS THE POINT (roborev 57313/57341). An earlier version of this
-// comment described a `fleetSnapshotsNow()` wrapper "at the bottom" that does the store reading.
-// No such function exists anywhere in the repo, and nothing outside the tests imports this module —
-// so the sentence told the next reader the app -> `@sparkle/core` seam was connected when it is not,
-// and pointed the file's whole safety argument at code that was never written.
+// WIRED 2026-08-04 (was roborev 57313/57341). An earlier version of this comment described a
+// `fleetSnapshotsNow()` wrapper "at the bottom" that did the store reading; no such function ever
+// existed, so the sentence told the next reader the app -> `@sparkle/core` seam was connected when
+// it was not, and pointed this file's whole safety argument at code nobody had written.
 //
-// What is genuinely missing is exactly the part these unit tests structurally cannot cover: binding
-// `branchStatus` by `agent.id` and `quotaFor`/`failureFor` to the right registry functions. That
-// arrives with the surface that renders these conditions.
+// The seam is real now, and it is somewhere else: `services/pusherMount.ts` calls
+// `buildFleetSnapshots` with `projectStore.projects`, `runtimeStore.branchStatus`, and
+// `engineRegistry.quotaBlockForAgent` / `lastFailureForAgent` — the exact binding these unit tests
+// structurally cannot cover, which is why it is named here rather than assumed.
 //
 // ── THE ONE RULE THAT MATTERS ────────────────────────────────────────────────────────────────────
 // FAIL CLOSED, inherited verbatim from `pusherObserve`: `undefined` means WE DID NOT LOOK and must

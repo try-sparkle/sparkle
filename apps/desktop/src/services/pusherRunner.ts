@@ -20,17 +20,18 @@
 // One coordination check remains and it is the real half of that concern: an agent the goal runner
 // has a send IN FLIGHT to is skipped, so the two never arrive in the same moment.
 //
-// ── NOT MOUNTED YET, AND SAYING SO HERE IS THE POINT (roborev 57400) ─────────────────────────────
-// `startPusherRunner` and `sweepPushers` have no production caller: the only place they are invoked
-// is `pusherRunner.test.ts`. So nothing in a running app constructs a `StandingDuty` or reads
-// `passHoldReason`, and every condition below is computed and tested but never delivered.
+// ── MOUNTED 2026-08-04, AND SAYING SO HERE IS THE POINT (was roborev 57400) ─────────────────────
+// `startPusherRunner` had no production caller for the whole of its life: the only thing that ever
+// invoked it was `pusherRunner.test.ts`, so every condition below was computed, tested and never
+// delivered. That is recorded rather than deleted because the gap was reported three times from
+// three different layers, each time because a comment described wiring that did not exist — and the
+// inverse lie is just as expensive, so this paragraph turns over the moment the wiring lands.
 //
-// This is recorded rather than left implicit because the same gap has now been reported three times
-// from three different layers, each time because a comment described wiring that did not exist. The
-// binding that is missing is small and specific — building the deps at a mount site, with
-// `duties: () => buildStandingDuties({ improvementLastRunAt, improvementIntervalMs, improvementHeldBy })`
-// driven off `passHoldReason` and the settings store — and it lands with the surface that renders
-// these conditions, which is a deliberate follow-up rather than an oversight.
+// It has landed. `services/pusherMount.ts` builds these deps from the live stores and `App.tsx`
+// mounts it beside `GoalContinuation`. `duties()` is bound; `reportRecipient` names the concierge;
+// `send` writes to the inbox and READS IT BACK before reporting success. `passHoldReason` is the one
+// input still unbound, so `duty-overdue` fires on the arithmetic without naming which arm holds the
+// hourly pass — a less useful sentence, never a wrong one.
 //
 // ── ATTACH-AT-BIRTH NEEDS NO SPAWN HOOK ──────────────────────────────────────────────────────────
 // A Pusher is not an agent row, so "attaching" is just this sweep covering every build agent from

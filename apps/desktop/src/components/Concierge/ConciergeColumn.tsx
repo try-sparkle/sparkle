@@ -602,12 +602,17 @@ export function ConciergeColumn({
           Whatever replaces this must fix the SIGNAL first: these goals carry `verify:landed`, so
           "did it actually land" is answerable from git ancestry without asking the agent anything.
 
-          AND IT MUST WIRE THE BINDING, NOT JUST DRAW A CARD. The decision logic survives — the
-          evaluator, the report layer and the runner all still exist and are still tested — but this
-          display was the only PRODUCTION caller of any of it. With it gone the whole path is
-          dormant: `services/pusherRunner.ts` and `services/pusherSnapshots.ts` are both carried in
-          `scripts/dormant-modules.allow`, so nothing in a running app computes or sends a fleet
-          condition today. Do not build a replacement expecting live data to be flowing already.
+          THE BINDING IS WIRED NOW, AND NOT TO A CARD (2026-08-04, sparkle-4cd0x). When this display
+          was deleted it took the only PRODUCTION caller of the decision logic with it, and the whole
+          path went dormant — both modules sat in `scripts/dormant-modules.allow` and nothing in a
+          running app computed or sent a fleet condition. That is no longer true: `services/
+          pusherMount.ts` drives the sweep from `App.tsx`, and the fleet conditions are DELIVERED to
+          the concierge as a proactive turn rather than rendered anywhere. Both allowlist entries are
+          gone, so the guard now fails if either module goes dormant again.
+
+          What that means for a replacement surface: the data IS flowing, and a card would be a
+          second consumer of it rather than the thing that switches it on. Read the conditions; do
+          not re-wire them.
 
           ONE THING WENT WITH IT THAT WAS NOT THE POINT: the improvement pass's "why the hourly pass
           is held / the pane is wedged" report (PRD/sparkle/pane-wedged-hold.md). `improvementHoldText`

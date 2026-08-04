@@ -258,6 +258,35 @@ fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
         .append(true)
         .open(path)
         .map_err(|e| format!("inbox open: {e}"))?;
+    // HEAL A TORN TAIL BEFORE APPENDING (sparkle-bbghz). The comment below explains how a pair of
+    // writes can interleave into one malformed line; this is that same corruption arriving from the
+    // OTHER direction, and it is the one that persists.
+    //
+    // If a previous append died between its bytes and the process (a crash, a full disk, a killed
+    // app), the file ends WITHOUT a newline. `O_APPEND` then places the next record's first byte
+    // immediately after the partial one, producing `{torn}{fresh}\n` — a single line that
+    // `read_jsonl` skips by contract. So the new message is lost, and `enqueue` still returns
+    // `Ok(id)`: the caller is handed a message id, which is exactly the evidence it would use to
+    // believe the send happened. That is the silent drop the concierge hit — ok:true with a distinct
+    // messageId for five sends, `pending: 0` on three of them.
+    //
+    // It is also self-perpetuating without this: the tail stays torn, so EVERY later append to that
+    // agent is swallowed the same way, and the corruption is per-agent, which is why three of five
+    // agents dropped and two did not.
+    //
+    // Writing the missing newline separates the damage instead of spreading it. A partial line that
+    // was in fact complete JSON is recovered outright; one that was genuinely truncated stays a
+    // single skipped record rather than eating its successor. Best-effort: a metadata read that
+    // fails is not a reason to refuse the send, because `verify_queued` below is the check that
+    // actually gates the acknowledgement.
+    if std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) > 0 {
+        let ends_clean = std::fs::read(path)
+            .map(|b| b.last().copied() == Some(b'\n'))
+            .unwrap_or(true);
+        if !ends_clean {
+            f.write_all(b"\n").map_err(|e| format!("inbox heal: {e}"))?;
+        }
+    }
     // ONE `write` syscall, newline included — this is a correctness requirement, not a style choice.
     //
     // `O_APPEND` makes an individual `write` atomic with respect to the file offset, but it says
@@ -318,6 +347,37 @@ pub fn enqueue(
         severity,
     };
     append_jsonl(&messages_path(app_data, agent_id), &msg)?;
+
+    // READ BACK BEFORE ACKNOWLEDGING (sparkle-bbghz). This is the rule the bug asked for in one
+    // line: *"inbox_send must not return ok unless the message is actually persisted to that
+    // agent's inbox."*
+    //
+    // WHY A SUCCESSFUL WRITE IS NOT ENOUGH EVIDENCE. `append_jsonl` returning `Ok` proves the bytes
+    // left this process. It does not prove they are READABLE as a record, and the gap between those
+    // two facts is the entire defect: `read_jsonl` skips malformed lines by contract, so a line that
+    // merged with a torn predecessor, or was truncated by a full disk, is written successfully and
+    // then does not exist as far as `pending` and `status_of` are concerned. Every downstream loop
+    // reads through those two functions, so "written" is the wrong thing to promise — "visible to
+    // the reader" is the thing callers actually depend on, and it is what is asserted here.
+    //
+    // Deliberately re-read through `read_jsonl` at `messages_path`, the exact path and parser
+    // `status_of` uses, rather than a cheaper stat or a byte search. A check that agreed with the
+    // writer instead of with the reader would re-open the same hole one layer down.
+    //
+    // COST: one extra read of a file this function has already read once for the capacity check, so
+    // it is warm. A send is a rare event — the Pusher is bounded to four per agent per hour — and a
+    // silent drop costs a whole cycle of a watchdog reporting agents it never reached.
+    let readable = read_jsonl::<InboxMessage>(&messages_path(app_data, agent_id))
+        .iter()
+        .any(|m| m.id == id);
+    if !readable {
+        return Err(format!(
+            "inbox: wrote message {id} to {agent_id}'s queue but could not read it back — \
+             treating this send as FAILED rather than returning an id for a message that \
+             does not exist"
+        ));
+    }
+
     Ok(id)
 }
 
@@ -572,6 +632,69 @@ mod tests {
             .unwrap();
         let s = status_of(&base, "a1", 1_000);
         assert_eq!((s.delivered, s.acknowledged, s.awaiting_ack), (1, 1, 0));
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn a_torn_tail_does_not_swallow_the_next_message(){
+        // THE SILENT DROP, REPRODUCED (sparkle-bbghz). A previous append that died between its bytes
+        // and the process leaves the file without a trailing newline. `O_APPEND` then writes the
+        // next record flush against it, `read_jsonl` sees one malformed line and skips it by
+        // contract, and BOTH records are gone — while `enqueue` hands back a message id.
+        //
+        // Asserts the SIDE EFFECT (the message is readable afterwards), not the precondition: before
+        // the heal, `status_of` reported pending 0 here with `send` having returned `Ok("m2")`,
+        // which is exactly what the concierge saw on three of five agents.
+        let base = tmp("torn-tail");
+        let path = messages_path(&base, "a1");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"id":"m1","ts":1000,"from":"concierge","text":"first","severity":"fyi"}"#,
+        )
+        .unwrap();
+
+        let id = send(&base, "a1", "second", 1_000, "m2").expect("the send is accepted");
+        assert_eq!(id, "m2");
+
+        let s = status_of(&base, "a1", 1_000);
+        assert!(
+            s.pending_ids.contains(&"m2".to_string()),
+            "the appended message must be READABLE, not merged into the torn line: {:?}",
+            s.pending_ids
+        );
+        assert_eq!(
+            s.pending, 2,
+            "healing the tail also recovers the partial record that was only missing its newline"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_write_that_cannot_be_read_back_is_reported_as_a_failure_not_as_an_id() {
+        // The rule sparkle-bbghz asked for: never return ok for a message that does not exist.
+        //
+        // `/dev/null` is the deterministic form of "the write succeeded and the record is not
+        // there" — `write_all` returns `Ok`, and every reader (`pending`, `status_of`, the Stop
+        // hook) sees an empty queue. Before the read-back this returned `Ok("m1")`, handing the
+        // caller the one piece of evidence it uses to believe a send happened.
+        let base = tmp("unreadable");
+        let path = messages_path(&base, "a1");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("/dev/null", &path).unwrap();
+
+        let err = send(&base, "a1", "into the void", 1_000, "m1")
+            .expect_err("a send whose message cannot be read back must FAIL");
+        assert!(err.contains("read it back"), "the failure must say why: {err}");
+
+        assert_eq!(
+            status_of(&base, "a1", 1_000).pending,
+            0,
+            "and the queue really is empty — the refusal is telling the truth"
+        );
 
         std::fs::remove_dir_all(&base).ok();
     }
