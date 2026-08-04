@@ -103,6 +103,7 @@ import { paneState } from "./paneReadiness";
 import { findKnownAgent } from "./knownAgents";
 import { getAgentViewport } from "./terminalViewport";
 import { isClaudeCodeScreen } from "../engine/claudeCodeScreen";
+import { screenBlocksWrite } from "../voice/dictationTerminalRoute";
 import { useInteractionStore } from "../stores/interactionStore";
 import { useProjectStore } from "../stores/projectStore";
 import { usePromptHistoryStore } from "../stores/promptHistoryStore";
@@ -132,6 +133,11 @@ export type ConciergeDispatchPath =
                     // as a delivery is the one lie this module exists to prevent.
   | "alternate-screen" // a full-screen app (vim/less/htop) owns the screen, which would EXECUTE the
                        // write as commands (refused — see the guard in dispatchConciergeAnswer)
+  | "blocked-prompt" // the screen is sitting at something that must not receive free text — a
+                     // credential field, an ssh host-key confirmation, a `(yes/no)` — and this write
+                     // would be pasted AND SUBMITTED into it (refused). Distinct from
+                     // `alternate-screen` because the remedy is different: answer what is on screen,
+                     // rather than quit the full-screen app.
   | "unauthorized" // no valid DispatchAuthority — nobody declared why this may be sent (NOT delivered)
   | "pty-gone"; // the agent's PTY was dead (answer NOT delivered)
 
@@ -494,9 +500,34 @@ export async function dispatchConciergeAnswer(
   // because of where we are: everything below this line pastes AND SUBMITS via `submitPrompt`, so a
   // false positive on a `vim` session is an ENTERED line, not merely a typed one.
   const screen = getAgentViewport(agentId);
-  if (screen?.alternateBuffer && !isClaudeCodeScreen(screen.text)) {
+  const claudeCodeHoldsTheBuffer = !!screen?.alternateBuffer && isClaudeCodeScreen(screen.text);
+  if (screen?.alternateBuffer && !claudeCodeHoldsTheBuffer) {
     log.warn("concierge", "refused a write into a full-screen app", { agentId });
     return { ok: false, path: "alternate-screen", agentId };
+  }
+  // ══ RECOGNISING CLAUDE CODE IS NOT A SAFETY VERDICT (roborev 57718) ═════════════════════════════
+  // `claudeCodeScreen`'s own doc says so — "do not let a true from this function stand in for
+  // [screenBlocksWrite]" — and the first cut of the line above did exactly that. The two guards had
+  // always travelled together in `terminalWriteRefusal`; skipping the alternate-screen arm here took
+  // only the first half, and the OTHER two callers of this function (`conciergeTools/terminal`, the
+  // goal auto-resume) have no screen guard of their own — they were relying entirely on the
+  // unconditional refusal that was just removed.
+  //
+  // THE CONCRETE HOLE: a Claude Code pane running a Bash tool that stopped at `[sudo] password for
+  // …:` or `Username for 'https://github.com':` still draws its composer box and its busy status
+  // bar, so it is recognised. `liveOptionsFor` is a PICKER detector and does not match a credential
+  // prompt, so the send fell through to `submitPrompt` and pasted AND SUBMITTED prose into a field
+  // that echoes nothing. That write was refused before this change. The four field misses
+  // `WRITE_BLOCKING_PROMPTS`/`CREDENTIAL_WORD` were grown from are exactly this class.
+  //
+  // Scoped to the case we relaxed, deliberately: only when Claude Code is why the buffer check was
+  // skipped. A normal-buffer screen keeps whatever behaviour it had, so this restores what was taken
+  // away without quietly widening the chokepoint's remit.
+  if (claudeCodeHoldsTheBuffer && screenBlocksWrite(screen.text)) {
+    log.warn("concierge", "refused a write into a blocked prompt on a Claude Code screen", {
+      agentId,
+    });
+    return { ok: false, path: "blocked-prompt", agentId };
   }
   const options = liveOptionsFor(agentId);
 

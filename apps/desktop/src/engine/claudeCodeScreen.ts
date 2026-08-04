@@ -167,9 +167,14 @@ export function hasClaudeCodeComposerBox(snapshot: string): boolean {
 /**
  * Is this screen CONFIDENTLY Claude Code's own TUI?
  *
- * Two independent families, for the asymmetry argued in the header: a miss costs one refusal, a
- * false positive types into `vim`. Callers must treat `false` as "assume a real full-screen app",
- * never as "assume safe".
+ * THE RULE: the live-TUI composer box is MANDATORY, plus at least one corroborating family. Not
+ * "any two of four" — see the header for why a pasted transcript in a pager clears that lower bar.
+ *
+ * THE PRICE OF A FALSE POSITIVE IS A PASTED *AND SUBMITTED* LINE, not a typed one: this predicate
+ * gates `services/conciergeDispatch`, which finishes with `submitPrompt`. The header carries the
+ * full argument; this note exists so a caller reading only the call site does not inherit the
+ * gentler dictation-flavoured framing an earlier draft had here. Callers must treat `false` as
+ * "assume a real full-screen app", never as "assume safe".
  *
  * THIS DOES NOT MEAN THE SCREEN IS SAFE TO WRITE TO. It means the alternate buffer is not evidence
  * of danger here. Claude Code can perfectly well be showing a permission dialog or a picker, and

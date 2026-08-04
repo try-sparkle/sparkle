@@ -135,14 +135,35 @@ describe("isClaudeCodeScreen — genuine full-screen apps are not Claude Code", 
     expect(isClaudeCodeScreen(transcript)).toBe(false);
   });
 
-  // The other half of the same rule: an underscore separator and a markdown blockquote must not be
-  // able to FORM the box. Both were accepted by the first cut of RULE_LINE/PROMPT_LINE.
-  it("rejects a document whose underscores and blockquote imitate the composer box", () => {
+  // ══ ONE NARROWING PER TEST (roborev 57718) ═══════════════════════════════════════════════════
+  // These were ONE test, and it was vacuous in the exact way this repo keeps finding: it combined
+  // underscore rules with a `> quoted` middle line, so reverting EITHER pattern alone still left no
+  // box and the test stayed green. It only failed if both were reverted at once — an assertion that
+  // passes against the code as it was before the change. Split so each narrowing is ratcheted by a
+  // fixture that isolates it.
+
+  // (a) Underscore rules around a LONE `>` — the middle line matches PROMPT_LINE's bare arm, so the
+  // only thing standing between this and a false positive is `_` being absent from RULE_LINE.
+  it("rejects a document whose underscore separators imitate the composer rules", () => {
     const doc = [
-      "Running things with ctrl+b to run in background is covered below.",
+      "⏺ quoted from a transcript",
       "________________________________________",
+      ">",
+      "________________________________________",
+      ":",
+    ].join("\n");
+    expect(isClaudeCodeScreen(doc)).toBe(false);
+  });
+
+  // (b) REAL box-drawing rules around a markdown blockquote — the rules are genuine, so the only
+  // thing standing between this and a false positive is bare `>` being absent from PROMPT_LINE's
+  // with-text arm.
+  it("rejects a document whose blockquote sits between real box rules", () => {
+    const doc = [
+      "⏺ quoted from a transcript",
+      "────────────────────────────────────────",
       "> quoted advice from the manual",
-      "________________________________________",
+      "────────────────────────────────────────",
       ":",
     ].join("\n");
     expect(isClaudeCodeScreen(doc)).toBe(false);

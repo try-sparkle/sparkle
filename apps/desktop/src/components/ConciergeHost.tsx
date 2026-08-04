@@ -440,6 +440,15 @@ function refusalCopy(path: RefusedPath | null, agent: ReferencableAgent, voice: 
       return approving
         ? line`${a} is in a full-screen app right now, so I didn't send the approval — anything typed there would run as commands. Quit it and approve again.`
         : line`${a} is in a full-screen app right now (an editor or pager), so I didn't send that — anything typed there would run as commands. Quit it and send again.`;
+    // The agent is at its own prompt (Claude Code, typically) but that prompt is sitting on a
+    // CREDENTIAL field, an ssh host-key question, or a `(yes/no)` — and this send would be pasted
+    // AND SUBMITTED into it. A different refusal from `alternate-screen` because the exit is
+    // different: answer the thing on screen, rather than quit an app. Named without quoting the
+    // prompt, since the whole hazard is that some of these echo nothing.
+    case "blocked-prompt":
+      return approving
+        ? line`${a} is waiting on something on screen — a prompt or a credential field — so I didn't send the approval. Answer that first, then approve again.`
+        : line`${a} is waiting on something on screen — a prompt or a credential field — so I didn't send that. Answer it in ${a}'s pane first, then send again.`;
     case "unauthorized":
       // Should be unreachable: `authority` is required and non-defaulted, so a call site that omits
       // it does not compile. Reachable only if a malformed authority is built dynamically — a bug,

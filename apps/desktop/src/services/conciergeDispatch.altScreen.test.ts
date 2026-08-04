@@ -129,6 +129,36 @@ describe("a busy Claude Code is not a full-screen app", () => {
     expect(r.ok).toBe(true);
   });
 
+  // ══ RECOGNISING CLAUDE CODE IS NOT A SAFETY VERDICT (roborev 57718) ═══════════════════════════
+  // The regression this pins: skipping the alternate-screen arm for a recognised Claude Code took
+  // only HALF of what `terminalWriteRefusal` does, and the other two callers of this function
+  // (`conciergeTools/terminal`, the goal auto-resume) have no screen guard of their own — they were
+  // relying entirely on the unconditional refusal that was removed.
+  //
+  // A Claude Code pane running a Bash tool that stopped at a sudo prompt STILL draws its composer
+  // box and its busy bar, so it is recognised; `liveOptionsFor` is a picker detector and does not
+  // match a credential prompt. Without the restored `screenBlocksWrite` this pastes AND SUBMITS
+  // prose into a field that echoes nothing.
+  it("refuses a credential prompt sitting on a recognised Claude Code screen", async () => {
+    vi.mocked(getAgentViewport).mockReturnValue({
+      text: [
+        "⏺ Installing the dependency.",
+        "  ⎿  $ sudo make install",
+        "     (ctrl+b to run in background)",
+        "[sudo] password for drodio:",
+        "──────────────────────────────────────────────────────────────────────────────",
+        "❯ ",
+        "──────────────────────────────────────────────────────────────────────────────",
+        "  ⏸ manual mode on · ? for shortcuts",
+      ].join("\n"),
+      alternateBuffer: true,
+    });
+    const r = await dispatchConciergeAnswer(AGENT, "give me an update after you do", OPTS);
+    expect(r.ok).toBe(false);
+    expect(r.path).toBe("blocked-prompt");
+    expectNothingWritten();
+  });
+
   // The refusal the bead insists on keeping is the row this one is paired with: `onFullScreenApp`
   // above is a real vim screen and still takes the `alternate-screen` path.
   it("still refuses a genuine full-screen app on the same code path", async () => {

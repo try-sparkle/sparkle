@@ -828,6 +828,11 @@ function sendDetail(path: ConciergeSendPath, agentId: string): string {
     // same conditions that triggered the refusal).
     case "alternate-screen":
       return "Not sent: the agent is in a full-screen app (an editor or pager), where typed text would run as commands.";
+    // Same shape as the line above and the same reason it offers no rephrasing: the screen is
+    // waiting on a specific answer, and free text submitted into it would be answering the wrong
+    // question — or, at a credential field, echoing nothing while it did so.
+    case "blocked-prompt":
+      return "Not sent: the agent is waiting on something on screen (a prompt or a credential field), which this text would have been submitted into.";
     case "unknown-agent":
       return `Not sent: there is no open agent with id ${agentId}.`;
     default: {
