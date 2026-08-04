@@ -127,7 +127,7 @@ vi.mock("../services/knownAgents", async (importOriginal) => {
     ...real,
     findKnownAgent: (agentId: string) =>
       agentId.startsWith("__sparkle_self__")
-        ? { id: agentId, name: "Sparkle", source: "sparkle" as const }
+        ? { id: agentId, name: "Sparkle", source: "sparkle" as const, runtime: "local" as const }
         : real.findKnownAgent(agentId),
   };
 });
@@ -137,10 +137,18 @@ vi.mock("../stores/runtimeStore", () => ({
     getState: () => RUNTIME,
   }),
   // Both are reached only once a SPARKLE-namespace agent is the selected target — that pane
-  // registers itself into the shared open-agent set on mount. No row asserts on them; they are here
-  // so the component can render that state at all, which it could not before.
-  mergeOpenAgentIds: vi.fn(),
-  readPersistedOpenAgentIds: vi.fn(() => []),
+  // registers itself into the shared open-agent set on mount.
+  //
+  // `mergeOpenAgentIds` MIRRORS THE REAL ONE rather than returning undefined (roborev 57970). It is
+  // not unobserved: `knownAgents.openAgentIdSet()` is `new Set(mergeOpenAgentIds(...))`, and
+  // `new Set(undefined)` is a legal EMPTY set — so a bare `vi.fn()` silently gave every caller in
+  // this file an empty open-agent set instead of failing loudly, which is exactly the drift the
+  // `knownAgents` mock below is written to avoid. Callers that treat the result as an array would
+  // also throw a TypeError reading as unrelated to whichever row triggered it.
+  mergeOpenAgentIds: vi.fn((inMemory: string[], persisted: string[], add?: string) => [
+    ...new Set([...inMemory, ...persisted, ...(add ? [add] : [])]),
+  ]),
+  readPersistedOpenAgentIds: vi.fn((): string[] => []),
 }));
 
 import { ConciergeHost, type ConciergePromptTarget } from "./ConciergeHost";
@@ -321,6 +329,23 @@ describe("ConciergeHost — a concierge-bound message is never screen-checked", 
     h.wired.mockReturnValue("off");
     selectSparkleRow();
     h.viewport.mockReturnValue(BLOCKING);
+    await send("here is a long thought for you about the roadmap");
+    await elapse();
+    expect(h.dispatchConciergeAnswer).not.toHaveBeenCalled();
+    expect(h.startConciergeTurn).toHaveBeenCalledTimes(1);
+  });
+
+  // ══ THE IRREVERSIBLE HALF, AND THE ROW THAT STAYS LOAD-BEARING (roborev 57970) ═══════════════
+  // The two rows around this one use a BLOCKING screen, so they only pin the REFUSAL. But with the
+  // cursor in that row, the cable off and an ordinary CLEAN screen, the removed `mountAddress` made
+  // `addressable` true, sailed past the screen guard, armed an intent and wrote the founder's
+  // unaddressed paragraph into that agent's PTY — no refusal, no warning. That is the direction
+  // `composerRoute`'s header calls unrecoverable, and it is the one a screen-dependent fixture
+  // cannot see: a future `isClaudeCodeScreen` that learns to recognise one more thing would make
+  // the blocking rows vacuous while this one keeps failing.
+  it("does not write into that agent's terminal on a clean screen either", async () => {
+    h.wired.mockReturnValue("off");
+    selectSparkleRow();
     await send("here is a long thought for you about the roadmap");
     await elapse();
     expect(h.dispatchConciergeAnswer).not.toHaveBeenCalled();
