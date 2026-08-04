@@ -185,17 +185,88 @@ pub struct FrontendLog {
     pub message: String,
 }
 
+/// Collapse embedded newlines so one forwarded record stays one physical line.
+///
+/// The frontend renders an Error as `name: message\n<stack>`, and `JSON.stringify` of a value
+/// holding a newline keeps it, so a forwarded message can arrive with line breaks in it. `tracing`
+/// writes the message verbatim, which splits ONE record across several physical lines: the head
+/// line carries the timestamp/level/target and the continuation lines carry nothing, while the
+/// record's own trailing fields (`scope="…"`) end up stranded on the LAST line, far from the head
+/// they belong to. Every consumer of this file reads it a line at a time — the retention/support
+/// tail, `grep`, and the humans and agents we hand it to — so those orphans are unattributable to a
+/// time or a level, and aggregating by level silently mis-attributes them to whatever came before.
+/// Observed in the field: a console stack trace landing as three lines, the last one alone holding
+/// `scope="console"`.
+///
+/// Escaping to a literal `\n` (and `\r`) keeps the stack readable and greppable on one line rather
+/// than dropping frames. Only the FILE is flattened — the frontend already printed the pretty
+/// multi-line version to devtools before forwarding, so nothing readable is lost there.
+///
+/// Backslashes are deliberately NOT doubled. That would make the escaping round-trippable, but this
+/// file is read by humans and agents, not parsed back, and the frontend renders structured payloads
+/// with `JSON.stringify` — whose output is already full of `\"` and `\n` escapes. Doubling would
+/// mangle every one of those on the most common path to buy unambiguity nobody consumes.
+fn to_single_line(msg: &str) -> String {
+    msg.replace('\r', "\\r").replace('\n', "\\n")
+}
+
 /// Sink for frontend logs so UI activity lands in the same file, in time order, as the
 /// Rust backend. Levels map onto the matching `tracing` macro; everything is tagged
 /// `target: "ui"` and carries its `scope` so the file is greppable per-subsystem.
 #[tauri::command]
 pub fn frontend_log(entry: FrontendLog) {
     let scope = entry.scope.unwrap_or_else(|| "ui".to_string());
-    let msg = entry.message;
+    let msg = to_single_line(&entry.message);
     match entry.level.as_str() {
         "error" => tracing::error!(target: "ui", scope, "{msg}"),
         "warn" => tracing::warn!(target: "ui", scope, "{msg}"),
         "debug" => tracing::debug!(target: "ui", scope, "{msg}"),
         _ => tracing::info!(target: "ui", scope, "{msg}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The whole contract: whatever the frontend hands us, the file gets ONE line for it.
+    fn line_count(msg: &str) -> usize {
+        to_single_line(msg).lines().count()
+    }
+
+    #[test]
+    fn plain_message_is_unchanged() {
+        assert_eq!(to_single_line("policy resolved"), "policy resolved");
+    }
+
+    #[test]
+    fn rendered_error_with_stack_collapses_to_one_line() {
+        // Shape the frontend's render() produces for an Error: `name: message\n<stack>`.
+        let rendered = "TypeError: Load failed\njson@[native code]\n@user-script:3:94:35";
+        assert_eq!(line_count(rendered), 1);
+        assert_eq!(
+            to_single_line(rendered),
+            "TypeError: Load failed\\njson@[native code]\\n@user-script:3:94:35"
+        );
+    }
+
+    #[test]
+    fn carriage_returns_are_escaped_too() {
+        // A bare \r would let a terminal overwrite the head of the line it is printed on.
+        assert_eq!(line_count("first\r\nsecond"), 1);
+        assert_eq!(to_single_line("first\r\nsecond"), "first\\r\\nsecond");
+    }
+
+    #[test]
+    fn trailing_newline_leaves_no_empty_continuation() {
+        assert_eq!(to_single_line("done\n"), "done\\n");
+    }
+
+    #[test]
+    fn json_payload_escapes_are_left_intact() {
+        // JSON.stringify output already carries literal `\"` / `\n`; doubling backslashes here
+        // would mangle every structured payload we forward.
+        let payload = r#"sent prompt {"text":"a\nb","q":"\""}"#;
+        assert_eq!(to_single_line(payload), payload);
     }
 }
