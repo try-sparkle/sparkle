@@ -23,7 +23,7 @@ function place(target: ConciergeReceipt["target"], agentName?: string): string {
 
 /** The receipt's sentence. Pure: the redirect wording is a correctness concern (see the header),
  *  so it is unit-tested directly rather than asserted through a rendered tree. */
-export function receiptText(r: ConciergeReceipt): string {
+export function receiptText(r: ConciergeReceipt): string | null {
   // `r.unanswered` IS DELIBERATELY NOT READ HERE. A displaced turn used to render "→ Replaced by
   // your next message — never answered", and that line was deleted on 2026-07-31 because it
   // asserted something the app cannot know: the concierge frequently answers a displaced question
@@ -44,9 +44,29 @@ export function receiptText(r: ConciergeReceipt): string {
   if (r.refused) {
     return r.agentName ? `→ Not sent — ${r.agentName} couldn't take it` : "→ Not sent";
   }
+  // ══ "Answered here" IS GONE (founder, 2026-08-04) ═══════════════════════════════════════════════
+  // *"Get rid of the 'Answered here' text below each concierge sent message."* The concierge
+  // answering IN PLACE is self-evident from the reply appearing directly underneath — the line
+  // restated it on every single turn, which is noise on the app's most-used path.
+  //
+  // A receipt earns its place by saying something the surrounding UI does NOT: that the message went
+  // somewhere ELSE (`Sent to X`), that it went nowhere (`Not sent`, above), or that it went to a
+  // second destination after the first. The default concierge turn is none of those.
+  //
+  // NULL, not an empty string, so the caller can TELL THE TWO APART. It does not currently use that
+  // to drop the row — the row stays mounted as the redirect's host, see the component below — and
+  // this comment previously claimed it did, which was simply false about the code beneath it.
+  // The distinction still earns its place: `null` is "there is nothing to say", which the component
+  // renders as no `<span>` at all rather than an empty one, and which a caller (the screen-reader
+  // announcement in ConciergeHost) tests directly to decide whether to announce anything.
+  if (r.target === "sparkle" && !r.alsoSentTo) return null;
   const first = r.target === "sparkle" ? "Answered here" : `Sent to ${place(r.target, r.agentName)}`;
   if (!r.alsoSentTo) return `→ ${first}`;
   // "then" — strictly sequential, so it cannot be read as a correction of the first delivery.
+  //
+  // The `sparkle` arm still reaches here WHEN THERE IS A SECOND DELIVERY, and keeps "Answered here"
+  // deliberately: with two destinations the ORDER is the whole content of the sentence, and "then to
+  // X" with no first term reads as though X were the only place it went.
   return `→ ${first}, then to ${place(r.alsoSentTo, r.agentName)}`;
 }
 
@@ -71,6 +91,11 @@ export function RoutingReceipt({
 }) {
   const label = redirectLabel(receipt);
   const showButton = !!onRedirect && !!label && receipt.redirectable;
+  const text = receiptText(receipt);
+  // THE ROW STAYS MOUNTED even with nothing to say. It is the redirect button's host — "Also ask
+  // <agent>" is offered on exactly the ordinary concierge answers whose TEXT was just removed — and
+  // removing the element as well would take the button with it on every one of them. Only the
+  // sentence goes; the affordance does not.
   return (
     <div
       data-testid="routing-receipt"
@@ -90,7 +115,7 @@ export function RoutingReceipt({
         flexWrap: "wrap",
       }}
     >
-      <span>{receiptText(receipt)}</span>
+      {text && <span>{text}</span>}
       {showButton && (
         <button
           type="button"

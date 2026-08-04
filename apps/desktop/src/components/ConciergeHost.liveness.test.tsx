@@ -256,17 +256,29 @@ describe("a displaced message never claims it went unanswered", () => {
   // pin its ABSENCE end-to-end through the real column, each paired with a positive count of the
   // ordinary receipts, so they cannot pass on a thread that simply rendered nothing (which is
   // exactly how the originals first failed).
+/** How many ordinary receipts the thread is showing.
+ *
+ *  These rows used to count the literal "Answered here". That text was REMOVED at the founder's
+ *  request (RoutingReceipt) — the concierge answering in place is self-evident from the reply
+ *  appearing — so the string is no longer a usable anchor. The receipt ELEMENT survives, because it
+ *  still hosts the "Also ask <agent>" redirect, and counting it preserves exactly what these rows
+ *  were written to guarantee: the ordinary receipt is intact and was not replaced by the deleted
+ *  "never answered" claim. The paired `not.toContain("never answered")` assertions are unchanged. */
+function receiptCount(): number {
+  return screen.queryAllByTestId("routing-receipt").length;
+}
+
   it("keeps the ordinary receipt on a bubble nothing ever came back for", async () => {
     render(<ConciergeHost feed={feed()} />);
     await send("what needs me?");
-    expect(threadText()).toContain("Answered here");
+    expect(receiptCount()).toBeGreaterThan(0);
     expect(threadText()).not.toContain("never answered");
 
     await send("what needs me right now?");
     expect(threadText()).not.toContain("never answered");
     expect(threadText()).not.toContain("Replaced by your next message");
     // Both bubbles carry their ordinary receipt — the displaced one reads exactly like the live one.
-    expect(threadText().match(/Answered here/g)?.length).toBe(2);
+    expect(receiptCount()).toBe(2);
   });
 
   // A TOOL CALL IS NOT AN ANSWER (roborev 55442-M1) — reading state or a terminal before replying is
@@ -281,7 +293,7 @@ describe("a displaced message never claims it went unanswered", () => {
     await send("what needs me right now?");
     expect(threadText()).not.toContain("never answered");
     expect(threadText()).not.toContain("Replaced by your next message");
-    expect(threadText().match(/Answered here/g)?.length).toBe(2);
+    expect(receiptCount()).toBe(2);
   });
 
   // A turn that streamed a partial answer the user then interrupted is NOT this. They got words;
@@ -290,7 +302,7 @@ describe("a displaced message never claims it went unanswered", () => {
     render(<ConciergeHost feed={feed()} />);
     await send("what needs me?");
     act(() => h.brain.delta?.({ id: "7", text: "Three agents " }));
-    expect(threadText()).toContain("Answered here");
+    expect(receiptCount()).toBeGreaterThan(0);
 
     await send("what needs me right now?");
     expect(threadText()).not.toContain("never answered");
@@ -300,7 +312,7 @@ describe("a displaced message never claims it went unanswered", () => {
     render(<ConciergeHost feed={feed()} />);
     await send("what needs me?");
     act(() => h.brain.done?.({ id: "7", sessionId: "s1", text: "Nothing right now." }));
-    expect(threadText()).toContain("Answered here");
+    expect(receiptCount()).toBeGreaterThan(0);
 
     await send("and after that?");
     expect(threadText()).not.toContain("never answered");
@@ -312,7 +324,7 @@ describe("a displaced message never claims it went unanswered", () => {
     render(<ConciergeHost feed={feed()} />);
     await send("what needs me?");
     act(() => h.brain.error?.({ id: "7", detail: "boom" }));
-    expect(threadText()).toContain("Answered here");
+    expect(receiptCount()).toBeGreaterThan(0);
 
     await send("try again?");
     expect(threadText()).not.toContain("never answered");

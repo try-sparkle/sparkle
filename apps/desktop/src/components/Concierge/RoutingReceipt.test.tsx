@@ -16,8 +16,13 @@ describe("receiptText", () => {
     expect(receiptText({ target: "agent", agentName: "Kraken Auth" })).toBe("→ Sent to Kraken Auth");
   });
 
-  it("says a chat answer landed here, not 'sent to Sparkle'", () => {
-    expect(receiptText({ target: "sparkle" })).toBe("→ Answered here");
+  // ══ AN ORDINARY CONCIERGE ANSWER GETS NO RECEIPT AT ALL (founder, 2026-08-04) ═════════════════
+  // This asserted `"→ Answered here"`. He asked for that line gone: the concierge answering IN PLACE
+  // is self-evident from the reply appearing directly beneath, so the receipt restated it on every
+  // turn of the app's most-used path. NULL rather than "", so the caller drops the row instead of
+  // laying out a blank one that still spends its margin.
+  it("says nothing at all when the concierge answered in place", () => {
+    expect(receiptText({ target: "sparkle" })).toBeNull();
   });
 
   it("falls back to a generic noun when the agent has no name", () => {
@@ -129,10 +134,10 @@ describe("RoutingReceipt — rendering", () => {
 // nothing (AGENTS.md, "Tests must assert the SIDE EFFECT").
 describe("receiptText — a displaced turn renders the ordinary receipt, never 'never answered'", () => {
   it("does not print the deleted claim, and prints the ordinary sparkle line instead", () => {
-    const line = receiptText({ target: "sparkle", unanswered: true });
-    expect(line).not.toMatch(/never answered/i);
-    expect(line).not.toMatch(/replaced by your next message/i);
-    expect(line).toBe("→ Answered here");
+    // Same removal as above: the ordinary sparkle line is now NO line. The point of this row is
+    // unchanged — a displaced turn must not print the deleted "never answered" claim — and it is
+    // strictly better served by there being no text at all than by text that merely omits it.
+    expect(receiptText({ target: "sparkle", unanswered: true })).toBeNull();
   });
 
   it("renders the agent's ordinary line when a displaced message went to an agent", () => {
@@ -153,17 +158,23 @@ describe("receiptText — a displaced turn renders the ordinary receipt, never '
   });
 
   // Rendering-level guard: the deleted string must not reach the DOM by any other route either.
-  it("renders no 'never answered' text in the receipt element", () => {
+  // The element is not rendered AT ALL now: no text to say and, with no `onRedirect`, no button to
+  // offer. `queryByTestId` rather than `getByTestId`, and its absence is the stronger form of the
+  // original assertion — "never answered" cannot appear in a row that does not exist.
+  // The row still MOUNTS — it hosts the redirect button — but it now carries no sentence, so the
+  // deleted claim cannot appear in it. Asserting the text is EMPTY is the stronger form of the
+  // original "does not contain 'never answered'".
+  it("renders no receipt text for a displaced concierge turn", () => {
     render(<RoutingReceipt receipt={{ target: "sparkle", unanswered: true }} />);
-    const text = screen.getByTestId("routing-receipt").textContent ?? "";
-    expect(text).not.toContain("never answered");
-    expect(text).toContain("Answered here");
+    expect((screen.getByTestId("routing-receipt").textContent ?? "").trim()).toBe("");
   });
 
   // The no-retraction rule the rest of this file is tripwired against still applies: the message
   // WAS delivered — the brain read it and was working on it — so nothing here may imply it wasn't.
   it("never implies the message itself was retracted", () => {
-    expect(receiptText({ target: "sparkle", unanswered: true })).not.toMatch(
+    // `?? ""` because the ordinary concierge line is now null — and null trivially satisfies the
+    // no-retraction rule, which is what this row is guarding.
+    expect(receiptText({ target: "sparkle", unanswered: true }) ?? "").not.toMatch(
       /instead|moved|undone|unsent|cancell?ed|not sent/i,
     );
   });

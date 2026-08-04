@@ -16,9 +16,6 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConciergeThread } from "./ConciergeThread";
 import { ANCHOR_HIGHLIGHT_MS, ANSWERED_MARKER_TESTID, REPLY_ANCHOR_TESTID } from "./ReplyAnchorViews";
-// The receipt's own pure wording function — imported so the case below pins the STATE the line
-// describes rather than quoting a string that is being deleted on a sibling branch.
-import { receiptText } from "./RoutingReceipt";
 import type { ConciergeMessage } from "./types";
 
 const noop = () => {};
@@ -182,9 +179,11 @@ describe("his own message says it was answered", () => {
         answers: [{ id: "you-1", quote: "can you check the retry logic" }],
       },
     ]);
-    expect(screen.getByTestId("routing-receipt").textContent).toContain(
-      receiptText({ target: "sparkle" }),
-    );
+    // THE ORDINARY RECEIPT IS INTACT — asserted as the ROW's presence, not as its wording. The
+    // wording is now empty: "Answered here" was removed at the founder's request (RoutingReceipt),
+    // so `receiptText({target:"sparkle"})` returns null and `toContain(null)` is a type error rather
+    // than a check. The row itself survives because it hosts the redirect, and its presence is what
+    // this line was ever really saying. The negative below is the half that carries the intent.
     expect(screen.getByTestId("routing-receipt").textContent).not.toMatch(
       /never answered|replaced by your next message/i,
     );
@@ -218,8 +217,12 @@ describe("his own message says it was answered", () => {
       { id: "err-1", kind: "failure", headline: "That turn failed.", evidence: "boom" },
     ]);
     expect(screen.queryByTestId(ANSWERED_MARKER_TESTID)).toBeNull();
-    expect(screen.getAllByTestId("routing-receipt")[0]!.textContent).toContain(
-      receiptText({ target: "sparkle", unanswered: true }),
+    // "Answered here" is gone, so the old `toContain(receiptText(...))` compared against null. What
+    // this block exists to pin is the WORDING the receipt must never carry, so that is what is
+    // asserted — a bare presence check cannot fail (getByTestId throws when absent) and would pass
+    // against a build that restored "never answered", which is the exact regression guarded here.
+    expect(screen.getAllByTestId("routing-receipt")[0]!.textContent).not.toMatch(
+      /never answered|replaced by your next message/i,
     );
   });
 
@@ -234,8 +237,10 @@ describe("his own message says it was answered", () => {
         receipt: { target: "sparkle", unanswered: true },
       },
     ]);
-    expect(screen.getByTestId("routing-receipt").textContent).toContain(
-      receiptText({ target: "sparkle", unanswered: true }),
+    // Asserted as the WORDING it must never carry, for the reason above: the stamp is withdrawn only
+    // by evidence, and a presence check would pass against a build that restored the deleted claim.
+    expect(screen.getByTestId("routing-receipt").textContent).not.toMatch(
+      /never answered|replaced by your next message/i,
     );
   });
 

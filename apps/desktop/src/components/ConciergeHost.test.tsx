@@ -1315,10 +1315,16 @@ describe("ConciergeHost — routing receipts", () => {
     expect(await within(thread()).findByText("→ Sent to CI Hardening")).toBeTruthy();
   });
 
-  it("says a chat answer landed here", async () => {
+  // ══ NO RECEIPT SENTENCE FOR AN ORDINARY CONCIERGE ANSWER (founder, 2026-08-04) ════════════════
+  // This asserted "→ Answered here". He asked for that gone: the concierge answering in place is
+  // self-evident from the reply appearing directly beneath it, so the line was noise on every turn.
+  // The receipt ROW stays — it hosts the redirect — so this pins the row present and the sentence
+  // absent, which is exactly the change and would fail if either half regressed.
+  it("shows no receipt sentence when the concierge answered in place", async () => {
     renderWithTarget();
     await send("what's going on?");
-    expect(await within(thread()).findByText("→ Answered here")).toBeTruthy();
+    expect(await within(thread()).findByTestId("routing-receipt")).toBeTruthy();
+    expect(within(thread()).queryByText(/Answered here/)).toBeNull();
   });
 
   // "→ Sent to CI Hardening" over a message that never arrived would be a plain lie; the failure
@@ -1335,7 +1341,9 @@ describe("ConciergeHost — routing receipts", () => {
   it("redirects a chat answer into the agent, on one click", async () => {
     renderWithTarget();
     await send("was that right?");
-    await within(thread()).findByText("→ Answered here");
+    // Wait on the redirect BUTTON rather than the removed receipt sentence — it is what this row is
+    // about to click, so it is the honest thing to wait for.
+    await within(thread()).findByTestId("routing-redirect");
     await act(async () => {
       fireEvent.click(screen.getByTestId("routing-redirect"));
     });

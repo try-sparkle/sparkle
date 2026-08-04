@@ -2781,7 +2781,13 @@ export function ConciergeHost({
     // two messages in a row answered by Sparkle both produce "→ Answered here" — so an identical
     // consecutive write is the COMMON case here, not a corner one, and a bare setState React bails
     // out of would announce the first and silently swallow every repeat.
-    announce(receiptText(receipt));
+    // NULL FOR AN ORDINARY CONCIERGE ANSWER, since "Answered here" was removed (RoutingReceipt).
+    // Nothing is announced then, and that is the right call rather than a gap: the reply itself
+    // lands in the thread and is read out, which is the same reasoning that removed the visual line.
+    // Every case that DOES say something a screen-reader user could not otherwise infer — sent
+    // elsewhere, refused, or a second delivery — still returns a string and is still announced.
+    const receiptLine = receiptText(receipt);
+    if (receiptLine) announce(receiptLine);
     setChat((prev) =>
       prev.map((m) => {
         if (m.kind !== "you") return m;
