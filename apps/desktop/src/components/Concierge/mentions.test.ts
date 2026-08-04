@@ -21,6 +21,11 @@ import {
   SPARKLE_MENTION_ID,
   type MentionAgent,
 } from "./mentions";
+// The APP-OWNED Improve-Sparkle agent's real id and name. Imported rather than spelled as literals
+// on purpose: the collision these tests are about exists because that name IS "Sparkle", so a test
+// that hardcoded the string would keep passing if the constant were ever renamed — and the bug would
+// come back silently (bead sparkle-k5kit).
+import { SPARKLE_AGENT_ID, SPARKLE_AGENT_NAME } from "../../services/sparkleAgent";
 
 function agent(over: Partial<MentionAgent> & { id: string; name: string }): MentionAgent {
   return {
@@ -184,16 +189,51 @@ describe("mentionRoster — the one list every other function is handed", () => 
     ]);
   });
 
-  // A human who names a build agent "Sparkle" makes the bare address ambiguous, and the existing
-  // duplicate rule takes over: BOTH get a project suffix, so each is still addressable and neither
-  // silently swallows the other's aim.
-  it("disambiguates a build agent a human also called Sparkle", () => {
+  // An agent that shares the concierge's name makes the bare address ambiguous, and the duplicate
+  // rule takes over for THE AGENT — it gets a project suffix, so it is still addressable and does
+  // not silently swallow the concierge's aim.
+  //
+  // THE CONCIERGE KEEPS `Sparkle` (bead sparkle-k5kit). It is the reserved address, and relabelling
+  // it is what killed the escape hatch: see the pair of tests below, which are the ones that would
+  // have caught the founder's screenshot.
+  it("suffixes a build agent that shares the concierge's name, and leaves the concierge bare", () => {
     const rival = agent({ id: "r", name: "Sparkle", projectName: "web" });
     expect(
       mentionRoster([rival])
-        .map((a) => a.label)
+        .map((a) => a.label ?? a.name)
         .sort(),
-    ).toEqual(["Sparkle (the concierge)", "Sparkle (web)"]);
+    ).toEqual(["Sparkle", "Sparkle (web)"]);
+  });
+
+  // ══ THE ESCAPE HATCH SURVIVES THE IMPROVE-SPARKLE PANE (bead sparkle-k5kit) ═══════════════════
+  // NOT a hypothetical human naming collision. `SPARKLE_AGENT_NAME` IS "Sparkle", so the app's own
+  // Improve-Sparkle build agent collides by construction the moment its pane is open — which is the
+  // exact state the founder was in. Both rows used to be relabelled, so the bare `@Sparkle` he typed
+  // resolved to NOTHING, the message followed the mount into that agent's terminal, and the
+  // full-screen refusal came back naming "@Sparkle" because the AGENT is called that.
+  it("resolves a bare @Sparkle to the concierge while the Improve Sparkle pane is open", () => {
+    const improveSparkle = agent({
+      id: SPARKLE_AGENT_ID,
+      name: SPARKLE_AGENT_NAME,
+      projectName: "Improve Sparkle",
+    });
+    expect(mentionsIn("@Sparkle what is the status?", mentionRoster([improveSparkle]))).toEqual([
+      { agentId: SPARKLE_MENTION_ID, name: "Sparkle" },
+    ]);
+  });
+
+  // And the pane itself stays reachable by its qualified address — the fix must not cost the founder
+  // the ability to address the Improve-Sparkle agent by name. `findMentionSpans` tries the LONGER
+  // label first, which is what keeps these two from fighting over the same prefix.
+  it("still resolves the qualified address to the Improve Sparkle agent itself", () => {
+    const improveSparkle = agent({
+      id: SPARKLE_AGENT_ID,
+      name: SPARKLE_AGENT_NAME,
+      projectName: "Improve Sparkle",
+    });
+    expect(
+      mentionsIn("@Sparkle (Improve Sparkle) ship it", mentionRoster([improveSparkle])),
+    ).toEqual([{ agentId: SPARKLE_AGENT_ID, name: "Sparkle (Improve Sparkle)" }]);
   });
 });
 

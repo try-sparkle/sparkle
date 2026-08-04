@@ -389,6 +389,29 @@ describe("ConciergeHost — @Sparkle is the way out of a mount", () => {
     expect(h.routeMessage).not.toHaveBeenCalled();
   });
 
+  // ══ THE SCREEN GUARD MAY NOT VETO A CONCIERGE-BOUND MESSAGE (bead sparkle-k5kit) ═══════════════
+  // The founder's report, verbatim: "@Sparkle has a full-screen app open, so I didn't type that into
+  // it — the keys would have run as commands." That sentence cannot be true of the concierge under
+  // any circumstance. It is not a PTY. It has no screen, no alternate buffer, and no way for keys to
+  // run as commands.
+  //
+  // THE GUARD IS ABOUT A TERMINAL, so it may only ever be asked about a message bound FOR a terminal.
+  // Once the route resolves to the concierge, no screen check of any kind may run — and in particular
+  // not one aimed at the MOUNTED agent's screen, which is a different destination entirely. The
+  // escape hatch has to work in exactly the state it exists for: patched to an agent that is busy.
+  //
+  // The three assertions are one invariant seen from three sides — the brain was asked, no terminal
+  // was written, and the words were NOT bounced back with a refusal.
+  it("reaches the concierge even while the mounted agent is in a full-screen app", async () => {
+    mount();
+    h.viewport.mockReturnValue({ text: "~\n~\n:", alternateBuffer: true });
+    await send("@Sparkle what is the status of the build?");
+    await elapse();
+    expect(h.startConciergeTurn).toHaveBeenCalledTimes(1);
+    expect(h.dispatchConciergeAnswer).not.toHaveBeenCalled();
+    expect(notice().textContent ?? "").not.toContain("full-screen app");
+  });
+
   // ══ NOT EVERY @Sparkle IS A REDIRECT ══════════════════════════════════════════════════════════
   // This app is called Sparkle, so its own name lands in ordinary instructions to an agent. Yanking
   // this message out of the terminal it was written for would silently drop the instruction. The

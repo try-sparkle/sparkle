@@ -94,6 +94,30 @@ function labelOf(a: MentionAgent): string {
  * "Docs" for the user.
  *
  * Only collisions get a suffix; the overwhelmingly common case is untouched.
+ *
+ * ══ EXCEPT THE CONCIERGE, WHICH KEEPS THE BARE NAME (bead sparkle-k5kit) ════════════════════════
+ * `@Sparkle` is a RESERVED ADDRESS, not merely one more row that happens to be called Sparkle, and
+ * relabelling it broke the escape hatch in the one configuration the founder actually runs.
+ *
+ * The app-owned Improve-Sparkle build agent is named `Sparkle` — `SPARKLE_AGENT_NAME`, a constant,
+ * not a name a human chose — so the collision this function guards against is not the rare
+ * two-projects-both-called-Docs case here. It is GUARANTEED the moment that pane is open. Both rows
+ * were then relabelled, the concierge's address became `@Sparkle (the concierge)`, and a bare
+ * `@Sparkle` — which is what the founder types, and what `dictatedSparkleAddress` produces from
+ * speech — matched NOTHING. Zero mentions means no addressing span, which means
+ * `classifyComposerRoute` falls through clause 2 to clause 3 and the message follows THE MOUNT into
+ * the agent's terminal. The escape hatch did not report a failure; it silently evaporated, and the
+ * refusal the founder saw named "@Sparkle" because the AGENT is called that.
+ *
+ * That is the unrecoverable direction this module's header is about: the way OUT of a mount cannot
+ * itself be shadowed by the thing being mounted to. So the concierge keeps `Sparkle`, and the build
+ * agent takes the suffix — `@Sparkle` is the concierge, `@Sparkle (Improve Sparkle)` is the pane.
+ * `findMentionSpans` tries the longer label first, so the qualified form still resolves to the
+ * agent; only the bare form is claimed, and it is claimed by the row that can always receive it.
+ *
+ * The concierge is still COUNTED above, so the build agent it collides with is relabelled and stays
+ * addressable. Exempting it from the count instead would leave both rows reading `Sparkle`, which is
+ * the ambiguity this function exists to remove.
  */
 export function withMentionLabels(agents: readonly MentionAgent[]): MentionAgent[] {
   const counts = new Map<string, number>();
@@ -102,7 +126,7 @@ export function withMentionLabels(agents: readonly MentionAgent[]): MentionAgent
     counts.set(key, (counts.get(key) ?? 0) + 1);
   }
   return agents.map((a) =>
-    (counts.get(a.name.toLowerCase()) ?? 0) > 1
+    (counts.get(a.name.toLowerCase()) ?? 0) > 1 && a.id !== SPARKLE_MENTION_ID
       ? { ...a, label: `${a.name} (${a.projectName})` }
       : a,
   );
