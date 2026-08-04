@@ -34,7 +34,15 @@ export interface WindowSpan {
   /** "That button didn't work." */
   actionError: string | null;
   displayCount: number;
-  /** Nothing is actionable until we know what displays exist. */
+  /**
+   * True until a layout is readable — a fact about what we KNOW, not a blanket "do nothing".
+   *
+   * It gates SPANNING (whose target rect is computed from the layout) and VISIBILITY (with no
+   * layout we cannot say a second display exists). It must NEVER gate `fit`/`reset`: those act in
+   * Rust on the window's current display, never consume this, and are the only way back from a
+   * stranded geometry. Wiring this into a `disabled` prop for them removes the documented recovery
+   * — which is exactly how that defect shipped twice (roborev 57683, 57687).
+   */
   noLayout: boolean;
   /** macOS "Displays have separate Spaces" is ON and there is more than one display to span. */
   blockedBySpaces: boolean;
@@ -131,8 +139,9 @@ export function useWindowSpan(): WindowSpan {
   );
 
   const displayCount = layout?.displays.length ?? 0;
-  // Nothing is actionable until we know what displays exist: acting on a null layout just produces
-  // a second error next to the one that caused it.
+  // SPANNING is what needs this: its target rect is computed from the layout, so asking for one we
+  // could not read just produces a second error beside the first. It is NOT a global "nothing is
+  // actionable" — see the field's doc above, and `fit`/`reset` below, which are never gated.
   const noLayout = !layout || displayCount === 0;
   // With one display "spanning" is just maximizing, which works regardless of the Spaces setting —
   // so only warn (and only block) when there is actually more than one display to span across.

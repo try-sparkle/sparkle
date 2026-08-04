@@ -223,10 +223,16 @@ describe("WindowSpanControls", () => {
     await waitFor(() => expect(invoke).toHaveBeenCalledWith("fit_window_to_current_display"));
     expect(useSettingsStore.getState().windowIsSpanned).toBe(false);
 
+    // Re-arm the flag first: the Fit above already cleared it, so asserting it afterwards without
+    // this would pass whatever Reset did — and the flag IS the side effect that matters here, since
+    // useDisplayRespan gates on it and a Reset that leaves it true keeps re-spanning the window the
+    // user is trying to recover.
+    useSettingsStore.setState({ windowIsSpanned: true });
     await userEvent.click(
       screen.getByRole("button", { name: /Reset the window to its default size/i }),
     );
     await waitFor(() => expect(invoke).toHaveBeenCalledWith("reset_window_size"));
+    expect(useSettingsStore.getState().windowIsSpanned).toBe(false);
   });
 
   it("distinguishes an action failure from a read failure", async () => {
