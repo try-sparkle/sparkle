@@ -41,7 +41,7 @@ import { useRuntimeStore } from "../stores/runtimeStore";
 import { submitPrompt } from "../pty";
 import { log } from "../logger";
 import type { AgentTabStatus } from "../types";
-import { routeSilence } from "@sparkle/core";
+import { routeAccountLimit, routeSilence } from "@sparkle/core";
 import { useProjectStore } from "../stores/projectStore";
 import { agentDisplayName } from "../engine/agentDisplayName";
 import { notifyConcierge } from "./conciergeNotifier";
@@ -725,18 +725,26 @@ export function liveDeps(now: number): ReviveDeps {
       // been wrong: restarting an agent whose account limit has not reset just re-fails. That is
       // exactly the distinction `routeSilence`'s non-transient branch exists to draw — "read its
       // terminal, then restart it" rather than "it was retried N times and stayed dead".
-      const transient = episode.failure !== "terminal";
-      // The budget path knows the real spend; every other path's truth is on the episode.
-      const retries = retriesSpent ?? episode.attempts;
-      const route = routeSilence({
-        label: labelForAgent(agentId),
-        transient,
-        retries,
-        // Equal, which is what makes `routeSilence` report `transient-retries-exhausted` rather than
-        // hold its tongue: reaching this callback IS the exhaustion.
-        retryLimit: retries,
-        message: reason,
-      });
+      // A WALL IS NOT SILENCE, AND NEEDS DIFFERENT WORDS (roborev 57773). Deriving `transient` from
+      // the episode removed the false retry count, but still sent an account-limited agent through
+      // the silence router — whose text says "is not running and cannot be pushed" (false: terminal
+      // escalates BEFORE the liveness gates, so the agent is typically alive and accepting input)
+      // and ends "restart it or take its branch over". Restarting an agent whose session window has
+      // not reset just re-fails, which is the exact harm the previous fix set out to prevent, so a
+      // concierge following the instruction did the wrong thing anyway.
+      const route =
+        episode.failure === "terminal"
+          ? routeAccountLimit({ label: labelForAgent(agentId), message: reason })
+          : routeSilence({
+              label: labelForAgent(agentId),
+              transient: true,
+              // The budget path knows the real spend; every other path's truth is on the episode.
+              retries: retriesSpent ?? episode.attempts,
+              // Equal, which is what makes `routeSilence` report `transient-retries-exhausted`
+              // rather than hold its tongue: reaching this callback IS the exhaustion.
+              retryLimit: retriesSpent ?? episode.attempts,
+              message: reason,
+            });
       if (route.target !== "concierge") return;
       if (!notifyConcierge(route.text)) {
         log.warn("apiRecovery", "gave up on an agent and could not tell the concierge", { agentId });

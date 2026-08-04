@@ -485,6 +485,42 @@ export function routeBlocker(report: BlockerReport, ctx: BlockerContext): Blocke
  * reported anywhere until the retries are spent; a non-transient one goes straight to the concierge,
  * because a build agent that is not running cannot be pushed to do anything about not running.
  */
+/**
+ * An agent held behind an ACCOUNT LIMIT — alive, reachable, and unable to do anything about it.
+ *
+ * ── WHY THIS IS NOT `routeSilence` (roborev 57773) ───────────────────────────────────────────────
+ * It was, briefly, and both of that router's factual claims were wrong here. `decideRevive` escalates
+ * `failure === "terminal"` BEFORE the `canAcceptInput` / `processAlive` gates, so a walled agent is
+ * typically RUNNING and accepting input — it simply cannot make progress. `routeSilence` opens with
+ * "is not running and cannot be pushed", which is false, and ends with "restart it or take its
+ * branch over" — and restarting an agent whose session window has not reset just re-fails, which is
+ * the precise harm the fix that introduced this was written to prevent. A concierge following that
+ * instruction does the wrong thing.
+ *
+ * Silence and a wall are different states and they need different words. This one says the agent is
+ * alive, says waiting is what clears it, and says explicitly not to restart.
+ *
+ * Still the CONCIERGE and never the founder, for the same reason as every other route here: taking a
+ * branch over is something the concierge can do, and a limit that resets on a clock is not something
+ * to page a human about. `pusherFleet` already suppresses quota conditions from "needs you" for the
+ * same reason.
+ */
+export function routeAccountLimit(input: {
+  label: string;
+  /** The verbatim banner, which is the only place the reset time and the remedy path appear. */
+  message?: string;
+}): BlockerRoute {
+  return {
+    target: "concierge",
+    reason: "account-limited",
+    text:
+      `${input.label} is running but blocked on an account limit` +
+      (input.message ? `: ${input.message}` : "") +
+      `. Retrying cannot clear it and DO NOT restart it — a restart re-fails until the window ` +
+      `resets or the cap is raised. Take its branch over if the work cannot wait.`,
+  };
+}
+
 export function routeSilence(input: {
   label: string;
   /** True when the agent's last error reads as self-clearing — see `isTransientFailure`. */

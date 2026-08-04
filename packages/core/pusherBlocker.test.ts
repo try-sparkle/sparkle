@@ -15,6 +15,7 @@ import {
   parseBlockerReport,
   retryDelayMs,
   routeBlocker,
+  routeAccountLimit,
   routeSilence,
   type BlockerReport,
   type BlockerState,
@@ -522,5 +523,40 @@ describe("arm 2 cannot smuggle a number in from the agent's own words (roborev 5
       })!;
       expect(checkCitations(`Your goal expired 3h 12m ago.\n\n${ask}`, ["3", "12"]).ok).toBe(true);
     }
+  });
+});
+
+describe("an account limit is a WALL, not silence (roborev 57773)", () => {
+  const walled = () =>
+    routeAccountLimit({ label: "Mount Tells The Truth", message: "resets at 3pm" });
+
+  it("does not claim the agent is dead — a terminal limit escalates BEFORE the liveness gates", () => {
+    // decideRevive answers failure === "terminal" before the canAcceptInput / processAlive checks,
+    // so a walled agent is typically RUNNING and accepting input. It simply cannot make progress.
+    expect(walled().text).not.toContain("is not running");
+    expect(walled().text).toContain("is running but blocked on an account limit");
+  });
+
+  it("tells the concierge NOT to restart it, which is the whole point", () => {
+    // Restarting an agent whose session window has not reset just re-fails. routeSilence ends with
+    // "restart it or take its branch over", so a concierge following that instruction did the exact
+    // thing the fix existed to prevent.
+    expect(walled().text).toContain("DO NOT restart it");
+    expect(walled().text).not.toMatch(/Restart it or take its branch over/);
+  });
+
+  it("quotes the banner verbatim — the only place the reset time and remedy path appear", () => {
+    expect(walled().text).toContain("resets at 3pm");
+    expect(routeAccountLimit({ label: "A" }).text).not.toContain("undefined");
+  });
+
+  it("goes to the concierge, never the founder — a clock-based limit is not a page", () => {
+    expect(walled().target).toBe("concierge");
+    expect(walled().reason).toBe("account-limited");
+  });
+
+  it("is a DIFFERENT route from silence, not a reworded one", () => {
+    const silent = routeSilence({ label: "A", transient: false, retries: 0, retryLimit: 4 });
+    expect(routeAccountLimit({ label: "A" }).reason).not.toBe(silent.reason);
   });
 });

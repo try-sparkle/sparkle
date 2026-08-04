@@ -452,6 +452,16 @@ describe("sweepApiRecovery", () => {
     // the episode, so an episode-scoped latch re-paged for every one of them (roborev 55612).
     const budgetPages = onEscalate.mock.calls.filter((c) => c[1] === BUDGET_SPENT_REASON);
     expect(budgetPages).toHaveLength(1);
+
+    // THE SPEND IS REPORTED, AND IT IS THE REAL ONE (roborev 57773). The 4th argument is what the
+    // concierge's give-up report quotes. Reading `episode.attempts` instead would report ZERO here:
+    // the budget is charged across PRIOR ladders and checked BEFORE `attempts` is assigned, so the
+    // common case is a brand-new episode — and "retried 0 times and stayed dead" attached to a
+    // reason saying the agent "has been auto-retried as much as is useful" understates the only
+    // evidence anyone gets. Asserting the CALL SITE here is the half a hand-built `liveDeps` test
+    // structurally cannot cover: deleting `pinged.length` from the producer left that one green.
+    expect(budgetPages[0]![3]).toBeGreaterThan(0);
+    expect(budgetPages[0]![3]).toBe(PING_BUDGET);
   });
 
   it("TERMINATES even when no ladder ever completes — the unconditional ceiling", async () => {

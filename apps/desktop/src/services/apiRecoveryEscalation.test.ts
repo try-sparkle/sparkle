@@ -109,7 +109,12 @@ describe("giving up on an agent tells the concierge", () => {
 
     expect(told).toHaveLength(1);
     expect(told[0]).not.toMatch(/retried \d+ times/);
-    expect(told[0]).toContain("Read its terminal");
+    // ...and it must not claim the agent is DEAD or tell anyone to restart it (roborev 57773).
+    // Terminal escalates BEFORE the liveness gates, so the agent is typically alive and accepting
+    // input; restarting it just re-fails until the window resets.
+    expect(told[0]).not.toContain("is not running");
+    expect(told[0]).toContain("is running but blocked on an account limit");
+    expect(told[0]).toContain("DO NOT restart it");
   });
 
   it("reports the REAL spend on the budget path, where the episode's own count is zero", () => {
