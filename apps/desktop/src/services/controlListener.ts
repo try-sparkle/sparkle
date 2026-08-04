@@ -18,7 +18,13 @@
 // identity is structural rather than claimed. Everything below that says "the caller" still means
 // an AgentTab id, except where the reserved id is called out explicitly.
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { canSelfMarkMet, selfMarkRefusal, parseGoalVerify, type GoalVerify } from "@sparkle/core";
+import {
+  canSelfMarkMet,
+  selfMarkRefusal,
+  parseGoalVerify,
+  type GoalVerify,
+  type GoalVerifyEvidence,
+} from "@sparkle/core";
 import { safeUnlisten } from "./safeUnlisten";
 import { startControlBridge, controlRespond } from "./orchestrationLaunch";
 import { useProjectStore } from "../stores/projectStore";
@@ -50,7 +56,7 @@ import { reportControlOp } from "./selfReportObservability";
 import { livenessOf } from "./agentLiveness";
 // The one assembly of goal + stall + thrash, shared with conciergeTools/terminal.getAgentStatus so
 // the roster sweep and the single-agent read cannot disagree about who is stalled.
-import { goalReading, stallReadingFor, thrashReadingFor } from "./agentGoalReading";
+import { goalReading, landedEvidenceFor, stallReadingFor, thrashReadingFor } from "./agentGoalReading";
 // CALM FIRST, THEN ROLL UP — applied to the raw status map before any bucketing, so a row's own
 // status, its rollup dot and its stall verdict cannot disagree about a never-briefed agent.
 import { withNewAgentCalm } from "../engine/newAgentAttention";
@@ -984,9 +990,20 @@ function handleSetGoal(req: ControlRequest): Record<string, unknown> {
       return {
         ok: false,
         code: "verify_not_yours",
+        // THE REMEDY MUST BE FOLLOWABLE (AGENTS.md: a remedy string is an instruction the agent WILL
+        // follow, so it needs the same analysis as the path it replaces). This used to end "or state
+        // a different check instead" — which is now false for exactly the checks that reach this
+        // refusal: an owed `command`/`human` check is sticky, so stating a different one silently
+        // does nothing and the agent is left believing it acted (roborev 57801).
         error:
           "clearing a goal's check is a human take-back, not something the agent it binds may do. " +
-          "Ask the concierge to drop it, or state a different check instead.",
+          "Ask the concierge to drop it. Stating a WEAKER check is refused for the same reason — " +
+          "the order is human > command > landed, so you can bind yourself harder but never looser. " +
+          "On an UNCHANGED goal two more swaps are refused even though the rank allows them: a " +
+          "`command` check may only be re-stated with the identical `cmd`, and `landed` may not " +
+          "become `command` (that trades git's answer for a string you wrote). Both lift on new " +
+          "goal text. If your goal's check is `landed`, you do not need a take-back at all: mark it " +
+          "met once the work is on origin/main.",
       };
     }
     verify = null;
@@ -1093,25 +1110,49 @@ function handleSetGoalMet(req: ControlRequest): Record<string, unknown> {
   }
   // ── THE SELF-REPORT GATE ────────────────────────────────────────────────────────────────────────
   // `setAgentGoalMet` LATCHES `metAt`, and `metAt` is the only signal that makes an idle agent count
-  // as done. So an agent allowed to call this on a goal that stated HOW it would be checked has
+  // as done. So an agent allowed to call this on a goal whose check IT would have to answer has
   // self-reported "done" — "I ran the command and it passed" is precisely the self-report the check
-  // exists to replace, and nothing downstream re-verifies it. `canSelfMarkMet` refuses EVERY stated
-  // kind; a goal with no `verify` is untouched, which is the compatibility path for every goal that
-  // predates the field (it never claimed to be verifiable).
+  // exists to replace, and nothing downstream re-verifies it. A goal with no `verify` is untouched,
+  // which is the compatibility path for every goal that predates the field (it never claimed to be
+  // verifiable).
   //
-  // THREE THINGS THIS DELIBERATELY DOES NOT REFUSE:
+  // FOUR THINGS THIS DELIBERATELY DOES NOT REFUSE:
   //   • the CONCIERGE. It is the human-driven surface that sweeps for stalls and closes out finished
   //     work; refusing it would leave a verified goal with no one able to close it at all. Its id is
   //     stamped server-side by the bridge, so this is not a hole an agent can climb through.
   //   • `met: false`. Reopening a goal is the opposite of a false "done" — it re-arms auto-continue.
   //     Refusing it would trap an agent that noticed its own premature close.
   //   • a goal with no stated check. See above.
+  //   • a `{kind:"landed"}` goal WHOSE WORK GIT SAYS IS ON ORIGIN/MAIN (sparkle-vfkqz). That is not
+  //     the agent's word — `landedEvidenceFor` computes it from the branch's reachability, polled
+  //     independently of anything the agent says, and the agent supplies no part of it. Refusing it
+  //     anyway is what escalated two FINISHED agents to the founder over already-merged PRs, three
+  //     auto-continues each. The gate exists to stop an agent calling UNLANDED work done; firing it
+  //     on landed work inverts it and buries the real escalations in false red.
+  //
+  // The evidence is gathered ONLY for the kind that consumes it. `landedEvidenceFor` is cheap
+  // (already-polled window state, no git call), but reading it for a `human` goal would suggest
+  // ancestry has some bearing there — it does not, and `canSelfMarkMet` ignores it for every other
+  // kind precisely so a landed branch can never launder a human sign-off.
   const goal = found.agent.goal;
-  if (!isConcierge && met && !canSelfMarkMet(goal.verify) && goal.verify) {
+  // `stated` always rides along: `selfMarkRefusal` uses it to decide WHAT TO TELL the agent (whether
+  // to mention the concierge take-back), never whether the goal may close — `canSelfMarkMet` reads
+  // only `landed`. Passing it is what stops the refusal asking the agent a question it cannot answer
+  // (roborev 57819). `landed` is still gathered only for the kind that consumes it.
+  const evidence: GoalVerifyEvidence = {
+    ...(goal.verify?.kind === "landed" ? { landed: landedEvidenceFor(targetId) } : {}),
+    // TWO BITS, because there are three populations and the refusal says something different to
+    // each (roborev 57825, then 57827): `stated` = a caller ever chose this check; `chosenHere` =
+    // they chose it for THIS goal rather than one it was carried from. Sent unconditionally — the
+    // absent-flag (legacy) case is a meaningful `false`, not a reason to omit them.
+    stated: goal.verifyStated === true,
+    chosenHere: goal.verifyStated === true && goal.verifyInherited !== true,
+  };
+  if (!isConcierge && met && !canSelfMarkMet(goal.verify, evidence) && goal.verify) {
     return {
       ok: false,
       code: "goal_not_self_markable",
-      error: selfMarkRefusal(goal.verify),
+      error: selfMarkRefusal(goal.verify, evidence),
     };
   }
   useProjectStore.getState().setAgentGoalMet(found.projectId, targetId, met);

@@ -144,6 +144,65 @@ export function stallEvidenceFor(agentId: string): StallEvidence {
   };
 }
 
+/**
+ * GIT'S ANSWER to "is this agent's work on origin/main?" — the evidence a `{kind:"landed"}` goal is
+ * closed on. `true` / `false` / `undefined` ("not looked up").
+ *
+ * WHY THIS EXISTS (sparkle-vfkqz). `canSelfMarkMet` refused every `landed` goal to its own claimant
+ * because nothing computed `landed`. Something did, all along — just not on this seam: the sidebar's
+ * stage ladder and the unlanded-work surface have answered it since the workflow-stage work. Two
+ * finished agents escalated to the founder over merged PRs while the fact sat one store read away.
+ *
+ * TWO CONDITIONS, AND BOTH ARE NEEDED:
+ *
+ *  • `workflowShipped` — the latched watermark set the first time the agent's stage reached `merged`
+ *    (ORIGIN main, deliberately not `merged_local`; see runtimeStore). This is the POSITIVE half,
+ *    and it must be positive: `hasUnlandedWork === false` would ALSO be true for an agent that never
+ *    committed anything, which would let a goal reading "the fix is merged to origin/main" be closed
+ *    by an agent that wrote no code. The watermark is written by `deriveLiveStage`, so it already
+ *    carries that module's `committedSeen` guard — a no-op branch sitting on main's HEAD cannot
+ *    claim it.
+ *  • `unlandedWorkEvidence !== true` — the NEW-WORK CYCLE veto. The watermark is monotonic, so an
+ *    agent that landed PR #1 and kept committing still reads `shipped: true` while holding unlanded
+ *    commits. Closing a goal there would call an agent done over work it is visibly still holding,
+ *    which is the original false-"done" this whole mechanism exists to prevent.
+ *
+ * NOT a new git call: every input is already-polled window-local state, same as
+ * {@link stallEvidenceFor}. So an unopened pane answers `undefined`, and `undefined` fails CLOSED at
+ * `canSelfMarkMet` — the agent is refused with copy telling it the reading is missing rather than
+ * negative, instead of being told a human must close it.
+ */
+export function landedEvidenceFor(agentId: string): boolean | undefined {
+  const rt = useRuntimeStore.getState();
+  const bs = rt.branchStatus?.[agentId];
+  const ws = rt.workflowState?.[agentId];
+  const stage = rt.workflowStage?.[agentId];
+  const shipped = rt.workflowShipped?.[agentId];
+  // ⚠️ A LIVE READING IS REQUIRED, NOT JUST THE WATERMARKS (roborev 57794). `workflowStage` and
+  // `workflowShipped` are PERSISTED across relaunch (runtimeStore `partialize`); `branchStatus` and
+  // `workflowState` deliberately boot clean. So after a relaunch — or in any window that has never
+  // polled this agent's pane — the two latches are present and both live signals are absent, and the
+  // new-work veto below CANNOT FIRE because it reads `bs.ahead`, the very field that is missing.
+  // That combination answered `true` from months-old localStorage: land PR #1, get a new task, write
+  // three unlanded commits, relaunch, and the agent could close its goal on a merge that predates
+  // the work — the false "done" this gate exists to prevent, restored by the fix for it.
+  //
+  // Treating it as "not looked up" is the honest reading and costs only a retry after the next poll,
+  // which is the same remedy the refusal copy already gives.
+  //
+  // IT MUST BE `bs` SPECIFICALLY, NOT "either live map" (roborev 57796). The first version accepted
+  // `ws !== undefined` as sufficient, which narrowed the hole without closing it: the veto below
+  // fires on `bs.ahead`, and `unlandedWorkEvidence` bails early only when BOTH `bs` and
+  // `stageOverride` are absent — so a `workflowState`-only reading plus a persisted `merged` stage
+  // still fell through to `hasUnmergedCommittedWork(…) === false` and answered `true`, with the veto
+  // structurally unable to fire. The two maps are populated independently (`AgentStatusResult.branch`
+  // is nullable), so that is a reachable state, not a hypothetical. Require the field the veto
+  // actually consumes; `ws` remains an INPUT to the evidence, never an alternative to `bs`.
+  if (bs === undefined) return undefined;
+  if (shipped !== true) return false;
+  return unlandedWorkEvidence({ bs, ws, stageOverride: stage }) === true ? false : true;
+}
+
 /** `prState: null` is ambiguous — see {@link stallEvidenceFor}. Only "open" is a positive reading. */
 function readOpenPr(ws: WorkflowState | undefined): boolean | undefined {
   if (ws === undefined || ws.prState === null) return undefined;

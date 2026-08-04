@@ -2,7 +2,7 @@
 // last prompts. Persisted to localStorage (durable in the Tauri webview) so quit/relaunch
 // restores everything. Live process/status state is NOT here (see runtimeStore).
 import { create } from "zustand";
-import type { GoalVerify } from "@sparkle/core";
+import { mayReplaceVerify, type GoalVerify } from "@sparkle/core";
 import { persist, createJSONStorage, type StateStorage } from "zustand/middleware";
 import type {
   AgentKind,
@@ -1455,21 +1455,89 @@ export const useProjectStore = create<ProjectState>()(
               if (a.goal && a.goal.text === trimmed) {
                 // `verify` comes OFF here and is re-added below, or a take-back could never land:
                 // spreading `rest` would put the old check straight back on top of the drop.
-                const { metAt: _met, verify: _priorVerify, ...rest } = a.goal;
+                // `verifyStated` comes off with `verify` and is re-derived below — the two must move
+                // together, or a dropped/replaced check leaves the old provenance behind on it.
+                const {
+                  metAt: _met,
+                  verify: _priorVerify,
+                  verifyStated: _priorStated,
+                  verifyInherited: _priorInherited,
+                  ...rest
+                } = a.goal;
                 // An explicitly supplied `verify` APPLIES here. Discarding it replied `{ ok: true }`
                 // while the goal stayed unverified and self-markable — the exact failure handleSetGoal
                 // refuses malformed input to avoid, relocated one layer down where that check cannot
                 // see it. It also meant a check could never be ADDED to a standing goal without
                 // rewording it (roborev 55893). Passing none keeps whatever the goal already had.
                 // `null` DROPS it (the concierge's take-back); `undefined` keeps what was there.
-                const kept = verify === null ? undefined : (verify ?? _priorVerify);
+                //
+                // ⚠️ …EXCEPT OVER A STANDING CHECK THE AGENT CANNOT CLOSE ITSELF, WHICH NO STATED
+                // KIND MAY REPLACE (roborev 57796, widened by 57801). This is the SAME invariant
+                // `chargeGoalDebt` enforces for new goal text — an agent must not be able to trade a
+                // check it CANNOT discharge for one it CAN — and this branch is the EASIER door,
+                // because it never consults the debt at all: re-assert the goal's text
+                // BYTE-IDENTICALLY with `verify: {kind:"landed"}` and the check was swapped in one
+                // free-tier call, without even rewording. Both halves of the rule have to live where
+                // the check is written, or closing one door just moves the traffic to the other.
+                //
+                // KEYED ON `agentClosableKind`, NOT ON `human`. Written as a literal `human` check it
+                // left the identical trade open through `command`, which the claimant equally cannot
+                // discharge — so `{kind:"command",cmd:…}` → `{kind:"landed"}` was still a one-call
+                // path to a self-closing goal. The predicate keeps this rule and `canSelfMarkMet`
+                // from drifting, and puts any future kind on the right side automatically.
+                //
+                // NARROW ON PURPOSE, and the two exclusions are what keep it from over-reaching:
+                // `verify: null` still lands (the concierge's take-back is the only exit, exactly as
+                // in the other branch), and a goal with NO prior check is untouched — adding a check
+                // to an unverified standing goal is the case roborev 55893 restored and it must stay
+                // possible. A prior `landed` is freely replaceable too: the agent could already close
+                // it, so trading it away wins nothing.
+                // THE SAME RULE `chargeGoalDebt` APPLIES, from the same shared function: a stated
+                // check may not WEAKEN a binding one (`mayReplaceVerify`). Two hand-written copies
+                // of this drifted apart twice in three review rounds — one door hardened while the
+                // other stayed open is this bug's signature failure — so both now call the one
+                // implementation in @sparkle/core.
+                //
+                // Two differences from the new-text branch, both because the TEXT HAS NOT CHANGED:
+                // the prior check is kept VERBATIM rather than downgraded (roborev 55933's
+                // stale-command hazard is about re-attaching a command to DIFFERENT work, which
+                // cannot arise here), and its provenance is preserved with it.
+                //
+                // Only a STATED check binds. A `human` the machine manufactured as a fallback must
+                // stay replaceable, or an agent that once owed a check is frozen out of ever holding
+                // a git-closable goal again — sparkle-vfkqz, re-created by its own fix (roborev 57806).
+                // `!== false`, not `=== true`: an ABSENT flag is a goal persisted before the field
+                // existed, and main's `chargeGoalDebt` filled the installed base with `{kind:"human"}`
+                // checks. Reading those as non-binding would let one call swap a concierge sign-off
+                // for a self-closable check on upgrade (roborev 57813). Absence fails closed.
+                const priorBinds = _priorVerify !== undefined && _priorStated !== false;
+                const refusedTrade =
+                  verify != null &&
+                  priorBinds &&
+                  // `sameGoal`: this branch runs only when the text is unchanged, which is what
+                  // makes the cmd-identity and landed→command rules apply (see mayReplaceVerify).
+                  !mayReplaceVerify(_priorVerify, verify, { sameGoal: true });
+                const kept =
+                  verify === null ? undefined : refusedTrade ? _priorVerify : (verify ?? _priorVerify);
+                // Stated when the caller's own check survived; otherwise it is the prior value and
+                // carries the prior's provenance forward VERBATIM (including "unknown").
+                const keptStated = kept === verify ? true : _priorStated;
+                // A check the caller states HERE is chosen for this goal, so it is no longer
+                // inherited; anything kept carries the prior's answer forward (roborev 57825).
+                const keptInherited = kept === verify ? false : _priorInherited === true;
                 return {
                   ...a,
                   goal: {
                     ...rest,
                     setAt: Date.now(),
                     ttlMs: ttlMs ?? a.goal.ttlMs,
-                    ...(kept !== undefined ? { verify: kept } : {}),
+                    ...(kept !== undefined
+                      ? {
+                          verify: kept,
+                          ...(keptStated !== undefined ? { verifyStated: keptStated } : {}),
+                          ...(keptInherited ? { verifyInherited: true } : {}),
+                        }
+                      : {}),
                   },
                 };
               }

@@ -170,7 +170,19 @@ describe("controlListener", () => {
     // Reset BOTH liveness inputs get_state's "active" scope reads — the in-memory open set and the
     // shared persisted one (readPersistedOpenAgentIds reads localStorage) — or open ids leak between
     // tests and silently widen the roster.
-    useRuntimeStore.setState({ status: {}, openAgentIds: [] } as never);
+    // The four git-shaped maps go with them: `landedEvidenceFor` reads branchStatus / workflowState /
+    // workflowStage / workflowShipped, and while agent ids are minted fresh per test the maps are not
+    // cleared by the store — a leaked `workflowShipped` entry would silently hand a later test the
+    // ancestry evidence that unlocks a `landed` goal, i.e. turn a refusal test green for the wrong
+    // reason.
+    useRuntimeStore.setState({
+      status: {},
+      openAgentIds: [],
+      branchStatus: {},
+      workflowState: {},
+      workflowStage: {},
+      workflowShipped: {},
+    } as never);
     try {
       localStorage.removeItem(RUNTIME_PERSIST_KEY);
     } catch {
@@ -906,13 +918,812 @@ describe("controlListener", () => {
       expect(goalStateOf(goalOf(callerId), Date.now())).toBe("unmet");
     });
 
-    it("refuses a landed-kind goal to its own claimant, and does not latch metAt", async () => {
+    it("refuses a landed-kind goal to its own claimant when NOTHING HAS READ its branch", async () => {
+      // No branch poll has landed, so `landedEvidenceFor` answers `undefined` — "not looked up" —
+      // and that fails CLOSED. The refusal must say the reading is MISSING, not that the work is
+      // unlanded and not that a human must close it: those send the agent to do different things.
       useProjectStore
         .getState()
         .setAgentGoal(projectId, callerId, "the goal-gate work is on origin main", undefined, "agent", {
           kind: "landed",
         });
       fire({ reqId: "sgV2", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
+      expect(String((lastReply() as { error?: string }).error)).toMatch(/has not been read/i);
+      expect(goalOf(callerId)!.metAt).toBeUndefined();
+    });
+
+    // ── sparkle-vfkqz: THE GATE MUST NOT FIRE ON WORK GIT SAYS IS LANDED ─────────────────────────
+    // Twice on 2026-08-04 a FINISHED agent burned three auto-continues and escalated to the founder
+    // over a merged PR, because `landed` was refused unconditionally while the app already knew the
+    // answer. These four cases pin both directions of the fix: git's YES unlocks the latch, and
+    // everything short of git's YES still refuses.
+    it("ALLOWS a landed-kind goal once the branch is ON ORIGIN MAIN — and LATCHES metAt", async () => {
+      useProjectStore
+        .getState()
+        .setAgentGoal(projectId, callerId, "PR #1148 is merged to origin/main", undefined, "agent", {
+          kind: "landed",
+        });
+      // The evidence the app already computes: the sticky watermark set the first time the agent's
+      // stage reached `merged` (ORIGIN main), plus a clean branch holding nothing back.
+      useRuntimeStore.getState().setWorkflowShipped(callerId, true);
+      useRuntimeStore.getState().setBranchStatus(callerId, {
+        ahead: 0,
+        behind: 0,
+        dirty: false,
+        filesChanged: 0,
+        insertions: 0,
+        deletions: 0,
+        worktreeOnBranch: true,
+      });
+      fire({ reqId: "sgV3", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: true, met: true });
+      // THE STORE FACT, not the reply. `metAt` is the only thing that makes an idle agent count as
+      // done — a test reading only the reply would pass against code that replied ok and never
+      // latched, leaving the agent to be auto-continued and escalated exactly as before.
+      expect(goalOf(callerId)!.metAt).toEqual(expect.any(Number));
+      expect(goalStateOf(goalOf(callerId), Date.now())).toBe("met");
+    });
+
+    it("still REFUSES a landed-kind goal while the branch holds UNLANDED commits", async () => {
+      // The new-work cycle: PR #1 landed (so the monotonic watermark says `merged`) and the agent
+      // kept committing. Closing the goal here would call an agent done over work it is visibly
+      // still holding — the original false-"done" this mechanism exists to prevent.
+      useProjectStore
+        .getState()
+        .setAgentGoal(projectId, callerId, "the fix is merged to origin/main", undefined, "agent", {
+          kind: "landed",
+        });
+      useRuntimeStore.getState().setWorkflowShipped(callerId, true);
+      useRuntimeStore.getState().setBranchStatus(callerId, {
+        ahead: 3,
+        behind: 0,
+        dirty: false,
+        filesChanged: 2,
+        insertions: 10,
+        deletions: 1,
+        worktreeOnBranch: true,
+      });
+      fire({ reqId: "sgV4", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
+      expect(String((lastReply() as { error?: string }).error)).toMatch(/not on origin\/main/i);
+      expect(goalOf(callerId)!.metAt).toBeUndefined();
+    });
+
+    it("still REFUSES a landed-kind goal for an agent that only ever polled a local branch", async () => {
+      // Polled, but never reached origin main: the watermark is absent. This is the case the gate is
+      // actually FOR, and it must be untouched by the fix.
+      useProjectStore
+        .getState()
+        .setAgentGoal(projectId, callerId, "the fix is merged to origin/main", undefined, "agent", {
+          kind: "landed",
+        });
+      useRuntimeStore.getState().setBranchStatus(callerId, {
+        ahead: 2,
+        behind: 0,
+        dirty: false,
+        filesChanged: 1,
+        insertions: 5,
+        deletions: 0,
+        worktreeOnBranch: true,
+      });
+      fire({ reqId: "sgV5", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
+      expect(goalOf(callerId)!.metAt).toBeUndefined();
+    });
+
+    it("still REFUSES a HUMAN-kind goal even when the branch is on origin main", async () => {
+      // THE HALF THAT MUST NOT MOVE. Ancestry answers "is this on main", never "did a person approve
+      // it". If landed evidence unlocked this arm, a merge would launder a human sign-off and the
+      // `human` kind would be decorative for anyone who pushed first.
+      useProjectStore
+        .getState()
+        .setAgentGoal(projectId, callerId, "the founder approves the onboarding copy", undefined, "agent", {
+          kind: "human",
+        });
+      useRuntimeStore.getState().setWorkflowShipped(callerId, true);
+      useRuntimeStore.getState().setBranchStatus(callerId, {
+        ahead: 0,
+        behind: 0,
+        dirty: false,
+        filesChanged: 0,
+        insertions: 0,
+        deletions: 0,
+        worktreeOnBranch: true,
+      });
+      fire({ reqId: "sgV6", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
+      expect(String((lastReply() as { error?: string }).error)).toMatch(/person/i);
+      expect(goalOf(callerId)!.metAt).toBeUndefined();
+    });
+
+    it("a goal that INHERITS its check on new landing-shaped text gets `landed`, not `human`", async () => {
+      // THE ROOT CAUSE, end to end (sparkle-vfkqz). The agent never passed a `verify`: it restated
+      // its goal in its own words and the inherited check was blanket-downgraded to `human`, which
+      // only a person could discharge. Now the fallback reads the new text — so a goal phrased as a
+      // git question inherits the check that can answer it, and the agent closes its own finished
+      // work instead of escalating.
+      useProjectStore
+        .getState()
+        .setAgentGoal(projectId, callerId, "the work is on origin main", undefined, "agent", { kind: "landed" });
+      fire({
+        reqId: "sgV7",
+        op: "set_agent_goal",
+        callerAgentId: callerId,
+        payload: { goal: "nudger.rs and nudge_gate.rs are merged to origin/main" },
+      });
+      await flush();
+      // The INHERITED kind, not the one it was set with — the rewrite carried the obligation over.
+      expect(goalOf(callerId)!.verify).toEqual({ kind: "landed" });
+      useRuntimeStore.getState().setWorkflowShipped(callerId, true);
+      useRuntimeStore.getState().setBranchStatus(callerId, {
+        ahead: 0,
+        behind: 0,
+        dirty: false,
+        filesChanged: 0,
+        insertions: 0,
+        deletions: 0,
+        worktreeOnBranch: true,
+      });
+      fire({ reqId: "sgV7b", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: true, met: true });
+      expect(goalOf(callerId)!.metAt).toEqual(expect.any(Number));
+    });
+
+    it("an agent cannot trade an owed HUMAN check for a landed one by REWORDING the goal", async () => {
+      // roborev 57794, and the sharpest version of this bug pointed backwards. The concierge sets a
+      // human sign-off; the agent restates the goal in landing-shaped words, inherits `landed`,
+      // merges its own PR and closes the founder's approval with a merge. `human` is therefore
+      // STICKY across inheritance — the concierge's `verify: null` take-back is the only exit.
+      useProjectStore
+        .getState()
+        .setAgentGoal(projectId, callerId, "the founder approves the onboarding copy", undefined, "agent", {
+          kind: "human",
+        });
+      fire({
+        reqId: "sgS1",
+        op: "set_agent_goal",
+        callerAgentId: callerId,
+        payload: { goal: "the onboarding copy fix is merged to origin/main" },
+      });
+      await flush();
+      expect(goalOf(callerId)!.verify).toEqual({ kind: "human" });
+      // …and the latch must actually hold, with full landed evidence in hand.
+      useRuntimeStore.getState().setWorkflowShipped(callerId, true);
+      useRuntimeStore.getState().setBranchStatus(callerId, {
+        ahead: 0,
+        behind: 0,
+        dirty: false,
+        filesChanged: 0,
+        insertions: 0,
+        deletions: 0,
+        worktreeOnBranch: true,
+      });
+      fire({ reqId: "sgS1b", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
+      expect(goalOf(callerId)!.metAt).toBeUndefined();
+    });
+
+    it("an agent cannot trade an owed HUMAN check for a landed one by STATING it either", async () => {
+      // The same hole through the explicit door. "A stated check wins" was safe only while NO kind
+      // was self-markable; now that `landed` closes itself, the substitution is a one-call bypass.
+      useProjectStore
+        .getState()
+        .setAgentGoal(projectId, callerId, "the founder approves the onboarding copy", undefined, "agent", {
+          kind: "human",
+        });
+      fire({
+        reqId: "sgS2",
+        op: "set_agent_goal",
+        callerAgentId: callerId,
+        payload: { goal: "the onboarding copy work is done", verify: { kind: "landed" } },
+      });
+      await flush();
+      expect(goalOf(callerId)!.verify).toEqual({ kind: "human" });
+      useRuntimeStore.getState().setWorkflowShipped(callerId, true);
+      useRuntimeStore.getState().setBranchStatus(callerId, {
+        ahead: 0,
+        behind: 0,
+        dirty: false,
+        filesChanged: 0,
+        insertions: 0,
+        deletions: 0,
+        worktreeOnBranch: true,
+      });
+      fire({ reqId: "sgS2b", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
+      expect(goalOf(callerId)!.metAt).toBeUndefined();
+    });
+
+    it("an agent cannot trade an owed HUMAN check by RE-ASSERTING THE IDENTICAL TEXT", async () => {
+      // roborev 57796 — the EASIEST door, and the one the first two guards missed entirely. The
+      // same-text branch of `setAgentGoal` never consults the debt, so it never reaches
+      // `chargeGoalDebt` where stickiness lived: re-state the goal byte-identically with
+      // `verify: {kind:"landed"}` and the human check was swapped in one free-tier call, without
+      // even rewording. Closing one door only moves the traffic to the other, so the rule now lives
+      // wherever the check is written.
+      const text = "the founder approves the onboarding copy";
+      useProjectStore.getState().setAgentGoal(projectId, callerId, text, undefined, "agent", {
+        kind: "human",
+      });
+      fire({
+        reqId: "sgT1",
+        op: "set_agent_goal",
+        callerAgentId: callerId,
+        payload: { goal: text, verify: { kind: "landed" } },
+      });
+      await flush();
+      expect(goalOf(callerId)!.verify).toEqual({ kind: "human" });
+      // And the latch must hold with full landed evidence in hand — the shape assertion above is a
+      // precondition; THIS is the thing that decides whether the sign-off got discharged by a merge.
+      useRuntimeStore.getState().setWorkflowShipped(callerId, true);
+      useRuntimeStore.getState().setBranchStatus(callerId, {
+        ahead: 0,
+        behind: 0,
+        dirty: false,
+        filesChanged: 0,
+        insertions: 0,
+        deletions: 0,
+        worktreeOnBranch: true,
+      });
+      fire({ reqId: "sgT1b", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
+      expect(goalOf(callerId)!.metAt).toBeUndefined();
+    });
+
+    it("an agent cannot trade an owed COMMAND check for a landed one either", async () => {
+      // roborev 57801. The stickiness was first written as a literal `human` check, which left the
+      // identical trade open through `command` — equally un-closable by the claimant, so
+      // {kind:"command"} → {kind:"landed"} still bought a self-closing goal in one call. The rule is
+      // keyed on `agentClosableKind` now, so both un-closable kinds are covered by construction.
+      const text = "the parser handles nested groups";
+      useProjectStore.getState().setAgentGoal(projectId, callerId, text, undefined, "agent", {
+        kind: "command",
+        cmd: "pnpm --filter @sparkle/desktop exec vitest run src/parser.test.ts",
+      });
+      fire({
+        reqId: "sgC1",
+        op: "set_agent_goal",
+        callerAgentId: callerId,
+        payload: { goal: text, verify: { kind: "landed" } },
+      });
+      await flush();
+      // Same text, so the prior check is kept VERBATIM — there is no different work to mis-attach it to.
+      expect(goalOf(callerId)!.verify).toMatchObject({ kind: "command" });
+      // …and through the NEW-TEXT door as well, which reaches the rule via chargeGoalDebt. Here the
+      // result is `human`, NOT the command carried over: the invariant is "never move to a check the
+      // agent CAN close", not "keep the exact check". Re-attaching `pnpm test parser` to landing work
+      // is roborev 55933's stale-command hazard, so it downgrades — still un-closable, no stale proof.
+      // Landing-shaped text must NOT let inference upgrade it to `landed`, which is the whole point.
+      fire({
+        reqId: "sgC1b",
+        op: "set_agent_goal",
+        callerAgentId: callerId,
+        payload: { goal: "the parser fix is merged to origin/main" },
+      });
+      await flush();
+      expect(goalOf(callerId)!.verify).toEqual({ kind: "human" });
+      useRuntimeStore.getState().setWorkflowShipped(callerId, true);
+      useRuntimeStore.getState().setBranchStatus(callerId, {
+        ahead: 0,
+        behind: 0,
+        dirty: false,
+        filesChanged: 0,
+        insertions: 0,
+        deletions: 0,
+        worktreeOnBranch: true,
+      });
+      fire({ reqId: "sgC1c", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
+      expect(goalOf(callerId)!.metAt).toBeUndefined();
+    });
+
+    it("an agent cannot trade a HUMAN sign-off for a COMMAND it authored itself", async () => {
+      // roborev 57806. Framing the rule as closable/not made `human` → `command` a permitted
+      // "lateral" move. It is not lateral: the founder's judgement becomes a command the AGENT wrote
+      // (`echo ok` passes), and the command arm's own refusal copy then tells it to "run it and show
+      // the result; a person closes the goal on that evidence" — a rubber-stamp close of a sign-off
+      // nobody gave. The rule is a STRENGTH RANK now: an agent may never make its own check weaker.
+      const text = "the founder approves the onboarding copy";
+      useProjectStore.getState().setAgentGoal(projectId, callerId, text, undefined, "agent", {
+        kind: "human",
+      });
+      fire({
+        reqId: "sgR1",
+        op: "set_agent_goal",
+        callerAgentId: callerId,
+        payload: { goal: text, verify: { kind: "command", cmd: "echo ok" } },
+      });
+      await flush();
+      expect(goalOf(callerId)!.verify).toEqual({ kind: "human" });
+      // …and the same refusal on new text, which reaches the rule through chargeGoalDebt.
+      fire({
+        reqId: "sgR1b",
+        op: "set_agent_goal",
+        callerAgentId: callerId,
+        payload: { goal: "the onboarding copy is rewritten", verify: { kind: "command", cmd: "echo ok" } },
+      });
+      await flush();
+      expect(goalOf(callerId)!.verify).toEqual({ kind: "human" });
+    });
+
+    it("STRENGTHENING a check is still allowed — the rule is one-way, not a freeze", async () => {
+      // The counterweight to the rank: moving to a check that binds HARDER is always fine, or the
+      // rule stops being "never weaken" and becomes "never change", which would block an agent that
+      // genuinely wants to hold itself to more.
+      const text = "the retry fix is merged to origin/main";
+      useProjectStore.getState().setAgentGoal(projectId, callerId, text, undefined, "agent", {
+        kind: "landed",
+      });
+      fire({
+        reqId: "sgR2",
+        op: "set_agent_goal",
+        callerAgentId: callerId,
+        payload: { goal: text, verify: { kind: "human" } },
+      });
+      await flush();
+      expect(goalOf(callerId)!.verify).toEqual({ kind: "human" });
+    });
+
+    it("a MACHINE-DEFAULTED human check stays re-inferable — it must not latch forever", async () => {
+      // roborev 57806, and the sharpest self-inflicted regression of this branch: stickiness could
+      // not tell a check a PERSON chose from one the machine fell back to. An agent that once stated
+      // a `command` check, then took new landing-shaped work, inherited a `human` nobody chose,
+      // could not close it from git, and escalated — sparkle-vfkqz re-created by its own fix, and
+      // PERMANENT, since every later goal re-inherited the manufactured `human`.
+      useProjectStore
+        .getState()
+        .setAgentGoal(projectId, callerId, "the parser handles nesting", undefined, "agent", {
+          kind: "command",
+          cmd: "pnpm test parser",
+        });
+      // Hop 1: new landing-shaped work. The stated command binds, so the honest carry is `human` —
+      // but MANUFACTURED, not chosen.
+      fire({
+        reqId: "sgM1",
+        op: "set_agent_goal",
+        callerAgentId: callerId,
+        payload: { goal: "the parser fix is merged to origin/main" },
+      });
+      await flush();
+      expect(goalOf(callerId)!.verify).toEqual({ kind: "human" });
+      // Explicitly `false`, not absent: absence now means "persisted before this field" and BINDS,
+      // so a manufactured check has to say so rather than stay silent (roborev 57813).
+      expect(goalOf(callerId)!.verifyStated).toBe(false);
+      // Hop 2: the manufactured check does NOT bind, so the next goal's text is read again and the
+      // agent gets a check git can close. Without provenance this stayed `human` for good.
+      fire({
+        reqId: "sgM2",
+        op: "set_agent_goal",
+        callerAgentId: callerId,
+        payload: { goal: "the follow-up cleanup is merged to origin/main" },
+      });
+      await flush();
+      expect(goalOf(callerId)!.verify).toEqual({ kind: "landed" });
+      // …and it really closes, which is the whole point: no founder turn needed.
+      useRuntimeStore.getState().setWorkflowShipped(callerId, true);
+      useRuntimeStore.getState().setBranchStatus(callerId, {
+        ahead: 0,
+        behind: 0,
+        dirty: false,
+        filesChanged: 0,
+        insertions: 0,
+        deletions: 0,
+        worktreeOnBranch: true,
+      });
+      fire({ reqId: "sgM3", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: true, met: true });
+    });
+
+    it("a stated HUMAN check survives REPEATED restatement — it must not decay after one hop", async () => {
+      // roborev 57813, and the sharpest regression this branch produced: marking every forced
+      // fallback un-stated meant a BINDING check stopped binding after exactly one hop, putting the
+      // original P0 back in two free-tier calls. Hop 1 turned the concierge's `human` into an
+      // un-stated `human`; hop 2 saw nothing binding, re-inferred `landed`, and the agent closed the
+      // founder's approval by merging its own PR. A fallback FORCED by a refused weakening stands in
+      // for the check that refused it, so it inherits the binding.
+      useProjectStore
+        .getState()
+        .setAgentGoal(projectId, callerId, "the founder approves the onboarding copy", undefined, "agent", {
+          kind: "human",
+        });
+      for (const [i, goal] of [
+        "the onboarding copy fix is merged to origin/main",
+        "the onboarding copy work is merged to main",
+        "the copy change has landed on origin/main",
+      ].entries()) {
+        fire({ reqId: `sgD${i}`, op: "set_agent_goal", callerAgentId: callerId, payload: { goal } });
+        await flush();
+        // Landing-shaped text every time — inference would answer `landed` at each hop if the
+        // binding were ever lost.
+        expect(goalOf(callerId)!.verify, `hop ${i + 1}`).toEqual({ kind: "human" });
+      }
+      // …and it still refuses with full landed evidence, which is the fact that actually matters.
+      useRuntimeStore.getState().setWorkflowShipped(callerId, true);
+      useRuntimeStore.getState().setBranchStatus(callerId, {
+        ahead: 0,
+        behind: 0,
+        dirty: false,
+        filesChanged: 0,
+        insertions: 0,
+        deletions: 0,
+        worktreeOnBranch: true,
+      });
+      fire({ reqId: "sgDm", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
+      expect(goalOf(callerId)!.metAt).toBeUndefined();
+    });
+
+    it("the human refusal's take-back offer follows PROVENANCE the app holds, not the agent's guess", async () => {
+      // roborev 57819: the take-back sentence must not fire on a check a caller deliberately chose,
+      // or a remedy string invites an agent to lobby away a real sign-off. The app has the
+      // provenance; this pins that it actually REACHES the refusal (the wiring, not just the copy).
+      const text = "the founder approves the onboarding copy";
+      useProjectStore.getState().setAgentGoal(projectId, callerId, text, undefined, "agent", {
+        kind: "human",
+      });
+      fire({ reqId: "sgZ1", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+      await flush();
+      const chosen = String((lastReply() as { error?: string }).error);
+      expect(chosen).not.toMatch(/verify: null/);
+      expect(chosen).toMatch(/leave it for the human to close/i);
+
+      // …and a SAME-KIND INHERITED check DOES get the offer, because nobody chose it for THIS goal.
+      // roborev 57825: this is the population the take-back exists for, and it was the one being
+      // refused it — `verifyStated` stays `true` through same-kind inheritance (it answers "was a
+      // check of this kind ever chosen"), so reusing it here read an inherited `human` as
+      // caller-chosen. `verifyInherited` is the narrower fact, recorded where inheritance happens.
+      fire({
+        reqId: "sgZ2",
+        op: "set_agent_goal",
+        callerAgentId: callerId,
+        payload: { goal: "the parser cleanup is finished and reviewed" },
+      });
+      await flush();
+      expect(goalOf(callerId)!.verifyStated).toBe(true); // still BINDING…
+      expect(goalOf(callerId)!.verifyInherited).toBe(true); // …but not chosen for this goal.
+      fire({ reqId: "sgZ2b", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+      await flush();
+      // roborev 57827: a check CARRIED from one a caller really chose is still a real sign-off, so
+      // this arm says it stands rather than inviting its removal — the take-back belongs to the
+      // manufactured population below. Offering it here would route a founder's approval toward
+      // being dropped one restatement after it was set.
+      const carried = String((lastReply() as { error?: string }).error);
+      expect(carried).not.toMatch(/verify: null/);
+      expect(carried).toMatch(/still stands/i);
+
+      // A MANUFACTURED (different-kind) fallback gets it too — the other half of the population.
+      const other = useProjectStore.getState().addAgent(projectId, { kind: "build" })!;
+      useProjectStore.getState().setAgentGoal(projectId, other, "the parser handles nesting", undefined, "agent", {
+        kind: "command",
+        cmd: "pnpm test parser",
+      });
+      useProjectStore
+        .getState()
+        .setAgentGoal(projectId, other, "the parser docs read clearly", undefined, "agent");
+      expect(goalOf(other)!.verify).toEqual({ kind: "human" });
+      expect(goalOf(other)!.verifyStated).toBe(false);
+      fire({ reqId: "sgZ3", op: "set_agent_goal_met", callerAgentId: other, payload: { met: true } });
+      await flush();
+      expect(String((lastReply() as { error?: string }).error)).toMatch(/verify: null/);
+    });
+
+    it("a stated HUMAN check survives a NON-LANDING intermediate hop — the sneakiest route", async () => {
+      // roborev 57814. The binding was inherited only when a DOWNGRADE was forced, so it survived
+      // landing-shaped restatements (which force one) and was lost on everything else — and
+      // "everything else" is most goal text, since inference answers `undefined` for anything not
+      // landing-shaped. One judgement-shaped hop in between was the whole bypass: it produced an
+      // UN-STATED `human`, and the next landing-shaped restatement re-inferred `landed` and
+      // self-closed. The previous round's test walked only landing-shaped texts and could not see it.
+      useProjectStore
+        .getState()
+        .setAgentGoal(projectId, callerId, "the founder approves the onboarding copy", undefined, "agent", {
+          kind: "human",
+        });
+      // Hop 1 — judgement-shaped, so inference returns nothing and the fallback AGREES with the owed
+      // kind. This is precisely the hop that used to shed the binding.
+      fire({
+        reqId: "sgW1",
+        op: "set_agent_goal",
+        callerAgentId: callerId,
+        payload: { goal: "the founder signs off on the onboarding copy" },
+      });
+      await flush();
+      expect(goalOf(callerId)!.verify).toEqual({ kind: "human" });
+      expect(goalOf(callerId)!.verifyStated).toBe(true);
+      // Hop 2 — landing-shaped. Without the fix this re-inferred `landed`.
+      fire({
+        reqId: "sgW2",
+        op: "set_agent_goal",
+        callerAgentId: callerId,
+        payload: { goal: "the onboarding copy fix is merged to origin/main" },
+      });
+      await flush();
+      expect(goalOf(callerId)!.verify).toEqual({ kind: "human" });
+      useRuntimeStore.getState().setWorkflowShipped(callerId, true);
+      useRuntimeStore.getState().setBranchStatus(callerId, {
+        ahead: 0,
+        behind: 0,
+        dirty: false,
+        filesChanged: 0,
+        insertions: 0,
+        deletions: 0,
+        worktreeOnBranch: true,
+      });
+      fire({ reqId: "sgW3", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
+      expect(goalOf(callerId)!.metAt).toBeUndefined();
+    });
+
+    it("a stated LANDED check keeps its protection across a restatement", async () => {
+      // The second trace from roborev 57814: a stated `landed` restated with landing-shaped text
+      // used to come back un-stated, so `priorBinds` was false and the same-goal
+      // `landed`→`command` guard never ran — the agent then swapped git's unforgeable answer for
+      // `echo ok` on the very next call.
+      useProjectStore
+        .getState()
+        .setAgentGoal(projectId, callerId, "the retry fix is merged to origin/main", undefined, "agent", {
+          kind: "landed",
+        });
+      const restated = "the retry backoff work has landed on origin/main";
+      fire({ reqId: "sgX1", op: "set_agent_goal", callerAgentId: callerId, payload: { goal: restated } });
+      await flush();
+      expect(goalOf(callerId)!.verify).toEqual({ kind: "landed" });
+      expect(goalOf(callerId)!.verifyStated).toBe(true);
+      fire({
+        reqId: "sgX2",
+        op: "set_agent_goal",
+        callerAgentId: callerId,
+        payload: { goal: restated, verify: { kind: "command", cmd: "echo ok" } },
+      });
+      await flush();
+      expect(goalOf(callerId)!.verify).toEqual({ kind: "landed" });
+    });
+
+    it("a LEGACY goal with no provenance recorded binds — the upgrade must fail closed", async () => {
+      // roborev 57813. `verify` already ships on origin/main, and main's chargeGoalDebt downgraded
+      // every inherited check to exactly `{kind:"human"}` — so the installed base is full of
+      // persisted human checks with NO `verifyStated`. Reading absence as "not stated" would let one
+      // call swap a concierge sign-off for a self-closable check the moment a user upgrades.
+      const text = "the founder approves the onboarding copy";
+      useProjectStore.getState().setAgentGoal(projectId, callerId, text, undefined, "agent", {
+        kind: "human",
+      });
+      // Simulate the persisted shape: a check with no provenance, exactly as it rehydrates.
+      useProjectStore.setState((s) => ({
+        projects: s.projects.map((p) =>
+          p.id !== projectId
+            ? p
+            : {
+                ...p,
+                agents: p.agents.map((ag) =>
+                  ag.id !== callerId || !ag.goal
+                    ? ag
+                    : { ...ag, goal: { ...ag.goal, verifyStated: undefined } },
+                ),
+              },
+        ),
+      }));
+      expect(goalOf(callerId)!.verifyStated).toBeUndefined();
+      fire({
+        reqId: "sgL1",
+        op: "set_agent_goal",
+        callerAgentId: callerId,
+        payload: { goal: text, verify: { kind: "landed" } },
+      });
+      await flush();
+      expect(goalOf(callerId)!.verify).toEqual({ kind: "human" });
+    });
+
+    it("an inherited LEGACY check stays 'unknown provenance' instead of being stamped as chosen", async () => {
+      // roborev 57816. `goalDebtOf` promises not to turn "we don't know" into a decision, and
+      // stamping `verifyStated: true` on the first inheritance hop broke that: a LEGACY check
+      // (absent flag) would be rewritten as caller-chosen, destroying the only marker that could
+      // ever identify the installed base for a migration. Enforcement is identical either way —
+      // `owedBinds` reads `!== false` — so this pins the FIELD, which is the thing at risk.
+      const text = "the founder approves the onboarding copy";
+      useProjectStore.getState().setAgentGoal(projectId, callerId, text, undefined, "agent", {
+        kind: "human",
+      });
+      // Strip the flag, as a goal persisted before it existed rehydrates.
+      useProjectStore.setState((s) => ({
+        projects: s.projects.map((p) =>
+          p.id !== projectId
+            ? p
+            : {
+                ...p,
+                agents: p.agents.map((ag) =>
+                  ag.id !== callerId || !ag.goal
+                    ? ag
+                    : { ...ag, goal: { ...ag.goal, verifyStated: undefined } },
+                ),
+              },
+        ),
+      }));
+      fire({
+        reqId: "sgY1",
+        op: "set_agent_goal",
+        callerAgentId: callerId,
+        payload: { goal: "the onboarding copy fix is merged to origin/main" },
+      });
+      await flush();
+      // Still binding (the check survived a landing-shaped restatement)…
+      expect(goalOf(callerId)!.verify).toEqual({ kind: "human" });
+      // …but its provenance is still UNKNOWN, not a manufactured "true".
+      expect(goalOf(callerId)!.verifyStated).toBeUndefined();
+    });
+
+    it("an agent cannot swap a standing command's cmd for a no-op on the SAME goal", async () => {
+      // roborev 57813: same kind is not the same check. `pnpm test parser` → `true` scored 1 >= 1
+      // and shed the obligation inside the kind.
+      const text = "the parser handles nested groups";
+      useProjectStore.getState().setAgentGoal(projectId, callerId, text, undefined, "agent", {
+        kind: "command",
+        cmd: "pnpm test parser",
+      });
+      fire({
+        reqId: "sgQ1",
+        op: "set_agent_goal",
+        callerAgentId: callerId,
+        payload: { goal: text, verify: { kind: "command", cmd: "true" } },
+      });
+      await flush();
+      expect(goalOf(callerId)!.verify).toEqual({ kind: "command", cmd: "pnpm test parser" });
+    });
+
+    it("an agent cannot trade git's answer for a command it wrote, on the SAME goal", async () => {
+      // roborev 57813: `landed` → `command` ranks as a "strengthening" but replaces an unforgeable
+      // ancestry proof with a string the agent authored, then asks a person to close on it. Scoped
+      // to the same goal — on NEW work, changing instruments is legitimate (see the test below).
+      const text = "the retry fix is merged to origin/main";
+      useProjectStore.getState().setAgentGoal(projectId, callerId, text, undefined, "agent", {
+        kind: "landed",
+      });
+      fire({
+        reqId: "sgQ2",
+        op: "set_agent_goal",
+        callerAgentId: callerId,
+        payload: { goal: text, verify: { kind: "command", cmd: "echo ok" } },
+      });
+      await flush();
+      expect(goalOf(callerId)!.verify).toEqual({ kind: "landed" });
+    });
+
+    it("the CONCIERGE's verify:null take-back still lands on a sticky check — the only exit", async () => {
+      // roborev 57801: the stickiness rules name this as the sole way out, and nothing tested it. An
+      // exit that is documented but broken is worse than no exit — it is what left the agents in
+      // sparkle-vfkqz auto-resuming with no path.
+      const text = "the founder approves the onboarding copy";
+      useProjectStore.getState().setAgentGoal(projectId, callerId, text, undefined, "agent", {
+        kind: "human",
+      });
+      fire({
+        reqId: "sgN1",
+        op: "set_agent_goal",
+        callerAgentId: CONCIERGE_CALLER_AGENT_ID,
+        payload: { targetAgentId: callerId, goal: text, verify: null },
+      });
+      await flush();
+      expect(goalOf(callerId)!.verify).toBeUndefined();
+      // …and the goal is genuinely closable again afterwards, which is the point of the take-back.
+      fire({ reqId: "sgN1b", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: true, met: true });
+      expect(goalOf(callerId)!.metAt).toEqual(expect.any(Number));
+    });
+
+    it("the same-text rule does NOT block adding a check to an unverified standing goal", async () => {
+      // The counterweight: the stickiness above must be narrow. A goal with NO prior check is
+      // untouched by it — that is the case roborev 55893 restored (a check could never be added to
+      // standing work without rewording it), and it has to stay possible.
+      useProjectStore.getState().setAgentGoal(projectId, callerId, "keep the build green", undefined, "agent");
+      fire({
+        reqId: "sgT2",
+        op: "set_agent_goal",
+        callerAgentId: callerId,
+        payload: { goal: "keep the build green", verify: { kind: "landed" } },
+      });
+      await flush();
+      expect(goalOf(callerId)!.verify).toEqual({ kind: "landed" });
+    });
+
+    it("refuses when workflowState was polled but the BRANCH STATUS was not", async () => {
+      // roborev 57796. Requiring "either live map" narrowed the persisted-state hole without closing
+      // it: the new-work veto fires on `bs.ahead`, and `unlandedWorkEvidence` bails early only when
+      // BOTH `bs` and `stageOverride` are absent — so ws-only + a persisted `merged` stage still fell
+      // through to "nothing unmerged" and answered landed, with the veto unable to fire. The two maps
+      // are populated independently, so this is a reachable state.
+      useProjectStore
+        .getState()
+        .setAgentGoal(projectId, callerId, "the follow-up fix is merged to origin/main", undefined, "agent", {
+          kind: "landed",
+        });
+      useRuntimeStore.getState().setWorkflowShipped(callerId, true);
+      useRuntimeStore.getState().setWorkflowStage(callerId, "merged");
+      useRuntimeStore.getState().setWorkflowState(callerId, {
+        inLocalMain: false,
+        inOriginMain: true,
+        inParent: false,
+        aheadOfBase: 0,
+        prState: "merged",
+        prNumber: 1148,
+        prUrl: "https://github.com/drodio/sparkle/pull/1148",
+      });
+      // …and NO setBranchStatus: the field the veto actually consumes is still missing.
+      fire({ reqId: "sgP2", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
+      expect(String((lastReply() as { error?: string }).error)).toMatch(/has not been read/i);
+      expect(goalOf(callerId)!.metAt).toBeUndefined();
+    });
+
+    it("a LANDED debt may still be re-chosen — stickiness is `human`-only, not a freeze", async () => {
+      // The counterweight to the two above: if EVERY inherited check froze, the sparkle-vfkqz fix
+      // would be dead on the inheritance path, which is the path both escalating agents took.
+      useProjectStore
+        .getState()
+        .setAgentGoal(projectId, callerId, "the work is on origin main", undefined, "agent", { kind: "landed" });
+      fire({
+        reqId: "sgS3",
+        op: "set_agent_goal",
+        callerAgentId: callerId,
+        payload: { goal: "the parser fix is merged to origin/main" },
+      });
+      await flush();
+      expect(goalOf(callerId)!.verify).toEqual({ kind: "landed" });
+    });
+
+    it("refuses when only the PERSISTED watermarks survive a relaunch and no branch has been polled", async () => {
+      // roborev 57794. `workflowStage`/`workflowShipped` persist across relaunch; `branchStatus` and
+      // `workflowState` boot clean. With only the latches, the new-work veto cannot fire — it reads
+      // `bs.ahead`, the field that is missing — so this combination used to answer "landed" from
+      // stale localStorage. Scenario: landed PR #1, took a new task, wrote 3 unlanded commits, app
+      // relaunched. Closing here would latch `metAt` on a merge that predates the work.
+      useProjectStore
+        .getState()
+        .setAgentGoal(projectId, callerId, "the follow-up fix is merged to origin/main", undefined, "agent", {
+          kind: "landed",
+        });
+      useRuntimeStore.getState().setWorkflowShipped(callerId, true);
+      useRuntimeStore.getState().setWorkflowStage(callerId, "merged");
+      // …and NO setBranchStatus / setWorkflowState: exactly what a fresh launch looks like.
+      fire({ reqId: "sgP1", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
+      // The reading is MISSING, not negative — the copy must send the agent to retry, not to a human.
+      expect(String((lastReply() as { error?: string }).error)).toMatch(/has not been read/i);
+      expect(goalOf(callerId)!.metAt).toBeUndefined();
+    });
+
+    it("a goal that INHERITS its check on human-shaped text still gets `human`, and stays refused", async () => {
+      // The fallback, intact. Inference can only ever move a goal toward a check a machine can run;
+      // anything it cannot read confidently keeps the check only a person can discharge.
+      useProjectStore
+        .getState()
+        .setAgentGoal(projectId, callerId, "the work is on origin main", undefined, "agent", { kind: "landed" });
+      fire({
+        reqId: "sgV8",
+        op: "set_agent_goal",
+        callerAgentId: callerId,
+        payload: { goal: "the founder is happy with the new column layout" },
+      });
+      await flush();
+      expect(goalOf(callerId)!.verify).toEqual({ kind: "human" });
+      useRuntimeStore.getState().setWorkflowShipped(callerId, true);
+      fire({ reqId: "sgV8b", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
       await flush();
       expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
       expect(goalOf(callerId)!.metAt).toBeUndefined();

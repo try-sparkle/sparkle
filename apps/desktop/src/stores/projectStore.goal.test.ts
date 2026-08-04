@@ -328,7 +328,14 @@ describe("the AGENT's own set is weaker than the human's", () => {
     // agent, the persisted blob, the cross-window broadcast and the fleet render (roborev 55960).
     store().setAgentGoal("p1", "a1", "the work is on origin main", undefined, "agent", { kind: "landed" });
     store().setAgentGoal("p1", "a1", "", undefined, "agent"); // the agent clears; the check is stashed
-    expect(agent().goalDebt).toEqual({ totalContinues: 0, verify: { kind: "landed" } });
+    // `verifyStated` rides along with the check: the stash must remember that a CALLER chose this
+    // one, or a clear-then-set would launder a stated check into a machine-defaulted one and shed
+    // the stickiness the debt exists to carry (roborev 57806).
+    expect(agent().goalDebt).toEqual({
+      totalContinues: 0,
+      verify: { kind: "landed" },
+      verifyStated: true,
+    });
     store().noteTerminalBrief("p1", "a1"); // the human types
     const before = useProjectStore.getState().projects;
     store().noteTerminalBrief("p1", "a1"); // …and types again
