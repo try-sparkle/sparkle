@@ -15,8 +15,15 @@ vi.mock("../services/beads", async (importOriginal) => {
   };
 });
 
+// The post-poll decompose watcher WRITES beads and spends AI, so whether a given scan runs it is a
+// correctness question — a stolen-from (stale) scan must not. Spy on it to assert that.
+const runDecomposeWatcherForPoll = vi.fn();
+vi.mock("../services/epicDecompose", () => ({
+  runDecomposeWatcherForPoll: (...a: unknown[]) => runDecomposeWatcherForPoll(...a),
+}));
+
 import { bucketBeads } from "../services/beads";
-import { useBeadsStore } from "./beadsStore";
+import { useBeadsStore, BEADS_STALE_REFRESH_MS, __resetBeadsRefreshInFlightForTest } from "./beadsStore";
 import { useSettingsStore } from "./settingsStore";
 
 function bead(partial: Partial<Bead> & { id: string }): Bead {
@@ -26,9 +33,14 @@ function bead(partial: Partial<Bead> & { id: string }): Bead {
 beforeEach(() => {
   listBeads.mockReset();
   ensureBeadsDb.mockReset();
+  runDecomposeWatcherForPoll.mockReset();
   ensureBeadsDb.mockResolvedValue("initialized");
   // Reset store snapshot state between cases.
   useBeadsStore.setState({ byProject: {}, loading: {}, error: {} });
+  // Clear the module-scope in-flight guard so a case that left a scan latched (e.g. the hand-held
+  // resolver below, or the never-settling steal case) can't drop a later case's refresh for the
+  // same project id.
+  __resetBeadsRefreshInFlightForTest();
 });
 
 afterEach(() => {
@@ -212,22 +224,111 @@ describe("in-flight guard — overlapping poll ticks coalesce to concurrency 1",
     expect(listBeads).toHaveBeenCalledTimes(2);
   });
 
-  it("stopPolling releases the guard so a remount recovers a scan that never settles", async () => {
+  it("a later tick steals a claim older than the staleness window so a wedged project recovers", async () => {
     vi.useFakeTimers();
     // First scan HANGS forever — models `bd` blocked on the wedged store's lock (run_bd has no
-    // timeout), so the guard's `finally` never runs and the id would stay latched for the session.
+    // timeout), so the guard's `finally` never runs and the id stays latched.
     listBeads.mockReturnValueOnce(new Promise<Bead[]>(() => {}));
     listBeads.mockResolvedValue([bead({ id: "a" })]);
 
     useBeadsStore.getState().startPolling("p1", "/proj", 5000);
-    expect(listBeads).toHaveBeenCalledTimes(1); // immediate scan, now hung + guard latched
+    expect(listBeads).toHaveBeenCalledTimes(1); // immediate scan, now hung + latched
 
-    // The board unmounts (last viewer) while that scan is still in flight, then remounts. Without
-    // the teardown releasing the guard this second immediate refresh would be DROPPED and the
-    // project would stay frozen; it must fire instead.
-    useBeadsStore.getState().stopPolling("p1");
-    useBeadsStore.getState().startPolling("p1", "/proj", 5000);
+    // Ticks WITHIN the staleness window are dropped — no convoy forms while the scan may still be
+    // legitimately (if slowly) progressing.
+    await vi.advanceTimersByTimeAsync(5000 * 3); // 15s < BEADS_STALE_REFRESH_MS (30s)
+    expect(listBeads).toHaveBeenCalledTimes(1);
+
+    // Advance to exactly the staleness threshold: the tick there sees an over-age claim, STEALS it,
+    // and retries — recovery that does not depend on teardown, so it covers the permanently-claimed
+    // selected project. Stop here: the stolen replacement resolves and normal polling resumes, so
+    // advancing further would keep incrementing — the point is that the SECOND scan happened at all.
+    await vi.advanceTimersByTimeAsync(BEADS_STALE_REFRESH_MS - 5000 * 3);
     expect(listBeads).toHaveBeenCalledTimes(2);
+  });
+
+  it("backs off exponentially between successive steals of a persistently hung project", async () => {
+    vi.useFakeTimers();
+    // Every scan hangs forever, so each steal just produces another hung, uncancellable scan. The
+    // backoff is what stops that from spawning a fresh `bd` pair every 30s without bound.
+    listBeads.mockReturnValue(new Promise<Bead[]>(() => {}));
+
+    useBeadsStore.getState().startPolling("p1", "/proj", 5000);
+    expect(listBeads).toHaveBeenCalledTimes(1); // scan 1, hung
+
+    // First steal fires at 1× the window (30s): scan 2.
+    await vi.advanceTimersByTimeAsync(BEADS_STALE_REFRESH_MS);
+    expect(listBeads).toHaveBeenCalledTimes(2);
+
+    // The window is now 2× (60s). Another 1× window is NOT enough to steal again — without backoff
+    // this tick would steal at 30s and the count would already be 3.
+    await vi.advanceTimersByTimeAsync(BEADS_STALE_REFRESH_MS);
+    expect(listBeads).toHaveBeenCalledTimes(2);
+
+    // Past the 2× window the next steal fires: scan 3.
+    await vi.advanceTimersByTimeAsync(BEADS_STALE_REFRESH_MS);
+    expect(listBeads).toHaveBeenCalledTimes(3);
+  });
+
+  it("an abandoned (stolen-from) scan that settles late does not free the successor's claim", async () => {
+    vi.useFakeTimers();
+    // Scan A hangs long enough to be stolen; we hold its resolver to settle it LATE, after a
+    // successor scan B has taken the claim. B stays pending so the guard is held by B.
+    let resolveA: (v: Bead[]) => void = () => {};
+    const scanA = new Promise<Bead[]>((r) => (resolveA = r));
+    const scanB = new Promise<Bead[]>(() => {}); // B: pending, never settles during the test
+    listBeads.mockReturnValueOnce(scanA).mockReturnValueOnce(scanB).mockResolvedValue([bead({ id: "a" })]);
+
+    useBeadsStore.getState().startPolling("p1", "/proj", 5000);
+    expect(listBeads).toHaveBeenCalledTimes(1); // A in flight
+
+    // Age A past the window, then a tick steals the claim and starts B (call 2).
+    await vi.advanceTimersByTimeAsync(BEADS_STALE_REFRESH_MS + 5000);
+    expect(listBeads).toHaveBeenCalledTimes(2); // B now holds the claim
+
+    // A finally settles with its STALE board — its tokenized `finally` must NOT delete B's claim
+    // (that would re-open the convoy), and its gated `commit` must NOT write. B still holds the
+    // claim and never settled, so the store must show B's state, not A's late one.
+    resolveA([bead({ id: "old" })]);
+    await vi.advanceTimersByTimeAsync(5000); // a tick fires within B's window
+    expect(listBeads).toHaveBeenCalledTimes(2); // still just A + B — the tick was coalesced under B
+    // The write-gate half of the token: A's stale snapshot never landed and loading was not flipped
+    // false out from under B. Both go RED if the success-path `commit` is reverted to a bare `set`.
+    expect(useBeadsStore.getState().byProject.p1).toBeUndefined();
+    expect(useBeadsStore.getState().loading.p1).toBe(true);
+    // ...and A's late settle did not run the AI/bead-writing decompose watcher on its stale board.
+    expect(runDecomposeWatcherForPoll).not.toHaveBeenCalled();
+  });
+
+  it("a stolen-from scan does not run the decompose watcher, but the successor does", async () => {
+    vi.useFakeTimers();
+    let resolveA: (v: Bead[]) => void = () => {};
+    const scanA = new Promise<Bead[]>((r) => (resolveA = r));
+    let resolveB: (v: Bead[]) => void = () => {};
+    const scanB = new Promise<Bead[]>((r) => (resolveB = r));
+    // A (immediate) hangs and is stolen; B (the steal) completes; any later scan stays pending so no
+    // scan C fires a third watcher.
+    listBeads
+      .mockReturnValueOnce(scanA)
+      .mockReturnValueOnce(scanB)
+      .mockReturnValue(new Promise<Bead[]>(() => {}));
+
+    useBeadsStore.getState().startPolling("p1", "/proj", 5000);
+
+    // Steal A once it ages past the window; B starts and holds the claim.
+    await vi.advanceTimersByTimeAsync(BEADS_STALE_REFRESH_MS);
+    expect(listBeads).toHaveBeenCalledTimes(2);
+
+    // B completes — it owns the claim, so ITS watcher runs (exactly once).
+    resolveB([bead({ id: "b" })]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(runDecomposeWatcherForPoll).toHaveBeenCalledTimes(1);
+
+    // A settles LATE with its stale board — its claim was stolen, so it must NOT run the watcher.
+    // Without the `ownsClaim()` gate this fires a second decompose against a ≥30s-old board.
+    resolveA([bead({ id: "old" })]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(runDecomposeWatcherForPoll).toHaveBeenCalledTimes(1);
   });
 });
 

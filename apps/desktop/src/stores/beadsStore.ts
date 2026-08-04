@@ -28,6 +28,25 @@ function beadsEnabled(): boolean {
  *  hammering the CLI. */
 export const BEADS_POLL_INTERVAL_MS = 5000;
 
+/** How long a single in-flight refresh may run before a later tick is allowed to STEAL its claim
+ *  and retry. `bd` reads are unbounded (`run_bd` is a bare `Command::output()` with no timeout), so
+ *  a scan blocked on the wedged store's lock can hang indefinitely; without a steal it would latch
+ *  the concurrency guard for the rest of the session. Set well above a merely-slow-but-progressing
+ *  scan (which the guard is meant to coalesce, not steal) so recovery only triggers for a genuinely
+ *  stuck one: at 6× the interval a claim older than this is presumed hung. The steal fires at most
+ *  once per window, so a wedged store retries on a slow trickle, never a convoy. */
+export const BEADS_STALE_REFRESH_MS = 6 * BEADS_POLL_INTERVAL_MS;
+
+/** Cap on the exponential backoff between successive steals of a hung claim: the effective window is
+ *  `BEADS_STALE_REFRESH_MS × 2^min(consecutiveSteals, this)`. A steal cannot CANCEL the `bd` process
+ *  it abandons, so each one leaks a blocked subprocess until the store recovers; stealing on a fixed
+ *  30s cadence forever would add ~4 such processes a minute and amplify the very lock convoy this
+ *  guard exists to break. Backing off — 30s, 60s, 2m, 4m, 8m, then capped at 32× (~16m) — turns an
+ *  hour-long wedge into a handful of retry processes instead of ~120, while still recovering
+ *  promptly from a brief stall. Reset to 0 whenever a scan completes while owning its claim (the
+ *  store is proven responsive again). The real fix is a bounded `bd` on the Rust side. */
+const BEADS_STEAL_BACKOFF_MAX_SHIFT = 5;
+
 interface ProjectSnapshot {
   beads: Bead[];
   board: Board;
@@ -82,7 +101,7 @@ interface BeadsState {
 // One interval per project, kept out of store state so timers never serialize / re-render.
 const timers = new Map<string, ReturnType<typeof setInterval>>();
 /**
- * Projects with a `refresh` currently in flight — the per-project CONCURRENCY-1 guard.
+ * The `refresh` currently in flight for each project — the per-project CONCURRENCY-1 guard.
  *
  * ══ WHY: THE LOCK CONVOY ═══════════════════════════════════════════════════════════════════════
  * `refresh` shells out to `bd list --all` + `bd blocked`, which read the shared embedded store.
@@ -94,11 +113,40 @@ const timers = new Map<string, ReturnType<typeof setInterval>>();
  *
  * The guard caps the poll path at one in-flight refresh per project. Polling is idempotent, so an
  * overlapping tick is DROPPED, not queued — the next un-blocked tick reads the latest state anyway.
- * Placed here in `refresh` (the single CLI chokepoint) so every caller — immediate fire, interval,
- * and the visibility-refresh listener — is covered by one guard rather than three. Kept out of
- * store state for the same reason as `timers`: bookkeeping, not rendered data.
+ * Placed in `refresh` (the single CLI chokepoint) so every caller — immediate fire, interval, and
+ * the visibility-refresh listener — is covered by one guard. Kept out of store state for the same
+ * reason as `timers`: bookkeeping, not rendered data.
+ *
+ * ══ TWO PROPERTIES THAT MATTER ═════════════════════════════════════════════════════════════════
+ * (1) TOKENIZED. Each claim carries a unique `token`, and only the refresh that OWNS the current
+ *     token may release it or write store state. A `bd` read is unbounded, so a scan can be
+ *     abandoned (its claim stolen — see below) and settle much later; without the token its stale
+ *     `finally` would free a newer claim (re-opening the convoy) and its stale `set()` would clobber
+ *     the fresher snapshot. The token makes a stolen-from scan a silent no-op.
+ * (2) STEALABLE. A claim older than `BEADS_STALE_REFRESH_MS` is presumed hung and a later tick
+ *     takes it over. This is the recovery path for a wedged store, and it does NOT depend on
+ *     teardown — which matters because `BeadPillHost` holds a permanent passive claim on the
+ *     SELECTED project (the one polled every 5s, so the one most likely to wedge), meaning its
+ *     viewer count never reaches zero and a teardown-based release would never fire for it.
  */
-const refreshInFlight = new Set<string>();
+interface InFlightClaim {
+  token: object;
+  startedAt: number;
+}
+const refreshInFlight = new Map<string, InFlightClaim>();
+/** Consecutive steals of a hung claim per project since the last completed scan. Drives the
+ *  exponential backoff — see `BEADS_STEAL_BACKOFF_MAX_SHIFT`. Reset when an owning scan completes. */
+const staleSteals = new Map<string, number>();
+
+/** TEST-ONLY. Clear the module-scope in-flight guard between cases. Unlike `timers`/`viewers`, which
+ *  the suites drain via `stopPolling`, the guard is no longer touched by teardown (recovery is
+ *  time-based), so a case that leaves a scan latched — e.g. a hand-held or never-settling mock —
+ *  would otherwise leak that claim into the next case reusing the same project id. Call in
+ *  `beforeEach`. Not part of the store's runtime surface. */
+export function __resetBeadsRefreshInFlightForTest(): void {
+  refreshInFlight.clear();
+  staleSteals.clear();
+}
 /**
  * How many mounted viewers currently want each project polled.
  *
@@ -172,9 +220,32 @@ export const useBeadsStore = create<BeadsState>()((set) => ({
     // tick that fires while a prior refresh is still shelling out to `bd` is DROPPED here, not
     // queued — polling is idempotent, so the next un-blocked tick reads the latest state. This is
     // what breaks the Dolt lock convoy: overlapping ticks can no longer stack `bd list --all`s.
-    if (refreshInFlight.has(projectId)) return;
-    refreshInFlight.add(projectId);
-    set((s) => ({ loading: { ...s.loading, [projectId]: true } }));
+    // EXCEPT a claim older than the staleness window is presumed hung (unbounded `bd` blocked on the
+    // wedged store's lock) and is STOLEN so the project can recover — see BEADS_STALE_REFRESH_MS.
+    const now = Date.now();
+    const existing = refreshInFlight.get(projectId);
+    if (existing) {
+      // A claim is held. Coalesce (drop) this tick unless the holder is older than the staleness
+      // window — then it's presumed hung and we STEAL it. The window grows exponentially per
+      // consecutive steal (capped) so a persistently wedged store isn't hammered with a fresh,
+      // uncancellable `bd` pair every 30s forever.
+      const shift = Math.min(staleSteals.get(projectId) ?? 0, BEADS_STEAL_BACKOFF_MAX_SHIFT);
+      const staleWindow = BEADS_STALE_REFRESH_MS * 2 ** shift;
+      if (now - existing.startedAt < staleWindow) return;
+      staleSteals.set(projectId, (staleSteals.get(projectId) ?? 0) + 1);
+    }
+    // Take (or steal) the claim with a fresh token. Only the holder of THIS token may release it or
+    // write store state below, so an abandoned (stolen-from) scan settling later is a no-op.
+    const token = {};
+    refreshInFlight.set(projectId, { token, startedAt: now });
+    /** True only while THIS refresh still owns the claim — a steal replaces the token. */
+    const ownsClaim = () => refreshInFlight.get(projectId)?.token === token;
+    /** Apply a store update only if this refresh still owns the claim, so a stolen-from scan can't
+     *  clobber the fresher snapshot or flip `loading` out from under the scan that replaced it. */
+    const commit = (updater: (s: BeadsState) => Partial<BeadsState>) => {
+      if (ownsClaim()) set(updater);
+    };
+    commit((s) => ({ loading: { ...s.loading, [projectId]: true } }));
     try {
       // CONCURRENTLY, not in sequence. `list_beads` is the 5s-poll hot path the perf work in
       // notes.rs targets, and the blocked query is independent of it — running them together costs
@@ -182,7 +253,7 @@ export const useBeadsStore = create<BeadsState>()((set) => ({
       // empty set), so this cannot turn a working board into a failed one.
       const [beads, blocked] = await Promise.all([listBeads(projectPath), blockedBeadIds(projectPath)]);
       const board = bucketBeads(beads, blocked);
-      set((s) => ({
+      commit((s) => ({
         byProject: { ...s.byProject, [projectId]: { beads, board, loadedAt: Date.now() } },
         loading: { ...s.loading, [projectId]: false },
         error: { ...s.error, [projectId]: undefined },
@@ -190,7 +261,12 @@ export const useBeadsStore = create<BeadsState>()((set) => ({
       // Post-poll auto-decompose watcher (spec §7). Every guard (main-window election, AI gate,
       // baseline, re-entrancy) lives in the service so the store stays dumb. Fire-and-forget —
       // it never throws, and the next poll picks up whatever labels/children it wrote.
-      if (runWatchers) void runDecomposeWatcherForPoll(projectId, projectPath, board);
+      // GATED ON THE CLAIM: this watcher WRITES beads and spends AI, and its service-side re-entrancy
+      // guard covers overlap, not a late replay. A scan whose claim was stolen would run it against a
+      // board ≥ a staleness window old — re-picking an epic the successor already decomposed and
+      // firing a second paid decompose with duplicate children. So it, like the writes, only runs
+      // while this refresh still owns the claim.
+      if (runWatchers && ownsClaim()) void runDecomposeWatcherForPoll(projectId, projectPath, board);
     } catch (e) {
       // Brand-new project whose beads DB was never created: bd rejects every read with
       // "no beads database found". Auto-init one (once per project this session) and retry the
@@ -206,18 +282,18 @@ export const useBeadsStore = create<BeadsState>()((set) => ({
             blockedBeadIds(projectPath),
           ]);
           const board = bucketBeads(beads, blocked);
-          set((s) => ({
+          commit((s) => ({
             byProject: { ...s.byProject, [projectId]: { beads, board, loadedAt: Date.now() } },
             loading: { ...s.loading, [projectId]: false },
             error: { ...s.error, [projectId]: undefined },
           }));
-          if (runWatchers) void runDecomposeWatcherForPoll(projectId, projectPath, board);
+          if (runWatchers && ownsClaim()) void runDecomposeWatcherForPoll(projectId, projectPath, board);
           return;
         } catch (initErr) {
           // Init (or the retried list) failed — e.g. `bd` isn't installed. Surface THIS error
           // instead of the original "no DB" one, and clear loading. The one-shot guard above
           // stays set so we don't hammer `bd init` on every subsequent poll.
-          set((s) => ({
+          commit((s) => ({
             loading: { ...s.loading, [projectId]: false },
             error: {
               ...s.error,
@@ -229,15 +305,21 @@ export const useBeadsStore = create<BeadsState>()((set) => ({
       }
       // Best-effort: a bd/parse failure must not break the UI. Keep the last snapshot,
       // surface the message, and clear the loading flag.
-      set((s) => ({
+      commit((s) => ({
         loading: { ...s.loading, [projectId]: false },
         error: { ...s.error, [projectId]: e instanceof Error ? e.message : String(e) },
       }));
     } finally {
-      // Release the guard whether the poll succeeded, failed, or self-healed. The `return`s inside
-      // the catch still run this, so a failed scan can never leave a project permanently blocked
-      // from ever refreshing again.
-      refreshInFlight.delete(projectId);
+      // Release the guard, but ONLY if we still own it. The `return`s inside the catch still run
+      // this. A scan whose claim was stolen (presumed hung, then a later tick took over) must NOT
+      // delete the successor's claim — that would re-open the convoy — so the release is gated on
+      // the token, exactly like the writes above. Reaching here while still owning the claim also
+      // proves this scan COMPLETED (success or error) rather than hanging, so the store is
+      // responsive: reset the steal-backoff counter.
+      if (ownsClaim()) {
+        refreshInFlight.delete(projectId);
+        staleSteals.delete(projectId);
+      }
     }
   },
 
@@ -292,14 +374,12 @@ export const useBeadsStore = create<BeadsState>()((set) => ({
       return;
     }
     viewers.delete(projectId);
-    // Release any in-flight refresh claim on full teardown. `bd` reads are UNBOUNDED (run_bd is a
-    // bare Command::output with no timeout), so a scan blocked on the wedged store's lock can never
-    // settle — its `finally` never runs and the guard would stay latched for the app session. Only
-    // the last viewer leaving clears it (the timer is gone too, so no tick can overlap): a board
-    // remount then fires a fresh refresh and recovers, instead of the project staying frozen. This
-    // also keeps the module-scope guard from leaking a latched id between test cases, since the
-    // afterEach drains via stopPolling.
-    refreshInFlight.delete(projectId);
+    // NB: recovery of a hung in-flight refresh is NOT done here. Teardown only fires when the viewer
+    // count reaches zero, and `BeadPillHost` holds a permanent passive claim on the selected project
+    // — the one most likely to wedge — so its count never reaches zero. Releasing the claim on
+    // teardown would therefore miss exactly that project, and (being untokenized) could free a claim
+    // a remount had already replaced. Recovery is instead time-based: a claim older than
+    // BEADS_STALE_REFRESH_MS is stolen by a later tick in `refresh`, which covers every project.
     const timer = timers.get(projectId);
     if (timer !== undefined) {
       clearInterval(timer);

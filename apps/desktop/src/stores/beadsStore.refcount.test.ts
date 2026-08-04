@@ -35,7 +35,11 @@ vi.mock("../services/epicDecompose", () => ({
   runDecomposeWatcherForPoll: (...a: unknown[]) => runDecomposeWatcherForPoll(...a),
 }));
 
-import { useBeadsStore, BEADS_POLL_INTERVAL_MS } from "./beadsStore";
+import {
+  useBeadsStore,
+  BEADS_POLL_INTERVAL_MS,
+  __resetBeadsRefreshInFlightForTest,
+} from "./beadsStore";
 import { useSettingsStore } from "./settingsStore";
 
 /** How many times `bd list` has been asked for, i.e. how many polls actually happened. */
@@ -63,6 +67,7 @@ beforeEach(() => {
   blockedBeadIds.mockResolvedValue(new Set());
   useBeadsStore.setState({ byProject: {}, loading: {}, error: {} });
   useSettingsStore.setState({ beadsEnabled: true });
+  __resetBeadsRefreshInFlightForTest(); // teardown no longer clears the guard; reset it explicitly
   vi.useFakeTimers();
 });
 
