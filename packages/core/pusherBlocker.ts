@@ -473,77 +473,90 @@ export function routeBlocker(report: BlockerReport, ctx: BlockerContext): Blocke
 }
 
 /**
- * The report an agent NEVER GAVE — the case that matters most, because it is the observed one.
- *
- * "Mount Tells The Truth" died on an Anthropic 529 after 21 minutes of good work and sat `errored`
- * for the rest of the night. It did not answer a re-query, because it could not: there was no
- * process left to answer. Every route above is keyed on an ANSWER, so an agent that cannot speak
- * would fall through all of them — which is precisely the hole the founder found, restated one layer
- * up. Silence has to be routable too.
- *
- * A transient failure (529, overloaded, a socket reset) is retried on the caller's backoff and NOT
- * reported anywhere until the retries are spent; a non-transient one goes straight to the concierge,
- * because a build agent that is not running cannot be pushed to do anything about not running.
- */
-/**
  * An agent held behind an ACCOUNT LIMIT — alive, reachable, and unable to do anything about it.
  *
- * ── WHY THIS IS NOT `routeSilence` (roborev 57773) ───────────────────────────────────────────────
+ * ── WHY THIS IS NOT THE EXHAUSTION ROUTE (roborev 57773) ─────────────────────────────────────────
  * It was, briefly, and both of that router's factual claims were wrong here. `decideRevive` escalates
  * `failure === "terminal"` BEFORE the `canAcceptInput` / `processAlive` gates, so a walled agent is
- * typically RUNNING and accepting input — it simply cannot make progress. `routeSilence` opens with
- * "is not running and cannot be pushed", which is false, and ends with "restart it or take its
- * branch over" — and restarting an agent whose session window has not reset just re-fails, which is
- * the precise harm the fix that introduced this was written to prevent. A concierge following that
- * instruction does the wrong thing.
+ * typically RUNNING and accepting input — it simply cannot make progress. The old text opened "is
+ * not running and cannot be pushed", which is false, and ended "restart it or take its branch over"
+ * — and restarting an agent whose session window has not reset just re-fails, which is the precise
+ * harm the fix that introduced this was written to prevent. A concierge following that instruction
+ * did the wrong thing.
  *
- * Silence and a wall are different states and they need different words. This one says the agent is
- * alive, says waiting is what clears it, and says explicitly not to restart.
+ * A wall and an exhausted ladder are different states and they need different words. This one says
+ * the agent is alive, says waiting is what clears it, and says explicitly not to restart.
  *
  * Still the CONCIERGE and never the founder, for the same reason as every other route here: taking a
  * branch over is something the concierge can do, and a limit that resets on a clock is not something
  * to page a human about. `pusherFleet` already suppresses quota conditions from "needs you" for the
  * same reason.
+ *
+ * ── NO `message` PARAMETER, DELIBERATELY (roborev 57783) ─────────────────────────────────────────
+ * It had one, documented as "the verbatim banner, which is the only place the reset time and the
+ * remedy path appear" — and nothing could supply one. `ReviveEpisode` does not carry the banner at
+ * all, so the only caller passed `decideRevive`'s STATIC reason string, and the result restated the
+ * limit twice, "retrying cannot clear it" twice, the reset/raise remedy twice, and produced a
+ * doubled period. The doc promised a reset time that could never arrive, and the test exercising it
+ * ("resets at 3pm") asserted a hand-built input no production path produces.
+ *
+ * The sentence below carries everything the concierge needs, so the parameter is gone rather than
+ * left as a hole someone fills later with the same static string. If the scrollback banner is ever
+ * threaded onto the episode, that is the moment to add it back — with a caller.
  */
-export function routeAccountLimit(input: {
-  label: string;
-  /** The verbatim banner, which is the only place the reset time and the remedy path appear. */
-  message?: string;
-}): BlockerRoute {
+export function routeAccountLimit(input: { label: string }): BlockerRoute {
   return {
     target: "concierge",
     reason: "account-limited",
     text:
-      `${input.label} is running but blocked on an account limit` +
-      (input.message ? `: ${input.message}` : "") +
-      `. Retrying cannot clear it and DO NOT restart it — a restart re-fails until the window ` +
-      `resets or the cap is raised. Take its branch over if the work cannot wait.`,
+      `${input.label} is running but blocked on an account limit. Retrying cannot clear it and ` +
+      `DO NOT restart it — a restart re-fails until the window resets or the cap is raised. ` +
+      `Take its branch over if the work cannot wait.`,
   };
 }
 
-export function routeSilence(input: {
+/**
+ * An agent that was retried to exhaustion and is still failing — the ladder's terminus.
+ *
+ * ── IT DOES NOT SAY THE AGENT IS DEAD, BECAUSE IT IS NOT (roborev 57783) ─────────────────────────
+ * This used to open "is not running and cannot be pushed", on the assumption that anything reaching
+ * a give-up report had stopped running. Every surviving caller proves the opposite. `decideRevive`
+ * returns `escalate` for ladder exhaustion only AFTER `if (!canAcceptInput) return none` and
+ * `if (processAlive !== true) return none`, and the budget path is guarded by
+ * `decision.action === "ping"`, which is strictly downstream of those same two gates. So on every
+ * call the agent has JUST been observed alive and input-accepting.
+ *
+ * That is the same defect `routeAccountLimit` above was extracted to fix, read in the other
+ * direction: the walled agent is alive because terminal escalates BEFORE the gates, and the
+ * exhausted agent is alive because exhaustion escalates AFTER them. Both were told the agent was
+ * gone, and the fix that split them corrected only one.
+ *
+ * ── AND THERE IS NO `transient` FLAG ANY MORE ────────────────────────────────────────────────────
+ * The non-transient arm is unreachable: the account-limit case has its own router above, and the
+ * only production caller passes a failure the ladder already classified as retryable. A branch no
+ * caller can select is a guard for a case that cannot happen, so it is deleted rather than kept for
+ * symmetry — and with it goes a parameter whose only effect was choosing between a true sentence and
+ * a false one.
+ *
+ * The agent that genuinely CANNOT be reached — a process that exited, an unclassifiable failure — is
+ * a real and separate case, tracked as `sparkle-a65tq`. It does not reach this function today:
+ * `decideRevive` declines both silently and never escalates them at all.
+ */
+export function routeRetriesExhausted(input: {
   label: string;
-  /** True when the agent's last error reads as self-clearing — see `isTransientFailure`. */
-  transient: boolean;
-  /** Retries already spent against this episode. */
+  /** Retries actually spent. The caller supplies the real figure — see `onEscalate.retriesSpent`. */
   retries: number;
-  /** How many are allowed before it escalates. */
-  retryLimit: number;
-  /** The verbatim error, quoted so the concierge reads what the agent read. */
+  /** The verbatim reason the ladder gave, quoted so the concierge reads what the agent read. */
   message?: string;
 }): BlockerRoute {
-  if (input.transient && input.retries < input.retryLimit) {
-    return { target: "none", reason: "transient-retrying", text: "" };
-  }
   return {
     target: "concierge",
-    reason: input.transient ? "transient-retries-exhausted" : "errored-not-transient",
+    reason: "retries-exhausted",
     text:
-      `${input.label} is not running and cannot be pushed` +
+      `${input.label} is still running but keeps failing on a vendor API error` +
       (input.message ? `: ${input.message}` : "") +
-      (input.transient
-        ? `. It was retried ${input.retries} times and stayed dead. Restart it or take its branch over.`
-        : `. Read its terminal, then restart it or take its branch over.`),
+      `. It was retried ${input.retries} times and has not recovered. Read its terminal, then ` +
+      `restart it or take its branch over.`,
   };
 }
 

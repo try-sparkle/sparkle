@@ -73,9 +73,10 @@ describe("giving up on an agent tells the concierge", () => {
 
     expect(told).toHaveLength(1);
     expect(told[0]).toContain("Mount Tells The Truth");
-    expect(told[0]).toContain("is not running and cannot be pushed");
+    // Alive, and said so: exhaustion escalates AFTER the liveness gates (roborev 57783).
+    expect(told[0]).toContain("is still running but keeps failing");
     expect(told[0]).toContain("11 times");
-    expect(told[0]).toContain("Restart it or take its branch over");
+    expect(told[0]).toContain("restart it or take its branch over");
   });
 
   it("quotes the reason the ladder gave, rather than inventing one", () => {

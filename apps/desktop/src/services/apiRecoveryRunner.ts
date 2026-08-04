@@ -41,7 +41,7 @@ import { useRuntimeStore } from "../stores/runtimeStore";
 import { submitPrompt } from "../pty";
 import { log } from "../logger";
 import type { AgentTabStatus } from "../types";
-import { routeAccountLimit, routeSilence } from "@sparkle/core";
+import { routeAccountLimit, routeRetriesExhausted } from "@sparkle/core";
 import { useProjectStore } from "../stores/projectStore";
 import { agentDisplayName } from "../engine/agentDisplayName";
 import { notifyConcierge } from "./conciergeNotifier";
@@ -734,15 +734,14 @@ export function liveDeps(now: number): ReviveDeps {
       // concierge following the instruction did the wrong thing anyway.
       const route =
         episode.failure === "terminal"
-          ? routeAccountLimit({ label: labelForAgent(agentId), message: reason })
-          : routeSilence({
+          ? // No `message`: the router's own sentence carries the whole account-limit story, and
+            // the only thing available to pass was `decideRevive`'s static reason, which restated
+            // every clause of it a second time (roborev 57783).
+            routeAccountLimit({ label: labelForAgent(agentId) })
+          : routeRetriesExhausted({
               label: labelForAgent(agentId),
-              transient: true,
               // The budget path knows the real spend; every other path's truth is on the episode.
               retries: retriesSpent ?? episode.attempts,
-              // Equal, which is what makes `routeSilence` report `transient-retries-exhausted`
-              // rather than hold its tongue: reaching this callback IS the exhaustion.
-              retryLimit: retriesSpent ?? episode.attempts,
               message: reason,
             });
       if (route.target !== "concierge") return;

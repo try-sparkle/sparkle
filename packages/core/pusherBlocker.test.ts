@@ -16,7 +16,7 @@ import {
   retryDelayMs,
   routeBlocker,
   routeAccountLimit,
-  routeSilence,
+  routeRetriesExhausted,
   type BlockerReport,
   type BlockerState,
 } from "./pusherBlocker";
@@ -219,55 +219,39 @@ describe("routing — the agent that will not move", () => {
   });
 });
 
-describe("silence — the agent that cannot answer at all", () => {
+describe("the ladder's terminus — retried to exhaustion, still failing", () => {
   // THE ACCEPTANCE CASE. An agent died on an Anthropic 529 after 21 minutes of good work and sat
-  // `errored` all night. Every route above is keyed on an ANSWER, so silence has to be routable too
-  // or the hole reappears one layer up.
-  it("says nothing while a transient failure still has retries left", () => {
-    const r = routeSilence({
+  // `errored` all night: the ladder retried it, gave up, and told nobody.
+  const spent = () =>
+    routeRetriesExhausted({
       label: "Mount Tells The Truth",
-      transient: true,
-      retries: 1,
-      retryLimit: TRANSIENT_RETRY_LIMIT,
+      retries: 22,
       message: "API Error: 529 Overloaded",
     });
-    expect(r).toEqual({ target: "none", reason: "transient-retrying", text: "" });
+
+  it("goes to the concierge, quoting what the agent read and the real spend", () => {
+    expect(spent().target).toBe("concierge");
+    expect(spent().reason).toBe("retries-exhausted");
+    expect(spent().text).toContain("529 Overloaded");
+    expect(spent().text).toContain("22 times");
   });
 
-  it("escalates to the concierge once the retries are spent, quoting what the agent read", () => {
-    const r = routeSilence({
-      label: "Mount Tells The Truth",
-      transient: true,
-      retries: TRANSIENT_RETRY_LIMIT,
-      retryLimit: TRANSIENT_RETRY_LIMIT,
-      message: "API Error: 529 Overloaded",
-    });
-    expect(r.target).toBe("concierge");
-    expect(r.reason).toBe("transient-retries-exhausted");
-    expect(r.text).toContain("529 Overloaded");
-    expect(r.text).toContain("4 times");
+  it("does NOT claim the agent is dead — exhaustion escalates AFTER the liveness gates", () => {
+    // `decideRevive` returns escalate for exhaustion only after `!canAcceptInput` and
+    // `processAlive !== true` have both returned `none`, so the agent was just observed alive and
+    // input-accepting. Saying otherwise is the same false claim `routeAccountLimit` was extracted
+    // to remove, read in the other direction (roborev 57783).
+    expect(spent().text).not.toContain("is not running");
+    expect(spent().text).toContain("is still running");
   });
 
-  it("does not wait at all on a failure that is not self-clearing", () => {
-    const r = routeSilence({
-      label: "A",
-      transient: false,
-      retries: 0,
-      retryLimit: TRANSIENT_RETRY_LIMIT,
-      message: "worktree is gone",
-    });
-    expect(r.target).toBe("concierge");
-    expect(r.reason).toBe("errored-not-transient");
+  it("never reaches the founder — a failing agent is the concierge's to restart", () => {
+    expect(spent().target).not.toBe("founder");
+    expect(routeRetriesExhausted({ label: "A", retries: 0 }).target).toBe("concierge");
   });
 
-  it("never reaches the founder — a dead agent is the concierge's to restart", () => {
-    for (const transient of [true, false]) {
-      for (const retries of [0, 99]) {
-        expect(
-          routeSilence({ label: "A", transient, retries, retryLimit: TRANSIENT_RETRY_LIMIT }).target,
-        ).not.toBe("founder");
-      }
-    }
+  it("omits the quote cleanly when there is no reason to give", () => {
+    expect(routeRetriesExhausted({ label: "A", retries: 3 }).text).not.toContain("undefined");
   });
 });
 
@@ -527,8 +511,7 @@ describe("arm 2 cannot smuggle a number in from the agent's own words (roborev 5
 });
 
 describe("an account limit is a WALL, not silence (roborev 57773)", () => {
-  const walled = () =>
-    routeAccountLimit({ label: "Mount Tells The Truth", message: "resets at 3pm" });
+  const walled = () => routeAccountLimit({ label: "Mount Tells The Truth" });
 
   it("does not claim the agent is dead — a terminal limit escalates BEFORE the liveness gates", () => {
     // decideRevive answers failure === "terminal" before the canAcceptInput / processAlive checks,
@@ -545,9 +528,12 @@ describe("an account limit is a WALL, not silence (roborev 57773)", () => {
     expect(walled().text).not.toMatch(/Restart it or take its branch over/);
   });
 
-  it("quotes the banner verbatim — the only place the reset time and remedy path appear", () => {
-    expect(walled().text).toContain("resets at 3pm");
-    expect(routeAccountLimit({ label: "A" }).text).not.toContain("undefined");
+  it("says the whole story on its own, with nothing to interpolate and nothing doubled", () => {
+    // It used to take a `message` no caller could supply — the only thing available was
+    // decideRevive's static reason, which restated every clause a second time (roborev 57783).
+    expect(walled().text).not.toContain("undefined");
+    expect(walled().text.match(/account limit/gi)).toHaveLength(1);
+    expect(walled().text).not.toContain("..");
   });
 
   it("goes to the concierge, never the founder — a clock-based limit is not a page", () => {
@@ -555,8 +541,10 @@ describe("an account limit is a WALL, not silence (roborev 57773)", () => {
     expect(walled().reason).toBe("account-limited");
   });
 
-  it("is a DIFFERENT route from silence, not a reworded one", () => {
-    const silent = routeSilence({ label: "A", transient: false, retries: 0, retryLimit: 4 });
-    expect(routeAccountLimit({ label: "A" }).reason).not.toBe(silent.reason);
+  it("is a DIFFERENT route from exhaustion, not a reworded one", () => {
+    const exhausted = routeRetriesExhausted({ label: "A", retries: 4 });
+    expect(routeAccountLimit({ label: "A" }).reason).not.toBe(exhausted.reason);
+    // ...and it never claims a retry count, because a wall is never retried.
+    expect(routeAccountLimit({ label: "A" }).text).not.toMatch(/retried \d+ times/);
   });
 });
