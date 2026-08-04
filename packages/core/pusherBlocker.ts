@@ -541,22 +541,29 @@ export function routeAccountLimit(input: { label: string }): BlockerRoute {
  * The agent that genuinely CANNOT be reached — a process that exited, an unclassifiable failure — is
  * a real and separate case, tracked as `sparkle-a65tq`. It does not reach this function today:
  * `decideRevive` declines both silently and never escalates them at all.
+ * ── AND NO `message` EITHER, FOR THE REASON THE SIBLING LOST ITS OWN (roborev 57791) ────────────
+ * `routeAccountLimit` gave up its `message` because the only thing production could pass was a
+ * STATIC reason that restated every clause of the router's own sentence. This route had exactly the
+ * same problem and it was left in place: `decideRevive`'s two real reasons already say the failure
+ * class and the retry count, so interpolating one produced *"…keeps failing on a vendor API error:
+ * Auto-retried 11 times over 1h 27m and it is still failing on a vendor API error. … It was retried
+ * 11 times and has not recovered."* — the class twice, the count twice.
+ *
+ * The router owns the sentence and the caller owns the number. Nothing is quoted, so nothing can
+ * double. A test asserts the class and the count each appear once.
  */
 export function routeRetriesExhausted(input: {
   label: string;
   /** Retries actually spent. The caller supplies the real figure — see `onEscalate.retriesSpent`. */
   retries: number;
-  /** The verbatim reason the ladder gave, quoted so the concierge reads what the agent read. */
-  message?: string;
 }): BlockerRoute {
   return {
     target: "concierge",
     reason: "retries-exhausted",
     text:
-      `${input.label} is still running but keeps failing on a vendor API error` +
-      (input.message ? `: ${input.message}` : "") +
-      `. It was retried ${input.retries} times and has not recovered. Read its terminal, then ` +
-      `restart it or take its branch over.`,
+      `${input.label} is still running but keeps failing on a vendor API error. It was retried ` +
+      `${input.retries} times and has not recovered. Read its terminal, then restart it or take ` +
+      `its branch over.`,
   };
 }
 

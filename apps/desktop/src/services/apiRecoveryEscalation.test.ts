@@ -3,7 +3,29 @@
 // where the hole was: `onEscalate` was a no-op for the whole life of the feature, with 54 tests
 // green over it, because no test ever called the real one.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { BUDGET_SPENT_REASON } from "../engine/apiRecovery";
+import { BUDGET_SPENT_REASON, REVIVE_LADDER_MS, decideRevive } from "../engine/apiRecovery";
+
+/**
+ * The ladder-exhaustion reason as PRODUCTION composes it, taken from `decideRevive` itself.
+ *
+ * Not hand-written (roborev 57791): a router test fed a string no production path produces, which is
+ * the exact criticism this work levelled at a test it deleted. Asking the real decider for the real
+ * sentence is the only way the composed text is checked against what the concierge will actually get.
+ */
+function ladderExhaustedReason(): string {
+  const d = decideRevive({
+    status: "errored",
+    failure: "retryable",
+    now: 10_000_000,
+    erroredSince: 0,
+    attempts: REVIVE_LADDER_MS.length,
+    lastPingAt: 1,
+    canAcceptInput: true,
+    processAlive: true,
+  });
+  if (d.action !== "escalate") throw new Error(`expected escalate, got ${d.action}`);
+  return d.reason;
+}
 import { liveDeps } from "./apiRecoveryRunner";
 import {
   _resetConciergeNotifierForTests,
@@ -79,9 +101,20 @@ describe("giving up on an agent tells the concierge", () => {
     expect(told[0]).toContain("restart it or take its branch over");
   });
 
-  it("quotes the reason the ladder gave, rather than inventing one", () => {
-    liveDeps(9_000).onEscalate("a1", BUDGET_SPENT_REASON, episode(11));
-    expect(told[0]).toContain(BUDGET_SPENT_REASON);
+  it("does not quote the ladder's reason back, because it says the same things twice", () => {
+    // Both of decideRevive's real reasons already state the failure class and the retry count that
+    // the router's own sentence states. Quoting one produced "…keeps failing on a vendor API error:
+    // Auto-retried 11 times … it is still failing on a vendor API error. … It was retried 11 times"
+    // (roborev 57791). Asserted against the REAL production strings, not a hand-built one — the
+    // hand-built message was the criticism this work levelled at a test it deleted.
+    for (const realReason of [BUDGET_SPENT_REASON, ladderExhaustedReason()]) {
+      told = [];
+      liveDeps(9_000).onEscalate("a1", realReason, episode(11));
+      expect(told).toHaveLength(1);
+      expect(told[0]!.match(/vendor API error/gi)).toHaveLength(1);
+      expect(told[0]!.match(/\d+ times/g)).toHaveLength(1);
+      expect(told[0]).not.toContain(realReason);
+    }
   });
 
   it("names an unknown agent by id rather than escalating about nobody", () => {

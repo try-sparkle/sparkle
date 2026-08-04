@@ -738,11 +738,13 @@ export function liveDeps(now: number): ReviveDeps {
             // the only thing available to pass was `decideRevive`'s static reason, which restated
             // every clause of it a second time (roborev 57783).
             routeAccountLimit({ label: labelForAgent(agentId) })
-          : routeRetriesExhausted({
+          : // Also no `message` (roborev 57791). `reason` is one of decideRevive's two STATIC
+            // strings, and both already state the failure class and the retry count that the
+            // router's own sentence states — quoting one doubled both. It is still logged above.
+            routeRetriesExhausted({
               label: labelForAgent(agentId),
               // The budget path knows the real spend; every other path's truth is on the episode.
               retries: retriesSpent ?? episode.attempts,
-              message: reason,
             });
       if (route.target !== "concierge") return;
       if (!notifyConcierge(route.text)) {

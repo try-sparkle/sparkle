@@ -222,36 +222,34 @@ describe("routing — the agent that will not move", () => {
 describe("the ladder's terminus — retried to exhaustion, still failing", () => {
   // THE ACCEPTANCE CASE. An agent died on an Anthropic 529 after 21 minutes of good work and sat
   // `errored` all night: the ladder retried it, gave up, and told nobody.
-  const spent = () =>
-    routeRetriesExhausted({
-      label: "Mount Tells The Truth",
-      retries: 22,
-      message: "API Error: 529 Overloaded",
-    });
+  const spent = () => routeRetriesExhausted({ label: "Mount Tells The Truth", retries: 22 });
 
-  it("goes to the concierge, quoting what the agent read and the real spend", () => {
+  it("goes to the concierge with the real spend", () => {
     expect(spent().target).toBe("concierge");
     expect(spent().reason).toBe("retries-exhausted");
-    expect(spent().text).toContain("529 Overloaded");
     expect(spent().text).toContain("22 times");
   });
 
   it("does NOT claim the agent is dead — exhaustion escalates AFTER the liveness gates", () => {
     // `decideRevive` returns escalate for exhaustion only after `!canAcceptInput` and
     // `processAlive !== true` have both returned `none`, so the agent was just observed alive and
-    // input-accepting. Saying otherwise is the same false claim `routeAccountLimit` was extracted
-    // to remove, read in the other direction (roborev 57783).
+    // input-accepting (roborev 57783).
     expect(spent().text).not.toContain("is not running");
     expect(spent().text).toContain("is still running");
+  });
+
+  it("states the failure class and the retry count ONCE each", () => {
+    // The anti-doubling guard its sibling already had (roborev 57791). This route kept a `message`
+    // it should not have had, and decideRevive's static reasons state both facts themselves — so
+    // interpolating one produced the class twice and the count twice in a single sentence.
+    expect(spent().text.match(/vendor API error/gi)).toHaveLength(1);
+    expect(spent().text.match(/retried/gi)).toHaveLength(1);
+    expect(spent().text.match(/\d+ times/g)).toHaveLength(1);
   });
 
   it("never reaches the founder — a failing agent is the concierge's to restart", () => {
     expect(spent().target).not.toBe("founder");
     expect(routeRetriesExhausted({ label: "A", retries: 0 }).target).toBe("concierge");
-  });
-
-  it("omits the quote cleanly when there is no reason to give", () => {
-    expect(routeRetriesExhausted({ label: "A", retries: 3 }).text).not.toContain("undefined");
   });
 });
 
