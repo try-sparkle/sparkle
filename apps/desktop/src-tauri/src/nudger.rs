@@ -471,43 +471,35 @@ fn tick<R: Runtime>(app: &AppHandle<R>, tracked: &mut HashMap<String, Tracked>, 
             }
         };
 
-        match outcome {
-            Some(Ok(Delivery::Submitted)) => {
-                // Count only what actually went out. `attempts` (which drives escalation) is the
-                // ladder's; this is the honest denominator for "does nudging work".
-                if matches!(decision.action, Action::Nudge { .. }) {
-                    entry.state.record_delivered();
-                }
-                tracing::info!(
+        if let Some(outcome) = &outcome {
+            // The STATE update is what the flag is built from, so it lives in its own testable
+            // function rather than inline in this match — an earlier version wired it here and the
+            // only test called the setter directly, so deleting the wiring left every test green.
+            record_outcome(&mut entry.state, &decision.action, outcome);
+            match outcome {
+                Ok(Delivery::Submitted) => tracing::info!(
                     target: "nudger",
                     agent = %agent_id,
                     rung = decision.rung,
                     action = action_name(&decision.action),
                     silent_secs = entry.state.silent_secs(),
                     "nudger wrote"
-                );
-            }
-            // Reported as its own action, NOT as a write. The text is on the prompt but unsent, so
-            // logging it as "nudger wrote" would put a delivery in the record that never happened.
-            Some(Ok(Delivery::Withheld)) => {
-                // Record it in the STATE, not only in the log — the FLAG is what the pusher reads,
-                // and without this it reads `nudges: 6, delivered: 0, blocked_by: null`, which by
-                // `blocked_by`'s own contract means "we could never write to this agent" when in
-                // fact the nudges are sitting on its prompt one bare Enter away from resolving.
-                entry.state.record_withheld();
-                tracing::warn!(
+                ),
+                // Reported as its OWN action, never as a write: the text is on the prompt but
+                // unsent, so logging "nudger wrote" would put a delivery in the record that never
+                // happened.
+                Ok(Delivery::Withheld) => tracing::warn!(
                     target: "nudger",
                     agent = %agent_id,
                     rung = decision.rung,
                     action = "nudge-withheld",
                     silent_secs = entry.state.silent_secs(),
                     "nudger left its text on the prompt unsent (another writer interleaved)"
-                );
+                ),
+                Err(e) => tracing::warn!(
+                    target: "nudger", agent = %agent_id, error = %e, "nudger write failed"
+                ),
             }
-            Some(Err(e)) => tracing::warn!(
-                target: "nudger", agent = %agent_id, error = %e, "nudger write failed"
-            ),
-            None => {}
         }
 
         if let Some(flags) = app.try_state::<NudgeFlags>() {
@@ -523,6 +515,34 @@ fn tick<R: Runtime>(app: &AppHandle<R>, tracked: &mut HashMap<String, Tracked>, 
                 let _ = app.emit("nudger://escalation", &flag);
             }
         }
+    }
+}
+
+/// Fold one delivery outcome back into the agent's state.
+///
+/// EVERY arm must land somewhere the flag can see, because the flag is what the pusher acts on. A
+/// permitted write that did not land leaves `last_blocked = None` from the ladder, so an arm that
+/// only logs produces `nudges: 6, delivered: 0, blocked_by: null` — which by `NudgeFlag::blocked_by`'s
+/// own contract says "we could never write to this agent", the one thing that is definitely not
+/// true. The three cases are genuinely different problems for the consumer:
+///
+///   * submitted  — it received the nudge and ignored it.
+///   * withheld   — the text is on its prompt, one bare Enter from resolving.
+///   * write error— its PTY is gone or erroring; nudging harder will never work.
+///
+/// Free function rather than inline in `tick` so it is assertable: `tick` needs an `AppHandle` and
+/// therefore has no test, which is exactly how the previous wiring shipped uncovered.
+fn record_outcome(state: &mut AgentState, action: &Action, outcome: &Result<Delivery, String>) {
+    match outcome {
+        Ok(Delivery::Submitted) => {
+            // Count only what actually went out. `attempts` (which drives escalation) is the
+            // ladder's; this is the honest denominator for "does nudging work".
+            if matches!(action, Action::Nudge { .. }) {
+                state.record_delivered();
+            }
+        }
+        Ok(Delivery::Withheld) => state.record_blocked("cr-withheld"),
+        Err(_) => state.record_blocked("write-failed"),
     }
 }
 
@@ -1198,6 +1218,120 @@ mod tests {
             vec!["alive".to_string()],
             "the dead session's flag must go; the live one must stay"
         );
+    }
+
+    // ══ THE TICK ITSELF ═════════════════════════════════════════════════════════════════════════
+
+    /// Drive the real `tick` against a mock Tauri app.
+    ///
+    /// `tick` is otherwise the ONE function here with no coverage — it needs an `AppHandle` — and it
+    /// is where the outcome→state wiring lives, which is why that wiring shipped deletable with
+    /// every test still green (roborev 57738). A mock app costs nothing and closes it.
+    #[test]
+    fn tick_records_a_failed_write_on_the_state_and_escalates() {
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        handle.manage(Observers::default());
+        handle.manage(NudgeFlags::default());
+
+        // An observer with a clean, writable screen — so the GATE permits and the only thing that
+        // can stop the write is the PTY itself, which does not exist here. That is exactly the
+        // production case of a child that exited between the sweep and the write.
+        let observer = handle.state::<Observers>().attach("agent-1", 120, 40);
+        observer.ingest(
+            "\x1b[2J\x1b[H────────────────────────\r\n❯\u{a0}\r\n────────────────────────",
+        );
+
+        let mut tracked: HashMap<String, Tracked> = HashMap::new();
+        // Walk the ladder far enough to cross the founder threshold. Each call is one "look"; the
+        // due-time is advanced by hand so the test does not wait out 600-second rungs.
+        let mut now = now_ms();
+        for _ in 0..20 {
+            tick(&handle, &mut tracked, now);
+            now = tracked.get("agent-1").map(|t| t.due_at_ms).unwrap_or(now);
+        }
+
+        let state = &tracked.get("agent-1").expect("agent tracked").state;
+        assert!(state.attempts() >= 6, "should have climbed to the escalation rungs");
+        assert_eq!(state.delivered(), 0, "no write can have succeeded — there is no PTY");
+        assert_eq!(
+            state.last_blocked(),
+            Some("write-failed"),
+            "the failed write must be recorded on the state, not merely logged"
+        );
+
+        let flags = handle.state::<NudgeFlags>().list();
+        assert_eq!(flags.len(), 1, "a stuck agent raises exactly one flag row");
+        assert_eq!(flags[0].target, "founder");
+        assert_eq!(
+            flags[0].blocked_by.as_deref(),
+            Some("write-failed"),
+            "and the pusher must be told WHY, not handed a null that reads as 'never writable'"
+        );
+    }
+
+    // ══ OUTCOME → STATE → FLAG ══════════════════════════════════════════════════════════════════
+    // The chain the pusher actually reads. Asserted end to end, because the previous version wired
+    // this inline in `tick` (which has no test, needing an AppHandle) and its only test called the
+    // setter directly and asserted the setter had set the field — so deleting the wiring left every
+    // test green.
+
+    /// Every arm must land somewhere the FLAG can see. `blocked_by: null` with a high `nudges` is a
+    /// specific claim — "we could never write to this agent" — and it must only be made when true.
+    #[test]
+    fn every_delivery_outcome_reaches_the_flag_distinguishably() {
+        let cases: [(Result<Delivery, String>, Option<&str>, u32); 3] = [
+            // Submitted: it got the nudge and ignored us. No block reason, and it counts.
+            (Ok(Delivery::Submitted), None, 1),
+            // Withheld: the text is on its prompt, one bare Enter from resolving.
+            (Ok(Delivery::Withheld), Some("cr-withheld"), 0),
+            // Errored: its PTY is gone or erroring — nudging harder will never work.
+            (Err("no such pty".to_string()), Some("write-failed"), 0),
+        ];
+
+        for (outcome, expected_block, expected_delivered) in cases {
+            let mut state = AgentState::default();
+            // Climb to a nudge rung so the ladder has counted an attempt, exactly as `tick` would.
+            let stalled = nudge_ladder::Observation {
+                hash: 1,
+                working: false,
+                refusal: None,
+                screen_readable: true,
+                prompt_has_text: false,
+                since_other_write_ms: u64::MAX,
+            };
+            for _ in 0..7 {
+                nudge_ladder::step(&mut state, &stalled);
+            }
+            assert_eq!(state.attempts(), 1, "precondition: one attempt counted");
+
+            record_outcome(&mut state, &Action::Nudge { n: 1 }, &outcome);
+            assert_eq!(state.delivered(), expected_delivered, "delivered for {outcome:?}");
+
+            // ...and out the far end: the FLAG the pusher consumes must carry it.
+            let flags = NudgeFlags::default();
+            let flag = apply_flags(
+                &flags,
+                "agent-1",
+                &decision(Some(nudge_ladder::Escalation::Concierge), false),
+                &state,
+            )
+            .expect("escalating tick raises a flag");
+            assert_eq!(
+                flag.blocked_by.as_deref(),
+                expected_block,
+                "the flag must distinguish {outcome:?} from an unreachable screen"
+            );
+            assert_eq!(flag.delivered, expected_delivered);
+        }
+    }
+
+    /// A bare Enter is not a nudge, so it must not move the nudge-delivery counter.
+    #[test]
+    fn a_bare_enter_is_not_counted_as_a_delivered_nudge() {
+        let mut state = AgentState::default();
+        record_outcome(&mut state, &Action::Enter, &Ok(Delivery::Submitted));
+        assert_eq!(state.delivered(), 0);
     }
 
     #[test]

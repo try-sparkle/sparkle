@@ -229,6 +229,19 @@ libc = "0.2"
 [dev-dependencies]
 hound = "3.5"
 tempfile = "3"
+# `tauri::test::mock_app`, so the nudger's tick loop can be driven end to end against a real
+# AppHandle. Without it `tick` is the one function in nudger.rs with no coverage at all — and it is
+# where the outcome-to-state wiring lives, which roborev 57738 flagged as deletable with every test
+# still green.
+#
+# `default-features = false` IS REQUIRED HERE TOO, and leaving it off is not a cosmetic slip.
+# Cargo unifies dev-dependency features into the crate whenever a TEST TARGET is built, so a
+# defaults-on entry here compiles `cargo test` against tauri WITH `compression` — the one default
+# member the production dependency above deliberately drops — while `cargo build` and the release
+# DMG compile it without. The test suite would then no longer exercise the feature set that ships,
+# and `generate_context!` would brotli-compress the whole embedded frontend on every test compile.
+# Unification still adds the production feature list from the entry above, so `mock_app` works.
+tauri = { version = "2", default-features = false, features = ["test"] }
 
 # Release tuning for a perf-sensitive native app. LTO + single codegen unit trade build time
 # for faster runtime on the git/audio/transcribe hot paths. Deliberately NOT panic="abort": the app

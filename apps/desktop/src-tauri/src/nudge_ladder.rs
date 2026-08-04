@@ -148,15 +148,18 @@ impl AgentState {
     pub fn record_delivered(&mut self) {
         self.delivered += 1;
     }
-    /// Record that a nudge's text reached the prompt but its carriage return was WITHHELD.
+    /// Record that a write the GATE permitted did not actually land, and why.
     ///
     /// Without this the flag read `nudges: 6, delivered: 0, blocked_by: null`, which by
-    /// `blocked_by`'s own contract means "we could never write to this agent" — when in fact six
-    /// nudges are sitting on its prompt, one bare Enter away from resolving. That is a materially
-    /// different problem for the consumer, and reporting the wrong one is the same conflation the
-    /// `delivered` counter exists to remove, moved one layer up.
-    pub fn record_withheld(&mut self) {
-        self.last_blocked = Some("cr-withheld");
+    /// `blocked_by`'s own contract means "we could never write to this agent" — when in fact the
+    /// nudges may be sitting on the prompt one bare Enter from resolving, or the PTY write may be
+    /// erroring out. Those are materially different problems for the consumer, and reporting the
+    /// wrong one is the same conflation the `delivered` counter exists to remove.
+    ///
+    /// Takes the reason rather than hard-coding one, because there is more than one way for a
+    /// permitted write not to land and every arm must be distinguishable.
+    pub fn record_blocked(&mut self, reason: &'static str) {
+        self.last_blocked = Some(reason);
     }
     /// Why the last attempt could not write.
     pub fn last_blocked(&self) -> Option<&'static str> {
@@ -619,24 +622,6 @@ mod tests {
         assert!(decisions.iter().all(|d| d.action == Action::Observe));
         assert_eq!(s.last_blocked(), Some("screen-unreadable"));
         assert!(decisions.iter().any(|d| d.escalate == Some(Escalation::Founder)));
-    }
-
-    /// A withheld carriage return must be visible in the STATE the flag is built from, not just in
-    /// the log — otherwise the flag says "we could never write to this agent" when in fact its
-    /// nudges are sitting on the prompt, one bare Enter from resolving.
-    #[test]
-    fn a_withheld_carriage_return_is_recorded_on_the_state() {
-        let mut s = AgentState::default();
-        run(&mut s, &stalled(), 7);
-        assert_eq!(s.last_blocked(), None, "the gate permitted the write");
-
-        s.record_withheld();
-        assert_eq!(
-            s.last_blocked(),
-            Some("cr-withheld"),
-            "the consumer must be able to tell this from an unreachable screen"
-        );
-        assert_eq!(s.delivered(), 0, "and it is still not a delivery");
     }
 
     /// The two refusals that mean the agent is FINE rather than stuck must NOT escalate — paging a
