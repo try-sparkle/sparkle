@@ -193,19 +193,40 @@ describe("WindowSpanControls", () => {
     expect(useSettingsStore.getState().windowIsSpanned).toBe(false);
   });
 
-  it("surfaces a read failure and disables every action rather than offering broken buttons", async () => {
-    invoke.mockRejectedValue(new Error("read monitors: backend gone"));
+  it("surfaces a read failure and disables SPAN — but never the way back out", async () => {
+    invoke.mockImplementation((cmd: string) =>
+      cmd === "display_layout"
+        ? Promise.reject(new Error("read monitors: backend gone"))
+        : Promise.resolve({ x: 0, y: 0, width: 1200, height: 800 }),
+    );
+    useSettingsStore.setState({ windowIsSpanned: true });
     render(<WindowSpanControls />);
 
     expect(await screen.findByText(/Couldn't read your displays: .*backend gone/)).toBeTruthy();
-    // Acting with no layout just produces a second error beside the first.
-    for (const name of [
-      /Span the Sparkle window/i,
-      /Fit the window to the display/i,
-      /Reset the window to its default size/i,
-    ]) {
-      expect(screen.getByRole("button", { name }).hasAttribute("disabled")).toBe(true);
+    // Spanning with no layout just produces a second error beside the first — its target rect
+    // genuinely needs one.
+    expect(
+      screen
+        .getByRole("button", { name: /Span the Sparkle window/i })
+        .hasAttribute("disabled"),
+    ).toBe(true);
+
+    // …but Fit and Reset act on the window's CURRENT display, in Rust. They do not consume the
+    // layout, and useDisplayRespan names Reset as the documented recovery from a failed re-span —
+    // so disabling them here removed the only affordance for a stranded window. They stay live and
+    // they still work.
+    for (const name of [/Fit the window to the display/i, /Reset the window to its default size/i]) {
+      expect(screen.getByRole("button", { name }).hasAttribute("disabled")).toBe(false);
     }
+
+    await userEvent.click(screen.getByRole("button", { name: /Fit the window to the display/i }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("fit_window_to_current_display"));
+    expect(useSettingsStore.getState().windowIsSpanned).toBe(false);
+
+    await userEvent.click(
+      screen.getByRole("button", { name: /Reset the window to its default size/i }),
+    );
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("reset_window_size"));
   });
 
   it("distinguishes an action failure from a read failure", async () => {

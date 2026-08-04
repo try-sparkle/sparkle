@@ -181,6 +181,14 @@ describe("the preconditions are the HOOK's, not each caller's", () => {
     await act(async () => void (await h.result.current.fit()));
     expect(invoke).toHaveBeenCalledWith("fit_window_to_current_display");
     expect(useSettingsStore.getState().windowIsSpanned).toBe(false);
+
+    // BOTH ways back. `reset` lost its gate in the same edit as `fit`, and this is the only
+    // assertion in the frontend suite that invokes `reset_window_size` at all — without it,
+    // re-introducing `if (noLayout) return` there would keep everything green.
+    useSettingsStore.setState({ windowIsSpanned: true });
+    await act(async () => void (await h.result.current.reset()));
+    expect(invoke).toHaveBeenCalledWith("reset_window_size");
+    expect(useSettingsStore.getState().windowIsSpanned).toBe(false);
   });
 });
 

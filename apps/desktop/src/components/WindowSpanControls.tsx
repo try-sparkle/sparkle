@@ -86,22 +86,31 @@ export function WindowSpanControls() {
         </div>
       </div>
 
+      {/* THE WAY OUT IS NEVER GATED — not by `blockedBySpaces` (already dropped here for this
+          reason) and not by `noLayout` either. `fit_window_to_current_display` and
+          `reset_window_size` act entirely in Rust on the window's CURRENT display; neither consumes
+          the layout this pane failed to read, so both would work.
+
+          Disabling them cost the documented recovery: useDisplayRespan names "Appearance → Window →
+          Reset to default size" as the way back from a failed re-span, and that was the button being
+          disabled. The header shortcut does not cover it — WindowSpanButton renders `null` unless
+          `isSpanned` — so "window stranded at a bad geometry, windowIsSpanned false, displays
+          unreadable" had no affordance anywhere in the UI. Span keeps the gate: its target rect
+          genuinely needs a layout. */}
       <div style={{ display: "flex", gap: 6 }}>
         <button
           type="button"
-          disabled={noLayout}
           aria-label="Fit the window to the display it is currently on"
           onClick={() => void fit()}
-          style={{ ...action, flex: 1, cursor: noLayout ? "not-allowed" : "pointer" }}
+          style={{ ...action, flex: 1, cursor: "pointer" }}
         >
           Fit to current display
         </button>
         <button
           type="button"
-          disabled={noLayout}
           aria-label="Reset the window to its default size, centered on the main display"
           onClick={() => void reset()}
-          style={{ ...action, flex: 1, cursor: noLayout ? "not-allowed" : "pointer" }}
+          style={{ ...action, flex: 1, cursor: "pointer" }}
         >
           Reset to default size
         </button>
