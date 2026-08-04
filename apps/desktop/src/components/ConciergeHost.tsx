@@ -1072,12 +1072,53 @@ export function ConciergeHost({
    * in the thread bubble regardless. Takes the TYPED text, never the payload — restoring quoted
    * attachment temp paths into the box would be the leak roborev 46911/46925 removed.
    */
-  const restoreDraft = useCallback((text: string) => {
-    if (text.trim() === "") return;
+  const restoreDraft = useCallback((text: string): boolean => {
+    if (text.trim() === "") return false;
     // VERBATIM: this is the user's own message coming back, and the box's ordinary insert path is
     // the DICTATION one, which trims. A restored body that contains a collapsed paste would arrive
     // dedented and short its trailing newline (roborev 55793).
-    insertRef.current?.(text, { verbatim: true });
+    const insert = insertRef.current;
+    if (!insert) return false;
+    insert(text, { verbatim: true });
+    // RETURNS WHETHER THE WORDS ACTUALLY GOT BACK, which `retractSend` needs (bead sparkle-k5kit).
+    // This used to be `void` and best-effort, and the doc above leaned on the thread bubble as the
+    // backstop for the drop. A refused send now RETRACTS that bubble, so the backstop and the thing
+    // being retracted are the same object: retracting unconditionally would turn "best-effort" into
+    // "silently lost". The caller retracts only on `true`.
+    return true;
+  }, []);
+
+  /**
+   * TAKE BACK the optimistic "you" bubble for a send that was REFUSED.
+   *
+   * ══ WHY A REFUSED SEND MUST NOT LEAVE ONE (bead sparkle-k5kit part 2) ═══════════════════════════
+   * `send` appends the bubble SYNCHRONOUSLY, before routing, and that is deliberate — queuing it left
+   * a second rapid send with no visible state at all. The cost is that a refusal arrives after the
+   * bubble is already on screen, and the refusal path also puts the words back in the composer. So
+   * the founder saw his paragraph in TWO places at once: quoted in the thread as though it had been
+   * sent, and sitting in the box as though it had not.
+   *
+   * His words: *"It's also not clearing what I sent out of the Compose box even though it shows up in
+   * the Concierge list."* Both halves are one bug. A message that is simultaneously "back in the box"
+   * and shown as sent is the worst of both, and it is how he ends up sending the same thing twice.
+   *
+   * The refusal is still SAID — `terminalRefusalLine` posts a Sparkle-authored line into the thread,
+   * and `noteMounted` puts it on the mounted column's notice row. Those are explanations, which is
+   * the right shape; the "you" bubble is a RECORD OF A SEND, and no send happened.
+   *
+   * The receipt goes with it: a receipt annotates a bubble, so it has nothing to attach to once the
+   * bubble is gone. That does not re-open roborev 57360 (the two refusal instants must tell the same
+   * story) — they still do, because BOTH instants now retract, and both still post the line.
+   *
+   * Also drops the three remembered renderings. `redirect` replays them, and the button that would
+   * have triggered it lived on the bubble — so leaving them is a leak whose only reachable effect
+   * would be replaying a message the user was told was not sent.
+   */
+  const retractSend = useCallback((messageId: string) => {
+    setChat((prev) => prev.filter((m) => m.id !== messageId));
+    sentTextRef.current.delete(messageId);
+    sentPayloadRef.current.delete(messageId);
+    sentWireRef.current.delete(messageId);
   }, []);
 
   const registerInsert = useCallback(
@@ -2838,8 +2879,16 @@ export function ConciergeHost({
           // (roborev 57424): unmounted, this refusal is already visible twice (the thread line and
           // the receipt), and a third copy in a row that could never clear would outlive the send.
           if (displayMountedRef.current) noteMounted(terminalRefusalText(aim.name, blocked), "warn");
-          restoreDraft(text);
+          const returned = restoreDraft(text);
           restoreAttachments(staged);
+          // NO BUBBLE FOR A SEND THAT DID NOT HAPPEN (bead sparkle-k5kit part 2). Only once the words
+          // are demonstrably back in the box, though — see `retractSend`: on the rare path where the
+          // composer is not mounted to take them, the bubble is the last surviving copy of what the
+          // founder typed, and dropping it too would turn a refusal into a loss.
+          if (returned) {
+            retractSend(id);
+            return true;
+          }
           setReceipt(id, {
             // NEITHER destination's wording (roborev 57360). `target: "agent"` would read "Sent to
             // X" over a write that never landed — and `target: "sparkle"`, which this used to say,
@@ -2971,8 +3020,15 @@ export function ConciergeHost({
                 postSparkle(terminalRefusalLine(asAgent(aim), blocked));
                 if (displayMountedRef.current)
                   noteMounted(terminalRefusalText(aim.name, blocked), "warn");
-                restoreDraft(text);
+                const returned = restoreDraft(text);
                 restoreAttachments(staged);
+                // BOTH refusal instants retract, for the reason roborev 57360 made both of them post
+                // a receipt: the two must tell the identical story about an identical outcome, and
+                // this is the one the founder reaches AFTER watching a countdown run.
+                if (returned) {
+                  retractSend(id);
+                  return false;
+                }
                 // THE SAME RECEIPT THE SUBMIT-TIME REFUSAL POSTS. This used to post none at all, so
                 // the two refusal instants told the user different stories about the identical
                 // outcome — and the later one, which is the one that happens after they have watched
@@ -3123,6 +3179,7 @@ export function ConciergeHost({
       agentStillExists,
       restoreAttachments,
       restoreDraft,
+      retractSend,
       enqueue,
       postSparkle,
       announce,

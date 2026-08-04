@@ -123,6 +123,7 @@ import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
 import { useProjectStore } from "../stores/projectStore";
 import { MOUNTED_THREAD_TESTID } from "./Concierge/MountedAgentThread";
 import { MOUNTED_NOTICE_TESTID } from "./Concierge/MountedNotice";
+import { CONCIERGE_THREAD_TESTID } from "../engine/composeBoxHeight";
 
 function agent(id: string, name: string) {
   return {
@@ -517,6 +518,49 @@ describe("ConciergeHost — a terminal that must not receive free text refuses",
     await waitFor(() => expect(box().value).toBe("move the button 5px left"));
   });
 
+  // ══ A REFUSED SEND LEAVES NO BUBBLE (bead sparkle-k5kit part 2) ═══════════════════════════════
+  // The founder: *"It's also not clearing what I sent out of the Compose box even though it shows up
+  // in the Concierge list."* Both halves are ONE bug. `send` appends the "you" bubble synchronously,
+  // before routing; the refusal then puts the words back in the composer — so his paragraph was in
+  // two places at once, quoted in the thread as though sent AND sitting in the box as though not.
+  // That is how he ends up sending the same thing twice.
+  //
+  // The words come back (the row above pins that) and the refusal is still SAID — but the record of
+  // a send that never happened is gone.
+  // UNMOUNTED, and that is not incidental: `ConciergeThread` — where the "you" bubble is rendered —
+  // is not mounted at all while the column is patched to an agent (the mounted view shows THAT
+  // AGENT's conversation instead). A first cut of this test asserted against MOUNTED_THREAD_TESTID
+  // and was VACUOUS: the bubble was never in that subtree to begin with, so it passed with the
+  // retraction disabled. This is the state where the founder can actually see the thing he reported.
+  it("takes back the thread bubble, since no send happened", async () => {
+    h.wired.mockReturnValue("off");
+    mount();
+    h.viewport.mockReturnValue({ text: "~\n~\n:", alternateBuffer: true });
+    await send("@Kraken Auth ship the DMG");
+    await elapse();
+    // The words are back in the box — the precondition for retracting at all.
+    await waitFor(() => expect(box().value).toBe("@Kraken Auth ship the DMG"));
+    // AND NOT ALSO QUOTED AS A SENT MESSAGE. `postSparkle`'s refusal line names the agent, so this
+    // looks for the BODY the founder typed, which only the "you" bubble would carry.
+    expect(screen.getByTestId(CONCIERGE_THREAD_TESTID).textContent ?? "").not.toContain(
+      "ship the DMG",
+    );
+  });
+
+  // ══ AND IT MUST NOT QUIETLY BECOME A CONCIERGE MESSAGE INSTEAD (bead sparkle-sp0wv) ═══════════
+  // *"If a refused terminal write falls through to the concierge, the message silently changes
+  // destination"* — the one failure mode composerRoute's header calls unrecoverable. He addressed the
+  // AGENT; re-aiming his words without telling him is the harm. Retracting the bubble must not open
+  // that door either: the words go back to the box and NOWHERE else.
+  it("does not reach the concierge instead", async () => {
+    mount();
+    h.viewport.mockReturnValue({ text: "~\n~\n:", alternateBuffer: true });
+    await send("move the button 5px left");
+    await elapse();
+    expect(h.startConciergeTurn).not.toHaveBeenCalled();
+    expect(h.dispatchConciergeAnswer).not.toHaveBeenCalled();
+  });
+
   it("refuses at a credential prompt", async () => {
     mount();
     h.viewport.mockReturnValue({
@@ -603,14 +647,23 @@ describe("ConciergeHost — a terminal that must not receive free text refuses",
     await send("@Kraken Auth ship the DMG");
     await elapse();
     expect(h.dispatchConciergeAnswer).not.toHaveBeenCalled();
-    const receipt = await waitFor(() => screen.getByTestId("routing-receipt"));
-    // THE COPY ITSELF, not merely that a receipt exists. This used to post `target: "sparkle"`, which
-    // renders as "→ Answered here" — and nothing was answered anywhere: the brain was never asked and
-    // the words went back to the box. Reading the rendered text is the only assertion that catches it
-    // (roborev 57360).
-    expect(receipt.textContent).toContain("Not sent");
-    expect(receipt.textContent).toContain("Kraken Auth");
-    expect(receipt.textContent).not.toContain("Answered here");
+    // ══ THE RECEIPT IS GONE BECAUSE THE BUBBLE IS (bead sparkle-k5kit part 2) ═══════════════════
+    // This used to assert a receipt reading "Not sent — Kraken Auth". That was roborev 57360's fix
+    // for a receipt that claimed "Answered here" over a send the brain never saw, and it was right
+    // about the claim being false — but it left the underlying record in place. A receipt ANNOTATES
+    // a "you" bubble, and the founder's complaint is that the bubble should not be there at all: a
+    // message shown as sent while its words are back in the composer is how he sends it twice.
+    //
+    // So the assertion moves UP a level: nothing on screen claims this was sent, because the record
+    // of the send has been retracted. Strictly stronger than the old row — a build that restored the
+    // "Answered here" receipt fails this too, since any receipt at all fails it.
+    await waitFor(() => expect(box().value).toBe("@Kraken Auth ship the DMG"));
+    expect(screen.queryByTestId("routing-receipt")).toBeNull();
+    // The refusal is still SAID — as a Sparkle-authored line, which is an explanation rather than a
+    // record of a send. That is the surface that must survive, and it names the agent.
+    const thread = screen.getByTestId(CONCIERGE_THREAD_TESTID).textContent ?? "";
+    expect(thread).toContain("full-screen app");
+    expect(thread).toContain("Kraken Auth");
     expect(screen.queryByRole("button", { name: /^Also ask / })).toBeNull();
     // ══ AND NO BANNER (roborev 57424) ═════════════════════════════════════════════════════════════
     // The notice row exists ONLY because a mounted column hides its thread. Unmounted, this refusal
