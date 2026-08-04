@@ -7,6 +7,10 @@ rather than asserted. `MAPPING.md`'s Verification section is what this closes.
 It is a **measuring instrument**. It does not change any component's styling, and neither should
 work that uses it — capture, read the number, fix the design, capture again.
 
+Scoring a whole surface is not the only pixel question. When the report is about a **specific**
+thing — a line, a gutter, a join, an edge that should not be there — the percentage cannot answer
+it. [Settling a pixel question](#settling-a-pixel-question) is the section for that.
+
 ## Run it
 
 ```bash
@@ -175,6 +179,69 @@ throws — the differing PNGs are the entire reason to run it, and deleting them
 are `visual-stable-a-*` / `visual-stable-b-*` under your temp dir, and repeated local failures
 accumulate. Delete them when you are done. A clean run cleans up after itself; `--keep` forces a
 keep, `--keep=false` forces a clean on the success path only.
+
+## Settling a pixel question
+
+**A unit test cannot settle a claim about what something LOOKS like.** jsdom never lays out and
+never loads the stylesheet, so a green suite is compatible with a visible line, a gap, or a shadow
+that nobody asserted on. Reasoning from the source is no better: "I removed the border, therefore
+the line is gone" cannot see a line painted by a *different* element, by a background gap, or by a
+scroll container's edge. Five rounds of "the seam is fixed" shipped that way before either of these
+two tools existed, so reach for a rendered image whenever the report is about appearance.
+
+Both read a PNG — a capture from `visual:capture`, or any screenshot.
+
+### `seam-probe.mjs` — what is actually painted there
+
+Collapses a horizontal scan into **runs** of near-identical colour. A 1px rule between two planes
+is unmissable as a short run whose colour is neither neighbour:
+
+```bash
+node scripts/visual/seam-probe.mjs shot.png --y=245 --x=700..800
+node scripts/visual/seam-probe.mjs shot.png --y=245 --x=700..800 --json
+```
+
+```
+x  700..745  #0e1b2e  (46px)
+x  746..747  #24406a  (2px)   <-- the seam, at scale 2
+x  748..800  #101f36  (53px)
+```
+
+| flag | meaning |
+|---|---|
+| `--y=<row>` or `--y=<from..to>` | the row(s) to scan; a range judges each row |
+| `--x=<from..to>` | the horizontal band to scan (inclusive both ends) |
+| `--tolerance=N` | per-channel tolerance for "same colour" (default 2) |
+| `--strict` | see below |
+| `--json` | emit the runs and the verdict for a test to assert on |
+
+**Two questions, two rules — pick deliberately.** The default answers the PANEL BOUNDARY question
+("is there a rule *between* these two surfaces"), where two runs meeting directly is continuous and
+correct. `--strict` answers the JOINT question ("does one plane run through unbroken") by demanding
+a **single** run — because a hard colour step straight down the join is two runs meeting, which the
+default rule calls continuous. Use `--strict` when the claim is that a surface is uninterrupted.
+
+Width alone does not decide it either: a band counts as a seam if it is narrow **or** if the scan
+starts and ends on the same colour, since a band splitting one continuous plane is an interruption
+however wide it is. The defect that motivated this was 14 image px across — over any sane rule width
+— with byte-identical planes either side.
+
+`--json` is what turns "no seam" into a regression-testable fact rather than a screenshot someone
+looked at once.
+
+### `crop.mjs` — make those pixels visible to a human
+
+```bash
+node scripts/visual/crop.mjs shot.png --x=680..820 --y=180..320 --zoom=4 --out=seam.png
+```
+
+Companion to the probe: that one settles what the pixels **are**, this one lets you look at them.
+Magnification is nearest-neighbour on purpose — a smoothed zoom invents intermediate colours, which
+is precisely what makes a 1px rule arguable.
+
+**Mind the scale.** Captures are taken at `devicePixelRatio` 2 by default, so a 1 CSS-px rule is
+2 image px, and every coordinate and width in both tools is **image px, not CSS px** — divide by the
+capture's `--scale` to get back to CSS px. A run of 1–2px is the signature to look for.
 
 ## Tests
 

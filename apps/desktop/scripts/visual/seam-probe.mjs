@@ -23,7 +23,10 @@
 // rather than a screenshot someone looked at once.
 //
 // SCALE. Captures are taken at devicePixelRatio 2 by default, so a 1 CSS-px rule is 2 image px and
-// a run of 1-2px is the signature to look for. Pass --scale to have widths reported in CSS px too.
+// a run of 1-2px is the signature to look for. Every coordinate and width here is IMAGE px — this
+// tool has no --scale flag, so divide by the capture's scale yourself to get back to CSS px. (It
+// used to claim `--scale` reported CSS px; nothing ever read that flag, and parseArgs accepts any
+// --key=value, so passing it was silently ignored rather than rejected.)
 
 import { readFileSync } from "node:fs";
 import { decodePng } from "./png.mjs";

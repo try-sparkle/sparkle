@@ -246,6 +246,79 @@ def _push_cwd_and_branch(cmd: str, fallback_cwd: str) -> tuple[str, str | None] 
     return None
 
 
+# Display bounds for the skipped-step list. A chained command can be long; the
+# point is to let the agent RECOGNIZE its own steps, not to reproduce them
+# verbatim, so a truncated step is still a useful answer while an unbounded dump
+# would bury the review list the deny message exists to show.
+_MAX_STEP_CHARS = 120
+_MAX_STEPS_LISTED = 8
+
+
+def _render_steps(segments: list[list[str]]) -> list[str]:
+    """Token lists -> displayable one-line step strings, empties dropped.
+
+    Rebuilt from the tokenizer's output rather than sliced out of the raw
+    command, so quoting is already normalized and no partial quote can leak into
+    the message."""
+    out: list[str] = []
+    for tokens in segments:
+        if not tokens:
+            continue  # a trailing `;` / `&` yields an empty tail segment
+        step = " ".join(tokens)
+        if len(step) > _MAX_STEP_CHARS:
+            step = step[: _MAX_STEP_CHARS - 1] + "…"
+        out.append(step)
+    return out
+
+
+def chained_steps_around_push(cmd: str) -> tuple[list[str], list[str]]:
+    """The other top-level steps chained around the first `git push` segment of
+    `cmd`, as `(before, after)` display strings.
+
+    Both gates deny the WHOLE Bash invocation before any of it runs, so every one
+    of these steps silently did not execute — `before` never ran despite reading
+    as already-done (`git commit && git push` leaves HEAD where it was), and
+    `after` never ran either. Naming them is the fix for bead sparkle-9tl2e: the
+    deny message could say a chain *might* have been skipped, but not which
+    steps, and a long compound command makes that non-obvious enough that agents
+    re-derived it from `git status`.
+
+    `([], [])` when the command is a standalone push, when there is no push
+    segment, or when the tokenizer fails — the caller then omits the list rather
+    than asserting anything about steps it could not read."""
+    segments = _split_into_segments(cmd)
+    push_idx = None
+    for i, tokens in enumerate(segments):
+        if not tokens or tokens[0] != "git":
+            continue
+        sub_idx = _find_subcommand_idx(tokens)
+        if sub_idx is None or tokens[sub_idx] != "push":
+            continue
+        push_idx = i
+        break
+    if push_idx is None:
+        return [], []
+    return _render_steps(segments[:push_idx]), _render_steps(segments[push_idx + 1:])
+
+
+def format_skipped_steps(before: list[str], after: list[str]) -> list[str]:
+    """Message lines naming the chained steps that did not run, or `[]` when the
+    push stood alone (nothing to report, so the caller prints nothing)."""
+    if not before and not after:
+        return []
+    total = len(before) + len(after)
+    lines = [
+        f"{total} other step(s) chained into that same command therefore did NOT "
+        "run:",
+    ]
+    for step, when in [(s, "before") for s in before] + [(s, "after") for s in after]:
+        if len(lines) - 1 >= _MAX_STEPS_LISTED:
+            lines.append(f"  … and {total - _MAX_STEPS_LISTED} more")
+            break
+        lines.append(f"  - [{when} the push] {step}")
+    return lines
+
+
 def _is_create_switch(args: list[str]) -> bool:
     """True when a `git checkout`/`git switch` CREATES (or force-resets) its target
     branch — `-b`/`-B`/`-c`/`-C`. The destination is then a brand-new (or reset)

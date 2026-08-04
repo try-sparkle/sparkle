@@ -457,6 +457,33 @@ describe("orchestrationPersona", () => {
     expect(rule).not.toMatch(/promptly|straight back|how long|elapsed|quickly|immediately returns/i);
   });
 
+  it("tells the orchestrator a spawned worker is UNREACHABLE, and what the two real moves are", () => {
+    // Beads sparkle-o6wmb / sparkle-1rknx, filed independently from two different runs: an
+    // orchestrator discovered a corrected contract minutes after fanning out, reached for a
+    // messaging tool, and got back only that no such agent is reachable. The persona said nothing
+    // about this, so both agents learned it by losing the batch — one of them by hand-reconciling
+    // superseded work, including a live work-loss path.
+    //
+    // Assert the CONSEQUENCE the orchestrator has to act on (the contract is frozen; here are the
+    // two moves), not merely that the word "worker" appears — the persona is full of those.
+    const b = bullet("- The `task` string you pass to `spawn_worker`");
+    expect(b).toMatch(/frozen/i);
+    expect(b).toMatch(/no inbox|cannot reach|unreachable|no such agent is reachable/i);
+    // The actionable half: a post-spawn correction is never delivered, so don't wait for it to be.
+    expect(b).toMatch(/never\s+be\s+delivered/i);
+
+    // The remedy bullet must offer BOTH moves — a persona that named only "spin it down and
+    // respawn" would instruct the agent to DELETE a worktree holding uncommitted work, which is the
+    // unsafe half of the pair (AGENTS.md: a remedy string is an instruction, audit it as code).
+    const moves = bullet("- When a contract does change mid-flight");
+    expect(moves).toMatch(/spin_down_worker/);
+    expect(moves).toMatch(/DELETES the worktree/i);
+    expect(moves).toMatch(/not\s+committed/i);
+    expect(moves).toMatch(/let it finish|reconcile at merge/i);
+    // And it must not tell the agent to sit and wait for a message it can never receive.
+    expect(moves).not.toMatch(/send (it |the worker )?a (message|correction)/i);
+  });
+
   it("distinguishes a CAPACITY error from every other spawn failure (roborev 56186)", () => {
     // Two defects in one line, both High/Medium. The copy said "An ERROR or timeout → the machine
     // was FULL and THAT UNIT WAS NOT STARTED … re-spawn exactly that unit":

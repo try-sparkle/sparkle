@@ -63,6 +63,8 @@ from _roborev_hooklib import (
     _emit_hook,
     open_fail_backlog,
     format_backlog_summary,
+    chained_steps_around_push,
+    format_skipped_steps,
 )
 
 # How long to wait for in-flight reviews. Fixed — under the installer's
@@ -73,14 +75,22 @@ from _roborev_hooklib import (
 WAIT_TIMEOUT_SECS = 600
 
 
-_LIST_FAIL_REASON = (
-    "Push blocked: couldn't determine roborev review state — `roborev list` "
-    "failed (timed out, errored, or returned unparseable output). The gate is "
-    "fail-closed: a wedged daemon must not be mistaken for 'no open findings'. "
-    "Check `roborev status`, then re-run the push. Note: this hook denied the "
-    "ENTIRE Bash command before it ran, so a chained `git commit && git push` "
-    "did NOT commit — run the earlier steps separately first."
-)
+def _list_fail_reason(cmd: str) -> str:
+    """The fail-closed deny (review state unreadable), with the chained steps
+    that never ran named — same skipped-step surface as `_format_block`, since
+    this deny blocks the whole invocation exactly as hard as that one does."""
+    lines = [
+        "Push blocked: couldn't determine roborev review state — `roborev list` "
+        "failed (timed out, errored, or returned unparseable output). The gate is "
+        "fail-closed: a wedged daemon must not be mistaken for 'no open findings'. "
+        "Check `roborev status`, then re-run the push. Note: this hook denied the "
+        "ENTIRE Bash command before it ran, so a chained `git commit && git push` "
+        "did NOT commit — run the earlier steps separately first.",
+    ]
+    skipped = format_skipped_steps(*chained_steps_around_push(cmd))
+    if skipped:
+        lines += ["", *skipped]
+    return "\n".join(lines)
 
 
 def _allow() -> int:
@@ -126,7 +136,7 @@ def _wait_for(roborev: str, repo_root: str, ids: list[int]) -> bool:
         return True  # best-effort: if wait can't run, fall through to re-query
 
 
-def _format_block(jobs: list[dict]) -> str:
+def _format_block(jobs: list[dict], cmd: str = "") -> str:
     lines = [
         f"Push blocked: {len(jobs)} open roborev fail-verdict review(s) on this "
         "branch must be addressed first.",
@@ -139,6 +149,12 @@ def _format_block(jobs: list[dict]) -> str:
         "first, then push separately once the reviews below are cleared.",
         "",
     ]
+    # Name the chained steps rather than only warning that some may exist: the
+    # paragraph above tells the agent a chain MIGHT have been skipped, which a
+    # long compound command makes hard to act on (bead sparkle-9tl2e).
+    skipped = format_skipped_steps(*chained_steps_around_push(cmd))
+    if skipped:
+        lines += [*skipped, ""]
     # Drifted open-fail rows (null/non-int id) still display usefully — fall back
     # to the short git_ref so the agent can find the review, matching how the
     # warn surface tolerates id-less rows rather than printing "review #None".
@@ -202,7 +218,7 @@ def main() -> int:
 
     jobs = _list_jobs(roborev, repo_root, branch)
     if jobs is None:
-        return _deny(_LIST_FAIL_REASON)
+        return _deny(_list_fail_reason(cmd))
 
     # Deny IMMEDIATELY on an already-confirmed open fail — a terminal fail can't
     # be cleared by waiting, so never hang up to WAIT_TIMEOUT_SECS on unrelated
@@ -210,7 +226,7 @@ def main() -> int:
     # enqueued review for the new commit).
     outstanding = [j for j in jobs if _is_open_fail(j)]
     if outstanding:
-        return _deny(_format_block(outstanding))
+        return _deny(_format_block(outstanding, cmd))
 
     # TRIAGED-TO-LAND (Sparkle policy): do NOT wait-and-block on reviews still in
     # flight for the commit being pushed. The gate blocks ONLY on already-
