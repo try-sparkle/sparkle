@@ -37,6 +37,12 @@ export function firstLadderRowId<
   stageOf: (id: string) => WorkflowStageId,
   statusOf: (id: string) => AgentTabStatus,
   visibleBands: Record<StatusBand, boolean>,
+  /** Does this row's worktree hold anything? Forwarded straight to `groupAgentsByStage`, and it MUST
+   *  be the same accessor the column passes. `local_none` sorts above `local_uncommitted`, so a
+   *  caller that omits it here while the sidebar supplies it computes a different first row — the
+   *  exact "selection points at a row the column is not rendering" failure this module was extracted
+   *  to end (roborev 53858), just reached through the section axis instead of the band axis. */
+  holdsWorkOf?: (id: string) => boolean | undefined,
 ): string | null {
   // NO rollup accessor here, deliberately — `statusOf` already carries it.
   //
@@ -53,6 +59,13 @@ export function firstLadderRowId<
   // the promotion, red and orange via the pre-existing bubbling, calm via withDismissedAlerts.
   // engine/workerRollup.test.ts pins that agreement as a matrix rather than leaving it to this
   // comment. Passing a NON-published map here was already a contract violation; it still is.
-  const sections = groupAgentsByStage(topLevelAgents(agents, mode), stageOf, statusOf, visibleBands);
+  const sections = groupAgentsByStage(
+    topLevelAgents(agents, mode),
+    stageOf,
+    statusOf,
+    visibleBands,
+    undefined,
+    holdsWorkOf,
+  );
   return flattenSections(sections)[0]?.id ?? null;
 }

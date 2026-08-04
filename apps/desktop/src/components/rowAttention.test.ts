@@ -112,21 +112,25 @@ describe("stallChipFor — SAYING WHICH FILE (sparkle-biezi)", () => {
     // The founder's complaint: "A row claiming uncommitted work without naming a file cannot be
     // acted on — he cannot tell a forgotten fix from a leftover build artifact."
     const c = chip(dirtyBs(["apps/desktop/src/vite.config.ts"]));
-    expect(c?.text).toBe("uncommitted: vite.config.ts");
+    // No "uncommitted:" prefix — the chip caps at 20ch and the row already carries an "Unsaved"
+    // badge and a ⚠ icon, so a prefix truncates the one thing they cannot say. The word survives in
+    // the accessible name, which is asserted below.
+    expect(c?.text).toBe("vite.config.ts");
     // The bare label is what this replaces — assert it is GONE, not merely that a name is present.
     expect(c?.text).not.toBe("uncommitted changes");
+    expect(c?.ariaLabel).toBe("Stalled — uncommitted changes: vite.config.ts");
   });
 
   it("counts the +N from the TRUE total, not from the capped preview", () => {
     // Rust caps the preview at 5 but always counts them all. Reading the array's length instead
     // would under-report a big mess as exactly "+4" forever.
     const c = chip(dirtyBs(["a.ts", "b.ts", "c.ts", "d.ts", "e.ts"], 12));
-    expect(c?.text).toBe("uncommitted: a.ts +11");
+    expect(c?.text).toBe("a.ts +11");
   });
 
   it("carries the FULL paths for the tooltip, while the chip shows a basename", () => {
     const c = chip(dirtyBs(["apps/desktop/src/x.ts", "dist/bundle.js"], 2));
-    expect(c?.text).toBe("uncommitted: x.ts +1");
+    expect(c?.text).toBe("x.ts +1");
     expect(c?.files).toEqual(["apps/desktop/src/x.ts", "dist/bundle.js"]);
   });
 

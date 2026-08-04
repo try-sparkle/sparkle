@@ -26,8 +26,9 @@ import {
   visualPrsRequested,
 } from "./visualFixtures";
 import { stallReport } from "../engine/agentStall";
-import { stallInputsFor } from "../components/rowAttention";
-import { bandOfStatus, sectionOfStage } from "../engine/buildSections";
+import { stallChipFor, stallInputsFor } from "../components/rowAttention";
+import { bandOfStatus, sectionOfRow } from "../engine/buildSections";
+import { uncommittedWorkEvidence } from "../engine/workflowStage";
 import type { AgentTabStatus } from "../types";
 import { useUiStore } from "../stores/uiStore";
 import { isProjectOpen } from "../engine/openProjects";
@@ -999,7 +1000,7 @@ describe("the sparkle-biezi capture row — its ONE load-bearing property", () =
    *  assembly rather than my restatement of it. The harness seeds the stage watermark and nothing
    *  else, so branchStatus and workflowState are genuinely absent here, not defaulted. */
   function soleExpiryRows() {
-    const { project, status, workflowStage } = buildVisualFixture();
+    const { project, status, workflowStage, branchStatus } = buildVisualFixture();
     const rows = project.agents.filter((a) => {
       const report = stallReport(
         stallInputsFor(status[a.id] as AgentTabStatus, FIXTURE_NOW, a.goal, {
@@ -1008,36 +1009,70 @@ describe("the sparkle-biezi capture row — its ONE load-bearing property", () =
       );
       return report.verdict === "stalled" && report.causes.length === 1 && report.causes[0] === "expired-goal";
     });
-    return { rows, status, workflowStage };
+    return { rows, status, workflowStage, branchStatus };
   }
 
-  it("has exactly one row whose ONLY stall cause is `expired-goal`", () => {
+  it("every sole-expiry row is CALM — a red one could not show 'finished renders gray'", () => {
     const { rows, status } = soleExpiryRows();
     expect(
       rows.map((a) => a.name),
       "no fixture row has `expired-goal` as its sole stall cause — the agent-sidebar capture can no " +
         "longer photograph the expiry colour fix, and would look identical with or without it",
-    ).toHaveLength(1);
-    // …and it must be CALM, since the whole claim is "a finished agent renders gray". A row that had
-    // drifted to `waiting`/`blocked` would report `active` above and never reach this line, but say it
-    // out loud so the intent survives a refactor of the filter.
-    expect(bandOfStatus(status[rows[0]!.id] as AgentTabStatus)).toBe("done");
+    ).not.toHaveLength(0);
+    for (const r of rows) {
+      expect(bandOfStatus(status[r.id] as AgentTabStatus), `${r.name} is not calm`).toBe("done");
+    }
   });
 
-  it("and THAT row is the founder's actual case — merged to main, idle, goal expired", () => {
-    // Three of the four red rows in his screenshot were labelled MERGED TO MAIN. A row that proved
-    // the rule from some other stage would leave the reported case unphotographed.
-    //
-    // This asserts the stage of the row selected by CAUSE above, which is what stops it being the
-    // tautology roborev 57779 flagged: nothing here chose the row for its stage, so `merged` /
-    // `remote_merged` is a fact being checked rather than one being restated.
-    const { rows, status, workflowStage } = soleExpiryRows();
-    const row = rows[0];
-    expect(row, "no sole-expiry row to make claims about").toBeDefined();
-    expect(goalStateOf(row!.goal, FIXTURE_NOW)).toBe("expired");
-    expect(status[row!.id]).toBe("idle");
-    expect(workflowStage[row!.id]).toBe("merged");
-    // The band the founder read off the screen.
-    expect(sectionOfStage(workflowStage[row!.id]!)).toBe("remote_merged");
+  it("covers BOTH stages the founder saw the bug at — merged, and pre-commit", () => {
+    // His four red rows were not all alike: three were labelled MERGED TO MAIN, and Babysit PR 1104
+    // sat in LOCAL: UNCOMMITTED. A fixture proving the rule from only one of those would leave the
+    // other unphotographed, and they exercise different arms — the merged row's `hasUnlandedWork` is
+    // false via the stage band, the pre-commit row's via a positively-read clean worktree.
+    const { rows, workflowStage } = soleExpiryRows();
+    const stages = rows.map((r) => workflowStage[r.id]);
+    expect(stages, "no sole-expiry row at `merged`").toContain("merged");
+    expect(stages, "no sole-expiry row at `building_unsaved`").toContain("building_unsaved");
+  });
+
+  it("the pre-commit sole-expiry row lands in `local_none`, NOT `local_uncommitted`", () => {
+    // BUG 2, on the same row that proves BUG 1 — which is what the founder actually saw: one agent
+    // reading "broken AND unsaved" while it was finished and holding nothing.
+    const { rows, workflowStage, branchStatus } = soleExpiryRows();
+    const row = rows.find((r) => workflowStage[r.id] === "building_unsaved");
+    expect(row, "no pre-commit sole-expiry row").toBeDefined();
+    // Its worktree must be POSITIVELY READ as empty; an unseeded row would read `undefined` and
+    // stay in `local_uncommitted`, making the capture vacuous for this half.
+    const holds = uncommittedWorkEvidence(branchStatus[row!.id]);
+    expect(holds, "the row's worktree was never seeded — the capture cannot show the split").toBe(false);
+    expect(sectionOfRow(workflowStage[row!.id]!, holds)).toBe("local_none");
+  });
+
+  it("keeps a DIRTY control at the same stage, in `local_uncommitted`, naming its files", () => {
+    // The control that makes the split above mean something: same stage, same idle status, differing
+    // only in whether the tree holds anything. Without it a capture could not show that the column
+    // distinguishes them rather than having simply relabelled the rung.
+    const { project, status, workflowStage, branchStatus } = buildVisualFixture();
+    const dirty = project.agents.filter(
+      (a) =>
+        workflowStage[a.id] === "building_unsaved" &&
+        status[a.id] === "idle" &&
+        uncommittedWorkEvidence(branchStatus[a.id]) === true,
+    );
+    expect(dirty, "no idle pre-commit row with a dirty tree").not.toHaveLength(0);
+    const row = dirty[0]!;
+    expect(sectionOfRow(workflowStage[row.id]!, true)).toBe("local_uncommitted");
+    // …and it NAMES what it holds — the other half of BUG 2.
+    const chip = stallChipFor(
+      stallReport(
+        stallInputsFor(status[row.id] as AgentTabStatus, FIXTURE_NOW, row.goal, {
+          bs: branchStatus[row.id],
+          stageOverride: workflowStage[row.id],
+        }),
+      ),
+      branchStatus[row.id],
+    );
+    expect(chip?.text).toMatch(/^\S+\.\w+/);
+    expect(chip?.files.length).toBeGreaterThan(0);
   });
 });

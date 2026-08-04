@@ -36,6 +36,7 @@ import { createJSONStorage } from "zustand/middleware";
 import type { AgentTab, Project } from "../types";
 import type { AgentTabStatus } from "@sparkle/ui";
 import type { WorkflowStageId } from "../engine/workflowStage";
+import type { BranchStatus } from "../services/branchStatus";
 import type { AgentGoal } from "../engine/agentGoal";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
@@ -424,6 +425,18 @@ interface Row {
   lastPrompt: string;
   /** This row's goal, if it has one. See {@link GOAL_STATES}. */
   goal?: AgentGoal;
+  /**
+   * This row's WORKTREE reading, seeded into `runtimeStore.branchStatus`.
+   *
+   * Omitted means "never polled", which is what the fixture used to be for every row — and that is
+   * exactly why the stage ladder's `local_none` rung could not be photographed (sparkle-biezi):
+   * `sectionOfRow` keeps an UNREAD row in `local_uncommitted` on purpose, so with no branchStatus
+   * seeded at all, a capture looked identical with the split present and absent.
+   *
+   * `dirtyFiles` is what lets a capture show the row NAMING what it holds rather than just
+   * asserting that it holds something.
+   */
+  worktree?: { dirty: boolean; dirtyFiles?: string[] };
 }
 
 /**
@@ -597,6 +610,40 @@ const ROWS: Row[] = [
     goal: GOAL_STATES.expired,
   },
   {
+    // THE `Local: Nothing Yet` ROW — agent 11a52157 itself, the one the founder asked about.
+    //
+    // "I don't know why it's still in local uncommitted." Spotless worktree, zero commits of its
+    // own, whole job was babysitting somebody else's PR. It demonstrates BOTH bugs on ONE row:
+    // `gitDerivedStage` maps its `ahead === 0` to `building_unsaved` (so it filed under a heading
+    // claiming its work was one close away from being lost), and its expired goal painted it red.
+    // After the fix it must render GRAY, under "Local: Nothing Yet".
+    id: "vfx-agent-9",
+    name: "Watch the roborev queue",
+    kind: "build",
+    parentId: null,
+    status: "idle",
+    elapsedMin: 140,
+    stage: "building_unsaved",
+    lastPrompt: "Keep an eye on the roborev queue and triage anything that lands",
+    goal: GOAL_STATES.expired,
+    worktree: { dirty: false },
+  },
+  {
+    // THE CONTROL FOR THAT SPLIT, and the row that photographs the other half of BUG 2. Same stage,
+    // same idle status — the ONE variable that differs is whether the tree actually holds anything.
+    // It must stay under "Local: Uncommitted" AND name what it is holding, so the capture shows the
+    // founder the difference he could not previously see without opening a terminal.
+    id: "vfx-agent-10",
+    name: "Retune the credit pill",
+    kind: "build",
+    parentId: null,
+    status: "idle",
+    elapsedMin: 12,
+    stage: "building_unsaved",
+    lastPrompt: "Nudge the credit pill's contrast against the flooded column",
+    worktree: { dirty: true, dirtyFiles: ["apps/desktop/src/components/CreditPill.tsx", "apps/desktop/src/theme/tokens.ts"] },
+  },
+  {
     // THE GOAL-LESS CONTROL, and it is a TOP-LEVEL BUILD row on purpose (roborev 57331). A control
     // has to differ from the rows it is compared against in the ONE variable under test, and every
     // goal above sits on a build row — so a goal-less WORKER could not serve: "has a goal" would be
@@ -654,6 +701,8 @@ export function buildVisualFixture(): {
   project: Project;
   status: Record<string, AgentTabStatus>;
   workflowStage: Record<string, WorkflowStageId>;
+  /** Per-row worktree readings, for the rows that declare one. See `Row.worktree`. */
+  branchStatus: Record<string, BranchStatus>;
 } {
   const iso = new Date(FIXTURE_NOW).toISOString();
   const project: Project = {
@@ -672,11 +721,33 @@ export function buildVisualFixture(): {
   };
   const status: Record<string, AgentTabStatus> = {};
   const workflowStage: Record<string, WorkflowStageId> = {};
+  const branchStatus: Record<string, BranchStatus> = {};
   for (const r of ROWS) {
     status[r.id] = r.status;
     workflowStage[r.id] = r.stage;
+    if (r.worktree) branchStatus[r.id] = fixtureBranchStatus(r.worktree);
   }
-  return { project, status, workflowStage };
+  return { project, status, workflowStage, branchStatus };
+}
+
+/** A minimal `BranchStatus` for a fixture row: only the fields the ladder and the chip read.
+ *
+ *  `worktreeOnBranch: true` is REQUIRED, not decoration — `uncommittedWorkEvidence` returns
+ *  `undefined` for a parked tree, so leaving it off would make every seeded row read "not looked up"
+ *  and put the fixture right back where it started. `ahead: 0` matches `building_unsaved`, the only
+ *  stage whose section this reading can change. */
+function fixtureBranchStatus(w: { dirty: boolean; dirtyFiles?: string[] }): BranchStatus {
+  return {
+    ahead: 0,
+    behind: 0,
+    dirty: w.dirty,
+    filesChanged: 0,
+    insertions: 0,
+    deletions: 0,
+    worktreeOnBranch: true,
+    dirtyFiles: w.dirtyFiles ?? [],
+    dirtyCount: w.dirtyFiles?.length ?? 0,
+  };
 }
 
 /**
@@ -854,7 +925,7 @@ export function applyVisualFixtures(
   if (!devBypassAuthEnabled(env)) return false;
   if (!visualFixturesRequested(search)) return false;
 
-  const { project, status, workflowStage } = buildVisualFixture();
+  const { project, status, workflowStage, branchStatus } = buildVisualFixture();
   // The second pair is OPT-IN (`?pairs=2`); see `visualPairCount` for why it cannot be the default.
   const left = visualPairCount(search) === 2 ? buildLeftPairFixture() : null;
   // The second TAB is a separate opt-in (`?projects=2`) on a separate axis — see
@@ -920,6 +991,11 @@ export function applyVisualFixtures(
     status: extras.reduce<Record<string, AgentTabStatus>>((all, e) => ({ ...all, ...e.status }), {
       ...status,
     }),
+    // SEEDED so the stage ladder can tell "holds nothing" from "we never looked" — without it
+    // `uncommittedWorkEvidence` answers `undefined` for every row and the `local_none` rung is
+    // unreachable in a capture (sparkle-biezi). Live-only, like `status`: branchStatus is not
+    // persisted, so it must be written on every boot.
+    branchStatus: { ...branchStatus },
     workflowStage: extras.reduce<Record<string, WorkflowStageId>>(
       (all, e) => ({ ...all, ...e.workflowStage }),
       { ...workflowStage },

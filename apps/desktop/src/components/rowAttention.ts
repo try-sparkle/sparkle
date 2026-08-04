@@ -29,7 +29,11 @@ import type { QuotaBlock } from "../engine/quotaBlock";
 import type { ThrashReport, ThrashVerdict } from "../engine/agentThrash";
 import type { AgentTabStatus } from "../types";
 import type { BranchStatus, WorkflowState } from "../services/branchStatus";
-import { unlandedWorkEvidence, type WorkflowStageId } from "../engine/workflowStage";
+import {
+  unlandedWorkEvidence,
+  uncommittedWorkEvidence,
+  type WorkflowStageId,
+} from "../engine/workflowStage";
 
 /** Everything the sidebar holds about one agent's git state, each field carrying its own "we never
  *  looked" arm. Passed as a bag rather than positionally so a future signal can be added without
@@ -78,22 +82,16 @@ function unlandedEvidence(ev: RowGitEvidence): boolean | undefined {
 }
 
 /**
- * Uncommitted changes in this agent's own worktree.
+ * Uncommitted changes in this agent's own worktree — DELEGATED to
+ * `engine/workflowStage.uncommittedWorkEvidence`.
  *
- * The `worktreeOnBranch === false` arm is the subtle one, and BranchStatus.dirty documents the rule
- * this follows: a parked tree's dirt belongs to whatever branch was checked out into it, so it is
- * not evidence about THIS agent's outstanding work. That makes it neither a stall cause nor proof
- * of a clean tree — which is precisely `undefined`. (The close-prompt reads the same field the
- * opposite way, on purpose: it asks a SAFETY question, "are there files at risk", and parking
- * carries them along. This asks an ATTRIBUTION question.)
- *
- * `worktreeOnBranch === undefined` is a Rust build predating the field, not a parked tree; it takes
- * the normal path, matching every other attribution consumer's `!== false` gate.
+ * The rule (and its parked-worktree arm) lives in the engine because the STAGE LADDER needs the same
+ * answer: `buildSections.sectionOfRow` uses it to tell "this row holds unsaved edits" from "nothing
+ * has happened here yet" (sparkle-biezi). Keeping a second copy here is how `unlandedWorkEvidence`
+ * previously let the sidebar and the control surface disagree about the same agent (roborev 55525).
  */
 function uncommittedEvidence(bs: BranchStatus | undefined): boolean | undefined {
-  if (bs === undefined) return undefined;
-  if (bs.worktreeOnBranch === false) return undefined;
-  return bs.dirty;
+  return uncommittedWorkEvidence(bs);
 }
 
 /** Assemble the stall question for one row. Pure; the clock and every fact arrive as arguments. */
@@ -164,11 +162,17 @@ export function stallChipFor(report: StallReport, bs?: BranchStatus | undefined)
   const more = report.causes.length - 1;
   const label = first === "uncommitted-changes" ? uncommittedLabel(bs) : STALL_CAUSE_LABEL[first];
   const text = `${label}${more > 0 ? ` +${more}` : ""}`;
+  const files = namedDirtyFiles(bs);
   return {
     text,
-    ariaLabel: `Stalled — ${text}`,
+    // The VISIBLE text may now be a bare filename (see `uncommittedLabel`), which on its own does not
+    // say what is wrong with it. The accessible name must, so it keeps the cause word.
+    ariaLabel:
+      first === "uncommitted-changes" && files.length > 0
+        ? `Stalled — uncommitted changes: ${text}`
+        : `Stalled — ${text}`,
     escalated: report.causes.includes("escalated-goal"),
-    files: namedDirtyFiles(bs),
+    files,
   };
 }
 
@@ -191,7 +195,14 @@ function uncommittedLabel(bs: BranchStatus | undefined): string {
   // The TRUE total, not the preview's length — Rust caps the preview at 5 but always counts them all.
   const total = bs?.dirtyCount ?? files.length;
   const rest = total - 1;
-  return `uncommitted: ${basename(head)}${rest > 0 ? ` +${rest}` : ""}`;
+  // JUST THE FILENAME — no "uncommitted:" prefix, and that is a deliberate reversal of the obvious
+  // wording. The chip is capped at 20ch and the row ALREADY carries an "Unsaved" stage badge plus
+  // this chip's own ⚠ icon and amber ink, so a prefix spends the scarce characters restating what
+  // two neighbouring affordances say and then truncates the ONE thing they cannot: which file.
+  // Photographed at the real column width, "uncommitted: CreditPill.tsx" renders as "uncommi…" —
+  // strictly worse than the bare label it replaced. The word survives in `ariaLabel` (what a screen
+  // reader announces) and in the tooltip, which is where the full paths already live.
+  return `${basename(head)}${rest > 0 ? ` +${rest}` : ""}`;
 }
 
 /**

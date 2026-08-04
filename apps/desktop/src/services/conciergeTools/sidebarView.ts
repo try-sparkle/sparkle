@@ -66,7 +66,13 @@ import {
   type StatusBand,
 } from "../../engine/buildSections";
 import { topLevelAgents } from "../../engine/agentOrdering";
-import { resolveStage, rollupStages, type WorkflowStageId } from "../../engine/workflowStage";
+import {
+  resolveStage,
+  rollupHoldsWork,
+  rollupStages,
+  uncommittedWorkEvidence,
+  type WorkflowStageId,
+} from "../../engine/workflowStage";
 import { bandOfRollup } from "../../engine/workerRollup";
 import { publishedStatusFor, rollupViewFor } from "../../useAttentionNotifications";
 import { openProjectTab } from "../openProjectTab";
@@ -327,6 +333,17 @@ function columnView(project: Project): ColumnView {
     return rollup ? rollup.stage : stageOf(id);
   };
 
+  // Rolled up over the SAME unfiltered bucket as `headStageOf`, and passed to `groupAgentsByStage`
+  // below for the same reason that function does: this view exists to tell the concierge what the
+  // column is showing, so a row it files under a different rung than the column does is a lie about
+  // the screen. `rollupHoldsWork` owns the precedence so this cannot fold it differently from
+  // AgentSidebar's copy.
+  const headHoldsWorkOf = (id: string): boolean | undefined =>
+    rollupHoldsWork([
+      uncommittedWorkEvidence(rt.branchStatus[id]),
+      ...(kids.get(id) ?? []).map((w) => uncommittedWorkEvidence(rt.branchStatus[w.id])),
+    ]);
+
   const mode = ui.workModeBySide[scopedSide()];
   const bands = ui.statusFilter;
   const topLevel = topLevelAgents(agents, mode);
@@ -344,6 +361,7 @@ function columnView(project: Project): ColumnView {
     (id) => status[id] ?? "stopped",
     bands,
     bandOf,
+    headHoldsWorkOf,
   ).map((g) => ({ id: g.id, rows: g.rows }));
 
   return {

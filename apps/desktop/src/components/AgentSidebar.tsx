@@ -152,7 +152,15 @@ import { FittedAgentName, AGENT_NAME_FONT_SIZE, rowTitleWeight } from "./FittedA
 import { ModelPill } from "./ModelPill";
 import { applyModelToRunningAgent } from "../services/agentModel";
 import { WorkflowLine } from "./WorkflowLine";
-import { resolveStage, rollupStages, stageFraction, stageIndex, stageMeta } from "../engine/workflowStage";
+import {
+  resolveStage,
+  rollupHoldsWork,
+  rollupStages,
+  stageFraction,
+  stageIndex,
+  stageMeta,
+  uncommittedWorkEvidence,
+} from "../engine/workflowStage";
 import type { WorkflowStageId } from "../engine/workflowStage";
 import { useNewAgent } from "../hooks/useNewAgent";
 import { NewAgentRuntimeToggle } from "./NewAgentRuntimeToggle";
@@ -1250,12 +1258,22 @@ export function AgentSidebar({
         return rollup ? rollup.stage : stageFor(id);
       };
       const published = publishedStatusFor(agents, rt.status, new Set(rt.openAgentIds), rt.lastObserved, stageFor);
+      // The SAME subtree fold the column uses (headHoldsWorkOf). `local_none` sorts above
+      // `local_uncommitted`, so omitting this here would compute a different first row than the one
+      // rendered — the drift roborev 53411/53428/53439/53440 kept finding, reached through the
+      // section axis rather than the band axis.
+      const headHoldsWorkFor = (id: string): boolean | undefined =>
+        rollupHoldsWork([
+          uncommittedWorkEvidence(rt.branchStatus[id]),
+          ...agents.filter((a) => a.parentId === id).map((w) => uncommittedWorkEvidence(rt.branchStatus[w.id])),
+        ]);
       return firstLadderRowId(
         agents,
         forMode,
         headStageFor,
         (id) => published[id] ?? "stopped",
         useUiStore.getState().statusFilter,
+        headHoldsWorkFor,
       );
     },
     [],
@@ -1925,6 +1943,22 @@ export function AgentSidebar({
     [childrenByParent, branchStatus, workflowStage],
   );
 
+  // Does this row's SUBTREE hold anything uncommitted? Rolled up exactly like `headStageOf` above,
+  // and for the reason that comment gives: the head is bucketed by its least-advanced worker, so
+  // answering from its own tree alone would file a head under "Local: Nothing Yet" while the bar on
+  // that same row showed a worker mid-edit. `rollupHoldsWork` owns the precedence
+  // (true > undefined > false) so this and `firstRenderedRowId` cannot fold it differently.
+  const headHoldsWorkOf = useCallback(
+    (id: string): boolean | undefined => {
+      const kids = childrenByParent.get(id) ?? [];
+      return rollupHoldsWork([
+        uncommittedWorkEvidence(branchStatus[id]),
+        ...kids.map((w) => uncommittedWorkEvidence(branchStatus[w.id])),
+      ]);
+    },
+    [childrenByParent, branchStatus],
+  );
+
   // THE ONE ROLLUP. Every surface that asks "what color is this row, and which chip finds it?" goes
   // through here: the disc in renderRow, the ladder's filter, and the chip counts. The stage-ladder
   // work already recorded that this column has THREE places that independently know how to build
@@ -1962,9 +1996,10 @@ export function AgentSidebar({
             (id) => effectiveStatus[id] ?? "stopped",
             statusFilter,
             rowBandOf,
+            headHoldsWorkOf,
           )
         : [],
-    [project, effectiveStatus, mode, headStageOf, statusFilter, rowBandOf],
+    [project, effectiveStatus, mode, headStageOf, statusFilter, rowBandOf, headHoldsWorkOf],
   );
   // The flat rendered order, used for the empty-state check and by anything that needs "the rows,
   // top to bottom" without caring about section boundaries.

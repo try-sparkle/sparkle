@@ -6,6 +6,7 @@ import {
   bandOfStatus,
   flattenSections,
   groupAgentsByStage,
+  sectionOfRow,
   sectionOfStage,
   type StatusBand,
 } from "./buildSections";
@@ -40,6 +41,9 @@ describe("the stage ladder", () => {
 
   it("orders the sections Local-first, then Remote", () => {
     expect(BUILD_SECTIONS.map((s) => s.id)).toEqual([
+      // `local_none` is FIRST — least advanced of all. A row that holds nothing has not started, so
+      // it sorts above one holding unsaved edits (sparkle-biezi).
+      "local_none",
       "local_uncommitted",
       "local_committed",
       "local_merged",
@@ -287,5 +291,78 @@ describe("grouping rows into sections", () => {
     // Identity, not just equality: selection is tracked by id and re-renders key off object identity.
     expect(flat[0]).toBe(a);
     expect(flat[1]).toBe(b);
+  });
+});
+
+describe("sectionOfRow — a row that holds NOTHING is not 'Uncommitted' (sparkle-biezi)", () => {
+  // The founder, on agent 11a52157: "I don't know why it's still in local uncommitted." Its
+  // worktree was spotless and it had authored zero commits — it babysat somebody else's PR. But
+  // `gitDerivedStage` maps `ahead === 0` to `building_unsaved` whether or not the tree is dirty, so
+  // it filed under a heading that says its work is one close away from being lost.
+
+  it("routes a positively-read EMPTY worktree to `local_none`", () => {
+    expect(sectionOfRow("building_unsaved", false)).toBe("local_none");
+  });
+
+  it("leaves a genuinely DIRTY worktree in `local_uncommitted`", () => {
+    // The heading's claim ("closing this agent loses them") has to stay true of everything left in
+    // it, which is the whole reason the split was worth making.
+    expect(sectionOfRow("building_unsaved", true)).toBe("local_uncommitted");
+  });
+
+  it("keeps an UNREAD worktree in `local_uncommitted` — absence of evidence earns nothing", () => {
+    // The load-bearing arm. `undefined` means "never polled" or "parked tree, dirt not ours". If it
+    // fell through to `local_none` the column would tell the founder "nothing here is at risk"
+    // about a row nobody had looked at — the same false claim as before, pointing the other way.
+    expect(sectionOfRow("building_unsaved", undefined)).toBe("local_uncommitted");
+  });
+
+  it("splits the pre-build planning stages the same way", () => {
+    for (const stage of ["thought", "specd", "planned"] as const) {
+      expect(sectionOfRow(stage, false)).toBe("local_none");
+      expect(sectionOfRow(stage, true)).toBe("local_uncommitted");
+      expect(sectionOfRow(stage, undefined)).toBe("local_uncommitted");
+    }
+  });
+
+  it("NEVER re-routes a row that has committed work, whatever its tree says", () => {
+    // Only the `local_uncommitted` rung is ambiguous. Every other stage means commits exist, so the
+    // worktree's cleanliness says nothing about which rung the row belongs on — and a `merged` row
+    // landing in "Nothing Yet" because its tree happens to be clean would be a far worse lie than
+    // the one this fixes.
+    for (const stage of ["building_saved", "pushed", "pull_request", "merged_local", "merged", "shipped"] as const) {
+      for (const holds of [true, false, undefined]) {
+        expect(sectionOfRow(stage, holds)).toBe(sectionOfStage(stage));
+      }
+    }
+  });
+
+  it("groupAgentsByStage without the accessor behaves exactly as before", () => {
+    // Back-compat is the reason the parameter is optional: a caller with no worktree reading must
+    // not be forced to invent one, and omitting it must not quietly move rows.
+    const agents = [{ id: "a" }, { id: "b" }];
+    const groups = groupAgentsByStage(
+      agents,
+      () => "building_unsaved",
+      () => "idle",
+      allBandsVisible(),
+    );
+    expect(groups.map((g) => g.id)).toEqual(["local_uncommitted"]);
+  });
+
+  it("groupAgentsByStage splits one bucket into two when the accessor disagrees per row", () => {
+    const agents = [{ id: "empty" }, { id: "dirty" }, { id: "unread" }];
+    const groups = groupAgentsByStage(
+      agents,
+      () => "building_unsaved",
+      () => "idle",
+      allBandsVisible(),
+      undefined,
+      (id) => (id === "empty" ? false : id === "dirty" ? true : undefined),
+    );
+    expect(groups.map((g) => g.id)).toEqual(["local_none", "local_uncommitted"]);
+    expect(groups[0]?.rows.map((r) => r.id)).toEqual(["empty"]);
+    // The unread row rides with the dirty one — conservative, and input order is preserved.
+    expect(groups[1]?.rows.map((r) => r.id)).toEqual(["dirty", "unread"]);
   });
 });

@@ -99,6 +99,61 @@ export function hasUnmergedCommittedWork(stage: WorkflowStageId): boolean {
   return idx >= stageIndex("building_saved") && idx < stageIndex("merged");
 }
 
+/**
+ * Uncommitted changes in this agent's own worktree. `true` / `false` / `undefined` ("not looked up").
+ *
+ * ONE IMPLEMENTATION, THREE SURFACES. This lived privately in `components/rowAttention` while the
+ * stage ladder had no opinion at all, and it now has to answer for the ladder too (sparkle-biezi):
+ * `sectionOfRow` needs it to tell "this row holds unsaved edits" from "nothing has happened here".
+ * `rowAttention.uncommittedEvidence` delegates here rather than keeping its own copy, for the same
+ * reason `unlandedWorkEvidence` was hoisted (roborev 55525) — two copies of an evidence rule is how
+ * the sidebar and the control surface came to disagree about the same agent at the same moment.
+ *
+ * The `worktreeOnBranch === false` arm is the subtle one, and `BranchStatus.dirty` documents the rule
+ * it follows: a PARKED tree's dirt belongs to whatever branch was checked out into it, so it is not
+ * evidence about THIS agent's work. That makes it neither proof of dirt nor proof of a clean tree —
+ * which is precisely `undefined`. (The close-prompt reads the same field the opposite way on purpose:
+ * it asks a SAFETY question, "are there files at risk", and parking carries them along. This asks an
+ * ATTRIBUTION question.)
+ *
+ * `worktreeOnBranch === undefined` is a Rust build predating the field, not a parked tree; it takes
+ * the normal path, matching every other attribution consumer's `!== false` gate.
+ */
+export function uncommittedWorkEvidence(bs?: BranchStatus | undefined): boolean | undefined {
+  if (bs === undefined) return undefined;
+  if (bs.worktreeOnBranch === false) return undefined;
+  return bs.dirty;
+}
+
+/**
+ * Fold a head row's own "holds work?" reading together with its workers' — the same roll-up
+ * `rollupStages` performs for the stage, in the same direction.
+ *
+ * WHY THE HEAD MUST ASK ITS WORKERS AT ALL. The ladder buckets an orchestrator by its LEAST-advanced
+ * worker, so a head whose worker is mid-edit already sits at `building_unsaved`. If this answered
+ * from the head's OWN tree alone it would report `false` for that head, `sectionOfRow` would file it
+ * under "Local: Nothing Yet — nothing here is at risk", and the progress bar on that very row would
+ * simultaneously show a worker holding uncommitted files. Two adjacent signals contradicting each
+ * other is the failure the ladder's own comment (AgentSidebar, `headStageOf`) was written about.
+ *
+ * PRECEDENCE, and it is deliberately NOT a majority: `true` beats `undefined` beats `false`.
+ *   • any `true`      → something, somewhere in this subtree, is at risk. Say so.
+ *   • any `undefined` → we did not read part of this subtree, so we cannot claim it is empty.
+ *   • all `false`     → positively read, genuinely nothing.
+ * Only the last one earns the calm heading, which is the same "absence of evidence is not evidence
+ * of absence" rule every other accessor in this file follows.
+ */
+export function rollupHoldsWork(
+  values: readonly (boolean | undefined)[],
+): boolean | undefined {
+  let sawUnknown = false;
+  for (const v of values) {
+    if (v === true) return true;
+    if (v === undefined) sawUnknown = true;
+  }
+  return sawUnknown ? undefined : false;
+}
+
 /** The git facts an "is there unlanded work?" question needs, each with its own "we never looked" arm. */
 export interface UnlandedInputs {
   /** `runtimeStore.branchStatus[id]` — ahead/behind/dirty. Absent until the first poll lands. */

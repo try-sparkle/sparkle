@@ -14,6 +14,8 @@ import {
   stageLineColor,
   LINE_FROM,
   LINE_TO,
+  rollupHoldsWork,
+  uncommittedWorkEvidence,
 } from "./workflowStage";
 import type { BranchStatus, WorkflowState } from "../services/branchStatus";
 
@@ -465,5 +467,61 @@ describe("worker rollup: local parent vs origin parent", () => {
         parentOnOriginMain: true,
       }),
     ).toBe("building_unsaved");
+  });
+});
+
+describe("rollupHoldsWork — a head answers for its whole subtree (sparkle-biezi)", () => {
+  it("reports TRUE when anything in the subtree is dirty", () => {
+    // The case that makes the roll-up necessary at all: the ladder buckets a head by its
+    // LEAST-advanced worker, so a head whose worker is mid-edit already sits at `building_unsaved`.
+    // Answering from the head's own clean tree would file it under "Nothing Yet — nothing here is
+    // at risk" while the bar on that same row showed a worker holding uncommitted files.
+    expect(rollupHoldsWork([false, true, false])).toBe(true);
+    expect(rollupHoldsWork([true])).toBe(true);
+  });
+
+  it("TRUE outranks UNKNOWN — a known risk is not softened by an unread sibling", () => {
+    expect(rollupHoldsWork([undefined, true])).toBe(true);
+  });
+
+  it("UNKNOWN outranks FALSE — a partly-unread subtree cannot be called empty", () => {
+    // The conservative arm, and the one worth pinning: if this returned `false` the row would earn
+    // the calm heading on the strength of a lookup nobody performed.
+    expect(rollupHoldsWork([false, undefined, false])).toBe(undefined);
+  });
+
+  it("reports FALSE only when EVERY member was positively read and empty", () => {
+    expect(rollupHoldsWork([false, false, false])).toBe(false);
+    expect(rollupHoldsWork([false])).toBe(false);
+  });
+
+  it("an empty subtree is FALSE — a childless head speaks only for itself", () => {
+    // Reached via [ownEvidence, ...noKids], so the array is never truly empty in production; pinned
+    // so the identity element cannot drift to `undefined` and strand every childless row.
+    expect(rollupHoldsWork([])).toBe(false);
+  });
+});
+
+describe("uncommittedWorkEvidence — attribution, not safety", () => {
+  const BS = { ahead: 0, behind: 0, dirty: false, filesChanged: 0, insertions: 0, deletions: 0 };
+
+  it("is undefined when nothing was polled", () => {
+    expect(uncommittedWorkEvidence(undefined)).toBe(undefined);
+  });
+
+  it("reports a dirty on-branch tree as this agent's work", () => {
+    expect(uncommittedWorkEvidence({ ...BS, dirty: true })).toBe(true);
+    expect(uncommittedWorkEvidence({ ...BS, dirty: true, worktreeOnBranch: true })).toBe(true);
+  });
+
+  it("declines a PARKED tree's dirt — neither dirty nor proof of clean", () => {
+    // A parked tree holds whatever branch was checked out into it, so its dirt is not attributable
+    // here. `undefined` (not `false`) is what keeps `sectionOfRow` from calling such a row empty.
+    expect(uncommittedWorkEvidence({ ...BS, dirty: true, worktreeOnBranch: false })).toBe(undefined);
+    expect(uncommittedWorkEvidence({ ...BS, dirty: false, worktreeOnBranch: false })).toBe(undefined);
+  });
+
+  it("reports a clean on-branch tree as positively empty", () => {
+    expect(uncommittedWorkEvidence(BS)).toBe(false);
   });
 });

@@ -16,6 +16,7 @@ import { type WorkflowStageId } from "./workflowStage";
 
 // ── The ladder ───────────────────────────────────────────────────────────────────────────────
 export type BuildSectionId =
+  | "local_none"
   | "local_uncommitted"
   | "local_committed"
   | "local_merged"
@@ -46,28 +47,39 @@ export interface BuildSectionMeta {
 // tell a user their work is at risk when it is sitting safely on the remote.
 export const BUILD_SECTIONS: readonly BuildSectionMeta[] = [
   {
+    // THE ROW THAT HOLDS NOTHING — split out of `local_uncommitted` (sparkle-biezi).
+    //
+    // The founder, on agent 11a52157: "I don't know why it's still in local uncommitted. If it's in
+    // merged-to-main as it claims to be..." Its worktree was SPOTLESS and it had authored ZERO
+    // commits — it babysat somebody else's PR. `gitDerivedStage` reads `ahead === 0` as
+    // `building_unsaved` whether or not the tree is dirty, so it filed under a heading that says its
+    // work is one close away from being lost. There was nothing to lose.
+    //
+    // This rung is where a row goes when we have POSITIVELY READ its worktree and found nothing:
+    // no commits, no uncommitted files. A row whose git state was never read, or whose tree is
+    // parked (so its dirt is another branch's), stays in `local_uncommitted` — see `sectionOfRow`.
+    // Absence of evidence does not earn the calmer heading.
+    id: "local_none",
+    label: "Local: Nothing Yet",
+    detail: "No commits and no edits in the working tree — nothing here is at risk.",
+  },
+  {
     id: "local_uncommitted",
     label: "Local: Uncommitted",
-    // ⚠️ THIS RUNG IS A CATCH-ALL, SO ITS COPY MUST NOT ASSERT WHAT ONLY HALF OF IT MEANS.
-    // `sectionOfStage` folds FOUR stages in here — thought / specd / planned / building_unsaved —
-    // and `gitDerivedStage` returns `building_unsaved` for `ahead === 0` REGARDLESS of `dirty`. So
-    // this section holds two different rows: one with unsaved edits at risk, and one where nothing
-    // has happened yet at all.
+    // THIS COPY IS ONLY HONEST BECAUSE `local_none` EXISTS. `sectionOfStage` folds four stages in
+    // here — thought / specd / planned / building_unsaved — and `gitDerivedStage` returns
+    // `building_unsaved` for `ahead === 0` REGARDLESS of `dirty`, so this rung used to hold BOTH a
+    // row with unsaved edits at risk AND a row where nothing had happened at all, while asserting
+    // the first about both (sparkle-biezi). `sectionOfRow` now routes the second kind to
+    // `local_none`, which is what lets this sentence make a definite claim again.
     //
-    // It used to read "Changes exist only in the working tree — closing this agent loses them." That
-    // is FALSE for the second kind, and it is the scariest copy in the column. Observed on agent
-    // 11a52157 (sparkle-biezi): spotless worktree, zero commits of its own, its whole job was
-    // babysitting somebody else's PR — and the column told the founder that closing it would lose
-    // work. Compounded with the false red from the expired goal, the row read "broken AND unsaved"
-    // about an agent that was finished.
-    //
-    // WHICH ROW IS WHICH IS ANSWERED ON THE ROW, NOT HERE: a genuinely dirty row carries the
-    // "uncommitted: <file>" chip (rowAttention.stallChipFor), naming what it is holding. A row with
-    // no chip is the "nothing yet" kind. The section says what is true of BOTH; the chip says what
-    // is true of ONE. Do not restore a sentence here that only one of them can honour.
-    detail:
-      "Nothing committed to a branch yet. Any edits in the working tree are lost if this agent " +
-      "closes — the row names them when there are any.",
+    // Keep the two in step: if you ever widen what lands here, widen `sectionOfRow` too or soften
+    // this line back to something true of every member. A row that reads "closing this agent loses
+    // them" while holding nothing is the scariest copy in the column, and it was live for months.
+    // WHICH files are at risk is answered ON THE ROW, by the "uncommitted: <file>" chip
+    // (rowAttention.stallChipFor) — a heading cannot name them, and a claim nobody can act on is
+    // what sent the founder to a terminal to check.
+    detail: "Edits exist only in the working tree — closing this agent loses them.",
   },
   {
     id: "local_committed",
@@ -145,6 +157,40 @@ export function sectionOfStage(stage: WorkflowStageId): BuildSectionId {
     case "shipped":
       return "remote_shipped";
   }
+}
+
+/**
+ * The section a ROW belongs in — the stage, plus the one fact the stage cannot carry.
+ *
+ * `sectionOfStage` is a pure function of the stage and stays that way: every other rung is decided
+ * by how far the work got, which is exactly what a stage IS. This wrapper exists for the single
+ * place that is not true (sparkle-biezi): `gitDerivedStage` maps `ahead === 0` to
+ * `building_unsaved` whether the tree is dirty or spotless, so "I have unsaved edits" and "nothing
+ * has happened here" arrive wearing the same stage. Only a worktree reading can separate them, and
+ * a stage never carries one.
+ *
+ * `holdsWork` is that reading, and its THREE-VALUED-NESS is the whole contract:
+ *   • `true`      — dirty, attributable to this branch → `local_uncommitted`, as before.
+ *   • `false`     — positively read and genuinely empty → `local_none`.
+ *   • `undefined` — never polled, or a PARKED tree whose dirt belongs to another branch →
+ *                   `local_uncommitted`, as before.
+ *
+ * That last arm is the one to preserve. "We did not look" must never buy the calmer heading: this
+ * whole area exists because a row claimed something about work it had not checked, and defaulting an
+ * unread row to "nothing here is at risk" would be the same lie pointing the other way. Feed it
+ * `engine/workflowStage.uncommittedWorkEvidence`, which already returns exactly these three values
+ * and already applies the parked-worktree gate.
+ *
+ * Only the `local_uncommitted` rung is ever re-routed. A row at any other stage has committed work
+ * by definition, so its worktree's cleanliness says nothing about which rung it belongs on.
+ */
+export function sectionOfRow(
+  stage: WorkflowStageId,
+  holdsWork: boolean | undefined,
+): BuildSectionId {
+  const section = sectionOfStage(stage);
+  if (section !== "local_uncommitted") return section;
+  return holdsWork === false ? "local_none" : section;
 }
 
 // NOTE: an `isLocalOnlyMerge(stage)` helper was removed here. It claimed a row at `merged_local`
@@ -252,11 +298,25 @@ export function groupAgentsByStage<T extends { id: string }>(
    *  consistently, though, since a caller whose dot and filter disagree is the bug this exists to
    *  prevent. */
   bandOf: (id: string) => StatusBand = (id) => bandOfStatus(statusOf(id)),
+  /** Does this row's worktree hold anything? `undefined` = not looked up (or parked). Only consulted
+   *  for rows that would land in `local_uncommitted` — see {@link sectionOfRow}.
+   *
+   *  OPTIONAL, and omitting it reproduces the pre-sparkle-biezi behaviour exactly: every such row
+   *  stays in `local_uncommitted`. That is deliberate rather than lazy — a caller with no worktree
+   *  reading must not be forced to invent one, and the default is the conservative arm.
+   *
+   *  ⚠️ BUT PASS IT CONSISTENTLY. This changes which SECTION a row lands in, and therefore the
+   *  flattened row ORDER (`local_none` sorts above `local_uncommitted`). Two callers that disagree
+   *  produce two different orders for the same fleet — which is precisely the drift that made
+   *  `firstLadderRowId` hand selection to a row the column was not rendering (roborev 53858). The
+   *  three production callers (AgentSidebar, ladderSelection, conciergeTools/sidebarView) all derive
+   *  it from `runtimeStore.branchStatus` through the same `uncommittedWorkEvidence`. */
+  holdsWorkOf?: (id: string) => boolean | undefined,
 ): BuildSectionGroup<T>[] {
   const buckets = new Map<BuildSectionId, T[]>();
   for (const agent of agents) {
     if (!visibleBands[bandOf(agent.id)]) continue;
-    const section = sectionOfStage(stageOf(agent.id));
+    const section = sectionOfRow(stageOf(agent.id), holdsWorkOf?.(agent.id));
     const arr = buckets.get(section);
     if (arr) arr.push(agent);
     else buckets.set(section, [agent]);
