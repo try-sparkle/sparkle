@@ -146,6 +146,20 @@ const lastSeen = new Map<string, AgentFingerprint>();
  */
 const lastAskedAt = new Map<string, number>();
 
+/**
+ * Test seam: forget both per-agent maps.
+ *
+ * REQUIRED IN `beforeEach`, not optional hygiene. These maps are module-level and outlive a test, so
+ * without this a case inherits another's stamps — and the failure is not a red test, it is a GREEN
+ * one passing for the wrong reason: a stamp taken with the real clock makes `now - askedAt` hugely
+ * negative under a faked clock, and an assertion about first contact then holds only because leaked
+ * fingerprint state happened to manufacture a "change" (roborev 57711).
+ */
+export function _resetRequeryMemoryForTests(): void {
+  lastSeen.clear();
+  lastAskedAt.clear();
+}
+
 interface AgentFingerprint {
   status: AgentTabStatus;
   goalMetAt: number | undefined;
@@ -221,20 +235,6 @@ function looksTerminal(f: AgentFingerprint): boolean {
  * gave us, or lead with what changed. All of it is arithmetic and string comparison — no model call,
  * which is what keeps this working during the outages it most needs to survive.
  */
-/**
- * Test seam: forget both per-agent maps.
- *
- * REQUIRED IN `beforeEach`, not optional hygiene. These maps are module-level and outlive a test, so
- * without this a case inherits another's stamps — and the failure is not a red test, it is a GREEN
- * one passing for the wrong reason: a stamp taken with the real clock makes `now - askedAt` hugely
- * negative under a faked clock, and an assertion about first contact then holds only because leaked
- * fingerprint state happened to manufacture a "change" (roborev 57711).
- */
-export function _resetRequeryMemoryForTests(): void {
-  lastSeen.clear();
-  lastAskedAt.clear();
-}
-
 export async function requeryOpenAgents(): Promise<void> {
   const { projects } = useProjectStore.getState();
 
