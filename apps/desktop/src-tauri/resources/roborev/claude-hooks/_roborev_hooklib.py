@@ -635,7 +635,23 @@ def open_fail_backlog(db_path: Path = ROBOREV_DB) -> list[dict] | None:
     return [dict(r) for r in rows if not _is_ephemeral_repo(r["root_path"])]
 
 
-def format_backlog_summary(backlog: list[dict]) -> str:
+# How much of the machine-wide backlog the PUSH-TIME notice is allowed to print.
+# The full list belongs to `roborev-list-all.py`, which is what an agent runs when
+# it has decided to sweep; the push-time surface only has to make the backlog's
+# SIZE visible and point at the rows this repo can actually act on. Unbounded, it
+# grew to 340+ findings over 140+ branches — a wall of text that buries the one
+# line that matters (the pushed branch is clean), so nobody read any of it.
+BACKLOG_NOTICE_MAX_ROWS = 8
+BACKLOG_NOTICE_MAX_IDS = 6
+
+
+def format_backlog_summary(
+    backlog: list[dict],
+    *,
+    current_roots: set[str] | None = None,
+    max_rows: int | None = None,
+    max_ids: int | None = None,
+) -> str:
     """Render `open_fail_backlog()` output as a compact `repo  branch  count/ids`
     block for the pre-push gate's non-blocking surface, plus the active-vs-stale
     cleanup nudge. Groups by (root_path, branch) — keyed on ROOT, not repo name,
@@ -643,7 +659,18 @@ def format_backlog_summary(backlog: list[dict]) -> str:
     pattern) stay distinct rather than collapsing into one row. The pushed branch
     is deliberately NOT marked: this only runs once the gate has confirmed the
     pushed (repo, branch) has zero open FAILs (it denies otherwise), so the pushed
-    branch can never appear in this backlog — there's nothing to mark."""
+    branch can never appear in this backlog — there's nothing to mark.
+
+    `max_rows` / `max_ids` bound the printed body (the HEADER always reports the
+    true machine-wide totals, so truncation can never understate the backlog).
+    `current_roots` are the repo roots of the checkout being pushed — its rows
+    sort FIRST, because those are the branches this session can actually sweep;
+    everything else is someone else's clone. Rows beyond the cap collapse into a
+    single tail line naming what was withheld and where to read it in full.
+
+    All three default to None = unbounded, which is the exact pre-cap output —
+    `roborev-list-all.py` is the deliberate "show me everything" surface and must
+    keep printing every row."""
     groups: dict[tuple[str, str], list[int]] = {}
     display_name: dict[tuple[str, str], str] = {}
     for row in backlog:
@@ -656,9 +683,33 @@ def format_backlog_summary(backlog: list[dict]) -> str:
         "push is NOT blocked by other branches):",
         "",
     ]
-    for (root_path, branch), ids in groups.items():
-        id_list = ", ".join(f"#{i}" for i in ids)
-        lines.append(f"  {display_name[(root_path, branch)]}  {branch}  ({len(ids)}) {id_list}")
+
+    shown = list(groups.items())
+    if max_rows is not None and len(shown) > max_rows:
+        roots = current_roots or set()
+        # This repo first, then the heaviest branches; (repo, branch) breaks ties
+        # so the notice is stable across pushes rather than reshuffling.
+        shown.sort(key=lambda kv: (kv[0][0] not in roots, -len(kv[1]), kv[0]))
+        hidden = shown[max_rows:]
+        shown = shown[:max_rows]
+        hidden_ids = sum(len(ids) for _, ids in hidden)
+    else:
+        hidden, hidden_ids = [], 0
+
+    for (root_path, branch), ids in shown:
+        listed = ids if max_ids is None else ids[:max_ids]
+        id_list = ", ".join(f"#{i}" for i in listed)
+        if len(listed) < len(ids):
+            id_list += f", +{len(ids) - len(listed)} more"
+        here = "  <- this repo" if current_roots and root_path in current_roots else ""
+        lines.append(
+            f"  {display_name[(root_path, branch)]}  {branch}  ({len(ids)}) {id_list}{here}"
+        )
+    if hidden:
+        lines.append(
+            f"  … and {len(hidden)} more branch(es) holding {hidden_ids} finding(s) "
+            "— `~/.config/roborev/claude-hooks/roborev-list-all.py` prints them all."
+        )
     lines += [
         "",
         "Sweep the STALE ones while you're here: open them with "

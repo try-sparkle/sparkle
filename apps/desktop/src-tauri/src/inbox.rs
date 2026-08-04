@@ -198,7 +198,18 @@ pub fn claims_dir(app_data: &Path, agent_id: &str) -> PathBuf {
 /// `create_new` maps to `O_CREAT | O_EXCL`, which the kernel guarantees is atomic — so when the
 /// `Stop` hook (a separate node process) and the app race to deliver the same message, exactly one
 /// of them gets `true` and the other gets `false`. Nothing else in this module needs a lock.
+///
+/// The MESSAGE id gets the same sink-side check the AGENT id gets — see [`refuse_escape`], whose
+/// argument applies here unchanged. `claims.join(id)` is a path join over a value this module does
+/// not mint: ids arrive by parsing the messages JSONL, and `read_jsonl` will happily hand back a
+/// record whose `id` is `../../../../something`. Every other path join in this module is guarded and
+/// this pair was not, so a record like that reached the filesystem OUTSIDE the claims dir — creating
+/// a file there via `create_new`, and probing for one via `is_claimed`. Fails closed: an id that
+/// cannot be a claim file name is never claimed and so is never delivered.
 pub fn claim(claims: &Path, id: &str) -> bool {
+    if refuse_escape("claim", id) {
+        return false;
+    }
     if std::fs::create_dir_all(claims).is_err() {
         return false;
     }
@@ -209,7 +220,21 @@ pub fn claim(claims: &Path, id: &str) -> bool {
         .is_ok()
 }
 
+/// Fails closed as ALREADY CLAIMED for an id that would escape the claims dir.
+///
+/// `true` is the safe answer for two of the three callers. `pending` filters claimed messages out,
+/// so such a record drops out of the delivery set instead of being offered to a claimant that
+/// `claim` would then refuse anyway — the two functions agree about the same record rather than
+/// looping over one they disagree on. `retention::reap_inbox` treats claimed as reapable, which is
+/// also right: nothing will ever deliver it.
+///
+/// The third caller, `status_of`, is the one this answer does NOT suit — `true` there would count
+/// the record as `delivered` and strand `awaiting_ack` at >= 1 forever. It therefore skips such a
+/// record before asking, rather than reinterpreting this boolean; see the comment at that call.
 pub fn is_claimed(claims: &Path, id: &str) -> bool {
+    if refuse_escape("is_claimed", id) {
+        return true;
+    }
     claims.join(id).exists()
 }
 
@@ -406,6 +431,19 @@ pub fn status_of(app_data: &Path, agent_id: &str, now: i64) -> InboxStatus {
     let mut pending_ids = Vec::new();
     let (mut pending_n, mut delivered, mut acknowledged) = (0u32, 0u32, 0u32);
     for m in &msgs {
+        // A record whose id cannot be a claim file name is counted in NO column.
+        //
+        // `is_claimed` fails closed to `true` for such an id, which is right for `pending` (the
+        // record drops out of the delivery set) and wrong here: `true` would land it in `delivered`,
+        // and `awaiting_ack` is `delivered - acknowledged`, so it would sit at >= 1 for the life of
+        // the record — the expiry check below is only reached on the `else`, and no ack can ever
+        // arrive for a message that is undeliverable by construction. That is a permanent phantom
+        // "this agent is not reaching turn boundaries" signal to the concierge, which is the exact
+        // failure shape `retention` documents as unacceptable. Skipping is the honest answer: the
+        // record is not pending, and it was never delivered.
+        if refuse_escape("status_of record", &m.id) {
+            continue;
+        }
         let expired = now.saturating_sub(m.ts) > MAX_AGE_MS;
         let claimed = is_claimed(&claims, &m.id);
         if acked.contains(m.id.as_str()) {
@@ -886,6 +924,75 @@ mod tests {
                 "a batch containing {bad:?} must be refused whole, not partly served"
             );
         }
+    }
+
+    /// The claim sinks take the MESSAGE id — the one path join in this module that was unguarded —
+    /// and must not touch the filesystem outside the claims dir.
+    ///
+    /// Asserts the side effect, not the validator: the test names the exact file an unguarded
+    /// `claim` creates (`<claims>/../escaped`) and asserts it does not appear. Removing either
+    /// `refuse_escape` makes that file exist and flips the assertion, so this cannot pass on the
+    /// pre-fix code. The message id is untrusted for the same reason the agent id is — it is parsed
+    /// back out of the JSONL by `read_jsonl`, which imposes no shape on the `id` field — so the
+    /// fixture plants such a record and drives it through `pending`, the real caller.
+    #[test]
+    fn the_claim_sinks_refuse_a_traversal_message_id_and_write_nothing_outside_the_claims_dir() {
+        let base = tmp("claim-escape");
+        let claims = claims_dir(&base, "a1");
+        std::fs::create_dir_all(&claims).unwrap();
+        let escaped = claims.join("..").join("escaped");
+
+        assert!(!claim(&claims, "../escaped"), "a traversal-shaped id must not be claimable");
+        assert!(
+            !escaped.exists(),
+            "claim wrote {} — a message id reached a path join outside the claims dir",
+            escaped.display()
+        );
+        assert!(
+            is_claimed(&claims, "../escaped"),
+            "a traversal-shaped id must read as already-claimed so it is never delivered"
+        );
+
+        // Positive control: the guard is what refuses above, not a broken fixture — a well-formed id
+        // claims once, creates its marker INSIDE the claims dir, and then reads as claimed.
+        assert!(claim(&claims, "m1"), "a well-formed id must still claim");
+        assert!(claims.join("m1").exists());
+        assert!(is_claimed(&claims, "m1"));
+        assert!(!claim(&claims, "m1"), "the second claimant must still lose");
+
+        // And through the real caller: a planted record whose id would escape is not offered for
+        // delivery, while a normal record beside it still is.
+        let line = |id: &str| {
+            serde_json::to_string(&InboxMessage {
+                id: id.into(),
+                ts: 1_000,
+                from: "concierge".into(),
+                text: "x".into(),
+                severity: Severity::Fyi,
+            })
+            .unwrap()
+        };
+        std::fs::write(messages_path(&base, "a2"), format!("{}\n{}\n", line("../escaped2"), line("ok1")))
+            .unwrap();
+        let ids: Vec<String> = pending(&base, "a2", 1_000).into_iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec!["ok1".to_string()], "a traversal-shaped record must not be pending");
+        assert!(
+            !claims_dir(&base, "a2").join("..").join("escaped2").exists(),
+            "no claim marker may be created outside the claims dir"
+        );
+
+        // And it must be counted in NO column. `is_claimed` fails closed to true, so a `status_of`
+        // that asked it directly would report the record as delivered and leave `awaiting_ack` at 1
+        // forever — a permanent "not reaching turn boundaries" signal for a message that is
+        // undeliverable by construction. One legitimate record beside it still counts as pending, so
+        // a `status_of` that skipped everything would not pass either.
+        let s = status_of(&base, "a2", 1_000);
+        assert_eq!(
+            (s.pending, s.delivered, s.awaiting_ack),
+            (1, 0, 0),
+            "a traversal-shaped record must be neither pending nor delivered"
+        );
+        assert_eq!(s.pending_ids, vec!["ok1".to_string()]);
     }
 
     /// The SINK half, and the one that actually proves the traversal is shut: a read sink handed a

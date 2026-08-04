@@ -61,10 +61,13 @@ from _roborev_hooklib import (
     _in_flight,
     _deny,
     _emit_hook,
+    _git_stdout,
     open_fail_backlog,
     format_backlog_summary,
     chained_steps_around_push,
     format_skipped_steps,
+    BACKLOG_NOTICE_MAX_ROWS,
+    BACKLOG_NOTICE_MAX_IDS,
 )
 
 # How long to wait for in-flight reviews. Fixed — under the installer's
@@ -97,7 +100,21 @@ def _allow() -> int:
     return 0  # exit 0, no stdout → normal permission flow proceeds
 
 
-def _allow_with_backlog() -> int:
+def _current_roots(cwd: str, repo_root: str) -> set[str]:
+    """The repo roots that mean "the checkout being pushed", for marking/sorting
+    the backlog notice. Two of them, because a WORKTREE's `--show-toplevel` is
+    the worktree path while the daemon registered the repo by its MAIN checkout;
+    matching only one would leave every agent worktree unable to recognise its
+    own repo's rows. Best-effort — a failed git call just yields fewer keys, and
+    the notice degrades to "no repo marked", never to an error."""
+    roots = {repo_root} if repo_root else set()
+    common = _git_stdout(cwd, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if common.endswith("/.git"):
+        roots.add(common[: -len("/.git")])
+    return roots
+
+
+def _allow_with_backlog(cwd: str = "", repo_root: str = "") -> int:
     """The happy-path allow: this branch is clear (current-branch deny already
     ruled out), so surface the MACHINE-WIDE open-FAIL backlog as non-blocking
     `additionalContext` and nudge the agent to sweep the stale ones.
@@ -110,7 +127,12 @@ def _allow_with_backlog() -> int:
     backlog = open_fail_backlog()
     if not backlog:
         return _allow()
-    _emit_hook({"additionalContext": format_backlog_summary(backlog)})
+    _emit_hook({"additionalContext": format_backlog_summary(
+        backlog,
+        current_roots=_current_roots(cwd, repo_root),
+        max_rows=BACKLOG_NOTICE_MAX_ROWS,
+        max_ids=BACKLOG_NOTICE_MAX_IDS,
+    )})
     return 0
 
 
@@ -245,7 +267,7 @@ def main() -> int:
     # This branch is clear (no un-triaged completed findings). Surface the machine-wide backlog (non-blocking) so
     # the agent can sweep stale FAILs on OTHER branches it's moved off of — the
     # visibility half the current-branch deny structurally can't cover.
-    return _allow_with_backlog()
+    return _allow_with_backlog(cwd, repo_root)
 
 
 if __name__ == "__main__":
