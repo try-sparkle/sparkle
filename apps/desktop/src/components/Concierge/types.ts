@@ -6,6 +6,7 @@
 
 import type { ReactNode } from "react";
 import type { StatusBand } from "../../engine/buildSections";
+import type { ConciergeMessageStatusText } from "./MessageStatus";
 // A TYPE ONLY, from the pure module that owns the digest rule (no stores, no Tauri) — so the two
 // halves of a digest line, the rule that builds it and the shape that renders it, cannot disagree
 // about what variants exist.
@@ -407,6 +408,21 @@ export interface ConciergeViewModel {
   messages: ConciergeMessage[];
   /** True while Sparkle is composing a reply — renders the typing indicator row. */
   typing?: boolean;
+  /**
+   * What the concierge is doing about a SPECIFIC message the user sent, keyed by that message's id.
+   *
+   * The founder's ask: *"I would like to see a status below each chat message that I send, showing
+   * what it's doing about that specific message."* The column-level typing row answers the same
+   * question for the column as a whole, which is ambiguous in a thread of several questions — the
+   * reader has to work out which of their messages it refers to.
+   *
+   * SPARSE, and usually a single entry. A message the app knows nothing about carries no entry and
+   * renders nothing; see services/conciergeMessageStatuses for why an unanswered older message is
+   * deliberately left blank rather than marked dead.
+   */
+  statuses?: Record<string, ConciergeMessageStatusText>;
+  /** The ONE turn boundary the column reports against (services/conciergeTurnFloor). */
+  turnFloor?: number;
   /** Files riding along with the NEXT send (parity row #21), rendered as removable chips above the
    *  compose row. The integration layer owns the list; the box only reports removals. */
   attachments?: Attachment[];

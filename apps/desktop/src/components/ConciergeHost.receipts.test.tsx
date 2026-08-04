@@ -42,6 +42,11 @@ vi.mock("../services/concierge", async (importOriginal) => {
     onConciergeDelta: () => () => {},
     onConciergeDone: () => () => {},
     onConciergeError: () => () => {},
+    // The live per-tool status channel (`concierge:tool`). This mock is TOTAL — the host imports
+    // every subscriber it uses — so a new one must be stubbed here or the module throws at import
+    // and every case in the file dies before it runs. Git merged the two branches cleanly; nothing
+    // but the suite could catch that the mock had gone stale.
+    onConciergeTool: () => () => {},
     onConciergeTurnsAbandoned: () => () => {},
   };
 });

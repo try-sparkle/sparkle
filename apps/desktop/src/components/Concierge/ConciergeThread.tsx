@@ -10,6 +10,7 @@ import { useCopyOnSelection } from "./useCopyOnSelection";
 import { useSelectionStableThread } from "./useSelectionStableThread";
 import { ThinkingIndicator } from "./ThinkingIndicator";
 import { ConciergeMessageRow } from "./ConciergeMessageRow";
+import type { ConciergeMessageStatusText } from "./MessageStatus";
 import { answeredByIndex } from "./replyAnchors";
 import { ANCHOR_HIGHLIGHT_MS } from "./ReplyAnchorViews";
 // THE collapsed-text modal — the same component the BUILD-AGENT composer draws (via
@@ -61,9 +62,38 @@ export function ConciergeThread({
   copyOnSelection = true,
   onCopied,
   wired = false,
+  statuses,
+  turnFloor,
 }: {
   messages: ConciergeMessage[];
   typing?: boolean;
+  /** What the concierge is doing about each message the user sent, KEYED BY MESSAGE ID and already
+   *  phrased by the producer (see ./MessageStatus).
+   *
+   *  OPTIONAL, and absent means the feature is simply not on — every existing caller and every
+   *  existing suite renders exactly what it did before. Sparse by nature: a thread of a hundred
+   *  bubbles normally has an entry for one of them.
+   *
+   *  THE MAP STOPS HERE. Each row is handed `statuses?.[m.id]` — the resolved entry — and never this
+   *  object or a `statusFor` callback, either of which would change identity on every tick and
+   *  re-render all hundred memoised rows for a fact about one (see the row's header, and the same
+   *  reasoning behind `shownAsText` being a boolean). Resolved per row, a bubble with no status gets
+   *  `undefined` on both renders and stays inert. */
+  statuses?: Record<string, ConciergeMessageStatusText>;
+  /**
+   * The ONE turn boundary the column reports against — see ThinkingIndicator.
+   *
+   * REQUIRED, and the `?? -1` this replaces was a lie that failed OPEN (roborev 57941-M2): floor
+   * -1 passes every entry, so an unwired hop did not degrade to the honest pulse — it narrated the
+   * PREVIOUS turn's last line under the new bubble, which is the exact falsehood the boundary
+   * exists to remove. Before the floor moved out of the indicator an unwired consumer was
+   * self-correcting on the typing edge; now it would be maximally wrong and silently so, so the
+   * invariant is carried by the DEFAULT instead: an absent boundary means "we do not know which
+   * turn this is", and the honest rendering of that is the bare pulse — which is what an infinite
+   * floor produces, since no entry can ever exceed it. Optional so the dozens of thread tests that
+   * do not care about the boundary keep working; wrong-by-omission is what changed, not the shape.
+   */
+  turnFloor?: number;
   /** The column around this thread is PATCHED to a terminal and has taken its colour. The user's
    *  bubble then paints a wash of the terminal's own ink instead of `--k-bubble`, which is a SHELL
    *  surface and would read as a foreign blue rectangle sitting on the flood. Purely
@@ -322,13 +352,17 @@ export function ConciergeThread({
             onAnswerCopied={onAnswerCopied}
             onMessageCopied={onMessageCopied}
             answeredBy={m.kind === "you" ? answeredBy.get(m.id) : undefined}
+            // RESOLVED HERE, so the row never sees the map. See the `statuses` prop doc: handing
+            // down the container (or a closure over it) would defeat the memo for the whole
+            // transcript on every tick, which is what this component's stabilisation work is for.
+            status={m.kind === "you" ? statuses?.[m.id] : undefined}
             highlighted={highlightId === m.id}
             onJump={jumpTo}
           />
         ))}
         {/* The pulse, plus what the concierge is actually doing when it is doing something the app
             observed — see ThinkingIndicator. It falls back to exactly the bare "…" this used to be. */}
-        <ThinkingIndicator typing={typing} />
+        <ThinkingIndicator typing={typing} floor={turnFloor ?? Number.POSITIVE_INFINITY} />
       </div>
       {/* "It's on your clipboard." A check mark, no words, gone in ~1.2s.
           THREE THINGS IT MUST NOT DO, all of them structural rather than stylistic:

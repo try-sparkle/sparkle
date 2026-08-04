@@ -39,8 +39,8 @@ use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::claude_chat::{
-    cached_login_shell_path, capture_result_status, capture_tool_uses, handle_event, shell_quote,
-    ToolUseRecord,
+    cached_login_shell_path, capture_result_status, capture_tool_uses_with, clamp_live_tool_input,
+    handle_event, shell_quote, ToolUseRecord,
 };
 use crate::preflight::cached_claude_path;
 
@@ -482,6 +482,36 @@ fn kill_turn_group(child: &mut Child) {
 struct ConciergeDelta {
     id: String,
     text: String,
+}
+
+/// ONE tool call, emitted LIVE the moment its `tool_use` block is parsed — the `concierge:tool`
+/// event.
+///
+/// WHY IT EXISTS: the concierge column can already name what the concierge is doing for the ~13
+/// `concierge_tool` control domains, because those round-trip through the frontend's control
+/// listener. Everything else the concierge runs — `Bash` (git/gh/bd), `Read`, `Grep`, `Glob`,
+/// `Task`, `WebFetch` — was invisible while the turn ran, which is the MAJORITY of a turn's elapsed
+/// time, and the column rendered three animated dots for all of it. Rust was already parsing every
+/// one of those blocks; it just held them until the turn ended.
+///
+/// It is a SEPARATE event from `concierge:done`'s `tool_calls`, not a replacement: that vector is
+/// the reply linter's record (full arguments, capped list, delivered once with the reply it belongs
+/// to), while this is a status line. Same parse, different clamp — see `clamp_live_tool_input`.
+///
+/// `id` is the turn token as a string, identical to what `concierge:delta` and `concierge:done`
+/// carry, so the frontend correlates a tool event exactly as it correlates a chunk of text.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConciergeToolEvent {
+    id: String,
+    /// The block's `name`, VERBATIM — `"Bash"`, `"Read"`,
+    /// `"mcp__sparkle-control__sparkle_terminal"`. Not normalized or prettified here: rendering is
+    /// the frontend's job, and a Rust-side mapping would be a second vocabulary to keep in step.
+    name: String,
+    /// Compact JSON of the block's `input`, clamped to `MAX_LIVE_TOOL_INPUT_CHARS`. Deliberately
+    /// NOT guaranteed parseable — a clamped value carries a truncation marker — for the same reason
+    /// `ToolUseRecord::input` isn't: the consumer reads it as text.
+    input: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -1055,11 +1085,16 @@ struct DrainedStream {
 /// token while the check contends with the UI thread for the manager's mutex on every send.
 /// Parsing continues either way, so `session_id`/`final_text` stay coherent for the caller's
 /// ownership check.
+///
+/// `emit_tool` rides the SAME gate as `emit`, for the same reason: a `concierge:tool` for a turn
+/// the user already replaced would paint the column with a status line belonging to a dead turn —
+/// the tool-call analogue of the orphan bubble the delta gate exists to prevent.
 fn drain_stream(
     stdout: impl std::io::Read,
     owns: &dyn Fn() -> bool,
     retired: &dyn Fn() -> bool,
     emit: &mut dyn FnMut(&str),
+    emit_tool: &mut dyn FnMut(&str, &str),
 ) -> DrainedStream {
     use std::io::BufRead;
     let mut reader = std::io::BufReader::new(stdout);
@@ -1106,7 +1141,29 @@ fn drain_stream(
                     // whether a delta goes out. A turn that loses ownership discards these at the
                     // reap (the `owned: false` outcome carries an empty vec), so the records only
                     // ever reach the frontend attached to the reply they belong to.
-                    capture_tool_uses(&ev, &mut tool_calls);
+                    //
+                    // The LIVE emit hanging off this same traversal IS gated, and by the same two
+                    // checks the delta emit uses above — the hoisted per-line `live` and the
+                    // per-chunk `retired()` — because it is an emission, not bookkeeping. Both are
+                    // load-bearing here for exactly the reasons stated above (roborev 53130): a
+                    // superseded turn must not narrate itself into the live turn's column.
+                    //
+                    // One traversal, two consumers: `capture_tool_uses_with` walks the blocks once
+                    // and drives both, so the live status line can never disagree with the record
+                    // the `done` payload carries about what this turn called.
+                    capture_tool_uses_with(&ev, &mut tool_calls, &mut |name, input| {
+                        if !live || retired() {
+                            return;
+                        }
+                        // EMITTED HERE, IN STREAM POSITION — never collected and flushed after the
+                        // loop. Buffering is the whole bug this feature exists to fix: holding the
+                        // tool calls until EOF is exactly what `concierge:done` already did, and it
+                        // delivers every status line at the one moment there is no longer anything
+                        // to report. The interleaving test asserts each tool event's position
+                        // RELATIVE to the deltas around it precisely because a count-based
+                        // assertion passes against the batched version.
+                        emit_tool(name, &clamp_live_tool_input(input.to_string()));
+                    });
                 } else {
                     tracing::debug!("concierge: skipped non-JSON stdout line");
                 }
@@ -1136,6 +1193,19 @@ fn drain_turn(
             let _ = app.emit(
                 "concierge:delta",
                 ConciergeDelta { id: id.to_string(), text: txt.to_string() },
+            );
+        },
+        // LIVE, once per tool call, under the same turn id as the deltas around it. Every caller of
+        // `drain_turn` gets this — the user send AND the proactive push, which share this transport
+        // on purpose (see `concierge_proactive_turn`): whatever the delta does, the tool event does.
+        &mut |name, input| {
+            let _ = app.emit(
+                "concierge:tool",
+                ConciergeToolEvent {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    input: input.to_string(),
+                },
             );
         },
     );
@@ -1247,8 +1317,10 @@ fn emit_outcome(app: &AppHandle, id: &str, outcome: TurnOutcome, elapsed: std::t
 /// continuing the concierge session when `resume_session_id` is passed. Returns immediately;
 /// the child and its reader run on background threads. Streams arrive as Tauri events keyed by
 /// the turn's `id` (the monotonic turn token as a string): `concierge:delta { id, text }`,
-/// `concierge:done { id, sessionId, text }` on success (keep `sessionId` and pass it back as
-/// `resume_session_id` next turn), `concierge:error { id, detail }` on failure.
+/// `concierge:tool { id, name, input }` once per tool call as it is parsed (the live status line —
+/// see `ConciergeToolEvent`), `concierge:done { id, sessionId, text, toolCalls }` on success (keep
+/// `sessionId` and pass it back as `resume_session_id` next turn), `concierge:error { id, detail }`
+/// on failure.
 ///
 /// A new turn SUPERSEDES an in-flight one (killed, whole group) — the concierge always answers
 /// the latest snapshot. Stale-session self-heal: a failed turn that carried a resume id is
@@ -2223,7 +2295,8 @@ mod tests {
         let owns = || asks.fetch_add(1, Ordering::Relaxed) < 2;
         let mut seen: Vec<String> = Vec::new();
 
-        let out = drain_stream(ndjson.as_bytes(), &owns, &|| false, &mut |t| seen.push(t.to_string()));
+        let out =
+            drain_stream(ndjson.as_bytes(), &owns, &|| false, &mut |t| seen.push(t.to_string()), &mut |_, _| {});
 
         assert_eq!(seen, vec!["live "], "everything after the supersede must be silent");
         // Parsing continued regardless, so the reap's ownership check sees a coherent turn.
@@ -2352,7 +2425,7 @@ mod tests {
         );
         let mut seen: Vec<String> = Vec::new();
         // Owns the slot (the replacement child has not spawned yet) but the floor has already risen.
-        let out = drain_stream(ndjson.as_bytes(), &|| true, &|| true, &mut |t| seen.push(t.to_string()));
+        let out = drain_stream(ndjson.as_bytes(), &|| true, &|| true, &mut |t| seen.push(t.to_string()), &mut |_, _| {});
         assert!(seen.is_empty(), "a retired turn must not emit even while it holds the slot: {seen:?}");
         assert_eq!(out.acc, "too late", "…and the parse still ran");
     }
@@ -2390,7 +2463,7 @@ mod tests {
             r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"the dead turn's buffered output"}}}"#, "\n",
         );
         let mut seen: Vec<String> = Vec::new();
-        let out = drain_stream(ndjson.as_bytes(), &|| false, &|| false, &mut |t| seen.push(t.to_string()));
+        let out = drain_stream(ndjson.as_bytes(), &|| false, &|| false, &mut |t| seen.push(t.to_string()), &mut |_, _| {});
         assert!(seen.is_empty(), "a superseded reader must not emit: {seen:?}");
         assert_eq!(out.session_id, "sess-OLD");
         assert_eq!(out.acc, "the dead turn's buffered output");
@@ -2425,7 +2498,7 @@ just the nearest test, because you are touching shared code.";
         );
 
         let mut seen: Vec<String> = Vec::new();
-        let out = drain_stream(ndjson.as_bytes(), &|| true, &|| false, &mut |t| seen.push(t.to_string()));
+        let out = drain_stream(ndjson.as_bytes(), &|| true, &|| false, &mut |t| seen.push(t.to_string()), &mut |_, _| {});
 
         // BOTH survive the same pass: the streamed text is unchanged by the capture…
         assert_eq!(seen, vec!["Relayed it. ", "Rebase note sent."]);
@@ -2455,7 +2528,7 @@ just the nearest test, because you are touching shared code.";
             r#"{"type":"assistant","message":{"content":[{"type":"text","text":"All quiet."}]}}"#, "\n",
             r#"{"type":"result","subtype":"success","session_id":"sess-N","result":"All quiet."}"#, "\n",
         );
-        let out = drain_stream(ndjson.as_bytes(), &|| true, &|| false, &mut |_| {});
+        let out = drain_stream(ndjson.as_bytes(), &|| true, &|| false, &mut |_| {}, &mut |_, _| {});
         assert!(out.tool_calls.is_empty(), "a text-only turn captures nothing: {:?}", out.tool_calls);
         assert_eq!(out.final_text, "All quiet.");
     }
@@ -2475,7 +2548,7 @@ just the nearest test, because you are touching shared code.";
             r#"{"type":"result","subtype":"success","session_id":"sess-M","result":"still here"}"#, "\n",
         );
         let mut seen: Vec<String> = Vec::new();
-        let out = drain_stream(ndjson.as_bytes(), &|| true, &|| false, &mut |t| seen.push(t.to_string()));
+        let out = drain_stream(ndjson.as_bytes(), &|| true, &|| false, &mut |t| seen.push(t.to_string()), &mut |_, _| {});
 
         let names: Vec<&str> = out.tool_calls.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, vec!["Read"], "only the well-formed block is recorded");
@@ -2496,7 +2569,7 @@ just the nearest test, because you are touching shared code.";
             r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"the dead turn's output"}}}"#, "\n",
         );
         let mut seen: Vec<String> = Vec::new();
-        let out = drain_stream(ndjson.as_bytes(), &|| false, &|| false, &mut |t| seen.push(t.to_string()));
+        let out = drain_stream(ndjson.as_bytes(), &|| false, &|| false, &mut |t| seen.push(t.to_string()), &mut |_, _| {});
         assert!(seen.is_empty(), "a superseded reader must not emit: {seen:?}");
         // The parse ran (that is the pre-existing contract), so the capture ran with it…
         assert_eq!(out.acc, "the dead turn's output");
@@ -2516,7 +2589,7 @@ just the nearest test, because you are touching shared code.";
             r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"gh pr merge 864 --merge"}}]}}"#, "\n",
             r#"{"type":"result","subtype":"success","session_id":"sess-D","result":"Merged it."}"#, "\n",
         );
-        let out = drain_stream(ndjson.as_bytes(), &|| true, &|| false, &mut |_| {});
+        let out = drain_stream(ndjson.as_bytes(), &|| true, &|| false, &mut |_| {}, &mut |_, _| {});
         // The exact construction `emit_outcome` performs on the success arm.
         let done = ConciergeDone {
             id: "42".into(),
@@ -2534,6 +2607,267 @@ just the nearest test, because you are touching shared code.";
             "the argument text must reach the frontend: {:?}",
             calls[0]["input"],
         );
+    }
+
+    /// Drive `drain_stream` and log deltas and tool events into ONE ordered list, tagged, so the
+    /// relative ORDER of the two channels is assertable. Two separate vectors could not express
+    /// "the Bash call arrived between these two sentences", which is the whole feature.
+    fn drain_logging_both(
+        ndjson: &str,
+        owns: &dyn Fn() -> bool,
+        retired: &dyn Fn() -> bool,
+    ) -> (Vec<String>, DrainedStream) {
+        let log = std::cell::RefCell::new(Vec::<String>::new());
+        let out = drain_stream(
+            ndjson.as_bytes(),
+            owns,
+            retired,
+            &mut |t| log.borrow_mut().push(format!("delta:{t}")),
+            &mut |name, input| log.borrow_mut().push(format!("tool:{name}:{input}")),
+        );
+        (log.into_inner(), out)
+    }
+
+    /// THE FEATURE: tool calls reach the frontend WHILE the turn is running, in stream position —
+    /// not batched onto `concierge:done` at the end, which is what they did before and why the
+    /// concierge column animated three dots through the majority of a turn.
+    ///
+    /// The assertion is a single interleaved sequence, deliberately. A test that counted the tool
+    /// events, or checked them in their own vector, would pass unchanged against an implementation
+    /// that collected them and flushed after the loop — i.e. against the bug. Only the position of
+    /// each `tool:` entry RELATIVE to the `delta:` entries around it distinguishes live from
+    /// batched.
+    #[test]
+    fn live_tool_events_arrive_interleaved_with_the_deltas_around_them() {
+        let ndjson = concat!(
+            r#"{"type":"system","subtype":"init","session_id":"sess-L"}"#, "\n",
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Checking. "}}}"#, "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"git log --oneline -3"}}]}}"#, "\n",
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Reading it. "}}}"#, "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"one sec"},{"type":"tool_use","id":"t2","name":"Read","input":{"file_path":"/a/b.rs"}}]}}"#, "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t3","name":"mcp__sparkle-control__sparkle_terminal","input":{"action":"send"}}]}}"#, "\n",
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Done."}}}"#, "\n",
+            r#"{"type":"result","subtype":"success","session_id":"sess-L","result":"Checking. Reading it. Done."}"#, "\n",
+        );
+
+        let (log, out) = drain_logging_both(ndjson, &|| true, &|| false);
+
+        assert_eq!(
+            log,
+            vec![
+                "delta:Checking. ".to_string(),
+                r#"tool:Bash:{"command":"git log --oneline -3"}"#.to_string(),
+                "delta:Reading it. ".to_string(),
+                r#"tool:Read:{"file_path":"/a/b.rs"}"#.to_string(),
+                r#"tool:mcp__sparkle-control__sparkle_terminal:{"action":"send"}"#.to_string(),
+                "delta:Done.".to_string(),
+            ],
+            "tool events must land BETWEEN the deltas they ran between, not after all of them",
+        );
+        // Belt and braces on the thing the vector above encodes: the first tool event preceded the
+        // LAST delta. A batched implementation cannot satisfy this, whatever its ordering within
+        // each channel.
+        let first_tool = log.iter().position(|e| e.starts_with("tool:")).expect("a tool event");
+        let last_delta = log.iter().rposition(|e| e.starts_with("delta:")).expect("a delta");
+        assert!(first_tool < last_delta, "the first tool call must be reported mid-turn: {log:?}");
+
+        // ONE parse: the live events and the `done` records name the same calls in the same order.
+        let recorded: Vec<&str> = out.tool_calls.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            recorded,
+            vec!["Bash", "Read", "mcp__sparkle-control__sparkle_terminal"],
+            "the batched record and the live stream must not disagree about what was called",
+        );
+        assert_eq!(out.final_text, "Checking. Reading it. Done.");
+    }
+
+    /// The per-LINE ownership gate covers the tool event exactly as it covers the delta: a send
+    /// that lands mid-stream silences the REST of the superseded turn's tool calls. Without this,
+    /// a dead turn keeps writing "Bash: …" into the column of the turn that replaced it — the
+    /// tool-call form of the orphan bubble the delta gate exists to prevent (roborev 53088/53105).
+    ///
+    /// The capture keeps running throughout, which is the pre-existing contract: the gate governs
+    /// EMISSION, not bookkeeping.
+    #[test]
+    fn a_supersede_mid_stream_stops_the_tool_events_but_not_the_capture() {
+        let ndjson = concat!(
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"live "}}}"#, "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"echo live"}}]}}"#, "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"/dead.rs"}}]}}"#, "\n",
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"dead"}}}"#, "\n",
+        );
+        // Ownership is lost after the reader has asked twice — the third line onward is silent.
+        let asks = AtomicU64::new(0);
+        let owns = || asks.fetch_add(1, Ordering::Relaxed) < 2;
+
+        let (log, out) = drain_logging_both(ndjson, &owns, &|| false);
+
+        assert_eq!(
+            log,
+            vec![
+                "delta:live ".to_string(),
+                r#"tool:Bash:{"command":"echo live"}"#.to_string(),
+            ],
+            "everything after the supersede must be silent, tool events included: {log:?}",
+        );
+        // …and the parse ran to EOF regardless, so the reap still sees a coherent turn.
+        let recorded: Vec<&str> = out.tool_calls.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(recorded, vec!["Bash", "Read"], "capture is ungated: {recorded:?}");
+        assert_eq!(out.acc, "live dead");
+    }
+
+    /// A reader that never owned the turn emits NO tool events at all, and a turn the FLOOR has
+    /// retired emits none either even while it still holds the slot. Both checks are load-bearing
+    /// on the delta path (roborev 53130) and both are re-asserted here, because a tool emit wired
+    /// past either one paints a status line for a turn the user already replaced.
+    #[test]
+    fn a_retired_or_unowned_turn_emits_zero_tool_events_though_the_parse_captures() {
+        let ndjson = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"echo dead"}}]}}"#, "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Grep","input":{"pattern":"x"}}]}}"#, "\n",
+        );
+
+        // Superseded at the slot.
+        let (log, out) = drain_logging_both(ndjson, &|| false, &|| false);
+        assert!(log.is_empty(), "a superseded reader must announce nothing: {log:?}");
+        assert_eq!(out.tool_calls.len(), 2, "…while the capture still recorded both calls");
+
+        // Retired at the floor, slot still ours — the window a slot-only check misses.
+        let (log, out) = drain_logging_both(ndjson, &|| true, &|| true);
+        assert!(log.is_empty(), "a retired turn must announce nothing: {log:?}");
+        assert_eq!(out.tool_calls.len(), 2);
+    }
+
+    /// The live payload is clamped MUCH smaller than the `done` record (512 vs 16_384) because it
+    /// ships per call, live, into a ~360px column. The clamp must cut on a CHARACTER boundary —
+    /// this input is all multi-byte, so a byte slice would panic here rather than fail quietly.
+    #[test]
+    fn the_live_tool_input_clamp_lands_on_a_character_boundary() {
+        use crate::claude_chat::MAX_LIVE_TOOL_INPUT_CHARS;
+        // 4-byte emoji, 3-byte CJK, 2-byte Latin — every boundary width, well past the clamp.
+        let wide = "🚀漢é".repeat(MAX_LIVE_TOOL_INPUT_CHARS);
+        let ndjson = format!(
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","name":"Bash","input":{{"command":{cmd}}}}}]}}}}"#,
+            cmd = serde_json::to_string(&wide).unwrap(),
+        ) + "\n";
+
+        let (log, out) = drain_logging_both(&ndjson, &|| true, &|| false);
+
+        assert_eq!(log.len(), 1, "one call, one event: {log:?}");
+        let emitted = log[0].strip_prefix("tool:Bash:").expect("the tagged prefix");
+        // The clamp fired, and the prefix it kept is EXACTLY the first N characters of the full
+        // compact JSON — the property a byte-boundary cut would violate (or panic attempting).
+        let full = &out.tool_calls[0].input;
+        assert!(
+            emitted.chars().count() > MAX_LIVE_TOOL_INPUT_CHARS,
+            "a truncation marker is appended, so the clamped value is slightly longer than the cap",
+        );
+        assert!(
+            emitted.chars().count() < MAX_LIVE_TOOL_INPUT_CHARS + 32,
+            "…but only by the marker: {}",
+            emitted.chars().count(),
+        );
+        let kept: String = emitted.chars().take(MAX_LIVE_TOOL_INPUT_CHARS).collect();
+        let expected: String = full.chars().take(MAX_LIVE_TOOL_INPUT_CHARS).collect();
+        assert_eq!(kept, expected, "the kept prefix must be the first N CHARACTERS of the input");
+        assert!(emitted.ends_with("[truncated]"), "a clamped value is marked: {emitted}");
+    }
+
+    /// THE REGRESSION THAT WOULD BE SILENT: the small live clamp must not reach the `concierge:done`
+    /// payload, whose full-length arguments the reply linter (`conciergeLint/checks/askWithoutAction`
+    /// and `relay-paste`) decides on. 512 characters is far below the verbatim overlap those checks
+    /// look for, so a leaked clamp would not break a test that only counted records — it would just
+    /// quietly stop the lint from ever matching.
+    #[test]
+    fn the_small_live_clamp_does_not_leak_into_the_done_payload() {
+        use crate::claude_chat::{MAX_LIVE_TOOL_INPUT_CHARS, MAX_TOOL_USE_INPUT_CHARS};
+        // Comfortably past the LIVE clamp and comfortably under the payload one, so the two paths
+        // must disagree about this exact value.
+        let relayed = "R".repeat(MAX_LIVE_TOOL_INPUT_CHARS * 4);
+        assert!(relayed.chars().count() < MAX_TOOL_USE_INPUT_CHARS, "fixture stays under the big cap");
+        let ndjson = format!(
+            concat!(
+                r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","name":"mcp__sparkle-control__sparkle_terminal","input":{{"text":{msg}}}}}]}}}}"#, "\n",
+                r#"{{"type":"result","subtype":"success","session_id":"sess-C","result":"Relayed."}}"#, "\n",
+            ),
+            msg = serde_json::to_string(&relayed).unwrap(),
+        );
+
+        let (log, out) = drain_logging_both(&ndjson, &|| true, &|| false);
+
+        // The LIVE event is clamped…
+        let emitted = log[0].split_once(':').unwrap().1;
+        assert!(
+            !emitted.contains(&relayed),
+            "the live event must not ship the full argument text",
+        );
+        // …and the `done` payload, built exactly as `emit_outcome` builds it, still is NOT.
+        let done = ConciergeDone {
+            id: "7".into(),
+            session_id: out.session_id,
+            text: out.final_text,
+            tool_calls: out.tool_calls,
+        };
+        let json = serde_json::to_value(&done).unwrap();
+        let payload_input = json["toolCalls"][0]["input"].as_str().expect("input on the payload");
+        assert!(
+            payload_input.contains(&relayed),
+            "the done payload must still carry the FULL argument text (len {})",
+            payload_input.chars().count(),
+        );
+    }
+
+    /// A malformed `tool_use` block costs neither a panic nor the REST of the stream — the same
+    /// contract the capture has always had, now extended to the live channel. The shapes here are
+    /// the CLI's to change, and going quiet for the rest of a turn would be a far worse failure
+    /// than dropping one status line.
+    #[test]
+    fn a_malformed_tool_use_block_emits_nothing_and_does_not_stop_later_events() {
+        let ndjson = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","input":{"a":1}}]}}"#, "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"   ","input":{"a":2}}]}}"#, "\n",
+            r#"{"type":"assistant","message":{"content":"not-an-array"}}"#, "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read"}]}}"#, "\n",
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"still here"}}}"#, "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"bd ready"}}]}}"#, "\n",
+            r#"{"type":"result","subtype":"success","session_id":"sess-B","result":"still here"}"#, "\n",
+        );
+
+        let (log, out) = drain_logging_both(ndjson, &|| true, &|| false);
+
+        assert_eq!(
+            log,
+            vec![
+                // A block with no `input` at all still names a real call; `{}` is its arguments.
+                "tool:Read:{}".to_string(),
+                "delta:still here".to_string(),
+                r#"tool:Bash:{"command":"bd ready"}"#.to_string(),
+            ],
+            "the nameless / non-array blocks are skipped and everything after them still fires: {log:?}",
+        );
+        let recorded: Vec<&str> = out.tool_calls.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(recorded, vec!["Read", "Bash"], "and the capture agrees with the live stream");
+        assert_eq!(out.final_text, "still here");
+    }
+
+    /// THE FROZEN WIRE CONTRACT. The TypeScript listener is written against exactly these three
+    /// keys; serializing the REAL struct is the only thing that proves the rename attribute applies
+    /// and that no field was added or renamed underneath it.
+    #[test]
+    fn the_live_tool_event_serializes_as_id_name_input() {
+        let ev = ConciergeToolEvent {
+            id: "42".into(),
+            name: "Bash".into(),
+            input: r#"{"command":"git status"}"#.into(),
+        };
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["id"], "42");
+        assert_eq!(json["name"], "Bash");
+        assert_eq!(json["input"], r#"{"command":"git status"}"#);
+        let obj = json.as_object().expect("an object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["id", "input", "name"], "no extra or renamed fields on the wire");
     }
 
     /// THE PRECEDENCE RULE OF THE PROACTIVE PUSH CHANNEL: the user's own message always wins.

@@ -24,6 +24,7 @@ import { C, CHAT_USER_BUBBLE } from "../../theme/colors";
 import { Markdown } from "../Markdown";
 import { bandColor } from "../../engine/statusBandLabels";
 import { CopyAnswerButton } from "./CopyAnswerButton";
+import { MessageStatusLive, type ConciergeMessageStatusText } from "./MessageStatus";
 import { NudgeCard } from "./NudgeCard";
 import { RecapCard } from "./RecapCard";
 import { RoutingReceipt } from "./RoutingReceipt";
@@ -121,6 +122,21 @@ export interface ConciergeMessageRowProps {
    *  boolean and not the thread's `Set`: this row is memoised, and handing it a container that is
    *  rebuilt every tick would re-render the whole transcript for a fact about one message. */
   answeredBy?: string;
+  /** For a `you` message: what the concierge is doing about THIS message, already phrased by the
+   *  producer (see ./MessageStatus). Undefined on every other kind, and on the overwhelming majority
+   *  of `you` bubbles — a settled thread has a status on roughly one of them.
+   *
+   *  THE RESOLVED ENTRY, never the thread's map and never a `statusFor` callback, for exactly the
+   *  reason `shownAsText` is a boolean and `answeredBy` a plain string: this row is memoised, and a
+   *  container or a closure rebuilt on every tick would re-render all hundred bubbles for a fact
+   *  about one of them — which is the transcript-wide re-diff that makes a click-drag selection
+   *  stutter (see this file's header). Resolved by the thread, a bubble with no status is handed
+   *  `undefined` on both renders and the memo holds.
+   *
+   *  THE PHRASE ONLY. The ink is a reading of the liveness clock and is taken inside
+   *  `MessageStatusLive`, one level below this row — a tone on this prop would change once a second
+   *  for the whole of every turn and re-render the bubble with it (roborev 57889-M2). */
+  status?: ConciergeMessageStatusText;
   /** This message was just jumped to — light it briefly so the reader can see where they landed. */
   highlighted?: boolean;
   /** Scroll to the message with this id and light it up. Stable, or the memo above is worthless. */
@@ -140,6 +156,7 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
   onAnswerCopied,
   onMessageCopied,
   answeredBy,
+  status,
   highlighted = false,
   onJump,
 }: ConciergeMessageRowProps) {
@@ -245,22 +262,57 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
               still carries the compact count ("look · 1 image"), which is what a restored bubble
               falls back to once its base64 has been stripped. */}
           <AttachmentStrip attachments={m.attachments ?? []} />
-          <MentionedText text={m.text} mentions={m.mentions} />
-        </div>
-        {/* THE USER'S OWN WORDS, one click away — the founder's ask, and the same component the
-            answers use so the two read as one system rather than as two controls that happen to
-            share a glyph.
+          {/* THE WORDS, WITH THE COPY GLYPH FLOATED INTO THEIR TOP-RIGHT.
+              The founder's placement: *"the copy icon should actually be put INSIDE the box,
+              because the copy icon should be referencing what I wrote. That's what we're copying
+              here."* The button copies `m.text` and nothing else, so it belongs with the words —
+              not in the margin beneath them, which is where the annotations about the send live and
+              is now where the per-message STATUS goes (./MessageStatus).
 
-            ABOVE THE RECEIPT, not below it, for two reasons. It belongs to the WORDS: the receipt
-            is an annotation about where they went, so a copy glyph under it attaches itself to the
-            annotation instead of to the message, and the entry would end on a control rather than
-            on the sentence that closes it. And it keeps the glyph off the receipt's own row, where
-            it would sit alongside the right-justified redirect button — two unrelated buttons on
-            one line, the smaller one easy to hit by mistake. Both live on the same right edge
-            (`marginRight: -2` mirrors the answer variant's left pull), so they still read as one
-            stack; they just don't share a row. Rendered ALWAYS, like the answer's, so nothing about
-            the entry's height changes on hover (see CopyAnswerButton's header). */}
-        <CopyAnswerButton kind="message" text={m.text} onCopied={onMessageCopied} />
+              THIS WRAPPER IS NOT DECORATION (roborev 58010-M1). The float must be scoped to the
+              TEXT, and my first cut put it at the top of the bubble instead — where it also met
+              `AttachmentStrip`, which is a block-level `display: flex` container. A block-level flex
+              box establishes its own formatting context, so it does NOT flow around a float: its
+              border box gets narrowed by the glyph's width for its full height, squeezing the
+              thumbnail strip and pushing thumbnails near the wrap boundary onto an extra row. The
+              rationale "the words flow around it" was true of the words and false of the strip.
+              Floating inside a text-only wrapper placed AFTER the strip is what makes the rationale
+              actually hold — the glyph now meets nothing but the text it belongs to.
+
+              FLOAT, NOT ABSOLUTE POSITIONING. An absolute glyph would sit ON TOP of a message long
+              enough to reach it, and the bubble is width-fitted (`inline-block`), so there is no
+              reserved gutter for it to live in. A float reserves its own space in the flow.
+
+              THE OLD CONSTRAINTS THAT STILL HOLD:
+                • RENDERED ALWAYS, never on hover, so nothing about the entry's height changes when
+                  the pointer crosses it (see CopyAnswerButton's header — the thread auto-follows on
+                  a content key, and a control that appears on hover nudges the scroll under a reader
+                  who is only moving the mouse).
+                • None of the bubble's geometry — `display: inline-block`, the 4px corners with the
+                  hard tail, `padding: "9px 12px"`, the fill, the deliberate absence of a border — is
+                  touched by any of this. */}
+          <div>
+            <span style={{ float: "right", marginLeft: 6, marginRight: -4, marginTop: -2 }}>
+              <CopyAnswerButton kind="message" text={m.text} onCopied={onMessageCopied} />
+            </span>
+            <MentionedText text={m.text} mentions={m.mentions} />
+          </div>
+        </div>
+        {/* WHAT THE CONCIERGE IS DOING ABOUT THIS MESSAGE — the founder's ask, in the corner the
+            copy glyph just vacated: *"below the box, where the copy icon currently is, it could show
+            the status for that specific question."* Renders NOTHING without a status, which is the
+            state almost every bubble in a long thread is in (see ./MessageStatus).
+
+            ABOVE THE RECEIPT, because the two say different things in the order they become true:
+            this is what is happening NOW, the receipt is the settled record of where the message
+            went, and "answered below" after that is what happened next.
+
+            `MessageStatusLive`, not `MessageStatus`: the ink is a clock reading, so the component
+            that takes it re-renders at 1 Hz for the whole of a turn. Mounted here it is one leaf on
+            one bubble; taken any higher — in the producer, which the host calls — it reconciles the
+            entire transcript (roborev 57889-M2). It renders nothing at all without a status, which
+            is the state almost every bubble is in. */}
+        <MessageStatusLive status={status} />
         {m.receipt && (
           <RoutingReceipt
             // THE `unanswered` STAMP IS WITHDRAWN ONCE A REPLY NAMES THIS MESSAGE, and this is the

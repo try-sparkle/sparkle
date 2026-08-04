@@ -84,6 +84,7 @@ const h = vi.hoisted(() => ({
     delta?: (e: { id: string; text: string }) => void;
     done?: (e: { id: string; text: string }) => void;
     error?: (e: { id: string; detail: string }) => void;
+    tool?: (e: { id: string; name: string; input: string }) => void;
   },
 }));
 // Single-window shell (CM-U7): "show me" is a TAB switch + agent reveal, not a bare select.
@@ -106,6 +107,13 @@ vi.mock("../services/concierge", async (importOriginal) => ({
   // ConciergeHost.proactive.test.tsx.
   startProactiveConciergeTurn: vi.fn(async (): Promise<string | null> => null),
   isProactiveTurn: () => false,
+  // The LIVE tool channel. A no-op unsubscribe, exactly like its siblings: these suites are about
+  // the host's other wiring, and a mock that simply OMITS an export the host calls does not
+  // degrade — vitest throws on the missing property and every case in the file dies at mount.
+  onConciergeTool: (cb: (e: { id: string; name: string; input: string }) => void) => {
+    h.brain.tool = cb;
+    return () => {};
+  },
   onConciergeDelta: (cb: (e: { id: string; text: string }) => void) => {
     h.brain.delta = cb;
     return () => {};
@@ -196,6 +204,14 @@ vi.mock("../stores/sparklePrefsStore", () => ({
 // string, and asserting the literal on each side is what pins that they stay shared. A hand-synced
 // copy here would turn a wording tweak into a red test for a non-bug (roborev 53044).
 import { ConciergeHost, TRIAL_SPENT_TEXT } from "./ConciergeHost";
+import {
+  _resetConciergeActivityForTests,
+  noteConciergeToolCall,
+} from "../services/conciergeActivity";
+import {
+  THINKING_ACTIVITY_TESTID,
+  THINKING_INDICATOR_TESTID,
+} from "./Concierge/ThinkingIndicator";
 // Through the mock above, which re-exports the REAL array — so these rows use the same literals the
 // host filters on and the same ones Rust emits.
 import { SUPERSEDED_DETAILS } from "../services/concierge";
@@ -539,14 +555,110 @@ describe("ConciergeHost", () => {
       fireEvent.change(screen.getByRole("textbox"), { target: { value: "what needs me?" } });
       fireEvent.click(screen.getByText("Send"));
       await settle();
-      expect(screen.queryByLabelText("Sparkle is typing")).toBeTruthy();
+      // BY TESTID, NOT BY ACCESSIBLE NAME. "Sparkle is typing" is only the indicator's FALLBACK
+      // name — it now reports the actual step instead ("Reading your message", "Checking git"),
+      // which is the entire point of the live status line, so a send immediately renames it. What
+      // this case is about is whether the row is THERE, and the testid is the handle that answers
+      // that without also asserting a caption this feature deliberately changes.
+      expect(screen.queryByTestId(THINKING_INDICATOR_TESTID)).toBeTruthy();
+      // AND THE CAPTION, through the REAL host (roborev 57925/57947). What this adds over presence
+      // is the COMPOSED path: that the recorded phase actually reaches the row as a caption. The
+      // store-level recording is pinned separately in conciergeTurnFloor.test.ts, so this is not
+      // the only thing keeping `noteConciergePhase` alive — an earlier version of this comment
+      // claimed that and was wrong.
+      //
+      // WHAT THIS DOES NOT PIN (roborev 57935): the send here is from IDLE, so `typing` moves and
+      // the effect would fire on that alone — the `sendSeq` argument is not exercised. The re-send
+      // case below is what covers it.
+      expect(screen.getByTestId(THINKING_ACTIVITY_TESTID).textContent).toBe("Reading your message");
 
       act(() => h.brain.error?.({ id: "9", detail }));
       expect(queryInThread(/couldn't reach my brain/i)).toBeNull();
       // Still typing — the displacing turn owns the indicator.
-      expect(screen.queryByLabelText("Sparkle is typing")).toBeTruthy();
+      expect(screen.queryByTestId(THINKING_INDICATOR_TESTID)).toBeTruthy();
     },
   );
+
+  /**
+   * THE RE-SEND, which is the half that actually broke twice (roborev 57889/57914/57935).
+   *
+   * A send SUPERSEDES the turn in flight, so `typing` never drops — only the per-send counter can
+   * re-take the boundary.
+   *
+   * The intervening tool call is what stops this being vacuous, and the reason is a property of the
+   * MUTANT, not of the shipped component: with the counter frozen the floor never moves, so the
+   * stale `reading_message` still sits above it and the caption would read correctly for the wrong
+   * reason. (In the shipped code the floor DOES move on every send while `typing` holds — that is
+   * exactly the 57933 fix.) The tool line is what makes the two builds differ.
+   *
+   * Freeze `useConciergeTurnFloor`'s second argument, or drop the unconditional `setSendSeq` bump at
+   * the send site, and the effect never re-runs — the caption stays on the tool line and this reds.
+   */
+  it("a re-send while still typing re-takes the boundary — the caption returns to 'Reading your message'", async () => {
+    _resetConciergeActivityForTests();
+    h.feed = feedWith("approval");
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "what needs me?" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    expect(screen.getByTestId(THINKING_ACTIVITY_TESTID).textContent).toBe("Reading your message");
+
+    // Turn 1 does some work, so the row is showing its tool line rather than the boundary.
+    act(() => void noteConciergeToolCall("workspace", "list_projects", {}));
+    expect(screen.getByTestId(THINKING_ACTIVITY_TESTID).textContent).toBe(
+      "Looking over your projects",
+    );
+
+    // The user sends again WITHOUT the turn finishing — `typing` stays true throughout.
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "and this too" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    expect(screen.getByTestId(THINKING_ACTIVITY_TESTID).textContent).toBe("Reading your message");
+  });
+
+  /**
+   * THE TOOL CHANNEL IS ACTUALLY SUBSCRIBED (roborev 58020-M1).
+   *
+   * Every one of the twenty total mocks stubs `onConciergeTool` as an inert subscriber that never
+   * fires, so nothing drove this wiring: deleting the whole `onConciergeTool(...)` block from the
+   * host left the suite green. The pure sinks are well covered; only the wiring reaching them was
+   * not — and the CI break that added those stubs was surfaced by an import-time throw, not by any
+   * assertion, so there was no signal that would catch the subscriber being disconnected.
+   *
+   * Asserted through the RENDERED CAPTION, which is the whole path: event → supersede gate →
+   * noteConciergeNativeToolCall → activity store → line → row.
+   */
+  it("renders a live tool event from the brain, and ignores one from a superseded turn", async () => {
+    _resetConciergeActivityForTests();
+    h.feed = feedWith("approval");
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "what needs me?" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    expect(screen.getByTestId(THINKING_ACTIVITY_TESTID).textContent).toBe("Reading your message");
+
+    // A tool call on the CURRENT turn reaches the column.
+    act(() => h.brain.tool?.({ id: "1", name: "Grep", input: '{"pattern":"retry"}' }));
+    const live = screen.getByTestId(THINKING_ACTIVITY_TESTID).textContent;
+    expect(live).not.toBe("Reading your message");
+    expect(live!.length).toBeGreaterThan(0);
+
+    // THE REAL DISPLACED-TURN SHAPE (roborev 58048): a SAME-ID straggler arriving after a re-send,
+    // which is what happens when turn 1's buffered stdout flushes once the user has already sent
+    // again. An older-id event would be rejected by `supersededTurn`'s `n < latest` branch, so it
+    // pins nothing about the `retireThrough` branch that the production comment identifies as the
+    // one closing the straggler window — the earlier version of this case did exactly that and
+    // claimed otherwise.
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "and this too" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    const afterResend = screen.getByTestId(THINKING_ACTIVITY_TESTID).textContent;
+    expect(afterResend).toBe("Reading your message");
+
+    // Turn 1 flushes late, under its OWN id, which the re-send has now retired.
+    act(() => h.brain.tool?.({ id: "1", name: "Read", input: '{"file_path":"/x"}' }));
+    expect(screen.getByTestId(THINKING_ACTIVITY_TESTID).textContent).toBe(afterResend);
+  });
 
   // Each refused path gets its OWN remedy, and the remedies genuinely differ: Retry for a pane that
   // gave up, "use its own pane" for a cloud agent. Falling back to the generic "I couldn't send the

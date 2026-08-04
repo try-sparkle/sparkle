@@ -356,15 +356,28 @@ pub(crate) const MAX_TOOL_USE_RECORDS: usize = 128;
 /// bridge in full.
 pub(crate) const MAX_TOOL_USE_INPUT_CHARS: usize = 16_384;
 
+/// Most characters retained per `input` on the LIVE per-call event (`concierge:tool`), which is a
+/// different job from the `done` payload above and therefore a different number.
+///
+/// The live event exists so the concierge column can say "Bash: git log …" instead of animating
+/// three dots, and it is emitted once per tool call while the turn runs — so its cost is paid over
+/// and over, and it renders into a ~360px column. `MAX_TOOL_USE_INPUT_CHARS` is 16_384 because a
+/// downstream lint needs a few-hundred-character verbatim overlap out of the `done` payload; NOTHING
+/// on the live path reads the argument text that way. 512 characters comfortably holds a shell
+/// command or a file path — everything the status line can show — while keeping a chatty turn's
+/// stream of events small.
+pub(crate) const MAX_LIVE_TOOL_INPUT_CHARS: usize = 512;
+
 /// Marker appended to a clamped `input`, so a consumer (or a human reading a log) can tell a short
 /// argument from a truncated one. Short by design: it must not itself be long enough to register as
 /// a verbatim overlap.
 const TOOL_USE_TRUNCATED: &str = "…[truncated]";
 
-/// Clamp to `MAX_TOOL_USE_INPUT_CHARS` on a CHARACTER boundary (never a byte one — the payload is
-/// arbitrary UTF-8 and slicing mid-codepoint would panic).
-fn clamp_tool_input(s: String) -> String {
-    match s.char_indices().nth(MAX_TOOL_USE_INPUT_CHARS) {
+/// Clamp to `max_chars` on a CHARACTER boundary (never a byte one — the payload is arbitrary UTF-8
+/// and slicing mid-codepoint would panic). `char_indices` is what makes that true: it yields the
+/// BYTE offset of the nth CHARACTER, so the slice below always lands between codepoints.
+fn clamp_tool_input_to(s: String, max_chars: usize) -> String {
+    match s.char_indices().nth(max_chars) {
         None => s,
         Some((byte_idx, _)) => {
             let mut out = String::with_capacity(byte_idx + TOOL_USE_TRUNCATED.len());
@@ -373,6 +386,18 @@ fn clamp_tool_input(s: String) -> String {
             out
         }
     }
+}
+
+/// Clamp for the `concierge:done` payload — the record the reply linter scans.
+fn clamp_tool_input(s: String) -> String {
+    clamp_tool_input_to(s, MAX_TOOL_USE_INPUT_CHARS)
+}
+
+/// Clamp for the LIVE `concierge:tool` event — much smaller, see `MAX_LIVE_TOOL_INPUT_CHARS`.
+/// Shares `clamp_tool_input_to` with the payload clamp so the char-boundary rule cannot be
+/// re-derived (and got wrong) on the second path.
+pub(crate) fn clamp_live_tool_input(s: String) -> String {
+    clamp_tool_input_to(s, MAX_LIVE_TOOL_INPUT_CHARS)
 }
 
 /// Sibling of `handle_event` / `capture_result_status`: capture the `tool_use` blocks carried by an
@@ -389,10 +414,20 @@ fn clamp_tool_input(s: String) -> String {
 /// third-party output whose shape is the CLI's to change, and losing the rest of a turn's parse
 /// over an unexpected block would trade a missing lint input for a broken reply.
 pub(crate) fn capture_tool_uses(ev: &Value, out: &mut Vec<ToolUseRecord>) {
-    // Counted, then logged ONCE below (roborev 55757, Medium). Warning per evicted record turned a
-    // 500-call runaway into ~436 identical lines per event, burying the warnings around it — the
-    // opposite of a durable trace, and a level escalation over the `debug!` this replaced.
-    let mut evicted = 0usize;
+    capture_tool_uses_with(ev, out, &mut |_, _| {});
+}
+
+/// THE ONE TRAVERSAL. Walk the `tool_use` blocks of an `assistant` event and hand each one to `f`
+/// as `(name, input)`, where `input` is `serde_json`'s compact serialization of the block's `input`
+/// object (`{}` when the block carried none) — UNCLAMPED, because the two consumers clamp at
+/// different lengths and neither may re-walk the blocks itself.
+///
+/// That last point is the reason this exists as a function rather than a second loop: the live
+/// `concierge:tool` event and the `concierge:done` record MUST agree on what counts as a tool call
+/// (which blocks are skipped, how a missing `input` is spelled), and two independent walks drift.
+///
+/// Defensive throughout, same as its caller: a partial or malformed block is SKIPPED, never fatal.
+pub(crate) fn for_each_tool_use(ev: &Value, f: &mut dyn FnMut(&str, &str)) {
     if ev.get("type").and_then(Value::as_str) != Some("assistant") {
         return;
     }
@@ -417,6 +452,35 @@ pub(crate) fn capture_tool_uses(ev: &Value, out: &mut Vec<ToolUseRecord>) {
         else {
             continue;
         };
+        let input = block
+            .get("input")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "{}".to_string());
+        f(name, &input);
+    }
+}
+
+/// `capture_tool_uses`, plus a LIVE callback invoked once per tool call at the moment the block is
+/// parsed — the seam the `concierge:tool` event hangs off.
+///
+/// `live` fires for EVERY call, including one the record cap later evicts: the call happened, and
+/// the cap exists to bound the `done` payload's size on the wire, not to decide what was true. It
+/// also fires BEFORE the record is pushed, so a caller that emits from it cannot be reordered by
+/// the eviction bookkeeping below.
+///
+/// Gating belongs to the CALLER (see `concierge::drain_stream`): this function's own bookkeeping is
+/// deliberately ungated, and `live` is where a superseded turn's silence is enforced.
+pub(crate) fn capture_tool_uses_with(
+    ev: &Value,
+    out: &mut Vec<ToolUseRecord>,
+    live: &mut dyn FnMut(&str, &str),
+) {
+    // Counted, then logged ONCE below (roborev 55757, Medium). Warning per evicted record turned a
+    // 500-call runaway into ~436 identical lines per event, burying the warnings around it — the
+    // opposite of a durable trace, and a level escalation over the `debug!` this replaced.
+    let mut evicted = 0usize;
+    for_each_tool_use(ev, &mut |name, input| {
+        live(name, input);
         // EVICT THE OLDEST, KEEP THE NEWEST (roborev 55648, Medium).
         //
         // This used to `return` on reaching the cap, dropping the TAIL of the turn — and the tail is
@@ -447,12 +511,17 @@ pub(crate) fn capture_tool_uses(ev: &Value, out: &mut Vec<ToolUseRecord>) {
             evicted += 1;
             out.remove(0);
         }
-        let input = block
-            .get("input")
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "{}".to_string());
-        out.push(ToolUseRecord { name: name.to_string(), input: clamp_tool_input(input) });
-    }
+        out.push(ToolUseRecord {
+            name: name.to_string(),
+            // `clamp_tool_input` (16_384), NOT the live 512 — the two clamps exist for two
+            // different consumers and are not interchangeable. This record is what the reply linter
+            // scans for a few-hundred-character VERBATIM overlap with a relayed message; clamping it
+            // to the status line's budget would truncate exactly the text that check compares, and
+            // `relay-paste` would fail open on every message longer than 512 characters while still
+            // looking perfectly healthy.
+            input: clamp_tool_input(input.to_string()),
+        });
+    });
     if evicted > 0 {
         tracing::warn!(
             cap = MAX_TOOL_USE_RECORDS,
@@ -1223,6 +1292,52 @@ mod tests {
         for (i, rec) in out.iter().enumerate() {
             assert_eq!(rec.name, format!("T{}", total - MAX_TOOL_USE_RECORDS + i));
         }
+    }
+
+    /// THE LIVE CALLBACK REPORTS WHAT HAPPENED, not what survived the cap. Every call fires it —
+    /// including the early ones `MAX_TOOL_USE_RECORDS` later evicts — because the cap bounds the
+    /// SIZE of the `concierge:done` payload on the wire, not the truth about the turn. A live
+    /// status line that went silent partway through a runaway would be the exact symptom the live
+    /// event exists to remove.
+    #[test]
+    fn the_live_callback_fires_for_every_call_including_the_ones_eviction_drops() {
+        let total = MAX_TOOL_USE_RECORDS + 25;
+        let blocks: Vec<Value> = (0..total)
+            .map(|i| serde_json::json!({"type": "tool_use", "name": format!("T{i}"), "input": {"i": i}}))
+            .collect();
+        let ev = serde_json::json!({"type": "assistant", "message": {"content": blocks}});
+
+        let mut out: Vec<ToolUseRecord> = Vec::new();
+        let mut live: Vec<String> = Vec::new();
+        capture_tool_uses_with(&ev, &mut out, &mut |name, input| {
+            live.push(format!("{name}:{input}"));
+        });
+
+        assert_eq!(live.len(), total, "the live channel is uncapped: {} of {}", live.len(), total);
+        assert_eq!(live[0], r#"T0:{"i":0}"#, "the first call is reported even though it is evicted");
+        assert_eq!(live[total - 1], format!(r#"T{n}:{{"i":{n}}}"#, n = total - 1));
+        // …and the capped record vector is unchanged by the callback's presence.
+        assert_eq!(out.len(), MAX_TOOL_USE_RECORDS);
+        assert_eq!(out[0].name, format!("T{}", total - MAX_TOOL_USE_RECORDS));
+    }
+
+    /// The live clamp is a DIFFERENT, much smaller cut than the payload clamp, and it lands on a
+    /// character boundary — the arguments are arbitrary UTF-8 and a byte slice would panic here.
+    #[test]
+    fn the_live_clamp_is_smaller_than_the_payload_clamp_and_cuts_on_a_char_boundary() {
+        assert!(
+            MAX_LIVE_TOOL_INPUT_CHARS < MAX_TOOL_USE_INPUT_CHARS,
+            "the live event must not ship the linter-sized payload",
+        );
+        let wide = "🚀漢é".repeat(MAX_LIVE_TOOL_INPUT_CHARS);
+        let clamped = clamp_live_tool_input(wide.clone());
+        assert!(clamped.chars().count() > MAX_LIVE_TOOL_INPUT_CHARS, "the marker is appended");
+        assert!(clamped.chars().count() < MAX_LIVE_TOOL_INPUT_CHARS + 32, "…and only the marker");
+        let kept: String = clamped.chars().take(MAX_LIVE_TOOL_INPUT_CHARS).collect();
+        let expected: String = wide.chars().take(MAX_LIVE_TOOL_INPUT_CHARS).collect();
+        assert_eq!(kept, expected, "the cut is by CHARACTER, not by byte");
+        // A short value is returned whole, unmarked.
+        assert_eq!(clamp_live_tool_input("🚀ok".to_string()), "🚀ok");
     }
 
     /// THE COST OF THE EVICTION DIRECTION, pinned so it is a known trade rather than a surprise

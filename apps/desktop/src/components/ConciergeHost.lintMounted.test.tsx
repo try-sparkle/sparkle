@@ -54,6 +54,9 @@ vi.mock("../services/concierge", () => ({
     return () => {};
   },
   onConciergeError: () => () => {},
+  // The live per-tool status channel — see ConciergeHost.receipts.test.tsx. This mock is total, so
+  // an unstubbed subscriber throws at import and takes the whole file with it.
+  onConciergeTool: () => () => {},
   onConciergeTurnsAbandoned: () => () => {},
   isSupersededDetail: () => false,
   SUPERSEDED_DETAILS: [],

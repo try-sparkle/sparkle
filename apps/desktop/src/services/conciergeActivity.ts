@@ -21,9 +21,13 @@ import {
   conciergeActivityResultSubject,
   conciergeActivitySubject,
   learnsSubjectFromReply,
+  NATIVE_DOMAIN,
+  PHASE_DOMAIN,
   type ConciergeActivitySubject,
+  type ConciergePhase,
   type ConciergeToolActivity,
 } from "../engine/conciergeActivityLine";
+import { conciergeNativeToolLine } from "../engine/conciergeNativeToolLine";
 
 interface ConciergeActivityState {
   /** The most recent call, or null when none has been observed this app run.
@@ -157,6 +161,140 @@ export function noteConciergeToolCall(
       },
     });
   };
+}
+
+/**
+ * Record a NATIVE Claude Code tool call — `Bash`, `Read`, `Grep`, `Task` — observed live on the
+ * `concierge:tool` event.
+ *
+ * ══ WHY THIS IS A SEPARATE ENTRY POINT FROM `noteConciergeToolCall` ═════════════════════════════
+ * Three differences, and the third is the one that shapes the API:
+ *
+ *  1. NO SUBJECT TO RESOLVE. A control call names an agent, a project or a PR by id, and this module
+ *     turns that into a name. A native call carries a shell command or a file path, and neither may
+ *     ever be rendered (a path is not a name a human recognises, and this column has already had to
+ *     have leaked temp paths removed from it). So nothing is resolved; the phrasing module reads the
+ *     arguments to pick a SENTENCE and the arguments themselves are never shown.
+ *
+ *  2. NO OUTCOME, EVER. `dispatchConciergeTool` hands back a reply, which is what lets a control
+ *     call settle from "Reading…" to "Read". A native call's result comes back as a `tool_result`
+ *     block on a *user* record, and Rust's capture only reads `assistant` records — so the app does
+ *     not observe it and MUST NOT claim to. These entries stay `running` for their whole life and
+ *     are superseded rather than settled. That is a real limitation, and it is deliberately left
+ *     visible instead of papered over with a timer: the age LADDER (services/conciergeLiveness) is
+ *     what tells the reader a line has gone stale, and a colour asserts nothing a clock cannot
+ *     support. Inventing a settle would be exactly the confidently-wrong claim this whole feature
+ *     exists to remove.
+ *
+ *  3. IT RETURNS NOTHING. There is no `settle` to call, which is what makes (2) unrepresentable
+ *     rather than merely documented — a caller cannot announce an outcome it never saw.
+ *
+ * FILTERING IS THE CALLER'S JOB, not this module's: `mcp__sparkle-control__*` calls arrive on the
+ * same channel and must be DROPPED here rather than recorded, because the control path already
+ * describes them far better (resolved agent names, clickable pills). See
+ * engine/conciergeNativeToolLine, which returns null for them.
+ */
+export function noteConciergeNativeToolCall(name: string, input: string): void {
+  // Same sign of life a control call is (see `noteConciergeToolCall`) — and for native calls this
+  // matters MORE, not less: a turn that spends a minute shelling out to `git` and `gh` emits no
+  // control calls and no text at all, which is precisely the shape a liveness detector fed on
+  // deltas alone would paint red while the concierge was visibly working.
+  //
+  // Recorded for an UNPHRASABLE call too, and deliberately before the guard below: the liveness
+  // question is "is anything happening", and a call this module has no sentence for is still a call
+  // that happened. Dropping it here would let a turn doing nothing but control calls drift toward
+  // red while it was visibly working.
+  noteConciergeProgress("tool");
+  // ══ NEVER CLOBBER A GOOD LINE WITH ONE THAT CANNOT BE PHRASED (roborev 57845, High) ════════════
+  //
+  // `latest` is a SINGLE SLOT, so writing here always destroys whatever was there. That is fine
+  // when the new entry renders — it is newer and more true — and destructive when it does not:
+  // `conciergeActivityLine` returns null for an unphrasable entry, the indicator falls back to the
+  // bare pulse, and the line we just erased was the good one.
+  //
+  // THE COMMON CASE IS NOT AN EDGE CASE. Every `mcp__sparkle-control__*` call arrives on this same
+  // live channel, and the phrasing module returns null for all of them BY DESIGN, because
+  // controlListener has already recorded the same call with a resolved agent name and a clickable
+  // pill. Without this guard the live event would land a blank entry over the rich line for the
+  // very same call — the feature would actively make the column worse than before it existed.
+  //
+  // ASKED AS "CAN THIS BE PHRASED", not "is this an mcp tool". The rule that matters is the one the
+  // renderer will apply, so this asks the renderer's own question rather than restating a policy
+  // that lives in another module and could drift from it.
+  if (!conciergeNativeToolLine({ name, input })) return;
+  seq += 1;
+  useConciergeActivityStore.setState({
+    latest: {
+      domain: NATIVE_DOMAIN,
+      op: name,
+      nativeInput: input,
+      subject: null,
+      agentId: null,
+      // See (2) above: never anything else.
+      outcome: "running",
+      seq,
+    },
+  });
+}
+
+/**
+ * Record a TURN PHASE — the turn itself starting, or its reply beginning to stream.
+ *
+ * These are what close the two guaranteed gaps in every turn where no tool is running and the
+ * column would otherwise have nothing to say. See {@link PHASE_DOMAIN} for why they satisfy this
+ * module's "observed, never predicted" rule rather than breaking it.
+ *
+ * NOT a sign of life for the liveness clock, and the asymmetry is deliberate. `reading_message` is
+ * recorded BY the send itself, so counting it as progress would mean every send instantly cleared
+ * the silence it just started — the clock would never be able to run, and a turn that died on
+ * arrival would look identical to one being answered. `composing` is only ever recorded from a
+ * delta, and the delta has ALREADY been counted as progress by the host's own handler; counting it
+ * twice changes nothing but invites the question of which one is authoritative.
+ */
+export function noteConciergePhase(phase: ConciergePhase): void {
+  // ══ IDEMPOTENT AT THE STORE (roborev 57845, Medium) ════════════════════════════════════════════
+  //
+  // `composing` is written from the DELTA handler, and Rust spawns claude with
+  // `--include-partial-messages`, so deltas arrive roughly per token chunk — hundreds per turn. An
+  // earlier version of this justified writing unconditionally on the grounds that "no subscriber
+  // re-renders for a second `composing` in a row". That was simply FALSE: `setState` is called with
+  // a fresh object literal every time, and `ThinkingIndicator` selects `s.latest` under zustand's
+  // default `Object.is`, so every write changed the selected reference and re-rendered the
+  // indicator — in a column the codebase elsewhere goes out of its way to keep off high-frequency
+  // updates (the host is deliberately not subscribed to the 1 Hz liveness ticker for exactly this
+  // reason).
+  //
+  // Guarding HERE rather than at the call site keeps the caller honest and simple — it may say
+  // "the reply is streaming" as often as it likes — and makes the property hold for every future
+  // caller rather than for the one that happened to remember.
+  // ══ BUT NEVER FOR `reading_message` (roborev 57870, Medium) ═══════════════════════════════════
+  //
+  // The guard must not be able to suppress a TURN BOUNDARY. `reading_message` is what establishes
+  // a new turn's first entry above `ThinkingIndicator`'s per-turn `seq` floor, so suppressing it
+  // leaves the new turn with nothing above the floor at all — the bare pulse, for the whole gap
+  // before the first tool call.
+  //
+  // That is not a corner case, it is the founder's own reported habit. Two turns in a row that
+  // reach no tool and no text — which is exactly what rapid re-sending produces, since a send
+  // SUPERSEDES the turn in flight rather than queueing behind it — leave `reading_message` as
+  // `latest` when the second turn starts, and an unconditional guard would drop it.
+  //
+  // Exempting it is principled rather than a special case: it is written exactly once per turn, by
+  // a rising-edge effect, so it has no repeats to collapse. The high-frequency caller is
+  // `composing`, which fires per token chunk, and that is the one this guard exists for.
+  const latest = useConciergeActivityStore.getState().latest;
+  if (phase !== "reading_message" && latest?.domain === PHASE_DOMAIN && latest.op === phase) return;
+  seq += 1;
+  useConciergeActivityStore.setState({
+    latest: {
+      domain: PHASE_DOMAIN,
+      op: phase,
+      subject: null,
+      agentId: null,
+      outcome: "running",
+      seq,
+    },
+  });
 }
 
 /** Test-only: drop the recorded activity and the counter, so cases can't see each other's calls. */

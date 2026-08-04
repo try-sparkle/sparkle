@@ -12,6 +12,7 @@ import {
   ThinkingIndicator,
 } from "./ThinkingIndicator";
 import {
+  useConciergeActivityStore,
   _resetConciergeActivityForTests,
   noteConciergeToolCall,
 } from "../../services/conciergeActivity";
@@ -62,14 +63,14 @@ function activityText(): string | null {
 
 describe("ThinkingIndicator", () => {
   it("renders nothing at all when no turn is in flight", () => {
-    render(<ThinkingIndicator typing={false} />);
+    render(<ThinkingIndicator typing={false} floor={-1} />);
     expect(indicator()).toBeNull();
   });
 
   // THE HONEST FALLBACK. A turn that thinks and calls no tools has nothing to report, and the right
   // answer is the pulse it always showed — not an invented status line.
   it("shows the bare pulse when the concierge has done nothing observable", () => {
-    render(<ThinkingIndicator typing />);
+    render(<ThinkingIndicator typing floor={-1} />);
     expect(indicator()).not.toBeNull();
     expect(activityText()).toBeNull();
     expect(indicator()?.querySelector(".sparkle-pulse")?.textContent).toBe("…");
@@ -81,9 +82,9 @@ describe("ThinkingIndicator", () => {
   });
 
   it("says what the concierge is doing once it calls a tool", () => {
-    const { rerender } = render(<ThinkingIndicator typing />);
+    const { rerender } = render(<ThinkingIndicator typing floor={-1} />);
     noteConciergeToolCall("terminal", "read_agent_terminal", { agentId: "gone" });
-    rerender(<ThinkingIndicator typing />);
+    rerender(<ThinkingIndicator typing floor={-1} />);
     expect(activityText()).toBe("Reading an agent's terminal");
     // A real sentence IS worth announcing — it changes once per tool call, not per token, so it
     // carries none of the flooding risk that kept the thread itself off a live region.
@@ -94,13 +95,13 @@ describe("ThinkingIndicator", () => {
   });
 
   it("keeps the pulse beside the line, so a settled call still reads as ongoing", () => {
-    const { rerender } = render(<ThinkingIndicator typing />);
+    const { rerender } = render(<ThinkingIndicator typing floor={-1} />);
     const settle = noteConciergeToolCall("workflow", "merge_pr", { number: 753 });
-    rerender(<ThinkingIndicator typing />);
+    rerender(<ThinkingIndicator typing floor={-1} />);
     expect(activityText()).toBe("Merging PR #753");
 
     settle(true);
-    rerender(<ThinkingIndicator typing />);
+    rerender(<ThinkingIndicator typing floor={-1} />);
     expect(activityText()).toBe("Merged PR #753");
     expect(indicator()?.querySelector(".sparkle-pulse")).not.toBeNull();
   });
@@ -109,10 +110,10 @@ describe("ThinkingIndicator", () => {
   // now — must read as an attempt. The past tense there would have the column announcing the merge
   // directly above the request asking whether to allow it.
   it("reads a refused call as an attempt, not as something that happened", () => {
-    const { rerender } = render(<ThinkingIndicator typing />);
+    const { rerender } = render(<ThinkingIndicator typing floor={-1} />);
     const settle = noteConciergeToolCall("workflow", "merge_pr", { number: 753 });
     settle(false);
-    rerender(<ThinkingIndicator typing />);
+    rerender(<ThinkingIndicator typing floor={-1} />);
     expect(activityText()).toBe("Tried merging PR #753");
   });
 
@@ -120,48 +121,38 @@ describe("ThinkingIndicator", () => {
   // tools with no typing indicator of its own, and the previous turn's last call outlives it — so
   // without this the column would present an old action as what it is doing about the message the
   // user just sent.
+  // THE FLOOR IS AN INPUT NOW (roborev 57933). It used to be derived here from the `typing` edge,
+  // which left this component with its OWN boundary — and on a supersede `typing` never changes, so
+  // that boundary never moved and the row narrated the dead turn beside the new bubble while the
+  // per-message status had already gone quiet. `services/conciergeTurnFloor` owns the one boundary
+  // and both surfaces read it, so the turn is expressed here by handing in the floor the host would.
   it("ignores activity recorded before this turn began", () => {
-    const { rerender } = render(<ThinkingIndicator typing={false} />);
+    const { rerender } = render(<ThinkingIndicator typing={false} floor={-1} />);
     noteConciergeToolCall("terminal", "read_agent_terminal", {});
+    // The boundary the host takes at send: everything recorded so far belongs to the previous turn.
+    const floor = useConciergeActivityStore.getState().latest!.seq;
 
-    rerender(<ThinkingIndicator typing />); // the user sends: a NEW turn starts
+    rerender(<ThinkingIndicator typing floor={floor} />); // the user sends: a NEW turn starts
     expect(indicator()).not.toBeNull();
     expect(activityText()).toBeNull();
 
     // A call made during THIS turn does show.
     noteConciergeToolCall("workspace", "list_projects", {});
-    rerender(<ThinkingIndicator typing />);
+    rerender(<ThinkingIndicator typing floor={floor} />);
     expect(activityText()).toBe("Looking over your projects");
   });
 
-  // The floor is snapshotted on the false→true edge, not on every render — otherwise it would keep
-  // moving past calls that had already arrived and the line would never appear.
-  it("does not re-snapshot the floor on a re-render mid-turn", () => {
-    const { rerender } = render(<ThinkingIndicator typing />);
-    noteConciergeToolCall("workspace", "list_projects", {});
-    rerender(<ThinkingIndicator typing />);
-    rerender(<ThinkingIndicator typing />);
-    expect(activityText()).toBe("Looking over your projects");
-  });
-
-  // A second turn must not inherit the first turn's last line.
-  it("drops the line again when the next turn starts with nothing to report", () => {
-    const { rerender } = render(<ThinkingIndicator typing />);
-    noteConciergeToolCall("workspace", "list_projects", {});
-    rerender(<ThinkingIndicator typing />);
-    expect(activityText()).toBe("Looking over your projects");
-
-    rerender(<ThinkingIndicator typing={false} />); // the turn finishes
-    rerender(<ThinkingIndicator typing />); // and the user sends again
-    expect(activityText()).toBeNull();
-  });
-
+  // NO "does not re-snapshot the floor mid-turn" CASE HERE ANY MORE (roborev 57941-M3). This
+  // component no longer snapshots anything — the floor is handed in — so a case rendering a
+  // constant floor across three renders was structurally unfalsifiable: the assertion held for any
+  // implementation of `latest.seq > floor`. That is the same vacuous shape removed from
+  // conciergeTurnFloor.test.ts, and floor stability genuinely lives there now.
   // A tool the phrase table has no sentence for still shows its own name, but a domain the app does
   // not recognise has nothing truthful to say and falls back to the pulse.
   it("falls back to the pulse for an unrecognised domain", () => {
-    const { rerender } = render(<ThinkingIndicator typing />);
+    const { rerender } = render(<ThinkingIndicator typing floor={-1} />);
     noteConciergeToolCall("filesystem", "rm_rf", {});
-    rerender(<ThinkingIndicator typing />);
+    rerender(<ThinkingIndicator typing floor={-1} />);
     expect(activityText()).toBeNull();
     expect(indicator()?.querySelector(".sparkle-pulse")).not.toBeNull();
   });
@@ -212,12 +203,12 @@ describe("ThinkingIndicator — the wait", () => {
     act(() => {
       vi.advanceTimersByTime(ms);
     });
-    rerender(<ThinkingIndicator typing />);
+    rerender(<ThinkingIndicator typing floor={-1} />);
   }
 
   it("is gray, and completely quiet, for the whole first half-minute", () => {
     noteConciergeSent();
-    const { rerender } = render(<ThinkingIndicator typing />);
+    const { rerender } = render(<ThinkingIndicator typing floor={-1} />);
     // 5s and 20s are where the old version put a counter and the words on screen.
     for (const at of [5_000, 15_000, 9_999]) {
       wait(at, rerender);
@@ -229,7 +220,7 @@ describe("ThinkingIndicator — the wait", () => {
 
   it("turns yellow at thirty seconds, and says nothing", () => {
     noteConciergeSent();
-    const { rerender } = render(<ThinkingIndicator typing />);
+    const { rerender } = render(<ThinkingIndicator typing floor={-1} />);
     wait(SLOW_AFTER_MS - 1_000, rerender);
     expect(ink()).toBe(GRAY);
 
@@ -245,7 +236,7 @@ describe("ThinkingIndicator — the wait", () => {
   // should mean something is actually wrong, not that a reply is taking a moment.*
   it("does NOT go red at thirty seconds — red waits for sixty", () => {
     noteConciergeSent();
-    const { rerender } = render(<ThinkingIndicator typing />);
+    const { rerender } = render(<ThinkingIndicator typing floor={-1} />);
     wait(SLOW_AFTER_MS, rerender);
     expect(ink()).not.toBe(RED);
 
@@ -259,7 +250,7 @@ describe("ThinkingIndicator — the wait", () => {
   // than by a testid, so re-introducing the wording under a different name still fails.
   it("never puts a word or a number on screen, however long the silence runs", () => {
     noteConciergeSent();
-    const { rerender } = render(<ThinkingIndicator typing />);
+    const { rerender } = render(<ThinkingIndicator typing floor={-1} />);
     for (const at of [5_000, 25_000, 30_000, 60_000, 300_000]) {
       wait(at, rerender);
       const text = visibleText();
@@ -275,7 +266,7 @@ describe("ThinkingIndicator — the wait", () => {
   // this row's own aria-live belongs to the activity line and to nothing else.
   it("adds no live region of its own at any colour", () => {
     noteConciergeSent();
-    const { container, rerender } = render(<ThinkingIndicator typing />);
+    const { container, rerender } = render(<ThinkingIndicator typing floor={-1} />);
     for (const at of [0, SLOW_AFTER_MS, STALLED_AFTER_MS - SLOW_AFTER_MS]) {
       wait(at, rerender);
       expect(container.querySelectorAll("[role='status']")).toHaveLength(0);
@@ -292,11 +283,11 @@ describe("ThinkingIndicator — the wait", () => {
   // already says "still going" without claiming the tool call is still running.
   it("keeps the activity line through yellow and red, and only re-inks it", () => {
     noteConciergeSent();
-    const { rerender } = render(<ThinkingIndicator typing />);
+    const { rerender } = render(<ThinkingIndicator typing floor={-1} />);
     // AFTER the first render: the row snapshots an activity floor when a turn starts, so a call
     // recorded before it mounted belongs to the previous turn and is correctly ignored.
     act(() => noteConciergeToolCall("terminal", "read_agent_terminal", { agentId: "gone" }));
-    rerender(<ThinkingIndicator typing />);
+    rerender(<ThinkingIndicator typing floor={-1} />);
     expect(activityText()).toBe("Reading an agent's terminal");
 
     // Measured from the TOOL CALL, which reset the silence clock — that reset is the whole reason a
@@ -313,12 +304,12 @@ describe("ThinkingIndicator — the wait", () => {
   // "Recovering must clear the state promptly" — in the same commit, not on the next tick.
   it("goes back to gray the instant the turn answers", () => {
     noteConciergeSent();
-    const { rerender } = render(<ThinkingIndicator typing />);
+    const { rerender } = render(<ThinkingIndicator typing floor={-1} />);
     wait(STALLED_AFTER_MS, rerender);
     expect(ink()).toBe(RED);
 
     act(() => noteConciergeSettled());
-    rerender(<ThinkingIndicator typing />);
+    rerender(<ThinkingIndicator typing floor={-1} />);
     expect(ink()).toBe(GRAY);
   });
 
@@ -329,9 +320,9 @@ describe("ThinkingIndicator — the wait", () => {
   // waiting" on any AT that read both channels (roborev 56122-M2).
   it("leaves the row's accessible name to the activity line, at every colour", () => {
     noteConciergeSent();
-    const { rerender } = render(<ThinkingIndicator typing />);
+    const { rerender } = render(<ThinkingIndicator typing floor={-1} />);
     act(() => noteConciergeToolCall("terminal", "read_agent_terminal", { agentId: "gone" }));
-    rerender(<ThinkingIndicator typing />);
+    rerender(<ThinkingIndicator typing floor={-1} />);
     for (const at of [0, SLOW_AFTER_MS, STALLED_AFTER_MS - SLOW_AFTER_MS]) {
       wait(at, rerender);
       expect(indicator()?.getAttribute("aria-label")).toBe("Reading an agent's terminal");
@@ -342,7 +333,7 @@ describe("ThinkingIndicator — the wait", () => {
   // The name several suites outside this file identify the row by, kept EXACTLY while there is
   // nothing else to say.
   it("keeps its original accessible name when nothing has happened yet", () => {
-    render(<ThinkingIndicator typing />);
+    render(<ThinkingIndicator typing floor={-1} />);
     expect(indicator()?.getAttribute("aria-label")).toBe("Sparkle is typing");
   });
 });
@@ -384,7 +375,7 @@ describe("ThinkingIndicator — agent references", () => {
           onOpenAgent: onOpenAgent as (t: { agentId: string; projectId: string }) => boolean,
         }}
       >
-        <ThinkingIndicator typing />
+        <ThinkingIndicator typing floor={-1} />
       </AgentPillProvider>
     );
     const r = render(ui(agents));

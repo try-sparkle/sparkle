@@ -27,6 +27,10 @@ const h = vi.hoisted(() => ({
 }));
 
 vi.mock("../services/concierge", () => ({
+  // The LIVE tool channel. A no-op unsubscribe, exactly like its siblings: these suites are about
+  // the host's other wiring, and a mock that simply OMITS an export the host calls does not
+  // degrade — vitest throws on the missing property and every case in the file dies at mount.
+  onConciergeTool: () => () => {},
   onConciergeDelta: () => () => {},
   onConciergeDone: (cb: (e: { id: string; sessionId: string; text: string }) => void) => {
     h.done = cb;

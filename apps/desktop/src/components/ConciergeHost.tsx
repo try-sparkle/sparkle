@@ -64,16 +64,23 @@ import { oneLine } from "./promptHistory";
 import { openProjectTab } from "../services/openProjectTab";
 import { agentExists } from "../services/agentReveal";
 import { useHistoryStore } from "../stores/historyStore";
+import { useConciergeMessageStatuses } from "../services/conciergeMessageStatuses";
+import { useConciergeTurnFloor } from "../services/conciergeTurnFloor";
 import {
   onConciergeDelta,
   onConciergeDone,
   onConciergeError,
+  onConciergeTool,
   onConciergeTurnsAbandoned,
   startConciergeTurn,
   startProactiveConciergeTurn,
   isProactiveTurn,
   isSupersededDetail,
 } from "../services/concierge";
+import {
+  noteConciergeNativeToolCall,
+  noteConciergePhase,
+} from "../services/conciergeActivity";
 import {
   clearConciergeLiveness,
   conciergeSawAnswerText,
@@ -1026,6 +1033,38 @@ export function ConciergeHost({
     [announce],
   );
   const [typing, setTyping] = useState(false);
+  /**
+   * WHICH user bubble the in-flight turn belongs to, as STATE rather than only as
+   * `awaitingBubbleRef`.
+   *
+   * The ref is the right tool for its own job — the orphan check reads it during a send and must
+   * see the value synchronously — but a ref does not re-render, and the per-message status has to
+   * MOVE to a new bubble when the user sends again. Kept beside the ref and written at the same
+   * three points rather than replacing it, because the ref's synchronous read is load-bearing at
+   * the send site and state would be stale exactly there.
+   */
+  const [awaitingId, setAwaitingId] = useState<string | null>(null);
+  /**
+   * Bumped on EVERY send — the turn-boundary signal for `useConciergeTurnFloor`.
+   *
+   * A counter rather than `awaitingId`, because not every send has a bubble: `relayFollowUp` and
+   * the "Also ask Sparkle" replay both send with none, so two of those in a row would leave the id
+   * at `null` and the boundary would never re-take (roborev 57914-M1). A counter cannot collide
+   * with itself.
+   */
+  const [sendSeq, setSendSeq] = useState(0);
+
+  /**
+   * THE TURN BOUNDARY, and the "Reading your message" phase that opens it — the first thing the
+   * column says about a turn, closing the gap between the send and the first tool call.
+   *
+   * KEYED ON THE SEND (`awaitingId`), not on the `typing` transition, because a send SUPERSEDES the
+   * turn in flight rather than queueing behind it and therefore does not move `typing` at all
+   * (roborev 57889-M1). The whole rule, and why it cannot live inline here, is in
+   * services/conciergeTurnFloor — where a test can reach it.
+   */
+  const turnFloor = useConciergeTurnFloor(typing, sendSeq);
+
   // The mic is the dictation hook's now (CM-U9) — it owns armed state, the app-wide dictation
   // target and the live interim transcript, so there is no local micLive to keep in sync.
   const dictation = useConciergeDictation();
@@ -1992,7 +2031,41 @@ export function ConciergeHost({
       // lands, and only for a turn that passed the supersede gate above — a straggler from a turn
       // the user already displaced proves nothing about the one they are waiting on now.
       noteConciergeProgress("text");
+      // THE REPLY IS ARRIVING — say so. This closes the second of the two dead zones in every turn
+      // (the first is the gap before the first tool call, closed by `reading_message` at send): once
+      // the last tool has run, the concierge can spend a long stretch writing, and until now the
+      // column's most recent line was whatever tool it happened to finish with. That line is stale
+      // the moment text starts flowing, and a stale line rendered as live is precisely the class of
+      // lie this feature exists to remove.
+      //
+      // Called on EVERY delta rather than only the first, which means this handler needs no "have I
+      // already said this" flag to get wrong across supersedes, retries and the proactive path.
+      //
+      // THE COST IS PAID IN THE STORE, NOT HERE, and it had to be: deltas arrive roughly per token
+      // chunk (Rust passes `--include-partial-messages`), so this fires hundreds of times a turn.
+      // `noteConciergePhase` is idempotent — a repeat of the phase already recorded is dropped
+      // before it writes — so the indicator re-renders once when composing BEGINS and not again.
+      // An earlier version of this comment claimed the repeat was free because "the rendered line
+      // is identical"; that was false, since each write was a fresh object literal and the
+      // indicator selects `latest` under `Object.is` (roborev 57845).
+      noteConciergePhase("composing");
       upsert(e.id, e.text, false);
+    });
+    // WHAT THE CONCIERGE IS ACTUALLY DOING, tool by tool, while it does it.
+    //
+    // This is the channel that carries `Bash`/`Read`/`Grep`/`Task` — everything that is NOT a
+    // `concierge_tool` control call, which is to say the majority of what a turn spends its time
+    // on. Control calls keep their own richer path (services/controlListener → resolved agent names
+    // and clickable pills) and are DROPPED here by the phrasing module, so a call cannot be
+    // reported twice or have its good line replaced by a generic one.
+    const offTool = onConciergeTool((e) => {
+      // The same supersede gate every other handler in this effect applies. `services/concierge`
+      // has already filtered on `turnIsCurrent` and Rust refuses to emit for a dead turn at all;
+      // this is the third guard, kept for the reason the delta path keeps its own — the failure it
+      // prevents (a displaced turn narrating the column the user is now watching) is exactly the
+      // ambiguity that made the founder ask "are you there".
+      if (supersededTurn(e.id)) return;
+      noteConciergeNativeToolCall(e.name, e.input);
     });
     const offDone = onConciergeDone((e) => {
       if (supersededTurn(e.id)) {
@@ -2012,6 +2085,7 @@ export function ConciergeHost({
         // This bubble got its answer, so the NEXT send has nothing to orphan. Without this, every
         // message would be stamped "never answered" by whatever the user typed after it.
         awaitingBubbleRef.current = null;
+      setAwaitingId(null);
       }
       // ══ THE LINTER RUNS HERE ═══════════════════════════════════════════════════════════════════
       // The reply is COMPLETE at `done`, which is what the checks need: mid-stream, `[@Left Pai` is
@@ -2151,6 +2225,7 @@ export function ConciergeHost({
       // A failure is an ANSWER — the user was told what happened. Not an orphan, so the next send
       // must not stamp this bubble "never answered" on top of the error it already carries.
       awaitingBubbleRef.current = null;
+      setAwaitingId(null);
       const notice = conciergeFailureNotice(e.detail);
       setChat((prev) => [
         ...prev,
@@ -2185,6 +2260,7 @@ export function ConciergeHost({
       // boundary must not preserve a field a turn boundary would.
       clearConciergeLiveness();
       awaitingBubbleRef.current = null;
+      setAwaitingId(null);
       // Every partial reply, not just the abandoned turn's — the ids belong to the previous human and
       // no `done` is coming for any of them to drain the map.
       brainTextRef.current = {};
@@ -2193,6 +2269,7 @@ export function ConciergeHost({
       offDelta();
       offDone();
       offError();
+      offTool();
       offReset();
     };
     // `noteMounted` is `useCallback(…, [])`, so naming it here satisfies the lint rule without
@@ -2842,6 +2919,9 @@ export function ConciergeHost({
       );
     }
     awaitingBubbleRef.current = bubbleId ?? null;
+    setAwaitingId(bubbleId ?? null);
+    // EVERY send moves the boundary, including one with no bubble of its own.
+    setSendSeq((n) => n + 1);
     // The send itself, for the liveness clock. AFTER the orphan check, which reads the state this
     // call is about to reset.
     noteConciergeSent();
@@ -4119,13 +4199,30 @@ export function ConciergeHost({
     needsYouIsolated,
   ]);
 
+  /**
+   * The per-message status map — what the concierge is doing about the specific message it is
+   * working on, rendered under that bubble rather than only at the foot of the column.
+   *
+   * DELIBERATELY OUTSIDE the view-model memo above. That memo is keyed on the agent feed and
+   * already rebuilds several times a second; folding a store subscription into it would make every
+   * tool call rebuild the entire message list, and the thread's rows are memoised precisely to keep
+   * that from happening (see ConciergeMessageRow's header on drag-selection stutter). Composed here
+   * and merged into the model as its own field, so only the map's identity changes when the status
+   * moves.
+   */
+  const messageStatuses = useConciergeMessageStatuses(awaitingId, typing, turnFloor);
+  const modelWithStatuses: ConciergeViewModel = useMemo(
+    () => ({ ...model, statuses: messageStatuses, turnFloor }),
+    [model, messageStatuses, turnFloor],
+  );
+
   return (
     <>
       {/* Renders nothing; speaks the liveness colour through the column's one announcer, and keeps
           that feature's 1 Hz ticker out of this host's render. See the component. */}
       <LivenessAnnouncer announce={announce} />
       <ConciergeColumn
-        model={model}
+        model={modelWithStatuses}
         controller={controller}
         width={width}
         // THE CABLE. `ConciergeColumn` has carried the flood and the lift since the cockpit landed,

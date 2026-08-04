@@ -30,10 +30,70 @@ import type { ApprovalsOp } from "../services/conciergeTools/approvals";
 import type { DiffOp } from "../services/conciergeTools/diff";
 import type { FleetOp } from "../services/conciergeTools/fleet";
 import type { PlansOp } from "../services/conciergeTools/plans";
+import { conciergeNativeToolLine } from "./conciergeNativeToolLine";
 
 /** Which glyph family a line wears. A KIND, not a component: this module stays React-free, and the
  *  indicator maps these onto react-icons/fi (this repo uses Feather; no emoji as icons). */
 export type ConciergeActivityIcon = "agents" | "terminal" | "workflow" | "workspace";
+
+/**
+ * The reserved `domain` for a NATIVE Claude Code tool call — `Bash`, `Read`, `Grep`, `Task` — as
+ * opposed to a `concierge_tool` control call.
+ *
+ * ══ WHY THIS EXISTS: THE DOTS THE FOUNDER KEPT SEEING ═══════════════════════════════════════════
+ * Every phrase table above describes a CONTROL call, dispatched through services/controlListener.
+ * Those are a minority of what a turn actually does. The concierge also shells out — `git`, `gh`,
+ * `bd`, `roborev` — reads files, greps the codebase and dispatches subagents, and until now not one
+ * of those was reported anywhere. The column had nothing to say for the majority of a turn's
+ * elapsed time, so it fell back to the bare pulse, and the founder's complaint was precise: *"when
+ * I ask you a question and I see three dots that go from gray to orange to red, I'm wondering what
+ * more context you can give me about what you're actually doing."*
+ *
+ * The signal was already being parsed — Rust reads every `tool_use` block off the same stream the
+ * deltas come from — it was simply not being sent until the turn was over, which is the one moment
+ * a status line is worthless. It is now emitted live (`concierge:tool`).
+ *
+ * The PHRASING for these lives in ./conciergeNativeToolLine rather than here, because sniffing a
+ * shell command's leading verb is a different kind of decision from mapping a known op to a
+ * sentence: this file's tables are TOTAL over closed unions the compiler checks, while that one is
+ * a heuristic over an open set and has to degrade honestly when it does not recognise something.
+ */
+export const NATIVE_DOMAIN = "native";
+
+/**
+ * The reserved `domain` for a TURN PHASE — a state of the turn itself rather than a tool it ran.
+ *
+ * ══ WHY A SYNTHETIC ENTRY IS STILL "OBSERVED" ═══════════════════════════════════════════════════
+ * services/conciergeActivity's header states the rule this has to answer to: *everything here is
+ * observed, never predicted.* These entries keep that rule. `reading_message` is recorded when a
+ * turn is STARTED — the send genuinely happened, and "reading your message" is the true description
+ * of a turn that has been handed a prompt and not yet done anything else. `composing` is recorded
+ * when the first assistant TEXT DELTA arrives — the app is at that moment literally receiving the
+ * reply. Neither guesses at the model's inner state, and neither is a prediction: both name an
+ * event the app watched happen.
+ *
+ * They exist because the founder's bar is that the fallback should be *rare enough that seeing it
+ * counts as a bug*. Without them there are two guaranteed dead zones in every single turn — the gap
+ * between sending and the first tool call, and the stretch after the last tool call while the reply
+ * streams — and both are stretches where the human is most likely to be staring at the column
+ * wondering whether anything is happening.
+ */
+export const PHASE_DOMAIN = "phase";
+
+/** The turn phases. A closed union so the phrase table below is total over it. */
+export type ConciergePhase = "reading_message" | "composing";
+
+/**
+ * What each phase says. Present tense only, and the `past` is deliberately identical in shape to
+ * the tables above so the same renderer handles it — but a phase never settles: it is superseded by
+ * the next thing that happens, never "finished".
+ */
+const PHASE_PHRASES: Record<ConciergePhase, { text: string; icon: ConciergeActivityIcon }> = {
+  // The founder's own first item: "Reading your message".
+  reading_message: { text: "Reading your message", icon: "workspace" },
+  // The founder's own last item: "Composing".
+  composing: { text: "Composing", icon: "workspace" },
+};
 
 /** One observed `concierge_tool` call, as the indicator sees it.
  *
@@ -62,6 +122,16 @@ export interface ConciergeToolActivity {
    *  not the id is still a correct sentence; it simply cannot be a pill. Keeping them separate is
    *  what stops the id from ever being rendered as words when resolution fails. */
   agentId?: string | null;
+  /**
+   * For a NATIVE call ({@link NATIVE_DOMAIN}) only: the tool's arguments, as Rust's compact JSON,
+   * CLAMPED AT 512 CHARS AND THEREFORE POSSIBLY NOT VALID JSON. Whoever reads it must guard the
+   * parse — see services/concierge's `ConciergeToolEvent`.
+   *
+   * Carried here rather than stuffed into `subject` because it is not a subject: it is the raw
+   * material a heuristic reads to DECIDE the subject, and it must never be rendered. `subject` is
+   * what the sentence says; this never reaches a screen.
+   */
+  nativeInput?: string;
 }
 
 /** The rendered line: a glyph family and one sentence.
@@ -471,6 +541,44 @@ export function learnsSubjectFromReply(domain: string, op: string): boolean {
 export function conciergeActivityLine(
   activity: ConciergeToolActivity,
 ): ConciergeActivityLine | null {
+  // A TURN PHASE, not a tool. Checked before the domain table because `phase` is deliberately NOT a
+  // member of `ConciergeToolDomain` — it is a state of the turn, and adding it to the registry's
+  // union would oblige every consumer of that union to handle a value no control call can ever
+  // carry. See PHASE_DOMAIN for why these entries are observations rather than predictions.
+  //
+  // No tense: a phase is superseded by whatever happens next, never "completed", so there is no
+  // moment at which "Composed" would be the true thing to say. An unknown phase string returns null
+  // and the column falls back to the pulse, which is the honest rendering of "we don't know".
+  if (activity.domain === PHASE_DOMAIN) {
+    const phase = PHASE_PHRASES[activity.op as ConciergePhase];
+    return phase ? { icon: phase.icon, text: phase.text } : null;
+  }
+  // A NATIVE Claude Code tool. Delegated to ./conciergeNativeToolLine, which owns the heuristic
+  // half of the vocabulary — see NATIVE_DOMAIN for why that is a different kind of decision from
+  // the total, compiler-checked tables below.
+  //
+  // Null is a REAL answer here and the common one: every `mcp__sparkle-control__*` call arrives on
+  // the same live channel as the native ones, and that module returns null for all of them because
+  // the control path has already described the same call far better (a resolved agent name, and a
+  // pill the reader can click). Rendering a generic "Used mcp__sparkle-control__sparkle_terminal"
+  // over "Reading Kraken Auth's terminal" would be a strict downgrade of a line we already had.
+  //
+  // NO PAST TENSE IS REACHABLE, and that is not an oversight: a native call never settles (the app
+  // never observes its `tool_result` — see services/conciergeActivity), so `outcome` is always
+  // "running". `past` is carried by the module because it is the honest shape of the data and
+  // because the moment the app CAN observe a native call finishing it is the correct phrase; it is
+  // wired here so that day needs no second change.
+  if (activity.domain === NATIVE_DOMAIN) {
+    const native = conciergeNativeToolLine({
+      name: activity.op,
+      input: activity.nativeInput ?? "",
+    });
+    if (!native) return null;
+    return {
+      icon: native.icon,
+      text: activity.outcome === "done" ? native.past : native.present,
+    };
+  }
   const domain = DOMAINS[activity.domain as ConciergeToolDomain];
   if (!domain) return null;
   const phrase = domain.phrases[activity.op];

@@ -552,6 +552,10 @@ export function ConciergeColumn({
               wired={isWired}
               messages={model.messages}
               typing={model.typing}
+              // The per-message status, straight through. The column does not compose or filter it
+              // — the host owns which message is being worked on, and the row owns how it reads.
+              statuses={model.statuses}
+              turnFloor={model.turnFloor}
               onNudgeClick={controller.onNudgeClick}
               onRevealAgent={controller.onRevealAgent}
               onNudgeAction={controller.onNudgeAction}

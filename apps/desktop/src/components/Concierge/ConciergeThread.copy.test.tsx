@@ -16,6 +16,7 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConciergeThread } from "./ConciergeThread";
+import { MESSAGE_ATTACHMENTS_TESTID } from "../composer/AttachmentStrip";
 import type { ConciergeMessage } from "./types";
 
 let writeText: ReturnType<typeof vi.fn>;
@@ -323,5 +324,66 @@ describe("ConciergeThread — copy affordances", () => {
     expect(onCopied).toHaveBeenCalledWith("answer");
     expect(container.querySelectorAll("[aria-live]")).toHaveLength(0);
     expect(container.querySelectorAll('[role="status"]')).toHaveLength(0);
+  });
+
+  /**
+   * WHERE the glyph sits, not merely THAT it is in the bubble (roborev 58010-M3, corrected by
+   * 58031). Every pre-existing assertion in this file passed identically before the glyph moved, so
+   * the placement was uncovered; the first attempt at covering it was ALSO vacuous, in two ways
+   * worth stating because both are easy to repeat:
+   *
+   *   • `firstElementChild` SKIPS TEXT NODES. `MentionedText` returns a bare fragment — a text node,
+   *     no element — whenever the message has no mentions, so the floated span was the only ELEMENT
+   *     child either way and the ordering assertion held with the glyph before OR after the words.
+   *     The content being ordered against is a text node, so the assertion has to be over
+   *     `childNodes`.
+   *   • The strip guard queried `[data-attachment-strip]`, which exists nowhere in the repo (the
+   *     real marker is MESSAGE_ATTACHMENTS_TESTID), on a fixture carrying no attachments — and
+   *     `AttachmentStrip` renders null for an empty list. It was dead code wrapped in `if (strip)`,
+   *     so the headline fix of that commit had no coverage at all while reading as covered.
+   *
+   * The fixture therefore carries an attachment, the constant is imported rather than re-typed, and
+   * the conditional is gone so an absent strip FAILS rather than skips.
+   */
+  it("floats the copy glyph ahead of the words, in a wrapper that never meets the attachment strip", () => {
+    render(
+      <ConciergeThread
+        messages={[
+          {
+            id: "u1",
+            kind: "you",
+            text: "ship the receipt fix, please",
+            attachments: [{ id: "a1", name: "shot.png", kind: "image", dataUrl: "data:," }],
+          } as ConciergeMessage,
+        ]}
+        onNudgeClick={noop}
+        onNudgeAction={noop}
+      />,
+    );
+    const bubble = screen.getByTestId("you-bubble");
+    const button = bubble.querySelector('[data-testid="concierge-copy-message"]')!;
+    expect(button).toBeTruthy();
+    // Walk UP to the floated ancestor rather than assuming a depth: CopyAnswerButton owns its own
+    // wrapper element, so the float is not necessarily the button's direct parent.
+    let wrapper = button.parentElement as HTMLElement | null;
+    while (wrapper && wrapper.style.float !== "right" && wrapper !== bubble) {
+      wrapper = wrapper.parentElement;
+    }
+    expect(wrapper).toBeTruthy();
+    expect(wrapper!.style.float).toBe("right");
+
+    // ORDERING, over childNodes so the text node counts. This is what puts the glyph on the first
+    // line rather than below the words.
+    expect(wrapper!.parentElement!.childNodes[0]).toBe(wrapper);
+
+    // AND THE SCOPING, which is the layout fix itself: the float's block must not contain — or
+    // precede — the attachment strip. A float that met that block-level flex container would narrow
+    // it for its full height, squeezing the thumbnails (roborev 58010-M1). No conditional: an
+    // absent strip is a broken fixture, not a skipped check.
+    const strip = screen.getByTestId(MESSAGE_ATTACHMENTS_TESTID);
+    expect(wrapper!.parentElement!.contains(strip)).toBe(false);
+    expect(
+      strip.compareDocumentPosition(wrapper!.parentElement!) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
   });
 });

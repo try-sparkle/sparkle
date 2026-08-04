@@ -58,6 +58,37 @@ export interface ConciergeDoneEvent {
   toolCalls: ConciergeToolCall[];
 }
 
+/**
+ * ONE tool call, delivered WHILE THE TURN IS STILL RUNNING (`concierge:tool`).
+ *
+ * ══ WHY THIS EXISTS ALONGSIDE `ConciergeDoneEvent.toolCalls` ════════════════════════════════════
+ * They carry the same facts at opposite ends of a turn, for opposite consumers. `toolCalls` rides
+ * the `done` event and is a COMPLETE, correlated record for after-the-fact analysis (the concierge
+ * lint reads it to ask "did the reply paste back the text we relayed?"), which is why its `input`
+ * is kept at full length. That record is worthless for a status line: it arrives when the turn is
+ * over and there is nothing left to report.
+ *
+ * This one is the live half. Rust emits it from the same drain loop that emits `concierge:delta`,
+ * the moment a `tool_use` block is parsed, so the column can say what the concierge is doing while
+ * it is still doing it. Its `input` is clamped much shorter (512 chars, Rust's
+ * `MAX_LIVE_TOOL_INPUT_CHARS`) because the only consumer sniffs the leading verb of a command or
+ * the kind of a path — it never renders the payload.
+ *
+ * CONSEQUENCE FOR CALLERS: `input` MAY BE TRUNCATED AND THEREFORE NOT VALID JSON. Do not
+ * `JSON.parse` it without a guard — see `engine/conciergeNativeToolLine`, which owns that parse.
+ *
+ * `name` is the tool's name verbatim as Claude Code reported it — "Bash", "Read", "Grep",
+ * "mcp__sparkle-control__sparkle_terminal". It is NOT filtered here: the `mcp__sparkle-control__*`
+ * calls also arrive on this channel, and dropping them is a POLICY decision that belongs with the
+ * phrasing (those calls are already described far better by the control path, which has resolved
+ * agent names and clickable pills). Transport reports; policy decides.
+ */
+export interface ConciergeToolEvent {
+  id: string;
+  name: string;
+  input: string;
+}
+
 /** A failed turn (`concierge:error`). `detail` is the most specific reason available (claude's
  *  own error text, stderr, or an exit-status phrase). */
 export interface ConciergeErrorEvent {
@@ -166,6 +197,7 @@ type Callback<T> = (event: T) => void;
 const deltaCallbacks = new Set<Callback<ConciergeDeltaEvent>>();
 const doneCallbacks = new Set<Callback<ConciergeDoneEvent>>();
 const errorCallbacks = new Set<Callback<ConciergeErrorEvent>>();
+const toolCallbacks = new Set<Callback<ConciergeToolEvent>>();
 
 /** The concierge's ongoing Claude Code session, captured from the last `concierge:done`.
  *  Module-level (not store state): it mirrors a real process-side resource, so it is never
@@ -463,6 +495,18 @@ function ensureWired(): Promise<void> {
         // the pointer alone fixes what the model remembers and leaves what the human SEES.
         listen<ConciergeDeltaEvent>("concierge:delta", (ev) => {
           if (turnIsCurrent(ev.payload.id)) dispatch(deltaCallbacks, ev.payload);
+        }),
+        // GATED ON `turnIsCurrent` EXACTLY LIKE THE DELTA ABOVE, and for the identical reason.
+        // Rust already refuses to emit for a superseded turn; this is the same belt-and-braces the
+        // delta path keeps (roborev 53088/53105/53130), and it additionally covers the identity
+        // reset the comment above describes — a pre-sign-out turn must not narrate the new human's
+        // column any more than it may write text into it.
+        //
+        // A stale tool line is the specific lie this feature must not tell: the whole point of the
+        // status line is that it distinguishes a working concierge from a wedged one, and a line
+        // left over from a turn the user already replaced reads exactly like live work.
+        listen<ConciergeToolEvent>("concierge:tool", (ev) => {
+          if (turnIsCurrent(ev.payload.id)) dispatch(toolCallbacks, ev.payload);
         }),
         listen<ConciergeDoneEvent>("concierge:done", (ev) => {
           // A turn that COMPLETED is the strongest evidence a session exists and is resumable, so it
@@ -902,6 +946,20 @@ export async function cancelConciergeTurn(): Promise<void> {
 }
 
 /** Subscribe to incremental reply text. Returns a synchronous unsubscribe. */
+/**
+ * Subscribe to LIVE tool calls — every `tool_use` block the turn emits, as it emits it. Returns a
+ * synchronous unsubscribe.
+ *
+ * Deliberately does NOT start the session probe the delta subscriber does: this is a passive
+ * observer of a turn somebody else started, and a status line must never be the thing that causes a
+ * disk probe.
+ */
+export function onConciergeTool(cb: Callback<ConciergeToolEvent>): () => void {
+  toolCallbacks.add(cb);
+  void ensureWired().catch((e) => console.warn("concierge: event wiring failed:", e));
+  return () => toolCallbacks.delete(cb);
+}
+
 export function onConciergeDelta(cb: Callback<ConciergeDeltaEvent>): () => void {
   deltaCallbacks.add(cb);
   void ensureWired().catch((e) => console.warn("concierge: event wiring failed:", e));
@@ -996,6 +1054,7 @@ export function _resetConciergeForTests(opts?: { keepRetiredSessions?: boolean }
   deltaCallbacks.clear();
   doneCallbacks.clear();
   errorCallbacks.clear();
+  toolCallbacks.clear();
   abandonCallbacks.clear();
   currentSessionId = null;
   fallbackSessionId = null;

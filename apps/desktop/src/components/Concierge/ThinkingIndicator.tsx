@@ -67,7 +67,6 @@
 // announcement has to go through the column's single live region, which only the host can feed —
 // and because subscribing the host itself to this 1 Hz ticker would reconcile the entire column
 // once a second for the length of every turn (roborev 56177-M2).
-import { useState } from "react";
 import { FiFolder, FiGitBranch, FiTerminal, FiUsers } from "react-icons/fi";
 import type { IconType } from "react-icons";
 
@@ -111,38 +110,25 @@ const INK: Record<ConciergeLiveness, string> = {
   stalled: C.sienna,
 };
 
-export function ThinkingIndicator({ typing }: { typing: boolean }) {
+export function ThinkingIndicator({ typing, floor }: { typing: boolean; floor: number }) {
   const latest = useConciergeActivityStore((s) => s.latest);
   const { liveness } = useConciergeLiveness();
-  /** The turn boundary: `floor` is the activity counter as it stood when this turn began, so
-   *  anything at or below it belongs to an earlier one. -1 rather than 0 so the very first call of
-   *  an app run (seq 1) still clears it.
+  /**
+   * THE TURN BOUNDARY IS NOW HANDED IN — ONE boundary for the whole column (roborev 57933).
    *
-   *  DERIVED DURING RENDER, not in an effect. An effect runs after the commit, so the false→true
-   *  render — the very first frame of a new turn — would paint with the PREVIOUS turn's floor and
-   *  show its last line as this turn's activity, and nothing would re-render to correct it until the
-   *  next store write. Setting state during render is React's sanctioned answer to exactly this
-   *  ("adjusting state when a prop changes"): the component re-runs before anything is committed, so
-   *  the stale frame is never shown. */
-  // The initializer covers a MOUNT that lands mid-turn (the column is remounted, the webview
-  // reloads): the floor has to be taken then too, or the previous turn's last call would be shown
-  // as this one's.
-  const [turn, setTurn] = useState(() => ({
-    typing,
-    floor: typing ? (useConciergeActivityStore.getState().latest?.seq ?? 0) : -1,
-  }));
-  if (turn.typing !== typing) {
-    setTurn({
-      typing,
-      // Only a STARTING turn moves the floor. Keeping it on the way down costs nothing and means the
-      // floor is only ever read while typing anyway.
-      floor: typing ? (useConciergeActivityStore.getState().latest?.seq ?? 0) : turn.floor,
-    });
-  }
-
+   * This used to derive its own, keyed on the `typing` transition alone. That is the defect shape
+   * fixed elsewhere as roborev 57889-M1 and it was still live HERE: a supersede leaves `typing`
+   * true, so this floor never moved and the row went on narrating the DEAD turn — "Reading Kraken
+   * Auth's terminal" — beside the brand-new bubble, while the per-message status for the very same
+   * frame had already gone quiet. Two surfaces reporting the same turn, disagreeing.
+   *
+   * `services/conciergeTurnFloor` owns it now, keyed on an unconditional per-send counter and
+   * snapshotted during render, and both surfaces read that one value. The reason its header can
+   * claim to fix this component is that it now feeds it.
+   */
   if (!typing) return null;
 
-  const fresh = latest && latest.seq > turn.floor ? latest : null;
+  const fresh = latest && latest.seq > floor ? latest : null;
   const line = fresh ? conciergeActivityLine(fresh) : null;
   // NO SUBSTITUTION, only a tint. The previous version swapped the tool glyph for an alert icon and
   // suppressed the activity line once it judged us silent, on the reasoning that a stale "Reading
