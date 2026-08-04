@@ -646,11 +646,23 @@ describe("ConciergeHost — a terminal that must not receive free text refuses",
     await elapse();
     expect(h.dispatchConciergeAnswer).not.toHaveBeenCalled();
     await waitFor(() => expect(box().value).toBe("@Kraken Auth ship the DMG"));
-    await waitFor(() =>
-      expect(screen.getByTestId(CONCIERGE_THREAD_TESTID).textContent ?? "").not.toContain(
-        "ship the DMG",
-      ),
-    );
+    // ══ RETRACTED *AND* EXPLAINED (roborev 57784) ═══════════════════════════════════════════════
+    // Both halves off ONE read of the thread, so the two facts describe a single render rather than
+    // two instants that might disagree.
+    //
+    // The positive half is not decoration. `postSparkle(terminalRefusalLine(…))` at this instant is
+    // observable ONLY unmounted — the mounted row asserts `notice()`, which comes from the separate
+    // `noteMounted` call — so this row is the only place in the suite where deleting it could fail
+    // anything. Without it the founder gets his words back and his bubble retracted with NO
+    // explanation, which is exactly the "both refusal instants tell the same story" invariant
+    // roborev 57360 was filed for. Third instance of this same unobservable-branch class in this
+    // file; the retraction and the explanation must be asserted together or one of them rots.
+    await waitFor(() => {
+      const thread = screen.getByTestId(CONCIERGE_THREAD_TESTID).textContent ?? "";
+      expect(thread).not.toContain("ship the DMG");
+      expect(thread).toContain("full-screen app");
+      expect(thread).toContain("Kraken Auth");
+    });
   });
 
   // The control for every row in this block: with a clean screen the same message goes through.
