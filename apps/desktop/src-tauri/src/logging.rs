@@ -199,4 +199,3 @@ pub fn frontend_log(entry: FrontendLog) {
         _ => tracing::info!(target: "ui", scope, "{msg}"),
     }
 }
-
