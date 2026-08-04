@@ -226,9 +226,20 @@ describe("his own message says it was answered", () => {
     );
   });
 
-  it("leaves the unanswered stamp alone on a message no reply ever named", () => {
-    // The stamp is only withdrawn by EVIDENCE. A message that really was displaced and never
-    // answered must keep saying so — withdrawing it wholesale would be the mirror-image lie.
+  it("puts no answered-below marker on a message no reply ever named", () => {
+    // ══ RENAMED, BECAUSE THE OLD NAME PROMISED A GUARANTEE NOTHING HELD (roborev 57896) ══════════
+    // This was "leaves the unanswered stamp alone on a message no reply ever named", over a comment
+    // claiming the stamp is withdrawn only by EVIDENCE. Both went stale on 2026-07-31, when the
+    // founder had the "never answered" line deleted outright: `receiptText` does not read
+    // `unanswered` at all any more, so there is no stamp to leave alone in any case, evidence or
+    // not. A name and a comment promising evidence-gating over an assertion that holds identically
+    // for every sibling row is the same false-comment class this file's neighbours were just fixed
+    // for — and worse, it would fail on exactly the input where, by its own name, the line SHOULD
+    // reappear if that call were ever reversed.
+    //
+    // What genuinely distinguishes this row from its siblings is the MARKER, so that is what it now
+    // pins: `you-1` was displaced and no reply ever named it, so nothing may point at an answer that
+    // does not exist. The negative on the receipt wording is kept as the tripwire it always was.
     mount([
       {
         id: "you-1",
@@ -237,8 +248,12 @@ describe("his own message says it was answered", () => {
         receipt: { target: "sparkle", unanswered: true },
       },
     ]);
-    // Asserted as the WORDING it must never carry, for the reason above: the stamp is withdrawn only
-    // by evidence, and a presence check would pass against a build that restored the deleted claim.
+    // THE DISCRIMINATOR: no reply named `you-1`, so there is no "Answered below" marker. This is the
+    // assertion the row's name is actually about, and the one that does not hold for the answered
+    // case at the top of this block.
+    expect(screen.queryByTestId(ANSWERED_MARKER_TESTID)).toBeNull();
+    // And the receipt still may not carry the deleted claim — kept as a tripwire, not as this row's
+    // point, since it holds for every sibling too.
     expect(screen.getByTestId("routing-receipt").textContent).not.toMatch(
       /never answered|replaced by your next message/i,
     );
