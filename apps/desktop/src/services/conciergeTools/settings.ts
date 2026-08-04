@@ -288,7 +288,11 @@ function rootProblem(projectRoot: string): string | null {
 /** Normalize a validated root the same way workspace.ts does, so the two agree on what "the same
  *  project" means: trailing separators dropped, but never the leading one of `/`. */
 function normalizeRoot(projectRoot: string): string {
-  return projectRoot.trim().replace(/(?<=.)[/\\]+$/, "");
+  // WITHOUT A LOOKBEHIND, deliberately (safari14 build target — a lookbehind assertion is a PARSE
+  // error there, taking out this whole module and everything importing it; roborev 54174 / me54).
+  // The `|| trimmed.slice(0, 1)` preserves a bare root (`/`, `C:\`) exactly as the `(?<=.)` did.
+  const trimmed = projectRoot.trim();
+  return trimmed.replace(/[/\\]+$/, "") || trimmed.slice(0, 1);
 }
 
 /**

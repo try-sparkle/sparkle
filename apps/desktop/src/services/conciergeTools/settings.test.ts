@@ -139,6 +139,14 @@ describe("no native modal is reachable, and the project root is explicit", () =>
     expect(code()).not.toMatch(/DELIBERATELY ABSENT/);
   });
 
+  // A regex lookbehind ((?<=…) / (?<!…)) is a PARSE error in the safari14 WebView this app pins
+  // (esbuild does not downlevel regex features), and a parse error takes out the WHOLE module and
+  // everything importing it — not just the one call. `code()` strips comments, so the header's
+  // mention of the old pattern does not count. (me54 / roborev 54174.)
+  it("stays lookbehind-free for the safari14 build target", () => {
+    expect(code()).not.toMatch(/\(\?<[=!]/);
+  });
+
   it("never imports the folder/file picker module", () => {
     expect(code()).not.toMatch(/from\s+"\.\.\/dialog"/);
     expect(code()).not.toMatch(/@tauri-apps\/plugin-dialog/);

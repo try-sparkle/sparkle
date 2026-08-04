@@ -22,14 +22,23 @@
 const HIGH_START = 0xd800;
 const HIGH_END = 0xdbff;
 
-/** A high surrogate not followed by a low one, or a low surrogate not preceded by a high one. */
-const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+/** Scans surrogates WITHOUT A LOOKBEHIND (safari14 build target — a lookbehind assertion is a PARSE
+ *  error there, taking out this module and everything importing it; roborev 54174 / me54). A valid
+ *  PAIR matches the first alternative and is consumed whole, so any surrogate left over — a high not
+ *  followed by a low, or a low not preceded by a high — can only match the second alternative. The
+ *  captured group is therefore set exactly for a LONE surrogate, replacing what the old lookbehind
+ *  ("a low not preceded by a high") did. */
+const SURROGATE_SCAN = /[\uD800-\uDBFF][\uDC00-\uDFFF]|([\uD800-\uDFFF])/g;
 
 /** True if `s` contains an unpaired surrogate — i.e. `JSON.stringify(s)` would emit an escape that
  *  serde_json refuses to parse. Exported so tests (and callers) can assert the invariant directly. */
 export function hasLoneSurrogate(s: string): boolean {
-  LONE_SURROGATE.lastIndex = 0; // the regex is /g; reset so the check is stateless
-  return LONE_SURROGATE.test(s);
+  SURROGATE_SCAN.lastIndex = 0; // the regex is /g; reset so the scan is stateless
+  let m: RegExpExecArray | null;
+  while ((m = SURROGATE_SCAN.exec(s)) !== null) {
+    if (m[1] !== undefined) return true; // the captured group is set only for a lone surrogate
+  }
+  return false;
 }
 
 /** Truncate to at most `maxUnits` UTF-16 code units WITHOUT splitting a surrogate pair.
@@ -56,7 +65,9 @@ export function truncateOnBoundary(s: string, maxUnits: number): string {
  *  clipboard paste — not a substitute for truncating safely at the source. */
 export function stripLoneSurrogates(s: string): string {
   if (!hasLoneSurrogate(s)) return s;
-  return s.replace(LONE_SURROGATE, "�");
+  // A valid pair matches the first alternative (captured group undefined) and is kept unchanged; a
+  // lone surrogate matches the captured second alternative and is replaced with U+FFFD.
+  return s.replace(SURROGATE_SCAN, (whole, lone) => (lone === undefined ? whole : "�"));
 }
 
 /** Both guards in the order they matter: cap the length on a character boundary, then repair any

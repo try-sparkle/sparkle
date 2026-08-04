@@ -1,4 +1,6 @@
 import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import {
   truncateOnBoundary,
   stripLoneSurrogates,
@@ -12,6 +14,35 @@ import {
 //   "unexpected end of hex escape at line N column N"
 // which is the publish_window_roster failure this module exists to prevent.
 const PARTY = "\u{1F389}";
+
+describe("safeText stays lookbehind-free (safari14 build target, me54)", () => {
+  // A lookbehind ((?<=…)/(?<!…)) is a PARSE error in the safari14 WebView the app pins, and esbuild
+  // does not downlevel it — the literal reaches the WebView intact and takes out this whole module
+  // and everything importing it. Comments are stripped so the header's mention does not count.
+  const code = readFileSync(resolve(process.cwd(), "src/services/safeText.ts"), "utf8")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/^\s*\/\/.*$/gm, "");
+  it("uses no regex lookbehind", () => {
+    expect(code).not.toMatch(/\(\?<[=!]/);
+  });
+});
+
+describe("stripLoneSurrogates (lookbehind-free repair)", () => {
+  it("keeps a valid surrogate pair intact", () => {
+    expect(stripLoneSurrogates(`a ${PARTY} b`)).toBe(`a ${PARTY} b`);
+    expect(hasLoneSurrogate(stripLoneSurrogates(`a ${PARTY} b`))).toBe(false);
+  });
+  it("replaces a lone LEADING (high) surrogate with U+FFFD", () => {
+    expect(stripLoneSurrogates("hi \uD83C")).toBe("hi �");
+  });
+  it("replaces a lone TRAILING (low) surrogate — the case the old lookbehind caught", () => {
+    expect(stripLoneSurrogates("\uDF89 hi")).toBe("� hi");
+  });
+  it("repairs only the lone surrogate when a valid pair sits beside it", () => {
+    // A valid pair (PARTY) then a lone HIGH surrogate: the pair is kept, only the lone one repaired.
+    expect(stripLoneSurrogates(`${PARTY}\uD83C`)).toBe(`${PARTY}�`);
+  });
+});
 
 describe("hasLoneSurrogate", () => {
   it("detects a lone leading surrogate (the serde-fatal case)", () => {
