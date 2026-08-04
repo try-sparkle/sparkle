@@ -2862,8 +2862,18 @@ pub async fn start_cloud_stream(
 /// Close the Deepgram cloud stream (the frontend calls this on the stop word, or it's called
 /// during stop_dictation). Flushes Deepgram for the trailing final result, then routes frames
 /// back to the on-device model for continued wake-word listening.
+///
+/// MUST stay `async fn`, for the SAME reason `start_cloud_stream` above does. A plain sync
+/// `#[tauri::command]` is `ExecutionContext::Blocking`, which runs the body INLINE on the
+/// IPC/event-loop (macOS main) thread — and `DeepgramSession::finish()` blocks it on a Deepgram
+/// flush (a network round trip that stalls on a slow/black-holed relay exactly as the handshake
+/// did). All the state mutations (epoch bump, cloud-slot take, cloud_tx drop) still happen
+/// synchronously under the lock BEFORE the first await, so the epoch/generation protocol is
+/// unchanged; only the blocking `finish()` moves to `spawn_blocking`. The `.await` keeps the
+/// teardown ordered — the command does not resolve until the flush completes, so a caller awaiting
+/// it still sees a fully torn-down stream.
 #[tauri::command]
-pub fn stop_cloud_stream(state: State<DictationState>) {
+pub async fn stop_cloud_stream(state: State<'_, DictationState>) -> Result<(), ()> {
     let to_finish = {
         let sess = state.0.lock().unwrap_or_else(|p| p.into_inner());
         let was_active = sess.cloud_active.swap(false, Ordering::Relaxed); // callback routes on-device again
@@ -2896,9 +2906,14 @@ pub fn stop_cloud_stream(state: State<DictationState>) {
             cloud.take()
         }
     }; // release locks before the (slower) finish()/join
+    // Move the blocking Deepgram flush off the calling (IPC/event-loop) thread — see the fn doc.
+    // The session was already taken OUT of the slot under the lock above, so finishing it here can
+    // never contend with a session a concurrent start_cloud_stream installs; this is the same
+    // take-then-finish-off-thread shape start_cloud_stream uses for its stale/orphan sockets.
     if let Some(s) = to_finish {
-        s.finish();
+        let _ = tauri::async_runtime::spawn_blocking(move || s.finish()).await;
     }
+    Ok(())
 }
 
 // ── Input device picker commands ───────────────────────────────────────────────────────────────
@@ -2985,8 +3000,19 @@ pub fn set_allow_virtual_input(
     Ok(())
 }
 
+/// MUST stay `async fn`, for the SAME reason `start_dictation` above does. A plain sync
+/// `#[tauri::command]` is `ExecutionContext::Blocking`, running the body INLINE on the
+/// IPC/event-loop (macOS main) thread — where the teardown below blocks it: the decode-worker join
+/// (a bounded drain, but up to `DECODE_DRAIN_BUDGET`), the Deepgram `finish()` flush (a network
+/// round trip), and the on-device `finalize()` (a synchronous decode). Any of those froze the UI on
+/// mute. All the state mutations (disarm, epoch bump, capture/cloud/tx teardown) still run
+/// synchronously under the lock BEFORE the first await, so the epoch protocol and idempotence are
+/// unchanged; only the blocking join/finish/finalize/emit moves to `spawn_blocking`. The `.await`
+/// keeps it ordered — the command does not resolve until teardown finishes, so the frontend's
+/// `await invoke("stop_dictation")` (which relies on metering having stopped) still sees a completed
+/// stop.
 #[tauri::command]
-pub fn stop_dictation(app: AppHandle, state: State<DictationState>) {
+pub async fn stop_dictation(app: AppHandle, state: State<'_, DictationState>) -> Result<(), ()> {
     let (transcriber, cloud_session, worker) = {
         let mut sess = state.0.lock().unwrap_or_else(|p| p.into_inner());
         // Idempotence: one mute is broadcast to every open window, so this command arrives N times
@@ -3000,7 +3026,7 @@ pub fn stop_dictation(app: AppHandle, state: State<DictationState>) {
             sess.transcriber.is_some(),
             start_could_still_arm,
         ) {
-            return;
+            return Ok(());
         }
         sess.armed = false;             // disarm so a later focus event can't resurrect the mic
         // Advance the stop epoch so an in-flight start_dictation still loading the model observes
@@ -3015,33 +3041,44 @@ pub fn stop_dictation(app: AppHandle, state: State<DictationState>) {
         (sess.transcriber.take(), cloud_session, worker)
     };                                  // release the session lock before the (slower) join/finalize
     tracing::info!(target: "dictation", "stop_dictation: capture dropped, finalizing");
-    // Wait for the decode worker BEFORE finalize. This is the one teardown that does NOT abort
-    // first: it wants the worker to drain its queued accept-path segments — emitting their
-    // `dictation://partial`s — so they land before finalize's trailing segment and the closing
-    // `dictation://final`, preserving the in-order emit.
-    //
-    // THAT DRAIN IS BEST-EFFORT WITHIN A BUDGET, not a guarantee — this comment used to claim the
-    // guarantee, and it was only ever true while the channel reliably closed here (the premise
-    // `DECODE_JOIN_TIMEOUT` documents as false). The drain gets `DECODE_DRAIN_BUDGET`; past it the
-    // worker is aborted and the REST OF THE BACKLOG IS DISCARDED, so the tail of a long dictation
-    // can be dropped rather than emitted. Reachable in practice: `DECODE_QUEUE_CAP` is 32 segments,
-    // so a slow machine or a burst can queue more decoding than the budget covers. The alternative
-    // is worse — this runs on the main thread, so an unbounded drain is a UI freeze (roborev 55788).
-    drop(worker);
-    // Flush the cloud stream first (if dictation was stopped mid-cloud) for its trailing final.
-    if let Some(s) = cloud_session {
-        s.finish();
-    }
-    // DELIBERATELY no `dictation://speech-end` here, unlike the worker's `accept` segments above.
-    // This is a teardown flush: capture has already stopped, so what it emits is the tail the VAD
-    // never got to close — not the engine observing the speaker fall silent. Arming a send
-    // countdown at this point would count down over a mic the user just muted, and would fire
-    // AFTER they stopped dictating, which is precisely the moment they are least able to catch it.
-    // Stopping dictation is the user taking manual control; the send decision is theirs from here.
-    if let Some(t) = transcriber {
-        for seg in t.lock().unwrap_or_else(|p| p.into_inner()).finalize() { emit_partial(&app, "finalize", seg); }
-    }
-    let _ = app.emit("dictation://final", String::new());
+    // The whole blocking teardown (worker join/drain, cloud flush, on-device finalize, and the final
+    // emit that must follow finalize) moves off the calling (IPC/event-loop) thread via
+    // `spawn_blocking`, and the `.await` keeps it ordered and complete before the command resolves —
+    // see the fn doc. It is one closure, not several awaits, so the in-order emit contract (queued
+    // accept partials, then finalize's tail, then the closing `dictation://final`) is preserved
+    // exactly as when it ran inline. The `join()` no longer runs on the main thread, so the
+    // best-effort-within-budget drain below is now bounded by a blocking-pool thread instead.
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        // Wait for the decode worker BEFORE finalize. This is the one teardown that does NOT abort
+        // first: it wants the worker to drain its queued accept-path segments — emitting their
+        // `dictation://partial`s — so they land before finalize's trailing segment and the closing
+        // `dictation://final`, preserving the in-order emit.
+        //
+        // THAT DRAIN IS BEST-EFFORT WITHIN A BUDGET, not a guarantee — this comment used to claim the
+        // guarantee, and it was only ever true while the channel reliably closed here (the premise
+        // `DECODE_JOIN_TIMEOUT` documents as false). The drain gets `DECODE_DRAIN_BUDGET`; past it the
+        // worker is aborted and the REST OF THE BACKLOG IS DISCARDED, so the tail of a long dictation
+        // can be dropped rather than emitted. Reachable in practice: `DECODE_QUEUE_CAP` is 32 segments,
+        // so a slow machine or a burst can queue more decoding than the budget covers. Now off the
+        // main thread, an over-budget drain no longer freezes the UI (roborev 55788).
+        drop(worker);
+        // Flush the cloud stream first (if dictation was stopped mid-cloud) for its trailing final.
+        if let Some(s) = cloud_session {
+            s.finish();
+        }
+        // DELIBERATELY no `dictation://speech-end` here, unlike the worker's `accept` segments above.
+        // This is a teardown flush: capture has already stopped, so what it emits is the tail the VAD
+        // never got to close — not the engine observing the speaker fall silent. Arming a send
+        // countdown at this point would count down over a mic the user just muted, and would fire
+        // AFTER they stopped dictating, which is precisely the moment they are least able to catch it.
+        // Stopping dictation is the user taking manual control; the send decision is theirs from here.
+        if let Some(t) = transcriber {
+            for seg in t.lock().unwrap_or_else(|p| p.into_inner()).finalize() { emit_partial(&app, "finalize", seg); }
+        }
+        let _ = app.emit("dictation://final", String::new());
+    })
+    .await;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4781,6 +4818,43 @@ mod tests {
         ) {
         }
         off_the_main_thread(super::start_dictation);
+    }
+
+    /// The SAME freeze guard, for the two STOP commands (sparkle-aah5). `start_dictation` was moved
+    /// off the main thread, but `stop_dictation` and `stop_cloud_stream` were left as sync
+    /// `#[tauri::command]`s doing the blocking teardown — the decode-worker join, the Deepgram
+    /// `finish()` flush, the on-device `finalize()` — INLINE on the IPC/event-loop thread, so muting
+    /// or ending a cloud stream froze the UI exactly the way the first-run load once did.
+    ///
+    /// The fix is `async fn` + `spawn_blocking`, and this is the compile-time tripwire that keeps it
+    /// that way: an async command returns a FUTURE, so both symbols coerce to a `fn(..) -> F` where
+    /// `F: Future + Send`. Drop the `async` from either and tauri-macros silently reclassifies it as
+    /// `ExecutionContext::Blocking` (inline on the main thread again) — its signature is then
+    /// `fn(..) -> ()`, which does not satisfy `Future`, and THIS TEST STOPS COMPILING. `Send` is the
+    /// second half: `respond_async_serialized` requires it, and the only realistic way to lose it is
+    /// holding the session `std::sync::Mutex` guard across the `.await` — the precise mistake the
+    /// epoch protocol cannot survive — so this also pins "drop the lock before awaiting the
+    /// teardown" as a compile error rather than a comment.
+    ///
+    /// Asserting the SIGNATURE, not a runtime effect, is deliberate: the fix IS the signature (it is
+    /// what selects the async execution context), the teardown itself needs a live Tauri `AppHandle`
+    /// + `State` that a unit test cannot construct, and this is the same shape the sibling
+    /// `start_dictation_is_async_and_its_future_is_send` uses for the identical property.
+    #[test]
+    fn the_stop_commands_are_async_and_their_futures_are_send() {
+        // stop_dictation: (AppHandle, State) -> impl Future + Send
+        fn stop_off_the_main_thread<'r, F: std::future::Future + Send>(
+            _: fn(AppHandle, State<'r, DictationState>) -> F,
+        ) {
+        }
+        stop_off_the_main_thread(super::stop_dictation);
+
+        // stop_cloud_stream: (State) -> impl Future + Send  (no AppHandle arg)
+        fn stop_cloud_off_the_main_thread<'r, F: std::future::Future + Send>(
+            _: fn(State<'r, DictationState>) -> F,
+        ) {
+        }
+        stop_cloud_off_the_main_thread(super::stop_cloud_stream);
     }
 
     /// The model load must be mutually exclusive process-wide. Two concurrent loads promote into the
