@@ -395,6 +395,75 @@ export const SURFACES = [
     },
     mock: null,
   },
+  {
+    // ── MERGE RIGHTS + DISMISSALS, EXPANDED (bead sparkle-j881r) ────────────────────────────────
+    //
+    // Two states no other surface can reach, and both are new ROWS in an already-crowded row — the
+    // exact place this menu has regressed twice, and both times it was a photograph that caught it
+    // rather than the suite (jsdom lays nothing out, so no assertion here can see a control being
+    // squeezed).
+    //
+    //   • The NO-MERGE-RIGHTS row: green checks, clean merge state, and a DISABLED Merge with the
+    //     words "No merge rights" beside the dot. The picture answers the question the unit tests
+    //     cannot — whether that longer state word pushes the primary action into truncating.
+    //   • The DISMISSED section, EXPANDED. It is collapsed by default, so a capture that only
+    //     opened the panel would photograph the summary line and nothing else; the extra click is
+    //     what puts the restore affordance in frame.
+    //
+    // AT THE DEFAULT WIDTH, and stated rather than implied — see `open-pr-menu-grouped-wide` for
+    // why an omitted `concierge` inherits the previously-captured surface's width and silently
+    // produces a byte-identical PNG under a filename claiming otherwise. The narrow companion
+    // below carries the containment half.
+    name: "open-pr-menu-dismissed-wide",
+    query: "prs=1&projects=2&concierge=360",
+    description:
+      "The open-PR menu with a no-merge-rights row and the Dismissed section expanded, at the default concierge width.",
+    app: {
+      steps: [
+        { waitFor: "[data-testid=workspace-shell]" },
+        { cable: "off" },
+        { waitFor: "[data-testid=open-pr-badge]" },
+        { click: "[data-testid=open-pr-badge]" },
+        { waitFor: "[data-testid=open-pr-panel]" },
+        // THE SECOND CLICK IS THE POINT. Without it the Dismissed rows are not in the DOM at all.
+        { waitFor: "[data-testid=pr-dismissed-toggle]" },
+        { click: "[data-testid=pr-dismissed-toggle]" },
+        { waitFor: "[data-testid=pr-dismissed-list]" },
+        // THE PANEL SCROLLS. Both new states live at its foot, so without this the capture
+        // photographs the top of the list and proves nothing about either of them.
+        { scrollTo: "[data-testid=pr-dismissed-list]" },
+      ],
+      clip: null,
+    },
+    mock: null,
+  },
+  {
+    // The same content at the HOSTILE width — the containment half, and the one that has actually
+    // regressed. 190px (half the default) is the width the original clipping bug was reported at
+    // (bead sparkle-8g4qh); the question here is whether a sixth control in the row and a new
+    // section at the panel's foot still leave the primary action and the blocking reason unelided.
+    name: "open-pr-menu-dismissed-narrow",
+    query: "prs=1&projects=2&concierge=190",
+    description:
+      "The open-PR menu with a no-merge-rights row and the Dismissed section expanded, over a HALF-WIDTH concierge column.",
+    app: {
+      steps: [
+        { waitFor: "[data-testid=workspace-shell]" },
+        { cable: "off" },
+        { waitFor: "[data-testid=open-pr-badge]" },
+        { click: "[data-testid=open-pr-badge]" },
+        { waitFor: "[data-testid=open-pr-panel]" },
+        { waitFor: "[data-testid=pr-dismissed-toggle]" },
+        { click: "[data-testid=pr-dismissed-toggle]" },
+        { waitFor: "[data-testid=pr-dismissed-list]" },
+        // THE PANEL SCROLLS. Both new states live at its foot, so without this the capture
+        // photographs the top of the list and proves nothing about either of them.
+        { scrollTo: "[data-testid=pr-dismissed-list]" },
+      ],
+      clip: null,
+    },
+    mock: null,
+  },
 ];
 
 export const THEMES = ["light", "dark"];
@@ -449,6 +518,27 @@ export function stepToExpression(step) {
     return `(() => { const e = document.querySelector(${JSON.stringify(sel)});
       if (!e) return false; e.setAttribute(${JSON.stringify(name)}, ${JSON.stringify(value)});
       return true; })()`;
+  }
+  if (step.scrollTo) {
+    // BRING A SCROLLED-OUT ELEMENT INTO FRAME.
+    //
+    // A panel with its own `overflow-y: auto` can hold far more than it shows, and a capture of it
+    // photographs the TOP of the list regardless of what the surface claims to be evidence about.
+    // The open-PR menu is exactly that: `maxHeight: min(420px, 100vh - 80px)`, so the rows at the
+    // foot of a two-project list — and the Dismissed section below them — are simply not in the
+    // picture, and a surface named for them would score identically whether they render or not.
+    //
+    // ASSERTS THE SIDE EFFECT, not the call. `scrollIntoView` is synchronous with `behavior:
+    // "instant"`, so the element's box is readable immediately afterwards — and this returns true
+    // only once that box is actually inside the viewport. A target inside a container that cannot
+    // scroll (or one that is display:none) therefore fails the step loudly and the run stops,
+    // rather than quietly capturing the unscrolled panel under a filename that says otherwise. That
+    // is the same mistake `cable` shipped with and the reason it now verifies the shell.
+    return `(() => { const e = document.querySelector(${JSON.stringify(step.scrollTo)});
+      if (!e) return false;
+      e.scrollIntoView({ behavior: "instant", block: "nearest" });
+      const r = e.getBoundingClientRect();
+      return r.height > 0 && r.top >= 0 && r.bottom <= window.innerHeight; })()`;
   }
   if (step.cable) {
     // The APP's wired state lives in the cable store, not in the DOM. Setting `data-wired` by hand

@@ -371,3 +371,100 @@ describe("BEHIND offers no merge affordance at all", () => {
     }
   });
 });
+
+// ── MERGE RIGHTS: A BUTTON THAT CANNOT WORK MUST NOT BE DRAWN (bead sparkle-j881r) ──────────────
+//
+// The fleet-wide chiclet surfaced pull requests in repos the user can open PRs into but not merge.
+// Every Merge there ends in `GraphQL: <user> does not have the correct permissions to execute
+// MergePullRequest`, and every refresh re-offered it. The permission is knowable before the click.
+describe("prMergeReadiness — merge rights", () => {
+  /** Green by every other measure: passing checks, mergeable, clean. Only rights are in question. */
+  const green = (viewerCanMerge?: boolean | null): PrJudgeable => ({
+    checks: "passing",
+    mergeable: "mergeable",
+    mergeStateStatus: "clean",
+    viewerCanMerge,
+  });
+
+  it("blocks a PR the user cannot merge, even when everything else is green", () => {
+    // The whole bug in one assertion. Before the pre-check this row was `tone: "ready"` with a live
+    // one-click Merge — the button the founder pressed to get a 403.
+    const r = prMergeReadiness(green(false));
+    expect(r.canMerge).toBe(false);
+    expect(r.tone).toBe("blocked");
+    expect(r.label).toBe("No merge rights");
+  });
+
+  it("offers NO override — two deliberate clicks would end in the same 403", () => {
+    // Every override on this surface justifies itself with "GitHub would accept this merge", which
+    // is exactly the claim that is false here. Checked across the branches that DO offer one when
+    // rights are unknown, so the no-rights answer cannot inherit an override from any of them.
+    expect(prMergeReadiness(green(false)).override).toBeNull();
+    expect(
+      prMergeReadiness({
+        checks: "failing",
+        mergeable: "mergeable",
+        mergeStateStatus: "unstable",
+        viewerCanMerge: false,
+      }).override,
+    ).toBeNull();
+    expect(
+      prMergeReadiness({
+        checks: "pending",
+        mergeable: "mergeable",
+        mergeStateStatus: "unstable",
+        viewerCanMerge: false,
+      }).override,
+    ).toBeNull();
+  });
+
+  it("says WHY, and points at the way out", () => {
+    // The title is the row's tooltip and the disabled button's — the only place the reader is told
+    // that waiting will not help and that Dismiss is what stops it being offered.
+    const t = prMergeReadiness(green(false)).title;
+    expect(t).toContain("permission");
+    expect(t).toContain("dismiss");
+  });
+
+  it("does NOT block when the permission is UNKNOWN — an unknown may not manufacture a NO", () => {
+    // `gh repo view` failing (absent, unauthed, offline, timed out) must behave exactly as this
+    // gate did before the field existed. Blocking on unknown would let one slow probe disable
+    // every Merge button in the app.
+    expect(prMergeReadiness(green(undefined)).canMerge).toBe(true);
+    expect(prMergeReadiness(green(null)).canMerge).toBe(true);
+    expect(prMergeReadiness(green()).canMerge).toBe(true);
+  });
+
+  it("allows the merge when the user explicitly CAN merge", () => {
+    expect(prMergeReadiness(green(true)).canMerge).toBe(true);
+    expect(prMergeReadiness(green(true)).tone).toBe("ready");
+  });
+
+  it("outranks every other blocker, because nothing below it can ever rescue the merge", () => {
+    // Checks finish, conflicts get resolved, mergeability settles. No write access does not — so
+    // reporting "checks running" here would send the reader to wait for a button that will still
+    // not work when the wait ends.
+    for (const pr of EVERY_COMBINATION) {
+      const r = prMergeReadiness({ ...pr, viewerCanMerge: false });
+      const shape = `${pr.checks}/${pr.mergeable}/${pr.mergeStateStatus}`;
+      expect(r.label, `no-rights must dominate: ${shape}`).toBe("No merge rights");
+      expect(r.canMerge, `no-rights must never merge: ${shape}`).toBe(false);
+    }
+  });
+
+  it("keeps the tone⟺canMerge invariant across every combination, with rights on and off", () => {
+    // The invariant that stops the dot and the button drifting apart, re-asserted over the NEW
+    // axis rather than assumed to survive it.
+    for (const pr of EVERY_COMBINATION) {
+      for (const viewerCanMerge of [true, false, null, undefined] as const) {
+        const r = prMergeReadiness({ ...pr, viewerCanMerge });
+        const shape = `${pr.checks}/${pr.mergeable}/${pr.mergeStateStatus}/rights=${viewerCanMerge}`;
+        expect(r.canMerge, `canMerge but not green: ${shape}`).toBe(r.tone === "ready");
+      }
+    }
+  });
+
+  it("drops a no-rights PR out of prReadyCount, so the chiclet cannot over-promise", () => {
+    expect(prReadyCount([green(true), green(false), green(true)])).toBe(2);
+  });
+});

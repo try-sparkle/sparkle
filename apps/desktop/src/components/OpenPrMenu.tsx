@@ -39,7 +39,13 @@
 // word, the button and the header count) and merges with a MERGE COMMIT via the Rust `merge_pr`
 // command — never a blind or `--auto` merge. See services/openPrs.ts and AGENTS.md.
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { FiChevronDown, FiExternalLink, FiGitBranch, FiGitPullRequest } from "react-icons/fi";
+import {
+  FiChevronDown,
+  FiExternalLink,
+  FiEyeOff,
+  FiGitBranch,
+  FiGitPullRequest,
+} from "react-icons/fi";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { C, FONT_WEIGHT } from "../theme/colors";
 import { TYPE } from "../theme/scale";
@@ -68,6 +74,14 @@ import {
   type PrGroup,
   type PrScope,
 } from "../services/fleetPrs";
+import {
+  dismissPr,
+  dismissedNumbers,
+  fetchDismissals,
+  partitionDismissals,
+  restorePr,
+  type PrDismissal,
+} from "../services/prDismissals";
 import { log } from "../logger";
 import type { Project } from "../types";
 
@@ -490,6 +504,23 @@ export function OpenPrMenu({
    *  it back to enabled mid-probe with nothing saying why. The set is the right granularity because
    *  the button re-asks EVERY scope at once. */
   const [refreshingScope, setRefreshingScope] = useState<string | null>(null);
+  /**
+   * What each scope has DISMISSED — the durable "not now" set, read back from Rust on every probe.
+   *
+   * Keyed by scope like every other ledger here, for the same reason: PR numbers collide across
+   * repositories, so a bare number would let a dismissal in one repo hide a stranger's pull request
+   * in another.
+   *
+   * Held as the full records rather than as a set of numbers because the Dismissed section renders
+   * `dismissedAt`, and because {@link partitionDismissals} needs the stored fingerprint to decide
+   * whether a dismissal has run out.
+   */
+  const [dismissedByKey, setDismissedByKey] = useState<ReadonlyMap<string, PrDismissal[]>>(
+    () => new Map(),
+  );
+  /** Whether the Dismissed section is expanded. Collapsed by default: it is a review surface, not
+   *  part of the ready list, and it must never push the actionable rows down the panel. */
+  const [showDismissed, setShowDismissed] = useState(false);
   // Set to false on unmount. Unmount only — the per-scope guard is `liveKeysRef` below, because this
   // effect sets it back to `true` on every re-run and so cannot answer "is this repo still listed".
   const aliveRef = useRef(true);
@@ -575,6 +606,33 @@ export function OpenPrMenu({
           }
           lastGoodRef.current.set(key, rows);
           setByKey((prev) => new Map(prev).set(key, rows));
+          // ── RECONCILE THE DISMISSALS AGAINST WHAT WE JUST READ ────────────────────────────
+          //
+          // Only on a SUCCESSFUL probe, and that is the whole safety rule here. `rows` is a
+          // complete open list, so it is safe to hand its numbers to Rust for pruning (a dismissed
+          // PR that has since merged or closed stops being stored) and safe to judge each
+          // dismissal's fingerprint against it. On a FAILED probe neither is true — the early
+          // return above leaves the dismissals exactly as they were, because reading a `gh` failure
+          // as "nothing is open" would erase the user's dismissals, and judging a dismissal against
+          // rows we could not read would revive on missing data. Both directions of that mistake
+          // end with the app deciding on the user's behalf what it may stop hiding.
+          const stored = await fetchDismissals(
+            scope.projectId,
+            rows.map((r) => r.number),
+          );
+          if (!aliveRef.current || !liveKeysRef.current.has(key)) return;
+          const { active, revived } = partitionDismissals(stored, rows);
+          setDismissedByKey((prev) => new Map(prev).set(key, active));
+          // A DISMISSAL THAT HAS RUN OUT IS DROPPED FROM THE STORE, not merely ignored here.
+          // Leaving it would make the row reappear on every poll while the record silently
+          // outlived its reason — and then a later change (a force-push back to the old SHA) could
+          // resurrect a dismissal the user has no memory of making. Fire-and-forget: the local
+          // state above has already un-hidden the row, so a failed write costs one more revival
+          // pass on the next poll and nothing else.
+          for (const d of revived) {
+            log.info("open-pr-menu", `dismissal expired for ${scope.projectName} PR #${d.number}`);
+            void restorePr(scope.projectId, d.number);
+          }
           // Only this scope's staleness flag. A merge error is a different fact and is not answered
           // by a probe succeeding — the user still needs to read why their merge failed.
           setFailedKeys((prev) => {
@@ -612,6 +670,8 @@ export function OpenPrMenu({
     for (const k of [...lastGoodRef.current.keys()]) if (!keys.has(k)) lastGoodRef.current.delete(k);
     setByKey((prev) => pruneMap(prev, keys) as ReadonlyMap<string, PrRow[]>);
     setFailedKeys((prev) => pruneSet(prev, (k) => keys.has(k)));
+    // Same prune, same reason: a closed tab's dismissals are re-read from Rust when it comes back.
+    setDismissedByKey((prev) => pruneMap(prev, keys) as ReadonlyMap<string, PrDismissal[]>);
     // A merge already in flight is DELIBERATELY not pruned — it is keyed by repo, so it can never
     // match a scope that is still listed, and dropping it is how a merge that finished while its
     // tab was closed leaves a row permanently greyed out when the tab comes back.
@@ -637,16 +697,38 @@ export function OpenPrMenu({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scopesKey, refetch]);
 
+  /** The dismissed NUMBERS per scope — what `buildPrGroups` filters on. Derived rather than stored
+   *  so the records and the filter can never disagree about which rows are hidden. */
+  const hiddenByKey = useMemo(() => {
+    const out = new Map<string, ReadonlySet<number>>();
+    for (const [k, ds] of dismissedByKey) out.set(k, dismissedNumbers(ds));
+    return out;
+  }, [dismissedByKey]);
   const groups = useMemo(
-    () => buildPrGroups(scopes, byKey, failedKeys),
+    () => buildPrGroups(scopes, byKey, failedKeys, hiddenByKey),
     // Same reasoning as the effect: recompute when the scope SET, the data, or the staleness moves.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [scopesKey, byKey, failedKeys],
+    [scopesKey, byKey, failedKeys, hiddenByKey],
   );
   const totals = fleetTotals(groups);
   // The wide pill's sentence ("3 PRs waiting"), which is also what the accessible name falls back to
   // when nothing is green. Null at zero or unknown — see `formatPrBadge`.
   const label = formatPrBadge(totals.known ? totals.total : null);
+  /**
+   * The WIDE pill's text — the count sentence, or, when everything open has been DISMISSED, what
+   * is being held back.
+   *
+   * WITHOUT THIS THE WIDE FORM DELETES ITS OWN UNDO. Its render rule is `!label → render nothing`,
+   * and `label` is null at a total of zero — so dismissing your last visible PR removed the only
+   * control that could list the dismissal or restore it. The row would have been hidden with no
+   * way back, which is precisely the invisible-state failure the Dismissed section exists to
+   * prevent, reintroduced one level up. A dismissal may hide a row; it may never hide the door.
+   */
+  const wideLabel =
+    label ??
+    (totals.dismissed > 0
+      ? `${totals.dismissed} dismissed PR${totals.dismissed === 1 ? "" : "s"}`
+      : null);
 
   // ── WHEN THIS CONTROL IS ALLOWED NOT TO EXIST ────────────────────────────────────────────────
   //
@@ -658,7 +740,9 @@ export function OpenPrMenu({
   // in. That cannot be caused by scope, by a failed probe, or by a count of zero, which is exactly
   // the property that was missing: before this, a concierge pointed at the wrong project unmounted
   // the app's only pull-request affordance while six PRs sat mergeable.
-  if (compact ? scopes.length === 0 : !label) return null;
+  // `wideLabel`, not `label`: a wide form holding dismissals must keep rendering, or it takes the
+  // only way to review and undo them with it. See `wideLabel` above.
+  if (compact ? scopes.length === 0 : !wideLabel) return null;
 
   const badgeTitle = prBadgeTitle(label, totals);
   const staleNames = staleProjectNames(groups);
@@ -666,6 +750,12 @@ export function OpenPrMenu({
   /** Sections are drawn for groups that have something in them; an empty tab is covered by the
    *  headline's total rather than by an empty section per project. */
   const sections = groups.filter((g) => g.prs.length > 0);
+  /** Every dismissed row across the fleet, flattened with the group it belongs to — the Dismissed
+   *  section is fleet-wide, so each row has to carry its own scope for the Restore call and its own
+   *  project name for the reader. In group (tab) order, then probe order, like the list above. */
+  const dismissedSections = groups.flatMap((group) =>
+    group.dismissed.map((pr) => ({ group, pr })),
+  );
 
   /**
    * Merge `nums` IN `scope` — the repo binding is a parameter, never an ambient default.
@@ -715,6 +805,44 @@ export function OpenPrMenu({
     if (firstError && listed()) setError(firstError);
     // Reconcile with the truth: merged PRs drop out, a failed one stays (now visibly still open).
     if (listed()) await refetch();
+  };
+
+  /**
+   * Hide `pr` from the ready list until something about it changes — the founder's Dismiss.
+   *
+   * OPTIMISTIC, then reconciled. The local map is written first so the row leaves the list on the
+   * click rather than a `gh`-free but still asynchronous IPC round trip later; the reply then
+   * replaces it with whatever Rust actually holds, so a rejected write cannot leave the UI claiming
+   * a dismissal that was never stored. A null reply means the write FAILED, and the optimistic
+   * entry is rolled back — a row that stays visible is the safe direction, and it is the direction
+   * this whole feature is allowed to fail in.
+   *
+   * Scoped by `scope.projectId`, never by a bare number: see `prKeyOf`.
+   */
+  const runDismiss = async (scope: PrScope, key: string, pr: PrRow) => {
+    const before = dismissedByKey.get(key) ?? [];
+    const optimistic: PrDismissal = {
+      number: pr.number,
+      headRefOid: pr.headRefOid ?? "",
+      tone: prMergeReadiness(pr).tone,
+      viewerCanMerge: pr.viewerCanMerge === true,
+      dismissedAt: Math.floor(Date.now() / 1000),
+    };
+    setDismissedByKey((prev) => new Map(prev).set(key, [...before, optimistic]));
+    const stored = await dismissPr(scope.projectId, pr);
+    if (!aliveRef.current || !liveKeysRef.current.has(key)) return;
+    setDismissedByKey((prev) => new Map(prev).set(key, stored ?? before));
+  };
+
+  /** Put a dismissed PR back in the ready list — the user's Restore. Same optimistic shape. */
+  const runRestore = async (scope: PrScope, key: string, number: number) => {
+    const before = dismissedByKey.get(key) ?? [];
+    setDismissedByKey((prev) =>
+      new Map(prev).set(key, before.filter((d) => d.number !== number)),
+    );
+    const stored = await restorePr(scope.projectId, number);
+    if (!aliveRef.current || !liveKeysRef.current.has(key)) return;
+    setDismissedByKey((prev) => new Map(prev).set(key, stored ?? before));
   };
 
   const openGithub = (url: string) => {
@@ -826,7 +954,7 @@ export function OpenPrMenu({
           <>
             {/* The git-branch mark, matching the "In PR" stage colour (violet) used by WorkflowLine. */}
             <FiGitBranch size={12} aria-hidden />
-            {label}
+            {wideLabel}
             <FiChevronDown size={12} aria-hidden style={{ opacity: 0.7 }} />
           </>
         )}
@@ -1271,6 +1399,38 @@ export function OpenPrMenu({
                           <FiExternalLink size={12} aria-hidden />
                         </button>
 
+                        {/* DISMISS — "not now", and the founder's literal ask ("next to the Merge
+                            button we need a DISMISS"). It sits BEFORE Merge so the destructive-
+                            looking control is never the one under a pointer aimed at the primary
+                            action, and it is icon-only for the same reason the GitHub link is: this
+                            row's hard constraint is that the primary action never truncates, and a
+                            sixth worded control is what would spend the width to break it.
+
+                            NOT DISABLED WHILE MERGING. Dismiss touches only a local JSON store,
+                            so there is no interaction with an in-flight merge worth guarding — and
+                            the row a merge is stuck on is exactly the one a user reaches to dismiss.
+                            A dismissed PR that then merges is pruned by the next probe. */}
+                        <button
+                          data-testid={`dismiss-${pr.number}`}
+                          data-project-id={group.scope.projectId}
+                          aria-label={`Dismiss PR #${pr.number} — stop offering it here until something changes`}
+                          title={`Dismiss — stop offering this PR here. It comes back if you gain merge rights, if it is pushed to, or if it becomes mergeable. Restore it any time from "Dismissed" at the bottom of this list.`}
+                          onClick={() => void runDismiss(group.scope, group.key, pr)}
+                          style={{
+                            flex: "0 0 auto",
+                            background: "transparent",
+                            color: C.muted,
+                            border: `1px solid ${C.hairline}`,
+                            borderRadius: 6,
+                            padding: "3px 8px",
+                            fontSize: 12,
+                            cursor: "pointer",
+                            whiteSpace: "nowrap",
+                          }}
+                        >
+                          <FiEyeOff size={12} aria-hidden />
+                        </button>
+
                         {/* GREEN ONLY gets the one-click Merge. A non-green PR with an ambiguous
                             answer (GitHub would accept it, but a non-required check is red or still
                             running) gets a two-step override instead — the user has to mean it.
@@ -1340,6 +1500,142 @@ export function OpenPrMenu({
                 </div>
               );
             })}
+
+            {/* ── DISMISSED: THE HALF THAT KEEPS "NOT NOW" FROM MEANING "NEVER" ────────────────
+                A dismissal that cannot be seen or undone is worse than the un-pressable Merge
+                button this feature removes: a mergeable pull request would be invisible, uncounted,
+                and with nothing on screen to say where it went. The founder has been bitten by
+                invisible state repeatedly, so hiding a row obliges this section to exist.
+
+                AT THE BOTTOM, AND COLLAPSED. It is a review surface rather than part of the ready
+                list, so it may never push an actionable row down the panel — and the summary line
+                is always rendered when there is anything in it, so the count is visible without a
+                click. Fleet-wide rather than per group: dismissals are rare and scattered, and a
+                per-project empty section in every group would cost more chrome than it explains. */}
+            {dismissedSections.length > 0 && (
+              <div data-testid="pr-dismissed" style={{ marginTop: 4 }}>
+                <button
+                  data-testid="pr-dismissed-toggle"
+                  aria-expanded={showDismissed}
+                  title={
+                    showDismissed
+                      ? "Hide the dismissed pull requests"
+                      : "Show the pull requests you've dismissed — each can be restored"
+                  }
+                  onClick={() => setShowDismissed((v) => !v)}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 6,
+                    width: "100%",
+                    background: "transparent",
+                    border: "none",
+                    borderTop: `1px solid ${C.hairline}`,
+                    color: C.muted,
+                    padding: "8px 8px 6px",
+                    marginTop: 2,
+                    fontSize: TYPE.micro,
+                    fontWeight: FONT_WEIGHT.semibold,
+                    letterSpacing: "0.04em",
+                    textTransform: "uppercase",
+                    cursor: "pointer",
+                    textAlign: "left",
+                  }}
+                >
+                  <FiChevronDown
+                    size={12}
+                    aria-hidden
+                    style={{
+                      flex: "0 0 auto",
+                      // A rotation rather than a second glyph, so the control cannot end up drawn
+                      // with one icon and the opposite `aria-expanded`.
+                      transform: showDismissed ? "none" : "rotate(-90deg)",
+                    }}
+                  />
+                  Dismissed ({totals.dismissed})
+                </button>
+                {showDismissed && (
+                  <div data-testid="pr-dismissed-list">
+                    {/* The one sentence that makes this list read as a PAUSE and not a graveyard.
+                        Without it a reader has to infer the revival rule from rows reappearing. */}
+                    <div
+                      style={{
+                        color: C.muted,
+                        fontSize: 12,
+                        padding: "0 8px 6px",
+                        wordBreak: "break-word",
+                      }}
+                    >
+                      These aren't listed or counted above. Each comes back on its own if you gain
+                      merge rights, if it's pushed to, or if it becomes mergeable.
+                    </div>
+                    {dismissedSections.map(({ group, pr }) => (
+                      <div
+                        key={prKeyOf(group.key, pr.number)}
+                        data-testid="pr-dismissed-row"
+                        data-project-id={group.scope.projectId}
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 8,
+                          padding: "6px 8px",
+                        }}
+                      >
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div
+                            title={pr.title}
+                            style={{
+                              color: C.muted,
+                              fontSize: 13,
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                              whiteSpace: "nowrap",
+                            }}
+                          >
+                            #{pr.number} {pr.title || pr.headRefName}
+                          </div>
+                          {/* NAMES ITS PROJECT, because this section is fleet-wide and sits below
+                              every group header — the row has no other context to inherit, and
+                              #39 alone does not identify a pull request in a fleet-wide list. */}
+                          <div
+                            style={{
+                              color: C.muted,
+                              fontSize: TYPE.micro,
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                              whiteSpace: "nowrap",
+                            }}
+                          >
+                            {group.scope.projectName}
+                          </div>
+                        </div>
+                        <button
+                          data-testid={`restore-${pr.number}`}
+                          data-project-id={group.scope.projectId}
+                          aria-label={`Restore PR #${pr.number} to the list`}
+                          title="Restore — list and count this PR again"
+                          onClick={() => void runRestore(group.scope, group.key, pr.number)}
+                          style={{
+                            flex: "0 0 auto",
+                            background: "transparent",
+                            color: C.accentInk,
+                            border: `1px solid ${C.accentMid}`,
+                            borderRadius: 6,
+                            padding: "3px 8px",
+                            fontSize: 12,
+                            fontWeight: FONT_WEIGHT.semibold,
+                            cursor: "pointer",
+                            whiteSpace: "nowrap",
+                          }}
+                        >
+                          Restore
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         </PanelLayer>
       )}

@@ -257,6 +257,12 @@ describe("surface registry", () => {
       "open-pr-menu-narrow",
       "open-pr-menu-grouped-narrow",
       "open-pr-menu-grouped-wide",
+      // The merge-rights + dismissal surfaces (bead sparkle-j881r). Two states no other surface
+      // reaches: a green PR with a DISABLED Merge because the user has no write access in that
+      // repo, and the Dismissed section EXPANDED. Both are new content in an already-crowded row,
+      // which is where this menu has regressed twice — and both times a photograph caught it.
+      "open-pr-menu-dismissed-wide",
+      "open-pr-menu-dismissed-narrow",
     ]);
     expect(THEMES).toEqual(["light", "dark"]);
   });
@@ -307,7 +313,16 @@ describe("surface registry", () => {
   // groups read correctly with room) if the two widths are genuinely far apart, so both ends are
   // bounded below — narrow squeezed, wide at least the app's own default.
   it("asks for a second project on the two grouped open-PR surfaces, and nowhere else", () => {
-    const grouped = ["open-pr-menu-grouped-narrow", "open-pr-menu-grouped-wide"];
+    // Every surface that needs a MULTI-REPO menu. The dismissal pair is here for the same reason
+    // the grouped pair is: the panel only groups once a second project tab is open, and the
+    // Dismissed section names the project each hidden row came from — which says nothing at all
+    // when there is only one project it could be.
+    const grouped = [
+      "open-pr-menu-grouped-narrow",
+      "open-pr-menu-grouped-wide",
+      "open-pr-menu-dismissed-wide",
+      "open-pr-menu-dismissed-narrow",
+    ];
     for (const name of grouped) {
       const q = new URLSearchParams(surfaceByName(name).query);
       expect(q.get("projects"), `${name} must open the second project`).toBe("2");

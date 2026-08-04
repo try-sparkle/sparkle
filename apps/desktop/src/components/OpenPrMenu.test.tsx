@@ -83,6 +83,7 @@ const SCOPES_ALT: readonly PrScope[] = [
 const totals = (t: Partial<FleetTotals> = {}): FleetTotals => ({
   total: 0,
   ready: 0,
+  dismissed: 0,
   known: true,
   groupsWithPrs: 0,
   unreadable: 0,
@@ -2029,5 +2030,275 @@ describe("prBadgeTitle — the zero claim waits too", () => {
     expect(prBadgeTitle(null, totals({ known: false, askable: 0 }))).toBe(
       "No project with a GitHub remote",
     );
+  });
+});
+
+// ── MERGE RIGHTS + DISMISS (bead sparkle-j881r) ────────────────────────────────────────────────
+//
+// The founder: "I need to have the option to dismiss merge candidates that won't actually merge …
+// So when I try to merge it, I get: tkmx-client PR #39: GraphQL: drodio does not have the correct
+// permissions to execute MergePullRequest."
+//
+// Two halves, tested as two things: the PRE-CHECK stops the un-pressable button being drawn at all,
+// and DISMISS handles everything the pre-check cannot see.
+
+/** A green PR in a repo the user cannot merge into — the tkmx-client case, end to end. */
+const NO_RIGHTS: PrRow = {
+  number: 39,
+  title: "feat: upstream contribution",
+  headRefName: "feature",
+  url: "https://github.com/srosro/tkmx-client/pull/39",
+  checks: "passing",
+  mergeable: "mergeable",
+  mergeStateStatus: "clean",
+  headRefOid: "sha-old",
+  viewerCanMerge: false,
+};
+
+/**
+ * Route the PR list AND the dismissal commands, recording every dismissal so a later `pr_dismissals`
+ * read reflects it — i.e. a fake with the store's actual behaviour, not one that always answers the
+ * same thing. Returns the ledger so a test can assert on what Rust was actually asked to persist.
+ */
+function stubWithDismissals(rows: PrRow[] | null, initial: Record<string, unknown>[] = []) {
+  const store = new Map<number, Record<string, unknown>>(
+    initial.map((d) => [d.number as number, d]),
+  );
+  const calls: { cmd: string; args: Record<string, unknown> }[] = [];
+  h.invoke.mockImplementation((cmd: string, args: Record<string, unknown> = {}) => {
+    calls.push({ cmd, args });
+    if (cmd === "project_open_prs") return Promise.resolve(rows);
+    if (cmd === "merge_pr") return Promise.resolve(null);
+    if (cmd === "pr_dismissals") return Promise.resolve([...store.values()]);
+    if (cmd === "dismiss_pr") {
+      store.set(args.number as number, {
+        number: args.number,
+        headRefOid: args.headRefOid,
+        tone: args.tone,
+        viewerCanMerge: args.viewerCanMerge,
+        dismissedAt: 1_700_000_000,
+      });
+      return Promise.resolve([...store.values()]);
+    }
+    if (cmd === "restore_pr") {
+      store.delete(args.number as number);
+      return Promise.resolve([...store.values()]);
+    }
+    return Promise.resolve(null);
+  });
+  return { store, calls };
+}
+
+describe("OpenPrMenu — a Merge button that cannot work is not drawn", () => {
+  it("disables Merge and says 'No merge rights' on a green PR the user cannot merge", async () => {
+    // THE REPORTED BUG. Before the pre-check this row was green with a live one-click Merge, and
+    // pressing it spent a gh round trip to come back with a GraphQL permissions error.
+    stubWithDismissals([NO_RIGHTS]);
+    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    fireEvent.click(await screen.findByTestId("open-pr-badge"));
+    const merge = await screen.findByTestId("merge-39");
+    expect(merge.hasAttribute("disabled")).toBe(true);
+    expect(screen.getByTestId("pr-state-39").textContent).toBe("No merge rights");
+    expect(screen.getByTestId("pr-dot-39").getAttribute("data-tone")).toBe("blocked");
+  });
+
+  it("keeps a no-rights PR out of the chiclet's green count and out of 'Merge all ready'", async () => {
+    stubWithDismissals([NO_RIGHTS]);
+    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} compact />);
+    const badge = await screen.findByTestId("open-pr-badge");
+    await waitFor(() => expect(badge.getAttribute("data-ready")).toBe("no"));
+    fireEvent.click(badge);
+    expect((await screen.findByTestId("merge-all")).hasAttribute("disabled")).toBe(true);
+  });
+
+  it("still offers Merge when the permission is UNKNOWN — a failed probe is not a refusal", async () => {
+    // `gh repo view` absent/unauthed/offline yields null. Blocking on that would disable every
+    // Merge button in the app on the strength of a probe that merely failed.
+    stubWithDismissals([{ ...NO_RIGHTS, viewerCanMerge: null }]);
+    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    fireEvent.click(await screen.findByTestId("open-pr-badge"));
+    expect((await screen.findByTestId("merge-39")).hasAttribute("disabled")).toBe(false);
+  });
+});
+
+describe("OpenPrMenu — Dismiss", () => {
+  it("removes the row from the list and stops it counting toward the chiclet", async () => {
+    // Both halves of the founder's ask, asserted as SIDE EFFECTS: the row is gone from the list and
+    // the green count went to zero. A green PR, so the count moves visibly.
+    const green = { ...NO_RIGHTS, viewerCanMerge: true };
+    stubWithDismissals([green]);
+    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} compact />);
+    const badge = await screen.findByTestId("open-pr-badge");
+    await waitFor(() => expect(badge.getAttribute("data-ready")).toBe("yes"));
+    fireEvent.click(badge);
+    fireEvent.click(await screen.findByTestId("dismiss-39"));
+    await waitFor(() => expect(screen.queryByTestId("merge-39")).toBeNull());
+    expect(badge.getAttribute("data-ready")).toBe("no");
+    expect(badge.textContent).not.toContain("1");
+  });
+
+  it("PERSISTS the dismissal through Rust, with the fingerprint the revival rule needs", async () => {
+    // The durability requirement. A dismissal that lives only in component state is forgotten by
+    // the next refresh, let alone the next restart.
+    const { calls } = stubWithDismissals([NO_RIGHTS]);
+    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    fireEvent.click(await screen.findByTestId("open-pr-badge"));
+    fireEvent.click(await screen.findByTestId("dismiss-39"));
+    await waitFor(() => expect(calls.some((c) => c.cmd === "dismiss_pr")).toBe(true));
+    const args = calls.find((c) => c.cmd === "dismiss_pr")!.args;
+    expect(args).toMatchObject({
+      projectId: "p1",
+      number: 39,
+      headRefOid: "sha-old",
+      tone: "blocked",
+      viewerCanMerge: false,
+    });
+  });
+
+  it("SURVIVES a remount — a dismissal already in the store hides its row on first render", async () => {
+    // The restart case, as close as jsdom gets: the store already holds the dismissal and the
+    // component has never seen the click.
+    stubWithDismissals([NO_RIGHTS], [
+      { number: 39, headRefOid: "sha-old", tone: "blocked", viewerCanMerge: false, dismissedAt: 1 },
+    ]);
+    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} compact />);
+    fireEvent.click(await screen.findByTestId("open-pr-badge"));
+    await waitFor(() => expect(screen.getByTestId("pr-dismissed")).toBeTruthy());
+    expect(screen.queryByTestId("merge-39")).toBeNull();
+  });
+
+  it("keeps the dismissal REVIEWABLE — the Dismissed section names it and offers it back", async () => {
+    // Silently disappearing a pull request forever is the opposite failure, and the one the founder
+    // has been bitten by repeatedly. Hiding a row obliges this section to exist.
+    stubWithDismissals([NO_RIGHTS]);
+    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    fireEvent.click(await screen.findByTestId("open-pr-badge"));
+    fireEvent.click(await screen.findByTestId("dismiss-39"));
+    const toggle = await screen.findByTestId("pr-dismissed-toggle");
+    expect(toggle.textContent).toContain("Dismissed (1)");
+    // COLLAPSED BY DEFAULT — it is a review surface, not part of the ready list.
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByTestId("pr-dismissed-list")).toBeNull();
+    fireEvent.click(toggle);
+    const row = await screen.findByTestId("pr-dismissed-row");
+    expect(row.textContent).toContain("#39");
+    expect(row.textContent).toContain("repo"); // names its project — the section is fleet-wide
+  });
+
+  it("RESTORES on demand, putting the row and its count back", async () => {
+    const green = { ...NO_RIGHTS, viewerCanMerge: true };
+    const { calls } = stubWithDismissals([green]);
+    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} compact />);
+    const badge = await screen.findByTestId("open-pr-badge");
+    fireEvent.click(badge);
+    fireEvent.click(await screen.findByTestId("dismiss-39"));
+    await waitFor(() => expect(screen.queryByTestId("merge-39")).toBeNull());
+    fireEvent.click(await screen.findByTestId("pr-dismissed-toggle"));
+    fireEvent.click(await screen.findByTestId("restore-39"));
+    await waitFor(() => expect(screen.queryByTestId("merge-39")).toBeTruthy());
+    expect(badge.getAttribute("data-ready")).toBe("yes");
+    expect(calls.some((c) => c.cmd === "restore_pr" && c.args.number === 39)).toBe(true);
+  });
+
+  it("AUTO-REVIVES when the reason goes away, and tells Rust to drop the record", async () => {
+    // "Dismissal means 'not now', not 'never'." The store holds a dismissal fingerprinted at
+    // `sha-old`; the live probe reports `sha-new`, so the PR has been pushed to and comes back
+    // WITHOUT the user doing anything — and the stale record is dropped rather than left to
+    // resurrect itself later.
+    const { calls } = stubWithDismissals([{ ...NO_RIGHTS, headRefOid: "sha-new" }], [
+      { number: 39, headRefOid: "sha-old", tone: "blocked", viewerCanMerge: false, dismissedAt: 1 },
+    ]);
+    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    fireEvent.click(await screen.findByTestId("open-pr-badge"));
+    expect(await screen.findByTestId("merge-39")).toBeTruthy();
+    expect(screen.queryByTestId("pr-dismissed")).toBeNull();
+    await waitFor(() =>
+      expect(calls.some((c) => c.cmd === "restore_pr" && c.args.number === 39)).toBe(true),
+    );
+  });
+
+  it("AUTO-REVIVES when merge rights arrive", async () => {
+    // The founder's case running backwards: he is added to the repo, so the PR he could do nothing
+    // about becomes one he can land — and the app stops hiding it on its own.
+    stubWithDismissals([{ ...NO_RIGHTS, viewerCanMerge: true }], [
+      { number: 39, headRefOid: "sha-old", tone: "blocked", viewerCanMerge: false, dismissedAt: 1 },
+    ]);
+    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    fireEvent.click(await screen.findByTestId("open-pr-badge"));
+    expect(await screen.findByTestId("merge-39")).toBeTruthy();
+  });
+
+  it("does NOT revive an unchanged PR — the dismissal has to actually hold", async () => {
+    // The control case for the two above. Without it they would pass against a component that
+    // simply never hides anything.
+    stubWithDismissals([NO_RIGHTS], [
+      { number: 39, headRefOid: "sha-old", tone: "blocked", viewerCanMerge: false, dismissedAt: 1 },
+    ]);
+    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    fireEvent.click(await screen.findByTestId("open-pr-badge"));
+    await waitFor(() => expect(screen.getByTestId("pr-dismissed-toggle")).toBeTruthy());
+    expect(screen.queryByTestId("merge-39")).toBeNull();
+  });
+
+  it("hands Rust the OPEN NUMBERS after a good probe, and nothing after a failed one", async () => {
+    // The prune contract. A failed probe read as "nothing is open" would erase every dismissal the
+    // user has made, so the failed path must not pass a list at all.
+    const { calls } = stubWithDismissals([NO_RIGHTS]);
+    const { unmount } = render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
+    await waitFor(() => expect(calls.some((c) => c.cmd === "pr_dismissals")).toBe(true));
+    expect(calls.find((c) => c.cmd === "pr_dismissals")!.args.openNumbers).toEqual([39]);
+    unmount();
+
+    // A failed probe must not reach `pr_dismissals` at all — there is no complete list to prune to.
+    const failed = stubWithDismissals(null);
+    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} compact />);
+    await waitFor(() => expect(failed.calls.some((c) => c.cmd === "project_open_prs")).toBe(true));
+    expect(failed.calls.some((c) => c.cmd === "pr_dismissals")).toBe(false);
+  });
+
+  it("dismisses only the PR it names, in only the repo it names", async () => {
+    // PR numbers collide across repositories. Dismissing one repo's #39 may never hide another's.
+    const rowsFor: Record<string, PrRow[]> = {
+      "/repo": [NO_RIGHTS],
+      "/other": [{ ...NO_RIGHTS, url: "https://github.com/o/other/pull/39" }],
+    };
+    const dismissed: { projectId: string; number: number }[] = [];
+    h.invoke.mockImplementation((cmd: string, args: Record<string, unknown> = {}) => {
+      if (cmd === "project_open_prs") return Promise.resolve(rowsFor[args.root as string] ?? []);
+      if (cmd === "pr_dismissals")
+        return Promise.resolve(
+          dismissed
+            .filter((d) => d.projectId === args.projectId)
+            .map((d) => ({ ...d, headRefOid: "sha-old", tone: "blocked", viewerCanMerge: false, dismissedAt: 1 })),
+        );
+      if (cmd === "dismiss_pr") {
+        dismissed.push({ projectId: args.projectId as string, number: args.number as number });
+        return Promise.resolve(
+          dismissed
+            .filter((d) => d.projectId === args.projectId)
+            .map((d) => ({ ...d, headRefOid: "sha-old", tone: "blocked", viewerCanMerge: false, dismissedAt: 1 })),
+        );
+      }
+      return Promise.resolve(null);
+    });
+    render(
+      <OpenPrMenu
+        scopes={[...SCOPES, ...SCOPES_OTHER]}
+        resolveAgent={noAgent}
+        onOpenAgent={noop}
+      />,
+    );
+    fireEvent.click(await screen.findByTestId("open-pr-badge"));
+    await waitFor(() => expect(screen.getAllByTestId("pr-row").length).toBe(2));
+    // The FIRST group's dismiss button — same number in both, so the row has to be found by repo.
+    const p1Row = screen
+      .getAllByTestId("pr-row")
+      .find((r) => r.getAttribute("data-project-id") === "p1")!;
+    fireEvent.click(within(p1Row).getByTestId("dismiss-39"));
+    await waitFor(() => expect(screen.getAllByTestId("pr-row").length).toBe(1));
+    expect(screen.getAllByTestId("pr-row")[0]!.getAttribute("data-project-id")).toBe("p2");
+    expect(dismissed).toEqual([{ projectId: "p1", number: 39 }]);
   });
 });

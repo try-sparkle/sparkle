@@ -90,7 +90,19 @@ export function prKeyOf(scopeKey: string, number: number): string {
 export interface PrGroup {
   scope: PrScope;
   key: string;
+  /** The rows the menu LISTS — everything open in this scope MINUS anything dismissed. */
   prs: PrRow[];
+  /**
+   * The rows the user has dismissed, in the same order the probe returned them.
+   *
+   * SEPARATED HERE rather than filtered out at the component, because `readyCount` and every fleet
+   * total are computed from `prs` — so doing the split in one place is what makes "a dismissed PR
+   * leaves the list AND stops counting toward the chiclet" one fact instead of three that have to
+   * be kept in agreement. They are still carried (not dropped) so the panel's Dismissed section can
+   * render what was dismissed and offer it back: a silently disappeared pull request is the one
+   * failure worse than the un-pressable Merge button this feature exists to remove.
+   */
+  dismissed: PrRow[];
   /** A probe for this scope has succeeded at least once, so `prs` is an answer rather than a gap. */
   known: boolean;
   /** This scope's most recent probe FAILED. Says nothing about whether we have an older list —
@@ -116,16 +128,27 @@ export interface PrGroup {
  *
  * A scope with no entry in `byKey` is `known: false` with an empty list, which is the honest
  * pre-probe state rather than a claim of zero.
+ *
+ * `dismissedByKey` maps a scope key to the PR numbers the user has dismissed there. Absent for a
+ * scope means "none dismissed", which is also what a failed read of the dismissal store degrades
+ * to — showing a row the user waved away is a far better failure than hiding one they did not.
+ * The numbers are per-scope because PR numbers collide across repositories; see `prKeyOf`.
  */
 export function buildPrGroups(
   scopes: readonly PrScope[],
   byKey: ReadonlyMap<string, PrRow[] | null>,
   failedKeys: ReadonlySet<string>,
+  dismissedByKey: ReadonlyMap<string, ReadonlySet<number>> = new Map(),
 ): PrGroup[] {
   return scopes.map((scope) => {
     const key = keyOfScope(scope);
     const rows = byKey.get(key) ?? null;
-    const prs = rows ?? [];
+    const all = rows ?? [];
+    const hidden = dismissedByKey.get(key);
+    // ONE PASS, TWO BUCKETS. `prs` is what the list shows and what every count is taken from;
+    // `dismissed` is what the Dismissed section offers back.
+    const prs = hidden && hidden.size > 0 ? all.filter((p) => !hidden.has(p.number)) : all;
+    const dismissed = hidden && hidden.size > 0 ? all.filter((p) => hidden.has(p.number)) : [];
     const known = rows !== null;
     // A scope with no `rootPath` is listed (the tab exists) but never probed, so it is neither
     // failed nor unreadable — there is nothing we tried and could not do.
@@ -134,6 +157,7 @@ export function buildPrGroups(
       scope,
       key,
       prs,
+      dismissed,
       known,
       failed,
       stale: failed && known,
@@ -153,6 +177,17 @@ export interface FleetTotals {
   total: number;
   /** Green PRs across every scope — what the chiclet's numeral counts. */
   ready: number;
+  /**
+   * Open PRs the user has DISMISSED, across every scope. Excluded from `total` and `ready` — that
+   * is the whole point of a dismissal — but counted here so the panel can say how many it is not
+   * showing.
+   *
+   * WITHOUT THIS, A FULLY-DISMISSED FLEET READS AS AN EMPTY ONE. `total === 0` would take the
+   * headline to a flat "No open pull requests", which is false in exactly the way this file spends
+   * three other fields preventing: it states a zero that is really a hidden non-zero, with nothing
+   * on screen pointing at where the rows went.
+   */
+  dismissed: number;
   /** At least one scope has been probed successfully, so `total` is an answer and not a gap. */
   known: boolean;
   /** Scopes that actually have PRs — the sections the panel renders. */
@@ -197,6 +232,7 @@ export interface FleetTotals {
 export function fleetTotals(groups: readonly PrGroup[]): FleetTotals {
   let total = 0;
   let ready = 0;
+  let dismissed = 0;
   let known = false;
   let groupsWithPrs = 0;
   let unreadable = 0;
@@ -205,13 +241,14 @@ export function fleetTotals(groups: readonly PrGroup[]): FleetTotals {
   for (const g of groups) {
     total += g.prs.length;
     ready += g.readyCount;
+    dismissed += g.dismissed.length;
     if (g.known) known = true;
     if (g.prs.length > 0) groupsWithPrs += 1;
     if (g.unreadable) unreadable += 1;
     if (g.scope.rootPath) askable += 1;
     if (g.scope.rootPath && !g.known && !g.failed) pending += 1;
   }
-  return { total, ready, known, groupsWithPrs, unreadable, pending, askable };
+  return { total, ready, dismissed, known, groupsWithPrs, unreadable, pending, askable };
 }
 
 /**
@@ -291,7 +328,14 @@ export function fleetHeadline(totals: FleetTotals): string {
       // Deliberately unhedged. A scope with no `rootPath` has no repository to hold a pull request,
       // so excluding it from the zero is not a claim we are failing to make — unlike `unreadable`,
       // which is a repo that may well have PRs we simply could not read.
-      return "No open pull requests";
+      //
+      // DISMISSALS ARE THE ONE HEDGE IT DOES CARRY, because they are the only case where the zero
+      // is a choice the user made rather than a fact about GitHub. A flat "No open pull requests"
+      // over three dismissed rows is the same false claim the rest of this switch exists to avoid,
+      // and it points at nothing — the Dismissed section below is exactly where those rows went.
+      return totals.dismissed > 0
+        ? `No open pull requests — ${totals.dismissed} dismissed`
+        : "No open pull requests";
     case "counted": {
       const noun = totals.total === 1 ? "open pull request" : "open pull requests";
       return asked <= 1 ? `${totals.total} ${noun}` : `${totals.total} ${noun} across ${asked} projects`;

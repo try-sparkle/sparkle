@@ -3207,6 +3207,20 @@ pub struct PrRow {
     /// Names of the checks still RUNNING, same shape as `failing_checks`. A PR can have both (some
     /// checks red while others are still going).
     pub pending_checks: Vec<String>,
+    /// The head commit SHA — the FINGERPRINT a dismissal is judged against (see `pr_dismissal`).
+    ///
+    /// A dismissal means "not now", so it has to expire when the pull request stops being the one
+    /// that was waved away, and a push is the cheapest honest signal of that. Empty when `gh` did
+    /// not supply one, which the revival rule reads as "cannot compare" rather than "unchanged" —
+    /// an absent SHA must never be able to look like a match and pin a dismissal open forever.
+    pub head_ref_oid: String,
+    /// Whether THIS identity may merge in the repo this PR targets, or `None` when we could not
+    /// find out. See `probe_viewer_permission` for why the third state is load-bearing.
+    ///
+    /// Per-row rather than per-probe purely so `prMergeReadiness` — the one function behind the dot,
+    /// the word and the button — can keep taking a single PR and stay pure. The value is a property
+    /// of the REPO and is identical across every row in a probe.
+    pub viewer_can_merge: Option<bool>,
     /// The agent that opened this PR, from the DURABLE mapping in `pr_owner` — `None` when nothing
     /// identifies it. Never inferred: a pill carrying the wrong id opens the wrong agent, which is
     /// worse than no pill, so "couldn't tell" stays null. See `pr_owner`'s module header.
@@ -3380,6 +3394,11 @@ fn decode_open_prs(stdout: &str) -> Option<Vec<PrRow>> {
                     merge_state_status,
                     failing_checks,
                     pending_checks,
+                    head_ref_oid: str_field("headRefOid"),
+                    // Merge rights are a REPO fact and cost their own `gh` call; the pure decoder
+                    // cannot know them, so every row leaves here UNKNOWN and `probe_open_prs` fills
+                    // them in. `None` is not `false` — see `probe_viewer_permission`.
+                    viewer_can_merge: None,
                     // Ownership is resolved by the caller, which has the app-data store; the pure
                     // decoder only carries the raw material (`body`) forward.
                     agent_id: None,
@@ -3412,7 +3431,7 @@ fn probe_open_prs(root: &str, project_id: &str, app_data: &Path) -> Option<Vec<P
             "--limit",
             "100",
             "--json",
-            "number,title,headRefName,url,mergeable,mergeStateStatus,statusCheckRollup,body",
+            "number,title,headRefName,headRefOid,url,mergeable,mergeStateStatus,statusCheckRollup,body",
         ])
         .current_dir(root)
         .env("GH_PROMPT_DISABLED", "1")
@@ -3422,8 +3441,82 @@ fn probe_open_prs(root: &str, project_id: &str, app_data: &Path) -> Option<Vec<P
     if !output.status.success() {
         return None;
     }
-    let rows = decode_open_prs(&String::from_utf8_lossy(&output.stdout))?;
+    let mut rows = decode_open_prs(&String::from_utf8_lossy(&output.stdout))?;
+    // ONLY WHEN THERE IS SOMETHING TO MERGE. The permission probe is a second network round trip,
+    // and a repo with no open pull requests has no row that could carry the answer — so the common
+    // quiet case costs exactly what it did before this field existed.
+    if !rows.is_empty() {
+        let can = probe_viewer_permission(root);
+        for r in rows.iter_mut() {
+            r.viewer_can_merge = can;
+        }
+    }
     Some(attach_pr_owners(rows, project_id, app_data))
+}
+
+/// GitHub's `viewerPermission` enum → whether this identity can MERGE a pull request there.
+///
+/// WRITE is the floor GitHub itself enforces for `MergePullRequest`; MAINTAIN and ADMIN are above
+/// it. TRIAGE and READ can open pull requests and comment but cannot merge, which is exactly the
+/// founder's case — he can open PRs into an open-source repo he does not control, and every merge
+/// there fails with `does not have the correct permissions to execute MergePullRequest`.
+///
+/// An UNRECOGNISED value yields `None`, never `false`. A permission string this app has not heard
+/// of (a new GitHub role, an enterprise deployment) must not be read as "you cannot merge" — that
+/// would disable the Merge button across a whole fleet on the strength of a word we failed to
+/// parse, which is a far worse failure than the button we are trying to remove.
+pub fn can_merge_with_permission(permission: &str) -> Option<bool> {
+    match permission.trim().to_ascii_uppercase().as_str() {
+        "ADMIN" | "MAINTAIN" | "WRITE" => Some(true),
+        "TRIAGE" | "READ" | "NONE" => Some(false),
+        _ => None,
+    }
+}
+
+/// Pure decoder for `gh repo view --json viewerPermission` → can this identity merge here.
+///
+/// Three-valued on purpose, and the distinction is the whole safety argument for the pre-check:
+/// `Some(false)` is GitHub telling us the merge cannot work, `None` is us not knowing. Unparsable
+/// output, a missing field, and an explicit JSON `null` (which GitHub returns for an unauthenticated
+/// viewer) all land on `None`.
+fn decode_viewer_permission(stdout: &str) -> Option<bool> {
+    let v = serde_json::from_str::<Value>(stdout).ok()?;
+    can_merge_with_permission(v.get("viewerPermission")?.as_str()?)
+}
+
+/// Whether this identity may merge pull requests in `root`'s repo — `None` when we could not tell.
+///
+/// ── WHY THE THIRD STATE MATTERS (bead sparkle-j881r) ────────────────────────────────────────
+///
+/// The menu draws a Merge button per row, and for a repo the user cannot merge into that button is
+/// a promise the app cannot keep: clicking it spends a `gh` round trip to come back with a GraphQL
+/// permissions error, every refresh re-offers it, and the list's whole claim — "these are ready" —
+/// stops being true. The permission is knowable BEFORE the click, so it is read here and the row is
+/// rendered as "No merge rights" instead.
+///
+/// But this probe can fail for reasons that have nothing to do with permissions: `gh` absent,
+/// unauthed, offline, rate-limited, a timeout. `None` is that case, and the frontend gate treats it
+/// exactly as it behaved before this existed — the OTHER gates still apply and `gh` remains the
+/// backstop. Blocking on unknown would let one slow `gh repo view` disable every Merge button in
+/// the app, which is the same "a gate must not act on an answer it does not have" rule the
+/// `mergeable: unknown` case follows, pointed the other way: there, not knowing withholds a
+/// confident YES; here, not knowing must not manufacture a confident NO.
+///
+/// Asked of the repo `gh` itself resolves in `root`, which is the same resolution `gh pr merge`
+/// will use when the button is pressed — so the two cannot disagree about which repo is meant.
+fn probe_viewer_permission(root: &str) -> Option<bool> {
+    let mut cmd = Command::new(crate::preflight::gh_program());
+    cmd.arg("repo")
+        .args(["view", "--json", "viewerPermission"])
+        .current_dir(root)
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1");
+    apply_noninteractive(&mut cmd);
+    let output = output_with_timeout(cmd, NETWORK_TIMEOUT).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    decode_viewer_permission(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// Fill each row's `agent_id`/`agent_id_source` from the durable mapping, backfilling it as a side
@@ -3458,6 +3551,79 @@ pub async fn project_open_prs(
     tauri::async_runtime::spawn_blocking(move || probe_open_prs(&root, &project_id, &app_data))
         .await
         .map_err(|e| format!("project_open_prs task failed: {e}"))
+}
+
+// ── DISMISSALS: "not now" for a pull request the menu should stop offering ───────────────────
+//
+// The store and the reasoning live in `pr_dismissal`; these are the three IPC doors onto it. They
+// sit here rather than in that module because `app_data_dir` does, and because every caller already
+// holds the (root, projectId) pair this surface is keyed by.
+//
+// SCOPED BY PROJECT ID, NEVER BY PR NUMBER ALONE. Every repository numbers its pull requests from
+// 1, so a fleet-wide list routinely holds two different PRs both called #39 — the same fact that
+// makes `prKeyOf` repo-keyed on the JS side. A dismissal keyed on the bare number would hide a
+// stranger's pull request.
+
+/// Dismiss PR `number` in `project_id`, recording the fingerprint the revival rule is judged
+/// against. Returns the project's whole dismissal set so the caller need not re-read.
+#[tauri::command]
+pub async fn dismiss_pr(
+    app: AppHandle,
+    project_id: String,
+    number: u64,
+    head_ref_oid: String,
+    tone: String,
+    viewer_can_merge: bool,
+) -> Result<Vec<crate::pr_dismissal::PrDismissal>, String> {
+    let app_data = app_data_dir(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::pr_dismissal::dismiss_pr(
+            &app_data,
+            &project_id,
+            number,
+            &head_ref_oid,
+            &tone,
+            viewer_can_merge,
+        )
+    })
+    .await
+    .map_err(|e| format!("dismiss_pr task failed: {e}"))?
+}
+
+/// Un-dismiss PR `number` — the user's Restore, and what the frontend calls when a dismissal's
+/// reason has gone away.
+#[tauri::command]
+pub async fn restore_pr(
+    app: AppHandle,
+    project_id: String,
+    number: u64,
+) -> Result<Vec<crate::pr_dismissal::PrDismissal>, String> {
+    let app_data = app_data_dir(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::pr_dismissal::restore_pr(&app_data, &project_id, number)
+    })
+    .await
+    .map_err(|e| format!("restore_pr task failed: {e}"))?
+}
+
+/// The dismissals recorded for `project_id`.
+///
+/// `open_numbers` is what a SUCCESSFUL probe found open, and passing it prunes records for pull
+/// requests that have since been merged or closed. `None` means the caller has no complete list —
+/// a failed probe — and skips the prune, because reading a failure as "nothing is open" would erase
+/// every dismissal the user has made.
+#[tauri::command]
+pub async fn pr_dismissals(
+    app: AppHandle,
+    project_id: String,
+    open_numbers: Option<Vec<u64>>,
+) -> Result<Vec<crate::pr_dismissal::PrDismissal>, String> {
+    let app_data = app_data_dir(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::pr_dismissal::dismissals_for(&app_data, &project_id, open_numbers.as_deref())
+    })
+    .await
+    .map_err(|e| format!("pr_dismissals task failed: {e}"))?
 }
 
 /// Read one PR's head branch and body — the two fields `pr_owner` resolves against — for a PR that
@@ -8219,6 +8385,58 @@ mod tests {
     }
 
     #[test]
+    fn can_merge_with_permission_uses_githubs_own_write_floor() {
+        // WRITE and above can call MergePullRequest; TRIAGE and READ cannot. This is the founder's
+        // reported case: he can open pull requests into a repo he does not control, and every merge
+        // there comes back "does not have the correct permissions to execute MergePullRequest".
+        for p in ["ADMIN", "MAINTAIN", "WRITE"] {
+            assert_eq!(can_merge_with_permission(p), Some(true), "{p} should be able to merge");
+        }
+        for p in ["TRIAGE", "READ", "NONE"] {
+            assert_eq!(can_merge_with_permission(p), Some(false), "{p} should not be able to merge");
+        }
+        // Case and whitespace are gh's to vary, not ours to depend on.
+        assert_eq!(can_merge_with_permission(" write "), Some(true));
+    }
+
+    #[test]
+    fn an_unrecognised_permission_is_unknown_rather_than_a_refusal() {
+        // A role this build has never heard of must NOT read as "you cannot merge" — that would
+        // disable Merge across the whole fleet on the strength of a word we failed to parse, which
+        // is a worse failure than the un-pressable button the pre-check exists to remove.
+        assert_eq!(can_merge_with_permission("SOMETHING_NEW"), None);
+        assert_eq!(can_merge_with_permission(""), None);
+    }
+
+    #[test]
+    fn decode_viewer_permission_reads_ghs_json_and_degrades_to_unknown() {
+        assert_eq!(decode_viewer_permission(r#"{"viewerPermission":"WRITE"}"#), Some(true));
+        assert_eq!(decode_viewer_permission(r#"{"viewerPermission":"READ"}"#), Some(false));
+        // Every way of not knowing lands on None — never on a confident false.
+        assert_eq!(decode_viewer_permission(r#"{"viewerPermission":null}"#), None);
+        assert_eq!(decode_viewer_permission("{}"), None);
+        assert_eq!(decode_viewer_permission("not json"), None);
+        assert_eq!(decode_viewer_permission(""), None);
+    }
+
+    #[test]
+    fn decode_open_prs_carries_the_head_sha_and_leaves_merge_rights_unknown() {
+        // `head_ref_oid` is the fingerprint a dismissal expires against, so the decoder has to
+        // carry it; merge rights are a REPO fact the pure decoder cannot know, so they leave here
+        // as None and `probe_open_prs` fills them in.
+        let rows = decode_open_prs(
+            r#"[{"number":39,"title":"t","headRefName":"b","headRefOid":"deadbeef","url":"u"}]"#,
+        )
+        .expect("decodes");
+        assert_eq!(rows[0].head_ref_oid, "deadbeef");
+        assert_eq!(rows[0].viewer_can_merge, None);
+        // A row with no headRefOid yields an EMPTY sha, which the revival rule reads as "cannot
+        // compare" — it must never look like a match.
+        let rows = decode_open_prs(r#"[{"number":40,"title":"t","url":"u"}]"#).expect("decodes");
+        assert_eq!(rows[0].head_ref_oid, "");
+    }
+
+    #[test]
     fn normalize_mergeable_maps_only_the_two_terminal_values() {
         assert_eq!(normalize_mergeable(Some("MERGEABLE")), "mergeable");
         assert_eq!(normalize_mergeable(Some("CONFLICTING")), "conflicting");
@@ -8258,6 +8476,10 @@ mod tests {
                 merge_state_status: "clean".into(),
                 failing_checks: vec![],
                 pending_checks: vec![],
+                head_ref_oid: String::new(),
+                // Merge rights are a repo fact `probe_open_prs` attaches; the decoder leaves them
+                // UNKNOWN, which is not the same as "cannot merge".
+                viewer_can_merge: None,
                 // Ownership is attached by `attach_pr_owners`, not by the pure decoder.
                 agent_id: None,
                 agent_id_source: None,
@@ -8279,6 +8501,8 @@ mod tests {
                 merge_state_status: "unknown".into(),
                 failing_checks: vec![],
                 pending_checks: vec![],
+                head_ref_oid: String::new(),
+                viewer_can_merge: None,
                 agent_id: None,
                 agent_id_source: None,
                 body: String::new(),

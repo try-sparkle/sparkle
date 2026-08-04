@@ -65,6 +65,7 @@ mod model_catalog;
 mod naming;
 mod onepassword;
 mod pr_claims;
+mod pr_dismissal;
 mod pr_owner;
 mod preflight;
 mod proc;
@@ -641,6 +642,9 @@ pub fn run() {
             worktree::project_open_prs,
             worktree::pr_owner,
             worktree::merge_pr,
+            worktree::dismiss_pr,
+            worktree::restore_pr,
+            worktree::pr_dismissals,
             worktree::land_agent_branch,
             worktree::push_agent_branch,
             worktree::delete_agent_branch,

@@ -347,3 +347,96 @@ describe("sentences count what was ASKED, not what has a tab", () => {
     expect(fleetHeadline(t)).toBe("2 open pull requests across 2 projects");
   });
 });
+
+// ── DISMISSALS: A DISMISSED PR LEAVES THE LIST *AND* STOPS COUNTING ─────────────────────────────
+//
+// The founder's ask was "it doesn't keep showing me that it's available to merge". Two halves, and
+// they are one fact here on purpose: the grouping does the split, and every count is taken from
+// what the split left behind, so the row and the chiclet cannot disagree about what is hidden.
+describe("buildPrGroups — dismissals", () => {
+  const hidden = (key: string, ...numbers: number[]) =>
+    new Map([[key, new Set(numbers)]]) as ReadonlyMap<string, ReadonlySet<number>>;
+
+  it("moves a dismissed PR out of prs and into dismissed", () => {
+    const key = keyOfScope(sparkle);
+    const g = firstGroup(
+      [sparkle],
+      new Map([[key, [green(1), green(2)]]]),
+      new Set(),
+      hidden(key, 2),
+    );
+    expect(g.prs.map((p) => p.number)).toEqual([1]);
+    expect(g.dismissed.map((p) => p.number)).toEqual([2]);
+  });
+
+  it("drops a dismissed PR from readyCount — the number the chiclet renders", () => {
+    // The SIDE EFFECT, not the precondition: two green PRs, one dismissed, count of one.
+    const key = keyOfScope(sparkle);
+    const args = [[sparkle], new Map([[key, [green(1), green(2)]]]), new Set<string>()] as const;
+    expect(firstGroup(...args).readyCount).toBe(2);
+    expect(firstGroup(...args, hidden(key, 2)).readyCount).toBe(1);
+  });
+
+  it("does not let one repo's dismissal hide another repo's PR of the same number", () => {
+    // PR numbers collide across repositories — the single most dangerous fact on this surface.
+    // Dismissing sparkle's #1 may never touch the website's #1.
+    const groups = buildPrGroups(
+      [sparkle, site],
+      new Map([
+        [keyOfScope(sparkle), [green(1)]],
+        [keyOfScope(site), [green(1)]],
+      ]),
+      new Set(),
+      hidden(keyOfScope(sparkle), 1),
+    );
+    expect(groups[0]!.prs).toEqual([]);
+    expect(groups[0]!.dismissed.map((p) => p.number)).toEqual([1]);
+    expect(groups[1]!.prs.map((p) => p.number)).toEqual([1]);
+    expect(groups[1]!.dismissed).toEqual([]);
+  });
+
+  it("defaults to hiding NOTHING, so a failed dismissal read shows too much rather than too little", () => {
+    const key = keyOfScope(sparkle);
+    const byKey = new Map([[key, [green(1)]]]);
+    expect(firstGroup([sparkle], byKey, new Set()).prs.map((p) => p.number)).toEqual([1]);
+    expect(firstGroup([sparkle], byKey, new Set(), new Map()).prs.map((p) => p.number)).toEqual([1]);
+  });
+});
+
+describe("fleetTotals + fleetHeadline — dismissals", () => {
+  const hidden = (key: string, ...numbers: number[]) =>
+    new Map([[key, new Set(numbers)]]) as ReadonlyMap<string, ReadonlySet<number>>;
+
+  it("keeps dismissed PRs out of total and ready, and counts them separately", () => {
+    const key = keyOfScope(sparkle);
+    const t = fleetTotals(
+      buildPrGroups([sparkle], new Map([[key, [green(1), green(2), green(3)]]]), new Set(), hidden(key, 2, 3)),
+    );
+    expect(t.total).toBe(1);
+    expect(t.ready).toBe(1);
+    expect(t.dismissed).toBe(2);
+  });
+
+  it("refuses a flat zero when every open PR has been dismissed", () => {
+    // `total === 0` here is a choice the user made, not a fact about GitHub — and a bare "No open
+    // pull requests" over two hidden rows states a zero that is really a hidden non-zero, with
+    // nothing on screen pointing at where they went. That is the same false claim the unreadable
+    // and pending hedges above exist to prevent.
+    const key = keyOfScope(sparkle);
+    const groups = buildPrGroups(
+      [sparkle],
+      new Map([[key, [green(1), green(2)]]]),
+      new Set(),
+      hidden(key, 1, 2),
+    );
+    const t = fleetTotals(groups);
+    expect(fleetState(t)).toBe("zero");
+    expect(fleetHeadline(t)).toBe("No open pull requests — 2 dismissed");
+  });
+
+  it("still says the plain sentence at a genuine zero", () => {
+    const t = fleetTotals(buildPrGroups([sparkle], new Map([[keyOfScope(sparkle), []]]), new Set()));
+    expect(t.dismissed).toBe(0);
+    expect(fleetHeadline(t)).toBe("No open pull requests");
+  });
+});

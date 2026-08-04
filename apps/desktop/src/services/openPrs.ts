@@ -48,6 +48,25 @@ export interface PrRow {
   /** Names of the checks still RUNNING. A PR can have both. */
   pendingChecks?: string[];
   /**
+   * The head commit SHA — the FINGERPRINT a dismissal is judged against.
+   *
+   * A dismissal means "not now", so it has to expire once the PR stops being the one that was
+   * waved away, and a push is the cheapest honest signal of that. An empty or absent value means
+   * "cannot compare" and never counts as unchanged: see `services/prDismissals.ts`.
+   */
+  headRefOid?: string;
+  /**
+   * Whether THIS identity may merge in the repo this PR targets — `null`/`undefined` when we could
+   * not find out, which is NOT the same as `false`.
+   *
+   * A repo the user can open PRs into but not merge (an open-source project they do not control)
+   * used to render a Merge button that could only ever come back with `GraphQL: <user> does not
+   * have the correct permissions to execute MergePullRequest`. The permission is knowable before
+   * the click, so the gate reads it — see `prMergeReadiness`, which blocks only on an explicit
+   * `false`.
+   */
+  viewerCanMerge?: boolean | null;
+  /**
    * The agent that opened this PR, from the DURABLE mapping Rust's `pr_owner` keeps — or `null`
    * when nothing identifies it.
    *
@@ -149,7 +168,7 @@ export function prMergeEligibility(pr: PrJudgeable): MergeEligibility {
 /** The subset of a PR this module judges. The newer fields are optional so a partial fixture (or a
  *  caller predating them) still typechecks — see `mergeStateStatus` for why absent ≠ "unknown". */
 export type PrJudgeable = Pick<PrRow, "checks" | "mergeable"> &
-  Partial<Pick<PrRow, "mergeStateStatus" | "failingChecks" | "pendingChecks">>;
+  Partial<Pick<PrRow, "mergeStateStatus" | "failingChecks" | "pendingChecks" | "viewerCanMerge">>;
 
 /**
  * The ONE question the status dot answers: **is this PR safe to merge right now?**
@@ -244,6 +263,35 @@ export function prMergeReadiness(pr: PrJudgeable): PrReadiness {
   // behind. UNSTABLE is checkable (GitHub reports `mergeable: MERGEABLE` beside it); BEHIND is
   // reported when the base requires an up-to-date head, i.e. when the merge is likely to be refused.
   const githubWouldAccept = pr.mergeable === "mergeable" && state === "unstable";
+
+  // ── NO MERGE RIGHTS — FIRST, BECAUSE NOTHING BELOW CAN RESCUE IT (bead sparkle-j881r) ────────
+  //
+  // Every other branch describes something that could CHANGE: checks finish, a conflict is
+  // resolved, GitHub settles a mergeability it had not computed. This one cannot. If the identity
+  // has no write access to the repo, no state of the checks makes `gh pr merge` succeed — it comes
+  // back `GraphQL: <user> does not have the correct permissions to execute MergePullRequest`, every
+  // time, forever. So it is the most-blocking fact on the list and it is checked first: reporting
+  // "checks running" on a PR the user could never merge sends them to wait for a button that will
+  // still not work when the wait ends.
+  //
+  // AND THERE IS NO OVERRIDE. An override's whole justification on this surface is "GitHub would
+  // accept this merge" (see `githubWouldAccept`), which is precisely the claim that is false here.
+  // An override would be two deliberate clicks ending in the same 403.
+  //
+  // ONLY AN EXPLICIT `false` BLOCKS. `undefined`/`null` means the probe could not tell us — `gh`
+  // absent, unauthed, offline, timed out — and must behave exactly as this gate did before the
+  // field existed. Blocking on unknown would let one slow `gh repo view` disable every Merge button
+  // in the app. That is the same rule the `mergeable: "unknown"` case follows, pointed the other
+  // way: not knowing may withhold a confident YES, but it may never manufacture a confident NO.
+  if (pr.viewerCanMerge === false)
+    return {
+      tone: "blocked",
+      label: "No merge rights",
+      title:
+        "You don't have permission to merge in this repository — someone with write access has to merge it, or you can dismiss it to stop it being offered here",
+      canMerge: false,
+      override: null,
+    };
 
   if (pr.mergeable === "conflicting" || state === "dirty")
     return {

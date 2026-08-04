@@ -315,6 +315,45 @@ export const FIXTURE_PRS = [
     checks: "passing",
     mergeable: "mergeable",
   },
+  {
+    // ── THE NO-MERGE-RIGHTS ROW (bead sparkle-j881r) ─────────────────────────────────────────
+    //
+    // GREEN BY EVERY OTHER MEASURE — passing checks, mergeable, clean — and still un-mergeable,
+    // which is the entire point of putting it in a picture. This is the founder's reported case: a
+    // pull request into an open-source repo he does not control, where the app used to draw a
+    // confident one-click Merge whose only possible outcome was `GraphQL: <user> does not have the
+    // correct permissions to execute MergePullRequest`.
+    //
+    // A row whose checks were also red could not photograph it: the reader would have no way to
+    // tell whether the button is disabled because of the checks or because of the rights, and the
+    // capture would score the same whether the pre-check works or not.
+    number: 39,
+    title: "feat(upstream): contribute the retry backoff we needed downstream",
+    headRefName: "sparkle/upstream-retry-backoff",
+    url: "https://github.com/o/upstream/pull/39",
+    checks: "passing",
+    mergeable: "mergeable",
+    mergeStateStatus: "clean",
+    headRefOid: "5f3a1c2",
+    viewerCanMerge: false,
+  },
+  {
+    // ── THE DISMISSED ROW ────────────────────────────────────────────────────────────────────
+    //
+    // Seeded as dismissed by {@link FIXTURE_DISMISSALS}, so the capture shows the Dismissed section
+    // populated rather than an empty affordance. It must NOT appear in the ready list above, and
+    // its fingerprint below matches this row exactly — a mismatched SHA would revive it on the
+    // first poll and the section would photograph as empty for reasons no reader could see.
+    number: 21,
+    title: "wip(docs): rework the footer — superseded by #1095",
+    headRefName: "sparkle/footer-rework",
+    url: "https://github.com/o/r/pull/21",
+    checks: "passing",
+    mergeable: "mergeable",
+    mergeStateStatus: "clean",
+    headRefOid: "9b0d4e7",
+    viewerCanMerge: true,
+  },
 ] as const;
 
 /**
@@ -371,6 +410,30 @@ export const FIXTURE_SECOND_PRS = [
     pendingChecks: ["Preview / build"],
   },
 ] as const;
+
+/**
+ * The dismissals `pr_dismissals` answers with, per PROJECT ID.
+ *
+ * Keyed on the project id rather than the root path because that is what the command is invoked
+ * with — and because dismissals are per-project by design: PR numbers collide across repositories,
+ * so a dismissal keyed on a bare number would hide a stranger's pull request.
+ *
+ * The fingerprint here has to MATCH the row it names in {@link FIXTURE_PRS}. `isRevived`
+ * compares the two on every probe, so a stale `headRefOid` would mean the fixture un-dismisses its
+ * own dismissal a beat after the capture starts — leaving a screenshot of an empty Dismissed
+ * section that looks like a rendering bug and is really a fixture that disagrees with itself.
+ */
+export const FIXTURE_DISMISSALS: Record<string, readonly Record<string, unknown>[]> = {
+  [FIXTURE_PROJECT_ID]: [
+    {
+      number: 21,
+      headRefOid: "9b0d4e7",
+      tone: "ready",
+      viewerCanMerge: true,
+      dismissedAt: Math.floor(FIXTURE_NOW / 1000) - 3600,
+    },
+  ],
+};
 
 /**
  * `project_open_prs`, ANSWERED PER ROOT PATH.
@@ -1085,12 +1148,25 @@ export function applyVisualFixtures(
       .__TAURI_INTERNALS__;
     const inner = internals?.invoke;
     if (internals && inner) {
-      internals.invoke = (cmd: string, args?: unknown) =>
-        cmd === "project_open_prs"
-          ? Promise.resolve(
-              fixturePrsForRoot((args as { root?: unknown } | undefined)?.root) as unknown,
-            )
-          : inner(cmd, args);
+      internals.invoke = (cmd: string, args?: unknown) => {
+        if (cmd === "project_open_prs") {
+          return Promise.resolve(
+            fixturePrsForRoot((args as { root?: unknown } | undefined)?.root) as unknown,
+          );
+        }
+        // THE DISMISSAL COMMANDS, answered from the same in-memory seed so the capture can show a
+        // populated Dismissed section. Read-only by design: `dismiss_pr`/`restore_pr` answer with
+        // the CURRENT set rather than mutating it, because a capture drives the app through a fixed
+        // script and a fixture that accumulated state would make each surface depend on which ones
+        // ran before it — the exact cross-surface bleed the `capture=1` reset exists to stop.
+        if (cmd === "pr_dismissals" || cmd === "dismiss_pr" || cmd === "restore_pr") {
+          const projectId = (args as { projectId?: unknown } | undefined)?.projectId;
+          return Promise.resolve(
+            (typeof projectId === "string" ? (FIXTURE_DISMISSALS[projectId] ?? []) : []) as unknown,
+          );
+        }
+        return inner(cmd, args);
+      };
     }
   }
 
