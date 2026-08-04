@@ -43,6 +43,7 @@ import { startUpdater } from "./services/updaterService";
 import { startStaleBuildWatch } from "./services/staleBuildService";
 import { startGoalContinuationRunner } from "./services/goalContinuationRunner";
 import { startFleetWatch } from "./services/fleetWatch";
+import { startInboxWatch } from "./stores/inboxStore";
 import { startPusher } from "./services/pusherMount";
 
 // The Workspace subtree pulls in the heavy authenticated UI — xterm, markdown rendering, modals,
@@ -116,6 +117,23 @@ function FleetWatch() {
       stop?.();
     };
   }, [isMain]);
+  return null;
+}
+
+// The READ half of the Level 2 inbox: what is queued for each agent a surface is currently showing,
+// so a message the concierge queued is VISIBLE before it is delivered (bead sparkle-zm0c8 — a queued
+// instruction appeared nowhere at all, which made "I sent it" uncheckable). Paints no UI.
+//
+// EVERY WINDOW, unlike `FleetWatch` above, and the difference is not an oversight. FleetWatch is
+// main-window-only because it WRITES — it claims messages and types them into a PTY — so extra
+// windows would be extra cost for the same delivery. This one only reads (`inbox_peek` never claims),
+// and agent rows render in every window: gating it on the main window would leave every other
+// window's column showing exactly the nothing this bead is about.
+//
+// Not deferred to `onIdle` either: the registry starts empty and a tick over no watchers returns
+// immediately, so there is no boot-burst cost to defer, and deferring would delay the first badge.
+function InboxWatch() {
+  useEffect(() => startInboxWatch(), []);
   return null;
 }
 
@@ -441,6 +459,7 @@ export function App() {
     <AppBoot>
       <RosterPublisher />
       <FleetWatch />
+      <InboxWatch />
       <LimitSync />
       <GoalContinuation />
       <Pusher />

@@ -467,6 +467,105 @@ pub fn status_of(app_data: &Path, agent_id: &str, now: i64) -> InboxStatus {
     }
 }
 
+/// The lifecycle stage one queued message has reached.
+///
+/// `InboxStatus` above counts these; this NAMES them per message, which is the difference between a
+/// caller being able to say "two things are queued" and being able to show WHICH two and where each
+/// one has got to. Both facts come from the same evidence — a claim file, an ack line — so the two
+/// can never disagree about a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeliveryState {
+    /// Queued, and no delivery path has taken it yet. This is the stage that was INVISIBLE.
+    Pending,
+    /// A claim file exists — the agent has been shown the text.
+    Delivered,
+    /// The agent appended an ack line. Terminal.
+    Acknowledged,
+}
+
+/// One live message, with its text and its stage — what a human needs to check a "I sent it" claim.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct InboxEntry {
+    pub id: String,
+    pub ts: i64,
+    pub from: String,
+    pub text: String,
+    pub severity: Severity,
+    pub state: DeliveryState,
+    /// When the agent acknowledged, if it did. `None` in every other state.
+    pub acked_at: Option<i64>,
+    /// The agent's own free-text note on the ack, when it wrote one.
+    pub ack_note: Option<String>,
+}
+
+/// One agent's live inbox.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct InboxView {
+    pub agent_id: String,
+    pub entries: Vec<InboxEntry>,
+}
+
+/// The LIVE view of one agent's inbox: every message still in flight, with its text and stage.
+///
+/// WHY A SECOND READER ALONGSIDE [`status_of`]. `status_of` answers "how many", which is all the
+/// concierge's own watchdog needs. It is not enough to answer the founder's question, which is *"you
+/// said you sent this — where is it?"*: counts cannot be read as evidence that a specific instruction
+/// exists, and `pending_ids` names opaque uuids. Showing the TEXT is the whole point — a queued
+/// message that nothing renders is indistinguishable from a message that was never sent, and
+/// sparkle-bbghz is the reason that distinction is not academic.
+///
+/// READ-ONLY, AND THAT IS LOAD-BEARING. This must never claim: a UI poll that claimed would BE a
+/// delivery path, so merely looking at the column would consume messages the agent never saw — the
+/// exact silent drop this pair of bugs is about, reintroduced by the fix for it. Nothing here opens a
+/// file for writing.
+///
+/// EXPIRED RECORDS ARE OMITTED ENTIRELY — pending, delivered and acknowledged alike. `MAX_AGE_MS` is
+/// how long a message is worth DELIVERING, and a badge counting a "rebase before you verify" from
+/// yesterday would be pointing a human at an instruction the queue itself has already abandoned.
+/// This is where the answer deliberately differs from `status_of`, whose counters are cumulative:
+/// that one reports what the queue HAS held, this one reports what is still in flight.
+pub fn entries_of(app_data: &Path, agent_id: &str, now: i64) -> Vec<InboxEntry> {
+    if refuse_escape("entries_of", agent_id) {
+        return Vec::new();
+    }
+    let claims = claims_dir(app_data, agent_id);
+    let acks = read_jsonl::<InboxAck>(&acks_path(app_data, agent_id));
+    read_jsonl::<InboxMessage>(&messages_path(app_data, agent_id))
+        .into_iter()
+        // Same skip as `status_of`: a record whose id cannot be a claim file name is undeliverable by
+        // construction, so it is not "in flight" and showing it would offer a human a message nothing
+        // will ever hand to the agent.
+        .filter(|m| !refuse_escape("entries_of record", &m.id))
+        .filter(|m| now.saturating_sub(m.ts) <= MAX_AGE_MS)
+        .map(|m| {
+            let ack = acks.iter().find(|a| a.id == m.id);
+            // ACK WINS OVER CLAIM. An ack is written by the agent AFTER it was shown the text, so it
+            // implies delivery — and reading the claim first would report `delivered` for a message
+            // the agent has explicitly confirmed, which is the more advanced fact.
+            let state = if ack.is_some() {
+                DeliveryState::Acknowledged
+            } else if is_claimed(&claims, &m.id) {
+                DeliveryState::Delivered
+            } else {
+                DeliveryState::Pending
+            };
+            InboxEntry {
+                id: m.id,
+                ts: m.ts,
+                from: m.from,
+                text: m.text,
+                severity: m.severity,
+                state,
+                acked_at: ack.map(|a| a.ts),
+                ack_note: ack.and_then(|a| a.note.clone()),
+            }
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------------------------
@@ -577,6 +676,37 @@ pub async fn inbox_status(
     })
     .await
     .map_err(|e| format!("inbox_status task failed: {e}"))
+}
+
+/// The LIVE inbox — text and lifecycle stage — for the named agents. READ-ONLY: it never claims.
+///
+/// This is what the agent row's pending badge and the mounted agent thread render, which is why it
+/// returns the message BODY and not only counts: the bug it exists to close (sparkle-zm0c8) is that a
+/// queued instruction appeared NOWHERE, so "the concierge said it sent this" and "the concierge
+/// imagined it" looked identical to the one person who has to decide which.
+///
+/// `async` + `spawn_blocking` for the reason given on [`inbox_send`], and it matters more here than
+/// for the others: this one is driven by a UI poll over every agent in the window, so a synchronous
+/// version would put a per-agent pair of file reads on the main thread on a repeating beat.
+///
+/// `validate_all` BEFORE the thread hop, matching `inbox_status`: these ids reach `messages_path`,
+/// `acks_path` and `claims_dir`, so a traversal-shaped one must never occupy a blocking-pool slot.
+#[tauri::command]
+pub async fn inbox_peek(app: AppHandle, agent_ids: Vec<String>) -> Result<Vec<InboxView>, String> {
+    validate_all(&agent_ids)?;
+    let base = app_data(&app)?;
+    let now = now_ms();
+    tauri::async_runtime::spawn_blocking(move || {
+        agent_ids
+            .into_iter()
+            .map(|agent_id| {
+                let entries = entries_of(&base, &agent_id, now);
+                InboxView { agent_id, entries }
+            })
+            .collect()
+    })
+    .await
+    .map_err(|e| format!("inbox_peek task failed: {e}"))
 }
 
 /// Messages the app-side idle path should deliver, and the claim it must win first.
@@ -733,6 +863,184 @@ mod tests {
             0,
             "and the queue really is empty — the refusal is telling the truth"
         );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The read half of sparkle-zm0c8: a queued message must be READABLE — text and stage — without
+    /// being consumed, because that is the only thing a human can check a "I sent it" claim against.
+    ///
+    /// Asserts the side effect (the TEXT and the STAGE that come back), not that a helper was called.
+    /// Before `entries_of` existed the only reader was `status_of`, which returns counts and opaque
+    /// uuids — so no arrangement of the pre-change code satisfies these assertions.
+    #[test]
+    fn peek_reports_the_text_and_the_lifecycle_stage_of_every_live_message() {
+        let base = tmp("peek-lifecycle");
+        send(&base, "a1", "rebase before you verify", 1_000, "m1").unwrap();
+        send(&base, "a1", "the picker spec changed", 1_000, "m2").unwrap();
+        send(&base, "a1", "main has moved", 1_000, "m3").unwrap();
+
+        // m2 was handed over; m3 was handed over AND confirmed.
+        claim(&claims_dir(&base, "a1"), "m2");
+        claim(&claims_dir(&base, "a1"), "m3");
+        append_jsonl(
+            &acks_path(&base, "a1"),
+            &InboxAck { id: "m3".into(), ts: 1_500, note: Some("read".into()) },
+        )
+        .unwrap();
+
+        let got = entries_of(&base, "a1", 1_000);
+        assert_eq!(got.len(), 3, "every live message must be readable: {got:?}");
+
+        // THE TEXT, which is the whole point — a count cannot be checked against a claim.
+        assert_eq!(
+            got.iter().map(|e| e.text.as_str()).collect::<Vec<_>>(),
+            vec!["rebase before you verify", "the picker spec changed", "main has moved"],
+        );
+        assert_eq!(
+            got.iter().map(|e| e.state).collect::<Vec<_>>(),
+            vec![DeliveryState::Pending, DeliveryState::Delivered, DeliveryState::Acknowledged],
+        );
+        // The ack detail rides along, so "acknowledged" is checkable rather than asserted.
+        assert_eq!(got[2].acked_at, Some(1_500));
+        assert_eq!(got[2].ack_note.as_deref(), Some("read"));
+        assert_eq!((got[0].acked_at, got[1].acked_at), (None, None));
+
+        // READ-ONLY. A UI poll that claimed would itself become a delivery path, consuming messages
+        // the agent never saw — the silent drop this work exists to close, caused by the fix for it.
+        assert_eq!(
+            status_of(&base, "a1", 1_000).pending,
+            1,
+            "peeking must not claim: m1 is still pending after being read"
+        );
+        assert_eq!(entries_of(&base, "a1", 1_000)[0].state, DeliveryState::Pending);
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn peek_omits_an_expired_message_so_no_surface_shows_a_dead_instruction() {
+        // MAX_AGE_MS is how long a message is worth DELIVERING. A badge counting a day-old "rebase
+        // before you verify" points a human at an instruction the queue itself has abandoned.
+        let base = tmp("peek-ttl");
+        send(&base, "a1", "stale news", 1_000, "m1").unwrap();
+        send(&base, "a1", "fresh news", 1_000 + MAX_AGE_MS, "m2").unwrap();
+
+        // `+ 1`, matching `pending`'s own `<= MAX_AGE_MS`: a message exactly at the age limit is
+        // still deliverable, so the two readers agree about the boundary rather than one of them
+        // dropping a message the other would still hand over.
+        let got = entries_of(&base, "a1", 1_000 + MAX_AGE_MS + 1);
+        assert_eq!(
+            got.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec!["m2"],
+            "the expired record must not be offered to any surface: {got:?}"
+        );
+
+        // A DELIVERED record ages out too. `status_of` counts it forever (its counters are
+        // cumulative); this reader answers "what is still in flight", which is what a badge means.
+        let base2 = tmp("peek-ttl-delivered");
+        send(&base2, "a1", "old but delivered", 1_000, "m1").unwrap();
+        claim(&claims_dir(&base2, "a1"), "m1");
+        assert_eq!(status_of(&base2, "a1", 1_000 + MAX_AGE_MS + 1).delivered, 1);
+        assert!(entries_of(&base2, "a1", 1_000 + MAX_AGE_MS + 1).is_empty());
+
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::remove_dir_all(&base2).ok();
+    }
+
+    /// `entries_of` returns the message BODY, so an unguarded id would leak the contents of any
+    /// `*.jsonl` on disk rather than merely its existence — a strictly worse version of the probe
+    /// `the_read_sinks_refuse_a_traversal_id_and_read_nothing_outside_the_inbox_dir` closes.
+    ///
+    /// Asserts the side effect: the fixture is planted at exactly the path an unguarded read resolves
+    /// to, with a positive control proving those same bytes ARE readable through a legitimate id.
+    #[test]
+    fn peek_refuses_a_traversal_id_and_reads_no_message_body_outside_the_inbox_dir() {
+        let base = tmp("peek-escape");
+        let escaping = "../evil";
+        std::fs::create_dir_all(inbox_dir(&base)).unwrap();
+
+        let record = serde_json::to_string(&InboxMessage {
+            id: "leaked".into(),
+            ts: 1_000,
+            from: "somewhere-else".into(),
+            text: "a secret from outside the inbox".into(),
+            severity: Severity::Fyi,
+        })
+        .unwrap();
+        let planted = messages_path(&base, escaping);
+        std::fs::write(&planted, format!("{record}\n")).unwrap();
+        assert_eq!(
+            planted.parent().unwrap().canonicalize().unwrap(),
+            base.canonicalize().unwrap(),
+            "the fixture must sit OUTSIDE the inbox dir or this test proves nothing"
+        );
+
+        // Positive control: the same bytes read fine through a valid id, so the empty result below is
+        // the guard refusing rather than an unreadable fixture.
+        std::fs::write(messages_path(&base, "a1"), format!("{record}\n")).unwrap();
+        assert_eq!(entries_of(&base, "a1", 1_000).len(), 1);
+
+        let got = entries_of(&base, escaping, 1_000);
+        assert!(got.is_empty(), "peek read {} — it leaks message BODIES: {got:?}", planted.display());
+
+        // And a record whose own id would escape is not offered either — it is undeliverable by
+        // construction (`claim` refuses it), so it is not "in flight" and must not be shown.
+        let line = |id: &str| {
+            serde_json::to_string(&InboxMessage {
+                id: id.into(),
+                ts: 1_000,
+                from: "concierge".into(),
+                text: "x".into(),
+                severity: Severity::Fyi,
+            })
+            .unwrap()
+        };
+        std::fs::write(messages_path(&base, "a2"), format!("{}\n{}\n", line("../escaped"), line("ok1")))
+            .unwrap();
+        assert_eq!(
+            entries_of(&base, "a2", 1_000).iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec!["ok1"],
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The two readers must never disagree about a message, because a badge built on one and a
+    /// watchdog built on the other would otherwise tell the founder different stories about the same
+    /// send — which is the class of defect this whole change is about.
+    #[test]
+    fn peek_and_status_agree_about_every_live_message() {
+        let base = tmp("peek-agrees");
+        for (i, id) in ["m1", "m2", "m3", "m4"].iter().enumerate() {
+            send(&base, "a1", &format!("msg {i}"), 1_000, id).unwrap();
+        }
+        claim(&claims_dir(&base, "a1"), "m2");
+        claim(&claims_dir(&base, "a1"), "m3");
+        append_jsonl(&acks_path(&base, "a1"), &InboxAck { id: "m3".into(), ts: 1_100, note: None })
+            .unwrap();
+
+        let s = status_of(&base, "a1", 1_000);
+        let e = entries_of(&base, "a1", 1_000);
+        let count = |st: DeliveryState| e.iter().filter(|x| x.state == st).count() as u32;
+
+        assert_eq!(count(DeliveryState::Pending), s.pending, "pending must match");
+        assert_eq!(
+            count(DeliveryState::Delivered) + count(DeliveryState::Acknowledged),
+            s.delivered,
+            "every acknowledged message was also delivered, so the two columns must sum to it"
+        );
+        assert_eq!(count(DeliveryState::Acknowledged), s.acknowledged, "acknowledged must match");
+        // …and the pending ids are the same set, not merely the same size.
+        let mut peeked: Vec<&str> = e
+            .iter()
+            .filter(|x| x.state == DeliveryState::Pending)
+            .map(|x| x.id.as_str())
+            .collect();
+        peeked.sort_unstable();
+        let mut named: Vec<&str> = s.pending_ids.iter().map(String::as_str).collect();
+        named.sort_unstable();
+        assert_eq!(peeked, named);
 
         std::fs::remove_dir_all(&base).ok();
     }
@@ -1096,9 +1404,9 @@ mod tests {
         // attribute inline with the fn would all turn this guard into a no-op that stays green — the
         // "assertion already true before the change" shape that is this repo's #1 finding.
         assert!(
-            total >= 4,
-            "expected at least the 4 inbox commands (send/broadcast/status/claim_for_idle), found \
-             {total} — the scanner matched nothing, so this guard is not guarding anything"
+            total >= 5,
+            "expected at least the 5 inbox commands (send/broadcast/status/peek/claim_for_idle), \
+             found {total} — the scanner matched nothing, so this guard is not guarding anything"
         );
         assert!(
             sync_cmds.is_empty(),

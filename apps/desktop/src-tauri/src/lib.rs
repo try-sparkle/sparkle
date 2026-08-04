@@ -537,6 +537,7 @@ pub fn run() {
             inbox::inbox_send,
             inbox::inbox_broadcast,
             inbox::inbox_status,
+            inbox::inbox_peek,
             inbox::inbox_claim_for_idle,
             folder_picker::pick_folder,
             folder_picker::pick_files,

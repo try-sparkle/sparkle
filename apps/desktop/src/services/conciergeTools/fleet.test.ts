@@ -142,6 +142,45 @@ describe("inboxBroadcast", () => {
     if (!r.ok) return;
     expect(r.data.queued).toBe(2);
     expect(r.data.failed).toBe(1);
+    // …and NAMES who was missed, so the caller does not have to walk `outcomes` to find out — the
+    // step it demonstrably skips when the envelope already says `ok: true`.
+    expect(r.data.failedAgents).toEqual(["b"]);
+  });
+
+  it("REFUSES when nothing was queued, instead of returning ok with a zero in it", async () => {
+    // sparkle-bbghz's rule, one layer up. `enqueue` is honest per agent now, but this wrapper
+    // flattened N honest failures into `ok: true` with a count the caller had to notice on its own —
+    // and the caller is a language model that has just been asked to instruct a fleet, for which
+    // `ok: true` is exactly the evidence it uses to tell a human that it did. That is the same
+    // positive-acknowledgement-for-nothing this bead pair is about, arriving through the batch path.
+    invoke.mockResolvedValue([
+      { agentId: "a", messageId: null, error: "inbox: wrote message m1 but could not read it back" },
+      { agentId: "b", messageId: null, error: "inbox: b already has 50 undelivered messages" },
+    ]);
+    const r = await inboxBroadcast(["a", "b"], "main has moved", "act");
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    // The refusal has to be actionable: WHO was missed and WHY, not just that something went wrong.
+    expect(r.message).toContain("a:");
+    expect(r.message).toContain("could not read it back");
+    expect(r.message).toContain("b:");
+    expect(r.message).toContain("no agent has been told anything");
+  });
+
+  it("counts a missing message id as a failure even when no error string came with it", async () => {
+    // A message id is what a caller USES as proof of a send, so the failure count must be the count
+    // of agents that have no id — never the count that happened to carry an error string. A backend
+    // that returned `{messageId: null, error: null}` would otherwise read as a clean success.
+    invoke.mockResolvedValue([
+      { agentId: "a", messageId: "m1", error: null },
+      { agentId: "b", messageId: null, error: null },
+    ]);
+    const r = await inboxBroadcast(["a", "b"], "x");
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.data.queued).toBe(1);
+    expect(r.data.failed).toBe(1);
+    expect(r.data.failedAgents).toEqual(["b"]);
   });
 
   it("refuses an empty recipient list", async () => {

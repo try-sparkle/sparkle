@@ -128,6 +128,34 @@ export interface InboxStatusRow {
   pendingIds: string[];
 }
 
+/**
+ * How far one queued message has got. Mirrors `inbox::DeliveryState`.
+ *
+ * `InboxStatusRow` above COUNTS these; this names the stage of a SPECIFIC message, which is what a
+ * human needs to check a "I sent it" claim rather than merely learn that two things are queued.
+ */
+export type DeliveryState = "pending" | "delivered" | "acknowledged";
+
+/** One live message with its text and stage. Mirrors `inbox::InboxEntry`. */
+export interface InboxEntry {
+  id: string;
+  ts: number;
+  from: string;
+  text: string;
+  severity: InboxSeverity;
+  state: DeliveryState;
+  /** When the agent acknowledged, if it did. `null` in every other state. */
+  ackedAt: number | null;
+  /** The agent's own note on the ack, when it wrote one. */
+  ackNote: string | null;
+}
+
+/** One agent's live inbox — every message still in flight. Mirrors `inbox::InboxView`. */
+export interface InboxView {
+  agentId: string;
+  entries: InboxEntry[];
+}
+
 export interface BroadcastOutcome {
   agentId: string;
   messageId: string | null;
@@ -264,12 +292,32 @@ export async function inboxSend(
  *
  * Partial failure is reported per agent rather than failing the whole call, so one agent with a full
  * inbox cannot silently prevent the other deliveries.
+ *
+ * A BROADCAST THAT QUEUED NOTHING IS A REFUSAL, NOT AN `ok` WITH A ZERO IN IT (sparkle-bbghz's rule
+ * applied one layer up). `enqueue` now reads each message back before returning an id, so the Rust
+ * side is honest per agent — but this wrapper flattened N honest failures into `ok: true` with a
+ * `failed` count the caller had to notice on its own. The caller is a language model that has just
+ * been asked to instruct a fleet, and `ok: true` is exactly the evidence it uses to tell a human it
+ * did. That is the same defect as the bug this pair of beads is about, arriving through the batch
+ * path: a positive acknowledgement for something that did not happen.
+ *
+ * PARTIAL SUCCESS STAYS `ok`, deliberately — some agents really were reached, and refusing the whole
+ * call would misreport those as failures and invite a re-send that double-queues them. It carries
+ * `failedAgents` so the caller can name who was missed without walking `outcomes` itself; the reason
+ * text is already per-agent inside `outcomes`.
  */
 export async function inboxBroadcast(
   agentIds: string[],
   text: string,
   severity: InboxSeverity = "fyi",
-): Promise<FleetResult<{ outcomes: BroadcastOutcome[]; queued: number; failed: number }>> {
+): Promise<
+  FleetResult<{
+    outcomes: BroadcastOutcome[];
+    queued: number;
+    failed: number;
+    failedAgents: string[];
+  }>
+> {
   if (agentIds.length === 0) {
     return refuse("inbox_broadcast", "no-recipients", "Name at least one agentId to broadcast to.");
   }
@@ -279,10 +327,27 @@ export async function inboxBroadcast(
       text,
       severity,
     });
+    const queued = outcomes.filter((o) => o.messageId !== null).length;
+    const failedOutcomes = outcomes.filter((o) => o.messageId === null);
+    if (queued === 0) {
+      return refuse(
+        "inbox_broadcast",
+        "none-queued",
+        `Nothing was queued. ${failedOutcomes.length} of ${outcomes.length} agent(s) rejected the ` +
+          `message and none accepted it, so no agent has been told anything:\n` +
+          failedOutcomes
+            .map((o) => `  ${o.agentId}: ${o.error ?? "no message id returned"}`)
+            .join("\n"),
+      );
+    }
     return ok("inbox_broadcast", {
       outcomes,
-      queued: outcomes.filter((o) => o.messageId !== null).length,
-      failed: outcomes.filter((o) => o.error !== null).length,
+      queued,
+      // Counted off `messageId`, not off `error`. They agree today, but a message id is what a caller
+      // would USE as proof of a send — so the count of failures must be the count of agents that have
+      // no id, never the count that happened to carry an error string.
+      failed: failedOutcomes.length,
+      failedAgents: failedOutcomes.map((o) => o.agentId),
     });
   } catch (e) {
     return refuse("inbox_broadcast", "broadcast-failed", detail(e));

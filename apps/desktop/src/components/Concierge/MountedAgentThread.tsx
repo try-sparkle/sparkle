@@ -21,12 +21,15 @@
 //     terminal plane the column already paints.
 //   • TOOL MACHINERY collapses into one expandable ActivityChip per stretch of work.
 // Which voice is speaking is legible from across the room — the thing a same-face thread cannot do.
-import { useLayoutEffect, useRef } from "react";
+import { useLayoutEffect, useMemo, useRef } from "react";
 
 import { ActivityChip } from "./ActivityChip";
 import { Markdown } from "../Markdown";
 import type { TranscriptEntry } from "../../services/agentTranscript";
+import type { InboxEntry } from "../../services/conciergeTools/fleet";
 import type { MountedThread } from "../../stores/mountedThreadStore";
+import { inFlight, useAgentInbox } from "../../stores/inboxStore";
+import { DELIVERY_A11Y, DELIVERY_LABEL, QUEUED_BLOCK_HEADING } from "../inboxCopy";
 import { useAutoFollow } from "../../hooks/useAutoFollow";
 import { termMuted } from "../terminalChrome";
 import { useResolvedTheme, type ResolvedTheme } from "../../theme/theme";
@@ -36,6 +39,8 @@ export const MOUNTED_THREAD_TESTID = "mounted-agent-thread";
 export const MOUNTED_HUMAN_TESTID = "mounted-human-turn";
 export const MOUNTED_AGENT_TESTID = "mounted-agent-turn";
 export const MOUNTED_EMPTY_TESTID = "mounted-thread-empty";
+export const MOUNTED_QUEUED_TESTID = "mounted-queued-message";
+export const MOUNTED_QUEUED_BLOCK_TESTID = "mounted-queued-block";
 
 /** The provenance mark under one of your own bubbles.
  *
@@ -55,10 +60,13 @@ function provenanceLabel(promptSource: string | null): string {
 
 export function MountedAgentThread({
   thread,
+  agentId,
   agentName,
   onReachTop,
 }: {
   thread: MountedThread;
+  /** Whose inbox to show alongside the transcript. Empty string = no agent, and nothing is queried. */
+  agentId: string;
   /** The agent's display name, for the empty state. Never used as an authorship label on turns —
    *  the typographic register carries authorship, exactly as it does in ConciergeThread. */
   agentName: string;
@@ -67,6 +75,38 @@ export function MountedAgentThread({
   const mode = useResolvedTheme();
   const muted = termMuted(mode);
   const entries = thread.entries;
+
+  // THE MESSAGES THIS THREAD COULD NOT SHOW (bead sparkle-zm0c8). The transcript is a projection of
+  // DISK — of turns that have happened — so a message the concierge queued a moment ago is by
+  // construction absent from it until the agent reaches a turn boundary and drains it. That is the
+  // whole reported bug: *"I don't see a followup message from you in that agent thread with this,
+  // just the original instruction."* Both halves were true, and this is the half the thread owed.
+  const queued = inFlight(useAgentInbox(agentId));
+
+  // …AND THEN STOP SHOWING ONE ONCE THE THREAD ITSELF CARRIES IT. A delivered message is typed into
+  // the agent verbatim by whichever path won the claim (`sparkle-hook.mjs::draftDelivery` at a turn
+  // boundary, `fleetWatch.draftIdleDelivery` for an already-idle agent), so Claude Code records it as
+  // a human turn and it arrives in this transcript on the next tail read. Leaving the placeholder up
+  // would then print the same instruction twice, which is its own small dishonesty — the reader would
+  // have no way to tell one message sent once from two sent in a row.
+  //
+  // MATCHED ON TEXT, NOT ON ID, because only ONE of the two delivery paths writes the id (the hook's
+  // ack instruction does; the idle path deliberately asks for no ack at all, see its docstring). The
+  // TEXT is what both paths inline. `pending` is never matched — nothing has been typed anywhere yet,
+  // so a hit could only ever be a coincidence.
+  //
+  // THE ERROR IS ASYMMETRIC AND FALLS THE SAFE WAY. A false positive (a short message that happens to
+  // appear in an unrelated turn) hides a placeholder for a message the transcript is showing anyway; a
+  // false negative keeps a delivered message visible, which is merely redundant. Neither can make a
+  // message invisible, which is the failure this whole file is being edited for.
+  const visible = useMemo(() => {
+    if (queued.length === 0) return queued;
+    const said = entries.filter((e) => e.kind === "human").map((e) => e.text);
+    const out = queued.filter(
+      (q) => q.state === "pending" || !said.some((t) => t.includes(q.text)),
+    );
+    return out.length === queued.length ? queued : out;
+  }, [queued, entries]);
 
   // The last entry id is enough of a content key here, unlike the concierge thread's: nothing in a
   // transcript grows IN PLACE. Records are appended and immutable — a streaming reply arrives as new
@@ -132,6 +172,35 @@ export function MountedAgentThread({
           <Entry key={e.id} entry={e} mode={mode} muted={muted} />
         ))}
 
+        {/* THE QUEUE, AT THE TAIL. Below every real turn because that is where it belongs in time —
+            these have not happened yet — and because the tail is where auto-follow already parks the
+            reader, so a message queued while they are watching appears under their eyes rather than
+            somewhere they have to hunt for. */}
+        {visible.length > 0 && (
+          <div
+            data-testid={MOUNTED_QUEUED_BLOCK_TESTID}
+            style={{ display: "flex", flexDirection: "column", gap: 10 }}
+          >
+            <div
+              style={{
+                fontFamily: FONT_MONO,
+                fontSize: TYPE.micro,
+                color: muted,
+                textAlign: "center",
+                // A hairline in the terminal ink, so the block reads as a section of THIS column
+                // rather than a notification pasted over it.
+                borderTop: "1px solid color-mix(in srgb, currentColor 15%, transparent)",
+                paddingTop: 8,
+              }}
+            >
+              {QUEUED_BLOCK_HEADING}
+            </div>
+            {visible.map((q) => (
+              <QueuedMessage key={q.id} entry={q} muted={muted} />
+            ))}
+          </div>
+        )}
+
         {entries.length === 0 && !thread.loading && (
           <div
             data-testid={MOUNTED_EMPTY_TESTID}
@@ -143,6 +212,57 @@ export function MountedAgentThread({
           </div>
         )}
         {entries.length === 0 && thread.loading && <Notice mode={mode}>Reading transcript…</Notice>}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * One message that is queued for this agent but not yet in its conversation.
+ *
+ * IT WEARS THE SAME BUBBLE AS A REAL TURN, DIMMED — not a distinct "notification" shape. The
+ * concierge speaks on the founder's behalf and its relays are recorded as human turns (see
+ * `provenanceLabel`), so a queued message is a turn that has not happened yet, and drawing it as the
+ * same object at lower contrast is what makes "it delivered" legible as the SAME thing arriving
+ * rather than one widget being replaced by another. That is the promotion the bead asked for: the
+ * transcript's copy takes its place at full contrast, in the same register, in the same column.
+ *
+ * THE OPACITY IS NOT DECORATION — it is the second channel for the stage, and it is not the only one.
+ * The stage is also written out underneath (`DELIVERY_LABEL`) and named for a screen reader
+ * (`DELIVERY_A11Y`), because dimming is invisible to a reader who cannot see it and ambiguous to one
+ * who can (dim could equally mean "old"). Three channels, one fact.
+ */
+function QueuedMessage({ entry, muted }: { entry: InboxEntry; muted: string }) {
+  const pending = entry.state === "pending";
+  return (
+    <div style={{ maxWidth: "92%", alignSelf: "flex-end", textAlign: "right" }}>
+      <div
+        data-testid={MOUNTED_QUEUED_TESTID}
+        data-delivery-state={entry.state}
+        aria-label={DELIVERY_A11Y[entry.state]}
+        style={{
+          display: "inline-block",
+          textAlign: "left",
+          fontSize: TYPE.body,
+          background: "color-mix(in srgb, currentColor 10%, transparent)",
+          borderRadius: "4px 4px 0 4px",
+          padding: "9px 12px",
+          whiteSpace: "pre-wrap",
+          wordBreak: "break-word",
+          // A DASHED EDGE ON THE PENDING ONE. Opacity alone put a queued message in the same visual
+          // class as a scrolled-away one; a drawn, unfinished boundary says "this is not settled yet"
+          // at a glance and survives the two things opacity does not — a dark theme, and a reader who
+          // is not comparing it against a neighbouring bubble.
+          border: pending
+            ? "1px dashed color-mix(in srgb, currentColor 35%, transparent)"
+            : "1px solid transparent",
+          opacity: pending ? 0.62 : 0.82,
+        }}
+      >
+        {entry.text}
+      </div>
+      <div style={{ fontFamily: FONT_MONO, fontSize: TYPE.micro, color: muted, marginTop: 2 }}>
+        · {DELIVERY_LABEL[entry.state]}
       </div>
     </div>
   );

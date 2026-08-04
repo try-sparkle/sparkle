@@ -72,6 +72,7 @@ import { refreshAgentBranch, landAgentBranch } from "../services/branchStatus";
 import type { BranchStatus } from "../services/branchStatus";
 import { shouldPromptOnClose, selectionAfterClose } from "../engine/closeAgent";
 import { shipAgent, saveAgent, discardAgentGit, type ShipOutcome } from "../services/closeAgentActions";
+import { AgentInboxBadge } from "./AgentInboxBadge";
 import { ModalShell } from "./ModalShell";
 import { refreshAgentTitle } from "../services/sessionTitle";
 import {
@@ -4988,6 +4989,7 @@ const AgentRow = memo(function AgentRow({
                 {/* Same overlay on the EXPANDED strip. The card stands in for the in-flow row while
                     it is open, so omitting them here would make the signal vanish from the one row
                     the user has actually stopped on. */}
+                <AgentInboxBadge agentId={a.id} />
                 {goalChipEl}
                 {stallChipEl}
                 {thrashChipEl}
@@ -5024,6 +5026,12 @@ const AgentRow = memo(function AgentRow({
                   }}
                 />
                 {workerCountBadge}
+                {/* "Someone has queued instructions for this agent, and it has not seen them yet."
+                    Leads the chips beside the never-idle overlay because it is the one mark on a
+                    calm row that says work is INBOUND rather than describing work already done —
+                    and because its absence is what made the concierge's "I sent it" uncheckable
+                    (bead sparkle-zm0c8). Renders nothing when the queue is empty. */}
+                <AgentInboxBadge agentId={a.id} />
                 {unjudgedAskChip}
                 {/* The never-idle overlay leads the metadata chips: it is the one thing on a calm
                     row that changes what you do about it. See the chip definitions above. */}

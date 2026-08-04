@@ -54,6 +54,7 @@ describe("the composer's thread handle", () => {
     const { container } = render(
       <MountedAgentThread
         thread={{ ...EMPTY_MOUNTED_THREAD, entries: [] }}
+        agentId="agent-1"
         agentName="Kraken Auth"
         onReachTop={vi.fn()}
       />,

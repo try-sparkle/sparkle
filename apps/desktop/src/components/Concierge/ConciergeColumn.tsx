@@ -534,6 +534,10 @@ export function ConciergeColumn({
         <MountedAgentThread
           key={mountedAgent.agentId}
           thread={mountedAgent.thread}
+          // …and the id, so the thread can also show what is QUEUED for this agent and not yet in
+          // its conversation (bead sparkle-zm0c8). The transcript alone is a projection of turns that
+          // have already happened, which is exactly why a just-sent message appeared nowhere.
+          agentId={mountedAgent.agentId}
           agentName={mountedAgent.name}
           onReachTop={mountedAgent.onReachTop}
         />
