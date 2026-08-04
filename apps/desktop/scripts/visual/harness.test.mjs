@@ -241,6 +241,12 @@ describe("surface registry", () => {
       "workspace-wired-left",
       "workspace-wired-right",
       "agent-sidebar",
+      // The queued-instruction badge, OPENED (bead sparkle-zm0c8). A concierge message queued for an
+      // agent used to render nowhere, so "I sent it" was uncheckable; the badge's popover is where
+      // the queued text and the three delivery stages live. App-only — the approved rev4 mock
+      // predates the affordance entirely, so this is a regression baseline rather than a fidelity
+      // comparison. Carries `inbox=1` so the seed stays off every other surface's capture.
+      "inbox-popover",
       "concierge-column",
       // The voice surfaces, added when the wake word was retired. `settings-voice` photographs the
       // Settings section the founder asked to have emptied; the three `send-tray-*` ones photograph

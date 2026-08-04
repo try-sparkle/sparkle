@@ -237,6 +237,26 @@ export function visualPrsRequested(search: string): boolean {
   return v === "1" || v === "true";
 }
 
+/** The query parameter that seeds a queued Level 2 inbox: `?inbox=1`. */
+export const VISUAL_INBOX_PARAM = "inbox";
+
+/**
+ * Whether this capture wants a queued inbox on the selected row.
+ *
+ * OPT-IN, and the first version of this fixture got it WRONG — which is worth recording, because the
+ * mistake is the one this whole family of parameters exists to prevent. The seed was unconditional,
+ * and `SELECTED_ROW_ID` is a top-level row rendered in `agent-sidebar`, `workspace-unwired`,
+ * `workspace-wired-left` and `workspace-wired-right`. The harness scores each surface as app-vs-mock,
+ * and the approved rev4 mock has no inbox badge — so an unconditional seed put an app-only element
+ * into four existing surfaces' captures permanently, raising their measured diff with no way to turn
+ * it off. That is exactly the argument this file already makes for keeping `project_open_prs` out of
+ * the shared shim, pointed the other way (roborev 58009).
+ */
+export function visualInboxRequested(search: string): boolean {
+  const v = new URLSearchParams(search).get(VISUAL_INBOX_PARAM);
+  return v === "1" || v === "true";
+}
+
 /** The query parameter that opens a SECOND project tab: `?projects=2`. */
 export const VISUAL_PROJECTS_PARAM = "projects";
 
@@ -1088,12 +1108,14 @@ export function applyVisualFixtures(
   // own header argues against). There is therefore nothing to detach and no developer state to
   // clobber.
   //
-  // THREE MESSAGES ON ONE ROW, ONE PER STAGE, on purpose: the badge must be shown counting ONLY the
-  // pending one (a mark that never goes away stops being read), while the popover and the thread
-  // show all three — so a capture proves the count rule and the three-stage vocabulary at once. The
+  // THREE MESSAGES ON ONE ROW, ONE PER STAGE, on purpose: the badge counts ONLY the pending one (a
+  // mark that never goes away stops being read) while the popover shows all three — so the
+  // `inbox-popover` surface proves the count rule and the three-stage vocabulary in one capture. The
   // timestamps are offsets from FIXTURE_NOW like everything else here, because a wall-clock `ts`
   // would move the 12h expiry boundary between runs and make the baseline unstable.
-  useInboxStore.setState({
+  //
+  // GATED ON `?inbox=1` — see {@link visualInboxRequested} for why an unconditional seed was wrong.
+  if (visualInboxRequested(search)) useInboxStore.setState({
     byAgent: {
       [SELECTED_ROW_ID]: Object.freeze([
         {

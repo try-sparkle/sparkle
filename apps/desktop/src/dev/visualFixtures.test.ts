@@ -230,8 +230,21 @@ describe("applyVisualFixtures", () => {
   // literal back out of the store — `pendingCount` is what the badge shows and `inFlight` is what
   // the thread lists, so a fixture whose stages drifted would fail here instead of shipping a
   // screenshot that proves nothing.
-  it("seeds a queued inbox on the selected row, with one message at each lifecycle stage", () => {
+  // THE GATE, AND WHY IT IS THE FIRST THING ASSERTED. The first version of this fixture seeded
+  // unconditionally, and `SELECTED_ROW_ID` is a top-level row rendered by `agent-sidebar`,
+  // `workspace-unwired`, `workspace-wired-left` and `workspace-wired-right`. The harness scores each
+  // surface app-vs-mock and the approved rev4 mock has no inbox badge — so an unconditional seed put
+  // an app-only element into four existing surfaces' captures permanently, raising their measured
+  // diff with no way to turn it off (roborev 58009). Asserting the DEFAULT is what stops that
+  // returning; the opt-in case below would pass either way.
+  it("does NOT seed the inbox by default, so no existing surface's baseline moves", () => {
     expect(applyVisualFixtures("?visual=1", ON)).toBe(true);
+    const rowId = useProjectStore.getState().projects[0]!.agents[0]!.id;
+    expect(useInboxStore.getState().byAgent[rowId] ?? []).toEqual([]);
+  });
+
+  it("seeds a queued inbox on the selected row, with one message at each lifecycle stage", () => {
+    expect(applyVisualFixtures("?visual=1&inbox=1", ON)).toBe(true);
     const rowId = useProjectStore.getState().projects[0]!.agents[0]!.id;
     const entries = useInboxStore.getState().byAgent[rowId] ?? [];
 

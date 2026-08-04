@@ -106,6 +106,44 @@ export const SURFACES = [
     },
   },
   {
+    // ── THE QUEUED-INBOX BADGE AND ITS POPOVER ────────────────────────────────────────────────
+    //
+    // Bead sparkle-zm0c8: a concierge message queued for an agent was rendered NOWHERE, so the
+    // founder could not tell "I sent it" from "the concierge imagined it". The fix is a row badge
+    // whose popover shows the queued text — and a fix whose entire purpose is BEING SEEN needs a
+    // capture, not just a jsdom assertion (jsdom neither lays out nor paints).
+    //
+    // CARRIES `query`, for the reason `pairs=2` does: the inbox seed is opt-in precisely so it does
+    // not put an app-only element into the four surfaces that render this row by default and raise
+    // their measured diff forever (roborev 58009). This surface is where it is asked for.
+    //
+    // THE `click` IS LOAD-BEARING, not incidental. The badge alone shows a count; the three-stage
+    // vocabulary and the queued TEXT — the whole point of the bead — live behind the popover, so a
+    // capture that only waited for the badge would photograph one digit and prove nothing about the
+    // thing that was invisible.
+    //
+    // Clipped to the POPOVER rather than the column: it is a fixed-position portal on `document.body`
+    // (it closes on scroll, so it cannot be anchored inside a scrolling column), which means a column
+    // clip would cut it off entirely.
+    name: "inbox-popover",
+    description:
+      "The queued-instruction badge on an agent row, opened: pending/delivered/acknowledged with text.",
+    query: "inbox=1",
+    app: {
+      steps: [
+        { waitFor: "[data-testid=row-inbox]" },
+        { click: "[data-testid=row-inbox]" },
+        { waitFor: "[data-testid=row-inbox-popover]" },
+      ],
+      clip: "[data-testid=row-inbox-popover]",
+    },
+    // NO MOCK REACH. The rev4 mock predates this affordance and has no inbox anything, so pairing it
+    // against `#assist` would score a 100% diff on every run and say nothing about fidelity. An
+    // app-only surface is the honest description of a control the approved mock never drew — the
+    // capture exists as a REGRESSION baseline for the badge, not as an app-vs-mock comparison.
+    mock: null,
+  },
+  {
     name: "concierge-column",
     description: "The full-height concierge: header, thread, compose box.",
     app: {
