@@ -75,12 +75,43 @@ describe("classifyTerminalRoute", () => {
 
   // ══ THE ALTERNATE SCREEN BUFFER ══════════════════════════════════════════════════════════════
   // The hazard the founder flagged: in `vim` normal mode a pasted phrase is not text, it is a
-  // command sequence. Note the viewport TEXT here is otherwise perfectly innocent — only the buffer
-  // type says anything is wrong, which is exactly why the guard cannot be a content heuristic.
-  it("refuses on the alternate screen buffer even when the text looks like a calm prompt", () => {
+  // command sequence. This refusal is the one the bead insists must survive.
+  it("refuses on the alternate screen buffer when a real full-screen app owns it", () => {
+    const vim = ["~", "~", "~", '"notes.md" 12L, 340B', ":"].join("\n");
+    expect(classifyTerminalRoute(input({ viewport: { text: vim, alternateBuffer: true } }))).toEqual(
+      { kind: "refuse", reason: "alternate-screen" },
+    );
+  });
+
+  // ══ …BUT NOT WHEN THE ALTERNATE BUFFER IS JUST CLAUDE CODE (bead sparkle-v7k3y) ═══════════════
+  // THIS ROW USED TO ASSERT THE OPPOSITE, and asserting it is how the defect survived: the fixture
+  // above it is described in this very file as "a finished Claude Code turn sitting at its idle
+  // input box", and the test demanded that writing to it be REFUSED. That is the founder's bug,
+  // written down as intent.
+  //
+  // Claude Code holds the alternate buffer for its ordinary idle and busy states. Refusing there
+  // means refusing on the most common state in the app — the founder was bounced while his agent
+  // read "Running 1 shell command · 1m 24s". Typing into that pane queues the message; so does this.
+  //
+  // The buffer flag has NOT stopped mattering. It is now weighed against `isClaudeCodeScreen`, which
+  // needs two independent markers of Claude's own TUI — the row above is the other half of the pair,
+  // and `engine/claudeCodeScreen.test.ts` holds the discrimination cases (vim, less, htop, lazygit,
+  // and a pager displaying a document that quotes Claude's status bar).
+  it("delivers into a Claude Code that merely holds the alternate buffer", () => {
     expect(
       classifyTerminalRoute(input({ viewport: { text: IDLE_SCREEN, alternateBuffer: true } })),
-    ).toEqual({ kind: "refuse", reason: "alternate-screen" });
+    ).toEqual({ kind: "deliver", text: "run the tests again" });
+  });
+
+  // AND THE PICKER GUARD STILL RUNS ON A RECOGNISED CLAUDE CODE. Recognising the TUI says the buffer
+  // flag is not the hazard; it says nothing about what is drawn. A message submitted at a permission
+  // dialog presses whatever button is highlighted, so this must refuse — one guard deeper than the
+  // alternate-screen arm that used to catch it by accident.
+  it("still refuses a Claude Code that is showing a permission dialog", () => {
+    const dialog = [IDLE_SCREEN, "", "Do you want to proceed?", "❯ 1. Yes", "  2. No", "", "Esc to cancel · Tab to amend · ctrl+e to explain"].join("\n");
+    expect(
+      classifyTerminalRoute(input({ viewport: { text: dialog, alternateBuffer: true } })),
+    ).toEqual({ kind: "refuse", reason: "awaiting-input" });
   });
 
   // ══ AWAITING INPUT ═══════════════════════════════════════════════════════════════════════════

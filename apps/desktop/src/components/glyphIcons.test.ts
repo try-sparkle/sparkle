@@ -147,6 +147,16 @@ const GLYPH_EXEMPT = new Set([
   // channel — there is no DOM, so there is no react-icon to reach for. Same category as the key
   // names above: the glyph is the only way to say it.
   "engine/attention.ts",
+  // `engine/claudeCodeScreen.ts` MATCHES glyphs, it never renders one. Its patterns recognise the
+  // bytes Claude Code paints into a PTY — the `⏺`/`⎿` gutter markers that open a tool call and its
+  // result — so that the write-guard can tell a busy Claude Code from `vim` (bead sparkle-v7k3y).
+  //
+  // Squarely the `engine/attention.ts` category, one step further out: there is not merely no DOM,
+  // there is no output at all. A react-icon cannot match text on a terminal screen, and swapping
+  // the codepoint for anything else would simply stop the matcher working. The scanner's existing
+  // `isRegexLiteral` escape hatch covers a line that IS a bare regex but not a `const` holding an
+  // array of them, which is the only reason this file surfaces at all.
+  "engine/claudeCodeScreen.ts",
 ]);
 
 function hits(): string[] {

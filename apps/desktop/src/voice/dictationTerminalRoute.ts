@@ -18,7 +18,15 @@
 // ALTERNATE SCREEN BUFFER (`vim`, `less`, `htop`, `lazygit`). The strongest of the guards and the one
 // most easily missed: a full-screen app reads pasted text as COMMANDS. Dictating "delete the second
 // paragraph" into `vim` in normal mode does not insert a sentence — `d` deletes, `2` counts, `p`
-// pastes. The buffer type answers this exactly, with no content heuristic to fool.
+// pastes.
+//
+// THE BUFFER TYPE ALONE IS NOT THE ANSWER, and this header used to say it was ("with no content
+// heuristic to fool"). It answers "is the alternate screen in use", which is a DIFFERENT question
+// from "will my text be read as commands" — Claude Code holds that buffer for its ordinary busy
+// state, and Claude Code is what every agent here runs, so the guard fired on the most common state
+// in the app (bead sparkle-v7k3y). The buffer flag is now weighed together with
+// `engine/claudeCodeScreen`, which must find TWO independent markers of Claude's own TUI before the
+// refusal is skipped. Genuine full-screen programs draw none of them and still refuse.
 //
 // AWAITING INPUT (an Ink picker, `(y/n)`, `password:`, `enter passphrase`). Free text aimed at a
 // live picker is the failure the concierge already refuses on its own path (`ambiguous-picker`), and
@@ -26,6 +34,7 @@
 //
 // Both are read from the VIEWPORT, never the scrollback — see `services/terminalViewport.ts` for why
 // history latches the second guard true forever.
+import { isClaudeCodeScreen } from "../engine/claudeCodeScreen";
 import { screenAwaitsInput } from "../engine/screenClassifier";
 import type { TerminalViewport } from "../services/terminalViewport";
 
@@ -156,7 +165,27 @@ export function terminalWriteRefusal(
   viewport: TerminalViewport | null,
 ): TerminalScreenRefusal | null {
   if (!viewport) return "no-viewport";
-  if (viewport.alternateBuffer) return "alternate-screen";
+  // ══ THE ALTERNATE BUFFER IS NOT, BY ITSELF, EVIDENCE OF DANGER (bead sparkle-v7k3y) ═══════════
+  // This file's header used to claim the buffer type "answers this exactly, with no content
+  // heuristic to fool". It does not. It answers "is the alternate screen in use", and CLAUDE CODE
+  // HOLDS THAT BUFFER WHILE IT WORKS — the same buffer `vim` and `less` use. Claude Code is what
+  // every agent in this app runs, so the guard fired on the most common state in the app: the
+  // founder, mounted to an agent reading "Running 1 shell command · 1m 24s", was told it had a
+  // full-screen app open and had his message bounced.
+  //
+  // Typing into that pane would have QUEUED the message, which is what he wanted. So the refusal is
+  // now conditioned on the screen NOT being confidently Claude Code — see `isClaudeCodeScreen` for
+  // why a content test is acceptable in this direction specifically (a miss costs one refusal; a
+  // false positive types into `vim`, so it demands two independent marker families).
+  //
+  // THE REFUSAL FOR GENUINE FULL-SCREEN PROGRAMS IS UNTOUCHED. `vim`, `less`, `htop` and `lazygit`
+  // draw none of those markers, so they still take this arm — which the bead requires explicitly.
+  if (viewport.alternateBuffer && !isClaudeCodeScreen(viewport.text)) return "alternate-screen";
+  // AND THE PROMPT GUARD STILL RUNS ON IT. Recognising Claude Code says the buffer flag is not the
+  // hazard; it says NOTHING about what is drawn on the screen. Claude Code shows permission
+  // dialogs, pickers and `(y/n)` prompts of its own, and a message submitted into one of those
+  // presses a button rather than queuing a sentence. That is this next line's question, and it is
+  // why the Claude Code test above may never short-circuit to `null`.
   if (screenBlocksWrite(viewport.text)) return "awaiting-input";
   return null;
 }

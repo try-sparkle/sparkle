@@ -102,6 +102,7 @@ import { queuePendingSend, takePendingSends } from "./pendingSends";
 import { paneState } from "./paneReadiness";
 import { findKnownAgent } from "./knownAgents";
 import { getAgentViewport } from "./terminalViewport";
+import { isClaudeCodeScreen } from "../engine/claudeCodeScreen";
 import { useInteractionStore } from "../stores/interactionStore";
 import { useProjectStore } from "../stores/projectStore";
 import { usePromptHistoryStore } from "../stores/promptHistoryStore";
@@ -478,7 +479,22 @@ export async function dispatchConciergeAnswer(
   //     lines down, when the text maps to an option. Hoisting it would break that.
   // Alternate-screen is the one refusal that is unconditionally right for every caller: no write of
   // any kind belongs on that screen, whoever authored it.
-  if (getAgentViewport(agentId)?.alternateBuffer) {
+  // ══ …UNLESS THE ALTERNATE BUFFER IS JUST CLAUDE CODE (bead sparkle-v7k3y, roborev 57704) ═══════
+  // Claude Code holds this buffer for its ordinary busy state, and Claude Code is what every agent
+  // in this app runs — so an unconditional refusal here fires on the most common state in the app.
+  // The founder, mounted to an agent reading "Running 1 shell command · 1m 24s", was bounced.
+  //
+  // THIS LINE IS THE ONE THAT ACTUALLY DECIDES IT. Relaxing only `terminalWriteRefusal` (the
+  // caller-side pre-check) moved the refusal here without changing what the founder sees: the send
+  // falls through the loosened pre-check and is refused at the chokepoint, and ConciergeHost posts
+  // the SAME "full-screen app" sentence from `refusalCopy`. Both have to agree, which is why they
+  // now share one predicate rather than two hand-kept-in-step conditions.
+  //
+  // `isClaudeCodeScreen` requires the live-TUI composer box PLUS a corroborating family precisely
+  // because of where we are: everything below this line pastes AND SUBMITS via `submitPrompt`, so a
+  // false positive on a `vim` session is an ENTERED line, not merely a typed one.
+  const screen = getAgentViewport(agentId);
+  if (screen?.alternateBuffer && !isClaudeCodeScreen(screen.text)) {
     log.warn("concierge", "refused a write into a full-screen app", { agentId });
     return { ok: false, path: "alternate-screen", agentId };
   }

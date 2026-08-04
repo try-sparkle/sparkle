@@ -458,6 +458,48 @@ describe("ConciergeHost — an address overrules the mount without moving it", (
 // screen. So without these, a mounted send into an agent sitting in `vim` is pasted AND submitted,
 // and vim normal mode does not insert a sentence, it EXECUTES it. The guard is the one shipped for
 // dictation (`voice/dictationTerminalRoute`), reused rather than rebuilt.
+// ══ …BUT A BUSY CLAUDE CODE IS NOT ONE OF THEM (bead sparkle-v7k3y, roborev 57704) ══════════════
+// THE END-TO-END ROW. Every other alternate-buffer fixture in this file is `"~\n~\n:"` — a vim
+// screen — so none of them can see whether a busy Claude Code still gets bounced. It did: relaxing
+// only the caller-side pre-check left `conciergeDispatch`'s own unconditional alternate-buffer
+// refusal in place, so the send fell through the loosened check and was refused at the chokepoint
+// with the SAME "full-screen app" sentence. Unit tests on the classifier were green throughout.
+//
+// This asserts the founder's actual outcome: mounted, agent busy in Claude Code, the message REACHES
+// the terminal.
+describe("ConciergeHost — a busy Claude Code takes the message", () => {
+  const BUSY_CLAUDE = [
+    "⏺ I'll run the test suite and commit.",
+    "  ⎿  $ bash scripts/tests/run.sh (1m 23s)",
+    "     (ctrl+b to run in background)",
+    "────────────────────────────────────────────────────────────────────────────────────────────",
+    "❯ ",
+    "────────────────────────────────────────────────────────────────────────────────────────────",
+    "  ⏸ manual mode on · ? for shortcuts",
+  ].join("\n");
+
+  it("delivers a mounted send into an agent running a shell command", async () => {
+    mount();
+    h.viewport.mockReturnValue({ text: BUSY_CLAUDE, alternateBuffer: true });
+    await send("give me an update after you do");
+    await elapse();
+    expect(h.dispatchConciergeAnswer).toHaveBeenCalledTimes(1);
+    expect(h.dispatchConciergeAnswer.mock.calls[0]![0]).toBe("ag1");
+  });
+
+  // `queryByTestId`, not the suite's throwing `notice()` helper: on a delivered send the notice row
+  // is not rendered AT ALL, which is the strongest form of "he was not told his message bounced".
+  it("says nothing about a full-screen app", async () => {
+    mount();
+    h.viewport.mockReturnValue({ text: BUSY_CLAUDE, alternateBuffer: true });
+    await send("give me an update after you do");
+    await elapse();
+    expect(screen.queryByTestId(MOUNTED_NOTICE_TESTID)?.textContent ?? "").not.toContain(
+      "full-screen app",
+    );
+  });
+});
+
 describe("ConciergeHost — a terminal that must not receive free text refuses", () => {
   it("refuses when a full-screen app owns the terminal, and keeps the words", async () => {
     mount();

@@ -96,6 +96,49 @@ describe("a full-screen app refuses every write", () => {
   });
 });
 
+// ══ …EXCEPT A BUSY CLAUDE CODE, WHICH IS NOT A FULL-SCREEN APP (bead sparkle-v7k3y) ═════════════
+// THIS IS THE CHOKEPOINT, and it is where the founder's send was actually being refused. Relaxing
+// only `terminalWriteRefusal` (the caller-side pre-check in ConciergeHost) changed nothing he could
+// see: the send fell through the loosened pre-check and died HERE, and `refusalCopy` posted the same
+// "full-screen app" sentence from the `alternate-screen` path below (roborev 57704).
+//
+// Claude Code holds the alternate buffer while it works, and every agent in this app runs Claude
+// Code — so an unconditional refusal here fires on the most common state in the product.
+describe("a busy Claude Code is not a full-screen app", () => {
+  /** Claude Code mid-command: the founder's screen. Its live composer box is what distinguishes it
+   *  from a pager showing a transcript of one — see engine/claudeCodeScreen. */
+  function onBusyClaudeCode(): void {
+    vi.mocked(getAgentViewport).mockReturnValue({
+      text: [
+        "⏺ I'll run the test suite and commit.",
+        "  ⎿  $ bash scripts/tests/run.sh (1m 23s)",
+        "     (ctrl+b to run in background)",
+        "──────────────────────────────────────────────────────────────────────────────",
+        "❯ ",
+        "──────────────────────────────────────────────────────────────────────────────",
+        "  ⏸ manual mode on · ? for shortcuts",
+      ].join("\n"),
+      alternateBuffer: true,
+    });
+  }
+
+  it("delivers free text into it rather than refusing", async () => {
+    onBusyClaudeCode();
+    const r = await dispatchConciergeAnswer(AGENT, "give me an update after you do", OPTS);
+    expect(r.path).not.toBe("alternate-screen");
+    expect(r.ok).toBe(true);
+  });
+
+  // The refusal the bead insists on keeping is the row this one is paired with: `onFullScreenApp`
+  // above is a real vim screen and still takes the `alternate-screen` path.
+  it("still refuses a genuine full-screen app on the same code path", async () => {
+    onFullScreenApp();
+    const r = await dispatchConciergeAnswer(AGENT, "give me an update after you do", OPTS);
+    expect(r.path).toBe("alternate-screen");
+    expectNothingWritten();
+  });
+});
+
 describe("the guard is narrow — it blocks the alternate buffer and nothing else", () => {
   it("delivers free text at an ordinary prompt", async () => {
     atAPrompt();
