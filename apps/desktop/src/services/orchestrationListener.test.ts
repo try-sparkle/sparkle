@@ -423,6 +423,65 @@ describe("orchestrationListener", () => {
     }
   });
 
+  it("list_workers flags a COMPLETED worker that is still taking turns (sparkle-xdilh)", async () => {
+    // Root cause: once result.json exists the verdict SHADOWS liveness — the row reads "done" and
+    // the worker's live tab status stops being reported at all. So the roster could not express the
+    // one state that costs real work: a worker that reported its result, was waited on and merged,
+    // and then carried on. One such worker independently re-fixed two bugs its orchestrator was
+    // fixing in parallel, producing a duplicate branch to triage and discard.
+    // Fix: `stillRunning` as its OWN field, so the "done" token keeps its 7kra meaning intact.
+    for (const t of ["busy", "quiet"]) {
+      fire({ reqId: `sx-${t}`, op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: t } });
+    }
+    await flush();
+    const [wBusy, wQuiet] = useProjectStore.getState().projects
+      .find((p) => p.id === projectId)!
+      .agents.filter((a) => a.kind === "worker" && a.parentId === buildId);
+
+    // BOTH have written a result.json, so both are terminal "done". They differ ONLY in liveness:
+    // wBusy is still actively producing output, wQuiet's turn has ended. That difference is exactly
+    // what the pre-fix reply could not carry.
+    useRuntimeStore.setState({ status: { [wBusy!.id]: "working", [wQuiet!.id]: "idle" } });
+
+    const done = JSON.stringify({
+      schemaVersion: 1, taskId: "t", branch: "b", status: "success", filesChanged: [], summary: "ok",
+    });
+    const resultFor: Record<string, string> = {
+      [wBusy!.worktreePath!]: done,
+      [wQuiet!.worktreePath!]: done,
+    };
+    try {
+      invokeMock.mockImplementation((cmd: string, args: { worktree?: string }) =>
+        Promise.resolve(cmd === "read_worker_result" ? (resultFor[args.worktree ?? ""] ?? null) : undefined),
+      );
+
+      fire({ reqId: "lxdilh", op: "list_workers", buildAgentId: buildId, projectId, payload: {} });
+      await flush();
+
+      const reply = invokeMock.mock.calls.filter(([c]) => c === "orchestration_respond").at(-1)!;
+      const workers = (
+        reply[1] as {
+          result: { workers: Array<{ workerId: string; status: string; stillRunning?: boolean }> };
+        }
+      ).result.workers;
+      const rowOf = (id: string) => workers.find((w) => w.workerId === id)!;
+
+      // THE SIDE EFFECT: the flag travels through to the reply for the worker that is still
+      // producing output. Deleting the `stillRunning` spread from handleList makes this fail.
+      expect(rowOf(wBusy!.id).stillRunning).toBe(true);
+      // ...and NOT for the one whose turn ended. A post-result `idle` worker is the normal,
+      // harmless state; flagging it would make the signal noise the orchestrator learns to ignore.
+      expect(rowOf(wQuiet!.id).stillRunning).toBeUndefined();
+      // The verdict token is UNCHANGED for both — the new fact is layered on, not encoded into
+      // `status`, so the 7kra invariant above still means exactly what it meant.
+      expect(rowOf(wBusy!.id).status).toBe("done");
+      expect(rowOf(wQuiet!.id).status).toBe("done");
+    } finally {
+      invokeMock.mockReset();
+      invokeMock.mockReturnValue(Promise.resolve());
+    }
+  });
+
   it("list_workers surfaces each worker's live tab state, not a flat 'running' (sparkle-0an0)", async () => {
     // Root cause: with no result.json the status collapsed EVERY live state to "running", so an
     // orchestrator polling list_workers could not tell a worker mid-cargo-test from one blocked on a

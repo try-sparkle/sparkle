@@ -318,6 +318,35 @@ function workerStatus(
   return liveStatus;
 }
 
+/** Has this worker reported a terminal result AND kept going anyway? (sparkle-xdilh)
+ *
+ *  `workerStatus` above deliberately lets the result.json verdict SHADOW the live tab status: once
+ *  the file exists the row reads "done"/"failed" and the worker's liveness stops being reported at
+ *  all. That is right for the verdict — but it means `list_workers` cannot express the one state
+ *  that burns an orchestrator: a worker that wrote its result, was waited on, was merged, and then
+ *  carried on taking turns. Observed cost: such a worker independently re-fixed two bugs the
+ *  orchestrator was fixing in parallel, producing a duplicate branch that had to be triaged and
+ *  discarded — plus a wasted roborev cycle. `wait_for_workers` returning success READS as terminal,
+ *  and nothing anywhere told the caller the session was still live.
+ *
+ *  So report it as its OWN field rather than by bending the status token. The token's meaning is
+ *  load-bearing (sparkle-7kra: a result-less worker must never read "done"), and widening it here
+ *  would re-open exactly that hole. A separate boolean layers the third fact — liveness AFTER
+ *  completion — onto the two the row already carries.
+ *
+ *  Positive evidence ONLY, and narrow on purpose: `working` means "actively producing output", so
+ *  it is the one live status that proves the session is still doing work. `idle`/`waiting` mean the
+ *  turn ENDED — the session is up but is not producing anything, which is the normal, harmless
+ *  post-result state and must not be flagged. An unknown live status (worker not open in this
+ *  window) is not evidence of anything and stays silent. */
+export function sessionStillRunning(
+  status: WorkerStatus,
+  liveStatus: AgentTabStatus | undefined,
+): boolean {
+  const completed = status === "done" || status === "failed";
+  return completed && liveStatus === "working";
+}
+
 async function runSpawn(req: OrchestrationRequest): Promise<void> {
   // Reserve the slot SYNCHRONOUSLY — before the first await — so a concurrent spawn/drain sees it
   // immediately and can't also pass the cap. Released in finally.
@@ -736,6 +765,9 @@ async function handleList(req: OrchestrationRequest): Promise<void> {
         const resultRaw = a.worktreePath
           ? await invoke<string | null>("read_worker_result", { worktree: a.worktreePath }).catch(() => null)
           : null;
+        // Read once — the verdict and the still-running check must describe the SAME observation.
+        const liveStatus = useRuntimeStore.getState().status[a.id];
+        const status = workerStatus(resultRaw, liveStatus);
         return {
           workerId: a.id,
           branch: a.branch ?? "",
@@ -744,7 +776,11 @@ async function handleList(req: OrchestrationRequest): Promise<void> {
           // result-less worker reports its real state (working / idle / waiting / blocked / approval)
           // instead of a flat "running" (sparkle-0an0). The live status map is per-window and
           // live-only; an unknown entry (worker not open here) falls back to "running".
-          status: workerStatus(resultRaw, useRuntimeStore.getState().status[a.id]),
+          status,
+          // Completed BUT still taking turns (sparkle-xdilh) — the verdict shadows liveness, so
+          // without this the roster cannot say it. Omitted (not `false`) when not observed, so
+          // "not still running" and "liveness unknown" stay the same falsy answer.
+          ...(sessionStillRunning(status, liveStatus) ? { stillRunning: true } : {}),
           // The bead this worker owns. Without it the roster is N ANONYMOUS workers: a resumed
           // orchestrator cannot tell which unit any live worker is already handling, so it
           // re-dispatches everything still showing in `bd ready`. Omitted (rather than "") when the
