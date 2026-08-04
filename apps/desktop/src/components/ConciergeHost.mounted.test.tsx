@@ -625,6 +625,34 @@ describe("ConciergeHost — a terminal that must not receive free text refuses",
     await waitFor(() => expect(box().value).toBe("move the button 5px left"));
   });
 
+  // ══ AND THE POST-COUNTDOWN REFUSAL RETRACTS ITS BUBBLE TOO (roborev 57776) ═══════════════════
+  // UNMOUNTED, and that is the whole point of this row existing separately from the one above.
+  // `retractSend` is called at BOTH refusal instants, but every test that reached the post-countdown
+  // one ran MOUNTED — where `ConciergeThread` is not rendered — so deleting that branch's retraction
+  // left the suite green. The submit-time retraction was covered; this one was not.
+  //
+  // Exactly the trap the previous commit recorded on the submit-time test, one instant over: an
+  // absence assertion is worthless if the container is never rendered in that state.
+  it("takes back the bubble when the refusal comes AFTER the countdown", async () => {
+    h.wired.mockReturnValue("off");
+    mount();
+    await send("@Kraken Auth ship the DMG");
+    expect(armedIntents()).toHaveLength(1);
+    // The bubble IS there while the countdown runs — the send has not been refused yet. Asserting
+    // its presence first is what makes the absence below mean something.
+    expect(screen.getByTestId(CONCIERGE_THREAD_TESTID).textContent ?? "").toContain("ship the DMG");
+    // vim opened while the banner was counting down.
+    h.viewport.mockReturnValue({ text: "~\n~\n:", alternateBuffer: true });
+    await elapse();
+    expect(h.dispatchConciergeAnswer).not.toHaveBeenCalled();
+    await waitFor(() => expect(box().value).toBe("@Kraken Auth ship the DMG"));
+    await waitFor(() =>
+      expect(screen.getByTestId(CONCIERGE_THREAD_TESTID).textContent ?? "").not.toContain(
+        "ship the DMG",
+      ),
+    );
+  });
+
   // The control for every row in this block: with a clean screen the same message goes through.
   // Without it, "nothing dispatched" would be satisfied by a build that stopped sending altogether.
   it("delivers when the screen is an ordinary prompt", async () => {
