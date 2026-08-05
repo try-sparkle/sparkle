@@ -31,7 +31,7 @@ import type { MountedThread } from "../../stores/mountedThreadStore";
 import { inFlight, useAgentInbox } from "../../stores/inboxStore";
 import { DELIVERY_A11Y, DELIVERY_LABEL, QUEUED_BLOCK_HEADING } from "../inboxCopy";
 import { useAutoFollow } from "../../hooks/useAutoFollow";
-import { termMuted } from "../terminalChrome";
+import { TERM_BODY_BASE_SIZE, TERM_BODY_FONT, termMuted } from "../terminalChrome";
 import { useResolvedTheme, type ResolvedTheme } from "../../theme/theme";
 import { FONT_MONO, TERM_TYPE, TYPE } from "../../theme/scale";
 
@@ -141,6 +141,36 @@ export function MountedAgentThread({
       <div
         ref={scrollRef}
         data-testid={MOUNTED_THREAD_TESTID}
+        // ══ THE THREAD IS SET IN THE TERMINAL'S FACE (bead sparkle-wj3ya) ═══════════════════════
+        // The founder, twice: *"I want the font in the concierge pane — both the font of the text
+        // that I'm writing in the prompt compose box, AS WELL AS THE FONT IN THE THREAD — to be the
+        // same font as the terminal window … to help make it clear to me that I'm speaking to the
+        // agent."*
+        //
+        // PR #1054 shipped the COMPOSER in this face and stopped there, which is why he has asked
+        // twice and seen it half-work: the box he types into changed, the conversation above it did
+        // not. From where he sits that reads as the feature not working.
+        //
+        // ON THE SCROLL CONTAINER, so it CASCADES to the message bodies rather than being applied
+        // per bubble — a per-bubble list is what drifts when a new row type is added. The chrome
+        // inside (activity chips, timestamps, the queued-block heading) sets `FONT_MONO`/`TYPE.micro`
+        // explicitly and is therefore untouched; only the prose inherits, which is exactly "the font
+        // in the thread".
+        //
+        // UNCONDITIONAL, because this component only exists while mounted — `ConciergeThread` is what
+        // renders when the cable is off. So there is no state here in which the terminal face would
+        // be wrong, and no flag to keep in step with the composer's.
+        //
+        // IMPORTED, NEVER RE-TYPED. `TERM_BODY_FONT` is the literal stack xterm is constructed with
+        // and `TERM_BODY_BASE_SIZE` is what it gets at zoom 1. A second copy is the silent drift
+        // `terminalChrome`'s header exists to prevent — the terminal is themeable and per-column zoom
+        // is landing, so a duplicate would diverge within a week and no test would go red, because
+        // nothing would be WRONG, only different. Same constants the composer already imports, so
+        // the two surfaces cannot disagree about what "the terminal's font" means.
+        //
+        // THE BACKGROUND IS NOT DONE HERE. The bead asks for that too; it is deliberately left for a
+        // follow-up that can be screenshot-verified in a running build, since picking the wrong plane
+        // is a change I cannot check from a jsdom test.
         // THE HANDLE ComposeBox MEASURES ITS DRAG CEILING AGAINST.
         //
         // The composer finds the scrolling thread inside the section to know how tall it may grow.
@@ -163,6 +193,8 @@ export function MountedAgentThread({
           display: "flex",
           flexDirection: "column",
           gap: 10,
+          fontFamily: TERM_BODY_FONT,
+          fontSize: TERM_BODY_BASE_SIZE,
         }}
       >
         {thread.paging && <Notice mode={mode}>Loading earlier…</Notice>}
