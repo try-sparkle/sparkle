@@ -157,17 +157,53 @@ export function buildClaudeExec(
   return `${configExport}export PATH="$HOME/.local/bin:$PATH"; ${cmd}`;
 }
 
-/** Build the `zsh -l -c` exec string that runs `claude login` — the interactive sign-in flow used
- *  by the first-run setup checklist. Like {@link buildClaudeExec} it prepends `~/.local/bin` to
- *  PATH so the `#!/usr/bin/env node` shebang in a freshly-installed `claude` resolves node. Kept
- *  here (not inline in the component) so the launcher stays consistent with every other spawn path
- *  and is unit-testable. `configDir` (optional) targets a specific account's config dir. */
+/**
+ * Build the `zsh -l -c` exec string that runs the interactive Claude sign-in — used by the auth
+ * gate, the first-run setup checklist, and the per-account login modal. Like {@link buildClaudeExec}
+ * it prepends `~/.local/bin` to PATH so the `#!/usr/bin/env node` shebang in a freshly-installed
+ * `claude` resolves node. Kept here (not inline in the component) so the launcher stays consistent
+ * with every other spawn path and is unit-testable. `configDir` (optional) targets a specific
+ * account's config dir.
+ *
+ * IT IS `auth login`, AND THE `auth` IS THE WHOLE BUG THIS FIXES. Every caller used to build
+ * `claude login`, which is not a subcommand — `claude --help` lists `agents`, `auth`, `auto-mode`,
+ * `doctor`, `gateway`, `install`, `mcp`, `plugin`, `project`, `setup-token`, `ultrareview`,
+ * `update`, and nothing else. Commander therefore parsed `login` as the POSITIONAL PROMPT, so the
+ * embedded terminal opened an ordinary Claude REPL and sent it the word "login". OAuth never ran.
+ * The founder hit this as "the little login window in onboarding isn't working" — it wasn't a
+ * rendering or PTY fault, the command simply did not exist. `claude auth --help` is the authority:
+ *
+ *     Commands:  login [options]   Sign in to your Anthropic account
+ *                logout            Log out from your Anthropic account
+ *                status [options]  Show authentication status
+ */
 export function buildClaudeLoginExec(claudePath: string, opts: { configDir?: string } = {}): string {
   const configExport = opts.configDir
     ? `export CLAUDE_CONFIG_DIR=${shellQuote(opts.configDir)}; `
     : "";
-  return `${configExport}export PATH="$HOME/.local/bin:$PATH"; exec ${shellQuote(claudePath)} login`;
+  return `${configExport}${ANTHROPIC_ENV_UNSET}export PATH="$HOME/.local/bin:$PATH"; exec ${shellQuote(claudePath)} auth login`;
 }
+
+/**
+ * The Anthropic env overrides, unset before the login runs — mirroring the Rust-side scrub that
+ * `accounts::claude_auth_status` applies to its probe (`claude_oneshot::ANTHROPIC_ENV_OVERRIDES`).
+ *
+ * SYMMETRY IS THE POINT, and its absence was a real defect (roborev 58006). The probe that decides
+ * whether the gate opens runs SCRUBBED, so it reports on the subscription OAuth credential. If the
+ * login that is supposed to SATISFY that gate ran unscrubbed, the two would be talking about
+ * different credentials: with `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_BASE_URL` exported, `claude auth
+ * login` authenticates against a redirected endpoint or declines to change anything, the probe keeps
+ * reporting the OAuth session dead, and the user is stuck in a loop — signing in, being told to sign
+ * in again, with nothing on screen explaining why. Unsetting here makes the login write exactly the
+ * credential the probe reads.
+ *
+ * `unset` rather than `env -u`, because this is a string handed to `zsh -l -c`: the login shell
+ * sources the user's profile, which is itself a place these get exported, so the unset has to happen
+ * INSIDE the shell after the profile has run. It is a no-op when the vars are absent.
+ */
+const ANTHROPIC_ENV_UNSET =
+  "unset ANTHROPIC_API_KEY ANTHROPIC_API ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL " +
+  "ANTHROPIC_CUSTOM_HEADERS CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX; ";
 
 /** Build the inline JSON for `claude --mcp-config` that launches the Sparkle orchestrator MCP
  *  server (a stdio child) wired to this build agent's bridge. The bridge socket + token ride in

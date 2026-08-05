@@ -294,6 +294,14 @@ export interface ConciergeFailureMessage {
   headline: string;
   /** The concierge's own words, unedited. Rendered as plain text, never as markdown. */
   evidence: string;
+  /** True when the failure was classified as an AUTH failure, so the bubble can offer to
+   *  re-authenticate in place.
+   *
+   *  A REMEDY STRING IS AN INSTRUCTION THE USER WILL FOLLOW (AGENTS.md), and the auth headline now
+   *  says "sign in again" — so the button that makes that possible has to travel with it. Without
+   *  this flag the copy would name an action the UI does not offer, which is how the previous
+   *  version ("run `claude` in a terminal") sent desktop users to a shell. */
+  canReauth?: boolean;
 }
 
 export type ConciergeMessage =

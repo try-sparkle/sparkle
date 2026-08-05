@@ -691,6 +691,17 @@ const ANTHROPIC_ENV_OVERRIDES: &[&str] = &[
 ];
 
 fn scrub_anthropic_env(cmd: &mut Command) {
+    scrub_anthropic_env_for(cmd);
+}
+
+/// The same scrub, for any OTHER module that spawns the user's `claude`.
+///
+/// Exported rather than copied because the list above is a moving target — it started as two names
+/// and grew to seven, each addition prompted by a real misroute — and a second copy would silently
+/// stop matching on the next addition. `accounts::claude_auth_status` is the current other caller:
+/// its probe must ask about the SAME credential the concierge's `claude -p` child uses, and an
+/// inherited `ANTHROPIC_API_KEY` there makes a dead OAuth session report healthy (roborev 57985).
+pub(crate) fn scrub_anthropic_env_for(cmd: &mut Command) {
     for name in ANTHROPIC_ENV_OVERRIDES {
         cmd.env_remove(name);
     }
@@ -1297,6 +1308,58 @@ mod tests {
         for raw in [r#"{"is_error":false,"result":""}"#, r#"{"is_error":false,"result":"   "}"#] {
             let v: serde_json::Value = serde_json::from_str(raw).unwrap();
             assert_eq!(classify_result_json(&v), CliOutcome::Failed("ai_empty_reply".to_string()));
+        }
+    }
+
+    // THE CROSS-LANGUAGE PIN. `ANTHROPIC_ENV_OVERRIDES` is the canonical list, but the TypeScript
+    // side has to unset the same names before `claude auth login` — otherwise the login writes a
+    // credential that `accounts::claude_auth_status` (which scrubs) does not read, and the user
+    // loops: sign in, be told to sign in again, with nothing on screen explaining why.
+    //
+    // WHY THIS TEST AND NOT A TS ONE. The TS suite already asserts its own list per-name, and that
+    // proves NOTHING about drift: the names, the constant, and the assertion all live on the TS
+    // side, so appending an eighth name HERE fails zero tests over there. A comment claiming
+    // otherwise is worse than no check, because it tells the next reader the drift is impossible
+    // (roborev 58033). This test is the only thing that actually crosses the boundary — it reads the
+    // TS source and fails if a name in the canonical list is missing from it.
+    //
+    // Reading the file is deliberate. A shared generated artifact would be tidier, but it adds a
+    // build step to keep two seven-item lists in sync; a grep-shaped assertion costs nothing and
+    // fails loudly at exactly the moment the lists diverge.
+    #[test]
+    fn every_scrubbed_name_is_also_unset_before_the_typescript_login_spawn() {
+        let ts = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../src/services/claudeSpawn.ts");
+        let src = std::fs::read_to_string(&ts)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", ts.display()));
+        // Scope to the unset constant, not the whole file: a name merely MENTIONED in a comment
+        // elsewhere must not satisfy this.
+        let start = src
+            .find("const ANTHROPIC_ENV_UNSET")
+            .expect("claudeSpawn.ts must define ANTHROPIC_ENV_UNSET — the login-side scrub");
+        let block = &src[start..];
+        let end = block.find(';').expect("ANTHROPIC_ENV_UNSET must be a terminated declaration");
+        let unset = &block[..end];
+        // WHOLE TOKENS, NOT SUBSTRINGS — and this is not pedantry, it is the difference between the
+        // pin working and being vacuous for one of the seven names. `ANTHROPIC_API` is a PREFIX of
+        // `ANTHROPIC_API_KEY`, and both are canonical. With a `contains` check, deleting
+        // `ANTHROPIC_API` from the TS list leaves `ANTHROPIC_API_KEY` in the string, so the
+        // substring is still found and the test stays green for exactly the drift it exists to
+        // catch (roborev 58057).
+        //
+        // Splitting on non-identifier characters is what makes each name an exact match. The
+        // separators in the TS constant are spaces and the trailing `;`, so this yields the seven
+        // names plus empty strings, and an empty string never equals a canonical name.
+        let unset_names: Vec<&str> = unset
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .collect();
+        for name in ANTHROPIC_ENV_OVERRIDES {
+            assert!(
+                unset_names.contains(name),
+                "{name} is scrubbed in Rust but NOT unset before `claude auth login` in \
+                 claudeSpawn.ts. Add it to ANTHROPIC_ENV_UNSET (and its test's UNSET_PREFIX), or \
+                 the login writes a credential the auth probe does not read."
+            );
         }
     }
 

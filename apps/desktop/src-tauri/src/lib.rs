@@ -804,6 +804,7 @@ pub fn run() {
             accounts::accounts_limit_events,
             accounts::accounts_ceilings,
             accounts::claude_signed_in,
+            accounts::claude_auth_status,
             trial::trial_status,
             trial::trial_start,
             // The hot path. `trial_increment` (a device-local bump) is deliberately GONE: the

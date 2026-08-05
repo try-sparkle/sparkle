@@ -53,11 +53,51 @@ export function checkNode(): Promise<PrereqStatus> {
   return invoke<PrereqStatus>("node_preflight");
 }
 
-/** Whether the user has actually completed `claude login` for the default config dir — checks that
+/** Whether the user has EVER completed `claude auth login` for the default config dir — checks that
  *  Claude Code recorded an authenticated identity (`oauthAccount.emailAddress` in `.claude.json`),
- *  NOT merely that the `claude` binary exists. Drives real sign-in detection in the setup checklist. */
+ *  NOT merely that the `claude` binary exists.
+ *
+ *  A MEMORY, NOT A READING — prefer {@link checkClaudeAuthStatus}. The recorded email survives the
+ *  session it was written for, so this stays `true` after the OAuth session expires. That is exactly
+ *  how an expired session reached the concierge unannounced; see `accounts.rs` for the full note. */
 export function checkClaudeSignedIn(configDir?: string): Promise<boolean> {
   return invoke<boolean>("claude_signed_in", { configDir });
+}
+
+/** How a {@link ClaudeAuthStatus} was obtained (Rust `AuthStatusSource`).
+ *
+ *  Only `"cli"` is a live reading of the credentials, so only `"cli"` may be trusted to say NO —
+ *  everything else is fail-open. See {@link authIsDefinitelyExpired}. */
+export type AuthStatusSource = "cli" | "recorded" | "absent";
+
+/** Live Claude Code auth status (Rust `ClaudeAuthStatus`). */
+export interface ClaudeAuthStatus {
+  loggedIn: boolean;
+  source: AuthStatusSource;
+  email: string | null;
+  authMethod: string | null;
+  subscriptionType: string | null;
+}
+
+/** Ask Claude Code itself whether it can authenticate right now (`claude auth status --json`),
+ *  falling back to the recorded identity when the probe can't run. This is the reading behind the
+ *  auth gate — unlike {@link checkClaudeSignedIn} it can come back false for a machine that signed
+ *  in successfully in the past, which is the entire point. */
+export function checkClaudeAuthStatus(configDir?: string): Promise<ClaudeAuthStatus> {
+  return invoke<ClaudeAuthStatus>("claude_auth_status", { configDir });
+}
+
+/** The session was signed in and is now DEAD — a live CLI `no`, not an absence.
+ *
+ *  Distinguished from "never signed in" (`source: "absent"`) because the two need different copy and
+ *  a different gate: one is onboarding, the other is a returning user whose credentials lapsed. */
+export function authIsDefinitelyExpired(s: ClaudeAuthStatus): boolean {
+  return !s.loggedIn && s.source === "cli";
+}
+
+/** Nobody has ever signed in on this machine — the true first-run case. */
+export function authIsAbsent(s: ClaudeAuthStatus): boolean {
+  return !s.loggedIn && s.source === "absent";
 }
 
 /** Re-probe just git (used to POLL for CLT-install completion, which is user-driven and slow). */

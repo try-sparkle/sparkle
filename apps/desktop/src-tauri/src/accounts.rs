@@ -1877,6 +1877,230 @@ fn claude_signed_in_sync(config_dir: Option<String>) -> bool {
     read_oauth_identity_at(dir.as_deref(), home.as_deref()).is_some()
 }
 
+// ── LIVE auth status ────────────────────────────────────────────────────────────────────────────
+//
+// WHY `claude_signed_in` ABOVE IS NOT ENOUGH, AND WHAT WENT WRONG.
+//
+// `claude_signed_in` answers "did `claude auth login` ever finish here?" by looking for a recorded
+// `oauthAccount.emailAddress`. That email is written once and NEVER REMOVED when the session lapses,
+// so the answer stays `true` forever after the first sign-in. It is a memory, not a reading.
+//
+// The founder opened Sparkle on a second machine and asked the concierge a question. The concierge
+// child failed with:
+//
+//     Failed to authenticate: OAuth session expired and could not be refreshed
+//
+// The readiness gate had already asked `claude_signed_in`, been told `true` (the email was still
+// there from a login weeks earlier), and stayed invisible. So the app's own model of auth said
+// "fine" while every `claude` child on the machine was failing — and the user was left retrying a
+// request that could not succeed. NO amount of reordering onboarding fixes that: the first run had
+// genuinely succeeded. What was missing was a probe that can come back FALSE after having been true.
+//
+// `claude auth status --json` is that probe — the CLI's own answer about its own credentials:
+//
+//     { "loggedIn": true, "authMethod": "claude.ai", "apiProvider": "firstParty",
+//       "email": "…", "orgId": "…", "orgName": "…", "subscriptionType": "max" }
+//
+// FAIL-OPEN, DELIBERATELY. This drives a gate that can block the whole app, so an unreadable probe
+// must never be the thing that locks a working user out. Binary missing, subcommand unknown (an
+// older Claude Code), timeout, garbage on stdout — every one of those falls back to the recorded
+// identity and reports `source: "recorded"`, and the gate treats that as signed in. Only a probe
+// that RAN and said `loggedIn: false` is allowed to block. The cost of that choice is that an
+// expired session on a machine whose probe is broken still reaches the concierge — where the
+// failure notice now names it and offers re-auth in place, which is the second half of this fix.
+
+/// How the auth answer was obtained. The frontend gates on this: only `Cli` is a live reading, so
+/// only `Cli` may be trusted to say NO.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthStatusSource {
+    /// `claude auth status --json` ran and parsed. The only source that can prove a session is dead.
+    Cli,
+    /// The CLI probe was unavailable/unreadable; this is the remembered `.claude.json` identity.
+    Recorded,
+    /// Neither a CLI answer nor a recorded identity — nobody has ever signed in here.
+    Absent,
+}
+
+/// Live Claude Code authentication status for one config dir.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeAuthStatus {
+    /// Whether Claude Code can currently authenticate. See [`AuthStatusSource`] for how much this
+    /// is worth: a `false` from `Recorded`/`Absent` means "never signed in", a `false` from `Cli`
+    /// means "signed in once, and the session is now dead".
+    pub logged_in: bool,
+    pub source: AuthStatusSource,
+    pub email: Option<String>,
+    /// e.g. "claude.ai" | "console". `None` when the CLI did not answer.
+    pub auth_method: Option<String>,
+    /// e.g. "max" | "pro". `None` when the CLI did not answer or the account has no subscription.
+    pub subscription_type: Option<String>,
+}
+
+/// How long we let `claude auth status` run before giving up and falling back to the recorded
+/// identity. The observed cost is a few hundred ms; 8s is generous headroom for a cold node start
+/// on a slow disk while still bounding the app's first paint.
+const AUTH_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Parse `claude auth status --json` stdout. PURE — the whole point, so the shape contract is
+/// unit-tested without spawning a process.
+///
+/// Returns `None` for anything that is not a JSON object carrying a boolean `loggedIn`. That
+/// strictness is intentional: a `None` falls back to the recorded identity (fail-open), whereas a
+/// half-parsed object could report `logged_in: false` from `Cli` and BLOCK THE APP on garbage. The
+/// only input allowed to block is one that unambiguously said so.
+fn parse_claude_auth_status(stdout: &str) -> Option<ClaudeAuthStatus> {
+    // The CLI prints a banner/warning line before the JSON on some installs, so scan for the first
+    // line that opens an object rather than assuming stdout is pure JSON.
+    let start = stdout.find('{')?;
+    let v: serde_json::Value = serde_json::from_str(stdout[start..].trim())
+        .ok()
+        .or_else(|| serde_json::from_str(stdout[start..].lines().next()?.trim()).ok())?;
+    let logged_in = v.get("loggedIn")?.as_bool()?;
+    let str_field = |k: &str| {
+        v.get(k)
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    Some(ClaudeAuthStatus {
+        logged_in,
+        source: AuthStatusSource::Cli,
+        email: str_field("email"),
+        auth_method: str_field("authMethod"),
+        subscription_type: str_field("subscriptionType"),
+    })
+}
+
+/// The recorded-identity fallback, as a [`ClaudeAuthStatus`]. Never blocks: an identity on disk is
+/// reported `logged_in: true` with `source: Recorded`, and the absence of one is the only way to
+/// get `Absent` — i.e. a genuinely fresh machine, which SHOULD be gated.
+fn recorded_auth_status(config_dir: Option<&Path>, home: Option<&Path>) -> ClaudeAuthStatus {
+    match read_oauth_identity_at(config_dir, home) {
+        Some(id) => ClaudeAuthStatus {
+            logged_in: true,
+            source: AuthStatusSource::Recorded,
+            email: Some(id.email),
+            auth_method: None,
+            subscription_type: None,
+        },
+        None => ClaudeAuthStatus {
+            logged_in: false,
+            source: AuthStatusSource::Absent,
+            email: None,
+            auth_method: None,
+            subscription_type: None,
+        },
+    }
+}
+
+/// Build the `claude auth status --json` command, fully configured. Split from the run so a test can
+/// assert the ENVIRONMENT without spawning anything — the scrub below is invisible at runtime when
+/// it regresses, so it needs a pinned contract rather than a comment (roborev 57985).
+fn claude_auth_status_command(claude_path: &str, config_dir: Option<&Path>) -> std::process::Command {
+    let mut cmd = std::process::Command::new(claude_path);
+    cmd.args(["auth", "status", "--json"]);
+
+    // SCRUB THE ANTHROPIC ENV — and this is not boilerplate, it is the difference between this probe
+    // working and actively re-creating the bug it exists to fix.
+    //
+    // The concierge's own `claude -p` child runs with these stripped (see
+    // `claude_oneshot::scrub_anthropic_env`), so it authenticates via subscription OAuth. If THIS
+    // probe inherited them, it would answer about a different credential than the one that actually
+    // failed: an inherited `ANTHROPIC_API_KEY` makes `claude auth status` report a healthy API-key
+    // posture while the concierge's OAuth session is dead — i.e. exactly the false "you're signed
+    // in" that let the founder's expired session reach the concierge unannounced. An inherited
+    // `ANTHROPIC_BASE_URL` gives the inverse: a probe that says logged-out and is allowed to BLOCK
+    // the whole app over a credential the concierge never uses.
+    //
+    // Deliberately the same list as claude_oneshot's, referenced rather than re-typed, so a name
+    // added there cannot be silently missing here.
+    crate::claude_oneshot::scrub_anthropic_env_for(&mut cmd);
+
+    if let Some(dir) = config_dir.filter(|d| !d.as_os_str().is_empty()) {
+        cmd.env("CLAUDE_CONFIG_DIR", dir);
+    }
+    // `claude` is a `#!/usr/bin/env node` shebang on a normal install, so node has to be findable.
+    // A GUI app's PATH does not include ~/.local/bin; prepend it the same way every spawn path does.
+    if let Some(home) = std::env::var_os("HOME") {
+        let path = std::env::var("PATH").unwrap_or_default();
+        let home_str = home.to_string_lossy().into_owned();
+        cmd.env("PATH", format!("{home_str}/.local/bin:{path}"));
+        // A Dock-launched bundle has CWD `/`, which some `claude` paths object to. Same reasoning as
+        // `hooks.rs::claude_command`.
+        cmd.current_dir(&home);
+    }
+    cmd
+}
+
+/// Run `claude auth status --json`, bounded by [`AUTH_STATUS_TIMEOUT`], and return its stdout.
+///
+/// USES THE REPO'S HARDENED CAPTURE (`worktree::output_with_timeout`) rather than a hand-rolled
+/// `try_wait` loop, and the reason is a deadlock this originally had. With `stdout` piped but never
+/// drained while polling, a child that writes past the ~64 KB pipe buffer blocks on write, so it
+/// never exits, so `try_wait` never reports it — the probe burns the full 8s and is then killed.
+/// That failure is SILENT by construction: it falls back to `source: "recorded"`, the stale memory
+/// this whole command exists to stop trusting. So a merely chatty CLI (banners, a debug env var)
+/// would quietly degrade the live reading to the old broken answer, on a path polled per window
+/// focus. `output_with_timeout` drains both streams on reader threads and kills the whole process
+/// group on expiry (roborev 57985).
+fn run_claude_auth_status(claude_path: &str, config_dir: Option<&Path>) -> Option<String> {
+    let cmd = claude_auth_status_command(claude_path, config_dir);
+    let out = crate::worktree::output_with_timeout(cmd, AUTH_STATUS_TIMEOUT).ok()?;
+    // Not gated on `status.success()`: a CLI that exits non-zero while still printing a valid
+    // `{"loggedIn":false}` is telling us exactly what we asked. `parse_claude_auth_status` is the
+    // one that decides whether the bytes mean anything.
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    if stdout.trim().is_empty() {
+        return None;
+    }
+    Some(stdout)
+}
+
+/// Blocking core of [`claude_auth_status`]. Split out so the fail-open decision tree is testable:
+/// `probe` stands in for the subprocess, so a test can drive "CLI says no", "CLI says yes",
+/// "CLI unavailable", and "garbage" without a `claude` binary on the machine.
+fn claude_auth_status_with(
+    config_dir: Option<&Path>,
+    home: Option<&Path>,
+    probe: impl FnOnce() -> Option<String>,
+) -> ClaudeAuthStatus {
+    match probe().as_deref().and_then(parse_claude_auth_status) {
+        Some(live) => live,
+        // FAIL-OPEN. The probe could not speak, so it does not get a vote — see the module note.
+        None => recorded_auth_status(config_dir, home),
+    }
+}
+
+/// Whether Claude Code can authenticate RIGHT NOW for the given config dir — the reading behind the
+/// auth gate and the concierge's re-auth prompt. Unlike [`claude_signed_in`], this can return
+/// `logged_in: false` for a machine that signed in successfully in the past, which is the entire
+/// reason it exists (see the module note above for the failure it closes).
+///
+/// `async` + `spawn_blocking`: runs a subprocess and reads a file, neither of which may touch the
+/// event loop. On a JoinError we report the fail-open `Recorded`/`Absent` answer rather than
+/// inventing a `false` that could gate the app.
+#[tauri::command]
+pub async fn claude_auth_status(config_dir: Option<String>) -> ClaudeAuthStatus {
+    tauri::async_runtime::spawn_blocking(move || {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let dir = config_dir.filter(|s| !s.is_empty()).map(PathBuf::from);
+        let claude = crate::preflight::cached_claude_path();
+        claude_auth_status_with(dir.as_deref(), home.as_deref(), || {
+            run_claude_auth_status(claude.as_deref()?, dir.as_deref())
+        })
+    })
+    .await
+    .unwrap_or(ClaudeAuthStatus {
+        logged_in: true,
+        source: AuthStatusSource::Recorded,
+        email: None,
+        auth_method: None,
+        subscription_type: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1920,6 +2144,10 @@ mod tests {
         // Opens `accounts.json` PLUS every account's own `.claude.json`.
         assert_async_command(accounts_identities);
         assert_async_command(claude_signed_in);
+        // Spawns `claude auth status` and waits on it — the only command here that blocks on a
+        // SUBPROCESS rather than a file, so reverting it to `pub fn` would freeze the UI for up to
+        // AUTH_STATUS_TIMEOUT on every window focus.
+        assert_async_command(claude_auth_status);
         // Also transcript-tree scanners.
         assert_async_command(accounts_spend);
         assert_async_command(accounts_limit_events);
@@ -2786,6 +3014,177 @@ mod tests {
         // oauthAccount present but empty email → not signed in.
         write_claude_json(&base, r#"{"oauthAccount":{"emailAddress":""}}"#);
         assert!(!claude_signed_in_sync(Some(base.to_string_lossy().into_owned())));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ── Live auth status (the expired-session gate) ─────────────────────────────────────────────
+
+    #[test]
+    fn parse_claude_auth_status_reads_the_cli_json_verbatim() {
+        // The exact shape `claude auth status --json` prints on 2.1.221, captured from the CLI.
+        let out = r#"{
+  "loggedIn": true,
+  "authMethod": "claude.ai",
+  "apiProvider": "firstParty",
+  "email": "someone@example.com",
+  "orgId": "00000000-0000-0000-0000-000000000000",
+  "orgName": "Example Org",
+  "subscriptionType": "max"
+}"#;
+        let s = parse_claude_auth_status(out).expect("valid CLI JSON must parse");
+        assert!(s.logged_in);
+        assert_eq!(s.source, AuthStatusSource::Cli);
+        assert_eq!(s.email.as_deref(), Some("someone@example.com"));
+        assert_eq!(s.auth_method.as_deref(), Some("claude.ai"));
+        assert_eq!(s.subscription_type.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn parse_claude_auth_status_tolerates_a_banner_line_before_the_json() {
+        // Some installs print an update/warning notice ahead of the payload. Scanning for the first
+        // `{` rather than assuming pure JSON keeps a chatty CLI from being read as "probe broken",
+        // which would silently downgrade a live reading to the recorded fallback.
+        let out = "Update available: 2.1.9 -> 2.1.221\n{\"loggedIn\":false}\n";
+        let s = parse_claude_auth_status(out).expect("banner must not defeat the parse");
+        assert!(!s.logged_in);
+        assert_eq!(s.source, AuthStatusSource::Cli);
+    }
+
+    #[test]
+    fn parse_claude_auth_status_rejects_anything_without_a_boolean_loggedin() {
+        // Each of these must be `None` so the caller FAILS OPEN. If any parsed to a status, it would
+        // arrive as `logged_in: false, source: Cli` — the one combination allowed to block the whole
+        // app — on the strength of garbage.
+        for junk in [
+            "",
+            "not json at all",
+            "{}",
+            r#"{"loggedIn":"yes"}"#,
+            r#"{"logged_in":true}"#,
+            r#"{"error":"unknown command 'auth'"}"#,
+        ] {
+            assert!(
+                parse_claude_auth_status(junk).is_none(),
+                "must not parse: {junk:?}"
+            );
+        }
+    }
+
+    // THE PROBE MUST ASK ABOUT THE SAME CREDENTIAL THE CONCIERGE USES. Asserted on the built
+    // Command's env rather than by spawning, because this scrub is invisible at runtime when it
+    // regresses: with `ANTHROPIC_API_KEY` inherited, `claude auth status` cheerfully reports a
+    // healthy API-key posture while the concierge's OAuth session is dead — the exact false
+    // "you're signed in" this command was added to end (roborev 57985).
+    #[test]
+    fn the_auth_probe_scrubs_every_anthropic_env_override() {
+        let cmd = claude_auth_status_command("/bin/claude", None);
+        let removed: Vec<String> = cmd
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        for name in [
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_API",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_CUSTOM_HEADERS",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+        ] {
+            assert!(
+                removed.contains(&name.to_string()),
+                "{name} not scrubbed from the auth probe; got {removed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_auth_probe_asks_the_cli_for_json_status() {
+        // Pins the argv. `auth status --json` is three separate facts (the `auth` prefix that the
+        // login bug was missing, the `status` subcommand, and the JSON the parser expects), and
+        // getting any of them wrong degrades silently to the recorded fallback.
+        let cmd = claude_auth_status_command("/bin/claude", None);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, vec!["auth", "status", "--json"]);
+    }
+
+    #[test]
+    fn the_auth_probe_targets_an_explicit_account_config_dir() {
+        let cmd = claude_auth_status_command("/bin/claude", Some(Path::new("/acc/dir")));
+        let set: Vec<(String, String)> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| Some((k.to_string_lossy().into_owned(), v?.to_string_lossy().into_owned())))
+            .collect();
+        assert!(
+            set.contains(&("CLAUDE_CONFIG_DIR".to_string(), "/acc/dir".to_string())),
+            "an explicit account dir must be probed in its own config dir; got {set:?}"
+        );
+        // And with no dir given, nothing is set — the machine-wide login is the target.
+        let plain = claude_auth_status_command("/bin/claude", None);
+        assert!(
+            !plain
+                .get_envs()
+                .any(|(k, v)| k == "CLAUDE_CONFIG_DIR" && v.is_some()),
+            "no config dir given must mean the machine-wide login, not an empty override"
+        );
+    }
+
+    #[test]
+    fn a_live_cli_no_beats_a_recorded_yes() {
+        // THE FOUNDER'S BUG, as a unit test. The machine has a perfectly good recorded identity from
+        // a login that succeeded weeks ago — `claude_signed_in_sync` says `true` for this same dir —
+        // but the CLI now reports the session dead. The live reading must win, because the recorded
+        // one is what let an expired session masquerade as healthy all the way to the concierge.
+        let base = unique_dir("auth-live-no");
+        write_claude_json(&base, r#"{"oauthAccount":{"emailAddress":"me@example.com"}}"#);
+        assert!(
+            claude_signed_in_sync(Some(base.to_string_lossy().into_owned())),
+            "precondition: the stale recorded identity still reads as signed in"
+        );
+
+        let s = claude_auth_status_with(Some(&base), None, || {
+            Some(r#"{"loggedIn":false}"#.to_string())
+        });
+        assert!(!s.logged_in, "a live CLI 'no' must not be overridden");
+        assert_eq!(s.source, AuthStatusSource::Cli);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn an_unavailable_probe_falls_back_to_the_recorded_identity() {
+        // FAIL-OPEN. `None` from the probe means the binary is missing, the subcommand is unknown on
+        // an older Claude Code, or it timed out. None of those is evidence the user is signed out,
+        // and this drives a gate that can block the app — so the recorded identity carries it, and
+        // `source` says the answer is only a memory.
+        let base = unique_dir("auth-probe-dead");
+        write_claude_json(&base, r#"{"oauthAccount":{"emailAddress":"me@example.com"}}"#);
+        let s = claude_auth_status_with(Some(&base), None, || None);
+        assert!(s.logged_in, "a broken probe must never lock the user out");
+        assert_eq!(s.source, AuthStatusSource::Recorded);
+        assert_eq!(s.email.as_deref(), Some("me@example.com"));
+
+        // Garbage on stdout takes the same path as no answer at all.
+        let s = claude_auth_status_with(Some(&base), None, || Some("segfault".to_string()));
+        assert!(s.logged_in);
+        assert_eq!(s.source, AuthStatusSource::Recorded);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_fresh_machine_with_no_probe_and_no_identity_is_absent() {
+        // The genuine first-run case — nothing has ever signed in here. This is the ONE way to get a
+        // blocking `false` without a live CLI answer, and it is correct: there is nothing to lock the
+        // user out OF, because they cannot run an agent either.
+        let base = unique_dir("auth-fresh");
+        std::fs::create_dir_all(&base).unwrap();
+        let s = claude_auth_status_with(Some(&base), None, || None);
+        assert!(!s.logged_in);
+        assert_eq!(s.source, AuthStatusSource::Absent);
+        assert_eq!(s.email, None);
         let _ = std::fs::remove_dir_all(&base);
     }
 

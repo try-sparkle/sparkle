@@ -1,10 +1,28 @@
 // Pure state machine for the first-run setup checklist (SetupChecklist.tsx). Kept separate from the
-// component so the transitions — all-missing → installing → all-green, plus the gated `claude login`
-// step — are unit-testable without rendering React or touching Tauri IPC.
+// component so the transitions — all-missing → installing → all-green — are unit-testable without
+// rendering React or touching Tauri IPC.
+//
+// INSTALL ONLY. THE LOGIN STEP IS GONE, AND ITS ABSENCE IS THE POINT.
+//
+// This used to carry a fourth step: a `LoginPhase` (`locked` → `ready` → `inProgress` → `done`) that
+// stayed LOCKED until claude was installed, ran `claude login` in an embedded terminal, and gated
+// `setupComplete`. It is deleted. Authentication is now a GATE (ReadinessGate), not a step.
+//
+// Why that is better rather than merely different — the login step had a structural flaw no amount
+// of fixing within the checklist could reach. A first-run checklist runs ONCE, on a fresh machine.
+// But auth is not a one-time fact: sessions expire. So the one place the app knew how to ask for
+// credentials was a screen that, by construction, a returning user would never see again. When the
+// founder's OAuth session expired on his second machine, nothing asked him to sign in — the
+// concierge simply failed, and told him to try again in a moment.
+//
+// The split that fixes it: INSTALL is machine work that runs unattended and genuinely only happens
+// once (this file), while AUTH is user work that can be needed at any time (the gate). The
+// dependency order is unchanged and unavoidable — `claude auth login` needs the claude binary, so
+// install still precedes auth — but install no longer waits on a human, so auth is the first thing
+// the user is actually ASKED for.
 //
 // The three prerequisites are ordered by dependency: git and node are independent; claude's shebang
-// needs node, and the final `claude login` step needs claude. The UI can install them in any order,
-// but the login step stays LOCKED until claude is present.
+// needs node. The UI can install them in any order.
 
 export type PrereqKey = "git" | "node" | "claude";
 
@@ -24,13 +42,8 @@ export interface PrereqRow {
   error: string | null;
 }
 
-/** The final "Sign in to Claude Code" step. `locked` until claude is installed, then `ready`;
- *  `inProgress` while the login terminal is open; `done` once completed. */
-export type LoginPhase = "locked" | "ready" | "inProgress" | "done";
-
 export interface SetupState {
   rows: Record<PrereqKey, PrereqRow>;
-  login: LoginPhase;
 }
 
 /** Fixed display order (also the order rows are rendered). */
@@ -42,27 +55,14 @@ export type SetupEvent =
   | { type: "installStart"; key: PrereqKey }
   | { type: "installProgress"; key: PrereqKey; message: string }
   | { type: "installOk"; key: PrereqKey; path: string | null }
-  | { type: "installError"; key: PrereqKey; error: string }
-  | { type: "loginStart" }
-  | { type: "loginDone" }
-  | { type: "loginReset" };
+  | { type: "installError"; key: PrereqKey; error: string };
 
 function row(key: PrereqKey): PrereqRow {
   return { key, phase: "checking", path: null, progress: "", error: null };
 }
 
 export function initialSetupState(): SetupState {
-  return {
-    rows: { git: row("git"), node: row("node"), claude: row("claude") },
-    login: "locked",
-  };
-}
-
-/** Derive the login gate from the claude row: it unlocks only once claude is installed, and never
- *  regresses out of `done` (a completed login stays done even if a re-detect re-runs). */
-function deriveLogin(prev: LoginPhase, claude: PrereqRow): LoginPhase {
-  if (prev === "done" || prev === "inProgress") return prev;
-  return claude.phase === "installed" ? "ready" : "locked";
+  return { rows: { git: row("git"), node: row("node"), claude: row("claude") } };
 }
 
 export function setupReducer(state: SetupState, event: SetupEvent): SetupState {
@@ -81,50 +81,28 @@ export function setupReducer(state: SetupState, event: SetupEvent): SetupState {
           rows[key] = { ...current, phase: "missing", path: null };
         }
       }
-      return { rows, login: deriveLogin(state.login, rows.claude) };
+      return { rows };
     }
     case "installStart": {
       const rows = { ...state.rows };
       rows[event.key] = { ...rows[event.key], phase: "installing", progress: "", error: null };
-      return { rows, login: deriveLogin(state.login, rows.claude) };
+      return { rows };
     }
     case "installProgress": {
       const rows = { ...state.rows };
       rows[event.key] = { ...rows[event.key], progress: event.message };
-      return { ...state, rows };
+      return { rows };
     }
     case "installOk": {
       const rows = { ...state.rows };
-      rows[event.key] = {
-        ...rows[event.key],
-        phase: "installed",
-        path: event.path,
-        error: null,
-      };
-      return { rows, login: deriveLogin(state.login, rows.claude) };
+      rows[event.key] = { ...rows[event.key], phase: "installed", path: event.path, error: null };
+      return { rows };
     }
     case "installError": {
       const rows = { ...state.rows };
       rows[event.key] = { ...rows[event.key], phase: "error", error: event.error };
-      return { rows, login: deriveLogin(state.login, rows.claude) };
+      return { rows };
     }
-    case "loginStart":
-      // Guard: can't start login before claude is installed.
-      if (state.login === "locked") return state;
-      return { ...state, login: "inProgress" };
-    case "loginDone":
-      return { ...state, login: "done" };
-    case "loginReset":
-      // Never regress a COMPLETED sign-in. A late `claude login` terminal exit can fire during
-      // unmount (its PTY-exit callback is captured at mount, so it can't see the live phase) — if
-      // that probe resolves "not signed in" AFTER the user already confirmed, this must not flip a
-      // done login back. Reducer-level guard keeps the invariant regardless of the caller's closure.
-      // `done` is intentionally TERMINAL for reset — there is no sign-out flow in first-run setup; if
-      // a re-auth path is ever added, introduce a dedicated `loginSignOut` event rather than relaxing
-      // this (which exists to swallow the late-probe race, not to model logging back out).
-      if (state.login === "done") return state;
-      // Otherwise return to `ready` if claude is present, else `locked` (e.g. login closed early).
-      return { ...state, login: state.rows.claude.phase === "installed" ? "ready" : "locked" };
     default:
       return state;
   }
@@ -135,10 +113,13 @@ export function allPrereqsInstalled(state: SetupState): boolean {
   return PREREQ_ORDER.every((k) => state.rows[k].phase === "installed");
 }
 
-/** The whole flow is complete — every prereq installed AND the user has signed in to Claude Code.
- *  This is the gate the UI uses to proceed into the app. */
+/** The checklist's work is done — every prerequisite is installed.
+ *
+ *  This NO LONGER means "the user can run agents": the auth gate still stands between here and a
+ *  usable app, and `onReady` hands off to it rather than dismissing straight into the workspace. The
+ *  name is kept because it means what it says for THIS screen; see the module header for the split. */
 export function setupComplete(state: SetupState): boolean {
-  return allPrereqsInstalled(state) && state.login === "done";
+  return allPrereqsInstalled(state);
 }
 
 /** True while any prerequisite install is running (used to disable "check again" / proceed). */

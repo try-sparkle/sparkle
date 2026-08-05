@@ -54,10 +54,17 @@ export const QUOTA_FAILURE_HEADLINE =
   "Your Claude plan is out of room — retrying won't clear it. This is a limit on your Claude account, not something Sparkle can route around:";
 
 /** The remedy has to be safe under the same condition that produced the failure (AGENTS.md: a
- *  remedy string is an instruction the user will follow). Signing in via the CLI is, because that is
- *  the same credential the concierge's own `claude -p` child reads. */
+ *  remedy string is an instruction the user will follow). Re-authenticating is, because it renews
+ *  the same credential the concierge's own `claude -p` child reads.
+ *
+ *  NOT "run `claude` in a terminal" any more. Two things were wrong with that. It sent a desktop
+ *  user to a terminal Sparkle exists to spare them, and — the reason it had to change — `claude`
+ *  with no subcommand drops you at a REPL, so the user still had to know to type `/login`. The app
+ *  now renders a Sign in button next to this sentence (`ConciergeHost`), which runs the real
+ *  `claude auth login` in place. The copy must keep naming the in-app action, not a shell command:
+ *  if the button is ever removed, this string has to change with it. */
 export const AUTH_FAILURE_HEADLINE =
-  "Your concierge can't sign in to Claude. Run `claude` in a terminal to authenticate, then ask me again:";
+  "Your Claude sign-in has expired, so I can't reach my brain. Retrying won't help — sign in again and I'll pick up where we left off:";
 
 const HEADLINES: Record<ConciergeFailureKind, string> = {
   quota: QUOTA_FAILURE_HEADLINE,
@@ -71,9 +78,27 @@ const HEADLINES: Record<ConciergeFailureKind, string> = {
 const QUOTA =
   /hit your (?:monthly spend|session|usage|weekly)\s+limit|rate.?limit|quota exceeded|usage limit|credit balance is too low|insufficient_quota/i;
 
-/** Credential failures. `please run claude` is the CLI's own onboarding line. */
+/**
+ * Credential failures. `please run claude` is the CLI's own onboarding line.
+ *
+ * THE MISS THIS WIDENS — a one-word gap that cost the founder an onboarding. The pattern used to
+ * read `oauth token (?:expired|invalid)`. What the CLI actually emitted on his second machine was:
+ *
+ *     Failed to authenticate: OAuth session expired and could not be refreshed
+ *
+ * "session", not "token". So the most unambiguous auth failure the CLI can produce fell through to
+ * `unknown` and was answered with "I couldn't reach my brain just now — try me again in a moment."
+ * He retried, because that is what it told him to do, and no number of retries could have worked.
+ *
+ * Widened accordingly, and deliberately past the one string that bit us — `oauth (?:token|session)`
+ * covers both nouns, `failed to authenticate` and `could not be refreshed` each catch that sentence
+ * independently, and `refresh token` covers the neighbouring phrasing. Over-matching here is cheap:
+ * a quota failure is classified BEFORE this (a 429 mentioning authorization is a quota fact), and a
+ * misfiled auth headline still ships the machine's verbatim words underneath it. Under-matching is
+ * what produced the bug.
+ */
 const AUTH =
-  /not logged in|invalid api key|unauthori[sz]ed|authentication (?:failed|error|required)|please run `?claude`?|oauth token (?:expired|invalid)|invalid_api_key/i;
+  /not logged in|invalid api key|unauthori[sz]ed|authentication (?:failed|error|required)|failed to authenticate|please run `?claude`?|oauth (?:token|session) (?:expired|invalid)|could not be refreshed|refresh token (?:expired|invalid)|invalid_api_key/i;
 
 /** What we tell the user, and what the machine actually said. */
 export interface ConciergeFailureNotice {

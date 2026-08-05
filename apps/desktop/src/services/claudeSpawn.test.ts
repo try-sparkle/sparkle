@@ -11,24 +11,60 @@ import {
 } from "./claudeSpawn";
 
 const PATH_PREFIX = `export PATH="$HOME/.local/bin:$PATH"; `;
+/** Mirrors ANTHROPIC_ENV_UNSET in claudeSpawn.ts — the login must write the same credential the
+ *  Rust-side auth probe reads. */
+const UNSET_PREFIX =
+  "unset ANTHROPIC_API_KEY ANTHROPIC_API ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL " +
+  "ANTHROPIC_CUSTOM_HEADERS CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX; ";
 
 describe("buildClaudeLoginExec (first-run setup)", () => {
-  it("runs `claude login` with the ~/.local/bin PATH prefix", () => {
+  // THE BUG THIS PINS. This built `claude login`, which is NOT a subcommand — `claude --help` lists
+  // `auth`, and `login` lives under it. Commander therefore read `login` as the POSITIONAL PROMPT,
+  // so the embedded setup terminal opened a Claude REPL and asked it the word "login". No OAuth ever
+  // ran, and the founder reported the onboarding sign-in window as simply not working. The assertion
+  // is on the exact argv, so a revert to the bare `login` form fails here.
+  it("runs `claude auth login` — NOT `claude login`, which is a prompt, not a command", () => {
     expect(buildClaudeLoginExec("/usr/local/bin/claude")).toBe(
-      `${PATH_PREFIX}exec '/usr/local/bin/claude' login`,
+      `${UNSET_PREFIX}${PATH_PREFIX}exec '/usr/local/bin/claude' auth login`,
     );
   });
 
   it("single-quotes a claude path containing a space", () => {
     expect(buildClaudeLoginExec("/path with space/claude")).toBe(
-      `${PATH_PREFIX}exec '/path with space/claude' login`,
+      `${UNSET_PREFIX}${PATH_PREFIX}exec '/path with space/claude' auth login`,
     );
   });
 
   it("exports CLAUDE_CONFIG_DIR before login when a config dir is given", () => {
     expect(buildClaudeLoginExec("/bin/claude", { configDir: "/acc/dir" })).toBe(
-      `export CLAUDE_CONFIG_DIR='/acc/dir'; ${PATH_PREFIX}exec '/bin/claude' login`,
+      `export CLAUDE_CONFIG_DIR='/acc/dir'; ${UNSET_PREFIX}${PATH_PREFIX}exec '/bin/claude' auth login`,
     );
+  });
+
+  // SYMMETRY WITH THE PROBE. `accounts::claude_auth_status` runs scrubbed, so it reports on the
+  // subscription OAuth credential. A login that ran UNSCRUBBED would write a different one — and the
+  // user would loop: sign in, be told to sign in again, with nothing explaining why (roborev 58006).
+  //
+  // WHAT THIS DOES AND DOES NOT PROVE. It pins that the shell string unsets each name BEFORE the
+  // exec, which is what makes the unset effective. It canNOT detect drift from the canonical Rust
+  // list: these names, UNSET_PREFIX, and ANTHROPIC_ENV_UNSET all live on this side, so appending an
+  // eighth name to `claude_oneshot::ANTHROPIC_ENV_OVERRIDES` fails nothing here. An earlier version
+  // of this comment claimed it did, which is worse than no check — it tells the reader the drift is
+  // impossible (roborev 58033). The real cross-language guard is the Rust test
+  // `every_scrubbed_name_is_also_unset_before_the_typescript_login_spawn`, which reads this file.
+  it.each([
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_API",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+  ])("unsets %s before login, matching the Rust-side probe scrub", (name) => {
+    const exec = buildClaudeLoginExec("/bin/claude");
+    expect(exec).toMatch(new RegExp(`unset[^;]*\\b${name}\\b`));
+    // And it must happen BEFORE the exec, or it accomplishes nothing.
+    expect(exec.indexOf(name)).toBeLessThan(exec.indexOf("exec "));
   });
 });
 

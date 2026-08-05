@@ -99,6 +99,7 @@ import {
   type ConciergeLiveness,
 } from "../engine/conciergeLiveness";
 import { conciergeFailureNotice } from "../engine/conciergeFailureNotice";
+import { reportClaudeAuthFailed } from "../services/claudeAuthSignal";
 import {
   accountedNeedsYou,
   createProactiveScheduler,
@@ -2234,8 +2235,22 @@ export function ConciergeHost({
           kind: "failure",
           headline: notice.headline,
           evidence: notice.evidence,
+          // The headline for an auth failure now says "sign in again", so the bubble must carry the
+          // control that does it — a remedy string is an instruction the user will follow, and one
+          // naming an action the UI does not offer is how the previous copy sent desktop users to a
+          // terminal.
+          canReauth: notice.kind === "auth",
         },
       ]);
+      // TELL THE GATE. The founder's case was a FOCUSED app: he typed a question and the concierge
+      // child was the thing that discovered the session was dead. ReadinessGate's focus re-probe
+      // cannot see that — the window never lost focus — so without this the app would keep serving
+      // the last healthy probe while every turn failed.
+      //
+      // This reports EVIDENCE, not a verdict: the gate re-runs its own live `claude auth status` and
+      // decides. So a misclassified failure costs one cheap probe and changes nothing, which is why
+      // it is safe to fire on the classifier's word.
+      if (notice.kind === "auth") reportClaudeAuthFailed();
       // Through the column's ONE live region, like every other bookkeeping line. The HEADLINE only:
       // the evidence can be a multi-line stderr dump, and a screen reader reading forty lines of
       // warnings aloud buries the sentence that says what to do.

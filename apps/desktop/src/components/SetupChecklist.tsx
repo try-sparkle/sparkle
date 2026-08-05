@@ -1,9 +1,8 @@
-import { useCallback, useEffect, useReducer, useRef, useState } from "react";
+import { useCallback, useEffect, useReducer, useRef } from "react";
 import {
   FiCheckCircle,
   FiDownload,
   FiAlertCircle,
-  FiLock,
   FiLoader,
   FiGitBranch,
   FiBox,
@@ -13,7 +12,6 @@ import type { IconType } from "react-icons";
 import { C, FONT_WEIGHT, DANGER, ON_BRAND_FILL } from "../theme/colors";
 import {
   checkPrereqs,
-  checkClaudeSignedIn,
   checkGit,
   installNode,
   installClaudeCode,
@@ -29,9 +27,7 @@ import {
   type PrereqKey,
   type PrereqRow,
 } from "../setupState";
-import { buildClaudeLoginExec, SHELL } from "../services/claudeSpawn";
 import { safeUnlisten } from "../services/safeUnlisten";
-import { Terminal } from "./Terminal";
 
 /** How often we re-probe git after triggering the (user-driven, slow) CLT installer. */
 const GIT_POLL_MS = 4000;
@@ -67,17 +63,23 @@ const META: Record<PrereqKey, PrereqMeta> = {
 /**
  * First-run setup checklist (install-readiness). One row per runtime prerequisite — git, Node.js,
  * Claude Code — each showing detected/missing state with an Install button that auto-installs the
- * missing one (no sudo) and streams live progress. A final "Sign in to Claude Code" step runs
- * `claude login` in an embedded terminal. When everything is green, `onReady` proceeds into the app.
+ * missing one (no sudo) and streams live progress. When every row is green, `onReady` hands off.
  *
  * Replaces the old link-only Onboarding: we now DETECT and AUTO-INSTALL rather than just guide,
  * falling back to clear guidance only when an auto-install can't complete.
+ *
+ * NO SIGN-IN STEP — see setupState.ts for the full reasoning. In short: this screen runs once, on a
+ * fresh machine, so a login step living here could never ask a RETURNING user whose session had
+ * expired. Authentication is a gate now (ReadinessGate), which serves first run and every run after.
+ * `onReady` therefore means "the installs are done", not "the user can run agents" — the caller
+ * re-probes and the auth gate takes over.
+ *
+ * The upshot for a new user is the thing that was asked for: this screen no longer waits on them.
+ * Installs run unattended, and the first thing they are actually asked for is signing in.
  */
 export function SetupChecklist({ onReady }: { onReady: () => void }) {
   const [state, dispatch] = useReducer(setupReducer, undefined, initialSetupState);
   const gitPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  // Path to the user's claude binary, needed to spawn `claude login`. Set once claude is installed.
-  const [claudePath, setClaudePath] = useState<string | null>(null);
 
   // Shared detection: probe all three prereqs and fold the result into the machine. On failure the
   // caller decides whether to force everything to "missing" (initial load) or leave state as-is.
@@ -85,7 +87,6 @@ export function SetupChecklist({ onReady }: { onReady: () => void }) {
     return checkPrereqs()
       .then((r) => {
         dispatch({ type: "detected", statuses: { git: r.git, node: r.node, claude: r.claude } });
-        if (r.claude.installed) setClaudePath(r.claude.path);
       })
       .catch(() => onError?.());
   }, []);
@@ -123,7 +124,7 @@ export function SetupChecklist({ onReady }: { onReady: () => void }) {
     };
   }, [detect]);
 
-  // Proceed into the app once every prerequisite is green AND the user has signed in.
+  // Hand off once every prerequisite is green. The auth gate is what comes next, not the workspace.
   useEffect(() => {
     if (setupComplete(state)) {
       const t = setTimeout(onReady, 500); // brief beat so the final ✓ is visible
@@ -139,7 +140,6 @@ export function SetupChecklist({ onReady }: { onReady: () => void }) {
         dispatch({ type: "installOk", key, path });
       } else if (key === "claude") {
         const path = await installClaudeCode();
-        setClaudePath(path);
         dispatch({ type: "installOk", key, path });
       } else {
         // git: trigger, then poll for the user-driven CLT install to complete.
@@ -191,12 +191,6 @@ export function SetupChecklist({ onReady }: { onReady: () => void }) {
     void detect();
   }
 
-  // The `claude login` terminal spawn (no cwd — runs before any worktree exists).
-  const loginSpawn =
-    claudePath != null
-      ? { command: SHELL, args: ["-l", "-c", buildClaudeLoginExec(claudePath)] }
-      : null;
-
   return (
     <div
       style={{
@@ -212,36 +206,16 @@ export function SetupChecklist({ onReady }: { onReady: () => void }) {
       }}
     >
       <style>{SPIN_KEYFRAMES}</style>
-      <div style={{ fontSize: 17, fontWeight: FONT_WEIGHT.semibold }}>Let’s finish setting up</div>
+      <div style={{ fontSize: 17, fontWeight: FONT_WEIGHT.semibold }}>Setting up your Mac</div>
       <div style={{ color: C.muted, maxWidth: 520, lineHeight: 1.5, textAlign: "center" }}>
         Sparkle runs Claude on your own Mac. We’ll install everything it needs — no Terminal
-        required — then sign you in to Claude Code (Sparkle never sees your credentials).
+        required. You’ll sign in to Claude next.
       </div>
 
       <div style={{ width: "100%", maxWidth: 560, display: "flex", flexDirection: "column", gap: 10 }}>
         {PREREQ_ORDER.map((key) => (
           <PrereqRowView key={key} row={state.rows[key]} onInstall={() => void handleInstall(key)} />
         ))}
-
-        {/* Final step: sign in to Claude Code. */}
-        <LoginRow
-          phase={state.login}
-          spawn={loginSpawn}
-          onStart={() => dispatch({ type: "loginStart" })}
-          onExit={() => {
-            // The `claude login` terminal exited. Don't treat that as success on its own (the user
-            // may have quit or failed) — verify Claude Code actually recorded an authenticated
-            // identity. Only a confirmed sign-in advances; anything else (not signed in OR a probe
-            // failure) resets so the user can retry or use the manual confirm. A `loginReset` here
-            // can't regress an already-`done` login — the reducer guards that (this callback is
-            // frozen at Terminal mount, so it can't check the live phase itself).
-            void checkClaudeSignedIn()
-              .then((ok) => dispatch(ok ? { type: "loginDone" } : { type: "loginReset" }))
-              .catch(() => dispatch({ type: "loginReset" }));
-          }}
-          onManualDone={() => dispatch({ type: "loginDone" })}
-          onCancel={() => dispatch({ type: "loginReset" })}
-        />
       </div>
 
       <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
@@ -254,7 +228,7 @@ export function SetupChecklist({ onReady }: { onReady: () => void }) {
         </button>
         {setupComplete(state) && (
           <span style={{ color: C.successInk, fontWeight: FONT_WEIGHT.medium }}>
-            All set — opening Sparkle…
+            Installed — next, sign in to Claude…
           </span>
         )}
       </div>
@@ -324,97 +298,6 @@ function StatusControl({ row, onInstall }: { row: PrereqRow; onInstall: () => vo
         </button>
       );
   }
-}
-
-function LoginRow({
-  phase,
-  spawn,
-  onStart,
-  onExit,
-  onManualDone,
-  onCancel,
-}: {
-  phase: "locked" | "ready" | "inProgress" | "done";
-  spawn: { command: string; args: string[] } | null;
-  onStart: () => void;
-  onExit: () => void;
-  onManualDone: () => void;
-  onCancel: () => void;
-}) {
-  return (
-    <div
-      style={{
-        display: "flex",
-        flexDirection: "column",
-        gap: 10,
-        padding: "12px 14px",
-        borderRadius: 6,
-        background: C.deepForest,
-        border: `1px solid ${C.hairline}`,
-        opacity: phase === "locked" ? 0.55 : 1,
-      }}
-    >
-      <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-        <FiTerminal size={20} style={{ color: C.muted, flexShrink: 0 }} aria-hidden />
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ fontWeight: FONT_WEIGHT.semibold, fontSize: 13 }}>Sign in to Claude Code</div>
-          <div style={{ color: C.muted, fontSize: 12, lineHeight: 1.4 }}>
-            Runs <code>claude login</code> in your browser. Sparkle never handles your credentials.
-          </div>
-        </div>
-        {phase === "locked" && (
-          <span style={{ display: "flex", alignItems: "center", gap: 6, color: C.muted }}>
-            <FiLock size={16} aria-hidden />
-            <span style={{ fontSize: 12 }}>Install Claude Code first</span>
-          </span>
-        )}
-        {phase === "ready" && (
-          <button onClick={onStart} style={primaryBtn} disabled={!spawn}>
-            Sign in
-          </button>
-        )}
-        {phase === "done" && (
-          <span style={{ display: "flex", alignItems: "center", gap: 6, color: C.successInk }}>
-            <FiCheckCircle size={18} aria-hidden />
-            <span style={{ fontSize: 13, fontWeight: FONT_WEIGHT.medium }}>Signed in</span>
-          </span>
-        )}
-      </div>
-
-      {phase === "inProgress" && spawn && (
-        <>
-          <div
-            style={{
-              height: 300,
-              border: `1px solid ${C.hairline}`,
-              borderRadius: 6,
-              overflow: "hidden",
-              padding: 6,
-            }}
-          >
-            <Terminal
-              agentId="setup-claude-login"
-              projectId="setup"
-              projectRootPath=""
-              command={spawn.command}
-              args={spawn.args}
-              active
-              onStatus={() => {}}
-              onExit={onExit}
-            />
-          </div>
-          <div style={{ display: "flex", gap: 10 }}>
-            <button onClick={onManualDone} style={primaryBtn}>
-              I’ve signed in
-            </button>
-            <button onClick={onCancel} style={secondaryBtn(false)}>
-              Cancel
-            </button>
-          </div>
-        </>
-      )}
-    </div>
-  );
 }
 
 /** Spin keyframes, rendered exactly once by SetupChecklist (not per-spinner). */

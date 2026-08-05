@@ -56,6 +56,37 @@ describe("conciergeFailureNotice", () => {
     expect(notice.headline).toBe(AUTH_FAILURE_HEADLINE);
   });
 
+  // THE FOUNDER'S ACTUAL FAILURE, verbatim. This string classified as `unknown` and was answered
+  // with "try me again in a moment" — advice that cannot work for an expired session, which he then
+  // followed. The classifier matched `oauth token expired`; the CLI says `OAuth session expired`.
+  // Pinned as its own case (not folded into a loop) because it is the specific regression.
+  it("classifies the CLI's real expired-session sentence as auth, not unknown", () => {
+    const notice = conciergeFailureNotice(
+      "Failed to authenticate: OAuth session expired and could not be refreshed",
+    );
+    expect(notice.kind).toBe("auth");
+    expect(notice.headline).toBe(AUTH_FAILURE_HEADLINE);
+    // The headline must not tell the user to wait or retry — that is what made the old copy wrong.
+    expect(notice.headline).not.toMatch(/try me again|in a moment/i);
+    expect(notice.evidence).toBe(
+      "Failed to authenticate: OAuth session expired and could not be refreshed",
+    );
+  });
+
+  // The neighbouring phrasings the same code path can emit. Each must land on `auth` on its own —
+  // written as separate strings rather than one compound sentence so a single alternative going
+  // stale can't be masked by another alternative in the same input.
+  it.each([
+    "OAuth token expired",
+    "OAuth session invalid",
+    "Refresh token expired",
+    "Failed to authenticate",
+    "credentials could not be refreshed",
+    "Error: Not logged in",
+  ])("classifies %j as an auth failure", (detail) => {
+    expect(conciergeFailureNotice(detail).kind).toBe("auth");
+  });
+
   // A 429 mentions both rate limiting and authorization. It is a quota fact, and the remedy differs:
   // "run claude to log in" would send a user with a working login to fix a login that isn't broken.
   it("reads a rate limit as quota, not as an auth problem", () => {

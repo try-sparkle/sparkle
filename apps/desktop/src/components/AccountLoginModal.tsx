@@ -1,10 +1,7 @@
-import { useEffect, useState } from "react";
 import { C, MODAL_SHADOW, SCRIM } from "../theme/colors";
 import { FONT_UI, RADIUS } from "../theme/scale";
 import type { Account } from "../services/accountStore";
-import { buildClaudeLoginExec, SHELL } from "../services/claudeSpawn";
-import { checkClaude } from "../preflight";
-import { Terminal } from "./Terminal";
+import { ClaudeSignIn } from "./ClaudeSignIn";
 import { ModalLayer } from "./ModalLayer";
 
 // The integrator seam for AccountsScreen's `onLogin` (multi Claude Max design, Task 4). After
@@ -17,37 +14,14 @@ import { ModalLayer } from "./ModalLayer";
 // outside: the modal (mounted by TopBar) owns the PTY; AccountsScreen just hands back the Account.
 
 export function AccountLoginModal({ account, onClose }: { account: Account; onClose: () => void }) {
-  // Resolve the user's claude binary (same preflight AgentPane uses). null = still checking;
-  // false = not installed.
-  const [claudePath, setClaudePath] = useState<string | null | false>(null);
-
-  useEffect(() => {
-    let alive = true;
-    void checkClaude()
-      .then((c) => {
-        if (alive) setClaudePath(c.installed && c.path ? c.path : false);
-      })
-      .catch(() => {
-        if (alive) setClaudePath(false);
-      });
-    return () => {
-      alive = false;
-    };
-  }, []);
-
-  // `claude login` directly, under this account's CLAUDE_CONFIG_DIR — the same builder the
-  // first-run SetupChecklist uses. This used to spawn a general interactive `claude` instead, which
-  // dropped the user at a REPL and left them to discover `/login` on their own; for the
-  // re-login case ("this account is signed into the wrong Claude account") that extra step is the
-  // whole task, so the modal now goes straight there.
-  const spawn =
-    typeof claudePath === "string"
-      ? {
-          command: SHELL,
-          args: ["-l", "-c", buildClaudeLoginExec(claudePath, { configDir: account.configDir })],
-          cwd: account.configDir,
-        }
-      : null;
+  // The sign-in flow itself — binary resolution, the `claude auth login` PTY, and confirming the
+  // credential actually landed — lives in ClaudeSignIn, shared with the first-run auth gate.
+  //
+  // It used to be duplicated here, and the duplicate carried the same bug: both copies built
+  // `claude login`, which is not a subcommand, so the PTY opened a REPL and OAuth never ran. One
+  // implementation is the fix for that class of drift, not just for the instance.
+  //
+  // `configDir` targets this account's own credentials rather than the machine-wide login.
 
   // `zIndex: 120` only outranks anything if this competes at ROOT, and it is mounted from
   // Concierge/KebabMenu — inside the concierge column's `CONCIERGE_LIFT_Z` stacking context, which
@@ -122,26 +96,11 @@ export function AccountLoginModal({ account, onClose }: { account: Account; onCl
               ? "This is your system-wide Claude login (~/.claude). Signing in as someone else here changes the account Claude Code uses everywhere, not just in Sparkle."
               : "Credentials are stored in this account’s own config folder, separate from your other accounts."}
           </p>
-          <div style={{ flex: 1, minHeight: 0, border: `1px solid ${C.hairline}`, borderRadius: RADIUS.input, overflow: "hidden", padding: 6 }}>
-            {spawn ? (
-              <Terminal
-                agentId={`account-login-${account.id}`}
-                projectId="account-login"
-                projectRootPath={account.configDir}
-                command={spawn.command}
-                args={spawn.args}
-                cwd={spawn.cwd}
-                active
-                onStatus={() => {}}
-                onExit={onClose}
-              />
-            ) : (
-              <div style={{ padding: 20, color: C.muted, fontSize: 13 }}>
-                {claudePath === false
-                  ? "Couldn’t find your claude binary. Install Claude Code, then try again."
-                  : "Preparing login…"}
-              </div>
-            )}
+          <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+            {/* Closes on a CONFIRMED sign-in rather than on the PTY exiting. The old wiring closed
+                on exit, which dismissed the modal while the user was still on the OAuth page in
+                their browser — and reported nothing when the login had in fact failed. */}
+            <ClaudeSignIn configDir={account.configDir} onSignedIn={onClose} />
           </div>
         </div>
       </div>

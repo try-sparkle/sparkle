@@ -21,6 +21,7 @@
 import { memo } from "react";
 import { FiAlertCircle, FiBell } from "react-icons/fi";
 import { C, CHAT_USER_BUBBLE } from "../../theme/colors";
+import { RADIUS } from "../../theme/scale";
 import { Markdown } from "../Markdown";
 import { bandColor } from "../../engine/statusBandLabels";
 import { CopyAnswerButton } from "./CopyAnswerButton";
@@ -37,6 +38,7 @@ import { MentionPill } from "./MentionPill";
 // case-insensitive filesystem two modules differing only in case are the same path to the resolver
 // (tsc rejects the program outright). The suffix keeps the pair distinguishable everywhere.
 import { AnsweredMarker, ReplyAnchorStubs } from "./ReplyAnchorViews";
+import { reportClaudeAuthFailed } from "../../services/claudeAuthSignal";
 import type {
   ConciergeDigestMessage,
   ConciergeMessage,
@@ -46,6 +48,22 @@ import type {
 
 export const FAILURE_BUBBLE_TESTID = "concierge-failure";
 export const FAILURE_EVIDENCE_TESTID = "concierge-failure-evidence";
+/** The in-place re-authentication affordance on an auth-kind failure bubble. */
+export const FAILURE_REAUTH_TESTID = "concierge-failure-reauth";
+/** Small, low-emphasis affordance: this sits inside an error bubble in a narrow column, so it must
+ *  read as a remedy attached to the message rather than compete with the concierge's own controls. */
+const reauthButton: React.CSSProperties = {
+  marginTop: 8,
+  background: "transparent",
+  color: C.cream,
+  border: `1px solid ${C.sienna}`,
+  borderRadius: RADIUS.input,
+  padding: "4px 10px",
+  fontSize: 12,
+  fontWeight: 500,
+  cursor: "pointer",
+};
+
 /** A collapsed payload the reader chose to see as regular text, expanded IN PLACE in its bubble. */
 export const COLLAPSED_TEXT_TESTID = "concierge-collapsed-text";
 
@@ -428,6 +446,21 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
               >
                 {m.evidence}
               </p>
+            )}
+            {/* THE REMEDY, AS A CONTROL RATHER THAN A SENTENCE. An expired session cannot be fixed
+                by retrying, so the failure has to carry a way out or the user is stuck exactly where
+                the founder was: re-sending a request that can never succeed. Publishing to the
+                auth signal (rather than opening a modal here) lets ReadinessGate re-probe and raise
+                its own blocking sign-in surface — one sign-in surface, one live probe deciding. */}
+            {m.canReauth && (
+              <button
+                type="button"
+                data-testid={FAILURE_REAUTH_TESTID}
+                onClick={reportClaudeAuthFailed}
+                style={reauthButton}
+              >
+                Sign in to Claude
+              </button>
             )}
           </div>
         </div>
