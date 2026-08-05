@@ -44,6 +44,7 @@ import { resolveOpenTarget } from "../services/openTarget";
 import { openProjectTab } from "../services/openProjectTab";
 import { closeProjectTab, closedProjects } from "../services/projectTabs";
 import { isProjectOpen, openProjectsOf } from "../engine/openProjects";
+import { useProjectStaleness, useStalenessTargets } from "../hooks/useProjectStaleness";
 import { projectsOnSide, resolveSideSelection, sideOf } from "../engine/pairs";
 import type { ConciergeFeed } from "../services/conciergeFeed";
 import { tearOffTopLeft } from "./tabDrag";
@@ -155,6 +156,10 @@ export function ProjectTabsBar({
     () => projectsOnSide(openProjectsOf(projects, openProjectIds), pairAssignment, side),
     [projects, openProjectIds, pairAssignment, side],
   );
+  // How far each open project's OWN checkout lags the branch it tracks. Only STALE projects come
+  // back, so the badge can never render a reassuring "0 behind" over a tree that could not be
+  // measured (bead sparkle-cuv2h).
+  const stalenessByProject = useProjectStaleness(useStalenessTargets(openProjects));
   // This strip's selection, validated against what this side actually holds — so a project that
   // moved to the other pair stops reading as selected here rather than leaving both strips lit.
   const selectedProjectId = resolveSideSelection(
@@ -316,6 +321,7 @@ export function ProjectTabsBar({
         selectedProjectId={selectedProjectId}
         pinnedProjectId={pinnedProjectId}
         countsByProject={countsFromFeed(feed)}
+        stalenessByProject={stalenessByProject}
         tornOutProjectIds={tornOut}
         onReorder={reorderProject}
         onTearOff={(id, at) => void handleTearOff(id, at)}

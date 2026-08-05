@@ -79,6 +79,7 @@ mod promotion;
 mod project_window;
 mod pty;
 mod redacting_writer;
+mod repo_freshness;
 mod retention;
 mod review_cmd;
 mod roborev_probe;
@@ -658,6 +659,8 @@ pub fn run() {
             worktree::project_default_branch,
             worktree::reconcile_default_branch,
             worktree::agent_branch_status,
+            repo_freshness::repo_root_staleness,
+            repo_freshness::repo_fresh_read,
             worktree::diff_files,
             worktree::diff_file_text,
             worktree::diff_commits,

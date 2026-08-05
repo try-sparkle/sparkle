@@ -18,11 +18,11 @@ import {
   useState,
 } from "react";
 import { MdOutlinePushPin } from "react-icons/md";
-import { FiPlus, FiX, FiExternalLink } from "react-icons/fi";
+import { FiPlus, FiX, FiExternalLink, FiAlertTriangle } from "react-icons/fi";
 import type { StatusBand } from "../engine/buildSections";
 import { bandColor, bandCountLabel } from "../engine/statusBandLabels";
 import { BandBadge } from "./BandBadge";
-import { C } from "../theme/colors";
+import { C, FONT_WEIGHT } from "../theme/colors";
 import { PROJECT_TAB_HINT } from "../keyboardHints/hintTargets";
 import { resolveTabDrag, type TabDragResult, type TabRect } from "./tabDrag";
 
@@ -64,6 +64,21 @@ export interface ProjectTabsProps {
   /** Projects currently living in their own window. Their tab stays in the strip — it is how you
    *  get back to that window — but it is dimmed and badged, because its columns are elsewhere. */
   tornOutProjectIds?: ReadonlySet<string>;
+  /** How far each project's OWN checkout lags the branch it tracks, keyed by project id.
+   *
+   *  ONLY STALE PROJECTS BELONG IN HERE. Omission means "nothing to say" — a fresh checkout and a
+   *  checkout we could not measure are both simply absent, which is what makes the fail-closed
+   *  reading from `repo_freshness` survive the trip to the UI: `unknown` can never arrive as a
+   *  confident "0 behind" and paint a reassuring badge over a tree nobody has verified. */
+  stalenessByProject?: Record<string, ProjectTabStaleness>;
+}
+
+/** A project checkout that has fallen behind the branch it tracks. See `stalenessByProject`. */
+export interface ProjectTabStaleness {
+  /** Commits the checkout is BEHIND `base`. */
+  behind: number;
+  /** What it is behind, e.g. `origin/main` — named on screen so the number means something. */
+  base: string;
 }
 
 /** Movement below this is still a click, so a tab with a slightly shaky press still just selects. */
@@ -196,6 +211,68 @@ function TabCountBadge({ projectId, count }: { projectId: string; count: number 
   );
 }
 
+/** The staleness badge's wording, exported so the test pins the SENTENCE rather than a substring —
+ *  the number alone ("1696") is meaningless without what it is behind and what to do about it. */
+export function staleTitle(projectName: string, s: ProjectTabStaleness): string {
+  const n = s.behind.toLocaleString();
+  return `${projectName} is ${n} commits behind ${s.base} — this checkout is STALE. Reading files from it returns old code; read from ${s.base} instead.`;
+}
+
+/**
+ * ⚠ N — this project's own checkout has fallen behind the branch it tracks.
+ *
+ * WHY IT EXISTS (bead sparkle-cuv2h). The checkout at a canonical-looking path is the one most
+ * likely to be read and the least likely to be pulled: the founder's sat 1,694 commits behind on a
+ * six-day-old `main` while every agent worktree was current, and answers drawn from it were
+ * reported as current code. Agent branches had carried an ahead/behind badge for a long time; the
+ * project root — the tree a human actually opens — had nothing.
+ *
+ * IT SHOWS ON THE ACTIVE TAB TOO, unlike `TabCountBadge` next to it. That badge is an ALARM about
+ * a tab you are not looking at, so it hides once you are. This is a PROPERTY of the checkout, and
+ * the moment it matters most is while you are working in it — hiding it on focus would hide it
+ * exactly when it is doing its job.
+ *
+ * AND IT KEEPS ITS TOOLTIP, also unlike that badge. There the `title` was dropped so a hover would
+ * not put back the words the badge deliberately dropped. Here the words ARE the feature: "1,696"
+ * alone tells you nothing, and the tab's own title cannot say what to do instead. `staleTitle`
+ * carries the whole sentence to both the tooltip and the accessible name.
+ */
+function TabStaleBadge({
+  projectId,
+  projectName,
+  staleness,
+}: {
+  projectId: string;
+  projectName: string;
+  staleness: ProjectTabStaleness;
+}) {
+  const label = staleTitle(projectName, staleness);
+  return (
+    <span
+      data-testid={`stale-${projectId}`}
+      data-behind={staleness.behind}
+      role="img"
+      aria-label={label}
+      title={label}
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 3,
+        flex: "none",
+        // `dangerInk`, not the brand red: this is TEXT on `barSurface`, where the raw red misses AA
+        // in both themes. Same rule (and same reason) as TabCountBadge's ink.
+        color: C.dangerInk,
+        fontWeight: FONT_WEIGHT.semibold,
+        fontVariantNumeric: "tabular-nums",
+      }}
+    >
+      {/* An icon from react-icons, never an emoji — this repo renders every icon that way. */}
+      <FiAlertTriangle size={11} />
+      {staleness.behind.toLocaleString()}
+    </span>
+  );
+}
+
 /** How wide a tab's project name may get before it ellipsizes. Sized so a typical repo folder name
  *  fits whole and only genuinely long ones truncate — the point is a bar of UNIFORM-height tabs, not
  *  aggressive shortening. */
@@ -280,6 +357,7 @@ export function ProjectTabs({
   onReorder,
   onTearOff,
   tornOutProjectIds,
+  stalenessByProject,
 }: ProjectTabsProps) {
   useEffect(ensureTabStyles, []);
 
@@ -408,6 +486,9 @@ export function ProjectTabs({
         // you are on too, while the number is the count the chips below already render.
         const glow = band ? `0 0 0 1px ${RED}73, 0 -2px 14px ${RED}29` : undefined;
         const badgeCount = tabBadgeCount(counts, active);
+        // Bound once here rather than indexed twice at the render site: under
+        // `noUncheckedIndexedAccess` the second lookup is independently `| undefined`.
+        const staleness = stalenessByProject?.[p.id];
         const tornOut = tornOutProjectIds?.has(p.id) ?? false;
         const isDragged = drag?.projectId === p.id;
         const caret = drag?.kind === "reorder" && drag.beforeId === p.id;
@@ -537,6 +618,11 @@ export function ProjectTabs({
                 aria-label="Open in its own window"
                 style={{ flex: "none", opacity: 0.9 }}
               />
+            )}
+            {/* ⚠ N — on EVERY tab, including the active one: a stale checkout matters most while
+                you are working in it. Absent unless this project is actually stale. */}
+            {staleness && (
+              <TabStaleBadge projectId={p.id} projectName={p.name} staleness={staleness} />
             )}
             {/* ● N, and ONLY on a tab you are not looking at. See `tabBadgeCount`. */}
             {badgeCount !== null && <TabCountBadge projectId={p.id} count={badgeCount} />}
