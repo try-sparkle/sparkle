@@ -242,7 +242,8 @@ pub struct ToolsConfig {
 /// EVERY KEY IS OPTIONAL, and an absent key is the normal case rather than a gap. The frontend
 /// policy layer (services/conciergeTools/policy.ts) derives a default for each tool from the risk
 /// its tool domain already classifies it with — read-only/routine → allow, everything irreversible,
-/// outward-facing, metered, disruptive or main-touching → ask. So this table holds only the rules
+/// outward-facing, metered, disruptive, main-touching, branch-rewriting, or privacy-sensitive (a
+/// screen capture, gated for what it can SEE rather than any change it makes) → ask. So this table holds only the rules
 /// the human actually changed, and a missing key resolves through a total function rather than
 /// falling into a hole.
 ///
@@ -3493,8 +3494,9 @@ composer        = true   # use the AI-enhanced composer; off = a plain terminal 
 # EVERY KEY IS OPTIONAL, and leaving this section out entirely is the normal case. A tool with no
 # line here uses a default DERIVED from how risky it is: read-only and local/reversible work is
 # allowed silently, and anything irreversible, outward-facing (a push, a PR), metered, disruptive,
-# or that touches your main branch asks first. Nothing defaults to "deny" — turning a tool off
-# completely is always your explicit choice, never something Sparkle infers.
+# that rewrites a branch's history, that reads your screen, or that touches your main branch asks
+# first. Nothing defaults to "deny" —
+# turning a tool off completely is always your explicit choice, never something Sparkle infers.
 #
 # Edit here or in ⋯ Settings → "Concierge tools", which lists every tool with its risk and its
 # default. Ignored in a project file: how autonomous the concierge is over YOUR machine is not
