@@ -38,11 +38,15 @@ import type { InboxEntry, InboxView } from "../services/conciergeTools/fleet";
 /**
  * Poll cadence.
  *
- * TEN SECONDS, matching `fleetWatch.FLEET_POLL_INTERVAL_MS`, and for the same reason: a tick is a
- * bounded pair of file reads per watched agent — no agent turn, no network, no LLM. It also has to be
- * fast relative to what it is watching for, and what it is watching for is a message the concierge
- * queued SECONDS ago while telling the founder it had done so. A badge that took a minute to appear
- * would leave the exact window of doubt this closes.
+ * TEN SECONDS. This used to say "matching `fleetWatch.FLEET_POLL_INTERVAL_MS`"; that watch has since
+ * moved to thirty seconds because its per-agent cost turned out to be five `git` subprocess spawns,
+ * and the two cadences are now deliberately DIFFERENT rather than accidentally equal.
+ *
+ * Ten stays right here, for the reason the fleet watch could afford to give up: a tick is a bounded
+ * pair of file reads per watched agent — no subprocess, no agent turn, no network, no LLM. It also
+ * has to be fast relative to what it is watching for, and what it is watching for is a message the
+ * concierge queued SECONDS ago while telling the founder it had done so. A badge that took a minute
+ * to appear would leave the exact window of doubt this closes.
  *
  * A NEW registration does not wait for the next tick — see {@link watch}.
  */

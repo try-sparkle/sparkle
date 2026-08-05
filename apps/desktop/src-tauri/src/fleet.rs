@@ -19,7 +19,11 @@
 //! WHY MESSAGING AGENTS IS NOT AN OPTION. Asking an agent whether it is alive costs a full turn: it
 //! loads context, reads, responds — and can END the turn it was in the middle of. Across 40 agents
 //! on a 10-minute ping that is ~240 turns an hour spent purely to learn who is alive. Reading these
-//! artifacts costs nothing and can run every ten seconds. So: liveness and progress come from here,
+//! artifacts costs no agent TURN. That is the sense in which it is "free", and the only sense —
+//! measured, a pass costs ~0.27s per agent (five `git` spawns plus a bounded walk), so at 30 agents
+//! it was ~8s of work against what used to be a ten-second poll. It runs every THIRTY seconds now,
+//! and an agent whose worktree, HEAD, index and base ref have not moved is served from a memo
+//! without spawning git at all. So: liveness and progress come from here,
 //! and an agent's turn is spent only when the concierge has something that agent NEEDS.
 //!
 //! FACTS, NOT VERDICTS. This module deliberately stops at observations. The verdict vocabulary
@@ -35,8 +39,9 @@
 //! rather than reporting the newest write it happened to reach as if it were the newest write. A
 //! truncated read is a window, not a result.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -321,31 +326,61 @@ pub fn parse_hook_tail(bytes: &[u8], truncated: bool, now_ms: i64, window_ms: i6
     facts
 }
 
-/// Newest mtime of any file under `root`, skipping `WALK_SKIP_DIRS`. Returns
-/// `(newest_ms, truncated)`; `truncated` means the budget ran out, so the value is a lower bound.
+/// Everything ONE walk of a worktree yields: the reported newest-write value, plus the extra
+/// signals that let [`git_fingerprint`] decide whether git could possibly have anything new to say.
+///
+/// `newest_file_ms` is the only field with a consumer outside this module — it is what
+/// [`newest_write_ms`] returns and what "did the agent write anything" means. The other three exist
+/// solely to make the memo SOUND, and each covers a mutation `newest_file_ms` alone cannot see:
+///
+///   * `newest_dir_ms` — a DELETION. Removing a file bumps its parent directory's mtime but leaves
+///     no file behind to observe, so a delete-only change is completely invisible to a files-only
+///     scan while it plainly changes `git status`. Without this the memo would serve a stale dirty
+///     count for as long as the agent deleted-and-did-nothing-else.
+///   * `entries` — an add/remove pair inside one budget window that happens to leave both mtimes
+///     unchanged (same-second churn on a coarse filesystem clock).
+///   * `truncated` — a walk that gave up saw a DIFFERENT amount of the tree than one that did not,
+///     so its other three numbers are not comparable to theirs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WalkStats {
+    newest_file_ms: Option<i64>,
+    newest_dir_ms: Option<i64>,
+    entries: u32,
+    truncated: bool,
+}
+
+/// Walk `root` once, skipping `WALK_SKIP_DIRS`, collecting every signal in [`WalkStats`].
 ///
 /// Iterative rather than recursive so a pathological tree cannot blow the stack, and budgeted so a
 /// worktree with an un-skipped dependency tree cannot make the digest unbounded.
-pub fn newest_write_ms(root: &Path) -> (Option<i64>, bool) {
-    let mut newest: Option<i64> = None;
-    let mut seen: u32 = 0;
-    let mut truncated = false;
+fn walk_stats(root: &Path) -> WalkStats {
+    let mut out =
+        WalkStats { newest_file_ms: None, newest_dir_ms: None, entries: 0, truncated: false };
     let mut stack: Vec<(PathBuf, u32)> = vec![(root.to_path_buf(), 0)];
 
     while let Some((dir, depth)) = stack.pop() {
         if depth > WALK_MAX_DEPTH {
-            truncated = true;
+            out.truncated = true;
             continue;
+        }
+        // Stat the directory we are ABOUT TO READ, rather than each subdirectory as we encounter it
+        // as an entry. Same number of stats, but it includes `root` itself — and the root is where
+        // agents overwhelmingly add, delete and rename files. Sampling only the subdirectories left
+        // the top level of every worktree with no delete-detector at all, which is exactly the hole
+        // `memo_recomputes_after_a_RENAME` exists to hold shut.
+        if let Some(ms) = std::fs::metadata(&dir).ok().and_then(|m| m.modified().ok()).and_then(ms_of)
+        {
+            out.newest_dir_ms = Some(out.newest_dir_ms.map_or(ms, |n: i64| n.max(ms)));
         }
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
         for entry in entries.flatten() {
-            if seen >= WALK_MAX_ENTRIES {
-                truncated = true;
-                return (newest, truncated);
+            if out.entries >= WALK_MAX_ENTRIES {
+                out.truncated = true;
+                return out;
             }
-            seen += 1;
+            out.entries += 1;
             let name = entry.file_name();
             let name = name.to_string_lossy();
             let Ok(ft) = entry.file_type() else { continue };
@@ -362,11 +397,22 @@ pub fn newest_write_ms(root: &Path) -> (Option<i64>, bool) {
                 continue;
             }
             if let Some(ms) = entry.metadata().ok().and_then(|m| m.modified().ok()).and_then(ms_of) {
-                newest = Some(newest.map_or(ms, |n: i64| n.max(ms)));
+                out.newest_file_ms = Some(out.newest_file_ms.map_or(ms, |n: i64| n.max(ms)));
             }
         }
     }
-    (newest, truncated)
+    out
+}
+
+/// Newest mtime of any file under `root`, skipping `WALK_SKIP_DIRS`. Returns
+/// `(newest_ms, truncated)`; `truncated` means the budget ran out, so the value is a lower bound.
+///
+/// Files only — a directory's own mtime is deliberately NOT folded in here, because this value is
+/// reported as "the newest thing the agent wrote" and a directory whose child was deleted did not
+/// have anything written to it. [`walk_stats`] keeps that signal separately for the memo.
+pub fn newest_write_ms(root: &Path) -> (Option<i64>, bool) {
+    let s = walk_stats(root);
+    (s.newest_file_ms, s.truncated)
 }
 
 /// Group `changed_files` across agents into the paths more than one agent is touching.
@@ -536,6 +582,180 @@ pub fn git_facts(worktree: &str, base: &str) -> GitFacts {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The git-facts memo
+//
+// WHY. [`git_facts`] is five `git` subprocess spawns per agent, and the digest runs over every open
+// agent on a timer. Measured on a real worktree: 0.15 s for the five spawns and 0.12 s for the
+// walk, so at 30 agents a pass was ~8.1 s of SEQUENTIAL work against a 10 s interval — an ~80 %
+// duty cycle that stopped fitting its own interval at ~37 agents. A profile of the running app
+// attributed 30.5 % of all CPU the process burned to this one command, and that figure UNDERSTATES
+// it: most of the 8 s is spent waiting on git children whose own CPU (~0.39 cores continuously) the
+// sampler never sees, because it profiles only this process.
+//
+// The observation that makes a memo possible: an agent that has not written, committed, staged, or
+// had its base ref move CANNOT have different git facts than it had a moment ago. Most agents, most
+// of the time, are in exactly that state. So the walk still runs every pass — it is the cheaper
+// half and it is the freshness signal — and its result decides whether the expensive half runs at
+// all.
+//
+// SOUNDNESS IS THE WHOLE POINT: this memo must never serve a fact that has changed. Every input
+// `git_facts` reads is covered by the fingerprint below, and anything it cannot observe makes the
+// fingerprint `None`, which disables memoization rather than guessing.
+// ---------------------------------------------------------------------------------------------
+
+/// Everything [`git_facts`] reads, reduced to values a stat can compare.
+///
+/// Each field exists because some git fact depends on it, and dropping any one of them would let a
+/// real change go unnoticed:
+///   * `walk` — the worktree's own content, which is what `dirty_files` counts (see [`WalkStats`]
+///     for why three numbers rather than one).
+///   * `head_ms` — a CHECKOUT rewrites the `HEAD` file, and on a detached HEAD (which holds a raw
+///     sha rather than a pointer) every move rewrites it too.
+///   * `head_ref_ms` — the ref `HEAD` POINTS AT, and this is the one that is easy to miss. On an
+///     attached branch `HEAD` is symbolic — the literal bytes `ref: refs/heads/<branch>` — so moving
+///     that branch does not touch it at all. `git commit` happens to bump `index` as a side effect,
+///     which masks the gap; `git reset --soft` and `git commit --amend --no-edit` explicitly do NOT
+///     touch the index or the tree. Without this field such a move left `ahead`, `last_commit_ms`
+///     and `changed_files` cached at their pre-move values indefinitely, because nothing the
+///     fingerprint watched had changed.
+///   * `index_ms` — staging changes `git status` without touching a file's mtime.
+///   * `remote_ref_ms` / `local_ref_ms` / `packed_refs_ms` — `ahead` and `changed_files` are measured
+///     AGAINST `base`, so a `git fetch` that advances `origin/main` changes them for an agent that
+///     did nothing at all. This is the input a fingerprint keyed only on the worktree would miss.
+///
+///     BOTH ref namespaces are stat'd, and that is not belt-and-braces. `base` defaults to
+///     `origin/main` but is caller-supplied, and a LOCAL branch base (`main`, `develop`) lives at
+///     `refs/heads/<base>` — nothing under `refs/remotes/` tracks it. Watching only the remote
+///     namespace meant a local base found no loose ref, fell back to `packed-refs` alone (which
+///     almost always exists, so the fingerprint was still built), and then never noticed that base
+///     moving. The memo would serve a stale `ahead` for as long as the agent itself sat still.
+///   * `base` — the caller may pass a different base branch between passes; the previous answer was
+///     to a different question.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitFingerprint {
+    walk: WalkStats,
+    head_ms: Option<i64>,
+    head_ref_ms: Option<i64>,
+    index_ms: Option<i64>,
+    remote_ref_ms: Option<i64>,
+    local_ref_ms: Option<i64>,
+    packed_refs_ms: Option<i64>,
+    base: String,
+}
+
+/// Is `name` a plain ref path — no traversal, no absolute path, no empty segments?
+///
+/// Shared by the base mapping and the symbolic-HEAD resolution below, both of which join
+/// caller-or-file-supplied text onto a gitdir. `git check-ref-format` forbids far more than this;
+/// this is the subset that keeps those joins safe.
+fn is_plain_ref_path(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('/')
+        && !name.split('/').any(|c| c.is_empty() || c == "." || c == "..")
+}
+
+/// The path of the ref that a symbolic `HEAD` points at, e.g. `<common>/refs/heads/topic`.
+///
+/// `None` when `HEAD` is unreadable or DETACHED — a detached `HEAD` stores the sha inline, so
+/// `head_ms` already moves whenever it does and there is no separate ref file to watch.
+fn head_ref_path(own_dir: &Path, common_dir: &Path) -> Option<PathBuf> {
+    let contents = std::fs::read_to_string(own_dir.join("HEAD")).ok()?;
+    let target = contents.trim().strip_prefix("ref:")?.trim();
+    is_plain_ref_path(target).then(|| common_dir.join(target))
+}
+
+/// Build the fingerprint, or `None` when this worktree's git state cannot be observed cheaply
+/// enough to be trusted — in which case the caller MUST recompute rather than memoize.
+///
+/// Returns `None` in exactly two cases, both fail-open:
+///   * `base` is not a plain `<remote>/<branch>`-shaped ref name. A base carrying `..`, an absolute
+///     path, or empty components cannot be mapped to a ref file, and joining it would be a path
+///     traversal against the gitdir. We decline to fingerprint rather than stat an attacker-shaped
+///     path or, worse, memoize against a ref we never actually watched.
+///   * no loose ref in EITHER namespace and no `packed-refs`, so there is NO file whose mtime tracks
+///     the base. Without that we cannot tell a moved base from a still one.
+fn git_fingerprint(worktree: &Path, base: &str, walk: WalkStats) -> Option<GitFingerprint> {
+    if !is_plain_ref_path(base) {
+        return None;
+    }
+    let (own_dir, common_dir) = crate::worktree::git_dirs(worktree);
+    let refs = common_dir.join("refs");
+    // Both namespaces — a local-branch base lives under `heads`, a remote-tracking one under
+    // `remotes`, and watching only one of them silently stops tracking the other. See
+    // `GitFingerprint::remote_ref_ms`.
+    let remote_ref_ms = mtime_ms(&refs.join("remotes").join(base));
+    let local_ref_ms = mtime_ms(&refs.join("heads").join(base));
+    let packed_refs_ms = mtime_ms(&common_dir.join("packed-refs"));
+    if remote_ref_ms.is_none() && local_ref_ms.is_none() && packed_refs_ms.is_none() {
+        return None;
+    }
+    Some(GitFingerprint {
+        walk,
+        head_ms: mtime_ms(&own_dir.join("HEAD")),
+        // The branch HEAD points at — see `GitFingerprint::head_ref_ms`. `git reset --soft` and
+        // `git commit --amend` move this and touch nothing else the fingerprint watches.
+        head_ref_ms: head_ref_path(&own_dir, &common_dir).as_deref().and_then(mtime_ms),
+        index_ms: mtime_ms(&own_dir.join("index")),
+        remote_ref_ms,
+        local_ref_ms,
+        packed_refs_ms,
+        base: base.to_string(),
+    })
+}
+
+/// One memoized answer: the facts, the fingerprint they were computed under, and when the entry was
+/// last USED (a monotonic counter, not a clock — see [`evict_git_memo`]).
+#[derive(Debug, Clone)]
+struct CachedGit {
+    fingerprint: GitFingerprint,
+    facts: GitFacts,
+    last_touch: u64,
+}
+
+/// Working-set ceiling for the memo. One entry is a handful of strings and six integers, so this is
+/// generous next to the number of agents anyone has open; it exists to bound a long-lived process,
+/// not to ration.
+const GIT_MEMO_MAX: usize = 512;
+
+/// Monotonic use-counter, so "least recently used" is a comparison rather than a clock read.
+fn memo_tick() -> u64 {
+    static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Process-wide memo, keyed by worktree path. `OnceLock<Mutex<HashMap<…>>>` is the idiom already
+/// used for the process caches in `accounts.rs` and `notes.rs`.
+fn git_memo() -> &'static Mutex<HashMap<PathBuf, CachedGit>> {
+    static MEMO: OnceLock<Mutex<HashMap<PathBuf, CachedGit>>> = OnceLock::new();
+    MEMO.get_or_init(Default::default)
+}
+
+/// Evict least-recently-used entries until at most `max` remain. Pure (takes the map) so the policy
+/// unit-tests without touching the static.
+///
+/// WHY NOT PRUNE TO THE CALLER'S AGENT SET, which is what this did first and is the obvious move.
+/// `fleet_digest` has TWO callers with different populations: the fleet watch passes every open
+/// agent, but the concierge tool (`conciergeTools/fleet.ts`) passes whatever SUBSET it is asking
+/// about. Pruning to "the agents of the pass that just ran" therefore let one concierge question
+/// about two agents evict the other thirty — so the next fleet-watch pass paid full price for all of
+/// them, which is precisely the cost this memo exists to remove. A capacity bound has no opinion
+/// about who asked.
+///
+/// It is also deliberately NOT the `map.clear()`-on-overflow shape used elsewhere in this crate,
+/// which throws away the whole working set the moment one new key arrives.
+fn evict_git_memo(memo: &mut HashMap<PathBuf, CachedGit>, max: usize) {
+    if memo.len() <= max {
+        return;
+    }
+    let mut by_age: Vec<(u64, PathBuf)> =
+        memo.iter().map(|(k, c)| (c.last_touch, k.clone())).collect();
+    by_age.sort_unstable();
+    for (_, path) in by_age.into_iter().take(memo.len() - max) {
+        memo.remove(&path);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Assembly
 // ---------------------------------------------------------------------------------------------
 
@@ -560,6 +780,24 @@ pub fn agent_facts(
     now_ms: i64,
     window_ms: i64,
 ) -> FleetAgentFacts {
+    agent_facts_with(agent_id, worktree, hook_log, base, now_ms, window_ms, &git_facts)
+}
+
+/// [`agent_facts`] with the git reader injected.
+///
+/// The seam exists so a test can COUNT spawns. The memo's whole claim is "an unchanged agent costs
+/// zero git subprocesses", and the only assertion that actually proves that is one which observes
+/// the call count — asserting that a cache entry exists would pass just as happily against a
+/// version that re-ran git every time and then overwrote the entry.
+fn agent_facts_with(
+    agent_id: &str,
+    worktree: &Path,
+    hook_log: &Path,
+    base: &str,
+    now_ms: i64,
+    window_ms: i64,
+    git_fn: &(dyn Fn(&str, &str) -> GitFacts + Sync),
+) -> FleetAgentFacts {
     let worktree_exists = worktree.is_dir();
 
     let hook_mtime_ms = mtime_ms(hook_log);
@@ -573,9 +811,46 @@ pub fn agent_facts(
     // hook activity while saying nothing about git is the honest answer.
     let (git, newest_write_ms_val, walk_truncated, task, result_status) = if worktree_exists {
         let wt = worktree.to_string_lossy().to_string();
-        let (newest, truncated) = newest_write_ms(worktree);
+        // The walk runs EVERY pass. It is the cheaper half (~0.12 s vs ~0.15 s measured) and it is
+        // the freshness signal the memo is keyed on, so skipping it would be both a smaller win and
+        // an unsound one.
+        let walk = walk_stats(worktree);
         let (task, result_status) = worker_facts(worktree);
-        (git_facts(&wt, base), newest, truncated, task, result_status)
+
+        // A `None` fingerprint means "we could not observe enough to be sure" — recompute, and do
+        // not store. See `git_fingerprint` for the two cases.
+        let fingerprint = git_fingerprint(worktree, base, walk);
+        let cached = fingerprint.as_ref().and_then(|fp| {
+            let mut memo = git_memo().lock().ok()?;
+            let touch = memo_tick();
+            let hit = memo.get_mut(worktree)?;
+            // A hit is a USE: restamp it so a steadily-polled agent is never the one evicted.
+            (hit.fingerprint == *fp).then(|| {
+                hit.last_touch = touch;
+                hit.facts.clone()
+            })
+        });
+        let git = match cached {
+            Some(facts) => facts,
+            None => {
+                let facts = git_fn(&wt, base);
+                if let Some(fp) = fingerprint {
+                    if let Ok(mut memo) = git_memo().lock() {
+                        memo.insert(
+                            worktree.to_path_buf(),
+                            CachedGit {
+                                fingerprint: fp,
+                                facts: facts.clone(),
+                                last_touch: memo_tick(),
+                            },
+                        );
+                        evict_git_memo(&mut memo, GIT_MEMO_MAX);
+                    }
+                }
+                facts
+            }
+        };
+        (git, walk.newest_file_ms, walk.truncated, task, result_status)
     } else {
         (GitFacts::default(), None, false, None, None)
     };
@@ -607,13 +882,72 @@ pub fn build_digest(
     now_ms: i64,
     window_ms: i64,
 ) -> FleetDigest {
-    let facts: Vec<FleetAgentFacts> = agents
-        .iter()
-        .map(|(id, worktree)| {
-            let log = hook_events_dir.join(format!("{id}.jsonl"));
-            agent_facts(id, worktree, &log, base, now_ms, window_ms)
+    build_digest_with(agents, hook_events_dir, base, now_ms, window_ms, &git_facts)
+}
+
+/// How many agents this digest reads CONCURRENTLY.
+///
+/// The per-agent work is independent — separate worktrees, separate subprocesses — so it was only
+/// ever sequential by construction, not by necessity. A cold pass costs ~0.27 s per agent, so at the
+/// 100-agent target the serial version needed ~27 s to answer a question asked every 10 s; it could
+/// not keep up past ~37 agents.
+///
+/// 8 rather than "core count": the work is dominated by `git` subprocesses and `stat`s (I/O and
+/// child processes, not this process's CPU), and these threads run INSIDE a `spawn_blocking` slot on
+/// a runtime whose blocking pool is shared with every other command in the app. A fixed, modest
+/// width bounds the subprocess storm — 8 concurrent `git status` runs, not 100 — while still cutting
+/// the wall time by ~8×.
+const DIGEST_MAX_CONCURRENCY: usize = 8;
+
+/// [`build_digest`] with the git reader injected, and the fan-out that makes a 100-agent pass fit.
+///
+/// ORDER IS PRESERVED. `chunks()` hands out contiguous slices and the results are concatenated in
+/// chunk order, so the `agents` array is byte-identical to the sequential version's. That matters:
+/// `find_conflicts`/`unread_diffs` document that two runs over the same fleet produce identical
+/// output, and a digest whose row order shuffled every pass would make every diff look like a change.
+fn build_digest_with(
+    agents: &[(String, PathBuf)],
+    hook_events_dir: &Path,
+    base: &str,
+    now_ms: i64,
+    window_ms: i64,
+    git_fn: &(dyn Fn(&str, &str) -> GitFacts + Sync),
+) -> FleetDigest {
+    let one = |(id, worktree): &(String, PathBuf)| {
+        let log = hook_events_dir.join(format!("{id}.jsonl"));
+        agent_facts_with(id, worktree, &log, base, now_ms, window_ms, git_fn)
+    };
+
+    let facts: Vec<FleetAgentFacts> = if agents.len() <= 1 {
+        agents.iter().map(one).collect()
+    } else {
+        let workers = DIGEST_MAX_CONCURRENCY.min(agents.len());
+        let chunk_len = agents.len().div_ceil(workers);
+        // `scope` joins every thread before returning, so nothing outlives this call and the
+        // borrowed `agents`/`git_fn` need no `'static`.
+        std::thread::scope(|s| {
+            let handles: Vec<_> = agents
+                .chunks(chunk_len)
+                .map(|c| s.spawn(move || c.iter().map(one).collect::<Vec<_>>()))
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| match h.join() {
+                    Ok(rows) => rows,
+                    // `unwrap_or_default()` here would substitute an EMPTY vec for the panicking
+                    // chunk — silently deleting up to 1/8th of the fleet from the digest. Nothing
+                    // downstream could tell that apart from "those agents do not exist": the rows
+                    // are simply absent, so `find_conflicts` and `unread_diffs` under-report and the
+                    // fleet watch sees agents vanish. Every field in this module is an `Option`
+                    // precisely so absence is never faked; a dropped chunk fakes it wholesale.
+                    // Re-raise on the caller's thread, which is inside `spawn_blocking` and is where
+                    // a panic was always going to surface before this fan-out existed.
+                    Err(payload) => std::panic::resume_unwind(payload),
+                })
+                .collect()
         })
-        .collect();
+    };
+
     let conflicts = find_conflicts(&facts);
     let diffs_unread = unread_diffs(&facts);
     FleetDigest { generated_at_ms: now_ms, window_ms, agents: facts, conflicts, diffs_unread }
@@ -651,6 +985,17 @@ pub async fn fleet_digest(
 ) -> Result<FleetDigest, String> {
     let app_data = crate::dev_identity::app_data_dir(&app)?;
     let base = base_branch.unwrap_or_else(|| "origin/main".to_string());
+    // VALIDATE THE BASE BEFORE IT REACHES GIT. This command is exposed to the concierge as a
+    // read-only tool, and `base` flows straight into `git diff <base>...HEAD` and
+    // `git rev-list <base>..HEAD`. Git parses a leading `-` as an OPTION, so an unvalidated base is
+    // not merely a bad ref: `--output=/tmp/x` makes `git diff` CREATE OR OVERWRITE that file, which
+    // turns a nominally read-only tool into an arbitrary-write primitive outside the worktree.
+    // `worktree::validate_ref` is the existing, already-tested guard for exactly this vector
+    // (`validate_ref_blocks_option_injection_but_allows_slash_branches`), so this reuses it rather
+    // than growing a second, thinner copy. Checked HERE, before the `spawn_blocking` hop, so a
+    // crafted base never occupies a blocking-pool slot — the same reasoning the id validation below
+    // already uses.
+    crate::worktree::validate_ref(&base)?;
     let window = window_ms.unwrap_or(DEFAULT_WINDOW_MS);
 
     // Path validation stays on THIS thread: it is pure string work, and doing it before the hop
@@ -2133,6 +2478,483 @@ mod tests {
         std::fs::remove_file(dir.join(".sparkle").join("result.json")).unwrap();
         let (_, gone) = worker_facts(&dir);
         assert_eq!(gone, None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- the git-facts memo ----------------------------------------------------------------
+    //
+    // EVERY test here asserts the SIDE EFFECT — how many times the git reader was actually
+    // invoked. Asserting instead that a memo entry exists would pass just as happily against a
+    // version that re-ran all five subprocesses every pass and then overwrote the entry, which is
+    // precisely the regression the memo exists to prevent (AGENTS.md: an assertion that would pass
+    // against the pre-change code proves nothing).
+
+    /// A worktree shaped like a REAL linked worktree: `.git` is a gitlink FILE pointing at
+    /// `<common>/worktrees/<name>`, and the ref files the fingerprint stats all exist. Each test
+    /// passes a distinct `tag` so the process-wide memo (keyed by worktree path) cannot leak
+    /// between tests running concurrently in the same process.
+    fn memo_fixture(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("sparkle-fleet-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let wt = root.join("wt");
+        let common = root.join("repo").join(".git");
+        let own = common.join("worktrees").join("a1");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::create_dir_all(common.join("refs").join("remotes").join("origin")).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", own.display())).unwrap();
+        std::fs::write(common.join("refs").join("remotes").join("origin").join("main"), "sha\n")
+            .unwrap();
+        std::fs::write(common.join("packed-refs"), "# pack-refs\n").unwrap();
+        std::fs::write(own.join("HEAD"), "ref: refs/heads/topic\n").unwrap();
+        std::fs::write(own.join("index"), "idx").unwrap();
+        std::fs::write(wt.join("a.txt"), "hello").unwrap();
+        (wt, common, own)
+    }
+
+    /// A git reader that records how many times it ran instead of spawning anything.
+    fn counting_git(
+    ) -> (std::sync::Arc<std::sync::atomic::AtomicUsize>, impl Fn(&str, &str) -> GitFacts + Sync)
+    {
+        let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = n.clone();
+        (n, move |_wt: &str, _base: &str| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            GitFacts { ahead: Some(7), ..GitFacts::default() }
+        })
+    }
+
+    fn memo_pass(
+        wt: &Path,
+        base: &str,
+        git_fn: &(dyn Fn(&str, &str) -> GitFacts + Sync),
+    ) -> FleetAgentFacts {
+        agent_facts_with("a1", wt, &wt.join("absent.jsonl"), base, 1_000_000, 10_000, git_fn)
+    }
+
+    /// mtimes are compared at millisecond resolution, so a mutation in the same millisecond as the
+    /// value it must differ from is not observable. Tests that mutate sleep past that boundary.
+    fn tick() {
+        std::thread::sleep(std::time::Duration::from_millis(12));
+    }
+
+    #[test]
+    fn memo_serves_an_unchanged_agent_without_running_git_again() {
+        let (wt, _c, _o) = memo_fixture("memo-hit");
+        let (calls, git) = counting_git();
+
+        let first = memo_pass(&wt, "origin/main", &git);
+        let second = memo_pass(&wt, "origin/main", &git);
+
+        // THE point of the change: the second pass spawned nothing.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // And it still reported the same facts — a memo that skipped the work but lost the answer
+        // would be a different bug.
+        assert_eq!(first.git.ahead, Some(7));
+        assert_eq!(second.git, first.git);
+        std::fs::remove_dir_all(wt.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn memo_recomputes_after_a_file_is_written() {
+        let (wt, _c, _o) = memo_fixture("memo-write");
+        let (calls, git) = counting_git();
+        memo_pass(&wt, "origin/main", &git);
+        tick();
+        std::fs::write(wt.join("b.txt"), "new work").unwrap();
+        memo_pass(&wt, "origin/main", &git);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        std::fs::remove_dir_all(wt.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn memo_recomputes_after_a_file_is_DELETED() {
+        // The case a files-only walk cannot see: a delete leaves no file behind to observe, but it
+        // plainly changes `git status`. Without the directory-mtime signal this pass would be
+        // served from cache and report a stale dirty count.
+        let (wt, _c, _o) = memo_fixture("memo-delete");
+        std::fs::write(wt.join("doomed.txt"), "bye").unwrap();
+        let (calls, git) = counting_git();
+        memo_pass(&wt, "origin/main", &git);
+        tick();
+        std::fs::remove_file(wt.join("doomed.txt")).unwrap();
+        memo_pass(&wt, "origin/main", &git);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        std::fs::remove_dir_all(wt.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn memo_recomputes_after_a_RENAME() {
+        // The case that isolates the directory-mtime signal, and the reason it exists rather than
+        // relying on the entry count. A rename preserves the file's mtime AND the number of
+        // entries, so `newest_file_ms` and `entries` are both byte-identical across it — yet
+        // `git status` now reports a delete plus an add. The parent directory's mtime is the ONLY
+        // thing that moves, so if this passes with that signal removed, the signal is dead code.
+        let (wt, _c, _o) = memo_fixture("memo-rename");
+        std::fs::write(wt.join("before.txt"), "same bytes").unwrap();
+        let (calls, git) = counting_git();
+        let first = walk_stats(&wt);
+        memo_pass(&wt, "origin/main", &git);
+        tick();
+        std::fs::rename(wt.join("before.txt"), wt.join("after.txt")).unwrap();
+        let second = walk_stats(&wt);
+
+        // Prove the premise before leaning on it: the two cheap signals really are unchanged.
+        assert_eq!(second.newest_file_ms, first.newest_file_ms, "rename must preserve file mtime");
+        assert_eq!(second.entries, first.entries, "rename must preserve the entry count");
+
+        memo_pass(&wt, "origin/main", &git);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        std::fs::remove_dir_all(wt.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn walk_stats_tracks_directory_mtime_so_a_delete_is_visible() {
+        // The mechanism behind the test above, asserted directly: the directory's own mtime moves
+        // when a child is removed, even though no file's mtime did.
+        let dir = std::env::temp_dir().join(format!("sparkle-fleet-dirmt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("keep.txt"), "k").unwrap();
+        std::fs::write(sub.join("gone.txt"), "g").unwrap();
+        let before = walk_stats(&dir);
+        assert!(before.newest_dir_ms.is_some(), "a directory mtime must be observed at all");
+        tick();
+        std::fs::remove_file(sub.join("gone.txt")).unwrap();
+        let after = walk_stats(&dir);
+        assert!(
+            after.newest_dir_ms > before.newest_dir_ms,
+            "removing a child must advance the directory mtime: {:?} -> {:?}",
+            before.newest_dir_ms,
+            after.newest_dir_ms
+        );
+        assert_eq!(after.entries, before.entries - 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn memo_recomputes_when_the_base_ref_moves() {
+        // A fetch that advances origin/main changes `ahead` and `changed_files` for an agent that
+        // did nothing at all. This is the input a worktree-only fingerprint would miss.
+        let (wt, common, _o) = memo_fixture("memo-base");
+        let (calls, git) = counting_git();
+        memo_pass(&wt, "origin/main", &git);
+        tick();
+        std::fs::write(common.join("refs").join("remotes").join("origin").join("main"), "sha2\n")
+            .unwrap();
+        memo_pass(&wt, "origin/main", &git);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        std::fs::remove_dir_all(wt.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn memo_recomputes_when_head_or_index_moves() {
+        let (wt, _c, own) = memo_fixture("memo-head");
+        let (calls, git) = counting_git();
+        memo_pass(&wt, "origin/main", &git);
+        tick();
+        std::fs::write(own.join("HEAD"), "ref: refs/heads/other\n").unwrap();
+        memo_pass(&wt, "origin/main", &git);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2, "HEAD move must recompute");
+        tick();
+        std::fs::write(own.join("index"), "idx2").unwrap();
+        memo_pass(&wt, "origin/main", &git);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3, "index move must recompute");
+        std::fs::remove_dir_all(wt.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn memo_recomputes_when_the_base_branch_itself_changes() {
+        // Two passes, two different questions. Serving the first answer to the second would report
+        // an `ahead` count measured against a base the caller is no longer asking about.
+        let (wt, common, _o) = memo_fixture("memo-rebase");
+        std::fs::write(common.join("refs").join("remotes").join("origin").join("dev"), "sha\n")
+            .unwrap();
+        let (calls, git) = counting_git();
+        memo_pass(&wt, "origin/main", &git);
+        memo_pass(&wt, "origin/dev", &git);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        std::fs::remove_dir_all(wt.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn memo_declines_a_base_that_is_not_a_plain_ref_name() {
+        // Fail OPEN: an un-mappable base must mean "always recompute", never "memoize against a ref
+        // we never watched" — and the traversal-shaped join must not happen at all.
+        let (wt, _c, _o) = memo_fixture("memo-traversal");
+        assert_eq!(git_fingerprint(&wt, "../../etc", walk_stats(&wt)), None);
+        assert_eq!(git_fingerprint(&wt, "/abs/path", walk_stats(&wt)), None);
+        assert_eq!(git_fingerprint(&wt, "", walk_stats(&wt)), None);
+
+        let (calls, git) = counting_git();
+        memo_pass(&wt, "../../etc", &git);
+        memo_pass(&wt, "../../etc", &git);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2, "must never be memoized");
+        std::fs::remove_dir_all(wt.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn memo_declines_when_no_file_tracks_the_base_at_all() {
+        // Neither a loose ref nor packed-refs: nothing whose mtime moves when the base moves, so
+        // there is no sound fingerprint and the memo must stay out of the way.
+        let (wt, common, _o) = memo_fixture("memo-noref");
+        std::fs::remove_file(common.join("refs").join("remotes").join("origin").join("main"))
+            .unwrap();
+        std::fs::remove_file(common.join("packed-refs")).unwrap();
+        assert_eq!(git_fingerprint(&wt, "origin/main", walk_stats(&wt)), None);
+
+        let (calls, git) = counting_git();
+        memo_pass(&wt, "origin/main", &git);
+        memo_pass(&wt, "origin/main", &git);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        std::fs::remove_dir_all(wt.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn git_dirs_resolves_a_gitlink_worktree_and_a_plain_clone() {
+        let (wt, common, own) = memo_fixture("memo-dirs");
+        assert_eq!(crate::worktree::git_dirs(&wt), (own, common));
+
+        // A normal clone: `.git` is a DIRECTORY, so both answers are `<root>/.git`.
+        let plain = std::env::temp_dir().join(format!("sparkle-fleet-plain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&plain);
+        std::fs::create_dir_all(plain.join(".git")).unwrap();
+        assert_eq!(crate::worktree::git_dirs(&plain), (plain.join(".git"), plain.join(".git")));
+        std::fs::remove_dir_all(&plain).ok();
+        std::fs::remove_dir_all(wt.parent().unwrap()).ok();
+    }
+
+    // ---- the parallel fan-out ---------------------------------------------------------------
+
+    #[test]
+    fn build_digest_preserves_agent_order_across_the_fan_out() {
+        // More agents than DIGEST_MAX_CONCURRENCY, so several chunks really do run at once. Row
+        // order is part of the payload — a shuffle would make every diff look like a change.
+        let dir = std::env::temp_dir().join(format!("sparkle-fleet-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let agents: Vec<(String, PathBuf)> = (0..DIGEST_MAX_CONCURRENCY * 3 + 1)
+            .map(|i| (format!("agent-{i:03}"), dir.join(format!("wt-{i:03}"))))
+            .collect();
+        let (calls, git) = counting_git();
+
+        let digest = build_digest_with(&agents, &dir, "origin/main", 1_000_000, 10_000, &git);
+
+        let got: Vec<&str> = digest.agents.iter().map(|a| a.agent_id.as_str()).collect();
+        let want: Vec<&str> = agents.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(got, want);
+        // None of these worktrees exist, so git is never consulted for any of them.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_subset_digest_does_not_evict_the_agents_it_did_not_ask_about() {
+        // REGRESSION. This first pruned the memo to "the agents of the pass that just ran", which
+        // reads as tidy until you notice `fleet_digest` has two callers with different populations:
+        // the fleet watch passes every open agent, the concierge tool passes whatever subset it is
+        // asking about. One concierge question about one agent therefore evicted all the others, and
+        // the next fleet pass paid full price for the whole fleet — deleting the benefit this memo
+        // exists to provide, intermittently and invisibly.
+        let (a_wt, _c, _o) = memo_fixture("memo-subset-a");
+        let (b_wt, _c2, _o2) = memo_fixture("memo-subset-b");
+        let hooks = a_wt.parent().unwrap().to_path_buf();
+        let (calls, git) = counting_git();
+
+        let both = vec![("a".to_string(), a_wt.clone()), ("b".to_string(), b_wt.clone())];
+        build_digest_with(&both, &hooks, "origin/main", 1_000_000, 10_000, &git);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2, "both cold on the first pass");
+
+        // The concierge asks about ONE of them.
+        build_digest_with(
+            &[("a".to_string(), a_wt.clone())],
+            &hooks,
+            "origin/main",
+            1_000_000,
+            10_000,
+            &git,
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2, "the subset pass is a hit");
+
+        // The fleet watch's next full pass must still be free for BOTH.
+        build_digest_with(&both, &hooks, "origin/main", 1_000_000, 10_000, &git);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the agent the subset pass did not mention must NOT have been evicted"
+        );
+        std::fs::remove_dir_all(a_wt.parent().unwrap()).ok();
+        std::fs::remove_dir_all(b_wt.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn evict_git_memo_drops_the_least_recently_used_and_keeps_the_rest() {
+        // Pure over the map, so the policy is testable without touching the process-wide static —
+        // which also keeps this test from evicting a CONCURRENT test's entries, the way a
+        // prune-the-static test necessarily would under the parallel harness.
+        fn entry(touch: u64) -> CachedGit {
+            CachedGit {
+                fingerprint: GitFingerprint {
+                    walk: WalkStats {
+                        newest_file_ms: None,
+                        newest_dir_ms: None,
+                        entries: 0,
+                        truncated: false,
+                    },
+                    head_ms: None,
+                    head_ref_ms: None,
+                    index_ms: None,
+                    remote_ref_ms: None,
+                    local_ref_ms: None,
+                    packed_refs_ms: None,
+                    base: "origin/main".to_string(),
+                },
+                facts: GitFacts::default(),
+                last_touch: touch,
+            }
+        }
+        let mut memo: HashMap<PathBuf, CachedGit> = HashMap::new();
+        for i in 0..10u64 {
+            memo.insert(PathBuf::from(format!("/wt/{i}")), entry(i));
+        }
+        evict_git_memo(&mut memo, 4);
+        assert_eq!(memo.len(), 4, "must trim down to the cap, not clear");
+        for i in 6..10u64 {
+            assert!(memo.contains_key(&PathBuf::from(format!("/wt/{i}"))), "newest {i} must survive");
+        }
+        for i in 0..6u64 {
+            assert!(!memo.contains_key(&PathBuf::from(format!("/wt/{i}"))), "oldest {i} must go");
+        }
+        // Under the cap it is a no-op — not an excuse to clear.
+        let before = memo.len();
+        evict_git_memo(&mut memo, 100);
+        assert_eq!(memo.len(), before);
+    }
+
+    #[test]
+    fn memo_recomputes_when_the_branch_HEAD_POINTS_AT_moves() {
+        // REGRESSION (`git reset --soft`, `git commit --amend`). On an attached branch `HEAD` holds
+        // the literal bytes `ref: refs/heads/<branch>` — moving that branch does not rewrite it, so
+        // `head_ms` does not move. `git commit` happens to bump `index` as a side effect, which
+        // masks the gap; `--soft` and `--amend` explicitly touch neither the index nor the tree.
+        // So NOTHING else in the fingerprint changes, and `ahead`/`last_commit_ms`/`changed_files`
+        // stayed cached at their pre-move values indefinitely.
+        let (wt, common, own) = memo_fixture("memo-headref");
+        let branch_ref = common.join("refs").join("heads").join("topic");
+        std::fs::create_dir_all(branch_ref.parent().unwrap()).unwrap();
+        std::fs::write(&branch_ref, "aaa\n").unwrap();
+        std::fs::write(own.join("HEAD"), "ref: refs/heads/topic\n").unwrap();
+        let (calls, git) = counting_git();
+
+        memo_pass(&wt, "origin/main", &git);
+        memo_pass(&wt, "origin/main", &git);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "unchanged is still a hit");
+
+        // The move: ONLY the branch ref. HEAD and index are deliberately left alone, which is
+        // exactly what `git reset --soft` does.
+        let head_before = mtime_ms(&own.join("HEAD"));
+        let index_before = mtime_ms(&own.join("index"));
+        tick();
+        std::fs::write(&branch_ref, "bbb\n").unwrap();
+        assert_eq!(mtime_ms(&own.join("HEAD")), head_before, "HEAD must be untouched (the premise)");
+        assert_eq!(mtime_ms(&own.join("index")), index_before, "index must be untouched");
+
+        memo_pass(&wt, "origin/main", &git);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "moving the branch HEAD points at must invalidate"
+        );
+        std::fs::remove_dir_all(wt.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn head_ref_path_resolves_a_symbolic_head_and_declines_a_detached_one() {
+        let (wt, common, own) = memo_fixture("memo-headpath");
+        std::fs::write(own.join("HEAD"), "ref: refs/heads/feature/x\n").unwrap();
+        assert_eq!(
+            head_ref_path(&own, &common),
+            Some(common.join("refs").join("heads").join("feature").join("x"))
+        );
+
+        // Detached: the sha lives in HEAD itself, so `head_ms` already tracks it and there is no
+        // separate ref file to watch.
+        std::fs::write(own.join("HEAD"), "9f1c0de9f1c0de9f1c0de9f1c0de9f1c0de9f1c0\n").unwrap();
+        assert_eq!(head_ref_path(&own, &common), None);
+
+        // A traversal-shaped symbolic target is declined rather than joined.
+        std::fs::write(own.join("HEAD"), "ref: ../../../etc/passwd\n").unwrap();
+        assert_eq!(head_ref_path(&own, &common), None);
+        std::fs::remove_dir_all(wt.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_base_shaped_like_a_git_OPTION_is_refused_before_it_reaches_git() {
+        // `git diff --output=/tmp/x ...` CREATES that file, so an unvalidated base turns this
+        // read-only digest into an arbitrary-write primitive outside the worktree. The guard is
+        // `worktree::validate_ref`, reused rather than re-implemented.
+        assert!(crate::worktree::validate_ref("--output=/tmp/sparkle-probe-pwned").is_err());
+        assert!(crate::worktree::validate_ref("--upload-pack=touch /tmp/x").is_err());
+        assert!(crate::worktree::validate_ref("-x").is_err());
+        // Legitimate bases still pass, including the default and slashed branch names.
+        assert!(crate::worktree::validate_ref("origin/main").is_ok());
+        assert!(crate::worktree::validate_ref("release/2026").is_ok());
+    }
+
+    #[test]
+    fn memo_recomputes_when_a_LOCAL_branch_base_moves() {
+        // REGRESSION. `base` is caller-supplied and defaults to `origin/main`, but a local-branch
+        // base (`main`) lives at `refs/heads/<base>` — nothing under `refs/remotes/` tracks it.
+        // Watching only the remote namespace found no loose ref, fell back to `packed-refs` alone
+        // (which exists, so a fingerprint was still built), and then never noticed that base moving:
+        // a stale `ahead` served for as long as the agent itself sat still.
+        let (wt, common, _o) = memo_fixture("memo-localbase");
+        std::fs::create_dir_all(common.join("refs").join("heads")).unwrap();
+        std::fs::write(common.join("refs").join("heads").join("main"), "sha\n").unwrap();
+        let (calls, git) = counting_git();
+
+        memo_pass(&wt, "main", &git);
+        memo_pass(&wt, "main", &git);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "unchanged is still a hit");
+
+        tick();
+        std::fs::write(common.join("refs").join("heads").join("main"), "sha2\n").unwrap();
+        memo_pass(&wt, "main", &git);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "a local base moving must invalidate"
+        );
+        std::fs::remove_dir_all(wt.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_panicking_agent_read_propagates_instead_of_deleting_its_whole_chunk() {
+        // `unwrap_or_default()` on the join would substitute an EMPTY vec for the panicking chunk,
+        // silently removing up to 1/8th of the fleet from the digest — indistinguishable downstream
+        // from "those agents do not exist". Every field in this module is an `Option` so absence is
+        // never faked; a dropped chunk fakes it wholesale.
+        let dir = std::env::temp_dir().join(format!("sparkle-fleet-panic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Real worktrees, so the git reader is actually reached.
+        let agents: Vec<(String, PathBuf)> = (0..DIGEST_MAX_CONCURRENCY * 2)
+            .map(|i| {
+                let (wt, _c, _o) = memo_fixture(&format!("memo-panic-{i}"));
+                (format!("agent-{i}"), wt)
+            })
+            .collect();
+        let boom = |_wt: &str, _base: &str| -> GitFacts { panic!("git blew up") };
+
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            build_digest_with(&agents, &dir, "origin/main", 1_000_000, 10_000, &boom)
+        }));
+        assert!(caught.is_err(), "the panic must reach the caller, not be swallowed into empty rows");
+
+        for (_, wt) in &agents {
+            std::fs::remove_dir_all(wt.parent().unwrap()).ok();
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -50,7 +50,7 @@ fn validate_id(label: &str, id: &str) -> Result<(), String> {
 ///
 /// Nothing legitimate is lost: `git check-ref-format` rejects all of the above too, so a name that
 /// fails here could never have named a real branch.
-fn validate_ref(branch: &str) -> Result<(), String> {
+pub(crate) fn validate_ref(branch: &str) -> Result<(), String> {
     let b = branch.trim();
     if b.is_empty() {
         return Err("empty git ref".into());
@@ -1002,31 +1002,61 @@ fn common_dir_for(repo_root: &str) -> PathBuf {
     }
 }
 
+/// THE canonical no-subprocess parser for a repo root's git layout: `(own_gitdir, common_gitdir)`.
+///
+/// This is the no-git-subprocess twin of `rev-parse --git-dir` / `--git-common-dir`. Three shapes
+/// exist and they resolve differently:
+///   * a normal clone — `.git` is a DIRECTORY, so both answers are `<root>/.git`
+///   * a linked worktree — `.git` is a gitlink FILE pointing at `<common>/worktrees/<name>`, which
+///     is its OWN gitdir (it holds that worktree's `HEAD` and `index`); the common dir is two
+///     levels up (it holds `hooks/`, `refs/`, `packed-refs`)
+///   * a submodule (or any other gitlink) — points straight at its own gitdir, which IS the common
+///     dir
+///
+/// Both parts matter and they are NOT interchangeable: per-worktree state (`HEAD`, `index`) lives
+/// under the own dir while shared state (`refs/`, `packed-refs`, `hooks/`) lives under the common
+/// one. `fleet.rs` needs both to fingerprint a worktree's git state, which is why this returns the
+/// pair rather than just the common dir — a second copy of this parsing grew there first, and two
+/// implementations of one git-layout contract is exactly one too many.
+pub(crate) fn git_dirs(repo_root: &Path) -> (PathBuf, PathBuf) {
+    let dot = repo_root.join(".git");
+    // `read_to_string` on a directory is an Err, which is exactly the "normal clone" signal.
+    let Ok(contents) = std::fs::read_to_string(&dot) else {
+        return (dot.clone(), dot);
+    };
+    let Some(target) = contents.lines().find_map(|l| l.trim().strip_prefix("gitdir:")).map(str::trim)
+    else {
+        return (dot.clone(), dot);
+    };
+    if target.is_empty() {
+        return (dot.clone(), dot);
+    }
+    // A gitlink may hold a path relative to the repo root; re-anchor it the same way git does.
+    let own = match Path::new(target) {
+        p if p.is_absolute() => p.to_path_buf(),
+        p => repo_root.join(p),
+    };
+    let common = if own.parent().and_then(|p| p.file_name()) == Some(std::ffi::OsStr::new("worktrees"))
+    {
+        own.parent().and_then(Path::parent).map(Path::to_path_buf).unwrap_or_else(|| own.clone())
+    } else {
+        own.clone()
+    };
+    (own, common)
+}
+
 /// Resolve `<repo_root>/.git` when it is a gitlink FILE, returning the SHARED (common) gitdir —
 /// the one holding `hooks/`. `None` when `.git` is a directory (a normal clone, where the caller's
 /// own `.git` join is already right) or when the file doesn't carry a parsable `gitdir:` pointer.
 ///
-/// This is the no-git-subprocess twin of `rev-parse --git-common-dir`, used only on that command's
-/// failure path. Two gitlink shapes exist and they resolve differently:
-///   * a linked worktree points at `<common>/worktrees/<name>` → the common dir is two levels up
-///   * a submodule points directly at its own gitdir → that IS the common dir
+/// A thin adapter over [`git_dirs`] — it exists only to preserve the `Option` contract
+/// [`common_dir_for`] depends on, where `None` means "not a gitlink, use your own `.git` join".
 fn gitfile_common_dir(repo_root: &str) -> Option<PathBuf> {
-    // `read_to_string` on a directory is an Err, which is exactly the "normal clone" signal.
-    let contents = std::fs::read_to_string(Path::new(repo_root).join(".git")).ok()?;
-    let target = contents.lines().find_map(|l| l.trim().strip_prefix("gitdir:"))?.trim();
-    if target.is_empty() {
-        return None;
-    }
-    // A gitlink may hold a path relative to the repo root; re-anchor it the same way git does.
-    let target = match Path::new(target) {
-        p if p.is_absolute() => p.to_path_buf(),
-        p => Path::new(repo_root).join(p),
-    };
-    if target.parent().and_then(|p| p.file_name()) == Some(std::ffi::OsStr::new("worktrees")) {
-        target.parent()?.parent().map(PathBuf::from)
-    } else {
-        Some(target)
-    }
+    let root = Path::new(repo_root);
+    let (_, common) = git_dirs(root);
+    // `git_dirs` collapses every non-gitlink case to `<root>/.git`; that is precisely this
+    // function's `None`.
+    (common != root.join(".git")).then_some(common)
 }
 
 /// Repos we have already warned about an inert `core.hooksPath` for. `install_repo_hooks` runs on

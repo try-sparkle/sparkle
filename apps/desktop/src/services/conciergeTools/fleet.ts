@@ -11,7 +11,10 @@
  * An agent's turn is spent only when the concierge has something that agent NEEDS. Concretely,
  * agent responses are NEVER used as a liveness mechanism: a message costs the agent a full turn and
  * can end the turn it was in the middle of, so pinging 40 agents every ten minutes is ~240 turns an
- * hour purely to learn who is alive. `fleet_digest` answers the same question for free.
+ * hour purely to learn who is alive. `fleet_digest` answers the same question without spending an
+ * agent TURN — which is the sense in which it is "free", and the only one. It still costs real disk
+ * and git work (~0.27s per agent, measured), so it is polled every thirty seconds rather than run
+ * in a loop, and unchanged agents are served from a memo without spawning git.
  *
  * THE TIERING IS THE INCENTIVE DESIGN. `inbox_send` is `routine` (auto-allowed) while
  * `send_to_agent_terminal` is `disruptive` (asks). That asymmetry is deliberate and is the whole

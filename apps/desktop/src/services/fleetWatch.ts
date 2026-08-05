@@ -47,17 +47,26 @@ import type { FleetAgentFacts, FleetVerdict } from "../engine/fleetVerdict";
 /**
  * Poll cadence.
  *
- * TEN SECONDS, and the number is the one `fleet.rs` was sized for: its `HOOK_TAIL_MAX_BYTES` budget
- * ("at 64 agents on a ten-second cadence that is the difference between free and not") and its own
- * header ("Reading these artifacts costs nothing and can run every ten seconds") both assume it.
- * A tick is a bounded tail read plus a bounded worktree walk per agent — no agent turn, no network,
- * no LLM.
+ * THIRTY SECONDS. This was ten, and the claim that came with it — "reading these artifacts costs
+ * nothing" — did not survive being measured.
  *
- * It also has to be fast relative to what it is watching for. `fleetVerdict.QUIET_AFTER_MS` is two
- * minutes — the PRD's first threshold worth naming — so twelve polls fit inside the shortest stall
- * the fleet counts, and a single slow or throwing tick never delays a verdict past it.
+ * A tick is a bounded tail read plus a bounded worktree walk per agent, but it is ALSO five `git`
+ * subprocess spawns per agent. Measured on a real worktree: ~0.15 s for the spawns and ~0.12 s for
+ * the walk, so at 30 agents a pass was ~8.1 s of work against a 10 s interval — an ~80 % duty cycle
+ * that stopped fitting its own interval entirely at ~37 agents. A profile of the running app
+ * attributed 30.5 % of all CPU the process burned to this one command, plus ~0.39 cores of `git`
+ * children the profiler could not even see.
+ *
+ * Two changes bought that back and this is the smaller of them: `fleet.rs` now memoizes an agent's
+ * git facts and re-runs the subprocesses only when that agent's worktree, HEAD, index or base ref
+ * actually moved, and reads agents concurrently. Tripling the interval is the cheap multiplier on
+ * top.
+ *
+ * It still has to be fast relative to what it is watching for. `fleetVerdict.QUIET_AFTER_MS` is two
+ * minutes — the PRD's first threshold worth naming — so four polls still fit inside the shortest
+ * stall the fleet counts, and a single slow or throwing tick never delays a verdict past it.
  */
-export const FLEET_POLL_INTERVAL_MS = 10_000;
+export const FLEET_POLL_INTERVAL_MS = 30_000;
 
 /**
  * How old the agent's last turn boundary must be before the app takes delivery over from the hook.
@@ -377,12 +386,15 @@ export function defaultFleetWatchDeps(): FleetWatchDeps {
     now: () => Date.now(),
     liveAgents: () => {
       // BOUNDED BY THE OPEN-PANE SET, not by the whole historical roster, and this is a cost gate
-      // rather than a correctness one. `fleet_digest` is a SYNCHRONOUS Tauri command, so it runs on
-      // the main thread, and each agent in the payload costs four `git` spawns plus a worktree walk
-      // of up to `WALK_MAX_ENTRIES`. Every ten seconds, over every agent row a long-lived install
-      // ever created, that is hundreds of process spawns and tens of thousands of `stat` calls
-      // against the UI thread — and `fleet.rs`'s own header says the per-agent API exists precisely
-      // so a caller does not sweep "long-dead agents whose worktrees were never reaped".
+      // rather than a correctness one. `fleet_digest` is `async` + `spawn_blocking` (`fleet.rs`), so
+      // it does NOT run on the main thread — an earlier version of this comment said it did, which
+      // was wrong and would have sent the next reader hunting a UI-thread stall that was never
+      // there. The cost is real all the same: each agent in the payload costs up to five `git`
+      // spawns plus a worktree walk of up to `WALK_MAX_ENTRIES`. Over every agent row a long-lived
+      // install ever created, that is hundreds of process spawns and tens of thousands of `stat`
+      // calls per pass — saturating the blocking pool and the machine's I/O rather than the UI
+      // thread. `fleet.rs`'s own header says the per-agent API exists precisely so a caller does not
+      // sweep "long-dead agents whose worktrees were never reaped".
       //
       // `openAgentIdSet()` is the app-wide set (in-memory merged with the persisted copy, the same
       // construction `handleGetState` and `getAgentStatus` use), cleared only by `runtimeStore.close()`
