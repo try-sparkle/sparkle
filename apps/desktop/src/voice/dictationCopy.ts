@@ -114,7 +114,24 @@ export const PAUSED_TERMINAL_COMPOSER_PLACEHOLDER =
  *  as separate elements — the first bold, both centered — and a `\n` in a JSX text node collapses
  *  to a space. RichPlaceholder's `focusPaused` arm is the only consumer. */
 export const PAUSED_TERMINAL_HEADLINE = "Listening paused";
-export const PAUSED_TERMINAL_ACTION = "Click to re-engage the Sparkle Concierge";
+/** ══ NAMES NO DESTINATION, AND THAT IS THE FIX (bead sparkle-wj3ya) ═══════════════════════════════
+ *  This read "Click to re-engage the Sparkle Concierge", and while the concierge is MOUNTED to a
+ *  build agent that is FALSE — resuming there talks to the agent's terminal, not to Sparkle.
+ *
+ *  The founder caught it on a screenshot where "ESC to unmount" was rendering two lines above this
+ *  one, so the pane simultaneously knew it was mounted and offered to re-engage the concierge. That
+ *  is worse than a missing indicator: a missing indicator is an absence, this is an ASSERTION, and
+ *  it is wrong at the exact moment the words would be routed into a live PTY — the one failure mode
+ *  `composerRoute`'s header calls unrecoverable.
+ *
+ *  SAYING NOTHING ABOUT THE DESTINATION is the bead's own sanctioned option ("or say nothing about
+ *  the concierge at all"), and it is the one that is TRUE IN BOTH STATES. The alternative — naming
+ *  the agent when mounted — needs the mount threaded into `RichPlaceholder`, which today knows only
+ *  its own geometry and pause reason; a placeholder that has to be told where words go is a second
+ *  source of truth for the routing, and it would be wrong whenever it drifted. Where the words are
+ *  going is the composer's own job to show (the terminal typeface, and the chip this bead still
+ *  wants); this line only has to say what happened and how to undo it. */
+export const PAUSED_TERMINAL_ACTION = "Click here to resume";
 
 /** The sidebar caption for a focus-paused mic, by cause. `null` (paused for a reason we don't have
  *  a specific story for — e.g. capture simply hasn't started yet) keeps the long-standing window

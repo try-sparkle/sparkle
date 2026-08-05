@@ -17,6 +17,9 @@
 //     clicking its middle stops working.
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+// The constant, not a literal: these rows assert the copy that SHIPS, so a reword lands here rather
+// than leaving a stale string that still passes because it was only moved.
+import { PAUSED_TERMINAL_ACTION } from "../../voice/dictationCopy";
 import {
   ComposeBox,
   CONCIERGE_PLACEHOLDER,
@@ -227,18 +230,25 @@ describe("ComposeBox — the live sentence names the MODE, not the phase", () =>
       inTerminal();
       setup();
       expect(screen.getByText("Listening paused")).toBeTruthy();
-      expect(screen.getByText("Click to re-engage the Sparkle Concierge")).toBeTruthy();
+      expect(screen.getByText(PAUSED_TERMINAL_ACTION)).toBeTruthy();
       // The reason is GONE — the whole point of the rewrite, and the half a "contains 'Listening
       // paused'" assertion would happily pass without.
       expect(bodyText()).not.toContain("cursor is in a terminal");
-      expect(bodyText()).not.toContain("Click here to resume");
+      // ══ AND IT NAMES NO DESTINATION (bead sparkle-wj3ya) ═══════════════════════════════════════
+      // This line used to read "Click to re-engage the Sparkle Concierge", which is FALSE while the
+      // concierge is mounted to a build agent — resuming there talks to that agent's terminal. The
+      // founder caught it on a screenshot with "ESC to unmount" two lines above. Asserted as the
+      // absence of the claim rather than as the new wording, so a future reword cannot quietly put
+      // a destination back: whatever this line says, it may not name Sparkle.
+      expect(bodyText()).not.toContain("Sparkle");
+      expect(bodyText()).not.toContain("Concierge");
     });
 
     it("bolds ONLY the first line, and centers the whole block", () => {
       inTerminal();
       setup();
       const headline = screen.getByText("Listening paused");
-      const action = screen.getByText("Click to re-engage the Sparkle Concierge");
+      const action = screen.getByText(PAUSED_TERMINAL_ACTION);
       expect(headline.style.fontWeight).toBeTruthy();
       // The second line stays normal weight — "bold" was asked for on the first line only.
       expect(action.style.fontWeight).toBe("");
@@ -307,7 +317,7 @@ describe("ComposeBox — the live sentence names the MODE, not the phase", () =>
       );
       setup();
       expect(bodyText()).toContain("Listening paused");
-      expect(bodyText()).not.toContain("Click to re-engage the Sparkle Concierge");
+      expect(bodyText()).not.toContain(PAUSED_TERMINAL_ACTION);
     });
   });
 
