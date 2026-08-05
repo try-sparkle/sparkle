@@ -472,17 +472,32 @@ fn mark_exhausted_at(
         .iter_mut()
         .find(|a| a.id == id)
         .ok_or_else(|| format!("account not found: {id}"))?;
-    // ONE ownership record: both fields move together or neither does. Policy and its rationale live
-    // once, on [`effective_exhaustion`].
+    // ONE ownership record: both fields move together or neither does. Policy and its rationale
+    // live once, on [`effective_exhaustion`].
+    //
+    // The skip is conditional on a LIVE bench. "Change nothing and let the poll retry" is only safe
+    // while the recorded bench is still protecting the account; once it has expired the owner is
+    // stale metadata guarding nothing, and skipping would drop a genuinely observed rate limit —
+    // permanently, for a config dir that is persistently unresolvable (removed, logged out, or a
+    // named account whose `config_dir` is empty, which resolves to `None` by design). The account
+    // would then never be benchable again and `pickAccount` would keep routing work into it, which
+    // is the worse of the two errors this whole field exists to avoid.
+    let live_bench = acct.exhausted_until.is_some_and(|e| e > now_secs());
     match identity_key_for(acct, home) {
         Some(key) => {
             acct.exhausted_until = Some(until_epoch);
             acct.exhausted_identity = Some(key);
         }
-        // No owner on record yet: an unowned bench is honoured and expires within the limit window,
-        // so recording it is strictly better than dropping an observed rate limit.
-        None if acct.exhausted_identity.is_none() => acct.exhausted_until = Some(until_epoch),
-        None => {}
+        // Unresolvable with a live bench on record: keep both, retry next poll.
+        None if live_bench => {
+            return Err("identity unresolvable; bench not recorded".to_string());
+        }
+        // Unresolvable with nothing live to protect: record the limit as UNOWNED rather than lose
+        // it. The read side honours an unowned bench, and it ages out inside the limit window.
+        None => {
+            acct.exhausted_until = Some(until_epoch);
+            acct.exhausted_identity = None;
+        }
     }
     write_accounts_at(accounts_path, &accounts)
 }
@@ -3541,7 +3556,8 @@ mod tests {
         let path = dir.join("accounts.json");
         write_accounts_at(&path, &[sample("a", false, dir.to_str().unwrap())]).unwrap();
 
-        mark_exhausted_at(&path, "a", 1_700_003_600, None).unwrap();
+        let until = now_secs() + 3_600;
+        mark_exhausted_at(&path, "a", until, None).unwrap();
 
         let stored = read_accounts_at(&path).unwrap();
         assert_eq!(
@@ -3550,10 +3566,13 @@ mod tests {
             "the bench must record WHICH login earned it"
         );
         // …and it round-trips: a different login does not inherit it, the same one does.
-        assert_eq!(effective_exhaustion(&stored[0], Some(&oauth(Some("uuid-other"), "other@x.com")), 1_700_000_000), None);
         assert_eq!(
-            effective_exhaustion(&stored[0], Some(&oauth(Some("uuid-mine"), "me@example.com")), 1_700_000_000),
-            Some(1_700_003_600)
+            effective_exhaustion(&stored[0], Some(&oauth(Some("uuid-other"), "other@x.com")), now_secs()),
+            None
+        );
+        assert_eq!(
+            effective_exhaustion(&stored[0], Some(&oauth(Some("uuid-mine"), "me@example.com")), now_secs()),
+            Some(until)
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3625,12 +3644,15 @@ mod tests {
         let path = dir.join("accounts.json");
         write_accounts_at(&path, &[sample("a", false, dir.to_str().unwrap())]).unwrap();
 
-        mark_exhausted_at(&path, "a", 1_700_003_600, None).unwrap();
+        // Real-time-relative: `mark_exhausted_at` compares against `now_secs()` to decide whether a
+        // LIVE bench is on record, so a fixed 2023 epoch would read as already expired.
+        let until = now_secs() + 3_600;
+        mark_exhausted_at(&path, "a", until, None).unwrap();
         assert_eq!(read_accounts_at(&path).unwrap()[0].exhausted_identity.as_deref(), Some("uuid-mine"));
 
         // The config becomes unreadable mid-write, and a poll re-marks in that tick.
         std::fs::remove_file(dir.join(".claude.json")).unwrap();
-        mark_exhausted_at(&path, "a", 1_700_007_200, None).unwrap();
+        let _ = mark_exhausted_at(&path, "a", until + 3_600, None); // reported as Err, retried next poll
 
         let stored = read_accounts_at(&path).unwrap();
         assert_eq!(
@@ -3639,7 +3661,10 @@ mod tests {
             "an unreadable tick must not erase who earned the bench"
         );
         // Which is what keeps the inheritance guard working afterwards.
-        assert_eq!(effective_exhaustion(&stored[0], Some(&oauth(Some("uuid-other"), "other@x.com")), 1_700_000_000), None);
+        assert_eq!(
+            effective_exhaustion(&stored[0], Some(&oauth(Some("uuid-other"), "other@x.com")), now_secs()),
+            None
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3653,23 +3678,59 @@ mod tests {
         write_claude_json(&dir, r#"{"oauthAccount":{"emailAddress":"a@x.com","accountUuid":"uuid-a"}}"#);
         let path = dir.join("accounts.json");
         write_accounts_at(&path, &[sample("a", false, dir.to_str().unwrap())]).unwrap();
-        mark_exhausted_at(&path, "a", 1_700_003_600, None).unwrap();
+        let until = now_secs() + 3_600; // a LIVE bench — the arm under test only skips for one
+        mark_exhausted_at(&path, "a", until, None).unwrap();
 
         // The config becomes unreadable and a NEW limit is observed in that tick.
         std::fs::remove_file(dir.join(".claude.json")).unwrap();
-        mark_exhausted_at(&path, "a", 1_700_007_200, None).unwrap();
+        // Reported as a FAILURE, not silently swallowed: limitSync's contract is "report only the
+        // writes that actually LANDED", and it retries on the next poll.
+        assert!(
+            mark_exhausted_at(&path, "a", until + 3_600, None).is_err(),
+            "an unrecordable bench must not report success"
+        );
 
         let stored = read_accounts_at(&path).unwrap();
         assert_eq!(
             (stored[0].exhausted_until, stored[0].exhausted_identity.as_deref()),
-            (Some(1_700_003_600), Some("uuid-a")),
+            (Some(until), Some("uuid-a")),
             "neither field moves without the other — no new timestamp under a stale owner"
         );
         // …so the standing bench still protects its own account rather than being dropped as a
         // mismatch the moment the identity resolves again.
         assert_eq!(
-            effective_exhaustion(&stored[0], Some(&oauth(Some("uuid-a"), "a@x.com")), 1_700_000_000),
-            Some(1_700_003_600)
+            effective_exhaustion(&stored[0], Some(&oauth(Some("uuid-a"), "a@x.com")), now_secs()),
+            Some(until)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_expired_bench_does_not_block_recording_a_new_one() {
+        // The hole the "change nothing" arm left: it was justified by "the standing bench protects
+        // the account meanwhile", which is false once that bench has EXPIRED. Nothing ever clears
+        // exhausted_identity, so a row keeps its owner forever — and for a config dir that is
+        // persistently unresolvable the account could then NEVER be benched again, with pickAccount
+        // routing work into a genuinely rate-limited login indefinitely.
+        let dir = unique_dir("expired-bench-rerecord");
+        write_claude_json(&dir, r#"{"oauthAccount":{"emailAddress":"a@x.com","accountUuid":"uuid-a"}}"#);
+        let path = dir.join("accounts.json");
+        let mut acct = sample("a", false, dir.to_str().unwrap());
+        // A bench that has already aged out, still carrying its owner.
+        acct.exhausted_until = Some(now_secs() - 60);
+        acct.exhausted_identity = Some("uuid-a".to_string());
+        write_accounts_at(&path, &[acct]).unwrap();
+
+        // The config is unreadable when the NEW limit is observed.
+        std::fs::remove_file(dir.join(".claude.json")).unwrap();
+        let future = now_secs() + 3_600;
+        mark_exhausted_at(&path, "a", future, None).expect("an expired bench must not block a new one");
+
+        let stored = read_accounts_at(&path).unwrap();
+        assert_eq!(stored[0].exhausted_until, Some(future), "the new limit IS recorded");
+        assert_eq!(
+            stored[0].exhausted_identity, None,
+            "recorded UNOWNED rather than under the stale owner — honoured, and it ages out"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

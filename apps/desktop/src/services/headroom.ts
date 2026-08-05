@@ -159,7 +159,13 @@ export function switchRecommendation(
 /** How to name an account at the START of a sentence. Only the not-signed-in case is capitalized:
  *  the signed-in name is an EMAIL, and "Drodio@storytell.ai" would be a different address. */
 function leadName(display: AccountDisplay): string {
-  return display.signedIn ? display.primary : "An account that isn't signed in";
+  if (display.signedIn) return display.primary;
+  // `hasLogin`, not `signedIn`. `signedIn` is EMAIL-only, so a login carrying a uuid but no readable
+  // email — which is a real sign-in — was announced as "An account that isn't signed in has hit its
+  // limit", a false statement about the account the user is actively working on. Same distinction
+  // `accountSentenceName` already draws for the object half of the sentence.
+  if (display.hasLogin) return "The account Sparkle is signed into";
+  return "An account that isn't signed in";
 }
 
 /** Human phrasing for the banner. Kept next to the policy so wording and thresholds can't drift.
