@@ -230,10 +230,18 @@ export function createStatusRouter(
   //   - a hook `working` — a real tool event (Pre/PostToolUse). Note this is not the common path:
   //     HookStatusEngine dedups, so a resumed tool call under an already-frozen `working` never
   //     reaches fromHook. The screen is the witness that actually fires.
+  //   - `done` — the SESSION ENDED (SessionEnd, or the PTY exited). Not progress, but a release all
+  //     the same, and a REQUIRED one: a dead process can never emit the `working` the two clauses
+  //     above wait for, so without this an agent that exits while parked on the picker resolves to
+  //     `waiting` FOREVER and only a re-prepare clears it. That is a permanently red "Needs you" row
+  //     on a session that is over — the inverse of the false-green defect this pierce exists to end,
+  //     and worse, because a false green on a LIVE agent self-corrects the moment it speaks again
+  //     while this never does. The `errored` override this is modelled on has no such hole: it
+  //     self-clears on any non-errored screen.
   // What deliberately does NOT count: a hook `idle`. Claude fires a `Notification` idle ping ~60s
   // into any wait, including this one, and that is the picker being unanswered — not progress past it.
   const clearedByProgress = (s: AgentTabStatus): void => {
-    if (s === "working") sessionLimitPicker = false;
+    if (s === "working" || s === "done") sessionLimitPicker = false;
   };
 
   // Dedup: only forward a genuine change. The router re-resolves on every event from either

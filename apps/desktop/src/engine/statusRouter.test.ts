@@ -517,6 +517,42 @@ describe("createStatusRouter — the session-limit picker pierces hook authority
     expect(emit.mock.calls.map((x) => x[0])).toEqual(["working", "waiting", "working"]);
   });
 
+  it("releases when the SESSION ENDS, so an exited agent is not red forever", () => {
+    // The pierce is held until POSITIVE PROGRESS, and the only progress signal is `working`. But a
+    // dead process can never emit one: `SessionEnd` maps to `done` (hookEvents.ts) and the PTY exit
+    // maps to `done` too, and neither is `working`. So an agent that exits while parked on the picker
+    // — the user quits Claude, the pane is closed, the process is killed — kept resolving to
+    // `waiting` until a re-prepare.
+    //
+    // That is a permanently red "Needs you" row on a session that is OVER: the exact inverse of the
+    // false-green defect this pierce exists to end, and worse than it, because a green row on a live
+    // agent self-corrects the moment the agent speaks again while this one never does. The `errored`
+    // override this is modelled on has no such hole — it self-clears on any non-errored screen.
+    const emit = vi.fn();
+    const c = mkClock();
+    const r = createStatusRouter(emit, c.now);
+    r.activate();
+    r.fromHook("working"); // the turn opens; the limit lands inside it, so no Stop ever follows
+    fromPicker(r);
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["working", "waiting"]);
+    r.fromHook("done"); // SessionEnd — the user quit, or the pane was closed
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["working", "waiting", "done"]);
+    // …and it stays released: a later screen report must not resurrect the pierce on a dead session.
+    r.fromScreen("idle");
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["working", "waiting", "done"]);
+  });
+
+  it("releases on a screen-reported exit too (the scraper path's `done`)", () => {
+    // Same hole, reached through the scraper: StatusEngine.exit() publishes `done`, and on an agent
+    // whose hooks never activated that is the only witness there is.
+    const emit = vi.fn();
+    const c = mkClock();
+    const r = createStatusRouter(emit, c.now);
+    fromPicker(r);
+    r.fromScreen("done");
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["waiting", "done"]);
+  });
+
   it("retracts on POSITIVE PROGRESS — a real tool event on the hook stream", () => {
     const emit = vi.fn();
     const c = mkClock();
