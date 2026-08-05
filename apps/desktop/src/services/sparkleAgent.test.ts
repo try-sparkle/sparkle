@@ -346,6 +346,13 @@ describe("sparklePersona — agent-feedback inbox drain", () => {
     expect(p).toContain("file a bead");
     expect(p).toContain("bd update");
     expect(p).toMatch(/BUMP its priority|bump.*priority/i);
+    // ROUTED THROUGH TRIAGE. This persona is a production consumer of the inbox, so a ranking the
+    // script computes but the persona never invokes reaches nobody — and triage is the only thing
+    // that marks beads whose fix already MERGED or LANDED, which is what stops the pass
+    // re-investigating finished work. The raw `bd list` above survives only as a stated fallback.
+    expect(p).toContain("scripts/retro-inbox-triage.sh");
+    expect(p).toMatch(/MERGED|LANDED/);
+    expect(p.indexOf("retro-inbox-triage.sh")).toBeLessThan(p.indexOf("bd list --label"));
     expect(p).toMatch(/severity/i);
   });
 

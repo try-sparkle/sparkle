@@ -200,9 +200,26 @@ describe("hourlyMissionPrompt", () => {
   it("both modes name the agent-feedback inbox and drain it before mining logs", () => {
     for (const mode of ["always", "case_by_case"] as const) {
       const p = hourlyMissionPrompt(mode);
-      expect(p).toContain("bd list --label agent-feedback");
+      expect(p).toContain("agent-feedback");
       // Ordered ahead of the log-mining sentence.
       expect(p.indexOf("agent-feedback")).toBeLessThan(p.indexOf("session logs"));
+    }
+  });
+
+  // ROUTED THROUGH TRIAGE, not a raw `bd list` — this prompt is the production consumer of the
+  // inbox, so a ranking the script computes but the prompt never invokes is a feature that reaches
+  // nobody. Triage is also the only thing that marks the beads whose fix already MERGED or already
+  // LANDED on main; without it the pass picks finished work and re-investigates it, which is the
+  // exact cost the script was written to remove.
+  it("drains the inbox through retro-inbox-triage.sh rather than a raw bd list", () => {
+    for (const mode of ["always", "case_by_case"] as const) {
+      const p = hourlyMissionPrompt(mode);
+      expect(p).toContain("scripts/retro-inbox-triage.sh");
+      expect(p).not.toContain("bd list --label agent-feedback");
+      // The ranking is worthless if the pass does not know what it is being told.
+      expect(p).toMatch(/MERGED|LANDED/);
+      // Ahead of the log-mining fallback, same as the drain itself.
+      expect(p.indexOf("retro-inbox-triage.sh")).toBeLessThan(p.indexOf("session logs"));
     }
   });
 
