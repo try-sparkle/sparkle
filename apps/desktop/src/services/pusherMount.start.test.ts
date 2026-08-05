@@ -18,12 +18,19 @@ const stopRunner = vi.hoisted(() => vi.fn());
 const getConfig = vi.hoisted(() => vi.fn());
 const onConfigChanged = vi.hoisted(() => vi.fn());
 const unlisten = vi.hoisted(() => vi.fn());
+const startBabysitDispatcher = vi.hoisted(() =>
+  vi.fn<(cfg?: unknown) => () => void>(() => stopBabysit),
+);
+const stopBabysit = vi.hoisted(() => vi.fn());
 
 vi.mock("./pusherRunner", async (orig) => ({
   ...(await orig<Record<string, unknown>>()),
   startPusherRunner,
 }));
 vi.mock("./config", () => ({ getConfig, onConfigChanged }));
+vi.mock("./babysitDispatcher", () => ({
+  startBabysitDispatcher: (cfg?: unknown) => startBabysitDispatcher(cfg),
+}));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 vi.mock("../logger", () => ({
   log: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() },
@@ -53,6 +60,9 @@ beforeEach(() => {
   startPusherRunner.mockClear();
   stopRunner.mockClear();
   unlisten.mockClear();
+  startBabysitDispatcher.mockClear();
+  stopBabysit.mockClear();
+  startBabysitDispatcher.mockImplementation(() => stopBabysit);
   getConfig.mockResolvedValue({ config: { pushers: {} } });
   onConfigChanged.mockResolvedValue(unlisten);
 });
@@ -122,7 +132,10 @@ describe("startPusher — the sweep is actually started", () => {
     await vi.waitFor(() => expect(onConfigChanged).toHaveBeenCalled());
     stop();
     expect(stopRunner).toHaveBeenCalledTimes(1);
-    expect(unlisten).toHaveBeenCalledTimes(1);
+    // TWO subscriptions now — the Pusher policy's and the babysit switch's — and BOTH must be
+    // dropped. A leaked one outlives the window: its callback keeps re-resolving state for a mount
+    // that is gone, which is the failure the test below describes for the async-resolve case.
+    expect(unlisten).toHaveBeenCalledTimes(2);
   });
 
   it("unlistens even when the subscription resolves AFTER the stopper ran", async () => {
@@ -134,6 +147,69 @@ describe("startPusher — the sweep is actually started", () => {
     const stop = startPusher();
     stop();
     resolveSub(unlisten);
-    await vi.waitFor(() => expect(unlisten).toHaveBeenCalledTimes(1));
+    // Both late-resolving subscriptions unlisten — see the note above on why there are two.
+    await vi.waitFor(() => expect(unlisten).toHaveBeenCalledTimes(2));
+  });
+});
+
+// ── THE BABYSIT KILL SWITCH MUST FAIL CLOSED (roborev 58645) ────────────────────────────────────
+//
+// `[babysit].enabled = false` stops a loop that spends a full Claude session per dispatch on the
+// founder's own quota. Every assertion here is about the ONE direction that cannot be recovered by
+// the user noticing later: the switch being honoured turning into the sweep running anyway.
+describe("startPusher — the babysit switch", () => {
+  it("passes enabled: false straight through", async () => {
+    getConfig.mockResolvedValue({ config: { pushers: {}, babysit: { enabled: false } } });
+    const { startPusher } = await freshStartPusher();
+    startPusher();
+    await vi.waitFor(() => expect(startBabysitDispatcher).toHaveBeenCalled());
+    expect(startBabysitDispatcher.mock.calls[0]?.[0]).toMatchObject({ enabled: false });
+  });
+
+  it("a THROW on the configured-start path does NOT fall back to enabled: true", async () => {
+    // The bug this pins: with `.catch` on the whole chain rather than on the read, a throw from
+    // startBabysitDispatcher ran the recovery arm, which starts with NO ARGUMENT — i.e. enabled
+    // defaults true — so `enabled = false` silently failed OPEN.
+    getConfig.mockResolvedValue({ config: { pushers: {}, babysit: { enabled: false } } });
+    startBabysitDispatcher.mockImplementation(() => {
+      throw new Error("boom");
+    });
+    const { startPusher } = await freshStartPusher();
+    startPusher();
+    await vi.waitFor(() => expect(startBabysitDispatcher).toHaveBeenCalled());
+
+    // It may be called ONCE, with the user's setting. It must never be re-called bare.
+    for (const call of startBabysitDispatcher.mock.calls) {
+      expect(call[0]).toMatchObject({ enabled: false });
+    }
+  });
+
+  it("an UNREADABLE config starts on shipped defaults — a failed read is not a request to stop", async () => {
+    // The opposite direction, stated so the fix above cannot be "never start on error": the sweep
+    // is compiled into this build, and a read that errored is not a user switching it off.
+    getConfig.mockRejectedValue(new Error("no backend"));
+    const { startPusher } = await freshStartPusher();
+    startPusher();
+    await vi.waitFor(() => expect(startBabysitDispatcher).toHaveBeenCalled());
+    expect(startBabysitDispatcher.mock.calls[0]?.[0]).toEqual({});
+  });
+
+  it("a LIVE config change to enabled: false restarts the sweep with the switch off", async () => {
+    getConfig.mockResolvedValue({ config: { pushers: {}, babysit: { enabled: true } } });
+    const { startPusher } = await freshStartPusher();
+    startPusher();
+    await vi.waitFor(() => expect(startBabysitDispatcher).toHaveBeenCalled());
+
+    // Drive the subscription the way the ⋯ Advanced panel would. There are TWO subscriptions —
+    // the Pusher policy's and the babysit switch's — and this asserts the babysit one exists rather
+    // than indexing blindly, so a future reorder fails here instead of silently testing the wrong
+    // callback and passing.
+    await vi.waitFor(() => expect(onConfigChanged.mock.calls.length).toBe(2));
+    const onChange = onConfigChanged.mock.calls.at(-1)?.[0] as (eff: unknown) => void;
+    onChange({ config: { pushers: {}, babysit: { enabled: false } } });
+
+    expect(stopBabysit).toHaveBeenCalled();
+    const last = startBabysitDispatcher.mock.calls.at(-1);
+    expect(last?.[0]).toMatchObject({ enabled: false });
   });
 });

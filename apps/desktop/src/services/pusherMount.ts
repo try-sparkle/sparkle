@@ -53,7 +53,7 @@ import { useRuntimeStore } from "../stores/runtimeStore";
 import { useConflictStore } from "../stores/conflictStore";
 import { useSettingsStore } from "../stores/settingsStore";
 import { quotaBlockForAgent, lastFailureForAgent } from "../engine/engineRegistry";
-import { getConfig, onConfigChanged } from "./config";
+import { getConfig, onConfigChanged, type BabysitConfigPayload } from "./config";
 import { startConflictFlags } from "./conflictFlags";
 import { startBabysitDispatcher } from "./babysitDispatcher";
 import { ownsProjectInThisWindow } from "./goalContinuationRunner";
@@ -316,41 +316,100 @@ export function startPusher(): () => void {
   // build and a failed read is not a user asking for it to stop. The switch is `enabled = false`,
   // and that is honoured the moment the read succeeds.
   let stopBabysit: (() => void) | undefined;
-  void getConfig()
-    .then((eff) => {
+  let babysitUnlisten: (() => void) | undefined;
+
+  /** Apply one `[babysit]` reading: stop whatever is running, start on the new settings. */
+  const applyBabysit = (b: BabysitConfigPayload | undefined): void => {
+    stopBabysit?.();
+    stopBabysit = undefined;
+    stopBabysit = startBabysitDispatcher({
+      ...(b?.enabled !== undefined ? { enabled: b.enabled } : {}),
+      ...(b?.cooldown_minutes !== undefined ? { cooldownMs: b.cooldown_minutes * 60_000 } : {}),
+      ...(b?.recovery_cooldown_minutes !== undefined
+        ? { recoveryCooldownMs: b.recovery_cooldown_minutes * 60_000 }
+        : {}),
+      ...(b?.max_dispatches_per_hour !== undefined
+        ? { maxDispatchesPerHour: b.max_dispatches_per_hour }
+        : {}),
+    });
+    if (stopped) stopBabysit();
+  };
+
+  // THE `.catch` IS ON THE READ ALONE, NOT THE CHAIN (roborev 58645).
+  //
+  // Attached to the whole chain it also catches a throw from `startBabysitDispatcher` or the log
+  // after it — and the recovery arm starts the dispatcher with NO ARGUMENT, i.e. `enabled: true`.
+  // That is `[babysit].enabled = false` silently failing OPEN, in exactly the direction this
+  // section's own comments say a kill switch must never fail. `.then(onOk, onErr)` cannot do that:
+  // the error handler sees only a rejected READ.
+  void getConfig().then(
+    (eff) => {
       if (stopped) return;
-      const b = eff.config.babysit;
-      stopBabysit = startBabysitDispatcher({
-        ...(b?.enabled !== undefined ? { enabled: b.enabled } : {}),
-        ...(b?.cooldown_minutes !== undefined ? { cooldownMs: b.cooldown_minutes * 60_000 } : {}),
-        ...(b?.recovery_cooldown_minutes !== undefined
-          ? { recoveryCooldownMs: b.recovery_cooldown_minutes * 60_000 }
-          : {}),
-        ...(b?.max_dispatches_per_hour !== undefined
-          ? { maxDispatchesPerHour: b.max_dispatches_per_hour }
-          : {}),
-      });
-      log.info("pusher", "babysit dispatcher started", { enabled: b?.enabled ?? true });
-      if (stopped) stopBabysit();
-    })
-    .catch((e) => {
+      // A THROW HERE LEAVES THE SWEEP UNSTARTED, DELIBERATELY, and must not reach the error arm
+      // below. We KNOW the user's setting at this point; if we cannot start with it, starting
+      // WITHOUT it would substitute the shipped default for a setting we have already read — which
+      // is `enabled = false` failing open, the one outcome this whole section exists to prevent.
+      // Not started is recoverable (the config subscription re-applies on the next change, and a
+      // relaunch retries); silently running against the user's explicit off is not.
+      try {
+        applyBabysit(eff.config.babysit);
+        log.info("pusher", "babysit dispatcher started", {
+          enabled: eff.config.babysit?.enabled ?? true,
+        });
+      } catch (err) {
+        log.warn("pusher", "babysit dispatcher failed to start; NOT falling back to defaults", {
+          error: String(err),
+          configuredEnabled: eff.config.babysit?.enabled ?? true,
+        });
+      }
+    },
+    (e) => {
+      // A read that ERRORED is not a user asking for the sweep to stop, and the sweep is compiled
+      // into this build, so shipped defaults is the honest starting point. `enabled = false` is
+      // honoured the moment a read succeeds — including the subscription below.
       log.warn("pusher", "babysit config read failed; starting on shipped defaults", {
         error: String(e),
       });
       if (stopped) return;
       try {
-        stopBabysit = startBabysitDispatcher();
-        if (stopped) stopBabysit();
+        applyBabysit(undefined);
       } catch (err) {
         log.warn("pusher", "babysit dispatcher failed to start", { error: String(err) });
       }
-    });
+    },
+  );
+
+  // LIVE, like the Pusher policy above it. Read-once would mean a user editing `enabled = false` in
+  // the ⋯ Advanced panel watches Pushers stop immediately while the babysit sweep keeps dispatching
+  // until the app restarts, with nothing anywhere saying a restart is required — and for a switch
+  // whose purpose is stopping a loop that spends a full Claude session per dispatch, "it looks like
+  // it did nothing" invites another hand-edit rather than a restart.
+  void onConfigChanged((eff) => {
+    if (stopped) return;
+    // Same rule as the initial read: a failed re-apply leaves it stopped rather than reverting to
+    // defaults, because the reading we just failed to apply is the user's own.
+    try {
+      applyBabysit(eff.config.babysit);
+    } catch (err) {
+      log.warn("pusher", "babysit re-apply failed; sweep left stopped", { error: String(err) });
+    }
+  })
+    .then((un) => {
+      if (stopped) un();
+      else babysitUnlisten = un;
+    })
+    .catch((e) =>
+      log.warn("pusher", "babysit config subscription failed; switch is restart-only", {
+        error: String(e),
+      }),
+    );
 
   return () => {
     stopped = true;
     stopRunner();
     stopConflicts?.();
     stopBabysit?.();
+    babysitUnlisten?.();
     unlisten?.();
   };
 }
