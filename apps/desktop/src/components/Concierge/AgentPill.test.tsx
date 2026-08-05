@@ -30,9 +30,9 @@ function agent(over: Partial<MentionAgent> & { id: string; name: string }): Ment
 const KRAKEN = agent({ id: "agent-7", name: "Kraken Auth", band: "needs_you" });
 
 function ctx(over: Partial<AgentPillContextValue> = {}): AgentPillContextValue {
-  // `() => true` — the opener REPORTS whether the reveal landed, and these rows are about the
-  // successful path. A handler returning undefined reads as "it did not land", which is the point
-  // of the return value (see AgentPill.deadEnd.test.tsx).
+  // `"revealed"` — the opener REPORTS WHAT THE READER SAW, and these rows are about the path where
+  // something moved. The other two outcomes ("gone", "already-showing") each produce a visible
+  // sentence instead, and both are covered in AgentPill.deadEnd.test.tsx.
   return { agents: [KRAKEN], onOpenAgent: vi.fn((): RevealOutcome => "revealed"), ...over };
 }
 

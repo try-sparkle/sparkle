@@ -62,7 +62,7 @@ import { bandCountLabel } from "../engine/statusBandLabels";
 import { rosterLine } from "../engine/conciergeRosterLine";
 import { oneLine } from "./promptHistory";
 import { openProjectTab } from "../services/openProjectTab";
-import { revealOutcomeFor } from "../services/agentReveal";
+import { revealOutcomeFor, type RevealOutcome } from "../services/agentReveal";
 import { useHistoryStore } from "../stores/historyStore";
 import { useConciergeMessageStatuses, waitingLine } from "../services/conciergeMessageStatuses";
 import {
@@ -2603,17 +2603,42 @@ export function ConciergeHost({
    * A top-level agent passes through untouched — it owns its row, so there is nothing to expand and
    * no filter to clear.
    */
-  const revealAgent = useCallback((a: ConciergeAgent) => {
+  const revealAgent = useCallback((a: ConciergeAgent): RevealOutcome => {
+    // TAKEN FIRST, before anything below writes. Same reason `openAgentFromPill` takes it first:
+    // every write on this path is idempotent, so afterwards "it was already like that" and "I just
+    // made it so" are indistinguishable from the store (bead sparkle-ixsb3).
+    const planned = revealOutcomeFor(a.projectId, a.id);
+    // …AND THE ROW-SURFACING COUNTS AS A VISIBLE CHANGE. `revealOutcomeFor` models the reveal
+    // path's writes, not these two, so a worker whose band was filtered out or whose orchestrator
+    // was collapsed would otherwise be reported as "already showing" while a row the reader could
+    // not see a moment ago appears. Measured rather than assumed: both setters are no-ops when the
+    // state already holds, so this is only true when something really was hidden.
+    let surfaced = false;
     if (a.parentRowId !== null) {
       const ui = useUiStore.getState();
+      surfaced =
+        !ui.statusFilter.needs_you ||
+        !ui.statusFilter.running ||
+        !ui.statusFilter.done ||
+        (ui.collapsedOrchestrators[a.parentRowId] ?? true);
       ui.showAllStatusBands();
       ui.expandOrchestrators([a.parentRowId]);
     }
+    // NO UP-FRONT BAIL ON A `"gone"` PREDICTION, unlike `openAgentFromPill`. That guard exists there
+    // because a doomed `openProjectTab` would yank the reader to another project's tab and only then
+    // report the miss (roborev 55548) — a notice contradicting what just happened on screen. This
+    // path has never had it, its callers report the miss from the boolean below, and adding one here
+    // would change which of the two sources of truth decides an agent is gone. The prediction is
+    // consulted for ONE thing: telling `"already-showing"` apart from a real reveal.
+    //
     // RETURNED, not discarded. `openProjectTab` reports a miss (unknown project, or an agent that
     // closed between the render and the click) by returning false, silently — and every caller that
     // suppresses the pill's own live notice on the grounds that "the caller reports the outcome" is
-    // relying on this value existing (roborev 56068).
-    return openProjectTab(a.projectId, a.id);
+    // relying on this value existing (roborev 56068). The ATTEMPT outranks the prediction in both
+    // directions: a `false` here is `"gone"` whatever was predicted, and a reveal that landed while
+    // the prediction said `"gone"` is reported as `"revealed"` — never as a claim that nothing moved.
+    if (!openProjectTab(a.projectId, a.id)) return "gone";
+    return !surfaced && planned === "already-showing" ? "already-showing" : "revealed";
   }, []);
 
 
@@ -2709,7 +2734,22 @@ export function ConciergeHost({
   const revealAgentById = useCallback(
     (agentId: string, fallbackName?: string) => {
       const a = resolveAgent(agentId);
-      if (a && revealAgent(a)) return;
+      const outcome = a ? revealAgent(a) : "gone";
+      if (outcome === "revealed") return;
+      // THE THIRD OUTCOME, WHICH THIS FUNCTION USED TO HAVE NO WORDS FOR. A card pill IS a wired
+      // surface, and `AgentPill` deliberately renders no notice of its own when a caller supplies
+      // `onOpen` — on the stated grounds that the caller reports the outcome. That grounding
+      // enumerated only "resolved" and "did not land", so an agent whose column was already showing
+      // it produced `true` here and silence everywhere: the founder's exact bug, on the surfaces
+      // (NudgeCard, RecapCard) that name freshly-spawned agents and therefore hit the
+      // already-showing state most often (roborev 58643).
+      //
+      // NOT the "isn't open any more" line, which would be a false claim about a live agent — the
+      // same false-claim direction roborev 55548/55590 fixed twice in the pill itself.
+      if (outcome === "already-showing" && a) {
+        postSparkle(line`${ref(a)} is already open in ${plain(a.projectName)}.`);
+        return;
+      }
       const named = a ?? (fallbackName ? { id: agentId, name: fallbackName } : null);
       postSparkle(
         named

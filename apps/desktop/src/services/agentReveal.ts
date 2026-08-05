@@ -61,7 +61,10 @@ export type RevealOutcome =
  * The conditions below are the WRITES `openProjectTab` + `selectAndOpen` perform, one for one, in
  * the same order. If you add a write to either, add its condition here — a missing one makes this
  * over-report `already-showing`, which puts a "nothing moved" sentence on screen next to a screen
- * that did move. The test for that lives in services/agentReveal.test.ts.
+ * that did move. `agentReveal.outcome.test.ts` guards it from BOTH sides: a row per condition,
+ * plus a mirror test that runs the REAL `openProjectTab` from an already-showing state and
+ * asserts the stores come back byte-identical. The per-condition rows alone would all stay
+ * green if a new write were added to the reveal path — the mirror is what actually fails.
  */
 export function revealOutcomeFor(projectId: string, agentId: string): RevealOutcome {
   const ps = useProjectStore.getState();

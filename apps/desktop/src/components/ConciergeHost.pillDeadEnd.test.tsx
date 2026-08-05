@@ -16,7 +16,7 @@
 // drew the pill and the click that lands on it — and it is produced below by removing the agent
 // from projectStore after mounting, which is what actually happens when an agent is closed.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 
 vi.mock("@tauri-apps/plugin-opener", () => ({
   openUrl: vi.fn(() => Promise.resolve()),
@@ -249,6 +249,37 @@ describe("(e) the host tells the reader when the reveal had nothing to do", () =
     // And a live agent is not labelled dead.
     expect(document.body.textContent ?? "").not.toMatch(/closed/i);
     expect(screen.queryByTestId("concierge-agent-pill-closed")).toBeNull();
+  });
+
+  /** THE CALLER-OWNED PATH. `NudgeCard` supplies `onOpen`, so `AgentPill` renders NO notice of its
+   *  own there — deliberately, because the caller reports the outcome through the column's one
+   *  announcer. That reporting enumerated only "does not resolve" and "does not land", so an
+   *  already-showing agent produced silence: the founder's exact bug, surviving the first cut of
+   *  this fix on precisely the surfaces that name freshly-spawned agents (roborev 58643). */
+  function nudgeFeed() {
+    const feed = JSON.parse(JSON.stringify(FEED_P2));
+    const counts = { needs_you: 1, running: 0, done: 0 };
+    feed.projects[1].agents[0].band = "needs_you";
+    feed.projects[1].agents[0].status = "waiting";
+    feed.counts = counts;
+    feed.scopedCounts = counts;
+    feed.projects[1].counts = counts;
+    feed.projects[1].scopedCounts = counts;
+    return feed as unknown as ConciergeFeed;
+  }
+
+  it("says it through the TRANSCRIPT for a card pill, which owns its own outcome", () => {
+    seedAlreadyShowing();
+    setConciergeChat(() => []);
+    render(<ConciergeHost feed={nudgeFeed()} />);
+
+    // The pill on the nudge card — the `onOpen` path, not the context one.
+    fireEvent.click(within(screen.getByTestId("concierge-nudge")).getByTestId("concierge-agent-pill"));
+
+    // A line in the column, because the card pill has no live region of its own to speak with.
+    expect(document.body.textContent ?? "").toMatch(/Build 8 is already open in other\./i);
+    // And NOT the "isn't open any more" line, which would be a false claim about a live agent.
+    expect(document.body.textContent ?? "").not.toMatch(/isn't open any more/i);
   });
 
   it("still NAVIGATES — and stays silent — when there really is somewhere to go", () => {

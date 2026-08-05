@@ -10,6 +10,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
 import { revealOutcomeFor } from "./agentReveal";
+import { openProjectTab } from "./openProjectTab";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
@@ -112,6 +113,51 @@ describe("revealOutcomeFor", () => {
 
     seedAlreadyShowing({ ui: { workModeBySide: { left: "build", right: "plan" } } });
     expect(revealOutcomeFor("p2", "ag2")).toBe("already-showing");
+  });
+
+  // ══ THE CONTRACT, CHECKED FROM THE OTHER SIDE ════════════════════════════════════════════════
+  //
+  // Every row above breaks ONE condition and asserts the prediction notices. All of them would stay
+  // green if a NEW write were added to `openProjectTab`/`selectAndOpen` without a matching condition
+  // in `revealOutcomeFor` — which is precisely the drift the module header names as the danger,
+  // because it makes the pill print "nothing moved" over a screen that moved.
+  //
+  // So this asserts the equivalence itself, against the REAL reveal path rather than a restatement
+  // of it: from a state `revealOutcomeFor` calls `"already-showing"`, running the actual
+  // `openProjectTab` must leave every store byte-identical. Add an unmodelled write and this fails,
+  // and it is the only test here that can (roborev 58643).
+  describe("the prediction MATCHES what the real reveal path does", () => {
+    /** Everything the reveal path is able to touch, deep-compared. */
+    const stores = () =>
+      JSON.stringify({
+        ui: useUiStore.getState(),
+        projects: useProjectStore.getState().projects,
+        selectedProjectId: useProjectStore.getState().selectedProjectId,
+        openAgentIds: useRuntimeStore.getState().openAgentIds,
+      });
+
+    it("already-showing means openProjectTab genuinely changes NOTHING", () => {
+      expect(revealOutcomeFor("p2", "ag2")).toBe("already-showing");
+
+      const before = stores();
+      const landed = openProjectTab("p2", "ag2");
+      const after = stores();
+
+      expect(landed).toBe(true); // it "landed" — that is the very claim that was misleading
+      expect(after).toBe(before); // …while changing nothing the reader could see
+    });
+
+    it("revealed means openProjectTab genuinely changes SOMETHING", () => {
+      // The mirror of the mirror: a prediction that never said "revealed" would pass the row above
+      // vacuously. Break one condition and the real path must actually write.
+      useRuntimeStore.setState({ openAgentIds: [] } as never);
+      expect(revealOutcomeFor("p2", "ag2")).toBe("revealed");
+
+      const before = stores();
+      openProjectTab("p2", "ag2");
+
+      expect(stores()).not.toBe(before);
+    });
   });
 
   it("writes NOTHING — it is a prediction, and calling it must not change the answer", () => {

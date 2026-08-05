@@ -292,10 +292,11 @@ export function AgentPill({
    * that is the common case here, not the exotic one.
    *
    * ANY VALUE RETURNED IS SILENTLY DISCARDED, and this is the difference between this prop and
-   * `onOpenAgent` (roborev 55988). `onOpenAgent`'s `false` means "nothing on screen changed", which
-   * this pill turns into a visible "…is closed". A caller that owns the reveal has taken over that
-   * reporting (`ConciergeHost.revealAgent` speaks through the column's one announcer), so this pill
-   * deliberately renders no notice at all — see `ownsOutcome` below.
+   * `onOpenAgent` (roborev 55988). `onOpenAgent` returns a `RevealOutcome` that this pill turns into
+   * a visible sentence — "…is closed" for `"gone"`, "…is already open in X" for
+   * `"already-showing"`. A caller that owns the reveal has taken over that reporting
+   * (`ConciergeHost.revealAgentById` speaks all three outcomes through the column's one announcer),
+   * so this pill deliberately renders no notice at all — see `ownsOutcome` below.
    *
    * THE `void` HERE IS A CONVENTION THE COMPILER WILL NOT ENFORCE (roborev 56002). TypeScript's
    * void-return bivariance makes `() => boolean` assignable to `() => void`, so a caller CAN still
@@ -451,9 +452,12 @@ export function AgentPill({
   // cards up it was several.
   //
   // `onOpen` is the exact signal: a caller that supplies its own reveal has taken responsibility for
-  // saying whether it landed — `ConciergeHost.revealAgentById` posts a "…isn't open any more" line
-  // when the id does not resolve OR the reveal does not land, which is the ONLY thing that makes
-  // this suppression safe. It was NOT true when the suppression was written: `revealAgent` dropped
+  // saying what the reader saw — `ConciergeHost.revealAgentById` posts a line for EVERY
+  // non-navigating outcome, which is the ONLY thing that makes this suppression safe. It must cover
+  // all three: it enumerated only "does not resolve" and "does not land" and therefore said nothing
+  // at all for an already-showing agent, which put the original dead click straight back on the
+  // card surfaces (roborev 58643). A fourth outcome added to `RevealOutcome` owes this list an
+  // entry too. It was NOT true when the suppression was written: `revealAgent` dropped
   // `openProjectTab`'s boolean, so a pill whose agent closed between render and click did nothing at
   // all on exactly the two surfaces that supply `onOpen` (roborev 56068). If you add a third
   // `onOpen` caller, it owes the reader that sentence too —
@@ -490,7 +494,13 @@ export function AgentPill({
         // decides where the click lands, so the disambiguating "(project)" suffix `mentionRoster`
         // adds for the composer would only be chrome here. The project belongs in the tooltip, where
         // it answers "which of these four is this one" without widening every pill to carry it.
-        title={notice ?? `Open ${agent.name} in ${agent.projectName}`}
+        // ONLY THE CLOSED SENTENCE TAKES THE TOOLTIP OVER. An `already-showing` notice is a
+        // one-shot answer to one click, but a `title` persists — so substituting it left the pill
+        // reading "…is already open in X." forever, including after that pair moved to another
+        // project, at which point the tooltip is a false claim and the documented "which of these
+        // four is this one" affordance is gone. It fires on the FIRST click of every freshly-spawned
+        // agent's pill, so this is the common path, not a rare one (roborev 58643).
+        title={showClosed ? notice! : `Open ${agent.name} in ${agent.projectName}`}
         // ALWAYS RE-ATTEMPTS, and derives the state from the FRESH outcome. An earlier version made
         // the first click on an explained pill merely dismiss the notice and return, which meant
         // that after the reader reopened the project the pill still claimed the agent was closed

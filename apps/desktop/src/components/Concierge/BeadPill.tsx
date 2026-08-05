@@ -95,9 +95,18 @@ export interface BeadPillContextValue {
   beads: ReadonlyMap<string, ResolvedBead>;
   /** Open the Plan board focused on this bead, and report whether it LANDED.
    *
-   *  THE RETURN VALUE IS THE CONTRACT, exactly as it is for `AgentPillContextValue.onOpenAgent`:
-   *  `false` means nothing on screen changed, and the card turns that into a sentence rather than
-   *  leaving the reader looking at an unchanged screen.
+   *  THE RETURN VALUE IS THE CONTRACT: `false` means the board could not be focused on this bead,
+   *  and the card turns that into a sentence rather than leaving the reader looking at an unchanged
+   *  screen. Stated in its own terms rather than by reference to
+   *  `AgentPillContextValue.onOpenAgent`, which it used to point at and which no longer returns a
+   *  boolean at all.
+   *
+   *  IT CARRIES THE SAME UNCLOSED GAP THAT POINTER USED TO SHARE, and it is worth knowing about
+   *  before trusting this value: `true` here means the OPEN RAN, not that anything moved. A board
+   *  already focused on this bead reports success and the card says nothing, which is exactly the
+   *  invisible click `AgentPillContextValue.onOpenAgent` grew a three-way `RevealOutcome` to fix
+   *  (bead sparkle-ixsb3 / roborev 58643). Deliberately NOT changed here — the board path has its
+   *  own reveal semantics and no reported bug — but a `RevealOutcome` is the shape it wants.
    *
    *  AN OBJECT, NOT TWO POSITIONAL STRINGS (roborev 54894). Both fields are `string`, so a swapped
    *  pair typechecks cleanly and its only symptom is a board that focuses nothing.
