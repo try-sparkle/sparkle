@@ -133,26 +133,30 @@ describe("useConciergeMessageStatuses", () => {
    * NO TONE, AND NO CLOCK READING. The tone used to ride down from here; it is the leaf's now, and a
    * producer that grew one back would put the 1 Hz ticker in the host again (roborev 57889-M2).
    *
-   * Asserted as the ABSENCE OF A TONE rather than as an exact key list, and the difference matters:
- * the key list said `["text"]`, so it also failed for `live` — a static boolean that is a fact about
- * the QUEUE (is this the running entry?) and requires reading no clock at all. That is exactly the
- * kind of addition this rule should permit, so enumerating keys asserts something STRICTER than the
- * invariant documented here. What must never appear is `tone`, or any other field whose value is a
- * reading of elapsed time — and that, not the key set, is what this case checks.
+   * Asserted as the WHOLE SHAPE rather than a key census or a single forbidden name. What must never
+ * appear is `tone`, or any other field whose value is a reading of elapsed time — and since such a
+ * field can be called anything, the only assertion that actually enforces it is an exhaustive one.
+ * See the body for the two weaker forms that were tried and why each failed.
    */
   it("hands down no tone and no clock reading", () => {
     const floor = seqNow();
     noteConciergeSent();
     noteConciergePhase("composing");
     const { result } = renderHook(() => useConciergeMessageStatuses("msg-1", true, floor));
-    const status = result.current["msg-1"]!;
-    // THE INVARIANT, and only it: nothing handed down is a reading of elapsed time. An exhaustive
-    // key list was tried here and removed (roborev 58532-M2) — it asserted something STRICTER than
-    // the rule it documents, so the next legitimate static field (another queue fact, costing no
-    // clock) would break this case for exactly the reason the rule permits it.
-    expect(status).not.toHaveProperty("tone");
-    // `live` is the one field beside the phrase, and it is a static boolean rather than a clock read.
-    expect(typeof status.live).toBe("boolean");
+    // THE WHOLE SHAPE, in the file's own idiom (roborev 58543). Two weaker forms were tried first
+    // and both were wrong in opposite directions:
+    //
+    //   • a bare key census — `Object.keys(status).sort()` — which reads as a spelling test rather
+    //     than the invariant, and contradicted the docstring above it;
+    //   • `not.toHaveProperty("tone")` alone, which forbids ONE NAME. A producer that regrew a
+    //     time-derived field as `ageMs`, `since`, `elapsedLabel` or `stale` would sail through, and
+    //     that is precisely the regression that puts the 1 Hz ticker back in the host.
+    //
+    // An exhaustive `toEqual` closes both: any field the producer grows fails here, and the reader
+    // sees the shape rather than a list of names. The claim that this over-constrains does not hold
+    // against the rest of this file, which already pins waiting entries to `{ text }` exactly — a
+    // new static field breaks those regardless, so nothing was bought by loosening this one.
+    expect(result.current["msg-1"]).toEqual({ text: "Composing", live: true });
   });
 
   /**
