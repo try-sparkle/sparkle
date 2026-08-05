@@ -380,6 +380,61 @@ describe("ConciergeHost — a concierge-bound message is never screen-checked", 
   });
 });
 
+// ══ SELECTING A DIFFERENT BUILD AGENT RE-POINTS THE MOUNT (bead sparkle-k5kit part 3) ══════════
+//
+// The founder: *"I clicked on Improve Sparkle bottom right corner… it still showed it as mounted. So
+// when I clicked on the Improve Sparkle Build Agent, it showed a mounted version of Concierge
+// content, which is wrong."* Whatever the mount was keyed on was not being invalidated when the
+// selected agent changed.
+//
+// The routing half and the display half are both derived from `promptTarget`, so a re-point should
+// be automatic — but "should be" is what this cluster has been wrong about five times, and NOTHING
+// in this suite moved the selection while mounted. These rows move it and assert both halves.
+describe("ConciergeHost — the mount follows the selected agent", () => {
+  it("routes to the NEWLY selected agent after the selection moves", async () => {
+    const view = mount();
+    await send("first, to the original mount");
+    await elapse();
+    expect(h.dispatchConciergeAnswer.mock.calls[0]![0]).toBe("ag1");
+
+    // The founder clicks a different build row. Same cable, different agent.
+    view.rerender(
+      <ConciergeHost
+        feed={FEED}
+        promptTarget={{ projectId: "p1", agentId: "ag2", name: "Kraken Auth" }}
+      />,
+    );
+    await send("second, to the new one");
+    await elapse();
+    expect(h.dispatchConciergeAnswer).toHaveBeenCalledTimes(2);
+    // THE ASSERTION THAT MATTERS: the second message went to ag2, not to the agent that was mounted
+    // when the column first rendered. A mount keyed on something staler than the selection sends
+    // both to ag1 — which is the founder's report, from the routing side.
+    expect(h.dispatchConciergeAnswer.mock.calls[1]![0]).toBe("ag2");
+  });
+
+  // AND THE DISPLAY HALF, which is what he actually SAW. The pane must show the newly selected
+  // agent's conversation — its accessible label names whose it is, so a pane still pointed at the
+  // previous agent (or fallen back to the concierge thread) fails here.
+  it("re-points the pane's conversation to the newly selected agent", async () => {
+    const view = mount();
+    expect(screen.getByTestId(MOUNTED_THREAD_TESTID).getAttribute("aria-label")).toContain(
+      "Blueprint UI/UX",
+    );
+    view.rerender(
+      <ConciergeHost
+        feed={FEED}
+        promptTarget={{ projectId: "p1", agentId: "ag2", name: "Kraken Auth" }}
+      />,
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId(MOUNTED_THREAD_TESTID).getAttribute("aria-label")).toContain(
+        "Kraken Auth",
+      ),
+    );
+  });
+});
+
 // ══ THE PRECONDITION EVERY OTHER ROW RESTS ON ═══════════════════════════════════════════════════
 // Asserted FIRST and on its own, because the first cut of this suite silently failed it: the column
 // never entered the mounted state, so every "what the founder sees" assertion below was reading the
