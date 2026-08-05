@@ -472,10 +472,18 @@ fn mark_exhausted_at(
         .iter_mut()
         .find(|a| a.id == id)
         .ok_or_else(|| format!("account not found: {id}"))?;
-    acct.exhausted_until = Some(until_epoch);
-    // Stamp WHOSE exhaustion this is, so a later "Switch login" cannot hand the bench to a
-    // different Anthropic account — see `Account::exhausted_identity`.
-    acct.exhausted_identity = identity_key_for(acct, home);
+    // ONE ownership record: both fields move together or neither does. Policy and its rationale live
+    // once, on [`effective_exhaustion`].
+    match identity_key_for(acct, home) {
+        Some(key) => {
+            acct.exhausted_until = Some(until_epoch);
+            acct.exhausted_identity = Some(key);
+        }
+        // No owner on record yet: an unowned bench is honoured and expires within the limit window,
+        // so recording it is strictly better than dropping an observed rate limit.
+        None if acct.exhausted_identity.is_none() => acct.exhausted_until = Some(until_epoch),
+        None => {}
+    }
     write_accounts_at(accounts_path, &accounts)
 }
 
@@ -1681,28 +1689,44 @@ fn ceiling_cache_lookup(cache: &CeilingCache, key: &str, now: i64) -> Option<Vec
 /// until the epoch passes. Same class as the learned ceiling carrying another person's history,
 /// on a different field.
 ///
-/// So it is surfaced only when it is still in the future AND was recorded by the identity currently
-/// behind the directory. A row with no recorded identity predates the field and is HONOURED: the
-/// limit resets within ~5h so it ages out by itself, and routing work INTO an exhausted account is
-/// the worse of the two errors.
-fn effective_exhaustion(acct: &Account, current_identity: Option<&str>, now: i64) -> Option<i64> {
+/// It must still be in the future, and then the policy is THREE-way, not two:
+///   * recorded owner matches the current identity → honoured;
+///   * the current identity cannot be RESOLVED → honoured. "Can't tell" is not "somebody else",
+///     and the config file is rewritten continuously so an unreadable tick is routine;
+///   * a KNOWN different login → cleared.
+///
+/// A row with no recorded identity predates the field and is honoured too: the limit resets within
+/// ~5h so it ages out by itself. Throughout, routing work INTO an exhausted account is the worse of
+/// the two errors, which is why every uncertain case honours the bench rather than dropping it.
+///
+/// Why "cannot resolve" is honoured rather than cleared: Claude Code rewrites
+/// `<config_dir>/.claude.json` continuously, so a truncated mid-write read is a routine tick and
+/// `limitSync` samples it on a 60s poll. Clearing there would make a rate-limited account read as
+/// healthy and cost an `accounts.json` read-modify-write under `AccountsLock` every poll instead of
+/// a no-op. The matching write-side rule is that both fields move together or neither does — never
+/// a new timestamp under a stale owner, and never a cleared owner under a live bench.
+///
+/// The comparison checks BOTH rungs of the identity ladder (uuid and email form), because
+/// [`identity_key`] returns the uuid once a login records one, so an unchanged login's key changes
+/// the first time `accountUuid` appears — a ladder climb is not a different account.
+fn effective_exhaustion(acct: &Account, current: Option<&OauthIdentity>, now: i64) -> Option<i64> {
     let until = acct.exhausted_until.filter(|&e| e > now)?;
-    match (acct.exhausted_identity.as_deref(), current_identity) {
+    // BOTH rungs of the ladder, not just the preferred key. `identity_key` returns the uuid when the
+    // login records one and the email form otherwise, so ONE unchanged login's key CHANGES the
+    // moment Claude Code refreshes a profile and `accountUuid` first appears. Comparing only the
+    // preferred key reads that as a different account and drops a real bench — the same
+    // ladder-climb-is-not-a-takeover rule already implemented for the identity ledger, which I
+    // failed to carry across to this comparison.
+    let matches = |owner: &str| {
+        current.is_some_and(|c| {
+            c.account_uuid.as_deref() == Some(owner) || email_key(c) == owner
+        })
+    };
+    match (acct.exhausted_identity.as_deref(), current) {
         (None, _) => Some(until), // legacy row: honour, it expires on its own
-        (Some(owner), Some(cur)) => {
-            // Cleared ONLY for a KNOWN different login.
-            if owner == cur { Some(until) } else { None }
-        }
-        // Owner recorded, but we cannot resolve who is behind the directory RIGHT NOW. That is
-        // "can't tell", not "somebody else" — and treating it as somebody else inverted this
-        // function's own policy. Claude Code rewrites `<config_dir>/.claude.json` continuously, so a
-        // truncated mid-write read (or a momentarily unavailable dir) yields None for a single tick:
-        // the bench would vanish from AccountUsage, a rate-limited account would read as healthy,
-        // and limitSync would re-mark it on the next poll — an accounts.json read-modify-write under
-        // AccountsLock every 60s instead of a no-op. The WRITE side already picks "honour" when it
-        // cannot identify the owner (it stores None, which the first arm honours forever); this arm
-        // makes the read side agree.
-        (Some(_), None) => Some(until),
+        // Cleared ONLY for a KNOWN different login — matched on either rung.
+        (Some(owner), Some(_)) => matches(owner).then_some(until),
+        (Some(_), None) => Some(until), // can't tell ≠ somebody else — see the policy above
     }
 }
 
@@ -1762,8 +1786,8 @@ fn usage_for_account(acct: &Account, now: i64, generation: u64) -> (AccountUsage
             tokens_7d,
             exhausted_until: effective_exhaustion(
                 acct,
-                identity_key_for(acct, std::env::var_os("HOME").map(PathBuf::from).as_deref())
-                    .as_deref(),
+                identity_for_account(acct, std::env::var_os("HOME").map(PathBuf::from).as_deref())
+                    .as_ref(),
                 now,
             ),
         },
@@ -2665,6 +2689,16 @@ pub async fn claude_auth_status(config_dir: Option<String>) -> ClaudeAuthStatus 
 
 #[cfg(test)]
 mod tests {
+    /// Build an `OauthIdentity` for the exhaustion tests. `uuid`/`email` are independent so both
+    /// rungs of the identity ladder can be exercised.
+    fn oauth(uuid: Option<&str>, email: &str) -> OauthIdentity {
+        OauthIdentity {
+            email: email.to_string(),
+            organization: None,
+            account_uuid: uuid.map(str::to_string),
+        }
+    }
+
     use super::*;
 
     // ── Event-loop offload guards ───────────────────────────────────────────────────────────────
@@ -3516,9 +3550,9 @@ mod tests {
             "the bench must record WHICH login earned it"
         );
         // …and it round-trips: a different login does not inherit it, the same one does.
-        assert_eq!(effective_exhaustion(&stored[0], Some("uuid-other"), 1_700_000_000), None);
+        assert_eq!(effective_exhaustion(&stored[0], Some(&oauth(Some("uuid-other"), "other@x.com")), 1_700_000_000), None);
         assert_eq!(
-            effective_exhaustion(&stored[0], Some("uuid-mine"), 1_700_000_000),
+            effective_exhaustion(&stored[0], Some(&oauth(Some("uuid-mine"), "me@example.com")), 1_700_000_000),
             Some(1_700_003_600)
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -3576,6 +3610,96 @@ mod tests {
     }
 
     #[test]
+    fn a_re_mark_with_an_unreadable_config_does_not_erase_the_recorded_owner() {
+        // roborev 58228. The write side used to assign unconditionally, so a transiently
+        // unresolvable read (Claude Code rewrites .claude.json continuously; limitSync re-marks on a
+        // poll cadence, sampling that window repeatedly) overwrote a KNOWN owner with None. That
+        // turns the row into a LEGACY row, legacy rows are honoured unconditionally, and the next
+        // genuinely different login then inherits a bench it never earned — with the provenance
+        // destroyed and unrecoverable. Losing it on a RE-mark is strictly worse than never having it.
+        let dir = unique_dir("remark-keeps-owner");
+        write_claude_json(
+            &dir,
+            r#"{"oauthAccount":{"emailAddress":"me@example.com","accountUuid":"uuid-mine"}}"#,
+        );
+        let path = dir.join("accounts.json");
+        write_accounts_at(&path, &[sample("a", false, dir.to_str().unwrap())]).unwrap();
+
+        mark_exhausted_at(&path, "a", 1_700_003_600, None).unwrap();
+        assert_eq!(read_accounts_at(&path).unwrap()[0].exhausted_identity.as_deref(), Some("uuid-mine"));
+
+        // The config becomes unreadable mid-write, and a poll re-marks in that tick.
+        std::fs::remove_file(dir.join(".claude.json")).unwrap();
+        mark_exhausted_at(&path, "a", 1_700_007_200, None).unwrap();
+
+        let stored = read_accounts_at(&path).unwrap();
+        assert_eq!(
+            stored[0].exhausted_identity.as_deref(),
+            Some("uuid-mine"),
+            "an unreadable tick must not erase who earned the bench"
+        );
+        // Which is what keeps the inheritance guard working afterwards.
+        assert_eq!(effective_exhaustion(&stored[0], Some(&oauth(Some("uuid-other"), "other@x.com")), 1_700_000_000), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_bench_is_never_paired_with_a_stale_owner() {
+        // The half-measure that preserving the owner introduced: advancing `exhausted_until` while
+        // keeping the PREVIOUS login's name pairs a new login's bench with the old owner. Once the
+        // config resolves, effective_exhaustion reads that as a mismatch, drops a REAL bench, and
+        // pickAccount routes work into a still-rate-limited login. The two fields are one record.
+        let dir = unique_dir("bench-pair-atomic");
+        write_claude_json(&dir, r#"{"oauthAccount":{"emailAddress":"a@x.com","accountUuid":"uuid-a"}}"#);
+        let path = dir.join("accounts.json");
+        write_accounts_at(&path, &[sample("a", false, dir.to_str().unwrap())]).unwrap();
+        mark_exhausted_at(&path, "a", 1_700_003_600, None).unwrap();
+
+        // The config becomes unreadable and a NEW limit is observed in that tick.
+        std::fs::remove_file(dir.join(".claude.json")).unwrap();
+        mark_exhausted_at(&path, "a", 1_700_007_200, None).unwrap();
+
+        let stored = read_accounts_at(&path).unwrap();
+        assert_eq!(
+            (stored[0].exhausted_until, stored[0].exhausted_identity.as_deref()),
+            (Some(1_700_003_600), Some("uuid-a")),
+            "neither field moves without the other — no new timestamp under a stale owner"
+        );
+        // …so the standing bench still protects its own account rather than being dropped as a
+        // mismatch the moment the identity resolves again.
+        assert_eq!(
+            effective_exhaustion(&stored[0], Some(&oauth(Some("uuid-a"), "a@x.com")), 1_700_000_000),
+            Some(1_700_003_600)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_login_that_gains_a_uuid_keeps_its_own_bench() {
+        // THE LADDER, on this comparison too. identity_key is uuid-else-email, so one unchanged
+        // login's key changes from `email:<addr>` to `<uuid>` the moment Claude Code refreshes the
+        // profile and the field first appears. Comparing only the preferred key reads that as a
+        // different account and drops a real bench. I implemented this rule for the identity ledger
+        // and failed to carry it here (roborev, PR #1243).
+        let now = 1_700_000_000;
+        let mut acct = sample("a", false, "/dirs/a");
+        acct.exhausted_until = Some(now + 3_600);
+        acct.exhausted_identity = Some("email:same@example.com".to_string()); // filed pre-uuid
+
+        // Same login, now reporting a uuid it never reported before.
+        assert_eq!(
+            effective_exhaustion(&acct, Some(&oauth(Some("uuid-same"), "same@example.com")), now),
+            Some(now + 3_600),
+            "a ladder climb is the same login — its bench must survive"
+        );
+        // And a genuinely different login still does not inherit it.
+        assert_eq!(
+            effective_exhaustion(&acct, Some(&oauth(Some("uuid-other"), "other@example.com")), now),
+            None
+        );
+    }
+
+    #[test]
     fn an_exhaustion_does_not_survive_a_switch_to_a_different_login() {
         // knightwatch: an exhaustion is a fact about an ANTHROPIC ACCOUNT but is stored on a
         // REGISTRATION, and "Switch login" changes the identity under it. Surfacing it blindly
@@ -3587,12 +3711,12 @@ mod tests {
         acct.exhausted_identity = Some("uuid-old".to_string());
 
         assert_eq!(
-            effective_exhaustion(&acct, Some("uuid-old"), now),
+            effective_exhaustion(&acct, Some(&oauth(Some("uuid-old"), "old@x.com")), now),
             Some(now + 3_600),
             "the login that EARNED the bench still serves it"
         );
         assert_eq!(
-            effective_exhaustion(&acct, Some("uuid-new"), now),
+            effective_exhaustion(&acct, Some(&oauth(Some("uuid-new"), "new@x.com")), now),
             None,
             "a different login must NOT inherit it"
         );
@@ -3610,13 +3734,13 @@ mod tests {
         // their own, and routing work INTO an exhausted account is the worse of the two errors.
         let mut legacy = sample("b", false, "/dirs/b");
         legacy.exhausted_until = Some(now + 3_600);
-        assert_eq!(effective_exhaustion(&legacy, Some("uuid-any"), now), Some(now + 3_600));
+        assert_eq!(effective_exhaustion(&legacy, Some(&oauth(Some("uuid-any"), "any@x.com")), now), Some(now + 3_600));
 
         // And an expired exhaustion is never surfaced, whoever owned it.
         let mut past = sample("c", false, "/dirs/c");
         past.exhausted_until = Some(now - 1);
         past.exhausted_identity = Some("uuid-old".to_string());
-        assert_eq!(effective_exhaustion(&past, Some("uuid-old"), now), None);
+        assert_eq!(effective_exhaustion(&past, Some(&oauth(Some("uuid-old"), "old@x.com")), now), None);
     }
 
     #[test]
