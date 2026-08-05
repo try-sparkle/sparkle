@@ -675,12 +675,16 @@ export async function spawnBuildAgent(
  * `useStore` subscriptions; the DECISION it feeds (`evaluateCloudGate`) is shared, which is the half
  * that must not have two copies.
  *
- * `cloudAuthStore` is deliberately NOT persisted (a stale "auth configured" would wave a start
- * through into a guaranteed 400), so a cold store reads `method: null` — which the gate correctly
- * calls "no auth". For a HUMAN that is fine: the dialog probes on open, and the person is looking at
- * the result. A tool call has no such moment, so it probes here, once, before deciding. Without this
- * the first cloud spawn of every launch would be refused with "add your Claude authentication" for
- * an account that has it.
+ * `cloudAuthStore` is deliberately NOT persisted, so it is cold on every launch — and a cold store
+ * now reads as ALLOWED, not as "no auth". Unprobed is UNKNOWN, and nobody may refuse on a fact
+ * nobody looked up; `POST /sessions/start` is the definitive check and refuses with the server's own
+ * reason. A FAILED probe reads the same way, deliberately: `refresh` leaves `loaded` false on error,
+ * and blocking on that would refuse every cloud spawn for the rest of the sign-in over one flaky GET.
+ *
+ * So the probe here is an OPTIMISATION, not the gate: it discovers a genuinely missing credential
+ * before spending a server round-trip, and lets the tool answer with the specific "add your Claude
+ * authentication" guidance instead of a generic failure. Remove it and nothing becomes unsafe —
+ * spawns simply reach the server before being told no.
  */
 async function readCloudGate() {
   const cloudAuth = useCloudAuthStore.getState();
@@ -690,8 +694,12 @@ async function readCloudGate() {
     featureEnabled: auth.me?.cloudAgentsEnabled === true,
     signedIn: auth.tokenPresent,
     entitled: auth.me?.entitled === true,
-    // Re-read AFTER the await: the refresh above is the whole point of asking.
-    authConfigured: useCloudAuthStore.getState().method != null,
+    // Re-read AFTER the await: the refresh above is the whole point of asking. And an unprobed or
+    // FAILED probe still reads as allowed — `refresh` leaves `loaded` false when the GET fails, and
+    // refusing on that would state as fact something we never learned, for the rest of the sign-in.
+    // `POST /sessions/start` is the definitive check and refuses with the server's own reason.
+    authConfigured:
+      useCloudAuthStore.getState().method != null || !useCloudAuthStore.getState().loaded,
     balanceCents: auth.me?.balanceCents ?? 0,
   });
 }

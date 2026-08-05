@@ -92,12 +92,16 @@ function seed(opts: {
   goal?: string;
   /** Grant turn-end authority (a live hook stream). Default true. */
   authority?: boolean;
+  /** Which runtime the agent tab claims. Default local. */
+  runtime?: "local" | "cloud";
   /** Put the agent in `openAgentIds`. Default true. */
   open?: boolean;
 }): { projectId: string; agentId: string; agentName: string } {
   const store = useProjectStore.getState();
   const projectId = store.addProject("Demo", "/tmp/demo");
-  const agentId = useProjectStore.getState().addAgent(projectId, { kind: "build" })!;
+  const agentId = useProjectStore
+    .getState()
+    .addAgent(projectId, { kind: "build", ...(opts.runtime ? { runtime: opts.runtime } : {}) })!;
   if (opts.goal !== undefined) {
     useProjectStore.getState().setAgentGoal(projectId, agentId, opts.goal);
   }
@@ -580,6 +584,19 @@ describe("an auto-continue that never REACHES the terminal", () => {
     // The wrong diagnosis, and the one this arm used to give.
     expect(reason).not.toContain("its process is gone");
     expect(reason).not.toContain("Restart the agent");
+  });
+
+  it("still gives a LOCAL agent the terminal wording on the same path", async () => {
+    // The other half: the fix must not blanket-replace the local copy, which is correct and is what
+    // the vast majority of agents get.
+    alwaysRefuse("blocked-prompt");
+    const { projectId, agentId } = seed({ goal: "land the PR" });
+
+    await sweepUntilEligible(MAX_UNDELIVERED_CONTINUES);
+
+    const reason = goalOf(projectId, agentId)!.escalationReason!;
+    expect(reason).toContain("Nothing was typed into the terminal");
+    expect(reason).not.toContain("sandbox");
   });
 
   it("does not credit a QUEUED send as delivered — held is not typed", async () => {

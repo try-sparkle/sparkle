@@ -551,8 +551,7 @@ describe("uiStore persistence — exactly these keys reach the blob", () => {
       settingsRequest: null,
       composeFocusSeq: 0,
       revealAgentId: null,
-      newAgentRuntime: "local",
-      cloudCreateOpen: false,
+      cloudCreateProjectId: null,
       zeroCreditBannerDismissed: false,
       zeroCreditBannerDismissedFor: null,
       themePref: "auto",
@@ -571,8 +570,7 @@ describe("uiStore persistence — exactly these keys reach the blob", () => {
       settingsRequest: "accounts",
       composeFocusSeq: 7,
       revealAgentId: "a-42",
-      newAgentRuntime: "cloud",
-      cloudCreateOpen: true,
+      cloudCreateProjectId: "p-42",
       zeroCreditBannerDismissed: true,
       zeroCreditBannerDismissedFor: "acct-1",
     });
@@ -603,8 +601,7 @@ describe("uiStore rehydrate — a stale transient key in the blob must not be re
       settingsRequest: null,
       composeFocusSeq: 0,
       revealAgentId: null,
-      newAgentRuntime: "local",
-      cloudCreateOpen: false,
+      cloudCreateProjectId: null,
       zeroCreditBannerDismissed: false,
       zeroCreditBannerDismissedFor: null,
       themePref: "auto",
@@ -627,8 +624,7 @@ describe("uiStore rehydrate — a stale transient key in the blob must not be re
           settingsRequest: "accounts",
           composeFocusSeq: 7,
           revealAgentId: "a-42",
-          newAgentRuntime: "cloud",
-          cloudCreateOpen: true,
+          cloudCreateProjectId: "p-42",
           zeroCreditBannerDismissed: true,
           zeroCreditBannerDismissedFor: "acct-1",
         },
@@ -648,8 +644,7 @@ describe("uiStore rehydrate — a stale transient key in the blob must not be re
     expect(s.settingsRequest).toBeNull();
     expect(s.composeFocusSeq).toBe(0);
     expect(s.revealAgentId).toBeNull();
-    expect(s.newAgentRuntime).toBe("local");
-    expect(s.cloudCreateOpen).toBe(false);
+    expect(s.cloudCreateProjectId).toBeNull();
     expect(s.zeroCreditBannerDismissed).toBe(false);
     expect(s.zeroCreditBannerDismissedFor).toBeNull();
   });

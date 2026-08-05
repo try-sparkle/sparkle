@@ -159,6 +159,8 @@ describe("the AGENT's own set is weaker than the human's", () => {
         canAcceptInput: true,
         mark: "stuck",
         processAlive: true,
+        runtime: "local",
+        cloud: undefined,
       }).action,
     ).toBe("escalate");
   });
@@ -223,6 +225,8 @@ describe("the AGENT's own set is weaker than the human's", () => {
         canAcceptInput: true,
         mark: "stuck",
         processAlive: true,
+        runtime: "local",
+        cloud: undefined,
       });
     const before = ask();
     expect(before.action).toBe("none"); // latched: already escalated
@@ -284,6 +288,7 @@ describe("the AGENT's own set is weaker than the human's", () => {
       decideContinuation({
         goal: agent().goal, status: "idle", now: Date.now() + 60_000, idleSince: Date.now(),
         hasTurnEndAuthority: true, canAcceptInput: true, mark: "stuck", processAlive: true,
+        runtime: "local", cloud: undefined,
       }).action,
     ).toBe("none");
 
@@ -428,6 +433,8 @@ describe("escalation and the human's reset", () => {
       // `idle` witnesses its own liveness, but the field is required-but-nullable so a caller has to
       // say what it knows — CI caught this exact omission here, which is the gate working.
       processAlive: undefined,
+      runtime: "local",
+      cloud: undefined,
     });
     expect(d.action).toBe("continue");
   });

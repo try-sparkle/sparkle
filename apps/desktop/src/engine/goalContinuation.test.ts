@@ -12,12 +12,14 @@ import {
 } from "./agentGoal";
 import { isSystemAuthoredPrompt } from "./agentOriginated";
 import {
+  CLOUD_MIN_CONTINUE_CENTS,
   IDLE_SETTLE_MS,
   MAX_CONTINUES_TOTAL,
   MAX_CONTINUES_WITHOUT_PROGRESS,
   continuePrompt,
   decideContinuation,
   progressMark,
+  type CloudEvidence,
   type ContinuationInput,
 } from "./goalContinuation";
 
@@ -38,6 +40,11 @@ function ready(over: Partial<ContinuationInput> = {}): ContinuationInput {
     // `idle` needs no liveness proof, but the field is required-but-nullable so a caller cannot
     // forget to decide — see ContinuationInput.processAlive.
     processAlive: undefined,
+    // The baseline is a LOCAL agent, so it carries no cloud evidence. `readyCloud` below is the
+    // cloud counterpart, and it is a separate fixture on purpose: a cloud agent must clear every
+    // gate this one clears AND its own, so sharing a fixture would hide a gate that stopped running.
+    runtime: "local",
+    cloud: undefined,
     ...over,
   };
 }
@@ -468,3 +475,171 @@ describe("continuePrompt names an op the control surface actually has", () => {
     for (const op of named) expect(ops, `${op} is not in CONTROL_OPS`).toContain(op);
   });
 });
+
+// ── CLOUD AGENTS ────────────────────────────────────────────────────────────────────────────────
+//
+// A cloud agent used to be refused categorically, one gate up: the runner fed this function
+// `agentCanAcceptInput`, which is the LOCAL-PTY question and is false for every cloud agent by
+// design, so the whole feature was dead for cloud — never nudged, and (the bounds sit AFTER the
+// gates) never escalated either. These tests pin the two halves of the fix: a healthy cloud session
+// is continued exactly like a local agent, and every way a sandbox can be un-resumable is refused
+// BY NAME rather than by falling through some other arm.
+describe("cloud agents", () => {
+  /** A cloud agent in the same qualifying state as `ready()`: live sandbox, funded, relay up. */
+  function readyCloud(over: Partial<ContinuationInput> = {}): ContinuationInput {
+    return ready({
+      runtime: "cloud",
+      cloud: { sessionStatus: "active", balanceCents: 5_000, relayConnected: true },
+      ...over,
+    });
+  }
+
+  it("continues a resting cloud agent whose sandbox is active — the whole point", () => {
+    const d = decideContinuation(readyCloud());
+    expect(d.action).toBe("continue");
+    if (d.action !== "continue") throw new Error("unreachable");
+    expect(d.prompt).toContain("Ship the auto-continue PR");
+  });
+
+  it("REFUSES a hibernated sandbox by name — waking it is the user's billing decision", () => {
+    expect(decideContinuation(readyCloud({ cloud: cloudWith({ sessionStatus: "paused" }) }))).toEqual({
+      action: "none",
+      reason: "cloud-session-paused",
+    });
+  });
+
+  it("REFUSES a parked session by name — exhaustion, or it is asking its human", () => {
+    expect(decideContinuation(readyCloud({ cloud: cloudWith({ sessionStatus: "waiting" }) }))).toEqual(
+      { action: "none", reason: "cloud-session-waiting" },
+    );
+  });
+
+  it("refuses a sandbox that has not come up yet, and one that has finished", () => {
+    expect(
+      decideContinuation(readyCloud({ cloud: cloudWith({ sessionStatus: "pending" }) })),
+    ).toEqual({ action: "none", reason: "cloud-session-starting" });
+    for (const status of ["complete", "error", "something-a-future-server-invents"]) {
+      // An UNRECOGNISED lifecycle lands with the terminal ones rather than falling through to a
+      // send: a status this build has never heard of is not evidence of a healthy sandbox.
+      expect(decideContinuation(readyCloud({ cloud: cloudWith({ sessionStatus: status }) }))).toEqual(
+        { action: "none", reason: "cloud-session-ended" },
+      );
+    }
+  });
+
+  it("refuses when there is no CURRENT reading of the lifecycle — absence is not `active`", () => {
+    // Both shapes of ignorance, and they must agree: a window that never listed the project's
+    // sessions, and one whose reading has aged out (`cloudSessionStatusOf` expires its own).
+    expect(
+      decideContinuation(readyCloud({ cloud: cloudWith({ sessionStatus: undefined }) })),
+    ).toEqual({ action: "none", reason: "cloud-session-unknown" });
+    // …and a cloud agent that arrives with NO bundle at all is refused, never waved through.
+    expect(decideContinuation(readyCloud({ cloud: undefined }))).toEqual({
+      action: "none",
+      reason: "cloud-session-unknown",
+    });
+  });
+
+  it("refuses a wallet the server would 402 — and re-explains the park it caused", () => {
+    // A live sandbox we cannot afford to keep running: the wallet IS the whole story.
+    const brokeActive = cloudWith({ balanceCents: CLOUD_MIN_CONTINUE_CENTS - 1 });
+    expect(decideContinuation(readyCloud({ cloud: brokeActive }))).toEqual({
+      action: "none",
+      reason: "cloud-out-of-credits",
+    });
+    // And a session the server PARKED reports the cause rather than the symptom: `waiting` is either
+    // exhaustion or the agent asking its human, and the balance identifies which.
+    const brokeWaiting = cloudWith({
+      balanceCents: CLOUD_MIN_CONTINUE_CENTS - 1,
+      sessionStatus: "waiting",
+    });
+    expect(decideContinuation(readyCloud({ cloud: brokeWaiting }))).toMatchObject({
+      reason: "cloud-out-of-credits",
+    });
+    // Exactly at the floor is affordable — the boundary, so a `<=` slip here fails.
+    expect(
+      decideContinuation(readyCloud({ cloud: cloudWith({ balanceCents: CLOUD_MIN_CONTINUE_CENTS }) }))
+        .action,
+    ).toBe("continue");
+  });
+
+  it("does NOT blame the wallet for a lifecycle an empty wallet cannot explain", () => {
+    // THE REMEDY-STRING BUG (roborev 58287). Run ahead of the lifecycle switch, the balance check
+    // told a user to buy credits for a session that had FINISHED, or — the common case, since a lost
+    // network takes the reading and the socket down together — for one this window has no reading of
+    // at all. Buying credits fixes neither, and this reason string is what a human is read out.
+    const broke = { balanceCents: CLOUD_MIN_CONTINUE_CENTS - 1 };
+    expect(
+      decideContinuation(readyCloud({ cloud: cloudWith({ ...broke, sessionStatus: "complete" }) })),
+    ).toEqual({ action: "none", reason: "cloud-session-ended" });
+    expect(
+      decideContinuation(readyCloud({ cloud: cloudWith({ ...broke, sessionStatus: undefined }) })),
+    ).toEqual({ action: "none", reason: "cloud-session-unknown" });
+    expect(
+      decideContinuation(readyCloud({ cloud: cloudWith({ ...broke, sessionStatus: "paused" }) })),
+    ).toEqual({ action: "none", reason: "cloud-session-paused" });
+    expect(
+      decideContinuation(readyCloud({ cloud: cloudWith({ ...broke, sessionStatus: "pending" }) })),
+    ).toEqual({ action: "none", reason: "cloud-session-starting" });
+  });
+
+  it("does NOT refuse on an unloaded balance — that would fire on every cold start", () => {
+    // `undefined` here is "the /me round trip has not landed", not "empty". It needs no refusal of
+    // its own because `sessionStatus` already refuses everything this window has not observed.
+    expect(
+      decideContinuation(readyCloud({ cloud: cloudWith({ balanceCents: undefined }) })).action,
+    ).toBe("continue");
+  });
+
+  it("refuses when the relay is down — a write on a null socket is silently dropped", () => {
+    expect(
+      decideContinuation(readyCloud({ cloud: cloudWith({ relayConnected: false }) })),
+    ).toEqual({ action: "none", reason: "cloud-offline" });
+  });
+
+  it("is not made EASIER than a local agent — every local gate still applies", () => {
+    // The direction that matters. A cloud agent clears the cloud gates AND all of the ordinary
+    // ones; a fix that let a healthy sandbox skip the settle window, the turn-end witness or the
+    // liveness proof would be strictly more willing to spend money on cloud than on local.
+    expect(decideContinuation(readyCloud({ hasTurnEndAuthority: false })).action).toBe("none");
+    expect(decideContinuation(readyCloud({ idleSince: undefined })).action).toBe("none");
+    expect(decideContinuation(readyCloud({ status: "waiting" })).action).toBe("none");
+    expect(
+      decideContinuation(readyCloud({ status: "unmerged", processAlive: false })),
+    ).toEqual({ action: "none", reason: "process-gone" });
+  });
+
+  it("tells the human WHERE it is when it escalates", () => {
+    // The local wording sends someone looking for a pane on this Mac. A cloud sandbox has none, and
+    // it is still billing while they look — so the escalation body has to say so.
+    const stuck = noteContinue(
+      noteContinue(noteContinue(newGoal("land the PR", T0), "m0"), "m0"),
+      "m0",
+    );
+    const d = decideContinuation(readyCloud({ goal: stuck, mark: "m0" }));
+    expect(d.action).toBe("escalate");
+    if (d.action !== "escalate") throw new Error("unreachable");
+    expect(d.reason).toContain("CLOUD sandbox");
+    expect(d.reason).toContain("nothing on this Mac will restart it");
+    // …and a LOCAL agent's escalation is unchanged — no cloud sentence leaks into it.
+    const local = decideContinuation(ready({ goal: stuck, mark: "m0" }));
+    if (local.action !== "escalate") throw new Error("unreachable");
+    expect(local.reason).not.toContain("CLOUD");
+  });
+
+  it("never applies the cloud gates to a LOCAL agent", () => {
+    // Gated on `runtime`, not on "did a bundle arrive". A local agent is judged by the local rules
+    // even if a caller hands it cloud evidence, and — the case that actually happens — a local
+    // sweep that reads no relay socket and no session list is unaffected by both being absent.
+    expect(decideContinuation(ready({ cloud: cloudWith({ sessionStatus: "paused" }) })).action).toBe(
+      "continue",
+    );
+    expect(decideContinuation(ready({ cloud: undefined })).action).toBe("continue");
+  });
+});
+
+/** A healthy cloud bundle with one or more facts overridden. Spelled out rather than spread from a
+ *  shared object so a test that overrides `sessionStatus` cannot silently also change the balance. */
+function cloudWith(over: Partial<CloudEvidence>): CloudEvidence {
+  return { sessionStatus: "active", balanceCents: 5_000, relayConnected: true, ...over };
+}

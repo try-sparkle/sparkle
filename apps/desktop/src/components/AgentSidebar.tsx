@@ -14,12 +14,11 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
-// FiPlus/FiMinus are the collapse/expand pull tabs; FiTool is the "+ New Build Agent" icon.
+// FiPlus/FiMinus are the collapse/expand pull tabs.
 // FiAlertTriangle/FiRepeat/FiTarget carry the never-idle overlay (stall / thrash / goal) — see
 // ./rowAttention and the chips in AgentRow. Icons, never emoji: this repo uses react-icons.
 import {
   FiCloud,
-  FiTool,
   FiHelpCircle,
   FiPlus,
   FiMinus,
@@ -149,7 +148,7 @@ import { useNewAgentCalm, useNewAgentGraceTick } from "../hooks/useNewAgentCalm"
 const NO_AGENTS: readonly AgentTab[] = [];
 import { AlertToggleButton } from "./AlertToggleButton";
 import { reconcileWorkMode, type WorkMode } from "../engine/workMode";
-import { PlanBuildToggle, BUILD_INK } from "./PlanBuildToggle";
+import { PlanBuildToggle } from "./PlanBuildToggle";
 import { StatusDot } from "./StatusDot";
 import { FittedAgentName, AGENT_NAME_FONT_SIZE, rowTitleWeight } from "./FittedAgentName";
 import { ModelPill } from "./ModelPill";
@@ -164,9 +163,8 @@ import {
   uncommittedWorkEvidence,
 } from "../engine/workflowStage";
 import type { WorkflowStageId } from "../engine/workflowStage";
-import { useNewAgent } from "../hooks/useNewAgent";
-import { NewAgentRuntimeToggle } from "./NewAgentRuntimeToggle";
-import { NEW_BUILD_AGENT_DND_TARGET } from "../services/dndTargets";
+import { useSpawnBuildAgent } from "../hooks/useSpawnBuildAgent";
+import { NewAgentButtons } from "./NewAgentButtons";
 import { CloseAgentPrompt } from "./CloseAgentPrompt";
 
 /**
@@ -175,35 +173,12 @@ import { CloseAgentPrompt } from "./CloseAgentPrompt";
  * to open the agent, double-click the agent name to rename it, ×
  * to close. "+ Agent" adds one.
  */
-// A dashed-outline "+ New <kind> Agent" row — the per-mode affordance for creating an agent,
-// shown in the sidebar list for the active Build/Think mode: below the last row when the list
-// fits, or pinned (sticky) at the top when the list is tall enough to scroll.
-// Border is split into longhand props (width/style/color) so NewAgentRow's hover state can flip
-// just the style (dashed → solid) and color without fighting a `border` shorthand.
 // `--hd-h` from rev4.html: the height of every column header band in the cockpit — the concierge's
 // `.ahd` and this column's `.bhd`. One number so the two line up across the seam; a header that is
 // two pixels off its neighbour is the kind of thing that reads as "not the design" without anyone
 // being able to name it.
 const BUILD_HEADER_H = 34;
 
-const DASHED_ROW_STYLE: React.CSSProperties = {
-  display: "flex",
-  alignItems: "center",
-  gap: 8,
-  width: "100%",
-  margin: "2px 0 8px",
-  padding: "9px 10px",
-  borderWidth: 1,
-  borderStyle: "dashed",
-  borderColor: C.muted,
-  borderRadius: 6,
-  background: "transparent",
-  color: C.muted,
-  fontFamily: FONT_UI,
-  fontSize: 13,
-  fontWeight: FONT_WEIGHT.semibold,
-  cursor: "pointer",
-};
 
 // Wrapper shared by BOTH placements of the "+ New … Agent" button (sticky top / below the last
 // row). A flex column so the button's margins can't collapse out of it — which keeps the button's
@@ -213,8 +188,8 @@ const DASHED_ROW_STYLE: React.CSSProperties = {
 const NEW_AGENT_SLOT_STYLE: React.CSSProperties = {
   display: "flex",
   flexDirection: "column",
-  // Separates the Local/Cloud runtime toggle from the button when the toggle renders (cloud
-  // enabled). With the toggle absent there is a single child, so this has no effect.
+  // Separates the two create rows ("+ Local Agent" / "+ Cloud Agent") from each other, and the
+  // cloud row from its block-reason line when one is shown.
   gap: 6,
 };
 
@@ -246,102 +221,6 @@ type SidebarScrollApi = {
   isAutoScrolling: () => boolean;
 };
 const SidebarScrollContext = createContext<SidebarScrollApi | null>(null);
-
-// The "+ New <kind> Agent" button. On hover the dotted outline becomes a solid stroke and the
-// icon + label light up in the mode's accent — the same gold as that mode's chevron, now that the
-// strip stopped painting a decorative cyan→blue fade. It takes the INK twin of that gold
-// (`BUILD_INK`), not the chevron's fill: `hoverColor` lands on `color` and `borderColor` here, and
-// a fill token is only held to the 3:1 control floor — see the note on PlanBuildToggle.BUILD_INK.
-// The background is left unchanged.
-// `sharedHover`/`onHoverChange` let a SECOND instance of the button elsewhere (the Workspace
-// empty-state start button) drive this one blue too, so hovering either lights up both.
-function NewAgentRow({
-  icon,
-  label,
-  hoverColor,
-  onClick,
-  sharedHover,
-  onHoverChange,
-  dndTarget,
-  dataHint,
-}: {
-  icon: React.ReactNode;
-  label: string;
-  hoverColor: string;
-  onClick: () => void;
-  sharedHover?: boolean;
-  onHoverChange?: (v: boolean) => void;
-  // Marks the button as a webview drag-drop target (see services/dndTargets.ts) so the
-  // window-global drag handlers can hit-test the cursor against it with elementFromPoint.
-  dndTarget?: string;
-  // Registers the button in the keyboard-hint overlay (see keyboardHints/hintTargets.ts). Only the
-  // sidebar instance passes this — the Workspace empty-state copy leaves it undefined so a single
-  // chiclet shows even when both buttons are on screen at once.
-  dataHint?: string;
-}) {
-  const [hover, setHover] = useState(false);
-  const lit = hover || !!sharedHover;
-  return (
-    <button
-      data-dnd-target={dndTarget}
-      data-hint={dataHint}
-      onClick={onClick}
-      onMouseEnter={() => {
-        setHover(true);
-        onHoverChange?.(true);
-      }}
-      onMouseLeave={() => {
-        setHover(false);
-        onHoverChange?.(false);
-      }}
-      style={{
-        ...DASHED_ROW_STYLE,
-        borderStyle: lit ? "solid" : "dashed",
-        borderColor: lit ? hoverColor : C.muted,
-        color: lit ? hoverColor : C.muted,
-      }}
-    >
-      {icon}
-      <span>{label}</span>
-    </button>
-  );
-}
-
-// The Build variant of NewAgentRow, wired to the shared `buildAgentHover` flag so every instance
-// (the sidebar's row AND the Workspace empty-state start button) highlights in sync. Exported so
-// the Workspace can drop the exact same button in place of its old "Add an agent" hint text.
-// Also a drag-drop target: dropping files on it spawns a new build agent with the files attached
-// to ITS composer (useNewBuildAgentDrop), which lights buildAgentHover during the drag — so the
-// drag-over visual IS the normal hover visual, on both copies.
-export function NewBuildAgentButton({
-  onClick,
-  dataHint,
-}: {
-  onClick: () => void;
-  dataHint?: string;
-}) {
-  const buildAgentHover = useUiStore((s) => s.buildAgentHover);
-  const setBuildAgentHover = useUiStore((s) => s.setBuildAgentHover);
-  // Clear the shared flag if this button unmounts while hovered — clicking the empty-state instance
-  // spawns an agent, which unmounts it before onMouseLeave can fire, otherwise leaving the sidebar's
-  // copy stuck blue. Any still-hovered sibling re-lights itself via its own local hover state.
-  useEffect(() => () => setBuildAgentHover(false), [setBuildAgentHover]);
-  return (
-    <NewAgentRow
-      // A react-icon, not the ⚒ character it replaced — the same swap PlanBuildToggle's Build
-      // chevron made, and for the second reason stated there as well as the emoji ban: an
-      // emoji-font glyph ignores `color`, so the ⚒ could not follow the gold hover ink below.
-      icon={<FiTool size={18} style={{ flexShrink: 0 }} />}
-      label="+ New Build Agent"
-      hoverColor={BUILD_INK}
-      onClick={onClick}
-      sharedHover={buildAgentHover}
-      onHoverChange={setBuildAgentHover}
-      dndTarget={NEW_BUILD_AGENT_DND_TARGET}
-      dataHint={dataHint}
-    />
-  );
-}
 
 export function AgentSidebar({
   project,
@@ -1140,9 +1019,10 @@ export function AgentSidebar({
   // Spawn a build agent AND auto-create a bead for it, so every piece of build work is tracked
   // from the start (it floors at "Planned" until code work begins). Shared with the Workspace
   // empty-state start button via the useSpawnBuildAgent hook so both create agents identically.
-  // Runtime-aware: with the Local/Cloud toggle on "Cloud" this opens the cloud create dialog
-  // instead of spawning a local PTY. Identical behavior in both "+ New Build Agent" call sites.
-  const spawnBuildAgentRaw = useNewAgent(project);
+  // LOCAL ONLY. This path no longer has a cloud branch — the billed action lives entirely in
+  // NewCloudAgentButton, which opens the create dialog rather than spawning anything here. (It used
+  // to fork on a Local/Cloud toggle, via a `useNewAgent` wrapper that is now deleted.)
+  const spawnBuildAgentRaw = useSpawnBuildAgent(project);
   /**
    * Spawn, then WIRE what was spawned.
    *
@@ -1151,9 +1031,12 @@ export function AgentSidebar({
    * pointerdown capture sees the "+ New Build Agent" row as outside the circuit and unbinds before
    * the spawn runs, so the next prompt went to Sparkle rather than the agent just created.
    *
-   * `spawnLocal` returns the new id synchronously; the CLOUD branch returns null (the server has to
-   * start the session before a tab exists), and there is nothing to wire yet in that case — the row
-   * click that follows its arrival does it.
+   * The local spawn returns the new id synchronously, so there is always something to wire. The
+   * only null is "no project", which seats nothing.
+   *
+   * The CLOUD row is deliberately not on this path and does NOT re-wire: the server has to start the
+   * session before a tab exists, so at click time there is nothing to plug into. The row click that
+   * follows its arrival does it.
    */
   const spawnBuildAgent = () => {
     const id = spawnBuildAgentRaw();
@@ -2118,18 +2001,16 @@ export function AgentSidebar({
   // ISOLATES a band through the same state the chips render, so its effect is visible in the chip
   // bar rather than being an invisible mode you can only exit via a special dismiss chip.
 
-  // The active mode's "+ New Build Agent" button (null in Plan / no project).
+  // The active mode's create options (null in Plan / no project).
   // Rendered in ONE of two slots in the scroll container below, chosen by listOverflows.
   const newAgentButton =
     project && mode === "build" ? (
-      // A fragment, not a wrapper element: both placement slots are already flex columns, and the
-      // button must stay THEIR direct child (the sticky/below-the-list placement is asserted on the
-      // button's parent). The toggle renders null unless cloud is enabled, so a local-only sidebar
-      // is byte-for-byte the same tree as before.
-      <>
-        <NewAgentRuntimeToggle />
-        <NewBuildAgentButton onClick={spawnBuildAgent} dataHint="newbuild" />
-      </>
+      // BOTH create options — "+ Local Agent" and "+ Cloud Agent" (see NewAgentButtons for why the
+      // cloud row is always rendered rather than hidden when it can't be used). It expands to a
+      // FRAGMENT, not a wrapper element: both placement slots are already flex columns and the
+      // rows must stay THEIR direct children (the sticky/below-the-list placement is asserted on a
+      // button's parent in AgentSidebar.newAgentPlacement.test.tsx).
+      <NewAgentButtons onLocalClick={spawnBuildAgent} projectId={project.id} dataHint />
     ) : null;
 
   return (
@@ -2777,10 +2658,10 @@ export function AgentSidebar({
             </button>
           </div>
         )}
-        {/* Empty hint: the dashed "+ New Build Agent" row above is the call to action. */}
+        {/* Empty hint: the dashed create rows above are the call to action. */}
         {project && mode === "build" && topLevelAgents.length === 0 && (
           <div style={{ color: C.muted, fontSize: 12, padding: "2px 10px 10px", lineHeight: 1.5 }}>
-            No Build agents yet — use <strong>+ New Build Agent</strong> above to start one.
+            No Build agents yet — use <strong>+ Local Agent</strong> or <strong>+ Cloud Agent</strong> above to start one.
           </div>
         )}
         {!project && (

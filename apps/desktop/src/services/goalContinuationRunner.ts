@@ -27,7 +27,12 @@
 //
 // THE EXPECTED FAILURE DIRECTION IS MISSING A STALL, NEVER INTERRUPTING LIVE WORK. Every piece of
 // absent evidence here resolves to "don't send".
-import { decideContinuation, progressMark } from "../engine/goalContinuation";
+import {
+  type CloudEvidence,
+  decideContinuation,
+  progressMark,
+} from "../engine/goalContinuation";
+import { hasUnmetGoal } from "../engine/agentGoal";
 import { quotaBlockForAgent } from "../engine/engineRegistry";
 import { hasTurnEndAuthority } from "../engine/turnEndAuthority";
 import { withUnmergedWork } from "../engine/unmergedAttention";
@@ -40,10 +45,18 @@ import {
 } from "../stores/runtimeStore";
 import type { AgentTab, AgentTabStatus } from "../types";
 import { APP_WINDOW_LABEL } from "../windowContext";
+import { useAuthStore } from "../stores/authStore";
 import { livenessOf } from "./agentLiveness";
 import { notifyAttention } from "./attention";
-import { agentCanAcceptInput, dispatchConciergeAnswer } from "./conciergeDispatch";
+import { cloudApi } from "./cloudAgents/api";
+import { cloudSessionStatusOf, refreshCloudSessionStatuses } from "./cloudAgents/sessionStatus";
+import {
+  agentCanAcceptInput,
+  agentCanAcceptPrompt,
+  dispatchConciergeAnswer,
+} from "./conciergeDispatch";
 import type { ConciergeDispatchPath } from "./conciergeDispatch";
+import { getRelaySocket } from "./relayClient";
 import { log } from "../logger";
 import { findWindowForProject } from "./windowRegistry";
 import { routeToOwningWindow } from "./windowOwnership";
@@ -143,6 +156,58 @@ export function processAliveFor(
 }
 
 /**
+ * Can this agent receive the continuation AT ALL — asked in the form that matches what a
+ * continuation actually IS.
+ *
+ * ══ WHY THIS IS NOT JUST `agentCanAcceptInput` (the bug this closes) ═════════════════════════════
+ * A continuation is a plain PROMPT. It goes through `dispatchConciergeAnswer`, which routes a cloud
+ * agent to `deliverCloudPrompt` and puts the text on the relay as an `agent_input` frame — a path
+ * that has existed and worked for cloud since the compose box learned to address one.
+ * `agentCanAcceptInput`, by its own doc, is deliberately THE LOCAL-PTY QUESTION and is false for
+ * every cloud agent, because its other callers (`sendControlKey`, dictation, the API-recovery ping)
+ * write RAW BYTES to a PTY that a cloud agent does not have. Feeding that answer to the sweep asked
+ * "can I write bytes to its PTY" about a send that writes no bytes to any PTY — so the whole
+ * goal-continuation feature was dead for cloud: never nudged, and (because the bounds sit after the
+ * gates) never escalated either. Silent forever, which is the state that module exists to abolish.
+ *
+ * ══ WHY IT IS NOT A BLANKET SWAP TO `agentCanAcceptPrompt` EITHER ════════════════════════════════
+ * The two predicates agree for every agent that has a roster row and a local runtime, so a blanket
+ * swap would look harmless today. It is still wrong to write, for one reason worth more than the
+ * diff it saves: `agentCanAcceptInput` is where the local-PTY question LIVES, and its doc promises
+ * that callers aiming a PTY write ask it. A sweep that reaches an irreversible local write through
+ * the prompt predicate inherits none of that promise, and the next person to narrow the local gate
+ * (a dead-PTY check is the obvious candidate, and the obvious place to put it) would tighten it for
+ * every caller except this one — silently, with no test able to see it. Asking each runtime its own
+ * question keeps the local path bound to the local gate, whatever that gate grows into.
+ *
+ * Fails closed on an unknown id both ways: both predicates refuse an agent the store never heard of.
+ */
+export function canAcceptContinuation(agent: Pick<AgentTab, "id" | "runtime">): boolean {
+  return agent.runtime === "cloud" ? agentCanAcceptPrompt(agent.id) : agentCanAcceptInput(agent.id);
+}
+
+/**
+ * Gather what this window knows about a cloud agent's sandbox (engine/goalContinuation's
+ * `CloudEvidence`). Cheap and synchronous — three in-memory reads, no IO — because it runs for every
+ * cloud agent with a goal on every 15s sweep.
+ *
+ * The freshness of `sessionStatus` is NOT this function's job: `cloudSessionStatusOf` expires its
+ * own readings, and {@link maybeRefreshCloudStatuses} is what keeps a live project's readings inside
+ * that window. Both halves are needed — an un-refreshed reading ages into `undefined` and refuses,
+ * which is the correct failure, not a working one.
+ */
+export function cloudEvidenceFor(agentId: string, now: number): CloudEvidence {
+  return {
+    sessionStatus: cloudSessionStatusOf(agentId, now),
+    balanceCents: useAuthStore.getState().me?.balanceCents,
+    // `CloudTransport.write` reads exactly this and silently no-ops when it is null, so a resume sent
+    // over a dead relay would be recorded as delivered. Asked here, before the decision, rather than
+    // discovered afterwards — the transport has no failure channel to read.
+    relayConnected: getRelaySocket() !== null,
+  };
+}
+
+/**
  * The status map the rest of the app reads, per project, flattened to one map.
  *
  * ONLY `withUnmergedWork` is applied, and the omissions are deliberate rather than an oversight:
@@ -191,6 +256,58 @@ export interface SweepOptions {
   now?: number;
   /** Single-owner election. Defaults to {@link ownsProjectInThisWindow}; injected by tests. */
   ownsProject?: (projectId: string) => boolean;
+  /**
+   * Re-list one SERVER project's cloud sessions so their lifecycle readings stay fresh. Defaults to
+   * the real (throttled, never-throwing) refresher; injected by tests so no suite makes a request.
+   */
+  refreshCloudStatuses?: (cloudProjectId: string, now: number) => unknown;
+}
+
+/** The real refresher: `GET /sessions?project_id=` behind {@link CLOUD_SESSION_REFRESH_MS}'s
+ *  throttle, recording every lifecycle it gets back. */
+function defaultRefreshCloudStatuses(cloudProjectId: string, now: number): Promise<number> {
+  return refreshCloudSessionStatuses(cloudProjectId, { api: cloudApi, now });
+}
+
+/**
+ * Keep one project's cloud lifecycle readings inside their expiry window — the producer half of the
+ * `cloud-session-*` gates.
+ *
+ * FIRE AND FORGET, NEVER AWAITED, and that is deliberate rather than lazy. The sweep already awaits
+ * its sends behind a `sweeping` re-entrancy guard, so a listing that hangs (a captive portal, a
+ * black-holed connection — `listSessions` carries no deadline of its own) would stall EVERY later
+ * sweep, for every agent, local ones included. The cost of not awaiting is that a brand-new reading
+ * lands one sweep late; the cost of awaiting is the whole feature stopping on one bad socket. The
+ * settle window makes the first cost invisible in practice — nothing is eligible on the sweep that
+ * first observes it at rest anyway.
+ *
+ * SCOPED TO PROJECTS THAT COULD USE IT: a project with no cloud binding, or with no cloud agent
+ * chasing a goal, issues no request at all. A local-only user never touches the network from here.
+ *
+ * "CHASING A GOAL" IS `hasUnmetGoal`, NOT "the field is set" (roborev 58287). `AgentTab.goal` is
+ * never cleared when a goal finishes — `goalStateOf` reads `met`/`escalated`/`expired` off a record
+ * that stays defined — so a presence check kept polling forever, once a minute per bound project,
+ * for readings `decideContinuation` can never act on: it answers `goal-met` / `already-escalated` /
+ * `goal-expired` before it ever looks at `input.cloud`. Same predicate the decision uses, so the
+ * request and the use of the request cannot drift apart.
+ */
+function maybeRefreshCloudStatuses(
+  project: { cloudProjectId?: string | null; agents: readonly AgentTab[] },
+  now: number,
+  refresh: (cloudProjectId: string, now: number) => unknown,
+): void {
+  const cloudProjectId = project.cloudProjectId;
+  if (!cloudProjectId) return;
+  if (!project.agents.some((a) => a.runtime === "cloud" && hasUnmetGoal(a.goal, now))) return;
+  try {
+    // The refresher swallows its own IO failures; this catch is for a bad injection or a synchronous
+    // throw. A failed refresh must never take the sweep down — the readings simply age out.
+    void Promise.resolve(refresh(cloudProjectId, now)).catch((e: unknown) => {
+      log.debug("goals", "cloud session-status refresh failed", { error: String(e) });
+    });
+  } catch (e) {
+    log.debug("goals", "cloud session-status refresh threw", { error: String(e) });
+  }
 }
 
 // ── Module state ────────────────────────────────────────────────────────────────────────────────
@@ -265,12 +382,19 @@ export function undeliveredStreakFor(agentId: string): number {
  * The default arm is deliberately vague rather than guessing: it still says the one fact that
  * matters — nothing was delivered — and names the path so a log or a bug report can identify it.
  */
-function undeliverableReason(goalText: string, path: UndeliveredPath): string {
+function undeliverableReason(goalText: string, path: UndeliveredPath, isCloud: boolean): string {
+  // THE SCREEN ARMS ARE RUNTIME-AWARE TOO, not just the closing sentence. Both of these fire for a
+  // cloud agent — the guards that produce them run BEFORE the cloud branch and read the RELAYED
+  // viewport — so keying only the closing on the runtime produced a message that contradicted
+  // itself in adjacent sentences: "its TERMINAL is waiting at a prompt … Nothing reached the
+  // SANDBOX." Same defect as the closing, one clause earlier (roborev 58551).
+  const screen = isCloud ? "its sandbox screen" : "its terminal";
+  const pane = isCloud ? "its pane" : "the pane";
   const why =
     path === "alternate-screen"
-      ? "its terminal is sitting in a full-screen app (vim/less/htop), which would read the message as commands. Quit that app in the pane and the auto-resume will take over again"
+      ? `${screen} is sitting in a full-screen app (vim/less/htop), which would read the message as commands. Quit that app in ${pane} and the auto-resume will take over again`
       : path === "blocked-prompt"
-        ? "its terminal is waiting at a prompt that must not receive free text — a password, a host-key confirmation, a yes/no. Answer that prompt in the pane"
+        ? `${screen} is waiting at a prompt that must not receive free text — a password, a host-key confirmation, a yes/no. Answer that prompt in ${pane}`
         : path === "pty-gone"
           ? "its process is gone. Restart the agent to pick the goal back up"
           : // SPLIT FROM `pty-gone`, because the remedies differ and this one already has an
@@ -283,7 +407,18 @@ function undeliverableReason(goalText: string, path: UndeliveredPath): string {
             ? "it never started. Open its pane and hit Retry (or finish installing Claude Code), and the auto-resume will take over again"
             : path === "cloud-offline"
               ? "it runs in the cloud and the relay is not connected. Reconnect, and the auto-resume will take over again"
-              : // HELD, NOT DELIVERED. `queued` reports that the PTY was still coming up and the
+              : // THE CLOUD TWIN of `alternate-screen`/`blocked-prompt`, and it only became
+                // reachable when cloud agents were enabled for this sweep. `deliverCloudPrompt`
+                // refuses with `cloud-agent` when the detector finds live options in the relayed
+                // scrollback: the agent is asking something only a human can answer, and the
+                // concierge cannot see that screen well enough to answer it. Its remedy is already
+                // established everywhere else in the app — answer it in its own pane — so the
+                // default arm's "the send kept coming back" plus a closing sentence about a
+                // terminal the agent does not have was the wrong-diagnosis shape this function's
+                // header exists to prevent.
+                path === "cloud-agent"
+                ? "it runs in the cloud and has a question on its own screen that only a human can answer. Open its pane and answer it there, and the auto-resume will take over again"
+                : // HELD, NOT DELIVERED. `queued` reports that the PTY was still coming up and the
                 // message is sitting in the hold queue — which is why the runner counts it as
                 // undelivered rather than crediting it (see the dispatch site). Reaching the bound
                 // on it means the pane never finished starting across the whole streak.
@@ -305,8 +440,17 @@ function undeliverableReason(goalText: string, path: UndeliveredPath): string {
   // every place that described the old timing, and demoting `queued` to undelivered changed
   // exactly that. So this arm says what is actually guaranteed — nothing has been typed YET — and
   // names the condition under which that changes.
-  const closing =
-    path === "queued"
+  //
+  // AND IT IS KEYED ON THE RUNTIME, NOT ON THE PATH. Keying it on the path name looked equivalent
+  // and is not: the cloud-named paths are NOT the only ones a cloud agent produces. The screen
+  // guards run BEFORE the cloud branch in `dispatchConciergeAnswer` and both read the RELAYED
+  // viewport, so a cloud agent stopped at a password prompt refuses with `blocked-prompt`, and the
+  // runner's own catch arm produces `threw`. Either would have been told "nothing was typed into
+  // the terminal" about an agent that has no terminal — the exact wording this arm exists to
+  // remove, leaking through a proxy (roborev 58544).
+  const closing = isCloud
+    ? `Nothing reached the sandbox, so the agent has not seen any of it.`
+    : path === "queued"
       ? `Nothing has been typed into the terminal yet. If its pane finishes starting within the ` +
         `next couple of minutes the held message may still go through, so check the pane before ` +
         `assuming the agent has seen nothing.`
@@ -379,6 +523,7 @@ export function ownsProjectInThisWindow(projectId: string): boolean {
 export async function sweepGoalContinuations(opts: SweepOptions = {}): Promise<SweepOutcome[]> {
   const now = opts.now ?? Date.now();
   const owns = opts.ownsProject ?? ownsProjectInThisWindow;
+  const refreshCloud = opts.refreshCloudStatuses ?? defaultRefreshCloudStatuses;
 
   const rt = useRuntimeStore.getState();
   const raw = rt.status;
@@ -405,6 +550,9 @@ export async function sweepGoalContinuations(opts: SweepOptions = {}): Promise<S
 
   for (const project of projects) {
     if (!owns(project.id)) continue;
+    // Only for projects this window OWNS: the ownership election is what stops two windows both
+    // acting on one agent, and it should stop them both polling for it too.
+    maybeRefreshCloudStatuses(project, now, refreshCloud);
     for (const agent of project.agents) {
       if (agent.goal === undefined) continue;
       if (inFlight.has(agent.id)) {
@@ -421,14 +569,31 @@ export async function sweepGoalContinuations(opts: SweepOptions = {}): Promise<S
         aiTitle: agent.aiTitle,
       });
 
+      // STATED, not inferred — see ContinuationInput.runtime. `AgentTab.runtime` is the store's own
+      // record of where the agent runs, and the same field `getTransport` selects a transport by.
+      const runtime = agent.runtime === "cloud" ? "cloud" : "local";
+
       const decision = decideContinuation({
         goal: agent.goal,
         status: composite.get(agent.id) ?? "stopped",
         now,
         idleSince: idleClock.get(agent.id),
+        // BOTH OF THESE ARE HONEST FOR CLOUD, and neither needed a special case — which is worth
+        // saying, because a "cloud has no PTY, so stub these true" reading of the same fields is the
+        // way this goes wrong. `Terminal.tsx` drives a cloud pane through the SAME StatusEngine over
+        // the SAME transport seam, so the spinner latch that grants turn-end authority is fed by
+        // relayed `agent_output` frames, and `cloud_exit` reaches `StatusEngine.exit` exactly as a
+        // local `pty:exit` does — which is what makes `processAliveFor` report a terminated sandbox
+        // as `process-gone` rather than guessing. A cloud agent this window is NOT streaming has
+        // neither witness and is refused, which is correct: the sweep never resumes an agent it
+        // cannot observe, whichever runtime it is.
         hasTurnEndAuthority: hasTurnEndAuthority(agent.id),
-        canAcceptInput: agentCanAcceptInput(agent.id),
+        canAcceptInput: canAcceptContinuation(agent),
         processAlive: processAliveFor(agent.id, raw, openIds),
+        runtime,
+        // The extra evidence a sandbox needs and a local PTY does not. Gathered ONLY for cloud, so a
+        // local sweep reads no auth store and no relay socket.
+        cloud: runtime === "cloud" ? cloudEvidenceFor(agent.id, now) : undefined,
         mark,
         // The wall the agent itself reported. Without this line the whole backoff is dead code: the
         // gate lives in the pure decision, and the pure decision only knows what this sweep hands it.
@@ -556,7 +721,11 @@ function noteUndelivered(projectId: string, agent: AgentTab, path: UndeliveredPa
   });
   if (count < MAX_UNDELIVERED_CONTINUES) return;
   undelivered.delete(agent.id);
-  escalateToHuman(projectId, agent, undeliverableReason(agent.goal?.text ?? "", path));
+  escalateToHuman(
+    projectId,
+    agent,
+    undeliverableReason(agent.goal?.text ?? "", path, agent.runtime === "cloud"),
+  );
 }
 
 /**

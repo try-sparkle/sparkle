@@ -129,12 +129,51 @@ describe("a cloud spawn that is allowed to proceed", () => {
   });
 
   it("probes the server for saved Claude auth when the store is COLD, instead of refusing", async () => {
-    // cloudAuthStore is deliberately not persisted, so a cold store reads "no auth". A human sees
-    // the dialog's own probe; a tool call has no such moment, so without this probe the FIRST cloud
-    // spawn of every launch would be refused for an account that is fully set up.
+    // cloudAuthStore is deliberately not persisted, so it is cold on every launch. A human sees the
+    // dialog's own probe; a tool call has no such moment, so it probes here — which is how the tool
+    // can answer with the specific "add your Claude authentication" guidance rather than a generic
+    // server failure.
     useCloudAuthStore.setState({ method: null, loaded: false } as never);
     const r = await spawnBuildAgent({ projectId: "p1", runtime: "cloud", prompt: "ship it" });
     expect(getClaudeAuth).toHaveBeenCalled();
+    expect(r.ok).toBe(true);
+    expect(startSession).toHaveBeenCalledTimes(1);
+  });
+
+  it("a probe that returns NO CREDENTIAL refuses with the actionable auth message", async () => {
+    // THE BRANCH THE PROBE EXISTS FOR, and the one nothing pinned (roborev 58530): replacing the
+    // whole `authConfigured` expression with `true` left every suite green, so the probe could
+    // decay into a pure round-trip cost — a user with no credential getting a generic server
+    // failure instead of the sentence that tells them what to do. The two probe tests above assert
+    // only `ok === true`; the other gate refusals in this file are driven by credits and sign-in.
+    useCloudAuthStore.setState({ method: null, loaded: false } as never);
+    getClaudeAuth.mockResolvedValueOnce(null as never);
+
+    const r = await spawnBuildAgent({ projectId: "p1", runtime: "cloud", prompt: "ship it" });
+
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toBe("cloud-blocked");
+    // VERBATIM, for the same reason as the credits case below: one sentence, not a paraphrase that
+    // can drift from what the dialog shows for the identical state.
+    expect(r.message).toBe("Add your Claude authentication to run agents in the cloud.");
+    expect(r.deepLink).toBe("cloudauth");
+    // …and nothing was spent finding that out, which is the whole point of probing first.
+    expect(startSession).not.toHaveBeenCalled();
+  });
+
+  it("a FAILED probe lets the spawn reach the server, rather than refusing on an answer nobody got", async () => {
+    // THE CASE THE `|| !loaded` CLAUSE EXISTS FOR, and the reason the test above cannot see it:
+    // there the probe SUCCEEDS, so `method != null` decides and the clause is never the deciding
+    // term (roborev 58524). `refresh` deliberately leaves `loaded` false when the GET fails, and
+    // that state persists for the rest of the sign-in — so refusing on it would turn one flaky GET
+    // into "add your Claude authentication" on every cloud spawn by a fully configured account.
+    // Unprobed is UNKNOWN; POST /sessions/start is the definitive refusal.
+    useCloudAuthStore.setState({ method: null, loaded: false } as never);
+    getClaudeAuth.mockRejectedValueOnce(new Error("offline"));
+
+    const r = await spawnBuildAgent({ projectId: "p1", runtime: "cloud", prompt: "ship it" });
+
     expect(r.ok).toBe(true);
     expect(startSession).toHaveBeenCalledTimes(1);
   });

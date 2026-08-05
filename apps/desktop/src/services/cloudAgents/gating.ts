@@ -31,7 +31,8 @@ export interface CloudGateInput {
   authConfigured: boolean;
   /** Current credit balance in cents (Me.balanceCents). */
   balanceCents: number;
-  /** Minimum affordable balance to START a cloud run. Defaults to {@link CLOUD_MIN_START_CENTS}. */
+  /** Obviously-empty floor. Defaults to {@link CLOUD_MIN_START_CENTS} — deliberately NOT the
+   *  server's real affordability rule; see that constant. */
   minStartCents?: number;
 }
 
@@ -49,11 +50,24 @@ export type CloudGate =
       needsSignIn?: boolean;
     };
 
-/** Conservative client-side floor before we even attempt a start. The server enforces the exact
- *  "≥ 5 affordable minutes" rule against the live pricing constant (spec §Billing); this is only a
- *  cheap pre-check so an obviously-empty wallet deep-links to Credits instead of round-tripping to a
- *  guaranteed 402. Kept small and generous so it never blocks a genuinely-affordable balance. */
-export const CLOUD_MIN_START_CENTS = 50;
+/**
+ * OBVIOUSLY-EMPTY ONLY. The client does not get a say in what a cloud agent costs.
+ *
+ * The server enforces the real rule — `canStartCloudAgent` requires
+ * `CLOUD_AGENT_MIN_START_MINUTES` (5) of affordable balance, which against the live 0.9¢/min
+ * constant is **5¢**. This constant said 50¢ and described itself as "small and generous so it
+ * never blocks a genuinely-affordable balance", which was simply false: every balance from 5¢ to
+ * 49¢ was refused locally with "you don't have enough credits" for a start the server would have
+ * accepted, and — because `CLOUD_MIN_CONTINUE_CENTS` derives from it — a running agent's
+ * auto-continue was silently abandoned in the same band.
+ *
+ * A duplicated exact floor is a second copy of a pricing rule that can drift from the one that
+ * decides, which is exactly what happened. So this is now only the check that needs no pricing
+ * knowledge at all: an empty wallet deep-links to Credits instead of round-tripping to a guaranteed
+ * 402. Anything above it is the server's call, and its refusal is surfaced verbatim
+ * (`startError.ts`).
+ */
+export const CLOUD_MIN_START_CENTS = 1;
 
 /**
  * Whether the Cloud runtime option is even OFFERED. The whole toggle/option is hidden unless the
@@ -67,24 +81,31 @@ export function cloudOptionVisible(input: Pick<CloudGateInput, "featureEnabled" 
 /**
  * Decide whether a cloud-agent create can proceed, or which precondition blocks it. Checks run
  * most-fundamental first so the surfaced reason is the one the user must fix first:
- * feature → signed in → paid → auth → credits.
+ * signed in → feature → paid → auth → credits.
  */
 export function evaluateCloudGate(input: CloudGateInput): CloudGate {
   const minStart = input.minStartCents ?? CLOUD_MIN_START_CENTS;
 
-  if (!input.featureEnabled) {
-    return {
-      ok: false,
-      reason: "feature_disabled",
-      message: "Cloud agents aren't available on your account yet.",
-    };
-  }
+  // SIGNED-IN FIRST, and the order is the whole point of this pair.
+  //
+  // `featureEnabled` comes from `/me`, so a signed-out user has no `/me` at all and reads as
+  // feature-disabled — which would tell someone who has simply not signed in that "Cloud agents
+  // aren't available on your account yet". That is a false statement about an account we have not
+  // looked at, and it is unactionable: it points at nothing they can do, when the fix is one click.
+  // We cannot know a capability we were never told, so "sign in" is the honest first answer.
   if (!input.signedIn) {
     return {
       ok: false,
       reason: "signed_out",
       message: "Sign in to run agents in the cloud.",
       needsSignIn: true,
+    };
+  }
+  if (!input.featureEnabled) {
+    return {
+      ok: false,
+      reason: "feature_disabled",
+      message: "Cloud agents aren't available on your account yet.",
     };
   }
   if (!input.entitled) {

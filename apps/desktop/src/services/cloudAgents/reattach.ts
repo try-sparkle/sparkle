@@ -8,6 +8,7 @@
 import type { AddAgentOpts } from "../../stores/projectStore";
 import type { CloudApi } from "./api";
 import { reconcileCloudSessions } from "./reconcile";
+import { noteCloudSessionStatus } from "./sessionStatus";
 
 export interface ReattachDeps {
   api: Pick<CloudApi, "listSessions">;
@@ -17,6 +18,8 @@ export interface ReattachDeps {
   addAgent: (projectId: string, opts: AddAgentOpts) => string | null;
   /** Optional: log a soft failure (defaults to a no-op so startup stays quiet). */
   onError?: (err: unknown) => void;
+  /** Injected clock for the lifecycle readings this records (services/cloudAgents/sessionStatus). */
+  now?: () => number;
 }
 
 /**
@@ -36,12 +39,27 @@ export async function reattachCloudSessions(
   projectId: string,
   deps: ReattachDeps,
 ): Promise<string[] | null> {
+  // STAMPED BEFORE THE REQUEST, not after it. `observedAt` is what orders two listings against each
+  // other, and only the ISSUE time does that correctly: a listing issued first but settling second
+  // is describing an older world, and stamping it on arrival would make it look newer than the
+  // reading it is about to overwrite. The sweep's refresh stamps the same way.
+  const at = (deps.now ?? Date.now)();
   let sessions;
   try {
     sessions = await deps.api.listSessions(projectId);
   } catch (err) {
     deps.onError?.(err);
     return null; // offline / signed out / server error → retryable, and never disrupts startup
+  }
+
+  // RECORD EVERY LIFECYCLE, not just the ones that need a tab. This listing is the app's only read
+  // of what the server thinks each sandbox is doing, and `engine/goalContinuation` needs it to tell
+  // an `active` cloud session from a hibernated (`paused`) or credit-parked (`waiting`) one before
+  // it spends money resuming anything. Dropping the statuses on the floor here is what left that
+  // gate with no producer at all. Sessions filtered out below (terminal ones) are recorded too — a
+  // `complete` reading is exactly what stops a resume aimed at a finished sandbox.
+  for (const s of sessions) {
+    if (s) noteCloudSessionStatus(s.id, s.status, at);
   }
 
   const { toCreate } = reconcileCloudSessions({

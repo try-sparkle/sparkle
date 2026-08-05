@@ -348,9 +348,9 @@ describe("Improve Sparkle row — pinned at the very bottom", () => {
     expect(list.compareDocumentPosition(sparkleRow()) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
-  it("sits below + New Build Agent", () => {
+  it("sits below the create rows", () => {
     render(<AgentSidebar project={seed()} />);
-    const newAgent = screen.getByText("+ New Build Agent");
+    const newAgent = screen.getByText("+ Local Agent");
     expect(
       newAgent.compareDocumentPosition(sparkleRow()) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();

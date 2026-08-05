@@ -77,7 +77,8 @@ export const CHROME_HINTS: Record<string, string> = {
   recent: "r",
   open: "o",
   new: "n",
-  newbuild: "g", // "+ New Build Agent" sidebar button — g for "aGent" (n/b are taken).
+  newbuild: "g", // "+ Local Agent" sidebar button — g for "aGent" (n/b are taken).
+  newcloud: "u", // "+ Cloud Agent", its sibling row — u for "clo-U-d" (c/d are taken).
   screenshot: "s",
   menu: ".",
   improve: "i",

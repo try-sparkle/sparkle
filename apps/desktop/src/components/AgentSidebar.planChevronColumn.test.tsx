@@ -27,7 +27,7 @@ vi.mock("../services/openProjectTab", () => ({ openProjectTab: vi.fn() }));
 // The Build chevron's SECOND press spawns a build agent (≡ the + button), and that is the half of
 // its behavior a mode assertion cannot see — so the spawn has to be observable.
 const spawnAgent = vi.fn(() => "spawned-1");
-vi.mock("../hooks/useNewAgent", () => ({ useNewAgent: () => spawnAgent }));
+vi.mock("../hooks/useSpawnBuildAgent", () => ({ useSpawnBuildAgent: () => spawnAgent }));
 
 import { AgentSidebar } from "./AgentSidebar";
 import { useProjectStore } from "../stores/projectStore";

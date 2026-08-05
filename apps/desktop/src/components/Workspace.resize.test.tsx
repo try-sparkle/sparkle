@@ -63,7 +63,6 @@ vi.mock("./AgentPane", () => ({
 }));
 vi.mock("./AgentSidebar", () => ({
   AgentSidebar: () => <div data-testid="sidebar" />,
-  NewBuildAgentButton: () => null,
 }));
 // THE STUB PUBLISHES THE WIDTH IT WAS HANDED, and that is the whole point of it. A stub that
 // ignored `width` — like the cockpit suite's, which renders a bare div — would make every

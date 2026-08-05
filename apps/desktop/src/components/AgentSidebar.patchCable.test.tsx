@@ -157,7 +157,7 @@ describe("selecting a build row patches the cable", () => {
     // to Sparkle instead of the agent the user had just asked for. (roborev 55234)
     render(<AgentSidebar project={PROJECT} />);
     expect(useCableStore.getState().wired).toBe("off");
-    fireEvent.click(screen.getByText("+ New Build Agent"));
+    fireEvent.click(screen.getByText("+ Local Agent"));
     expect(useCableStore.getState().wired).toBe("right");
   });
 

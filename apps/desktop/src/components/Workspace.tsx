@@ -24,11 +24,11 @@ import { useUiStore } from "../stores/uiStore";
 import { useConnectionStore } from "../stores/connectionStore";
 import { useCloudAgentsEnabled } from "../hooks/useCloudAgents";
 import { useSettingsStore } from "../stores/settingsStore";
-import { useNewAgent } from "../hooks/useNewAgent";
+import { useSpawnBuildAgent } from "../hooks/useSpawnBuildAgent";
 import { reattachProjectOnOpen } from "../services/cloudAgents/startup";
-import { NewAgentRuntimeToggle } from "./NewAgentRuntimeToggle";
+import { NewAgentButtons } from "./NewAgentButtons";
 import { useNewBuildAgentDrop } from "../hooks/useNewBuildAgentDrop";
-import { AgentSidebar, NewBuildAgentButton } from "./AgentSidebar";
+import { AgentSidebar } from "./AgentSidebar";
 import { PLAN_COLUMN_Z } from "./layers";
 import { PlanBuildToggle } from "./PlanBuildToggle";
 import { ProjectTabsBar } from "./ProjectTabsBar";
@@ -1323,12 +1323,19 @@ export function Workspace() {
     () => decidePromptTarget(wiredProject, wiredAgentId, sparkleTarget),
     [wiredProject, wiredAgentId, sparkleTarget],
   );
-  // Lets the empty-state start button create a build agent exactly like the sidebar's "+ New Build
-  // Agent" row does (same hook → same behavior).
-  // Runtime-aware (Local/Cloud toggle) — the same action the sidebar row runs.
-  const spawnBuild = useNewAgent(project);
-  const cloudCreateOpen = useUiStore((s) => s.cloudCreateOpen);
-  const setCloudCreateOpen = useUiStore((s) => s.setCloudCreateOpen);
+  // Lets the empty-state "+ Local Agent" button create a build agent exactly like the sidebar's row
+  // does (same hook → same behavior). LOCAL only; the empty state's "+ Cloud Agent" row opens the
+  // create dialog itself, through the same NewAgentButtons pair the sidebar renders.
+  const spawnBuild = useSpawnBuildAgent(project);
+  const cloudCreateProjectId = useUiStore((s) => s.cloudCreateProjectId);
+  const setCloudCreateProjectId = useUiStore((s) => s.setCloudCreateProjectId);
+  // Resolved from the FULL project list, not from either column: the click may have come from the
+  // left pair while `project` here is the right one. A captured id whose project has since closed
+  // resolves to undefined and the dialog simply does not render — the correct answer, since there
+  // is nothing left to create in.
+  const cloudCreateTarget = cloudCreateProjectId
+    ? (projects.find((p) => p.id === cloudCreateProjectId) ?? null)
+    : null;
   // Cloud re-attach (Service B): a cloud session keeps running while the laptop is closed, so when
   // a project's tab is first selected we reconcile its tabs against the server's LIVE sessions and
   // recreate any that lost their tab. Best-effort and silent — signed out, offline, feature off, or
@@ -1994,12 +2001,13 @@ export function Workspace() {
             )}
             {!sparkleActive && !boardActive && !selectedIsTornOut && project && project.agents.length === 0 && (
               <Hint title={project.name}>
-                {/* The same "+ New Build Agent" button as the sidebar, so the user can start a build
-                    agent right here. Hovering it also lights up the sidebar's copy blue (shared
-                    buildAgentHover flag), pointing at where the affordance normally lives. */}
+                {/* The same two create options as the sidebar, so the user can start an agent right
+                    here. Hovering the local one also lights up the sidebar's copy (shared
+                    buildAgentHover flag), pointing at where the affordance normally lives. No
+                    `dataHint`: the sidebar copy owns the keyboard-hint chiclets, so a single
+                    chiclet shows even when both copies are on screen at once. */}
                 <div style={{ width: 240, margin: "0 auto", display: "flex", flexDirection: "column", gap: 6 }}>
-                  <NewAgentRuntimeToggle />
-                  <NewBuildAgentButton onClick={spawnBuild} />
+                  <NewAgentButtons onLocalClick={spawnBuild} projectId={project?.id ?? null} />
                 </div>
                 {/* ~3 blank rows of breathing room before the tour line. */}
                 <div style={{ height: 60 }} />
@@ -2101,12 +2109,18 @@ export function Workspace() {
         </Suspense>
       )}
 
-      {/* The cloud-agent create dialog is rendered exactly ONCE here, though the "+ New Build
-          Agent" affordance that opens it exists in two places (sidebar row + empty state). Lazy so
-          a local-only user never downloads it. */}
-      {cloudCreateOpen && project && (
+      {/* The cloud-agent create dialog is rendered exactly ONCE here, though the "+ Cloud Agent"
+          affordance that opens it exists in two places (sidebar row + empty state). Lazy so a
+          local-only user never downloads it.
+          It is handed the project the CLICK captured, not the live front `project`: with two
+          columns those differ, so reading the front tab created in the wrong project and let a tab
+          switch retarget an open dialog. */}
+      {cloudCreateTarget && (
         <Suspense fallback={null}>
-          <NewCloudAgentDialog project={project} onClose={() => setCloudCreateOpen(false)} />
+          <NewCloudAgentDialog
+            project={cloudCreateTarget}
+            onClose={() => setCloudCreateProjectId(null)}
+          />
         </Suspense>
       )}
 

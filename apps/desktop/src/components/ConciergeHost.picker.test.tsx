@@ -112,9 +112,19 @@ vi.mock("../services/conciergeAttach", async (orig) => {
     loadAttachmentPaths: vi.fn(async () => ({ attachments: [], failed: [] })),
   };
 });
-vi.mock("../stores/runtimeStore", () => {
+// SPREAD THE REAL MODULE and replace the ONE export this suite steers, rather than hand-listing.
+// Vitest throws on access to any export a factory omits, so a hand-listed factory fails whenever an
+// import edge is added anywhere in the host's graph — which is not a defect in the change that added
+// it, only in the shape of this mock. (It happened twice in one sitting here: `mergeOpenAgentIds`,
+// then `readPersistedOpenAgentIds`, both reached through `services/knownAgents` for the nudge card's
+// runtime lookup.) Spreading makes the file immune to the whole class, and `useRuntimeStore` — the
+// only export this suite actually cares about, because `status.ag1 === "approval"` is what puts a
+// live picker on screen — is still fully controlled.
+vi.mock("../stores/runtimeStore", async (orig) => {
+  const real = (await orig()) as Record<string, unknown>;
   const S = { status: { ag1: "approval" }, workflowState: {}, branchStatus: {}, workflowStage: {} };
   return {
+    ...real,
     useRuntimeStore: Object.assign((sel: (s: typeof S) => unknown) => sel(S), {
       getState: () => S,
     }),

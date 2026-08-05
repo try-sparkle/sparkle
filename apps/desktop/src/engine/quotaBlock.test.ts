@@ -400,6 +400,10 @@ describe("auto-resume backs off until the wall comes down", () => {
       canAcceptInput: true,
       processAlive: true,
       mark: "m",
+      // A LOCAL agent — the quota wall this suite is about is an account limit an agent reports from
+      // its own terminal, which is a local-runtime signal. Cloud evidence is `undefined` accordingly.
+      runtime: "local" as const,
+      cloud: undefined,
     };
   }
 

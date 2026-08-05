@@ -19,7 +19,6 @@ import {
   steppedZoom,
   type ZoomColumn,
 } from "../engine/columnZoom";
-import type { Runtime } from "../types";
 // TYPE-ONLY import, deliberately: engine/buildSections → engine/workflowStage → theme/colors, and
 // theme/theme.ts imports THIS store. A value import would close that loop into a runtime cycle; a
 // type import is erased at compile time, so it can't. The default below is spelled inline for the
@@ -65,8 +64,7 @@ const TRANSIENT_UI_KEYS = [
   // Travels with `revealAgentId` — a viewport coordinate from one click is meaningless on the next
   // launch, and worse than meaningless if it outlived the request that carried it.
   "revealAnchorY",
-  "newAgentRuntime",
-  "cloudCreateOpen",
+  "cloudCreateProjectId",
   // A promotion confirm dialog is a live, half-made decision about moving work off this machine.
   // Restoring one on the next launch would put a "Move to cloud" button in front of a user who
   // never opened it, against a preflight read from a worktree that has moved on since.
@@ -317,19 +315,18 @@ interface UiState {
   // pointing the user at where that affordance normally lives. Transient — NOT persisted.
   buildAgentHover: boolean;
   setBuildAgentHover: (v: boolean) => void;
-  // Which runtime the NEXT agent you create runs on: "local" (a PTY on this Mac, free) or "cloud"
-  // (a Sparkle-provisioned sandbox, billed in credits). Shared so the sidebar's toggle and the
-  // Workspace empty-state button agree. Transient — NOT persisted: cloud is a per-account server
-  // capability that can go away between launches, and a persisted "cloud" would silently re-arm a
-  // billed action for a user who no longer has it. Every launch starts on the free default.
-  newAgentRuntime: Runtime;
-  setNewAgentRuntime: (r: Runtime) => void;
-  // Whether the "new cloud agent" dialog is open. Lives here (not in a component) because the
-  // "+ New Build Agent" affordance exists in two places (sidebar + Workspace empty state) while the
+  // WHICH PROJECT the open "new cloud agent" dialog is creating in — null when it is closed.
+  //
+  // An ID, not a boolean, and that is the whole point. The dialog is a singleton rendered by the
+  // Workspace, which used to hand it the LIVE front project while the flag said only "something is
+  // open". With two columns those are different projects: clicking "+ Cloud Agent" in the LEFT
+  // pair opened a dialog that would create in the RIGHT one, and switching the right tab while it
+  // was open silently retargeted it. Capturing the id at click time makes the dialog answer to the
+  // gesture that opened it. Lives here (not in a component) because the
   // dialog must be rendered exactly ONCE. Transient — NOT persisted; a relaunch never restores a
   // dialog, least of all one whose action costs credits.
-  cloudCreateOpen: boolean;
-  setCloudCreateOpen: (v: boolean) => void;
+  cloudCreateProjectId: string | null;
+  setCloudCreateProjectId: (id: string | null) => void;
   // Per build-agent: whether its worker subtree is collapsed in the sidebar. A build agent's
   // workers start COLLAPSED (a missing entry reads as collapsed) so a busy orchestrator shows a
   // compact "N workers" roll-up by default; the user expands to see each worker's own tracker.
@@ -615,10 +612,8 @@ export const useUiStore = create<UiState>()(
         ),
       buildAgentHover: false,
       setBuildAgentHover: (v) => set({ buildAgentHover: v }),
-      newAgentRuntime: "local",
-      setNewAgentRuntime: (r) => set({ newAgentRuntime: r }),
-      cloudCreateOpen: false,
-      setCloudCreateOpen: (v) => set({ cloudCreateOpen: v }),
+      cloudCreateProjectId: null,
+      setCloudCreateProjectId: (id) => set({ cloudCreateProjectId: id }),
       collapsedOrchestrators: {},
       // Absent → collapsed (workers start hidden behind the roll-up).
       isOrchestratorCollapsed: (id) => get().collapsedOrchestrators[id] ?? true,

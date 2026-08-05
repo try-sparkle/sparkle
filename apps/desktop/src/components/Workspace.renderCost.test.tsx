@@ -105,7 +105,6 @@ vi.mock("./AgentSidebar", () => ({
     counts.sidebar += 1;
     return <div data-testid="sidebar" />;
   },
-  NewBuildAgentButton: () => null,
 }));
 vi.mock("./ConciergeHost", () => ({
   ConciergeHost: ({ width }: { width?: number }) => {

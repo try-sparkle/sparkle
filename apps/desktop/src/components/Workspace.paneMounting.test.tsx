@@ -97,7 +97,6 @@ vi.mock("./AgentPane", async () => {
 });
 vi.mock("./AgentSidebar", () => ({
   AgentSidebar: () => <div data-testid="sidebar" />,
-  NewBuildAgentButton: () => null,
 }));
 vi.mock("./ConciergeHost", () => ({ ConciergeHost: () => <div data-testid="concierge" /> }));
 vi.mock("./OfflineBanner", () => ({ OfflineBanner: () => null }));

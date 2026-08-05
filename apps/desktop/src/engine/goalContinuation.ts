@@ -33,6 +33,11 @@ import { type AgentGoal, goalStateOf } from "./agentGoal";
 // would achieve nothing. See the gate order in `decideContinuation`.
 import { RESUME_PROMPT_MARKER } from "./agentOriginated";
 import { type QuotaBlock, isQuotaBlocked } from "./quotaBlock";
+// The client-side floor a cloud RUN must clear before we ask the server to buy sandbox minutes. An
+// auto-continue buys exactly that, so it clears the same floor rather than a second one invented
+// here — see CLOUD_MIN_CONTINUE_CENTS. (Pure module: `gating` imports one erased type and nothing
+// else, so this does not drag a store into the engine's runtime graph.)
+import { CLOUD_MIN_START_CENTS } from "../services/cloudAgents/gating";
 
 /**
  * How long a row must sit CONTINUOUSLY idle before an auto-continue is allowed.
@@ -72,6 +77,17 @@ export const MAX_CONTINUES_WITHOUT_PROGRESS = 3;
  *  healthy goal needs and still a hard ceiling on the spend. */
 export const MAX_CONTINUES_TOTAL = 20;
 
+/**
+ * The balance a cloud auto-continue must clear, in cents.
+ *
+ * DERIVED, NOT A SECOND NUMBER. Resuming a cloud agent asks a sandbox to keep burning minutes,
+ * which is the same purchase `services/cloudAgents/gating` pre-checks before a START — so the two
+ * share one floor. Spelling a literal here would let the start gate be retuned while a background
+ * timer went on resuming agents the user can no longer afford, which is the failure this whole
+ * arm exists to prevent.
+ */
+export const CLOUD_MIN_CONTINUE_CENTS = CLOUD_MIN_START_CENTS;
+
 /** Why no auto-continue happened. Every arm is a REASON, never a bare false, because this is the
  *  field the concierge reads when it wants to know why a stalled-looking agent was left alone. */
 export type NoContinueReason =
@@ -85,18 +101,98 @@ export type NoContinueReason =
   | "idle-not-settled"
   | "no-turn-end-authority"
   | "cannot-accept-input"
-  | "quota-blocked";
+  | "quota-blocked"
+  // ── CLOUD-ONLY. See `CloudEvidence` and the cloud gate block in `decideContinuation`. ──────────
+  /** The account can no longer pay for sandbox minutes. Resuming would 402 at best. */
+  | "cloud-out-of-credits"
+  /** The sandbox is hibernated. Input written at it goes nowhere, and waking it is a billing
+   *  decision that belongs to the user rather than to a 15-second timer. */
+  | "cloud-session-paused"
+  /** The server parked the session — credit exhaustion, or the agent is asking its human. */
+  | "cloud-session-waiting"
+  /** The session row exists but its sandbox has not come up yet; there is nothing to type into. */
+  | "cloud-session-starting"
+  /** The session finished or errored server-side. Nothing to continue. */
+  | "cloud-session-ended"
+  /** This window has no CURRENT reading of the session's lifecycle (never listed it, or the
+   *  reading expired). Fails closed — see `CloudEvidence.sessionStatus`. */
+  | "cloud-session-unknown"
+  /** The desktop's relay socket is down, so `CloudTransport.write` would silently no-op. */
+  | "cloud-offline";
 
 export type ContinuationDecision =
   | { action: "continue"; prompt: string; attempt: number }
   | { action: "escalate"; reason: string }
   | { action: "none"; reason: NoContinueReason };
 
+/**
+ * What this window knows about a CLOUD agent's sandbox. Required whenever `runtime` is `"cloud"`.
+ *
+ * WHY A CLOUD AGENT NEEDS ITS OWN EVIDENCE BUNDLE AT ALL. Every other field on
+ * {@link ContinuationInput} is ultimately a reading of a process on THIS machine: `status` is
+ * derived from a local terminal's output, `hasTurnEndAuthority` from a local hook stream or spinner,
+ * `processAlive` from a local `pty:exit`. A cloud agent's sandbox is on someone else's computer, it
+ * survives the laptop closing, and it can be hibernated or parked by a server this window never
+ * hears from. So the local readings answer "what did the last frames we received look like" — which
+ * is genuinely useful, and is why the fields above are still consulted — but they cannot answer "is
+ * there a running sandbox at the other end of the wire, and may we spend the user's money on it".
+ * These three do.
+ *
+ * ALL THREE FAIL CLOSED, with MORE force than the local ones. `processAlive`'s doc says never spend
+ * money typing into a terminal that might not be there; a cloud sandbox bills by the minute, so the
+ * same rule reads: never spend money waking one. A cloud agent must not be easier to auto-continue
+ * than a local one, and the gate order below keeps that true — a cloud agent passes every gate a
+ * local agent passes, and then these as well.
+ */
+export interface CloudEvidence {
+  /**
+   * The server-side session lifecycle as this window CURRENTLY reads it
+   * (`services/cloudAgents/sessionStatus`), or `undefined` when it has no current reading.
+   *
+   * Only `active` is continuable. `paused`/`waiting` are refused by NAME rather than by falling
+   * through some other gate, because "resuming would restart billing the user did not ask for" and
+   * "the agent is asking you a question" are things a human needs told, and a generic `not-idle`
+   * tells them neither. `undefined` refuses too: a lifecycle reading is a snapshot of a remote
+   * machine and the reader expires it on purpose, so absent evidence is absent, never `active`.
+   */
+  sessionStatus: string | undefined;
+  /**
+   * The account balance in cents as this window last read it (`authStore.me.balanceCents`), or
+   * `undefined` when it has not loaded.
+   *
+   * A KNOWN-EMPTY wallet is its own refusal ({@link CLOUD_MIN_CONTINUE_CENTS}) rather than something
+   * the user discovers from a resume that 402s server-side. An UNKNOWN balance is deliberately NOT a
+   * refusal here — it would fire on every cold start before `me` settles, and it does not need to
+   * be, because `sessionStatus` already refuses everything this window has not currently observed.
+   */
+  balanceCents: number | undefined;
+  /**
+   * Is the desktop's relay socket connected? Asked because `CloudTransport.write` emits into
+   * `getSocket()?.emit(...)` and SILENTLY NO-OPS on a null socket — a dropped resume would otherwise
+   * be recorded as a delivered one, spending a retry against a mark that cannot move and eventually
+   * escalating to a human with a reason that never happened.
+   */
+  relayConnected: boolean;
+}
+
 export interface ContinuationInput {
   goal: AgentGoal | undefined;
   /** The agent's OWN status (not a rollup). */
   status: AgentTabStatus;
   now: number;
+  /**
+   * Where the agent actually runs. STATED, never inferred from the presence of {@link cloud}:
+   * inferring it would make a cloud agent whose evidence was forgotten look local, and take the
+   * local path — the permissive one — which is the exact direction a fail-closed gate must not fail.
+   */
+  runtime: "local" | "cloud";
+  /**
+   * Cloud-only evidence; `undefined` for a local agent, and REQUIRED-BUT-NULLABLE for the same
+   * reason `processAlive` is (see its note). A cloud agent that arrives here with no bundle is
+   * refused as `cloud-session-unknown` — not waved through — and forgetting to pass the key at all
+   * is a compile error rather than a silent permissive default.
+   */
+  cloud: CloudEvidence | undefined;
   /** Epoch ms the row last became idle, or undefined if it is not idle. Drives {@link IDLE_SETTLE_MS}. */
   idleSince: number | undefined;
   /**
@@ -211,6 +307,23 @@ export function decideContinuation(input: ContinuationInput): ContinuationDecisi
   // settles back to idle, and the next 15s sweep resumes it — the "then resume ONCE automatically"
   // half of the requirement, with no second timer here to drift from that one.
   if (isQuotaBlocked(input.quotaBlock, now)) return { action: "none", reason: "quota-blocked" };
+
+  // ══ THE CLOUD GATES, AND WHY THEY SIT HERE ══════════════════════════════════════════════════════
+  // Same placement argument as the quota wall directly above, for the same reason. A hibernated
+  // sandbox stops emitting, so the LOCAL reading of a paused cloud agent is whatever its last frames
+  // said — often `working` (it froze mid-spinner), sometimes `idle`. Put after the status gate, a
+  // paused session would usually be refused as `not-idle`, and the refusal a human reads would be
+  // "it isn't idle" about a sandbox that has been frozen for an hour. Asked FIRST, the reason names
+  // the actual fact, which is what requirement 3 of this gate is: never continue a paused or
+  // out-of-credits session BY NAME, not by accident of some other arm.
+  //
+  // Before the BOUNDS too, exactly as the quota wall is: a session the user paused must not spend
+  // retries or eventually page them with "restarting cannot fix this" — restarting was never tried.
+  if (input.runtime === "cloud") {
+    const refusal = cloudRefusal(input.cloud);
+    if (refusal !== null) return { action: "none", reason: refusal };
+  }
+
   if (!isRestingStatus(status)) return { action: "none", reason: "not-idle" };
   // ...but `unmerged` must prove the process still EXISTS, because the overlay that writes it also
   // covers `done` and `stopped`. See ContinuationInput.processAlive: `idle` witnesses its own
@@ -242,7 +355,8 @@ export function decideContinuation(input: ContinuationInput): ContinuationDecisi
       action: "escalate",
       reason:
         `Auto-continued ${consecutive} times with no sign of progress. The goal is still unmet: ` +
-        `"${live.text}". Something is blocking it that restarting cannot fix.`,
+        `"${live.text}". Something is blocking it that restarting cannot fix.` +
+        whereItRuns(input.runtime),
     };
   }
   if (live.totalContinues >= MAX_CONTINUES_TOTAL) {
@@ -250,7 +364,8 @@ export function decideContinuation(input: ContinuationInput): ContinuationDecisi
       action: "escalate",
       reason:
         `Auto-continued ${live.totalContinues} times on this goal — the per-goal ceiling. The goal ` +
-        `is still unmet: "${live.text}".`,
+        `is still unmet: "${live.text}".` +
+        whereItRuns(input.runtime),
     };
   }
 
@@ -272,6 +387,75 @@ export function decideContinuation(input: ContinuationInput): ContinuationDecisi
  *  `unmerged` belongs here and the red tier does not. */
 function isRestingStatus(status: AgentTabStatus): boolean {
   return status === "idle" || status === "unmerged";
+}
+
+/**
+ * The clause that tells a human WHERE the agent they are being paged about actually is. Empty for a
+ * local agent, whose escalation copy has always been implicitly about a pane on this Mac.
+ *
+ * AGENTS.md's rule that user-facing copy is code applies with unusual force here: this string is the
+ * body of a notification whose whole purpose is to get someone to act, and the action is different.
+ * A local agent is a terminal they can open and type into. A cloud agent is a remote sandbox that
+ * keeps billing whether or not this laptop is even awake, and nothing they do on this machine
+ * restarts it — so an escalation that silently reuses the local wording sends them hunting for a
+ * pane that does not exist and leaves the meter running while they look.
+ */
+function whereItRuns(runtime: "local" | "cloud"): string {
+  if (runtime !== "cloud") return "";
+  return (
+    ` It runs in a Sparkle CLOUD sandbox — remotely, and still on the clock — so nothing on this ` +
+    `Mac will restart it. Open it to take over, or stop it.`
+  );
+}
+
+/**
+ * Why this cloud agent must not be resumed, or `null` when nothing here objects.
+ *
+ * ORDER IS THE MESSAGE. The LIFECYCLE is asked first, because it is the server's own verdict on the
+ * sandbox and it is the fact that decides whether any other fact is even relevant. The balance is
+ * then allowed to RE-EXPLAIN exactly one lifecycle — `waiting`, which is the state an empty wallet
+ * causes (`cloudAgentRunner` maps exhaustion → `waiting`) — and to refuse an otherwise-healthy
+ * `active` session we could not afford to keep running. The relay comes last, because "we cannot
+ * reach it right now" is the most transient of the three.
+ *
+ * THE BALANCE USED TO RUN FIRST, AND THAT WAS A REMEDY STRING THAT LIED (roborev 58287). Ahead of
+ * the switch it pre-empted lifecycles it has no causal relationship with: a user below the floor was
+ * told to buy credits for a session that had FINISHED, or — the common case, since a lost network
+ * takes the reading and the socket down together — for one this window simply has no reading of.
+ * Buying credits fixes neither. AGENTS.md's rule that a remedy has to be true for the path that
+ * produced it is exactly this: the sentence a human acts on must describe why THIS agent is stuck.
+ *
+ * `undefined` evidence is a refusal, never a pass: see {@link ContinuationInput.cloud}.
+ */
+function cloudRefusal(cloud: CloudEvidence | undefined): NoContinueReason | null {
+  if (cloud === undefined) return "cloud-session-unknown";
+  const broke =
+    cloud.balanceCents !== undefined && cloud.balanceCents < CLOUD_MIN_CONTINUE_CENTS;
+  switch (cloud.sessionStatus) {
+    case "active":
+      // Alive and reachable, so the wallet is the next thing that can stop us — and here it really
+      // is the whole story: nothing else objects, we simply cannot pay for the minutes.
+      if (broke) return "cloud-out-of-credits";
+      break; // the ONLY continuable lifecycle
+    case "paused":
+      return "cloud-session-paused";
+    case "waiting":
+      // THE ONE STATE THE BALANCE MAY RE-EXPLAIN. `waiting` is either exhaustion or the agent asking
+      // its human; a wallet below the floor identifies which, and "you are out of credits" is the
+      // actionable half of that pair. Without the balance we can only report the symptom.
+      return broke ? "cloud-out-of-credits" : "cloud-session-waiting";
+    case "pending":
+      return "cloud-session-starting";
+    case undefined:
+      return "cloud-session-unknown";
+    default:
+      // `complete`, `error`, and anything a future server adds. A lifecycle this build does not
+      // recognise is not evidence of a healthy sandbox, so it lands with the terminal ones rather
+      // than falling through to a send.
+      return "cloud-session-ended";
+  }
+  if (!cloud.relayConnected) return "cloud-offline";
+  return null;
 }
 
 /**

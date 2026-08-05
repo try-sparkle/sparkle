@@ -58,9 +58,9 @@ function wrapperOf(name: RegExp) {
 }
 
 describe("AgentSidebar — new-agent button placement", () => {
-  it("renders + New Build Agent below the list (non-sticky wrapper) when the list fits", () => {
+  it("renders the create rows below the list (non-sticky wrapper) when the list fits", () => {
     render(<AgentSidebar project={project} />);
-    const wrapper = wrapperOf(/New Build Agent/);
+    const wrapper = wrapperOf(/Local Agent/);
     const sc = screen.getByTestId("agent-list-scroll");
     expect(wrapper.parentElement).toBe(sc);
     expect(wrapper.style.position).not.toBe("sticky");
@@ -68,10 +68,10 @@ describe("AgentSidebar — new-agent button placement", () => {
     expect(wrapper.nextElementSibling?.textContent).toMatch(/No Build agents yet/);
   });
 
-  it("pins + New Build Agent to a sticky top wrapper when the list overflows", () => {
+  it("pins the create rows to a sticky top wrapper when the list overflows", () => {
     const { rerender } = render(<AgentSidebar project={project} />);
     setListHeights(rerender, 500, 100);
-    const wrapper = wrapperOf(/New Build Agent/);
+    const wrapper = wrapperOf(/Local Agent/);
     const sc = screen.getByTestId("agent-list-scroll");
     expect(wrapper.style.position).toBe("sticky");
     expect(wrapper.style.top).toBe("0px");
@@ -85,9 +85,9 @@ describe("AgentSidebar — new-agent button placement", () => {
   it("returns below the list when the overflow goes away again", () => {
     const { rerender } = render(<AgentSidebar project={project} />);
     setListHeights(rerender, 500, 100); // overflow → pinned
-    expect(wrapperOf(/New Build Agent/).style.position).toBe("sticky");
+    expect(wrapperOf(/Local Agent/).style.position).toBe("sticky");
     setListHeights(rerender, 100, 500); // fits again → back below the last row
-    const wrapper = wrapperOf(/New Build Agent/);
+    const wrapper = wrapperOf(/Local Agent/);
     expect(wrapper.style.position).not.toBe("sticky");
     expect(wrapper.nextElementSibling?.textContent).toMatch(/No Build agents yet/);
   });

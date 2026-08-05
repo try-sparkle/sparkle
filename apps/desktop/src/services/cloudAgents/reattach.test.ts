@@ -1,5 +1,9 @@
-import { describe, it, expect, vi } from "vitest";
+import { beforeEach, describe, it, expect, vi } from "vitest";
 import { reattachCloudSessions, type ReattachDeps } from "./reattach";
+import {
+  cloudSessionStatusOf,
+  resetCloudSessionStatusesForTests,
+} from "./sessionStatus";
 import type { CloudSessionSummary } from "./reconcile";
 import type { AddAgentOpts } from "../../stores/projectStore";
 
@@ -20,6 +24,12 @@ function harness(opts: {
   };
   return { deps, addAgent, onError, listSessions };
 }
+
+const T0 = 1_700_000_000_000;
+
+beforeEach(() => {
+  resetCloudSessionStatusesForTests();
+});
 
 describe("reattachCloudSessions", () => {
   it("creates a cloud tab (id + runtime) for each live session lacking one", async () => {
@@ -82,6 +92,40 @@ describe("reattachCloudSessions", () => {
     const { deps } = harness({ sessions: [{ id: "s1", status: "active" }] });
     deps.addAgent = vi.fn(() => null); // projectStore.addAgent's unknown-project return
     await expect(reattachCloudSessions("gone", deps)).resolves.toEqual([]);
+  });
+
+  // ── THE LIFECYCLE READINGS ────────────────────────────────────────────────────────────────────
+  //
+  // This listing is the app's only read of what the server thinks each sandbox is doing, and
+  // `engine/goalContinuation` refuses to resume a cloud agent it has no CURRENT reading for. So
+  // dropping the statuses on the floor here — which is what it did — leaves that gate with no
+  // producer at all and every cloud agent permanently `cloud-session-unknown`. Asserted as the SIDE
+  // EFFECT on the reader, not as a call on a spy.
+  it("records every session's lifecycle, including the ones it creates no tab for", async () => {
+    const { deps } = harness({
+      sessions: [
+        { id: "s1", status: "active" },
+        { id: "s2", status: "paused" },
+        { id: "s3", status: "complete" },
+      ],
+      existing: ["s1"], // already has a tab, so nothing is created for it — its status still matters
+    });
+    deps.now = () => T0;
+
+    await reattachCloudSessions("proj", deps);
+
+    expect(cloudSessionStatusOf("s1", T0)).toBe("active");
+    expect(cloudSessionStatusOf("s2", T0)).toBe("paused");
+    // The TERMINAL one too: a `complete` reading is exactly what stops a resume aimed at a finished
+    // sandbox, and it is the one `reconcileCloudSessions` filters out.
+    expect(cloudSessionStatusOf("s3", T0)).toBe("complete");
+  });
+
+  it("records nothing when the listing itself never landed", async () => {
+    const { deps } = harness({ sessions: () => Promise.reject(new Error("offline")) });
+    deps.now = () => T0;
+    await expect(reattachCloudSessions("proj", deps)).resolves.toBeNull();
+    expect(cloudSessionStatusOf("s1", T0)).toBeUndefined();
   });
 
   // One refused insert must not strand the project's OTHER live sessions — those tabs are the only

@@ -67,7 +67,6 @@ vi.mock("./AgentSidebar", () => ({
   AgentSidebar: ({ slotSide = "right" }: { slotSide?: string }) => (
     <div data-testid={`sidebar-${slotSide}`} data-slot-side={slotSide} />
   ),
-  NewBuildAgentButton: () => null,
 }));
 vi.mock("./ConciergeHost", () => ({ ConciergeHost: () => <div data-testid="concierge" /> }));
 vi.mock("./OfflineBanner", () => ({ OfflineBanner: () => null }));

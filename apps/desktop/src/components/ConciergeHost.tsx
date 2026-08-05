@@ -676,11 +676,32 @@ function strandedAgents(feed: ConciergeFeed): ConciergeAgent[] {
  *
  *  Approve stays a labelled button on purpose: it is a one-tap relay into a live terminal, there is
  *  no other place in the app to do it from, and an icon would make an irreversible action ambiguous. */
+/** The action id that reveals the agent's own pane instead of relaying anything into it. */
+const NUDGE_OPEN_ACTION = "open";
+
 function actionsFor(a: ConciergeAgent): ConciergeNudgeAction[] {
-  if (a.status === "approval") {
-    return [{ id: "approve", label: "Approve", kind: "primary" }];
-  }
-  return [];
+  if (a.status !== "approval") return [];
+  // A CLOUD AGENT GETS "Open", NOT "Approve". Approve relays the word into that agent's terminal,
+  // and `conciergeDispatch.deliverCloudPrompt` refuses every approval gesture aimed at a cloud agent
+  // by design — an approval presses a button on the agent's own screen, which the concierge cannot
+  // see well enough to press correctly. So the old card offered a button whose only possible outcome
+  // was a refusal, discoverable only by pressing it. "Open" is the action the refusal copy already
+  // told the user to take. It is a SWAP, never a removal: a control that vanishes on scope reads as
+  // a deleted feature (sparkle-lcx8y).
+  //
+  // Resolved off `knownAgents` rather than by importing `conciergeDispatch.isCloudAgent`, which
+  // evaluates this identical expression: 19 suites hand-list a partial mock of that module, and
+  // vitest throws on any export a factory omits, so one more import from it turns 143 unrelated
+  // tests red. Same record, same polarity — TRUE only on positive evidence, so `runtime: "unknown"`
+  // keeps the Approve relay and lets the write attempt report honestly.
+  const cloud = findKnownAgent(a.id)?.runtime === "cloud";
+  return [
+    {
+      id: cloud ? NUDGE_OPEN_ACTION : "approve",
+      label: cloud ? "Open" : "Approve",
+      kind: "primary",
+    },
+  ];
 }
 
 function agentToNudge(a: ConciergeAgent): ConciergeNudge {
@@ -4341,6 +4362,11 @@ export function ConciergeHost({
         if (!a) return;
         if (actionId === "approve") {
           void approve(a);
+        } else if (actionId === NUDGE_OPEN_ACTION) {
+          // A cloud agent's approval has to be given where the question is — the same destination
+          // the card's own click and the refusal copy both point at, so the button is not a third
+          // behaviour, just the one that is reachable in a single tap.
+          revealAgentById(a.id, a.name);
         } else if (actionId === NUDGE_MUTE_ACTION) {
           useSparklePrefsStore.getState().setInterruptPreference(a.id, "mute");
         } else if (actionId === NUDGE_DISMISS_ACTION) {

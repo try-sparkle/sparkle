@@ -89,7 +89,10 @@ describe("evaluateCloudGate", () => {
   });
 
   it("surfaces the MOST FUNDAMENTAL block first when several fail at once", () => {
-    // Everything wrong → feature_disabled wins (it's checked first).
+    // Everything wrong → signed_out wins, and that ordering is deliberate: `featureEnabled` comes
+    // from `/me`, which a signed-out user does not have, so "not available on your account" would
+    // be a false claim about an account nobody looked at — and unactionable, when the real fix is
+    // one click. This is the exact shape a signed-out trial user hits.
     const all = evaluateCloudGate({
       featureEnabled: false,
       signedIn: false,
@@ -98,17 +101,17 @@ describe("evaluateCloudGate", () => {
       balanceCents: 0,
     });
     expect(all.ok).toBe(false);
-    if (!all.ok) expect(all.reason).toBe("feature_disabled");
+    if (!all.ok) expect(all.reason).toBe("signed_out");
 
-    // Feature on but everything else wrong → signed_out next.
+    // Signed in but the account genuinely lacks the capability → feature_disabled next.
     const g2 = evaluateCloudGate({
-      featureEnabled: true,
-      signedIn: false,
+      featureEnabled: false,
+      signedIn: true,
       entitled: false,
       authConfigured: false,
       balanceCents: 0,
     });
-    if (!g2.ok) expect(g2.reason).toBe("signed_out");
+    if (!g2.ok) expect(g2.reason).toBe("feature_disabled");
 
     // Signed in but unpaid + no auth + no credits → no_paid_account next.
     const g3 = evaluateCloudGate({
@@ -129,5 +132,24 @@ describe("evaluateCloudGate", () => {
       balanceCents: 0,
     });
     if (!g4.ok) expect(g4.reason).toBe("no_auth");
+  });
+});
+
+describe("the credit floor is OBVIOUSLY-EMPTY only — the server owns the real rule", () => {
+  // The client said 50¢ while `canStartCloudAgent` requires 5 minutes × 0.9¢/min = 5¢, so every
+  // balance from 5¢ to 49¢ was refused locally for a start the server would have accepted — and,
+  // because CLOUD_MIN_CONTINUE_CENTS derives from this constant, a running agent's auto-continue
+  // was abandoned in the same band. A duplicated exact floor is a second copy of a pricing rule
+  // that can drift from the one that decides.
+  it("allows a balance the SERVER accepts but the old 50¢ floor refused", () => {
+    for (const balanceCents of [5, 10, 25, 49]) {
+      expect(evaluateCloudGate({ ...OK, balanceCents })).toEqual({ ok: true });
+    }
+  });
+
+  it("still refuses an empty wallet, which needs no pricing knowledge", () => {
+    const g = evaluateCloudGate({ ...OK, balanceCents: 0 });
+    expect(g.ok).toBe(false);
+    if (!g.ok) expect(g.reason).toBe("insufficient_credits");
   });
 });

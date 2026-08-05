@@ -1,4 +1,4 @@
-import { useEffect, useState, type CSSProperties } from "react";
+import { useState, type CSSProperties } from "react";
 import { FiCloud, FiX } from "react-icons/fi";
 import { C, DANGER, MODAL_SHADOW, ON_BRAND_FILL, SCRIM } from "../theme/colors";
 import { FONT_UI, RADIUS } from "../theme/scale";
@@ -7,7 +7,6 @@ import type { Project } from "../types";
 import { useUiStore } from "../stores/uiStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
-import { useCloudAuthStore } from "../stores/cloudAuthStore";
 import { useCloudGate } from "../hooks/useCloudAgents";
 import { cloudApi } from "../services/cloudAgents/api";
 import { createCloudAgent } from "../services/cloudAgents/create";
@@ -33,19 +32,11 @@ import { ModalLayer } from "./ModalLayer";
 export function NewCloudAgentDialog({ project, onClose }: { project: Project; onClose: () => void }) {
   const gate = useCloudGate();
   const openSettings = useUiStore((s) => s.openSettings);
-  const refreshAuth = useCloudAuthStore((s) => s.refresh);
-  const authLoaded = useCloudAuthStore((s) => s.loaded);
 
   const [goal, setGoal] = useState("");
   const [name, setName] = useState("");
   const [starting, setStarting] = useState(false);
   const [guidance, setGuidance] = useState<StartGuidance | null>(null);
-
-  // The gate's `authConfigured` reads the cloudAuthStore, which is not persisted — probe once on
-  // open so the "add your Claude auth" block reflects the SERVER's answer rather than a cold store.
-  useEffect(() => {
-    if (!authLoaded) void refreshAuth();
-  }, [authLoaded, refreshAuth]);
 
   const start = async () => {
     const trimmedGoal = goal.trim();

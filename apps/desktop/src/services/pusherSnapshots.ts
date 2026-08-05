@@ -38,7 +38,21 @@ import { agentDisplayName } from "../engine/agentDisplayName";
 export interface FleetSnapshotInput {
   /** `projectStore.projects` — the Pusher spans every project, ownership is filtered downstream. */
   projects: readonly Project[];
-  /** `runtimeStore.branchStatus`. A MISSING entry is "not polled", never "clean". */
+  /**
+   * `runtimeStore.branchStatus`. A MISSING entry is "not polled", never "clean".
+   *
+   * A CLOUD AGENT NEVER HAS AN ENTRY, and that is correct rather than an oversight worth fixing
+   * here. Branch status is polled from an app-managed worktree on this Mac (`pollProjectStatus`),
+   * and a cloud agent's branch lives inside an E2B sandbox where nothing local can stat it. So a
+   * cloud agent enters a Pusher sweep like any other and simply has no branch signal — which the
+   * "missing is not polled" rule above already handles safely, since nothing may conclude "clean"
+   * from its absence.
+   *
+   * Stated because it is otherwise INVISIBLE: nothing in this file mentions runtime, so a reader
+   * would reasonably assume cloud agents are covered. The server does know each session's branch
+   * (it is what the egress push targets); surfacing it would mean carrying it back over the relay,
+   * which is a real feature and not a filter tweak.
+   */
   branchStatus: Readonly<Record<string, BranchStatus>>;
   /** `engineRegistry.quotaBlockForAgent`. */
   quotaFor(agentId: string, now: number): QuotaBlock | undefined;

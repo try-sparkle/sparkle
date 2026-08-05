@@ -221,8 +221,10 @@ export function NudgeCard({
           object sitting immediately beside a bordered pill, which is exactly the visual stutter the
           one-line rewrite is for; the project reads fine as the tail of a sentence. */}
       <span style={{ color: C.conciergeMuted }}>in {nudge.projectName}</span>
-      {/* Everything the agent can be TOLD to do, inline. Today that is Approve and only Approve —
-          Show me and Mute left `actionsFor` when this card became a line. */}
+      {/* Everything the agent can be TOLD to do, inline. Today that is exactly one button, chosen by
+          RUNTIME in services/nudgeActions: Approve for a local agent, and Open for a cloud one —
+          whose approval relay the dispatcher refuses by design, so an Approve there could only ever
+          produce a refusal. Show me and Mute left `actionsFor` when this card became a line. */}
       {nudge.actions.map((a) => (
         <button
           key={a.id}
