@@ -129,7 +129,10 @@ import { CountdownBanner } from "./Concierge/CountdownBanner";
 import { flat, line, plain, ref } from "./Concierge/conciergeLine";
 import type { Line, ReferencableAgent } from "./Concierge/conciergeLine";
 import { actionReceiptLine } from "./Concierge/actionReceiptLine";
-import { noteConciergeTurnForPromises } from "../services/conciergePromiseLedger";
+import {
+  noteConciergeTurnForPromises,
+  promiseVerbPhrase,
+} from "../services/conciergePromiseLedger";
 import { toLintToolCalls } from "../services/conciergeLintRunner";
 import { claimReceiptForDisplay, onConciergeActionReceipt } from "../services/conciergeReceipts";
 import { routeMessage } from "../services/conciergeRouter";
@@ -2157,16 +2160,21 @@ export function ConciergeHost({
       //
       // Same seam as the linter and the receipt path, so "a turn happened" is decided in one place.
       // Guarded: a bookkeeping module must never be able to cost the user their reply.
+      // The FULL reply, not just `e.text` (roborev 58101). This handler documents twelve lines above
+      // that a `done` can carry no text — "exactly a turn whose deltas said everything" — and the
+      // reply for such a turn lives in `brainTextRef`. Reading only `e.text` silently skipped promise
+      // DETECTION for every one of those turns, which is a promise the ledger can never later report.
+      const replyText = e.text || brainTextRef.current[e.id] || "";
       try {
         for (const p of noteConciergeTurnForPromises({
           id: e.id,
-          text: e.text ?? "",
+          text: replyText,
           toolCalls: toLintToolCalls(e.toolCalls),
           at: Date.now(),
         })) {
           // Quotes the sentence back, which is what makes it checkable rather than abstract —
           // "You said you'd …" is the founder's own complaint, answered in his terms.
-          postSparkle(line`You said you'd ${plain(p.label)} — ${plain(oneLine(p.sentence))} — and that hasn't happened.`);
+          postSparkle(line`You said you'd ${plain(promiseVerbPhrase(p.family))} — ${plain(oneLine(p.sentence))} — and that hasn't happened.`);
         }
       } catch (err) {
         console.warn("concierge: promise ledger failed; the reply is unaffected", err);

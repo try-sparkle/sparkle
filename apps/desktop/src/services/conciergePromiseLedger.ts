@@ -99,6 +99,29 @@ const FUTURE_MATCHERS: readonly { family: ClaimFamily; label: string; re: RegExp
     };
   }).filter((m): m is { family: ClaimFamily; label: string; re: RegExp } => m !== null);
 
+/**
+ * How each family reads in "You said you'd ___".
+ *
+ * SEPARATE FROM `CLAIM_FAMILIES.label` (roborev 58101). Those labels are NOUN phrases, written for
+ * the same-turn check's `detail` string ("claimed a bead filing with no bead filing call") — so
+ * dropping them into this sentence produced "You said you'd goal update" and "You said you'd bead
+ * filing". A verb phrase and a noun phrase are not interchangeable, and reusing one as the other is
+ * the same broken-copy failure as splicing a paragraph into a clause.
+ */
+const PROMISE_VERB_PHRASE: Record<ClaimFamily, string> = {
+  send: "send that",
+  spawn: "spawn an agent",
+  close: "close it",
+  goal: "set a goal",
+  filed: "file that",
+  merged: "merge it",
+};
+
+/** The verb phrase for a family, for the reporting surface. */
+export function promiseVerbPhrase(family: ClaimFamily): string {
+  return PROMISE_VERB_PHRASE[family] ?? "do that";
+}
+
 /** Exported for the drift test — the families this module can produce a promise for. */
 export const FUTURE_FAMILIES: readonly ClaimFamily[] = Object.keys(FUTURE_VERBS) as ClaimFamily[];
 

@@ -5,6 +5,7 @@ import {
   promisesIn,
   PROMISE_GRACE_TURNS,
   FUTURE_FAMILIES,
+  promiseVerbPhrase,
   type PromiseRecord,
 } from "./conciergePromiseLedger";
 import { CLAIM_FAMILIES } from "./conciergeLint/checks/unbackedClaim";
@@ -212,5 +213,27 @@ describe("the future forms cover every claim family", () => {
         `family ${family} has a key but matches nothing`,
       ).toContain(family);
     }
+  });
+});
+
+// ══ THE SENTENCE READS AS ENGLISH (roborev 58101) ══════════════════════════════════════════════
+// The first version reused CLAIM_FAMILIES' `label`, which is a NOUN phrase written for the
+// same-turn check's detail string. Dropped into "You said you'd ___" it produced "You said you'd
+// goal update" and "You said you'd bead filing".
+describe("promiseVerbPhrase", () => {
+  it('completes "You said you\'d ___" for every family', () => {
+    for (const { family } of CLAIM_FAMILIES) {
+      const phrase = promiseVerbPhrase(family);
+      expect(phrase, `family ${family} has no verb phrase`).toBeTruthy();
+      // The tell for a noun phrase slipping back in: the two that broke.
+      expect(phrase).not.toBe("goal update");
+      expect(phrase).not.toBe("bead filing");
+      // A verb phrase starts with a bare verb, so the sentence reads.
+      expect(`You said you'd ${phrase}`).toMatch(/^You said you'd [a-z]+( |$)/);
+    }
+  });
+
+  it("falls back rather than producing an empty sentence for an unknown family", () => {
+    expect(promiseVerbPhrase("teleport" as never)).toBe("do that");
   });
 });
