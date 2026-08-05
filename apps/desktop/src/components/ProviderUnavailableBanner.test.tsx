@@ -4,12 +4,22 @@
 // that is OURS. These cover the render branches plus the three things the copy must never do, which
 // are the whole point of the component: offer a Refill (the user's balance is fine), blame their
 // network, or render nothing at all while AI is dead.
-import { cleanup, render, screen } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ProviderUnavailableBanner, PROVIDER_UNAVAILABLE_BAR_TESTID } from "./ProviderUnavailableBanner";
 import { OUTAGE_MAX_AGE_MS, useAiProviderStore } from "../stores/aiProviderStore";
+import { getUsage } from "../services/accountStore";
 
-beforeEach(() => useAiProviderStore.setState({ outage: null }));
+// The usage-limit branch consults the accounts' LIVE exhaustion flags (see the component). Mocked
+// so a test can state what the accounts currently say without a Tauri backend.
+vi.mock("../services/accountStore", () => ({ getUsage: vi.fn(async () => []) }));
+const getUsageMock = vi.mocked(getUsage);
+
+beforeEach(() => {
+  useAiProviderStore.setState({ outage: null });
+  getUsageMock.mockReset();
+  getUsageMock.mockResolvedValue([]);
+});
 afterEach(cleanup);
 
 describe("ProviderUnavailableBanner", () => {
@@ -126,5 +136,60 @@ describe("the bar's layout shape at a narrow window", () => {
     // equally at both ends, leaving exactly the middle. That is the founder's fragment.
     expect(sentence.style.minWidth).toBe("0");
     expect(sentence.style.overflowWrap).toBe("break-word");
+  });
+});
+
+// ── THE STALE-BANNER REGRESSION (bead drodio-website-229f.4) ──────────────────────────────────────
+// The founder watched this banner assert "Sparkle's AI features are paused" while his whole fleet
+// ran tool calls. It could not clear itself: the observation is latched, and its only clear path is
+// one of Sparkle's OWN AI calls later succeeding — which agent turns never are.
+describe("the usage-limit banner tracks the account's CURRENT state", () => {
+  const account = (exhaustedUntil: number | null) => ({
+    id: "acct",
+    tokens5h: 0,
+    tokens7d: 0,
+    exhaustedUntil,
+  });
+
+  it("clears itself when the account is no longer limited, with no user action", async () => {
+    // A latched observation says "limited". The ACCOUNT says otherwise. Nothing else happens — no
+    // successful AI call, no reload, no dismissal. The banner must go.
+    useAiProviderStore.setState({ outage: { reason: "usage_limit", at: Date.now() } });
+    getUsageMock.mockResolvedValue([account(null)]);
+
+    const { container } = render(<ProviderUnavailableBanner />);
+    await waitFor(() => expect(container.innerHTML).toBe(""));
+  });
+
+  it("clears itself once the reset instant has passed", async () => {
+    useAiProviderStore.setState({ outage: { reason: "usage_limit", at: Date.now() } });
+    getUsageMock.mockResolvedValue([account(Date.now() - 1)]);
+
+    const { container } = render(<ProviderUnavailableBanner />);
+    await waitFor(() => expect(container.innerHTML).toBe(""));
+  });
+
+  it("keeps showing a limit that is genuinely live, and names when it resets", async () => {
+    // The other direction matters just as much: this must not become a banner that never appears.
+    const until = Date.now() + 45 * 60_000;
+    useAiProviderStore.setState({ outage: { reason: "usage_limit", at: Date.now() } });
+    getUsageMock.mockResolvedValue([account(until)]);
+
+    render(<ProviderUnavailableBanner />);
+    await waitFor(() => {
+      const text = screen.getByRole("status").textContent ?? "";
+      // A real clock time, so the claim is checkable rather than the unfalsifiable "when it resets".
+      expect(text).toMatch(/paused until \d/);
+      // And it must stop implying the agent fleet is stopped, which is what caused the confusion.
+      expect(text).toContain("agents keep running");
+    });
+  });
+
+  it("does not consult the accounts for a reason that has no account-level truth", async () => {
+    // `cli_missing` is about the local install; polling accounts for it would be noise.
+    useAiProviderStore.setState({ outage: { reason: "cli_missing", at: Date.now() } });
+    render(<ProviderUnavailableBanner />);
+    await waitFor(() => expect(screen.getByRole("status")).toBeTruthy());
+    expect(getUsageMock).not.toHaveBeenCalled();
   });
 });

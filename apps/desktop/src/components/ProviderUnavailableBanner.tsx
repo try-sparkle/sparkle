@@ -15,6 +15,8 @@ import {
   useAiProviderStore,
   type AiProviderOutageReason,
 } from "../stores/aiProviderStore";
+import { currentUsageLimit, USAGE_LIMIT_RECHECK_MS } from "../engine/usageLimit";
+import { getUsage, type Usage } from "../services/accountStore";
 
 /** The full-width bar's hook, so a real-layout test can measure the element the user sees. */
 export const PROVIDER_UNAVAILABLE_BAR_TESTID = "provider-unavailable-bar";
@@ -40,6 +42,26 @@ const WARNING: Record<AiProviderOutageReason, string> = {
   usage_limit:
     "Your Claude usage limit has been reached, so Sparkle's AI features are paused. They'll resume when it resets",
 };
+
+/**
+ * The usage-limit sentence, which is built rather than looked up because it NAMES THE RESET TIME.
+ *
+ * "They'll resume when it resets" is unfalsifiable: a reader cannot tell a live claim from a stuck
+ * one, which is exactly how the stale banner survived unnoticed (bead drodio-website-229f.4). A
+ * real clock time makes the banner checkable at a glance.
+ *
+ * It also says AGENTS KEEP RUNNING. The founder read "Sparkle's AI features are paused" while his
+ * fleet was visibly working and concluded the banner was broken. He was right that it was stale,
+ * but the confusion is independent and worth closing: agent turns run on the Claude Code CLI, and
+ * the paused features are Sparkle's own (suggestions, summaries).
+ */
+export function usageLimitSentence(until: number): string {
+  const at = new Date(until).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  return (
+    `Your Claude usage limit has been reached, so Sparkle's AI features are paused until ${at}. ` +
+    `Your agents keep running`
+  );
+}
 
 // Brand amber is the caution fill and is theme-CONSTANT, so it needs an ink legible on it in both
 // themes — the constant brand navy, not the themed `C.cream`. Matches ZeroCreditBanner exactly.
@@ -142,8 +164,51 @@ export function ProviderUnavailableBanner({ inline = false }: { inline?: boolean
     return () => window.clearInterval(id);
   }, []);
 
+  // LIVE ACCOUNT TRUTH for the usage-limit reason (bead drodio-website-229f.4).
+  //
+  // The store's `usage_limit` record is LATCHED when one of Sparkle's own AI calls sees the limit,
+  // and its only clear path is a LATER Sparkle AI call SUCCEEDING. Agent turns run on the Claude
+  // Code CLI and never travel that path, so a whole fleet can work for hours without retiring the
+  // banner — the founder watched exactly that happen. The accounts' own `exhaustedUntil` flags are
+  // the current state instead: they carry a real reset instant and lapse by the clock on their own.
+  //
+  // Only polled while a usage limit is actually being claimed, so a healthy machine pays nothing.
+  // The OTHER two reasons are genuinely local to the CLI install (missing, signed out) and have no
+  // account-level truth to consult, so they keep the observed-and-expiring behaviour unchanged.
+  const claimsUsageLimit = outage?.reason === "usage_limit";
+  const [usage, setUsage] = useState<Usage[] | null>(null);
+  useEffect(() => {
+    if (!claimsUsageLimit) {
+      setUsage(null);
+      return;
+    }
+    let alive = true;
+    const check = () => {
+      getUsage()
+        .then((u) => {
+          if (alive) setUsage(u);
+        })
+        // A failed read is NOT evidence the limit lifted, so leave the previous answer standing and
+        // try again next tick. The store's own expiry still bounds how long a stale claim can last.
+        .catch(() => {});
+    };
+    check();
+    const id = window.setInterval(check, USAGE_LIMIT_RECHECK_MS);
+    return () => {
+      alive = false;
+      window.clearInterval(id);
+    };
+  }, [claimsUsageLimit]);
+
   if (!isOutageActive(outage, now)) return null;
-  const warning = WARNING[outage.reason];
+
+  // Derived state WINS over the latched observation once we have read the accounts. Before the
+  // first read `usage` is null and the observed claim stands, so a real limit is never hidden by a
+  // slow fetch.
+  const live = claimsUsageLimit && usage !== null ? currentUsageLimit(usage, now) : null;
+  if (claimsUsageLimit && usage !== null && live === null) return null;
+
+  const warning = live ? usageLimitSentence(live.until) : WARNING[outage.reason];
 
   if (inline) {
     return (
