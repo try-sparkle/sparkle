@@ -149,6 +149,12 @@ export const SURFACES = [
         { waitFor: "[data-testid=row-inbox]" },
         { click: "[data-testid=row-inbox]" },
         { waitFor: "[data-testid=row-inbox-popover]" },
+        // …AND BOTH ARE ACTUALLY IN THE PICTURE. `clip: null` gives up the box check a clipped
+        // surface gets for free, and the `waitFor` above only proves the panel is in the DOM — it
+        // can satisfy that while sitting below the fold, where `captureBeyondViewport: false` means
+        // the PNG holds none of it and the run still passes. Named together because the whole point
+        // of this shot is the chip AND the panel in one frame. See the `inFrame` verb.
+        { inFrame: ["[data-testid=row-inbox]", "[data-testid=row-inbox-popover]"] },
       ],
       clip: null,
     },
@@ -571,6 +577,34 @@ export function stepToExpression(step) {
     return `(() => { const e = document.querySelector(${JSON.stringify(sel)});
       if (!e) return false; e.setAttribute(${JSON.stringify(name)}, ${JSON.stringify(value)});
       return true; })()`;
+  }
+  if (step.inFrame) {
+    // ASSERT EVERY NAMED ELEMENT IS ACTUALLY IN THE PICTURE — the term a `clip` provides for free,
+    // restored for the surfaces that cannot use one.
+    //
+    // WHY IT HAS TO EXIST. `capture.mjs` resolves a `clip` selector to a box and fails when it
+    // matches nothing or has no area, so a clipped surface gets an is-it-really-there check as a
+    // side effect. `clip: null` — a full-viewport capture — has no such term, and `waitFor` does not
+    // supply one: it compiles to a bare `document.querySelector`, i.e. PRESENCE IN THE DOM. An
+    // element can satisfy it while sitting entirely below the fold, and `cdp.mjs` screenshots with
+    // `captureBeyondViewport: false`, so the PNG then contains none of it and the run still logs a
+    // tick. That is the silent green these surfaces exist to prevent, arriving through the fix for
+    // one (roborev 58034).
+    //
+    // The concrete case: `inbox-popover`'s panel is `position: fixed` at `top: anchor.bottom + 6`
+    // with only its `left` clamped — no vertical flip — so a taller header, more fixture rows or a
+    // smaller viewport pushes it past the bottom edge with nothing complaining.
+    //
+    // SAME RECT TEST AS `scrollTo`, deliberately: height > 0 and the box within the viewport. This
+    // one only OBSERVES (it never scrolls), so it composes after any verb, and it takes a LIST
+    // because "both the badge and its popover are in frame" is one fact about the shot — asserting
+    // them separately would let a later step move one out from under the other.
+    const sels = Array.isArray(step.inFrame) ? step.inFrame : [step.inFrame];
+    return `(() => { return ${JSON.stringify(sels)}.every((s) => {
+      const e = document.querySelector(s);
+      if (!e) return false;
+      const r = e.getBoundingClientRect();
+      return r.height > 0 && r.width > 0 && r.top >= 0 && r.bottom <= window.innerHeight; }); })()`;
   }
   if (step.scrollTo) {
     // BRING A SCROLLED-OUT ELEMENT INTO FRAME.

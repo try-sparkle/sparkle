@@ -380,6 +380,40 @@ describe("surface registry", () => {
     }
   });
 
+  // ── THE CLIP THAT MUST STAY NULL, AS A MECHANISM RATHER THAN A COMMENT ──────────────────────
+  //
+  // `inbox-popover` is the only surface that seeds an inbox, so its capture is the ONLY place the
+  // on-row badge is photographed — and the badge is the primary artifact of bead sparkle-zm0c8
+  // ("which of my agents are holding instructions" is a column question).
+  //
+  // Clipping to the popover silently deletes that. The panel is a `position: fixed` portal at
+  // `top: anchor.bottom + 6`, so its box begins strictly BELOW the chip: a popover-scoped clip
+  // excludes the badge by construction, and a column-scoped one fails too because the portal is not
+  // in the column's subtree. That is not hypothetical — it shipped exactly once, and the whole suite
+  // stayed green, because nothing here inspects `app.clip` at all (only `mock.clip`). The reasoning
+  // lived in a source comment, which is not a mechanism (roborev 58034).
+  //
+  // Pinned by NAME rather than as a blanket rule: `clip: null` is wrong for most surfaces — a
+  // full-viewport shot of a component scores layout noise as component drift. This one earns it.
+  it("keeps inbox-popover's clip null, so the badge stays in its own capture", () => {
+    const s = surfaceByName("inbox-popover");
+    expect(
+      s.app.clip,
+      "inbox-popover must capture the FULL VIEWPORT. Its popover is a fixed-position portal at " +
+        "anchor.bottom + 6, so any clip scoped to the popover excludes the on-row badge by " +
+        "construction — and since this is the only surface that seeds an inbox, that leaves the " +
+        "badge photographed nowhere. Use the `inFrame` step to assert both are in the picture.",
+    ).toBe(null);
+    // …and the step that replaces the clip's geometry check is still there. Without it the null clip
+    // is a capture with NO box assertion at all, which is the other half of the same defect.
+    expect(
+      s.app.steps.some((step) => step.inFrame),
+      "inbox-popover must keep an `inFrame` step: a null clip gives up the box check a clip " +
+        "performs, and `waitFor` proves DOM presence only — an element below the fold satisfies it " +
+        "while the PNG contains none of it.",
+    ).toBe(true);
+  });
+
   it("has unique surface names — artifacts are keyed on them", () => {
     expect(new Set(SURFACES.map((s) => s.name)).size).toBe(SURFACES.length);
   });
@@ -407,6 +441,44 @@ describe("step compilation", () => {
     const attr = stepToExpression({ setAttr: { sel: "#s", name: "data-wired", value: "left" } });
     expect(attr).toContain('"data-wired"');
     expect(attr).toContain('"left"');
+  });
+
+  // ── THE `inFrame` RECT LOGIC, RUN RATHER THAN READ ──────────────────────────────────────────
+  //
+  // Every other test here asserts the compiled expression's TEXT, which cannot tell a correct rect
+  // check from `return true`. That gap is not theoretical: gutting this verb's comparison to
+  // `return true` left the whole suite green, so the verb protecting `inbox-popover` from a silent
+  // pass was itself unprotected against exactly the failure it exists to catch.
+  //
+  // So this EVALUATES the generated expression against fake geometry. The below-the-fold case is the
+  // one that matters — `captureBeyondViewport: false` means such an element is absent from the PNG
+  // while `waitFor` is perfectly satisfied — and it is the shape `inbox-popover` can actually reach,
+  // since its panel is fixed at `anchor.bottom + 6` with no vertical flip.
+  it("passes only when every named element is really inside the viewport", () => {
+    const evaluate = (boxes) => {
+      const expr = stepToExpression({ inFrame: Object.keys(boxes) });
+      const document = { querySelector: (s) => (boxes[s] ? { getBoundingClientRect: () => boxes[s] } : null) };
+      return new Function("document", "window", `return ${expr}`)(document, { innerHeight: 900 });
+    };
+    const ok = { height: 20, width: 40, top: 100, bottom: 120 };
+
+    expect(evaluate({ ".a": ok }), "a fully visible element passes").toBe(true);
+    expect(evaluate({ ".a": ok, ".b": { ...ok, top: 300, bottom: 340 } }), "…and so do two").toBe(true);
+
+    // BELOW THE FOLD — present in the DOM, absent from the screenshot. The whole point of the verb.
+    expect(evaluate({ ".a": { ...ok, top: 880, bottom: 940 } }), "below the fold must FAIL").toBe(false);
+    // Above it, too: a fixed panel can be pushed off the top edge just as easily.
+    expect(evaluate({ ".a": { ...ok, top: -30, bottom: 10 } }), "above the fold must FAIL").toBe(false);
+    // Zero-area: rendered, laid out, and photographs as nothing.
+    expect(evaluate({ ".a": { ...ok, height: 0 } }), "zero height must FAIL").toBe(false);
+    expect(evaluate({ ".a": { ...ok, width: 0 } }), "zero width must FAIL").toBe(false);
+    // Absent entirely.
+    expect(evaluate({ ".missing": null }), "an unmatched selector must FAIL").toBe(false);
+    // EVERY, not SOME: one good element must not carry a bad one into the frame.
+    expect(
+      evaluate({ ".a": ok, ".b": { ...ok, top: 880, bottom: 940 } }),
+      "one visible element must not excuse an off-screen sibling",
+    ).toBe(false);
   });
 
   it("escapes selectors rather than splicing them in raw", () => {
