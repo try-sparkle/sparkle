@@ -55,6 +55,7 @@ import { useSettingsStore } from "../stores/settingsStore";
 import { quotaBlockForAgent, lastFailureForAgent } from "../engine/engineRegistry";
 import { getConfig, onConfigChanged } from "./config";
 import { startConflictFlags } from "./conflictFlags";
+import { startBabysitDispatcher } from "./babysitDispatcher";
 import { ownsProjectInThisWindow } from "./goalContinuationRunner";
 import { notifyConcierge } from "./conciergeNotifier";
 import { IMPROVEMENT_INTERVAL_MS } from "./improvementPass";
@@ -295,10 +296,28 @@ export function startPusher(): () => void {
     })
     .catch((e) => log.warn("pusher", "conflict probe failed to start", { error: String(e) }));
 
+  // THE `/babysit-pr` AUTO-DISPATCH SWEEP, started here for the reason the founder gave when he
+  // asked for it: detection is MECHANICAL, so it belongs on a deterministic timer beside the
+  // conflict detector above — NOT in the hourly LLM pass, because "an hour is far too long for a PR
+  // to sit with a blocking probe". The babysit pass itself needs a model; the decision to start one
+  // does not, and nothing in services/babysitDispatcher makes a model call.
+  //
+  // Same best-effort contract as the conflict probe: if it cannot start, no driver is dispatched and
+  // nothing else about the sweep changes. Silence is the fail-closed direction here too — the harm
+  // being avoided is TWO drivers replying on one human's PR, never a missed one.
+  let stopBabysit: (() => void) | undefined;
+  try {
+    stopBabysit = startBabysitDispatcher();
+    if (stopped) stopBabysit();
+  } catch (e) {
+    log.warn("pusher", "babysit dispatcher failed to start", { error: String(e) });
+  }
+
   return () => {
     stopped = true;
     stopRunner();
     stopConflicts?.();
+    stopBabysit?.();
     unlisten?.();
   };
 }

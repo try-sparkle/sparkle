@@ -11,6 +11,9 @@ mod audio;
 mod audio_devices;
 mod auth;
 mod auto_send_tuner;
+/// The durable one-driver-per-PR lease behind auto-dispatch of `/babysit-pr` (bead sparkle-5gxom).
+/// NOT `pr_claims` — that is explicitly a courtesy, not a lock. See the module docs.
+mod babysit_lease;
 mod beads_cmd;
 /// Recovering the paths of a drag whose Tauri event carried none — wry reads only the deprecated
 /// `NSFilenamesPboardType`, so a modern-only drag source drops silently. See the module docs.
@@ -696,6 +699,14 @@ pub fn run() {
             pr_claims::pr_claim_set,
             pr_claims::pr_claim_release,
             pr_claims::pr_claims_list,
+            // The one-driver-per-PR lease for auto-dispatched `/babysit-pr`. A neighbour of
+            // `pr_claims` in the list and nothing else: a claim is a courtesy, this is a lock.
+            // Registered in the SAME commit as the module — a missing registration only fails at
+            // invoke time, which for a lock means the caller cannot tell "refused" from "absent".
+            babysit_lease::babysit_lease_acquire,
+            babysit_lease::babysit_lease_heartbeat,
+            babysit_lease::babysit_lease_release,
+            babysit_lease::babysit_leases,
             sparkle_agent::ensure_sparkle_repo,
             sparkle_agent::reap_secondary_sparkle_worktrees,
             sparkle_agent::sparkle_submit_capability,
