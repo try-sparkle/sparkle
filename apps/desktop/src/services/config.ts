@@ -184,6 +184,14 @@ export interface StageCriterion {
   signal: string | null;
 }
 /** Per-project "Done" stage definition. Undefined = null description + empty criteria. */
+/** The `[babysit]` wire shape. Mirrors `BabysitConfig` in `config.rs` (serde snake_case). */
+export interface BabysitConfigPayload {
+  enabled?: boolean;
+  cooldown_minutes?: number;
+  recovery_cooldown_minutes?: number;
+  max_dispatches_per_hour?: number;
+}
+
 export interface DoneConfig {
   description: string | null;
   criteria: StageCriterion[];
@@ -235,6 +243,16 @@ export interface SparkleConfig {
    *  An absent section is NOT "Pushers are on with the shipped defaults" — `resolvePusherPolicy`
    *  reads it as DISABLED, because a backend with no [pushers] concept cannot be running one. */
   pushers?: PushersConfigPayload;
+  /**
+   * The `/babysit-pr` auto-dispatch envelope, including its kill switch.
+   *
+   * OPTIONAL for the same reason as `pushers?` above — a payload from a Rust backend predating
+   * `[babysit]` omits it. Unlike Pushers, an absent section here reads as the SHIPPED DEFAULTS
+   * rather than as disabled: the sweep is compiled into any build that has this field at all, so
+   * treating "the backend is older than the section" as off would silently stop a loop that build
+   * is in fact running, and the user would have no switch to turn back on.
+   */
+  babysit?: BabysitConfigPayload;
   /** Per-project "Done" stage definition (Definable Done & Delivered feature). */
   done: DoneConfig;
   /** Per-project "Delivered" stage definition + detected production-ship signal. */

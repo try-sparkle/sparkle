@@ -305,13 +305,46 @@ export function startPusher(): () => void {
   // Same best-effort contract as the conflict probe: if it cannot start, no driver is dispatched and
   // nothing else about the sweep changes. Silence is the fail-closed direction here too — the harm
   // being avoided is TWO drivers replying on one human's PR, never a missed one.
+  //
+  // STARTED FROM CONFIG, so `[babysit].enabled = false` actually stops it. It used to be started
+  // with no argument at all, which meant `resolveBabysitConfig({}).enabled` was hardwired true and
+  // the decision core's `disabled` hold was unreachable — the only way to stop a loop that spends a
+  // full Claude session per dispatch was to ship a new build.
+  //
+  // The read is best-effort and its FAILURE DIRECTION IS DELIBERATE: if the config cannot be read we
+  // start with the shipped defaults rather than staying off, because the sweep is compiled into this
+  // build and a failed read is not a user asking for it to stop. The switch is `enabled = false`,
+  // and that is honoured the moment the read succeeds.
   let stopBabysit: (() => void) | undefined;
-  try {
-    stopBabysit = startBabysitDispatcher();
-    if (stopped) stopBabysit();
-  } catch (e) {
-    log.warn("pusher", "babysit dispatcher failed to start", { error: String(e) });
-  }
+  void getConfig()
+    .then((eff) => {
+      if (stopped) return;
+      const b = eff.config.babysit;
+      stopBabysit = startBabysitDispatcher({
+        ...(b?.enabled !== undefined ? { enabled: b.enabled } : {}),
+        ...(b?.cooldown_minutes !== undefined ? { cooldownMs: b.cooldown_minutes * 60_000 } : {}),
+        ...(b?.recovery_cooldown_minutes !== undefined
+          ? { recoveryCooldownMs: b.recovery_cooldown_minutes * 60_000 }
+          : {}),
+        ...(b?.max_dispatches_per_hour !== undefined
+          ? { maxDispatchesPerHour: b.max_dispatches_per_hour }
+          : {}),
+      });
+      log.info("pusher", "babysit dispatcher started", { enabled: b?.enabled ?? true });
+      if (stopped) stopBabysit();
+    })
+    .catch((e) => {
+      log.warn("pusher", "babysit config read failed; starting on shipped defaults", {
+        error: String(e),
+      });
+      if (stopped) return;
+      try {
+        stopBabysit = startBabysitDispatcher();
+        if (stopped) stopBabysit();
+      } catch (err) {
+        log.warn("pusher", "babysit dispatcher failed to start", { error: String(err) });
+      }
+    });
 
   return () => {
     stopped = true;

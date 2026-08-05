@@ -622,6 +622,32 @@ impl Default for ConciergeChecksConfig {
 /// the same shape `[workers] max_concurrent` already uses, and the reason is stated on each field.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
+pub struct BabysitConfig {
+    /// Master switch for the `/babysit-pr` auto-dispatch sweep. Ships TRUE.
+    ///
+    /// THE REASON THIS SECTION EXISTS AT ALL. The sweep dispatches a full Claude session against the
+    /// founder's own subscription quota whenever an open PR turns up carrying unanswered review
+    /// probes, on a 180-second timer, with no human in the loop. Before this, `enabled` was hardwired
+    /// true — `resolveBabysitConfig({})` — so the decision core's `disabled` hold was unreachable and
+    /// the only way to stop the loop was to ship a new build. An autonomous loop that spends money
+    /// must be switchable off without a rebuild.
+    ///
+    /// On-by-default is the same trade `[pushers]` records above and is defensible for the same
+    /// reason: `max_dispatches_per_hour` below is what bounds the worst case.
+    pub enabled: bool,
+    /// Minutes a PR waits after a driver exits before another may start. Default 30.
+    pub cooldown_minutes: i64,
+    /// The SHORTER clock used when a lease reads dead — an app restart killed the driver, so the PR
+    /// is unwatched and should be picked back up sooner. Default 5. Must stay below
+    /// `cooldown_minutes`; the TypeScript resolver enforces that relation and falls back if not.
+    pub recovery_cooldown_minutes: i64,
+    /// Fleet-wide ceiling on dispatches per hour. Default 4. This is the number that makes
+    /// on-by-default defensible, so treat raising it as a spend decision.
+    pub max_dispatches_per_hour: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct PushersConfig {
     /// Master switch. Ships TRUE.
     ///
@@ -1121,6 +1147,10 @@ pub struct SparkleConfig {
     /// The Pusher's operating envelope. Machine-wide (see PushersConfig) — a repo does not get to
     /// decide how much this machine's agents are challenged.
     pub pushers: PushersConfig,
+    /// The `/babysit-pr` auto-dispatch sweep's envelope, including its kill switch. Machine-wide for
+    /// the same reason as [pushers]: a repo does not get to decide how much of this machine's
+    /// Claude quota is spent answering review probes.
+    pub babysit: BabysitConfig,
     /// Per-project "Done" stage definition (see the Definable Done & Delivered feature).
     pub done: DoneConfig,
     /// Per-project "Delivered" stage definition + detected production-ship signal.
@@ -1202,6 +1232,12 @@ impl Default for SparkleConfig {
             // No consent mirrored until the user sets it — see ImprovementConfig on why this stays
             // None rather than defaulting to "case_by_case" (it must not clobber a persisted choice).
             improvement: ImprovementConfig { consent: None },
+            babysit: BabysitConfig {
+                enabled: true,
+                cooldown_minutes: 30,
+                recovery_cooldown_minutes: 5,
+                max_dispatches_per_hour: 4,
+            },
             // No vault and no account until the user picks them, and no worktree seeding until they
             // ask for it. An unset account_id means "let `op` decide", which is right whenever
             // exactly one account is signed in.
@@ -1426,6 +1462,16 @@ struct PartialConciergeChecks {
 /// setting from the future, and left silent it would parse, apply nothing, and say nothing while
 /// the Pusher kept talking at its shipped rate.
 #[derive(Debug, Default, Deserialize)]
+struct PartialBabysit {
+    enabled: Option<toml::Value>,
+    cooldown_minutes: Option<toml::Value>,
+    recovery_cooldown_minutes: Option<toml::Value>,
+    max_dispatches_per_hour: Option<toml::Value>,
+    #[serde(flatten)]
+    rest: std::collections::BTreeMap<String, toml::Value>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct PartialPushers {
     enabled: Option<toml::Value>,
     observe_interval_ms: Option<toml::Value>,
@@ -1537,6 +1583,7 @@ struct PartialConfig {
     plugins: Option<PartialPlugins>,
     roborev: Option<PartialRoborev>,
     improvement: Option<PartialImprovement>,
+    babysit: Option<PartialBabysit>,
     onepassword: Option<PartialOnePassword>,
     freshness: Option<PartialFreshness>,
     worktree_pool: Option<PartialWorktreePool>,
@@ -1893,6 +1940,65 @@ fn apply_concierge_checks(
 /// and a line the user deliberately wrote that silently does nothing is the worst outcome of the
 /// three. Same contract as `apply_concierge` / `apply_plugins`.
 #[must_use]
+fn apply_babysit(into: &mut BabysitConfig, p: Option<PartialBabysit>) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let Some(p) = p else { return warnings };
+
+    // SAME OFF-SPELLING RULE AS `[pushers].enabled`, and for the same reason, which applies with
+    // more force here: this switch stops a loop that spends a full Claude session per dispatch on
+    // the founder's own quota. Dropping `enabled = "false"` with a warning would leave it RUNNING,
+    // and the only signal that the edit did nothing is a string in the Advanced panel — not where
+    // someone who just hand-edited the TOML to stop it is looking. Failing open on an off switch is
+    // the one direction the user cannot recover by noticing later.
+    if let Some(v) = p.enabled {
+        let off = match &v {
+            toml::Value::Boolean(false) => true,
+            toml::Value::Integer(0) => true,
+            toml::Value::String(s) => {
+                matches!(s.trim().to_ascii_lowercase().as_str(), "false" | "off" | "no" | "0")
+            }
+            _ => false,
+        };
+        if off {
+            into.enabled = false;
+        } else {
+            match v.as_bool() {
+                Some(b) => into.enabled = b,
+                None => warnings.push(format!(
+                    "[babysit].enabled is a {}, not true or false, so it has no effect — the \
+                     /babysit-pr sweep is still dispatching. Use `enabled = false` to stop it.",
+                    v.type_str()
+                )),
+            }
+        }
+    }
+    let mut int_field = |field: &str, v: Option<toml::Value>, into: &mut i64| {
+        let Some(v) = v else { return };
+        match v.as_integer() {
+            Some(n) => *into = n,
+            None => warnings.push(format!(
+                "[babysit].{field} is a {}, not a whole number, so it has no effect",
+                v.type_str()
+            )),
+        }
+    };
+    int_field("cooldown_minutes", p.cooldown_minutes, &mut into.cooldown_minutes);
+    int_field(
+        "recovery_cooldown_minutes",
+        p.recovery_cooldown_minutes,
+        &mut into.recovery_cooldown_minutes,
+    );
+    int_field("max_dispatches_per_hour", p.max_dispatches_per_hour, &mut into.max_dispatches_per_hour);
+
+    for (field, _) in p.rest {
+        warnings.push(format!(
+            "[babysit].{field} is not a babysit setting (enabled, cooldown_minutes, \
+             recovery_cooldown_minutes, max_dispatches_per_hour), so it has no effect"
+        ));
+    }
+    warnings
+}
+
 fn apply_pushers(into: &mut PushersConfig, p: Option<PartialPushers>) -> Vec<String> {
     let mut warnings = Vec::new();
     let Some(p) = p else { return warnings };
@@ -2754,6 +2860,8 @@ fn build_effective(
                 // Extended immediately for the same reason as [concierge]: [pushers] is global-only,
                 // so there is no second layer whose warnings could interleave with these.
                 warnings.extend(apply_pushers(&mut cfg.pushers, p.pushers));
+                // Global-only like [pushers], so its warnings cannot interleave with a repo layer's.
+                warnings.extend(apply_babysit(&mut cfg.babysit, p.babysit));
                 apply_done(&mut cfg.done, p.done);
                 apply_delivered(&mut cfg.delivered, p.delivered);
             }

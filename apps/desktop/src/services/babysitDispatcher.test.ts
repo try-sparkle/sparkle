@@ -657,3 +657,47 @@ describe("sweepAllProjects — the dispatch clock reaches the sweep", () => {
     expect(spawnMock).toHaveBeenCalledTimes(N);
   });
 });
+
+// ── THE KILL SWITCH (bead sparkle-4cd0x follow-up) ──────────────────────────────────────────────
+//
+// `resolveBabysitConfig({}).enabled` is true, and `startBabysitDispatcher` used to be called with no
+// argument at all — so the decision core's `disabled` hold was UNREACHABLE in production and the
+// only way to stop a loop that spends a full Claude session per dispatch was to ship a new build.
+// These assert the switch on the SIDE EFFECT (did the sweep touch the network), not on the config
+// object, because a config-shape assertion would have passed the whole time it was unreachable.
+describe("startBabysitDispatcher — the kill switch", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("enabled: false performs NO sweep — not even the immediate one", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    useProjectStore.setState({ projects: [PROJECT], selectedProjectId: PROJECT.id });
+    wireInvoke({ leases: [] });
+
+    const stop = startBabysitDispatcher({ enabled: false });
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(BABYSIT_SWEEP_MS * 3);
+
+    // No PR listing, no probe read, no spawn. The loop is genuinely off, not merely quiet.
+    expect(fetchOpenPrsMock).not.toHaveBeenCalled();
+    expect(spawnMock).not.toHaveBeenCalled();
+    stop();
+  });
+
+  it("the DEFAULT still sweeps — the switch is a switch, not a deletion", async () => {
+    // The paired direction. Without it, breaking the dispatcher entirely also passes the test above.
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    useProjectStore.setState({ projects: [PROJECT], selectedProjectId: PROJECT.id });
+    wireInvoke({ leases: [], gate: { applicable: false, probes: [], error: null, overridden: false } });
+
+    const stop = startBabysitDispatcher();
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(fetchOpenPrsMock).toHaveBeenCalled();
+    stop();
+  });
+});
