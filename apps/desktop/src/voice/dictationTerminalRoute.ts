@@ -53,8 +53,40 @@ import type { TerminalViewport } from "../services/terminalViewport";
  * and "a picker the dispatcher answers". Every other arm — a password/passphrase line, the
  * `CREDENTIAL_WORD` tail, `type "yes" to confirm` — is a field, never a menu, and must block no
  * matter what the scrollback happens to still contain.
+ *
+ * ══ IT MIRRORS THE DETECTOR'S `YN`, AND THAT IS ENFORCED BY TEST ════════════════════════════════
+ * This was NARROWER — it matched only `(yes/no`, while `suggestions/heuristics`' `YN`, the pattern
+ * `conciergeDispatch` reconciles it against, also matches `y/n`, `[y/n]` and `[yes/no]`. That left a
+ * REAL HOLE, found the first time the agreement was actually asserted
+ * (`suggestions/yesNoAgreement.test.ts`): a `(y/n)` confirmation scrolled out of the detector's
+ * last-two-lines reach was refused by NOTHING — the detector returned no options, this arm did not
+ * match the spelling, and the credential tail wants a colon. Free text was pasted AND SUBMITTED into
+ * a live confirmation. Bit-for-bit the bug roborev 58540 raised, surviving six rounds because every
+ * round only ever tested the `yes/no` spelling.
+ *
+ * ══ WHITESPACE TOLERANCE IS PART OF THE PATTERN, NOT DECORATION (roborev 58717) ═════════════════
+ * A first cut widened the SPELLING (`y/n`, bracketed forms) while silently NARROWING whitespace: it
+ * required the literal unspaced token, where the original `\(\s*yes\s*\/\s*no` tolerated
+ * `( yes / no )`. That mattered far more than it looks, because `screenTail` joins rows with a
+ * SPACE — so a prompt hard-wrapped by a narrow column arrives as `"(yes /no)"`, and the unspaced
+ * form matches none of it. This file's own header documents xterm hard-wrap in user-resizable
+ * columns as a recurring miss mode, and the detector's `YN` never covered those forms either. So a
+ * wrapped or space-padded confirmation was refused by NOTHING — the same hole this work set out to
+ * close, in the other axis.
+ *
+ * The `\b` anchors cover the bracketed forms for free (`[` and `]` are non-word characters), which
+ * is why there is no separate `\[y\/n\]` alternative.
+ *
+ * WHY NOT `import { YN }` AND HAVE ONE OBJECT? It was tried, and it is the better design in the
+ * abstract — but eight suites `vi.mock("./suggestions/heuristics")` without supplying `YN`, so a
+ * module-scope `const YES_NO_PROMPT = YN` reads `undefined` at import time and kills them at
+ * COLLECTION, with zero test failures to explain it. Every future mock of that module would inherit
+ * the same trap. So the source is duplicated deliberately, and the duplication is what
+ * `suggestions/yesNoAgreement.test.ts` exists to police: it runs ONE corpus of screens through both
+ * predicates and fails naming the screen whose meaning changed. `nudge_gate.rs` pins both spellings
+ * for the Rust port besides.
  */
-const YES_NO_PROMPT = /\(\s*yes\s*\/\s*no/i;
+const YES_NO_PROMPT = /\by\s*\/\s*n\b|\byes\s*\/\s*no\b/i;
 
 /**
  * Prompts that must block a WRITE but that `screenAwaitsInput` does not catch.

@@ -30,7 +30,7 @@ export const TAIL_LINES = 12;
  *  If you change this pattern, or the branch order below that decides whether `YN` is reached at
  *  all, read `dictationTerminalRoute`'s `matchesBlockingPrompt` and `conciergeDispatch`'s credential
  *  arm in the same sitting. */
-export const YN = /\b(y\/n|yes\/no)\b|\[y\/n\]|\[yes\/no\]/i;
+export const YN = /\by\s*\/\s*n\b|\byes\s*\/\s*no\b/i;
 /** Exported so the concierge's fingerprint can locate a generic menu's rows with the DETECTOR'S
  *  pattern rather than a wider one of its own — a locator that accepts a line the parser rejects
  *  breaks the run and produces a permanent refusal (roborev 55218). */

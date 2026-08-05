@@ -164,7 +164,25 @@ pattern!(
     write_block_password_colon,
     r"(?im)\bpass(word|phrase)\b[^\n]*:\s*$"
 );
-pattern!(write_block_yes_no, r"(?i)\(\s*yes\s*/\s*no");
+// WIDENED to match the TS pair, in BOTH axes.
+//
+// SPELLING: the old `\(\s*yes\s*/\s*no` matched only `(yes/no`, leaving `(y/n)` confirmations
+// refused by nothing when they scrolled out of the detector's reach.
+//
+// WHITESPACE: a first cut fixed the spelling and silently dropped the `\s*` classes, which was the
+// same hole in the other axis — `screenTail` joins rows with a SPACE, so a hard-wrapped prompt
+// arrives as `"(yes /no)"` and an unspaced token matches none of it (roborev 58717).
+//
+// THREE COPIES OF THIS PATTERN EXIST, deliberately: this one, TS `YN`
+// (services/suggestions/heuristics), and TS `YES_NO_PROMPT` (voice/dictationTerminalRoute). The TS
+// pair is duplicated rather than shared by import because eight suites mock the heuristics module
+// without supplying `YN`, so a module-scope alias reads `undefined` at import time and kills them at
+// collection. `suggestions/yesNoAgreement.test.ts` polices the two TS copies against one corpus; the
+// two needles in this file's drift test pin both of them for this port. Change one, change all three.
+pattern!(
+    write_block_yes_no,
+    r"(?i)\by\s*/\s*n\b|\byes\s*/\s*no\b"
+);
 pattern!(write_block_type_yes, r#"(?i)\btype\s+["']?yes["']?\b"#);
 
 // TS `CREDENTIAL_WORD` — broader than "password" on purpose: the hazard is a field that echoes
@@ -798,6 +816,9 @@ mod tests {
     // header records that this exact mistake has already been made twice.
     const TS_CLASSIFIER: &str = "../src/engine/screenClassifier.ts";
     const TS_ROUTE: &str = "../src/voice/dictationTerminalRoute.ts";
+    /// The picker detector. Enrolled because `dictationTerminalRoute`'s yes/no arm is now an ALIAS
+    /// of `YN` here rather than its own literal, so this file is where that pattern actually lives.
+    const TS_HEURISTICS: &str = "../src/services/suggestions/heuristics.ts";
     const TS_FIXTURE: &str = "../src/engine/capturedScreens.fixture.ts";
     const TS_SESSION_LIMIT: &str = "../src/services/sessionLimitScreen.ts";
 
@@ -2033,7 +2054,12 @@ mod tests {
             //
             // The trailing `;` restores the end-anchor AND re-asserts the pattern is still a
             // standalone const, which is the invariant the identity filter actually depends on.
-            r"const YES_NO_PROMPT = /\(\s*yes\s*\/\s*no/i;",
+            // Mirrors the detector's `YN` in spelling AND whitespace. Deliberately a DUPLICATE
+            // rather than an import — eight suites mock the heuristics module without supplying
+            // `YN`, so a module-scope alias reads `undefined` at import time and kills them at
+            // collection. `suggestions/yesNoAgreement.test.ts` polices the duplication; the
+            // heuristics block after this loop pins the other TS copy.
+            r"const YES_NO_PROMPT = /\by\s*\/\s*n\b|\byes\s*\/\s*no\b/i;",
             r#"/\btype\s+["']?yes["']?\b/i,"#,
             r"pass(word|phrase|code)|username|token|otp|one[-\s]?time\s+(code|password)|verification\s+code|2fa|two[-\s]?factor|pin",
         ] {
@@ -2041,6 +2067,21 @@ mod tests {
                 route.contains(needle),
                 "dictationTerminalRoute.ts changed a pattern this module ported: {needle}\n\
                  Port the change into nudge_gate.rs rather than editing this expectation."
+            );
+        }
+
+        // ── THE SHARED yes/no PATTERN, AT ITS REAL HOME ─────────────────────────────────────────
+        // `dictationTerminalRoute`'s `YES_NO_PROMPT` is an alias of this, so pinning the alias alone
+        // would let the actual pattern be widened or narrowed with the guard still green. That is not
+        // hypothetical in the other direction: the arm USED to be a narrower local literal matching
+        // only `(yes/no`, which left `(y/n)` confirmations refused by nothing.
+        let heuristics = ts(TS_HEURISTICS);
+        for needle in [r"export const YN = /\by\s*\/\s*n\b|\byes\s*\/\s*no\b/i;"] {
+            assert!(
+                heuristics.contains(needle),
+                "heuristics.ts changed the yes/no pattern this module ported: {needle}\n\
+                 It is shared with dictationTerminalRoute's write guard. Port the change into \
+                 nudge_gate.rs rather than editing this expectation."
             );
         }
 
