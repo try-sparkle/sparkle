@@ -283,28 +283,73 @@ where
     }
 }
 
-/// Turn a login-shell resolution into the program to spawn, or an error that says what is missing.
+/// Turn a resolution into the program to spawn, or an error that says what is missing.
+///
+/// The message names BOTH places we looked, because naming only the PATH made it actively
+/// misleading. `resolve_manager` now falls back to the canonical install locations, so a failure
+/// here means the binary is absent from the login-shell PATH *and* from every standard prefix —
+/// and the old "install it (or add it to your shell profile)" told a user whose pnpm sits in one
+/// of those prefixes to install something they already have. A remedy string is an instruction
+/// the reader will follow, so it has to describe the check that actually ran.
 pub fn program_or_error(
     resolved: Option<String>,
     pm: PackageManager,
 ) -> Result<String, String> {
     resolved.ok_or_else(|| {
         format!(
-            "could not find `{}` on the login-shell PATH; \
+            "could not find `{}` on the login-shell PATH or in the standard install locations; \
              install it (or add it to your shell profile) and reopen the agent",
             pm.program()
         )
     })
 }
 
-/// Locate the package manager. Unix form: the login-shell PATH probe.
+/// Canonical absolute locations the official installers use, in priority order.
+///
+/// Mirrors `preflight::known_roborev_paths_for`. Homebrew comes before `/usr/local/bin` on Apple
+/// silicon; the pnpm standalone installer and Volta put their shims under `$HOME`, which is why
+/// `home` is a parameter rather than read here — it keeps this pure and testable without touching
+/// the real environment.
+pub fn known_manager_paths_for(pm: PackageManager, home: Option<PathBuf>) -> Vec<PathBuf> {
+    let bin = pm.program();
+    let mut paths = Vec::new();
+    if let Some(home) = home {
+        // pnpm's standalone installer (PNPM_HOME), macOS default and XDG default respectively.
+        paths.push(home.join("Library/pnpm").join(bin));
+        paths.push(home.join(".local/share/pnpm").join(bin));
+        paths.push(home.join(".volta/bin").join(bin)); // volta shim
+        paths.push(home.join(".bun/bin").join(bin)); // bun's own installer
+        paths.push(home.join(".local/bin").join(bin));
+    }
+    paths.push(PathBuf::from("/opt/homebrew/bin").join(bin)); // homebrew (Apple silicon)
+    paths.push(PathBuf::from("/usr/local/bin").join(bin)); // homebrew (Intel) / npm global
+    paths
+}
+
+/// Locate the package manager. Unix form: the login-shell PATH probe, then the canonical absolute
+/// install locations.
 ///
 /// A Finder/Dock-launched Sparkle inherits a bare GUI PATH with no nvm, corepack or `~/.local/bin`,
 /// so `pnpm` resolves to nothing there while working fine in a terminal. Every other user-scope
 /// binary in this app (`claude`, `git`, `gh`, `roborev`, `op`) is resolved the same way.
+///
+/// THE PROBE ALONE IS NOT ENOUGH, which is the gap this fallback closes. `run_in_login_shell`
+/// returns `None` for a whole class of reasons that have nothing to do with the binary being
+/// absent: the profile writes to stdout (version managers routinely do, and the greeting is then
+/// taken as the resolved path), the profile exits non-zero, `$SHELL` names a shell that does not
+/// accept `-lc`, or the spawn simply fails. Every one of those presents to the user as
+/// "could not find pnpm" while `/usr/local/bin/pnpm` sits right there — and the install is then
+/// skipped, leaving the worktree with no `node_modules`, which is the exact silent failure this
+/// module exists to prevent. `roborev`, `op` and `claude` all already pair the probe with this
+/// fallback; the package manager was the one user-scope binary left without it.
 #[cfg(unix)]
 fn resolve_manager(pm: PackageManager) -> Option<String> {
-    crate::preflight::run_in_login_shell(&format!("command -v {}", pm.program()))
+    crate::preflight::run_in_login_shell(&format!("command -v {}", pm.program())).or_else(|| {
+        crate::preflight::first_executable(&known_manager_paths_for(
+            pm,
+            std::env::var_os("HOME").map(PathBuf::from),
+        ))
+    })
 }
 
 /// Windows form: `where` (GUI apps inherit PATH there).
@@ -315,7 +360,12 @@ fn resolve_manager(pm: PackageManager) -> Option<String> {
 /// that `Command::new` needs to launch pnpm/npm/yarn on Windows at all.
 #[cfg(not(unix))]
 fn resolve_manager(pm: PackageManager) -> Option<String> {
-    crate::preflight::resolve_on_path(pm.program())
+    crate::preflight::resolve_on_path(pm.program()).or_else(|| {
+        crate::preflight::first_executable(&known_manager_paths_for(
+            pm,
+            crate::preflight::home_dir(),
+        ))
+    })
 }
 
 /// The PATH the install must run with, or `None` when the inherited one is all there is.
@@ -574,6 +624,70 @@ mod tests {
         assert!(
             err.to_lowercase().contains("path"),
             "must say where we looked, got: {err}"
+        );
+    }
+
+    #[test]
+    fn the_remedy_names_the_canonical_locations_it_also_checked() {
+        // The message is an INSTRUCTION the reader will follow, so it must describe the check that
+        // actually ran. Naming only the PATH was wrong once the canonical-location fallback
+        // existed: a user whose pnpm sits in /usr/local/bin was told to install a pnpm they have,
+        // which is unactionable. Observed in the wild — the app reported "could not find pnpm"
+        // on a machine where the binary was present in a standard prefix.
+        let err = program_or_error(None, PackageManager::Pnpm).unwrap_err();
+        assert!(
+            err.contains("standard install locations"),
+            "must say the canonical prefixes were checked too, got: {err}"
+        );
+    }
+
+    #[test]
+    fn the_canonical_fallback_finds_a_manager_the_path_probe_would_miss() {
+        // THE SIDE EFFECT, not the precondition. `resolve_manager` pairs the login-shell probe
+        // with `first_executable(known_manager_paths_for(..))`; this drives that exact second half
+        // over a planted binary to prove the candidate list is one a resolution can actually
+        // succeed on. Asserting only that the list is non-empty would have passed against a list
+        // of paths that never resolve.
+        let d = TempDir::new("mgrhome");
+        let home = d.path().to_path_buf();
+        let dir = home.join(".local/share/pnpm");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("pnpm");
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let found = crate::preflight::first_executable(&known_manager_paths_for(
+            PackageManager::Pnpm,
+            Some(home),
+        ));
+        assert_eq!(
+            found,
+            Some(bin.to_string_lossy().into_owned()),
+            "the fallback must resolve a manager installed in a canonical prefix"
+        );
+    }
+
+    #[test]
+    fn the_canonical_fallback_covers_the_homebrew_and_npm_prefixes() {
+        // Both are absolute (no $HOME), so a Sparkle launched with no HOME still resolves a
+        // system-wide install. /usr/local/bin is the one the observed failure was sitting in.
+        let paths = known_manager_paths_for(PackageManager::Pnpm, None);
+        assert!(paths.contains(&PathBuf::from("/opt/homebrew/bin/pnpm")), "{paths:?}");
+        assert!(paths.contains(&PathBuf::from("/usr/local/bin/pnpm")), "{paths:?}");
+    }
+
+    #[test]
+    fn the_canonical_fallback_is_per_manager_never_hardcoded_to_pnpm() {
+        // A list that always named `pnpm` would "resolve" npm to a pnpm binary — silently running
+        // the wrong package manager against the user's lockfile.
+        let paths = known_manager_paths_for(PackageManager::Npm, None);
+        assert!(
+            paths.iter().all(|p| p.file_name().unwrap() == "npm"),
+            "every candidate must be the requested manager, got: {paths:?}"
         );
     }
 
