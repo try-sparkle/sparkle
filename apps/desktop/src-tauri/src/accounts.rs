@@ -1297,14 +1297,18 @@ fn projects_root_for_account_at(acct: &Account, home: Option<&Path>) -> Option<P
 
 /// The newest rate-limit event for one account within the lookback window, or `None` if it hasn't
 /// hit a limit recently.
-fn limit_event_for_account(acct: &Account, now: i64, log: &IdentityLog) -> Option<AccountLimitEvent> {
+fn limit_event_for_account(
+    acct: &Account,
+    now: i64,
+    home: Option<&Path>,
+    log: &IdentityLog,
+) -> Option<AccountLimitEvent> {
     let root = projects_root_for_account(acct)?;
     // Floor the scan at the moment the CURRENT identity took over this directory. Transcripts have
     // no account marker, so a rate-limit event written by the previous login sits in the same tree
     // and would otherwise be re-read and re-bench the new one — the frontend polls this and calls
     // `markExhausted` on what it finds. Same boundary the learned ceiling already respects.
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let floor = identity_key_for(acct, home.as_deref())
+    let floor = identity_key_for(acct, home)
         .and_then(|k| identity_log::takeover_at(log, &acct.config_dir, &k))
         .map_or(now - LIMIT_EVENT_LOOKBACK, |t| t.max(now - LIMIT_EVENT_LOOKBACK));
     let mut best = None;
@@ -1669,13 +1673,6 @@ fn ceiling_cache_lookup(cache: &CeilingCache, key: &str, now: i64) -> Option<Vec
     Some(value.clone())
 }
 
-/// Compute the usage snapshot for one account at `now`. Resolves the transcript
-/// root the SAME way session detection does (`claude.rs::claude_projects_root`,
-/// passing the account's own `config_dir`), then buckets. A stored
-/// `exhausted_until` is surfaced only while still in the future.
-/// Usage for EVERY account in one pass: one generation across all of them, eviction once at the
-/// end. Extracted from the command body so the invariant is testable — inlined there, reverting to
-/// a generation per account left every test green while restoring the memo thrash.
 /// The still-in-effect exhaustion for this account, or `None`.
 ///
 /// An exhaustion is a fact about an ANTHROPIC ACCOUNT but is stored on a REGISTRATION, and the
@@ -1691,12 +1688,27 @@ fn ceiling_cache_lookup(cache: &CeilingCache, key: &str, now: i64) -> Option<Vec
 fn effective_exhaustion(acct: &Account, current_identity: Option<&str>, now: i64) -> Option<i64> {
     let until = acct.exhausted_until.filter(|&e| e > now)?;
     match (acct.exhausted_identity.as_deref(), current_identity) {
-        (None, _) => Some(until),                       // legacy row: honour, it expires on its own
-        (Some(owner), Some(cur)) if owner == cur => Some(until),
-        _ => None,                                      // a different login earned this, not us
+        (None, _) => Some(until), // legacy row: honour, it expires on its own
+        (Some(owner), Some(cur)) => {
+            // Cleared ONLY for a KNOWN different login.
+            if owner == cur { Some(until) } else { None }
+        }
+        // Owner recorded, but we cannot resolve who is behind the directory RIGHT NOW. That is
+        // "can't tell", not "somebody else" — and treating it as somebody else inverted this
+        // function's own policy. Claude Code rewrites `<config_dir>/.claude.json` continuously, so a
+        // truncated mid-write read (or a momentarily unavailable dir) yields None for a single tick:
+        // the bench would vanish from AccountUsage, a rate-limited account would read as healthy,
+        // and limitSync would re-mark it on the next poll — an accounts.json read-modify-write under
+        // AccountsLock every 60s instead of a no-op. The WRITE side already picks "honour" when it
+        // cannot identify the owner (it stores None, which the first arm honours forever); this arm
+        // makes the read side agree.
+        (Some(_), None) => Some(until),
     }
 }
 
+/// Usage for EVERY account in one pass: one generation across all of them, eviction once at the
+/// end. Extracted from the command body so the invariant is testable — inlined there, reverting to
+/// a generation per account left every test green while restoring the memo thrash.
 fn usage_for_accounts(accounts: &[Account], now: i64) -> Vec<AccountUsage> {
     let pass = UsagePass::start();
     let mut touched = 0usize;
@@ -1712,6 +1724,11 @@ fn usage_for_accounts(accounts: &[Account], now: i64) -> Vec<AccountUsage> {
     usage
 }
 
+/// Compute the usage snapshot for one account at `now`. Resolves the transcript root the SAME way
+/// session detection does (`claude.rs::claude_projects_root`, passing the account's own
+/// `config_dir`), then buckets. The stored `exhausted_until` is surfaced through
+/// [`effective_exhaustion`] — being in the future is necessary but NOT sufficient, since a bench
+/// belongs to the login that earned it rather than to the registration it is stored on.
 fn usage_for_account(acct: &Account, now: i64, generation: u64) -> (AccountUsage, usize) {
     let mut records = Vec::new();
     let mut touched = 0usize;
@@ -2302,11 +2319,15 @@ pub async fn accounts_limit_events(app: AppHandle) -> Result<Vec<AccountLimitEve
         let accounts = read_accounts_at(&accounts_json_path(&app_data))?;
         let now = now_secs();
         // The ledger, so a rate-limit event written by a PREVIOUS login in the same config dir is
-        // not re-read and used to bench the current one.
+        // not re-read and used to bench the current one. Both resolved ONCE here rather than per
+        // account — and `home` is threaded rather than read from process env inside the helper, so
+        // the takeover floor is reachable from a unit test (the same reason every sibling on this
+        // path takes it).
+        let home = std::env::var_os("HOME").map(PathBuf::from);
         let log = identity_log::read_log_at(&identity_log::identity_log_path(&app_data));
         Ok(accounts
             .iter()
-            .filter_map(|a| limit_event_for_account(a, now, &log))
+            .filter_map(|a| limit_event_for_account(a, now, home.as_deref(), &log))
             .collect())
     })
     .await
@@ -3472,6 +3493,89 @@ mod tests {
     }
 
     #[test]
+    fn mark_exhausted_records_WHO_was_signed_in_when_the_bench_was_taken() {
+        // THE WRITE HALF, which nothing pinned. The existing callers pass `home: None` against a
+        // `sample()` whose config_dir does not exist, so `identity_key_for` returns None and the
+        // assignment is a no-op — delete the line and the suite stays green while every exhaustion
+        // becomes a "legacy" row that `effective_exhaustion` honours unconditionally, restoring the
+        // bug in full. My own mutation check only exercised the READ side (roborev 58210).
+        let dir = unique_dir("mark-exhausted-identity");
+        write_claude_json(
+            &dir,
+            r#"{"oauthAccount":{"emailAddress":"me@example.com","accountUuid":"uuid-mine"}}"#,
+        );
+        let path = dir.join("accounts.json");
+        write_accounts_at(&path, &[sample("a", false, dir.to_str().unwrap())]).unwrap();
+
+        mark_exhausted_at(&path, "a", 1_700_003_600, None).unwrap();
+
+        let stored = read_accounts_at(&path).unwrap();
+        assert_eq!(
+            stored[0].exhausted_identity.as_deref(),
+            Some("uuid-mine"),
+            "the bench must record WHICH login earned it"
+        );
+        // …and it round-trips: a different login does not inherit it, the same one does.
+        assert_eq!(effective_exhaustion(&stored[0], Some("uuid-other"), 1_700_000_000), None);
+        assert_eq!(
+            effective_exhaustion(&stored[0], Some("uuid-mine"), 1_700_000_000),
+            Some(1_700_003_600)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_limit_event_from_the_previous_login_does_not_bench_the_current_one() {
+        // THE TAKEOVER FLOOR, which had no test and was unreachable from one until `home` was
+        // threaded through instead of read from process env. Transcripts carry no account marker, so
+        // the previous login's rate-limit event sits in the same tree; the frontend polls this and
+        // calls markExhausted on whatever it finds. Replacing the floor with a bare lookback
+        // restores the pre-fix behaviour, and nothing caught that (roborev 58210).
+        let dir = unique_dir("limit-event-takeover-floor");
+        write_claude_json(&dir, r#"{"oauthAccount":{"accountUuid":"uuid-new","emailAddress":"n@x.com"}}"#);
+        let projects = dir.join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+
+        let old_iso = "2026-07-22T10:30:00.000Z"; // the PREVIOUS login's event
+        let new_iso = "2026-07-22T11:30:00.000Z"; // ours
+        let takeover = parse_iso8601_to_epoch("2026-07-22T11:00:00.000Z").unwrap();
+        let now = parse_iso8601_to_epoch("2026-07-22T12:00:00.000Z").unwrap();
+        let after = parse_iso8601_to_epoch(new_iso).unwrap();
+        let before = parse_iso8601_to_epoch(old_iso).unwrap();
+
+        // OLDER event only: with no boundary it is visible, which is what makes the assertion below
+        // meaningful rather than a restatement of "the newest wins".
+        std::fs::write(projects.join("s.jsonl"), format!("{}\n", limit_line(old_iso, "old login"))).unwrap();
+        let acct = sample("a", false, dir.to_str().unwrap());
+        assert_eq!(
+            limit_event_for_account(&acct, now, None, &no_log()).map(|e| e.at_epoch),
+            Some(before),
+            "with no ledger boundary the pre-takeover event IS returned"
+        );
+
+        // Same transcript, but the ledger says a different login held this dir until `takeover`.
+        let log = log_with_takeover(&dir, "uuid-old", "uuid-new", takeover);
+        assert_eq!(
+            limit_event_for_account(&acct, now, None, &log),
+            None,
+            "someone else's rate-limit event must not bench the current login"
+        );
+
+        // And our OWN post-takeover event still benches us.
+        std::fs::write(
+            projects.join("s.jsonl"),
+            format!("{}\n{}\n", limit_line(old_iso, "old login"), limit_line(new_iso, "ours")),
+        )
+        .unwrap();
+        assert_eq!(
+            limit_event_for_account(&acct, now, None, &log).map(|e| e.at_epoch),
+            Some(after),
+            "our own event after the takeover is still ours"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn an_exhaustion_does_not_survive_a_switch_to_a_different_login() {
         // knightwatch: an exhaustion is a fact about an ANTHROPIC ACCOUNT but is stored on a
         // REGISTRATION, and "Switch login" changes the identity under it. Surfacing it blindly
@@ -3492,10 +3596,14 @@ mod tests {
             None,
             "a different login must NOT inherit it"
         );
+        // "We cannot resolve who is behind the directory right now" is NOT "somebody else". The
+        // config file is rewritten continuously, so one truncated read would otherwise drop a live
+        // bench for a tick and show a rate-limited account as healthy. The WRITE side already
+        // honours the unresolvable case, and this makes the read side agree (roborev 58210).
         assert_eq!(
             effective_exhaustion(&acct, None, now),
-            None,
-            "nor may an unresolvable identity claim someone else's bench"
+            Some(now + 3_600),
+            "an unreadable identity keeps the bench — can't-tell is not somebody-else"
         );
 
         // Legacy rows carry no owner. Honour them: a limit resets within ~5h so they age out on

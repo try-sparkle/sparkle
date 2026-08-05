@@ -139,6 +139,38 @@ export const IDLE_AFTER_TURN_2_1_220 = [
   "  ⏸ manual mode on · ? for shortcuts",
 ].join("\n");
 
+/**
+ * Claude Code's SESSION-LIMIT picker — the screen the founder's whole fleet was parked on while
+ * every row still read green (PRD/sparkle/claude-account-identity-truth.md §6).
+ *
+ * PROVENANCE DIFFERS from the four screens above, and the difference matters. Those are xterm
+ * replays of sessions driven on demand; this one cannot be produced on demand, because producing it
+ * means exhausting a real account's session window. It is transcribed from the founder's 2026-08-04
+ * screenshot as recorded in §6 of that PRD — with the de-fanging that document applies REVERSED, so
+ * the glyphs and footer here are the ones the real TUI draws (`U+276F`, "Enter to confirm · Esc to
+ * cancel") rather than the doc's neutered stand-ins. Re-capture it properly with the recipe at the
+ * top of this file the next time a session limit is hit under a PTY log.
+ *
+ * ON THE LIVE TRIGGER IN THIS FILE: yes, this fixture classifies TRUE, and so does APPROVAL_2_1_220
+ * under `screenAwaitsInput` — that exposure is not new. It is also bounded for THIS screen in a way
+ * it is not for the others: `isSessionLimitPicker` is bottom-anchored and is only ever run against
+ * the settle-time viewport, so reading, diffing or `cat`ing this file cannot trip it (the content
+ * below the block keeps printing, so the footer is never the last line on the grid).
+ */
+export const SESSION_LIMIT_PICKER = [
+  "⏺ Let me check the test suite.",
+  "",
+  "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+  " Session limit reached",
+  "",
+  " What do you want to do?",
+  " ❯ 1. Stop and wait for limit to reset",
+  "   2. Switch to usage credits",
+  "   3. Switch to Team plan",
+  "",
+  " Enter to confirm · Esc to cancel",
+].join("\n");
+
 /** More picker footers Claude Code 2.1.220 can draw. PROVENANCE DIFFERS from the screens above:
  *  these are string literals read out of the 2.1.220 bundle, not captured viewports, so they are
  *  evidence of what the TUI *can* render rather than of one session. The first is the diff/review

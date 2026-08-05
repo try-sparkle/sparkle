@@ -45,6 +45,7 @@ import { startGoalContinuationRunner } from "./services/goalContinuationRunner";
 import { startFleetWatch } from "./services/fleetWatch";
 import { startInboxWatch } from "./stores/inboxStore";
 import { startPusher } from "./services/pusherMount";
+import { startAuthRecovery } from "./services/authRecovery";
 
 // The Workspace subtree pulls in the heavy authenticated UI — xterm, markdown rendering, modals,
 // the agent panes. Lazy-load it (code-split) so an unauthenticated / unpaid first-run user, who
@@ -193,6 +194,22 @@ function GoalContinuation() {
 // election, so a satellite window observes without double-pushing.
 function Pusher() {
   useEffect(() => startPusher(), []);
+  return null;
+}
+
+// Unblocks the whole fleet when the subscription comes back (PRD/sparkle/claude-account-identity-truth.md §6).
+//
+// MOUNTED, and that word is the entire point of this component. `authRecovery` is 600 lines whose
+// value is exactly zero until something calls `startAuthRecovery()` — the same failure its own
+// header describes for `nudger://escalation`, which detected these agents and flagged into a void
+// because nothing in TypeScript ever listened. An unmounted recovery service IS that void.
+//
+// Model-free on every path, so it survives the outage it exists to report on: `claude_oneshot` is
+// gated by the same account limit, which is why the resume is a pane restart and a Rust-side `Esc`
+// rather than anything that asks a model. `startAuthRecovery` is idempotent (StrictMode and HMR
+// both double-mount) and returns its own teardown.
+function AuthRecovery() {
+  useEffect(() => startAuthRecovery(), []);
   return null;
 }
 
@@ -463,6 +480,7 @@ export function App() {
       <LimitSync />
       <GoalContinuation />
       <Pusher />
+      <AuthRecovery />
       <ApiRecovery />
       <DisplayRespan />
       <LastFocusedProjectTracker />

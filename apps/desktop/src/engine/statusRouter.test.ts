@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { createStatusRouter, HOOK_STALE_MS } from "./statusRouter";
+import { createStatusRouter, HOOK_STALE_MS, withScreenReason, type StatusTransition } from "./statusRouter";
 
 describe("createStatusRouter", () => {
   it("lets the screen scraper drive until hooks activate", () => {
@@ -406,7 +406,7 @@ describe("hook-liveness watchdog", () => {
     expect(emit.mock.calls.map((x) => x[0])).toEqual(["idle", "working", "idle"]);
   });
 
-  it("mid_turn_death_is_not_recovered — KNOWN GAP, pinned deliberately", () => {
+  it("mid_turn_death_is_not_recovered — KNOWN GAP, pinned deliberately (minus the session-limit carve-out)", () => {
     // Documents a limitation rather than asserting desired behavior. If the stream dies MID-turn,
     // lastHook is frozen at "working", the idle/working contradiction never forms, and the watchdog
     // cannot fire — so resolve() answers "working" for every screen report and the row pins GREEN
@@ -418,7 +418,11 @@ describe("hook-liveness watchdog", () => {
     // for a false red on healthy sessions. The gap predates this watchdog — the pre-watchdog router
     // behaved identically — so nothing regressed; it is simply not covered.
     //
-    // If this is ever fixed, DELETE this test — do not "make it pass".
+    // NARROWED, NOT DELETED (PRD §6c). Exactly ONE screen now pierces the frozen hook: Claude Code's
+    // session-limit picker, which carries a REASON CODE saying so (see the suite below). That is a
+    // carve-out on the evidence, not a weakening of the rule — silence is still not a signal, and a
+    // prompt the classifier cannot NAME still leaves the row green, which is what this test pins.
+    // Only widen it with another named screen; never with a bare `waiting`.
     const emit = vi.fn();
     const c = mkClock();
     const r = createStatusRouter(emit, c.now);
@@ -427,6 +431,11 @@ describe("hook-liveness watchdog", () => {
     c.advance(HOOK_STALE_MS * 100);
     r.fromScreen("waiting"); // a REAL prompt is on screen and the user is blocked
     expect(emit.mock.calls.map((x) => x[0])).toEqual(["working"]); // ...but the row stays green
+    // The carve-out is by SCREEN, not by band: the same `waiting`, reported again with no reason,
+    // still does not pierce. So an approval dialog, an AskUserQuestion menu and a /model picker all
+    // keep today's behaviour, and only the named screen is exempt.
+    r.fromScreen("approval");
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["working"]);
   });
 
   it("reset() clears the hook timestamp", () => {
@@ -440,5 +449,181 @@ describe("hook-liveness watchdog", () => {
     r.activate();
     r.fromScreen("working"); // no lastHookAt → watchdog can't fire on a stale ghost
     expect(emit.mock.calls.map((x) => x[0])).toEqual(["idle"]);
+  });
+});
+
+// ── The session-limit pierce (PRD/sparkle/claude-account-identity-truth.md §6c) ─────────────────
+//
+// The founder's whole fleet was parked on Claude Code's session-limit picker while every row read
+// GREEN. The classifier was never the defect — `screenAwaitsInput` matched that screen all along.
+// The defect was here: a session limit lands MID-TURN, so no `Stop` hook ever fires, `lastHook`
+// freezes at "working", and the screen escalation below `if (hook !== "idle") return hook` only ever
+// lifts a hook-IDLE turn. The screen's verdict was arbitrated away every time.
+
+/** Report a screen status the way statusEngine does when the viewport IS the session-limit picker:
+ *  the reason rides beside the call for its synchronous duration. */
+const fromPicker = (r: ReturnType<typeof createStatusRouter>, s: Parameters<typeof r.fromScreen>[0] = "waiting") =>
+  withScreenReason("session-limit-picker", () => r.fromScreen(s));
+
+describe("createStatusRouter — the session-limit picker pierces hook authority", () => {
+  const mkClock = () => {
+    let t = 0;
+    return { now: () => t, advance: (ms: number) => (t += ms) };
+  };
+
+  it("THE TEST: a frozen `working` hook + a session-limit viewport resolves to `waiting` with the reason", () => {
+    // This is the founder's screen, reduced to its two facts. Against the router as it stood, the
+    // last assertion read ["working"] — the row stayed green.
+    const emit = vi.fn();
+    const transitions: StatusTransition[] = [];
+    const c = mkClock();
+    const r = createStatusRouter(emit, c.now, (t) => transitions.push(t));
+    r.activate();
+    r.fromHook("working"); // the turn opens; the limit lands inside it, so no Stop ever follows
+    c.advance(HOOK_STALE_MS * 100); // …and the hook stays frozen there for as long as you like
+    fromPicker(r);
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["working", "waiting"]);
+    expect(transitions.at(-1)?.reason).toBe("session-limit-picker");
+    // The band is `waiting`, not `blocked` — deliberately, because `blocked` raises no banner and no
+    // dock badge, so the fleet would have gone red and still paged nobody.
+    expect(transitions.at(-1)?.to).toBe("waiting");
+    // And the frozen hook is still exactly what it was: the pierce overrides it, it does not repair it.
+    expect(transitions.at(-1)?.lastHook).toBe("working");
+  });
+
+  it("does NOT retract merely because the picker left the screen", () => {
+    // The whole reason the pierce is latched. If it retracted on "picker gone", the instant a
+    // recovery service pressed Esc the row would fall through to the STILL frozen `working` hook and
+    // go green whether or not the resume took — back to the invisible-green state that was reported.
+    const emit = vi.fn();
+    const c = mkClock();
+    const r = createStatusRouter(emit, c.now);
+    r.activate();
+    r.fromHook("working");
+    fromPicker(r);
+    r.fromScreen("idle"); // Esc landed: the dialog is gone and the screen is calm…
+    r.fromScreen("idle"); // …and stays calm, because a walled agent prints nothing
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["working", "waiting"]); // still red
+  });
+
+  it("retracts on POSITIVE PROGRESS — new agent output", () => {
+    const emit = vi.fn();
+    const c = mkClock();
+    const r = createStatusRouter(emit, c.now);
+    r.activate();
+    r.fromHook("working");
+    fromPicker(r);
+    r.fromScreen("working"); // the spinner is redrawing again: the agent really did resume
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["working", "waiting", "working"]);
+  });
+
+  it("retracts on POSITIVE PROGRESS — a real tool event on the hook stream", () => {
+    const emit = vi.fn();
+    const c = mkClock();
+    const r = createStatusRouter(emit, c.now);
+    r.activate();
+    r.fromHook("idle"); // this run's turn had closed…
+    fromPicker(r); // …and the picker is up (a resume walked straight back into the wall)
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["idle", "waiting"]);
+    r.fromHook("working"); // PreToolUse: the agent is executing again
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["idle", "waiting", "working"]);
+  });
+
+  it("a hook `idle` is NOT progress — Claude's idle Notification fires while the picker sits unanswered", () => {
+    const emit = vi.fn();
+    const c = mkClock();
+    const r = createStatusRouter(emit, c.now);
+    r.activate();
+    r.fromHook("working");
+    fromPicker(r);
+    r.fromHook("idle"); // the ~60s "waiting for your input" ping — that IS the unanswered dialog
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["working", "waiting"]);
+  });
+
+  it("an `errored` screen still outranks it, and is not reported as a session limit", () => {
+    const emit = vi.fn();
+    const transitions: StatusTransition[] = [];
+    const c = mkClock();
+    const r = createStatusRouter(emit, c.now, (t) => transitions.push(t));
+    r.activate();
+    r.fromHook("working");
+    fromPicker(r);
+    r.fromScreen("errored"); // the agent went on to wedge on an API banner
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["working", "waiting", "errored"]);
+    expect(transitions.at(-1)?.reason).toBeNull();
+  });
+
+  it("reports the reason even when the row was ALREADY `waiting` for some other prompt", () => {
+    // The common real path: the picker's footer streams past mid-turn, so the engine paints
+    // `waiting` off the stream ~2s before it reads the viewport. Same colour, materially different
+    // fact — the consumer that acts on the reason has to hear about it, so the transition record
+    // fires without a redundant status emit.
+    const emit = vi.fn();
+    const transitions: StatusTransition[] = [];
+    const c = mkClock();
+    const r = createStatusRouter(emit, c.now, (t) => transitions.push(t));
+    r.activate();
+    r.fromHook("idle");
+    r.fromScreen("waiting"); // some prompt is up; nothing yet says which
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["idle", "waiting"]);
+    fromPicker(r); // the viewport read names it
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["idle", "waiting"]); // no redundant emit…
+    expect(transitions.map((t) => t.reason)).toEqual([null, null, "session-limit-picker"]); // …but it IS reported
+  });
+
+  it("holds the pierce on the scraper-driven path too (hooks never activated)", () => {
+    const emit = vi.fn();
+    const c = mkClock();
+    const r = createStatusRouter(emit, c.now);
+    fromPicker(r); // no hooks at all: the scraper owns the row
+    r.fromScreen("idle"); // Esc landed, screen calm — but nothing proves the agent resumed
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["waiting"]);
+    r.fromScreen("working");
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["waiting", "working"]);
+  });
+
+  it("an `errored` screen outranks the pierce on the SCRAPER path too, and keeps its own band", () => {
+    // The hooks-live path gets this right via `resolve`'s ordering, but the scraper path took a
+    // different branch that overrode the incoming status unconditionally once the latch was set —
+    // including `errored` (roborev 58141). Two things went wrong at once, and both are asserted:
+    // the band was downgraded from `errored` to `waiting`, AND `resolveReason()` correctly returns
+    // null for an errored screen, so the transition carried NO reason. An agent that wedged on an
+    // API banner after hitting the limit was reported as merely needing an answer, with the one
+    // field a consumer acts on stripped off.
+    const emit = vi.fn();
+    const c = mkClock();
+    const transitions: StatusTransition[] = [];
+    const r = createStatusRouter(emit, c.now, (t) => transitions.push(t));
+    fromPicker(r); // no hooks: the scraper owns the row
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["waiting"]);
+    r.fromScreen("errored"); // the process died on top of the picker
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["waiting", "errored"]);
+    expect(transitions.at(-1)?.reason).toBeNull();
+  });
+
+  it("reset() drops the pierce — a re-prepare is a new run", () => {
+    const emit = vi.fn();
+    const c = mkClock();
+    const r = createStatusRouter(emit, c.now);
+    r.activate();
+    r.fromHook("working");
+    fromPicker(r);
+    r.reset();
+    r.fromScreen("idle");
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["working", "waiting", "idle"]);
+  });
+
+  it("the reason does not leak past the synchronous call that carried it", () => {
+    // The hand-off slot is the one piece of module state here, so pin that it is scoped to a single
+    // emit. A later screen report from ANY agent must not inherit it.
+    const emit = vi.fn();
+    const c = mkClock();
+    const other = createStatusRouter(vi.fn(), c.now);
+    const r = createStatusRouter(emit, c.now);
+    fromPicker(other); // a DIFFERENT agent is the one at the picker
+    r.activate();
+    r.fromHook("working");
+    r.fromScreen("waiting"); // this one merely has some prompt on screen
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["working"]); // …so it stays green
   });
 });

@@ -1,5 +1,8 @@
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, resolve } from "node:path";
 import { describe, it, expect } from "vitest";
-import { screenAwaitsInput, PICKER_FOOTER } from "./screenClassifier";
+import { screenAwaitsInput, isSessionLimitPicker, PICKER_FOOTER } from "./screenClassifier";
 import {
   APPROVAL_2_1_220,
   APPROVAL_OPTION_2_2_1_220,
@@ -8,6 +11,7 @@ import {
   IDLE_AFTER_TURN_2_1_220,
   NON_PICKER_HINT_LINES_2_1_220,
   OTHER_PICKER_FOOTERS_2_1_220,
+  SESSION_LIMIT_PICKER,
 } from "./capturedScreens.fixture";
 
 // These fixtures are plain-text snapshots of the *rendered* terminal screen (the visible
@@ -296,5 +300,217 @@ describe("screenAwaitsInput — captured Claude Code 2.1.220 screens", () => {
       expect(PICKER_FOOTER.test(SPINNER_FRAME)).toBe(false);
       expect(screenAwaitsInput(SPINNER_FRAME)).toBe(false);
     });
+  });
+});
+
+// ── isSessionLimitPicker ────────────────────────────────────────────────────────────────────────
+//
+// The one classifier whose answer PIERCES hook authority and whose reason code is a machine
+// trigger, so its false-positive discipline is what these tests are mostly about. Three independent
+// gates (co-presence, bottom-anchoring, two distinct remedy topics) — each is pinned below by
+// removing exactly that gate from a screen the function otherwise accepts.
+
+/** This repo's copy of the frozen contract. Read at TEST TIME so the assertion tracks the real
+ *  file rather than a copy of it that drifts the moment someone edits the doc. */
+const CONTRACT_DOC = resolve(dirname(fileURLToPath(import.meta.url)), "../../../../PRD/sparkle/claude-account-identity-truth.md");
+
+describe("isSessionLimitPicker", () => {
+  it("flags a real session-limit viewport", () => {
+    expect(isSessionLimitPicker(SESSION_LIMIT_PICKER)).toBe(true);
+  });
+
+  it("does NOT flag it when prose continues beneath it (the bottom-anchored rule)", () => {
+    // The gate that keeps this function off documents, diffs and reviews that QUOTE the screen: a
+    // live Ink dialog is the last thing on the grid, a quotation never is. Everything else about
+    // this input is byte-identical to the accepted one above, so only anchoring can explain the
+    // difference.
+    const quoted = [
+      SESSION_LIMIT_PICKER,
+      "",
+      "That is the screen the whole fleet was parked on. The classifier must not fire on this",
+      "paragraph, or reviewing this file would pin the reviewer's own agent red.",
+    ].join("\n");
+    expect(isSessionLimitPicker(quoted)).toBe(false);
+    // …and a bare code fence beneath it is enough, too — the common shape in a markdown file.
+    expect(isSessionLimitPicker(`${SESSION_LIMIT_PICKER}\n\`\`\``)).toBe(false);
+  });
+
+  it("does NOT flag the frozen contract's own de-fanged reproduction of the screen", () => {
+    // PRD §6c makes this a REQUIRED test, and the alarm it arms is specific: if a future edit puts
+    // the live glyph or the real footer back into that fenced block, an agent that reviews the PRD
+    // streams a live trigger through its own terminal and flags itself. This test is what goes red
+    // first. Read out of the file so it cannot pass against a stale copy.
+    const doc = readFileSync(CONTRACT_DOC, "utf8");
+    const section = doc.slice(doc.indexOf("## 6. ADDENDUM"));
+    // Guard against a vacuous pass: if the section or the block is ever restructured away, fail
+    // here rather than quietly asserting `false` about an empty string.
+    expect(section).not.toBe("");
+    const block = /```\n([\s\S]*?)```/.exec(section)?.[1] ?? "";
+    expect(block).toContain("What do you want to do?");
+    expect(isSessionLimitPicker(block)).toBe(false);
+    // Stronger, and the actual guarantee the doc claims: the de-fanged block reads as no prompt at
+    // all — neither the selection cursor nor the footer survives the de-fanging.
+    expect(screenAwaitsInput(block)).toBe(false);
+    // And the document as a whole is not a picker either (its last line is prose, not a footer).
+    expect(isSessionLimitPicker(doc)).toBe(false);
+  });
+
+  it("does NOT flag any other captured picker", () => {
+    // Every one of these is a genuine blocking dialog — `screenAwaitsInput` says true for all of
+    // them. Only the session-limit one may pierce a frozen hook or arm a machine keystroke.
+    for (const screen of [APPROVAL_2_1_220, APPROVAL_OPTION_2_2_1_220, ASK_USER_QUESTION_2_1_220, MODEL_PICKER_2_1_220]) {
+      expect(screenAwaitsInput(screen)).toBe(true); // a real blocking dialog…
+      expect(isSessionLimitPicker(screen)).toBe(false); // …but not THIS one
+    }
+    expect(isSessionLimitPicker(IDLE_AFTER_TURN_2_1_220)).toBe(false);
+  });
+
+  it("does NOT flag ambient chrome that merely mentions credits or a limit", () => {
+    for (const line of NON_PICKER_HINT_LINES_2_1_220) expect(isSessionLimitPicker(line)).toBe(false);
+    // The two nearest misses in the wild, verbatim from the 2.1.220 bundle.
+    expect(isSessionLimitPicker("Usage credits are off · /usage-credits to turn them on")).toBe(false);
+    expect(isSessionLimitPicker("← or → to adjust · Del to remove limit")).toBe(false);
+  });
+
+  it("requires the selection cursor — a menu nobody is sitting on is not it", () => {
+    const noCursor = SESSION_LIMIT_PICKER.replace("❯ 1.", "  1.");
+    expect(noCursor).not.toBe(SESSION_LIMIT_PICKER); // the substitution really landed
+    expect(isSessionLimitPicker(noCursor)).toBe(false);
+  });
+
+  it("requires the picker footer", () => {
+    const noFooter = SESSION_LIMIT_PICKER.replace(" Enter to confirm · Esc to cancel", " (limit reached)");
+    expect(PICKER_FOOTER.test(noFooter)).toBe(false);
+    expect(isSessionLimitPicker(noFooter)).toBe(false);
+  });
+
+  it("requires TWO distinct remedies, so one stray option line cannot carry it", () => {
+    const oneRemedy = SESSION_LIMIT_PICKER.replace("   2. Switch to usage credits", "   2. Keep going").replace(
+      "   3. Switch to Team plan",
+      "   3. Cancel",
+    );
+    expect(oneRemedy).not.toContain("usage credits");
+    expect(isSessionLimitPicker(oneRemedy)).toBe(false);
+  });
+
+  it("requires the options to be in the same frame as the footer, not far up the viewport", () => {
+    const scrolledApart = SESSION_LIMIT_PICKER.replace(
+      "\n\n Enter to confirm · Esc to cancel",
+      `\n${Array(20).fill("⏺ …then twenty lines of transcript scrolled past.").join("\n")}\n Enter to confirm · Esc to cancel`,
+    );
+    expect(scrolledApart).not.toBe(SESSION_LIMIT_PICKER); // the substitution really landed
+    expect(scrolledApart).toContain("Enter to confirm · Esc to cancel"); // …and the footer survived it
+    expect(isSessionLimitPicker(scrolledApart)).toBe(false);
+  });
+
+  it("requires the RESET option — the two billing labels alone are not this screen", () => {
+    // The mandatory label, and the one that exists on no other Claude Code picker. "Switch to usage
+    // credits" and "Switch to Team plan" are generic enough to belong to some future settings
+    // dialog, and this predicate gates a machine-initiated pane restart — so two billing labels
+    // must not be able to carry it on their own.
+    //
+    // This is also the case that proves the delegation is live rather than decorative: the topic
+    // matcher this file used to carry returned true here, while `hasSessionLimitOptions` (and the
+    // Rust twin's `the_billing_options_without_the_reset_option_are_not_a_picker`) return false.
+    const billingOnly = SESSION_LIMIT_PICKER.replace(
+      " ❯ 1. Stop and wait for limit to reset",
+      " ❯ 1. Keep the current plan",
+    );
+    expect(billingOnly).toContain("usage credits"); // the substitution left the billing labels alone
+    expect(billingOnly).toContain("Team plan");
+    expect(isSessionLimitPicker(billingOnly)).toBe(false);
+  });
+
+  it("the cursor must be on an OPTION ROW OF THIS DIALOG, not merely somewhere on the grid", () => {
+    // Tested against the whole snapshot, an unrelated permission menu still in the viewport
+    // satisfied the gate for a picker nobody was highlighted on. "A menu nobody is sitting on
+    // cannot qualify" is the claim; this is the case that makes it true.
+    const noHighlight = SESSION_LIMIT_PICKER.replace(" ❯ 1. Stop and", "   1. Stop and");
+    const withStrayCursor = ["❯ 1. Yes", "  2. No", "", noHighlight].join("\n");
+    expect(withStrayCursor).toContain("❯ 1."); // precondition: a cursor IS on the grid
+    expect(isSessionLimitPicker(withStrayCursor)).toBe(false);
+    // …and the same frame WITH its own highlight restored still classifies, so the assertion above
+    // is about where the cursor is and not about the substitution having broken something else.
+    expect(isSessionLimitPicker(["❯ 1. Yes", "  2. No", "", SESSION_LIMIT_PICKER].join("\n"))).toBe(true);
+  });
+
+  it("agrees with the Rust port on a `\\r`-framed grid", () => {
+    // `nudge_gate::lines` splits on BOTH `\n` and `\r`, because the PTY redraws in place and a chunk
+    // can carry several frames separated by carriage returns alone. Every rule here is line-INDEX
+    // arithmetic, so a TS side that split on `/\r?\n/` would collapse the dialog into one array
+    // element, find no footer below the options, and answer false while Rust answered TRUE — a
+    // disagreement that hands out the Esc exemption on a screen this classifier never recognised.
+    const crFramed = SESSION_LIMIT_PICKER.replace(/\n/g, "\r");
+    expect(crFramed).not.toContain("\n"); // the substitution really landed
+    expect(isSessionLimitPicker(crFramed)).toBe(true);
+    // CRLF too — the character class yields Rust's empty element for each pair, so indices match.
+    expect(isSessionLimitPicker(SESSION_LIMIT_PICKER.replace(/\n/g, "\r\n"))).toBe(true);
+  });
+
+  it("is false for an empty or whitespace screen", () => {
+    expect(isSessionLimitPicker("")).toBe(false);
+    expect(isSessionLimitPicker("   \n\n  ")).toBe(false);
+  });
+
+  it("THERE IS EXACTLY ONE MATCHER — this file spells no option literal of its own", () => {
+    // Two independent implementations of this predicate briefly existed: one here, keyed on topic
+    // regexes, and one in `services/sessionLimitScreen.ts`, keyed on the labels. Only the second is
+    // read by `nudge_gate.rs`'s `ported_typescript_patterns_have_not_drifted`, so a widening of the
+    // first would have been invisible to the test that keeps the Rust escape exemption honest — and
+    // the Rust exemption is what licenses a keystroke at a BILLING dialog.
+    //
+    // So the labels live in exactly one module and this one delegates. Asserted against the source
+    // because the failure mode is a well-meaning future edit that re-inlines "just this one
+    // literal" for readability; a behavioural test cannot see that at all.
+    const src = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "screenClassifier.ts"), "utf8");
+    // The option ROWS are a regex shape, and that shape belongs to the shared module. Asserted on
+    // the shape rather than on the words so this stays a delegation test and not a spelling test:
+    // the header comment may (and does) describe the screen, and explain the shared anchor, in prose.
+    //
+    // COMMENTS ARE STRIPPED FIRST, and that is not a convenience — it is the difference between a
+    // test about the code and a test about the documentation. Without it this assertion fired on
+    // the header's own explanation of why a `//` prefix cannot match the anchor, which is exactly
+    // the kind of prose the file should be free to carry.
+    const code = src
+      .split("\n")
+      .filter((l) => !l.trimStart().startsWith("//"))
+      .join("\n");
+    expect(code, "the option-row regex belongs in sessionLimitScreen.ts, not here").not.toMatch(
+      /\[❯›\]\?\\s\*\\d\+\\\./,
+    );
+    // …and it really does delegate: the shared module is imported by value, not merely by type.
+    expect(src).toMatch(/import \{[\s\S]*?hasSessionLimitOptions[\s\S]*?\} from "\.\.\/services\/sessionLimitScreen"/);
+  });
+
+  it("READING THIS FILE DOES NOT ARM THE FEATURE — no viewport of it is the picker", () => {
+    // The same guarantee PRD §6 carries for the contract doc, and it matters MORE here: this file is
+    // read, diffed and reviewed constantly, and its header draws the screen it exists to recognise.
+    // A source copy that classified true would mean the agent reviewing the matcher pierces its own
+    // row to `waiting` and becomes a candidate for an automated pane restart.
+    //
+    // WHAT THIS TEST CAN AND CANNOT CATCH (measured with two hand-mutations, not assumed):
+    //   • Restoring the live `❯` and the real footer in the header comment — STAYS GREEN. The `//`
+    //     prefix defeats every option pattern on its own, so that edit is not actually a hazard and
+    //     this test rightly does not claim to catch it.
+    //   • Injecting the same block as a template literal, with no `//` — GOES RED at the viewport
+    //     ending on its footer. That is the real hazard shape (a fixture or example landing in this
+    //     file), and it is what this test guards.
+    const src = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "screenClassifier.ts"), "utf8");
+    expect(src).toContain("What do you want to do?"); // guard against a vacuous pass
+    expect(isSessionLimitPicker(src)).toBe(false);
+    // NOT asserted: `screenAwaitsInput(src) === false`. It is true, and legitimately so — this file
+    // documents three OTHER picker footers verbatim (see PICKER_FOOTER) and that exposure predates
+    // the session-limit work by a long way. It is also bounded in a way the session-limit predicate
+    // is not: `screenAwaitsInput` never pierces a frozen hook and never triggers a keystroke, so a
+    // false positive there costs a red row, not a machine action on a billing dialog.
+    // The strongest form, and the one that survives the file being viewed a screenful at a time:
+    // no window of this source is the picker, however the viewport happens to be cut. `false` for
+    // the whole file could otherwise rest entirely on the bottom-anchor rule, which a scrolled
+    // viewport ending on the footer row would not have.
+    const lines = src.split("\n");
+    for (let end = 1; end <= lines.length; end++) {
+      const window = lines.slice(Math.max(0, end - 60), end).join("\n");
+      expect(isSessionLimitPicker(window), `viewport ending at line ${end} classifies as the picker`).toBe(false);
+    }
   });
 });

@@ -567,6 +567,7 @@ pub fn run() {
             pty::pty_ack,
             nudger::nudger_flags,
             nudger::nudger_clear_flag,
+            nudger::nudger_send_escape,
             conflict_watch::conflict_flags,
             conflict_watch::conflict_clear_flag,
             conflict_watch::conflict_probe_status,

@@ -195,6 +195,136 @@ pattern!(
     r"(?i)\b(want me to|should i\b|shall i\b|would you like|do you want|ok(?:ay)? to (?:go|proceed|land|push|commit)|ready for me to|which (?:one|of these|approach|option)|let me know (?:if|whether|which))"
 );
 
+// ── THE SESSION-LIMIT PICKER ──────────────────────────────────────────────────────────────────
+//
+// THE ONE SCREEN AT WHICH A MACHINE MAY SEND A KEY THAT `write_refusal` WOULD REFUSE — and the key
+// is `Esc`, always and only. See `escape_refusal` below for the gate; this is the recognizer.
+//
+// Ported from `../src/services/sessionLimitScreen.ts`, which exists so this matcher can be enrolled
+// in `ported_typescript_patterns_have_not_drifted` without W-RESUME editing `screenClassifier.ts`.
+// That TS module's header carries the full rationale; the parts that constrain THIS code:
+//
+//   * The three options are account-level BILLING decisions ("Switch to usage credits" moves the
+//     user onto paid overage; "Switch to Team plan" changes their subscription). A false positive
+//     here means a machine pressed Esc at some OTHER live dialog — cancelling a tool approval a
+//     human was mid-answer on. Every rule below therefore fails CLOSED.
+//   * `PRD/sparkle/claude-account-identity-truth.md` §6 quotes this screen. Four independent
+//     properties keep that block from matching: it renders its cursor as a bare `>` (which
+//     `selection_cursor` rejects), its labels carry U+200B inside each keyword, its footer is
+//     rewritten so no footer matcher fires, and prose continues beneath it (the bottom-anchor
+//     rule). Any ONE of them is sufficient; all four hold.
+//
+// The trailing `s` in the credits pattern is REQUIRED, not optional: `\b` treats U+200B as a
+// non-word character, so a permissive `credits?\b` matches the PRD's de-fanged `credit`+U+200B+`s`.
+
+// TS: /^\s*[│|]?\s*[❯›]?\s*\d+\.\s+stop and wait for (?:the )?limit to reset\b/im
+pattern!(
+    session_limit_reset_option,
+    r"(?im)^\s*[│|]?\s*[❯›]?\s*\d+\.\s+stop and wait for (?:the )?limit to reset\b"
+);
+// TS: /^\s*[│|]?\s*[❯›]?\s*\d+\.\s+switch to usage credits\b/im
+pattern!(
+    session_limit_credits_option,
+    r"(?im)^\s*[│|]?\s*[❯›]?\s*\d+\.\s+switch to usage credits\b"
+);
+// TS: /^\s*[│|]?\s*[❯›]?\s*\d+\.\s+switch to team plan\b/im
+pattern!(
+    session_limit_team_option,
+    r"(?im)^\s*[│|]?\s*[❯›]?\s*\d+\.\s+switch to team plan\b"
+);
+
+/// TS `MIN_OPTIONS_PRESENT`. The reset option is mandatory on top of this count — see
+/// `session_limit_options_present`.
+const MIN_OPTIONS_PRESENT: usize = 2;
+
+/// TS `MAX_TRAILING_ROWS`. The bottom-anchored rule: a live Ink dialog IS the bottom of the grid,
+/// whereas a document quoting it continues underneath.
+///
+/// ZERO on evidence — all four pickers captured verbatim from Claude Code 2.1.220 in
+/// `capturedScreens.fixture.ts` end at their footer, with at most a trailing BLANK line (ignored
+/// here). At 3, a markdown file quoting the screen would match the moment its closing fence was the
+/// only row beneath the footer, which is one line.
+const MAX_TRAILING_ROWS: usize = 0;
+
+/// TS `MAX_OPTION_FOOTER_GAP`. How many rendered rows may separate the LAST option row from the
+/// footer — what makes "the same rendered frame" precise. Eight, measured: the gap across the four
+/// captured 2.1.220 pickers is 2, 2, 2 and 6 (the `/model` picker is the wide one).
+const MAX_OPTION_FOOTER_GAP: usize = 8;
+
+fn is_session_limit_option_line(line: &str) -> bool {
+    session_limit_reset_option().is_match(line)
+        || session_limit_credits_option().is_match(line)
+        || session_limit_team_option().is_match(line)
+}
+
+/// How many of the three labels this frame carries. Mirrors TS `sessionLimitOptionsPresent`.
+fn session_limit_options_present(text: &str) -> usize {
+    usize::from(session_limit_reset_option().is_match(text))
+        + usize::from(session_limit_credits_option().is_match(text))
+        + usize::from(session_limit_team_option().is_match(text))
+}
+
+/// Is this rendered line a picker FOOTER? Reuses the two matchers already ported rather than adding
+/// raw literals, and applies the same `to interrupt` disqualifier `screen_awaits_input` does — a
+/// line carrying it is Claude's always-present status bar, not a menu.
+fn is_picker_footer_line(line: &str) -> bool {
+    !line.to_ascii_lowercase().contains(NOT_A_FOOTER_VERB)
+        && (footer_legacy().is_match(line) || footer_bar().is_match(line))
+}
+
+/// True when the rendered viewport is Claude Code's SESSION-LIMIT picker specifically.
+///
+/// Requires ALL of: the mandatory reset label, at least `MIN_OPTIONS_PRESENT` labels overall, the
+/// shared `selection_cursor` (so a markdown blockquote's `>` cannot qualify), a picker footer
+/// BELOW the options, and at most `MAX_TRAILING_ROWS` non-blank rows after that footer.
+pub fn screen_is_session_limit_picker(text: &str) -> bool {
+    // The label half, mirroring TS `hasSessionLimitOptions`. Reset is mandatory: both "Switch to …"
+    // labels are generic enough to appear on some other settings picker, whereas "stop and wait for
+    // limit to reset" exists on no other Claude Code screen.
+    if !session_limit_reset_option().is_match(text) {
+        return false;
+    }
+    if session_limit_options_present(text) < MIN_OPTIONS_PRESENT {
+        return false;
+    }
+    let all: Vec<&str> = lines(text).collect();
+    let Some(last_option) = all.iter().rposition(|l| is_session_limit_option_line(l)) else {
+        return false;
+    };
+    // Rule (1): the selection cursor, reusing the SHARED matcher (`>` is not in its class) — and it
+    // must sit ON AN OPTION ROW OF THIS DIALOG, not merely somewhere on the grid (roborev 58159).
+    // Tested against the whole text, any `❯ 1. …` in the visible scrollback satisfied it, including
+    // a permission menu hundreds of rows above; the exemption this gates is a keystroke.
+    if !all
+        .iter()
+        .any(|l| is_session_limit_option_line(l) && selection_cursor().is_match(l))
+    {
+        return false;
+    }
+    // Rule (3): a picker footer, and it must sit BELOW the options — a footer above them belongs to
+    // some earlier frame still on screen, not to this dialog.
+    let Some(footer_idx) = all
+        .iter()
+        .enumerate()
+        .skip(last_option + 1)
+        .find(|(_, l)| is_picker_footer_line(l))
+        .map(|(i, _)| i)
+    else {
+        return false;
+    };
+    // …and WITHIN the same rendered frame. TS `MAX_OPTION_FOOTER_GAP`: option rows scrolled far up
+    // the viewport must not pair with an unrelated footer at the bottom of the grid.
+    if footer_idx - last_option > MAX_OPTION_FOOTER_GAP {
+        return false;
+    }
+    // Rule (4): bottom-anchored.
+    let trailing = all[footer_idx + 1..]
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .count();
+    trailing <= MAX_TRAILING_ROWS
+}
+
 // ── THE RUNNING-TURN MARKER ───────────────────────────────────────────────────────────────────
 
 // Claude Code's live spinner hint. This is the one marker `screenClassifier.ts` calls "reliable on
@@ -426,6 +556,55 @@ pub fn write_refusal(screen: Option<&Screen>) -> Option<Refusal> {
     None
 }
 
+/// The ONE byte any machine may ever send at a session-limit picker: `Esc`, which CANCELS.
+///
+/// Never a numbered option, under any recovery path, ever. Options 2 and 3 on that picker are
+/// billing decisions — paid overage and a subscription change — and pressing either on the user's
+/// behalf is the exact harm `Refusal::AwaitingInput` exists to prevent ("free text aimed at a live
+/// picker presses a button nobody read"). Exported as a constant rather than spelled at the call
+/// site so a test can assert the whole recovery path's byte alphabet is `{ESC}`.
+pub const ESCAPE_KEY: &str = "\x1b";
+
+/// MAY THE MACHINE SEND `ESCAPE_KEY` INTO THIS TERMINAL? `None` means yes.
+///
+/// ── WHY THIS IS A SEPARATE FUNCTION AND NOT A HOLE IN `write_refusal` ─────────────────────────
+/// The obvious shape — teach `write_refusal` to return `None` on a session-limit picker — would be
+/// wrong in the dangerous direction: `write_refusal`'s `None` licenses the nudger's ARBITRARY TEXT
+/// (a bracketed paste followed by a carriage return), and a paste-then-CR at a live picker submits
+/// whichever option the cursor happens to sit on. The exemption §6c calls for is narrow, so it is
+/// scoped by CONSTRUCTION: `write_refusal` is unchanged and still answers `AwaitingInput` here, and
+/// the only caller that may consult this function is the one that writes exactly `ESCAPE_KEY`.
+///
+/// Every other refusal still applies, in the same order and for the same reasons. In particular a
+/// RUNNING turn still refuses: a picker cannot be live while output is streaming, so a screen that
+/// shows both is a stale or garbled grid, and pressing Esc into a running turn cancels the turn.
+///
+/// FAILS CLOSED on every unknown — no screen, an alternate buffer that is not Claude Code's own
+/// prompt, a credential prompt, or any screen this module's Rust matcher does not positively
+/// recognise as the session-limit picker. "The TypeScript side said so" is NOT an input here and
+/// must never become one: this gate runs on the nudger thread precisely because the WebView may be
+/// wedged, so a disagreement between the two sides can only be resolved by refusing.
+pub fn escape_refusal(screen: Option<&Screen>) -> Option<Refusal> {
+    let Some(screen) = screen else {
+        return Some(Refusal::NoViewport);
+    };
+    if screen.alternate && !looks_like_claude_prompt(screen.text) {
+        return Some(Refusal::AlternateScreen);
+    }
+    if screen_is_working(screen.text) {
+        return Some(Refusal::Working);
+    }
+    if screen_shows_credential_prompt(screen.text) {
+        return Some(Refusal::CredentialPrompt);
+    }
+    if screen_is_session_limit_picker(screen.text) {
+        return None;
+    }
+    // Everything else — including every ORDINARY picker, which is the hazard `nudge_gate.rs`'s
+    // `AwaitingInput` arm exists to prevent.
+    Some(Refusal::AwaitingInput)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,6 +622,7 @@ mod tests {
     const TS_CLASSIFIER: &str = "../src/engine/screenClassifier.ts";
     const TS_ROUTE: &str = "../src/voice/dictationTerminalRoute.ts";
     const TS_FIXTURE: &str = "../src/engine/capturedScreens.fixture.ts";
+    const TS_SESSION_LIMIT: &str = "../src/services/sessionLimitScreen.ts";
 
     /// Read one of the TypeScript sources at TEST time, from the real tree, so the port is judged
     /// against the source of truth rather than against a copy of it.
@@ -778,6 +958,334 @@ mod tests {
         );
     }
 
+    // ══ THE SESSION-LIMIT PICKER, AND THE ESCAPE EXEMPTION ══════════════════════════════════════
+    //
+    // THE LIVE OPTION LABELS ARE ASSEMBLED AT RUNTIME, NEVER WRITTEN CONTIGUOUSLY. A test file is a
+    // file agents `cat`, diff and review; whole labels sitting in this source would stream a genuine
+    // trigger through the classifier and pin the READING agent at `waiting`. The PRD de-fangs its
+    // reproduction for the same reason; splitting the strings does it here at no cost to the
+    // assertion, because the matcher only ever sees the joined result.
+    //
+    // The PRD's own de-fanged block is asserted below by SHAPE rather than by reading the file: a
+    // string literal here resolving to a real path outside the crate would oblige `RUST_RE` to match
+    // `PRD/`, which would run the 10x macOS Rust legs on every progress-doc edit.
+
+    fn reset_label() -> String {
+        ["Stop and wait for", "limit to", "reset"].join(" ")
+    }
+    fn credits_label() -> String {
+        ["Switch to", "usage", "credits"].join(" ")
+    }
+    fn team_label() -> String {
+        ["Switch to", "Team", "plan"].join(" ")
+    }
+    const PICKER_FOOTER: &str = "Enter to confirm · Esc to cancel";
+
+    /// The real screen, with `cursor` as the highlight glyph and `trailing` appended beneath the
+    /// footer (empty for the genuine bottom-anchored article).
+    fn session_limit_screen(cursor: &str, trailing: &str) -> String {
+        let mut s = format!(
+            "⏺ Reading files…\n\nWhat do you want to do?\n{cursor} 1. {}\n  2. {}\n  3. {}\n{PICKER_FOOTER}",
+            reset_label(),
+            credits_label(),
+            team_label(),
+        );
+        if !trailing.is_empty() {
+            s.push('\n');
+            s.push_str(trailing);
+        }
+        s
+    }
+
+    #[test]
+    fn the_session_limit_picker_is_recognised() {
+        assert!(screen_is_session_limit_picker(&session_limit_screen("❯", "")));
+    }
+
+    /// THE CO-ASSERTION THAT KEEPS THE EXEMPTION NARROW: recognising the picker must NOT open
+    /// `write_refusal`. Arbitrary text at a live picker is exactly what `Refusal::AwaitingInput`
+    /// exists to prevent, and the nudger's own write is a bracketed paste followed by a carriage
+    /// return — which would submit whichever billing option the cursor sits on.
+    #[test]
+    fn recognising_the_picker_does_not_license_free_text() {
+        assert_eq!(
+            plain(&session_limit_screen("❯", "")),
+            Some(Refusal::AwaitingInput),
+            "the ordinary write gate must be UNCHANGED at a session-limit picker"
+        );
+    }
+
+    #[test]
+    fn escape_is_permitted_at_the_session_limit_picker() {
+        assert_eq!(
+            escape_refusal(Some(&Screen {
+                text: &session_limit_screen("❯", ""),
+                alternate: false
+            })),
+            None,
+        );
+    }
+
+    /// THE NARROWNESS TEST. Every ordinary captured picker — permission dialogs, AskUserQuestion
+    /// menus, the `/model` picker — must still be refused. This is the case where a laxer matcher
+    /// would have a machine cancel a tool approval a human was mid-answer on.
+    #[test]
+    fn an_ordinary_picker_never_earns_the_escape_exemption() {
+        for name in [
+            "APPROVAL_2_1_220",
+            "APPROVAL_OPTION_2_2_1_220",
+            "ASK_USER_QUESTION_2_1_220",
+            "MODEL_PICKER_2_1_220",
+        ] {
+            let screen = fixture_screen(name);
+            assert!(
+                !screen_is_session_limit_picker(&screen),
+                "{name} is not the session-limit picker"
+            );
+            assert_eq!(
+                escape_refusal(Some(&Screen {
+                    text: &screen,
+                    alternate: false
+                })),
+                Some(Refusal::AwaitingInput),
+                "{name} is an ordinary picker and must never be cancelled by a machine"
+            );
+        }
+    }
+
+    /// An IDLE finished turn earns no exemption either — Esc there is not harmful, but licensing it
+    /// would mean the gate is answering "is this not obviously dangerous" instead of "is this the
+    /// one screen the exemption is for".
+    #[test]
+    fn an_idle_prompt_earns_no_escape_exemption() {
+        let idle = fixture_screen("IDLE_AFTER_TURN_2_1_220");
+        assert_eq!(
+            escape_refusal(Some(&Screen {
+                text: &idle,
+                alternate: false
+            })),
+            Some(Refusal::AwaitingInput),
+        );
+    }
+
+    /// The bottom-anchor rule: a document QUOTING the picker keeps going underneath it.
+    #[test]
+    fn prose_continuing_beneath_the_picker_disqualifies_it() {
+        let quoted = session_limit_screen(
+            "❯",
+            "\nThe screenshot shows Claude Code's session-limit picker rendered into the PTY.\n\
+             Nothing unblocks these agents today, and the reason is measured rather than guessed.\n\
+             The classifier is not the defect; three separate things throw its answer away.\n\
+             This paragraph is what a real picker never has beneath it.",
+        );
+        assert!(
+            !screen_is_session_limit_picker(&quoted),
+            "a picker with a document continuing under it is a QUOTE, not a live dialog"
+        );
+    }
+
+    /// `MAX_TRAILING_ROWS` is ZERO, pinned on the ROW COUNT rather than on a paragraph.
+    ///
+    /// `prose_continuing_beneath_the_picker_disqualifies_it` appends four lines, which fails the
+    /// gate at 3 as well as at 0 — so it could not see the constant change, and reverting the Rust
+    /// value was invisible (roborev 58159). `ported_typescript_patterns_have_not_drifted` asserts
+    /// the TYPESCRIPT text, not this side's number. One non-blank row is the discriminating case,
+    /// and it is the realistic one: a markdown fence closing beneath a quoted screen.
+    #[test]
+    fn one_non_blank_row_beneath_the_footer_disqualifies_it() {
+        assert!(
+            screen_is_session_limit_picker(&session_limit_screen("❯", "")),
+            "precondition: the same screen with nothing beneath it IS the picker"
+        );
+        assert!(!screen_is_session_limit_picker(&session_limit_screen("❯", "```")));
+        // A BLANK row beneath is still fine — the rule counts non-blank rows only.
+        assert!(screen_is_session_limit_picker(&session_limit_screen("❯", "\n   ")));
+    }
+
+    /// `MAX_OPTION_FOOTER_GAP` — the "same rendered frame" rule, which shipped with no Rust test at
+    /// all, so the branch could have been inverted or off by one and `cargo test` stayed green.
+    /// Pinned on BOTH sides of the boundary so an off-by-one cannot pass.
+    #[test]
+    fn options_far_above_the_footer_do_not_pair_with_it() {
+        let framed = |gap: usize| {
+            format!(
+                "What do you want to do?\n❯ 1. {}\n  2. {}{}\n{PICKER_FOOTER}",
+                reset_label(),
+                credits_label(),
+                "\n⏺ …transcript scrolled past.".repeat(gap.saturating_sub(1)),
+            )
+        };
+        // gap == MAX_OPTION_FOOTER_GAP: still one frame.
+        assert!(
+            screen_is_session_limit_picker(&framed(MAX_OPTION_FOOTER_GAP)),
+            "a gap of exactly MAX_OPTION_FOOTER_GAP is still the same frame"
+        );
+        // gap == MAX_OPTION_FOOTER_GAP + 1: the footer belongs to something else.
+        assert!(!screen_is_session_limit_picker(&framed(MAX_OPTION_FOOTER_GAP + 1)));
+    }
+
+    /// The cursor must sit on an OPTION ROW OF THIS DIALOG. Against the whole grid, an unrelated
+    /// permission menu still in the viewport satisfied the gate for a picker nobody was highlighted
+    /// on (roborev 58159).
+    #[test]
+    fn a_cursor_on_some_other_menu_does_not_count() {
+        let elsewhere = format!(
+            "❯ 1. Yes\n  2. No\n\nWhat do you want to do?\n  1. {}\n  2. {}\n{PICKER_FOOTER}",
+            reset_label(),
+            credits_label(),
+        );
+        assert!(
+            selection_cursor().is_match(&elsewhere),
+            "precondition: a cursor IS present on the grid, just not on this dialog's options"
+        );
+        assert!(!screen_is_session_limit_picker(&elsewhere));
+    }
+
+    /// A blockquoted reproduction renders its cursor as a bare `>`, which the SHARED
+    /// `selection_cursor` deliberately rejects.
+    #[test]
+    fn a_blockquoted_picker_is_not_a_picker() {
+        let quoted = session_limit_screen(">", "");
+        assert!(!selection_cursor().is_match(&quoted));
+        assert!(!screen_is_session_limit_picker(&quoted));
+    }
+
+    /// The PRD's de-fanged reproduction, by shape: a bare `>` cursor, U+200B inside each keyword,
+    /// and a rewritten footer. Any one of the three is disqualifying; all three hold.
+    #[test]
+    fn the_defanged_reproduction_shape_is_not_a_picker() {
+        let defanged = concat!(
+            "What do you want to do?\n",
+            "> 1. Stop and wait for limit to rese\u{200b}t\n",
+            "  2. Switch to usage credit\u{200b}s\n",
+            "  3. Switch to Team pla\u{200b}n\n",
+            "[confirm-key] to confirm / [cancel-key] to cancel",
+        );
+        assert_eq!(
+            session_limit_options_present(defanged),
+            0,
+            "the zero-width spaces must defeat every label — not merely the mandatory one"
+        );
+        assert!(!screen_is_session_limit_picker(defanged));
+        assert_eq!(
+            escape_refusal(Some(&Screen {
+                text: defanged,
+                alternate: false
+            })),
+            Some(Refusal::AwaitingInput),
+        );
+    }
+
+    #[test]
+    fn one_option_label_alone_is_not_a_picker() {
+        let alone = format!("What do you want to do?\n❯ 1. {}\n{PICKER_FOOTER}", reset_label());
+        assert_eq!(session_limit_options_present(&alone), 1);
+        assert!(!screen_is_session_limit_picker(&alone));
+    }
+
+    /// The two "Switch to …" labels are generic enough to belong to some other settings picker, so
+    /// the reset label is mandatory rather than merely one of three.
+    #[test]
+    fn the_billing_options_without_the_reset_option_are_not_a_picker() {
+        let billing = format!(
+            "What do you want to do?\n❯ 1. {}\n  2. {}\n{PICKER_FOOTER}",
+            credits_label(),
+            team_label(),
+        );
+        assert_eq!(session_limit_options_present(&billing), 2);
+        assert!(!screen_is_session_limit_picker(&billing));
+    }
+
+    /// A footer ABOVE the options belongs to an earlier frame still on screen, not to this dialog.
+    #[test]
+    fn a_footer_above_the_options_does_not_count() {
+        let inverted = format!(
+            "{PICKER_FOOTER}\nWhat do you want to do?\n❯ 1. {}\n  2. {}",
+            reset_label(),
+            credits_label(),
+        );
+        assert!(!screen_is_session_limit_picker(&inverted));
+    }
+
+    /// The exemption fails closed on every unknown, in the documented order.
+    #[test]
+    fn the_escape_exemption_fails_closed() {
+        assert_eq!(escape_refusal(None), Some(Refusal::NoViewport));
+
+        // A full-screen app that is not Claude Code's own prompt.
+        assert_eq!(
+            escape_refusal(Some(&Screen {
+                text: &session_limit_screen("❯", ""),
+                alternate: true
+            })),
+            Some(Refusal::AlternateScreen),
+            "a picker rendered inside an alternate buffer we cannot attribute to Claude Code is \
+             unreadable evidence, not a licence"
+        );
+
+        // A picker AND a spinner on the same grid is a stale or garbled read, and Esc into a
+        // running turn cancels the turn.
+        let working = format!(
+            "{}\n✻ Churning… (12s · esc to interrupt)",
+            session_limit_screen("❯", "")
+        );
+        assert_eq!(
+            escape_refusal(Some(&Screen {
+                text: &working,
+                alternate: false
+            })),
+            Some(Refusal::Working),
+        );
+
+        // Credentials outrank the picker, exactly as in `write_refusal`.
+        //
+        // The prompt sits ABOVE the dialog deliberately. `MAX_TRAILING_ROWS` is 0, so anything
+        // printed BENEATH the footer disqualifies the frame outright — which would make this test
+        // pass for the wrong reason (the recogniser failing, not the ordering holding). Above, the
+        // `password:` line still matches `write_block_password_colon` (it is `(?m)`-anchored per
+        // line, not tail-scoped), so both facts are true at once and the ordering is what decides.
+        let credential = format!(
+            "Enter your password:\n{}",
+            session_limit_screen("❯", "")
+        );
+        assert!(
+            screen_is_session_limit_picker(&credential),
+            "precondition: the picker itself still matches, so the CredentialPrompt below is the \
+             ordering doing the work rather than the recogniser failing"
+        );
+        assert!(
+            screen_shows_credential_prompt(&credential),
+            "precondition: the credential prompt is genuinely detected on this frame"
+        );
+        assert_eq!(
+            escape_refusal(Some(&Screen {
+                text: &credential,
+                alternate: false
+            })),
+            Some(Refusal::CredentialPrompt),
+        );
+    }
+
+    /// THE SAFETY TEST. The only key any recovery path may send is `Esc`.
+    ///
+    /// Written to FAIL if someone later made the resume press "1": the assertion is on the byte
+    /// alphabet, not on the constant's name, so renaming it or repointing it at an option digit
+    /// both go red. Options 2 and 3 on that picker move the user onto paid overage and change their
+    /// subscription; there is no recovery worth pressing them for.
+    #[test]
+    fn the_only_key_the_gate_licenses_is_escape() {
+        assert_eq!(ESCAPE_KEY, "\u{1b}");
+        assert_eq!(ESCAPE_KEY.len(), 1, "one byte — no chorded or suffixed key");
+        assert!(
+            !ESCAPE_KEY.chars().any(|c| c.is_ascii_digit()),
+            "a digit here selects a BILLING option"
+        );
+        assert!(
+            !ESCAPE_KEY.contains('\r') && !ESCAPE_KEY.contains('\n'),
+            "a carriage return CONFIRMS whichever option the cursor sits on"
+        );
+    }
+
     // ══ THE PORT IS STILL A PORT ════════════════════════════════════════════════════════════════
 
     /// Assert the TypeScript patterns this module transcribed have NOT changed underneath it.
@@ -817,6 +1325,40 @@ mod tests {
             assert!(
                 route.contains(needle),
                 "dictationTerminalRoute.ts changed a pattern this module ported: {needle}\n\
+                 Port the change into nudge_gate.rs rather than editing this expectation."
+            );
+        }
+
+        // ── THE SESSION-LIMIT MATCHER ───────────────────────────────────────────────────────────
+        // Enrolled here alongside `selection_cursor` / `footer_legacy` because the exemption it
+        // grants — one `Esc` at a screen every other rule refuses — is only as safe as its
+        // narrowness, and a TS-side widening that never reached this port would leave the Rust gate
+        // exempting screens the TS classifier does not consider session-limit pickers at all.
+        let session_limit = ts(TS_SESSION_LIMIT);
+        for needle in [
+            r"/^\s*[│|]?\s*[❯›]?\s*\d+\.\s+stop and wait for (?:the )?limit to reset\b/im;",
+            r"/^\s*[│|]?\s*[❯›]?\s*\d+\.\s+switch to usage credits\b/im;",
+            r"/^\s*[│|]?\s*[❯›]?\s*\d+\.\s+switch to team plan\b/im;",
+        ] {
+            assert!(
+                session_limit.contains(needle),
+                "sessionLimitScreen.ts changed a pattern this module ported: {needle}\n\
+                 Port the change into nudge_gate.rs rather than editing this expectation."
+            );
+        }
+        // The two thresholds are as load-bearing as the patterns: MIN_OPTIONS_PRESENT is what stops
+        // one generic label from qualifying, and MAX_TRAILING_ROWS is the bottom-anchor rule that
+        // stops prose quoting the picker from matching. A TS-side relaxation of either without the
+        // matching Rust change is a silent widening of the exemption.
+        for needle in [
+            "export const MIN_OPTIONS_PRESENT = 2;",
+            "export const MAX_TRAILING_ROWS = 0;",
+            "export const MAX_OPTION_FOOTER_GAP = 8;",
+            r#"export const SESSION_LIMIT_REASON = "session-limit-picker";"#,
+        ] {
+            assert!(
+                session_limit.contains(needle),
+                "sessionLimitScreen.ts changed a constant this module ported: {needle}\n\
                  Port the change into nudge_gate.rs rather than editing this expectation."
             );
         }

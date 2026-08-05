@@ -23,6 +23,53 @@
 // sparkle-7wij.
 import type { AgentTabStatus } from "@sparkle/ui";
 
+/**
+ * WHY a status is what it is, when the band alone is too broad to act on.
+ *
+ * `waiting` is the most common attention state in the app — a mid-stream question, a permission
+ * dialog, an AskUserQuestion menu, a `/model` picker all land there — so a machine that triggered on
+ * the BAND would send keystrokes at dialogs a human was about to answer. A reason code is what makes
+ * one specific `waiting` safely actionable. It rides the transition record rather than the status,
+ * precisely so nothing downstream has to widen `AgentTabStatus` to carry it.
+ *
+ *   session-limit-picker  Claude Code's account session-limit dialog is on the rendered screen and
+ *                         the agent is parked on it. The ONE screen state that outranks a frozen
+ *                         `working` hook (see `resolve`). This is W-RESUME's only safe trigger.
+ */
+export type StatusReason = "session-limit-picker";
+
+// ── The screen-reason hand-off ──────────────────────────────────────────────────────────────────
+//
+// statusEngine reports to this router through a callback chain it does not own — `StatusEngine`'s
+// `onStatus` → Terminal's `onStatusWithCapture` → AgentPane's `(s) => router.fromScreen(s)` — and
+// every hop of it is typed `(s: AgentTabStatus) => void`. Widening that signature would mean editing
+// two components to carry one field, so the reason travels beside the call instead of inside it.
+//
+// SAFE BECAUSE THE CHAIN IS SYNCHRONOUS. `withScreenReason` sets the slot, invokes the emit, and
+// clears it in a `finally`; `fromScreen` reads it inside that window. JS is single-threaded, so no
+// other agent's engine can be mid-emit at the same time, and nothing survives the call to be
+// mis-attributed later. If a hop ever DEFERS, the slot reads null and the pierce simply doesn't
+// happen — the failure direction is today's behaviour, never a wrong pierce on a healthy agent.
+let deliveringScreenReason: StatusReason | null = null;
+
+/** Publish `reason` as the evidence behind the status `emit` is about to report, for the duration of
+ *  that one synchronous call. Used by statusEngine; see the block above for why it is a slot rather
+ *  than a parameter. */
+export function withScreenReason<T>(reason: StatusReason | null, emit: () => T): T {
+  const prev = deliveringScreenReason;
+  deliveringScreenReason = reason;
+  try {
+    return emit();
+  } finally {
+    deliveringScreenReason = prev;
+  }
+}
+
+/** The reason accompanying the screen status currently being delivered, or null. */
+export function currentScreenReason(): StatusReason | null {
+  return deliveringScreenReason;
+}
+
 export interface StatusRouter {
   /** Mark that a real hook event has arrived; hooks own the status from here on. */
   activate: () => void;
@@ -66,6 +113,12 @@ export interface StatusTransition {
   from: AgentTabStatus | null;
   /** What arbitration resolved to — the value actually emitted. */
   to: AgentTabStatus;
+  /** WHY, when the band alone is too broad to act on — see {@link StatusReason}. Null for every
+   *  ordinary transition. This is the observable field a consumer reads to distinguish "parked on
+   *  the session-limit picker" from the dozen other things `waiting` means, WITHOUT importing the
+   *  screen classifier. AgentPane already forwards the whole record to the `agent-status` log line,
+   *  so it needs no new plumbing to be greppable. */
+  reason: StatusReason | null;
   /** The other sources' latest readings, so a surprising `to` can be explained from one line. */
   lastHook: AgentTabStatus | null;
   lastScreen: AgentTabStatus | null;
@@ -111,6 +164,10 @@ export function createStatusRouter(
   // judge dispatch with a turn token and won't apply a verdict that arrives after the turn moved
   // on, so a late verdict never lands here against the wrong turn.
   let lastJudge: AgentTabStatus | null = null;
+  // LATCHED (sparkle §6c): the screen reported Claude Code's session-limit picker. Latched rather
+  // than read live, and that is the whole design — see the pierce in `resolve` and `clearedByProgress`
+  // below for why "the picker is gone" is NOT allowed to retract it.
+  let sessionLimitPicker = false;
 
   // The one case the hook stream genuinely can't see: Claude fires the same `Stop` (→ idle)
   // whether a turn ended *done* or ended sitting at its own interactive selection menu
@@ -135,26 +192,73 @@ export function createStatusRouter(
     // process alive (so no Stop/SessionEnd ever fires). The scraper clears this the instant real
     // progress resumes — it emits a non-errored screen status — so it can't outlive recovery.
     if (lastScreen === "errored") return "errored";
+    // SECOND FAIL-CLOSED OVERRIDE — the session-limit picker (PRD §6c). Ordered here deliberately:
+    // AFTER `errored` (a crashed agent is the more urgent read of the same screen) and BEFORE hook
+    // authority, because hook authority is exactly what is broken in this case. A session limit
+    // lands MID-TURN, so no `Stop` ever fires, `lastHook` freezes at `working`, and the escalation
+    // below — which only lifts a hook-IDLE turn — never gets a look. That is why the founder's whole
+    // fleet read GREEN while every agent sat on an unanswered dialog.
+    //
+    // The band is `waiting`, NOT `blocked`, and that is not a cosmetic choice. `blocked` raises no
+    // banner and no dock badge (statusEngine's own rationale: it is for a condition that clears on
+    // its own clock), and `attention.needsAttention()` covers only waiting|approval|errored. Routing
+    // here to `blocked` would turn the rows red and still page nobody — the letter of the report
+    // with its reason dropped. `waiting` ("Needs you") already alerts.
+    if (sessionLimitPicker) return "waiting";
     if (hook !== "idle") return hook;
     if (screenAwaits()) return lastScreen!;
     if (judgeAwaits()) return lastJudge!;
     return hook;
   };
 
+  /** The reason behind whatever `resolve` just returned. Mirrors its precedence: an `errored` screen
+   *  outranks the picker, so it must not be reported as one. */
+  const resolveReason = (): StatusReason | null =>
+    lastScreen !== "errored" && sessionLimitPicker ? "session-limit-picker" : null;
+
+  // POSITIVE PROGRESS retracts the picker pierce — nothing else does, and "the picker left the
+  // screen" explicitly does NOT (PRD §6c). The weaker rule reverts straight to the bug: the instant a
+  // recovery service sends `Esc` the latch would drop, `resolve` would fall through to the STILL
+  // frozen `working` hook, and the row would go green whether or not the resume actually took —
+  // landing back in the invisible-green state this whole change exists to end. So the row holds
+  // `waiting` through the whole Esc → did-it-work window, and a recovery service has to VERIFY its
+  // resume rather than assume it.
+  //
+  // What counts, precisely:
+  //   - a screen `working` — new agent output. The spinner only redraws while a turn is running, and
+  //     a walled agent prints nothing at all.
+  //   - a hook `working` — a real tool event (Pre/PostToolUse). Note this is not the common path:
+  //     HookStatusEngine dedups, so a resumed tool call under an already-frozen `working` never
+  //     reaches fromHook. The screen is the witness that actually fires.
+  // What deliberately does NOT count: a hook `idle`. Claude fires a `Notification` idle ping ~60s
+  // into any wait, including this one, and that is the picker being unanswered — not progress past it.
+  const clearedByProgress = (s: AgentTabStatus): void => {
+    if (s === "working") sessionLimitPicker = false;
+  };
+
   // Dedup: only forward a genuine change. The router re-resolves on every event from either
   // source, so without this an unchanged value (e.g. a repeat idle hook during an active
   // escalation) would re-emit redundantly. `lastEmitted` is cleared by reset().
   let lastEmitted: AgentTabStatus | null = null;
+  let lastReason: StatusReason | null = null;
   // `source`/`input` are what this call is REPORTING; everything else the transition record needs is
   // router state read at emit time. Threaded as parameters rather than module state so a nested
   // re-resolve can't attribute a change to the wrong source.
+  //
+  // The REASON is deduped alongside the status but does NOT re-emit one: a row already sitting at
+  // `waiting` for an ordinary question, which then turns out to be parked on the session-limit
+  // picker, is the same colour but a materially different fact — the consumer that acts on the
+  // reason has to hear about it. `emit` stays keyed on the status alone so no redundant store write
+  // reaches the UI.
   const out = (s: AgentTabStatus, source: StatusTransition["source"], input: AgentTabStatus): void => {
-    if (s !== lastEmitted) {
-      const from = lastEmitted;
-      lastEmitted = s;
-      emit(s);
-      onTransition?.({ source, input, from, to: s, lastHook, lastScreen, lastJudge, hooksLive });
-    }
+    const reason = resolveReason();
+    if (s === lastEmitted && reason === lastReason) return;
+    const from = lastEmitted;
+    const statusChanged = s !== lastEmitted;
+    lastEmitted = s;
+    lastReason = reason;
+    if (statusChanged) emit(s);
+    onTransition?.({ source, input, from, to: s, reason, lastHook, lastScreen, lastJudge, hooksLive });
   };
 
   return {
@@ -170,11 +274,15 @@ export function createStatusRouter(
       lastScreen = null;
       lastJudge = null;
       lastEmitted = null;
+      lastReason = null;
       lastHookAt = null;
+      // A re-prepare is a new run; whatever the previous one was parked on is not this one's news.
+      sessionLimitPicker = false;
     },
     fromHook: (s) => {
       lastHook = s;
       lastHookAt = now();
+      clearedByProgress(s);
       // Any non-idle hook status means the turn the judge spoke about is over — the agent is
       // working again, exited, etc. Drop the verdict so it can't escalate a LATER idle (a stale
       // verdict re-redding the next genuinely-done turn). The judge re-runs on each new Stop.
@@ -183,6 +291,11 @@ export function createStatusRouter(
     },
     fromScreen: (s) => {
       lastScreen = s;
+      // Read the hand-off slot FIRST: statusEngine set it around this very call (see
+      // `withScreenReason`), and it is gone the moment this returns. Latch before the progress
+      // check, so a single call can never both raise and retract the pierce.
+      if (currentScreenReason() === "session-limit-picker") sessionLimitPicker = true;
+      else clearedByProgress(s);
       // A screen `working` is positive evidence the agent is RUNNING, which disproves any live
       // judge verdict ("this turn is blocked on the user"). Without this the judge escalation had
       // exactly one clear path — a non-idle hook event (see fromHook) — so when the hook stream
@@ -219,7 +332,18 @@ export function createStatusRouter(
         onHooksDead?.();
       }
       if (!hooksLive) {
-        out(s, "screen", s);
+        // The pierce applies on the scraper-driven path too. Hook freeze is not what creates the
+        // hole here, but the second half of it is identical: once `Esc` dismisses the picker the
+        // screen is calm, the scraper reads a finished turn, and the row would go gray on an agent
+        // that may still be walled. Held until the same progress signal.
+        //
+        // `errored` FIRST, mirroring `resolve`'s ordering exactly (roborev 58141). A crashed agent
+        // is the more urgent read of the same screen, and `resolveReason()` already returns null
+        // when `lastScreen === "errored"` — so without this the emitted transition would be a bare
+        // `waiting` carrying NO reason: an agent that wedged on an API banner after hitting the
+        // limit would be reported as merely needing an answer, with the one field a consumer acts
+        // on stripped off.
+        out(s === "errored" ? s : sessionLimitPicker ? "waiting" : s, "screen", s);
         return;
       }
       // Hooks own the status; the screen can only ESCALATE a hook-idle turn to red. Re-resolving

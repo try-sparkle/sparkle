@@ -33,7 +33,8 @@
 // UI without saying why it fired.
 import { classifyLine } from "@sparkle/core";
 import type { AgentTabStatus } from "@sparkle/ui";
-import { screenAwaitsInput } from "./screenClassifier";
+import { isSessionLimitPicker, screenAwaitsInput } from "./screenClassifier";
+import { withScreenReason, type StatusReason } from "./statusRouter";
 import { forgetAgent, noteProcessExit, noteSpinnerSeen, trackAgent } from "./turnEndAuthority";
 import { StreamFailureDetector, apiErrorFramesIn, countApiErrorFrames } from "./streamFailure";
 import { type QuotaBlock, isQuotaBlocked, quotaBlockIn, quotaBlocksIn } from "./quotaBlock";
@@ -211,6 +212,64 @@ const ECHO_SUBSTRING_MIN_CHARS = 8;
 // and spinner markers are short, so a bounded tail keeps detection intact.
 const MAX_PARTIAL = 4096;
 
+// ── The session-limit picker announcement ───────────────────────────────────────────────────────
+//
+// The RECOVERY side of this (W-RESUME) needs to know which agent is parked on Claude Code's
+// session-limit dialog, and it must learn that WITHOUT importing `screenClassifier` — the two units
+// are deliberately disjoint, and a recovery service that reached into the classifier would couple
+// its safety analysis to a matcher it does not own. So detection announces, and recovery listens.
+//
+// TWO EQUIVALENT CHANNELS, one announcement:
+//   - `sparkle://session-limit-picker` on `window`, the contract's named event (PRD §6c);
+//   - `onSessionLimitPicker`, an in-process subscription, because most of this engine's tests (and
+//     any non-DOM caller) run under vitest's default `node` environment where `window` is absent.
+// Both carry the same detail. Guarded so a node context announces to subscribers and simply skips
+// the DOM half rather than throwing on a hot path.
+//
+// EDGE-TRIGGERED. It fires when a screen read first sees the picker, not on every settle, so a
+// listener gets one event per episode. The screen going quiet re-arms it, so a picker that comes
+// back after a failed resume announces again — which is exactly the signal a verify loop needs.
+
+/** DOM event name for "this agent is parked on Claude Code's session-limit picker".
+ *
+ *  RE-EXPORTED, not re-declared: `services/sessionLimitScreen.ts` owns the string, because that is
+ *  the module `nudge_gate.rs` reads at `cargo test` time. Two `const`s that happen to spell the
+ *  same event are two things to keep in step, and this one is observable from the DOM. */
+export { SESSION_LIMIT_PICKER_EVENT } from "../services/sessionLimitScreen";
+import { SESSION_LIMIT_PICKER_EVENT as PICKER_EVENT } from "../services/sessionLimitScreen";
+
+/** Payload of {@link SESSION_LIMIT_PICKER_EVENT} and of {@link onSessionLimitPicker}. */
+export interface SessionLimitPickerDetail {
+  agentId: string;
+  /** Epoch ms the screen read that saw it. */
+  at: number;
+}
+
+const sessionLimitPickerSubs = new Set<(d: SessionLimitPickerDetail) => void>();
+
+/** Subscribe to session-limit-picker detections. Returns an unsubscribe. */
+export function onSessionLimitPicker(fn: (d: SessionLimitPickerDetail) => void): () => void {
+  sessionLimitPickerSubs.add(fn);
+  return () => {
+    sessionLimitPickerSubs.delete(fn);
+  };
+}
+
+function announceSessionLimitPicker(detail: SessionLimitPickerDetail): void {
+  // Snapshot the set: a listener that unsubscribes itself must not perturb this iteration, and one
+  // that throws must not silence the rest (or the DOM half below).
+  for (const fn of [...sessionLimitPickerSubs]) {
+    try {
+      fn(detail);
+    } catch {
+      /* a listener's failure is not this engine's news */
+    }
+  }
+  if (typeof window !== "undefined" && typeof CustomEvent === "function") {
+    window.dispatchEvent(new CustomEvent(PICKER_EVENT, { detail }));
+  }
+}
+
 export interface StatusEngineOpts {
   agentId: string;
   onStatus: (s: AgentTabStatus) => void;
@@ -223,6 +282,13 @@ export interface StatusEngineOpts {
 export class StatusEngine {
   private partial = "";
   private status: AgentTabStatus = "working";
+  // The reason accompanying `status`, part of `set`'s dedup key — see set().
+  private statusReason: StatusReason | null = null;
+  // Was the session-limit picker on the LAST screen this engine read? Edge-detection state for the
+  // announcement only (see announceSessionLimitPicker): the row's own persistence is the router's
+  // latch, which holds past the picker leaving the screen. This one tracks the screen itself, so a
+  // picker that returns after a failed resume announces again.
+  private sawSessionLimitPicker = false;
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private recheckTimer: ReturnType<typeof setTimeout> | null = null;
   // Latched by dispose(). A disposed engine must go completely silent: its PTY listener is torn
@@ -333,13 +399,31 @@ export class StatusEngine {
    *                 decided this transition. The verdict ONLY: terminal content is user data and
    *                 never reaches the log.
    */
-  private set(s: AgentTabStatus, trigger: StatusTransitionTrigger, screen?: ScreenVerdict): void {
-    if (s === this.status) return;
+  private set(
+    s: AgentTabStatus,
+    trigger: StatusTransitionTrigger,
+    screen?: ScreenVerdict,
+    // WHY, when the band alone is too broad for a consumer to act on — today only the session-limit
+    // picker. Part of the dedup key, deliberately: the picker can appear on an agent this engine has
+    // ALREADY painted `waiting` (its footer streams past mid-turn, so `prompt-detected-midstream`
+    // fires ~2s before settle reads the screen). Keyed on the status alone, that settle would dedup
+    // to a no-op and the reason would never reach the router — the row would stay green and the whole
+    // fix would be inert on its most common path.
+    reason: StatusReason | null = null,
+  ): void {
+    if (s === this.status && reason === this.statusReason) return;
     const from = this.status;
+    const statusChanged = s !== this.status;
     this.status = s;
-    // Logged BEFORE the listener runs, so the record survives a throwing subscriber.
-    logStatusTransition({ agentId: this.opts.agentId, from, to: s, trigger, screen, monotonicMs: monotonicNow() });
-    this.opts.onStatus(s);
+    this.statusReason = reason;
+    // Logged BEFORE the listener runs, so the record survives a throwing subscriber. Only a real
+    // status CHANGE is logged: a reason-only refresh is not a transition, and the router's own
+    // transition record (which does carry the reason) is where that shows up.
+    if (statusChanged)
+      logStatusTransition({ agentId: this.opts.agentId, from, to: s, trigger, screen, monotonicMs: monotonicNow() });
+    // The reason rides beside the call for its synchronous duration — the emit chain to the router
+    // runs through two components whose callbacks are typed `(s: AgentTabStatus) => void`.
+    withScreenReason(reason, () => this.opts.onStatus(s));
   }
 
   private clearTimers(): void {
@@ -496,6 +580,10 @@ export class StatusEngine {
     if (opts?.machine !== true) this.releaseQuotaBlock();
     this.sawRecentError = false;
     this.sawRecentRisk = false;
+    // Re-arm the picker announcement. Whatever this send does to the dialog, a picker that is on
+    // screen AFTER it is fresh news to a recovery listener — that is precisely how "the resume did
+    // not take" becomes observable rather than assumed.
+    this.sawSessionLimitPicker = false;
     // A new turn starts here, and its token counter restarts from zero.
     this.resetSpinnerTokens();
     // stripAnsi also strips the bracketed-paste ESC[200~/ESC[201~ wrappers submitPrompt adds (they
@@ -545,6 +633,10 @@ export class StatusEngine {
     const snapshot = this.opts.getScreen?.();
     const blank = snapshot === undefined || !snapshot.trim();
     const awaiting = blank ? false : screenAwaitsInput(snapshot);
+    // The VIEWPORT is the only surface this question may be asked of — never the streamed lines
+    // `ingest` scans. See isSessionLimitPicker's header: bottom-anchoring is what keeps prose that
+    // quotes the screen out, and scrollback has no bottom.
+    const picker = blank ? false : this.noteSessionLimitPicker(snapshot);
     // Consume the risk flag on every settle, not just the red branch: a non-blocking
     // turn that ends idle must not carry a stale risk into the next turn's question.
     const risky = this.sawRecentRisk;
@@ -556,10 +648,32 @@ export class StatusEngine {
     // and is cleared whenever the risk flag itself is re-armed or the re-check consumes it.
     this.settledTurnRisk = risky;
     this.set(
-      awaiting ? (risky ? "approval" : "waiting") : "idle",
+      // `waiting`, never `approval`, when it is the session-limit picker: nothing dangerous is being
+      // approved, and the recovery path keys off the reason code below rather than off the band.
+      awaiting ? (risky && !picker ? "approval" : "waiting") : "idle",
       trigger,
       blank ? "blank" : awaiting ? "awaiting" : "calm",
+      picker ? "session-limit-picker" : null,
     );
+  }
+
+  /**
+   * Record whether the just-read viewport is the session-limit picker, announcing on the RISING edge.
+   *
+   * Deliberately NOT a quota-band trip. `failureKind` stays untouched: `noteUserInput` computes
+   * `keepQuota = machine && failureKind === "quota"` and reaches `releaseQuotaBlock` only for a
+   * HUMAN, a guard whose whole rationale is that a machine release re-opens the self-concealing
+   * resume loop. Routing the picker into that band would leave a machine resume either unable to
+   * clear it — agents pinned red forever — or forced to bypass the guard and resurrect the bug
+   * `quotaBlock` exists to kill. A screen-sourced reason needs no release path at all.
+   */
+  private noteSessionLimitPicker(snapshot: string): boolean {
+    const picker = isSessionLimitPicker(snapshot);
+    if (picker && !this.sawSessionLimitPicker) {
+      announceSessionLimitPicker({ agentId: this.opts.agentId, at: Date.now() });
+    }
+    this.sawSessionLimitPicker = picker;
+    return picker;
   }
 
   // A LATE re-read of the rendered screen, armed alongside the settle timer on the fallback path.
@@ -570,17 +684,38 @@ export class StatusEngine {
   // the status exactly where settle put it.
   private recheckScreen(): void {
     this.recheckTimer = null;
+    // REASON-ONLY UPGRADE, and the one path that is not about red-vs-gray at all.
+    //
+    // The mid-stream prompt path (see ingest) paints `waiting` off the STREAM and returns without
+    // arming a settle — so on a session limit, which streams its picker in and then goes completely
+    // silent, the viewport would never be read again and the reason would never attach. The row
+    // would stay green behind a frozen `working` hook: the founder's exact bug, relocated. It also
+    // cannot be answered synchronously at that moment, because xterm paints on its own schedule and
+    // the dialog may not be on the grid yet when its footer streams past.
+    //
+    // So: re-read the viewport, and if it IS the session-limit picker, re-emit the same `waiting`
+    // carrying the reason. Raises the reason, never lowers the status.
+    if (this.status === "waiting" && this.statusReason === null) {
+      if (this.noteSessionLimitPicker(this.opts.getScreen?.() ?? ""))
+        this.set("waiting", "screen-recheck", undefined, "session-limit-picker");
+      return;
+    }
     // Only from the two calm states. Anything else is either already red (nothing to promote) or a
     // terminal state (done/stopped), and a screen read must not resurrect it.
     if (this.status !== "working" && this.status !== "idle") return;
-    if (!screenAwaitsInput(this.opts.getScreen?.() ?? "")) return;
+    const snapshot = this.opts.getScreen?.() ?? "";
+    if (!screenAwaitsInput(snapshot)) return;
+    // Same viewport, same question as settle — a session-limit picker that painted late is exactly
+    // the case this re-read exists for, and it must arrive carrying its reason or the router has
+    // nothing to pierce with.
+    const picker = this.noteSessionLimitPicker(snapshot);
     // `settledTurnRisk`, not `sawRecentRisk`: settle already consumed the live flag, so reading it
     // here always saw `false` and could never say `approval`. The prompt this re-check exists to
     // catch is precisely the one that painted late — including a dangerous-action one.
     const risky = this.sawRecentRisk || this.settledTurnRisk;
     this.sawRecentRisk = false;
     this.settledTurnRisk = false;
-    this.set(risky ? "approval" : "waiting", "screen-recheck");
+    this.set(risky && !picker ? "approval" : "waiting", "screen-recheck", undefined, picker ? "session-limit-picker" : null);
   }
 
   // Fallback path only: arm the legacy time-based settle timer plus the late screen re-check (used
@@ -829,9 +964,20 @@ export class StatusEngine {
     // 1. An input prompt always wins: the agent is asking for you.
     if (prompt) {
       this.clearTimers();
+      // WHICH prompt it is has to come from the VIEWPORT — the stream can say "a picker opened" but
+      // not "it is the session-limit one", and that distinction is what pierces a frozen hook. Read
+      // it now (usually already painted), and arm ONE late re-read for the async-render race, since
+      // this path returns without arming a settle and a walled agent emits nothing further.
+      const picker = this.noteSessionLimitPicker(this.opts.getScreen?.() ?? "");
       // The prompt was detected in the STREAM, not on the rendered screen, so there is no screen
       // verdict to record here — `screenAwaitsInput` ran against the ingested lines, not a snapshot.
-      this.set(this.sawRecentRisk ? "approval" : "waiting", "prompt-detected-midstream");
+      this.set(
+        this.sawRecentRisk && !picker ? "approval" : "waiting",
+        "prompt-detected-midstream",
+        undefined,
+        picker ? "session-limit-picker" : null,
+      );
+      if (!picker) this.recheckTimer = setTimeout(() => this.recheckScreen(), SPINNER_GRACE_MS);
       this.sawRecentRisk = false;
       // A calm prompt means the agent recovered and is awaiting you — not a crash or a stall. The
       // token baseline deliberately SURVIVES here: an approval question is asked MID-turn and the

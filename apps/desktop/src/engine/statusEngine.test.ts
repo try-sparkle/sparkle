@@ -1,5 +1,15 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { StatusEngine, parseSpinnerTokens, latestSpinnerTokens, isSpinnerFrame } from "./statusEngine";
+import {
+  StatusEngine,
+  parseSpinnerTokens,
+  latestSpinnerTokens,
+  isSpinnerFrame,
+  onSessionLimitPicker,
+  SESSION_LIMIT_PICKER_EVENT,
+  type SessionLimitPickerDetail,
+} from "./statusEngine";
+import { createStatusRouter, type StatusTransition } from "./statusRouter";
+import { SESSION_LIMIT_PICKER } from "./capturedScreens.fixture";
 // The SAME predicate the concierge tool surface derives `needsYou` from, so the no-false-alarm
 // tests below assert the tier the human is actually paged on rather than a status name.
 import { isRedStatus } from "../services/windowStatus";
@@ -1292,5 +1302,208 @@ describe("lastFailureNow", () => {
     engine.ingest(`\n  ⎿  ${OFFLINE}\n`);
     expect(last()).toBe("working");
     expect(engine.lastFailureNow()).toBeUndefined();
+  });
+});
+
+// ── The session-limit picker, end to end (PRD/sparkle/claude-account-identity-truth.md §6) ──────
+//
+// The founder's fleet was parked on Claude Code's session-limit dialog while every row read GREEN.
+// The engine and the router each hold half of the fix, and neither half is worth anything alone —
+// so these drive the REAL pair, the way Terminal + AgentPane wire them, and assert the colour a
+// human would have seen.
+
+describe("StatusEngine — the session-limit picker", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  const SPINNER = "✻ Cogitating… (12s · ↑ 1.2k tokens · esc to interrupt)";
+
+  /** Engine → router, exactly the chain Terminal's `onStatusWithCapture` and AgentPane's
+   *  `(s) => router.fromScreen(s)` form in production. */
+  function wired(getScreen: () => string) {
+    const emitted: AgentTabStatus[] = [];
+    const transitions: StatusTransition[] = [];
+    const router = createStatusRouter(
+      (s) => emitted.push(s),
+      undefined,
+      (t) => transitions.push(t),
+    );
+    const engine = new StatusEngine({ agentId: "wired", onStatus: (s) => router.fromScreen(s), getScreen });
+    return { engine, router, emitted, transitions };
+  }
+
+  it("turns the row RED behind a hook frozen at `working` — the founder's screen", () => {
+    const screen = { v: "⏺ Working on it." };
+    const { engine, router, emitted, transitions } = wired(() => screen.v);
+    router.activate();
+    router.fromHook("working"); // the turn opens…
+    engine.ingest(SPINNER);
+    // …and the session limit lands INSIDE it, so Claude draws the picker and no `Stop` ever fires.
+    screen.v = SESSION_LIMIT_PICKER;
+    vi.advanceTimersByTime(2000); // the spinner stops re-drawing → settle reads the viewport
+    expect(emitted).toEqual(["working", "waiting"]);
+    expect(transitions.at(-1)?.reason).toBe("session-limit-picker");
+    expect(transitions.at(-1)?.lastHook).toBe("working"); // the hook is still frozen; we overrode it
+  });
+
+  it("holds RED after the picker leaves the screen, until the agent actually resumes", () => {
+    const screen = { v: "⏺ Working on it." };
+    const { engine, router, emitted } = wired(() => screen.v);
+    router.activate();
+    router.fromHook("working");
+    engine.ingest(SPINNER);
+    screen.v = SESSION_LIMIT_PICKER;
+    vi.advanceTimersByTime(2000);
+    expect(emitted.at(-1)).toBe("waiting");
+    // A recovery service presses Esc. The dialog goes away and the screen is calm — but nothing yet
+    // says the agent is unstuck, and the hook is STILL frozen at `working`. Retracting here would
+    // repaint the row green on a possibly-still-walled agent: the exact bug, relocated.
+    screen.v = IDLE_SCREEN;
+    engine.ingest("\n");
+    vi.advanceTimersByTime(30_000);
+    expect(emitted.at(-1)).toBe("waiting");
+    // Real output resumes → green, on evidence.
+    engine.ingest(SPINNER);
+    expect(emitted.at(-1)).toBe("working");
+  });
+
+  it("does NOT route into the quota band — `failureKind` and the wall are untouched", () => {
+    // Load-bearing (PRD §6c): `noteUserInput` computes keepQuota = machine && failureKind==="quota"
+    // and only a HUMAN reaches releaseQuotaBlock. A picker routed into that band would leave a
+    // machine resume unable to clear it, or force it to bypass the guard that exists to kill the
+    // self-concealing resume loop.
+    const { engine, statuses } = makeEngine(() => SESSION_LIMIT_PICKER);
+    engine.ingest(SPINNER);
+    vi.advanceTimersByTime(2000);
+    expect(statuses.at(-1)).toBe("waiting");
+    expect(statuses).not.toContain("blocked");
+    expect(statuses).not.toContain("errored");
+    expect(engine.quotaBlockNow(Date.now())).toBeUndefined();
+  });
+
+  it("stays `waiting` rather than `approval`, even if a risky action was seen this turn", () => {
+    // Nothing dangerous is being approved here, and the recovery path keys off the reason code, not
+    // the band — so the band must not drift to the one reserved for "approve this destructive thing".
+    const RISKY = "Bash(rm -rf build/)\n"; // classifies as approval_needed → arms the risk flag
+    // CONTROL FIRST, or this test proves nothing: the same input against an ordinary permission
+    // screen really does reach `approval`, so the `waiting` below is the picker's doing.
+    const control = makeEngine(() => PERMISSION_SCREEN);
+    control.engine.ingest(RISKY);
+    control.engine.ingest(SPINNER);
+    vi.advanceTimersByTime(2000);
+    expect(control.statuses.at(-1)).toBe("approval");
+
+    const { engine, statuses } = makeEngine(() => SESSION_LIMIT_PICKER);
+    engine.ingest(RISKY);
+    engine.ingest(SPINNER);
+    vi.advanceTimersByTime(2000);
+    expect(statuses.at(-1)).toBe("waiting");
+  });
+
+  it("attaches the reason when the picker streams past mid-turn (no settle ever runs)", () => {
+    // The common real path, and the one that silently broke the first design: the picker's footer
+    // arrives as OUTPUT, so `prompt-detected-midstream` paints `waiting` and returns WITHOUT arming
+    // a settle. A walled agent then prints nothing more, so if the viewport were never re-read the
+    // reason would never exist and the row would stay green behind the frozen hook.
+    const { engine, router, emitted, transitions } = wired(() => SESSION_LIMIT_PICKER);
+    router.activate();
+    router.fromHook("working");
+    engine.ingest(" Enter to confirm · Esc to cancel\n");
+    expect(emitted).toEqual(["working", "waiting"]);
+    expect(transitions.at(-1)?.reason).toBe("session-limit-picker");
+  });
+
+  it("re-reads the viewport when the dialog paints AFTER its footer streamed past", () => {
+    // xterm paints on its own schedule, so the grid can still be showing the previous frame at the
+    // instant the footer arrives. One late read is what closes that race.
+    const screen = { v: "⏺ Working on it." };
+    const { engine, router, emitted, transitions } = wired(() => screen.v);
+    router.activate();
+    router.fromHook("working");
+    engine.ingest(" Enter to confirm · Esc to cancel\n"); // prompt seen in the STREAM…
+    expect(emitted).toEqual(["working"]); // …viewport not painted yet, so no pierce and no reason
+    expect(transitions.at(-1)?.reason).toBeNull();
+    screen.v = SESSION_LIMIT_PICKER; // now xterm draws it
+    vi.advanceTimersByTime(2000);
+    expect(emitted).toEqual(["working", "waiting"]);
+    expect(transitions.at(-1)?.reason).toBe("session-limit-picker");
+  });
+
+  it("announces to a listener that never imports the screen classifier — once per episode", () => {
+    // W-RESUME's trigger. It must not have to reach into `screenClassifier` to learn which agent is
+    // parked on the dialog, and it must not act on the bare `waiting` band (which also means a
+    // permission dialog, an AskUserQuestion menu, a /model picker — sending Esc at any of those
+    // cancels an answer the human was mid-way through giving).
+    const seen: SessionLimitPickerDetail[] = [];
+    const off = onSessionLimitPicker((d) => seen.push(d));
+    try {
+      const screen = { v: SESSION_LIMIT_PICKER };
+      const { engine } = makeEngine(() => screen.v);
+      engine.ingest(SPINNER);
+      vi.advanceTimersByTime(2000);
+      expect(seen.map((d) => d.agentId)).toEqual(["test"]);
+      // A second settle on the SAME unanswered dialog is not new news.
+      engine.ingest(SPINNER);
+      vi.advanceTimersByTime(2000);
+      expect(seen).toHaveLength(1);
+      // …but a picker that comes BACK after a resume attempt is: that is how "the resume did not
+      // take" becomes observable instead of assumed.
+      screen.v = IDLE_SCREEN;
+      engine.ingest(SPINNER);
+      vi.advanceTimersByTime(2000);
+      screen.v = SESSION_LIMIT_PICKER;
+      engine.ingest(SPINNER);
+      vi.advanceTimersByTime(2000);
+      expect(seen).toHaveLength(2);
+    } finally {
+      off();
+    }
+  });
+
+  it("also dispatches the sparkle://session-limit-picker window event when a DOM is present", () => {
+    // The contract's named channel. These suites run under vitest's default `node` environment, so
+    // the DOM half is stubbed rather than assumed — the guard in announceSessionLimitPicker is what
+    // keeps it from throwing on the hot path in a non-DOM context.
+    const dispatched: Array<{ type: string; detail: unknown }> = [];
+    class FakeCustomEvent {
+      constructor(
+        readonly type: string,
+        readonly init?: { detail?: unknown },
+      ) {}
+      get detail() {
+        return this.init?.detail;
+      }
+    }
+    vi.stubGlobal("CustomEvent", FakeCustomEvent);
+    vi.stubGlobal("window", {
+      dispatchEvent: (e: FakeCustomEvent) => dispatched.push({ type: e.type, detail: e.detail }),
+    });
+    try {
+      const { engine } = makeEngine(() => SESSION_LIMIT_PICKER);
+      engine.ingest(SPINNER);
+      vi.advanceTimersByTime(2000);
+      expect(dispatched).toEqual([
+        { type: SESSION_LIMIT_PICKER_EVENT, detail: { agentId: "test", at: expect.any(Number) } },
+      ]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("says nothing for any OTHER picker — no reason, no announcement", () => {
+    const seen: SessionLimitPickerDetail[] = [];
+    const off = onSessionLimitPicker((d) => seen.push(d));
+    try {
+      const { engine, router, emitted, transitions } = wired(() => PERMISSION_SCREEN);
+      router.activate();
+      router.fromHook("working"); // same frozen hook…
+      engine.ingest(SPINNER);
+      vi.advanceTimersByTime(2000);
+      expect(emitted).toEqual(["working"]); // …and the row stays green, as sparkle-7wij pins
+      expect(transitions.every((t) => t.reason === null)).toBe(true);
+      expect(seen).toEqual([]);
+    } finally {
+      off();
+    }
   });
 });

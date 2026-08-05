@@ -338,6 +338,79 @@ pub fn nudger_clear_flag(flags: State<NudgeFlags>, agent_id: String) {
     flags.clear(&agent_id);
 }
 
+/// DISMISS CLAUDE CODE'S SESSION-LIMIT PICKER — the only machine keystroke this app will ever send
+/// at a dialog `write_refusal` refuses, and it is exactly one byte: `nudge_gate::ESCAPE_KEY`.
+///
+/// ── WHY THE DECISION IS MADE HERE AND NOT BY THE CALLER ──────────────────────────────────────
+/// `services/authRecovery.ts` asks; this decides. The TypeScript side has its own matcher and its
+/// own reason code, but "the WebView believes this is the session-limit picker" is NOT an input to
+/// this function and must never become one. The nudger thread re-derives the verdict from the grid
+/// it owns, because the whole reason a Rust twin of the matcher exists is that this layer keeps
+/// working when the WebView is wedged — and a wedged WebView's last opinion is exactly the stale
+/// evidence that would press a button nobody read.
+///
+/// So the gate is `nudge_gate::escape_refusal`, which fails CLOSED on every unknown: no viewport,
+/// an alternate buffer we cannot attribute to Claude Code, a running turn, a credential prompt, or
+/// any screen its own matcher does not positively recognise. `Err` on refusal rather than a silent
+/// no-op, so the caller records `escape-failed` instead of claiming an action that did not happen.
+///
+/// ── WHAT IS SENT ─────────────────────────────────────────────────────────────────────────────
+/// `ESCAPE_KEY`, with NO carriage return and NO option digit, ever. The three options on that picker
+/// are account-level BILLING decisions — "Switch to usage credits" moves the user onto paid overage
+/// and "Switch to Team plan" changes their subscription — so a digit here spends the user's money
+/// and a CR confirms whichever option the cursor happens to sit on. `deliver_with` is deliberately
+/// NOT used: its job is to type a body and optionally submit it, and submitting is the harm.
+#[tauri::command]
+pub fn nudger_send_escape<R: Runtime>(
+    app: AppHandle<R>,
+    observers: State<Observers>,
+    agent_id: String,
+) -> Result<(), String> {
+    let Some(observer) = observers.get(&agent_id) else {
+        return Err("no terminal observer for this agent".into());
+    };
+    send_escape_with(&observer, now_ms(), |data| {
+        crate::pty::write_session(&app, &agent_id, data)
+    })
+}
+
+/// `nudger_send_escape` with the PTY write INJECTED, so "which bytes were written" is assertable.
+///
+/// Split for the same reason `deliver_with` is: the interesting properties here are which writes do
+/// NOT happen, and that the one that does is exactly one byte. Through a real `AppHandle` none of
+/// that is observable in a unit test, and an edit swapping the body for `deliver_with(…, submit =
+/// true)` — which would CONFIRM whichever billing option the cursor sits on — would keep every test
+/// green.
+fn send_escape_with<W: FnOnce(&str) -> Result<(), String>>(
+    observer: &PtyObserver,
+    now: u64,
+    write: W,
+) -> Result<(), String> {
+    // A parked reader means the grid stopped advancing, so nothing read off it is current. Same
+    // fail-closed verdict `observe` gives it.
+    if observer.reader_is_parked() {
+        return Err("screen unreadable (reader parked)".into());
+    }
+    // THE FOREIGN-WRITE STAND-DOWN, which every other machine write in this crate already respects
+    // via `nudge_ladder::step` (roborev 58167). Without it this was the ONE write that could land
+    // inside a human's in-flight interaction: the founder sitting at this very picker, deciding
+    // between "Stop and wait" and "Switch to usage credits", presses ↓ — a `pty_write` that moves
+    // the cursor without changing the screen enough to fail `escape_refusal` — and a recovery
+    // attempt cancels the dialog out from under them mid-decision. That is precisely the harm the
+    // gate exists to prevent, and the caller already records `escape-failed` on `Err`.
+    if observer.since_foreign_write_ms(now) < nudge_ladder::QUIET_AFTER_OTHER_WRITE_MS {
+        return Err("recent write by another writer".into());
+    }
+    let (text, alternate) = observer.render();
+    if let Some(refusal) = nudge_gate::escape_refusal(Some(&Screen {
+        text: &text,
+        alternate,
+    })) {
+        return Err(format!("refused: {}", refusal.as_str()));
+    }
+    write(nudge_gate::ESCAPE_KEY)
+}
+
 // ══ THE LOOP ════════════════════════════════════════════════════════════════════════════════════
 
 /// Per-agent scheduling state, held only by the thread.
@@ -1074,6 +1147,89 @@ mod tests {
             observe(&spinning, "", now_ms()).working,
             "screen veto, with the roster saying nothing at all — the wedged-WebView case"
         );
+    }
+
+    // ══ THE ESCAPE WRITE — THE ONLY MACHINE KEYSTROKE AT A BILLING DIALOG ═══════════════════════
+    //
+    // The labels are assembled at runtime rather than written contiguously, for the same reason the
+    // `nudge_gate` suite does it: a test file is a file agents `cat`, diff and review, and a whole
+    // label sitting here would stream a live trigger through the reading agent's own classifier.
+
+    /// Feed an observer the real session-limit picker so `escape_refusal` permits the write.
+    fn picker_observer() -> PtyObserver {
+        let o = observer();
+        o.ingest(&format!(
+            "What do you want to do?\r\n❯ 1. {}\r\n  2. {}\r\n  3. {}\r\n{}\r\n",
+            ["Stop and wait for", "limit to", "reset"].join(" "),
+            ["Switch to", "usage", "credits"].join(" "),
+            ["Switch to", "Team", "plan"].join(" "),
+            "Enter to confirm · Esc to cancel",
+        ));
+        o
+    }
+
+    /// Record what `send_escape_with` actually put on the PTY.
+    fn escape_writes(o: &PtyObserver, now: u64) -> (Result<(), String>, Vec<String>) {
+        let sent = Mutex::new(Vec::new());
+        let r = send_escape_with(o, now, |data| {
+            sent.lock().unwrap().push(data.to_string());
+            Ok(())
+        });
+        (r, sent.into_inner().unwrap())
+    }
+
+    /// EXACTLY ONE BYTE, AND IT IS `ESC`. Written to fail if the body were ever swapped for
+    /// `deliver_with(…, submit = true)`: that sends a paste AND a carriage return, and the CR
+    /// confirms whichever billing option the cursor sits on — paid overage, or a plan change.
+    #[test]
+    fn the_escape_write_is_one_esc_and_nothing_else() {
+        let o = picker_observer();
+        let (r, sent) = escape_writes(&o, u64::MAX / 2);
+        assert!(r.is_ok(), "the picker must permit the write: {r:?}");
+        assert_eq!(sent, vec![nudge_gate::ESCAPE_KEY.to_string()]);
+        assert_eq!(sent[0].len(), 1, "one byte — no chorded or suffixed key");
+        assert!(
+            !sent[0].contains('\r') && !sent[0].chars().any(|c| c.is_ascii_digit()),
+            "a CR confirms an option and a digit selects one"
+        );
+    }
+
+    /// A PARKED READER means the grid stopped advancing, so nothing read off it is current.
+    #[test]
+    fn a_parked_reader_writes_nothing() {
+        let o = picker_observer();
+        o.set_reader_parked(true);
+        let (r, sent) = escape_writes(&o, u64::MAX / 2);
+        assert!(r.is_err());
+        assert!(sent.is_empty(), "nothing may reach the PTY on a refusal");
+    }
+
+    /// THE FOREIGN-WRITE STAND-DOWN. The founder is at this picker deciding between "Stop and wait"
+    /// and a billing option, presses ↓ — and a recovery attempt must NOT cancel the dialog out from
+    /// under them. Every other machine write in this crate already respects this window.
+    #[test]
+    fn a_recent_write_by_someone_else_stands_the_escape_down() {
+        let o = picker_observer();
+        o.note_foreign_write();
+        // `note_foreign_write` stamps `now_ms()`, so read the clock the same way the command does.
+        let (r, sent) = escape_writes(&o, now_ms());
+        assert!(r.is_err(), "a human mid-interaction outranks the machine");
+        assert!(sent.is_empty());
+        // …and once the window has passed, the same screen is writable again.
+        let (r2, sent2) = escape_writes(&o, now_ms() + nudge_ladder::QUIET_AFTER_OTHER_WRITE_MS);
+        assert!(r2.is_ok(), "{r2:?}");
+        assert_eq!(sent2, vec![nudge_gate::ESCAPE_KEY.to_string()]);
+    }
+
+    /// AN ORDINARY PICKER EARNS NOTHING. This is the case where a laxer gate would have a machine
+    /// cancel a tool approval a human was mid-answer on.
+    #[test]
+    fn an_ordinary_picker_is_never_escaped() {
+        let o = observer();
+        o.ingest("Do you want to proceed?\r\n  1. Yes\r\n❯ 2. No\r\n Esc to cancel · Tab to amend · ctrl+e to explain\r\n");
+        let (r, sent) = escape_writes(&o, u64::MAX / 2);
+        assert!(r.is_err(), "an ordinary approval dialog must be refused");
+        assert!(sent.is_empty());
     }
 
     // ══ DELIVERY: THE PASTE AND ITS CARRIAGE RETURN ═════════════════════════════════════════════

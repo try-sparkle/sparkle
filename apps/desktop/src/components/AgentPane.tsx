@@ -51,6 +51,7 @@ import { noteAgentTranscriptPath } from "../services/conciergeTools/terminal";
 import { invoke } from "@tauri-apps/api/core";
 import { HookStatusEngine, createHookEventHandler, type HookEvent } from "../engine/hookEvents";
 import { createStatusRouter, type StatusRouter } from "../engine/statusRouter";
+import { noteAgentStatus } from "../services/authRecovery";
 import { noteHooksDead, noteHooksLive } from "../engine/turnEndAuthority";
 import { forgetThrash, noteThrashEvent } from "../engine/agentThrash";
 import { log } from "../logger";
@@ -301,7 +302,24 @@ function AgentPaneInner({
       // UI. `info` (not `debug`) deliberately: debug forwarding is off in production builds, and this
       // is exactly the trail a support capture needs. It fires only on a real change, so a row that
       // sits still costs nothing.
-      (t) => log.info("agent-status", "transition", { agentId: agent.id, agentName: agent.name, ...t }),
+      (t) => {
+        log.info("agent-status", "transition", { agentId: agent.id, agentName: agent.name, ...t });
+        // THE DETECTION → RECOVERY HAND-OFF (PRD/sparkle/claude-account-identity-truth.md §6c).
+        //
+        // This one line is the whole channel, and the transition record is the right carrier rather
+        // than a convenient one. `authRecovery` acts on the PAIR `waiting` + a reason code, never on
+        // the band: `waiting` is the app's most common attention state, so triggering on it alone
+        // would send `Esc` to every correlated agent sitting at a permission dialog or an
+        // AskUserQuestion menu, cancelling an approval a human was mid-answer on.
+        //
+        // It also carries the CLEAR edge, which the screen-level event cannot. The router latches
+        // the session-limit pierce and drops it only on positive progress — a real tool event or new
+        // agent output — so a `reason`-less transition arriving here is the measured evidence that
+        // an agent moved, which is what releases its account's remaining stuck peers. Un-registering
+        // on "the picker left the screen" instead would fire the moment `Esc` landed, before anyone
+        // knew whether the resume took.
+        noteAgentStatus(agent.id, t.to, t.reason ?? undefined);
+      },
       // The stream just died; it witnesses nothing from here. Recovery is automatic — the next
       // main-session event calls activate(), which re-asserts noteHooksLive.
       () => {
