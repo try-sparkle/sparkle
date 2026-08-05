@@ -421,6 +421,8 @@ describe("sweepAllProjects — the single-owner election", () => {
     await sweepAllProjects(CONFIG, {
       ownsProject: (id) => id === PROJECT.id,
       projects: () => [PROJECT, projectB],
+      dispatchClock: () => T0,
+      sweepClock: () => T0,
     });
 
     // The unowned project is never even listed — one `fetchOpenPrs`, for the owned one only.
@@ -430,7 +432,12 @@ describe("sweepAllProjects — the single-owner election", () => {
 
   it("sweeps BOTH when this window owns both — the gate is a filter, not an off switch", async () => {
     wireInvoke({ leases: [], gate: { applicable: false, probes: [], error: null, overridden: false } });
-    await sweepAllProjects(CONFIG, { ownsProject: () => true, projects: () => [PROJECT, projectB] });
+    await sweepAllProjects(CONFIG, {
+      ownsProject: () => true,
+      projects: () => [PROJECT, projectB],
+      dispatchClock: () => T0,
+      sweepClock: () => T0,
+    });
     expect(fetchOpenPrsMock).toHaveBeenCalledTimes(2);
   });
 });
@@ -606,5 +613,47 @@ describe("the abandon deadline", () => {
     expect(BABYSIT_SWEEP_ABANDON_MS).toBe(4 * BABYSIT_SWEEP_MS);
 
     stop();
+  });
+});
+
+// ── THE PRODUCTION CLOCK WIRING (roborev 58566) ─────────────────────────────────────────────────
+//
+// `dispatchClock` defaults to the sweep's `now`, so the whole fix lives in ONE argument at the
+// `sweepAllProjects` call site — and deleting it silently restores the bug (budget entries filed
+// under a wedged sweep's ancient start time) with every test green, because each other test injects
+// its own clock straight into `babysitSweepProject` and never touches the seam.
+describe("sweepAllProjects — the dispatch clock reaches the sweep", () => {
+  it("passes its deps' dispatchClock through, so the budget is filed under the REAL time", async () => {
+    const LATE = T0 + 59 * 60_000;
+    const N = CONFIG.maxDispatchesPerHour;
+
+    // Spend the ceiling through sweepAllProjects, with sweeps judging at "now" but dispatches
+    // happening 59 minutes later. If the seam is not wired, entries land under the sweep clock.
+    for (let i = 0; i < N; i++) {
+      fetchOpenPrsMock.mockResolvedValue([prWithProbe(7000 + i)]);
+      wireInvoke({ leases: [] });
+      // The two clocks are DISTINCT on purpose: sweeps judge at T0, dispatches happen 59 min later.
+      const deps = {
+        ownsProject: () => true,
+        projects: () => [PROJECT],
+        dispatchClock: () => LATE,
+        sweepClock: () => T0,
+      };
+      await sweepAllProjects(CONFIG, deps);
+      await sweepAllProjects(CONFIG, deps);
+    }
+    expect(spawnMock).toHaveBeenCalledTimes(N);
+
+    // Real time is now past the hour relative to T0 but NOT relative to LATE, so a correctly-wired
+    // seam still refuses. Driven through babysitSweepProject with the same late clock so only the
+    // stored entries' timestamps decide the outcome.
+    fetchOpenPrsMock.mockResolvedValue([prWithProbe(7999)]);
+    wireInvoke({ leases: [] });
+    const AFTER = T0 + 61 * 60_000;
+    await babysitSweepProject(PROJECT, AFTER, CONFIG, () => true, () => AFTER);
+    const over = await babysitSweepProject(PROJECT, AFTER + 1000, CONFIG, () => true, () => AFTER);
+
+    expect(over.holds["rate-limited"]).toBe(1);
+    expect(spawnMock).toHaveBeenCalledTimes(N);
   });
 });

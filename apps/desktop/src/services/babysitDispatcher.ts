@@ -572,9 +572,25 @@ export function startBabysitDispatcher(config?: Partial<BabysitDispatchConfig>):
 export interface BabysitSweepDeps {
   ownsProject: (projectId: string) => boolean;
   projects: () => readonly Project[];
+  /**
+   * The REAL clock, for the hourly-budget append only — see `babysitSweepProject`'s `dispatchClock`.
+   *
+   * It lives on the injectable deps rather than being written inline at the call site so the
+   * production wiring is REACHABLE FROM A TEST. It was inline, and that made the whole fix unpinned:
+   * `dispatchClock` defaults to the sweep's `now`, so deleting the argument silently restored the
+   * bug (budget entries filed under a wedged sweep's ancient start time) with every test green,
+   * because each one injected its own clock directly into `babysitSweepProject`.
+   */
+  dispatchClock: () => number;
+  /** The instant every DECISION in one sweep judges against. Injectable for the same reason as
+   *  `dispatchClock`: with only one of the two controllable, a test cannot tell the two apart, and
+   *  the wiring that keeps them distinct stays unpinned. */
+  sweepClock: () => number;
 }
 
 const PRODUCTION_DEPS: BabysitSweepDeps = {
+  dispatchClock: () => Date.now(),
+  sweepClock: () => Date.now(),
   ownsProject: ownsProjectInThisWindow,
   projects: () => useProjectStore.getState().projects,
 };
@@ -584,7 +600,7 @@ export async function sweepAllProjects(
   deps: BabysitSweepDeps = PRODUCTION_DEPS,
   isCurrent: () => boolean = () => true,
 ): Promise<void> {
-  const now = Date.now();
+  const now = deps.sweepClock();
   for (const project of deps.projects()) {
     // SINGLE-OWNER ELECTION, the same one every sibling per-project sweep uses
     // (`sweepGoalContinuations`, `startPusherRunner`). `startPusher` mounts in EVERY window, and
@@ -602,7 +618,7 @@ export async function sweepAllProjects(
     if (!deps.ownsProject(project.id)) continue;
     try {
       if (!isCurrent()) return;
-      const outcome = await babysitSweepProject(project, now, resolved, isCurrent, () => Date.now());
+      const outcome = await babysitSweepProject(project, now, resolved, isCurrent, deps.dispatchClock);
       if (outcome.dispatched.length > 0 || Object.keys(outcome.holds).length > 0) {
         log.debug("babysit", "sweep", {
           project: project.id,
