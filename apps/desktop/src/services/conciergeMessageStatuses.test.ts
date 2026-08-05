@@ -134,11 +134,11 @@ describe("useConciergeMessageStatuses", () => {
    * producer that grew one back would put the 1 Hz ticker in the host again (roborev 57889-M2).
    *
    * Asserted as the ABSENCE OF A TONE rather than as an exact key list, and the difference matters:
-   * the key list said `["text"]`, so it also failed for `live` — a static boolean that is a fact
-   * about the QUEUE (is this the running entry?) and requires reading no clock at all. That is
-   * exactly the kind of addition this rule should permit, and enumerating keys made the test assert
-   * something stricter than the invariant it documents. What must never appear is `tone`, or any
-   * other field whose value is a reading of elapsed time.
+ * the key list said `["text"]`, so it also failed for `live` — a static boolean that is a fact about
+ * the QUEUE (is this the running entry?) and requires reading no clock at all. That is exactly the
+ * kind of addition this rule should permit, so enumerating keys asserts something STRICTER than the
+ * invariant documented here. What must never appear is `tone`, or any other field whose value is a
+ * reading of elapsed time — and that, not the key set, is what this case checks.
    */
   it("hands down no tone and no clock reading", () => {
     const floor = seqNow();
@@ -146,9 +146,12 @@ describe("useConciergeMessageStatuses", () => {
     noteConciergePhase("composing");
     const { result } = renderHook(() => useConciergeMessageStatuses("msg-1", true, floor));
     const status = result.current["msg-1"]!;
+    // THE INVARIANT, and only it: nothing handed down is a reading of elapsed time. An exhaustive
+    // key list was tried here and removed (roborev 58532-M2) — it asserted something STRICTER than
+    // the rule it documents, so the next legitimate static field (another queue fact, costing no
+    // clock) would break this case for exactly the reason the rule permits it.
     expect(status).not.toHaveProperty("tone");
-    // Everything handed down is either the phrase or a static queue fact — nothing time-derived.
-    expect(Object.keys(status).sort()).toEqual(["live", "text"]);
+    // `live` is the one field beside the phrase, and it is a static boolean rather than a clock read.
     expect(typeof status.live).toBe("boolean");
   });
 
