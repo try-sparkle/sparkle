@@ -948,6 +948,34 @@ export function OpenPrMenu({
   // the app's only pull-request affordance while six PRs sat mergeable.
   // `wideLabel`, not `label`: a wide form holding dismissals must keep rendering, or it takes the
   // only way to review and undo them with it. See `wideLabel` above.
+  /**
+   * DISARM WHENEVER THE ARMED ROW IS NOT ON SCREEN.
+   *
+   * `overrideArmed` is a standing authorisation to merge a red PR, and this file's own rule is that
+   * it "does not survive anything" — it is cleared on a scope change and on panel open/close. But
+   * Dismiss and Restore happen INSIDE the open panel, so neither reset fires: arm a row, dismiss it,
+   * restore it, and it returns with `data-armed="yes"` and its typed reason intact, so a SINGLE
+   * click spends a waiver whose deliberate second act happened before the row was hidden. Auto-
+   * revival (a dismissed PR reappearing after a push) reaches the same state with no click at all.
+   * Both the probe override and the `unstable` "Merge anyway?" button read this flag.
+   *
+   * IT HAS TO BE AN EFFECT, not a render-time `&& rowVisible` guard. The restored row comes back
+   * under the SAME `rowKey`, so by the time it renders again both conditions hold and such a guard
+   * is inert — it would read as a fix and change nothing. Clearing while the row is ABSENT is the
+   * only version that works, and deriving it from the rendered set (rather than clearing inside
+   * `runDismiss`/`runRestore`) means a future path that removes a row cannot forget to disarm.
+   */
+  useEffect(() => {
+    if (!overrideArmed) return;
+    const visible = groups.some((g) =>
+      g.prs.some((pr) => prKeyOf(g.key, pr.number) === overrideArmed),
+    );
+    if (!visible) {
+      setOverrideArmed(null);
+      setOverrideReason("");
+    }
+  }, [groups, overrideArmed]);
+
   if (compact ? scopes.length === 0 : !wideLabel) return null;
 
   const badgeTitle = prBadgeTitle(label, totals);

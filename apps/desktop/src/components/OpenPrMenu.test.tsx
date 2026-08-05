@@ -3135,6 +3135,54 @@ describe("OpenPrMenu — Dismiss", () => {
     ).toBe(true);
   });
 
+  // ONE CLICK MUST NEVER SPEND A WAIVER ARMED BEFORE THE ROW WENT AWAY.
+  //
+  // `overrideArmed` is a standing authorisation to merge a red PR, and the rule this file states is
+  // that it does not survive anything — but Dismiss and Restore happen INSIDE the open panel, so
+  // neither the scope-change nor the panel-toggle reset fires. Arm, dismiss, restore, and the row
+  // used to return with data-armed="yes" and its second deliberate act already consumed.
+  //
+  // NOTE FOR ANYONE TIGHTENING THIS: a render-time `&& rowIsVisible` guard does NOT fix it. The
+  // restored row comes back under the SAME rowKey, so both conditions hold again by the time it
+  // renders and the guard is inert. Only clearing while the row is ABSENT works.
+  it("disarms an override when its row is dismissed, so Restore cannot hand back a spent step", async () => {
+    const green: PrRow = {
+      ...NO_RIGHTS,
+      viewerCanMerge: true,
+      mergeStateStatus: "unstable",
+    };
+    stubWithDismissals([green]);
+    render(
+      <OpenPrMenu
+        scopes={SCOPES}
+        resolveAgent={noAgent}
+        onOpenAgent={noop}
+        compact
+      />,
+    );
+    fireEvent.click(await screen.findByTestId("open-pr-badge"));
+
+    // Arm the row's override — one deliberate click, not yet a merge.
+    const override = await screen.findByTestId("merge-override-39");
+    fireEvent.click(override);
+    await waitFor(() =>
+      expect(
+        screen.getByTestId("merge-override-39").getAttribute("data-armed"),
+      ).toBe("yes"),
+    );
+
+    fireEvent.click(await screen.findByTestId("dismiss-39"));
+    await waitFor(() =>
+      expect(screen.queryByTestId("merge-override-39")).toBeNull(),
+    );
+    fireEvent.click(await screen.findByTestId("pr-dismissed-toggle"));
+    fireEvent.click(await screen.findByTestId("restore-39"));
+
+    // THE SIDE EFFECT UNDER TEST: the row is back, and its override needs BOTH clicks again.
+    const back = await screen.findByTestId("merge-override-39");
+    expect(back.getAttribute("data-armed")).toBe("no");
+  });
+
   it("AUTO-REVIVES when the reason goes away, and tells Rust to drop the record", async () => {
     // "Dismissal means 'not now', not 'never'." The store holds a dismissal fingerprinted at
     // `sha-old`; the live probe reports `sha-new`, so the PR has been pushed to and comes back
