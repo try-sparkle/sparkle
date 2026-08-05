@@ -1,12 +1,21 @@
 // @vitest-environment jsdom
 //
-// THE CONTRACT: clicking an agent pill NEVER results in no visible change.
+// THE CONTRACT: clicking an agent pill ON A WIRED SURFACE never results in no visible change.
+//
+// ══ READ THE SCOPE OF THAT SENTENCE ═════════════════════════════════════════════════════════════
+// It used to read "clicking an agent pill NEVER results in no visible change", full stop, and that
+// was an over-claim this file's own tests contradicted — see "an unwired surface says nothing about
+// the agent's lifecycle" below, which PINS a pill with no opener as a non-interactive `<span>`.
+// A click there produces no visible change by design and by assertion, and that is the right
+// behaviour (a surface with no reveal path must not pretend to have one) — but a header claiming
+// otherwise made this suite read as proof of something broader than it tests. It was read that way,
+// and the gap it hid is case (e) below (bead sparkle-ixsb3).
 //
 // The bug this file exists for: a pill labelled "Remove BYOK" was clicked and nothing happened —
 // no navigation, no error, no explanation. A dead link that fails silently is worse than no link,
 // because the reader cannot tell whether the agent is gone or whether the click registered.
 //
-// Two distinct silent paths produced that, and both are covered below:
+// Three distinct silent paths produce that, and all three are covered below:
 //
 //   • THE ID NO LONGER RESOLVES. Agents get closed and discarded, and a pill embeds a hard id. The
 //     BYOK migration really did run under ids that are not in the roster today. Those pills
@@ -16,14 +25,28 @@
 //     `selectAndOpen` on a missing agent, both silently — so a pill whose agent was closed after
 //     the reply rendered looks live, is clicked, and does nothing. The pill cannot predict this
 //     (see the "no other-window state" note in AgentPill.tsx); it has to believe the OUTCOME.
+//   • THE REVEAL LANDS AND NOTHING MOVES. The one nobody named, and the one the founder hit. Every
+//     write on the reveal path is idempotent and skips when its target state already holds, so for
+//     an agent whose own column is ALREADY showing it the whole sequence writes nothing and reports
+//     success — and a pill that says nothing on success produced a completely invisible click. That
+//     state is not exotic: it is exactly what the concierge's own spawn leaves behind (`landInAgent`)
+//     before it names the new agent as a pill in its reply, so the FIRST click on a freshly-spawned
+//     agent's pill hit it every time. When that project sits on the OTHER pair from the one the
+//     reader is watching, nothing they can see moves at all.
 //
-// The cases are named (a)–(d) in the titles: they are the states a pill can be in, and the
+// WHY A BOOLEAN COULD NOT SAY THIS. `onOpenAgent` returned `true`/`false`, documented HERE as "the
+// screen changed"/"it did not" and produced THERE (`openProjectTab`) as "the writes ran"/"they did
+// not". Two files, opposite definitions of one bit, and the pill believed the wrong one. It returns
+// a three-way `RevealOutcome` now, so "already showing" has a value of its own to be reported as.
+//
+// The cases are named (a)–(e) in the titles: they are the states a pill can be in, and the
 // contract is that every one of them is visible to the reader.
 import { StrictMode } from "react";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentPill, AgentPillProvider, type AgentPillContextValue } from "./AgentPill";
 import type { MentionAgent } from "./mentions";
+import type { RevealOutcome } from "../../services/agentReveal";
 
 afterEach(() => cleanup());
 
@@ -35,7 +58,7 @@ function agent(over: Partial<MentionAgent> & { id: string; name: string }): Ment
 const BUILD8 = agent({ id: "b78f9f8c", name: "Build 8" });
 
 function ctx(over: Partial<AgentPillContextValue> = {}): AgentPillContextValue {
-  return { agents: [BUILD8], onOpenAgent: vi.fn(() => true), onSeeHistory: vi.fn(), ...over };
+  return { agents: [BUILD8], onOpenAgent: vi.fn((): RevealOutcome => "revealed"), onSeeHistory: vi.fn(), ...over };
 }
 
 function mount(value: AgentPillContextValue, agentId: string, fallbackName: string) {
@@ -51,7 +74,7 @@ const visible = () => document.body.textContent ?? "";
 
 describe("a pill click never dead-ends", () => {
   it("(a) live and reachable — clicking navigates to that agent and explains nothing", () => {
-    const onOpenAgent = vi.fn(() => true);
+    const onOpenAgent = vi.fn((): RevealOutcome => "revealed");
     mount(ctx({ onOpenAgent }), "b78f9f8c", "@Build 8");
 
     fireEvent.click(screen.getByTestId("concierge-agent-pill"));
@@ -67,7 +90,7 @@ describe("a pill click never dead-ends", () => {
     // The agent was closed between the render that drew this pill and the click that hit it, so
     // the reveal path bails. Previously this was the whole bug: a live-looking pill, a click, and
     // an unchanged screen.
-    const onOpenAgent = vi.fn(() => false);
+    const onOpenAgent = vi.fn((): RevealOutcome => "gone");
     const before = visible();
     mount(ctx({ onOpenAgent }), "b78f9f8c", "@Build 8");
 
@@ -83,7 +106,7 @@ describe("a pill click never dead-ends", () => {
 
   it("(b) a failed reveal also offers the history route, same as a known-closed pill", () => {
     const onSeeHistory = vi.fn();
-    mount(ctx({ onOpenAgent: () => false, onSeeHistory }), "b78f9f8c", "@Build 8");
+    mount(ctx({ onOpenAgent: (): RevealOutcome => "gone", onSeeHistory }), "b78f9f8c", "@Build 8");
     fireEvent.click(screen.getByTestId("concierge-agent-pill"));
     fireEvent.click(screen.getByTestId("concierge-agent-pill-notice-action"));
     expect(onSeeHistory).toHaveBeenCalledWith({ agentId: "b78f9f8c", name: "Build 8" });
@@ -133,7 +156,7 @@ describe("a pill click never dead-ends", () => {
     mount(
       ctx({
         agents: [agent({ id: "a0d5dc98", name: "Talk/Send Mode Slider" })],
-        onOpenAgent: () => false,
+        onOpenAgent: (): RevealOutcome => "gone",
       }),
       "a0d5dc98",
       "@Build 9",
@@ -151,7 +174,7 @@ describe("the failed state is about a MOMENT, never sticky", () => {
     // A pill that kept asserting "closed" — and whose first click merely dismissed its own notice —
     // would be the dead end one state deeper: the click meant to retry does nothing (roborev 55548).
     let reachable = false;
-    const onOpenAgent = vi.fn(() => reachable);
+    const onOpenAgent = vi.fn((): RevealOutcome => (reachable ? "revealed" : "gone"));
     mount(ctx({ onOpenAgent }), "b78f9f8c", "@Build 8");
 
     fireEvent.click(screen.getByTestId("concierge-agent-pill"));
@@ -170,7 +193,7 @@ describe("the failed state is about a MOMENT, never sticky", () => {
     // A boolean state could not express this: setting "closed" on an already-closed pill is an
     // identical-value update, React bails out, and the reader's second click paints and announces
     // nothing — the dead end one step further out (roborev 55590).
-    mount(ctx({ onOpenAgent: () => false }), "b78f9f8c", "@Build 8");
+    mount(ctx({ onOpenAgent: (): RevealOutcome => "gone" }), "b78f9f8c", "@Build 8");
 
     fireEvent.click(screen.getByTestId("concierge-agent-pill"));
     const first = screen.getByTestId("concierge-agent-pill-notice");
@@ -191,7 +214,7 @@ describe("the failed state is about a MOMENT, never sticky", () => {
   it("(b) the retry pill does not advertise itself as a collapsible disclosure", () => {
     // It never collapses — activating it re-attempts. `aria-expanded` here would promise assistive
     // tech a control that cannot be un-expanded. The known-closed pill, which IS a toggle, keeps it.
-    mount(ctx({ onOpenAgent: () => false }), "b78f9f8c", "@Build 8");
+    mount(ctx({ onOpenAgent: (): RevealOutcome => "gone" }), "b78f9f8c", "@Build 8");
     fireEvent.click(screen.getByTestId("concierge-agent-pill"));
     const retry = screen.getByTestId("concierge-agent-pill-closed");
     expect(retry.getAttribute("aria-expanded")).toBeNull();
@@ -220,7 +243,7 @@ describe("the reveal is a side effect, so it runs ONCE per click", () => {
     // bails on the unchanged value, never re-renders, and so never double-invokes — a `() => true`
     // version of this row cannot fail either, for a subtler reason than the plain-render one. The
     // miss is what makes the state actually change (0 → 1) and the second invocation observable.
-    const onOpenAgent = vi.fn(() => false);
+    const onOpenAgent = vi.fn((): RevealOutcome => "gone");
     render(
       <StrictMode>
         <AgentPillProvider value={ctx({ onOpenAgent })}>
@@ -267,6 +290,69 @@ describe("expanding an explanation is not the same fact as a failed reveal", () 
     expect(screen.queryByTestId("concierge-agent-pill-closed")).toBeNull();
     expect(screen.queryByTestId("concierge-agent-pill-notice")).toBeNull();
     expect(visible()).not.toMatch(/closed/i);
+  });
+});
+
+describe("(e) a live agent whose column already shows it says WHERE, not nothing", () => {
+  it("names the project instead of leaving the click invisible", () => {
+    // The reveal ran and had nothing to do. Before this, the pill said nothing on any non-`false`
+    // outcome, so the reader clicked and got no visible change whatsoever.
+    const onOpenAgent = vi.fn((): RevealOutcome => "already-showing");
+    mount(ctx({ onOpenAgent }), "b78f9f8c", "@Build 8");
+
+    fireEvent.click(screen.getByTestId("concierge-agent-pill"));
+
+    expect(onOpenAgent).toHaveBeenCalled();
+    // SOMETHING IS ON SCREEN. This is the whole contract.
+    expect(screen.getByTestId("concierge-agent-pill-notice").textContent).toMatch(
+      /Build 8 is already open in web\./i,
+    );
+  });
+
+  it("does NOT call a live agent closed, in words or in dress", () => {
+    // The two failure modes this branch sits between, and both have been shipped before in the
+    // other direction (roborev 55548/55590): silence, or a false "…is closed" about a running agent.
+    mount(ctx({ onOpenAgent: (): RevealOutcome => "already-showing" }), "b78f9f8c", "@Build 8");
+
+    fireEvent.click(screen.getByTestId("concierge-agent-pill"));
+
+    expect(visible()).not.toMatch(/closed/i);
+    // Still the LIVE pill — teal, with its status dot — not the muted closed form.
+    expect(screen.getByTestId("concierge-agent-pill")).toBeTruthy();
+    expect(screen.queryByTestId("concierge-agent-pill-closed")).toBeNull();
+    // And no "See what it did": that route is for prompts that OUTLIVED an agent, and this one is
+    // running right now.
+    expect(screen.queryByTestId("concierge-agent-pill-notice-action")).toBeNull();
+  });
+
+  it("re-announces on a repeat click rather than going quiet", () => {
+    // Same reason the miss ladder counts (roborev 55590): an identical-value setState is a no-op
+    // React bails out of, so the second click would paint and announce nothing. The notice is
+    // re-keyed instead, which is what makes an unchanged answer a live-region UPDATE.
+    mount(ctx({ onOpenAgent: (): RevealOutcome => "already-showing" }), "b78f9f8c", "@Build 8");
+    const pill = screen.getByTestId("concierge-agent-pill");
+
+    fireEvent.click(pill);
+    const first = screen.getByTestId("concierge-agent-pill-notice");
+    fireEvent.click(pill);
+    const second = screen.getByTestId("concierge-agent-pill-notice");
+
+    expect(second).not.toBe(first); // a REPLACED child, not an updated one
+    expect(second.textContent).toMatch(/already open/i);
+  });
+
+  it("clears the sentence as soon as a click actually moves the screen", () => {
+    // A non-navigating outcome is a fact about ONE moment. The reader reopens the project, clicks
+    // again, and must not be left reading a stale explanation of a click that has since worked.
+    let outcome: RevealOutcome = "already-showing";
+    mount(ctx({ onOpenAgent: (): RevealOutcome => outcome }), "b78f9f8c", "@Build 8");
+
+    fireEvent.click(screen.getByTestId("concierge-agent-pill"));
+    expect(screen.getByTestId("concierge-agent-pill-notice").textContent).toMatch(/already open/i);
+
+    outcome = "revealed";
+    fireEvent.click(screen.getByTestId("concierge-agent-pill"));
+    expect(screen.queryByTestId("concierge-agent-pill-notice")).toBeNull();
   });
 });
 
@@ -329,7 +415,7 @@ describe("the closed state degrades where no host opted in", () => {
     // SupportModal and agent replies render <Markdown> outside the concierge column. A pill there
     // must not become a button wired to nothing — that would be the dead link in a new costume.
     mount(
-      { agents: [], onOpenAgent: vi.fn(() => false) } as AgentPillContextValue,
+      { agents: [], onOpenAgent: vi.fn((): RevealOutcome => "gone") } as AgentPillContextValue,
       "b78f9f8c",
       "@Build 8",
     );

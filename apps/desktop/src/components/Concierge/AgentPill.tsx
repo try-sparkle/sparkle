@@ -57,18 +57,34 @@ import { bandColor } from "../../engine/statusBandLabels";
 import { stripMentionSigil } from "./agentRefs";
 import { MENTION_PILL_FILL } from "./MentionPill";
 import type { MentionAgent } from "./mentions";
+// TYPE ONLY, so this module still pulls in no store at runtime — the rule every component under
+// components/Concierge follows. The union lives beside the function that PRODUCES it
+// (services/agentReveal.revealOutcomeFor) rather than here, so there is one definition of what a
+// reveal can do rather than a copy on each side of the seam.
+import type { RevealOutcome } from "../../services/agentReveal";
 
 export interface AgentPillContextValue {
   /** The live roster. Empty means "nothing resolves", which is the correct default. */
   agents: readonly MentionAgent[];
-  /** Open this agent, and report whether the reveal actually LANDED. Carries the project id too,
-   *  because the agent may live in a project that is not the open one and the reveal path needs
-   *  both.
+  /** Open this agent, and report WHAT THE READER SAW. Carries the project id too, because the agent
+   *  may live in a project that is not the open one and the reveal path needs both.
    *
-   *  THE RETURN VALUE IS THE CONTRACT. `false` means nothing on screen changed — the project or the
-   *  agent was gone by the time the click arrived — and the pill turns that into a sentence rather
-   *  than leaving the reader looking at an unchanged screen. A handler that cannot fail returns
-   *  `true`.
+   *  THE RETURN VALUE IS THE CONTRACT, and it is a three-way `RevealOutcome` rather than a boolean
+   *  because a boolean could not tell the two non-navigating cases apart:
+   *
+   *    • `"revealed"`        — something moved. The pill says nothing; the screen already answered.
+   *    • `"already-showing"` — the agent is live and its side was ALREADY showing it, so the reveal
+   *                            had nothing left to write. The pill says where it is.
+   *    • `"gone"`            — no such agent any more. The pill says it is closed.
+   *
+   *  IT USED TO BE A BOOLEAN, and that is the bug this shape closes (bead sparkle-ixsb3). `true` was
+   *  written here to mean "the screen changed" and produced there to mean "the writes ran" — see the
+   *  opposite claims quoted on `RevealOutcome` — so an already-showing agent reported success and the
+   *  pill, which says nothing on success, produced a completely invisible click. Every write on the
+   *  reveal path is idempotent, so that state is ordinary rather than exotic: it is exactly what the
+   *  concierge's own spawn leaves behind before it names the new agent in its reply.
+   *
+   *  A HANDLER THAT CANNOT FAIL RETURNS `"revealed"`.
    *
    *  OPTIONAL, and its absence is NOT the same as a failed open. "This surface has no reveal path"
    *  is a fact about the surface; "that agent is closed" is a fact about the agent, and rendering
@@ -86,7 +102,7 @@ export interface AgentPillContextValue {
    *  agent is not the same as the reader FINDING it; the row is brought to the cursor instead of to
    *  an arbitrary edge. Optional because a keyboard activation has no meaningful cursor position,
    *  and inventing one would scroll the column to somewhere nobody was looking. */
-  onOpenAgent?: (target: { agentId: string; projectId: string; anchorY?: number }) => boolean;
+  onOpenAgent?: (target: { agentId: string; projectId: string; anchorY?: number }) => RevealOutcome;
   /** Search the prompt history of an agent that can no longer be opened. A closed agent's prompts
    *  outlive it (`services/history`), which is exactly how the discarded BYOK agent ids were
    *  recovered — so this is what turns the dead end into a destination.
@@ -160,6 +176,19 @@ const closedSentence = (name: string) => `${name} is closed.`;
  *  accumulating, when the fact being reported has not changed. */
 const missSentence = (misses: number, name: string) =>
   misses > 1 ? `${name} is still closed.` : closedSentence(name);
+
+/** What a pill says when the agent is LIVE and its column was already showing it.
+ *
+ *  It NAMES THE PROJECT, and that is the whole value of the sentence. The reader is looking at the
+ *  concierge column with one project's pair either side of it; an agent revealed in the pair they
+ *  are not watching moved nothing they can see. "Where is it" is the only question they have, and
+ *  the project is the answer — the same thing the pill's own tooltip promises ("Open X in Y").
+ *
+ *  NOT "…is closed", which is the trap this branch exists to avoid: the agent is perfectly alive,
+ *  and this pill labelling it dead would be the false claim roborev 55548/55590 already fixed twice
+ *  in the other direction. NOT silence either, which is what shipped and is the bug. */
+const alreadySentence = (name: string, projectName: string) =>
+  `${name} is already open in ${projectName}.`;
 
 /**
  * The always-mounted live region, with the notice inside it.
@@ -287,10 +316,19 @@ export function AgentPill({
   const canOpen = onOpen !== undefined || contextOpen !== undefined;
   // TWO SEPARATE STATES, because they mean different things and one counter could not.
   //
-  // `misses` — consecutive FAILED REVEALS on a resolved pill. A count rather than a boolean because
-  // a boolean cannot distinguish a repeat miss from the first: setting `true` on an already-`true`
-  // state is an identical-value update, React bails out, and the reader's retry click paints and
-  // announces NOTHING (roborev 55590).
+  // `attempt` — the LAST NON-NAVIGATING OUTCOME on a resolved pill, and how many times running it
+  // has come back. `null` while nothing has been attempted, or after an attempt that DID move the
+  // screen (a reveal needs no sentence — the reader just watched it happen).
+  //
+  // IT CARRIES THE OUTCOME, not just a tally, because there are now two things a click can fail to
+  // do and they need different sentences: `"gone"` says the agent is closed and offers its history,
+  // `"already-showing"` says the agent is live and names where. Collapsing them back into a counter
+  // is how the pill would start calling a live agent closed again.
+  //
+  // STILL COUNTED, for the reason a boolean could not carry (roborev 55590): setting an identical
+  // value is a no-op update React bails out of, so a second click with the same outcome would paint
+  // and announce NOTHING. The count is what re-keys the notice (see LiveNotice) and makes an
+  // unchanged answer register as a live-region update.
   //
   // `expanded` — whether an UNRESOLVED pill's explanation is showing. Nothing was attempted; it is
   // a pure disclosure toggle.
@@ -299,7 +337,9 @@ export function AgentPill({
   // expand while unresolved carried `misses = 1` into the resolved branch when a feed tick re-added
   // its agent, and rendered a live, in-roster agent as "…is closed" with no attempt ever made.
   // Per-pill either way, so one explained pill does not open every other pill's notice.
-  const [misses, setMisses] = useState(0);
+  const [attempt, setAttempt] = useState<{ outcome: "gone" | "already-showing"; n: number } | null>(
+    null,
+  );
   const [expanded, setExpanded] = useState(false);
   const noticeId = useId();
   const agent = agents.find((a) => a.id === agentId);
@@ -420,7 +460,17 @@ export function AgentPill({
   // so there is nothing left here to announce and the miss/retry state is unreachable by
   // construction. The pill degrades to what it is on that path — a button that opens an agent.
   const ownsOutcome = onOpen !== undefined;
-  const showClosed = !ownsOutcome && misses > 0;
+  const outcome = ownsOutcome ? null : (attempt?.outcome ?? null);
+  // ONLY `"gone"` mutes the pill. An `"already-showing"` agent is LIVE, so it keeps the teal wash and
+  // its status dot — dressing it in the closed style would say with colour the thing the sentence
+  // deliberately does not say with words.
+  const showClosed = outcome === "gone";
+  const notice =
+    outcome === "gone"
+      ? missSentence(attempt?.n ?? 1, name)
+      : outcome === "already-showing"
+        ? alreadySentence(name, agent.projectName)
+        : null;
   return (
     <span style={{ display: "inline" }}>
       <button
@@ -440,7 +490,7 @@ export function AgentPill({
         // decides where the click lands, so the disambiguating "(project)" suffix `mentionRoster`
         // adds for the composer would only be chrome here. The project belongs in the tooltip, where
         // it answers "which of these four is this one" without widening every pill to carry it.
-        title={showClosed ? missSentence(misses, name) : `Open ${agent.name} in ${agent.projectName}`}
+        title={notice ?? `Open ${agent.name} in ${agent.projectName}`}
         // ALWAYS RE-ATTEMPTS, and derives the state from the FRESH outcome. An earlier version made
         // the first click on an explained pill merely dismiss the notice and return, which meant
         // that after the reader reopened the project the pill still claimed the agent was closed
@@ -476,8 +526,23 @@ export function AgentPill({
           // keyboard activation to that would yank the column to the top of the viewport, which is
           // both wrong and unrequested, so it passes no anchor and gets the old behaviour.
           const anchorY = e.detail > 0 ? e.clientY : undefined;
-          const landed = contextOpen!({ ...target, anchorY });
-          setMisses((n) => (landed ? 0 : n + 1));
+          const result = contextOpen!({ ...target, anchorY });
+          // The updater stays PURE — it only folds an already-decided outcome (see above). A reveal
+          // that moved the screen clears the notice; either non-navigating outcome sets or bumps it,
+          // and a CHANGE of outcome restarts the count, because "still closed" must not be said
+          // about a fact the reader is hearing for the first time.
+          setAttempt((prev) => {
+            if (result === "revealed") return null;
+            // NORMALISED, not trusted. TypeScript's void-return bivariance lets a handler typed
+            // `() => void` satisfy this signature and hand back `undefined` — the same hole the
+            // `onOpen` doc above spells out, and a real one: an `undefined` here used to compare
+            // equal to `prev?.outcome` on a FIRST click (both `undefined`), taking the increment
+            // branch and reading `.n` off `null`. Anything that is not a known non-navigating
+            // outcome degrades to `"gone"`, which is exactly what the old boolean did with a falsy
+            // return, so the fallback is the previous behaviour rather than a new guess.
+            const outcome = result === "already-showing" ? "already-showing" : "gone";
+            return { outcome, n: prev !== null && prev.outcome === outcome ? prev.n + 1 : 1 };
+          });
         }}
         style={
           showClosed
@@ -500,8 +565,16 @@ export function AgentPill({
         {!showClosed && <span style={dot(agent.band)} aria-hidden />}@{agent.name}
       </button>
       {!ownsOutcome && (
-        <LiveNotice id={noticeId} open={showClosed} contentKey={misses} action={historyAction}>
-          {missSentence(misses, name)}
+        <LiveNotice
+          id={noticeId}
+          open={notice !== null}
+          contentKey={attempt?.n}
+          // "See what it did" is a route for a CLOSED agent's surviving prompts. Offering it beside
+          // "…is already open in X" would point the reader at history for an agent that is running
+          // right now — the wrong destination, and one that implies the agent is over.
+          action={outcome === "gone" ? historyAction : undefined}
+        >
+          {notice}
         </LiveNotice>
       )}
     </span>

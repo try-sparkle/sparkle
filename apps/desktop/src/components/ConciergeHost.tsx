@@ -62,7 +62,7 @@ import { bandCountLabel } from "../engine/statusBandLabels";
 import { rosterLine } from "../engine/conciergeRosterLine";
 import { oneLine } from "./promptHistory";
 import { openProjectTab } from "../services/openProjectTab";
-import { agentExists } from "../services/agentReveal";
+import { revealOutcomeFor } from "../services/agentReveal";
 import { useHistoryStore } from "../stores/historyStore";
 import { useConciergeMessageStatuses, waitingLine } from "../services/conciergeMessageStatuses";
 import {
@@ -1705,9 +1705,17 @@ export function ConciergeHost({
       // yank the reader to another tab and then tell them the click accomplished nothing — a
       // notice that contradicts what just happened on screen (roborev 55548). Checking up front is
       // also the established pattern for this exact decision (paletteJump, useAttentionNotifications).
-      if (!agentExists(projectId, agentId)) return false;
+      //
+      // IT ALSO HAS TO BE ASKED FIRST, not merely SHOULD (bead sparkle-ixsb3). The question is no
+      // longer just "is it there" but "would revealing it CHANGE anything", and that one is
+      // unanswerable afterwards: every write on the reveal path is idempotent, so once it has run,
+      // "the tab was already selected" and "I just selected it" look identical from the store. The
+      // prediction has to be taken before the writes collapse the difference. `revealOutcomeFor`
+      // subsumes the `agentExists` check this line used to make — a missing agent is `"gone"`.
+      const planned = revealOutcomeFor(projectId, agentId);
+      if (planned === "gone") return "gone";
       // RETURNED, not discarded: both of that path's early exits are silent, and the pill turns a
-      // `false` into "…is closed" rather than leaving the reader looking at an unchanged screen.
+      // `"gone"` into "…is closed" rather than leaving the reader looking at an unchanged screen.
       const landed = openProjectTab(projectId, agentId);
       // SELECTING IS NOT FINDING. `openProjectTab` selects the agent — which highlights its row and
       // opens its pane — but the builder column is longer than a screen, so the row that answered
@@ -1721,7 +1729,18 @@ export function ConciergeHost({
       // The anchor rides along so the row comes to the CURSOR (see components/anchoredScroll). A
       // keyboard activation sends no anchor and keeps the old get-it-on-screen behaviour.
       if (landed) useUiStore.getState().requestRevealAgent(agentId, { anchorY });
-      return landed;
+      // THE PREDICTION IS ONLY TRUSTED ONCE THE ATTEMPT AGREES WITH IT. `landed === false` means the
+      // agent went away between the read above and the write — the race this path has always had to
+      // believe the OUTCOME over the roster for — and it outranks a `"already-showing"` prediction
+      // taken a microtask earlier.
+      //
+      // `requestRevealAgent` above is deliberately NOT counted as "something moved". It scrolls the
+      // agent's row into view in ITS OWN column's sidebar, which is (a) nothing at all when the row
+      // is already on screen, and (b) on the other pair entirely from the reader whenever the pill's
+      // project is not the one they are watching. Treating it as a visible result is exactly the
+      // over-claim that let this click be invisible.
+      if (!landed) return "gone";
+      return planned;
     },
     [],
   );

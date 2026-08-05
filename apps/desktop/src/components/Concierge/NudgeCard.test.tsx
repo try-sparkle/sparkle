@@ -24,6 +24,7 @@ import {
 } from "./NudgeCard";
 import { AgentPillProvider } from "./AgentPill";
 import type { ConciergeNudge } from "./types";
+import type { RevealOutcome } from "../../services/agentReveal";
 
 afterEach(() => cleanup());
 
@@ -57,7 +58,7 @@ const approvalNudge: ConciergeNudge = {
 const renderCard = (
   n: ConciergeNudge,
   handlers: { onNudgeClick?: () => void; onNudgeAction?: () => void } = {},
-  contextOpen = vi.fn(() => true),
+  contextOpen = vi.fn((): RevealOutcome => "revealed"),
 ) => {
   const onNudgeClick = handlers.onNudgeClick ?? vi.fn();
   const onNudgeAction = handlers.onNudgeAction ?? vi.fn();

@@ -10,6 +10,7 @@ import { AgentPillProvider } from "./AgentPill";
 import type { MentionAgent } from "./mentions";
 import { ConciergeThread } from "./ConciergeThread";
 import type { ConciergeRecapMessage } from "../../services/conciergeRecap";
+import type { RevealOutcome } from "../../services/agentReveal";
 
 afterEach(() => cleanup());
 
@@ -242,7 +243,7 @@ describe("RecapCard — its agents are clickable, without a second live region",
    *  (roborev 56062). */
   const wired = (onRevealAgent?: (id: string) => void) =>
     render(
-      <AgentPillProvider value={{ agents: ROSTER, onOpenAgent: () => true }}>
+      <AgentPillProvider value={{ agents: ROSTER, onOpenAgent: (): RevealOutcome => "revealed" }}>
         <RecapCard recap={recap()} onRevealAgent={onRevealAgent} />
       </AgentPillProvider>,
     );
@@ -295,7 +296,7 @@ describe("a recap pill's reveal reaches the thread's caller", () => {
   it("carries the clicked row's agentId out through ConciergeThread", () => {
     const onRevealAgent = vi.fn();
     render(
-      <AgentPillProvider value={{ agents: ROSTER, onOpenAgent: () => true }}>
+      <AgentPillProvider value={{ agents: ROSTER, onOpenAgent: (): RevealOutcome => "revealed" }}>
         <ConciergeThread
           messages={[recap()]}
           onNudgeClick={vi.fn()}

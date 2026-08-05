@@ -13,6 +13,7 @@ import { Markdown } from "../Markdown";
 import { AgentPill, AgentPillProvider, type AgentPillContextValue } from "./AgentPill";
 import { agentRefHref } from "./agentRefs";
 import type { MentionAgent } from "./mentions";
+import type { RevealOutcome } from "../../services/agentReveal";
 
 afterEach(() => cleanup());
 
@@ -32,7 +33,7 @@ function ctx(over: Partial<AgentPillContextValue> = {}): AgentPillContextValue {
   // `() => true` — the opener REPORTS whether the reveal landed, and these rows are about the
   // successful path. A handler returning undefined reads as "it did not land", which is the point
   // of the return value (see AgentPill.deadEnd.test.tsx).
-  return { agents: [KRAKEN], onOpenAgent: vi.fn(() => true), ...over };
+  return { agents: [KRAKEN], onOpenAgent: vi.fn((): RevealOutcome => "revealed"), ...over };
 }
 
 function mountPill(value: AgentPillContextValue, agentId: string, fallbackName: string) {
@@ -98,7 +99,7 @@ describe("AgentPill — resolved", () => {
   });
 
   it("opens the agent WITH its project id, which the reveal path needs", () => {
-    const onOpenAgent = vi.fn(() => true);
+    const onOpenAgent = vi.fn((): RevealOutcome => "revealed");
     mountPill(ctx({ onOpenAgent }), "agent-7", "@Kraken Auth");
     fireEvent.click(screen.getByTestId("concierge-agent-pill"));
     // Named fields, not positional strings: `openProjectTab` takes (projectId, agentId) — the

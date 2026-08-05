@@ -8,8 +8,85 @@
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { sideOf } from "../engine/pairs";
+import { isProjectOpen } from "../engine/openProjects";
 import { useUiStore } from "../stores/uiStore";
 import { markProjectOpen } from "./projectTabs";
+
+/**
+ * WHAT A CLICK ON A REVEAL AFFORDANCE ACTUALLY DID — three outcomes, not two.
+ *
+ * ══ WHY A BOOLEAN COULD NOT CARRY THIS ══════════════════════════════════════════════════════════
+ * `selectAndOpen` and `openProjectTab` return `true` when their WRITES RAN. `Concierge/AgentPill`
+ * consumed that same `true` as "the screen changed", and its whole "a pill click is never invisible"
+ * contract rests on the difference. The two files stated OPPOSITE definitions of one boolean, in
+ * their own docstrings, and the pill believed the wrong one:
+ *
+ *   • openProjectTab — *"Returns whether the REVEAL LANDED … NOT 'whether the screen changed',
+ *     which an earlier version of this comment claimed and the code does not support."*
+ *   • AgentPill.onOpenAgent — *"THE RETURN VALUE IS THE CONTRACT. `false` means nothing on screen
+ *     changed."*
+ *
+ * Every write on the reveal path is idempotent and SKIPS when its target state already holds —
+ * `markProjectOpen` returns early when the tab is open, `projectStore.selectAgent` returns early on
+ * a re-select, `setWorkMode` bails on an equal value. So for an agent that is ALREADY the shown
+ * agent on its own side, the whole sequence writes nothing, reports `true`, and the pill — which
+ * says nothing on `true` — leaves the reader looking at an unchanged screen. That is the fifth
+ * dead-end state, and it is the one the founder hit (bead sparkle-ixsb3).
+ *
+ * It is not an exotic state either: it is precisely what the concierge's OWN spawn leaves behind.
+ * `spawnBuildAgentInProject` finishes with `landInAgent`, which selects the agent, opens it, clears
+ * the overlay and sets that side to Build. The concierge then names the new agent as a pill in its
+ * reply. Every condition below already holds by the time the reader can click it, so the FIRST click
+ * on a freshly-spawned agent's pill is the guaranteed no-op — and when that project sits on the
+ * OTHER pair from the one the reader is watching, nothing they can see moves at all.
+ */
+export type RevealOutcome =
+  /** Something the reader can see changed — a tab, a pane, a selection, an overlay coming down. */
+  | "revealed"
+  /** The agent is real and is already what its side is showing. Nothing was left to write. */
+  | "already-showing"
+  /** No such agent in that project any more. Nothing was attempted. */
+  | "gone";
+
+/**
+ * PREDICT what a reveal would do, without doing it.
+ *
+ * A PRE-FLIGHT READ, deliberately — the same "ASK FIRST, THEN ACT" shape `paletteJump`,
+ * `useAttentionNotifications` and `ConciergeHost.openAgentFromPill` already use, and for the same
+ * reason: a caller that must tell the user what happened cannot ask afterwards, because by then the
+ * writes have collapsed the difference between "it was already like that" and "I just made it so".
+ *
+ * Pure: reads the three stores and writes nothing, so calling it is free and repeatable.
+ *
+ * The conditions below are the WRITES `openProjectTab` + `selectAndOpen` perform, one for one, in
+ * the same order. If you add a write to either, add its condition here — a missing one makes this
+ * over-report `already-showing`, which puts a "nothing moved" sentence on screen next to a screen
+ * that did move. The test for that lives in services/agentReveal.test.ts.
+ */
+export function revealOutcomeFor(projectId: string, agentId: string): RevealOutcome {
+  const ps = useProjectStore.getState();
+  const project = ps.projects.find((p) => p.id === projectId);
+  const agent = project?.agents.find((a) => a.id === agentId);
+  if (!project || !agent) return "gone";
+  const ui = useUiStore.getState();
+  const side = sideOf(ui.pairAssignment, projectId);
+  const alreadyShowing =
+    // markProjectOpen — the tab already exists
+    isProjectOpen(projectId, ui.openProjectIds) &&
+    // selectProjectOnItsSide — and it is the project selected ON ITS OWN SIDE. Read per side, never
+    // from `selectedProjectId` alone: that value is the RIGHT pair's selection, so comparing a
+    // left-assigned project against it answers about a pair that does not hold it.
+    (side === "left" ? ui.leftProjectId === projectId : ps.selectedProjectId === projectId) &&
+    // selectAgent — and it is that project's shown agent
+    project.selectedAgentId === agentId &&
+    // runtime.open — and its pane is mounted
+    useRuntimeStore.getState().openAgentIds.includes(agentId) &&
+    // setActiveSpecial(null) — no app-global overlay is covering the pane
+    ui.activeSpecial === null &&
+    // setWorkMode(side, "build") — and that column is on Build, not the Plan board
+    ui.workModeBySide[side] === "build";
+  return alreadyShowing ? "already-showing" : "revealed";
+}
 
 /** Mount the agent (so its pane exists) and make it the selected tab — and crucially REVEAL it.
  *  A cross-window "needs attention" jump lands here in the owning window, but that window may be

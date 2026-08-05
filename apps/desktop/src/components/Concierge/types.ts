@@ -279,6 +279,9 @@ export interface ConciergeDigestMessage {
  *  drift. Re-exported so consumers of this module's public surface get it from one place. */
 export type { ConciergeRecapMessage } from "../../services/conciergeRecap";
 import type { ConciergeRecapMessage } from "../../services/conciergeRecap";
+// TYPE ONLY — this directory stays store-free; the union is defined beside the function that
+// produces it so both sides of the seam cannot drift.
+import type { RevealOutcome } from "../../services/agentReveal";
 
 /** A turn that failed, said in the user's terms with the machine's own words attached.
  *
@@ -623,14 +626,17 @@ export interface ConciergeColumnProps {
    *  partial re-implementations of that sequence are a documented source of "it's red somewhere but
    *  I can't find it" bugs.
    *
-   *  RETURNS whether the reveal LANDED. `false` means the click changed nothing on screen — the
-   *  project or the agent was gone by the time it arrived — and the pill turns that into a sentence
-   *  instead of failing silently, which is the bug the return value exists for.
+   *  RETURNS WHAT THE READER SAW — `"revealed"`, `"already-showing"` or `"gone"`. It was a boolean,
+   *  and the boolean was the bug (bead sparkle-ixsb3): `false` was documented here as "the click
+   *  changed nothing on screen", while the function bound to it returns `true` whenever its WRITES
+   *  RAN. Those are different questions, and every write on the reveal path is idempotent — so an
+   *  agent whose column was already showing it reported success, the pill stayed silent on success,
+   *  and the click was invisible. `"already-showing"` is the state that had no way to be said.
    *
    *  Absent means pills still RENDER (with their live name and status dot) but report a failed
    *  open when clicked, which is the honest default for a surface that has not wired the reveal
    *  path — it cannot navigate, so it must not pretend it did. */
-  onOpenAgent?: (target: { agentId: string; projectId: string }) => boolean;
+  onOpenAgent?: (target: { agentId: string; projectId: string }) => RevealOutcome;
   /** Search the prompt history of an agent that can no longer be opened — the destination that
    *  replaces the dead end. Absent → an unresolvable pill stays plain prose rather than becoming a
    *  button with nowhere to go. */

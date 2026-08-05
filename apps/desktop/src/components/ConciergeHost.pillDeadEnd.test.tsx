@@ -186,6 +186,101 @@ describe("the host's opener reports whether the reveal landed", () => {
   });
 });
 
+describe("(e) the host tells the reader when the reveal had nothing to do", () => {
+  /** THE FOUNDER'S STATE, reproduced from the stores rather than described.
+   *
+   *  The concierge spawned an agent in ANOTHER project and named it as a pill in its reply.
+   *  `spawnBuildAgentInProject` finishes with `landInAgent`, so by the time that reply is on screen
+   *  the agent is already its project's selected agent, already open, already on Build, with the
+   *  overlay already down. The reader then goes back to the project they were working in — a
+   *  DIFFERENT pair — and clicks the pill.
+   *
+   *  Every write `openProjectTab` + `selectAndOpen` would perform is therefore already satisfied,
+   *  and every one of them skips. The click used to report success and produce nothing at all. */
+  function seedAlreadyShowing() {
+    useRuntimeStore.setState({ openAgentIds: ["ag2"] } as never);
+    useUiStore.setState({
+      openProjectIds: null,
+      // p2 lives on the LEFT pair; the reader is watching the right one. This is what makes the
+      // no-op total: `selectProjectOnItsSide` writes `leftProjectId`, which is already p2, so not
+      // even the tab selection moves.
+      pairAssignment: { p2: "left" },
+      leftProjectId: "p2",
+      activeSpecial: null,
+      workModeBySide: { left: "build", right: "build" },
+    } as never);
+    useProjectStore.setState({
+      projects: [
+        { id: "p1", name: "sparkle", agents: [{ id: "ag1", name: "Build 7" }] },
+        {
+          id: "p2",
+          name: "other",
+          agents: [{ id: "ag2", name: "Build 8" }],
+          selectedAgentId: "ag2",
+        },
+      ],
+      selectedProjectId: "p1",
+    } as never);
+  }
+
+  it("says where the agent is instead of producing no visible change", () => {
+    seedAlreadyShowing();
+    threadReferencing("ag2", "Build 8");
+    render(<ConciergeHost feed={FEED_P2} />);
+
+    fireEvent.click(screen.getByTestId("concierge-agent-pill"));
+
+    // THE CONTRACT: the reader sees something.
+    expect(screen.getByTestId("concierge-agent-pill-notice").textContent).toMatch(
+      /Build 8 is already open in other\./i,
+    );
+  });
+
+  it("moves nothing and calls nothing closed — the agent is alive and was already up", () => {
+    seedAlreadyShowing();
+    threadReferencing("ag2", "Build 8");
+    render(<ConciergeHost feed={FEED_P2} />);
+
+    fireEvent.click(screen.getByTestId("concierge-agent-pill"));
+
+    // The reader was not yanked anywhere: this is the state where there was nowhere to go.
+    expect(useProjectStore.getState().selectedProjectId).toBe("p1");
+    expect(useUiStore.getState().leftProjectId).toBe("p2");
+    // And a live agent is not labelled dead.
+    expect(document.body.textContent ?? "").not.toMatch(/closed/i);
+    expect(screen.queryByTestId("concierge-agent-pill-closed")).toBeNull();
+  });
+
+  it("still NAVIGATES — and stays silent — when there really is somewhere to go", () => {
+    // The mirror of the case above, and the reason `revealOutcomeFor` is a prediction rather than a
+    // blanket "say something every time": a reveal that MOVES the screen must add no sentence, or
+    // every working click grows an explanation nobody needs.
+    useRuntimeStore.setState({ openAgentIds: [] } as never);
+    useUiStore.setState({
+      openProjectIds: null,
+      pairAssignment: {},
+      leftProjectId: null,
+      activeSpecial: null,
+      workModeBySide: { left: "build", right: "build" },
+    } as never);
+    useProjectStore.setState({
+      projects: [
+        { id: "p1", name: "sparkle", agents: [{ id: "ag1", name: "Build 7" }] },
+        { id: "p2", name: "other", agents: [{ id: "ag2", name: "Build 8" }] },
+      ],
+      selectedProjectId: "p1",
+    } as never);
+    threadReferencing("ag2", "Build 8");
+    render(<ConciergeHost feed={FEED_P2} />);
+
+    fireEvent.click(screen.getByTestId("concierge-agent-pill"));
+
+    expect(useProjectStore.getState().selectedProjectId).toBe("p2");
+    expect(useRuntimeStore.getState().openAgentIds).toContain("ag2");
+    expect(screen.queryByTestId("concierge-agent-pill-notice")).toBeNull();
+  });
+});
+
 describe("the host gives a closed agent somewhere to go", () => {
   it("(c) an id the roster cannot resolve is INTERACTIVE here, because the host offers history", () => {
     // Outside the concierge column the same pill stays plain prose — that contrast is the wiring.

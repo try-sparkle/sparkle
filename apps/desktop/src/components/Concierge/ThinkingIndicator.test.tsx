@@ -26,6 +26,7 @@ import { C } from "../../theme/colors";
 import { useProjectStore } from "../../stores/projectStore";
 import { AgentPillProvider } from "./AgentPill";
 import type { MentionAgent } from "./mentions";
+import type { RevealOutcome } from "../../services/agentReveal";
 
 /** A real project + agent in the store, so the recorder's id→name lookup genuinely resolves.
  *
@@ -367,12 +368,15 @@ describe("ThinkingIndicator — agent references", () => {
   // `=> true` — the opener REPORTS whether the reveal landed, and these rows are about the pill's
   // live form. An opener that returns false is read as "that agent is closed", which would take
   // every pill here into the explained state instead of the one being asserted (see AgentPill).
-  function harness(agents: MentionAgent[], onOpenAgent: (t: never) => boolean = () => true) {
+  function harness(
+    agents: MentionAgent[],
+    onOpenAgent: (t: never) => RevealOutcome = () => "revealed",
+  ) {
     const ui = (a: MentionAgent[]) => (
       <AgentPillProvider
         value={{
           agents: a,
-          onOpenAgent: onOpenAgent as (t: { agentId: string; projectId: string }) => boolean,
+          onOpenAgent: onOpenAgent as (t: { agentId: string; projectId: string }) => RevealOutcome,
         }}
       >
         <ThinkingIndicator typing floor={-1} />

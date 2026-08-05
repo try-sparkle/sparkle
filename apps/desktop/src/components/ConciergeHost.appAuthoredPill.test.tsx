@@ -18,10 +18,14 @@
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ConciergeDispatchResult } from "../services/conciergeDispatch";
+import type { RevealOutcome } from "../services/agentReveal";
 
 const h = vi.hoisted(() => ({
   openProjectTab: vi.fn(() => true),
-  agentExists: vi.fn(() => true),
+  // The gate the host asks BEFORE it acts is `revealOutcomeFor` now, not `agentExists`: the
+  // question widened from "is that agent there" to "would revealing it CHANGE anything", which is
+  // the distinction the pill needs and a boolean could not carry (bead sparkle-ixsb3).
+  revealOutcomeFor: vi.fn((): RevealOutcome => "revealed"),
   deferred: undefined as ((r: ConciergeDispatchResult) => void) | undefined,
 }));
 
@@ -35,7 +39,7 @@ vi.mock("../services/openProjectTab", () => ({
 }));
 vi.mock("../services/agentReveal", async (orig) => {
   const real = (await orig()) as Record<string, unknown>;
-  return { ...real, agentExists: h.agentExists };
+  return { ...real, revealOutcomeFor: h.revealOutcomeFor };
 });
 vi.mock("../services/conciergeDispatch", async (orig) => {
   const real = (await orig()) as Record<string, unknown>;
@@ -100,8 +104,8 @@ beforeEach(() => {
   h.deferred = undefined;
   h.openProjectTab.mockClear();
   h.openProjectTab.mockReturnValue(true);
-  h.agentExists.mockClear();
-  h.agentExists.mockReturnValue(true);
+  h.revealOutcomeFor.mockClear();
+  h.revealOutcomeFor.mockReturnValue("revealed");
 });
 afterEach(() => cleanup());
 
@@ -186,7 +190,7 @@ describe("clicking an app-authored pill lands the row at the cursor", () => {
   it("does NOT ask for a reveal when the agent could not be opened", () => {
     // A reveal for an agent that did not open would scroll the column toward a row that is not
     // going to be there.
-    h.agentExists.mockReturnValue(false);
+    h.revealOutcomeFor.mockReturnValue("gone");
     render(<ConciergeHost feed={feed()} />);
     relayLands();
     fireEvent.click(receiptPill(), { detail: 1, clientY: 300 });
