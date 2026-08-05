@@ -184,7 +184,10 @@ describe("his own message says it was answered", () => {
     // so `receiptText({target:"sparkle"})` returns null and `toContain(null)` is a type error rather
     // than a check. The row itself survives because it hosts the redirect, and its presence is what
     // this line was ever really saying. The negative below is the half that carries the intent.
-    expect(screen.getByTestId("routing-receipt").textContent).not.toMatch(
+    // `queryBy` + `?? ""`: a concierge-answered message renders NO receipt element now, and the
+    // claim this asserts absent is absent a fortiori when the box itself is gone. `getBy` would
+    // throw on the missing element instead of testing the string.
+    expect(screen.queryByTestId("routing-receipt")?.textContent ?? "").not.toMatch(
       /never answered|replaced by your next message/i,
     );
     // …and the marker is what replaces it: where the answer IS, not a claim there wasn't one.
@@ -221,7 +224,7 @@ describe("his own message says it was answered", () => {
     // this block exists to pin is the WORDING the receipt must never carry, so that is what is
     // asserted — a bare presence check cannot fail (getByTestId throws when absent) and would pass
     // against a build that restored "never answered", which is the exact regression guarded here.
-    expect(screen.getAllByTestId("routing-receipt")[0]!.textContent).not.toMatch(
+    expect(screen.queryAllByTestId("routing-receipt")[0]?.textContent ?? "").not.toMatch(
       /never answered|replaced by your next message/i,
     );
   });
@@ -254,7 +257,10 @@ describe("his own message says it was answered", () => {
     expect(screen.queryByTestId(ANSWERED_MARKER_TESTID)).toBeNull();
     // And the receipt still may not carry the deleted claim — kept as a tripwire, not as this row's
     // point, since it holds for every sibling too.
-    expect(screen.getByTestId("routing-receipt").textContent).not.toMatch(
+    // `queryBy` + `?? ""`: a concierge-answered message renders NO receipt element now, and the
+    // claim this asserts absent is absent a fortiori when the box itself is gone. `getBy` would
+    // throw on the missing element instead of testing the string.
+    expect(screen.queryByTestId("routing-receipt")?.textContent ?? "").not.toMatch(
       /never answered|replaced by your next message/i,
     );
   });

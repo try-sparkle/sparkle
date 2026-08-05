@@ -260,29 +260,37 @@ describe("a displaced message never claims it went unanswered", () => {
   // pin its ABSENCE end-to-end through the real column, each paired with a positive count of the
   // ordinary receipts, so they cannot pass on a thread that simply rendered nothing (which is
   // exactly how the originals first failed).
-/** How many ordinary receipts the thread is showing.
+/**
+ * How many of the user's own messages the thread is showing.
  *
- *  These rows used to count the literal "Answered here". That text was REMOVED at the founder's
- *  request (RoutingReceipt) — the concierge answering in place is self-evident from the reply
- *  appearing — so the string is no longer a usable anchor. The receipt ELEMENT survives, because it
- *  still hosts the "Also ask <agent>" redirect, and counting it preserves exactly what these rows
- *  were written to guarantee: the ordinary receipt is intact and was not replaced by the deleted
- *  "never answered" claim. The paired `not.toContain("never answered")` assertions are unchanged. */
-function receiptCount(): number {
-  return screen.queryAllByTestId("routing-receipt").length;
+ * ══ WHY THIS COUNTS BUBBLES AND NOT RECEIPTS ═══════════════════════════════════════════════════
+ * These rows originally counted the literal "Answered here"; when that text was removed they were
+ * re-pointed at the receipt ELEMENT, which survived only because it hosted the "Also ask" redirect.
+ * That button has now been removed too (founder: *"you can just take that out completely"*), so a
+ * concierge-answered message renders no receipt at all and the element is no longer countable.
+ *
+ * The POSITIVE CONTROL is the point and it is preserved: each row pairs a
+ * `not.toContain("never answered")` with a positive count, so it cannot pass on a thread that
+ * simply rendered nothing — which is exactly how the originals first failed. The user's bubble is
+ * the right anchor for that now: it is present for every sent message regardless of how the turn
+ * was routed or whether it was ever answered, which is more robust than either thing this helper
+ * previously counted.
+ */
+function sentBubbleCount(): number {
+  return screen.queryAllByTestId("you-bubble").length;
 }
 
   it("keeps the ordinary receipt on a bubble nothing ever came back for", async () => {
     render(<ConciergeHost feed={feed()} />);
     await send("what needs me?");
-    expect(receiptCount()).toBeGreaterThan(0);
+    expect(sentBubbleCount()).toBeGreaterThan(0);
     expect(threadText()).not.toContain("never answered");
 
     await send("what needs me right now?");
     expect(threadText()).not.toContain("never answered");
     expect(threadText()).not.toContain("Replaced by your next message");
     // Both bubbles carry their ordinary receipt — the displaced one reads exactly like the live one.
-    expect(receiptCount()).toBe(2);
+    expect(sentBubbleCount()).toBe(2);
   });
 
   // A TOOL CALL IS NOT AN ANSWER (roborev 55442-M1) — reading state or a terminal before replying is
@@ -297,7 +305,7 @@ function receiptCount(): number {
     await send("what needs me right now?");
     expect(threadText()).not.toContain("never answered");
     expect(threadText()).not.toContain("Replaced by your next message");
-    expect(receiptCount()).toBe(2);
+    expect(sentBubbleCount()).toBe(2);
   });
 
   // A turn that streamed a partial answer the user then interrupted is NOT this. They got words;
@@ -306,7 +314,7 @@ function receiptCount(): number {
     render(<ConciergeHost feed={feed()} />);
     await send("what needs me?");
     act(() => h.brain.delta?.({ id: "7", text: "Three agents " }));
-    expect(receiptCount()).toBeGreaterThan(0);
+    expect(sentBubbleCount()).toBeGreaterThan(0);
 
     await send("what needs me right now?");
     expect(threadText()).not.toContain("never answered");
@@ -316,7 +324,7 @@ function receiptCount(): number {
     render(<ConciergeHost feed={feed()} />);
     await send("what needs me?");
     act(() => h.brain.done?.({ id: "7", sessionId: "s1", text: "Nothing right now." }));
-    expect(receiptCount()).toBeGreaterThan(0);
+    expect(sentBubbleCount()).toBeGreaterThan(0);
 
     await send("and after that?");
     expect(threadText()).not.toContain("never answered");
@@ -328,7 +336,7 @@ function receiptCount(): number {
     render(<ConciergeHost feed={feed()} />);
     await send("what needs me?");
     act(() => h.brain.error?.({ id: "7", detail: "boom" }));
-    expect(receiptCount()).toBeGreaterThan(0);
+    expect(sentBubbleCount()).toBeGreaterThan(0);
 
     await send("try again?");
     expect(threadText()).not.toContain("never answered");

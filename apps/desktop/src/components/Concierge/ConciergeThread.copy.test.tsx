@@ -186,17 +186,21 @@ describe("ConciergeThread — copy affordances", () => {
       expect(onCopied).not.toHaveBeenCalledWith("answer");
     });
 
-    it("sits ABOVE the routing receipt, clear of its redirect button", async () => {
-      // Both live on the bubble's right edge; they must not share a ROW, or the copy glyph sits
-      // beside the redirect button and is easy to hit by mistake. Asserted by document order rather
-      // than by geometry — jsdom has no layout engine (it cannot evaluate the flex box at all), so
-      // "which element comes first" is the honest question to ask here.
+    it("sits ABOVE the routing receipt", async () => {
+      // Both live on the bubble's right edge and must not share a ROW. Asserted by document order
+      // rather than geometry — jsdom has no layout engine, so "which element comes first" is the
+      // honest question to ask here.
+      //
+      // AN AGENT RECEIPT, not a sparkle one: a message the concierge answered itself now renders NO
+      // receipt element at all ("Answered here" and the "Also ask" button are both gone), so a
+      // sparkle fixture would assert ordering against something that does not exist. An agent
+      // delivery still earns a line — it names somewhere the reader cannot see.
       render(
         <ConciergeThread
           messages={[
             {
               ...mine,
-              receipt: { target: "sparkle", redirectable: true, agentName: "Kraken Auth" },
+              receipt: { target: "agent", redirectable: true, agentName: "Kraken Auth" },
             },
           ]}
           onNudgeClick={noop}
@@ -208,8 +212,8 @@ describe("ConciergeThread — copy affordances", () => {
       const receipt = screen.getByTestId("routing-receipt");
       expect(receipt.contains(copy)).toBe(false);
       expect(copy.compareDocumentPosition(receipt) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-      // The redirect button is still reachable and still the receipt's own.
-      expect(receipt.querySelector('[data-testid="routing-redirect"]')).toBeTruthy();
+      // And the receipt hosts no control any more — the "Also ask" affordance was removed.
+      expect(receipt.querySelector('[data-testid="routing-redirect"]')).toBeNull();
     });
 
     it("copies the SENT text of a message that addressed an agent, with no internal id in it", async () => {

@@ -1,15 +1,24 @@
-// The routing receipt: the one-line "→ where your message went" under a user bubble, plus the
-// one-tap redirect (PRD/sparkle/concierge-auto-routing.md §3).
+// The routing receipt: the one-line "→ where your message went" under a user bubble
+// (PRD/sparkle/concierge-auto-routing.md §3).
 //
 // WHY THIS EXISTS. The compose box used to make the user pick a target before sending. That was
-// removed in favour of inference, and inference is only defensible because this line is here: a
-// misroute the user can SEE and fix in one click is recoverable, a silent one is not. If this
-// component is ever deleted, the target toggle has to come back with it.
+// removed in favour of inference, and this line is what keeps inference honest: a misroute the user
+// can SEE is at least recoverable by hand, a silent one is not. If this component is ever deleted,
+// the target toggle has to come back with it.
 //
-// A REDIRECT RE-SENDS; IT NEVER RETRACTS. Text already written into a PTY cannot be pulled back,
-// so nothing here may say "moved", "instead of", "undone", or anything else implying the first
-// delivery didn't happen. Once redirected, the line states BOTH destinations in the order they
-// happened. `receiptText` is pure and exported so that wording is pinned by tests rather than by
+// THE ONE-TAP REDIRECT IS GONE (founder, 2026-08-04), and the header used to promise it: "a
+// misroute the user can see and fix in ONE CLICK". It no longer can — the "Also ask" pill was
+// removed and nothing replaced its function, so seeing the misroute and re-sending by hand is the
+// whole of the recovery story now. Stated plainly here because the sentence it replaces was the
+// stated justification for removing the target toggle, and a future agent reading it would conclude
+// a safety net exists that does not.
+//
+// A REDIRECT RE-SENDS; IT NEVER RETRACTS. `alsoSentTo` receipts still exist on rehydrated threads
+// and on anything a future re-surfacing produces, so the rule stands: nothing here may say "moved",
+// "instead of", "undone", or anything else implying the first delivery didn't happen. The line
+// states every delivery the reader CANNOT otherwise see — both, in order, for an agent-first
+// redirect; only the agent for a sparkle-first one, where the first delivery is the reply already
+// on screen. `receiptText` is pure and exported so that wording is pinned by tests rather than by
 // good intentions.
 import { C } from "../../theme/colors";
 import type { ConciergeReceipt } from "./types";
@@ -79,32 +88,29 @@ export function receiptText(r: ConciergeReceipt): string | null {
   return `→ ${first}, then to ${place(r.alsoSentTo, r.agentName)}`;
 }
 
-/** The redirect button's label: the destination it has NOT gone to yet. Null when there is
- *  nowhere else to send it (no build agent in view), so the button is omitted rather than
- *  offering a target that doesn't exist. */
-export function redirectLabel(r: ConciergeReceipt): string | null {
-  if (r.alsoSentTo) return null; // already sent both ways — nothing left to offer
-  // "Also" — the button is the one place the user reads the promise BEFORE acting, so it must not
-  // say "instead" when the first delivery stands. The same no-retraction rule receiptText is
-  // tripwired against applies here, and this label used to break it.
-  if (r.target === "sparkle") return r.agentName ? `Also ask ${r.agentName}` : null;
-  return "Also ask Sparkle";
-}
+// THE "Also ask" AFFORDANCE IS DELETED (founder, 2026-08-04): *"the pill that says 'Also ask' — you
+// can just take that out completely. What we're talking about would REPLACE that."* The strip
+// beneath a message carries the per-message status now (./MessageStatus), which is the replacement.
+//
+// `redirectLabel` went with it. `onRedirect` remains on the props so callers need not change in
+// lockstep, but NOTHING IN THE UI CALLS IT any more — the host-side redirect path is unreachable as
+// of this change and should be removed rather than left as a dead branch (tracked as a bead).
 
 export function RoutingReceipt({
   receipt,
-  onRedirect,
 }: {
   receipt: ConciergeReceipt;
+  /** RETAINED ON THE TYPE, NOT DESTRUCTURED. Every caller still passes it (ConciergeMessageRow →
+   *  ConciergeThread → ConciergeColumn), so removing it from the props would be a four-file change
+   *  for a prop that is about to be deleted outright with the host-side redirect (sparkle-s15al).
+   *  Binding it here would be an unused-var lint error, which is what it was after the button went. */
   onRedirect?: () => void;
 }) {
-  const label = redirectLabel(receipt);
-  const showButton = !!onRedirect && !!label && receipt.redirectable;
   const text = receiptText(receipt);
-  // THE ROW STAYS MOUNTED even with nothing to say. It is the redirect button's host — "Also ask
-  // <agent>" is offered on exactly the ordinary concierge answers whose TEXT was just removed — and
-  // removing the element as well would take the button with it on every one of them. Only the
-  // sentence goes; the affordance does not.
+  // NOTHING TO SAY, NOTHING DRAWN. The row used to stay mounted with no text because it hosted the
+  // redirect button; with that gone there is nothing left to host, so an empty receipt would be an
+  // empty strip — and that strip belongs to the per-message status.
+  if (!text) return null;
   return (
     <div
       data-testid="routing-receipt"
@@ -124,25 +130,7 @@ export function RoutingReceipt({
         flexWrap: "wrap",
       }}
     >
-      {text && <span>{text}</span>}
-      {showButton && (
-        <button
-          type="button"
-          data-testid="routing-redirect"
-          onClick={onRedirect}
-          style={{
-            fontSize: 12,
-            color: C.cream,
-            background: "transparent",
-            border: `1px solid color-mix(in srgb, ${C.muted} 35%, transparent)`,
-            borderRadius: 6,
-            padding: "2px 7px",
-            cursor: "pointer",
-          }}
-        >
-          {label}
-        </button>
-      )}
+      <span>{text}</span>
     </div>
   );
 }

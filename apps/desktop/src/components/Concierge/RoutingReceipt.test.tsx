@@ -4,9 +4,9 @@
 // header), so its wording is treated as a correctness concern, not copy. The retraction tripwire
 // below is the important one: a redirect RE-SENDS, and text already in a PTY cannot be pulled
 // back, so any wording implying otherwise is a lie to the user about what the app did.
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { RoutingReceipt, receiptText, redirectLabel } from "./RoutingReceipt";
+import { RoutingReceipt, receiptText } from "./RoutingReceipt";
 import type { ConciergeReceipt } from "./types";
 
 afterEach(() => cleanup());
@@ -29,13 +29,22 @@ describe("receiptText", () => {
     expect(receiptText({ target: "agent" })).toBe("→ Sent to the agent");
   });
 
-  it("states BOTH destinations in order once redirected", () => {
+  // SPLIT INTO TWO ROWS (roborev 58076), because the two arms now pin OPPOSITE contracts and one
+  // title cannot be true of both: an agent-first redirect states both destinations in order, a
+  // sparkle-first one states exactly one and no order. A single row titled "states BOTH destinations"
+  // answered "is the both-destinations rule still pinned?" with a yes that was only half true.
+  it("states BOTH destinations in order when an agent-bound message is redirected into chat", () => {
     expect(receiptText({ target: "agent", agentName: "Kraken Auth", alsoSentTo: "sparkle" })).toBe(
       "→ Sent to Kraken Auth, then to here",
     );
+  });
+
+  it("states ONLY the agent delivery when a chat answer is redirected into an agent", () => {
+    // The sparkle half goes too (founder, unqualified). Only the delivery the reader cannot see is
+    // stated — the concierge's own reply is already on screen — and with no first term there is no
+    // "then" to write: a bare "then to X" would read as a correction of a delivery this line no
+    // longer mentions, which is the retraction the module header forbids.
     expect(receiptText({ target: "sparkle", agentName: "Kraken Auth", alsoSentTo: "agent" })).toBe(
-      // The sparkle half goes too (founder, unqualified). Only the delivery the reader cannot see
-      // is stated — and with no first term there is no "then" to write.
       "→ Sent to Kraken Auth",
     );
   });
@@ -52,44 +61,13 @@ describe("receiptText", () => {
   });
 });
 
-describe("redirectLabel", () => {
-  it("offers Sparkle when the message went to an agent", () => {
-    expect(redirectLabel({ target: "agent", agentName: "Kraken Auth" })).toBe("Also ask Sparkle");
-  });
-
-  it("offers the agent by name when the message stayed in chat", () => {
-    expect(redirectLabel({ target: "sparkle", agentName: "Kraken Auth" })).toBe(
-      "Also ask Kraken Auth",
-    );
-  });
-
-  // The button is the one place the user reads the promise BEFORE acting, so the no-retraction rule
-  // applies to it at least as strongly as to the receipt line. It used to say "instead" — the exact
-  // word receiptText is tripwired against (roborev 53043).
-  it("never implies the original delivery will be undone", () => {
-    const labels = [
-      redirectLabel({ target: "agent", agentName: "Kraken Auth" }),
-      redirectLabel({ target: "sparkle", agentName: "Kraken Auth" }),
-    ];
-    for (const l of labels) {
-      expect(l).not.toMatch(/instead|moved|undone|unsent|cancell?ed|rather than/i);
-    }
-  });
-
-  // Offering a redirect with nowhere to redirect TO would be a dead button.
-  it("offers nothing when a chat answer has no agent to redirect to", () => {
-    expect(redirectLabel({ target: "sparkle" })).toBeNull();
-  });
-
-  it("offers nothing once the message has gone both ways", () => {
-    expect(
-      redirectLabel({ target: "agent", agentName: "Kraken Auth", alsoSentTo: "sparkle" }),
-    ).toBeNull();
-  });
-});
 
 describe("RoutingReceipt — rendering", () => {
-  it("renders the button and reports the click when redirectable", () => {
+  // THE "Also ask" BUTTON IS GONE (founder: *"you can just take that out completely"*). Asserted as
+  // an ABSENCE on the receipt that would previously have shown it, rather than by deleting these
+  // cases: a suite with no case here could not tell "removed on purpose" from "quietly regressed",
+  // and this affordance has been asked about twice.
+  it("renders no button even on a redirectable receipt — the affordance was removed", () => {
     const onRedirect = vi.fn();
     render(
       <RoutingReceipt
@@ -97,26 +75,24 @@ describe("RoutingReceipt — rendering", () => {
         onRedirect={onRedirect}
       />,
     );
-    fireEvent.click(screen.getByTestId("routing-redirect"));
-    expect(onRedirect).toHaveBeenCalledTimes(1);
-  });
-
-  // Only the LATEST receipt is redirectable — redirecting a message from ten turns ago is never
-  // what the user means, and a thread full of live buttons invites exactly that misfire.
-  it("renders the line but no button on a stale receipt", () => {
-    render(
-      <RoutingReceipt
-        receipt={{ target: "agent", agentName: "Kraken Auth" }}
-        onRedirect={vi.fn()}
-      />,
-    );
     expect(screen.getByTestId("routing-receipt").textContent).toContain("Kraken Auth");
     expect(screen.queryByTestId("routing-redirect")).toBeNull();
+    expect(onRedirect).not.toHaveBeenCalled();
   });
 
-  it("renders no button when the host supplies no redirect handler", () => {
-    render(<RoutingReceipt receipt={{ target: "agent", agentName: "Kraken Auth", redirectable: true }} />);
-    expect(screen.queryByTestId("routing-redirect")).toBeNull();
+  // The LINE still earns its place: it names a delivery the reader cannot see.
+  it("still states an agent delivery", () => {
+    render(
+      <RoutingReceipt receipt={{ target: "agent", agentName: "Kraken Auth" }} onRedirect={vi.fn()} />,
+    );
+    expect(screen.getByTestId("routing-receipt").textContent).toContain("Kraken Auth");
+  });
+
+  // …and a sparkle-answered message has NO receipt element at all now — not an empty strip. That
+  // space belongs to the per-message status (./MessageStatus).
+  it("renders nothing at all for a message Sparkle answered itself", () => {
+    render(<RoutingReceipt receipt={{ target: "sparkle", redirectable: true }} onRedirect={vi.fn()} />);
+    expect(screen.queryByTestId("routing-receipt")).toBeNull();
   });
 });
 
@@ -166,9 +142,12 @@ describe("receiptText — a displaced turn renders the ordinary receipt, never '
   // The row still MOUNTS — it hosts the redirect button — but it now carries no sentence, so the
   // deleted claim cannot appear in it. Asserting the text is EMPTY is the stronger form of the
   // original "does not contain 'never answered'".
-  it("renders no receipt text for a displaced concierge turn", () => {
+  // STRONGER THAN IT WAS: this asserted an EMPTY receipt element, because the row stayed mounted to
+  // host the redirect button. With that button deleted there is nothing left to host, so the element
+  // is absent entirely — no empty strip above the per-message status.
+  it("renders no receipt at all for a displaced concierge turn", () => {
     render(<RoutingReceipt receipt={{ target: "sparkle", unanswered: true }} />);
-    expect((screen.getByTestId("routing-receipt").textContent ?? "").trim()).toBe("");
+    expect(screen.queryByTestId("routing-receipt")).toBeNull();
   });
 
   // The no-retraction rule the rest of this file is tripwired against still applies: the message

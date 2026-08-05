@@ -1432,10 +1432,16 @@ describe("ConciergeHost — routing receipts", () => {
   // self-evident from the reply appearing directly beneath it, so the line was noise on every turn.
   // The receipt ROW stays — it hosts the redirect — so this pins the row present and the sentence
   // absent, which is exactly the change and would fail if either half regressed.
-  it("shows no receipt sentence when the concierge answered in place", async () => {
+  // NO RECEIPT ELEMENT AT ALL now, not merely no sentence. The row previously survived an empty
+  // sentence because it hosted the "Also ask" redirect; with that button removed there is nothing
+  // left to host, and that strip belongs to the per-message status (Concierge/MessageStatus).
+  it("shows no receipt at all when the concierge answered in place", async () => {
     renderWithTarget();
     await send("what's going on?");
-    expect(await within(thread()).findByTestId("routing-receipt")).toBeTruthy();
+    // The bubble is the settle signal: `send` awaits routing, so once the user's message is in the
+    // thread the receipt (if any) has been stamped.
+    expect(await within(thread()).findByTestId("you-bubble")).toBeTruthy();
+    expect(within(thread()).queryByTestId("routing-receipt")).toBeNull();
     expect(within(thread()).queryByText(/Answered here/)).toBeNull();
   });
 
@@ -1450,62 +1456,8 @@ describe("ConciergeHost — routing receipts", () => {
     expect(within(thread()).queryByTestId("routing-receipt")).toBeNull();
   });
 
-  it("redirects a chat answer into the agent, on one click", async () => {
-    renderWithTarget();
-    await send("was that right?");
-    // Wait on the redirect BUTTON rather than the removed receipt sentence — it is what this row is
-    // about to click, so it is the honest thing to wait for.
-    await within(thread()).findByTestId("routing-redirect");
-    await act(async () => {
-      fireEvent.click(screen.getByTestId("routing-redirect"));
-    });
-    await settle();
-    expect(h.dispatchConciergeAnswer).toHaveBeenCalledWith("ag1", "was that right?", {
-      // The user tapped redirect on THIS message's receipt.
-      authority: { kind: "redirect", receiptId: expect.any(String) },
-      userPrompt: true,
-      display: "was that right?",
-      namingBasis: "was that right?",
-      // TRUE, and this is the ONE send in this file for which it is (roborev 55418). A redirect is a
-      // replay of a COMPOSED message, and unlike an addressed send it does not arm a cancellable
-      // intent — it dispatches on one tap. So it may never be collapsed into a picker keystroke: a
-      // bare "1" redirected at a waiting agent would otherwise select the first row of a picker the
-      // user never read. The countdown sends below keep `false`; only the redirect path changed.
-      neverPickerAnswer: true,
-    });
-  });
 
-  it("redirects an agent-bound message into the chat, on one click", async () => {
-    routeToAgent();
-    renderWithTarget();
-    await send("add retry logic");
-    await within(thread()).findByText("→ Sent to CI Hardening");
-    await act(async () => {
-      fireEvent.click(screen.getByTestId("routing-redirect"));
-    });
-    await settle();
-    expect(h.startConciergeTurn).toHaveBeenCalledTimes(1);
-  });
 
-  // A redirect RE-SENDS; it never retracts. Text already in a PTY cannot be pulled back, so the
-  // line must state BOTH destinations in the order they happened — and the button is consumed,
-  // because a message that has gone both ways has nowhere left to go.
-  it("records BOTH destinations after a redirect, and retires the button", async () => {
-    renderWithTarget();
-    await send("both ways");
-    await act(async () => {
-      fireEvent.click(screen.getByTestId("routing-redirect"));
-    });
-    await settle();
-    // ONLY the agent delivery is stated now: "Answered here" was removed on the founder's
-    // instruction, and with its first term gone there is no sequence left for "then" to describe —
-    // a bare "then to X" would read as a correction of a delivery the line no longer mentions,
-    // which is the retraction this case's own header forbids. The no-retraction assertion below is
-    // unchanged and still the point.
-    expect(await within(thread()).findByText("→ Sent to CI Hardening")).toBeTruthy();
-    expect(screen.queryByTestId("routing-redirect")).toBeNull();
-    expect(within(thread()).queryByText(/instead|moved|undone/i)).toBeNull();
-  });
 
   // With the target pill gone the receipt is the ONLY routing signal a screen-reader user gets, so
   // rendering it without announcing it would leave them with nothing.
@@ -1516,71 +1468,9 @@ describe("ConciergeHost — routing receipts", () => {
     expect(screen.getByTestId("concierge-announcer").textContent).toBe("→ Sent to CI Hardening");
   });
 
-  it("leaves only the latest receipt redirectable", async () => {
-    renderWithTarget();
-    await send("first");
-    await send("second");
-    expect(screen.getAllByTestId("routing-receipt").length).toBe(2);
-    expect(screen.getAllByTestId("routing-redirect").length).toBe(1);
-  });
 
-  // The relay is async and the button stays mounted until the receipt updates, so an impatient
-  // second click passed the alsoSentTo guard twice and wrote the same text into the terminal
-  // twice — irreversible, with the receipt still reading as a single redirect.
-  it("a double-tap on the redirect delivers ONCE", async () => {
-    renderWithTarget();
-    await send("only once please");
-    const button = screen.getByTestId("routing-redirect");
-    await act(async () => {
-      fireEvent.click(button);
-      fireEvent.click(button);
-    });
-    await settle();
-    await settle();
-    expect(h.dispatchConciergeAnswer).toHaveBeenCalledTimes(1);
-  });
 
-  // The label ("Also ask CI Hardening") is an explicit promise made BEFORE the click, and the
-  // selection moves for reasons unrelated to this thread.
-  it("delivers to the agent the BUTTON NAMED, even after the selection moves", async () => {
-    const { rerender } = renderWithTarget();
-    await send("for CI Hardening");
-    const feed2 = feedWith("approval") as ConciergeFeed;
-    (feed2.projects[0]!.agents as unknown[]).push({
-      ...feed2.projects[0]!.agents[0]!,
-      id: "other",
-      name: "Something Else",
-    });
-    h.feed = feed2;
-    await act(async () => {
-      rerender(
-        <ConciergeHost
-          feed={feed2}
-          promptTarget={{ projectId: "p1", agentId: "other", name: "Something Else" }}
-        />,
-      );
-    });
-    await act(async () => {
-      fireEvent.click(screen.getByTestId("routing-redirect"));
-    });
-    await settle();
-    expect(h.dispatchConciergeAnswer.mock.calls[0]![0]).toBe("ag1");
-  });
 
-  it("says so rather than silently dropping a redirect whose agent has closed", async () => {
-    const { rerender } = renderWithTarget();
-    await send("nowhere to go");
-    const empty = { projects: [], counts: EMPTY_COUNTS, scopedCounts: EMPTY_COUNTS, pinnedProjectId: null };
-    await act(async () => {
-      rerender(<ConciergeHost feed={empty as unknown as ConciergeFeed} promptTarget={null} />);
-    });
-    await act(async () => {
-      fireEvent.click(screen.getByTestId("routing-redirect"));
-    });
-    await settle();
-    expect(await findInThread(/isn't open any more, so I couldn't pass the message along/)).toBeTruthy();
-    expect(h.dispatchConciergeAnswer).not.toHaveBeenCalled();
-  });
 });
 
 // The recommended-action row, re-homed above the compose box (PRD §4). Real build agents lost their

@@ -279,67 +279,9 @@ describe("ConciergeHost — a terse answer, a live picker on screen, and files s
     expect(askedSparkle()[0]).not.toContain("/tmp/");
   });
 
-  // ══ THE THIRD PATH TO A PTY: THE RECEIPT'S REDIRECT ══════════════════════════════════════════
-  // "Also ask <agent>" replays the wire payload into the agent's terminal, and unlike an addressed
-  // send it does NOT arm a visible, cancellable intent — it calls promptAgent directly, so one tap
-  // dispatches irreversibly. It therefore may never press a button: every redirect declares
-  // `neverPickerAnswer` (roborev 55418).
-  it("declares the redirect of an attachment-carrying answer a NON-answer", async () => {
-    h.answersLivePicker.mockReturnValue(true);
-    await attachImage();
-    await send("Yes");
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Also ask CI Hardening" }));
-    });
-    await flush();
-    expect(h.dispatch).toHaveBeenCalledTimes(1);
-    expect(h.dispatch.mock.calls[0]![1]).toContain("/tmp/shot.png");
-    expect(h.dispatch.mock.calls[0]![2]).toMatchObject({ neverPickerAnswer: true });
-  });
 
-  // INVERTED, not deleted (this row used to assert `false`). It pinned the behaviour the review
-  // showed was unsafe, so it now pins the fix — which is what keeps the hazard from coming back.
-  it("…and so does a FILE-LESS redirect: a replay may not press a button either", async () => {
-    h.answersLivePicker.mockReturnValue(true);
-    await send("Yes");
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Also ask CI Hardening" }));
-    });
-    await flush();
-    expect(h.dispatch.mock.calls[0]![2]).toMatchObject({ neverPickerAnswer: true });
-  });
 
-  it("THE HAZARD: a redirected bare number does not select a row of a picker nobody read", async () => {
-    // The concrete failure the blanket rule exists for. `matchAnswerToOption` resolves a bare number
-    // by 1-based ON-SCREEN POSITION, so with the old carve-out this sequence pressed a button: the
-    // concierge lists options in CHAT, the user types "1" to pick one, the router sends it to Sparkle
-    // (it can no longer route at an agent), the receipt offers "Also ask CI Hardening", and they tap
-    // it to pass their choice along — selecting the FIRST ROW of that agent's unrelated picker. The
-    // button's label promises to ASK, not to press.
-    h.answersLivePicker.mockReturnValue(true);
-    await send("1");
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Also ask CI Hardening" }));
-    });
-    await flush();
-    expect(h.dispatch).toHaveBeenCalledTimes(1);
-    expect(h.dispatch.mock.calls[0]![2]).toMatchObject({ neverPickerAnswer: true });
-  });
 
-  it("an ATTACHMENTS-ONLY send has a working redirect, not a dead button", async () => {
-    // `send` stores "" for a message that is nothing but a file, and the receipt still renders "Also
-    // ask <agent>" for it — so a FALSY guard on the remembered text returned before anything
-    // dispatched and the button did nothing at all, twice if the user tapped again (roborev 55418).
-    await attachImage();
-    await send("");
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Also ask CI Hardening" }));
-    });
-    await flush();
-    expect(h.dispatch).toHaveBeenCalledTimes(1);
-    expect(h.dispatch.mock.calls[0]![1]).toContain("/tmp/shot.png");
-    expect(h.dispatch.mock.calls[0]![2]).toMatchObject({ neverPickerAnswer: true });
-  });
 
   // STRUCTURAL, and the reason it is worth an assertion: the predicate still exists and is still
   // exported, so the cheapest way to re-introduce the drop is to consult it here again. The host
