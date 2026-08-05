@@ -10,7 +10,7 @@ import {
   termInk,
   termMuted,
 } from "./terminalChrome";
-import type { AgentTab, Project } from "../types";
+import type { AgentTab, Project, Runtime } from "../types";
 import {
   prepareAgentWorkspace,
   installWorktreeGuard,
@@ -166,6 +166,13 @@ interface SpawnCmd {
   // Whether this spawn resumes a prior Claude session (`claude --resume`) vs starts fresh. Passed to
   // the Terminal so its loading affordance reads "Resuming conversation…" vs "Starting Claude…".
   resuming: boolean;
+  // The runtime this command was BUILT FOR. A cloud spawn is a placeholder (empty argv — CloudTransport
+  // ignores it and attaches to the server session); a local spawn is the real argv a LocalTransport
+  // executes. The render below refuses to mount Terminal with a LOCAL runtime while `spawn` is still a
+  // cloud placeholder, so a cloud→local flip cannot spawn the empty command on a real PTY before
+  // prepare() rebuilds it (see the mount gate). See the deps note on the prepare() effect for why the
+  // flip re-runs prepare() at all.
+  runtime: Runtime;
 }
 
 function AgentPaneInner({
@@ -451,7 +458,7 @@ function AgentPaneInner({
     // CloudTransport) and attaches over the relay. command/args/cwd here are placeholders the cloud
     // transport ignores. (Creating the server session + re-attach reconciliation is W5's scope.)
     if (agent.runtime === "cloud") {
-      setSpawn({ command: SHELL, args: [], cwd: project.rootPath, resuming: false });
+      setSpawn({ command: SHELL, args: [], cwd: project.rootPath, resuming: false, runtime: "cloud" });
       setPhase("ready");
       return;
     }
@@ -475,6 +482,7 @@ function AgentPaneInner({
         args: buildShellSpawnArgs(SHELL, cmd),
         cwd: project.rootPath,
         resuming: false, // a raw command run, never a Claude session resume
+        runtime: "local", // reached only past the runtime === "cloud" early return above
       });
       setPhase("ready");
       return;
@@ -806,6 +814,7 @@ function AgentPaneInner({
               control,
             }),
             resuming: resume,
+            runtime: "local", // build agents reach here only past the runtime === "cloud" early return
           });
           perfMark(agent.id, "spawn assembled (build)");
           setPhase("ready");
@@ -841,6 +850,7 @@ function AgentPaneInner({
         args: ["-l", "-c", exec],
         cwd: wt.path,
         resuming: resume,
+        runtime: "local", // worker/generic reach here only past the runtime === "cloud" early return
       });
       perfMark(agent.id, "spawn assembled");
       setPhase("ready");
@@ -879,9 +889,24 @@ function AgentPaneInner({
         );
       }
     };
-    // Prepare once per agent (agent.id is stable for this component's life).
+    // Re-prepare on identity OR runtime change. `agent.id` is stable for this component's life, so
+    // for a given pane this is really "re-run when the agent flips cloud↔local". prepare() branches
+    // on `agent.runtime` at its very top (a cloud agent ATTACHES with a placeholder command; a local
+    // agent SPAWNS the real one), so a runtime flip that kept the id — the store mints a new agent
+    // object but reuses the id — used to leave the effect dormant and the spawn command stale, built
+    // for the OLD runtime (a cloud→local flip attached with the empty cloud placeholder instead of
+    // spawning locally). Adding `agent.runtime` makes the flip tear down the old runtime's bridge +
+    // hook watcher (the cleanup above) and rebuild for the new one.
+    //
+    // This cannot loop: `agent.runtime` is a value-compared string enum, so the effect re-runs only
+    // when it actually changes, and prepare() never writes `agent.runtime` (it reads it to branch and
+    // writes only local state / stores keyed elsewhere) — the field is owned by the agents store and
+    // only a user/app cloud↔local toggle changes it. An ordinary re-render (sibling store write,
+    // theme flip, a new agent object with the same id+runtime) leaves both deps unchanged and does
+    // NOT re-run. The eslint-disable stays because prepare() still closes over dozens of values we
+    // deliberately do NOT want to re-prepare on — only id and runtime are re-prepare triggers.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [agent.id]);
+  }, [agent.id, agent.runtime]);
 
   // Manual override: pin this agent to a specific account. Updates the displayed badge immediately;
   // the pinned account actually takes effect on the NEXT spawn (a re-prepare / reopen) — we don't
@@ -905,10 +930,39 @@ function AgentPaneInner({
   // (roborev 46924); a successful Retry re-enters the prepare flow and republishes. On unmount the
   // entry goes AND any prompt still held for this agent is dropped: the pane is gone for good, so
   // delivering it into a later reincarnation would be worse than losing it.
+  // Mount Terminal only when `spawn` was built for the runtime we are NOW showing — specifically,
+  // never mount a LOCAL runtime against a spawn still built for cloud. Terminal SELECTS its transport
+  // by `runtime` and, on a runtime flip, its own effect re-binds BEFORE this parent's prepare() re-runs
+  // (React fires child effects before parent effects). For a cloud→local flip that means a LocalTransport
+  // would `spawn()` the cloud PLACEHOLDER argv (empty) on a real PTY before prepare() rebuilds the real
+  // local command. Gating the mount here holds Terminal off the local command until `spawn.runtime ===
+  // "local"`, so the pane shows the "preparing" placeholder for the one render the rebuild takes and then
+  // mounts Terminal ONCE against the correct argv. The reverse flip (local→cloud promotion) is
+  // deliberately NOT gated: CloudTransport ignores command/args, so its in-place re-bind is correct and
+  // rebinding-not-remounting is what preserves the promoted pane's scrollback (Terminal.transportRebind
+  // .test.tsx). Both directions still require prepare() to re-run on the flip — the `agent.runtime` dep
+  // on the prepare() effect above.
+  const spawnMatchesTargetRuntime = !!spawn && !(agent.runtime === "local" && spawn.runtime !== "local");
+
+  // Publish this pane's PTY readiness so the concierge send path can tell "still coming up" (queue
+  // the prompt) from "the process exited" (fail it truthfully) — see services/paneReadiness. A
+  // GIVEN-UP pane (spawn error / Claude missing) publishes `failed` so a prompt sent AFTER the
+  // pane settled there fails truthfully instead of re-queuing into a hold nobody will ever drain
+  // (roborev 46924); a successful Retry re-enters the prepare flow and republishes. On unmount the
+  // entry goes AND any prompt still held for this agent is dropped: the pane is gone for good, so
+  // delivering it into a later reincarnation would be worse than losing it.
+  //
+  // The signal is DERIVED (`ptyReady && spawnMatchesTargetRuntime`), not a flag we flip: on a
+  // cloud→local flip the terminal is gated off (spawn still cloud) so this reads not-ready for the one
+  // render prepare() takes to rebuild — republishing "starting" so a prompt in that window is QUEUED,
+  // not dropped as `pty-gone` — and it SELF-HEALS to ready when the rebuilt local spawn matches and the
+  // remounted Terminal's onReady fires. Deriving (rather than an unconditional setPtyReady(false) in
+  // prepare()) is what avoids latching not-ready on a same-runtime early-return re-prepare, where
+  // nothing remounts Terminal to clear a reset flag (roborev 58063).
   useEffect(() => {
     if (phase === "error" || phase === "no-claude") setPaneFailed(agent.id);
-    else setPaneReady(agent.id, ptyReady);
-  }, [agent.id, ptyReady, phase]);
+    else setPaneReady(agent.id, ptyReady && spawnMatchesTargetRuntime);
+  }, [agent.id, ptyReady, phase, spawnMatchesTargetRuntime]);
   useEffect(
     () => () => {
       unregisterPane(agent.id);
@@ -1100,7 +1154,7 @@ function AgentPaneInner({
               whatever `phase` is rendering — a file dropped while the workspace is still preparing
               is staged just the same, so refusing to say so would be the misleading half. */}
           {terminalDrop.dropActive && <TerminalDropOverlay agentName={agent.name} />}
-          {phase === "ready" && spawn ? (
+          {phase === "ready" && spawn && spawnMatchesTargetRuntime ? (
           <div
             style={{
               position: "absolute",

@@ -338,6 +338,11 @@ describe("the cut guard compares the sandbox's live head to the handoff's pushed
     const msg = res.ok === false ? res.message : "";
     expect(msg).toMatch(/safe in the sandbox/i);
     expect(msg).toMatch(/demote again/i);
+    // ccgz8: the remedy has to be SAFE under the very condition that triggered the refusal. The
+    // guard fires because the cloud agent is STILL committing, so a bare "demote again" can lose
+    // the same race on the next pass. The copy must therefore tell the user to wait for the agent
+    // to go idle first — otherwise it hands them back into the loop the guard just caught.
+    expect(msg).toMatch(/idle/i);
   });
 });
 

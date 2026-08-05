@@ -287,6 +287,88 @@ describe("refusals and failures", () => {
     expect(screen.getByTestId("demote-failure-cloud-note")).toBeTruthy();
     expect(screen.queryByTestId("demote-failure-indeterminate")).toBeNull();
   });
+
+  // ccgz8: the HEAD-guard refusal fires BECAUSE the cloud agent is still committing, so a bare
+  // "bring it down again" can lose the same race. The remedy the user reads must tell them to wait
+  // for the agent to be idle first — a remedy that is safe under the condition that triggered it.
+  it("tells the user to wait for the cloud agent to be idle before retrying a HEAD-guard refusal", async () => {
+    mount(okPlan(), async () => ({
+      ok: false,
+      step: "cutover",
+      message: "the sandbox committed after the push",
+    }));
+    fireEvent.click(await screen.findByTestId("demote-confirm"));
+    const note = (await screen.findByTestId("demote-cut-guard-note")).textContent!;
+    expect(note).toMatch(/idle/i);
+    expect(note).toMatch(/race/i);
+  });
+});
+
+// s6vsf: the confirm button doubles as the retry affordance, and a full-emphasis "Bring down to
+// local" is UNSAFE under the two failures whose copy says not to retry — an orphan (the cut already
+// happened here) and a throw mid-cut (the delete may already have fired). Following it re-runs a
+// partially-applied, destructive move. In those states the button must become a Close action; in
+// genuinely retry-safe states it must stay a retry. These assert the actual rendered control, not a
+// flag.
+describe("the retry button is offered only where retry is safe (s6vsf)", () => {
+  const orphanFailure = async () =>
+    ({
+      ok: false,
+      step: "cutover",
+      message: "the delete failed",
+      orphanedSessionId: "sess-abc",
+    }) as DemoteResult;
+
+  const thrownDuringCut: DemoteToLocalDeps["demote"] = async ({ onStep }) => {
+    onStep("cutover");
+    throw new Error("socket died");
+  };
+
+  it("replaces retry with a Close action after an ORPHAN, and Close dismisses the dialog", async () => {
+    const { onClose } = mount(okPlan(), orphanFailure);
+    // The button starts as the retry/confirm control; clicking it starts the run that then fails.
+    fireEvent.click(await screen.findByTestId("demote-confirm"));
+    // After the non-retryable failure the retry control is GONE — not merely disabled — and a Close
+    // action stands in its place.
+    const dismiss = (await screen.findByTestId("demote-dismiss")) as HTMLButtonElement;
+    expect(dismiss.textContent).toMatch(/close/i);
+    expect(dismiss.disabled).toBe(false);
+    expect(screen.queryByTestId("demote-confirm")).toBeNull();
+    // And it is a real dismiss, not a relabelled retry: pressing it closes the dialog.
+    fireEvent.click(dismiss);
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("replaces retry with a Close action after a THROW during the cut", async () => {
+    mount(okPlan(), thrownDuringCut);
+    fireEvent.click(await screen.findByTestId("demote-confirm"));
+    // The indeterminate note is the one that says "don't just try again"; the button under it must
+    // not be a retry.
+    await screen.findByTestId("demote-failure-indeterminate");
+    expect((await screen.findByTestId("demote-dismiss")).textContent).toMatch(/close/i);
+    expect(screen.queryByTestId("demote-confirm")).toBeNull();
+  });
+
+  it("KEEPS the retry button for a structured HEAD-guard cutover refusal (retry is safe there)", async () => {
+    mount(okPlan(), async () => ({
+      ok: false,
+      step: "cutover",
+      message: "the sandbox committed after the push",
+    }));
+    fireEvent.click(await screen.findByTestId("demote-confirm"));
+    // This refusal's own remedy is to demote again, so the retry control must survive it…
+    expect((await screen.findByTestId("demote-confirm")).textContent).toMatch(/bring down to local/i);
+    // …and NOT be swapped for a Close.
+    expect(screen.queryByTestId("demote-dismiss")).toBeNull();
+  });
+
+  it("KEEPS the retry button for an ordinary post-handoff failure", async () => {
+    mount(okPlan(), async () => ({ ok: false, step: "land", message: "dirty: src/a.ts" }));
+    fireEvent.click(await screen.findByTestId("demote-confirm"));
+    await screen.findByTestId("demote-error");
+    expect(screen.getByTestId("demote-confirm").textContent).toMatch(/bring down to local/i);
+    expect(screen.queryByTestId("demote-dismiss")).toBeNull();
+  });
 });
 
 describe("progress and success", () => {

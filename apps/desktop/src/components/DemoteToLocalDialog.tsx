@@ -213,6 +213,27 @@ export function DemoteToLocalDialog({
   const agentLabel = agent.name || "this agent";
   const running = step !== null;
 
+  // The retry affordance is UNSAFE in exactly the two failure states whose own copy tells the user
+  // NOT to try again — the same two the failure panel REPLACES the "you can try again" note for:
+  //
+  //   • an ORPHAN (`orphanedSessionId`) — the cut already happened on this side, the local agent is
+  //     live on this branch, and only the sandbox delete failed. A second demotion would hand off
+  //     and land the SAME work a second time.
+  //   • a THROW during `cutover` (`thrown && step === "cutover"`) — the cut was in flight and we
+  //     cannot say whether the delete fired, so a retry could re-run a partially-applied destructive
+  //     move.
+  //
+  // In both, the primary button used to be a full-emphasis "Bring down to local" retry sitting
+  // directly under a sentence saying not to press it (disabled only WHILE running, i.e. never once
+  // the failure is on screen). There it becomes a Close action instead. Every OTHER failure —
+  // preflight, handoff, the PUSHED_BEFORE steps, and the STRUCTURED HEAD-guard `cutover` refusal
+  // whose own remedy is "demote again" — is genuinely retry-safe (the cloud agent is still running
+  // and nothing was deleted) and keeps the retry button.
+  const retryUnsafe =
+    failure !== null &&
+    (failure.orphanedSessionId != null ||
+      (failure.thrown === true && failure.step === "cutover"));
+
   // THE LIVE STEP, IN A REF, and not for convenience. `confirm`'s `catch` runs inside the closure
   // created at the render where the button was clicked — where `step` is necessarily `null`, since
   // `confirm` returns early when `running`. `setStep` re-renders the component but never updates
@@ -509,7 +530,9 @@ export function DemoteToLocalDialog({
                         <div style={note} data-testid="demote-cut-guard-note">
                           The cloud agent committed something after its work was pushed, so the
                           handover stopped rather than shutting it down. That commit is safe in the
-                          sandbox — bring it down again and it comes with everything else.
+                          sandbox. Once the cloud agent is idle, bring it down again and it comes
+                          with everything else — while it&apos;s still working, another attempt can
+                          hit the same race.
                         </div>
                       )}
                       {/* …but "nothing has been shut down" is NOT "nothing happened". The handoff
@@ -567,16 +590,32 @@ export function DemoteToLocalDialog({
                 </div>
               )}
 
-              <button
-                type="button"
-                data-testid="demote-confirm"
-                style={{ ...primaryBtn, opacity: running ? 0.5 : 1 }}
-                onClick={() => void confirm()}
-                disabled={running}
-              >
-                <FiDownloadCloud size={13} />
-                {running ? "Bringing it down…" : "Bring down to local"}
-              </button>
+              {retryUnsafe ? (
+                // Non-retryable failure (orphan, or a throw mid-cut): the safe action is to dismiss,
+                // not to re-run a move that may already be partly applied. The retry button is
+                // GONE — not merely disabled — so following the "don't try again" copy above is the
+                // only action this panel offers.
+                <button
+                  type="button"
+                  data-testid="demote-dismiss"
+                  style={primaryBtn}
+                  onClick={onClose}
+                >
+                  <FiX size={13} />
+                  Close
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  data-testid="demote-confirm"
+                  style={{ ...primaryBtn, opacity: running ? 0.5 : 1 }}
+                  onClick={() => void confirm()}
+                  disabled={running}
+                >
+                  <FiDownloadCloud size={13} />
+                  {running ? "Bringing it down…" : "Bring down to local"}
+                </button>
+              )}
             </>
           )}
         </div>

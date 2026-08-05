@@ -374,9 +374,16 @@ export async function demoteAgentToLocal(
     return {
       ok: false,
       step: "cutover",
+      // REMEDY SAFETY (bead ccgz8): the guard refused BECAUSE the cloud agent is still committing,
+      // so a bare "demote again" can lose the same race on the next pass — this Mac catches up, the
+      // agent commits once more, and the head diverges again. There is no quiesce/pause dep to stop
+      // the sandbox agent (that is a server capability this contract does not have), so the honest,
+      // safe remedy under the SAME condition that triggered the refusal is: wait for the agent to go
+      // idle first, then demote. Nothing here is destructive, and it does not send the user back
+      // into the loop the guard just caught.
       message:
-        `Your cloud agent committed again while this Mac was catching up, so there's work on ${branch} that wasn't in the push. ` +
-        `That commit is safe in the sandbox and nothing was deleted — demote again to bring it down.${STILL_CLOUD}`,
+        `Your cloud agent committed again while this Mac was catching up, so the sandbox now holds newer work than the push carried. ` +
+        `That commit is safe in the sandbox and nothing was deleted. Once the cloud agent is idle, demote again to bring it down — while it's still working, another attempt can race the same way.${STILL_CLOUD}`,
     };
   }
 
