@@ -159,6 +159,13 @@ beforeEach(() => {
     // gesture, which is a different feature's row.
     focusOwner: "other",
     enabled: true,
+    // RESET THE SURFACE AND THE PHASE TOO. Both are read by the reconcile's guards, so a row that
+    // writes either one leaked it into every row after it — and the leak is SILENT, because an
+    // inherited foreign `voiceSurface` makes the guard return early and leaves `micCalls` empty,
+    // which is what a "never arms the mic" assertion is looking for anyway. One row parking the
+    // surface at "agent" therefore turned its neighbour vacuous without failing anything.
+    voiceSurface: "concierge",
+    phase: "passive",
   });
 });
 
@@ -670,21 +677,102 @@ describe("the caret moving into a terminal pauses Speak", () => {
     expect(useUiStore.getState().conciergeSendMode).toBe("speak");
   });
 
-  it("leaves Push to talk exactly as it already was", () => {
-    // The regression guard: ptt's resting intent is ALREADY "paused", so the new term must be a
-    // no-op there rather than a second, competing write.
+  it("leaves Push to talk RELEASED across the terminal edge — a caret move never opens that mic", () => {
+    // The regression guard, rewritten for sparkle-u81cz. It used to assert the edge wrote "paused",
+    // because ptt's resting intent WAS "paused". It now rests at "off", so the invariant is the
+    // stronger one: crossing into a terminal and back must leave push-to-talk released, and must
+    // never reach `setMuted`/`setActive` — both of which ARM (`setEnabled(true)`).
     //
     // `every()` ALONE WAS VACUOUS (roborev 56315): it is true of an empty array, which is exactly
-    // what `micCalls` holds if the effect never re-runs on the `inert` edge — the defect this
-    // change fixes. So the row stayed green with the fix deleted and guarded nothing. Assert the
-    // reconcile FIRED as well as what it wrote.
+    // what `micCalls` holds if the effect never re-runs on the `inert` edge. So the reconcile is
+    // asserted to have FIRED as well as to have written the right thing. This arm starts from a
+    // mic that is NOT armed elsewhere, which is what lets the reconcile run at all.
     useUiStore.setState({ conciergeSendMode: "ptt" });
+    useDictationStore.setState({ enabled: false });
     setup();
     caret("terminal");
     micCalls.length = 0;
     caret("other");
     expect(micCalls.length).toBeGreaterThan(0);
-    expect(micCalls.every((c) => c === "paused")).toBe(true);
+    expect(micCalls.every((c) => c === "off")).toBe(true);
+  });
+
+  it("RELEASES a mic that is already on when the tray is at Push to talk — the upgrade path", () => {
+    // ── THE HIGHEST-SEVERITY HOLE IN THIS CHANGE'S FIRST CUT, and this row is the one that would
+    // have caught it. An earlier version of this test asserted the OPPOSITE — that push-to-talk
+    // stands down like Send — which encoded the bug as a contract.
+    //
+    // `dictationStore` PERSISTS `{enabled, phase}`, and every user parked on Push to talk has
+    // `enabled: true` on disk because the OLD resting intent armed the mic via `setMuted`. If the
+    // stand-down applied here, the first launch after this change would reconcile to "off", return
+    // early, never call `setOff`, and leave the microphone capturing at rest — shipping the founder
+    // straight back into the bug he reported. So the mount reconcile MUST release it.
+    //
+    // Send's carve-out is untouched (see the row below): that one is the default position nobody
+    // chose. Push to talk is chosen, and its contract is that the mic is shut between holds.
+    useUiStore.setState({ conciergeSendMode: "ptt" });
+    useDictationStore.setState({ enabled: true, phase: "passive" });
+    micCalls.length = 0;
+    setup();
+    expect(micCalls).toContain("off");
+    expect(micCalls).not.toContain("paused");
+    expect(micCalls).not.toContain("active");
+  });
+
+  it("STANDS DOWN at Send rather than releasing a mic armed elsewhere — the original carve-out", () => {
+    // THE GUARD ITSELF HAD NO TEST once the ptt row above was reversed. Every other Send row sets
+    // `enabled: false`, so it passes whether or not the carve-out exists — delete the
+    // `if (intent === "off" && …) return;` line entirely and the suite stayed green, while the
+    // concierge mounting silently switched off a mic armed in the header ring under a tray reading
+    // "Send". That is the exact defect this hook's header says the guard was written for.
+    useUiStore.setState({ conciergeSendMode: "send" });
+    useDictationStore.setState({ enabled: true, phase: "passive" });
+    micCalls.length = 0;
+    setup();
+    // `micCalls` is the ONLY real assertion available here: `useMicActions` is mocked to push
+    // strings and never writes the store, so re-reading `enabled` would just echo the line above.
+    expect(micCalls).not.toContain("off");
+  });
+
+  it("…and STANDS DOWN in Push to talk too when the mic belongs to ANOTHER SURFACE", () => {
+    // The ptt carve-out is scoped to a mic THIS COLUMN owns. Without the `voiceSurface` term the
+    // effect re-runs on every terminal focus edge, and each one would steal the surface and disarm
+    // an agent composer's microphone mid-dictation — no gesture aimed at the concierge at all.
+    useUiStore.setState({ conciergeSendMode: "ptt" });
+    useDictationStore.setState({ enabled: true, phase: "active", voiceSurface: "agent" });
+    setup();
+    micCalls.length = 0;
+    caret("terminal");
+    caret("other");
+    expect(micCalls).toEqual([]);
+  });
+
+  it("…nor even CLAIMS that surface when the foreign mic is already off", () => {
+    // The mic-off half, and it is not cosmetic: `applyIntent` calls `setVoiceSurface("concierge")`
+    // BEFORE it touches the mic, so an "off" reconcile on a surface we do not own rewrites
+    // ownership even though it changes no mic state. The user then arms with the wake word or the
+    // header ring — neither claims a surface — and the dictation lands in the concierge box instead
+    // of the agent composer they last put the caret in.
+    useUiStore.setState({ conciergeSendMode: "ptt" });
+    useDictationStore.setState({ enabled: false, phase: "passive", voiceSurface: "agent" });
+    setup();
+    caret("terminal");
+    caret("other");
+    expect(useDictationStore.getState().voiceSurface).toBe("agent");
+  });
+
+  it("…and a caret round-trip in Push to talk still never ARMS that mic", () => {
+    // The terminal edge, with a mic that is on and OURS: it may only ever be closed here, never
+    // opened. `voiceSurface` is set explicitly rather than inherited — a foreign surface would make
+    // the guard return early and leave `micCalls` empty, which passes this row for the wrong reason.
+    useUiStore.setState({ conciergeSendMode: "ptt" });
+    useDictationStore.setState({ enabled: true, phase: "passive", voiceSurface: "concierge" });
+    setup();
+    micCalls.length = 0;
+    caret("terminal");
+    caret("other");
+    expect(micCalls).not.toContain("paused");
+    expect(micCalls).not.toContain("active");
   });
 
   it("NEVER arms the mic when the tray is at Send", () => {

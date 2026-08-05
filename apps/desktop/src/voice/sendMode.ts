@@ -236,12 +236,32 @@ export function stepSendMode(mode: SendMode, delta: 1 | -1): SendMode {
  *   send  → "off"    the mic is released. **An off state for the MICROPHONE ONLY, never for the
  *                    control**: in Send the tray is the most actionable it ever gets (filled
  *                    primary blue). Two objects, opposite treatments, one frame.
- *   ptt   → "paused" armed but not routing. The hold is what routes — see {@link pttHeldIntent}.
+ *   ptt   → "off"    RELEASED between holds. The hold is what opens the mic — {@link pttHeldIntent}.
  *   speak → "active" live, routing, and counting down.
+ *
+ * ── WHY PUSH TO TALK RESTS AT "off" AND NOT AT "paused" (sparkle-u81cz) ─────────────────────────
+ * It used to return `"paused"`, and that was the bug the founder reported: *"it shows the
+ * microphone as gray but LISTENING when I don't have the push-to-talk button pressed … AND IT
+ * SHOULD NOT BE CAPTURING ANY WAVEFORM."*
+ *
+ * `"paused"` is NOT a weaker "off" — this module's own consumer says so in useSendMode: it maps to
+ * `setMuted`, and `setMuted` is an **ARM** (`setEnabled(true); setPhase("passive")`). So the
+ * resting position of push-to-talk held a LIVE, capturing microphone: a waveform sweeping with real
+ * audio, a metered relay open, under a glyph that read as idle. Looks off, behaves on — the worst
+ * of the two, and the one combination a user cannot detect.
+ *
+ * The whole promise of push-to-talk over Speak is that the microphone is CLOSED until you ask for
+ * it. That promise is now literal: at rest the mic is released exactly as in Send, and the ONLY
+ * thing that opens it is the hold. It matters more than it used to, because Speak is always-on
+ * since the wake word was retired (sparkle-6hu3c) — push-to-talk is now the only position in which
+ * the microphone is ever shut.
+ *
+ * WHAT THIS DOES NOT CHANGE: the HELD state. `pttHeldIntent` is untouched, and the surfaces that
+ * draw a held hold read the live mic rather than this function (see micPresentation's `ptt` branch,
+ * which keys on `enabled` precisely so the held rendering survived this change unaltered).
  */
 export function micIntentForMode(mode: SendMode): MicIntent {
   if (mode === "speak") return "active";
-  if (mode === "ptt") return "paused";
   // EVERY OTHER VALUE — including `send`, and including anything a corrupt or hand-edited persisted
   // blob can produce — releases the mic. Written as an explicit `speak` match with an "off" default
   // rather than the other way round, because the fall-through direction is not a style choice here:
@@ -326,16 +346,28 @@ export interface ChordKey {
 /**
  * Does this keystroke send, in this mode, under this setting?
  *
- * **In Push to talk it is always `false`, whatever the chord.** There, `⌘` means *talk* — so ⌘↩
- * cannot also mean send. One meaning per chord per mode; the alternative is a timing heuristic that
- * tries to tell a tap from a hold, which is exactly the guesswork this control was designed to
- * delete. Releasing the hold already sends, immediately, so nothing is lost.
+ * ── ⌘↩ SENDS IN EVERY POSITION, PUSH TO TALK INCLUDED (sparkle-u81cz) ──────────────────────────
+ * This used to open with `if (mode === "ptt") return false`, on the reasoning that `⌘` means *talk*
+ * there so `⌘↩` must not also mean send. The founder asked for both: *"I can tap the command key to
+ * have what I typed send, but I could also type command enter, and that would also send it."*
+ *
+ * IT DOES NOT DOUBLE-SEND, and the reason is a guard that already exists rather than anything added
+ * here. `usePushToTalk` treats a SECOND KEY arriving mid-hold as proof the gesture was a chord and
+ * not speech, so it ABANDONS the hold — and an abandoned hold sends nothing. The full ⌘↩ sequence
+ * is therefore: `Meta` down starts a hold → `Enter` down abandons it (no send) and this function
+ * submits once → `Meta` up finds no hold and does nothing. Exactly one send, from the composer.
+ * That guard was written for ⌘V/⌘A/⌘Z, and ⌘↩ is simply another chord it already covered; the
+ * historical stacking this docblock used to warn about predates it. `ComposeBox.test.tsx` and
+ * `sendMode.test.ts` both pin the call COUNT, not merely that a send happened.
+ *
+ * So the hold is no longer the only way a typed draft can leave the box in this mode — which also
+ * removes the trap `usePushToTalk`'s header describes, where gating the release on a minimum
+ * duration or a transcript delta would have stranded a typed message with no send path at all.
  *
  * ⌃↩ is accepted alongside ⌘↩ under the `cmd-enter` setting because the shipped composer already
  * accepts it and removing a working chord is not this change's business.
  */
 export function chordSends(mode: SendMode, chord: SendChord, e: ChordKey): boolean {
-  if (mode === "ptt") return false;
   if (e.key !== "Enter") return false;
   if (e.shiftKey) return false; // ⇧↩ is a newline in both settings
   if (chord === "cmd-enter") return Boolean(e.metaKey || e.ctrlKey);

@@ -266,6 +266,30 @@ function indicatorState(mode: SendMode, i: MicIndicatorInput): MicState {
   // anything deciding whether a terminal is a destination calls `terminalRoutingArmed`. This is the
   // fourth consumer of that fact, and the three that already carry it are why the surfaces agree.
   if (i.focusOwner === "terminal" && !i.terminalRoutes) return "off";
+  // ── PUSH TO TALK READS THE MIC, NOT THE POSITION (sparkle-u81cz) ──────────────────────────────
+  //
+  // This position is the one whose resting state and held state are DIFFERENT MICROPHONES, so it is
+  // the one place the position alone cannot answer the question. Since `micIntentForMode("ptt")`
+  // became "off", the shared expression below would have drawn Push to talk exactly like Send in
+  // BOTH states — correct at rest, and wrong the moment the key goes down.
+  //
+  // `enabled` is what separates them, and it is authoritative rather than a guess: the hold is the
+  // only thing that arms this mic (`pttHeldIntent` → `setActive`), and every path that ends a hold
+  // drops it back through `micIntentForMode` → `setOff`.
+  //
+  //   at rest  (released) → "off"    the grey slashed glyph, identical to Send. THE FIX: the
+  //                                  founder asked for "the microphone in the OFF position, as if I
+  //                                  had it in Send mode — that same gray microphone".
+  //   held     (armed)    → "paused" amber, BYTE-IDENTICAL to what this returned for `ptt` before
+  //                                  the change, in every combination of status and phase. He was
+  //                                  explicit that the held state is already right: "when I push
+  //                                  the button is when it becomes active, like it is now. Nothing
+  //                                  changes to the active state. It's perfect."
+  //
+  // Deliberately NOT `deriveMicState`, which is what the generic "off" branch below would have
+  // reached and which promotes a live routing mic to GREEN. Green is Speak's, and letting a hold
+  // reach it is the exact defect the "stays AMBER when the phase is active" test guards.
+  if (mode === "ptt") return i.enabled ? "paused" : "off";
   const intent = micIntentForMode(mode);
   // `modelProgress` is passed as null: case 1 above already claimed that state, so this call is
   // only ever asked the paused-vs-active question.
@@ -305,6 +329,17 @@ export type MicCaptionKind =
  * which is the precise failure this module exists to delete.
  */
 export function micCaptionKind(mode: SendMode): MicCaptionKind {
-  if (micIntentForMode(mode) === "off") return "none";
-  return mode === "speak" ? "dictating" : "pushToTalk";
+  // KEYED ON THE POSITION ITSELF, not on `micIntentForMode` (sparkle-u81cz). It used to read
+  // `if (micIntentForMode(mode) === "off") return "none"`, which was a faithful way to ask "does
+  // this position promise anything about voice" only while `ptt` rested at "paused". Now that Push
+  // to talk rests RELEASED, that spelling would return "none" for it and silently delete the
+  // "Hold ⌘ to talk" caption — the one thing that tells the user how to open a mic this change
+  // just closed. Deleting the instructions along with the capture is the opposite of the fix.
+  //
+  // The mapping below is unchanged for every position: send (and any unrecognised value) still
+  // promises nothing, and the fail-closed default is preserved by naming the two armed positions
+  // explicitly rather than by falling through to one of them.
+  if (mode === "speak") return "dictating";
+  if (mode === "ptt") return "pushToTalk";
+  return "none";
 }

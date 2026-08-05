@@ -25,6 +25,8 @@ import {
   SEND_MODE_LABEL,
   SEND_MODE_LABEL_SHORT,
   SWEEP_FLOOR_MS,
+  TALK_KEY_GLYPH,
+  pttHeldIntent,
   TRAY_SHORT_LABEL_MAX_PX,
   TRAY_FULL_NO_CHICLET_MIN_PX,
   TRAY_SHORT_NO_CHICLET_MIN_PX,
@@ -73,10 +75,23 @@ describe("the tray's three positions", () => {
 });
 
 describe("the position IS the microphone", () => {
-  it("Send releases the mic, Push to talk arms it, Speak takes it live", () => {
+  it("Send AND Push to talk both release the mic; only Speak takes it live", () => {
+    // PUSH TO TALK RESTS RELEASED (sparkle-u81cz). It rested at "paused" until the founder reported
+    // the mic "gray but LISTENING" between holds — and "paused" is not a weaker "off": useSendMode
+    // maps it to `setMuted`, which ARMS (`setEnabled(true)`). So the resting position of
+    // push-to-talk was a live, capturing microphone. The hold is now the only thing that opens it.
     expect(micIntentForMode("send")).toBe("off");
-    expect(micIntentForMode("ptt")).toBe("paused");
+    expect(micIntentForMode("ptt")).toBe("off");
     expect(micIntentForMode("speak")).toBe("active");
+  });
+
+  it("the HOLD is what opens the mic — and it is the only position whose two states differ", () => {
+    // The other half of the fix, and what stops "ptt rests off" from meaning "ptt is just Send":
+    // the resting intent releases, the held intent goes live. Asserted as a RELATIONSHIP so a
+    // change that collapsed push-to-talk onto Send entirely would fail here rather than pass.
+    expect(micIntentForMode("ptt")).toBe("off");
+    expect(pttHeldIntent()).toBe("active");
+    expect(pttHeldIntent()).not.toBe(micIntentForMode("ptt"));
   });
 
   it("an UNRECOGNISED position releases the mic — it never fails open into a live one", () => {
@@ -146,12 +161,29 @@ describe("the keycap chip cannot lie about the keystroke", () => {
     expect(chordSends("send", "cmd-enter", { key: "Enter", metaKey: true, shiftKey: true })).toBe(false);
   });
 
-  it("in Push to talk NOTHING sends by chord — ⌘ means talk there", () => {
-    // One meaning per chord per mode. The alternative is a timing heuristic trying to tell a tap
-    // from a hold, which is exactly the guesswork this control was designed to delete. Releasing
-    // already sends, so nothing is lost.
-    expect(chordSends("ptt", "cmd-enter", { key: "Enter", metaKey: true })).toBe(false);
-    expect(chordSends("ptt", "enter", { key: "Enter" })).toBe(false);
+  it("⌘↩ ALSO sends in Push to talk — the chord and the hold are both send paths", () => {
+    // REVERSED by the founder (sparkle-u81cz): "I can tap the command key to have what I typed
+    // send, but I could also type command enter, and that would also send it." This used to assert
+    // the opposite — that nothing sends by chord in this mode.
+    //
+    // It does not double-send, and the guard is in usePushToTalk rather than here: a second key
+    // arriving mid-hold ABANDONS the hold (it was a chord, not speech), so ⌘↩ produces exactly one
+    // send, from the composer. ComposeBox.test.tsx pins that COUNT at the surface that submits.
+    expect(chordSends("ptt", "cmd-enter", { key: "Enter", metaKey: true })).toBe(true);
+    expect(chordSends("ptt", "cmd-enter", { key: "Enter", ctrlKey: true })).toBe(true);
+    expect(chordSends("ptt", "enter", { key: "Enter" })).toBe(true);
+    // The exclusions still hold in this mode: ⇧↩ is a newline, and a bare ↩ does not send under
+    // the ⌘↩ setting (the mention picker owns it).
+    expect(chordSends("ptt", "cmd-enter", { key: "Enter", metaKey: true, shiftKey: true })).toBe(false);
+    expect(chordSends("ptt", "cmd-enter", { key: "Enter" })).toBe(false);
+  });
+
+  it("every position now honours the SAME send chord — none refuses it", () => {
+    // The generalisation of the case above: `chordSends` no longer branches on the mode at all, so
+    // a future position cannot silently inherit a refusal. Asserted across SEND_MODES so adding one
+    // is what fails here, not a hand-listed trio.
+    for (const mode of SEND_MODES)
+      expect(chordSends(mode, "cmd-enter", { key: "Enter", metaKey: true })).toBe(true);
   });
 
   it("the chip shows the chord the handler honours, and ⌘ where ⌘ means talk", () => {
@@ -163,19 +195,24 @@ describe("the keycap chip cannot lie about the keystroke", () => {
     expect(chicletFor("ptt", "enter")).toBe("⌘");
   });
 
-  it("a chip is never drawn for a chord its own mode refuses", () => {
+  it("a chip never advertises a SEND chord its own mode refuses", () => {
     // The vacuous-test guard for the pair above: this asserts the RELATIONSHIP rather than two
     // independent literals, so changing one function without the other fails here.
+    //
+    // REPHRASED for sparkle-u81cz. It used to require the converse as well — that a "⌘" chip
+    // implied `chordSends` was FALSE — which was true only while Push to talk refused the chord.
+    // Now that ⌘↩ sends everywhere, that clause would fail on a mode whose chip is honest: the
+    // push-to-talk chip names the TALK key (hold it), not a send chord, and ⌘↩ sending as well
+    // does not make "⌘" a lie. What must never happen is a chip naming a send chord that is inert,
+    // which is the direction that misleads — so that is the direction asserted.
     for (const mode of SEND_MODES) {
       for (const chord of ["cmd-enter", "enter"] as const) {
         const cap = chicletFor(mode, chord);
-        if (cap === "⌘") {
-          expect(chordSends(mode, chord, { key: "Enter", metaKey: true })).toBe(false);
-          continue;
-        }
+        // The talk-key chip makes no claim about ↩, so there is no send chord to hold it to.
+        if (cap === TALK_KEY_GLYPH) continue;
         const press =
           chord === "cmd-enter" ? { key: "Enter", metaKey: true } : { key: "Enter" };
-        expect(chordSends(mode, chord, press)).toBe(true);
+        expect(chordSends(mode, chord, press), `${mode}/${chord} chip "${cap}"`).toBe(true);
       }
     }
   });

@@ -5,6 +5,7 @@ import { FiAlertTriangle } from "react-icons/fi";
 // light mode (the @sparkle/ui C.muted is a dark-mode-only literal).
 import { C, FONT_WEIGHT } from "../theme/colors";
 import { terminalRoutingArmed } from "../voice/dictationFocus";
+import { trayInert } from "../voice/sendMode";
 import {
   deriveMicPresentation,
   micCaptionKind,
@@ -654,6 +655,40 @@ export function LogoWaveform() {
               treatment the retired wake phrase carried, so the caption keeps its two-line shape. */}
           <span style={{ display: "block", fontWeight: 600, color: C.tealInk }}>
             {captionKind === "pushToTalk" ? PTT_CAPTION_ACTION : SPEAK_CAPTION_ACTION}
+          </span>
+        </div>
+      ) : presentation === "off" && captionKind === "pushToTalk" && !trayInert(focusOwner) ? (
+        // PUSH TO TALK AT REST — a RELEASED mic, since sparkle-u81cz (see voice/sendMode
+        // `micIntentForMode`). This arm exists because that fix moved this position out of the live
+        // states above: without it, closing the mic would also have deleted "Hold ⌘ to talk", which
+        // is the one sentence that says how to reopen it. A shut mic with no instructions is a
+        // worse surface than the always-on one this replaced.
+        //
+        // `!trayInert` IS REQUIRED, not defensive. A live PTY owning the keyboard makes
+        // `usePushToTalk` UNBIND the gesture, and `deriveMicPresentation` returns "off" on
+        // `!enabled` before it ever consults `pauseReason` — so without this term a terminal caret
+        // would render "Hold ⌘ to talk" over a ⌘ that does nothing. AGENTS.md is explicit that a
+        // remedy string is an instruction the user will follow, so it has to be true under the same
+        // conditions that produced it. Before this fix that state was `enabled: true` and reached
+        // the honest `focusPaused` arm; now it falls through to silence, which claims nothing.
+        //
+        // Same two-line shape and the same constants as the live arm, so the caption does not
+        // reflow or restyle when the key goes down — from the user's side the words simply stay put
+        // while the glyph beside them comes alive. Rendered for `pushToTalk` ONLY: an `off` mic
+        // under Send or master mute still claims nothing.
+        <div
+          style={{
+            display: "block",
+            width: "100%",
+            textAlign: "center",
+            marginTop: 4,
+            color: C.muted,
+            fontSize: 12,
+          }}
+        >
+          <span style={{ display: "block", fontWeight: 600 }}>{PTT_CAPTION_HEADLINE}</span>
+          <span style={{ display: "block", fontWeight: 600, color: C.tealInk }}>
+            {PTT_CAPTION_ACTION}
           </span>
         </div>
       ) : presentation === "focusPaused" ? (

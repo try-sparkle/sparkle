@@ -217,6 +217,36 @@ describe("micIndicatorFor — the tray position, with the hardware able only to 
 
   // ── THE DEMOTIONS. Each is a state where the position is not a true statement about the mic. ──
 
+  it("Push to talk AT REST draws Send's OFF glyph — grey and slashed, not a live mic", () => {
+    // ── THE FOUNDER'S REPORT (sparkle-u81cz) ──────────────────────────────────────────────────
+    // "It should show the microphone in the OFF position, as if I had it in Send mode — that same
+    // gray microphone." Since the position now RELEASES the mic between holds, `enabled: false` is
+    // what "at rest" means here, and the glyph follows the hardware.
+    //
+    // Compared against Send's own rendering rather than against two literals, so the two cannot
+    // drift apart: "as if I had it in Send mode" is the requirement, and this is that sentence.
+    const atRest = micVisual(micIndicatorFor("ptt", live({ enabled: false })).state, false);
+    expect(atRest).toEqual(micVisual(micIndicatorFor("send", live({ enabled: false })).state, false));
+    expect(atRest).toEqual({ color: C.muted, variant: "slash" });
+  });
+
+  it("…and the HELD state is untouched — still the amber pause, exactly as before", () => {
+    // The founder was explicit that the active state is already right: "when I push the button is
+    // when it becomes active, like it is now. Nothing changes to the active state. It's perfect."
+    //
+    // The risk this guards is specific. `micIntentForMode("ptt")` became "off", and this module
+    // used to derive the indicator straight from it — so without a `ptt` branch keyed on `enabled`,
+    // a hold would have fallen through to the generic "off but armed" path and been promoted to the
+    // GREEN live mic, which belongs to Speak alone. Asserted across every status/phase combination
+    // because the old code path was a single expression covering all of them.
+    for (const status of STATUSES)
+      for (const phase of ["passive", "active"] as const)
+        expect(
+          micVisual(micIndicatorFor("ptt", live({ enabled: true, status, phase })).state, false),
+          `ptt held @ ${status}/${phase}`,
+        ).toEqual({ color: C.amber, variant: "pause" });
+  });
+
   it("Push to talk stays AMBER when the phase is active — the original defect", () => {
     // `live()` already has `phase: "active"` and `status: "listening"`, i.e. something has
     // fired with nothing about the tray having changed. Green here is what this whole change exists

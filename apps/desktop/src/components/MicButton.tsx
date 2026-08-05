@@ -194,7 +194,19 @@ export function useMicActions(): {
       setPhase("passive");
     },
     // Release the mic entirely (red "off"). Always allowed — turning OFF never spends credits.
-    setOff: () => setEnabled(false),
+    //
+    // IT CLEARS `phase` TOO (sparkle-u81cz). This used to write `enabled` alone, which was harmless
+    // while the only way to reach "off" was from an already-passive mic. Push to talk now RESTS
+    // here — every hold ends by dropping back through this — and a hold leaves `phase: "active"`,
+    // so releasing without clearing it parked a released microphone with its ROUTING flag still
+    // set. Nothing routes today (`terminalRoutingArmed` gates on `enabled`, so the flag is inert
+    // while off), which is exactly why this is worth writing down rather than relying on: the
+    // guard that saves it is one term in one other module, and "off but still routing" is a state
+    // no reader should have to prove is unreachable.
+    setOff: () => {
+      setEnabled(false);
+      setPhase("passive");
+    },
   };
 }
 

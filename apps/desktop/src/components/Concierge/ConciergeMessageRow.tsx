@@ -473,7 +473,7 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
           <FiBell size={11} aria-hidden />
           <span>{m.stale ? "Sparkle noticed — no longer current" : "Sparkle noticed"}</span>
         </div>
-        <Markdown text={m.text} />
+        <Markdown text={m.text} mergeQuotes />
         {collapsedPayload(m)}
         {/* A push is still an ANSWER — the same words, arrived unasked — so it gets the same copy
             affordance. Copying its markdown source, like the branch below. */}
@@ -495,7 +495,7 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
           they were sent, so a single reply to a burst of five is legible as five answers rather than
           one paragraph nobody can aim at. */}
       <ReplyAnchorStubs anchors={m.answers} onJump={onJump} />
-      <Markdown text={m.text} />
+      <Markdown text={m.text} mergeQuotes />
       {/* AFTER the sentence, because it is what the sentence is about — a relayed brief the
           transcript used to echo inline and push the conversation off screen. */}
       {collapsedPayload(m)}

@@ -42,7 +42,12 @@ export const SPEAK_COMPOSER_PLACEHOLDER =
 // chiclet cannot name different keys.
 export const PTT_CAPTION_HEADLINE = "Push to talk";
 export const PTT_CAPTION_ACTION = `Hold ${TALK_KEY_GLYPH} to talk`;
-export const PTT_COMPOSER_PLACEHOLDER = `Hold ${TALK_KEY_GLYPH} to talk — or type here instead.`;
+/** THE WHOLE SENTENCE, with no typing tail. It read `… — or type here instead.` and the founder
+ *  trimmed it (sparkle-u81cz): *"it should only say the 'Hold X to talk' part."* He can see the
+ *  box, so the tail was noise. This SUPERSEDES the copy table agreed in sparkle-6hu3c's comments,
+ *  which is the only other place that tail is written down. The two constants above are unchanged
+ *  and still correct. */
+export const PTT_COMPOSER_PLACEHOLDER = `Hold ${TALK_KEY_GLYPH} to talk.`;
 
 // ── EVERY OTHER COMPOSER (an agent's own box, the capture window) ───────────────────────────────
 // THE TRAY GOVERNS THE CONCIERGE BOX, AND ONLY IT. The two sentences above are true there and

@@ -21,10 +21,18 @@
 //
 // WHAT IS DELIBERATELY *NOT* A REASON TO ABANDON: a short hold, or a hold during which nothing was
 // dictated. Both were proposed as extra evidence that the gesture "was really speech", and both
-// would break the mode: `chordSends` makes ⌘↩ inert in Push to talk on purpose, so the RELEASE is
-// the only way a typed draft can leave the box here. Gating it on a minimum duration or a
-// transcript delta would leave someone who typed a message in this mode with no send path at all —
-// a worse failure than the one being guarded against, and a silent one.
+// would break the mode — a deliberate silent hold is how you dispatch a draft you TYPED, and
+// gating the release on a minimum duration or a transcript delta would turn that gesture into a
+// silent no-op. The user let go; that is the whole signal this mode takes.
+//
+// The argument used to rest on ⌘↩ being inert here ("the RELEASE is the only way a typed draft can
+// leave the box"). IT NO LONGER IS — the founder asked for both, so `chordSends` now honours ⌘↩ in
+// this mode too (sparkle-u81cz). That removes the *stranding* risk, not the reason: a release that
+// quietly dropped the draft would still be a gesture the user performed and the app ignored.
+//
+// It also makes the chord guard below load-bearing in a way it was not before. ⌘↩ now reaches this
+// listener as `Meta` down → `Enter` down, and it is precisely the "second key abandons the hold"
+// branch that stops the composer's submit and a hold-release send from STACKING into two messages.
 //
 // WHY THE WINDOW-BLUR ABANDON IS NOT DEFENSIVE. While ⌘ is held, every stray letter becomes an OS
 // chord — ⌘Q, ⌘W, ⌘Tab. ⌘Tab in particular switches application WITHOUT ever delivering the

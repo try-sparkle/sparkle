@@ -289,6 +289,52 @@ describe("LogoWaveform — honest listening", () => {
     expect(screen.queryByText(/Listening paused/)).toBeNull();
     expect(pttHint()).toBeNull();
   });
+
+  it("Push to talk AT REST keeps its caption over a RELEASED mic", () => {
+    // THE REGRESSION THIS CATCHES (sparkle-u81cz). Push to talk now rests with the microphone
+    // released, which moved it into the same `off` presentation as master mute — the state the row
+    // above proves shows NOTHING. Without a dedicated arm, closing the mic would also have removed
+    // "Hold ⌘ to talk" from the sidebar, deleting the instruction for reopening it at the same
+    // moment it was shut.
+    useUiStore.setState({ conciergeSendMode: "ptt" });
+    useDictationStore.setState({ enabled: false, status: "idle", phase: "passive" });
+    render(<LogoWaveform />);
+    const t = document.body.textContent?.replace(/\s+/g, " ") ?? "";
+    expect(t).toContain(PTT_CAPTION_HEADLINE);
+    expect(pttHint()).not.toBeNull();
+    // It is the resting affordance, not a claim that anything is being heard.
+    expect(screen.queryByText(/Listening paused/)).toBeNull();
+  });
+
+  it("…but NOT while a terminal owns the keyboard — that ⌘ is unbound", () => {
+    // A live PTY makes `usePushToTalk` unbind the hold (voice/sendMode `trayInert`), so offering
+    // "Hold ⌘ to talk" there instructs a gesture that does nothing. AGENTS.md: a remedy string is an
+    // instruction the user will follow, so it has to be true under the conditions that produced it.
+    //
+    // This became reachable only because push-to-talk now rests RELEASED —
+    // `deriveMicPresentation` answers "off" on `!enabled` BEFORE it consults `pauseReason`, so the
+    // terminal case reaches the new resting arm instead of the honest `focusPaused` one it used to.
+    useUiStore.setState({ conciergeSendMode: "ptt" });
+    useDictationStore.setState({
+      enabled: false,
+      status: "idle",
+      phase: "passive",
+      focusOwner: "terminal",
+    });
+    render(<LogoWaveform />);
+    expect(pttHint()).toBeNull();
+  });
+
+  it("…and that arm is scoped to Push to talk — Send with the same released mic stays silent", () => {
+    // The discriminator for the row above: same mic state, different tray position. Without this,
+    // an implementation that simply always captioned an `off` mic would pass — and would put
+    // push-to-talk copy under a tray that has no push-to-talk gesture.
+    useUiStore.setState({ conciergeSendMode: "send" });
+    useDictationStore.setState({ enabled: false, status: "idle", phase: "passive" });
+    render(<LogoWaveform />);
+    expect(pttHint()).toBeNull();
+    expect(document.body.textContent ?? "").not.toContain(PTT_CAPTION_HEADLINE);
+  });
 });
 
 // ---------------------------------------------------------------------------

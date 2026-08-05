@@ -163,19 +163,28 @@ describe("ComposeBox — the box names no destination", () => {
     expect(onSend).toHaveBeenCalledTimes(1);
   });
 
-  it("REFUSES ⌘↩ in Push to talk, where ⌘ means TALK", () => {
-    // One meaning per chord per mode. Before this the two paths STACKED: the composer submitted on
-    // the ⌘↩ keydown, and then releasing ⌘ fired the hold's own send an instant later — two messages
-    // from one gesture, in the mode whose entire promise is that you decide when the message goes.
+  it("sends ⌘↩ in Push to talk too — EXACTLY ONCE, not once per path", () => {
+    // REVERSED by the founder (sparkle-u81cz): "I can tap the command key to have what I typed
+    // send, but I could also type command enter, and that would also send it." This row used to
+    // assert the refusal.
+    //
+    // THIS BOX ONLY OWNS HALF THE GESTURE. `usePushToTalk` and `useSendMode` live in ConciergeHost,
+    // which `setup()` does not mount, so no hold machinery exists here and this row can only prove
+    // that the COMPOSER submits once. The other half — that releasing ⌘ does not then fire the
+    // hold's own send, which is the stacking the old refusal existed to prevent — is only
+    // observable where both paths are live, and is asserted in ConciergeHost.pushToTalk.test.tsx
+    // ("⌘↩ sends ONCE"). An earlier version of this row fired a `Meta` keyup here and claimed it
+    // caught the guard being removed; it could not, because there was nothing listening for it.
     const { onSend } = setup({ sendMode: "ptt" } as never);
     fireEvent.change(box(), { target: { value: "ship it" } });
     fireEvent.keyDown(box(), { key: "Enter", metaKey: true });
-    expect(onSend).not.toHaveBeenCalled();
+    expect(onSend).toHaveBeenCalledTimes(1);
   });
 
-  it("…and still sends on ⌘↩ in Speak, so the refusal is the MODE and not a blanket off-switch", () => {
-    // The other half. A change that simply stopped honouring ⌘↩ would pass the row above and break
-    // the shortcut everywhere, which no test would have caught.
+  it("…and still sends on ⌘↩ in Speak, so the chord works in every position", () => {
+    // The other half. A change that stopped honouring ⌘↩ anywhere would break the shortcut for
+    // everyone, and the row above (which now expects a send) could not tell the difference on its
+    // own between "push-to-talk gained the chord" and "the chord is unconditional and untested".
     const { onSend } = setup({ sendMode: "speak" } as never);
     fireEvent.change(box(), { target: { value: "ship it" } });
     fireEvent.keyDown(box(), { key: "Enter", metaKey: true });

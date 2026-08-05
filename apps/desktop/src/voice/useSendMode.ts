@@ -212,10 +212,62 @@ export function useSendMode({ onSend }: UseSendModeArgs): SendModeController {
   //
   // Keying on the RESTING intent keeps Send on the "off" branch, where the stand-down guard can do
   // its job, while still demoting the one position that is actually live.
+  // ── THE STAND-DOWN IS FOR `send` ONLY — PUSH TO TALK MUST STILL BE RELEASED ───────────────────
+  //
+  // `ptt !== "off"` is load-bearing and was the highest-severity hole in sparkle-u81cz's first cut.
+  // The carve-out below was reasoned for ONE position: `send` is the DEFAULT, "the one nobody
+  // chose", so releasing on its behalf would destroy a mic the user armed somewhere else. When
+  // push-to-talk's resting intent became "off" it silently inherited that carve-out — and that
+  // defeats the fix on exactly the population it was written for.
+  //
+  // `dictationStore` PERSISTS `{enabled, phase}`, and every user currently parked on Push to talk
+  // has `enabled: true` on disk, because the OLD resting intent armed the mic through `setMuted`.
+  // So on the first launch after this change: `mode === "ptt"`, `resting === "off"`,
+  // `enabled === true` → the guard returns, `setOff` is never called, and the microphone is still
+  // open and capturing at rest. The founder would have upgraded into the very bug he reported.
+  //
+  // WHAT THIS DELIBERATELY DOES *NOT* CLOSE, so the next reader does not plan against a guard that
+  // is not here: arming the mic from the HEADER RING while the tray is parked on Push to talk. The
+  // deps are `[mode, inert, applyIntent]`, so nothing re-runs on `enabled`, and the mic stays open
+  // until a mode change or a focus edge happens to re-run this. That is the ordinary
+  // armed-from-another-surface case Send has always had, and it is left alone on purpose: `enabled`
+  // cannot become a dependency here, because a push-to-talk HOLD sets it — the effect would re-run
+  // mid-hold, read the resting intent, and release the microphone in the middle of the sentence.
+  //
+  // Push to talk is a position the user PICKED, and its whole contract is that the mic is shut
+  // between holds — so a mic THIS COLUMN owns is not state to preserve here, it is the state this
+  // position exists to deny. Send keeps the carve-out, and so does an unrecognised persisted value,
+  // which still fails closed onto it.
+  //
+  // ── …BUT ONLY FOR A MIC THIS COLUMN OWNS (`voiceSurface`) ─────────────────────────────────────
+  //
+  // The `voiceSurface` term is not belt-and-braces; without it the ptt carve-out reaches a
+  // microphone that has nothing to do with the concierge. This effect re-runs on every `inert`
+  // edge — i.e. every time the caret enters or leaves a terminal — and for `ptt` the intent is
+  // always "off", so each of those transitions would call `applyIntent("off")`, which does
+  // `setVoiceSurface("concierge")` and then `setOff()`. The agent composer arms its own mic with
+  // `voiceSurface: "agent"` (components/Composer, MicButton), so: tray parked on Push to talk and
+  // not in use, the user dictates into an AGENT composer, clicks into a terminal — and the
+  // concierge steals the surface and disarms their microphone mid-sentence, with no gesture aimed
+  // at this column at all. The `enabled` guard used to prevent exactly that.
+  //
+  // `voiceSurface` is NOT persisted (`partialize` keeps only `{enabled, phase}`) and initialises to
+  // "concierge", so the upgrade path this carve-out exists for still releases: a relaunch with a
+  // persisted `enabled: true` reads "concierge" and falls through to `applyIntent("off")`.
   useEffect(() => {
     const resting = micIntentForMode(mode);
     const intent = inert && resting !== "off" ? "paused" : resting;
-    if (intent === "off" && useDictationStore.getState().enabled) return;
+    const mic = useDictationStore.getState();
+    const ownedHere = mic.voiceSurface === "concierge";
+    // A RELEASE WE DO NOT OWN IS NOT OURS TO MAKE — and `enabled` is the wrong term to gate it on,
+    // because `applyIntent` CLAIMS THE SURFACE before it touches the mic (`setVoiceSurface`, then
+    // `setOff`). So an "off" reconcile on a foreign surface is never harmless even when the mic is
+    // already released: it silently rewrites ownership to "concierge" on every mount and every
+    // terminal focus edge. The user then arms with the wake word or the header ring — neither of
+    // which claims a surface — and their dictation lands in the concierge box instead of the agent
+    // composer they last put the caret in. Checked BEFORE `enabled` for exactly that reason.
+    if (intent === "off" && !ownedHere) return;
+    if (intent === "off" && mic.enabled && mode !== "ptt") return;
     applyIntent(intent);
     // `inert` IS a dependency now. Without it this effect only re-ran when the tray moved, so the
     // caret entering or leaving a terminal changed nothing — which is precisely why Speak stayed
@@ -350,9 +402,11 @@ export function useSendMode({ onSend }: UseSendModeArgs): SendModeController {
    *
    * ── A RELEASE IS A SEND, FULL STOP ────────────────────────────────────────────────────────────
    * Not "a send when there is a transcript". A hold with no speech in it at all is a deliberate way
-   * to dispatch a TYPED draft — in this mode it is the ONLY way, since `chordSends` makes ⌘↩ inert
-   * here on purpose — so it takes the fast path below and sends in the keyup's own tick. Anything
-   * that made a silent hold wait, or made it a no-op, would take that draft's only send path away.
+   * to dispatch a TYPED draft, so it takes the fast path below and sends in the keyup's own tick.
+   * Anything that made a silent hold wait, or made it a no-op, would ignore a gesture the user
+   * deliberately performed. (This used to add "in this mode it is the ONLY way to send it, since
+   * `chordSends` makes ⌘↩ inert here" — no longer true: ⌘↩ sends in Push to talk too as of
+   * sparkle-u81cz. The release is now one of two send paths, not the only one.)
    *
    * ── "IMMEDIATELY" DOES NOT MEAN "IN THIS TICK" WHEN HE ACTUALLY SPOKE ─────────────────────────
    * The transcript is not always finished arriving when the key comes up: on the cloud path Deepgram

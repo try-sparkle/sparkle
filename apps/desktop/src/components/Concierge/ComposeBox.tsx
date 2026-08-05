@@ -768,7 +768,13 @@ export function ComposeBox({
   // WHICH live sentence the placeholder shows, from the TRAY — the same pure function the sidebar
   // caption uses, so the two surfaces cannot name different modes for one position. The presentation
   // above still selects WHICH state is rendered; this only decides the words for the live ones.
-  const captionKind = micCaptionKind(sendMode);
+  // AN INERT TRAY PROMISES NOTHING. A live PTY owns the keyboard, so `usePushToTalk` has unbound the
+  // hold — offering "Hold ⌘ to talk" here would instruct a gesture that does nothing (sparkle-u81cz).
+  // It matters now that push-to-talk RESTS released: `deriveMicPresentation` answers "off" on
+  // `!enabled` before it consults `pauseReason`, so the terminal case reaches the resting arm rather
+  // than the honest focus-paused one it used to. Suppressing here rather than inside RichPlaceholder
+  // keeps that component pure — the caller reads state, it renders words.
+  const captionKind = trayInert ? "none" : micCaptionKind(sendMode);
   // The overlay stands in for a native placeholder, so it shows on exactly the same terms one
   // would: an empty textarea. Staged attachments render in their OWN row above the textarea (see
   // below), so they never compete for this slot.

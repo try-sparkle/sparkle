@@ -1461,8 +1461,8 @@ export function ConciergeHost({
   // of the talk key means "send this message"; what the message turns out to be made of is the box's
   // business. So all three of these are one path, not a case and two edge cases:
   //   spoke only  → the box holds the transcript dictation inserted, and that goes out;
-  //   typed only  → a silent hold sends the typed draft, exactly as pressing Send would (and in this
-  //                 mode it is the ONLY way to send it — `chordSends` makes ⌘↩ inert here);
+  //   typed only  → a silent hold sends the typed draft, exactly as pressing Send would (⌘↩ sends it
+  //                 here too since sparkle-u81cz, so the hold is one of two paths, not the only one);
   //   both        → `submit` sends what the box holds, which is the typed text with the transcript
   //                 appended after it (ComposeBox's `append` adds dictated segments at the caret,
   //                 which follows the text) — the typed words were there first, so they lead.

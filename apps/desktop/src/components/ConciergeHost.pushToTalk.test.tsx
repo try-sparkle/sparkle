@@ -160,12 +160,22 @@ describe("the tray IS the microphone", () => {
     expect(useDictationStore.getState().voiceSurface).toBe("concierge");
   });
 
-  it("sliding to Push to talk ARMS the mic without routing speech at the box", () => {
-    // Armed, not hot. Anything else would make "push to talk" an always-on microphone with a
-    // decorative key.
+  it("sliding to Push to talk RELEASES the mic — it captures nothing until the key is held", () => {
+    // ── THE FOUNDER'S REPORT (sparkle-u81cz) ──────────────────────────────────────────────────
+    // "It shows the microphone as gray but LISTENING when I don't have the push-to-talk button
+    // pressed … AND IT SHOULD NOT BE CAPTURING ANY WAVEFORM."
+    //
+    // This row asserted the opposite — `{ enabled: true }` — and that WAS the bug, written down as
+    // a contract: "armed, not hot" sounds conservative, but `enabled: true` is a live capture. The
+    // waveform swept, the relay stayed open, and the glyph beside it read idle.
+    //
+    // The promise of push-to-talk over Speak is that the microphone is CLOSED until you ask for it,
+    // and with Speak always-on since the wake word was retired this is now the ONLY position in
+    // which it is ever shut. `enabled: false` is the whole fix; the hold is the only thing that
+    // opens it (see the hold rows below, which still take it live).
     mount();
     act(() => fireEvent.click(pill("ptt")));
-    expect(mic()).toEqual({ enabled: true, phase: "passive" });
+    expect(mic()).toEqual({ enabled: false, phase: "passive" });
   });
 
   it("sliding back to Send RELEASES the microphone", () => {
@@ -234,16 +244,23 @@ describe("the tray IS the microphone", () => {
 });
 
 describe("hold ⌘ anywhere to talk; release sends", () => {
-  it("holding ⌘ takes the mic live, and releasing puts it back to armed", () => {
+  it("holding ⌘ OPENS the mic, and releasing closes it again", () => {
+    // The full gesture, and the row that proves "ptt rests released" did not simply break the mode:
+    // the hold is what takes the microphone live, and the release puts it back to RELEASED rather
+    // than to the armed-and-capturing state it used to return to (sparkle-u81cz).
+    //
+    // The held middle line is UNCHANGED — the founder was explicit that the active state is already
+    // right ("nothing changes to the active state. It's perfect."), so it still reads exactly
+    // `{ enabled: true, phase: "active" }`.
     mount();
     act(() => fireEvent.click(pill("ptt")));
-    expect(mic().phase).toBe("passive");
+    expect(mic()).toEqual({ enabled: false, phase: "passive" });
 
     act(() => fireEvent.keyDown(window, { key: "Meta" }));
     expect(mic()).toEqual({ enabled: true, phase: "active" });
 
     act(() => fireEvent.keyUp(window, { key: "Meta" }));
-    expect(mic()).toEqual({ enabled: true, phase: "passive" });
+    expect(mic()).toEqual({ enabled: false, phase: "passive" });
   });
 
   it("the hold works with focus NOWHERE NEAR the compose box", () => {
@@ -273,6 +290,39 @@ describe("hold ⌘ anywhere to talk; release sends", () => {
     // Through the BOX's submit, not a send assembled out here — so the words leave the textarea
     // with the message rather than sitting behind it.
     expect(box().value).toBe("");
+  });
+
+  it("⌘↩ sends ONCE in Push to talk — the composer submits, the hold abandons", async () => {
+    // ── THE DOUBLE-SEND, TESTED WHERE BOTH PATHS ACTUALLY EXIST ───────────────────────────────
+    // The founder asked for ⌘↩ to send in this mode as well as the hold (sparkle-u81cz), and
+    // `chordSends` no longer refuses it. The refusal existed because the two paths once STACKED:
+    // the composer submitted on the ⌘↩ keydown and releasing ⌘ fired the hold's own send an instant
+    // later — two messages from one gesture, in the mode whose entire promise is that you decide
+    // when the message goes.
+    //
+    // What makes it safe is `usePushToTalk`'s chord guard: `Enter` arriving while ⌘ is held means
+    // the gesture was a CHORD, not speech, so the hold is abandoned and sends nothing. This row
+    // must live HERE and not in ComposeBox.test.tsx — that file renders the box alone, without
+    // `usePushToTalk`, so a `Meta` keyup there has no hold machinery to fire against and the
+    // assertion would hold with the guard deleted.
+    mount();
+    act(() => fireEvent.click(pill("ptt")));
+    type("ship the staging branch");
+
+    await act(async () => {
+      fireEvent.keyDown(window, { key: "Meta" });
+      fireEvent.keyDown(box(), { key: "Enter", metaKey: true });
+      fireEvent.keyUp(window, { key: "Meta" });
+      for (let i = 0; i < 8; i++) await Promise.resolve();
+    });
+
+    expect(h.startConciergeTurn).toHaveBeenCalledTimes(1);
+    expect(h.startConciergeTurn).toHaveBeenCalledWith(
+      expect.stringContaining("ship the staging branch"),
+    );
+    expect(box().value).toBe("");
+    // The abandoned hold must also have closed the mic behind it, not left it open.
+    expect(mic()).toEqual({ enabled: false, phase: "passive" });
   });
 
   it("⌘Tab away mid-hold sends NOTHING and leaves the draft intact", async () => {
@@ -530,7 +580,10 @@ describe("release sends immediately, and sends everything", () => {
       for (let i = 0; i < 8; i++) await Promise.resolve();
     });
     expect(h.startConciergeTurn).not.toHaveBeenCalled();
-    expect(mic()).toEqual({ enabled: true, phase: "passive" });
+    // Back to push-to-talk's resting state, which is RELEASED since sparkle-u81cz — the cancel path
+    // restores the mic through `micIntentForMode`, so it follows the position rather than pinning a
+    // literal of its own.
+    expect(mic()).toEqual({ enabled: false, phase: "passive" });
   });
 
   it("UNMOUNTING mid-settle cancels the send AND puts the mic back to armed", async () => {
@@ -549,24 +602,31 @@ describe("release sends immediately, and sends everything", () => {
     expect(mic().phase).toBe("active"); // still hot: the phrase is still arriving
 
     act(() => view.unmount());
-    expect(mic()).toEqual({ enabled: true, phase: "passive" });
+    expect(mic()).toEqual({ enabled: false, phase: "passive" });
 
     // AND THE COMMIT RACE IS REALLY DETACHED, not merely unobservable. `startConciergeTurn` is the
     // wrong witness here — the composer is gone, so the send cannot be seen from this level whether
     // or not anything was cancelled, and asserting it never ran is vacuous (roborev 56110). The mic
-    // is the witness instead: park the tray at Send, whose intent RELEASES the mic, and then let the
-    // commit land. A subscription still attached runs `finish`, which re-reads the live position and
-    // would drop the mic to off; a cancelled one leaves it armed where the teardown put it.
+    // is the witness instead: park the tray somewhere whose intent DIFFERS from where the teardown
+    // left it, then let the commit land. A subscription still attached runs `finish`, which re-reads
+    // the live position and moves the mic; a cancelled one leaves it where the teardown put it.
+    //
+    // THE WITNESS IS `speak`, NOT `send` (sparkle-u81cz). It was `send`, chosen because its intent
+    // RELEASES the mic while the teardown left it armed. Push-to-talk now rests released too, so
+    // `send` and the resting state became the SAME reading and the row would have passed whether or
+    // not the subscription was cancelled — a vacuous test created by a change nowhere near it.
+    // `speak` ARMS, so the two outcomes are distinguishable again, and in the safer direction: the
+    // failure it must catch is a stray `finish` turning a microphone ON after teardown.
     //
     // It witnesses `finish` RUNNING, which is what dispatches the send — not the send itself. The
     // row below covers the other race the same way.
-    act(() => useUiStore.setState({ conciergeSendMode: "send" }));
+    act(() => useUiStore.setState({ conciergeSendMode: "speak" }));
     await act(async () => {
       useDictationStore.getState().setInterim("");
       await new Promise((r) => setTimeout(r, 0));
       for (let i = 0; i < 8; i++) await Promise.resolve();
     });
-    expect(mic()).toEqual({ enabled: true, phase: "passive" });
+    expect(mic()).toEqual({ enabled: false, phase: "passive" });
   });
 
   it("…and the SETTLE CAP is detached by that unmount too, not just the commit subscription", async () => {
@@ -578,7 +638,10 @@ describe("release sends immediately, and sends everything", () => {
     // IT PINS THE RACE, NOT EITHER LINE. The cap is guarded twice over — `wait.settled` makes
     // `settle` a no-op and the `clearTimeout` stops it being called at all — so dropping either one
     // alone leaves this green (measured, both ways). Dropping both turns it red: the mic reads
-    // `enabled: false`, which is `finish` having run and re-read the live position.
+    // `enabled: true`, which is `finish` having run and re-read the live position (parked at
+    // `speak`). That polarity FLIPPED with sparkle-u81cz — the witness position changed from `send`
+    // to `speak` because push-to-talk's resting state is now released, so "finish ran" is now the
+    // reading that ARMS rather than the one that releases.
     vi.useFakeTimers();
     try {
       const view = mount();
@@ -590,21 +653,24 @@ describe("release sends immediately, and sends everything", () => {
         fireEvent.keyUp(window, { key: "Meta" });
       });
       // A SETTLE IS ACTUALLY PENDING — the row's precondition, and without it the final assertion is
-      // indistinguishable from "no wait was ever entered": `micIntentForMode("ptt")` is `paused`, so
-      // clicking the pill alone already leaves the mic exactly where the last line looks for it. A
-      // hold that stopped engaging, or an `endHold` that stopped taking the wait branch, would
-      // schedule no cap timer at all and the row would pass proving nothing (roborev 56129).
+      // indistinguishable from "no wait was ever entered": clicking the pill alone already leaves
+      // the mic exactly where the last line looks for it. A hold that stopped engaging, or an
+      // `endHold` that stopped taking the wait branch, would schedule no cap timer at all and the
+      // row would pass proving nothing (roborev 56129). (The resting state it would coincide with
+      // is now RELEASED rather than armed — sparkle-u81cz — which changes the value below but not
+      // this row's reason for existing.)
       expect(mic().phase).toBe("active");
 
       act(() => view.unmount());
-      // Same witness as above, and the interim stays OUTSTANDING so the subscription cannot be what
-      // fires: the cap is the only race left that could run `finish`.
-      act(() => useUiStore.setState({ conciergeSendMode: "send" }));
+      // Same witness as above — `speak`, which ARMS, so a stray `finish` is visible against a
+      // resting state that is now released. The interim stays OUTSTANDING so the subscription
+      // cannot be what fires: the cap is the only race left that could run `finish`.
+      act(() => useUiStore.setState({ conciergeSendMode: "speak" }));
       await act(async () => {
         vi.advanceTimersByTime(PARTIAL_SETTLE_CAP_MS + 10);
         for (let i = 0; i < 8; i++) await Promise.resolve();
       });
-      expect(mic()).toEqual({ enabled: true, phase: "passive" });
+      expect(mic()).toEqual({ enabled: false, phase: "passive" });
     } finally {
       vi.useRealTimers();
     }

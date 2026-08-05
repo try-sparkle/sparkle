@@ -35,7 +35,7 @@ import type { SendMode } from "../../voice/sendMode";
 // copy follows the TRAY, and on Send the box deliberately promises nothing (the mic, if on at all,
 // is governed by another surface) — so a fixture left on the component default would render the
 // fallback for every live-mic row and pass its negative assertions vacuously.
-function setup(over: { interim?: string; sendMode?: SendMode } = {}) {
+function setup(over: { interim?: string; sendMode?: SendMode; trayInert?: boolean } = {}) {
   return render(
     <ComposeBox onSend={vi.fn()} onAttach={vi.fn()} sendMode="speak" {...over} />,
   );
@@ -130,6 +130,48 @@ describe("ComposeBox — the live sentence names the MODE, not the phase", () =>
       expect(bodyText()).not.toContain(SPEAK_COMPOSER_PLACEHOLDER);
       cleanup();
     }
+  });
+
+  it("…and STILL says it over a RELEASED mic, which is where Push to talk now rests", () => {
+    // THE REGRESSION THIS EXISTS TO CATCH (sparkle-u81cz). Closing the mic at rest moved this
+    // position out of the live states above and into `off` — the arm that had always meant "master
+    // mute, promise nothing". Left alone, the fix for "the mic must be off" would silently have
+    // deleted the one sentence telling the user how to turn it back on: a shut microphone with no
+    // instructions, which is worse than the always-on mic it replaced.
+    //
+    // The founder asked for both in one breath — the mic OFF at rest, and the box reading "Hold ⌘
+    // to talk" — so this pins them together.
+    act(() => useDictationStore.setState(mic.off()));
+    setup({ sendMode: "ptt" });
+    expect(bodyText()).toContain(PTT_COMPOSER_PLACEHOLDER);
+    expect(bodyText()).not.toContain(SPEAK_COMPOSER_PLACEHOLDER);
+  });
+
+  it("…but NOT while the tray is INERT — a terminal has unbound that ⌘", () => {
+    // Same rule as the sidebar caption: `usePushToTalk` unbinds the hold when a live PTY owns the
+    // keyboard, so "Hold ⌘ to talk" would name a gesture that does nothing. Reachable only because
+    // push-to-talk rests released now — `deriveMicPresentation` returns "off" on `!enabled` before
+    // it looks at `pauseReason`, so this state no longer reaches the honest focus-paused copy.
+    act(() => useDictationStore.setState(mic.off()));
+    setup({ sendMode: "ptt", trayInert: true });
+    expect(bodyText()).not.toContain(PTT_COMPOSER_PLACEHOLDER);
+  });
+
+  it("a released mic on SEND still promises nothing — the copy follows the tray, not the mic", () => {
+    // The discriminator for the row above: it must not have been implemented as "an off mic always
+    // says push-to-talk". Same mic state, different position, no voice promise.
+    act(() => useDictationStore.setState(mic.off()));
+    setup({ sendMode: "send" });
+    expect(bodyText()).not.toContain(PTT_COMPOSER_PLACEHOLDER);
+    expect(bodyText()).toContain(CONCIERGE_PLACEHOLDER);
+  });
+
+  it("the push-to-talk sentence is the WHOLE placeholder — no ', or type here' tail", () => {
+    // The founder trimmed the tail he had previously approved: "it should only say the 'Hold X to
+    // talk' part." He can see the box. Asserted on the CONSTANT rather than the render so it cannot
+    // be satisfied by a surface that happens not to show it.
+    expect(PTT_COMPOSER_PLACEHOLDER).toBe("Hold ⌘ to talk.");
+    expect(PTT_COMPOSER_PLACEHOLDER).not.toMatch(/type here/i);
   });
 
   it("Speak says its own sentence, and never push-to-talk's", () => {

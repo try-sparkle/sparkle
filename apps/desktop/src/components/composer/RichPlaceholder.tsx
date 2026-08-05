@@ -286,7 +286,20 @@ export function VoicePlaceholderCopy({
 }) {
   switch (micPresentation) {
     case "off":
-      // Master mute: no voice promise to make, so the caller's own words (or nothing) take the slot.
+      // ── PUSH TO TALK RESTS HERE NOW (sparkle-u81cz) ───────────────────────────────────────────
+      // A released mic used to mean one thing — master mute — and the slot yielded to the caller's
+      // own words. Since push-to-talk stopped capturing between holds, `off` is ALSO its ordinary
+      // resting state, and those two need opposite copy: master mute has nothing to say about
+      // voice, while push-to-talk has the single most useful thing to say about it — how to open
+      // the mic that is currently shut.
+      //
+      // `captionKind` is what tells them apart, and it is the tray position, so this cannot drift
+      // from what the sidebar caption does in the same state. Suppressing the sentence here would
+      // have been a silent regression of the exact affordance the founder was praising: he asked
+      // for the mic to be OFF at rest and for the box to read "Hold ⌘ to talk", in one breath.
+      if (captionKind === "pushToTalk") return <>{PTT_COMPOSER_PLACEHOLDER}</>;
+      // Master mute (or the tray on Send): no voice promise to make, so the caller's own words
+      // (or nothing) take the slot.
       return <>{fallback}</>;
     case "error":
     case "outOfCredits":
