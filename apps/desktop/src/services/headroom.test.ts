@@ -148,6 +148,34 @@ describe("switchRecommendation", () => {
     ).toBeNull();
   });
 
+  it("still recommends when `from`'s email is AMBIGUOUS across two uuid accounts", () => {
+    // knightwatch probe 2 on PR #1261, and the case where the local pairwise policy this file used
+    // to carry disagreed with `duplicateAccountGroups`.
+    //
+    // `from` has an email and no uuid. Both candidates carry a uuid AND the same email — an email
+    // that therefore identifies TWO Anthropic accounts. The old rule asked "are these two
+    // identities comparable, and do they agree?" pairwise: both sides have an email, the emails
+    // match, so EVERY candidate read as the same login and all were excluded. The switcher went
+    // silent for an exhausted account with two perfectly good alternatives.
+    //
+    // `duplicateAccountGroups` refuses that inference explicitly — an email-only row whose email
+    // maps to more than one uuid group is grouped with NOTHING, because guessing would bench an
+    // account that is not actually a sibling. Deriving from it makes this case eligible again.
+    // This assertion fails against the deleted policy, which is the point.
+    const ambiguousEmail: Identity[] = [
+      { id: "a", email: "shared@x.com", organization: null, accountUuid: null },
+      { id: "b", email: "shared@x.com", organization: null, accountUuid: "u-b" },
+      { id: "c", email: "shared@x.com", organization: null, accountUuid: "u-c" },
+    ];
+    // `a` is exhausted by a real limit event; `b` and `c` are nearly untouched.
+    const u = [usage("a", 10, NOW + 60_000), usage("b", 1), usage("c", 50)];
+    const c2 = [ceil("a", 100), ceil("b", 100), ceil("c", 100)];
+    expect(
+      switchRecommendation("a", [acct("a"), acct("b"), acct("c")], u, c2, ambiguousEmail, NOW)?.to
+        .id,
+    ).toBe("b");
+  });
+
   it("still recommends when the CURRENT account's identity is unreadable — unknown is not same", () => {
     // THE REACHABLE HALF of "unknown is not same", and the only one that discriminates. Candidates
     // are already filtered by `signedInAccountIds` (email != null), so a candidate is always

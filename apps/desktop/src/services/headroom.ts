@@ -16,7 +16,7 @@
 // hence a threshold well below 1.0 and a banner that RECOMMENDS rather than acts unilaterally.
 
 import type { Account, Usage, Identity, AccountDisplay } from "./accountStore";
-import { accountSentenceName, signedInAccountIds, identitiesDiffer } from "./accountStore";
+import { accountSentenceName, signedInAccountIds, duplicateAccountGroups } from "./accountStore";
 
 /** Fraction of the learned ceiling at which we start recommending a switch. Chosen against the
  *  observed spread (CoV 0.24): at 0.8 a typical account still has real runway left, so the switch
@@ -118,14 +118,20 @@ function headroomRank(h: Headroom): number {
  *  existed for the DISPLAY (`duplicateAccountGroups`) and for BENCHING (`siblingMap`); it was never
  *  applied to this DECISION.
  *
- *  Sameness is the negation of {@link identitiesDiffer} — the uuid when both sides have one, else
- *  the email — so it matches `identityKey`, the display, and the Rust ledger rather than inventing
- *  a fourth rule. Note `identitiesDiffer` returns false when it CANNOT tell, so "not different" is
- *  not "same": a candidate is only excluded when the two identities are **decidably** the same —
- *  both carrying a uuid, or both carrying an email. Individually non-empty is NOT enough, since
- *  `identitiesDiffer` compares like with like and a uuid-only identity against an email-only one
- *  falls through both of its branches. That keeps an undecidable pair eligible instead of silently
- *  emptying the candidate list.
+ *  Sameness is whatever {@link duplicateAccountGroups} says it is — ONE rule, shared with the
+ *  display and with benching, rather than a second policy spelled out here. That matters because
+ *  this file DID spell out a second one, and the two disagreed in precisely the case the canonical
+ *  rule is careful about (knightwatch probe 2 on PR #1261): an email-only `from` was judged the
+ *  same login as EVERY uuid-bearing candidate sharing its email, even when that email maps to more
+ *  than one account. `duplicateAccountGroups` refuses that inference outright — an ambiguous
+ *  email-only row is grouped with nothing — but the local rule excluded all of them, so an
+ *  exhausted account with two perfectly good alternatives got NO recommendation at all. That is the
+ *  outcome the same-login guard exists to prevent, reintroduced one level over.
+ *
+ *  The canonical rule keeps the property the local one was reaching for: it pairs only on POSITIVE
+ *  evidence (a shared uuid, or an email that identifies exactly one uuid group), so an undecidable
+ *  pair stays a candidate instead of silently emptying the list. Deriving from it rather than
+ *  re-deriving beside it is what makes that guarantee hold in both places at once.
  *
  *  `currentAccountId` is the account agents are actually running under; a recommendation is only
  *  made about that account, since switching an account nobody is using accomplishes nothing. */
@@ -146,35 +152,21 @@ export function switchRecommendation(
   if (!current || (current.state !== "warn" && current.state !== "exhausted")) return null;
 
   const signedIn = new Set(signedInAccountIds(identities));
-  // Same-login exclusion — see the docblock. `identitiesDiffer` answers false when it cannot tell,
-  // so this asks the question in the direction that only excludes on POSITIVE evidence of sameness:
-  // the two identities must be COMPARABLE (both uuids, or both emails) and then agree. An
-  // undecidable pair stays a candidate.
-  const identityById = new Map(identities.map((i) => [i.id, i]));
-  const fromId = identityById.get(currentAccountId);
-  const isSameLoginAsFrom = (id: string): boolean => {
-    const cand = identityById.get(id);
-    if (!fromId || !cand) return false;
-    // COMPARABLE, not merely resolvable. `identitiesDiffer` only decides when both sides carry the
-    // SAME field — uuids first, else emails — so two identities can each be individually non-empty
-    // and still be mutually undecidable: `from` with a uuid but no email, against a candidate with
-    // an email but no uuid (a login predating the field). A per-side "is this non-empty" check
-    // passes both, `identitiesDiffer` then takes neither branch and returns false, and `!false`
-    // excludes the candidate on ZERO evidence. If every candidate predates the uuid field the
-    // switcher goes silent for an exhausted account — precisely the outcome the guard exists to
-    // prevent, reintroduced one level in.
-    const comparable =
-      (fromId.accountUuid != null && cand.accountUuid != null) ||
-      (fromId.email != null && cand.email != null);
-    if (!comparable) return false;
-    return !identitiesDiffer(
-      { accountUuid: fromId.accountUuid, email: fromId.email },
-      { accountUuid: cand.accountUuid, email: cand.email },
-    );
-  };
+  // Same-login exclusion, from the CANONICAL grouping — see the docblock for why this is derived
+  // rather than re-decided here. A group only exists on positive evidence of a shared login, so an
+  // account the grouping declines to pair stays a candidate.
+  const sameLoginAsFrom = new Set(
+    (
+      duplicateAccountGroups(accounts, identities).find((g) =>
+        g.accounts.some((a) => a.id === currentAccountId),
+      )?.accounts ?? []
+    )
+      .map((a) => a.id)
+      .filter((id) => id !== currentAccountId),
+  );
   const candidates = accounts
     .filter(
-      (a) => a.id !== currentAccountId && signedIn.has(a.id) && !isSameLoginAsFrom(a.id),
+      (a) => a.id !== currentAccountId && signedIn.has(a.id) && !sameLoginAsFrom.has(a.id),
     )
     .map((a) => ({
       account: a,
