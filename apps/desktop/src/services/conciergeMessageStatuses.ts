@@ -17,8 +17,12 @@
 // what the founder asked for: *"I don't know which one you are working on."*
 //
 // The two kinds of line are different in nature and must not be conflated. The working message's
-// line is OBSERVED — it names the tool actually running. A waiting message's line is a fact about
-// the QUEUE, not about the concierge, and says only that: its turn has not started.
+// line is OBSERVED — it names the phase or tool actually running, opening with "Reading your
+// message" from the frame after dispatch (services/conciergeTurnFloor). A waiting message's line is
+// a fact about the QUEUE, not about the concierge: it says where the message stands in line and
+// nothing about what the concierge is doing, because nothing is being done about it yet. See
+// {@link waitingLine} for why that position is stated rather than a flat "waiting", and why it
+// carries no ETA — and the call site for why the waiting side gets no queue-derived FALLBACK.
 //
 // ══ WHAT AN OLDER MESSAGE GETS: NOTHING, DELIBERATELY ═══════════════════════════════════════════
 // It is tempting to mark a displaced message "never answered", and this app has already tried it.
@@ -50,6 +54,54 @@ import type { ConciergeMessageStatusText } from "../components/Concierge/Message
 const NONE: Record<string, ConciergeMessageStatusText> = {};
 
 /**
+ * `1` → `"1st"`, `22` → `"22nd"`. English ordinals, teens and all.
+ *
+ * The teen exception is a live case here rather than a textbook one: the queue holds up to
+ * {@link MAX_QUEUED_TURNS} = 50 and the founder's ask is *"twenty to fifty messages"*, so a burst
+ * routinely runs through 11–13 (which take `th` despite ending in 1/2/3) and out the other side into
+ * 21–23 (which resume `st`/`nd`/`rd`). A bare `n % 10` rule is wrong for three of every hundred
+ * positions and every one of them is reachable by hand in one sitting.
+ */
+function ordinal(n: number): string {
+  const teen = n % 100;
+  if (teen >= 11 && teen <= 13) return `${n}th`;
+  switch (n % 10) {
+    case 1:
+      return `${n}st`;
+    case 2:
+      return `${n}nd`;
+    case 3:
+      return `${n}rd`;
+    default:
+      return `${n}th`;
+  }
+}
+
+/**
+ * What a WAITING message says, given its 1-based place in the queue.
+ *
+ * ══ WHY A POSITION AND NOT JUST "WAITING" ══════════════════════════════════════════════════════
+ * Every waiter used to render the identical `"Waiting its turn"`. That is honest but nearly
+ * contentless at the depth this queue exists for: twenty messages produced twenty identical lines,
+ * so the reader could see THAT a question was queued and not how far off its answer was. The depth
+ * was already computed — `engine/conciergeTurnQueue.waitingCount` has existed since the queue landed
+ * and nothing ever read it — which makes this the app's recurring failure of knowing something and
+ * not showing it, in miniature.
+ *
+ * ══ STILL A FACT ABOUT THE QUEUE, NOT A PREDICTION ═════════════════════════════════════════════
+ * "3rd in line" says where the message sits in an ordered list this module can see in full. It is
+ * NOT an estimate of when the answer arrives, and deliberately carries no time: turn duration varies
+ * by more than an order of magnitude (a one-line answer versus a repo-wide read), so any "about two
+ * minutes" would be the confident-but-unknowable claim this column has removed everywhere else.
+ *
+ * The front of the queue is named rather than numbered — "Next up" beats "1st in line", which reads
+ * like a position in a list rather than the thing the reader wants to know.
+ */
+export function waitingLine(position: number): string {
+  return position === 1 ? "Next up" : `${ordinal(position)} in line`;
+}
+
+/**
  * The per-message status map, keyed by user-message id.
  *
  * @param awaitingId the bubble whose turn is in flight, or null when nothing is being awaited
@@ -73,7 +125,12 @@ export function useConciergeMessageStatuses(
     // message has no turn, so there is no activity that could describe it. The line states the one
     // thing that IS true of it — it is in line — and nothing about what the concierge is doing.
     const waiting: Record<string, ConciergeMessageStatusText> = {};
-    for (const q of queue.waiting) waiting[q.bubbleId] = { text: "Waiting its turn" };
+    // The INDEX is the whole added signal — see {@link waitingLine}. `queue.waiting` is ordered
+    // oldest-first and drains from the front, so `i + 1` is the message's actual place in line and
+    // moves on its own every time a turn finishes.
+    queue.waiting.forEach((q, i) => {
+      waiting[q.bubbleId] = { text: waitingLine(i + 1) };
+    });
 
     if (!awaitingId || !typing) return queue.waiting.length ? waiting : NONE;
     const fresh = latest && latest.seq > floor ? latest : null;
@@ -81,7 +138,18 @@ export function useConciergeMessageStatuses(
     // NO ACTIVITY, NO CLAIM — the rule the column-level indicator degrades by, kept identical here.
     // A turn that is thinking and has called nothing yet gets no status rather than a manufactured
     // one; the bubble simply carries nothing, exactly as it did before this feature.
+    //
+    // A QUEUE-DERIVED FALLBACK WAS TRIED HERE AND REMOVED, so it is not re-added by the next reader
+    // who notices the gap. The idea was to say "Working on this" for `queue.running` until a tool
+    // line existed, on the reasoning that the running message was dark while every message queued
+    // behind it showed a position. It is not: `services/conciergeTurnFloor` records a
+    // `reading_message` phase in an effect keyed on the send counter, which fires for EVERY
+    // dispatched turn including one promoted off the queue, so the running message says "Reading
+    // your message" from the frame after dispatch. The only window such a fallback could fill is the
+    // single pre-commit frame that module already weighs and accepts ("the cost is one frame of bare
+    // pulse"), and a phrase that renders for one frame is noise rather than a status.
     if (!line) return queue.waiting.length ? waiting : NONE;
-    return { ...waiting, [awaitingId]: { text: line.text } };
+    // LIVE: this one is actually running, so its ink is the age ladder the founder asked for.
+    return { ...waiting, [awaitingId]: { text: line.text, live: true } };
   }, [awaitingId, typing, latest, floor, queue]);
 }

@@ -113,6 +113,8 @@ import {
   STALLED_AFTER_MS,
 } from "../engine/conciergeLiveness";
 import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
+import { MAX_QUEUED_TURNS } from "../engine/conciergeTurnQueue";
+import { waitingLine } from "../services/conciergeMessageStatuses";
 import type { ConciergeFeed } from "../useConciergeFeed";
 import type { StatusBand } from "../engine/buildSections";
 
@@ -590,5 +592,105 @@ describe("the liveness colour is spoken, through the column's one announcer", ()
         .querySelector("[data-announce-seq]")
         ?.getAttribute("data-announce-seq"),
     ).toBe(seq);
+  });
+});
+
+// ── THE QUEUE, SPOKEN ──────────────────────────────────────────────────────────────────────────
+//
+// The per-message status line is NOT a live region and must not become one: this column owns exactly
+// ONE announcer, and a second in the subtree double-announces (Concierge/MessageStatus's header;
+// ConciergeThread.roleLabels asserts it). That placement was justified on the AT reader getting the
+// same information through the column's announcer — true while the line only repeated things
+// announced elsewhere, and FALSE the moment it started carrying a queue position, which nothing else
+// says anywhere.
+describe("the queue is spoken, through the column's one announcer", () => {
+  const announcer = () => screen.getByTestId("concierge-announcer").textContent ?? "";
+  /** The region's write counter — bumped per announcement, so a SECOND write is visible even when
+   *  the first is immediately overwritten and the rendered text looks unchanged. */
+  const announceSeq = (): number =>
+    Number(
+      screen
+        .getByTestId("concierge-announcer")
+        .querySelector("[data-announce-seq]")
+        ?.getAttribute("data-announce-seq") ?? -1,
+    );
+
+  it("says where a queued send landed, and says nothing about a queue for an ordinary send", async () => {
+    render(<ConciergeHost feed={feed()} />);
+    await send("the first question");
+    // An ordinary send starts immediately — there is no queue to report, and inventing one would be
+    // noise on the overwhelmingly common path.
+    expect(announcer()).not.toMatch(/Queued/);
+
+    await send("the second question");
+    expect(announcer()).toContain("Queued — Next up");
+
+    await send("the third question");
+    expect(announcer()).toContain("Queued — 2nd in line");
+  });
+
+  /**
+   * A DROPPED MESSAGE IS SPOKEN, folded into the SAME write as the position.
+   *
+   * At {@link MAX_QUEUED_TURNS} the reducer evicts the OLDEST waiter. The thread gets a `failure`
+   * bubble naming the lost text — but this column's aria-live region does not read the thread, so
+   * this is the only channel it has. Announcing the position alone would hand a screen-reader user a
+   * reassuring receipt for the new message while an older question disappeared without a word.
+   *
+   * ONE write, not two: the region is a single `{ seq, text }`, so a second write would say only the
+   * second thing. Loss first, position after.
+   */
+  it("says which question was lost when the queue overflows, and still says where the new one sits", async () => {
+    render(<ConciergeHost feed={feed()} />);
+    // This one DISPATCHES, so it is the running turn and never a waiter — the cap is about the
+    // queue behind it.
+    await send("the running question");
+    // Fill the queue to exactly the cap, so the next send is the one that evicts.
+    for (let n = 0; n < MAX_QUEUED_TURNS; n += 1) await send(`waiter ${n}`);
+    expect(announcer()).not.toMatch(/dropped/i);
+
+    await send("the one that pushes it over");
+    // The OLDEST waiter goes — `waiter 0`, not the running turn and not the newest message. The
+    // reducer drops from the front deliberately: refusing the newest would throw away the thing the
+    // user is still looking at.
+    expect(announcer()).toContain("One queued message was dropped: waiter 0");
+    // THE POSITION'S VALUE, not merely its presence. This number is the one boundary-sensitive value
+    // in the folded string: it is read from `outcome.next` AFTER the reducer has both shift()ed the
+    // evicted waiter and appended the new one, so an off-by-one either way — 49th, 51st, or the
+    // pre-drop state — would leave a `/in line/` match green. Tied to the cap constant so it cannot
+    // drift from MAX_QUEUED_TURNS.
+    expect(announcer()).toContain(`Queued — ${waitingLine(MAX_QUEUED_TURNS)}.`);
+  });
+
+  /**
+   * NO ANNOUNCEMENT WHEN A QUEUED MESSAGE IS PROMOTED, asserted so the omission is deliberate.
+   *
+   * ══ NOT BECAUSE ONE REGION CAN ONLY CARRY ONE FACT ═════════════════════════════════════════════
+   * The drop notice above folds two facts into one string, so that was never the constraint. The
+   * reason that survives folding is what the reader could otherwise KNOW. A destroyed question is
+   * unrecoverable and mentioned nowhere else — if the region does not say it, it is gone. A
+   * PROMOTION is derivable: the answer to message N arriving is itself the signal that N+1 is next,
+   * and the position lines already said where it sat. Folding it into the reply's write would push
+   * the ANSWER — the thing the user is waiting for — behind a detail they can infer, on the one
+   * channel a screen-reader user has.
+   *
+   * ══ WHAT THIS ACTUALLY PINS, STATED HONESTLY (roborev 58518) ═══════════════════════════════════
+   * The `seq` check catches a SECOND write — an `announce()` placed inside `drainQueue`. It does NOT
+   * by itself catch the fold-into-the-reply variant, which is still one write. The exact-text
+   * assertion is what closes that: appending "Now answering: …" to the reply's own string makes the
+   * region read something other than the reply, and this goes red.
+   */
+  it("writes the region exactly ONCE across the drain and the reply, with only the reply in it", async () => {
+    render(<ConciergeHost feed={feed()} />);
+    await send("what needs me");
+    await send("and is CI green");
+
+    const before = announceSeq();
+    act(() => h.brain.done?.({ id: "1", sessionId: "s1", text: "all calm" }));
+    await flush();
+
+    expect(announceSeq()).toBe(before + 1);
+    // EXACT, not `toContain` — see the docblock. `toContain("all calm")` survives a fold.
+    expect(announcer()).toBe("all calm");
   });
 });

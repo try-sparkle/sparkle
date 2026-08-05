@@ -47,7 +47,7 @@ import type { ConciergeMountedAgent } from "./Concierge/types";
 // The reply-anchoring RULE — which of the user's messages a reply is answering — lives in its own
 // pure module (no React, no stores) so the inference is unit-testable without mounting this file, and
 // so the stub that draws an anchor reads the same declaration the host writes.
-import { pendingAnchors, type ReplyAnchor } from "./Concierge/replyAnchors";
+import { anchorQuote, pendingAnchors, type ReplyAnchor } from "./Concierge/replyAnchors";
 // The linter's findings, projected to the metadata-only shape a message carries, plus the wording
 // rule the mounted-column notice below reuses so the banner and the inline mark say ONE thing.
 import { lintMarkText, toLintMarks, type MessageLintMark } from "./Concierge/lintMarks";
@@ -64,9 +64,10 @@ import { oneLine } from "./promptHistory";
 import { openProjectTab } from "../services/openProjectTab";
 import { agentExists } from "../services/agentReveal";
 import { useHistoryStore } from "../stores/historyStore";
-import { useConciergeMessageStatuses } from "../services/conciergeMessageStatuses";
+import { useConciergeMessageStatuses, waitingLine } from "../services/conciergeMessageStatuses";
 import {
   clearQueue,
+  waitingCount,
   EMPTY_TURN_QUEUE,
   // ALIASED: this file already has an `enqueue` — the send SERIALIZER, which orders network
   // round-trips within one send. This one queues whole TURNS. Different jobs, and a shadowed name
@@ -3125,6 +3126,26 @@ export function ConciergeHost({
         },
       ]);
     }
+    // ══ THE QUEUE REACHES A SCREEN READER TOO ═════════════════════════════════════════════════════
+    // The per-message status line is deliberately NOT a live region: this column owns exactly ONE
+    // announcer and a second in the subtree double-announces (Concierge/MessageStatus's header, and
+    // ConciergeThread.roleLabels asserts it). That placement is justified on the AT reader getting
+    // the same information through the column's announcer — true while the line only repeated things
+    // announced elsewhere, and FALSE the moment it carries a queue POSITION, which nothing else says.
+    //
+    // ONE WRITE CARRYING BOTH FACTS, LOSS FIRST. The region is a single `{ seq, text }`, so two
+    // writes in one send means saying only the second — and the eviction above is by far the more
+    // important. Its `failure` bubble lives in the THREAD, which is not a live region, so this is the
+    // only channel it has: announcing the position alone would hand the reader a reassuring receipt
+    // for the new message while an older question disappeared without a word.
+    if (!outcome.dispatch) {
+      const position = `Queued — ${waitingLine(waitingCount(outcome.next))}.`;
+      announce(
+        outcome.dropped
+          ? `One queued message was dropped: ${anchorQuote(outcome.dropped.text)}. ${position}`
+          : position,
+      );
+    }
     if (!outcome.dispatch) {
       // WAITING. The turn in flight keeps the typing indicator, the liveness clock, the activity
       // floor and the awaited-bubble pointer — every one of those describes the turn being
@@ -3133,7 +3154,10 @@ export function ConciergeHost({
       return;
     }
     dispatchTurnRef.current(outcome.dispatch);
-  }, []);
+    // `announce` only — it is a `useCallback(…, [])` and therefore stable, so this keeps `askSparkle`
+    // stable too. Everything else here is a ref or a module function, deliberately, because it is
+    // installed on `askSparkleRef` and a changing identity would churn that.
+  }, [announce]);
 
   /**
    * Actually start a turn — the half of the old `askSparkle` tail that must only run for a send

@@ -6,7 +6,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { act, renderHook } from "@testing-library/react";
 
-import { useConciergeMessageStatuses } from "./conciergeMessageStatuses";
+import { useConciergeMessageStatuses, waitingLine } from "./conciergeMessageStatuses";
 import {
   _resetConciergeActivityForTests,
   noteConciergeNativeToolCall,
@@ -19,7 +19,7 @@ import {
   noteConciergeSent,
 } from "./conciergeLiveness";
 import { useProjectStore } from "../stores/projectStore";
-import { enqueue, EMPTY_TURN_QUEUE } from "../engine/conciergeTurnQueue";
+import { enqueue, EMPTY_TURN_QUEUE, turnFinished } from "../engine/conciergeTurnQueue";
 
 /** The counter as it stands now — what the host snapshots as the turn floor. */
 const seqNow = () => useConciergeActivityStore.getState().latest?.seq ?? -1;
@@ -129,14 +129,27 @@ describe("useConciergeMessageStatuses", () => {
     expect(renders).toBe(before);
   });
 
-  // The phrase, and NOTHING else. The tone used to ride along here; it is the leaf's now, and a
-  // producer that grew one back would put the 1 Hz ticker in the host again.
-  it("hands down the phrase alone — no tone, no clock reading", () => {
+  /**
+   * NO TONE, AND NO CLOCK READING. The tone used to ride down from here; it is the leaf's now, and a
+   * producer that grew one back would put the 1 Hz ticker in the host again (roborev 57889-M2).
+   *
+   * Asserted as the ABSENCE OF A TONE rather than as an exact key list, and the difference matters:
+   * the key list said `["text"]`, so it also failed for `live` — a static boolean that is a fact
+   * about the QUEUE (is this the running entry?) and requires reading no clock at all. That is
+   * exactly the kind of addition this rule should permit, and enumerating keys made the test assert
+   * something stricter than the invariant it documents. What must never appear is `tone`, or any
+   * other field whose value is a reading of elapsed time.
+   */
+  it("hands down no tone and no clock reading", () => {
     const floor = seqNow();
     noteConciergeSent();
     noteConciergePhase("composing");
     const { result } = renderHook(() => useConciergeMessageStatuses("msg-1", true, floor));
-    expect(Object.keys(result.current["msg-1"]!)).toEqual(["text"]);
+    const status = result.current["msg-1"]!;
+    expect(status).not.toHaveProperty("tone");
+    // Everything handed down is either the phrase or a static queue fact — nothing time-derived.
+    expect(Object.keys(status).sort()).toEqual(["live", "text"]);
+    expect(typeof status.live).toBe("boolean");
   });
 
   /**
@@ -158,11 +171,11 @@ describe("useConciergeMessageStatuses", () => {
 
     const { result } = renderHook(() => useConciergeMessageStatuses("msg-1", true, floor, q));
     // The one being worked on gets the observed tool line…
-    expect(result.current["msg-1"]!.text).not.toBe("Waiting its turn");
+    expect(result.current["msg-1"]!.text).not.toMatch(/in line|Next up/);
     expect(result.current["msg-1"]!.text.length).toBeGreaterThan(0);
-    // …and the ones behind it say only that they are in line.
-    expect(result.current["msg-2"]).toEqual({ text: "Waiting its turn" });
-    expect(result.current["msg-3"]).toEqual({ text: "Waiting its turn" });
+    // …and the ones behind it say only where they stand in the queue.
+    expect(result.current["msg-2"]).toEqual({ text: "Next up" });
+    expect(result.current["msg-3"]).toEqual({ text: "2nd in line" });
   });
 
   // A waiting line does NOT depend on the activity floor or on `typing`: a queued message has no
@@ -173,7 +186,137 @@ describe("useConciergeMessageStatuses", () => {
     let q = enqueue(EMPTY_TURN_QUEUE, { bubbleId: "msg-1", text: "first" }).next;
     q = enqueue(q, { bubbleId: "msg-2", text: "second" }).next;
     const { result } = renderHook(() => useConciergeMessageStatuses("msg-1", true, floor, q));
-    expect(result.current["msg-1"]).toBeUndefined(); // no activity, no claim
-    expect(result.current["msg-2"]).toEqual({ text: "Waiting its turn" });
+    expect(result.current["msg-2"]).toEqual({ text: "Next up" });
+  });
+
+
+
+
+  /**
+   * WHERE YOU STAND, NOT JUST THAT YOU ARE WAITING (the founder's *"a queue of effectively twenty to
+   * fifty messages"*).
+   *
+   * Every waiter used to render the identical `"Waiting its turn"`. At the depth this queue is built
+   * for that is a wall of twenty identical lines: it says a message is in the queue and withholds the
+   * one thing the reader wants — how far off its answer is. `waitingCount` had computed the depth
+   * since the queue landed and NOTHING read it.
+   *
+   * Asserted on the DISTINCTNESS of the lines across a burst, which is the property that failed
+   * before: a producer that ignored position would still return a full map of plausible strings, so
+   * a per-message assertion alone could pass while every line said the same thing.
+   */
+  it("tells each waiter its own place in the queue, so twenty lines are not identical", () => {
+    const floor = seqNow();
+    noteConciergeSent();
+    let q = enqueue(EMPTY_TURN_QUEUE, { bubbleId: "run", text: "running" }).next;
+    for (let n = 1; n <= 20; n += 1) q = enqueue(q, { bubbleId: `w${n}`, text: `q${n}` }).next;
+
+    const { result } = renderHook(() => useConciergeMessageStatuses("run", true, floor, q));
+    const lines = Array.from({ length: 20 }, (_, i) => result.current[`w${i + 1}`]!.text);
+    expect(new Set(lines).size).toBe(20);
+    expect(lines[0]).toBe("Next up");
+    expect(lines[1]).toBe("2nd in line");
+    expect(lines[19]).toBe("20th in line");
+  });
+
+  /**
+   * THE LINE MOVES. A position that is right once and then frozen would be worse than no position at
+   * all — it would keep telling the reader they are third while they are actually next.
+   *
+   * ON ONE MOUNTED HOOK, via `rerender`, and that is the whole point of the case (roborev 58249-M1).
+   * A second `renderHook` builds a FRESH instance, and a fresh instance recomputes no matter what the
+   * `useMemo` dependency list says — so the obvious version of this test passes against an
+   * implementation whose positions are frozen for the life of the turn. The concrete regression it
+   * has to catch is `queue` being dropped from that dependency array: the host holds ONE long-lived
+   * hook instance and mutates the queue on every enqueue and drain, so a stale memo there is exactly
+   * the frozen line this docstring calls worse than nothing. Driven through the real reducer rather
+   * than by hand-editing the queue.
+   */
+  it("promotes the next waiter on the SAME hook instance when the running turn finishes", () => {
+    const floor = seqNow();
+    noteConciergeSent();
+    let q = enqueue(EMPTY_TURN_QUEUE, { bubbleId: "run", text: "running" }).next;
+    q = enqueue(q, { bubbleId: "a", text: "a" }).next;
+    q = enqueue(q, { bubbleId: "b", text: "b" }).next;
+
+    const { result, rerender } = renderHook(
+      ({ queue, id }) => useConciergeMessageStatuses(id, true, floor, queue),
+      { initialProps: { queue: q, id: "run" as string } },
+    );
+    // The running entry carries nothing here: this suite records no activity for it, and a
+    // message with no observed activity gets no claim (see the call site).
+    expect(result.current["run"]).toBeUndefined();
+    expect(result.current["a"]).toEqual({ text: "Next up" });
+    expect(result.current["b"]).toEqual({ text: "2nd in line" });
+
+    // The running turn ends: `a` starts, and `b` moves up to the front of the line.
+    rerender({ queue: turnFinished(q).next, id: "a" });
+    expect(result.current["a"]).toBeUndefined();
+    expect(result.current["b"]).toEqual({ text: "Next up" });
+    // …and the finished message is no longer claimed by anything.
+    expect(result.current["run"]).toBeUndefined();
+  });
+
+  /**
+   * THE QUEUE ALONE MOVES THE LINES — the case that actually isolates the memo.
+   *
+   * The promotion case above changes `awaitingId` as well as the queue, and `awaitingId` is itself a
+   * dependency, so it recomputes for a reason that has nothing to do with the queue: dropping `queue`
+   * from the dependency list leaves that test green (verified by hand-mutation). This one holds
+   * EVERY other input fixed and changes only the queue, which is the sole shape that can fail on a
+   * stale memo.
+   *
+   * It is also the most common thing that happens in a burst: the founder sends again while the same
+   * turn keeps running, so `awaitingId` does not move and the new bubble must still light up
+   * immediately. With a stale memo it would render nothing at all — the message would look like it
+   * had not been received, which is precisely the fear the queue was built to answer.
+   */
+  it("shows a newly enqueued message while the SAME turn keeps running", () => {
+    const floor = seqNow();
+    noteConciergeSent();
+    const running = enqueue(EMPTY_TURN_QUEUE, { bubbleId: "run", text: "running" }).next;
+    const withA = enqueue(running, { bubbleId: "a", text: "a" }).next;
+
+    const { result, rerender } = renderHook(
+      ({ queue }) => useConciergeMessageStatuses("run", true, floor, queue),
+      { initialProps: { queue: withA } },
+    );
+    expect(result.current["a"]).toEqual({ text: "Next up" });
+    expect(result.current["b"]).toBeUndefined();
+
+    // A third message arrives. Nothing else about the turn has changed — same running bubble, same
+    // floor, same activity — so only the queue can carry this.
+    rerender({ queue: enqueue(withA, { bubbleId: "b", text: "b" }).next });
+    expect(result.current["a"]).toEqual({ text: "Next up" });
+    expect(result.current["b"]).toEqual({ text: "2nd in line" });
+  });
+});
+
+/**
+ * THE ORDINALS, over the range this queue is actually built for.
+ *
+ * The founder asked for *"twenty to fifty messages"*, which is exactly the span where the naive
+ * `n + "th"`/`n % 10` rules break: the teens (11th, 12th, 13th) take `th` despite ending in 1/2/3,
+ * and the twenties resume `st`/`nd`/`rd`. A queue capped at {@link MAX_QUEUED_TURNS} = 50 reaches all
+ * of them, so these are live cases and not pedantry.
+ */
+describe("waitingLine", () => {
+  it("calls the front of the queue what it is, rather than numbering it", () => {
+    expect(waitingLine(1)).toBe("Next up");
+  });
+
+  it.each([
+    [2, "2nd in line"],
+    [3, "3rd in line"],
+    [4, "4th in line"],
+    [11, "11th in line"],
+    [12, "12th in line"],
+    [13, "13th in line"],
+    [21, "21st in line"],
+    [22, "22nd in line"],
+    [23, "23rd in line"],
+    [50, "50th in line"],
+  ])("renders position %i as %s", (position, expected) => {
+    expect(waitingLine(position)).toBe(expected);
   });
 });

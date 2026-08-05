@@ -27,9 +27,12 @@
 // between states, and MessageStatus.test.tsx asserts it programmatically across all four tones
 // rather than one case at a time, because "only the colour differs" is a claim about the SET.
 //
-// NO STATUS, NO ROW. A hundred-message thread has a status on approximately one bubble; every other
-// one renders `null` — not an empty box and not a reserved height. Reserving the height would push
-// the whole transcript down by a line per message for a surface that is almost always absent.
+// NO STATUS, NO ROW. A status sits on the message being worked on and on every message queued behind
+// it — one plus the queue depth, which is a handful in a hundred-message thread and still zero on the
+// overwhelming majority of bubbles. Every other one renders `null`: not an empty box and not a
+// reserved height, because reserving it would push the whole transcript down by a line per message
+// for a surface that is absent almost everywhere. (This used to say "approximately one bubble", which
+// was true only before the turn queue — see {@link ConciergeMessageStatusText.live}.)
 //
 // NOT A LIVE REGION, deliberately, and this is the third time that conclusion has been reached the
 // hard way. The column owns exactly ONE announcer (ConciergeColumn), and a second region in this
@@ -65,6 +68,29 @@ export interface ConciergeMessageStatus {
  */
 export interface ConciergeMessageStatusText {
   text: string;
+  /**
+   * Does this line describe something IN PROGRESS, whose ink should age?
+   *
+   * ══ WHY THIS DISCRIMINATOR EXISTS: 50 TICKERS ══════════════════════════════════════════════════
+   * Only one bubble could ever carry a status until the turn queue landed, so `MessageStatusLive`'s
+   * header could say "exactly one of these exists" and put `useConciergeLiveness` in the leaf on
+   * that basis. A queue changes the arithmetic: every WAITING message carries a line too, up to
+   * {@link MAX_QUEUED_TURNS} = 50 of them, and routing all of those through the live component would
+   * mount 50 tickers — each re-rendering at 1 Hz for the whole of every turn, and each subscribed to
+   * the liveness store WITHOUT a selector, so each also wakes on every `noteConciergeProgress`, i.e.
+   * once per token chunk. That is the exact cost the leaf placement was chosen to avoid, multiplied
+   * by the queue depth.
+   *
+   * ══ AND IT IS A CORRECTNESS FIX, NOT ONLY A COST ONE ═══════════════════════════════════════════
+   * The clock those tickers read is the RUNNING turn's. A waiting message has no turn, so ageing its
+   * ink says the wrong thing twice over: a queued question would go amber at 30s and sienna at 60s —
+   * the app's two alarm inks — because a DIFFERENT message is taking a long time. Nothing is wrong
+   * with the queued one; it simply has not started.
+   *
+   * So `false`/absent means STATIC: drawn once, quiet ink, no clock. True means the running message,
+   * where the age ladder is exactly the signal the founder asked for.
+   */
+  live?: boolean;
 }
 
 /**
@@ -146,10 +172,19 @@ export function MessageStatus({ status }: { status?: ConciergeMessageStatus | nu
  * Mounted ONLY when there is a status, which is why the hook can live here at all: `useConciergeLiveness`
  * keeps `now` in state and re-renders its caller at 1 Hz for the duration of every turn, and it
  * subscribes to the liveness store WITHOUT a selector — so it also re-renders on every
- * `noteConciergeProgress`, i.e. per token chunk. In a hundred-message thread exactly one bubble ever
- * carries a status (see this file's header), so exactly one of these exists, and both of those
- * re-render paths stop at this `div`. Calling the hook one level up — in `MessageStatus`, which every
- * row renders — would mount a ticker per bubble; calling it in the producer put it in the host.
+ * `noteConciergeProgress`, i.e. per token chunk. Exactly one status is `live` at a time — the message
+ * whose turn is actually running — so exactly one of these exists, and both of those re-render paths
+ * stop at this `div`.
+ *
+ * THAT IS A PROPERTY OF THE FLAG, NOT OF THE THREAD, and the distinction is load-bearing now. It
+ * used to rest on "exactly one bubble ever carries a status", which the turn queue retired: every
+ * WAITING message carries one too, up to {@link MAX_QUEUED_TURNS}. Routing a waiter through here —
+ * by setting `live: true` on it in the producer — re-creates precisely the per-bubble ticker cost
+ * this placement exists to avoid, multiplied by the queue depth, and ages its ink off a clock that
+ * belongs to a different message. See {@link ConciergeMessageStatusText.live}.
+ *
+ * Calling the hook one level up — in `MessageStatus`, which every row renders — would mount a ticker
+ * per bubble; calling it in the producer put it in the host.
  */
 function LiveMessageStatus({ text }: { text: string }) {
   const { liveness } = useConciergeLiveness();
@@ -176,5 +211,8 @@ function LiveMessageStatus({ text }: { text: string }) {
  */
 export function MessageStatusLive({ status }: { status?: ConciergeMessageStatusText | null }) {
   if (!status) return null;
+  // A STATIC line takes the plain component and never mounts the ticker — see `live`'s doc for why
+  // that matters at queue depth, and why a waiting message must not age into an alarm ink.
+  if (!status.live) return <MessageStatus status={{ text: status.text, tone: "waiting" }} />;
   return <LiveMessageStatus text={status.text} />;
 }
