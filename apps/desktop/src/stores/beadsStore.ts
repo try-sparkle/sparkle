@@ -37,6 +37,19 @@ export const BEADS_POLL_INTERVAL_MS = 5000;
  *  once per window, so a wedged store retries on a slow trickle, never a convoy. */
 export const BEADS_STALE_REFRESH_MS = 6 * BEADS_POLL_INTERVAL_MS;
 
+/**
+ * How often the concierge re-reads the projects it is NOT looking at, so a bead id belonging to one
+ * of them still resolves. `BeadPillHost` owns the sweep and the reasoning behind it.
+ *
+ * SIX TIMES SLOWER than the poll interval, deliberately. Every refresh is a `bd list --all` +
+ * `bd blocked` pair against the shared embedded store, so sweeping N projects at the board's
+ * cadence would multiply the exact subprocess load the in-flight guard above exists to contain —
+ * for projects nobody is looking at. A cross-project pill needs EXISTENCE, which does not change
+ * second to second; the status dot lagging by up to this interval is the cheap half of the trade,
+ * and the project the reader IS looking at keeps the fast cadence.
+ */
+export const BEADS_CROSS_PROJECT_REFRESH_MS = 30_000;
+
 /** Cap on the exponential backoff between successive steals of a hung claim: the effective window is
  *  `BEADS_STALE_REFRESH_MS × 2^min(consecutiveSteals, this)`. A steal cannot CANCEL the `bd` process
  *  it abandons, so each one leaks a blocked subprocess until the store recovers; stealing on a fixed
@@ -79,8 +92,17 @@ interface BeadsState {
    *  land in `error` and the previous snapshot is left intact.
    *
    *  `runWatchers` defaults to TRUE so every existing direct caller keeps the behaviour it had; the
-   *  poll paths pass the answer derived from who is actually watching. */
-  refresh: (projectId: string, projectPath: string, runWatchers?: boolean) => Promise<void>;
+   *  poll paths pass the answer derived from who is actually watching.
+   *
+   *  `allowAutoInit` likewise defaults to TRUE. Passing `false` means "read this project, but do not
+   *  CREATE anything in it" — see the auto-init branch in the catch below for why the cross-project
+   *  resolution sweep must say so. */
+  refresh: (
+    projectId: string,
+    projectPath: string,
+    runWatchers?: boolean,
+    allowAutoInit?: boolean,
+  ) => Promise<void>;
   /** Start polling a project: refresh immediately, then every intervalMs. Idempotent in the sense
    *  that matters — one timer per project — but REFERENCE-COUNTED, so N viewers of the same project
    *  each hold the poller up and the timer stops when the last one lets go. See `viewers` below.
@@ -204,7 +226,7 @@ export const useBeadsStore = create<BeadsState>()((set) => ({
   loading: {},
   error: {},
 
-  refresh: async (projectId, projectPath, runWatchers = true) => {
+  refresh: async (projectId, projectPath, runWatchers = true, allowAutoInit = true) => {
     // "Off means off": with [tools].beads disabled, never shell out to `bd`. This is the single
     // chokepoint for the CLI (startPolling's immediate + interval + visibility-refresh paths all
     // route through here), and it also gates the post-poll decompose watcher below. Drop any prior
@@ -273,7 +295,20 @@ export const useBeadsStore = create<BeadsState>()((set) => ({
       // list so the board self-heals into an empty state instead of surfacing that raw error —
       // "beads by default". Only the recognized "no DB" case triggers this; any other failure, or
       // a still-failing retry, falls through to the normal error path below.
-      if (isBeadsUnavailable(e) && !autoInitAttempted.has(projectId)) {
+      //
+      // ══ `allowAutoInit` IS WHAT KEEPS "BEADS BY DEFAULT" FROM BECOMING "BEADS EVERYWHERE" ══════
+      // Auto-init WRITES to the user's repo — it creates a `.beads/` store — and that is a fair
+      // trade for a project someone has opened a board on, because they asked to see the board.
+      // It is NOT a fair trade for the cross-project resolution sweep, which reads every registered
+      // project the moment the concierge mounts: that would silently create a beads DB in every
+      // repo the user has ever added, unprompted and invisibly. The sweep passes `false`, so a
+      // project with no DB simply contributes no beads and its ids stay prose — the same outcome
+      // the reader already had, at no cost to their repo.
+      //
+      // `autoInitAttempted` is deliberately NOT marked on the suppressed path. The one-shot budget
+      // belongs to the caller that is allowed to spend it, so a later BOARD poll on the same
+      // project can still self-heal exactly as it does today.
+      if (isBeadsUnavailable(e) && allowAutoInit && !autoInitAttempted.has(projectId)) {
         autoInitAttempted.add(projectId);
         try {
           await ensureBeadsDb(projectPath);
@@ -302,6 +337,23 @@ export const useBeadsStore = create<BeadsState>()((set) => ({
           }));
           return;
         }
+      }
+      // ══ A SUPPRESSED AUTO-INIT REPORTS NOTHING, BECAUSE NOBODY ASKED ═══════════════════════════
+      // Reached only when auto-init was declined above, i.e. the cross-project sweep found a project
+      // with no beads DB. Falling through to the error commit below would be a WRITE the sweep's
+      // whole design is trying to avoid — a different one than `bd init`, but visible in the same
+      // way: `error` is shared, and `BoardView` renders `s.error[project.id]` as a banner. So the
+      // concierge merely mounting would record "no beads database found" for a project in the
+      // background, and the banner would then paint the moment the user opened that board — for the
+      // whole duration of the init + retry that used to happen silently. Before the sweep existed
+      // that entry was never set at all: the board's OWN refresh auto-healed inside the catch and
+      // the user saw an empty board.
+      //
+      // "A project the sweep could not read" is not news for a surface nobody has opened. Clear
+      // `loading` and say nothing; the board's own refresh will still heal it when someone looks.
+      if (isBeadsUnavailable(e) && !allowAutoInit) {
+        commit((s) => ({ loading: { ...s.loading, [projectId]: false } }));
+        return;
       }
       // Best-effort: a bd/parse failure must not break the UI. Keep the last snapshot,
       // surface the message, and clear the loading flag.

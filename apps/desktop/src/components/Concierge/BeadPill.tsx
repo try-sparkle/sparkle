@@ -52,7 +52,7 @@ import { C } from "../../theme/colors";
 import { FONT_MONO, TYPE } from "../../theme/scale";
 import { MENTION_PILL_FILL } from "./MentionPill";
 import { sideOf } from "../../engine/pairs";
-import { useBeadsStore } from "../../stores/beadsStore";
+import { BEADS_CROSS_PROJECT_REFRESH_MS, useBeadsStore } from "../../stores/beadsStore";
 import { useProjectStore } from "../../stores/projectStore";
 import { useSettingsStore } from "../../stores/settingsStore";
 import { useUiStore } from "../../stores/uiStore";
@@ -64,6 +64,27 @@ import type { Bead, BeadStatus } from "../../services/beads";
 export interface ResolvedBead {
   bead: Bead;
   projectId: string;
+  /**
+   * The project's name, set ONLY when the bead lives outside the SELECTED project.
+   *
+   * ══ WHY THIS IS ON THE CARD AND NOT ON THE PILL ═════════════════════════════════════════════
+   * The pill cannot carry it. An unresolved candidate is deliberately indistinguishable from
+   * ordinary hyphenated English, so there is no "this one is elsewhere" state to render before a
+   * bead resolves — the component does not know the token is an id at all. Only a bead that HAS
+   * resolved can say where it lives, and by then the card is the surface.
+   *
+   * ══ WHY IT IS WORTH SAYING AT ALL ═══════════════════════════════════════════════════════════
+   * `viewOnBoard` below calls `selectProject` before opening the board, so "View on board" on a
+   * bead from another project SWITCHES the reader's whole selected project. That is the right
+   * behaviour — the board is per-side and would otherwise never contain the bead — but it is a
+   * large, silent jump to make on an unannounced click. Naming the project turns it into a
+   * choice.
+   *
+   * OPTIONAL, and absence means "same project as the reader's" rather than "unknown": a surface
+   * that supplies no names (a test fixture, `SupportModal`) simply shows no line, which is the
+   * same thing it showed before.
+   */
+  projectName?: string;
 }
 
 export interface BeadPillContextValue {
@@ -86,6 +107,11 @@ export interface BeadPillContextValue {
    *  is not a dead end: the click already produced the card. */
   onViewOnBoard?: (target: { beadId: string; projectId: string }) => boolean;
 }
+
+/** One project the reader is NOT currently in: `[id, rootPath, name]`. The sweep needs the first
+ *  two, the card needs the third, and carrying them as one tuple is what keeps "which projects are
+ *  foreign" from being answered twice and differently. */
+type ForeignProject = [string, string, string];
 
 /** A STABLE empty default — a module const, not an inline literal, so every `<Markdown>` outside the
  *  concierge column (SupportModal, agent replies) shares one identity and never re-renders on it. */
@@ -115,14 +141,28 @@ export const BeadPillProvider = BeadPillContext.Provider;
  * added for this and fixes a latent bug it did not cause — two boards on one project (a project can
  * be shown in both pairs) already had the first board's poller killed by the second board's unmount.
  *
- * ══ WHICH PROJECT ═══════════════════════════════════════════════════════════════════════════════
- * The SELECTED one, which is the project the founder is working in and the project whose ids the
- * concierge is overwhelmingly writing. Ids belonging to a project nobody has open resolve to
- * nothing and render as plain text — the safe direction, and the one the bead asks for.
+ * ══ WHICH PROJECT — EVERY ONE OF THEM, AT TWO DIFFERENT SPEEDS ══════════════════════════════════
+ * The SELECTED project is polled at the board's own cadence: it is the project the founder is
+ * working in and the one whose ids the concierge is overwhelmingly writing, so its bead statuses
+ * stay live to the second.
  *
- * RESOLUTION, though, spans every project the store currently holds, not just the polled one. That
- * costs nothing (the snapshots are already there — a board open in either pair contributes one) and
- * it is what lets the click below open the RIGHT board rather than assuming the selected one.
+ * EVERY OTHER REGISTERED PROJECT is swept on the much slower `BEADS_CROSS_PROJECT_REFRESH_MS`, and
+ * that sweep is the fix for a bug that made this feature look broken to the founder rather than
+ * incomplete. `indexBeads` below has always spanned every project in `byProject`, so the LOOKUP was
+ * never single-project — but `byProject` only ever holds projects something is actively polling,
+ * and until the sweep the only passive poller was this host on the selected project. A bead id the
+ * concierge wrote for any other project therefore missed the index and rendered as dead prose.
+ *
+ * That failure was INVISIBLE by construction, which is why it survived. An id that does not resolve
+ * is deliberately indistinguishable from the ordinary hyphenated English the loose pattern also
+ * matches ("auto-heal", "one-shot"), so the pill cannot announce "this one lives in another
+ * project" — it does not know the token is a bead id at all. There is no degraded state to notice.
+ * The only place the difference can be made visible is on a bead that HAS resolved, which is what
+ * the card's project line does. So the fix has to be resolution, not a better error.
+ *
+ * The sweep reads and never writes: no decompose watcher (nobody is viewing those boards) and no
+ * auto-init (creating a `.beads/` store in every repo the user ever registered is not something a
+ * concierge render should do). See `refresh`'s `allowAutoInit`.
  */
 export function BeadPillHost({ children }: { children: ReactNode }) {
   const byProject = useBeadsStore((s) => s.byProject);
@@ -140,6 +180,103 @@ export function BeadPillHost({ children }: { children: ReactNode }) {
   // claim before the new one is taken.
   const beadsEnabled = useSettingsStore((s) => s.beadsEnabled);
 
+  /**
+   * Every project EXCEPT the selected one, flattened to a string.
+   *
+   * A STRING RATHER THAN AN ARRAY, because this is an effect dependency. A selector returning a
+   * fresh `Project[]` (or even a fresh array of ids) is a new reference on every projectStore write
+   * — and projectStore is written constantly, by agent status ticks — so the sweep effect would tear
+   * down and re-arm its interval several times a second, re-firing the immediate sweep each time.
+   * That turns a 30-second read into a hot loop of `bd` subprocesses. Comparing a string means the
+   * effect re-runs only when the SET of projects (or the selection) genuinely changes.
+   */
+  const others = useProjectStore((s) =>
+    JSON.stringify(
+      s.projects
+        .filter((p) => p.id !== s.selectedProjectId && p.rootPath !== "")
+        // The NAME rides along because the card needs it (see `ResolvedBead.projectName`) and
+        // deriving both from one string keeps the sweep and the index from disagreeing about which
+        // projects count as foreign. Annotated as a TUPLE rather than inferred: without it the
+        // elements widen to `string | undefined` under `noUncheckedIndexedAccess` and the sort below
+        // cannot compare them.
+        .map((p): ForeignProject => [p.id, p.rootPath, p.name])
+        // SORTED, so two stores holding the same projects in a different order compare EQUAL and
+        // the effect does not re-arm on a reorder that changes nothing about what to read.
+        .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)),
+    ),
+  );
+
+  // THE CROSS-PROJECT SWEEP — see this component's header for why it exists.
+  //
+  // Deliberately NOT `startPolling`. That path keeps ONE timer per project and the first claimant's
+  // interval wins, so a slow claim here would pin a project a `BoardView` later opens to this
+  // interval instead of the board's — a silent downgrade of someone else's live board. Calling
+  // `refresh` directly avoids the shared timer entirely, and `refresh`'s own in-flight guard already
+  // makes an overlapping board poll safe (the later call is coalesced, not stacked).
+  useEffect(() => {
+    if (!beadsEnabled) return;
+    const targets = JSON.parse(others) as ForeignProject[];
+    if (targets.length === 0) return;
+    // A one-shot `visibilitychange` re-arm, mirroring the store's own `armVisibilityRefresh`.
+    //
+    // The first version of this skipped a hidden tick and simply waited for the next interval, on
+    // the reasoning that a stale cross-project snapshot "shows nothing wrong on screen". That was
+    // wrong about the symptom: an unswept project's ids are not stale, they are DEAD PROSE — the
+    // exact bug this whole change exists to fix, reappearing for up to a full interval every time
+    // the founder comes back to the app. Staleness is invisible; a dead id is the complaint.
+    let onVisible: (() => void) | null = null;
+    const disarm = () => {
+      if (onVisible !== null && typeof document !== "undefined") {
+        document.removeEventListener("visibilitychange", onVisible);
+      }
+      onVisible = null;
+    };
+    const armVisible = () => {
+      if (typeof document === "undefined" || onVisible !== null) return;
+      onVisible = () => {
+        // Also fires on visible→hidden; only the return trip is interesting.
+        if (document.visibilityState !== "visible") return;
+        disarm();
+        sweep();
+      };
+      document.addEventListener("visibilitychange", onVisible);
+    };
+    const sweep = () => {
+      // Same gate the poll interval uses: don't shell out for a window nobody is looking at — but
+      // arm the re-entry above so the wait ends when the reader returns, not when the timer says so.
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+        armVisible();
+        return;
+      }
+      const now = Date.now();
+      const loaded = useBeadsStore.getState().byProject;
+      for (const [id, path] of targets) {
+        // ══ FRESHNESS, NOT EFFECT IDENTITY, DECIDES WHETHER TO SHELL OUT ═══════════════════════
+        // `others` filters on `selectedProjectId`, so it changes on EVERY selection change and
+        // re-arms this effect — which re-fires the immediate sweep below for all N−1 remaining
+        // projects, including the N−2 that were read seconds ago and did not change. Clicking
+        // through the project strip (or any "View on board", which calls `selectProject`) would
+        // otherwise produce back-to-back convoys of `bd` subprocesses against the shared store —
+        // exactly the load the 6× interval was chosen to avoid. `refresh`'s in-flight guard does
+        // not cover this: it coalesces CONCURRENT calls for one project, not back-to-back ones.
+        const at = loaded[id]?.loadedAt;
+        if (at !== undefined && now - at < BEADS_CROSS_PROJECT_REFRESH_MS) continue;
+        // `false, false` — no watchers, no auto-init. Both are WRITES (one spends AI and files
+        // child beads, the other creates a `.beads/` store in the user's repo), and nobody asked a
+        // concierge render to write anything.
+        void useBeadsStore.getState().refresh(id, path, false, false);
+      }
+    };
+    // Immediately, so an id resolves on the first render the founder actually reads rather than up
+    // to a full interval later.
+    sweep();
+    const timer = setInterval(sweep, BEADS_CROSS_PROJECT_REFRESH_MS);
+    return () => {
+      clearInterval(timer);
+      disarm();
+    };
+  }, [others, beadsEnabled]);
+
   useEffect(() => {
     if (projectId === undefined || rootPath === undefined) return;
     // "passive", NOT the default "board". This host is mounted for the whole app session (the
@@ -151,30 +288,74 @@ export function BeadPillHost({ children }: { children: ReactNode }) {
     return () => useBeadsStore.getState().stopPolling(projectId, "passive");
   }, [projectId, rootPath, beadsEnabled]);
 
+  // `others` rather than the `projects` array, for the reason its own docstring gives: an array
+  // dependency here would rebuild the whole index on every agent status tick.
+  // THE INDEX IS DERIVED FROM WHAT IS REGISTERED NOW, not from whatever the store still holds.
+  //
+  // `byProject` is a CACHE and nothing prunes it: removing a project only touches `projectStore`,
+  // and switching `[tools].beads` off stops the pollers rather than clearing snapshots (the clear
+  // in `refresh` only reaches projects that get another call, and with beads off none do). Indexing
+  // it raw therefore outlives both events — a pill for a project that no longer exists, or beads
+  // still resolving after the user turned beads off. Narrowing here fixes both without a new
+  // clearing path, and it cannot go stale because it is recomputed from the live stores.
   const value = useMemo<BeadPillContextValue>(
-    () => ({ beads: indexBeads(byProject), onViewOnBoard: viewOnBoard }),
-    [byProject],
+    () => ({
+      beads: beadsEnabled ? indexBeads(byProject, foreignProjects(others), projectId) : EMPTY_BEADS,
+      onViewOnBoard: viewOnBoard,
+    }),
+    [byProject, others, projectId, beadsEnabled],
   );
   return <BeadPillProvider value={value}>{children}</BeadPillProvider>;
 }
 
 /**
- * Every bead in every polled project, indexed by id.
+ * Every bead in every loaded project, indexed by id.
  *
- * FIRST PROJECT WINS on a collision. Bead ids carry a project prefix (`sparkle-…`, `bd-…`) so a
- * genuine collision across two repos is not reachable in practice; picking deterministically rather
- * than last-wins simply means the answer does not depend on object key order.
+ * ══ THE READER'S OWN PROJECT IS INDEXED FIRST, AND THAT IS NOT A TIE-BREAK NICETY ═══════════════
+ * The rule used to be "first project wins", justified by ids carrying a project prefix so a
+ * collision was unreachable. The cross-project sweep RETIRED that premise, and the collision it
+ * opens is not exotic: `bd` resolves `.beads/` through `git-common-dir`, so a worktree of a repo
+ * registered as its own project reads THE SAME DATABASE as the repo. Every id then collides, and
+ * which side won depended on refresh ORDER — with the sweep dispatched before the passive poll, the
+ * foreign copy usually landed first.
+ *
+ * The visible damage was on the reader's own beads: the card would show another project's snapshot,
+ * label it `in <other>`, and — worst — "View on board" would `selectProject` away from the project
+ * the reader was already in, for a bead that lives right there. Seeding from the selected project
+ * makes the winner a property of WHOSE BEAD IT IS rather than of which `bd` call returned first.
  */
 function indexBeads(
   byProject: Record<string, { beads: Bead[] } | undefined>,
+  /** The projects that are registered but NOT selected. Doubles as the membership test that keeps
+   *  a removed project's cached snapshot out of the index, and as the source of `projectName`. */
+  foreign: readonly ForeignProject[],
+  /** The selected project, indexed before all others. `undefined` when nothing is selected, in
+   *  which case there is no "reader's own" to prefer and insertion order decides as before. */
+  selectedProjectId: string | undefined,
 ): ReadonlyMap<string, ResolvedBead> {
   const out = new Map<string, ResolvedBead>();
-  for (const [projectId, snapshot] of Object.entries(byProject)) {
-    for (const bead of snapshot?.beads ?? []) {
-      if (!out.has(bead.id)) out.set(bead.id, { bead, projectId });
+  const names = new Map(foreign.map(([id, , name]) => [id, name]));
+  // The selected project FIRST, then every other registered one. Anything still sitting in
+  // `byProject` that is no longer registered is simply not visited.
+  const ordered = [
+    ...(selectedProjectId === undefined ? [] : [selectedProjectId]),
+    ...foreign.map(([id]) => id),
+  ];
+  for (const projectId of ordered) {
+    const name = names.get(projectId);
+    // Empty string is treated as "no name to show" rather than rendering `in ` with nothing after.
+    const projectName = name === undefined || name === "" ? undefined : name;
+    for (const bead of byProject[projectId]?.beads ?? []) {
+      if (!out.has(bead.id)) out.set(bead.id, { bead, projectId, projectName });
     }
   }
   return out;
+}
+
+/** The `others` string, read back. Parsed rather than threaded as a second selector so there is
+ *  exactly one definition of "which projects are foreign". */
+function foreignProjects(others: string): readonly ForeignProject[] {
+  return JSON.parse(others) as ForeignProject[];
 }
 
 /**
@@ -316,7 +497,7 @@ export function BeadPill({ beadId }: { beadId: string }) {
   // what arrives here is an ordinary hyphenated word like "auto-heal" that must come out unchanged.
   if (resolved === undefined) return <>{beadId}</>;
 
-  const { bead, projectId } = resolved;
+  const { bead, projectId, projectName } = resolved;
   const showMiss = misses > 0;
 
   return (
@@ -358,6 +539,7 @@ export function BeadPill({ beadId }: { beadId: string }) {
         <BeadCard
           id={cardId}
           bead={bead}
+          projectName={projectName}
           missSentence={showMiss ? noBoardSentence(bead.id) : undefined}
           missKey={misses}
           // THE NAVIGATION RUNS IN THE HANDLER, NEVER INSIDE THE UPDATER.
@@ -406,12 +588,15 @@ export function BeadPill({ beadId }: { beadId: string }) {
 function BeadCard({
   id,
   bead,
+  projectName,
   onViewOnBoard,
   missSentence,
   missKey,
 }: {
   id: string;
   bead: Bead;
+  /** Set only for a bead outside the reader's selected project — see `ResolvedBead.projectName`. */
+  projectName?: string;
   /** Absent when the surface has no board to open. The card is still the result of the click, so
    *  this is a missing SECOND step, not a dead end. */
   onViewOnBoard?: () => void;
@@ -422,6 +607,10 @@ function BeadCard({
     statusLabel(bead.status),
     bead.priority === undefined ? null : `P${bead.priority}`,
     bead.type ?? null,
+    // LAST in the row, and only when the bead is somewhere else. Appended to the existing meta line
+    // rather than given a line of its own: a card that grows is the thing DESC_MAX_H exists to
+    // prevent, and "which board" is the same class of fact as status and priority.
+    projectName === undefined || projectName === "" ? null : `in ${projectName}`,
   ].filter((v): v is string => v !== null && v !== "");
   return (
     <span

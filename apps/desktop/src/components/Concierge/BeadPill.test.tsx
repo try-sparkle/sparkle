@@ -14,9 +14,25 @@
 //
 // So: the `ConciergeThread` describe below is load-bearing. If it is ever deleted as redundant, the
 // feature can regress to firing on nothing a reader will ever see.
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// Stub the `bd` shell-outs so the CROSS-PROJECT describe below can drive real store loads without a
+// Tauri bridge. Everything else in this file switches `[tools].beads` OFF instead, so these mocks
+// are never reached by those rows — `refresh` returns before touching the service.
+const listBeads = vi.fn();
+const blockedBeadIds = vi.fn();
+const ensureBeadsDb = vi.fn();
+vi.mock("../../services/beads", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../services/beads")>();
+  return {
+    ...actual,
+    listBeads: (...a: unknown[]) => listBeads(...a),
+    blockedBeadIds: (...a: unknown[]) => blockedBeadIds(...a),
+    ensureBeadsDb: (...a: unknown[]) => ensureBeadsDb(...a),
+  };
+});
 import { Markdown } from "../Markdown";
 import { ConciergeThread } from "./ConciergeThread";
 import { BeadPillHost, BeadPillProvider, type BeadPillContextValue } from "./BeadPill";
@@ -29,6 +45,20 @@ import type { ConciergeMessage } from "./types";
 import type { Project } from "../../types";
 
 afterEach(() => cleanup());
+
+// ── THE POLLER IS STUBBED FOR THE WHOLE FILE, AND THAT REPLACED A SHARPER HACK ───────────────────
+// Letting the poller arm would shell out to `bd` through a Tauri bridge jsdom does not have, so the
+// rows below used to switch `[tools].beads` OFF to keep it quiet. That worked only by accident: it
+// leaned on beads-off still resolving whatever was already cached, which is precisely the behaviour
+// that had to change — a bead must NOT stay clickable after the user turns beads off. Stubbing the
+// two poller actions says what those rows actually meant ("don't poll"), and lets them keep beads
+// ON so they exercise the real resolution path.
+const realPoller = {
+  startPolling: useBeadsStore.getState().startPolling,
+  stopPolling: useBeadsStore.getState().stopPolling,
+};
+beforeEach(() => useBeadsStore.setState({ startPolling: () => {}, stopPolling: () => {} }));
+afterEach(() => useBeadsStore.setState(realPoller));
 
 function bead(over: Partial<Bead> & { id: string }): Bead {
   return {
@@ -64,6 +94,13 @@ function mountMarkdown(value: BeadPillContextValue, text: string) {
 
 const pills = () => screen.queryAllByTestId("concierge-bead-pill");
 const card = () => screen.queryByTestId("concierge-bead-card");
+
+/** jsdom's `visibilityState` is read-only; override the getter so a test can drive it. Mirrors the
+ *  helper in `beadsStore.visibility.test.ts` — the sweep is gated on the same signal the poller is. */
+function setVisibility(state: "visible" | "hidden") {
+  Object.defineProperty(document, "visibilityState", { configurable: true, get: () => state });
+  document.dispatchEvent(new Event("visibilitychange"));
+}
 
 // ── 1. EXISTENCE DECIDES LINKIFICATION ──────────────────────────────────────────────────────────
 
@@ -243,11 +280,11 @@ describe("BeadPill — re-reads CURRENT state, never a snapshot", () => {
   }
 
   beforeEach(() => {
-    // The poller is not what these rows are about, and leaving it armed would shell out to `bd`
-    // through a Tauri bridge jsdom does not have. Off means `startPolling` returns immediately, so
-    // `byProject` is exactly what the test puts there. Refcounting is covered in the store's suite.
+    // Beads stay ON — the poller is stubbed at the top of this file, which is what these rows
+    // actually needed. `byProject` is still exactly what the test puts there; refcounting is
+    // covered in the store's suite.
     act(() => {
-      useSettingsStore.setState({ beadsEnabled: false });
+      useSettingsStore.setState({ beadsEnabled: true });
       useProjectStore.setState({ projects: [PROJECT], selectedProjectId: "p1" });
       useUiStore.setState({ boardFocusBeadId: null, pairAssignment: {} });
     });
@@ -334,6 +371,287 @@ describe("BeadPill — re-reads CURRENT state, never a snapshot", () => {
   });
 });
 
+// ── 4b. THE BEAD LIVES IN ANOTHER PROJECT ───────────────────────────────────────────────────────
+//
+// THE BUG THESE ROWS EXIST FOR, and why nothing above them caught it.
+//
+// The founder wrote a bare bead id into the concierge and it rendered as dead prose. Every row
+// above passes with that bug present, because they all seed `byProject` DIRECTLY — so they prove
+// the LOOKUP spans projects (`indexBeads` always did) while never exercising the question that was
+// actually broken: does anything ever PUT a non-selected project's beads in the store? It did not.
+// `BeadPillHost` claimed a poller for the selected project alone, so a bead belonging to any other
+// project was absent, missed the index, and fell through to the prose branch.
+//
+// These rows therefore drive the store the way production does — real `refresh` calls against a
+// stubbed `bd` — rather than seeding it. That is the whole point: a seeded store cannot fail this
+// way, which is exactly why the bug survived a 432-line suite.
+describe("BeadPill — a bead in a project the founder is not looking at", () => {
+  const base = {
+    defaultBranch: "main",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    agents: [],
+    selectedAgentId: null,
+  };
+  const SELECTED: Project = { ...base, id: "p1", name: "sparkle", rootPath: "/tmp/sparkle" };
+  const OTHER: Project = { ...base, id: "p2", name: "festival", rootPath: "/tmp/festival" };
+
+  /** The selected project's own 5s poller is not what these rows are about, and letting it arm would
+   *  leak an interval into the next case. Its claim is pinned by "claims the poller as PASSIVE"
+   *  above; here it is stubbed out so only the cross-project sweep is under test. */
+  let startPolling: ReturnType<typeof vi.spyOn>;
+  let stopPolling: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    listBeads.mockReset();
+    blockedBeadIds.mockReset();
+    ensureBeadsDb.mockReset();
+    blockedBeadIds.mockResolvedValue(new Set());
+    listBeads.mockResolvedValue([]);
+    startPolling = vi
+      .spyOn(useBeadsStore.getState(), "startPolling")
+      .mockImplementation(() => {});
+    stopPolling = vi.spyOn(useBeadsStore.getState(), "stopPolling").mockImplementation(() => {});
+    act(() => {
+      useBeadsStore.setState({ byProject: {}, loading: {}, error: {} });
+      useSettingsStore.setState({ beadsEnabled: true });
+      useProjectStore.setState({ projects: [SELECTED, OTHER], selectedProjectId: "p1" });
+      useUiStore.setState({ boardFocusBeadId: null, pairAssignment: {} });
+    });
+  });
+
+  afterEach(() => {
+    startPolling.mockRestore();
+    stopPolling.mockRestore();
+    setVisibility("visible");
+    act(() => useSettingsStore.setState({ beadsEnabled: true }));
+  });
+
+  function mountHosted(text: string) {
+    return render(
+      <BeadPillHost>
+        <Markdown text={text} />
+      </BeadPillHost>,
+    );
+  }
+
+  // THE REPRO. `sparkle-88onj` is a real sparkle bead; the concierge in the founder's session was
+  // bound to a DIFFERENT project, so this id resolved against a store that had never loaded sparkle
+  // and rendered as the plain words it had always been — with nothing on screen to say why.
+  it("resolves an id whose bead lives in a project that is not selected", async () => {
+    listBeads.mockImplementation(async (path: string) =>
+      path === "/tmp/festival" ? [bead({ id: "sparkle-88onj" })] : [],
+    );
+    mountHosted("filed as sparkle-88onj for the next pass");
+    await waitFor(() => expect(pills()).toHaveLength(1));
+    expect(pills()[0]!.getAttribute("data-bead-id")).toBe("sparkle-88onj");
+    // And the sentence around it still reads.
+    expect(screen.getByText(/for the next pass/)).toBeTruthy();
+  });
+
+  // The sweep READS. Both of the trailing `false`s are load-bearing and neither is cosmetic:
+  // `runWatchers: false` keeps the decompose watcher — which spends AI and files child beads —
+  // from running for a board nobody is looking at, and `allowAutoInit: false` keeps a concierge
+  // render from creating a `.beads/` store inside every repo the user ever registered.
+  it("reads the other project without writing to it, and leaves the selected one alone", async () => {
+    const refresh = vi
+      .spyOn(useBeadsStore.getState(), "refresh")
+      .mockResolvedValue(undefined as never);
+    mountHosted("filed as sparkle-88onj");
+    await waitFor(() => expect(refresh).toHaveBeenCalledWith("p2", "/tmp/festival", false, false));
+    // The SELECTED project is not swept — it has its own faster claim, and sweeping it too would
+    // double every `bd` read for the project that is already the hottest.
+    expect(refresh.mock.calls.some((c) => c[0] === "p1")).toBe(false);
+    refresh.mockRestore();
+  });
+
+  // The write the sweep must never perform, asserted through the real store rather than through the
+  // flag. A project that never ran `bd init` rejects every read; the board path self-heals by
+  // creating the DB, and that is right for a board someone opened. Doing it here would mean opening
+  // the concierge silently writes into every repo on the machine.
+  it("never creates a beads DB in a project nobody opened", async () => {
+    listBeads.mockImplementation(async (path: string) => {
+      if (path === "/tmp/festival") throw new Error("no beads database found");
+      return [];
+    });
+    mountHosted("filed as sparkle-88onj");
+    // It did attempt the project — so the row below is a real guarantee, not a vacuous pass on a
+    // sweep that never ran.
+    await waitFor(() => expect(listBeads).toHaveBeenCalledWith("/tmp/festival"));
+    expect(ensureBeadsDb).not.toHaveBeenCalled();
+    // And the id stays prose, which is the correct outcome: that project has no beads to resolve
+    // against, so nothing is claimed about the token.
+    expect(pills()).toHaveLength(0);
+  });
+
+  // WHERE THE READER IS ABOUT TO BE SENT. "View on board" calls `selectProject` first, so clicking
+  // it on a bead from another project switches the reader's whole selected project. The card names
+  // that project so the jump is a choice rather than a surprise.
+  it("names the other project on the card", async () => {
+    listBeads.mockImplementation(async (path: string) =>
+      path === "/tmp/festival" ? [bead({ id: "sparkle-88onj" })] : [],
+    );
+    mountHosted("filed as sparkle-88onj");
+    await waitFor(() => expect(pills()).toHaveLength(1));
+    fireEvent.click(pills()[0]!);
+    expect(screen.getByTestId("concierge-bead-card-meta").textContent).toContain("in festival");
+  });
+
+  // The other half, and the one that stops the line above from being decoration: a bead in the
+  // reader's OWN project says nothing about projects at all. Without this, "name the project"
+  // could be implemented as "always name the project" and still pass the row above.
+  it("says nothing about the project for a bead in the reader's own", () => {
+    act(() => {
+      useBeadsStore.setState({
+        byProject: { p1: { beads: [bead({ id: "sparkle-88onj" })], board: {} as never, loadedAt: 1 } },
+      });
+    });
+    mountHosted("filed as sparkle-88onj");
+    expect(pills()).toHaveLength(1);
+    fireEvent.click(pills()[0]!);
+    const meta = screen.getByTestId("concierge-bead-card-meta").textContent ?? "";
+    expect(meta).not.toContain("in sparkle");
+    // It still says everything it said before.
+    expect(meta).toContain("open");
+  });
+
+  // ── WHAT THE WIDER `byProject` BROKE, AND HAD TO BE FIXED WITH IT ─────────────────────────────
+  //
+  // `indexBeads` used to say "first project wins on a collision", justified by ids carrying a
+  // project prefix so a collision was unreachable. Loading EVERY project retires that premise, and
+  // the collision is not exotic: `bd` resolves `.beads/` through `git-common-dir`, so a worktree of
+  // a repo registered as its own project reads the SAME database. Every id then collides and the
+  // winner was decided by which `bd` call happened to return first.
+  it("prefers the reader's OWN project when the same id is in two of them", () => {
+    act(() => {
+      useBeadsStore.setState({
+        // p2 FIRST in insertion order, which is what "first project wins" would have picked.
+        byProject: {
+          p2: {
+            beads: [bead({ id: "sparkle-88onj", title: "the foreign copy" })],
+            board: {} as never,
+            loadedAt: 1,
+          },
+          p1: {
+            beads: [bead({ id: "sparkle-88onj", title: "the reader's own" })],
+            board: {} as never,
+            loadedAt: 1,
+          },
+        },
+      });
+    });
+    mountHosted("filed as sparkle-88onj");
+    fireEvent.click(pills()[0]!);
+    expect(screen.getByTestId("concierge-bead-card-title").textContent).toBe("the reader's own");
+    // …and therefore NOT labelled as living elsewhere, which is the visible half of the bug: the
+    // card would otherwise offer to send the reader to another project for a bead in this one.
+    expect(screen.getByTestId("concierge-bead-card-meta").textContent).not.toContain("in festival");
+  });
+
+  // Suppressing auto-init avoids the `bd init` WRITE, but the fall-through used to still write the
+  // raw failure into the shared `error` map — which `BoardView` renders as a banner. So the
+  // concierge merely mounting would arm an error for a project nobody had opened.
+  it("records no error for a project the sweep could not read", async () => {
+    listBeads.mockImplementation(async (path: string) => {
+      if (path === "/tmp/festival") throw new Error("no beads database found");
+      return [];
+    });
+    mountHosted("filed as sparkle-88onj");
+    await waitFor(() => expect(listBeads).toHaveBeenCalledWith("/tmp/festival"));
+    await waitFor(() => expect(useBeadsStore.getState().loading.p2).toBe(false));
+    expect(useBeadsStore.getState().error.p2).toBeUndefined();
+  });
+
+  // `others` filters on `selectedProjectId`, so it changes on every selection change and re-arms the
+  // effect — which re-fired the immediate sweep for every remaining project, including ones read
+  // seconds earlier. Clicking through the project strip produced back-to-back `bd` convoys.
+  it("does not re-read a project it just read when the selection changes", async () => {
+    const THIRD: Project = { ...base, id: "p3", name: "third", rootPath: "/tmp/third" };
+    act(() => {
+      useProjectStore.setState({ projects: [SELECTED, OTHER, THIRD], selectedProjectId: "p1" });
+    });
+    mountHosted("filed as sparkle-88onj");
+    await waitFor(() => expect(listBeads).toHaveBeenCalledWith("/tmp/festival"));
+    const before = listBeads.mock.calls.filter((c) => c[0] === "/tmp/festival").length;
+    // Switching the selection re-arms the sweep. The festival snapshot is seconds old, so it must
+    // be skipped rather than re-read.
+    act(() => useProjectStore.setState({ selectedProjectId: "p3" }));
+    await act(async () => {});
+    const after = listBeads.mock.calls.filter((c) => c[0] === "/tmp/festival").length;
+    expect(after).toBe(before);
+  });
+
+  // "Off means off" — the same contract `refresh` states at its top. With `[tools].beads` disabled
+  // the sweep must not reach `bd` at all, not merely discard what it read.
+  it("does not sweep at all when beads are switched off", async () => {
+    act(() => useSettingsStore.setState({ beadsEnabled: false }));
+    mountHosted("filed as sparkle-88onj");
+    await act(async () => {});
+    expect(listBeads).not.toHaveBeenCalled();
+  });
+
+  // …and the half the row above CANNOT see, because it starts from an empty cache. `byProject` is a
+  // cache nobody prunes: switching beads off stops the pollers but clears no snapshot (the clear
+  // inside `refresh` only reaches projects that get another call, and with beads off none do). So
+  // an implementation that merely stopped sweeping would keep resolving beads read before the
+  // switch — beads still clickable with beads turned off.
+  it("resolves nothing from the cache once beads are switched off", () => {
+    act(() => {
+      useBeadsStore.setState({
+        byProject: {
+          p2: { beads: [bead({ id: "sparkle-88onj" })], board: {} as never, loadedAt: 1 },
+        },
+      });
+    });
+    const { rerender } = mountHosted("filed as sparkle-88onj");
+    expect(pills()).toHaveLength(1); // resolvable while beads are on
+    act(() => useSettingsStore.setState({ beadsEnabled: false }));
+    rerender(
+      <BeadPillHost>
+        <Markdown text="filed as sparkle-88onj" />
+      </BeadPillHost>,
+    );
+    expect(pills()).toHaveLength(0);
+  });
+
+  // The same cache outliving the other lifecycle event: removing a project touches `projectStore`
+  // only, so its snapshot stays in `byProject`. Indexing that raw gives a pill whose card names a
+  // project that no longer exists and whose "View on board" has nowhere to go.
+  it("resolves nothing from a project that is no longer registered", () => {
+    act(() => {
+      useBeadsStore.setState({
+        byProject: {
+          p2: { beads: [bead({ id: "sparkle-88onj" })], board: {} as never, loadedAt: 1 },
+        },
+      });
+    });
+    mountHosted("filed as sparkle-88onj");
+    expect(pills()).toHaveLength(1);
+    // The user removes the festival project. Its beads must stop resolving even though the
+    // snapshot is still cached.
+    act(() => useProjectStore.setState({ projects: [SELECTED], selectedProjectId: "p1" }));
+    expect(pills()).toHaveLength(0);
+  });
+
+  // A hidden window skips the sweep — correct, nobody is looking — but the wait must end when the
+  // reader COMES BACK, not when the interval next fires. An unswept project's ids are not merely
+  // stale, they are dead prose: the exact bug this change exists to fix, reappearing for up to a
+  // full interval after every return to the app.
+  it("sweeps on return from a hidden window rather than waiting out the interval", async () => {
+    listBeads.mockImplementation(async (path: string) =>
+      path === "/tmp/festival" ? [bead({ id: "sparkle-88onj" })] : [],
+    );
+    setVisibility("hidden");
+    mountHosted("filed as sparkle-88onj");
+    await act(async () => {});
+    expect(listBeads).not.toHaveBeenCalledWith("/tmp/festival");
+    expect(pills()).toHaveLength(0);
+    await act(async () => {
+      setVisibility("visible");
+    });
+    await waitFor(() => expect(pills()).toHaveLength(1));
+  });
+});
+
 // ── 5. VIEW ON BOARD ────────────────────────────────────────────────────────────────────────────
 
 describe("BeadPill — view on board", () => {
@@ -378,7 +696,7 @@ describe("BeadPill — view on board", () => {
       selectedAgentId: null,
     };
     act(() => {
-      useSettingsStore.setState({ beadsEnabled: false });
+      useSettingsStore.setState({ beadsEnabled: true });
       useProjectStore.setState({ projects: [project], selectedProjectId: "p1" });
       useBeadsStore.setState({
         byProject: { p1: { beads: [T6], board: {} as never, loadedAt: 1 } },
