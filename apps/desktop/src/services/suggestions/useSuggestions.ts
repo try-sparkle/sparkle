@@ -864,14 +864,18 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
         // `AiUnavailableError`. So `unavailable` is already true and short-circuits this `||`
         // before any message matching happens.
         //
-        // Stated precisely, because the categorical version of this claim was wrong once: what is
-        // closed is the path that CLASSIFIES, which is the CLI's result JSON. A CLI that dies
-        // before emitting one reports on stderr and is NOT classified, so that rejection does reach
-        // here as prose and is retried — a real, narrower gap, tracked as sparkle-o36ao. The fix
-        // belongs in the Rust classifier, not in a second matcher here: adding one would rebuild
-        // the parallel classifier this PR just deleted, and would still miss every other consumer
-        // of the same failure (attention-summary, the judge), which is precisely why the canonical
-        // seam is the right place.
+        // Stated precisely, because the categorical version of this claim was wrong once: BOTH of
+        // the CLI's failure channels are classified now, but they were not always. The result-JSON
+        // path always was. The other one — a CLI that dies before emitting a result object and
+        // reports on stderr instead — was NOT, so that rejection reached here as prose and was
+        // retried. That was the narrower gap tracked as sparkle-o36ao, and it is CLOSED: the fix
+        // landed in the Rust classifier (the canonical seam, exactly where this comment said it
+        // belonged, rather than a second matcher here that would have missed attention-summary and
+        // the judge). `unusable_output_error` now runs the stderr detail through `typed_cli_failure`
+        // after `strip_argv_echo`, so a dead CLI naming a broken credential yields the same
+        // `claude_not_authenticated` sentinel the JSON path yields, and `unavailable` is true on
+        // both. Pinned by `a_dead_cli_that_names_a_broken_credential_gets_the_auth_sentinel_not_prose`
+        // in claude_oneshot.rs — read that test before assuming this arm needs widening.
         //
         // A string matcher added here would therefore be unreachable on the classified path, and
         // only a test injecting `callHaiku` (the seam production never sets) can manufacture the

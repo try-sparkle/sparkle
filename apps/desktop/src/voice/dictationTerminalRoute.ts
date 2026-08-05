@@ -156,8 +156,31 @@ export function screenBlocksWrite(snapshot: string): boolean {
  * places.
  */
 export function screenIsCredentialPrompt(snapshot: string): boolean {
-  if (WRITE_BLOCKING_PROMPTS.some((re) => re.test(snapshot))) return true;
+  if (matchesBlockingPrompt(snapshot)) return true;
   return matchesCredentialTail(snapshot);
+}
+
+/**
+ * The blocking-prompt arms, each evaluated over the region it is actually about.
+ *
+ * ══ THE YES/NO ARM IS TAIL-SCOPED HERE, NOT AT ONE CALL SITE (roborev 58575) ════════════════════
+ * A previous round scoped it only inside `screenIsYesNoPrompt`, which the dispatcher consults on the
+ * NON-Claude-Code path. But `screenBlocksWrite` → `screenIsCredentialPrompt` still tested the
+ * unscoped pattern against the WHOLE snapshot, and the dispatcher runs that for every screen where
+ * Claude Code holds the alternate buffer — the most common state in the product, since every agent
+ * here runs Claude Code. So a pane displaying this source file, a `git show` of it, a `--help` or a
+ * README containing `(yes/no)` still refused every write, with no override, until it scrolled off.
+ * Dictation's caller inherited it too.
+ *
+ * Scoping at the DEFINITION is the difference between fixing the bug and fixing one of its callers.
+ * The other arms keep their whole-snapshot test: a password line or `type "yes" to confirm` is not
+ * something a pane incidentally displays the way it displays documentation.
+ */
+function matchesBlockingPrompt(snapshot: string): boolean {
+  const tail = screenTail(snapshot, 5);
+  return WRITE_BLOCKING_PROMPTS.some((re) =>
+    re === YES_NO_PROMPT ? re.test(tail) : re.test(snapshot),
+  );
 }
 
 /**
@@ -199,7 +222,9 @@ export function screenIsYesNoPrompt(snapshot: string): boolean {
  */
 export function screenIsCredentialField(snapshot: string): boolean {
   if (WRITE_BLOCKING_PROMPTS.some((re) => re !== YES_NO_PROMPT && re.test(snapshot))) return true;
-  if (YES_NO_PROMPT.test(snapshot) && SSH_HOST_KEY.test(snapshot)) return true;
+  // ssh's prompt is tail-scoped through the same helper the yes/no arm uses, so a pane merely
+  // DISPLAYING an ssh transcript is not mistaken for one sitting at the prompt.
+  if (screenIsYesNoPrompt(snapshot) && SSH_HOST_KEY.test(screenTail(snapshot, 5))) return true;
   return matchesCredentialTail(snapshot);
 }
 

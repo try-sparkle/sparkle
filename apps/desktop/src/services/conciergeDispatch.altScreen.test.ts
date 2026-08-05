@@ -303,6 +303,58 @@ describe("a credential prompt refuses on the normal buffer too", () => {
     expectNothingWritten();
   });
 
+  // ══ A STALE PICKER MUST NOT SUPPLY THE ANSWER THE WAIVER ALLOWED (roborev 58575) ══════════════
+  // The mirror of the previous round: the waiver read the VIEWPORT while the answer was still parsed
+  // from the SCROLLBACK. `detectClaudeCodePicker` scans 50 non-empty scrollback lines with no
+  // near-the-end requirement, so a picker scrolled just above the visible area supplied `1\n`/`2\n`
+  // for a screen whose live prompt is a shell confirmation — and a terse "2" pressed a digit into it.
+  it("does not answer a live (yes/no) from a picker that scrolled out of the viewport", async () => {
+    const real = await vi.importActual<typeof import("./suggestions/heuristics")>(
+      "./suggestions/heuristics",
+    );
+    vi.mocked(detectTerminalPrompts).mockImplementation(real.detectTerminalPrompts);
+    vi.mocked(getAgentScrollback).mockReturnValue(
+      "❯ 1. Yes\n  2. No\nEsc to cancel · Tab to amend · ctrl+e to explain\n" +
+        "$ rm -rf build\nOverwrite existing config? (yes/no)",
+    );
+    vi.mocked(getAgentViewport).mockReturnValue({
+      text: "$ rm -rf build\nOverwrite existing config? (yes/no)",
+      alternateBuffer: false,
+    });
+    // "2" is the STALE picker's option. The harm was that it reached the PTY as `2\r` — a digit
+    // pressed into a shell confirmation that has no numbered options at all.
+    await dispatchConciergeAnswer(AGENT, "2", OPTS);
+    expect(writePtyChainedStrict).not.toHaveBeenCalledWith(AGENT, "2\r");
+    // AND THE POSITIVE HALF, so this row cannot pass by the send simply failing: whatever went down
+    // the wire was an answer to the prompt that is ACTUALLY on screen. `matchAnswerToOption` selects
+    // ordinally, so "2" picks the live pair's second option — Deny — and `n\r` is a valid answer to
+    // the confirmation the user is looking at, which is the whole point of answering from the text
+    // the waiver read.
+    expect(writePtyChainedStrict).toHaveBeenCalledWith(AGENT, "n\r");
+  });
+
+  // ══ AND A CLAUDE CODE PANE MERELY SHOWING (yes/no) STILL DELIVERS (roborev 58575) ══════════════
+  // The previous round scoped the yes/no arm inside `screenIsYesNoPrompt` only — the NON-Claude-Code
+  // path — while `screenBlocksWrite` still tested it unscoped for every screen where Claude Code
+  // holds the alternate buffer, which is the most common state in the product. So a pane displaying
+  // documentation refused every write. This row runs that dominant path.
+  it("delivers on a busy Claude Code pane that merely displays (yes/no)", async () => {
+    const SCREEN = [
+      "⏺ Reading the guard's source.",
+      "  ⎿  the pattern matches screens like (yes/no) — documentation, not a prompt",
+      "     (ctrl+b to run in background)",
+      "──────────────────────────────────────────────────────────────────────────────",
+      "❯ ",
+      "──────────────────────────────────────────────────────────────────────────────",
+      "  ⏸ manual mode on · ? for shortcuts",
+    ].join("\n");
+    vi.mocked(getAgentScrollback).mockReturnValue(SCREEN);
+    vi.mocked(getAgentViewport).mockReturnValue({ text: SCREEN, alternateBuffer: true });
+    const r = await dispatchConciergeAnswer(AGENT, "carry on", OPTS);
+    expect(r.path).toBe("free-text");
+    expect(r.ok).toBe(true);
+  });
+
   // ══ AND MERELY MENTIONING (yes/no) IS NOT A PROMPT (roborev 58562) ════════════════════════════
   // The delivering direction for the yes/no arm, which `screenIsYesNoPrompt` previously lacked: it
   // tested the WHOLE viewport, so any pane displaying the string — this source file, a `git show` of

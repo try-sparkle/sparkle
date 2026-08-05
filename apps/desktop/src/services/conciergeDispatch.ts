@@ -634,7 +634,18 @@ export async function dispatchConciergeAnswer(
     });
     return { ok: false, path: "blocked-prompt", agentId };
   }
-  const options = pickerOptions;
+  // ══ ANSWER FROM THE TEXT THE WAIVER READ (roborev 58575) ═══════════════════════════════════════
+  // The previous round made the WAIVER read the viewport but left the ANSWER parsed from the
+  // scrollback, so the same cross-source harm survived mirrored. `detectClaudeCodePicker` scans the
+  // last 50 non-empty SCROLLBACK lines with no requirement that the footer be near the end, while
+  // `screen.text` is only the visible rows. So a Claude Code picker scrolled just above the viewport,
+  // with a shell's `Overwrite existing config? (yes/no)` now on the last visible line, gave:
+  // viewport → the y/n pair → waiver fires; scrollback → the stale picker's `1\n`/`2\n`; and a terse
+  // "2" pressed a DIGIT into the live confirmation, returning ok:true / picker-option.
+  //
+  // So when the waiver fired, the options come from the same text that justified it. Otherwise the
+  // scrollback parse stands, which is this block's shipped behaviour for every other screen.
+  const options = viewportOffersYesNo ? viewportOptions : pickerOptions;
 
   // ══ A CLOUD AGENT LEAVES THE LOCAL-PTY PATH HERE ════════════════════════════════════════════════
   // Read the screen FIRST (above) rather than short-circuiting on the runtime the way the old
