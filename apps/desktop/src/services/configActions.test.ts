@@ -56,6 +56,7 @@ import {
   refreshRoborevAuth,
   markRoborevConsentPrompted,
   setImprovementConsent,
+  backfillImprovementConsentMirror,
   setBuilderIndexEnabled,
   setOnePasswordAccount,
   setOnePasswordVault,
@@ -75,7 +76,7 @@ import {
   installRepoHooks,
   removeRepoHooks,
 } from "./roborev";
-import { useSettingsStore } from "../stores/settingsStore";
+import { useSettingsStore, DEFAULT_SPARKLE_CONSENT } from "../stores/settingsStore";
 import { useProjectStore } from "../stores/projectStore";
 
 beforeEach(() => {
@@ -602,6 +603,65 @@ describe("configActions", () => {
     await setImprovementConsent("never");
     // A failed file write is non-fatal — the optimistic update stands (the next hydrate reconciles).
     expect(useSettingsStore.getState().sparkleImprovementConsent).toBe("never");
+  });
+
+  // The back-fill closes the gap the writer above cannot: setImprovementConsent only fires on a
+  // CHANGE, so a choice made before the mirror existed (or whose single write failed) lives in
+  // localStorage while the file has no [improvement] section — and hydrate refuses to reconcile
+  // that direction on purpose. Headless readers gate fail-closed on the file, so the user's
+  // "always" reads as no-consent until something writes it. These assert the WRITE, not the state.
+  describe("backfillImprovementConsentMirror", () => {
+    // The helper takes the one field it reads, so these cases pass it directly — no synthetic
+    // partial EffectiveConfig and no `as unknown` cast standing between the test and the contract.
+    const effWith = (consent: string | null | undefined) => consent;
+
+    it("writes the persisted choice when the file has no [improvement] section", async () => {
+      useSettingsStore.setState({ sparkleImprovementConsent: "always" });
+      await backfillImprovementConsentMirror(effWith(undefined));
+      expect(setConfigValue).toHaveBeenCalledWith("improvement.consent", "always");
+    });
+
+    it("writes the persisted choice when the section exists but consent is null", async () => {
+      // A backend that sends the section with an unset value is the same gap, not a written choice.
+      useSettingsStore.setState({ sparkleImprovementConsent: "never" });
+      await backfillImprovementConsentMirror(effWith(null));
+      expect(setConfigValue).toHaveBeenCalledWith("improvement.consent", "never");
+    });
+
+    it("does not write when the file already carries a value", async () => {
+      // The file is the source of truth. Writing here would let a stale store overwrite a value
+      // the user (or a hand-edit) just put in the file.
+      useSettingsStore.setState({ sparkleImprovementConsent: "always" });
+      await backfillImprovementConsentMirror(effWith("never"));
+      expect(setConfigValue).not.toHaveBeenCalled();
+    });
+
+    it("does not write when the persisted choice is the default", async () => {
+      // An absent section already MEANS case_by_case, so writing it records a choice the user
+      // never made while changing nothing.
+      useSettingsStore.setState({ sparkleImprovementConsent: DEFAULT_SPARKLE_CONSENT });
+      await backfillImprovementConsentMirror(effWith(undefined));
+      expect(setConfigValue).not.toHaveBeenCalled();
+    });
+
+    it("treats an explicit empty-string consent as WRITTEN, not as absent", async () => {
+      // The fail-closed case, and the one direction this back-fill must never move. `""` is falsy,
+      // so a truthiness guard read it as "no value present" and overwrote it with the persisted
+      // "always" — after which every headless reader (each gating on `=== "always"`) starts
+      // forwarding retro data the file currently forbids. Writing `""` is how someone pins the
+      // mirror shut, since it matches no reader; silently upgrading it inverts that choice.
+      useSettingsStore.setState({ sparkleImprovementConsent: "always" });
+      await backfillImprovementConsentMirror(effWith(""));
+      expect(setConfigValue).not.toHaveBeenCalled();
+    });
+
+    it("survives a failed write and leaves the store alone", async () => {
+      vi.mocked(setConfigValue).mockRejectedValueOnce(new Error("disk full"));
+      useSettingsStore.setState({ sparkleImprovementConsent: "always" });
+      await expect(backfillImprovementConsentMirror(effWith(undefined))).resolves.toBeUndefined();
+      // Self-healing rather than fatal: the next launch re-runs the same back-fill.
+      expect(useSettingsStore.getState().sparkleImprovementConsent).toBe("always");
+    });
   });
 
   // The one non-obvious invariant of the 1Password write path: a blank vault UNSETS the key rather

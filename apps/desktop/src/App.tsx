@@ -13,7 +13,7 @@ import { importDefault } from "./services/accountStore";
 import { startRelayHost, stopRelayHost } from "./services/relayClient";
 import { useSettingsStore } from "./stores/settingsStore";
 import { getConfig, onConfigChanged } from "./services/config";
-import { refreshRoborevAuth } from "./services/configActions";
+import { refreshRoborevAuth, backfillImprovementConsentMirror } from "./services/configActions";
 import { pollMemoryAdmission } from "./services/agentCapacity";
 import { MEMORY_ADMISSION_POLL_MS } from "./services/memoryAdmission";
 import { safeUnlisten } from "./services/safeUnlisten";
@@ -406,6 +406,12 @@ export function App() {
       .then((eff) => {
         if (cancelled) return;
         hydrate(eff);
+        // Reconcile the [improvement].consent mirror the OTHER way. hydrate above is read-only and
+        // deliberately won't let an absent section overwrite a persisted choice, so a user whose
+        // choice predates the mirror has one that no headless agent can see — and those gate
+        // fail-closed on the file. Must run AFTER hydrate, which is what makes `eff` and the store
+        // agree about what the file says. Fire-and-forget: it must never delay first paint.
+        void backfillImprovementConsentMirror(eff.config.improvement?.consent);
         // Probe roborev's auth once the real flag is loaded. Must run AFTER hydrate (the store's
         // pre-hydrate default would decide it for us) and only matters when roborev is on — see
         // refreshRoborevAuth: the toggle defaults ON, so this launch path is the only thing that

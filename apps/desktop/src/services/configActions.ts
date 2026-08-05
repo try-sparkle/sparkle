@@ -17,6 +17,7 @@ import {
   useSettingsStore,
   normalizeAccountId,
   normalizeVaultId,
+  DEFAULT_SPARKLE_CONSENT,
   type AiFeatureKey,
   type PluginKey,
   type ToolKey,
@@ -721,6 +722,47 @@ export async function setImprovementConsent(mode: SparkleImprovementConsent): Pr
   } catch (e) {
     console.warn("config write failed (improvement consent)", e);
   }
+}
+
+/** Back-fill [improvement].consent when the file has no value but the persisted store does.
+ *
+ *  WHY: setImprovementConsent above is the ONLY writer, so the mirror exists only for users who
+ *  changed the setting AFTER the mirror shipped. A user who chose "always" before that — or whose
+ *  one write failed — keeps the choice in localStorage while config.toml has no [improvement]
+ *  section at all, and nothing ever reconciles the two: hydrateFromConfig deliberately refuses to
+ *  let an absent value clobber the persisted one (it would revert a real choice to the default),
+ *  so the gap is permanent in BOTH directions.
+ *
+ *  What that costs is silent and total. Every headless reader gates on the file — the retro
+ *  self-file path (`scripts/lib/retro-beads.sh` `read_consent`) requires exactly "always" and is
+ *  fail-closed — so an absent section reads as no-consent even while the app runs the hourly pass
+ *  under "Always". The agent's pain points then answer `unfiled:no-consent` and are dropped, which
+ *  is precisely the durable channel AGENTS.md says a printed retro is not.
+ *
+ *  Only the LOSSY case is written. An absent section already means DEFAULT_SPARKLE_CONSENT by
+ *  definition (see the Rust ImprovementConfig), so back-filling that value would record a choice
+ *  the user never made while changing no behavior. A non-default persisted value is the one the
+ *  file is actively misreporting, and the only one worth a write. */
+export async function backfillImprovementConsentMirror(
+  fileConsent: string | null | undefined,
+): Promise<void> {
+  // A written value — including one that equals the default — is the user's, and authoritative.
+  //
+  // `!= null`, NOT truthiness. The values here are strings, and the empty string is both FALSY and a
+  // deliberate choice: `consent = ""` matches no reader (every one of them gates on `=== "always"`,
+  // fail-closed), so writing it is how someone pins the mirror shut. A truthiness test reads that
+  // explicit opt-OUT as "no value present" and overwrites it with a persisted `"always"` — after
+  // which the headless readers begin forwarding retro data the file currently says they may not.
+  // Inverting a privacy decision the user made explicitly is the one direction this back-fill must
+  // never move, and it is silent when it happens.
+  if (fileConsent != null) return;
+  const persisted = useSettingsStore.getState().sparkleImprovementConsent;
+  if (persisted === DEFAULT_SPARKLE_CONSENT) return;
+  // Through the EXISTING writer rather than a second one. `setImprovementConsent` already owns the
+  // store update and the non-fatal-write policy; duplicating its try/catch here made two consent
+  // writers that a future change would have to keep in step. Its store write is a no-op on this
+  // path — `persisted` was just read from that same store — so the only effect is the mirror write.
+  await setImprovementConsent(persisted);
 }
 
 /** Bulk-set every AI feature in ONE atomic write. A single set_config_values call fires one

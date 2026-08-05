@@ -2940,13 +2940,36 @@ fn cell() -> &'static RwLock<EffectiveConfig> {
     })
 }
 
+/// Read a config layer for the RUNTIME, distinguishing "absent" from "could not be read".
+///
+/// `read_if_exists` cannot make that distinction — it is `read_to_string(..).ok()` — and at these
+/// call sites the difference decides whether the user keeps their settings. An unreadable file
+/// arriving as `None` is read as an ABSENT layer, so `build_effective` never enters its
+/// `if let Some(text)` arm, never sets `hard_error`, and never pushes a warning: the cached layer
+/// is replaced by pure DEFAULTS, silently, at launch and on every watcher event. Concurrency pins,
+/// approvals, `[improvement]`, `[freshness]` all revert with nothing in the UI to say why — while a
+/// merely UNPARSEABLE file, which is strictly less severe, correctly keeps last-good and warns.
+///
+/// `Ok(None)` is therefore reserved for a file that genuinely is not there; anything else is an
+/// error the caller routes into the same last-good-plus-warning path as a syntax error.
+fn read_layer_for_runtime(path: &Path) -> Result<Option<String>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{} could not be read: {e}", path.display())),
+    }
+}
+
 /// Load the global file from disk and replace the cached global layer. Called at startup and
 /// on every watcher event. On a syntax error the previous cached config is KEPT (last-good
 /// stays live); only the warnings are refreshed so the UI can surface the problem.
 pub fn reload_global(app_data: &Path) -> EffectiveConfig {
-    let text = read_if_exists(&global_path(app_data));
-    let (cfg, warnings, hard_error) =
-        build_effective(SparkleConfig::default(), text.as_deref(), None);
+    // An unreadable file takes the SAME branch as a syntax error: keep last-good, surface a
+    // warning. Letting it read as absent would silently swap every setting for a default.
+    let (cfg, warnings, hard_error) = match read_layer_for_runtime(&global_path(app_data)) {
+        Ok(text) => build_effective(SparkleConfig::default(), text.as_deref(), None),
+        Err(msg) => (SparkleConfig::default(), vec![msg], true),
+    };
     let lock = cell();
     // Poison-tolerant: a panic in a prior writer must not permanently wedge config reloads for the
     // rest of the process. Recover the inner guard and carry on; the last-good cached config is
@@ -3008,6 +3031,19 @@ struct ProjectCacheEntry {
     /// The global layer this result was merged against; when it changes (watcher reload) the memo
     /// is invalidated so a global edit still propagates into the per-project view.
     global_config: SparkleConfig,
+    /// The global layer's WARNINGS, keyed separately from `global_config` because `effective` bakes
+    /// them in (see the merge below) while the parsed config alone does not carry them.
+    ///
+    /// Without this the memo went stale in the direction that matters most: a global `config.toml`
+    /// that becomes unreadable or unparseable takes `reload_global`'s hard-error branch, which
+    /// deliberately KEEPS the last-good `config` and refreshes only `warnings` — so `global_config`
+    /// is unchanged, every project entry stays valid, and each project-scoped reader keeps serving
+    /// the stale (empty) warning list. `read_project_config` forwards these to the concierge, so
+    /// the warning channel for the more severe of the two global failure modes went silent for
+    /// exactly the surface meant to announce it. The repair direction was symmetric: fixing the
+    /// file back to an equal parsed config cleared the warning globally and left the stale one
+    /// baked into every project memo.
+    global_warnings: Vec<String>,
     effective: EffectiveConfig,
 }
 
@@ -3048,31 +3084,88 @@ pub fn for_project(repo_root: &str) -> EffectiveConfig {
     // Fast path: the project file and the global layer are both unchanged since we last computed.
     if let Ok(cache) = project_cache().lock() {
         if let Some(e) = cache.get(repo_root) {
-            if e.mtime_ms == mtime_ms && e.len == len && e.global_config == global.config {
+            if e.mtime_ms == mtime_ms
+                && e.len == len
+                && e.global_config == global.config
+                && e.global_warnings == global.warnings
+            {
                 return e.effective.clone();
             }
         }
     }
 
-    let project_text = read_if_exists(&path);
-    // `global.config` already has defaults+global folded in, so pass only the project layer here.
-    let (cfg, mut warnings, _) =
-        build_effective(global.config.clone(), None, project_text.as_deref());
+    // Same rule as reload_global: an unreadable project file must not read as an absent one, or
+    // the project's auto-approve rules and [done]/[delivered] stage definitions vanish silently.
+    // There is no last-good project layer to keep, so the honest result is the global layer plus a
+    // warning naming the file — never a quiet fallback to "this project configures nothing".
+    let mut read_failed = false;
+    let (cfg, mut warnings, _) = match read_layer_for_runtime(&path) {
+        Ok(project_text) => {
+            // `global.config` already has defaults+global folded in, so pass only the project layer.
+            build_effective(global.config.clone(), None, project_text.as_deref())
+        }
+        Err(msg) => {
+            read_failed = true;
+            (global.config.clone(), vec![msg], true)
+        }
+    };
     // Carry forward any standing global warnings so the UI sees them in a project context too.
+    // Cloned rather than moved: the memo keys on them (see ProjectCacheEntry) precisely because
+    // they are baked into `effective` here and the parsed config alone cannot represent them.
+    let global_warnings = global.warnings.clone();
     let mut all = global.warnings;
     all.append(&mut warnings);
     let effective = EffectiveConfig::derive(cfg, all);
 
-    if let Ok(mut cache) = project_cache().lock() {
-        cache.insert(
-            repo_root.to_string(),
-            ProjectCacheEntry {
-                mtime_ms,
-                len,
-                global_config: global.config,
-                effective: effective.clone(),
-            },
-        );
+    // A READ FAILURE OBSERVED HERE IS NOT MEMOIZED, and the scope of that is worth stating exactly,
+    // because the fast path above bounds it.
+    //
+    // What this covers: a failure seen on a cache MISS. The key has THREE parts — `(mtime_ms, len)`
+    // AND the global layer's identity (`e.global_config == global.config` on the fast path) — so a
+    // miss is the first read of a root, a moved stamp, OR a changed global layer. Without it the failure would be cached under that stamp, and
+    // since the repair for a permissions problem is a `chmod` — which moves ctime, not `modified()`
+    // or `len` — the entry would stay valid and freeze the failure for the process lifetime: the
+    // project's rules and [done]/[delivered] definitions unloaded behind a stale banner even after
+    // the user fixed it. Re-reading on the next call is cheap; a wrong answer nobody can clear is
+    // not.
+    //
+    // What it does NOT cover, deliberately: a root already memoized as GOOD whose file then becomes
+    // unreadable at an unchanged `(mtime_ms, len)` — again, `chmod 000` is exactly that. The fast
+    // path matches and serves the last-good entry, so the user sees no warning until the stamp
+    // moves, THE GLOBAL LAYER CHANGES, or the process restarts.
+    //
+    // That third exit is compared BY VALUE (`e.global_config == global.config` on a `PartialEq`
+    // `SparkleConfig`), not by generation, so bound it precisely: a global edit that changes the
+    // PARSED config invalidates every project entry at once. A reload that parses to an equal
+    // config — a touch, a comment-only or whitespace edit — leaves every memo valid, and so does
+    // one that fails to parse, since that branch deliberately keeps the last-good `config` and
+    // refreshes only `warnings`.
+    //
+    // Closing THE PROJECT-FILE CASE — the `chmod 000` paragraph above, and nothing else here —
+    // would mean re-reading the file on every hit of a hot poll path, or keying the stamp on
+    // ctime/permissions; neither is worth it for a failure mode nobody has reported, and serving
+    // last-good is the safe direction. That one is stated rather than fixed so the next reader does
+    // not have to re-derive the boundary.
+    //
+    // The warnings-only case IS fixed, so do not read the paragraph above as declining it: the
+    // entry also keys on `global_warnings` (see `ProjectCacheEntry`), because `effective` bakes the
+    // global warnings in and the parsed config cannot represent them. Keying on the parsed config
+    // alone left every project-scoped reader serving a stale warning list for the one global
+    // failure mode that changes nothing but the warnings — and neither remedy named above would
+    // have closed it, since the project file is not what went wrong.
+    if !read_failed {
+        if let Ok(mut cache) = project_cache().lock() {
+            cache.insert(
+                repo_root.to_string(),
+                ProjectCacheEntry {
+                    mtime_ms,
+                    len,
+                    global_config: global.config,
+                    global_warnings,
+                    effective: effective.clone(),
+                },
+            );
+        }
     }
     effective
 }
@@ -3652,13 +3745,6 @@ fn unset_dotted(doc: &mut toml_edit::DocumentMut, path: &str) -> Result<(), Stri
     Ok(())
 }
 
-/// Read the current global file (or the default template if absent) as an editable document.
-fn load_document(app_data: &Path) -> toml_edit::DocumentMut {
-    let text = read_if_exists(&global_path(app_data)).unwrap_or_else(|| DEFAULT_TEMPLATE.to_string());
-    text.parse::<toml_edit::DocumentMut>()
-        .unwrap_or_else(|_| DEFAULT_TEMPLATE.parse().expect("default template is valid TOML"))
-}
-
 /// Schema revision of the on-disk global config. Bump when adding a one-time migration below.
 const CONFIG_MIGRATION_VERSION: i64 = 3;
 
@@ -3683,11 +3769,21 @@ pub fn migrate_global(app_data: &Path) -> Result<(), String> {
     let Some(text) = read_if_exists(&path) else {
         return Ok(());
     };
-    // Parse DIRECTLY — deliberately NOT via `load_document`, which falls back to DEFAULT_TEMPLATE on
-    // a syntax error (roborev 53240). That fallback is safe behind an explicit user write, but here
+    // Parse DIRECTLY. A shared loader USED TO fall back to DEFAULT_TEMPLATE on a syntax error
+    // (roborev 53240); it is deleted, and `load_document_for_write` now refuses instead. That
+    // fallback was safe behind an explicit user write, but here
     // it would stamp the template over a config the user merely typo'd and `write_atomic` it, wiping
     // every setting AND the broken text they need in order to fix it — silently, since the write
-    // succeeds. `reload_global` keeps the last-good config and warns precisely so the file can be
+    // succeeds.
+    //
+    // (The `read_if_exists` on the line above shares the absent-vs-unreadable blind spot the rest
+    // of this file now avoids, but the consequence HERE is benign and so it is left alone: an
+    // unreadable file returns `Ok(())` before this parse is ever reached, which defers the
+    // migration with no write and no loss, and the next launch retries it. That is unlike
+    // `load_document_for_write` and `read_layer_for_runtime`, where the same collapse costs the
+    // user's settings.)
+    //
+    // `reload_global` keeps the last-good config and warns precisely so the file can be
     // repaired; a migration must not undo that. Bail instead: the caller logs, and the migration is
     // retried on the NEXT LAUNCH — not mid-session. The watcher only calls `reload_global`, so
     // fixing the typo now reloads the config but does not re-run this.
@@ -3767,8 +3863,9 @@ pub fn migrate_global(app_data: &Path) -> Result<(), String> {
     // v3 — the RETIRED `[pushers].model` key, removed for the same reason v1 and v2 exist: the app
     // WROTE this line, so removing it discards nothing the user chose.
     //
-    // `model = "claude-haiku-4-5"` shipped inside DEFAULT_TEMPLATE, and `load_document` falls back
-    // to that template, so the first `set_value` on a fresh install writes the whole thing to disk.
+    // `model = "claude-haiku-4-5"` shipped inside DEFAULT_TEMPLATE, and `load_document_for_write`
+    // still starts from that template when the file is ABSENT (its `NotFound` arm), so the first
+    // `set_value` on a fresh install writes the whole thing to disk.
     // The field is gone from `PartialPushers` now (nothing composes a challenge — see the note on
     // PushersConfig), so without this the line falls through to the unknown-key catch-all and emits
     // "[pushers].model is not a Pusher setting … so it has no effect" on EVERY load, permanently,
@@ -3851,10 +3948,54 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
     std::fs::rename(&tmp, path).map_err(|e| format!("replace config: {e}"))
 }
 
+/// Load the global config as an editable document FOR A WRITE — deliberately not a plain read.
+///
+/// Every arm of this file now distinguishes "absent" from "present but unusable", and this function
+/// is where that rule is strictest, because it is the one whose output gets persisted back.
+///
+/// TWO THINGS IT REFUSES, both of which used to be silent data loss:
+///
+/// 1. A PRESENT-BUT-UNPARSEABLE file. A shared loader once fell back to `DEFAULT_TEMPLATE` on any
+///    parse failure and every writer went through it — so the document being edited was the
+///    TEMPLATE rather than the user's file, and rendering it back replaced their config with the
+///    default: every setting, every comment, and the malformed text needed to repair it, gone. The
+///    `parse_layer` validation below could not catch that, because the template is perfectly valid
+///    TOML — it was the WRONG document, not an invalid one. That loader is deleted; the editor's
+///    read (`read_editor_text`) surfaces an error instead, since presenting the default as the
+///    file's contents is one Save away from the same loss.
+///
+/// 2. A file it cannot READ AT ALL. This does not use `read_if_exists`, which is
+///    `read_to_string(..).ok()` and collapses *every* read error into `None`: invalid UTF-8 from a
+///    hand-edit saved in another encoding or a truncated write, `EACCES` on the file inside a
+///    writable directory, `EIO` from failing storage. Each is a file that EXISTS and holds the
+///    user's settings, and each would take the absent branch — template, then `write_atomic`'s
+///    rename, then the config is the default. The same loss, through the one branch that looked
+///    safe.
+///
+/// So only `NotFound` falls back to the template. A hand-edited config makes both reachable by a
+/// typo, and neither needs user action to fire: any automatic launch-time write lands it at startup.
+///
+/// The governing rule, worth stating once for the whole file: **a read we could not complete is
+/// never evidence that there is nothing to lose.** `load_project_document`, `write_stage_definition`,
+/// `read_editor_text` and `read_layer_for_runtime` all follow it.
+fn load_document_for_write(app_data: &Path) -> Result<toml_edit::DocumentMut, String> {
+    match std::fs::read_to_string(global_path(app_data)) {
+        Ok(text) => text.parse::<toml_edit::DocumentMut>().map_err(|e| {
+            format!("existing config.toml is not valid TOML; fix it before editing it: {e}")
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DEFAULT_TEMPLATE
+            .parse()
+            .map_err(|e| format!("default template is not valid TOML: {e}")),
+        Err(e) => Err(format!(
+            "existing config.toml could not be read, so it will not be overwritten: {e}"
+        )),
+    }
+}
+
 /// Set one key in the global config file, preserving comments/formatting. `path` is dotted.
 pub fn set_value(app_data: &Path, path: &str, value: &serde_json::Value) -> Result<(), String> {
     let v = json_to_toml_value(value)?;
-    let mut doc = load_document(app_data);
+    let mut doc = load_document_for_write(app_data)?;
     set_dotted(&mut doc, path, v)?;
     let text = doc.to_string();
     // Validate the edited document against the schema BEFORE persisting (mirrors write_text). A
@@ -3874,7 +4015,7 @@ pub fn set_value(app_data: &Path, path: &str, value: &serde_json::Value) -> Resu
 /// left untouched. On duplicate dotted paths the last entry wins (the command's `serde_json::Map`
 /// source can't contain duplicates).
 pub fn set_values(app_data: &Path, entries: &[(String, serde_json::Value)]) -> Result<(), String> {
-    let mut doc = load_document(app_data);
+    let mut doc = load_document_for_write(app_data)?;
     for (path, value) in entries {
         let v = json_to_toml_value(value)?;
         set_dotted(&mut doc, path, v)?;
@@ -3888,7 +4029,7 @@ pub fn set_values(app_data: &Path, entries: &[(String, serde_json::Value)]) -> R
 /// Remove one dotted key from the global config file, preserving comments/formatting. Validates the
 /// rendered result before persisting. Removing an absent key is a harmless no-op.
 pub fn unset_value(app_data: &Path, path: &str) -> Result<(), String> {
-    let mut doc = load_document(app_data);
+    let mut doc = load_document_for_write(app_data)?;
     unset_dotted(&mut doc, path)?;
     let text = doc.to_string();
     parse_layer(&text)
@@ -3899,13 +4040,23 @@ pub fn unset_value(app_data: &Path, path: &str) -> Result<(), String> {
 /// Read the per-project `.sparkle/config.toml` as an editable document, preserving its comments +
 /// other sections. Refuses to clobber an existing-but-unparseable file (matches
 /// `write_stage_definition`); an absent file starts from an empty document.
+/// ONLY `NotFound` MAY START FROM AN EMPTY DOCUMENT — the same rule as `load_document_for_write`,
+/// and it matters MORE here. The absent branch on this side is an *empty* document, not the default
+/// template, so a write that reaches it renders a file holding only the key just set. An unreadable
+/// `.sparkle/config.toml` (invalid UTF-8 from a hand-edit, a truncated write, `EACCES`, `EIO`) would
+/// therefore be replaced by a one-key file: every project setting and every `[done]`/`[delivered]`
+/// stage definition gone, along with the bytes needed to repair it. `read_if_exists` collapses all
+/// of those into `None`, which is why this reads the error kind directly.
 fn load_project_document(project_root: &str) -> Result<toml_edit::DocumentMut, String> {
     let path = project_path(project_root);
-    match read_if_exists(&path) {
-        Some(text) => text.parse::<toml_edit::DocumentMut>().map_err(|e| {
+    match std::fs::read_to_string(&path) {
+        Ok(text) => text.parse::<toml_edit::DocumentMut>().map_err(|e| {
             format!("existing .sparkle/config.toml is not valid TOML; fix it before editing it: {e}")
         }),
-        None => Ok(toml_edit::DocumentMut::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(toml_edit::DocumentMut::new()),
+        Err(e) => Err(format!(
+            "existing .sparkle/config.toml could not be read, so it will not be overwritten: {e}"
+        )),
     }
 }
 
@@ -3925,9 +4076,13 @@ pub fn set_project_value(project_root: &str, path: &str, value: &serde_json::Val
 /// is absent — but a present-but-unparseable file is refused rather than clobbered.
 pub fn unset_project_value(project_root: &str, path: &str) -> Result<(), String> {
     let path_buf = project_path(project_root);
-    // Nothing to remove from a file that doesn't exist yet.
-    if read_if_exists(&path_buf).is_none() {
-        return Ok(());
+    // Nothing to remove from a file that doesn't exist yet. Checked on the error KIND, not on
+    // `read_if_exists`: an unreadable-but-present file would otherwise return Ok(()) here and
+    // report a removal that never happened. It falls through to `load_project_document`, which
+    // refuses it loudly.
+    match std::fs::metadata(&path_buf) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        _ => {}
     }
     let mut doc = load_project_document(project_root)?;
     unset_dotted(&mut doc, path)?;
@@ -4038,11 +4193,18 @@ fn write_stage_definition(
     let path = project_path(project_root);
     // Preserve the existing project file (comments + other sections). If it exists but is
     // unparseable, refuse rather than clobber a hand-edited file; if absent, start from empty.
-    let mut doc = match read_if_exists(&path) {
-        Some(text) => text.parse::<toml_edit::DocumentMut>().map_err(|e| {
+    // Only NotFound starts from empty; an unreadable file is refused rather than replaced by a
+    // document holding just this stage. Same rule and same reason as `load_project_document`.
+    let mut doc = match std::fs::read_to_string(&path) {
+        Ok(text) => text.parse::<toml_edit::DocumentMut>().map_err(|e| {
             format!("existing .sparkle/config.toml is not valid TOML; fix it before defining a stage: {e}")
         })?,
-        None => toml_edit::DocumentMut::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml_edit::DocumentMut::new(),
+        Err(e) => {
+            return Err(format!(
+                "existing .sparkle/config.toml could not be read, so it will not be overwritten: {e}"
+            ))
+        }
     };
     // Insert-or-replace: assigning the key REPLACES the whole prior `[done]`/`[delivered]` table
     // (and its `[[<key>.criteria]]`) in place, rather than appending a second one.
@@ -4193,7 +4355,28 @@ pub fn reset_config(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub fn read_config_text(app: AppHandle) -> Result<String, String> {
     let ad = app_data(&app)?;
-    Ok(read_if_exists(&global_path(&ad)).unwrap_or_else(|| DEFAULT_TEMPLATE.to_string()))
+    read_editor_text(&global_path(&ad))
+}
+
+/// The raw editor's read, split out so it is testable without an `AppHandle`.
+///
+/// THE READ ARM OF THE SAME DATA LOSS, and it needs one click rather than none. Showing
+/// `DEFAULT_TEMPLATE` for a file that could not be READ is indistinguishable from a first-run empty
+/// state: the editor gives no sign a file exists, and pressing Save calls `write_text`, which
+/// validates the template (perfectly valid TOML) and atomically renames it over the user's
+/// `config.toml` — destroying the settings and the bytes needed to repair them.
+///
+/// Only UNREADABLE files are affected. A merely-unparseable-but-UTF-8 file already shows its own
+/// broken text, which is the point of the editor and must keep working.
+fn read_editor_text(path: &Path) -> Result<String, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DEFAULT_TEMPLATE.to_string()),
+        Err(e) => Err(format!(
+            "config.toml exists but could not be read: {e}. Fix or move it; the editor will not \
+             show the default in its place, because saving that would overwrite your file."
+        )),
+    }
 }
 
 /// Insert-or-replace a per-project `[done]`/`[delivered]` stage definition in the project's
@@ -5520,9 +5703,10 @@ quit_app = 42
         assert!(!global_text(&dir).contains("max_concurrent"), "global migrated");
     }
 
-    // roborev 53240 (High): `load_document` falls back to DEFAULT_TEMPLATE on a parse error. Using
-    // it here would stamp the template over a config the user merely typo'd and write it — wiping
-    // every setting AND the broken text they need in order to fix it, silently.
+    // roborev 53240 (High): a shared loader used to fall back to DEFAULT_TEMPLATE on a parse error,
+    // and using it here would have stamped the template over a config the user merely typo'd and
+    // written it — wiping every setting AND the broken text they need in order to fix it, silently.
+    // That loader is gone; this pins the migration against reintroducing the behaviour.
     #[test]
     fn an_unparseable_config_survives_the_migration_byte_for_byte() {
         let broken = "[workers\nmax_concurrent = 20\nthis is not toml";
@@ -7225,17 +7409,416 @@ mesages_per_hour = 9
     }
 
     #[test]
-    fn load_document_falls_back_to_template_on_unparseable_toml() {
-        // FIX 2 regression: a corrupt on-disk config.toml must not panic load_document — it falls
-        // back to the (valid) default template so the in-app editor still opens with something sane.
+    fn a_write_refuses_an_unparseable_global_config_instead_of_erasing_it() {
+        // THE DATA-LOSS CASE. A shared loader used to fall back to DEFAULT_TEMPLATE when the file would not
+        // parse — right for the read path (the editor still opens), catastrophic for a write: the
+        // document being edited is then the TEMPLATE, so persisting it replaces the user's settings,
+        // their comments, and the malformed text they need in order to repair it. `parse_layer`
+        // cannot catch it, because the template is valid TOML; it is the WRONG document, not an
+        // invalid one.
+        //
+        // Reachable by a typo in a hand-edited file, and it needs no user action to fire: any
+        // automatic launch-time write lands it at startup.
         let dir = tempfile::tempdir().unwrap();
         let ad = dir.path();
-        std::fs::write(global_path(ad), "this is = = not valid toml [[[").unwrap();
-        let doc = load_document(ad); // must not panic
-        // The fallback document is itself valid and parses to the built-in defaults.
-        let (cfg, _, hard) = effective(Some(&doc.to_string()), None);
-        assert!(!hard, "fallback document must be valid TOML");
-        assert_eq!(cfg, SparkleConfig::default());
+        let corrupt = "# my careful settings\n[approvals]\nbash = \"always\"\n[[[ oops";
+        std::fs::write(global_path(ad), corrupt).unwrap();
+
+        let err = set_value(ad, "improvement.consent", &serde_json::json!("always"))
+            .expect_err("a write against an unparseable config must be refused");
+        assert!(err.contains("not valid TOML"), "unexpected error: {err}");
+
+        // The SIDE EFFECT is the assertion: the bytes on disk are untouched, including the comment
+        // and the malformed tail. Asserting only the Err would pass against a version that errored
+        // after writing.
+        assert_eq!(
+            std::fs::read_to_string(global_path(ad)).unwrap(),
+            corrupt,
+            "the user's file must survive byte-identical"
+        );
+
+        // Same for the other two writers, which shared the same loader.
+        assert!(set_values(ad, &[("improvement.consent".into(), serde_json::json!("never"))]).is_err());
+        assert!(unset_value(ad, "improvement.consent").is_err());
+        assert_eq!(std::fs::read_to_string(global_path(ad)).unwrap(), corrupt);
+    }
+
+    #[test]
+    fn a_write_refuses_a_file_it_cannot_read_rather_than_treating_it_as_absent() {
+        // The residual branch of the fix above. `read_if_exists` is `read_to_string(..).ok()`, so it
+        // collapses EVERY read error into "absent" — invalid UTF-8 from a hand-edit saved in another
+        // encoding, a truncated write, EACCES, EIO. Each of those is a file that EXISTS and holds
+        // the user's settings, and each would otherwise start the write from the template and let
+        // the atomic rename replace their config with the default: the same data loss, through the
+        // one branch that looked safe.
+        //
+        // Invalid UTF-8 is the case a hand-editor can actually produce, and it needs no unusual
+        // permissions to set up, so it is the one asserted here.
+        let dir = tempfile::tempdir().unwrap();
+        let ad = dir.path();
+        let raw: &[u8] = b"[approvals]\nbash = \"alw\xffays\"\n";
+        std::fs::write(global_path(ad), raw).unwrap();
+
+        let err = set_value(ad, "improvement.consent", &serde_json::json!("always"))
+            .expect_err("a write against an unreadable config must be refused");
+        assert!(err.contains("could not be read"), "unexpected error: {err}");
+
+        // The bytes, not the message: a version that errored AFTER writing would pass on the Err.
+        assert_eq!(
+            std::fs::read(global_path(ad)).unwrap(),
+            raw,
+            "the user's file must survive byte-identical"
+        );
+    }
+
+    #[test]
+    fn a_project_write_refuses_a_file_it_cannot_read_rather_than_emptying_it() {
+        // The per-project sibling, and a STRICTLY WORSE loss than the global one: the absent branch
+        // here is an EMPTY document, not the default template, so a write that wrongly reaches it
+        // renders a file holding only the key just set — every project setting and every
+        // [done]/[delivered] stage definition gone, along with the bytes needed to repair it.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let path = project_path(&root);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let raw: &[u8] = b"# hand-written\n[workflow]\nrequire_pr = fa\xfflse\n";
+        std::fs::write(&path, raw).unwrap();
+
+        let err = set_project_value(&root, "approvals.bash", &serde_json::json!("always"))
+            .expect_err("a project write against an unreadable config must be refused");
+        assert!(err.contains("could not be read"), "unexpected error: {err}");
+        assert_eq!(std::fs::read(&path).unwrap(), raw, "the project file must survive byte-identical");
+
+        // The stage-definition writer reads the same file inline and had the same shape.
+        let def = serde_json::json!({ "description": "x", "criteria": [] });
+        assert!(write_stage_definition(&root, "done", &def).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), raw);
+
+        // And the remover must not report a removal it did not perform.
+        assert!(unset_project_value(&root, "approvals.bash").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), raw);
+    }
+
+    #[test]
+    fn the_editor_refuses_to_show_the_template_for_a_file_it_cannot_read() {
+        // The READ arm, and the cheapest path to the same loss: showing DEFAULT_TEMPLATE for an
+        // unreadable file is indistinguishable from a first-run empty state, so one Save calls
+        // write_text, which validates the template (valid TOML) and renames it over the user's
+        // config. Zero clicks became one.
+        let dir = tempfile::tempdir().unwrap();
+        let ad = dir.path();
+        let raw: &[u8] = b"[approvals]\nbash = \"alw\xffays\"\n";
+        std::fs::write(global_path(ad), raw).unwrap();
+
+        let err = read_editor_text(&global_path(ad))
+            .expect_err("an unreadable config must not render as the default template");
+        assert!(err.contains("could not be read"), "unexpected error: {err}");
+
+        // Absent still opens on the template — that is the first-run path and must keep working.
+        let empty = tempfile::tempdir().unwrap();
+        let text = read_editor_text(&global_path(empty.path())).expect("absent file opens");
+        assert_eq!(text, DEFAULT_TEMPLATE);
+
+        // ...and a merely-UNPARSEABLE but readable file still shows its OWN text, not the default:
+        // repairing it in the editor is the whole point.
+        let broken = tempfile::tempdir().unwrap();
+        std::fs::write(global_path(broken.path()), "[[[ oops").unwrap();
+        assert_eq!(read_editor_text(&global_path(broken.path())).unwrap(), "[[[ oops");
+    }
+
+    /// Serializes the tests that touch the PROCESS-GLOBAL cached config layer.
+    ///
+    /// `reload_global` writes a singleton, so two tests driving it in parallel interleave: one
+    /// resets the cached layer to defaults between another's load and its assertion. The harness
+    /// runs tests in parallel by default and nothing in this crate passes `--test-threads=1`, so
+    /// this is not hypothetical — and the test it breaks is the only proof of the unreadable-file
+    /// fix, which is the worst possible place for an intermittent red (it reads as "the fix is
+    /// broken"). Poison-tolerant for the same reason the production lock is: one panicking test
+    /// must not wedge the rest.
+    static CONFIG_GLOBAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn an_unreadable_project_config_keeps_the_global_layer_and_warns() {
+        // The OTHER runtime arm. The previous commit claimed "restoring read_if_exists fails it",
+        // and that held for only half the diff: nothing in the crate drove `for_project` at all, so
+        // reverting its arm left the suite green. It is also the arm with the DIFFERENT contract —
+        // there is no last-good project layer to keep, so the honest result is the global layer plus
+        // a warning, never a silent "this project configures nothing".
+        let _guard = CONFIG_GLOBAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let path = project_path(&root);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        // A project-scoped non-default, so its loss is observable.
+        std::fs::write(&path, "[workflow]\nrequire_pr = false\n").unwrap();
+        let good = for_project(&root);
+        assert!(!good.config.workflow.require_pr, "fixture must load the project value");
+
+        // Now unreadable. mtime and len both move here, so the (mtime,len) memo cannot serve the
+        // previous entry — this exercises the read, not the cache.
+        std::fs::write(&path, b"[workflow]\nrequire_pr = fa\xfflse\n").unwrap();
+        let after = for_project(&root);
+
+        // The GLOBAL layer's value, not the project's stale one and not a silent empty project.
+        assert!(
+            after.config.workflow.require_pr,
+            "an unreadable project file must fall back to the global layer, not keep a stale value"
+        );
+        // MATCHED ON THIS FILE'S PATH, not on the phrase alone. `for_project` carries the GLOBAL
+        // layer's warnings forward into its result, so a bare "could not be read" match also sees a
+        // global-config warning left by another test — which made this assertion pass (and its
+        // negative counterpart below fail) for a reason having nothing to do with the project file.
+        let names_project_file =
+            |ws: &[String]| ws.iter().any(|w| w.contains(&path.display().to_string()));
+        assert!(
+            names_project_file(&after.warnings),
+            "the UI needs a warning naming the project file, got {:?}",
+            after.warnings
+        );
+
+        // AND THE FAILURE IS NOT FROZEN — asserted via `chmod`, which is the ONLY way to reach the
+        // state the memo fix targets.
+        //
+        // The first cut of this block rewrote the file's CONTENT to repair it and claimed that
+        // "restoring readable content without touching the byte length keeps len equal". That was
+        // false — the good fixture is 30 bytes and the invalid-UTF-8 one is 31 — so a memoized
+        // failure would have missed on `len` regardless and all three assertions passed with the
+        // guard removed. Vacuous, and self-certifying: the comment asserted the premise the
+        // assertions needed instead of establishing it.
+        //
+        // Permissions are the real case anyway, and the one the production comment names: `chmod`
+        // moves ctime only, so `modified()` and `len` are IDENTICAL across the failure and the
+        // repair. A cached failure is therefore served, and the repair never takes effect for the
+        // life of the process. Nothing but this shape exercises that.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let fresh = tempfile::tempdir().unwrap();
+            let froot = fresh.path().to_string_lossy().to_string();
+            let fpath = project_path(&froot);
+            std::fs::create_dir_all(fpath.parent().unwrap()).unwrap();
+            std::fs::write(&fpath, "[workflow]\nrequire_pr = false\n").unwrap();
+
+            std::fs::set_permissions(&fpath, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+            // THE SKIP CONDITION IS THE OS, NOT THE CODE UNDER TEST. Gating on whether
+            // `for_project` warned would make the whole proof self-referential: any regression that
+            // stops it reporting an EACCES — reverting the read arm, or a message that drops the
+            // path — would make this block SKIP and the test go green, which is the failure mode it
+            // exists to catch. Asking the filesystem directly cannot be fooled that way, and it is
+            // the only thing that actually distinguishes "root defeats mode bits" from "the
+            // production path stopped reporting the failure".
+            if std::fs::read_to_string(&fpath).is_err() {
+                let denied = for_project(&froot);
+                assert!(
+                    denied
+                        .warnings
+                        .iter()
+                        .any(|w| w.contains(&fpath.display().to_string())),
+                    "an unreadable project file must warn, got {:?}",
+                    denied.warnings
+                );
+                let before = std::fs::metadata(&fpath).unwrap();
+                std::fs::set_permissions(&fpath, std::fs::Permissions::from_mode(0o644)).unwrap();
+                let after_meta = std::fs::metadata(&fpath).unwrap();
+                assert_eq!(
+                    (before.len(), before.modified().unwrap()),
+                    (after_meta.len(), after_meta.modified().unwrap()),
+                    "the fixture must leave len and mtime untouched, or it does not test the memo"
+                );
+
+                let repaired = for_project(&froot);
+                assert!(
+                    !repaired.config.workflow.require_pr,
+                    "a repaired project file must be re-read, not served from a cached failure"
+                );
+                assert!(
+                    !repaired
+                        .warnings
+                        .iter()
+                        .any(|w| w.contains(&fpath.display().to_string())),
+                    "the stale warning must clear once the file reads again, got {:?}",
+                    repaired.warnings
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_already_memoized_project_keeps_serving_last_good_when_it_becomes_unreadable() {
+        // PINS THE BOUNDARY the production comment states, rather than leaving it asserted in prose.
+        //
+        // `for_project`'s fast path keys on `(mtime_ms, len)` plus the global layer. `chmod 000`
+        // moves ctime only, so for a project ALREADY memoized as good — the common shape, since
+        // this runs on a hot poll — the stamp still matches, the cache hit is served, and the
+        // un-memoization code is never reached. The user therefore gets the last-good config and NO
+        // warning until the stamp moves, THE GLOBAL LAYER CHANGES, or the process restarts.
+        //
+        // Both halves are pinned below, because the second is the one a reader trips over: the
+        // silent window is not "until restart", it ends at the next global-config change.
+        //
+        // That is deliberate: closing it would mean re-reading the file on every hit of a hot path,
+        // or keying the stamp on ctime/mode. Serving last-good is the safe direction. This test
+        // exists so the decision is visible and a future change to the fast path has to confront it
+        // — if someone makes it re-validate, this test fails and they update it on purpose.
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = CONFIG_GLOBAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let path = project_path(&root);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "[workflow]\nrequire_pr = false\n").unwrap();
+
+        // Warm the memo with a successful read.
+        assert!(!for_project(&root).config.workflow.require_pr, "fixture must load first");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Gate on the OS, never on the code under test (see the sibling case for why).
+        if std::fs::read_to_string(&path).is_err() {
+            let after = for_project(&root);
+            assert!(
+                !after.config.workflow.require_pr,
+                "an already-memoized project must keep serving last-good on an unchanged stamp"
+            );
+            assert!(
+                !after.warnings.iter().any(|w| w.contains(&path.display().to_string())),
+                "and it does NOT warn, because the fast path never reaches the read: {:?}",
+                after.warnings
+            );
+
+            // THE INVALIDATION EDGE. A global-layer change fails `e.global_config == global.config`
+            // for every project entry, so the very next call is a miss, reaches the read, and
+            // surfaces the failure — with no stamp movement and no restart. Pinning it here keeps
+            // the boundary from reading as "silent until restart", which is what it looks like from
+            // the assertions above alone.
+            let gdir = tempfile::tempdir().unwrap();
+            std::fs::write(global_path(gdir.path()), "[workers]\nmax_concurrent = 5\n").unwrap();
+            let _ = reload_global(gdir.path());
+
+            let after_global_change = for_project(&root);
+            assert!(
+                after_global_change
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains(&path.display().to_string())),
+                "a changed global layer must invalidate the entry and surface the failure, got {:?}",
+                after_global_change.warnings
+            );
+        }
+        // Restore so the tempdir can be cleaned up.
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
+    }
+
+    #[test]
+    fn a_global_warning_reaches_project_scoped_readers_without_a_project_change() {
+        // THE WARNING CHANNEL, and the failure mode that silences it.
+        //
+        // `reload_global`'s hard-error branch deliberately keeps the last-good `config` and
+        // refreshes only `warnings` — so a global config.toml that becomes unparseable changes
+        // NOTHING about the parsed config. Keying the project memo on `global_config` alone
+        // therefore left every entry valid, and every project-scoped reader served the stale
+        // (empty) warning list: `read_project_config` forwards these to the concierge, so the
+        // channel meant to announce a broken global config went silent for exactly the surface that
+        // announces it, until the project file's own stamp moved or the process restarted.
+        let _guard = CONFIG_GLOBAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let gdir = tempfile::tempdir().unwrap();
+        let ad = gdir.path();
+        // A value that changes nothing observable and warns about NOTHING — pinning
+        // max_concurrent, for instance, emits its own advisory and would mask the assertion below.
+        std::fs::write(global_path(ad), "[workflow]\nrequire_pr = true\n").unwrap();
+        let _ = reload_global(ad);
+
+        let pdir = tempfile::tempdir().unwrap();
+        let root = pdir.path().to_string_lossy().to_string();
+        let ppath = project_path(&root);
+        std::fs::create_dir_all(ppath.parent().unwrap()).unwrap();
+        std::fs::write(&ppath, "[workflow]\nrequire_pr = false\n").unwrap();
+
+        // Warm the project memo against a clean global layer.
+        let warm = for_project(&root);
+        assert!(warm.warnings.is_empty(), "fixture must start clean, got {:?}", warm.warnings);
+
+        // Break the GLOBAL file only. The parsed config is unchanged (hard-error keeps last-good);
+        // the project file is untouched, so its stamp does not move.
+        std::fs::write(global_path(ad), "[workflow]\nrequire_pr = true\n[[[ oops").unwrap();
+        let reloaded = reload_global(ad);
+        let global_warning = reloaded
+            .warnings
+            .first()
+            .cloned()
+            .expect("the global layer must warn");
+
+        // MATCHED ON THE GLOBAL LAYER'S OWN WARNING, not on "the list is non-empty". `for_project`
+        // concatenates global + project warnings, so a bare emptiness check would also be satisfied
+        // by any future project-side warning — and would then pass with `global_warnings` dropped
+        // from the fast-path guard, turning the only pin of this defect vacuous. The sibling test
+        // above carries the same note for the same reason: it was bitten by exactly that.
+        let after = for_project(&root);
+        assert!(
+            after.warnings.contains(&global_warning),
+            "a project-scoped reader must see the GLOBAL warning ({global_warning:?}) without any \
+             project-side change, got {:?}",
+            after.warnings
+        );
+        // And the invalidation must RE-MERGE, not discard: the project overlay still has to win.
+        assert!(
+            !after.config.workflow.require_pr,
+            "the re-merged entry must keep the project's own value, got the global one"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_config_keeps_last_good_instead_of_reverting_to_defaults() {
+        let _guard = CONFIG_GLOBAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // THE RUNTIME ARM, and the one that needs no user action at all: reload_global runs at
+        // launch and on every watcher event. An unreadable file arriving as `None` reads as an
+        // ABSENT layer, so build_effective never sets hard_error and never warns — the cached
+        // config is replaced by pure DEFAULTS, silently. Concurrency pins, approvals, [improvement]
+        // and [freshness] all revert with nothing in the UI to say why, while a merely UNPARSEABLE
+        // file (strictly less severe) correctly keeps last-good and warns.
+        let dir = tempfile::tempdir().unwrap();
+        let ad = dir.path();
+
+        // A good load first, with a non-default value to notice the loss of.
+        std::fs::write(global_path(ad), "[workers]\nmax_concurrent = 7\n").unwrap();
+        let good = reload_global(ad);
+        assert_eq!(good.config.workers.max_concurrent, Some(7), "fixture must load a non-default value");
+
+        // Now make it unreadable (invalid UTF-8 — what a hand-edit in another encoding produces).
+        std::fs::write(global_path(ad), b"[workers]\nmax_concurrent = \xff7\n").unwrap();
+        let after = reload_global(ad);
+
+        assert_eq!(
+            after.config.workers.max_concurrent, Some(7),
+            "an unreadable file must keep the last-good config, not revert to defaults"
+        );
+        assert!(
+            after.warnings.iter().any(|w| w.contains("could not be read")),
+            "the UI needs a warning naming the problem, got {:?}",
+            after.warnings
+        );
+    }
+
+    #[test]
+    fn a_write_still_starts_from_the_template_when_the_file_is_absent() {
+        // The complement, and what stops the fix above from being "refuse everything": a first-run
+        // write with no file yet must still work and produce a valid config.
+        let dir = tempfile::tempdir().unwrap();
+        let ad = dir.path();
+        assert!(read_if_exists(&global_path(ad)).is_none(), "fixture must start with no file");
+
+        set_value(ad, "improvement.consent", &serde_json::json!("always"))
+            .expect("a first write with no existing file must succeed");
+
+        let text = std::fs::read_to_string(global_path(ad)).unwrap();
+        assert!(text.contains("always"), "the written value must be present: {text}");
+        let (_cfg, _, hard) = effective(Some(&text), None);
+        assert!(!hard, "the result must be valid TOML");
     }
 
     #[test]
@@ -7335,6 +7918,10 @@ mesages_per_hour = 9
 
     #[test]
     fn config_lock_recovers_after_poison() {
+        // Shares the lock with the unreadable-config test: this one calls `reload_global` against
+        // an empty tempdir, which resets the cached layer to defaults and would otherwise land
+        // between that test's load and its assertion.
+        let _guard = CONFIG_GLOBAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Poison the process-wide config RwLock by panicking while holding the write guard, then
         // assert the poison-tolerant accessors still function. Without the recovery, every future
         // get_config/reload would panic for the rest of the process (a permanently wedged command).
