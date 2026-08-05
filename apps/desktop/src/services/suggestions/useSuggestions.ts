@@ -854,6 +854,29 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
         // budget guard refuses any later re-trigger for this same hash. Two disjoint shapes are
         // terminal — an unavailable backend (AiUnavailableError, tracked above via `unavailable`,
         // whose message carries no HTTP code) and a 4xx surfaced as `... (HTTP 4xx)` — so OR them.
+        //
+        // A BROKEN CREDENTIAL IS ALREADY COVERED BY THE FIRST OF THOSE, and does not need a third
+        // arm here. It is tempting to add one, because the rejection carries no HTTP code and so is
+        // invisible to `isTerminalComputeError` — but the classification happens upstream, in Rust:
+        // `classify_cli_failure` maps "failed to authenticate" and "session expired" to
+        // `claude_not_authenticated`, `parseUnavailableReason` turns that into
+        // `cli_not_authenticated`, and `chatOnce` throws `ClaudeAuthError` — which EXTENDS
+        // `AiUnavailableError`. So `unavailable` is already true and short-circuits this `||`
+        // before any message matching happens.
+        //
+        // Stated precisely, because the categorical version of this claim was wrong once: what is
+        // closed is the path that CLASSIFIES, which is the CLI's result JSON. A CLI that dies
+        // before emitting one reports on stderr and is NOT classified, so that rejection does reach
+        // here as prose and is retried — a real, narrower gap, tracked as sparkle-o36ao. The fix
+        // belongs in the Rust classifier, not in a second matcher here: adding one would rebuild
+        // the parallel classifier this PR just deleted, and would still miss every other consumer
+        // of the same failure (attention-summary, the judge), which is precisely why the canonical
+        // seam is the right place.
+        //
+        // A string matcher added here would therefore be unreachable on the classified path, and
+        // only a test injecting `callHaiku` (the seam production never sets) can manufacture the
+        // prose it would match. Recorded because it has been proposed once already; see
+        // PRD/sparkle/suggestions-auth-terminal.md for the full trace.
         const terminal = unavailable || isTerminalComputeError(message);
         const spent = terminal ? MAX_COMPUTE_ATTEMPTS : failuresFor(fail.current, nextHash) + 1;
         // Count and hash move together, so a compute for another state can never be charged this

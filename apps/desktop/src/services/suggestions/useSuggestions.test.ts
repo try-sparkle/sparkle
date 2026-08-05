@@ -17,7 +17,7 @@ import {
   trackAgent,
 } from "../../engine/turnEndAuthority";
 import { SuggestionOfflineError } from "./engine";
-import { AiUnavailableError, AiUnreachableError } from "../anthropic";
+import { AiUnavailableError, AiUnreachableError, ClaudeAuthError } from "../anthropic";
 import { OutOfCreditsError } from "../credits";
 
 describe("computeDeferralReason (a shut gate is not a failure of this state)", () => {
@@ -71,6 +71,36 @@ describe("isTerminalComputeError (skips retries that can't succeed)", () => {
     expect(isTerminalComputeError("Claude request failed: ai request failed")).toBe(false);
     expect(isTerminalComputeError("bad JSON: unexpected token")).toBe(false);
     expect(isTerminalComputeError("")).toBe(false);
+  });
+});
+
+describe("a broken credential is terminal — via the TYPE, not the message", () => {
+  // Guards the invariant the terminal decision actually rests on, and the one whose quiet removal
+  // would resurrect a measured incident: a single expired session driving hundreds of doomed
+  // suggestion calls, each spending a full 3-attempt budget on a rejection ~5s of backoff could
+  // never clear.
+  //
+  // The chain: Rust `classify_cli_failure` maps "failed to authenticate" / "session expired" to
+  // `claude_not_authenticated` -> `parseUnavailableReason` -> `cli_not_authenticated` ->
+  // `chatOnce` throws `ClaudeAuthError`. `terminal` reads `err instanceof AiUnavailableError`, so
+  // the SUBCLASS RELATION is load-bearing: flatten it and auth silently becomes retryable again,
+  // with no test failing anywhere near the change.
+
+  it("ClaudeAuthError is an AiUnavailableError, which is what makes it terminal", () => {
+    expect(new ClaudeAuthError() instanceof AiUnavailableError).toBe(true);
+  });
+
+  // Deliberately NOT asserting `isTerminalComputeError(new ClaudeAuthError().message) === false`.
+  // That reads like it proves the message classifier cannot see a credential failure, and it does
+  // not: `.message` is Sparkle's own remedy copy ("Sign in to Claude Code…"), never a CLI rejection
+  // body, and the assertion would pass for any sentence without an `(HTTP nnn)` suffix — i.e.
+  // against every possible implementation of the classifier. The two cases here carry the invariant.
+
+  it("is not deferred — there is no dep that flips when a credential is fixed", () => {
+    // Deferral is for conditions with an effect dep that recovers (`isOnline`, `learnedOn`).
+    // Auth has none, so deferring would leave the gate open and let every re-render buy another
+    // doomed call. Terminal spends the budget once and stops.
+    expect(computeDeferralReason(new ClaudeAuthError())).toBeFalsy();
   });
 });
 
