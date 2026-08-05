@@ -10,6 +10,12 @@
 // picking a position sets the mic, and there is exactly one place that says what happens when you
 // stop talking. See voice/sendMode for the mapping, which both this and the host read.
 //
+// IT IS THE ONLY PRESS TARGET, BUT NO LONGER THE ONLY CONTROL IN THE BAR. Speak carries one
+// modifier beneath this tray — the Auto-send switch (./AutoSendToggle), rendered by ComposeBox
+// directly below and right-aligned. It does NOT change what this component draws: the sweep runs
+// and resolves identically either way, because it is showing when the dictated utterance ENDS,
+// which happens whether or not the message then goes. Only the dispatch differs.
+//
 // PRESENTATIONAL, like everything else in this directory: it takes a model and callbacks and reads
 // no store. The host owns the timer, the mic, the routing and the announcements.
 //

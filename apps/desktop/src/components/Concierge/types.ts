@@ -731,6 +731,12 @@ export interface ConciergeColumnProps {
   sendMode?: SendMode;
   /** The user moved the tray. Absent → the tray's positions are inert. */
   onSendModeChange?: (next: SendMode) => void;
+  /** The Auto-send toggle's position — does an expired Speak countdown actually send? Absent → on,
+   *  which is how Speak has always behaved. OFF still runs the countdown; see ./AutoSendToggle. */
+  autoSendOn?: boolean;
+  /** The user flipped Auto-send. ABSENT HIDES THE TOGGLE — a switch the engine ignores is worse
+   *  than none. This column is a conduit for both, exactly as it is for `sendMode`. */
+  onAutoSendChange?: (next: boolean) => void;
   /** A live PTY owns the keyboard, so the tray is not being addressed and goes flat grey. */
   trayInert?: boolean;
   /** Is the push-to-talk gesture active — key or button down? Passed straight through to the tray;

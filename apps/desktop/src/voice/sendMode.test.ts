@@ -322,3 +322,16 @@ describe("the keycap chip cannot lie about the keystroke", () => {
     });
   });
 });
+
+describe("which positions offer the Auto-send toggle (sparkle-aew8t)", () => {
+  it("exactly the positions that count down — Speak, and only Speak", () => {
+    // ComposeBox gates the Auto-send switch on `modeCountsDown` itself rather than on a second
+    // predicate of its own, so this is the whole rule: the switch governs what an EXPIRED countdown
+    // does, and a position with no countdown has nothing for it to govern.
+    //
+    // Asserted across the WHOLE mode set rather than at three literals, so a fourth position cannot
+    // be added that draws a switch over nothing without failing here.
+    const offersToggle = SEND_MODES.filter((m) => modeCountsDown(m));
+    expect(offersToggle).toEqual(["speak"]);
+  });
+});

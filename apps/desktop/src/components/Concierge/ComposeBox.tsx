@@ -155,7 +155,14 @@ import { classifyComposerRoute } from "./composerRoute";
 import { TERM_BODY_BASE_SIZE, TERM_BODY_FONT } from "../terminalChrome";
 import { MentionMirror, MENTION_MIRROR_SKIP_ATTR } from "./MentionMirror";
 import { SendModeTray, type SendTrayModel } from "./SendModeTray";
-import { DEFAULT_SEND_CHORD, chordSends, type SendChord, type SendMode } from "../../voice/sendMode";
+import {
+  DEFAULT_SEND_CHORD,
+  chordSends,
+  modeCountsDown,
+  type SendChord,
+  type SendMode,
+} from "../../voice/sendMode";
+import { AutoSendToggle } from "./AutoSendToggle";
 import { micCaptionKind } from "../../voice/micPresentation";
 
 const line = `color-mix(in srgb, ${C.muted} 25%, transparent)`;
@@ -588,6 +595,8 @@ export function ComposeBox({
   autoSend,
   sendMode = "send",
   onSendModeChange,
+  autoSendOn = true,
+  onAutoSendChange,
   trayInert = false,
   pttHeld = false,
   sendChord = DEFAULT_SEND_CHORD,
@@ -676,6 +685,19 @@ export function ComposeBox({
   sendMode?: SendMode;
   /** The user moved the tray. Absent → the tray's positions are inert (see `sendMode`). */
   onSendModeChange?: (next: SendMode) => void;
+  /**
+   * The **Auto-send** toggle's position — does an expired Speak countdown actually send?
+   *
+   * OFF DOES NOT MEAN "NO COUNTDOWN": the countdown still runs and still ends the utterance; only
+   * the dispatch is withheld, leaving the words in this box. See ./AutoSendToggle.
+   *
+   * DEFAULTS TRUE so a host that has not wired the toggle up behaves exactly as Speak always has.
+   */
+  autoSendOn?: boolean;
+  /** The user flipped Auto-send. ABSENT HIDES THE TOGGLE ENTIRELY — a switch nothing listens to
+   *  would paint a position the user could move and the engine would ignore, which is worse than
+   *  no switch. Same posture `onSendModeChange` takes for the tray's own positions. */
+  onAutoSendChange?: (next: boolean) => void;
   /** A live PTY owns the keyboard, so the tray is NOT BEING ADDRESSED — it goes flat grey while
    *  still showing which mode is selected. Decided by the host from voice/dictationFocus; see
    *  voice/sendMode `trayInert` for why "is the composer focused" is a different question. */
@@ -2152,6 +2174,31 @@ export function ComposeBox({
         // i.e. the one cue that separates counting from armed-idle disappears (roborev 55244).
         wired={wired}
       />
+      {/* THE AUTO-SEND SWITCH — below the tray, right-aligned, and ONLY in Speak.
+
+          The founder's placement, verbatim: "below the slider tray, but to the right side".
+
+          `modeCountsDown` rather than `sendMode === "speak"` spelled out again: the toggle governs
+          what an expired countdown does, so "there is a switch here" and "there is a countdown here"
+          are ONE fact (voice/sendMode). Two spellings is how a switch ends up in a position with
+          nothing behind it.
+
+          Hidden — not disabled — outside Speak. The setting is remembered while it is hidden (it
+          lives in the persisted store, not in this subtree), so the founder's "every time I go to
+          the speak slider, then it stays on" holds across mode changes and across relaunches.
+
+          NO TOGGLE WITHOUT A LISTENER: `onAutoSendChange` absent means this host has not wired the
+          setting to the countdown, and painting a movable switch the engine ignores is worse than
+          painting none. */}
+      {onAutoSendChange && modeCountsDown(sendMode) && (
+        <AutoSendToggle
+          checked={autoSendOn}
+          onChange={onAutoSendChange}
+          // Greyed with the tray when a live PTY owns the keyboard, for the same reason the tray
+          // greys: keystrokes are going somewhere else. The VALUE is untouched and still shown.
+          disabled={trayInert}
+        />
+      )}
     </div>
   );
 }

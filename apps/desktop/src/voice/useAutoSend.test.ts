@@ -44,6 +44,9 @@ function setup(overrides: Partial<Props> = {}) {
   const onAnnounce = vi.fn();
   const base: Props = {
     armed: true,
+    // ON, matching the shipped default — every pre-existing row below asserts the auto-sending
+    // behaviour and must keep doing so. The OFF rows opt in explicitly.
+    autoSend: true,
     micLive: true,
     composedText: DONE,
     interim: "",
@@ -700,5 +703,115 @@ describe("keep talking and it waits — ON THE ON-DEVICE PATH TOO", () => {
     speechEnds();
     await tick(1200);
     expect(onFire).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// THE AUTO-SEND TOGGLE (sparkle-aew8t)
+//
+// The founder asked for an on/off switch under the Speak tray. The subtlety that makes these tests
+// worth more than "does the flag work" is what OFF must NOT mean:
+//
+//   OFF ≠ "disable the countdown". Speak ends a dictated utterance on a silence countdown, and
+//   typing during that countdown pauses it and re-evaluates. He asked for that separately and it
+//   was built. With auto-send off, ALL of it still runs — the clock starts, the sweep drains, the
+//   utterance ends on the same schedule. The ONLY thing removed is the dispatch at the end.
+//
+// So every row here asserts a PAIR: the countdown behaved exactly as it does with the toggle on,
+// AND nothing was sent or announced as sent. Asserting only the second half would pass just as
+// happily against `armed: false`, which is the wrong fix wearing the right result.
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+describe("auto-send OFF holds the message instead of sending it", () => {
+  it("still COUNTS DOWN and still ENDS the utterance — only the send is withheld", async () => {
+    const { onFire, result } = setup({ autoSend: false });
+    speechEnds();
+    // THE COUNTDOWN RAN. This is the half that `armed: false` would fail, and it is why it is
+    // asserted first: it pins that the toggle did not quietly become a second disarm switch.
+    expect(result.current.phase).toBe("counting");
+    await tick(HIGH + AUTO_SEND_TICK_MS);
+    // THE COUNTDOWN ENDED — back to listening, ready for the next utterance, exactly as a fired one
+    // leaves it. The dictation was ended by the silence, which is the behaviour being preserved.
+    expect(result.current.phase).toBe("listening");
+    // …AND NOTHING WENT OUT.
+    expect(onFire).not.toHaveBeenCalled();
+  });
+
+  it("never announces a send — the defect an auto-send toggle most easily reintroduces", async () => {
+    // ── WHY THIS ROW EXISTS ────────────────────────────────────────────────────────────────────
+    // Both source files carry headers about the rail announcing "Sent to …" when nothing was sent.
+    // With auto-send off the countdown still runs to completion, so every countdown announcement
+    // still fires and ONLY the send is gone — which is precisely the shape that produces a phantom
+    // "Sent". A screen-reader user has nothing but this line to tell them where their words are.
+    const { onAnnounce } = setup({ autoSend: false });
+    speechEnds();
+    await tick(HIGH + AUTO_SEND_TICK_MS);
+    const said = onAnnounce.mock.calls.map(([line]) => String(line));
+    expect(said.some((l) => /\bSent\b/.test(l))).toBe(false);
+    // And it says the TRUE thing instead: the words are waiting for a press.
+    expect(said.some((l) => /composer|Ready to send/i.test(l))).toBe(true);
+  });
+
+  it("does not bump firedSeq — the tray's green fill is the same claim in paint", async () => {
+    // roborev 57314/57330 pinned the counter and the announcement together: a fire that sent
+    // nothing must not flash the Speak pill green either. The toggle has to respect both.
+    const { result } = setup({ autoSend: false });
+    const before = result.current.firedSeq ?? 0;
+    speechEnds();
+    await tick(HIGH + AUTO_SEND_TICK_MS);
+    expect(result.current.firedSeq ?? 0).toBe(before);
+  });
+
+  it("KEEPS THE WORDS — a later send has the same text, not an emptied box", async () => {
+    // `evaluate`'s fire branch clears `transcript` because the message is gone. Nothing left the box
+    // here, so clearing it would desync the reducer from the textarea the user is looking at —
+    // `noteTranscript` only re-syncs when composedText CHANGES, so it would stay wrong for as long
+    // as the user did not touch the box. Proven end-to-end: flip the toggle back on, speak again,
+    // and the SAME text fires — which can only happen if it survived the held countdown.
+    const { onFire, update, result } = setup({ autoSend: false });
+    speechEnds();
+    await tick(HIGH + AUTO_SEND_TICK_MS);
+    expect(onFire).not.toHaveBeenCalled();
+
+    update({ autoSend: true });
+    speechEnds(); // the user speaks again over the still-present draft
+    expect(result.current.phase).toBe("counting");
+    await tick(HIGH + AUTO_SEND_TICK_MS);
+    expect(onFire).toHaveBeenCalledTimes(1);
+  });
+
+  it("TYPING STILL PAUSES THE COUNTDOWN — the behaviour he asked for survives the toggle", async () => {
+    // The countdown's moving threshold is the mechanism most at risk from a careless toggle: wire
+    // the flag into `armed` and this stops existing. A mid-clause edit drops the tier to `verylow`,
+    // which pushes the deadline far out — so the countdown that would have ended by now has not.
+    const { result, update } = setup({ autoSend: false });
+    speechEnds();
+    expect(result.current.phase).toBe("counting");
+    update({ composedText: MID_CLAUSE }); // trailing conjunction → verylow → 10s
+    await tick(HIGH + AUTO_SEND_TICK_MS); // well past the clean-sentence threshold
+    // STILL COUNTING: the threshold moved rather than the clock resetting, exactly as with the
+    // toggle on. If the toggle had disabled the countdown this would read "listening" too — so the
+    // discriminator is the row above, which proves it DOES end on its own once the tier allows.
+    expect(result.current.phase).toBe("counting");
+    expect(result.current.remainingFraction).toBeGreaterThan(0);
+  });
+
+  it("flipping the toggle mid-countdown decides at the DEADLINE, not at arm time", async () => {
+    // The flag is read in the tick, not latched when the clock starts — so a user who changes their
+    // mind while the fill is draining gets what the switch says NOW. The opposite (latching at
+    // arm time) would send a message the switch visibly says will not be sent.
+    const { onFire, update } = setup({ autoSend: true });
+    speechEnds();
+    update({ autoSend: false }); // they flip it off while it drains
+    await tick(HIGH + AUTO_SEND_TICK_MS);
+    expect(onFire).not.toHaveBeenCalled();
+  });
+
+  it("auto-send ON is untouched — the shipped behaviour is the default", async () => {
+    // The control row. Everything above must be attributable to the toggle and nothing else.
+    const { onFire, onAnnounce } = setup({ autoSend: true });
+    speechEnds();
+    await tick(HIGH + AUTO_SEND_TICK_MS);
+    expect(onFire).toHaveBeenCalledTimes(1);
+    expect(onAnnounce.mock.calls.map(([l]) => String(l)).some((l) => /\bSent\b/.test(l))).toBe(true);
   });
 });

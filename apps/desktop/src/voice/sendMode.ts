@@ -5,6 +5,13 @@
 // hand or on its own, and is the microphone part of that?" This is that question as ONE control —
 // a three-position tray that IS the composer's bottom bar, edge to edge, and the only press target.
 //
+// THE TRAY IS THE MICROPHONE CONTROL; IT IS NOT THE ONLY CONTROL IN THIS BAR. Speak carries one
+// modifier — the Auto-send switch below the tray (components/Concierge/AutoSendToggle) — and the
+// two answer different questions. A POSITION says what the microphone does. AUTO-SEND says what the
+// countdown's END does. With it off the countdown still runs and still ends the utterance; only the
+// dispatch is withheld, leaving the words in the composer. Collapsing them — wiring the switch into
+// the countdown's arming — would delete the countdown while still looking like a working switch.
+//
 // The design was settled on a standalone prototype (PRD/sparkle/send-modes-live-spec.md) and the
 // rules below are that spec, transcribed. What lives here is only the part that can be decided
 // without a DOM: the mode set, the mic each mode implies, which mode owns a countdown, the floor
@@ -291,6 +298,14 @@ export function pttHeldIntent(): MicIntent {
  * Send sends when you press it. Push to talk sends the instant you RELEASE — a timer there would
  * make the deliberate mode feel laggier than the automatic one, which inverts the whole point of
  * offering both.
+ *
+ * IT ALSO DECIDES WHERE THE **AUTO-SEND** TOGGLE APPEARS (ComposeBox), and that is ONE fact rather
+ * than two. The founder asked for the switch in exactly those terms — *"when speak is active, I
+ * want to have a slider … for auto-send"* — and it governs what an EXPIRED countdown does, so a
+ * position with no countdown has nothing for it to govern: a control the user could operate that
+ * changes nothing. Asking this function rather than adding a second `mode === "speak"` predicate
+ * beside it is what stops a fourth position drawing a switch over nothing, or running a countdown
+ * nobody can turn off.
  */
 export function modeCountsDown(mode: SendMode): boolean {
   return mode === "speak";

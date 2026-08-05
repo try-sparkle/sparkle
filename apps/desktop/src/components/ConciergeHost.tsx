@@ -1628,6 +1628,12 @@ export function ConciergeHost({
     // tray is being addressed (see voice/useSendMode — an inert tray must not count invisibly and
     // then fire when colour returns).
     armed: sendTray.armed,
+    // ── THE TOGGLE, AND IT IS A DIFFERENT QUESTION FROM `armed` ─────────────────────────────────
+    // `armed` decides whether a countdown RUNS; this decides what it does when it EXPIRES. Passing
+    // the toggle as `armed` instead would switch the countdown itself off — deleting the silence
+    // countdown, its visible sweep, and the type-during-it pause, all of which the founder asked
+    // for separately and which must keep working with auto-send off. See useAutoSend's own doc.
+    autoSend: sendTray.autoSend,
     // OWNERSHIP GATE, and it is load-bearing rather than defensive. `speechEndSeq` is GLOBAL —
     // bumped for every utterance in the focused window whichever surface owns the mic — while the
     // cancel signal is not: `useConciergeDictation` returns interim `""` unless the concierge owns
@@ -4799,6 +4805,11 @@ export function ConciergeHost({
         autoSend={autoSendRail}
         sendMode={sendTray.mode}
         onSendModeChange={sendTray.setMode}
+        // THE AUTO-SEND TOGGLE, from the same hook that owns the position — so the switch the user
+        // sees and the flag the countdown reads (`autoSend` on the rail below) are ONE persisted
+        // value, never a prop mirror that could drift from it.
+        autoSendOn={sendTray.autoSend}
+        onAutoSendChange={sendTray.setAutoSend}
         trayInert={sendTray.inert}
         // The gesture, straight from the hook that owns it — see ComposeBox's `pttHeld` doc for why
         // this one line is the difference between the held treatment existing and running.

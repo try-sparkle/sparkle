@@ -298,6 +298,33 @@ export function evaluate(state: AutoSendState, now: number): AutoSendDecision {
 }
 
 /**
+ * The countdown reached its deadline with **auto-send OFF**. Stop counting — and send NOTHING.
+ *
+ * ── "AUTO-SEND OFF" IS NOT "NO COUNTDOWN" ───────────────────────────────────────────────────────
+ * This is the whole point of the toggle, and the one thing that would be easy to get backwards.
+ * `setArmed(state, false)` also stops a countdown, and reaching for it here would be the obvious
+ * implementation — but it means something else entirely: DISARMED is "nothing is watching", the
+ * state a tray parked on Send is in. Speak with auto-send off is still watching. The silence
+ * countdown still runs, the fill still drains, and it still ENDS the dictated utterance on the same
+ * schedule the founder already asked for and had built. What changes is only what happens at the
+ * end: the words stay in the composer and wait for a deliberate Send.
+ *
+ * ── SO THE TRANSCRIPT SURVIVES, AND THAT IS THE DIFFERENCE FROM `evaluate`'s FIRE BRANCH ────────
+ * `evaluate` clears `transcript` when it fires, because the message is GONE — the box is empty
+ * behind it. Here nothing left the box, so clearing it would make the reducer's own view of what is
+ * pending disagree with the textarea the user is looking at. `noteTranscript` only re-syncs when
+ * `composedText` CHANGES, so a cleared transcript here would stay wrong for as long as the user did
+ * not touch the box — which is exactly the state this path leaves them in.
+ *
+ * ALIASED to {@link noteSpeechResumed} rather than copied, because state-wise it IS that transition:
+ * stop the clock, stay armed, keep the words. The distinct NAME is what earns its keep — it says at
+ * the call site which event happened — while a duplicate body would be two things to keep in step
+ * for no benefit. If the two ever need to differ, split them then; today claiming they might is
+ * speculation that costs a reader a diff to confirm.
+ */
+export const noteCountdownHeld = noteSpeechResumed;
+
+/**
  * The user pressed Send. Cancel the countdown; the send has already happened by other means.
  *
  * MANUAL SEND ALWAYS OVERRIDES, at any confidence (PRD §4c). No hold, no confirmation, no
@@ -325,19 +352,59 @@ export function noteManualSend(state: AutoSendState): AutoSendState {
  * reader user needs here is the same thing a sighted one does — WHERE this is about to go, so a
  * misroute is catchable before it lands.
  */
+export type AutoSendEvent =
+  /** Speak was selected — a countdown may now run. */
+  | "armed"
+  /** Silence started accumulating toward a threshold. */
+  | "counting"
+  /** A message actually left the box. NEVER produced while `willSend` is false. */
+  | "fired"
+  /** The deadline passed with auto-send OFF: the words are waiting in the composer. */
+  | "held"
+  /** Speak was left — nothing is counting any more. */
+  | "disarmed";
+
 export function autoSendAnnouncement(
-  event: "armed" | "counting" | "fired" | "disarmed",
+  event: AutoSendEvent,
   targetName: string,
+  /**
+   * Will an expired countdown actually SEND? The Auto-send toggle, threaded in.
+   *
+   * ── EVERY LINE HERE IS A PROMISE, AND HALF OF THEM WERE FALSE WITH THE TOGGLE OFF ──────────────
+   * This defaulted-true parameter is not a convenience: with auto-send off, "Sending to X shortly"
+   * and "Auto-send on. Messages will go to X." are both statements that nothing is going to do. The
+   * rail announcing a send that never happens is the exact defect this module's `onFire` contract
+   * was written to close (see UseAutoSendArgs.onFire — "telling a screen-reader user a message went
+   * out when none did is worse than the silent no-op it replaced"), and an auto-send toggle is the
+   * most direct way to reintroduce it: the countdown still runs and still ends, so every countdown
+   * announcement still fires, and only the send is gone.
+   *
+   * So the flag reaches the COPY, not just the send. A sighted user can see the composer still
+   * holding their words; a screen-reader user has only this line.
+   */
+  willSend = true,
 ): string {
   switch (event) {
     case "armed":
-      return `Auto-send on. Messages will go to ${targetName}.`;
+      return willSend
+        ? `Auto-send on. Messages will go to ${targetName}.`
+        : `Speak on, auto-send off. What you say waits in the composer — press Send to send to ${targetName}.`;
     case "counting":
-      return `Sending to ${targetName} shortly. Press Send to go now, or keep talking to wait.`;
+      return willSend
+        ? `Sending to ${targetName} shortly. Press Send to go now, or keep talking to wait.`
+        : `Wrapping up. What you said stays in the composer — press Send to send to ${targetName}, or keep talking.`;
     case "fired":
-      return `Sent to ${targetName}.`;
+      // UNREACHABLE with `willSend` false — the host never calls `onFire` in that case, so there is
+      // nothing to announce. Answered anyway, and answered with the HELD line rather than the sent
+      // one, so that even a future wiring bug cannot make this function the thing that claims a send
+      // that did not happen. Fail closed, exactly as `micIntentForMode` does one module over.
+      return willSend ? `Sent to ${targetName}.` : `Ready to send to ${targetName}. Auto-send is off.`;
+    case "held":
+      return `Ready to send to ${targetName}. Auto-send is off.`;
     case "disarmed":
-      return "Auto-send off.";
+      // "Auto-send off." would be ambiguous once there are two switches — it is also the name of the
+      // toggle's own off position. This event is the MODE leaving Speak, so it says so.
+      return willSend ? "Auto-send off." : "Speak off.";
     default: {
       const unhandled: never = event;
       void unhandled;

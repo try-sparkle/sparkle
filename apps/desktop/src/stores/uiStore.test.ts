@@ -515,6 +515,15 @@ describe("uiStore persistence — exactly these keys reach the blob", () => {
     // only the default differs. (It replaced a boolean `conciergeAutoSend`; composerPersist's v3
     // migration carries an armed blob across rather than dropping the preference.)
     "conciergeSendMode",
+    // The Auto-send toggle under the Speak tray (sparkle-aew8t). Persisted because REMEMBERING IS
+    // THE FEATURE, in the founder's own words: "it remembers the last position I set it to … if I
+    // set it to off, every time it's off." A switch that reset itself each launch would be the
+    // "setting that un-sets itself" the copy-on-selection note above calls worse than no setting.
+    //
+    // Defaults ON, unlike `conciergeSendMode` — see the field's doc. The irreversibility argument
+    // that makes the tray default to "send" is already satisfied by the time this is reachable:
+    // you cannot see this switch without having deliberately chosen Speak.
+    "conciergeSpeakAutoSend",
     // Opt-in for the background Haiku grader (PRD §4e). Persisted so a deliberate opt-in is not
     // re-asked every launch — and it is a SEPARATE switch from the rail above on purpose: arming
     // auto-send costs nothing, while this spends the user's own Claude subscription quota.

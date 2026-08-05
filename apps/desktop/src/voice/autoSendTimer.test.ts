@@ -5,6 +5,7 @@ import {
   noteTranscript,
   noteSpeechEnd,
   noteSpeechResumed,
+  noteCountdownHeld,
   noteManualSend,
   elapsedMs,
   remainingMs,
@@ -395,6 +396,84 @@ describe("the countdown never runs faster than the sweep floor", () => {
     for (const tier of ["high", "normal", "low", "verylow"] as const) {
       const s: AutoSendState = { ...counting("Ship it.", 0), tier };
       expect(evaluate(s, SWEEP_FLOOR_MS - 1).action).toBe("wait");
+    }
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// AUTO-SEND OFF: THE COUNTDOWN STILL ENDS, THE MESSAGE STAYS (sparkle-aew8t)
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+describe("noteCountdownHeld — the deadline passed with auto-send off", () => {
+  it("stops the countdown but KEEPS the transcript, unlike the fire branch", () => {
+    // THE DIFFERENCE FROM `evaluate`'s fire, and the reason this is its own reducer: a fire clears
+    // the transcript because the box is empty behind the message. Here nothing left the box, so a
+    // cleared transcript would make the reducer disagree with the textarea the user is looking at —
+    // and `noteTranscript` only re-syncs when composedText CHANGES, so it would stay wrong until
+    // they typed something.
+    let s = setArmed(initialState(), true);
+    s = noteTranscript(s, "ship the release", 0);
+    s = noteSpeechEnd(s, 0);
+    expect(s.phase).toBe("counting");
+
+    const held = noteCountdownHeld(s);
+    expect(held.phase).toBe("listening");
+    expect(held.silenceStartedAt).toBeNull();
+    expect(held.fireNoEarlierThan).toBeNull();
+    // The words survive.
+    expect(held.transcript).toBe("ship the release");
+  });
+
+  it("is NOT a disarm — the rail stays armed and counts again on the next utterance", () => {
+    // `setArmed(s, false)` also stops a clock, and reaching for it here would be the obvious wrong
+    // implementation: DISARMED means nothing is watching, which is what a tray parked on Send is.
+    // Speak with auto-send off is still watching.
+    let s = setArmed(initialState(), true);
+    s = noteTranscript(s, "ship the release", 0);
+    s = noteSpeechEnd(s, 0);
+    s = noteCountdownHeld(s);
+    expect(s.phase).not.toBe("disarmed");
+
+    // A second utterance still starts a clock.
+    s = noteTranscript(s, "and deploy it", 100);
+    s = noteSpeechEnd(s, 100);
+    expect(s.phase).toBe("counting");
+  });
+
+  it("is inert when nothing is counting", () => {
+    const idle = setArmed(initialState(), true);
+    expect(noteCountdownHeld(idle)).toBe(idle);
+  });
+});
+
+describe("announcements never claim a send that auto-send withheld", () => {
+  it("says nothing containing 'Sent' when willSend is false", () => {
+    // The rail announcing "Sent to …" when nothing was sent is the defect both source headers warn
+    // about, and an auto-send toggle is the most direct way back to it: the countdown still runs to
+    // completion, so every countdown announcement still fires and only the send is gone.
+    for (const event of ["armed", "counting", "fired", "held", "disarmed"] as const) {
+      const line = autoSendAnnouncement(event, "Build 4", false);
+      expect(line, `${event} must not claim a send`).not.toMatch(/\bSent\b/);
+    }
+  });
+
+  it("still names the target, so a misroute is still catchable", () => {
+    // The target name is the documented mis-route safety net. Withholding the SEND must not
+    // withhold the WHERE — a screen-reader user has only this line.
+    expect(autoSendAnnouncement("counting", "Build 4", false)).toContain("Build 4");
+    expect(autoSendAnnouncement("held", "Build 4", false)).toContain("Build 4");
+  });
+
+  it("defaults to the sending copy, so existing callers are unchanged", () => {
+    expect(autoSendAnnouncement("fired", "Concierge")).toBe(
+      autoSendAnnouncement("fired", "Concierge", true),
+    );
+    expect(autoSendAnnouncement("fired", "Concierge")).toMatch(/\bSent\b/);
+  });
+
+  it("carries no digits, exactly like every other line", () => {
+    for (const event of ["armed", "counting", "fired", "held", "disarmed"] as const) {
+      const line = autoSendAnnouncement(event, "Build 4", false);
+      expect(line.replace(/Build 4/g, "")).not.toMatch(/\d/);
     }
   });
 });

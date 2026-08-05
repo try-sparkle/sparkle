@@ -95,8 +95,22 @@ export interface SendModeController {
   setMode: (next: SendMode) => void;
   /** A live PTY owns the keyboard: the tray is not being addressed (./sendMode `trayInert`). */
   inert: boolean;
-  /** Is the auto-send countdown allowed to run at all right now? Speak, and not inert. */
+  /** Is the auto-send countdown allowed to run at all right now? Speak, and not inert.
+   *
+   *  DELIBERATELY UNAFFECTED BY {@link SendModeController.autoSend} — see that field. */
   armed: boolean;
+  /**
+   * Does an expired countdown SEND, or leave the words in the composer? Persisted (uiStore
+   * `conciergeSpeakAutoSend`), because the founder asked for a switch that remembers its position
+   * across mode changes and across relaunches.
+   *
+   * READ IT ALONGSIDE `armed`, NOT INSTEAD OF IT. `armed` says whether the countdown runs; this says
+   * what it does when it finishes. Off does NOT stop the countdown — the utterance still ends on the
+   * same schedule, the fill still drains, typing still pauses it — it only withholds the dispatch.
+   */
+  autoSend: boolean;
+  /** Flip the Auto-send toggle. Writes straight through to the persisted store. */
+  setAutoSend: (v: boolean) => void;
   /** Is the push-to-talk GESTURE active right now — the key or the button held down?
    *
    *  The third tray state, and the one that was missing: `mode === "ptt"` says only that the
@@ -113,6 +127,10 @@ export interface SendModeController {
 export function useSendMode({ onSend }: UseSendModeArgs): SendModeController {
   const mode = useUiStore((s) => s.conciergeSendMode);
   const setStoredMode = useUiStore((s) => s.setConciergeSendMode);
+  // The Auto-send toggle. Read from the SAME persisted store as the position, so "it remembers the
+  // last position I set it to" costs nothing extra and cannot drift from the tray it belongs to.
+  const autoSend = useUiStore((s) => s.conciergeSpeakAutoSend);
+  const setAutoSend = useUiStore((s) => s.setConciergeSpeakAutoSend);
   // The store's MIRROR of the focus owner, not a live DOM read. That is the right choice for paint
   // (it is what re-renders the tray when the caret moves) and the wrong one for routing, which is
   // why voice/dictationFocus keeps `focusOwnerNow` separate — see its doc.
@@ -703,6 +721,11 @@ export function useSendMode({ onSend }: UseSendModeArgs): SendModeController {
     // host hands voice/useAutoSend, so an inert tray stops counting rather than counting invisibly
     // and firing when colour returns.
     armed: mode === "speak" && !inert,
+    // NOT gated on `inert`, and NOT collapsed with "is this Speak": a terminal focus greys the tray
+    // but does not un-choose a setting, and the countdown is already stopped there by `armed`. WHERE
+    // the toggle is shown is ComposeBox's question, answered from the pure `modeCountsDown`.
+    autoSend,
+    setAutoSend,
     /** Is the push-to-talk key down RIGHT NOW — i.e. is the microphone actually capturing?
      *  Distinct from `mode === "ptt"`, which only says the position is selected. */
     held,

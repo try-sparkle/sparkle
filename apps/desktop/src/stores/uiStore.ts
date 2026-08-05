@@ -495,6 +495,40 @@ interface UiState {
   conciergeSendMode: SendMode;
   setConciergeSendMode: (v: SendMode) => void;
   /**
+   * Does a Speak countdown, when it expires, actually SEND?
+   *
+   * The founder's ask, verbatim: *"when speak is active, I want to have a slider. on-off slider
+   * button. For auto-send … And it remembers the last position I set it to. So if I set it to on,
+   * every time I go to the speak slider, then it stays on. If I set it to off, every time it's
+   * off."* THE REMEMBERING IS THE FEATURE, which is why this is a persisted store field and not
+   * component state: it has to survive leaving Speak, and it has to survive a relaunch.
+   *
+   * ── IT IS NOT A SECOND `conciergeSendMode`, AND OFF IS NOT "SEND" ───────────────────────────────
+   * The field above answers *what happens when I stop talking* at the level of the microphone. This
+   * answers a narrower question that only exists inside Speak: the silence countdown runs either
+   * way, still ends the dictated utterance either way, and still honours the type-during-the-
+   * countdown pause either way. With this off the words simply STAY IN THE COMPOSER and wait for a
+   * press. Wiring it into the countdown's arming instead would delete a behaviour the founder
+   * separately asked for and had built — see voice/useAutoSend's `autoSend` doc.
+   *
+   * ── DEFAULT **ON**, WHICH IS THE OPPOSITE POSTURE FROM THE FIELD ABOVE, DELIBERATELY ────────────
+   * `conciergeSendMode` defaults to `send` because arming an irreversible dispatcher is not
+   * something to do on a user's behalf. That argument does not transfer here, because it has
+   * already been satisfied: reaching this setting at all requires having deliberately moved the
+   * tray to Speak, which IS the once-and-deliberately consent that doc is about. Given that consent,
+   * Speak has auto-sent since the day it shipped — so defaulting this OFF would silently change what
+   * an existing user's chosen mode does, with no notice and nothing on screen to explain why their
+   * dictation stopped going out. A new default is not a safer default when it breaks the shipped
+   * behaviour of a mode the user already picked.
+   *
+   * NAMED `conciergeSpeakAutoSend`, NOT `conciergeAutoSend`. That exact key is retired: it was the
+   * pre-tray boolean, and ./composerPersist's v3 migration DELETES it while translating it into
+   * `conciergeSendMode`. Reusing the name would put a live field in the path of a migration written
+   * to destroy it — harmless only for as long as nobody's blob is old enough to be re-migrated.
+   */
+  conciergeSpeakAutoSend: boolean;
+  setConciergeSpeakAutoSend: (v: boolean) => void;
+  /**
    * Grade each auto-send with a background Haiku call, to tune the heuristics (PRD §4e).
    *
    * DEFAULT OFF and opt-in, because it spends the USER'S OWN Claude subscription: the classify runs
@@ -700,6 +734,10 @@ export const useUiStore = create<UiState>()(
       // OFF by default — see the field's doc for why this one is not symmetric with the above.
       conciergeSendMode: "send",
       setConciergeSendMode: (v) => set({ conciergeSendMode: v }),
+      // ON by default — and NOT symmetric with the line above, which is the point. See the field's
+      // doc: picking Speak is the deliberate consent, and Speak has auto-sent since it shipped.
+      conciergeSpeakAutoSend: true,
+      setConciergeSpeakAutoSend: (v) => set({ conciergeSpeakAutoSend: v }),
       // OFF by default — it spends the user's own Claude subscription. See the field's doc.
       conciergeAutoSendTuner: false,
       setConciergeAutoSendTuner: (v) => set({ conciergeAutoSendTuner: v }),

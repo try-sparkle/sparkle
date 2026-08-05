@@ -49,6 +49,7 @@ import {
   autoSendAnnouncement,
   evaluate,
   initialState,
+  noteCountdownHeld,
   noteManualSend,
   noteSpeechEnd,
   noteSpeechResumed,
@@ -121,6 +122,28 @@ export interface UseAutoSendArgs {
   /** The arming toggle's state, owned by the caller so it can persist it. */
   armed: boolean;
   /**
+   * Does an EXPIRED countdown actually send? The **Auto-send** toggle (uiStore
+   * `conciergeSpeakAutoSend`), which the founder asked for as a switch under the Speak tray.
+   *
+   * ── THIS IS NOT `armed`, AND CONFLATING THEM WOULD BREAK THE COUNTDOWN ──────────────────────────
+   * The distinction is the entire feature and it is easy to get backwards, so it is stated here in
+   * the terms the founder used. `armed: false` means NOTHING IS WATCHING — no clock, no fill, no
+   * end to the utterance; it is what a tray parked on Send is. `autoSend: false` means the opposite
+   * of that in every respect except one: the silence countdown STILL RUNS, the fill STILL drains,
+   * and it STILL ends the dictated utterance on exactly the schedule it does today — including the
+   * "type during the countdown and it pauses, then re-evaluates" behaviour that was built for it.
+   * The ONLY thing it removes is the send at the end, so the words sit in the composer waiting for a
+   * deliberate press.
+   *
+   * Wiring this into `armed` would delete the countdown the founder already asked for and had
+   * built, and would present as the feature "working" (nothing sends) while a behaviour he
+   * specified silently disappeared.
+   *
+   * DEFAULT TRUE at every layer above this one, because Speak has auto-sent since it shipped:
+   * flipping the default would change what an existing user's chosen mode does, with no notice.
+   */
+  autoSend: boolean;
+  /**
    * The CONCIERGE currently owns dictation (`useConciergeDictation().micLive`).
    *
    * Load-bearing, not a nicety — see "whose speech is this" above. Without it the rail counts down
@@ -163,6 +186,7 @@ export interface UseAutoSendArgs {
 /** Builds the rail's model and drives the timer. */
 export function useAutoSend({
   armed,
+  autoSend,
   micLive,
   composedText,
   interim,
@@ -209,8 +233,19 @@ export function useAutoSend({
   announceRef.current = onAnnounce;
   const targetRef = useRef(targetName);
   targetRef.current = targetName;
+  /**
+   * The Auto-send toggle, read through a ref for the same reason every other input here is: the
+   * tick runs on a plain `setInterval` outside React's render cycle, and `say` is a no-dep callback
+   * that effects depend on — closing over the prop would either stale the value or re-subscribe the
+   * timer every time the user flipped the switch.
+   */
+  const autoSendRef = useRef(autoSend);
+  autoSendRef.current = autoSend;
   const say = useCallback((event: Parameters<typeof autoSendAnnouncement>[0]) => {
-    announceRef.current?.(autoSendAnnouncement(event, targetRef.current));
+    // THE FLAG REACHES THE COPY, not just the send — see `autoSendAnnouncement`'s `willSend` doc.
+    // Every countdown announcement still fires with auto-send off (the countdown still runs), so
+    // the announcements are where a phantom "Sent to …" would come back.
+    announceRef.current?.(autoSendAnnouncement(event, targetRef.current, autoSendRef.current));
   }, []);
 
   /**
@@ -442,6 +477,30 @@ export function useAutoSend({
       const decision = evaluate(s, now);
 
       if (decision.action === "fire") {
+        // ── AUTO-SEND OFF: THE COUNTDOWN RAN, THE UTTERANCE ENDED, NOTHING IS SENT ───────────────
+        // Everything up to this line is identical to the auto-sending path — the clock started on
+        // the speech-end, accumulated silence against a moving threshold, honoured the type-during-
+        // the-countdown grace, and reached its deadline. This branch takes away ONLY the dispatch.
+        //
+        // FOUR THINGS ARE DELIBERATELY SKIPPED, and each of them would be a lie on its own:
+        //   • `onFire` — nothing may leave the box;
+        //   • `say("fired")` — the rail must never announce a send that did not happen. That is the
+        //     defect this hook's `onFire` contract already exists to prevent, and an auto-send
+        //     toggle is the most direct way to reintroduce it, so `say("held")` says the true thing
+        //     instead: the words are waiting;
+        //   • `setFiredSeq` — the tray's Speak pill flashes green on that counter, and a flash with
+        //     no send is the same lie in paint (roborev 57314/57330 pinned the two together);
+        //   • `recordAutoSend` — a sample for a send that never went does not merely miscount, it
+        //     TRAINS the thresholds.
+        //
+        // `noteCountdownHeld` rather than `decision.state`: the fire branch clears the transcript
+        // because the message is gone, and here it is still in the composer. See that reducer.
+        if (!autoSendRef.current) {
+          apply(noteCountdownHeld(s));
+          resetSample();
+          say("held");
+          return;
+        }
         const sample = {
           tier: s.tier,
           thresholdMs: sweepThresholdMs(s.tier),

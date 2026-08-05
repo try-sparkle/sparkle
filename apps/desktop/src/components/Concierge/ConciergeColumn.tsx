@@ -153,6 +153,8 @@ export function ConciergeColumn({
   autoSend,
   sendMode,
   onSendModeChange,
+  autoSendOn,
+  onAutoSendChange,
   trayInert,
   pttHeld,
   onComposedText,
@@ -830,6 +832,8 @@ export function ConciergeColumn({
           autoSend={autoSend}
           sendMode={sendMode}
           onSendModeChange={onSendModeChange}
+          autoSendOn={autoSendOn}
+          onAutoSendChange={onAutoSendChange}
           trayInert={trayInert}
           pttHeld={pttHeld}
           onComposedText={onComposedText}
