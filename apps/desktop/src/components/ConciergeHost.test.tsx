@@ -422,6 +422,30 @@ const spans = (re: RegExp | string) => (_t: string, el: Element | null) => {
 const findInThread = (re: RegExp | string) => within(thread()).findByText(spans(re));
 const queryInThread = (re: RegExp | string) => within(thread()).queryByText(spans(re));
 
+/**
+ * THE RENDERED CAPTION — the observed activity line, wherever it legitimately lives.
+ *
+ * Every case below that reads this is pinning the same COMPOSED PATH: event → supersede gate →
+ * activity store → `conciergeActivityLine` → a caption on screen. None of them is about which box
+ * the caption is drawn in. That distinction stopped being academic with sparkle-9ciay: the founder's
+ * rule is that the rail beside the compose box carries only what is about the concierge AS A WHOLE,
+ * so an observed line — which always describes the turn running for one bubble — now renders UNDER
+ * that bubble, and the rail carries it only when there is no bubble to attach it to. Showing it in
+ * both places at once was the bug (ConciergeThread.statusOwnership.test.tsx).
+ *
+ * So this reads the rail first and the running message second, and every assertion below is
+ * unchanged in what it claims. `[data-live]` is what separates the observed line from a QUEUE
+ * POSITION ("3rd in line"), which is a different kind of status that can be on screen at the same
+ * time and is not what any of these cases mean by the caption.
+ */
+function caption(): string {
+  const rail = document.querySelector(`[data-testid="${THINKING_ACTIVITY_TESTID}"]`);
+  if (rail) return rail.textContent ?? "";
+  const live = document.querySelector(`[data-testid="${MESSAGE_STATUS_TESTID}"][data-live]`);
+  if (!live) throw new Error("no activity caption on screen, in either surface");
+  return live.textContent ?? "";
+}
+
 describe("ConciergeHost", () => {
   it("surfaces an in-scope needing agent as a nudge with an Approve action", () => {
     h.feed = feedWith("approval");
@@ -588,7 +612,7 @@ describe("ConciergeHost", () => {
       // WHAT THIS DOES NOT PIN (roborev 57935): the send here is from IDLE, so `typing` moves and
       // the effect would fire on that alone — the `sendSeq` argument is not exercised. The re-send
       // case below is what covers it.
-      expect(screen.getByTestId(THINKING_ACTIVITY_TESTID).textContent).toBe("Reading your message");
+      expect(caption()).toBe("Reading your message");
 
       act(() => h.brain.error?.({ id: "9", detail }));
       expect(queryInThread(/couldn't reach my brain/i)).toBeNull();
@@ -619,11 +643,11 @@ describe("ConciergeHost", () => {
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "what needs me?" } });
     fireEvent.click(screen.getByText("Send"));
     await settle();
-    expect(screen.getByTestId(THINKING_ACTIVITY_TESTID).textContent).toBe("Reading your message");
+    expect(caption()).toBe("Reading your message");
 
     // Turn 1 does some work, so the row is showing its tool line rather than the boundary.
     act(() => void noteConciergeToolCall("workspace", "list_projects", {}));
-    expect(screen.getByTestId(THINKING_ACTIVITY_TESTID).textContent).toBe(
+    expect(caption()).toBe(
       "Looking over your projects",
     );
 
@@ -634,7 +658,7 @@ describe("ConciergeHost", () => {
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "and this too" } });
     fireEvent.click(screen.getByText("Send"));
     await settle();
-    expect(screen.getByTestId(THINKING_ACTIVITY_TESTID).textContent).toBe(
+    expect(caption()).toBe(
       "Looking over your projects",
     );
   });
@@ -689,13 +713,13 @@ describe("ConciergeHost", () => {
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "what needs me?" } });
     fireEvent.click(screen.getByText("Send"));
     await settle();
-    expect(screen.getByTestId(THINKING_ACTIVITY_TESTID).textContent).toBe("Reading your message");
+    expect(caption()).toBe("Reading your message");
 
     // A tool call on the CURRENT turn reaches the column.
     act(() => h.brain.tool?.({ id: "1", name: "Grep", input: '{"pattern":"retry"}' }));
-    const live = screen.getByTestId(THINKING_ACTIVITY_TESTID).textContent;
+    const live = caption();
     expect(live).not.toBe("Reading your message");
-    expect(live!.length).toBeGreaterThan(0);
+    expect(live.length).toBeGreaterThan(0);
 
     // THE REAL DISPLACED-TURN SHAPE (roborev 58048): a SAME-ID straggler arriving after a re-send,
     // which is what happens when turn 1's buffered stdout flushes once the user has already sent
@@ -711,12 +735,12 @@ describe("ConciergeHost", () => {
     await settle();
     act(() => h.brain.done?.({ id: "1", text: "answered" }));
     await settle();
-    const afterDrain = screen.getByTestId(THINKING_ACTIVITY_TESTID).textContent;
+    const afterDrain = caption();
     expect(afterDrain).toBe("Reading your message");
 
     // Turn 1 flushes late, under its OWN id, which is now retired.
     act(() => h.brain.tool?.({ id: "1", name: "Read", input: '{"file_path":"/x"}' }));
-    expect(screen.getByTestId(THINKING_ACTIVITY_TESTID).textContent).toBe(afterDrain);
+    expect(caption()).toBe(afterDrain);
   });
 
   /**

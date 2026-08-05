@@ -240,6 +240,30 @@ export function ConciergeThread({
   // `onJump` at a message id that is not currently rendered, so `jumpTo`'s scan finds nothing and the
   // click does nothing. Indexed off what is on screen, the affordance and its target appear together.
   const answeredBy = useMemo(() => answeredByIndex(visible), [visible]);
+
+  /**
+   * IS A BUBBLE ALREADY SAYING WHAT THE RAIL WOULD SAY? (sparkle-9ciay)
+   *
+   * The founder: *"you're giving me an update in the left side of the chat window but then ALSO
+   * below the message itself… I don't need to see it twice."* Two surfaces render the same
+   * `conciergeActivityLine`: `ThinkingIndicator` recomputes it from the activity store, and the
+   * producer behind `statuses` pins that same global entry onto the awaited bubble. Neither can see
+   * the other. THIS component renders both, so this is the only place the "never in both" rule can
+   * be a guarantee instead of a convention — which is why the decision is made here and handed down,
+   * rather than each surface being trusted to stay in step.
+   *
+   * `live` IS THE CLAIM, and it is exactly the right flag: it marks the one status that is the
+   * observed activity line for the running turn (see MessageStatus's `live` doc). A queued message's
+   * "3rd in line" is a fact about the queue that the rail never says, so it claims nothing and the
+   * rail keeps its own line — asserted in ConciergeThread.statusOwnership.test.tsx.
+   *
+   * Memoised on the map's identity, which the producer already keeps stable (`NONE` for the common
+   * empty case) — so the common thread does not walk this object on every render.
+   */
+  const activityClaimed = useMemo(
+    () => Object.values(statuses ?? {}).some((s) => s.live === true),
+    [statuses],
+  );
   /** The message the reader just jumped to, lit for {@link ANCHOR_HIGHLIGHT_MS}. */
   const [highlightId, setHighlightId] = useState<string | null>(null);
   const highlightTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -373,8 +397,13 @@ export function ConciergeThread({
           />
         ))}
         {/* The pulse, plus what the concierge is actually doing when it is doing something the app
-            observed — see ThinkingIndicator. It falls back to exactly the bare "…" this used to be. */}
-        <ThinkingIndicator typing={typing} floor={turnFloor ?? Number.POSITIVE_INFINITY} />
+            observed AND no bubble is already saying it — see ThinkingIndicator and `activityClaimed`
+            above. It falls back to exactly the bare "…" this used to be. */}
+        <ThinkingIndicator
+          typing={typing}
+          floor={turnFloor ?? Number.POSITIVE_INFINITY}
+          activityClaimed={activityClaimed}
+        />
       </div>
       {/* "It's on your clipboard." A check mark, no words, gone in ~1.2s.
           THREE THINGS IT MUST NOT DO, all of them structural rather than stylistic:

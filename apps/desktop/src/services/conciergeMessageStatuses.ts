@@ -150,6 +150,26 @@ export function useConciergeMessageStatuses(
     // pulse"), and a phrase that renders for one frame is noise rather than a status.
     if (!line) return queue.waiting.length ? waiting : NONE;
     // LIVE: this one is actually running, so its ink is the age ladder the founder asked for.
-    return { ...waiting, [awaitingId]: { text: line.text, live: true } };
+    //
+    // THE GLYPH TRAVELS WITH THE PHRASE (sparkle-9ciay). *"I like how on the left side it gives me a
+    // little icon, I'd like to see that icon on the right side as well."* It is the SAME field the
+    // column-level rail draws from — `line.icon`, the tool domain — carried rather than re-derived,
+    // so the mark under the bubble cannot disagree with the mark in the rail about what kind of work
+    // is running. That matters more than it looks: the rail now yields the WORDS to this line
+    // whenever it exists (see ConciergeThread's `activityClaimed`), and the two marks sit side by
+    // side on screen while it does.
+    //
+    // A WAITING line gets none, deliberately — see `waitingLine`. A queue position is not an
+    // observed call and has no domain; a glyph on it would be a made-up signal.
+    //
+    // AND SO DOES `agentRef`, for a sharper reason than the glyph. The rail rendered the agent the
+    // sentence names as a live `AgentPill` — current name, status dot, click to open. Handing the
+    // bubble `text` alone while the rail yields its words does not move that pill, it DELETES it:
+    // `text` embeds the name "as it stood when the call was recorded", so a renamed agent would go
+    // stale under the bubble and the click would be gone. Carried, the pill simply changes parent.
+    return {
+      ...waiting,
+      [awaitingId]: { text: line.text, icon: line.icon, agentRef: line.agentRef, live: true },
+    };
   }, [awaitingId, typing, latest, floor, queue]);
 }

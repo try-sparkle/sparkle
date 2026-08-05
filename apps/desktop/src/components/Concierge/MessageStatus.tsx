@@ -15,11 +15,18 @@
 // a store) would put the vocabulary in two places, and the half that reached the screen would be the
 // one nobody was reading when the wording changed. One producer, one phrase; this draws it.
 //
-// THE TEXT CARRIES THE COLOUR, and there is no dot, badge or icon. The founder's words: *"the status
-// text itself carries the colour, not a separate indicator."* The inks are ThinkingIndicator's own —
+// THE TEXT CARRIES THE COLOUR — there is no dot and no badge. The founder's words: *"the status text
+// itself carries the colour, not a separate indicator."* The inks are ThinkingIndicator's own —
 // gray → amber → sienna — READ FROM THE SAME PALETTE rather than imported from it, because that
 // component's map is keyed by `ConciergeLiveness` (which has an `idle` this ladder has no use for)
 // and coupling to it would make either file's state list the other's problem.
+//
+// THERE IS A GLYPH NOW, and it is the ONE thing deliberately shared with the rail. *"I like how on
+// the left side it gives me a little icon, I'd like to see that icon on the right side as well."*
+// It is not a second indicator of the same fact — it names the tool DOMAIN the line came from
+// (terminal, agents, workflow, workspace), which the phrase does not. Drawn from ./activityIcons,
+// the single map both surfaces read, so the two can never draw different glyphs for one domain.
+// It does NOT vary with tone; the ink is still the entire age signal.
 //
 // NOTHING BUT THE INK CHANGES BETWEEN TONES. Same size, same weight, same position, same layout —
 // so a message going slow costs a GLANCE and not a re-read. That rule is inherited rather than
@@ -41,9 +48,15 @@
 // itself is kept off a live region for. It is a plain readable text node: a sighted reader gets it
 // from the screen, and an assistive-tech reader gets the same information from the column's
 // announcer, once, in the place every other thing this column says goes through.
+import type {
+  ConciergeActivityIcon,
+  ConciergeActivityLine,
+} from "../../engine/conciergeActivityLine";
 import { useConciergeLiveness } from "../../services/conciergeLiveness";
 import { C } from "../../theme/colors";
 import { TYPE } from "../../theme/scale";
+import { ACTIVITY_ICONS } from "./activityIcons";
+import { AgentPill } from "./AgentPill";
 
 export const MESSAGE_STATUS_TESTID = "concierge-message-status";
 
@@ -53,6 +66,35 @@ export interface ConciergeMessageStatus {
   text: string;
   /** The age ladder. Drives the ink only — nothing else about the row changes between tones. */
   tone: "waiting" | "slow" | "stalled" | "settled";
+  /** The tool domain the phrase came from, drawn as the rail's own glyph (see the header).
+   *
+   *  OPTIONAL because not every status has one: a queue position ("Next up", "3rd in line") is a
+   *  fact about the queue rather than an observed tool call, so it has no domain and gets no mark.
+   *  Deriving one from the words would be this component inventing a signal the producer never
+   *  gave it — the same rule that keeps the wording out of here. */
+  icon?: ConciergeActivityIcon;
+  /** The agent the phrase NAMES, when it names one — the pieces either side of the subject plus the
+   *  id, exactly as `conciergeActivityLine` hands them to the rail.
+   *
+   *  IT TRAVELS WITH THE WORDS, and that is the whole reason it is here. The subject used to be a
+   *  live `AgentPill` because the rail drew it: a status dot, the agent's CURRENT name re-read from
+   *  the roster, and a click that opens it — the founder's ask being *"as it renames, I would see it
+   *  rename."* When sparkle-9ciay moved the sentence under the bubble, rendering `text` alone would
+   *  have silently dropped all three and frozen the name at the value it had when the call was
+   *  recorded (see ConciergeActivityLine.agentRef's doc). The same component draws it here, from
+   *  inside the same `AgentPillProvider` the rail sat in, so the move costs nothing.
+   *
+   *  ABSENT is the ordinary case — a phase line, a queue position, or a subject that did not resolve
+   *  to an agent — and then the phrase renders as the plain words it always was. */
+  agentRef?: ConciergeActivityLine["agentRef"];
+  /** Is this the OBSERVED activity line for the running turn, rather than a queue position?
+   *
+   *  Reaches the DOM as `data-live` and changes nothing visual — the same job `tone` does, and for
+   *  the same reason its doc gives: a caller needs to name which line this is without reading a
+   *  phrase back out and matching it. It matters more than a convenience since sparkle-9ciay,
+   *  because this is now the ONLY place the observed line renders while a turn is running, so the
+   *  suites that used to read it off the rail read it here. */
+  live?: boolean;
 }
 
 /**
@@ -68,6 +110,13 @@ export interface ConciergeMessageStatus {
  */
 export interface ConciergeMessageStatusText {
   text: string;
+  /** The tool domain behind the phrase — see {@link ConciergeMessageStatus.icon}. Absent for a
+   *  queue position, which is not an observed call. */
+  icon?: ConciergeActivityIcon;
+  /** The agent the phrase names, so the subject stays a LIVE pill under the bubble — see
+   *  {@link ConciergeMessageStatus.agentRef}. Carried rather than re-derived: slicing the name back
+   *  out of `text` is the fragile answer the engine already refused to give. */
+  agentRef?: ConciergeActivityLine["agentRef"];
   /**
    * Does this line describe something IN PROGRESS, whose ink should age?
    *
@@ -113,12 +162,16 @@ const INK: Record<ConciergeMessageStatus["tone"], string> = {
 export function MessageStatus({ status }: { status?: ConciergeMessageStatus | null }) {
   // Rendering nothing is the COMMON case, not the edge case — see the header.
   if (!status) return null;
+  const Icon = status.icon ? ACTIVITY_ICONS[status.icon] : null;
   return (
     <div
       data-testid={MESSAGE_STATUS_TESTID}
       // The tone is on the DOM as well as in the ink so a test (and a screenshot diff) can say which
       // rung it is on without reading a colour back out of a style attribute.
       data-tone={status.tone}
+      // Present only on the observed line — see `live`. Absent (not `"no"`) on a queue position, so
+      // a `[data-live]` selector picks out the one status that is the activity line.
+      data-live={status.live ? "yes" : undefined}
       style={{
         // Every property below is identical in all four tones on purpose. `color` is the only line
         // in this object that reads `status.tone`; if a second one ever does, the invariance test
@@ -161,7 +214,36 @@ export function MessageStatus({ status }: { status?: ConciergeMessageStatus | nu
         whiteSpace: "nowrap",
       }}
     >
-      {status.text}
+      {/* INLINE, not a flex item, and that is what keeps every rule above intact. This box owes the
+          entry a single truncating line: `text-overflow: ellipsis` acts on a block's INLINE content,
+          so a glyph in the same inline run is clipped and ellipsised with the words it belongs to,
+          and `text-align: right` still ends the whole run — mark and phrase together — on the
+          column's right edge. Making this a flex row would have moved the ellipsis onto an inner
+          span and quietly retired the four declarations above that produce it.
+
+          `aria-hidden`: the domain is decoration beside a phrase that already names the work, and
+          this surface is deliberately not a second announcer (see the header). */}
+      {Icon && (
+        <Icon size={12} aria-hidden style={{ verticalAlign: "-2px", marginRight: 4 }} />
+      )}
+      {/* THE SUBJECT IS A LIVE CONTROL WHEN IT IS AN AGENT — the same three-piece split
+          `ThinkingIndicator` draws, moved here with the sentence it belongs to (see `agentRef`).
+          Rendering `text` alone would have frozen the agent's name at the value it had when the call
+          was recorded and dropped the click that opens it, which is the founder's *"as it renames, I
+          would see it rename"* undone by a refactor rather than by a decision.
+
+          NO `onOpen`: the pill takes the column's context opener, exactly as it does in the rail —
+          this row sits inside the same `AgentPillProvider` (ConciergeColumn wraps ConciergeThread,
+          which renders the message rows). Without a ref the phrase is plain words, unchanged. */}
+      {status.agentRef ? (
+        <>
+          {status.agentRef.before}
+          <AgentPill agentId={status.agentRef.agentId} fallbackName={status.agentRef.name} />
+          {status.agentRef.after}
+        </>
+      ) : (
+        status.text
+      )}
     </div>
   );
 }
@@ -186,12 +268,23 @@ export function MessageStatus({ status }: { status?: ConciergeMessageStatus | nu
  * Calling the hook one level up — in `MessageStatus`, which every row renders — would mount a ticker
  * per bubble; calling it in the producer put it in the host.
  */
-function LiveMessageStatus({ text }: { text: string }) {
+function LiveMessageStatus({
+  text,
+  icon,
+  agentRef,
+}: {
+  text: string;
+  icon?: ConciergeActivityIcon;
+  agentRef?: ConciergeActivityLine["agentRef"];
+}) {
   const { liveness } = useConciergeLiveness();
   return (
     <MessageStatus
       status={{
         text,
+        icon,
+        agentRef,
+        live: true,
         // `idle` cannot occur while a status is showing (a turn is being awaited, so the clock is
         // running), but it maps to the same quiet ink as `waiting` rather than being asserted away:
         // a wrong ink is cosmetic, and a thrown error in a render path is not.
@@ -213,6 +306,21 @@ export function MessageStatusLive({ status }: { status?: ConciergeMessageStatusT
   if (!status) return null;
   // A STATIC line takes the plain component and never mounts the ticker — see `live`'s doc for why
   // that matters at queue depth, and why a waiting message must not age into an alarm ink.
-  if (!status.live) return <MessageStatus status={{ text: status.text, tone: "waiting" }} />;
-  return <LiveMessageStatus text={status.text} />;
+  if (!status.live)
+    return (
+      // `agentRef` forwarded here too, though today nothing sets it on a static line — a queue
+      // position names no agent, which the producer's suite pins. Dropping a field on ONE of two
+      // branches is how a surface silently loses a feature later: the day a static line does carry a
+      // subject, it would render as frozen words here and as a live pill three lines down, and
+      // nothing would say so. Forwarding costs nothing and cannot be wrong.
+      <MessageStatus
+        status={{
+          text: status.text,
+          icon: status.icon,
+          agentRef: status.agentRef,
+          tone: "waiting",
+        }}
+      />
+    );
+  return <LiveMessageStatus text={status.text} icon={status.icon} agentRef={status.agentRef} />;
 }

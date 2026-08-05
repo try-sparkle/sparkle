@@ -20,6 +20,7 @@ import {
 } from "./conciergeLiveness";
 import { useProjectStore } from "../stores/projectStore";
 import { enqueue, EMPTY_TURN_QUEUE, turnFinished } from "../engine/conciergeTurnQueue";
+import { conciergeActivityLine } from "../engine/conciergeActivityLine";
 
 /** The counter as it stands now — what the host snapshots as the turn floor. */
 const seqNow = () => useConciergeActivityStore.getState().latest?.seq ?? -1;
@@ -156,7 +157,15 @@ describe("useConciergeMessageStatuses", () => {
     // sees the shape rather than a list of names. The claim that this over-constrains does not hold
     // against the rest of this file, which already pins waiting entries to `{ text }` exactly — a
     // new static field breaks those regardless, so nothing was bought by loosening this one.
-    expect(result.current["msg-1"]).toEqual({ text: "Composing", live: true });
+    //
+    // `icon` was added by sparkle-9ciay and this assertion is what caught it, which is the check
+    // working rather than failing: a STATIC domain mark is admitted deliberately here, and anything
+    // derived from a clock still cannot get past the exhaustive compare.
+    expect(result.current["msg-1"]).toEqual({
+      text: "Composing",
+      icon: "workspace",
+      live: true,
+    });
   });
 
   /**
@@ -325,5 +334,46 @@ describe("waitingLine", () => {
     [50, "50th in line"],
   ])("renders position %i as %s", (position, expected) => {
     expect(waitingLine(position)).toBe(expected);
+  });
+});
+
+/**
+ * THE GLYPH TRAVELS WITH THE PHRASE (sparkle-9ciay).
+ *
+ * The founder: *"I like how on the left side it gives me a little icon, I'd like to see that icon on
+ * the right side as well."* The rail draws `line.icon`; this producer must hand the SAME field down
+ * rather than letting the bubble derive one, or the two marks can disagree about what kind of work
+ * is running — which is the failure the shared map in components/Concierge/activityIcons exists to
+ * make impossible on the drawing side, and this is its other half.
+ */
+describe("the tool domain travels with the line", () => {
+  it("carries the icon the rail would draw for the same activity", () => {
+    const floor = seqNow();
+    noteConciergeSent();
+    noteConciergePhase("composing");
+    const { result } = renderHook(() => useConciergeMessageStatuses("msg-1", true, floor));
+    // Read from the engine rather than hard-coded, so this asserts "the same value the rail gets"
+    // instead of re-stating one file's opinion about which glyph "composing" deserves.
+    const line = conciergeActivityLine(useConciergeActivityStore.getState().latest!)!;
+    expect(result.current["msg-1"]!.icon).toBe(line.icon);
+    // Not vacuous: the engine really did produce a domain, so `undefined === undefined` cannot pass.
+    expect(line.icon).toBeTruthy();
+  });
+
+  it("gives a QUEUED message no icon — a position is not an observed call", () => {
+    const floor = seqNow();
+    noteConciergeSent();
+    noteConciergePhase("composing");
+    // Two sends: the first becomes `running`, so the second is the one that actually WAITS.
+    let queue = enqueue(EMPTY_TURN_QUEUE, { bubbleId: "msg-1", text: "now" }).next;
+    queue = enqueue(queue, { bubbleId: "msg-2", text: "later" }).next;
+    const { result } = renderHook(() =>
+      useConciergeMessageStatuses("msg-1", true, floor, queue),
+    );
+    expect(result.current["msg-2"]!.text.length).toBeGreaterThan(0);
+    expect(result.current["msg-2"]!.icon).toBeUndefined();
+    // …while the RUNNING one in the very same map does have one, so "no icon" is a property of the
+    // waiting line and not of this fixture.
+    expect(result.current["msg-1"]!.icon).toBeTruthy();
   });
 });

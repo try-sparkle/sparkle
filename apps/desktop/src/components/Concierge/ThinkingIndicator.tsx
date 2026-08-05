@@ -67,27 +67,51 @@
 // announcement has to go through the column's single live region, which only the host can feed —
 // and because subscribing the host itself to this 1 Hz ticker would reconcile the entire column
 // once a second for the length of every turn (roborev 56177-M2).
-import { FiFolder, FiGitBranch, FiTerminal, FiUsers } from "react-icons/fi";
-import type { IconType } from "react-icons";
-
+//
+// ══ IT YIELDS THE WORDS WHEN A BUBBLE IS CARRYING THEM (sparkle-9ciay) ══════════════════════════
+// The founder: *"You're doing a new thing where you're giving me an update in the left side of the
+// chat window but then ALSO below the message itself… I don't need to see it twice."* Two surfaces
+// render `conciergeActivityLine` — this row, and `services/conciergeMessageStatuses`, which pins the
+// same global entry onto the awaited bubble — so for the whole of every turn with a bubble the
+// SAME sentence was on screen twice.
+//
+// The rule he stated: this rail is for updates about the concierge AS A WHOLE; anything specific to
+// one message goes under that message and NOWHERE ELSE. An observed line always describes the turn
+// running for one bubble, so when a bubble is showing it, `activityClaimed` is true here and the row
+// falls back to exactly the bare pulse it degrades to anyway — the honest general statement that
+// something is in flight. The line still lives here for a turn with NO bubble to attach to
+// (`relayFollowUp` and friends), which is genuinely a fact about the column.
+//
+// THE GLYPH STAYS IN BOTH PLACES, deliberately: *"I like how on the left side it gives me a little
+// icon, I'd like to see that icon on the right side as well."* It is a domain mark, not the status
+// string, and both surfaces now draw it from ./activityIcons.
+//
+// ══ AND THE YIELDED LINE IS NOT RE-ANNOUNCED ANYWHERE — A FOURTH DEAD END, MEASURED ═════════════
+// When this row carries the line it is a `polite` region of its OWN, so per-tool-call changes never
+// touched anything else. Yielding the line therefore drops it out of the audio channel, and the
+// obvious repair — speak it from `ConciergeHost` through the column's one announcer, exactly as the
+// list above concludes for the LIVENESS step — was built and REVERTED. The two cases are not alike:
+// liveness changes at most twice a turn, the activity line changes once per TOOL CALL, and the
+// column's announcer is a single region that every write CLOBBERS. It reddened
+// ConciergeHost.liveness's "writes the region exactly ONCE across the drain and the reply" with
+// extra writes inside the window that case guards — which is to say the concierge's actual ANSWER
+// would have been overwritten by "Reading an agent's terminal" on its way past. (That case is
+// separately flaky under load, so treat the count it printed as indicative and the mechanism as the
+// reason.) A per-call narration is exactly the flooding the thread itself is kept off a live region
+// for.
+//
+// So the line is announced by whichever surface is SHOWING it, and when that is a bubble it is
+// announced by neither — it is ordinary readable text in the transcript, reached the way every other
+// sentence in the column is. What still speaks is what was always general: the liveness step, the
+// reply, the receipts. Do not re-add an announcer here or in the host without a way to write the
+// region that does not overwrite a pending answer.
 import { C } from "../../theme/colors";
 import { useConciergeActivityStore } from "../../services/conciergeActivity";
 import { useConciergeLiveness } from "../../services/conciergeLiveness";
 import type { ConciergeLiveness } from "../../engine/conciergeLiveness";
-import {
-  conciergeActivityLine,
-  type ConciergeActivityIcon,
-} from "../../engine/conciergeActivityLine";
+import { conciergeActivityLine } from "../../engine/conciergeActivityLine";
+import { ACTIVITY_ICONS } from "./activityIcons";
 import { AgentPill } from "./AgentPill";
-
-/** Feather glyphs, one per tool domain (no emoji as icons — house rule). Small and monochrome: this
- *  is a status line in a 360px column, not a badge. */
-const ICONS: Record<ConciergeActivityIcon, IconType> = {
-  agents: FiUsers,
-  terminal: FiTerminal,
-  workflow: FiGitBranch,
-  workspace: FiFolder,
-};
 
 export const THINKING_INDICATOR_TESTID = "concierge-thinking";
 export const THINKING_ACTIVITY_TESTID = "concierge-thinking-activity";
@@ -110,7 +134,27 @@ const INK: Record<ConciergeLiveness, string> = {
   stalled: C.sienna,
 };
 
-export function ThinkingIndicator({ typing, floor }: { typing: boolean; floor: number }) {
+export function ThinkingIndicator({
+  typing,
+  floor,
+  activityClaimed = false,
+}: {
+  typing: boolean;
+  floor: number;
+  /**
+   * Is a MESSAGE already showing the observed line? Then this row must not repeat it.
+   *
+   * Decided by `ConciergeThread`, which is the one component that renders both surfaces and is
+   * therefore the only place the "never in both" invariant can actually be guaranteed rather than
+   * agreed on by two files. See this file's header for the founder's rule, and
+   * ConciergeThread.statusOwnership.test.tsx for it asserted across the pair.
+   *
+   * DEFAULTS TO FALSE, i.e. to the behaviour this row has always had. An unwired caller keeps its
+   * line, which is the safe direction: the failure is a line shown where nothing else shows it, not
+   * a turn that goes silent everywhere.
+   */
+  activityClaimed?: boolean;
+}) {
   const latest = useConciergeActivityStore((s) => s.latest);
   const { liveness } = useConciergeLiveness();
   /**
@@ -136,13 +180,22 @@ export function ThinkingIndicator({ typing, floor }: { typing: boolean; floor: n
   // swap and the disappearing line were exactly the reflow the founder objected to — and the pulse
   // beside the line already says "still going" without claiming the call is still running. So the
   // line stays put in every state and only its ink moves.
-  const Icon = line ? ICONS[line.icon] : null;
-  // What a screen reader is given for the ROW, unchanged by this whole feature: the line, or the
-  // name the row has always carried. The waiting state is NOT appended — the host speaks it through
-  // the column's announcer, and saying it here as well produced a duplicated "Sparkle is typing ·
-  // Still waiting … Still waiting" on any AT that read both (roborev 56122-M2).
+  // THE GLYPH SURVIVES A CLAIM, the words do not — see the header. `line` still drives it, because
+  // the mark says which KIND of work is running and that is a general fact about the column; the
+  // sentence saying what it is doing about one message is the message's to tell.
+  const Icon = line ? ACTIVITY_ICONS[line.icon] : null;
+  // The words this row is entitled to. Null when a bubble is carrying them, which puts the row back
+  // in exactly the shape it degrades to with no activity at all: pulse, glyph, and no claim.
+  const words = activityClaimed ? null : line;
+  // What a screen reader is given for the ROW: the line, or the name the row has always carried.
+  // Driven by `words` rather than `line`, so a row that has yielded its sentence does not go on
+  // announcing it — that would put the duplication back in the one channel where it is worse, since
+  // the bubble's copy is read from the transcript a moment later. The waiting state is NOT appended
+  // either — the host speaks it through the column's announcer, and saying it here as well produced
+  // a duplicated "Sparkle is typing · Still waiting … Still waiting" on any AT that read both
+  // (roborev 56122-M2).
   const spoken =
-    line?.text ??
+    words?.text ??
     // Several suites outside this file identify the indicator by this exact string.
     "Sparkle is typing";
 
@@ -159,8 +212,8 @@ export function ThinkingIndicator({ typing, floor }: { typing: boolean; floor: n
       // stable region exists to avoid. (The old per-second counter was never announced either: it
       // changed every second, which is the flooding the thread is kept off a live region for. It no
       // longer exists in any channel.)
-      aria-hidden={line ? undefined : true}
-      aria-live={line ? "polite" : undefined}
+      aria-hidden={words ? undefined : true}
+      aria-live={words ? "polite" : undefined}
       // The accessible name is the LINE when there is one, so what gets announced is the same thing
       // the sighted user is reading rather than the generic "typing" underneath it. It falls back to
       // the name this row has always carried, which several suites identify the indicator by.
@@ -184,7 +237,7 @@ export function ThinkingIndicator({ typing, floor }: { typing: boolean; floor: n
       }}
     >
       {Icon && <Icon size={12} aria-hidden style={{ flexShrink: 0 }} />}
-      {line && (
+      {words && (
         <span
           data-testid={THINKING_ACTIVITY_TESTID}
           style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
@@ -199,14 +252,14 @@ export function ThinkingIndicator({ typing, floor }: { typing: boolean; floor: n
               CONTEXT, and a context update reaches a consumer regardless of any memo above it.
               Without a ref — an unresolved agent, or a subject that is a project or a PR — the line
               renders exactly as it always did, as plain words. */}
-          {line.agentRef ? (
+          {words.agentRef ? (
             <>
-              {line.agentRef.before}
-              <AgentPill agentId={line.agentRef.agentId} fallbackName={line.agentRef.name} />
-              {line.agentRef.after}
+              {words.agentRef.before}
+              <AgentPill agentId={words.agentRef.agentId} fallbackName={words.agentRef.name} />
+              {words.agentRef.after}
             </>
           ) : (
-            line.text
+            words.text
           )}
         </span>
       )}
