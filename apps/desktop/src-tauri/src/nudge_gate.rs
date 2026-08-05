@@ -1026,6 +1026,48 @@ mod tests {
         );
     }
 
+    /// THE COMPOSITE SHAPE: session-limit option labels sitting in SCROLLBACK while a live ORDINARY
+    /// picker occupies the bottom of the grid. Each rule can in principle be satisfied by a
+    /// DIFFERENT thing on the same screen — the scrollback supplies the reset label and the option
+    /// count, the live approval dialog supplies a `❯ 1.` row and a footer — and a matcher that
+    /// tested each rule against the whole viewport independently would hand out the Esc exemption
+    /// here, cancelling a tool approval a human is mid-answer on.
+    ///
+    /// WHAT THIS PINS, stated precisely: the OUTCOME, not any single rule. No individual rule can be
+    /// mutated away and make this fail — cursor-on-an-option-row, footer-below-the-options,
+    /// `MAX_OPTION_FOOTER_GAP` and the `MAX_TRAILING_ROWS == 0` bottom-anchor each independently
+    /// reject this shape. That is defence in depth working as intended, and it is also why a
+    /// per-rule mutation check is the wrong instrument here; the rules are pinned individually by
+    /// their own tests. This one exists so the composite CANNOT regress silently if several are
+    /// relaxed together — which is exactly how a laxer rewrite would arrive.
+    #[test]
+    fn scrollback_options_plus_a_live_ordinary_picker_never_earn_the_exemption() {
+        for name in ["APPROVAL_2_1_220", "ASK_USER_QUESTION_2_1_220", "MODEL_PICKER_2_1_220"] {
+            let live = fixture_screen(name);
+            // Session-limit labels ABOVE, carrying no selection cursor of their own, then the live
+            // dialog below — the ordinary way a limit banner scrolls up but stays on the grid.
+            let composite = format!(
+                "  1. Stop and wait for limit to reset\n  2. Switch to usage credits\n  3. Switch to Team plan\n{live}"
+            );
+            // The premise is real: the label half IS satisfied by the scrollback, so this screen
+            // genuinely reaches the coherence rules rather than being rejected before them.
+            assert_eq!(
+                session_limit_options_present(&composite),
+                3,
+                "{name}: the scrollback must supply all three labels, or this test proves nothing"
+            );
+            assert!(
+                !screen_is_session_limit_picker(&composite),
+                "{name} under scrolled-up session-limit labels must NOT read as the session-limit picker"
+            );
+            assert_eq!(
+                escape_refusal(Some(&Screen { text: &composite, alternate: false })),
+                Some(Refusal::AwaitingInput),
+                "{name} under scrolled-up labels must still refuse the keystroke"
+            );
+        }
+    }
+
     /// THE NARROWNESS TEST. Every ordinary captured picker — permission dialogs, AskUserQuestion
     /// menus, the `/model` picker — must still be refused. This is the case where a laxer matcher
     /// would have a machine cancel a tool approval a human was mid-answer on.
