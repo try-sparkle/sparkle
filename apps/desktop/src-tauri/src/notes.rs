@@ -8,6 +8,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
 // `bd` resolution — kill the per-call login shell (PERF)
@@ -22,12 +23,50 @@ use std::sync::{Mutex, OnceLock};
 // (injection-safe); as real argv tokens now they keep that property with no shell in the loop.
 // ---------------------------------------------------------------------------
 
-/// Session cache for bd's resolved absolute path. Only a positive hit is cached (a miss re-probes
-/// next call) so a bd installed while the app runs is picked up without a restart — matching
-/// preflight.rs's cache policy.
-fn bd_path_cache() -> &'static Mutex<Option<String>> {
-    static CACHE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(None))
+/// How long a NEGATIVE resolution (bd is not installed) is trusted before probing again.
+///
+/// Caching the miss at all is the point: the module note above exists because a `zsh -l` probe
+/// costs 100-500ms and `list_beads` runs EVERY 5s per open project. A positive-hit-only cache
+/// delivers that win on machines where bd IS installed and defeats it completely on machines where
+/// it is NOT — every miss re-ran the full login-shell probe, so the one configuration that gets no
+/// value out of bd paid the entire cost of it, forever, on the poll interval.
+///
+/// The TTL is what keeps the original property intact. The policy that motivated positive-only
+/// caching — "a bd installed while the app runs is picked up without a restart" — only needs the
+/// miss to EXPIRE, not to be re-probed on literally every call. At 30s against a 5s poll that is a
+/// 6x cut in login shells for the missing-bd case, and a bd installed mid-session is still picked
+/// up within half a minute with no restart.
+const BD_MISS_TTL: Duration = Duration::from_secs(30);
+
+/// Session cache for bd's resolved absolute path.
+///
+/// A hit is cached for the whole session. A miss is cached for [`BD_MISS_TTL`] — see that
+/// constant for why the miss is cached at all and why it expires.
+#[derive(Default)]
+struct BdPathCache {
+    /// A successful resolution, kept for the session.
+    hit: Option<String>,
+    /// When the last failed resolution happened, if any.
+    last_miss: Option<Instant>,
+}
+
+fn bd_path_cache() -> &'static Mutex<BdPathCache> {
+    static CACHE: OnceLock<Mutex<BdPathCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(BdPathCache::default()))
+}
+
+/// Whether a cache in this state has to run the (expensive) resolver.
+///
+/// Pure so the TTL policy is testable without a clock or a machine that lacks bd.
+fn bd_cache_needs_probe(cache: &BdPathCache, now: Instant, ttl: Duration) -> bool {
+    if cache.hit.is_some() {
+        return false;
+    }
+    match cache.last_miss {
+        // `saturating_` because a non-monotonic reading must degrade to "probe again", never panic.
+        Some(at) => now.saturating_duration_since(at) >= ttl,
+        None => true,
+    }
 }
 
 /// Canonical absolute `bd` install locations, user-first: native/non-sudo installs (`~/.local/bin`),
@@ -123,22 +162,35 @@ fn resolve_bd_uncached() -> Option<String> {
     }
 }
 
-/// bd's resolved absolute path, cached for the session (positive-hit-only, per the cache note).
+/// bd's resolved absolute path, cached for the session — a hit forever, a miss for
+/// [`BD_MISS_TTL`] (see the cache note).
 /// Concurrent callers may both resolve on a cold cache (idempotent); a poisoned lock falls back to
 /// an uncached resolve.
 /// `pub(crate)` so `beads_cmd` (the typed planning/beads command surface) resolves bd through THIS
 /// resolver instead of standing up a second, divergent one — the same reuse rationale
 /// `preflight::run_in_login_shell` documents at its own definition.
 pub(crate) fn cached_bd_path() -> Option<String> {
+    let now = Instant::now();
     if let Ok(guard) = bd_path_cache().lock() {
-        if let Some(path) = guard.as_ref() {
+        if let Some(path) = guard.hit.as_ref() {
             return Some(path.clone());
+        }
+        if !bd_cache_needs_probe(&guard, now, BD_MISS_TTL) {
+            // A recent probe already said bd is not installed. Answer from the cache rather than
+            // paying another login shell — that repeat cost is the whole defect this guards.
+            return None;
         }
     }
     let resolved = resolve_bd_uncached();
-    if let Some(path) = resolved.as_ref() {
-        if let Ok(mut guard) = bd_path_cache().lock() {
-            *guard = Some(path.clone());
+    if let Ok(mut guard) = bd_path_cache().lock() {
+        match resolved.as_ref() {
+            Some(path) => {
+                guard.hit = Some(path.clone());
+                guard.last_miss = None;
+            }
+            // Stamp the miss AFTER the probe: the TTL should bound the gap between probes, not
+            // start running while a slow login shell is still going.
+            None => guard.last_miss = Some(Instant::now()),
         }
     }
     resolved
@@ -1106,6 +1158,51 @@ mod tests {
         assert!(paths.iter().any(|p| p.ends_with("opt/homebrew/bin/bd")));
         assert!(!paths.iter().any(|p| p.to_string_lossy().contains(".local")));
         assert!(!paths.iter().any(|p| p.to_string_lossy().contains("go/bin")));
+    }
+
+    // ── Negative-resolution cache (PERF) ────────────────────────────────────────────────────
+    // These assert the DECISION `cached_bd_path` makes — "must I run the login-shell probe?" —
+    // because that decision is the entire cost being saved. Asserting the cache merely holds a
+    // timestamp would pass against the old positive-only cache too, and prove nothing.
+
+    #[test]
+    fn a_cached_hit_never_probes() {
+        let cache = BdPathCache { hit: Some("/usr/local/bin/bd".into()), last_miss: None };
+        assert!(!bd_cache_needs_probe(&cache, Instant::now(), BD_MISS_TTL));
+    }
+
+    #[test]
+    fn a_cold_cache_probes() {
+        let cache = BdPathCache::default();
+        assert!(bd_cache_needs_probe(&cache, Instant::now(), BD_MISS_TTL));
+    }
+
+    #[test]
+    fn a_fresh_miss_suppresses_the_probe() {
+        // The regression this exists for: bd is not installed, the beads poll comes round again
+        // 5s later, and we must NOT re-run `zsh -lc`. Under the old positive-hit-only cache this
+        // call re-probed every single time.
+        let now = Instant::now();
+        let cache = BdPathCache { hit: None, last_miss: Some(now) };
+        assert!(!bd_cache_needs_probe(&cache, now + Duration::from_secs(5), BD_MISS_TTL));
+    }
+
+    #[test]
+    fn a_stale_miss_probes_again() {
+        // The property the TTL preserves: a bd installed while the app runs is still picked up
+        // without a restart, just not on every call.
+        let now = Instant::now();
+        let cache = BdPathCache { hit: None, last_miss: Some(now) };
+        assert!(bd_cache_needs_probe(&cache, now + BD_MISS_TTL, BD_MISS_TTL));
+        assert!(bd_cache_needs_probe(&cache, now + BD_MISS_TTL + Duration::from_secs(1), BD_MISS_TTL));
+    }
+
+    #[test]
+    fn the_miss_ttl_is_short_enough_to_stay_unnoticeable() {
+        // A miss that outlived a user's patience would trade one defect for another: they install
+        // bd, come back to the app, and the board is still empty.
+        assert!(BD_MISS_TTL <= Duration::from_secs(60), "a mid-session bd install must be picked up promptly");
+        assert!(BD_MISS_TTL >= Duration::from_secs(10), "a TTL under the poll interval saves nothing");
     }
 
     #[test]
