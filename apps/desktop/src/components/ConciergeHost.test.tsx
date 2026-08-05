@@ -1497,7 +1497,12 @@ describe("ConciergeHost — routing receipts", () => {
       fireEvent.click(screen.getByTestId("routing-redirect"));
     });
     await settle();
-    expect(await within(thread()).findByText("→ Answered here, then to CI Hardening")).toBeTruthy();
+    // ONLY the agent delivery is stated now: "Answered here" was removed on the founder's
+    // instruction, and with its first term gone there is no sequence left for "then" to describe —
+    // a bare "then to X" would read as a correction of a delivery the line no longer mentions,
+    // which is the retraction this case's own header forbids. The no-retraction assertion below is
+    // unchanged and still the point.
+    expect(await within(thread()).findByText("→ Sent to CI Hardening")).toBeTruthy();
     expect(screen.queryByTestId("routing-redirect")).toBeNull();
     expect(within(thread()).queryByText(/instead|moved|undone/i)).toBeNull();
   });

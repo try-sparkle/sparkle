@@ -34,7 +34,9 @@ describe("receiptText", () => {
       "→ Sent to Kraken Auth, then to here",
     );
     expect(receiptText({ target: "sparkle", agentName: "Kraken Auth", alsoSentTo: "agent" })).toBe(
-      "→ Answered here, then to Kraken Auth",
+      // The sparkle half goes too (founder, unqualified). Only the delivery the reader cannot see
+      // is stated — and with no first term there is no "then" to write.
+      "→ Sent to Kraken Auth",
     );
   });
 

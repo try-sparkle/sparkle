@@ -60,13 +60,22 @@ export function receiptText(r: ConciergeReceipt): string | null {
   // renders as no `<span>` at all rather than an empty one, and which a caller (the screen-reader
   // announcement in ConciergeHost) tests directly to decide whether to announce anything.
   if (r.target === "sparkle" && !r.alsoSentTo) return null;
-  const first = r.target === "sparkle" ? "Answered here" : `Sent to ${place(r.target, r.agentName)}`;
+  // THE TWO-DELIVERY SPARKLE CASE LOSES IT TOO (founder, 2026-08-04). The previous cut kept
+  // "Answered here" on this arm, reasoning that with two destinations the ORDER is the whole
+  // content of the sentence. His instruction was unqualified — the phrase goes — and the reasoning
+  // does not survive contact with it anyway: the "first delivery" here is the concierge answering
+  // in the thread, which is exactly the self-evident fact the removal was about. Stating only the
+  // delivery the reader CANNOT see is the entire sentence.
+  //
+  // No "then", deliberately: with no first term it would read as a correction of a delivery this
+  // line no longer mentions — the retraction this module's header forbids.
+  if (r.target === "sparkle") return `→ Sent to ${place(r.alsoSentTo!, r.agentName)}`;
+  const first = `Sent to ${place(r.target, r.agentName)}`;
   if (!r.alsoSentTo) return `→ ${first}`;
   // "then" — strictly sequential, so it cannot be read as a correction of the first delivery.
   //
-  // The `sparkle` arm still reaches here WHEN THERE IS A SECOND DELIVERY, and keeps "Answered here"
-  // deliberately: with two destinations the ORDER is the whole content of the sentence, and "then to
-  // X" with no first term reads as though X were the only place it went.
+  // Only the AGENT-first arm reaches here now, and it keeps its sequence: both halves are
+  // deliveries the reader cannot otherwise see, so the order is real content.
   return `→ ${first}, then to ${place(r.alsoSentTo, r.agentName)}`;
 }
 
