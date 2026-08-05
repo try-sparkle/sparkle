@@ -34,7 +34,15 @@ import {
   speakLeftFraction,
 } from "./trayGeometry";
 
-import { C, FONT_WEIGHT, ON_GOLD_FILL } from "../../theme/colors";
+import { C, FONT_WEIGHT } from "../../theme/colors";
+import {
+  MODE_INK_TOKEN,
+  PILL_LABEL_TOKEN,
+  TRAY_SELECTED_FILL_PCT,
+  TRAY_STRIP_TINT_PCT,
+  TRAY_SWEEP_INK_TOKEN,
+  TRAY_SWEEP_TINT_PCT,
+} from "./trayInk";
 import { KeyPill } from "./KeyPill";
 import { BLUEPRINT } from "../../theme/blueprintSpec";
 import { RADIUS, TYPE } from "../../theme/scale";
@@ -176,10 +184,13 @@ export interface SendModeTrayProps {
  *  primary button uses); the two voice positions are amber and green, matching the mic glyph's own
  *  resting palette (components/MicButton `micVisual`) so the tray and the mic never disagree about
  *  what colour "armed" and "live" are. */
+// Read through ./trayInk's token map rather than naming the tokens twice: the contrast guard
+// composites these exact identity colours into the pill fill, and a second spelling here is how the
+// guard would end up measuring a palette the component no longer paints.
 const MODE_INK: Record<SendMode, string> = {
-  send: C.goldFill,
-  ptt: C.amber,
-  speak: C.successInk,
+  send: C[MODE_INK_TOKEN.send],
+  ptt: C[MODE_INK_TOKEN.ptt],
+  speak: C[MODE_INK_TOKEN.speak],
 };
 
 // The keycap slot's width lives in ./trayGeometry (`chicletSlot`) — it is one of the inputs to the
@@ -361,7 +372,7 @@ export function SendModeTray({
         borderWidth: 1,
         borderStyle: "solid",
         borderColor: edge,
-        background: `color-mix(in srgb, ${edge} 8%, transparent)`,
+        background: `color-mix(in srgb, ${edge} ${TRAY_STRIP_TINT_PCT}%, transparent)`,
         overflow: "hidden",
         // INERT = GREY, and grey by DESATURATION rather than by opacity — the PlanBuildToggle
         // precedent. Opacity would make the tray read as fading out of the interface (i.e. as
@@ -425,7 +436,7 @@ export function SendModeTray({
             //
             // Still no numerals anywhere: a countdown that shows "3…2…1" invites the user to race
             // it, and the number is not the information.
-            background: `color-mix(in srgb, ${C.successInk} 18%, transparent)`,
+            background: `color-mix(in srgb, ${C[TRAY_SWEEP_INK_TOKEN]} ${TRAY_SWEEP_TINT_PCT}%, transparent)`,
             // Uniform across tiers, for the same reason the hatch went (above): the dimmed leading
             // edge was the OTHER half of the illegible `verylow` signalling, and two cues nobody can
             // decode are not better than one. The sweep's speed carries the tier.
@@ -665,7 +676,7 @@ export function SendModeTray({
               ...(acting
                 ? {
                     background: ink,
-                    color: ON_GOLD_FILL,
+                    color: C[PILL_LABEL_TOKEN.acting],
                     // LONGHANDS, not the `border` shorthand — the same reason the tray root states
                     // at its own `borderColor`: a shorthand carrying a `var()` cannot be decomposed
                     // into its longhands, so the whole declaration stays an opaque string and
@@ -691,15 +702,51 @@ export function SendModeTray({
                     // back as "" — which made "fill DIFFERS from stroke" pass for the wrong reason
                     // (a colour is never equal to an empty string) rather than because the tint
                     // genuinely differs from the edge.
-                    background: `color-mix(in srgb, ${ink} 22%, transparent)`,
-                    color: ink,
+                    background: `color-mix(in srgb, ${ink} ${TRAY_SELECTED_FILL_PCT}%, transparent)`,
+                    // ── SELECTION MUST NOT COST LEGIBILITY ────────────────────────────────────
+                    // This was `color: ink` — the label painted in the SAME hue as its own fill and
+                    // border. The founder's report is exactly what that produces: "the text should
+                    // be above the button … which is shaded behind", i.e. the word reads as part of
+                    // the wash rather than as text sitting on it. The selected pill is the one the
+                    // user most needs to read — it is the only thing on screen saying which mode
+                    // they are in — and it was the LEAST legible of the three.
+                    //
+                    // MEASURED (theme/sendModeTrayContrast.test.ts composites the real stack: plane
+                    // → tray strip at 8% edge → pill fill at 22% ink). Selected Speak against its
+                    // own fill, versus the UNSELECTED baseline on the same tray:
+                    //     dark  unwired   baseline 6.78   was 5.19 (ink)   now 9.32
+                    //     light unwired   baseline 5.94   was 6.09 (ink)   now 11.43
+                    //     light unwired   Push to talk    was 1.95 (ink)   now 13.93  ← failed AA
+                    //     light wired     Push to talk    was 1.60 (ink)   now 11.41  ← failed AA
+                    // So this was not merely "dimmer than its neighbours": amber-on-amber in light
+                    // mode was a hard WCAG AA failure that had never been measured, because no guard
+                    // composited the pill fill.
+                    //
+                    // WHY `cream` AND NOT `C.conciergeMuted` (the literal unselected token). Copying
+                    // the hex does NOT copy the legibility, because the surface underneath is not the
+                    // same surface: the 22% fill moves the plate toward mid-tone, and a mid-tone ink
+                    // loses contrast against it. Measured, `conciergeMuted` on the selected fill is
+                    // 4.48 in dark (against a 6.78 baseline — still visibly the dimmest pill, i.e.
+                    // the founder's complaint only partly addressed) and 3.30/3.39 in light+wired,
+                    // which is BELOW AA. `cream` is the plane's primary text ink — the fill/ink split
+                    // this palette already makes everywhere else (accent/accentInk, success/
+                    // successInk, goldFill/ON_GOLD_FILL; see PresenceSlider's "INK AND FILL ARE
+                    // DIFFERENT TOKENS") — and it clears the unselected baseline on all four planes
+                    // with margin. Selection is carried by the FILL and the BORDER; the label is
+                    // never tinted or dimmed to say it.
+                    //
+                    // The ACTING branch above is untouched: a solid `ink` fill still inverts to
+                    // ON_GOLD_FILL. That state was not in the complaint and is not changed here.
+                    color: C[PILL_LABEL_TOKEN.selectedIdle],
                     borderWidth: TRAY_GEOMETRY.pillBorder,
                     borderStyle: "solid",
                     borderColor: ink,
                   }
                 : {
                     background: "transparent",
-                    color: C.conciergeMuted,
+                    // THE LEGIBILITY BASELINE. Every other state's label is measured against this
+                    // one — see ./trayInk and theme/sendModeTrayContrast.test.ts.
+                    color: C[PILL_LABEL_TOKEN.unselected],
                     borderWidth: TRAY_GEOMETRY.pillBorder,
                     borderStyle: "solid",
                     borderColor: "transparent",

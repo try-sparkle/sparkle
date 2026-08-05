@@ -24,6 +24,11 @@ import {
   TRAY_SHORT_TIGHT_MIN_PX,
 } from "../../voice/sendMode";
 import { C } from "../../theme/colors";
+import {
+  TRAY_SELECTED_FILL_PCT,
+  TRAY_STRIP_TINT_PCT,
+  TRAY_SWEEP_TINT_PCT,
+} from "./trayInk";
 
 afterEach(cleanup);
 
@@ -519,6 +524,82 @@ describe("Send is an off state for the MICROPHONE, never for the control", () =>
     mount({ mode: "speak", model: COUNTING });
     expect(pill("speak").style.background).toContain("color-mix");
     expect(pill("speak").style.background).not.toBe(C.successInk);
+  });
+});
+
+// ── SELECTION MUST NOT COST LEGIBILITY ─────────────────────────────────────────────────────────
+//
+// THE FOUNDER'S REPORT, with a screenshot of the three buttons: Send and Push to talk (unselected)
+// are crisp, and Speak (selected, nothing running) is the hardest of the three to read. His words:
+// "the text should be above the button … which is shaded behind … basically the same font color …
+// as when it's not an active button". The cause was `color: ink` — the label drawn in the SAME hue
+// as its own fill and border, so the word read as part of the wash instead of sitting on it.
+//
+// THESE ROWS ARE WHAT MAKE THE PALETTE GUARD MEAN ANYTHING. theme/sendModeTrayContrast.test.ts
+// measures the WCAG ratios, but it reads ./trayInk — so on its own it would stay green if this
+// component were reverted to `color: ink` without anyone touching that module. These rows bind the
+// rendered pill to the token, which is the half that can actually regress.
+describe("the selected-but-idle label is as legible as an unselected one", () => {
+  it("paints the selected label in the plane's primary ink, NOT the position's own colour", () => {
+    mount({ mode: "speak", model: COUNTING });
+    // The exact defect: the label must not be the same colour as the fill and border it sits on.
+    expect(pill("speak").style.color).not.toBe(C.successInk);
+    expect(pill("speak").style.color).not.toBe(pill("speak").style.borderColor);
+    expect(pill("speak").style.color).toBe(C.cream);
+  });
+
+  it("holds for every position, so no one mode is the illegible one", () => {
+    for (const m of ["send", "ptt", "speak"] as const) {
+      cleanup();
+      mount({ mode: m });
+      expect(pill(m).style.color, `${m} selected-but-idle`).toBe(C.cream);
+    }
+  });
+
+  it("still says WHICH position is selected — via the fill and the border, not the text", () => {
+    mount({ mode: "speak", model: COUNTING });
+    // Selection is carried entirely by the two surfaces...
+    expect(pill("speak").style.background).toContain("color-mix");
+    expect(pill("speak").style.borderColor).toBe(C.successInk);
+    // ...while the unselected pills stay transparent-on-baseline-ink.
+    expect(pill("send").style.background).toBe("transparent");
+    expect(pill("send").style.color).toBe(C.conciergeMuted);
+  });
+
+  // ── THE WASHES ARE BOUND TOO, NOT JUST THE INK ────────────────────────────────────────────────
+  // The rows above bind the component's LABEL COLOUR to ./trayInk. The percentages were left
+  // unbound, which is the same drift hole one level down: re-inlining a literal in SendModeTray
+  // (`${ink} 40%`) would leave every suite green while theme/sendModeTrayContrast.test.ts went on
+  // measuring a fill the component no longer paints — exactly the roborev-56213 failure trayInk's
+  // header claims to have closed (roborev 59015). Read the number back off the node instead.
+  it("paints the washes the contrast guard measures — read back off the rendered node", () => {
+    // `toContain("8%")` WOULD BE SATISFIED BY "18%" — the sweep's own constant, sitting right next
+    // to this one. That is not hypothetical: it was the bug in the first cut of this test (roborev
+    // 59042). Anchoring on the leading space and trailing comma makes each percentage match only
+    // itself, because " 8%," does not occur inside " 18%,".
+    const wash = (pct: number) => ` ${pct}%,`;
+    mount({ mode: "speak", model: COUNTING });
+    expect(pill("speak").style.background).toContain(wash(TRAY_SELECTED_FILL_PCT));
+    expect(tray().style.background).toContain(wash(TRAY_STRIP_TINT_PCT));
+    expect(screen.getByTestId("send-tray-sweep").style.background).toContain(
+      wash(TRAY_SWEEP_TINT_PCT),
+    );
+    // ...and prove the anchoring actually discriminates, so this test cannot rot back into the
+    // substring bug it was written to fix.
+    expect(tray().style.background).not.toContain(wash(TRAY_SWEEP_TINT_PCT));
+  });
+
+  it("leaves the ACTING state alone — it still inverts onto the solid fill", () => {
+    // The founder was explicit that the held/firing treatment is fine as it is, so the fix must not
+    // reach it: acting keeps the solid identity fill with the inverted ink.
+    mount({ mode: "ptt", pttHeld: true });
+    // Stated as the founder's own rule — fill MATCHES stroke = acting — rather than against a
+    // colour literal. `C.amber` is brand-constant hex (not a `var()`), so jsdom normalises it to
+    // `rgb(…)` on read; comparing the two properties sidesteps that and says the actual invariant.
+    expect(pill("ptt").style.background).toBe(pill("ptt").style.borderColor);
+    expect(pill("ptt").style.background).not.toContain("color-mix");
+    expect(pill("ptt").style.color).toBe(C.onGoldFill);
+    expect(pill("ptt").style.color).not.toBe(C.cream);
   });
 });
 
