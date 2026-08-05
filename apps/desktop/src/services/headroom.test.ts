@@ -5,7 +5,9 @@ import {
   describeRecommendation,
   WARN_FRACTION,
   type Ceiling,
+  type SwitchRecommendation,
 } from "./headroom";
+import { accountDisplay } from "./accountStore";
 import type { Account, Usage, Identity } from "./accountStore";
 
 const NOW = 1_000_000;
@@ -79,6 +81,18 @@ describe("switchRecommendation", () => {
     expect(rec?.fraction).toBeCloseTo(0.9);
   });
 
+  it("carries the CURRENT account's identity-change flag onto the recommendation", () => {
+    // The ceiling itself is the guard: `ceiling_for_account` returns null while an identity change
+    // leaves too few attributable samples, so a recommendation that HAS a fraction is already one
+    // measured only against the current login. Nothing about the change needs to ride the wire.
+    const u = [usage("a", 90), usage("b", 10)];
+    const c = [ceil("a", 100), ceil("b", 100)];
+    const changed = [{ ...ident("a"), identityChanged: true }, ident("b"), ident("c")];
+    const rec = switchRecommendation("a", accounts, u, c, changed, NOW);
+    expect(rec?.fraction).toBe(0.9);
+    expect(rec).not.toHaveProperty("identityChanged");
+  });
+
   it("stays silent while the current account has room", () => {
     const u = [usage("a", 10), usage("b", 50)];
     const c = [ceil("a", 100), ceil("b", 100)];
@@ -131,29 +145,85 @@ describe("switchRecommendation", () => {
 });
 
 describe("describeRecommendation", () => {
-  const label = (a: Account) => a.nickname;
+  /** The real wiring: name each account from its VERIFIED identity, exactly as AccountSwitchHost
+   *  does. Any account missing from `identities` has no login and must not be named. */
+  const displayFor =
+    (identities: Identity[]) =>
+    (a: Account) =>
+      accountDisplay(a, identities.find((i) => i.id === a.id));
 
-  it("quantifies an approaching limit", () => {
-    const rec = {
-      from: acct("a", { nickname: "Storytell" }),
-      to: acct("b", { nickname: "Gmail" }),
-      fraction: 0.87,
-      reason: "approaching" as const,
-    };
-    expect(describeRecommendation(rec, label)).toBe(
-      "Storytell is 87% of its usual limit. Switch to Gmail before it runs out.",
+  const FROM = acct("a", { nickname: "Storytell" });
+  const TO = acct("b", { nickname: "Gmail" });
+  const signedIn = displayFor([ident("a", "drodio@storytell.ai"), ident("b", "drodio@gmail.com")]);
+
+  it("quantifies an approaching limit, naming both accounts by their verified email", () => {
+    const rec = { from: FROM, to: TO, fraction: 0.87, reason: "approaching" as const };
+    expect(describeRecommendation(rec, signedIn)).toBe(
+      "drodio@storytell.ai is 87% of its usual limit. Switch to drodio@gmail.com before it runs out.",
     );
   });
 
   it("states a reached limit plainly", () => {
-    const rec = {
-      from: acct("a", { nickname: "Storytell" }),
-      to: acct("b", { nickname: "Gmail" }),
-      fraction: null,
-      reason: "exhausted" as const,
-    };
-    expect(describeRecommendation(rec, label)).toBe(
-      "Storytell has hit its limit. Switch to Gmail to keep working.",
+    const rec = { from: FROM, to: TO, fraction: null, reason: "exhausted" as const };
+    expect(describeRecommendation(rec, signedIn)).toBe(
+      "drodio@storytell.ai has hit its limit. Switch to drodio@gmail.com to keep working.",
     );
   });
+
+  it("NEVER names an account by a nickname it cannot verify", () => {
+    // The banner asks the user to move work between real Anthropic logins. Naming an unverified
+    // account "Storytell" asserts a login nobody read. Assert the nicknames are ABSENT — asserting
+    // only that the not-signed-in phrasing appears would pass even if the nickname came along too.
+    const rec = { from: FROM, to: TO, fraction: 0.9, reason: "approaching" as const };
+    const out = describeRecommendation(rec, displayFor([]));
+    expect(out).not.toContain("Storytell");
+    expect(out).not.toContain("Gmail");
+    expect(out).toBe(
+      "An account that isn't signed in is 90% of its usual limit. " +
+        "Switch to an account that isn't signed in before it runs out.",
+    );
+  });
+
+  it("never claims a surviving estimate is partly someone else's (knightwatch probe 4)", () => {
+    // There USED to be an identity caveat here. It was false wherever it could appear: it required
+    // `fraction != null`, i.e. a ceiling to divide by — and `ceiling_for_account` cuts every
+    // pre-takeover and boundary-crossing episode BEFORE returning a non-null ceiling. A number that
+    // survives to reach this banner therefore contains only the current login's samples. The reset
+    // already carries the doubt by yielding `null` while the evidence is insufficient; saying it
+    // again in prose said something untrue about the user's own data.
+    // The flag is CARRIED but IGNORED — and carrying it is what makes this test able to fail.
+    // My first version omitted `identityChanged` entirely, so the pre-fix formatter (which appended
+    // the caveat only when `rec.identityChanged && rec.fraction != null`) returned the same plain
+    // string: the assertion held against the very code it was written to pin. Vacuous, and
+    // knightwatch caught it. Setting it true is the discriminator — the old formatter appends here,
+    // the new one does not. The cast is deliberate: the field is gone from the type, and this
+    // asserts the FORMATTER ignores it even if a stale producer still sends it over the wire.
+    const rec = {
+      from: FROM,
+      to: TO,
+      fraction: 0.87,
+      reason: "approaching" as const,
+      identityChanged: true,
+    } as unknown as SwitchRecommendation;
+    const text = describeRecommendation(rec, signedIn);
+    expect(text).toBe(
+      "drodio@storytell.ai is 87% of its usual limit. Switch to drodio@gmail.com before it runs out.",
+    );
+    expect(text).not.toMatch(/isn't its own|rough|different Claude sign-in/i);
+  });
+
+  it("NEVER names an account by a nickname it cannot verify", () => {
+    // The banner asks the user to move work between real Anthropic logins. Naming an unverified
+    // account "Storytell" asserts a login nobody read. Assert the nicknames are ABSENT — asserting
+    // only that the not-signed-in phrasing appears would pass even if the nickname came along too.
+    const rec = { from: FROM, to: TO, fraction: 0.9, reason: "approaching" as const };
+    const out = describeRecommendation(rec, displayFor([]));
+    expect(out).not.toContain("Storytell");
+    expect(out).not.toContain("Gmail");
+    expect(out).toBe(
+      "An account that isn't signed in is 90% of its usual limit. " +
+        "Switch to an account that isn't signed in before it runs out.",
+    );
+  });
+
 });

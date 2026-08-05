@@ -42,6 +42,7 @@ import {
   unsetProjectConfigValue,
 } from "./config";
 import { roborevAuthSelftest } from "./roborev";
+import { CLAUDE_LOGIN_COMMAND } from "./claudeSpawn";
 import { ensureDefaultPluginsInstalled, type PluginInstallOutcome } from "./worktree";
 import {
   setAiFeature,
@@ -488,7 +489,7 @@ describe("configActions", () => {
       await refreshRoborevAuth();
 
       expect(roborevAuthSelftest).toHaveBeenCalledTimes(1);
-      expect(useSettingsStore.getState().roborevAuthWarning).toContain("claude login");
+      expect(useSettingsStore.getState().roborevAuthWarning).toContain(CLAUDE_LOGIN_COMMAND);
     });
 
     it("clears a stale warning when the probe now passes", async () => {
@@ -562,7 +563,19 @@ describe("configActions", () => {
     it("tells the user the specific fix for each confident failure", () => {
       expect(authWarningFor({ kind: "NotInstalled" })).toContain("isn't installed");
       expect(authWarningFor({ kind: "ClaudeMissing" })).toContain("Install Claude Code");
-      expect(authWarningFor({ kind: "NotAuthenticated" })).toContain("claude login");
+      expect(authWarningFor({ kind: "NotAuthenticated" })).toContain("claude auth login");
+    });
+
+    it("names a command that EXISTS — never the non-existent `claude login` (sparkle-gwkui)", () => {
+      // A remedy string is an instruction the user will follow. Both of these told people to run
+      // `claude login`, which the CLI has no such subcommand for — following it left them exactly
+      // as unauthenticated as before. Assert the bad form is gone, not merely that the good form is
+      // present: "claude auth login" contains neither "claude login" nor a bare trailing "login".
+      for (const v of [{ kind: "NotAuthenticated" as const }, undefined]) {
+        const msg = authWarningFor(v) ?? "";
+        expect(msg, `verdict ${JSON.stringify(v)}`).toContain(CLAUDE_LOGIN_COMMAND);
+        expect(msg, `verdict ${JSON.stringify(v)}`).not.toContain("`claude login`");
+      }
     });
   });
 

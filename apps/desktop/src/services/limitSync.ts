@@ -62,7 +62,10 @@ export function pendingExhaustions(
 
 /** Build the `siblings` map {@link pendingExhaustions} needs: for each account, the OTHER accounts
  *  that are the same Anthropic login. Derived from `duplicateAccountGroups`, so it inherits its
- *  accountUuid-only matching (never nickname or email). */
+ *  identity-key matching: the `accountUuid` when the login records one, else its verified EMAIL
+ *  (see `accountStore.identityKey`). Never the nickname, which is user-typed and proves nothing.
+ *  The email fallback is load-bearing here — without it a login predating `accountUuid` and its
+ *  twin are not seen as siblings, so only one gets benched and auto-pick reuses the same quota. */
 export function siblingMap(accounts: Account[], identities: Identity[]): Record<string, string[]> {
   const out: Record<string, string[]> = {};
   for (const group of duplicateAccountGroups(accounts, identities)) {

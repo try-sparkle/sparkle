@@ -4,8 +4,8 @@
 // rename, and the two-step remove confirm (default guarded). IO is injected via the `deps` prop.
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { AccountsScreen, type AccountsDeps } from "./AccountsScreen";
-import type { Account, Usage, Identity } from "../services/accountStore";
+import { AccountsScreen, SIGNED_IN_NO_EMAIL, type AccountsDeps } from "./AccountsScreen";
+import { NOT_SIGNED_IN, type Account, type Usage, type Identity } from "../services/accountStore";
 
 afterEach(() => cleanup());
 
@@ -31,8 +31,10 @@ describe("AccountsScreen", () => {
       [{ id: "a", tokens5h: 0, tokens7d: 0, exhaustedUntil: null }],
     );
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
-    expect(await screen.findByText("Personal")).toBeTruthy();
-    expect(screen.getByText("Work")).toBeTruthy();
+    // No identities were supplied, so neither account is signed in — the nickname appears only on
+    // the secondary alias line, never in the identity slot (see the identity-slot suite below).
+    expect(await screen.findByText("alias: Personal")).toBeTruthy();
+    expect(screen.getByText("alias: Work")).toBeTruthy();
     expect(screen.getByText("default")).toBeTruthy();
     // Two windows per account × two accounts = 4 progressbars.
     expect(screen.getAllByRole("progressbar")).toHaveLength(4);
@@ -47,6 +49,87 @@ describe("AccountsScreen", () => {
     fireEvent.click(screen.getByText("Create & log in"));
     await waitFor(() => expect(deps.addAccount).toHaveBeenCalledWith("Cloud Max"));
     expect(onLogin).toHaveBeenCalledWith(expect.objectContaining({ nickname: "Cloud Max" }));
+  });
+
+  // ── The add-account loop, end to end ────────────────────────────────────────────────────────
+  // Adding an account used to be a one-way hand-off: create the dir, fire onLogin, and never look
+  // again. So whatever the login did — succeed, fail, or (for as long as the spawn ran the
+  // non-existent `claude login`) never even open a browser — the row afterwards showed the
+  // nickname the user typed, which is what left the founder believing he had accounts he did not
+  // have. The fix is that the attempt ENDING triggers a re-read, and the re-read drives the row.
+  //
+  // `store()` models the real sequence: the identity does not exist while the login window is
+  // open, so both reads before it closes come back empty. Only a THIRD read, after onLogin
+  // settles, can see an email — which makes displaying that email proof the re-read happened.
+  function store(onLoginEffect: (ids: Identity[]) => void) {
+    const accounts: Account[] = [];
+    const identities: Identity[] = [];
+    const deps: AccountsDeps = {
+      listAccounts: vi.fn(async () => [...accounts]),
+      getUsage: vi.fn(async () => []),
+      getIdentities: vi.fn(async () => [...identities]),
+      addAccount: vi.fn(async (nickname: string) => {
+        // Distinct ids so the multi-add case renders distinct rows, the way real ones do.
+        const a = acct(`acct-${accounts.length}`, { nickname });
+        accounts.push(a);
+        return a;
+      }),
+      setNickname: vi.fn(async () => {}),
+      removeAccount: vi.fn(async () => {}),
+    };
+    let readsAtLoginStart = -1;
+    const onLogin = vi.fn(async () => {
+      readsAtLoginStart = vi.mocked(deps.getIdentities).mock.calls.length;
+      onLoginEffect(identities);
+    });
+    return { deps, onLogin, readsAtLoginStart: () => readsAtLoginStart };
+  }
+
+  async function addAccountNamed(name: string) {
+    fireEvent.click(await screen.findByText("+ Add account"));
+    fireEvent.change(screen.getByLabelText("New account nickname"), { target: { value: name } });
+    fireEvent.click(screen.getByText("Create & log in"));
+  }
+
+  it("re-reads identities after the login window closes and shows the email signed in as", async () => {
+    const { deps, onLogin, readsAtLoginStart } = store((ids) =>
+      ids.push({ id: "acct-0", email: "drodio@gmail.com", organization: null, accountUuid: "u5" }),
+    );
+    render(<AccountsScreen onLogin={onLogin} deps={deps} />);
+    await addAccountNamed("Cloud Max");
+
+    // The resolved EMAIL, not the nickname the user typed. Unreachable without a read that
+    // happens after the login attempt ends — the identity did not exist before then.
+    const slot = await screen.findByTestId("account-identity-acct-0");
+    expect(slot.textContent).toBe("drodio@gmail.com");
+    expect(screen.getByText("alias: Cloud Max")).toBeTruthy();
+    // And that read is strictly AFTER onLogin started, not one of the earlier two.
+    expect(vi.mocked(deps.getIdentities).mock.calls.length).toBeGreaterThan(readsAtLoginStart());
+  });
+
+  it("leaves the account visibly NOT signed in when the login resolves no identity", async () => {
+    // The failure state has to look like failure. This is exactly the founder's `602064ad` account:
+    // a config dir that exists with no `oauthAccount` in it. A closed window is not a sign-in.
+    const { deps, onLogin } = store(() => {
+      /* login window closed, nothing was written — the OAuth never completed */
+    });
+    render(<AccountsScreen onLogin={onLogin} deps={deps} />);
+    await addAccountNamed("Cloud Max");
+
+    const slot = await screen.findByTestId("account-identity-acct-0");
+    expect(slot.textContent).toBe("Not signed in");
+    expect(slot.textContent).not.toContain("Cloud Max");
+    expect(screen.getByText("alias: Cloud Max")).toBeTruthy();
+  });
+
+  it("does not cap how many accounts can be added", async () => {
+    // The founder has four or five. Nothing in the add path is allowed to bound the list.
+    const { deps, onLogin } = store(() => {});
+    render(<AccountsScreen onLogin={onLogin} deps={deps} />);
+    for (const n of ["One", "Two", "Three", "Four", "Five"]) await addAccountNamed(n);
+    await waitFor(() => expect(deps.addAccount).toHaveBeenCalledTimes(5));
+    expect(await screen.findByText("alias: Five")).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 
   it("inline rename calls setNickname exactly once on Enter (no blur double-commit)", async () => {
@@ -72,14 +155,14 @@ describe("AccountsScreen", () => {
     // The blur the unmount would trigger must not commit the discarded draft.
     fireEvent.blur(input);
     // The edit is discarded: original name is shown again and setNickname never ran.
-    expect(await screen.findByText("Old")).toBeTruthy();
+    expect(await screen.findByText("alias: Old")).toBeTruthy();
     expect(deps.setNickname).not.toHaveBeenCalled();
   });
 
   it("does not offer Remove on the default account", async () => {
     const deps = makeDeps([acct("a", { nickname: "Default", isDefault: true })]);
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
-    await screen.findByText("Default");
+    await screen.findByText("alias: Default");
     expect(screen.queryByText("Remove")).toBeNull();
   });
 
@@ -106,15 +189,36 @@ describe("AccountsScreen", () => {
     expect(screen.getByText("alias: DROdio Gmail")).toBeTruthy();
   });
 
-  it("falls back to the nickname and flags 'Not signed in' for an account with no identity", async () => {
+  it("shows 'Not signed in' — NOT the nickname — in the identity slot when no identity resolves", async () => {
+    // The founder's live state (bead sparkle-gwkui): `<app_data>/accounts/602064ad…/.claude.json`
+    // carries no `oauthAccount` at all, and the screen rendered the string he had typed —
+    // "DROdio Gmail" — in the slot reserved for a verified identity. An unauthenticated
+    // registration displayed as a login. The nickname is a user-typed label and is never evidence
+    // of who is signed in, so it may appear only on the secondary alias line.
     const deps = makeDeps(
       [acct("a", { nickname: "DROdio Chief" })],
       [],
       [{ id: "a", email: null, organization: null, accountUuid: null }],
     );
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
-    expect(await screen.findByText("DROdio Chief")).toBeTruthy();
-    expect(screen.getByText("Not signed in")).toBeTruthy();
+    const slot = await screen.findByTestId("account-identity-a");
+    expect(slot.textContent).toBe("Not signed in");
+    // The nickname is present, but demoted — it must not be what the identity slot says.
+    expect(slot.textContent).not.toContain("DROdio Chief");
+    expect(screen.getByText("alias: DROdio Chief")).toBeTruthy();
+  });
+
+  it("states a uuid-only login honestly instead of borrowing the nickname for it", async () => {
+    // A login with a uuid but no readable email IS signed in, so "Not signed in" would be the same
+    // lie pointed the other way — and falling back to the nickname is the lie this fix removes.
+    const deps = makeDeps([acct("a", { nickname: "Nick" })], [], [
+      { id: "a", email: null, organization: null, accountUuid: "u1" },
+    ]);
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    const slot = await screen.findByTestId("account-identity-a");
+    expect(slot.textContent).not.toBe("Nick");
+    expect(slot.textContent).not.toBe("Not signed in");
+    expect(slot.textContent).toMatch(/signed in/i);
   });
 
   it("shows an exhausted-until indicator when an account is rate-limited", async () => {
@@ -180,7 +284,7 @@ describe("duplicate-login warning", () => {
       ],
     );
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
-    expect(await screen.findByText("One")).toBeTruthy();
+    expect(await screen.findByText("alias: One")).toBeTruthy();
     expect(screen.queryByText(/are the same Claude login/i)).toBeNull();
   });
 });
@@ -221,7 +325,7 @@ describe("log in / switch login on an EXISTING account", () => {
     ]);
     render(<AccountsScreen onLogin={onLogin} deps={deps} />);
     fireEvent.click(await screen.findByRole("button", { name: "Switch login" }));
-    fireEvent.click(screen.getByRole("button", { name: "Change system-wide login" }));
+    fireEvent.click(screen.getByRole("button", { name: "Change default account login" }));
     expect(onLogin).toHaveBeenCalledOnce();
   });
 });
@@ -240,7 +344,7 @@ describe("the DEFAULT account's login is guarded", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Switch login" }));
     expect(onLogin).not.toHaveBeenCalled(); // first click only arms the confirm
 
-    const confirm = screen.getByRole("button", { name: "Change system-wide login" });
+    const confirm = screen.getByRole("button", { name: "Change default account login" });
     fireEvent.click(confirm);
     expect(onLogin).toHaveBeenCalledOnce();
   });
@@ -267,14 +371,27 @@ describe("the DEFAULT account's login is guarded", () => {
     expect(onLogin).toHaveBeenCalledOnce();
   });
 
-  it("treats an identity with a uuid but no email as signed in", async () => {
-    // All three affordances (label, tooltip, 'Not signed in' badge) must agree — keying on email
-    // alone would claim a signed-in account isn't, while tinting it as a duplicate.
+  it("treats an identity with a uuid but no email as signed in — while saying it has no email", async () => {
+    // The login AFFORDANCE keys on uuid-OR-email (`isSignedIn`), because the Rust AccountIdentity
+    // allows those independently and duplicate detection matches on uuid alone: keying the button
+    // on email would offer "Log in" for an account that IS signed in.
+    //
+    // The IDENTITY SLOT keys on EMAIL, so for an `oauthAccount` carrying no readable
+    // `emailAddress` the two deliberately differ in what they can say — but NOT in whether the
+    // account is signed in. Two parallel branches disagreed here and the merge had to pick: §4c's
+    // two-state rule would print the literal "Not signed in", which is FALSE for a login that
+    // genuinely has a uuid, and false in the direction that pushes the user to re-authenticate an
+    // account they are already on. "A wrong identity is worse than none" (§5) cuts both ways, so
+    // the slot gets a third honest string instead. What must NOT happen on any branch is the
+    // nickname appearing as the identity.
     const deps = makeDeps([acct("a", { nickname: "Nick" })], [], [
       { id: "a", email: null, organization: null, accountUuid: "u1" },
     ]);
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
     expect(await screen.findByRole("button", { name: "Switch login" })).toBeTruthy();
-    expect(screen.queryByText("Not signed in")).toBeNull();
+    const slot = screen.getByTestId("account-identity-a");
+    expect(slot.textContent).toBe(SIGNED_IN_NO_EMAIL);
+    expect(slot.textContent).not.toContain("Nick");
+    expect(screen.queryByText(NOT_SIGNED_IN)).toBeNull();
   });
 });

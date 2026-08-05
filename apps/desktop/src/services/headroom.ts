@@ -15,8 +15,8 @@
 // excluded from the unit. That's tight enough to warn on, and much too loose to promise precision —
 // hence a threshold well below 1.0 and a banner that RECOMMENDS rather than acts unilaterally.
 
-import type { Account, Usage, Identity } from "./accountStore";
-import { signedInAccountIds } from "./accountStore";
+import type { Account, Usage, Identity, AccountDisplay } from "./accountStore";
+import { accountSentenceName, signedInAccountIds } from "./accountStore";
 
 /** Fraction of the learned ceiling at which we start recommending a switch. Chosen against the
  *  observed spread (CoV 0.24): at 0.8 a typical account still has real runway left, so the switch
@@ -29,6 +29,18 @@ export interface Ceiling {
   id: string;
   samples: number[];
   ceiling: number | null;
+
+  // Mirrors of the §4b wire fields (PRD/sparkle/claude-account-identity-truth.md). OPTIONAL for the
+  // same reason the Identity additions are: this file can land before the Rust does. Neither drives
+  // any copy, and deliberately so — a ceiling that survived an identity change is BY CONSTRUCTION
+  // one whose remaining samples all belong to the current login, because `ceiling_for_account` cuts
+  // the others before returning a number. There is nothing left to caveat (knightwatch probe 4).
+  /** The `accountUuid` the samples were measured against; null when the account has no resolvable
+   *  identity, in which case `ceiling` is null too. */
+  accountUuid?: string | null;
+  /** True when samples were discarded because the identity behind the config dir changed inside the
+   *  learn window. `ceiling` may be null purely for this reason. */
+  resetByIdentityChange?: boolean;
 }
 
 /** Where one account stands relative to its learned ceiling. */
@@ -77,6 +89,10 @@ export interface SwitchRecommendation {
   fraction: number | null;
   /** Why we're recommending: it hit a real limit, or it's approaching its learned ceiling. */
   reason: "exhausted" | "approaching";
+  /** True when `from`'s config dir is known to have hosted a DIFFERENT Anthropic login inside the
+   *  ceiling learn window — so the percentage above was partly measured against someone else and
+   *  has to be presented with a caveat. Optional so a hand-built recommendation (tests, an older
+   *  caller) simply carries no caveat rather than failing to typecheck. */
 }
 
 /** Rank candidate targets: least-loaded first. Accounts with a known fraction sort by it; those
@@ -139,13 +155,36 @@ export function switchRecommendation(
   };
 }
 
-/** Human phrasing for the banner. Kept next to the policy so wording and thresholds can't drift. */
+
+/** How to name an account at the START of a sentence. Only the not-signed-in case is capitalized:
+ *  the signed-in name is an EMAIL, and "Drodio@storytell.ai" would be a different address. */
+function leadName(display: AccountDisplay): string {
+  return display.signedIn ? display.primary : "An account that isn't signed in";
+}
+
+/** Human phrasing for the banner. Kept next to the policy so wording and thresholds can't drift.
+ *
+ *  Takes an {@link AccountDisplay} producer rather than a `(a) => string` labeller ON PURPOSE: this
+ *  banner asks the user to move their work between real Anthropic logins, and the old signature let
+ *  any caller hand it `a => a.nickname` — a user-typed string with no bearing on which login a
+ *  config dir holds. Taking the display makes naming an unverified account by its nickname
+ *  unrepresentable rather than merely discouraged. */
 export function describeRecommendation(
   rec: SwitchRecommendation,
-  label: (a: Account) => string,
+  display: (a: Account) => AccountDisplay,
 ): string {
+  const from = leadName(display(rec.from));
+  const to = accountSentenceName(display(rec.to));
   const pct = rec.fraction != null ? `${Math.round(rec.fraction * 100)}% of` : "at";
-  return rec.reason === "exhausted"
-    ? `${label(rec.from)} has hit its limit. Switch to ${label(rec.to)} to keep working.`
-    : `${label(rec.from)} is ${pct} its usual limit. Switch to ${label(rec.to)} before it runs out.`;
+  const base =
+    rec.reason === "exhausted"
+      ? `${from} has hit its limit. Switch to ${to} to keep working.`
+      : `${from} is ${pct} its usual limit. Switch to ${to} before it runs out.`;
+  // NO identity caveat here (knightwatch probe 4). It would only ever fire when `fraction != null`,
+  // i.e. when a ceiling EXISTS — and `ceiling_for_account` cuts every pre-takeover and
+  // boundary-crossing episode before it returns a non-null one. A surviving number therefore
+  // contains only the current login's samples, so telling the user "part of the history behind it
+  // isn't its own" was false exactly where it appeared. The reset already expresses the doubt, by
+  // yielding `null` while the evidence is insufficient.
+  return base;
 }

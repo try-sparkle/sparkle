@@ -8,15 +8,17 @@
 // instantaneous by design — busy agents migrate as their turns end, so "3 of 7 moved" is the honest
 // thing to show while that happens.
 import { AGENT_STATUS } from "@sparkle/ui";
-import type { Account } from "../services/accountStore";
+import { accountSentenceName, type Account, type AccountDisplay } from "../services/accountStore";
 import { describeRecommendation, type SwitchRecommendation } from "../services/headroom";
 import type { SwitchPlan } from "../services/accountSwitch";
 
 export interface AccountSwitchBannerProps {
   recommendation: SwitchRecommendation | null;
   plan: SwitchPlan | null;
-  /** Display name for an account — the real logged-in email where known (see `accountLabel`). */
-  label: (a: Account) => string;
+  /** The honest identity of an account (see `accountDisplay`). NOT a `(a) => string` labeller: this
+   *  banner moves the user's work between real Anthropic logins, so it must never name an account
+   *  by a nickname it cannot verify. */
+  display: (a: Account) => AccountDisplay;
   onAccept: () => void;
   onDismiss: () => void;
 }
@@ -45,7 +47,7 @@ const btn: React.CSSProperties = {
 export function AccountSwitchBanner({
   recommendation,
   plan,
-  label,
+  display,
   onAccept,
   onDismiss,
 }: AccountSwitchBannerProps) {
@@ -67,9 +69,9 @@ export function AccountSwitchBanner({
 
   return (
     <div role="alert" style={{ ...wrap, color: AGENT_STATUS.waiting.color }}>
-      <span style={{ flex: 1 }}>{describeRecommendation(recommendation, label)}</span>
+      <span style={{ flex: 1 }}>{describeRecommendation(recommendation, display)}</span>
       <button type="button" style={btn} onClick={onAccept}>
-        Switch to {label(recommendation.to)}
+        Switch to {accountSentenceName(display(recommendation.to))}
       </button>
       <button type="button" style={{ ...btn, opacity: 0.7 }} onClick={onDismiss}>
         Not now

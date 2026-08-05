@@ -8,14 +8,15 @@ import { useEffect, useState } from "react";
 import { AccountSwitchBanner } from "./AccountSwitchBanner";
 import { useAccountSwitch } from "../hooks/useAccountSwitch";
 import { loadAccountState } from "../services/accountSelection";
-import { accountLabel, type Account, type Identity } from "../services/accountStore";
+import { accountDisplay, type Account, type Identity } from "../services/accountStore";
 
 export function AccountSwitchHost() {
   const { recommendation, plan, accept, dismiss } = useAccountSwitch();
   const [identities, setIdentities] = useState<Identity[]>([]);
 
-  // The banner names accounts by their REAL logged-in email where known, matching AccountsScreen
-  // and the per-agent badge — a nickname is user-typed and may not reflect the actual login.
+  // The banner names accounts by their REAL logged-in email, matching the per-agent badge. It never
+  // falls back to the nickname: a nickname is user-typed and has no bearing on which Anthropic login
+  // a config dir holds, and this banner is asking to move the user's work between logins.
   useEffect(() => {
     if (!recommendation && !plan) return;
     let cancelled = false;
@@ -27,13 +28,13 @@ export function AccountSwitchHost() {
     };
   }, [recommendation, plan]);
 
-  const label = (a: Account) => accountLabel(a, identities.find((i) => i.id === a.id));
+  const display = (a: Account) => accountDisplay(a, identities.find((i) => i.id === a.id));
 
   return (
     <AccountSwitchBanner
       recommendation={recommendation}
       plan={plan}
-      label={label}
+      display={display}
       onAccept={accept}
       onDismiss={dismiss}
     />

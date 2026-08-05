@@ -44,6 +44,7 @@ import {
   type ResumeRule,
 } from "./suggestions/approvalCategories";
 import { categoriesForPreset, type AutoApprovePreset } from "./autoApprovePreset";
+import { CLAUDE_LOGIN_COMMAND } from "./claudeSpawn";
 import {
   conciergeToolConfigPath,
   CONCIERGE_TOOL_NAMES,
@@ -602,7 +603,12 @@ export async function setPluginEnabled(key: PluginKey, on: boolean): Promise<voi
  *  work is best-effort (each roborev.ts wrapper swallows + logs its own error) and never rejects. */
 /** Turn an auth-probe verdict into an actionable sentence for the Roborev row, or null when there's
  *  nothing wrong. `undefined` (the probe couldn't run) is deliberately NOT silent: an unverified
- *  daemon is exactly the state that fails invisibly. */
+ *  daemon is exactly the state that fails invisibly.
+ *
+ *  The remedy quotes {@link CLAUDE_LOGIN_COMMAND} rather than a hand-typed string. AGENTS.md: a
+ *  remedy message is an instruction the user will follow, so it has to name a command that exists —
+ *  these two sentences told people to run `claude login`, which is not a claude subcommand at all
+ *  (bead sparkle-gwkui), leaving anyone who followed them exactly as unauthenticated as before. */
 export function authWarningFor(verdict: RoborevAuthVerdict | undefined): string | null {
   switch (verdict?.kind) {
     case "Passed":
@@ -612,11 +618,11 @@ export function authWarningFor(verdict: RoborevAuthVerdict | undefined): string 
     case "ClaudeMissing":
       return "Roborev can't find the claude command, so your commits won't be reviewed. Install Claude Code, then turn Roborev on again.";
     case "NotAuthenticated":
-      return "Roborev found claude but couldn't sign in, so your commits won't be reviewed. Run `claude login` in a terminal, then turn Roborev on again.";
+      return `Roborev found claude but couldn't sign in, so your commits won't be reviewed. Run \`${CLAUDE_LOGIN_COMMAND}\` in a terminal, then turn Roborev on again.`;
     default:
       // Unknown verdict, or the probe didn't run at all. We can't claim it works and we can't claim
       // it's broken — say so, and leave it on rather than blocking on our own uncertainty.
-      return "Sparkle couldn't confirm Roborev is able to review your commits. It's on — but if reviews never appear, run `claude login` in a terminal.";
+      return `Sparkle couldn't confirm Roborev is able to review your commits. It's on — but if reviews never appear, run \`${CLAUDE_LOGIN_COMMAND}\` in a terminal.`;
   }
 }
 

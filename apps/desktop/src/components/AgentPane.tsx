@@ -37,7 +37,7 @@ import {
 } from "../services/orchestrationLaunch";
 import { purgeBuildAgent } from "../services/orchestrationListener";
 import { useSettingsStore, enforcedWorkerCap } from "../stores/settingsStore";
-import { setPin, accountLabel, type Account, type Identity } from "../services/accountStore";
+import { setPin, accountDisplay, forkNotice, type Account, type Identity } from "../services/accountStore";
 import {
   registerPaneRestart,
   unregisterPaneRestart,
@@ -1329,17 +1329,19 @@ export function AccountBadge({
 }) {
   const resolvedTheme = useResolvedTheme();
   const identityFor = (id: string) => identities.find((i) => i.id === id);
-  const chosenIdentity = identityFor(chosen.id);
-  // The trustworthy label is the REAL logged-in email; the nickname is only a secondary alias.
-  const chosenReal = accountLabel(chosen, chosenIdentity);
-  const chosenOrg = chosenIdentity?.organization;
-  // Tooltip surfaces the full identity: email, org, and nickname alias when it differs from email.
+  const displayFor = (a: Account) => accountDisplay(a, identityFor(a.id));
+  // The identity slot holds the VERIFIED login or the literal "Not signed in" — never the nickname,
+  // which is a string the user typed and which says nothing about which Anthropic account this
+  // agent's work actually runs under. See accountStore.accountDisplay.
+  const chosenDisplay = displayFor(chosen);
+  const chosenFork = forkNotice(chosenDisplay);
+  // Tooltip surfaces the full identity: login, org, the nickname NAMED AS AN ALIAS, and the fork
+  // between what Sparkle runs this account as and what the user's own terminal is signed in as.
   const tooltip = [
-    chosenIdentity?.email
-      ? `Claude account: ${chosenIdentity.email}`
-      : `Claude account: ${chosen.nickname} (not signed in)`,
-    chosenOrg ? `Organization: ${chosenOrg}` : null,
-    chosenIdentity?.email && chosen.nickname !== chosenIdentity.email ? `Nickname: ${chosen.nickname}` : null,
+    `Claude account: ${chosenDisplay.primary}`,
+    chosenDisplay.organization ? `Organization: ${chosenDisplay.organization}` : null,
+    chosenDisplay.nickname !== chosenDisplay.primary ? `Nickname: ${chosenDisplay.nickname}` : null,
+    chosenFork,
     "click to change",
   ]
     .filter(Boolean)
@@ -1369,11 +1371,31 @@ export function AccountBadge({
           boxShadow: "0 2px 8px rgba(0,0,0,0.3)",
         }}
       >
+        {/* An unverified account reads as UNAVAILABLE, not as a differently-named account: the live
+            dot goes out and the slot takes the muted ink. */}
         <span
-          style={{ width: 6, height: 6, borderRadius: TERM_RADIUS.sm, background: C.teal }}
+          style={{
+            width: 6,
+            height: 6,
+            borderRadius: TERM_RADIUS.sm,
+            // hasLogin (uuid OR email), NOT signedIn (email only): the dot is an AVAILABILITY
+            // claim. An oauthAccount with a uuid but no readable emailAddress is fully usable, and
+            // keying the dot on signedIn rendered it as dead while its own row offered "Switch login".
+            background: chosenDisplay.hasLogin ? C.teal : "transparent",
+            border: chosenDisplay.hasLogin ? "none" : `1px solid ${termMuted(resolvedTheme)}`,
+          }}
         />
-        <span style={{ maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-          {chosenReal}
+        <span
+          data-testid="account-badge-identity"
+          style={{
+            maxWidth: 180,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+            color: chosenDisplay.hasLogin ? undefined : termMuted(resolvedTheme),
+          }}
+        >
+          {chosenDisplay.primary}
         </span>
         <span style={{ color: termMuted(resolvedTheme) }}>▾</span>
       </button>
@@ -1400,11 +1422,12 @@ export function AccountBadge({
           >
             {accounts.map((a) => {
               const active = a.id === chosen.id;
-              const identity = identityFor(a.id);
-              // Primary line = real logged-in email (or nickname when not signed in); the nickname
-              // becomes a secondary alias line whenever it differs from the email.
-              const primary = accountLabel(a, identity);
-              const alias = identity?.email && a.nickname !== identity.email ? a.nickname : null;
+              // Primary line = the VERIFIED login, or "Not signed in". The nickname only ever
+              // appears below it, as a clearly secondary alias — including (especially) when there
+              // is no login, which is exactly the case the old fallback silently mislabelled.
+              const d = displayFor(a);
+              const alias = d.nickname !== d.primary ? d.nickname : null;
+              const fork = forkNotice(d);
               // The 10px secondary lines (alias, "not signed in", "default") are `muted` on an
               // unselected row — a transparent row, so they are read on the menu's `deepForest`
               // plane, which is what `muted` is for. On the SELECTED row the backdrop is
@@ -1417,7 +1440,7 @@ export function AccountBadge({
                 <div
                   key={a.id}
                   onClick={() => onPick(a)}
-                  title={identity?.organization ? `${a.configDir}\nOrganization: ${identity.organization}` : a.configDir}
+                  title={d.organization ? `${a.configDir}\nOrganization: ${d.organization}` : a.configDir}
                   style={{
                     display: "flex",
                     alignItems: "center",
@@ -1447,16 +1470,36 @@ export function AccountBadge({
                     }}
                   />
                   <span style={{ flex: 1, minWidth: 0, overflow: "hidden" }}>
-                    <span style={{ display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                      {primary}
+                    <span
+                      data-testid="account-row-identity"
+                      style={{
+                        display: "block",
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap",
+                        // An account with no login reads as unavailable rather than as a name.
+                        color: d.hasLogin ? undefined : secondaryInk,
+                      }}
+                    >
+                      {d.primary}
                     </span>
                     {alias && (
                       <span style={{ display: "block", color: secondaryInk, fontSize: TERM_TYPE.micro, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                         {alias}
                       </span>
                     )}
-                    {!identity?.email && (
-                      <span style={{ display: "block", color: secondaryInk, fontSize: TERM_TYPE.micro }}>not signed in</span>
+                    {fork && (
+                      // VISIBLE, not just in the tooltip: this is the founder's own case — Sparkle
+                      // exports CLAUDE_CONFIG_DIR=~/.claude and reads ~/.claude/.claude.json while
+                      // his terminal reads ~/.claude.json, two valid logins in two different files.
+                      // Deliberately NOT an offer to migrate: the Rust guard that refuses to
+                      // normalize a config dir holding a login is correct and stays.
+                      <span
+                        data-testid="account-row-fork"
+                        style={{ display: "block", color: secondaryInk, fontSize: TERM_TYPE.micro, whiteSpace: "normal" }}
+                      >
+                        {fork}
+                      </span>
                     )}
                   </span>
                   {a.isDefault && <span style={{ color: secondaryInk, fontSize: TERM_TYPE.micro, flexShrink: 0 }}>default</span>}

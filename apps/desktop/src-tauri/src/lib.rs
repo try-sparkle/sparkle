@@ -52,6 +52,8 @@ mod github;
 mod history;
 mod helper;
 mod hooks;
+/// The identity-epoch ledger backing `accounts.rs`' identity-keyed ceilings.
+mod identity_log;
 mod inbox;
 mod judge;
 mod knightwatch;

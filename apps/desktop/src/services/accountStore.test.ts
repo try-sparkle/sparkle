@@ -8,6 +8,11 @@ import {
   getUsage,
   getIdentities,
   accountLabel,
+  accountDisplay,
+  accountSentenceName,
+  forkNotice,
+  identityChanged,
+  NOT_SIGNED_IN,
   addAccount,
   setNickname,
   removeAccount,
@@ -19,9 +24,11 @@ import {
   clearAllPins,
   signedInAccountIds,
   duplicateAccountGroups,
+  identityKey,
   duplicateAccountIds,
   PINS_STORAGE_KEY,
   type Account,
+  type Identity,
   type Usage,
 } from "./accountStore";
 
@@ -190,16 +197,270 @@ describe("getIdentities", () => {
   });
 });
 
-describe("accountLabel — real email is authoritative, nickname is the fallback", () => {
-  it("prefers the real authenticated email over the nickname", () => {
-    expect(accountLabel(acct("a", { nickname: "DROdio Gmail" }), { id: "a", email: "drodio@storytell.ai", organization: null, accountUuid: null })).toBe(
-      "drodio@storytell.ai",
+/** An {@link Identity} row, defaulting the three optional Rust-side fields to ABSENT so each test
+ *  that cares about them has to opt in — which is also the shape a backend predating them sends. */
+function ident(id: string, over: Partial<Identity> = {}): Identity {
+  return { id, email: null, organization: null, accountUuid: null, ...over };
+}
+
+describe("accountDisplay — the verified email or nothing; the nickname is never the identity", () => {
+  it("renders the real authenticated email in the identity slot", () => {
+    const d = accountDisplay(acct("a", { nickname: "DROdio Gmail" }), ident("a", { email: "drodio@storytell.ai" }));
+    expect(d.primary).toBe("drodio@storytell.ai");
+    expect(d.signedIn).toBe(true);
+  });
+
+  it("an account with NO completed login does not put its nickname in the identity slot", () => {
+    // The bug: `identity?.email ?? account.nickname` rendered a user-typed string as though it were
+    // the Anthropic account the work runs under. Assert the nickname's ABSENCE — asserting only
+    // that NOT_SIGNED_IN appears would pass even if the nickname were still leaking through.
+    const a = acct("a", { nickname: "DROdio Gmail" });
+    for (const identity of [ident("a"), undefined]) {
+      const d = accountDisplay(a, identity);
+      expect(d.primary).not.toBe("DROdio Gmail");
+      expect(d.primary).toBe(NOT_SIGNED_IN);
+      expect(d.signedIn).toBe(false);
+      // …and it is still carried, so a surface can show it as a clearly secondary alias.
+      expect(d.nickname).toBe("DROdio Gmail");
+    }
+  });
+
+  it("accountLabel keeps its signature and is exactly accountDisplay(...).primary", () => {
+    // Another worker calls accountLabel; it must not have to change at merge, but it must also not
+    // be a second, softer definition of the identity slot.
+    const a = acct("a", { nickname: "DROdio Gmail" });
+    for (const identity of [ident("a", { email: "drodio@storytell.ai" }), ident("a"), undefined]) {
+      expect(accountLabel(a, identity)).toBe(accountDisplay(a, identity).primary);
+    }
+    expect(accountLabel(a, ident("a"))).not.toBe("DROdio Gmail");
+  });
+
+  it("carries the org and the anthropic account uuid through", () => {
+    const d = accountDisplay(acct("a"), ident("a", { email: "x@y.z", organization: "Acme", accountUuid: "u1" }));
+    expect(d.organization).toBe("Acme");
+    expect(d.accountUuid).toBe("u1");
+  });
+});
+
+describe("accountDisplay — the shell fork (default account only)", () => {
+  const DEFAULT = acct("d", { nickname: "DROdio Personal", isDefault: true });
+
+  it("flags the fork when the terminal is signed in as a DIFFERENT anthropic account", () => {
+    const d = accountDisplay(
+      DEFAULT,
+      ident("d", {
+        email: "drodio@storytell.ai",
+        accountUuid: "c70bea4e",
+        shellEmail: "drodio@gmail.com",
+        shellAccountUuid: "5fb3d67c",
+      }),
+    );
+    expect(d.shellForked).toBe(true);
+    expect(forkNotice(d)).toBe(
+      "Sparkle runs this account as drodio@storytell.ai; your terminal is signed in as drodio@gmail.com.",
     );
   });
 
-  it("falls back to the nickname when the account has no identity (not signed in)", () => {
-    expect(accountLabel(acct("a", { nickname: "DROdio Chief" }), { id: "a", email: null, organization: null, accountUuid: null })).toBe("DROdio Chief");
-    expect(accountLabel(acct("a", { nickname: "DROdio Chief" }), undefined)).toBe("DROdio Chief");
+  it("does NOT invent a fork when only ONE side records a uuid but the emails match", () => {
+    // THE LADDER, pinned. `shellForked` used to be a bare `shellAccountUuid !== accountUuid`, which
+    // reads `null !== "u1"` as a difference — announcing that the terminal is on a different
+    // account when both sides are demonstrably the same login. roborev found that my fix for this
+    // was not pinned by ANY test: reverting it to the one-liner kept all 59 green. It now fails.
+    const d = accountDisplay(
+      DEFAULT,
+      ident("d", { email: "same@example.com", shellEmail: "same@example.com", shellAccountUuid: "u1" }),
+    );
+    expect(d.shellForked).toBe(false);
+    expect(forkNotice(d)).toBeNull();
+  });
+
+  it("DOES report a fork when neither side has a uuid and the emails differ", () => {
+    // The other half of the ladder: with no uuids at all the email decides, so a real difference
+    // must still surface. The old one-liner returned false here (both uuids null), silently hiding
+    // a genuine fork — the failure this PR exists to fix, in the opposite direction.
+    const d = accountDisplay(DEFAULT, ident("d", { email: "a@example.com", shellEmail: "b@example.com" }));
+    expect(d.shellForked).toBe(true);
+    expect(forkNotice(d)).toBe(
+      "Sparkle runs this account as a@example.com; your terminal is signed in as b@example.com.",
+    );
+  });
+
+  it("never calls a signed-in account 'not signed in' — a uuid with no email is still a login", () => {
+    // roborev 58018. `signedIn` is email-only, and it was driving PROSE and AVAILABILITY as well as
+    // the label. For an `oauthAccount` carrying a uuid but no readable `emailAddress` — which
+    // AccountsScreen's own affordance and `duplicateAccountGroups` both treat as signed in — the
+    // fork notice emitted the flatly false "Sparkle runs this account as an account that isn't
+    // signed in", about the user's own account, in the dropdown and the tooltip.
+    const d = accountDisplay(
+      DEFAULT,
+      ident("d", { email: null, accountUuid: "u1", shellEmail: "them@example.com", shellAccountUuid: "u2" }),
+    );
+
+    expect(d.hasLogin).toBe(true);
+    expect(d.signedIn).toBe(false); // still no email to PRINT — the slot rule is unchanged
+    expect(d.shellForked).toBe(true);
+
+    const notice = forkNotice(d);
+    expect(notice).not.toContain("isn't signed in");
+    expect(notice).toBe(
+      "Sparkle runs this account as the account Sparkle is signed into; your terminal is signed in as them@example.com.",
+    );
+  });
+
+  it("groups two registrations of ONE pre-accountUuid login as duplicates (knightwatch probe 1)", () => {
+    // THE CONSEQUENCE, not just the rule. duplicateAccountGroups keyed on `accountUuid` alone and
+    // `continue`d on a null one, so two registrations of the SAME login predating that field were
+    // never seen as duplicates. limitSync's siblingMap is derived from this, so only ONE of them
+    // got benched when the shared quota ran out — and auto-pick then routed work straight back into
+    // the same exhausted account. Fails against the uuid-only keying.
+    const a = acct("a", { nickname: "one" });
+    const b = acct("b", { nickname: "two" });
+    const groups = duplicateAccountGroups(
+      [a, b],
+      [ident("a", { email: "same@example.com" }), ident("b", { email: "same@example.com" })],
+    );
+    expect(groups).toHaveLength(1);
+    expect(groups[0]!.accounts.map((x) => x.id)).toEqual(["a", "b"]);
+    expect(groups[0]!.accountUuid).toBeNull(); // email-keyed group: no uuid to report
+    expect(groups[0]!.email).toBe("same@example.com");
+  });
+
+  it("identityKey mirrors the Rust ladder: uuid, else email:<addr>, else null", () => {
+    // Direct coverage, because this is a CROSS-LANGUAGE mirror of `accounts::identity_key` and the
+    // ledger + ceiling gate key on the Rust side of it. With nothing exercising it here the two
+    // halves could drift silently and disagree about who an account is — which is the whole failure
+    // this branch exists to remove (roborev 58175).
+    expect(identityKey(ident("a", { accountUuid: "u1", email: "e@x.com" }))).toBe("u1");
+    expect(identityKey(ident("a", { email: "e@x.com" }))).toBe("email:e@x.com");
+    expect(identityKey(ident("a", {}))).toBeNull();
+    expect(identityKey(undefined)).toBeNull();
+    // The uuid WINS when both are present — it is the stronger discriminator, and two config dirs
+    // can hold logins to one account under one email, which is why accountUuid exists at all.
+    expect(identityKey(ident("a", { accountUuid: "u2", email: "same@x.com" }))).toBe("u2");
+  });
+
+  it("groups a uuid-bearing row with its email-only TWIN (knightwatch probe 1)", () => {
+    // The subtler split, and the one a single identityKey pass still gets wrong: ONE Anthropic
+    // login registered twice, where the modern client recorded `accountUuid` and the older login in
+    // the other config dir did not. Keyed per-identity they land in different buckets — `<uuid>` and
+    // `email:<addr>` — so siblingMap benches only one when their SHARED quota runs out and auto-pick
+    // routes straight back into the exhausted account. Fails against single-key bucketing.
+    const groups = duplicateAccountGroups(
+      [acct("modern", {}), acct("legacy", {})],
+      [
+        ident("modern", { email: "same@example.com", accountUuid: "u1" }),
+        ident("legacy", { email: "same@example.com" }), // no uuid — pre-field login
+      ],
+    );
+    expect(groups).toHaveLength(1);
+    expect(groups[0]!.accounts.map((x) => x.id).sort()).toEqual(["legacy", "modern"]);
+    expect(groups[0]!.accountUuid).toBe("u1"); // the uuid group absorbed the twin
+    expect(groups[0]!.key).toBe("u1"); // stable, non-null — usable as a React key
+  });
+
+  it("does NOT guess when one email maps to TWO different uuids — including with each other", () => {
+    // FOUR rows, and the fourth is the point. My first version of this test had ONE orphan, so its
+    // `for (const g of groups) expect(...)` body ran ZERO assertions on the passing path — vacuous,
+    // and it hid a real bug: the ambiguity guard refused to attribute an orphan to u1 or u2, then
+    // fell through and grouped the orphans WITH EACH OTHER under `email:X`. That is the same
+    // unfounded guess, except it produced a group of two that survived the length filter — so
+    // siblingMap benched `d` when `c` exhausted, and the banner claimed they were the same login.
+    // c may be u1 and d may be u2; we established we cannot tell (roborev 58175).
+    const groups = duplicateAccountGroups(
+      [acct("a", {}), acct("b", {}), acct("c", {}), acct("d", {})],
+      [
+        ident("a", { email: "shared@example.com", accountUuid: "u1" }),
+        ident("b", { email: "shared@example.com", accountUuid: "u2" }),
+        ident("c", { email: "shared@example.com" }),
+        ident("d", { email: "shared@example.com" }),
+      ],
+    );
+    expect(groups).toEqual([]);
+  });
+
+  it("still pairs email-only rows when NO uuid group claims that email", () => {
+    // The narrowness twin of the guard above: skipping on ambiguity must not also stop the ordinary
+    // case, where the email is the only discriminator anyone has.
+    const groups = duplicateAccountGroups(
+      [acct("c", {}), acct("d", {})],
+      [ident("c", { email: "only@example.com" }), ident("d", { email: "only@example.com" })],
+    );
+    expect(groups).toHaveLength(1);
+    expect(groups[0]!.key).toBe("email:only@example.com");
+    expect(groups[0]!.accounts.map((x) => x.id).sort()).toEqual(["c", "d"]);
+  });
+
+  it("does NOT group two different logins that merely both lack a uuid", () => {
+    // Narrowness guard: the email is the discriminator when the uuid is absent, so different
+    // emails must stay separate rather than collapsing into one bogus "duplicate" group.
+    const groups = duplicateAccountGroups(
+      [acct("a", {}), acct("b", {})],
+      [ident("a", { email: "one@example.com" }), ident("b", { email: "two@example.com" })],
+    );
+    expect(groups).toHaveLength(0);
+  });
+
+  it("keeps calling a genuinely login-less account not signed in", () => {
+    // The narrowness guard: widening to `hasLogin` must not make an empty config dir claim a login.
+    const d = accountDisplay(
+      DEFAULT,
+      ident("d", { email: null, accountUuid: null, shellEmail: "them@example.com", shellAccountUuid: "u2" }),
+    );
+    expect(d.hasLogin).toBe(false);
+    expect(accountSentenceName(d)).toBe("an account that isn't signed in");
+  });
+
+  it("does NOT flag a fork when the terminal is the same anthropic account", () => {
+    const d = accountDisplay(
+      DEFAULT,
+      ident("d", {
+        email: "drodio@storytell.ai",
+        accountUuid: "c70bea4e",
+        shellEmail: "drodio@storytell.ai",
+        shellAccountUuid: "c70bea4e",
+      }),
+    );
+    expect(d.shellForked).toBe(false);
+    expect(forkNotice(d)).toBeNull();
+  });
+
+  it("does NOT flag a fork on a NON-default account — the shell's login says nothing about it", () => {
+    const d = accountDisplay(
+      acct("n", { nickname: "DROdio Gmail" }),
+      ident("n", { email: "a@b.c", accountUuid: "u1", shellEmail: "z@y.x", shellAccountUuid: "u2" }),
+    );
+    expect(d.shellForked).toBe(false);
+    expect(forkNotice(d)).toBeNull();
+  });
+
+  it("a backend that does not yet send the shell fields claims NO fork (and does not throw)", () => {
+    // This UI can land before the Rust does. A missing shell uuid is UNKNOWN, and unknown must
+    // never render as a warning about an identity nobody read.
+    const d = accountDisplay(DEFAULT, ident("d", { email: "drodio@storytell.ai", accountUuid: "c70bea4e" }));
+    expect(d.shellForked).toBe(false);
+    expect(d.shellEmail).toBeNull();
+    expect(forkNotice(d)).toBeNull();
+  });
+
+  it("names an unverified account by state, not by nickname, in prose", () => {
+    const d = accountDisplay(DEFAULT, ident("d", { shellEmail: "drodio@gmail.com", shellAccountUuid: "5fb3d67c" }));
+    expect(d.shellForked).toBe(true);
+    const notice = forkNotice(d) ?? "";
+    expect(notice).not.toContain("DROdio Personal");
+    expect(notice).toContain("drodio@gmail.com");
+    expect(accountSentenceName(d)).toBe("an account that isn't signed in");
+  });
+});
+
+describe("identityChanged", () => {
+  it("is true only when the backend says the config dir hosted another login", () => {
+    expect(identityChanged(ident("a", { identityChanged: true }))).toBe(true);
+    expect(identityChanged(ident("a", { identityChanged: false }))).toBe(false);
+  });
+
+  it("an ABSENT field means 'not known to have changed', never a manufactured caveat", () => {
+    expect(identityChanged(ident("a"))).toBe(false);
+    expect(identityChanged(undefined)).toBe(false);
   });
 });
 

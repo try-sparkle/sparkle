@@ -48,7 +48,11 @@ export function KebabMenu() {
   const [hover, setHover] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [accountsOpen, setAccountsOpen] = useState(false);
-  const [loginAccount, setLoginAccount] = useState<Account | null>(null);
+  // A pending per-account sign-in: the account being logged into, plus the resolver that lets
+  // AccountsScreen's add-flow await the login window closing before it re-reads identities.
+  const [loginAccount, setLoginAccount] = useState<{ account: Account; done: () => void } | null>(
+    null,
+  );
 
   const triggerRef = useRef<HTMLButtonElement>(null);
 
@@ -222,25 +226,52 @@ export function KebabMenu() {
       {accountsOpen && (
         <ModalShell
           width={520}
+          // DISMISSAL IS SUPPRESSED WHILE A LOGIN IS PENDING. ModalShell binds Escape at the
+          // WINDOW and its backdrop is a full-inset click target, and neither is scoped to the
+          // topmost layer — so with the accounts screen deliberately left mounted underneath the
+          // login modal, an Escape at the verdict banner (the natural "dismiss this" reflex; xterm
+          // only swallows Escape while the terminal itself is focused, and by then it is gone)
+          // would unmount AccountsScreen out from under its pending `await onLogin(...)`. The
+          // post-login re-read — the whole point of the promise — would silently never run. The
+          // login modal owns dismissal for as long as it is up.
           onCancel={() => {
+            if (loginAccount) return;
             setAccountsOpen(false);
             invalidateAccountState();
           }}
         >
+          {/* `onLogin` returns a promise that settles when the login window CLOSES, and the accounts
+              screen stays mounted underneath (the login modal portals above it at zIndex 120 vs
+              ModalShell's 100). That is what lets AccountsScreen re-read identities afterwards and
+              show the email the user actually signed in as. Closing the screen here — as this used
+              to — resolved the await instantly and unmounted the thing that was waiting, so the
+              post-login re-read could never run outside a test. */}
           <AccountsScreen
-            onLogin={(account) => {
-              setAccountsOpen(false);
-              setLoginAccount(account);
-            }}
+            onLogin={(account) =>
+              new Promise<void>((resolve) => {
+                // Never drop an outstanding resolver on the floor. The background screen is still
+                // tab-reachable beneath the login modal's backdrop, so a second "Log in" press is
+                // reachable; overwriting would leave the first promise pending FOREVER, which
+                // parks handleAdd past its `await` with `busy === true` — Add account permanently
+                // disabled, `finally` never run. Settle the old one, then take its place.
+                setLoginAccount((prev) => {
+                  prev?.done();
+                  return { account, done: resolve };
+                });
+              })
+            }
           />
         </ModalShell>
       )}
 
-      {/* Interactive `claude login` PTY for a just-added account (AccountsScreen onLogin seam). */}
+      {/* Interactive `claude auth login` PTY for a just-added account (AccountsScreen onLogin
+          seam). Closing it resolves the pending onLogin promise — always, so a screen awaiting it
+          can never be left hanging. */}
       {loginAccount && (
         <AccountLoginModal
-          account={loginAccount}
+          account={loginAccount.account}
           onClose={() => {
+            loginAccount.done();
             setLoginAccount(null);
             invalidateAccountState();
           }}

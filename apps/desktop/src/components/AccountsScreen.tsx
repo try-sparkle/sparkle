@@ -10,7 +10,7 @@ import {
   addAccount,
   setNickname,
   removeAccount,
-  accountLabel,
+  accountDisplay,
   duplicateAccountGroups,
   type Account,
   type Usage,
@@ -22,21 +22,28 @@ import {
 // config dir with its nickname, a "default" tag, per-window usage bars (5h / 7d) and an
 // exhausted-until indicator; supports add / inline-rename / remove (the default can't be removed).
 //
-// ── The onLogin SEAM (integrator / Worker C must implement) ───────────────────────────────────
+// ── The onLogin SEAM ──────────────────────────────────────────────────────────────────────────
 // "Add account" creates an empty config dir via addAccount(), then needs to run the real
-// `claude login` flow in that dir's CLAUDE_CONFIG_DIR so the user can OAuth into a Max account.
+// `claude auth login` flow in that dir's CLAUDE_CONFIG_DIR so the user can OAuth into a Max account.
 // Spawning the PTY lives on the spawn path (claudeSpawn / AgentPane), which this component must NOT
 // import. So we hand the freshly-created Account back through the required `onLogin(account)` prop;
-// the integrator wires it to a PTY `claude login` (env CLAUDE_CONFIG_DIR=account.configDir). Until
-// that login completes the account exists but is unauthenticated — that's expected for Phase 1.
+// the integrator wires it to a PTY `claude auth login` (env CLAUDE_CONFIG_DIR=account.configDir) —
+// see AccountLoginModal, which owns the PTY and reports the identity that actually resolved.
+//
+// `onLogin` MAY return a promise that settles when the login window closes. When it does, we
+// re-read identities afterwards, so the row shows the email the user just signed in as instead of
+// the nickname they typed — and shows an explicit not-signed-in state when nothing resolved.
+// Nothing here caps the number of accounts: add is a plain create-and-refresh loop, unbounded.
 
 const DEPS = { listAccounts, getUsage, getIdentities, addAccount, setNickname, removeAccount };
 export type AccountsDeps = typeof DEPS;
 
 export interface AccountsScreenProps {
-  /** Integrator seam: invoked with the new Account right after it's created, to launch the
-   *  `claude login` PTY in account.configDir. See the block comment above. */
-  onLogin: (account: Account) => void;
+  /** Integrator seam: invoked with the Account to launch the `claude auth login` PTY in
+   *  `account.configDir`. See the block comment above. May return a promise that settles when the
+   *  login window closes — we re-read identities after it, so the list reflects the identity that
+   *  actually resolved rather than the one the user hoped for. */
+  onLogin: (account: Account) => void | Promise<void>;
   /** IO overrides — defaults to the real accountStore functions. Injectable for tests. */
   deps?: Partial<AccountsDeps>;
 }
@@ -140,12 +147,29 @@ function exhaustedLabel(usage: Usage | undefined, now: number): string | null {
 }
 
 /** Whether this account has a real Claude login. Derived from accountUuid OR email: the Rust
- *  `AccountIdentity` allows those independently, and `duplicateAccountGroups` matches on uuid alone,
+ *  `AccountIdentity` allows those independently, and `duplicateAccountGroups` matches on the
+ *  identity key (uuid when recorded, else email — see `accountStore.identityKey`),
  *  so keying the login button on email alone could render "Log in" for an account that IS signed in
  *  (and even tint it as a duplicate at the same time). One definition, shared by every affordance. */
 function isSignedIn(identity: Identity | undefined): boolean {
   return !!(identity?.accountUuid || identity?.email);
 }
+
+/** What the identity slot says for a login that IS real (it has an `accountUuid`) but carries no
+ *  readable email. It is neither the email (there isn't one) nor "Not signed in" (that would be a
+ *  lie in the other direction) nor the nickname (never evidence of anything).
+ *
+ *  NOTE this state is currently UNREACHABLE from the Rust side — `read_oauth_identity_at` refuses
+ *  an `oauthAccount` with no non-empty `emailAddress`, so a non-null `accountUuid` implies a
+ *  non-null `email` on the wire. It is rendered anyway because `isSignedIn` below (which predates
+ *  this and drives the Log in / Switch login buttons) already treats the fields as independent, so
+ *  without this arm a uuid-only identity would fall through to "Not signed in" while its own button
+ *  read "Switch login". See the same note on `resolveLoginOutcome`.
+ *
+ *  Exported and shared with {@link AccountLoginModal} so the list and the login verdict cannot give
+ *  opposite answers for the same identity. When §4c's `accountDisplay` lands in accountStore this
+ *  belongs there, beside `NOT_SIGNED_IN`, and both callers should defer to it. */
+export const SIGNED_IN_NO_EMAIL = "Signed in — no email on this login";
 
 export function AccountsScreen({ onLogin, deps }: AccountsScreenProps) {
   const io: AccountsDeps = { ...DEPS, ...deps };
@@ -196,7 +220,8 @@ export function AccountsScreen({ onLogin, deps }: AccountsScreenProps) {
 
   const usageFor = (id: string) => usage.find((u) => u.id === id);
   const identityFor = (id: string) => identities.find((i) => i.id === id);
-  // Registrations that resolve to the SAME Anthropic account (identical accountUuid) — see the
+  // Registrations that resolve to the SAME Anthropic account (same identity key: uuid when
+  // recorded, else the verified email) — see the
   // banner below and `duplicateAccountGroups`.
   const duplicates = duplicateAccountGroups(accounts, identities);
   const duplicateIds = new Set(duplicates.flatMap((g) => g.accounts.map((a) => a.id)));
@@ -216,12 +241,32 @@ export function AccountsScreen({ onLogin, deps }: AccountsScreenProps) {
       setAdding(false);
       setNewName("");
       await refresh();
-      // Hand off to the integrator to run `claude login` in the new config dir (see block comment).
-      onLogin(created);
+      // Hand off to the integrator to run `claude auth login` in the new config dir (block comment
+      // above). The account exists at this point but is a folder with no login in it.
+      await onLogin(created);
+      // The login attempt has ended. Re-read — never infer. A closed login window is not evidence
+      // of a sign-in (it is equally what a cancelled OAuth, a failed one, and a `claude` that
+      // exited on an unknown subcommand all look like), so the only way the list can be truthful
+      // is to ask for the identities again. Whatever comes back drives the row: the resolved email
+      // if there is one, an explicit "Not signed in" if there isn't.
+      await refresh();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to add account");
     } finally {
       setBusy(false);
+    }
+  }
+
+  // Re-login on an EXISTING account. Same rule as the add flow: the window closing is not a
+  // verdict, so wait for it and re-read. Without this the row keeps showing the identity from
+  // before the switch — which, for a user who just re-pointed an account at a different Claude
+  // login, is the wrong email presented as the current one.
+  async function handleLogin(a: Account) {
+    try {
+      await onLogin(a);
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to log in");
     }
   }
 
@@ -318,10 +363,13 @@ export function AccountsScreen({ onLogin, deps }: AccountsScreenProps) {
 
       {/* Two registrations of the SAME Claude login look like two accounts here but share one
           quota, so failover between them is a no-op that re-hits the same limit immediately. The
-          nickname can't reveal this (it's user-typed), so we surface the real accountUuid clash. */}
+          nickname can't reveal this (it's user-typed), so we surface the identity clash instead.
+          NOTE: a group is a PROVEN clash when it has an accountUuid, and an INFERENCE from a shared
+          verified email when it does not — `duplicateAccountGroups` only infers when that email
+          identifies exactly one uuid group, or none at all. */}
       {duplicates.map((g) => (
         <div
-          key={g.accountUuid}
+          key={g.key}
           role="alert"
           style={{ ...card, borderColor: C.amber, color: C.amber, fontSize: 12, lineHeight: 1.5 }}
         >
@@ -344,9 +392,24 @@ export function AccountsScreen({ onLogin, deps }: AccountsScreenProps) {
         const identity = identityFor(a.id);
         const exhausted = exhaustedLabel(u, now);
         const isEditing = editingId === a.id;
-        // Authoritative label = the REAL logged-in email; nickname is only a secondary alias.
-        const primary = accountLabel(a, identity);
-        const alias = identity?.email && a.nickname !== identity.email ? a.nickname : null;
+        // The identity slot renders a VERIFIED identity or an explicit not-signed-in state — never
+        // the user-typed nickname, which is not evidence of anything (contract §5). This row is how
+        // an account with no `oauthAccount` in its config dir came to be displayed as "DROdio
+        // Gmail": an unauthenticated registration presented as a login.
+        //
+        // `accountDisplay` is the shared authority (§4c) so this screen, the pane badge and the
+        // switch banner cannot drift. THREE states, not two, though: `display.signedIn` is
+        // email-only, while `isSignedIn` is WIDER (uuid OR email). A login carrying a uuid but no
+        // readable email IS a real sign-in, so labelling it "Not signed in" would be the same lie
+        // pointed the other way — it gets its own honest string instead.
+        const display = accountDisplay(a, identity);
+        const signedIn = isSignedIn(identity);
+        const primary = display.signedIn
+          ? display.primary
+          : signedIn
+            ? SIGNED_IN_NO_EMAIL
+            : display.primary;
+        const alias = primary !== display.nickname ? display.nickname : null;
         return (
           <div key={a.id} style={card}>
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -366,8 +429,21 @@ export function AccountsScreen({ onLogin, deps }: AccountsScreenProps) {
               ) : (
                 <span style={{ flex: 1, minWidth: 0 }}>
                   <span
-                    style={{ fontSize: 13, fontWeight: 600, display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
-                    title={identity?.email ? undefined : "Not signed in — showing nickname until you log in"}
+                    data-testid={`account-identity-${a.id}`}
+                    style={{
+                      fontSize: 13,
+                      fontWeight: 600,
+                      display: "block",
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                      ...(signedIn ? {} : { color: C.amber }),
+                    }}
+                    title={
+                      signedIn
+                        ? undefined
+                        : "This config folder holds no Claude login. Log in to give it a real identity."
+                    }
                   >
                     {primary}
                   </span>
@@ -377,9 +453,13 @@ export function AccountsScreen({ onLogin, deps }: AccountsScreenProps) {
                   {identity?.organization && (
                     <span style={{ fontSize: 12, color: C.muted, display: "block" }}>{identity.organization}</span>
                   )}
-                  {!isSignedIn(identity) && (
-                    <span style={{ fontSize: 12, color: C.amber, display: "block" }}>Not signed in</span>
-                  )}
+                  {/* The separate amber "Not signed in" badge is gone: the identity slot above now
+                      says it literally, and rendering the same words twice in one card was both
+                      noise and an ambiguous target for tests. `isSignedIn` (uuid OR email) still
+                      drives the Log in / Switch login affordance below — it is deliberately WIDER
+                      than the identity slot's rule (email only), so an account holding an
+                      `oauthAccount` with no readable `emailAddress` offers "Switch login" while its
+                      identity slot honestly reports it has no email to show. */}
                 </span>
               )}
               {a.isDefault && <span style={tagStyle}>default</span>}
@@ -403,7 +483,8 @@ export function AccountsScreen({ onLogin, deps }: AccountsScreenProps) {
                         : smallBtn
                     }
                     onClick={() => setConfirmLogin(a.id)}
-                    title="This is your system-wide Claude login (~/.claude) — changing it affects every use of Claude Code, not just Sparkle."
+                    // Scope named, not overstated — see AccountLoginModal (knightwatch probe 3).
+                    title={`Changes the Claude login Sparkle uses for the default account (${a.configDir || "~/.claude.json"}).`}
                   >
                     {isSignedIn(identity) ? "Switch login" : "Log in"}
                   </button>
@@ -414,11 +495,11 @@ export function AccountsScreen({ onLogin, deps }: AccountsScreenProps) {
                       style={{ ...smallBtn, borderColor: C.amber, color: C.amber }}
                       onClick={() => {
                         setConfirmLogin(null);
-                        onLogin(a);
+                        void handleLogin(a);
                       }}
-                      title="Replaces your system-wide Claude Code login"
+                      title={`Replaces the login Sparkle uses for the default account (${a.configDir || "~/.claude.json"})`}
                     >
-                      Change system-wide login
+                      Change default account login
                     </button>
                     <button type="button" style={smallBtn} onClick={() => setConfirmLogin(null)}>
                       Cancel
@@ -432,7 +513,7 @@ export function AccountsScreen({ onLogin, deps }: AccountsScreenProps) {
                         ? { ...smallBtn, borderColor: C.amber, color: C.amber }
                         : smallBtn
                     }
-                    onClick={() => onLogin(a)}
+                    onClick={() => void handleLogin(a)}
                     title={
                       isSignedIn(identity)
                         ? `Currently ${identity?.email ?? "signed in"}. Logging in again lets you point this account at a different Claude login.`
@@ -451,7 +532,10 @@ export function AccountsScreen({ onLogin, deps }: AccountsScreenProps) {
                   Rename
                 </button>
               )}
-              {/* The default account can't be removed (the Rust side also refuses). */}
+              {/* The default account has no Remove control. NOTE: this is a UI-only rule —
+                  `accounts_remove` does NOT reject a default, so do not rely on the backend for it.
+                  What the backend does guarantee is that the DIRECTORY survives
+                  (`dir_to_remove_on_remove` returns None for a default). */}
               {!a.isDefault &&
                 (confirmRemove === a.id ? (
                   <>

@@ -2,6 +2,8 @@ import { describe, it, expect } from "vitest";
 import {
   buildClaudeExec,
   buildClaudeLoginExec,
+  CLAUDE_LOGIN_ARGV,
+  CLAUDE_LOGIN_COMMAND,
   shellQuote,
   buildOrchestratorMcpConfig,
   buildControlMcpConfig,
@@ -23,6 +25,22 @@ describe("buildClaudeLoginExec (first-run setup)", () => {
   // so the embedded setup terminal opened a Claude REPL and asked it the word "login". No OAuth ever
   // ran, and the founder reported the onboarding sign-in window as simply not working. The assertion
   // is on the exact argv, so a revert to the bare `login` form fails here.
+  // The exported constants exist so USER-FACING COPY quotes the same string the spawn runs — a
+  // message naming a command is an instruction the user will follow, so it has to be the real one.
+  //
+  // WHAT THIS ACTUALLY GUARANTEES, stated honestly because the first version of this comment did
+  // not: the constants are pinned to INDEPENDENTLY-WRITTEN literals. That is all. An earlier draft
+  // also asserted `CLAUDE_LOGIN_COMMAND === \`claude ${CLAUDE_LOGIN_ARGV}\`` and that the exec ends
+  // with CLAUDE_LOGIN_ARGV — both tautologies, since the source DEFINES the command that way and
+  // INTERPOLATES the argv into the exec. They hold for any value and cannot fail, so a reader would
+  // have believed derivation drift was mechanically guarded when it was not (roborev 58151).
+  // Drift is prevented structurally instead: `configActions.ts` and the setup copy import
+  // CLAUDE_LOGIN_COMMAND rather than hand-typing it, so there is one string to get wrong.
+  it("pins the login argv and the human-facing command to literals", () => {
+    expect(CLAUDE_LOGIN_ARGV).toBe("auth login");
+    expect(CLAUDE_LOGIN_COMMAND).toBe("claude auth login");
+  });
+
   it("runs `claude auth login` — NOT `claude login`, which is a prompt, not a command", () => {
     expect(buildClaudeLoginExec("/usr/local/bin/claude")).toBe(
       `${UNSET_PREFIX}${PATH_PREFIX}exec '/usr/local/bin/claude' auth login`,

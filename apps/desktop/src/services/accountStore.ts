@@ -50,6 +50,26 @@ export interface Identity {
    *  really the same login — see {@link duplicateAccountGroups}. `null` on a login predating the
    *  field, or an account never signed into. */
   accountUuid: string | null;
+
+  // ── The three fields below arrive from the Rust `AccountIdentity` (PRD/sparkle/
+  // claude-account-identity-truth.md §4a). They are declared OPTIONAL deliberately: this UI can
+  // ship before the Rust does, and every read below coalesces (`?? null` / `?? false`) so a build
+  // whose backend predates them degrades to "no fork known" rather than crashing or — much worse —
+  // raising a fork warning about a shell identity nobody actually read.
+
+  /** The identity a plain terminal `claude` would run as (`$HOME/.claude.json`, read with no
+   *  CLAUDE_CONFIG_DIR). Present ONLY on the default account: a named account's own config dir is
+   *  its own truth, and the shell's login has no bearing on it. */
+  shellEmail?: string | null;
+  /** `accountUuid` of that same shell identity. On the DEFAULT account, differing from
+   *  {@link Identity.accountUuid} is the FORK condition the UI surfaces — Sparkle exports
+   *  `CLAUDE_CONFIG_DIR=~/.claude` and so reads `~/.claude/.claude.json`, while the user's terminal
+   *  reads `~/.claude.json`. Both can hold valid logins for DIFFERENT Anthropic accounts. */
+  shellAccountUuid?: string | null;
+  /** True when this config dir is known to have hosted a different `accountUuid` inside the ceiling
+   *  learn window, so any learned headroom/ceiling number was partly measured against someone
+   *  else. Absent (older backend) means "not known to have changed" — never assume it did. */
+  identityChanged?: boolean;
 }
 
 /** Raw shape the Rust side returns — mapped to {@link Usage} at the boundary. `AccountUsage` in
@@ -139,18 +159,173 @@ export function getIdentities(): Promise<Identity[]> {
 // the credit balance without saying which is which. Note that Settings → History & Spend is a
 // DIFFERENT feature entirely (`services/spendApi.ts` → the Rust `spend_report` command).
 
-/** The authoritative label to show for an account: its REAL logged-in email when known, otherwise
- *  the user-typed nickname (an account never `claude login`ed has no identity yet). Use this — not
- *  `account.nickname` — wherever the account is identified to the user, so the label reflects the
- *  identity the session actually runs under. */
-export function accountLabel(account: Account, identity: Identity | undefined): string {
-  return identity?.email ?? account.nickname;
+/** What every identity surface renders when an account has no verified login. A LITERAL string, not
+ *  a name — see {@link accountDisplay} for why it is never the nickname. */
+export const NOT_SIGNED_IN = "Not signed in";
+
+/** Everything a surface needs to identify an account HONESTLY, derived in one place so no caller
+ *  can re-invent the fallback this type exists to remove.
+ *
+ *  Frozen shape — PRD/sparkle/claude-account-identity-truth.md §4c. Three workers build against it. */
+export type AccountDisplay = {
+  /** What to render in the identity slot: the live logged-in email, or the literal
+   *  {@link NOT_SIGNED_IN}. NEVER the nickname. */
+  primary: string;
+  /** Whether {@link AccountDisplay.primary} is a verified identity — i.e. whether there is an EMAIL
+   *  to show. Governs the identity SLOT only. Do NOT use it for availability: see
+   *  {@link AccountDisplay.hasLogin}. */
+  signedIn: boolean;
+  /** Whether this account has a real Claude login at all — `accountUuid` OR `email`.
+   *
+   *  DELIBERATELY WIDER than {@link AccountDisplay.signedIn}, and the two must not be conflated.
+   *  `signedIn` answers "can I print a name?"; this answers "is this account usable?". An
+   *  `oauthAccount` carrying a uuid but no readable `emailAddress` is fully signed in and fully
+   *  usable — `AccountsScreen`'s own affordance and `duplicateAccountGroups` both already key on
+   *  uuid — so keying the live dot, the muted ink or any PROSE on `signedIn` renders such an
+   *  account as unusable, and made {@link forkNotice} emit the flatly false "Sparkle runs this
+   *  account as an account that isn't signed in". Availability and prose key on THIS. */
+  hasLogin: boolean;
+  /** The user's own label. Always available, and may be shown ONLY as a secondary alias. */
+  nickname: string;
+  organization: string | null;
+  accountUuid: string | null;
+  /** Default account only: the user's terminal is signed in as a DIFFERENT Anthropic account than
+   *  the one Sparkle runs this account as. See {@link forkNotice}. */
+  shellForked: boolean;
+  /** The terminal's email, when known. Null when unknown (incl. a backend predating the field). */
+  shellEmail: string | null;
+};
+
+/** Derive the honest display for one account.
+ *
+ *  THE BUG THIS FIXES: `accountLabel` was `identity?.email ?? account.nickname`. An account whose
+ *  config dir was registered but never `claude login`ed reports `email: null`, so the UI rendered
+ *  the USER-TYPED nickname in the exact slot reserved for a verified identity — presenting a string
+ *  the user invented as the Anthropic account their work runs under. Measured on the founder's
+ *  machine: account "DROdio Gmail" has a config dir whose `.claude.json` carries no `oauthAccount`
+ *  at all, and the pill had been showing his own label back to him as though it were a login.
+ *  A WRONG IDENTITY IS WORSE THAN NONE (contract §5), so the fallback is gone: an unverified
+ *  account reads as unavailable, never as a differently-named account.
+ *
+ *  All three `shell*`/`identityChanged` reads coalesce, so this is safe against a backend that does
+ *  not yet send them: no fork is claimed unless a shell uuid was actually read. */
+/** The key an identity is filed under — TS mirror of Rust `accounts::identity_key`.
+ *
+ *  `accountUuid` when the login records one, otherwise `email:<addr>`, otherwise null (no login at
+ *  all). The uuid ALONE is not enough: it is absent on logins predating the field, and those are
+ *  fully signed in and fully attributable by email. Rust keys the identity ledger and the ceiling
+ *  gate this way; TypeScript must match, or the two halves of one product disagree about who an
+ *  account is. */
+export function identityKey(identity: Identity | undefined): string | null {
+  const uuid = identity?.accountUuid ?? null;
+  if (uuid) return uuid;
+  const email = identity?.email ?? null;
+  return email ? `email:${email}` : null;
 }
 
-/** A set of registered accounts that are all the SAME Anthropic login (identical `accountUuid`).
- *  Every group returned has ≥2 members — a group of one isn't a duplicate. */
+/** Do two identities denote DIFFERENT Anthropic accounts? TS mirror of Rust
+ *  `accounts::identities_differ`.
+ *
+ *  The uuid decides when BOTH sides have one; otherwise fall back to the email. A bare `!==` on the
+ *  uuids reads `null !== "x"` as a difference and INVENTS one — which, on the fork notice, means
+ *  telling the user their terminal is on a different account when it may well be the same. Never
+ *  claims a difference it cannot show. */
+export function identitiesDiffer(
+  a: { accountUuid: string | null; email: string | null },
+  b: { accountUuid: string | null; email: string | null },
+): boolean {
+  if (a.accountUuid && b.accountUuid) return a.accountUuid !== b.accountUuid;
+  if (a.email && b.email) return a.email !== b.email;
+  return false; // unresolvable on one side — unknown, NOT different
+}
+
+export function accountDisplay(account: Account, identity: Identity | undefined): AccountDisplay {
+  const email = identity?.email ?? null;
+  const accountUuid = identity?.accountUuid ?? null;
+  const shellAccountUuid = identity?.shellAccountUuid ?? null;
+  const shellEmail = identity?.shellEmail ?? null;
+  return {
+    primary: email ?? NOT_SIGNED_IN,
+    signedIn: email != null,
+    hasLogin: email != null || accountUuid != null,
+    nickname: account.nickname,
+    organization: identity?.organization ?? null,
+    accountUuid,
+    // Default account ONLY (the shell's login is irrelevant to a named account's own dir), and only
+    // when a shell uuid was actually read — an absent one is "unknown", never "forked".
+    // Requires the default account and a shell identity we could actually RESOLVE — an unknown
+    // terminal identity is unknown, never "forked". Given that, two cases are a fork:
+    //
+    //  * both sides resolvable and DIFFERENT — decided by `identitiesDiffer`, i.e. the uuid when
+    //    both have one, else the email. NOT a bare uuid `!==`, which reads `null !== "x"` as a
+    //    difference and would announce a fork between what may be one account (knightwatch probe 1).
+    //  * this account has no login at all while the terminal does. That is not a claim that they
+    //    are different ACCOUNTS — it is the honest "nothing here, something there", and it is worth
+    //    surfacing rather than swallowing. `accountSentenceName` names it without inventing a name.
+    shellForked:
+      account.isDefault &&
+      (shellAccountUuid != null || shellEmail != null) &&
+      ((accountUuid == null && email == null) ||
+        identitiesDiffer(
+          { accountUuid, email },
+          { accountUuid: shellAccountUuid, email: shellEmail },
+        )),
+    shellEmail,
+  };
+}
+
+/** The authoritative label to show for an account. Signature UNCHANGED so no consumer breaks; the
+ *  BEHAVIOUR changed — it is now `accountDisplay(...).primary`, which is the verified email or
+ *  {@link NOT_SIGNED_IN} and never the nickname. Prefer {@link accountDisplay} in new code, which
+ *  also carries the alias, the org and the fork state. */
+export function accountLabel(account: Account, identity: Identity | undefined): string {
+  return accountDisplay(account, identity).primary;
+}
+
+/** Whether this account's learned headroom/ceiling numbers were partly measured against a DIFFERENT
+ *  Anthropic login that previously occupied the same config dir. Absent → false ("not known to have
+ *  changed"), so an older backend never manufactures a caveat. */
+export function identityChanged(identity: Identity | undefined): boolean {
+  return identity?.identityChanged ?? false;
+}
+
+/** The one-sentence fork warning, or null when there is no fork to report.
+ *
+ *  The founder's literal complaint: his terminal reads `~/.claude.json` (gmail) while Sparkle's
+ *  default account exports `CLAUDE_CONFIG_DIR=~/.claude` and so reads `~/.claude/.claude.json`
+ *  (storytell) — two valid logins in two different files, and nothing said so. We deliberately do
+ *  NOT offer to migrate: the Rust guard that refuses to normalize a config dir holding a login is
+ *  correct and stays (contract §5). Making the fork VISIBLE is the whole fix. */
+export function forkNotice(display: AccountDisplay): string | null {
+  if (!display.shellForked) return null;
+  const sparkleAs = accountSentenceName(display);
+  const shellAs = display.shellEmail ?? "a different account";
+  return `Sparkle runs this account as ${sparkleAs}; your terminal is signed in as ${shellAs}.`;
+}
+
+/** How to name an account inside PROSE. {@link NOT_SIGNED_IN} is a slot label, not a name — dropped
+ *  into a sentence it reads as an account literally called "Not signed in". */
+export function accountSentenceName(display: AccountDisplay): string {
+  if (display.signedIn) return display.primary;
+  // A login with a uuid but no readable email IS signed in — saying otherwise in prose is a false
+  // statement about the user's own account, rendered in the dropdown and the tooltip. Name it
+  // without claiming a name we do not have.
+  if (display.hasLogin) return "the account Sparkle is signed into";
+  return "an account that isn't signed in";
+}
+
+/** A set of registered accounts that are all the SAME Anthropic login — proven by an identical
+ *  `accountUuid`, or INFERRED from a shared verified email when no uuid is recorded (see
+ *  {@link duplicateAccountGroups} for the two-pass rule and its ambiguity guard). Every group
+ *  returned has ≥2 members — a group of one isn't a duplicate. */
 export interface DuplicateGroup {
-  accountUuid: string;
+  /** Stable, never-null identifier for this group — the uuid when it has one, else `email:<addr>`.
+   *  Use this as a React key; {@link DuplicateGroup.accountUuid} is nullable and cannot serve. */
+  key: string;
+  /** The shared login's uuid, or null when the group was keyed by EMAIL (a login predating the
+   *  `accountUuid` field). Null here does NOT mean "not a duplicate" — see
+   *  {@link duplicateAccountGroups}. */
+  accountUuid: string | null;
   /** The shared login's email, for display. */
   email: string | null;
   /** The registered accounts that resolve to it, in input order. */
@@ -160,32 +335,83 @@ export interface DuplicateGroup {
 /** Find registered accounts that are really the same Anthropic login.
  *
  *  This exists because it happened: two accounts nicknamed "DROdio Storytell" and "DROdio Gmail"
- *  both resolved to `accountUuid 5fb3d67c-…`. Nothing detected it, so the UI showed two independent
- *  headroom bars for ONE quota and "failover" between them switched to the same account and re-hit
- *  the same limit immediately. A nickname is a user-typed label with no bearing on which login a
- *  config dir holds, so it can never be the identity key.
+ *  held logins to the SAME Anthropic account, so failing over between them switched to the same
+ *  quota and re-hit the limit immediately while the UI showed two independent headroom bars.
  *
- *  Matching is on `accountUuid` ONLY — deliberately not email. Email is a display label; the uuid is
- *  the account. Accounts with no uuid (never signed in, or a login predating the field) are excluded
- *  rather than lumped together, so "not signed in yet" is never reported as a duplicate. */
+ *  MATCHING IS TWO-PASS, uuid first:
+ *    1. every row that records an `accountUuid` buckets by it — the authoritative discriminator;
+ *    2. a row with an email but NO uuid joins a uuid group only when that email identifies exactly
+ *       ONE such group. If the email maps to two or more, it is ambiguous and the row is not
+ *       grouped at all; if no uuid group claims it, email-only rows pair among themselves.
+ *
+ *  The email fallback is not a nicety: `accountUuid` is absent on logins predating the field, and
+ *  without it a pre-field registration and its uuid-bearing twin are never seen as siblings — so
+ *  only one is benched when their SHARED quota runs out and auto-pick routes straight back into the
+ *  exhausted account. The nickname is never used; it is user-typed and proves nothing. */
 export function duplicateAccountGroups(
   accounts: Account[],
   identities: Identity[],
 ): DuplicateGroup[] {
   const byId = new Map(identities.map((i) => [i.id, i]));
+
+  // TWO PASSES, uuid first. A single pass keyed on `identityKey` still splits ONE login across two
+  // groups whenever one registration reports an `accountUuid` and its twin does not — the modern
+  // client records the field, an older login in another config dir does not. `siblingMap` is
+  // derived from these groups, so a split means only one of the pair gets benched when their SHARED
+  // quota runs out, and auto-pick immediately routes work back into the exhausted account. That is
+  // precisely the failure this function exists to prevent (knightwatch probe 1).
   const groups = new Map<string, DuplicateGroup>();
+  const emailToUuidKeys = new Map<string, Set<string>>();
+
+  // Pass 1 — every row that HAS a uuid. The uuid is the authoritative discriminator.
   for (const a of accounts) {
-    const uuid = byId.get(a.id)?.accountUuid;
-    if (!uuid) continue; // not signed in / no uuid → not comparable
+    const identity = byId.get(a.id);
+    const uuid = identity?.accountUuid ?? null;
+    if (!uuid) continue;
     const g = groups.get(uuid);
     if (g) g.accounts.push(a);
-    else
-      groups.set(uuid, {
-        accountUuid: uuid,
-        email: byId.get(a.id)?.email ?? null,
-        accounts: [a],
-      });
+    else groups.set(uuid, { key: uuid, accountUuid: uuid, email: identity?.email ?? null, accounts: [a] });
+    const email = identity?.email;
+    if (email) {
+      const keys = emailToUuidKeys.get(email) ?? new Set<string>();
+      keys.add(uuid);
+      emailToUuidKeys.set(email, keys);
+    }
   }
+
+  // Pass 2 — rows with an email but no uuid. Merge into a uuid group ONLY when that email
+  // identifies exactly one such group: with two, the email is ambiguous (it genuinely maps to more
+  // than one Anthropic account) and guessing would bench an account that is not actually a sibling,
+  // which is worse than missing the pairing. Otherwise they group among themselves by email.
+  for (const a of accounts) {
+    const identity = byId.get(a.id);
+    if (identity?.accountUuid) continue;
+    const email = identity?.email;
+    if (!email) continue; // no login at all → not comparable
+    const candidates = emailToUuidKeys.get(email);
+    if (candidates && candidates.size > 1) {
+      // AMBIGUOUS, so this row is not grouped AT ALL — not with a uuid group, and not with the
+      // other refused rows either. Falling through to email bucketing here was a real bug: given
+      // a(u1,X) b(u2,X) c(no-uuid,X) d(no-uuid,X), c and d landed in one `email:X` group of two,
+      // which survives the length filter. That is the SAME unfounded guess the line above just
+      // declined — c may be u1 and d may be u2 — except this branch actually produces a group, so
+      // `siblingMap` benched d when c exhausted, and the banner told the user "2 accounts are the
+      // same Claude login" about accounts we had just proven we cannot pair (roborev 58175).
+      continue;
+    }
+    if (candidates?.size === 1) {
+      groups.get([...candidates][0]!)!.accounts.push(a);
+      continue;
+    }
+    // No uuid group claims this email: pair the email-only rows among themselves. `identityKey` is
+    // the shared ladder (and here always returns the `email:` form, since uuid-bearing rows already
+    // `continue`d), so this key cannot drift from the Rust rule it mirrors.
+    const key = identityKey(identity)!;
+    const g = groups.get(key);
+    if (g) g.accounts.push(a);
+    else groups.set(key, { key, accountUuid: null, email, accounts: [a] });
+  }
+
   return [...groups.values()].filter((g) => g.accounts.length > 1);
 }
 

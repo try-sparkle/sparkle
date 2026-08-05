@@ -158,30 +158,49 @@ export function buildClaudeExec(
 }
 
 /**
- * Build the `zsh -l -c` exec string that runs the interactive Claude sign-in — used by the auth
- * gate, the first-run setup checklist, and the per-account login modal. Like {@link buildClaudeExec}
- * it prepends `~/.local/bin` to PATH so the `#!/usr/bin/env node` shebang in a freshly-installed
- * `claude` resolves node. Kept here (not inline in the component) so the launcher stays consistent
- * with every other spawn path and is unit-testable. `configDir` (optional) targets a specific
- * account's config dir.
+ * The claude ARGV that opens the interactive browser sign-in.
  *
- * IT IS `auth login`, AND THE `auth` IS THE WHOLE BUG THIS FIXES. Every caller used to build
- * `claude login`, which is not a subcommand — `claude --help` lists `agents`, `auth`, `auto-mode`,
- * `doctor`, `gateway`, `install`, `mcp`, `plugin`, `project`, `setup-token`, `ultrareview`,
- * `update`, and nothing else. Commander therefore parsed `login` as the POSITIONAL PROMPT, so the
- * embedded terminal opened an ordinary Claude REPL and sent it the word "login". OAuth never ran.
- * The founder hit this as "the little login window in onboarding isn't working" — it wasn't a
- * rendering or PTY fault, the command simply did not exist. `claude auth --help` is the authority:
+ * IT IS `auth login`, AND THE `auth` IS THE WHOLE BUG. Every caller used to build `claude login`,
+ * which is not a subcommand — `claude --help` lists `agents`, `auth`, `auto-mode`, `doctor`,
+ * `gateway`, `install`, `mcp`, `plugin`, `project`, `setup-token`, `ultrareview`, `update`, and
+ * nothing else. Commander therefore parsed `login` as the POSITIONAL PROMPT, so the embedded
+ * terminal opened an ordinary Claude REPL and sent it the word "login". OAuth never ran.
+ *
+ * Measured directly rather than inferred: `CLAUDE_CONFIG_DIR=<tmp> claude login </dev/null` prints
+ * `Not logged in · Please run /login` and exits 1, leaving a config dir whose `.claude.json` has NO
+ * `oauthAccount` — byte-for-byte the state of a half-registered Sparkle account. So the broken path
+ * did not merely fail; it MANUFACTURED the accounts whose nicknames the pill was showing as
+ * identities (bead sparkle-gwkui). The founder hit the same defect from the other side as "the
+ * little login window in onboarding isn't working" — not a rendering or PTY fault; the command
+ * simply did not exist. `claude auth --help` is the authority:
  *
  *     Commands:  login [options]   Sign in to your Anthropic account
  *                logout            Log out from your Anthropic account
  *                status [options]  Show authentication status
+ *
+ * Exported so user-facing copy quotes the SAME string the spawn actually runs: a message that
+ * names a command is an instruction the user will follow, so it has to be the real one.
  */
+export const CLAUDE_LOGIN_ARGV = "auth login";
+
+/** `claude auth login` — the full command, for user-facing copy and error remedies. Derived from
+ *  {@link CLAUDE_LOGIN_ARGV} so a string shown to a human cannot drift from the one we spawn. */
+export const CLAUDE_LOGIN_COMMAND = `claude ${CLAUDE_LOGIN_ARGV}`;
+
+/** Build the `zsh -l -c` exec string that runs `claude auth login` — the interactive sign-in used
+ *  by the auth gate, the first-run setup checklist, and the per-account login modal. Like
+ *  {@link buildClaudeExec} it prepends `~/.local/bin` to PATH so the `#!/usr/bin/env node` shebang
+ *  in a freshly-installed `claude` resolves node. `configDir` (optional) targets a specific
+ *  account's config dir — that export is what makes the login land in a named account's folder
+ *  instead of the user's system-wide `~/.claude`. */
 export function buildClaudeLoginExec(claudePath: string, opts: { configDir?: string } = {}): string {
   const configExport = opts.configDir
     ? `export CLAUDE_CONFIG_DIR=${shellQuote(opts.configDir)}; `
     : "";
-  return `${configExport}${ANTHROPIC_ENV_UNSET}export PATH="$HOME/.local/bin:$PATH"; exec ${shellQuote(claudePath)} auth login`;
+  // ANTHROPIC_ENV_UNSET is load-bearing and came from the parallel auth-gate fix: with an API-key
+  // env var set, `claude` authenticates with THAT instead of running the OAuth browser flow, so the
+  // sign-in silently does nothing. Both halves of this bug had to be fixed for a login to work.
+  return `${configExport}${ANTHROPIC_ENV_UNSET}export PATH="$HOME/.local/bin:$PATH"; exec ${shellQuote(claudePath)} ${CLAUDE_LOGIN_ARGV}`;
 }
 
 /**

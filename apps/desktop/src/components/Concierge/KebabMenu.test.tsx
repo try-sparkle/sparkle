@@ -54,19 +54,45 @@ vi.mock("../AuthStatusButton", () => ({
   AuthStatusButton: () => <button data-testid="auth-status">avatar</button>,
 }));
 
+// THE MOCK BINDS ESCAPE AT THE WINDOW, because the real one does (ModalShell.tsx: a `keydown`
+// listener on `window` calling `onCancel`) and that binding is load-bearing here. A mock without it
+// let "the accounts screen survives while a login is pending" pass against chrome production does
+// not have — the vacuous shape AGENTS.md names (roborev 58070).
 vi.mock("../ModalShell", () => ({
-  ModalShell: ({ children, onCancel }: { children: React.ReactNode; onCancel: () => void }) => (
-    <div data-testid="modal-shell">
-      {children}
-      <button onClick={onCancel}>cancel shell</button>
-    </div>
-  ),
+  ModalShell: ({ children, onCancel }: { children: React.ReactNode; onCancel: () => void }) => {
+    useEffect(() => {
+      const onKey = (e: KeyboardEvent) => {
+        if (e.key === "Escape") onCancel();
+      };
+      window.addEventListener("keydown", onKey);
+      return () => window.removeEventListener("keydown", onKey);
+    }, [onCancel]);
+    return (
+      <div data-testid="modal-shell">
+        {children}
+        <button onClick={onCancel}>cancel shell</button>
+      </div>
+    );
+  },
 }));
 
+// `onLogin` is a PROMISE seam: the real AccountsScreen awaits it and re-reads identities once it
+// settles, so this double captures what the host handed back rather than discarding it. Typed as
+// the real prop (`void | Promise<void>`) so a host that regressed to a bare `void` return still
+// type-checks here and is caught by the assertions instead of by the compiler only.
+let capturedLogin: void | Promise<void>;
+const loginPromise = () => capturedLogin as Promise<void> | undefined;
+
 vi.mock("../AccountsScreen", () => ({
-  AccountsScreen: ({ onLogin }: { onLogin: (a: { id: string }) => void }) => (
+  AccountsScreen: ({ onLogin }: { onLogin: (a: { id: string }) => void | Promise<void> }) => (
     <div data-testid="accounts-screen">
-      <button onClick={() => onLogin({ id: "acct-1" })}>login acct-1</button>
+      <button
+        onClick={() => {
+          capturedLogin = onLogin({ id: "acct-1" });
+        }}
+      >
+        login acct-1
+      </button>
     </div>
   ),
 }));
@@ -96,6 +122,7 @@ import { useUiStore } from "../../stores/uiStore";
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  capturedLogin = undefined;
   act(() => useUiStore.getState().clearSettingsRequest());
 });
 
@@ -355,20 +382,100 @@ describe("KebabMenu — reused surfaces", () => {
     expect(await screen.findByTestId("settings-dialog")).toBeTruthy();
   });
 
-  it("Manage accounts hands off to AccountsScreen, then onLogin to AccountLoginModal", () => {
+  it("Manage accounts hands off to AccountsScreen, then onLogin to AccountLoginModal", async () => {
     render(<KebabMenu />);
     fireEvent.click(trigger());
     fireEvent.click(screen.getByText("manage accounts"));
     expect(screen.queryByTestId("settings-dialog")).toBeNull();
     expect(screen.getByTestId("accounts-screen")).toBeTruthy();
     fireEvent.click(screen.getByText("login acct-1"));
-    expect(screen.queryByTestId("accounts-screen")).toBeNull();
+    // The accounts screen STAYS MOUNTED under the login modal. It used to be closed here, which
+    // silently disabled the whole point of the promise below: the component that awaits the login
+    // was unmounted before the login even spawned, so its post-login identity re-read could never
+    // run outside a test double (roborev 58028).
+    expect(screen.getByTestId("accounts-screen")).toBeTruthy();
     const login = screen.getByTestId("login-modal");
     expect(login.getAttribute("data-account")).toBe("acct-1");
     // Closing the login modal invalidates the account-selection cache (badge refresh).
     fireEvent.click(screen.getByText("close login"));
     expect(screen.queryByTestId("login-modal")).toBeNull();
     expect(invalidateAccountStateMock).toHaveBeenCalledOnce();
+    // …and the promise handed to AccountsScreen settles, which is the signal that drives the
+    // post-login re-read. An un-awaitable `void` return leaves this pending forever.
+    await expect(loginPromise()).resolves.toBeUndefined();
+  });
+
+  it("Escape while a login is pending does NOT tear the accounts screen out from under it", async () => {
+    // ModalShell binds Escape at the WINDOW and is not scoped to the topmost layer, so with the
+    // accounts screen deliberately left mounted below the login modal, the natural "dismiss this"
+    // reflex at the verdict banner would unmount the component that is awaiting onLogin — killing
+    // the post-login re-read silently and firing invalidateAccountState early. xterm swallows
+    // Escape only while the terminal has focus, and by the verdict stage it is gone.
+    render(<KebabMenu />);
+    fireEvent.click(trigger());
+    fireEvent.click(screen.getByText("manage accounts"));
+    fireEvent.click(screen.getByText("login acct-1"));
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.getByTestId("accounts-screen")).toBeTruthy();
+    expect(screen.getByTestId("login-modal")).toBeTruthy();
+    expect(invalidateAccountStateMock).not.toHaveBeenCalled();
+
+    // Once the login is done, Escape dismisses normally again — the suppression is scoped, not a
+    // permanent trap.
+    fireEvent.click(screen.getByText("close login"));
+    await expect(loginPromise()).resolves.toBeUndefined();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByTestId("accounts-screen")).toBeNull();
+  });
+
+  it("a SECOND onLogin settles the first promise instead of stranding it", async () => {
+    // The background screen stays tab-reachable beneath the login modal's backdrop, so a second
+    // "Log in" press is reachable. Overwriting the pending entry would drop the first resolver on
+    // the floor: AccountsScreen's handleAdd parks past its `await` with busy === true forever, so
+    // "Add account" is permanently disabled and its `finally` never runs.
+    render(<KebabMenu />);
+    fireEvent.click(trigger());
+    fireEvent.click(screen.getByText("manage accounts"));
+    fireEvent.click(screen.getByText("login acct-1"));
+    const first = loginPromise();
+
+    fireEvent.click(screen.getByText("login acct-1"));
+    const second = loginPromise();
+    expect(second).not.toBe(first);
+
+    // The abandoned promise is settled, not stranded.
+    await expect(first).resolves.toBeUndefined();
+    // The live one still waits for its own window to close.
+    let secondSettled = false;
+    void second?.then(() => {
+      secondSettled = true;
+    });
+    await Promise.resolve();
+    expect(secondSettled).toBe(false);
+    fireEvent.click(screen.getByText("close login"));
+    await expect(second).resolves.toBeUndefined();
+  });
+
+  it("resolves onLogin ONLY when the login window closes, not when it opens", async () => {
+    // If it resolved early, AccountsScreen would re-read identities before the user had signed in
+    // and render the pre-login truth — which is the "nickname shown as an identity" defect.
+    render(<KebabMenu />);
+    fireEvent.click(trigger());
+    fireEvent.click(screen.getByText("manage accounts"));
+    fireEvent.click(screen.getByText("login acct-1"));
+
+    let settled = false;
+    void loginPromise()?.then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    fireEvent.click(screen.getByText("close login"));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(settled).toBe(true);
   });
 });
 

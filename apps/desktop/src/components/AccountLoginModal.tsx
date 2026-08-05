@@ -92,15 +92,32 @@ export function AccountLoginModal({ account, onClose }: { account: Account; onCl
               lineHeight: 1.4,
             }}
           >
+            {/* NOT "system-wide" / "everywhere" (knightwatch probe 3). That claim is FALSE for the
+                exact case this feature exists for: a legacy default carries `configDir =
+                $HOME/.claude`, so signing in here writes `$HOME/.claude/.claude.json` while a plain
+                terminal `claude` reads `$HOME/.claude.json` and is untouched. A warning that
+                overstates the blast radius is an instruction the user will follow — it talks them
+                out of a sign-in that would not have done what it threatened. Name the directory and
+                let it be checkable, rather than asserting a scope we cannot verify from here. */}
             {account.isDefault
-              ? "This is your system-wide Claude login (~/.claude). Signing in as someone else here changes the account Claude Code uses everywhere, not just in Sparkle."
+              ? `Signing in here changes the Claude login Sparkle uses for this account, stored in ${account.configDir || "~/.claude.json"}. If that is also the config your terminal uses, it changes there too.`
               : "Credentials are stored in this account’s own config folder, separate from your other accounts."}
           </p>
           <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
             {/* Closes on a CONFIRMED sign-in rather than on the PTY exiting. The old wiring closed
                 on exit, which dismissed the modal while the user was still on the OAuth page in
                 their browser — and reported nothing when the login had in fact failed. */}
-            <ClaudeSignIn configDir={account.configDir} onSignedIn={onClose} />
+            <ClaudeSignIn
+              // `key` is load-bearing, not decoration (knightwatch probe 2). A second reachable
+              // "Log in" swaps the account BENEATH this modal without unmounting it, and
+              // ClaudeSignIn's `done` / `confirming` / `unconfirmed` are component state: without a
+              // key they survive the swap, so the new account inherits the PREVIOUS account's
+              // verdict — rendering "signed in" for one that was never signed into, and never
+              // starting its PTY. Keying on the config dir remounts it, which is exactly the reset.
+              key={account.configDir}
+              configDir={account.configDir}
+              onSignedIn={onClose}
+            />
           </div>
         </div>
       </div>

@@ -23,6 +23,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
 
+use crate::identity_log::{self, IdentityLog};
+
 /// Process-wide lock serializing the read-modify-write of `accounts.json`. Held in
 /// Tauri managed state (registered in `lib.rs` via `.manage(...)`); every mutating
 /// command acquires it for its whole critical section, so concurrent commands —
@@ -77,6 +79,20 @@ pub struct Account {
     /// (pre-fix) are repaired on read by [`normalize_epoch_seconds`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exhausted_until: Option<i64>,
+    /// The [`identity_key`] that was signed in when [`exhausted_until`] was recorded.
+    ///
+    /// An exhaustion is a fact about an ANTHROPIC ACCOUNT, but it is stored on a REGISTRATION — and
+    /// the identity behind a registration can change under it ("Switch login"). Without this, the
+    /// new login inherits a bench it never earned: `usage_for_account` surfaces the old identity's
+    /// `exhausted_until`, so `pickAccount` skips a perfectly usable account until that epoch passes.
+    /// That is the same account-keyed-state-outliving-its-identity bug as the learned ceiling, on a
+    /// different field (knightwatch, 2026-08-04).
+    ///
+    /// `None` on rows written before this field existed. Those are HONOURED rather than dropped:
+    /// a limit resets within ~5h so they age out on their own, and wrongly routing work INTO an
+    /// exhausted account is the worse of the two errors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exhausted_identity: Option<String>,
 }
 
 /// Any epoch at or above this is a stray MILLISECONDS value that must be scaled back to
@@ -154,6 +170,42 @@ pub struct AccountIdentity {
     pub email: Option<String>,
     pub organization: Option<String>,
     pub account_uuid: Option<String>,
+
+    /// The identity a `claude` launched from the user's own LOGIN SHELL would run as. `Some` ONLY
+    /// on the default account.
+    ///
+    /// Resolved through [`shell_identity_at`], i.e. `crate::claude::effective_spawn_config_dir()` —
+    /// the `CLAUDE_CONFIG_DIR` that shell really exports, falling back to `$HOME/.claude.json` when
+    /// it exports none (see [`identity_json_path`]). It is NOT hardcoded to `$HOME`: for a user who
+    /// exports one in their dotfiles, the terminal reads that dir's config, which is the same file
+    /// the default account reads, and reporting `$HOME`'s login as "your terminal" would announce a
+    /// fork that does not exist.
+    ///
+    /// This exists because the two can legitimately diverge and nothing used to say so. A default
+    /// account whose `config_dir` is `$HOME/.claude`, on a machine whose shell exports nothing,
+    /// makes Sparkle export `CLAUDE_CONFIG_DIR=$HOME/.claude` and read
+    /// `$HOME/.claude/.claude.json` while the terminal reads `$HOME/.claude.json`. On the machine
+    /// that motivated this both files held valid logins to DIFFERENT Anthropic accounts, and the UI
+    /// showed only one of them — so "my account is wrong" was really "Sparkle and my terminal are
+    /// two different people".
+    ///
+    /// `shell_account_uuid != account_uuid` is the FORK condition the UI surfaces. We surface it and
+    /// let the human choose; we never silently resolve it, which is exactly what
+    /// [`default_config_dir_needs_normalizing`] refuses to do and for the same reason.
+    ///
+    /// `None` for a named account: its dir is its own truth and the shell's login says nothing
+    /// about it.
+    pub shell_email: Option<String>,
+    pub shell_account_uuid: Option<String>,
+    /// True when this account's config dir is known — from the identity-epoch ledger
+    /// ([`crate::identity_log`]) — to have hosted a DIFFERENT identity key inside the ceiling learn
+    /// window. Its learned history is therefore not attributable to the current login, which is what
+    /// resets the ceiling (see [`AccountCeiling::reset_by_identity_change`]).
+    ///
+    /// The IDENTITY KEY, not the `accountUuid`: see [`identity_key`]. A login predating that field
+    /// is tracked by email rather than being skipped, and one merely *gaining* a uuid it did not
+    /// report before is a ladder climb, not a takeover — so this stays `false` through it.
+    pub identity_changed: bool,
 }
 
 /// The `oauthAccount` fields we read out of an account's `.claude.json`. A present value means
@@ -283,6 +335,7 @@ fn add_account_at(
         is_default: false,
         created_at: now,
         exhausted_until: None,
+        exhausted_identity: None,
     };
     accounts.push(acct.clone());
     write_accounts_at(accounts_path, &accounts)?;
@@ -346,6 +399,7 @@ fn import_default_at(
         is_default: true,
         created_at: now,
         exhausted_until: None,
+        exhausted_identity: None,
     };
     accounts.push(acct.clone());
     write_accounts_at(accounts_path, &accounts)?;
@@ -407,13 +461,21 @@ fn normalize_default_config_dir_at(
 }
 
 /// Persist a per-account exhausted-until epoch (the moment the rate limit resets).
-fn mark_exhausted_at(accounts_path: &Path, id: &str, until_epoch: i64) -> Result<(), String> {
+fn mark_exhausted_at(
+    accounts_path: &Path,
+    id: &str,
+    until_epoch: i64,
+    home: Option<&Path>,
+) -> Result<(), String> {
     let mut accounts = read_accounts_at(accounts_path)?;
     let acct = accounts
         .iter_mut()
         .find(|a| a.id == id)
         .ok_or_else(|| format!("account not found: {id}"))?;
     acct.exhausted_until = Some(until_epoch);
+    // Stamp WHOSE exhaustion this is, so a later "Switch login" cannot hand the bench to a
+    // different Anthropic account — see `Account::exhausted_identity`.
+    acct.exhausted_identity = identity_key_for(acct, home);
     write_accounts_at(accounts_path, &accounts)
 }
 
@@ -1224,15 +1286,29 @@ fn latest_limit_event(
 /// rate-limit events, while its sessions pile up under `$HOME/.claude/projects`.
 fn projects_root_for_account(acct: &Account) -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    crate::claude::claude_projects_root(Some(Path::new(&acct.config_dir)), home.as_deref())
+    projects_root_for_account_at(acct, home.as_deref())
+}
+
+/// [`projects_root_for_account`] with `$HOME` injected, so callers that already hold a home (and
+/// unit tests driving a fake one) resolve the same root without touching process env.
+fn projects_root_for_account_at(acct: &Account, home: Option<&Path>) -> Option<PathBuf> {
+    crate::claude::claude_projects_root(Some(Path::new(&acct.config_dir)), home)
 }
 
 /// The newest rate-limit event for one account within the lookback window, or `None` if it hasn't
 /// hit a limit recently.
-fn limit_event_for_account(acct: &Account, now: i64) -> Option<AccountLimitEvent> {
+fn limit_event_for_account(acct: &Account, now: i64, log: &IdentityLog) -> Option<AccountLimitEvent> {
     let root = projects_root_for_account(acct)?;
+    // Floor the scan at the moment the CURRENT identity took over this directory. Transcripts have
+    // no account marker, so a rate-limit event written by the previous login sits in the same tree
+    // and would otherwise be re-read and re-bench the new one — the frontend polls this and calls
+    // `markExhausted` on what it finds. Same boundary the learned ceiling already respects.
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let floor = identity_key_for(acct, home.as_deref())
+        .and_then(|k| identity_log::takeover_at(log, &acct.config_dir, &k))
+        .map_or(now - LIMIT_EVENT_LOOKBACK, |t| t.max(now - LIMIT_EVENT_LOOKBACK));
     let mut best = None;
-    latest_limit_event(&root, now - LIMIT_EVENT_LOOKBACK, &mut best);
+    latest_limit_event(&root, floor, &mut best);
     best.map(|(at_epoch, text)| AccountLimitEvent { id: acct.id.clone(), at_epoch, text })
 }
 
@@ -1273,6 +1349,28 @@ pub struct AccountCeiling {
     /// Median of `samples`, or `None` with fewer than [`CEILING_MIN_SAMPLES`] — the frontend must
     /// treat `None` as "not enough evidence to warn", never as zero.
     pub ceiling: Option<u64>,
+
+    /// The `accountUuid` the samples were measured against, when the login records one.
+    ///
+    /// **This is the WIRE value only, and `None` here does NOT mean `ceiling` is `None`.** A login
+    /// predating the `accountUuid` field reports no uuid while being fully signed in and fully
+    /// attributable by email, and it keeps its ceiling — see [`identity_key`], which is what the
+    /// history is actually filed under, and the test
+    /// `a_login_predating_account_uuid_still_learns_its_ceiling`.
+    ///
+    /// A consumer must therefore NOT read `accountUuid == null` as "no ceiling here". What is
+    /// unconditional is the other direction: a directory with NO resolvable identity at all (no
+    /// uuid *and* no email) yields `ceiling: None`, because a number learned from a directory we
+    /// cannot attribute to anybody is not a fact about anybody.
+    pub account_uuid: Option<String>,
+    /// True when this directory's history is not attributable to `account_uuid`, so samples were
+    /// discarded. Two causes, both "somebody else's usage is in here": the identity behind the dir
+    /// CHANGED inside the learn window (the ledger's takeover cut), or a terminal `claude` running
+    /// as a different identity is writing into the SAME transcript tree concurrently (see
+    /// [`shares_transcripts_with_a_different_shell_identity`]). `ceiling` may be `None` purely for
+    /// this reason, and that is the intended outcome — see the note below on why an unknown ceiling
+    /// is the safe answer.
+    pub reset_by_identity_change: bool,
 }
 
 /// Every rate-limit event time under `projects_root` at or after `since_epoch` (not just the
@@ -1374,14 +1472,75 @@ fn median(sorted: &[u64]) -> u64 {
 }
 
 /// Learn one account's ceiling by pairing each past limit episode with the consumption that
-/// preceded it. Pure given the filesystem; the caching wrapper is [`ceilings_cached`].
-fn ceiling_for_account(acct: &Account, now: i64) -> AccountCeiling {
+/// preceded it — **for the identity currently behind the config dir, and nobody else**.
+///
+/// Ceilings are measured from transcripts, and transcripts carry no account marker (verified:
+/// sampled records expose only `sessionId`/`type`/`leafUuid`/`mode`), so history CANNOT be
+/// re-attributed after a different Anthropic account signs into the same directory. The
+/// identity-epoch ledger ([`crate::identity_log`]) records *when* each uuid was seen behind each
+/// dir, and this is what that record is for: if the current uuid took over at `T` and `T` falls
+/// inside the learn window, everything older belongs to someone else and is dropped.
+///
+/// Two consequences, both deliberate:
+///
+/// * Episodes are kept only when their WHOLE 5h consumption window post-dates the takeover
+///   (`ep - WINDOW_5H >= T`), not merely the episode itself. An episode straddling the boundary
+///   would be sampled against truncated records, which under-states consumption, which lowers the
+///   median, which makes the near-cap banner fire EARLY. That is the unsafe direction.
+/// * Falling under [`CEILING_MIN_SAMPLES`] yields `ceiling: None`. A pre-boundary ceiling is NEVER
+///   carried forward. `switchRecommendation` treats an unknown ceiling as `unknown`, which cannot
+///   raise a `warn` — so the failure mode is silence, not moving the user's work to another account
+///   on a number measured against a different person.
+///
+/// Pure given the filesystem and the ledger; the caching wrapper is [`accounts_ceilings`].
+fn ceiling_for_account(
+    acct: &Account,
+    now: i64,
+    home: Option<&Path>,
+    shell_config_dir: &str,
+    log: &IdentityLog,
+) -> AccountCeiling {
+    let identity = identity_for_account(acct, home);
+    // The WIRE value (what the UI reports) and the FILING key are different questions: an older
+    // login has no uuid to report but is still perfectly attributable by email. See `identity_key`.
+    let account_uuid = identity.as_ref().and_then(|i| i.account_uuid.clone());
+    let identity_key = identity.as_ref().map(identity_key);
+    // The ledger separates identities that held a directory in SEQUENCE. It cannot separate two
+    // holding it at once, which is what the founder's forked default does — see
+    // `shares_transcripts_with_a_different_shell_identity`. Such a directory is unattributable, and
+    // an unattributable directory yields no ceiling.
+    let shell_commingled = shares_transcripts_with_a_different_shell_identity(
+        acct,
+        identity.as_ref(),
+        home,
+        shell_config_dir,
+    );
+    let window_start = now - CEILING_LEARN_WINDOW;
+    // The moment the CURRENT identity took over this directory, when that is inside the learn
+    // window. `None` when the ledger has never seen a different identity here — which is also the
+    // state on first run, so an upgrade does not blank every learned ceiling.
+    let takeover = identity_key
+        .as_deref()
+        .and_then(|k| identity_log::takeover_at(log, &acct.config_dir, k))
+        .filter(|t| *t > window_start);
+    // Records are collected from the takeover; episodes are kept from a further 5h in, so every
+    // sample's consumption window is fully covered by records this identity actually produced.
+    let record_floor = takeover.unwrap_or(window_start);
+    let episode_floor = takeover.map_or(window_start, |t| t + WINDOW_5H);
+
     let mut samples = Vec::new();
+    let mut reset_by_identity_change = false;
     if let Some(root) = projects_root_for_account(acct) {
-        let since = now - CEILING_LEARN_WINDOW;
+        // Collected over the FULL window, then cut: knowing how many episodes the takeover
+        // discarded is what `reset_by_identity_change` reports.
         let mut times = Vec::new();
-        collect_limit_event_times(&root, since, &mut times);
-        let episodes = limit_episodes(times);
+        collect_limit_event_times(&root, window_start, &mut times);
+        let all_episodes = limit_episodes(times);
+        let episodes: Vec<i64> =
+            all_episodes.iter().copied().filter(|t| *t >= episode_floor).collect();
+        // Only ever true because of the takeover cut: with no takeover `episode_floor` IS the
+        // window start, which `collect_limit_event_times` already filtered on.
+        reset_by_identity_change = takeover.is_some() && episodes.len() < all_episodes.len();
         if !episodes.is_empty() {
             let mut records = Vec::new();
             // Its OWN pass, not a bare walk: this runs from `accounts_ceilings`, which is a
@@ -1389,9 +1548,11 @@ fn ceiling_for_account(acct: &Account, now: i64) -> AccountCeiling {
             // process-wide memo. Registering the pass is what keeps a concurrent scan from evicting
             // this one's working set mid-walk (see `finish_usage_pass` / `live_usage_passes`).
             let pass = UsagePass::start();
+            // From `record_floor`, NOT `since`: usage this identity did not produce must not be
+            // able to reach `consumption_before` at all.
             let touched = collect_usage_records_across(
                 std::slice::from_ref(&root),
-                since,
+                record_floor,
                 &mut records,
                 pass.id(),
             );
@@ -1411,22 +1572,101 @@ fn ceiling_for_account(acct: &Account, now: i64) -> AccountCeiling {
             }
         }
     }
-    let ceiling = if samples.len() >= CEILING_MIN_SAMPLES {
+    if shell_commingled {
+        // Reported through the same flag the takeover cut uses: from the consumer's side both mean
+        // "this directory's history is not attributable to this identity, so there is no number".
+        reset_by_identity_change = true;
+    }
+    // A RESOLVABLE IDENTITY is a hard precondition, not a formality: a ceiling is a claim about a
+    // specific Anthropic account, so a directory we cannot attribute to one yields no ceiling even
+    // when it has plenty of samples. Note this gates on `identity_key`, not on `account_uuid` — an
+    // older login has no uuid to report yet is fully attributable by email, and gating on the uuid
+    // would silently and permanently disable the near-cap banner for it. See `identity_key`.
+    let ceiling = if identity_key.is_some() && !shell_commingled && samples.len() >= CEILING_MIN_SAMPLES
+    {
         let mut s = samples.clone();
         s.sort_unstable();
         Some(median(&s))
     } else {
         None
     };
-    AccountCeiling { id: acct.id.clone(), samples, ceiling }
+    AccountCeiling {
+        id: acct.id.clone(),
+        samples,
+        ceiling,
+        account_uuid,
+        reset_by_identity_change,
+    }
 }
 
-/// Cache for [`accounts_ceilings`]: `(computed_at, value)`.
-type CeilingCache = Option<(i64, Vec<AccountCeiling>)>;
+/// Cache for [`accounts_ceilings`]: `(key, computed_at, value)`.
+///
+/// The KEY is the fix for a real bug: this was `(computed_at, value)`, keyed on **nothing at all**
+/// and served for [`CEILING_CACHE_TTL`] regardless of which accounts existed, whether one had been
+/// added or removed, or whether a fresh `claude login` had changed the identity behind a config dir.
+/// Adding an account showed the previous account set's ceilings for 15 minutes; signing a different
+/// person into a directory kept serving the old person's number — which is precisely the
+/// mis-attribution the identity work exists to stop. Shortening the TTL would not have fixed it,
+/// only narrowed the window.
+type CeilingCache = Option<(String, i64, Vec<AccountCeiling>)>;
 
 fn ceiling_cache() -> &'static std::sync::Mutex<CeilingCache> {
     static CACHE: std::sync::OnceLock<std::sync::Mutex<CeilingCache>> = std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Everything a cached ceiling set is only valid FOR: the app-data root it was computed against,
+/// every account's id / config dir / default-ness / currently-resolved [`identity_key`], AND the
+/// SHELL's config dir plus the identity behind it.
+///
+/// The account half keys on the identity KEY rather than the raw `accountUuid`, so a re-login that
+/// changes only the email — the discriminator for a pre-`accountUuid` login — still invalidates.
+/// Keying on the uuid would serve a stale ceiling for up to the TTL after exactly the swap this
+/// feature exists to detect.
+///
+/// The shell half is not incidental — it is an input to the result. `ceiling_for_account` suppresses
+/// the ceiling when a default account shares one transcript tree with a differently-signed-in
+/// terminal, so `claude auth login` in that terminal flips the answer while nothing about any
+/// account record changes. Leaving it out of the key would serve the pre-login number for the full
+/// [`CEILING_CACHE_TTL`] — the exact staleness this key was introduced to end, merely relocated to
+/// the one directory the key did not cover.
+///
+/// `\0` separated because it is the one byte a path cannot contain, so no two distinct inputs can
+/// collide by concatenation.
+fn ceiling_cache_key(
+    app_data: &Path,
+    accounts: &[Account],
+    uuids: &[Option<String>],
+    shell_config_dir: &str,
+    shell_key: Option<&str>,
+) -> String {
+    let mut key = app_data.to_string_lossy().into_owned();
+    key.push('\0');
+    key.push_str(shell_config_dir);
+    key.push('\0');
+    key.push_str(shell_key.unwrap_or("-"));
+    for (a, uuid) in accounts.iter().zip(uuids) {
+        key.push('\0');
+        key.push_str(&a.id);
+        key.push('\0');
+        key.push_str(&a.config_dir);
+        key.push('\0');
+        key.push(if a.is_default { 'd' } else { 'n' });
+        key.push('\0');
+        key.push_str(uuid.as_deref().unwrap_or("-"));
+    }
+    key
+}
+
+/// A cached ceiling set, but only when it was computed for exactly this `key` and is still inside
+/// [`CEILING_CACHE_TTL`]. Split out from the command so both halves of the invalidation — the key
+/// and the TTL — are testable without a Tauri runtime.
+fn ceiling_cache_lookup(cache: &CeilingCache, key: &str, now: i64) -> Option<Vec<AccountCeiling>> {
+    let (cached_key, at, value) = cache.as_ref()?;
+    if cached_key != key || now - at >= CEILING_CACHE_TTL {
+        return None;
+    }
+    Some(value.clone())
 }
 
 /// Compute the usage snapshot for one account at `now`. Resolves the transcript
@@ -1436,6 +1676,27 @@ fn ceiling_cache() -> &'static std::sync::Mutex<CeilingCache> {
 /// Usage for EVERY account in one pass: one generation across all of them, eviction once at the
 /// end. Extracted from the command body so the invariant is testable — inlined there, reverting to
 /// a generation per account left every test green while restoring the memo thrash.
+/// The still-in-effect exhaustion for this account, or `None`.
+///
+/// An exhaustion is a fact about an ANTHROPIC ACCOUNT but is stored on a REGISTRATION, and the
+/// identity behind a registration can change under it ("Switch login"). Surfacing it blindly hands
+/// the new login a bench it never earned — `pickAccount` then skips a perfectly usable account
+/// until the epoch passes. Same class as the learned ceiling carrying another person's history,
+/// on a different field.
+///
+/// So it is surfaced only when it is still in the future AND was recorded by the identity currently
+/// behind the directory. A row with no recorded identity predates the field and is HONOURED: the
+/// limit resets within ~5h so it ages out by itself, and routing work INTO an exhausted account is
+/// the worse of the two errors.
+fn effective_exhaustion(acct: &Account, current_identity: Option<&str>, now: i64) -> Option<i64> {
+    let until = acct.exhausted_until.filter(|&e| e > now)?;
+    match (acct.exhausted_identity.as_deref(), current_identity) {
+        (None, _) => Some(until),                       // legacy row: honour, it expires on its own
+        (Some(owner), Some(cur)) if owner == cur => Some(until),
+        _ => None,                                      // a different login earned this, not us
+    }
+}
+
 fn usage_for_accounts(accounts: &[Account], now: i64) -> Vec<AccountUsage> {
     let pass = UsagePass::start();
     let mut touched = 0usize;
@@ -1482,7 +1743,12 @@ fn usage_for_account(acct: &Account, now: i64, generation: u64) -> (AccountUsage
             id: acct.id.clone(),
             tokens_5h,
             tokens_7d,
-            exhausted_until: acct.exhausted_until.filter(|&e| e > now),
+            exhausted_until: effective_exhaustion(
+                acct,
+                identity_key_for(acct, std::env::var_os("HOME").map(PathBuf::from).as_deref())
+                    .as_deref(),
+                now,
+            ),
         },
         touched,
     )
@@ -1551,6 +1817,209 @@ fn read_oauth_identity_at(
     })
 }
 
+/// The live identity behind ONE account's own config dir.
+///
+/// The `<home>` fallback is passed only for the DEFAULT account. A named account with an empty
+/// `config_dir` must NOT fall back to the home identity — that would label the home user's email as
+/// this account's, the exact trust bug this plumbing exists to prevent; it resolves to `None`
+/// ("not signed in") instead.
+fn identity_for_account(acct: &Account, home: Option<&Path>) -> Option<OauthIdentity> {
+    let home_for = if acct.is_default { home } else { None };
+    read_oauth_identity_at(Some(Path::new(&acct.config_dir)), home_for)
+}
+
+
+/// The key an account's learned history is filed under: the Anthropic `accountUuid` when the login
+/// records one, otherwise the verified email.
+///
+/// Keying on the uuid ALONE is wrong, and costs a real capability rather than merely being untidy.
+/// A login predating the `accountUuid` field reports `None` (documented on
+/// [`OauthIdentity::account_uuid`]) while being fully signed in and fully attributable. Gating on
+/// the uuid would return `ceiling: None` for such an account *forever*; `switchRecommendation`
+/// reads that as `unknown`, so the near-cap banner could never fire for it again — and nothing
+/// would distinguish that from the intended "this directory is unattributable" case. A silent,
+/// permanent capability loss with no visible cause is worse than the imprecision it avoids.
+///
+/// The email is a weaker discriminator than the uuid — two config dirs can hold logins to the same
+/// account under one email, which is exactly why `accountUuid` was added — so it is only ever the
+/// fallback, never preferred. It is prefixed so a ledger row can never be mistaken for a uuid.
+///
+/// `None` only when NEITHER resolves (a dir never logged into). That single case is what the
+/// contract means by unattributable.
+fn identity_key(id: &OauthIdentity) -> String {
+    id.account_uuid.clone().unwrap_or_else(|| email_key(id))
+}
+
+/// The email-form key for an identity — what [`identity_key`] returns when there is no uuid, and
+/// always computable regardless.
+///
+/// The ledger needs BOTH forms, because the ladder is not stable over time for one account: a login
+/// predating `accountUuid` is filed under its email, and when the field later appears its key
+/// changes with no fork having occurred. Passing the email form alongside lets the ledger recognise
+/// that climb and continue the existing epoch instead of recording a false takeover — see
+/// `identity_log::apply_observation`.
+fn email_key(id: &OauthIdentity) -> String {
+    format!("email:{}", id.email)
+}
+
+/// [`identity_key`] for an account, or `None` when it has no resolvable identity at all.
+fn identity_key_for(acct: &Account, home: Option<&Path>) -> Option<String> {
+    identity_for_account(acct, home).as_ref().map(identity_key)
+}
+
+/// [`identity_key`] for the identity behind the user's LOGIN SHELL, or `None` when it has none.
+///
+/// Extracted as its own seam purely so it can be TESTED. It is the one derivation that is unique to
+/// the cache-key path, and inlined in `accounts_ceilings` — a `#[tauri::command]` body — nothing
+/// could reach it: `ceiling_cache_key` takes the shell identity as an opaque `Option<&str>`, so its
+/// shell cases pass string literals and stay green whether the caller derives the identity KEY or
+/// the raw `accountUuid`. That is a vacuous test of exactly the regression this ladder prevents
+/// (AGENTS.md: an assertion that would pass against the pre-change code proves nothing).
+///
+/// The failure it silently permitted: a terminal `claude auth login` into an account predating
+/// `accountUuid` leaves the shell half of the key unchanged, the cache hits, and the pre-login —
+/// possibly another person's — ceiling is served for the full [`CEILING_CACHE_TTL`].
+fn shell_identity_key_at(shell_config_dir: &str, home: Option<&Path>) -> Option<String> {
+    shell_identity_at(shell_config_dir, home).as_ref().map(identity_key)
+}
+
+/// Do two resolved identities denote DIFFERENT Anthropic accounts?
+///
+/// The uuid decides when BOTH sides record one. When either does not, a bare `!=` on the uuids
+/// would read `None != Some(x)` as a difference and invent one — announcing a fork between what may
+/// well be the same account. So fall back to the email, which `read_oauth_identity_at` guarantees
+/// is present and non-empty on every resolved identity. Never claims a difference it cannot show.
+fn identities_differ(a: &OauthIdentity, b: &OauthIdentity) -> bool {
+    match (a.account_uuid.as_deref(), b.account_uuid.as_deref()) {
+        (Some(x), Some(y)) => x != y,
+        _ => a.email != b.email,
+    }
+}
+
+/// The identity a `claude` launched from the user's own LOGIN SHELL would run as.
+///
+/// `shell_config_dir` is `crate::claude::effective_spawn_config_dir()` — the `CLAUDE_CONFIG_DIR`
+/// that shell actually exports, "" for none. Reading `$HOME/.claude.json` unconditionally would be
+/// wrong for the user who exports one in `.zprofile`/`.zlogin`: their terminal reads
+/// `<their dir>/.claude.json`, which is the SAME file the default account reads (that is why
+/// `accounts_ensure_default` stores `effective_spawn_config_dir()` as the default's `config_dir`),
+/// so there is no fork — but `$HOME/.claude.json` would hold a stale or unrelated login and we
+/// would report one. Announcing a fork that does not exist is precisely the "a wrong identity is
+/// worse than none" failure this surface was built to prevent.
+fn shell_identity_at(shell_config_dir: &str, home: Option<&Path>) -> Option<OauthIdentity> {
+    read_oauth_identity_at(Some(Path::new(shell_config_dir)), home)
+}
+
+/// Whether this account's transcript tree is ALSO written by a terminal `claude` running as a
+/// DIFFERENT identity — the founder's own configuration, and a case the temporal ledger cannot fix.
+///
+/// With `config_dir = $HOME/.claude` the default account's projects root is
+/// `$HOME/.claude/projects`, which is byte-identical to where a plain terminal `claude` (no
+/// `CLAUDE_CONFIG_DIR`) writes. Two identities are then appending to ONE tree *concurrently*. That
+/// is not a takeover: no uuid ever changes behind the config file, so `takeover_at` stays `None`,
+/// nothing is cut, and the learned median silently mixes both people's consumption.
+///
+/// The ledger records WHEN an identity held a directory; it has nothing to say about two holding it
+/// at once. So the only honest answer is that this directory is unattributable, and by the module's
+/// own rule an unattributable directory yields no ceiling.
+///
+/// Narrow by construction: it requires the default account, two RESOLVABLE and DIFFERENT
+/// identities, and the two roots to be the same path. A normalized default (`config_dir = ""`) and
+/// an exported `CLAUDE_CONFIG_DIR` both read the same config file as the shell, so both resolve to
+/// the same identity and are excluded.
+///
+/// "Different" is [`identities_differ`], not a bare uuid `!=`: a login predating `accountUuid`
+/// would otherwise compare `None != Some(x)` and be declared a different account, blanking the
+/// ceiling of an account that is not commingled at all.
+fn shares_transcripts_with_a_different_shell_identity(
+    acct: &Account,
+    identity: Option<&OauthIdentity>,
+    home: Option<&Path>,
+    shell_config_dir: &str,
+) -> bool {
+    if !acct.is_default {
+        return false;
+    }
+    let (Some(mine), Some(shell)) = (identity, shell_identity_at(shell_config_dir, home)) else {
+        return false;
+    };
+    if !identities_differ(mine, &shell) {
+        return false;
+    }
+    let shell_root =
+        crate::claude::claude_projects_root(Some(Path::new(shell_config_dir)), home);
+    shell_root.is_some() && projects_root_for_account_at(acct, home) == shell_root
+}
+
+/// Pure core of [`accounts_identities`].
+///
+/// Resolves every account's live identity, folds the observations into the identity-epoch ledger at
+/// `log_path`, and builds the wire rows — including the SHELL identity, read once via
+/// [`shell_identity_at`] (`shell_config_dir` when the login shell exports one, `$HOME/.claude.json`
+/// otherwise) and attached only to the default account.
+///
+/// Takes the home, the shell's config dir and the ledger path rather than reading `$HOME` or
+/// running a login shell itself, so the founder's exact forked state is reproducible in a unit test
+/// without mutating process env.
+fn identities_at(
+    accounts: &[Account],
+    home: Option<&Path>,
+    shell_config_dir: &str,
+    log_path: &Path,
+    now: i64,
+) -> Vec<AccountIdentity> {
+    let resolved: Vec<Option<OauthIdentity>> =
+        accounts.iter().map(|a| identity_for_account(a, home)).collect();
+    let observations: Vec<(String, Option<(String, String)>)> = accounts
+        .iter()
+        .zip(&resolved)
+        .map(|(a, id)| {
+            (a.config_dir.clone(), id.as_ref().map(|i| (identity_key(i), email_key(i))))
+        })
+        .collect();
+    // Recording is best-effort by construction (see `record_observations`): a failed ledger write
+    // must never keep the user from seeing who they are signed in as.
+    let log = identity_log::record_observations(log_path, &observations, now);
+    // ONE read for every account: the shell config is a single file, and it is the same file
+    // whichever account we are describing.
+    let shell = shell_identity_at(shell_config_dir, home);
+    let since = now - CEILING_LEARN_WINDOW;
+    accounts
+        .iter()
+        .zip(resolved)
+        .map(|(a, id)| {
+            let key = id.as_ref().map(identity_key);
+            let (email, organization, account_uuid) = match id {
+                Some(i) => (Some(i.email), i.organization, i.account_uuid),
+                None => (None, None, None),
+            };
+            // Keyed on the identity KEY, matching what was just written to the ledger — an older
+            // login has no uuid but still gets a real epoch, so it still reports a takeover.
+            let identity_changed = key
+                .as_deref()
+                .and_then(|k| identity_log::takeover_at(&log, &a.config_dir, k))
+                .is_some_and(|t| t > since);
+            let (shell_email, shell_account_uuid) = if a.is_default {
+                (
+                    shell.as_ref().map(|s| s.email.clone()),
+                    shell.as_ref().and_then(|s| s.account_uuid.clone()),
+                )
+            } else {
+                (None, None)
+            };
+            AccountIdentity {
+                id: a.id.clone(),
+                email,
+                organization,
+                account_uuid,
+                shell_email,
+                shell_account_uuid,
+                identity_changed,
+            }
+        })
+        .collect()
+}
+
 // ---- Tauri commands (thin wrappers) -------------------------------------------
 
 /// All registered accounts (empty vec on a clean install).
@@ -1609,7 +2078,28 @@ pub fn accounts_remove(
 ) -> Result<(), String> {
     let _guard = lock.guard();
     let app_data = crate::worktree::app_data_dir_pub(&app)?;
-    remove_account_at(&accounts_json_path(&app_data), &id)
+    // Capture the whole record BEFORE the row is gone — afterwards there is nothing to look it up
+    // by, and `is_default` decides whether the prune below may run at all.
+    let removed = read_accounts_at(&accounts_json_path(&app_data))
+        .ok()
+        .and_then(|v| v.into_iter().find(|a| a.id == id));
+    remove_account_at(&accounts_json_path(&app_data), &id)?;
+    // Drop this directory's identity history too, so a removed account's absolute path and every
+    // email/uuid that ever held it do not outlive it with nothing reading them (knightwatch probe 3).
+    //
+    // ONLY when the directory is actually deleted. `dir_to_remove_on_remove` deliberately returns
+    // `None` for the default, so the user's real `~/.claude` SURVIVES a "remove" and is re-imported
+    // on the next launch by `accounts_ensure_default`. Pruning there would delete the takeover
+    // boundary for a live directory — and that boundary is precisely what stops a ceiling being
+    // learned across an identity change, so the damage would outlast the removal on a directory
+    // still in daily use. Retention only justifies dropping history for a tree that is going away.
+    if let Some(acct) = removed.filter(|a| !a.is_default) {
+        identity_log::forget_config_dir_at(
+            &identity_log::identity_log_path(&app_data),
+            &acct.config_dir,
+        );
+    }
+    Ok(())
 }
 
 /// Idempotently import the user's existing default config dir as an account.
@@ -1671,7 +2161,8 @@ pub fn accounts_mark_exhausted(
 ) -> Result<(), String> {
     let _guard = lock.guard();
     let app_data = crate::worktree::app_data_dir_pub(&app)?;
-    mark_exhausted_at(&accounts_json_path(&app_data), &id, until_epoch)
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    mark_exhausted_at(&accounts_json_path(&app_data), &id, until_epoch, home.as_deref())
 }
 
 /// Per-account token tallies (5h / 7d) plus any in-effect exhausted-until epoch.
@@ -1766,6 +2257,11 @@ pub async fn accounts_spend(app: AppHandle) -> Result<SpendSummary, String> {
 /// trustworthy account label the badge and Accounts screen surface, so the user can see
 /// which account a session actually runs under — not just the nickname they typed.
 ///
+/// Also reports, on the DEFAULT account only, the identity a plain terminal `claude` would use
+/// (`shell_email` / `shell_account_uuid`), so a fork between Sparkle and the user's shell is
+/// visible instead of silent — see [`AccountIdentity::shell_email`]. And it is the hook that keeps
+/// the identity-epoch ledger current; see [`identities_at`].
+///
 /// `async` + `spawn_blocking`: this opens `accounts.json` PLUS every account's own `.claude.json`,
 /// so it is the heaviest read here — it must never run inline on the Tauri event-loop thread.
 #[tauri::command]
@@ -1774,24 +2270,17 @@ pub async fn accounts_identities(app: AppHandle) -> Result<Vec<AccountIdentity>,
     tauri::async_runtime::spawn_blocking(move || -> Result<Vec<AccountIdentity>, String> {
         let accounts = read_accounts_at(&accounts_json_path(&app_data))?;
         let home = std::env::var_os("HOME").map(PathBuf::from);
-        Ok(accounts
-            .iter()
-            .map(|a| {
-                // The `<home>/.claude` fallback is only correct for the DEFAULT account (whose
-                // config_dir IS ~/.claude, sometimes stored empty). A NAMED account with an empty
-                // config_dir must NOT fall back to the home identity — that would mislabel the home
-                // user's email as this account's, the exact trust bug this change fixes. So pass home
-                // only for the default; a named account with no usable dir resolves to None ("not
-                // signed in") instead.
-                let home_for = if a.is_default { home.as_deref() } else { None };
-                let identity = read_oauth_identity_at(Some(Path::new(&a.config_dir)), home_for);
-                let (email, organization, account_uuid) = match identity {
-                    Some(i) => (Some(i.email), i.organization, i.account_uuid),
-                    None => (None, None, None),
-                };
-                AccountIdentity { id: a.id.clone(), email, organization, account_uuid }
-            })
-            .collect())
+        // Through the login shell's REAL export, not a hardcoded `$HOME` — a user who exports
+        // `CLAUDE_CONFIG_DIR` in their dotfiles reads that dir's config, and reporting `$HOME`'s
+        // login as "your terminal" would invent a fork. Cached for the process after the first call.
+        let shell_config_dir = crate::claude::effective_spawn_config_dir();
+        Ok(identities_at(
+            &accounts,
+            home.as_deref(),
+            &shell_config_dir,
+            &identity_log::identity_log_path(&app_data),
+            now_secs(),
+        ))
     })
     .await
     .map_err(|e| format!("accounts_identities task failed: {e}"))?
@@ -1812,9 +2301,12 @@ pub async fn accounts_limit_events(app: AppHandle) -> Result<Vec<AccountLimitEve
     tauri::async_runtime::spawn_blocking(move || -> Result<Vec<AccountLimitEvent>, String> {
         let accounts = read_accounts_at(&accounts_json_path(&app_data))?;
         let now = now_secs();
+        // The ledger, so a rate-limit event written by a PREVIOUS login in the same config dir is
+        // not re-read and used to bench the current one.
+        let log = identity_log::read_log_at(&identity_log::identity_log_path(&app_data));
         Ok(accounts
             .iter()
-            .filter_map(|a| limit_event_for_account(a, now))
+            .filter_map(|a| limit_event_for_account(a, now, &log))
             .collect())
     })
     .await
@@ -1822,7 +2314,11 @@ pub async fn accounts_limit_events(app: AppHandle) -> Result<Vec<AccountLimitEve
 }
 
 /// Per-account learned rate-limit ceilings (see [`AccountCeiling`]). Cached for
-/// [`CEILING_CACHE_TTL`] — learning walks 30 days of transcripts, far too expensive per poll.
+/// [`CEILING_CACHE_TTL`] — learning walks 30 days of transcripts, far too expensive per poll —
+/// but keyed on the account set, each account's resolved identity, and the SHELL's dir and identity
+/// ([`ceiling_cache_key`]) — so adding an account, or a fresh `claude auth login` behind any config
+/// dir INCLUDING the terminal's, invalidates it immediately rather than serving the previous
+/// person's number for 15 minutes.
 ///
 /// `async` + `spawn_blocking`: the heaviest read in this module by a wide margin.
 #[tauri::command]
@@ -1830,18 +2326,63 @@ pub async fn accounts_ceilings(app: AppHandle) -> Result<Vec<AccountCeiling>, St
     let app_data = crate::worktree::app_data_dir_pub(&app)?;
     tauri::async_runtime::spawn_blocking(move || -> Result<Vec<AccountCeiling>, String> {
         let now = now_secs();
+        // Reading `accounts.json` plus one `.claude.json` per account is cheap — microseconds
+        // against the 30-day transcript walk the cache exists to avoid — and it is what the cache
+        // must be keyed on, so it happens BEFORE the lookup rather than after it.
+        let accounts = read_accounts_at(&accounts_json_path(&app_data))?;
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let uuids: Vec<Option<String>> =
+            accounts.iter().map(|a| identity_key_for(a, home.as_deref())).collect();
+        // The SHELL's dir and identity are inputs to the result (they can suppress a ceiling), so
+        // they are resolved before the lookup and keyed on. Stated tradeoff: this makes a cache HIT
+        // pay `effective_spawn_config_dir()` — a login-shell probe of 100-500ms, but `OnceLock`-
+        // cached, so once per process rather than never. Serving one person's ceiling to another
+        // for 15 minutes is the worse bargain.
+        //
+        // The shell side is keyed by `identity_key` too, not its raw uuid: a shell re-login into an
+        // account predating `accountUuid` would otherwise leave the key unchanged and serve the
+        // pre-login ceiling — the same hole this key closes for the account side.
+        let shell_config_dir = crate::claude::effective_spawn_config_dir();
+        let shell_key = shell_identity_key_at(&shell_config_dir, home.as_deref());
+        let key = ceiling_cache_key(
+            &app_data,
+            &accounts,
+            &uuids,
+            &shell_config_dir,
+            shell_key.as_deref(),
+        );
         if let Ok(guard) = ceiling_cache().lock() {
-            if let Some((at, ref v)) = *guard {
-                if now - at < CEILING_CACHE_TTL {
-                    return Ok(v.clone());
-                }
+            if let Some(hit) = ceiling_cache_lookup(&guard, &key, now) {
+                return Ok(hit);
             }
         }
-        let accounts = read_accounts_at(&accounts_json_path(&app_data))?;
-        let out: Vec<AccountCeiling> =
-            accounts.iter().map(|a| ceiling_for_account(a, now)).collect();
+        // Record here too, not only on the identity path: this is the surface whose correctness
+        // depends on the takeover being on record, and it has already resolved every uuid.
+        // Both key forms, like the identity path: the email form is what lets a login whose
+        // `accountUuid` has only just appeared continue its epoch rather than read as a takeover.
+        let observations: Vec<(String, Option<(String, String)>)> = accounts
+            .iter()
+            .map(|a| {
+                (
+                    a.config_dir.clone(),
+                    identity_for_account(a, home.as_deref())
+                        .as_ref()
+                        .map(|i| (identity_key(i), email_key(i))),
+                )
+            })
+            .collect();
+        let log = identity_log::record_observations(
+            &identity_log::identity_log_path(&app_data),
+            &observations,
+            now,
+        );
+        let shell_config_dir = crate::claude::effective_spawn_config_dir();
+        let out: Vec<AccountCeiling> = accounts
+            .iter()
+            .map(|a| ceiling_for_account(a, now, home.as_deref(), &shell_config_dir, &log))
+            .collect();
         if let Ok(mut guard) = ceiling_cache().lock() {
-            *guard = Some((now, out.clone()));
+            *guard = Some((key, now, out.clone()));
         }
         Ok(out)
     })
@@ -2221,6 +2762,7 @@ mod tests {
             is_default,
             created_at: 1_700_000_000,
             exhausted_until: None,
+        exhausted_identity: None,
         }
     }
 
@@ -2590,6 +3132,7 @@ mod tests {
                 is_default: false,
                 created_at: 0,
                 exhausted_until: None,
+        exhausted_identity: None,
             }
         };
         let accounts = vec![mk("acct-a", 11), mk("acct-b", 22)];
@@ -2780,6 +3323,7 @@ mod tests {
     #[test]
     fn ceiling_samples_count_a_resumed_turn_once() {
         let base = unique_dir("ceiling-resume");
+        write_identity(&base, FIXTURE_UUID);
         let projects = base.join("projects");
         std::fs::create_dir_all(&projects).unwrap();
 
@@ -2800,7 +3344,7 @@ mod tests {
         std::fs::write(projects.join("b-resumed.jsonl"), format!("{turn}{limit}")).unwrap();
 
         let now = parse_iso8601_to_epoch("2026-07-21T00:00:00.000Z").unwrap();
-        let got = ceiling_for_account(&sample("c9", false, base.to_str().unwrap()), now);
+        let got = ceiling_for_account(&sample("c9", false, base.to_str().unwrap()), now, None, "", &no_log());
         assert_eq!(got.samples, vec![100], "one episode, and its consumption is 100 (not 200)");
         assert_eq!(got.ceiling, None, "one sample is below CEILING_MIN_SAMPLES");
 
@@ -2906,6 +3450,68 @@ mod tests {
     }
 
     #[test]
+    fn the_ledger_prune_spares_a_default_whose_directory_survives_removal() {
+        // roborev 58164: the prune had no is_default guard, while `dir_to_remove_on_remove`
+        // deliberately keeps a default's directory on disk (it is the user's real ~/.claude and is
+        // re-imported next launch). Pruning there deletes the takeover boundary for a LIVE tree —
+        // and that boundary is what stops a ceiling being learned across an identity change, so the
+        // damage outlives the removal. Named/non-default dirs are genuinely deleted, so their
+        // history should go with them.
+        let home = unique_dir("prune-default-guard");
+        let default_acct = sample("d", true, home.join(".claude").to_str().unwrap());
+        let named = sample("n", false, home.join("named").to_str().unwrap());
+        assert!(
+            dir_to_remove_on_remove(&default_acct).is_none(),
+            "a default's directory survives removal, so its history must too"
+        );
+        assert!(
+            dir_to_remove_on_remove(&named).is_some(),
+            "a named account's directory is deleted, so pruning its history is right"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn an_exhaustion_does_not_survive_a_switch_to_a_different_login() {
+        // knightwatch: an exhaustion is a fact about an ANTHROPIC ACCOUNT but is stored on a
+        // REGISTRATION, and "Switch login" changes the identity under it. Surfacing it blindly
+        // hands the NEW login a bench it never earned, so pickAccount skips a usable account until
+        // the epoch passes — the same account-keyed-state-outliving-its-identity bug as the ceiling.
+        let now = 1_700_000_000;
+        let mut acct = sample("a", false, "/dirs/a");
+        acct.exhausted_until = Some(now + 3_600);
+        acct.exhausted_identity = Some("uuid-old".to_string());
+
+        assert_eq!(
+            effective_exhaustion(&acct, Some("uuid-old"), now),
+            Some(now + 3_600),
+            "the login that EARNED the bench still serves it"
+        );
+        assert_eq!(
+            effective_exhaustion(&acct, Some("uuid-new"), now),
+            None,
+            "a different login must NOT inherit it"
+        );
+        assert_eq!(
+            effective_exhaustion(&acct, None, now),
+            None,
+            "nor may an unresolvable identity claim someone else's bench"
+        );
+
+        // Legacy rows carry no owner. Honour them: a limit resets within ~5h so they age out on
+        // their own, and routing work INTO an exhausted account is the worse of the two errors.
+        let mut legacy = sample("b", false, "/dirs/b");
+        legacy.exhausted_until = Some(now + 3_600);
+        assert_eq!(effective_exhaustion(&legacy, Some("uuid-any"), now), Some(now + 3_600));
+
+        // And an expired exhaustion is never surfaced, whoever owned it.
+        let mut past = sample("c", false, "/dirs/c");
+        past.exhausted_until = Some(now - 1);
+        past.exhausted_identity = Some("uuid-old".to_string());
+        assert_eq!(effective_exhaustion(&past, Some("uuid-old"), now), None);
+    }
+
+    #[test]
     fn remove_refuses_to_delete_a_default_dir() {
         let base = unique_dir("remove");
         let path = accounts_json_path(&base);
@@ -2961,12 +3567,12 @@ mod tests {
         set_nickname_at(&path, "x1", "Personal".into()).unwrap();
         assert_eq!(read_accounts_at(&path).unwrap()[0].nickname, "Personal");
 
-        mark_exhausted_at(&path, "x1", 999).unwrap();
+        mark_exhausted_at(&path, "x1", 999, None).unwrap();
         assert_eq!(read_accounts_at(&path).unwrap()[0].exhausted_until, Some(999));
 
         // Operating on an unknown id is an error, not a silent no-op.
         assert!(set_nickname_at(&path, "missing", "z".into()).is_err());
-        assert!(mark_exhausted_at(&path, "missing", 1).is_err());
+        assert!(mark_exhausted_at(&path, "missing", 1, None).is_err());
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -4212,10 +4818,34 @@ mod tests {
         assert_eq!(median(&[u64::MAX - 2, u64::MAX]), u64::MAX - 1);
     }
 
+    /// The `accountUuid` [`ceiling_fixture`] signs its directory in as. A ceiling is a claim about a
+    /// specific Anthropic account, so every ceiling scenario needs one.
+    const FIXTURE_UUID: &str = "uuid-a";
+
+    /// Sign `dir` in as `uuid` — a `.claude.json` with an `oauthAccount` carrying that `accountUuid`.
+    fn write_identity(dir: &Path, uuid: &str) {
+        write_claude_json(
+            dir,
+            &format!(
+                r#"{{"oauthAccount":{{"emailAddress":"{uuid}@example.com","accountUuid":"{uuid}"}}}}"#
+            ),
+        );
+    }
+
+    /// An empty ledger: "we have never observed a different identity behind this dir", the state of
+    /// every install before this code ran and the baseline for the no-regression ceiling tests.
+    fn no_log() -> IdentityLog {
+        IdentityLog::new()
+    }
+
     /// Build a transcript pairing each `(limit_iso, usage_iso, tokens)` into usage-then-limit, so
     /// `ceiling_for_account` can learn from it. `tokens` lands in `input_tokens`; a fixed
     /// `cache_read` rides along and must never appear in a sample.
+    ///
+    /// Also signs the dir in as [`FIXTURE_UUID`]: without a resolvable identity `ceiling_for_account`
+    /// returns `None` by contract, so an unsigned fixture could not exercise the learner at all.
     fn ceiling_fixture(dir: &Path, episodes: &[(&str, &str, u64)]) {
+        write_identity(dir, FIXTURE_UUID);
         let projects = dir.join("projects");
         std::fs::create_dir_all(&projects).unwrap();
         let mut body = String::new();
@@ -4241,7 +4871,7 @@ mod tests {
             ],
         );
         let now = parse_iso8601_to_epoch("2026-07-21T00:00:00.000Z").unwrap();
-        let got = ceiling_for_account(&sample("c1", false, base.to_str().unwrap()), now);
+        let got = ceiling_for_account(&sample("c1", false, base.to_str().unwrap()), now, None, "", &no_log());
         assert_eq!(got.samples, vec![100, 100], "cache reads excluded from the sample");
         assert_eq!(got.ceiling, None, "below CEILING_MIN_SAMPLES → not trusted");
         let _ = std::fs::remove_dir_all(&base);
@@ -4261,7 +4891,7 @@ mod tests {
             ],
         );
         let now = parse_iso8601_to_epoch("2026-07-22T00:00:00.000Z").unwrap();
-        let got = ceiling_for_account(&sample("c1", false, base.to_str().unwrap()), now);
+        let got = ceiling_for_account(&sample("c1", false, base.to_str().unwrap()), now, None, "", &no_log());
         assert_eq!(got.samples.len(), 4);
         // sorted: 100,200,300,400 → median averages the middle pair.
         assert_eq!(got.ceiling, Some(250));
@@ -4274,6 +4904,7 @@ mod tests {
         // elsewhere) yields consumption 0. Counting it would drag the median toward zero and make
         // the banner fire permanently.
         let base = unique_dir("ceiling-zero");
+        write_identity(&base, FIXTURE_UUID);
         let projects = base.join("projects");
         std::fs::create_dir_all(&projects).unwrap();
         let mut body = String::new();
@@ -4295,7 +4926,7 @@ mod tests {
         std::fs::write(projects.join("s.jsonl"), body).unwrap();
 
         let now = parse_iso8601_to_epoch("2026-07-22T00:00:00.000Z").unwrap();
-        let got = ceiling_for_account(&sample("c1", false, base.to_str().unwrap()), now);
+        let got = ceiling_for_account(&sample("c1", false, base.to_str().unwrap()), now, None, "", &no_log());
         assert_eq!(got.samples, vec![100, 100, 100], "the evidence-free episode is dropped");
         assert_eq!(got.ceiling, Some(100));
         let _ = std::fs::remove_dir_all(&base);
@@ -4304,23 +4935,610 @@ mod tests {
     #[test]
     fn ceiling_is_none_for_an_account_that_never_hit_a_limit() {
         let base = unique_dir("ceiling-clean");
+        // Signed in — so `None` here is "no limit events", not "no identity".
+        write_identity(&base, FIXTURE_UUID);
         std::fs::create_dir_all(base.join("projects")).unwrap();
         let now = parse_iso8601_to_epoch("2026-07-22T00:00:00.000Z").unwrap();
-        let got = ceiling_for_account(&sample("c1", false, base.to_str().unwrap()), now);
+        let got = ceiling_for_account(&sample("c1", false, base.to_str().unwrap()), now, None, "", &no_log());
         assert!(got.samples.is_empty());
         assert_eq!(got.ceiling, None);
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    // ---- ceilings keyed on IDENTITY, not directory ---------------------------------
+
+    /// A ledger in which `prev` held `dir` first and `next` took it over at `takeover`.
+    fn log_with_takeover(dir: &Path, prev: &str, next: &str, takeover: i64) -> IdentityLog {
+        let mut log = IdentityLog::new();
+        let key = dir.to_str().unwrap();
+        // Distinct email forms: these are takeovers between different logins, not ladder climbs.
+        identity_log::apply_observation(&mut log, key, prev, "email:prev@test.invalid", takeover - 1000);
+        identity_log::apply_observation(&mut log, key, next, "email:next@test.invalid", takeover);
+        log
+    }
+
+    /// The four-episode fixture the ceiling tests share: consumption 100/300/200/400 → median 250.
+    fn four_episode_fixture(base: &Path) {
+        ceiling_fixture(
+            base,
+            &[
+                ("2026-07-18T09:59:00.000Z", "2026-07-18T10:00:00.000Z", 100),
+                ("2026-07-19T09:59:00.000Z", "2026-07-19T10:00:00.000Z", 300),
+                ("2026-07-20T09:59:00.000Z", "2026-07-20T10:00:00.000Z", 200),
+                ("2026-07-21T09:59:00.000Z", "2026-07-21T10:00:00.000Z", 400),
+            ],
+        );
+    }
+
+    #[test]
+    fn ceiling_resets_to_none_when_the_identity_behind_the_dir_changed_midwindow() {
+        // THE headline case. Four limit episodes in one config dir — plenty to learn a ceiling from,
+        // and the pre-change code returned one. But a DIFFERENT Anthropic account signed into that
+        // directory partway through the window, and transcripts carry no account marker, so the
+        // older episodes cannot be attributed to the current login. Carrying that median forward
+        // would warn (or fail over) the current user against a number measured on someone else.
+        let base = unique_dir("ceiling-identity-reset");
+        four_episode_fixture(&base);
+        let now = parse_iso8601_to_epoch("2026-07-22T00:00:00.000Z").unwrap();
+        let acct = sample("c1", false, base.to_str().unwrap());
+
+        // Control: with no recorded identity change the very same fixture DOES learn a ceiling.
+        // Without this line the assertions below could pass on a fixture that never worked.
+        let control = ceiling_for_account(&acct, now, None, "", &no_log());
+        assert_eq!(control.ceiling, Some(250));
+        assert!(!control.reset_by_identity_change);
+
+        // Now the ledger says the current uuid only took the directory over on 07-20, so the 07-18
+        // and 07-19 episodes belong to whoever had it before.
+        let takeover = parse_iso8601_to_epoch("2026-07-20T00:00:00.000Z").unwrap();
+        let log = log_with_takeover(&base, "uuid-previous", FIXTURE_UUID, takeover);
+        let got = ceiling_for_account(&acct, now, None, "", &log);
+
+        assert!(got.reset_by_identity_change, "samples were dropped for an identity change");
+        assert_eq!(got.ceiling, None, "under CEILING_MIN_SAMPLES → unknown, NEVER the old median");
+        assert!(
+            got.samples.len() < CEILING_MIN_SAMPLES,
+            "only post-takeover episodes survive: {:?}",
+            got.samples
+        );
+        assert_eq!(got.samples, vec![200, 400], "and they are exactly the post-takeover pair");
+        assert_eq!(got.account_uuid.as_deref(), Some(FIXTURE_UUID), "whose ceiling this would be");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_takeover_that_still_leaves_enough_samples_learns_from_only_those() {
+        // The reset is a CUT, not a blanket refusal: drop one episode and the remaining three are a
+        // legitimate measurement of the current identity. `reset_by_identity_change` still reports
+        // that history was discarded, so the UI can explain a number that moved.
+        let base = unique_dir("ceiling-identity-cut");
+        four_episode_fixture(&base);
+        let now = parse_iso8601_to_epoch("2026-07-22T00:00:00.000Z").unwrap();
+        let takeover = parse_iso8601_to_epoch("2026-07-18T20:00:00.000Z").unwrap();
+        let log = log_with_takeover(&base, "uuid-previous", FIXTURE_UUID, takeover);
+        let got = ceiling_for_account(&sample("c1", false, base.to_str().unwrap()), now, None, "", &log);
+        assert!(got.reset_by_identity_change);
+        assert_eq!(got.samples, vec![300, 200, 400], "the 07-18 episode is the previous identity's");
+        assert_eq!(got.ceiling, Some(300), "median of what is genuinely ours");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn an_unchanged_identity_learns_its_ceiling_normally() {
+        // The no-regression guard. Everything above must not cost the ordinary case its ceiling.
+        let base = unique_dir("ceiling-identity-stable");
+        four_episode_fixture(&base);
+        let now = parse_iso8601_to_epoch("2026-07-22T00:00:00.000Z").unwrap();
+        let acct = sample("c1", false, base.to_str().unwrap());
+
+        // (a) A ledger holding ONLY this uuid — the shape after a first sighting, which is what
+        //     every existing install looks like the moment this ships. A first epoch is not a
+        //     takeover; reading it as one would blank every learned ceiling on upgrade.
+        let mut first_sighting = IdentityLog::new();
+        identity_log::apply_observation(
+            &mut first_sighting,
+            base.to_str().unwrap(),
+            FIXTURE_UUID,
+            "email:fixture@test.invalid",
+            now - 10,
+        );
+        let got = ceiling_for_account(&acct, now, None, "", &first_sighting);
+        assert_eq!(got.ceiling, Some(250));
+        assert!(!got.reset_by_identity_change);
+        assert_eq!(got.samples.len(), 4);
+
+        // (b) A takeover that happened BEFORE the 30-day learn window is already aged out by the
+        //     window itself — it must not keep cutting forever.
+        let old = log_with_takeover(
+            &base,
+            "uuid-previous",
+            FIXTURE_UUID,
+            now - CEILING_LEARN_WINDOW - 24 * 60 * 60,
+        );
+        let got = ceiling_for_account(&acct, now, None, "", &old);
+        assert_eq!(got.ceiling, Some(250), "a takeover outside the window cuts nothing");
+        assert!(!got.reset_by_identity_change);
+
+        // (c) Another dir's churn is not ours.
+        let elsewhere = log_with_takeover(
+            Path::new("/somewhere/else"),
+            "uuid-previous",
+            FIXTURE_UUID,
+            parse_iso8601_to_epoch("2026-07-20T00:00:00.000Z").unwrap(),
+        );
+        assert_eq!(ceiling_for_account(&acct, now, None, "", &elsewhere).ceiling, Some(250));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn ceiling_is_none_when_the_account_has_no_resolvable_identity() {
+        // A ceiling is a claim about a specific Anthropic account. A directory full of limit events
+        // that we cannot attribute to anyone yields samples but NO ceiling — `account_uuid: None`
+        // and `ceiling: None` travel together, by contract (§4b).
+        let base = unique_dir("ceiling-no-identity");
+        four_episode_fixture(&base);
+        std::fs::remove_file(base.join(".claude.json")).unwrap(); // never logged in
+        let now = parse_iso8601_to_epoch("2026-07-22T00:00:00.000Z").unwrap();
+        let got = ceiling_for_account(&sample("c1", false, base.to_str().unwrap()), now, None, "", &no_log());
+        assert_eq!(got.account_uuid, None);
+        assert_eq!(got.ceiling, None, "unattributable history is not a ceiling");
+        assert_eq!(got.samples.len(), 4, "the samples are still reported, just not trusted");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_shell_half_of_the_cache_key_uses_the_identity_LADDER_not_the_raw_uuid() {
+        // The one behaviour unique to the cache-key path, and previously untestable: it was inlined
+        // in a #[tauri::command] body, and `ceiling_cache_key` takes the shell identity as an opaque
+        // Option<&str>, so its shell cases pass literals and stay green either way. This asserts the
+        // DERIVATION, so it fails if `shell_identity_key_at` reverts to `.and_then(|s| s.account_uuid)`.
+        //
+        // What that revert would silently permit: a terminal `claude auth login` into an account
+        // predating `accountUuid` leaves the shell half of the key unchanged, the cache hits, and
+        // the pre-login (possibly another person's) ceiling is served for the full TTL.
+        let dir = unique_dir("shell-identity-key");
+
+        // A shell login WITHOUT accountUuid — the pre-field shape. Raw-uuid derivation gives None.
+        write_claude_json(&dir, r#"{"oauthAccount":{"emailAddress":"shell-old@example.com"}}"#);
+        assert_eq!(
+            shell_identity_key_at(dir.to_str().unwrap(), None),
+            Some("email:shell-old@example.com".to_string()),
+            "an email-only shell login must still produce a key, or a re-login cannot invalidate"
+        );
+
+        // A shell login WITH accountUuid — the uuid wins, since it is the stronger discriminator.
+        write_claude_json(
+            &dir,
+            r#"{"oauthAccount":{"emailAddress":"shell-new@example.com","accountUuid":"uuid-shell"}}"#,
+        );
+        assert_eq!(
+            shell_identity_key_at(dir.to_str().unwrap(), None),
+            Some("uuid-shell".to_string())
+        );
+
+        // Signing the terminal OUT changes the key, so the cached ceiling cannot survive it.
+        std::fs::remove_file(dir.join(".claude.json")).unwrap();
+        assert_eq!(shell_identity_key_at(dir.to_str().unwrap(), None), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_login_predating_account_uuid_still_learns_its_ceiling() {
+        // THE LADDER (contract §4b). `accountUuid` is absent on logins that predate the field, and
+        // such an account is SIGNED IN and fully attributable — just by email. Gating the ceiling on
+        // the uuid returned `None` for it forever, so `switchRecommendation` read `unknown` and the
+        // near-cap banner could never fire again, with nothing to distinguish it from a directory
+        // that genuinely belongs to nobody. That is a silent, permanent capability loss.
+        //
+        // Fails against a uuid-only gate: `ceiling` comes back `None` there.
+        let base = unique_dir("ceiling-email-only-identity");
+        four_episode_fixture(&base);
+        // Signed in, with an email and NO accountUuid — the pre-field login shape.
+        write_claude_json(&base, r#"{"oauthAccount":{"emailAddress":"old@example.com"}}"#);
+        let now = parse_iso8601_to_epoch("2026-07-22T00:00:00.000Z").unwrap();
+
+        let got =
+            ceiling_for_account(&sample("c1", false, base.to_str().unwrap()), now, None, "", &no_log());
+
+        assert_eq!(got.ceiling, Some(250), "an email-attributable login keeps its ceiling");
+        assert_eq!(got.account_uuid, None, "and still reports no uuid on the wire");
+        assert!(!got.reset_by_identity_change);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn an_email_keyed_identity_still_gets_its_history_cut_on_a_takeover() {
+        // The ladder must not weaken the reset: an email-keyed identity that TOOK OVER a directory
+        // inside the learn window still discards the previous occupant's episodes. Otherwise the
+        // fallback would quietly reintroduce the very bug the ledger exists to fix.
+        let base = unique_dir("ceiling-email-only-takeover");
+        four_episode_fixture(&base);
+        write_claude_json(&base, r#"{"oauthAccount":{"emailAddress":"old@example.com"}}"#);
+        let now = parse_iso8601_to_epoch("2026-07-22T00:00:00.000Z").unwrap();
+        let takeover = parse_iso8601_to_epoch("2026-07-18T20:00:00.000Z").unwrap();
+
+        // The ledger files this identity under its EMAIL key, exactly as `identity_key` writes it.
+        let log = log_with_takeover(&base, "uuid-previous", "email:old@example.com", takeover);
+        let got =
+            ceiling_for_account(&sample("c1", false, base.to_str().unwrap()), now, None, "", &log);
+
+        assert!(got.reset_by_identity_change, "an email-keyed takeover still cuts");
+        assert_eq!(got.samples, vec![300, 200, 400], "the 07-18 episode is the previous identity's");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_uuid_less_login_is_not_mistaken_for_a_different_account() {
+        // `identities_differ` must never read a MISSING uuid as a mismatch. A bare `!=` makes
+        // `None != Some(x)` true, which invents a fork between what may be one account — the
+        // "a wrong identity is worse than none" failure (§5) in the surface built to prevent it.
+        let with_uuid = |u: &str, e: &str| OauthIdentity {
+            email: e.to_string(),
+            organization: None,
+            account_uuid: Some(u.to_string()),
+        };
+        let no_uuid = |e: &str| OauthIdentity {
+            email: e.to_string(),
+            organization: None,
+            account_uuid: None,
+        };
+
+        // Rung 1 — both uuids present: the uuid decides, even when the emails agree.
+        assert!(identities_differ(&with_uuid("a", "same@x.com"), &with_uuid("b", "same@x.com")));
+        assert!(!identities_differ(&with_uuid("a", "one@x.com"), &with_uuid("a", "two@x.com")));
+
+        // Rung 2 — a uuid missing on EITHER side: fall back to the email, do not read the gap as a
+        // difference. This is the case a bare `!=` gets wrong.
+        assert!(
+            !identities_differ(&no_uuid("same@x.com"), &with_uuid("b", "same@x.com")),
+            "a missing uuid is unknown, NOT a different account"
+        );
+        assert!(
+            !identities_differ(&with_uuid("b", "same@x.com"), &no_uuid("same@x.com")),
+            "and it is symmetric"
+        );
+        assert!(identities_differ(&no_uuid("one@x.com"), &no_uuid("two@x.com")));
+        assert!(!identities_differ(&no_uuid("same@x.com"), &no_uuid("same@x.com")));
+    }
+
+    #[test]
+    fn ceiling_cache_is_keyed_on_the_account_set_and_their_identities() {
+        // It used to be keyed on NOTHING — one process-global `(computed_at, value)` served for 15
+        // minutes however the accounts changed. Adding an account showed the old set's ceilings;
+        // a fresh login behind a dir kept serving the previous person's number, which is exactly
+        // the mis-attribution this work exists to stop.
+        let app_data = Path::new("/app/data");
+        let a = sample("a1", true, "");
+        let b = sample("b2", false, "/data/accounts/b2");
+        let key = |accts: &[Account], uuids: &[Option<String>]| {
+            ceiling_cache_key(app_data, accts, uuids, "", Some("u-shell"))
+        };
+        let base = key(&[a.clone(), b.clone()], &[Some("u-a".into()), Some("u-b".into())]);
+
+        // Same everything → hit.
+        let cache: CeilingCache = Some((base.clone(), 1_000, vec![]));
+        assert!(ceiling_cache_lookup(&cache, &base, 1_000 + CEILING_CACHE_TTL - 1).is_some());
+        // TTL still expires it.
+        assert!(ceiling_cache_lookup(&cache, &base, 1_000 + CEILING_CACHE_TTL).is_none());
+
+        // A DIFFERENT identity behind the same dir must miss, inside the TTL.
+        let relogin = key(&[a.clone(), b.clone()], &[Some("u-a".into()), Some("u-NEW".into())]);
+        assert_ne!(relogin, base);
+        assert!(ceiling_cache_lookup(&cache, &relogin, 1_001).is_none());
+        // Signing OUT (uuid → None) must miss too.
+        let signed_out = key(&[a.clone(), b.clone()], &[Some("u-a".into()), None]);
+        assert!(ceiling_cache_lookup(&cache, &signed_out, 1_001).is_none());
+        // Removing an account must miss.
+        let removed = key(&[a.clone()], &[Some("u-a".into())]);
+        assert!(ceiling_cache_lookup(&cache, &removed, 1_001).is_none());
+        // Adding one must miss.
+        let added = key(
+            &[a.clone(), b.clone(), sample("c3", false, "/data/accounts/c3")],
+            &[Some("u-a".into()), Some("u-b".into()), Some("u-c".into())],
+        );
+        assert!(ceiling_cache_lookup(&cache, &added, 1_001).is_none());
+        // Repointing an account's config dir must miss.
+        let moved = key(
+            &[a.clone(), sample("b2", false, "/data/accounts/OTHER")],
+            &[Some("u-a".into()), Some("u-b".into())],
+        );
+        assert!(ceiling_cache_lookup(&cache, &moved, 1_001).is_none());
+        // A different app_data root must miss.
+        assert!(ceiling_cache_lookup(
+            &cache,
+            &ceiling_cache_key(
+                Path::new("/other/data"),
+                &[a.clone(), b.clone()],
+                &[Some("u-a".into()), Some("u-b".into())],
+                "",
+                Some("u-shell")
+            ),
+            1_001
+        )
+        .is_none());
+
+        // THE SHELL'S OWN LOGIN must miss too. `ceiling_for_account` suppresses the ceiling when a
+        // default account shares a transcript tree with a differently-signed-in terminal, so
+        // `claude auth login` in that terminal flips the answer while NOTHING about any account
+        // record changes. Without this the pre-login number would be served for the full TTL — the
+        // very staleness the key exists to end, relocated to the one dir it did not cover.
+        let accts = [a.clone(), b.clone()];
+        let ids = [Some("u-a".to_string()), Some("u-b".to_string())];
+        let shell_relogin = ceiling_cache_key(app_data, &accts, &ids, "", Some("u-shell-NEW"));
+        assert_ne!(shell_relogin, base);
+        assert!(ceiling_cache_lookup(&cache, &shell_relogin, 1_001).is_none());
+        // As must the shell signing out, or exporting a different CLAUDE_CONFIG_DIR.
+        assert!(
+            ceiling_cache_lookup(&cache, &ceiling_cache_key(app_data, &accts, &ids, "", None), 1_001)
+                .is_none()
+        );
+        assert!(ceiling_cache_lookup(
+            &cache,
+            &ceiling_cache_key(app_data, &accts, &ids, "/exported", Some("u-shell")),
+            1_001
+        )
+        .is_none());
+    }
+
+    // ---- shell identity on the default account -------------------------------------
+
+    #[test]
+    fn shell_identity_pins_the_founders_forked_default_account() {
+        // The founder's EXACT measured state (identity-truth contract §1). His default account has
+        // `config_dir = <home>/.claude`, so Sparkle exports CLAUDE_CONFIG_DIR and reads
+        // `<home>/.claude/.claude.json`; his terminal exports nothing and reads `<home>/.claude.json`.
+        // BOTH hold valid logins, to DIFFERENT Anthropic accounts. Before this, the UI showed only
+        // the first and there was no way to see the fork at all.
+        let home = fake_home("shell-fork", Some("storytell@example.com"), Some("gmail@example.com"));
+        let log_path = home.join("account-identity-log.json");
+        let default = sample("d", true, home.join(".claude").to_str().unwrap());
+        let named_dir = home.join("named");
+        write_claude_json(&named_dir, r#"{"oauthAccount":{"emailAddress":"named@example.com"}}"#);
+        let named = sample("n", false, named_dir.to_str().unwrap());
+
+        let got = identities_at(&[default, named], Some(&home), "", &log_path, 1_700_000_000);
+
+        assert_eq!(
+            got[0].email.as_deref(),
+            Some("storytell@example.com"),
+            "Sparkle runs the default account as this"
+        );
+        assert_eq!(
+            got[0].shell_email.as_deref(),
+            Some("gmail@example.com"),
+            "...while a plain terminal `claude` is this person — the fork, now visible"
+        );
+        assert_ne!(got[0].email, got[0].shell_email, "which is the whole point");
+
+        // A NAMED account's dir is its own truth; the shell's login says nothing about it, and
+        // reporting it here would re-create the mislabelling this module exists to prevent.
+        assert_eq!(got[1].email.as_deref(), Some("named@example.com"));
+        assert_eq!(got[1].shell_email, None);
+        assert_eq!(got[1].shell_account_uuid, None);
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn shell_identity_matches_when_the_default_account_is_not_forked() {
+        // A normalized default (`config_dir = ""`, export nothing) reads the SAME file the terminal
+        // does, so the two agree and the UI has no fork to report.
+        let home = fake_home("shell-same", None, Some("only@example.com"));
+        let log_path = home.join("account-identity-log.json");
+        let got = identities_at(&[sample("d", true, "")], Some(&home), "", &log_path, 1_700_000_000);
+        assert_eq!(got[0].email.as_deref(), Some("only@example.com"));
+        assert_eq!(got[0].shell_email.as_deref(), Some("only@example.com"));
+        let _ = std::fs::remove_dir_all(&home);
+
+        // No terminal login at all → nothing to report, not a fabricated fork.
+        let home = fake_home("shell-none", Some("sparkle@example.com"), None);
+        let log_path = home.join("account-identity-log.json");
+        let acct = sample("d", true, home.join(".claude").to_str().unwrap());
+        let got = identities_at(&[acct], Some(&home), "", &log_path, 1_700_000_000);
+        assert_eq!(got[0].email.as_deref(), Some("sparkle@example.com"));
+        assert_eq!(got[0].shell_email, None);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn shell_identity_follows_an_exported_claude_config_dir() {
+        // A user who exports CLAUDE_CONFIG_DIR in .zprofile/.zlogin: their terminal reads
+        // `<their dir>/.claude.json`, and `accounts_ensure_default` stores that same dir as the
+        // default account's config_dir — so the two read ONE file and there is NO fork.
+        // Hardcoding `$HOME/.claude.json` as "the shell" would report the stale login sitting there
+        // and announce a fork that does not exist: a fabricated identity presented as verified
+        // truth, in the surface built to prevent exactly that.
+        let home = fake_home("shell-exported", None, Some("stale@example.com"));
+        let exported = home.join("exported");
+        write_claude_json(
+            &exported,
+            r#"{"oauthAccount":{"emailAddress":"work@example.com","accountUuid":"u-work"}}"#,
+        );
+        let log_path = home.join("account-identity-log.json");
+        let acct = sample("d", true, exported.to_str().unwrap());
+
+        let got = identities_at(
+            &[acct],
+            Some(&home),
+            exported.to_str().unwrap(),
+            &log_path,
+            1_700_000_000,
+        );
+        assert_eq!(got[0].email.as_deref(), Some("work@example.com"));
+        assert_eq!(
+            got[0].shell_email.as_deref(),
+            Some("work@example.com"),
+            "same file as the account reads — no fork to report"
+        );
+        assert_eq!(got[0].shell_email, got[0].email);
+        assert_eq!(got[0].shell_account_uuid.as_deref(), Some("u-work"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_default_account_sharing_one_transcript_tree_with_the_shell_has_no_ceiling() {
+        // The founder's configuration, and the case the temporal ledger CANNOT fix. With
+        // `config_dir = <home>/.claude` the account's projects root is `<home>/.claude/projects` —
+        // byte-identical to where a plain terminal `claude` writes. Two identities append to ONE
+        // tree concurrently, so no uuid ever changes behind the config file, `takeover_at` stays
+        // None, nothing is cut, and the median silently mixes both people's consumption. Claiming
+        // `accountUuid: <sparkle's>` over that sample set is a false attribution.
+        let home = unique_dir("ceiling-commingled");
+        let state = home.join(".claude");
+        four_episode_fixture(&state); // signs <home>/.claude in as FIXTURE_UUID + writes transcripts
+        let now = parse_iso8601_to_epoch("2026-07-22T00:00:00.000Z").unwrap();
+        let acct = sample("d", true, state.to_str().unwrap());
+
+        // Control: the terminal is signed in as the SAME account, so one tree is fine and the
+        // ceiling is learned exactly as before. Without this the assertion below could pass on a
+        // fixture that never produced a ceiling at all.
+        std::fs::write(
+            home.join(".claude.json"),
+            format!(
+                r#"{{"oauthAccount":{{"emailAddress":"same@example.com","accountUuid":"{FIXTURE_UUID}"}}}}"#
+            ),
+        )
+        .unwrap();
+        let control = ceiling_for_account(&acct, now, Some(&home), "", &no_log());
+        assert_eq!(control.ceiling, Some(250), "same identity in one tree still learns");
+        assert!(!control.reset_by_identity_change);
+
+        // Now the terminal is a DIFFERENT Anthropic account writing into the same tree.
+        std::fs::write(
+            home.join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"other@example.com","accountUuid":"uuid-shell"}}"#,
+        )
+        .unwrap();
+        let got = ceiling_for_account(&acct, now, Some(&home), "", &no_log());
+        assert_eq!(got.ceiling, None, "commingled transcripts are not attributable to anyone");
+        assert!(got.reset_by_identity_change, "and the UI is told why the number is gone");
+        assert_eq!(got.account_uuid.as_deref(), Some(FIXTURE_UUID), "still whose account this is");
+
+        // A NAMED account is never affected: its dir is its own, whatever the shell is doing.
+        let mut named = acct.clone();
+        named.is_default = false;
+        assert_eq!(
+            ceiling_for_account(&named, now, Some(&home), "", &no_log()).ceiling,
+            Some(250)
+        );
+        // Nor is a default whose transcripts live somewhere else entirely.
+        let elsewhere = sample("d", true, home.join("other").to_str().unwrap());
+        four_episode_fixture(&home.join("other"));
+        assert_eq!(
+            ceiling_for_account(&elsewhere, now, Some(&home), "", &no_log()).ceiling,
+            Some(250),
+            "different tree → the shell's identity is irrelevant"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn the_identity_read_records_the_ledger_and_reports_a_change() {
+        // The identity read is the ledger's hook. Reading the same identity twice must not fabricate
+        // a takeover; reading a DIFFERENT one must open an epoch and flip `identity_changed`, which
+        // is the same boundary the ceiling reset keys on.
+        let home = unique_dir("identities-ledger");
+        let dir = home.join("acct");
+        write_identity(&dir, "uuid-one");
+        let log_path = home.join("account-identity-log.json");
+        let acct = sample("a", false, dir.to_str().unwrap());
+        let t0 = 1_700_000_000;
+
+        let got = identities_at(std::slice::from_ref(&acct), None, "", &log_path, t0);
+        assert_eq!(got[0].account_uuid.as_deref(), Some("uuid-one"));
+        assert!(!got[0].identity_changed, "a first sighting is not a change");
+
+        // Same identity later: ONE epoch, tail moved.
+        let got = identities_at(std::slice::from_ref(&acct), None, "", &log_path, t0 + 3600);
+        assert!(!got[0].identity_changed);
+        let log = identity_log::read_log_at(&log_path);
+        let key = dir.to_str().unwrap();
+        assert_eq!(log[key].len(), 1, "same uuid must not open a second epoch");
+        assert_eq!(log[key][0].first_seen_at, t0);
+        assert_eq!(log[key][0].last_seen_at, t0 + 3600, "lastSeenAt bumped in place");
+
+        // A different login into the same dir opens an epoch and is reported as a change.
+        write_identity(&dir, "uuid-two");
+        let got = identities_at(std::slice::from_ref(&acct), None, "", &log_path, t0 + 7200);
+        assert_eq!(got[0].account_uuid.as_deref(), Some("uuid-two"));
+        assert!(got[0].identity_changed, "the fork the ceiling reset keys on");
+        let log = identity_log::read_log_at(&log_path);
+        assert_eq!(log[key].len(), 2);
+        assert_eq!(log[key][1].first_seen_at, t0 + 7200);
+        // No orphan temp left behind by any of those writes.
+        assert!(!log_path.with_extension("json.tmp").exists());
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_ledger_write_failure_never_breaks_the_identity_read() {
+        // Identity DISPLAY must not depend on the ledger. Point it at a path that cannot be created
+        // (a directory where the file should be) and the emails still come back.
+        let home = unique_dir("identities-ledger-broken");
+        let dir = home.join("acct");
+        write_identity(&dir, "uuid-one");
+        let log_path = home.join("blocked");
+        std::fs::create_dir_all(&log_path).unwrap(); // rename onto a dir fails
+        let got =
+            identities_at(&[sample("a", false, dir.to_str().unwrap())], None, "", &log_path, 1_700_000);
+        assert_eq!(got[0].account_uuid.as_deref(), Some("uuid-one"));
+        assert_eq!(got[0].email.as_deref(), Some("uuid-one@example.com"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[test]
     fn account_ceiling_serializes_camel_case_keys() {
-        let c = AccountCeiling { id: "a".into(), samples: vec![1, 2, 3], ceiling: Some(2) };
+        let c = AccountCeiling {
+            id: "a".into(),
+            samples: vec![1, 2, 3],
+            ceiling: Some(2),
+            account_uuid: Some("c70bea4e".into()),
+            reset_by_identity_change: false,
+        };
         let v = serde_json::to_value(&c).unwrap();
         assert_eq!(v.get("ceiling").unwrap(), 2);
         assert!(v.get("samples").is_some());
-        // A null ceiling must survive as null (the frontend keys "can't warn" off it).
-        let none = AccountCeiling { id: "a".into(), samples: vec![], ceiling: None };
-        assert!(serde_json::to_value(&none).unwrap().get("ceiling").unwrap().is_null());
+        // The FROZEN wire names the TS side reads (PRD/sparkle/claude-account-identity-truth.md §4b).
+        assert_eq!(v.get("accountUuid").unwrap(), "c70bea4e");
+        assert_eq!(v.get("resetByIdentityChange").unwrap(), false);
+        assert!(v.get("account_uuid").is_none() && v.get("reset_by_identity_change").is_none());
+        // A null ceiling must survive as null (the frontend keys "can't warn" off it), and so must a
+        // null accountUuid — "we don't know whose this is" is a distinct state from "no ceiling".
+        let none = AccountCeiling {
+            id: "a".into(),
+            samples: vec![],
+            ceiling: None,
+            account_uuid: None,
+            reset_by_identity_change: true,
+        };
+        let v = serde_json::to_value(&none).unwrap();
+        assert!(v.get("ceiling").unwrap().is_null());
+        assert!(v.get("accountUuid").unwrap().is_null());
+        assert_eq!(v.get("resetByIdentityChange").unwrap(), true);
+    }
+
+    #[test]
+    fn account_identity_serializes_camel_case_keys() {
+        // The FROZEN wire the two TS units build against (§4a of the identity-truth contract): a
+        // rename here breaks them silently, since a missing key deserializes to `undefined`.
+        let v = serde_json::to_value(AccountIdentity {
+            id: "133420d1".into(),
+            email: Some("work@example.com".into()),
+            organization: None,
+            account_uuid: Some("c70bea4e".into()),
+            shell_email: Some("personal@example.com".into()),
+            shell_account_uuid: Some("5fb3d67c".into()),
+            identity_changed: true,
+        })
+        .unwrap();
+        assert_eq!(v.get("shellEmail").unwrap(), "personal@example.com");
+        assert_eq!(v.get("shellAccountUuid").unwrap(), "5fb3d67c");
+        assert_eq!(v.get("identityChanged").unwrap(), true);
+        assert!(v.get("shell_email").is_none() && v.get("identity_changed").is_none());
     }
 
     #[test]

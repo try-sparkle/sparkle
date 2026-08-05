@@ -20,7 +20,7 @@ import { AccountBadge } from "./AgentPane";
 import { PinnedPrompt } from "./PinnedPrompt";
 import { C } from "../theme/colors";
 import { TERM_HAIRLINE, TERM_RADIUS, TERM_TYPE, termInk, termMuted } from "./terminalChrome";
-import type { Account, Identity } from "../services/accountStore";
+import { NOT_SIGNED_IN, type Account, type Identity } from "../services/accountStore";
 
 afterEach(() => cleanup());
 
@@ -100,7 +100,17 @@ describe("AgentPane — the account chip sits ON the terminal plane", () => {
     // `muted` are the measured inks (theme/chromeContrast + AgentPane.accountBadge.test). Sweeping
     // them into the terminal register would break a floor that IS enforced, to fix one that isn't.
     setup(true);
-    expect(screen.getByText("not signed in").style.color).toBe(C.muted);
+    // The row that carries this rule used to be a lowercase "not signed in" SECONDARY line beside
+    // the nickname. That line is gone: the identity slot itself now says `NOT_SIGNED_IN`, because
+    // rendering a user-typed nickname where a verified login belongs was the bug (sparkle-gwkui).
+    // The INK RULE this test exists for is unchanged and still enforced — assert it on the element
+    // that inherited the role rather than deleting the guard with the line it happened to name.
+    // Fixture: account "b" has no identity, so its row is the unverified one.
+    const unverified = screen
+      .getAllByTestId("account-row-identity")
+      .find((el) => el.textContent === NOT_SIGNED_IN);
+    expect(unverified, `expected an unverified row rendering "${NOT_SIGNED_IN}"`).toBeTruthy();
+    expect(unverified!.style.color).toBe(C.muted);
     expect(screen.getByText("work-alias").style.color).toBe(C.cream);
   });
 });
