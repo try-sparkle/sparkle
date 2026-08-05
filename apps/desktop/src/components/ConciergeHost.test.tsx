@@ -110,6 +110,9 @@ vi.mock("../services/concierge", async (importOriginal) => ({
   // The LIVE tool channel. A no-op unsubscribe, exactly like its siblings: these suites are about
   // the host's other wiring, and a mock that simply OMITS an export the host calls does not
   // degrade — vitest throws on the missing property and every case in the file dies at mount.
+  // The typed sticky rejection the dispatch handler branches on — a real class, not a stub, so
+  // `instanceof` in the host actually discriminates.
+  ConciergeAiDisabledError: class ConciergeAiDisabledError extends Error {},
   onConciergeTool: (cb: (e: { id: string; name: string; input: string }) => void) => {
     h.brain.tool = cb;
     return () => {};
@@ -209,6 +212,10 @@ import {
   noteConciergeToolCall,
 } from "../services/conciergeActivity";
 import { MESSAGE_STATUS_TESTID } from "./Concierge/MessageStatus";
+import { FAILURE_EVIDENCE_TESTID } from "./Concierge/ConciergeMessageRow";
+import { ConciergeAiDisabledError } from "../services/concierge";
+import { MAX_QUEUED_TURNS } from "../engine/conciergeTurnQueue";
+import { ANSWERED_MARKER_TESTID } from "./Concierge/ReplyAnchorViews";
 import {
   THINKING_ACTIVITY_TESTID,
   THINKING_INDICATOR_TESTID,
@@ -767,6 +774,132 @@ describe("ConciergeHost", () => {
     fireEvent.click(screen.getByText("Send"));
     await settle();
     expect(String(h.startConciergeTurn.mock.calls.at(-1)?.[0])).toContain("third");
+  });
+
+  /**
+   * A REPLY MUST NOT CLAIM THE MESSAGE QUEUED BEHIND IT (probe 2, and roborev 58223-M1).
+   *
+   * Driven through the NO-DELTA path deliberately: that is the one the first fix silently failed
+   * on. `drainQueue` runs earlier in the same `done` handler and promotes the waiter from `waiting`
+   * to `running`, so a filter that asked the LIVE queue saw "working" and let it through. Only a
+   * reply whose bubble is created in `done` (no prior delta) exposes it.
+   */
+  it("does not anchor the queued message to the running turn's reply — even with no delta", async () => {
+    _resetConciergeActivityForTests();
+    h.feed = feedWith("approval");
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "question A" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "question B" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+
+    // A answers with NO prior delta, so its bubble is minted in the done path.
+    act(() => h.brain.done?.({ id: "1", text: "here is the answer to A" }));
+    await settle();
+    // NAMED, not counted. B was never in A's prompt, so B's own bubble must carry no
+    // "Answered below" marker — a count says two markers exist without saying which bubble is
+    // wrongly claimed, and the whole finding is about WHICH message gets claimed.
+    const bubbles = within(thread()).getAllByTestId("you-bubble");
+    const bBubble = bubbles.find((b) => b.textContent?.includes("question B"))!;
+    expect(bBubble).toBeTruthy();
+    const bRow = bBubble.closest("[data-message-id]")!;
+    expect(bRow.querySelector(`[data-testid="${ANSWERED_MARKER_TESTID}"]`)).toBeNull();
+  });
+
+  /**
+   * A DROPPED MESSAGE IS REPORTED, AND CANNOT BE CLAIMED (probes 1 and 3, roborev 58223-M3).
+   *
+   * At the cap the oldest waiter is evicted. Losing it silently is the defect the queue exists to
+   * remove, and leaving its bubble unmarked is worse than losing it: the next reply's anchor walk
+   * would stamp "Answered below" on a question that was never sent.
+   */
+  it("reports a message dropped at the cap, with its text", async () => {
+    _resetConciergeActivityForTests();
+    h.feed = feedWith("approval");
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    // One running turn, then fill the queue past the cap.
+    for (let n = 0; n <= MAX_QUEUED_TURNS + 1; n += 1) {
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: `q${n}` } });
+      fireEvent.click(screen.getByText("Send"));
+    }
+    await settle();
+    // The oldest WAITER (q1 — q0 is the one running) is gone, and the thread says so WITH ITS TEXT.
+    // The text is the entire point: a count reports the loss and gives no way to recover from it,
+    // so asserting only the headline would leave the fix's actual claim unverified.
+    expect(await within(thread()).findByText(/One queued message was dropped/)).toBeTruthy();
+    expect(within(thread()).getByTestId(FAILURE_EVIDENCE_TESTID).textContent).toContain("q1");
+  });
+
+  /**
+   * A STICKY REJECTION CLEARS THE QUEUE ONCE, WITHOUT CASCADING (probe 4 / roborev 58241-M2).
+   *
+   * `ConciergeAiDisabledError` cannot be retried, so draining would dispatch the next waiter into
+   * the same rejection and empty the queue in N microtasks with nothing on screen. The cascade was
+   * the reported defect and shipped untested.
+   */
+  it("reports a sticky rejection once and does not cascade through the queue", async () => {
+    _resetConciergeActivityForTests();
+    h.feed = feedWith("approval");
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "first" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    for (const t of ["second", "third"]) {
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: t } });
+      fireEvent.click(screen.getByText("Send"));
+    }
+    await settle();
+
+    // The next dispatch hits the sticky failure.
+    h.startConciergeTurn.mockRejectedValueOnce(new ConciergeAiDisabledError());
+    const before = h.startConciergeTurn.mock.calls.length;
+    act(() => h.brain.done?.({ id: "1", text: "answered" }));
+    await settle();
+
+    // EXACTLY ONE further dispatch — the one that rejected. No cascade through the rest.
+    expect(h.startConciergeTurn.mock.calls.length).toBe(before + 1);
+    // One notice, naming the toggle rather than telling the user to retry a sticky condition…
+    expect(
+      await within(thread()).findByText(/AI enhancements are off/),
+    ).toBeTruthy();
+    // …carrying every stranded question so each can be re-sent.
+    const evidence = within(thread()).getByTestId(FAILURE_EVIDENCE_TESTID).textContent ?? "";
+    expect(evidence).toContain("second");
+    expect(evidence).toContain("third");
+  });
+
+  /**
+   * A TRANSIENT REJECTION MUST NOT DESTROY THE QUEUE (roborev 58241-M2).
+   *
+   * The rejection handler is generic, so making the clear unconditional would mean any one-off
+   * failure silently discarded every queued question. Only `ConciergeAiDisabledError` is sticky —
+   * everything else should release the slot and let the next message through, which is the ordinary
+   * drain.
+   */
+  it("keeps the queue and drains on a NON-sticky rejection", async () => {
+    _resetConciergeActivityForTests();
+    h.feed = feedWith("approval");
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "first" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    for (const t of ["second", "third"]) {
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: t } });
+      fireEvent.click(screen.getByText("Send"));
+    }
+    await settle();
+
+    // An ORDINARY error, not the sticky one.
+    h.startConciergeTurn.mockRejectedValueOnce(new Error("a transient blip"));
+    act(() => h.brain.done?.({ id: "1", text: "answered" }));
+    await settle();
+
+    // "third" still got its turn — the queue survived the blip that killed "second".
+    expect(String(h.startConciergeTurn.mock.calls.at(-1)?.[0])).toContain("third");
+    // And no sticky notice was posted.
+    expect(within(thread()).queryByText(/AI enhancements are off/)).toBeNull();
   });
 
   // Each refused path gets its OWN remedy, and the remedies genuinely differ: Retry for a pane that

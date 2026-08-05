@@ -72,7 +72,6 @@ import {
   // round-trips within one send. This one queues whole TURNS. Different jobs, and a shadowed name
   // here would silently route sends into the wrong one.
   enqueue as enqueueTurn,
-  statusOf,
   turnFinished,
   type QueuedTurn,
   type TurnQueueState,
@@ -83,6 +82,7 @@ import {
   onConciergeDone,
   onConciergeError,
   onConciergeTool,
+  ConciergeAiDisabledError,
   onConciergeTurnsAbandoned,
   startConciergeTurn,
   startProactiveConciergeTurn,
@@ -1077,6 +1077,25 @@ export function ConciergeHost({
    *  effect must keep its minimal dep array — re-subscribing mid-turn would drop the events still
    *  arriving for it — and `dispatchTurn` is defined below its own callers. */
   const drainQueueRef = useRef<() => void>(() => {});
+  /**
+   * Bubble ids that were NEVER handed to the brain — queued behind a running turn, or evicted at the
+   * cap — so no reply may claim to have answered them.
+   *
+   * ══ A SET, NOT A LIVE READ OF THE QUEUE (roborev 58223-M1) ═══════════════════════════════════
+   * The first cut asked `statusOf(turnQueueRef.current, id) !== "waiting"` at stamp time, and that
+   * is defeated by the drain: `drainQueue` runs earlier in the same `done` handler and synchronously
+   * promotes the next waiter from `waiting` to `running`, so by the time the anchors are stamped the
+   * queued message reports "working" and the filter lets it through. The two fixes silently
+   * cancelled — visible only on the no-delta path, where the reply's bubble is created in `done`.
+   *
+   * Recording membership at ENQUEUE is NOT by itself order-independent, and claiming it was is how
+   * the second attempt failed: `dispatchTurn` DELETES the id, so a drain running before the stamp
+   * retracted the flag just as surely as the live read did. What actually holds the property is
+   * WHERE THE DRAIN RUNS — last in the `done` handler, after the reply has been stamped. This set
+   * carries the fact; the drain's position is what stops it being retracted too early. Both are
+   * required, and the ordering is asserted by a test rather than left to this comment.
+   */
+  const neverSentRef = useRef<Set<string>>(new Set());
 
   /**
    * The running turn ended — release the slot and start the next waiter, if any.
@@ -2047,9 +2066,7 @@ export function ConciergeHost({
       // Filtered on the QUEUE rather than on the thread, because the thread cannot tell the
       // difference — both bubbles look identically sent. `statusOf` is the reducer's own answer to
       // "has this message's turn started", which is precisely the question being asked here.
-      const answers = pendingAnchors(prev).filter(
-        (a) => statusOf(turnQueueRef.current, a.id) !== "waiting",
-      );
+      const answers = pendingAnchors(prev).filter((a) => !neverSentRef.current.has(a.id));
       return answers.length ? { answers } : {};
     };
     // `lint` IS ONLY EVER PASSED BY THE `done` PATH, and the omission is load-bearing on the delta
@@ -2161,13 +2178,6 @@ export function ConciergeHost({
         // message would be stamped "never answered" by whatever the user typed after it.
         awaitingBubbleRef.current = null;
         setAwaitingId(null);
-      // ══ DRAINED AFTER TEARDOWN, NEVER BEFORE (probe 3) ═══════════════════════════════════════════
-      // `drainQueue` DISPATCHES the next turn, and dispatch sets the awaited bubble, starts the
-      // liveness clock and raises the typing indicator. Every one of those is state about the turn
-      // that just STARTED — so running it before this handler's teardown meant the teardown then
-      // cleared them: `noteConciergeSettled` stopped the new turn's clock and the null-out dropped
-      // its bubble association, leaving turn N+1 running with no message attached to it.
-        drainQueueRef.current();
       }
       // ══ THE LINTER RUNS HERE ═══════════════════════════════════════════════════════════════════
       // The reply is COMPLETE at `done`, which is what the checks need: mid-stream, `[@Left Pai` is
@@ -2228,6 +2238,20 @@ export function ConciergeHost({
       // one is skipped entirely for a `done` carrying no text, which is exactly a turn whose deltas
       // said everything — the case where the flag would silently never be set.
       markSettled(e.id);
+      // ══ DRAIN LAST — AFTER THE TEARDOWN *AND* AFTER THE REPLY IS STAMPED (roborev 58223-M1) ═════
+      // Two earlier positions were both wrong, and the second is the instructive one.
+      //
+      // Before the teardown: dispatch raises the new turn's state and the teardown then cleared it
+      // (probe 3). Moved after the teardown but still ABOVE the stamp: `dispatchTurn` removes the
+      // newly-started message from `neverSentRef`, so by the time the reply's anchors were computed
+      // the queued message no longer looked unsent and the filter let it through — the SAME
+      // cancellation the set was introduced to prevent, one level down. A set recorded at enqueue is
+      // only order-independent if nothing mutates it in between, and dispatch does.
+      //
+      // Last is the only position where both hold: the teardown has run, the reply has been stamped
+      // against the queue as it stood while that turn was the one being answered, and only then does
+      // the next turn start.
+      drainQueueRef.current();
       // ══ THE PROMISE LEDGER (sparkle-gfume) ═══════════════════════════════════════════════════
       // Measured across all 1,490 logged turns: 45 first-person promises made, 9 kept, 35 dropped.
       // The linter above cannot see this — it compares a claim against THIS turn's calls and
@@ -3073,8 +3097,21 @@ export function ConciergeHost({
     // losing it SILENTLY is not acceptable: the whole point of this feature is that a question the
     // user asked is never quietly destroyed, which is precisely the defect the queue replaced.
     // `SendOutcome.dropped` exists for this, and until now nothing read it.
+    if (!outcome.dispatch) neverSentRef.current.add(queued.bubbleId);
     if (outcome.dropped) {
       const lost = outcome.dropped;
+      // FINDING 3 (roborev 58223-M3): the evicted bubble stays in the thread, and once it is out of
+      // the queue nothing marks it — so the next reply's anchor walk would claim it and stamp
+      // "Answered below" on a question that was never sent. It gets the same treatment `askSparkle`
+      // already gives an orphaned bubble.
+      neverSentRef.current.add(lost.bubbleId);
+      setChat((prev) =>
+        prev.map((m) =>
+          m.kind === "you" && m.id === lost.bubbleId && m.receipt
+            ? { ...m, receipt: { ...m.receipt, unanswered: true, redirectable: false } }
+            : m,
+        ),
+      );
       setChat((prev) => [
         ...prev,
         {
@@ -3108,6 +3145,8 @@ export function ConciergeHost({
    * would silence the turn that is still legitimately streaming.
    */
   const dispatchTurn = useCallback((entry: QueuedTurn) => {
+    // Its turn is starting, so it HAS been sent — a reply may legitimately claim it from here.
+    neverSentRef.current.delete(entry.bubbleId);
     const bubbleId = entry.bubbleId.startsWith("pending-") ? null : entry.bubbleId;
     awaitingBubbleRef.current = bubbleId;
     setAwaitingId(bubbleId);
@@ -3148,7 +3187,56 @@ export function ConciergeHost({
         setTyping(false);
         awaitingBubbleRef.current = null;
         setAwaitingId(null);
-        drainQueueRef.current();
+        // ══ SAY SO, AND DO NOT CASCADE (roborev 58223-M2) ═══════════════════════════════════════
+        // `startConciergeTurn` rejects on exactly one condition — AI enhancements being off — and
+        // that condition is STICKY. Draining here would dispatch the next waiter, which rejects for
+        // the same reason, which drains the next: a queue of N questions emptied in N microtasks
+        // with nothing on screen. That is the silent loss this file refuses to accept for a single
+        // evicted message, doing it to the whole queue.
+        //
+        // So the queue is CLEARED and the loss is reported ONCE, listing what did not go, rather
+        // than cascading a rejection through every waiter.
+        // ══ ONLY A STICKY FAILURE CLEARS THE QUEUE (roborev 58241-M2) ═════════════════════════════
+        // `ConciergeAiDisabledError` is the one rejection that cannot be retried — the toggle is off
+        // and stays off — so draining would dispatch the next waiter into the same rejection, and
+        // the whole queue would empty in N microtasks. Any OTHER rejection may be transient, and
+        // destroying every queued question over one is far worse than trying the next: this handler
+        // is generic, so the clear must be conditional on the typed error rather than on "something
+        // threw".
+        const sticky = err instanceof ConciergeAiDisabledError;
+        if (!sticky) {
+          drainQueueRef.current();
+          return;
+        }
+        const stranded = [entry, ...turnQueueRef.current.waiting];
+        for (const q of stranded) neverSentRef.current.add(q.bubbleId);
+        // EACH STRANDED BUBBLE IS MARKED (roborev 58241-M4). `clearQueue` erases their "Waiting its
+        // turn" line, so without this they render identically to a delivered message and the only
+        // trace is one failure bubble that scrolls away. Same stamp the evicted message gets.
+        const strandedIds = new Set(stranded.map((q) => q.bubbleId));
+        setChat((prev) =>
+          prev.map((m) =>
+            m.kind === "you" && strandedIds.has(m.id) && m.receipt
+              ? { ...m, receipt: { ...m.receipt, unanswered: true, redirectable: false } }
+              : m,
+          ),
+        );
+        turnQueueRef.current = clearQueue();
+        setTurnQueue(turnQueueRef.current);
+        setChat((prev) => [
+          ...prev,
+          {
+            id: nextId("err"),
+            kind: "failure",
+            // NAMES THE TOGGLE. Routing this through `conciergeFailureNotice` produced "try me again
+            // in a moment" — and retrying is the one thing that cannot work here, which is exactly
+            // the remedy-string failure that module's own header exists to prevent.
+            headline: "AI enhancements are off — turn them back on to send these",
+            // The machine's OWN sentence, per that module's contract that evidence is the verbatim
+            // detail, followed by the questions that did not go so each can be re-sent.
+            evidence: [String(err), "", ...stranded.map((q) => q.text)].join("\n"),
+          },
+        ]);
       },
     );
   }, []);
