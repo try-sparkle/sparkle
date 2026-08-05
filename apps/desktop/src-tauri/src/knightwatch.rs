@@ -299,6 +299,35 @@ fn truncate_text(text: &str) -> String {
 /// body whose quoted half cites probe 1 while saying nothing about it, and the next read would score
 /// the probe ANSWERED. The same shape fires from a quote of the refusal message, which renders
 /// `• probe 1 …` in citation form. Quoted text is somebody else's words being shown, never an answer.
+/// Does `body` cite this probe by its DURABLE identity — `<commentId>#<index>`?
+///
+/// THE WINDOW HAS A HARD EDGE, and this is the way over it. A `Probe N` citation is attributed only
+/// to the review the reply directly follows, because numbering RESTARTS every review and `Probe 1`
+/// after review 2 must mean review 2's. The cost is that once a newer review posts, the older
+/// review's probes become unreachable: no `Probe N` in any later reply can ever name them again, so
+/// a probe that was genuinely FIXED can only be merged with an override — a recorded waiver for
+/// work that was actually done. knightwatch re-reviews on ~1h inactivity, so a pass slower than that
+/// has its window closed underneath it while it is still citing correctly (bead `sparkle-tv6ii`).
+///
+/// `<commentId>#<index>` has no such ambiguity — it names exactly one probe on the whole PR — so it
+/// is honoured from ANY later reply. It is the same string the refusal prints, so the remedy the
+/// gate suggests is one a reader can actually follow.
+fn cites_probe_id(body: &str, comment_id: u64, index: u32) -> bool {
+    let needle = format!("{comment_id}#{index}");
+    body.lines()
+        .filter(|l| !l.trim_start().starts_with('>'))
+        .any(|l| {
+            l.match_indices(&needle).any(|(at, _)| {
+                // Bounded like `line_cites_probe`: neither side may extend the number, so
+                // `15182769304#1` and `5182769304#12` are not this probe.
+                let before_ok = at == 0 || !l.as_bytes()[at - 1].is_ascii_digit();
+                let end = at + needle.len();
+                let after_ok = end >= l.len() || !l.as_bytes()[end].is_ascii_digit();
+                before_ok && after_ok
+            })
+        })
+}
+
 fn cites_probe(body: &str, n: u32) -> bool {
     body.lines()
         .filter(|l| !l.trim_start().starts_with('>'))
@@ -421,7 +450,18 @@ fn evaluate(comments: &[Comment]) -> ProbeGate {
             let Some((index, severity, from, text)) = parse_probe_line(line) else {
                 continue;
             };
-            let answered = repliers.iter().any(|c| cites_probe(&c.body, index));
+            // Two ways to answer, and the second is deliberately NOT windowed. The windowed
+            // `Probe N` form is the teachable one; the durable `<commentId>#<index>` form is the
+            // only one that can still reach a probe after a newer review has closed its window.
+            let answered = repliers.iter().any(|c| cites_probe(&c.body, index))
+                || comments
+                    .iter()
+                    .skip(pos + 1)
+                    .filter(|c| {
+                        !is_knightwatch(&c.body)
+                            && !c.body.trim_start().starts_with(OVERRIDE_MARKER)
+                    })
+                    .any(|c| cites_probe_id(&c.body, review.id, index));
             probes.push(Probe {
                 comment_id: review.id,
                 index,
@@ -575,7 +615,12 @@ fn describe_probe(p: &Probe) -> String {
         None => String::new(),
     };
     let url = if p.url.is_empty() { String::new() } else { format!("\n    {}", p.url) };
-    format!("  • probe {}{from} — \"{}\"{url}", p.index, p.text)
+    format!(
+        "  • probe {} [{}]{from} — \"{}\"{url}",
+        p.index,
+        p.id(),
+        p.text
+    )
 }
 
 /// The refusal. Names EVERY offending probe, says how to answer one, and says how to override.
@@ -585,9 +630,12 @@ fn blocking_refusal(number: u64, probes: &[&Probe]) -> String {
     format!(
         "Merge blocked: PR #{number} carries {} unanswered [blocking] knightwatch {plural}.\n\n\
          {listed}\n\n\
-         To answer one, post a NEW comment on the PR that cites it by number — \"Probe 1 — applied, \
-         …\" or \"probe #1 declined because …\". The citation has to be in a comment of YOUR own: a \
-         later knightwatch comment never clears a probe. Then merge again.\n\
+         To answer one, post a NEW comment on the PR citing it by the DURABLE id shown above — \
+         \"5182769304#1 — applied, …\". That form names one probe on the whole PR and works from any \
+         later comment. A bare \"Probe 1\" also works, but ONLY until the next review lands: it is \
+         read against the review your reply follows, so a newer review puts older probes out of its \
+         reach. Either way the citation has to be in a comment of YOUR own — a later knightwatch \
+         comment never clears a probe. Then merge again.\n\
          To merge anyway, supply a knightwatch override reason (at least {MIN_OVERRIDE_REASON} \
          characters, more than one word) saying why. It is posted to the PR as a permanent record \
          BEFORE the merge runs.",
@@ -1044,6 +1092,7 @@ mod tests {
         let blocking = gate.unanswered_blocking();
         assert_eq!(ids(&blocking), vec!["5182769304#1"]);
 
+        let probe_id = blocking[0].id();
         let msg = blocking_refusal(1176, &blocking);
         assert!(msg.contains("Merge blocked"), "{msg}");
         assert!(msg.contains("probe 1"), "the probe's number: {msg}");
@@ -1053,7 +1102,15 @@ mod tests {
             msg.contains("The landing gate still checks only orchestration and mobile"),
             "the probe's own words: {msg}"
         );
-        assert!(msg.contains("cites it by number"), "how to answer it: {msg}");
+        // THE REMEDY MUST LEAD WITH THE FORM THAT ALWAYS WORKS. A bare `Probe 1` is read against
+        // the review the reply follows, so telling the reader to use it is telling them to use the
+        // one form that CANNOT clear this probe once a newer review has landed — the
+        // remedy-you-cannot-follow shape this gate has already shipped once.
+        assert!(
+            msg.contains("DURABLE id shown above"),
+            "how to answer it, durable form first: {msg}"
+        );
+        assert!(msg.contains(&probe_id), "the durable id itself: {msg}");
         assert!(msg.contains("override"), "and how to override: {msg}");
     }
 
