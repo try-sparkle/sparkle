@@ -272,11 +272,81 @@ fn is_picker_footer_line(line: &str) -> bool {
         && (footer_legacy().is_match(line) || footer_bar().is_match(line))
 }
 
+/// Is this row pure SEPARATION — no content — between a dialog's options and its footer?
+///
+/// Blank, or nothing but box decoration. Border-aware on purpose: every other matcher in this
+/// module tolerates a frame (`selection_cursor` carries `[│|]?`, all three label patterns carry it,
+/// both footer arms carry `[ \t]*[│|┃]?` on each side), and the classifier's own fixtures pin
+/// Claude Code's `╭─ … ─╮` menu as a real screen. A literal `trim().is_empty()` treats the box's
+/// spacer row (`│        │`) and its bottom border (`╰────────╯`) as CONTENT, so a genuinely
+/// bordered session-limit picker would classify false — fail-closed, so nothing unsafe is armed,
+/// but the feature would silently stop working for that shape and no fixture would catch it: the
+/// sole captured picker is a screenshot transcription its own header flags as needing a proper
+/// re-capture, so it is not authority on whether the real TUI boxes this dialog (roborev 58539).
+fn is_separator_row(line: &str) -> bool {
+    line.chars()
+        .all(|c| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    // sides and rules
+                    '│' | '|' | '┃' | '─' | '━' | '┄' | '┈' | '═'
+                    // rounded corners
+                    | '╭' | '╮' | '╰' | '╯'
+                    // square and heavy corners. These were absent, which made four of
+                    // `is_closing_border`'s six glyphs UNREACHABLE: the trailing slot is only ever
+                    // spent as `is_separator_row && is_closing_border`, so `└────┘` failed the
+                    // first conjunct and could never be free — a false negative on a render this
+                    // repo has already captured (`claude_code_screen`'s BOX_BOTTOM accepts `└`/`┘`,
+                    // and a captured screen draws `└─────┘└─────┘`). Adding the OPENING squares too
+                    // is behaviour-preserving — they were rejected for not being separator-class
+                    // and are now rejected by `is_opening_border`, which is the rule that MEANS it
+                    // — and it keeps every glyph in both border classes reachable (roborev 58581).
+                    | '┌' | '┐' | '└' | '┘' | '┏' | '┓' | '┗' | '┛'
+                )
+        })
+}
+
+/// An OPENING box border, and therefore NOT separation (roborev 58557).
+///
+/// `is_separator_row` answers "does this row carry content"; it cannot tell a box CLOSING from a
+/// box OPENING, and the difference is the whole safety argument. A closing `╰────╯` beneath the
+/// options says the frame we already matched ended there. A `╭──────╮` says a DIFFERENT frame
+/// STARTS here — which is positive evidence that whatever follows belongs to that new dialog, not
+/// to our options. Treating it as blank space is what let a scrolled-past picker whose viewport
+/// clips the top border of the live input box score zero trailing rows and arm `Esc` at whatever
+/// was live underneath.
+///
+/// THE SQUARE/HEAVY CORNERS HERE ARE LOAD-BEARING — do not trim them as redundant. They were
+/// decorative when this was written, because `is_separator_row` did not accept them and a row
+/// carrying one already counted as content. Reaching the dead half of `is_closing_border` meant
+/// widening that class (roborev 58581), which spent exactly that belt-and-braces defence: `┌ ┐ ┏ ┓`
+/// in this predicate are now the ONLY thing rejecting a square or heavy top border, both in the
+/// option→footer gap and beneath the footer. Removing one opens a real gap.
+fn is_opening_border(line: &str) -> bool {
+    line.chars().any(|c| matches!(c, '╭' | '╮' | '┌' | '┐' | '┏' | '┓'))
+}
+
+/// A CLOSING box border — the only decoration the trailing budget may spend its one slot on.
+///
+/// `is_separator_row && !is_opening_border` is NOT the same predicate (roborev 58571). It frees any
+/// row drawn from the separator class, and the class contains `─`, which is the full-width
+/// TRANSCRIPT DIVIDER Claude Code draws between segments — `capturedScreens.fixture.ts` catches the
+/// real TUI drawing one directly above "Session limit reached". A divider beneath the footer is the
+/// same "a different frame starts here" evidence `is_opening_border` exists to reject, yet it was
+/// consuming the free slot and scoring zero. Requiring a corner makes the code mean what the
+/// budget's name, its comment and the shared doc block all already claimed it meant.
+fn is_closing_border(line: &str) -> bool {
+    line.chars().any(|c| matches!(c, '╰' | '╯' | '└' | '┘' | '┗' | '┛'))
+}
+
 /// True when the rendered viewport is Claude Code's SESSION-LIMIT picker specifically.
 ///
 /// Requires ALL of: the mandatory reset label, at least `MIN_OPTIONS_PRESENT` labels overall, the
 /// shared `selection_cursor` (so a markdown blockquote's `>` cannot qualify), a picker footer
-/// BELOW the options, and at most `MAX_TRAILING_ROWS` non-blank rows after that footer.
+/// BELOW the options, and at most `MAX_TRAILING_ROWS` rows after that footer once blanks and a
+/// SINGLE closing-border row are discounted — an opening border always counts, and so does a bare
+/// `─` transcript divider, which is decoration but closes nothing (roborev 58557, 58571).
 pub fn screen_is_session_limit_picker(text: &str) -> bool {
     // The label half, mirroring TS `hasSessionLimitOptions`. Reset is mandatory: both "Switch to …"
     // labels are generic enough to appear on some other settings picker, whereas "stop and wait for
@@ -317,11 +387,52 @@ pub fn screen_is_session_limit_picker(text: &str) -> bool {
     if footer_idx - last_option > MAX_OPTION_FOOTER_GAP {
         return false;
     }
-    // Rule (4): bottom-anchored.
-    let trailing = all[footer_idx + 1..]
+    // …and the footer must BELONG to this option block. Positive ownership, not a blocklist:
+    // only BLANK rows may separate the last option from its footer.
+    //
+    // The first attempt rejected an intervening CURSORED NUMBERED row, which closes exactly one
+    // shape of foreign dialog and leaves the class open — a live slider footer
+    // ("← or → to adjust · Del to remove limit") or a switcher carries no numbered row at all, so it
+    // sailed through and `MAX_OPTION_FOOTER_GAP` was again the only defence, holding on height
+    // alone. That is the reasoning this rule exists to reject, so keying on one shape was the same
+    // mistake one level up (roborev 58527).
+    //
+    // The genuine article renders its footer immediately beneath option 3, so requiring whitespace
+    // is not a guess — anything else on those rows belongs to something that is not this dialog.
+    //
+    // An OPENING border in that span is content no matter how box-drawn it looks: `╭──────╮`
+    // between our options and a footer means a new frame began there, so the footer beneath it is
+    // that frame's, not ours (roborev 58557).
+    if all[last_option + 1..footer_idx]
         .iter()
-        .filter(|l| !l.trim().is_empty())
-        .count();
+        .any(|l| !is_separator_row(l) || is_opening_border(l))
+    {
+        return false;
+    }
+    // Rule (4): bottom-anchored — and BOUNDED, which the first version of this was not.
+    //
+    // A bordered dialog closes with `╰────╯` beneath its footer, so that one row must be free or
+    // the separator rule above would accept a bordered render this rule then rejects. But my first
+    // pass discounted EVERY decoration row, unbounded, on a budget whose own documentation argues
+    // for exactness "in the dangerous direction" — so an arbitrarily long decoration run, or the
+    // `╭──────╮` top border of the live input box clipped by the viewport, scored zero and armed
+    // the keystroke (roborev 58557). The motivation needs exactly one row; it gets exactly one.
+    let mut trailing = 0usize;
+    let mut closing_border_budget = 1usize;
+    for l in &all[footer_idx + 1..] {
+        if l.trim().is_empty() {
+            continue; // a blank line was always free, and stays free
+        }
+        if is_separator_row(l)
+            && is_closing_border(l)
+            && !is_opening_border(l)
+            && closing_border_budget > 0
+        {
+            closing_border_budget -= 1; // the dialog's own closing border, once
+            continue;
+        }
+        trailing += 1;
+    }
     trailing <= MAX_TRAILING_ROWS
 }
 
@@ -1046,8 +1157,15 @@ mod tests {
             let live = fixture_screen(name);
             // Session-limit labels ABOVE, carrying no selection cursor of their own, then the live
             // dialog below — the ordinary way a limit banner scrolls up but stays on the grid.
+            // Labels ASSEMBLED, never written contiguously — the module's own invariant, stated
+            // above: a test file is a file agents `cat` and review, and whole labels sitting in this
+            // source would stream a genuine trigger through the classifier and pin the READING agent
+            // at `waiting`. I violated it in the first version of this test (roborev 58506).
             let composite = format!(
-                "  1. Stop and wait for limit to reset\n  2. Switch to usage credits\n  3. Switch to Team plan\n{live}"
+                "  1. {}\n  2. {}\n  3. {}\n{live}",
+                reset_label(),
+                credits_label(),
+                team_label()
             );
             // The premise is real: the label half IS satisfied by the scrollback, so this screen
             // genuinely reaches the coherence rules rather than being rejected before them.
@@ -1066,6 +1184,118 @@ mod tests {
                 "{name} under scrolled-up labels must still refuse the keystroke"
             );
         }
+    }
+
+    /// THE CURSOR-BEARING COMPOSITE, which is the REALISTIC scrollback and the variant my first
+    /// version missed. A session-limit picker that scrolled up KEEPS its highlight glyph — the real
+    /// fixture renders `❯ 1. <reset>` — so the scrollback alone satisfies the mandatory reset label,
+    /// the option count AND rule (1) cursor-on-an-option-row. The cursorless composite tested above
+    /// is over-determined; here the only remaining defence is the option→footer distance.
+    ///
+    /// The short-dialog arm is the sharp one: a live approval whose footer sits within
+    /// `MAX_OPTION_FOOTER_GAP` rows of the scrolled-up options. If that earned the exemption, a
+    /// machine would press Esc on a tool approval a human is mid-answer on.
+    #[test]
+    fn a_cursor_bearing_scrollback_still_never_earns_the_exemption() {
+        for name in ["APPROVAL_2_1_220", "ASK_USER_QUESTION_2_1_220", "MODEL_PICKER_2_1_220"] {
+            let live = fixture_screen(name);
+            let composite = format!(
+                "❯ 1. {}\n  2. {}\n  3. {}\n{live}",
+                reset_label(),
+                credits_label(),
+                team_label()
+            );
+            assert_eq!(
+                session_limit_options_present(&composite),
+                3,
+                "{name}: the premise — the scrollback must carry all three labels"
+            );
+            assert!(
+                !screen_is_session_limit_picker(&composite),
+                "{name} under a CURSOR-BEARING scrolled-up picker must not read as the session-limit picker"
+            );
+            assert_eq!(
+                escape_refusal(Some(&Screen { text: &composite, alternate: false })),
+                Some(Refusal::AwaitingInput),
+                "{name} under a cursor-bearing scrollback must still refuse the keystroke"
+            );
+        }
+
+        // A live dialog with a footer but NO NUMBERED ROW AT ALL — a slider or a switcher. The
+        // first ownership rule keyed on an intervening cursored numbered row, so this shape sailed
+        // straight through it (roborev 58527); these are real captured 2.1.220 footers.
+        for foreign in [
+            "← or → to adjust · Del to remove limit",
+            "←/→ to switch · ↓ to select · Esc to cancel",
+        ] {
+            let slider = format!(
+                "❯ 1. {}\n  2. {}\n  3. {}\nAdjust the limit\n{foreign}",
+                reset_label(),
+                credits_label(),
+                team_label()
+            );
+            assert!(
+                !screen_is_session_limit_picker(&slider),
+                "a cursorless live dialog's footer must not be adopted by scrolled-up options"
+            );
+            assert_eq!(
+                escape_refusal(Some(&Screen { text: &slider, alternate: false })),
+                Some(Refusal::AwaitingInput),
+                "…and the keystroke must still be refused"
+            );
+        }
+
+        // A BARE `>` OPTION ROW — and this comment has now been wrong in BOTH directions, so read
+        // the scope carefully (roborev 58548, then knightwatch probe 1 on PR #1261).
+        //
+        // Version one said "the real approval fixture uses it". That was the inverse of the
+        // evidence and 58548 was right to kill it. Version two over-corrected to "grepping the
+        // fixtures for a bare-`>` cursor returns nothing" — true of `capturedScreens.fixture.ts`,
+        // and MISLEADING, because it reads as "no live approval draws `>`". One does:
+        // `screenClassifier.test.ts` pins a FOUNDER-REPORTED approval that rendered `>` instead of
+        // `❯`, which is why that file's own test catches such prompts by their FOOTER.
+        //
+        // So the bare `>` is a real render, not merely a blockquote or a degraded font — which
+        // makes this assertion MORE load-bearing than version two credited, not less. What does not
+        // change is the remedy: `SELECTION_CURSOR` still must not accept `>`, because every markdown
+        // blockquote in scrollback is `> …` and three separate guards exist to keep it out. The
+        // positive ownership rule needs no glyph at all — `> 1. Yes` is CONTENT, so a footer beneath
+        // it is not ours whatever drew the cursor — and that is exactly what this pins.
+        let bare_gt = format!(
+            "❯ 1. {}\n  2. {}\n  3. {}\nDo you want to proceed?\n> 1. Yes\n  2. No\n{}",
+            reset_label(),
+            credits_label(),
+            team_label(),
+            PICKER_FOOTER
+        );
+        assert!(
+            !screen_is_session_limit_picker(&bare_gt),
+            "a bare `>` approval under scrolled-up options must not earn the exemption either"
+        );
+        assert_eq!(
+            escape_refusal(Some(&Screen { text: &bare_gt, alternate: false })),
+            Some(Refusal::AwaitingInput)
+        );
+
+        // SHORT dialog: the options and the live footer are only a few rows apart, so
+        // MAX_OPTION_FOOTER_GAP cannot carry the decision on height alone.
+        let short = format!(
+            "❯ 1. {}\n  2. {}\n  3. {}\n\nDo you want to proceed?\n❯ 1. Yes\n  2. No\n{}",
+            reset_label(),
+            credits_label(),
+            team_label(),
+            PICKER_FOOTER
+        );
+        assert_eq!(session_limit_options_present(&short), 3, "premise: all three labels present");
+        assert!(
+            !screen_is_session_limit_picker(&short),
+            "a SHORT live approval under scrolled-up session-limit options must not earn the exemption"
+        );
+        assert_eq!(
+            escape_refusal(Some(&Screen { text: &short, alternate: false })),
+            Some(Refusal::AwaitingInput),
+            "and the keystroke must still be refused"
+        );
     }
 
     /// THE NARROWNESS TEST. Every ordinary captured picker — permission dialogs, AskUserQuestion
@@ -1149,6 +1379,14 @@ mod tests {
     /// Pinned on BOTH sides of the boundary so an off-by-one cannot pass.
     #[test]
     fn options_far_above_the_footer_do_not_pair_with_it() {
+        // CONTRACT CHANGED DELIBERATELY (roborev 58527), not worked around. This asserted that a
+        // gap of up to MAX_OPTION_FOOTER_GAP filled with TRANSCRIPT lines was "still the same
+        // frame". That tolerance is exactly the vulnerability: a live dialog rendered a few rows
+        // under a scrolled-up session-limit picker supplies the footer, the scrollback supplies the
+        // labels and the cursor, and the distance bound is the only thing left — which holds on
+        // fixture height, not on any property of the screen. A live Ink dialog renders contiguously;
+        // the genuine article puts its footer immediately beneath option 3. So only WHITESPACE may
+        // separate them, and the distance bound remains as a cheap outer guard.
         let framed = |gap: usize| {
             format!(
                 "What do you want to do?\n❯ 1. {}\n  2. {}{}\n{PICKER_FOOTER}",
@@ -1157,13 +1395,253 @@ mod tests {
                 "\n⏺ …transcript scrolled past.".repeat(gap.saturating_sub(1)),
             )
         };
-        // gap == MAX_OPTION_FOOTER_GAP: still one frame.
+        // Non-blank (non-decoration) rows between the options and the footer disqualify at ANY
+        // distance — the footer belongs to whatever rendered them. The DISTANCE bound is pinned on
+        // both sides below, on the blank path, which is the only one that still reaches it.
         assert!(
-            screen_is_session_limit_picker(&framed(MAX_OPTION_FOOTER_GAP)),
-            "a gap of exactly MAX_OPTION_FOOTER_GAP is still the same frame"
+            !screen_is_session_limit_picker(&framed(MAX_OPTION_FOOTER_GAP)),
+            "transcript between the options and the footer means the footer is not theirs"
         );
-        // gap == MAX_OPTION_FOOTER_GAP + 1: the footer belongs to something else.
         assert!(!screen_is_session_limit_picker(&framed(MAX_OPTION_FOOTER_GAP + 1)));
+
+        // …while BLANK separation is still one frame, and the distance bound still bites beyond it.
+        let spaced = |blanks: usize| {
+            format!(
+                "What do you want to do?\n❯ 1. {}\n  2. {}\n  3. {}{}\n{PICKER_FOOTER}",
+                reset_label(),
+                credits_label(),
+                team_label(),
+                "\n".repeat(blanks),
+            )
+        };
+        assert!(
+            screen_is_session_limit_picker(&spaced(1)),
+            "a blank line between the options and their own footer is still one dialog"
+        );
+        // BOTH SIDES OF THE BOUNDARY, on the blank path — the only path that still reaches the
+        // distance bound now that non-blank rows are rejected outright. `spaced(n)` puts the footer
+        // n+1 rows after the last option, so these are gap == MAX and gap == MAX + 1. Without the
+        // pair, mutating `>` to `>=` or drifting the constant anywhere in 2..=10 stays green,
+        // INCLUDING the loosening direction on a rule that arms a keystroke (roborev 58539).
+        assert!(
+            screen_is_session_limit_picker(&spaced(MAX_OPTION_FOOTER_GAP - 1)),
+            "a gap of exactly MAX_OPTION_FOOTER_GAP is still one dialog"
+        );
+        assert!(
+            !screen_is_session_limit_picker(&spaced(MAX_OPTION_FOOTER_GAP)),
+            "one row beyond it, the footer belongs to something else"
+        );
+
+        // A BORDERED render: the box's spacer and bottom border are decoration, not content, so a
+        // genuine picker inside a frame must still match. Every other matcher here tolerates
+        // `[│|┃]?`, and the classifier's fixtures pin Claude Code's `╭─ … ─╮` menu as real.
+        let boxed = format!(
+            "╭──────────────╮\n│ What do you want to do? │\n│ ❯ 1. {} │\n│   2. {} │\n│   3. {} │\n│              │\n│ {PICKER_FOOTER} │\n╰──────────────╯",
+            reset_label(),
+            credits_label(),
+            team_label()
+        );
+        assert!(
+            screen_is_session_limit_picker(&boxed),
+            "a bordered session-limit picker is still the session-limit picker"
+        );
+    }
+
+    /// THE OTHER BORDERED RENDER: the footer drawn BENEATH the closed box rather than inside it.
+    ///
+    /// This is the case where the accommodation and the ownership rule genuinely pull against each
+    /// other, and roborev 58557 was right that it passed while nothing pinned it. A `╰────╯`
+    /// between the last option and the footer is positive evidence the footer rendered OUTSIDE the
+    /// options' frame — so is it a second dialog?
+    ///
+    /// No, and the reason is asymmetric. A CLOSING border says only that the frame we already
+    /// matched ended; Ink routinely draws a menu's hint line just below its box, which is exactly
+    /// this shape. An OPENING border would say a new frame STARTS, and that is the one we reject.
+    /// The pair of tests below is the contract: closing → still ours, opening → never ours.
+    #[test]
+    fn a_footer_beneath_the_closed_box_is_still_this_dialog() {
+        let footer_below = format!(
+            "╭──────────────╮\n│ ❯ 1. {} │\n│   2. {} │\n│   3. {} │\n╰──────────────╯\n{PICKER_FOOTER}",
+            reset_label(),
+            credits_label(),
+            team_label()
+        );
+        assert!(
+            screen_is_session_limit_picker(&footer_below),
+            "a hint line drawn just beneath a menu's closed box is that menu's own footer"
+        );
+    }
+
+    /// AN OPENING BORDER IS NEVER SEPARATION — the half that actually guards the keystroke.
+    #[test]
+    fn an_opening_border_between_the_options_and_the_footer_disqualifies() {
+        let new_frame = format!(
+            "❯ 1. {}\n  2. {}\n  3. {}\n╭──────────────╮\n{PICKER_FOOTER}",
+            reset_label(),
+            credits_label(),
+            team_label()
+        );
+        assert!(
+            !screen_is_session_limit_picker(&new_frame),
+            "a box that OPENS between our options and a footer means that footer is the new box's"
+        );
+    }
+
+    /// THE TRAILING BUDGET IS BOUNDED, which my first version of the border accommodation was not.
+    ///
+    /// Discounting every decoration row without limit spent slack in the direction
+    /// `MAX_TRAILING_ROWS`'s own doc block refuses. The first case is the concrete regression
+    /// roborev 58557 named: a scrolled-past picker whose viewport clips the TOP border of the live
+    /// input box below scored zero trailing rows and armed `Esc` at whatever was live underneath.
+    #[test]
+    fn decoration_below_the_footer_is_bounded_to_one_closing_row() {
+        let with_trailing = |trailing: &str| {
+            format!(
+                "❯ 1. {}\n  2. {}\n  3. {}\n{PICKER_FOOTER}\n{trailing}",
+                reset_label(),
+                credits_label(),
+                team_label()
+            )
+        };
+
+        // The one row the accommodation exists for.
+        assert!(
+            screen_is_session_limit_picker(&with_trailing("╰──────────────╯")),
+            "the dialog's own closing border beneath its footer is free"
+        );
+        // …and only one.
+        assert!(
+            !screen_is_session_limit_picker(&with_trailing("╰──────────────╯\n────────────────")),
+            "a SECOND decoration row is not free — the budget is one, not unlimited"
+        );
+        // The clipped live input box. Decoration by shape, a live dialog by meaning.
+        assert!(
+            !screen_is_session_limit_picker(&with_trailing("╭──────────────╮")),
+            "an OPENING border below the footer is another dialog starting, never free"
+        );
+        // Blank rows were free before this change and stay free, at any length.
+        assert!(
+            screen_is_session_limit_picker(&with_trailing("\n\n\n")),
+            "blank rows beneath the footer were always ignored and still are"
+        );
+
+        // THE BUDGET IS ONE, asserted with rows that BOTH satisfy the closing-border conjunct.
+        //
+        // The `╰──╯` + `────` case below pins the closing-glyph rule, not the budget: its second
+        // row fails `is_closing_border`, so it would still return false with the budget deleted
+        // outright. Adding that conjunct silently un-pinned the counter it sits next to — the
+        // "a fix makes an existing guard unable to fail" shape — and a scrolled-past picker
+        // trailing several `╰──╯` rows would have scored zero and armed Esc (roborev 58581).
+        assert!(
+            !screen_is_session_limit_picker(&with_trailing("╰──────────────╯\n╰──────────────╯")),
+            "TWO closing borders is one more than the budget, whatever their shape"
+        );
+
+        // A CLOSING BORDER WITH CONTENT ON THE SAME ROW IS NOT DECORATION — the `is_separator_row`
+        // conjunct's own pin, and the THIRD one in this condition to need it (roborev 58615).
+        // Nothing in the corpus was a row carrying both content and a closing glyph, so that
+        // conjunct was deletable with every test green. Ink labels its borders — `╰─ press ? for
+        // help ─╯`, `└─ tests ─┘` — and discounting one would score zero with genuine content
+        // sitting beneath the footer, which is the exact claim `MAX_TRAILING_ROWS == 0` makes.
+        assert!(
+            !screen_is_session_limit_picker(&with_trailing("╰──────────────╯ 3 files changed")),
+            "a closing border with CONTENT on the same row is content, not decoration"
+        );
+
+        // A ROW THAT CLOSES OURS AND OPENS ANOTHER IS NEVER FREE — the `!is_opening_border`
+        // conjunct's own pin (roborev 58608). Every other trailing case reaches `false` through the
+        // closing-border rule first, including the lone `╭──────╮`, so that sibling conjunct could
+        // be deleted from the Rust loop with every test still green — the same un-pinning the
+        // closing conjunct did to the budget one round earlier, one conjunct over. Side-by-side
+        // boxes are a shape this repo has captured, and spending the slot on one would score zero
+        // and arm Esc at a frame that just started.
+        assert!(
+            !screen_is_session_limit_picker(&with_trailing("╰──────────────╯╭──────────────╮")),
+            "a row that closes our frame AND opens another is never free"
+        );
+
+        // THE SLOT IS FOR A CLOSING BORDER, NOT FOR DECORATION IN GENERAL (roborev 58571).
+        //
+        // `is_separator_row && !is_opening_border` freed any row of the separator class, and that
+        // class contains `─` — the full-width TRANSCRIPT DIVIDER the real TUI draws between
+        // segments, captured in `capturedScreens.fixture.ts` directly above "Session limit
+        // reached". A divider beneath the footer is the same "a different frame starts here"
+        // evidence `is_opening_border` was added to reject, and it was consuming the slot and
+        // scoring zero. Before the border work it counted, and the gate refused. These two cases
+        // are the difference between the budget's NAME and its behaviour.
+        assert!(
+            !screen_is_session_limit_picker(&with_trailing("────────────────")),
+            "a bare transcript divider is decoration, but it CLOSES nothing — not free"
+        );
+        assert!(
+            !screen_is_session_limit_picker(&with_trailing("│")),
+            "a lone frame side closes nothing either"
+        );
+    }
+
+    /// EVERY GLYPH IN THE CLOSING CLASS CAN ACTUALLY SPEND THE SLOT, one at a time.
+    ///
+    /// Four of the six were UNREACHABLE when this class was added: the slot is only ever spent as
+    /// `is_separator_row && is_closing_border`, and the separator class carried no square or heavy
+    /// bottom corner, so `└────┘` failed the first conjunct and the picker went unrecognised on a
+    /// render this repo has captured. Fail-closed, so never a safety hole — but a false negative,
+    /// and the drift test had frozen the dead half of the class into both ports (roborev 58581).
+    #[test]
+    fn each_closing_glyph_can_spend_the_trailing_slot() {
+        // ONE AT A TIME, not in pairs. The first version iterated `('╰','╯')`, `('└','┘')`,
+        // `('┗','┛')` and put BOTH members on every row — and `is_closing_border` is an `any()`,
+        // so dropping `╯`, `┘` or `┛` from the class left all three rows matching on their
+        // left-hand partner and both suites green. Half the class was still unexercised, which is
+        // the exact defect the previous round asked this test to fix (roborev 58608).
+        for glyph in ['╰', '╯', '└', '┘', '┗', '┛'] {
+            let trailing = format!("{glyph}──────────────");
+            let screen = format!(
+                "❯ 1. {}\n  2. {}\n  3. {}\n{PICKER_FOOTER}\n{trailing}",
+                reset_label(),
+                credits_label(),
+                team_label()
+            );
+            assert!(
+                screen_is_session_limit_picker(&screen),
+                "{trailing:?} closes a frame, so it must be able to spend the one free slot"
+            );
+        }
+    }
+
+    /// EVERY GLYPH IN THE SEPARATOR CLASS IS LOAD-BEARING, asserted one at a time.
+    ///
+    /// The bordered fixtures above exercise `│` and space only, so deleting `┃ ━ ┄ ┈ ═ |` from
+    /// either port left both suites green (roborev 58557). A class member nothing exercises is a
+    /// class member that can be dropped by accident.
+    #[test]
+    fn each_separator_glyph_counts_as_separation() {
+        for glyph in [
+            '│', '|', '┃', '─', '━', '┄', '┈', '═', '╰', '╯', '└', '┘', '┗', '┛',
+        ] {
+            let gapped = format!(
+                "❯ 1. {}\n  2. {}\n  3. {}\n{glyph}\n{PICKER_FOOTER}",
+                reset_label(),
+                credits_label(),
+                team_label()
+            );
+            assert!(
+                screen_is_session_limit_picker(&gapped),
+                "{glyph:?} is in the separator class, so a row of it must not break ownership"
+            );
+        }
+        // The opening corners are in the class too, but they are separation NOWHERE.
+        for glyph in ['╭', '╮', '┌', '┐', '┏', '┓'] {
+            let gapped = format!(
+                "❯ 1. {}\n  2. {}\n  3. {}\n{glyph}\n{PICKER_FOOTER}",
+                reset_label(),
+                credits_label(),
+                team_label()
+            );
+            assert!(
+                !screen_is_session_limit_picker(&gapped),
+                "{glyph:?} OPENS a frame, so it is content no matter how box-drawn it looks"
+            );
+        }
     }
 
     /// The cursor must sit on an OPTION ROW OF THIS DIALOG. Against the whole grid, an unrelated
@@ -1344,6 +1822,16 @@ mod tests {
         for needle in [
             // screenClassifier.ts
             r"const SELECTION_CURSOR = /^\s*[│|]?\s*[❯›]\s*\d+\.\s/m;",
+            // The two border predicates decide what counts as "no content" on the rule that arms
+            // the keystroke, and pinning only their CALL SITES left the character classes free to
+            // drift: add `>` to SEPARATOR_ROW, or drop `╰╯─`, and every call-site needle still
+            // matched verbatim while the ports silently disagreed on which screens are pickers
+            // (roborev 58557). The Rust side is the one that presses the key, so a TS-side
+            // NARROWING leaves this gate strictly more permissive than the classifier meant to
+            // bound it. Byte-for-byte, like every other ported regex here.
+            r"const SEPARATOR_ROW = /^[\s│|┃╭╮╰╯┌┐└┘┏┓┗┛─━┄┈═]*$/;",
+            r"const OPENING_BORDER = /[╭╮┌┐┏┓]/;",
+            r"const CLOSING_BORDER = /[╰╯└┘┗┛]/;",
             r"/[([]y\/n[)\]]/i,",
             r"/press enter to continue/i,",
             r"/\boverwrite\?/i,",
@@ -1354,6 +1842,62 @@ mod tests {
                 classifier.contains(needle),
                 "screenClassifier.ts changed a pattern this module ported: {needle}\n\
                  Port the change into nudge_gate.rs rather than editing this expectation."
+            );
+        }
+
+        // STRUCTURE, not just literals. The loop above pins the ported REGEXES; it says nothing
+        // about the RULES built on them — which is how the two ports came to disagree in the first
+        // place. `screenClassifier.ts` grew the same four-rule session-limit matcher, and the
+        // dialog-OWNERSHIP rule (a foreign cursored option row between the options and the footer
+        // means that footer is not ours) existed in neither until a live Esc-exemption gap was found
+        // on main. Deleting it from the TS side would leave every literal intact and this test green,
+        // so pin the rule itself: these are the load-bearing fragments of each rule, chosen to be
+        // stable under formatting.
+        // VACUOUS-NEEDLE FIX (knightwatch probe 2 on PR #1261). The first three needles here were
+        // BARE IDENTIFIERS — `MAX_OPTION_FOOTER_GAP`, `MAX_TRAILING_ROWS`,
+        // `isSessionLimitOptionLine` — and screenClassifier.ts IMPORTS all three (lines 26/27/29).
+        // So each one matched the import statement, and every assertion below stayed green with the
+        // rule BODIES deleted outright: precisely the "assertion was already true before the
+        // change" shape AGENTS.md calls the #1 fleet-wide finding. Pin the USE SITE instead — an
+        // expression cannot survive in a file whose rule has been removed.
+        for needle in [
+            // Rule 2a (TS's own numbering — the labels here were swapped, roborev 58564).
+            "footerAt - lastOption > MAX_OPTION_FOOTER_GAP",
+            // Rule 2b — bottom-anchored.
+            "return trailing <= MAX_TRAILING_ROWS;",
+            // Rule 1 — the cursor must sit on OUR option row, not a foreign dialog's.
+            //
+            // The scan-loop `continue` was pinned here first, and it was VACUOUS in the same way
+            // the bare identifiers were: that loop must survive to compute `lastOption` for the
+            // footer search and the distance bound, so reverting roborev 58159 — back to testing
+            // SELECTION_CURSOR against the WHOLE snapshot, the widening that let a permission menu
+            // hundreds of rows above satisfy this rule — left the needle matching byte-for-byte.
+            // Mutation-verified: deleting both lines below kept the drift test green. Pin the two
+            // that cannot outlive the rule (roborev 58564/58571).
+            "if (SELECTION_CURSOR.test(lines[i]!)) cursorOnOption = true;",
+            "if (lastOption < 0 || !cursorOnOption) return false;",
+            "if (!isSessionLimitOptionLine(lines[i]!)) continue;",
+            // The ownership rule. Deleting this loop is the regression this line exists to catch.
+            "for (let i = lastOption + 1; i < footerAt; i++) {",
+            "if (!isSeparatorRow(lines[i]!) || isOpeningBorder(lines[i]!)) return false;",
+            // The bounded trailing budget. An unbounded decoration discount is the regression.
+            "isSeparatorRow(line) &&",
+            "isClosingBorder(line) &&",
+            "!isOpeningBorder(line) &&",
+            // THE BUDGET ITSELF. Adding the `isClosingBorder` conjunct silently un-pinned it: the
+            // only case that had exercised it used a bare `────` as its second row, which now fails
+            // the new conjunct, so it returns false for a reason unrelated to the budget and the
+            // whole budget could be deleted with both suites green (roborev 58581). Pinned here and
+            // asserted behaviourally by the two-closing-borders case in both ports.
+            "closingBorderBudget > 0",
+            "closingBorderBudget--;",
+        ] {
+            assert!(
+                classifier.contains(needle),
+                "screenClassifier.ts dropped a session-limit RULE this module mirrors: {needle}\n\
+                 The two ports gate the same keystroke exemption; they must agree on the rules, not \
+                 merely on the regexes. Port the change into nudge_gate.rs rather than editing this \
+                 expectation."
             );
         }
 
@@ -1404,16 +1948,25 @@ mod tests {
         // one generic label from qualifying, and MAX_TRAILING_ROWS is the bottom-anchor rule that
         // stops prose quoting the picker from matching. A TS-side relaxation of either without the
         // matching Rust change is a silent widening of the exemption.
+        // DERIVED FROM THE RUST CONSTANTS, not hardcoded. These read `= 2;` / `= 0;` / `= 8;` as
+        // literals, which pinned the TS value against a number typed twice — so a drift on the RUST
+        // side sailed through and the ports could disagree on the very thresholds this test exists
+        // to keep in step. Measured: setting MAX_OPTION_FOOTER_GAP to 1000 left all 36 tests green,
+        // because the boundary tests build their input RELATIVE to the constant and therefore scale
+        // with it. That is the half of roborev 58539's second finding ("drifting the constant
+        // anywhere in 2..=10 stays green") that re-pinning the boundary could not reach: the
+        // boundary tests pin the off-by-one, and only this loop can pin the VALUE.
         for needle in [
-            "export const MIN_OPTIONS_PRESENT = 2;",
-            "export const MAX_TRAILING_ROWS = 0;",
-            "export const MAX_OPTION_FOOTER_GAP = 8;",
-            r#"export const SESSION_LIMIT_REASON = "session-limit-picker";"#,
+            format!("export const MIN_OPTIONS_PRESENT = {MIN_OPTIONS_PRESENT};"),
+            format!("export const MAX_TRAILING_ROWS = {MAX_TRAILING_ROWS};"),
+            format!("export const MAX_OPTION_FOOTER_GAP = {MAX_OPTION_FOOTER_GAP};"),
+            r#"export const SESSION_LIMIT_REASON = "session-limit-picker";"#.to_string(),
         ] {
             assert!(
-                session_limit.contains(needle),
-                "sessionLimitScreen.ts changed a constant this module ported: {needle}\n\
-                 Port the change into nudge_gate.rs rather than editing this expectation."
+                session_limit.contains(&needle),
+                "sessionLimitScreen.ts and nudge_gate.rs disagree on a ported constant: {needle}\n\
+                 This needle is DERIVED from the Rust constant, so this fires in BOTH directions — \
+                 either the TS value drifted, or the Rust value did. Change the two together."
             );
         }
 

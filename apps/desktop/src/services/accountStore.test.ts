@@ -452,6 +452,42 @@ describe("accountDisplay — the shell fork (default account only)", () => {
   });
 });
 
+describe("hasLogin — availability is a WIDER question than 'can I name it'", () => {
+  const DEFAULT = acct("d", { nickname: "DROdio Personal", isDefault: true });
+
+  it("never calls a signed-in account 'not signed in' — a uuid with no email is still a login", () => {
+    // roborev 58018. `signedIn` is email-only, and it was driving PROSE and AVAILABILITY as well as
+    // the label. For an `oauthAccount` carrying a uuid but no readable `emailAddress` — which
+    // AccountsScreen's own affordance and `duplicateAccountGroups` both treat as signed in — the
+    // fork notice emitted the flatly false "Sparkle runs this account as an account that isn't
+    // signed in", about the user's own account, in the dropdown and the tooltip.
+    const d = accountDisplay(
+      DEFAULT,
+      ident("d", { email: null, accountUuid: "u1", shellEmail: "them@example.com", shellAccountUuid: "u2" }),
+    );
+
+    expect(d.hasLogin).toBe(true);
+    expect(d.signedIn).toBe(false); // still no email to PRINT — the slot rule is unchanged
+    expect(d.shellForked).toBe(true);
+
+    const notice = forkNotice(d);
+    expect(notice).not.toContain("isn't signed in");
+    expect(notice).toBe(
+      "Sparkle runs this account as the account Sparkle is signed into; your terminal is signed in as them@example.com.",
+    );
+  });
+
+  it("keeps calling a genuinely login-less account not signed in", () => {
+    // The narrowness guard: widening to `hasLogin` must not make an empty config dir claim a login.
+    const d = accountDisplay(
+      DEFAULT,
+      ident("d", { email: null, accountUuid: null, shellEmail: "them@example.com", shellAccountUuid: "u2" }),
+    );
+    expect(d.hasLogin).toBe(false);
+    expect(accountSentenceName(d)).toBe("an account that isn't signed in");
+  });
+});
+
 describe("identityChanged", () => {
   it("is true only when the backend says the config dir hosted another login", () => {
     expect(identityChanged(ident("a", { identityChanged: true }))).toBe(true);

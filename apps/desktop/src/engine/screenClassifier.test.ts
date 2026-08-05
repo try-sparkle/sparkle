@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import { describe, it, expect } from "vitest";
 import { screenAwaitsInput, isSessionLimitPicker, PICKER_FOOTER } from "./screenClassifier";
+import { MAX_OPTION_FOOTER_GAP } from "../services/sessionLimitScreen";
 import {
   APPROVAL_2_1_220,
   APPROVAL_OPTION_2_2_1_220,
@@ -315,6 +316,232 @@ describe("screenAwaitsInput — captured Claude Code 2.1.220 screens", () => {
 const CONTRACT_DOC = resolve(dirname(fileURLToPath(import.meta.url)), "../../../../PRD/sparkle/claude-account-identity-truth.md");
 
 describe("isSessionLimitPicker", () => {
+  it("pins MAX_OPTION_FOOTER_GAP on BOTH sides, and accepts a bordered render", () => {
+    // The TS distance bound had NO assertion at all — grep found only the definition, the use, and a
+    // prose mention — so `>` → `>=` or any drift of the constant passed silently, including the
+    // loosening direction on a rule that arms a keystroke. Blank rows are the only path that still
+    // reaches it now that content rows are rejected outright (roborev 58539).
+    const reset = ["Stop and wait for", "limit to", "reset"].join(" ");
+    const credits = ["Switch to", "usage", "credits"].join(" ");
+    const team = ["Switch to", "Team", "plan"].join(" ");
+    const spaced = (blanks: number) =>
+      [
+        "What do you want to do?",
+        `\u276F 1. ${reset}`,
+        `  2. ${credits}`,
+        `  3. ${team}`,
+        ...Array(blanks).fill(""),
+        "Enter to confirm \u00B7 Esc to cancel",
+      ].join("\n");
+
+    expect(isSessionLimitPicker(spaced(MAX_OPTION_FOOTER_GAP - 1))).toBe(true);
+    expect(isSessionLimitPicker(spaced(MAX_OPTION_FOOTER_GAP))).toBe(false);
+
+    // Box decoration is not content — the frame's spacer and its closing border must not disqualify
+    // a genuine picker, matching the [│|┃]? tolerance every other matcher here already carries.
+    const boxed = [
+      "\u256D\u2500\u2500\u2500\u2500\u2500\u2500\u256E",
+      "\u2502 What do you want to do? \u2502",
+      `\u2502 \u276F 1. ${reset} \u2502`,
+      `\u2502   2. ${credits} \u2502`,
+      `\u2502   3. ${team} \u2502`,
+      "\u2502          \u2502",
+      "\u2502 Enter to confirm \u00B7 Esc to cancel \u2502",
+      "\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u256F",
+    ].join("\n");
+    expect(isSessionLimitPicker(boxed)).toBe(true);
+  });
+
+  // The TWIN of nudge_gate.rs's border contract (roborev 58557). A CLOSING border says the frame we
+  // matched ended — Ink routinely draws a menu's hint line just beneath its box — so the footer is
+  // still ours. An OPENING border says a different frame STARTS, so it never is. The pair is the
+  // contract; neither half is meaningful without the other.
+  it("keeps a footer drawn beneath the closed box, and refuses one beneath an opening box", () => {
+    const reset = ["Stop and wait for", "limit to", "reset"].join(" ");
+    const credits = ["Switch to", "usage", "credits"].join(" ");
+    const team = ["Switch to", "Team", "plan"].join(" ");
+    const withGap = (gap: string) =>
+      [
+        `\u276F 1. ${reset}`,
+        `  2. ${credits}`,
+        `  3. ${team}`,
+        gap,
+        "Enter to confirm \u00B7 Esc to cancel",
+      ].join("\n");
+
+    expect(isSessionLimitPicker(withGap("\u2570\u2500\u2500\u2500\u2500\u256F"))).toBe(true);
+    expect(isSessionLimitPicker(withGap("\u256D\u2500\u2500\u2500\u2500\u256E"))).toBe(false);
+  });
+
+  // The trailing budget is BOUNDED. Discounting every decoration row without limit spent slack in
+  // the direction MAX_TRAILING_ROWS explicitly refuses: a scrolled-past picker whose viewport clips
+  // the TOP border of the live input box scored zero and armed the keystroke.
+  it("frees exactly one closing-border row beneath the footer, and no more", () => {
+    const reset = ["Stop and wait for", "limit to", "reset"].join(" ");
+    const credits = ["Switch to", "usage", "credits"].join(" ");
+    const team = ["Switch to", "Team", "plan"].join(" ");
+    const withTrailing = (trailing: string) =>
+      [
+        `\u276F 1. ${reset}`,
+        `  2. ${credits}`,
+        `  3. ${team}`,
+        "Enter to confirm \u00B7 Esc to cancel",
+        trailing,
+      ].join("\n");
+
+    // The row the accommodation exists for.
+    expect(isSessionLimitPicker(withTrailing("\u2570\u2500\u2500\u2500\u2500\u256F"))).toBe(true);
+    // …and only one.
+    expect(
+      isSessionLimitPicker(withTrailing("\u2570\u2500\u2500\u2500\u2500\u256F\n\u2500\u2500\u2500\u2500")),
+    ).toBe(false);
+    // The clipped live input box: decoration by shape, a live dialog by meaning.
+    expect(isSessionLimitPicker(withTrailing("\u256D\u2500\u2500\u2500\u2500\u256E"))).toBe(false);
+    // Blanks were free before this change and stay free.
+    expect(isSessionLimitPicker(withTrailing("\n\n"))).toBe(true);
+
+    // The budget is ONE, asserted with two rows that BOTH satisfy the closing conjunct. The
+    // divider case below pins the closing-glyph rule, not the counter — with the budget deleted it
+    // would still be false — so without this the whole budget could be removed and stay green
+    // (roborev 58581).
+    expect(
+      isSessionLimitPicker(
+        withTrailing("\u2570\u2500\u2500\u2500\u256F\n\u2570\u2500\u2500\u2500\u256F"),
+      ),
+    ).toBe(false);
+
+    // A closing border with CONTENT on the same row is not decoration — the isSeparatorRow
+    // conjunct's own pin, third in the same condition to need one (roborev 58615). Ink labels its
+    // borders, and discounting a labelled one scores zero with real content below the footer.
+    expect(
+      isSessionLimitPicker(withTrailing("\u2570\u2500\u2500\u256F 3 files changed")),
+    ).toBe(false);
+
+    // A row that closes ours AND opens another is never free — the !isOpeningBorder conjunct's own
+    // pin. Every other case reaches false through the closing rule first, so the sibling conjunct
+    // was un-pinnable by exactly the mechanism that un-pinned the budget (roborev 58608).
+    expect(
+      isSessionLimitPicker(
+        withTrailing("\u2570\u2500\u2500\u256F\u256D\u2500\u2500\u256E"),
+      ),
+    ).toBe(false);
+
+    // The slot is for a CLOSING border, not decoration in general (roborev 58571): the separator
+    // class contains `\u2500`, the full-width transcript divider the real TUI draws between
+    // segments, and it was consuming the slot while closing nothing.
+    expect(isSessionLimitPicker(withTrailing("\u2500\u2500\u2500\u2500\u2500\u2500"))).toBe(false);
+    expect(isSessionLimitPicker(withTrailing("\u2502"))).toBe(false);
+  });
+
+  // Every member of the separator class, one at a time. The bordered fixture above exercises only
+  // `\u2502` and space, so deleting the rest of the class left this suite green.
+  it("treats each separator glyph as separation, and each opening corner as content", () => {
+    const reset = ["Stop and wait for", "limit to", "reset"].join(" ");
+    const credits = ["Switch to", "usage", "credits"].join(" ");
+    const team = ["Switch to", "Team", "plan"].join(" ");
+    const withGap = (gap: string) =>
+      [
+        `\u276F 1. ${reset}`,
+        `  2. ${credits}`,
+        `  3. ${team}`,
+        gap,
+        "Enter to confirm \u00B7 Esc to cancel",
+      ].join("\n");
+
+    for (const glyph of [
+      "\u2502", "|", "\u2503", "\u2500", "\u2501", "\u2504", "\u2508", "\u2550",
+      "\u2570", "\u256F", "\u2514", "\u2518", "\u2517", "\u251B",
+    ]) {
+      expect(isSessionLimitPicker(withGap(glyph))).toBe(true);
+    }
+    for (const glyph of ["\u256D", "\u256E", "\u250C", "\u2510", "\u250F", "\u2513"]) {
+      expect(isSessionLimitPicker(withGap(glyph))).toBe(false);
+    }
+
+    // Every glyph of the CLOSING class can actually spend the trailing slot. Four of the six were
+    // unreachable when the class was added, because the separator class carried no square or heavy
+    // bottom corner and the slot is only spent as isSeparatorRow && isClosingBorder.
+    const withTrailingRow = (row: string) =>
+      [
+        `\u276F 1. ${reset}`,
+        `  2. ${credits}`,
+        `  3. ${team}`,
+        "Enter to confirm \u00B7 Esc to cancel",
+        row,
+      ].join("\n");
+    // ONE AT A TIME. Iterating PAIRS put both members on every row, and isClosingBorder is an
+    // any(), so dropping the right-hand glyph of each pair left the suite green (roborev 58608).
+    for (const glyph of ["\u2570", "\u256F", "\u2514", "\u2518", "\u2517", "\u251B"]) {
+      expect(isSessionLimitPicker(withTrailingRow(`${glyph}\u2500\u2500\u2500\u2500`))).toBe(true);
+    }
+  });
+
+  it("refuses a BARE `>` approval cursor under a scrolled-up session-limit picker", () => {
+    // ATTRIBUTION CORRECTED (roborev 58548): an earlier version of this comment claimed the real
+    // approval fixture uses a bare `>`. It does not — all four captured 2.1.220 screens render `❯`,
+    // and no fixture contains a bare-`>` cursor. The shape this stands in for is the markdown
+    // BLOCKQUOTE (SELECTION_CURSOR excludes `>` precisely so a quote cannot flip status) and any
+    // build that degrades the glyph. The distinction matters because the false version is the exact
+    // premise that would justify widening SELECTION_CURSOR to accept `>`. The assertion stays: a
+    // cheap guard against a future glyph-keyed ownership rule.
+    const reset = ["Stop and wait for", "limit to", "reset"].join(" ");
+    const credits = ["Switch to", "usage", "credits"].join(" ");
+    const team = ["Switch to", "Team", "plan"].join(" ");
+    const screen = [
+      `\u276F 1. ${reset}`,
+      `  2. ${credits}`,
+      `  3. ${team}`,
+      "Do you want to proceed?",
+      "> 1. Yes",
+      "  2. No",
+      "Enter to confirm \u00B7 Esc to cancel",
+    ].join("\n");
+    expect(isSessionLimitPicker(screen)).toBe(false);
+  });
+
+  it("refuses a CURSORLESS live dialog's footer under a scrolled-up session-limit picker", () => {
+    // A slider or switcher supplies a picker footer with NO numbered row at all, so an ownership
+    // rule keyed on an intervening cursored numbered row misses it entirely (roborev 58527). Real
+    // captured 2.1.220 footers. Labels assembled, never contiguous.
+    const reset = ["Stop and wait for", "limit to", "reset"].join(" ");
+    const credits = ["Switch to", "usage", "credits"].join(" ");
+    const team = ["Switch to", "Team", "plan"].join(" ");
+    for (const foreign of [
+      "\u2190 or \u2192 to adjust \u00B7 Del to remove limit",
+      "\u2190/\u2192 to switch \u00B7 \u2193 to select \u00B7 Esc to cancel",
+    ]) {
+      const screen = [
+        `\u276F 1. ${reset}`,
+        `  2. ${credits}`,
+        `  3. ${team}`,
+        "Adjust the limit",
+        foreign,
+      ].join("\n");
+      expect(isSessionLimitPicker(screen)).toBe(false);
+    }
+  });
+
+  it("refuses a SHORT live approval rendered under a scrolled-up session-limit picker", () => {
+    // The TS twin of the Rust gap (roborev 58506). Distance alone is not ownership: the scrollback
+    // supplies the labels and the cursor, the live approval supplies the footer, and both sit inside
+    // MAX_OPTION_FOOTER_GAP. Granting the exemption here would have a machine press Esc on a tool
+    // approval a human is mid-answer on. Labels assembled, never written contiguously.
+    const reset = ["Stop and wait for", "limit to", "reset"].join(" ");
+    const credits = ["Switch to", "usage", "credits"].join(" ");
+    const team = ["Switch to", "Team", "plan"].join(" ");
+    const screen = [
+      `\u276F 1. ${reset}`,
+      `  2. ${credits}`,
+      `  3. ${team}`,
+      "",
+      "Do you want to proceed?",
+      "\u276F 1. Yes",
+      "  2. No",
+      "Enter to confirm \u00B7 Esc to cancel",
+    ].join("\n");
+    expect(isSessionLimitPicker(screen)).toBe(false);
+  });
+
   it("flags a real session-limit viewport", () => {
     expect(isSessionLimitPicker(SESSION_LIMIT_PICKER)).toBe(true);
   });

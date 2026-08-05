@@ -122,6 +122,14 @@ describe("AccountBadge — the identity slot is a verified login or nothing", ()
     mount([acct("g", "DROdio Gmail")], [ident("g", null)]);
     expect(dot().style.background).not.toBe(rgb(C.teal));
     expect(dot().style.background).toBe("transparent");
+    cleanup();
+
+    // …but an account whose oauthAccount carries a uuid and no readable email IS logged in. Its
+    // LABEL is unavailable, not the account, so the dot stays lit. Keying the dot on `signedIn`
+    // (email only) instead of `hasLogin` (uuid OR email) would paint a working account as dead.
+    mount([acct("u", "uuid-only")], [ident("u", null, { accountUuid: "u1" })]);
+    expect(dot().style.background).toBe(rgb(C.teal));
+    expect(screen.getByTestId("account-badge-identity").textContent).toBe(NOT_SIGNED_IN);
   });
 });
 

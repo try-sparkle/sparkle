@@ -107,6 +107,90 @@ describe("switchRecommendation", () => {
     expect(rec?.to.id).toBe("b");
   });
 
+  // SAME LOGIN IS NOT A SWITCH. Two registrations of one Anthropic account share one quota, so
+  // moving every agent across gains nothing and re-hits the identical limit immediately — under a
+  // banner naming both sides with the same email. `duplicateAccountGroups` (display) and
+  // `siblingMap` (benching) already deduped on identity; this decision never did.
+  it.each([
+    ["they share an accountUuid", "u-same", "u-same", "a@x.com", "b@x.com"],
+    // The uuid is absent on a login predating the field, so the email carries it — matching
+    // `identityKey` and the Rust ledger rather than a fourth rule.
+    ["neither has a uuid but the emails match", null, null, "same@x.com", "same@x.com"],
+    ["one has no uuid and the emails match", null, "u-b", "same@x.com", "same@x.com"],
+  ])("never recommends a registration of the same login when %s", (_case, ua, ub, ea, eb) => {
+    const dup: Identity[] = [
+      { id: "a", email: ea, organization: null, accountUuid: ua },
+      ident("b"),
+      { id: "c", email: eb, organization: null, accountUuid: ub },
+    ];
+    const u = [usage("a", 90), usage("b", 50), usage("c", 1)];
+    const c2 = [ceil("a", 100), ceil("b", 100), ceil("c", 100)];
+    // `c` looks like the emptiest account in the world; it is the same quota as `a`.
+    expect(switchRecommendation("a", accounts, u, c2, dup, NOW)?.to.id).toBe("b");
+    // …and when the duplicate is the ONLY candidate, stay silent rather than offer a no-op.
+    expect(switchRecommendation("a", [acct("a"), acct("c")], u, c2, dup, NOW)).toBeNull();
+  });
+
+  it("excludes on the UUID clause alone, when no email is readable on `from`", () => {
+    // Pins the other half of the `comparable` disjunction. Every row above that proves exclusion
+    // also has emails on both sides, so the email clause alone keeps them comparable and deleting
+    // the uuid clause leaves them green — the guard would be half-unpinned. Here sameness is
+    // provable ONLY by the uuid, so dropping that clause makes the pair incomparable → "not same"
+    // → recommended, restoring the duplicate-quota no-op switch this exclusion exists to prevent.
+    const sameUuidNoEmailOnFrom: Identity[] = [
+      { id: "a", email: null, organization: null, accountUuid: "u-same" },
+      { id: "b", email: "b@x.com", organization: null, accountUuid: "u-same" },
+    ];
+    const u = [usage("a", 10, NOW + 60_000), usage("b", 1)];
+    const c2 = [ceil("a", 100), ceil("b", 100)];
+    expect(
+      switchRecommendation("a", [acct("a"), acct("b")], u, c2, sameUuidNoEmailOnFrom, NOW),
+    ).toBeNull();
+  });
+
+  it("still recommends when the CURRENT account's identity is unreadable — unknown is not same", () => {
+    // THE REACHABLE HALF of "unknown is not same", and the only one that discriminates. Candidates
+    // are already filtered by `signedInAccountIds` (email != null), so a candidate is always
+    // resolvable — an unreadable one is dropped by that filter, not by this rule. `from` is NOT
+    // filtered that way: it is whichever account agents are running under, and it can be exhausted
+    // by a real limit event with no readable identity at all.
+    //
+    // `identitiesDiffer` answers false both for "provably same" and for "cannot tell". Without the
+    // resolvable guard an unreadable `from` therefore reads as the SAME login as every candidate,
+    // all of them are excluded, and the switcher goes silent exactly when the user most needs it.
+    // Only positive evidence of sameness may exclude.
+    const unreadableFrom: Identity[] = [
+      { id: "a", email: null, organization: null, accountUuid: null },
+      { id: "b", email: "b@x.com", organization: null, accountUuid: "u-b" },
+    ];
+    // `a` is exhausted by a real limit event, so a recommendation is warranted regardless of its
+    // ceiling or its identity.
+    const u = [usage("a", 10, NOW + 60_000), usage("b", 1)];
+    const c2 = [ceil("a", 100), ceil("b", 100)];
+    expect(
+      switchRecommendation("a", [acct("a"), acct("b")], u, c2, unreadableFrom, NOW)?.to.id,
+    ).toBe("b");
+  });
+
+  it("still recommends when the two identities are INCOMPARABLE, not merely non-empty", () => {
+    // The subtler half, and the one a per-side "is this non-empty" guard lets through.
+    // `identitiesDiffer` only decides when both sides carry the SAME field, so `from` with a uuid
+    // and no email, against a candidate with an email and no uuid (a login predating the field),
+    // is undecidable — it takes neither branch and returns false. A guard that only asks whether
+    // each side is individually resolvable passes both, and `!false` then excludes the candidate on
+    // zero evidence. With every candidate predating the uuid field, the switcher would go silent
+    // for an exhausted account.
+    const incomparable: Identity[] = [
+      { id: "a", email: null, organization: null, accountUuid: "u-a" },
+      { id: "b", email: "b@x.com", organization: null, accountUuid: null },
+    ];
+    const u = [usage("a", 10, NOW + 60_000), usage("b", 1)];
+    const c2 = [ceil("a", 100), ceil("b", 100)];
+    expect(
+      switchRecommendation("a", [acct("a"), acct("b")], u, c2, incomparable, NOW)?.to.id,
+    ).toBe("b");
+  });
+
   it("never recommends an account that is itself exhausted or warning", () => {
     const u = [usage("a", 90), usage("b", 95), usage("c", 10, NOW + 60_000)];
     const c2 = [ceil("a", 100), ceil("b", 100), ceil("c", 100)];

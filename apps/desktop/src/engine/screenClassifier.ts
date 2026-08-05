@@ -196,6 +196,38 @@ function isPickerFooterLine(line: string): boolean {
  * to be: that function is what permits a machine keystroke at a billing dialog, and it fails closed
  * whenever the two sides disagree. Change one, change the other, in the same commit.
  */
+/** Pure SEPARATION — blank, or nothing but box decoration. Border-aware because every other matcher
+ *  here tolerates a frame (`SELECTION_CURSOR` and the footer arms all carry `[│|┃]?`) and the
+ *  fixtures pin Claude Code's `╭─ … ─╮` menu as a real screen; a literal emptiness test would treat
+ *  a box spacer or bottom border as content and reject a genuinely bordered picker. Kept in step
+ *  with `nudge_gate.rs::is_separator_row` (roborev 58539). */
+const SEPARATOR_ROW = /^[\s│|┃╭╮╰╯┌┐└┘┏┓┗┛─━┄┈═]*$/;
+function isSeparatorRow(line: string): boolean {
+  return SEPARATOR_ROW.test(line);
+}
+
+/** An OPENING box border, and therefore NOT separation (roborev 58557).
+ *
+ *  `isSeparatorRow` answers "does this row carry content" and cannot tell a box CLOSING from one
+ *  OPENING — which is the whole safety argument. `╰────╯` says the frame we matched ended; a
+ *  `╭──────╮` says a DIFFERENT frame starts here, so what follows is that dialog's, not ours.
+ *  Kept in step with `nudge_gate.rs::is_opening_border`. */
+const OPENING_BORDER = /[╭╮┌┐┏┓]/;
+function isOpeningBorder(line: string): boolean {
+  return OPENING_BORDER.test(line);
+}
+
+/** A CLOSING box border — the only decoration the trailing budget may spend its one slot on.
+ *
+ *  `isSeparatorRow && !isOpeningBorder` is a LOOSER predicate: the separator class contains `─`,
+ *  which is the full-width transcript divider the real TUI draws between segments. A divider
+ *  beneath the footer is the same "different frame" evidence `isOpeningBorder` rejects, so it must
+ *  not consume the slot (roborev 58571). Kept in step with `nudge_gate.rs::is_closing_border`. */
+const CLOSING_BORDER = /[╰╯└┘┗┛]/;
+function isClosingBorder(line: string): boolean {
+  return CLOSING_BORDER.test(line);
+}
+
 export function isSessionLimitPicker(snapshot: string): boolean {
   if (!snapshot.trim()) return false;
 
@@ -241,9 +273,38 @@ export function isSessionLimitPicker(snapshot: string): boolean {
   }
   if (footerAt < 0 || footerAt - lastOption > MAX_OPTION_FOOTER_GAP) return false;
 
-  // Rule 2b — bottom-anchored. See MAX_TRAILING_ROWS for why the budget is exact rather than slack.
+  // Rule 2a-bis — the footer must BELONG to this option block. Positive ownership, not a
+  // blocklist: only BLANK rows may separate the last option from its footer. Keying on an
+  // intervening cursored NUMBERED row closed one shape and left the class open — a live slider or
+  // switcher footer carries no numbered row, so it slipped through and the distance bound was again
+  // the only defence, holding on height alone. The genuine article renders its footer immediately
+  // beneath option 3. Kept in step with `nudge_gate.rs` (roborev 58527).
+  // An OPENING border in that span is content however box-drawn it looks: a new frame began there,
+  // so the footer beneath it is that frame's, not ours (roborev 58557).
+  for (let i = lastOption + 1; i < footerAt; i++) {
+    if (!isSeparatorRow(lines[i]!) || isOpeningBorder(lines[i]!)) return false;
+  }
+
+  // Rule 2b — bottom-anchored, and BOUNDED. A bordered dialog closes with `╰────╯` beneath its
+  // footer, so that ONE row is free; discounting every decoration row without limit spent slack in
+  // the dangerous direction the MAX_TRAILING_ROWS doc block explicitly refuses, letting a clipped
+  // `╭──────╮` from the live input box score zero (roborev 58557).
   let trailing = 0;
-  for (let i = footerAt + 1; i < lines.length; i++) if (lines[i]!.trim()) trailing++;
+  let closingBorderBudget = 1;
+  for (let i = footerAt + 1; i < lines.length; i++) {
+    const line = lines[i]!;
+    if (!line.trim()) continue; // a blank line was always free
+    if (
+      isSeparatorRow(line) &&
+      isClosingBorder(line) &&
+      !isOpeningBorder(line) &&
+      closingBorderBudget > 0
+    ) {
+      closingBorderBudget--; // the dialog's own closing border, once
+      continue;
+    }
+    trailing++;
+  }
   return trailing <= MAX_TRAILING_ROWS;
 }
 

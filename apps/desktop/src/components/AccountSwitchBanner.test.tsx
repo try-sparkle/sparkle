@@ -44,7 +44,7 @@ describe("AccountSwitchBanner", () => {
       <AccountSwitchBanner recommendation={rec} plan={null} display={display} onAccept={vi.fn()} onDismiss={vi.fn()} />,
     );
     expect(screen.getByRole("alert").textContent).toContain("drodio@storytell.ai is 87% of its usual limit");
-    expect(screen.getByRole("button", { name: /Switch to drodio@gmail.com/ })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Switch to drodio@gmail.com" })).toBeTruthy();
   });
 
   it("accepting and dismissing call through", () => {
@@ -53,7 +53,7 @@ describe("AccountSwitchBanner", () => {
     render(
       <AccountSwitchBanner recommendation={rec} plan={null} display={display} onAccept={onAccept} onDismiss={onDismiss} />,
     );
-    fireEvent.click(screen.getByRole("button", { name: /Switch to drodio@gmail.com/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Switch to drodio@gmail.com" }));
     expect(onAccept).toHaveBeenCalledOnce();
     fireEvent.click(screen.getByRole("button", { name: "Not now" }));
     expect(onDismiss).toHaveBeenCalledOnce();

@@ -39,8 +39,9 @@
 //   2. the PRD's option labels carry a zero-width space inside each keyword, so they do not match
 //      the literals below at all;
 //   3. a picker FOOTER must be co-present, and the PRD rewrites its footer so it cannot match;
-//   4. the picker must be BOTTOM-ANCHORED — at most {@link MAX_TRAILING_ROWS} non-blank rows may
-//      follow the footer — so prose or a fence continuing beneath it disqualifies the frame.
+//   4. the picker must be BOTTOM-ANCHORED — at most {@link MAX_TRAILING_ROWS} rows may follow the
+//      footer, counting everything except blanks and a SINGLE closing-border row — so prose or a
+//      fence continuing beneath it disqualifies the frame.
 //
 // This module deliberately does NOT export a full `isSessionLimitPicker(snapshot)`; that is
 // W-DETECT's deliverable in `engine/screenClassifier.ts`, where the settle-time viewport and the
@@ -115,6 +116,14 @@ export const SESSION_LIMIT_TEAM_OPTION = /^\s*[│|]?\s*[❯›]?\s*\d+\.\s+swit
  *  `engine/capturedScreens.fixture.ts` — the permission box, its two-option sibling, the
  *  AskUserQuestion menu and the `/model` picker — end at their footer, with at most a trailing
  *  BLANK line (which this rule ignores). A modal picker takes the bottom of the grid.
+ *
+ *  WHAT "non-blank" MEANS HERE (roborev 58557): blanks are free, and so is ONE closing-border row,
+ *  because a bordered dialog draws its `╰────╯` beneath the footer. Exactly one — an unbounded
+ *  decoration allowance is slack in the direction this doc block refuses, and an OPENING border
+ *  (`╭──────╮`) is never free at all, since it is positive evidence a different frame starts
+ *  there. Neither is a bare `────────` transcript divider: it is decoration, but it CLOSES nothing,
+ *  and the real TUI draws one between segments. The free row must carry a closing corner. Both
+ *  ports implement this identically; see `nudge_gate.rs::is_closing_border`.
  *
  *  Any slack here is spent in the dangerous direction. At 3, a markdown file quoting the screen
  *  matches the moment its closing ``` fence is the only thing beneath the footer — one line — and

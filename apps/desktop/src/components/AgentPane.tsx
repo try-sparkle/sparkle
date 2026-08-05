@@ -1389,8 +1389,8 @@ export function AccountBadge({
           boxShadow: "0 2px 8px rgba(0,0,0,0.3)",
         }}
       >
-        {/* An unverified account reads as UNAVAILABLE, not as a differently-named account: the live
-            dot goes out and the slot takes the muted ink. */}
+        {/* An account with NO LOGIN reads as unavailable, not as a differently-named account: the
+            live dot goes out and the slot takes the muted ink. */}
         <span
           style={{
             width: 6,
