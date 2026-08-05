@@ -1499,25 +1499,41 @@ export function ConciergeHost({
     }
   }, [draftKey, takeAttachments, restoreAttachments]);
 
-  // ══ THE MOUNT THAT ROUTES — ONE VALUE, NOT TWO NOTIONS OF "MOUNTED" (roborev 57358/57361) ═══════
-  // `mountedAgentId` above is the DISPLAY mount: it asks only whether the cable is patched, which is
-  // the right question for "whose conversation does the column show". It is the WRONG question for
-  // "where do the founder's words go", and the difference is reachable rather than theoretical:
-  // `routingTarget` is `promptTargetShown ? target : null`, and `Workspace` sets `promptTargetShown =
-  // !sparkleActive && !boardActive && activeIsOpen` — false whenever the Plan board or the
-  // Improve-Sparkle pane is up, or the agent's tab is closed.
+  // ══ THE MOUNT THAT ROUTES *IS* THE MOUNT THE COLUMN NAMES — ONE VALUE, UNGATED ═════════════════
+  // The founder's rule, which supersedes the `promptTargetShown` gate that used to stand here:
+  // *"It should be sending it to the build agent unless I @mention Sparkle."*
   //
-  // In those states the cable is still patched, so an ungated mount would have `send` refuse to route
-  // (`mountRouted` also requires the routing target to agree) while the COMPOSER painted itself in the
-  // terminal's face — the indicator telling the founder their words were going into a PTY at the exact
-  // moment the app had decided they must not. An indicator that is wrong in the direction of "this is
-  // going somewhere irreversible" is worse than no indicator.
+  // WHAT THE GATE DID. This was `promptTargetShown ? mountedAgentId : null`, and `Workspace` sets
+  // `promptTargetShown = sparkleActive ? sparkleOpen : !boardActive && activeIsOpen` — false whenever
+  // the Plan board or the Improve-Sparkle pane is up, the agent's tab is closed, or (the cross-pair
+  // case, since `promptTarget` follows the CABLE via `wiredProject` while this predicate reads the
+  // RIGHT column) the cable is patched LEFT while the right column is on its board. In every one of
+  // those states the cable is still patched, so the column kept drawing "Chatting with ● <Agent>" and
+  // kept the agent's transcript swapped in — while the send fell through to the concierge and posted
+  // *"Asked Sparkle — press Esc to unmount and read the reply."* The founder screenshotted the two
+  // sentences stacked in one frame. Silently delivering his words to a recipient he did not choose is
+  // the most expensive failure this file can have, and it is worse than any refusal.
   //
-  // So this is the one value both halves read: the send path through `mountedAgentIdRef`, and the
-  // composer's typeface through the prop the column hands down. The thread swap deliberately keeps
-  // the UNGATED `mountedAgent` — which conversation is on screen is a display question, and hiding
-  // the agent's transcript because the Plan board is open would be a different bug.
-  const routableMountedAgentId = promptTargetShown ? mountedAgentId : null;
+  // WHY UNGATING IS SAFE, not merely mandated. The gate existed to stop an imperative typed while
+  // looking at the Plan board from being written into a terminal the founder cannot see. That hazard
+  // is caught ONE LAYER DOWN and caught better: `terminalWriteBlocked` treats a `no-viewport` read as
+  // FATAL for a `mount` (see its header — "I cannot read that screen" is not a normal state for a
+  // mount), so a send at an unmounted or unreadable pane is REFUSED, the reason is named on the
+  // mounted notice row, and the words go back in the box. The gate was a redundant SILENT pre-guard
+  // in front of a visible one; deleting it loses no protection and costs no message.
+  //
+  // WHAT STILL GATES ON `promptTargetShown`: the UNMOUNTED inference path (`routingTarget`, which is
+  // what `routeMessage` is told about the agent on screen) and the suggestions row's visibility.
+  // Those are inferences from what the user is looking at, and an inference genuinely must not aim at
+  // an off-screen pane. A MOUNT is not an inference — it is a gesture the user made and the column
+  // reports back to them — which is the same distinction `Concierge/composerRoute`'s header draws
+  // between a heuristic verdict and a user gesture. Do not re-gate this on a surface predicate.
+  //
+  // So one value now answers all three questions that must agree — the send path through
+  // `mountedAgentIdRef`, the composer's typeface through the prop the column hands down, and the
+  // "Chatting with" chip — and the state where the header named an agent and the words went
+  // elsewhere is no longer representable.
+  const routableMountedAgentId = mountedAgentId;
   // `send` is memoized on stable deps and runs after render, so it reads this through a ref exactly
   // as it reads the aim through `targetRef` — and for the same reason: the value has to be the one
   // that was true AT SUBMIT. Re-reading a live store inside the queued half would route a message at
@@ -1527,12 +1543,26 @@ export function ConciergeHost({
   useEffect(() => {
     mountedAgentIdRef.current = routableMountedAgentId;
   }, [routableMountedAgentId]);
-  // ══ AND THE *DISPLAY* MOUNT, WHICH IS THE ONE THE NOTICE ROW KEYS OFF (roborev 57424) ═══════════
-  // These two must not be conflated, and the first cut conflated them in the damaging direction:
-  // every notice write was gated on the ROUTING mount. That is the wrong question. The notice row
-  // exists for exactly one reason — `ConciergeThread` is not rendered, so anything said with
-  // `postSparkle` is off screen — and whether the thread is hidden is decided by the DISPLAY mount
-  // (`mountedAgent`, which the column keeps ungated). Two failures fell out of gating it on routing:
+  // ══ AND THE MOUNT'S FULL TARGET, WHICH HAS TO BE UNGATED FOR THE SAME REASON ═══════════════════
+  // `send`'s `mountRouted` cross-check needs the projectId and name of the terminal it is aiming at,
+  // and it used to read them from `targetRef` — that is `routingTarget`, the value `promptTargetShown`
+  // STILL gates. Ungating the mount id above while cross-checking it against a gated target would
+  // have left the founder's bug exactly where it was, one identifier over: the id would resolve, the
+  // cross-check would fail against `null`, and the message would fall through to the concierge again.
+  //
+  // Derived from the very same `target` that `mountedAgentId` is derived from, so the two cannot
+  // disagree about which agent is mounted. That is the property the old comment claimed for
+  // `targetRef`, and it only held while both values were gated the same way.
+  const mountTarget = mountedAgentId ? target : null;
+  const mountTargetRef = useRef(mountTarget);
+  useEffect(() => {
+    mountTargetRef.current = mountTarget;
+  }, [mountTarget]);
+  // ══ THE *DISPLAY* MOUNT, WHICH IS THE ONE THE NOTICE ROW KEYS OFF (roborev 57424) ══════════════
+  // The notice row exists for exactly one reason — `ConciergeThread` is not rendered while mounted,
+  // so anything said with `postSparkle` is off screen — and whether the thread is hidden is decided
+  // by the DISPLAY mount (`mountedAgent`, which the column keeps ungated). Gating these writes on the
+  // ROUTING mount instead produced two failures, and they are why the split was introduced:
   //
   //   • DISPLAY-MOUNTED BUT NOT ROUTABLE (the Plan board or Improve-Sparkle up, or the tab closed):
   //     the thread is still swapped away, the message falls through to Sparkle, Sparkle answers into
@@ -1544,11 +1574,34 @@ export function ConciergeHost({
   //     keyed on a routing id that stays `null` throughout. A stale "Not sent" row for the rest of
   //     the session, sitting over later successful sends.
   //
-  // So: routing and the typeface take `routableMountedAgentId`; the notice takes this.
+  // ══ AND AS OF THE MOUNTED-SEND FIX, THE TWO MOUNTS HOLD THE SAME VALUE ═════════════════════════
+  // This used to end "routing and the typeface take `routableMountedAgentId`; the notice takes this",
+  // and that distinction is GONE: `routableMountedAgentId` is now `mountedAgentId` unmodified, so
+  // this ref and `mountedAgentIdRef` mirror one value. Both are kept because their NAMES are the
+  // documentation at ~12 call sites — "is the thread hidden" and "where do the words go" are still
+  // two different questions, and a reader at either call site should not have to know they currently
+  // share an answer.
+  //
+  // WHAT MUST NOT HAPPEN IS THE TWO DRIFTING APART AGAIN. The first bullet above is precisely the
+  // founder's bug seen from the notice's side: the split existed because routing was gated and
+  // display was not, and the response at the time was to make the NOTICE tell him about the
+  // divergence rather than to remove it. If you find yourself narrowing either of these with a
+  // surface predicate, you are re-opening "the header names an agent and the send goes elsewhere" —
+  // read `routableMountedAgentId` above first.
   const displayMountedRef = useRef(mountedAgentId);
   useEffect(() => {
     displayMountedRef.current = mountedAgentId;
   }, [mountedAgentId]);
+  // …AND ITS NAME, so the notice can say WHO DID NOT GET the message and not only who did.
+  //
+  // From `mountedName` — the very value the "Chatting with ● <Agent>" chip renders — rather than from
+  // `target.name`, and that is the whole point: a notice naming an agent the chip does not would
+  // reintroduce the header-disagrees-with-the-truth defect this branch exists to remove, in one line
+  // of prose instead of in the router.
+  const displayMountedNameRef = useRef(mountedName);
+  useEffect(() => {
+    displayMountedNameRef.current = mountedName;
+  }, [mountedName]);
   // THE NOTICE DIES WITH THE MOUNT IT DESCRIBES. Left standing after an unmount it asserts a state
   // that is over, which is the same stale signal the unmount hint is gated to avoid. Keyed on the
   // DISPLAY mount for the same reason the writes are — that is when the row is on screen — and on
@@ -4442,8 +4495,37 @@ export function ConciergeHost({
       // The full prose does not belong in a one-line banner, so this points at it rather than
       // quoting it. Only while mounted: unmounted, the answer appears in the thread the founder is
       // already looking at and a notice would be noise about the ordinary case.
+      //
+      // ══ AND IT NAMES WHO DID *NOT* GET IT (the founder's second ask on this bug) ═════════════════
+      // "Asked Sparkle — press Esc to unmount and read the reply." was the whole line, and it names
+      // the wrong concern: it tells the founder where the ANSWER is while saying nothing about the
+      // agent he is mounted to and plainly looking at. That is what let the misroute read as normal
+      // for as long as it did — the one line on screen that could have said "this did not reach your
+      // agent" was busy talking about a reply.
+      //
+      // Every remaining way to reach this while mounted is DELIBERATE now (a leading `@Sparkle`; the
+      // two ways an aim turns out unusable write their own, more specific line and set
+      // `notedThisSend`), so naming the mount here is never a report of a surprise — it is the
+      // receipt for a diversion he chose, and it is exactly as true unmounted, where the name is
+      // simply absent.
+      //
+      // …EXCEPT WHEN THE MOUNT IS THE APP-OWNED SPARKLE AGENT, WHOSE NAME IS "Sparkle" (roborev
+      // 59097). `mountedName` falls back to `SPARKLE_AGENT_NAME` for that row, so the named form
+      // rendered `Asked Sparkle — not Sparkle.` — and it rendered it in the LIKELIEST case, since a
+      // leading `@Sparkle` is now the only way to reach this line while mounted and it is exactly
+      // what someone mounted to an agent called "Sparkle" types. A line whose whole job is to
+      // separate "the brain got it" from "your agent did not" must not collapse into a
+      // contradiction when the two share a name; the unnamed form is the honest one there, and it
+      // is the fallback that already exists.
       if (displayMountedRef.current && !notedThisSend) {
-        noteMounted("Asked Sparkle — press Esc to unmount and read the reply.", "info");
+        const mounted = displayMountedRef.current;
+        const held = isSparkleAgentId(mounted) ? undefined : displayMountedNameRef.current;
+        noteMounted(
+          held
+            ? `Asked Sparkle — not ${held}. Press Esc to unmount and read the reply.`
+            : "Asked Sparkle — press Esc to unmount and read the reply.",
+          "info",
+        );
       }
       const here = stillThere ? aim : null;
       setReceipt(id, {
@@ -4568,15 +4650,19 @@ export function ConciergeHost({
       // Any CABLE-MOUNTED build agent, the app-owned Sparkle one included — one rule, not a general
       // case with a special case beside it (see above for why the special case had to go).
       //
-      // A MOUNT AIMS AT `targetRef`, NOT AT A ROSTER LOOKUP, and the two cannot disagree:
+      // A MOUNT AIMS AT `mountTargetRef`, NOT AT A ROSTER LOOKUP, and the two cannot disagree:
       // `routableMountedAgentId` is derived from that very target, so re-deriving the projectId/name
       // from anywhere else would be a second source of truth for one fact. False when the cable moved
       // between render and submit, which falls through to the ordinary unaddressed path — the
       // recoverable direction.
+      //
+      // `mountTargetRef` AND NOT `targetRef`: the latter is `routingTarget`, which `promptTargetShown`
+      // still gates for the unmounted inference path. Cross-checking a mount against it is what made
+      // the founder's plain mounted send fall through to the concierge — see `routableMountedAgentId`.
       const mountRouted =
         route.kind === "agent" &&
         route.via === "mount" &&
-        targetRef.current?.agentId === route.agentId;
+        mountTargetRef.current?.agentId === route.agentId;
       // NO GUARD HERE FOR "named but unresolvable", deliberately, and it is worth saying why since it
       // is the obvious thing to add. `named` exists only when the COMPOSER's roster recognised the
       // span, and this lookup uses the same feed — one render, one source — so a recognised name is
@@ -4606,13 +4692,18 @@ export function ConciergeHost({
       // A named agent OVERRIDES what happens to be selected — that is the whole point of naming one.
       // `addressedAgent` folds in the Improve-Sparkle mount (above), which resolves to the same
       // `targetRef.current` it is built from, so the fallback is unchanged for every other send.
+      //
+      // A MOUNT SUPPLIES ITS OWN, for the reason spelled out at `mountRouted` above: `targetRef` is
+      // gated by `promptTargetShown` and a mount is not. Falling back to it here would hand `deliver`
+      // a null aim for exactly the sends this fix exists to route, and `addressable` would go false —
+      // the concierge again, by a different road.
       const submitted: ConciergePromptTarget | null = addressedAgent
         ? {
             projectId: addressedAgent.projectId,
             agentId: addressedAgent.id,
             name: addressedAgent.name,
           }
-        : targetRef.current;
+        : (mountRouted ? mountTargetRef.current : targetRef.current);
       // ══ THERE IS NO LONGER A PICKER SHORT-CIRCUIT HERE, AND THERE MUST NOT BE ═══════════════
       // This used to ask `answersLivePicker` BEFORE building the payload and, on a true, send the
       // text UNPREFIXED with its attachments left staged. The reason was real at the time: a send

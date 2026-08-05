@@ -978,52 +978,139 @@ describe("ConciergeHost — a mounted column can still say what happened", () =>
   });
 });
 
-// ══ ONE NOTION OF "MOUNTED" FOR ROUTING (roborev 57358/57361) ══════════════════════════════════
+// ══ THE HEADER IS THE CONTRACT: IF IT NAMES AN AGENT, THE SEND GOES THERE ═══════════════════════
 //
-// The cable being patched decides whose CONVERSATION is shown. It does NOT decide where words go —
-// the host also requires the agent's pane to be on screen (`promptTargetShown`). Two derivations of
-// "mounted" meant the composer could paint itself in the terminal's face while the send path had
-// already decided the message must not go to a PTY: an indicator lying in the irreversible direction.
-describe("ConciergeHost — the mount that routes is the mount the composer reports", () => {
+// The founder, on the defect these rows now pin the fix for: *"If I have a mounted Concierge and I
+// type in the compose box, it actually sends it to Sparkle. You can see here that it tells me that
+// I'm talking to that build agent but then right above it says it's sent what I said to Sparkle.
+// That should not be happening. It should be sending it to the build agent unless I @mention
+// Sparkle. This is a big bug that needs to be fixed."*
+//
+// His screenshot is the whole case, stacked vertically in one frame: the notice row reading *"Asked
+// Sparkle — press Esc to unmount and read the reply."* and DIRECTLY BELOW IT the composer header
+// reading *"Chatting with ● Mic Capture Regression"*.
+//
+// THIS BLOCK USED TO PIN THE OPPOSITE, and the reversal is deliberate (it was roborev 57358/57361's
+// "one notion of mounted for routing"). `promptTargetShown` — false whenever the Plan board or the
+// Improve-Sparkle pane is up, the agent's tab is closed, or, with two pairs, the cable is patched
+// LEFT while that predicate reads the RIGHT column — nulled the ROUTING mount while the DISPLAY
+// mount, which draws "Chatting with ● <Agent>" and swaps the thread, stayed. So the column named the
+// agent and the words went to the concierge.
+//
+// The old rows called that state agreement because BOTH halves said "not a terminal". They were
+// right that the two halves must agree, and wrong about which way: the composer never disagreed with
+// the send path so much as the HEADER did, and the header is what the founder reads. The rule
+// resolves it toward the terminal.
+//
+// NOTHING IS LOST BY UNGATING IT, which is why this is a deletion rather than a new special case.
+// The hazard `promptTargetShown` was there to prevent — his words going into a terminal he cannot
+// see — is caught one layer down by the SCREEN GUARD, which treats a `no-viewport` read as FATAL for
+// a mount (`terminalWriteBlocked`) and refuses VISIBLY, with the words put back in the box. That is
+// the founder's own stated remedy for an unresolvable route, and it is strictly better than the
+// silent redirect it replaces: a refusal you can read beats a delivery to the wrong recipient.
+describe("ConciergeHost — a plain mounted send goes to the mounted agent, always", () => {
   const mountHidden = () =>
     render(<ConciergeHost feed={FEED} promptTarget={MOUNTED} promptTargetShown={false} />);
 
-  it("does not route to the terminal when the agent's pane is not shown", async () => {
+  it("routes to the mounted agent even when its pane is not the shown surface", async () => {
     mountHidden();
     await send("move the button 5px left");
+    await elapse();
+    expect(h.dispatchConciergeAnswer).toHaveBeenCalledTimes(1);
+    expect(h.dispatchConciergeAnswer.mock.calls[0]?.[0]).toBe("ag1");
+    // AND THE BRAIN IS NEVER ASKED. The screenshotted defect is exactly this call happening
+    // INSTEAD of the dispatch above, so asserting only the dispatch would leave the bug's own
+    // signature untested.
+    expect(h.startConciergeTurn).not.toHaveBeenCalled();
+  });
+
+  // THE ROW THAT PINS THE AGREEMENT, kept from the old block and flipped with it: the composer must
+  // not disclaim a terminal destination the send path is about to use, any more than it may claim
+  // one the send path has refused.
+  it("paints the composer in the terminal's face in that same state", () => {
+    mountHidden();
+    expect(box().style.fontFamily).not.toBe("inherit");
+  });
+
+  // THE ESCAPE HATCH IS UNAFFECTED — and it is now the ONLY way to reach the concierge from here,
+  // which is precisely what the founder asked for ("unless I @mention Sparkle").
+  it("still lets @Sparkle pull the message back to the concierge from that state", async () => {
+    mountHidden();
+    await send("@Sparkle what is the status of the build?");
     await elapse();
     expect(h.dispatchConciergeAnswer).not.toHaveBeenCalled();
     expect(h.startConciergeTurn).toHaveBeenCalledTimes(1);
   });
 
-  // THE ROW THAT PINS THE AGREEMENT. Same state, the other half: the composer must not claim a
-  // terminal destination the send path has refused. A build with two derivations passes the row
-  // above and fails this one.
-  it("does not paint the composer in the terminal's face in that same state", () => {
+  // ══ AND WHEN THE ROUTE GENUINELY CANNOT BE RESOLVED, IT REFUSES — IT DOES NOT REDIRECT ═════════
+  // The founder's rule has two halves and this is the second: *"if a route genuinely cannot be
+  // resolved, the send must be REFUSED with a visible reason, never silently redirected."* An
+  // unreadable screen is that case, and it is the one `promptTargetShown` used to swallow: the
+  // message went to Sparkle with a notice that said only "Asked Sparkle", which names the wrong
+  // recipient rather than the reason.
+  it("refuses visibly rather than falling through to Sparkle when the screen can't be read", async () => {
+    h.viewport.mockReturnValue(null);
     mountHidden();
-    const ta = screen.getByLabelText("Message") as HTMLTextAreaElement;
-    expect(ta.style.fontFamily).toBe("inherit");
+    await send("move the button 5px left");
+    await elapse();
+    expect(h.dispatchConciergeAnswer).not.toHaveBeenCalled();
+    // THE POINT OF THE ROW. A refusal that quietly asks the brain instead is the defect wearing a
+    // different hat — the words still reached a recipient the founder did not choose.
+    expect(h.startConciergeTurn).not.toHaveBeenCalled();
+    await waitFor(() => expect(notice().textContent).toContain("Not sent"));
+    // …and the words are back where he can see them, so the refusal costs him nothing.
+    expect(box().value).toBe("move the button 5px left");
   });
 
   // ══ THE THREAD IS STILL HIDDEN HERE, SO THE COLUMN MUST STILL BE ABLE TO SPEAK (roborev 57424) ══
-  // `promptTargetShown === false` gates ROUTING and the typeface; it does not un-swap the thread —
-  // the column keeps showing the agent's transcript. So a message that falls through to Sparkle in
-  // this state is answered into a thread that is not rendered, which is the exact defect the notice
-  // row was added to fix. Gating the notice on the ROUTING mount reintroduced it one state over.
+  // The notice row's original defect is still a defect: a message that DOES legitimately go to
+  // Sparkle from a mounted column is answered into a thread that is not rendered. `@Sparkle` is now
+  // the only way to get there, and it must still say so.
   it("still points at the Sparkle reply while the thread is swapped away", async () => {
     mountHidden();
     expect(screen.queryByTestId("concierge-thread")).toBeNull();
-    await send("what is the status of the build?");
+    await send("@Sparkle what is the status of the build?");
     await elapse();
     expect(h.startConciergeTurn).toHaveBeenCalledTimes(1);
     await waitFor(() => expect(screen.getByTestId(MOUNTED_NOTICE_TESTID)).toBeTruthy());
   });
 
-  // The control: shown, and both halves agree the other way.
+  // ══ AND THE NOTICE NAMES WHO DID *NOT* GET IT (the founder's second ask) ═══════════════════════
+  // The line used to read only "Asked Sparkle — press Esc to unmount and read the reply.", which
+  // talks about where the ANSWER is and says nothing about the agent he is mounted to and looking
+  // at. That is what let the misroute read as normal: the one line that could have said "this did
+  // not reach your agent" was busy discussing a reply. It must name the mount, or a Sparkle-bound
+  // send stays indistinguishable at a glance from one that reached the terminal.
+  it("names the mounted agent it did NOT go to", async () => {
+    mountHidden();
+    await send("@Sparkle what is the status of the build?");
+    await elapse();
+    await waitFor(() => expect(notice().textContent).toContain("Asked Sparkle"));
+    // The chip's own name, so the notice and the "Chatting with ● <Agent>" header cannot disagree.
+    expect(notice().textContent).toContain("Blueprint UI/UX");
+  });
+
+  // ══ …BUT NOT WHEN THE MOUNT IS THE AGENT *CALLED* "Sparkle" (roborev 59097) ════════════════════
+  // `mountedName` falls back to SPARKLE_AGENT_NAME for the app-owned Improve-Sparkle row, so the
+  // named form rendered `Asked Sparkle — not Sparkle.` — a self-contradiction, and in the LIKELIEST
+  // case: a leading `@Sparkle` is the only way to reach this line while mounted, and it is exactly
+  // what someone mounted to an agent named "Sparkle" types. This also covers the `held === undefined`
+  // fallback branch, which no other row exercises.
+  it("does not say 'not Sparkle' when the mount IS the Sparkle agent", async () => {
+    render(<ConciergeHost feed={FEED} promptTarget={SPARKLE_TARGET} promptTargetShown={false} />);
+    await send("@Sparkle what is the status of the build?");
+    await elapse();
+    await waitFor(() => expect(notice().textContent).toContain("Asked Sparkle"));
+    expect(notice().textContent).not.toContain("not Sparkle");
+    // The unnamed fallback, whole — so a future edit cannot satisfy this row by dropping the
+    // sentence that tells him where the reply is.
+    expect(notice().textContent).toContain("press Esc to unmount and read the reply");
+  });
+
+  // The control: shown, and every half agrees, exactly as it did before.
   it("routes AND paints when the pane is shown", async () => {
     mount();
-    const ta = screen.getByLabelText("Message") as HTMLTextAreaElement;
-    expect(ta.style.fontFamily).not.toBe("inherit");
+    expect(box().style.fontFamily).not.toBe("inherit");
     await send("move the button 5px left");
     await elapse();
     expect(h.dispatchConciergeAnswer).toHaveBeenCalledTimes(1);
