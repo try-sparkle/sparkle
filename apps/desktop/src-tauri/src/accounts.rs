@@ -309,6 +309,72 @@ fn write_accounts_at(path: &Path, accounts: &[Account]) -> Result<(), String> {
 
 // ---- mutations (pure) ---------------------------------------------------------
 
+/// Seed Sparkle's OWN control-plane allowlist into an added account's `settings.json`.
+///
+/// `CLAUDE_CONFIG_DIR` REPLACES `$HOME/.claude` rather than layering on it, so a `claude` Sparkle
+/// runs on an added account reads none of the user's own grants. Agents that live in a managed
+/// worktree are still covered — project settings resolve from the cwd, not from the config dir, so
+/// the `.claude/settings.local.json` Sparkle writes into every worktree applies on any account.
+/// The gap is every `claude` Sparkle runs OUTSIDE a managed worktree (concierge turns, one-shot
+/// probes, improvement passes): those have no project layer at all, so on an added account they
+/// cannot call Sparkle's own control plane without stopping to ask a human.
+///
+/// This is the narrowest place that closes it: the directory is Sparkle's own, created by Sparkle,
+/// and only Sparkle's own rules are written into it. The user's PERSONAL grants are deliberately
+/// not copied across accounts — replicating something like `bypassPermissions` onto a second
+/// identity is a decision for the human, not a side effect of adding an account.
+///
+/// Best-effort and non-destructive: a `settings.json` that is present but unparseable is left
+/// alone rather than replaced, because overwriting real state (an in-progress `claude login`, a
+/// hand-edited file) to fix a permission nit is a far worse outcome than an extra prompt.
+pub(crate) fn ensure_account_allowlist_at(config_dir: &Path) -> Result<(), String> {
+    let file = config_dir.join("settings.json");
+    // ══ ONLY `NotFound` MEANS "ABSENT" (knightwatch probe 1, blocking) ═══════════════════════════
+    // This was `read_to_string(&file).ok()`, which collapses EVERY read failure into `None` — and
+    // `None` is precisely the input that makes `merge_allowed_tools_settings` synthesise a FRESH
+    // settings object. So an unreadable-but-present file (invalid UTF-8, EACCES, EIO, a transient
+    // I/O error) was treated as a missing one and then OVERWRITTEN, erasing whatever it held:
+    // permission DENIES, hooks, preferences. That is the exact opposite of this function's own
+    // documented contract two paragraphs up, and it is unrecoverable — there is no prior copy.
+    //
+    // A read error that is not `NotFound` is therefore propagated, which lands in the same
+    // best-effort caller arm as the unparseable-JSON case below: log and move on, leaving the file
+    // untouched. An extra permission prompt is a nuisance; a destroyed settings.json is not.
+    let existing = match std::fs::read_to_string(&file) {
+        Ok(s) => Some(s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(format!(
+                "cannot read account settings.json ({e}), leaving it untouched: {}",
+                file.display()
+            ))
+        }
+    };
+    if let Some(s) = existing.as_deref() {
+        if serde_json::from_str::<serde_json::Value>(s).is_err() {
+            return Err(format!(
+                "account settings.json is not valid JSON, leaving it untouched: {}",
+                file.display()
+            ));
+        }
+    }
+    let merged = crate::worktree::merge_allowed_tools_settings(existing.as_deref());
+    if existing.as_deref() == Some(merged.as_str()) {
+        return Ok(()); // already current — do not rewrite the file for nothing
+    }
+    std::fs::create_dir_all(config_dir).map_err(|e| format!("mkdir account dir: {e}"))?;
+    // ══ WRITE VIA TEMP+RENAME, NOT IN PLACE (same probe) ═════════════════════════════════════════
+    // `std::fs::write` TRUNCATES the live file and then fills it. A crash, a full disk, or the app
+    // quitting inside that window leaves a truncated or empty settings.json where a working one
+    // used to be — and a live `claude` on that account reads this file. `atomic_write_settings`
+    // writes a sibling temp and renames it over the target, so a reader sees either the old file or
+    // the new one and never a half-written one. It also re-validates the JSON before writing, which
+    // makes "never clobber with invalid JSON" true on this path too rather than only on the hooks
+    // path that already used it.
+    crate::hooks::atomic_write_settings(&file, &merged)
+        .map_err(|e| format!("write account settings.json: {e}"))
+}
+
 /// Create the account's config dir, append it (non-default) to `accounts.json`,
 /// and return it. The frontend launches `claude login` against `config_dir`
 /// separately — we never spawn it here.
@@ -327,6 +393,12 @@ fn add_account_at(
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    // Sparkle's control plane must reach this identity too — see `ensure_account_allowlist_at`.
+    // Best-effort: an account that exists but is missing one permission rule is still a usable
+    // account, so this must never be the reason adding one fails.
+    if let Err(e) = ensure_account_allowlist_at(&dir) {
+        tracing::warn!(error = %e, "could not seed the account's Sparkle allowlist");
     }
     let acct = Account {
         id,
@@ -2091,9 +2163,22 @@ fn identities_at(
 #[tauri::command]
 pub async fn accounts_list(app: AppHandle) -> Result<Vec<Account>, String> {
     let app_data = crate::worktree::app_data_dir_pub(&app)?;
-    tauri::async_runtime::spawn_blocking(move || read_accounts_at(&accounts_json_path(&app_data)))
-        .await
-        .map_err(|e| format!("accounts_list task failed: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        let accounts = read_accounts_at(&accounts_json_path(&app_data))?;
+        // Heal accounts added BEFORE Sparkle seeded its allowlist at creation. Seeding only on
+        // `accounts_add` would leave every already-registered identity permanently grant-less, and
+        // this list is read before the picker chooses one — so an account is repaired before it can
+        // be spawned on. Idempotent (a current file is not rewritten) and best-effort: never fail
+        // the listing over it, or a bad file would hide the user's accounts entirely.
+        for a in accounts.iter().filter(|a| !a.is_default && !a.config_dir.is_empty()) {
+            if let Err(e) = ensure_account_allowlist_at(Path::new(&a.config_dir)) {
+                tracing::warn!(account = %a.id, error = %e, "could not heal the account's Sparkle allowlist");
+            }
+        }
+        Ok(accounts)
+    })
+    .await
+    .map_err(|e| format!("accounts_list task failed: {e}"))?
 }
 
 /// Register a new (non-default) account: create `<app_data>/accounts/<id>/` and
@@ -4448,6 +4533,97 @@ mod tests {
         assert!(!records.is_empty(), "a migrated default must still contribute usage records");
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// An added account's config dir REPLACES `$HOME/.claude`, so it must carry Sparkle's own
+    /// control-plane rules or every non-worktree `claude` on that identity prompts a human.
+    /// Asserts the rule is READABLE BACK from the account's settings.json (the side effect), not
+    /// merely that the directory exists — which was already true before the change.
+    #[test]
+    fn adding_an_account_seeds_sparkles_control_plane_allowlist() {
+        let tmp = unique_dir("seed-allowlist");
+        let acct = add_account_at(&tmp, &accounts_json_path(&tmp), "Second".into(), "abc123".into(), 1)
+            .unwrap();
+
+        let body = std::fs::read_to_string(Path::new(&acct.config_dir).join("settings.json"))
+            .expect("a new account must get a settings.json");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let rules: Vec<&str> = v["permissions"]["allow"]
+            .as_array()
+            .expect("permissions.allow")
+            .iter()
+            .filter_map(|r| r.as_str())
+            .collect();
+        assert!(
+            rules.contains(&"mcp__sparkle-control"),
+            "added account cannot call Sparkle's control plane: {rules:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The heal must ADD to a real settings.json rather than replace it, and must refuse outright
+    /// when the file is not parseable — losing a human's config to fix a permission nit is the
+    /// worse failure by far.
+    #[test]
+    fn healing_an_account_preserves_existing_settings_and_refuses_garbage() {
+        let tmp = unique_dir("heal-allowlist");
+
+        // Real, parseable config with the user's own keys → merged, everything preserved.
+        std::fs::write(tmp.join("settings.json"), r#"{"theme":"dark","permissions":{"allow":["Bash(ls)"]}}"#)
+            .unwrap();
+        ensure_account_allowlist_at(&tmp).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(tmp.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(v["theme"], "dark", "unrelated user keys must survive the heal");
+        let rules: Vec<&str> =
+            v["permissions"]["allow"].as_array().unwrap().iter().filter_map(|r| r.as_str()).collect();
+        assert!(rules.contains(&"Bash(ls)"), "user rule dropped: {rules:?}");
+        assert!(rules.contains(&"mcp__sparkle-control"), "control plane not added: {rules:?}");
+
+        // Unparseable → refused, and the bytes are left exactly as they were.
+        std::fs::write(tmp.join("settings.json"), "{ not json").unwrap();
+        assert!(ensure_account_allowlist_at(&tmp).is_err());
+        assert_eq!(
+            std::fs::read_to_string(tmp.join("settings.json")).unwrap(),
+            "{ not json",
+            "an unparseable settings.json must be left byte-for-byte intact"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A settings.json that EXISTS but cannot be READ must be left alone — not treated as absent.
+    ///
+    /// This is the blocking knightwatch probe on PR #1302. The heal used
+    /// `read_to_string(&file).ok()`, which turns every read failure into `None`, and `None` is the
+    /// input that makes the merge synthesise a FRESH settings object — which was then written over
+    /// the real file. So a file holding permission DENIES, hooks and preferences was destroyed by a
+    /// routine best-effort heal, with no prior copy to recover from.
+    ///
+    /// Invalid UTF-8 is the cheap, deterministic way to produce that read failure (`read_to_string`
+    /// returns `InvalidData`, not `NotFound`). The unparseable-JSON test above does NOT cover this:
+    /// that file reads fine and is rejected later by the JSON parse. This one never gets that far.
+    ///
+    /// ASSERTS THE SIDE EFFECT — the bytes on disk — not merely the returned `Err`. A version that
+    /// returned an error and still wrote would satisfy an `is_err()` check and lose the file anyway.
+    #[test]
+    fn healing_leaves_an_unreadable_settings_file_byte_for_byte_intact() {
+        let tmp = unique_dir("heal-unreadable");
+        let file = tmp.join("settings.json");
+        // Lone continuation bytes: valid on disk, not valid UTF-8.
+        let raw: &[u8] = &[0x7b, 0x22, 0x61, 0x22, 0x3a, 0xff, 0xfe, 0x22, 0x7d];
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(&file, raw).unwrap();
+
+        assert!(
+            ensure_account_allowlist_at(&tmp).is_err(),
+            "an unreadable settings.json must be refused, not silently treated as absent"
+        );
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            raw,
+            "the heal overwrote a file it could not read — this is the data-loss path"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

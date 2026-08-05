@@ -5698,6 +5698,28 @@ fn merge_allowed_tools(root: &mut Value) {
     }
 }
 
+/// Merge [`SPARKLE_ALLOWED_TOOLS`] into a settings JSON *document*, preserving every other key.
+/// Returns the merged JSON; a `None`/unparseable input yields a fresh object carrying just the
+/// allowlist, so callers that must not clobber an existing file check parseability themselves.
+///
+/// This exists so the allowlist is reachable from more than one installer. It used to be written
+/// ONLY as a side effect of [`merge_guard_settings`], which meant a failed guard install — a
+/// failure `AgentPane.prepare` deliberately catches and merely warns about, because a missing
+/// write-guard is not worth refusing to start an agent over — silently produced an agent with no
+/// pre-approved tools at all. The human then paid for that, one "Approve?" click at a time, with
+/// nothing in the UI connecting the two. `merge_allowed_tools` de-duplicates by rule string, so
+/// running this alongside the guard merge is idempotent.
+pub fn merge_allowed_tools_settings(existing: Option<&str>) -> String {
+    let mut root: Value = existing
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_else(|| json!({}));
+    if !root.is_object() {
+        root = json!({});
+    }
+    merge_allowed_tools(&mut root);
+    serde_json::to_string_pretty(&root).unwrap()
+}
+
 /// Merge the PreToolUse guard hook into existing settings JSON (or a fresh object), preserving
 /// any keys the user already has.
 pub fn merge_guard_settings(existing: Option<&str>, guard_cmd: &str) -> String {

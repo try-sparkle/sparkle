@@ -120,7 +120,13 @@ pub fn stage_resource_script(app: &AppHandle, name: &str) -> Result<PathBuf, Str
 /// Refuses to clobber the target with invalid JSON: `contents` is parsed first, so a bug upstream
 /// can never replace a good settings file with garbage Claude would fail to load. Our merge/heal
 /// producers always emit valid JSON, so this is belt-and-suspenders that also documents the invariant.
-fn atomic_write_settings(path: &Path, contents: &str) -> Result<(), String> {
+/// Replace a settings file ATOMICALLY: validate, write a sibling temp, rename over the target.
+///
+/// `pub(crate)` because `accounts::ensure_account_allowlist_at` needs the same guarantee (knightwatch
+/// probe on PR #1302): it used a plain `std::fs::write`, which truncates the live file first, so a
+/// crash mid-write left a live `claude` reading a truncated settings.json. One implementation rather
+/// than two, so the JSON-validation and never-a-partial-file properties cannot drift apart.
+pub(crate) fn atomic_write_settings(path: &Path, contents: &str) -> Result<(), String> {
     serde_json::from_str::<Value>(contents)
         .map_err(|e| format!("atomic_write_settings: refusing to write invalid JSON: {e}"))?;
     let dir = path
@@ -1245,6 +1251,28 @@ pub async fn install_agent_hooks(
         .map_err(|e| format!("install_agent_hooks task failed: {e}"))?
 }
 
+/// Compose the whole body Sparkle owns in an agent worktree's `settings.local.json`: the event
+/// emitter hooks, the default-on plugin keys, and the pre-approved permission allowlist — chained
+/// over whatever the file already had, so one atomic write carries all three.
+///
+/// Order matters only in that each merge reads the previous one's output; all three preserve keys
+/// they do not own. The allowlist step is the load-bearing addition: it is ALSO performed by
+/// [`crate::worktree::merge_guard_settings`], and that duplication is deliberate. The allowlist
+/// used to ride solely on the guard installer, so the two callers in `AgentPane.prepare` —
+/// `installWorktreeGuard` (wrapped in a `try/catch` that only warns) and `installAgentHooks` — had
+/// a silent dependency: lose the first and the agent spawned with nothing pre-approved, prompting
+/// the human for Sparkle's own control-plane calls. Either installer is now sufficient, and
+/// `merge_allowed_tools` de-duplicates by rule string so running both changes nothing.
+pub fn compose_agent_settings(
+    existing: Option<&str>,
+    emitter_cmd: &str,
+    plugins: &[&crate::config::KnownPlugin],
+) -> String {
+    let merged = merge_event_hooks(existing, emitter_cmd);
+    let merged = merge_plugin_settings(Some(&merged), plugins);
+    crate::worktree::merge_allowed_tools_settings(Some(&merged))
+}
+
 /// Blocking core of [`install_agent_hooks`].
 pub fn install_agent_hooks_sync(
     app: AppHandle,
@@ -1275,13 +1303,9 @@ pub fn install_agent_hooks_sync(
         let write_lock = settings_write_lock(&file);
         let _w = write_lock.lock().unwrap_or_else(|e| e.into_inner());
         let existing = std::fs::read_to_string(&file).ok();
-        let merged = merge_event_hooks(existing.as_deref(), &emitter_cmd);
-        // Pre-enable Sparkle's default-on marketplace plugins in the SAME file, after the emitter
-        // merge (both are read-modify-write on this path, so they must compose, not race). Chaining
-        // the two merges means the plugin keys ride the one atomic write below.
         let cfg = plugins_layer_for(project_root.as_deref());
         let enabled = cfg.plugins.enabled();
-        let merged = merge_plugin_settings(Some(&merged), &enabled);
+        let merged = compose_agent_settings(existing.as_deref(), &emitter_cmd, &enabled);
         // Atomic + JSON-validated: a concurrently-running Claude (this file drives its executable
         // hooks) must never read a truncated/partial write, and we refuse to clobber invalid JSON.
         atomic_write_settings(&file, &merged)?;
@@ -2844,6 +2868,68 @@ mod tests {
         assert!(confine_to_worktrees(&base, &escape).is_err());
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The hooks installer must pre-approve Sparkle's control plane BY ITSELF.
+    ///
+    /// Regression pin for the "founder keeps clicking Approve? for sparkle-control - rename_agent"
+    /// report. The allowlist used to be written only by `merge_guard_settings`, so this path — the
+    /// one that always runs, and whose sibling guard install `AgentPane.prepare` catches and merely
+    /// warns about — produced a settings file with hooks and plugins but NO `permissions.allow`.
+    /// Asserting the SIDE EFFECT (a control-plane rule is present in the composed output), not the
+    /// precondition (some file was written), which was already true before the change.
+    #[test]
+    fn composed_agent_settings_pre_approve_the_control_plane_without_the_guard_installer() {
+        let out = compose_agent_settings(None, "node '/x/sparkle-hook.mjs' '/y/ev.jsonl'", &[]);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("composed settings are JSON");
+        let rules: Vec<&str> = v["permissions"]["allow"]
+            .as_array()
+            .expect("permissions.allow must exist on the hooks path alone")
+            .iter()
+            .filter_map(|r| r.as_str())
+            .collect();
+        assert!(
+            rules.contains(&"mcp__sparkle-control"),
+            "sparkle-control not pre-approved by the hooks installer: {rules:?}"
+        );
+        assert!(
+            rules.contains(&"mcp__sparkle-orchestrator"),
+            "sparkle-orchestrator not pre-approved by the hooks installer: {rules:?}"
+        );
+        // The emitter must survive the added merge — the allowlist step must not drop hooks.
+        assert!(out.contains("sparkle-hook.mjs"), "emitter hook lost: {out}");
+    }
+
+    /// Composing over a file the guard installer already wrote must not duplicate rules, and must
+    /// keep rules a human added by hand. Both installers run on every prepare, so a merge that
+    /// appended blindly would grow the file without bound.
+    #[test]
+    fn composed_agent_settings_are_idempotent_and_keep_user_rules() {
+        let seeded = crate::worktree::merge_allowed_tools_settings(Some(
+            r#"{"permissions":{"allow":["Bash(git status)"]}}"#,
+        ));
+        let once = compose_agent_settings(Some(&seeded), // The command MUST contain EMITTER_MARKER — that substring is how merge_event_hooks
+        // recognizes and replaces its own prior entry. A fake path without it appends a second
+        // copy on every re-prepare, which looks like a product bug and is only a test artifact.
+        "node '/x/sparkle-hook.mjs' '/y.jsonl'", &[]);
+        let twice = compose_agent_settings(Some(&once), // The command MUST contain EMITTER_MARKER — that substring is how merge_event_hooks
+        // recognizes and replaces its own prior entry. A fake path without it appends a second
+        // copy on every re-prepare, which looks like a product bug and is only a test artifact.
+        "node '/x/sparkle-hook.mjs' '/y.jsonl'", &[]);
+        assert_eq!(once, twice, "composing twice must be a no-op");
+        let v: serde_json::Value = serde_json::from_str(&twice).unwrap();
+        let rules: Vec<&str> = v["permissions"]["allow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r.as_str())
+            .collect();
+        assert!(rules.contains(&"Bash(git status)"), "user rule dropped: {rules:?}");
+        assert_eq!(
+            rules.iter().filter(|r| **r == "mcp__sparkle-control").count(),
+            1,
+            "control-plane rule duplicated: {rules:?}"
+        );
     }
 
     #[test]
