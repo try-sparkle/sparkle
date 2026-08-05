@@ -103,6 +103,7 @@ import { paneState } from "./paneReadiness";
 import { findKnownAgent } from "./knownAgents";
 import { getAgentViewport } from "./terminalViewport";
 import { isClaudeCodeScreen } from "../engine/claudeCodeScreen";
+import { pickerFingerprint } from "./pickerFingerprint";
 import {
   screenBlocksWrite,
   screenIsCredentialField,
@@ -238,6 +239,25 @@ export interface ConciergeDispatchOptions {
    * `refusalCopy`, where that advice could aim a bare "yes" at a different agent's picker.)
    */
   neverPickerAnswer?: boolean;
+  /**
+   * THIS WRITE IS A PICKER PRESS, and here is the menu it is answering (bead sparkle-jk8zt).
+   *
+   * A FINGERPRINT, NEVER A BOOLEAN, and that is the whole design. The dispatcher does not take this
+   * as a claim — it re-derives the fingerprint from the CURRENT screen and compares. A caller that
+   * cannot name the live menu gets nothing; a caller that can has proved the menu is really there,
+   * because `pickerFingerprint` hashes the question along with the option shape.
+   *
+   * WHAT IT BUYS: exemption from the alternate-screen refusal, and nothing else. Claude Code's
+   * permission dialog replaces the composer box that `isClaudeCodeScreen` requires, so that
+   * predicate reads a live approval prompt as a full-screen app — see the guard for the full
+   * account. Every other guard on this path still runs on a picker press, the credential checks
+   * included.
+   *
+   * SET BY EXACTLY ONE CALLER: `conciergeTools/terminal`'s `selectPickerOption`, after its own
+   * fingerprint check. It is deliberately NOT reachable from `send_to_agent_terminal`'s tool
+   * schema, so free text cannot acquire the exemption by asking for it.
+   */
+  pickerPress?: { fingerprint: string };
 }
 
 // WHOLE-PHRASE anchored (roborev 46311): the entire trimmed answer must be a member of the
@@ -517,7 +537,39 @@ export async function dispatchConciergeAnswer(
   // harmless was wrong.)
   const pickerOptions = liveOptionsFor(agentId);
   const claudeCodeHoldsTheBuffer = !!screen?.alternateBuffer && isClaudeCodeScreen(screen.text);
-  if (screen?.alternateBuffer && !claudeCodeHoldsTheBuffer) {
+  // ══ A FINGERPRINTED PICKER PRESS IS ITS OWN EVIDENCE (bead sparkle-jk8zt) ══════════════════════
+  // THE BUG THIS FIXES: the concierge could not answer ANY approval prompt. Four agents in one day,
+  // four for four, every `select_picker_option` refused `alternate-screen` — while
+  // `read_picker_options` SUCCEEDED on the same agent in the same instant, returning clean numbered
+  // options and a stable fingerprint. Two detectors disagreeing about one terminal at one moment.
+  //
+  // THE WRONG ONE WAS THE WRITE PATH, and the mechanism is exact: `isClaudeCodeScreen` REQUIRES the
+  // composer box (its family D, mandatory — see that module's header), and Claude Code's permission
+  // dialog REPLACES the composer box. So on a permission prompt exactly one family survives (the
+  // tool-call glyphs) and the predicate returns false. `claudeCodeScreen.test.ts` pins this
+  // (`claudeCodeMarkerFamilies(APPROVAL_2_1_220) === 1`) and calls it the safe answer — which it is,
+  // for FREE TEXT. It made the carve-out structurally incapable of firing during a picker, i.e.
+  // precisely when answering one is the point.
+  //
+  // THE GUARD IS NOT DELETED AND ITS PREMISE IS NOT WEAKENED. Typed text in a real pager runs as
+  // commands, and that cannot be walked back. What changes is that ONE write earns an exception: an
+  // option press whose fingerprint the DISPATCHER ITSELF just re-derived from the CURRENT screen.
+  //
+  // WHY THAT IS EVIDENCE RATHER THAN A CALLER'S WORD. `pickerPress` carries a fingerprint, never a
+  // boolean, and the match below is recomputed here — not trusted. `pickerFingerprint` hashes the
+  // QUESTION together with the option shape, so a match means this function has just read the same
+  // live menu the caller read. `vim`, `less` and `htop` have no menu for `liveOptionsFor` to find,
+  // so they produce no options, no fingerprint, and take the refusal exactly as before.
+  //
+  // FREE TEXT STAYS REFUSED IN THIS STATE, which is the other half of the contract. `pickerPress` is
+  // reachable only from `selectPickerOption`; the model-facing `send_to_agent_terminal` passes just
+  // `userPrompt`, so no tool call can set it and no prose can ride this exception onto that screen.
+  const verifiedPickerPress =
+    opts.pickerPress !== undefined &&
+    opts.pickerPress.fingerprint !== "" &&
+    pickerOptions.length > 0 &&
+    pickerFingerprint(agentId, pickerOptions) === opts.pickerPress.fingerprint;
+  if (screen?.alternateBuffer && !claudeCodeHoldsTheBuffer && !verifiedPickerPress) {
     log.warn("concierge", "refused a write into a full-screen app", { agentId });
     return { ok: false, path: "alternate-screen", agentId };
   }

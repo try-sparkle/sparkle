@@ -37,6 +37,7 @@ import {
 import { _resetConciergeLivenessForTests } from "../../services/conciergeLiveness";
 import { useProjectStore } from "../../stores/projectStore";
 import type { ConciergeMessage } from "./types";
+import type { RevealOutcome } from "../../services/agentReveal";
 
 /** What `noteConciergeToolCall("terminal", "read_agent_terminal", …)` phrases to. Taken from
  *  ThinkingIndicator.test.tsx rather than invented, so both suites are pinned to the same phrase and
@@ -208,7 +209,11 @@ describe("the agent the line names stays a live pill under the bubble", () => {
 
   function drawWired(
     statuses: Record<string, ConciergeMessageStatusText>,
-    onOpenAgent = vi.fn(() => true),
+    // `RevealOutcome`, not the boolean this used to be: `onOpenAgent` now reports WHAT the reveal
+    // did, and a `true` here no longer typechecks. "revealed" is the right stand-in — these rows
+    // click a pill for an agent the fixture defines, which is the case that actually moves the UI.
+    // Same shape `AgentPill.deadEnd.test.tsx` already uses.
+    onOpenAgent = vi.fn((): RevealOutcome => "revealed"),
   ) {
     render(
       <AgentPillProvider
