@@ -3163,7 +3163,19 @@ export function ConciergeHost({
       setChat((prev) =>
         prev.map((m) =>
           m.kind === "you" && m.id === orphan && m.receipt
-            ? { ...m, receipt: { ...m.receipt, refused: true } }
+            ? // ══ `unanswered`, NEVER `refused` (roborev 58638-M2) ══════════════════════════════
+              // This is the DISPLACED-TURN path: the message reached the brain and was being worked
+              // on — it simply had no answer text yet. `refused` means "never left this app", and
+              // `receiptText` renders it as "Not sent — <agent> couldn't take it" whenever the
+              // receipt carries an agentName, fabricating an agent refusal for a message no agent
+              // was ever offered.
+              //
+              // It is also UNWITHDRAWABLE: ConciergeMessageRow's seam strips only `unanswered` when
+              // a later reply names the message, and the concierge answering a displaced question a
+              // couple of messages later is the documented common case — so `refused` here would
+              // render "Not sent" directly above an "Answered below" marker, the exact two-opposite-
+              // claims state that seam exists to prevent.
+              { ...m, receipt: { ...m.receipt, unanswered: true, redirectable: false } }
             : m,
         ),
       );
@@ -3202,7 +3214,16 @@ export function ConciergeHost({
       setChat((prev) =>
         prev.map((m) =>
           m.kind === "you" && m.id === lost.bubbleId && m.receipt
-            ? { ...m, receipt: { ...m.receipt, unanswered: true, redirectable: false } }
+            ? {
+                ...m,
+                // NO `agentName` ON A NEVER-SENT MESSAGE (knightwatch, PR #1288). Spreading the
+                // original receipt preserves it, and `receiptText`'s refused branch renders
+                // "Not sent — <agent> couldn't take it" whenever one is present — fabricating a
+                // refusal by an agent that was never offered this message. A sparkle-targeted
+                // receipt routinely carries a name, so this is the common path, not an edge.
+                // `undefined` gives the bare, true "→ Not sent".
+                receipt: { ...m.receipt, refused: true, agentName: undefined },
+              }
             : m,
         ),
       );
@@ -3339,7 +3360,16 @@ export function ConciergeHost({
           setChat((prev) =>
             prev.map((m) =>
               m.kind === "you" && m.id === entry.bubbleId && m.receipt
-                ? { ...m, receipt: { ...m.receipt, refused: true } }
+                ? {
+                ...m,
+                // NO `agentName` ON A NEVER-SENT MESSAGE (knightwatch, PR #1288). Spreading the
+                // original receipt preserves it, and `receiptText`'s refused branch renders
+                // "Not sent — <agent> couldn't take it" whenever one is present — fabricating a
+                // refusal by an agent that was never offered this message. A sparkle-targeted
+                // receipt routinely carries a name, so this is the common path, not an edge.
+                // `undefined` gives the bare, true "→ Not sent".
+                receipt: { ...m.receipt, refused: true, agentName: undefined },
+              }
                 : m,
             ),
           );
@@ -3366,7 +3396,16 @@ export function ConciergeHost({
         setChat((prev) =>
           prev.map((m) =>
             m.kind === "you" && strandedIds.has(m.id) && m.receipt
-              ? { ...m, receipt: { ...m.receipt, refused: true } }
+              ? {
+                ...m,
+                // NO `agentName` ON A NEVER-SENT MESSAGE (knightwatch, PR #1288). Spreading the
+                // original receipt preserves it, and `receiptText`'s refused branch renders
+                // "Not sent — <agent> couldn't take it" whenever one is present — fabricating a
+                // refusal by an agent that was never offered this message. A sparkle-targeted
+                // receipt routinely carries a name, so this is the common path, not an edge.
+                // `undefined` gives the bare, true "→ Not sent".
+                receipt: { ...m.receipt, refused: true, agentName: undefined },
+              }
               : m,
           ),
         );

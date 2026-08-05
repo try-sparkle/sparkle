@@ -438,7 +438,7 @@ export async function babysitSweepProject(
     }
 
     lastObservation.set(k, { evidenceIds: babysitEvidenceIds(decision.evidence) });
-    const agentId = await dispatchOne(project, repo, pr.number, now);
+    const agentId = await dispatchOne(project, repo, pr.number, now, isCurrent);
     // NO FENCE HERE, DELIBERATELY (roborev 58537). There WAS one, and it was strictly permissive in
     // the two directions this module says matter most, because neither write below is a stale-clock
     // hazard — they record FACTS about a driver that demonstrably exists:
@@ -486,6 +486,7 @@ async function dispatchOne(
   repo: string,
   pr: number,
   now: number,
+  isCurrent: () => boolean = () => true,
 ): Promise<string | null> {
   const holder = `babysit-dispatch:${repo}#${pr}:${now}`;
   let acquired = false;
@@ -501,6 +502,30 @@ async function dispatchOne(
     return null;
   }
   if (!acquired) return null;
+
+  // CHECK AFTER THE ACQUIRE, BEFORE THE SPAWN (knightwatch #1298 probe 1).
+  //
+  // The acquire is an await, so `stop()` can land during it. Until here the sweep held nothing a
+  // caller can see: the lease is ours but NO AGENT EXISTS, so standing down costs only a release —
+  // no driver is leaked, nothing goes uncharged, no cooldown is left unarmed. That makes this the
+  // last cancellable instant, and the previous version's claim that everything from `dispatchOne`
+  // onward was uncancellable was wider than it needed to be.
+  //
+  // Past `spawnBuildAgentInProject` it really is uncancellable: the agent exists and is about to
+  // start replying on a human's PR, and the writes after it record facts about it.
+  if (!isCurrent()) {
+    try {
+      await invoke(BABYSIT_LEASE_RELEASE_COMMAND, { repo, pr, agentId: holder });
+    } catch (e) {
+      log.warn("babysit", "lease release after a cancelled dispatch failed", {
+        repo,
+        pr,
+        error: String(e),
+      });
+    }
+    log.debug("babysit", "dispatch cancelled after acquire: the sweep was superseded", { repo, pr });
+    return null;
+  }
 
   const agentId = spawnBuildAgentInProject(project, {
     prompt: babysitPrompt(pr),
@@ -564,6 +589,19 @@ export function startBabysitDispatcher(config?: Partial<BabysitDispatchConfig>):
   return () => {
     if (timer !== null) clearInterval(timer);
     timer = null;
+    // CANCEL THE SWEEP ALREADY RUNNING, not just the future ticks (knightwatch #1291 probe 1).
+    //
+    // Clearing the interval alone leaves an in-flight sweep parked on an await — a probe-gate read,
+    // or a lease acquisition — and when it resumes it walks on to dispatch. So `[babysit].enabled =
+    // false` would stop the NEXT sweep while the current one still spawned a driver, which is the
+    // user's off switch visibly not taking effect on the one dispatch they were trying to prevent.
+    //
+    // Bumping the generation makes that sweep's `isCurrent()` false, so it fences out at its next
+    // check. One window stays uncancellable by design: a sweep already inside `dispatchOne` has
+    // acquired the lease and may have created the agent, and the writes after it record facts about
+    // a driver that exists (see the note there) — abandoning those would leak an uncharged,
+    // un-cooled-down driver, which is worse than one extra dispatch.
+    sweepGeneration += 1;
   };
 }
 

@@ -497,9 +497,11 @@ describe("the sweep fence", () => {
     wireInvoke({ leases: [] });
     await babysitSweepProject(PROJECT, T0, CONFIG);
 
-    // Current through the top fence AND the post-probe fence; superseded only after dispatchOne.
+    // Current through ALL THREE checkpoints — top of loop, post-probe-read, and the one inside
+    // dispatchOne after the acquire — so the supersession lands only once the agent exists. That
+    // third checkpoint is the #1298 probe-1 fix; before it there were two, and this counter said 2.
     let calls = 0;
-    const out = await babysitSweepProject(PROJECT, T0 + 60_000, CONFIG, () => ++calls <= 2);
+    const out = await babysitSweepProject(PROJECT, T0 + 60_000, CONFIG, () => ++calls <= 3);
 
     expect(out.dispatched).toHaveLength(1);
     expect(spawnMock).toHaveBeenCalledTimes(1);
@@ -698,6 +700,117 @@ describe("startBabysitDispatcher — the kill switch", () => {
     await vi.advanceTimersByTimeAsync(10);
 
     expect(fetchOpenPrsMock).toHaveBeenCalled();
+    stop();
+  });
+});
+
+// ── STOPPING MUST CANCEL THE SWEEP IN FLIGHT (knightwatch #1291 probe 1) ────────────────────────
+//
+// Driven through `startBabysitDispatcher` and the stopper IT returns — not a hand-rolled fence —
+// because the fix is the generation bump inside that stopper, and a test that supplies its own
+// `isCurrent` proves nothing about it.
+describe("the stopper cancels a running sweep", () => {
+  it("a sweep already awaiting is fenced out by stop(), so no driver is spawned", async () => {
+    useProjectStore.setState({ projects: [PROJECT], selectedProjectId: PROJECT.id });
+    fetchOpenPrsMock.mockResolvedValue([prWithProbe(4001)]);
+
+    // FIRST SIGHTING, recorded through the real path. Without it the two-observation rule alone
+    // would stop the dispatch and the fence would never be the reason — which is exactly how the
+    // first version of this test passed against a deleted generation bump.
+    wireInvoke({ leases: [] });
+    await babysitSweepProject(PROJECT, T0, CONFIG);
+    expect(spawnMock).not.toHaveBeenCalled();
+
+    // Now the sweep that WOULD dispatch, parked on its probe-gate read.
+    let releaseGate: (v: unknown) => void = () => {};
+    let gateCalls = 0;
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === BABYSIT_LEASE_LIST_COMMAND) return [];
+      if (cmd === KNIGHTWATCH_PROBE_GATE_COMMAND) {
+        gateCalls += 1;
+        return new Promise((r) => {
+          releaseGate = r;
+        });
+      }
+      if (cmd === BABYSIT_LEASE_ACQUIRE_COMMAND) return { acquired: true };
+      return null;
+    });
+
+    const stop = startBabysitDispatcher();
+    await vi.waitFor(() => expect(gateCalls).toBe(1));
+
+    // The user switches babysit off while that read is still outstanding.
+    stop();
+    releaseGate(gateWithUnansweredBlocking());
+    await new Promise((r) => setTimeout(r, 0));
+
+    // The parked sweep resumed and fenced out instead of walking on to dispatch.
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  it("stop() DURING lease acquisition releases the lease and spawns nothing", async () => {
+    // knightwatch #1298 probe 1. The acquire is an await, so stop() can land inside it. Until the
+    // spawn the sweep holds nothing a caller can see — the lease is ours but NO AGENT EXISTS — so
+    // standing down costs only a release. The previous version checked no further than the probe
+    // read, so a stop during the acquire still produced a driver.
+    useProjectStore.setState({ projects: [PROJECT], selectedProjectId: PROJECT.id });
+    fetchOpenPrsMock.mockResolvedValue([prWithProbe(4003)]);
+    wireInvoke({ leases: [] });
+    await babysitSweepProject(PROJECT, T0, CONFIG);
+    expect(spawnMock).not.toHaveBeenCalled();
+
+    let releaseAcquire: (v: unknown) => void = () => {};
+    let acquireCalls = 0;
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === BABYSIT_LEASE_LIST_COMMAND) return [];
+      if (cmd === KNIGHTWATCH_PROBE_GATE_COMMAND) return gateWithUnansweredBlocking();
+      if (cmd === BABYSIT_LEASE_ACQUIRE_COMMAND) {
+        acquireCalls += 1;
+        return new Promise((r) => {
+          releaseAcquire = r;
+        });
+      }
+      return null;
+    });
+
+    const stop = startBabysitDispatcher();
+    await vi.waitFor(() => expect(acquireCalls).toBe(1));
+
+    stop();
+    releaseAcquire({ acquired: true });
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(spawnMock).not.toHaveBeenCalled();
+    // And the lease we took is given back, so the PR is not silenced until it goes stale.
+    const released = invokeMock.mock.calls.filter((c) => c[0] === BABYSIT_LEASE_RELEASE_COMMAND);
+    expect(released).toHaveLength(1);
+  });
+
+  it("...and WITHOUT the stop it does dispatch — the fence is the reason, not the setup", async () => {
+    // The paired direction, and the one that makes the test above non-vacuous.
+    useProjectStore.setState({ projects: [PROJECT], selectedProjectId: PROJECT.id });
+    fetchOpenPrsMock.mockResolvedValue([prWithProbe(4001)]);
+    wireInvoke({ leases: [] });
+    await babysitSweepProject(PROJECT, T0, CONFIG);
+
+    let releaseGate: (v: unknown) => void = () => {};
+    let gateCalls = 0;
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === BABYSIT_LEASE_LIST_COMMAND) return [];
+      if (cmd === KNIGHTWATCH_PROBE_GATE_COMMAND) {
+        gateCalls += 1;
+        return new Promise((r) => {
+          releaseGate = r;
+        });
+      }
+      if (cmd === BABYSIT_LEASE_ACQUIRE_COMMAND) return { acquired: true };
+      return null;
+    });
+
+    const stop = startBabysitDispatcher();
+    await vi.waitFor(() => expect(gateCalls).toBe(1));
+    releaseGate(gateWithUnansweredBlocking());
+    await vi.waitFor(() => expect(spawnMock).toHaveBeenCalledTimes(1));
     stop();
   });
 });

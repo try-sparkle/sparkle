@@ -159,4 +159,29 @@ describe("receiptText — a displaced turn renders the ordinary receipt, never '
       /instead|moved|undone|unsent|cancell?ed|not sent/i,
     );
   });
+
+describe("refused + agentName — why a never-sent message must drop the name", () => {
+  /**
+   * THE RENDERER'S BEHAVIOUR THAT MAKES THE DROP NECESSARY (knightwatch, PR #1288).
+   *
+   * The queue stamps `refused` on a message that never left the app (evicted at the cap, stranded
+   * by a sticky failure, lost to a rejection) by SPREADING the original receipt — which carries an
+   * `agentName` on the sparkle path. This is what that would render: an agent refusal, by an agent
+   * that was never offered the message.
+   *
+   * Pinned HERE rather than in the host suite, honestly: the host fixture's receipt carries no
+   * `agentName`, so an assertion there passes whether or not the name is dropped (verified by
+   * mutation — restoring the name did not redden it). This case is the one that can actually fail,
+   * and it is what the host-side `agentName: undefined` exists to avoid.
+   */
+  it("renders an AGENT REFUSAL when a refused receipt still carries a name", () => {
+    expect(receiptText({ target: "sparkle", agentName: "Kraken Auth", refused: true })).toBe(
+      "→ Not sent — Kraken Auth couldn't take it",
+    );
+  });
+
+  it("renders the bare, true line once the name is dropped", () => {
+    expect(receiptText({ target: "sparkle", refused: true })).toBe("→ Not sent");
+  });
+});
 });

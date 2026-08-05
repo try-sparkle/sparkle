@@ -864,6 +864,57 @@ describe("ConciergeHost", () => {
     // so asserting only the headline would leave the fix's actual claim unverified.
     expect(await within(thread()).findByText(/One queued message was dropped/)).toBeTruthy();
     expect(within(thread()).getByTestId(FAILURE_EVIDENCE_TESTID).textContent).toContain("q1");
+    // AND THE EVICTED BUBBLE ITSELF CARRIES A RENDERED MARK (roborev 58638-M1). The previous commit
+    // rewrote the comment on this path to claim `refused` and left the code stamping `unanswered`,
+    // which renders nothing — so the bubble still looked delivered. Asserting the failure bubble
+    // alone could not catch that; this asserts the LOST MESSAGE'S OWN bubble.
+    const q1Bubble = within(thread())
+      .getAllByTestId("you-bubble")
+      .find((b) => b.textContent?.includes("q1"))!;
+    expect(q1Bubble).toBeTruthy();
+    const q1Text = q1Bubble.closest("[data-message-id]")!.textContent ?? "";
+    expect(q1Text).toMatch(/Not sent/);
+    // …and NOT "Not sent — <agent> couldn't take it" (knightwatch, PR #1288). The receipt is spread
+    // from the original, which carries an `agentName` on the sparkle path, and `receiptText`'s
+    // refused branch renders that name as an agent REFUSAL — a claim about an agent that was never
+    // offered this message. The bare form is the only true one here.
+    expect(q1Text).not.toMatch(/couldn't take it/);
+  });
+
+  /**
+   * A DISPLACED MESSAGE IS **NOT** "Not sent" (roborev 58638-M2).
+   *
+   * The orphan path marks a message that REACHED the brain and was being worked on when the next
+   * send arrived. `refused` means "never left this app" and renders "Not sent — <agent> couldn't
+   * take it" whenever the receipt names an agent, fabricating a refusal by an agent that was never
+   * offered the message — and unlike `unanswered` it cannot be withdrawn when the concierge answers
+   * a couple of messages later, which is the documented common case.
+   *
+   * Asserted as an ABSENCE of the false claim, because the true state here renders nothing at all.
+   */
+  it("never stamps a displaced message 'Not sent' — it reached the brain", async () => {
+    _resetConciergeActivityForTests();
+    h.feed = feedWith("approval");
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "displaced question" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    // A tool call: the brain is working on it, but no answer TEXT has arrived.
+    //
+    // The turn is deliberately left RUNNING. The orphan check reads `awaitingBubbleRef`, and the
+    // done handler nulls it — so delivering `done` first leaves nothing to stamp and the case
+    // passes whatever the stamp says. (Verified: with `done` in between, mutating the stamp to
+    // `refused` did not redden this.) The next send is what runs the check.
+    act(() => h.brain.tool?.({ id: "1", name: "Grep", input: '{"pattern":"x"}' }));
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "next question" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+
+    const displaced = within(thread())
+      .getAllByTestId("you-bubble")
+      .find((b) => b.textContent?.includes("displaced question"))!;
+    expect(displaced).toBeTruthy();
+    expect(displaced.closest("[data-message-id]")!.textContent).not.toMatch(/Not sent/);
   });
 
   /**

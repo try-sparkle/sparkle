@@ -317,6 +317,15 @@ export function startPusher(): () => void {
   // and that is honoured the moment the read succeeds.
   let stopBabysit: (() => void) | undefined;
   let babysitUnlisten: (() => void) | undefined;
+  /**
+   * Set once any LIVE config event has been applied.
+   *
+   * The initial `getConfig()` and the `onConfigChanged` subscription are independent async paths
+   * with no ordering guarantee between them, so a slow initial read could land AFTER the user had
+   * already switched the sweep off in the Advanced panel and restart it with the stale `enabled:
+   * true` it had been holding all along (knightwatch #1291 probe 2). A newer reading always wins.
+   */
+  let babysitLiveApplied = false;
 
   /** Apply one `[babysit]` reading: stop whatever is running, start on the new settings. */
   const applyBabysit = (b: BabysitConfigPayload | undefined): void => {
@@ -351,6 +360,11 @@ export function startPusher(): () => void {
       // is `enabled = false` failing open, the one outcome this whole section exists to prevent.
       // Not started is recoverable (the config subscription re-applies on the next change, and a
       // relaunch retries); silently running against the user's explicit off is not.
+      // A live event already applied a NEWER reading; this one is stale by arrival order.
+      if (babysitLiveApplied) {
+        log.debug("pusher", "babysit initial config ignored: a live change already applied");
+        return;
+      }
       try {
         applyBabysit(eff.config.babysit);
         log.info("pusher", "babysit dispatcher started", {
@@ -370,7 +384,7 @@ export function startPusher(): () => void {
       log.warn("pusher", "babysit config read failed; starting on shipped defaults", {
         error: String(e),
       });
-      if (stopped) return;
+      if (stopped || babysitLiveApplied) return;
       try {
         applyBabysit(undefined);
       } catch (err) {
@@ -389,14 +403,36 @@ export function startPusher(): () => void {
     // Same rule as the initial read: a failed re-apply leaves it stopped rather than reverting to
     // defaults, because the reading we just failed to apply is the user's own.
     try {
+      babysitLiveApplied = true;
       applyBabysit(eff.config.babysit);
     } catch (err) {
       log.warn("pusher", "babysit re-apply failed; sweep left stopped", { error: String(err) });
     }
   })
     .then((un) => {
-      if (stopped) un();
-      else babysitUnlisten = un;
+      if (stopped) return un();
+      babysitUnlisten = un;
+      // RE-READ ONCE THE LISTENER IS ACTUALLY REGISTERED (knightwatch #1298 probe 2).
+      //
+      // `getConfig()` starts before `onConfigChanged()` finishes registering, and the Rust side
+      // emits without replay — so an `enabled = false` written in that gap is seen by NEITHER path:
+      // the initial read had already returned the older value, and the event fired before anyone was
+      // listening. The sweep would then run against a setting the user had already changed, until
+      // some later edit happened to fire another event.
+      //
+      // One extra read closes it. It defers to `babysitLiveApplied` like the initial read does, so a
+      // live event that arrived first still wins.
+      void getConfig().then(
+        (eff) => {
+          if (stopped || babysitLiveApplied) return;
+          try {
+            applyBabysit(eff.config.babysit);
+          } catch (err) {
+            log.warn("pusher", "babysit post-subscribe re-apply failed", { error: String(err) });
+          }
+        },
+        (e) => log.debug("pusher", "babysit post-subscribe re-read failed", { error: String(e) }),
+      );
     })
     .catch((e) =>
       log.warn("pusher", "babysit config subscription failed; switch is restart-only", {

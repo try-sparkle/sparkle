@@ -213,3 +213,56 @@ describe("startPusher — the babysit switch", () => {
     expect(last?.[0]).toMatchObject({ enabled: false });
   });
 });
+
+// ── A SLOW INITIAL READ MUST NOT UNDO A NEWER LIVE CHANGE (knightwatch #1291 probe 2) ───────────
+describe("startPusher — babysit config ordering", () => {
+  it("a late initial getConfig does NOT restart the sweep the user just switched off", async () => {
+    // The two async paths are independent and unordered. Holding the initial read open lets the
+    // live `enabled: false` land first; when the stale `enabled: true` finally resolves it must be
+    // ignored, or the user's off switch is undone by a read that started before they flipped it.
+    let resolveInitial: (v: unknown) => void = () => {};
+    getConfig.mockReturnValue(new Promise((r) => (resolveInitial = r)));
+    const { startPusher } = await freshStartPusher();
+    startPusher();
+
+    await vi.waitFor(() => expect(onConfigChanged.mock.calls.length).toBe(2));
+    const onChange = onConfigChanged.mock.calls.at(-1)?.[0] as (eff: unknown) => void;
+    onChange({ config: { pushers: {}, babysit: { enabled: false } } });
+    expect(startBabysitDispatcher.mock.calls.at(-1)?.[0]).toMatchObject({ enabled: false });
+
+    // The stale initial read lands last, carrying the value from before the user's edit.
+    resolveInitial({ config: { pushers: {}, babysit: { enabled: true } } });
+    await new Promise((r) => setTimeout(r, 0));
+
+    // It must not have re-started with enabled: true.
+    expect(startBabysitDispatcher.mock.calls.at(-1)?.[0]).toMatchObject({ enabled: false });
+  });
+});
+
+// ── THE GAP BEFORE THE LISTENER REGISTERS (knightwatch #1298 probe 2) ───────────────────────────
+describe("startPusher — babysit config written before the listener exists", () => {
+  it("RE-READS once subscribed, so an off written in the gap is not missed", async () => {
+    // getConfig() starts before onConfigChanged() finishes registering, and Rust emits without
+    // replay. An `enabled = false` written in that gap is seen by NEITHER path: the initial read
+    // already returned the older value, and the event fired with nobody listening.
+    //
+    // COUNTING NOTE, because it made an earlier version of this test vacuous: `startPusher` issues
+    // TWO getConfig calls of its own — one for the Pusher policy, one for babysit's initial read —
+    // so "a second read happened" was already true without the fix. The fix's read is the THIRD.
+    let reads = 0;
+    getConfig.mockImplementation(async () => {
+      reads += 1;
+      // Reads 1-2 are the mount's own and see the OLD value; anything later is the re-read, by
+      // which time the file says off.
+      return { config: { pushers: {}, babysit: { enabled: reads <= 2 } } };
+    });
+
+    const { startPusher } = await freshStartPusher();
+    startPusher();
+
+    await vi.waitFor(() => expect(reads).toBe(3));
+    await vi.waitFor(() =>
+      expect(startBabysitDispatcher.mock.calls.at(-1)?.[0]).toMatchObject({ enabled: false }),
+    );
+  });
+});
