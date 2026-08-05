@@ -391,6 +391,24 @@ export function ConciergeColumn({
             to carry: Blueprint retired gold entirely, so a gold glint was the last gold left on
             screen. Still the same masked asset and the same accessible name. */}
         <SparkleLogoLink height={WORDMARK_H} fill={wordmarkRamp(mode)} />
+        {/* SEARCH, BESIDE THE MARK — the founder's ask, verbatim: "I want the search to be up next
+            to the Sparkle.ai logo." It used to sit two strips lower (below this row AND below the
+            voice/waveform strip), which put the app's only global search behind the one control
+            nobody scrolls to.
+
+            IMMEDIATELY AFTER THE WORDMARK, and that adjacency is the requirement rather than mere
+            ordering — "next to" is the whole instruction. It stays `flex: "0 0 auto"` so the row's
+            single growing child is still `concierge-header-spacer`; a growing search box here would
+            split the slack and drag the right-hand cluster back toward the mark, which is the exact
+            regression that spacer was added to prevent (roborev 57364).
+
+            The control itself rests as a bare magnifier in this row — see `PaletteTrigger`'s
+            `compact` note for why the header form may not spell out the word "Search". */}
+        {searchSlot && (
+          <div data-testid="concierge-header-search" style={{ flex: "0 0 auto", display: "flex" }}>
+            {searchSlot}
+          </div>
+        )}
         {controller.onMoveSide && <ConciergeGrip onMoveSide={controller.onMoveSide} />}
         {/* THE ROW'S ONLY FLEXIBLE CHILD, and the reason it is an empty box rather than nothing.
             The deleted scope line carried `flex: "1 1 auto"` and was the one item here that could
@@ -579,7 +597,11 @@ export function ConciergeColumn({
           <BalanceBadge />
         </div>
       </div>
-      {searchSlot && <div style={{ flex: "0 0 auto", padding: "10px 16px 0" }}>{searchSlot}</div>}
+      {/* THE SEARCH USED TO RENDER HERE — it now sits in the header row beside the wordmark (see
+          the `concierge-header-search` note above). Left as a marker rather than silently deleted
+          because this position is load-bearing in the reader's mental model of the column: the
+          strip order is header → voice/waveform → thread, and search was the thing between the
+          second and third. It is not "also" in the header; it is only there. */}
       {/* THE LOCKED STATE swaps the paid half — the chat with the `claude -p` brain — for the
           upsell, and NOTHING above this line changes: the header, the scope line, the needs-you
           counts and the per-project segments are all derived from local app state, cost nothing to

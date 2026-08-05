@@ -373,8 +373,16 @@ export function CommandPalette({ open, onClose, jump, onJumped }: CommandPalette
 }
 
 /** The small search affordance for the concierge column — attach-button idiom (muted hairline
- *  pill) with the shortcut spelled out. U7 drops this near the wordmark/scope header. */
-export function PaletteTrigger({ onOpen }: { onOpen: () => void }) {
+ *  pill) with the shortcut spelled out. U7 drops this near the wordmark/scope header.
+ *
+ *  `compact` is the HEADER form, and it is a different trade from the resident pill below.
+ *  The founder asked for the search to sit "up next to the Sparkle.ai logo", and that row has a
+ *  standing rule of his that predates this move: in the CALM state "the row carries the wordmark
+ *  and no words at all" (ConciergeColumn.header.test.tsx). A resident pill spelling out "Search"
+ *  would put the first word ever onto that row. So in the header the control rests as a BARE
+ *  MAGNIFIER and expands to the full `Search ⌘K` pill on hover/focus — his call, asked directly:
+ *  "Icon-only in CALM, expands on hover". */
+export function PaletteTrigger({ onOpen, compact = false }: { onOpen: () => void; compact?: boolean }) {
   // ── THE PILL IS A HOVER/FOCUS AFFORDANCE, AND THE SPACE FOR IT IS ALWAYS RESERVED ──────────────
   // The founder wants shortcuts revealed rather than resident: "it should only show the keyboard
   // shortcut on hover". FOCUS-VISIBLE counts as hover here, and that is not a nicety — a hover-only
@@ -406,10 +414,31 @@ export function PaletteTrigger({ onOpen }: { onOpen: () => void }) {
   // width is now 100% of its slot, which cannot depend on its contents at all. Do not go back to
   // `inline-flex` on the theory that the reserve alone is enough — the reserve is what stops the
   // BOX moving, and the full width is what stops the box being mostly empty.
+  //
+  // ── EVERYTHING ABOVE IS THE RESIDENT FORM. `compact` INVERTS ALL OF IT, DELIBERATELY ──────────
+  // The two forms answer two different complaints of the founder's and they are not reconcilable
+  // into one box, which is why this is a mode rather than a tweak:
+  //
+  //   RESIDENT (below the header, the slot bead sparkle-kk9dg.3 measured): full width, word always
+  //   spelled out, keycap's box reserved and parked right. Fills its slot; nothing reads as a stub.
+  //
+  //   COMPACT (the header row, beside the wordmark): shrink-wrapped, icon-only at rest, expanding
+  //   on hover. Full width here would stretch the button across the header and shove the wordmark's
+  //   neighbours off the row — the header sizes its children, the slot does not size them.
+  //
+  // THE WIDTH CHANGE IS THE POINT in compact ("expands on hover"), not a twitch to avoid, and
+  // reserving the keycap's space would defeat the rule compact exists to honour: `visibility:
+  // hidden` still leaves the string in `textContent`, so a merely-invisible "Search" would read as
+  // a word on the calm row to every assertion in ConciergeColumn.header.test.tsx — and to a screen
+  // reader walking the row's text. Compact therefore CONDITIONALLY RENDERS the label and the
+  // keycap. The accessible name is unchanged in both forms, so the icon-only rest state is never a
+  // nameless button.
   const [revealed, setRevealed] = useState(false);
+  const showLabel = !compact || revealed;
   return (
     <button
       type="button"
+      data-testid="concierge-search-trigger"
       aria-label="Search history (⌘K)"
       title="Search history (⌘K)"
       onClick={onOpen}
@@ -425,30 +454,49 @@ export function PaletteTrigger({ onOpen }: { onOpen: () => void }) {
         fontSize: 12,
         color: C.muted,
         background: "transparent",
-        border: `1px solid ${line}`,
+        // The hairline reads as a text field when the pill is spelled out; at icon-only rest in the
+        // header it would draw a box around a lone glyph, so compact drops it until it expands.
+        border: `1px solid ${showLabel ? line : "transparent"}`,
         borderRadius: 6,
-        padding: "5px 9px",
+        padding: compact && !showLabel ? "5px 6px" : "5px 9px",
         cursor: "pointer",
-        display: "flex",
+        // THE ONE LINE THE MERGE GOT WRONG ON ITS OWN, so it is called out: git took `flex` +
+        // `width: 100%` cleanly into the compact form too, and nothing marked it as a conflict.
+        // Full width is correct ONLY in the resident slot. In the header it would stretch the
+        // button across the row and push the wordmark's neighbours off it.
+        display: compact ? "inline-flex" : "flex",
         // Spans its slot — see the note above. `box-sizing: border-box` is global (index.css), so
         // the 1px border and the 9px side padding sit INSIDE this 100%, not beyond it.
-        width: "100%",
+        ...(compact ? null : { width: "100%" }),
         gap: 5,
         alignItems: "center",
         fontFamily: FONT_UI,
       }}
     >
       <FiSearch size={12} aria-hidden style={{ flex: "0 0 auto" }} />
-      Search
+      {showLabel && "Search"}
       {/* Hidden, not absent — see the reveal note above. `aria-hidden` because the shortcut is
           already in this button's accessible NAME, and announcing "⌘K" twice is worse than once.
 
           `marginLeft: auto` PARKS IT ON THE RIGHT EDGE. Without it the reserved box trails the word
           "Search" and every pixel between there and the border is dead space — which is exactly the
-          empty stub the founder read as an artifact. */}
-      <span aria-hidden style={{ marginLeft: "auto", visibility: revealed ? "visible" : "hidden" }}>
-        <KeyPill>⌘K</KeyPill>
-      </span>
+          empty stub the founder read as an artifact. That is a fix for the RESIDENT form, where the
+          button spans its slot and there is dead space to reclaim; compact shrink-wraps, so there
+          is none, and the auto margin would only push the keycap away from the word it belongs to.
+
+          Compact also drops the RESERVE (renders nothing at rest) rather than hiding the box — see
+          the `compact` note above for why `visibility` cannot satisfy the calm-row rule. */}
+      {compact ? (
+        revealed && (
+          <span aria-hidden>
+            <KeyPill>⌘K</KeyPill>
+          </span>
+        )
+      ) : (
+        <span aria-hidden style={{ marginLeft: "auto", visibility: revealed ? "visible" : "hidden" }}>
+          <KeyPill>⌘K</KeyPill>
+        </span>
+      )}
     </button>
   );
 }

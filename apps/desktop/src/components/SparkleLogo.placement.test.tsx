@@ -269,6 +269,62 @@ describe("the Sparkle.ai logo lives in column one, the concierge", () => {
     expect(logo.compareDocumentPosition(pill) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
+  // ── SEARCH SITS BESIDE THE MARK ──────────────────────────────────────────────────────────────
+  // The founder's ask, verbatim: "I want the search to be up next to the Sparkle.ai logo." Before
+  // this, the slot rendered OUTSIDE the header entirely — below the row and below the voice strip
+  // (`{searchSlot && <div style={{ padding: "10px 16px 0" }}>` in ConciergeColumn) — which put the
+  // app's only global search behind the one strip nobody scrolls past.
+  //
+  // ADJACENCY IS THE ASSERTION, not mere containment. "Next to" is the whole instruction, so a
+  // future change that keeps the slot in the row but parks it after the spacer (i.e. hard right,
+  // by the kebab) has to fail here — containment alone would call that a pass.
+  describe("the search sits next to the wordmark", () => {
+    const searchSlot = <div data-testid="search-slot">stub</div>;
+
+    it("renders the search INSIDE the header row, not in a strip below it", () => {
+      render(
+        <ConciergeColumn model={model} controller={controller()} searchSlot={searchSlot} />,
+      );
+      const head = screen.getByTestId("concierge-header");
+      expect(head.contains(screen.getByTestId("search-slot"))).toBe(true);
+    });
+
+    it("puts it IMMEDIATELY after the mark — nothing between them", () => {
+      render(
+        <ConciergeColumn model={model} controller={controller()} searchSlot={searchSlot} />,
+      );
+      const head = screen.getByTestId("concierge-header");
+      const logo = screen.getByRole("img", { name: "Sparkle" });
+      const search = screen.getByTestId("concierge-header-search");
+      // The mark still LEADS the row (pinned above); the search is the very next child of it.
+      expect(head.firstElementChild?.contains(logo)).toBe(true);
+      expect(head.firstElementChild?.nextElementSibling).toBe(search);
+      expect(search.contains(screen.getByTestId("search-slot"))).toBe(true);
+    });
+
+    it("does not grow, so the right-hand cluster stays on the right", () => {
+      render(
+        <ConciergeColumn model={model} controller={controller()} searchSlot={searchSlot} />,
+      );
+      const head = screen.getByTestId("concierge-header");
+      const search = screen.getByTestId("concierge-header-search");
+      // `flex: 0 0 auto` — the spacer must remain the row's ONE growing child, or the search
+      // splits the slack and drags the avatar/kebab back toward the mark (roborev 57364).
+      expect(search.style.flex).toBe("0 0 auto");
+      const growing = [...head.children].filter(
+        (el) => !/^0/.test((el as HTMLElement).style.flex || "0") && (el as HTMLElement).style.flex,
+      );
+      expect(growing).toEqual([screen.getByTestId("concierge-header-spacer")]);
+    });
+
+    it("still renders when the column is the only thing the host hands a slot", () => {
+      // The slot is OPTIONAL — a column with no search must not render an empty box beside the
+      // mark, which would open a gap the row's `gap: 7` then doubles.
+      render(<ConciergeColumn model={model} controller={controller()} />);
+      expect(screen.queryByTestId("concierge-header-search")).toBeNull();
+    });
+  });
+
   it("has no star field left anywhere in the column", () => {
     const { container } = render(<ConciergeColumn model={model} controller={controller()} />);
     // The field was a <canvas> painting drifting particles behind the mark. Deleting the component

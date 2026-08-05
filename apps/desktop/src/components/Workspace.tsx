@@ -1840,7 +1840,9 @@ export function Workspace() {
           feed={feed}
           promptTarget={promptTarget}
           promptTargetShown={promptTargetShown}
-          searchSlot={<PaletteTrigger onOpen={palette.openPalette} />}
+          // `compact`: this slot lands in the header row beside the wordmark now, and that row may
+          // carry no words at rest — see PaletteTrigger's `compact` note.
+          searchSlot={<PaletteTrigger onOpen={palette.openPalette} compact />}
           // The palette is the only surface that renders `historyStore`, so "See what it did" on a
           // closed agent's pill has to open it — seeding the query alone would paint nothing.
           onOpenHistory={palette.openPalette}

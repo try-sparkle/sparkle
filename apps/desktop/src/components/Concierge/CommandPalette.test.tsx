@@ -232,6 +232,64 @@ describe("PaletteTrigger", () => {
     expect(onOpen).toHaveBeenCalledTimes(1);
   });
 
+  // ── THE HEADER FORM: ICON-ONLY AT REST, EXPANDS ON HOVER ─────────────────────────────────────
+  // Moving search up beside the wordmark collided with a standing rule of the founder's — in the
+  // CALM state that row "carries the wordmark and no words at all". Asked directly, he chose
+  // "Icon-only in CALM, expands on hover", so the header form must contribute NO TEXT at rest.
+  //
+  // `textContent`, deliberately, is what these assert. The resident form hides its keycap with
+  // `visibility: hidden`, which still leaves the string in `textContent` — so a compact form built
+  // the same way would read as a word on the calm row to every assertion in
+  // ConciergeColumn.header.test.tsx and to a screen reader walking the row. Only a CONDITIONAL
+  // render actually satisfies the rule, and asserting on the style property instead of the text
+  // would pass for the broken version.
+  describe("compact (the header form)", () => {
+    const btn = () => screen.getByRole("button", { name: "Search history (⌘K)" });
+
+    it("states nothing at rest — no word, no keycap", () => {
+      render(<PaletteTrigger onOpen={vi.fn()} compact />);
+      expect(btn().textContent).toBe("");
+    });
+
+    it("expands to the full pill on hover, and collapses again on leave", () => {
+      render(<PaletteTrigger onOpen={vi.fn()} compact />);
+      fireEvent.mouseEnter(btn());
+      expect(btn().textContent).toContain("Search");
+      expect(btn().textContent).toContain("⌘K");
+      fireEvent.mouseLeave(btn());
+      expect(btn().textContent).toBe("");
+    });
+
+    it("keeps its accessible name at rest, so the icon is never a nameless button", () => {
+      render(<PaletteTrigger onOpen={vi.fn()} compact />);
+      // Found BY that name above, so reaching it at all is the assertion; this pins the reason.
+      expect(btn().getAttribute("aria-label")).toBe("Search history (⌘K)");
+    });
+
+    it("leaves the resident form alone — it still spells out Search at rest", () => {
+      // The guard that keeps this a NEW mode rather than a behaviour change to the existing pill.
+      render(<PaletteTrigger onOpen={vi.fn()} />);
+      expect(btn().textContent).toContain("Search");
+    });
+
+    // THE HALF THE MERGE COULD HAVE EATEN. `sparkle-kk9dg.3` landed on main while this branch was
+    // open and made the RESIDENT button `width: 100%`; git took that into the compact form too,
+    // cleanly and unmarked. Full width in the header would stretch the button across the row. So
+    // compact's shrink-wrap is asserted here rather than left to the style block's good intentions.
+    it("shrink-wraps instead of filling the row — full width belongs to the resident slot", () => {
+      render(<PaletteTrigger onOpen={vi.fn()} compact />);
+      expect(btn().style.display).toBe("inline-flex");
+      expect(btn().style.width).toBe("");
+    });
+
+    it("does not park its keycap right — there is no dead space to reclaim when shrink-wrapped", () => {
+      render(<PaletteTrigger onOpen={vi.fn()} compact />);
+      fireEvent.mouseEnter(btn());
+      const cap = btn().querySelector<HTMLElement>("span[aria-hidden]");
+      expect(cap?.style.marginLeft).toBe("");
+    });
+  });
+
   // ── NARROW CONCIERGE COLUMN (bead sparkle-kk9dg.3) ──────────────────────────────────────────
   // Founder: "The search field is small and left-floating, with a stray empty box artifact
   // directly beneath its lower-left corner."
