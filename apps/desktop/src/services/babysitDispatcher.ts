@@ -343,6 +343,19 @@ export async function babysitSweepProject(
   /** False once this sweep has been superseded — see {@link sweepGeneration}. Defaults to "always
    *  current" so a direct caller (every test) is unaffected. */
   isCurrent: () => boolean = () => true,
+  /**
+   * WHEN A DISPATCH ACTUALLY HAPPENED, for the hourly budget only (roborev, PR #1266 probe 1).
+   *
+   * `now` is captured once at the top of the sweep, which is correct for every DECISION here — they
+   * must all judge the same instant. It is wrong for the budget: a sweep that wedged for 12+ minutes
+   * and then dispatched would file the entry under its ANCIENT start time, and the core reads that
+   * as the dispatch epoch — so it ages out of the one-hour window early and permits an extra Claude
+   * session in the hour. The append is the one write whose timestamp must be the real one.
+   *
+   * Defaults to the sweep's own `now`, so every direct caller (and every test that fixes the clock)
+   * behaves exactly as before.
+   */
+  dispatchClock: () => number = () => now,
 ): Promise<BabysitSweepOutcome> {
   const out: BabysitSweepOutcome = { dispatched: [], holds: {}, unidentified: 0 };
   const hold = (reason: string): void => {
@@ -426,16 +439,27 @@ export async function babysitSweepProject(
 
     lastObservation.set(k, { evidenceIds: babysitEvidenceIds(decision.evidence) });
     const agentId = await dispatchOne(project, repo, pr.number, now);
-    // dispatchOne awaits the lease commands, so the same rule applies. A dispatch that DID happen is
-    // still reported to the caller; what is skipped is writing this sweep's stale clock over a
-    // newer sweep's.
-    if (!isCurrent()) {
-      out.abandoned = true;
-      if (agentId) out.dispatched.push({ repo, pr: pr.number, agentId });
-      return out;
-    }
+    // NO FENCE HERE, DELIBERATELY (roborev 58537). There WAS one, and it was strictly permissive in
+    // the two directions this module says matter most, because neither write below is a stale-clock
+    // hazard — they record FACTS about a driver that demonstrably exists:
+    //
+    //   * `recentDispatchAt` is the hourly budget, and a real driver costs a full Claude session on
+    //     the founder's own quota. Writing it with a stale `now` would only age the entry out early;
+    //     SKIPPING it never charges the driver at all, so the hour permits N+1. Strictly worse.
+    //   * `clocks.sawLive` records that a driver was just spawned. Without it, if that driver's lease
+    //     goes free before any sweep observes it `held-live`, `observeLease` never takes the exit
+    //     edge, `lastDriverExitAt` — THE SOLE PER-PR LIMITER — is never stamped, and the PR is
+    //     re-dispatchable with NO cooldown at all. The fence reintroduced exactly the crash loop
+    //     `BABYSIT_RECOVERY_COOLDOWN_MS` exists to slow.
+    //
+    // The fence that matters is the one after `readProbeGate` above, which guards `observeLease` —
+    // the write that stamps a TIMESTAMP and can therefore be poisoned by a stale clock.
     if (agentId) {
-      recentDispatchAt = [...recentDispatchAt.filter((t) => now - t < BABYSIT_RATE_WINDOW_MS), now];
+      const dispatchedAt = dispatchClock();
+      recentDispatchAt = [
+        ...recentDispatchAt.filter((t) => dispatchedAt - t < BABYSIT_RATE_WINDOW_MS),
+        dispatchedAt,
+      ];
       // Stamped only on a dispatch that actually produced a driver. A lost acquire or a refused
       // spawn created nothing, so recording that a driver existed would charge the PR a cooldown
       // for an event that never happened — and since the exit clock is the sole per-PR limiter,
@@ -578,7 +602,7 @@ export async function sweepAllProjects(
     if (!deps.ownsProject(project.id)) continue;
     try {
       if (!isCurrent()) return;
-      const outcome = await babysitSweepProject(project, now, resolved, isCurrent);
+      const outcome = await babysitSweepProject(project, now, resolved, isCurrent, () => Date.now());
       if (outcome.dispatched.length > 0 || Object.keys(outcome.holds).length > 0) {
         log.debug("babysit", "sweep", {
           project: project.id,

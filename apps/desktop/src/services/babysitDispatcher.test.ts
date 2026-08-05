@@ -482,6 +482,84 @@ describe("the sweep fence", () => {
     expect(spawnMock).not.toHaveBeenCalled();
   });
 
+  it("STILL charges the budget and records the driver when superseded AFTER the spawn", async () => {
+    // A dispatch that actually happened is a FACT, not a stale clock. Fencing its accounting off was
+    // strictly permissive: the driver was never charged against the hourly ceiling, and `sawLive` was
+    // never set — so the exit edge never fired and the PR came back re-dispatchable with NO cooldown,
+    // the crash loop the recovery clock exists to slow (roborev 58537).
+    wireInvoke({ leases: [] });
+    await babysitSweepProject(PROJECT, T0, CONFIG);
+
+    // Current through the top fence AND the post-probe fence; superseded only after dispatchOne.
+    let calls = 0;
+    const out = await babysitSweepProject(PROJECT, T0 + 60_000, CONFIG, () => ++calls <= 2);
+
+    expect(out.dispatched).toHaveLength(1);
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+
+    // THE SIDE EFFECT THAT WAS BEING DROPPED: `sawLive` was set, so the next sweep sees the exit
+    // edge and the PR is cooling down rather than immediately re-dispatchable.
+    const next = await babysitSweepProject(PROJECT, T0 + 120_000, CONFIG);
+    expect(next.holds["cooling-down"]).toBe(1);
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("the dispatch is CHARGED against the hourly ceiling — not merely reported", async () => {
+    // Probe 2 on #1266: the test above passes even if only the `recentDispatchAt` write is removed,
+    // because it asserts dispatch reporting and `sawLive`/cooldown but never the budget. This is the
+    // assertion that pins the accounting: spend the whole hourly ceiling across distinct PRs, then
+    // prove the next one is refused for `rate-limited` specifically. Without the append, the counter
+    // never grows and the ceiling can never be reached.
+    const N = CONFIG.maxDispatchesPerHour;
+    let t = T0;
+    for (let i = 0; i < N; i++) {
+      fetchOpenPrsMock.mockResolvedValue([prWithProbe(9000 + i)]);
+      wireInvoke({ leases: [] });
+      await babysitSweepProject(PROJECT, t, CONFIG);
+      await babysitSweepProject(PROJECT, t + 1000, CONFIG);
+      t += 5000;
+    }
+    expect(spawnMock).toHaveBeenCalledTimes(N);
+
+    // One more distinct PR, still inside the hour: the ceiling is spent.
+    fetchOpenPrsMock.mockResolvedValue([prWithProbe(9999)]);
+    wireInvoke({ leases: [] });
+    await babysitSweepProject(PROJECT, t, CONFIG);
+    const over = await babysitSweepProject(PROJECT, t + 1000, CONFIG);
+
+    expect(over.holds["rate-limited"]).toBe(1);
+    expect(spawnMock).toHaveBeenCalledTimes(N);
+  });
+
+  it("files the budget entry under WHEN THE DISPATCH HAPPENED, not the sweep's start", async () => {
+    // Probe 1 on #1266. `now` is captured once at the top of a sweep, which is right for every
+    // decision but wrong for the budget: a sweep that wedged for 12+ minutes and then dispatched
+    // would file the entry under its ANCIENT start time, so it ages out of the one-hour window early
+    // and permits an extra Claude session in the hour.
+    //
+    // Drive the two apart: sweeps judge at T0, but the dispatches actually happen 59 minutes later.
+    const N = CONFIG.maxDispatchesPerHour;
+    const LATE = T0 + 59 * 60_000;
+    for (let i = 0; i < N; i++) {
+      fetchOpenPrsMock.mockResolvedValue([prWithProbe(8000 + i)]);
+      wireInvoke({ leases: [] });
+      await babysitSweepProject(PROJECT, T0, CONFIG, () => true, () => LATE);
+      await babysitSweepProject(PROJECT, T0 + 1000, CONFIG, () => true, () => LATE);
+    }
+    expect(spawnMock).toHaveBeenCalledTimes(N);
+
+    // At T0+61min, entries filed under T0 would have aged out and this would dispatch. Filed under
+    // LATE they are still inside the hour, so the ceiling holds.
+    const AFTER = T0 + 61 * 60_000;
+    fetchOpenPrsMock.mockResolvedValue([prWithProbe(8999)]);
+    wireInvoke({ leases: [] });
+    await babysitSweepProject(PROJECT, AFTER, CONFIG, () => true, () => AFTER);
+    const over = await babysitSweepProject(PROJECT, AFTER + 1000, CONFIG, () => true, () => AFTER);
+
+    expect(over.holds["rate-limited"]).toBe(1);
+    expect(spawnMock).toHaveBeenCalledTimes(N);
+  });
+
   it("runs every PR to completion while it is still current", async () => {
     // The paired direction: without it, a fence that always reported "superseded" would pass above.
     fetchOpenPrsMock.mockResolvedValue([prWithProbe(1), prWithProbe(2), prWithProbe(3)]);
