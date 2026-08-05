@@ -103,7 +103,11 @@ import { paneState } from "./paneReadiness";
 import { findKnownAgent } from "./knownAgents";
 import { getAgentViewport } from "./terminalViewport";
 import { isClaudeCodeScreen } from "../engine/claudeCodeScreen";
-import { screenBlocksWrite, screenIsCredentialField } from "../voice/dictationTerminalRoute";
+import {
+  screenBlocksWrite,
+  screenIsCredentialField,
+  screenIsYesNoPrompt,
+} from "../voice/dictationTerminalRoute";
 import { useInteractionStore } from "../stores/interactionStore";
 import { useProjectStore } from "../stores/projectStore";
 import { usePromptHistoryStore } from "../stores/promptHistoryStore";
@@ -581,7 +585,26 @@ export async function dispatchConciergeAnswer(
   // the scrollback still holds. ssh matters specifically: it carries `(yes/no)` but wants the whole
   // word `yes` while the detector's Approve sends `y`, so answering it would report a delivery ssh
   // rejected.
-  if (screen && screenIsCredentialField(screen.text)) {
+  // AND THE `(yes/no)` ARM IS WAIVED ONLY BY A *LIVE* PICKER (roborev 58540), which the previous cut
+  // dropped entirely. `screenIsCredentialField` excludes that arm unconditionally, so a confirmation
+  // with NO detected options stopped blocking — and the detector's YN only fires when `yes/no` sits
+  // in the last two non-empty scrollback lines, with the generic-menu branch short-circuiting it.
+  //
+  //     Overwrite existing config? (yes/no)
+  //     Waiting for response…
+  //     Press Ctrl-C to abort.
+  //
+  // YN misses (the prompt is three lines up), `pickerOptions` is empty, nothing blocks, and the send
+  // pastes AND SUBMITS prose into a live confirmation. The goal auto-resume hits it every 15s.
+  //
+  // So: refuse a credential FIELD always, and refuse a yes/no prompt too whenever there is no picker
+  // to answer it with. That is the shape roborev 58529 asked for, and this restores the half of it
+  // the last commit lost.
+  if (
+    screen &&
+    (screenIsCredentialField(screen.text) ||
+      (pickerOptions.length === 0 && screenIsYesNoPrompt(screen.text)))
+  ) {
     log.warn("concierge", "refused a write into a credential prompt", { agentId });
     return { ok: false, path: "blocked-prompt", agentId };
   }

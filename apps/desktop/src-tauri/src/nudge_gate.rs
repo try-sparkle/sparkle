@@ -1360,12 +1360,19 @@ mod tests {
         for needle in [
             // dictationTerminalRoute.ts
             r"/\bpass(word|phrase)\b[^\n]*:\s*$/im,",
-            // NO TRAILING COMMA on this one: the pattern moved out of the array literal into its own
-            // `const YES_NO_PROMPT = …;` declaration, because the TS side needs to exclude that arm
-            // BY OBJECT IDENTITY and a duplicate literal is a different object (roborev 58529). The
-            // pattern itself is byte-for-byte unchanged, which is what this guard is actually about —
-            // so the needle drops the comma rather than the check being weakened or removed.
-            r"/\(\s*yes\s*\/\s*no/i",
+            // THE WHOLE DECLARATION, not the bare literal (roborev 58550). This pattern moved out of
+            // the array into its own const, because the TS side excludes that arm BY OBJECT IDENTITY
+            // and a duplicate literal is a different object. A first cut simply dropped the trailing
+            // comma — which also dropped the only RIGHT-ANCHOR the needle had: `contains` is a
+            // substring test, so `/i` still matched `/im`, `/gi`, `/iu`, and the guard stayed green
+            // through a flag edit. That is not theoretical: these regexes are shared objects whose
+            // `.test()` is called repeatedly, so adding `g` makes matching stateful via `lastIndex`
+            // and a `(yes/no)` screen would start blocking on alternate calls — an intermittent hole
+            // in the write gate, with the drift guard reporting no drift.
+            //
+            // The trailing `;` restores the end-anchor AND re-asserts the pattern is still a
+            // standalone const, which is the invariant the identity filter actually depends on.
+            r"const YES_NO_PROMPT = /\(\s*yes\s*\/\s*no/i;",
             r#"/\btype\s+["']?yes["']?\b/i,"#,
             r"pass(word|phrase|code)|username|token|otp|one[-\s]?time\s+(code|password)|verification\s+code|2fa|two[-\s]?factor|pin",
         ] {

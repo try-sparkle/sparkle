@@ -261,6 +261,38 @@ describe("a credential prompt refuses on the normal buffer too", () => {
     expectNothingWritten();
   });
 
+  // ══ …BUT ONLY WHEN A PICKER IS ACTUALLY LIVE (roborev 58540) ══════════════════════════════════
+  // The detector's YN arm only fires when `yes/no` sits in the last two non-empty lines. Three lines
+  // up it misses, `pickerOptions` is empty, and an unconditional waiver let the send paste AND SUBMIT
+  // prose into a live confirmation — which the goal auto-resume would hit every 15s.
+  it("refuses a (yes/no) confirmation that scrolled out of the detector's reach", async () => {
+    const real = await vi.importActual<typeof import("./suggestions/heuristics")>(
+      "./suggestions/heuristics",
+    );
+    vi.mocked(detectTerminalPrompts).mockImplementation(real.detectTerminalPrompts);
+    const SCREEN =
+      "Overwrite existing config? (yes/no)\nWaiting for response…\nPress Ctrl-C to abort.";
+    vi.mocked(getAgentScrollback).mockReturnValue(SCREEN);
+    vi.mocked(getAgentViewport).mockReturnValue({ text: SCREEN, alternateBuffer: false });
+    const r = await dispatchConciergeAnswer(AGENT, "continue", OPTS);
+    expect(r.path).toBe("blocked-prompt");
+    expectNothingWritten();
+  });
+
+  // ══ AND "fingerprint" IS NOT A PROMPT (roborev 58540) ══════════════════════════════════════════
+  // SSH_HOST_KEY tests the whole viewport, so a bare `\bfingerprint\b` alternative refused EVERY send
+  // to any agent whose pane happened to show the word — a key listing, `git log --show-signature`, or
+  // an agent reading this very diff — with no override until it scrolled off. This row is the
+  // delivering direction, so the over-block cannot come back.
+  it("delivers to a screen that merely mentions a fingerprint", async () => {
+    const SCREEN = "ED25519 key fingerprint is SHA256:abc\n$ ";
+    vi.mocked(getAgentScrollback).mockReturnValue(SCREEN);
+    vi.mocked(getAgentViewport).mockReturnValue({ text: SCREEN, alternateBuffer: false });
+    const r = await dispatchConciergeAnswer(AGENT, "carry on", OPTS);
+    expect(r.path).toBe("free-text");
+    expect(r.ok).toBe(true);
+  });
+
   // ══ A `(yes/no)` PROMPT IS A PICKER, THROUGH THE REAL DETECTOR (roborev 58512) ════════════════
   // THE ROW THE FIRST CUT COULD NOT HAVE. `WRITE_BLOCKING_PROMPTS` carries `/\(\s*yes\s*\/\s*no/i`,
   // so `screenIsCredentialPrompt` is NOT purely the non-picker half — and `suggestions/heuristics`'

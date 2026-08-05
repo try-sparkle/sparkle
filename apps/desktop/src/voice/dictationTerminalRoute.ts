@@ -173,16 +173,35 @@ export function screenIsCredentialPrompt(snapshot: string): boolean {
  * while the dispatcher reported a delivery — so it is matched by the credential-tail arm's
  * `fingerprint` sibling below rather than left to the yes/no waiver.
  */
+export function screenIsYesNoPrompt(snapshot: string): boolean {
+  return YES_NO_PROMPT.test(snapshot);
+}
+
+/**
+ * A CREDENTIAL FIELD, excluding the `(yes/no)` shape a LIVE picker may answer.
+ *
+ * The caller must still refuse a `(yes/no)` screen when no picker is actually live — see
+ * {@link screenIsYesNoPrompt} and its use in `conciergeDispatch`. This predicate alone waives that
+ * arm UNCONDITIONALLY, which is not the same thing (roborev 58540).
+ */
 export function screenIsCredentialField(snapshot: string): boolean {
   if (WRITE_BLOCKING_PROMPTS.some((re) => re !== YES_NO_PROMPT && re.test(snapshot))) return true;
-  if (SSH_HOST_KEY.test(snapshot)) return true;
+  if (YES_NO_PROMPT.test(snapshot) && SSH_HOST_KEY.test(snapshot)) return true;
   return matchesCredentialTail(snapshot);
 }
 
 /** ssh's host-key confirmation, which carries `(yes/no…)` but is NOT picker-answerable: ssh wants
  *  the whole word `yes`, and the detector's Approve sends `y`. Named separately so the yes/no
- *  waiver cannot reach it (roborev 58529). */
-const SSH_HOST_KEY = /\bcontinue connecting\b|\bauthenticity of host\b|\bfingerprint\b/i;
+ *  waiver cannot reach it (roborev 58529).
+ *
+ *  NO BARE `\bfingerprint\b` ALTERNATIVE (roborev 58540). This tests the WHOLE viewport, so a common
+ *  word made every send to that agent refuse: a GPG/SSH key listing, `git log --show-signature`, or
+ *  an agent simply reading this diff would show "fingerprint" and lock the pane out of the concierge,
+ *  `send_to_agent_terminal` AND the goal auto-resume until it scrolled off — with no override. The
+ *  two remaining alternatives are ssh's own sentences, and {@link screenIsCredentialField} only
+ *  consults this at all when the yes/no shape is present, which confines it to the case the waiver
+ *  would otherwise reach. */
+const SSH_HOST_KEY = /\bcontinue connecting\b|\bauthenticity of host\b/i;
 
 /** The wrap-tolerant arm: a credential word ANYWHERE in the trailing region, and that region ending
  *  in a colon — the shape of a prompt sitting there waiting, however it happened to wrap. */
