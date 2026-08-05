@@ -488,8 +488,13 @@ fn mark_exhausted_at(
             acct.exhausted_until = Some(until_epoch);
             acct.exhausted_identity = Some(key);
         }
-        // Unresolvable with a live bench on record: keep both, retry next poll.
-        None if live_bench => {
+        // Unresolvable with an OWNED live bench: keep both, retry next poll. The owner qualifier is
+        // load-bearing — an UNOWNED bench has no owner to be stale, so blocking there is pure loss.
+        // Concretely, a named account with an empty `config_dir` (persistently unresolvable by
+        // design) records a limit unowned at 2:00 resetting 3:00; a new limit at 2:30 resetting 6:00
+        // would be refused, the 3:00 bench would expire, and `pickAccount` would route work into an
+        // account genuinely limited until 6:00. The unowned case falls through to the write below.
+        None if live_bench && acct.exhausted_identity.is_some() => {
             return Err("identity unresolvable; bench not recorded".to_string());
         }
         // Unresolvable with nothing live to protect: record the limit as UNOWNED rather than lose
@@ -3702,6 +3707,32 @@ mod tests {
             effective_exhaustion(&stored[0], Some(&oauth(Some("uuid-a"), "a@x.com")), now_secs()),
             Some(until)
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unowned_live_bench_can_still_be_extended() {
+        // The regression my own previous fix introduced: `None if live_bench => Err` fired even with
+        // NO owner on record. An unowned bench has no owner to be stale, so refusing there is pure
+        // loss. A named account with an empty config_dir is persistently unresolvable BY DESIGN, so
+        // it would record a limit unowned at 2:00 resetting 3:00, refuse the 2:30 limit resetting
+        // 6:00, let the 3:00 bench expire, and read healthy while genuinely limited until 6:00.
+        let dir = unique_dir("unowned-bench-extend");
+        let path = dir.join("accounts.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut acct = sample("a", false, dir.to_str().unwrap());
+        acct.exhausted_until = Some(now_secs() + 600); // LIVE…
+        acct.exhausted_identity = None; // …but UNOWNED
+        write_accounts_at(&path, &[acct]).unwrap();
+
+        // No .claude.json here, so the identity is unresolvable — the arm under test.
+        let later = now_secs() + 7_200;
+        mark_exhausted_at(&path, "a", later, None)
+            .expect("an UNOWNED live bench has no owner to protect — the later limit must land");
+
+        let stored = read_accounts_at(&path).unwrap();
+        assert_eq!(stored[0].exhausted_until, Some(later), "the longer limit is recorded");
+        assert_eq!(stored[0].exhausted_identity, None, "and stays unowned");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -42,8 +42,17 @@ export function AccountSwitchHost() {
   // Only the RECOMMENDATION branch is gated. The in-progress `plan` branch renders "Switching
   // accounts — N of M agents moved" and names no account, so withholding it would hide real
   // progress for no benefit.
-  const named = (a: Account | undefined) =>
-    a != null && identities != null && identities.some((i) => i.id === a.id);
+  // NAMEABLE, not merely present. `identities_at` maps 1:1 over accounts and emits a row for EVERY
+  // registered account, with email and accountUuid both null when the config is unresolvable — so a
+  // row-presence check passes for exactly the account we cannot name, and `leadName` then says "An
+  // account that isn't signed in has hit its limit" about the account the user is working in. `from`
+  // is never filtered for a login (it comes straight from currentAccountId; only `to` goes through
+  // signedInAccountIds), so a truncated mid-write read of .claude.json — the routine tick the Rust
+  // half of this feature is built around — reaches it.
+  const named = (a: Account | undefined) => {
+    if (a == null || identities == null) return false;
+    return accountDisplay(a, identities.find((i) => i.id === a.id)).hasLogin;
+  };
   if (!plan && (!named(recommendation?.from) || !named(recommendation?.to))) return null;
 
   const display = (a: Account) => accountDisplay(a, identities!.find((i) => i.id === a.id));

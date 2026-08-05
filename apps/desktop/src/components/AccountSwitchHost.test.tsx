@@ -92,6 +92,45 @@ describe("AccountSwitchHost — naming the accounts it asks you to switch betwee
     expect(screen.queryByText(/isn't signed in/i)).toBeNull();
   });
 
+  it("stays silent when the read FAILED but identities came back NON-empty", async () => {
+    // This is the ONLY input for which the `failed` gate and the per-account gate differ, and it is
+    // reachable: loadAccountState sets `failed` when `accounts` or `usage` comes back non-array
+    // while `identities` was fine. Without it, mutating the `failed` check away left all four tests
+    // green — the empty-array case is rejected by the per-account gate on its own, so the branch I
+    // named as the headline fix was never exercised. My mutation check confirmed the whole gate,
+    // not the part I claimed.
+    loadAccountState.mockResolvedValue({
+      accounts: [],
+      usage: [],
+      identities: [ident("a", "me@personal.com"), ident("b", "me@work.com")],
+      failed: true,
+    });
+    const { container } = render(<AccountSwitchHost />);
+
+    await new Promise((r) => setTimeout(r, 0));
+    expect(container.textContent).toBe("");
+  });
+
+  it("stays silent when a row EXISTS but carries no login to name", async () => {
+    // identities_at emits a row for every registered account, with email and accountUuid both null
+    // when the config is unresolvable — so row presence is not nameability, and `from` is never
+    // filtered for a login. This is the common real failure the previous gate missed.
+    loadAccountState.mockResolvedValue({
+      accounts: [],
+      usage: [],
+      identities: [
+        { ...ident("a", "me@personal.com"), email: null, accountUuid: null },
+        ident("b", "me@work.com"),
+      ],
+      failed: false,
+    });
+    const { container } = render(<AccountSwitchHost />);
+
+    await new Promise((r) => setTimeout(r, 0));
+    expect(container.textContent).toBe("");
+    expect(screen.queryByText(/isn't signed in/i)).toBeNull();
+  });
+
   it("stays silent when identities load but the recommended TARGET has no row", async () => {
     // The gate has to be per-account. A non-empty list still names the missing one wrongly, and the
     // banner names two accounts — one unnameable is enough to make it meaningless.
