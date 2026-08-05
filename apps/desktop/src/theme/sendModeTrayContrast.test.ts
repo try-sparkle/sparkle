@@ -76,7 +76,12 @@ type Theme = "dark" | "light";
  *  BRAND — which is exactly why trayInk stores NAMES: the two families resolve differently. */
 function ink(theme: Theme, token: string): string {
   const themed = (THEME_HEX[theme] as Record<string, string>)[token];
-  return themed ?? (BRAND as unknown as Record<string, string>)[token];
+  const resolved = themed ?? (BRAND as unknown as Record<string, string>)[token];
+  // Every token the tray uses resolves in one of the two families; an unresolved one is a test
+  // bug, so surface it loudly rather than letting `undefined` flow into the contrast math. This
+  // also narrows the return to `string` under `noUncheckedIndexedAccess`.
+  if (resolved === undefined) throw new Error(`unresolved ink token: ${token}`);
+  return resolved;
 }
 
 /**
