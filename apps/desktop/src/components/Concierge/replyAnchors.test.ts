@@ -14,6 +14,7 @@ import {
   reachedTheBrain,
   remapAnchors,
 } from "./replyAnchors";
+import { collapseText } from "../composer/attachments";
 import type { ConciergeMessage, ConciergeReceipt } from "./types";
 
 const you = (id: string, text: string, receipt?: ConciergeReceipt): ConciergeMessage => ({
@@ -309,5 +310,52 @@ describe("remapAnchors — surviving the persisted thread's reindex", () => {
   it("leaves a reply with no anchors without an empty array to persist", () => {
     expect(remapAnchors(undefined, new Map())).toBeUndefined();
     expect(remapAnchors([], new Map())).toBeUndefined();
+  });
+});
+
+// ── A MESSAGE WHOSE WORDS ARE ALL INSIDE A PILL ────────────────────────────────────────────────
+// A `you` message's `text` is only what was typed AROUND its pastes (ConciergeUserMessage.collapsed),
+// so a send that is nothing but a paste has `text === ""` — and the compose box allows exactly that.
+// Before the fallback, the chain fell through to `attachmentQuote(0)` and a forty-row message was
+// quoted, above the reply answering it, as "0 attachments".
+describe("pendingAnchors — quoting a message whose words are all in a pill", () => {
+  const PASTE = `Ship the reply linter behind a flag\n${Array.from(
+    { length: 8 },
+    (_, i) => `step ${i}`,
+  ).join("\n")}\n`;
+  const pasted = (id: string, typed: string): ConciergeMessage => ({
+    id,
+    kind: "you",
+    text: typed,
+    collapsed: [collapseText("blk-1", PASTE)],
+  });
+
+  it("quotes the paste's own first words when nothing was typed", () => {
+    const [anchor] = pendingAnchors([pasted("you-1", "")]);
+    expect(anchor!.quote).toBe("Ship the reply linter behind a flag");
+    // Explicitly NOT the fallback below it, which is what this used to read.
+    expect(anchor!.quote).not.toContain("attachment");
+  });
+
+  it("still prefers the TYPED words when there are any", () => {
+    // The paste is context; the sentence is the question. The stub should say the question.
+    const [anchor] = pendingAnchors([pasted("you-1", "what is wrong here?")]);
+    expect(anchor!.quote).toBe("what is wrong here?");
+  });
+
+  it("caps a pill quote like every other quote", () => {
+    const long = `${"z".repeat(400)}\nb\nc\nd\ne\nf\n`;
+    const [anchor] = pendingAnchors([
+      { id: "you-1", kind: "you", text: "", collapsed: [collapseText("blk-1", long)] },
+    ]);
+    expect(anchor!.quote.length).toBeLessThanOrEqual(ANCHOR_QUOTE_MAX);
+  });
+
+  it("falls all the way through to the attachment count when there is no paste either", () => {
+    // The pre-existing behaviour, restated so the new rung cannot have displaced it.
+    const [anchor] = pendingAnchors([
+      { id: "you-1", kind: "you", text: "", attachments: [] as never[] },
+    ]);
+    expect(anchor!.quote).toBe("0 attachments");
   });
 });

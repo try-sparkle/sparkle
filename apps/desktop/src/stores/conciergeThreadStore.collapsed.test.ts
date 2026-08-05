@@ -12,6 +12,7 @@
 import { describe, expect, it } from "vitest";
 import {
   CONCIERGE_COLLAPSED_MAX_LEN,
+  CONCIERGE_COLLAPSED_FLOOR_TOTAL,
   CONCIERGE_COLLAPSED_MIN_LEN,
   CONCIERGE_COLLAPSED_TOTAL_CHARS,
   CONCIERGE_TRUNCATION_SUFFIX,
@@ -117,5 +118,155 @@ describe("persistableThread — a collapsed payload survives the trip to disk", 
     expect(only(persistableThread(chat)).collapsed).toBe(
       (chat[0] as ConciergeSparkleMessage).collapsed,
     );
+  });
+});
+
+// ── THE USER'S OWN PASTES, ON THE SAME AXIS ────────────────────────────────────────────────────
+// A `you` message carries an ARRAY of blocks (ConciergeUserMessage.collapsed) — one per paste — and
+// they are the same persistence hazard as the sparkle side's single block: `clip` bounds `text` and
+// cannot see them at all, so an unbounded array is a quota-blowing write by another door. Bounded on
+// ONE budget shared with the sparkle side, because a reader with a long paste and the brief it was
+// relayed as would otherwise be charged the cap twice over.
+describe("boundCollapsedPayloads — a user message's pastes", () => {
+  const youWith = (...texts: string[]): ConciergeMessage => ({
+    id: "u1",
+    kind: "you",
+    text: "what is wrong here?",
+    collapsed: texts.map((t, i) => collapseText(`blk-${i}`, t)),
+  });
+  const blocksOf = (chat: ConciergeMessage[]) => {
+    const m = chat[0]!;
+    if (m.kind !== "you") throw new Error("expected a you message");
+    return m.collapsed!;
+  };
+
+  it("survives save → restore, so a restored pill still has its text", () => {
+    const round = rehydrateThread(persistableThread([youWith(BRIEF)]));
+    expect(blocksOf(round)[0]!.text).toBe(BRIEF);
+  });
+
+  it("keeps the typed half and the pastes as separate fields", () => {
+    // The split IS the feature: collapsing `text` itself would hide the question.
+    const round = rehydrateThread(persistableThread([youWith(BRIEF)]));
+    expect(round[0]!.kind === "you" && round[0]!.text).toBe("what is wrong here?");
+  });
+
+  it("truncates an over-cap paste rather than dropping it, and recounts its lines", () => {
+    const huge = Array.from({ length: 4000 }, (_, i) => `line ${i}`).join("\n");
+    const block = blocksOf(persistableThread([youWith(huge)]))[0]!;
+    expect(block.text.length).toBeLessThanOrEqual(
+      CONCIERGE_COLLAPSED_MAX_LEN + CONCIERGE_TRUNCATION_SUFFIX.length,
+    );
+    // Never dropped: a pill with no text behind it is a button that lies.
+    expect(block.text.length).toBeGreaterThan(0);
+    expect(block.text.endsWith(CONCIERGE_TRUNCATION_SUFFIX)).toBe(true);
+    expect(block.lineCount).toBe(countLines(block.text));
+  });
+
+  it("bounds EVERY paste on one message, not just the first", () => {
+    const huge = Array.from({ length: 4000 }, (_, i) => `line ${i}`).join("\n");
+    const got = blocksOf(persistableThread([youWith(huge, huge)]));
+    expect(got).toHaveLength(2);
+    for (const b of got) {
+      expect(b.text.length).toBeLessThanOrEqual(
+        CONCIERGE_COLLAPSED_MAX_LEN + CONCIERGE_TRUNCATION_SUFFIX.length,
+      );
+    }
+    const total = got.reduce((n, b) => n + b.text.length, 0);
+    expect(total).toBeLessThanOrEqual(
+      CONCIERGE_COLLAPSED_TOTAL_CHARS +
+        2 * CONCIERGE_TRUNCATION_SUFFIX.length +
+        2 * CONCIERGE_COLLAPSED_MIN_LEN,
+    );
+  });
+
+  it("leaves pastes that already fit completely alone", () => {
+    // Identity, not equality: bubbles are memoized on it.
+    const chat = [youWith(BRIEF)];
+    const before = blocksOf(chat);
+    expect(persistableThread(chat)[0]).toBe(chat[0]);
+    expect(blocksOf(persistableThread(chat))[0]).toBe(before[0]);
+  });
+});
+
+// ── THE FLOOR'S OWN BUDGET ─────────────────────────────────────────────────────────────────────
+// The MIN_LEN floor overdraws the aggregate budget by design. That overdraw used to be bounded by
+// the SHAPE of the data — one payload per sparkle message — and a `you` message's array removed that
+// bound without anyone noticing (roborev 58639): nothing caps how many pastes go into one message,
+// so the overdraw became O(total blocks) with the count under the user's hand. These rows assert the
+// HARD ceiling, not a per-block one, which is the only form of the claim that can catch this.
+/** One message, one paste that comfortably fits. */
+const youWithOne = (text: string): ConciergeMessage => ({
+  id: "u1",
+  kind: "you",
+  text: "have a look",
+  collapsed: [collapseText("blk-0", text)],
+});
+
+describe("boundCollapsedPayloads — the floor is itself budgeted", () => {
+  /** A block big enough that every one of them is over the per-block cap, so every one hits the
+   *  budget and then the floor. */
+  const big = (n: number) => `paste ${n}\n`.repeat(4000);
+  const paster = (i: number, blocks: number): ConciergeMessage => ({
+    id: `u${i}`,
+    kind: "you",
+    text: "have a look",
+    collapsed: Array.from({ length: blocks }, (_, j) => collapseText(`blk-${j}`, big(j))),
+  });
+
+  const totalCollapsed = (chat: ConciergeMessage[]) =>
+    chat.reduce((n, m) => {
+      if (m.kind === "you") return n + (m.collapsed ?? []).reduce((k, b) => k + b.text.length, 0);
+      if (m.kind === "sparkle" && m.collapsed) return n + m.collapsed.text.length;
+      return n;
+    }, 0);
+
+  /**
+   * The ceiling, and why it is a CONSTANT rather than a function of the block count.
+   *
+   * Two budgets bound the text itself. The `…truncated` suffix rides on top of each clipped block,
+   * so it looks like a third, unbounded term — it is not: a clipped block always consumes at least
+   * `CONCIERGE_COLLAPSED_MIN_LEN` from one budget or the other, so the NUMBER of suffixes is capped
+   * by the budgets too. That is the whole claim this row exists to make, which is why it is written
+   * as an expression in the constants rather than as a magic number.
+   */
+  const CEILING =
+    CONCIERGE_COLLAPSED_TOTAL_CHARS +
+    CONCIERGE_COLLAPSED_FLOOR_TOTAL +
+    ((CONCIERGE_COLLAPSED_TOTAL_CHARS + CONCIERGE_COLLAPSED_FLOOR_TOTAL) /
+      CONCIERGE_COLLAPSED_MIN_LEN) *
+      CONCIERGE_TRUNCATION_SUFFIX.length;
+
+  it("holds a HARD total ceiling no matter how many blocks are spread across the thread", () => {
+    // 60 messages × 20 pastes = 1200 blocks. Under a per-block floor with no allowance this is
+    // ~240k characters of guaranteed overdraw on top of the 60k budget.
+    const chat = Array.from({ length: 60 }, (_, i) => paster(i, 20));
+    expect(totalCollapsed(persistableThread(chat))).toBeLessThanOrEqual(CEILING);
+  });
+
+  it("holds the SAME ceiling when the blocks are piled onto ONE message", () => {
+    // The axis that actually became user-controlled: nothing caps pastes per message. A bound that
+    // only held when blocks were spread thin would miss exactly the shape that broke it.
+    expect(totalCollapsed(persistableThread([paster(0, 1200)]))).toBeLessThanOrEqual(CEILING);
+  });
+
+  it("keeps the NEWEST payloads and drops the oldest, never a pill with nothing behind it", () => {
+    const chat = Array.from({ length: 60 }, (_, i) => paster(i, 20));
+    const got = persistableThread(chat);
+    // The last message is nearest the reader, so its pastes are the ones that survived…
+    const last = got[got.length - 1]!;
+    expect(last.kind === "you" && (last.collapsed?.length ?? 0)).toBeGreaterThan(0);
+    // …and every block that survived ANYWHERE has real text behind it. A pill with an empty block is
+    // the "button that lies" the degrade-never-vanish rule is about; dropping it outright is not.
+    for (const m of got) {
+      if (m.kind !== "you") continue;
+      for (const b of m.collapsed ?? []) expect(b.text.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("still leaves a thread that fits entirely alone", () => {
+    // The common case must not have acquired a drop: identity all the way through.
+    const chat = [youWithOne(BRIEF)];
+    expect(persistableThread(chat)[0]).toBe(chat[0]);
   });
 });

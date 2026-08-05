@@ -115,11 +115,16 @@ describe("ConciergeThread — the full text is one click away", () => {
     fireEvent.click(pill());
     fireEvent.click(screen.getByTestId("text-pill-show-as-text"));
 
-    // IN PLACE: the expanded text sits in the same bubble as the sentence it belongs to, not in a
+    // IN PLACE: the expanded text sits in the same ENTRY as the sentence it belongs to, not in a
     // panel and not appended to the bottom of the thread.
+    //
+    // Asserted against the entry (`[data-message-id]`, which is the transcript's own unit) rather
+    // than against `parentElement`. The immediate parent is an implementation detail — the payloads
+    // are a list now that a user bubble can carry several, so a block sits one wrapper deeper than it
+    // did — and "the expanded text is in this message" is the claim either way.
     const expanded = screen.getByTestId(COLLAPSED_TEXT_TESTID);
     expect(expanded.textContent).toBe(BRIEF);
-    expect(expanded.parentElement!.textContent).toContain(SENTENCE);
+    expect(expanded.closest("[data-message-id]")!.textContent).toContain(SENTENCE);
     // The pill is gone (it IS regular text now) and so is the modal.
     expect(noPill()).toBeNull();
     expect(screen.queryByTestId("modal-overlay")).toBeNull();

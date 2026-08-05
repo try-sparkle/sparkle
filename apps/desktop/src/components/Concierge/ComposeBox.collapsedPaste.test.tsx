@@ -13,10 +13,21 @@
 // The threshold, the expand rule and the expansion itself are pure and tested as data
 // (composer/attachments.test.ts). What is pinned HERE is this box's wiring: the paste handler, the
 // send gate, the clear, and the restore after a failed send.
+//
+// ── WHY THESE ROWS READ ARGUMENTS INSTEAD OF `toHaveBeenCalledWith(body)` ──────────────────────
+// A send that staged a pill now carries a THIRD argument: the bubble-only decomposition the
+// transcript draws its pills from (`CollapsedSend`, see composer/attachments). So on a pill send the
+// call is `(body, mentions | undefined, {blocks, typed})`, and ARITY IS NO LONGER THE SIGNAL for
+// "was this addressed" — the explicit `undefined` in slot two is. Rows below therefore assert the
+// three slots by name.
+//
+// A send with NO pill is untouched and still one or two arguments — the column's oldest contract —
+// and the last describe in this file keeps a row on exactly that, so the exemption cannot quietly
+// widen into "every send passes three arguments now".
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ComposeBox } from "./ComposeBox";
-import { PILL_MIN_LINES, pillPreview } from "../composer/attachments";
+import { PILL_MIN_LINES, pillPreview, type CollapsedSend } from "../composer/attachments";
 import { COMPOSE_MENTION_PILL_TESTID } from "./MentionMirror";
 import type { MentionAgent } from "./mentions";
 
@@ -77,7 +88,11 @@ const DOCS: MentionAgent = {
 
 function setup(
   over: {
-    onSend?: (text: string, mentions?: unknown) => void | Promise<boolean>;
+    onSend?: (
+      text: string,
+      mentions?: unknown,
+      collapsed?: CollapsedSend,
+    ) => void | Promise<boolean>;
     mentionAgents?: MentionAgent[];
     /** Stable by construction (a ref-held identity would churn the box's effect otherwise). */
     /** Mirrors ComposeBox's prop, options included — ConciergeHost.restoreDraft passes
@@ -101,6 +116,15 @@ function setup(
   );
   return { onSend, onTextEdit };
 }
+
+/** THE BODY — argument one, and the only rendering that reaches an agent's terminal. Every "sends
+ *  its full text" claim in this file is a claim about THIS string. */
+const bodyOf = (calls: unknown[][], n = 0) => calls[n]?.[0] as string | undefined;
+/** THE MENTIONS — argument two. `undefined` on an unaddressed send, which is now what says so. */
+const mentionsOf = (calls: unknown[][], n = 0) => calls[n]?.[1];
+/** THE PILLS — argument three, for the transcript's bubble only. Absent unless a pill was staged. */
+const collapsedOf = (calls: unknown[][], n = 0) => calls[n]?.[2] as CollapsedSend | undefined;
+const lastIndex = (calls: unknown[][]) => calls.length - 1;
 
 const box = () => screen.getByLabelText("Message") as HTMLTextAreaElement;
 const send = () => screen.getByRole("button", { name: "Send" }) as HTMLButtonElement;
@@ -181,7 +205,12 @@ describe("ComposeBox — a collapsed paste SENDS its full text", () => {
     paste(LONG);
     fireEvent.change(box(), { target: { value: "please review this" } });
     fireEvent.keyDown(box(), { key: "Enter", metaKey: true });
-    expect(onSend).toHaveBeenCalledWith(`${LONG}\n\nplease review this`);
+    expect(bodyOf(onSend.mock.calls)).toBe(`${LONG}\n\nplease review this`);
+    // …and the SAME send carries the split the bubble draws from — the block whole, and the words
+    // typed around it, both verbatim. This is the argument that must never be mistaken for the body.
+    const collapsed = collapsedOf(onSend.mock.calls);
+    expect(collapsed?.blocks.map((b) => b.text)).toEqual([LONG]);
+    expect(collapsed?.typed).toBe("please review this");
   });
 
   it("is byte-identical again after a round trip through 'Show as regular text'", () => {
@@ -199,7 +228,7 @@ describe("ComposeBox — a collapsed paste SENDS its full text", () => {
     paste(LONG);
     expect(box().value).toBe("");
     fireEvent.click(send());
-    expect(onSend).toHaveBeenCalledWith(LONG);
+    expect(bodyOf(onSend.mock.calls, lastIndex(onSend.mock.calls))).toBe(LONG);
   });
 
   // ── THE OUTER WHITESPACE ROWS ────────────────────────────────────────────────────────────────
@@ -258,7 +287,10 @@ describe("ComposeBox — a collapsed paste SENDS its full text", () => {
     paste(LONG);
     expect(sendDeclined(send())).toBe(false);
     fireEvent.click(send());
-    expect(onSend).toHaveBeenCalledWith(LONG);
+    expect(bodyOf(onSend.mock.calls)).toBe(LONG);
+    // A box with nothing typed: the block is the whole message and `typed` is empty.
+    expect(collapsedOf(onSend.mock.calls)?.blocks.map((b) => b.text)).toEqual([LONG]);
+    expect(collapsedOf(onSend.mock.calls)?.typed).toBe("");
   });
 
   it("restores the typed text AND the pill when the send resolves false", async () => {
@@ -266,7 +298,7 @@ describe("ComposeBox — a collapsed paste SENDS its full text", () => {
     paste(LONG);
     fireEvent.change(box(), { target: { value: "have a look" } });
     fireEvent.click(send());
-    expect(onSend).toHaveBeenCalledWith(`${LONG}\n\nhave a look`);
+    expect(bodyOf(onSend.mock.calls)).toBe(`${LONG}\n\nhave a look`);
     // Cleared optimistically…
     expect(pills()).toHaveLength(0);
     // …and both halves come back, in the shape the user had them: typed words in the textarea,
@@ -277,7 +309,7 @@ describe("ComposeBox — a collapsed paste SENDS its full text", () => {
     expect(pills()[0]?.getAttribute("data-line-count")).toBe(String(LONG_LINES));
     // And the restored draft still sends the full bytes.
     fireEvent.click(send());
-    expect(onSend).toHaveBeenLastCalledWith(`${LONG}\n\nhave a look`);
+    expect(bodyOf(onSend.mock.calls, lastIndex(onSend.mock.calls))).toBe(`${LONG}\n\nhave a look`);
   });
 
   // THE HOST HAS ITS OWN RESTORE, and the two must not both fire (roborev 55730).
@@ -403,7 +435,7 @@ describe("ComposeBox — a collapsed paste SENDS its full text", () => {
     const { onSend } = setup({ onSend: () => new Promise<boolean>((res) => (settle = res)) });
     paste(LONG);
     fireEvent.click(send());
-    expect(onSend).toHaveBeenCalledWith(LONG);
+    expect(bodyOf(onSend.mock.calls)).toBe(LONG);
     // The user starts a new thought before the failure comes back.
     fireEvent.change(box(), { target: { value: "wait, also" } });
     await act(async () => settle(false));
@@ -414,7 +446,7 @@ describe("ComposeBox — a collapsed paste SENDS its full text", () => {
     expect(box().value).toBe("wait, also");
     // And the recovered draft sends the full bytes.
     fireEvent.click(send());
-    expect(onSend).toHaveBeenLastCalledWith(`${LONG}\n\nwait, also`);
+    expect(bodyOf(onSend.mock.calls, lastIndex(onSend.mock.calls))).toBe(`${LONG}\n\nwait, also`);
   });
 
   // …and the same loss arriving through the PASTE handler (roborev 55758). `onPaste` has no notion
@@ -424,7 +456,7 @@ describe("ComposeBox — a collapsed paste SENDS its full text", () => {
     const { onSend } = setup({ onSend: () => new Promise<boolean>((res) => (settle = res)) });
     paste(LONG);
     fireEvent.click(send());
-    expect(onSend).toHaveBeenCalledWith(LONG);
+    expect(bodyOf(onSend.mock.calls)).toBe(LONG);
     // A stack trace arrives while the host is still deciding.
     paste(SECOND);
     expect(pills()).toHaveLength(1);
@@ -438,7 +470,11 @@ describe("ComposeBox — a collapsed paste SENDS its full text", () => {
     ]);
     // …and the next send carries both bodies, each verbatim.
     fireEvent.click(send());
-    expect(onSend).toHaveBeenLastCalledWith(`${LONG}\n\n${SECOND}`);
+    const last = lastIndex(onSend.mock.calls);
+    expect(bodyOf(onSend.mock.calls, last)).toBe(`${LONG}\n\n${SECOND}`);
+    // TWO blocks ride along, in paste order — so the bubble draws two pills rather than one merged
+    // one, which is the shape the transcript's own suite pins from the other end.
+    expect(collapsedOf(onSend.mock.calls, last)?.blocks.map((b) => b.text)).toEqual([LONG, SECOND]);
   });
 });
 
@@ -457,10 +493,13 @@ describe("ComposeBox — a mention inside a collapsed paste is not an address", 
     paste(PASTE_WITH_MENTION);
     expect(pills()).toHaveLength(1);
     fireEvent.click(send());
-    // One argument: an unaddressed send, indistinguishable from what this box has always sent.
+    // UNADDRESSED — said by the mentions slot being `undefined`, not by the call's arity. A pill was
+    // staged here, so the third argument is present and the call is three long; before that existed
+    // this row read `toHaveLength(1)`, and keeping that would now be asserting the absence of the
+    // pills rather than the absence of an address.
     expect(onSend).toHaveBeenCalledTimes(1);
-    expect(onSend.mock.calls[0]).toHaveLength(1);
-    expect(onSend.mock.calls[0]?.[0]).toBe(PASTE_WITH_MENTION);
+    expect(mentionsOf(onSend.mock.calls)).toBeUndefined();
+    expect(bodyOf(onSend.mock.calls)).toBe(PASTE_WITH_MENTION);
   });
 
   it("still resolves a mention the user TYPED, alongside a pill", () => {
@@ -469,7 +508,8 @@ describe("ComposeBox — a mention inside a collapsed paste is not an address", 
     fireEvent.change(box(), { target: { value: "@Docs " } });
     fireEvent.click(send());
     // Addressed — and the body still leads with the verbatim paste.
-    expect(onSend).toHaveBeenCalledWith(`${LONG}\n\n@Docs`, [{ agentId: "a1", name: "Docs" }]);
+    expect(bodyOf(onSend.mock.calls)).toBe(`${LONG}\n\n@Docs`);
+    expect(mentionsOf(onSend.mock.calls)).toEqual([{ agentId: "a1", name: "Docs" }]);
   });
 });
 

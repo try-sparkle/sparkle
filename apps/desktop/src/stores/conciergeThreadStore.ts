@@ -17,7 +17,7 @@ import { persist, createJSONStorage } from "zustand/middleware";
 import type { ConciergeMessage } from "../components/Concierge/types";
 // `countLines` is the line-count rule for a collapsed block, imported rather than re-derived so a
 // clipped block's subtitle ("41 lines") counts the same way the pill that made it did.
-import { countLines, type Attachment } from "../components/composer/attachments";
+import { countLines, type Attachment, type TextBlock } from "../components/composer/attachments";
 // The anchor-id rewrite lives with the module that owns what an anchor IS, for the same reason
 // `countLines` is imported rather than re-derived: the rule and its persistence must not drift.
 import { remapAnchors } from "../components/Concierge/replyAnchors";
@@ -264,11 +264,37 @@ export const CONCIERGE_COLLAPSED_TOTAL_CHARS = 60_000;
 export const CONCIERGE_COLLAPSED_MIN_LEN = 200;
 
 /**
+ * How much the {@link CONCIERGE_COLLAPSED_MIN_LEN} floor may spend PAST the budget, in total.
+ *
+ * The floor is an overdraw by construction: it hands an out-of-budget block 200 characters after
+ * {@link CONCIERGE_COLLAPSED_TOTAL_CHARS} is already spent. That used to be bounded without anyone
+ * having to say so — only `sparkle` messages carried a payload and each carried exactly ONE, so the
+ * worst case was {@link CONCIERGE_THREAD_MAX} × the floor, about 40k characters.
+ *
+ * A `you` message carries an ARRAY (ConciergeUserMessage.collapsed) and NOTHING caps how many pastes
+ * go into one message — the compose box appends a block per paste and `canSend` accepts a box holding
+ * only blocks — so that incidental bound is gone and the overdraw became O(total blocks), with the
+ * count under the user's hand (roborev 58639). This is the same number, now stated and enforced
+ * rather than inferred from a shape that changed.
+ *
+ * PAST IT, A BLOCK IS DROPPED FROM THE PERSISTED MESSAGE — not kept as a stub. That is a deliberate
+ * exception to "degrade, never vanish" above, and it is the lesser loss by a wide margin: any
+ * non-empty per-block keep is still O(blocks), so the alternative is an unbounded write, and an
+ * over-quota persist makes zustand silently stop persisting the WHOLE store — the entire thread,
+ * every session from here on. Dropping the OLDEST pills (the walk is newest-first) is the same trade
+ * {@link CONCIERGE_THREAD_MAX} already makes by evicting old messages.
+ */
+export const CONCIERGE_COLLAPSED_FLOOR_TOTAL = 40_000;
+
+/**
  * Bound the COLLAPSED-PAYLOAD axis of a persisted thread, which {@link clip} cannot see.
  *
  * A `sparkle` message can carry a relayed brief as a `TextBlock` (see
- * ConciergeSparkleMessage.collapsed) so the transcript draws it as a pill instead of inlining it. That
- * field SURVIVES persistence for free — every rebuild in this module is a spread, not a field-by-field
+ * ConciergeSparkleMessage.collapsed) and a `you` message can carry an ARRAY of them — the founder's own
+ * pastes (see ConciergeUserMessage.collapsed) — so the transcript draws them as pills instead of
+ * inlining them. Both kinds are bounded here, on ONE budget spent across the whole thread, because
+ * they are one size axis: a reader with a long paste and the brief it was relayed as would otherwise
+ * be charged the cap twice over. That field SURVIVES persistence for free — every rebuild in this module is a spread, not a field-by-field
  * copy — and survival is the point: a restored pill with no text behind it would be a button that
  * lies. But it arrives UNBOUNDED, which is exactly the failure {@link CONCIERGE_MSG_MAX_LEN} exists to
  * prevent, reaching through a field the text cap cannot see (the same shape as {@link stripDataUrls}):
@@ -287,20 +313,53 @@ export const CONCIERGE_COLLAPSED_MIN_LEN = 200;
  */
 export function boundCollapsedPayloads(chat: ConciergeMessage[]): ConciergeMessage[] {
   let budget = CONCIERGE_COLLAPSED_TOTAL_CHARS;
+  /** What the floor may still overdraw. See {@link CONCIERGE_COLLAPSED_FLOOR_TOTAL}. */
+  let floorLeft = CONCIERGE_COLLAPSED_FLOOR_TOTAL;
   let out: ConciergeMessage[] | null = null;
-  // Newest first: the budget is spent on the payloads the reader is nearest to.
-  for (let i = chat.length - 1; i >= 0; i--) {
-    const m = chat[i]!;
-    if (m.kind !== "sparkle" || !m.collapsed) continue;
-    const room = Math.max(CONCIERGE_COLLAPSED_MIN_LEN, Math.min(CONCIERGE_COLLAPSED_MAX_LEN, budget));
+  /** Bound ONE block against the running budget, returning it UNCHANGED when it fits — identity is
+   *  what the callers below test to decide whether the message needs rebuilding at all — and NULL
+   *  when there is no room left on either budget, which drops it. */
+  const bound = (b: TextBlock): TextBlock | null => {
+    let room = Math.min(CONCIERGE_COLLAPSED_MAX_LEN, budget);
+    // Out of budget: fall back to the floor, but only while the floor's OWN allowance lasts. That
+    // second budget is what keeps the overdraw finite now that one message can carry any number of
+    // blocks — before, the shape of the data bounded it and nothing said so.
+    if (room < CONCIERGE_COLLAPSED_MIN_LEN) {
+      const grant = Math.min(CONCIERGE_COLLAPSED_MIN_LEN, floorLeft);
+      floorLeft -= grant;
+      room = Math.max(room, grant);
+    }
+    if (room === 0) return null;
     // Spend what this block actually takes, so a short payload does not cost a long one its room. The
     // floor above can overdraw; clamp rather than going negative, or a later block would get `room`
     // from a negative `budget` and the Math.max would silently hand it the floor twice over.
-    budget = Math.max(0, budget - Math.min(m.collapsed.text.length, room));
-    if (m.collapsed.text.length <= room) continue;
-    const text = m.collapsed.text.slice(0, room) + CONCIERGE_TRUNCATION_SUFFIX;
-    out ??= chat.slice();
-    out[i] = { ...m, collapsed: { ...m.collapsed, text, lineCount: countLines(text) } };
+    budget = Math.max(0, budget - Math.min(b.text.length, room));
+    if (b.text.length <= room) return b;
+    const text = b.text.slice(0, room) + CONCIERGE_TRUNCATION_SUFFIX;
+    return { ...b, text, lineCount: countLines(text) };
+  };
+  // Newest first: the budget is spent on the payloads the reader is nearest to.
+  for (let i = chat.length - 1; i >= 0; i--) {
+    const m = chat[i]!;
+    if (m.kind === "sparkle" && m.collapsed) {
+      const next = bound(m.collapsed);
+      if (next === m.collapsed) continue;
+      out ??= chat.slice();
+      // `undefined`, never an empty field: a dropped payload leaves the line as the ordinary
+      // sentence it always was, which is what the absent field already means everywhere else.
+      out[i] = { ...m, collapsed: next ?? undefined };
+      continue;
+    }
+    // A `you` message carries an ARRAY — one block per paste. Bounded in send order (the order they
+    // are read in), each against what the ones before it left.
+    if (m.kind === "you" && m.collapsed?.length) {
+      const blocks = m.collapsed;
+      const bounded = blocks.map(bound);
+      if (bounded.every((b, j) => b === blocks[j])) continue;
+      const next = bounded.filter((b): b is TextBlock => b !== null);
+      out ??= chat.slice();
+      out[i] = { ...m, collapsed: next.length ? next : undefined };
+    }
   }
   return out ?? chat;
 }

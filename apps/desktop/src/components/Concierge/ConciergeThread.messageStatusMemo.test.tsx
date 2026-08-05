@@ -11,7 +11,7 @@
 // A per-message status arrives as a MAP that is rebuilt every tick, so there are two obvious wirings
 // and both are wrong: pass the map down, or pass a `statusFor` callback. Either changes identity on
 // every render and re-renders all hundred rows for a fact about one of them — the exact mistake the
-// row's header warns about, and the reason `shownAsText` is a boolean rather than the thread's Set.
+// row's header warns about, and the reason `shownBlockIds` is a string rather than the thread's Set.
 // The thread therefore RESOLVES `statuses?.[m.id]` and hands each row the entry.
 //
 // THE PROBE is `CopyAnswerButton`, mocked: every row renders exactly one, so counting its calls

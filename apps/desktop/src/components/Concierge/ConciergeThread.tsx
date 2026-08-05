@@ -15,17 +15,19 @@ import { answeredByIndex } from "./replyAnchors";
 import { ANCHOR_HIGHLIGHT_MS } from "./ReplyAnchorViews";
 // THE collapsed-text modal — the same component the BUILD-AGENT composer draws (via
 // components/composer/AttachmentRow), reused here rather than copied into a transcript-shaped twin (see
-// TextPill's header for why there is only one). The concierge's own compose box is NOT on this
-// primitive yet, so do not read this import as evidence that surface is already wired — it still
-// needs doing (roborev 55746).
+// TextPill's header for why there is only one). All three surfaces are on this primitive now: both
+// compose boxes and this transcript, on BOTH sides of it (the concierge's relayed brief and the
+// founder's own paste). The note that used to sit here — "the concierge's own compose box is NOT on
+// this primitive yet" — was stale by the time anyone read it (roborev 55746 landed).
 import { TextPillModal } from "../composer/TextPillModal";
+// WHICH BLOCKS AN ENTRY CARRIES — one rule, shared with the row that draws them (./collapsedBlocks).
+import { blockKey, collapsedBlocksOf, shownIdsFor } from "./collapsedBlocks";
 import { CONCIERGE_THREAD_TESTID } from "../../engine/composeBoxHeight";
 import type {
   ConciergeCopyKind,
   ConciergeDigestMessage,
   ConciergeMessage,
   ConciergeNudge,
-  ConciergeSparkleMessage,
 } from "./types";
 
 // Re-exported: these ids named this module before the per-message rendering moved into its own
@@ -77,7 +79,7 @@ export function ConciergeThread({
    *  THE MAP STOPS HERE. Each row is handed `statuses?.[m.id]` — the resolved entry — and never this
    *  object or a `statusFor` callback, either of which would change identity on every tick and
    *  re-render all hundred memoised rows for a fact about one (see the row's header, and the same
-   *  reasoning behind `shownAsText` being a boolean). Resolved per row, a bubble with no status gets
+   *  reasoning behind `shownBlockIds` being a primitive). Resolved per row, a bubble with no status gets
    *  `undefined` on both renders and stays inert. */
   statuses?: Record<string, ConciergeMessageStatusText>;
   /**
@@ -187,28 +189,38 @@ export function ConciergeThread({
     (d: ConciergeDigestMessage) => handlers.current.onDigestClick?.(d),
     [],
   );
-  // ── A relayed payload, collapsed (see ConciergeSparkleMessage.collapsed) ──────────────────────
+  // ── A collapsed payload, on EITHER side of the thread ─────────────────────────────────────────
   //
-  // Both bits of state are LOCAL and KEYED BY MESSAGE ID, deliberately. Neither is a fact about the
-  // conversation: which modal is open and which payload the reader has expanded are properties of
-  // this reading session, and the thread is persisted — writing them onto the message would restore
-  // a thread tomorrow with a brief already spilled open, which is the flood coming back by the other
-  // door. Keyed by id rather than held per-bubble because a bubble is not a component here (the map
-  // returns plain JSX), and because the modal is portaled to `document.body` and only ever wants ONE
+  // A relayed brief under a sparkle line (ConciergeSparkleMessage.collapsed) and the founder's own
+  // paste in a `you` bubble (ConciergeUserMessage.collapsed) are the same object drawn the same way,
+  // so one modal and one expanded-set serve both. That sameness is the founder's ask, not a
+  // coincidence: *"I want that same functionality when I'M the one sending big blocks of text."*
+  //
+  // KEYED BY THE (MESSAGE, BLOCK) PAIR. A message-keyed set would expand a paste's siblings along
+  // with it; a BLOCK-keyed one would confuse two pastes that happen to share an id, which is not
+  // hypothetical — the id counter restarts at 0 every launch and a restored block keeps its original
+  // one (roborev 58639). See ./collapsedBlocks' header.
+  //
+  // Both bits of state are LOCAL, deliberately. Neither is a fact about the conversation: which
+  // modal is open and which payload the reader has expanded are properties of this reading session,
+  // and the thread is persisted — writing them onto the message would restore a thread tomorrow with
+  // a brief already spilled open, which is the flood coming back by the other door. Held here rather
+  // than per-bubble because the modal is portaled to `document.body` and only ever wants ONE
   // instance on screen.
-  /** Which message's payload has its full-text modal open, or null. */
+  /** Which payload has its full-text modal open, as a `blockKey` pair, or null. */
   const [openPayloadId, setOpenPayloadId] = useState<string | null>(null);
-  /** Messages whose payload the reader asked to see as regular text, IN PLACE — the founder's
-   *  literal ask ("show as regular text" puts it back in the bubble, not in a panel). */
+  /** Blocks the reader asked to see as regular text, IN PLACE — the founder's literal ask ("show as
+   *  regular text" puts it back in the bubble, not in a panel). */
   const [shownAsText, setShownAsText] = useState<ReadonlySet<string>>(() => new Set());
+  // Only walked while a modal is actually open, so the common render costs nothing. The message is
+  // held through the flatMap because the identity being matched is the pair, not the block.
   const openPayload =
     openPayloadId === null
       ? undefined
-      : visible.find(
-          (m): m is ConciergeSparkleMessage =>
-            m.id === openPayloadId && m.kind === "sparkle" && m.collapsed !== undefined,
-        );
-  /** Open the full-text modal for a payload. Stable, so it does not un-memoise every row. */
+      : visible
+          .flatMap((m) => collapsedBlocksOf(m).map((b) => ({ key: blockKey(m.id, b.id), block: b })))
+          .find((e) => e.key === openPayloadId)?.block;
+  /** Open the full-text modal for a block. Stable, so it does not un-memoise every row. */
   const openPayloadFor = useCallback((id: string) => setOpenPayloadId(id), []);
   // ── Reply anchoring: the jump, and the flash that says where you landed ────────────────────────
   //
@@ -342,7 +354,7 @@ export function ConciergeThread({
             key={m.id}
             message={m}
             wired={wired}
-            shownAsText={shownAsText.has(m.id)}
+            shownBlockIds={shownIdsFor(m, shownAsText)}
             onOpenPayload={openPayloadFor}
             onNudgeClick={nudgeClick}
             onNudgeAction={nudgeAction}
@@ -404,13 +416,15 @@ export function ConciergeThread({
           "Show as regular text" EXPANDS IN PLACE and closes the modal; it does not remove the block
           the way the composer's does, because there is nothing here to remove it from — the payload is
           a record of what was sent, and the reader is choosing how to look at it. */}
-      {openPayload?.collapsed && (
+      {openPayload && (
         <TextPillModal
-          block={openPayload.collapsed}
+          block={openPayload}
           onClose={() => setOpenPayloadId(null)}
           onShowAsText={() => {
-            const id = openPayload.id;
-            setShownAsText((prev) => new Set(prev).add(id));
+            // The KEY that is open, not the block's own id — the set is keyed on the pair too, or
+            // expanding one paste would expand every same-id block in the thread.
+            const key = openPayloadId;
+            setShownAsText((prev) => (key === null ? prev : new Set(prev).add(key)));
             setOpenPayloadId(null);
           }}
         />

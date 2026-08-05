@@ -181,6 +181,7 @@ import {
   collapseText,
   shouldPasteAsPill,
   type Attachment,
+  type CollapsedSend,
   type TextBlock,
 } from "./composer/attachments";
 import { screenshotAttachment } from "./composer/attachmentsApi";
@@ -2134,6 +2135,12 @@ export function ConciergeHost({
           // but the union now contains a variant with no `text` at all (the recap card), so the
           // narrowing has to be explicit rather than a defensive `?? ""`.
           text: replace ? text : (cur.kind === "sparkle" ? cur.text : "") + text,
+          // THE SAME NARROWING, for the same reason. A `you` message's `collapsed` is an ARRAY of
+          // the user's own pastes; a sparkle bubble's is the ONE brief it relayed. Spreading `cur`
+          // blind would carry the wrong shape across, so the field is restated from the narrowed
+          // side — which preserves this turn's own payload and can never graft a user's pills onto
+          // a reply.
+          collapsed: cur.kind === "sparkle" ? cur.collapsed : undefined,
           ...(lint ? { lint } : {}),
           ...pushFields(id),
         };
@@ -3815,7 +3822,14 @@ export function ConciergeHost({
    * through the ordering fix itself, exactly the misdelivery the removed pinned-aim guard prevented.
    */
   const send = useCallback(
-    (text: string, mentions?: ConciergeMention[]): Promise<boolean> => {
+    (
+      text: string,
+      mentions?: ConciergeMention[],
+      /** The BUBBLE's decomposition of `text` — the pills the compose box staged and the words
+       *  typed around them (composer/attachments' `CollapsedSend`). Present only when a pill was
+       *  staged. It reaches exactly ONE of the renderings below; see `bubbleText`. */
+      collapsed?: CollapsedSend,
+    ): Promise<boolean> => {
       // The capture-Chat aim, consumed HERE for the same reason the aim itself is: everything that
       // must reflect SUBMIT happens synchronously, so a handoff landing while this send is still
       // queued cannot retroactively redirect it.
@@ -3979,6 +3993,17 @@ export function ConciergeHost({
       // The temp paths must never reach any of them but the first (roborev 46911/46925).
       const payload = attachedPayload(text, staged);
       const display = attachedDisplay(text, staged);
+      // ══ AND A RENDERING THAT IS THE BUBBLE'S ALONE ══════════════════════════════════════════════
+      // A long paste rides as a pill in the transcript instead of as forty rows of wall (the
+      // founder's ask; see ConciergeUserMessage.collapsed). So the bubble shows what was TYPED
+      // around the pastes and draws the pastes themselves as pills.
+      //
+      // IT IS A FIFTH RENDERING, NOT A NARROWING OF `display`, and the distinction is the whole
+      // safety of this. `display` above still carries the entire body and still goes to `deliver`,
+      // which is what every prompt-history surface shows and what a re-send replays — narrowing it
+      // would have made the history dropdown hand back a message with the paste missing. `payload`
+      // and `text` are untouched by construction: neither is built from anything below.
+      const bubbleText = collapsed ? attachedDisplay(collapsed.typed, staged) : display;
       // A FOURTH rendering, and only when the message is addressed: the same thing with the `@…`
       // address taken off. It is a separate rendering rather than a change to `payload` because
       // `payload` still has to carry the address everywhere else — Sparkle answering the message
@@ -4046,8 +4071,12 @@ export function ConciergeHost({
         {
           id,
           kind: "you" as const,
-          text: display,
+          text: bubbleText,
           attachments: staged.length ? staged : undefined,
+          // Snapshotted like the files and the mentions, and for the same reason: the pill is the
+          // record of a paste that was sent, so it has to survive the compose box clearing. The
+          // full text lives in the block — nothing here is a reference to something already gone.
+          collapsed: collapsed?.blocks.length ? collapsed.blocks : undefined,
           // Snapshotted onto the message for the same reason the files are: this bubble is the
           // record of who the message went to, and resolving its pills against the live fleet later
           // would erase them the moment that agent was closed. ALL of them, not just the one that
@@ -4280,9 +4309,13 @@ export function ConciergeHost({
    * hence the flag — without it the rail would cancel itself at the instant it fired.
    */
   const sendFromComposer = useCallback(
-    (text: string, mentions?: ConciergeMention[]): Promise<boolean> => {
+    (
+      text: string,
+      mentions?: ConciergeMention[],
+      collapsed?: CollapsedSend,
+    ): Promise<boolean> => {
       if (!autoFiringRef.current) notifyManualSend();
-      return send(text, mentions);
+      return send(text, mentions, collapsed);
     },
     [send],
   );

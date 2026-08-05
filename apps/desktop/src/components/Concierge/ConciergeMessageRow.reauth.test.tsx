@@ -28,7 +28,7 @@ function renderFailure(over: Partial<ConciergeMessage> = {}) {
     <ConciergeMessageRow
       message={message}
       wired={false}
-      shownAsText={false}
+      shownBlockIds=""
       onOpenPayload={noop}
       onNudgeClick={noop}
       onNudgeAction={noop}

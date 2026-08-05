@@ -33,6 +33,30 @@ export interface TextBlock {
   lineCount: number;
 }
 
+/**
+ * The BUBBLE-ONLY decomposition of a send: the pills that were staged, and the words typed around
+ * them.
+ *
+ * WHAT IT IS NOT. It is not what gets sent. A compose surface still hands its host the WHOLE body
+ * as the first argument — every block's full text spliced in by {@link composeBody} — and this
+ * rides alongside it purely so the transcript can draw the pills again instead of the wall of text
+ * they were collapsed to keep out of the box. The founder's ask, in his words: *"I want that same
+ * functionality when I'M the one sending big blocks of text."*
+ *
+ * THE SPLIT IS PASSED, NEVER RE-DERIVED, and that is the whole reason this shape exists. A reader
+ * would reasonably try to recover it from the composed body — `composeBody` joins with a blank
+ * line, so a blank-line split looks like its inverse. IT IS NOT ONE: a pasted diff or a stack
+ * trace contains blank lines of its own, so that split shreds one block into several segments,
+ * each of which is then under the collapse threshold and none of which is the block that was
+ * pasted. The compose box is the only place that knows where a block starts and ends, so it says.
+ */
+export interface CollapsedSend {
+  /** The staged blocks, in paste order — the same records the compose box drew as pills. */
+  blocks: TextBlock[];
+  /** What was typed AROUND them. `""` on a send that is nothing but a paste. */
+  typed: string;
+}
+
 /** "More than five lines" → a paste of six or more lines becomes a pill.
  *
  *  A NAMED CONSTANT because the founder picked the number loosely ("let's say five rows"),

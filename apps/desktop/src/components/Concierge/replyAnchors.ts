@@ -20,6 +20,7 @@
 // messages it sent to the brain and which of them were still outstanding when the reply began. The
 // anchors are therefore a fact about DELIVERY, which the app owns, not a claim about content, which
 // it would have to trust the model for.
+import { pillPreview, type TextBlock } from "../composer/attachments";
 import type { ConciergeMessage, ConciergeUserMessage } from "./types";
 
 /** One quoted original above a reply: the message's id (for the jump) and a one-line excerpt of it. */
@@ -57,6 +58,25 @@ export const ANCHOR_MAX = 20;
  *  nothing; this names what was actually sent. */
 export function attachmentQuote(count: number): string {
   return count === 1 ? "1 attachment" : `${count} attachments`;
+}
+
+/**
+ * What a message whose words are all INSIDE A PILL is quoted as.
+ *
+ * A `you` message's `text` is only what was typed AROUND its pastes (see
+ * ConciergeUserMessage.collapsed), so a send that is nothing but a paste has `text === ""` — and
+ * `canSend` allows exactly that, a box holding one pill and no typing. Without this the fallback
+ * chain fell through to `attachmentQuote(0)` and a forty-row message was quoted, above the reply
+ * answering it, as "0 attachments".
+ *
+ * THE PASTE'S OWN FIRST WORDS, through the same `pillPreview` the pill's face uses, so the stub and
+ * the pill it stands for say the same thing. Run back through `anchorQuote` for the cap and the
+ * whitespace flattening every other quote gets — `pillPreview` has its own, shorter limit, and a
+ * quote that skipped the cap would be the one unbounded string in a persisted record.
+ */
+export function collapsedQuote(blocks: readonly TextBlock[] | undefined): string {
+  const first = blocks?.[0];
+  return first ? anchorQuote(pillPreview(first.text)) : "";
 }
 
 /** A message's words as ONE line: newlines and runs of whitespace collapsed, trimmed, capped.
@@ -124,7 +144,12 @@ export function pendingAnchors(chat: readonly ConciergeMessage[]): ReplyAnchor[]
     if (m.kind === "sparkle" && m.settled && !m.proactive) break;
     if (m.kind !== "you") continue;
     if (!reachedTheBrain(m)) continue;
-    const quote = anchorQuote(m.text) || attachmentQuote(m.attachments?.length ?? 0);
+    // ORDER IS THE PRIORITY: what was typed, then what was pasted, then what was attached. Each
+    // one is a weaker description of the same message, and the first non-empty wins.
+    const quote =
+      anchorQuote(m.text) ||
+      collapsedQuote(m.collapsed) ||
+      attachmentQuote(m.attachments?.length ?? 0);
     out.push({ id: m.id, quote });
     if (out.length === ANCHOR_MAX) break;
   }

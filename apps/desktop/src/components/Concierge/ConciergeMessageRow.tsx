@@ -15,9 +15,11 @@
 // (conciergeThreadStore upserts in place, so only the bubble actually being streamed into is a new
 // object), and every callback below is stabilised by ConciergeThread before it is handed down.
 //
-// `shownAsText` is a BOOLEAN, not the thread's `Set`. Passing the set would defeat the whole thing —
+// `shownBlockIds` is a STRING, not the thread's `Set`. Passing the set would defeat the whole thing —
 // expanding one payload replaces the set, so every row's props would change and every row would
-// re-render for a state change that concerns exactly one of them.
+// re-render for a state change that concerns exactly one of them. It is a string rather than the
+// boolean it started as because a user message can carry SEVERAL pastes, and one of them being
+// expanded says nothing about its siblings.
 import { memo } from "react";
 import { FiAlertCircle, FiBell } from "react-icons/fi";
 import { C, CHAT_USER_BUBBLE } from "../../theme/colors";
@@ -32,6 +34,8 @@ import { RoutingReceipt } from "./RoutingReceipt";
 import { LintMark } from "./LintMark";
 import { AttachmentStrip } from "../composer/AttachmentStrip";
 import { TextPill } from "../composer/TextPill";
+import { composeBody, type TextBlock } from "../composer/attachments";
+import { blockKey, SHOWN_ID_SEP } from "./collapsedBlocks";
 import { splitMentionText, type ConciergeMention } from "./mentions";
 import { MentionPill } from "./MentionPill";
 // `ReplyAnchorViews`, not `ReplyAnchors` — the RULE module is `replyAnchors.ts`, and on a
@@ -43,7 +47,6 @@ import type {
   ConciergeDigestMessage,
   ConciergeMessage,
   ConciergeNudge,
-  ConciergeSparkleMessage,
 } from "./types";
 
 export const FAILURE_BUBBLE_TESTID = "concierge-failure";
@@ -115,10 +118,13 @@ export interface ConciergeMessageRowProps {
   message: ConciergeMessage;
   /** The column is PATCHED to a terminal and has taken its colour (see ConciergeThread). */
   wired: boolean;
-  /** THIS message's payload has been expanded in place. A boolean, never the thread's set. */
-  shownAsText: boolean;
-  /** Open the full-text modal for the message with this id. */
-  onOpenPayload: (id: string) => void;
+  /** THIS message's blocks that have been expanded in place, `|`-joined. A primitive, never the
+   *  thread's set — see this file's header. `""` when none are, which is almost always. */
+  shownBlockIds: string;
+  /** Open the full-text modal for one payload, identified by its (message, block) PAIR — see
+   *  ./collapsedBlocks' `blockKey`. Not the message: it can carry several pastes. Not the block
+   *  either: block ids are not unique across a restart. */
+  onOpenPayload: (key: string) => void;
   onNudgeClick: (nudge: ConciergeNudge) => void;
   onNudgeAction: (nudge: ConciergeNudge, actionId: string) => void;
   onRevealAgent?: (agentId: string) => void;
@@ -136,8 +142,8 @@ export interface ConciergeMessageRowProps {
    *
    *  A PLAIN STRING, derived by the thread rather than stored on the message, and both halves of that
    *  matter. Derived, so the reply's `answers` array stays the single record and the two directions
-   *  cannot disagree. A string rather than the thread's map, for the same reason `shownAsText` is a
-   *  boolean and not the thread's `Set`: this row is memoised, and handing it a container that is
+   *  cannot disagree. A string rather than the thread's map, for the same reason `shownBlockIds` is a
+   *  string and not the thread's `Set`: this row is memoised, and handing it a container that is
    *  rebuilt every tick would re-render the whole transcript for a fact about one message. */
   answeredBy?: string;
   /** For a `you` message: what the concierge is doing about THIS message, already phrased by the
@@ -145,7 +151,7 @@ export interface ConciergeMessageRowProps {
    *  of `you` bubbles — a settled thread has a status on roughly one of them.
    *
    *  THE RESOLVED ENTRY, never the thread's map and never a `statusFor` callback, for exactly the
-   *  reason `shownAsText` is a boolean and `answeredBy` a plain string: this row is memoised, and a
+   *  reason `shownBlockIds` is a string and `answeredBy` a plain string: this row is memoised, and a
    *  container or a closure rebuilt on every tick would re-render all hundred bubbles for a fact
    *  about one of them — which is the transcript-wide re-diff that makes a click-drag selection
    *  stutter (see this file's header). Resolved by the thread, a bubble with no status is handed
@@ -164,7 +170,7 @@ export interface ConciergeMessageRowProps {
 export const ConciergeMessageRow = memo(function ConciergeMessageRow({
   message: m,
   wired,
-  shownAsText,
+  shownBlockIds,
   onOpenPayload,
   onNudgeClick,
   onNudgeAction,
@@ -195,38 +201,66 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
         transition: "box-shadow 200ms ease",
       }
     : { borderRadius: 6, transition: "box-shadow 400ms ease" };
+  /** The blocks this reader has already asked to see as regular text. Rebuilt per render from a
+   *  primitive prop — see this file's header for why it is not the thread's own Set. */
+  const shown = shownBlockIds ? new Set(shownBlockIds.split(SHOWN_ID_SEP)) : null;
   /**
-   * The pill (or the expanded text) under a sparkle line that carries a payload.
+   * The pills (or the expanded text) for a message's collapsed payloads.
    *
-   * ONE ROW while collapsed, and `variant="inline"` is what makes that true — the default `tile` is
-   * the composer's 46px dashed box, which reads as an empty drop target sitting in running prose.
-   * NO `onRemove`: a posted line is a record, and offering to delete half of one implies an edit the
-   * app cannot make.
+   * ONE COMPONENT FOR BOTH ARMS. The sparkle side draws a brief the concierge relayed; the `you`
+   * side draws the founder's own paste. They are the same object rendered the same way on purpose:
+   * the parity IS the feature ("I want that same functionality when I'M the one sending big blocks
+   * of text"), and two renderers over one `TextBlock` is how the two sides drift a shade apart with
+   * nothing failing.
+   *
+   * ONE ROW per block while collapsed, and `variant="inline"` is what makes that true — the default
+   * `tile` is the composer's 46px dashed box, which reads as an empty drop target sitting in running
+   * prose. NO `onRemove` on either side: a sent message is a record, and offering to delete half of
+   * one implies an edit the app cannot make.
    */
-  const collapsedPayload = (sm: ConciergeSparkleMessage) => {
-    const block = sm.collapsed;
-    if (!block) return null;
-    if (shownAsText)
-      return (
-        <div
-          data-testid={COLLAPSED_TEXT_TESTID}
-          style={{
-            marginTop: 4,
-            fontSize: 12,
-            color: C.cream,
-            // VERBATIM, never through <Markdown> — the same call the failure bubble's evidence makes
-            // below, for the same reason: this is the user's own pasted text, where a `_` or a `*` is
-            // a character and not a formatting instruction.
-            whiteSpace: "pre-wrap",
-            overflowWrap: "anywhere",
-          }}
-        >
-          {block.text}
-        </div>
-      );
+  const collapsedPayload = (blocks: readonly TextBlock[]) => {
+    if (blocks.length === 0) return null;
     return (
-      <div style={{ marginTop: 4 }}>
-        <TextPill block={block} variant="inline" onOpen={() => onOpenPayload(sm.id)} />
+      <div
+        style={{
+          marginTop: 4,
+          display: "flex",
+          flexDirection: "column",
+          gap: 4,
+          // The `you` bubble is right-aligned prose; without this the pills would stretch to the
+          // bubble's full width instead of sitting at their own.
+          alignItems: "flex-start",
+        }}
+      >
+        {blocks.map((block) =>
+          shown?.has(block.id) ? (
+            <div
+              key={block.id}
+              data-testid={COLLAPSED_TEXT_TESTID}
+              style={{
+                fontSize: 12,
+                color: C.cream,
+                // VERBATIM, never through <Markdown> — the same call the failure bubble's evidence
+                // makes below, for the same reason: this is the user's own pasted text, where a `_`
+                // or a `*` is a character and not a formatting instruction.
+                whiteSpace: "pre-wrap",
+                overflowWrap: "anywhere",
+              }}
+            >
+              {block.text}
+            </div>
+          ) : (
+            <TextPill
+              key={block.id}
+              block={block}
+              variant="inline"
+              // THE PAIR, not the block id — see ./collapsedBlocks' header. Two pastes from
+              // different sessions can both be `blk-1`, and opening by block id alone shows the
+              // wrong one.
+              onOpen={() => onOpenPayload(blockKey(m.id, block.id))}
+            />
+          ),
+        )}
       </div>
     );
   };
@@ -280,6 +314,21 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
               still carries the compact count ("look · 1 image"), which is what a restored bubble
               falls back to once its base64 has been stripped. */}
           <AttachmentStrip attachments={m.attachments ?? []} />
+          {/* THE PASTES, AS PILLS — the founder's ask, and the parity that named this work: the
+              transcript draws the same pills his compose box drew, instead of the forty rows of
+              wall they were collapsed to keep out of the box.
+
+              ABOVE THE WORDS, matching BOTH the composer's own layout (pills sit over the textarea)
+              and the wire order (`composeBody` puts every block ahead of what was typed), so the
+              bubble reads in the order the message was actually assembled.
+
+              `m.text` IS THE TYPED HALF ONLY once this field is present — see
+              ConciergeUserMessage.collapsed. Nothing here is a truncation: the full bytes are in the
+              block, one click away, and what reached the agent's terminal never came through this
+              branch at all. */}
+          {m.collapsed?.length ? (
+            <div style={{ marginBottom: 4 }}>{collapsedPayload(m.collapsed)}</div>
+          ) : null}
           {/* THE WORDS, WITH THE COPY GLYPH FLOATED INTO THEIR TOP-RIGHT.
               The founder's placement: *"the copy icon should actually be put INSIDE the box,
               because the copy icon should be referencing what I wrote. That's what we're copying
@@ -311,7 +360,22 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
                   touched by any of this. */}
           <div>
             <span style={{ float: "right", marginLeft: 6, marginRight: -4, marginTop: -2 }}>
-              <CopyAnswerButton kind="message" text={m.text} onCopied={onMessageCopied} />
+              {/* THE WHOLE MESSAGE, not the visible half. `m.text` is only what was typed AROUND
+                  the pastes once this bubble carries pills, so copying it would silently hand over
+                  a message with its paste missing — the exact substitution the pill's promise is
+                  that it never makes. Recomposed through the SHARED `composeBody`, the same
+                  function the compose box built the body with, so the clipboard and the wire cannot
+                  disagree about what a pill expands to. `verbatimTyped`, because `typed` already
+                  arrived trimmed-or-deliberately-not from the box (see that function's doc). */}
+              <CopyAnswerButton
+                kind="message"
+                text={
+                  m.collapsed?.length
+                    ? composeBody(m.collapsed, m.text, { verbatimTyped: true })
+                    : m.text
+                }
+                onCopied={onMessageCopied}
+              />
             </span>
             <MentionedText text={m.text} mentions={m.mentions} />
           </div>
@@ -507,7 +571,7 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
           <span>{m.stale ? "Sparkle noticed — no longer current" : "Sparkle noticed"}</span>
         </div>
         <Markdown text={m.text} mergeQuotes />
-        {collapsedPayload(m)}
+        {collapsedPayload(m.collapsed ? [m.collapsed] : [])}
         {/* A push is still an ANSWER — the same words, arrived unasked — so it gets the same copy
             affordance. Copying its markdown source, like the branch below. */}
         <CopyAnswerButton text={m.text} onCopied={onAnswerCopied} />
@@ -531,7 +595,7 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
       <Markdown text={m.text} mergeQuotes />
       {/* AFTER the sentence, because it is what the sentence is about — a relayed brief the
           transcript used to echo inline and push the conversation off screen. */}
-      {collapsedPayload(m)}
+      {collapsedPayload(m.collapsed ? [m.collapsed] : [])}
       {/* PROSE ONLY — answers here, pushes above, and the user's own bubbles in the `you` branch.
           NOT the nudge, recap, digest or batch cards: those are chrome the app generated about
           state, not words anyone wants in a doc, and the negative assertions in

@@ -120,6 +120,7 @@ import {
   composeBody,
   expandTextBlock,
   shouldPasteAsPill,
+  type CollapsedSend,
   type TextBlock,
 } from "../composer/attachments";
 import { nextId } from "../composer/attachmentsApi";
@@ -603,7 +604,15 @@ export function ComposeBox({
    *
    *  May return a promise resolving FALSE when the send failed, in which case the box restores the
    *  draft (see submit). */
-  onSend: (text: string, mentions?: ConciergeMention[]) => void | Promise<boolean>;
+  /** `collapsed` is the BUBBLE's decomposition of the same body (see composer/attachments'
+   *  `CollapsedSend`) and is passed ONLY when a pill was staged — an ordinary send stays the
+   *  one- or two-argument call it has always been. See `submit` for why it is a third argument
+   *  rather than something the host re-derives from `text`. */
+  onSend: (
+    text: string,
+    mentions?: ConciergeMention[],
+    collapsed?: CollapsedSend,
+  ) => void | Promise<boolean>;
   onAttach: (kind: ConciergeAttachKind) => void;
   onRemoveAttachment?: (id: string) => void;
   /** Staged files, owned by the host — rendered as chips, cleared by the host on send. */
@@ -1478,12 +1487,31 @@ export function ComposeBox({
     // `text`, not `typed`: the two differ only in edge whitespace (see `typed` above), which cannot
     // change which spans match — and naming the raw visible string here says what the rule IS.
     const mentions = mentionsIn(text, roster);
+    // ══ THE PILLS, FOR THE BUBBLE ONLY ═════════════════════════════════════════════════════════
+    // The transcript draws the same pills this box drew, instead of the wall of text they were
+    // collapsed to keep out of the box — the founder's ask, and the parity this feature is.
+    //
+    // A THIRD ARGUMENT RATHER THAN SOMETHING THE HOST RE-DERIVES, and the reason is not
+    // convenience: the composed body is NOT decomposable. `composeBody` joins with a blank line, so
+    // a blank-line split reads like its inverse — and a pasted diff or stack trace has blank lines
+    // of its own, so that split shreds one block into fragments that are each under the collapse
+    // threshold. This box is the only thing that knows where a block starts and ends.
+    //
+    // `typed`, not `text`: the trimmed-or-verbatim copy, which is what the bubble should show for
+    // the same reason it is what a failed send restores.
+    //
+    // PASSED ONLY WHEN A PILL WAS STAGED. Below it, the call is exactly what it has always been:
     // ONE argument when nothing is addressed, not a second one holding `undefined`. An unaddressed
     // send has to be indistinguishable from what this box has always sent — the host's `onSend` is
     // the column's oldest contract and every consumer and test of it was written against the
     // single-argument call. Passing an explicit `undefined` is a different call, and arity is
     // observable (a spy asserted with `toHaveBeenCalledWith(text)` sees it and fails).
-    const outcome = mentions.length ? onSend(v, mentions) : onSend(v);
+    const collapsed: CollapsedSend | undefined = blocks.length ? { blocks, typed } : undefined;
+    const outcome = collapsed
+      ? onSend(v, mentions.length ? mentions : undefined, collapsed)
+      : mentions.length
+        ? onSend(v, mentions)
+        : onSend(v);
     setText("");
     setCaret(0);
     setDismissedAnchor(null);

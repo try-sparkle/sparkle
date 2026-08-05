@@ -17,7 +17,7 @@ import type { DigestVariant } from "../../services/conciergeDigest";
 // …and the collapsed-text block for the same reason: `TextBlock` is the one declaration of "a long
 // block of text, carried whole, shown as a pill" (see components/composer/attachments), and a second
 // one here is how a transcript pill and a composer pill would drift about what a block is.
-import type { Attachment, TextBlock } from "../composer/attachments";
+import type { Attachment, CollapsedSend, TextBlock } from "../composer/attachments";
 // TYPE-ONLY, and that is the whole reason it is allowed. The rule this module's header states is
 // that nothing under components/Concierge may TOUCH a store; a type import is erased at compile time
 // and creates no subscription, no import cycle and no runtime dependency. Naming the store's own
@@ -131,6 +131,42 @@ export interface ConciergeUserMessage {
    *  `undefined` rather than `[]` on an unaddressed message, matching `attachments`: this thread is
    *  persisted, and an empty array per message buys nothing the absent field doesn't. */
   mentions?: ConciergeMention[];
+  /**
+   * The long blocks this message PASTED, carried whole and drawn as pills instead of as a wall of
+   * text — the user-side twin of {@link ConciergeSparkleMessage.collapsed}, and the founder's ask
+   * verbatim: *"I want that same functionality when I'M the one sending big blocks of text."*
+   *
+   * ── WHAT `text` MEANS ONCE THIS FIELD IS PRESENT ──────────────────────────────────────────────
+   * `text` is what the user TYPED AROUND the pastes, and it is `""` on a paste-only send. The whole
+   * message body is `composeBody(collapsed, text, { verbatimTyped: true })` — the same function the
+   * compose box built it with, so the bubble and the wire cannot disagree about what a pill expands
+   * to. Splitting the two is what keeps the QUESTION visible while the paste stays collapsed;
+   * collapsing `text` itself would have hidden "what is wrong here?" inside the log it was asked
+   * about.
+   *
+   * ── THIS IS THE BUBBLE'S RENDERING AND ONLY THE BUBBLE'S ──────────────────────────────────────
+   * A user's message is rendered several ways (ConciergeHost's `send`, and the count kept in
+   * ./agentRefs' header): the thread bubble, the payload relayed into a live Claude Code PTY, the
+   * plain text the router and the auto-namer read, and the `display` every prompt-history surface
+   * shows. THIS FIELD TOUCHES ONLY THE FIRST. Every other rendering is built from the composed body
+   * the compose box hands `onSend` as its FIRST argument, which collapsing never touches — if a
+   * pill ever shortened what reached the PTY, the agent would silently receive less than the
+   * founder typed, which is the worst outcome this feature has available to it.
+   * `ConciergeHost.userCollapsed.test.tsx` is the guard on exactly that, and it is not optional.
+   *
+   * ── THE OTHER READERS OF A `you` MESSAGE'S WORDS, WHICH THIS FIELD MADE PARTIAL ────────────────
+   *   • `CopyAnswerButton` on the bubble — recomposes the full body, so the copy glyph still copies
+   *     everything that was sent rather than only the visible half.
+   *   • `replyAnchors.pendingAnchors` — quotes `text`, which is EMPTY on a paste-only send, so it
+   *     falls back to the first block's preview. Without that, a 40-row message was quoted as
+   *     "0 attachments".
+   *   • `stores/conciergeThreadStore` — `clip` bounds `text` and cannot see this field, so
+   *     `boundCollapsedPayloads` bounds it on both kinds.
+   * A FOURTH reader pays the same price or reintroduces the bug. Check before adding one.
+   *
+   * `undefined` rather than `[]` on a message with no pastes, matching `attachments` and `mentions`.
+   */
+  collapsed?: TextBlock[];
 }
 
 /** Left-aligned plain Sparkle reply. No "Sparkle" label, no glow — just warm text. */
@@ -516,8 +552,18 @@ export interface ConciergeController {
    *
    *  May return a promise resolving FALSE when the send did not land; the compose box then puts
    *  the draft back rather than making the user retype it. Returning nothing means "assume it
-   *  landed" (the chat path, which can't fail visibly). */
-  onSend(text: string, mentions?: ConciergeMention[]): void | Promise<boolean>;
+   *  landed" (the chat path, which can't fail visibly).
+   *
+   *  `collapsed` is the BUBBLE's decomposition of that same body — the pills that were staged and
+   *  the words typed around them (see composer/attachments' {@link CollapsedSend}). Present ONLY on
+   *  a send that staged a pill, so an ordinary send is the one- or two-argument call it has always
+   *  been. It changes what the transcript DRAWS and nothing else: `text` above is still the whole
+   *  body, and it is `text` that reaches the PTY. */
+  onSend(
+    text: string,
+    mentions?: ConciergeMention[],
+    collapsed?: CollapsedSend,
+  ): void | Promise<boolean>;
   /** The user tapped the redirect on a routing receipt: send that same message the OTHER way.
    *  Additive — the original delivery stands (see ConciergeReceipt). */
   onRedirect?(messageId: string): void;
