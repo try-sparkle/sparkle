@@ -129,6 +129,8 @@ import { CountdownBanner } from "./Concierge/CountdownBanner";
 import { flat, line, plain, ref } from "./Concierge/conciergeLine";
 import type { Line, ReferencableAgent } from "./Concierge/conciergeLine";
 import { actionReceiptLine } from "./Concierge/actionReceiptLine";
+import { noteConciergeTurnForPromises } from "../services/conciergePromiseLedger";
+import { toLintToolCalls } from "../services/conciergeLintRunner";
 import { claimReceiptForDisplay, onConciergeActionReceipt } from "../services/conciergeReceipts";
 import { routeMessage } from "../services/conciergeRouter";
 import {
@@ -2147,6 +2149,28 @@ export function ConciergeHost({
       // one is skipped entirely for a `done` carrying no text, which is exactly a turn whose deltas
       // said everything — the case where the flag would silently never be set.
       markSettled(e.id);
+      // ══ THE PROMISE LEDGER (sparkle-gfume) ═══════════════════════════════════════════════════
+      // Measured across all 1,490 logged turns: 45 first-person promises made, 9 kept, 35 dropped.
+      // The linter above cannot see this — it compares a claim against THIS turn's calls and
+      // deliberately ignores future tense, because "I'll do that next" is the honest form. A promise
+      // is about a LATER turn, so it needs a ledger.
+      //
+      // Same seam as the linter and the receipt path, so "a turn happened" is decided in one place.
+      // Guarded: a bookkeeping module must never be able to cost the user their reply.
+      try {
+        for (const p of noteConciergeTurnForPromises({
+          id: e.id,
+          text: e.text ?? "",
+          toolCalls: toLintToolCalls(e.toolCalls),
+          at: Date.now(),
+        })) {
+          // Quotes the sentence back, which is what makes it checkable rather than abstract —
+          // "You said you'd …" is the founder's own complaint, answered in his terms.
+          postSparkle(line`You said you'd ${plain(p.label)} — ${plain(oneLine(p.sentence))} — and that hasn't happened.`);
+        }
+      } catch (err) {
+        console.warn("concierge: promise ledger failed; the reply is unaffected", err);
+      }
       // Recorded AFTER this turn is linted, so `restated-state` compares against the previous reply
       // rather than against itself. Stores the text as RENDERED (autofixes included): the check asks
       // whether the human is being told the same thing twice, and what they were told is the

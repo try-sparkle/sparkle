@@ -45,7 +45,7 @@ function isCountableCheck(id: string): id is LintCheckId {
  *  an unparseable input is decided. It stays as the raw string in that case rather than becoming
  *  `null`: a check scanning for pasted relay text wants the characters, and a string that failed to
  *  parse is still the characters. */
-function toLintToolCalls(calls: readonly ConciergeToolCall[] | undefined): LintToolCall[] {
+export function toLintToolCalls(calls: readonly ConciergeToolCall[] | undefined): LintToolCall[] {
   if (!Array.isArray(calls)) return [];
   return calls.map((c) => {
     let input: unknown = c?.input;

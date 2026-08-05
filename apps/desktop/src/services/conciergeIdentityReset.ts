@@ -62,6 +62,7 @@ import { clearConciergeApprovals } from "../stores/conciergeApprovals";
 import { clearConciergeEventLog } from "../stores/conciergeEventLog";
 import { clearConciergeThread } from "../stores/conciergeThreadStore";
 import { clearConciergeReceiptBacklog, clearPostedReceiptIds } from "./conciergeReceipts";
+import { clearPromiseLedger } from "./conciergePromiseLedger";
 
 /**
  * Drop every piece of concierge state that belongs to the human who is signing out.
@@ -87,5 +88,9 @@ export function resetConciergeIdentityState(): void {
   // never equal a pre-sign-out one. They simply name receipts that no longer exist once the backlog
   // above is dropped, and keeping them is pointless residue.
   clearPostedReceiptIds();
+  // An unkept promise belongs to the human it was made TO. Carrying one across a sign-out would
+  // report the previous human's outstanding obligation to the next one, which is nonsense — and it
+  // is the same per-human-residue class conciergeIdentityReset's header enumerates.
+  clearPromiseLedger();
   resetConciergeSession();
 }
