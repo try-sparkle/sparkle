@@ -807,7 +807,7 @@ describe("ConciergeHost — a terminal that must not receive free text refuses",
   // same mistake that hid this suite's own defect). The refusal path is shared, so the copy is the
   // same fact; this is the state where a human can read it. The mounted state's channel is the
   // notice row, covered in its own block below.
-  it("does not claim the message was sent, and offers no redirect into the refusing agent", async () => {
+  it("does not claim the message was sent", async () => {
     h.wired.mockReturnValue("off");
     mount();
     h.viewport.mockReturnValue({ text: "~\n~\n:", alternateBuffer: true });
@@ -831,7 +831,11 @@ describe("ConciergeHost — a terminal that must not receive free text refuses",
     const thread = screen.getByTestId(CONCIERGE_THREAD_TESTID).textContent ?? "";
     expect(thread).toContain("full-screen app");
     expect(thread).toContain("Kraken Auth");
-    expect(screen.queryByRole("button", { name: /^Also ask / })).toBeNull();
+    // THE "Also ask" ASSERTION IS GONE, not relaxed. `d23f186` deleted the redirect pill and
+    // `redirectLabel` with it, so that button can no longer render ANYWHERE — a query for it cannot
+    // fail, and an assertion that cannot fail is worse than none: it reads as coverage of a
+    // capability that no longer exists. The property it guarded (a refusal must not offer to replay
+    // the message into the agent that just declined it) is now structural rather than tested here.
     // ══ AND NO BANNER (roborev 57424) ═════════════════════════════════════════════════════════════
     // The notice row exists ONLY because a mounted column hides its thread. Unmounted, this refusal
     // is already on screen twice — the thread line and the receipt above — so a third copy is noise;

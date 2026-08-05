@@ -257,9 +257,13 @@ describe("a displaced message never claims it went unanswered", () => {
   // message — never answered"; that was deleted on 2026-07-31 because a displaced turn is FREQUENTLY
   // answered a couple of messages later — the follow-up carries enough of the earlier question that
   // the brain addresses both — so the line asserted something the app cannot know. These rows now
-  // pin its ABSENCE end-to-end through the real column, each paired with a positive count of the
-  // ordinary receipts, so they cannot pass on a thread that simply rendered nothing (which is
+  // pin its ABSENCE end-to-end through the real column, each paired with a positive count of THE
+  // USER'S OWN BUBBLES, so they cannot pass on a thread that simply rendered nothing (which is
   // exactly how the originals first failed).
+  //
+  // NOT a count of receipts, and the distinction is load-bearing now: `RoutingReceipt` returns null
+  // for a concierge-answered message, so there is no receipt under these turns to count. See
+  // `sentBubbleCount`'s own docblock below.
 /**
  * How many of the user's own messages the thread is showing.
  *
@@ -280,7 +284,11 @@ function sentBubbleCount(): number {
   return screen.queryAllByTestId("you-bubble").length;
 }
 
-  it("keeps the ordinary receipt on a bubble nothing ever came back for", async () => {
+  // RENAMED (the receipt is gone; `d23f186`/`f57e1ff` removed the sentence and then the row). What
+  // these rows have always been about is the DELETED "never answered" claim, and they now say so:
+  // the bubble survives and carries no accusation. A name promising "the ordinary receipt" over an
+  // assertion counting bubbles is the stale-name shape this file has been bitten by before.
+  it("leaves a bubble nothing ever came back for un-accused", async () => {
     render(<ConciergeHost feed={feed()} />);
     await send("what needs me?");
     expect(sentBubbleCount()).toBeGreaterThan(0);
@@ -289,15 +297,17 @@ function sentBubbleCount(): number {
     await send("what needs me right now?");
     expect(threadText()).not.toContain("never answered");
     expect(threadText()).not.toContain("Replaced by your next message");
-    // Both bubbles carry their ordinary receipt — the displaced one reads exactly like the live one.
+    // Both bubbles survive and neither is accused — the displaced one reads exactly like the live one.
     expect(sentBubbleCount()).toBe(2);
   });
 
   // A TOOL CALL IS NOT AN ANSWER (roborev 55442-M1) — reading state or a terminal before replying is
   // the concierge's normal FIRST move, so this is the ORDINARY shape of a displaced question, not a
   // corner case. It is kept as its own row because it is the shape most likely to regress: whatever
-  // the host decides about a tool-only turn, the receipt under it must stay the ordinary one.
-  it("keeps the ordinary receipt on a bubble whose turn only called a tool", async () => {
+  // the host decides about a tool-only turn, that turn must not attract the deleted "never answered"
+  // claim. (It used to say "the receipt under it must stay the ordinary one" — there is no receipt
+  // under it any more, so that sentence sent a reader hunting for a surface that cannot render.)
+  it("leaves a bubble whose turn only called a tool un-accused", async () => {
     render(<ConciergeHost feed={feed()} />);
     await send("what needs me?");
     act(() => noteConciergeToolCall("terminal", "read_agent_terminal", { agentId: "ag1" }));
