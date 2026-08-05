@@ -5,7 +5,6 @@ import {
   RECENT_HINT,
   RECENT_SWITCH_HINT,
   CHROME_HINTS,
-  ATTACH_ACTION_HINTS,
   AGENT_OVERFLOW_POOL,
   RECENT_POOL,
   PAIR_PREFIX,
@@ -81,7 +80,6 @@ describe("the pair prefix", () => {
     expect(AGENT_OVERFLOW_POOL).not.toContain(PAIR_PREFIX);
     expect(RECENT_POOL).not.toContain(PAIR_PREFIX);
     expect(Object.values(CHROME_HINTS)).not.toContain(PAIR_PREFIX);
-    expect(Object.values(ATTACH_ACTION_HINTS)).not.toContain(PAIR_PREFIX);
   });
 
   it("recognises pair labels and only pair labels", () => {
@@ -99,20 +97,27 @@ describe("the pair prefix", () => {
 });
 
 describe("the concierge compose-box mnemonics", () => {
-  it("gives the prompt box, presence slider and paperclip their approved characters", () => {
+  it("gives the prompt box and presence slider their approved characters", () => {
     expect(CHROME_HINTS.prompt).toBe("/");
     expect(CHROME_HINTS.presence).toBe("h");
-    expect(CHROME_HINTS.attach).toBe("k");
   });
 
-  // "s" is deliberately shared with CHROME_HINTS.screenshot (the agent-pane composer's button); it is
-  // legal ONLY because the overlay scopes the attach chain to these two badges. Keeping them out of
-  // CHROME_HINTS is what preserves that map's own no-duplicates invariant.
-  it("keeps the attach actions out of the chrome map so their letters can be reused", () => {
-    expect(ATTACH_ACTION_HINTS["attach-screenshot"]).toBe("s");
-    expect(ATTACH_ACTION_HINTS["attach-upload"]).toBe("u");
-    expect(Object.keys(CHROME_HINTS)).not.toContain("attach-screenshot");
-    expect(Object.keys(CHROME_HINTS)).not.toContain("attach-upload");
+  // ONE CONTROL BECAME TWO (bead sparkle-f8bjx), so one mnemonic became two. The paperclip and its
+  // scoped ATTACH_ACTION_HINTS map are gone; both actions are ordinary chrome leaves now, which
+  // means they are bound by the same no-duplicates invariant as every other chrome control.
+  it("gives BOTH attach buttons a chrome mnemonic, since neither is hidden behind a trigger", () => {
+    expect(CHROME_HINTS["attach-screenshot"]).toBe("k");
+    expect(CHROME_HINTS["attach-upload"]).toBe("f");
+    // The retired paperclip's own key is not left behind pointing at nothing.
+    expect(Object.keys(CHROME_HINTS)).not.toContain("attach");
+  });
+
+  // The reason Screenshot is "k" and not "s": "s" is the AGENT-PANE composer's screenshot button,
+  // and both surfaces can be on screen at once. While the attach actions lived in a scoped sub-layer
+  // they were the only badges on screen and could reuse it; as top-level chrome they cannot.
+  it("does not collide with the agent-pane composer's own screenshot key", () => {
+    expect(CHROME_HINTS.screenshot).toBe("s");
+    expect(CHROME_HINTS["attach-screenshot"]).not.toBe(CHROME_HINTS.screenshot);
   });
 
   it("still hands out a distinct character for every chrome control", () => {
@@ -241,12 +246,16 @@ describe("assignLabels", () => {
     expect(out.at(-3)!.label).toBe(`${PAIR_PREFIX}z`);
   });
 
-  it("labels the paperclip's two actions from their own map", () => {
+  // These two used to resolve through a SECOND map consulted after CHROME_HINTS, which is what let
+  // them hold "s"/"u" — letters already spoken for elsewhere in the chrome map. They resolve
+  // through CHROME_HINTS itself now, like every other non-agent target, so there is exactly one
+  // place a chrome mnemonic can come from.
+  it("labels the two attach buttons from CHROME_HINTS like any other chrome control", () => {
     const out = assignLabels([
       { hintId: "attach-screenshot" },
       { hintId: "attach-upload" },
     ]);
-    expect(out.map((t) => t.label)).toEqual(["s", "u"]);
+    expect(out.map((t) => t.label)).toEqual(["k", "f"]);
   });
 
   it("yields null for an unknown chrome id", () => {

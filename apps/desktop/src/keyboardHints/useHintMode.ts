@@ -16,8 +16,8 @@ import { isRebinding, useKeybindingsStore } from "../stores/keybindingsStore";
 // Label-key SELECTION (pressing "t", "1", … to activate a control) is handled by the overlay, which
 // owns the label→element map. This hook only owns open/close.
 //
-// ESCAPE IS DELEGATED, via `onEscape`. The overlay has inner layers to unwind before the whole thing
-// should close — the z prefix layer, the paperclip's action chain — and it cannot do that by
+// ESCAPE IS DELEGATED, via `onEscape`. The overlay has an inner layer to unwind before the whole
+// thing should close — the z prefix layer, and today that is the only one — and it cannot do that by
 // intercepting the key itself: BOTH listeners are capture-phase on `window`, so dispatch order is
 // registration order, this hook's effect runs first, and by the time the overlay sees Escape the
 // overlay is already closing. stopPropagation cannot reach backwards. Handing the decision down is

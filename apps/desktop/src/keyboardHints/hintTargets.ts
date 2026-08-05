@@ -40,29 +40,20 @@ export const RECENT_TRIGGER_HINT = "recent";
 // first the moment either list grew.
 export const PROJECT_TAB_HINT = "project-tab";
 
-// The data-hint value of the PAPERCLIP in the concierge compose box. Like RECENT_TRIGGER_HINT this is
-// a chaining trigger, not a leaf action: the paperclip's own click only EXPANDS a group holding the
-// two things it can actually do, so selecting it keeps hint mode alive and re-collects (HintOverlay).
-export const ATTACH_TRIGGER_HINT = "attach";
-
-// The two actions behind the paperclip, with their own mnemonics — deliberately NOT in CHROME_HINTS.
+// ── THE ATTACH CHAIN IS GONE, AND SO ARE ITS SCOPED MNEMONICS ──────────────────────────────────
 //
-// "s" is ALREADY CHROME_HINTS.screenshot, the agent-pane composer's screenshot button, and both
-// surfaces can be on screen at once. Keeping these out of the chrome map is what lets that letter be
-// reused without breaking the "every chrome mnemonic is distinct" invariant: they are only ever
-// labelled inside the scoped attach chain, where they are the ONLY badges on screen (the same trick
-// the Recent dropdown uses for its a–z rows). collectChiclets drops them in every other mode — which
-// matters, because the group also expands on plain HOVER, so they can be in the DOM unbidden.
-export const ATTACH_ACTION_HINTS: Record<string, string> = {
-  "attach-screenshot": "s",
-  "attach-upload": "u",
-};
-
-/** That hint id's attach-action mnemonic, or null if it isn't one. The overlay uses this to bucket
- *  the chain's members; assignLabels uses it to label them. */
-export function attachActionLabel(hintId: string): string | null {
-  return Object.hasOwn(ATTACH_ACTION_HINTS, hintId) ? ATTACH_ACTION_HINTS[hintId]! : null;
-}
+// There used to be an ATTACH_TRIGGER_HINT ("attach" → "k", the paperclip) that behaved like
+// RECENT_TRIGGER_HINT: a chaining trigger whose click only EXPANDED a group, so selecting it kept
+// hint mode alive and re-collected into a scoped sub-layer holding its two actions. Those two lived
+// in an ATTACH_ACTION_HINTS map deliberately kept OUT of CHROME_HINTS, because their "s" duplicated
+// CHROME_HINTS.screenshot and that was legal only while they were the sole badges on screen.
+//
+// The paperclip no longer exists — the two actions are permanently visible buttons now — so there
+// is nothing left to expand and nothing to scope. They are ordinary chrome leaves in CHROME_HINTS
+// below, which means their letters must be globally distinct like every other chrome mnemonic; "s"
+// could not come with them.
+//
+// See `ATTACH_ACTIONS` in Concierge/ComposeBox.tsx for the control itself.
 
 // Fixed mnemonic key for each chrome control, keyed by its data-hint attribute value.
 // (The "." on the `menu` slot is a deliberate pun: three dots → the period key. It puns on the ⋯
@@ -90,7 +81,21 @@ export const CHROME_HINTS: Record<string, string> = {
   // one fewer project tab / overflow agent that can be reached at all.
   prompt: "/",
   presence: "h", // the Here | Away slider. One key that TOGGLES, not two that set.
-  attach: "k", // the paperclip — "klip", since a/c/d/p/s are all taken.
+  // The concierge composer's two attach buttons. One control became two, so the single "k" the
+  // paperclip held became two keys — see the block above the map for what was retired.
+  //
+  // "k" STAYS ON SCREENSHOT rather than being reassigned freshly, because it is the same key in the
+  // same place: it was the paperclip's ("klip"), the paperclip stood where Screenshot now stands,
+  // and Screenshot is by far the more used of the two. Existing muscle memory lands on the right
+  // button. It is NOT "s" — that is CHROME_HINTS.screenshot, the agent-pane composer's own
+  // screenshot button, and both surfaces can be on screen at once.
+  //
+  // "f" for File costs the overflow pool one letter, which is a real price (see AGENT_OVERFLOW_POOL
+  // — every letter promoted here is one fewer addressable agent). It is the honest cost of the
+  // second control: two leaf actions need two distinct keys, and the alternative was leaving Upload
+  // reachable by mouse only.
+  "attach-screenshot": "k",
+  "attach-upload": "f",
 };
 
 // The prefix character for TWO-character labels. It is never a label on its own, anywhere: press it
@@ -111,8 +116,14 @@ export const PAIR_SECONDS = ALPHABET;
 
 // Letters available to agents beyond the 9th, with the reserved chrome letters AND the pair prefix
 // removed so an overflow agent can never collide with a chrome control or shadow the prefix.
-// Reserved: a b c d g i m n o p r s t (+ h k from the concierge controls, "/" is not a letter), plus
-// z → pool = e f j l q u v w x y (10 letters, then 26 pairs; with 1–9 that's 45 addressable agents).
+// Reserved: a b c d g i m n o p r s t u (+ f h k from the concierge controls, "/" is not a letter),
+// plus z → pool = e j l q v w x y (8 letters, then 26 pairs; with 1–9 that's 43 addressable
+// agents). "f" joined the reserved set when the composer's one paperclip became two buttons.
+//
+// "u" IS RESERVED, not available: it is `newcloud`, the "+ Cloud Agent" sidebar row. It was listed
+// as free here for as long as that row has existed, which is exactly the mistake this comment gets
+// read to avoid — the pool is COMPUTED below, so a stale list here can only ever mislead the next
+// person choosing a mnemonic into picking a letter that already collides.
 const RESERVED = new Set([...Object.values(CHROME_HINTS), PAIR_PREFIX]);
 export const AGENT_OVERFLOW_POOL = ALPHABET.filter((ch) => !RESERVED.has(ch));
 
@@ -193,15 +204,11 @@ export function assignLabels<T extends HintInput>(targets: T[]): LabeledHint<T>[
       recentIndex += 1;
       return { ...t, label };
     }
-    // ATTACH_ACTION_HINTS is consulted second and kept out of CHROME_HINTS on purpose: its "s"
-    // duplicates CHROME_HINTS.screenshot, which is safe only because the overlay shows these two in
-    // a scope of their own. See the constant's header.
-    //
     // hasOwn, not a plain index: `hintId` comes off a DOM attribute, so an element tagged
     // data-hint="constructor" would otherwise resolve through Object.prototype and yield a FUNCTION
     // where a label string belongs.
     const chrome = Object.hasOwn(CHROME_HINTS, t.hintId) ? CHROME_HINTS[t.hintId]! : null;
-    return { ...t, label: chrome ?? attachActionLabel(t.hintId) };
+    return { ...t, label: chrome };
   });
 }
 

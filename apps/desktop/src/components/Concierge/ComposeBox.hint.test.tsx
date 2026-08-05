@@ -1,12 +1,13 @@
 // @vitest-environment jsdom
 //
 // The compose box's keyboard-hint tagging, and the end-to-end behaviour it buys with HintOverlay:
-// "/" puts the caret in the box, "k" opens the paperclip and chains into Screenshot / Upload.
+// "/" puts the caret in the box; "k" fires Screenshot and "f" fires Upload, each a leaf that
+// activates its button and dismisses the overlay.
 //
 // The overlay is mounted for real here rather than stubbed. The interesting failures in this
 // feature are all in the seam between the two — a textarea that is clicked instead of focused, an
-// attach action badged outside its chain — and a test that asserts only on attributes would pass
-// through every one of them.
+// attach button that is tagged but never badged — and a test that asserts only on attributes would
+// pass through every one of them.
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ComposeBox } from "./ComposeBox";
@@ -52,7 +53,6 @@ function controlTap() {
 }
 
 const box = () => screen.getByRole("textbox", { name: "Message" }) as HTMLTextAreaElement;
-const clip = () => screen.getByRole("button", { name: "Attach" });
 
 describe("ComposeBox — the prompt-box hint", () => {
   it("tags the textarea and asks for a top-anchored badge", () => {
@@ -87,174 +87,70 @@ describe("ComposeBox — the prompt-box hint", () => {
   });
 });
 
-describe("ComposeBox — the paperclip hint", () => {
-  it("tags the paperclip at the approved character", () => {
+describe("ComposeBox — the two attach-button hints", () => {
+  const shot = () => screen.getByRole("button", { name: "Screenshot" });
+  const upload = () => screen.getByRole("button", { name: "Upload" });
+
+  it("tags both buttons at their approved characters", () => {
     setup();
-    expect(clip().dataset.hint).toBe("attach");
-    expect(CHROME_HINTS.attach).toBe("k");
+    expect(shot().dataset.hint).toBe("attach-screenshot");
+    expect(upload().dataset.hint).toBe("attach-upload");
+    expect(CHROME_HINTS["attach-screenshot"]).toBe("k");
+    expect(CHROME_HINTS["attach-upload"]).toBe("f");
   });
 
-  it("k expands the group and chains into Screenshot and Upload", async () => {
-    const { onAttach } = setup();
+  // THE BADGES ARE ON SCREEN AT THE TOP LEVEL, which is the whole behavioural change here. They
+  // used to be reachable only after selecting the paperclip's own "k", which opened a scoped
+  // sub-layer; a single Control tap showed one badge where it now shows two.
+  it("badges BOTH actions on a plain Control tap, with no trigger to press first", () => {
+    setup();
     controlTap();
     expect(screen.getByText("k")).toBeTruthy();
-
-    fireEvent.keyDown(window, { key: "k" });
-    // The paperclip's own click only EXPANDS the group, so closing here would leave the user on an
-    // open menu with no badges. It stays open on the two things the clip can actually do.
-    await waitFor(() => expect(screen.getByText("u")).toBeTruthy());
-    expect(screen.getByText("s")).toBeTruthy();
-    expect(screen.queryByText("k")).toBeNull(); // scoped: the trigger's own badge is spent
-
-    fireEvent.keyDown(window, { key: "s" });
-    await waitFor(() => expect(onAttach).toHaveBeenCalledWith("screenshot"));
+    expect(screen.getByText("f")).toBeTruthy();
   });
 
-  it("u reaches Upload, so the second action isn't mouse-only", async () => {
+  it("k fires Screenshot directly and closes the overlay", async () => {
     const { onAttach } = setup();
     controlTap();
     fireEvent.keyDown(window, { key: "k" });
-    await waitFor(() => expect(screen.getByText("u")).toBeTruthy());
-    fireEvent.keyDown(window, { key: "u" });
+    await waitFor(() => expect(onAttach).toHaveBeenCalledWith("screenshot"));
+    // A LEAF, not a chain: selecting it dismisses the overlay rather than re-collecting into a
+    // sub-layer. Against the old form "k" left the overlay open showing "s" and "u".
+    await waitFor(() => expect(screen.queryByText("k")).toBeNull());
+    expect(screen.queryByText("f")).toBeNull();
+  });
+
+  it("f reaches Upload, so the second action is not mouse-only", async () => {
+    const { onAttach } = setup();
+    controlTap();
+    fireEvent.keyDown(window, { key: "f" });
     // The service call is named for what it opens ("files"); the hint is named for what the user
     // sees ("upload"). ATTACH_ACTIONS carries both so neither name drifts into the other.
     await waitFor(() => expect(onAttach).toHaveBeenCalledWith("files"));
   });
 
-  // The group expands on HOVER too. If its actions were badged in the ordinary layer, their "s"
-  // would collide with the agent-pane composer's screenshot mnemonic and one would be dead.
-  it("does not badge the actions when the group was opened by hover instead of by k", () => {
+  // The letters that USED to reach these two, back when they lived in a scope of their own. "s" is
+  // the agent-pane composer's screenshot button and must not be answered by the concierge; "u" is
+  // the "+ Cloud Agent" sidebar row. Neither surface is mounted here, so a stray badge for either
+  // would mean this row had kept a mnemonic it no longer owns.
+  it("no longer answers to the scoped letters the sub-layer gave them", () => {
     setup();
-    fireEvent.mouseEnter(screen.getByTestId("concierge-attach"));
     controlTap();
-    expect(screen.getByText("k")).toBeTruthy();
-    expect(screen.queryByText("u")).toBeNull();
     expect(screen.queryByText("s")).toBeNull();
-  });
-});
-
-// ABANDONING THE CHAIN MUST CLOSE WHAT IT OPENED (roborev 54675). The group latches open on
-// `pinned`, whose release paths all run through focus leaving it — and a synthetic click focuses
-// nothing. Entering the chain therefore FOCUSES the paperclip and leaving BLURS it, driving the
-// component through its own machinery. These run against the real AttachControl: a stand-in
-// modelling `open` as one useState is exactly the thing that would let this regress unnoticed.
-describe("ComposeBox — abandoning the paperclip chain", () => {
-  const actions = () => document.getElementById("concierge-attach-actions")!;
-
-  it("puts focus in the group when the chain opens, which is what holds it expanded", async () => {
-    setup();
-    controlTap();
-    fireEvent.keyDown(window, { key: "k" });
-    await waitFor(() => expect(screen.getByText("u")).toBeTruthy());
-    expect(document.activeElement).toBe(clip());
-    expect(actions().hidden).toBe(false);
+    expect(screen.queryByText("u")).toBeNull();
   });
 
-  it("Escape out of the chain collapses the group instead of stranding it open", async () => {
-    setup();
-    controlTap();
-    fireEvent.keyDown(window, { key: "k" });
-    await waitFor(() => expect(screen.getByText("u")).toBeTruthy());
-
-    fireEvent.keyDown(window, { key: "Escape" });
-    // Back to the ordinary layer...
-    expect(screen.getByText("k")).toBeTruthy();
-    // ...and the disclosure the chain opened is shut. Left expanded it would sit in the compose row
-    // with no badges on it (they're scoped out) and no keyboard way to close it.
-    await waitFor(() => expect(actions().hidden).toBe(true));
-    expect(clip().getAttribute("aria-expanded")).toBe("false");
-  });
-
-  it("dismissing the whole overlay collapses it too", async () => {
-    setup();
-    controlTap();
-    fireEvent.keyDown(window, { key: "k" });
-    await waitFor(() => expect(screen.getByText("u")).toBeTruthy());
-
-    controlTap(); // a second tap dismisses outright, never reaching onEscape
-    await waitFor(() => expect(actions().hidden).toBe(true));
-  });
-
-  it("but CHOOSING an action still reaches it — the group is not collapsed out from under it", async () => {
-    const { onAttach } = setup();
-    controlTap();
-    fireEvent.keyDown(window, { key: "k" });
-    await waitFor(() => expect(screen.getByText("u")).toBeTruthy());
-    fireEvent.keyDown(window, { key: "s" });
-    await waitFor(() => expect(onAttach).toHaveBeenCalledWith("screenshot"));
-  });
-
-  // ...AND THE RESTORE MUST NOT HAND FOCUS BACK INTO THE GROUP IT JUST CLOSED. If the paperclip
-  // already held focus when the chain opened, "restoring" re-fires the group's focus handler and
-  // re-expands it — stranded again, badges scoped away, no keyboard way out.
-  //
-  // Neither older cohort of tests reaches this: the collapse ones focus nothing (so the restore is
-  // skipped as document.body) and the caret ones focus the textarea. It needs the trigger itself to
-  // be the previous holder, which is the STEADY state, not a contrived one.
-  it("stays collapsed when the chain was opened with the paperclip already focused", async () => {
-    setup();
-    clip().focus();
-    controlTap();
-    fireEvent.keyDown(window, { key: "k" });
-    await waitFor(() => expect(screen.getByText("u")).toBeTruthy());
-
-    fireEvent.keyDown(window, { key: "Escape" });
-    await waitFor(() => expect(actions().hidden).toBe(true));
-    // AND focus goes back to the clip, not to <body>. "Nowhere else to go" here means the trigger
-    // IS where the user was — a keyboard user who tabbed to it would otherwise lose their place and
-    // the next Tab would restart from the top of the document. Collapsed-but-focused is only
-    // possible because the handback is programmatic, which AttachControl reads as not-the-user.
-    expect(document.activeElement).toBe(clip());
-  });
-
-  it("stays collapsed on a SECOND chain, the state any completed chain leaves behind", async () => {
-    const { onAttach } = setup();
-    // First chain, run to completion. AttachControl.close skips its handback because the clip is
-    // what holds focus, so the clip is still focused when the next one starts.
-    controlTap();
-    fireEvent.keyDown(window, { key: "k" });
-    await waitFor(() => expect(screen.getByText("u")).toBeTruthy());
-    fireEvent.keyDown(window, { key: "s" });
-    await waitFor(() => expect(onAttach).toHaveBeenCalledWith("screenshot"));
-
-    // Second chain, abandoned.
-    controlTap();
-    fireEvent.keyDown(window, { key: "k" });
-    await waitFor(() => expect(screen.getByText("u")).toBeTruthy());
-    fireEvent.keyDown(window, { key: "Escape" });
-    await waitFor(() => expect(actions().hidden).toBe(true));
-    expect(document.activeElement).toBe(clip());
-  });
-
-  // THE FOCUS THE CHAIN TOOK HAS TO GO BACK. Opening it moves focus onto the paperclip, and letting
-  // go with a bare blur() drops the caret on <body> — so the draft the user was mid-way through has
-  // nowhere to type. Both exits restore it.
-  it("returns the caret to the draft when the chain is abandoned", async () => {
-    setup();
-    fireEvent.change(box(), { target: { value: "mid sentence" } });
-    box().focus();
-    controlTap();
-    fireEvent.keyDown(window, { key: "k" });
-    await waitFor(() => expect(document.activeElement).toBe(clip()));
-
-    fireEvent.keyDown(window, { key: "Escape" });
-    await waitFor(() => expect(document.activeElement).toBe(box()));
-  });
-
-  it("returns the caret to the draft after an action is chosen, too", async () => {
+  it("leaves the caret in the draft — a leaf activation is not a focus trip", async () => {
     const { onAttach } = setup();
     fireEvent.change(box(), { target: { value: "mid sentence" } });
     box().focus();
     controlTap();
     fireEvent.keyDown(window, { key: "k" });
-    await waitFor(() => expect(screen.getByText("u")).toBeTruthy());
-
-    fireEvent.keyDown(window, { key: "s" });
     await waitFor(() => expect(onAttach).toHaveBeenCalledWith("screenshot"));
-    // AttachControl.close() skips its own focus handback when the paperclip is what holds focus,
-    // which after a keyboard chain it always is — so without the restore the caret would be left on
-    // the clip and the next keystroke would go nowhere.
-    await waitFor(() => expect(document.activeElement).toBe(box()));
+    // The chain used to FOCUS the paperclip on the way in and hand the caret back on the way out,
+    // through `chainReturnRef`/`restoreFocus`. With nothing to expand, focus never leaves at all —
+    // so the caret is still in the draft without any handback machinery to get it there.
+    expect(document.activeElement).toBe(box());
   });
 });
 
@@ -301,19 +197,16 @@ describe("ComposeBox — Escape does not leak while a sub-layer unwinds", () => 
   // shape. useHintMode still sees it first: it listens on window in the CAPTURE phase.
   const pressEscape = () => fireEvent.keyDown(document.body, { key: "Escape" });
 
-  it("swallows the Escape that backs out of the chain, from BOTH cohorts", async () => {
-    setup();
-    const { onDocEscape, onWindowCaptureEscape } = withBystanders();
-    controlTap();
-    fireEvent.keyDown(window, { key: "k" });
-    await waitFor(() => expect(screen.getByText("u")).toBeTruthy());
-
-    pressEscape();
-    expect(onDocEscape).not.toHaveBeenCalled();
-    expect(onWindowCaptureEscape).not.toHaveBeenCalled();
-    expect(screen.getByText("k")).toBeTruthy(); // the sub-layer did unwind
-  });
-
+  // THE "SWALLOWED ESCAPE" CASE MOVED, it was not dropped. It used to be staged here by pressing
+  // "k" to open the paperclip's sub-layer and then Escaping out of it. There is no chaining trigger
+  // in this surface any more, so the only layer Escape still unwinds is PAIR_PREFIX — which needs
+  // more badges than a lone compose box can produce. It is pinned in HintOverlay.test.tsx
+  // ("Escape backs out to the ordinary layer first, and only then dismisses").
+  //
+  // What is still this file's to prove is the OTHER half, below: with nothing to unwind, the press
+  // must reach the surfaces around the composer. That half is the one that regresses quietly — a
+  // stray `return true` in onEscape would make Escape stop working app-wide the moment hint mode
+  // was open, and no chain test would notice.
   it("still lets the Escape that DISMISSES the overlay through", () => {
     setup();
     const { onDocEscape, onWindowCaptureEscape } = withBystanders();

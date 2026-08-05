@@ -214,188 +214,109 @@ describe("ComposeBox — the box names no destination", () => {
 });
 
 describe("ComposeBox — attachments", () => {
-  it("each revealed attach action reports its kind", () => {
+  it("each attach action reports its kind, with no reveal step in front of it", () => {
     const { onAttach } = setup();
-    fireEvent.mouseEnter(screen.getByTestId("concierge-attach"));
+    // THE MISSING SETUP LINES ARE THE ASSERTION. This used to need a `mouseEnter` on the group
+    // before EITHER `getByRole` could resolve — the buttons did not exist until something revealed
+    // them. Both are queried straight off the first render now.
     fireEvent.click(screen.getByRole("button", { name: "Screenshot" }));
-    fireEvent.mouseEnter(screen.getByTestId("concierge-attach"));
     fireEvent.click(screen.getByRole("button", { name: "Upload" }));
     expect(onAttach.mock.calls).toEqual([["screenshot"], ["files"]]);
   });
 });
 
-// THE ATTACH AFFORDANCE IS ONE ICON THAT EXPANDS, and every assertion here is about a way that can
-// go wrong rather than about the happy path alone.
+// TWO ALWAYS-VISIBLE BUTTONS, SIDE BY SIDE (bead sparkle-f8bjx).
 //
-// The row was three permanently-visible labelled buttons (Screenshot / Image / Files) over a
-// compose box designed to look empty. The founder asked for the single paperclip to stay single at
-// rest and to REVEAL its two actions on hover — not a click-then-menu, which makes you commit a
-// click before it will say what is behind the icon.
+// The history of this row in three steps: three permanently-visible LABELLED buttons (Screenshot /
+// Image / Files) → ONE paperclip that expanded into two of them on hover or focus → these two,
+// permanently visible, drawn as icons with no word.
 //
-// Hover alone would be unusable by keyboard and by touch, so the group opens on `hovered ||
-// pinned` (focus/click), and the two inputs are independent on purpose: neither may close what the
-// other holds open. The collapsed actions carry `hidden`, which drops them from the accessibility
-// tree and the tab order TOGETHER — the failure mode being guarded against is an invisible button
-// that is still focusable, or an announced one that isn't reachable.
-describe("ComposeBox — the attach affordance expands from one icon", () => {
-  const clip = () => screen.getByRole("button", { name: "Attach" });
+// WHY THE DISCLOSURE WENT. Screenshot is the founder's highest-frequency composer action, and the
+// expansion made it cost two interactions (reveal, then choose) where it had cost one. The chrome
+// it was saving turns out not to be spent: the resting row is 2 controls where the EXPANDED row
+// was 3.
+//
+// EVERY ASSERTION BELOW IS CHOSEN TO FAIL AGAINST THE PAPERCLIP. That matters more than usual
+// here, because the happy-path "clicking Screenshot calls onAttach('screenshot')" passed perfectly
+// well against the old form too — it just needed a `mouseEnter` first. A test that keeps the
+// reveal step and asserts the outcome would go green on both designs and pin neither.
+describe("ComposeBox — the attach row is two permanent buttons", () => {
   const group = () => screen.getByTestId("concierge-attach");
-  const actions = () => document.getElementById("concierge-attach-actions") as HTMLElement;
+  const shot = () => screen.getByRole("button", { name: "Screenshot" });
+  const upload = () => screen.getByRole("button", { name: "Upload" });
 
-  it("rests as a SINGLE paperclip — neither action is shown, announced or focusable", () => {
+  it("shows BOTH actions at rest — nothing hovered, focused or clicked", () => {
     setup();
-    expect(clip().getAttribute("aria-expanded")).toBe("false");
-    expect(actions().hidden).toBe(true);
-    expect(actions().style.display).toBe("none");
-    // `hidden` is what testing-library reads for accessibility, so these two are the announced-
-    // and-reachable check, not a repeat of the style assertion above.
-    expect(screen.queryByRole("button", { name: "Screenshot" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Upload" })).toBeNull();
+    // `getByRole` reads the accessibility tree, so this is the announced-and-reachable check, not
+    // merely a painted one. Against the paperclip both of these threw: the actions carried
+    // `hidden`, which took them out of the a11y tree and the tab order together.
+    expect(shot()).toBeTruthy();
+    expect(upload()).toBeTruthy();
   });
 
-  it("hovering reveals BOTH actions — a screenshot and a file upload", () => {
+  it("has no expanding trigger left in front of them", () => {
     setup();
-    fireEvent.mouseEnter(group());
-    expect(clip().getAttribute("aria-expanded")).toBe("true");
-    expect(actions().hidden).toBe(false);
-    expect(screen.getByRole("button", { name: "Screenshot" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Upload" })).toBeTruthy();
-    fireEvent.mouseLeave(group());
-    expect(actions().hidden).toBe(true);
+    // The paperclip itself. Its removal is the founder's actual ask, so it gets its own assertion
+    // rather than being implied by the two above.
+    expect(screen.queryByRole("button", { name: "Attach" })).toBeNull();
+    // …and the disclosure container it controlled, whose `hidden` attribute was the old form's
+    // whole state model. A leftover empty container would mean the expansion was only styled away.
+    expect(document.getElementById("concierge-attach-actions")).toBeNull();
+    // Nothing announces an expanded/collapsed state any more, because there is none to report.
+    expect(group().querySelector("[aria-expanded]")).toBeNull();
   });
 
-  it("is reachable by KEYBOARD — focus alone opens it, with no pointer involved", () => {
-    const { onAttach } = setup();
-    fireEvent.focus(clip());
-    expect(clip().getAttribute("aria-expanded")).toBe("true");
-    const upload = screen.getByRole("button", { name: "Upload" });
-    // Tabbing BETWEEN the paperclip and an action blurs the clip; that must not collapse the group
-    // out from under the very keystroke that is walking into it.
-    fireEvent.blur(clip(), { relatedTarget: upload });
-    fireEvent.focus(upload);
-    expect(actions().hidden).toBe(false);
-    fireEvent.click(upload);
-    expect(onAttach).toHaveBeenCalledWith("files");
-  });
-
-  it("closes on Escape and hands focus back to the paperclip", () => {
+  it("names each button WITHOUT drawing a word — tooltip and accessible name agree", () => {
     setup();
-    // REAL focus, not fireEvent.focus: the handback is guarded on where focus actually IS (it must
-    // not yank the caret out of the textarea — see close() in ComposeBox), and fireEvent.focus
-    // dispatches the event without moving document.activeElement, so it cannot model that.
-    act(() => clip().focus());
-    // Tab on into an action, so Escape has somewhere real to reclaim focus FROM — this is the path
-    // where the handback matters, since closing takes that button out of the tree under it.
-    act(() => screen.getByRole("button", { name: "Screenshot" }).focus());
-    fireEvent.keyDown(group(), { key: "Escape" });
-    expect(clip().getAttribute("aria-expanded")).toBe("false");
-    expect(document.activeElement).toBe(clip());
+    // The founder's line: "it doesn't have to say screenshot, it could say screenshot on a mouse
+    // over." So the word exists only as `title` (what a pointer user gets) and `aria-label` (what a
+    // screen-reader user gets), and the two must be the same string or the two users are being told
+    // about different controls.
+    for (const [el, name] of [[shot(), "Screenshot"], [upload(), "Upload"]] as const) {
+      expect(el.textContent).toBe("");
+      expect(el.getAttribute("title")).toBe(name);
+      expect(el.getAttribute("aria-label")).toBe(name);
+    }
   });
 
-  it("does NOT grab focus that was never inside the group (roborev 54233)", () => {
-    // WebKit on macOS does not focus a <button> on click, so the ordinary path is "caret in the
-    // textarea, user clicks Screenshot". Reclaiming focus unconditionally would drag the caret out
-    // of the app's only composer to attach a file.
+  it("draws a glyph in each, so a wordless button is not just an empty box", () => {
+    setup();
+    // Pairs with the assertion above: `textContent === ""` is satisfied by a button that renders
+    // nothing at all, which would be a strictly worse control than the one it replaced.
+    expect(shot().querySelector("svg")).toBeTruthy();
+    expect(upload().querySelector("svg")).toBeTruthy();
+  });
+
+  it("leaves the caret in the draft — pressing one is not a focus move", () => {
+    // WebKit does not focus a <button> on click without Full Keyboard Access, so the ordinary path
+    // is "caret in the textarea, user clicks Screenshot". The old form had elaborate machinery to
+    // avoid stealing that caret while collapsing itself; the new one must simply never take it.
     const { onAttach } = setup();
     act(() => box().focus());
-    fireEvent.mouseEnter(group());
-    fireEvent.click(screen.getByRole("button", { name: "Screenshot" }));
+    fireEvent.click(shot());
     expect(onAttach).toHaveBeenCalledWith("screenshot");
-    expect(actions().hidden).toBe(true);
     expect(document.activeElement).toBe(box());
   });
 
-  it("Escape closes it with the POINTER still over the group (roborev 54158)", () => {
-    // The real Escape path, and the one the keyboard-only test above cannot see. `open = hovered ||
-    // pinned`, so clearing `pinned` alone leaves hover holding the group open — and the pointer IS
-    // still over it, because the focus almost always arrived by clicking the paperclip. Escape then
-    // appears to do nothing, and the group is un-closable by keyboard until the mouse physically
-    // leaves.
-    setup();
-    fireEvent.mouseEnter(group());
-    act(() => clip().focus());
-    fireEvent.keyDown(group(), { key: "Escape" });
-    expect(actions().hidden).toBe(true);
-    expect(clip().getAttribute("aria-expanded")).toBe("false");
-    expect(document.activeElement).toBe(clip());
-  });
-
-  it("a dismissed group re-arms on the next real mouseenter, not on a stale hover", () => {
-    // Escape clears hover, which is what "I dismissed this" has to mean — but it must not disarm
-    // hover for good, or the paperclip would be mouse-dead for the rest of the session.
-    setup();
-    fireEvent.mouseEnter(group());
-    fireEvent.keyDown(group(), { key: "Escape" });
-    expect(actions().hidden).toBe(true);
-    fireEvent.mouseLeave(group());
-    fireEvent.mouseEnter(group());
-    expect(actions().hidden).toBe(false);
-  });
-
-  it("tabbing OUT closes it, but the mouse cannot close what focus is holding open", () => {
-    setup();
-    fireEvent.mouseEnter(group());
-    fireEvent.focus(screen.getByRole("button", { name: "Screenshot" }));
-    // Pointer leaves while focus is still inside → stays open (the keyboard user is mid-choice).
-    fireEvent.mouseLeave(group());
-    expect(actions().hidden).toBe(false);
-    // Focus leaves for something outside the group → now it closes.
-    fireEvent.blur(screen.getByRole("button", { name: "Screenshot" }), {
-      relatedTarget: screen.getByRole("textbox", { name: "Message" }),
-    });
-    expect(actions().hidden).toBe(true);
-  });
-
-  it("clicking the paperclip OPENS and never collapses it under the cursor", () => {
-    setup();
-    // The touch/click path: no hover, one tap opens.
-    fireEvent.click(clip());
-    expect(actions().hidden).toBe(false);
-    // And a second click — the case a toggle would get wrong, since hover has already opened it by
-    // the time the pointer can click and mouseenter cannot re-fire without leaving first.
-    fireEvent.mouseEnter(group());
-    fireEvent.click(clip());
-    expect(actions().hidden).toBe(false);
-  });
-
-  it("collapses back to one icon once an action is chosen", () => {
+  it("both stay pressable after one is used — nothing collapses behind the picker", () => {
+    // The old row closed itself on choose, which is why "click Screenshot, then click Upload"
+    // needed a second reveal between them. It must not now.
     const { onAttach } = setup();
-    fireEvent.focus(clip());
-    fireEvent.click(screen.getByRole("button", { name: "Screenshot" }));
-    expect(onAttach).toHaveBeenCalledWith("screenshot");
-    expect(actions().hidden).toBe(true);
+    fireEvent.click(shot());
+    fireEvent.click(upload());
+    fireEvent.click(shot());
+    expect(onAttach.mock.calls).toEqual([["screenshot"], ["files"], ["screenshot"]]);
   });
 
-  it("hands focus back to the paperclip when an action is chosen (roborev 54233)", () => {
-    // The consequence of closing BOTH inputs on the action path: a mouse click focuses the button
-    // (mousedown focus), so the actions container gets `hidden` + display:none WHILE focus is
-    // inside it. Focus falls to <body> — the user loses their place in the compose box, and for a
-    // moment a focused element sits in a hidden subtree. Hover used to keep the group mounted on
-    // this path, so the button stayed valid; clearing `hovered` is what exposed it.
-    const { onAttach } = setup();
-    fireEvent.mouseEnter(group());
-    const upload = screen.getByRole("button", { name: "Upload" });
-    act(() => upload.focus()); // what a click does anywhere mousedown-focus is in effect
-    fireEvent.click(upload);
-    expect(onAttach).toHaveBeenCalledWith("files");
-    expect(actions().hidden).toBe(true);
-    expect(document.activeElement).toBe(clip());
-    // …and the handback must not RE-PIN what the click just closed — the same trap the Escape path
-    // needs `reclaimingFocus` for, since this refocus also lands inside the group.
-    expect(clip().getAttribute("aria-expanded")).toBe("false");
-  });
-
-  it("collapses on the MOUSE path too — the one that can get stuck (roborev 54158)", () => {
-    // The primary path, and the worst one to leave open: choosing an action hands the OS a picker,
-    // which takes the pointer away without necessarily delivering a mouseleave to the webview. With
-    // `hovered` still latched true the row stays expanded after the picker dismisses, with no
-    // gesture left that would close it.
-    const { onAttach } = setup();
-    fireEvent.mouseEnter(group());
-    fireEvent.click(screen.getByRole("button", { name: "Upload" }));
-    expect(onAttach).toHaveBeenCalledWith("files");
-    expect(actions().hidden).toBe(true);
-    expect(clip().getAttribute("aria-expanded")).toBe("false");
+  it("the row may SHRINK AND WRAP — the founder's actual narrow-column clipping", () => {
+    // ── roborev 57278, carried forward ──────────────────────────────────────────────────────────
+    // Assertable in jsdom despite the no-layout-engine limit, because these are inline styles — the
+    // declarations ARE the behaviour. The group is a flex item of the toolbar, so its own default
+    // `min-width: auto` refuses to go below its min-content and the toolbar's `flex-wrap` cannot
+    // break INSIDE it; that is how the row ran past the column's right edge.
+    setup();
+    expect(group().style.minWidth).toBe("0");
+    expect(group().style.flexWrap).toBe("wrap");
   });
 });
 

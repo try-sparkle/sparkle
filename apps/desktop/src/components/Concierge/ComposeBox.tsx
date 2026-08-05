@@ -86,12 +86,15 @@ import {
   useRef,
   useState,
   type ClipboardEvent as ReactClipboardEvent,
+  type ComponentType,
   type CSSProperties,
   type KeyboardEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
 // FiFile left with the chip row it belonged to — the shared AttachmentStrip draws the file glyph now.
-import { FiAlertTriangle, FiCamera, FiPaperclip, FiUpload, FiX } from "react-icons/fi";
+import { FiAlertTriangle, FiUpload, FiX } from "react-icons/fi";
+// THE SCREENSHOT GLYPH IS DRAWN HERE, NOT IMPORTED — see CaptureRegionIcon below for both the
+// shape and the reason it is inline.
 // `C` ALONE, and the three tokens that left are the two halves of this merge, not an oversight:
 // FONT_WEIGHT / ON_GOLD_FILL went with the Send button when it moved into ./SendRail (the gold
 // rect's styling travelled verbatim, so SendRail imports them itself), and COMPOSE_SCRIM went with
@@ -302,18 +305,90 @@ const attachStyle: CSSProperties = {
   alignItems: "center",
 };
 
-/** The id `aria-controls` points at — one control, one target, so a constant rather than a hook. */
-const ATTACH_ACTIONS_ID = "concierge-attach-actions";
-
-/** THE TWO THINGS THE PAPERCLIP CAN DO. The row used to be three permanently-visible labelled
- *  buttons — Screenshot / Image / Files — which is three controls' worth of chrome above a compose
- *  box whose whole design is to look empty. It is one resting icon now, expanding into these on
- *  hover or focus (see AttachControl).
+/**
+ * THE CAPTURE-REGION GLYPH: four solid rounded corner brackets with two short dashes along each
+ * side between them — the macOS screen-capture marquee.
  *
- *  Two, not three: `image` and `files` are the same OS panel, differing only in whether it is
- *  narrowed to the image extensions, and "upload an image" vs "upload a file" is not a distinction
- *  worth a second target in a two-target menu — the unfiltered picker takes images too, and the
- *  chip it produces is identical (loadAttachment classifies by extension, so a picked .png is still
+ * THE FOUNDER SPECIFIED THIS SHAPE AND REJECTED THE ALTERNATIVE UNPROMPTED: "the four corners
+ * screenshot with like a dotted lines in between the four solid corners… it shouldn't be the
+ * camera, I don't think." He chose it over two other weight-matched candidates (Lucide `scan` —
+ * the same corners with bare sides, crisper at this size; Tabler `capture` — corners plus a centre
+ * circle, which reads as a lens).
+ *
+ * ── WHY IT IS HAND-DRAWN RATHER THAN IMPORTED ──────────────────────────────────────────────────
+ * This is Lucide's `square-dashed`, path for path. It was first written as a `LuSquareDashed`
+ * import from `react-icons/lu`, which works — but `react-icons/lu` is a single barrel module
+ * declaring every Lucide icon, so importing one glyph puts the whole set into the module graph of
+ * every suite that renders a concierge. `react-icons/fi` is already in this file's graph for the
+ * other glyphs; adding a SECOND entire icon set for one shape is a different trade, and twelve
+ * <path> elements is a smaller thing to own than that dependency.
+ *
+ * NO PERFORMANCE CLAIM IS BEING MADE HERE. The barrel was briefly suspected of causing a 48s
+ * timeout in ConciergeHost.liveness's queue-overflow test; it was measured and it is not the cause
+ * (that test times out identically with this whole feature reverted — it is load-sensitive). The
+ * reason above is dependency weight, not speed. Do not cite this comment as evidence that barrel
+ * imports are slow in tests.
+ *
+ * The geometry is Feather's own (24px grid, 2px stroke, round caps, `currentColor`) because Lucide
+ * is a fork of Feather — which is the whole reason this shape could be borrowed without looking
+ * heavier than the `fi` icons beside it. Keep those four attributes if you ever redraw it.
+ */
+/** What ATTACH_ACTIONS' `Icon` slot accepts: the props this file actually passes. Wide enough for a
+ *  react-icons glyph and for the hand-drawn one above, so the two are interchangeable in the row. */
+type AttachGlyphProps = { size?: number; "aria-hidden"?: boolean };
+function CaptureRegionIcon({ size = 13 }: AttachGlyphProps) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      {/* The four solid corners. */}
+      <path d="M5 3a2 2 0 0 0-2 2" />
+      <path d="M19 3a2 2 0 0 1 2 2" />
+      <path d="M21 19a2 2 0 0 1-2 2" />
+      <path d="M5 21a2 2 0 0 1-2-2" />
+      {/* Two dashes per side, between them. */}
+      <path d="M9 3h1" />
+      <path d="M14 3h1" />
+      <path d="M9 21h1" />
+      <path d="M14 21h1" />
+      <path d="M3 9v1" />
+      <path d="M3 14v1" />
+      <path d="M21 9v1" />
+      <path d="M21 14v1" />
+    </svg>
+  );
+}
+
+/** THE TWO ATTACH ACTIONS, BOTH ALWAYS ON SCREEN.
+ *
+ *  This row has had three shapes. It began as three permanently-visible LABELLED buttons
+ *  (Screenshot / Image / Files) — three controls' worth of chrome above a compose box whose whole
+ *  design is to look empty. That collapsed to ONE paperclip that expanded into these two on hover
+ *  or focus. It is now these two, permanently visible, as icons with no word at all.
+ *
+ *  THE PAPERCLIP IS GONE BECAUSE OF WHAT IT COST THE COMMON CASE. Screenshot is the founder's
+ *  single highest-frequency composer action — he sends them constantly, and each one turns a vague
+ *  report into a diagnosis. The expansion made that action cost two interactions (reveal, then
+ *  choose) where it had cost one, to save chrome that two icon-only buttons do not actually spend:
+ *  the resting row is now 2 controls wide where the expanded row was 3.
+ *
+ *  NO PERMANENT WORD, BY REQUEST — "it doesn't have to say screenshot, it could say screenshot on a
+ *  mouse over". So `label` is the hover tooltip AND the accessible name, and nothing is drawn but
+ *  the glyph. That makes the two identical, which is the a11y-correct pairing anyway: what a
+ *  pointer user is told on hover is exactly what a screen-reader user is told on focus.
+ *
+ *  Two actions, not three: `image` and `files` are the same OS panel, differing only in whether it
+ *  is narrowed to the image extensions, and "upload an image" vs "upload a file" is not a
+ *  distinction worth a second target — the unfiltered picker takes images too, and the chip it
+ *  produces is identical (loadAttachment classifies by extension, so a picked .png is still
  *  `kind: "image"` with a thumbnail).
  *
  *  `pickAttachments("image")` is NOT dead: the kind stays in ConciergeAttachKind and keeps its unit
@@ -322,28 +397,16 @@ const ATTACH_ACTIONS_ID = "concierge-attach-actions";
  *  entry point (a paste path, a second surface) should not have to re-derive the picker. */
 const ATTACH_ACTIONS: {
   kind: ConciergeAttachKind;
+  /** Drawn nowhere. It is the `title` (hover tooltip) and the `aria-label` (accessible name). */
   label: string;
-  Icon: typeof FiCamera;
-  title: string;
+  Icon: ComponentType<AttachGlyphProps>;
   // The keyboard-hint id, carried here rather than derived from `kind`: the ids are named for what
   // the user sees ("upload") while the kind is named for the service call it makes ("files"), and a
   // derived id would silently break the hint the day either name changes for its own reasons.
   hint: string;
 }[] = [
-  {
-    kind: "screenshot",
-    label: "Screenshot",
-    Icon: FiCamera,
-    title: "Capture a screen region",
-    hint: "attach-screenshot",
-  },
-  {
-    kind: "files",
-    label: "Upload",
-    Icon: FiUpload,
-    title: "Upload a file from your desktop",
-    hint: "attach-upload",
-  },
+  { kind: "screenshot", label: "Screenshot", Icon: CaptureRegionIcon, hint: "attach-screenshot" },
+  { kind: "files", label: "Upload", Icon: FiUpload, hint: "attach-upload" },
 ];
 
 /**
@@ -361,24 +424,39 @@ const ATTACH_ACTIONS: {
 export const COMPOSER_INSETS_PX = 46;
 
 /**
- * Below this COLUMN width (px) the expanded attach actions drop their words and draw icons only.
+ * Below this COLUMN width (px) the toolbar row drops its words and draws icons only.
  *
  * ── THE UNIT MATTERS, AND IT CHANGED (roborev 57270) ────────────────────────────────────────────
- * This was derived as the TOOLBAR ROW's own min-content width — the two labels (~76 + ~48px), their
- * icons and padding (~30px each), the row gap, and the Here/Away slider (~96px) — and it was
+ * This was derived as the TOOLBAR ROW's own min-content width — the two attach labels (~76 + ~48px),
+ * their icons and padding (~30px each), the row gap, and the Here/Away slider (~96px) — and it was
  * compared against a measurement of that row. When the observer moved to the composer's PARENT (to
  * kill an oscillation), the comparison silently started using a number 46px larger while the
  * constant kept its old value, so the collapse fired 46px too late: every column in [300, 346) hands
  * the labelled row less than the ~300px it needs, which is exactly the degradation this tier exists
  * to prevent.
  *
- * So the constant is now expressed in COLUMN terms — the toolbar requirement plus the insets — and
- * named for it. `attachShowsLabels` takes a column width, and the parameter says so.
+ * So the constant is expressed in COLUMN terms — the toolbar requirement plus the insets — and
+ * named for it. `toolbarShowsLabels` takes a column width, and the parameter says so.
+ *
+ * ── THE ATTACH HALF OF THAT DERIVATION IS NOW SLACK, DELIBERATELY ───────────────────────────────
+ * The attach group no longer HAS words to drop at any width: it is two icon-only buttons (~30px
+ * each + a 6px gap ≈ 66px, fixed), so the ~124px the two labels used to claim is gone and the only
+ * thing still trading width for words is the PresenceSlider (~96px labelled, ~52px as glyphs).
+ * Re-derived from scratch the threshold would land near 170.
+ *
+ * The value is held at 300 anyway, and that is a decision rather than an oversight. Lowering it
+ * would change WHEN the Here/Away slider collapses — a behaviour change to a control the founder
+ * did not ask about, in the direction (labels surviving into narrower columns) that this tier
+ * exists to prevent. Being pessimistic only means the slider collapses to glyphs slightly earlier
+ * than strictly necessary, which the original derivation already called the safe direction.
  */
-export const ATTACH_ICON_ONLY_MAX_COLUMN_PX = 300 + COMPOSER_INSETS_PX;
+export const TOOLBAR_ICON_ONLY_MAX_COLUMN_PX = 300 + COMPOSER_INSETS_PX;
 
 /**
- * Does the attach group draw words at this COLUMN width?
+ * Does the toolbar row draw words at this COLUMN width?
+ *
+ * Governs the PresenceSlider only — see the constant's second section for why the attach group no
+ * longer consults it.
  *
  * Pure and exported for this file's usual reason (cf. `appendDictated`): jsdom has no layout engine,
  * so a test that rendered the row and measured would read 0 for every width and pass vacuously. The
@@ -387,183 +465,71 @@ export const ATTACH_ICON_ONLY_MAX_COLUMN_PX = 300 + COMPOSER_INSETS_PX;
  * 0 means "not measured yet" and takes the LABELLED form, matching `trayDensityFor`: booting into
  * the collapsed state and widening a frame later is a visible flicker.
  */
-export function attachShowsLabels(columnWidthPx: number): boolean {
-  return !(columnWidthPx > 0) || columnWidthPx >= ATTACH_ICON_ONLY_MAX_COLUMN_PX;
+export function toolbarShowsLabels(columnWidthPx: number): boolean {
+  return !(columnWidthPx > 0) || columnWidthPx >= TOOLBAR_ICON_ONLY_MAX_COLUMN_PX;
 }
 
 /**
- * ONE resting paperclip that expands into its two real actions on hover — the founder's ask, and
- * the reason it is a hover EXPANSION rather than a click-then-menu: a menu makes you commit a click
- * before it will tell you what is behind the icon, and there are only two things back there.
+ * THE TWO ATTACH ACTIONS, SIDE BY SIDE AND ALWAYS VISIBLE — the founder's ask, replacing the single
+ * paperclip that expanded into them on hover.
  *
- * HOVER IS NOT THE ONLY PATH, and that is not decoration. A pointer-only disclosure is unusable by
- * keyboard and by touch, so `open` is driven by TWO independent inputs:
- *   • `hovered` — mouseenter/mouseleave on the group.
- *   • `pinned`  — focus anywhere inside the group (React's onFocus/onBlur are focusin/focusout, so
- *     they bubble from the buttons), plus a click on the paperclip for touch, where nothing hovers.
- * `open = hovered || pinned`, so neither input can close what the other is holding open: tabbing
- * in opens it and it stays open while you tab BETWEEN the two actions (the blur only counts when
- * the new target is outside the group), and moving the mouse away doesn't yank it from under a
- * keyboard user.
+ * WHAT THIS DELETED, AND WHY NONE OF IT IS OWED A REPLACEMENT. The old control was a disclosure,
+ * and nearly all of its code existed to make a disclosure survive contact with reality: `hovered ||
+ * `pinned` as two independent opens so neither could close what the other held; a click that opened
+ * but never closed (by the time you can click it, hover has already opened it); Escape unwinding it
+ * with a one-shot guard so the focus handback would not immediately re-pin what Escape just closed;
+ * `hidden` on the actions so the announced state and the tab order could not drift apart.
  *
- * THE PAPERCLIP'S CLICK OPENS; IT NEVER CLOSES. A toggle reads tidier but is wrong on the mouse
- * path: by the time you can click it, hover has already opened it, so the click's only visible
- * effect would be to collapse the thing you just aimed at, out from under a cursor that cannot
- * re-fire mouseenter without leaving and coming back. Escape closes (and returns focus to the
- * paperclip), and so does leaving/tabbing away. `aria-expanded` still reports the true state.
+ * Every one of those was correct, and every one of them was solving a problem created by hiding two
+ * buttons behind a third. With both buttons simply present there is no open state to hold, nothing
+ * to unwind, nothing to announce as expanded, and nothing that can be visible-but-unfocusable. That
+ * is why this is ~15 lines where it was ~150 — the machinery went away with the thing it managed,
+ * not into some other file. Do not reintroduce a disclosure here without re-reading the four
+ * behaviours above; they are the cost of one.
  *
- * The actions carry the `hidden` attribute when collapsed rather than being unmounted or merely
- * painted out: `hidden` takes them out of the accessibility tree AND the tab order together, so the
- * announced state and the reachable state can't drift apart. Choosing one collapses the group back
- * to the single icon — the picker it opened is the surface now.
+ * NARROWER AT REST THAN THE THING IT REPLACED. The concern with two permanent controls is the
+ * narrow column (bead sparkle-kk9dg), but the arithmetic runs the right way: this row is 2
+ * icon-only buttons where the EXPANDED old row was 3 (paperclip + two actions, labelled until
+ * ~346px). The resting row grew by one control and the worst case shrank by one.
+ *
+ * `minWidth: 0` / `flexWrap` stay, and they are still load-bearing. This is a flex item of the
+ * toolbar, so its own default `min-width: auto` refuses to go below its min-content and the
+ * toolbar's `flex-wrap` cannot break INSIDE it — which is how the row ran past the column's right
+ * edge in the founder's original narrow-column report.
  */
-/** Exported for a RENDER test of its collapsed form. The pure `attachShowsLabels` decides WHEN to
- *  collapse; only a render can prove WHAT the collapsed button is — specifically that it keeps an
- *  accessible name once its visible word is gone (roborev 57049). */
+/** Exported for a RENDER test: only a render can prove these two buttons carry an accessible name,
+ *  since neither ever draws a visible word (roborev 57049 pinned the same property of the older
+ *  collapsed form). */
 export function AttachControl({
   onAttach,
-  showLabels = true,
 }: {
   onAttach: (kind: ConciergeAttachKind) => void;
-  /** False collapses the two actions to icons — see `attachShowsLabels`. Defaults TRUE so every
-   *  existing caller and test keeps the labelled form it already asserts. */
-  showLabels?: boolean;
 }) {
-  const [hovered, setHovered] = useState(false);
-  const [pinned, setPinned] = useState(false);
-  const groupRef = useRef<HTMLDivElement>(null);
-  const clipRef = useRef<HTMLButtonElement>(null);
-  // Escape closes the group AND hands focus back to the paperclip — but that refocus lands INSIDE
-  // the group, so the focusin it raises would immediately re-pin what Escape just closed and the
-  // key would do nothing at all. This one-shot flag lets the handler know that focus event is our
-  // own. Set only when a focus event will actually fire (i.e. the clip isn't already focused), so
-  // it can never be left armed to swallow a genuine one.
-  const reclaimingFocus = useRef(false);
-  const open = hovered || pinned;
-  // BOTH INPUTS, because `open` is their OR and an explicit dismissal has to beat both (roborev
-  // 54158). Clearing `pinned` alone is not closing: on the ordinary mouse path the pointer is still
-  // over the group when Escape is pressed — keydown only fires with focus inside, and that focus
-  // almost always arrived by clicking the paperclip — so hover holds the group open, `aria-expanded`
-  // stays "true", and Escape looks inert. The group is then un-closable by keyboard until the
-  // pointer physically leaves. Choosing an action is the same bug and the worse one: the picker it
-  // opens takes the pointer away without necessarily delivering a `mouseleave` to the webview, so
-  // `hovered` latches true and the row stays expanded after the picker dismisses.
-  //
-  // Hover is cleared, not disarmed: `mouseenter` fires again the next time the pointer actually
-  // enters the group, which is what "I dismissed this" should mean — dismissed until you come back.
-  //
-  // Closing takes the actions OUT of the tree (`hidden` + display:none), so whoever closed it must
-  // also say where focus goes — otherwise it falls to <body>, dropping the user out of the compose
-  // box entirely, and for a moment leaves a focused element inside a hidden subtree (roborev
-  // 54233). That was invisible while `pinned` was cleared alone: hover kept the group mounted, so
-  // the focused action button stayed valid. Both close paths need the handback, and both need the
-  // `reclaimingFocus` guard with it, since the paperclip is INSIDE the group and the focus event it
-  // raises would otherwise re-pin what we just closed.
-  //
-  // ONLY when focus is already inside the group, though. WebKit on macOS does not focus a <button>
-  // on click unless Full Keyboard Access is on, and this app is a WKWebView — so the ordinary path
-  // is "caret in the textarea, user clicks Screenshot", and grabbing focus unconditionally would
-  // yank the caret out of the composer to attach a file. Focus outside the group is already
-  // somewhere the user chose; only focus that is about to be destroyed needs rehoming.
-  const close = useCallback(() => {
-    setHovered(false);
-    setPinned(false);
-    const active = document.activeElement;
-    if (active !== clipRef.current && groupRef.current?.contains(active)) {
-      reclaimingFocus.current = true;
-      clipRef.current?.focus();
-    }
-  }, []);
-
   return (
     <div
-      ref={groupRef}
       data-testid="concierge-attach"
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
-      onFocus={(e) => {
-        if (reclaimingFocus.current) {
-          reclaimingFocus.current = false;
-          return;
-        }
-        // A PROGRAMMATIC focus is not the user arriving here, so it must not pin the group open.
-        // The keyboard-hint overlay hands focus back to the paperclip when it abandons a chain
-        // (HintOverlay.leaveChain → focusQuietly), and re-pinning on that would re-expand the very
-        // group the same gesture just collapsed — leaving it stranded with its badges scoped away.
-        // Genuine focus still pins, and chain ENTRY uses a plain focus() precisely so that it does.
-        if (isProgrammaticFocus(e.target as HTMLElement)) return;
-        setPinned(true);
-      }}
-      onBlur={(e) => {
-        // Only a focus move OUT of the group closes it — moving between the paperclip and the two
-        // actions fires blur too, and treating that as "left" would collapse the group mid-tab.
-        if (!groupRef.current?.contains(e.relatedTarget as Node | null)) setPinned(false);
-      }}
-      onKeyDown={(e) => {
-        if (e.key !== "Escape" || !open) return;
-        // Stop here: Escape inside the compose box otherwise reaches the surfaces around it, and
-        // closing this group is the whole of what the user asked for.
-        e.stopPropagation();
-        // `close` carries the focus handback — a keydown can only have reached here with focus
-        // inside the group, so its guard is always satisfied on this path.
-        close();
-      }}
-      // THE GROUP WRAPPER SHRINKS AND WRAPS TOO. It is a flex item of the toolbar, so its own
-      // default `min-width: auto` refuses to go below its min-content — and the toolbar's
-      // `flex-wrap` cannot break INSIDE it. Expanded, that runs past the column's right edge below
-      // roughly a 97px column: the founder's exact reported failure.
       style={{ display: "inline-flex", alignItems: "center", gap: 6, minWidth: 0, flexWrap: "wrap" }}
     >
-      <button
-        ref={clipRef}
-        type="button"
-        aria-label="Attach"
-        aria-expanded={open}
-        aria-controls={ATTACH_ACTIONS_ID}
-        title="Attach a screenshot or a file"
-        // A CHAINING hint, like the Recent-projects trigger: this click only EXPANDS the group, so
-        // the overlay keeps hint mode alive and badges the two actions rather than closing on a
-        // menu the keyboard then can't reach.
-        data-hint="attach"
-        onClick={() => setPinned(true)}
-        style={{
-          ...attachStyle,
-          padding: "5px 7px",
-          // The one lit-on-open cue the resting state gets: with the label gone, nothing else says
-          // this icon is the thing the two buttons came out of.
-          color: open ? C.cream : C.conciergeMuted,
-        }}
-      >
-        <FiPaperclip size={13} aria-hidden />
-      </button>
-      <div
-        id={ATTACH_ACTIONS_ID}
-        hidden={!open}
-        style={{ display: open ? "inline-flex" : "none", gap: 6, alignItems: "center", flexWrap: "wrap", minWidth: 0 }}
-      >
-        {ATTACH_ACTIONS.map(({ kind, label, Icon, title, hint }) => (
-          <button
-            key={kind}
-            type="button"
-            title={title}
-            // Only badged while the overlay's attach chain is open — the group expands on hover too,
-            // and "s" is also the agent-pane composer's screenshot mnemonic. See HintLayer.
-            data-hint={hint}
-            // THE NAME SURVIVES THE COLLAPSE. With the word gone the button would otherwise have no
-            // accessible name at all — the icon is `aria-hidden` — so "click Upload" would stop
-            // working in a narrow column while continuing to work in a wide one.
-            aria-label={showLabels ? undefined : label}
-            onClick={() => {
-              onAttach(kind);
-              close();
-            }}
-            style={attachStyle}
-          >
-            <Icon size={12} aria-hidden />
-            {showLabels ? label : null}
-          </button>
-        ))}
-      </div>
+      {ATTACH_ACTIONS.map(({ kind, label, Icon, hint }) => (
+        <button
+          key={kind}
+          type="button"
+          // THE HOVER TOOLTIP AND THE ACCESSIBLE NAME ARE THE SAME STRING, on purpose. The founder
+          // asked for no permanent word ("it could say screenshot on a mouse over"), which leaves
+          // `title` as the only thing a pointer user is ever told — so an `aria-label` that said
+          // something else would be describing a different control to a screen reader.
+          title={label}
+          aria-label={label}
+          // A LEAF hint now, not a chaining trigger: there is no group left to expand, so selecting
+          // one of these fires it and closes the overlay like any other chrome control. Both letters
+          // live in CHROME_HINTS (see keyboardHints/hintTargets) rather than in a scoped sub-layer.
+          data-hint={hint}
+          onClick={() => onAttach(kind)}
+          style={{ ...attachStyle, padding: "5px 7px" }}
+        >
+          <Icon size={13} aria-hidden />
+        </button>
+      ))}
     </div>
   );
 }
@@ -1171,7 +1137,7 @@ export function ComposeBox({
     return () => ro.disconnect();
   }, []);
   /** Below the attach threshold the whole composer tightens, not just the labels — see `margin`. */
-  const narrowColumn = !attachShowsLabels(columnWidth);
+  const narrowColumn = !toolbarShowsLabels(columnWidth);
 
   // The thread node currently under observation. Tracked so `measure` re-observes only when the
   // node IDENTITY changes (ConciergeThread remounting), never on every callback.
@@ -1872,12 +1838,12 @@ export function ComposeBox({
           minWidth: 0,
         }}
       >
-        <AttachControl onAttach={onAttach} showLabels={attachShowsLabels(columnWidth)} />
+        <AttachControl onAttach={onAttach} />
         {/* Right-aligned in the attach row, which puts it directly ABOVE the Send button — the
             action whose autonomy it governs. It reads and writes presenceStore itself rather than
             taking props; see PresenceSlider's header for why, and note this box already reads
             useUiStore for the same class of reason. */}
-        <PresenceSlider showLabels={attachShowsLabels(columnWidth)} />
+        <PresenceSlider showLabels={toolbarShowsLabels(columnWidth)} />
       </div>
       {/* NO INTERIM STRIP HERE. The live dictation preview used to be its own row at exactly this
           point — above the drag handle, above the textarea — and the founder's report was that the

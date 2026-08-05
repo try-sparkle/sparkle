@@ -191,12 +191,11 @@ const threadEl = () => screen.getByTestId("concierge-thread");
  *  reaches, so it is where the attachments have to show up. */
 const askedSparkle = () => h.startConciergeTurn.mock.calls.map((c) => c[0]);
 
-/** Stage a screenshot through the compose box's attach affordance. The paperclip rests collapsed,
- *  so the actions have to be REVEALED first — hover is the mouse path (focus is the keyboard one;
- *  ComposeBox.test.tsx covers both). What this suite cares about is only that a file is staged. */
+/** Stage a screenshot through the compose box's attach affordance. Both buttons are permanently
+ *  visible (bead sparkle-f8bjx), so there is nothing to reveal first. What this suite cares about is
+ *  only that a file is staged. */
 async function attachImage() {
   h.pick.mockResolvedValue({ attachments: [shot], failed: [] });
-  fireEvent.mouseEnter(screen.getByTestId("concierge-attach"));
   await act(async () => {
     fireEvent.click(screen.getByRole("button", { name: "Upload" }));
   });

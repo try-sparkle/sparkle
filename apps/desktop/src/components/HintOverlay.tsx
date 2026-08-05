@@ -2,7 +2,6 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import { createPortal } from "react-dom";
 import { C, ON_GOLD_FILL } from "../theme/colors";
 import { FONT_MONO, RADIUS, TYPE } from "../theme/scale";
-import { focusQuietly } from "../services/programmaticFocus";
 import { useHintMode } from "../keyboardHints/useHintMode";
 import {
   AGENT_HINT,
@@ -10,11 +9,9 @@ import {
   RECENT_HINT,
   RECENT_SWITCH_HINT,
   RECENT_TRIGGER_HINT,
-  ATTACH_TRIGGER_HINT,
   HINT_JUMP_ATTR,
   PAIR_PREFIX,
   assignLabels,
-  attachActionLabel,
   isPairLabel,
 } from "../keyboardHints/hintTargets";
 
@@ -22,15 +19,23 @@ import {
 // badge hangs off the control's TOP edge rather than being vertically centred on it.
 type Chiclet = { label: string; rect: DOMRect; el: HTMLElement; anchorTop: boolean };
 
-// A scoped sub-layer of the overlay: while one is open, ONLY its own targets are badged.
+// ── THE SCOPED SUB-LAYER ("chain") WAS REMOVED WITH ITS ONLY USER ──────────────────────────────
 //
-// "attach" is the paperclip's two actions. The scope is not a nicety — "s" (Screenshot) is also
-// CHROME_HINTS.screenshot, the agent-pane composer's button, and both can be on screen together.
+// There was a `HintLayer` state (`null | "attach"`) plus `layerRef`, `chainTriggerRef`,
+// `chainReturnRef` and a `leaveChain` callback. All of it existed for ONE target: the concierge
+// paperclip, whose click only EXPANDED a disclosure, so selecting it had to keep hint mode alive,
+// re-collect into a scope holding just its two actions, and — the hard part — drive that disclosure
+// through its own focus machinery so abandoning the chain actually closed it.
 //
-// It is state rather than something inferred from the DOM (the way the Recent dropdown's scope is),
-// because the attach group ALSO expands on plain hover: inferring it would let a mouse pointer left
-// resting over the paperclip blank every other badge in the app.
-type HintLayer = null | "attach";
+// The paperclip is gone; its two actions are permanently-visible buttons with their own chrome
+// mnemonics, so selecting either one is an ordinary leaf activation. Nothing else ever opened a
+// layer: the Recent dropdown keeps hint mode open too, but INFERS its scope from the DOM (see
+// collectChiclets) rather than recording one, precisely so it needs none of this.
+//
+// Consequence worth knowing: Escape now has one fewer thing to unwind. It still unwinds the
+// PAIR_PREFIX layer before dismissing (see onEscape); it simply can no longer be spent collapsing a
+// disclosure. If a future chaining trigger arrives, this is the machinery it needs back — the git
+// history for this file is the reference, not a reimplementation from scratch.
 
 // True for elements that are actually on screen and clickable: laid out (offsetParent), non-zero
 // size, and at least partially within the viewport. Filters out display:none / collapsed / mode-
@@ -104,43 +109,6 @@ function normalizeKey(key: string): string {
   return key.length === 1 ? key.toLowerCase() : "";
 }
 
-/** Where focus should go when a chain opened by `trigger` is left — i.e. what held it beforehand,
- *  UNLESS that is somewhere inside the surface the chain itself owns.
- *
- *  Handing focus back INTO that surface would re-fire the disclosure's own focus handler and
- *  re-expand what leaving had just collapsed — stranding the group open with its badges scoped away
- *  and no keyboard way out, which is the bug the collapse was written to fix.
- *
- *  This is not an exotic entry state, it is the STEADY one: AttachControl.close deliberately skips
- *  its focus handback when the paperclip is what holds focus, which after any completed chain it
- *  always is. So the second chain of a session starts with the trigger already focused. Tabbing to
- *  the paperclip before opening hint mode arrives the same way.
- *
- *  Containment, not identity, is the test — a hidden action button inside the collapsed group is
- *  just as wrong a target, and is harmless today only by the accident that `display: none` makes
- *  focus() a no-op. The trigger's PARENT is that surface: AttachControl wraps the clip and its two
- *  actions in one group element. */
-function returnTargetFor(trigger: HTMLElement): HTMLElement | null {
-  const prev = document.activeElement as HTMLElement | null;
-  if (!prev || prev === trigger) return null;
-  if (trigger.parentElement?.contains(prev)) return null;
-  return prev;
-}
-
-/** Put focus back on the element a chain took it from, if that is still a real place to put it.
- *
- *  `document.body` is what `activeElement` reads as when nothing is focused, and it is not itself
- *  focusable — so it means "there was nothing to go back to", not "go back to the body". Treating it
- *  as a restore target is a silent no-op, which is worse than skipping: it looks like a handback.
- *
- *  Quiet, because putting focus back where it already was is not the user choosing a surface. A
- *  plain focus() here would have the compose box claim dictation on the way past. */
-function restoreFocus(back: HTMLElement | null): void {
-  if (!back || back === document.body || !back.isConnected) return;
-  if (document.activeElement === back) return;
-  focusQuietly(back);
-}
-
 /** Hand the selected control its own activation, once the overlay has torn down.
  *
  *  Deferred a tick so React has removed the overlay first — a synchronous click could re-enter
@@ -204,19 +172,10 @@ function place(els: HTMLElement[]): Chiclet[] {
 // Scan the DOM for tagged controls and assign each a label. Agents (data-hint="agent") are numbered
 // top-to-bottom (then left-to-right); chrome controls keep their fixed mnemonic. Returns the placed
 // chiclets in render order.
-//
-// `layer` is the scoped sub-layer that is open, if any (see HintLayer).
-function collectChiclets(layer: HintLayer): Chiclet[] {
+function collectChiclets(): Chiclet[] {
   const nodes = Array.from(
     document.querySelectorAll<HTMLElement>("[data-hint]"),
   ).filter(isVisible);
-
-  // The paperclip's chain. Selecting "k" expanded the group; these two actions are now the whole
-  // layer, and everything else is deliberately unbadged (see HintLayer for why "s" requires that).
-  const attachActions = nodes
-    .filter((el) => attachActionLabel(el.dataset.hint ?? "") !== null)
-    .sort(byVisualOrder);
-  if (layer === "attach") return place(attachActions);
 
   // Recent-dropdown mode: when its rows are on screen, this is a focused "pick a project" moment.
   // Show ONLY the row badges (lettered a–z top to bottom) and suppress chrome/agents, so the whole
@@ -244,17 +203,15 @@ function collectChiclets(layer: HintLayer): Chiclet[] {
   // A Switch button only exists inside a Recent row, so if we got here there are none — but filter
   // it out anyway so it can never leak into the chrome bucket and resolve to a null label.
   //
-  // The attach ACTIONS are filtered out too, and that one is load-bearing: the group they live in
-  // expands on hover, so they are in the DOM and visible whenever the pointer rests on the
-  // paperclip. Letting them through here would put a second "s" on screen beside the agent-pane
-  // composer's screenshot button, and one of the two would be unreachable.
+  // The concierge's two attach buttons DO fall through to here now, and that is the point: they are
+  // ordinary chrome with their own distinct mnemonics, badged in the top-level layer like everything
+  // else. They used to be excluded because they were only legal inside a scope of their own.
   const chrome = nodes.filter(
     (el) =>
       el.dataset.hint !== AGENT_HINT &&
       el.dataset.hint !== PROJECT_TAB_HINT &&
       el.dataset.hint !== RECENT_HINT &&
-      el.dataset.hint !== RECENT_SWITCH_HINT &&
-      attachActionLabel(el.dataset.hint ?? "") === null,
+      el.dataset.hint !== RECENT_SWITCH_HINT,
   );
 
   // Tabs first, then agents, then chrome: tabs claim the head of the shared overflow pool in
@@ -273,16 +230,8 @@ export function HintOverlay() {
   // just its second character. Mirrored into a ref for the same reason the chiclets are.
   const [prefix, setPrefix] = useState(false);
   const prefixRef = useRef(false);
-  // The open scoped sub-layer. Ref only — nothing renders from it directly; it feeds the next
-  // collect, and a re-collect is what actually repaints.
-  const layerRef = useRef<HintLayer>(null);
-  // The trigger that opened the current chain, so leaving can hand focus back out of it, and what
-  // held focus BEFORE the chain took it — almost always the compose box, since "/" is a hint whose
-  // whole job is putting the caret there.
-  const chainTriggerRef = useRef<HTMLElement | null>(null);
-  const chainReturnRef = useRef<HTMLElement | null>(null);
-  // Mirrors `active` for the deferred chain callbacks, which resolve two frames later and must not
-  // commit into an overlay that has been dismissed in the meantime.
+  // Mirrors `active` for the deferred Recent-dropdown callback, which resolves two frames later and
+  // must not commit into an overlay that has been dismissed in the meantime.
   const activeRef = useRef(false);
 
   // The keydown listener below reads the CURRENT chiclets through this ref rather than closing over
@@ -321,64 +270,23 @@ export function HintOverlay() {
     [applyPrefix],
   );
 
-  const refresh = useCallback(
-    () => applyChiclets(collectChiclets(layerRef.current)),
-    [applyChiclets],
-  );
-
-  // LEAVING A CHAIN HAS TO CLOSE WHAT IT OPENED. A chain trigger is a disclosure, and the one we
-  // have — the concierge paperclip — latches open on `pinned`, whose only release paths run through
-  // focus leaving the group. A synthetic click() focuses nothing (WKWebView does not focus a button
-  // on click at all without Full Keyboard Access), so a chain entered and then abandoned left the
-  // group expanded in the compose row with no badges on it and no keyboard way to collapse it.
-  //
-  // So the chain drives that group through its OWN machinery rather than around it: entering
-  // focuses the trigger (which is what opens it), leaving blurs it (which is what closes it). No
-  // new listener, no second source of truth for "is this thing open", and the keyboard path now
-  // looks to the component exactly like the tab-in/tab-out it was already built to handle.
-  // GIVING THE FOCUS BACK IS PART OF LEAVING. Entering took it from wherever the user was, and
-  // releasing it with a bare blur() drops it on <body> — so "/" a draft, tap Control, k, Escape and
-  // the caret is out of the box with nowhere to type. Restoring the previous element IS also the
-  // collapse: focus landing outside the group is what its focusout handler reads. Quietly, via
-  // focusQuietly, because putting focus back where it already was is not the user choosing a
-  // surface — a plain focus() here would have the compose box claim dictation on the way past.
-  const leaveChain = useCallback(() => {
-    const trigger = chainTriggerRef.current;
-    const back = chainReturnRef.current;
-    chainTriggerRef.current = null;
-    chainReturnRef.current = null;
-    layerRef.current = null;
-    if (!trigger) return;
-    // BLUR UNCONDITIONALLY, THEN restore. Letting the restore stand in for the blur looks tempting
-    // — focus landing outside the group is what collapses it either way — but it fails silently in
-    // the case that matters most: when nothing was focused before the chain, there is no restore
-    // target, so nothing moves and the group stays open. Two focus events, in the order that says
-    // what happened: let go, then put it back.
-    trigger.blur();
-    // `back` is null when the previous holder was inside the group itself (returnTargetFor), and
-    // that does NOT mean "nowhere to go" — it means the TRIGGER is where they were. A keyboard user
-    // who tabbed to the paperclip, or anyone starting their second chain (the clip still holds
-    // focus after a completed one), would otherwise be left on <body> with their tab position gone.
-    // Handing it back is safe because restoreFocus goes through focusQuietly: AttachControl reads a
-    // programmatic focus as ours and does not re-pin the group this same call just collapsed.
-    restoreFocus(back ?? trigger);
-  }, []);
+  const refresh = useCallback(() => applyChiclets(collectChiclets()), [applyChiclets]);
 
   // Escape unwinds one layer at a time and only dismisses once there is nothing left to unwind.
   // useHintMode owns the dismissal and asks us first — see its header for why this is delegated
   // rather than intercepted.
+  //
+  // PAIR_PREFIX is the only layer left to unwind (the attach chain was the other; see the note near
+  // the top of this file). Returning false here is what lets the press reach useHintMode's own
+  // dismissal AND the surfaces around it — so an Escape with no prefix layer open is an ordinary
+  // Escape everywhere, which is the behaviour the bystander tests in ComposeBox.hint.test.tsx pin.
   const onEscape = useCallback(() => {
     if (prefixRef.current) {
       applyPrefix(false);
       return true;
     }
-    if (layerRef.current) {
-      leaveChain();
-      applyChiclets(collectChiclets(null));
-      return true;
-    }
     return false;
-  }, [applyPrefix, applyChiclets, leaveChain]);
+  }, [applyPrefix]);
 
   const { active, close } = useHintMode(onEscape);
 
@@ -387,11 +295,8 @@ export function HintOverlay() {
   useLayoutEffect(() => {
     activeRef.current = active;
     if (!active) {
-      // Closing drops every layer with it: reopening always starts at the top level, so a chain
-      // abandoned by clicking away can't be waiting the next time the overlay opens. Dismissing the
-      // whole overlay collapses an open chain for the same reason Escape does — a second trigger
-      // tap must not leave a disclosure hanging open behind it.
-      leaveChain();
+      // Closing drops the prefix layer with it: reopening always starts at the top level, so a
+      // half-typed pair can't be waiting the next time the overlay opens.
       applyPrefix(false);
       applyChiclets([]);
       return;
@@ -399,7 +304,7 @@ export function HintOverlay() {
     refresh();
     window.addEventListener("resize", refresh);
     return () => window.removeEventListener("resize", refresh);
-  }, [active, refresh, applyChiclets, applyPrefix, leaveChain]);
+  }, [active, refresh, applyChiclets, applyPrefix]);
 
   // Label-key selection. Capture phase so we intercept the key before xterm/inputs consume it.
   useEffect(() => {
@@ -425,7 +330,7 @@ export function HintOverlay() {
             // second trigger tap, a mousedown, a scroll). Committing into a closed overlay would
             // resurrect state the close path just cleared.
             if (!activeRef.current) return;
-            const next = collectChiclets(null);
+            const next = collectChiclets();
             // Dropdown opened with rows → show their a–z badges and stay open to chain a pick.
             // Opened empty (no recent projects) → there's nothing to pick, so close instead of
             // stranding the user on a "stuck open" chrome overlay still showing the r badge.
@@ -435,54 +340,11 @@ export function HintOverlay() {
         );
         return;
       }
-      // The paperclip is the same shape: its click only EXPANDS the group holding the two things it
-      // can do, so closing here would leave the user staring at an open menu with no badges on it.
-      // Unlike the Recent dropdown the sub-layer is recorded (layerRef) rather than re-derived, so a
-      // later resize re-collects the chain instead of falling back to the top level.
-      if (el.dataset.hint === ATTACH_TRIGGER_HINT) {
-        // FOCUS, then click. The group opens on focus anywhere inside it, and driving it that way
-        // is what gives leaveChain something to undo — see its header. The click stays because it
-        // is the trigger's documented contract; the focus is what makes the state releasable.
-        chainReturnRef.current = returnTargetFor(el);
-        el.focus();
-        chainTriggerRef.current = el;
-        el.click();
-        requestAnimationFrame(() =>
-          requestAnimationFrame(() => {
-            // Dismissed while we waited — leaveChain has already run, so re-setting layerRef here
-            // would leave the overlay reopening into a chain whose group is long collapsed: an
-            // active overlay showing no badges at all, whose first Escape gets swallowed unwinding
-            // the phantom layer instead of dismissing.
-            if (!activeRef.current) return;
-            const next = collectChiclets("attach");
-            if (next.length > 0) {
-              layerRef.current = "attach";
-              applyChiclets(next);
-            } else {
-              // The group didn't expand (or its actions aren't reachable). Same call the Recent
-              // trigger makes: close rather than strand the user on a layer with nothing in it.
-              close();
-            }
-          }),
-        );
-        return;
-      }
-      // CHOOSING a chain member is not abandoning the chain, so hand the trigger over rather than
-      // blurring it: the member's own handler closes the group and decides where focus goes (see
-      // AttachControl.close, which rehomes focus only when it is about to destroy the element
-      // holding it). Blurring first would collapse the group out from under the click we are about
-      // to fire and take that decision away from it.
-      //
-      // The focus the chain TOOK still has to go back, though — AttachControl.close deliberately
-      // skips its own handback when the paperclip is what holds focus, which after a keyboard chain
-      // it always is, so choosing Screenshot would otherwise leave the caret out of the draft.
-      // Queued after fireActivation's own tick so the handler has had its say first.
-      const back = chainReturnRef.current;
-      chainTriggerRef.current = null;
-      chainReturnRef.current = null;
+      // EVERY OTHER TARGET IS A LEAF: close the overlay and hand the control its own activation.
+      // The concierge's Screenshot and Upload buttons are in this bucket now — they were the one
+      // exception, back when a paperclip had to be expanded before either could be pressed.
       close();
       fireActivation(el);
-      if (back) setTimeout(() => restoreFocus(back), 0);
     };
 
     const onKeyDown = (e: KeyboardEvent) => {

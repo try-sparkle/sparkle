@@ -618,143 +618,52 @@ describe("HintOverlay — activation shapes", () => {
   });
 });
 
-describe("HintOverlay — the paperclip chain", () => {
-  // A stand-in for AttachControl: one resting trigger whose click expands the two real actions.
-  function Paperclip({ onScreenshot }: { onScreenshot: () => void }) {
-    const [open, setOpen] = useState(false);
-    return (
-      <div>
-        <button data-hint="attach" onClick={() => setOpen(true)}>Attach</button>
-        {open ? (
-          <>
-            <button data-hint="attach-screenshot" onClick={onScreenshot}>Screenshot</button>
-            <button data-hint="attach-upload" onClick={() => {}}>Upload</button>
-          </>
-        ) : null}
-      </div>
-    );
-  }
 
-  it("k expands the group and chains into its two actions", async () => {
+// THE PAPERCLIP CHAIN SUITE LIVED HERE, and it went with the feature (bead sparkle-f8bjx).
+//
+// It exercised a scoped sub-layer: a stand-in AttachControl whose trigger click expanded two
+// actions, plus cases for suppressing every other badge while the chain was open, a trigger that
+// never opened, and Escape restoring the ordinary layer. There is no chaining trigger in the app
+// any more — the concierge's attach actions are permanently-visible buttons with their own chrome
+// mnemonics — so the layer, `leaveChain`, and the focus handback they required are all gone from
+// HintOverlay.
+//
+// The ONE behaviour from that suite that outlives it is "Escape unwinds a layer before dismissing",
+// which the PAIR_PREFIX layer still exercises — see "Escape backs out to the ordinary layer first,
+// and only then dismisses" above. What replaces the rest is this: the attach actions are now
+// ordinary chrome, badged in the top-level layer like any other control.
+describe("HintOverlay — the concierge attach buttons are ordinary chrome", () => {
+  it("badges both of them in the top-level layer, alongside unrelated chrome", () => {
     const onScreenshot = vi.fn();
     render(
       <>
-        <Paperclip onScreenshot={onScreenshot} />
-        <HintOverlay />
-      </>,
-    );
-    controlTap();
-    expect(screen.getByText("k")).toBeTruthy();
-
-    fireEvent.keyDown(window, { key: "k" });
-    await waitFor(() => expect(screen.getByText("s")).toBeTruthy());
-    expect(screen.getByText("u")).toBeTruthy();
-    // Scoped: the trigger's own badge is gone, so the layer reads as "pick one of these two".
-    expect(screen.queryByText("k")).toBeNull();
-
-    fireEvent.keyDown(window, { key: "s" });
-    await waitFor(() => expect(onScreenshot).toHaveBeenCalledTimes(1));
-  });
-
-  // THE REASON THE CHAIN IS SCOPED. "s" is also the agent-pane composer's screenshot mnemonic, and
-  // both surfaces are on screen together — unscoped, one of the two "s" badges would be dead.
-  it("suppresses every other badge while the chain is open, and restores them on Escape", async () => {
-    const onComposerShot = vi.fn();
-    render(
-      <>
-        <Paperclip onScreenshot={() => {}} />
-        <button data-hint="screenshot" onClick={onComposerShot}>Composer screenshot</button>
-        <HintOverlay />
-      </>,
-    );
-    controlTap();
-    expect(screen.getAllByText("s")).toHaveLength(1); // only the composer's, while collapsed
-
-    fireEvent.keyDown(window, { key: "k" });
-    // Gate on "u", which exists ONLY inside the chain. Waiting on "s" proves nothing here: there is
-    // exactly one of those in both layers, so the wait resolves before the chain has opened and the
-    // next keystroke lands on the composer's button instead.
-    await waitFor(() => expect(screen.getByText("u")).toBeTruthy());
-    expect(screen.getAllByText("s")).toHaveLength(1); // the chain's, and only the chain's
-    fireEvent.keyDown(window, { key: "s" });
-    await waitFor(() => expect(screen.queryByText("u")).toBeNull());
-    expect(onComposerShot).not.toHaveBeenCalled();
-  });
-
-  // The group ALSO expands on hover, so its actions can be in the DOM with no chain open. If they
-  // were labelled there, two live "s" badges would collide and one would be unreachable.
-  it("never badges the actions outside the chain, even when the group is already expanded", () => {
-    render(
-      <>
-        <button data-hint="attach-screenshot" onClick={() => {}}>Screenshot</button>
+        <button data-hint="build" onClick={() => {}}>Build</button>
+        <button data-hint="attach-screenshot" onClick={onScreenshot}>Screenshot</button>
         <button data-hint="attach-upload" onClick={() => {}}>Upload</button>
-        <button data-hint="screenshot" onClick={() => {}}>Composer screenshot</button>
         <HintOverlay />
       </>,
     );
     controlTap();
-    expect(screen.getAllByText("s")).toHaveLength(1);
-    expect(screen.queryByText("u")).toBeNull();
-  });
-
-  // THE FAILURE BRANCH. If the group never expands there is nothing to badge, so the overlay closes
-  // rather than stranding the user on an empty layer — but the trigger has already been focused and
-  // clicked by then, so closing must ALSO hand focus back out or the disclosure it just latched is
-  // left open with no overlay at all to explain it.
-  it("hands focus back out when the group fails to expand", async () => {
-    render(
-      <>
-        <button data-hint="attach" onClick={() => {}}>Attach that never opens</button>
-        <button data-hint="build" onClick={() => {}}>Build</button>
-        <HintOverlay />
-      </>,
-    );
-    controlTap();
-    fireEvent.keyDown(window, { key: "k" });
-    await waitFor(() => expect(screen.queryByText("b")).toBeNull()); // overlay closed
-    expect(document.activeElement).not.toBe(screen.getByText("Attach that never opens"));
-  });
-
-  // A DISMISSAL INSIDE THE TWO-FRAME WINDOW MUST WIN. The chain commits its layer from a double
-  // rAF, so an overlay dismissed while that is in flight would otherwise have the layer re-set
-  // underneath it — and the next time it opened it would collect against a chain whose group is
-  // long collapsed, yielding an ACTIVE overlay with no badges at all, whose first Escape gets
-  // swallowed unwinding the phantom layer instead of dismissing.
-  it("a dismissal mid-flight is not undone by the chain's deferred commit", async () => {
-    render(
-      <>
-        <Paperclip onScreenshot={() => {}} />
-        <button data-hint="build" onClick={() => {}}>Build</button>
-        <HintOverlay />
-      </>,
-    );
-    controlTap();
-    fireEvent.keyDown(window, { key: "k" });
-    controlTap(); // dismiss before the rAFs resolve
-    // Let the in-flight callback run.
-    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(null))));
-
-    controlTap(); // reopen
-    // The ordinary layer, not a phantom chain that would show nothing.
+    // All three at once. Under the old scoping rule the two attach ids were FILTERED OUT of the
+    // chrome bucket, so this same render showed "b" alone.
     expect(screen.getByText("b")).toBeTruthy();
     expect(screen.getByText("k")).toBeTruthy();
+    expect(screen.getByText("f")).toBeTruthy();
   });
 
-  it("Escape leaves the chain and brings the rest of the badges back", async () => {
+  it("fires one on its key and dismisses, with no sub-layer left behind", async () => {
+    const onScreenshot = vi.fn();
     render(
       <>
-        <Paperclip onScreenshot={() => {}} />
         <button data-hint="build" onClick={() => {}}>Build</button>
+        <button data-hint="attach-screenshot" onClick={onScreenshot}>Screenshot</button>
         <HintOverlay />
       </>,
     );
     controlTap();
     fireEvent.keyDown(window, { key: "k" });
-    await waitFor(() => expect(screen.getByText("u")).toBeTruthy());
-    expect(screen.queryByText("b")).toBeNull();
-
-    fireEvent.keyDown(window, { key: "Escape" });
-    expect(screen.getByText("b")).toBeTruthy(); // ordinary layer, still open
-    expect(screen.queryByText("u")).toBeNull();
+    await waitFor(() => expect(onScreenshot).toHaveBeenCalledTimes(1));
+    // A leaf closes the overlay outright. The chain kept it open and re-collected instead.
+    await waitFor(() => expect(screen.queryByText("b")).toBeNull());
   });
 });

@@ -147,11 +147,10 @@ function feed(): ConciergeFeed {
 
 const mount = () => render(<ConciergeHost feed={feed()} promptTarget={target} />);
 
-/** Stage a file through the compose box's attach affordance. The paperclip rests collapsed, so the
- *  two actions have to be REVEALED before either can be clicked — hover here (focus is the other
- *  path; ComposeBox.test.tsx owns both). */
+/** Stage a file through the compose box's attach affordance. Both buttons are permanently visible
+ *  (bead sparkle-f8bjx), so there is nothing to reveal first — this used to need a hover on the
+ *  paperclip before either action existed. ComposeBox.test.tsx owns that control's own behaviour. */
 async function attachViaUpload() {
-  fireEvent.mouseEnter(screen.getByTestId("concierge-attach"));
   await act(async () => {
     fireEvent.click(screen.getByRole("button", { name: "Upload" }));
     await Promise.resolve();
@@ -233,18 +232,16 @@ describe("ConciergeHost — attach pickers", () => {
     ).toBeTruthy();
   });
 
-  // Both of the paperclip's actions, each on its own kind. They are revealed by hover here; the
-  // reveal itself (and its keyboard equivalence) is ComposeBox.test.tsx's — this row is only about
-  // the host running the right picker for the action that was chosen.
-  it("each revealed action runs its own picker kind", async () => {
+  // Both attach actions, each on its own kind. Neither needs revealing — they are permanently
+  // visible buttons (bead sparkle-f8bjx), and the control's own behaviour is ComposeBox.test.tsx's.
+  // This row is only about the host running the right picker for the action that was chosen.
+  it("each action runs its own picker kind", async () => {
     mount();
     h.pick.mockResolvedValue({ attachments: [], failed: [] });
-    fireEvent.mouseEnter(screen.getByTestId("concierge-attach"));
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Screenshot" }));
       await Promise.resolve();
     });
-    fireEvent.mouseEnter(screen.getByTestId("concierge-attach"));
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Upload" }));
       await Promise.resolve();
