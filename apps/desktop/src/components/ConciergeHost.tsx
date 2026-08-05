@@ -3097,7 +3097,7 @@ export function ConciergeHost({
       setChat((prev) =>
         prev.map((m) =>
           m.kind === "you" && m.id === orphan && m.receipt
-            ? { ...m, receipt: { ...m.receipt, unanswered: true, redirectable: false } }
+            ? { ...m, receipt: { ...m.receipt, refused: true } }
             : m,
         ),
       );
@@ -3122,10 +3122,16 @@ export function ConciergeHost({
     if (!outcome.dispatch) neverSentRef.current.add(queued.bubbleId);
     if (outcome.dropped) {
       const lost = outcome.dropped;
-      // FINDING 3 (roborev 58223-M3): the evicted bubble stays in the thread, and once it is out of
-      // the queue nothing marks it — so the next reply's anchor walk would claim it and stamp
-      // "Answered below" on a question that was never sent. It gets the same treatment `askSparkle`
-      // already gives an orphaned bubble.
+      // ══ A MARK THAT ACTUALLY RENDERS (roborev 58517-M2) ═════════════════════════════════════════
+      // This used to stamp `unanswered`, and that was a comment asserting a rendering that does not
+      // exist: `receiptText` deliberately does NOT read that flag (it was withdrawn on 2026-07-31
+      // because "never answered" is unknowable), and nothing in `conciergeMessageStatuses` reads it
+      // either. So the bubble was RECORDED as lost and still rendered exactly like a delivered one —
+      // the defect was written down rather than fixed.
+      //
+      // `refused` IS read, and renders "→ Not sent". It is also the honest claim here in a way
+      // `unanswered` never was: "never left this app" is OBSERVABLE at this moment, whereas "never
+      // answered" is a prediction about a reply that may still arrive.
       neverSentRef.current.add(lost.bubbleId);
       setChat((prev) =>
         prev.map((m) =>
@@ -3250,19 +3256,51 @@ export function ConciergeHost({
         // threw".
         const sticky = err instanceof ConciergeAiDisabledError;
         if (!sticky) {
+          // ══ A TRANSIENT REJECTION STILL LOSES ITS MESSAGE — SAY SO (roborev 58517-M1) ═══════════
+          // This branch drains so the rest of the queue survives, but the entry it was dispatching
+          // is gone: `dispatchTurn` already removed it from `neverSentRef`, so without restoring
+          // that the NEXT waiter's reply would claim it — `pendingAnchors` walks back to the last
+          // settled reply and `reachedTheBrain` passes any sparkle-targeted receipt. The result was
+          // "Answered below" under a question the brain never received, with no notice anywhere
+          // that it was lost: the exact over-claim and silent-loss this file removed twice already,
+          // reintroduced by the branch added to satisfy them.
+          //
+          // Today `startConciergeTurn` only ever rejects with the typed error — everything else is
+          // caught and routed through `dispatchLocalError` — so this is the DEFENSIVE branch. It is
+          // also the branch that exists precisely for a future transient rejection, which is when
+          // an unguarded version would start losing questions quietly.
+          neverSentRef.current.add(entry.bubbleId);
+          setChat((prev) =>
+            prev.map((m) =>
+              m.kind === "you" && m.id === entry.bubbleId && m.receipt
+                ? { ...m, receipt: { ...m.receipt, refused: true } }
+                : m,
+            ),
+          );
+          setChat((prev) => [
+            ...prev,
+            {
+              id: nextId("err"),
+              kind: "failure",
+              headline: "That message didn't get sent",
+              evidence: [String(err), "", entry.text].join("\n"),
+            },
+          ]);
           drainQueueRef.current();
           return;
         }
         const stranded = [entry, ...turnQueueRef.current.waiting];
         for (const q of stranded) neverSentRef.current.add(q.bubbleId);
-        // EACH STRANDED BUBBLE IS MARKED (roborev 58241-M4). `clearQueue` erases their "Waiting its
-        // turn" line, so without this they render identically to a delivered message and the only
-        // trace is one failure bubble that scrolls away. Same stamp the evicted message gets.
+        // EACH STRANDED BUBBLE IS MARKED (roborev 58241-M4, corrected by 58517-M2). `clearQueue`
+        // erases their "Waiting its turn" line, so without a mark they render identically to a
+        // delivered message and the only trace is one failure bubble that scrolls away. `refused`
+        // rather than `unanswered`, because only `refused` is rendered — see the evicted-message
+        // stamp above for the full reasoning.
         const strandedIds = new Set(stranded.map((q) => q.bubbleId));
         setChat((prev) =>
           prev.map((m) =>
             m.kind === "you" && strandedIds.has(m.id) && m.receipt
-              ? { ...m, receipt: { ...m.receipt, unanswered: true, redirectable: false } }
+              ? { ...m, receipt: { ...m.receipt, refused: true } }
               : m,
           ),
         );

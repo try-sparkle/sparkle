@@ -112,7 +112,17 @@ vi.mock("../services/concierge", async (importOriginal) => ({
   // degrade — vitest throws on the missing property and every case in the file dies at mount.
   // The typed sticky rejection the dispatch handler branches on — a real class, not a stub, so
   // `instanceof` in the host actually discriminates.
-  ConciergeAiDisabledError: class ConciergeAiDisabledError extends Error {},
+  // FAITHFUL TO PRODUCTION (roborev 58517-M3). This was `class extends Error {}` with no
+  // constructor, so `String(err)` was just "Error" — which made the claim that the notice carries
+  // the machine's own sentence untestable, AND made the headline assertion pass only because the
+  // stub diverged: with the real message, a bare /AI enhancements are off/ matches the headline and
+  // the evidence block both, and the query throws on multiple matches.
+  ConciergeAiDisabledError: class ConciergeAiDisabledError extends Error {
+    constructor() {
+      super("AI enhancements are off, so the concierge can't think or act.");
+      this.name = "ConciergeAiDisabledError";
+    }
+  },
   onConciergeTool: (cb: (e: { id: string; name: string; input: string }) => void) => {
     h.brain.tool = cb;
     return () => {};
@@ -860,14 +870,20 @@ describe("ConciergeHost", () => {
 
     // EXACTLY ONE further dispatch — the one that rejected. No cascade through the rest.
     expect(h.startConciergeTurn.mock.calls.length).toBe(before + 1);
-    // One notice, naming the toggle rather than telling the user to retry a sticky condition…
-    expect(
-      await within(thread()).findByText(/AI enhancements are off/),
-    ).toBeTruthy();
-    // …carrying every stranded question so each can be re-sent.
+    // One notice, naming the toggle rather than telling the user to retry a sticky condition.
+    // Matched on a fragment UNIQUE TO THE HEADLINE: the error's own sentence also begins "AI
+    // enhancements are off", so a bare substring matches the evidence block too and throws.
+    expect(await within(thread()).findByText(/turn them back on to send these/)).toBeTruthy();
     const evidence = within(thread()).getByTestId(FAILURE_EVIDENCE_TESTID).textContent ?? "";
+    // The MACHINE'S OWN SENTENCE — the commit claimed evidence carries it, and with the previous
+    // unfaithful stub that claim could not fail.
+    expect(evidence).toContain("so the concierge can't think or act");
+    // …and every stranded question, so each can be re-sent.
     expect(evidence).toContain("second");
     expect(evidence).toContain("third");
+    // EACH STRANDED BUBBLE CARRIES A MARK THAT RENDERS. `unanswered` is never rendered, so the
+    // earlier stamp recorded the loss without showing it; `refused` renders "Not sent".
+    expect(within(thread()).getAllByText(/Not sent/).length).toBeGreaterThan(0);
   });
 
   /**
@@ -898,8 +914,31 @@ describe("ConciergeHost", () => {
 
     // "third" still got its turn — the queue survived the blip that killed "second".
     expect(String(h.startConciergeTurn.mock.calls.at(-1)?.[0])).toContain("third");
-    // And no sticky notice was posted.
-    expect(within(thread()).queryByText(/AI enhancements are off/)).toBeNull();
+    // And no sticky notice was posted — this failure is not the toggle.
+    expect(within(thread()).queryByText(/turn them back on to send these/)).toBeNull();
+
+    // ══ AND "second" IS NOT LOST SILENTLY (roborev 58517-M1) ═══════════════════════════════════
+    // The earlier version of this case asserted ONLY that "third" ran, never what became of the
+    // message the rejection consumed — which is how a branch that destroyed it quietly, and let the
+    // next reply claim it, passed review-by-test.
+    expect(await within(thread()).findByText(/That message didn't get sent/)).toBeTruthy();
+    const lost = within(thread()).getAllByTestId(FAILURE_EVIDENCE_TESTID).at(-1)?.textContent ?? "";
+    expect(lost).toContain("second");
+
+    // …and its own bubble is MARKED, which is what stops a later reply claiming it: the mark and
+    // the `neverSentRef` re-entry are set together, so this is the observable proxy for both.
+    //
+    // Asserted on the bubble rather than on a downstream anchor: a reply delivered under a retired
+    // turn id is rejected before any bubble is created, so an anchor assertion there passes whether
+    // or not the message was protected — it proves nothing. (Verified by mutation: removing the
+    // stamp and the ref re-entry left that anchor check green.)
+    const secondBubble = within(thread())
+      .getAllByTestId("you-bubble")
+      .find((b) => b.textContent?.includes("second"))!;
+    expect(secondBubble).toBeTruthy();
+    expect(
+      secondBubble.closest("[data-message-id]")!.textContent,
+    ).toMatch(/Not sent/);
   });
 
   // Each refused path gets its OWN remedy, and the remedies genuinely differ: Retry for a pane that
