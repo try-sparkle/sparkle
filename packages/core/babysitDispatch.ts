@@ -30,6 +30,32 @@
 // deliberately NOT a `BabysitEvidenceKind`, and adding one would re-introduce dispatch-on-schedule
 // wearing an event's clothes.
 //
+// THE TEST THAT ADMITTED `commits-pushed-since-last-review` AND STILL EXCLUDES `pr-opened`. The two
+// look alike — both are "something happened to this PR" — and they are not the same kind of thing:
+//
+//   * `pr-opened` is an EVENT. True exactly once, for every PR, regardless of that PR's state, and
+//     it can never become false again. Evidence built on it fires for every PR ever opened: a
+//     schedule keyed on creation instead of on the clock. Nothing the PR does can clear it.
+//   * `commits-pushed-since-last-review` is a STANDING FACT, re-derived from the PR on every sweep —
+//     the head sha against the head the newest knightwatch review says it read. It is FALSE for a
+//     healthy PR (the common case is a review that covers the head), becomes true when someone
+//     pushes, and goes false again when a review catches up. It is a condition the PR is IN, exactly
+//     like `checks-failing`, not a thing that happened to it once.
+//
+// The distinction is not "event vs fact" as a word game; it is whether the evidence can CLEAR. A
+// kind that cannot clear is a schedule wearing an event's clothes. This one clears by itself.
+//
+// ── WHY IT HAD TO EXIST: THE GATE WAS SATISFIABLE AND THEN SILENTLY INVALIDATED ──────────────────
+// knightwatch GATES the merge (`probe-gate.sh` really does exit 10), but it TRIGGERS on PR-open and
+// takes 20-40 minutes to run. The steady state that produces: answer the probes, gate clears, push
+// four more commits, merge code no reviewer has ever read. Observed on #1273 — knightwatch reviewed
+// `9c65efe` while HEAD moved to `4d3030a`, and never saw the last four commits, one of them a
+// High-severity credential-leak fix. Running knightwatch MORE OFTEN does not fix it: it is already
+// automatic on PR-open, and it is stale BY CONSTRUCTION the moment the head moves under it.
+// `babysit-pr` already knows how to notice (its Step 3.5 coverage table, which the Rust
+// `reviewed_head`/`review_stale` parse mirrors) — but only once it is RUNNING, and nothing was ever
+// starting it for this. That gap is what this kind closes.
+//
 // ── RULE 2 · EVIDENCE IS PROBES, NOT COMMENTS ────────────────────────────────────────────────────
 // LOAD-BEARING, NOT TIDY. knightwatch's `⏸ knightwatch paused` status post re-posts roughly every
 // two minutes for as long as an outage lasts, and it carries the review marker while listing ZERO
@@ -142,6 +168,25 @@ export interface BabysitProbeGate {
    * `no-evidence` while doing it.
    */
   overridden: boolean;
+  /**
+   * WHICH HEAD the newest knightwatch review says it evaluated, as the bot printed it — abbreviated,
+   * typically 7 chars. Mirrors Rust `ProbeGate::reviewed_head`.
+   *
+   * `undefined` is UNKNOWN and MUST NOT be read as "covered": no review, a lifecycle status post, and
+   * a status form the parser does not recognise all produce it. Compare by PREFIX against the 40-char
+   * `headSha`, never with `===` — matching the short form against the start of the long one, and
+   * never the reverse.
+   */
+  reviewedHead?: string;
+  /**
+   * Does that review self-label `⚠️ Stale: head moved from X to Y mid-run`?
+   *
+   * AUTHORITATIVE not-covered, and better than our own sha arithmetic — the bot knows what it
+   * actually diffed. Its own field rather than a third state of `reviewedHead` because it CO-OCCURS
+   * with a named head rather than replacing one: a review can both say what it read and say that the
+   * head has already moved past it.
+   */
+  reviewStale?: boolean;
 }
 
 /** Where the PR itself stands. A read that FAILED has no snapshot, so `unknown` is its own state. */
@@ -169,6 +214,12 @@ export interface BabysitPrSnapshot {
   mergeStateStatus?: string;
   /** `undefined` = not looked. See [`BabysitCheckRollup`]. */
   checks?: BabysitCheckRollup;
+  /**
+   * The PR's current head oid, full 40 chars (`headRefOid`). `undefined` = NOT LOOKED, and like
+   * every other unknown here it manufactures no evidence — without it there is no stable identity to
+   * compare across sweeps, and rule 3 would have nothing to hold on to.
+   */
+  headSha?: string;
   gate: BabysitProbeGate;
 }
 
@@ -204,6 +255,11 @@ export type BabysitEvidenceKind =
   | "unanswered-blocking-probe"
   /** An unanswered `[open]` probe. Never blocks a merge; still owed an answer. */
   | "unanswered-open-probe"
+  /**
+   * The head has moved past what the newest knightwatch review read, so the current code is
+   * UNREVIEWED. See the header for why this is a standing fact and `pr-opened` is not.
+   */
+  | "commits-pushed-since-last-review"
   /** The check rollup is failing. */
   | "checks-failing"
   /** The read succeeded and this PR has NO checks at all — CI never ran for it. */
@@ -266,6 +322,44 @@ export function babysitEvidenceFor(pr: BabysitPrSnapshot): BabysitEvidence[] {
     }
   }
 
+  // IS THE CURRENT HEAD REVIEWED? Independent of the probe list above: a review with ZERO probes is
+  // the healthy outcome and says nothing about whether it read THIS code.
+  //
+  // Every guard here fails CLOSED — the module's standing rule that an unknown never manufactures
+  // evidence, applied three times over:
+  //
+  //   * `applicable: false` — no knightwatch on this PR at all. Every non-Sparkle project is here,
+  //     and emitting would dispatch a driver on every one of their PRs forever.
+  //   * `headSha` unknown — we did not look, so there is no stable id to carry across sweeps.
+  //   * `reviewedHead` unknown AND not self-labelled stale — a lifecycle status post or a status form
+  //     the parser does not recognise. "We could not tell what it read" is not "it read nothing".
+  //
+  // The overridden flag is deliberately NOT consulted. A human waiving PROBES has said nothing about
+  // whether the code is reviewed, and the existing `overridden` doc makes exactly this point about
+  // checks and merge state: it suppresses probe evidence and nothing else.
+  if (pr.gate.applicable && pr.headSha !== undefined) {
+    const reviewedHead = pr.gate.reviewedHead;
+    // PREFIX, never equality — the bot prints 7 chars and `headSha` is the full 40. Short against the
+    // start of long, never the reverse.
+    const uncovered =
+      pr.gate.reviewStale === true ||
+      (reviewedHead !== undefined && reviewedHead.length > 0 && !pr.headSha.startsWith(reviewedHead));
+    if (uncovered) {
+      out.push({
+        kind: "commits-pushed-since-last-review",
+        // KEYED ON THE HEAD, which is what makes rule 3 debounce a push instead of fighting it. While
+        // someone is actively pushing, the id changes every sweep and never clears the two-observation
+        // gate — so a driver starts once the branch SETTLES, not on the first commit of a burst. A
+        // count of commits would have been the wrong identity for the reason rule 3 names outright:
+        // it drifts, so a persisting condition would look new forever and could never qualify.
+        id: `unreviewed-head:${pr.headSha}`,
+        detail: pr.gate.reviewStale
+          ? `knightwatch self-labelled its newest review stale — head ${pr.headSha.slice(0, 7)} is unreviewed.`
+          : `The newest knightwatch review read ${reviewedHead}; head is now ${pr.headSha.slice(0, 7)} and unreviewed.`,
+      });
+    }
+  }
+
   const conflicting = pr.mergeStateStatus?.toLowerCase() === "dirty";
   if (conflicting) {
     out.push({
@@ -300,12 +394,16 @@ export function babysitEvidenceFor(pr: BabysitPrSnapshot): BabysitEvidence[] {
   return out;
 }
 
+// Review-coverage facts group together at the top — an unanswered probe, then an unanswered probe of
+// lesser severity, then "nobody has read this code at all" — ahead of the CI and merge conditions.
+// The relative order of the original five is unchanged.
 const EVIDENCE_RANK: Record<BabysitEvidenceKind, number> = {
   "unanswered-blocking-probe": 0,
   "unanswered-open-probe": 1,
-  "merge-conflicting": 2,
-  "checks-failing": 3,
-  "checks-absent": 4,
+  "commits-pushed-since-last-review": 2,
+  "merge-conflicting": 3,
+  "checks-failing": 4,
+  "checks-absent": 5,
 };
 
 function rankOf(kind: BabysitEvidenceKind): number {

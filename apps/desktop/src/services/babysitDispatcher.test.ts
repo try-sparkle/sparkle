@@ -660,6 +660,77 @@ describe("sweepAllProjects — the dispatch clock reaches the sweep", () => {
   });
 });
 
+// END-TO-END for the trigger that re-arms the gate: the sweep must turn a PR whose head has outrun
+// knightwatch into a real dispatch, and must NOT invent one from a head it could not read.
+describe("commits pushed since the last review — through the whole sweep", () => {
+  const HEAD = `4d3030a${"1".repeat(33)}`;
+
+  /** A green, probe-free PR at `HEAD` — nothing to dispatch on EXCEPT review coverage. */
+  function greenPr(headRefOid: string | undefined = HEAD) {
+    return { ...prWithProbe(1273), headRefOid };
+  }
+
+  /** A gate with no probes at all, whose newest review read `reviewedHead`. */
+  function coverage(reviewedHead: string | undefined, reviewStale = false) {
+    return { applicable: true, probes: [], error: null, overridden: false, reviewedHead, reviewStale };
+  }
+
+  it("dispatches when the head has moved past what the newest review read", async () => {
+    fetchOpenPrsMock.mockResolvedValue([greenPr()]);
+    // knightwatch read 9c65efe; the head is now 4d3030a. #1273, exactly.
+    wireInvoke({ leases: [], gate: coverage("9c65efe") });
+
+    const out = await sweepTwice();
+
+    expect(out.dispatched).toEqual([{ repo: "drodio/sparkle", pr: 1273, agentId: "agent-1" }]);
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("does NOT dispatch when the review covers the head — the healthy steady state", async () => {
+    fetchOpenPrsMock.mockResolvedValue([greenPr()]);
+    wireInvoke({ leases: [], gate: coverage(HEAD.slice(0, 7)) });
+
+    const out = await sweepTwice();
+
+    expect(out.dispatched).toHaveLength(0);
+    expect(out.holds["no-evidence"]).toBe(1);
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  it("dispatches on the ⚠️ Stale self-label even though the sha matches", async () => {
+    fetchOpenPrsMock.mockResolvedValue([greenPr()]);
+    wireInvoke({ leases: [], gate: coverage(HEAD.slice(0, 7), true) });
+
+    expect((await sweepTwice()).dispatched).toHaveLength(1);
+  });
+
+  it("an EMPTY headRefOid never manufactures a dispatch", async () => {
+    // The Rust decoder fills this field with `str_field`, so an absent oid arrives as "" rather than
+    // as absent. Passed through unmapped it would clear the core's `headSha !== undefined` guard and
+    // then fail every prefix test — inventing "unreviewed" for a PR whose head we could not read.
+    fetchOpenPrsMock.mockResolvedValue([greenPr("")]);
+    wireInvoke({ leases: [], gate: coverage("9c65efe") });
+
+    const out = await sweepTwice();
+
+    expect(out.dispatched).toHaveLength(0);
+    expect(out.holds["no-evidence"]).toBe(1);
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  it("a lifecycle repost that names no head never manufactures a dispatch", async () => {
+    // The repost storm: `⏸ knightwatch paused` carries the marker, names no sha, reposts every ~2
+    // minutes. Coverage UNKNOWN must stay a hold, however many sweeps see it.
+    fetchOpenPrsMock.mockResolvedValue([greenPr()]);
+    wireInvoke({ leases: [], gate: coverage(undefined) });
+
+    for (let i = 0; i < 6; i += 1) {
+      await babysitSweepProject(PROJECT, T0 + i * 60_000, CONFIG);
+    }
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+});
+
 // ── THE KILL SWITCH (bead sparkle-4cd0x follow-up) ──────────────────────────────────────────────
 //
 // `resolveBabysitConfig({}).enabled` is true, and `startBabysitDispatcher` used to be called with no

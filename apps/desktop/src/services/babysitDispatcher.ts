@@ -405,6 +405,13 @@ export async function babysitSweepProject(
       state: "open",
       mergeStateStatus: pr.mergeStateStatus,
       checks: checkRollupOf(pr),
+      // `|| undefined` IS THE UNKNOWN MAPPING, not a tidy-up. The Rust decoder fills `headRefOid`
+      // with `str_field`, which yields an EMPTY STRING when the field is absent — and an empty head
+      // passed through as-is would satisfy the core's `headSha !== undefined` guard and then fail
+      // every prefix test, manufacturing `commits-pushed-since-last-review` for a PR whose head we
+      // could not read. That is precisely the "an unknown never becomes evidence" rule the core
+      // states, defeated at the boundary rather than in the decision.
+      headSha: pr.headRefOid || undefined,
       gate,
     };
     const k = key(repo, pr.number);

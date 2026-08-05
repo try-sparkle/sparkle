@@ -163,18 +163,48 @@ pub struct ProbeGate {
     /// telling the user to do the thing they had just done. Bounded to records newer than the newest
     /// review so one override cannot silence a PR forever: a new review re-arms the gate.
     pub overridden: bool,
+    /// WHICH HEAD the newest review actually evaluated, as knightwatch printed it (it abbreviates,
+    /// typically 7 chars — compare by PREFIX against a 40-char oid, never with `==`).
+    ///
+    /// `None` is UNKNOWN and must never be read as "covered": a PR with no review, a lifecycle
+    /// status post, and a status form this parser does not recognise all yield it. The consumer's
+    /// fail-closed direction is the OPPOSITE of the merge gate's — an unknown here suppresses a
+    /// DISPATCH rather than blocking a merge — so a `None` read as "covered" would silently stop a
+    /// PR being re-reviewed, which is the bug this field exists to fix.
+    pub reviewed_head: Option<String>,
+    /// Does the newest review self-label `⚠️ Stale: head moved from X to Y mid-run`?
+    ///
+    /// AUTHORITATIVE not-covered, and strictly better than our own SHA arithmetic: the bot knows
+    /// what it actually diffed. `SKILL.md` Step 3.5 calls it "the single most useful field on the
+    /// whole comment". It co-occurs WITH a recognised form rather than replacing one, so it is its
+    /// own field and not a third state of [`Self::reviewed_head`].
+    pub review_stale: bool,
 }
 
 impl ProbeGate {
     /// The read succeeded and this PR has no knightwatch comments. NOT "clean" — the gate does not
     /// apply at all, which is the state every non-Sparkle project is in.
     fn not_applicable() -> Self {
-        Self { applicable: false, probes: Some(Vec::new()), error: None, overridden: false }
+        Self {
+            applicable: false,
+            probes: Some(Vec::new()),
+            error: None,
+            overridden: false,
+            reviewed_head: None,
+            review_stale: false,
+        }
     }
 
     /// We could not read the PR's comments. Blocks; overridable.
     fn unknown(error: String) -> Self {
-        Self { applicable: true, probes: None, error: Some(error), overridden: false }
+        Self {
+            applicable: true,
+            probes: None,
+            error: Some(error),
+            overridden: false,
+            reviewed_head: None,
+            review_stale: false,
+        }
     }
 
     /// Unanswered probes of one severity, in the order the reviews raised them.
@@ -217,6 +247,96 @@ struct RawComment {
     body: Option<String>,
     #[serde(default)]
     html_url: Option<String>,
+}
+
+// ── THE COVERAGE STATUS LINE ─────────────────────────────────────────────────────────────────────
+// Every knightwatch review opens with a blockquoted status naming the head it evaluated. Parsing it
+// is what lets a consumer tell "reviewed" from "reviewed something else"; the merge gate never
+// needed to know, but a DISPATCHER does — a PR whose probes were all answered can then take four
+// more commits that no review has ever seen (observed on #1273: reviewed `9c65efe`, head `4d3030a`).
+//
+// THE GRAMMAR IS NOT INVENTED HERE. `.claude/skills/babysit-pr/SKILL.md` Step 3.5 specifies it and
+// has run against it live on #1104 and #1105; this is that table, in code. Keep the two in step.
+//
+// THE THIRD FORM IS NOT A VARIANT OF THE SECOND. When a rebase or force-push makes a clean
+// incremental impossible, knightwatch evaluates the whole PR and names ONE sha instead of a
+// from→to pair. SKILL.md records that omitting that row once turned the babysit loop into an
+// infinite one: the parse fell through to "cannot tell", which is fail-closed, and a fail-closed
+// default over an INCOMPLETE table never terminates. All three forms, or none of them.
+const FIRST_REVIEW: &str = "First review of this PR";
+const RE_REVIEW_CHANGES: &str = "Re-review of changes from";
+const RE_REVIEW_AT: &str = "Re-review at";
+const STALE_LABEL: &str = "Stale: head moved from";
+
+/// The first backticked token after `marker`, when it looks like a SHA. `marker: ""` takes the
+/// first token in `s`.
+///
+/// TOKENS, NEVER "the first sha-shaped thing in the line" — the line is FULL of decoys. Form 2
+/// carries the from-sha, the to-sha AND both again inside `git diff X..Y`; the stale suffix adds two
+/// more. Anchoring each read to the phrase that precedes the one we want is the whole difference
+/// between reading the head that was reviewed and reading the head it was reviewed AGAINST.
+fn backticked_after(s: &str, marker: &str) -> Option<String> {
+    let at = s.find(marker)? + marker.len();
+    let rest = &s[at..];
+    let open = rest.find('`')? + 1;
+    let close = rest[open..].find('`')?;
+    let token = &rest[open..open + close];
+    let sha_like = (7..=40).contains(&token.len()) && token.chars().all(|c| c.is_ascii_hexdigit());
+    sha_like.then(|| token.to_string())
+}
+
+/// The content of a FIRST-LEVEL blockquote line (`> …`), or `None` for anything else — including a
+/// NESTED one (`> > …`).
+///
+/// THE NESTING IS THE WHOLE POINT, and it is what stops a quote-reply being read as a review.
+/// GitHub's "Quote reply" reproduces the quoted comment's raw markdown, HTML comments included —
+/// the same fact the override-record filter above is anchored against — so quoting a knightwatch
+/// review produces a comment that `is_knightwatch` accepts (the marker is genuinely in it) and whose
+/// body carries the original status line, now at depth TWO.
+///
+/// Left unfiltered that is not a cosmetic mis-parse, it is a COST bug with no self-limit: the quote
+/// is the newest marker-carrying comment, so its quoted `⚠️ Stale` banner or superseded sha becomes
+/// the coverage record, `commits-pushed-since-last-review` goes permanently true, and the dispatcher
+/// spends a full Claude session on that PR every cooldown window forever. Depth-1-only makes the
+/// quote state NO coverage, so `evaluate` skips past it to the real review underneath.
+///
+/// `is_knightwatch` is deliberately NOT touched: it is the frozen shared contract that the fixture
+/// corpus and a second shell implementation both assert against.
+fn first_level_quote(line: &str) -> Option<&str> {
+    let rest = line.trim_start().strip_prefix('>')?;
+    let rest = rest.strip_prefix(' ').unwrap_or(rest);
+    (!rest.trim_start().starts_with('>')).then_some(rest)
+}
+
+/// `(the head this review evaluated, does it self-label ⚠️ Stale)`.
+///
+/// Read ONLY from first-level blockquoted lines, which is where the status lives. A probe's own text
+/// can quote anything — including a previous review — and a status parsed out of a finding, or out
+/// of a quoted copy of an older review, would name a sha nobody reviewed.
+fn parse_review_coverage(body: &str) -> (Option<String>, bool) {
+    let quoted: Vec<&str> = body.lines().filter_map(first_level_quote).collect();
+
+    // Detected INDEPENDENTLY of the form. The self-label is authoritative not-covered, so it must
+    // survive a status shape this parser does not recognise — otherwise the one field SKILL.md calls
+    // "the single most useful field on the whole comment" is lost to an unrelated wording change.
+    let stale = quoted.iter().any(|l| l.contains(STALE_LABEL));
+
+    let head = quoted.iter().find_map(|line| {
+        if let Some(i) = line.find(RE_REVIEW_CHANGES) {
+            // The `to` sha. Reading the `from` here would report the head as covered exactly when a
+            // re-review proves it is not.
+            return backticked_after(&line[i + RE_REVIEW_CHANGES.len()..], " to ");
+        }
+        if let Some(i) = line.find(RE_REVIEW_AT) {
+            return backticked_after(&line[i + RE_REVIEW_AT.len()..], "");
+        }
+        if let Some(i) = line.find(FIRST_REVIEW) {
+            return backticked_after(&line[i + FIRST_REVIEW.len()..], "reviewed");
+        }
+        None
+    });
+
+    (head, stale)
 }
 
 /// Is this comment a knightwatch review? The marker, and nothing else.
@@ -483,7 +603,26 @@ fn evaluate(comments: &[Comment]) -> ProbeGate {
         comments[last + 1..].iter().any(|c| c.body.trim_start().starts_with(OVERRIDE_MARKER))
     });
 
-    ProbeGate { applicable: true, probes: Some(probes), error: None, overridden }
+    // COVERAGE COMES FROM THE NEWEST REVIEW THAT ACTUALLY STATES IT — not simply the newest
+    // marker-carrying comment. Lifecycle status posts (`⏸ knightwatch paused`) carry the marker and
+    // name no sha, and they re-post every couple of minutes for as long as an outage lasts. Keying
+    // on the last marker would let one of those ERASE a real review's coverage for the whole outage,
+    // reporting "we cannot tell" about a PR we can tell about perfectly well.
+    let (reviewed_head, review_stale) = review_positions
+        .iter()
+        .rev()
+        .map(|&i| parse_review_coverage(&comments[i].body))
+        .find(|(head, stale)| head.is_some() || *stale)
+        .unwrap_or((None, false));
+
+    ProbeGate {
+        applicable: true,
+        probes: Some(probes),
+        error: None,
+        overridden,
+        reviewed_head,
+        review_stale,
+    }
 }
 
 /// The exact `gh api` argv. PURE so the flags are assertable — `--paginate` in particular, without
@@ -1703,5 +1842,212 @@ mod tests {
         // Short text is left exactly alone.
         let (_, _, _, short) = parse_probe_line("1. [blocking] tiny").unwrap();
         assert_eq!(short, "tiny");
+    }
+
+    // ── COVERAGE: WHICH HEAD DID THE NEWEST REVIEW ACTUALLY READ ─────────────────────────────────
+    // Every status below is copied from a real knightwatch post (#1249, #1256, #1251, #1273), so a
+    // wording change upstream fails these rather than silently degrading to "cannot tell".
+
+    /// A review of the head is COVERED — the baseline the other cases are read against.
+    #[test]
+    fn a_first_review_names_the_head_it_read() {
+        let body = format!(
+            "{REVIEW_MARKER}\n> 📋 First review of this PR — reviewed `c977040`. 🧪 Tests not run.\n"
+        );
+        let gate = evaluate(&[comment(1, &body)]);
+        assert_eq!(gate.reviewed_head.as_deref(), Some("c977040"));
+        assert!(!gate.review_stale, "nothing self-labelled it stale");
+    }
+
+    /// Form 2 names a FROM and a TO, and `git diff FROM..TO` repeats both. The head that was
+    /// reviewed is the TO — reading the FROM would report a PR as covered at the exact moment a
+    /// re-review proves it moved.
+    #[test]
+    fn a_re_review_of_changes_names_the_to_sha_not_the_from() {
+        let body = format!(
+            "{REVIEW_MARKER}\n> 📋 Re-review of changes from `c977040` to `9769dc7` \
+             (`git diff c977040..9769dc7`). 🧪 Tests not run.\n"
+        );
+        let gate = evaluate(&[comment(1, &body)]);
+        assert_eq!(gate.reviewed_head.as_deref(), Some("9769dc7"), "the TO sha");
+        assert_ne!(gate.reviewed_head.as_deref(), Some("c977040"), "never the FROM sha");
+    }
+
+    /// Form 3 is a DIFFERENT form, not a variant of form 2: one sha (the head it read) plus the
+    /// sha it could not diff against. SKILL.md records that omitting this row made the babysit loop
+    /// non-terminating, so the assertion is specifically that the head wins over the decoy.
+    #[test]
+    fn a_re_review_at_names_the_head_it_evaluated_not_the_unavailable_base() {
+        let body = format!(
+            "{REVIEW_MARKER}\n> 📋 Re-review at `e129301` — clean incremental unavailable for \
+             `9150dfe` (rebase, force-push, or merge from base branch); evaluated full PR.\n"
+        );
+        let gate = evaluate(&[comment(1, &body)]);
+        assert_eq!(gate.reviewed_head.as_deref(), Some("e129301"), "the head it read");
+        assert_ne!(gate.reviewed_head.as_deref(), Some("9150dfe"), "not the base it could not use");
+    }
+
+    /// The self-label CO-OCCURS with a recognised form — it does not replace one. Both facts must
+    /// survive, which is why they are two fields. This is #1273 verbatim, the PR that produced the
+    /// whole change: reviewed `9c65efe` while the head had already moved to `4d3030a`.
+    #[test]
+    fn the_stale_self_label_survives_alongside_the_reviewed_head() {
+        let body = format!(
+            "{REVIEW_MARKER}\n> 📋 First review of this PR — reviewed `9c65efe`. ⚠️ Stale: head \
+             moved from `9c65efe` to `4d3030a` mid-run — see commands below to re-run.\n"
+        );
+        let gate = evaluate(&[comment(1, &body)]);
+        assert_eq!(gate.reviewed_head.as_deref(), Some("9c65efe"), "still names what it read");
+        assert!(gate.review_stale, "AND reports that the head has already moved past it");
+    }
+
+    /// The label is detected independently of the form, so an unrecognised status still yields the
+    /// one field SKILL.md calls the most useful on the comment.
+    #[test]
+    fn the_stale_self_label_survives_a_status_form_we_cannot_parse() {
+        let body = format!(
+            "{REVIEW_MARKER}\n> 📋 Some future wording nobody has written yet. ⚠️ Stale: head \
+             moved from `aaa1111` to `bbb2222` mid-run.\n"
+        );
+        let gate = evaluate(&[comment(1, &body)]);
+        assert_eq!(gate.reviewed_head, None, "the form is genuinely unknown");
+        assert!(gate.review_stale, "but not-covered is still authoritative");
+    }
+
+    /// An unrecognised status with no self-label is UNKNOWN, never "covered". Fail-closed against a
+    /// dispatch: we report nothing rather than inventing a head.
+    #[test]
+    fn an_unparseable_status_yields_unknown_and_never_a_guess() {
+        let body = format!("{REVIEW_MARKER}\n> 📋 Reviewed the thing. Looks fine.\n");
+        let gate = evaluate(&[comment(1, &body)]);
+        assert_eq!(gate.reviewed_head, None);
+        assert!(!gate.review_stale);
+    }
+
+    /// THE REPOST-STORM CASE. `⏸ knightwatch paused` posts carry the marker, name no sha, and
+    /// re-post every couple of minutes for as long as an outage lasts. Keying coverage on the last
+    /// MARKER-carrying comment would let one erase a real review's coverage for the whole outage.
+    #[test]
+    fn a_lifecycle_status_post_does_not_erase_the_real_review_it_follows() {
+        let review = format!(
+            "{REVIEW_MARKER}\n> 📋 First review of this PR — reviewed `c977040`. 🧪 Tests not run.\n"
+        );
+        let paused = format!("{REVIEW_MARKER}\n> ⏸ knightwatch paused — upstream outage.\n");
+        let gate = evaluate(&[comment(1, &review), comment(2, &paused)]);
+        assert_eq!(
+            gate.reviewed_head.as_deref(),
+            Some("c977040"),
+            "the newest comment that actually STATES coverage wins, not the newest marker"
+        );
+    }
+
+    /// A newer real review supersedes an older one — the whole point of reading the newest.
+    #[test]
+    fn the_newest_real_review_supersedes_the_older_one() {
+        let first = format!("{REVIEW_MARKER}\n> 📋 First review of this PR — reviewed `aaa1111`.\n");
+        let second = format!(
+            "{REVIEW_MARKER}\n> 📋 Re-review of changes from `aaa1111` to `bbb2222` \
+             (`git diff aaa1111..bbb2222`).\n"
+        );
+        let gate = evaluate(&[comment(1, &first), comment(2, &second)]);
+        assert_eq!(gate.reviewed_head.as_deref(), Some("bbb2222"));
+    }
+
+    /// Coverage is read from the BLOCKQUOTED status only. A probe may quote anything — including a
+    /// previous review's status — and a head parsed out of a finding would name a sha nobody read.
+    #[test]
+    fn a_status_shaped_line_inside_a_probe_is_not_coverage() {
+        let body = format!(
+            "{REVIEW_MARKER}\n> 📋 First review of this PR — reviewed `c977040`.\n\n\
+             1. [blocking] [from: a] First review of this PR — reviewed `dead123` is what it said.\n"
+        );
+        let gate = evaluate(&[comment(1, &body)]);
+        assert_eq!(gate.reviewed_head.as_deref(), Some("c977040"), "the status, not the probe");
+        // The decoy really is in the body, so this test cannot pass for lack of anything to find.
+        assert!(body.contains("dead123"));
+    }
+
+    /// Both non-authoritative constructors carry UNKNOWN coverage. `not_applicable` in particular
+    /// must not read as "covered" — every non-Sparkle PR is in that state.
+    #[test]
+    fn the_non_authoritative_gates_carry_no_coverage() {
+        for gate in [ProbeGate::not_applicable(), ProbeGate::unknown("boom".into())] {
+            assert_eq!(gate.reviewed_head, None, "{gate:?}");
+            assert!(!gate.review_stale, "{gate:?}");
+        }
+    }
+
+    /// Against the FROZEN shared corpus, so the parser is pinned to a real bot post and not only to
+    /// strings written in this file.
+    #[test]
+    fn the_shared_corpus_review_reports_the_head_it_named() {
+        assert_eq!(gate_for("real-pr-1176.json").reviewed_head.as_deref(), Some("01c5ed7"));
+    }
+
+    /// A HUMAN QUOTE-REPLY MUST NOT BECOME THE COVERAGE RECORD (roborev 58746, Medium).
+    ///
+    /// GitHub's "Quote reply" reproduces raw markdown, marker included, so the quote IS a review as
+    /// far as the frozen `is_knightwatch` contract is concerned — and it is the NEWEST one. If its
+    /// quoted status were read as coverage, a superseded sha (or worse, a quoted `⚠️ Stale` banner)
+    /// would pin `commits-pushed-since-last-review` true forever and spend a Claude session on that
+    /// PR every cooldown window, permanently. The nesting is what distinguishes them.
+    #[test]
+    fn a_quote_reply_does_not_overwrite_the_real_reviews_coverage() {
+        // The quote must name a DIFFERENT sha from the newest real review, or the test passes
+        // whether or not the guard works — a first draft quoted the newest review and was vacuous
+        // under mutation for exactly that reason. So: a human quotes the OLD round-1 review, after
+        // round 2 has already landed.
+        let round_one =
+            format!("{REVIEW_MARKER}\n> 📋 First review of this PR — reviewed `aaa1111`.\n");
+        let round_two = format!(
+            "{REVIEW_MARKER}\n> 📋 Re-review of changes from `aaa1111` to `bbb2222` \
+             (`git diff aaa1111..bbb2222`).\n"
+        );
+        // Exactly what GitHub's quote-reply produces: EVERY line prefixed with "> ", so the original
+        // marker lands at depth 1 and the original status at depth 2.
+        let quoted_round_one: String =
+            round_one.lines().map(|l| format!("> {l}\n")).collect::<String>()
+                + "\nStill relevant — see above.\n";
+
+        // The premises this rests on. Without them it could pass for lack of anything to find.
+        assert!(is_knightwatch(&quoted_round_one), "a quote-reply really does read as a review");
+        assert!(quoted_round_one.contains("aaa1111"), "and it really does carry the STALE sha");
+
+        let gate = evaluate(&[
+            comment(1, &round_one),
+            comment(2, &round_two),
+            comment(3, &quoted_round_one),
+        ]);
+        assert_eq!(
+            gate.reviewed_head.as_deref(),
+            Some("bbb2222"),
+            "round 2's head survives; the quote of round 1 must not drag coverage backwards"
+        );
+    }
+
+    /// The same defence for the field that would do the most damage: a quoted `⚠️ Stale` banner
+    /// would make the PR permanently uncovered.
+    #[test]
+    fn a_quoted_stale_banner_does_not_mark_the_pr_stale() {
+        let review = format!(
+            "{REVIEW_MARKER}\n> 📋 First review of this PR — reviewed `c977040`. ⚠️ Stale: head \
+             moved from `c977040` to `9769dc7` mid-run.\n"
+        );
+        let quoted: String = review.lines().map(|l| format!("> {l}\n")).collect();
+        // The QUOTE alone, with no real review before it, must state nothing at all.
+        let gate = evaluate(&[comment(1, &quoted)]);
+        assert_eq!(gate.reviewed_head, None, "a quote states no coverage of its own");
+        assert!(!gate.review_stale, "and cannot pin the PR stale forever");
+    }
+
+    /// Depth-1 content is returned; deeper nesting and non-quotes are refused.
+    #[test]
+    fn first_level_quote_accepts_only_depth_one() {
+        assert_eq!(first_level_quote("> 📋 status"), Some("📋 status"));
+        assert_eq!(first_level_quote(">no space"), Some("no space"));
+        assert_eq!(first_level_quote("  > indented"), Some("indented"));
+        assert_eq!(first_level_quote("> > nested"), None);
+        assert_eq!(first_level_quote(">> nested tight"), None);
+        assert_eq!(first_level_quote("plain text"), None);
     }
 }

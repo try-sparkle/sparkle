@@ -575,3 +575,165 @@ describe("every hold reason is reachable", () => {
     );
   });
 });
+
+// THE STRUCTURAL BUG THIS CLOSES: knightwatch GATES the merge but TRIGGERS on PR-open, so the gate
+// is satisfiable and then silently invalidated — answer the probes, gate clears, push more code,
+// merge code nobody reviewed. Every assertion below reads the returned evidence/decision, and the
+// headline test walks the whole steady state rather than asserting a single snapshot.
+describe("evidence — commits pushed since the last review", () => {
+  const HEAD_OLD = `9c65efe${"0".repeat(33)}`;
+  const HEAD_NEW = `4d3030a${"1".repeat(33)}`;
+
+  /** The HEALTHY state: the newest review really did read this head. */
+  function covered(head: string): BabysitPrSnapshot {
+    return snapshot({
+      headSha: head,
+      gate: gate([], { reviewedHead: head.slice(0, 7), reviewStale: false }),
+    });
+  }
+
+  /** The head has moved past what was reviewed. */
+  function uncovered(head: string, reviewed: string): BabysitPrSnapshot {
+    return snapshot({ headSha: head, gate: gate([], { reviewedHead: reviewed }) });
+  }
+
+  it("THE BUG: a push after a CLEARED gate re-triggers a driver", () => {
+    // 1. Settled and healthy — probes answered, checks green, review covers the head.
+    const settled = covered(HEAD_OLD);
+    expect(babysitEvidenceFor(settled)).toEqual([]);
+    expect(holdOf(decide({ pr: settled }))).toBe("no-evidence");
+
+    // 2. Someone pushes. Nothing else about the PR changed; the review now covers a superseded sha.
+    const pushed = uncovered(HEAD_NEW, HEAD_OLD.slice(0, 7));
+    expect(babysitEvidenceFor(pushed).map((e) => e.kind)).toEqual([
+      "commits-pushed-since-last-review",
+    ]);
+
+    // 3. Rule 3 is NOT bypassed. The first sweep that sees it only remembers it — which is also what
+    //    debounces a burst of pushes into one dispatch.
+    const first = decide({
+      pr: pushed,
+      prior: { evidenceIds: babysitEvidenceIds(babysitEvidenceFor(settled)) },
+    });
+    expect(holdOf(first)).toBe("single-observation");
+
+    // 4. The next sweep, head unchanged, DISPATCHES. The gate re-armed itself.
+    const second = decide({
+      pr: pushed,
+      prior: { evidenceIds: babysitEvidenceIds(babysitEvidenceFor(pushed)) },
+    });
+    expect(second.dispatch).toBe(true);
+    if (!second.dispatch) throw new Error("unreachable");
+    expect(second.evidence.map((e) => e.kind)).toEqual(["commits-pushed-since-last-review"]);
+    expect(second.evidence[0]?.detail).toContain("4d3030a");
+  });
+
+  it("a 7-char abbreviation covering the 40-char head is not evidence", () => {
+    expect(babysitEvidenceFor(covered(HEAD_NEW))).toEqual([]);
+  });
+
+  it("the prefix test runs SHORT-against-LONG, never the reverse", () => {
+    // Flipping the operands (`reviewedHead.startsWith(headSha)`) would report this as covered — and
+    // would report almost every genuinely-uncovered PR as covered too. Pins the direction.
+    const pr = snapshot({ headSha: "9c65efe", gate: gate([], { reviewedHead: HEAD_OLD }) });
+    expect(babysitEvidenceFor(pr).map((e) => e.kind)).toEqual([
+      "commits-pushed-since-last-review",
+    ]);
+  });
+
+  it("the stale self-label is evidence even when the status form is unparseable", () => {
+    const pr = snapshot({
+      headSha: HEAD_NEW,
+      gate: gate([], { reviewedHead: undefined, reviewStale: true }),
+    });
+    expect(babysitEvidenceFor(pr).map((e) => e.kind)).toEqual([
+      "commits-pushed-since-last-review",
+    ]);
+  });
+
+  it("the stale self-label outranks our own sha arithmetic", () => {
+    // The bot knows what it actually diffed; believing the shas over its own label is how #1273's
+    // last four commits went unreviewed.
+    const pr = snapshot({
+      headSha: HEAD_OLD,
+      gate: gate([], { reviewedHead: HEAD_OLD.slice(0, 7), reviewStale: true }),
+    });
+    expect(babysitEvidenceFor(pr).map((e) => e.kind)).toEqual([
+      "commits-pushed-since-last-review",
+    ]);
+  });
+
+  it("UNKNOWN coverage manufactures nothing — the repost-storm defence still holds", () => {
+    // `⏸ knightwatch paused` carries the marker, names no sha, and reposts every ~2 minutes. Reading
+    // that as "unreviewed" would spend a full Claude session per repost, during the exact window the
+    // account is already in trouble.
+    const pr = snapshot({
+      headSha: HEAD_NEW,
+      gate: gate([], { reviewedHead: undefined, reviewStale: false }),
+    });
+    expect(babysitEvidenceFor(pr)).toEqual([]);
+  });
+
+  it("a PR with no knightwatch at all yields nothing, however far the head has moved", () => {
+    // As Rust actually builds it: `not_applicable()` carries no coverage, so what stops this is the
+    // UNKNOWN-coverage guard, not the `applicable` one. Pinned separately below for that reason.
+    expect(babysitEvidenceFor(snapshot({ headSha: HEAD_NEW, gate: NOT_APPLICABLE_GATE }))).toEqual([]);
+  });
+
+  it("`applicable: false` suppresses coverage even if the producer sends coverage anyway", () => {
+    // This pair cannot occur today — Rust's `not_applicable()` never emits `reviewedHead` — which is
+    // exactly why the guard needs a test that ISOLATES it. Deleting the `applicable` check leaves the
+    // realistic fixture above still green (it is stopped by the unknown guard), so that test alone
+    // would be vacuous cover: a mutation run proved it passes with the guard removed. `readProbeGate`
+    // CASTS its IPC reply, so a drifted producer reaches this module unchecked — and without this
+    // check every PR in every non-Sparkle project would dispatch a driver, forever.
+    const pr = snapshot({
+      headSha: HEAD_NEW,
+      gate: {
+        applicable: false,
+        probes: [],
+        error: null,
+        overridden: false,
+        reviewedHead: "1111111",
+        reviewStale: true,
+      },
+    });
+    expect(babysitEvidenceFor(pr)).toEqual([]);
+  });
+
+  it("an unread head yields nothing — no identity to carry across sweeps", () => {
+    const pr = snapshot({ headSha: undefined, gate: gate([], { reviewedHead: "9c65efe" }) });
+    expect(babysitEvidenceFor(pr)).toEqual([]);
+  });
+
+  it("the id is keyed on the HEAD, so a moving head never clears rule 3 but a settled one does", () => {
+    const a = babysitEvidenceFor(uncovered(HEAD_OLD, "1111111"))[0];
+    const b = babysitEvidenceFor(uncovered(HEAD_NEW, "1111111"))[0];
+    expect(a?.id).not.toBe(b?.id);
+    // A settled head keeps ONE identity across sweeps, which is what lets the gate ever open.
+    expect(babysitEvidenceFor(uncovered(HEAD_NEW, "1111111"))[0]?.id).toBe(b?.id);
+  });
+
+  it("sorts after the probe kinds and before the CI conditions", () => {
+    const pr = snapshot({
+      headSha: HEAD_NEW,
+      checks: "failing",
+      gate: gate([probe()], { reviewedHead: "1111111" }),
+    });
+    expect(babysitEvidenceFor(pr).map((e) => e.kind)).toEqual([
+      "unanswered-blocking-probe",
+      "commits-pushed-since-last-review",
+      "checks-failing",
+    ]);
+  });
+
+  it("a probe override does not suppress it — waiving probes says nothing about coverage", () => {
+    const pr = snapshot({
+      headSha: HEAD_NEW,
+      gate: gate([probe()], { overridden: true, reviewedHead: "1111111" }),
+    });
+    expect(babysitEvidenceFor(pr).map((e) => e.kind)).toEqual([
+      "commits-pushed-since-last-review",
+    ]);
+  });
+});
