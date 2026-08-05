@@ -521,13 +521,22 @@ describe("isSessionLimitPicker", () => {
   });
 
   it("refuses a BARE `>` approval cursor under a scrolled-up session-limit picker", () => {
-    // ATTRIBUTION CORRECTED (roborev 58548): an earlier version of this comment claimed the real
-    // approval fixture uses a bare `>`. It does not — all four captured 2.1.220 screens render `❯`,
-    // and no fixture contains a bare-`>` cursor. The shape this stands in for is the markdown
-    // BLOCKQUOTE (SELECTION_CURSOR excludes `>` precisely so a quote cannot flip status) and any
-    // build that degrades the glyph. The distinction matters because the false version is the exact
-    // premise that would justify widening SELECTION_CURSOR to accept `>`. The assertion stays: a
-    // cheap guard against a future glyph-keyed ownership rule.
+    // THIS COMMENT HAS BEEN WRONG IN BOTH DIRECTIONS — read the scope carefully.
+    //
+    // Version one claimed the real approval fixture uses a bare `>`; that was the inverse of the
+    // evidence and roborev 58548 was right to kill it. Version two over-corrected to "no fixture
+    // contains a bare-`>` cursor", which is true of `capturedScreens.fixture.ts` and MISLEADING,
+    // because it reads as "no live approval draws `>`". One does, and the counter-evidence is in
+    // THIS FILE: see "flags a command-approval prompt via its footer even when the cursor glyph is
+    // '>'" above — a FOUNDER-REPORTED approval that rendered `>` instead of `❯`, which is exactly
+    // why that prompt is caught by its FOOTER rather than its cursor. The Rust twin was corrected
+    // first; leaving the retracted wording here meant the disowned claim survived in the file that
+    // holds the disproof (roborev 58633).
+    //
+    // So a bare `>` is a real render, which makes this assertion MORE load-bearing, not less. The
+    // REMEDY is unchanged: SELECTION_CURSOR must still refuse `>`, because every markdown
+    // blockquote in scrollback is `> …`. The positive ownership rule needs no glyph at all — a
+    // `> 1. Yes` row is CONTENT, so a footer beneath it is not ours whatever drew the cursor.
     const reset = ["Stop and wait for", "limit to", "reset"].join(" ");
     const credits = ["Switch to", "usage", "credits"].join(" ");
     const team = ["Switch to", "Team", "plan"].join(" ");
