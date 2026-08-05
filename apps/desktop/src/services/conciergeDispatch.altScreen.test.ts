@@ -169,6 +169,64 @@ describe("a busy Claude Code is not a full-screen app", () => {
   });
 });
 
+// ══ A CREDENTIAL PROMPT BLOCKS ON ANY BUFFER (bead sparkle-p9hs5) ═══════════════════════════════
+// PRE-EXISTING hazard, not a regression. Only the alternate-buffer arms ran here, so a NORMAL-buffer
+// screen reached `submitPrompt` with no screen check at all. ConciergeHost has its own pre-check —
+// but `conciergeTools/terminal` (the model-issued send_to_agent_terminal) and the goal auto-resume
+// do NOT, and for them this chokepoint is the only guard there is.
+describe("a credential prompt refuses on the normal buffer too", () => {
+  /** A shell at a sudo prompt: NORMAL buffer, no Claude Code, no picker. */
+  function atASudoPrompt(): void {
+    vi.mocked(getAgentViewport).mockReturnValue({
+      text: "$ sudo -v\n[sudo] password for drodio:",
+      alternateBuffer: false,
+    });
+  }
+
+  it("refuses free text rather than pasting into a field that echoes nothing", async () => {
+    atASudoPrompt();
+    const r = await dispatchConciergeAnswer(AGENT, "continue with the retry work", OPTS);
+    expect(r.ok).toBe(false);
+    expect(r.path).toBe("blocked-prompt");
+    expectNothingWritten();
+  });
+
+  // WHOEVER AUTHORED IT. The goal auto-resume sends "continue" every 15s with no screen guard of its
+  // own, which is precisely the caller this chokepoint has to cover.
+  it("refuses a machine-authored auto-resume at the same prompt", async () => {
+    atASudoPrompt();
+    const r = await dispatchConciergeAnswer(AGENT, "continue", {
+      authority: { kind: "goal-continue", agentId: AGENT },
+    });
+    expect(r.path).toBe("blocked-prompt");
+    expectNothingWritten();
+  });
+
+  // ══ AND A LIVE PICKER IS STILL *ANSWERED*, NOT REFUSED ════════════════════════════════════════
+  // THE ROW THAT CONSTRAINS THE FIX. The obvious implementation — calling `screenBlocksWrite` here —
+  // would refuse every live picker, because that predicate is a SUPERSET of `screenAwaitsInput` and
+  // this guard sits ABOVE the picker branch. This file's own header calls that out as something that
+  // must not be hoisted. So the guard calls `screenIsCredentialPrompt`, the non-picker half, and
+  // this row fails the moment someone "simplifies" it back.
+  it("still answers a live picker instead of refusing it", async () => {
+    // A REAL PICKER SCREEN, not the bare `$ ` fixture with options mocked on top. The first cut of
+    // this row used `atAPrompt()`, and it was VACUOUS: `screenAwaitsInput("$ ")` is false, so the
+    // naive `screenBlocksWrite` implementation this row exists to forbid passed it. The text below
+    // makes `screenAwaitsInput` true, which is the only way the row can see the difference between
+    // the two predicates.
+    vi.mocked(getAgentViewport).mockReturnValue({
+      text: "Do you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel · Tab to amend",
+      alternateBuffer: false,
+    });
+    vi.mocked(detectTerminalPrompts).mockReturnValue([
+      { label: "Yes", value: "y" } as unknown as SuggestionButton,
+    ]);
+    const r = await dispatchConciergeAnswer(AGENT, "yes", OPTS);
+    expect(r.ok).toBe(true);
+    expect(r.path).toBe("picker-option");
+  });
+});
+
 describe("the guard is narrow — it blocks the alternate buffer and nothing else", () => {
   it("delivers free text at an ordinary prompt", async () => {
     atAPrompt();

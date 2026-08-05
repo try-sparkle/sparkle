@@ -107,6 +107,33 @@ function screenTail(snapshot: string, rows = 3): string {
  */
 export function screenBlocksWrite(snapshot: string): boolean {
   if (screenAwaitsInput(snapshot)) return true;
+  return screenIsCredentialPrompt(snapshot);
+}
+
+/**
+ * The NON-PICKER half of {@link screenBlocksWrite}: a credential field, an ssh host-key question, a
+ * `(yes/no)` — the prompts that must never receive free text and that `screenAwaitsInput` does not
+ * catch.
+ *
+ * ══ WHY THIS IS SPLIT OUT (bead sparkle-p9hs5) ══════════════════════════════════════════════════
+ * `services/conciergeDispatch` is the chokepoint every text→PTY path goes through, and two of its
+ * three callers — the model-issued `send_to_agent_terminal` and the goal auto-resume — have NO screen
+ * guard of their own. But it cannot simply call `screenBlocksWrite`, because that is a SUPERSET of
+ * `screenAwaitsInput`, and the chokepoint does not REFUSE a live picker — it ANSWERS one a few lines
+ * further down. Refusing above that block would break picker answering outright, which the
+ * dispatcher's own header calls out as something that must not be hoisted.
+ *
+ * So the hazard the chokepoint needs is exactly this subset: the prompts where free text would be
+ * pasted AND SUBMITTED into a field that frequently ECHOES NOTHING. `screenAwaitsInput` stays behind,
+ * where the picker branch can still do its job.
+ *
+ * Both lists it reads grew four entries apiece from real field misses — `[sudo] password for …`,
+ * `Password for 'https://github.com':`, ssh's `(yes/no/[fingerprint])?`, `Type "yes" to confirm:`,
+ * then `Paste your authentication token:`, `Verification code:`, `Username for …:`. Keeping ONE
+ * implementation shared by both callers is what stops the next one being fixed in only half the
+ * places.
+ */
+export function screenIsCredentialPrompt(snapshot: string): boolean {
   if (WRITE_BLOCKING_PROMPTS.some((re) => re.test(snapshot))) return true;
   // The wrap-tolerant arm: a credential word ANYWHERE in the trailing region, and that region
   // ending in a colon — the shape of a prompt sitting there waiting, however it happened to wrap.

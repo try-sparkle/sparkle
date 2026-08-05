@@ -103,7 +103,7 @@ import { paneState } from "./paneReadiness";
 import { findKnownAgent } from "./knownAgents";
 import { getAgentViewport } from "./terminalViewport";
 import { isClaudeCodeScreen } from "../engine/claudeCodeScreen";
-import { screenBlocksWrite } from "../voice/dictationTerminalRoute";
+import { screenBlocksWrite, screenIsCredentialPrompt } from "../voice/dictationTerminalRoute";
 import { useInteractionStore } from "../stores/interactionStore";
 import { useProjectStore } from "../stores/projectStore";
 import { usePromptHistoryStore } from "../stores/promptHistoryStore";
@@ -523,6 +523,27 @@ export async function dispatchConciergeAnswer(
   // Scoped to the case we relaxed, deliberately: only when Claude Code is why the buffer check was
   // skipped. A normal-buffer screen keeps whatever behaviour it had, so this restores what was taken
   // away without quietly widening the chokepoint's remit.
+  // ══ …AND A CREDENTIAL PROMPT BLOCKS ON ANY BUFFER (bead sparkle-p9hs5) ═════════════════════════
+  // The arm below only fires when Claude Code is why the alternate-screen refusal was skipped, which
+  // left a NORMAL-buffer screen reaching `submitPrompt` with no screen check at all. `ConciergeHost`
+  // has its own pre-check, but the other two callers of this function — the model-issued
+  // `send_to_agent_terminal` and the goal auto-resume — do not, so for them this is the only guard
+  // there is.
+  //
+  // CONCRETE: a pane whose Claude Code has exited, or whose shell is running `sudo -v` / `ssh` /
+  // `gh auth login`, sits on the NORMAL buffer at `[sudo] password for …:`. `liveOptionsFor` is a
+  // PICKER detector and matches nothing there, so the send fell through and was pasted AND SUBMITTED
+  // into a field that echoes nothing.
+  //
+  // `screenIsCredentialPrompt`, NOT `screenBlocksWrite`, and the distinction is the whole reason
+  // that predicate was split out. `screenBlocksWrite` is a SUPERSET of `screenAwaitsInput`, and this
+  // sits ABOVE the picker block — so calling it here would refuse every live picker instead of
+  // ANSWERING it, which this file's own header says must not be hoisted. The non-picker arms are
+  // exactly the hazard that has no other home.
+  if (screen && screenIsCredentialPrompt(screen.text)) {
+    log.warn("concierge", "refused a write into a credential prompt", { agentId });
+    return { ok: false, path: "blocked-prompt", agentId };
+  }
   if (claudeCodeHoldsTheBuffer && screenBlocksWrite(screen.text)) {
     log.warn("concierge", "refused a write into a blocked prompt on a Claude Code screen", {
       agentId,
