@@ -117,25 +117,21 @@ describe("concierge lint registry ↔ config policy", () => {
     }
   });
 
-  it("ships no check at \"block\" while nothing implements blocking", () => {
-    // The severity's EFFECT, not just its implementation (roborev 55981). The assertion above only
-    // asks whether a check with a non-"off" severity has code behind it. `ask-without-action` did —
-    // and shipped `"block"`, which config.rs documents as "re-prompts the concierge once for a
-    // corrected reply", while the mount consumes `LintResult.text` and DISCARDS `blocked`. Nothing
-    // re-prompts, so `"block"` was an unkept promise of exactly the kind the seven `"off"` rows
-    // exist to prevent — and worse, because the check runs, so nothing looks wrong.
-    //
-    // DELETE THIS TEST in the change that implements the re-prompt at the mount. It is scaffolding
-    // for a gap, not a permanent rule: blocking is the design, and this only holds the line until
-    // the behaviour catches up with the vocabulary.
-    const blocking = defaultChecks().filter((r) => r.severity === "block");
-    expect(
-      blocking.map((r) => r.id),
-      'a check ships severity = "block", but no code re-prompts the concierge — the mount reads ' +
-        "LintResult.text and discards `blocked`. Implement the block path (re-prompt once, then " +
-        'rendered_marked) before raising any check to "block", and delete this test when you do.',
-    ).toEqual([]);
-  });
+  // ══ THE "NOTHING IMPLEMENTS BLOCKING" TEST USED TO LIVE HERE, AND IT IS GONE ON PURPOSE ════════
+  // It asserted that no check could ship at `severity = "block"`, because `lintReply` computed
+  // `LintResult.blocked` and the mount read `.text` and DISCARDED the flag — so `"block"` behaved
+  // exactly like `"warn"` while `config.rs` documented it as "re-prompts the concierge once for a
+  // corrected reply". That test said, in its own body, to delete it in the change that implements
+  // the re-prompt. This is that change (bead sparkle-ugohl).
+  //
+  // `ConciergeHost` now HOLDS a blocked reply, dispatches exactly one correction turn, and renders
+  // the correction — or the held original, marked, on every failure path. What replaces the pin is
+  // behaviour, not another list assertion:
+  //   • components/ConciergeHost.lintBlock.test.tsx — the mount's block path, end to end.
+  //   • services/conciergeLintRunner.test.ts — the deferred report and the correction prompt.
+  // The row ABOVE this one still holds the real invariant: a check with a non-"off" severity must
+  // have an implementation behind it. Blocking is now an implemented effect, so it no longer needs
+  // its own exception.
 
   it("the DEFAULT_TEMPLATE block agrees with the table on every severity", () => {
     // Two hand-maintained copies of the same policy. Rust's own test asserts they PARSE to the same

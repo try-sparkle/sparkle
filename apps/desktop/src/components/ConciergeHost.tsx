@@ -89,6 +89,7 @@ import {
   startProactiveConciergeTurn,
   isProactiveTurn,
   isSupersededDetail,
+  type ConciergeToolCall,
 } from "../services/concierge";
 import {
   noteConciergeNativeToolCall,
@@ -103,9 +104,14 @@ import {
   noteConciergeSettled,
   useConciergeLiveness,
 } from "../services/conciergeLiveness";
-import { runReplyLint } from "../services/conciergeLintRunner";
+import {
+  buildLintCorrectionPrompt,
+  reportLintOutcome,
+  runReplyLint,
+} from "../services/conciergeLintRunner";
 import { DISABLED_POLICY, toLintPolicy } from "../services/conciergeLintPolicy";
-import type { LintPolicy } from "../services/conciergeLint";
+import type { LintPolicy, LintResult, Violation } from "../services/conciergeLint";
+import type { LintAction } from "../stores/conciergeLintMetrics";
 import { getConfig, onConfigChanged, type EffectiveConfig } from "../services/config";
 import {
   livenessAnnouncement,
@@ -953,6 +959,64 @@ function ConciergePrChip() {
   );
 }
 
+/**
+ * ONE REPLY HELD BACK WHILE ITS CORRECTION TURN RUNS — the whole state of the linter's block path.
+ *
+ * A `severity = "block"` check used to compute `LintResult.blocked` and reach nobody: the mount read
+ * `.text` and dropped the flag, so the strictest tier the config offers rendered exactly like
+ * `"warn"`. This record is what makes it mean something — the reply is held here instead of being
+ * rendered, ONE correction turn is dispatched, and whatever comes back (or doesn't) ends in
+ * `settleHold`.
+ *
+ * ══ NEVER LOSE A REPLY ══════════════════════════════════════════════════════════════════════════
+ * `services/conciergeLint` states the one unacceptable failure of this design: "a linter that can
+ * destroy one is worse than no linter." So {@link LintHold.text} is the reply as it would have
+ * rendered, kept for the length of the hold, and EVERY exit renders something — the correction when
+ * one arrives, this text when it does not. `done` is the latch that keeps two racing exits (a late
+ * `done` and the backstop timer, say) from rendering twice.
+ */
+interface LintHold {
+  /** The ORIGINAL turn, which owns the bubble everything here renders into. */
+  turnId: string;
+  /** The held reply, linted — what renders if the correction never lands. */
+  text: string;
+  /** The held reply's violations, deliberately UNREPORTED until the outcome is known
+   *  (`runReplyLint` defers a blocked result; see its header). */
+  violations: Violation[];
+  /** The held turn's tool calls, so the promise ledger runs against the reply that actually lands
+   *  rather than one the user never saw. */
+  toolCalls: readonly ConciergeToolCall[] | undefined;
+  /** Which of the user's messages this reply answers, captured AT HOLD TIME.
+   *
+   *  `answerFields` computes anchors from the thread as it stands when the bubble is CREATED, and a
+   *  held reply's bubble may not be created until after the user has sent something else — at which
+   *  point `pendingAnchors` would claim that newer message too. "Answered below" under a question
+   *  the brain never received is the exact over-claim `neverSentRef` exists to prevent, one path
+   *  further along, so the answer is frozen here while it is still true. */
+  answers?: ReplyAnchor[];
+  /** The reply before the held one, so the correction is linted against the same `restated-state`
+   *  corpus the held reply was. */
+  prevReply: string | null;
+  /** The correction turn's id, once `startConciergeTurn` has resolved one. Null means the dispatch
+   *  is still in flight and no event can be attributed to it yet. */
+  correctionTurnId: string | null;
+  /** The backstop that fires when the correction turn simply never speaks. */
+  timer: ReturnType<typeof setTimeout> | null;
+  /** Latched by `settleHold`. Two exits can race; only the first renders. */
+  done: boolean;
+}
+
+/**
+ * How long a held reply waits for its correction before it renders anyway.
+ *
+ * A ceiling, not a schedule: every ORDINARY end of a correction turn (done, error, superseded,
+ * abandoned, a rejected dispatch, the user sending again) settles the hold directly, so this only
+ * fires when the backend goes silent without a terminal event — which is the one case where nothing
+ * else would ever render the reply. Generous next to a real concierge turn because firing early
+ * would render the original while a good correction was still being written.
+ */
+const LINT_CORRECTION_TIMEOUT_MS = 90_000;
+
 export function ConciergeHost({
   feed,
   promptTarget = null,
@@ -1187,6 +1251,35 @@ export function ConciergeHost({
   // time an unrelated config key changed. It starts DISABLED so the window between mount and the
   // first `getConfig` resolving cannot lint against a policy nobody supplied.
   const lintPolicyRef = useRef<LintPolicy>(DISABLED_POLICY);
+  /** The one reply currently held back by a blocking finding, or null. See {@link LintHold}. */
+  const lintHoldRef = useRef<LintHold | null>(null);
+  /**
+   * Turn ids that may never again start a correction turn — every original that has already spent
+   * its retry, and every correction turn itself.
+   *
+   * ══ ONE RETRY. EVER. ══════════════════════════════════════════════════════════════════════════
+   * A correction can itself be blocked, and re-prompting THAT is an unbounded loop paid for in
+   * model quota — the worst possible failure of this feature, and the one it would be easiest to
+   * ship by accident. Two independent things stop it: the correction path never calls the hold
+   * branch at all (its exit is `settleHold`), and this set makes a second hold on either id
+   * impossible even if a later edit routes a correction back through the main path.
+   */
+  const lintRetriedRef = useRef<Set<string>>(new Set());
+  /**
+   * Correction turns whose hold gave up on them while they were still alive — every event they
+   * emit from that moment is dropped on the floor.
+   *
+   * `isCorrectionTurn` is derived from `lintHoldRef`, and giving up CLEARS that ref, so without
+   * this set an abandoned correction stops being recognised and falls through to the ORDINARY
+   * render path. It is also the newest id the stream has seen, so `supersededTurn` waves it
+   * through. The concrete failure (roborev 58805): the backstop fires at 90s and renders the held
+   * original, then the still-streaming correction paints its own bubble and `done`s into a second
+   * answer — to a prompt the user never sent — appended under the reply it was meant to replace.
+   */
+  const lintSilencedRef = useRef<Set<string>>(new Set());
+  /** `settleHold` through a ref, so `dispatchTurn` — defined outside the brain subscription — can
+   *  end a hold before its own turn supersedes the correction. Same shape as `drainQueueRef`. */
+  const settleLintHoldRef = useRef<(why: string) => void>(() => {});
   // The last reply the concierge produced, for `restated-state` to compare against. Held here rather
   // than read back out of the thread store because the store holds RENDERED messages — including
   // receipts and restores — and the check's corpus is specifically the previous BRAIN reply.
@@ -2121,7 +2214,17 @@ export function ConciergeHost({
     // path rather than merely tidy: the field is spread from `cur`, so leaving it out PRESERVES what
     // is already on the bubble. Passing `undefined` on every streamed token would erase a mark the
     // moment a straggling delta landed after `done`.
-    const upsert = (id: string, text: string, replace: boolean, lint?: MessageLintMark[]) => {
+    /** `answers` OVERRIDES the anchors this bubble would compute for itself, and only the block
+     *  path passes it: a held reply's bubble can be created long after `answerFields` stopped being
+     *  able to answer honestly (see {@link LintHold.answers}). Ignored when the bubble already
+     *  exists, exactly as the computed form is. */
+    const upsert = (
+      id: string,
+      text: string,
+      replace: boolean,
+      lint?: MessageLintMark[],
+      answers?: ReplyAnchor[],
+    ) => {
       const prior = brainTextRef.current[id] ?? "";
       brainTextRef.current[id] = replace ? text : prior + text;
       setChat((prev) => {
@@ -2130,7 +2233,14 @@ export function ConciergeHost({
         if (i === -1)
           return [
             ...prev,
-            { id: k, kind: "sparkle", text, ...(lint ? { lint } : {}), ...pushFields(id), ...answerFields(prev, id) },
+            {
+              id: k,
+              kind: "sparkle",
+              text,
+              ...(lint ? { lint } : {}),
+              ...pushFields(id),
+              ...(answers?.length ? { answers } : answerFields(prev, id)),
+            },
           ];
         const next = prev.slice();
         const cur = next[i]!;
@@ -2147,6 +2257,12 @@ export function ConciergeHost({
           // side — which preserves this turn's own payload and can never graft a user's pills onto
           // a reply.
           collapsed: cur.kind === "sparkle" ? cur.collapsed : undefined,
+          // A HOLD ENDS THE MOMENT REAL TEXT LANDS HERE. `held` is spread in from `cur`, so without
+          // this the placeholder would outlive the rewrite it announces and the winning reply would
+          // render underneath "rewriting…" forever. `settleHold` is the only writer of the text that
+          // ends a hold, and it goes through this upsert, so clearing it here covers every exit —
+          // corrected, retry-also-blocked, errored, superseded, abandoned, timed out.
+          held: undefined,
           ...(lint ? { lint } : {}),
           ...pushFields(id),
         };
@@ -2168,8 +2284,347 @@ export function ConciergeHost({
         return next;
       });
     };
+    /** Take one turn's violating TEXT off screen while its correction runs — WITHOUT moving its row.
+     *
+     *  ONLY the block path uses this, and it is not optional there. Deltas paint live into the same
+     *  bubble the `done` handler replaces, so by the time a reply is judged blocked it is already
+     *  fully on screen — and a hold that only declines to re-render leaves it there for the whole
+     *  correction turn (roborev 58805). That is precisely what `severity = "block"` exists to
+     *  prevent: the founder can read "Say go and I'll spawn the worker", answer `go`, and act on a
+     *  sentence the linter is in the middle of rejecting. The reply is not lost — it is in
+     *  `LintHold.text`, its anchors are in `LintHold.answers`, and `settleHold` puts back whichever
+     *  text finally wins.
+     *
+     *  ══ BLANKED IN PLACE, NEVER SPLICED OUT (roborev 58971, High) ═══════════════════════════════
+     *  The first version removed the row. `upsert`'s not-found branch APPENDS, so the held reply came
+     *  back at the BOTTOM of the thread — below anything that landed during the up-to-90s hold. The
+     *  sharp case is the one `dispatchTurn` is written around: `send()` appends the new `you` bubble
+     *  BEFORE `dispatchTurn` settles the hold, so a user who sent again got
+     *  `[you Q1, you Q2, sparkle A1]` — the answer to Q1 sitting under Q2, reading as Q2's answer,
+     *  with Q2's real reply arriving beneath it as a second one. Any `postSparkle` during the window
+     *  (relay receipts, promise-ledger nags, feed notices) relocated it the same way.
+     *
+     *  Blanking keeps the index, so `settleHold`'s `replace: true` upsert finds the row where it has
+     *  always been. `held: true` is what the renderer keys the placeholder off — an empty bubble with
+     *  no marker would read as a lost turn, which is the other half of what this must not do. */
+    const blankHeldBubble = (id: string) => {
+      setChat((prev) => {
+        const k = key(id);
+        const i = prev.findIndex((m) => m.id === k);
+        if (i === -1) return prev;
+        const cur = prev[i]!;
+        if (cur.kind !== "sparkle") return prev;
+        const next = prev.slice();
+        next[i] = { ...cur, text: "", held: true };
+        return next;
+      });
+    };
+
+    // ══ THE BLOCK PATH — WHAT `severity = "block"` ACTUALLY DOES ════════════════════════════════
+    //
+    // `lintReply` has always computed `LintResult.blocked` and, until this, NO caller read it: the
+    // mount consumed `.text` and `.violations` and dropped the flag on the floor. So the strictest
+    // tier the config offers behaved exactly like `"warn"` — `config.rs` documented
+    // `ask-without-action` as "re-prompts the concierge once for a corrected reply" while nothing
+    // re-prompted, and the check therefore shipped at `"warn"` for want of this code.
+    //
+    // What happens now: a blocked reply is HELD rather than rendered, ONE correction turn is
+    // dispatched naming the checks that fired, and the correction replaces the held reply in the
+    // ORIGINAL turn's bubble.
+    //
+    // ══ THE THREE PROPERTIES THAT MATTER, IN ORDER OF WHAT THEY COST IF BROKEN ══════════════════
+    //  1. NEVER LOSE A REPLY. `services/conciergeLint`'s header: "a linter that can destroy one is
+    //     worse than no linter." Every exit below — corrected, retry-also-blocked, correction
+    //     errored, superseded, abandoned, dispatch rejected, timed out, column unmounted — ends in
+    //     `settleHold`, which renders something. There is no path that merely drops the hold.
+    //  2. ONE RETRY, EVER. A correction that is itself blocked renders MARKED; it does not re-prompt.
+    //     An unbounded loop here spends the founder's model quota, silently, on a reply nobody is
+    //     reading. `lintRetriedRef` and the fact that the correction path never touches the hold
+    //     branch are two independent guards on the same thing.
+    //  3. THE COUNT STAYS HONEST. `"revised"` is only written when a correction actually replaced
+    //     the held text on screen. A reply that was never corrected counts `"rendered_marked"`.
+    //
+    // ══ WHY THE CORRECTION IS DISPATCHED DIRECTLY AND NOT THROUGH THE QUEUE ═════════════════════
+    // `dispatchTurn` is the USER-send path: it owns a `you` bubble, `awaitingBubbleRef`,
+    // `neverSentRef`, a receipt, and it advances `retireThroughRef`. A correction has none of those
+    // — nobody typed it, no bubble is waiting on it, and taking a queue slot would make the reply a
+    // user IS waiting on queue behind a rewrite they never asked for. So it is a bare
+    // `startConciergeTurn`, and `canHoldFor` refuses the hold outright when anyone is queued: a
+    // waiting user turn would dispatch on the drain below and `concierge.rs` would kill the
+    // correction child, which is a paid turn spent to reach the same rendered original.
+
+    /** Stop the backstop timer and drop the hold. Never renders — see `settleHold` for that. */
+    const clearHold = () => {
+      const held = lintHoldRef.current;
+      if (held?.timer) clearTimeout(held.timer);
+      lintHoldRef.current = null;
+    };
+
+    /**
+     * Render a held reply, count it, and close the hold. THE ONLY EXIT FROM A HOLD.
+     *
+     * `held.done` is latched first because two exits genuinely race — a `done` that lands in the
+     * same tick as the backstop timer, a supersede that lands beside a rejected dispatch — and the
+     * second one through must not render a second bubble or double-count a violation.
+     */
+    const settleHold = (
+      held: LintHold,
+      text: string,
+      violations: readonly Violation[],
+      reports: readonly { violations: readonly Violation[]; turnId: string; action: LintAction }[],
+      toolCalls: readonly ConciergeToolCall[] | undefined,
+    ) => {
+      if (held.done) return;
+      held.done = true;
+      clearHold();
+      // Each report guarded on its own: telemetry is the byproduct and the reply is the product, so
+      // a broken counter must not be able to stop the render three lines below it.
+      for (const r of reports) {
+        try {
+          reportLintOutcome({
+            violations: r.violations,
+            turnId: r.turnId,
+            action: r.action,
+            policy: lintPolicyRef.current,
+          });
+        } catch (err) {
+          console.warn("conciergeLint: reporting a held reply's outcome failed", err);
+        }
+      }
+      // The hold raised the indicator (a rewrite really was in flight); this is where it comes down.
+      // Safe against stealing a NEWER turn's indicator because the only way a new turn starts during
+      // a hold is `dispatchTurn`, which settles the hold as its FIRST statement and raises typing
+      // afterwards — so this always runs before that, never after it.
+      setTyping(false);
+      const marks = toLintMarks(violations);
+      upsert(held.turnId, text, true, marks, held.answers);
+      const lintLine = lintMarkText(marks);
+      if (lintLine && displayMountedRef.current) noteMounted(lintLine, "info");
+      // AFTER the upsert, which is what creates the bubble when a hold was taken before one existed:
+      // `markSettled` returns `prev` untouched for a turn with no bubble, so the other order would
+      // silently never stamp it and every later reply would claim this one's questions.
+      markSettled(held.turnId);
+      // THE LEDGER READS WHAT THE USER WAS ACTUALLY TOLD. Running it at `done` on a reply that was
+      // then replaced would record a promise out of text nobody ever saw — and the ledger's whole
+      // value is that the founder can check it against what he read.
+      try {
+        for (const p of noteConciergeTurnForPromises({
+          id: held.turnId,
+          text,
+          toolCalls: toLintToolCalls(toolCalls),
+          at: Date.now(),
+        })) {
+          postSparkle(line`You said you'd ${plain(promiseVerbPhrase(p.family))} — ${plain(oneLine(p.sentence))} — and that hasn't happened.`);
+        }
+      } catch (err) {
+        console.warn("concierge: promise ledger failed; the reply is unaffected", err);
+      }
+      // The RENDERED form, like the non-blocked path: `restated-state` asks whether the human is
+      // being told the same thing twice, and a correction they never saw is not what they were told.
+      prevReplyRef.current = text;
+      if (text) announce(text);
+    };
+
+    /** Give up on the correction and render the HELD ORIGINAL, marked. Every failure path lands
+     *  here, and `why` is logged rather than shown: the user asked a question and got an answer,
+     *  and a notice about the linter's own plumbing is not something they can act on.
+     *
+     *  `owner` scopes the give-up to ONE hold, and a caller that is a continuation of a specific
+     *  hold — a timer, a settled dispatch promise — must pass it. Without that check a stale
+     *  continuation tears down whatever hold is current NOW (roborev 58805): hold A's rejection
+     *  arriving after A was settled by a new send would render hold B's original and strand B's
+     *  correction, spending B's one retry on A's failure. The event-driven callers (an error, an
+     *  abandon, a new send, unmount) legitimately mean "whatever is held", and pass nothing. */
+    const giveUpOnCorrection = (why: string, owner?: LintHold) => {
+      const held = lintHoldRef.current;
+      if (!held || held.done) return;
+      if (owner && owner !== held) return;
+      console.warn(`conciergeLint: ${why}; rendering the held reply marked`);
+      // The correction turn may still be ALIVE — nothing here kills the child. From this moment its
+      // events must reach nothing, and `isCorrectionTurn` is about to stop recognising them because
+      // `settleHold` clears the ref they are matched against.
+      if (held.correctionTurnId) rememberSilenced(held.correctionTurnId);
+      settleHold(
+        held,
+        held.text,
+        held.violations,
+        [{ violations: held.violations, turnId: held.turnId, action: "rendered_marked" }],
+        held.toolCalls,
+      );
+    };
+    settleLintHoldRef.current = giveUpOnCorrection;
+
+    /** Is this event the correction turn's? Null-safe on `correctionTurnId`, which is null for the
+     *  window between dispatch and the invoke resolving a token. */
+    const isCorrectionTurn = (id: string): boolean => {
+      const held = lintHoldRef.current;
+      return !!held && held.correctionTurnId !== null && held.correctionTurnId === id;
+    };
+
+    /** Add to a bounded id set, oldest-first eviction, so a long session cannot grow it forever. */
+    const remember = (set: Set<string>, id: string) => {
+      set.add(id);
+      if (set.size > 500) for (const k of set) { set.delete(k); if (set.size <= 400) break; }
+    };
+    /** Remember a turn id as having spent its one retry. */
+    const rememberRetried = (id: string) => remember(lintRetriedRef.current, id);
+    /** Remember a correction turn id as abandoned — its events reach nothing from here. */
+    const rememberSilenced = (id: string) => remember(lintSilencedRef.current, id);
+    /** Is this an abandoned correction turn, whose events must all be dropped? */
+    const isSilencedTurn = (id: string): boolean => lintSilencedRef.current.has(id);
+
+    /** May this turn's blocked reply take the one correction turn it is allowed? */
+    const canHoldFor = (id: string): boolean => {
+      // One hold at a time. A second would need a second bubble, a second timer and a second
+      // never-lose guarantee, to buy nothing: the first is about to settle either way.
+      if (lintHoldRef.current) return false;
+      // ONE RETRY, EVER — for the original and for the correction alike.
+      if (lintRetriedRef.current.has(id)) return false;
+      // Nobody is waiting on a push, so it does not get to spend a turn on a rewrite.
+      if (isProactiveTurn(id)) return false;
+      // See the header: a queued user turn will dispatch on this handler's drain and kill the
+      // correction child, so the correction would be paid for and never arrive.
+      if (turnQueueRef.current.waiting.length > 0) return false;
+      return true;
+    };
+
+    /** Hold this reply and dispatch its one correction turn. Returns false when nothing was held,
+     *  in which case the caller renders normally. */
+    const takeHold = (
+      e: { id: string; text: string; toolCalls?: readonly ConciergeToolCall[] },
+      linted: LintResult,
+    ): boolean => {
+      // Assembled from CHECK IDS ONLY — no reply prose leaves this subsystem, the same rule
+      // `Violation.span` (a character count) exists for. Empty means the violations named nothing
+      // actionable, and a paid turn on an empty instruction list is worse than rendering marked.
+      const prompt = buildLintCorrectionPrompt(linted.violations);
+      if (!prompt) return false;
+      rememberRetried(e.id);
+      const held: LintHold = {
+        turnId: e.id,
+        text: linted.text,
+        violations: linted.violations,
+        toolCalls: e.toolCalls,
+        answers: answerFields(chatRef.current, e.id).answers,
+        prevReply: prevReplyRef.current,
+        correctionTurnId: null,
+        timer: null,
+        done: false,
+      };
+      held.timer = setTimeout(
+        () => giveUpOnCorrection("the correction turn never produced a terminal event", held),
+        LINT_CORRECTION_TIMEOUT_MS,
+      );
+      lintHoldRef.current = held;
+      // ══ AND TAKE THE VIOLATING TEXT OFF SCREEN ═══════════════════════════════════════════════
+      // It is already painted — deltas stream into this same bubble — so declining to re-render is
+      // not the same as not rendering. The indicator goes back up because a rewrite genuinely is in
+      // flight, and because a reply that vanishes with nothing in its place reads as a lost turn.
+      blankHeldBubble(e.id);
+      setTyping(true);
+      void startConciergeTurn(prompt).then(
+        (id) => {
+          // ══ A LATE ID MUST STILL BE SILENCED (roborev 58971, Medium) ═════════════════════════
+          // `correctionTurnId` is null for the whole window between dispatching and this resolving,
+          // and `giveUpOnCorrection` can only silence an id it has. So a hold that settles inside
+          // that window — the 90s backstop firing on a slow invoke is the ordinary way — used to
+          // return here and DISCARD the id, leaving the correction turn unrecognised by
+          // `isCorrectionTurn` (the ref is cleared), absent from `lintSilencedRef`, and not
+          // superseded (it is the newest id the stream has seen). Its deltas then painted a fresh
+          // bubble and its `done` rendered a SECOND answer to a prompt the user never sent — the
+          // exact failure `lintSilencedRef` was added to prevent, surviving through the null window.
+          if (held.done) {
+            if (id !== null) rememberSilenced(id);
+            return;
+          }
+          // A turn with no token cannot be recognised when it finishes, so there is nothing to wait
+          // for — render now rather than burn the whole backstop window first.
+          if (id === null) {
+            giveUpOnCorrection("the correction turn returned no id", held);
+            return;
+          }
+          held.correctionTurnId = id;
+          // The correction may never itself be held: this is the second of the two guards on the
+          // retry ceiling, and the one that survives a later edit routing corrections elsewhere.
+          rememberRetried(id);
+        },
+        (err) => {
+          // ══ NO QUEUE SURGERY HERE (contrast `dispatchTurn`'s rejection handler) ═══════════════
+          // That one clears the queue on `ConciergeAiDisabledError` because a STICKY rejection
+          // would otherwise cascade through every waiting user message. A correction has no queue
+          // entry and no waiters — `canHoldFor` refused the hold if anyone was queued — so the
+          // sticky/transient distinction has nothing to decide here. The one correct response to
+          // either is the same: the user gets the reply that was held.
+          //
+          // SCOPED TO `held`, like the timer above. A rejection can land long after its own hold
+          // settled, and an unscoped give-up would then tear down the hold that is current now.
+          if (held.done) return;
+          console.warn("conciergeLint: the correction turn failed to start", err);
+          giveUpOnCorrection("the correction turn failed to start", held);
+        },
+      );
+      return true;
+    };
+
+    /** The correction turn finished. Renders the correction, or falls back to the held original. */
+    const finishCorrection = (e: {
+      id: string;
+      text: string;
+      toolCalls?: readonly ConciergeToolCall[];
+    }) => {
+      const held = lintHoldRef.current;
+      if (!held) return;
+      const corrected = e.text || brainTextRef.current[e.id] || "";
+      delete brainTextRef.current[e.id];
+      // A correction that said nothing is not a correction. The held reply is strictly better than
+      // an empty bubble, and this is one of the paths that would otherwise lose a reply outright.
+      if (!corrected.trim()) {
+        giveUpOnCorrection("the correction turn came back empty");
+        return;
+      }
+      // The correction is linted too — a re-prompt that produced a worse reply must still be
+      // marked. This result CANNOT start another hold: the only exit from here is `settleHold`.
+      const retry = runReplyLint({
+        text: corrected,
+        turnId: e.id,
+        toolCalls: e.toolCalls,
+        // The corpus the HELD reply was linted against, not the held reply itself: `restated-state`
+        // would otherwise fire on every correction, since a corrected reply says the same thing.
+        prevReply: held.prevReply,
+        policy: lintPolicyRef.current,
+      });
+      const text = retry?.text ?? corrected;
+      const retryViolations = retry?.violations ?? [];
+      // THE HELD REPLY WAS REVISED — a correction actually replaced it on screen. That is true
+      // whether or not the correction is itself clean, and it is the ONLY condition under which
+      // this word is written: `giveUpOnCorrection` writes `rendered_marked` for every reply that
+      // was never corrected, so the rollup counts revisions that happened, not ones intended.
+      const reports: { violations: readonly Violation[]; turnId: string; action: LintAction }[] = [
+        { violations: held.violations, turnId: held.turnId, action: "revised" },
+      ];
+      // `runReplyLint` already reported a clean-or-warning retry itself; only a BLOCKED one is still
+      // owed a report, and its action is the give-up word because no third turn is coming.
+      if (retry?.blocked && retryViolations.length) {
+        reports.push({ violations: retryViolations, turnId: e.id, action: "rendered_marked" });
+      }
+      settleHold(held, text, retryViolations, reports, e.toolCalls);
+    };
+
     const offDelta = onConciergeDelta((e) => {
+      // AN ABANDONED CORRECTION REACHES NOTHING. Above the supersede gate because it cannot help:
+      // the correction is the NEWEST id the stream has seen, so `supersededTurn` returns false and
+      // these deltas would paint a fresh bubble under the reply they were meant to replace.
+      if (isSilencedTurn(e.id)) return;
       if (supersededTurn(e.id)) return;
+      // ══ A CORRECTION TURN STREAMS SILENTLY ═════════════════════════════════════════════════════
+      // Its text is accumulated (so a `done` carrying none — "the turn whose deltas said
+      // everything" — still has a reply to render) but it paints NO bubble of its own and narrates
+      // nothing. A second bubble growing under the reply it is replacing, for a turn the user never
+      // sent, would be worse than the brief glimpse of the unlinted reply this file already accepts.
+      if (isCorrectionTurn(e.id)) {
+        brainTextRef.current[e.id] = (brainTextRef.current[e.id] ?? "") + e.text;
+        return;
+      }
       // A SIGN OF LIFE, and specifically the kind that ANSWERS the user. Recorded before the text
       // lands, and only for a turn that passed the supersede gate above — a straggler from a turn
       // the user already displaced proves nothing about the one they are waiting on now.
@@ -2202,6 +2657,10 @@ export function ConciergeHost({
     // and clickable pills) and are DROPPED here by the phrasing module, so a call cannot be
     // reported twice or have its good line replaced by a generic one.
     const offTool = onConciergeTool((e) => {
+      if (isSilencedTurn(e.id)) return;
+      // Silent for the same reason its deltas are: narrating a rewrite the user never asked for
+      // puts "Read", "Grep" into the column under a reply that already finished.
+      if (isCorrectionTurn(e.id)) return;
       // The same supersede gate every other handler in this effect applies. `services/concierge`
       // has already filtered on `turnIsCurrent` and Rust refuses to emit for a dead turn at all;
       // this is the third guard, kept for the reason the delta path keeps its own — the failure it
@@ -2211,6 +2670,22 @@ export function ConciergeHost({
       noteConciergeNativeToolCall(e.name, e.input);
     });
     const offDone = onConciergeDone((e) => {
+      // A correction its hold already gave up on. Dropped whole — rendering it now would append a
+      // SECOND answer, to a prompt the user never sent, under the reply that replaced it.
+      if (isSilencedTurn(e.id)) {
+        delete brainTextRef.current[e.id];
+        return;
+      }
+      // ══ THE CORRECTION TURN ENDS HERE AND NOWHERE ELSE ═════════════════════════════════════════
+      // ABOVE the supersede gate deliberately. If the user has sent again, the correction IS
+      // superseded — and dropping this event on that ground would strand the held reply until the
+      // backstop timer, leaving the violating text on screen for a minute and a half. The reply the
+      // user is waiting on now comes through its own turn regardless; this only settles the one
+      // that was already answered.
+      if (isCorrectionTurn(e.id)) {
+        finishCorrection(e);
+        return;
+      }
       if (supersededTurn(e.id)) {
         delete brainTextRef.current[e.id];
         return;
@@ -2267,6 +2742,33 @@ export function ConciergeHost({
       //
       // `toLintMarks` narrows each violation to metadata (check / severity / detail) and drops
       // `span`; see Concierge/lintMarks for why that boundary is enforced by the type.
+      // ══ AND A BLOCKING FINDING HOLDS IT BACK, ONCE (bead sparkle-ugohl) ════════════════════════
+      // Nothing below runs for a held reply: it is not rendered, not marked, not stamped settled,
+      // and does not become `prevReply`, because none of those are true of it yet. `settleHold`
+      // does every one of them against the text that actually lands. The queue still drains — the
+      // turn is over as far as `concierge.rs` is concerned — and `canHoldFor` has already refused
+      // the hold if anything was waiting behind it.
+      if (linted?.blocked && e.text && canHoldFor(e.id) && takeHold(e, linted)) {
+        delete brainTextRef.current[e.id];
+        if (!isProactiveTurn(e.id)) drainQueueRef.current();
+        return;
+      }
+      // A blocked reply that could NOT take a correction turn still has to be counted:
+      // `runReplyLint` deferred its violations precisely because the outcome was unknown, and this
+      // is the outcome — rendered, marked, no revision. Without this they would be the one class of
+      // violation the counters never see, which is worse than the miscount the deferral prevents.
+      if (linted?.blocked && linted.violations.length) {
+        try {
+          reportLintOutcome({
+            violations: linted.violations,
+            turnId: e.id,
+            action: "rendered_marked",
+            policy: lintPolicyRef.current,
+          });
+        } catch (err) {
+          console.warn("conciergeLint: reporting an unretried blocked reply failed", err);
+        }
+      }
       const marks = toLintMarks(linted?.violations);
       if (e.text) upsert(e.id, linted?.text ?? e.text, true, marks);
       // ══ AND THE MOUNTED COLUMN, WHICH CANNOT SHOW A THREAD ROW AT ALL (roborev 57360's problem) ═
@@ -2368,6 +2870,23 @@ export function ConciergeHost({
       if (full) announce(full);
     });
     const offError = onConciergeError((e) => {
+      // Likewise for an abandoned correction's failure: there is no hold left to settle, and it must
+      // not raise the user-facing failure bubble below.
+      if (isSilencedTurn(e.id)) {
+        delete brainTextRef.current[e.id];
+        return;
+      }
+      // ══ A CORRECTION TURN'S FAILURE IS NOT THE USER'S FAILURE ══════════════════════════════════
+      // Above every gate below, for the reason the `done` interception is: superseded or not, the
+      // held reply has to render. And it must NOT take the failure path underneath — no failure
+      // bubble, no liveness escalation, no auth report. The user asked a question and the concierge
+      // answered it; that a private rewrite of that answer did not work out is plumbing, and a
+      // "your concierge isn't answering" strip over a reply that is right there would be a lie.
+      if (isCorrectionTurn(e.id)) {
+        delete brainTextRef.current[e.id];
+        giveUpOnCorrection(`the correction turn errored (${e.detail || "no detail"})`);
+        return;
+      }
       if (supersededTurn(e.id)) {
         delete brainTextRef.current[e.id];
         return;
@@ -2479,6 +2998,10 @@ export function ConciergeHost({
     // was abandoned" are different claims — this one carries no id and no text, so there is nothing of
     // the previous human's left to render.
     const offReset = onConciergeTurnsAbandoned(() => {
+      // BEFORE the wipe below, which clears `brainTextRef` wholesale. A held reply is one the user
+      // already watched stream in; abandoning the turns must not be the thing that finally deletes
+      // it, and no correction is coming for it now.
+      giveUpOnCorrection("the concierge's turns were abandoned");
       setTyping(false);
       // DISCARD, never drain. The conversation was thrown away; starting a queued turn here would
       // resurrect a question the user just discarded — which is why `clearQueue` is a separate
@@ -2495,6 +3018,12 @@ export function ConciergeHost({
       brainTextRef.current = {};
     });
     return () => {
+      // The thread store is module-scoped and persisted, so `settleHold` still lands after this
+      // component is gone — which makes rendering the held reply on the way out strictly better
+      // than clearing the timer and dropping it. Losing a reply is the one failure this design does
+      // not accept, and "the column unmounted" is not an exception to that.
+      giveUpOnCorrection("the concierge column unmounted");
+      settleLintHoldRef.current = () => {};
       offDelta();
       offDone();
       offError();
@@ -3333,6 +3862,12 @@ export function ConciergeHost({
    * would silence the turn that is still legitimately streaming.
    */
   const dispatchTurn = useCallback((entry: QueuedTurn) => {
+    // ══ A NEW TURN ENDS ANY HELD REPLY FIRST (the linter's block path) ═════════════════════════
+    // `concierge.rs` installs one turn and KILLS the child it evicts, so a correction turn in
+    // flight is about to die without ever emitting a terminal event. Settling here renders the held
+    // reply now instead of at the 90-second backstop — and renders it BEFORE this turn's own reply
+    // can arrive, so the thread does not grow an answer above the question it was answering.
+    settleLintHoldRef.current("the user sent again");
     // Its turn is starting, so it HAS been sent — a reply may legitimately claim it from here.
     neverSentRef.current.delete(entry.bubbleId);
     const bubbleId = entry.bubbleId.startsWith("pending-") ? null : entry.bubbleId;

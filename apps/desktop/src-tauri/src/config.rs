@@ -494,6 +494,37 @@ const DEFAULT_CONCIERGE_CHECKS: &[DefaultCheck] = &[
         threshold: None,
         words: None,
     },
+    // Asserted that a DEFECT EXISTS — "there is a bug in X", "the pill never fires", "traced it to
+    // workerRollup.ts" — and attached nothing durable to it. A bead filed or an agent spawned
+    // passes; so does a stated reason for not acting. A MESSAGE TO AN OWNING AGENT DOES NOT — see
+    // `tookDisposition`'s header for the founder's ruling of 2026-08-05, which turns on the fact that
+    // the originating miss was exactly that. Reporting an already-handled defect ("already fixed on
+    // main") is never a violation.
+    //
+    // The failure it exists for: the concierge diagnosed a real bug and filed no bead, and the
+    // founder had to notice the omission himself. `ask-without-action` could not see it — that check
+    // keys entirely on an interrogative ("want me to", "should I") and the miss contained no question
+    // at all, and it returns clean the moment the turn takes ANY state-changing action.
+    //
+    // ══ THE FIRST CHECK IN THIS TABLE TO SHIP `"block"`, AND WHY IT MAY ═════════════════════════
+    // Every `severity = "block"` here used to be inert: `lintReply` computed `blocked` and no caller
+    // read it. That is no longer true — the mount now HOLDS a blocked reply and dispatches exactly one
+    // correction turn (see `ConciergeHost.tsx`'s block path and `ConciergeHost.lintBlock.test.tsx`),
+    // so `"block"` states something the app actually does.
+    //
+    // It blocks rather than warns because a warning here would be the same passivity one level up: it
+    // hands the founder a note about a dropped bug to read and act on, which is precisely the labour
+    // this check exists to remove. `askWithoutAction`'s header makes the argument in full.
+    //
+    // `ask-without-action` deliberately stays `"warn"` for now — raising it is a separate judgement
+    // about a check with its own false-positive profile, and it should be made on its own evidence.
+    DefaultCheck {
+        id: "defect-without-disposition",
+        severity: "block",
+        autofix: false,
+        threshold: None,
+        words: None,
+    },
     DefaultCheck {
         id: "hedge-words",
         severity: "warn",
@@ -3570,6 +3601,22 @@ autofix   = false
 enabled   = true
 severity  = "warn"
 autofix   = false
+
+# Said a DEFECT EXISTS — "there is a bug in X", "the pill never fires", "traced it to
+# workerRollup.ts" — and attached nothing durable to it. What counts as attaching it: a bead
+# filed, or an agent spawned. A message to the agent that owns the code does NOT count on its
+# own — messaging is fine, but the defect still has to be written down somewhere you will find
+# it again. Saying why you are not acting ("by design", "not worth filing because…") also
+# passes. Reporting a defect that is already handled ("already fixed on main", "covered by
+# sparkle-xxxx") is never flagged, and neither is a hypothetical ("if it were broken"), a defect
+# you yourself reported back to you, or anything inside a code block or a quote.
+# This one BLOCKS: the reply is held and the concierge is asked once for a corrected one. A mere
+# warning would hand you a note about a dropped bug to read and act on, which is the labour this
+# check exists to remove.
+[concierge.checks.defect-without-disposition]
+enabled   = true
+severity  = "block"
+autofix   = false
 [concierge.checks.hedge-words]
 enabled   = true
 severity  = "warn"
@@ -6530,6 +6577,11 @@ quit_app = 42
         ("ask-without-action", "warn", false, None, None),
         ("bare-agent-name", "off", true, None, None),
         ("bare-pr-number", "off", true, None, None),
+        // THE ONE SHIPPED `"block"`, and the only check in this table entitled to it: the mount's
+        // block path holds a blocked reply and dispatches one correction turn, so `blocked` is read
+        // rather than computed and dropped. `ask-without-action` stays `"warn"` above — raising it is
+        // a separate judgement on its own false-positive profile, not a consequence of this one.
+        ("defect-without-disposition", "block", false, None, None),
         ("fat-pill-label", "off", true, None, None),
         ("hedge-words", "warn", false, None, Some("should, deserves to")),
         ("naked-file-ref", "warn", false, None, None),

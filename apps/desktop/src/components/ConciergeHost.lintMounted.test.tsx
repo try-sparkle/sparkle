@@ -61,7 +61,13 @@ vi.mock("../services/concierge", () => ({
   isSupersededDetail: () => false,
   SUPERSEDED_DETAILS: [],
 }));
-vi.mock("../services/conciergeLintRunner", () => ({ runReplyLint: h.runReplyLint }));
+// Spread the real module, replace one export — the host imports `toLintToolCalls`,
+// `reportLintOutcome` and `buildLintCorrectionPrompt` from here too, and a mock that omits them
+// leaves each `undefined` at a call site whose try/catch turns the crash into a warning.
+vi.mock("../services/conciergeLintRunner", async (importOriginal) => {
+  const real = await importOriginal<typeof import("../services/conciergeLintRunner")>();
+  return { ...real, runReplyLint: h.runReplyLint };
+});
 vi.mock("../services/conciergeDispatch", () => ({
   dispatchConciergeAnswer: vi.fn(async () => ({ ok: true, path: "free-text" })),
   flushPendingSends: vi.fn(async () => []),

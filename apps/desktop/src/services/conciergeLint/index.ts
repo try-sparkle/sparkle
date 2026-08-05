@@ -32,6 +32,7 @@
 import type { Check, LintContext, LintResult, Violation } from "./types";
 import { severityBlocks, severityRuns } from "./types";
 import { askWithoutActionCheck } from "./checks/askWithoutAction";
+import { defectWithoutDispositionCheck } from "./checks/defectWithoutDisposition";
 import { hedgeWordsCheck } from "./checks/hedgeWords";
 import { nakedFileRefCheck } from "./checks/nakedFileRef";
 import { restatedStateCheck } from "./checks/restatedState";
@@ -71,6 +72,12 @@ export const CHECKS: Check[] = [
   // Second because it is the other half of the same pair: `ask-without-action` catches the reply
   // that took no action and said so, this catches the reply that took no action and said it did.
   unbackedClaimCheck,
+  // Third because it completes that pair into a triple over one axis — WHAT THE TURN OWED THE
+  // HUMAN. `ask-without-action` catches the reply that offered instead of acting, `unbacked-claim`
+  // the reply that said it acted when it did not, and this one the reply that named a defect and
+  // attached nothing to it: no bead, no agent, no stated reason. It is the only one of the three
+  // whose trigger is not a first-person sentence about the concierge itself.
+  defectWithoutDispositionCheck,
   hedgeWordsCheck,
   nakedFileRefCheck,
   restatedStateCheck,

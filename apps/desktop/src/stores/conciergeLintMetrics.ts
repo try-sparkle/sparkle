@@ -34,6 +34,10 @@ export type LintCheckId =
   // The other half of that pair: the reply that took no action and said it DID. A receipt the human
   // cannot check retires the task in their head, so this one costs more than the passivity above.
   | "unbacked-claim"
+  // The third member of that family: the reply that named a DEFECT and attached nothing to it — no
+  // bead, no agent, no stated reason. Unlike the two above, its trigger is not a sentence about the
+  // concierge at all; it is an assertion that something is broken.
+  | "defect-without-disposition"
   | "bare-agent-name"
   | "bare-pr-number"
   | "fat-pill-label"
@@ -61,6 +65,7 @@ export type LintAction = "warned" | "autofixed" | "revised" | "rendered_marked";
 export const LINT_CHECK_IDS: readonly LintCheckId[] = [
   "ask-without-action",
   "unbacked-claim",
+  "defect-without-disposition",
   "bare-agent-name",
   "bare-pr-number",
   "fat-pill-label",
@@ -100,6 +105,7 @@ interface ConciergeLintMetricsState {
 const emptyChecks = (): Record<LintCheckId, number> => ({
   "ask-without-action": 0,
   "unbacked-claim": 0,
+  "defect-without-disposition": 0,
   "bare-agent-name": 0,
   "bare-pr-number": 0,
   "fat-pill-label": 0,

@@ -97,6 +97,12 @@ const CHECK_SENTENCES: Record<string, string> = {
   // references: the check cannot see earlier turns, so the mark must not accuse the reply of more
   // than it actually observed.
   "unbacked-claim": "Said it did it — no matching action this turn",
+  // THE THIRD OF THAT FAMILY, and the one the founder had to catch by hand: the reply diagnosed a
+  // real bug and then filed nothing, spawned nobody, and messaged no one. Worded as the OMISSION
+  // rather than as the diagnosis, because the diagnosis was the good part — what went missing is the
+  // disposition. "Nothing attached" rather than "no bead" so the sentence stays true of the other two
+  // dispositions the check accepts (an agent spawned, a message sent).
+  "defect-without-disposition": "Named a bug — nothing attached to it",
   "bare-agent-name": "Named an agent you can't click",
   "bare-pr-number": "Named a PR you can't click",
   "fat-pill-label": "Put a whole sentence inside a pill",

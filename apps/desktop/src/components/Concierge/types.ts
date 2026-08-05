@@ -249,6 +249,20 @@ export interface ConciergeSparkleMessage {
    */
   settled?: true;
   /**
+   * This reply is HELD by a blocking lint finding while a correction turn runs.
+   *
+   * The row stays in the thread with its text blanked rather than being spliced out, because the
+   * thread is ordered by position and `upsert` appends a row it cannot find — a spliced reply came
+   * back at the BOTTOM, under anything that landed during the hold, so the answer to one question
+   * rendered beneath a later one and read as its answer (roborev 58971).
+   *
+   * So the flag exists to tell "blanked on purpose, a rewrite is in flight" apart from "a turn that
+   * produced nothing" — an empty bubble with no marker reads as a lost reply, which is precisely
+   * what the block path must never look like. `ConciergeThread` draws the placeholder off this;
+   * `settleHold`'s upsert clears it when the winning text lands.
+   */
+  held?: true;
+  /**
    * WHAT THE REPLY LINTER CAUGHT IN THIS TURN (bead sparkle-kr2jz, part A).
    *
    * `services/conciergeLint/` runs on every `concierge:done` and its findings used to go two places

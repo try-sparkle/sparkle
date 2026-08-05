@@ -92,7 +92,15 @@ vi.mock("../services/concierge", async (importOriginal) => {
 });
 // The REAL policy mapper — the config→policy half must not be stubbed out of the path it exists to
 // serve, or this file would pass with the mapper broken.
-vi.mock("../services/conciergeLintRunner", () => ({ runReplyLint: h.runReplyLint }));
+// SPREAD THE REAL MODULE, replace one export. The host also imports `toLintToolCalls`,
+// `reportLintOutcome` and `buildLintCorrectionPrompt` from here; a mock that lists only
+// `runReplyLint` leaves those `undefined`, and the failure is silent — the promise ledger's call
+// site is inside a try/catch, so `toLintToolCalls is not a function` merely warned and every row
+// still passed while the ledger was structurally dead in this suite.
+vi.mock("../services/conciergeLintRunner", async (importOriginal) => {
+  const real = await importOriginal<typeof import("../services/conciergeLintRunner")>();
+  return { ...real, runReplyLint: h.runReplyLint };
+});
 vi.mock("../services/config", () => ({
   getConfig: h.getConfig,
   onConfigChanged: h.onConfigChanged,

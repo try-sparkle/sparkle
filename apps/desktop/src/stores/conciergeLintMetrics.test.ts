@@ -121,6 +121,10 @@ describe("useConciergeLintMetrics — session-scoped increments", () => {
         // hand-maintained, so a check added to the store and not to this row is uncounted exactly
         // the way the comment above describes.
         "unbacked-claim",
+        // The third of that family, and the one the founder had to catch by hand: the reply named a
+        // real defect and attached nothing to it. Its trigger is not a sentence about the concierge
+        // at all — it is an assertion that something is broken.
+        "defect-without-disposition",
         "bare-agent-name",
         "bare-pr-number",
         "fat-pill-label",

@@ -48,10 +48,13 @@ describe("lintReply — the registry", () => {
     // `ask-without-action` leads deliberately: it is the only check here that BLOCKS, and when a
     // reply both offers to act and hedges, the offer is the finding worth surfacing.
     // `unbacked-claim` sits second because it is the other half of the same pair — took no action
-    // and said so, versus took no action and said it did.
+    // and said so, versus took no action and said it did. `defect-without-disposition` completes
+    // that into a triple over one axis (what the turn owed the human): named a defect and attached
+    // nothing to it — no bead, no agent, no stated reason.
     expect(CHECKS.map((c) => c.id)).toEqual([
       "ask-without-action",
       "unbacked-claim",
+      "defect-without-disposition",
       "hedge-words",
       "naked-file-ref",
       "restated-state",

@@ -69,6 +69,8 @@ const reauthButton: React.CSSProperties = {
 
 /** A collapsed payload the reader chose to see as regular text, expanded IN PLACE in its bubble. */
 export const COLLAPSED_TEXT_TESTID = "concierge-collapsed-text";
+/** The placeholder standing in for a reply held back by a blocking lint finding. */
+export const HELD_REPLY_TESTID = "concierge-held-reply";
 
 /**
  * A user bubble's words, with any agent it ADDRESSED drawn as a pill rather than as raw `@text`.
@@ -592,7 +594,19 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
           they were sent, so a single reply to a burst of five is legible as five answers rather than
           one paragraph nobody can aim at. */}
       <ReplyAnchorStubs anchors={m.answers} onJump={onJump} />
-      <Markdown text={m.text} mergeQuotes />
+      {/* HELD BY A BLOCKING LINT FINDING — the words are withheld while a correction turn runs.
+          The ROW stays (blanking in place is what keeps the reply in its original position; see
+          `ConciergeSparkleMessage.held`), so something has to occupy it: an empty bubble reads as a
+          turn that produced nothing, which is the one thing the block path must never look like.
+          Deliberately says nothing ABOUT the finding — the violating sentence is exactly what must
+          not be on screen, and naming the check here would invite reading it as the answer. */}
+      {m.held ? (
+        <div data-testid={HELD_REPLY_TESTID} style={{ fontSize: 13, color: C.conciergeMuted }}>
+          Rewriting this reply…
+        </div>
+      ) : (
+        <Markdown text={m.text} mergeQuotes />
+      )}
       {/* AFTER the sentence, because it is what the sentence is about — a relayed brief the
           transcript used to echo inline and push the conversation off screen. */}
       {collapsedPayload(m.collapsed ? [m.collapsed] : [])}
