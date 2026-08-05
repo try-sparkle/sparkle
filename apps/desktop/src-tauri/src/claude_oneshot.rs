@@ -424,6 +424,30 @@ fn is_account_limit(lower: &str) -> bool {
 /// the global offline banner. A local CLI stall under a 50-agent storm is not evidence of that, and
 /// flipping the banner from it would make every unrelated feature defer for the wrong reason.
 fn classify_cli_failure(result_text: &str, api_error_status: Option<u16>) -> String {
+    if let Some(sentinel) = typed_cli_failure(result_text, api_error_status) {
+        return sentinel.to_string();
+    }
+    let detail: String = result_text.chars().take(200).collect();
+    if detail.trim().is_empty() {
+        "ai request failed".to_string()
+    } else {
+        format!("ai request failed: {}", detail.trim())
+    }
+}
+
+/// The RECOGNISING half of `classify_cli_failure`: `Some` when the body names a condition the JS
+/// layer has a specific branch for, `None` when it is prose we can only pass through.
+///
+/// Split out so a caller can ask "was this recognised?" without matching on the prose the other
+/// half builds. `spawn_claude`'s no-usable-output path is the caller that needs it: it has its own
+/// diagnostic message (the exit code, which the JSON path never has) and wants to keep it EXCEPT
+/// when the body actually names a condition. A `starts_with("ai request failed")` test would have
+/// worked today and broken silently the first time that prefix changed.
+///
+/// The arms are unchanged and stay in this one function on purpose. PR #1234 recorded the rule
+/// after deleting a second matcher that had grown up beside this one: consumers route through the
+/// canonical seam rather than hand-picking arms into a parallel classifier that then drifts.
+fn typed_cli_failure(result_text: &str, api_error_status: Option<u16>) -> Option<&'static str> {
     let lower = result_text.to_lowercase();
 
     // AN ACCOUNT-STATE SENTENCE BEATS A BARE STATUS.
@@ -443,13 +467,13 @@ fn classify_cli_failure(result_text: &str, api_error_status: Option<u16>) -> Str
     // So ~40 minutes of one user's exhausted allowance re-stamped a banner announcing that the
     // PRODUCT was down, while Sparkle's own service was healthy on every probe.
     if is_account_limit(&lower) {
-        return "claude_usage_limit".to_string();
+        return Some("claude_usage_limit");
     }
 
     // Vendor-side overload / transient throttle: no account condition was named above, so a 429/529
     // here really is "try again shortly".
     if matches!(api_error_status, Some(429) | Some(529)) {
-        return "ai_rate_limited".to_string();
+        return Some("ai_rate_limited");
     }
     // AN EXPIRED SESSION IS "NOT AUTHENTICATED", NOT A GENERIC SERVICE FAILURE.
     //
@@ -477,7 +501,7 @@ fn classify_cli_failure(result_text: &str, api_error_status: Option<u16>) -> Str
         || lower.contains("failed to authenticate")
         || lower.contains("session expired")
     {
-        return "claude_not_authenticated".to_string();
+        return Some("claude_not_authenticated");
     }
     // The status-LESS prose path, unchanged from before this fix. It keeps the loose `quota` /
     // `rate limit` words because with no status to contradict them there is nothing else to go on,
@@ -486,14 +510,9 @@ fn classify_cli_failure(result_text: &str, api_error_status: Option<u16>) -> Str
     if lower.contains("usage limit") || lower.contains("rate limit") || lower.contains("quota") {
         // The subscription analogue of the old `insufficient_credits`: the user still has an
         // account, they have simply spent this window's allowance.
-        return "claude_usage_limit".to_string();
+        return Some("claude_usage_limit");
     }
-    let detail: String = result_text.chars().take(200).collect();
-    if detail.trim().is_empty() {
-        "ai request failed".to_string()
-    } else {
-        format!("ai request failed: {}", detail.trim())
-    }
+    None
 }
 
 /// A held concurrency slot. Releases on drop, including on panic.
@@ -994,13 +1013,111 @@ fn spawn_claude(claude_path: &str, args: &[String], timeout: Duration) -> Result
             detail = %detail,
             "claude one-shot produced no usable output"
         );
-        return Err(if detail.is_empty() {
-            format!("ai request failed: claude exited {code:?} with no output")
-        } else {
-            format!("ai request failed: claude exited {code:?}: {detail}")
-        });
+        // `args` goes in so the classifier can tell the CLI's diagnosis from our own prompt quoted
+        // back at it — an argv-parser error or usage dump prints argv, and the prompt is in argv.
+        return Err(unusable_output_error(&detail, code, args));
     }
     Ok(stdout)
+}
+
+/// The error for a run that emitted no parseable result object — CLASSIFIED, not merely reported.
+///
+/// A CLI that dies before writing its result JSON says why on stderr, and this path used to hand
+/// that prose straight back as `ai request failed: claude exited …`. `run_with` returns a spawn
+/// error as the sentinel verbatim, exactly as it returns `CliOutcome::Failed`, so the two channels
+/// are the same wire with only one of them classified.
+///
+/// That gap has a name. `classify_cli_failure` maps "failed to authenticate" / "session expired" to
+/// `claude_not_authenticated`, which YIELDS to the sign-in banner; unclassified prose DEGRADES,
+/// accumulating toward the app-shell banner that says Sparkle's AI features are failing. So a
+/// credential that broke hard enough to kill the CLI produced the one message that never mentions
+/// the only fix, and — because an unrefreshable session is STICKY, unlike an allowance that resets
+/// — every automatic caller (suggestions, attention-summary, the judge) kept firing against it and
+/// kept being told to retry. PR #1234 made the suggestions loop treat this as terminal and recorded
+/// that the residue belonged HERE, in the classifier, rather than in a second matcher per consumer.
+///
+/// The exit code is the one diagnostic the JSON path does not have, so it is kept for everything
+/// the classifier does NOT recognise — a corrupt install, a bad shebang, an OOM kill, a flag
+/// removed by a CLI upgrade. Recognition upgrades the message; it never swallows a diagnosis.
+///
+/// `None` for `api_error_status`: there is no result JSON, so there is no status to read, and
+/// inventing one would route a dead CLI into the rate-limit arm.
+fn unusable_output_error(detail: &str, code: Option<i32>, args: &[String]) -> String {
+    // CLASSIFY THE CLI'S OWN WORDS, NEVER OUR PROMPT QUOTED BACK — see `strip_argv_echo`.
+    if let Some(sentinel) = typed_cli_failure(&strip_argv_echo(detail, args), None) {
+        return sentinel.to_string();
+    }
+    // The unrecognised message keeps the ORIGINAL stderr. Stripping is a classification-time
+    // precaution against our own text voting; the diagnosis a human reads should be verbatim.
+    if detail.is_empty() {
+        format!("ai request failed: claude exited {code:?} with no output")
+    } else {
+        format!("ai request failed: claude exited {code:?}: {detail}")
+    }
+}
+
+/// The shortest run of characters that may be treated as OUR TEXT rather than the CLI's.
+///
+/// Long enough that ordinary English cannot collide with a prompt by accident (a 32-char window
+/// shared verbatim with an argument we just passed is quotation, not coincidence), short enough to
+/// catch a usage line that echoes only a clipped fragment. A shorter echo than this is not
+/// detectable here and is left to the multi-word anchoring in `is_account_limit`.
+const ARGV_ECHO_WINDOW: usize = 32;
+
+/// Blank out any span of `detail` that the CLI quoted back from OUR OWN argv.
+///
+/// WHY THIS EXISTS AT ALL. `is_account_limit`'s doc states the rule for the JSON path: the error
+/// body can quote the REQUEST back, and Sparkle's own prompts are agent terminal output, judge
+/// inputs and attention screens — text that genuinely contains "usage limit reached" whenever an
+/// agent it is summarising hit one. `a_429_that_merely_quotes_prompt_text_is_still_a_transient`
+/// pins that for `result_text`. The stderr channel was assumed exempt because "the prompt travels
+/// in argv, not in the CLI's own diagnostics" — but `build_args` passes the prompt AS `-p <user>`,
+/// and an argv-parser error, a usage dump or a Node stack trace is exactly the failure that prints
+/// argv back at you. That is also the only class of failure that reaches this function, since it
+/// runs only when the CLI died before writing any result JSON.
+///
+/// The cost of getting it wrong is not symmetric. A false `claude_usage_limit` YIELDS in
+/// `classifyServiceFailure`, and a yield RESETS the consecutive-failure run — so a broken install
+/// whose usage dump happens to contain the user's own words would hold a genuine sustained outage
+/// permanently below threshold, and light a banner making a specific false claim about their
+/// account. Losing the sentinel costs a less-actionable message; inventing one costs the detector.
+///
+/// Spans are replaced by a SPACE rather than deleted so a cut cannot glue the two halves of
+/// unrelated text into a phrase that matches, and the adjacent real diagnosis survives: a stderr
+/// reading `<echoed prompt> Failed to authenticate: session expired` still classifies.
+fn strip_argv_echo(detail: &str, args: &[String]) -> String {
+    let chars: Vec<char> = detail.chars().collect();
+    if chars.len() < ARGV_ECHO_WINDOW {
+        return detail.to_string();
+    }
+    // Only the free-text option arguments can carry a user's words. The flags and their own values
+    // (`-p`, `json`, the model id) are ours, are shorter than one window, and matching against them
+    // would blank out the CLI's legitimate mention of a flag it rejected.
+    let ours: Vec<&String> = args.iter().filter(|a| a.chars().count() >= ARGV_ECHO_WINDOW).collect();
+    if ours.is_empty() {
+        return detail.to_string();
+    }
+    let mut echoed = vec![false; chars.len()];
+    for start in 0..=(chars.len() - ARGV_ECHO_WINDOW) {
+        let window: String = chars[start..start + ARGV_ECHO_WINDOW].iter().collect();
+        if ours.iter().any(|a| a.contains(&window)) {
+            echoed[start..start + ARGV_ECHO_WINDOW].fill(true);
+        }
+    }
+    let mut out = String::with_capacity(detail.len());
+    let mut cut_open = false;
+    for (i, c) in chars.iter().enumerate() {
+        if echoed[i] {
+            if !cut_open {
+                out.push(' ');
+                cut_open = true;
+            }
+        } else {
+            out.push(*c);
+            cut_open = false;
+        }
+    }
+    out
 }
 
 fn child_path() -> String {
@@ -1138,6 +1255,128 @@ mod tests {
     fn classify_result_json_returns_the_result_text_on_success() {
         let v: serde_json::Value = serde_json::from_str(OK_JSON).unwrap();
         assert_eq!(classify_result_json(&v), CliOutcome::Text("DONE".to_string()));
+    }
+
+    #[test]
+    fn a_dead_cli_that_names_a_broken_credential_gets_the_auth_sentinel_not_prose() {
+        // The defect this covers: the CLI dies before writing any result JSON, so the reason is on
+        // stderr and the JSON classifier never sees it. `run_with` returns a spawn error as the
+        // sentinel verbatim — the same wire `CliOutcome::Failed` uses — so this prose reached every
+        // consumer as a RETRYABLE generic failure, on a condition that stays broken until a human
+        // signs in. Asserting the sentinel, not the input: the prose form is what shipped before.
+        for detail in [
+            "Failed to authenticate: OAuth session expired and could not be refreshed",
+            "error: Not logged in",
+            "Invalid API key provided",
+        ] {
+            assert_eq!(
+                unusable_output_error(detail, Some(1), &[]),
+                "claude_not_authenticated",
+                "for {detail:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_death_keeps_its_exit_code_diagnosis() {
+        // Recognition upgrades the message; it must never swallow the one diagnostic this path has
+        // that the JSON path does not. A bad shebang, a missing dylib and an OOM kill are all
+        // unclassifiable, and the exit code plus the stderr line is the whole diagnosis.
+        let msg = unusable_output_error("dyld: Library not loaded: libnode.dylib", Some(133), &[]);
+        assert!(msg.contains("claude exited"), "lost the exit code: {msg}");
+        assert!(msg.contains("133"), "lost the exit status: {msg}");
+        assert!(msg.contains("dyld"), "lost the stderr diagnosis: {msg}");
+
+        // A silent death still says so, rather than reporting an empty reason.
+        let quiet = unusable_output_error("", Some(9), &[]);
+        assert!(quiet.contains("with no output"), "{quiet}");
+        assert!(quiet.contains('9'), "{quiet}");
+    }
+
+    #[test]
+    fn a_spent_allowance_on_stderr_is_a_usage_limit_not_a_generic_failure() {
+        // Same wire, the other sticky-vs-transient condition: `claude_usage_limit` YIELDS to the
+        // banner that names the user's own allowance, where the generic arm claims the product is
+        // down. The loose arm is reachable here because the prompt has been stripped first — see
+        // the argv-echo pair below; a CLI diagnostic that survives that cut is the CLI's own.
+        assert_eq!(
+            unusable_output_error("Claude usage limit reached", Some(1), &[]),
+            "claude_usage_limit"
+        );
+    }
+
+    /// A prompt that genuinely contains an account-state phrase — the realistic shape, not a
+    /// contrived one: Sparkle's own calls summarise agent terminals, and an agent that hit its
+    /// allowance says so in the text we hand to the CLI.
+    const PROMPT_QUOTING_A_LIMIT: &str =
+        "Summarise this terminal: [agent-7] Claude usage limit reached - resuming at 5pm.";
+
+    #[test]
+    fn an_argv_echo_of_our_own_prompt_never_decides_the_verdict() {
+        // THE PAIRED WITNESS. `build_args` passes the prompt as `-p <user>`, and the ONLY failure
+        // class that reaches `unusable_output_error` is a CLI that died before writing result JSON
+        // — which is exactly the class that prints argv back at you: a parser error, a usage dump,
+        // a Node stack trace. So the assumption that stderr cannot quote the request back is false
+        // for this path, and a false `claude_usage_limit` is not a cosmetic error: it YIELDS in
+        // `classifyServiceFailure`, and a yield RESETS the consecutive-failure run, holding a real
+        // sustained outage below threshold while claiming the user's allowance is spent.
+        let args = build_args("claude-haiku-4-5", "you are a summariser", PROMPT_QUOTING_A_LIMIT);
+
+        // ECHOED — the phrase is in OUR argv, so it must not vote.
+        let echoed =
+            format!("error: unknown option '--safe-mode'\nUsage: claude -p {PROMPT_QUOTING_A_LIMIT} --model <model>");
+        let verdict = unusable_output_error(&echoed, Some(2), &args);
+        assert_ne!(verdict, "claude_usage_limit", "our own prompt decided the verdict: {verdict}");
+        assert!(
+            verdict.contains("unknown option"),
+            "the real diagnosis must survive the strip: {verdict}"
+        );
+
+        // NOT ECHOED — the CLI's own words, under the SAME argv. The guard must not deafen this.
+        assert_eq!(
+            unusable_output_error("Claude usage limit reached|resets 5pm", Some(1), &args),
+            "claude_usage_limit",
+            "a genuine allowance message must still classify"
+        );
+    }
+
+    #[test]
+    fn the_diagnosis_beside_an_echo_still_classifies() {
+        // Spans are blanked, not the whole body discarded — otherwise the fix would trade a false
+        // positive for a false negative, and the auth case (STICKY, unfixable by retrying) is the
+        // one that matters most to keep. Note the pre-strip ordering: `is_account_limit` runs
+        // first, so without the cut this body returns `claude_usage_limit` — the wrong sentinel
+        // AND the wrong stickiness.
+        let args = build_args("claude-haiku-4-5", "you are a summariser", PROMPT_QUOTING_A_LIMIT);
+        let mixed = format!("{PROMPT_QUOTING_A_LIMIT}\nFailed to authenticate: session expired");
+        assert_eq!(
+            unusable_output_error(&mixed, Some(1), &args),
+            "claude_not_authenticated",
+            "the CLI's own diagnosis next to an echo must survive"
+        );
+    }
+
+    #[test]
+    fn strip_argv_echo_leaves_short_arguments_alone() {
+        // Only free-text arguments are treated as ours. Matching on the flags and their short
+        // values (`-p`, `json`, the model id) would blank out the CLI's legitimate complaint about
+        // the very flag it rejected — the diagnosis, deleted by the guard meant to protect it.
+        let args = build_args("claude-haiku-4-5", "sys", "hi");
+        let detail = "error: unknown option '--output-format'; model claude-haiku-4-5 not found";
+        assert_eq!(strip_argv_echo(detail, &args), detail);
+    }
+
+    #[test]
+    fn typed_cli_failure_declines_prose_so_callers_can_tell_recognised_from_not() {
+        // The seam's contract: `None` is what lets `unusable_output_error` keep its own message.
+        // If this ever answered `Some` for arbitrary prose, every unclassified death would lose its
+        // exit code and the test above would be the only thing left saying so.
+        assert_eq!(typed_cli_failure("dyld: Library not loaded", None), None);
+        assert_eq!(typed_cli_failure("", None), None);
+        assert_eq!(
+            typed_cli_failure("Failed to authenticate: session expired", None),
+            Some("claude_not_authenticated")
+        );
     }
 
     #[test]
