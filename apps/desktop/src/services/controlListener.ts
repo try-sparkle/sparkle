@@ -1026,8 +1026,33 @@ function handleSetGoal(req: ControlRequest): Record<string, unknown> {
   // The store may have done something other than what the caller literally asked (a re-asserted goal
   // keeps its counters; an empty text dropped it), and the caller is about to tell a human what
   // happened. `cleared` distinguishes the two without the caller having to compare texts.
-  const reading = goalReading(findAgent(targetId)?.agent.goal, Date.now());
-  return reading ? { ok: true, goal: reading } : { ok: true, cleared: true };
+  const stored = findAgent(targetId)?.agent.goal;
+  const reading = goalReading(stored, Date.now());
+  if (!reading) return { ok: true, cleared: true };
+  // A STATED check can be SILENTLY REFUSED while the goal is still set (bead sparkle-4n1nk). The
+  // store never weakens a binding standing check: `set_agent_goal {verify:{kind:"landed"}}` over an
+  // owed `human`/`command` keeps the OLD check — `mayReplaceVerify` refuses the trade in BOTH doors
+  // (projectStore's same-text re-assert and `chargeGoalDebt`'s new-text path). The goal-set half
+  // succeeds either way, so a bare `{ ok: true, goal }` could not be told apart from "goal set AND
+  // your check applied": a caller that stated `landed` to make its goal self-closable would read
+  // `ok: true`, believe verification was accepted, and proceed to latch a goal it in fact cannot.
+  // `verifyRefused` is the honest bit — the caller asked for one check and the goal now carries a
+  // DIFFERENT one. Derived by comparing the stated check to the one the store actually KEPT, so it
+  // reflects the side effect (what binds the goal) rather than re-deriving the refusal rule here, and
+  // so it stays correct if that rule changes. Absent on genuine success: an accepted check (including
+  // a STRENGTHENING the store takes, where `stored` then equals the stated check) and every call that
+  // stated no check at all (`verify` is null/undefined) both leave it off.
+  const verifyRefused = verify != null && !sameGoalVerify(verify, stored?.verify);
+  return verifyRefused ? { ok: true, goal: reading, verifyRefused: true } : { ok: true, goal: reading };
+}
+
+/** Do two checks name the SAME verification? Kind must match, and `command` must agree on `cmd` — a
+ *  different cmd is a different check (trading `pnpm test parser` for `true` is a refused weakening,
+ *  not the same check). An `undefined` stored side is "no check now", which never equals a stated one. */
+function sameGoalVerify(stated: GoalVerify, stored: GoalVerify | undefined): boolean {
+  if (stored === undefined || stated.kind !== stored.kind) return false;
+  if (stated.kind === "command" && stored.kind === "command") return stated.cmd === stored.cmd;
+  return true;
 }
 
 /**

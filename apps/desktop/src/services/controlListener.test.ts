@@ -1530,6 +1530,94 @@ describe("controlListener", () => {
       expect(goalOf(callerId)!.verify).toEqual({ kind: "landed" });
     });
 
+    // ── verifyRefused: the goal-set REPLY says whether the caller's stated check was applied ───────
+    // bead sparkle-4n1nk. The store refuses a WEAKENING trade (`mayReplaceVerify`) but still sets the
+    // goal, so a bare `{ ok: true, goal }` could not tell "your check applied" from "your check was
+    // refused and a stronger one stands". A caller that stated `landed` to make its goal self-closable
+    // would read `ok: true`, believe verification was accepted, and try to latch a goal it cannot.
+    // `verifyRefused: true` is that missing bit. Each case asserts the REPLY carries (or omits) the
+    // flag AND the store fact it must reflect — a reply-only assertion would pass against a handler
+    // that stamped the flag without the refusal ever happening, and a store-only one is the assertion
+    // that already existed and did not need this field.
+    it("REPLIES verifyRefused when a stated check is refused on IDENTICAL-text re-assert", async () => {
+      const text = "the founder approves the onboarding copy";
+      useProjectStore.getState().setAgentGoal(projectId, callerId, text, undefined, "agent", {
+        kind: "human",
+      });
+      fire({
+        reqId: "vr1",
+        op: "set_agent_goal",
+        callerAgentId: callerId,
+        payload: { goal: text, verify: { kind: "landed" } },
+      });
+      await flush();
+      // THE SIDE EFFECT the flag must reflect: the store kept the stronger `human`, not the `landed`
+      // the caller asked for — so the reply MUST say the check was refused.
+      expect(goalOf(callerId)!.verify).toEqual({ kind: "human" });
+      expect(lastReply()).toMatchObject({ ok: true, verifyRefused: true });
+    });
+
+    it("REPLIES verifyRefused when a stated check is refused on the NEW-text (chargeGoalDebt) path", async () => {
+      // The other door: an owed COMMAND check the agent cannot close, then genuinely new landing-shaped
+      // work stating `landed`. The store downgrades to `human` rather than take the weaker stated check.
+      useProjectStore
+        .getState()
+        .setAgentGoal(projectId, callerId, "the parser handles nested groups", undefined, "agent", {
+          kind: "command",
+          cmd: "pnpm --filter @sparkle/desktop exec vitest run src/parser.test.ts",
+        });
+      fire({
+        reqId: "vr2",
+        op: "set_agent_goal",
+        callerAgentId: callerId,
+        payload: { goal: "the parser fix is merged to origin/main", verify: { kind: "landed" } },
+      });
+      await flush();
+      expect(goalOf(callerId)!.verify).toEqual({ kind: "human" });
+      expect(lastReply()).toMatchObject({ ok: true, verifyRefused: true });
+    });
+
+    it("OMITS verifyRefused when the stated check is ACCEPTED — the plain success case", async () => {
+      // No standing check, so `landed` is applied verbatim: the caller got exactly what it asked for,
+      // and the flag must be ABSENT or every honest success reads as a refusal.
+      fire({
+        reqId: "vr3",
+        op: "set_agent_goal",
+        callerAgentId: callerId,
+        payload: { goal: "the retry fix is merged to origin/main", verify: { kind: "landed" } },
+      });
+      await flush();
+      expect(goalOf(callerId)!.verify).toEqual({ kind: "landed" });
+      expect(lastReply()).toMatchObject({ ok: true });
+      expect((lastReply() as { verifyRefused?: boolean }).verifyRefused).toBeUndefined();
+    });
+
+    it("OMITS verifyRefused when the stated check STRENGTHENS the standing one — that is applied, not refused", async () => {
+      // The trap this flag must not fall into: strengthening (`landed` → `human`) IS accepted, so the
+      // stored check equals the stated one and the reply must NOT claim a refusal. Keying the flag on
+      // "a check was stated" rather than "the stated check differs from what was kept" would mislabel
+      // this genuine success.
+      const text = "the retry fix is merged to origin/main";
+      useProjectStore.getState().setAgentGoal(projectId, callerId, text, undefined, "agent", {
+        kind: "landed",
+      });
+      fire({
+        reqId: "vr4",
+        op: "set_agent_goal",
+        callerAgentId: callerId,
+        payload: { goal: text, verify: { kind: "human" } },
+      });
+      await flush();
+      expect(goalOf(callerId)!.verify).toEqual({ kind: "human" });
+      expect((lastReply() as { verifyRefused?: boolean }).verifyRefused).toBeUndefined();
+    });
+
+    it("OMITS verifyRefused when NO check was stated at all", async () => {
+      fire({ reqId: "vr5", op: "set_agent_goal", callerAgentId: callerId, payload: { goal: "land the retry PR" } });
+      await flush();
+      expect((lastReply() as { verifyRefused?: boolean }).verifyRefused).toBeUndefined();
+    });
+
     it("a LEGACY goal with no provenance recorded binds — the upgrade must fail closed", async () => {
       // roborev 57813. `verify` already ships on origin/main, and main's chargeGoalDebt downgraded
       // every inherited check to exactly `{kind:"human"}` — so the installed base is full of
