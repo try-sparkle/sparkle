@@ -36,6 +36,7 @@ const h = vi.hoisted(() => ({
   answersLivePicker: vi.fn((_agentId: string, _text: string) => false),
   pick: vi.fn(),
   startConciergeTurn: vi.fn(async (_p: string): Promise<string | null> => null),
+  brain: {} as { done?: (e: { id: string; sessionId: string; text: string }) => void },
 }));
 
 vi.mock("../services/openProjectTab", () => ({
@@ -49,10 +50,18 @@ vi.mock("../services/concierge", () => ({
   // degrade — vitest throws on the missing property and every case in the file dies at mount.
   onConciergeTool: () => () => {},
   onConciergeDelta: () => () => {},
-  onConciergeDone: () => () => {},
+  // CAPTURED, not inert: a send now QUEUES behind a running turn (sparkle-t8wsj), so a case that
+  // sends twice needs a way to END the first turn or the second never dispatches.
+  onConciergeDone: (cb: (e: { id: string; sessionId: string; text: string }) => void) => {
+    h.brain.done = cb;
+    return () => {};
+  },
   onConciergeError: () => () => {},
   onConciergeTurnsAbandoned: () => () => {},
   isSupersededDetail: () => false,
+  // Reached only once a `done` actually fires — which this suite never did until the queue made
+  // ending a turn part of the setup (sparkle-t8wsj).
+  isProactiveTurn: () => false,
   SUPERSEDED_DETAILS: [],
 }));
 // A picker really IS on screen for ag1, and the terse text really WOULD match one of its options —
@@ -257,6 +266,13 @@ describe("ConciergeHost — a terse answer, a live picker on screen, and files s
     await send("Yes");
     h.answersLivePicker.mockReturnValue(false); // the picker is answered and gone
     await send("now look at this");
+    // The second send QUEUES now (sparkle-t8wsj), so end the first turn to let it dispatch. What
+    // this case is about — that the attachment does not ride along on the NEXT message — is
+    // unchanged; only the point at which the second turn starts moved.
+    await act(async () => {
+      h.brain.done?.({ id: "1", sessionId: "s1", text: "" });
+    });
+    await flush();
     expect(askedSparkle()[1]).toContain("now look at this");
     expect(askedSparkle()[1]).not.toContain("/tmp/shot.png");
   });

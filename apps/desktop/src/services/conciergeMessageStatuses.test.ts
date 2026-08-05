@@ -19,6 +19,7 @@ import {
   noteConciergeSent,
 } from "./conciergeLiveness";
 import { useProjectStore } from "../stores/projectStore";
+import { enqueue, EMPTY_TURN_QUEUE } from "../engine/conciergeTurnQueue";
 
 /** The counter as it stands now — what the host snapshots as the turn floor. */
 const seqNow = () => useConciergeActivityStore.getState().latest?.seq ?? -1;
@@ -136,5 +137,43 @@ describe("useConciergeMessageStatuses", () => {
     noteConciergePhase("composing");
     const { result } = renderHook(() => useConciergeMessageStatuses("msg-1", true, floor));
     expect(Object.keys(result.current["msg-1"]!)).toEqual(["text"]);
+  });
+
+  /**
+   * QUEUED MESSAGES CARRY THEIR OWN LINE (sparkle-t8wsj). Before sends queued, only one message
+   * could ever have a status; now the founder's *"I don't know which one you are working on"* is
+   * answered for every message he sent, not just the newest.
+   *
+   * The two kinds of line differ in nature and this asserts both: the working message's line is
+   * OBSERVED (it names the tool actually running), while a waiting message's line is a fact about
+   * the QUEUE and claims nothing about what the concierge is doing.
+   */
+  it("gives every queued message its own waiting line, and the working one the live tool line", () => {
+    const floor = seqNow();
+    noteConciergeSent();
+    noteConciergeNativeToolCall("Grep", '{"pattern":"x"}');
+    let q = enqueue(EMPTY_TURN_QUEUE, { bubbleId: "msg-1", text: "first" }).next;
+    q = enqueue(q, { bubbleId: "msg-2", text: "second" }).next;
+    q = enqueue(q, { bubbleId: "msg-3", text: "third" }).next;
+
+    const { result } = renderHook(() => useConciergeMessageStatuses("msg-1", true, floor, q));
+    // The one being worked on gets the observed tool line…
+    expect(result.current["msg-1"]!.text).not.toBe("Waiting its turn");
+    expect(result.current["msg-1"]!.text.length).toBeGreaterThan(0);
+    // …and the ones behind it say only that they are in line.
+    expect(result.current["msg-2"]).toEqual({ text: "Waiting its turn" });
+    expect(result.current["msg-3"]).toEqual({ text: "Waiting its turn" });
+  });
+
+  // A waiting line does NOT depend on the activity floor or on `typing`: a queued message has no
+  // turn, so there is no activity that could describe it.
+  it("still marks waiters when the running turn has produced no activity yet", () => {
+    const floor = seqNow();
+    noteConciergeSent();
+    let q = enqueue(EMPTY_TURN_QUEUE, { bubbleId: "msg-1", text: "first" }).next;
+    q = enqueue(q, { bubbleId: "msg-2", text: "second" }).next;
+    const { result } = renderHook(() => useConciergeMessageStatuses("msg-1", true, floor, q));
+    expect(result.current["msg-1"]).toBeUndefined(); // no activity, no claim
+    expect(result.current["msg-2"]).toEqual({ text: "Waiting its turn" });
   });
 });

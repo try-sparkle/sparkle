@@ -10,13 +10,15 @@
 // than to a question, so the reader has to infer which of their messages it is about. Attaching it
 // to the bubble removes the inference.
 //
-// ══ WHY EXACTLY ONE MESSAGE EVER CARRIES A STATUS TODAY ═════════════════════════════════════════
-// Not a simplification — a property of the backend, and the honest rendering of it. A send does not
-// QUEUE behind the turn in flight, it SUPERSEDES it: `concierge.rs` kills the running turn's process
-// group, and `buildSnapshot` puts only the newest message in the prompt. So at any instant there is
-// exactly one message being worked on, and it is always the most recent one. A map is still the
-// right shape — it is what the per-message surface consumes, and it is what stops this from being
-// re-plumbed when that changes (bead sparkle-t8wsj, which makes sends queue and fan out).
+// ══ SEVERAL MESSAGES CARRY A STATUS NOW (sparkle-t8wsj) ═════════════════════════════════════════
+// This header used to say only one ever could, because a send SUPERSEDED the turn in flight — it
+// killed the running child rather than waiting. Sends QUEUE now, so at any instant there is one
+// message being WORKED ON and any number WAITING behind it, and each carries its own line. That is
+// what the founder asked for: *"I don't know which one you are working on."*
+//
+// The two kinds of line are different in nature and must not be conflated. The working message's
+// line is OBSERVED — it names the tool actually running. A waiting message's line is a fact about
+// the QUEUE, not about the concierge, and says only that: its turn has not started.
 //
 // ══ WHAT AN OLDER MESSAGE GETS: NOTHING, DELIBERATELY ═══════════════════════════════════════════
 // It is tempting to mark a displaced message "never answered", and this app has already tried it.
@@ -38,6 +40,7 @@
 import { useMemo } from "react";
 
 import { conciergeActivityLine } from "../engine/conciergeActivityLine";
+import { EMPTY_TURN_QUEUE, type TurnQueueState } from "../engine/conciergeTurnQueue";
 import { useConciergeActivityStore } from "./conciergeActivity";
 import type { ConciergeMessageStatusText } from "../components/Concierge/MessageStatus";
 
@@ -61,17 +64,24 @@ export function useConciergeMessageStatuses(
   awaitingId: string | null,
   typing: boolean,
   floor: number,
+  queue: TurnQueueState = EMPTY_TURN_QUEUE,
 ): Record<string, ConciergeMessageStatusText> {
   const latest = useConciergeActivityStore((s) => s.latest);
 
   return useMemo(() => {
-    if (!awaitingId || !typing) return NONE;
+    // WAITING MESSAGES FIRST, and they do not depend on `typing` or the activity floor: a queued
+    // message has no turn, so there is no activity that could describe it. The line states the one
+    // thing that IS true of it — it is in line — and nothing about what the concierge is doing.
+    const waiting: Record<string, ConciergeMessageStatusText> = {};
+    for (const q of queue.waiting) waiting[q.bubbleId] = { text: "Waiting its turn" };
+
+    if (!awaitingId || !typing) return queue.waiting.length ? waiting : NONE;
     const fresh = latest && latest.seq > floor ? latest : null;
     const line = fresh ? conciergeActivityLine(fresh) : null;
     // NO ACTIVITY, NO CLAIM — the rule the column-level indicator degrades by, kept identical here.
     // A turn that is thinking and has called nothing yet gets no status rather than a manufactured
     // one; the bubble simply carries nothing, exactly as it did before this feature.
-    if (!line) return NONE;
-    return { [awaitingId]: { text: line.text } };
-  }, [awaitingId, typing, latest, floor]);
+    if (!line) return queue.waiting.length ? waiting : NONE;
+    return { ...waiting, [awaitingId]: { text: line.text } };
+  }, [awaitingId, typing, latest, floor, queue]);
 }

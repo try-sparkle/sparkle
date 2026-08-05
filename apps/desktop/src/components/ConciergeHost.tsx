@@ -65,6 +65,18 @@ import { openProjectTab } from "../services/openProjectTab";
 import { agentExists } from "../services/agentReveal";
 import { useHistoryStore } from "../stores/historyStore";
 import { useConciergeMessageStatuses } from "../services/conciergeMessageStatuses";
+import {
+  clearQueue,
+  EMPTY_TURN_QUEUE,
+  // ALIASED: this file already has an `enqueue` — the send SERIALIZER, which orders network
+  // round-trips within one send. This one queues whole TURNS. Different jobs, and a shadowed name
+  // here would silently route sends into the wrong one.
+  enqueue as enqueueTurn,
+  statusOf,
+  turnFinished,
+  type QueuedTurn,
+  type TurnQueueState,
+} from "../engine/conciergeTurnQueue";
 import { useConciergeTurnFloor } from "../services/conciergeTurnFloor";
 import {
   onConciergeDelta,
@@ -1051,6 +1063,35 @@ export function ConciergeHost({
    */
   const [awaitingId, setAwaitingId] = useState<string | null>(null);
   /**
+   * The turn queue (sparkle-t8wsj). A REF plus mirrored state, and both are load-bearing: the send
+   * path reads and writes it synchronously — two sends in the same tick must see each other, which
+   * `useState` alone cannot guarantee — while the mirror is what re-renders the per-message status
+   * when a message moves from waiting to working.
+   */
+  const turnQueueRef = useRef<TurnQueueState>(EMPTY_TURN_QUEUE);
+  const [turnQueue, setTurnQueue] = useState<TurnQueueState>(EMPTY_TURN_QUEUE);
+  /** `dispatchTurn` through a ref: the send path calls it above its definition, and the turn-ended
+   *  handlers call it from effects that must not re-subscribe when it changes identity. */
+  const dispatchTurnRef = useRef<(entry: QueuedTurn) => void>(() => {});
+  /** `drainQueue` through a ref, for the same reason `dispatchTurn` is: the brain subscription
+   *  effect must keep its minimal dep array — re-subscribing mid-turn would drop the events still
+   *  arriving for it — and `dispatchTurn` is defined below its own callers. */
+  const drainQueueRef = useRef<() => void>(() => {});
+
+  /**
+   * The running turn ended — release the slot and start the next waiter, if any.
+   *
+   * A plain function on a ref rather than a `useCallback` dependency of the subscription effect:
+   * that effect subscribes once for the life of the host, and giving it a changing identity would
+   * tear down and re-establish the brain subscriptions on every render.
+   */
+  const drainQueue = useCallback(() => {
+    const outcome = turnFinished(turnQueueRef.current);
+    turnQueueRef.current = outcome.next;
+    setTurnQueue(outcome.next);
+    if (outcome.dispatch) dispatchTurnRef.current(outcome.dispatch);
+  }, []);
+  /**
    * Bumped on EVERY send — the turn-boundary signal for `useConciergeTurnFloor`.
    *
    * A counter rather than `awaitingId`, because not every send has a bubble: `relayFollowUp` and
@@ -1996,7 +2037,19 @@ export function ConciergeHost({
     // channel exists to avoid making.
     const answerFields = (prev: ConciergeMessage[], id: string): { answers?: ReplyAnchor[] } => {
       if (isProactiveTurn(id)) return {};
-      const answers = pendingAnchors(prev);
+      // ══ A QUEUED MESSAGE IS NOT ANSWERED BY THE TURN AHEAD OF IT (probe 2 on PR #1235) ══════════
+      // `pendingAnchors` walks back to the last settled reply and claims every user message since.
+      // That was exactly right when a send superseded — the newest message WAS the one being
+      // answered. With a queue it over-claims: if B is sent while A is still running, B's bubble is
+      // already in the thread, so A's reply would carry an "Answered below" anchor for a question
+      // that was never in A's prompt (`buildSnapshot` carries one message).
+      //
+      // Filtered on the QUEUE rather than on the thread, because the thread cannot tell the
+      // difference — both bubbles look identically sent. `statusOf` is the reducer's own answer to
+      // "has this message's turn started", which is precisely the question being asked here.
+      const answers = pendingAnchors(prev).filter(
+        (a) => statusOf(turnQueueRef.current, a.id) !== "waiting",
+      );
       return answers.length ? { answers } : {};
     };
     // `lint` IS ONLY EVER PASSED BY THE `done` PATH, and the omission is load-bearing on the delta
@@ -2096,6 +2149,9 @@ export function ConciergeHost({
       // would take the indicator away from the reply the user IS waiting on.
       if (!isProactiveTurn(e.id)) {
         setTyping(false);
+        // DRAIN THE QUEUE (sparkle-t8wsj). The turn that was holding the slot is over, so the next
+        // waiting message may start. Reads the ref rather than the mirrored state: several turn-ended
+        // events can land in one tick, and state would still show the queue as it was.
         // The turn is over and it answered. Clears every liveness escalation, including a latched
         // UNAVAILABLE — "recovering must clear the state promptly", and this is the recovery.
         // A push is excluded for the same reason it does not own the typing indicator: it is not
@@ -2104,7 +2160,14 @@ export function ConciergeHost({
         // This bubble got its answer, so the NEXT send has nothing to orphan. Without this, every
         // message would be stamped "never answered" by whatever the user typed after it.
         awaitingBubbleRef.current = null;
-      setAwaitingId(null);
+        setAwaitingId(null);
+      // ══ DRAINED AFTER TEARDOWN, NEVER BEFORE (probe 3) ═══════════════════════════════════════════
+      // `drainQueue` DISPATCHES the next turn, and dispatch sets the awaited bubble, starts the
+      // liveness clock and raises the typing indicator. Every one of those is state about the turn
+      // that just STARTED — so running it before this handler's teardown meant the teardown then
+      // cleared them: `noteConciergeSettled` stopped the new turn's clock and the null-out dropped
+      // its bubble association, leaving turn N+1 running with no message attached to it.
+        drainQueueRef.current();
       }
       // ══ THE LINTER RUNS HERE ═══════════════════════════════════════════════════════════════════
       // The reply is COMPLETE at `done`, which is what the checks need: mid-stream, `[@Left Pai` is
@@ -2255,6 +2318,9 @@ export function ConciergeHost({
         return;
       }
       setTyping(false);
+      // DRAINED ON FAILURE TOO, and that is deliberate: if a failed turn did not release the slot,
+      // one quota rejection would strand every question queued behind it — the 2026-07-29 burst
+      // turned into a permanent stall instead of a recoverable one.
       // A failed turn never reaches the done handler, so drop its partial text here rather than
       // retaining every failed reply for the life of the session.
       delete brainTextRef.current[e.id];
@@ -2272,6 +2338,13 @@ export function ConciergeHost({
       // must not stamp this bubble "never answered" on top of the error it already carries.
       awaitingBubbleRef.current = null;
       setAwaitingId(null);
+      // ══ DRAINED AFTER TEARDOWN, NEVER BEFORE (probe 3) ═══════════════════════════════════════════
+      // `drainQueue` DISPATCHES the next turn, and dispatch sets the awaited bubble, starts the
+      // liveness clock and raises the typing indicator. Every one of those is state about the turn
+      // that just STARTED — so running it before this handler's teardown meant the teardown then
+      // cleared them: `noteConciergeSettled` stopped the new turn's clock and the null-out dropped
+      // its bubble association, leaving turn N+1 running with no message attached to it.
+      drainQueueRef.current();
       const notice = conciergeFailureNotice(e.detail);
       setChat((prev) => [
         ...prev,
@@ -2316,6 +2389,11 @@ export function ConciergeHost({
     // the previous human's left to render.
     const offReset = onConciergeTurnsAbandoned(() => {
       setTyping(false);
+      // DISCARD, never drain. The conversation was thrown away; starting a queued turn here would
+      // resurrect a question the user just discarded — which is why `clearQueue` is a separate
+      // entry point from `turnFinished` rather than a flag on it.
+      turnQueueRef.current = clearQueue();
+      setTurnQueue(turnQueueRef.current);
       // `clearConciergeLiveness`, not `noteConciergeSettled`: the turn did not settle, and an identity
       // boundary must not preserve a field a turn boundary would.
       clearConciergeLiveness();
@@ -2978,9 +3056,62 @@ export function ConciergeHost({
         ),
       );
     }
-    awaitingBubbleRef.current = bubbleId ?? null;
-    setAwaitingId(bubbleId ?? null);
-    // EVERY send moves the boundary, including one with no bubble of its own.
+    // ══ QUEUE, DO NOT SUPERSEDE (sparkle-t8wsj) ═══════════════════════════════════════════════
+    //
+    // The decision is the reducer's; this only carries it out. With nothing running the entry is
+    // dispatched immediately and everything below behaves exactly as it always has. With a turn
+    // already in flight the send WAITS — and that is the whole defect being fixed: dispatching
+    // here is what makes `concierge.rs` kill the running child, destroying the answer the user is
+    // waiting on (149 of 378 turns on 2026-07-29).
+    const queued: QueuedTurn = { bubbleId: bubbleId ?? `pending-${Date.now()}`, text };
+    const outcome = enqueueTurn(turnQueueRef.current, queued);
+    turnQueueRef.current = outcome.next;
+    setTurnQueue(outcome.next);
+    // ══ A DROPPED MESSAGE IS SAID OUT LOUD (probe 3 on PR #1235) ══════════════════════════════════
+    // At the cap the reducer evicts the OLDEST waiter. That is the right message to lose — the user
+    // has moved on from it, and the alternative is refusing the one they are still looking at — but
+    // losing it SILENTLY is not acceptable: the whole point of this feature is that a question the
+    // user asked is never quietly destroyed, which is precisely the defect the queue replaced.
+    // `SendOutcome.dropped` exists for this, and until now nothing read it.
+    if (outcome.dropped) {
+      const lost = outcome.dropped;
+      setChat((prev) => [
+        ...prev,
+        {
+          id: nextId("err"),
+          kind: "failure",
+          headline: "One queued message was dropped",
+          // The TEXT, so the user can see which question went and re-send it if it still matters.
+          // A count alone ("1 message dropped") would tell them something was lost and give them no
+          // way to recover it.
+          evidence: lost.text,
+        },
+      ]);
+    }
+    if (!outcome.dispatch) {
+      // WAITING. The turn in flight keeps the typing indicator, the liveness clock, the activity
+      // floor and the awaited-bubble pointer — every one of those describes the turn being
+      // ANSWERED, and this message is not it. The per-message status is what says this one is
+      // queued (engine/conciergeTurnQueue.statusOf), which is the surface the founder asked for.
+      return;
+    }
+    dispatchTurnRef.current(outcome.dispatch);
+  }, []);
+
+  /**
+   * Actually start a turn — the half of the old `askSparkle` tail that must only run for a send
+   * that is DISPATCHING.
+   *
+   * Everything here is about the turn now in flight: the awaited bubble, the liveness clock, the
+   * typing indicator, and the retirement floor that silences older turns. Running any of it for a
+   * QUEUED message would describe a turn that has not started, and `retireThroughRef` in particular
+   * would silence the turn that is still legitimately streaming.
+   */
+  const dispatchTurn = useCallback((entry: QueuedTurn) => {
+    const bubbleId = entry.bubbleId.startsWith("pending-") ? null : entry.bubbleId;
+    awaitingBubbleRef.current = bubbleId;
+    setAwaitingId(bubbleId);
+    // EVERY dispatched turn moves the boundary, including one with no bubble of its own.
     setSendSeq((n) => n + 1);
     // The send itself, for the liveness clock. AFTER the orphan check, which reads the state this
     // call is about to reset.
@@ -2996,11 +3127,33 @@ export function ConciergeHost({
     // are belt to concierge.rs's braces, which stops a superseded reader emitting at all
     // (roborev 53088/53105/53130).
     retireThroughRef.current = latestTurnRef.current;
-    void startConciergeTurn(buildSnapshot(feedRef.current, text)).then((id) => {
-      const n = id !== null && /^\d+$/.test(id) ? Number(id) : null;
-      if (n !== null) retireThroughRef.current = Math.max(retireThroughRef.current, n - 1);
-    });
+    // BUILT NOW, NOT AT ENQUEUE. A queued entry deliberately carries no snapshot: the fleet picture
+    // is read at dispatch so a turn that waited behind three others still describes the app as it
+    // is when it actually runs, rather than as it looked when the user typed.
+    void startConciergeTurn(buildSnapshot(feedRef.current, entry.text)).then(
+      (id) => {
+        const n = id !== null && /^\d+$/.test(id) ? Number(id) : null;
+        if (n !== null) retireThroughRef.current = Math.max(retireThroughRef.current, n - 1);
+      },
+      // ══ A REJECTED DISPATCH MUST STILL RELEASE THE SLOT (probe 4 on PR #1235) ═══════════════════
+      // `startConciergeTurn` throws BEFORE its own try block when AI enhancements are off
+      // (`ConciergeAiDisabledError`) — deliberately, so no paid child is spawned. That path emits no
+      // `concierge:error` event, so the handler that would normally drain never runs: the entry sits
+      // as `running` forever and EVERY later question queues behind a turn that does not exist.
+      //
+      // Turning the toggle off with messages waiting is not exotic — it is the shape a user
+      // reaches by pausing the concierge mid-queue, and the failure is silent and permanent.
+      (err) => {
+        console.warn("concierge: turn failed to start:", err);
+        setTyping(false);
+        awaitingBubbleRef.current = null;
+        setAwaitingId(null);
+        drainQueueRef.current();
+      },
+    );
   }, []);
+  dispatchTurnRef.current = dispatchTurn;
+  drainQueueRef.current = drainQueue;
 
   /** Stamp a receipt onto a user bubble. Clears `redirectable` from every OTHER bubble, so only
    *  the newest routed message offers the button — a thread full of live redirects invites
@@ -4270,7 +4423,7 @@ export function ConciergeHost({
    * and merged into the model as its own field, so only the map's identity changes when the status
    * moves.
    */
-  const messageStatuses = useConciergeMessageStatuses(awaitingId, typing, turnFloor);
+  const messageStatuses = useConciergeMessageStatuses(awaitingId, typing, turnFloor, turnQueue);
   const modelWithStatuses: ConciergeViewModel = useMemo(
     () => ({ ...model, statuses: messageStatuses, turnFloor }),
     [model, messageStatuses, turnFloor],

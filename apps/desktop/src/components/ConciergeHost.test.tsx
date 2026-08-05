@@ -208,6 +208,7 @@ import {
   _resetConciergeActivityForTests,
   noteConciergeToolCall,
 } from "../services/conciergeActivity";
+import { MESSAGE_STATUS_TESTID } from "./Concierge/MessageStatus";
 import {
   THINKING_ACTIVITY_TESTID,
   THINKING_INDICATOR_TESTID,
@@ -609,11 +610,47 @@ describe("ConciergeHost", () => {
       "Looking over your projects",
     );
 
-    // The user sends again WITHOUT the turn finishing — `typing` stays true throughout.
+    // THE SECOND SEND NOW QUEUES (sparkle-t8wsj) — it does not start a turn, so it takes no
+    // boundary and the caption keeps describing the turn that is actually running. This case was
+    // written when a re-send SUPERSEDED, and its old expectation ("Reading your message" again) is
+    // exactly the behaviour that killed the first turn's work.
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "and this too" } });
     fireEvent.click(screen.getByText("Send"));
     await settle();
-    expect(screen.getByTestId(THINKING_ACTIVITY_TESTID).textContent).toBe("Reading your message");
+    expect(screen.getByTestId(THINKING_ACTIVITY_TESTID).textContent).toBe(
+      "Looking over your projects",
+    );
+  });
+
+  /**
+   * THE DEFECT sparkle-t8wsj FIXES, end to end through the real host: a second send must not start
+   * a turn while one is running, because starting one is what makes `concierge.rs` kill the child
+   * answering the first question.
+   *
+   * Asserted on `startConciergeTurn` CALL COUNT, which is the thing that does the killing — the
+   * caption assertion above is a consequence, not the mechanism.
+   */
+  it("queues a second send instead of starting a turn that would kill the first", async () => {
+    _resetConciergeActivityForTests();
+    h.feed = feedWith("approval");
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "first question" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    const afterFirst = h.startConciergeTurn.mock.calls.length;
+    expect(afterFirst).toBeGreaterThan(0);
+
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "second question" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    // No new turn: the first one is still being answered.
+    expect(h.startConciergeTurn.mock.calls.length).toBe(afterFirst);
+
+    // …and when it finishes, the queued one starts — carrying ITS OWN text.
+    act(() => h.brain.done?.({ id: "1", text: "answered" }));
+    await settle();
+    expect(h.startConciergeTurn.mock.calls.length).toBe(afterFirst + 1);
+    expect(String(h.startConciergeTurn.mock.calls.at(-1)?.[0])).toContain("second question");
   });
 
   /**
@@ -649,15 +686,87 @@ describe("ConciergeHost", () => {
     // pins nothing about the `retireThrough` branch that the production comment identifies as the
     // one closing the straggler window — the earlier version of this case did exactly that and
     // claimed otherwise.
+    // A SEND NO LONGER RETIRES THE RUNNING TURN (sparkle-t8wsj) — it queues — so the displaced-turn
+    // shape is now produced by the turn ENDING and the queued one starting, which is what advances
+    // the retirement floor past turn 1.
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "and this too" } });
     fireEvent.click(screen.getByText("Send"));
     await settle();
-    const afterResend = screen.getByTestId(THINKING_ACTIVITY_TESTID).textContent;
-    expect(afterResend).toBe("Reading your message");
+    act(() => h.brain.done?.({ id: "1", text: "answered" }));
+    await settle();
+    const afterDrain = screen.getByTestId(THINKING_ACTIVITY_TESTID).textContent;
+    expect(afterDrain).toBe("Reading your message");
 
-    // Turn 1 flushes late, under its OWN id, which the re-send has now retired.
+    // Turn 1 flushes late, under its OWN id, which is now retired.
     act(() => h.brain.tool?.({ id: "1", name: "Read", input: '{"file_path":"/x"}' }));
-    expect(screen.getByTestId(THINKING_ACTIVITY_TESTID).textContent).toBe(afterResend);
+    expect(screen.getByTestId(THINKING_ACTIVITY_TESTID).textContent).toBe(afterDrain);
+  });
+
+  /**
+   * THE DRAIN MUST NOT RUN BEFORE THE TEARDOWN (probe 3 on PR #1235).
+   *
+   * `drainQueue` DISPATCHES the next turn, and dispatch sets the awaited bubble, starts the liveness
+   * clock and raises the typing indicator. Draining before this handler's teardown meant the
+   * teardown then cleared them — turn N+1 ran with no message attached and a stopped clock.
+   *
+   * Asserted on the TYPING INDICATOR surviving the turn that ended: it is raised by the dispatch and
+   * cleared by the teardown, so it is the visible consequence of the ordering.
+   */
+  it("keeps the next turn's state after the finishing turn tears down", async () => {
+    _resetConciergeActivityForTests();
+    h.feed = feedWith("approval");
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "first" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "second" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+
+    // Turn 1 ends: the queued turn 2 starts, and turn 1's teardown must not undo it.
+    act(() => h.brain.done?.({ id: "1", text: "answered" }));
+    await settle();
+    // THE PER-MESSAGE STATUS IS STILL ATTACHED, which is the assertion that actually discriminates.
+    //
+    // `typing` and the column caption both SURVIVE the bug — nothing sets typing false afterwards
+    // and the phase was already recorded — so asserting on them passes against the broken ordering.
+    // (The first version of this case did exactly that and stayed green under the mutation.) What
+    // the teardown really destroys is `awaitingId`: nulling it detaches the running turn from its
+    // bubble, so the per-message status has nothing to attach to and disappears entirely.
+    expect(screen.queryByTestId(THINKING_INDICATOR_TESTID)).toBeTruthy();
+    expect(screen.queryByTestId(MESSAGE_STATUS_TESTID)).toBeTruthy();
+  });
+
+  /**
+   * A REJECTED DISPATCH STILL RELEASES THE SLOT (probe 4 on PR #1235).
+   *
+   * `startConciergeTurn` throws before its own try block when AI enhancements are off, and that path
+   * emits no `concierge:error` event — so nothing drained, the entry stayed `running` forever, and
+   * every later question queued behind a turn that did not exist.
+   */
+  it("drains the queue when a dispatch REJECTS without emitting an error event", async () => {
+    _resetConciergeActivityForTests();
+    h.feed = feedWith("approval");
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "first" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+
+    // The NEXT dispatch rejects — no error event follows it.
+    h.startConciergeTurn.mockRejectedValueOnce(new Error("ai enhancements are off"));
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "second" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    const before = h.startConciergeTurn.mock.calls.length;
+    act(() => h.brain.done?.({ id: "1", text: "answered" }));
+    await settle();
+    expect(h.startConciergeTurn.mock.calls.length).toBe(before + 1); // the rejecting one ran
+
+    // A THIRD question must still be reachable — the rejected turn released the slot.
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "third" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    expect(String(h.startConciergeTurn.mock.calls.at(-1)?.[0])).toContain("third");
   });
 
   // Each refused path gets its OWN remedy, and the remedies genuinely differ: Retry for a pane that

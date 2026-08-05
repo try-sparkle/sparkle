@@ -236,14 +236,31 @@ describe("ConciergeHost — turn tokens (a superseded turn keeps talking — con
   const done = (id: string, text: string) =>
     act(() => h.brain.done?.({ id, sessionId: "s1", text }));
 
+  /**
+   * Send again and let the NEXT turn actually start.
+   *
+   * A send no longer supersedes — it QUEUES (sparkle-t8wsj) — so a second `send()` alone leaves the
+   * first turn running and no second turn exists to be raced. The retired-turn shape these rows
+   * guard is still entirely real (a turn ends, the queued one starts, and the old reader flushes
+   * its buffer afterwards); it is now reached by ENDING the running turn rather than by displacing
+   * it. Every assertion below is unchanged — only the way turn 8 comes into existence moved.
+   */
+  const sendAndStartNext = async (c: { type: (t: string) => void; send: () => Promise<void> }, text: string, endingId: string) => {
+    c.type(text);
+    await c.send();
+    // The running turn ends, which releases the slot and dispatches the queued message.
+    await act(async () => {
+      h.brain.done?.({ id: endingId, sessionId: "s1", text: "" });
+    });
+  };
+
   it("a straggler from the OLD turn can't corrupt the new turn's reply", async () => {
     const c = mount();
     c.type("first question");
     await c.send();
     delta("7", "part of the OLD answer");
-    // The user asks again: the backend kills turn 7 and spawns turn 8.
-    c.type("second question");
-    await c.send();
+    // The user asks again; turn 7 then ends, so turn 8 starts and 7's reader flushes late.
+    await sendAndStartNext(c, "second question", "7");
     delta("7", " …and more of it"); // turn 7's reader flushing its buffer, post-kill
     delta("8", "The new answer.");
     done("8", "");
@@ -256,8 +273,7 @@ describe("ConciergeHost — turn tokens (a superseded turn keeps talking — con
     c.type("first question");
     await c.send();
     delta("7", "the old answer");
-    c.type("second question");
-    await c.send();
+    await sendAndStartNext(c, "second question", "7");
     done("7", "the old answer, finished"); // races the new send
     expect(within(thread()).queryByText(/finished/)).toBeNull();
 
@@ -271,8 +287,7 @@ describe("ConciergeHost — turn tokens (a superseded turn keeps talking — con
     c.type("first question");
     await c.send();
     delta("7", "partial");
-    c.type("second question");
-    await c.send();
+    await sendAndStartNext(c, "second question", "7");
     act(() => h.brain.error?.({ id: "7", detail: "killed" }));
     expect(within(thread()).queryByText(/couldn't reach my brain/i)).toBeNull();
   });
@@ -287,8 +302,7 @@ describe("ConciergeHost — turn tokens (a superseded turn keeps talking — con
     await c.send();
     delta("7", "the first answer");
     h.startConciergeTurn.mockResolvedValueOnce("9");
-    c.type("second");
-    await c.send();
+    await sendAndStartNext(c, "second", "7");
     await act(async () => {}); // the token lands
     delta("8", "the dead turn's buffered output");
     expect(within(thread()).queryByText(/dead turn/)).toBeNull();
@@ -310,14 +324,25 @@ describe("ConciergeHost — turn tokens (a superseded turn keeps talking — con
     await c.send();
     delta("7", "the first answer");
 
+    // The deferred token: turn 9's `startConciergeTurn` hangs until this test releases it, which is
+    // what lets the straggler race the token.
+    //
+    // INSTALLED BEFORE THE DRAIN, NOT BEFORE THE SEND (sparkle-t8wsj). A send no longer calls
+    // `startConciergeTurn` while a turn is running — it queues — so a `mockImplementationOnce`
+    // registered at send time would be consumed later, by whichever dispatch happens to come next.
+    // The call this case cares about is the one the DRAIN makes.
     let settle!: (id: string | null) => void;
+    c.type("second");
+    await c.send();
     h.startConciergeTurn.mockImplementationOnce(
       () => new Promise<string | null>((res) => { settle = res; }),
     );
-    c.type("second");
-    await c.send();
+    // Turn 7 ends, so the queued message dispatches — taking the deferred mock above.
     await act(async () => {
-      settle("9"); // the send that spawned turn 9 — registered AFTER the first send consumed none
+      h.brain.done?.({ id: "7", sessionId: "s1", text: "" });
+    });
+    await act(async () => {
+      settle("9");
     });
 
     delta("8", "the dead turn's buffered output");
