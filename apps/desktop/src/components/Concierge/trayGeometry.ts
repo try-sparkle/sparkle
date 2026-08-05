@@ -22,6 +22,7 @@
 // goes back to describing a tray that no longer exists.
 
 import { SEND_MODES } from "../../voice/sendMode";
+import { SPACE } from "../../theme/scale";
 /**
  * How many positions the tray draws — READ FROM `SEND_MODES`, never spelled out.
  *
@@ -68,11 +69,45 @@ export const TRAY_GEOMETRY = {
   pillPadXIcon: 2,
   /** Each pill's border, per side. Counts toward width under `box-sizing: border-box`. */
   pillBorder: 1.5,
+  /**
+   * A pill's VERTICAL padding, above and below the word — and the only thing that sets the tray's
+   * height (see `SendModeTray`, which declares no height of its own).
+   *
+   * ── WHY THE TRAY MUST NOT STATE ITS OWN HEIGHT ────────────────────────────────────────────────
+   * It used to: `minHeight: 42` on the tray, `height: "100%"` on the pills. Those are two
+   * independent claims about one measurement, and they disagreed — a percentage height against an
+   * auto-height flex parent is not a stretch instruction, so the pills sized to their content while
+   * the tray held itself open at 42, leaving the dead band under the words the founder reported
+   * three times: "the tray should be the same height as the button. There shouldn't be space below
+   * the button. It looks weird that way."
+   *
+   * The fix he asked for, twice, and in this direction specifically: "let's just make the buttons
+   * taller inside the container and keep the container about the same size." So the pill's padding
+   * is the ONE input, the tray hugs it, and there is no second number that can drift out of step
+   * with the first. A tray that cannot name a height cannot be taller than what it contains.
+   *
+   * `SPACE.nav` is 10 — the founder's own figure ("10 pixels above and 10 pixels below the word")
+   * and an existing value in the approved spec (`--sp-navitem` axis 2), not a number invented here.
+   */
+  pillPadY: SPACE.nav,
   /** Gap between a pill's label and its keycap slot. */
   pillGap: 6,
   /** The keycap slot, reserved in BOTH states so nothing shifts when the chiclet appears. */
   chicletSlot: 30,
+  /** The tray's own border, per side. Part of its chrome, alongside `trayPad`. */
+  trayBorder: 1,
 } as const;
+
+/**
+ * The horizontal room a CENTRED label must leave free on EACH side for the keycap to sit clear.
+ *
+ * The chiclet is justified right and drawn OUT OF FLOW (see `SendModeTray`), so it costs the label
+ * no width — but a label centred in the whole pill grows toward BOTH edges at once, and it is the
+ * right-hand edge that meets the keycap. Hence the doubling in `fullLabelsFitAtPx`: clearance on the
+ * right is what the founder asked for ("some distance between the word and the keyboard shortcut
+ * chiclet"), and the matching space on the left is not spare — it is what centring the word costs.
+ */
+export const chicletClearancePx = TRAY_GEOMETRY.chicletSlot + TRAY_GEOMETRY.pillGap;
 
 /**
  * The widest full label's rendered width, in px, at `TYPE.small`.
@@ -89,7 +124,7 @@ export const TRAY_GEOMETRY = {
 export const WIDEST_LABEL_PX = 72;
 
 /**
- * The tray width at which the FULL labels stop fitting.
+ * The tray width at which the `full` tier fits — full labels, CENTRED, with the keycap clear of them.
  *
  * ── ONE COORDINATE SYSTEM: contentRect ──────────────────────────────────────────────────────────
  * The measured quantity this is compared against is the ResizeObserver's `contentRect.width`, which
@@ -97,12 +132,48 @@ export const WIDEST_LABEL_PX = 72;
  * `2 * trayPad` (+6) while omitting `2 * pillBorder` per pill (−9); the two errors partially
  * cancelled, which is precisely why the result still landed on a plausible-looking 428 and the guard
  * stayed green. Mixing boxes is not a rounding error — it is two bugs hiding each other.
+ *
+ * ── WHY THE CLEARANCE IS DOUBLED (and why this number GREW from 389 to 497) ─────────────────────
+ * The keycap used to be an in-flow sibling of the label: `[label][gap][30px slot]`, the pair centred
+ * together. That is precisely the defect the founder diagnosed himself — the word and the chiclet
+ * were "what is centering", which pushes the WORD left of centre by half the slot, and at rest,
+ * with no chiclet drawn, the word is the only thing on the pill. So the slot left the flow and the
+ * label is now centred alone.
+ *
+ * Out of flow, the slot costs the label no width — but centring changes which inequality binds. A
+ * centred label spends its free space symmetrically, so keeping the keycap clear of the word's RIGHT
+ * edge means reserving the same distance on the LEFT, whether or not anything is drawn there. Hence
+ * `2 *`. Getting this wrong is not cosmetic: with the old one-sided budget the widest label ("Push
+ * to talk", 72px) overruns the keycap by ~3px at the bottom of this tier — a word touching the chip
+ * it is supposed to sit clear of, in the one state the founder is looking at when he hovers.
  */
 export function fullLabelsFitAtPx(): number {
   const g = TRAY_GEOMETRY;
-  const perPill = 2 * g.pillPadX + 2 * g.pillBorder + g.pillGap + g.chicletSlot;
+  const perPill = 2 * g.pillPadX + 2 * g.pillBorder + 2 * chicletClearancePx;
   // `(n - 1)` gaps, never a hardcoded 2, so the pill count and the gap count cannot disagree.
   return TRAY_PILL_COUNT * (WIDEST_LABEL_PX + perPill) + (TRAY_PILL_COUNT - 1) * g.trayGap;
+}
+
+/**
+ * The CLEAR SPACE between the widest centred label and the keycap beside it, at a given tray width.
+ * Negative means they overlap.
+ *
+ * Exported rather than left as arithmetic in a test, for this module's documented reason: a test
+ * that re-spells the geometry is a copy that goes stale while staying green (roborev 56213). It
+ * takes the ResizeObserver's `contentRect.width` — the same coordinate system as every threshold
+ * above — and works back to one pill: the pills are `flex: 1`, so they share the width evenly minus
+ * the inter-pill gaps, and a centred label leaves half the remainder on each side.
+ *
+ * The founder asked for this space by name — the keycap should have "some distance between the word
+ * and the keyboard shortcut chiclet" — so it is a quantity worth being able to state, not just a
+ * by-product of a threshold. At `fullLabelsFitAtPx()` it comes out to exactly `pillGap`.
+ */
+export function wordToKeycapGapPx(trayContentWidthPx: number): number {
+  const g = TRAY_GEOMETRY;
+  const pillOuter =
+    (trayContentWidthPx - (TRAY_PILL_COUNT - 1) * g.trayGap) / TRAY_PILL_COUNT;
+  const pillContent = pillOuter - 2 * g.pillPadX - 2 * g.pillBorder;
+  return (pillContent - WIDEST_LABEL_PX) / 2 - g.chicletSlot;
 }
 
 /**

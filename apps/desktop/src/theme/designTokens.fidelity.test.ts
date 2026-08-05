@@ -105,6 +105,7 @@ describe("the type / radius / spacing scales are GENERATED from the spec, not re
     expect(SPACE.xs).toBe(px(B["--sp-row"]!)); // 6 — row padding, vertical
     expect(SPACE.sm).toBe(px(B["--sp-bubble"]!)); // 8 — bubble padding, vertical
     expect(SPACE.row).toBe(part(B["--sp-row"]!, 1)); // 9 — row padding, horizontal
+    expect(SPACE.nav).toBe(part(B["--sp-navitem"]!, 1)); // 10 — nav-item padding, a control's own
     expect(SPACE.input).toBe(part(B["--sp-bubble"]!, 1)); // 11 — bubble padding, horizontal
     expect(SPACE.md).toBe(px(B["--sp-comp"]!)); // 12 — compose box
     expect(SPACE.lg).toBe(px(B["--sp-hd"]!)); // 14 — header sides
@@ -118,11 +119,14 @@ describe("the type / radius / spacing scales are GENERATED from the spec, not re
     expect(LABEL.textTransform).toBe(B["--tt-label"]);
     expect(TERM_MEASURE).toBe(B["--term-measure"]);
   });
-  // The one spec padding component the SPACE scale does not expose, pinned so its absence stays a
-  // conscious decision (see the note in scale.ts) rather than a value someone forgets exists.
-  it("documents the one spec padding with no named step: --sp-navitem's 10px", () => {
+  // `--sp-navitem`'s 10px USED to be the one spec padding component with no named step, pinned here
+  // as a deliberate absence. It has a name now (`SPACE.nav`) because the send tray's pills read it —
+  // so the assertion flips: the value is EXPOSED, and still equal to what the spec says it is. The
+  // row survives rather than being deleted because the fact worth pinning is unchanged (this scale
+  // covers every spec padding component); only which side of it is true has moved.
+  it("exposes --sp-navitem's 10px, so every spec padding component now has a named step", () => {
     expect(part(B["--sp-navitem"]!, 1)).toBe(10);
-    expect(Object.values(SPACE)).not.toContain(10);
+    expect(Object.values(SPACE)).toContain(10);
   });
 });
 

@@ -88,12 +88,19 @@ export function shortLabelsAreContainedInFullLabels(): boolean {
  * paints "Push to tal", a silently truncated word, which is strictly worse than the "P…" this whole
  * change exists to delete. Showing "Push" a notch early costs nothing.
  *
- * 440 sits above the derived bound of 431 — but only by 9px, which is NOT much next to the spread
- * in the one input nobody can measure (two readings of `WIDEST_LABEL_PX` differed by 14px). So the
- * margin is not what makes this safe. Two other things are: the test asserts
+ * 497 is the derived bound EXACTLY, and it grew from 440 when the keycap chiclet left the flow to
+ * be justified right against a label centred alone (trayGeometry `fullLabelsFitAtPx` — a centred
+ * label must be given the keycap's clearance on both sides, not one). The margin is not what makes
+ * this safe. Two other things are: the test asserts
  * `TRAY_SHORT_LABEL_MAX_PX >= fullLabelsFitAtPx()`, so any geometry change that outgrows the margin
  * fails loudly rather than silently clipping; and `textOverflow: ellipsis` remains in the component
  * as a last-resort backstop if the estimate itself is wrong.
+ *
+ * WHAT MOVING IT COSTS, stated plainly: between 440 and 497 the tray now draws the `fullTight`
+ * tier — the same three WHOLE words, minus the hover keycap. Nothing truncates and no label
+ * shortens; the only thing that changes in that band is that hovering a pill no longer reveals its
+ * shortcut. That is the right trade against the alternative, which is a keycap overlapping the word
+ * it annotates.
  *
  * A residual backstop still exists in the component (`textOverflow: ellipsis`) for exactly that
  * reason: if the estimate is ever wrong, an ellipsis beats a word cut mid-stroke.
@@ -102,7 +109,7 @@ export function shortLabelsAreContainedInFullLabels(): boolean {
  * column width the full labels genuinely do not fit, which is why the founder saw "S… P… S…"
  * without having resized anything unusual. That relationship is pinned in sendMode.test.ts too.
  */
-export const TRAY_SHORT_LABEL_MAX_PX = 440;
+export const TRAY_SHORT_LABEL_MAX_PX = 497;
 
 /**
  * Below this tray width the pills drop their words entirely and draw ICONS ONLY.

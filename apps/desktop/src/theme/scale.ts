@@ -126,9 +126,7 @@ export const LABEL = {
  * direction actually uses, which is why 9 and 11 appear.
  *
  * Each step names the spec padding it is lifted from, so the mapping is auditable rather than
- * coincidental. `--sp-navitem`'s 10px is the one spec padding component with no named step here —
- * the direction uses it once, for nav items — and it is deliberately left unexposed rather than
- * given a key nothing reads (the fidelity test records it as a known-unexposed spec value).
+ * coincidental.
  */
 export const SPACE = {
   /** 6 — tight row padding (vertical). (`--sp-row` axis 1) */
@@ -137,6 +135,17 @@ export const SPACE = {
   sm: px("--sp-bubble"),
   /** 9 — row padding (horizontal). (`--sp-row` axis 2) */
   row: part("--sp-row", 1),
+  /**
+   * 10 — a CONTROL's own padding, the step between a row's 9 and an input's 11. (`--sp-navitem` axis 2)
+   *
+   * This was the one spec padding component the scale deliberately left unexposed, on the grounds
+   * that it was "a key nothing reads". Something reads it now: the send tray's pills, whose vertical
+   * padding the founder specified as "10 pixels above and 10 pixels below the word"
+   * (components/Concierge/trayGeometry `pillPadY`). The number was already in the approved spec —
+   * only the name was missing — so exposing it is the faithful move rather than minting a literal
+   * beside a scale that already contained the value.
+   */
+  nav: part("--sp-navitem", 1),
   /** 11 — bubble/input padding (horizontal). (`--sp-bubble` axis 2) */
   input: part("--sp-bubble", 1),
   /** 12 — compose box, header bottom. (`--sp-comp`) */

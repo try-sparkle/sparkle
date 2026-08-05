@@ -23,6 +23,7 @@ import { useEffect, useRef, useState } from "react";
 import {
   DEFAULT_SPEAK_LEFT_FRAC,
   TRAY_GEOMETRY,
+  chicletClearancePx,
   wordPillMinPx,
   speakLeftFraction,
 } from "./trayGeometry";
@@ -156,8 +157,14 @@ export interface SendModeTrayProps {
   wired?: boolean;
 }
 
-/** The strip's height. Matches what the Send button used to be, so the row has no slack. */
-const TRAY_HEIGHT = 42;
+// ── THE TRAY DECLARES NO HEIGHT ────────────────────────────────────────────────────────────────
+// There used to be a `TRAY_HEIGHT = 42` here, applied as `minHeight` on the strip while the pills
+// asked for `height: "100%"`. Two numbers for one measurement, and they disagreed: a percentage
+// height resolved against an auto-height flex parent is not a stretch instruction, so the pills sized
+// to their own content and the tray held itself open at 42 — the dead band under the words that the
+// founder reported three separate times. Neither value is here now. The pills' `pillPadY` is the only
+// input, and the strip hugs whatever that produces, so "the tray is the same height as the button" is
+// structural rather than a number someone has to keep in step. See trayGeometry `pillPadY`.
 
 /** The identity colour of each position. Send is the app's PRIMARY fill (the pair every other
  *  primary button uses); the two voice positions are amber and green, matching the mic glyph's own
@@ -180,6 +187,7 @@ export {
   TRAY_GEOMETRY,
   WIDEST_LABEL_PX,
   DEFAULT_SPEAK_LEFT_FRAC,
+  chicletClearancePx,
   fullLabelsFitAtPx,
   speakLeftFraction,
 } from "./trayGeometry";
@@ -332,9 +340,10 @@ export function SendModeTray({
         // half outside the column, which is the founder's report one level down.
         flexWrap: "wrap",
         minWidth: 0,
-        // `minHeight`, not a fixed `height`, so a wrapped tray grows instead of cropping its own
-        // second row. At every width that does NOT wrap this is the identical box it always was.
-        minHeight: TRAY_HEIGHT,
+        // NO `height` AND NO `minHeight` — see the note above the palette. The strip's height is
+        // whatever its pills come to plus `trayPad` and the border, which is the only arrangement in
+        // which there is provably no space below the buttons. A wrapped tray still grows into its
+        // second and third rows for the same reason: nothing here is holding a size open.
         marginTop: 8,
         padding: TRAY_GEOMETRY.trayPad,
         borderRadius: RADIUS.modal,
@@ -477,6 +486,16 @@ export function SendModeTray({
         const label = trayLabelFor(m, density);
         // The narrowest tier: the pills WRAP so the words stay whole, rather than dropping to icons.
         const atFloor = density === "floor";
+        // Hoisted out of the style object because the CHICLET needs it too: the keycap is positioned
+        // against the pill's padding box (that is what `position: absolute` resolves to), so insetting
+        // it by the same padding the label answers to is what puts the two on one right-hand margin.
+        // Padding is one of the things the ladder spends to keep WHOLE WORDS, so it is tier-dependent.
+        const padX = atFloor
+          ? TRAY_GEOMETRY.pillPadXFloor
+          : density === "shortTight"
+          ? TRAY_GEOMETRY.pillPadXTight
+          : TRAY_GEOMETRY.pillPadX;
+        const showsChiclet = trayShowsChiclet(density);
         // ── THE ACCESSIBLE NAME DOES NOT MOVE WITH THE WIDTH ───────────────────────────────────
         // Built from the FULL label, never from the rendered one. An earlier revision derived it
         // from `label`, so a narrow tray silently renamed the Push-to-talk pill to "Push" — the
@@ -579,17 +598,21 @@ export function SendModeTray({
               minWidth: atFloor ? wordPillMinPx() : 0,
               display: "inline-flex",
               alignItems: "center",
+              // THE WORD IS CENTRED IN THE PILL, and it is centred ALONE. The keycap used to be an
+              // in-flow sibling, so this rule centred the PAIR — which is exactly what the founder
+              // diagnosed: "I think you probably have it so that the words and the keyboard shortcut
+              // chiclet is what is centering." The word came out left of centre by half the slot, and
+              // at rest — no hover, no chiclet — the word is the only thing on the pill. The keycap is
+              // now out of flow (below), so this centres the one thing the user actually reads.
+              //
+              // NO `gap`: with a single in-flow child it would have nothing to separate, and leaving
+              // it here would imply the keycap is still a sibling. The distance between word and
+              // keycap is `chicletClearancePx`, spent as the label's `maxWidth` below.
               justifyContent: "center",
-              gap: TRAY_GEOMETRY.pillGap,
-              height: "100%",
-              // Padding is one of the things the ladder spends to keep WHOLE WORDS.
-              padding: `0 ${
-                atFloor
-                  ? TRAY_GEOMETRY.pillPadXFloor
-                  : density === "shortTight"
-                  ? TRAY_GEOMETRY.pillPadXTight
-                  : TRAY_GEOMETRY.pillPadX
-              }px`,
+              // NO `height: "100%"` — that percentage, resolved against an auto-height flex parent,
+              // is what left the pills short of the tray they sit in. Height comes from `pillPadY`
+              // alone, and `alignItems: "stretch"` on the tray levels the three pills to the tallest.
+              padding: `${TRAY_GEOMETRY.pillPadY}px ${padX}px`,
               borderRadius: RADIUS.input,
               font: "inherit",
               // One step down at the two tightest tiers — a smaller WHOLE word beats a truncated
@@ -690,38 +713,75 @@ export function SendModeTray({
                 paint, and if it does an ellipsis beats a word cut mid-stroke. */}
             <span
               data-testid={`send-mode-label-${m}`}
-              style={{ overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis" }}
+              style={{
+                overflow: "hidden",
+                whiteSpace: "nowrap",
+                textOverflow: "ellipsis",
+                // ── THE SAME INEQUALITY `fullLabelsFitAtPx` ENFORCES, RESTATED AS CSS ────────────
+                // The keycap is out of flow, so nothing in the layout stops a centred label growing
+                // under it. This is what does: capping the label at the pill minus the clearance on
+                // BOTH sides keeps its right edge clear of the keycap while leaving it centred, since
+                // a symmetric cap does not move a centred box. At the bottom of the `full` tier the
+                // two agree exactly (the cap resolves to WIDEST_LABEL_PX), and above it the cap is
+                // slack — so this is a floor under the derivation, not a second opinion about it.
+                // It matters because the derivation governs a THRESHOLD someone could lower without
+                // touching this file.
+                maxWidth: showsChiclet ? `calc(100% - ${2 * chicletClearancePx}px)` : undefined,
+              }}
             >
               {label}
             </span>
-            {/* THE KEYCAP CHICLET. Hover or keyboard focus only, never at rest, at the pill's right
-                inside edge. The slot is reserved in BOTH states so nothing shifts when it appears.
+            {/* THE KEYCAP CHICLET — JUSTIFIED RIGHT, OUT OF FLOW, HOVER/FOCUS ONLY.
                 What it says comes from voice/sendMode `chicletFor`, which is the same function the
                 keystroke handler asks — a chip that advertises a chord the handler does not honour
-                is worse than no chip at all. */}
-            {/* NOT RENDERED AT ALL in the icon tier — see `iconsFitAtPx`. A reserved 30px slot per
-                pill is the single largest thing standing between three icons and a narrow column,
-                and a keycap hint is the first thing to go when there is no room for words either. */}
-            {!trayShowsChiclet(density) ? null : (
+                is worse than no chip at all.
+
+                ── WHY IT IS ABSOLUTELY POSITIONED ────────────────────────────────────────────────
+                It was an in-flow sibling of the label, and the two were centred as one unit. That is
+                the founder's third complaint and his own diagnosis of it: the word ends up left of
+                centre, and the word is all there is to see at rest. Taking the keycap out of flow is
+                what lets the label be centred alone.
+
+                IT ALSO PINS THE PROPERTY THAT MATTERS MORE THAN EITHER: the label MUST NOT MOVE when
+                the keycap appears. An out-of-flow box contributes nothing to its siblings' layout in
+                any state, so the reveal cannot shift the word — not by construction of a matching
+                reservation that someone could later unbalance, but because there is no flow
+                contribution to balance. Only `opacity` changes on hover; the box is laid out
+                identically at rest, and `SendModeTray.geometry.test.tsx` holds that.
+
+                `pointerEvents: "none"` because it now overlays the pill: a chip that swallowed the
+                pointer would make the button's own right-hand end unclickable, and — worse — a
+                mouseleave onto it would flicker the very hover state that summoned it. */}
+            {/* NOT RENDERED AT ALL below the `full` tier. A 30px keycap per pill is the first thing
+                to go when the column is tight, and the words never give way for it. */}
+            {!showsChiclet ? null : (
             <span
               data-testid={showCap ? `send-chiclet-${m}` : undefined}
               aria-hidden
               style={{
-                flex: "none",
+                position: "absolute",
+                // The pill's own horizontal padding, so the keycap's right edge lands on the same
+                // margin the label answers to rather than flush against the border.
+                right: padX,
+                top: 0,
+                bottom: 0,
+                pointerEvents: "none",
                 width: TRAY_GEOMETRY.chicletSlot,
                 display: "inline-flex",
+                alignItems: "center",
                 justifyContent: "flex-end",
                 // TYPE.micro (10), not an off-scale 11: a keycap IS a badge — the rung this scale
                 // names for tracked labels, badges and ticks. theme/scale.test.ts ratchets off-scale
                 // fontSize at zero, so an eyeballed 11 here is a hard red, not a nit.
                 fontSize: TYPE.micro,
-                // ── THE SLOT IS ALWAYS LAID OUT; ONLY ITS CONTENTS APPEAR ─────────────────────
-                // `visibility`/opacity on a FIXED-WIDTH box, never a conditional render. The
-                // founder's open complaint is Send/Push/Speak truncating to "Se…" at narrow widths,
-                // and a pill that materialises on hover would push the label into exactly that
-                // ellipsis — trading one bug for another. The slot's width is a first-class input to
-                // the label threshold (trayGeometry `chicletSlot`), so it is reserved at rest by
-                // construction.
+                // ── THE BOX IS ALWAYS LAID OUT; ONLY ITS CONTENTS APPEAR ─────────────────────
+                // `opacity`, never a conditional render — and the reason has outlived the mechanism
+                // it was written for. It used to be that a chip MATERIALISING would widen the flow
+                // and shove the label into the "Se…" ellipsis the founder had already complained
+                // about. Out of flow that particular harm is gone, but the rule stays for the
+                // stronger version of the requirement: hovering must not change the pill AT ALL, and
+                // `opacity` is the only reveal that touches neither layout nor paint order. It also
+                // keeps the reveal cheap — no mount, no reflow, on a per-frame hover path.
                 opacity: showCap ? 1 : 0,
               }}
             >

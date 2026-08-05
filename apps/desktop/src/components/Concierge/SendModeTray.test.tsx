@@ -673,11 +673,18 @@ describe("the shortcut pill — one treatment, revealed not resident (sparkle-bi
     expect(kbd!.textContent).toBe("⌘↩");
   });
 
-  it("reserves the slot at REST so revealing the pill cannot shove the label into an ellipsis", () => {
+  it("keeps the slot the same size at REST and on hover, so the reveal changes no geometry", () => {
     // Requirement 4, and the reason it exists: the founder has an open complaint about
     // Send/Push/Speak truncating to "Se…" at narrow widths. A pill that materialises on hover would
     // widen the row and cause exactly that. The slot is a fixed-width box in BOTH states — only its
-    // contents fade — and its width is a first-class input to the label threshold.
+    // contents fade.
+    //
+    // THE SLOT IS NO LONGER IN FLOW, so "reserves" is the wrong verb now: it is absolutely
+    // positioned and justified right, which is what lets the LABEL be centred alone (the founder's
+    // third ask — see ./SendModeTray.geometry.test.tsx, which owns the centring and no-shift
+    // properties). What this row still pins is narrower and still worth pinning: the box does not
+    // change size between the two states. The width also remains an input to the tier threshold,
+    // now via `chicletClearancePx` rather than by occupying flow.
     mount({ mode: "send" });
     const restWidth = slot("send").style.width;
     expect(restWidth, "the slot has a width before any hover").toBe(
