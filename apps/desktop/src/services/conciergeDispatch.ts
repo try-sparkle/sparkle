@@ -500,6 +500,18 @@ export async function dispatchConciergeAnswer(
   // because of where we are: everything below this line pastes AND SUBMITS via `submitPrompt`, so a
   // false positive on a `vim` session is an ENTERED line, not merely a typed one.
   const screen = getAgentViewport(agentId);
+  // ══ READ ONCE, AND REUSED BY THE PICKER BLOCK BELOW ═══════════════════════════════════════════
+  // Hoisted because the credential arm now has to know whether a menu is up. It must be ONE read,
+  // not two: `liveOptionsFor` re-runs the detector over the CURRENT scrollback, so a second call
+  // could straddle a redraw and let the two decisions disagree about whether a picker is live —
+  // and the guard would then refuse a screen the block below was about to answer.
+  //
+  // (A first cut left the block's own call in place. That broke four rows in
+  // `conciergeDispatch.renderings.test.ts`, which queue their options with `mockReturnValueOnce`:
+  // the extra call consumed the queued value and the picker block saw an empty list, turning a
+  // `picker-option` into `free-text`. The suite was right and the comment claiming re-reading was
+  // harmless was wrong.)
+  const pickerOptions = liveOptionsFor(agentId);
   const claudeCodeHoldsTheBuffer = !!screen?.alternateBuffer && isClaudeCodeScreen(screen.text);
   if (screen?.alternateBuffer && !claudeCodeHoldsTheBuffer) {
     log.warn("concierge", "refused a write into a full-screen app", { agentId });
@@ -540,7 +552,20 @@ export async function dispatchConciergeAnswer(
   // sits ABOVE the picker block — so calling it here would refuse every live picker instead of
   // ANSWERING it, which this file's own header says must not be hoisted. The non-picker arms are
   // exactly the hazard that has no other home.
-  if (screen && screenIsCredentialPrompt(screen.text)) {
+  // GATED ON THERE BEING NO LIVE PICKER (roborev 58512), which the first cut of this guard missed.
+  // `screenIsCredentialPrompt` is not purely the non-picker half after all: `WRITE_BLOCKING_PROMPTS`
+  // carries `/\(\s*yes\s*\/\s*no/i`, and a `(yes/no)` confirmation IS a live picker to this
+  // dispatcher — `suggestions/heuristics`' own `YN` emits the Approve/Deny pair for exactly that
+  // shape. So `Overwrite existing config? (yes/no)` was being refused here instead of answered with
+  // `y\r`, for every caller including the nudge Approve relay. That is the same
+  // refusing-above-the-picker-block hazard this arm's doc claims to avoid, narrowed to the yes/no
+  // family rather than removed.
+  //
+  // A REAL credential prompt yields NO options — `[sudo] password for …:` is not a menu — so the
+  // sudo/token/host-key cases this guard exists for still block, and the shipped `answersLivePicker`
+  // mirror keeps agreeing with what the dispatcher will actually do. Those two are documented as
+  // having to agree; the first cut made them disagree.
+  if (screen && pickerOptions.length === 0 && screenIsCredentialPrompt(screen.text)) {
     log.warn("concierge", "refused a write into a credential prompt", { agentId });
     return { ok: false, path: "blocked-prompt", agentId };
   }
@@ -550,7 +575,7 @@ export async function dispatchConciergeAnswer(
     });
     return { ok: false, path: "blocked-prompt", agentId };
   }
-  const options = liveOptionsFor(agentId);
+  const options = pickerOptions;
 
   // ══ A CLOUD AGENT LEAVES THE LOCAL-PTY PATH HERE ════════════════════════════════════════════════
   // Read the screen FIRST (above) rather than short-circuiting on the runtime the way the old

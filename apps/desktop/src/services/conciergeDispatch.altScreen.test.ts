@@ -28,6 +28,7 @@ vi.mock("./suggestions/heuristics", () => ({
 vi.mock("./terminalViewport", () => ({ getAgentViewport: vi.fn(() => null) }));
 
 import { submitPrompt, writePtyChainedStrict } from "../pty";
+import { getAgentScrollback } from "./terminalScrollback";
 import { detectTerminalPrompts } from "./suggestions/heuristics";
 import { getAgentViewport } from "./terminalViewport";
 import { dispatchConciergeAnswer } from "./conciergeDispatch";
@@ -208,6 +209,32 @@ describe("a credential prompt refuses on the normal buffer too", () => {
   // this guard sits ABOVE the picker branch. This file's own header calls that out as something that
   // must not be hoisted. So the guard calls `screenIsCredentialPrompt`, the non-picker half, and
   // this row fails the moment someone "simplifies" it back.
+  // ══ A `(yes/no)` PROMPT IS A PICKER, THROUGH THE REAL DETECTOR (roborev 58512) ════════════════
+  // THE ROW THE FIRST CUT COULD NOT HAVE. `WRITE_BLOCKING_PROMPTS` carries `/\(\s*yes\s*\/\s*no/i`,
+  // so `screenIsCredentialPrompt` is NOT purely the non-picker half — and `suggestions/heuristics`'
+  // own `YN` emits the Approve/Deny pair for exactly that shape. The guard therefore refused
+  // `Overwrite existing config? (yes/no)` instead of answering it, for every caller including the
+  // nudge Approve relay, which is the very hazard the guard's doc claims to avoid.
+  //
+  // DRIVEN THROUGH THE REAL `detectTerminalPrompts`, not a mocked option list: the collision only
+  // exists because the detector and the blocking list overlap on this shape, and a hand-built list
+  // cannot see that. `getAgentScrollback` feeds it, so the same text drives both predicates.
+  it("answers a (yes/no) confirmation rather than refusing it as a credential prompt", async () => {
+    const YN = "Overwrite existing config? (yes/no) ";
+    vi.mocked(getAgentScrollback).mockReturnValue(YN);
+    // THE REAL detector, reached with `importActual` past this file's module mock. The `(yes/no)`
+    // collision only exists because the detector's YN arm and WRITE_BLOCKING_PROMPTS match the same
+    // screen, so a hand-built option list cannot express it.
+    const real = await vi.importActual<typeof import("./suggestions/heuristics")>(
+      "./suggestions/heuristics",
+    );
+    vi.mocked(detectTerminalPrompts).mockImplementation(real.detectTerminalPrompts);
+    vi.mocked(getAgentViewport).mockReturnValue({ text: YN, alternateBuffer: false });
+    const r = await dispatchConciergeAnswer(AGENT, "yes", OPTS);
+    expect(r.path).toBe("picker-option");
+    expect(r.ok).toBe(true);
+  });
+
   it("still answers a live picker instead of refusing it", async () => {
     // A REAL PICKER SCREEN, not the bare `$ ` fixture with options mocked on top. The first cut of
     // this row used `atAPrompt()`, and it was VACUOUS: `screenAwaitsInput("$ ")` is false, so the
