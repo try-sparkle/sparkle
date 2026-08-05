@@ -6,8 +6,8 @@
 //! a device (device enumeration is not gated by TCC), `default_input_config()` is Ok,
 //! `build_input_stream` is Ok, and `stream.play()` is Ok. CoreAudio then delivers buffers of
 //! ZEROS, forever. So `Capture::start` reports success, no `dictation://error` is ever emitted,
-//! `rms_level` stays 0.0, the VAD never fires, and the app sits waiting for a wake word it can
-//! never hear. The mic is dead and nothing anywhere says so. The only way to know is to ask TCC
+//! `rms_level` stays 0.0, the VAD never fires, and the app paints an armed, listening microphone
+//! over speech it can never hear. The mic is dead and nothing anywhere says so. The only way to know is to ask TCC
 //! directly, which is what this module does.
 //!
 //! Note what this is NOT: `Info.plist`'s NSMicrophoneUsageDescription (the prompt STRING) and the

@@ -43,6 +43,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 // Modules under test (imported after mocks are registered)
 // ---------------------------------------------------------------------------
 import { useDictationStore } from "./stores/dictationStore";
+import { useDictationEngineStore } from "./stores/dictationEngineStore";
 import { useAuthStore } from "./stores/authStore";
 import { useUiStore } from "./stores/uiStore";
 import {
@@ -258,10 +259,14 @@ describe("createDictationController (hook logic without renderHook)", () => {
   });
 
   it("dictation://cloud-ended clears interim and invokes stop_cloud_stream (fallback handoff)", () => {
-    useDictationStore.setState({ interim: "stale ghost" });
+    // The interim starts EMPTY here on purpose. This row is about the handoff — preview cleared,
+    // backend told to resume on-device — and it used to seed a "stale ghost" to prove the clear.
+    // That premise is now false: a non-empty interim at this instant is the user's uncommitted tail,
+    // not a ghost, and it is recovered rather than discarded (see the tail-recovery block below).
+    // Seeding one here would make this row silently assert the OPPOSITE of the fix.
+    useDictationStore.setState({ interim: "" });
     invoke.mockClear();
     emit("dictation://cloud-ended", null);
-    // Stale preview cleared, and the backend is told to resume on-device routing.
     expect(useDictationStore.getState().interim).toBe("");
     expect(invoke).toHaveBeenCalledWith("stop_cloud_stream");
   });
@@ -1909,6 +1914,217 @@ describe("the on-device speech LEVEL — the countdown's cancel, and the latch t
     expect(useDictationStore.getState().onDeviceSpeech).toBe(true);
     await ctrl.toggle(); // status was "listening", so this stops dictation
     expect(useDictationStore.getState().onDeviceSpeech).toBe(false);
+    ctrl.cleanup();
+  });
+});
+
+// ══ THE PUSH-TO-TALK TAIL: `interim` AT cloud-ended IS THE USER'S LAST WORDS ═══════════════════
+// The founder dictates nearly everything he sends and his final words kept getting cut off. The
+// cause was in this file: `dictation://cloud-ended` cleared `interim` UNCONDITIONALLY. That is a
+// no-op on a clean close (Rust's Finalize + read-drain already delivered the trailing final as a
+// `dictation://partial`, so `interim` is already ""), but the same event fires on a mid-stream relay
+// failure and on the out-of-credits teardown — where no final is coming and `interim` still holds
+// words the user actually said. They were dropped silently.
+//
+// EVERY ROW ASSERTS THE SIDE EFFECT — a segment DELIVERED, a seq BUMPED, the sink CALLED — never
+// that `interim` became "", which was already true before the fix and would prove nothing.
+describe("the orphaned interim tail at cloud-ended (the truncation bug)", () => {
+  beforeEach(() => {
+    useDictationStore.setState({
+      interim: "",
+      status: "listening",
+      enabled: true,
+      phase: "active",
+      error: null,
+      windowFocused: true,
+      focusOwner: "other",
+      insertTarget: null,
+    });
+    routeToTerminal.mockClear();
+    // The engine store is module state shared across this file's rows (and it is the one thing the
+    // `cloud-ended` handler now writes on EVERY path), so reset it here rather than letting one
+    // row's fallback reason decide another's starting point.
+    useDictationEngineStore.setState({ fallbackReason: null, dismissed: false });
+  });
+
+  it("COMMITS a non-empty interim as a segment instead of dropping it", async () => {
+    const onSegment = vi.fn();
+    const ctrl = await createDictationController({
+      onSegment,
+      isWindowActive: () => true,
+      focusOwner: () => "other",
+    });
+    useDictationStore.setState({ interim: "and one more thing before I forget" });
+    // A mid-stream relay death: no trailing final will arrive, so this text is all there is.
+    emit("dictation://cloud-ended", false);
+    // THE ASSERTION THAT FAILS AGAINST THE OLD CODE: the words reach a destination. Before the fix
+    // `onSegment` was never called on this path and the tail was gone with no trace anywhere.
+    expect(onSegment).toHaveBeenCalledWith("and one more thing before I forget", {
+      terminal: false,
+    });
+    ctrl.cleanup();
+  });
+
+  it("bumps committedSeq for the recovered tail, so the push-to-talk drain sees it land", async () => {
+    const ctrl = await createDictationController({
+      onSegment: vi.fn(),
+      isWindowActive: () => true,
+      focusOwner: () => "other",
+    });
+    const before = useDictationStore.getState().committedSeq;
+    useDictationStore.setState({ interim: "the tail" });
+    emit("dictation://cloud-ended", false);
+    // `useSendMode`'s release drain settles on "has anything landed since the release" and reads
+    // ONLY this counter (roborev 57295). A tail delivered without bumping it can still be raced by
+    // the drain and sent-past — recovering the words but not in time for the message they belong to.
+    expect(useDictationStore.getState().committedSeq).toBe(before + 1);
+    ctrl.cleanup();
+  });
+
+  it("commits NOTHING when the interim is empty — the clean-close path stays a no-op", async () => {
+    const onSegment = vi.fn();
+    const ctrl = await createDictationController({
+      onSegment,
+      isWindowActive: () => true,
+      focusOwner: () => "other",
+    });
+    const before = useDictationStore.getState().committedSeq;
+    emit("dictation://cloud-ended", false);
+    // The overreach guard. On a clean close the trailing final ALREADY arrived as a partial and
+    // cleared `interim`; a recovery that fired regardless would deliver an empty segment and bump
+    // the drain's counter for text nobody said.
+    expect(onSegment).not.toHaveBeenCalled();
+    expect(useDictationStore.getState().committedSeq).toBe(before);
+    ctrl.cleanup();
+  });
+
+  it("commits nothing for a whitespace-only interim", async () => {
+    const onSegment = vi.fn();
+    const ctrl = await createDictationController({
+      onSegment,
+      isWindowActive: () => true,
+      focusOwner: () => "other",
+    });
+    useDictationStore.setState({ interim: "   \n " });
+    emit("dictation://cloud-ended", false);
+    expect(onSegment).not.toHaveBeenCalled();
+    ctrl.cleanup();
+  });
+
+  it("recovers the tail on the OUT-OF-CREDITS teardown too, and still refreshes the balance", async () => {
+    // The exhausted path is the one where a user is MOST likely to be mid-sentence: the relay cuts
+    // them off, so the tail is guaranteed to be uncommitted. Both effects must happen — an earlier
+    // shape could plausibly early-return on `exhausted` and skip one of them.
+    const refresh = vi.spyOn(useAuthStore.getState(), "refresh").mockResolvedValue();
+    const onSegment = vi.fn();
+    const ctrl = await createDictationController({
+      onSegment,
+      isWindowActive: () => true,
+      focusOwner: () => "other",
+    });
+    useDictationStore.setState({ interim: "cut off mid sen" });
+    emit("dictation://cloud-ended", true);
+    expect(onSegment).toHaveBeenCalledWith("cut off mid sen", { terminal: false });
+    expect(refresh).toHaveBeenCalledTimes(1);
+    refresh.mockRestore();
+    ctrl.cleanup();
+  });
+
+  it("sends the tail to the TERMINAL, not the composer, when the caret is in a routable terminal", async () => {
+    // THE DESTINATION IS NOT ASSUMED. `{ terminal: true }` names WHERE the text goes — hand it back
+    // to be typed into the PTY the user is driving — and a recovery that skipped this gate would
+    // insert the tail into a composer the user is not looking at while their terminal sat empty.
+    const onSegment = phaseMachine();
+    const ctrl = await createDictationController({
+      onSegment,
+      isWindowActive: () => true,
+      focusOwner: () => "terminal",
+    });
+    useDictationStore.setState({ interim: "npm run buil" });
+    emit("dictation://cloud-ended", false);
+    expect(onSegment).toHaveBeenCalledWith("npm run buil", { terminal: true });
+    // …and it travelled the whole way, through the same sink every committed segment uses.
+    expect(routeToTerminal).toHaveBeenCalledWith("npm run buil");
+    ctrl.cleanup();
+  });
+
+  it("a terminal REFUSAL leaves the tail in the composer rather than dropping it", async () => {
+    // The refusal fallback is part of the committed-segment contract, and the tail inherits it by
+    // going through the same delivery function — not by a second copy of the logic that could omit
+    // it. A tail typed at a live picker would otherwise vanish twice over.
+    routeToTerminal.mockResolvedValueOnce({
+      kind: "refused",
+      agentId: "a1",
+      reason: "awaiting-input",
+    });
+    // Through `insertTarget` — the REAL mechanism — not a hand-installed `insert` action: `insert`
+    // is a silent no-op when no compose box registered a target (roborev 56057).
+    const insert = vi.fn();
+    useDictationStore.setState({ insertTarget: insert });
+    const ctrl = await createDictationController({
+      onSegment: phaseMachine(),
+      isWindowActive: () => true,
+      focusOwner: () => "terminal",
+    });
+    useDictationStore.setState({ interim: "the words" });
+    emit("dictation://cloud-ended", false);
+    // The delivery is awaited inside the listener's promise chain, so let it settle.
+    await new Promise((r) => setTimeout(r, 0));
+    expect(insert).toHaveBeenCalledWith("the words");
+    useDictationStore.setState({ insertTarget: null });
+    ctrl.cleanup();
+  });
+
+  it("a BACKGROUND window commits nothing — the tail belongs to the window that heard it", async () => {
+    // The recovery rides the SAME one gate as every other committed segment. Without that, one relay
+    // failure would type the tail into every open window's composer at once (sparkle-ozvr), which is
+    // the bug the gate exists to prevent — reached by a new door.
+    const onSegment = vi.fn();
+    const ctrl = await createDictationController({
+      onSegment,
+      isWindowActive: () => false,
+      focusOwner: () => "other",
+    });
+    useDictationStore.setState({ interim: "not this window's words" });
+    emit("dictation://cloud-ended", false);
+    expect(onSegment).not.toHaveBeenCalled();
+    // The preview is still cleared, so no ghost is left painted in the background window.
+    expect(useDictationStore.getState().interim).toBe("");
+    ctrl.cleanup();
+  });
+
+  it("never repeats a tail: a committed partial clears interim, so the next cloud-ended has nothing", async () => {
+    // THE NO-DUPLICATION INVARIANT, exercised rather than asserted in prose. The partial handler
+    // clears `interim` on every committed segment, so a non-empty `interim` at cloud-ended is by
+    // construction text no segment has carried. This drives the ordinary clean-close sequence —
+    // final arrives, then the stream ends — and pins that it yields exactly ONE delivery.
+    const onSegment = vi.fn();
+    const ctrl = await createDictationController({
+      onSegment,
+      isWindowActive: () => true,
+      focusOwner: () => "other",
+    });
+    useDictationStore.setState({ interim: "hello wor" });
+    emit("dictation://partial", "hello world");
+    emit("dictation://cloud-ended", false);
+    expect(onSegment).toHaveBeenCalledTimes(1);
+    expect(onSegment).toHaveBeenCalledWith("hello world", { terminal: false });
+    ctrl.cleanup();
+  });
+
+  it("tells the engine store the cloud is gone, naming out-of-credits distinctly", async () => {
+    const ctrl = await createDictationController({
+      onSegment: vi.fn(),
+      isWindowActive: () => true,
+      focusOwner: () => "other",
+    });
+    emit("dictation://cloud-ended", false);
+    // Dictation keeps working on-device — with NO interim results at all, so the live word-by-word
+    // preview structurally stops existing. A silent engine swap reads as a broken feature.
+    expect(useDictationEngineStore.getState().fallbackReason).toBe("unavailable");
+    emit("dictation://cloud-ended", true);
+    // Out-of-credits is the one cause the user can act on, so it must not collapse into "unavailable".
+    expect(useDictationEngineStore.getState().fallbackReason).toBe("exhausted");
     ctrl.cleanup();
   });
 });

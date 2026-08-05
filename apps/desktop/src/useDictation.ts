@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useDictationStore } from "./stores/dictationStore";
+import { useDictationEngineStore } from "./stores/dictationEngineStore";
 import { useAiFeature, aiFeatureNow } from "./services/aiGate";
 import { useAuthStore } from "./stores/authStore";
 import { openCloudDictationWindow, nextBalanceCents } from "./services/cloudDictation";
@@ -422,75 +423,97 @@ export async function createDictationController(
     maybeResumeOwnedStream();
   };
 
+  /**
+   * DELIVER ONE COMMITTED SEGMENT to whichever destination is bound. Returns true iff a destination
+   * gate passed and the text was handed on.
+   *
+   * ── WHY THIS IS A FUNCTION AND NOT THE BODY OF THE `partial` LISTENER ──────────────────────────
+   * There are TWO producers of committed text, not one. `dictation://partial` is the ordinary one;
+   * the other is the orphaned-tail recovery in `dictation://cloud-ended` (see there). They must make
+   * the identical decision — same gates in the same order, same `noteCommittedSegment`, same
+   * terminal branch with its refusal fallback — because a tail delivered by a second, similar-looking
+   * copy of this logic is exactly how one destination grows a rule the other lacks. In particular a
+   * copy that skipped `isTerminalRoutable()` would type the tail into the composer while the user was
+   * driving a PTY, and one that skipped the refusal fallback would drop it silently.
+   */
+  const deliverCommittedSegment = (text: string): boolean => {
+    // THE ONE GATE (see isRoutable). Committed text must land in exactly one place: the focused
+    // window, and only while dictation is routable there. Background windows bail — otherwise the
+    // same phrase types into every open window's composer — and so does a window whose caret sits
+    // in a terminal, where the composer the text would land in isn't the thing the user is typing
+    // into at all.
+    // ══ THE TERMINAL DESTINATION ═══════════════════════════════════════════════════════════
+    // Checked BEFORE the composer gate and returning unconditionally, so exactly one destination
+    // ever sees a given phrase. Only COMMITTED text reaches here (`dictation://partial` is the
+    // committed-segment event; the live preview is `dictation://interim`), which is the contract
+    // the sink depends on — streaming a phrase the recognizer is still revising into a live PTY
+    // would type, and partly execute, words the speaker never finished saying.
+    if (isTerminalRoutable()) {
+      useDictationStore.getState().setModelProgress(null);
+      useDictationStore.getState().setInterim("");
+      // A COMMITTED segment arrived. The push-to-talk drain keys its "is anything still landing"
+      // question on this rather than on the composer's text, which cannot tell a transcript from a
+      // keystroke (roborev 57295).
+      useDictationStore.getState().noteCommittedSegment();
+      // ══ ONE HANDLER, BOTH DESTINATIONS ═══════════════════════════════════════════════════
+      // `onSegment` decides delivery for the composer and the terminal alike, and passing
+      // `{ terminal: true }` is what makes it hand the text BACK rather than insert it. Keeping
+      // one handler (rather than short-circuiting past it here) is why the routing gate cannot
+      // apply to one destination and not the other — the shape that let a spoken command be typed
+      // onto an agent's command line instead of being acted on, back when segments carried
+      // commands at all (roborev 56038).
+      //
+      // `{ terminal: true }` NAMES THE DESTINATION, NOT THE SEGMENT'S FINALITY. It means "hand this
+      // back to be typed into a PTY" and nothing else — there is no "this is the last segment" flag
+      // here, and reading it as one is how unfinished words get typed into a live terminal.
+      const toType = onSegment(text, { terminal: true });
+      if (!toType) return true;
+      // Fire-and-forget: the write is chained per-agent inside the sink, so ordering is preserved
+      // without this listener awaiting anything. The outcome is logged WITHOUT the transcript —
+      // dictation captures whatever was said near the mic, which is not all of it meant for a log.
+      void routeDictationToTerminal(toType).then((out) => {
+        if (out.kind === "delivered") return;
+        // ══ A REFUSAL PUTS THE WORDS IN THE COMPOSER, IT DOES NOT DROP THEM ═════════════════
+        // The refusing states (a live picker, a password prompt, an unreadable screen) are the
+        // LIKELY ones, and the user is watching a live meter and a placeholder that says "I'm
+        // listening". A phrase that simply vanishes there is indistinguishable from dictation
+        // being broken. The composer is the safe destination: it is a text box the user can read
+        // and edit, so nothing is executed and nothing is lost.
+        // `insertTarget` is ONE app-wide slot, registered by whichever compose box mounted last,
+        // and `insert` is a silent no-op when it is null (roborev 56057). Claiming "left in the
+        // composer" without checking would re-create the exact silent drop the fallback exists to
+        // close, and would say so in the log while it happened.
+        const placed = useDictationStore.getState().insertTarget !== null;
+        if (placed) useDictationStore.getState().insert(toType);
+        console.info(
+          placed
+            ? "[dictation] terminal declined; text left in the composer"
+            : "[dictation] terminal declined and no composer was mounted to catch it",
+          {
+            outcome: out.kind,
+            reason: out.kind === "refused" ? out.reason : undefined,
+            chars: toType.length,
+          },
+        );
+      });
+      return true;
+    }
+    if (!isRoutable()) return false;
+    // Capture started — clear any lingering model-download progress.
+    useDictationStore.getState().setModelProgress(null);
+    // A committed (final) segment supersedes the live preview — clear it so the interim text
+    // doesn't briefly double up with the text that's about to land in the box.
+    useDictationStore.getState().setInterim("");
+    // …and record the ARRIVAL itself, for the push-to-talk drain (roborev 57295).
+    useDictationStore.getState().noteCommittedSegment();
+    onSegment(text, { terminal: false });
+    return true;
+  };
+
   // Register event listeners — each `listen()` returns an unsubscribe fn.
   const unsubscribes = await Promise.all([
     listen<string>("dictation://partial", (e) => {
-      // THE ONE GATE (see isRoutable). Committed text must land in exactly one place: the focused
-      // window, and only while dictation is routable there. Background windows bail — otherwise the
-      // same phrase types into every open window's composer — and so does a window whose caret sits
-      // in a terminal, where the composer the text would land in isn't the thing the user is typing
-      // into at all.
-      // ══ THE TERMINAL DESTINATION ═══════════════════════════════════════════════════════════
-      // Checked BEFORE the composer gate and returning unconditionally, so exactly one destination
-      // ever sees a given phrase. Only COMMITTED text reaches here (`dictation://partial` is the
-      // committed-segment event; the live preview is `dictation://interim`), which is the contract
-      // the sink depends on — streaming a phrase the recognizer is still revising into a live PTY
-      // would type, and partly execute, words the speaker never finished saying.
-      if (isTerminalRoutable()) {
-        useDictationStore.getState().setModelProgress(null);
-        useDictationStore.getState().setInterim("");
-        // A COMMITTED segment arrived. The push-to-talk drain keys its "is anything still landing"
-        // question on this rather than on the composer's text, which cannot tell a transcript from a
-        // keystroke (roborev 57295).
-        useDictationStore.getState().noteCommittedSegment();
-        // ══ ONE HANDLER, BOTH DESTINATIONS ═══════════════════════════════════════════════════
-        // `onSegment` decides delivery for the composer and the terminal alike, and passing
-        // `{ terminal: true }` is what makes it hand the text BACK rather than insert it. Keeping
-        // one handler (rather than short-circuiting past it here) is why the routing gate cannot
-        // apply to one destination and not the other — the shape that let a spoken command be typed
-        // onto an agent's command line instead of being acted on, back when segments carried
-        // commands at all (roborev 56038).
-        const toType = onSegment(e.payload, { terminal: true });
-        if (!toType) return;
-        // Fire-and-forget: the write is chained per-agent inside the sink, so ordering is preserved
-        // without this listener awaiting anything. The outcome is logged WITHOUT the transcript —
-        // dictation captures whatever was said near the mic, which is not all of it meant for a log.
-        void routeDictationToTerminal(toType).then((out) => {
-          if (out.kind === "delivered") return;
-          // ══ A REFUSAL PUTS THE WORDS IN THE COMPOSER, IT DOES NOT DROP THEM ═════════════════
-          // The refusing states (a live picker, a password prompt, an unreadable screen) are the
-          // LIKELY ones, and the user is watching a live meter and a placeholder that says "I'm
-          // listening". A phrase that simply vanishes there is indistinguishable from dictation
-          // being broken. The composer is the safe destination: it is a text box the user can read
-          // and edit, so nothing is executed and nothing is lost.
-          // `insertTarget` is ONE app-wide slot, registered by whichever compose box mounted last,
-          // and `insert` is a silent no-op when it is null (roborev 56057). Claiming "left in the
-          // composer" without checking would re-create the exact silent drop the fallback exists to
-          // close, and would say so in the log while it happened.
-          const placed = useDictationStore.getState().insertTarget !== null;
-          if (placed) useDictationStore.getState().insert(toType);
-          console.info(
-            placed
-              ? "[dictation] terminal declined; text left in the composer"
-              : "[dictation] terminal declined and no composer was mounted to catch it",
-            {
-              outcome: out.kind,
-              reason: out.kind === "refused" ? out.reason : undefined,
-              chars: toType.length,
-            },
-          );
-        });
-        return;
-      }
-      if (!isRoutable()) return;
-      // Capture started — clear any lingering model-download progress.
-      useDictationStore.getState().setModelProgress(null);
-      // A committed (final) segment supersedes the live preview — clear it so the interim text
-      // doesn't briefly double up with the text that's about to land in the box.
-      useDictationStore.getState().setInterim("");
-      // …and record the ARRIVAL itself, for the push-to-talk drain (roborev 57295).
-      useDictationStore.getState().noteCommittedSegment();
-      onSegment(e.payload, { terminal: false });
+      deliverCommittedSegment(e.payload);
     }),
 
     // Cloud-only: Deepgram interim results — the live, word-by-word preview. Volatile; replaced in
@@ -514,8 +537,45 @@ export async function createDictationController(
     // instead of dictation getting stranded). Idempotent on the normal stop path (cloud already torn
     // down). Metering is server-side now, so there's no client meter to stop here.
     listen<boolean>("dictation://cloud-ended", (e) => {
+      // ══ THE TAIL RECOVERY: THE USER'S LAST WORDS ARE IN `interim`, AND THEY WERE BEING DROPPED ══
+      // This handler used to clear `interim` unconditionally, which is correct on exactly one of the
+      // three paths that reach it. On a CLEAN close Rust has already sent Finalize/CloseStream and
+      // read-drained the socket, so the trailing final arrived as a `dictation://partial` and
+      // `interim` is already "" — clearing is a no-op. On a mid-stream RELAY FAILURE, and on the
+      // out-of-credits teardown, no final is coming: `interim` still holds words the user actually
+      // said, and clearing them is a silent, unrecoverable loss. Dictation is how nearly everything
+      // here gets written, so a truncated tail is the most expensive bug this file can have.
+      //
+      // THE INVARIANT THAT MAKES COMMITTING IT SAFE — i.e. why this cannot DUPLICATE text. The
+      // `dictation://partial` path clears `interim` on EVERY committed segment (both branches of
+      // `deliverCommittedSegment`), and the `dictation://interim` handler clears it whenever this
+      // window is not routable. So a NON-EMPTY `interim` at this instant is by construction text
+      // that no committed segment has carried. Committing it adds words; it can never repeat them.
+      //
+      // It goes through `deliverCommittedSegment` rather than a private insert so the recovered tail
+      // obeys the identical destination rules as every other committed segment — including the
+      // terminal branch, which hands the text back to be typed into the PTY the user is actually
+      // driving instead of into a composer they are not looking at.
+      const tail = useDictationStore.getState().interim;
+      if (tail.trim() !== "") {
+        const recovered = deliverCommittedSegment(tail);
+        // NEVER THE TRANSCRIPT ITSELF — only its length. Dictation captures whatever was said near
+        // the microphone, which is not all of it meant for a log (see emit_partial in dictation.rs).
+        console.info(
+          recovered
+            ? "[dictation] committed an orphaned interim tail at cloud-ended"
+            : "[dictation] dropped an orphaned interim tail at cloud-ended (no routable destination)",
+          { chars: tail.length, exhausted: e.payload === true },
+        );
+      }
       useDictationStore.getState().setInterim("");
       invoke("stop_cloud_stream").catch(() => {});
+      // The cloud engine is gone, so dictation continues on-device — which has no interim results at
+      // all, meaning the live word-by-word preview structurally stops existing. Say so rather than
+      // letting the user read a silent engine swap as a broken feature (see dictationEngineStore).
+      // `e.payload` is the relay's `exhausted` flag: out-of-credits is the one cause the user can act
+      // on, so it is reported distinctly from an ordinary outage.
+      useDictationEngineStore.getState().noteCloudUnavailable(e.payload ? "exhausted" : "unavailable");
       // Out-of-credits teardown → refresh the balance so the credits pill reflects the now-depleted
       // balance (the last relay `balance` frame was pre-decline). A clean close (payload false) skips
       // the round-trip.
@@ -941,8 +1001,26 @@ export function useAmbientVoice(): void {
     void openCloudDictationWindow({
       // Metering-only: attributes the per-minute dictation debits to the project the user is
       // dictating into. Resolved at open time; undefined when no project is selected.
-      startCloudStream: () =>
-        invoke<boolean>("start_cloud_stream", { project: selectedProjectName() }),
+      // THE RELAY'S OWN ANSWER, RECORDED. `true` = the socket opened, so the cloud engine is live and
+      // any standing fallback notice retires; `false` = the relay REFUSED (signed out, not entitled,
+      // can't afford the first minute) and dictation silently continues on-device without interim
+      // results. That refusal is definitive, not a blip to be de-flapped — see dictationEngineStore.
+      //
+      // THE ONE PLACE THIS INVOKE LIVES, which is why wiring it here covers every opener: both the
+      // passive→active phase edge and the focus-regain resume reach the relay through
+      // `onResumeActive` → this closure, so neither can open a stream without reporting what happened.
+      // Refusals are deliberately indistinguishable at this seam (see openCloudDictationWindow), so
+      // "unavailable" is the only honest reason available here; out-of-credits is reported by name
+      // from the mid-stream `cloud-ended` teardown, which does know.
+      startCloudStream: async () => {
+        const opened = await invoke<boolean>("start_cloud_stream", {
+          project: selectedProjectName(),
+        });
+        const engine = useDictationEngineStore.getState();
+        if (opened) engine.noteCloudLive();
+        else engine.noteCloudUnavailable("unavailable");
+        return opened;
+      },
       stopCloudStream: () => void invoke("stop_cloud_stream").catch(() => {}),
       isStillActive: () =>
         useDictationStore.getState().phase === "active" &&

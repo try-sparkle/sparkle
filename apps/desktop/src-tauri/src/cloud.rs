@@ -1,7 +1,8 @@
 //! Deepgram Nova-3 cloud dictation — streamed through the SERVER-SIDE orchestration relay.
 //!
 //! Audio is captured natively (see `audio.rs`) as 16 kHz mono f32. When the user is actively
-//! dictating (the wake-word phase machine is ACTIVE — see the frontend) we open a WebSocket to the
+//! dictating (the dictation phase is ACTIVE — the send tray sitting on Speak, or a push-to-talk
+//! hold; see `voice/dictationPhase` on the frontend) we open a WebSocket to the
 //! orchestration relay's `/ai/deepgram` endpoint (see apps/orchestration/src/socket/deepgramRelay.ts)
 //! and stream PCM16 frames up. The relay authenticates the user's Sparkle bearer, opens Deepgram
 //! Nova-3 on SPARKLE's key (not a local one), meters per-minute server-authoritatively, and streams
@@ -142,7 +143,8 @@ pub struct DeepgramSession {
     /// `suppress_ended` is NOT enough there: it gates only the `cloud-ended` emit, while the ~2 s
     /// post-CloseStream drain keeps forwarding transcripts. `dictation://partial` feeds straight
     /// into the frontend's `onSegment`, so a trailing final from the OLD socket can inject stale text
-    /// into the new session — or, if it happens to contain the configured stop word, end it. Balance
+    /// into the new session — and, since a committed segment arms the auto-send countdown, dispatch
+    /// it. Balance
     /// emits are deliberately NOT muted: that minute was really debited and the pill must show it.
     muted: Arc<AtomicBool>,
     /// The project name this socket was OPENED with, normalized the same way the wire value is
@@ -209,7 +211,8 @@ impl DeepgramSession {
 
     /// Drop into warm standby: Finalize the current utterance (so its trailing text still commits)
     /// and keep the socket open for `WARM_STANDBY` so the next utterance can reuse it. No-ops if the
-    /// worker already exited. Called instead of `finish()` on a normal stop-word stop.
+    /// worker already exited. Called instead of `finish()` on a normal stop (the send tray leaving
+    /// Speak, a push-to-talk hold released, a window blur, or the idle-relay park).
     pub fn pause(&self) {
         self.parked.store(true, Ordering::Relaxed);
         let _ = self.audio_tx.send(AudioMsg::Pause);
@@ -1123,7 +1126,7 @@ mod tests {
         // The reopen paths tear a session down WHILE its replacement is opening, so both gates must
         // close before the blocking close is handed to a worker: `suppress_ended` alone leaves the
         // ~2 s drain still emitting partials (the frontend feeds those to onSegment — stale text in
-        // the new session, or the stop word ending it outright), and a cloud-ended emitted from the
+        // the new session, and an auto-send countdown armed over it), and a cloud-ended emitted from the
         // scheduling gap stops the successor outright. Asserted on the flags the WORKER reads, before
         // finish() is ever called. (roborev 50498/53024)
         let (session, _rx) = parkable_session();

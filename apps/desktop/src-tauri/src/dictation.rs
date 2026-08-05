@@ -1,12 +1,21 @@
 //! Tauri commands wiring mic capture → transcriber → events.
 //!
 //! Two transcription engines sit behind this module:
-//!   - **on-device** (Parakeet/Silero, `transcribe.rs`): always runs while the mic is hot. It
-//!     powers the always-listening wake-word detection — the free, private "gate".
+//!   - **on-device** (Parakeet/Silero, `transcribe.rs`): the free, private, ALWAYS-AVAILABLE local
+//!     path. Silero closes a VAD segment on a silence gap and the Parakeet transducer decodes it
+//!     offline, off the realtime audio thread (`DecodeWorker`). It runs whenever the mic is hot and
+//!     the cloud stream is not routing — i.e. it is both the fallback when the cloud is unavailable
+//!     (signed out, out of credits, socket death) and the engine of record the rest of the time.
 //!   - **cloud** (Deepgram Nova-3, `cloud.rs`): opened only once the user is actively dictating
-//!     (the frontend wake-word machine hits ACTIVE and calls `start_cloud_stream`), and closed
+//!     (the frontend's dictation phase reaches ACTIVE and calls `start_cloud_stream`), and closed
 //!     on stop. While it's open the capture callback routes frames to Deepgram instead of the
 //!     on-device model, so the cloud only ever sees speech the user intended to dictate.
+//!
+//! WHAT MOVES THE PHASE, since this module's job is to react to it: the three-position send tray
+//! (`voice/sendMode`, `voice/dictationPhase`). **Speak** holds ACTIVE for as long as the tray sits
+//! there; **Push to talk** is PASSIVE at rest and ACTIVE for the duration of a hold; **Send**
+//! releases the mic. There is no wake word and no stop word — both were retired (PR #1160); every
+//! transition here is driven by that tray, by window focus, or by the relay itself.
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -79,8 +88,9 @@ pub(crate) fn reset_interim_log_sampling() {
 }
 
 /// Emit a live, *volatile* interim transcript (the cloud path's word-by-word preview). Unlike a
-/// committed partial this is replaced in place on the frontend and is NOT routed through the
-/// wake-word machine.
+/// committed partial this is replaced in place on the frontend and is NOT routed to a destination:
+/// it only paints the italic preview, so nothing is inserted into a composer or a PTY from it and
+/// it never arms the auto-send countdown.
 ///
 /// ── WHY THIS LOGS AT ALL, WHEN IT DELIBERATELY DID NOT ────────────────────────────────────────
 /// The old contract here was "we emit it to the webview and keep nothing", and for the TEXT that
@@ -147,8 +157,10 @@ fn should_log_interim(n: u64) -> bool {
 /// callback routes each frame to the relay OR the on-device VAD/decode queue on `cloud_active`,
 /// never both — so ROUTING is exclusive. EMISSION is not: `decode_tx` is a 32-deep buffer the decode
 /// worker keeps draining after the flag flips, so a segment closed just before it decodes hundreds
-/// of ms later, while Deepgram is already authoring. The wake-word path makes that the common case
-/// rather than an exotic one, since the on-device model IS the always-listening wake gate.
+/// of ms later, while Deepgram is already authoring. That is the COMMON case rather than an exotic
+/// one, because the on-device model is what runs right up to the instant the relay opens: every
+/// passive→active transition hands over mid-stream, with the decode queue still holding segments
+/// captured before the flip.
 ///
 /// That overlap is NOT suppressed here, and `plan_decode_emit` documents at length why an attempt to
 /// suppress it was withdrawn: the boundary it discarded had no successor, so the flagship hands-free
@@ -200,7 +212,7 @@ pub(crate) fn emit_on_device_speech(app: &AppHandle, active: bool) {
 /// the relay signalling out-of-credits. The frontend handles this by clearing the interim preview and
 /// calling stop_cloud_stream, which flips `cloud_active` back to false so the capture callback resumes
 /// routing frames to the on-device model. Without this, a mid-stream socket death would strand
-/// dictation: frames keep going to the dead session, the on-device wake/stop-word path never resumes,
+/// dictation: frames keep going to the dead session, the on-device fallback path never resumes,
 /// and the last interim stays painted as a stale ghost. `exhausted` is true when the relay tore the
 /// stream down for out-of-credits, so the frontend can refresh the (now-depleted) balance pill.
 pub(crate) fn emit_cloud_ended(app: &AppHandle, exhausted: bool) {
@@ -280,7 +292,8 @@ pub(crate) enum RacedStream {
 /// at all. The user was paying real money for the churn.
 ///
 /// Most of those races are survivable. The common trigger is a window blur (capture paused) or a
-/// stop word landing mid-handshake — neither of which invalidates the SESSION, only the routing. If
+/// stop landing mid-handshake (the tray leaving Speak, a push-to-talk hold released, the idle-relay
+/// park) — neither of which invalidates the SESSION, only the routing. If
 /// the generation is unchanged and nothing else has claimed the slot, parking the socket makes the
 /// next utterance reuse it via `cloud_reuse`'s `Resume` path: no second handshake, and the minute
 /// already paid for gets used instead of discarded.
@@ -333,8 +346,8 @@ pub(crate) struct Installed {
 /// currently installed.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum CloudReuse {
-    /// A live socket for THIS project is already routing — do nothing (idempotent: a repeated wake
-    /// transition must not open a second socket).
+    /// A live socket for THIS project is already routing — do nothing (idempotent: a repeated
+    /// passive→active transition must not open a second socket).
     AlreadyRouting,
     /// A warm (parked) socket for this project — resume it, no handshake.
     Resume,
@@ -745,7 +758,8 @@ pub(crate) enum DecodeEmitPlan {
 /// That guard had NO SUCCESSOR ARM, and it broke the flagship flow (roborev 55417). "Hey Sparkle,
 /// deploy the staging branch" said in one breath closes as TWO segments. The first decodes with the
 /// flag still false, drives the phase flip and opens the relay; the second was captured pre-flip and
-/// drains after it — the common case, not an exotic one, since the on-device model IS the wake gate.
+/// drains after it — the common case, not an exotic one, since the on-device model is what runs
+/// right up to the instant the relay opens.
 /// Its transcript lands in the composer and its boundary was thrown away. The user has stopped
 /// talking, so the relay carries only silence and never sends an `Ended`/`UtteranceEnd` frame, and
 /// `cloud_active` means the on-device engine produces no further segment either. Nothing ever arms:
@@ -766,8 +780,8 @@ pub(crate) enum DecodeEmitPlan {
 /// (roborev 55455). The risk is accepted at its true size, not at a flattering one.
 ///
 /// So the boundary stays coupled to the transcript it describes, and WHETHER to arm is decided where
-/// the facts live — the frontend knows mic ownership and wake-word stripping; this thread knows
-/// neither.
+/// the facts live — the frontend knows mic ownership, the tray position and where the caret is;
+/// this thread knows none of them.
 ///
 /// The two silent cases below are unchanged, and unlike the withdrawn one they ARE recoverable by
 /// the very next segment: the user keeps talking, the VAD closes a segment with words in it, and
@@ -1244,7 +1258,8 @@ enum ReconcileStep {
 
 /// Whether a focus-driven capture TEARDOWN should park the installed cloud session in warm
 /// standby. Deliberately the same predicate as `stop_cloud_stream`'s `keep_warm`: parking on blur
-/// and parking on a stop-word stop are one rule, not two, so they can't drift.
+/// and parking on a deliberate stop (the tray leaving Speak, a hold released) are one rule, not
+/// two, so they can't drift.
 fn should_standby_on_blur(cloud_active: bool, alive: bool) -> bool {
     should_keep_warm_on_stop(cloud_active, alive, false)
 }
@@ -1276,7 +1291,7 @@ fn should_resume_on_focus(cloud_active: bool, alive: bool) -> bool {
     !cloud_active && alive
 }
 
-/// Park a live cloud session in warm standby on window blur, mirroring a stop-word stop.
+/// Park a live cloud session in warm standby on window blur, mirroring a deliberate stop.
 ///
 /// Without this the blur path drops the capture but leaves the socket UNPAUSED: it then idles with
 /// no audio, no `CloseStream` and no warm timer until the relay's upstream idle-close severs it, so
@@ -1665,7 +1680,7 @@ impl DictationState {
     /// Record whether any Sparkle window is the focused OS window and reconcile the mic to match.
     /// Called from the window-focus event (lib.rs). When the app-level focus actually flips we emit
     /// `dictation://focus` so the frontend can pause/resume the billable cloud stream + per-minute
-    /// meter, reset the wake-phase, and update the listening UI. Moving focus between two Sparkle
+    /// meter, reset the dictation phase, and update the listening UI. Moving focus between two Sparkle
     /// windows keeps `focused` true, so no event fires and the mic stays live.
     pub fn set_focused(&self, app: &AppHandle, focused: bool) {
         let (changed, leftovers) = {
@@ -1739,7 +1754,7 @@ impl DictationState {
 /// Build the cpal capture stream and wire its callback to the transcription pipeline, plus the
 /// dedicated decode worker that runs the heavy on-device transducer OFF the realtime thread. Shared
 /// by start_dictation (fresh arm) and the focus reconciler (resume), so the routing logic — cloud
-/// frames while actively dictating, else the on-device wake-word model — lives in exactly one place.
+/// frames while actively dictating, else the on-device model — lives in exactly one place.
 ///
 /// Returns `(Capture, DecodeWorker)`: the caller stores BOTH in the session and, on teardown, drops
 /// the Capture first (closing the decode channel) then the DecodeWorker (a bounded join). The audio
@@ -1796,7 +1811,10 @@ fn build_capture(
         }
         // While the cloud stream is open (user actively dictating), route frames to Deepgram and
         // skip the on-device model entirely. Otherwise the on-device model handles the frame —
-        // this is the always-listening wake-word gate. Locks are poison-tolerant ():
+        // this is the local transcription path, which is what runs whenever the relay is not
+        // routing (armed but passive, signed out, out of credits, socket death). The callback only
+        // enqueues; the transducer decodes on the DecodeWorker, off this realtime thread.
+        // Locks are poison-tolerant ():
         // a prior panicked frame must not wedge dictation; the audio.rs panic firewall already
         // prevents such a panic from aborting the process.
         // NOTE: on a mid-stream cloud failure there's a brief (~one event round-trip) window where
@@ -2541,8 +2559,8 @@ pub async fn start_dictation(app: AppHandle, state: State<'_, DictationState>) -
     //
     //  1. It is the only thing that catches a DENIED user at all. cpal/CoreAudio do not fail for
     //     them — `Capture::start` returns Ok and then delivers buffers of zeros forever, so the mic
-    //     ring goes amber, the composer says "Say Hey Sparkle", and the app waits for a wake word it
-    //     can never hear, with no error anywhere. See mic_permission.rs's module docs.
+    //     ring goes amber, every surface paints an armed, listening microphone, and the app waits
+    //     on speech it can never hear, with no error anywhere. See mic_permission.rs's module docs.
     //
     //  2. The OS prompt is triggered by the FIRST mic access, which — before this — was
     //     `stream.play()` at the very end of `reconcile_locked`, i.e. AFTER the multi-minute
@@ -2660,8 +2678,10 @@ pub async fn start_dictation(app: AppHandle, state: State<'_, DictationState>) -
 }
 
 /// Open the cloud (relay) stream for the active-dictation window. The frontend calls this only when
-/// the wake-word machine transitions to ACTIVE *and* it has already gated on the live "voice
-/// dictation" + composer settings — so this command's job is just "open if signed in". (The
+/// the dictation phase transitions to ACTIVE — the send tray moving to Speak, or a push-to-talk
+/// hold beginning (`voice/dictationPhase`, `voice/sendMode`) — *and* it has already gated on the
+/// live "voice dictation" + composer settings, so this command's job is just "open if signed in".
+/// (The
 /// voice-setting gate lives entirely in the frontend, the single source of truth; no `cloud` arg.)
 ///
 /// Returns TRUE only when a live relay socket was actually installed. Returns FALSE on every
@@ -2693,7 +2713,7 @@ pub async fn start_cloud_stream(
     // can later confirm (via ptr_eq) the session generation didn't change.
     let (cloud_slot, cloud_active, cloud_epoch, cloud_tx, stale_socket) = {
         let sess = state.0.lock().unwrap_or_else(|p| p.into_inner());
-        // Warm reuse: a socket paused into standby by a recent stop-word stop is still open. If its
+        // Warm reuse: a socket paused into standby by a recent stop is still open. If its
         // worker is alive AND it belongs to the project we're dictating into, resume on it — no
         // TLS+WS handshake, so dictation starts instantly. Done entirely under the lock (resume() is
         // just a non-blocking channel send). A lost liveness race is safe: resuming a just-dead
@@ -2787,7 +2807,7 @@ pub async fn start_cloud_stream(
     // finish() itself: this teardown runs CONCURRENTLY with the successor session's handshake, and
     // finish() suppresses only the cloud-ended emit — the post-CloseStream drain would keep
     // forwarding transcripts, so a trailing final from the old project's socket could land in
-    // the new session's composer (or end it, if it carried the stop word). Fire-and-forget — nothing
+    // the new session's composer. Fire-and-forget — nothing
     // below depends on it.
     if let Some(stale) = stale_socket {
         tauri::async_runtime::spawn_blocking(move || stale.finish());
@@ -2927,9 +2947,10 @@ pub async fn start_cloud_stream(
     }
 }
 
-/// Close the Deepgram cloud stream (the frontend calls this on the stop word, or it's called
-/// during stop_dictation). Flushes Deepgram for the trailing final result, then routes frames
-/// back to the on-device model for continued wake-word listening.
+/// Close the Deepgram cloud stream. The frontend calls this when the dictation phase leaves ACTIVE
+/// (the send tray moving off Speak, a push-to-talk hold released, or the idle-relay park after a
+/// stretch of silence), and it is also called during stop_dictation. Flushes Deepgram for the
+/// trailing final result, then routes frames back to the on-device model.
 ///
 /// MUST stay `async fn`, for the SAME reason `start_cloud_stream` above does. A plain sync
 /// `#[tauri::command]` is `ExecutionContext::Blocking`, which runs the body INLINE on the
@@ -2947,11 +2968,11 @@ pub async fn stop_cloud_stream(state: State<'_, DictationState>) -> Result<(), (
         let was_active = sess.cloud_active.swap(false, Ordering::Relaxed); // callback routes on-device again
         sess.cloud_epoch.fetch_add(1, Ordering::Relaxed); // invalidate any in-flight start_cloud_stream
         let mut cloud = sess.cloud.lock().unwrap_or_else(|p| p.into_inner());
-        // Warm standby: a genuine stop-word stop of a LIVE stream pauses the socket and KEEPS it for
+        // Warm standby: a genuine stop of a LIVE stream pauses the socket and KEEPS it for
         // ~WARM_STANDBY so the next utterance reuses it (no handshake). The session stays in the slot;
         // start_cloud_stream resumes it. Any other case (already inactive — e.g. a cloud-ended cleanup
         // after warm expiry — or a worker that already died) takes + finishes the leftover instead.
-        // Shares the predicate with the blur path rather than restating it: parking on a stop-word
+        // Shares the predicate with the blur path rather than restating it: parking on a deliberate
         // stop and parking on a window blur are ONE rule, and an inline copy here is exactly how the
         // two would drift. `is_parked` is what makes the blur ordering work — see
         // `should_keep_warm_on_stop`.
@@ -4486,7 +4507,7 @@ mod tests {
         // IPC/event-loop thread) that the 8s warm standby already existed to avoid: 114 sub-8s
         // reconnects in a single observed session. Park iff there is something live to park.
         assert!(should_standby_on_blur(true, true), "live + active → park in warm standby");
-        // Not active: the session is already parked (a stop-word stop got there first) or was never
+        // Not active: the session is already parked (a deliberate stop got there first) or was never
         // routed to cloud. Re-pausing would restart the warm timer and hold the socket longer.
         assert!(!should_standby_on_blur(false, true), "already inactive → nothing to park");
         // Dead worker: the socket is gone; pause() would be a send into a closed channel.
@@ -4506,7 +4527,7 @@ mod tests {
             should_keep_warm_on_stop(false, true, true),
             "already parked by the blur path → keep the warm socket, don't close it"
         );
-        // Unchanged: a stop-word stop of a live, actively-routing stream still parks.
+        // Unchanged: a deliberate stop of a live, actively-routing stream still parks.
         assert!(should_keep_warm_on_stop(true, true, false), "live + active → park");
         // Still closed — an installed session that never routed and was never parked has NO warm
         // timer running behind it, so keeping it would leave a socket idling until the relay's
@@ -4696,7 +4717,7 @@ mod tests {
         // "discarding cloud stream opened during a stop/again race" appears repeatedly in the
         // 2026-07-29 log, and every occurrence cost a full TLS+WS handshake AND an up-front
         // firstMinuteCents debit for a connection that carried no audio. The common triggers — a
-        // window blur pausing capture, a stop word landing mid-handshake — do not invalidate the
+        // window blur pausing capture, a stop landing mid-handshake — do not invalidate the
         // SESSION, only the routing, so the socket is still worth keeping.
         assert_eq!(
             disposition(SALVAGEABLE),

@@ -36,6 +36,7 @@ import { OfflineBanner } from "./OfflineBanner";
 import { ZeroCreditBanner } from "./ZeroCreditBanner";
 import { ProviderUnavailableBanner } from "./ProviderUnavailableBanner";
 import { AiServiceBanner } from "./AiServiceBanner";
+import { DictationEngineBanner } from "./DictationEngineBanner";
 import { ClosePrompt } from "./ClosePrompt";
 import { StatusStrip } from "./StatusStrip";
 import {
@@ -1669,6 +1670,12 @@ export function Workspace() {
           non-flappy — a lone blip never lights it — and it clears on the first successful call.
           Dismissible, unlike the provider banner, because the retry path keeps working underneath. */}
       <AiServiceBanner />
+      {/* The dictation relay is Sparkle's OWN service, so none of the three above ever fires for
+          it: the machine is online, the balance may be fine, and Claude Code is untouched. When the
+          relay declines, dictation silently swaps to the on-device engine — which has no interim
+          results, so the live italic preview disappears while the words keep landing. This names
+          that loss and its remedy; nothing is shown inside the composer or the mic UI. */}
+      <DictationEngineBanner />
       {/* NO FULL-WIDTH PROJECT TAB STRIP. `main` still renders one here across the whole window.
           The cockpit moves it: tabs belong to the PAIR, because a pair IS one project (build and
           its terminal), and they must never sit above the concierge — which is cross-project by
