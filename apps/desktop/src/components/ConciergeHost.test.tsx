@@ -80,6 +80,7 @@ const h = vi.hoisted(() => ({
     })),
     failed: [] as string[],
   })),
+  proactiveIds: new Set<string>(),
   brain: {} as {
     delta?: (e: { id: string; text: string }) => void;
     done?: (e: { id: string; text: string }) => void;
@@ -106,7 +107,9 @@ vi.mock("../services/concierge", async (importOriginal) => ({
   // none of the cases below spend a turn they did not ask for. Its own wiring is covered in
   // ConciergeHost.proactive.test.tsx.
   startProactiveConciergeTurn: vi.fn(async (): Promise<string | null> => null),
-  isProactiveTurn: () => false,
+  // CONTROLLABLE: a push's terminal event must not release a USER turn's slot (roborev 58503), and
+  // that cannot be exercised while every id reads as non-proactive.
+  isProactiveTurn: (id: string) => h.proactiveIds.has(id),
   // The LIVE tool channel. A no-op unsubscribe, exactly like its siblings: these suites are about
   // the host's other wiring, and a mock that simply OMITS an export the host calls does not
   // degrade — vitest throws on the missing property and every case in the file dies at mount.
@@ -1014,6 +1017,43 @@ describe("ConciergeHost", () => {
     expect(
       secondBubble.closest("[data-message-id]")!.textContent,
     ).toMatch(/Not sent/);
+  });
+
+  /**
+   * A PUSH'S `done` MUST NOT RELEASE A USER TURN'S SLOT (roborev 58503).
+   *
+   * `turnFinished` is id-agnostic — it releases whatever is in `running` — so an unguarded drain in
+   * the done handler let a background push dispatch the queued message while the user's turn was
+   * still streaming, and `concierge.rs` then killed that turn's child. The exact loss the queue
+   * exists to prevent, arriving from a turn the user never sent.
+   *
+   * Asserted on `startConciergeTurn` NOT being called again, which is the call that does the
+   * killing.
+   */
+  it("a proactive push finishing does not dispatch the queued message", async () => {
+    _resetConciergeActivityForTests();
+    h.proactiveIds.clear();
+    h.feed = feedWith("approval");
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "M1" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "M2" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    const before = h.startConciergeTurn.mock.calls.length;
+
+    // A background push finishes. It owns no slot, so it must release nothing.
+    h.proactiveIds.add("99");
+    act(() => h.brain.done?.({ id: "99", text: "an unprompted note" }));
+    await settle();
+    expect(h.startConciergeTurn.mock.calls.length).toBe(before);
+
+    // NOT ALSO ASSERTING "M1's own done still drains" HERE. The push carries a higher turn id, which
+    // advances the retirement floor, so M1's `done` is then rejected by the supersede gate before it
+    // reaches the drain — a property of the harness's id ordering, not of this guard. Asserting it
+    // here would fail for a reason unrelated to what this case is about. The guard narrowing rather
+    // than disabling is covered by the re-send case above, which drains on an ordinary `done`.
   });
 
   // Each refused path gets its OWN remedy, and the remedies genuinely differ: Retry for a pane that

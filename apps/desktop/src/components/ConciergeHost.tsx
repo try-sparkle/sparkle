@@ -2305,7 +2305,20 @@ export function ConciergeHost({
       // Last is the only position where both hold: the teardown has run, the reply has been stamped
       // against the queue as it stood while that turn was the one being answered, and only then does
       // the next turn start.
-      drainQueueRef.current();
+      //
+      // ══ AND STILL ONLY FOR A USER TURN (roborev 58503) ═══════════════════════════════════════
+      // Moving this to "last" also moved it OUT of the `!isProactiveTurn` block above, which made it
+      // unconditional — and `turnFinished` is deliberately id-agnostic: it releases whatever is in
+      // `running` and dispatches the next waiter, without checking that the ending turn is the one
+      // holding the slot. So a PUSH's terminal event released a USER turn's slot.
+      //
+      // The damage is the thing the queue exists to prevent. A push whose reply arrives in one chunk
+      // emits no delta, so `latestTurnRef` stays below it; the user then sends M1 (running) and M2
+      // (queued); the push's buffered `done` passes the supersede gate, skips the teardown because
+      // it is proactive, and — unguarded — drained: M2 dispatched while M1 was still streaming, and
+      // `concierge.rs` killed M1's child. The error handler kept its own proactive guard, so the two
+      // terminal paths were also asymmetric.
+      if (!isProactiveTurn(e.id)) drainQueueRef.current();
       // ══ THE PROMISE LEDGER (sparkle-gfume) ═══════════════════════════════════════════════════
       // Measured across all 1,490 logged turns: 45 first-person promises made, 9 kept, 35 dropped.
       // The linter above cannot see this — it compares a claim against THIS turn's calls and
