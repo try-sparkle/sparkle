@@ -6,7 +6,7 @@
 // network, or render nothing at all while AI is dead.
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { ProviderUnavailableBanner } from "./ProviderUnavailableBanner";
+import { ProviderUnavailableBanner, PROVIDER_UNAVAILABLE_BAR_TESTID } from "./ProviderUnavailableBanner";
 import { OUTAGE_MAX_AGE_MS, useAiProviderStore } from "../stores/aiProviderStore";
 
 beforeEach(() => useAiProviderStore.setState({ outage: null }));
@@ -82,5 +82,49 @@ describe("ProviderUnavailableBanner", () => {
     useAiProviderStore.setState({ outage: null });
     rerender(<ProviderUnavailableBanner />);
     expect(container.innerHTML).toBe("");
+  });
+});
+
+/**
+ * ── THE NARROW-WINDOW GUARD (bead sparkle-kk9dg.2) ─────────────────────────────────────────────
+ *
+ * jsdom has NO LAYOUT ENGINE, so nothing here can observe wrapping, overflow or clipping — a test
+ * claiming to see the banner clipped would measure nothing at all (docs/jsdom-test-caveats.md).
+ * These assert the STYLE SHAPE only. The pixels are proven separately, in real Chrome, by
+ * BannerStack.layout.test.ts; this block is the cheap always-runs guard that the two properties
+ * that shape survive are still on the element.
+ */
+describe("the bar's layout shape at a narrow window", () => {
+  it("top-anchors its content rather than centring it", () => {
+    useAiProviderStore.setState({ outage: { reason: "usage_limit", at: Date.now() } });
+    render(<ProviderUnavailableBanner />);
+    const bar = screen.getByTestId(PROVIDER_UNAVAILABLE_BAR_TESTID);
+    // `center` is the ONE value that can place the sentence's first line ABOVE this box's top
+    // edge, where an ancestor with hidden overflow eats it — i.e. "the subject is cut off above
+    // the viewport", with the reader unable to tell what the banner is even about.
+    expect(bar.style.alignItems).toBe("flex-start");
+  });
+
+  it("never caps its own height — wrapping to more lines is the whole remedy", () => {
+    useAiProviderStore.setState({ outage: { reason: "usage_limit", at: Date.now() } });
+    render(<ProviderUnavailableBanner />);
+    const bar = screen.getByTestId(PROVIDER_UNAVAILABLE_BAR_TESTID);
+    // A taller banner is fine; a clipped one is not. Anything that fixes the height here would
+    // reintroduce "a box shorter than its content" with the centring gone but the damage back.
+    expect(bar.style.height).toBe("");
+    expect(bar.style.maxHeight).toBe("");
+    // ...and the shell (a flex column) must not be able to squash it either.
+    expect(bar.style.flexShrink).toBe("0");
+  });
+
+  it("lets the sentence wrap instead of spilling off both edges", () => {
+    useAiProviderStore.setState({ outage: { reason: "usage_limit", at: Date.now() } });
+    render(<ProviderUnavailableBanner />);
+    const sentence = screen.getByRole("status");
+    // A flex item's default `min-width: auto` floor is min-content, which makes a long sentence
+    // OVERFLOW a narrow bar rather than wrap — and under `justify-content: center` it overflows
+    // equally at both ends, leaving exactly the middle. That is the founder's fragment.
+    expect(sentence.style.minWidth).toBe("0");
+    expect(sentence.style.overflowWrap).toBe("break-word");
   });
 });

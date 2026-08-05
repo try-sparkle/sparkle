@@ -384,6 +384,28 @@ export function PaletteTrigger({ onOpen }: { onOpen: () => void }) {
   // button NEVER CHANGES WIDTH when it appears. Un-rendering it would make the control twitch under
   // the pointer, and the same reveal in the tray would shove `Push to talk` into an ellipsis — the
   // exact trade the tray's reserved keycap slot exists to avoid.
+  //
+  // ── …AND THE BUTTON FILLS ITS SLOT, WHICH IS WHAT MAKES THE RESERVED BOX READ AS DELIBERATE ────
+  // Founder, at a narrow concierge column (bead sparkle-kk9dg.3): "The search field is small and
+  // left-floating, with a stray empty box artifact directly beneath its lower-left corner."
+  //
+  // MEASURED at a 280px column: the slot offers 247px of content width and this button took 109px
+  // of it — `inline-flex`, so it shrink-wrapped its content and sat hard against the left edge with
+  // 138px of nothing beside it, while the nudge card and the compose box directly below both span
+  // the full width. That is the "small and left-floating" half, and it is the whole reason the
+  // reserved keycap slot reads as an ARTIFACT rather than as a shortcut hint: at rest the visible
+  // ink ("🔍 Search") stops ~33px short of the button's own right border, so the control ends in an
+  // empty stub of bordered box that lines up with nothing.
+  //
+  // `flex` + `width: 100%` fixes both at once. The button now spans the column like everything
+  // under it, and the keycap is pushed to the RIGHT EDGE (`marginLeft: auto` below) — the ordinary
+  // search-field idiom, where the trailing shortcut belongs. Nothing is left over to read as a stub.
+  //
+  // THE NO-TWITCH GUARANTEE IS STRENGTHENED, NOT TRADED AWAY. `visibility` still reserves the
+  // keycap's box, so the layout inside is identical revealed or not; and on top of that the button's
+  // width is now 100% of its slot, which cannot depend on its contents at all. Do not go back to
+  // `inline-flex` on the theory that the reserve alone is enough — the reserve is what stops the
+  // BOX moving, and the full width is what stops the box being mostly empty.
   const [revealed, setRevealed] = useState(false);
   return (
     <button
@@ -407,17 +429,24 @@ export function PaletteTrigger({ onOpen }: { onOpen: () => void }) {
         borderRadius: 6,
         padding: "5px 9px",
         cursor: "pointer",
-        display: "inline-flex",
+        display: "flex",
+        // Spans its slot — see the note above. `box-sizing: border-box` is global (index.css), so
+        // the 1px border and the 9px side padding sit INSIDE this 100%, not beyond it.
+        width: "100%",
         gap: 5,
         alignItems: "center",
         fontFamily: FONT_UI,
       }}
     >
-      <FiSearch size={12} aria-hidden />
+      <FiSearch size={12} aria-hidden style={{ flex: "0 0 auto" }} />
       Search
       {/* Hidden, not absent — see the reveal note above. `aria-hidden` because the shortcut is
-          already in this button's accessible NAME, and announcing "⌘K" twice is worse than once. */}
-      <span aria-hidden style={{ visibility: revealed ? "visible" : "hidden" }}>
+          already in this button's accessible NAME, and announcing "⌘K" twice is worse than once.
+
+          `marginLeft: auto` PARKS IT ON THE RIGHT EDGE. Without it the reserved box trails the word
+          "Search" and every pixel between there and the border is dead space — which is exactly the
+          empty stub the founder read as an artifact. */}
+      <span aria-hidden style={{ marginLeft: "auto", visibility: revealed ? "visible" : "hidden" }}>
         <KeyPill>⌘K</KeyPill>
       </span>
     </button>

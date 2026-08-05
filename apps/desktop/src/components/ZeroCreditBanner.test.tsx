@@ -20,7 +20,7 @@ function seedFetchedMe(next: Me | null) {
   fetchMeMock.mockResolvedValue(next);
 }
 
-import { ZeroCreditBanner } from "./ZeroCreditBanner";
+import { ZeroCreditBanner, ZERO_CREDIT_BAR_TESTID } from "./ZeroCreditBanner";
 import { useAuthStore } from "../stores/authStore";
 import { useUiStore } from "../stores/uiStore";
 import type { Me } from "../services/entitlement";
@@ -221,5 +221,59 @@ describe("ZeroCreditBanner", () => {
     useAuthStore.setState({ me: me({ balanceCents: 250 }) });
     const { container } = render(<ZeroCreditBanner inline />);
     expect(container.textContent).toBe("");
+  });
+});
+
+/**
+ * ── THE NARROW-WINDOW GUARD (bead sparkle-kk9dg.2) ─────────────────────────────────────────────
+ *
+ * jsdom has NO LAYOUT ENGINE, so nothing here can observe wrapping, overflow or clipping — a test
+ * claiming to see the banner clipped would measure nothing at all (docs/jsdom-test-caveats.md).
+ * These assert the STYLE SHAPE only. The pixels are proven separately, in real Chrome, by
+ * BannerStack.layout.test.ts; this block is the cheap always-runs guard that the two properties
+ * that shape survive are still on the element.
+ */
+describe("the bar's layout shape at a narrow window", () => {
+  it("top-anchors its content rather than centring it", () => {
+    render(<ZeroCreditBanner />);
+    const bar = screen.getByTestId(ZERO_CREDIT_BAR_TESTID);
+    // `center` is the ONE value that can place the sentence's first line ABOVE this box's top
+    // edge, where an ancestor with hidden overflow eats it — i.e. "the subject is cut off above
+    // the viewport", with the reader unable to tell what the banner is even about.
+    expect(bar.style.alignItems).toBe("flex-start");
+  });
+
+  it("never caps its own height — wrapping to more lines is the whole remedy", () => {
+    render(<ZeroCreditBanner />);
+    const bar = screen.getByTestId(ZERO_CREDIT_BAR_TESTID);
+    // A taller banner is fine; a clipped one is not. Anything that fixes the height here would
+    // reintroduce "a box shorter than its content" with the centring gone but the damage back.
+    expect(bar.style.height).toBe("");
+    expect(bar.style.maxHeight).toBe("");
+    // ...and the shell (a flex column) must not be able to squash it either.
+    expect(bar.style.flexShrink).toBe("0");
+  });
+
+  it("lets the sentence wrap instead of spilling off both edges", () => {
+    render(<ZeroCreditBanner />);
+    const sentence = screen.getByRole("status");
+    // A flex item's default `min-width: auto` floor is min-content, which makes a long sentence
+    // OVERFLOW a narrow bar rather than wrap — and under `justify-content: center` it overflows
+    // equally at both ends, leaving exactly the middle. That is the founder's fragment.
+    expect(sentence.style.minWidth).toBe("0");
+    expect(sentence.style.overflowWrap).toBe("break-word");
+  });
+
+  it("lets the LINE break too — this bar carries an item that cannot shrink", () => {
+    useAuthStore.setState({ me: me() });
+    render(<ZeroCreditBanner />);
+    const bar = screen.getByTestId(ZERO_CREDIT_BAR_TESTID);
+    // ONLY THIS BAR OF THE THREE NEEDS THIS, and it is the one behavioural property the
+    // real-Chrome suite proves that CI cannot run (it stands down without a Chromium — see
+    // BannerStack.layout.test.ts). `min-width: 0` frees the SENTENCE to wrap, but `RefillLink` is
+    // an in-flow flex item that cannot shrink, so once the line's unshrinkable content exceeds the
+    // bar, `justify-content: center` pushes it off BOTH ends. Measured at 100px: 15.3px left of
+    // the bar's own padding edge, with everything else already fixed. (roborev 58706/58707)
+    expect(bar.style.flexWrap).toBe("wrap");
   });
 });

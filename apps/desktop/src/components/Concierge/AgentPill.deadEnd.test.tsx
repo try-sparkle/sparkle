@@ -378,7 +378,20 @@ describe("an unwired surface says nothing about the agent's lifecycle", () => {
 
     const pill = screen.getByTestId("concierge-agent-pill-unwired");
     expect(pill.textContent).toContain("@Build 8");
-    expect(pill.getAttribute("title")).toBeNull();
+    // ── THE CLAIM, NOT THE ATTRIBUTE (roborev 58699) ──────────────────────────────────────────
+    // This was `toBeNull()`, which was the right test only while the only `title` this form could
+    // ever carry WAS a lifecycle claim — the hover-only "…is closed" that the dead-end work
+    // removed. It has one again, and it says exactly the agent's name: the pill's label can be
+    // ellipsized to "@Build…" in a narrow column, and this form is the one SupportModal and agent
+    // replies render, so without a tooltip a truncated name was unrecoverable by any means.
+    //
+    // A NAME IS NOT A LIFECYCLE CLAIM, which is what this block is about — so the assertion is now
+    // what the describe already says: no claim about whether the agent is closed, alive, or
+    // anywhere in particular. Written as a rule over the tooltip rather than as "must equal
+    // @Build 8", so it keeps failing if a future edit puts a sentence back in there.
+    const title = pill.getAttribute("title") ?? "";
+    expect(title).toContain("@Build 8");
+    expect(title).not.toMatch(/closed|open|already|gone/i);
     expect(visible()).not.toMatch(/closed/i);
   });
 });

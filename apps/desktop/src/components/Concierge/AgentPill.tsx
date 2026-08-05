@@ -149,7 +149,108 @@ const base: CSSProperties = {
   fontFamily: "inherit",
   lineHeight: "inherit",
   verticalAlign: "baseline",
+  // ── THE PILL MAY NOT OUTGROW ITS LINE (bead sparkle-kk9dg.1) ──────────────────────────────────
+  // `whiteSpace: nowrap` above is what makes the pill read as one object, and it is also what made
+  // it UNSHRINKABLE: a nowrap box's min-content size is its full width, and a flex item defaults to
+  // `min-width: auto` — so a pill in a narrow concierge column pushed past its container's right
+  // edge and was clipped mid-word. `minWidth: 0` lets the item shrink at all; `maxWidth: 100%`
+  // bounds it to the line it is on. The ellipsis then happens on the INNER name span (`nameText`).
+  //
+  // NO `overflow` HERE. The rule being avoided: an inline-level box whose `overflow` is anything
+  // but `visible` takes its BOTTOM MARGIN EDGE as its baseline instead of its text baseline — and
+  // this pill renders inside `<Markdown>` prose (i.e. inside a `<p>`), so a clip here would drop
+  // every pill in every concierge reply relative to its own sentence. `maxWidth` bounds the box
+  // without changing how it sits on the line; the clip lives one level in, on `nameText`.
+  //
+  // WHAT WAS ACTUALLY MEASURED, because the honest version is narrower than the warning above —
+  // and narrower still than the first draft of this paragraph claimed (roborev 58698/58699).
+  // `scripts/visual/recap-narrow-probe.mjs` was run with `overflow: "hidden"` added right here, in
+  // real Chrome, and the pill's baseline did NOT move (2.00px offset from the surrounding prose
+  // either way). But that measurement was taken against ONE form of the pill — the LIVE one, which
+  // the probe reaches by `[data-testid="concierge-agent-pill"]` — and the live pill's first flex
+  // item is the 6px status dot, which is what donates the baseline and therefore SHIELDS the
+  // container from the rule. The three DOT-LESS forms (`-closed` inert, `-closed` disclosure
+  // button, `-unwired`, plus a resolved pill showing `showClosed`) have no such shield, and nothing
+  // measured them until the probe was extended to. So: the reading above is real, it is about the
+  // dotted form only, and it is NOT evidence that this box is safe to clip. The declaration test in
+  // `AgentPill.truncation.test.tsx` is what holds the line here; the dot-less baselines are now
+  // measured by the probe.
+  maxWidth: "100%",
+  minWidth: 0,
 };
+
+/** The clip that does NOT make its box a scroll container — the repo's own utility, defined in
+ *  `index.css` beside the reasoning for it.
+ *
+ *  WHY NOT `overflow: hidden` INLINE, which is what this shipped as. `hidden` clips, but it also
+ *  makes the box a SCROLL CONTAINER, and a scroll container's alignment baseline is SYNTHESISED
+ *  from its border box rather than taken from its text (CSS Box Alignment §9). A flex container
+ *  takes its first baseline from its FIRST FLEX ITEM — and in every dot-less form of this pill THIS
+ *  SPAN IS THAT ITEM. So the clip that was moved one level in to keep the pill on its sentence's
+ *  baseline reintroduced the same hazard one level down, on exactly the forms nothing measured:
+ *  `-unwired` (what SupportModal and agent replies render) and both `-closed` forms could sit a
+ *  descender off the baseline of the prose around them (roborev 58698/58699).
+ *
+ *  WHY NOT `overflow: clip` INLINE, which is the obvious one-word fix. `clip` clips without
+ *  establishing a scroll container, so the baseline is untouched and `text-overflow: ellipsis`
+ *  still applies — but it is WebKit 16+, and `tauri.conf.json` still declares
+ *  `minimumSystemVersion: "11.0"`. On a Big Sur WKWebView the declaration is DROPPED, leaving
+ *  `overflow: visible`, which takes the ellipsis with it (`text-overflow` needs a non-visible
+ *  overflow) — so a long name would paint straight out of the card with nothing to say it was cut.
+ *  That trades a baseline shift everywhere for an overflow on old macOS, which is not a fix.
+ *
+ *  So this uses the CLASS, which is `hidden` upgraded to `clip` under `@supports` — the floor
+ *  everyone honours, the better baseline wherever it is understood. `@supports` has no inline form,
+ *  which is why the declaration cannot live in this file at all. Keep `overflow` OUT of `nameText`:
+ *  an inline style would win over the class and silently undo the upgrade.
+ *
+ *  DOES WEBKIT ACTUALLY PAINT THE ELLIPSIS UNDER `clip`? MEASURED: YES (roborev 58759). That review
+ *  raised the one thing neither test tier can see — jsdom never loads the stylesheet and the probe
+ *  is Chrome — so on the engine this app SHIPS IN (WKWebView) the `clip` branch was backed by no
+ *  evidence, and its failure mode is the exact bug this span exists to fix: a name hard-cut with no
+ *  "…" to say so. Settled by rendering two otherwise-identical boxes in real WebKit (Playwright's
+ *  webkit build) — one `overflow: hidden`, one `overflow: clip`, both `text-overflow: ellipsis` —
+ *  and comparing their PIXELS, since an ellipsis is painted rather than exposed to the DOM.
+ *  `CSS.supports("overflow","clip")` is true there, the two boxes compute to `hidden` and `clip`
+ *  respectively, and their screenshots are BYTE-IDENTICAL. So the upgrade is safe on both engines,
+ *  and the `@supports` floor still covers the Big Sur case where the declaration is dropped.
+ *
+ *  THAT MEASUREMENT IS A CHECKED-IN PROBE, NOT A CLAIM IN A COMMENT (roborev 58797):
+ *  `apps/desktop/scripts/visual/webkit-clip-ellipsis.mjs`. Run it if you touch this class, the
+ *  `@supports` block in `index.css`, or the second consumer (`RecapCard`'s `CLIP_CLASS`) — because
+ *  nothing else can see this failure mode: jsdom never loads the stylesheet and the CDP probe is
+ *  Chrome, so if WebKit ever stops painting the "…" the name is hard-cut and both tiers stay green. */
+const NAME_CLIP_CLASS = "clip-no-scroll";
+
+/** The sigil and the name, as ONE clippable box.
+ *
+ *  IT EXISTS TO BE ELLIPSIZABLE. The label used to be a bare text node beside the status dot, and a
+ *  bare text node cannot ellipsize — `text-overflow` applies to a block container, so there was
+ *  nothing for it to apply to and a too-long name was clipped mid-glyph with no "…" to say so.
+ *  Wrapping the sigil and the name TOGETHER (rather than the name alone) keeps "@" glued to what it
+ *  qualifies, so a truncated pill reads "@Concierge Say…" rather than "@" then a separate stub.
+ *
+ *  `minWidth: 0` because this is itself a flex item of the pill: without it the same
+ *  `min-width: auto` floor would keep the box at its full nowrap width and the overflow would never
+ *  trigger.
+ *
+ *  NO `overflow` HERE EITHER — it comes from `NAME_CLIP_CLASS`, for the reason spelled out there.
+ *  An inline `overflow` would override the class and take the `@supports` upgrade with it. */
+const nameText: CSSProperties = {
+  textOverflow: "ellipsis",
+  whiteSpace: "nowrap",
+  minWidth: 0,
+};
+
+/** Every form of the pill renders its label the same way, so the clip class and the testid cannot
+ *  be applied to three of the four and forgotten on the one nothing photographs. */
+function PillName({ children }: { children: ReactNode }) {
+  return (
+    <span data-testid="concierge-agent-pill-name" className={NAME_CLIP_CLASS} style={nameText}>
+      {children}
+    </span>
+  );
+}
 
 /** The muted form the non-navigating state wears: same words, no teal wash. */
 const quiet: CSSProperties = {
@@ -371,9 +472,22 @@ export function AgentPill({
         data-testid="concierge-agent-pill-unwired"
         data-agent-id={agentId}
         {...(agent ? { "data-band": agent.band } : {})}
+        // THE TOOLTIP IS THE WHOLE SAFETY NET FOR TRUNCATION, and this was the ONE form without one
+        // (roborev 58699). The ellipsis is allowed to eat the name on screen precisely because
+        // hovering recovers it — the live pill promises "Open X in Y", both closed forms carry
+        // `closedSentence(name)`, and this form carried nothing, so a name cut to "@Concierge Say…"
+        // was unrecoverable by any means. It is also the form that actually reaches a reader:
+        // SupportModal and agent replies render `<Markdown>` with no provider at all.
+        //
+        // THE FULL `@name` AND NOTHING ELSE. This surface is not wired, so its roster is not
+        // authoritative and the pill may make NO claim about the agent's lifecycle (see the block
+        // above) — a sentence here would be the false "…is closed" this branch exists to prevent,
+        // in a tooltip. The name is a fact about the text, not about the agent.
+        title={`@${name}`}
         style={quiet}
       >
-        {agent && <span style={dot(agent.band)} aria-hidden />}@{name}
+        {agent && <span style={dot(agent.band)} aria-hidden />}
+        <PillName>@{name}</PillName>
       </span>
     );
   }
@@ -408,7 +522,7 @@ export function AgentPill({
           title={closedSentence(name)}
           style={quiet}
         >
-          @{name}
+          <PillName>@{name}</PillName>
         </span>
       );
     }
@@ -426,7 +540,7 @@ export function AgentPill({
           onClick={() => setExpanded((v) => !v)}
           style={{ ...quiet, border: "none", cursor: "pointer", textDecoration: "underline dotted" }}
         >
-          @{name}
+          <PillName>@{name}</PillName>
         </button>
         <LiveNotice id={noticeId} open={expanded} action={historyAction}>
           {closedSentence(name)}
@@ -572,7 +686,8 @@ export function AgentPill({
               }
         }
       >
-        {!showClosed && <span style={dot(agent.band)} aria-hidden />}@{agent.name}
+        {!showClosed && <span style={dot(agent.band)} aria-hidden />}
+        <PillName>@{agent.name}</PillName>
       </button>
       {!ownsOutcome && (
         <LiveNotice

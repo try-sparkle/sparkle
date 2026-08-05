@@ -56,6 +56,37 @@ const WAVEFORM_INSET = -14;
  *  header are the same height, which is what lets the eye read across the shell at that line. */
 const HEADER_H = 34;
 
+/** HOW FAR THE CREDIT PILL'S BACKDROP REACHES PAST ITS OWN GLYPHS, in px — the gutter that keeps
+ *  the dictation waveform off the balance.
+ *
+ *  Founder, at a narrow concierge column (bead sparkle-kk9dg.3): "The dictation waveform runs right
+ *  up against '$9972.67' with no separation."
+ *
+ *  MEASURED at a 190px column: `BalanceBadge` paints a filled pill with `padding: 3px 9px` and the
+ *  overlay below hugged it EXACTLY — zero padding of its own — so the blurred region and the badge's
+ *  own fill had the same edge. The bars therefore ran sharp right into that edge, and a 7px blur
+ *  confined to a box that starts where the ink starts blurs nothing a reader can see. The blur was
+ *  never wrong; it simply had no room to do its job.
+ *
+ *  Padding on the OVERLAY rather than on the badge, because the overlay is the box carrying
+ *  `backdrop-filter`: widening it is what extends the softened region outward, and it costs the
+ *  waveform nothing (the pill is absolutely positioned — see its render site).
+ *
+ *  THE BLUR IS THE WHOLE REASON, and it is the only one — this used to read "`backdrop-filter` and
+ *  the drop shadow", which stopped being true the moment the gutter pushed the shadow off the pill
+ *  and it was deleted (roborev 58712). A rationale resting on a property the box no longer has is
+ *  the same defect as a comment describing geometry the code no longer has.
+ *
+ *  DO NOT "SIMPLIFY" THIS TO A SOLID FILL. The column's background floods on `data-wired`, so a
+ *  scrim in a fixed colour is wrong half the time; the whole point of a backdrop blur is that it is
+ *  background-agnostic. Widening the blurred region is the move that respects that. */
+const CREDIT_BACKDROP_GUTTER = 10;
+
+/** The blur radius over the moving bars, in px. It was 7 and that reads as "no separation" at a
+ *  narrow column, where the bars run the full strip and reach the pill. Judged by eye in a real
+ *  capture at 190px and 280px, light and dark — not derived from a number. */
+const CREDIT_BACKDROP_BLUR = 14;
+
 /** `--t-title` — the wordmark's type size. The mask is sized by HEIGHT alone (its width follows the
  *  asset's aspect), so this is the mark's height rather than a font-size. */
 const WORDMARK_H = 17;
@@ -491,7 +522,13 @@ export function ConciergeColumn({
             // OVERLAID, not laid out beside. Absolute so it takes zero width from the waveform —
             // the ask was explicitly "do not shrink the waveform to make room".
             position: "absolute",
-            right: 16,
+            // THE BADGE KEEPS THE COLUMN'S 16px INSET; only its BACKDROP reaches past it. The
+            // gutter below is padding, so it grows this box outward in both directions — pinning
+            // the box at 16 would have shoved the visible pill 10px left of the search field and
+            // the cards under it, i.e. fixed the crowding by breaking the column's one vertical
+            // edge. Offsetting by the same gutter keeps every glyph exactly where it was and lets
+            // the softened region be the only thing that moved.
+            right: 16 - CREDIT_BACKDROP_GUTTER,
             // Centred on the WAVE STAGE — half the stage down from the strip's top padding, then
             // pulled back by half of its OWN height. Against the stage rather than the strip so it
             // sits on the bars instead of drifting with the caption block underneath them; and by
@@ -508,14 +545,35 @@ export function ConciergeColumn({
             // data-wired), so a scrim painted in a fixed colour would be wrong half the time. A
             // local backdrop blur is background-agnostic: it turns whatever is behind the pill —
             // bars mid-animation included — into soft texture, and the pill's own fill does the
-            // rest. The blur is confined to the pill's own box, so the waveform is untouched.
+            // rest. The blur is confined to this box, so the waveform is untouched.
             borderRadius: 999,
-            backdropFilter: "blur(7px)",
-            WebkitBackdropFilter: "blur(7px)",
-            // A DROP shadow, not a spread halo. `0 0 10px 5px` casts equally in every direction
-            // from a box that is itself invisible, which paints a ring around the pill rather than
-            // lifting it off the bars.
-            boxShadow: "0 1px 6px rgba(0,0,0,0.20)",
+            // THE GUTTER, and it is the actual fix for "the waveform runs right up against the
+            // balance" (bead sparkle-kk9dg.3). This box used to hug `BalanceBadge` exactly, so the
+            // blurred region began where the ink began and the bars met a hard edge. The padding
+            // pushes the softened region past the glyphs on every side. See CREDIT_BACKDROP_GUTTER
+            // for why it is here and not on the badge — and the block below for what the same
+            // enlarged box cost the drop shadow that used to sit here.
+            padding: `3px ${CREDIT_BACKDROP_GUTTER}px`,
+            backdropFilter: `blur(${CREDIT_BACKDROP_BLUR}px)`,
+            WebkitBackdropFilter: `blur(${CREDIT_BACKDROP_BLUR}px)`,
+            // ── NO SHADOW ON THIS BOX, AND THE GUTTER IS WHY (roborev 58703) ──────────────────
+            // It carried `0 1px 6px rgba(0,0,0,0.20)`, and that was RIGHT while this box hugged
+            // `BalanceBadge`: the shadow fell on the badge's own edge and lifted the ink off the
+            // bars. The gutter moves the border box ~10px out past the ink, and a shadow is drawn
+            // from the BORDER BOX — so it stopped tracing the pill and started tracing a rounded
+            // rectangle with nothing on it, ~10px away from the only visible object. That is the
+            // "ring around the pill rather than lifting it off the bars" the old comment here was
+            // written to prevent; the gutter walked straight into it from the other direction.
+            //
+            // Deleted rather than retuned because THE LIFT IS NO LONGER NEEDED. A shadow separated
+            // ink from bars that reached it; the bars now stop a gutter's width short and the blur
+            // softens everything inside that gutter, which is the same job done by the thing that
+            // caused the problem. Checked the way the rest of this strip is: captured at 280px in
+            // both themes with and without it, and without reads cleaner — the badge's fill is the
+            // only edge on screen, and no contour floats beside it.
+            //
+            // If the pill ever needs a lift again it belongs on `BalanceBadge`, which is the box
+            // that actually paints, not on this one — pinned by the header suite.
           }}
         >
           <BalanceBadge />

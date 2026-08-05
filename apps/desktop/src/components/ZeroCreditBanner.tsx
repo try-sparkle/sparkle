@@ -29,11 +29,32 @@ const WARNING = "Your Sparkle credit balance is $0. AI Enhanced features will no
 // navy in light and would be fine, but flips to near-white in dark and would wash out).
 const INK = ON_BRAND_FILL_DARK;
 
+/** The full-width bar's hook, so a real-layout test can measure the element the user sees. */
+export const ZERO_CREDIT_BAR_TESTID = "zero-credit-bar";
+
+/** See BANNER_BAR_TOP_ANCHOR in ProviderUnavailableBanner — the three bars share this shape, so a
+ *  fix that left this one centred would be half a fix. It matters MORE here: the ✕ and the Refill
+ *  link eat the width the sentence would otherwise wrap into, so this bar overflows first. */
+const sentence: CSSProperties = {
+  minWidth: 0,
+  overflowWrap: "break-word",
+};
+
 const bar: CSSProperties = {
   flex: "0 0 auto",
   display: "flex",
-  alignItems: "center",
+  // TOP-ANCHORED, not centred — see BANNER_BAR_TOP_ANCHOR in ProviderUnavailableBanner.
+  alignItems: "flex-start",
   justifyContent: "center",
+  // WRAPPING THE LINE, and only this bar of the three needs it. `min-width: 0` frees the SENTENCE
+  // to wrap, but `RefillLink` is an in-flow flex item that cannot shrink — so once the line's
+  // unshrinkable content exceeds the bar, `justify-content: center` pushes it off BOTH ends and
+  // the sentence loses its head and its tail. Measured: at 100px this bar rendered 15.3px left of
+  // its own padding edge with everything else already fixed. Letting the line wrap drops Refill to
+  // a second row instead. No effect at any width where the content fits, so the common case is
+  // byte-identical. The sibling bars carry no such item (icon + sentence, and an out-of-flow ✕
+  // that is positioned rather than laid out), and both measure clean without it. (roborev 58696)
+  flexWrap: "wrap",
   // Positioning context for the ✕. It is pinned out of flow rather than pushed right with
   // `marginLeft: auto`, which absorbed ALL the free space and left `justifyContent: center` with
   // nothing to distribute — the sentence silently went flush-left. (roborev 48271/48284)
@@ -109,11 +130,13 @@ export function ZeroCreditBanner({ inline = false }: { inline?: boolean } = {}) 
   }
 
   return (
-    <div style={bar}>
-      <FiAlertTriangle size={14} style={{ flex: "none" }} aria-hidden />
+    <div style={bar} data-testid={ZERO_CREDIT_BAR_TESTID}>
+      {/* `marginTop: 1` restores the 1px that `align-items: center` used to supply on a
+          single-line bar; see the icon note in ProviderUnavailableBanner. */}
+      <FiAlertTriangle size={14} style={{ flex: "none", marginTop: 1 }} aria-hidden />
       {/* The live region wraps ONLY the sentence. With the buttons inside it, some screen readers
           re-announce the whole warning on focus/state changes of Refill or ✕. */}
-      <span role="status" aria-live="polite">
+      <span role="status" aria-live="polite" style={sentence}>
         {WARNING}.
       </span>
       <RefillLink color={INK} />

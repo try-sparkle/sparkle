@@ -325,6 +325,66 @@ describe("the voice strip lays the credit pill OVER the waveform", () => {
     // Confined to the pill's own box — the waveform underneath is untouched.
     expect(overlay.contains(screen.getByTestId("logo-waveform"))).toBe(false);
   });
+
+  // ── THE GUTTER (bead sparkle-kk9dg.3) ─────────────────────────────────────────────────────
+  // Founder, at a narrow concierge column: "The dictation waveform runs right up against
+  // '$9972.67' with no separation."
+  //
+  // MEASURED IN A REAL BROWSER at 190px and 280px (the visual harness's `?concierge=`, painted
+  // width asserted): this box hugged `BalanceBadge` EXACTLY — no padding of its own — so the
+  // blurred region began where the ink began and the bars ran sharp into the badge's own fill.
+  // The blur was never wrong; it had no room. The fix widens the blurred box past the glyphs.
+  //
+  // jsdom cannot see any of that: there is no layout, `backdrop-filter` composites nothing, and a
+  // `getBoundingClientRect` here is 0 (docs/jsdom-test-caveats.md). So these assert the STYLE
+  // SHAPE the fix adds — a gutter that did not exist, a blur wider than the 7px that shipped, and
+  // the offset that keeps the badge itself where it was. The separation is judged in the capture.
+  const paddingX = (el: HTMLElement) => {
+    const m = /^\s*\S+\s+(-?\d+(?:\.\d+)?)px\s*$/.exec(el.style.padding);
+    if (!m) throw new Error(`credit overlay has no horizontal padding: ${el.style.padding || "(none)"}`);
+    return Number(m[1]);
+  };
+
+  it("pads the backdrop past the badge's own glyphs, so the bars stop short of the ink", () => {
+    fullHeader();
+    // The gutter itself. Zero — or the declaration missing altogether — IS the reported defect.
+    expect(paddingX(screen.getByTestId("concierge-credit-overlay"))).toBeGreaterThanOrEqual(8);
+  });
+
+  it("blurs harder than the 7px that shipped as 'no separation'", () => {
+    fullHeader();
+    const overlay = screen.getByTestId("concierge-credit-overlay");
+    // `?? ""` because the index-signature read is `string | undefined` under
+    // `noUncheckedIndexedAccess`, and an absent property must fail the ASSERTION below rather than
+    // the compile — a missing blur is exactly what this test exists to catch.
+    const filter =
+      overlay.style.backdropFilter ||
+      (overlay.style as unknown as Record<string, string>)["webkitBackdropFilter"] ||
+      "";
+    const m = /blur\((\d+(?:\.\d+)?)px\)/.exec(filter);
+    expect(m, `no blur radius in ${JSON.stringify(filter)}`).toBeTruthy();
+    expect(Number(m![1])).toBeGreaterThan(7);
+  });
+
+  it("casts NO shadow, because the gutter moved its border box off the pill (roborev 58703)", () => {
+    fullHeader();
+    const overlay = screen.getByTestId("concierge-credit-overlay");
+    // A shadow is drawn from the BORDER BOX, and the gutter pushed that box ~10px out past the
+    // ink — so a shadow here traces a rounded rectangle with nothing on it instead of lifting the
+    // badge. This box paints no fill and no border either, so the ONLY thing it may contribute is
+    // the blur. A lift, if one is ever wanted again, belongs on `BalanceBadge`.
+    expect(overlay.style.boxShadow === "" || overlay.style.boxShadow === "none").toBe(true);
+  });
+
+  it("offsets by the gutter, so the VISIBLE badge keeps the column's 16px inset", () => {
+    fullHeader();
+    const overlay = screen.getByTestId("concierge-credit-overlay");
+    // THE RELATIONSHIP, not two literals. Padding grows this box outward in BOTH directions, so a
+    // gutter added without pulling `right` back by the same amount shoves the visible pill left of
+    // the search field and the cards under it — fixing the crowding by breaking the column's one
+    // vertical edge. `right + gutter` is where the badge's own right edge lands.
+    expect(Number(overlay.style.right.replace("px", "")) + paddingX(overlay)).toBe(16);
+  });
 });
 
 // ── NOTHING BESIDE THE WORDMARK (bead sparkle-ircc3) ────────────────────────────────────────────

@@ -217,10 +217,60 @@ describe("CommandPalette — jump dispatch", () => {
 });
 
 describe("PaletteTrigger", () => {
+  const trigger = () => screen.getByRole("button", { name: "Search history (⌘K)" });
+  /** The reserved keycap's wrapper — the `aria-hidden` span the reveal toggles. */
+  const keycapSlot = () => {
+    const el = trigger().querySelector<HTMLElement>("span[aria-hidden]");
+    if (!el) throw new Error("no reserved keycap slot in the trigger");
+    return el;
+  };
+
   it("fires onOpen (the affordance U7 drops into the concierge header)", () => {
     const onOpen = vi.fn();
     render(<PaletteTrigger onOpen={onOpen} />);
     fireEvent.click(screen.getByRole("button", { name: "Search history (⌘K)" }));
     expect(onOpen).toHaveBeenCalledTimes(1);
+  });
+
+  // ── NARROW CONCIERGE COLUMN (bead sparkle-kk9dg.3) ──────────────────────────────────────────
+  // Founder: "The search field is small and left-floating, with a stray empty box artifact
+  // directly beneath its lower-left corner."
+  //
+  // MEASURED IN A REAL BROWSER at a 280px concierge (the visual harness's `?concierge=280`, painted
+  // width asserted): the slot offers 247px and this button took 109px of it, hard against the left
+  // edge, while the nudge card and compose box directly below span the full width. Of those 109px,
+  // 33 were the reserved-but-invisible ⌘K box trailing the word "Search" — a bordered control
+  // ending in an empty stub.
+  //
+  // jsdom HAS NO LAYOUT ENGINE, so none of that is observable here: `getBoundingClientRect` is 0
+  // and `visibility` reserves nothing measurable (docs/jsdom-test-caveats.md). What IS checkable is
+  // the STYLE SHAPE — the three declarations the fix adds, every one of which was absent before —
+  // and that is deliberately all these assert. The real-layout proof is the capture.
+  describe("at a narrow concierge column", () => {
+    beforeEach(() => render(<PaletteTrigger onOpen={vi.fn()} />));
+
+    it("fills its slot rather than shrink-wrapping to its text", () => {
+      // `inline-flex` is what made it shrink-wrap and float left. A block-level flex container at
+      // 100% spans the column like everything under it.
+      expect(trigger().style.display).toBe("flex");
+      expect(trigger().style.width).toBe("100%");
+    });
+
+    it("parks the reserved keycap on the RIGHT EDGE, so no dead stub trails the label", () => {
+      // Without this the reserved box sits immediately after "Search" and every pixel from there to
+      // the border is unexplained empty bordered space — the artifact the founder read.
+      expect(keycapSlot().style.marginLeft).toBe("auto");
+    });
+
+    it("STILL reserves the keycap's box, so the button cannot twitch on hover", () => {
+      // The pre-existing decision this fix must not undo (see PaletteTrigger's docblock): the pill
+      // is hidden, never un-rendered. Asserted from both ends — the node exists while hidden, and
+      // revealing it changes only `visibility`.
+      expect(keycapSlot().style.visibility).toBe("hidden");
+      expect(keycapSlot().textContent).toBe("⌘K");
+      fireEvent.mouseEnter(trigger());
+      expect(keycapSlot().style.visibility).toBe("visible");
+      expect(keycapSlot().style.marginLeft).toBe("auto");
+    });
   });
 });

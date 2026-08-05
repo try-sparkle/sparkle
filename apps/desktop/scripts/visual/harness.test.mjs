@@ -13,7 +13,7 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { CONCIERGE_DEFAULT_WIDTH } from "../../src/engine/columnResize.ts";
+import { CONCIERGE_DEFAULT_WIDTH, CONCIERGE_MIN_WIDTH } from "../../src/engine/columnResize.ts";
 import { visualCaptureRun, visualFixturesRequested } from "../../src/dev/visualFixtures.ts";
 import { decodePng, encodePng } from "./png.mjs";
 import { blank, blit, compareImages, diffImage, sideBySide } from "./diff.mjs";
@@ -42,6 +42,15 @@ import {
   wantsStrict,
 } from "./seam-probe.mjs";
 import { crop } from "./crop.mjs";
+import {
+  DEFAULT_WIDTHS,
+  EDGE_TOLERANCE,
+  HYBRID_MIN_WIDTH,
+  MAX_ROW_LINES,
+  parseArgs as recapArgs,
+  parseWidths as recapWidths,
+  verdictFor as recapVerdict,
+} from "./recap-narrow-probe.mjs";
 
 /** A tiny image with a known pixel at (x, y). */
 function img(width, height, fill = [0, 0, 0, 255]) {
@@ -1195,6 +1204,330 @@ describe("--strict reaches the verdict", () => {
     // a verdict on nothing must not be a confident pass either.
     expect(verdict([], 6, 2, { strict: true }).continuous).toBe(false);
     expect(verdict([], 6, 2).continuous).toBe(false);
+  });
+});
+
+// ── THE RECAP-NARROW PROBE'S VERDICT RULES ─────────────────────────────────────────────────────
+//
+// WHY THIS BLOCK EXISTS (roborev 58700). `recap-narrow-probe.mjs` is the only half of the
+// narrow-column work that can fail on real geometry, and nothing referenced it: not
+// `apps/desktop/package.json`, not `scripts/tests/run.sh`, and not one import of `verdictFor`,
+// `parseArgs`, `DEFAULT_WIDTHS`, `MAX_ROW_LINES`, `EDGE_TOLERANCE` or `BASELINE_OFFSET_PX` —
+// despite the file's closing comment claiming its pure helpers stay "importable by a unit test".
+// Its sibling `seam-probe.mjs` has had exactly that coverage all along, three blocks up.
+//
+// The rules are fed SYNTHETIC measurements, which is the point: an instrument whose judgements have
+// never been shown to fail is an instrument that can report a clean card while the card overflows.
+describe("recap-narrow probe — the verdict rules, fed synthetic measurements", () => {
+  /** One row as `MEASURE` returns it. Defaults describe a healthy single-line change row. */
+  const row = (over = {}) => ({
+    testid: "recap-change",
+    text: "sparkle@AgentDone",
+    height: 18,
+    lineHeight: 18,
+    lines: 1,
+    overhang: -20,
+    statusHeight: 18,
+    statusLines: 1,
+    statusSameLine: true,
+    proseHeight: null,
+    ...over,
+  });
+
+  /** A whole measurement. Defaults are a card that passes everything. */
+  const measurement = (over = {}) => ({
+    cardScrollWidth: 200,
+    cardClientWidth: 200,
+    columnWidth: 200,
+    offenders: [],
+    // TWO ROWS, one of which WRAPPED: a card whose rows all fit trips the probe's own vacuity guard
+    // ("the long row genuinely reflowed at this width"), which is correct behaviour and would make
+    // every "healthy card" fixture here a failing one.
+    rows: [row(), row({ text: "sparkle@Long AgentDone — your turn", lines: 2.2, statusSameLine: false })],
+    names: [{ text: "@Agent", scrollWidth: 90, clientWidth: 40, truncated: true }],
+    baseline: { refBottom: 100, pillBottom: 102, delta: 2 },
+    dotless: [
+      { form: "unwired", testid: "concierge-agent-pill-unwired", hasDot: false, nameOverflow: "clip", refBottom: 100, pillBottom: 100, delta: 0 },
+    ],
+    ...over,
+  });
+
+  const CLICKED = { tag: "BUTTON", clicks: ["a"], title: "Open Concierge Says What It Is Doing in sparkle" };
+
+  /** Did the named check pass? `undefined` when the rule did not run at this width at all, which is
+   *  a different thing from failing and must not be readable as a pass. */
+  const check = (v, fragment) => v.checks.find((c) => c.name.includes(fragment))?.ok;
+  const failed = (v) => v.checks.filter((c) => !c.ok).map((c) => c.name);
+
+  it("passes a healthy card", () => {
+    expect(failed(recapVerdict(280, measurement(), CLICKED))).toEqual([]);
+  });
+
+  // ── THE EMPTY-ROWS GUARD ────────────────────────────────────────────────────────────────────
+  // Every fold used to seed from `m.rows[0]`. With no rows that seed is `undefined`, the fold throws
+  // a TypeError, and `main().catch` exits 2 — which the probe's own header defines as "could not
+  // run (no Chrome, no server)". So a RENAMED TESTID reported itself as an environment problem, and
+  // the reader wires up Chrome instead of looking at the regression.
+  it("reports an empty row set as a FAILED CHECK, not by throwing", () => {
+    let v;
+    expect(() => {
+      v = recapVerdict(280, measurement({ rows: [] }), CLICKED);
+    }).not.toThrow();
+    expect(check(v, "rendered rows to measure")).toBe(false);
+    // …and it stops there rather than half-judging a card it could not see.
+    expect(check(v, "no row's content passes")).toBeUndefined();
+  });
+
+  it("reports change rows going missing separately from rows going missing", () => {
+    // A card with only decision rows: `rows` is non-empty, so the guard above says nothing, but
+    // every hybrid rule below judges CHANGE rows and would fold over an empty list.
+    const onlyDecisions = measurement({
+      rows: [row({ testid: "recap-decision", proseHeight: 18 })],
+    });
+    let v;
+    expect(() => {
+      v = recapVerdict(280, onlyDecisions, CLICKED);
+    }).not.toThrow();
+    expect(check(v, "rendered CHANGE rows")).toBe(false);
+  });
+
+  // The same guard BELOW the hybrid floor, which is where it used to be skipped entirely
+  // (roborev 58761): it was gated behind `width >= HYBRID_MIN_WIDTH` with an empty else-branch, so
+  // `--widths=100` on a card whose change rows had vanished produced zero checks and reported PASS.
+  // The below-floor branch asserts "clipped, never word-stacked", so it needs change rows too.
+  it("reports change rows going missing BELOW the hybrid floor, where the rule still bites", () => {
+    const onlyDecisions = measurement({
+      rows: [row({ testid: "recap-decision", proseHeight: 18 })],
+    });
+    expect(check(recapVerdict(100, onlyDecisions, CLICKED), "rendered CHANGE rows")).toBe(false);
+    // …and the width is genuinely below the floor, so this is not the >=200 path in disguise.
+    expect(100).toBeLessThan(HYBRID_MIN_WIDTH);
+  });
+
+  // A stale showClosed selector must GRADE, not crash the run into exit 2 — see the arming step in
+  // `main()`. `verdictFor` only speaks about it when the probe actually reported an arming outcome.
+  it("fails when the showClosed control could not be armed", () => {
+    const notArmed = measurement({
+      armed: { armed: false, reason: "no live pill in #prose-showclosed" },
+    });
+    expect(check(recapVerdict(280, notArmed, CLICKED), "showClosed control was reachable")).toBe(
+      false,
+    );
+    const armed = measurement({ armed: { armed: true } });
+    expect(check(recapVerdict(280, armed, CLICKED), "showClosed control was reachable")).toBe(true);
+    // Absent entirely (an older measurement) says nothing rather than failing.
+    expect(
+      check(recapVerdict(280, measurement(), CLICKED), "showClosed control was reachable"),
+    ).toBeUndefined();
+  });
+
+  // A renamed `#prose-ref` / prose pill used to reach `.toFixed` on a null and throw, which
+  // main().catch turns into exit 2 — "the probe could not run" — hiding the rename that caused it
+  // (roborev 58797). MEASURE now returns null fields and verdictFor grades them.
+  it("fails, rather than throwing, when the baseline reference is missing", () => {
+    const noRef = measurement({
+      baseline: { refBottom: null, pillBottom: null, delta: null, missing: "#prose-ref" },
+    });
+    let v;
+    expect(() => {
+      v = recapVerdict(280, noRef, CLICKED);
+    }).not.toThrow();
+    expect(check(v, "has not MOVED on its sentence's baseline")).toBe(false);
+    // …and it names what it could not find, so the reader fixes the selector rather than Chrome.
+    const detail = v.checks.find((c) => c.name.includes("has not MOVED")).detail;
+    expect(detail).toContain("#prose-ref");
+  });
+
+  // ── THE CLI CONTRACT, which used to pin a property the code did not have ─────────────────────
+  // `--widths` bare arrives as boolean `true`; the old `String(true).split(",").map(Number)` gave
+  // `[NaN]`, the probe navigated to `?w=NaN`, the column fell back to the 1200px viewport, and every
+  // width comparison in `verdictFor` was false for NaN — so the narrow rules were graded against a
+  // wide layout and reported PASS. `parseWidths` returns null for anything that is not a width list.
+  it("refuses a --widths value that is not a list of positive numbers", () => {
+    expect(recapWidths(undefined)).toEqual(DEFAULT_WIDTHS);
+    expect(recapWidths("520,360,280")).toEqual([520, 360, 280]);
+    expect(recapWidths(" 280 , 200 ")).toEqual([280, 200]);
+    expect(recapWidths(true)).toBeNull(); // `--widths` with no value
+    expect(recapWidths("520,,200")).toBeNull(); // an empty slot coerces to 0
+    expect(recapWidths("wide")).toBeNull(); // a typo
+    expect(recapWidths("-280")).toBeNull(); // negative
+    expect(recapWidths("0")).toBeNull(); // zero
+    expect(recapWidths("")).toBeNull();
+  });
+
+  // ── CONTAINMENT ─────────────────────────────────────────────────────────────────────────────
+  it("fails a row whose content passes the card's content edge", () => {
+    const v = recapVerdict(280, measurement({ rows: [row({ overhang: 22 })] }), CLICKED);
+    expect(check(v, "passes the card's content edge")).toBe(false);
+  });
+
+  it("allows sub-pixel slack, so rounding is not reported as an overflow", () => {
+    const v = recapVerdict(280, measurement({ rows: [row({ overhang: EDGE_TOLERANCE })] }), CLICKED);
+    expect(check(v, "passes the card's content edge")).toBe(true);
+  });
+
+  it("fails a card that scrolls horizontally, and names what went past the edge", () => {
+    const v = recapVerdict(
+      280,
+      measurement({
+        cardScrollWidth: 240,
+        offenders: [{ testid: "concierge-agent-pill-name", tag: "SPAN", text: "@Agent", past: 22 }],
+      }),
+      CLICKED,
+    );
+    const c = v.checks.find((x) => x.name.includes("does not scroll"));
+    expect(c.ok).toBe(false);
+    // The detail is the whole reason the offender list is collected: "scrollWidth 240 <= 200" on its
+    // own says the card overflows and nothing about WHAT, and the row-level check next door is blind
+    // to the summary line and the section headings.
+    expect(c.detail).toContain("concierge-agent-pill-name");
+    expect(c.detail).toContain("+22.0px");
+  });
+
+  // ── THE FOUNDER'S HYBRID ────────────────────────────────────────────────────────────────────
+  it("fails a word-stacked status — the exact failure the reflow was written to kill", () => {
+    const stacked = measurement({ rows: [row({ lines: 3, statusLines: 3, statusSameLine: false })] });
+    expect(check(recapVerdict(280, stacked, CLICKED), "stays on ONE line")).toBe(false);
+  });
+
+  it("fails a row that wrapped in the WRONG place — the pill squeezed instead of the status moved", () => {
+    // `statusSameLine: true` on a row taller than one line means the break fell inside the lead
+    // group, which is the always-one-line-truncate layout the founder rejected.
+    const wrongBreak = measurement({ rows: [row({ lines: 2.2, statusSameLine: true })] });
+    const v = recapVerdict(280, wrongBreak, CLICKED);
+    expect(check(v, "moved its STATUS to its own line")).toBe(false);
+  });
+
+  it("fails a row that grew past the line budget", () => {
+    const tall = measurement({ rows: [row({ lines: MAX_ROW_LINES + 0.1, statusSameLine: false })] });
+    expect(check(recapVerdict(280, tall, CLICKED), "exceeds")).toBe(false);
+  });
+
+  it("refuses to judge the wrap rule vacuously — no wrapped row is itself a failure", () => {
+    // With every row on one line there is nothing for "wrapped in the right place" to judge, so it
+    // would pass by having no evidence. The fixture must actually REACH the state under test.
+    const v = recapVerdict(280, measurement({ rows: [row()] }), CLICKED);
+    expect(check(v, "genuinely reflowed")).toBe(false);
+    expect(check(v, "moved its STATUS to its own line")).toBe(true); // …passing vacuously, hence the guard
+  });
+
+  it("fails an orphaned decision verb — the sentence pushed off the verb's line", () => {
+    // A row exactly one line-height taller than its own prose is the shape a max-content flex basis
+    // produces on `decisionProse`.
+    const orphan = measurement({
+      rows: [
+        row({ lines: 2.2, statusSameLine: false }),
+        row({ testid: "recap-decision", height: 36, proseHeight: 18, lines: 2 }),
+      ],
+    });
+    expect(check(recapVerdict(280, orphan, CLICKED), "shares its line")).toBe(false);
+  });
+
+  it("holds the WIDE end to one line, which is the 'unchanged when there is room' half", () => {
+    const wrapped = measurement({ rows: [row({ lines: 2.2, statusSameLine: false })] });
+    const v = recapVerdict(520, wrapped, CLICKED);
+    expect(check(v, "still ONE line when there is room")).toBe(false);
+    expect(check(v, "share ONE line when there is room")).toBe(false);
+  });
+
+  // ── THE FLOOR, AS A RULE RATHER THAN A COMMENT ──────────────────────────────────────────────
+  it("gives up the LINE BUDGET below the hybrid floor but never containment", () => {
+    // Three lines at 100px is in contract (the chip alone fills the line, so the group breaks); the
+    // same row at 280px is not. Asserting both directions is what makes the floor a decision rather
+    // than a gap — and containment must still be judged at the narrow end.
+    const tall = measurement({ rows: [row({ lines: 3.6, statusSameLine: false, overhang: -5 })] });
+    expect(check(recapVerdict(100, tall, CLICKED), "exceeds")).toBeUndefined();
+    expect(check(recapVerdict(280, tall, CLICKED), "exceeds")).toBe(false);
+    expect(check(recapVerdict(100, tall, CLICKED), "passes the card's content edge")).toBe(true);
+    const spilling = measurement({ rows: [row({ lines: 3.6, statusSameLine: false, overhang: 22 })] });
+    expect(check(recapVerdict(100, spilling, CLICKED), "passes the card's content edge")).toBe(false);
+  });
+
+  it("still forbids a word-stacked status below the floor — clipped, never stacked", () => {
+    const stacked = measurement({ rows: [row({ lines: 3.6, statusLines: 2, statusSameLine: false })] });
+    expect(check(recapVerdict(100, stacked, CLICKED), "clipped, never word-stacked")).toBe(false);
+  });
+
+  it("sweeps every width down to the resize engine's floor", () => {
+    // The band this whole exercise is about is 50-135px, and the list stopping at 200 is what let a
+    // regression ship there. Sourced from the app's own constant rather than re-spelled.
+    expect(Math.min(...DEFAULT_WIDTHS)).toBe(CONCIERGE_MIN_WIDTH);
+    expect(DEFAULT_WIDTHS).toContain(CONCIERGE_DEFAULT_WIDTH);
+    expect(DEFAULT_WIDTHS.some((w) => w < HYBRID_MIN_WIDTH)).toBe(true);
+  });
+
+  // ── THE DOT-LESS BASELINE CONTROLS ──────────────────────────────────────────────────────────
+  it("fails a name span that clips by becoming a SCROLL CONTAINER", () => {
+    const hidden = measurement({
+      dotless: [{ form: "unwired", testid: "x", hasDot: false, nameOverflow: "hidden", refBottom: 100, pillBottom: 100, delta: 0 }],
+    });
+    expect(check(recapVerdict(280, hidden, CLICKED), "WITHOUT becoming a scroll container")).toBe(false);
+  });
+
+  it("fails a dot-less pill that has drifted off its sentence's baseline", () => {
+    const drifted = measurement({
+      dotless: [{ form: "unwired", testid: "x", hasDot: false, nameOverflow: "clip", refBottom: 100, pillBottom: 117, delta: 17 }],
+    });
+    expect(check(recapVerdict(280, drifted, CLICKED), "sits ON its sentence's baseline")).toBe(false);
+  });
+
+  it("fails a 'dot-less' control that has quietly grown a dot", () => {
+    // The vacuity guard. An unwired pill draws a dot the moment its id resolves, at which point the
+    // control is a second copy of the SHIELDED case and proves nothing about the hazard.
+    const dotted = measurement({
+      dotless: [{ form: "unwired", testid: "x", hasDot: true, nameOverflow: "clip", refBottom: 100, pillBottom: 100, delta: 0 }],
+    });
+    expect(check(recapVerdict(280, dotted, CLICKED), "really is dot-less")).toBe(false);
+  });
+
+  it("fails when the dot-less controls are missing from the page entirely", () => {
+    expect(check(recapVerdict(280, measurement({ dotless: [] }), CLICKED), "on the page at all")).toBe(false);
+  });
+
+  it("keeps the dotted pill's PRE-EXISTING 2px offset passing — 'has not moved', not 'is zero'", () => {
+    // That offset predates this branch (the pill's baseline is donated by its empty 6px dot).
+    // Asserting zero would fail on untouched code and tempt someone to "fix" it by moving every pill
+    // in every concierge reply.
+    expect(check(recapVerdict(280, measurement(), CLICKED), "has not MOVED")).toBe(true);
+    const moved = measurement({ baseline: { refBottom: 100, pillBottom: 118, delta: 18 } });
+    expect(check(recapVerdict(280, moved, CLICKED), "has not MOVED")).toBe(false);
+  });
+
+  // ── THE VERY-NARROW CLAIMS ──────────────────────────────────────────────────────────────────
+  it("fails when nothing was actually truncated at the truncation width", () => {
+    const untruncated = measurement({
+      names: [{ text: "@Agent", scrollWidth: 40, clientWidth: 40, truncated: false }],
+    });
+    expect(check(recapVerdict(200, untruncated, CLICKED), "genuinely truncated")).toBe(false);
+  });
+
+  it("fails a truncated pill that stopped being a working control", () => {
+    expect(check(recapVerdict(200, measurement(), { ...CLICKED, clicks: [] }), "working control")).toBe(false);
+    expect(check(recapVerdict(200, measurement(), { ...CLICKED, tag: "SPAN" }), "working control")).toBe(false);
+  });
+
+  it("fails when the full name did not survive in the tooltip", () => {
+    const v = recapVerdict(200, measurement(), { ...CLICKED, title: "Open Concierge Say… in sparkle" });
+    expect(check(v, "survives truncation in the tooltip")).toBe(false);
+  });
+
+  it("does not make the truncation claims at a width where nothing should be truncated", () => {
+    // The rules are width-scoped; a rule that did not run must read as absent, not as a pass.
+    const v = recapVerdict(520, measurement(), CLICKED);
+    expect(check(v, "genuinely truncated")).toBeUndefined();
+  });
+});
+
+describe("recap-narrow probe — the CLI contract", () => {
+  it("reads --widths and --json the way the probe's own docs promise", () => {
+    expect(recapArgs(["--widths=520,280,200", "--json"])).toEqual({
+      widths: "520,280,200",
+      json: true,
+    });
+    expect(recapArgs([])).toEqual({});
+    // A bare `--widths` yields `true`, which `main()` must not treat as a width list — the guard
+    // there is `args.widths ? … : DEFAULT_WIDTHS`, so this documents the shape it receives.
+    expect(recapArgs(["--widths"])).toEqual({ widths: true });
   });
 });
 

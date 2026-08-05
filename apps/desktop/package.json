@@ -17,6 +17,7 @@
     "visual:capture": "node scripts/visual/capture.mjs",
     "visual:compare": "node scripts/visual/compare.mjs",
     "visual:verify-stable": "node scripts/visual/verify-stable.mjs",
+    "visual:recap-narrow": "node scripts/visual/recap-narrow-probe.mjs",
     "visual": "pnpm visual:capture && pnpm visual:compare",
     "lint": "eslint src --max-warnings 12",
     "typecheck": "tsc --noEmit",

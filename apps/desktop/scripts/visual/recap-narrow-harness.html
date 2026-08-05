@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Recap card — narrow-column layout probe</title>
+  </head>
+  <body>
+    <!--
+      A LAYOUT-ONLY PAGE, served by the app's own vite dev server so it renders the REAL RecapCard
+      with the REAL stylesheet and the REAL fonts. It exists because jsdom cannot answer the only
+      question that matters here — does anything actually overflow — and the full visual harness
+      cannot reach a recap card without a fixture in src/dev/visualFixtures.ts, which belongs to
+      another worker's file set. See recap-narrow-probe.mjs for what is measured.
+    -->
+    <div id="root"></div>
+    <script type="module" src="./recap-narrow-harness.jsx"></script>
+  </body>
+</html>

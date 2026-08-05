@@ -63,10 +63,22 @@ const WARNING: Record<AiServiceReason, string> = {
 // ZeroCreditBanner / ProviderUnavailableBanner) rather than the themed cream.
 const INK = ON_BRAND_FILL_DARK;
 
+/** The full-width bar's hook, so a real-layout test can measure the element the user sees. */
+export const AI_SERVICE_BAR_TESTID = "ai-service-bar";
+
+/** See BANNER_BAR_TOP_ANCHOR in ProviderUnavailableBanner — the three bars share this shape, so a
+ *  fix that left this one centred would be half a fix. This bar carries the LONGEST sentence of the
+ *  three, so it is the first to wrap and the one with the most lines to lose off the top. */
+const sentence: CSSProperties = {
+  minWidth: 0,
+  overflowWrap: "break-word",
+};
+
 const bar: CSSProperties = {
   flex: "0 0 auto",
   display: "flex",
-  alignItems: "center",
+  // TOP-ANCHORED, not centred — see BANNER_BAR_TOP_ANCHOR in ProviderUnavailableBanner.
+  alignItems: "flex-start",
   justifyContent: "center",
   // Positioning context for the out-of-flow ✕ (see ZeroCreditBanner for why it is pinned, not
   // pushed with marginLeft:auto).
@@ -120,11 +132,13 @@ export function AiServiceBanner() {
   if (!degraded || dismissed || reason === null) return null;
 
   return (
-    <div style={bar}>
-      <FiAlertTriangle size={14} style={{ flex: "none" }} aria-hidden />
+    <div style={bar} data-testid={AI_SERVICE_BAR_TESTID}>
+      {/* `marginTop: 1` restores the 1px that `align-items: center` used to supply on a
+          single-line bar; see the icon note in ProviderUnavailableBanner. */}
+      <FiAlertTriangle size={14} style={{ flex: "none", marginTop: 1 }} aria-hidden />
       {/* The live region wraps ONLY the sentence — with the ✕ inside it some screen readers
           re-announce the whole warning on the button's focus/state changes. */}
-      <span role="status" aria-live="polite">
+      <span role="status" aria-live="polite" style={sentence}>
         {WARNING[reason]}.
       </span>
       <button
