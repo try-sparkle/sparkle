@@ -451,9 +451,31 @@ fn classify_cli_failure(result_text: &str, api_error_status: Option<u16>) -> Str
     if matches!(api_error_status, Some(429) | Some(529)) {
         return "ai_rate_limited".to_string();
     }
+    // AN EXPIRED SESSION IS "NOT AUTHENTICATED", NOT A GENERIC SERVICE FAILURE.
+    //
+    // The three phrases below this comment cover a credential that was never valid or was signed
+    // out. They do NOT cover the far more common shape: a session that WAS valid and whose refresh
+    // failed. The CLI reports that as "Failed to authenticate: <reason>" — e.g. an OAuth session
+    // that expired and could not be refreshed — which matches none of them, so it fell through to
+    // the generic `ai request failed: …` arm at the bottom of this function.
+    //
+    // That is the same mis-bucketing the 2026-08-02 ordering fix above addressed, one condition
+    // over, and it is worse here because the state is STICKY: a spent allowance resets on its own,
+    // but an unrefreshable session stays broken until a human signs in again. Every automatic
+    // caller (suggestions, attention-summary, the judge) keeps firing against it, and each failure
+    // DEGRADES — accumulating toward the app-shell AiServiceBanner, whose copy says Sparkle's AI
+    // features are failing. So the user is told the product is broken, indefinitely, and never told
+    // the one thing that would fix it. `claude_not_authenticated` instead YIELDS to the named-reason
+    // banner (`cli_not_authenticated`), which says to sign in.
+    //
+    // Matched on the failure verb, not on "oauth": the reason clause varies with the credential
+    // kind, and it is the "failed to authenticate" prefix that is invariant. "session expired"
+    // stands alone for the same reason — a session can expire without that prefix.
     if lower.contains("not logged in")
         || lower.contains("/login")
         || lower.contains("invalid api key")
+        || lower.contains("failed to authenticate")
+        || lower.contains("session expired")
     {
         return "claude_not_authenticated".to_string();
     }
@@ -1116,6 +1138,40 @@ mod tests {
         ] {
             assert_eq!(classify_cli_failure(s, None), "claude_not_authenticated", "for {s:?}");
         }
+    }
+
+    #[test]
+    fn an_unrefreshable_session_is_an_auth_failure_not_a_generic_service_failure() {
+        // Observed shape, verbatim from a capture: an OAuth session that expired and whose refresh
+        // failed. It names no "/login", is not "not logged in", and is not an "invalid api key", so
+        // before this arm existed it fell to the generic `ai request failed: …` bottom arm — which
+        // DEGRADES toward the banner claiming Sparkle's AI features are failing, on a condition only
+        // the user signing in again can clear. One capture window held over a thousand of these from
+        // a single expired session, every one of them mislabelled.
+        for s in [
+            "Failed to authenticate: OAuth session expired and could not be refreshed",
+            "failed to authenticate: token refresh returned 401",
+            "Your session expired. Sign in to continue.",
+        ] {
+            assert_eq!(classify_cli_failure(s, None), "claude_not_authenticated", "for {s:?}");
+        }
+    }
+
+    #[test]
+    fn a_spent_allowance_still_outranks_the_new_auth_phrases() {
+        // The auth arm sits BELOW `is_account_limit` on purpose. A message carrying both — the
+        // allowance is spent AND the CLI phrased it as an authentication failure — must stay
+        // `claude_usage_limit`, or the 2026-08-02 fix is undone from the other direction: the user
+        // would be sent to re-authenticate a session that is already fine and would come back to the
+        // identical failure. Both sentinels yield, so this costs no banner; it costs the user the
+        // correct remedy.
+        assert_eq!(
+            classify_cli_failure(
+                "Failed to authenticate: Claude usage limit reached, limit resets at 4pm",
+                None
+            ),
+            "claude_usage_limit"
+        );
     }
 
     #[test]
