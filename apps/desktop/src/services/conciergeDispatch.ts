@@ -103,7 +103,7 @@ import { paneState } from "./paneReadiness";
 import { findKnownAgent } from "./knownAgents";
 import { getAgentViewport } from "./terminalViewport";
 import { isClaudeCodeScreen } from "../engine/claudeCodeScreen";
-import { screenBlocksWrite, screenIsCredentialPrompt } from "../voice/dictationTerminalRoute";
+import { screenBlocksWrite, screenIsCredentialField } from "../voice/dictationTerminalRoute";
 import { useInteractionStore } from "../stores/interactionStore";
 import { useProjectStore } from "../stores/projectStore";
 import { usePromptHistoryStore } from "../stores/promptHistoryStore";
@@ -565,7 +565,23 @@ export async function dispatchConciergeAnswer(
   // sudo/token/host-key cases this guard exists for still block, and the shipped `answersLivePicker`
   // mirror keeps agreeing with what the dispatcher will actually do. Those two are documented as
   // having to agree; the first cut made them disagree.
-  if (screen && pickerOptions.length === 0 && screenIsCredentialPrompt(screen.text)) {
+  // GATED ON WHICH ARM MATCHED, NOT ON "are there any options" (roborev 58529). The first cut waived
+  // the whole predicate whenever the detector found anything, and the two sides read DIFFERENT
+  // SOURCES: `pickerOptions` parses the SCROLLBACK (50 lines for the Claude picker, 12 for a generic
+  // menu) while the credential check reads the VIEWPORT. So a menu merely still in scrollback — not
+  // what the screen is waiting on — switched the guard off.
+  //
+  // That reported SUCCESS while doing the harm: `CHOICE_KEYWORD` contains `enter`, so
+  // `Enter your vault password:` under a still-visible `1) … 2) …` run parses as a menu, and a terse
+  // "1" was submitted as `1\r` INTO THE CONCEALED FIELD with `ok: true, path: "picker-option"`.
+  //
+  // `screenIsCredentialField` excludes only the `(yes/no)` arm — the single shape genuinely
+  // ambiguous between "must not receive free text" and "a picker to answer". A password line, the
+  // credential tail, `type "yes" to confirm`, and ssh's host-key prompt all block regardless of what
+  // the scrollback still holds. ssh matters specifically: it carries `(yes/no)` but wants the whole
+  // word `yes` while the detector's Approve sends `y`, so answering it would report a delivery ssh
+  // rejected.
+  if (screen && screenIsCredentialField(screen.text)) {
     log.warn("concierge", "refused a write into a credential prompt", { agentId });
     return { ok: false, path: "blocked-prompt", agentId };
   }

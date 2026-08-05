@@ -57,11 +57,33 @@ import type { TerminalViewport } from "../services/terminalViewport";
  * ("Steps to reset your password:"). That costs the user one repeated phrase. The opposite error
  * costs them a password typed into a terminal, in the clear, and possibly submitted.
  */
+/**
+ * The `(yes/no)` arm ALONE — the one member of the list above that a live picker may waive.
+ *
+ * ══ WHY THIS IS SEPARATED (roborev 58529) ═══════════════════════════════════════════════════════
+ * `conciergeDispatch` needs to refuse credential prompts while still ANSWERING pickers, and a first
+ * cut waived the whole predicate whenever any options were detected. That was wrong in a way that
+ * REPORTED SUCCESS: `CHOICE_KEYWORD` contains `enter`, so `Enter your vault password:` under a
+ * still-visible `1) … 2) …` run parses as a menu, the guard was skipped, and a terse "1" was
+ * submitted as `1\r` INTO THE CONCEALED FIELD with `ok: true, path: "picker-option"`.
+ *
+ * Only the yes/no shape is genuinely ambiguous between "a prompt that must not receive free text"
+ * and "a picker the dispatcher answers". Every other arm — a password/passphrase line, the
+ * `CREDENTIAL_WORD` tail, `type "yes" to confirm` — is a field, never a menu, and must block no
+ * matter what the scrollback happens to still contain.
+ */
+const YES_NO_PROMPT = /\(\s*yes\s*\/\s*no/i;
+
 const WRITE_BLOCKING_PROMPTS: RegExp[] = [
   /\bpass(word|phrase)\b[^\n]*:\s*$/im,
-  /\(\s*yes\s*\/\s*no/i,
+  // THE SAME OBJECT as `YES_NO_PROMPT`, not a second literal with the same source. That identity is
+  // load-bearing: `screenIsCredentialField` excludes this arm with `re !== YES_NO_PROMPT`, and a
+  // duplicate literal — which a first cut used — is a different object, so the filter matched
+  // nothing and every `(yes/no)` screen kept blocking.
+  YES_NO_PROMPT,
   /\btype\s+["']?yes["']?\b/i,
 ];
+
 
 /**
  * Words that mark a line as a CREDENTIAL PROMPT. Broader than "password" on purpose (roborev 56047):
@@ -135,8 +157,36 @@ export function screenBlocksWrite(snapshot: string): boolean {
  */
 export function screenIsCredentialPrompt(snapshot: string): boolean {
   if (WRITE_BLOCKING_PROMPTS.some((re) => re.test(snapshot))) return true;
-  // The wrap-tolerant arm: a credential word ANYWHERE in the trailing region, and that region
-  // ending in a colon — the shape of a prompt sitting there waiting, however it happened to wrap.
+  return matchesCredentialTail(snapshot);
+}
+
+/**
+ * A CREDENTIAL FIELD, excluding the `(yes/no)` shape a picker may legitimately answer.
+ *
+ * The subset `conciergeDispatch` refuses UNCONDITIONALLY — see {@link YES_NO_PROMPT} for why the
+ * yes/no arm is the only one a live picker waives, and why waiving the whole predicate typed a
+ * keystroke into a password field while reporting success (roborev 58529).
+ *
+ * ssh's `…continue connecting (yes/no/[fingerprint])?` deliberately stays BLOCKED here even though
+ * it carries "yes/no": it is not answerable as a picker, because ssh requires the literal word
+ * `yes` and the detector's Approve maps to `y`. Answering it would send a keystroke ssh rejects
+ * while the dispatcher reported a delivery — so it is matched by the credential-tail arm's
+ * `fingerprint` sibling below rather than left to the yes/no waiver.
+ */
+export function screenIsCredentialField(snapshot: string): boolean {
+  if (WRITE_BLOCKING_PROMPTS.some((re) => re !== YES_NO_PROMPT && re.test(snapshot))) return true;
+  if (SSH_HOST_KEY.test(snapshot)) return true;
+  return matchesCredentialTail(snapshot);
+}
+
+/** ssh's host-key confirmation, which carries `(yes/no…)` but is NOT picker-answerable: ssh wants
+ *  the whole word `yes`, and the detector's Approve sends `y`. Named separately so the yes/no
+ *  waiver cannot reach it (roborev 58529). */
+const SSH_HOST_KEY = /\bcontinue connecting\b|\bauthenticity of host\b|\bfingerprint\b/i;
+
+/** The wrap-tolerant arm: a credential word ANYWHERE in the trailing region, and that region ending
+ *  in a colon — the shape of a prompt sitting there waiting, however it happened to wrap. */
+function matchesCredentialTail(snapshot: string): boolean {
   const tail = screenTail(snapshot);
   return /:\s*$/.test(tail) && CREDENTIAL_WORD.test(tail);
 }

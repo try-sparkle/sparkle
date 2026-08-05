@@ -209,6 +209,58 @@ describe("a credential prompt refuses on the normal buffer too", () => {
   // this guard sits ABOVE the picker branch. This file's own header calls that out as something that
   // must not be hoisted. So the guard calls `screenIsCredentialPrompt`, the non-picker half, and
   // this row fails the moment someone "simplifies" it back.
+  // ══ A STALE SCROLLBACK MENU MUST NOT WAIVE A LIVE CREDENTIAL PROMPT (roborev 58529) ═══════════
+  // THE ROW THE PREVIOUS GATE COULD NOT HAVE. `pickerOptions` parses the SCROLLBACK; the credential
+  // check reads the VIEWPORT. Gating on "are there any options" therefore let a menu still sitting
+  // in scrollback — not what the screen is waiting on — switch the guard off entirely.
+  //
+  // It reported SUCCESS while doing the harm: `CHOICE_KEYWORD` contains `enter`, so
+  // `Enter your vault password:` under a still-visible numbered run parses as a menu, and a terse
+  // "1" was submitted as `1\r` INTO THE CONCEALED FIELD with ok:true / path:"picker-option".
+  //
+  // The two sources are set to DIFFERENT text here on purpose — the earlier row sets them to the
+  // same string and so cannot see this divergence at all.
+  it("refuses a credential prompt even while a menu is still in scrollback", async () => {
+    // THE REAL detector — with the file's default `[]` mock, `pickerOptions` is empty and the
+    // option-count gate this row exists to forbid never fires, so the row would pass against it.
+    const real = await vi.importActual<typeof import("./suggestions/heuristics")>(
+      "./suggestions/heuristics",
+    );
+    vi.mocked(detectTerminalPrompts).mockImplementation(real.detectTerminalPrompts);
+    vi.mocked(getAgentScrollback).mockReturnValue(
+      "Pick a vault:\n1) personal\n2) work\nEnter your vault password:",
+    );
+    vi.mocked(getAgentViewport).mockReturnValue({
+      text: "Enter your vault password:",
+      alternateBuffer: false,
+    });
+    const r = await dispatchConciergeAnswer(AGENT, "1", OPTS);
+    expect(r.path).toBe("blocked-prompt");
+    expectNothingWritten();
+  });
+
+  // ssh's host-key prompt carries `(yes/no)` and the detector matches it — but it is NOT
+  // picker-answerable: ssh requires the whole word `yes` while Approve sends `y`, so answering it
+  // would report a delivery ssh rejected. The commit that added the yes/no waiver claimed this case
+  // still blocked; it did not, which is why it is pinned here.
+  it("refuses ssh's host-key confirmation rather than answering it as a picker", async () => {
+    const HOSTKEY =
+      "The authenticity of host 'x (1.2.3.4)' can't be established.\n" +
+      "ED25519 key fingerprint is SHA256:abc.\n" +
+      "Are you sure you want to continue connecting (yes/no/[fingerprint])? ";
+    // Real detector, for the same reason as the row above: ssh's prompt has to actually PARSE as a
+    // picker for this row to prove the waiver does not reach it.
+    const real = await vi.importActual<typeof import("./suggestions/heuristics")>(
+      "./suggestions/heuristics",
+    );
+    vi.mocked(detectTerminalPrompts).mockImplementation(real.detectTerminalPrompts);
+    vi.mocked(getAgentScrollback).mockReturnValue(HOSTKEY);
+    vi.mocked(getAgentViewport).mockReturnValue({ text: HOSTKEY, alternateBuffer: false });
+    const r = await dispatchConciergeAnswer(AGENT, "yes", OPTS);
+    expect(r.path).toBe("blocked-prompt");
+    expectNothingWritten();
+  });
+
   // ══ A `(yes/no)` PROMPT IS A PICKER, THROUGH THE REAL DETECTOR (roborev 58512) ════════════════
   // THE ROW THE FIRST CUT COULD NOT HAVE. `WRITE_BLOCKING_PROMPTS` carries `/\(\s*yes\s*\/\s*no/i`,
   // so `screenIsCredentialPrompt` is NOT purely the non-picker half — and `suggestions/heuristics`'

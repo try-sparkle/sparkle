@@ -1360,7 +1360,12 @@ mod tests {
         for needle in [
             // dictationTerminalRoute.ts
             r"/\bpass(word|phrase)\b[^\n]*:\s*$/im,",
-            r"/\(\s*yes\s*\/\s*no/i,",
+            // NO TRAILING COMMA on this one: the pattern moved out of the array literal into its own
+            // `const YES_NO_PROMPT = …;` declaration, because the TS side needs to exclude that arm
+            // BY OBJECT IDENTITY and a duplicate literal is a different object (roborev 58529). The
+            // pattern itself is byte-for-byte unchanged, which is what this guard is actually about —
+            // so the needle drops the comma rather than the check being weakened or removed.
+            r"/\(\s*yes\s*\/\s*no/i",
             r#"/\btype\s+["']?yes["']?\b/i,"#,
             r"pass(word|phrase|code)|username|token|otp|one[-\s]?time\s+(code|password)|verification\s+code|2fa|two[-\s]?factor|pin",
         ] {
