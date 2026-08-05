@@ -305,6 +305,16 @@ describe("three states — the read that could not look", () => {
     expect(holdOf(decide({ pr }))).toBe("probe-read-unknown");
   });
 
+  it("THE WIRE FORM: probes: null holds probe-read-unknown too, NOT no-evidence", () => {
+    // The case above builds `undefined` by hand; the PRODUCER never sends that. `probes` mirrors
+    // Rust `Option<Vec<Probe>>` with no `skip_serializing_if`, so an unreadable read arrives over IPC
+    // as literal `null`. The old `=== undefined` guard missed it and returned `no-evidence` — the
+    // fail-OPEN direction, claiming "we looked; this PR is fine" about a PR nobody could look at.
+    const pr = snapshot({ gate: { ...UNKNOWN_GATE, probes: null } });
+    expect(babysitEvidenceFor(pr)).toEqual([]);
+    expect(holdOf(decide({ pr }))).toBe("probe-read-unknown");
+  });
+
   it("applicable: false with green checks is no-evidence, not probe-read-unknown", () => {
     const pr = snapshot({ gate: NOT_APPLICABLE_GATE, checks: "passing" });
     expect(holdOf(decide({ pr }))).toBe("no-evidence");
@@ -672,6 +682,29 @@ describe("evidence — commits pushed since the last review", () => {
       gate: gate([], { reviewedHead: undefined, reviewStale: false }),
     });
     expect(babysitEvidenceFor(pr)).toEqual([]);
+  });
+
+  it("THE WIRE FORM: reviewedHead: null is UNKNOWN, and does not throw out of the sweep", () => {
+    // The case above hand-builds `undefined`; Rust `Option<String>` reaches this code as `null`, and
+    // the old guard read `null !== undefined` as "a head was named" and then dereferenced `.length`.
+    // The throw escaped all the way to `sweepAllProjects`' per-project catch, so ONE PR in this state
+    // aborted its whole project's sweep and every PR after it went unswept.
+    const pr = snapshot({
+      headSha: HEAD_NEW,
+      gate: gate([], { reviewedHead: null, reviewStale: false }),
+    });
+    expect(() => babysitEvidenceFor(pr)).not.toThrow();
+    expect(babysitEvidenceFor(pr)).toEqual([]);
+  });
+
+  it("THE WIRE FORM: a null head with a STALE self-label still reports uncovered", () => {
+    // The null must not swallow the other half of the fix: `reviewStale` is authoritative on its own,
+    // so a paused-then-stale review still yields evidence rather than being silenced by the guard.
+    const pr = snapshot({
+      headSha: HEAD_NEW,
+      gate: gate([], { reviewedHead: null, reviewStale: true }),
+    });
+    expect(babysitEvidenceFor(pr).map((e) => e.kind)).toContain("commits-pushed-since-last-review");
   });
 
   it("a PR with no knightwatch at all yields nothing, however far the head has moved", () => {

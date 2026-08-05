@@ -140,16 +140,31 @@ export interface BabysitProbe {
  *   * NOT-APPLICABLE — `applicable: false`. The read SUCCEEDED and this PR carries no knightwatch
  *     comment at all. Every non-Sparkle project is in this state. It is not "clean"; the probe
  *     evidence class simply does not apply.
- *   * UNKNOWN — `applicable: true, probes: undefined`. The read FAILED or came back saturated. We
+ *   * UNKNOWN — `applicable: true`, `probes` nullish. The read FAILED or came back saturated. We
  *     could not look. This is the state that must never be collapsed into either neighbour.
  *   * AUTHORITATIVE — `probes: [...]`, where `[]` means "asked; this PR has no probes". A PR
  *     carrying nothing but `⏸ knightwatch paused` status posts is in THIS state with an empty
  *     array, which is the whole of rule 2's defence against the repost storm.
+ *
+ * NULLISH, NOT `undefined` — this type crosses an IPC boundary, so read UNKNOWN with `== null`.
+ * Every optional field here mirrors a Rust `Option<T>` on `knightwatch.rs`'s `ProbeGate`, and serde
+ * serializes `None` as JSON **`null`**; nothing on that struct carries `skip_serializing_if`, so the
+ * key is always present and its value is literally `null`. A TS `?:` therefore describes a shape the
+ * producer never sends, and an `=== undefined` / `!== undefined` guard written against it is wrong in
+ * both directions — the two bugs below were one of each:
+ *
+ *   * `reviewedHead !== undefined && reviewedHead.length > 0` admitted `null` and then read `.length`
+ *     off it. That THREW, and the throw was caught a whole level up in `sweepAllProjects` — so one
+ *     PR whose newest review named no head aborted the sweep for its entire project, and every PR
+ *     after it in that project went unswept for as long as the condition held.
+ *   * `probes === undefined` missed `null`, so an unreadable read fell through to `no-evidence` —
+ *     silently claiming "we looked; this PR is fine" about a PR nobody could look at. That is the
+ *     exact collapse the THREE STATES note above exists to forbid, and it fails OPEN.
  */
 export interface BabysitProbeGate {
   applicable: boolean;
-  /** `undefined` is UNKNOWN — never an empty answer. `[]` is "asked; none". */
-  probes: BabysitProbe[] | undefined;
+  /** Nullish is UNKNOWN — never an empty answer. `[]` is "asked; none". Test it with `== null`. */
+  probes: BabysitProbe[] | null | undefined;
   /** Why the read is unknown, in the tool's own words. Shown, never parsed. */
   error: string | null;
   /**
@@ -172,12 +187,15 @@ export interface BabysitProbeGate {
    * WHICH HEAD the newest knightwatch review says it evaluated, as the bot printed it — abbreviated,
    * typically 7 chars. Mirrors Rust `ProbeGate::reviewed_head`.
    *
-   * `undefined` is UNKNOWN and MUST NOT be read as "covered": no review, a lifecycle status post, and
+   * Nullish is UNKNOWN and MUST NOT be read as "covered": no review, a lifecycle status post, and
    * a status form the parser does not recognise all produce it. Compare by PREFIX against the 40-char
    * `headSha`, never with `===` — matching the short form against the start of the long one, and
    * never the reverse.
+   *
+   * `null` on the wire and `undefined` from a hand-built test object are the SAME state; see the
+   * NULLISH note on this interface for why a `!== undefined` guard here threw on the real value.
    */
-  reviewedHead?: string;
+  reviewedHead?: string | null;
   /**
    * Does that review self-label `⚠️ Stale: head moved from X to Y mid-run`?
    *
@@ -341,9 +359,13 @@ export function babysitEvidenceFor(pr: BabysitPrSnapshot): BabysitEvidence[] {
     const reviewedHead = pr.gate.reviewedHead;
     // PREFIX, never equality — the bot prints 7 chars and `headSha` is the full 40. Short against the
     // start of long, never the reverse.
+    //
+    // `!= null`, never `!== undefined`: the producer sends `null` for UNKNOWN (see the interface's
+    // NULLISH note), and the `undefined`-only form both admitted that `null` and then dereferenced
+    // it — throwing out of the whole project's sweep rather than holding this one PR.
     const uncovered =
       pr.gate.reviewStale === true ||
-      (reviewedHead !== undefined && reviewedHead.length > 0 && !pr.headSha.startsWith(reviewedHead));
+      (reviewedHead != null && reviewedHead.length > 0 && !pr.headSha.startsWith(reviewedHead));
     if (uncovered) {
       out.push({
         kind: "commits-pushed-since-last-review",
@@ -615,7 +637,10 @@ export function decideBabysitDispatch(input: BabysitDispatchInput): BabysitDecis
     // the reason we cannot say `no-evidence`, which is a claim ("we looked; this PR is fine") that an
     // unreadable probe read does not support. When other evidence DID land, the unknown changes
     // nothing: we already have a reason to go, and the driver reads the comments itself on arrival.
-    if (pr.gate.applicable && pr.gate.probes === undefined) return hold("probe-read-unknown");
+    // `== null` catches the `null` the IPC producer actually sends as well as the `undefined` a
+    // hand-built object carries. `=== undefined` matched only the second, so a real unreadable read
+    // fell through to `no-evidence` — the fail-OPEN direction. See the interface's NULLISH note.
+    if (pr.gate.applicable && pr.gate.probes == null) return hold("probe-read-unknown");
     return hold("no-evidence");
   }
 
