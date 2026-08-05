@@ -22,6 +22,7 @@ import type { Attachment, TextBlock } from "../composer/attachments";
 // that nothing under components/Concierge may TOUCH a store; a type import is erased at compile time
 // and creates no subscription, no import cycle and no runtime dependency. Naming the store's own
 // shape here is what stops the column and the store drifting into two definitions of one thing.
+import type { AgentTabStatus } from "../../types";
 import type { MountedThread } from "../../stores/mountedThreadStore";
 // The @-mention shapes live with the pure module that owns the matching rules (./mentions — no
 // React, no stores), for the same reason `Attachment` lives with the composer's model: one
@@ -487,6 +488,17 @@ export interface ConciergeMountedAgent {
   thread: MountedThread;
   /** The reader scrolled near the top and wants older turns. */
   onReachTop: () => void;
+  /** THIS AGENT'S LIVE STATUS, for the "Chatting with ● Name" chip (bead sparkle-wj3ya).
+   *
+   *  The founder asked for "the dot that has the color of the agent … so it would be the dot and
+   *  then the name of the agent", and the bead is explicit that it must reflect LIVE state, not the
+   *  state at mount time: *"An agent that goes red while he is composing should show red."* So the
+   *  host SUBSCRIBES to it rather than reading it once — see its construction in ConciergeHost.
+   *
+   *  Carried here rather than looked up in the column because this column never imports a store;
+   *  the same rule `thread` above follows. Optional so every existing caller and suite is unchanged
+   *  — absent simply renders the chip without a dot rather than inventing a status. */
+  status?: AgentTabStatus;
 }
 
 /** Every gesture the column can emit. The integration layer supplies all of these. */

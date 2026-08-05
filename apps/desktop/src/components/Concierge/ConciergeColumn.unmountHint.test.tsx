@@ -83,12 +83,23 @@ describe("mounted — the way out is on screen", () => {
     expect(hint()!.textContent).toMatch(/unmount/i);
   });
 
-  it("is right-justified on its row, as the founder placed it", () => {
+  it("is last on its row, as the founder placed it", () => {
     mount("right");
-    // The hint sits at the END of its row — the founder's "right justified". Read off the row that
-    // owns the alignment rather than the text node inside it.
     const row = hint()!.parentElement!;
-    expect(row.style.justifyContent).toBe("flex-end");
+    // ══ ASSERTED AS POSITION, NOT AS A CSS VALUE (bead sparkle-wj3ya) ══════════════════════════
+    // This read `justifyContent === "flex-end"`, which was the right requirement expressed through
+    // the wrong fact. The row now also carries the "Chatting with ● <Agent>" chip on its LEFT — the
+    // founder's placement, *"to the LEFT of where it says escape click to unmount"* — so it is laid
+    // out `space-between` and the hint is held at the right edge by being the LAST child rather
+    // than by the container pushing a lone item over.
+    //
+    // The founder's requirement never changed: the hint is hard right. So assert THAT — it survives
+    // any future occupant arriving on this row, where a literal `flex-end` would have to be
+    // rewritten again and would go red for a layout that still satisfies him.
+    expect(row.lastElementChild).toBe(hint());
+    // And the row really is a row that spreads its children, not a stack that happens to end here.
+    expect(row.style.display).toBe("flex");
+    expect(row.style.justifyContent).toBe("space-between");
   });
 
   // PLACEMENT IS THE REQUIREMENT, and `justify-content` alone does not express it: a row aligned

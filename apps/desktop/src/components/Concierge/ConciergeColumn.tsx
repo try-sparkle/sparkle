@@ -40,6 +40,9 @@ import { pillStyle } from "./pillStyle";
 import { wordmarkRamp } from "./wordmarkRamp";
 import type { ConciergeAnnouncement, ConciergeColumnProps } from "./types";
 import { FONT_UI, TYPE } from "../../theme/scale";
+// The SAME dot the sidebar row draws, so the chip and the row cannot disagree about what
+// green/gray/red mean — the chip exists to report how that agent is doing (bead sparkle-wj3ya).
+import { StatusDot } from "../StatusDot";
 
 /** Nothing announced yet. Module-level so the default prop is referentially stable. */
 const EMPTY_ANNOUNCEMENT: ConciergeAnnouncement = { seq: 0, text: "" };
@@ -72,6 +75,11 @@ export const CONCIERGE_LIFT_Z = 3;
  *  suite identifies it structurally rather than by matching the copy, which is expected to be
  *  reworded. See its render site for why it is gated and not merely styled. */
 export const CONCIERGE_UNMOUNT_HINT_TESTID = "concierge-unmount-hint";
+
+/** The "Chatting with ● <Agent>" chip's handle — shown ONLY while the cable is patched, on the same
+ *  row as the unmount hint (bead sparkle-wj3ya). Exported so the suite identifies it structurally
+ *  rather than by matching copy, exactly like its neighbour above. */
+export const CONCIERGE_CHATTING_WITH_TESTID = "concierge-chatting-with";
 
 // rev4's `.pill` MOVED to ./pillStyle — the PR badge one slot over needs the same box, and the
 // founder asked for it as a chiclet matching this one rather than as a second chip shape.
@@ -671,7 +679,59 @@ export function ConciergeColumn({
           it would break the founder's placement ("directly above the composer") by construction
           (roborev 55535). */}
       {!aiLock && isWired && (
-        <div style={{ display: "flex", justifyContent: "flex-end", padding: "0 12px 4px" }}>
+        // ══ THE CHIP SHARES THIS ROW, LEFT-ALIGNED (bead sparkle-wj3ya) ═══════════════════════════
+        // The founder's placement, which supersedes the "next to the paperclip" one in that bead's
+        // description: *"When the pane is mounted, it should be saying 'Chatting with [circle (red,
+        // green etc)] [Agent name]' to the LEFT of where it says escape click to unmount."*
+        //
+        // THIS ROW IS THE RIGHT HOME because it already renders only while mounted: the indicator
+        // and the way out cannot appear without each other, and neither can outlive the cable. That
+        // is also why the chip needs no gate of its own — `isWired` above is the whole condition.
+        //
+        // `space-between` rather than a second container: the hint keeps its right edge exactly
+        // where it was, so this adds a chip without moving anything that was already on screen.
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            gap: 8,
+            padding: "0 12px 4px",
+          }}
+        >
+          {mountedAgent ? (
+            <span
+              data-testid={CONCIERGE_CHATTING_WITH_TESTID}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 5,
+                fontSize: TYPE.small,
+                color: C.conciergeMuted,
+                // THE NAME DEGRADES, THE DOT NEVER DOES — the bead's explicit rule for narrow
+                // columns ("Degrade the NAME first, never the dot"). The dot is a fixed-size flex
+                // item outside this clamp; only the label truncates.
+                minWidth: 0,
+              }}
+            >
+              <span>Chatting with</span>
+              {/* LIVE, and the same component the sidebar row draws, so the two cannot disagree
+                  about what green/gray/red mean — the chip's whole job is to tell him WHO he is
+                  talking to and HOW THAT AGENT IS DOING without leaving the composer. Omitted
+                  rather than guessed when the status is not known yet. */}
+              {mountedAgent.status !== undefined && (
+                <StatusDot status={mountedAgent.status} size={7} />
+              )}
+              <span
+                style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+              >
+                {mountedAgent.name}
+              </span>
+            </span>
+          ) : (
+            // Keeps the hint hard right when there is no chip to balance it against.
+            <span />
+          )}
           <span
             data-testid={CONCIERGE_UNMOUNT_HINT_TESTID}
             // Not a button. Escape is the gesture; drawing a control here would invite a click that

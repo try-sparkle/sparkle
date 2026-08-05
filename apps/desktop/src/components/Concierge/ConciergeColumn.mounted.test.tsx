@@ -24,7 +24,7 @@ vi.mock("@tauri-apps/plugin-opener", () => ({
 vi.mock("../LogoWaveform", () => ({ LogoWaveform: () => null }));
 vi.mock("../BalanceBadge", () => ({ BalanceBadge: () => null }));
 
-import { ConciergeColumn } from "./ConciergeColumn";
+import { ConciergeColumn, CONCIERGE_CHATTING_WITH_TESTID } from "./ConciergeColumn";
 import { ACTIVITY_CHIP_ITEMS_TESTID, ACTIVITY_CHIP_TESTID } from "./ActivityChip";
 import { MOUNTED_AGENT_TESTID, MOUNTED_HUMAN_TESTID, MOUNTED_THREAD_TESTID } from "./MountedAgentThread";
 import { RESUME_PROMPT_MARKER } from "../../engine/agentOriginated";
@@ -114,6 +114,38 @@ function renderColumn(mounted: ConciergeMountedAgent | null) {
     />,
   );
 }
+
+// ══ THE "CHATTING WITH ● <AGENT>" CHIP (bead sparkle-wj3ya) ═════════════════════════════════════
+//
+// The founder's placement, which supersedes the "next to the paperclip" one in that bead's
+// description: *"When the pane is mounted, it should be saying 'Chatting with [circle (red, green
+// etc)] [Agent name]' to the LEFT of where it says escape click to unmount."*
+//
+// THE ROW MATTERS AS MUCH AS THE CHIP. It renders only while the cable is patched, so the indicator
+// and the way out cannot appear without each other and neither can outlive the mount. The last row
+// here asserts that pairing rather than merely the chip's existence — a chip that survived an
+// unmount would be the exact lie this whole cluster is about: a pane naming a destination that is
+// no longer where the words go.
+describe("mounted — the pane names who it is talking to", () => {
+  it("renders the chip, naming the agent", () => {
+    renderColumn(mountedAgent({ status: "working" }));
+    const chip = screen.getByTestId(CONCIERGE_CHATTING_WITH_TESTID);
+    expect(chip.textContent).toContain("Chatting with");
+    expect(chip.textContent).toContain("Kraken Auth");
+  });
+
+  // NOT INVENTED when the status is not known yet — the chip still names the agent, it just draws no
+  // dot. A dot with a guessed colour is worse than none: it is an indicator that lies.
+  it("still names the agent when no status is known", () => {
+    renderColumn(mountedAgent({ status: undefined }));
+    expect(screen.getByTestId(CONCIERGE_CHATTING_WITH_TESTID).textContent).toContain("Kraken Auth");
+  });
+
+  it("is gone when the cable is unplugged", () => {
+    renderColumn(null);
+    expect(screen.queryByTestId(CONCIERGE_CHATTING_WITH_TESTID)).toBeNull();
+  });
+});
 
 describe("mounted — the pane shows the AGENT's conversation", () => {
   it("renders the agent's turns and NOT the Sparkle conversation", () => {

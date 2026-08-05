@@ -1386,6 +1386,18 @@ export function ConciergeHost({
   // only one of the two places one can come from (see `mountedName`). Keeping `mountedRow` as the
   // gate is what made the app-owned agent unmountable in the column while being mounted everywhere
   // else.
+  // ══ THE CHIP'S DOT IS LIVE, NOT A SNAPSHOT (bead sparkle-wj3ya) ═══════════════════════════════
+  // A SUBSCRIPTION, deliberately, not `useRuntimeStore.getState()`. The bead is explicit: *"The dot
+  // must reflect LIVE state, not the state at mount time. An agent that goes red while he is
+  // composing should show red."* A one-shot read would paint the status the agent had when the
+  // cable was patched and then never move — which is worse than no dot, because a stale green over
+  // an agent that has stopped and needs him is an indicator that lies in the reassuring direction.
+  //
+  // Selected down to the ONE agent's status rather than the whole map, so this re-renders when that
+  // agent changes rather than on every status write anywhere in the fleet.
+  const mountedStatus = useRuntimeStore((s) =>
+    mountedAgentId ? s.status[mountedAgentId] : undefined,
+  );
   const mountedAgent = useMemo<ConciergeMountedAgent | null>(
     () =>
       mountedAgentId && mountedName
@@ -1394,9 +1406,10 @@ export function ConciergeHost({
             name: mountedName,
             thread: mountedThread,
             onReachTop: pageBack,
+            status: mountedStatus,
           }
         : null,
-    [mountedAgentId, mountedName, mountedThread, pageBack],
+    [mountedAgentId, mountedName, mountedThread, pageBack, mountedStatus],
   );
 
   // ══ @-MENTIONS ═══════════════════════════════════════════════════════════════════════════════
