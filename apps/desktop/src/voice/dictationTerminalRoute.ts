@@ -161,28 +161,41 @@ export function screenIsCredentialPrompt(snapshot: string): boolean {
 }
 
 /**
- * A CREDENTIAL FIELD, excluding the `(yes/no)` shape a picker may legitimately answer.
+ * Does a `(yes/no)` confirmation sit at the BOTTOM of this screen?
  *
- * The subset `conciergeDispatch` refuses UNCONDITIONALLY — see {@link YES_NO_PROMPT} for why the
- * yes/no arm is the only one a live picker waives, and why waiving the whole predicate typed a
- * keystroke into a password field while reporting success (roborev 58529).
+ * ══ TAIL-SCOPED, LIKE EVERY OTHER ARM HERE (roborev 58562) ═══════════════════════════════════════
+ * A first cut tested the WHOLE viewport, which is exactly the over-block this file removed from
+ * `SSH_HOST_KEY` in the same commit: any pane merely DISPLAYING the string — this source file, a
+ * `git show` of it, a script's `--help`, a README — refused every write to that agent, with no
+ * override, until it scrolled off. `matchesCredentialTail` was already bounded; this now matches.
  *
- * ssh's `…continue connecting (yes/no/[fingerprint])?` deliberately stays BLOCKED here even though
- * it carries "yes/no": it is not answerable as a picker, because ssh requires the literal word
- * `yes` and the detector's Approve maps to `y`. Answering it would send a keystroke ssh rejects
- * while the dispatcher reported a delivery — so it is matched by the credential-tail arm's
- * `fingerprint` sibling below rather than left to the yes/no waiver.
+ * FIVE ROWS rather than the tail's default three: the shipped bug is a prompt with two lines of
+ * chatter under it (`Waiting for response…` / `Press Ctrl-C to abort.`), and a bound that only just
+ * covered that would break on a third line.
  */
 export function screenIsYesNoPrompt(snapshot: string): boolean {
-  return YES_NO_PROMPT.test(snapshot);
+  return YES_NO_PROMPT.test(screenTail(snapshot, 5));
 }
 
 /**
- * A CREDENTIAL FIELD, excluding the `(yes/no)` shape a LIVE picker may answer.
+ * A CREDENTIAL FIELD: the arms that must block whatever else is on screen.
  *
- * The caller must still refuse a `(yes/no)` screen when no picker is actually live — see
- * {@link screenIsYesNoPrompt} and its use in `conciergeDispatch`. This predicate alone waives that
- * arm UNCONDITIONALLY, which is not the same thing (roborev 58540).
+ * Everything in {@link WRITE_BLOCKING_PROMPTS} EXCEPT the `(yes/no)` arm, plus the wrap-tolerant
+ * credential tail, plus ssh's host-key confirmation.
+ *
+ * ══ WHY `(yes/no)` IS THE ONE EXCLUSION ═════════════════════════════════════════════════════════
+ * It is the single shape genuinely ambiguous between "a prompt that must not receive free text" and
+ * "a picker the dispatcher ANSWERS". Everything else — a password/passphrase line, the
+ * `CREDENTIAL_WORD` tail, `type "yes" to confirm` — is a field, never a menu.
+ *
+ * The caller must still refuse a yes/no prompt when no picker is live to answer it; this predicate
+ * alone does not, which is not the same thing (see `conciergeDispatch`, and roborev 58540).
+ *
+ * ssh's `…continue connecting (yes/no/[fingerprint])?` stays BLOCKED here even though it carries
+ * `yes/no`, because it is not picker-answerable: ssh wants the literal word `yes` while the
+ * detector's Approve sends `y`, so answering it reports a delivery ssh rejected. It is matched by
+ * {@link SSH_HOST_KEY}, consulted only alongside the yes/no shape — NOT by the credential tail, as
+ * an earlier version of this doc claimed after the mechanism it named had been deleted.
  */
 export function screenIsCredentialField(snapshot: string): boolean {
   if (WRITE_BLOCKING_PROMPTS.some((re) => re !== YES_NO_PROMPT && re.test(snapshot))) return true;

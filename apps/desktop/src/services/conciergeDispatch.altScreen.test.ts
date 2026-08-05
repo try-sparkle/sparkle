@@ -279,6 +279,45 @@ describe("a credential prompt refuses on the normal buffer too", () => {
     expectNothingWritten();
   });
 
+  // ══ A STALE SCROLLBACK MENU MUST NOT WAIVE A LIVE yes/no PROMPT (roborev 58562) ═══════════════
+  // The waiver used to be computed from the SCROLLBACK while the guard read the VIEWPORT, so a menu
+  // still sitting in history waived a confirmation three lines up — and because
+  // `detectTerminalPrompts` short-circuits on the menu branches before it ever evaluates YN, it did
+  // not even have to be a yes/no menu. A terse answer matching a stale option was then written as a
+  // keystroke into the live confirmation, returning ok:true / picker-option.
+  it("refuses a live (yes/no) prompt while an unrelated menu sits in scrollback", async () => {
+    const real = await vi.importActual<typeof import("./suggestions/heuristics")>(
+      "./suggestions/heuristics",
+    );
+    vi.mocked(detectTerminalPrompts).mockImplementation(real.detectTerminalPrompts);
+    // SCROLLBACK carries a numbered menu; the VIEWPORT is the confirmation with chatter under it.
+    vi.mocked(getAgentScrollback).mockReturnValue(
+      "Select a profile:\n1) staging\n2) prod\nOverwrite existing config? (yes/no)\nWaiting…\nPress Ctrl-C to abort.",
+    );
+    vi.mocked(getAgentViewport).mockReturnValue({
+      text: "Overwrite existing config? (yes/no)\nWaiting…\nPress Ctrl-C to abort.",
+      alternateBuffer: false,
+    });
+    const r = await dispatchConciergeAnswer(AGENT, "1", OPTS);
+    expect(r.path).toBe("blocked-prompt");
+    expectNothingWritten();
+  });
+
+  // ══ AND MERELY MENTIONING (yes/no) IS NOT A PROMPT (roborev 58562) ════════════════════════════
+  // The delivering direction for the yes/no arm, which `screenIsYesNoPrompt` previously lacked: it
+  // tested the WHOLE viewport, so any pane displaying the string — this source file, a `git show` of
+  // it, a `--help` — refused every write until it scrolled off. Tail-scoped now.
+  it("delivers to a screen that merely mentions (yes/no) above the prompt", async () => {
+    const SCREEN =
+      "The guard matches /\\(\\s*yes\\s*\\/\\s*no/i on screens like (yes/no).\n" +
+      "That is documentation, not a prompt.\n\n\n\n\n$ ";
+    vi.mocked(getAgentScrollback).mockReturnValue(SCREEN);
+    vi.mocked(getAgentViewport).mockReturnValue({ text: SCREEN, alternateBuffer: false });
+    const r = await dispatchConciergeAnswer(AGENT, "carry on", OPTS);
+    expect(r.path).toBe("free-text");
+    expect(r.ok).toBe(true);
+  });
+
   // ══ AND "fingerprint" IS NOT A PROMPT (roborev 58540) ══════════════════════════════════════════
   // SSH_HOST_KEY tests the whole viewport, so a bare `\bfingerprint\b` alternative refused EVERY send
   // to any agent whose pane happened to show the word — a key listing, `git log --show-signature`, or

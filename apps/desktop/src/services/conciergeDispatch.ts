@@ -600,10 +600,30 @@ export async function dispatchConciergeAnswer(
   // So: refuse a credential FIELD always, and refuse a yes/no prompt too whenever there is no picker
   // to answer it with. That is the shape roborev 58529 asked for, and this restores the half of it
   // the last commit lost.
+  // ══ THE WAIVER READS THE SAME TEXT THE GUARD DOES (roborev 58562) ═════════════════════════════
+  // FIFTH ROUND ON THIS GUARD, and every previous one was the same shape: a waiver computed from the
+  // SCROLLBACK deciding whether to skip a check computed from the VIEWPORT. `liveOptionsFor` parses
+  // 50 lines (Claude picker) or 12 (generic menu) of scrollback; `screenIsYesNoPrompt` reads the
+  // viewport. So a menu merely still in scrollback kept waiving a live prompt three lines up — and
+  // `detectTerminalPrompts` short-circuits on the menu branches BEFORE it evaluates YN, so it did
+  // not even have to be a yes/no menu.
+  //
+  // Rather than patch that instance again, the waiver now runs the detector over `screen.text`
+  // ITSELF. One source, one region, so the two halves cannot disagree about what is on screen —
+  // which is the class, not the case.
+  //
+  // AND IT MUST BE THE YES/NO PAIR, not merely "some options": the exclusion exists only because a
+  // yes/no confirmation is answerable, so any OTHER picker shape leaves the prompt refused.
+  //
+  // The picker block below still reads `pickerOptions` from the scrollback — that is its shipped
+  // behaviour and not this guard's to change.
+  const viewportOptions = screen ? detectTerminalPrompts(screen.text) : [];
+  const viewportOffersYesNo =
+    viewportOptions.length === 2 && viewportOptions.every((o) => /^[yn]\n?$/.test(o.value));
   if (
     screen &&
     (screenIsCredentialField(screen.text) ||
-      (pickerOptions.length === 0 && screenIsYesNoPrompt(screen.text)))
+      (!viewportOffersYesNo && screenIsYesNoPrompt(screen.text)))
   ) {
     log.warn("concierge", "refused a write into a credential prompt", { agentId });
     return { ok: false, path: "blocked-prompt", agentId };
