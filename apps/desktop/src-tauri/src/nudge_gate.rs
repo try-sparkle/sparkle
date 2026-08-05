@@ -237,14 +237,18 @@ pattern!(
 /// `session_limit_options_present`.
 const MIN_OPTIONS_PRESENT: usize = 2;
 
-/// TS `MAX_TRAILING_ROWS`. The bottom-anchored rule: a live Ink dialog IS the bottom of the grid,
-/// whereas a document quoting it continues underneath.
+/// TS `MAX_CHROME_BELOW_FOOTER`. The bottom-anchored rule: a live Ink dialog IS the bottom of the
+/// grid, whereas a document quoting it continues underneath.
 ///
-/// ZERO on evidence — all four pickers captured verbatim from Claude Code 2.1.220 in
-/// `capturedScreens.fixture.ts` end at their footer, with at most a trailing BLANK line (ignored
-/// here). At 3, a markdown file quoting the screen would match the moment its closing fence was the
-/// only row beneath the footer, which is one line.
-const MAX_TRAILING_ROWS: usize = 0;
+/// THIS WAS ZERO, AND ZERO WAS MEASURED AGAINST THE WRONG SCREENS. The old argument was that all
+/// four pickers captured from 2.1.220 end at their footer — but none of those four is the
+/// SESSION-LIMIT picker, and when that screen was captured in situ it carried FIVE rows of
+/// persistent chrome beneath its footer. A zero-row rule rejects the one screen this gate exists to
+/// recognize. Both ports were green because each tested its own fixtures (bead `sparkle-d2i0c`).
+///
+/// The rule is now "nothing UNRECOGNIZED follows", which keeps the anti-prose property zero was
+/// protecting: prose and code fences are not chrome, so a document quoting the screen still fails.
+const MAX_CHROME_BELOW_FOOTER: usize = 8;
 
 /// TS `MAX_OPTION_FOOTER_GAP`. How many rendered rows may separate the LAST option row from the
 /// footer — what makes "the same rendered frame" precise. Eight, measured: the gap across the four
@@ -327,6 +331,67 @@ fn is_opening_border(line: &str) -> bool {
     line.chars().any(|c| matches!(c, '╭' | '╮' | '┌' | '┐' | '┏' | '┓'))
 }
 
+/// TS `AMBIENT_CHROME_LINE`, ported shape-for-shape — the persistent chrome Claude Code paints
+/// below an open dialog. Kept in step by `ported_typescript_patterns_have_not_drifted`.
+///
+/// Four alternatives, after optional leading space/tab/NBSP:
+///   1. a single status glyph (warning, pause, play, diamond, dot, check, cross, spinner frames),
+///   2. a run of 4+ rule characters that IS THE WHOLE ROW,
+///   3. a frame edge then 4+ rule characters, again ending the row,
+///   4. an EMPTY composer: an optional frame edge, then a caret and nothing but whitespace after.
+///
+/// Alternative 4 is why this is not simply "starts with a box glyph": the composer's caret row is
+/// chrome ONLY when empty. A caret with text after it is the user typing, which is content.
+fn is_ambient_chrome_line(line: &str) -> bool {
+    const STATUS: &[char] = &['⚠', '⏸', '▶', '◆', '●', '✓', '✗', '✻', '✽', '✢'];
+    const RULE: &[char] = &['─', '━', '═', '▔', '▁', '_'];
+    const HEAVY_RULE: &[char] = &['─', '━', '═'];
+    const EDGE: &[char] = &['│', '|'];
+    const CARET: &[char] = &['❯', '›', '>'];
+    fn is_sp(c: char) -> bool {
+        c == ' ' || c == '\t' || c == '\u{a0}'
+    }
+
+    let rest = line.trim_start_matches(is_sp);
+    let Some(first) = rest.chars().next() else {
+        return false; // a blank line is handled by the caller, not here
+    };
+
+    // 1. a lone status glyph.
+    if STATUS.contains(&first) {
+        return true;
+    }
+    // 2. a run of rule characters, 4 or more, THAT IS THE WHOLE ROW.
+    //
+    // The trailing check is the guard, not the count. Matching a four-glyph PREFIX and ignoring the
+    // rest reads `──── Do you want to continue?` as chrome — a LIVE PROMPT discounted as
+    // decoration, after which `escape_refusal` arms a keystroke at it (knightwatch probe 1 on
+    // PR #1290). The TS pattern this was ported from had the same hole.
+    if RULE.contains(&first) {
+        let run = rest.chars().take_while(|c| RULE.contains(c)).count();
+        if run >= 4 && rest.chars().skip(run).all(is_sp) {
+            return true;
+        }
+    }
+    // 3./4. anything else must start at a frame edge, or be a bare caret row.
+    let at_edge = EDGE.contains(&first);
+    let after_edge = if at_edge { &rest[first.len_utf8()..] } else { rest };
+    let body = after_edge.trim_start_matches(is_sp);
+    let Some(c) = body.chars().next() else {
+        return false; // an edge with nothing after it is a frame, not chrome we recognize
+    };
+    // 3. edge then a heavy rule run — which must END the row, for the same reason.
+    if at_edge && HEAVY_RULE.contains(&c) {
+        let run = body.chars().take_while(|c| HEAVY_RULE.contains(c)).count();
+        return run >= 4 && body.chars().skip(run).all(is_sp);
+    }
+    // 4. a caret with nothing but whitespace after it.
+    if CARET.contains(&c) {
+        return body[c.len_utf8()..].chars().all(is_sp);
+    }
+    false
+}
+
 /// A CLOSING box border — the only decoration the trailing budget may spend its one slot on.
 ///
 /// `is_separator_row && !is_opening_border` is NOT the same predicate (roborev 58571). It frees any
@@ -344,9 +409,9 @@ fn is_closing_border(line: &str) -> bool {
 ///
 /// Requires ALL of: the mandatory reset label, at least `MIN_OPTIONS_PRESENT` labels overall, the
 /// shared `selection_cursor` (so a markdown blockquote's `>` cannot qualify), a picker footer
-/// BELOW the options, and at most `MAX_TRAILING_ROWS` rows after that footer once blanks and a
-/// SINGLE closing-border row are discounted — an opening border always counts, and so does a bare
-/// `─` transcript divider, which is decoration but closes nothing (roborev 58557, 58571).
+/// BELOW the options, and NOTHING UNRECOGNIZED after that footer: blanks, up to
+/// `MAX_CHROME_BELOW_FOOTER` ambient-chrome rows, and one closing border are free; an opening
+/// border never is (roborev 58557, 58571; bead `sparkle-d2i0c` for why zero was wrong).
 pub fn screen_is_session_limit_picker(text: &str) -> bool {
     // The label half, mirroring TS `hasSessionLimitOptions`. Reset is mandatory: both "Switch to …"
     // labels are generic enough to appear on some other settings picker, whereas "stop and wait for
@@ -409,31 +474,32 @@ pub fn screen_is_session_limit_picker(text: &str) -> bool {
     {
         return false;
     }
-    // Rule (4): bottom-anchored — and BOUNDED, which the first version of this was not.
+    // Rule (4): bottom-anchored — nothing UNRECOGNIZED may follow the footer.
     //
-    // A bordered dialog closes with `╰────╯` beneath its footer, so that one row must be free or
-    // the separator rule above would accept a bordered render this rule then rejects. But my first
-    // pass discounted EVERY decoration row, unbounded, on a budget whose own documentation argues
-    // for exactness "in the dangerous direction" — so an arbitrarily long decoration run, or the
-    // `╭──────╮` top border of the live input box clipped by the viewport, scored zero and armed
-    // the keystroke (roborev 58557). The motivation needs exactly one row; it gets exactly one.
-    let mut trailing = 0usize;
+    // Free below the footer, in any order: blanks; up to `MAX_CHROME_BELOW_FOOTER` ambient-chrome
+    // rows; and ONE closing border, which is not chrome (a corner is outside the chrome class) but
+    // is the bordered dialog's own bottom edge. An OPENING border is never free at all — a frame
+    // starting below the footer is the shape that would arm Esc at a dialog somebody is answering
+    // (roborev 58557/58571). The old rule allowed none of the chrome and rejected the real screen.
+    let mut chrome_below = 0usize;
     let mut closing_border_budget = 1usize;
     for l in &all[footer_idx + 1..] {
         if l.trim().is_empty() {
             continue; // a blank line was always free, and stays free
         }
-        if is_separator_row(l)
-            && is_closing_border(l)
-            && !is_opening_border(l)
-            && closing_border_budget > 0
-        {
+        if is_opening_border(l) {
+            return false;
+        }
+        if is_separator_row(l) && is_closing_border(l) && closing_border_budget > 0 {
             closing_border_budget -= 1; // the dialog's own closing border, once
             continue;
         }
-        trailing += 1;
+        if !is_ambient_chrome_line(l) || chrome_below >= MAX_CHROME_BELOW_FOOTER {
+            return false;
+        }
+        chrome_below += 1;
     }
-    trailing <= MAX_TRAILING_ROWS
+    true
 }
 
 // ── THE RUNNING-TURN MARKER ───────────────────────────────────────────────────────────────────
@@ -1146,7 +1212,7 @@ mod tests {
     ///
     /// WHAT THIS PINS, stated precisely: the OUTCOME, not any single rule. No individual rule can be
     /// mutated away and make this fail — cursor-on-an-option-row, footer-below-the-options,
-    /// `MAX_OPTION_FOOTER_GAP` and the `MAX_TRAILING_ROWS == 0` bottom-anchor each independently
+    /// `MAX_OPTION_FOOTER_GAP` and the chrome-bounded bottom-anchor each independently
     /// reject this shape. That is defence in depth working as intended, and it is also why a
     /// per-rule mutation check is the wrong instrument here; the rules are pinned individually by
     /// their own tests. This one exists so the composite CANNOT regress silently if several are
@@ -1356,7 +1422,7 @@ mod tests {
         );
     }
 
-    /// `MAX_TRAILING_ROWS` is ZERO, pinned on the ROW COUNT rather than on a paragraph.
+    /// The bottom-anchor admits only RECOGNIZED chrome, pinned on the SHAPE of the trailing row.
     ///
     /// `prose_continuing_beneath_the_picker_disqualifies_it` appends four lines, which fails the
     /// gate at 3 as well as at 0 — so it could not see the constant change, and reverting the Rust
@@ -1490,7 +1556,7 @@ mod tests {
     /// THE TRAILING BUDGET IS BOUNDED, which my first version of the border accommodation was not.
     ///
     /// Discounting every decoration row without limit spent slack in the direction
-    /// `MAX_TRAILING_ROWS`'s own doc block refuses. The first case is the concrete regression
+    /// the bottom-anchor's own doc block refuses. The first case is the concrete regression
     /// roborev 58557 named: a scrolled-past picker whose viewport clips the TOP border of the live
     /// input box below scored zero trailing rows and armed `Esc` at whatever was live underneath.
     #[test]
@@ -1511,8 +1577,12 @@ mod tests {
         );
         // …and only one.
         assert!(
-            !screen_is_session_limit_picker(&with_trailing("╰──────────────╯\n────────────────")),
-            "a SECOND decoration row is not free — the budget is one, not unlimited"
+            screen_is_session_limit_picker(&with_trailing("╰──────────────╯\n────────────────")),
+            "a rule BELOW the closing border is ambient chrome — the real screen draws one"
+        );
+        assert!(
+            !screen_is_session_limit_picker(&with_trailing("╰──────────────╯\n╰──────────────╯")),
+            "but a SECOND closing border is not chrome, and the border budget is one"
         );
         // The clipped live input box. Decoration by shape, a live dialog by meaning.
         assert!(
@@ -1542,7 +1612,7 @@ mod tests {
         // Nothing in the corpus was a row carrying both content and a closing glyph, so that
         // conjunct was deletable with every test green. Ink labels its borders — `╰─ press ? for
         // help ─╯`, `└─ tests ─┘` — and discounting one would score zero with genuine content
-        // sitting beneath the footer, which is the exact claim `MAX_TRAILING_ROWS == 0` makes.
+        // sitting beneath the footer, which is the exact claim the bottom-anchor rule makes.
         assert!(
             !screen_is_session_limit_picker(&with_trailing("╰──────────────╯ 3 files changed")),
             "a closing border with CONTENT on the same row is content, not decoration"
@@ -1569,13 +1639,61 @@ mod tests {
         // evidence `is_opening_border` was added to reject, and it was consuming the slot and
         // scoring zero. Before the border work it counted, and the gate refused. These two cases
         // are the difference between the budget's NAME and its behaviour.
+        // THE CONTRACT CHANGED HERE, deliberately (bead `sparkle-d2i0c`). A bare rule used to be
+        // rejected on the reasoning that it "closes nothing". That reasoning was sound and the
+        // premise was wrong: the real session-limit picker draws rules, the composer and status
+        // bars beneath its footer, so rejecting them rejects the one screen this gate exists for.
         assert!(
-            !screen_is_session_limit_picker(&with_trailing("────────────────")),
-            "a bare transcript divider is decoration, but it CLOSES nothing — not free"
+            screen_is_session_limit_picker(&with_trailing("────────────────")),
+            "a rule beneath the footer is ambient chrome, and the real screen draws one"
         );
         assert!(
             !screen_is_session_limit_picker(&with_trailing("│")),
-            "a lone frame side closes nothing either"
+            "a lone frame side is neither a closing border nor recognized chrome"
+        );
+
+        // THE REAL SCREEN, which the zero-row rule rejected: a rule, the composer, a rule, and two
+        // status bars stacked beneath the footer. This is the case bead `sparkle-d2i0c` is about.
+        let real_tail = "────────────────\n│ ❯\n────────────────\n⏸ plan mode\n✻ 2 agents";
+        assert!(
+            screen_is_session_limit_picker(&with_trailing(real_tail)),
+            "five rows of persistent chrome beneath the footer is the REAL captured screen"
+        );
+        // …but the tail is BOUNDED, and prose is not chrome however much of it there is.
+        let too_much = (0..MAX_CHROME_BELOW_FOOTER + 1)
+            .map(|_| "────────────────")
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !screen_is_session_limit_picker(&with_trailing(&too_much)),
+            "one row past MAX_CHROME_BELOW_FOOTER stops being a dialog at the bottom of the grid"
+        );
+        assert!(
+            !screen_is_session_limit_picker(&with_trailing("and then the document keeps going")),
+            "prose beneath the footer is not chrome — this is what keeps the gate off documents"
+        );
+
+        // A RULE IS CHROME ONLY WHEN THE RULE IS THE WHOLE ROW (knightwatch probe 1 on PR #1290).
+        // Matching a four-glyph prefix and ignoring the rest discounts a LIVE PROMPT as decoration
+        // and arms Esc at it. BOTH rule alternatives leaked this way — the bare run and the framed
+        // run — and so did the TS pattern this was ported from.
+        for tail in ["──── Do you want to continue?", "│ ──── Do you want to continue?"] {
+            let screen = with_trailing(tail);
+            assert!(
+                !screen_is_session_limit_picker(&screen),
+                "{tail:?}: a rule with a live prompt after it is content, not chrome"
+            );
+            assert_eq!(
+                escape_refusal(Some(&Screen { text: &screen, alternate: false })),
+                Some(Refusal::AwaitingInput),
+                "{tail:?}: …and the keystroke must be refused"
+            );
+        }
+        // The status-glyph alternative is deliberately NOT anchored: a status bar is a glyph
+        // followed by its own text, so anchoring it would reject the real screen.
+        assert!(
+            screen_is_session_limit_picker(&with_trailing("⏸ plan mode")),
+            "a status glyph with its label is chrome — why alternative 1 carries no anchor"
         );
     }
 
@@ -1759,7 +1877,7 @@ mod tests {
 
         // Credentials outrank the picker, exactly as in `write_refusal`.
         //
-        // The prompt sits ABOVE the dialog deliberately. `MAX_TRAILING_ROWS` is 0, so anything
+        // The prompt sits ABOVE the dialog deliberately. Unrecognized rows are rejected, so anything
         // printed BENEATH the footer disqualifies the frame outright — which would make this test
         // pass for the wrong reason (the recogniser failing, not the ordering holding). Above, the
         // `password:` line still matches `write_block_password_colon` (it is `(?m)`-anchored per
@@ -1854,7 +1972,7 @@ mod tests {
         // so pin the rule itself: these are the load-bearing fragments of each rule, chosen to be
         // stable under formatting.
         // VACUOUS-NEEDLE FIX (knightwatch probe 2 on PR #1261). The first three needles here were
-        // BARE IDENTIFIERS — `MAX_OPTION_FOOTER_GAP`, `MAX_TRAILING_ROWS`,
+        // BARE IDENTIFIERS — `MAX_OPTION_FOOTER_GAP`, `MAX_CHROME_BELOW_FOOTER`,
         // `isSessionLimitOptionLine` — and screenClassifier.ts IMPORTS all three (lines 26/27/29).
         // So each one matched the import statement, and every assertion below stayed green with the
         // rule BODIES deleted outright: precisely the "assertion was already true before the
@@ -1864,7 +1982,7 @@ mod tests {
             // Rule 2a (TS's own numbering — the labels here were swapped, roborev 58564).
             "footerAt - lastOption > MAX_OPTION_FOOTER_GAP",
             // Rule 2b — bottom-anchored.
-            "return trailing <= MAX_TRAILING_ROWS;",
+            "if (!AMBIENT_CHROME_LINE.test(line) || chromeBelow >= MAX_CHROME_BELOW_FOOTER) return false;",
             // Rule 1 — the cursor must sit on OUR option row, not a foreign dialog's.
             //
             // The scan-loop `continue` was pinned here first, and it was VACUOUS in the same way
@@ -1881,9 +1999,8 @@ mod tests {
             "for (let i = lastOption + 1; i < footerAt; i++) {",
             "if (!isSeparatorRow(lines[i]!) || isOpeningBorder(lines[i]!)) return false;",
             // The bounded trailing budget. An unbounded decoration discount is the regression.
-            "isSeparatorRow(line) &&",
-            "isClosingBorder(line) &&",
-            "!isOpeningBorder(line) &&",
+            "if (isOpeningBorder(line)) return false;",
+            "isSeparatorRow(line) && isClosingBorder(line) && closingBorderBudget > 0",
             // THE BUDGET ITSELF. Adding the `isClosingBorder` conjunct silently un-pinned it: the
             // only case that had exercised it used a bare `────` as its second row, which now fails
             // the new conjunct, so it returns false for a reason unrelated to the budget and the
@@ -1945,7 +2062,7 @@ mod tests {
             );
         }
         // The two thresholds are as load-bearing as the patterns: MIN_OPTIONS_PRESENT is what stops
-        // one generic label from qualifying, and MAX_TRAILING_ROWS is the bottom-anchor rule that
+        // one generic label from qualifying, and MAX_CHROME_BELOW_FOOTER bounds the tail that
         // stops prose quoting the picker from matching. A TS-side relaxation of either without the
         // matching Rust change is a silent widening of the exemption.
         // DERIVED FROM THE RUST CONSTANTS, not hardcoded. These read `= 2;` / `= 0;` / `= 8;` as
@@ -1958,7 +2075,7 @@ mod tests {
         // boundary tests pin the off-by-one, and only this loop can pin the VALUE.
         for needle in [
             format!("export const MIN_OPTIONS_PRESENT = {MIN_OPTIONS_PRESENT};"),
-            format!("export const MAX_TRAILING_ROWS = {MAX_TRAILING_ROWS};"),
+            format!("export const MAX_CHROME_BELOW_FOOTER = {MAX_CHROME_BELOW_FOOTER};"),
             format!("export const MAX_OPTION_FOOTER_GAP = {MAX_OPTION_FOOTER_GAP};"),
             r#"export const SESSION_LIMIT_REASON = "session-limit-picker";"#.to_string(),
         ] {

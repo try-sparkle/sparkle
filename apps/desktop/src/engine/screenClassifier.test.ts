@@ -3,7 +3,10 @@ import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import { describe, it, expect } from "vitest";
 import { screenAwaitsInput, isSessionLimitPicker, PICKER_FOOTER } from "./screenClassifier";
-import { MAX_OPTION_FOOTER_GAP } from "../services/sessionLimitScreen";
+import {
+  MAX_OPTION_FOOTER_GAP,
+  MAX_CHROME_BELOW_FOOTER,
+} from "../services/sessionLimitScreen";
 import {
   APPROVAL_2_1_220,
   APPROVAL_OPTION_2_2_1_220,
@@ -374,7 +377,7 @@ describe("isSessionLimitPicker", () => {
   });
 
   // The trailing budget is BOUNDED. Discounting every decoration row without limit spent slack in
-  // the direction MAX_TRAILING_ROWS explicitly refuses: a scrolled-past picker whose viewport clips
+  // the direction the bottom-anchor rule explicitly refuses: a picker whose viewport clips
   // the TOP border of the live input box scored zero and armed the keystroke.
   it("frees exactly one closing-border row beneath the footer, and no more", () => {
     const reset = ["Stop and wait for", "limit to", "reset"].join(" ");
@@ -391,10 +394,10 @@ describe("isSessionLimitPicker", () => {
 
     // The row the accommodation exists for.
     expect(isSessionLimitPicker(withTrailing("\u2570\u2500\u2500\u2500\u2500\u256F"))).toBe(true);
-    // …and only one.
+    // A rule BELOW the closing border is ambient chrome — the real screen draws one.
     expect(
       isSessionLimitPicker(withTrailing("\u2570\u2500\u2500\u2500\u2500\u256F\n\u2500\u2500\u2500\u2500")),
-    ).toBe(false);
+    ).toBe(true);
     // The clipped live input box: decoration by shape, a live dialog by meaning.
     expect(isSessionLimitPicker(withTrailing("\u256D\u2500\u2500\u2500\u2500\u256E"))).toBe(false);
     // Blanks were free before this change and stay free.
@@ -429,8 +432,49 @@ describe("isSessionLimitPicker", () => {
     // The slot is for a CLOSING border, not decoration in general (roborev 58571): the separator
     // class contains `\u2500`, the full-width transcript divider the real TUI draws between
     // segments, and it was consuming the slot while closing nothing.
-    expect(isSessionLimitPicker(withTrailing("\u2500\u2500\u2500\u2500\u2500\u2500"))).toBe(false);
+    // THE CONTRACT CHANGED HERE, deliberately (bead sparkle-d2i0c): a bare rule used to be rejected
+    // because it "closes nothing". Sound reasoning, wrong premise — the real session-limit picker
+    // draws rules, the composer and status bars beneath its footer.
+    expect(isSessionLimitPicker(withTrailing("\u2500\u2500\u2500\u2500\u2500\u2500"))).toBe(true);
+    // A lone frame side is neither a closing border nor recognized chrome.
     expect(isSessionLimitPicker(withTrailing("\u2502"))).toBe(false);
+
+    // THE REAL SCREEN the zero-row rule rejected: rule, composer, rule, and two status bars.
+    expect(
+      isSessionLimitPicker(
+        withTrailing(
+          [
+            "\u2500\u2500\u2500\u2500\u2500\u2500",
+            "\u2502 \u276F",
+            "\u2500\u2500\u2500\u2500\u2500\u2500",
+            "\u23F8 plan mode",
+            "\u273B 2 agents",
+          ].join("\n"),
+        ),
+      ),
+    ).toBe(true);
+    // …bounded, and prose is never chrome — this is what keeps the gate off documents.
+    expect(
+      isSessionLimitPicker(
+        withTrailing(Array(MAX_CHROME_BELOW_FOOTER + 1).fill("\u2500\u2500\u2500\u2500\u2500\u2500").join("\n")),
+      ),
+    ).toBe(false);
+    expect(isSessionLimitPicker(withTrailing("and then the document keeps going"))).toBe(false);
+
+    // A rule is chrome only when the rule IS THE WHOLE ROW (knightwatch probe 1 on PR #1290).
+    // Matching a four-glyph prefix and ignoring the rest discounts a LIVE PROMPT as decoration.
+    // Both rule alternatives leaked this way, and so did the pattern this was ported from.
+    expect(
+      isSessionLimitPicker(withTrailing("\u2500\u2500\u2500\u2500 Do you want to continue?")),
+    ).toBe(false);
+    expect(
+      isSessionLimitPicker(
+        withTrailing("\u2502 \u2500\u2500\u2500\u2500 Do you want to continue?"),
+      ),
+    ).toBe(false);
+    // The status-glyph alternative is deliberately unanchored — a status bar is a glyph followed
+    // by its own text, so anchoring it would reject the real screen.
+    expect(isSessionLimitPicker(withTrailing("\u23F8 plan mode"))).toBe(true);
   });
 
   // Every member of the separator class, one at a time. The bordered fixture above exercises only

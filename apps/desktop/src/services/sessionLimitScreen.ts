@@ -39,9 +39,9 @@
 //   2. the PRD's option labels carry a zero-width space inside each keyword, so they do not match
 //      the literals below at all;
 //   3. a picker FOOTER must be co-present, and the PRD rewrites its footer so it cannot match;
-//   4. the picker must be BOTTOM-ANCHORED — at most {@link MAX_TRAILING_ROWS} rows may follow the
-//      footer, counting everything except blanks and a SINGLE closing-border row — so prose or a
-//      fence continuing beneath it disqualifies the frame.
+//   4. the picker must be BOTTOM-ANCHORED — nothing UNRECOGNIZED may follow the footer: blanks,
+//      up to {@link MAX_CHROME_BELOW_FOOTER} {@link AMBIENT_CHROME_LINE} rows, and one closing
+//      border are free — so prose or a fence continuing beneath it disqualifies the frame.
 //
 // This module deliberately does NOT export a full `isSessionLimitPicker(snapshot)`; that is
 // W-DETECT's deliverable in `engine/screenClassifier.ts`, where the settle-time viewport and the
@@ -105,32 +105,57 @@ export const SESSION_LIMIT_CREDITS_OPTION = /^\s*[│|]?\s*[❯›]?\s*\d+\.\s+s
 /** "3. Switch to Team plan" — changes the user's SUBSCRIPTION. Never machine-selected. */
 export const SESSION_LIMIT_TEAM_OPTION = /^\s*[│|]?\s*[❯›]?\s*\d+\.\s+switch to team plan\b/im;
 
-/** How many non-blank rendered rows may follow the picker's footer.
+/** What may sit BELOW the picker's footer and still leave it "the bottom of the grid".
  *
  *  This is the bottom-anchored rule, and it is what stops prose that merely QUOTES the picker from
  *  matching: a live Ink dialog IS the bottom of the grid, whereas a document continues underneath.
  *
- *  ZERO, on evidence rather than on taste. This constant was 3, reasoned from an assumption that
- *  Claude Code's persistent chrome (the transcript warning, the permission-mode bar) renders below
- *  an open dialog. It does not: all four pickers captured verbatim from 2.1.220 in
- *  `engine/capturedScreens.fixture.ts` — the permission box, its two-option sibling, the
- *  AskUserQuestion menu and the `/model` picker — end at their footer, with at most a trailing
- *  BLANK line (which this rule ignores). A modal picker takes the bottom of the grid.
+ *  IT WAS ZERO, AND ZERO WAS WRONG — measured against the wrong screens. The argument was that all
+ *  four pickers captured from 2.1.220 end at their footer, so nothing but a blank may follow. Those
+ *  four are the permission box, its two-option sibling, the AskUserQuestion menu and `/model` — and
+ *  none of them is the SESSION-LIMIT picker. When that screen was finally captured in situ it had
+ *  FIVE rows of persistent chrome stacked beneath the footer (a rule, the composer, a rule, and two
+ *  status bars), so a zero-row rule rejects the one screen this whole feature exists to detect. The
+ *  ports were independently green because each tested its own fixtures; the contradiction only
+ *  surfaced when the two branches met (bead `sparkle-d2i0c`, and knightwatch probe 1 on PR #1261).
  *
- *  WHAT "non-blank" MEANS HERE (roborev 58557): blanks are free, and so is ONE closing-border row,
- *  because a bordered dialog draws its `╰────╯` beneath the footer. Exactly one — an unbounded
- *  decoration allowance is slack in the direction this doc block refuses, and an OPENING border
- *  (`╭──────╮`) is never free at all, since it is positive evidence a different frame starts
- *  there. Neither is a bare `────────` transcript divider: it is decoration, but it CLOSES nothing,
- *  and the real TUI draws one between segments. The free row must carry a closing corner. Both
- *  ports implement this identically; see `nudge_gate.rs::is_closing_border`.
+ *  So the rule is no longer "nothing follows" but "nothing UNRECOGNIZED follows", which keeps the
+ *  anti-prose property that motivated zero. Below the footer we accept, in any order:
  *
- *  Any slack here is spent in the dangerous direction. At 3, a markdown file quoting the screen
- *  matches the moment its closing ``` fence is the only thing beneath the footer — one line — and
- *  the whole point of this rule is that reviewing the PRD which specifies this feature must not
- *  arm it. A false negative costs one un-resumed agent a human can still unstick by hand; a false
- *  positive presses Esc at a dialog somebody was mid-answer on. So: exact. */
-export const MAX_TRAILING_ROWS = 0;
+ *    - BLANK lines, unbounded — always were.
+ *    - Up to {@link MAX_CHROME_BELOW_FOOTER} lines matching {@link AMBIENT_CHROME_LINE}: the
+ *      status glyphs, horizontal rules and empty composer caret Claude Code paints persistently.
+ *    - ONE closing-border row (`╰────╯`), because a bordered dialog draws its own bottom edge
+ *      there. Exactly one, and an OPENING border (`╭──────╮`) is never free at all — that is
+ *      positive evidence a DIFFERENT frame starts below, which is the shape that would arm `Esc`
+ *      at a dialog somebody is mid-answer on (roborev 58557/58571).
+ *
+ *  A bare `────────` transcript divider is admitted by the chrome class, not by the border rule —
+ *  it is chrome and it closes nothing. Prose, code fences and option rows are none of these, so a
+ *  markdown file quoting this screen still fails: the fence beneath the footer is not chrome.
+ *
+ *  The asymmetry that set the old bound still holds and still argues for a TIGHT class rather than
+ *  a large budget: a false negative costs one un-resumed agent a human can unstick by hand; a false
+ *  positive presses `Esc` at a live dialog. The fix for the false negative is to RECOGNIZE more
+ *  precisely, never to count more loosely. */
+export const MAX_CHROME_BELOW_FOOTER = 8;
+
+/** The persistent chrome Claude Code paints below an open dialog, as one shared pattern so the two
+ *  ports cannot disagree about what "recognized" means. Ported byte-for-byte into
+ *  `nudge_gate.rs::is_ambient_chrome_line`, which `ported_typescript_patterns_have_not_drifted`
+ *  pins at `cargo test` time.
+ *
+ *  Written as escapes, not glyphs: the glyph-icon ratchet reads a literal class here as one more
+ *  affordance drawn with a character, and it is not — these are bytes we RECOGNIZE, not bytes we
+ *  render. Escapes also keep the codepoints legible.
+ *
+ *    status  \u26a0 ⚠  \u23f8 ⏸  \u25b6 ▶  \u25c6 ◆  \u25cf ●  \u2713 ✓  \u2717 ✗
+ *            \u273b ✻  \u273d ✽  \u2722 ✢
+ *    rules   \u2500 ─  \u2501 ━  \u2550 ═  \u2594 ▔  \u2581 ▁  and a run of underscores
+ *    frame   \u2502 │  with a rule after it
+ *    caret   \u276f ❯  \u203a ›  or a bare > — an EMPTY composer only, hence the `$` */
+export const AMBIENT_CHROME_LINE =
+  /^[ \t\u00a0]*(?:[\u26a0\u23f8\u25b6\u25c6\u25cf\u2713\u2717\u273b\u273d\u2722]|[\u2500\u2501\u2550\u2594\u2581_]{4,}[ \t\u00a0]*$|[\u2502|][ \t\u00a0]*[\u2500\u2501\u2550]{4,}[ \t\u00a0]*$|[\u2502|]?[ \t\u00a0]*[\u276f\u203a>][ \t\u00a0]*$)/u;
 
 /** How many rendered rows may separate the LAST option row from the picker's footer.
  *

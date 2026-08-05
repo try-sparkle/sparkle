@@ -24,7 +24,8 @@
 // classifier uses. See `isSessionLimitPicker` below.
 import {
   MAX_OPTION_FOOTER_GAP,
-  MAX_TRAILING_ROWS,
+  MAX_CHROME_BELOW_FOOTER,
+  AMBIENT_CHROME_LINE,
   hasSessionLimitOptions,
   isSessionLimitOptionLine,
 } from "../services/sessionLimitScreen";
@@ -285,27 +286,29 @@ export function isSessionLimitPicker(snapshot: string): boolean {
     if (!isSeparatorRow(lines[i]!) || isOpeningBorder(lines[i]!)) return false;
   }
 
-  // Rule 2b — bottom-anchored, and BOUNDED. A bordered dialog closes with `╰────╯` beneath its
-  // footer, so that ONE row is free; discounting every decoration row without limit spent slack in
-  // the dangerous direction the MAX_TRAILING_ROWS doc block explicitly refuses, letting a clipped
-  // `╭──────╮` from the live input box score zero (roborev 58557).
-  let trailing = 0;
+  // Rule 2b — bottom-anchored: nothing UNRECOGNIZED may follow the footer.
+  //
+  // This was "nothing but a blank and one closing border", and that rejected the real screen. The
+  // session-limit picker renders with five rows of persistent chrome stacked beneath it; the four
+  // captured screens the old bound was measured against are all OTHER dialogs. See the doc block on
+  // MAX_CHROME_BELOW_FOOTER. Free below the footer, in any order: blanks; up to
+  // MAX_CHROME_BELOW_FOOTER ambient-chrome rows; and ONE closing border, which is not chrome (a
+  // corner is outside the chrome class) but is the bordered dialog's own bottom edge. An OPENING
+  // border is never free — a new frame starting below is what would arm Esc at a live dialog.
+  let chromeBelow = 0;
   let closingBorderBudget = 1;
   for (let i = footerAt + 1; i < lines.length; i++) {
     const line = lines[i]!;
-    if (!line.trim()) continue; // a blank line was always free
-    if (
-      isSeparatorRow(line) &&
-      isClosingBorder(line) &&
-      !isOpeningBorder(line) &&
-      closingBorderBudget > 0
-    ) {
-      closingBorderBudget--; // the dialog's own closing border, once
+    if (!line.trim()) continue;
+    if (isOpeningBorder(line)) return false;
+    if (isSeparatorRow(line) && isClosingBorder(line) && closingBorderBudget > 0) {
+      closingBorderBudget--;
       continue;
     }
-    trailing++;
+    if (!AMBIENT_CHROME_LINE.test(line) || chromeBelow >= MAX_CHROME_BELOW_FOOTER) return false;
+    chromeBelow++;
   }
-  return trailing <= MAX_TRAILING_ROWS;
+  return true;
 }
 
 /**
