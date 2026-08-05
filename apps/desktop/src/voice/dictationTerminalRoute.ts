@@ -39,6 +39,24 @@ import { screenAwaitsInput } from "../engine/screenClassifier";
 import type { TerminalViewport } from "../services/terminalViewport";
 
 /**
+ * The `(yes/no)` arm ALONE — the one member of {@link WRITE_BLOCKING_PROMPTS} (declared below, since
+ * that list references this constant) that a live picker may waive.
+ *
+ * ══ WHY THIS IS SEPARATED (roborev 58529) ═══════════════════════════════════════════════════════
+ * `conciergeDispatch` needs to refuse credential prompts while still ANSWERING pickers, and a first
+ * cut waived the whole predicate whenever any options were detected. That was wrong in a way that
+ * REPORTED SUCCESS: `CHOICE_KEYWORD` contains `enter`, so `Enter your vault password:` under a
+ * still-visible `1) … 2) …` run parses as a menu, the guard was skipped, and a terse "1" was
+ * submitted as `1\r` INTO THE CONCEALED FIELD with `ok: true, path: "picker-option"`.
+ *
+ * Only the yes/no shape is genuinely ambiguous between "a prompt that must not receive free text"
+ * and "a picker the dispatcher answers". Every other arm — a password/passphrase line, the
+ * `CREDENTIAL_WORD` tail, `type "yes" to confirm` — is a field, never a menu, and must block no
+ * matter what the scrollback happens to still contain.
+ */
+const YES_NO_PROMPT = /\(\s*yes\s*\/\s*no/i;
+
+/**
  * Prompts that must block a WRITE but that `screenAwaitsInput` does not catch.
  *
  * ══ WHY THIS LIST EXISTS AT ALL (roborev 56022) ═════════════════════════════════════════════════
@@ -56,24 +74,18 @@ import type { TerminalViewport } from "../services/terminalViewport";
  * mentions a password or passphrase blocks, which will occasionally refuse over ordinary prose
  * ("Steps to reset your password:"). That costs the user one repeated phrase. The opposite error
  * costs them a password typed into a terminal, in the clear, and possibly submitted.
- */
-/**
- * The `(yes/no)` arm ALONE — the one member of the list above that a live picker may waive.
  *
- * ══ WHY THIS IS SEPARATED (roborev 58529) ═══════════════════════════════════════════════════════
- * `conciergeDispatch` needs to refuse credential prompts while still ANSWERING pickers, and a first
- * cut waived the whole predicate whenever any options were detected. That was wrong in a way that
- * REPORTED SUCCESS: `CHOICE_KEYWORD` contains `enter`, so `Enter your vault password:` under a
- * still-visible `1) … 2) …` run parses as a menu, the guard was skipped, and a terse "1" was
- * submitted as `1\r` INTO THE CONCEALED FIELD with `ok: true, path: "picker-option"`.
+ * ══ THE `(yes/no)` ARM IS COUPLED TO THE PICKER DETECTOR — CHANGE BOTH OR NEITHER ═══════════════
+ * `services/suggestions/heuristics`' `YN` matches the same shape, because a confirmation is BOTH "a
+ * picker the dispatcher answers" and "a prompt free text must not be pasted into".
+ * `services/conciergeDispatch` resolves the overlap: it refuses the prompt unless that detector
+ * reports the y/n pair, in which case it answers instead.
  *
- * Only the yes/no shape is genuinely ambiguous between "a prompt that must not receive free text"
- * and "a picker the dispatcher answers". Every other arm — a password/passphrase line, the
- * `CREDENTIAL_WORD` tail, `type "yes" to confirm` — is a field, never a menu, and must block no
- * matter what the scrollback happens to still contain.
+ * The coupling is invisible from either file alone, and it cost SIX review rounds (roborev 58512 →
+ * 58575) — every one the same shape: this guard and that detector disagreeing about what was on
+ * screen, through a different region, a different source, or a shape one matched and the other did
+ * not. `heuristics` now carries the mirror of this note on `YN`.
  */
-const YES_NO_PROMPT = /\(\s*yes\s*\/\s*no/i;
-
 const WRITE_BLOCKING_PROMPTS: RegExp[] = [
   /\bpass(word|phrase)\b[^\n]*:\s*$/im,
   // THE SAME OBJECT as `YES_NO_PROMPT`, not a second literal with the same source. That identity is
@@ -83,7 +95,6 @@ const WRITE_BLOCKING_PROMPTS: RegExp[] = [
   YES_NO_PROMPT,
   /\btype\s+["']?yes["']?\b/i,
 ];
-
 
 /**
  * Words that mark a line as a CREDENTIAL PROMPT. Broader than "password" on purpose (roborev 56047):

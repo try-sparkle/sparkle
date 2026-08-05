@@ -14,7 +14,22 @@ export const TAIL_LINES = 12;
 // by this one and added no behavior.)
 /** Exported so the concierge's picker fingerprint can decide whether a screen with no option run is
  *  a y/n confirmation or simply a dialog it failed to locate — those must not be conflated, because
- *  the second one is unsafe to fingerprint at all (roborev 55182). One definition, not two. */
+ *  the second one is unsafe to fingerprint at all (roborev 55182). One definition, not two.
+ *
+ *  ══ A WRITE GUARD KEYS OFF THIS SAME SHAPE — CHANGE BOTH OR NEITHER ═══════════════════════════
+ *  `voice/dictationTerminalRoute`'s `WRITE_BLOCKING_PROMPTS` carries its own `(yes/no)` pattern,
+ *  because a confirmation is both "a picker the dispatcher ANSWERS" and "a prompt free text must not
+ *  be pasted into". `services/conciergeDispatch` resolves that overlap: it refuses the prompt unless
+ *  THIS detector reports the y/n pair, in which case it answers instead.
+ *
+ *  So the two are coupled, and the coupling is invisible from either file alone. It cost SIX review
+ *  rounds (roborev 58512 → 58575), every one the same shape: the guard and the detector disagreeing
+ *  about what was on screen — different regions, different sources, or a shape one matched and the
+ *  other did not. Widening or narrowing `YN` here silently moves what that guard refuses.
+ *
+ *  If you change this pattern, or the branch order below that decides whether `YN` is reached at
+ *  all, read `dictationTerminalRoute`'s `matchesBlockingPrompt` and `conciergeDispatch`'s credential
+ *  arm in the same sitting. */
 export const YN = /\b(y\/n|yes\/no)\b|\[y\/n\]|\[yes\/no\]/i;
 /** Exported so the concierge's fingerprint can locate a generic menu's rows with the DETECTOR'S
  *  pattern rather than a wider one of its own — a locator that accepts a line the parser rejects
