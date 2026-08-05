@@ -291,13 +291,22 @@ describe("(e) the host tells the reader when the reveal had nothing to do", () =
    *  expands its head before revealing it, and whether THOSE writes changed anything is the one
    *  piece of logic that can flip an already-showing prediction back to "revealed". It had no test
    *  at all: deleting the whole `surfaced` computation left the suite green (roborev 58705). */
-  function nestedNudgeFeed() {
+  /** Defaults reproduce the ORIGINAL shape: a `done` head with a `needs_you` worker. The two bands
+   *  must DIFFER — a worker whose band its head already carries is `representedElsewhere`, and the
+   *  nudge for it is suppressed, so a same-band pair renders no card to click at all. */
+  function nestedNudgeFeed(headBand = "done", workerBand = "needs_you") {
     const feed = JSON.parse(JSON.stringify(FEED_P2));
     const counts = { needs_you: 1, running: 0, done: 0 };
-    const head = { ...feed.projects[1].agents[0], id: "head2", name: "Head 2", parentRowId: null };
+    const head = {
+      ...feed.projects[1].agents[0],
+      id: "head2",
+      name: "Head 2",
+      parentRowId: null,
+      band: headBand,
+    };
     const worker = {
       ...feed.projects[1].agents[0],
-      band: "needs_you",
+      band: workerBand,
       status: "waiting",
       parentRowId: "head2",
     };
@@ -353,7 +362,9 @@ describe("(e) the host tells the reader when the reveal had nothing to do", () =
     // "a row appeared" swallowed the sentence for a genuinely already-showing agent.
     useUiStore.setState({
       collapsedOrchestrators: { head2: false },
-      statusFilter: { needs_you: true, running: false, done: false },
+      // `done` — the HEAD's band, which is what gates the row — stays on. `running` is the band
+      // belonging to nobody here, and switching it off must change nothing.
+      statusFilter: { needs_you: true, running: false, done: true },
     } as never);
     render(<ConciergeHost feed={nestedNudgeFeed()} />);
 
@@ -362,6 +373,71 @@ describe("(e) the host tells the reader when the reveal had nothing to do", () =
     );
 
     expect(document.body.textContent ?? "").toMatch(/Build 8 is already open in other\./i);
+  });
+
+  it("(nested) reads the HEAD's band, not the worker's — a drawn head means the row was up", () => {
+    // Isolate `needs_you`. The head rolls up red so it is DRAWN and expanded, and every worker under
+    // it is on screen — workers are never band-filtered themselves (engine/buildSections filters the
+    // top-level list only). A `done` worker there did not move, so the sentence is owed. Reading the
+    // WORKER's band called this "a row appeared" and swallowed it (roborev 58713).
+    seedAlreadyShowing();
+    setConciergeChat(() => []);
+    useUiStore.setState({
+      collapsedOrchestrators: { head2: false },
+      // THE DISCRIMINATOR: the HEAD's band (`done`) is ON, so its row is drawn and its workers are
+      // on screen with it. The WORKER's own band (`needs_you`) is OFF — which is irrelevant, because
+      // workers are never band-filtered. Reading the worker's band here calls this "a row appeared"
+      // and swallows the sentence; reading the head's band gets it right.
+      statusFilter: { needs_you: false, running: true, done: true },
+    } as never);
+    render(<ConciergeHost feed={nestedNudgeFeed()} />);
+
+    fireEvent.click(
+      within(screen.getByTestId("concierge-nudge")).getByTestId("concierge-agent-pill"),
+    );
+
+    expect(document.body.textContent ?? "").toMatch(/is already open in other\./i);
+  });
+
+  it("(nested) a worker under a FILTERED-OUT head was not drawable, whatever its own band", () => {
+    // The mirror: isolate `running`. The head rolls up red and is filtered OUT, so its worker is not
+    // on screen at all — clearing the filter puts the whole subtree up, which IS a visible result.
+    // Reading the worker's own `running` band said "nothing was hidden" and produced a sentence
+    // contradicting the screen.
+    seedAlreadyShowing();
+    setConciergeChat(() => []);
+    useUiStore.setState({
+      collapsedOrchestrators: { head2: false },
+      statusFilter: { needs_you: false, running: true, done: false },
+    } as never);
+    render(<ConciergeHost feed={nestedNudgeFeed("needs_you", "running")} />);
+
+    fireEvent.click(
+      within(screen.getByTestId("concierge-nudge")).getByTestId("concierge-agent-pill"),
+    );
+
+    expect(document.body.textContent ?? "").not.toMatch(/is already open in/i);
+  });
+
+  it("(top-level) a row whose OWN band is filtered off is not showing either", () => {
+    // Top-level rows ARE the population `groupAgentsByStage` band-filters. Skipping the filter term
+    // (and the clear) for them left a `done` agent undrawn while the caller announced it was
+    // already open — newly reachable once `parentRowId` was corrected to `null`, because these
+    // agents used to fall down the nested branch, which cleared the filter (roborev 58713).
+    seedAlreadyShowing();
+    setConciergeChat(() => []);
+    useUiStore.setState({
+      collapsedOrchestrators: {},
+      // `nudgeFeed()`'s agent is `needs_you`, and it is TOP-LEVEL — so this is its own row's band.
+      statusFilter: { needs_you: false, running: true, done: true },
+    } as never);
+    render(<ConciergeHost feed={nudgeFeed()} />);
+
+    fireEvent.click(
+      within(screen.getByTestId("concierge-nudge")).getByTestId("concierge-agent-pill"),
+    );
+
+    expect(document.body.textContent ?? "").not.toMatch(/is already open in/i);
   });
 
   it("still NAVIGATES — and stays silent — when there really is somewhere to go", () => {

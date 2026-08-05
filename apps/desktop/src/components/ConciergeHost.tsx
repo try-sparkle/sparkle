@@ -2606,8 +2606,11 @@ export function ConciergeHost({
    * and is tracked as bead `sparkle-bel2` (raised by roborev 53740) — stated here rather than left
    * for the docstring to imply it is closed, which would be worse than leaving it undocumented.
    *
-   * A top-level agent passes through untouched — it owns its row, so there is nothing to expand and
-   * no filter to clear.
+   * A top-level agent owns its row, so there is nothing to EXPAND for it — but there is very much a
+   * filter to clear, and an earlier version of this sentence said otherwise and was wrong
+   * (roborev 58713). Top-level rows are exactly what `groupAgentsByStage` band-filters
+   * (engine/buildSections — `if (!visibleBands[bandOf(agent.id)]) continue`), so skipping the clear
+   * for them left a `done` agent undrawn while the caller announced it was already open.
    */
   const revealAgent = useCallback((a: ConciergeAgent): RevealOutcome => {
     // TAKEN FIRST, before anything below writes. Same reason `openAgentFromPill` takes it first:
@@ -2619,25 +2622,45 @@ export function ConciergeHost({
     // was collapsed would otherwise be reported as "already showing" while a row the reader could
     // not see a moment ago appears. Measured rather than assumed: both setters are no-ops when the
     // state already holds, so this is only true when something really was hidden.
-    let surfaced = false;
-    // `!= null`, NOT `!== null`. `ConciergeAgent.parentRowId` is typed `string | null` and the feed
-    // always sets it, but a hand-built fixture that omits it yields `undefined` — which `!== null`
-    // waves through into this branch, where `collapsedOrchestrators[undefined] ?? true` reads
-    // `true` and reports a top-level agent as "its row was hidden". That is not hypothetical: it is
-    // how this commit's own caller-owned test came to pass for the wrong reason (roborev 58705).
-    if (a.parentRowId != null) {
-      const ui = useUiStore.getState();
-      // SCOPED TO THIS AGENT'S OWN BAND. The question is "was the row the reader just asked for
-      // undrawable", not "was any row hidden anywhere" — and the difference is the common case, not
-      // a corner: isolating a band is a one-click designed affordance (the needs-you filter, the
-      // helper chiclets), so `running`/`done` being off is an ordinary resting state. Asking the
-      // broad question there reported a genuinely already-showing agent as "revealed" and went
-      // silent — this commit's own bug, reintroduced by its own fix (roborev 58705).
-      surfaced =
-        !ui.statusFilter[a.band] || (ui.collapsedOrchestrators[a.parentRowId] ?? true);
-      ui.showAllStatusBands();
-      ui.expandOrchestrators([a.parentRowId]);
-    }
+    const ui = useUiStore.getState();
+    // ── WAS THE ROW THE READER ASKED FOR ACTUALLY DRAWABLE? ────────────────────────────────────
+    //
+    // THE BAND THAT GATES A ROW IS NOT ALWAYS THAT AGENT'S OWN. The sidebar band-filters exactly
+    // ONE population — the TOP-LEVEL rows — and does it by the head's ROLLED-UP band
+    // (AgentSidebar's `groupAgentsByStage(topLevelOf(...), …, statusFilter, rowBandOf)` →
+    // engine/buildSections `if (!visibleBands[bandOf(agent.id)]) continue`). Workers are never in
+    // that list: they render from `childrenByParent` under any head that is drawn and expanded. So
+    // a worker's drawability is its HEAD's band plus the head's collapse state, and using the
+    // worker's own band was wrong in both directions (roborev 58713):
+    //
+    //   • SILENT CLICK — isolate `needs_you`; a head with a waiting worker rolls up red, so it is
+    //     drawn and expanded and every worker under it is on screen. Clicking a `done` worker there
+    //     read `!statusFilter["done"]` as "its row was hidden" and swallowed the sentence, though
+    //     nothing moved. That is the very defect this branch exists to remove.
+    //   • FALSE SENTENCE — isolate `running`; a head rolling up red is filtered OUT, so its
+    //     `working` worker is not drawable. Clicking it read `!statusFilter["running"]` as false,
+    //     so the host announced "…is already open" immediately after `showAllStatusBands()` had put
+    //     the head and its whole subtree on screen.
+    //
+    // Resolved through `feedRef` rather than a closed-over helper so this callback keeps its empty
+    // dep list — a fresh identity here would invalidate the context value every render.
+    const head =
+      a.parentRowId != null
+        ? allAgents(feedRef.current).find((x) => x.id === a.parentRowId)
+        : undefined;
+    // A nested agent whose head is not in the feed has no row to be drawn under at all, so it
+    // cannot have been showing — `undefined` reads as hidden rather than as visible.
+    const rowBand = a.parentRowId != null ? head?.band : a.band;
+    const surfaced =
+      rowBand === undefined ||
+      !ui.statusFilter[rowBand] ||
+      (a.parentRowId != null && (ui.collapsedOrchestrators[a.parentRowId] ?? true));
+    // UNCONDITIONAL, because top-level rows are band-filtered too — that is the population
+    // `groupAgentsByStage` filters. Guarding this behind `parentRowId != null` left a `done`
+    // top-level agent undrawn while the caller said it was already open (roborev 58713).
+    ui.showAllStatusBands();
+    // …whereas EXPANDING only means anything for a row that nests under another one.
+    if (a.parentRowId != null) ui.expandOrchestrators([a.parentRowId]);
     // NO UP-FRONT BAIL ON A `"gone"` PREDICTION, unlike `openAgentFromPill`. That guard exists there
     // because a doomed `openProjectTab` would yank the reader to another project's tab and only then
     // report the miss (roborev 55548) — a notice contradicting what just happened on screen. This
