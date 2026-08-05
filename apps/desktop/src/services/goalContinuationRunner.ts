@@ -43,6 +43,7 @@ import { APP_WINDOW_LABEL } from "../windowContext";
 import { livenessOf } from "./agentLiveness";
 import { notifyAttention } from "./attention";
 import { agentCanAcceptInput, dispatchConciergeAnswer } from "./conciergeDispatch";
+import type { ConciergeDispatchPath } from "./conciergeDispatch";
 import { log } from "../logger";
 import { findWindowForProject } from "./windowRegistry";
 import { routeToOwningWindow } from "./windowOwnership";
@@ -203,11 +204,117 @@ let idleClock: Map<string, number> = new Map();
  *  idle-clock re-arm below only lands after the await, so without this a second sweep starting
  *  while a slow PTY write is still pending would decide to send again off the pre-send clock. */
 const inFlight = new Set<string>();
+/** agentId → how many auto-continues IN A ROW never reached the terminal, and the path the last one
+ *  refused on. See {@link MAX_UNDELIVERED_CONTINUES}. Cleared by a delivery and by an escalation. */
+const undelivered = new Map<string, { count: number; path: string }>();
 
-/** Test seam: forget the idle clock and any in-flight sends. */
+/** Test seam: forget the idle clock, any in-flight sends, and the undelivered streaks. */
 export function _resetGoalContinuationRunnerForTests(): void {
   idleClock = new Map();
   inFlight.clear();
+  undelivered.clear();
+}
+
+/**
+ * How many consecutive auto-continues may fail to REACH the terminal before we stop retrying and
+ * tell the human.
+ *
+ * This is a different bound from `MAX_CONTINUES_WITHOUT_PROGRESS`, and conflating them is the bug it
+ * was added for. That one asks "we restarted the agent and it still isn't moving" — it counts
+ * DELIVERED sends, and `continueAgent` deliberately records a retry only after a delivery it watched
+ * succeed, so an undelivered send costs nothing from that budget. Correct, and by itself
+ * open-ended: a send that is refused for a STRUCTURAL reason is refused identically on every sweep,
+ * so the pair "try, get refused, re-arm the settle window" repeats for as long as the condition
+ * holds. Observed in the field as an agent whose pane sat in a full-screen app: the auto-resume was
+ * refused at the dispatch chokepoint every ~45s for over five hours, ~400 times, and the only trace
+ * was a WARN line. The agent never moved, the goal was never met, and nobody was told.
+ *
+ * Three is the same shape as the progress bound for the same reason — enough to ride out a
+ * transient (a pane mid-remount, a PTY that came up a beat late) without turning a permanent
+ * condition into an unbounded loop. At one send per settle window that is ~2¼ minutes of silence
+ * before the human hears about it.
+ */
+export const MAX_UNDELIVERED_CONTINUES = 3;
+
+/**
+ * Why an auto-continue did not reach the terminal: a dispatch path, or `"threw"` for the one
+ * outcome the dispatcher cannot report because it never returned.
+ *
+ * TYPED AGAINST THE CLOSED UNION rather than `string`. `ConciergeDispatchPath` is exhaustive by
+ * design, and taking a bare `string` here quietly opted this ladder out of that guarantee: a path
+ * renamed or removed on the dispatch side would still typecheck here and silently fall through to
+ * the default arm, which is the one that cannot name a remedy. It also meant nothing checked that
+ * every arm below corresponds to a path that actually exists — the reason `agent-failed` could sit
+ * under the wrong remedy without a compiler complaint.
+ */
+type UndeliveredPath = ConciergeDispatchPath | "threw";
+
+/** Test/introspection seam: how many auto-continues in a row have failed to reach `agentId`? */
+export function undeliveredStreakFor(agentId: string): number {
+  return undelivered.get(agentId)?.count ?? 0;
+}
+
+/**
+ * What to tell the human when auto-continue could not DELIVER, keyed on the dispatch path.
+ *
+ * Every arm names the obstacle and the remedy, because the generic escalation copy is actively
+ * misleading here: "Something is blocking it that restarting cannot fix" sends someone hunting for a
+ * mystery blocker inside the agent's work, when the truth is that the message never arrived and the
+ * fix is a few seconds of pane-wrangling. A wrong diagnosis costs more than no diagnosis.
+ *
+ * The default arm is deliberately vague rather than guessing: it still says the one fact that
+ * matters — nothing was delivered — and names the path so a log or a bug report can identify it.
+ */
+function undeliverableReason(goalText: string, path: UndeliveredPath): string {
+  const why =
+    path === "alternate-screen"
+      ? "its terminal is sitting in a full-screen app (vim/less/htop), which would read the message as commands. Quit that app in the pane and the auto-resume will take over again"
+      : path === "blocked-prompt"
+        ? "its terminal is waiting at a prompt that must not receive free text — a password, a host-key confirmation, a yes/no. Answer that prompt in the pane"
+        : path === "pty-gone"
+          ? "its process is gone. Restart the agent to pick the goal back up"
+          : // SPLIT FROM `pty-gone`, because the remedies differ and this one already has an
+            // established answer elsewhere in the app. `agent-failed` means the agent never
+            // STARTED, and ConciergeHost's refusal copy for it says "open its pane and hit Retry
+            // (or finish installing Claude Code)". Grouping it under "its process is gone. Restart
+            // the agent" sent the user to restart something that had not run yet — a wrong
+            // diagnosis, which this function's own header says costs more than no diagnosis.
+            path === "agent-failed"
+            ? "it never started. Open its pane and hit Retry (or finish installing Claude Code), and the auto-resume will take over again"
+            : path === "cloud-offline"
+              ? "it runs in the cloud and the relay is not connected. Reconnect, and the auto-resume will take over again"
+              : // HELD, NOT DELIVERED. `queued` reports that the PTY was still coming up and the
+                // message is sitting in the hold queue — which is why the runner counts it as
+                // undelivered rather than crediting it (see the dispatch site). Reaching the bound
+                // on it means the pane never finished starting across the whole streak.
+                path === "queued"
+                ? "its terminal never finished starting, so the message was only ever held rather than typed. Open its pane to see what it is waiting on"
+                : `the send kept coming back "${path}"`;
+  // THE CLOSING SENTENCE IS NOT THE SAME ON EVERY PATH, and `queued` is the exception.
+  //
+  // Every other arm here describes a send that was REFUSED — nothing was written and nothing is
+  // pending, so "nothing was typed" is simply true and stays true. A `queued` send is different:
+  // it is HELD in `pendingSends` with a 2-minute TTL and flushed for real if the pane reports
+  // ready. The bound trips after three sends one settle window apart — roughly 92 seconds — so at
+  // the moment the human is notified, all three holds are still live and WILL be typed if the PTY
+  // comes up in the next half-minute or so.
+  //
+  // Claiming "nothing was typed, so the agent has not seen any of it" would therefore be a
+  // statement that can become false minutes after it is read, on the one surface a stuck user
+  // trusts. AGENTS.md § User-facing copy is code: a change to WHEN something happens has to update
+  // every place that described the old timing, and demoting `queued` to undelivered changed
+  // exactly that. So this arm says what is actually guaranteed — nothing has been typed YET — and
+  // names the condition under which that changes.
+  const closing =
+    path === "queued"
+      ? `Nothing has been typed into the terminal yet. If its pane finishes starting within the ` +
+        `next couple of minutes the held message may still go through, so check the pane before ` +
+        `assuming the agent has seen nothing.`
+      : `Nothing was typed into the terminal, so the agent has not seen any of it.`;
+  return (
+    `Auto-resume could not reach this agent ${MAX_UNDELIVERED_CONTINUES} times in a row: ${why}. ` +
+    `The goal is still unmet: "${goalText}". ${closing}`
+  );
 }
 
 /** Test/introspection seam: when did this window first see `agentId` come to rest? */
@@ -288,6 +395,10 @@ export async function sweepGoalContinuations(opts: SweepOptions = {}): Promise<S
   // row and not of our interest in it — clocking only the eligible subset would restart the timer
   // the moment a goal is set on an already-idle agent, and delay its rescue by a settle window.
   idleClock = trackIdleSince(idleClock, composite, now);
+  // Same garbage collection `trackIdleSince` does by rebuilding: an agent that has been closed can
+  // never deliver, so leaving its streak behind would both leak and, if the id were ever reused,
+  // start the next agent partway to an escalation.
+  for (const id of undelivered.keys()) if (!composite.has(id)) undelivered.delete(id);
 
   const outcomes: SweepOutcome[] = [];
   const pending: Promise<void>[] = [];
@@ -384,26 +495,68 @@ async function continueAgent(
       userPrompt: false,
     });
     outcome.detail = result.path;
-    outcome.sent = result.ok;
-    if (result.ok) {
+    // `ok` IS NOT DELIVERY, and `queued` is the one path where they diverge. A dispatch to a pane
+    // whose PTY has not come up yet returns `ok: true, path: "queued"`: the message is HELD in the
+    // pending-sends queue, not typed. Crediting that as a delivery cleared the undelivered streak
+    // and recorded a goal-continue against a message the agent had not seen — so if the queue
+    // later expired or was abandoned, the streak reset on every sweep, the bound could never trip,
+    // and this feature's whole purpose (stop retrying an unreachable agent, and TELL someone)
+    // silently did not apply to the case where a pane never finishes starting.
+    //
+    // Counted as undelivered instead. That is the safe direction: if the hold does flush and the
+    // next sweep delivers for real, the streak clears then — a slight over-count costs one settle
+    // window, while the under-count cost an unbounded loop nobody was told about. Fixed HERE rather
+    // than by refusing to queue `goal-continue` in the dispatcher: this is a reading of a result
+    // the dispatcher already reports correctly, so it needs no new refusal path threaded through a
+    // closed union and every switch over it, and no behaviour change for the other callers that
+    // legitimately want the hold.
+    const delivered = result.ok && result.path !== "queued";
+    outcome.sent = delivered;
+    if (delivered) {
+      undelivered.delete(agent.id);
       useProjectStore.getState().noteAgentGoalContinue(projectId, agent.id, mark);
       log.info("goals", "auto-continued a stalled agent", { agentId: agent.id, path: result.path });
     } else {
-      log.warn("goals", "auto-continue did not reach the terminal", {
-        agentId: agent.id,
-        path: result.path,
-      });
+      noteUndelivered(projectId, agent, result.path);
     }
   } catch (e) {
     outcome.detail = "threw";
     outcome.sent = false;
     log.warn("goals", "auto-continue threw", { agentId: agent.id, error: String(e) });
+    noteUndelivered(projectId, agent, "threw");
   } finally {
     // RE-ARM ON BOTH PATHS. On success this is the one-send-per-turn rule. On FAILURE it is a
     // backoff: a refused or dead-PTY send that left the clock alone would be retried on every
     // 15s sweep forever. A failure costs one settle window and no retry from the budget.
     markContinued(agent.id, now);
   }
+}
+
+/**
+ * Record one auto-continue that never reached the terminal, and escalate once the streak hits
+ * {@link MAX_UNDELIVERED_CONTINUES}.
+ *
+ * A STREAK, not a total: the counter is cleared by any delivery, so a pane that is briefly
+ * unreachable and then reachable again never accumulates toward the bound. Only a condition that
+ * holds across three consecutive settle windows escalates.
+ *
+ * The escalation reuses {@link escalateToHuman}, which latches the goal — so `decideContinuation`
+ * answers `already-escalated` on the next sweep and this function is never reached again for that
+ * goal. Clearing the entry here is therefore belt-and-braces rather than the thing that stops the
+ * retrying; it matters if a human un-escalates the goal, which should start the count over rather
+ * than re-escalate on the first refusal.
+ */
+function noteUndelivered(projectId: string, agent: AgentTab, path: UndeliveredPath): void {
+  const count = (undelivered.get(agent.id)?.count ?? 0) + 1;
+  undelivered.set(agent.id, { count, path });
+  log.warn("goals", "auto-continue did not reach the terminal", {
+    agentId: agent.id,
+    path,
+    consecutive: count,
+  });
+  if (count < MAX_UNDELIVERED_CONTINUES) return;
+  undelivered.delete(agent.id);
+  escalateToHuman(projectId, agent, undeliverableReason(agent.goal?.text ?? "", path));
 }
 
 /**

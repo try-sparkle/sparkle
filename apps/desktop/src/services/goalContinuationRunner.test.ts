@@ -67,10 +67,12 @@ import { dispatchConciergeAnswer } from "./conciergeDispatch";
 import {
   _resetGoalContinuationRunnerForTests,
   idleSinceFor,
+  MAX_UNDELIVERED_CONTINUES,
   ownsProjectInThisWindow,
   processAliveFor,
   sweepGoalContinuations,
   trackIdleSince,
+  undeliveredStreakFor,
 } from "./goalContinuationRunner";
 
 const sendMock = vi.mocked(dispatchConciergeAnswer);
@@ -481,5 +483,208 @@ describe("ownsProjectInThisWindow — the thing standing between this and a doub
     expect(ownsProjectInThisWindow("p1")).toBe(false);
     asWindow("satellite-7");
     expect(ownsProjectInThisWindow("p1")).toBe(false);
+  });
+});
+
+describe("an auto-continue that never REACHES the terminal", () => {
+  // `mockImplementation` outlives a `mockClear`, and the shared `beforeEach` only clears. Without
+  // this, a refusing stub would leak into whatever describe is appended after this one — the kind of
+  // cross-test coupling that shows up as an unrelated failure days later. Vitest 2's `mockReset`
+  // restores the implementation `vi.fn(impl)` was constructed with, which is the module stub.
+  afterEach(() => {
+    sendMock.mockReset();
+  });
+
+  /** Always refuse, on `path`. The whole point is a condition that does not clear by itself. */
+  function alwaysRefuse(path: string): void {
+    sendMock.mockImplementation(async (agentId: string) => ({
+      ok: false as const,
+      path: path as never,
+      agentId,
+    }));
+  }
+
+  /**
+   * Drive `n` eligible sweeps. Each send re-arms the idle clock, so the next one has to be a full
+   * settle window later — sweeping at a fixed `now` would produce exactly one send however many
+   * times it was called, and every count below would be testing the harness.
+   */
+  async function sweepUntilEligible(n: number): Promise<void> {
+    await sweepGoalContinuations({ now: T0, ownsProject: ownsEverything });
+    for (let i = 0; i < n; i++) {
+      await sweepGoalContinuations({ now: SETTLED + i * 46_000, ownsProject: ownsEverything });
+    }
+  }
+
+  it("stops retrying and tells the human after three refusals in a row", async () => {
+    alwaysRefuse("alternate-screen");
+    const { projectId, agentId } = seed({ goal: "land the PR" });
+
+    await sweepUntilEligible(MAX_UNDELIVERED_CONTINUES);
+
+    expect(sendMock).toHaveBeenCalledTimes(MAX_UNDELIVERED_CONTINUES);
+    // The latch is what actually stops the loop: without it the refusal repeats every settle window
+    // for as long as the pane stays in the full-screen app — observed in the field as hours of it.
+    expect(goalOf(projectId, agentId)!.escalatedAt).toBeDefined();
+    expect(notifyMock).toHaveBeenCalledTimes(1);
+
+    // ...and a fourth eligible window sends nothing, because the goal is now escalated.
+    await sweepGoalContinuations({
+      now: SETTLED + MAX_UNDELIVERED_CONTINUES * 46_000,
+      ownsProject: ownsEverything,
+    });
+    expect(sendMock).toHaveBeenCalledTimes(MAX_UNDELIVERED_CONTINUES);
+  });
+
+  it("names the OBSTACLE, and never the restart copy that would send the human hunting", async () => {
+    alwaysRefuse("alternate-screen");
+    const { projectId, agentId } = seed({ goal: "land the PR" });
+
+    await sweepUntilEligible(MAX_UNDELIVERED_CONTINUES);
+
+    const reason = goalOf(projectId, agentId)!.escalationReason!;
+    expect(reason).toContain("full-screen app");
+    expect(reason).toContain("land the PR");
+    // The diagnosis the progress bound gives is WRONG here — nothing was ever typed, so there is no
+    // "restarting" that failed. This is the assertion the whole change exists for.
+    expect(reason).not.toContain("restarting cannot fix");
+    expect(reason).toContain("Nothing was typed into the terminal");
+    // The banner the human actually reads carries the same sentence, not a second one that drifts.
+    expect(notifyMock.mock.calls[0]![0].body).toBe(reason);
+  });
+
+  it("keys the remedy off the path — a dead PTY does not get the full-screen advice", async () => {
+    alwaysRefuse("pty-gone");
+    const { projectId, agentId } = seed({ goal: "land the PR" });
+
+    await sweepUntilEligible(MAX_UNDELIVERED_CONTINUES);
+
+    const reason = goalOf(projectId, agentId)!.escalationReason!;
+    expect(reason).toContain("its process is gone");
+    expect(reason).not.toContain("full-screen");
+  });
+
+  it("does not send the RESTART remedy for an agent that never started", async () => {
+    // `agent-failed` and `pty-gone` shared an arm, so this said "its process is gone. Restart the
+    // agent" about an agent whose process never ran. ConciergeHost's refusal copy for the same
+    // path already says the true remedy — open the pane and hit Retry — so the two surfaces
+    // contradicted each other on the one sentence a stuck user acts on.
+    alwaysRefuse("agent-failed");
+    const { projectId, agentId } = seed({ goal: "land the PR" });
+
+    await sweepUntilEligible(MAX_UNDELIVERED_CONTINUES);
+
+    const reason = goalOf(projectId, agentId)!.escalationReason!;
+    expect(reason).toContain("Retry");
+    expect(reason).toContain("never started");
+    // The wrong diagnosis, and the one this arm used to give.
+    expect(reason).not.toContain("its process is gone");
+    expect(reason).not.toContain("Restart the agent");
+  });
+
+  it("does not credit a QUEUED send as delivered — held is not typed", async () => {
+    // The gap that made the whole bound inapplicable to a pane that never finishes starting.
+    // `dispatchConciergeAnswer` returns ok:true/path:"queued" when the PTY is not up: the message
+    // sits in the hold queue. Reading `ok` alone cleared the streak and recorded a goal-continue on
+    // every sweep, so the counter could never reach the bound and nobody was ever told — while the
+    // agent saw nothing.
+    sendMock.mockImplementation(async (agentId: string) => ({
+      ok: true as const,
+      path: "queued" as const,
+      agentId,
+      sent: "x",
+      display: "x",
+    }));
+    const { projectId, agentId } = seed({ goal: "land the PR" });
+
+    await sweepUntilEligible(MAX_UNDELIVERED_CONTINUES);
+
+    // It escalates, which is the whole point: the streak has to be able to climb.
+    expect(goalOf(projectId, agentId)!.escalatedAt).toBeDefined();
+    expect(notifyMock).toHaveBeenCalledTimes(1);
+    // ...and it is NOT charged to the progress budget, which counts delivered resumes only.
+    expect(goalOf(projectId, agentId)!.totalContinues).toBe(0);
+
+    const reason = goalOf(projectId, agentId)!.escalationReason!;
+    expect(reason).toContain("never finished starting");
+    expect(reason).toContain("only ever held");
+    // The default arm would have quoted the raw path instead of naming a remedy.
+    expect(reason).not.toContain('kept coming back "queued"');
+
+    // ...and it must NOT make the claim every other arm makes. A held send has a 2-minute TTL and
+    // the bound trips at ~92s, so all three holds are still live when the human is notified and
+    // will be typed if the pane comes up. "Nothing was typed, so the agent has not seen any of it"
+    // is a sentence that can become false minutes after it is read.
+    expect(reason).not.toContain("has not seen any of it");
+    expect(reason).toContain("Nothing has been typed into the terminal yet");
+    expect(reason).toContain("may still go through");
+  });
+
+  it("keeps the absolute claim on paths where it IS true", async () => {
+    // The control for the sentence above: a refused send wrote nothing and left nothing pending,
+    // so weakening the copy everywhere would lose a guarantee that genuinely holds.
+    alwaysRefuse("alternate-screen");
+    const { projectId, agentId } = seed({ goal: "land the PR" });
+
+    await sweepUntilEligible(MAX_UNDELIVERED_CONTINUES);
+
+    const reason = goalOf(projectId, agentId)!.escalationReason!;
+    expect(reason).toContain("Nothing was typed into the terminal, so the agent has not seen any of it");
+    expect(reason).not.toContain("may still go through");
+  });
+
+  it("still clears the streak on a REAL delivery, so queued is the only demoted path", async () => {
+    // The control. Without it, "treat ok:true as undelivered" would look identical to the fix, and
+    // every genuine delivery would be silently counted against the bound too.
+    sendMock.mockImplementation(async (agentId: string) => ({
+      ok: true as const,
+      path: "free-text" as const,
+      agentId,
+      sent: "x",
+      display: "x",
+    }));
+    const { projectId, agentId } = seed({ goal: "land the PR" });
+
+    await sweepUntilEligible(MAX_UNDELIVERED_CONTINUES);
+
+    expect(undeliveredStreakFor(agentId)).toBe(0);
+    expect(goalOf(projectId, agentId)!.escalatedAt).toBeUndefined();
+    expect(goalOf(projectId, agentId)!.totalContinues).toBeGreaterThan(0);
+  });
+
+  it("counts a STREAK — one delivery in between clears it", async () => {
+    const { projectId, agentId } = seed({ goal: "land the PR" });
+    alwaysRefuse("alternate-screen");
+
+    await sweepUntilEligible(2);
+    expect(undeliveredStreakFor(agentId)).toBe(2);
+
+    // The pane becomes reachable for exactly one window...
+    sendMock.mockImplementationOnce(async (id: string) => ({
+      ok: true as const,
+      path: "free-text" as const,
+      agentId: id,
+      sent: "x",
+      display: "x",
+    }));
+    await sweepGoalContinuations({ now: SETTLED + 2 * 46_000, ownsProject: ownsEverything });
+    expect(undeliveredStreakFor(agentId)).toBe(0);
+
+    // ...so the two refusals that follow are a streak of two, not five, and nothing escalates.
+    await sweepGoalContinuations({ now: SETTLED + 3 * 46_000, ownsProject: ownsEverything });
+    await sweepGoalContinuations({ now: SETTLED + 4 * 46_000, ownsProject: ownsEverything });
+    expect(undeliveredStreakFor(agentId)).toBe(2);
+    expect(goalOf(projectId, agentId)!.escalatedAt).toBeUndefined();
+  });
+
+  it("does not spend the PROGRESS budget — the two bounds stay separate", async () => {
+    alwaysRefuse("alternate-screen");
+    const { projectId, agentId } = seed({ goal: "land the PR" });
+
+    await sweepUntilEligible(MAX_UNDELIVERED_CONTINUES);
+
+    // `totalContinues` counts DELIVERED resumes. An undelivered one crediting it would make
+    // `MAX_CONTINUES_WITHOUT_PROGRESS` fire on sends the agent never saw.
+    expect(goalOf(projectId, agentId)!.totalContinues).toBe(0);
   });
 });
