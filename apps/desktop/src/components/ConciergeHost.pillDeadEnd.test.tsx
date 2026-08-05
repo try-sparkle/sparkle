@@ -52,6 +52,11 @@ function feedAgent(id: string, name: string) {
     statusLabel: "Idle",
     // `done`, not `needs_you`: a surfaced agent adds nudge cards unrelated to this suite.
     band: "done" as const,
+    // EXPLICIT, because the fixture is cast through `unknown` and a missing field is therefore
+    // `undefined` rather than a type error. `revealAgent` branches on it, and omitting it sent a
+    // top-level agent down the nested path — which is how this suite's caller-owned row passed for
+    // the wrong reason (roborev 58705). The real feed always sets it (services/conciergeFeed).
+    parentRowId: null as string | null,
     inScope: true,
     muted: false,
     topLevel: true,
@@ -280,6 +285,83 @@ describe("(e) the host tells the reader when the reveal had nothing to do", () =
     expect(document.body.textContent ?? "").toMatch(/Build 8 is already open in other\./i);
     // And NOT the "isn't open any more" line, which would be a false claim about a live agent.
     expect(document.body.textContent ?? "").not.toMatch(/isn't open any more/i);
+  });
+
+  /** A NESTED agent — a worker under an orchestrator row. `revealAgent` un-hides its band and
+   *  expands its head before revealing it, and whether THOSE writes changed anything is the one
+   *  piece of logic that can flip an already-showing prediction back to "revealed". It had no test
+   *  at all: deleting the whole `surfaced` computation left the suite green (roborev 58705). */
+  function nestedNudgeFeed() {
+    const feed = JSON.parse(JSON.stringify(FEED_P2));
+    const counts = { needs_you: 1, running: 0, done: 0 };
+    const head = { ...feed.projects[1].agents[0], id: "head2", name: "Head 2", parentRowId: null };
+    const worker = {
+      ...feed.projects[1].agents[0],
+      band: "needs_you",
+      status: "waiting",
+      parentRowId: "head2",
+    };
+    feed.projects[1].agents = [head, worker];
+    feed.counts = counts;
+    feed.scopedCounts = counts;
+    feed.projects[1].counts = counts;
+    feed.projects[1].scopedCounts = counts;
+    return feed as unknown as ConciergeFeed;
+  }
+
+  it("(nested) a worker whose row was COLLAPSED counts as revealed — a row appeared", () => {
+    seedAlreadyShowing();
+    setConciergeChat(() => []);
+    // Its head is collapsed, so the worker's row was not drawable a moment ago. Un-collapsing it
+    // puts a row on screen the reader could not see: that IS a visible result, and adding a
+    // "nothing moved" sentence beside it would contradict the screen.
+    useUiStore.setState({
+      collapsedOrchestrators: { head2: true },
+      statusFilter: { needs_you: true, running: true, done: true },
+    } as never);
+    render(<ConciergeHost feed={nestedNudgeFeed()} />);
+
+    fireEvent.click(
+      within(screen.getByTestId("concierge-nudge")).getByTestId("concierge-agent-pill"),
+    );
+
+    expect(document.body.textContent ?? "").not.toMatch(/is already open in/i);
+  });
+
+  it("(nested) a worker already drawable still gets the sentence", () => {
+    seedAlreadyShowing();
+    setConciergeChat(() => []);
+    // Head expanded AND this agent's own band shown — nothing was hidden, so nothing moved.
+    useUiStore.setState({
+      collapsedOrchestrators: { head2: false },
+      statusFilter: { needs_you: true, running: true, done: true },
+    } as never);
+    render(<ConciergeHost feed={nestedNudgeFeed()} />);
+
+    fireEvent.click(
+      within(screen.getByTestId("concierge-nudge")).getByTestId("concierge-agent-pill"),
+    );
+
+    expect(document.body.textContent ?? "").toMatch(/Build 8 is already open in other\./i);
+  });
+
+  it("(nested) another band being filtered off does NOT count as this row appearing", () => {
+    seedAlreadyShowing();
+    setConciergeChat(() => []);
+    // Isolating a band is a one-click designed affordance, so this is an ordinary resting state.
+    // `running`/`done` being off says nothing about a `needs_you` row's drawability — reading it as
+    // "a row appeared" swallowed the sentence for a genuinely already-showing agent.
+    useUiStore.setState({
+      collapsedOrchestrators: { head2: false },
+      statusFilter: { needs_you: true, running: false, done: false },
+    } as never);
+    render(<ConciergeHost feed={nestedNudgeFeed()} />);
+
+    fireEvent.click(
+      within(screen.getByTestId("concierge-nudge")).getByTestId("concierge-agent-pill"),
+    );
+
+    expect(document.body.textContent ?? "").toMatch(/Build 8 is already open in other\./i);
   });
 
   it("still NAVIGATES — and stays silent — when there really is somewhere to go", () => {

@@ -2614,13 +2614,21 @@ export function ConciergeHost({
     // not see a moment ago appears. Measured rather than assumed: both setters are no-ops when the
     // state already holds, so this is only true when something really was hidden.
     let surfaced = false;
-    if (a.parentRowId !== null) {
+    // `!= null`, NOT `!== null`. `ConciergeAgent.parentRowId` is typed `string | null` and the feed
+    // always sets it, but a hand-built fixture that omits it yields `undefined` — which `!== null`
+    // waves through into this branch, where `collapsedOrchestrators[undefined] ?? true` reads
+    // `true` and reports a top-level agent as "its row was hidden". That is not hypothetical: it is
+    // how this commit's own caller-owned test came to pass for the wrong reason (roborev 58705).
+    if (a.parentRowId != null) {
       const ui = useUiStore.getState();
+      // SCOPED TO THIS AGENT'S OWN BAND. The question is "was the row the reader just asked for
+      // undrawable", not "was any row hidden anywhere" — and the difference is the common case, not
+      // a corner: isolating a band is a one-click designed affordance (the needs-you filter, the
+      // helper chiclets), so `running`/`done` being off is an ordinary resting state. Asking the
+      // broad question there reported a genuinely already-showing agent as "revealed" and went
+      // silent — this commit's own bug, reintroduced by its own fix (roborev 58705).
       surfaced =
-        !ui.statusFilter.needs_you ||
-        !ui.statusFilter.running ||
-        !ui.statusFilter.done ||
-        (ui.collapsedOrchestrators[a.parentRowId] ?? true);
+        !ui.statusFilter[a.band] || (ui.collapsedOrchestrators[a.parentRowId] ?? true);
       ui.showAllStatusBands();
       ui.expandOrchestrators([a.parentRowId]);
     }
