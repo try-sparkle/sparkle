@@ -5,7 +5,7 @@
 // than on evidence (an agent per PR per sweep burns the fleet). Both are asserted here against the
 // SIDE EFFECT — whether a spawn happened, whether a lease was released — never against a
 // precondition, because a precondition assertion would have passed before this module existed.
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 
 const invokeMock = vi.fn();
 const spawnMock = vi.fn();
@@ -15,6 +15,9 @@ const capacityMock = vi.fn(() => ({ atCapacity: false, used: 0, limit: 8, basis:
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invokeMock(...a) }));
 vi.mock("./buildAgentSpawn", () => ({ spawnBuildAgentInProject: (...a: unknown[]) => spawnMock(...a) }));
 vi.mock("./agentCapacity", () => ({ localAgentCapacity: () => capacityMock() }));
+// The production tick reads the real store and the real window-ownership election; both are
+// stubbed so the deadline test can drive `startBabysitDispatcher` itself.
+vi.mock("./goalContinuationRunner", () => ({ ownsProjectInThisWindow: () => true }));
 vi.mock("./openPrs", async (orig) => {
   const real = (await orig()) as Record<string, unknown>;
   return { ...real, fetchOpenPrs: (...a: unknown[]) => fetchOpenPrsMock(...a) };
@@ -28,6 +31,9 @@ import {
   _resetBabysitDispatcherForTests,
   babysitPrompt,
   sweepAllProjects,
+  startBabysitDispatcher,
+  BABYSIT_SWEEP_ABANDON_MS,
+  BABYSIT_SWEEP_MS,
   babysitSweepProject,
   checkRollupOf,
   readProbeGate,
@@ -35,6 +41,7 @@ import {
   standingFor,
 } from "./babysitDispatcher";
 import { resolveBabysitConfig } from "@sparkle/core";
+import { useProjectStore } from "../stores/projectStore";
 import type { Project } from "../types";
 
 const PROJECT = { id: "p1", name: "sparkle", rootPath: "/repo" } as unknown as Project;
@@ -425,5 +432,101 @@ describe("sweepAllProjects — the single-owner election", () => {
     wireInvoke({ leases: [], gate: { applicable: false, probes: [], error: null, overridden: false } });
     await sweepAllProjects(CONFIG, { ownsProject: () => true, projects: () => [PROJECT, projectB] });
     expect(fetchOpenPrsMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ── THE ABANDONED SWEEP MUST STOP WRITING (roborev 58525) ───────────────────────────────────────
+//
+// The deadline starts a replacement sweep; it does not stop the old one. The abandoned sweep is
+// still parked on an await, and when its invoke settles it resumes holding a `now` captured at
+// least 12 minutes earlier. The dangerous write is `observeLease` stamping `lastDriverExitAt` with
+// that ancient timestamp — on the field this module calls THE SOLE PER-PR LIMITER — so a cooldown
+// that should still be owed reads as long expired and the PR is re-dispatchable a full cooldown
+// early. The boolean guard this replaced made that impossible; the deadline has to come WITH a
+// fence or it trades a visible stall for silent corruption.
+describe("the sweep fence", () => {
+  it("STOPS at the next PR once superseded, rather than writing stale state", async () => {
+    fetchOpenPrsMock.mockResolvedValue([prWithProbe(1), prWithProbe(2), prWithProbe(3)]);
+    wireInvoke({ leases: [] });
+
+    // Current for the first PR, superseded from then on.
+    let calls = 0;
+    const out = await babysitSweepProject(PROJECT, T0, CONFIG, () => ++calls <= 1);
+
+    expect(out.abandoned).toBe(true);
+    // Exactly ONE probe-gate read: PR 1's. PRs 2 and 3 were never touched, so nothing of theirs was
+    // written with the stale clock.
+    const gateReads = invokeMock.mock.calls.filter((c) => c[0] === KNIGHTWATCH_PROBE_GATE_COMMAND);
+    expect(gateReads).toHaveLength(1);
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  it("STOPS after the await that actually wedges — not just before it", async () => {
+    // THE CHECK THAT MATTERS. The sweep that gets abandoned is the one parked INSIDE the loop on the
+    // probe-gate read; it passed the top-of-iteration fence long before the deadline. A fence checked
+    // only there covers PRs 2..N of an abandoned sweep and misses the single PR it was written for.
+    //
+    // First sweep normally, so the two-observation rule is satisfied and the second sweep WOULD
+    // dispatch. Then supersede it after the probe read: call 1 is the top fence (still current),
+    // call 2 is the post-await one.
+    wireInvoke({ leases: [] });
+    await babysitSweepProject(PROJECT, T0, CONFIG);
+    expect(spawnMock).not.toHaveBeenCalled();
+
+    let calls = 0;
+    const out = await babysitSweepProject(PROJECT, T0 + 60_000, CONFIG, () => ++calls <= 1);
+
+    expect(out.abandoned).toBe(true);
+    // Without the post-await fence this sweep reaches the decision and dispatches with its stale
+    // clock — which is precisely the corruption the fence exists to stop.
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  it("runs every PR to completion while it is still current", async () => {
+    // The paired direction: without it, a fence that always reported "superseded" would pass above.
+    fetchOpenPrsMock.mockResolvedValue([prWithProbe(1), prWithProbe(2), prWithProbe(3)]);
+    wireInvoke({ leases: [] });
+
+    const out = await babysitSweepProject(PROJECT, T0, CONFIG, () => true);
+
+    expect(out.abandoned).toBeUndefined();
+    expect(invokeMock.mock.calls.filter((c) => c[0] === KNIGHTWATCH_PROBE_GATE_COMMAND)).toHaveLength(3);
+  });
+});
+
+describe("the abandon deadline", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("skips while a sweep is young, and ABANDONS one past the deadline", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    useProjectStore.setState({ projects: [PROJECT], selectedProjectId: PROJECT.id });
+    // A sweep that never settles — the wedge this deadline exists for.
+    fetchOpenPrsMock.mockImplementation(() => new Promise(() => {}));
+
+    const stop = startBabysitDispatcher();
+    await Promise.resolve();
+    expect(fetchOpenPrsMock).toHaveBeenCalledTimes(1);
+
+    // One period later the first sweep is still wedged and young: SKIPPED, no second sweep.
+    vi.setSystemTime(T0 + BABYSIT_SWEEP_MS);
+    await vi.advanceTimersByTimeAsync(BABYSIT_SWEEP_MS);
+    expect(fetchOpenPrsMock).toHaveBeenCalledTimes(1);
+
+    // Past the deadline the wedged sweep is abandoned and a fresh one starts.
+    //
+    // A LITERAL 13 MINUTES, deliberately, not `BABYSIT_SWEEP_ABANDON_MS`. Deriving the clock from
+    // the constant under test makes the assertion scale WITH the mutation: widening the multiplier
+    // from 4 to 4000 left this green, because the test moved its own goalposts. 13 min is just past
+    // the documented 4 x 180 s and is what actually pins the value.
+    vi.setSystemTime(T0 + 13 * 60_000);
+    await vi.advanceTimersByTimeAsync(BABYSIT_SWEEP_MS);
+    expect(fetchOpenPrsMock).toHaveBeenCalledTimes(2);
+    // And the constant itself is what the code uses, stated once so the literal above is anchored.
+    expect(BABYSIT_SWEEP_ABANDON_MS).toBe(4 * BABYSIT_SWEEP_MS);
+
+    stop();
   });
 });

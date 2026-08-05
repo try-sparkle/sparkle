@@ -212,6 +212,24 @@ let sweepStartedAt: number | null = null;
 export const BABYSIT_SWEEP_ABANDON_MS = 4 * BABYSIT_SWEEP_MS;
 
 /**
+ * Bumped every time a sweep starts. A sweep that has been ABANDONED must not keep writing.
+ *
+ * The deadline above starts a replacement, but starting one does not stop the old one: it is still
+ * parked on an `await` inside `babysitSweepProject`, and when its `invoke` finally settles it
+ * resumes the loop holding a `now` captured at least `BABYSIT_SWEEP_ABANDON_MS` ago. Every write it
+ * then makes is stale, and one of them is actively harmful: `observeLease` would stamp
+ * `lastDriverExitAt` with that ancient timestamp — on the field this module calls THE SOLE PER-PR
+ * LIMITER — so a cooldown that should still be owed reads as long expired and the PR becomes
+ * re-dispatchable a full cooldown early. `recentDispatchAt`'s rebuild filters on the same stale
+ * `now`, and `lastObservation` loses the newer sweep's sighting.
+ *
+ * The boolean guard this replaced made that impossible by never letting a second sweep start. The
+ * deadline is worth having anyway — a permanently wedged sweep must not disable dispatch forever —
+ * but it has to come WITH a fence, or it trades a visible stall for silent corruption.
+ */
+let sweepGeneration = 0;
+
+/**
  * THE PER-PR CLOCKS. Without these the `cooling-down` hold is UNREACHABLE.
  *
  * `BabysitFleetState`'s clock fields are OPTIONAL, so omitting them is not a type error — it
@@ -307,6 +325,9 @@ export interface BabysitSweepOutcome {
   holds: Record<string, number>;
   /** PRs whose repo slug could not be parsed, so they were never judged at all. */
   unidentified: number;
+  /** True when this sweep was superseded mid-flight and stopped early rather than writing stale
+   *  state. Surfaced so an abandoned sweep is visible rather than looking like a quiet one. */
+  abandoned?: boolean;
 }
 
 /**
@@ -319,6 +340,9 @@ export async function babysitSweepProject(
   project: Project,
   now: number,
   config: BabysitDispatchConfig,
+  /** False once this sweep has been superseded — see {@link sweepGeneration}. Defaults to "always
+   *  current" so a direct caller (every test) is unaffected. */
+  isCurrent: () => boolean = () => true,
 ): Promise<BabysitSweepOutcome> {
   const out: BabysitSweepOutcome = { dispatched: [], holds: {}, unidentified: 0 };
   const hold = (reason: string): void => {
@@ -337,12 +361,31 @@ export async function babysitSweepProject(
   const leases = await readLeases();
 
   for (const pr of prs) {
+    // THE FENCE. Checked before every PR's writes rather than once at the top, because the awaits
+    // that make a sweep abandonable are INSIDE this loop (one probe-gate read per PR). An abandoned
+    // sweep stops here and writes nothing further; what it already wrote before the deadline was
+    // written while it was still current.
+    if (!isCurrent()) {
+      out.abandoned = true;
+      return out;
+    }
     const repo = repoSlugFromPrUrl(pr.url);
     if (!repo) {
       out.unidentified += 1;
       continue;
     }
     const gate = await readProbeGate(project.rootPath, pr.number);
+    // FENCE AGAIN, AFTER THE AWAIT — this is the check that actually matters (roborev 58533). The
+    // sweep that gets abandoned is the one parked INSIDE this loop, on the probe-gate read under a
+    // 45 s `gh` timeout. It passed the check at the top of the iteration and, without this, walks
+    // straight into `observeLease` below holding a `now` and a `leases` snapshot from before the
+    // deadline — stamping `lastDriverExitAt` with an ancient timestamp and clearing the replacement
+    // sweep's `sawLive`. A fence checked only before the await covers PRs 2..N of an abandoned
+    // sweep and misses the single PR it was written for.
+    if (!isCurrent()) {
+      out.abandoned = true;
+      return out;
+    }
     const snapshot: BabysitPrSnapshot = {
       repo,
       number: pr.number,
@@ -383,6 +426,14 @@ export async function babysitSweepProject(
 
     lastObservation.set(k, { evidenceIds: babysitEvidenceIds(decision.evidence) });
     const agentId = await dispatchOne(project, repo, pr.number, now);
+    // dispatchOne awaits the lease commands, so the same rule applies. A dispatch that DID happen is
+    // still reported to the caller; what is skipped is writing this sweep's stale clock over a
+    // newer sweep's.
+    if (!isCurrent()) {
+      out.abandoned = true;
+      if (agentId) out.dispatched.push({ repo, pr: pr.number, agentId });
+      return out;
+    }
     if (agentId) {
       recentDispatchAt = [...recentDispatchAt.filter((t) => now - t < BABYSIT_RATE_WINDOW_MS), now];
       // Stamped only on a dispatch that actually produced a driver. A lost acquire or a refused
@@ -474,8 +525,9 @@ export function startBabysitDispatcher(config?: Partial<BabysitDispatchConfig>):
       log.warn("babysit", "abandoning a wedged sweep and starting a fresh one", { ageMs: age });
     }
     sweepStartedAt = startedAt;
+    const myGeneration = ++sweepGeneration;
     try {
-      await sweepAllProjects(resolved);
+      await sweepAllProjects(resolved, PRODUCTION_DEPS, () => myGeneration === sweepGeneration);
     } finally {
       // Only the sweep that still owns the slot clears it — an abandoned sweep that settles late
       // must not clear the flag out from under the one that replaced it.
@@ -506,6 +558,7 @@ const PRODUCTION_DEPS: BabysitSweepDeps = {
 export async function sweepAllProjects(
   resolved: BabysitDispatchConfig,
   deps: BabysitSweepDeps = PRODUCTION_DEPS,
+  isCurrent: () => boolean = () => true,
 ): Promise<void> {
   const now = Date.now();
   for (const project of deps.projects()) {
@@ -515,11 +568,17 @@ export async function sweepAllProjects(
     // per-webview module instance, so the ceiling documented as FLEET-WIDE would silently become
     // 4 per open window — on a budget whose whole point is that "a dispatch costs a full Claude
     // session on the founder's own quota" — and every window would independently spend one `gh`
-    // subprocess per open PR per 180 s on the same repos. The lease still stops two DRIVERS on one
-    // PR; it does not bound spend, so this is the thing that does.
+    // subprocess per open PR per 180 s on the same repos.
+    //
+    // WHAT IT DOES NOT DO, stated because the previous wording claimed otherwise: it does not make
+    // the hourly ceiling app-wide. `recentDispatchAt` is per-webview module state and this election
+    // only makes each window's PROJECT SET disjoint, so two windows owning different projects are
+    // still `BABYSIT_DISPATCHES_PER_HOUR` EACH. The lease stops two drivers on one PR; nothing here
+    // bounds total spend across windows, and a durable counter is what would.
     if (!deps.ownsProject(project.id)) continue;
     try {
-      const outcome = await babysitSweepProject(project, now, resolved);
+      if (!isCurrent()) return;
+      const outcome = await babysitSweepProject(project, now, resolved, isCurrent);
       if (outcome.dispatched.length > 0 || Object.keys(outcome.holds).length > 0) {
         log.debug("babysit", "sweep", {
           project: project.id,
@@ -539,6 +598,7 @@ export async function sweepAllProjects(
 /** Test seam: forget every remembered observation and dispatch. */
 export function _resetBabysitDispatcherForTests(): void {
   sweepStartedAt = null;
+  sweepGeneration = 0;
   lastObservation.clear();
   prClocks.clear();
   recentDispatchAt = [];
