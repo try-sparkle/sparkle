@@ -69,7 +69,16 @@ const BREW_TIMEOUT: Duration = Duration::from_secs(600);
 const MAX_SCAN_DEPTH: usize = 4;
 
 /// Directories never worth descending into when hunting for env files.
-const SKIP_DIRS: [&str; 4] = ["node_modules", ".git", "target", "dist"];
+///
+/// `worktrees` earns its place for a reason the others don't share. Seeding writes a copy of the
+/// project's `.env.local` into every agent worktree, and those worktrees live at
+/// `.claude/worktrees/<name>/` inside the project — so the scan used to FIND those copies and back
+/// each one up as its own vault item. One secret became a dozen items titled
+/// `<project>/.claude/worktrees/<name>/.env.local`, and on a second machine every one of them
+/// rendered as an "Only in vault" row for a worktree that machine has never cut (bead
+/// sparkle-y5xc9). They are derivatives, never originals: skipping them is what keeps the vault a
+/// list of the user's real env files.
+const SKIP_DIRS: [&str; 5] = ["node_modules", ".git", "target", "dist", "worktrees"];
 
 /// Dot-segments that mark a committed TEMPLATE rather than a real secret file: `.env.example`,
 /// `.env.sample`, `.env.template`, and compounds like `.env.example.local`. These are checked into
@@ -1608,6 +1617,86 @@ fn seed_worktree_outcome(
     Ok(SeedOutcome { written, rejected: skipped_unsafe, failed, torn_down })
 }
 
+/// Copy every backup-worthy `.env*` file from `source_root` into `dest_root` at the same relative
+/// path. Returns the relative paths actually written.
+///
+/// THE SPAWN PATH DOES NOT TALK TO 1Password ANY MORE, and that is the whole point.
+///
+/// Seeding used to call [`seed_worktree_outcome`], downloading each file from the vault. 1Password
+/// grants CLI access to the CALLING PROCESS — Sparkle, never the agent's terminal, which invokes
+/// `op` nowhere — and lets that grant lapse after ten minutes of inactivity. Sparkle's `op` calls
+/// are sporadic by construction: one burst per agent spawn, then silence. Sporadic is exactly the
+/// shape that re-prompts, so opening fifteen agents across an afternoon meant re-authorizing about
+/// once per agent (bead sparkle-y5xc9). Reducing the NUMBER of calls could never fix that; only
+/// making zero calls could.
+///
+/// A worktree's `.env.local` was always a copy of the one already in the project checkout, so the
+/// vault was never the nearest source. Copying locally is also strictly fresher — it picks up edits
+/// made since the last backup.
+fn seed_from_checkout(source_root: &str, dest_root: &str) -> Result<Vec<String>, String> {
+    let source = PathBuf::from(source_root);
+    if !source.is_dir() {
+        return Err("the project folder couldn't be read".to_string());
+    }
+    let root = PathBuf::from(dest_root);
+    if !root.is_dir() {
+        return Err("the destination worktree folder doesn't exist".to_string());
+    }
+    // Resolved ONCE so every destination can be proven to land inside it even when an intermediate
+    // directory is a symlink — the same containment discipline `seed_worktree_outcome` uses.
+    let root_real = root
+        .canonicalize()
+        .map_err(|_| "the destination worktree folder couldn't be resolved".to_string())?;
+
+    let mut paths = Vec::new();
+    collect_env_files(&source, 0, &mut paths);
+    paths.sort();
+
+    let mut written = Vec::new();
+    let mut failed = 0usize;
+    for src in paths {
+        let Ok(rel) = src.strip_prefix(&source) else { continue };
+        // TEARDOWN CHECK FIRST, before containment — a worktree can be removed while this loop
+        // runs (an agent closed moments after opening). Checked second, the containment probe walks
+        // up past the deleted root, finds itself outside `root_real`, and a benign teardown would
+        // be indistinguishable from a path trying to escape. Same ordering, same reason, as
+        // `seed_worktree_outcome`.
+        if !root.is_dir() {
+            break;
+        }
+        let dest = root.join(rel);
+        if !is_contained(&root_real, &dest) {
+            continue;
+        }
+        // NEVER OVERWRITE. A file already in the destination is the caller's, not ours — the same
+        // contract `seed_worktree_outcome` holds, and the reason a re-run of a partially seeded
+        // worktree is safe.
+        if dest.exists() {
+            continue;
+        }
+        if let Some(parent) = dest.parent() {
+            if std::fs::create_dir_all(parent).is_err() {
+                failed += 1;
+                continue;
+            }
+        }
+        // One failed file is skipped, never fatal: a partially seeded worktree beats a failed spawn.
+        match std::fs::copy(&src, &dest) {
+            Ok(_) => {
+                // `fs::copy` carries the SOURCE's permission bits over, which for a `.env` a user
+                // created by hand may be 0644. Assert the contract rather than inherit whatever
+                // happened to be on the original.
+                set_owner_only_permissions(&dest);
+                written.push(rel.to_string_lossy().replace('\\', "/"));
+            }
+            Err(_) => failed += 1,
+        }
+    }
+    // Counts only — never a path (the module's standing privacy rule).
+    tracing::info!(written = written.len(), failed, "copied env files into a new worktree");
+    Ok(written)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 // Tauri commands
 // ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -1739,6 +1828,31 @@ pub async fn op_restore(args: OpRestoreArgs) -> Result<(), String> {
     })
     .await
     .map_err(|_| "the restore didn't finish".to_string())?
+}
+
+/// Which of these paths are existing DIRECTORIES, in the same order.
+///
+/// No `op`, no secrets, no prompt — a plain filesystem probe. It exists so the frontend's restore
+/// planner can tell "the destination folder is there" from "this row's folder is a worktree this
+/// machine never cut" in ONE round trip rather than one per file.
+#[tauri::command]
+pub async fn env_dirs_exist(paths: Vec<String>) -> Result<Vec<bool>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        paths.iter().map(|p| Path::new(p).is_dir()).collect::<Vec<bool>>()
+    })
+    .await
+    .map_err(|_| "the folder check didn't finish".to_string())
+}
+
+/// Copy the project's env files into a freshly cut worktree. Never overwrites, never calls `op`.
+#[tauri::command]
+pub async fn env_seed_from_checkout(
+    source_root: String,
+    dest_root: String,
+) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || seed_from_checkout(&source_root, &dest_root))
+        .await
+        .map_err(|_| "seeding the worktree didn't finish".to_string())?
 }
 
 /// Seed a freshly cut worktree with the project's backed-up env files. Never overwrites.
@@ -3621,6 +3735,128 @@ fi
         };
         let j = serde_json::to_value(&r).unwrap();
         assert!(j.get("itemId").is_some() && j.get("updatedAt").is_some());
+    }
+
+    // ── seeding a worktree from the project checkout (bead sparkle-y5xc9) ────────────────────
+    //
+    // NONE of these drive `op`, which is the property under test as much as anything else: the
+    // whole reason this path exists is that the old one invoked `op` on every agent spawn, and
+    // 1Password's grant to the calling process lapses after ten minutes idle, so a fleet of agents
+    // re-authorized about once per agent.
+
+    /// A project checkout with a root env file, a nested one, a template, and a stale worktree copy.
+    fn checkout(dir: &Path) {
+        std::fs::write(dir.join(".env.local"), "ROOT=1\n").unwrap();
+        std::fs::create_dir_all(dir.join("apps/web")).unwrap();
+        std::fs::write(dir.join("apps/web/.env.local"), "WEB=2\n").unwrap();
+        std::fs::write(dir.join(".env.example"), "TEMPLATE=\n").unwrap();
+        std::fs::create_dir_all(dir.join(".claude/worktrees/old")).unwrap();
+        std::fs::write(dir.join(".claude/worktrees/old/.env.local"), "STALE=3\n").unwrap();
+    }
+
+    #[test]
+    fn dirs_exist_answers_each_path_in_order() {
+        let d = tmp();
+        std::fs::create_dir_all(d.path().join("here")).unwrap();
+        std::fs::write(d.path().join("afile"), "x").unwrap();
+        let paths = [
+            d.path().join("here").to_string_lossy().into_owned(),
+            d.path().join("afile").to_string_lossy().into_owned(),
+            d.path().join("missing").to_string_lossy().into_owned(),
+        ];
+        let answers: Vec<bool> = paths.iter().map(|p| Path::new(p).is_dir()).collect();
+        // A regular FILE is not a directory: a restore planner reading `true` here would take the
+        // "the folder is there, write into it" branch for a path that can never hold a file.
+        assert_eq!(answers, vec![true, false, false]);
+    }
+
+    #[test]
+    fn checkout_seed_copies_the_projects_env_files_with_their_bytes() {
+        let src = tmp();
+        let dst = tmp();
+        checkout(src.path());
+        let written = seed_from_checkout(
+            &src.path().to_string_lossy(),
+            &dst.path().to_string_lossy(),
+        )
+        .unwrap();
+        let mut got = written.clone();
+        got.sort();
+        assert_eq!(got, vec![".env.local".to_string(), "apps/web/.env.local".to_string()]);
+        // The BYTES, not merely the existence — a seed that creates empty files would satisfy a
+        // path-only assertion while leaving every agent without its secrets.
+        assert_eq!(std::fs::read_to_string(dst.path().join(".env.local")).unwrap(), "ROOT=1\n");
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join("apps/web/.env.local")).unwrap(),
+            "WEB=2\n"
+        );
+    }
+
+    #[test]
+    fn checkout_seed_never_overwrites_a_file_already_there() {
+        let src = tmp();
+        let dst = tmp();
+        checkout(src.path());
+        std::fs::write(dst.path().join(".env.local"), "MINE=9\n").unwrap();
+        let written = seed_from_checkout(
+            &src.path().to_string_lossy(),
+            &dst.path().to_string_lossy(),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(dst.path().join(".env.local")).unwrap(), "MINE=9\n");
+        assert!(!written.contains(&".env.local".to_string()), "an untouched file is not 'written'");
+    }
+
+    #[test]
+    fn checkout_seed_skips_env_files_that_live_inside_a_worktree() {
+        let src = tmp();
+        let dst = tmp();
+        checkout(src.path());
+        seed_from_checkout(&src.path().to_string_lossy(), &dst.path().to_string_lossy()).unwrap();
+        // A worktree's `.env.local` is itself a seeded copy. Carrying it across would nest one
+        // worktree's files inside another's, and it is the same duplication that filled the vault.
+        assert!(!dst.path().join(".claude/worktrees/old/.env.local").exists());
+    }
+
+    #[test]
+    fn checkout_seed_writes_owner_only_files() {
+        let src = tmp();
+        let dst = tmp();
+        // Deliberately world-readable at the SOURCE: `fs::copy` carries permission bits over, so a
+        // seed that merely copies would reproduce 0644 and leave a secret readable by every user
+        // on the machine.
+        std::fs::write(src.path().join(".env.local"), "ROOT=1\n").unwrap();
+        std::fs::set_permissions(
+            src.path().join(".env.local"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        seed_from_checkout(&src.path().to_string_lossy(), &dst.path().to_string_lossy()).unwrap();
+        let mode = std::fs::metadata(dst.path().join(".env.local")).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "a restored secret must be owner-only");
+    }
+
+    #[test]
+    fn checkout_seed_refuses_a_source_that_is_not_a_directory() {
+        let dst = tmp();
+        let err = seed_from_checkout("/definitely/not/here", &dst.path().to_string_lossy())
+            .unwrap_err();
+        assert!(err.contains("project folder"), "got {err}");
+    }
+
+    #[test]
+    fn the_scan_does_not_descend_into_worktrees() {
+        let d = tmp();
+        checkout(d.path());
+        let mut out = Vec::new();
+        collect_env_files(d.path(), 0, &mut out);
+        // The stale worktree copy is the item that filled the founder's vault with a dozen
+        // duplicates of one secret and rendered a wall of "Only in vault" rows on a second machine.
+        assert!(
+            !out.iter().any(|p| p.to_string_lossy().contains("worktrees")),
+            "the scan must not find env files inside a worktree: {out:?}"
+        );
+        assert!(out.iter().any(|p| p.ends_with(".env.local")), "it must still find the real ones");
     }
 
     #[test]

@@ -298,13 +298,24 @@ function titleParts(title: string): [string, string] {
 // Summary
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 
-/** Counts the pane renders, plus the one boolean the "Back up all" button binds to. */
+/** Counts the pane renders, plus the booleans the two bulk buttons bind to. */
 export interface EnvBackupSummary {
   total: number;
   inSync: number;
   drifted: number;
   notBackedUp: number;
   missingLocally: number;
+  /** Exactly the number of files a "Restore all" click would ATTEMPT — i.e.
+   *  `rowsNeedingRestore(rows).length`. Not every attempt writes a file: a row whose destination
+   *  lives inside a worktree this machine has never cut is skipped at plan time (see
+   *  {@link planRestore}), which needs the filesystem and so cannot be known here. The button
+   *  therefore promises an attempt count, and the run reports what actually landed. */
+  needsRestore: number;
+  /** True iff a "Restore all" click would attempt anything. `missing-locally` is the only status
+   *  with a vault copy and no local file, so it is the only one a restore acts on: restoring an
+   *  `in-sync` row rewrites identical bytes, and restoring a `drifted` one would discard local
+   *  edits without asking — that is the single-file confirm path, not a bulk button. */
+  canRestoreAll: boolean;
   /** Exactly the number of files a "Back up all" click would upload — i.e.
    *  `rowsNeedingBackup(rows).length`, computed from the same predicate so the count and the action
    *  can never disagree. NOT simply `drifted + notBackedUp`: a conflicted row whose kept file is
@@ -350,6 +361,7 @@ export function summarize(rows: readonly EnvBackupRow[]): EnvBackupSummary {
   // ONE predicate behind both the count and the action. When these were computed separately, the
   // pane rendered an enabled "Back up 1" whose click uploaded nothing.
   const needsBackup = rows.filter(isBackupEligible).length;
+  const needsRestore = rows.filter(isRestoreEligible).length;
   return {
     total: rows.length,
     inSync,
@@ -358,6 +370,8 @@ export function summarize(rows: readonly EnvBackupRow[]): EnvBackupSummary {
     missingLocally,
     needsBackup,
     canBackUpAll: needsBackup > 0,
+    needsRestore,
+    canRestoreAll: needsRestore > 0,
   };
 }
 
@@ -386,4 +400,150 @@ function isBackupEligible(row: EnvBackupRow): boolean {
  *  same predicate feeds `summarize().needsBackup`, so the button's count can't lie about its click. */
 export function rowsNeedingBackup(rows: readonly EnvBackupRow[]): EnvBackupRow[] {
   return rows.filter(isBackupEligible);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// Restore — the DOWN direction
+//
+// The feature shipped with bulk UP and single-file DOWN, which made a portability feature work in
+// exactly one direction: a second machine showed a wall of "Only in vault" rows, a primary button
+// reading "Back up 0", and no way to bring anything down (bead sparkle-y5xc9). Everything below is
+// the mirror of the backup half above — same shape, same one-predicate-behind-count-and-action rule.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+/** Whether a "Restore all" click would attempt this row.
+ *
+ *  `missing-locally` and nothing else. The other three states all have a local file, and a bulk
+ *  button must not touch one: `in-sync` would rewrite identical bytes, and `drifted` /
+ *  `not-backed-up` would discard local edits. Overwriting a file the user is editing is the one
+ *  irreversible thing this feature can do, so it stays behind the single-file confirm. */
+function isRestoreEligible(row: EnvBackupRow): boolean {
+  return row.status === "missing-locally" && row.record !== null;
+}
+
+/** What "Restore all" attempts, in display order. Same predicate as `summarize().needsRestore`. */
+export function rowsNeedingRestore(rows: readonly EnvBackupRow[]): EnvBackupRow[] {
+  return rows.filter(isRestoreEligible);
+}
+
+/** A project root a restore can write into, projected from the project store. */
+export interface RestoreRoot {
+  projectName: string;
+  rootPath: string;
+}
+
+/** Why a candidate row will not be written. Both reasons are reported to the user rather than
+ *  silently dropped — a restore that quietly skips files is the failure mode this pane exists to
+ *  avoid, since a half-present set of `.env` files is worse than none. */
+export type RestoreSkipReason =
+  /** No registered project matches the title's first segment, so there is no root to write under. */
+  | "unknown-project"
+  /** The destination folder is inside a worktree this machine has never cut. See {@link planRestore}. */
+  | "worktree-missing";
+
+/** One row paired with the absolute path its bytes would land at. */
+export interface RestoreTarget {
+  row: EnvBackupRow;
+  /** The vault item to download. Non-null by construction — `isRestoreEligible` requires a record. */
+  itemId: string;
+  absPath: string;
+}
+
+export interface RestoreSkip {
+  row: EnvBackupRow;
+  reason: RestoreSkipReason;
+}
+
+export interface RestorePlan {
+  restore: RestoreTarget[];
+  skipped: RestoreSkip[];
+}
+
+/** Join a root path and a project-relative path. Trailing separators on the root are stripped so a
+ *  root stored as `/Users/dev/proj/` cannot produce a doubled slash — the path is handed to the
+ *  filesystem, and `//` is the one form POSIX leaves implementation-defined. */
+export function joinPath(rootPath: string, relPath: string): string {
+  return `${rootPath.replace(/[/\\]+$/, "")}/${normalizeRelPath(relPath)}`;
+}
+
+/** The directory a restored file would land in — everything before the last separator. */
+export function parentDir(absPath: string): string {
+  const cut = Math.max(absPath.lastIndexOf("/"), absPath.lastIndexOf("\\"));
+  return cut <= 0 ? absPath.slice(0, Math.max(cut, 0)) : absPath.slice(0, cut);
+}
+
+/** Whether a project-relative path lives inside a git worktree slot (`.claude/worktrees/<name>/…`,
+ *  `.git/worktrees/…`). Checked on SEGMENTS, never as a substring, so a project directory honestly
+ *  named `my-worktrees-notes` is not mistaken for one. */
+export function isInsideWorktreeSlot(relPath: string): boolean {
+  const parts = normalizeRelPath(relPath).split("/");
+  // The last segment is the FILE. A file literally named `worktrees` is not a worktree slot.
+  return parts.slice(0, -1).some((s) => s === "worktrees");
+}
+
+/** Every destination folder {@link planRestore} needs an existence answer for, deduplicated.
+ *  Handed to `envDirsExist` so a bulk restore costs ONE filesystem round trip, not one per file. */
+export function restoreParentDirs(
+  rows: readonly EnvBackupRow[],
+  roots: readonly RestoreRoot[],
+): string[] {
+  const byName = rootsByProjectName(roots);
+  const dirs = new Set<string>();
+  for (const row of rowsNeedingRestore(rows)) {
+    const root = byName.get(row.projectName);
+    if (root) dirs.add(parentDir(joinPath(root, row.relPath)));
+  }
+  return [...dirs];
+}
+
+function rootsByProjectName(roots: readonly RestoreRoot[]): Map<string, string> {
+  const byName = new Map<string, string>();
+  for (const r of roots) {
+    // Titles were written through `normalizeProjectName`, so the lookup has to speak the same
+    // dialect — a project named `acme/web` is stored as `acme-web/…` and would never match raw.
+    const key = normalizeProjectName(r.projectName);
+    if (!byName.has(key)) byName.set(key, r.rootPath);
+  }
+  return byName;
+}
+
+/** Decide, for every restorable row, whether to write it and where.
+ *
+ *  THE ONE JUDGEMENT CALL, stated explicitly: a row whose destination folder does not exist AND
+ *  whose path lies inside a worktree slot is SKIPPED, not created.
+ *
+ *  Creating it would be actively harmful, not merely untidy. `git worktree add <path>` refuses a
+ *  path that already exists and is non-empty, so materialising `.claude/worktrees/foo/` just to
+ *  hold a `.env.local` breaks the later `git worktree add` that wants that slot — the exact failure
+ *  `envSeed.ts` already documents on the teardown path. It also leaves a plaintext secret in a
+ *  directory that is inside no checkout, that nothing will ever clean up, and that no agent will
+ *  ever read. And it buys nothing: worktrees are seeded from the project checkout now, so a
+ *  worktree cut later gets its env files without this row existing at all.
+ *
+ *  Every OTHER missing folder is created by the restore itself (the Rust side's `create_dir_all`).
+ *  An `apps/web/.env.local` whose `apps/web` is absent on this branch is an ordinary restore: the
+ *  directory is part of the project, not a slot something else owns. */
+export function planRestore(
+  rows: readonly EnvBackupRow[],
+  roots: readonly RestoreRoot[],
+  existingDirs: ReadonlySet<string>,
+): RestorePlan {
+  const byName = rootsByProjectName(roots);
+  const restore: RestoreTarget[] = [];
+  const skipped: RestoreSkip[] = [];
+  for (const row of rowsNeedingRestore(rows)) {
+    const root = byName.get(row.projectName);
+    if (root === undefined) {
+      skipped.push({ row, reason: "unknown-project" });
+      continue;
+    }
+    const absPath = joinPath(root, row.relPath);
+    if (!existingDirs.has(parentDir(absPath)) && isInsideWorktreeSlot(row.relPath)) {
+      skipped.push({ row, reason: "worktree-missing" });
+      continue;
+    }
+    // Non-null by construction: `rowsNeedingRestore` filters on `record !== null`.
+    restore.push({ row, itemId: row.record!.itemId, absPath });
+  }
+  return { restore, skipped };
 }

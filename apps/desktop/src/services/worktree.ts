@@ -316,13 +316,15 @@ function bootstrapDepsInto(worktreePath: string): void {
 const preparedPaths = new Map<string, string>();
 const seedKey = (projectId: string, agentId: string) => `${projectId}\u0000${agentId}`;
 
-/** Kick off the 1Password env-file restore for a newly cut worktree, if the user has turned it on.
+/** Kick off the env-file copy for a newly cut worktree, if the user has turned it on.
  *
  *  Deliberately NOT awaited: the worktree is ready and the caller should proceed. Seeding is a
  *  best-effort convenience that must never delay — or fail — opening an agent. See envSeed.ts.
  *
- *  The project NAME (not the id) is what the vault item titles are keyed on, so it is read from the
- *  store here rather than derived from the root path, which can differ from the project's name. */
+ *  The project's ROOT PATH is what seeding needs — the files are copied from the project's own
+ *  checkout, not downloaded from 1Password (bead sparkle-y5xc9), so this path makes no `op` call
+ *  and can never raise an authorization prompt. It is read from the store rather than derived from
+ *  the worktree path, which points at app data and holds none of the originals. */
 function seedEnvInto(projectId: string, agentId: string, worktreePath: string): void {
   // The try/catch enforces "seeding never fails a spawn" HERE rather than trusting every callee to
   // keep being throw-free. The store read and the seeder are both non-throwing today; this is what
@@ -331,13 +333,13 @@ function seedEnvInto(projectId: string, agentId: string, worktreePath: string): 
     const project = useProjectStore.getState().projects.find((p) => p.id === projectId);
     if (!project) {
       // An evicted record, a worker re-derived from its on-disk manifest, or a store still
-      // rehydrating: without the name there is no title prefix to match, so seeding is impossible
-      // rather than merely empty. Say so — silence here looks identical to "the feature is off".
-      // The project ID only: a worktree path is exactly what these logs keep out.
+      // rehydrating: without the record there is no source checkout to copy from, so seeding is
+      // impossible rather than merely empty. Say so — silence here looks identical to "the feature
+      // is off". The project ID only: a worktree path is exactly what these logs keep out.
       console.warn(`env seed: no project record for ${projectId}; skipping seed`);
       return;
     }
-    seedWorktreeEnv(project.name, worktreePath);
+    seedWorktreeEnv(project.rootPath, worktreePath);
   } catch (e) {
     console.warn("env seed: could not start the seed for this worktree", e);
   }

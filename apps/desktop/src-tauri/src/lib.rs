@@ -591,6 +591,8 @@ pub fn run() {
             onepassword::op_backup,
             onepassword::op_restore,
             onepassword::op_seed_worktree,
+            onepassword::env_dirs_exist,
+            onepassword::env_seed_from_checkout,
             setup::install_node,
             setup::install_claude_code,
             setup::install_git,

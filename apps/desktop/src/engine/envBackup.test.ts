@@ -5,6 +5,10 @@ import {
   joinBackups,
   summarize,
   rowsNeedingBackup,
+  rowsNeedingRestore,
+  isInsideWorktreeSlot,
+  planRestore,
+  restoreParentDirs,
   type EnvBackupRow,
 } from "./envBackup";
 import type { EnvFile, OpBackupRecord, ScanRoot } from "../services/onepassword";
@@ -356,6 +360,8 @@ describe("summarize", () => {
       missingLocally: 1,
       needsBackup: 2,
       canBackUpAll: true,
+      needsRestore: 1,
+      canRestoreAll: true,
     });
   });
 
@@ -368,6 +374,8 @@ describe("summarize", () => {
       missingLocally: 0,
       needsBackup: 0,
       canBackUpAll: false,
+      needsRestore: 0,
+      canRestoreAll: false,
     });
   });
 
@@ -799,5 +807,134 @@ describe("row provenance", () => {
     // missing-locally rows come from a title alone — there is no project id to report, and a UI
     // navigating from the row has to handle that rather than trust a fabricated one.
     expect(gone?.projectId).toBeUndefined();
+  });
+});
+
+// ── restore: the DOWN direction (bead sparkle-y5xc9) ────────────────────────────────────────
+
+describe("rowsNeedingRestore / summarize", () => {
+  it("offers exactly the rows that exist only in the vault", () => {
+    const rows = joinBackups(
+      [file("sparkle", ".env.local", HASH_A), file("sparkle", "b.env", HASH_B)],
+      [record("sparkle/.env.local", HASH_A), record("sparkle/gone/.env.local", HASH_C)],
+      { roots: [root("sparkle")] },
+    );
+    // in-sync and not-backed-up rows both have a local file; restoring either would rewrite or
+    // clobber it. Only the vault-only row is a restore.
+    expect(byTitle(rowsNeedingRestore(rows))).toEqual(["sparkle/gone/.env.local"]);
+  });
+
+  it("counts and enables from the SAME predicate the click uses", () => {
+    const rows = joinBackups([], [record("sparkle/gone/.env.local")], { roots: [root("sparkle")] });
+    const s = summarize(rows);
+    expect(s.needsRestore).toBe(rowsNeedingRestore(rows).length);
+    expect(s.canRestoreAll).toBe(true);
+  });
+
+  it("disables the button when nothing is vault-only", () => {
+    const rows = joinBackups([file("sparkle", ".env.local", HASH_A)], [], { roots: [root("sparkle")] });
+    const s = summarize(rows);
+    expect(s.needsRestore).toBe(0);
+    expect(s.canRestoreAll).toBe(false);
+  });
+});
+
+describe("isInsideWorktreeSlot", () => {
+  it("matches a worktree slot on SEGMENTS, never as a substring", () => {
+    expect(isInsideWorktreeSlot(".claude/worktrees/foo/.env.local")).toBe(true);
+    expect(isInsideWorktreeSlot(".git/worktrees/x/.env")).toBe(true);
+    // A project directory honestly named `my-worktrees-notes` is not a slot, and neither is a
+    // FILE named `worktrees` — the last segment is the file, never a directory.
+    expect(isInsideWorktreeSlot("my-worktrees-notes/.env.local")).toBe(false);
+    expect(isInsideWorktreeSlot("worktrees")).toBe(false);
+    expect(isInsideWorktreeSlot(".env.local")).toBe(false);
+  });
+});
+
+describe("planRestore", () => {
+  const roots = [{ projectName: "sparkle", rootPath: "/Users/dev/sparkle" }];
+  const vaultOnly = (relPath: string) =>
+    joinBackups([], [record(`sparkle/${relPath}`)], { roots: [root("sparkle")] });
+
+  it("writes into the project root and names the absolute destination", () => {
+    const plan = planRestore(vaultOnly(".env.local"), roots, new Set(["/Users/dev/sparkle"]));
+    expect(plan.restore).toHaveLength(1);
+    expect(plan.restore[0]?.absPath).toBe("/Users/dev/sparkle/.env.local");
+    expect(plan.restore[0]?.itemId).toBe("item-sparkle/.env.local");
+    expect(plan.skipped).toEqual([]);
+  });
+
+  it("SKIPS a row whose worktree this machine has never cut, and says why", () => {
+    // THE JUDGEMENT CALL. Creating `.claude/worktrees/foo/` to hold a `.env.local` would break the
+    // later `git worktree add` that wants that slot (git refuses a non-empty existing path) and
+    // would leave a plaintext secret in a directory inside no checkout. Restoring it buys nothing
+    // either: worktrees are seeded from the project checkout now.
+    const plan = planRestore(
+      vaultOnly(".claude/worktrees/foo/.env.local"),
+      roots,
+      new Set(["/Users/dev/sparkle"]), // the slot dir is NOT in the set
+    );
+    expect(plan.restore).toEqual([]);
+    expect(plan.skipped.map((s) => s.reason)).toEqual(["worktree-missing"]);
+  });
+
+  it("DOES restore into a worktree that already exists", () => {
+    // The skip is about not CREATING the slot, not about worktrees being off-limits. A slot that
+    // is already there is an ordinary destination.
+    const plan = planRestore(
+      vaultOnly(".claude/worktrees/foo/.env.local"),
+      roots,
+      new Set(["/Users/dev/sparkle/.claude/worktrees/foo"]),
+    );
+    expect(plan.restore).toHaveLength(1);
+    expect(plan.skipped).toEqual([]);
+  });
+
+  it("creates ordinary missing folders rather than skipping them", () => {
+    // `apps/web` is part of the project, not a slot something else owns — an absent one on this
+    // branch is a normal restore, and the backend's create_dir_all handles it.
+    const plan = planRestore(vaultOnly("apps/web/.env.local"), roots, new Set([]));
+    expect(plan.restore).toHaveLength(1);
+    expect(plan.restore[0]?.absPath).toBe("/Users/dev/sparkle/apps/web/.env.local");
+  });
+
+  it("skips a row whose project is not open in Sparkle rather than guessing a root", () => {
+    const plan = planRestore(vaultOnly(".env.local"), [], new Set([]));
+    expect(plan.restore).toEqual([]);
+    expect(plan.skipped.map((s) => s.reason)).toEqual(["unknown-project"]);
+  });
+
+  it("matches roots through the SAME name normalization the titles were written with", () => {
+    // A project named `acme/web` is stored as `acme-web/…`; a raw-name lookup would never match
+    // and every one of its rows would report unknown-project.
+    const rows = joinBackups([], [record("acme-web/.env.local")], { roots: [root("acme/web")] });
+    const plan = planRestore(rows, [{ projectName: "acme/web", rootPath: "/Users/dev/acme-web" }], new Set(["/Users/dev/acme-web"]));
+    expect(plan.restore[0]?.absPath).toBe("/Users/dev/acme-web/.env.local");
+  });
+
+  it("asks about each destination folder once, deduplicated", () => {
+    const rows = joinBackups(
+      [],
+      [record("sparkle/apps/web/.env.local"), record("sparkle/apps/web/.env.production")],
+      { roots: [root("sparkle")] },
+    );
+    expect(restoreParentDirs(rows, roots)).toEqual(["/Users/dev/sparkle/apps/web"]);
+  });
+});
+
+describe("rowsNeedingBackup covers every uploadable file in one click", () => {
+  it("takes drifted and never-backed-up rows together, so 'Back up N' is the upload-all", () => {
+    // The founder's second ask: one button that uploads everything rather than file-by-file.
+    const rows = joinBackups(
+      [
+        file("sparkle", ".env.local", HASH_A), // in sync
+        file("sparkle", "a/.env", HASH_B), // drifted
+        file("sparkle", "b/.env", HASH_C), // never backed up
+      ],
+      [record("sparkle/.env.local", HASH_A), record("sparkle/a/.env", HASH_A)],
+      { roots: [root("sparkle")] },
+    );
+    expect(byTitle(rowsNeedingBackup(rows)).sort()).toEqual(["sparkle/a/.env", "sparkle/b/.env"]);
+    expect(summarize(rows).needsBackup).toBe(2);
   });
 });

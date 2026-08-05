@@ -20,8 +20,20 @@ import {
   type OpStatus,
   type OpVault,
 } from "../services/onepassword";
-import { backupRows, loadEnvBackupRows, toScanRoots } from "../services/envBackupActions";
-import { rowsNeedingBackup, summarize, type EnvBackupRow, type EnvFileStatus } from "../engine/envBackup";
+import {
+  backupRows,
+  loadEnvBackupRows,
+  restoreRows,
+  toScanRoots,
+  type RestoreRunResult,
+} from "../services/envBackupActions";
+import {
+  rowsNeedingBackup,
+  rowsNeedingRestore,
+  summarize,
+  type EnvBackupRow,
+  type EnvFileStatus,
+} from "../engine/envBackup";
 import { CHIP, SECTION_LABEL } from "./labelTreatment";
 
 // The "1Password" settings pane: get `op` working, pick a vault, then see every .env file across
@@ -41,6 +53,30 @@ const INTEGRATION_DOCS = "https://developer.1password.com/docs/cli/app-integrati
 function accountLabel(a: OpAccount): string {
   const head = [a.url, a.email].filter(Boolean).join(" — ");
   return head ? `${head} (${a.userUuid})` : a.userUuid;
+}
+
+/** One sentence covering ALL THREE outcomes of a restore run, in the order that matters to someone
+ *  who just clicked the button: what landed, what was deliberately left alone and why, what broke.
+ *
+ *  A restore that reports only its successes is the failure this pane exists to prevent — a set of
+ *  `.env` files that is silently half-present is worse than one that is honestly absent — so the
+ *  skipped and failed counts are never dropped, even when zero files failed. */
+export function describeRestore(res: RestoreRunResult): string {
+  const parts = [`${res.restored.length} restored`];
+  const worktreeSkips = res.skipped.filter((s) => s.reason === "worktree-missing").length;
+  const unknownSkips = res.skipped.filter((s) => s.reason === "unknown-project").length;
+  if (worktreeSkips > 0) {
+    // Say WHY in the same breath. "10 skipped" alone reads as a malfunction; these rows are copies
+    // of files that already restored, belonging to worktrees this machine has never cut.
+    parts.push(
+      `${worktreeSkips} skipped (they belong to agent worktrees this machine hasn’t created — new worktrees get their env files copied from your project, so there’s nothing to do)`,
+    );
+  }
+  if (unknownSkips > 0) {
+    parts.push(`${unknownSkips} skipped (no matching project is open in Sparkle)`);
+  }
+  if (res.failures.length > 0) parts.push(`${res.failures.length} failed`);
+  return `${parts.join(" · ")}.`;
 }
 
 /** Human label + tone for each drift state. */
@@ -71,6 +107,11 @@ export function OnePasswordPane() {
   const [backupBusy, setBackupBusy] = useState<string | null>(null);
   const busy = backupBusy ?? scanBusy;
   const [error, setError] = useState<string | null>(null);
+  // The OUTCOME of the last bulk run, success included. An error-only banner could report what
+  // failed but never what worked, which for a restore is the more important half: "12 restored" is
+  // what tells the user their machine is actually set up. Held separately from `error` so a run
+  // that both wrote files and skipped some can say both.
+  const [notice, setNotice] = useState<string | null>(null);
 
   // Probe `op` on mount and whenever the tool is switched on, so the pane opens showing the real
   // state rather than an optimistic one.
@@ -118,6 +159,7 @@ export function OnePasswordPane() {
     const gen = ++scanGen.current;
     setScanBusy("Scanning…");
     setError(null);
+    setNotice(null);
     try {
       const next = await loadEnvBackupRows(vaultId, toScanRoots(projects));
       if (gen !== scanGen.current) return; // a newer scan started; its result is the truth
@@ -181,25 +223,58 @@ export function OnePasswordPane() {
     const pending = rowsNeedingBackup(rows);
     setBackupBusy(`Backing up 0/${pending.length}…`);
     setError(null);
+    setNotice(null);
     // Held rather than set immediately: the re-scan below CLEARS the banner on the way in, so a
     // message set here would vanish before the user could read which files didn't make it.
     let failure: string | null = null;
+    let outcome: string | null = null;
     try {
       const res = await backupRows(vaultId, pending, (done, total) =>
         setBackupBusy(`Backing up ${done}/${total}…`),
       );
+      outcome = `${res.uploaded} of ${pending.length} backed up.`;
       if (res.failures.length > 0) {
         // Name the count and the first failure rather than a generic "something went wrong" — a
         // partial backup the user can't characterize is worse than none.
         failure = `${res.uploaded} backed up, ${res.failures.length} failed. First error: ${res.failures[0]?.error ?? ""}`;
+        outcome = null;
       }
     } catch (e) {
       failure = String(e);
     } finally {
       setBackupBusy(null);
-      // Re-scan so the rows reflect what actually landed, THEN restore the failure summary.
+      // Re-scan so the rows reflect what actually landed, THEN restore the summary.
       await refreshRows();
       if (failure) setError(failure);
+      if (outcome) setNotice(outcome);
+    }
+  };
+
+  const onRestoreAll = async () => {
+    if (!rows) return;
+    const pending = rowsNeedingRestore(rows).length;
+    setBackupBusy(`Restoring 0/${pending}…`);
+    setError(null);
+    setNotice(null);
+    // Same hold-then-set dance as the backup above, and for the same reason: `refreshRows` clears
+    // both banners on the way in.
+    let failure: string | null = null;
+    let outcome: string | null = null;
+    try {
+      const res = await restoreRows(rows, toScanRoots(projects), (done, total) =>
+        setBackupBusy(`Restoring ${done}/${total}…`),
+      );
+      outcome = describeRestore(res);
+      if (res.failures.length > 0) {
+        failure = `${res.failures.length} couldn’t be restored. First error: ${res.failures[0]?.error ?? ""}`;
+      }
+    } catch (e) {
+      failure = String(e);
+    } finally {
+      setBackupBusy(null);
+      await refreshRows();
+      if (failure) setError(failure);
+      if (outcome) setNotice(outcome);
     }
   };
 
@@ -359,6 +434,20 @@ export function OnePasswordPane() {
               <button type="button" style={linkBtn} disabled={!!busy} onClick={() => void refreshRows()}>
                 <FiRefreshCw size={12} /> Rescan
               </button>
+              {/* The DOWN direction, sitting beside the UP one. Its absence is what made a feature
+                  built for portability work in exactly one direction: a second machine showed a
+                  wall of "Only in vault" rows and a primary button reading "Back up 0" (bead
+                  sparkle-y5xc9). Both bulk actions share the `backupBusy` slot, so one can never
+                  run while the other is mid-flight. */}
+              <button
+                type="button"
+                style={{ ...secondaryBtn, opacity: summary?.canRestoreAll && !busy ? 1 : 0.5 }}
+                disabled={!summary?.canRestoreAll || !!busy}
+                onClick={() => void onRestoreAll()}
+              >
+                <FiDownload size={13} />{" "}
+                {busy?.startsWith("Restoring") ? busy : `Restore ${summary?.needsRestore ?? 0}`}
+              </button>
               <button
                 type="button"
                 style={{ ...primaryBtn, opacity: summary?.canBackUpAll && !busy ? 1 : 0.5 }}
@@ -424,11 +513,27 @@ export function OnePasswordPane() {
               {summary.missingLocally > 0 ? ` · ${summary.missingLocally} only in your vault` : ""}
             </div>
           )}
+
+          {/* SAY IT BEFORE, not after. 1Password grants CLI access to the calling process and lets
+              it lapse after ten minutes idle, so a bulk run that starts cold raises one prompt —
+              and being told that up front is the difference between a normal step and the app
+              apparently misbehaving. It is ONE prompt, not one per file: the files go out
+              back-to-back, and back-to-back activity is what keeps the grant alive. */}
+          {summary && rows !== null && rows.length > 0 && (
+            <div style={hintStyle}>
+              If 1Password has been idle it will ask you to authorize Sparkle once when a backup or
+              restore starts. Both buttons work through the whole list in one go, so it asks once,
+              not once per file.
+            </div>
+          )}
         </section>
       )}
 
-      {/* ── Worktree seeding ───────────────────────────────────────────────────────────────── */}
-      {ready && vaultId && (
+      {/* ── Worktree seeding ─────────────────────────────────────────────────────────────────
+          NO LONGER GATED ON A VAULT. Seeding copies from the project checkout now (bead
+          sparkle-y5xc9), so it touches neither `op` nor the vault — gating the control on a vault
+          choice would have hidden the only switch for a feature that no longer depends on one. */}
+      {enabled && (
         <section>
           <div style={groupLabel}>New agent worktrees</div>
           <label style={checkRow}>
@@ -438,15 +543,19 @@ export function OnePasswordPane() {
               onChange={(e) => void setOnePasswordSeedWorktrees(e.target.checked)}
             />
             <span>
-              <span style={{ color: C.cream }}>Restore env files into every new worktree</span>
+              <span style={{ color: C.cream }}>Copy env files into every new worktree</span>
               <div style={hintStyle}>
                 Every agent gets its own git worktree, and <code>.env</code> files are gitignored —
-                so without this, each new agent starts without your project’s secrets.
+                so without this, each new agent starts without your project’s secrets. The files are
+                copied from your project folder, not downloaded, so opening an agent never asks
+                1Password for anything.
               </div>
             </span>
           </label>
         </section>
       )}
+
+      {notice && <div style={hintStyle}>{notice}</div>}
 
       {error && (
         <div role="alert" style={errorStyle}>
@@ -488,6 +597,22 @@ const primaryBtn: CSSProperties = {
   border: "none",
   background: C.teal,
   color: ON_BRAND_FILL,
+  fontSize: 12,
+  fontWeight: FONT_WEIGHT.semibold,
+  cursor: "pointer",
+};
+// The DOWN action. Deliberately NOT `primaryBtn`: two filled buttons side by side read as equally
+// weighted, and on the machine where restore matters the up-direction is what you must not click by
+// reflex. A hairline outline is the standard secondary treatment in this pane's chrome.
+const secondaryBtn: CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  gap: 6,
+  padding: "6px 12px",
+  borderRadius: 6,
+  border: `1px solid ${C.hairline}`,
+  background: "transparent",
+  color: C.cream,
   fontSize: 12,
   fontWeight: FONT_WEIGHT.semibold,
   cursor: "pointer",

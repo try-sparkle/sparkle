@@ -6,9 +6,9 @@
 // and never write into a worktree that is being torn down.
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
-vi.mock("./onepassword", () => ({ opSeedWorktree: vi.fn() }));
+vi.mock("./onepassword", () => ({ envSeedFromCheckout: vi.fn() }));
 
-import { opSeedWorktree } from "./onepassword";
+import { envSeedFromCheckout } from "./onepassword";
 import { useSettingsStore } from "../stores/settingsStore";
 import {
   abandonWorktreeSeed,
@@ -17,9 +17,13 @@ import {
   seedWorktreeEnv,
 } from "./envSeed";
 
-const mockSeed = vi.mocked(opSeedWorktree);
+const mockSeed = vi.mocked(envSeedFromCheckout);
 
-/** The fully opted-in state: tool on, seeding on, vault chosen. */
+/** The project checkout seeding copies FROM. Seeding reads the project's own root path now, not a
+ *  vault id and a project name — see the module comment in envSeed.ts. */
+const SOURCE = "/Users/dev/sparkle";
+
+/** The fully opted-in state: tool on, seeding on. */
 function seedReady() {
   useSettingsStore.setState({
     onepasswordEnabled: true,
@@ -60,32 +64,46 @@ describe("envSeedEnabled — all three conditions are required", () => {
     expect(envSeedEnabled()).toBe(false);
   });
 
-  it("is false when no vault has been chosen", () => {
+  it("is TRUE with no vault chosen — seeding copies from the checkout, not the vault", () => {
+    // The vault requirement was removed with bead sparkle-y5xc9. Seeding no longer touches
+    // 1Password at all, so refusing to copy a file sitting on disk because of an unrelated
+    // setting would be a bug, not caution. This assertion fails against the old gate.
     useSettingsStore.setState({ onepasswordVaultId: null });
-    expect(envSeedEnabled()).toBe(false);
+    expect(envSeedEnabled()).toBe(true);
   });
 });
 
 describe("seedWorktreeEnv", () => {
-  it("restores using the vault id and the project NAME the titles are keyed on", async () => {
-    seedWorktreeEnv("sparkle", "/tmp/wt/agent-1");
-    await vi.waitFor(() =>
-      expect(mockSeed).toHaveBeenCalledWith("vault-abc", "sparkle", "/tmp/wt/agent-1"),
-    );
+  it("copies from the project checkout into the worktree", async () => {
+    seedWorktreeEnv(SOURCE, "/tmp/wt/agent-1");
+    await vi.waitFor(() => expect(mockSeed).toHaveBeenCalledWith(SOURCE, "/tmp/wt/agent-1"));
   });
 
-  it("hands the RAW store name to the boundary, which owns the normalization", async () => {
-    // opSeedWorktree normalizes (see onepassword.test.ts, which pins that the name crossing the IPC
-    // boundary is the same segment backupTitle wrote). This layer must not pre-mangle it.
-    seedWorktreeEnv("  acme/web  ", "/tmp/wt/agent-2");
-    await vi.waitFor(() =>
-      expect(mockSeed).toHaveBeenCalledWith("vault-abc", "  acme/web  ", "/tmp/wt/agent-2"),
-    );
+  it("never calls 1Password on the spawn path", async () => {
+    // THE POINT OF THE WHOLE CHANGE (bead sparkle-y5xc9). 1Password grants CLI access to the
+    // calling process — Sparkle — and lets it lapse after ten minutes idle, so a sporadic `op`
+    // call per agent spawn re-prompted about once per agent. This asserts the boundary this
+    // module reaches for, which is the only thing that can bring a prompt back: the mocked
+    // module exposes ONLY envSeedFromCheckout, so any reintroduced `op` import would be
+    // undefined and this call would land in the swallow-and-warn path instead.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    seedWorktreeEnv(SOURCE, "/tmp/wt/agent-2");
+    await vi.waitFor(() => expect(mockSeed).toHaveBeenCalledTimes(1));
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it("does nothing when the project has no root path to copy from", async () => {
+    // Distinct from "the feature is off": a project record with no root on disk has no source,
+    // and an empty source would let the backend walk from a path nobody chose.
+    seedWorktreeEnv("", "/tmp/wt/agent-3");
+    await Promise.resolve();
+    expect(mockSeed).not.toHaveBeenCalled();
   });
 
   it("does nothing at all when seeding is not enabled", async () => {
     useSettingsStore.setState({ onepasswordSeedWorktrees: false });
-    seedWorktreeEnv("sparkle", "/tmp/wt/agent-1");
+    seedWorktreeEnv(SOURCE, "/tmp/wt/agent-1");
     await Promise.resolve();
     expect(mockSeed).not.toHaveBeenCalled();
   });
@@ -95,7 +113,7 @@ describe("seedWorktreeEnv", () => {
     // If seedWorktreeEnv awaited it, it could not hand back a plain value at all — it would have
     // to return a pending promise, and opening an agent would hang with it.
     mockSeed.mockReturnValue(new Promise<string[]>(() => {}));
-    expect(seedWorktreeEnv("sparkle", "/tmp/wt/agent-1")).toBeUndefined();
+    expect(seedWorktreeEnv(SOURCE, "/tmp/wt/agent-1")).toBeUndefined();
   });
 
   it("swallows a rejected restore — a locked vault must not fail the spawn", async () => {
@@ -103,7 +121,7 @@ describe("seedWorktreeEnv", () => {
     mockSeed.mockRejectedValue(new Error("1Password is locked"));
 
     // The call itself must not throw...
-    expect(() => seedWorktreeEnv("sparkle", "/tmp/wt/agent-1")).not.toThrow();
+    expect(() => seedWorktreeEnv(SOURCE, "/tmp/wt/agent-1")).not.toThrow();
     // ...and the rejection must be handled, not left to become an unhandled rejection.
     await vi.waitFor(() => expect(warn).toHaveBeenCalled());
     warn.mockRestore();
@@ -113,7 +131,7 @@ describe("seedWorktreeEnv", () => {
     const info = vi.spyOn(console, "info").mockImplementation(() => {});
     mockSeed.mockResolvedValue([".env.local", "apps/web/.env.local"]);
 
-    seedWorktreeEnv("sparkle", "/tmp/wt/agent-1");
+    seedWorktreeEnv(SOURCE, "/tmp/wt/agent-1");
     await vi.waitFor(() => expect(info).toHaveBeenCalled());
 
     const logged = info.mock.calls.flat().join(" ");
@@ -127,7 +145,7 @@ describe("seedWorktreeEnv", () => {
   it("stays quiet when nothing was restored", async () => {
     const info = vi.spyOn(console, "info").mockImplementation(() => {});
     mockSeed.mockResolvedValue([]);
-    seedWorktreeEnv("sparkle", "/tmp/wt/agent-1");
+    seedWorktreeEnv(SOURCE, "/tmp/wt/agent-1");
     await vi.waitFor(() => expect(mockSeed).toHaveBeenCalled());
     expect(info).not.toHaveBeenCalled();
     info.mockRestore();
@@ -138,10 +156,10 @@ describe("seedWorktreeEnv — cost guards", () => {
   it("seeds a given worktree ONCE per session, however many times it is opened", async () => {
     // prepareAgentWorkspace runs on every agent mount, not just on a fresh cut. Without this guard
     // every open pays an `op item list` — and possibly a Touch ID prompt — to find nothing to do.
-    seedWorktreeEnv("sparkle", "/tmp/wt/agent-1");
+    seedWorktreeEnv(SOURCE, "/tmp/wt/agent-1");
     await vi.waitFor(() => expect(mockSeed).toHaveBeenCalledTimes(1));
-    seedWorktreeEnv("sparkle", "/tmp/wt/agent-1");
-    seedWorktreeEnv("sparkle", "/tmp/wt/agent-1");
+    seedWorktreeEnv(SOURCE, "/tmp/wt/agent-1");
+    seedWorktreeEnv(SOURCE, "/tmp/wt/agent-1");
     await Promise.resolve();
     expect(mockSeed).toHaveBeenCalledTimes(1);
   });
@@ -151,12 +169,12 @@ describe("seedWorktreeEnv — cost guards", () => {
     const first = deferred<string[]>();
     mockSeed.mockReturnValueOnce(first.promise).mockResolvedValue([]);
 
-    seedWorktreeEnv("sparkle", "/tmp/wt/w-1");
-    seedWorktreeEnv("sparkle", "/tmp/wt/w-2");
-    seedWorktreeEnv("sparkle", "/tmp/wt/w-3");
+    seedWorktreeEnv(SOURCE, "/tmp/wt/w-1");
+    seedWorktreeEnv(SOURCE, "/tmp/wt/w-2");
+    seedWorktreeEnv(SOURCE, "/tmp/wt/w-3");
 
     await vi.waitFor(() => expect(mockSeed).toHaveBeenCalledTimes(1));
-    expect(mockSeed).toHaveBeenCalledWith("vault-abc", "sparkle", "/tmp/wt/w-1");
+    expect(mockSeed).toHaveBeenCalledWith(SOURCE, "/tmp/wt/w-1");
 
     first.resolve([]);
     await vi.waitFor(() => expect(mockSeed).toHaveBeenCalledTimes(3));
@@ -165,10 +183,10 @@ describe("seedWorktreeEnv — cost guards", () => {
   it("does not let one failed seed poison the queue", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     mockSeed.mockRejectedValueOnce(new Error("boom")).mockResolvedValue([]);
-    seedWorktreeEnv("sparkle", "/tmp/wt/w-1");
-    seedWorktreeEnv("sparkle", "/tmp/wt/w-2");
+    seedWorktreeEnv(SOURCE, "/tmp/wt/w-1");
+    seedWorktreeEnv(SOURCE, "/tmp/wt/w-2");
     await vi.waitFor(() =>
-      expect(mockSeed).toHaveBeenCalledWith("vault-abc", "sparkle", "/tmp/wt/w-2"),
+      expect(mockSeed).toHaveBeenCalledWith(SOURCE, "/tmp/wt/w-2"),
     );
     warn.mockRestore();
   });
@@ -182,18 +200,18 @@ describe("seedWorktreeEnv — a FAILED seed stays retryable", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     mockSeed.mockRejectedValueOnce(new Error("1Password is locked")).mockResolvedValue([".env"]);
 
-    seedWorktreeEnv("sparkle", "/tmp/wt/agent-1");
+    seedWorktreeEnv(SOURCE, "/tmp/wt/agent-1");
     await vi.waitFor(() => expect(warn).toHaveBeenCalled());
 
-    seedWorktreeEnv("sparkle", "/tmp/wt/agent-1"); // the user unlocked and reopened the agent
+    seedWorktreeEnv(SOURCE, "/tmp/wt/agent-1"); // the user unlocked and reopened the agent
     await vi.waitFor(() => expect(mockSeed).toHaveBeenCalledTimes(2));
     warn.mockRestore();
   });
 
   it("stops retrying once a seed has SUCCEEDED", async () => {
-    seedWorktreeEnv("sparkle", "/tmp/wt/agent-1");
+    seedWorktreeEnv(SOURCE, "/tmp/wt/agent-1");
     await vi.waitFor(() => expect(mockSeed).toHaveBeenCalledTimes(1));
-    seedWorktreeEnv("sparkle", "/tmp/wt/agent-1");
+    seedWorktreeEnv(SOURCE, "/tmp/wt/agent-1");
     await Promise.resolve();
     expect(mockSeed).toHaveBeenCalledTimes(1);
   });
@@ -205,8 +223,8 @@ describe("abandonWorktreeSeed — teardown must win over an in-flight seed", () 
     // queue would stall unrelated prepares/removes on the same project for the full timeout.
     const first = deferred<string[]>();
     mockSeed.mockReturnValueOnce(first.promise).mockResolvedValue([]);
-    seedWorktreeEnv("sparkle", "/tmp/wt/w-1");
-    seedWorktreeEnv("sparkle", "/tmp/wt/doomed");
+    seedWorktreeEnv(SOURCE, "/tmp/wt/w-1");
+    seedWorktreeEnv(SOURCE, "/tmp/wt/doomed");
     await vi.waitFor(() => expect(mockSeed).toHaveBeenCalledTimes(1));
 
     let settled = false;
@@ -226,20 +244,20 @@ describe("abandonWorktreeSeed — teardown must win over an in-flight seed", () 
     const first = deferred<string[]>();
     mockSeed.mockReturnValueOnce(first.promise).mockResolvedValue([]);
 
-    seedWorktreeEnv("sparkle", "/tmp/wt/w-1");
-    seedWorktreeEnv("sparkle", "/tmp/wt/doomed");
+    seedWorktreeEnv(SOURCE, "/tmp/wt/w-1");
+    seedWorktreeEnv(SOURCE, "/tmp/wt/doomed");
     await vi.waitFor(() => expect(mockSeed).toHaveBeenCalledTimes(1));
 
     void abandonWorktreeSeed("/tmp/wt/doomed");
     first.resolve([]);
     await vi.waitFor(() => expect(mockSeed).toHaveBeenCalledTimes(1));
-    expect(mockSeed).not.toHaveBeenCalledWith("vault-abc", "sparkle", "/tmp/wt/doomed");
+    expect(mockSeed).not.toHaveBeenCalledWith(SOURCE, "/tmp/wt/doomed");
   });
 
   it("waits for a RUNNING seed before letting teardown proceed", async () => {
     const running = deferred<string[]>();
     mockSeed.mockReturnValue(running.promise);
-    seedWorktreeEnv("sparkle", "/tmp/wt/w-1");
+    seedWorktreeEnv(SOURCE, "/tmp/wt/w-1");
     await vi.waitFor(() => expect(mockSeed).toHaveBeenCalledTimes(1));
 
     let settled = false;
@@ -256,7 +274,7 @@ describe("abandonWorktreeSeed — teardown must win over an in-flight seed", () 
 
   it("gives up on a STUCK seed rather than hanging teardown", async () => {
     mockSeed.mockReturnValue(new Promise<string[]>(() => {})); // never settles
-    seedWorktreeEnv("sparkle", "/tmp/wt/w-1");
+    seedWorktreeEnv(SOURCE, "/tmp/wt/w-1");
     await vi.waitFor(() => expect(mockSeed).toHaveBeenCalledTimes(1));
     // A hung `op` (or a Touch ID prompt nobody answers) must not wedge closing an agent.
     await expect(abandonWorktreeSeed("/tmp/wt/w-1", 1)).resolves.toBeUndefined();
@@ -268,14 +286,14 @@ describe("abandonWorktreeSeed — teardown must win over an in-flight seed", () 
     // exists for.
     const running = deferred<string[]>();
     mockSeed.mockReturnValueOnce(running.promise).mockResolvedValue([]);
-    seedWorktreeEnv("sparkle", "/tmp/wt/slot-1");
+    seedWorktreeEnv(SOURCE, "/tmp/wt/slot-1");
     await vi.waitFor(() => expect(mockSeed).toHaveBeenCalledTimes(1));
 
     const wait = abandonWorktreeSeed("/tmp/wt/slot-1");
     running.resolve([".env"]); // the op call finishes AFTER the teardown
     await wait;
 
-    seedWorktreeEnv("sparkle", "/tmp/wt/slot-1"); // re-cut at the same slot
+    seedWorktreeEnv(SOURCE, "/tmp/wt/slot-1"); // re-cut at the same slot
     await vi.waitFor(() => expect(mockSeed).toHaveBeenCalledTimes(2));
   });
 
@@ -285,25 +303,25 @@ describe("abandonWorktreeSeed — teardown must win over an in-flight seed", () 
     // going to no-op — neither seed happened, silently.
     const first = deferred<string[]>();
     mockSeed.mockReturnValueOnce(first.promise).mockResolvedValue([]);
-    seedWorktreeEnv("sparkle", "/tmp/wt/w-1");
-    seedWorktreeEnv("sparkle", "/tmp/wt/slot-2");
+    seedWorktreeEnv(SOURCE, "/tmp/wt/w-1");
+    seedWorktreeEnv(SOURCE, "/tmp/wt/slot-2");
     await vi.waitFor(() => expect(mockSeed).toHaveBeenCalledTimes(1));
 
     await abandonWorktreeSeed("/tmp/wt/slot-2"); // still queued, never started
-    seedWorktreeEnv("sparkle", "/tmp/wt/slot-2"); // re-cut at the same slot
+    seedWorktreeEnv(SOURCE, "/tmp/wt/slot-2"); // re-cut at the same slot
 
     first.resolve([]);
     await vi.waitFor(() =>
-      expect(mockSeed).toHaveBeenCalledWith("vault-abc", "sparkle", "/tmp/wt/slot-2"),
+      expect(mockSeed).toHaveBeenCalledWith(SOURCE, "/tmp/wt/slot-2"),
     );
   });
 
   it("lets a worktree re-cut at the same path seed again", async () => {
-    seedWorktreeEnv("sparkle", "/tmp/wt/slot-1");
+    seedWorktreeEnv(SOURCE, "/tmp/wt/slot-1");
     await vi.waitFor(() => expect(mockSeed).toHaveBeenCalledTimes(1));
     await abandonWorktreeSeed("/tmp/wt/slot-1");
 
-    seedWorktreeEnv("sparkle", "/tmp/wt/slot-1");
+    seedWorktreeEnv(SOURCE, "/tmp/wt/slot-1");
     await vi.waitFor(() => expect(mockSeed).toHaveBeenCalledTimes(2));
   });
 });

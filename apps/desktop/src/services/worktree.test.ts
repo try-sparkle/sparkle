@@ -206,12 +206,14 @@ describe("worktree service — env seeding", () => {
     abandonMock.mockResolvedValue(undefined);
   });
 
-  it("seeds an agent worktree with the project's NAME and the path that was just cut", async () => {
-    // The NAME, not the id: vault item titles are `<projectName>/<relPath>`, so an id here would
-    // match nothing and silently seed an empty worktree.
+  it("seeds an agent worktree with the project's ROOT PATH and the path that was just cut", async () => {
+    // The project's own checkout is the SOURCE the env files are copied from (bead sparkle-y5xc9).
+    // Passing the project NAME here — what this used to do, when seeding downloaded from the vault
+    // by title — would hand the backend a name where it expects a directory, and every new
+    // worktree would come up empty.
     invoke.mockResolvedValue({ path: "/wt/p/a", branch: "sparkle/agent-a" });
     await prepareAgentWorkspace("/root-seed-agent", "p", "a", "main");
-    expect(seedMock).toHaveBeenCalledWith("Sparkle", "/wt/p/a");
+    expect(seedMock).toHaveBeenCalledWith("/root", "/wt/p/a");
   });
 
   it("seeds a worker worktree too — a fan-out is where empty worktrees hurt most", async () => {
@@ -219,7 +221,7 @@ describe("worktree service — env seeding", () => {
     await prepareWorkerWorkspace({
       root: "/root-seed-worker", projectId: "p", workerId: "w1", parentBranch: "main",
     });
-    expect(seedMock).toHaveBeenCalledWith("Sparkle", "/wt/p/w1");
+    expect(seedMock).toHaveBeenCalledWith("/root", "/wt/p/w1");
   });
 
   it("does NOT wait on the seed — a spawn resolves while the restore is still running", async () => {

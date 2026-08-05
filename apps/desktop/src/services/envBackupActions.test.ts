@@ -5,10 +5,12 @@ vi.mock("./onepassword", () => ({
   envScan: vi.fn(),
   opListBackups: vi.fn(),
   opBackup: vi.fn(),
+  opRestore: vi.fn(),
+  envDirsExist: vi.fn(),
 }));
 
-import { envScan, opListBackups, opBackup } from "./onepassword";
-import { loadEnvBackupRows, backupRows, toScanRoots } from "./envBackupActions";
+import { envScan, opListBackups, opBackup, opRestore, envDirsExist } from "./onepassword";
+import { loadEnvBackupRows, backupRows, restoreRows, toScanRoots } from "./envBackupActions";
 import type { EnvBackupRow } from "../engine/envBackup";
 
 const HASH_A = "a".repeat(64);
@@ -17,6 +19,8 @@ const HASH_B = "b".repeat(64);
 const mockScan = vi.mocked(envScan);
 const mockList = vi.mocked(opListBackups);
 const mockBackup = vi.mocked(opBackup);
+const mockRestore = vi.mocked(opRestore);
+const mockDirs = vi.mocked(envDirsExist);
 
 const envFile = (projectName: string, relPath: string, sha256 = HASH_A) => ({
   projectId: `id-${projectName}`,
@@ -31,6 +35,9 @@ const envFile = (projectName: string, relPath: string, sha256 = HASH_A) => ({
 beforeEach(() => {
   mockScan.mockResolvedValue([]);
   mockList.mockResolvedValue([]);
+  mockRestore.mockResolvedValue(undefined);
+  // Every destination folder exists unless a test says otherwise.
+  mockDirs.mockImplementation(async (paths: string[]) => paths.map(() => true));
   mockBackup.mockResolvedValue({
     itemId: "I1",
     title: "t",
@@ -161,6 +168,98 @@ describe("toScanRoots", () => {
   it("projects project-store rows into the backend's scan input", () => {
     expect(toScanRoots([{ id: "p1", name: "sparkle", rootPath: "/Users/dev/sparkle" }])).toEqual([
       { projectId: "p1", projectName: "sparkle", rootPath: "/Users/dev/sparkle" },
+    ]);
+  });
+});
+
+// ── restoreRows — the DOWN direction (bead sparkle-y5xc9) ───────────────────────────────────
+
+describe("restoreRows", () => {
+  const ROOTS = [{ projectName: "sparkle", rootPath: "/Users/dev/sparkle" }];
+
+  const vaultOnly = (relPath: string, itemId = `item-${relPath}`): EnvBackupRow => ({
+    title: `sparkle/${relPath}`,
+    projectName: "sparkle",
+    relPath,
+    file: null,
+    record: { itemId, title: `sparkle/${relPath}`, sha256: HASH_A, updatedAt: "x" },
+    status: "missing-locally",
+  });
+
+  it("restores every vault-only row into its project, one at a time", async () => {
+    const res = await restoreRows([vaultOnly(".env.local"), vaultOnly("apps/web/.env.local")], ROOTS);
+    expect(mockRestore).toHaveBeenCalledTimes(2);
+    expect(mockRestore).toHaveBeenCalledWith({
+      itemId: "item-.env.local",
+      absPath: "/Users/dev/sparkle/.env.local",
+      overwrite: false,
+    });
+    expect(res.restored).toEqual(["sparkle/.env.local", "sparkle/apps/web/.env.local"]);
+    expect(res.failures).toEqual([]);
+  });
+
+  it("NEVER asks to overwrite — a bulk button must not clobber a file being edited", async () => {
+    await restoreRows([vaultOnly(".env.local")], ROOTS);
+    // If a file has appeared since the scan, the backend refuses and we report it as a failure.
+    // Passing `overwrite: true` here would silently destroy the user's local edits instead.
+    for (const call of mockRestore.mock.calls) expect(call[0]?.overwrite).toBe(false);
+  });
+
+  it("keeps going after a failure and names every file that did not land", async () => {
+    mockRestore
+      .mockRejectedValueOnce(new Error("item not found"))
+      .mockResolvedValueOnce(undefined);
+    const res = await restoreRows([vaultOnly("a.env"), vaultOnly("b.env")], ROOTS);
+    expect(res.restored).toEqual(["sparkle/b.env"]);
+    expect(res.failures).toHaveLength(1);
+    expect(res.failures[0]?.title).toBe("sparkle/a.env");
+    expect(res.failures[0]?.error).toContain("item not found");
+    // A partial restore that reports only its successes is the failure this whole pane exists to
+    // prevent — .env files must never be silently half-present.
+    expect(mockRestore).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports skipped worktree rows instead of creating the slot directory", async () => {
+    mockDirs.mockResolvedValue([false]);
+    const res = await restoreRows([vaultOnly(".claude/worktrees/foo/.env.local")], ROOTS);
+    expect(mockRestore).not.toHaveBeenCalled();
+    expect(res.restored).toEqual([]);
+    expect(res.skipped).toEqual([
+      { title: "sparkle/.claude/worktrees/foo/.env.local", reason: "worktree-missing" },
+    ]);
+  });
+
+  it("asks the filesystem ONCE for every destination folder, not once per file", async () => {
+    await restoreRows(
+      [vaultOnly("apps/web/.env.local"), vaultOnly("apps/web/.env.production")],
+      ROOTS,
+    );
+    expect(mockDirs).toHaveBeenCalledTimes(1);
+    expect(mockDirs).toHaveBeenCalledWith(["/Users/dev/sparkle/apps/web"]);
+  });
+
+  it("does no work at all when nothing is vault-only", async () => {
+    const inSync: EnvBackupRow = {
+      title: "sparkle/.env.local",
+      projectName: "sparkle",
+      relPath: ".env.local",
+      file: envFile("sparkle", ".env.local"),
+      record: { itemId: "I1", title: "sparkle/.env.local", sha256: HASH_A, updatedAt: "x" },
+      status: "in-sync",
+    };
+    const res = await restoreRows([inSync], ROOTS);
+    // Not even the folder probe: a restore with no candidates must not touch the disk.
+    expect(mockDirs).not.toHaveBeenCalled();
+    expect(mockRestore).not.toHaveBeenCalled();
+    expect(res).toEqual({ restored: [], skipped: [], failures: [] });
+  });
+
+  it("reports progress as each file lands", async () => {
+    const seen: [number, number][] = [];
+    await restoreRows([vaultOnly("a.env"), vaultOnly("b.env")], ROOTS, (d, t) => seen.push([d, t]));
+    expect(seen).toEqual([
+      [1, 2],
+      [2, 2],
     ]);
   });
 });

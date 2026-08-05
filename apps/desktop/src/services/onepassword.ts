@@ -203,6 +203,36 @@ export function opRestore(args: OpRestoreArgs): Promise<void> {
   return invoke<void>("op_restore", { args });
 }
 
+/** Which of these paths are directories that exist on this machine, in the same order.
+ *
+ *  A plain filesystem probe — no `op`, no secrets, no prompt. It exists so the restore planner can
+ *  tell "the folder is there, write into it" from "this row's folder is a worktree this machine has
+ *  never cut", which is a decision that must not be guessed at (see `planRestore`). One call covers
+ *  every destination, so a bulk restore adds exactly one IPC round trip, not one per file. */
+export function envDirsExist(paths: string[]): Promise<boolean[]> {
+  return invoke<boolean[]>("env_dirs_exist", { paths });
+}
+
+/** Copy every backup-worthy `.env*` file from `sourceRoot` into `destRoot` at the same relative
+ *  path, and return the relative paths actually written.
+ *
+ *  THIS IS THE WORKTREE SEED PATH, and it deliberately does not touch 1Password.
+ *
+ *  A worktree's `.env.local` is a copy of the one already sitting in the project checkout, so the
+ *  vault was never the nearest source — it was just the one we happened to build first. Going
+ *  through `op` made every agent spawn a sporadic CLI invocation, and 1Password's app-integration
+ *  authorization is granted to the CALLING PROCESS (Sparkle) and expires after ten minutes of
+ *  inactivity. Sporadic is exactly the shape that re-prompts: one burst per spawn, then silence, so
+ *  a fleet of agents opened over an afternoon re-authorized once per agent (bead sparkle-y5xc9).
+ *  A local copy makes the spawn path incapable of prompting because it makes no call at all.
+ *
+ *  Never overwrites: a file already present in the destination is left untouched and omitted from
+ *  the result. Files inside a `worktrees/` path segment are skipped — those are themselves seeded
+ *  copies, and re-seeding them would nest one worktree's env files inside another's. */
+export function envSeedFromCheckout(sourceRoot: string, destRoot: string): Promise<string[]> {
+  return invoke<string[]>("env_seed_from_checkout", { sourceRoot, destRoot });
+}
+
 /** Restore every `` document belonging to `projectName` into `destRoot`, recreating the
  *  relative layout the titles encode. Returns the relative paths actually written.
  *

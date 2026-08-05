@@ -1,41 +1,51 @@
-import { opSeedWorktree } from "./onepassword";
+import { envSeedFromCheckout } from "./onepassword";
 import { useSettingsStore } from "../stores/settingsStore";
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 // Seeding a fresh worktree with its project's `.env*` files.
 //
-// This is the payoff of the whole 1Password feature. `.env` and `.env.*` are gitignored, so a git
-// worktree NEVER carries one — and Sparkle cuts a fresh worktree for every agent and every worker.
-// The result today is that each new agent starts life missing the secrets its project needs;
-// `naming.rs` even hardcodes a `$HOME/Projects/sparkle/.env.local` fallback to paper over it.
-// Restoring the backed-up files into a new worktree fixes the cause rather than the symptom.
+// `.env` and `.env.*` are gitignored, so a git worktree NEVER carries one — and Sparkle cuts a
+// fresh worktree for every agent and every worker. Without seeding, each new agent starts life
+// missing the secrets its project needs; `naming.rs` even hardcodes a
+// `$HOME/Projects/sparkle/.env.local` fallback to paper over it.
+//
+// THE SOURCE IS THE PROJECT CHECKOUT, NOT THE VAULT — and that is the whole point (bead
+// sparkle-y5xc9).
+//
+// This used to call `op_seed_worktree`, downloading each file from 1Password on the spawn path. It
+// worked, and it was unusable at fleet scale. 1Password's app-integration authorization is granted
+// to the CALLING PROCESS — Sparkle itself, never the agent's terminal, which invokes `op` nowhere —
+// and it expires after ten minutes of inactivity. Sparkle's `op` calls are sporadic by
+// construction: one burst per agent spawn, then silence. Sporadic is exactly the shape that
+// re-prompts, so a founder opening fifteen agents across an afternoon re-authorized roughly once
+// per agent. Reducing the NUMBER of calls could never fix that; only making zero calls could.
+//
+// A worktree's `.env.local` was always a copy of the one already sitting in the project checkout,
+// so the vault was never the nearest source — just the one that got built first. Copying locally
+// makes this path incapable of prompting because it makes no call at all, and it is strictly
+// fresher: it picks up edits made since the last backup. The vault keeps its real job, which is
+// moving files BETWEEN machines: back up here, "Restore all" there.
 //
 // Two properties matter more than speed here:
 //
-//   • NEVER BLOCK THE SPAWN. Opening an agent must not wait on a network round-trip to 1Password.
-//     `op` can be slow, can sit behind a Touch ID prompt, or can hang; the Rust side bounds each
-//     call at 20s, but even that is far too long to hold the UI. So seeding is fire-and-forget:
-//     the caller gets its worktree immediately and the files land moments later.
-//   • NEVER FAIL THE SPAWN. Every failure here is swallowed and logged. A missing vault, a locked
-//     1Password, a revoked item — none of these are reasons to stop the user opening an agent.
-//     The worst case is the status quo: a worktree with no `.env`, exactly as before this feature.
+//   • NEVER BLOCK THE SPAWN. Seeding is fire-and-forget: the caller gets its worktree immediately
+//     and the files land moments later. A local copy is fast, but "fast" is not "bounded", and a
+//     slow disk must not hold the UI.
+//   • NEVER FAIL THE SPAWN. Every failure here is swallowed and logged. The worst case is the
+//     status quo: a worktree with no `.env`, exactly as before this feature.
 //
 // Two properties the naive version got wrong, both about COST rather than correctness:
 //
 //   • ONCE PER WORKTREE, not once per open. `prepareAgentWorkspace` runs on every agent mount, not
 //     only when a worktree is freshly cut (git worktree slots are reused), so an unguarded seed
-//     fires an `op item list` — a 20s-bounded subprocess that can raise a Touch ID prompt — every
-//     single time you open an agent, to discover there is nothing to do.
-//   • ONE AT A TIME. `op` is a single-user CLI sitting behind one biometric prompt. A worker
-//     fan-out cuts many worktrees at once, and N concurrent seeds would stack N prompts and N
-//     concurrent CLI invocations on it. Seeds are queued so at most one is ever in flight; the
-//     callers still never wait, they just get their files in sequence.
+//     re-walks the project tree every single time you open an agent to discover there is nothing
+//     to do.
+//   • ONE AT A TIME. Inherited from the `op` era, and kept: a worker fan-out cuts many worktrees at
+//     once, and N concurrent tree walks over the same project buy nothing. The callers still never
+//     wait, they just get their files in sequence.
 //
-// KNOWN LIMITATION: the vault item titles are `<projectName>/<relPath>`, captured at BACKUP time,
-// and a Sparkle project name is user-mutable. Renaming a project makes its existing backups
-// unmatchable, and seeding then silently restores nothing (see sparkle bead in the progress doc).
-// Also, because seeding is unawaited, a process the agent starts at t=0 can still race the files
-// in — the `.env` lands moments later, not before the PTY.
+// KNOWN LIMITATION: because seeding is unawaited, a process the agent starts at t=0 can still race
+// the files in — the `.env` lands moments later, not before the PTY.
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 
 /** Worktree paths whose seed has SUCCEEDED this session — the "once per worktree, not once per
@@ -61,26 +71,31 @@ const inFlight = new Map<string, PendingSeed>();
 /** The serialization point: every seed chains onto this, so at most one `op` runs at a time. */
 let queue: Promise<void> = Promise.resolve();
 
-/** Whether seeding is configured to run: the tool is on, the user asked for worktree seeding, and
- *  a vault has been chosen. All three are required — a missing vault is not an error to report at
- *  spawn time, it just means there is nowhere to read from yet. */
+/** Whether seeding is configured to run: the tool is on and the user asked for worktree seeding.
+ *
+ *  NO VAULT REQUIREMENT — deliberately. Seeding copies from the project checkout now, so a vault is
+ *  irrelevant to it; requiring one would refuse to copy a file sitting right there on disk because
+ *  of an unrelated setting. */
 export function envSeedEnabled(): boolean {
   const s = useSettingsStore.getState();
-  return s.onepasswordEnabled && s.onepasswordSeedWorktrees && !!s.onepasswordVaultId;
+  return s.onepasswordEnabled && s.onepasswordSeedWorktrees;
 }
 
-/** Restore this project's backed-up env files into a freshly created worktree.
+/** Copy this project's `.env*` files into a freshly created worktree.
  *
  *  Fire-and-forget by design — see the module comment. Returns immediately; the work is queued
  *  behind any other in-flight seed and never awaited by the spawn path.
  *
- *  `projectName` must be the same name the backup was written under, since the vault item titles
- *  are `<projectName>/<relPath>`. Passing a different name silently seeds nothing, which is why
- *  callers read it from the project store rather than deriving it from a path. */
-export function seedWorktreeEnv(projectName: string, destRoot: string): void {
+ *  `sourceRoot` is the project's own checkout — the directory the files are copied FROM. Callers
+ *  read it from the project store rather than deriving it from the worktree path, which points at
+ *  app data and holds none of the originals. */
+export function seedWorktreeEnv(sourceRoot: string, destRoot: string): void {
   if (!envSeedEnabled()) return;
   // No path, nothing to seed — and an empty key would collapse every worktree onto one entry.
   if (!destRoot) return;
+  // Nothing to copy FROM. Distinct from the checks above: this is a project with no root on disk,
+  // not a disabled feature.
+  if (!sourceRoot) return;
   // Already seeded successfully this session: the files are there, and re-running only buys another
   // `op` invocation and another biometric prompt.
   if (seeded.has(destRoot)) return;
@@ -104,16 +119,12 @@ export function seedWorktreeEnv(projectName: string, destRoot: string): void {
       // The worktree may have been torn down while this seed waited its turn — writing into it now
       // would recreate the directory git just deleted.
       if (pending.abandoned) return;
-      // Re-read rather than capture: the store can change between queueing and running, and a vault
-      // that has since been cleared means there is nowhere to read from.
-      const vaultId = useSettingsStore.getState().onepasswordVaultId;
-      if (!vaultId) return;
+      // Re-read rather than capture: the user can switch seeding off between queueing and running,
+      // and a seed that was queued under the old setting must not still fire.
+      if (!envSeedEnabled()) return;
       pending.running = true;
       try {
-        // The RAW store name goes in: `opSeedWorktree` normalizes it the same way `backupTitle` did
-        // when the items were written (a project named `acme/web` is stored as `acme-web/…`), so the
-        // invariant lives at that boundary rather than at each call site.
-        const written = await opSeedWorktree(vaultId, projectName, destRoot);
+        const written = await envSeedFromCheckout(sourceRoot, destRoot);
         // Only a completed seed marks the path done; a failure below stays retryable. And NOT when
         // the worktree was torn down mid-write: marking then would make a worktree re-cut at this
         // path skip seeding for the rest of the session — the exact property abandon exists for.
@@ -126,8 +137,9 @@ export function seedWorktreeEnv(projectName: string, destRoot: string): void {
       } catch (e) {
         // Never surfaced as a spawn failure. The agent still opens; it just opens without secrets,
         // which is precisely the behavior that existed before this feature. The path is deliberately
-        // NOT marked seeded, so reopening the agent after unlocking 1Password retries.
-        console.warn("env seed: could not restore env files into the new worktree", e);
+        // NOT marked seeded, so reopening the agent retries — the user's recovery path for a
+        // transient failure (a project root that was temporarily unreadable, a full disk).
+        console.warn("env seed: could not copy env files into the new worktree", e);
       }
     } finally {
       pending.running = false;

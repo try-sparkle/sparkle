@@ -30,6 +30,7 @@ vi.mock("../services/envBackupActions", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../services/envBackupActions")>()),
   loadEnvBackupRows: vi.fn(),
   backupRows: vi.fn(),
+  restoreRows: vi.fn(),
 }));
 
 import { setOnePasswordAccount, setOnePasswordVault } from "../services/configActions";
@@ -41,11 +42,11 @@ import {
   type OpAccount,
   type OpStatus,
 } from "../services/onepassword";
-import { backupRows, loadEnvBackupRows } from "../services/envBackupActions";
+import { backupRows, loadEnvBackupRows, restoreRows } from "../services/envBackupActions";
 import { useSettingsStore } from "../stores/settingsStore";
 import { useProjectStore } from "../stores/projectStore";
 import { joinBackups, type EnvBackupRow } from "../engine/envBackup";
-import { OnePasswordPane } from "./OnePasswordPane";
+import { OnePasswordPane, describeRestore } from "./OnePasswordPane";
 
 const HASH_A = "a".repeat(64);
 const HASH_B = "b".repeat(64);
@@ -102,6 +103,7 @@ beforeEach(() => {
   vi.mocked(opVaults).mockResolvedValue([{ id: "vault-abc", name: "Private" }]);
   vi.mocked(loadEnvBackupRows).mockResolvedValue([]);
   vi.mocked(backupRows).mockResolvedValue({ uploaded: 0, failures: [] });
+  vi.mocked(restoreRows).mockResolvedValue({ restored: [], skipped: [], failures: [] });
 });
 
 afterEach(() => {
@@ -495,5 +497,125 @@ describe("OnePasswordPane — re-scan cost", () => {
       ],
     } as never);
     await waitFor(() => expect(loadEnvBackupRows).toHaveBeenCalledTimes(2));
+  });
+});
+
+// ── Restore all — the DOWN direction (bead sparkle-y5xc9) ───────────────────────────────────
+//
+// Its absence is what made a portability feature work in one direction: a second machine showed a
+// wall of "Only in vault" rows and a primary button reading "Back up 0".
+
+/** The "Restore N" button, once the in-flight scan has cleared `busy`. */
+async function enabledRestoreButton(): Promise<HTMLButtonElement> {
+  const btn = (await screen.findByRole("button", { name: /restore/i })) as HTMLButtonElement;
+  await waitFor(() => expect(btn.disabled).toBe(false));
+  return btn;
+}
+
+describe("Restore all", () => {
+  /** Two files that exist only in the vault — a fresh machine. */
+  const vaultOnlyRows = () =>
+    joinBackups([], [record("sparkle/.env.local"), record("sparkle/apps/web/.env.local")], {
+      roots: [{ projectId: "p1", projectName: "sparkle", rootPath: "/repo" }],
+    });
+
+  it("offers a Restore button counting the rows that exist only in the vault", async () => {
+    vi.mocked(loadEnvBackupRows).mockResolvedValue(vaultOnlyRows());
+    render(<OnePasswordPane />);
+    const btn = await enabledRestoreButton();
+    expect(btn.textContent).toContain("Restore 2");
+  });
+
+  it("is DISABLED when nothing is vault-only — a click that does nothing reads as broken", async () => {
+    vi.mocked(loadEnvBackupRows).mockResolvedValue(
+      joinBackups([file(".env.local")], [record("sparkle/.env.local")]),
+    );
+    render(<OnePasswordPane />);
+    const btn = (await screen.findByRole("button", { name: /restore/i })) as HTMLButtonElement;
+    await waitFor(() => expect(btn.disabled).toBe(true));
+  });
+
+  it("restores every vault-only row and reports what landed", async () => {
+    vi.mocked(loadEnvBackupRows).mockResolvedValue(vaultOnlyRows());
+    vi.mocked(restoreRows).mockResolvedValue({
+      restored: ["sparkle/.env.local", "sparkle/apps/web/.env.local"],
+      skipped: [],
+      failures: [],
+    });
+    render(<OnePasswordPane />);
+    fireEvent.click(await enabledRestoreButton());
+    await waitFor(() => expect(restoreRows).toHaveBeenCalledTimes(1));
+    // The SUCCESS is reported, not only failures: "2 restored" is what tells the user their new
+    // machine is actually set up. An error-only banner could never say it.
+    expect(await screen.findByText(/2 restored/)).toBeTruthy();
+  });
+
+  it("names the failures rather than reporting a clean run", async () => {
+    vi.mocked(loadEnvBackupRows).mockResolvedValue(vaultOnlyRows());
+    vi.mocked(restoreRows).mockResolvedValue({
+      restored: ["sparkle/.env.local"],
+      skipped: [],
+      failures: [{ title: "sparkle/apps/web/.env.local", error: "item not found" }],
+    });
+    render(<OnePasswordPane />);
+    fireEvent.click(await enabledRestoreButton());
+    // A partially restored set of .env files that reports success is worse than none.
+    expect(await screen.findByRole("alert")).toHaveProperty(
+      "textContent",
+      expect.stringContaining("item not found"),
+    );
+  });
+
+  it("hands the pane's project roots to the restore, so destinations resolve", async () => {
+    vi.mocked(loadEnvBackupRows).mockResolvedValue(vaultOnlyRows());
+    render(<OnePasswordPane />);
+    fireEvent.click(await enabledRestoreButton());
+    await waitFor(() => expect(restoreRows).toHaveBeenCalledTimes(1));
+    const roots = vi.mocked(restoreRows).mock.calls[0]?.[1];
+    // Without a root the planner reports every row as unknown-project and restores nothing.
+    expect(roots).toEqual([{ projectId: "p1", projectName: "sparkle", rootPath: "/repo" }]);
+  });
+
+  it("cannot run while a backup is in flight, and vice versa", async () => {
+    // Needs BOTH directions live: a drifted file to back up and a vault-only file to restore.
+    vi.mocked(loadEnvBackupRows).mockResolvedValue(
+      joinBackups([file(".env.local", HASH_B)], [record("sparkle/.env.local", HASH_A), record("sparkle/gone/.env.local")], {
+        roots: [{ projectId: "p1", projectName: "sparkle", rootPath: "/repo" }],
+      }),
+    );
+    const held = deferredResult();
+    vi.mocked(backupRows).mockReturnValue(held.promise as never);
+    render(<OnePasswordPane />);
+    // Both bulk actions share one busy slot; two concurrent runs would race the same vault.
+    const backUp = await screen.findByRole("button", { name: /back up/i });
+    await waitFor(() => expect((backUp as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(backUp);
+    const restore = (await screen.findByRole("button", { name: /restor/i })) as HTMLButtonElement;
+    await waitFor(() => expect(restore.disabled).toBe(true));
+    held.resolve({ uploaded: 0, failures: [] });
+  });
+
+  it("says up front that 1Password may ask once, and that it is not once per file", async () => {
+    vi.mocked(loadEnvBackupRows).mockResolvedValue(vaultOnlyRows());
+    render(<OnePasswordPane />);
+    expect(await screen.findByText(/not once per file/i)).toBeTruthy();
+  });
+});
+
+describe("describeRestore", () => {
+  it("reports all three outcomes, and says WHY a worktree row was skipped", () => {
+    const text = describeRestore({
+      restored: ["a"],
+      skipped: [{ title: "b", reason: "worktree-missing" }],
+      failures: [{ title: "c", error: "boom" }],
+    });
+    expect(text).toContain("1 restored");
+    expect(text).toContain("1 failed");
+    // "1 skipped" with no reason reads as a malfunction; the reason is what makes it a decision.
+    expect(text).toMatch(/worktrees this machine hasn/i);
+  });
+
+  it("still names the counts when nothing failed", () => {
+    expect(describeRestore({ restored: ["a", "b"], skipped: [], failures: [] })).toBe("2 restored.");
   });
 });
