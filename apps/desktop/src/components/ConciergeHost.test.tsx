@@ -274,6 +274,10 @@ import { NUDGE_CARD_TESTID } from "./Concierge/NudgeCard";
 // (Concierge/conciergeAiLock). A fresh test's default is the anonymous trial (`me: null`), which is
 // locked. The locked state has its own suite: Concierge/ConciergeColumn.locked.test.
 beforeEach(enableAiEnhancementsForTests);
+// `proactiveIds` is MODULE-level harness state, so a case that marks an id proactive leaks it into
+// every case after it — mine did, and reddened an unrelated cap case that passed in isolation.
+// Cleared here rather than at the end of the one case that writes it: the next writer will forget.
+beforeEach(() => h.proactiveIds.clear());
 
 const EMPTY_COUNTS: Record<StatusBand, number> = { needs_you: 0, running: 0, done: 0 };
 
@@ -1032,7 +1036,6 @@ describe("ConciergeHost", () => {
    */
   it("a proactive push finishing does not dispatch the queued message", async () => {
     _resetConciergeActivityForTests();
-    h.proactiveIds.clear();
     h.feed = feedWith("approval");
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "M1" } });
@@ -1044,16 +1047,31 @@ describe("ConciergeHost", () => {
     const before = h.startConciergeTurn.mock.calls.length;
 
     // A background push finishes. It owns no slot, so it must release nothing.
-    h.proactiveIds.add("99");
-    act(() => h.brain.done?.({ id: "99", text: "an unprompted note" }));
+    //
+    // ══ A LOWER ID THAN THE USER TURNS, BECAUSE THAT IS THE ONLY ORDER PRODUCTION CAN PRODUCE ═════
+    // This drove the push with id "99" — higher than both user turns — and `concierge.rs` makes that
+    // impossible: `proactive_may_start` refuses to start a push while ANY turn holds the slot or a
+    // send is pending, and `reserve_proactive_token` draws from the SAME monotonic sequence. So a
+    // push that is still in flight when the user sends necessarily took its token FIRST.
+    //
+    // The unrealistic ordering was not cosmetic — it is what forced the real assertion out. A higher
+    // id advanced the mock's retirement floor, so M1's own `done` was then rejected by the supersede
+    // gate and "the queue still drains afterwards" could not be checked. Production has no such
+    // effect: a push publishes no retirement floor at all, precisely so it can never silence a turn.
+    h.proactiveIds.add("0");
+    act(() => h.brain.done?.({ id: "0", text: "an unprompted note" }));
     await settle();
     expect(h.startConciergeTurn.mock.calls.length).toBe(before);
 
-    // NOT ALSO ASSERTING "M1's own done still drains" HERE. The push carries a higher turn id, which
-    // advances the retirement floor, so M1's `done` is then rejected by the supersede gate before it
-    // reaches the drain — a property of the harness's id ordering, not of this guard. Asserting it
-    // here would fail for a reason unrelated to what this case is about. The guard narrowing rather
-    // than disabling is covered by the re-send case above, which drains on an ordinary `done`.
+    // ══ AND THE QUEUE IS NOT STRANDED — the guard's real risk ════════════════════════════════════
+    // Releasing someone else's slot is one failure; the mirror image is a guard so broad that the
+    // queue never drains again, leaving every later question waiting on a turn that already ended.
+    // With the realistic ordering this is finally assertable.
+    act(() => h.brain.done?.({ id: "1", text: "answered M1" }));
+    await settle();
+    expect(h.startConciergeTurn.mock.calls.length).toBe(before + 1);
+    expect(String(h.startConciergeTurn.mock.calls.at(-1)?.[0])).toContain("M2");
+
   });
 
   // Each refused path gets its OWN remedy, and the remedies genuinely differ: Retry for a pane that
