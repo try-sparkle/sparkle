@@ -1158,6 +1158,12 @@ const mergePrArgs = z
     // the shape, and its refusal explains that waiving roborev findings means naming the ids you
     // read — a `bad-args` error naming a field would not.
     roborevOverride: z.unknown().optional(),
+    // Same convention again. A `z.object({ reason: z.string().min(15) })` here would refuse a
+    // one-word waiver with "bad-args: knightwatchOverride.reason too small" — true, and useless.
+    // `mergePrTool` refuses it with the sentence that says the reason is PUBLISHED ON THE PULL
+    // REQUEST beside the reviewer's unanswered question, which is the fact that should change what
+    // the model does next.
+    knightwatchOverride: z.unknown().optional(),
   })
   .strict();
 
@@ -1244,6 +1250,9 @@ const WORKFLOW_ROUTES: Record<WorkflowOperation, Handler> = {
           ...(a.rebase !== undefined ? { rebase: a.rebase as never } : {}),
           ...(a.roborevOverride !== undefined
             ? { roborevOverride: a.roborevOverride as { acknowledgedJobIds: number[]; reason: string } }
+            : {}),
+          ...(a.knightwatchOverride !== undefined
+            ? { knightwatchOverride: a.knightwatchOverride as { reason: string } }
             : {}),
         }),
       ),

@@ -38,7 +38,16 @@
 // The Merge action is deliberately gated (`prMergeReadiness` — one decision behind the dot, the
 // word, the button and the header count) and merges with a MERGE COMMIT via the Rust `merge_pr`
 // command — never a blind or `--auto` merge. See services/openPrs.ts and AGENTS.md.
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import {
   FiChevronDown,
   FiExternalLink,
@@ -74,6 +83,13 @@ import {
   type PrGroup,
   type PrScope,
 } from "../services/fleetPrs";
+import {
+  isKnightwatchRefusal,
+  knightwatchReasonFor,
+  knightwatchReasonIssue,
+  refusalLines,
+  type KnightwatchOverrideFor,
+} from "../services/mergeGuard/knightwatch";
 import {
   dismissPr,
   dismissedNumbers,
@@ -278,12 +294,21 @@ export function panelPlacement(
 ): PanelPlacement {
   // Never wider than the window less a margin at each side. `max(0, …)` so a degenerate viewport
   // yields a zero-width box rather than a negative one that would invert the clamp below.
-  const width = Math.max(0, Math.min(PANEL_MAX_W, viewport.width - PANEL_EDGE_MARGIN * 2));
+  const width = Math.max(
+    0,
+    Math.min(PANEL_MAX_W, viewport.width - PANEL_EDGE_MARGIN * 2),
+  );
   // The rightmost left-coordinate that still leaves the margin on the right. Floored at the left
   // margin so the range is never inverted — if it were, the two clamps would fight and `Math.min`
   // would win, pushing the panel off the LEFT edge to keep it off the right.
-  const rightMost = Math.max(PANEL_EDGE_MARGIN, viewport.width - PANEL_EDGE_MARGIN - width);
-  const left = Math.min(Math.max(anchor.right - width, PANEL_EDGE_MARGIN), rightMost);
+  const rightMost = Math.max(
+    PANEL_EDGE_MARGIN,
+    viewport.width - PANEL_EDGE_MARGIN - width,
+  );
+  const left = Math.min(
+    Math.max(anchor.right - width, PANEL_EDGE_MARGIN),
+    rightMost,
+  );
   return { left, top: anchor.bottom + PANEL_ANCHOR_GAP, width };
 }
 
@@ -345,8 +370,111 @@ export function probeUnreadableFor(names: readonly string[]): string {
   // subject/verb pair in one place and the pronoun in another, so an edit to either could ship
   // "they isn't counted or listed here" with a green suite (roborev 57724).
   const { pronoun, verb } =
-    names.length === 1 ? { pronoun: "it", verb: "isn't" } : { pronoun: "they", verb: "aren't" };
+    names.length === 1
+      ? { pronoun: "it", verb: "isn't" }
+      : { pronoun: "they", verb: "aren't" };
   return `Couldn't reach GitHub for ${names.join(", ")} — ${pronoun} ${verb} counted or listed here. Try Refresh.`;
+}
+
+// ── THE KNIGHTWATCH PROBE REFUSAL ──────────────────────────────────────────────────────────────
+//
+// Rust's `merge_pr` refuses a PR that still carries unanswered knightwatch `[blocking]` review
+// probes, and it refuses with SEVERAL LINES: each probe, its specialist, a link to the comment, and
+// the probe's first line quoted. Everything below exists because a refusal the founder cannot act on
+// is just an obstacle — the message has to arrive with its structure intact, and the way past it has
+// to be reachable without leaving the panel.
+
+/** What the row's override button says before it is armed. Short by construction: this is the
+ *  primary action slot and the hard rule on this surface is that it never truncates. */
+export const PROBE_OVERRIDE_LABEL = "Override probes…";
+/** …and after. It names what the second click DOES, the way the `unstable` override's
+ *  "Merge anyway?" does — the arming step is worth nothing if the armed label is the same word. */
+export const PROBE_OVERRIDE_ARMED_LABEL = "Merge with reason";
+/** The standing hint under the reason box. Says where the sentence GOES, because that is the fact
+ *  that makes an override cost something: it is recorded on the pull request under your name. */
+export const PROBE_REASON_HINT =
+  "A sentence, please — it is recorded on the pull request as your reason for merging with the probe unanswered. Answering the probe on the PR is the way through; this is not.";
+/** Shown when the typed reason will not do yet, so the disabled button is never mute. */
+export const PROBE_REASON_SHORT =
+  "That is not a reason yet — say why merging unanswered is safe.";
+
+/**
+ * The bulk-merge report: which PRs a batch left BEHIND, and why they are not all covered by one
+ * decision.
+ *
+ * "Merge all ready" walks N pull requests. A single reason spent across the batch would turn a
+ * per-PR judgement into a blanket waiver — and the probes are per-PR by construction, since each is
+ * a reviewer's question about that diff. So a refused PR is reported and SKIPPED, and its override
+ * is offered on its own row afterwards.
+ */
+export function probeRefusedInBatch(numbers: readonly number[]): string {
+  const list = numbers.map((n) => `#${n}`).join(", ");
+  return `Skipped ${numbers.length} PRs with unanswered knightwatch probes (${list}). Each probe is a question about that PR, so one reason cannot cover them — override them one row at a time.`;
+}
+
+/**
+ * The merge error, rendered so it survives being read.
+ *
+ * ONE ELEMENT PER LINE rather than a `white-space: pre-wrap` string, and that is a testability
+ * decision as much as a visual one: jsdom lays nothing out and never loads the stylesheet, so an
+ * assertion about wrapping CSS proves nothing (docs/jsdom-test-caveats.md). A line that is its own
+ * element is a fact the suite can hold onto.
+ *
+ * The LINKS are buttons, not text. The refusal's whole value is that it points at the comment
+ * carrying the question; a URL the reader has to select and retype points nowhere. Ordinary
+ * single-line errors ("Pull request is not mergeable") pass through this unchanged — one line, no
+ * links, same rendering as before.
+ */
+function MergeErrorText({
+  text,
+  onOpenLink,
+}: {
+  text: string;
+  onOpenLink: (url: string) => void;
+}) {
+  return (
+    <>
+      {refusalLines(text).map((segments, i) => (
+        <div
+          key={i}
+          data-testid="merge-error-line"
+          // Indentation carries meaning in the probe list (the link sits under its probe), and a
+          // block box strips leading whitespace without this.
+          style={{
+            whiteSpace: "pre-wrap",
+            minHeight: segments.length === 0 ? "0.7em" : undefined,
+          }}
+        >
+          {segments.map((s, j) =>
+            s.kind === "link" ? (
+              <button
+                key={j}
+                data-testid="merge-error-link"
+                title={s.url}
+                onClick={() => onOpenLink(s.url)}
+                style={{
+                  background: "transparent",
+                  border: "none",
+                  padding: 0,
+                  font: "inherit",
+                  color: C.violetInk,
+                  textDecoration: "underline",
+                  cursor: "pointer",
+                  // A URL is one long unbreakable token; without this it forces the panel wide.
+                  wordBreak: "break-all",
+                  textAlign: "left",
+                }}
+              >
+                {s.text}
+              </button>
+            ) : (
+              <span key={j}>{s.text}</span>
+            ),
+          )}
+        </div>
+      ))}
+    </>
+  );
 }
 
 /**
@@ -362,7 +490,10 @@ export function probeUnreadableFor(names: readonly string[]): string {
  * `totals` and switching on the shared state is what makes "they cannot drift" structural rather
  * than something a reviewer has to keep noticing.
  */
-export function prBadgeTitle(label: string | null, totals: FleetTotals): string {
+export function prBadgeTitle(
+  label: string | null,
+  totals: FleetTotals,
+): string {
   switch (fleetState(totals)) {
     case "nothing-askable":
       return "No project with a GitHub remote";
@@ -391,13 +522,22 @@ export function prBadgeTitle(label: string | null, totals: FleetTotals): string 
  * `ModalLayer` owns a hook (it tracks the host's inherited `visibility`), so it has to be a real
  * element in the tree.
  */
-function PanelLayer({ portaled, children }: { portaled: boolean; children: ReactNode }) {
+function PanelLayer({
+  portaled,
+  children,
+}: {
+  portaled: boolean;
+  children: ReactNode;
+}) {
   return portaled ? <ModalLayer>{children}</ModalLayer> : <>{children}</>;
 }
 
 /** Drop every entry whose key has left the live scope set — returning `prev` UNCHANGED when nothing
  *  went, so a re-render caused by an unrelated prop cannot cascade into another one. */
-function pruneMap<V>(prev: ReadonlyMap<string, V>, live: ReadonlySet<string>): ReadonlyMap<string, V> {
+function pruneMap<V>(
+  prev: ReadonlyMap<string, V>,
+  live: ReadonlySet<string>,
+): ReadonlyMap<string, V> {
   let dropped = false;
   const next = new Map<string, V>();
   for (const [k, v] of prev) {
@@ -408,7 +548,10 @@ function pruneMap<V>(prev: ReadonlyMap<string, V>, live: ReadonlySet<string>): R
 }
 
 /** The `pruneMap` twin for the key sets (`stale`), with the same identity-preserving contract. */
-function pruneSet(prev: ReadonlySet<string>, keep: (k: string) => boolean): ReadonlySet<string> {
+function pruneSet(
+  prev: ReadonlySet<string>,
+  keep: (k: string) => boolean,
+): ReadonlySet<string> {
   let dropped = false;
   const next = new Set<string>();
   for (const k of prev) {
@@ -477,11 +620,15 @@ export function OpenPrMenu({
   // needs that: opening a fourth project tab cannot make the other three's rows wrong, so the effect
   // below PRUNES departed scopes instead of blanking the lot, and the tabs you kept keep their data.
   /** What the last probe returned per scope. A missing key is UNKNOWN; `null` never lands here. */
-  const [byKey, setByKey] = useState<ReadonlyMap<string, PrRow[]>>(() => new Map());
+  const [byKey, setByKey] = useState<ReadonlyMap<string, PrRow[]>>(
+    () => new Map(),
+  );
   /** Scopes whose LATEST PROBE FAILED, whether or not an older list survives. `buildPrGroups`
    *  splits that into "stale" (we have an older list to show) and "unreadable" (we have nothing,
    *  so this project contributes no rows and its absence proves nothing). */
-  const [failedKeys, setFailedKeys] = useState<ReadonlySet<string>>(() => new Set());
+  const [failedKeys, setFailedKeys] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
   const [open, setOpen] = useState(false);
   /** Which PRs are mid-merge (`prKeyOf`) — drives per-row spinners and disables the row's actions.
    *  A Set so a group's "Merge all ready" can mark several at once without clobbering a single
@@ -493,6 +640,48 @@ export function OpenPrMenu({
    *  matters more here than anywhere else on this surface: an arm is a standing authorisation, and
    *  a bare number would let it be spent on a different repo's PR of the same number. */
   const [overrideArmed, setOverrideArmed] = useState<string | null>(null);
+  /**
+   * PRs whose LAST merge attempt was refused for unanswered knightwatch probes, `prKeyOf` → the
+   * refusal message. This is what turns the row's Merge into the written override.
+   *
+   * Held per PR rather than as one panel-wide flag, and that is the whole safety property of this
+   * feature: a probe is a reviewer's question about ONE diff, so "the founder decided to merge past
+   * it" is a fact about one pull request and can never be spent on another. The reason typed for
+   * #1176 is passed to #1176's merge and to nothing else — see `runMerge`.
+   *
+   * NOT pruned when a project tab closes, for the same reason `merging` is not: the keys carry the
+   * repo, so an entry can never match a row in another one, and dropping it would lose the state
+   * explaining a row the user comes back to. A successful merge of the same PR clears its entry.
+   */
+  const [probeRefusals, setProbeRefusals] = useState<
+    ReadonlyMap<string, string>
+  >(() => new Map());
+
+  /**
+   * Forget every recorded probe refusal.
+   *
+   * THE LEDGER MUST NOT OUTLIVE THE STATE IT DESCRIBES. A row's action slot is
+   * `probeRefusal ? <override> : <merge>`, so an entry REPLACES the ordinary Merge affordance. The
+   * ledger was previously cleared only by a successful merge of the same PR — which meant the one
+   * path this whole feature exists to steer people onto was the one path it punished: answer the
+   * probe on GitHub, come back, and the row still offers nothing but "Override probes…", so the
+   * only way through is to type a sentence justifying a merge with the probe unanswered for a probe
+   * that is now answered. Rust's `decide` returns Allow before it ever reads the reason once
+   * nothing is blocking, so that sentence is discarded and no override record is posted — the user
+   * is made to fabricate a waiver that is then thrown away.
+   *
+   * Cleared on the two DELIBERATE re-read signals — opening the panel and pressing Refresh — and
+   * NOT inside `refetch`, because `runMerge` calls `refetch` itself and would erase the refusal it
+   * had just recorded, taking the override affordance with it. A PR that is still refusing simply
+   * re-enters the ledger on the next merge attempt, which costs one click and cannot get stuck.
+   */
+  const clearProbeRefusals = useCallback(() => {
+    setProbeRefusals((prev) => (prev.size === 0 ? prev : new Map()));
+  }, []);
+  /** What the founder is typing into the armed row's reason box. ONE string because only one row can
+   *  be armed at a time — and it is cleared on every arm, so a reason typed for one PR can never be
+   *  inherited by the next row armed. */
+  const [overrideReason, setOverrideReason] = useState("");
   /** WHICH SCOPE SET has a user-initiated Refresh in flight, or null — so the button says so rather
    *  than looking inert for the length of a `gh` round trip.
    *
@@ -515,9 +704,9 @@ export function OpenPrMenu({
    * `dismissedAt`, and because {@link partitionDismissals} needs the stored fingerprint to decide
    * whether a dismissal has run out.
    */
-  const [dismissedByKey, setDismissedByKey] = useState<ReadonlyMap<string, PrDismissal[]>>(
-    () => new Map(),
-  );
+  const [dismissedByKey, setDismissedByKey] = useState<
+    ReadonlyMap<string, PrDismissal[]>
+  >(() => new Map());
   /** Whether the Dismissed section is expanded. Collapsed by default: it is a review surface, not
    *  part of the ready list, and it must never push the actionable rows down the panel. */
   const [showDismissed, setShowDismissed] = useState(false);
@@ -562,7 +751,12 @@ export function OpenPrMenu({
       const el = anchorRef.current;
       if (!el) return;
       const r = el.getBoundingClientRect();
-      setPlacement(panelPlacement({ right: r.right, bottom: r.bottom }, { width: window.innerWidth }));
+      setPlacement(
+        panelPlacement(
+          { right: r.right, bottom: r.bottom },
+          { width: window.innerWidth },
+        ),
+      );
     };
     place();
     // THE ONLY THING THAT CAN INVALIDATE A PLACEMENT. Content cannot — the width is a function of
@@ -601,7 +795,9 @@ export function OpenPrMenu({
             // poll, so this is the persistent case, not a blip) was indistinguishable from a repo
             // with genuinely nothing open, and the panel would state a flat "No open pull requests"
             // across it. `buildPrGroups` splits the two back out via `known`.
-            setFailedKeys((prev) => (prev.has(key) ? prev : new Set(prev).add(key)));
+            setFailedKeys((prev) =>
+              prev.has(key) ? prev : new Set(prev).add(key),
+            );
             return;
           }
           lastGoodRef.current.set(key, rows);
@@ -630,7 +826,10 @@ export function OpenPrMenu({
           // state above has already un-hidden the row, so a failed write costs one more revival
           // pass on the next poll and nothing else.
           for (const d of revived) {
-            log.info("open-pr-menu", `dismissal expired for ${scope.projectName} PR #${d.number}`);
+            log.info(
+              "open-pr-menu",
+              `dismissal expired for ${scope.projectName} PR #${d.number}`,
+            );
             void restorePr(scope.projectId, d.number);
           }
           // Only this scope's staleness flag. A merge error is a different fact and is not answered
@@ -667,11 +866,14 @@ export function OpenPrMenu({
     // change because a stale list would otherwise render under the new repo's name — repo-keyed
     // state makes that impossible, so clearing would now only throw away good data and put every
     // remaining tab back into "Checking GitHub…" for a round trip.
-    for (const k of [...lastGoodRef.current.keys()]) if (!keys.has(k)) lastGoodRef.current.delete(k);
+    for (const k of [...lastGoodRef.current.keys()])
+      if (!keys.has(k)) lastGoodRef.current.delete(k);
     setByKey((prev) => pruneMap(prev, keys) as ReadonlyMap<string, PrRow[]>);
     setFailedKeys((prev) => pruneSet(prev, (k) => keys.has(k)));
     // Same prune, same reason: a closed tab's dismissals are re-read from Rust when it comes back.
-    setDismissedByKey((prev) => pruneMap(prev, keys) as ReadonlyMap<string, PrDismissal[]>);
+    setDismissedByKey(
+      (prev) => pruneMap(prev, keys) as ReadonlyMap<string, PrDismissal[]>,
+    );
     // A merge already in flight is DELIBERATELY not pruned — it is keyed by repo, so it can never
     // match a scope that is still listed, and dropping it is how a merge that finished while its
     // tab was closed leaves a row permanently greyed out when the tab comes back.
@@ -679,6 +881,10 @@ export function OpenPrMenu({
     // An armed override is dropped whenever the scope set moves: it is a standing authorisation to
     // merge a red PR, and the cheapest safe rule for one is that it does not survive anything.
     setOverrideArmed(null);
+    // …AND THE SENTENCE TYPED INTO IT. A written probe override is authorisation for one pull
+    // request in one repo; carrying the words across a scope change is how they would end up
+    // recorded on a different PR than the one they were written about.
+    setOverrideReason("");
     // AND THE PANEL CLOSES. The list the user was reading just changed shape underneath them —
     // sections appearing or disappearing while their pointer is over a Merge button is exactly the
     // way to make them click a row they did not mean to. In practice this is unreachable rather
@@ -766,7 +972,20 @@ export function OpenPrMenu({
    * call site: the per-row button passes its own group's scope, and a group's "Merge all ready"
    * passes that group's.
    */
-  const runMerge = async (scope: PrScope, nums: number[]) => {
+  const runMerge = async (
+    scope: PrScope,
+    nums: number[],
+    /**
+     * A written knightwatch override, BOUND TO ONE PR NUMBER.
+     *
+     * The number is not redundant with `nums`. "Merge all ready" calls this with N numbers, and a
+     * reason that applied to whatever the loop happened to be on would turn a per-PR judgement into
+     * a blanket waiver of every probe in the batch — the single most damaging thing this surface
+     * could do. Carrying the number means the loop can only spend the reason on the PR it was
+     * written for, whatever else is in the list.
+     */
+    override?: KnightwatchOverrideFor,
+  ) => {
     if (!scope.rootPath || nums.length === 0) return;
     // THE SCOPE THIS MERGE WAS ISSUED AGAINST, compared to what is listed when it lands. `aliveRef`
     // answers unmount and nothing else — the effect sets it back to `true` on every re-run — and
@@ -780,14 +999,36 @@ export function OpenPrMenu({
     setError(null);
     setMerging((prev) => new Set([...prev, ...prKeys]));
     let firstError: string | null = null;
+    /** Rows refused for unanswered probes this run, `prKeyOf` → the refusal, and their numbers in
+     *  list order for the batch report. */
+    const refusedProbes = new Map<string, string>();
+    const refusedNumbers: number[] = [];
+    /** Rows that MERGED — any probe refusal recorded for them is now history. */
+    const merged: string[] = [];
     // Sequential on purpose: merging PR B right after A picks up A's landing, and it keeps the gh
     // calls from racing each other's rate limit. One failure is recorded but does not abort the rest.
     for (const n of nums) {
+      const prKey = prKeyOf(key, n);
       try {
-        await mergePr(scope.rootPath, n);
+        // THE REASON IS SPENT ON EXACTLY ONE PR — see `knightwatchReasonFor`, which is a named
+        // function precisely so the binding can be asserted against without a UI path that merges a
+        // batch WITH an override. A batch and a single-row merge take this same line.
+        await mergePr(scope.rootPath, n, knightwatchReasonFor(n, override));
+        merged.push(prKey);
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
-        log.warn("open-pr-menu", `merge failed for ${scope.projectName} PR #${n}`, msg);
+        log.warn(
+          "open-pr-menu",
+          `merge failed for ${scope.projectName} PR #${n}`,
+          msg,
+        );
+        // A PROBE REFUSAL IS A DIFFERENT KIND OF FAILURE: nothing is wrong with the PR, a reviewer
+        // asked a question nobody answered. It is recorded per row so the row itself can offer the
+        // way through — which is also how a batch stays per-PR.
+        if (isKnightwatchRefusal(msg)) {
+          refusedProbes.set(prKey, msg);
+          refusedNumbers.push(n);
+        }
         // NAMED BY PROJECT, because #12 alone no longer identifies a pull request in this list.
         if (!firstError) firstError = `${scope.projectName} PR #${n}: ${msg}`;
       }
@@ -800,9 +1041,27 @@ export function OpenPrMenu({
       for (const k of prKeys) next.delete(k);
       return next;
     });
+    // THE PROBE LEDGER, like the spinners above, is repo-keyed and updated unconditionally: it is
+    // the state that lets a row offer its own override when the user comes back to it.
+    if (refusedProbes.size > 0 || merged.length > 0)
+      setProbeRefusals((prev) => {
+        const next = new Map(prev);
+        for (const k of merged) next.delete(k);
+        for (const [k, v] of refusedProbes) next.set(k, v);
+        return next;
+      });
     // The MESSAGE is different: it is addressed to whoever is reading this panel, so it goes up only
     // while the repo it is about is still listed.
-    if (firstError && listed()) setError(firstError);
+    //
+    // A BATCH REPORTS WHAT IT SKIPPED. `firstError` alone names one PR, which reads as "one failed"
+    // when four were refused — and the other three would sit there looking merged. The refusal
+    // itself is kept verbatim; the batch line is appended, never substituted for it.
+    if (firstError && listed())
+      setError(
+        refusedNumbers.length > 1
+          ? `${firstError}\n\n${probeRefusedInBatch(refusedNumbers)}`
+          : firstError,
+      );
     // Reconcile with the truth: merged PRs drop out, a failed one stays (now visibly still open).
     if (listed()) await refetch();
   };
@@ -828,7 +1087,9 @@ export function OpenPrMenu({
       viewerCanMerge: pr.viewerCanMerge === true,
       dismissedAt: Math.floor(Date.now() / 1000),
     };
-    setDismissedByKey((prev) => new Map(prev).set(key, [...before, optimistic]));
+    setDismissedByKey((prev) =>
+      new Map(prev).set(key, [...before, optimistic]),
+    );
     const stored = await dismissPr(scope.projectId, pr);
     if (!aliveRef.current || !liveKeysRef.current.has(key)) return;
     setDismissedByKey((prev) => new Map(prev).set(key, stored ?? before));
@@ -838,7 +1099,10 @@ export function OpenPrMenu({
   const runRestore = async (scope: PrScope, key: string, number: number) => {
     const before = dismissedByKey.get(key) ?? [];
     setDismissedByKey((prev) =>
-      new Map(prev).set(key, before.filter((d) => d.number !== number)),
+      new Map(prev).set(
+        key,
+        before.filter((d) => d.number !== number),
+      ),
     );
     const stored = await restorePr(scope.projectId, number);
     if (!aliveRef.current || !liveKeysRef.current.has(key)) return;
@@ -847,7 +1111,9 @@ export function OpenPrMenu({
 
   const openGithub = (url: string) => {
     if (!url) return;
-    void openUrl(url).catch((e) => log.warn("open-pr-menu", "could not open PR", e));
+    void openUrl(url).catch((e) =>
+      log.warn("open-pr-menu", "could not open PR", e),
+    );
   };
 
   const anyMergingIn = (group: PrGroup) =>
@@ -862,7 +1128,9 @@ export function OpenPrMenu({
    * explain why. This is the unscoped-flag bug the notes above record as already fixed twice
    * (roborev 56164, 56193), and it came back one control over.
    */
-  const anyListedMerging = [...merging].some((k) => groups.some((g) => k.startsWith(`${g.key}#`)));
+  const anyListedMerging = [...merging].some((k) =>
+    groups.some((g) => k.startsWith(`${g.key}#`)),
+  );
 
   return (
     // THIS WRAPPER IS THE COMPACT PANEL'S ANCHOR, AND NOTHING ELSE. It stays `static` there on
@@ -895,7 +1163,11 @@ export function OpenPrMenu({
           // armed when it reopens — that would turn a single later click into a merge of a red PR,
           // which is the whole thing the two-step exists to prevent.
           setOverrideArmed(null);
-          if (!open) void refetch(); // refresh on open so the user acts on current state
+          setOverrideReason("");
+          if (!open) {
+            clearProbeRefusals(); // see clearProbeRefusals — answering the probe is the remedy
+            void refetch(); // refresh on open so the user acts on current state
+          }
         }}
         style={
           compact
@@ -972,6 +1244,7 @@ export function OpenPrMenu({
             onClick={() => {
               setOpen(false);
               setOverrideArmed(null); // closing the panel discards the deliberate act
+              setOverrideReason(""); // …and the sentence written to justify it
             }}
             style={{ position: "fixed", inset: 0, zIndex: 40 }}
           />
@@ -1068,11 +1341,21 @@ export function OpenPrMenu({
                   // job is "try again" must not look like it ignored the click meanwhile.
                   const scope = scopesKey;
                   setRefreshingScope(scope);
+                  clearProbeRefusals(); // see clearProbeRefusals — answering the probe is the remedy
+                  // DISARM ALONGSIDE THE CLEAR, for the same reason the open/close toggle does it.
+                  // Dropping the refusal takes the row out of the `probeRefusal` branch, so if the
+                  // refetch shows the PR as not-green-but-overridable it renders the `unstable`
+                  // override button instead — and `armed` is shared state, so that button would
+                  // come up already reading "Merge anyway?" with its first click consumed. One
+                  // click would then merge a red PR whose two-step the user never performed.
+                  setOverrideArmed(null);
+                  setOverrideReason("");
                   // Clears only if it is still OURS. A refresh for a different set of open tabs may
                   // have started in the meantime and owns the flag now; ending this one must not
                   // flip that button back to idle.
                   void refetch().finally(() => {
-                    if (aliveRef.current) setRefreshingScope((s) => (s === scope ? null : s));
+                    if (aliveRef.current)
+                      setRefreshingScope((s) => (s === scope ? null : s));
                   });
                 }}
                 style={{
@@ -1088,7 +1371,8 @@ export function OpenPrMenu({
                   padding: "3px 8px",
                   fontSize: 12,
                   fontWeight: FONT_WEIGHT.semibold,
-                  cursor: anyListedMerging || refreshing ? "default" : "pointer",
+                  cursor:
+                    anyListedMerging || refreshing ? "default" : "pointer",
                   whiteSpace: "nowrap",
                 }}
               >
@@ -1104,9 +1388,14 @@ export function OpenPrMenu({
                   fontSize: 12,
                   padding: "4px 8px 8px",
                   wordBreak: "break-word",
+                  // The probe refusal is several lines and they are the whole point of it. Room to
+                  // scroll rather than a clipped or panel-stretching block: this sits above the PR
+                  // list, and a long refusal must not push the rows it is about off screen.
+                  maxHeight: 220,
+                  overflowY: "auto",
                 }}
               >
-                {error}
+                <MergeErrorText text={error} onOpenLink={openGithub} />
               </div>
             )}
 
@@ -1150,7 +1439,11 @@ export function OpenPrMenu({
             {sections.map((group) => {
               const groupMerging = anyMergingIn(group);
               return (
-                <div key={group.key} data-testid="pr-group" data-project-id={group.scope.projectId}>
+                <div
+                  key={group.key}
+                  data-testid="pr-group"
+                  data-project-id={group.scope.projectId}
+                >
                   {/* ── THE SECTION HEADER: WHICH PROJECT, AND THE ONLY BULK ACTION ────────────
                       The founder's ask verbatim — "listed by project tab name in the actual PR list
                       the user sees when clicking on the chiclet".
@@ -1191,7 +1484,12 @@ export function OpenPrMenu({
                       {group.scope.projectName}
                     </span>
                     <span
-                      style={{ flex: "0 0 auto", color: C.muted, fontSize: TYPE.micro, whiteSpace: "nowrap" }}
+                      style={{
+                        flex: "0 0 auto",
+                        color: C.muted,
+                        fontSize: TYPE.micro,
+                        whiteSpace: "nowrap",
+                      }}
                     >
                       {group.prs.length}
                     </span>
@@ -1215,7 +1513,9 @@ export function OpenPrMenu({
                       onClick={() =>
                         void runMerge(
                           group.scope,
-                          group.prs.filter((p) => prMergeReadiness(p).canMerge).map((p) => p.number),
+                          group.prs
+                            .filter((p) => prMergeReadiness(p).canMerge)
+                            .map((p) => p.number),
                         )
                       }
                       style={{
@@ -1223,16 +1523,27 @@ export function OpenPrMenu({
                         // constraint on this whole surface — so it never shrinks, and the project
                         // name beside it yields first.
                         flex: "0 0 auto",
-                        background: group.readyCount === 0 || groupMerging ? "transparent" : C.teal,
-                        color: group.readyCount === 0 || groupMerging ? C.muted : "#fff",
+                        background:
+                          group.readyCount === 0 || groupMerging
+                            ? "transparent"
+                            : C.teal,
+                        color:
+                          group.readyCount === 0 || groupMerging
+                            ? C.muted
+                            : "#fff",
                         border: `1px solid ${
-                          group.readyCount === 0 || groupMerging ? C.muted : C.teal
+                          group.readyCount === 0 || groupMerging
+                            ? C.muted
+                            : C.teal
                         }`,
                         borderRadius: 6,
                         padding: "3px 10px",
                         fontSize: 12,
                         fontWeight: FONT_WEIGHT.semibold,
-                        cursor: group.readyCount === 0 || groupMerging ? "default" : "pointer",
+                        cursor:
+                          group.readyCount === 0 || groupMerging
+                            ? "default"
+                            : "pointer",
                         whiteSpace: "nowrap",
                       }}
                     >
@@ -1248,50 +1559,59 @@ export function OpenPrMenu({
                     const busy = merging.has(rowKey);
                     const armed = overrideArmed === rowKey;
                     const agent = resolveAgent(pr);
+                    /** This row's last merge was refused for unanswered probes — the message, or
+                     *  undefined. Takes precedence over `ready` in the action slot: the PR was green
+                     *  enough for us to try, and Rust said no for a reason `ready` cannot see. */
+                    const probeRefusal = probeRefusals.get(rowKey);
+                    /** Why the typed reason will not do yet, or null. Read at RENDER time so the
+                     *  button's enabled state and the hint under the box cannot disagree. */
+                    const reasonIssue = knightwatchReasonIssue(overrideReason);
                     return (
-                      <div
-                        key={rowKey}
-                        data-testid="pr-row"
-                        data-project-id={group.scope.projectId}
-                        style={{
-                          display: "flex",
-                          alignItems: "center",
-                          gap: 8,
-                          padding: "8px 8px",
-                          borderRadius: 6,
-                        }}
-                      >
-                        <span
-                          // Not aria-hidden: the dot now carries the BLOCKING REASON, not just a
-                          // decorative CI colour, so it has to be readable rather than skipped.
-                          role="img"
-                          aria-label={ready.title}
-                          data-testid={`pr-dot-${pr.number}`}
-                          data-tone={ready.tone}
-                          title={ready.title}
+                      <Fragment key={rowKey}>
+                        <div
+                          data-testid="pr-row"
+                          data-project-id={group.scope.projectId}
                           style={{
-                            flex: "0 0 auto",
-                            width: 8,
-                            height: 8,
-                            borderRadius: "50%",
-                            background: dotColor(ready.tone),
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 8,
+                            padding: "8px 8px",
+                            borderRadius: 6,
                           }}
-                        />
-                        <div style={{ flex: 1, minWidth: 0 }}>
-                          <div
+                        >
+                          <span
+                            // Not aria-hidden: the dot now carries the BLOCKING REASON, not just a
+                            // decorative CI colour, so it has to be readable rather than skipped.
+                            role="img"
+                            aria-label={ready.title}
+                            data-testid={`pr-dot-${pr.number}`}
+                            data-tone={ready.tone}
+                            title={ready.title}
                             style={{
-                              color: C.cream,
-                              fontSize: 13,
-                              overflow: "hidden",
-                              textOverflow: "ellipsis",
-                              whiteSpace: "nowrap",
+                              flex: "0 0 auto",
+                              width: 8,
+                              height: 8,
+                              borderRadius: "50%",
+                              background: dotColor(ready.tone),
                             }}
-                            title={pr.title}
-                          >
-                            <span style={{ color: C.muted }}>#{pr.number}</span>{" "}
-                            {pr.title || pr.headRefName}
-                          </div>
-                          {/* A FLEX ROW, so the two halves of this line can be ranked. It was one
+                          />
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div
+                              style={{
+                                color: C.cream,
+                                fontSize: 13,
+                                overflow: "hidden",
+                                textOverflow: "ellipsis",
+                                whiteSpace: "nowrap",
+                              }}
+                              title={pr.title}
+                            >
+                              <span style={{ color: C.muted }}>
+                                #{pr.number}
+                              </span>{" "}
+                              {pr.title || pr.headRefName}
+                            </div>
+                            {/* A FLEX ROW, so the two halves of this line can be ranked. It was one
                               text node with a single ellipsis across the whole thing, which
                               ellipsises LEFT-TO-RIGHT — and the state label comes first, so at a
                               narrow width the reader got "1 c…" and neither fact. The founder's
@@ -1299,107 +1619,111 @@ export function OpenPrMenu({
                               string on this surface (it is the answer to "why can't I merge this"),
                               so it is pinned; the branch is recoverable from the row's other
                               controls, so the branch yields. */}
-                          <div
-                            style={{
-                              display: "flex",
-                              alignItems: "baseline",
-                              color: C.muted,
-                              fontSize: 12,
-                            }}
-                          >
-                            {/* The STATE IN WORDS, so a non-green row does not depend on colour
+                            <div
+                              style={{
+                                display: "flex",
+                                alignItems: "baseline",
+                                color: C.muted,
+                                fontSize: 12,
+                              }}
+                            >
+                              {/* The STATE IN WORDS, so a non-green row does not depend on colour
                                 perception alone. Green needs none — its enabled Merge button says
                                 it. */}
-                            {ready.label ? (
-                              <span
-                                data-testid={`pr-state-${pr.number}`}
-                                title={ready.title}
-                                style={{
-                                  // NEVER ELIDED. See the note above.
-                                  flex: "0 0 auto",
-                                  whiteSpace: "nowrap",
-                                  color: dotColor(ready.tone),
-                                  fontWeight: FONT_WEIGHT.semibold,
-                                }}
-                              >
-                                {ready.label}
-                              </span>
-                            ) : null}
-                            {/* PADDING, not the literal spaces this used to be written with. Making
+                              {ready.label ? (
+                                <span
+                                  data-testid={`pr-state-${pr.number}`}
+                                  title={ready.title}
+                                  style={{
+                                    // NEVER ELIDED. See the note above.
+                                    flex: "0 0 auto",
+                                    whiteSpace: "nowrap",
+                                    color: dotColor(ready.tone),
+                                    fontWeight: FONT_WEIGHT.semibold,
+                                  }}
+                                >
+                                  {ready.label}
+                                </span>
+                              ) : null}
+                              {/* PADDING, not the literal spaces this used to be written with. Making
                                 the line a flex row BLOCKIFIES every child, and leading/trailing
                                 whitespace in a block box is stripped — so `" · "` rendered as a bare
                                 `·` jammed against both neighbours. Caught in the capture, not by the
                                 suite: jsdom lays nothing out, so no assertion here could see it. */}
-                            {ready.label ? (
+                              {ready.label ? (
+                                <span
+                                  aria-hidden
+                                  style={{
+                                    flex: "0 0 auto",
+                                    opacity: 0.5,
+                                    padding: "0 5px",
+                                  }}
+                                >
+                                  ·
+                                </span>
+                              ) : null}
                               <span
-                                aria-hidden
-                                style={{ flex: "0 0 auto", opacity: 0.5, padding: "0 5px" }}
+                                data-testid={`pr-branch-${pr.number}`}
+                                title={pr.headRefName}
+                                style={{
+                                  minWidth: 0,
+                                  overflow: "hidden",
+                                  textOverflow: "ellipsis",
+                                  whiteSpace: "nowrap",
+                                }}
                               >
-                                ·
+                                {pr.headRefName}
                               </span>
-                            ) : null}
-                            <span
-                              data-testid={`pr-branch-${pr.number}`}
-                              title={pr.headRefName}
+                            </div>
+                          </div>
+
+                          {agent && (
+                            <button
+                              data-testid={`open-agent-${pr.number}`}
+                              title={`Open ${agent.agentName} — the agent that opened this PR`}
+                              onClick={() => {
+                                setOpen(false);
+                                onOpenAgent(agent);
+                              }}
                               style={{
-                                minWidth: 0,
-                                overflow: "hidden",
-                                textOverflow: "ellipsis",
+                                flex: "0 0 auto",
+                                background: "transparent",
+                                color: C.accentInk,
+                                border: `1px solid ${C.accentMid}`,
+                                borderRadius: 6,
+                                padding: "3px 8px",
+                                fontSize: 12,
+                                cursor: "pointer",
                                 whiteSpace: "nowrap",
                               }}
                             >
-                              {pr.headRefName}
-                            </span>
-                          </div>
-                        </div>
+                              Open agent
+                            </button>
+                          )}
 
-                        {agent && (
                           <button
-                            data-testid={`open-agent-${pr.number}`}
-                            title={`Open ${agent.agentName} — the agent that opened this PR`}
-                            onClick={() => {
-                              setOpen(false);
-                              onOpenAgent(agent);
-                            }}
+                            data-testid={`open-github-${pr.number}`}
+                            title="View this PR on GitHub"
+                            onClick={() => openGithub(pr.url)}
+                            disabled={!pr.url}
                             style={{
                               flex: "0 0 auto",
                               background: "transparent",
-                              color: C.accentInk,
-                              border: `1px solid ${C.accentMid}`,
+                              // Ink vs stroke, as on the chip above: violetInk for the label the user
+                              // READS, the brand literal for the box it sits in.
+                              color: pr.url ? C.violetInk : C.muted,
+                              border: `1px solid ${pr.url ? C.violet : C.muted}`,
                               borderRadius: 6,
                               padding: "3px 8px",
                               fontSize: 12,
-                              cursor: "pointer",
+                              cursor: pr.url ? "pointer" : "default",
                               whiteSpace: "nowrap",
                             }}
                           >
-                            Open agent
+                            <FiExternalLink size={12} aria-hidden />
                           </button>
-                        )}
 
-                        <button
-                          data-testid={`open-github-${pr.number}`}
-                          title="View this PR on GitHub"
-                          onClick={() => openGithub(pr.url)}
-                          disabled={!pr.url}
-                          style={{
-                            flex: "0 0 auto",
-                            background: "transparent",
-                            // Ink vs stroke, as on the chip above: violetInk for the label the user
-                            // READS, the brand literal for the box it sits in.
-                            color: pr.url ? C.violetInk : C.muted,
-                            border: `1px solid ${pr.url ? C.violet : C.muted}`,
-                            borderRadius: 6,
-                            padding: "3px 8px",
-                            fontSize: 12,
-                            cursor: pr.url ? "pointer" : "default",
-                            whiteSpace: "nowrap",
-                          }}
-                        >
-                          <FiExternalLink size={12} aria-hidden />
-                        </button>
-
-                        {/* DISMISS — "not now", and the founder's literal ask ("next to the Merge
+                          {/* DISMISS — "not now", and the founder's literal ask ("next to the Merge
                             button we need a DISMISS"). It sits BEFORE Merge so the destructive-
                             looking control is never the one under a pointer aimed at the primary
                             action, and it is icon-only for the same reason the GitHub link is: this
@@ -1410,91 +1734,222 @@ export function OpenPrMenu({
                             so there is no interaction with an in-flight merge worth guarding — and
                             the row a merge is stuck on is exactly the one a user reaches to dismiss.
                             A dismissed PR that then merges is pruned by the next probe. */}
-                        <button
-                          data-testid={`dismiss-${pr.number}`}
-                          data-project-id={group.scope.projectId}
-                          aria-label={`Dismiss PR #${pr.number} — stop offering it here until something changes`}
-                          title={`Dismiss — stop offering this PR here. It comes back if you gain merge rights, if it is pushed to, or if it becomes mergeable. Restore it any time from "Dismissed" at the bottom of this list.`}
-                          onClick={() => void runDismiss(group.scope, group.key, pr)}
-                          style={{
-                            flex: "0 0 auto",
-                            background: "transparent",
-                            color: C.muted,
-                            border: `1px solid ${C.hairline}`,
-                            borderRadius: 6,
-                            padding: "3px 8px",
-                            fontSize: 12,
-                            cursor: "pointer",
-                            whiteSpace: "nowrap",
-                          }}
-                        >
-                          <FiEyeOff size={12} aria-hidden />
-                        </button>
-
-                        {/* GREEN ONLY gets the one-click Merge. A non-green PR with an ambiguous
-                            answer (GitHub would accept it, but a non-required check is red or still
-                            running) gets a two-step override instead — the user has to mean it.
-                            Everything else gets a disabled button that says why. */}
-                        {ready.canMerge || !ready.override ? (
                           <button
-                            data-testid={`merge-${pr.number}`}
+                            data-testid={`dismiss-${pr.number}`}
                             data-project-id={group.scope.projectId}
-                            disabled={!ready.canMerge || busy}
-                            title={
-                              ready.canMerge
-                                ? `Merge this PR into ${group.scope.projectName}'s main (merge commit)`
-                                : ready.title
+                            aria-label={`Dismiss PR #${pr.number} — stop offering it here until something changes`}
+                            title={`Dismiss — stop offering this PR here. It comes back if you gain merge rights, if it is pushed to, or if it becomes mergeable. Restore it any time from "Dismissed" at the bottom of this list.`}
+                            onClick={() =>
+                              void runDismiss(group.scope, group.key, pr)
                             }
-                            onClick={() => void runMerge(group.scope, [pr.number])}
-                            style={{
-                              flex: "0 0 auto",
-                              background: ready.canMerge && !busy ? C.teal : "transparent",
-                              color: ready.canMerge && !busy ? "#fff" : C.muted,
-                              border: `1px solid ${ready.canMerge && !busy ? C.teal : C.muted}`,
-                              borderRadius: 6,
-                              padding: "3px 10px",
-                              fontSize: 12,
-                              fontWeight: FONT_WEIGHT.semibold,
-                              cursor: ready.canMerge && !busy ? "pointer" : "default",
-                              whiteSpace: "nowrap",
-                            }}
-                          >
-                            {busy ? "Merging…" : "Merge"}
-                          </button>
-                        ) : (
-                          <button
-                            data-testid={`merge-override-${pr.number}`}
-                            data-project-id={group.scope.projectId}
-                            data-armed={armed ? "yes" : "no"}
-                            disabled={busy}
-                            title={`${ready.title}. ${ready.override.reason}`}
-                            onClick={() => {
-                              // Two deliberate acts. The first only ARMS the button and relabels it
-                              // with the consequence; merging takes a second, informed click.
-                              if (!armed) {
-                                setOverrideArmed(rowKey);
-                                return;
-                              }
-                              setOverrideArmed(null);
-                              void runMerge(group.scope, [pr.number]);
-                            }}
                             style={{
                               flex: "0 0 auto",
                               background: "transparent",
-                              color: armed ? C.sienna : C.muted,
-                              border: `1px solid ${armed ? C.sienna : C.muted}`,
+                              color: C.muted,
+                              border: `1px solid ${C.hairline}`,
                               borderRadius: 6,
-                              padding: "3px 10px",
+                              padding: "3px 8px",
                               fontSize: 12,
-                              fontWeight: FONT_WEIGHT.semibold,
-                              cursor: busy ? "default" : "pointer",
+                              cursor: "pointer",
                               whiteSpace: "nowrap",
                             }}
                           >
-                            {busy ? "Merging…" : armed ? "Merge anyway?" : ready.override.label}
+                            <FiEyeOff size={12} aria-hidden />
                           </button>
+
+                          {/* GREEN ONLY gets the one-click Merge. A non-green PR with an ambiguous
+                            answer (GitHub would accept it, but a non-required check is red or still
+                            running) gets a two-step override instead — the user has to mean it.
+                            Everything else gets a disabled button that says why.
+
+                            A PROBE REFUSAL OUTRANKS BOTH. It is not a property of the PR's checks —
+                            `ready` will still say this row is green — it is Rust having refused a
+                            merge we already attempted. Its override is the same two-step grammar
+                            with one thing added: the second step COSTS A SENTENCE, because unlike
+                            "GitHub would accept this anyway" there is a reviewer's unanswered
+                            question here and the reason is recorded on the PR beside it. */}
+                          {probeRefusal ? (
+                            <button
+                              data-testid={`probe-override-${pr.number}`}
+                              data-project-id={group.scope.projectId}
+                              data-armed={armed ? "yes" : "no"}
+                              // Armed with nothing written is DISABLED, not a silent no-op: the button
+                              // that does the merge must never look like it did something.
+                              disabled={busy || (armed && reasonIssue !== null)}
+                              title={
+                                armed
+                                  ? PROBE_REASON_HINT
+                                  : "Refused: this PR still carries unanswered knightwatch [blocking] probes. Answering them on the pull request is the way through — this records a written reason for merging without one."
+                              }
+                              onClick={() => {
+                                // Two deliberate acts, as everywhere else on this surface — plus the
+                                // sentence. The first click only arms the row and opens the box.
+                                if (!armed) {
+                                  setOverrideArmed(rowKey);
+                                  // CLEARED ON EVERY ARM, so a reason typed for one PR can never be
+                                  // inherited by the next row the user arms.
+                                  setOverrideReason("");
+                                  return;
+                                }
+                                const reason = overrideReason.trim();
+                                if (knightwatchReasonIssue(reason) !== null)
+                                  return;
+                                setOverrideArmed(null);
+                                setOverrideReason("");
+                                // BOUND TO THIS PR NUMBER. See `runMerge`'s `override` parameter.
+                                void runMerge(group.scope, [pr.number], {
+                                  number: pr.number,
+                                  reason,
+                                });
+                              }}
+                              style={{
+                                flex: "0 0 auto",
+                                background: "transparent",
+                                color:
+                                  armed && reasonIssue === null
+                                    ? C.sienna
+                                    : C.muted,
+                                border: `1px solid ${armed && reasonIssue === null ? C.sienna : C.muted}`,
+                                borderRadius: 6,
+                                padding: "3px 10px",
+                                fontSize: 12,
+                                fontWeight: FONT_WEIGHT.semibold,
+                                cursor:
+                                  busy || (armed && reasonIssue !== null)
+                                    ? "default"
+                                    : "pointer",
+                                whiteSpace: "nowrap",
+                              }}
+                            >
+                              {busy
+                                ? "Merging…"
+                                : armed
+                                  ? PROBE_OVERRIDE_ARMED_LABEL
+                                  : PROBE_OVERRIDE_LABEL}
+                            </button>
+                          ) : ready.canMerge || !ready.override ? (
+                            <button
+                              data-testid={`merge-${pr.number}`}
+                              data-project-id={group.scope.projectId}
+                              disabled={!ready.canMerge || busy}
+                              title={
+                                ready.canMerge
+                                  ? `Merge this PR into ${group.scope.projectName}'s main (merge commit)`
+                                  : ready.title
+                              }
+                              onClick={() =>
+                                void runMerge(group.scope, [pr.number])
+                              }
+                              style={{
+                                flex: "0 0 auto",
+                                background:
+                                  ready.canMerge && !busy
+                                    ? C.teal
+                                    : "transparent",
+                                color:
+                                  ready.canMerge && !busy ? "#fff" : C.muted,
+                                border: `1px solid ${ready.canMerge && !busy ? C.teal : C.muted}`,
+                                borderRadius: 6,
+                                padding: "3px 10px",
+                                fontSize: 12,
+                                fontWeight: FONT_WEIGHT.semibold,
+                                cursor:
+                                  ready.canMerge && !busy
+                                    ? "pointer"
+                                    : "default",
+                                whiteSpace: "nowrap",
+                              }}
+                            >
+                              {busy ? "Merging…" : "Merge"}
+                            </button>
+                          ) : (
+                            <button
+                              data-testid={`merge-override-${pr.number}`}
+                              data-project-id={group.scope.projectId}
+                              data-armed={armed ? "yes" : "no"}
+                              disabled={busy}
+                              title={`${ready.title}. ${ready.override.reason}`}
+                              onClick={() => {
+                                // Two deliberate acts. The first only ARMS the button and relabels it
+                                // with the consequence; merging takes a second, informed click.
+                                if (!armed) {
+                                  setOverrideArmed(rowKey);
+                                  return;
+                                }
+                                setOverrideArmed(null);
+                                void runMerge(group.scope, [pr.number]);
+                              }}
+                              style={{
+                                flex: "0 0 auto",
+                                background: "transparent",
+                                color: armed ? C.sienna : C.muted,
+                                border: `1px solid ${armed ? C.sienna : C.muted}`,
+                                borderRadius: 6,
+                                padding: "3px 10px",
+                                fontSize: 12,
+                                fontWeight: FONT_WEIGHT.semibold,
+                                cursor: busy ? "default" : "pointer",
+                                whiteSpace: "nowrap",
+                              }}
+                            >
+                              {busy
+                                ? "Merging…"
+                                : armed
+                                  ? "Merge anyway?"
+                                  : ready.override.label}
+                            </button>
+                          )}
+                        </div>
+
+                        {/* THE SENTENCE, on its own line UNDER the row it belongs to.
+                          Not a modal: the panel already has a deliberate two-step arming grammar and
+                          a modal would be a second one, with the row's own context (its number, its
+                          state, its branch) hidden behind it. Not inline in the row either — the row
+                          is a ranked flex line whose rule is that the action never truncates, and a
+                          text box in it would fight the title for the same space. */}
+                        {probeRefusal && armed && (
+                          <div
+                            data-testid={`probe-override-row-${pr.number}`}
+                            style={{ padding: "0 8px 8px 24px" }}
+                          >
+                            <input
+                              data-testid={`probe-override-reason-${pr.number}`}
+                              // The row was armed by a deliberate click; the caret belongs here.
+                              autoFocus
+                              value={overrideReason}
+                              onChange={(e) =>
+                                setOverrideReason(e.target.value)
+                              }
+                              placeholder="Why is it safe to merge with the probe unanswered?"
+                              aria-label={`Reason for merging PR #${pr.number} with unanswered knightwatch probes`}
+                              style={{
+                                width: "100%",
+                                boxSizing: "border-box",
+                                background: "transparent",
+                                color: C.cream,
+                                border: `1px solid ${reasonIssue === null ? C.sienna : C.muted}`,
+                                borderRadius: 6,
+                                padding: "4px 8px",
+                                fontSize: 12,
+                              }}
+                            />
+                            <div
+                              data-testid={`probe-override-hint-${pr.number}`}
+                              style={{
+                                color: reasonIssue === null ? C.muted : C.amber,
+                                // TYPE.micro, not a literal: the theme ratchet counts off-scale
+                                // fontSize values and this is a hint, the register `micro` is for.
+                                fontSize: TYPE.micro,
+                                paddingTop: 4,
+                              }}
+                            >
+                              {reasonIssue === null
+                                ? PROBE_REASON_HINT
+                                : PROBE_REASON_SHORT}
+                            </div>
+                          </div>
                         )}
-                      </div>
+                      </Fragment>
                     );
                   })}
                 </div>
@@ -1566,8 +2021,9 @@ export function OpenPrMenu({
                         wordBreak: "break-word",
                       }}
                     >
-                      These aren't listed or counted above. Each comes back on its own if you gain
-                      merge rights, if it's pushed to, or if it becomes mergeable.
+                      These aren't listed or counted above. Each comes back on
+                      its own if you gain merge rights, if it's pushed to, or if
+                      it becomes mergeable.
                     </div>
                     {dismissedSections.map(({ group, pr }) => (
                       <div
@@ -1614,7 +2070,9 @@ export function OpenPrMenu({
                           data-project-id={group.scope.projectId}
                           aria-label={`Restore PR #${pr.number} to the list`}
                           title="Restore — list and count this PR again"
-                          onClick={() => void runRestore(group.scope, group.key, pr.number)}
+                          onClick={() =>
+                            void runRestore(group.scope, group.key, pr.number)
+                          }
                           style={{
                             flex: "0 0 auto",
                             background: "transparent",

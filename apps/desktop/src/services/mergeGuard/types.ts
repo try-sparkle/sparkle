@@ -143,6 +143,28 @@ export interface RoborevGateVerdict {
 }
 
 // ---------------------------------------------------------------------------------------------
+// knightwatch — the review probes a PR must not merge past unanswered
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * A WRITTEN waiver for a PR carrying unanswered knightwatch `[blocking]` probes.
+ *
+ * An object with one required field rather than a bare string, for the same reason
+ * `roborevOverride` is an object rather than a boolean: the shape is what stops a caller expressing
+ * "override" without expressing WHY. Rust validates that the reason costs a sentence and records it
+ * on the pull request, so the waiver is attributable to whoever wrote it — a human who typed it into
+ * the PR menu, or a model whose words are recorded AS the model's words.
+ *
+ * NOTHING HERE MAKES A PROBE ANSWERED. The probe is a reviewer's question on the PR and the only
+ * thing that answers it is a reply on the PR citing it. This type is the record of a decision to
+ * merge anyway; every refusal message that mentions it has to say so, or the override quietly
+ * becomes the cheaper path and the gate is worth nothing.
+ */
+export interface KnightwatchOverride {
+  reason: string;
+}
+
+// ---------------------------------------------------------------------------------------------
 // PR claims — an agent's "I will land this myself", made legible to the concierge
 // ---------------------------------------------------------------------------------------------
 

@@ -581,7 +581,10 @@ describe("merge_pr", () => {
       risk: "mutates-main",
       data: { number: 7, method: "merge", url: "u" },
     });
-    expect(m.mergePr).toHaveBeenCalledWith("/repo", 7);
+    // The third argument is the knightwatch override, and an ordinary merge sends NO reason —
+    // asserted positionally, because "undefined" here is the difference between merging on the
+    // gate's terms and merging past a reviewer's unanswered question.
+    expect(m.mergePr).toHaveBeenCalledWith("/repo", 7, undefined);
   });
 
   it("refuses to merge over pending or failing checks, or a conflict", async () => {
@@ -709,7 +712,7 @@ describe("merge_pr honours roborev, not just CI", () => {
   it("MERGES when roborev is not in play on this machine — the gate is a no-op, not a deadlock", async () => {
     m.fetchRoborevProbe.mockResolvedValue({ enabled: false, jobs: null });
     expect(await mergePrTool({ root: "/repo", projectId: "p1", number: 806 })).toMatchObject({ ok: true });
-    expect(m.mergePr).toHaveBeenCalledWith("/repo", 806);
+    expect(m.mergePr).toHaveBeenCalledWith("/repo", 806, undefined);
   });
 
   it("MERGES when a closed FAIL is all that is left — roborev close is somebody's judgement", async () => {
@@ -794,6 +797,138 @@ describe("merge_pr honours roborev, not just CI", () => {
       expect(r).toMatchObject({ ok: false, code: "invalid-request" });
       expect(m.mergePr).not.toHaveBeenCalled();
     });
+  });
+});
+
+// ── GATE 6: KNIGHTWATCH PROBES ────────────────────────────────────────────────────────────────
+//
+// The gate is inside Rust's `merge_pr`, so what is asserted here is the TOOL LAYER's two jobs:
+// forward a written override (or refuse a malformed one before spending a merge on it), and turn
+// Rust's refusal into a coded, actionable one. Measured before it was built — of the last 40 merged
+// PRs, 24 carried a `[blocking]` probe and every one merged with zero probe-citing reply.
+describe("merge_pr and unanswered knightwatch probes", () => {
+  const openPr = {
+    number: 1176,
+    title: "feat: a thing",
+    headRefName: "sparkle/a-thing",
+    url: "https://github.com/drodio/sparkle/pull/1176",
+    checks: "passing" as const,
+    mergeable: "mergeable" as const,
+  };
+  const RUST_REFUSAL = [
+    "PR #1176 still carries 1 unanswered knightwatch [blocking] probe.",
+    "",
+    "1. [blocking] [from: shape] Q: Does the retry loop bound its attempts?",
+    "   https://github.com/drodio/sparkle/pull/1176#issuecomment-5182769304",
+  ].join("\n");
+  const REASON = "the probe asks about a file this PR does not touch";
+
+  beforeEach(() => {
+    m.fetchOpenPrs.mockResolvedValue([openPr]);
+    // Every earlier gate open, so what is left is the one under test.
+    m.fetchRoborevProbe.mockResolvedValue({ enabled: false, jobs: null });
+    m.mergePr.mockResolvedValue(undefined);
+  });
+
+  it("turns Rust's refusal into a CODED one that names the reply as the remedy", async () => {
+    m.mergePr.mockRejectedValue(new Error(RUST_REFUSAL));
+    const r = await mergePrTool({ root: "/repo", projectId: "p1", number: 1176 });
+    expect(r).toMatchObject({ ok: false, kind: "refused", code: "knightwatch-unanswered" });
+    const msg = (r as { message: string }).message;
+    // Rust's own words survive — the probe, its specialist and its link are the actionable part.
+    expect(msg).toContain(RUST_REFUSAL);
+    // …and the remedy is ANSWERING, not waiving. A refusal that leads with its own escape hatch
+    // teaches the model that the hatch is the way through, which is the failure being fixed.
+    expect(msg).toMatch(/answer them on the pull request/i);
+    expect(msg).toMatch(/does NOT answer one/);
+    expect(msg).toMatch(/published under your name/i);
+  });
+
+  it("does NOT mistake an ordinary merge failure for a probe refusal", async () => {
+    m.mergePr.mockRejectedValue(new Error("Pull request is not mergeable"));
+    expect(await mergePrTool({ root: "/repo", projectId: "p1", number: 1176 })).toMatchObject({
+      ok: false,
+      kind: "failed",
+      code: "conflict",
+    });
+  });
+
+  it("FORWARDS a written override to the merge — the reason is the whole feature", async () => {
+    const r = await mergePrTool({
+      root: "/repo",
+      projectId: "p1",
+      number: 1176,
+      knightwatchOverride: { reason: REASON },
+    });
+    expect(r).toMatchObject({ ok: true });
+    // POSITIONALLY. A reason collected, validated and then dropped looks identical from here — the
+    // merge succeeds either way in this mock — and in production Rust would refuse it forever.
+    expect(m.mergePr).toHaveBeenCalledWith("/repo", 1176, REASON);
+  });
+
+  it("trims the reason rather than recording the caller's whitespace on the PR", async () => {
+    await mergePrTool({
+      root: "/repo",
+      projectId: "p1",
+      number: 1176,
+      knightwatchOverride: { reason: `  ${REASON}  ` },
+    });
+    expect(m.mergePr).toHaveBeenCalledWith("/repo", 1176, REASON);
+  });
+
+  it("rejects a BOOLEAN override — a waiver has to say why", async () => {
+    const r = await mergePrTool({
+      root: "/repo",
+      projectId: "p1",
+      number: 1176,
+      knightwatchOverride: true,
+    } as never);
+    expect(r).toMatchObject({ ok: false, kind: "refused", code: "invalid-request" });
+    expect(m.mergePr).not.toHaveBeenCalled();
+  });
+
+  it("rejects the one-word waiver a model reaches for first, and says what to write", async () => {
+    for (const reason of ["", "   ", "ok", "approved", "merging"]) {
+      m.mergePr.mockClear();
+      const r = await mergePrTool({
+        root: "/repo",
+        projectId: "p1",
+        number: 1176,
+        knightwatchOverride: { reason },
+      });
+      expect(r, JSON.stringify(reason)).toMatchObject({ ok: false, code: "invalid-request" });
+      // NOTHING WAS MERGED. A refused override that still merged would be the worst of both.
+      expect(m.mergePr, JSON.stringify(reason)).not.toHaveBeenCalled();
+      expect((r as { message: string }).message).toMatch(/recorded on the pull request/i);
+    }
+  });
+
+  it("does not let the override skip the gates ahead of it", async () => {
+    // An override is for the probe gate and nothing else. A model that pastes one in to get past a
+    // roborev refusal must still be refused BY ROBOREV — and the merge must not run.
+    m.fetchRoborevProbe.mockResolvedValue({
+      enabled: true,
+      jobs: [
+        {
+          id: 55234,
+          branch: "sparkle/a-thing",
+          gitRef: "abc1234",
+          status: "done",
+          verdict: "F",
+          closed: false,
+          commitSubject: null,
+          finishedAt: null,
+        },
+      ],
+    });
+    const r = await mergePrTool({
+      root: "/repo",
+      projectId: "p1",
+      number: 1176,
+      knightwatchOverride: { reason: REASON },
+    });
+    expect(r).toMatchObject({ ok: false, code: "roborev-unresolved" });
+    expect(m.mergePr).not.toHaveBeenCalled();
   });
 });
 

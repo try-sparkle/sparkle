@@ -124,11 +124,32 @@ export function fetchPrOwner(
   return invoke<PrOwnerAnswer>("pr_owner", { root, projectId, number });
 }
 
-/** Ask GitHub to merge PR `number` with a MERGE COMMIT (the Rust `merge_pr` command). Rejects with
- *  gh's own error text when the merge is declined (red required checks, a conflict, lost auth), which
- *  the menu surfaces so the user sees exactly why. */
-export async function mergePr(root: string, number: number): Promise<void> {
-  await invoke("merge_pr", { root, number });
+/**
+ * Ask GitHub to merge PR `number` with a MERGE COMMIT (the Rust `merge_pr` command). Rejects with
+ * gh's own error text when the merge is declined (red required checks, a conflict, lost auth), which
+ * the menu surfaces so the user sees exactly why.
+ *
+ * `knightwatchOverride` is a WRITTEN reason for merging a PR that still carries unanswered
+ * knightwatch `[blocking]` review probes. Rust refuses that merge by default — see
+ * `mergeGuard/knightwatch.ts` for why the gate lives there and not here — and a reason is what buys
+ * past it. It is not a boolean and not a flag: Rust records the sentence ON THE PULL REQUEST and
+ * validates that it costs one, so an override is always attributable to whoever wrote it.
+ *
+ * OMITTED, NOT `undefined`, when absent. The Rust parameter is an `Option<String>`, so either would
+ * decode — but every existing caller and test asserts the exact payload `{ root, number }`, and a
+ * key that materialises on every merge is a change to the wire for no gain. Passing a reason is the
+ * exceptional path and it looks like one.
+ */
+export async function mergePr(
+  root: string,
+  number: number,
+  knightwatchOverride?: string,
+): Promise<void> {
+  await invoke("merge_pr", {
+    root,
+    number,
+    ...(knightwatchOverride === undefined ? {} : { knightwatchOverride }),
+  });
 }
 
 export interface MergeEligibility {

@@ -2,15 +2,27 @@
 // Component coverage for the TopBar open-PR menu: render/hide by the null-vs-zero rule, the dropdown
 // list, the per-PR + "merge all" merge paths, the check-status gate, and the "Open agent" hand-off.
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { act, render, screen, waitFor, cleanup, fireEvent, within } from "@testing-library/react";
+import {
+  act,
+  render,
+  screen,
+  waitFor,
+  cleanup,
+  fireEvent,
+  within,
+} from "@testing-library/react";
 
 const h = vi.hoisted(() => ({
   invoke: vi.fn(),
   openUrl: vi.fn(),
 }));
 
-vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => h.invoke(...a) }));
-vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: (u: string) => h.openUrl(u) }));
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: (...a: unknown[]) => h.invoke(...a),
+}));
+vi.mock("@tauri-apps/plugin-opener", () => ({
+  openUrl: (u: string) => h.openUrl(u),
+}));
 
 import {
   OpenPrMenu,
@@ -98,9 +110,13 @@ const noop = () => {};
 describe("OpenPrMenu", () => {
   it("renders the count when PRs are waiting", async () => {
     stubList([PASS, FAILING]);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     await waitFor(() =>
-      expect(screen.getByTestId("open-pr-badge").textContent).toContain("2 PRs waiting"),
+      expect(screen.getByTestId("open-pr-badge").textContent).toContain(
+        "2 PRs waiting",
+      ),
     );
   });
 
@@ -113,13 +129,23 @@ describe("OpenPrMenu", () => {
     expect(screen.queryByTestId("open-pr-badge")).toBeNull();
 
     stubList(null);
-    rerender(<OpenPrMenu scopes={SCOPES_ALT} resolveAgent={noAgent} onOpenAgent={noop} />);
-    await waitFor(() => expect(screen.queryByTestId("open-pr-badge")).toBeNull());
+    rerender(
+      <OpenPrMenu
+        scopes={SCOPES_ALT}
+        resolveAgent={noAgent}
+        onOpenAgent={noop}
+      />,
+    );
+    await waitFor(() =>
+      expect(screen.queryByTestId("open-pr-badge")).toBeNull(),
+    );
   });
 
   it("opens the dropdown and lists each PR", async () => {
     stubList([PASS, FAILING]);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     fireEvent.click(await screen.findByTestId("open-pr-badge"));
     expect(await screen.findByTestId("merge-1")).toBeTruthy();
     expect(screen.getByTestId("merge-2")).toBeTruthy();
@@ -127,32 +153,49 @@ describe("OpenPrMenu", () => {
 
   it("gates merge on checks: a failing PR's Merge is disabled, a passing one's is enabled", async () => {
     stubList([PASS, FAILING]);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     fireEvent.click(await screen.findByTestId("open-pr-badge"));
-    expect((await screen.findByTestId("merge-1")).hasAttribute("disabled")).toBe(false);
+    expect(
+      (await screen.findByTestId("merge-1")).hasAttribute("disabled"),
+    ).toBe(false);
     expect(screen.getByTestId("merge-2").hasAttribute("disabled")).toBe(true);
   });
 
   it("merges a single PR through the Rust command", async () => {
     stubList([PASS]);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     fireEvent.click(await screen.findByTestId("open-pr-badge"));
     fireEvent.click(await screen.findByTestId("merge-1"));
     await waitFor(() =>
-      expect(h.invoke).toHaveBeenCalledWith("merge_pr", { root: "/repo", number: 1 }),
+      expect(h.invoke).toHaveBeenCalledWith("merge_pr", {
+        root: "/repo",
+        number: 1,
+      }),
     );
   });
 
   it("'Merge all ready' merges only the eligible PRs, skipping the failing one", async () => {
     stubList([PASS, FAILING]);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     fireEvent.click(await screen.findByTestId("open-pr-badge"));
     fireEvent.click(await screen.findByTestId("merge-all"));
     await waitFor(() =>
-      expect(h.invoke).toHaveBeenCalledWith("merge_pr", { root: "/repo", number: 1 }),
+      expect(h.invoke).toHaveBeenCalledWith("merge_pr", {
+        root: "/repo",
+        number: 1,
+      }),
     );
     // The failing PR (#2) must never be merged by "merge all".
-    expect(h.invoke).not.toHaveBeenCalledWith("merge_pr", { root: "/repo", number: 2 });
+    expect(h.invoke).not.toHaveBeenCalledWith("merge_pr", {
+      root: "/repo",
+      number: 2,
+    });
   });
 
   it("shows 'Open agent' only when a live agent matches the PR branch, and calls back on click", async () => {
@@ -163,9 +206,16 @@ describe("OpenPrMenu", () => {
       projectId: "p1",
       isCurrentProject: true,
     };
-    const resolve = (pr: PrRow) => (pr.headRefName === PASS.headRefName ? link : null);
+    const resolve = (pr: PrRow) =>
+      pr.headRefName === PASS.headRefName ? link : null;
     const onOpen = vi.fn();
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={resolve} onOpenAgent={onOpen} />);
+    render(
+      <OpenPrMenu
+        scopes={SCOPES}
+        resolveAgent={resolve}
+        onOpenAgent={onOpen}
+      />,
+    );
     fireEvent.click(await screen.findByTestId("open-pr-badge"));
     fireEvent.click(await screen.findByTestId("open-agent-1"));
     expect(onOpen).toHaveBeenCalledWith(link);
@@ -213,7 +263,9 @@ function cssLength(value: string, innerWidth: number): number | null {
   const min = /^min\((.*)\)$/.exec(v);
   if (min) {
     const parts = splitTopLevel(min[1]!).map((p) => cssLength(p, innerWidth));
-    return parts.some((p) => p === null) ? null : Math.min(...(parts as number[]));
+    return parts.some((p) => p === null)
+      ? null
+      : Math.min(...(parts as number[]));
   }
   const calc = /^calc\(100vw\s*-\s*([\d.]+)px\)$/.exec(v);
   if (calc) return innerWidth - Number(calc[1]);
@@ -236,7 +288,10 @@ function cssLength(value: string, innerWidth: number): number | null {
 function stubLayout(innerWidth: number) {
   const realRect = HTMLElement.prototype.getBoundingClientRect;
   const realInnerWidth = Object.getOwnPropertyDescriptor(window, "innerWidth");
-  Object.defineProperty(window, "innerWidth", { value: innerWidth, configurable: true });
+  Object.defineProperty(window, "innerWidth", {
+    value: innerWidth,
+    configurable: true,
+  });
   HTMLElement.prototype.getBoundingClientRect = function (this: HTMLElement) {
     if (this.dataset.testid !== "open-pr-panel") return realRect.call(this);
     const minW = cssLength(this.style.minWidth, innerWidth);
@@ -248,7 +303,10 @@ function stubLayout(innerWidth: number) {
     const badgeRight = innerWidth - BADGE_RIGHT_INSET;
     // Right-anchored: the panel's right edge meets the badge's. Left-anchored (the bug): its left
     // edge meets the badge's left, and the panel runs off the window from there.
-    const left = this.style.right === "0px" ? badgeRight - width : badgeRight - BADGE_WIDTH;
+    const left =
+      this.style.right === "0px"
+        ? badgeRight - width
+        : badgeRight - BADGE_WIDTH;
     return {
       left,
       right: left + width,
@@ -262,7 +320,8 @@ function stubLayout(innerWidth: number) {
   };
   return () => {
     HTMLElement.prototype.getBoundingClientRect = realRect;
-    if (realInnerWidth) Object.defineProperty(window, "innerWidth", realInnerWidth);
+    if (realInnerWidth)
+      Object.defineProperty(window, "innerWidth", realInnerWidth);
   };
 }
 
@@ -270,7 +329,9 @@ function stubLayout(innerWidth: number) {
 async function openPanelAt(innerWidth: number) {
   const restore = stubLayout(innerWidth);
   stubList([PASS, FAILING]);
-  render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+  render(
+    <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+  );
   fireEvent.click(await screen.findByTestId("open-pr-badge"));
   const panel = await screen.findByTestId("open-pr-panel");
   return { panel, rect: panel.getBoundingClientRect(), restore };
@@ -279,7 +340,9 @@ async function openPanelAt(innerWidth: number) {
 describe("OpenPrMenu (containment — §12a)", () => {
   it("anchors the panel to the badge's RIGHT edge, never its left", async () => {
     stubList([PASS]);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     fireEvent.click(await screen.findByTestId("open-pr-badge"));
     const panel = await screen.findByTestId("open-pr-panel");
     expect(panel.style.right).toBe("0px");
@@ -293,7 +356,9 @@ describe("OpenPrMenu (containment — §12a)", () => {
   // tested it (roborev 53787).
   it("clamps BOTH min-width and max-width to the viewport", async () => {
     stubList([PASS]);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     fireEvent.click(await screen.findByTestId("open-pr-badge"));
     const panel = await screen.findByTestId("open-pr-panel");
     expect(panel.style.minWidth).toBe("min(340px, calc(100vw - 16px))");
@@ -339,7 +404,9 @@ describe("OpenPrMenu (containment — §12a)", () => {
 
   it("stays scrollable at small window heights (the list can never outgrow the window)", async () => {
     stubList([PASS, FAILING]);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     fireEvent.click(await screen.findByTestId("open-pr-badge"));
     const panel = await screen.findByTestId("open-pr-panel");
     expect(panel.style.overflowY).toBe("auto");
@@ -360,9 +427,21 @@ describe("OpenPrMenu (containment — §12a)", () => {
 
 describe("agentLinkForBranch", () => {
   const agent = (over: Partial<AgentTab> & { id: string }): AgentTab =>
-    ({ kind: "build", parentId: null, name: over.id, branch: null, ...over }) as AgentTab;
+    ({
+      kind: "build",
+      parentId: null,
+      name: over.id,
+      branch: null,
+      ...over,
+    }) as AgentTab;
   const project = (id: string, agents: AgentTab[]): Project =>
-    ({ id, name: id, rootPath: `/${id}`, createdAt: "2026-01-01T00:00:00Z", agents }) as Project;
+    ({
+      id,
+      name: id,
+      rootPath: `/${id}`,
+      createdAt: "2026-01-01T00:00:00Z",
+      agents,
+    }) as Project;
 
   it("matches the agent whose branch equals the PR's headRefName", () => {
     const projects = [
@@ -396,16 +475,30 @@ describe("agentLinkForBranch", () => {
   });
 
   it("returns null when no agent owns the branch (the common orphaned-PR case)", () => {
-    const projects = [project("p1", [agent({ id: "a", branch: "sparkle/agent-a" })])];
+    const projects = [
+      project("p1", [agent({ id: "a", branch: "sparkle/agent-a" })]),
+    ];
     expect(agentLinkForBranch("sparkle/agent-gone", projects, "p1")).toBeNull();
   });
 });
 
 describe("agentLinkForPr", () => {
   const agent = (over: Partial<AgentTab> & { id: string }): AgentTab =>
-    ({ kind: "build", parentId: null, name: over.id, branch: null, ...over }) as AgentTab;
+    ({
+      kind: "build",
+      parentId: null,
+      name: over.id,
+      branch: null,
+      ...over,
+    }) as AgentTab;
   const project = (id: string, agents: AgentTab[]): Project =>
-    ({ id, name: id, rootPath: `/${id}`, createdAt: "2026-01-01T00:00:00Z", agents }) as Project;
+    ({
+      id,
+      name: id,
+      rootPath: `/${id}`,
+      createdAt: "2026-01-01T00:00:00Z",
+      agents,
+    }) as Project;
   const pr = (over: Partial<PrRow>): PrRow => ({ ...PASS, ...over });
 
   it("resolves a PR on a DESCRIPTIVE branch — no agent id in the name — from the recorded owner", () => {
@@ -413,9 +506,19 @@ describe("agentLinkForPr", () => {
     // below can never answer it; the durable `agentId` can, and that is the whole point of recording
     // the mapping instead of re-deriving it from a string.
     const projects = [
-      project("p1", [agent({ id: "cockpit", branch: "sparkle/left-pair", name: "Left Pair" })]),
+      project("p1", [
+        agent({
+          id: "cockpit",
+          branch: "sparkle/left-pair",
+          name: "Left Pair",
+        }),
+      ]),
     ];
-    const row = pr({ number: 806, headRefName: "sparkle/left-pair", agentId: "cockpit" });
+    const row = pr({
+      number: 806,
+      headRefName: "sparkle/left-pair",
+      agentId: "cockpit",
+    });
     expect(agentLinkForPr(row, projects, "p1")).toEqual({
       agentId: "cockpit",
       agentName: "Left Pair",
@@ -424,7 +527,11 @@ describe("agentLinkForPr", () => {
     });
     // Prove the branch name is doing NO work: the same recorded owner still resolves when the
     // branch has been renamed to something the roster join cannot match at all.
-    const renamed = pr({ number: 806, headRefName: "totally/unrelated", agentId: "cockpit" });
+    const renamed = pr({
+      number: 806,
+      headRefName: "totally/unrelated",
+      agentId: "cockpit",
+    });
     expect(agentLinkForPr(renamed, projects, "p1")?.agentId).toBe("cockpit");
   });
 
@@ -442,7 +549,9 @@ describe("agentLinkForPr", () => {
 
   it("falls back to the branch join for a PR recorded before the mapping existed", () => {
     const projects = [
-      project("p1", [agent({ id: "a", branch: "sparkle/agent-a", name: "Alpha" })]),
+      project("p1", [
+        agent({ id: "a", branch: "sparkle/agent-a", name: "Alpha" }),
+      ]),
     ];
     const row = pr({ headRefName: "sparkle/agent-a", agentId: null });
     expect(agentLinkForPr(row, projects, "p1")?.agentId).toBe("a");
@@ -452,12 +561,24 @@ describe("agentLinkForPr", () => {
     // A link is only useful if it OPENS the agent it names. A recorded id for an agent that has left
     // the roster, and a PR nothing identifies at all, must both be null — never a neighbour's id.
     const projects = [
-      project("p1", [agent({ id: "a", branch: "sparkle/agent-a", name: "Alpha" })]),
+      project("p1", [
+        agent({ id: "a", branch: "sparkle/agent-a", name: "Alpha" }),
+      ]),
     ];
-    expect(agentLinkForPr(pr({ headRefName: "sparkle/left-pair", agentId: "gone" }), projects, "p1"))
-      .toBeNull();
-    expect(agentLinkForPr(pr({ headRefName: "sparkle/left-pair", agentId: null }), projects, "p1"))
-      .toBeNull();
+    expect(
+      agentLinkForPr(
+        pr({ headRefName: "sparkle/left-pair", agentId: "gone" }),
+        projects,
+        "p1",
+      ),
+    ).toBeNull();
+    expect(
+      agentLinkForPr(
+        pr({ headRefName: "sparkle/left-pair", agentId: null }),
+        projects,
+        "p1",
+      ),
+    ).toBeNull();
   });
 
   it("a KNOWN owner that left the roster is null — it never falls through to the branch join", () => {
@@ -466,13 +587,17 @@ describe("agentLinkForPr", () => {
     // recorded an owner" are different facts, and re-attributing the first by branch name is exactly
     // the wrong-pill failure the durable mapping exists to prevent.
     const projects = [
-      project("p1", [agent({ id: "squatter", branch: "shared/branch", name: "Squatter" })]),
+      project("p1", [
+        agent({ id: "squatter", branch: "shared/branch", name: "Squatter" }),
+      ]),
     ];
     const row = pr({ headRefName: "shared/branch", agentId: "departed" });
     expect(agentLinkForPr(row, projects, "p1")).toBeNull();
     // …and the same row with NO recorded owner does use the join, which is what makes the case above
     // a real divergence rather than a branch that simply never matched.
-    expect(agentLinkForPr({ ...row, agentId: null }, projects, "p1")?.agentId).toBe("squatter");
+    expect(
+      agentLinkForPr({ ...row, agentId: null }, projects, "p1")?.agentId,
+    ).toBe("squatter");
   });
 });
 
@@ -489,7 +614,9 @@ const CONFLICTING: PrRow = {
 describe("OpenPrMenu (the dot reflects MERGEABILITY, not just checks)", () => {
   it("does not render green for a green-CI PR that conflicts (#779)", async () => {
     stubList([CONFLICTING]);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     fireEvent.click(await screen.findByTestId("open-pr-badge"));
     const dot = await screen.findByTestId("pr-dot-779");
     // The assertion is on the RENDERED tone, so it fails against the old checks-only dot — which
@@ -504,31 +631,43 @@ describe("OpenPrMenu (the dot reflects MERGEABILITY, not just checks)", () => {
   it("still renders green for a genuinely ready PR", async () => {
     // Guards the fix against over-correcting into "nothing is ever green".
     stubList([PASS]);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     fireEvent.click(await screen.findByTestId("open-pr-badge"));
-    expect((await screen.findByTestId("pr-dot-1")).getAttribute("data-tone")).toBe("ready");
+    expect(
+      (await screen.findByTestId("pr-dot-1")).getAttribute("data-tone"),
+    ).toBe("ready");
   });
 
   it("disables Merge on a conflicting PR and says why in the tooltip", async () => {
     stubList([CONFLICTING]);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     fireEvent.click(await screen.findByTestId("open-pr-badge"));
     const btn = (await screen.findByTestId("merge-779")) as HTMLButtonElement;
     expect(btn.disabled).toBe(true);
     expect(btn.getAttribute("title")).toMatch(/conflict/i);
     // A disabled control must also be INERT — clicking it must not fire a merge that silently fails.
     fireEvent.click(btn);
-    expect(h.invoke.mock.calls.filter((c) => c[0] === "merge_pr")).toHaveLength(0);
+    expect(h.invoke.mock.calls.filter((c) => c[0] === "merge_pr")).toHaveLength(
+      0,
+    );
   });
 
   it("keeps a conflicting PR out of 'Merge all ready'", async () => {
     stubList([CONFLICTING]);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     fireEvent.click(await screen.findByTestId("open-pr-badge"));
     const all = (await screen.findByTestId("merge-all")) as HTMLButtonElement;
     expect(all.disabled).toBe(true);
     fireEvent.click(all);
-    expect(h.invoke.mock.calls.filter((c) => c[0] === "merge_pr")).toHaveLength(0);
+    expect(h.invoke.mock.calls.filter((c) => c[0] === "merge_pr")).toHaveLength(
+      0,
+    );
   });
 });
 
@@ -536,14 +675,19 @@ describe("OpenPrMenu (merge error surfacing)", () => {
   it("surfaces the gh error text when a merge is declined", async () => {
     h.invoke.mockImplementation((cmd: string) => {
       if (cmd === "project_open_prs") return Promise.resolve([PASS]);
-      if (cmd === "merge_pr") return Promise.reject(new Error("required status check is pending"));
+      if (cmd === "merge_pr")
+        return Promise.reject(new Error("required status check is pending"));
       return Promise.resolve(null);
     });
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     fireEvent.click(await screen.findByTestId("open-pr-badge"));
     fireEvent.click(await screen.findByTestId("merge-1"));
     await waitFor(() =>
-      expect(screen.getByTestId("merge-error").textContent).toContain("required status check is pending"),
+      expect(screen.getByTestId("merge-error").textContent).toContain(
+        "required status check is pending",
+      ),
     );
   });
 });
@@ -576,7 +720,10 @@ const PR_934: PrRow = {
   checks: "failing",
   mergeable: "mergeable",
   mergeStateStatus: "unstable",
-  failingChecks: ["Node — coverage (shard 3/4)", "Node — typecheck · test · build"],
+  failingChecks: [
+    "Node — coverage (shard 3/4)",
+    "Node — typecheck · test · build",
+  ],
   pendingChecks: [],
 };
 const PR_925: PrRow = {
@@ -603,12 +750,15 @@ const PR_UNKNOWN: PrRow = {
   pendingChecks: [],
 };
 
-const openMenu = async () => fireEvent.click(await screen.findByTestId("open-pr-badge"));
+const openMenu = async () =>
+  fireEvent.click(await screen.findByTestId("open-pr-badge"));
 
 describe("OpenPrMenu — no Merge affordance when the answer is not yes", () => {
   it("offers a one-click Merge ONLY on the green row", async () => {
     stubList([PASS, PR_944, PR_934, PR_925, PR_UNKNOWN]);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     await openMenu();
 
     // Green: enabled.
@@ -634,43 +784,65 @@ describe("OpenPrMenu — no Merge affordance when the answer is not yes", () => 
     // cannot be satisfied by fixing one row. Fails against the old build, where unknown-mergeability
     // painted amber and left the button live.
     stubList([PASS, PR_944, PR_934, PR_925, PR_UNKNOWN]);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     await openMenu();
     await screen.findByTestId("merge-1");
 
     for (const pr of [PASS, PR_944, PR_934, PR_925, PR_UNKNOWN]) {
-      const tone = screen.getByTestId(`pr-dot-${pr.number}`).getAttribute("data-tone");
-      const btn = screen.queryByTestId(`merge-${pr.number}`) as HTMLButtonElement | null;
+      const tone = screen
+        .getByTestId(`pr-dot-${pr.number}`)
+        .getAttribute("data-tone");
+      const btn = screen.queryByTestId(
+        `merge-${pr.number}`,
+      ) as HTMLButtonElement | null;
       const live = btn !== null && !btn.disabled;
-      expect(live, `#${pr.number} (${tone}) offered a one-click merge`).toBe(tone === "ready");
+      expect(live, `#${pr.number} (${tone}) offered a one-click merge`).toBe(
+        tone === "ready",
+      );
     }
   });
 
   it("gives every non-green row a WORD, so the state is not colour-only", async () => {
     stubList([PASS, PR_944, PR_934, PR_925, PR_UNKNOWN]);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     await openMenu();
     await screen.findByTestId("merge-1");
 
     expect(screen.getByTestId("pr-state-944").textContent).toBe("Conflicts");
-    expect(screen.getByTestId("pr-state-934").textContent).toBe("2 checks failing");
-    expect(screen.getByTestId("pr-state-925").textContent).toBe("1 check failing");
-    expect(screen.getByTestId("pr-state-900").textContent).toMatch(/checking mergeability/i);
+    expect(screen.getByTestId("pr-state-934").textContent).toBe(
+      "2 checks failing",
+    );
+    expect(screen.getByTestId("pr-state-925").textContent).toBe(
+      "1 check failing",
+    );
+    expect(screen.getByTestId("pr-state-900").textContent).toMatch(
+      /checking mergeability/i,
+    );
     // The green row needs no word — its enabled button says it.
     expect(screen.queryByTestId("pr-state-1")).toBeNull();
   });
 
   it("names the failing check on an UNSTABLE PR rather than just counting it", async () => {
     stubList([PR_925]);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     await openMenu();
     const dot = await screen.findByTestId("pr-dot-925");
-    expect(dot.getAttribute("title")).toContain("Desktop Rust — cargo check · test");
+    expect(dot.getAttribute("title")).toContain(
+      "Desktop Rust — cargo check · test",
+    );
   });
 
   it("requires TWO deliberate clicks to override, and merges only on the second", async () => {
     stubList([PR_934]);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     await openMenu();
     const btn = await screen.findByTestId("merge-override-934");
     expect(btn.getAttribute("data-armed")).toBe("no");
@@ -679,36 +851,52 @@ describe("OpenPrMenu — no Merge affordance when the answer is not yes", () => 
     // First click ARMS only — nothing is merged.
     fireEvent.click(btn);
     await waitFor(() =>
-      expect(screen.getByTestId("merge-override-934").getAttribute("data-armed")).toBe("yes"),
+      expect(
+        screen.getByTestId("merge-override-934").getAttribute("data-armed"),
+      ).toBe("yes"),
     );
-    expect(h.invoke.mock.calls.filter((c) => c[0] === "merge_pr")).toHaveLength(0);
+    expect(h.invoke.mock.calls.filter((c) => c[0] === "merge_pr")).toHaveLength(
+      0,
+    );
 
     // Second click merges.
     fireEvent.click(screen.getByTestId("merge-override-934"));
     await waitFor(() =>
-      expect(h.invoke.mock.calls.filter((c) => c[0] === "merge_pr")).toHaveLength(1),
+      expect(
+        h.invoke.mock.calls.filter((c) => c[0] === "merge_pr"),
+      ).toHaveLength(1),
     );
-    expect(h.invoke.mock.calls.find((c) => c[0] === "merge_pr")?.[1]).toMatchObject({ number: 934 });
+    expect(
+      h.invoke.mock.calls.find((c) => c[0] === "merge_pr")?.[1],
+    ).toMatchObject({ number: 934 });
   });
 
   it("counts ONLY green in 'Merge all ready', and merges only those", async () => {
     stubList([PASS, PR_944, PR_934, PR_925, PR_UNKNOWN]);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     await openMenu();
     const all = await screen.findByTestId("merge-all");
     expect(all.textContent).toContain("(1)");
 
     fireEvent.click(all);
     await waitFor(() =>
-      expect(h.invoke.mock.calls.filter((c) => c[0] === "merge_pr")).toHaveLength(1),
+      expect(
+        h.invoke.mock.calls.filter((c) => c[0] === "merge_pr"),
+      ).toHaveLength(1),
     );
     // Exactly the green one — not the conflicting, unstable or unknown rows.
-    expect(h.invoke.mock.calls.find((c) => c[0] === "merge_pr")?.[1]).toMatchObject({ number: 1 });
+    expect(
+      h.invoke.mock.calls.find((c) => c[0] === "merge_pr")?.[1],
+    ).toMatchObject({ number: 1 });
   });
 
   it("disables 'Merge all ready' outright when nothing is green", async () => {
     stubList([PR_944, PR_934, PR_925, PR_UNKNOWN]);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     await openMenu();
     const all = (await screen.findByTestId("merge-all")) as HTMLButtonElement;
     expect(all.disabled).toBe(true);
@@ -718,19 +906,27 @@ describe("OpenPrMenu — no Merge affordance when the answer is not yes", () => 
   it("discards an armed override when the panel is closed", async () => {
     // Arming is a deliberate act about a specific PR; it must not survive the user walking away.
     stubList([PR_934]);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     await openMenu();
     fireEvent.click(await screen.findByTestId("merge-override-934"));
     await waitFor(() =>
-      expect(screen.getByTestId("merge-override-934").getAttribute("data-armed")).toBe("yes"),
+      expect(
+        screen.getByTestId("merge-override-934").getAttribute("data-armed"),
+      ).toBe("yes"),
     );
 
     fireEvent.click(screen.getByTestId("open-pr-badge")); // close
     fireEvent.click(screen.getByTestId("open-pr-badge")); // reopen
     await waitFor(() =>
-      expect(screen.getByTestId("merge-override-934").getAttribute("data-armed")).toBe("no"),
+      expect(
+        screen.getByTestId("merge-override-934").getAttribute("data-armed"),
+      ).toBe("no"),
     );
-    expect(h.invoke.mock.calls.filter((c) => c[0] === "merge_pr")).toHaveLength(0);
+    expect(h.invoke.mock.calls.filter((c) => c[0] === "merge_pr")).toHaveLength(
+      0,
+    );
   });
 });
 
@@ -740,7 +936,12 @@ describe("OpenPrMenu — no Merge affordance when the answer is not yes", () => 
 // which is the point of it being the same component rather than a second PR affordance.
 describe("OpenPrMenu, compact", () => {
   const compact = () => (
-    <OpenPrMenu compact scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />
+    <OpenPrMenu
+      compact
+      scopes={SCOPES}
+      resolveAgent={noAgent}
+      onOpenAgent={noop}
+    />
   );
 
   // ── A REAL GEOMETRY FOR jsdom, WHICH LAYS NOTHING OUT ────────────────────────────────────────
@@ -752,7 +953,11 @@ describe("OpenPrMenu, compact", () => {
   const ORIGINAL_INNER_WIDTH = window.innerWidth;
 
   function setViewportWidth(width: number) {
-    Object.defineProperty(window, "innerWidth", { value: width, configurable: true, writable: true });
+    Object.defineProperty(window, "innerWidth", {
+      value: width,
+      configurable: true,
+      writable: true,
+    });
   }
 
   /**
@@ -762,24 +967,27 @@ describe("OpenPrMenu, compact", () => {
    * the element the component is supposed to measure: a stub that answers for every element would
    * make "measures the wrong node" — one of the mutations this test exists to catch — pass anyway.
    */
-  function withAnchorRect(rect: { right: number; bottom: number }, viewportWidth: number) {
+  function withAnchorRect(
+    rect: { right: number; bottom: number },
+    viewportWidth: number,
+  ) {
     setViewportWidth(viewportWidth);
     const real = HTMLElement.prototype.getBoundingClientRect;
-    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (
-      this: HTMLElement,
-    ) {
-      if (this.dataset.testid !== "open-pr-menu") return real.call(this);
-      return {
-        ...rect,
-        left: rect.right - 40,
-        top: rect.bottom - 20,
-        width: 40,
-        height: 20,
-        x: rect.right - 40,
-        y: rect.bottom - 20,
-        toJSON: () => ({}),
-      } as DOMRect;
-    });
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(
+      function (this: HTMLElement) {
+        if (this.dataset.testid !== "open-pr-menu") return real.call(this);
+        return {
+          ...rect,
+          left: rect.right - 40,
+          top: rect.bottom - 20,
+          width: 40,
+          height: 20,
+          x: rect.right - 40,
+          y: rect.bottom - 20,
+          toJSON: () => ({}),
+        } as DOMRect;
+      },
+    );
   }
 
   afterEach(() => {
@@ -815,7 +1023,9 @@ describe("OpenPrMenu, compact", () => {
     render(compact());
     const badge = await screen.findByTestId("open-pr-badge");
     expect(badge.querySelector("svg")).not.toBeNull();
-    expect(badge.textContent ?? "").not.toMatch(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}]/u);
+    expect(badge.textContent ?? "").not.toMatch(
+      /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}]/u,
+    );
   });
 
   // CONTAINMENT — and the panel is no longer contained by the COLUMN, which is the whole fix
@@ -909,7 +1119,9 @@ describe("OpenPrMenu, compact", () => {
   // the body would strand it at the top-left corner. The two forms differ here and only here.
   it("leaves the wide form where it is", async () => {
     stubList([PASS]);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     await openMenu();
     const panel = await screen.findByTestId("open-pr-panel");
     expect(screen.getByTestId("open-pr-menu").contains(panel)).toBe(true);
@@ -952,7 +1164,9 @@ describe("OpenPrMenu, compact", () => {
     render(compact());
     await openMenu();
     for (const id of ["merge-all", "pr-refresh"]) {
-      expect(screen.getByTestId(id).style.flex, `${id} must not shrink`).toBe("0 0 auto");
+      expect(screen.getByTestId(id).style.flex, `${id} must not shrink`).toBe(
+        "0 0 auto",
+      );
     }
     const label = screen.getByTestId("pr-count-label");
     expect(label.style.minWidth).toBe("0");
@@ -981,7 +1195,9 @@ describe("OpenPrMenu, compact", () => {
 
   it("keeps the wide pill and its own containment clamps when NOT compact", async () => {
     stubList([PASS]);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     const badge = await screen.findByTestId("open-pr-badge");
     expect(badge.textContent).toContain("1 PR waiting");
     await openMenu();
@@ -998,11 +1214,17 @@ describe("OpenPrMenu, compact", () => {
     await openMenu();
     fireEvent.click(await screen.findByTestId("merge-1"));
     await waitFor(() =>
-      expect(h.invoke.mock.calls.filter((c) => c[0] === "merge_pr")).toHaveLength(1),
+      expect(
+        h.invoke.mock.calls.filter((c) => c[0] === "merge_pr"),
+      ).toHaveLength(1),
     );
-    expect(h.invoke.mock.calls.find((c) => c[0] === "merge_pr")?.[1]).toMatchObject({ number: 1 });
+    expect(
+      h.invoke.mock.calls.find((c) => c[0] === "merge_pr")?.[1],
+    ).toMatchObject({ number: 1 });
     // …and the conflicting one is still not offered a live Merge.
-    expect((screen.getByTestId("merge-944") as HTMLButtonElement).disabled).toBe(true);
+    expect(
+      (screen.getByTestId("merge-944") as HTMLButtonElement).disabled,
+    ).toBe(true);
   });
 });
 
@@ -1016,11 +1238,20 @@ describe("OpenPrMenu — the badge is named for assistive tech", () => {
   it("names the compact badge by its meaning, not by its numeral", async () => {
     stubList([PASS, PR_944, PR_934, PR_925, PR_UNKNOWN]);
     render(
-      <OpenPrMenu compact scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+      <OpenPrMenu
+        compact
+        scopes={SCOPES}
+        resolveAgent={noAgent}
+        onOpenAgent={noop}
+      />,
     );
-    const badge = await screen.findByRole("button", { name: /ready to merge/i });
+    const badge = await screen.findByRole("button", {
+      name: /ready to merge/i,
+    });
     expect(badge.getAttribute("data-testid")).toBe("open-pr-badge");
-    expect(badge.getAttribute("aria-label")).toBe("1 of 5 open pull requests ready to merge");
+    expect(badge.getAttribute("aria-label")).toBe(
+      "1 of 5 open pull requests ready to merge",
+    );
     // The visible text is still just the count — the name is carried, not painted.
     expect(badge.textContent).toBe("1");
   });
@@ -1028,16 +1259,27 @@ describe("OpenPrMenu — the badge is named for assistive tech", () => {
   it("names it when NOTHING is green, where there is no numeral at all", async () => {
     stubList([PR_944, PR_934]);
     render(
-      <OpenPrMenu compact scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+      <OpenPrMenu
+        compact
+        scopes={SCOPES}
+        resolveAgent={noAgent}
+        onOpenAgent={noop}
+      />,
     );
-    const badge = await screen.findByRole("button", { name: /none ready to merge/i });
+    const badge = await screen.findByRole("button", {
+      name: /none ready to merge/i,
+    });
     expect(badge.textContent).toBe("");
   });
 
   it("names the wide badge the same way", async () => {
     stubList([PASS, PR_944]);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
-    await screen.findByRole("button", { name: "1 of 2 open pull requests ready to merge" });
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
+    await screen.findByRole("button", {
+      name: "1 of 2 open pull requests ready to merge",
+    });
   });
 
   it("says 'request' not 'requests' for a single PR", () => {
@@ -1055,10 +1297,14 @@ describe("OpenPrMenu — the badge is named for assistive tech", () => {
 describe("OpenPrMenu — Refresh re-asks GitHub on demand", () => {
   it("re-probes when pressed, without closing the panel", async () => {
     stubList([PR_UNKNOWN]);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     await openMenu();
     await screen.findByTestId("open-pr-panel");
-    const before = h.invoke.mock.calls.filter((c) => c[0] === "project_open_prs").length;
+    const before = h.invoke.mock.calls.filter(
+      (c) => c[0] === "project_open_prs",
+    ).length;
 
     fireEvent.click(screen.getByTestId("pr-refresh"));
     await waitFor(() =>
@@ -1072,19 +1318,32 @@ describe("OpenPrMenu — Refresh re-asks GitHub on demand", () => {
 
   it("is the ONLY control on an all-unknown list, and the merge paths stay shut", async () => {
     stubList([PR_UNKNOWN]);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     await openMenu();
-    expect((await screen.findByTestId("merge-all")).hasAttribute("disabled")).toBe(true);
-    expect((screen.getByTestId(`merge-${PR_UNKNOWN.number}`) as HTMLButtonElement).disabled).toBe(true);
-    expect(screen.queryByTestId(`merge-override-${PR_UNKNOWN.number}`)).toBeNull();
-    expect((screen.getByTestId("pr-refresh") as HTMLButtonElement).disabled).toBe(false);
+    expect(
+      (await screen.findByTestId("merge-all")).hasAttribute("disabled"),
+    ).toBe(true);
+    expect(
+      (screen.getByTestId(`merge-${PR_UNKNOWN.number}`) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+    expect(
+      screen.queryByTestId(`merge-override-${PR_UNKNOWN.number}`),
+    ).toBeNull();
+    expect(
+      (screen.getByTestId("pr-refresh") as HTMLButtonElement).disabled,
+    ).toBe(false);
   });
 
   // The disabled tooltip listed only checks and conflicts, so the state that now blocks most often
   // was the one it never named.
   it("says unknown mergeability is a reason nothing is ready", async () => {
     stubList([PR_UNKNOWN]);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     await openMenu();
     const all = await screen.findByTestId("merge-all");
     expect(all.getAttribute("title")).toMatch(/has not finished working out/i);
@@ -1101,7 +1360,8 @@ describe("OpenPrMenu — a probe that fails keeps what we already knew", () => {
   function stubThenFail(rows: PrRow[]) {
     let asked = 0;
     h.invoke.mockImplementation((cmd: string) => {
-      if (cmd === "project_open_prs") return Promise.resolve(asked++ === 0 ? rows : null);
+      if (cmd === "project_open_prs")
+        return Promise.resolve(asked++ === 0 ? rows : null);
       if (cmd === "merge_pr") return Promise.resolve(null);
       return Promise.resolve(null);
     });
@@ -1109,13 +1369,17 @@ describe("OpenPrMenu — a probe that fails keeps what we already knew", () => {
 
   it("keeps the list and the panel up, and says the list may be stale", async () => {
     stubThenFail([PASS, PR_944]);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     await openMenu();
     await screen.findByTestId("open-pr-panel");
 
     fireEvent.click(screen.getByTestId("pr-refresh"));
     await waitFor(() =>
-      expect(screen.getByTestId("pr-stale-notice").textContent).toMatch(/last list/i),
+      expect(screen.getByTestId("pr-stale-notice").textContent).toMatch(
+        /last list/i,
+      ),
     );
     // The whole point: everything is still there.
     expect(screen.getByTestId("open-pr-badge")).toBeTruthy();
@@ -1127,22 +1391,31 @@ describe("OpenPrMenu — a probe that fails keeps what we already knew", () => {
   it("clears its own notice once a probe succeeds again", async () => {
     let asked = 0;
     h.invoke.mockImplementation((cmd: string) => {
-      if (cmd === "project_open_prs") return Promise.resolve(asked++ === 1 ? null : [PASS]);
+      if (cmd === "project_open_prs")
+        return Promise.resolve(asked++ === 1 ? null : [PASS]);
       return Promise.resolve(null);
     });
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     await openMenu();
     fireEvent.click(await screen.findByTestId("pr-refresh")); // the failing one
-    await waitFor(() => expect(screen.getByTestId("pr-stale-notice")).toBeTruthy());
+    await waitFor(() =>
+      expect(screen.getByTestId("pr-stale-notice")).toBeTruthy(),
+    );
     fireEvent.click(screen.getByTestId("pr-refresh")); // succeeds
-    await waitFor(() => expect(screen.queryByTestId("pr-stale-notice")).toBeNull());
+    await waitFor(() =>
+      expect(screen.queryByTestId("pr-stale-notice")).toBeNull(),
+    );
   });
 
   // The badge's unknown-vs-zero rule is unchanged where there is nothing to preserve: a probe that
   // has NEVER succeeded still renders nothing, because "0 PRs" would be a claim we cannot make.
   it("still renders nothing when the FIRST probe fails", async () => {
     stubList(null);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     await waitFor(() => expect(h.invoke).toHaveBeenCalled());
     expect(screen.queryByTestId("open-pr-badge")).toBeNull();
   });
@@ -1157,16 +1430,22 @@ describe("OpenPrMenu — a probe that fails keeps what we already knew", () => {
         release = res;
       });
     });
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     await openMenu();
     fireEvent.click(await screen.findByTestId("pr-refresh"));
     await waitFor(() =>
-      expect((screen.getByTestId("pr-refresh") as HTMLButtonElement).disabled).toBe(true),
+      expect(
+        (screen.getByTestId("pr-refresh") as HTMLButtonElement).disabled,
+      ).toBe(true),
     );
     expect(screen.getByTestId("pr-refresh").textContent).toMatch(/refreshing/i);
     release([PASS]);
     await waitFor(() =>
-      expect((screen.getByTestId("pr-refresh") as HTMLButtonElement).disabled).toBe(false),
+      expect(
+        (screen.getByTestId("pr-refresh") as HTMLButtonElement).disabled,
+      ).toBe(false),
     );
   });
 
@@ -1179,10 +1458,16 @@ describe("OpenPrMenu — a probe that fails keeps what we already knew", () => {
     );
     await screen.findByTestId("open-pr-badge");
     rerender(
-      <OpenPrMenu scopes={SCOPES_OTHER} resolveAgent={noAgent} onOpenAgent={noop} />,
+      <OpenPrMenu
+        scopes={SCOPES_OTHER}
+        resolveAgent={noAgent}
+        onOpenAgent={noop}
+      />,
     );
     // The new repo's probe fails, and there is nothing legitimate to show under its name.
-    await waitFor(() => expect(screen.queryByTestId("open-pr-badge")).toBeNull());
+    await waitFor(() =>
+      expect(screen.queryByTestId("open-pr-badge")).toBeNull(),
+    );
   });
 });
 
@@ -1214,7 +1499,11 @@ describe("OpenPrMenu — preserving a stale list must not preserve the WRONG lis
     );
     await waitFor(() => expect(h.invoke).toHaveBeenCalled());
     rerender(
-      <OpenPrMenu scopes={SCOPES_OTHER} resolveAgent={noAgent} onOpenAgent={noop} />,
+      <OpenPrMenu
+        scopes={SCOPES_OTHER}
+        resolveAgent={noAgent}
+        onOpenAgent={noop}
+      />,
     );
     // …and only NOW does /repo's probe come back, with rows that belong to /repo.
     releaseFirst([PASS, PR_944]);
@@ -1224,7 +1513,9 @@ describe("OpenPrMenu — preserving a stale list must not preserve the WRONG lis
     // whose Merge button would target /other.
     expect(screen.queryByTestId("open-pr-badge")).toBeNull();
     expect(screen.queryByTestId(`merge-${PASS.number}`)).toBeNull();
-    expect(h.invoke.mock.calls.filter((c) => c[0] === "merge_pr")).toHaveLength(0);
+    expect(h.invoke.mock.calls.filter((c) => c[0] === "merge_pr")).toHaveLength(
+      0,
+    );
   });
 
   // `runMerge` sets the merge failure and then immediately refetches. When `gh` is down — the most
@@ -1233,19 +1524,27 @@ describe("OpenPrMenu — preserving a stale list must not preserve the WRONG lis
   it("keeps a merge error readable alongside the staleness notice", async () => {
     let listed = 0;
     h.invoke.mockImplementation((cmd: string) => {
-      if (cmd === "project_open_prs") return Promise.resolve(listed++ === 0 ? [PASS] : null);
-      if (cmd === "merge_pr") return Promise.reject(new Error("Pull request is not mergeable"));
+      if (cmd === "project_open_prs")
+        return Promise.resolve(listed++ === 0 ? [PASS] : null);
+      if (cmd === "merge_pr")
+        return Promise.reject(new Error("Pull request is not mergeable"));
       return Promise.resolve(null);
     });
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     await openMenu();
     fireEvent.click(await screen.findByTestId(`merge-${PASS.number}`));
 
     // BOTH, in their own slots. The reason the merge failed is the one the user acts on.
     await waitFor(() =>
-      expect(screen.getByTestId("merge-error").textContent).toMatch(/not mergeable/i),
+      expect(screen.getByTestId("merge-error").textContent).toMatch(
+        /not mergeable/i,
+      ),
     );
-    await waitFor(() => expect(screen.getByTestId("pr-stale-notice")).toBeTruthy());
+    await waitFor(() =>
+      expect(screen.getByTestId("pr-stale-notice")).toBeTruthy(),
+    );
   });
 });
 
@@ -1277,14 +1576,22 @@ describe("OpenPrMenu — a merge in flight must not follow you to another repo",
     await openMenu();
     fireEvent.click(await screen.findByTestId(`merge-${PASS.number}`));
     await waitFor(() =>
-      expect(h.invoke.mock.calls.filter((c) => c[0] === "merge_pr")).toHaveLength(1),
+      expect(
+        h.invoke.mock.calls.filter((c) => c[0] === "merge_pr"),
+      ).toHaveLength(1),
     );
 
     rerender(
-      <OpenPrMenu scopes={SCOPES_OTHER} resolveAgent={noAgent} onOpenAgent={noop} />,
+      <OpenPrMenu
+        scopes={SCOPES_OTHER}
+        resolveAgent={noAgent}
+        onOpenAgent={noop}
+      />,
     );
     fail(); // the /repo merge finally fails, after the switch
-    await waitFor(() => expect(screen.getByTestId("open-pr-badge")).toBeTruthy());
+    await waitFor(() =>
+      expect(screen.getByTestId("open-pr-badge")).toBeTruthy(),
+    );
     await openMenu();
     // "PR #1: …" would name a number that means a DIFFERENT pull request in the repo now on screen.
     expect(screen.queryByTestId("merge-error")).toBeNull();
@@ -1299,18 +1606,29 @@ describe("OpenPrMenu — a merge in flight must not follow you to another repo",
     await openMenu();
     fireEvent.click(await screen.findByTestId(`merge-${PASS.number}`));
     await waitFor(() =>
-      expect((screen.getByTestId(`merge-${PASS.number}`) as HTMLButtonElement).disabled).toBe(true),
+      expect(
+        (screen.getByTestId(`merge-${PASS.number}`) as HTMLButtonElement)
+          .disabled,
+      ).toBe(true),
     );
 
     rerender(
-      <OpenPrMenu scopes={SCOPES_OTHER} resolveAgent={noAgent} onOpenAgent={noop} />,
+      <OpenPrMenu
+        scopes={SCOPES_OTHER}
+        resolveAgent={noAgent}
+        onOpenAgent={noop}
+      />,
     );
     await openMenu();
     // Same number, different repository — and nothing about it is mid-merge.
-    const row = (await screen.findByTestId(`merge-${PASS.number}`)) as HTMLButtonElement;
+    const row = (await screen.findByTestId(
+      `merge-${PASS.number}`,
+    )) as HTMLButtonElement;
     expect(row.disabled).toBe(false);
     expect(row.textContent).not.toMatch(/merging/i);
-    expect((screen.getByTestId("merge-all") as HTMLButtonElement).disabled).toBe(false);
+    expect(
+      (screen.getByTestId("merge-all") as HTMLButtonElement).disabled,
+    ).toBe(false);
   });
 });
 
@@ -1340,7 +1658,9 @@ describe("OpenPrMenu — switching away and BACK is not the same as switching aw
     await openMenu();
     fireEvent.click(await screen.findByTestId(`merge-${PASS.number}`));
     await waitFor(() =>
-      expect(h.invoke.mock.calls.filter((c) => c[0] === "merge_pr")).toHaveLength(1),
+      expect(
+        h.invoke.mock.calls.filter((c) => c[0] === "merge_pr"),
+      ).toHaveLength(1),
     );
 
     rerender(<OpenPrMenu scopes={SCOPES_OTHER} {...props} />);
@@ -1350,7 +1670,9 @@ describe("OpenPrMenu — switching away and BACK is not the same as switching aw
     await openMenu();
     // The user is in front of the right repo and their merge failed. Saying nothing is the bug.
     await waitFor(() =>
-      expect(screen.getByTestId("merge-error").textContent).toMatch(/not mergeable/i),
+      expect(screen.getByTestId("merge-error").textContent).toMatch(
+        /not mergeable/i,
+      ),
     );
   });
 
@@ -1363,18 +1685,25 @@ describe("OpenPrMenu — switching away and BACK is not the same as switching aw
     await openMenu();
     fireEvent.click(await screen.findByTestId(`merge-${PASS.number}`));
     await waitFor(() =>
-      expect((screen.getByTestId(`merge-${PASS.number}`) as HTMLButtonElement).disabled).toBe(true),
+      expect(
+        (screen.getByTestId(`merge-${PASS.number}`) as HTMLButtonElement)
+          .disabled,
+      ).toBe(true),
     );
 
     rerender(<OpenPrMenu scopes={SCOPES_OTHER} {...props} />);
     rerender(<OpenPrMenu scopes={SCOPES} {...props} />);
     await openMenu();
 
-    const row = (await screen.findByTestId(`merge-${PASS.number}`)) as HTMLButtonElement;
+    const row = (await screen.findByTestId(
+      `merge-${PASS.number}`,
+    )) as HTMLButtonElement;
     expect(row.disabled).toBe(true);
     fireEvent.click(row);
     // Still exactly one — the merge already running was not issued a second time.
-    expect(h.invoke.mock.calls.filter((c) => c[0] === "merge_pr")).toHaveLength(1);
+    expect(h.invoke.mock.calls.filter((c) => c[0] === "merge_pr")).toHaveLength(
+      1,
+    );
   });
 
   // Refresh is the panel's designated escape hatch, so it going dead for another repo's round trip
@@ -1406,7 +1735,9 @@ describe("OpenPrMenu — switching away and BACK is not the same as switching aw
     await screen.findByTestId("open-pr-panel");
 
     hangNext = true;
-    const probesBefore = h.invoke.mock.calls.filter((c) => c[0] === "project_open_prs").length;
+    const probesBefore = h.invoke.mock.calls.filter(
+      (c) => c[0] === "project_open_prs",
+    ).length;
     fireEvent.click(screen.getByTestId("pr-refresh"));
     // THE HANG LANDED ON THE REFRESH'S OWN PROBE — asserted against the MOCK, not against the
     // button. `fetchOpenPrs` calls `invoke` synchronously, so the flag is consumed before the click
@@ -1415,22 +1746,26 @@ describe("OpenPrMenu — switching away and BACK is not the same as switching aw
     // microtask flushes separates "still in flight" from "resolved, `.finally` not yet run"
     // (roborev 56209).
     expect(hangNext).toBe(false);
-    expect(h.invoke.mock.calls.filter((c) => c[0] === "project_open_prs")).toHaveLength(
-      probesBefore + 1,
-    );
+    expect(
+      h.invoke.mock.calls.filter((c) => c[0] === "project_open_prs"),
+    ).toHaveLength(probesBefore + 1);
     // Now let everything that CAN settle settle — a macrotask drains the whole microtask chain and
     // React's scheduler, where two `await Promise.resolve()` did not even reach the `.finally`. The
     // button is still busy because the probe is genuinely hung, not because nothing has run yet.
     await act(async () => {
       await new Promise((r) => setTimeout(r, 0));
     });
-    expect((screen.getByTestId("pr-refresh") as HTMLButtonElement).disabled).toBe(true);
+    expect(
+      (screen.getByTestId("pr-refresh") as HTMLButtonElement).disabled,
+    ).toBe(true);
     expect(screen.getByTestId("pr-refresh").textContent).toMatch(/refreshing/i);
 
     // …and now, with /repo's refresh genuinely still in flight, the OTHER repo's button is free.
     rerender(<OpenPrMenu scopes={SCOPES_OTHER} {...props} />);
     await openMenu();
-    const other = (await screen.findByTestId("pr-refresh")) as HTMLButtonElement;
+    const other = (await screen.findByTestId(
+      "pr-refresh",
+    )) as HTMLButtonElement;
     expect(other.disabled).toBe(false);
     expect(other.textContent).not.toMatch(/refreshing/i);
 
@@ -1444,7 +1779,9 @@ describe("OpenPrMenu — switching away and BACK is not the same as switching aw
 
     releaseRefresh([PASS]);
     await waitFor(() =>
-      expect((screen.getByTestId("pr-refresh") as HTMLButtonElement).disabled).toBe(false),
+      expect(
+        (screen.getByTestId("pr-refresh") as HTMLButtonElement).disabled,
+      ).toBe(false),
     );
   });
 });
@@ -1492,7 +1829,9 @@ describe("panelPlacement — the one clamping rule", () => {
     const right = panelPlacement(badgeAt(1420), { width: vw });
     expect(right.width).toBe(PANEL_MAX_W);
     expect(right.left).toBeGreaterThanOrEqual(PANEL_EDGE_MARGIN);
-    expect(right.left + right.width).toBeLessThanOrEqual(vw - PANEL_EDGE_MARGIN);
+    expect(right.left + right.width).toBeLessThanOrEqual(
+      vw - PANEL_EDGE_MARGIN,
+    );
     // Docked left, squeezed to 50px: the badge is at x≈30 and right-hanging is far off-screen.
     const left = panelPlacement(badgeAt(30), { width: vw });
     expect(left.left).toBe(PANEL_EDGE_MARGIN);
@@ -1517,9 +1856,16 @@ describe("panelPlacement — the one clamping rule", () => {
       // Anchors from off the left edge to past the right edge, including both extremes.
       for (let right = -50; right <= vw + 50; right += 37) {
         const p = panelPlacement(badgeAt(right), { width: vw });
-        expect(p.width, `width @ vw=${vw} right=${right}`).toBeGreaterThanOrEqual(0);
-        expect(p.width, `width @ vw=${vw} right=${right}`).toBeLessThanOrEqual(vw);
-        expect(p.left, `left @ vw=${vw} right=${right}`).toBeGreaterThanOrEqual(PANEL_EDGE_MARGIN);
+        expect(
+          p.width,
+          `width @ vw=${vw} right=${right}`,
+        ).toBeGreaterThanOrEqual(0);
+        expect(p.width, `width @ vw=${vw} right=${right}`).toBeLessThanOrEqual(
+          vw,
+        );
+        expect(p.left, `left @ vw=${vw} right=${right}`).toBeGreaterThanOrEqual(
+          PANEL_EDGE_MARGIN,
+        );
         expect(
           p.left + p.width,
           `right edge @ vw=${vw} right=${right}`,
@@ -1546,8 +1892,16 @@ describe("panelPlacement — the one clamping rule", () => {
 // against the RENDERED OUTPUT and the ARGUMENTS `merge_pr` is called with, because the failure that
 // matters most is not a missing row: it is a Merge button that fires against the wrong repository.
 describe("OpenPrMenu — fleet-wide, grouped by project tab", () => {
-  const SPARKLE = { projectId: "p1", projectName: "sparkle", rootPath: "/code/sparkle" };
-  const SITE = { projectId: "p2", projectName: "drodio-website", rootPath: "/code/site" };
+  const SPARKLE = {
+    projectId: "p1",
+    projectName: "sparkle",
+    rootPath: "/code/sparkle",
+  };
+  const SITE = {
+    projectId: "p2",
+    projectName: "drodio-website",
+    rootPath: "/code/site",
+  };
   const TWO: readonly PrScope[] = [SPARKLE, SITE];
 
   /** Answer `project_open_prs` per ROOT PATH, so the two repos can differ — and collide. */
@@ -1562,7 +1916,11 @@ describe("OpenPrMenu — fleet-wide, grouped by project tab", () => {
     });
   }
 
-  const pr = (number: number, title: string, extra: Partial<PrRow> = {}): PrRow => ({
+  const pr = (
+    number: number,
+    title: string,
+    extra: Partial<PrRow> = {},
+  ): PrRow => ({
     number,
     title,
     headRefName: `branch-${number}`,
@@ -1573,7 +1931,9 @@ describe("OpenPrMenu — fleet-wide, grouped by project tab", () => {
   });
 
   const mergeCalls = () =>
-    h.invoke.mock.calls.filter((c) => c[0] === "merge_pr").map((c) => c[1] as Record<string, unknown>);
+    h.invoke.mock.calls
+      .filter((c) => c[0] === "merge_pr")
+      .map((c) => c[1] as Record<string, unknown>);
 
   it("COUNTS PRs from a project that is not the one the concierge is 'on'", async () => {
     // The reported bug, end to end. The first tab has nothing open; every PR is in the second. The
@@ -1582,7 +1942,9 @@ describe("OpenPrMenu — fleet-wide, grouped by project tab", () => {
       "/code/sparkle": [],
       "/code/site": [pr(1, "a"), pr(2, "b")],
     });
-    render(<OpenPrMenu scopes={TWO} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={TWO} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     const badge = await screen.findByTestId("open-pr-badge");
     await waitFor(() => expect(badge.getAttribute("data-ready")).toBe("yes"));
     expect(badge).toHaveProperty("textContent", "2 PRs waiting");
@@ -1593,17 +1955,23 @@ describe("OpenPrMenu — fleet-wide, grouped by project tab", () => {
       "/code/sparkle": [pr(10, "sparkle work")],
       "/code/site": [pr(20, "site work")],
     });
-    render(<OpenPrMenu scopes={TWO} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={TWO} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     await openMenu();
     await screen.findByTestId("open-pr-panel");
-    const names = (await screen.findAllByTestId("pr-group-name")).map((n) => n.textContent);
+    const names = (await screen.findAllByTestId("pr-group-name")).map(
+      (n) => n.textContent,
+    );
     // In TAB ORDER, so the sections read the way the tab strip reads.
     expect(names).toEqual(["sparkle", "drodio-website"]);
   });
 
   it("says how many projects the list spans, so the total is not read as one repo's", async () => {
     stubByRoot({ "/code/sparkle": [pr(10, "a")], "/code/site": [pr(20, "b")] });
-    render(<OpenPrMenu scopes={TWO} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={TWO} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     await openMenu();
     await waitFor(() =>
       expect(screen.getByTestId("pr-count-label").textContent).toBe(
@@ -1621,14 +1989,19 @@ describe("OpenPrMenu — fleet-wide, grouped by project tab", () => {
       "/code/sparkle": [pr(12, "sparkle twelve")],
       "/code/site": [pr(12, "site twelve")],
     });
-    render(<OpenPrMenu scopes={TWO} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={TWO} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     await openMenu();
     await screen.findByTestId("open-pr-panel");
 
     const rows = await screen.findAllByTestId("pr-row");
     expect(rows).toHaveLength(2);
     // Each row is stamped with the project it belongs to, and they are different projects.
-    expect(rows.map((r) => r.getAttribute("data-project-id"))).toEqual(["p1", "p2"]);
+    expect(rows.map((r) => r.getAttribute("data-project-id"))).toEqual([
+      "p1",
+      "p2",
+    ]);
 
     // Merge the SECOND #12 — the website's.
     const siteRow = rows[1]!;
@@ -1650,7 +2023,9 @@ describe("OpenPrMenu — fleet-wide, grouped by project tab", () => {
       "/code/sparkle": [pr(1, "s1"), pr(2, "s2")],
       "/code/site": [pr(3, "w1"), pr(4, "w2")],
     });
-    render(<OpenPrMenu scopes={TWO} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={TWO} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     await openMenu();
     await screen.findByTestId("open-pr-panel");
 
@@ -1662,7 +2037,11 @@ describe("OpenPrMenu — fleet-wide, grouped by project tab", () => {
 
     await waitFor(() => expect(mergeCalls()).toHaveLength(2));
     // ONLY the website's two, and both addressed to the website's checkout.
-    expect(mergeCalls().map((c) => c.number).sort()).toEqual([3, 4]);
+    expect(
+      mergeCalls()
+        .map((c) => c.number)
+        .sort(),
+    ).toEqual([3, 4]);
     expect(mergeCalls().every((c) => c.root === "/code/site")).toBe(true);
   });
 
@@ -1670,12 +2049,17 @@ describe("OpenPrMenu — fleet-wide, grouped by project tab", () => {
     h.invoke.mockImplementation((cmd: string, args?: unknown) => {
       if (cmd === "project_open_prs") {
         const root = (args as { root?: string } | undefined)?.root ?? "";
-        return Promise.resolve(root === "/code/site" ? [pr(12, "site twelve")] : []);
+        return Promise.resolve(
+          root === "/code/site" ? [pr(12, "site twelve")] : [],
+        );
       }
-      if (cmd === "merge_pr") return Promise.reject(new Error("Pull request is not mergeable"));
+      if (cmd === "merge_pr")
+        return Promise.reject(new Error("Pull request is not mergeable"));
       return Promise.resolve(null);
     });
-    render(<OpenPrMenu scopes={TWO} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={TWO} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     await openMenu();
     fireEvent.click(await screen.findByTestId("merge-12"));
     await waitFor(() =>
@@ -1689,14 +2073,18 @@ describe("OpenPrMenu — fleet-wide, grouped by project tab", () => {
     // Fleet-wide, "we couldn't ask" is per-repo. Collapsing it would either blank a good list or
     // claim a bad one is fresh.
     stubByRoot({ "/code/sparkle": [pr(1, "still here")], "/code/site": null });
-    render(<OpenPrMenu scopes={TWO} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={TWO} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     await openMenu();
     await screen.findByTestId("open-pr-panel");
     // sparkle's row survives…
     expect(await screen.findByTestId("merge-1")).toBeTruthy();
     // …and the website is the only section named as unreadable. (No prior good list for it, so it
     // is UNKNOWN rather than stale — the notice appears once a good list has been superseded.)
-    const names = (await screen.findAllByTestId("pr-group-name")).map((n) => n.textContent);
+    const names = (await screen.findAllByTestId("pr-group-name")).map(
+      (n) => n.textContent,
+    );
     expect(names).toEqual(["sparkle"]);
   });
 });
@@ -1707,24 +2095,44 @@ describe("OpenPrMenu — fleet-wide, grouped by project tab", () => {
 // to rendering nothing is "there is no project tab open at all", and these tests pin the three
 // things that used to remove it: a scope with no PRs, a count of zero, and a failed probe.
 describe("OpenPrMenu, compact — the chiclet survives every empty state", () => {
-  const ONE: readonly PrScope[] = [{ projectId: "p1", projectName: "sparkle", rootPath: "/repo" }];
+  const ONE: readonly PrScope[] = [
+    { projectId: "p1", projectName: "sparkle", rootPath: "/repo" },
+  ];
 
   it("STAYS, with no numeral, when every project genuinely has zero PRs", async () => {
     stubList([]);
-    render(<OpenPrMenu compact scopes={ONE} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu
+        compact
+        scopes={ONE}
+        resolveAgent={noAgent}
+        onOpenAgent={noop}
+      />,
+    );
     const badge = await screen.findByTestId("open-pr-badge");
     // Present and clickable — an icon and no number, never a "0".
     expect(badge.textContent).toBe("");
     expect(badge.getAttribute("data-ready")).toBe("no");
-    await waitFor(() => expect(badge.getAttribute("aria-label")).toBe("No open pull requests"));
+    await waitFor(() =>
+      expect(badge.getAttribute("aria-label")).toBe("No open pull requests"),
+    );
   });
 
   it("SAYS the zero in the panel, rather than opening onto nothing", async () => {
     stubList([]);
-    render(<OpenPrMenu compact scopes={ONE} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu
+        compact
+        scopes={ONE}
+        resolveAgent={noAgent}
+        onOpenAgent={noop}
+      />,
+    );
     await openMenu();
     await waitFor(() =>
-      expect(screen.getByTestId("pr-count-label").textContent).toBe("No open pull requests"),
+      expect(screen.getByTestId("pr-count-label").textContent).toBe(
+        "No open pull requests",
+      ),
     );
     // …and offers no merge affordance to press, because there is nothing to merge.
     expect(screen.queryByTestId("merge-all")).toBeNull();
@@ -1734,18 +2142,29 @@ describe("OpenPrMenu, compact — the chiclet survives every empty state", () =>
     // `fetchOpenPrs` returns null for "we could not ask". That is not zero, and the badge must not
     // claim it is — but it must also not disappear, since Refresh lives behind it.
     stubList(null);
-    render(<OpenPrMenu compact scopes={ONE} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu
+        compact
+        scopes={ONE}
+        resolveAgent={noAgent}
+        onOpenAgent={noop}
+      />,
+    );
     const badge = await screen.findByTestId("open-pr-badge");
     // A SETTLED FAILURE, not a pending one. The probe returned — it returned `null` — so "checking
     // GitHub" would promise an answer that is not on its way. That wording is reserved for the
     // genuine pre-probe moment, which the assertion below this one covers.
     await waitFor(() =>
-      expect(badge.getAttribute("aria-label")).toBe("Pull requests — couldn't reach GitHub"),
+      expect(badge.getAttribute("aria-label")).toBe(
+        "Pull requests — couldn't reach GitHub",
+      ),
     );
     fireEvent.click(badge);
     // SINGULAR — one open tab is the common case, and "any of these projects" over one project is
     // the same agreement slip as "they isn't".
-    expect((await screen.findByTestId("pr-count-label")).textContent).toBe("Couldn't reach GitHub");
+    expect((await screen.findByTestId("pr-count-label")).textContent).toBe(
+      "Couldn't reach GitHub",
+    );
     // The escape hatch is reachable, which is the entire point of not unmounting.
     expect(screen.getByTestId("pr-refresh")).toBeTruthy();
   });
@@ -1753,12 +2172,19 @@ describe("OpenPrMenu, compact — the chiclet survives every empty state", () =>
   it("renders NOTHING only when there is no open project tab at all", async () => {
     stubList([PASS]);
     const { container } = render(
-      <OpenPrMenu compact scopes={[]} resolveAgent={noAgent} onOpenAgent={noop} />,
+      <OpenPrMenu
+        compact
+        scopes={[]}
+        resolveAgent={noAgent}
+        onOpenAgent={noop}
+      />,
     );
     expect(container.firstChild).toBeNull();
     expect(screen.queryByTestId("open-pr-badge")).toBeNull();
     // It did not even ask, because there is no repo in the app to ask about.
-    expect(h.invoke.mock.calls.filter((c) => c[0] === "project_open_prs")).toHaveLength(0);
+    expect(
+      h.invoke.mock.calls.filter((c) => c[0] === "project_open_prs"),
+    ).toHaveLength(0);
   });
 });
 
@@ -1766,8 +2192,16 @@ describe("OpenPrMenu, compact — the chiclet survives every empty state", () =>
 // All three are the same species: a fact that was correctly PER-REPO while the menu had one repo,
 // and silently became fleet-wide when it grew several.
 describe("OpenPrMenu — fleet scoping must not un-scope what was already scoped", () => {
-  const SPARKLE = { projectId: "p1", projectName: "sparkle", rootPath: "/code/sparkle" };
-  const SITE = { projectId: "p2", projectName: "drodio-website", rootPath: "/code/site" };
+  const SPARKLE = {
+    projectId: "p1",
+    projectName: "sparkle",
+    rootPath: "/code/sparkle",
+  };
+  const SITE = {
+    projectId: "p2",
+    projectName: "drodio-website",
+    rootPath: "/code/site",
+  };
   const TWO: readonly PrScope[] = [SPARKLE, SITE];
   const ONLY_SITE: readonly PrScope[] = [SITE];
 
@@ -1790,7 +2224,14 @@ describe("OpenPrMenu — fleet scoping must not un-scope what was already scoped
       // sparkle genuinely has none; the website cannot be reached at all.
       return Promise.resolve(root === "/code/sparkle" ? [] : null);
     });
-    render(<OpenPrMenu compact scopes={TWO} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu
+        compact
+        scopes={TWO}
+        resolveAgent={noAgent}
+        onOpenAgent={noop}
+      />,
+    );
     await openMenu();
     await waitFor(() =>
       expect(screen.getByTestId("pr-count-label").textContent).toBe(
@@ -1809,10 +2250,18 @@ describe("OpenPrMenu — fleet scoping must not un-scope what was already scoped
     h.invoke.mockImplementation((cmd: string, args?: unknown) => {
       if (cmd !== "project_open_prs") return Promise.resolve(null);
       const root = (args as { root?: string } | undefined)?.root ?? "";
-      if (root === "/code/site") return Promise.resolve(failSite ? null : [row(5)]);
+      if (root === "/code/site")
+        return Promise.resolve(failSite ? null : [row(5)]);
       return Promise.resolve([row(1)]);
     });
-    render(<OpenPrMenu compact scopes={TWO} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu
+        compact
+        scopes={TWO}
+        resolveAgent={noAgent}
+        onOpenAgent={noop}
+      />,
+    );
     await openMenu();
     await screen.findByTestId("merge-5");
 
@@ -1844,13 +2293,17 @@ describe("OpenPrMenu — fleet scoping must not un-scope what was already scoped
     await openMenu();
     fireEvent.click(await screen.findByTestId("merge-1"));
     await waitFor(() =>
-      expect((screen.getByTestId("pr-refresh") as HTMLButtonElement).disabled).toBe(true),
+      expect(
+        (screen.getByTestId("pr-refresh") as HTMLButtonElement).disabled,
+      ).toBe(true),
     );
 
     // Close the sparkle tab. Its merge is still hanging, but it is no longer on screen.
     rerender(<OpenPrMenu compact scopes={ONLY_SITE} {...props} />);
     await openMenu();
-    const refresh = (await screen.findByTestId("pr-refresh")) as HTMLButtonElement;
+    const refresh = (await screen.findByTestId(
+      "pr-refresh",
+    )) as HTMLButtonElement;
     expect(refresh.disabled).toBe(false);
     expect(refresh.textContent).not.toMatch(/refreshing/i);
   });
@@ -1917,15 +2370,18 @@ describe("prBadgeTitle — a zero it cannot stand behind", () => {
     expect(prBadgeTitle(null, totals({ known: false, pending: 1 }))).toBe(
       "Pull requests — checking GitHub",
     );
-    expect(prBadgeTitle(null, totals({ known: false, unreadable: 2, askable: 2 }))).toBe(
-      "Pull requests — couldn't reach GitHub",
-    );
+    expect(
+      prBadgeTitle(null, totals({ known: false, unreadable: 2, askable: 2 })),
+    ).toBe("Pull requests — couldn't reach GitHub");
   });
 
   it("still counts normally once there is something to count", () => {
-    expect(prBadgeTitle("2 PRs waiting", totals({ total: 2, ready: 1, unreadable: 1, askable: 2 }))).toBe(
-      "1 of 2 open pull requests ready to merge",
-    );
+    expect(
+      prBadgeTitle(
+        "2 PRs waiting",
+        totals({ total: 2, ready: 1, unreadable: 1, askable: 2 }),
+      ),
+    ).toBe("1 of 2 open pull requests ready to merge");
   });
 });
 
@@ -1935,7 +2391,11 @@ describe("OpenPrMenu — two unreadable projects render the plural notice", () =
   it("names both, and the badge refuses to call it zero", async () => {
     const THREE: readonly PrScope[] = [
       { projectId: "p1", projectName: "sparkle", rootPath: "/code/sparkle" },
-      { projectId: "p2", projectName: "drodio-website", rootPath: "/code/site" },
+      {
+        projectId: "p2",
+        projectName: "drodio-website",
+        rootPath: "/code/site",
+      },
       { projectId: "p3", projectName: "mobile", rootPath: "/code/mobile" },
     ];
     h.invoke.mockImplementation((cmd: string, args?: unknown) => {
@@ -1944,7 +2404,14 @@ describe("OpenPrMenu — two unreadable projects render the plural notice", () =
       // Only sparkle answers, and it answers empty. The other two cannot be reached at all.
       return Promise.resolve(root === "/code/sparkle" ? [] : null);
     });
-    render(<OpenPrMenu compact scopes={THREE} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu
+        compact
+        scopes={THREE}
+        resolveAgent={noAgent}
+        onOpenAgent={noop}
+      />,
+    );
     const badge = await screen.findByTestId("open-pr-badge");
     await waitFor(() =>
       expect(badge.getAttribute("aria-label")).toBe(
@@ -1977,16 +2444,29 @@ describe("OpenPrMenu — does not announce failure while a probe is still in fli
     });
     const TWO: readonly PrScope[] = [
       { projectId: "p1", projectName: "sparkle", rootPath: "/code/sparkle" },
-      { projectId: "p2", projectName: "drodio-website", rootPath: "/code/site" },
+      {
+        projectId: "p2",
+        projectName: "drodio-website",
+        rootPath: "/code/site",
+      },
     ];
-    render(<OpenPrMenu compact scopes={TWO} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu
+        compact
+        scopes={TWO}
+        resolveAgent={noAgent}
+        onOpenAgent={noop}
+      />,
+    );
     const badge = await screen.findByTestId("open-pr-badge");
     // Let the failing probe land and everything it can settle, settle.
     await act(async () => {
       await new Promise((r) => setTimeout(r, 0));
     });
     // One repo has failed, but the other has not answered — nothing may be announced yet.
-    expect(badge.getAttribute("aria-label")).toBe("Pull requests — checking GitHub");
+    expect(badge.getAttribute("aria-label")).toBe(
+      "Pull requests — checking GitHub",
+    );
 
     releaseGood([
       {
@@ -1999,37 +2479,428 @@ describe("OpenPrMenu — does not announce failure while a probe is still in fli
       },
     ]);
     await waitFor(() =>
-      expect(badge.getAttribute("aria-label")).toBe("1 of 1 open pull request ready to merge"),
+      expect(badge.getAttribute("aria-label")).toBe(
+        "1 of 1 open pull request ready to merge",
+      ),
     );
   });
 });
 
 describe("prBadgeTitle — pending outranks a failure", () => {
   it("says CHECKING while anything is still outstanding", () => {
-    expect(prBadgeTitle(null, totals({ known: false, unreadable: 1, pending: 1, askable: 2 }))).toBe(
-      "Pull requests — checking GitHub",
-    );
+    expect(
+      prBadgeTitle(
+        null,
+        totals({ known: false, unreadable: 1, pending: 1, askable: 2 }),
+      ),
+    ).toBe("Pull requests — checking GitHub");
   });
 
   it("says it could not reach GitHub only once nothing is outstanding", () => {
-    expect(prBadgeTitle(null, totals({ known: false, unreadable: 1, askable: 1 }))).toBe(
-      "Pull requests — couldn't reach GitHub",
-    );
+    expect(
+      prBadgeTitle(null, totals({ known: false, unreadable: 1, askable: 1 })),
+    ).toBe("Pull requests — couldn't reach GitHub");
   });
 });
 
 // The same rule on the badge, which is the surface reachable without a click.
 describe("prBadgeTitle — the zero claim waits too", () => {
   it("says CHECKING while a project is still answering", () => {
-    expect(prBadgeTitle(null, totals({ known: true, pending: 1, askable: 2 }))).toBe(
-      "Pull requests — checking GitHub",
-    );
+    expect(
+      prBadgeTitle(null, totals({ known: true, pending: 1, askable: 2 })),
+    ).toBe("Pull requests — checking GitHub");
   });
 
   it("says there is no project to ask when none has a remote", () => {
     expect(prBadgeTitle(null, totals({ known: false, askable: 0 }))).toBe(
       "No project with a GitHub remote",
     );
+  });
+});
+
+// ── THE KNIGHTWATCH PROBE GATE ────────────────────────────────────────────────────────────────
+//
+// Rust's `merge_pr` refuses a PR still carrying unanswered knightwatch `[blocking]` review probes.
+// It refuses for a reason the founder has to be able to ACT on — so these assert what reaches the
+// screen and what reaches `invoke`, never that a handler ran. The measured problem: of the last 40
+// merged PRs, 24 carried a blocking probe and all 24 merged with zero probe-citing reply.
+describe("OpenPrMenu — unanswered knightwatch probes", () => {
+  const PROBE_LINES = [
+    "PR #1176 still carries 1 unanswered knightwatch [blocking] probe.",
+    "",
+    "1. [blocking] [from: shape] Q: Does the retry loop bound its attempts?",
+    "   https://github.com/o/r/pull/1176#issuecomment-5182769304",
+    "",
+    "Answer it on the pull request — reply citing the probe — or merge with a written reason.",
+  ];
+  const REFUSAL = PROBE_LINES.join("\n");
+  const REASON = "the probe is about a file this PR does not touch";
+
+  const GREEN_A: PrRow = {
+    number: 1176,
+    title: "feat: a thing",
+    headRefName: "sparkle/a",
+    url: "https://github.com/o/r/pull/1176",
+    checks: "passing",
+    mergeable: "mergeable",
+    mergeStateStatus: "clean",
+  };
+  const GREEN_B: PrRow = {
+    number: 1104,
+    title: "fix: another thing",
+    headRefName: "sparkle/b",
+    url: "https://github.com/o/r/pull/1104",
+    checks: "passing",
+    mergeable: "mergeable",
+    mergeStateStatus: "clean",
+  };
+
+  /** Rust's contract, modelled: a merge with no written override is refused for unanswered probes;
+   *  one carrying a reason goes through. */
+  function stubProbeGate(rows: PrRow[]) {
+    h.invoke.mockImplementation(
+      (cmd: string, args?: Record<string, unknown>) => {
+        if (cmd === "project_open_prs") return Promise.resolve(rows);
+        if (cmd === "merge_pr")
+          return typeof args?.knightwatchOverride === "string"
+            ? Promise.resolve(null)
+            : Promise.reject(new Error(REFUSAL));
+        return Promise.resolve(null);
+      },
+    );
+  }
+
+  const mergeCalls = () =>
+    h.invoke.mock.calls
+      .filter((c) => c[0] === "merge_pr")
+      .map((c) => c[1] as { number: number; knightwatchOverride?: string });
+
+  it("shows the refusal with its LINES and its LINK intact, not flattened into one string", async () => {
+    stubProbeGate([GREEN_A]);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
+    await openMenu();
+    fireEvent.click(await screen.findByTestId("merge-1176"));
+
+    const err = await screen.findByTestId("merge-error");
+    const lines = within(err).getAllByTestId("merge-error-line");
+    // ONE ELEMENT PER LINE — a refusal collapsed to a single run of text is a refusal nobody reads,
+    // and the probe list is the part that says WHAT to answer.
+    expect(lines).toHaveLength(PROBE_LINES.length);
+    // The first line carries the panel's own "which project, which PR" prefix; the rest are verbatim.
+    expect(lines[0]!.textContent).toBe(`repo PR #1176: ${PROBE_LINES[0]}`);
+    for (let i = 1; i < PROBE_LINES.length; i++)
+      expect(lines[i]!.textContent, `line ${i}`).toBe(PROBE_LINES[i]);
+
+    // …and the link is OPENABLE, not text to retype. This is the assertion that fails if the URL is
+    // rendered as a plain span: the side effect is the browser opening the comment.
+    // (The real `openUrl` returns a promise the caller attaches a `.catch` to; the bare `vi.fn()`
+    // returns undefined, which surfaces as an unhandled TypeError rather than a failing assertion.)
+    h.openUrl.mockResolvedValue(undefined);
+    const link = within(err).getByTestId("merge-error-link");
+    fireEvent.click(link);
+    expect(h.openUrl).toHaveBeenCalledWith(
+      "https://github.com/o/r/pull/1176#issuecomment-5182769304",
+    );
+  });
+
+  it("turns the refused row's Merge into a two-step written override", async () => {
+    stubProbeGate([GREEN_A]);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
+    await openMenu();
+    // BEFORE any attempt there is no override on offer — a green PR is just a green PR.
+    expect(screen.queryByTestId("probe-override-1176")).toBeNull();
+
+    fireEvent.click(await screen.findByTestId("merge-1176"));
+    const btn = await screen.findByTestId("probe-override-1176");
+    expect(btn.getAttribute("data-armed")).toBe("no");
+    // The plain Merge is gone: the row's one action is now the override.
+    expect(screen.queryByTestId("merge-1176")).toBeNull();
+    expect(mergeCalls()).toHaveLength(1); // the refused attempt, and nothing since
+
+    // First click ARMS and opens the box; it must not merge.
+    fireEvent.click(btn);
+    const input = (await screen.findByTestId(
+      "probe-override-reason-1176",
+    )) as HTMLInputElement;
+    expect(
+      screen.getByTestId("probe-override-1176").getAttribute("data-armed"),
+    ).toBe("yes");
+    expect(mergeCalls()).toHaveLength(1);
+
+    // An armed row with nothing written is DISABLED — the override costs a sentence.
+    expect(
+      (screen.getByTestId("probe-override-1176") as HTMLButtonElement).disabled,
+    ).toBe(true);
+    fireEvent.click(screen.getByTestId("probe-override-1176"));
+    expect(mergeCalls()).toHaveLength(1);
+
+    // A one-word waiver does not buy it either, and the hint says so.
+    fireEvent.change(input, { target: { value: "ok" } });
+    expect(
+      (screen.getByTestId("probe-override-1176") as HTMLButtonElement).disabled,
+    ).toBe(true);
+    expect(screen.getByTestId("probe-override-hint-1176").textContent).toMatch(
+      /not a reason yet/i,
+    );
+
+    // A sentence does.
+    fireEvent.change(input, { target: { value: REASON } });
+    expect(
+      (screen.getByTestId("probe-override-1176") as HTMLButtonElement).disabled,
+    ).toBe(false);
+    fireEvent.click(screen.getByTestId("probe-override-1176"));
+    await waitFor(() => expect(mergeCalls()).toHaveLength(2));
+    // THE SENTENCE REACHES RUST. Asserting the payload, not the click: a reason that is collected
+    // and dropped looks identical on screen and leaves the gate refusing forever.
+    expect(mergeCalls()[1]).toEqual({
+      root: "/repo",
+      number: 1176,
+      knightwatchOverride: REASON,
+    });
+  });
+
+  it("does NOT offer the override for an ordinary merge failure", async () => {
+    // A conflict is not a probe. Offering a reason box there would promise the founder that a
+    // sentence can merge it — it cannot, and the second click would just error again.
+    h.invoke.mockImplementation((cmd: string) => {
+      if (cmd === "project_open_prs") return Promise.resolve([GREEN_A]);
+      if (cmd === "merge_pr")
+        return Promise.reject(new Error("Pull request is not mergeable"));
+      return Promise.resolve(null);
+    });
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
+    await openMenu();
+    fireEvent.click(await screen.findByTestId("merge-1176"));
+    await waitFor(() =>
+      expect(screen.getByTestId("merge-error").textContent).toMatch(
+        /not mergeable/i,
+      ),
+    );
+    expect(screen.queryByTestId("probe-override-1176")).toBeNull();
+    expect(screen.getByTestId("merge-1176")).toBeTruthy();
+  });
+
+  // ── THE DANGEROUS ONE ────────────────────────────────────────────────────────────────────────
+  // "Merge all ready" walks N pull requests. A reason spent across the batch would turn a per-PR
+  // judgement into a blanket waiver of every probe in it — and each probe is a different reviewer's
+  // question about a different diff.
+  // THE REMEDY THIS FEATURE EXISTS TO STEER PEOPLE ONTO. Answering the probe on GitHub is the way
+  // out; the override is the exception. The refusal ledger replaces the row's Merge button, and it
+  // used to be cleared ONLY by a successful merge of that same PR — so a user who went and answered
+  // the probe came back to a row offering nothing but "Override probes…", and the only way through
+  // was to write a sentence justifying a merge with the probe unanswered for a probe they had just
+  // answered. Rust discards that sentence (it returns Allow before reading it once nothing blocks),
+  // so the waiver was fabricated and then thrown away.
+  it("gives the row its Merge button back after a deliberate re-read", async () => {
+    stubProbeGate([GREEN_A]);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
+    await openMenu();
+    fireEvent.click(await screen.findByTestId("merge-1176"));
+    // Refused: the row now offers only the override.
+    await screen.findByTestId("probe-override-1176");
+    expect(screen.queryByTestId("merge-1176")).toBeNull();
+
+    // The user answers the probe on GitHub and presses Refresh. THE SIDE EFFECT UNDER TEST is that
+    // the ordinary Merge affordance returns — not that the ledger is empty, which is unobservable.
+    fireEvent.click(screen.getByTestId("pr-refresh"));
+
+    expect(await screen.findByTestId("merge-1176")).toBeTruthy();
+    expect(screen.queryByTestId("probe-override-1176")).toBeNull();
+  });
+
+  it("gives the row its Merge button back when the panel is reopened", async () => {
+    stubProbeGate([GREEN_A]);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
+    await openMenu();
+    fireEvent.click(await screen.findByTestId("merge-1176"));
+    await screen.findByTestId("probe-override-1176");
+
+    // Close, then reopen — the other deliberate "re-evaluate this list" signal.
+    await openMenu();
+    await openMenu();
+
+    expect(await screen.findByTestId("merge-1176")).toBeTruthy();
+    expect(screen.queryByTestId("probe-override-1176")).toBeNull();
+  });
+
+  // ONE CLICK MUST NEVER MERGE A PR WHOSE TWO-STEP WAS NOT PERFORMED FOR THAT BUTTON. `armed` is
+  // shared between the probe override and the `unstable` "Merge anyway?" override, so arming a
+  // probe-refused row and then clearing the refusal can hand the arming to a DIFFERENT button. The
+  // panel toggle has always disarmed on both edges for this reason; Refresh gained the same clear
+  // and needed the same disarm. This is the highest-consequence behaviour on this surface and it
+  // was guarded only by two lines any later refactor could drop silently.
+  it("disarms when Refresh clears the refusal, so no button inherits the arming", async () => {
+    stubProbeGate([GREEN_A]);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
+    await openMenu();
+    fireEvent.click(await screen.findByTestId("merge-1176"));
+    // Arm the probe override — one click, so it is now armed but NOT submitted.
+    const armedBtn = await screen.findByTestId("probe-override-1176");
+    fireEvent.click(armedBtn);
+    expect(
+      (await screen.findByTestId("probe-override-1176")).getAttribute(
+        "data-armed",
+      ),
+    ).toBe("yes");
+
+    fireEvent.click(screen.getByTestId("pr-refresh"));
+
+    // The row is back to an ordinary Merge, and nothing merged on the way through.
+    expect(await screen.findByTestId("merge-1176")).toBeTruthy();
+    expect(screen.queryByTestId("probe-override-1176")).toBeNull();
+    expect(mergeCalls()).toHaveLength(1); // still just the one refused attempt
+
+    // …and re-refusing gives a DISARMED button, not one whose first click was already spent.
+    fireEvent.click(screen.getByTestId("merge-1176"));
+    expect(
+      (await screen.findByTestId("probe-override-1176")).getAttribute(
+        "data-armed",
+      ),
+    ).toBe("no");
+  });
+
+  describe("bulk merge never spends one reason on more than one PR", () => {
+    it("reports and SKIPS every refused PR, carrying no reason at all", async () => {
+      stubProbeGate([GREEN_A, GREEN_B]);
+      render(
+        <OpenPrMenu
+          scopes={SCOPES}
+          resolveAgent={noAgent}
+          onOpenAgent={noop}
+        />,
+      );
+      await openMenu();
+      fireEvent.click(await screen.findByTestId("merge-all"));
+
+      await waitFor(() => expect(mergeCalls()).toHaveLength(2));
+      for (const call of mergeCalls())
+        expect(call.knightwatchOverride, `#${call.number}`).toBeUndefined();
+      // BOTH are reported, not just the first: one named PR reads as "one failed" while the other
+      // sits there looking merged.
+      const err = await screen.findByTestId("merge-error");
+      expect(err.textContent).toContain("#1176");
+      expect(err.textContent).toContain("#1104");
+      expect(err.textContent).toMatch(/one reason cannot cover them/i);
+      // …and each keeps its own way through.
+      expect(screen.getByTestId("probe-override-1176")).toBeTruthy();
+      expect(screen.getByTestId("probe-override-1104")).toBeTruthy();
+    });
+
+    it("does not leak a reason typed for one row into a batch merge of every row", async () => {
+      stubProbeGate([GREEN_A, GREEN_B]);
+      render(
+        <OpenPrMenu
+          scopes={SCOPES}
+          resolveAgent={noAgent}
+          onOpenAgent={noop}
+        />,
+      );
+      await openMenu();
+      fireEvent.click(await screen.findByTestId("merge-all"));
+      await waitFor(() => expect(mergeCalls()).toHaveLength(2));
+
+      // Arm #1176 and write its reason — then walk away and press the batch button instead.
+      fireEvent.click(await screen.findByTestId("probe-override-1176"));
+      fireEvent.change(
+        await screen.findByTestId("probe-override-reason-1176"),
+        {
+          target: { value: REASON },
+        },
+      );
+      fireEvent.click(screen.getByTestId("merge-all"));
+
+      await waitFor(() => expect(mergeCalls()).toHaveLength(4));
+      // NOT ONE of the batch's calls may carry it — including #1176's own, because the founder
+      // never pressed the button that spends it.
+      for (const call of mergeCalls().slice(2))
+        expect(call.knightwatchOverride, `#${call.number}`).toBeUndefined();
+    });
+
+    it("spends an override on the PR it was written for and on no other", async () => {
+      stubProbeGate([GREEN_A, GREEN_B]);
+      render(
+        <OpenPrMenu
+          scopes={SCOPES}
+          resolveAgent={noAgent}
+          onOpenAgent={noop}
+        />,
+      );
+      await openMenu();
+      fireEvent.click(await screen.findByTestId("merge-all"));
+      await waitFor(() => expect(mergeCalls()).toHaveLength(2));
+
+      fireEvent.click(await screen.findByTestId("probe-override-1176"));
+      fireEvent.change(
+        await screen.findByTestId("probe-override-reason-1176"),
+        {
+          target: { value: REASON },
+        },
+      );
+      fireEvent.click(screen.getByTestId("probe-override-1176"));
+      await waitFor(() => expect(mergeCalls()).toHaveLength(3));
+
+      const withReason = mergeCalls().filter(
+        (c) => c.knightwatchOverride !== undefined,
+      );
+      expect(withReason).toHaveLength(1);
+      expect(withReason[0]).toMatchObject({
+        number: 1176,
+        knightwatchOverride: REASON,
+      });
+      // #1104's probe is still unanswered and still blocking. It has to be, or the override was a
+      // batch waiver wearing a per-row button.
+      expect(
+        mergeCalls()
+          .filter((c) => c.number === 1104)
+          .every((c) => !c.knightwatchOverride),
+      ).toBe(true);
+      expect(screen.getByTestId("probe-override-1104")).toBeTruthy();
+    });
+
+    it("clears the armed row's sentence when the next row is armed", async () => {
+      // One box, one string — so the guard is that arming RESETS it. Without that, a reason written
+      // for #1176 becomes the pre-filled justification for #1104 at one click.
+      stubProbeGate([GREEN_A, GREEN_B]);
+      render(
+        <OpenPrMenu
+          scopes={SCOPES}
+          resolveAgent={noAgent}
+          onOpenAgent={noop}
+        />,
+      );
+      await openMenu();
+      fireEvent.click(await screen.findByTestId("merge-all"));
+      await waitFor(() => expect(mergeCalls()).toHaveLength(2));
+
+      fireEvent.click(await screen.findByTestId("probe-override-1176"));
+      fireEvent.change(
+        await screen.findByTestId("probe-override-reason-1176"),
+        {
+          target: { value: REASON },
+        },
+      );
+      fireEvent.click(await screen.findByTestId("probe-override-1104"));
+      const next = (await screen.findByTestId(
+        "probe-override-reason-1104",
+      )) as HTMLInputElement;
+      expect(next.value).toBe("");
+      expect(
+        (screen.getByTestId("probe-override-1104") as HTMLButtonElement)
+          .disabled,
+      ).toBe(true);
+    });
   });
 });
 
@@ -2060,32 +2931,37 @@ const NO_RIGHTS: PrRow = {
  * read reflects it — i.e. a fake with the store's actual behaviour, not one that always answers the
  * same thing. Returns the ledger so a test can assert on what Rust was actually asked to persist.
  */
-function stubWithDismissals(rows: PrRow[] | null, initial: Record<string, unknown>[] = []) {
+function stubWithDismissals(
+  rows: PrRow[] | null,
+  initial: Record<string, unknown>[] = [],
+) {
   const store = new Map<number, Record<string, unknown>>(
     initial.map((d) => [d.number as number, d]),
   );
   const calls: { cmd: string; args: Record<string, unknown> }[] = [];
-  h.invoke.mockImplementation((cmd: string, args: Record<string, unknown> = {}) => {
-    calls.push({ cmd, args });
-    if (cmd === "project_open_prs") return Promise.resolve(rows);
-    if (cmd === "merge_pr") return Promise.resolve(null);
-    if (cmd === "pr_dismissals") return Promise.resolve([...store.values()]);
-    if (cmd === "dismiss_pr") {
-      store.set(args.number as number, {
-        number: args.number,
-        headRefOid: args.headRefOid,
-        tone: args.tone,
-        viewerCanMerge: args.viewerCanMerge,
-        dismissedAt: 1_700_000_000,
-      });
-      return Promise.resolve([...store.values()]);
-    }
-    if (cmd === "restore_pr") {
-      store.delete(args.number as number);
-      return Promise.resolve([...store.values()]);
-    }
-    return Promise.resolve(null);
-  });
+  h.invoke.mockImplementation(
+    (cmd: string, args: Record<string, unknown> = {}) => {
+      calls.push({ cmd, args });
+      if (cmd === "project_open_prs") return Promise.resolve(rows);
+      if (cmd === "merge_pr") return Promise.resolve(null);
+      if (cmd === "pr_dismissals") return Promise.resolve([...store.values()]);
+      if (cmd === "dismiss_pr") {
+        store.set(args.number as number, {
+          number: args.number,
+          headRefOid: args.headRefOid,
+          tone: args.tone,
+          viewerCanMerge: args.viewerCanMerge,
+          dismissedAt: 1_700_000_000,
+        });
+        return Promise.resolve([...store.values()]);
+      }
+      if (cmd === "restore_pr") {
+        store.delete(args.number as number);
+        return Promise.resolve([...store.values()]);
+      }
+      return Promise.resolve(null);
+    },
+  );
   return { store, calls };
 }
 
@@ -2094,30 +2970,49 @@ describe("OpenPrMenu — a Merge button that cannot work is not drawn", () => {
     // THE REPORTED BUG. Before the pre-check this row was green with a live one-click Merge, and
     // pressing it spent a gh round trip to come back with a GraphQL permissions error.
     stubWithDismissals([NO_RIGHTS]);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     fireEvent.click(await screen.findByTestId("open-pr-badge"));
     const merge = await screen.findByTestId("merge-39");
     expect(merge.hasAttribute("disabled")).toBe(true);
-    expect(screen.getByTestId("pr-state-39").textContent).toBe("No merge rights");
-    expect(screen.getByTestId("pr-dot-39").getAttribute("data-tone")).toBe("blocked");
+    expect(screen.getByTestId("pr-state-39").textContent).toBe(
+      "No merge rights",
+    );
+    expect(screen.getByTestId("pr-dot-39").getAttribute("data-tone")).toBe(
+      "blocked",
+    );
   });
 
   it("keeps a no-rights PR out of the chiclet's green count and out of 'Merge all ready'", async () => {
     stubWithDismissals([NO_RIGHTS]);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} compact />);
+    render(
+      <OpenPrMenu
+        scopes={SCOPES}
+        resolveAgent={noAgent}
+        onOpenAgent={noop}
+        compact
+      />,
+    );
     const badge = await screen.findByTestId("open-pr-badge");
     await waitFor(() => expect(badge.getAttribute("data-ready")).toBe("no"));
     fireEvent.click(badge);
-    expect((await screen.findByTestId("merge-all")).hasAttribute("disabled")).toBe(true);
+    expect(
+      (await screen.findByTestId("merge-all")).hasAttribute("disabled"),
+    ).toBe(true);
   });
 
   it("still offers Merge when the permission is UNKNOWN — a failed probe is not a refusal", async () => {
     // `gh repo view` absent/unauthed/offline yields null. Blocking on that would disable every
     // Merge button in the app on the strength of a probe that merely failed.
     stubWithDismissals([{ ...NO_RIGHTS, viewerCanMerge: null }]);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     fireEvent.click(await screen.findByTestId("open-pr-badge"));
-    expect((await screen.findByTestId("merge-39")).hasAttribute("disabled")).toBe(false);
+    expect(
+      (await screen.findByTestId("merge-39")).hasAttribute("disabled"),
+    ).toBe(false);
   });
 });
 
@@ -2127,7 +3022,14 @@ describe("OpenPrMenu — Dismiss", () => {
     // the green count went to zero. A green PR, so the count moves visibly.
     const green = { ...NO_RIGHTS, viewerCanMerge: true };
     stubWithDismissals([green]);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} compact />);
+    render(
+      <OpenPrMenu
+        scopes={SCOPES}
+        resolveAgent={noAgent}
+        onOpenAgent={noop}
+        compact
+      />,
+    );
     const badge = await screen.findByTestId("open-pr-badge");
     await waitFor(() => expect(badge.getAttribute("data-ready")).toBe("yes"));
     fireEvent.click(badge);
@@ -2141,10 +3043,14 @@ describe("OpenPrMenu — Dismiss", () => {
     // The durability requirement. A dismissal that lives only in component state is forgotten by
     // the next refresh, let alone the next restart.
     const { calls } = stubWithDismissals([NO_RIGHTS]);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     fireEvent.click(await screen.findByTestId("open-pr-badge"));
     fireEvent.click(await screen.findByTestId("dismiss-39"));
-    await waitFor(() => expect(calls.some((c) => c.cmd === "dismiss_pr")).toBe(true));
+    await waitFor(() =>
+      expect(calls.some((c) => c.cmd === "dismiss_pr")).toBe(true),
+    );
     const args = calls.find((c) => c.cmd === "dismiss_pr")!.args;
     expect(args).toMatchObject({
       projectId: "p1",
@@ -2158,12 +3064,30 @@ describe("OpenPrMenu — Dismiss", () => {
   it("SURVIVES a remount — a dismissal already in the store hides its row on first render", async () => {
     // The restart case, as close as jsdom gets: the store already holds the dismissal and the
     // component has never seen the click.
-    stubWithDismissals([NO_RIGHTS], [
-      { number: 39, headRefOid: "sha-old", tone: "blocked", viewerCanMerge: false, dismissedAt: 1 },
-    ]);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} compact />);
+    stubWithDismissals(
+      [NO_RIGHTS],
+      [
+        {
+          number: 39,
+          headRefOid: "sha-old",
+          tone: "blocked",
+          viewerCanMerge: false,
+          dismissedAt: 1,
+        },
+      ],
+    );
+    render(
+      <OpenPrMenu
+        scopes={SCOPES}
+        resolveAgent={noAgent}
+        onOpenAgent={noop}
+        compact
+      />,
+    );
     fireEvent.click(await screen.findByTestId("open-pr-badge"));
-    await waitFor(() => expect(screen.getByTestId("pr-dismissed")).toBeTruthy());
+    await waitFor(() =>
+      expect(screen.getByTestId("pr-dismissed")).toBeTruthy(),
+    );
     expect(screen.queryByTestId("merge-39")).toBeNull();
   });
 
@@ -2171,7 +3095,9 @@ describe("OpenPrMenu — Dismiss", () => {
     // Silently disappearing a pull request forever is the opposite failure, and the one the founder
     // has been bitten by repeatedly. Hiding a row obliges this section to exist.
     stubWithDismissals([NO_RIGHTS]);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     fireEvent.click(await screen.findByTestId("open-pr-badge"));
     fireEvent.click(await screen.findByTestId("dismiss-39"));
     const toggle = await screen.findByTestId("pr-dismissed-toggle");
@@ -2188,7 +3114,14 @@ describe("OpenPrMenu — Dismiss", () => {
   it("RESTORES on demand, putting the row and its count back", async () => {
     const green = { ...NO_RIGHTS, viewerCanMerge: true };
     const { calls } = stubWithDismissals([green]);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} compact />);
+    render(
+      <OpenPrMenu
+        scopes={SCOPES}
+        resolveAgent={noAgent}
+        onOpenAgent={noop}
+        compact
+      />,
+    );
     const badge = await screen.findByTestId("open-pr-badge");
     fireEvent.click(badge);
     fireEvent.click(await screen.findByTestId("dismiss-39"));
@@ -2197,7 +3130,9 @@ describe("OpenPrMenu — Dismiss", () => {
     fireEvent.click(await screen.findByTestId("restore-39"));
     await waitFor(() => expect(screen.queryByTestId("merge-39")).toBeTruthy());
     expect(badge.getAttribute("data-ready")).toBe("yes");
-    expect(calls.some((c) => c.cmd === "restore_pr" && c.args.number === 39)).toBe(true);
+    expect(
+      calls.some((c) => c.cmd === "restore_pr" && c.args.number === 39),
+    ).toBe(true);
   });
 
   it("AUTO-REVIVES when the reason goes away, and tells Rust to drop the record", async () => {
@@ -2205,25 +3140,49 @@ describe("OpenPrMenu — Dismiss", () => {
     // `sha-old`; the live probe reports `sha-new`, so the PR has been pushed to and comes back
     // WITHOUT the user doing anything — and the stale record is dropped rather than left to
     // resurrect itself later.
-    const { calls } = stubWithDismissals([{ ...NO_RIGHTS, headRefOid: "sha-new" }], [
-      { number: 39, headRefOid: "sha-old", tone: "blocked", viewerCanMerge: false, dismissedAt: 1 },
-    ]);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    const { calls } = stubWithDismissals(
+      [{ ...NO_RIGHTS, headRefOid: "sha-new" }],
+      [
+        {
+          number: 39,
+          headRefOid: "sha-old",
+          tone: "blocked",
+          viewerCanMerge: false,
+          dismissedAt: 1,
+        },
+      ],
+    );
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     fireEvent.click(await screen.findByTestId("open-pr-badge"));
     expect(await screen.findByTestId("merge-39")).toBeTruthy();
     expect(screen.queryByTestId("pr-dismissed")).toBeNull();
     await waitFor(() =>
-      expect(calls.some((c) => c.cmd === "restore_pr" && c.args.number === 39)).toBe(true),
+      expect(
+        calls.some((c) => c.cmd === "restore_pr" && c.args.number === 39),
+      ).toBe(true),
     );
   });
 
   it("AUTO-REVIVES when merge rights arrive", async () => {
     // The founder's case running backwards: he is added to the repo, so the PR he could do nothing
     // about becomes one he can land — and the app stops hiding it on its own.
-    stubWithDismissals([{ ...NO_RIGHTS, viewerCanMerge: true }], [
-      { number: 39, headRefOid: "sha-old", tone: "blocked", viewerCanMerge: false, dismissedAt: 1 },
-    ]);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    stubWithDismissals(
+      [{ ...NO_RIGHTS, viewerCanMerge: true }],
+      [
+        {
+          number: 39,
+          headRefOid: "sha-old",
+          tone: "blocked",
+          viewerCanMerge: false,
+          dismissedAt: 1,
+        },
+      ],
+    );
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     fireEvent.click(await screen.findByTestId("open-pr-badge"));
     expect(await screen.findByTestId("merge-39")).toBeTruthy();
   });
@@ -2231,12 +3190,25 @@ describe("OpenPrMenu — Dismiss", () => {
   it("does NOT revive an unchanged PR — the dismissal has to actually hold", async () => {
     // The control case for the two above. Without it they would pass against a component that
     // simply never hides anything.
-    stubWithDismissals([NO_RIGHTS], [
-      { number: 39, headRefOid: "sha-old", tone: "blocked", viewerCanMerge: false, dismissedAt: 1 },
-    ]);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    stubWithDismissals(
+      [NO_RIGHTS],
+      [
+        {
+          number: 39,
+          headRefOid: "sha-old",
+          tone: "blocked",
+          viewerCanMerge: false,
+          dismissedAt: 1,
+        },
+      ],
+    );
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
     fireEvent.click(await screen.findByTestId("open-pr-badge"));
-    await waitFor(() => expect(screen.getByTestId("pr-dismissed-toggle")).toBeTruthy());
+    await waitFor(() =>
+      expect(screen.getByTestId("pr-dismissed-toggle")).toBeTruthy(),
+    );
     expect(screen.queryByTestId("merge-39")).toBeNull();
   });
 
@@ -2247,14 +3219,27 @@ describe("OpenPrMenu — Dismiss", () => {
     const { unmount } = render(
       <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
     );
-    await waitFor(() => expect(calls.some((c) => c.cmd === "pr_dismissals")).toBe(true));
-    expect(calls.find((c) => c.cmd === "pr_dismissals")!.args.openNumbers).toEqual([39]);
+    await waitFor(() =>
+      expect(calls.some((c) => c.cmd === "pr_dismissals")).toBe(true),
+    );
+    expect(
+      calls.find((c) => c.cmd === "pr_dismissals")!.args.openNumbers,
+    ).toEqual([39]);
     unmount();
 
     // A failed probe must not reach `pr_dismissals` at all — there is no complete list to prune to.
     const failed = stubWithDismissals(null);
-    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} compact />);
-    await waitFor(() => expect(failed.calls.some((c) => c.cmd === "project_open_prs")).toBe(true));
+    render(
+      <OpenPrMenu
+        scopes={SCOPES}
+        resolveAgent={noAgent}
+        onOpenAgent={noop}
+        compact
+      />,
+    );
+    await waitFor(() =>
+      expect(failed.calls.some((c) => c.cmd === "project_open_prs")).toBe(true),
+    );
     expect(failed.calls.some((c) => c.cmd === "pr_dismissals")).toBe(false);
   });
 
@@ -2265,24 +3250,42 @@ describe("OpenPrMenu — Dismiss", () => {
       "/other": [{ ...NO_RIGHTS, url: "https://github.com/o/other/pull/39" }],
     };
     const dismissed: { projectId: string; number: number }[] = [];
-    h.invoke.mockImplementation((cmd: string, args: Record<string, unknown> = {}) => {
-      if (cmd === "project_open_prs") return Promise.resolve(rowsFor[args.root as string] ?? []);
-      if (cmd === "pr_dismissals")
-        return Promise.resolve(
-          dismissed
-            .filter((d) => d.projectId === args.projectId)
-            .map((d) => ({ ...d, headRefOid: "sha-old", tone: "blocked", viewerCanMerge: false, dismissedAt: 1 })),
-        );
-      if (cmd === "dismiss_pr") {
-        dismissed.push({ projectId: args.projectId as string, number: args.number as number });
-        return Promise.resolve(
-          dismissed
-            .filter((d) => d.projectId === args.projectId)
-            .map((d) => ({ ...d, headRefOid: "sha-old", tone: "blocked", viewerCanMerge: false, dismissedAt: 1 })),
-        );
-      }
-      return Promise.resolve(null);
-    });
+    h.invoke.mockImplementation(
+      (cmd: string, args: Record<string, unknown> = {}) => {
+        if (cmd === "project_open_prs")
+          return Promise.resolve(rowsFor[args.root as string] ?? []);
+        if (cmd === "pr_dismissals")
+          return Promise.resolve(
+            dismissed
+              .filter((d) => d.projectId === args.projectId)
+              .map((d) => ({
+                ...d,
+                headRefOid: "sha-old",
+                tone: "blocked",
+                viewerCanMerge: false,
+                dismissedAt: 1,
+              })),
+          );
+        if (cmd === "dismiss_pr") {
+          dismissed.push({
+            projectId: args.projectId as string,
+            number: args.number as number,
+          });
+          return Promise.resolve(
+            dismissed
+              .filter((d) => d.projectId === args.projectId)
+              .map((d) => ({
+                ...d,
+                headRefOid: "sha-old",
+                tone: "blocked",
+                viewerCanMerge: false,
+                dismissedAt: 1,
+              })),
+          );
+        }
+        return Promise.resolve(null);
+      },
+    );
     render(
       <OpenPrMenu
         scopes={[...SCOPES, ...SCOPES_OTHER]}
@@ -2298,7 +3301,9 @@ describe("OpenPrMenu — Dismiss", () => {
       .find((r) => r.getAttribute("data-project-id") === "p1")!;
     fireEvent.click(within(p1Row).getByTestId("dismiss-39"));
     await waitFor(() => expect(screen.getAllByTestId("pr-row").length).toBe(1));
-    expect(screen.getAllByTestId("pr-row")[0]!.getAttribute("data-project-id")).toBe("p2");
+    expect(
+      screen.getAllByTestId("pr-row")[0]!.getAttribute("data-project-id"),
+    ).toBe("p2");
     expect(dismissed).toEqual([{ projectId: "p1", number: 39 }]);
   });
 });

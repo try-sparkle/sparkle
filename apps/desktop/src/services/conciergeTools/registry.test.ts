@@ -78,10 +78,25 @@ vi.mock("../branchStatus", () => ({
   projectAgentsStatus: vi.fn(async () => []),
 }));
 const mergePrMock = vi.fn(async () => {});
+/** The repo's open PRs, as the merge path reads them. A module-level handle (rather than an inline
+ *  `vi.fn`) so one test can put a mergeable PR in front of `merge_pr` and assert what reaches the
+ *  service — the registry's job on that op is to FORWARD arguments, and an empty list refuses at
+ *  `pr-not-found` long before anything is forwarded. */
+const openPrsMock = vi.fn(async (): Promise<unknown[]> => []);
 vi.mock("../openPrs", async (orig) => ({
   ...(await orig<typeof import("../openPrs")>()),
-  fetchOpenPrs: vi.fn(async () => []),
+  fetchOpenPrs: (...a: unknown[]) => openPrsMock(...(a as [])),
   mergePr: (...a: unknown[]) => mergePrMock(...(a as [])),
+}));
+// The two gates `merge_pr` runs after the checks gate. Neither is this file's subject — registry
+// tests are about routing and argument forwarding — so both answer "nothing in the way".
+vi.mock("../mergeGuard/roborev", async (orig) => ({
+  ...(await orig<typeof import("../mergeGuard/roborev")>()),
+  fetchRoborevProbe: vi.fn(async () => ({ enabled: false, jobs: null })),
+}));
+vi.mock("../mergeGuard/prClaims", async (orig) => ({
+  ...(await orig<typeof import("../mergeGuard/prClaims")>()),
+  fetchPrClaims: vi.fn(async () => []),
 }));
 
 // ── terminal's write edge. The single most important mock here: every refusal test asserts against
@@ -443,6 +458,61 @@ describe("dispatchConciergeTool — normalization", () => {
     // which a bad-args error naming a field would have thrown away.
     expect(refusal(r).code).toBe("invalid-request");
     expect(refusal(r).message).toContain("MERGE COMMIT");
+    expect(mergePrMock).not.toHaveBeenCalled();
+  });
+
+  it("workflow: merge_pr FORWARDS knightwatchOverride to the service, verbatim", async () => {
+    const projectId = seedProject("Repo", "/repos/app");
+    openPrsMock.mockResolvedValueOnce([
+      {
+        number: 7,
+        title: "feat: a thing",
+        headRefName: "sparkle/a-thing",
+        url: "https://github.com/o/r/pull/7",
+        checks: "passing",
+        mergeable: "mergeable",
+        mergeStateStatus: "clean",
+      },
+    ]);
+    const reason = "the probe asks about a file this PR does not touch";
+    const r = await dispatchConciergeTool(
+      call({
+        domain: "workflow",
+        op: "merge_pr",
+        args: { projectId, number: 7, knightwatchOverride: { reason } },
+      }),
+    );
+    expect(r.ok).toBe(true);
+    // THE POINT OF THE TEST: the reason reaches the service. `.strict()` on the args schema means a
+    // key it does not declare is a bad-args error, and a declared-but-unforwarded key is a merge
+    // that silently drops the founder's sentence — both invisible from the result alone.
+    expect(mergePrMock).toHaveBeenCalledWith("/repos/app", 7, reason);
+  });
+
+  it("workflow: a malformed knightwatchOverride is refused by the DOMAIN, not by the schema", async () => {
+    const projectId = seedProject("Repo", "/repos/app");
+    openPrsMock.mockResolvedValueOnce([
+      {
+        number: 7,
+        title: "feat: a thing",
+        headRefName: "sparkle/a-thing",
+        url: "https://github.com/o/r/pull/7",
+        checks: "passing",
+        mergeable: "mergeable",
+        mergeStateStatus: "clean",
+      },
+    ]);
+    const r = await dispatchConciergeTool(
+      call({
+        domain: "workflow",
+        op: "merge_pr",
+        args: { projectId, number: 7, knightwatchOverride: { reason: "ok" } },
+      }),
+    );
+    // The domain's code and the domain's sentence — a `bad-args` naming a zod field would tell the
+    // model the shape was wrong without telling it the reason is PUBLISHED on the pull request.
+    expect(refusal(r).code).toBe("invalid-request");
+    expect(refusal(r).message).toMatch(/recorded on the pull request/i);
     expect(mergePrMock).not.toHaveBeenCalled();
   });
 

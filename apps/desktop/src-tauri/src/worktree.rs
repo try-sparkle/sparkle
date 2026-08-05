@@ -3696,9 +3696,31 @@ const MERGE_TIMEOUT: Duration = Duration::from_secs(60);
 /// PR's checks are green and it is mergeable; `gh` is the backstop that refuses a merge whose
 /// required checks are still red. The `gh` error text is returned verbatim on failure so the menu
 /// can show exactly why a merge was declined.
+///
+/// GATED ON KNIGHTWATCH PROBES. This function is the single sink for all six in-app merge paths
+/// (three UI buttons, the concierge tool, the approval-resume path, and MCP), so
+/// [`crate::knightwatch::enforce`] runs here and covers every one of them at once — the three UI
+/// buttons applied no review gate at all before this. An unanswered `[blocking]` probe refuses the
+/// merge; `knightwatch_override` (a reason of at least a sentence, which is POSTED to the PR before
+/// the merge runs) is the way past it. `[open]` probes only warn — see the `knightwatch` module
+/// header for where that warning goes.
+///
+/// FROM TYPESCRIPT: `invoke("merge_pr", { root, number, knightwatchOverride })`. Both halves of that
+/// were verified against the vendored crates rather than assumed. `tauri-macros` 2.6.3 derives the
+/// JS key with `to_lower_camel_case()` by default (`command/wrapper.rs:507`), so `knightwatchOverride`
+/// is the key this parameter is read from; and `tauri` 2.11.3's `CommandItem::deserialize_option`
+/// (`ipc/command.rs:134`) calls `visit_none()` when the key is ABSENT, so the existing caller —
+/// `invoke("merge_pr", { root, number })` in `services/openPrs.ts` — keeps working and arrives here
+/// as `None`. Adding the parameter is not a breaking change for callers that ignore it.
 #[tauri::command]
-pub async fn merge_pr(root: String, number: u64) -> Result<(), String> {
+pub async fn merge_pr(
+    root: String,
+    number: u64,
+    knightwatch_override: Option<String>,
+) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
+        // BEFORE the merge, and returning `Err` on refusal: the merge is the irreversible half.
+        crate::knightwatch::enforce(&root, number, knightwatch_override.as_deref())?;
         let mut cmd = Command::new(crate::preflight::gh_program());
         cmd.args(["pr", "merge", &number.to_string(), "--merge"])
             .current_dir(&root)

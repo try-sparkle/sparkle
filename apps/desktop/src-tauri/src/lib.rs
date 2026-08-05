@@ -54,6 +54,7 @@ mod helper;
 mod hooks;
 mod inbox;
 mod judge;
+mod knightwatch;
 mod logging;
 mod mac_panel;
 mod main_thread_bench;
@@ -659,6 +660,9 @@ pub fn run() {
             worktree::project_open_prs,
             worktree::pr_owner,
             worktree::merge_pr,
+            // The read side of the merge gate `merge_pr` enforces. Registered in the SAME commit as
+            // the module: a missing registration only fails at invoke time.
+            knightwatch::knightwatch_probe_gate,
             worktree::dismiss_pr,
             worktree::restore_pr,
             worktree::pr_dismissals,

@@ -1,6 +1,14 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+
+// The knightwatch-override block below asserts the PAYLOAD that reaches Rust, so it needs a real
+// `invoke` spy. Hoisted so the mock is installed before `./openPrs` is imported.
+const h = vi.hoisted(() => ({ invoke: vi.fn() }));
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: (...a: unknown[]) => h.invoke(...a),
+}));
 import {
   formatPrBadge,
+  mergePr,
   OPEN_PR_POLL_MS,
   OPEN_PR_QUERY_LIMIT,
   prMergeEligibility,
@@ -77,7 +85,10 @@ const PR_934_UNSTABLE: PrJudgeable = {
   checks: "failing",
   mergeable: "mergeable",
   mergeStateStatus: "unstable",
-  failingChecks: ["Node — coverage (shard 3/4)", "Node — typecheck · test · build"],
+  failingChecks: [
+    "Node — coverage (shard 3/4)",
+    "Node — typecheck · test · build",
+  ],
   pendingChecks: [],
 };
 const PR_925_UNSTABLE: PrJudgeable = {
@@ -176,7 +187,11 @@ describe("prMergeReadiness — the dot answers ONE question: safe to merge right
 
   it("blocks branch protection and drafts outright — gh would refuse anyway", () => {
     for (const state of ["blocked", "draft"] as const) {
-      const r = prMergeReadiness({ checks: "passing", mergeable: "mergeable", mergeStateStatus: state });
+      const r = prMergeReadiness({
+        checks: "passing",
+        mergeable: "mergeable",
+        mergeStateStatus: state,
+      });
       expect(r.tone, state).toBe("blocked");
       expect(r.canMerge, state).toBe(false);
       expect(r.override, state).toBeNull();
@@ -195,16 +210,25 @@ describe("prMergeReadiness — the dot answers ONE question: safe to merge right
   it("distinguishes an ABSENT merge state from GitHub's own 'unknown'", () => {
     // undefined = the caller did not supply it (a partial fixture); "unknown" = GitHub is still
     // computing. Only the second is a reason to withhold green.
-    expect(prMergeReadiness({ checks: "passing", mergeable: "mergeable" }).canMerge).toBe(true);
     expect(
-      prMergeReadiness({ checks: "passing", mergeable: "mergeable", mergeStateStatus: "unknown" })
-        .canMerge,
+      prMergeReadiness({ checks: "passing", mergeable: "mergeable" }).canMerge,
+    ).toBe(true);
+    expect(
+      prMergeReadiness({
+        checks: "passing",
+        mergeable: "mergeable",
+        mergeStateStatus: "unknown",
+      }).canMerge,
     ).toBe(false);
   });
 });
 
 const ALL_CHECKS: PrRow["checks"][] = ["passing", "pending", "failing", "none"];
-const ALL_MERGEABLE: PrRow["mergeable"][] = ["mergeable", "conflicting", "unknown"];
+const ALL_MERGEABLE: PrRow["mergeable"][] = [
+  "mergeable",
+  "conflicting",
+  "unknown",
+];
 const ALL_STATES: (PrRow["mergeStateStatus"] | undefined)[] = [
   undefined,
   "clean",
@@ -218,7 +242,11 @@ const ALL_STATES: (PrRow["mergeStateStatus"] | undefined)[] = [
 ];
 const EVERY_COMBINATION: PrJudgeable[] = ALL_CHECKS.flatMap((checks) =>
   ALL_MERGEABLE.flatMap((mergeable) =>
-    ALL_STATES.map((mergeStateStatus) => ({ checks, mergeable, mergeStateStatus })),
+    ALL_STATES.map((mergeStateStatus) => ({
+      checks,
+      mergeable,
+      mergeStateStatus,
+    })),
   ),
 );
 
@@ -231,7 +259,9 @@ describe("the invariant that keeps the dot and the button honest", () => {
     for (const pr of EVERY_COMBINATION) {
       const r = prMergeReadiness(pr);
       const shape = `${pr.checks}/${pr.mergeable}/${pr.mergeStateStatus}`;
-      expect(r.canMerge, `canMerge but not green: ${shape}`).toBe(r.tone === "ready");
+      expect(r.canMerge, `canMerge but not green: ${shape}`).toBe(
+        r.tone === "ready",
+      );
     }
   });
 
@@ -242,7 +272,8 @@ describe("the invariant that keeps the dot and the button honest", () => {
       const r = prMergeReadiness(pr);
       const shape = `${pr.checks}/${pr.mergeable}/${pr.mergeStateStatus}`;
       if (r.tone === "ready") expect(r.label, shape).toBeNull();
-      else expect(r.label?.length ?? 0, `no word for ${shape}`).toBeGreaterThan(0);
+      else
+        expect(r.label?.length ?? 0, `no word for ${shape}`).toBeGreaterThan(0);
       expect(r.title.length, `no tooltip for ${shape}`).toBeGreaterThan(0);
     }
   });
@@ -254,13 +285,17 @@ describe("the invariant that keeps the dot and the button honest", () => {
       const r = prMergeReadiness(pr);
       if (!r.override) continue;
       const shape = `${pr.checks}/${pr.mergeable}/${pr.mergeStateStatus}`;
-      expect(pr.mergeable, `override on a non-mergeable PR: ${shape}`).toBe("mergeable");
+      expect(pr.mergeable, `override on a non-mergeable PR: ${shape}`).toBe(
+        "mergeable",
+      );
       expect(["unstable", "behind"], shape).toContain(pr.mergeStateStatus);
     }
   });
 
   it("still reaches green — the implication is not satisfied by never being ready", () => {
-    const green = EVERY_COMBINATION.filter((pr) => prMergeReadiness(pr).tone === "ready");
+    const green = EVERY_COMBINATION.filter(
+      (pr) => prMergeReadiness(pr).tone === "ready",
+    );
     expect(green.length).toBeGreaterThan(0);
     // ...and every green one really is mergeable with nothing outstanding.
     for (const pr of green) {
@@ -275,7 +310,13 @@ describe("prReadyCount / prMergeEligibility — the header count and the concier
   it("counts ONLY green, so 'Merge all ready (N)' matches the enabled buttons", () => {
     // The reported header said "Merge all ready (1)" over five rows that all offered Merge. The app
     // already knew the right number; it just did not act on it everywhere.
-    const rows = [GREEN, PR_944_CONFLICTING, PR_934_UNSTABLE, PR_925_UNSTABLE, GREEN];
+    const rows = [
+      GREEN,
+      PR_944_CONFLICTING,
+      PR_934_UNSTABLE,
+      PR_925_UNSTABLE,
+      GREEN,
+    ];
     expect(prReadyCount(rows)).toBe(2);
   });
 
@@ -447,7 +488,9 @@ describe("prMergeReadiness — merge rights", () => {
     for (const pr of EVERY_COMBINATION) {
       const r = prMergeReadiness({ ...pr, viewerCanMerge: false });
       const shape = `${pr.checks}/${pr.mergeable}/${pr.mergeStateStatus}`;
-      expect(r.label, `no-rights must dominate: ${shape}`).toBe("No merge rights");
+      expect(r.label, `no-rights must dominate: ${shape}`).toBe(
+        "No merge rights",
+      );
       expect(r.canMerge, `no-rights must never merge: ${shape}`).toBe(false);
     }
   });
@@ -459,12 +502,63 @@ describe("prMergeReadiness — merge rights", () => {
       for (const viewerCanMerge of [true, false, null, undefined] as const) {
         const r = prMergeReadiness({ ...pr, viewerCanMerge });
         const shape = `${pr.checks}/${pr.mergeable}/${pr.mergeStateStatus}/rights=${viewerCanMerge}`;
-        expect(r.canMerge, `canMerge but not green: ${shape}`).toBe(r.tone === "ready");
+        expect(r.canMerge, `canMerge but not green: ${shape}`).toBe(
+          r.tone === "ready",
+        );
       }
     }
   });
 
   it("drops a no-rights PR out of prReadyCount, so the chiclet cannot over-promise", () => {
     expect(prReadyCount([green(true), green(false), green(true)])).toBe(2);
+  });
+});
+
+// ── THE KNIGHTWATCH OVERRIDE REACHES RUST, OR IT IS NOT AN OVERRIDE ───────────────────────────
+//
+// `mergePr` is the ONLY `invoke("merge_pr")` in the codebase, so this is the single place the
+// written waiver can be lost. Losing it is silent and looks like the gate working: the user types a
+// sentence, clicks Merge, and Rust — never handed the reason — refuses again for unanswered probes.
+// So these assert the PAYLOAD, not that the call happened.
+describe("mergePr — the knightwatch override is passed THROUGH", () => {
+  beforeEach(() => {
+    h.invoke.mockReset();
+    h.invoke.mockResolvedValue(null);
+  });
+
+  it("carries the reason to the Rust command as `knightwatchOverride`", async () => {
+    await mergePr(
+      "/repo",
+      1176,
+      "the probe asks about a file this PR does not touch",
+    );
+    const [cmd, payload] = h.invoke.mock.calls[0] as [
+      string,
+      Record<string, unknown>,
+    ];
+    expect(cmd).toBe("merge_pr");
+    expect(payload).toEqual({
+      root: "/repo",
+      number: 1176,
+      knightwatchOverride: "the probe asks about a file this PR does not touch",
+    });
+  });
+
+  it("OMITS the key entirely on an ordinary merge", async () => {
+    await mergePr("/repo", 1176);
+    const payload = h.invoke.mock.calls[0]?.[1] as Record<string, unknown>;
+    // `in`, not `=== undefined`: the existing callers assert the exact payload `{ root, number }`,
+    // and a key that is present-but-undefined is a different object on the wire.
+    expect("knightwatchOverride" in payload).toBe(false);
+    expect(payload).toEqual({ root: "/repo", number: 1176 });
+  });
+
+  it("does not swallow a refusal — the caller must see why the merge did not happen", async () => {
+    h.invoke.mockRejectedValueOnce(
+      new Error("knightwatch: 1 unanswered [blocking] probe"),
+    );
+    await expect(mergePr("/repo", 1176)).rejects.toThrow(
+      /unanswered \[blocking\] probe/,
+    );
   });
 });

@@ -80,7 +80,9 @@ import {
   summarizeRoborev,
 } from "../mergeGuard/roborev";
 import { fetchPrClaims, findClaim, viewClaim } from "../mergeGuard/prClaims";
+import { isKnightwatchRefusal, knightwatchReasonIssue } from "../mergeGuard/knightwatch";
 import type {
+  KnightwatchOverride,
   PrClaimView,
   RoborevBranchState,
   RoborevGateVerdict,
@@ -344,6 +346,11 @@ export type WorkflowFailureCode =
   | "roborev-pending" // a review round is IN FLIGHT — its verdict does not exist yet
   | "roborev-unresolved" // open FAIL-verdict reviews nobody has read or closed
   | "roborev-unknown" // roborev IS the gate here and we could not read it
+  // The PR still carries a knightwatch [blocking] review probe nobody answered. A DISTINCT code
+  // from the roborev ones on purpose: the remedy is not "read a finding and close it", it is
+  // "answer the reviewer's question on the pull request". Measured before it was built — of the
+  // last 40 merged PRs, 24 carried a blocking probe and all 24 merged with zero probe-citing reply.
+  | "knightwatch-unanswered"
   | "gh-unavailable" // the gh CLI is missing or unusable
   | "auth-failed" // credentials expired / rejected
   | "rejected-non-fast-forward"
@@ -640,6 +647,46 @@ function normalizeAck(
   return { acknowledgedJobIds: ids as number[], reason: reason.trim() };
 }
 
+/**
+ * Read `knightwatchOverride` off the wire. `null` for "not supplied", `"invalid"` for a malformed
+ * one, the trimmed value otherwise.
+ *
+ * MALFORMED IS AN ERROR, NOT ABSENT — the same rule as {@link normalizeAck}, for the same reason:
+ * the caller is a model sending JSON that TypeScript never sees, and silently ignoring
+ * `{ knightwatchOverride: true }` would refuse the merge with a probe message while the caller
+ * believed it had waived them, on every retry.
+ *
+ * The SENTENCE FLOOR is applied here too (`knightwatchReasonIssue`), not left to Rust. Rust remains
+ * the authority — it must be, since it is the only thing every merge path passes through — but a
+ * one-word reason bounced from there arrives as a `failed`/`unknown-error` with gh's wording, which
+ * tells the model nothing about what to write instead. Refusing it here says exactly what is wrong.
+ */
+function normalizeKnightwatchOverride(
+  value: unknown,
+): KnightwatchOverride | "invalid" | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "object") return "invalid";
+  const reason = (value as Record<string, unknown>).reason;
+  if (typeof reason !== "string") return "invalid";
+  if (knightwatchReasonIssue(reason) !== null) return "invalid";
+  return { reason: reason.trim() };
+}
+
+/**
+ * What to tell a model whose merge was refused for unanswered probes — the Rust refusal verbatim,
+ * plus the remedy.
+ *
+ * THE REMEDY IS THE REPLY, NOT THE OVERRIDE. A refusal that leads with its own escape hatch teaches
+ * the model that the hatch is the way through, and the measured failure this gate exists to fix is
+ * exactly that: 24 of the last 40 merged PRs carried a blocking probe and every one merged with no
+ * probe-citing reply. So this names answering ON THE PULL REQUEST first, says plainly that the
+ * override does not answer anything, and warns that whatever it writes is published as its own
+ * words next to the question it skipped.
+ */
+function knightwatchRefusalMessage(number: number, rustMessage: string): string {
+  return `Refused: PR #${number} still carries knightwatch review probes nobody has answered.\n\n${rustMessage}\n\nANSWER THEM ON THE PULL REQUEST — reply to the review comment, citing the probe, and say what you did about it. That is the only thing that clears a probe. \`knightwatchOverride: { reason }\` does NOT answer one: it records YOUR sentence on the PR as the reason you merged with the reviewer's question outstanding, and it is published under your name beside that question. Reach for it only when you can say why the probe does not apply — and if you are not the one who can answer it, say so and leave the PR unmerged.`;
+}
+
 /** The gate's own code word, mapped onto this domain's failure codes. Total over
  *  `RoborevGateCode`, so a new code there is a typecheck failure here rather than a silent
  *  `unknown-error`. */
@@ -885,6 +932,22 @@ export interface MergePrRequest {
    * the human for confirmation, and this is the sentence they read before saying yes.
    */
   roborevOverride?: { acknowledgedJobIds: number[]; reason: string };
+  /**
+   * MERGE PAST AN UNANSWERED KNIGHTWATCH `[blocking]` PROBE, in writing.
+   *
+   * Same shape discipline as `roborevOverride` and for the same reason: an object with a required
+   * `reason` is what stops a caller expressing "override" without expressing why. Rust validates
+   * that the reason costs a sentence and RECORDS IT ON THE PULL REQUEST, so whatever a model writes
+   * here is published as the model's own words beside the question it declined to answer.
+   *
+   * IT DOES NOT ANSWER THE PROBE, AND THE REFUSAL SAYS SO. A probe is a reviewer's question about
+   * this diff; the only thing that answers it is a reply on the PR citing it. A model that reaches
+   * for this because a gate is in its way is doing the thing the gate exists to prevent, one step
+   * more expensively — so the refusal text names the reply as the remedy and this field as the
+   * exception, not the other way round. `merge_pr` is `mutates-main`, so a human confirms the call
+   * either way and this sentence is what they are confirming.
+   */
+  knightwatchOverride?: KnightwatchOverride;
 }
 
 /**
@@ -993,11 +1056,30 @@ export async function mergePrTool(
   if (!verdict.canMerge)
     return refused(op, roborevCode(verdict), roborevRefusalMessage(verdict, pr.headRefName, ack !== null));
 
+  // --- Gate 6: knightwatch probes -------------------------------------------------------------
+  //
+  // NOT ANOTHER PROBE OF OUR OWN. The gate itself is inside Rust's `merge_pr`, the single sink all
+  // six in-app merge paths reach, so it cannot be routed around by a caller that skips this domain.
+  // What happens HERE is only the two things a tool layer can do: refuse a malformed override
+  // before spending a merge on it, and turn Rust's refusal into a coded, actionable one.
+  const knightwatch = normalizeKnightwatchOverride(raw.knightwatchOverride);
+  if (knightwatch === "invalid")
+    return refused(
+      op,
+      "invalid-request",
+      "Refused: `knightwatchOverride` must be `{ reason: string }`, and the reason has to be a sentence — at least 15 characters with a space in it. It is deliberately not a boolean: it is recorded on the pull request as your stated reason for merging with a reviewer's question unanswered, so \"ok\" is not one. Answering the probe on the PR is the way through; this is the exception.",
+    );
+
   try {
-    await mergePr(root, req.number);
+    await mergePr(root, req.number, knightwatch?.reason);
     return ok(op, { number: req.number, method: "merge", url: pr.url });
   } catch (e) {
     const msg = errText(e);
+    // FIRST, because a probe refusal is a REFUSAL — nothing was merged and the repo did not move —
+    // and because its remedy is nothing the patterns below would suggest. Left to them it lands on
+    // `unknown-error` with Rust's prose and no code, which is a message a model retries verbatim.
+    if (isKnightwatchRefusal(msg))
+      return refused(op, "knightwatch-unanswered", knightwatchRefusalMessage(req.number, msg));
     if (/not mergeable|conflict/i.test(msg)) return failed(op, "conflict", msg);
     if (/required status check|checks have not passed|blocked/i.test(msg)) return failed(op, "checks-blocked", msg);
     if (/auth|not logged|401|403|token/i.test(msg)) return failed(op, "auth-failed", msg);
