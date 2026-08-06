@@ -4508,7 +4508,12 @@ const AgentRow = memo(function AgentRow({
   // its own popover, and is the one mark the founder singled out as already right — so the row
   // passes NO `pendingInbox` into `agentNotices` and the badge keeps the class. The composer's pill
   // row reads the full model including the inbox; this is the one surface that deliberately does not.
-  const noticeMarks = rowGlyphsFor(agentNotices({ thrash, stall }));
+  // `goalBadge` IS passed, and `rowGlyphsFor` drops the goal-class mark it produces (roborev 59278).
+  // The row draws its own goal chip, so it needs no mark — but it DOES need the goal as an INPUT,
+  // because a stall cause standing in for the goal takes the goal's glyph. Omitting it made this row
+  // compute an amber triangle for `stall:unmet-goal` while the composer drew a blue target for the
+  // very same notice, so a click still crossed from one mark to a different-looking pill.
+  const noticeMarks = rowGlyphsFor(agentNotices({ thrash, stall, goal: goalBadge }));
   /**
    * MOUNT THIS AGENT AND OPEN THE PILL THAT EXPLAINS `noticeId`. Bead sparkle-tyter, the founder's
    * second scope addition.
@@ -4534,6 +4539,11 @@ const AgentRow = memo(function AgentRow({
         key={mark.cls}
         data-testid="row-notice-glyph"
         data-notice-class={mark.cls}
+        // THE GLYPH NAME, exposed so a test can compare the row's mark to the composer's pill for
+        // one notice id (roborev 59278). react-icons render as anonymous SVG in jsdom, so without
+        // this the row-side half of the parity invariant is unassertable — which is exactly how the
+        // divergence survived: the model-level test passes whether or not the ROW supplies the goal.
+        data-notice-glyph={mark.glyph}
         data-notice-count={mark.count}
         data-notice-lead={mark.leadNoticeId}
         role="button"

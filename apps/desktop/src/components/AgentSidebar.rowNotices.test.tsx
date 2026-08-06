@@ -349,6 +349,26 @@ describe("clicking a notice mark mounts the agent and names the pill to open", (
     expect(rowFor(AGENT_NAME).textContent).not.toContain("land the retry PR");
   });
 
+  it("draws the GOAL's glyph on the row when the stall cause IS the goal", () => {
+    // ══ THE PARITY BUG WHERE IT ACTUALLY LIVES (roborev 59278) ════════════════════════════════
+    // A goal-derived stall pill takes the goal's glyph on the composer. The ROW computed its mark
+    // from `agentNotices({ thrash, stall })` with no goal, so it drew an amber alert triangle for
+    // `stall:unmet-goal` while the composer drew a blue target for the same notice id — click an
+    // amber triangle, land on a blue target.
+    //
+    // THIS MUST BE ASSERTED ON THE ROW, not on the model: `agentNotices` called directly with a
+    // goal passes whether or not the ROW supplies one, which is why the divergence survived a
+    // model-level parity test. FAILS when AgentSidebar stops passing `goal` into agentNotices.
+    render(
+      <AgentSidebar
+        project={seed({ a1: "idle" }, { a1: CLEAN_BS }, { a1: BARE_WS }, {}, { goal: UNMET_GOAL })}
+      />,
+    );
+    const mark = within(rowFor(AGENT_NAME)).getByTestId("row-notice-glyph");
+    expect(mark.getAttribute("data-notice-lead")).toBe("stall:unmet-goal");
+    expect(mark.getAttribute("data-notice-glyph")).toBe("target");
+  });
+
   it("is operable from the keyboard, not pointer-only", () => {
     makeLooping();
     render(<AgentSidebar project={seed({ a1: "working" })} />);

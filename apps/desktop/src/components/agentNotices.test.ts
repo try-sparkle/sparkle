@@ -303,10 +303,40 @@ describe("the pill that stands in for a goal keeps the goal's MARK and WORDS", (
 
   it("carries the goal's OWN WORDS, which no explainer can supply", () => {
     // "land the retry PR" is the only part of that pill that is about THIS agent.
-    const [n] = agentNotices({ stall: stallOf(["escalated-goal"]), goal: goalOf("escalated") });
+    //
+    // A DISTINCTIVE SENTINEL for the engine half, not a stray letter (roborev 59278). This asserted
+    // `toContain("s")`, which only had force because `stallOf`'s default detail is the literal "s"
+    // AND the default goal text happens to contain no lowercase s — two incidental facts. Changing
+    // the goal text to anything with an "s" in it would have made the guard vacuous forever while
+    // still passing, even if the engine sentence were dropped from the concatenation entirely.
+    const [n] = agentNotices({
+      stall: stallOf(["escalated-goal"], "ENGINE-SENTENCE"),
+      goal: goalOf("escalated"),
+    });
     expect(n?.detail).toContain("land the retry PR");
-    // …without losing the engine's own sentence.
-    expect(n?.detail).toContain("s");
+    expect(n?.detail).toContain("ENGINE-SENTENCE");
+  });
+
+  it("draws the SAME glyph on the row mark as on the pill for one notice", () => {
+    // ══ THE PARITY BUG, RELOCATED AND THEN FIXED (roborev 59278) ══════════════════════════════
+    // Giving a goal-derived stall pill the goal's glyph fixed the goal-chip click path and broke the
+    // warning-mark path: the row passed no `goal`, so it computed `alert` (amber triangle) for
+    // `stall:unmet-goal` while the composer, which does pass it, drew `target` (blue) for that very
+    // same notice id. Clicking an amber triangle landed on a blue target pill.
+    //
+    // Asserted as the two surfaces AGREEING, rather than as either one's literal value, so neither
+    // can drift from the other. FAILS if the row stops passing the goal.
+    const inputs = { stall: stallOf(["unmet-goal"]), goal: goalOf("unmet") } as const;
+    const pill = agentNotices(inputs).find((n) => n.id === "stall:unmet-goal");
+    const mark = rowGlyphsFor(agentNotices(inputs)).find((m) => m.cls === "warning");
+    expect(mark?.leadNoticeId).toBe("stall:unmet-goal");
+    expect(mark?.glyph).toBe(pill?.glyph);
+  });
+
+  it("still draws NO row mark for the goal class — the goal chip is that mark", () => {
+    // The row passes the goal as an INPUT but must not render a second mark for it.
+    const marks = rowGlyphsFor(agentNotices({ goal: goalOf("met") }));
+    expect(marks).toEqual([]);
   });
 
   it("does not staple a goal onto a stall cause that has nothing to do with it", () => {

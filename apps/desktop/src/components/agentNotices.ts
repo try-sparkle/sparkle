@@ -520,6 +520,13 @@ const GLYPH_RANK: Record<NoticeGlyph, number> = {
 export function rowGlyphsFor(notices: readonly AgentNotice[]): RowGlyphMark[] {
   const byClass = new Map<NoticeClass, AgentNotice[]>();
   for (const n of notices) {
+    // THE ROW DOES NOT DRAW THE GOAL CLASS — its own goal chip is that mark, and it is clickable.
+    // The row still PASSES the goal into `agentNotices` (roborev 59278), because that is what lets a
+    // goal-derived stall cause wear the goal's glyph on both surfaces; without it the row computed
+    // an amber triangle for `stall:unmet-goal` while the composer drew a blue target for the same
+    // notice id, which is the parity bug relocated rather than fixed. Passing the input and dropping
+    // the mark here is what keeps one derivation and two correct renderings.
+    if (n.cls === "goal") continue;
     const bucket = byClass.get(n.cls);
     if (bucket === undefined) byClass.set(n.cls, [n]);
     else bucket.push(n);
