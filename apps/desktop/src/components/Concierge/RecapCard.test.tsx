@@ -207,6 +207,41 @@ describe("RecapCard", () => {
     });
   });
 
+  // ── THE CARD IS BOUNDED, THE ROW SET IS NOT ─────────────────────────────────────────────────
+  // `SECTION_CAP`'s docblock explicitly delegates height protection to these declarations, so
+  // deleting them would leave both the code and that docblock silently wrong. They are INLINE
+  // styles, so jsdom can assert them directly — no layout engine needed, and therefore no excuse
+  // for the gap (roborev 59167).
+  describe("the card bounds its own height instead of hiding rows", () => {
+    const card = () => screen.getByTestId("concierge-recap");
+
+    it("scrolls past a max height rather than growing without limit", () => {
+      render(<RecapCard recap={recap({ needsYou: changes(40, "a"), finished: [] })} />);
+      // Every one of the forty actionable rows is rendered — the bound is on the BOX, not the set.
+      expect(screen.getAllByTestId("recap-change")).toHaveLength(40);
+      expect(card().style.maxHeight).toBe("50vh");
+      expect(card().style.overflowY).toBe("auto");
+    });
+
+    it("does NOT shrink as a flex item — the scroll container's min-height is zero", () => {
+      // The High finding this exists for: this card is a direct flex item of the thread's column
+      // scroller, and Flexbox §4.5 gives a SCROLL CONTAINER an automatic minimum size of zero while
+      // every sibling row keeps its content height. Without `flex-shrink: 0` the card is the only
+      // item that can give, so a transcript longer than one screen collapses it toward 0px and
+      // hides every row — strictly worse than the "+N more" this bead is about.
+      render(<RecapCard recap={recap()} />);
+      expect(card().style.flexShrink).toBe("0");
+    });
+
+    it("does not become a HORIZONTAL scroll container as a side effect", () => {
+      // `overflow-y` alone computes the other axis from `visible` to `auto`, which would put a
+      // horizontal scrollbar on the surface whose horizontal overflow was already fixed by
+      // `overflow-wrap: anywhere` (roborev 58700).
+      render(<RecapCard recap={recap()} />);
+      expect(card().style.overflowX).toBe("hidden");
+    });
+  });
+
   describe("the +N more line is a control, not a caption", () => {
     it("expands in place on click, revealing every hidden row, and collapses again", () => {
       render(<RecapCard recap={recap({ needsYou: [], finished: changes(12, "a", "done") })} />);

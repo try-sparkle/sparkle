@@ -539,11 +539,42 @@ export function RecapCard({
         // once. That is categorically different from "+N more", which required a click to learn
         // that the rows even existed.
         //
-        // `vh` rather than a pixel constant so it scales with the window, and it is a MAX: a short
-        // card is untouched, and `overflow-y: auto` shows no scrollbar until there is something to
-        // scroll. 60% leaves the summary, the thread above and the compose box below all visible.
-        maxHeight: "60vh",
+        // ── `flexShrink: 0` IS LOAD-BEARING, NOT TIDINESS (roborev 59167, High) ────────────────
+        // This card is a DIRECT FLEX ITEM of the thread scroller (ConciergeMessageRow returns it as
+        // the message's root; ConciergeThread's scroller is `display: flex; flex-direction:
+        // column`). Per Flexbox §4.5 an item's automatic minimum size is its content height —
+        // EXCEPT for a scroll container, where it is ZERO. So the moment `overflow-y` made this a
+        // scroll container, this card became the only item in the transcript that could be shrunk,
+        // while every sibling row (not a scroll container) stayed frozen at its content height.
+        // With a transcript longer than one screen — the ordinary case, and precisely the
+        // night-away case this bead is about — the whole negative free space would be absorbed
+        // HERE and the card would collapse toward 0px with every row inside an internal scrollbar.
+        // That is strictly worse than the "+11 more" this bead exists to fix: it hides every
+        // actionable row with no disclosure at all. Never set overflow here without this.
+        flexShrink: 0,
+        // A MAX, so a short card is untouched and no scrollbar appears until there is something to
+        // scroll.
+        //
+        // THE FRACTION IS OF THE VIEWPORT, NOT OF THE THREAD, and that distinction is stated rather
+        // than glossed (roborev 59167). The thread scroller is `flex: 1` inside a column that also
+        // carries the header, the voice strip, the search row and the compose box, so its visible
+        // height is well under `100vh` — a viewport fraction therefore bounds this card less
+        // tightly than the same fraction of the transcript would. Half the WINDOW is the claim
+        // being made, and it is deliberately conservative for that reason: it guarantees the card
+        // can never take more than half the app, without this component having to measure a box it
+        // does not own. Bounding against the scroller itself (`container-type` there + `cqh` here)
+        // is the tighter answer and belongs with a change to ConciergeThread, not to this file.
+        maxHeight: "50vh",
         overflowY: "auto",
+        // EXPLICIT, because `overflow-y` alone does not leave the other axis alone: per CSS
+        // Overflow, when one axis is not `visible` the other computes from `visible` to `auto`. So
+        // this card would silently have become a HORIZONTAL scroll container too — on the exact
+        // surface where a horizontal-overflow defect was already found and fixed (`overflowWrap:
+        // "anywhere"` above, roborev 58700). Any residual overflow from the nowrap cells at a
+        // narrow width would then paint a horizontal scrollbar inside the card instead of being
+        // handled by the wrap rule. `hidden` rather than `clip`: this box is already a scroll
+        // container on the y axis, so `clip`'s one advantage — not becoming one — is unavailable.
+        overflowX: "hidden",
         background: `color-mix(in srgb, ${accent} ${CARD_WASH_PCT}%, transparent)`,
         border: `1px solid color-mix(in srgb, ${accent} 32%, transparent)`,
         borderRadius: 6,
