@@ -63,11 +63,36 @@ export function withUnmergedWork<T extends { id: string }>(
   let out: Record<string, AgentTabStatus> | null = null;
   const ensure = (): Record<string, AgentTabStatus> => (out ??= { ...statusMap });
   for (const a of agents) {
-    const st = statusMap[a.id] ?? "stopped";
-    if (!RESTING.has(st)) continue;
-    const stage = stageOf(a.id);
-    if (!stage || !hasUnmergedCommittedWork(stage)) continue;
-    ensure()[a.id] = "unmerged";
+    const calm = calmStatusOf(statusMap[a.id], stageOf(a.id));
+    if (calm === (statusMap[a.id] ?? "stopped")) continue;
+    ensure()[a.id] = calm;
   }
   return out ?? statusMap;
+}
+
+/**
+ * THE SAME OVERLAY FOR ONE AGENT — and the map above is now written in terms of it, so the two
+ * cannot drift.
+ *
+ * ══ WHY THIS EXISTS (roborev 58774, a High) ═══════════════════════════════════════════════════
+ * `Concierge/MountedAgentNotices` asked the stall question against the RAW `runtimeStore.status`
+ * while the sidebar row asked it against the overlaid map. They disagree on the single most common
+ * stalled shape: a finished agent holding committed-but-unlanded work reads `done` raw, which this
+ * overlay turns into `unmerged` — and `agentStall.isQuiet` accepts `unmerged` but rejects `done`.
+ * So the ROW drew its alert glyph and the composer rendered NO pills: clicking the mark mounted the
+ * agent, patched the cable, and landed on an empty composer. Two callers deriving "is this agent
+ * resting" separately is what made that possible, so there is now one derivation.
+ *
+ * An ABSENT status defaults to `stopped`, matching every other reader in the repo
+ * (`AgentSidebar`, `useRosterPublisher`, `conciergeFeed`). Defaulting to `idle` instead would let
+ * an agent nobody has observed produce stall claims from git evidence alone.
+ */
+export function calmStatusOf(
+  status: AgentTabStatus | undefined,
+  stage: WorkflowStageId | undefined,
+): AgentTabStatus {
+  const st = status ?? "stopped";
+  if (!RESTING.has(st)) return st;
+  if (!stage || !hasUnmergedCommittedWork(stage)) return st;
+  return "unmerged";
 }

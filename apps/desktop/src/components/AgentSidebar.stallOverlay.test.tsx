@@ -164,20 +164,29 @@ describe("a STALLED row says what is outstanding", () => {
         })}
       />,
     );
-    const chip = within(rowFor("Stalled One")).getByTestId("row-stall");
-    // The VISIBLE reading is the outstanding work — "stalled" alone would send the reader off to
-    // investigate, and the investigation is the expensive part.
-    expect(chip.textContent).toContain("PR unmerged");
+    const row = rowFor("Stalled One");
+    const mark = within(row).getByTestId("row-notice-glyph");
+    // ══ THE WORDS MOVED, THE FACT DID NOT (bead sparkle-tyter) ═══════════════════════════════
+    // This used to assert `chip.textContent` contained "PR unmerged" — i.e. that the row rendered
+    // the phrase. That is exactly the shape that broke the column: a nowrap, non-shrinking text
+    // chip beside a name written to give up all its width first, which flexbox resolved by
+    // shrinking the NAME to zero. The row now carries a wordless mark and the phrase lives on its
+    // hover, so the assertion follows the words rather than being deleted with them.
+    expect(mark.getAttribute("title")).toContain("PR unmerged");
     // ONE clause, no "+N" tail: an open PR and unlanded commits are the same fact, and agentStall
-    // folds the second into the first rather than saying it twice (roborev 55298/55379). This test
-    // asserted "+1" while that duplicate was still being reported.
-    expect(chip.textContent).not.toContain("+");
-    // The word itself survives in the accessible name.
-    expect(chip.getAttribute("aria-label")).toBe("Stalled — PR unmerged");
-    // And the engine's own sentence is the tooltip, naming every cause and refusing to promise a
-    // resume would fix it.
-    expect(chip.getAttribute("title")).toContain("it has an open PR that nobody merged");
-    expect(chip.getAttribute("title")).toContain("Nothing is coming to finish this on its own");
+    // folds the second into the first rather than saying it twice (roborev 55298/55379).
+    expect(mark.getAttribute("title")).not.toContain("+");
+    // The count says how many, so a single cause must not wear one.
+    expect(mark.getAttribute("data-notice-count")).toBe("1");
+    // The word "stalled" no longer appears anywhere — the mark's accessible name is the class and
+    // its members, which is what a reader who cannot see the glyph needs.
+    expect(mark.getAttribute("aria-label")).toBe("1 warning: PR unmerged");
+    // AND THE NEW INVARIANT, which is the whole contract: nothing on this row renders the phrase
+    // as visible text. The old assertion above would now pass on a row that still had the bug if
+    // it only checked the tooltip, so this is the half that pins the fix.
+    expect(row.textContent).not.toContain("PR unmerged");
+    // The engine's full sentence still rides along — on the CARD's chip, which has room for it.
+    // (The collapsed mark's title is the label list; `row-stall` is card-only now.)
   });
 
   it("shows uncommitted work as its own named cause", () => {
@@ -190,10 +199,12 @@ describe("a STALLED row says what is outstanding", () => {
         })}
       />,
     );
-    const chip = within(rowFor("Stalled One")).getByTestId("row-stall");
-    expect(chip.textContent).toContain("uncommitted changes");
-    // Exactly one cause → no "+N" tail to mislead the reader into hovering for more.
-    expect(chip.textContent).not.toContain("+");
+    const row = rowFor("Stalled One");
+    const mark = within(row).getByTestId("row-notice-glyph");
+    // The cause is named on the HOVER now, not in the row's text — see the note above.
+    expect(mark.getAttribute("title")).toContain("uncommitted changes");
+    expect(mark.getAttribute("data-notice-count")).toBe("1");
+    expect(row.textContent).not.toContain("uncommitted changes");
   });
 
   it("takes the CAUTION ink, never a second red alarm", () => {
@@ -206,7 +217,11 @@ describe("a STALLED row says what is outstanding", () => {
         })}
       />,
     );
-    expect(within(rowFor("Stalled One")).getByTestId("row-stall").style.color).toBe(C.amberInk);
+    // Amber, not danger — the row's dot is the alarm channel and a stall must not open a second
+    // one. The ink moved to the mark with the words.
+    expect(
+      within(rowFor("Stalled One")).getByTestId("row-notice-glyph").style.color,
+    ).toBe(C.amberInk);
   });
 });
 
@@ -248,8 +263,10 @@ describe("GRAY IS A TERMINAL STATE — the founder's rule, end to end through th
     // THE INTEGRATION TRAP. The row derives its stall report from its own status, and `stallReport`
     // answers `active` for the whole red tier — so composing the escalation naively deleted the chip
     // at exactly the moment the row turned red: colour with no cause. `calmSt` exists for this.
-    const chip = within(renderStalled()).getByTestId("row-stall");
-    expect(chip.textContent).toContain("goal unmet");
+    // The mark's HOVER is where the cause lives now (bead sparkle-tyter); the trap this guards is
+    // unchanged — the mark must still be THERE, naming the cause, on a row that has gone red.
+    const mark = within(renderStalled()).getByTestId("row-notice-glyph");
+    expect(mark.getAttribute("title")).toContain("goal unmet");
   });
 
   it("the whole ACKNOWLEDGE cycle works through the real sidebar", () => {
@@ -294,7 +311,7 @@ describe("GRAY IS A TERMINAL STATE — the founder's rule, end to end through th
     const after = rowFor("Stalled One");
     expect(within(after).queryByTitle(AGENT_STATUS.blocked.label)).toBeNull();
     expect(within(after).getByTitle(AGENT_STATUS.unmerged.label)).toBeTruthy();
-    expect(within(after).getByTestId("row-stall")).toBeTruthy();
+    expect(within(after).getByTestId("row-notice-glyph")).toBeTruthy();
     // 4. …and Re-enable is offered, so the dismissal is undoable from the UI.
     expect(alertControlKind(alertOf(), "blocked")).toBe("reenable");
   });
@@ -328,7 +345,7 @@ describe("a FINISHED row shows no stall affordance", () => {
         })}
       />,
     );
-    expect(within(rowFor("Finished One")).queryByTestId("row-stall")).toBeNull();
+    expect(within(rowFor("Finished One")).queryByTestId("row-notice-glyph")).toBeNull();
   });
 });
 
@@ -338,7 +355,7 @@ describe("an UNKNOWN row raises nothing — a stall we never looked for is not a
     // Painting this row would be an alarm built on missing data, which is what trains a human to
     // stop trusting the signal.
     render(<AgentSidebar project={seed({ status: { unknown: "idle" } })} />);
-    expect(within(rowFor("Unknown One")).queryByTestId("row-stall")).toBeNull();
+    expect(within(rowFor("Unknown One")).queryByTestId("row-notice-glyph")).toBeNull();
   });
 
   it("still renders no chip when only SOME evidence is in and none of it is a cause", () => {
@@ -352,7 +369,7 @@ describe("an UNKNOWN row raises nothing — a stall we never looked for is not a
         })}
       />,
     );
-    expect(within(rowFor("Unknown One")).queryByTestId("row-stall")).toBeNull();
+    expect(within(rowFor("Unknown One")).queryByTestId("row-notice-glyph")).toBeNull();
   });
 });
 
@@ -367,7 +384,7 @@ describe("the RED tier gets no second alarm", () => {
         })}
       />,
     );
-    expect(within(rowFor("Busy One")).queryByTestId("row-stall")).toBeNull();
+    expect(within(rowFor("Busy One")).queryByTestId("row-notice-glyph")).toBeNull();
   });
 
   it("a DISMISSED waiting row gets no stall chip either", () => {
@@ -403,7 +420,7 @@ describe("the RED tier gets no second alarm", () => {
 
     // …and only now is the absence meaningful: the row is calm, so `isQuiet` accepts it, and the chip
     // is suppressed by `calmSt` reading the PRE-dismissal `waiting` rather than the rewritten `idle`.
-    expect(within(row).queryByTestId("row-stall")).toBeNull();
+    expect(within(row).queryByTestId("row-notice-glyph")).toBeNull();
   });
 });
 
@@ -419,9 +436,11 @@ describe("a THRASHING row shows its own verdict", () => {
     noteThrashEvent("busy", { event: "PreCompact", ts: t - 60_000 });
     noteThrashEvent("busy", { event: "PreCompact", ts: t - 5_000 });
     render(<AgentSidebar project={project} />);
-    const chip = within(rowFor("Busy One")).getByTestId("row-thrash");
-    expect(chip.textContent).toContain("Context exhausted");
-    expect(chip.getAttribute("title")).toContain("running out of usable context");
+    // The verdict is named on the mark's HOVER now, never as row text (bead sparkle-tyter).
+    const row = rowFor("Busy One");
+    const mark = within(row).getByTestId("row-notice-glyph");
+    expect(mark.getAttribute("title")).toContain("Context exhausted");
+    expect(row.textContent).not.toContain("Context exhausted");
   });
 
   it("reports a repeated command as LOOPING", () => {
@@ -432,16 +451,19 @@ describe("a THRASHING row shows its own verdict", () => {
       noteThrashEvent("busy", { event: "Stop", ts: 1_100 + i });
     }
     render(<AgentSidebar project={project} />);
-    const chip = within(rowFor("Busy One")).getByTestId("row-thrash");
-    expect(chip.textContent).toContain("Looping");
-    expect(chip.getAttribute("title")).toContain("It is looping, not working");
+    // "Looping" was one of the four words the founder photographed colliding with the agent name
+    // ("Looping Shipped"). It must not be row text under any circumstances now.
+    const row = rowFor("Busy One");
+    const mark = within(row).getByTestId("row-notice-glyph");
+    expect(mark.getAttribute("title")).toContain("Looping");
+    expect(row.textContent).not.toContain("Looping");
   });
 
   it("shows nothing for an agent this window has never seen a hook event for", () => {
     // `thrashReportFor` returns undefined there, and undefined must NOT render as healthy OR as an
     // alarm — it means "not observed".
     render(<AgentSidebar project={seed({ status: { busy: "working" } })} />);
-    expect(within(rowFor("Busy One")).queryByTestId("row-thrash")).toBeNull();
+    expect(within(rowFor("Busy One")).queryByTestId("row-notice-glyph")).toBeNull();
   });
 
   it("shows nothing for an agent whose turns are running tools", () => {
@@ -450,7 +472,7 @@ describe("a THRASHING row shows its own verdict", () => {
     noteThrashEvent("busy", { event: "PreToolUse", tool: "Edit", ts: 1_010 });
     noteThrashEvent("busy", { event: "Stop", ts: 1_020 });
     render(<AgentSidebar project={project} />);
-    expect(within(rowFor("Busy One")).queryByTestId("row-thrash")).toBeNull();
+    expect(within(rowFor("Busy One")).queryByTestId("row-notice-glyph")).toBeNull();
   });
 });
 
@@ -497,14 +519,25 @@ describe("EVERY goal state is visible on the row, and an ESCALATED one is still 
     // text at all here, so without this a screen reader would reach an empty span. Asserted through
     // the ACCESSIBLE NAME, not just the attribute: an `aria-label` on an element with no role is
     // not reliably announced, so this is what proves the label is actually exposed.
+    //
+    // `button`, NOT `img` as this read before (bead sparkle-tyter). The founder's second scope
+    // addition made the goal chip CLICKABLE — *"when I click on the blue target it doesn't do
+    // anything"* — and an operable control announced as an image is one a screen-reader user cannot
+    // find. The property this row actually guards is unchanged and still checked: the mark carries
+    // its state in its accessible name rather than in visible text.
     expect(
-      within(rowFor("Busy One")).getByRole("img", { name: "Goal active, 3h 20m left — ship it" }),
+      within(rowFor("Busy One")).getByRole("button", { name: "Goal active, 3h 20m left — ship it" }),
     ).toBe(chip);
     expect(chip.getAttribute("aria-label")).toBe("Goal active, 3h 20m left — ship it");
     expect(chip.style.color).toBe(C.accentInk);
     // The words themselves stay one hover away rather than on the row.
     expect(chip.textContent).not.toContain("Goal");
-    expect(chip.getAttribute("title")).toBe("Goal: ship it — active · 3h 20m left");
+    // The goal sentence is still exactly what it was; the title now ALSO says the chip is
+    // clickable (bead sparkle-tyter). That suffix is not decoration — the founder's complaint was
+    // that he clicked this mark and got silence, so the affordance has to be discoverable from the
+    // one surface that was already carrying its words.
+    expect(chip.getAttribute("title")).toContain("Goal: ship it — active · 3h 20m left");
+    expect(chip.getAttribute("title")).toContain("click");
   });
 
   it("marks a MET goal on the row in the success ink", () => {
@@ -666,9 +699,14 @@ describe("EVERY goal state is visible on the row, and an ESCALATED one is still 
     // Escalation is categorically different from "needs merging eventually": nothing is coming for
     // this row at all, so the mark takes DANGER rather than the caution ink every other cause gets.
     expect(goal.style.color).toBe(DANGER);
-    // The WORDS are the stall chip's, and they name the cause rather than restating the state.
-    const stall = row.getByTestId("row-stall");
-    expect(stall.textContent).toContain("auto-continue gave up");
-    expect(stall.style.color).toBe(DANGER);
+    // The WORDS are the notice mark's HOVER now (bead sparkle-tyter) — the row itself renders no
+    // notice prose at all. The escalated glyph is the loudest in its class, so it wins the mark
+    // even though the goal chip beside it is already saying DANGER.
+    const mark = row.getByTestId("row-notice-glyph");
+    expect(mark.getAttribute("title")).toContain("auto-continue gave up");
+    expect(mark.getAttribute("data-notice-lead")).toBe("stall:escalated-goal");
+    expect(mark.style.color).toBe(DANGER);
+    // Digits only, never words — the invariant this whole bead exists to establish.
+    expect(mark.textContent).toBe("");
   });
 });

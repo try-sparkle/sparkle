@@ -1,0 +1,427 @@
+// @vitest-environment jsdom
+//
+// ══ THE ROW MUST SAY WHICH AGENT IT IS. Bead sparkle-tyter. ═══════════════════════════════════
+//
+// The founder asked twice for row notices to become icons. The second ask came with a screenshot,
+// and the screenshot showed something worse than the density complaint he was making: rows rendering
+// as literal collisions —
+//
+//     "Rate limitedShipped"   "Rate limitedUnsaved"   "Rate limitedSaved"   "Looping Shipped"
+//
+// On EIGHT visible rows the agent's NAME WAS ENTIRELY ABSENT. The notice text had taken its place.
+//
+// THE MECHANISM, because it is not the one it looks like. Nothing was painted over anything; there
+// is no absolute positioning anywhere in that row. `FittedAgentName`'s span was `flex: 1;
+// minWidth: 0` — "take everything from me first" — and the thrash chip beside it was
+// `flex: "0 0 auto"` with `whiteSpace: "nowrap"` and a literal label inside it — "I will not give
+// up a pixel". Flexbox resolved that exactly as written: the name shrank to ZERO and the notice
+// ended up flush against the stage chip that follows it outside the name container. Reading order
+// `[name: 0px][thrash "Rate limited"][stage "Shipped"]` renders as `Rate limitedShipped`.
+//
+// So this file pins the two halves of the fix, and it is deliberately written so that BOTH
+// assertions fail against the code as it was:
+//
+//   1. NO NOTICE RENDERS PROSE. A notice mark carries an icon and at most a count digit. The words
+//      live on its hover and in the pills above the composer.
+//   2. THE NAME HAS A FLOOR. `AGENT_NAME_MIN_WIDTH_PX`, so whatever chip the next branch adds to
+//      that row, the name degrades by ELLIPSIS — which is information — rather than by vanishing.
+//
+// WHY THERE IS NO PIXEL MEASUREMENT HERE. jsdom has no layout engine: `getBoundingClientRect()`
+// returns 0 for everything, so a test claiming to observe "unclipped" would measure nothing and
+// pass vacuously (docs/jsdom-test-caveats.md, and the whole reason `stageChipShows` is a pure
+// predicate rather than a measurement). What is assertable — and what actually pins the contract —
+// is the style SHAPE and the absence of the words. Real geometry belongs in a Chrome-driven test
+// following `BannerStack.layout.test.ts`, which must skip when Chromium is absent or it is
+// permanently red on CI.
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@tauri-apps/plugin-opener", () => ({
+  openUrl: vi.fn(() => Promise.resolve()),
+  revealItemInDir: vi.fn(() => Promise.resolve()),
+}));
+vi.mock("./LogoWaveform", () => ({ LogoWaveform: () => null }));
+vi.mock("./StatusBar", () => ({ StatusBar: () => null }));
+vi.mock("./HistorySearch", () => ({
+  HistorySearch: () => null,
+  relativeTime: () => "",
+  renderSnippet: () => null,
+}));
+vi.mock("../services/branchStatus", () => ({
+  refreshAgentBranch: vi.fn(() => Promise.resolve({ ok: true })),
+  landAgentBranch: vi.fn(() => Promise.resolve({ ok: true })),
+}));
+
+import { AgentSidebar, stageChipShows, STAGE_CHIP_MIN_COLUMN_PX } from "./AgentSidebar";
+import { AGENT_NAME_MIN_WIDTH_PX } from "./FittedAgentName";
+import { BUILD_COLUMN_DEFAULT_WIDTH } from "../engine/columnResize";
+import { THRASH_VERDICT_LABEL } from "./rowAttention";
+import { useProjectStore } from "../stores/projectStore";
+import { useRuntimeStore } from "../stores/runtimeStore";
+import { useUiStore } from "../stores/uiStore";
+import { useCableStore, resetCable } from "../stores/cableStore";
+import { useBeadsStore } from "../stores/beadsStore";
+import { useHelperPrefs } from "../helper/helperPrefs";
+import { allBandsVisible } from "../engine/buildSections";
+import { noteThrashEvent, resetThrashTracking } from "../engine/agentThrash";
+import type { AgentTab, AgentTabStatus, Project } from "../types";
+import type { Bead, Board } from "../services/beads";
+import type { WorkflowStageId } from "../engine/workflowStage";
+import type { BranchStatus, WorkflowState } from "../services/branchStatus";
+
+const EMPTY_BOARD: Board = { backlog: [], blocked: [], inProgress: [], done: [], delivered: [] };
+
+const CLEAN_BS: BranchStatus = {
+  ahead: 0,
+  behind: 0,
+  dirty: false,
+  filesChanged: 0,
+  insertions: 0,
+  deletions: 0,
+  worktreeOnBranch: true,
+};
+
+const BARE_WS: WorkflowState = {
+  inLocalMain: false,
+  inOriginMain: false,
+  inParent: false,
+  aheadOfBase: 0,
+  prState: null,
+  prNumber: null,
+  prUrl: null,
+};
+const OPEN_PR_WS: WorkflowState = { ...BARE_WS, prState: "open", prNumber: 7, pushed: true };
+
+/** Long enough that a zero-floor row would genuinely have squeezed it — the bug was never visible
+ *  on two-character names. And deliberately sharing NO substring with any verdict label, so the
+ *  "no notice prose on the row" assertion below cannot be satisfied or defeated by the name itself.
+ *  ("Looping Agent Alpha" made that test fail against correct code.) */
+const AGENT_NAME = "Marmalade Spiral Beta";
+
+/** An UNMET, unexpired goal — the state whose mark is the founder's "blue target". `setAt` is NOW
+ *  rather than a literal so the default TTL has not already run out against the row's live clock,
+ *  which would make this an `expired` chip and quietly test the wrong state. */
+const UNMET_GOAL = {
+  text: "land the retry PR",
+  setAt: Date.now(),
+  ttlMs: 4 * 60 * 60_000,
+  continues: 0,
+  totalContinues: 0,
+} as AgentTab["goal"];
+
+function mkAgent(id: string, name: string, over: Partial<AgentTab> = {}): AgentTab {
+  return {
+    id,
+    name,
+    kind: "build",
+    parentId: null,
+    runtime: "local",
+    worktreePath: null,
+    branch: null,
+    baseBranch: null,
+    lastPrompt: "",
+    promptHistory: [],
+    // Pinned so auto-naming cannot rewrite the label the assertions look the row up by.
+    namePinned: true,
+    autoNameBasis: null,
+    autoNameVariants: null,
+    shellCommand: null,
+    ...over,
+  };
+}
+
+function seed(
+  status: Record<string, AgentTabStatus> = {},
+  branchStatus: Record<string, BranchStatus> = {},
+  workflowState: Record<string, WorkflowState> = {},
+  opts: { stage?: WorkflowStageId; feedback?: number } = {},
+  over: Partial<AgentTab> = {},
+): Project {
+  const project: Project = {
+    id: "p1",
+    name: "Demo",
+    rootPath: "/tmp/demo",
+    defaultBranch: "main",
+    createdAt: new Date(0).toISOString(),
+    selectedAgentId: null,
+    agents: [mkAgent("a1", AGENT_NAME, over)],
+  };
+  useProjectStore.setState({ projects: [project] } as never);
+  useRuntimeStore.setState({
+    status,
+    branchStatus,
+    workflowState,
+    workflowStage: opts.stage ? { a1: opts.stage } : {},
+    workflowShipped: {},
+    openAgentIds: ["a1"],
+    open: vi.fn(),
+    pollBranchStatus: vi.fn(() => Promise.resolve()),
+  } as never);
+  // The FEEDBACK pill counts beads labelled `agent:<id>` straight off the raw list.
+  const beads: Bead[] = Array.from({ length: opts.feedback ?? 0 }, (_, i) => ({
+    id: `fb-${i}`,
+    title: `feedback ${i}`,
+    description: "",
+    status: "open" as const,
+    labels: ["agent:a1"],
+    parent: null,
+  }));
+  useBeadsStore.setState({
+    byProject: { p1: { beads, board: EMPTY_BOARD, loadedAt: Date.now() } },
+  } as never);
+  return project;
+}
+
+const rowFor = (name: string) =>
+  screen.getByText(name).closest('[data-hint="agent"]') as HTMLElement;
+
+/**
+ * Put the agent into the `repeating-command` thrash verdict, whose label is the literal string
+ * "Looping" — one of the four readings on the founder's screenshot ("Looping Shipped").
+ *
+ * `repeating-command` rather than `quota-blocked` purely because it is fixturable from the public
+ * hook-event API: the quota verdict needs a live `QuotaBlock` from `engine/engineRegistry`, which
+ * a component test cannot seed without a registered StatusEngine. The RENDERING contract under test
+ * is per-class, not per-verdict — `agentNotices.test.ts` walks all ten verdicts — so any non-healthy
+ * thrash verdict exercises the same path.
+ */
+function makeLooping(id = "a1") {
+  // Three identical submissions with no tool call between them — the observed /compact spiral.
+  for (let i = 0; i < 3; i++) {
+    noteThrashEvent(id, { event: "UserPromptSubmit", prompt: "/compact", ts: 1_000 + i });
+    noteThrashEvent(id, { event: "Stop", ts: 1_100 + i });
+  }
+}
+
+beforeEach(() => {
+  useUiStore.setState({
+    collapsedOrchestrators: {},
+    activeSpecial: null,
+    statusFilter: allBandsVisible(),
+    focusedNoticeBySide: { left: null, right: null },
+  } as never);
+  useHelperPrefs.setState({ enabled: true } as never);
+  resetThrashTracking();
+  resetCable();
+});
+afterEach(() => {
+  cleanup();
+  resetThrashTracking();
+  resetCable();
+  useBeadsStore.setState({ byProject: {} } as never);
+});
+
+describe("a row carrying a notice STILL SAYS WHICH AGENT IT IS", () => {
+  it("renders the agent's full name beside the notice, not in place of it", () => {
+    // THE HEADLINE ASSERTION OF THE WHOLE BEAD. On the founder's screenshot this name was gone.
+    makeLooping();
+    render(<AgentSidebar project={seed({ a1: "working" })} />);
+    const row = rowFor(AGENT_NAME);
+    expect(within(row).getByTestId("row-agent-name").textContent).toBe(AGENT_NAME);
+    // And the row does carry a notice — otherwise this passes for the boring reason.
+    expect(within(row).getByTestId("row-notice-glyph")).toBeTruthy();
+  });
+
+  it("gives the name a NON-ZERO width floor, so no sibling can squeeze it to nothing", () => {
+    // The structural half. `minWidth: 0` is what let flexbox take the name to zero; the notice
+    // marks being wordless fixes the chips that exist TODAY, and this fixes the ones that don't.
+    // FAILS against the pre-change code, where this span was `minWidth: 0`.
+    makeLooping();
+    render(<AgentSidebar project={seed({ a1: "working" })} />);
+    const name = within(rowFor(AGENT_NAME)).getByTestId("row-agent-name");
+    expect(AGENT_NAME_MIN_WIDTH_PX).toBeGreaterThan(0);
+    expect(name.style.minWidth).toBe(`${AGENT_NAME_MIN_WIDTH_PX}px`);
+    // It still truncates rather than growing the row — the degradation is an ellipsis.
+    expect(name.style.overflow).toBe("hidden");
+  });
+
+  it("renders NO notice prose anywhere on the row — icons and digits only", () => {
+    // FAILS against the pre-change code, which rendered the literal "Rate limited" here. This is
+    // the assertion the founder's requirement 1 reduces to: "never text; never anything that can
+    // occupy the name's space."
+    makeLooping();
+    render(<AgentSidebar project={seed({ a1: "working" })} />);
+    const row = rowFor(AGENT_NAME);
+    for (const mark of within(row).getAllByTestId("row-notice-glyph")) {
+      // Empty, or a bare count. Never a word.
+      expect(mark.textContent ?? "").toMatch(/^\d*$/);
+    }
+    // Belt and braces: not one of the ten verdict labels appears as visible row text.
+    for (const label of Object.values(THRASH_VERDICT_LABEL)) {
+      expect(row.textContent).not.toContain(label);
+    }
+  });
+
+  it("keeps the words reachable WITHOUT mounting — they ride the hover", () => {
+    // Requirement 4: "hover or click the row icon reveals the same detail WITHOUT mounting, so a
+    // glance is still possible." Moving the words off the row only works if they are still gettable.
+    makeLooping();
+    render(<AgentSidebar project={seed({ a1: "working" })} />);
+    const mark = within(rowFor(AGENT_NAME)).getByTestId("row-notice-glyph");
+    expect(mark.getAttribute("title")).toContain("Looping");
+    expect(mark.getAttribute("aria-label")).toContain("Looping");
+  });
+
+  it("collapses several warnings into ONE mark carrying a count", () => {
+    // "If we're gonna have more than one or two showing up on the row, we need to find a different
+    // way to handle it." One mark per class is that different way — a mark per verdict would
+    // rebuild the same wall of signal in icon form.
+    makeLooping();
+    render(
+      <AgentSidebar
+        project={seed(
+          { a1: "idle" },
+          { a1: { ...CLEAN_BS, ahead: 3, dirty: true } },
+          { a1: OPEN_PR_WS },
+        )}
+      />,
+    );
+    const marks = within(rowFor(AGENT_NAME)).getAllByTestId("row-notice-glyph");
+    expect(marks).toHaveLength(1);
+    expect(Number(marks[0]!.getAttribute("data-notice-count"))).toBeGreaterThan(1);
+  });
+
+  it("shows no mark at all on an agent with nothing to say", () => {
+    // The control. Without it every assertion above could pass on a row that marks everything.
+    render(<AgentSidebar project={seed({ a1: "working" })} />);
+    expect(within(rowFor(AGENT_NAME)).queryByTestId("row-notice-glyph")).toBeNull();
+  });
+});
+
+describe("clicking a notice mark mounts the agent and names the pill to open", () => {
+  it("patches the cable and records the lead notice", () => {
+    // The founder's worked example, generalized: "If I were to click on the mailbox icon on the row
+    // then the mailbox could expand on the mounted concierge." Assert the SIDE EFFECTS — the cable
+    // moved and the notice id was recorded — not merely that a handler exists.
+    makeLooping();
+    render(<AgentSidebar project={seed({ a1: "working" })} />);
+    expect(useCableStore.getState().wired).toBe("off");
+
+    fireEvent.click(within(rowFor(AGENT_NAME)).getByTestId("row-notice-glyph"));
+
+    expect(useCableStore.getState().wired).not.toBe("off");
+    const side = useCableStore.getState().wired as "left" | "right";
+    expect(useUiStore.getState().focusedNoticeBySide[side]).toBe("thrash:repeating-command");
+  });
+
+  it("makes the GOAL chip clickable too — the blue target that did nothing", () => {
+    // ══ THE FOUNDER'S SECOND SCOPE ADDITION (bead sparkle-tyter) ═══════════════════════════════
+    // *"When I click, for example, on screenshot and upload split, there is a blue target and I
+    // don't know what that blue target is. When I click on the blue target it doesn't do anything.
+    // I'm not seeing any sort of notice above the compose window when the concierge is mounted."*
+    //
+    // The chip was a MARK with no onClick, on the premise that its words stayed recoverable through
+    // its hover title and its accessible name. He went straight for a click and recovered nothing.
+    // Asked which model to use, he chose MOUNT-then-explain — so this asserts all three side
+    // effects, not merely that a handler exists. FAILS against the pre-change chip, which had no
+    // click handler at all.
+    render(
+      <AgentSidebar
+        project={seed({ a1: "working" }, {}, {}, {}, { goal: UNMET_GOAL })}
+      />,
+    );
+    const goal = within(rowFor(AGENT_NAME)).getByTestId("row-goal");
+    // Operable, and ANNOUNCED as operable — `role="img"` on a control is a control a screen-reader
+    // user cannot find.
+    expect(goal.getAttribute("role")).toBe("button");
+    expect(goal.getAttribute("tabindex")).toBe("0");
+
+    fireEvent.click(goal);
+
+    expect(useCableStore.getState().wired).not.toBe("off");
+    const side = useCableStore.getState().wired as "left" | "right";
+    // The pill NAMED, not merely "something about this agent" — the composer has to know which of
+    // its pills to open, and `goal:unmet` is the one whose explainer says what a blue target is.
+    expect(useUiStore.getState().focusedNoticeBySide[side]).toBe("goal:unmet");
+  });
+
+  it("still renders the goal as a GLYPH — clickable did not mean wordy", () => {
+    // Requirement 4 of the same message: *"Do NOT reintroduce visible text on the row."* Making the
+    // chip operable is exactly the kind of change that tempts a label onto it.
+    render(
+      <AgentSidebar
+        project={seed({ a1: "working" }, {}, {}, {}, { goal: UNMET_GOAL })}
+      />,
+    );
+    const goal = within(rowFor(AGENT_NAME)).getByTestId("row-goal");
+    expect(goal.textContent ?? "").toBe("");
+    // …and the goal's own words are nowhere on the row either.
+    expect(rowFor(AGENT_NAME).textContent).not.toContain("land the retry PR");
+  });
+
+  it("is operable from the keyboard, not pointer-only", () => {
+    makeLooping();
+    render(<AgentSidebar project={seed({ a1: "working" })} />);
+    const mark = within(rowFor(AGENT_NAME)).getByTestId("row-notice-glyph");
+    expect(mark.getAttribute("tabindex")).toBe("0");
+    fireEvent.keyDown(mark, { key: "Enter" });
+    expect(useCableStore.getState().wired).not.toBe("off");
+  });
+});
+
+describe("the right-hand slot holds ONE pill, and drops it when the column is tight", () => {
+  it("shows FEEDBACK instead of the stage chip when the agent has feedback", () => {
+    // The founder: "If an agent has provided feedback then it should say 'feedback' instead of
+    // 'shift' or whatever. The feedback label should go where the PR or shift, etc., label goes."
+    // ("shift" is dictation for "Shipped".) They used to render side by side.
+    render(
+      <AgentSidebar
+        project={seed({ a1: "idle" }, { a1: CLEAN_BS }, { a1: OPEN_PR_WS }, {
+          stage: "pull_request",
+          feedback: 3,
+        })}
+      />,
+    );
+    const row = rowFor(AGENT_NAME);
+    expect(within(row).getByTestId("row-feedback-pill")).toBeTruthy();
+    expect(within(row).queryByTestId("row-stage-chip")).toBeNull();
+  });
+
+  it("still shows the stage chip when there is no feedback", () => {
+    // The control for the case above — without it, deleting the stage chip outright would pass.
+    render(
+      <AgentSidebar
+        project={seed({ a1: "idle" }, { a1: CLEAN_BS }, { a1: OPEN_PR_WS }, {
+          stage: "pull_request",
+        })}
+      />,
+    );
+    expect(within(rowFor(AGENT_NAME)).getByTestId("row-stage-chip")).toBeTruthy();
+  });
+});
+
+describe("stageChipShows — the narrow-column rule, as a pure predicate", () => {
+  // Pure and exported for the reason `ComposeBox.attachShowsLabels` is: jsdom has no layout engine,
+  // so the component measures and this decides. Testing the decision is testable; testing the
+  // measurement in jsdom is not.
+  it("hides the chip below the threshold", () => {
+    expect(stageChipShows(STAGE_CHIP_MIN_COLUMN_PX - 1)).toBe(false);
+    expect(stageChipShows(120)).toBe(false);
+  });
+
+  it("shows it at or above the threshold", () => {
+    expect(stageChipShows(STAGE_CHIP_MIN_COLUMN_PX)).toBe(true);
+    expect(stageChipShows(600)).toBe(true);
+  });
+
+  it("SHOWS THE CHIP AT THE WIDTH THE APP ACTUALLY OPENS AT", () => {
+    // ══ THE FINDING THIS PINS (roborev 58758) ═══════════════════════════════════════════════
+    // The threshold shipped at 260 against a default column of 220, so the chip was not "hidden on
+    // a narrow column" — it was gone for every user on every row until they dragged the column
+    // wider. Nothing caught it: jsdom delivers no ResizeObserver callback, so `columnWidth` stays 0
+    // and every other chip test in the repo takes the unmeasured-is-wide branch and never reads the
+    // threshold at all.
+    //
+    // Asserted as a RELATIONSHIP against the real constant, not as a literal, so it keeps failing if
+    // either number moves — a literal `expect(stageChipShows(220)).toBe(true)` would go stale the
+    // moment the default column width changed and would pin nothing.
+    expect(stageChipShows(BUILD_COLUMN_DEFAULT_WIDTH)).toBe(true);
+    expect(STAGE_CHIP_MIN_COLUMN_PX).toBeLessThan(BUILD_COLUMN_DEFAULT_WIDTH);
+  });
+
+  it("treats NOT-YET-MEASURED as wide, so booting does not flicker every row at once", () => {
+    // 0 is "no ResizeObserver callback has landed", not "a zero-width column". Booting into the
+    // hidden state and revealing the chip a frame later is a visible flicker down the whole column.
+    expect(stageChipShows(0)).toBe(true);
+  });
+});

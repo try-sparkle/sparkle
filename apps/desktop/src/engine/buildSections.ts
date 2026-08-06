@@ -260,6 +260,28 @@ export function honestStageMeta(
   };
 }
 
+/**
+ * Should the ROW's stage chip stay silent entirely? Bead sparkle-tyter.
+ *
+ * The founder, on seeing the chip: *"If it's empty, we shouldn't say empty."* He is right, and the
+ * reason is that the chip costs the same row space whatever it says. `honestStageMeta` already
+ * fixed the chip's honesty problem — it stopped a `building_unsaved` row under "Nothing Yet" from
+ * claiming unsaved work — but it fixed it by substituting the word "Empty", which spends a slot on
+ * a row in a section whose own HEADING already says nothing is there. Two renderings of one fact,
+ * the smaller one competing with the agent's name.
+ *
+ * So: no chip at all for that case. The information is not lost — the section heading carries it,
+ * and the expanded card's `WorkflowLine` still renders the full "Nothing Built Yet" with its detail
+ * sentence, which is the surface with room for it.
+ *
+ * IT LIVES HERE, NOT IN `StageChip`, for the reason this file's own header gives at length: the
+ * copy rule took three passes to stop moving because each fix lived inside one of the components
+ * that had to apply it. A predicate beside the override it is derived from cannot drift from it.
+ */
+export function stageChipIsSilent(stage: WorkflowStageId, section?: BuildSectionId): boolean {
+  return section === "local_none" && stage === "building_unsaved";
+}
+
 // ── Status bands (the filter) ────────────────────────────────────────────────────────────────
 // The four buckets the filter chips toggle. These are EXACTLY the four color tiers in
 // packages/ui/tokens.ts AGENT_STATUS (RED / BLUE / GREEN / GRAY) — deliberately so, because the

@@ -30,6 +30,7 @@ import {
   FiUploadCloud,
   FiClock,
   FiAlertOctagon,
+  FiInbox,
 } from "react-icons/fi";
 import type { IconType } from "react-icons";
 import { C, AGENT_STATUS, FONT_WEIGHT, ON_BRAND_FILL, DANGER, statusInk } from "../theme/colors";
@@ -104,6 +105,7 @@ import {
   groupAgentsByStage,
   honestStageMeta,
   sectionOfRow,
+  stageChipIsSilent,
   type BuildSectionId,
   type StatusBand,
 } from "../engine/buildSections";
@@ -140,6 +142,9 @@ import {
   thrashChipLabel,
 } from "./rowAttention";
 import type { GoalBadge } from "./rowAttention";
+// ONE producer for what an agent is complaining about, shared with the composer's pill row so the
+// two surfaces cannot drift — the taxonomy drift engine/workerRollup.ts warns about twice.
+import { agentNotices, rowGlyphsFor, type NoticeGlyph } from "./agentNotices";
 import { splitStatusPollTargets } from "../engine/statusPollTargets";
 import { useNewAgentCalm, useNewAgentGraceTick } from "../hooks/useNewAgentCalm";
 
@@ -1473,6 +1478,34 @@ export function AgentSidebar({
   // apart from a user's. `restoreTimerRef` debounces the ease-back so cursor travel between adjacent
   // bottom rows doesn't bounce the column.
   const listScrollRef = useRef<HTMLDivElement | null>(null);
+  // ── HOW WIDE IS THIS COLUMN? (bead sparkle-tyter) ────────────────────────────────────────────
+  // The founder: *"If the column is narrow, I don't think we should show the in PR or saved or
+  // shipped pill."* Measured ONCE here and threaded down as a prop rather than measured per row —
+  // forty rows each observing the same element is forty callbacks per resize frame to learn one
+  // number, and `agentRowPropsEqual` (which now compares it) keeps the re-render cost to the rows
+  // that actually cross the threshold.
+  //
+  // 0 until the first observation, which `stageChipShows` reads as the WIDE form: booting into the
+  // hidden state and revealing the chip a frame later flickers every row in the column at once.
+  const [columnWidth, setColumnWidth] = useState(0);
+  useEffect(() => {
+    const el = listScrollRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver((entries) => {
+      // `borderBoxSize`, NOT `contentRect` (roborev 58758). This element carries
+      // `padding: 0 ${LIST_PAD_X}px`, so `contentRect.width` is the COLUMN width minus 16 — and
+      // minus the scrollbar gutter on top of that. Comparing that to a constant documented as "the
+      // column width" is a systematic under-read that biases every row toward the hidden form.
+      // `offsetWidth` is the fallback for the jsdom/older-observer path where the box array is
+      // absent; both are border-box readings, which is what the threshold is written against.
+      const entry = entries[0];
+      if (entry === undefined) return;
+      const w = entry.borderBoxSize?.[0]?.inlineSize ?? (entry.target as HTMLElement).offsetWidth;
+      if (typeof w === "number" && w > 0) setColumnWidth((prev) => (prev === w ? prev : w));
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
   const baselineRef = useRef<number | null>(null);
   const autoTargetRef = useRef<number | null>(null);
   const autoClearTimerRef = useRef<number | null>(null);
@@ -2341,7 +2374,13 @@ export function AgentSidebar({
         // element, and the fillets flare from a shape that no longer touches the pane) with the
         // geometry tests still green, because they read the row's own margin and never this.
         // rowGeometry now asserts the two agree.
-        style={{ flex: 1, overflowY: "auto", padding: `0 ${LIST_PAD_X}px` }}
+        // `overflowX: "hidden"` is LOAD-BEARING, not tidiness (roborev 58758). A row's name now has
+        // a hard `AGENT_NAME_MIN_WIDTH_PX` floor and its chips are `flex: 0 0 auto`, so at a column
+        // dragged near `BUILD_COLUMN_MIN_WIDTH` the row is genuinely wider than this container —
+        // and `overflow-y: auto` with `overflow-x: visible` computes the other axis to `auto`, so
+        // the whole list would gain a horizontal scrollbar and slide sideways. Clipping is the
+        // degradation we want: the name ellipsizes, the tail is cut, the column never scrolls.
+        style={{ flex: 1, overflowY: "auto", overflowX: "hidden", padding: `0 ${LIST_PAD_X}px` }}
       >
         {/* Per-mode "+ New … Agent" affordance — the only way to create agents now that the chevrons
             are a selector. Plan has none (no agents in Plan). Placement is dynamic (listOverflows):
@@ -2542,6 +2581,7 @@ export function AgentSidebar({
               dragActive={dragId != null}
               paneSide={pairSide}
               jointOpen={jointOpen}
+              columnWidth={columnWidth}
               onDragStartAgent={onAgentDragStart}
               onDragEndAgent={onAgentDragEnd}
               onDropAgent={onAgentDrop}
@@ -3474,17 +3514,63 @@ function ElapsedTimer({ since, now, color }: { since: number; now: number; color
  * order (scrolled past its header, or pulled up in a filtered view) and because the two disagree
  * for a head whose stage rolls up from its workers.
  */
+/**
+ * The column width at or above which the row still spends space on its stage chip. Bead
+ * sparkle-tyter.
+ *
+ * The founder: *"If the column is narrow, I don't think we should show the in PR or saved or
+ * shipped pill. It's fine if the column is wider and there's space but that's a nice-to-have not
+ * need-to-have."* That is a ranking, and it is the right one — "Shipped" is a status readout, while
+ * the agent's NAME is what the row is for. Below this width the chip is the first thing to go.
+ *
+ * The FEEDBACK pill is deliberately NOT covered by this: it is an action ("open this agent's
+ * feedback in Plan"), not a status readout, and the founder asked for it to take this very slot.
+ *
+ * ══ THIS NUMBER MUST SIT BELOW `BUILD_COLUMN_DEFAULT_WIDTH` (roborev 58758) ═══════════════════
+ * It shipped at 260 against a default column of **220**, which is not "hidden when narrow" — it is
+ * the chip DELETED for every user until they drag the column wider, which is not what was asked
+ * for. The rule is a degradation, so the threshold has to be below the width the app opens at, and
+ * `AgentSidebar.rowNotices.test.tsx` asserts exactly that relationship rather than the literal so
+ * a later change to either constant cannot quietly re-open it.
+ *
+ * 190 ≈ the width at which the row's fixed chrome (dot · timer · glyph slots) plus the name's own
+ * `AGENT_NAME_MIN_WIDTH_PX` floor leaves nothing for a pill worth reading.
+ */
+export const STAGE_CHIP_MIN_COLUMN_PX = 190;
+
+/**
+ * Does the row draw a stage chip at this COLUMN width?
+ *
+ * Pure and exported for the same reason `Concierge/ComposeBox.attachShowsLabels` is: jsdom has no
+ * layout engine, so a test that rendered the row and measured would read 0 for every width and pass
+ * vacuously. The component measures; this decides.
+ *
+ * 0 means "not measured yet" and takes the WIDE form, matching `attachShowsLabels`: booting into the
+ * hidden state and revealing the chip a frame later is a visible flicker on every row at once.
+ */
+export function stageChipShows(columnWidthPx: number): boolean {
+  return !(columnWidthPx > 0) || columnWidthPx >= STAGE_CHIP_MIN_COLUMN_PX;
+}
+
 function StageChip({
   stage,
   active,
   section,
+  columnWidth,
 }: {
   stage: WorkflowStageId;
   active: boolean;
   /** The rung this row was FILED under. Only consulted to catch the one case where the stage's own
    *  copy contradicts it — see `honestStageMeta`. */
   section?: BuildSectionId;
+  /** The measured build column width, or 0 before the first measurement. See `stageChipShows`. */
+  columnWidth?: number;
 }) {
+  // "If it's empty, we shouldn't say empty" — the rule lives in the engine beside the override it
+  // comes from, because this same question is asked by more than one renderer (buildSections.ts).
+  if (stageChipIsSilent(stage, section)) return null;
+  // …and the chip is the first thing to go when the column gets tight.
+  if (!stageChipShows(columnWidth ?? 0)) return null;
   const meta = honestStageMeta(stage, section);
   return (
     <span
@@ -3726,6 +3812,11 @@ type AgentRowProps = {
   /** Does this pair hold the live cable? Opens the row's CONCIERGE end too, so a wired row reads as
    *  a length of cable seated in two sockets rather than one. */
   jointOpen: boolean;
+  /** The measured width of the build column, or 0 before the first measurement. Threaded rather
+   *  than measured per row: forty rows each holding their own ResizeObserver on the same element is
+   *  forty callbacks per resize frame for one number. Drives `stageChipShows`; 0 takes the WIDE
+   *  form so booting does not flicker the chip in on every row at once. Bead sparkle-tyter. */
+  columnWidth: number;
   onDragStartAgent: (id: string, section?: BuildSectionId) => void;
   onDragEndAgent: () => void;
   onDropAgent: (targetId: string, targetSection?: BuildSectionId) => void;
@@ -3819,6 +3910,11 @@ function agentRowPropsEqual(prev: AgentRowProps, next: AgentRowProps): boolean {
     // patched in, leaves every already-mounted row painting the old side's box.
     prev.paneSide === next.paneSide &&
     prev.jointOpen === next.jointOpen &&
+    // A THIRD GEOMETRY INPUT (bead sparkle-tyter). The stage chip is hidden below
+    // STAGE_CHIP_MIN_COLUMN_PX, so a row memoized across a resize would keep painting the chip at a
+    // width that no longer has room for it — the precise class of bug this comparator's own header
+    // warns about, where an omitted prop silently freezes the row on stale data.
+    prev.columnWidth === next.columnWidth &&
     prev.editing === next.editing &&
     workerDetailsEqual(prev.workers, next.workers)
   );
@@ -3869,6 +3965,32 @@ const GOAL_CHIP_ICON: Record<GoalChipState, IconType> = {
   met: FiCheckCircle,
   unmet: FiTarget,
 };
+/**
+ * The mark for each notice class. Bead sparkle-tyter.
+ *
+ * The founder named both of these himself — *"just show me the exclamation point icon or the the
+ * little mailbox icon"*. `escalated` is not a third class; it is `warning` at its loudest, split out
+ * because auto-continue GIVING UP on an agent (nothing is coming for it at all) has to be
+ * distinguishable at a glance from an agent that merely owes a merge.
+ *
+ * `inbox` is listed for completeness of the union, but the collapsed row never draws it: the message
+ * class stays with `AgentInboxBadge`, which already renders the mailbox with its count and owns the
+ * popover. See the note at `noticeMarksEl`.
+ */
+const NOTICE_GLYPH_ICON: Record<NoticeGlyph, IconType> = {
+  alert: FiAlertTriangle,
+  escalated: FiAlertOctagon,
+  inbox: FiInbox,
+  // The three GOAL glyphs, and the same components `GOAL_CHIP_ICON` above uses — one mapping per
+  // glyph name, so a state cannot wear one shape here and another there. The collapsed row does not
+  // draw a `goal`-class mark (the goal chip IS that mark, and it is clickable now), exactly as it
+  // does not draw the `message` class; these entries exist because the union is total and the map
+  // must cover it, and because the hover card renders from the same table.
+  target: FiTarget,
+  clock: FiClock,
+  check: FiCheckCircle,
+};
+
 const GOAL_CHIP_COLOR: Record<GoalChipState, string> = {
   escalated: DANGER,
   // Amber, not danger: the mandate ran out on unfinished work. Loud, but not the top of the row.
@@ -3925,6 +4047,7 @@ const AgentRow = memo(function AgentRow({
   dragActive,
   paneSide,
   jointOpen,
+  columnWidth,
   onDragStartAgent,
   onDragEndAgent,
   onDropAgent,
@@ -4524,6 +4647,100 @@ const AgentRow = memo(function AgentRow({
   // and is the right weight for a landing state that needs a human eventually. An ESCALATED goal
   // takes DANGER instead, because it is categorically different: auto-continue has given up and
   // handed the agent back, so nothing is coming for it at all.
+  // ══ THE NOTICE MARKS — A GLYPH, NEVER THE WORDS. Bead sparkle-tyter. ═══════════════════════════
+  //
+  // WHAT THIS REPLACES, and why it was not a styling nit. `stallChipEl` and `thrashChipEl` used to
+  // render the literal notice text ("Rate limited", "Looping", "PR unmerged") into this row. The
+  // thrash chip did it at `flex: "0 0 auto"` + `whiteSpace: "nowrap"` — an item that refuses to
+  // shrink — while `FittedAgentName` beside it was `flex: 1; minWidth: 0`, an item that gives up
+  // everything first. Flexbox did exactly that: at the real column width the NAME went to ZERO and
+  // disappeared, and the notice ended up flush against the stage chip after it. Eight rows of the
+  // founder's screenshot read `Rate limitedShipped` / `Rate limitedUnsaved` / `Looping Shipped`,
+  // with no agent name anywhere. Nothing painted over anything; there is no absolute positioning
+  // involved. A fleet list whose rows cannot identify their agents has stopped working.
+  //
+  // TWO THINGS FIX IT AND BOTH ARE KEPT. These marks are wordless, which BOUNDS the tail's width;
+  // and `FittedAgentName` now carries a hard `minWidth` floor, which is the structural half — it
+  // survives whatever chip the next branch adds here, where a bounded-width convention would not.
+  //
+  // ONE MARK PER CLASS, NOT PER VERDICT. `rowGlyphsFor` collapses ten warning verdicts into a single
+  // mark with a count. A glyph per verdict would rebuild, in icon form, the exact wall of signal the
+  // founder asked to be rid of ("I can't read all of these in line notices").
+  //
+  // THE MESSAGE CLASS IS NOT DRAWN HERE. `AgentInboxBadge` already renders the mailbox + count, owns
+  // its own popover, and is the one mark the founder singled out as already right — so the row
+  // passes NO `pendingInbox` into `agentNotices` and the badge keeps the class. The composer's pill
+  // row reads the full model including the inbox; this is the one surface that deliberately does not.
+  const noticeMarks = rowGlyphsFor(agentNotices({ thrash, stall }));
+  /**
+   * MOUNT THIS AGENT AND OPEN THE PILL THAT EXPLAINS `noticeId`. Bead sparkle-tyter, the founder's
+   * second scope addition.
+   *
+   * *"When I click on the blue target it doesn't do anything. I'm not seeing any sort of notice
+   * above the compose window when the concierge is mounted."* — and he chose this model when asked
+   * which it should be: clicking a row icon MOUNTS that agent and shows the pill, rather than
+   * explaining in place. So every clickable mark on the row runs exactly this, and the gesture is
+   * one thing rather than three copies of it drifting apart.
+   *
+   * `stopPropagation` because the row's own click selects and folds the subtree; this gesture means
+   * something more specific and must not also do that.
+   */
+  const openNoticePill = (noticeId: string) => {
+    onSelect();
+    useCableStore.getState().patch(paneSide);
+    useUiStore.getState().setFocusedNotice(paneSide, noticeId);
+  };
+  const noticeMarksEl = noticeMarks.map((mark) => {
+    const Glyph = NOTICE_GLYPH_ICON[mark.glyph];
+    return (
+      <span
+        key={mark.cls}
+        data-testid="row-notice-glyph"
+        data-notice-class={mark.cls}
+        data-notice-count={mark.count}
+        data-notice-lead={mark.leadNoticeId}
+        role="button"
+        tabIndex={0}
+        // THE HOVER IS THE NO-MOUNT READING PATH — the founder's fourth requirement, "hover or click
+        // the row icon reveals the same detail WITHOUT mounting, so a glance is still possible".
+        // Every label in the class, one per line.
+        title={`${mark.title}\n\nClick to open on the composer`}
+        aria-label={mark.ariaLabel}
+        onClick={(e) => {
+          e.stopPropagation();
+          openNoticePill(mark.leadNoticeId);
+        }}
+        onKeyDown={(e) => {
+          if (e.key !== "Enter" && e.key !== " ") return;
+          e.stopPropagation();
+          e.preventDefault();
+          openNoticePill(mark.leadNoticeId);
+        }}
+        style={{
+          display: "inline-flex",
+          alignItems: "center",
+          gap: 2,
+          // Never shrinks — but unlike the chip it replaces, it has nothing to shrink: an icon and
+          // at most a two-digit count. That is the difference between this and the bug.
+          flex: "0 0 auto",
+          lineHeight: 1.4,
+          fontSize: 10,
+          fontWeight: FONT_WEIGHT.semibold,
+          cursor: "pointer",
+          color: mark.glyph === "escalated" ? DANGER : C.amberInk,
+        }}
+      >
+        <Glyph size={10} style={{ flex: "0 0 auto" }} />
+        {/* The count only, and only when it says something a single glyph cannot. Digits are the
+            one "text" this mark may carry: bounded at two characters, so it cannot re-open the
+            collision the words caused. */}
+        {mark.count > 1 ? mark.count : null}
+      </span>
+    );
+  });
+
+  // RETAINED BUT NO LONGER RENDERED ON THE COLLAPSED ROW — the expanded CARD still uses it (see
+  // `stallChip &&` further down), where there is room for the sentence and no name to crowd out.
   const stallChipEl = stallChip ? (
     <span
       data-testid="row-stall"
@@ -4610,12 +4827,30 @@ const AgentRow = memo(function AgentRow({
       // by sniffing a colour.
       data-testid="row-goal"
       data-goal-state={goalBadge.state}
-      title={`Goal: ${goalBadge.text} — ${goalBadge.label}`}
-      // `role="img"`, because for `met`/`unmet` this span's ONLY content is the icon. An
-      // `aria-label` on a bare generic span is not reliably announced; on an `img` it is the
-      // element's accessible name by definition — which is the whole point on the two states that
-      // have no visible text to fall back on.
-      role="img"
+      // CLICKABLE NOW, and that is the founder's second scope addition rather than a flourish: the
+      // blue target and the red octagon were MARKS with no onClick, on the premise that their words
+      // stayed recoverable through this `title`, the `aria-label` below and the detail card. He is a
+      // sighted mouse user, went straight for a click, got silence, and could not recover the
+      // meaning at all — *"I really don't know what's going on"*. So the words get the route he
+      // actually took. Same gesture as every other mark: mount, and open the pill that explains it.
+      title={`Goal: ${goalBadge.text} — ${goalBadge.label} · click to explain it above the composer`}
+      onClick={(e) => {
+        e.stopPropagation();
+        openNoticePill(`goal:${goalBadge.state}`);
+      }}
+      onKeyDown={(e) => {
+        if (e.key !== "Enter" && e.key !== " ") return;
+        e.stopPropagation();
+        e.preventDefault();
+        openNoticePill(`goal:${goalBadge.state}`);
+      }}
+      tabIndex={0}
+      // `role="button"`, NOT `role="img"` as it was. The chip is operable now, and an operable
+      // control announced as an image is a control a keyboard or screen-reader user cannot find —
+      // the `aria-label` below is still its accessible name either way, so nothing is lost by
+      // naming it what it now is. (It was `img` because a bare generic span does not reliably
+      // announce an `aria-label`; `button` has the same property and is true.)
+      role="button"
       // The state, NAMED. Colour is not an accessible channel, and the `met`/`unmet` chips have no
       // visible text at all — without this a screen reader reaches an empty span on the two most
       // common rows in the fleet.
@@ -4941,9 +5176,29 @@ const AgentRow = memo(function AgentRow({
                 {/* The never-idle overlay leads the metadata chips: it is the one thing on a calm
                     row that changes what you do about it. See the chip definitions above. */}
                 {goalChipEl}
-                {stallChipEl}
-                {thrashChipEl}
-                {epicPill}
+                {/* ONE WORDLESS MARK PER NOTICE CLASS, replacing the stall and thrash chips that
+                    used to render their labels here and squeeze the name to zero (bead
+                    sparkle-tyter — see `noticeMarksEl`). The words live on the hover and in the
+                    pills above the composer.
+
+                    `epicPill` LEFT THIS ROW with them, at the founder's call ("move it to the hover
+                    card"): it is not a notice, it is a jump-to-Plan link, and — the part that
+                    matters for this bead — it is a TEXT pill up to 18ch wide, so it was the row's
+                    other real width consumer. It still renders on the expanded card, one hover away.
+
+                    `cloudChip` STAYED, and that is a deliberate departure from the same instruction.
+                    He asked for both to move; the cloud glyph turns out to be SPEC'd — Service B,
+                    §Creation UX, "Cloud rows get a small cloud glyph next to the name; no other
+                    visual difference" — and pinned by AgentSidebar.cloudGlyph.test.tsx. It is also
+                    the cheap one: a single 11px icon, only on cloud rows, carrying no text at all,
+                    so it cannot reproduce the collision this bead exists to fix. Removing a spec'd
+                    affordance to save 11px on a subset of rows was not what he was buying. Flagged
+                    back to him rather than done silently.
+
+                    That leaves the collapsed row at three icon slots (goal · warnings · mailbox),
+                    plus the rare cloud mark and one right-hand pill — the budget he asked for:
+                    "one, two, or maybe three max". */}
+                {noticeMarksEl}
                 {cloudChip}
               </div>
               {/* `.stg` — LAST before the close slot, exactly as the mock orders the row
@@ -4951,10 +5206,28 @@ const AgentRow = memo(function AgentRow({
                   against it rather than pushing it off the row. Collapsed only: the card already
                   renders the full WorkflowLine for this stage, and two readings of one fact in one
                   view is the thing the row was stripped down to avoid. */}
-              {/* FEEDBACK pill sits to the LEFT of the stage chip (the row's rightmost status pill),
-                  so the row reads dot · el · nm · [feedback] · stg · close. */}
-              {feedbackPill}
-              {trackerStage && <StageChip stage={trackerStage} active={isActive} section={rowSection} />}
+              {/* ONE PILL IN THIS SLOT, NEVER TWO. Bead sparkle-tyter, the founder verbatim:
+                  *"If an agent has provided feedback then it should say 'feedback' instead of
+                  'shift' or whatever. The feedback label should go where the PR or shift, etc.,
+                  label goes when there is feedback."* ("shift" is dictation for "Shipped".)
+
+                  They used to render side by side, which spent two pill-widths of the row's tail on
+                  a row that also had to fit a name. Feedback WINS when there is any: it is the
+                  actionable one (it opens this agent's feedback in Plan), while the stage chip is a
+                  status readout the section heading above the row already carries.
+
+                  The stage chip additionally goes silent on a narrow column and on the "nothing
+                  built yet" case — both inside StageChip, so every caller gets the same rule. */}
+              {feedbackPill ?? (
+                trackerStage && (
+                  <StageChip
+                    stage={trackerStage}
+                    active={isActive}
+                    section={rowSection}
+                    columnWidth={columnWidth}
+                  />
+                )
+              )}
             </div>
           )}
           {/* The agent's live first-person "what I'm building now" narration, self-reported via the

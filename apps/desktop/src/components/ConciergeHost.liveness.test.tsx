@@ -113,6 +113,7 @@ import {
   STALLED_AFTER_MS,
 } from "../engine/conciergeLiveness";
 import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
+import { __resetInboxForTests, __setInboxPeekForTests } from "../stores/inboxStore";
 import { MAX_QUEUED_TURNS } from "../engine/conciergeTurnQueue";
 import { waitingLine } from "../services/conciergeMessageStatuses";
 import type { ConciergeFeed } from "../useConciergeFeed";
@@ -155,14 +156,31 @@ function feed(): ConciergeFeed {
   } as unknown as ConciergeFeed;
 }
 
+/** Undo for the inbox peek stub installed below. */
+let restoreInboxPeek: (() => void) | null = null;
+
 beforeEach(() => {
   enableAiEnhancementsForTests();
   _resetConciergeLivenessForTests();
   h.proactiveIds = [];
+  // ══ STUB THE INBOX PROBE (bead sparkle-tyter) ══════════════════════════════════════════════
+  // The column now mounts `MountedAgentNotices`, which calls `useAgentInbox` — and `watch()` starts
+  // the inbox store's REAL poll: a `setTimeout(0)` into `refreshInbox()` and a repeating interval,
+  // both landing on `invoke("inbox_peek")` with no Tauri host behind it in jsdom. That is not a
+  // detail of this suite's subject: it left unresolved work in the queue while these rows advance
+  // timers, which is how two rows here went from passing to a 47s hang and an extra live-region
+  // write. The store publishes `__setInboxPeekForTests` for exactly this, so the probe is answered
+  // with "no inboxes" and the announcer rows measure the announcer again.
+  restoreInboxPeek = __setInboxPeekForTests(async () => []);
+  __resetInboxForTests();
 });
 
 afterEach(() => {
   cleanup();
+  restoreInboxPeek?.();
+  restoreInboxPeek = null;
+  // Drops the registration AND stops the poll — one test's watcher must not tick into the next.
+  __resetInboxForTests();
   // resetAllMocks, not clearAllMocks — see the main host suite. Both mocks the send path actually
   // depends on have to be put back, or the NEXT row silently loses its routing.
   vi.resetAllMocks();
@@ -640,7 +658,11 @@ describe("the queue is spoken, through the column's one announcer", () => {
    * ONE write, not two: the region is a single `{ seq, text }`, so a second write would say only the
    * second thing. Loss first, position after.
    */
-  it("says which question was lost when the queue overflows, and still says where the new one sits", async () => {
+  // 60s, not the 15s default: this row performs MAX_QUEUED_TURNS + 2 sequential `send()`s through
+  // the real host, each one a full render of the concierge column. It is legitimately the longest
+  // row in the file, and under the whole suite's parallelism it runs several times slower than it
+  // does alone — a timeout there reports as a failure of the queue logic, which it is not.
+  it("says which question was lost when the queue overflows, and still says where the new one sits", { timeout: 60_000 }, async () => {
     render(<ConciergeHost feed={feed()} />);
     // This one DISPATCHES, so it is the running turn and never a waiter — the cap is about the
     // queue behind it.
@@ -685,6 +707,16 @@ describe("the queue is spoken, through the column's one announcer", () => {
     await send("what needs me");
     await send("and is CI green");
 
+    // ══ MEASURE THE DRAIN, NOT THE WALL CLOCK ══════════════════════════════════════════════════
+    // The liveness engine is a SECOND legitimate writer to this one region: past SLOW_AFTER_MS it
+    // says "still working", past STALLED_AFTER_MS it says so again. Those are real behaviour, and
+    // on REAL time — so when the whole file runs alongside the rest of the suite and these two sends
+    // take longer than the thresholds, both land inside the window this row measures and the seq
+    // reads +3 instead of +1. That is not a second `announce()` in `drainQueue`, which is what this
+    // row exists to catch; it is an unrelated writer inside the measurement. Resetting the liveness
+    // clock immediately before `before` removes it from the window WITHOUT weakening the assertion:
+    // the seq check below is still exact, and the exact-text check still catches the fold variant.
+    act(() => _resetConciergeLivenessForTests());
     const before = announceSeq();
     act(() => h.brain.done?.({ id: "1", sessionId: "s1", text: "all calm" }));
     await flush();

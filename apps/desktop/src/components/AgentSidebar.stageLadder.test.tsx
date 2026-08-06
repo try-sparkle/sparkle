@@ -459,20 +459,34 @@ describe("the `local_none` rung is actually WIRED to the column (roborev 57842)"
     expect(screen.getByTestId("stage-header-local_uncommitted")).toBeTruthy();
   });
 
-  it("does not claim a `local_none` row has unsaved changes — the row's OWN chip", () => {
-    // The contradiction roborev 57842 found: the heading said "nothing here is at risk" while the
-    // row beneath it rendered the `building_unsaved` chip, whose tooltip reads "closing now loses
-    // this work". Assert the SIDE EFFECT (what the chip says), not merely that the header exists.
+  it("renders NO row chip at all for a `local_none` row — it must not say 'Empty'", () => {
+    // ══ THE RULE CHANGED, AND THIS IS THE STRONGER FORM OF IT (bead sparkle-tyter) ═══════════
+    // roborev 57842 found a contradiction — the heading said "nothing here is at risk" while the
+    // row beneath rendered the `building_unsaved` chip, whose tooltip reads "closing now loses this
+    // work" — and `honestStageMeta` fixed it by substituting the word "Empty". The founder's
+    // verdict on seeing that: *"If it's empty, we shouldn't say empty."* He is right: the chip costs
+    // the same row width whatever it says, and the SECTION HEADING above the row already carries
+    // the fact. So the row chip is now silent for this case entirely.
+    //
+    // This is strictly stronger than the assertion it replaces — an absent chip cannot contradict
+    // the heading — and the honesty rule it came from is still covered, by the two card tests
+    // below (the expanded card DOES still render "Nothing Built Yet" with its detail sentence,
+    // which is the surface with room for it).
     const project = seed([mkAgent("a1", "Cleanly")]);
     setStages({ a1: "building_unsaved" });
     setStatuses({ a1: "idle" });
     useRuntimeStore.setState({ branchStatus: { a1: bs(false) } } as never);
     render(<AgentSidebar project={project} />);
 
-    const chip = screen.getByTestId("row-stage-chip");
-    expect(chip.getAttribute("title")).not.toMatch(/loses this work/);
-    expect(chip.getAttribute("title")).toMatch(/nothing here is at risk/);
-    expect(chip.textContent).not.toBe("Unsaved");
+    expect(screen.queryByTestId("row-stage-chip")).toBeNull();
+    // …and the word itself appears nowhere on the row. `[data-hint="agent"]` is the row's REAL
+    // attribute (roborev 58758): this read `[data-agent-row]`, which exists nowhere in the source,
+    // so `closest()` returned null, `?? ""` swallowed it, and the check passed against the empty
+    // string no matter what the row said. Non-null asserted first, so a renamed row fails here
+    // instead of silently satisfying the assertion.
+    const row = screen.getByText("Cleanly").closest('[data-hint="agent"]');
+    expect(row, "the agent row must be findable for this assertion to mean anything").not.toBeNull();
+    expect(row!.textContent).not.toContain("Empty");
   });
 
   it("the expanded CARD receives the section — the wiring, not just the rule", () => {

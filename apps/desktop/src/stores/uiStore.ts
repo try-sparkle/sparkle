@@ -68,6 +68,11 @@ const TRANSIENT_UI_KEYS = [
   "buildAgentHover",
   "boardFocusBeadId",
   "boardAgentFilterBySide",
+  // Which notice pill the mounted composer should open (bead sparkle-tyter). A statement about the
+  // mark the user just clicked, and it is CONSUMED on the next render — restoring one on the next
+  // launch would pop a pill open about a condition that may no longer hold, on an agent they have
+  // not looked at. The ratchet test caught this key reaching the blob, which is exactly its job.
+  "focusedNoticeBySide",
   // A restored filter would show a board that looks EMPTY with no visible cause — the control that
   // narrowed it is off screen and the user never touched it this session. Same reasoning as
   // boardAgentFilterBySide directly above.
@@ -324,6 +329,24 @@ interface UiState {
   // renders empty under "Showing feedback from agent <id>" with no visible cause in that column.
   boardAgentFilterBySide: Record<PairSide, string | null>;
   setBoardAgentFilter: (side: PairSide, id: string | null) => void;
+  // WHICH NOTICE PILL the mounted composer should open, as an `AgentNotice.id`. Bead sparkle-tyter.
+  //
+  // The founder's worked example: *"If I were to click on the mailbox icon on the row then the
+  // mailbox could expand on the mounted concierge and then could show me the actual queued
+  // messages."* A row mark's click therefore does three things — select the agent, patch the cable,
+  // and name the pill to open — and this is the third. Without it the click could only say
+  // "something in this class" and the pill row would have to guess which one he meant.
+  //
+  // KEYED BY SIDE, like `boardAgentFilterBySide` directly above and for the identical reason: both
+  // pairs can be mounted at once, and a global string would have a LEFT row's click expand a pill in
+  // the RIGHT column's composer.
+  //
+  // NOT PERSISTED. A focused notice is a statement about what the user just clicked; restoring it
+  // across a relaunch would pop a pill open about a condition that may no longer hold, on an agent
+  // they have not looked at. The consumer CLEARS it once consumed, so a later manual collapse sticks
+  // rather than being re-opened on the next render.
+  focusedNoticeBySide: Record<PairSide, string | null>;
+  setFocusedNotice: (side: PairSide, noticeId: string | null) => void;
   // The board's PRIORITY + DATE-RANGE filter (founder: "I want to be able to only look at cards of
   // a certain priority status and also a certain date range").
   //
@@ -676,6 +699,13 @@ export const useUiStore = create<UiState>()(
           st.boardAgentFilterBySide[side] === id
             ? {}
             : { boardAgentFilterBySide: { ...st.boardAgentFilterBySide, [side]: id } },
+        ),
+      focusedNoticeBySide: { left: null, right: null },
+      setFocusedNotice: (side, noticeId) =>
+        set((st) =>
+          st.focusedNoticeBySide[side] === noticeId
+            ? {}
+            : { focusedNoticeBySide: { ...st.focusedNoticeBySide, [side]: noticeId } },
         ),
       boardFilterBySide: { left: NO_BOARD_FILTER, right: NO_BOARD_FILTER },
       // Identity-stable when nothing actually changed, matching setBoardAgentFilter above: the

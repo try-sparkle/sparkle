@@ -31,6 +31,7 @@ import { useConciergeAiLock } from "./conciergeAiLock";
 import { ConciergeThread } from "./ConciergeThread";
 import { MountedAgentThread } from "./MountedAgentThread";
 import { MountedNotice } from "./MountedNotice";
+import { MountedAgentNotices } from "./MountedAgentNotices";
 import { ConciergeTopRight } from "./KebabMenu";
 import { WindowSpanButton } from "./WindowSpanButton";
 import { AgentPillProvider, type AgentPillContextValue } from "./AgentPill";
@@ -739,6 +740,32 @@ export function ConciergeColumn({
           here as well would be a second place for "are we mounted" to be decided — the divergence
           that put the composer in the terminal's face while the send path refused to route. */}
       {!aiLock && <MountedNotice notice={mountedNotice} />}
+      {/* THE MOUNTED AGENT'S NOTICES, AS PILLS — bead sparkle-tyter, and the founder's second ask
+          for it: *"when I click on the agent to mount the concierge, I get pills on top of the
+          composed window that tell me any notices or warnings."*
+
+          THIS ROW IS WHERE THE WORDS WENT. The sidebar row now renders one wordless glyph per notice
+          class, because rendering the labels there squeezed the agent's NAME to zero width — eight
+          rows on his screenshot had no name at all. Moving them off the row is only honest if they
+          land somewhere with room, and this is that place.
+
+          SAME THREE GATES AS ITS NEIGHBOURS, for the reasons spelled out at 650-680 rather than
+          re-derived here. `!aiLock` because `aiLock && isWired` is REACHABLE and there is NO COMPOSER
+          AT ALL in that state, so pills claiming to sit "above the composer" would be pointing at
+          something that is not on screen. `isWired` because a pill row about the mounted agent must
+          not outlive the cable. `mountedAgent` because that is where the id comes from.
+
+          OUTSIDE THE MOUNT SWAP, like `countdownSlot` and `MountedNotice` above and the unmount hint
+          below — which is what makes it visible in the one state the feature exists for.
+
+          THE SIDE COMES FROM `wired` ITSELF, not from a new prop. `wired` IS the PairSide holding
+          the cable ("off" | "left" | "right"), and the row mark that seeds `focusedNoticeBySide`
+          patched the cable to that same side — so reading it here is reading the one value, rather
+          than adding a second place for "which side am I" to be decided. The `isWired` gate above
+          has already excluded "off", which is what makes the narrowing sound. */}
+      {!aiLock && isWired && mountedAgent && (
+        <MountedAgentNotices agentId={mountedAgent.agentId} side={wired} />
+      )}
       {/* THE WAY OUT OF THE MOUNT. Mounted, the human's typing goes to a build agent's terminal
           rather than to the concierge — a big change in where their words land, and Escape is the
           only gesture that undoes it. So the affordance is ON SCREEN while the state is live rather
