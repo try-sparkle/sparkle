@@ -42,6 +42,7 @@ import type { CSSProperties, KeyboardEvent } from "react";
 import { FiBellOff, FiX } from "react-icons/fi";
 import { C, CHAT_USER_BUBBLE, FONT_WEIGHT } from "../../theme/colors";
 import { AgentPill } from "./AgentPill";
+import { RADIUS } from "../../theme/scale";
 import type { ConciergeNudge } from "./types";
 
 /** The card's accent — brand sienna, for every nudge.
@@ -109,7 +110,8 @@ const control: CSSProperties = {
   width: 20,
   height: 20,
   padding: 0,
-  borderRadius: 4,
+  // The same token the labelled action beside it now uses — this was already 4, just re-typed.
+  borderRadius: RADIUS.input,
   border: "none",
   background: "transparent",
   color: C.conciergeMuted,
@@ -233,7 +235,17 @@ export function NudgeCard({
           style={{
             fontSize: 12,
             fontWeight: FONT_WEIGHT.bold,
-            borderRadius: 999,
+            // A DRAWN BOX, NOT A CAPSULE. This was `999` — a full stadium pill, which the founder
+            // called out by name off the BLOCKED card: "I don't like these rounded buttons … like
+            // the roundedness of the Push to Talk button for example." That button is
+            // `SendModeTray`'s mode pill, and it rounds at `RADIUS.input` — so this is the SAME
+            // token rather than a number re-typed to look like it, and the two cannot drift apart
+            // (`buttonRadius.test.tsx` reads both off the rendered DOM and compares them).
+            //
+            // It is also what the scale already said: `RADIUS.input` is documented as "inputs,
+            // BUTTONS, cards — the workhorse", and the mute/dismiss controls on this very card were
+            // already 4. The Approve button was the odd one out on its own line.
+            borderRadius: RADIUS.input,
             padding: "3px 10px",
             cursor: "pointer",
             flex: "0 0 auto",

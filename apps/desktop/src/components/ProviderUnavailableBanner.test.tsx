@@ -4,21 +4,32 @@
 // that is OURS. These cover the render branches plus the three things the copy must never do, which
 // are the whole point of the component: offer a Refill (the user's balance is fine), blame their
 // network, or render nothing at all while AI is dead.
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ProviderUnavailableBanner, PROVIDER_UNAVAILABLE_BAR_TESTID } from "./ProviderUnavailableBanner";
 import { OUTAGE_MAX_AGE_MS, useAiProviderStore } from "../stores/aiProviderStore";
-import { getUsage } from "../services/accountStore";
+import { loadAccountState } from "../services/accountSelection";
 
-// The usage-limit branch consults the accounts' LIVE exhaustion flags (see the component). Mocked
+// The usage-limit branch reads the accounts' LIVE exhaustion flags through the shared seam. Mocked
 // so a test can state what the accounts currently say without a Tauri backend.
-vi.mock("../services/accountStore", () => ({ getUsage: vi.fn(async () => []) }));
-const getUsageMock = vi.mocked(getUsage);
+vi.mock("../services/accountSelection", () => ({ loadAccountState: vi.fn() }));
+const loadStateMock = vi.mocked(loadAccountState);
+const MINE = "mine";
+
+/** One settled read of account state, so a test can await exactly what the component awaited. */
+function stateWith(exhaustedUntil: number | null) {
+  return {
+    accounts: [{ id: MINE, isDefault: true }],
+    usage: [{ id: MINE, tokens5h: 0, tokens7d: 0, exhaustedUntil }],
+    identities: [],
+    failed: false,
+  } as never;
+}
 
 beforeEach(() => {
   useAiProviderStore.setState({ outage: null });
-  getUsageMock.mockReset();
-  getUsageMock.mockResolvedValue([]);
+  loadStateMock.mockReset();
+  loadStateMock.mockResolvedValue(stateWith(null));
 });
 afterEach(cleanup);
 
@@ -141,55 +152,60 @@ describe("the bar's layout shape at a narrow window", () => {
 
 // ── THE STALE-BANNER REGRESSION (bead drodio-website-229f.4) ──────────────────────────────────────
 // The founder watched this banner assert "Sparkle's AI features are paused" while his whole fleet
-// ran tool calls. It could not clear itself: the observation is latched, and its only clear path is
-// one of Sparkle's OWN AI calls later succeeding — which agent turns never are.
-describe("the usage-limit banner tracks the account's CURRENT state", () => {
-  const account = (exhaustedUntil: number | null) => ({
-    id: "acct",
-    tokens5h: 0,
-    tokens7d: 0,
-    exhaustedUntil,
-  });
-
-  it("clears itself when the account is no longer limited, with no user action", async () => {
-    // A latched observation says "limited". The ACCOUNT says otherwise. Nothing else happens — no
-    // successful AI call, no reload, no dismissal. The banner must go.
-    useAiProviderStore.setState({ outage: { reason: "usage_limit", at: Date.now() } });
-    getUsageMock.mockResolvedValue([account(null)]);
-
-    const { container } = render(<ProviderUnavailableBanner />);
-    await waitFor(() => expect(container.innerHTML).toBe(""));
-  });
-
-  it("clears itself once the reset instant has passed", async () => {
-    useAiProviderStore.setState({ outage: { reason: "usage_limit", at: Date.now() } });
-    getUsageMock.mockResolvedValue([account(Date.now() - 1)]);
-
-    const { container } = render(<ProviderUnavailableBanner />);
-    await waitFor(() => expect(container.innerHTML).toBe(""));
-  });
-
-  it("keeps showing a limit that is genuinely live, and names when it resets", async () => {
-    // The other direction matters just as much: this must not become a banner that never appears.
+// ran tool calls. The observation is latched and its only clear path is one of Sparkle's OWN AI
+// calls later succeeding — which agent turns never are.
+describe("the usage-limit banner reads live account state", () => {
+  it("names when the limit resets, and says agents keep running", async () => {
     const until = Date.now() + 45 * 60_000;
     useAiProviderStore.setState({ outage: { reason: "usage_limit", at: Date.now() } });
-    getUsageMock.mockResolvedValue([account(until)]);
+    loadStateMock.mockResolvedValue(stateWith(until));
 
     render(<ProviderUnavailableBanner />);
     await waitFor(() => {
       const text = screen.getByRole("status").textContent ?? "";
       // A real clock time, so the claim is checkable rather than the unfalsifiable "when it resets".
       expect(text).toMatch(/paused until \d/);
-      // And it must stop implying the agent fleet is stopped, which is what caused the confusion.
+      // And it must stop implying the agent fleet is stopped, which caused the original confusion.
       expect(text).toContain("agents keep running");
     });
   });
 
+  it("outlives the store's 10-minute expiry while the limit is verifiably still live", async () => {
+    // OUTAGE_MAX_AGE_MS was the right bound on an UNVERIFIABLE claim. Reset instants are
+    // minutes-to-hours out, so applying it to a verified limit would name a reset 45 minutes away
+    // and vanish 10 minutes later — the "banner is lying" complaint, inverted.
+    const until = Date.now() + 45 * 60_000;
+    useAiProviderStore.setState({
+      outage: { reason: "usage_limit", at: Date.now() - OUTAGE_MAX_AGE_MS - 1 },
+    });
+    loadStateMock.mockResolvedValue(stateWith(until));
+
+    render(<ProviderUnavailableBanner />);
+    await waitFor(() => expect(screen.getByRole("status").textContent ?? "").toMatch(/paused until/));
+  });
+
+  // ── NEVER SUPPRESS (knightwatch 5198911473#1 + #2) ──────────────────────────────────────────
+  it("keeps the banner when the accounts show no bench, because that is not evidence of health", async () => {
+    // A one-shot runs with --no-session-persistence and writes no transcript, so limit-sync can
+    // never bench for its limit. Reading "no bench" as "not limited" would hide a real one.
+    //
+    // Awaits the recorded read INSIDE act before asserting, so this cannot pass on the initial
+    // pre-read render — which is what made the earlier version of this test vacuous.
+    useAiProviderStore.setState({ outage: { reason: "usage_limit", at: Date.now() } });
+    loadStateMock.mockResolvedValue(stateWith(null));
+
+    render(<ProviderUnavailableBanner />);
+    await act(async () => {
+      await Promise.all(loadStateMock.mock.results.map((r) => r.value));
+    });
+    expect(loadStateMock).toHaveBeenCalled();
+    expect(screen.getByRole("status")).toBeTruthy();
+  });
+
   it("does not consult the accounts for a reason that has no account-level truth", async () => {
-    // `cli_missing` is about the local install; polling accounts for it would be noise.
     useAiProviderStore.setState({ outage: { reason: "cli_missing", at: Date.now() } });
     render(<ProviderUnavailableBanner />);
     await waitFor(() => expect(screen.getByRole("status")).toBeTruthy());
-    expect(getUsageMock).not.toHaveBeenCalled();
+    expect(loadStateMock).not.toHaveBeenCalled();
   });
 });

@@ -15,8 +15,8 @@ import {
   useAiProviderStore,
   type AiProviderOutageReason,
 } from "../stores/aiProviderStore";
-import { currentUsageLimit, USAGE_LIMIT_RECHECK_MS } from "../engine/usageLimit";
-import { getUsage, type Usage } from "../services/accountStore";
+import { currentUsageLimit, oneshotAccountId, USAGE_LIMIT_RECHECK_MS } from "../engine/usageLimit";
+import { loadAccountState, type AccountState } from "../services/accountSelection";
 
 /** The full-width bar's hook, so a real-layout test can measure the element the user sees. */
 export const PROVIDER_UNAVAILABLE_BAR_TESTID = "provider-unavailable-bar";
@@ -176,21 +176,20 @@ export function ProviderUnavailableBanner({ inline = false }: { inline?: boolean
   // The OTHER two reasons are genuinely local to the CLI install (missing, signed out) and have no
   // account-level truth to consult, so they keep the observed-and-expiring behaviour unchanged.
   const claimsUsageLimit = outage?.reason === "usage_limit";
-  const [usage, setUsage] = useState<Usage[] | null>(null);
+  const [live, setLive] = useState<AccountState | null>(null);
   useEffect(() => {
     if (!claimsUsageLimit) {
-      setUsage(null);
+      setLive(null);
       return;
     }
     let alive = true;
+    // The established seam (services/accountSelection), not a second loader: it already owns the
+    // short TTL cache, in-flight de-duplication and the degrade-to-empty failure contract
+    // (knightwatch 5198911473#3).
     const check = () => {
-      getUsage()
-        .then((u) => {
-          if (alive) setUsage(u);
-        })
-        // A failed read is NOT evidence the limit lifted, so leave the previous answer standing and
-        // try again next tick. The store's own expiry still bounds how long a stale claim can last.
-        .catch(() => {});
+      loadAccountState().then((state) => {
+        if (alive) setLive(state);
+      });
     };
     check();
     const id = window.setInterval(check, USAGE_LIMIT_RECHECK_MS);
@@ -200,15 +199,23 @@ export function ProviderUnavailableBanner({ inline = false }: { inline?: boolean
     };
   }, [claimsUsageLimit]);
 
+  // ENRICH ONLY — never suppress (knightwatch 5198911473#1). A one-shot's limit writes no
+  // transcript, so limit-sync can never bench for it; "no bench" is therefore not evidence of
+  // health, and a derived clear would hide a real limit. Positive evidence still earns its keep: it
+  // carries the reset instant, and it outranks the store's generic 10-minute expiry, which was the
+  // right bound on an UNVERIFIABLE claim but would otherwise hide a limit we can see is still live.
+  const seen =
+    claimsUsageLimit && live !== null
+      ? currentUsageLimit(live.usage, oneshotAccountId(live.accounts), now)
+      : null;
+  if (seen) return renderBar(usageLimitSentence(seen.until), inline);
+
   if (!isOutageActive(outage, now)) return null;
+  return renderBar(WARNING[outage.reason], inline);
+}
 
-  // Derived state WINS over the latched observation once we have read the accounts. Before the
-  // first read `usage` is null and the observed claim stands, so a real limit is never hidden by a
-  // slow fetch.
-  const live = claimsUsageLimit && usage !== null ? currentUsageLimit(usage, now) : null;
-  if (claimsUsageLimit && usage !== null && live === null) return null;
-
-  const warning = live ? usageLimitSentence(live.until) : WARNING[outage.reason];
+/** The two render shapes, factored out so every early return above can reach both. */
+function renderBar(warning: string, inline: boolean) {
 
   if (inline) {
     return (

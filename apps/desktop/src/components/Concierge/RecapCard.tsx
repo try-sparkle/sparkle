@@ -36,6 +36,7 @@ import { useState, type CSSProperties } from "react";
 import { FiChevronDown, FiChevronRight } from "react-icons/fi";
 import { C, CARD_WASH_PCT, FONT_WEIGHT } from "../../theme/colors";
 import { AgentPill } from "./AgentPill";
+import { DESC_MAX_H } from "./BeadPill";
 import {
   isActionableChange,
   recapSummary,
@@ -495,6 +496,26 @@ function ChangeRow({
   );
 }
 
+/** Does this recap owe the reader anything? Drives the disclosure's STARTING state.
+ *
+ *  ══ THE FOUNDER'S STANDING RULE OUTRANKS THE NEW DEFAULT ═════════════════════════════════════
+ *  "We should never hide a row that needs action from me." A collapsed card hides every row behind
+ *  a click, which is exactly what that rule forbids — so the collapse is allowed only on a recap
+ *  where nothing asks. This is the reconciliation of two founder instructions that genuinely
+ *  conflict: the new one ("collapse it to one line, click to expand") and the standing one, which
+ *  the header of this file records verbatim and which was written after a real card ate a row that
+ *  needed him.
+ *
+ *  `isActionableChange` owns the test — this file must not re-decide it by reading the rendered
+ *  label, which is prose and gets reworded. WANTS YOU is actionable by construction (that is what
+ *  the section IS), so it counts whole; FINISHED is mixed and gets the predicate.
+ *
+ *  DECISIONS DO NOT COUNT. "What I did" is a record of what already happened — the one section
+ *  whose rows ask nothing — so a recap carrying only decisions may collapse. */
+function wantsSomething(recap: ConciergeRecapMessage): boolean {
+  return recap.needsYou.length > 0 || recap.finished.some(isActionableChange);
+}
+
 export function RecapCard({
   recap,
   onRevealAgent,
@@ -502,6 +523,11 @@ export function RecapCard({
   recap: ConciergeRecapMessage;
   onRevealAgent?: (agentId: string) => void;
 }) {
+  // Mount-time only, and that is deliberate: a recap message is keyed by its id in the thread, so
+  // each one is its own instance. Re-deriving this on every render would slam the card shut under a
+  // reader who had opened it, the moment an agent's status ticked over to settled.
+  const [expanded, setExpanded] = useState(() => wantsSomething(recap));
+  const Chevron = expanded ? FiChevronDown : FiChevronRight;
   return (
     <div
       data-testid="concierge-recap"
@@ -552,55 +578,132 @@ export function RecapCard({
         // That is strictly worse than the "+11 more" this bead exists to fix: it hides every
         // actionable row with no disclosure at all. Never set overflow here without this.
         flexShrink: 0,
-        // A MAX, so a short card is untouched and no scrollbar appears until there is something to
-        // scroll.
+        // ── THE SCROLL EXISTS ONLY IN THE EXPANDED STATE (bead `sparkle-o37mn`) ────────────────
+        // This used to be an unconditional `maxHeight: 50vh` + `overflowY: auto`. The founder saw
+        // the result and rejected the shape itself: "the scrolling inside the small one line tall
+        // box doesn't work … it needs to be a message that can be clicked to expand versus
+        // scrolling in one line."
         //
-        // THE FRACTION IS OF THE VIEWPORT, NOT OF THE THREAD, and that distinction is stated rather
-        // than glossed (roborev 59167). The thread scroller is `flex: 1` inside a column that also
-        // carries the header, the voice strip, the search row and the compose box, so its visible
-        // height is well under `100vh` — a viewport fraction therefore bounds this card less
-        // tightly than the same fraction of the transcript would. Half the WINDOW is the claim
-        // being made, and it is deliberately conservative for that reason: it guarantees the card
-        // can never take more than half the app, without this component having to measure a box it
-        // does not own. Bounding against the scroller itself (`container-type` there + `cqh` here)
-        // is the tighter answer and belongs with a change to ConciergeThread, not to this file.
-        maxHeight: "50vh",
-        overflowY: "auto",
-        // EXPLICIT, because `overflow-y` alone does not leave the other axis alone: per CSS
-        // Overflow, when one axis is not `visible` the other computes from `visible` to `auto`. So
-        // this card would silently have become a HORIZONTAL scroll container too — on the exact
-        // surface where a horizontal-overflow defect was already found and fixed (`overflowWrap:
-        // "anywhere"` above, roborev 58700). Any residual overflow from the nowrap cells at a
-        // narrow width would then paint a horizontal scrollbar inside the card instead of being
-        // handled by the wrap rule. `hidden` rather than `clip`: this box is already a scroll
-        // container on the y axis, so `clip`'s one advantage — not becoming one — is unavailable.
-        overflowX: "hidden",
+        // Collapsed, the card renders ONE LINE and therefore needs no overflow of any kind — the
+        // summary clips itself (see `summaryLine`). Setting overflow here anyway would be actively
+        // wrong, and not only redundant: per CSS Overflow, a non-`visible` value on ONE axis makes
+        // the other compute to `auto`, so an `overflowX: hidden` kept for narrow widths would
+        // quietly make the collapsed card a vertical scroll container — reintroducing the very
+        // "scrollbar inside a one-line box" this bead is about.
+        //
+        // Expanded, the height is the BEAD CARD's, at the founder's instruction ("whatever we're
+        // using for the beads expand sizes"). `DESC_MAX_H` rather than a viewport fraction: the
+        // reader is comparing this to the bead card one scroll away in the same column, so the two
+        // must be one decision. It is also a much tighter bound than `50vh` was, which is the
+        // point — a fixed number of rows is what he asked to see.
+        ...(expanded
+          ? {
+              maxHeight: DESC_MAX_H,
+              overflowY: "auto" as const,
+              // EXPLICIT, because `overflow-y` alone does not leave the other axis alone: per CSS
+              // Overflow, when one axis is not `visible` the other computes from `visible` to
+              // `auto`. So this card would silently have become a HORIZONTAL scroll container too
+              // — on the exact surface where a horizontal-overflow defect was already found and
+              // fixed (`overflowWrap: "anywhere"` above, roborev 58700). Any residual overflow
+              // from the nowrap cells at a narrow width would then paint a horizontal scrollbar
+              // inside the card instead of being handled by the wrap rule. `hidden` rather than
+              // `clip`: this box is already a scroll container on the y axis, so `clip`'s one
+              // advantage — not becoming one — is unavailable.
+              overflowX: "hidden" as const,
+            }
+          : {}),
         background: `color-mix(in srgb, ${accent} ${CARD_WASH_PCT}%, transparent)`,
         border: `1px solid color-mix(in srgb, ${accent} 32%, transparent)`,
         borderRadius: 6,
         padding: "12px 13px",
       }}
     >
-      <div style={{ fontSize: 13, fontWeight: FONT_WEIGHT.semibold, color: C.cream }}>
-        {recapSummary(recap)}
-      </div>
+      {/* ── THE SUMMARY IS THE DISCLOSURE TRIGGER ────────────────────────────────────────────────
+          A BUTTON, not a heading with a button beside it: the founder's ask was that the box read
+          as openable, and the whole first line being the target is what makes that legible (and
+          gives a comfortably large hit area). Same `<button>`-reset shape as `MoreLine` above —
+          including its `alignItems` override, since a button defaults to `center` and would sit
+          the chevron off the text it labels.
 
-      <ChangeSection
-        label="Wants you"
-        changes={recap.needsYou}
-        section="needsYou"
-        onRevealAgent={onRevealAgent}
-      />
-      <ChangeSection
-        label="Finished"
-        changes={recap.finished}
-        section="finished"
-        onRevealAgent={onRevealAgent}
-      />
+          `aria-expanded` is honest here for the same reason it is on `MoreLine`: this genuinely
+          toggles both ways, so advertising it as expandable promises nothing it cannot do. */}
+      <button
+        type="button"
+        data-testid="recap-disclosure"
+        onClick={() => setExpanded((v) => !v)}
+        aria-expanded={expanded}
+        style={{
+          display: "flex",
+          alignItems: "baseline",
+          gap: 6,
+          width: "100%",
+          border: "none",
+          background: "transparent",
+          padding: 0,
+          font: "inherit",
+          fontSize: 13,
+          fontWeight: FONT_WEIGHT.semibold,
+          color: C.cream,
+          cursor: "pointer",
+          textAlign: "left",
+        }}
+      >
+        {/* ON THE LEFT, which the founder named ("maybe there's a little expand arrow on the left
+            side or something that helps the user understand that it's an expandable box"). An ICON
+            rather than a glyph typed into the string — this repo bans emoji-as-icons and uses
+            react-icons/fi (Feather) for exactly this. `flex: none` so the narrow-column reflow can
+            never shrink the one part that says "this opens". */}
+        <Chevron size={12} aria-hidden style={{ flex: "none", alignSelf: "center" }} />
+        <span data-testid="recap-summary" style={summaryLine(expanded)}>
+          {recapSummary(recap)}
+        </span>
+      </button>
 
-      <DecisionSection decisions={recap.decisions} onRevealAgent={onRevealAgent} />
+      {/* Collapsed renders NO rows at all, rather than rows inside a clipped box. The distinction
+          is the bug: a clipped box still lays its rows out, which is how the card ended up with an
+          unusable scrollbar over content the reader could not reach. */}
+      {expanded && (
+        <>
+          <ChangeSection
+            label="Wants you"
+            changes={recap.needsYou}
+            section="needsYou"
+            onRevealAgent={onRevealAgent}
+          />
+          <ChangeSection
+            label="Finished"
+            changes={recap.finished}
+            section="finished"
+            onRevealAgent={onRevealAgent}
+          />
+
+          <DecisionSection decisions={recap.decisions} onRevealAgent={onRevealAgent} />
+        </>
+      )}
     </div>
   );
+}
+
+/** The summary's own clipping, which is what produces the founder's `…`.
+ *
+ *  COLLAPSED IT IS A SINGLE LINE. `nowrap` + `overflow: hidden` + `textOverflow: ellipsis` is the
+ *  three-part idiom — all three are required, and `minWidth: 0` is the fourth thing nobody
+ *  remembers: this span is a flex item, and a flex item's `min-width: auto` floor is its
+ *  min-content size, which for nowrap text is the WHOLE string. Without it the span simply grows
+ *  past the button and no ellipsis ever appears.
+ *
+ *  EXPANDED IT MUST STOP CLIPPING, and that is not automatic — a summary left `nowrap` would
+ *  ellipsize inside an open card, which reads as a rendering fault rather than a design. `normal`
+ *  restores the card's inherited `overflowWrap: "anywhere"` behaviour for the long-word case. */
+function summaryLine(expanded: boolean): CSSProperties {
+  return expanded
+    ? { whiteSpace: "normal", minWidth: 0 }
+    : {
+        whiteSpace: "nowrap",
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        minWidth: 0,
+      };
 }
 
 /** "What I did" — the concierge's own actions, and the one section whose rows ask NOTHING of the

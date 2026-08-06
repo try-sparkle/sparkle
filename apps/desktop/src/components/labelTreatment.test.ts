@@ -138,7 +138,14 @@ describe("nothing in the tree reaches for a capsule where the spec draws a box",
   // work that is in flight. `PILL` stays legal in scale.ts for the shapes that genuinely need it —
   // a status DOT is a circle, which is not a radius decision — so this counts the LITERAL, which is
   // always someone reaching past the scale rather than naming the shape.
-  const MAX_LITERAL_999 = 8;
+  // 8 -> 5, LOWERED with the cleanup that produced it, because a ceiling left above the real count
+  // is slack rather than a gate: the three free slots would have let the very defect just fixed
+  // (`NudgeCard` / `ApprovalPrompt`'s action buttons drawn as stadium pills) reappear in a third
+  // component silently — and `Concierge/buttonRadius.test.tsx` only renders those two, so nothing
+  // else would have caught it. The five that remain are AgentSidebar's close affordance,
+  // ConciergeColumn's credit backdrop and PresenceSlider's three slider parts; each is recorded as
+  // deliberate in that test's header. A ratchet only ratchets if it is re-tightened when it can be.
+  const MAX_LITERAL_999 = 5;
 
   // The SAME shape, for the same reason, over the same tree. The first cut of the tracking guard
   // iterated only the eleven files it had just cleaned, so it passed VACUOUSLY — it could fire only

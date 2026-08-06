@@ -18,6 +18,7 @@ import { detectClaudeCodePicker, detectResumePrompt } from "./heuristics";
 import {
   toApprovalMap,
   asResumeRule,
+  resumeRuleComplaint,
   type ApprovalCategory,
   type ApprovalRule,
   type ResumeRule,
@@ -152,6 +153,11 @@ export function useSyncProjectApprovals(root: string | null): void {
           if (cancelled) return;
           useApprovalsStore.getState().setForRoot(root, toApprovalMap(eff.config.approvals));
           // The resume sibling rides the same config pull (it lives in the same [approvals] table).
+          // A value this key does not accept is silently narrowed to "ask" below, which is the exact
+          // opposite of what the user asked for. Say so — this is the only place the raw config value
+          // and a logger are both in scope.
+          const complaint = resumeRuleComplaint(eff.config.approvals?.resume);
+          if (complaint) log.warn("approvals", complaint, { root });
           useApprovalsStore.getState().setResumeForRoot(root, asResumeRule(eff.config.approvals?.resume));
         })
         .catch((e) => log.debug("approvals", "getConfig failed", { root, e: String(e) }));

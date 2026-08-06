@@ -21,7 +21,7 @@
 // none of them was already true. The real-layout half — that nothing actually overflows and no row
 // grows past two lines — is measured in a real browser by
 // `scripts/visual/recap-narrow-probe.mjs`, which is the only place it can be measured at all.
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import { RecapCard } from "./RecapCard";
 import { AgentPillProvider } from "./AgentPill";
@@ -112,7 +112,15 @@ const withDecisionRow = (): ConciergeRecapMessage =>
     ],
   });
 
-/** Render the card into a container pinned to a concierge width, the way the column mounts it. */
+/** Render the card into a container pinned to a concierge width, the way the column mounts it —
+ *  and OPEN IT, because every assertion in this file is about how a ROW lays out.
+ *
+ *  The card is a disclosure since bead `sparkle-o37mn`, and a recap with nothing actionable in it
+ *  starts collapsed, rendering no rows at all. That is a real behaviour with its own coverage in
+ *  `RecapCard.expand.test.tsx`; here it would merely mean these tests assert against an empty card.
+ *  Expanding unconditionally keeps each assertion pointed at exactly what it was written to check —
+ *  it does not weaken any of them, because a collapsed card fails them by ABSENCE (the query throws)
+ *  rather than by passing vacuously. */
 function renderNarrow(width: number, message: ConciergeRecapMessage = recap()) {
   const container = document.createElement("div");
   container.style.width = `${width}px`;
@@ -123,6 +131,8 @@ function renderNarrow(width: number, message: ConciergeRecapMessage = recap()) {
     </AgentPillProvider>,
     { container },
   );
+  const disclosure = within(container).getByTestId("recap-disclosure");
+  if (disclosure.getAttribute("aria-expanded") === "false") fireEvent.click(disclosure);
   return container;
 }
 

@@ -34,6 +34,7 @@
 import { classifyLine } from "@sparkle/core";
 import type { AgentTabStatus } from "@sparkle/ui";
 import { isSessionLimitPicker, screenAwaitsInput } from "./screenClassifier";
+import { screenOffersAnswer, streamOffersAnswer } from "./screenAnswerable";
 import { withScreenReason, type StatusReason } from "./statusRouter";
 import { forgetAgent, noteProcessExit, noteSpinnerSeen, trackAgent } from "./turnEndAuthority";
 import { StreamFailureDetector, apiErrorFramesIn, countApiErrorFrames } from "./streamFailure";
@@ -279,6 +280,32 @@ export interface StatusEngineOpts {
   getScreen?: () => string;
 }
 
+// `approval` PROMISES A BUTTON — so it may only be claimed when one is actually on screen.
+//
+// The band `approval` renders as "Approve?" and points the human at a dialog. `screenAwaitsInput`
+// cannot support that claim on its own: it is true on THREE signals (the `❯ 1.` cursor, the picker
+// FOOTER ALONE, or a bare shell prompt like `(y/n)`), and only the first implies pressable options.
+// A footer whose option block has scrolled out of the parse window satisfies it while the option
+// parser returns [] — precisely the state the founder hit on two agents at once: `status:
+// "approval"` with `read_picker_options` answering `present: false, options: []`. A row that looks
+// actionable and is not is worse than a plain red — the human taps it, finds nothing, and stops
+// trusting the dot.
+//
+// The predicate lives in `engine/screenAnswerable.ts`. It IS the canonical footer-anchored option
+// parser (`heuristics.pickerBlockBounds`), plus the two checks that parser does not make: the run
+// must belong to THIS footer (carry the cursor or abut it) and the footer must still be live. Its
+// own module because heuristics imports PICKER_FOOTER from screenClassifier, so reusing the parser
+// inside screenClassifier would be an import cycle.
+//
+// DIRECTION OF THE DOWNGRADE: `approval` → `waiting`, NEVER → calm. Both bands are red and both are
+// covered by `attention.needsAttention()`, so the agent still pages the human and no question is
+// silenced. screenClassifier's header calls an unrecognized prompt (a blocked agent nobody is told
+// about) strictly worse than a false red; that ordering is preserved here, because this narrows
+// WHICH red is claimed, never whether one is.
+function offersPressableOptions(snapshot: string | undefined): boolean {
+  return screenOffersAnswer(snapshot ?? "");
+}
+
 export class StatusEngine {
   private partial = "";
   private status: AgentTabStatus = "working";
@@ -297,6 +324,17 @@ export class StatusEngine {
   // terminal `done`/`errored`, which opens the destructive-op gate on its own (roborev 55076).
   private disposed = false;
   private sawRecentRisk = false;
+  // STREAM-SIDE evidence that a menu is painting: an option row ("❯ 1. Yes") went past in the
+  // ingested lines. Parallel to `sawRecentRisk` and consumed on the same boundaries, because the
+  // mid-stream prompt path detects its prompt in the STREAM and so must read its option evidence
+  // there too. The viewport check cannot serve that path: rows arrive one at a time and a completed
+  // line has already left `this.partial`, so there is nothing left to count by the time the band is
+  // chosen. Requires the CURSOR form (`❯ 1. …`), not any numbered row, so ordinary markdown list
+  // items streaming past cannot arm the approval band. CLEARED AT EVERY SITE `sawRecentRisk` is
+  // cleared — settle, the late re-check, noteUserInput, and the mid-stream path — because a single
+  // missed site lets stale evidence re-pin `approval` through the carry branch, which does not
+  // itself require risk. That asymmetry was the bug in the first draft of this change.
+  private sawRecentOptionRow = false;
   // The risk flag as it stood at the LAST settle, kept alive for `recheckScreen` alone — settle
   // consumes `sawRecentRisk`, so the re-check 22.5s later has nothing left to read. See settle().
   private settledTurnRisk = false;
@@ -580,6 +618,7 @@ export class StatusEngine {
     if (opts?.machine !== true) this.releaseQuotaBlock();
     this.sawRecentError = false;
     this.sawRecentRisk = false;
+    this.sawRecentOptionRow = false;
     // Re-arm the picker announcement. Whatever this send does to the dialog, a picker that is on
     // screen AFTER it is fresh news to a recovery listener — that is precisely how "the resume did
     // not take" becomes observable rather than assumed.
@@ -641,6 +680,7 @@ export class StatusEngine {
     // turn that ends idle must not carry a stale risk into the next turn's question.
     const risky = this.sawRecentRisk;
     this.sawRecentRisk = false;
+    this.sawRecentOptionRow = false;
     // REMEMBER what we just consumed, for the late screen re-check only (roborev on 95013a2f1).
     // `recheckScreen` runs 22.5s AFTER this, by which point `sawRecentRisk` is always false — so
     // reading that flag there made its `approval` branch unreachable, and a dangerous-action prompt
@@ -650,7 +690,7 @@ export class StatusEngine {
     this.set(
       // `waiting`, never `approval`, when it is the session-limit picker: nothing dangerous is being
       // approved, and the recovery path keys off the reason code below rather than off the band.
-      awaiting ? (risky && !picker ? "approval" : "waiting") : "idle",
+      awaiting ? (risky && !picker && offersPressableOptions(snapshot) ? "approval" : "waiting") : "idle",
       trigger,
       blank ? "blank" : awaiting ? "awaiting" : "calm",
       // `awaiting` here is a VIEWPORT verdict — `screenAwaitsInput` ran against the snapshot read a
@@ -736,12 +776,13 @@ export class StatusEngine {
     // catch is precisely the one that painted late — including a dangerous-action one.
     const risky = this.sawRecentRisk || this.settledTurnRisk;
     this.sawRecentRisk = false;
+    this.sawRecentOptionRow = false;
     this.settledTurnRisk = false;
     // `screenAwaitsInput(snapshot)` returned true a few lines up, so this emit is viewport-confirmed
     // and carries a reason either way — the pierce works from here too, for a dialog that painted
     // late enough to miss settle entirely.
     this.set(
-      risky && !picker ? "approval" : "waiting",
+      risky && !picker && offersPressableOptions(snapshot) ? "approval" : "waiting",
       "screen-recheck",
       undefined,
       picker ? "session-limit-picker" : "tool-approval-prompt",
@@ -882,6 +923,7 @@ export class StatusEngine {
         trippedThisChunk = true;
       }
       if (screenAwaitsInput(line)) prompt = true;
+      if (streamOffersAnswer(line)) this.sawRecentOptionRow = true;
       // Spend one tick of the user-input echo window per non-empty line, so it can't mask a later
       // genuine wedge (Fix 2). Decremented AFTER this line's echo check so the final in-window line
       // is still covered (no boundary off-by-one). When it runs out, drop the noted text so
@@ -1028,7 +1070,20 @@ export class StatusEngine {
         // destructive-action prompt as an ordinary question for the life of the dialog (and it never
         // recovers, since the re-check's reason-only branch is gated on a null reason). Narrower than
         // the green flash, since the row stays red, but it is the same class of lie.
-        !picker && (this.sawRecentRisk || (stillOnScreen && this.status === "approval")) ? "approval" : "waiting",
+        // Gates the CARRY too, not just the fresh raise: the carry exists so a redraw can't demote a
+        // live `approval`, but a dialog whose options have scrolled away is no longer answerable, and
+        // carrying the band there would re-pin the exact dead end.
+        //
+        // EITHER SOURCE COUNTS HERE, unlike settle and the late re-check. This path detected the
+        // prompt in the STREAM, so the stream is where its evidence lives — a construction with no
+        // `getScreen` wired reads an empty viewport, and requiring the viewport alone would silently
+        // demote every stream-only detection to `waiting`. The dead end is unaffected: it is defined
+        // by options being absent from BOTH, and in the real app the viewport is always readable.
+        !picker &&
+        (offersPressableOptions(snapshot) || this.sawRecentOptionRow) &&
+        (this.sawRecentRisk || (stillOnScreen && this.status === "approval"))
+          ? "approval"
+          : "waiting",
         "prompt-detected-midstream",
         undefined,
         // NEVER LOWERS AN ALREADY-RAISED REASON. This path may not RAISE `tool-approval-prompt` — it
@@ -1044,6 +1099,7 @@ export class StatusEngine {
       );
       if (!picker) this.recheckTimer = setTimeout(() => this.recheckScreen(), SPINNER_GRACE_MS);
       this.sawRecentRisk = false;
+      this.sawRecentOptionRow = false;
       // A calm prompt means the agent recovered and is awaiting you — not a crash or a stall. The
       // token baseline deliberately SURVIVES here: an approval question is asked MID-turn and the
       // counter keeps climbing from where it was once you answer, so dropping it would throw away a

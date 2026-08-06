@@ -6,6 +6,7 @@
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RecapCard } from "./RecapCard";
+import { DESC_MAX_H } from "./BeadPill";
 import { AgentPillProvider } from "./AgentPill";
 import type { MentionAgent } from "./mentions";
 import { ConciergeThread } from "./ConciergeThread";
@@ -45,6 +46,20 @@ const recap = (over: Partial<ConciergeRecapMessage> = {}): ConciergeRecapMessage
   decisions: [],
   ...over,
 });
+
+/** Open the card if it started closed.
+ *
+ *  The card is a disclosure since bead `sparkle-o37mn`: a recap with nothing ACTIONABLE in it (only
+ *  settled `done` rows, or only decisions) starts collapsed and renders no rows. The tests below
+ *  that use such a fixture are about the SECTION CAP and the row content, not about the disclosure
+ *  — that has its own file, `RecapCard.expand.test.tsx` — so they open the card first.
+ *
+ *  This cannot mask a regression: a collapsed card makes every one of those assertions fail by
+ *  ABSENCE (`getAllByTestId` throws on an empty match), never pass vacuously. */
+function openCard() {
+  const d = screen.getByTestId("recap-disclosure");
+  if (d.getAttribute("aria-expanded") === "false") fireEvent.click(d);
+}
 
 describe("RecapCard", () => {
   it("leads with the one-line summary", () => {
@@ -91,6 +106,7 @@ describe("RecapCard", () => {
         })}
       />,
     );
+    openCard();
     const rows = screen.getAllByTestId("recap-decision");
     expect(rows.map((r) => r.getAttribute("data-kind"))).toEqual(["queued", "sent"]);
     // "Held for you" and "Sent" are opposite facts, so the verb leads the line rather than trailing
@@ -151,6 +167,7 @@ describe("RecapCard", () => {
     // `done` rows, deliberately — those are the only ones the cap may eat. This test used to use
     // `waiting`, which is exactly the defect the founder reported (bead sparkle-ws8gd).
     render(<RecapCard recap={recap({ needsYou: [], finished: changes(12, "a", "done") })} />);
+    openCard();
     expect(screen.getAllByTestId("recap-change")).toHaveLength(5);
     expect(more("finished")!.textContent).toBe("+7 more in Finished");
     // Nothing is hidden from the sentence — it still counts all twelve.
@@ -219,7 +236,10 @@ describe("RecapCard", () => {
       render(<RecapCard recap={recap({ needsYou: changes(40, "a"), finished: [] })} />);
       // Every one of the forty actionable rows is rendered — the bound is on the BOX, not the set.
       expect(screen.getAllByTestId("recap-change")).toHaveLength(40);
-      expect(card().style.maxHeight).toBe("50vh");
+      // The bead card's height, not a viewport fraction — the founder asked for the recap to
+      // expand to "whatever we're using for the beads expand sizes" (bead `sparkle-o37mn`).
+      // Bound to the imported constant so the two cards cannot drift apart.
+      expect(card().style.maxHeight).toBe(`${DESC_MAX_H}px`);
       expect(card().style.overflowY).toBe("auto");
     });
 
@@ -245,6 +265,7 @@ describe("RecapCard", () => {
   describe("the +N more line is a control, not a caption", () => {
     it("expands in place on click, revealing every hidden row, and collapses again", () => {
       render(<RecapCard recap={recap({ needsYou: [], finished: changes(12, "a", "done") })} />);
+      openCard();
       expect(screen.getAllByTestId("recap-change")).toHaveLength(5);
 
       fireEvent.click(more("finished")!);
@@ -260,6 +281,7 @@ describe("RecapCard", () => {
       // "Make it LOOK clickable" — it was a bare div in muted caption ink, visually identical to
       // the asides around it, which is why the founder could not tell it did anything.
       render(<RecapCard recap={recap({ needsYou: [], finished: changes(12, "a", "done") })} />);
+      openCard();
       const line = more("finished")!;
       expect(line.tagName).toBe("BUTTON");
       expect(line.getAttribute("aria-expanded")).toBe("false");
@@ -283,6 +305,7 @@ describe("RecapCard", () => {
     // Decisions render oldest-first (the card reads as a narrative), but a cancelled deploy from
     // two minutes ago is the line you can still act on, so the tail is what survives the cap.
     render(<RecapCard recap={recap({ needsYou: [], finished: [], decisions: decisions(8) })} />);
+    openCard();
     const rows = screen.getAllByTestId("recap-decision");
     expect(rows).toHaveLength(5);
     expect(rows[0]!.textContent).toContain("Did thing 3");

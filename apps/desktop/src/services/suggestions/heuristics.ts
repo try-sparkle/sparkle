@@ -74,6 +74,10 @@ function asksChoice(lastLine: string): boolean {
 // option walk works identically.
 export const PICKER_WINDOW = 50; // non-empty lines to search for the footer
 export const PICKER_SPAN = 30; // non-empty lines above the footer the option block may span
+// The option-row shape as RENDERED, for callers that must ask "is this line an option row?" without
+// running the whole footer-anchored parse. Border class is BOX-DRAWING ONLY — a literal ASCII `|`
+// would make one prose line ("Options: 1. yes | 2. no") read as two rows.
+export const RENDERED_OPTION_ROW = /(?:^|[\u2502\u2503])[ \t]*(?:[\u276f\u203a>][ \t]*)?\d{1,2}\.[ \t]+\S/;
 const PICKER_OPTION = /^\s*(?:[❯›>]\s*)?(\d{1,2})\.\s+(\S.*)/;
 const PICKER_LABEL_MAX = 40;
 const PICKER_MAX_BUTTONS = 6;

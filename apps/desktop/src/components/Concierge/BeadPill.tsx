@@ -473,8 +473,14 @@ const base: CSSProperties = {
  *  THE BEAD NAMES THIS AS A REQUIREMENT — "beads carry long descriptions, so the card needs to
  *  handle that without swallowing the conversation". A bead description runs to several screens
  *  (this one does), and a card that grows to fit pushes the sentence the reader was reading off the
- *  top of the thread, which is the context switch the whole feature exists to avoid. */
-const DESC_MAX_H = 180;
+ *  top of the thread, which is the context switch the whole feature exists to avoid.
+ *
+ *  EXPORTED because `RecapCard`'s disclosure reuses it (bead `sparkle-o37mn`). The founder asked
+ *  for the recap's expanded height to be "whatever we're using for the beads expand sizes" — so the
+ *  two heights are ONE decision, and a second literal would be a second thing that can drift. Both
+ *  cards sit in the same column and are read by the same person one scroll apart; they must not
+ *  disagree about how much is "enough before it scrolls". */
+export const DESC_MAX_H = 180;
 
 /** What the card says when the board could not be opened. One sentence, non-alarming, and it names
  *  the bead — a paragraph can hold several cards. Matches `AgentPill`'s `closedSentence` in shape so

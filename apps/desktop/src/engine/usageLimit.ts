@@ -16,63 +16,69 @@
 //
 // The banner therefore asserted a TRANSITION it once observed rather than the CURRENT state. This
 // module is the current state: a pure question asked of the accounts' own live exhaustion flags,
-// which carry a real reset instant and lapse by the clock with nobody doing anything. That is what
-// makes the banner self-clearing — the property the latched design could not have at any poll rate.
+// which carry a real reset instant and lapse by the clock with nobody doing anything.
 //
-// PURE. `now` is injected, so every rule below is tested as arithmetic rather than by faking timers,
-// and so the banner and any other reader cannot drift apart on what "currently limited" means.
+// ── WHAT THIS MAY AND MAY NOT DECIDE (knightwatch 5198911473#1, blocking) ───────────────────────
+//
+// This module may only ever say "there IS a limit". It must never be used to conclude there is not.
+//
+// The `usage_limit` observation is raised by Sparkle's OWN one-shot AI calls. Those run through
+// `claude_oneshot::spawn_claude` with `--no-session-persistence`, so they write NO transcript — and
+// `services/limitSync` benches an account solely from `error: "rate_limit"` records found in that
+// account's OWN transcripts. A limit hit by a one-shot therefore produces **no `exhaustedUntil`,
+// ever**. Reading "no bench" as "not limited" would hide a genuine limit, and no poll rate or trust
+// delay fixes that, because the evidence is never written in the first place.
+//
+// An earlier revision did exactly that, via a timed "clear" heuristic. It is deleted rather than
+// tuned. Positive evidence is still worth having — an `exhaustedUntil` in the future is real
+// whoever wrote it, and it carries the reset instant that makes the banner checkable — so this
+// module ENRICHES a banner that the store has already decided to show, and nothing more.
+//
+// The real destination is for the one-shot producer to record the account-specific limit state it
+// actually used; then this question can be asked soundly in both directions. Tracked on the bead.
+//
+// PURE. `now` is injected, so every rule is tested as arithmetic rather than by faking timers.
 import type { Usage } from "../services/accountStore";
 
-/** The live answer: which account frees up first, and when. */
+/** A limit we can positively see, with the instant it lifts. `null` means NO POSITIVE EVIDENCE —
+ *  never "no limit". */
 export interface UsageLimitState {
-  /** The account whose limit resets soonest — the one that will end the pause. */
   accountId: string;
-  /** Epoch ms when AI resumes. Real, parsed from Anthropic's own reset string upstream, so it is
-   *  safe to show the user rather than the unfalsifiable "they'll resume when it resets". */
+  /** Epoch ms when the limit lifts. Real, parsed from Anthropic's own reset string upstream, so it
+   *  is safe to show rather than the unfalsifiable "they'll resume when it resets". */
   until: number;
 }
 
 /**
- * Is Sparkle's AI paused by usage limits right now?
+ * Is there a live, positively-observed limit on the account Sparkle's own AI calls run under?
  *
- * WHY EVERY ACCOUNT MUST BE BENCHED, NOT JUST ONE. Sparkle runs multi-Max failover: `accountStore`
- * ranks accounts and skips any whose `exhaustedUntil` is in the future. So one benched account out
- * of three means AI is FINE — the next call simply routes elsewhere. A banner that fired on "any
- * account limited" would assert a pause that is not happening, which is the same class of false
- * claim this whole module exists to end, merely arriving from the opposite direction.
- *
- * Returns the account with the EARLIEST reset, because that is the moment the pause actually ends:
- * the first account to come back is the one that serves the next call. Naming the latest would
- * overstate the outage to the user.
- *
- * WHY AN EMPTY LIST ASSERTS NOTHING. No usage records means we have not read the accounts yet — an
- * ABSENCE of evidence, not evidence of health OR of limits. Returning `null` there means the banner
- * stays hidden until something is actually known, which is the right direction to fail: a missing
- * banner during a real outage is recovered by the very next poll, while a banner shown on no
- * evidence is exactly the stale, unfalsifiable claim being fixed.
+ * @param accountId The account one-shots use — the default (`Account.isDefault`, the imported
+ *                  `~/.claude`), which is what the ambient `CLAUDE_CONFIG_DIR` resolves to.
  */
-export function currentUsageLimit(usage: readonly Usage[], now: number): UsageLimitState | null {
-  if (usage.length === 0) return null;
-
-  let soonest: UsageLimitState | null = null;
-  for (const u of usage) {
-    // A null flag, or one whose instant has PASSED, is a usable account. `<= now` rather than
-    // `< now` so the reset instant itself already counts as recovered — the banner must not
-    // survive its own stated deadline by even a tick, which is precisely the "it's old" complaint.
-    if (u.exhaustedUntil == null || u.exhaustedUntil <= now) return null;
-    if (soonest === null || u.exhaustedUntil < soonest.until) {
-      soonest = { accountId: u.id, until: u.exhaustedUntil };
-    }
-  }
-  return soonest;
+export function currentUsageLimit(
+  usage: readonly Usage[],
+  accountId: string | null,
+  now: number,
+): UsageLimitState | null {
+  if (accountId === null) return null;
+  const mine = usage.find((u) => u.id === accountId);
+  // `<= now` rather than `< now`: the reset instant itself already counts as recovered, so the
+  // banner cannot outlive its own stated deadline by even a tick.
+  if (mine?.exhaustedUntil == null || mine.exhaustedUntil <= now) return null;
+  return { accountId, until: mine.exhaustedUntil };
 }
 
 /**
- * How often to re-ask while a limit IS showing.
+ * Which account Sparkle's own AI calls run under: the default, else the only one, else unknown.
  *
- * Only runs while the banner is up, so it costs nothing on a healthy machine — which is what makes
- * a tight interval affordable here. Ten seconds is well inside "I looked away and it was gone" and
- * far finer than the reset instants involved (minutes to hours), so the banner retires promptly
- * without the app polling hard in its normal state.
+ * Mirrors `accountStore`'s own tie-break (`eligible.find(isDefault) ?? eligible[0]`) so the two
+ * cannot drift on what "the default account" means.
  */
+export function oneshotAccountId(
+  accounts: readonly { id: string; isDefault: boolean }[],
+): string | null {
+  return accounts.find((a) => a.isDefault)?.id ?? accounts[0]?.id ?? null;
+}
+
+/** How often to re-ask while a limit IS showing. Only runs then, so a healthy machine pays nothing. */
 export const USAGE_LIMIT_RECHECK_MS = 10_000;

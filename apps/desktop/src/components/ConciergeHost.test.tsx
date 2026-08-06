@@ -2360,6 +2360,11 @@ describe("ConciergeHost — Away → Here recap", () => {
     back();
     const card = within(thread()).getByTestId("concierge-recap");
     expect(card.textContent).toContain("1 finished");
+    // OPEN THE CARD FIRST. It is a disclosure since bead `sparkle-o37mn`, and this fixture is the
+    // one shape allowed to start collapsed: a single SETTLED row (`done` — finished AND landed),
+    // which asks the reader for nothing. The row assertion below is about the recap DIFF, not about
+    // the disclosure, so it opens the card rather than changing what it checks.
+    fireEvent.click(within(card).getByTestId("recap-disclosure"));
     expect(within(card).getByTestId("recap-change").getAttribute("data-status")).toBe("done");
   });
   // ── A HEAD STANDING IN FOR ITS SUBTREE ────────────────────────────────────────────────────────

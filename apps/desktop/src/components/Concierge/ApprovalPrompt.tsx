@@ -263,7 +263,11 @@ function actionBtn(): CSSProperties {
     gap: 4,
     fontSize: 12,
     fontWeight: FONT_WEIGHT.bold,
-    borderRadius: 999,
+    // Same change, same reason as `NudgeCard`'s action button — and it has to move WITH it, for the
+    // reason the comment above already gives about the colour stack: these two are byte-for-byte
+    // the same treatment, so a divergence here is the defect relocating rather than being fixed.
+    // `RADIUS.input` is what `SendModeTray`'s Push-to-talk pill rounds at.
+    borderRadius: RADIUS.input,
     padding: "6px 11px",
     cursor: "pointer",
     font: "inherit",

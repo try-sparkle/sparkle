@@ -36,7 +36,7 @@ import {
 // only becomes an auto-answer after the looksLikePermission "No"-option gate), a bare "> 1. …" would
 // flip status RED off any markdown blockquote in scrollback. The footer check below is the
 // glyph-independent catch-all, so ">"-cursor prompts are still caught — via their footer.
-const SELECTION_CURSOR = /^\s*[│|]?\s*[❯›]\s*\d+\.\s/m;
+export const SELECTION_CURSOR = /^\s*[│|]?\s*[❯›]\s*\d+\.\s/m;
 
 // Claude Code's interactive picker FOOTER — the closing hint line every menu/permission dialog
 // draws below its options. It is a glyph-independent "a menu is open, waiting on you" marker, so it
@@ -108,7 +108,7 @@ export const PICKER_FOOTER = new RegExp(`${FOOTER_LEGACY}|${FOOTER_BAR}`, "im");
 // match anywhere in the snapshot. The `/i` flag case-folds, so one delimiter-agnostic
 // pattern covers `(y/n)`, `[Y/n]`, `[y/N]` etc. (It also matches mismatched delimiters
 // like `(y/n]` — harmless: such strings never occur in prose and are still prompt-like.)
-const SHELL_PROMPTS: RegExp[] = [
+export const SHELL_PROMPTS: RegExp[] = [
   /[([]y\/n[)\]]/i,
   /press enter to continue/i,
   /\boverwrite\?/i,

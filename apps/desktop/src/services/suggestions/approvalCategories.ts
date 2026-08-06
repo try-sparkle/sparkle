@@ -78,6 +78,32 @@ export function asResumeRule(v: unknown): ResumeRule {
   return v === "summary" || v === "full" || v === "ask" ? v : DEFAULT_RESUME_RULE;
 }
 
+/**
+ * The complaint to surface when `[approvals].resume` holds a value this key does not accept, or null
+ * when there is nothing to say.
+ *
+ * WHY THIS EXISTS. `resume` is a SIBLING of the approval categories with a DIFFERENT value domain:
+ * the categories take "always"/"never", this one takes ask|summary|full. `asResumeRule` narrows
+ * anything else to "ask" — the hands-off default — so writing the value that works for every
+ * neighbouring key produces the exact OPPOSITE of the intent (the prompt is surfaced every restart)
+ * with nothing anywhere saying so. The Rust side stores it as a bare `Option<String>` and validates
+ * nothing, and the only warning is a comment in the config template you would have to already know
+ * to look for. The founder hit precisely this with `resume = "always"`.
+ *
+ * Absent/empty is NOT a complaint — that is the documented default, not a mistake. This reports only
+ * a value the user actually chose and that will silently not apply.
+ */
+export function resumeRuleComplaint(v: unknown): string | null {
+  if (v === undefined || v === null || v === "") return null;
+  if (v === "summary" || v === "full" || v === "ask") return null;
+  return (
+    `[approvals].resume = ${JSON.stringify(v)} is not a valid value and was ignored ` +
+    `(falling back to "${DEFAULT_RESUME_RULE}", which surfaces the prompt every time). ` +
+    `Unlike the permission categories, resume does not take "always"/"never" — ` +
+    `use "summary", "full", or "ask".`
+  );
+}
+
 /** The one friendly label per resume choice, as it reads in the approvals pane. */
 export const RESUME_RULE_LABEL: Record<ResumeRule, string> = {
   ask: "Ask me each time",
