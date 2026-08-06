@@ -82,12 +82,30 @@ describe("the in-flight latch", () => {
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SRC = resolve(HERE, "..");
 
-/** Resolve a relative specifier the way the bundler does, or null for a package import. */
+/** Files this walk models. A specifier resolving to anything else is a real edge in the bundle but
+ *  not a TypeScript module, so it has no imports of its own to follow — and it must never be handed
+ *  to the parser. */
+export function isWalkableModule(path: string): boolean {
+  return path.endsWith(".ts") || path.endsWith(".tsx");
+}
+
+/**
+ * Resolve a relative specifier to a TypeScript module, or null.
+ *
+ * NULL FOR A NON-TS RESOLUTION, deliberately, and this is not a detail. `import "./index.css"` is a
+ * shape this repo uses (main.tsx), and an extensionless `base` candidate happily resolves it.
+ * TypeScript's `getScriptKindFromFileName` returns `Unknown` for `.css` and `ensureScriptKind` falls
+ * back to `ScriptKind.TS`, so the stylesheet would be parsed as TypeScript, fail on its first token,
+ * and — since a parse failure now THROWS — red every boundary case with an error naming neither the
+ * stylesheet nor the module that imported it. Scoping the resolver keeps the loud throw for the case
+ * it was written for: a `.ts`/`.tsx` file the walker genuinely cannot read.
+ */
 function resolveSpec(fromFile: string, spec: string): string | null {
   if (!spec.startsWith(".")) return null;
   const base = resolve(dirname(fromFile), spec);
   for (const candidate of [`${base}.ts`, `${base}.tsx`, `${base}/index.ts`, `${base}/index.tsx`, base]) {
-    if (existsSync(candidate) && statSync(candidate).isFile()) return candidate;
+    if (!existsSync(candidate) || !statSync(candidate).isFile()) continue;
+    return isWalkableModule(candidate) ? candidate : null;
   }
   return null;
 }
@@ -128,10 +146,20 @@ export function runtimeSpecifiers(source: string, fileName = "m.ts"): string[] {
   // No explicit ScriptKind: `createSourceFile` derives it from the extension, so a `.ts` file is
   // never parsed under JSX rules and vice versa.
   const sf = ts.createSourceFile(fileName, source, ts.ScriptTarget.ESNext, true);
-  // `parseDiagnostics` is internal, hence the cast; an absent field must not read as "no errors".
+  // `parseDiagnostics` is a TypeScript INTERNAL reached through a cast, so nothing type-checks its
+  // continued existence. FAIL CLOSED ON ABSENCE: a version that renames, moves, or lazily populates
+  // it would otherwise turn this guard off silently, `runtimeSpecifiers` would go back to returning
+  // `[]` for every unparseable file, and all four boundary assertions — every one of them negative —
+  // would pass on a walk that read nothing. That is the exact vacuity this function exists to close,
+  // so "the field is gone" has to be as loud as "the file did not parse".
   const diagnostics = (sf as unknown as { parseDiagnostics?: readonly ts.Diagnostic[] })
     .parseDiagnostics;
-  if (diagnostics !== undefined && diagnostics.length > 0) {
+  if (!Array.isArray(diagnostics)) {
+    throw new Error(
+      "runtimeSpecifiers: ts.SourceFile.parseDiagnostics is gone — the parse-error guard is inert",
+    );
+  }
+  if (diagnostics.length > 0) {
     const first = ts.flattenDiagnosticMessageText(diagnostics[0]!.messageText, " ");
     throw new Error(`runtimeSpecifiers: ${fileName} failed to parse (${first})`);
   }
@@ -262,6 +290,31 @@ describe("the walker models RUNTIME edges", () => {
     // file must be loud. Without this, a future parser change that broke on some real file would
     // turn the boundary cases green for the worst possible reason.
     expect(() => runtimeSpecifiers(`import { a from "./x";`, "broken.ts")).toThrow(/failed to parse/);
+  });
+
+  it("observes a REAL diagnostics array on the clean path, so the guard is not inert", () => {
+    // The throw above only fires when the internal field exists. If a TypeScript upgrade removed it,
+    // that case would still pass (the input is broken either way) while the guard quietly stopped
+    // guarding every OTHER file — so the clean path has to prove the field is actually there.
+    const sf = ts.createSourceFile("m.ts", `import { a } from "./x";`, ts.ScriptTarget.ESNext, true);
+    const diagnostics = (sf as unknown as { parseDiagnostics?: readonly ts.Diagnostic[] })
+      .parseDiagnostics;
+    expect(Array.isArray(diagnostics)).toBe(true);
+    expect(diagnostics).toHaveLength(0);
+  });
+});
+
+describe("the resolver only hands TypeScript to the parser", () => {
+  it("models .ts and .tsx, and nothing else", () => {
+    expect(isWalkableModule("/a/b.ts")).toBe(true);
+    expect(isWalkableModule("/a/b.tsx")).toBe(true);
+    // A stylesheet IS a real edge in the bundle (`import "./index.css"` is used in main.tsx), but it
+    // is not a TypeScript module: it has no imports to follow, and TypeScript would parse it as TS
+    // and fail on the first token — which, now that a parse failure throws, would red every boundary
+    // case with an error naming neither the stylesheet nor its importer.
+    expect(isWalkableModule("/a/index.css")).toBe(false);
+    expect(isWalkableModule("/a/tokens.json")).toBe(false);
+    expect(isWalkableModule("/a/logo.svg")).toBe(false);
   });
 
   it("is not fooled by an import-like string in a comment or a literal", () => {
