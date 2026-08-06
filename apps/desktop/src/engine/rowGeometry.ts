@@ -54,6 +54,75 @@ export const LIST_PAD_X = 8;
  *  move. See the compensation note above. */
 export const ROW_PAD_COMPENSATED = ROW_PAD_X + LIST_PAD_X;
 
+/** The row box's own vertical padding. Named because the hover card has to reproduce it EXACTLY
+ *  (minus its own border) to stand over a row without anything jumping — see the card strip's
+ *  padding. */
+export const ROW_PAD_Y = 4;
+
+// ── THE ROW ANATOMY, SHARED BY EVERY ROW TYPE ─────────────────────────────────────────────────
+// Improve Sparkle is not a project agent — it has no AgentTab, so it cannot go through AgentRow —
+// but it IS a row in this column and has to read as one. It used to be styled by hand, and drifted:
+// a bigger disc, a different left inset, its own font size, its own progress bar. These constants
+// are the contract. AgentSidebar.sparkleRow.test.tsx asserts the two rows agree on every one of
+// them by measuring BOTH rows in a rendered sidebar, so a change here that lands in only one of
+// the two call sites goes red.
+//
+// They live HERE, next to `rowBox`, rather than module-private inside AgentSidebar.tsx, because a
+// row type in its OWN file cannot honour a rule it cannot import — see components/rowAnatomy.tsx.
+//
+// Width of the leading disc slot on a build/worker row (a shell row's ▶ takes a narrower one). The
+// disc is CENTERED in it, so this — not the padding alone — is what fixes the disc's left edge.
+export const DOT_SLOT_W = 24;
+/** Diameter of the status disc on a row (StatusDot's own default 9 is for the TopBar cluster). */
+export const DOT_SIZE = 12;
+
+/** The leading glyph slot is a fixed height so the glyph AND the title beside it sit at the exact
+ *  same spot whether the card is collapsed or expanded — on hover the card only grows DOWNWARD, so
+ *  the eye never sees the pickaxe or title jump. Shared so the elapsed timer can match it. */
+export const GLYPH_SLOT_H = 20;
+
+/** Depth indent (px) per nesting level. Set so a WORKER's status disc lands exactly where its
+ *  parent's TITLE begins: a head row's title starts at padding-left(10) + disc slot(24) + gap(8) =
+ *  42px, and a child at marginLeft(32) + its own padding-left(10) puts its disc at that same 42px.
+ *  The subtree therefore reads as a hanging indent off the parent's text rather than as a second,
+ *  arbitrary column. Changing the disc slot or the row padding means changing this too. */
+export const DEPTH_INDENT = 32;
+
+// ── GEOMETRY BELONGS TO EVERY ROW, NEVER ONLY THE SELECTED ONE ─────────────────────────────────
+//
+// `.row` in the mock carries the pane-side margin; `.row.on` changes only what is PAINTED. The
+// version this replaces put `marginRight: isActive ? -8 : 0` on the row, which meant the row's
+// CONTENT BOX narrowed by 8px the instant you selected it — so the title under the pointer jumped
+// ~10px on click and jumped back on the next row. The founder reported the list twitching every
+// time they changed agents; this is that bug, and it is a layout property masquerading as a
+// selection style.
+//
+// The fix is the mock's: every row runs to the seam and every row pays the same padding back, so
+// the ink sits at a constant inset from the column's edges in all states. See MAPPING.md,
+// "Row geometry belongs to `.row`, never to `.row.on`" — `padding compensates margin one-for-one
+// instead of just changing it` is the exact instruction, and it is why `ROW_PAD_COMPENSATED`
+// exists rather than the row simply keeping `ROW_PAD_X` on both sides.
+//
+// Those numbers were written for a right-hand pair and read correctly for years because there was
+// only one pair, on the right. See `rowBox`, which decides which END takes them.
+
+// ── THE MOUTH IS 26 × 9, NOT 9 × 9 ─────────────────────────────────────────────────────────────
+//
+// `--r-delta` (9px) is the fillet's RISE and `--m-run` (26px) is its RUN. It is not a square, and
+// the founder rejected the square: a circular 9×9 corner-round is 78% quarter-disc, so it packs the
+// whole flare into the last ~4px before the seam. The near-white build column (`deepForest`, the
+// spec's `--k-bridge`) therefore ran flush beside the row right up to the pane and stopped in a
+// rounded stub — two pale claws pinching the row where it enters the terminal. That is the "white
+// lines shouldn't be there when rounded" report: nothing stray, just a corner-round doing what a
+// corner-round does.
+//
+// Stretched to 26 × 9 the same arc leaves the row's edge with a HORIZONTAL tangent (flush with the
+// row) and meets the seam with a VERTICAL one (flush with the column boundary), so it is smooth at
+// both ends and the bank sweeps out of frame instead of hooking back. Same colours, same anchor,
+// same 9px rise — only the run is longer. 26 is `--grid-step`; the mock records that 38 reads melty.
+export const ACTIVE_FILLET = 9;
+export const ACTIVE_FILLET_RUN = 26;
+
 /** The other side. */
 export const oppositeSide = (side: PairSide): PairSide => (side === "left" ? "right" : "left");
 

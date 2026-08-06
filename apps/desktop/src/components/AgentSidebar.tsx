@@ -93,8 +93,17 @@ import {
 } from "../engine/agentOrdering";
 import { firstLadderRowId } from "../engine/ladderSelection";
 import { otherSide, pairCountFor, projectsOnSide, sideOf } from "../engine/pairs";
-import { LIST_PAD_X, rowBox } from "../engine/rowGeometry";
+import {
+  DEPTH_INDENT,
+  DOT_SIZE,
+  DOT_SLOT_W,
+  GLYPH_SLOT_H,
+  LIST_PAD_X,
+  ROW_PAD_Y,
+} from "../engine/rowGeometry";
 import type { PairSide } from "../engine/rowGeometry";
+// The shared row anatomy every row type in this column must honour — see that file's header.
+import { ActiveFillets, rowBoxFor } from "./rowAnatomy";
 import { useCableStore } from "../stores/cableStore";
 import { usePairIsLive } from "../hooks/useEffectiveWired";
 import { openProjectTab } from "../services/openProjectTab";
@@ -2876,17 +2885,6 @@ export function AgentSidebar({
   );
 }
 
-// The leading glyph slot is a fixed height so the glyph AND the title beside it sit at the exact
-// same spot whether the card is collapsed or expanded — on hover the card only grows DOWNWARD,
-// so the eye never sees the pickaxe or title jump. Module-level so the elapsed timer can match it.
-const GLYPH_SLOT_H = 20;
-// Depth indent (px) per nesting level. Set so a WORKER's status disc lands exactly where its
-// parent's TITLE begins: a head row's title starts at padding-left(10) + disc slot(24) + gap(8) =
-// 42px, and a child at marginLeft(32) + its own padding-left(10) puts its disc at that same 42px.
-// The subtree therefore reads as a hanging indent off the parent's text rather than as a second,
-// arbitrary column. Changing the disc slot or the row padding means changing this too.
-const DEPTH_INDENT = 32;
-
 // DOM id of a head's worker `group`. One function so the row's aria-owns and the group's own id
 // cannot drift — a mismatched pair is a dangling reference that reads as no relationship at all.
 /**
@@ -3212,172 +3210,11 @@ function WorkerPeek({
   );
 }
 
-// The row box. Named because the hover card has to reproduce them EXACTLY (minus its own border)
-// to stand over a row without anything jumping — see the card strip's padding.
-//
-// `ROW_PAD_X` and `LIST_PAD_X` now live in `engine/rowGeometry` alongside the rule that consumes
-// them: which end of a row bleeds, and by how much, is a property of the PAIR's side, and putting
-// the numbers next to the rule is what stopped them being re-derived inline for one pair.
-const ROW_PAD_Y = 4;
-
-// ── THE ROW ANATOMY, SHARED WITH THE PINNED IMPROVE SPARKLE ROW ───────────────────────────────
-// Improve Sparkle is not a project agent — it has no AgentTab, so it cannot go through AgentRow —
-// but it IS a row in this column and has to read as one. It used to be styled by hand, and drifted:
-// a bigger disc, a different left inset, its own font size, its own progress bar. These constants
-// are the contract. AgentSidebar.sparkleRow.test.tsx asserts the two rows agree on every one of
-// them by measuring BOTH rows in a rendered sidebar, so a change here that lands in only one of
-// the two call sites goes red.
-//
-// Width of the leading disc slot on a build/worker row (a shell row's ▶ takes a narrower one). The
-// disc is CENTERED in it, so this — not the padding alone — is what fixes the disc's left edge.
-const DOT_SLOT_W = 24;
-// Diameter of the status disc on a row (StatusDot's own default 9 is for the TopBar cluster).
-const DOT_SIZE = 12;
-
-// ── GEOMETRY BELONGS TO EVERY ROW, NEVER ONLY THE SELECTED ONE ─────────────────────────────────
-//
-// `.row` in the mock carries the pane-side margin; `.row.on` changes only what is PAINTED. The
-// version this replaces put `marginRight: isActive ? -8 : 0` on the row, which meant the row's
-// CONTENT BOX narrowed by 8px the instant you selected it — so the title under the pointer jumped
-// ~10px on click and jumped back on the next row. The founder reported the list twitching every
-// time they changed agents; this is that bug, and it is a layout property masquerading as a
-// selection style.
-//
-// The fix is the mock's: every row runs to the seam and every row pays the same padding back, so
-// the ink sits at a constant inset from the column's edges in all states. See MAPPING.md,
-// "Row geometry belongs to `.row`, never to `.row.on`" — `padding compensates margin one-for-one
-// instead of just changing it` is the exact instruction, and it is why `ROW_PAD_COMPENSATED`
-// exists rather than the row simply keeping `ROW_PAD_X` on both sides.
-//
-// BOTH of those live in `engine/rowGeometry` now, with the rule that decides which END takes them.
-// They were written here for a right-hand pair and read correctly for years because there was only
-// one pair, on the right. See `rowBox`.
-
-// ── THE MOUTH IS 26 × 9, NOT 9 × 9 ─────────────────────────────────────────────────────────────
-//
-// `--r-delta` (9px) is the fillet's RISE and `--m-run` (26px) is its RUN. It is not a square, and
-// the founder rejected the square: a circular 9×9 corner-round is 78% quarter-disc, so it packs the
-// whole flare into the last ~4px before the seam. The near-white build column (`deepForest`, the
-// spec's `--k-bridge`) therefore ran flush beside the row right up to the pane and stopped in a
-// rounded stub — two pale claws pinching the row where it enters the terminal. That is the "white
-// lines shouldn't be there when rounded" report: nothing stray, just a corner-round doing what a
-// corner-round does.
-//
-// Stretched to 26 × 9 the same arc leaves the row's edge with a HORIZONTAL tangent (flush with the
-// row) and meets the seam with a VERTICAL one (flush with the column boundary), so it is smooth at
-// both ends and the bank sweeps out of frame instead of hooking back. Same colours, same anchor,
-// same 9px rise — only the run is longer. 26 is `--grid-step`; the mock records that 38 reads melty.
-const ACTIVE_FILLET = 9;
-const ACTIVE_FILLET_RUN = 26;
-
-
-// ── THE SELECTED ROW'S GEOMETRY, IN ONE PLACE ─────────────────────────────────────────────────
-// The active row's corners: square on the PANE side (it opens into the terminal — the mouth below
-// does that work) and rounded on the concierge side; fully rounded when it isn't selected. WHICH
-// physical side each of those is flips with the pair, and the cable squares the concierge end too —
-// both decided by `rowBox`, which is why this is now a call rather than two constants.
-//
-// Shared, because two rows draw it: a build/worker row and the pinned Improve Sparkle row. They were
-// literals in both for one commit, which is the one-sided-drift hazard the rest of the row anatomy
-// was consolidated to remove — changing one leaves the other on the old geometry with every test
-// green. AgentSidebar.sparkleRow.test.tsx compares the two rows' computed radius and mouth paint
-// directly, so a change has to land here to satisfy both.
-//
-// `RADIUS.modal`, not a literal: a stray `10` is both off-scale (theme/scale.test.ts is a ratchet at
-// 0) and the kind of local re-derivation blueprintSpec.ts exists to end. The mock's leading radius
-// is `--r-lead: 10px` and RADIUS tops out at 6 (`modal`); this holds at the token and the missing
-// step is reported rather than hard-coded.
-function rowBoxFor(opts: {
-  paneSide: PairSide;
-  jointOpen: boolean;
-  isActive: boolean;
-  depthIndent?: number;
-  pinned?: boolean;
-}) {
-  return rowBox({
-    ...opts,
-    leadRadius: RADIUS.modal,
-    idleRadius: RADIUS.modal,
-    padY: ROW_PAD_Y,
-  });
-}
-
-/** THE MOUTH: a concave fillet where a selected row opens into the pane — NOT a corner.
- *
- *  A `border-radius` curves the corner IN. It cuts material away, so the row NECKS DOWN as it
- *  reaches the pane — the exact opposite of what a junction should do. A mouth curves OUT, the way a
- *  river opens into a delta: the channel widens and the bank sweeps away from it. NO radius value
- *  produces that at any size; it is a different construction, and the distinction cost ~20 review
- *  rounds (MAPPING.md, "Geometry vocabulary"). If a review says "rounded the wrong way / backwards",
- *  changing the number is not converging.
- *
- *  The construction, straight from the mock's `--m-tr` / `--m-br`: an `--m-run` × `--r-delta` box
- *  sitting just above / below the row at its pane-side end, filled with the PANE's colour, with an
- *  ELLIPTICAL quadrant bitten out of the corner FURTHEST from the junction — `radial-gradient(ellipse
- *  farthest-side at <far corner>, transparent 0 calc(100% - .5px), <pane> 100%)`. Read it as "inside
- *  the ellipse → transparent, so the build column shows through; outside → pane colour". It rounds
- *  the BUILD COLUMN's corner away from the row, never the row's own.
- *
- *  `farthest-side` is what makes the box's own dimensions the radii, so the 26 × 9 shape falls out of
- *  `width`/`height` rather than being restated. The `-0.5px` is the mock's antialias feather: without
- *  it the gradient's hard stop lands on a pixel boundary and the arc renders as a stair.
- *
- *  The two documented ways to make a CORRECT mouth invisible, so neither is re-diagnosed as bad
- *  geometry: an ancestor `overflow:hidden` clipping the overhang, and the pane painting over it
- *  because it is later in the DOM (needs z-index on the columns). Both live outside this file — see
- *  PRD/sparkle/blueprint-agent-sidebar.md.
- *
- *  `pointerEvents:none` so they never eat clicks; `aria-hidden` since they are pure chrome. The
- *  caller positions them by making its own box `position: relative`, and is responsible for any
- *  suppression rule of its own (the build row hides them behind its open hover card). */
-function ActiveFillets({ ends, paneSide }: { ends: PairSide[]; paneSide: PairSide }) {
-  return (
-    <>
-      {ends.map((end) => {
-        // The arc is bitten out of the corner FURTHEST from the junction, so an end that opens to
-        // the RIGHT anchors its ellipse on the left and vice versa. Mirroring the anchor with the
-        // end is the whole of the left pair's fix: keep it at `left` and the left pair's bank
-        // sweeps the wrong way, hooking back into the row instead of away from it.
-        const far = end === "right" ? "left" : "right";
-        // `row-mouth-*` is the PANE end — the one every selected row has had since this shipped, and
-        // the id the existing geometry tests read. `row-joint-*` is the concierge end, which exists
-        // only while this pair holds the cable. Two names because they are two different claims: one
-        // says "this row feeds its terminal", the other says "…and the concierge is plugged in".
-        const id = end === paneSide ? "mouth" : "joint";
-        return (
-          <Fragment key={end}>
-            <div
-              aria-hidden
-              data-testid={`row-${id}-top`}
-              style={{
-                position: "absolute",
-                top: -ACTIVE_FILLET,
-                [end]: 0,
-                width: ACTIVE_FILLET_RUN,
-                height: ACTIVE_FILLET,
-                background: `radial-gradient(ellipse farthest-side at top ${far}, transparent 0 calc(100% - .5px), ${C.forest} 100%)`,
-                pointerEvents: "none",
-              }}
-            />
-            <div
-              aria-hidden
-              data-testid={`row-${id}-bottom`}
-              style={{
-                position: "absolute",
-                bottom: -ACTIVE_FILLET,
-                [end]: 0,
-                width: ACTIVE_FILLET_RUN,
-                height: ACTIVE_FILLET,
-                background: `radial-gradient(ellipse farthest-side at bottom ${far}, transparent 0 calc(100% - .5px), ${C.forest} 100%)`,
-                pointerEvents: "none",
-              }}
-            />
-          </Fragment>
-        );
-      })}
-    </>
-  );
-}
+// The row anatomy every row in this column shares — the numbers (`ROW_PAD_Y`, `DOT_SLOT_W`,
+// `DOT_SIZE`, `GLYPH_SLOT_H`, `DEPTH_INDENT`, `ACTIVE_FILLET*`) live in `engine/rowGeometry`
+// beside the `rowBox` rule that consumes them, and the React half (`rowBoxFor`, `ActiveFillets`)
+// in `./rowAnatomy`. Both are imported at the top of this file. They moved out so a row type in
+// its OWN file — `PersonRow` — can honour the same anatomy; see rowAnatomy.tsx's header.
 
 // What a rolled-up disc is painted. The four definite marks reuse the AGENT_STATUS tier colors
 // straight (NOT statusInk — that resolves a color to a legible TEXT ink, and this is a filled
