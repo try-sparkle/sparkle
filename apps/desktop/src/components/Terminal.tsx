@@ -237,6 +237,7 @@ export function Terminal({
   active,
   onStatus,
   onReady,
+  onSpawnFailed,
   onExit,
   onRequestFocus,
   onUserRequestFocus,
@@ -274,6 +275,17 @@ export function Terminal({
   runtime?: Runtime;
   onStatus: (s: AgentTabStatus) => void;
   onReady?: () => void;
+  /**
+   * The spawn chain REJECTED — no PTY, and this terminal is showing "Couldn't start the agent".
+   *
+   * The counterpart to `onReady`, and it exists because the failure used to be terminal-LOCAL: the
+   * rejection set `spawnFail` for the overlay and told nobody, so an owner holding state that only a
+   * failed launch can release never heard. Concretely, `AgentPane` never reached its `error` phase,
+   * so the opening brief stayed marked in-flight and `spawn_build_agent` answered `launching` — "give
+   * it a moment" — 45 seconds after the pane had already said the agent could not start. Two surfaces
+   * telling the user opposite things about the same launch.
+   */
+  onSpawnFailed?: () => void;
   onExit?: () => void;
   // Called when the active tab is shown, to put initial focus in the composer.
   /** The APP wants the caret in the composer — the reveal effect below, on pane show / agent
@@ -1242,6 +1254,9 @@ export function Terminal({
     });
     unlistens.push(offOut, offExit);
 
+    // Did `transport.spawn` return? Read by the `.catch` below to tell "never started" from "started,
+    // then something in the tail threw" — see where it is set, just after the await.
+    let spawned = false;
     (async () => {
       // Re-fit right before spawning to capture the freshest measurement, then guard it: a pane
       // that's still display:none / pre-layout fits to a tiny size (cols≈12), which would make
@@ -1270,6 +1285,15 @@ export function Terminal({
       // detach (which already ran, on a not-yet-existing PTY) will never reap (roborev 46244).
       if (disposed) return;
       await transport.spawn({ command, args, cwd, cols, rows });
+      // THE BOUNDARY BETWEEN "never started" AND "started, then something downstream threw".
+      //
+      // The `.catch` below wraps this whole body, including the tail that runs AFTER a SUCCESSFUL
+      // spawn (`fit`, `syncPtySize`, `onReady`). Without this flag a throw in that tail reported a
+      // launch failure for a PTY that had really started — and since the brief is already in claude's
+      // argv by then, `noteBriefFailed` would tell the user to "Start again" on a working agent,
+      // briefing it twice. That is the remedy-copy hazard this branch exists to remove, so the catch
+      // has to know which side of the spawn it is on.
+      spawned = true;
       // Layout may have settled — or a ResizeObserver resize may have been dropped because the
       // PTY didn't exist yet — during the async spawn. Now that the PTY exists, sync the true
       // size (no-op while still hidden; the become-active effect covers that).
@@ -1279,8 +1303,23 @@ export function Terminal({
         } catch {
           /* still not laid out */
         }
-        syncPtySize(transport, term, sentPtySizeRef);
+        // ONCE THE PTY EXISTS, THE OWNER MUST HEAR EXACTLY ONE OF ready/failed — and the `!spawned`
+        // gate below means this tail can no longer report `failed`. So nothing in it may swallow
+        // `onReady`: a throw here would leave a RUNNING agent whose owner never learned it was up,
+        // so the opening brief stays marked in-flight, `awaitBriefDelivery` burns its whole bound and
+        // answers `unconfirmed` — and the documented consequence of a false `unconfirmed` is a human
+        // re-sending the brief into an already-briefed agent. That is the same double-brief the
+        // `spawned` flag was added to prevent, reached through the other door.
+        //
+        // `fit.fit()` was already individually caught; `syncPtySize` was not, and it runs BEFORE the
+        // only success signal. Ready is now reported first, and the size sync — which is a
+        // best-effort refinement, not a precondition — can fail without costing the signal.
         onReady?.();
+        try {
+          syncPtySize(transport, term, sentPtySizeRef);
+        } catch (e) {
+          console.debug("syncPtySize after spawn failed", agentId, e);
+        }
       }
     })().catch((e) => {
       // A rejected spawn chain (e.g. pty_spawn's worktree-scope guard, claude/shell not found, or a
@@ -1289,7 +1328,16 @@ export function Terminal({
       // Start again" state rather than a silent blank pane. (Guarded by `disposed` so a teardown-race
       // rejection on an unmounting terminal doesn't set state on a dead component.)
       console.debug("terminal spawn chain failed", agentId, e);
-      if (!disposed) setSpawnFail("failed");
+      // `!spawned` as well as `!disposed`: only a failure BEFORE the PTY existed is a failed launch.
+      // A throw in the post-spawn tail leaves a running agent, and reporting that as a launch failure
+      // would restart-and-double-brief it (see `spawned` above).
+      if (!disposed && !spawned) {
+        setSpawnFail("failed");
+        // TELL THE OWNER, not just the overlay. Same guards and same call site as the overlay, so the
+        // two can never disagree about whether this launch failed — which is exactly what went wrong
+        // when only the overlay knew (see `onSpawnFailed`).
+        onSpawnFailed?.();
+      }
     });
 
     // Copy-on-select: when the user finishes a mouse selection, copy it to the clipboard and show

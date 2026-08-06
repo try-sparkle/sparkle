@@ -81,6 +81,15 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
   const [errorMsg, setErrorMsg] = useState("");
   const [spawn, setSpawn] = useState<SpawnCmd | null>(null);
   const [ptyReady, setPtyReady] = useState(false);
+  // THE TERMINAL GAVE UP ON A LAUNCH THAT NEVER TOUCHED `phase` — its own spawn rejection.
+  //
+  // Same shape, same reason as AgentPane's `gaveUp`: `Terminal` catches a rejected spawn chain and
+  // sets only its own overlay, so neither the readiness derive below nor the abandon effect fires and
+  // this pane stays published as "starting" forever — every concierge send to it queued against a
+  // launch that has already failed. Pane STATE rather than a direct `setPaneFailed` write, so the
+  // registry value stays derivable (paneReadiness's contract), and cleared on ready so a successful
+  // retry recovers even when `ptyReady` is already true and React bails out of the re-render.
+  const [gaveUp, setGaveUp] = useState(false);
   // Why this machine can't open PRs, if it can't (null = it can, or we couldn't tell). Set during
   // prepare() so the pane says the same thing the agent was told — see submitBlockedReason.
   const [submitNotice, setSubmitNotice] = useState<string | null>(null);
@@ -114,6 +123,7 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
 
   const prepare = async () => {
     setPhase("preparing");
+    setGaveUp(false);
     setErrorMsg("");
     setPtyReady(false);
     try {
@@ -216,9 +226,9 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
   //  • on unmount: drop the entries and REPORT anything still held, rather than silently losing a
   //    delivery the concierge already promised.
   useEffect(() => {
-    if (phase === "error" || phase === "no-claude") setPaneFailed(agentId);
+    if (gaveUp || phase === "error" || phase === "no-claude") setPaneFailed(agentId);
     else setPaneReady(agentId, ptyReady);
-  }, [agentId, ptyReady, phase]);
+  }, [agentId, ptyReady, phase, gaveUp]);
   // `prepare` is re-created every render, so the registry gets a ref that always calls the latest.
   // A full RE-PREPARE, not `Terminal.restart()`: the exec string in `args` was built by the last
   // prepare (consent mode, --add-dir, resume-vs-fresh all baked in), so only going through prepare
@@ -246,8 +256,8 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
   // A spawn that ERRORS or finds no Claude never flips ptyReady, so a held prompt would dangle with
   // no outcome. Report it the moment the pane gives up (roborev 46311) — the pane may never unmount.
   useEffect(() => {
-    if (phase === "error" || phase === "no-claude") abandonPendingSends(agentId);
-  }, [phase, agentId]);
+    if (gaveUp || phase === "error" || phase === "no-claude") abandonPendingSends(agentId);
+  }, [phase, agentId, gaveUp]);
 
   // The visible, ready pane takes the caret: with no composer over it, the terminal IS this pane's
   // input surface for anyone who wants to type directly. Verbatim the rule AgentPane follows, and
@@ -367,7 +377,16 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
               // the composer gone the terminal owns the whole stage and its own mouse mode again,
               // which is how AgentPane has always mounted it.
               onStatus={(s) => setStatus(agentId, s)}
-              onReady={() => setPtyReady(true)}
+              onReady={() => {
+                // Clear the gave-up latch here, not only in `prepare()`: Terminal's own "Start again"
+                // is an internal attempt bump that never re-enters `prepare()`, so a prepare-only
+                // clear would leave this pane published `failed` through a successful retry.
+                setGaveUp(false);
+                setPtyReady(true);
+              }}
+              // Terminal owns the spawn rejection and it never reaches `phase`; without this the pane
+              // stays "starting" forever and concierge sends queue against a dead launch.
+              onSpawnFailed={() => setGaveUp(true)}
               // NO `onRequestFocus` / `onUserRequestFocus` either: both handed the caret to the
               // composer, and the ⌘J one additionally named THIS pane as the dictation surface.
               // With nothing to focus, the chord is swallowed (Terminal returns false either way)

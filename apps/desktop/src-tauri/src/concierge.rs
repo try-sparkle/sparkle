@@ -127,8 +127,12 @@ guaranteed to go stale. `spawn_build_agent` replies with `agentId`, `agentExists
 agent still exists — `provisionalName` (with `nameIsProvisional: true`). CHECK `agentExists` FIRST. \
 When it is false the agent was closed (or its project was) while the spawn was still starting it, \
 so the row is GONE and `provisionalName` is absent: do NOT render a pill for it, do NOT call \
-`send_to_agent_terminal` or `close_agent` on that id, and do not describe it as running. Say it was \
-closed before it got its brief, and offer to start a fresh one. An id from the reply is not proof \
+`send_to_agent_terminal` or `close_agent` on that id, and do not describe it as running. SAY WHAT \
+THE REPLY SAYS: use its `briefFailure` sentence, which is written for the exact case, and do not \
+impose a chronology of your own. In particular do NOT assert the agent closed BEFORE it got its \
+brief unless the reply says so — `briefDelivery: \"submitted\"` with `agentExists: false` means the \
+brief DID go in and the row was closed after, and telling the user the opposite invites them to \
+re-send a brief the agent already had. Offer to start a fresh one either way. An id from the reply is not proof \
 the agent is there — this one field is what tells you, and a pill built from a dead id opens \
 nothing while looking exactly like a working one. The provisional name is a spawn-time placeholder \
 like 'Build 17' that \
@@ -1980,6 +1984,13 @@ mod tests {
         // rendering a pill from a dead id — which opens nothing while looking exactly like a working
         // one — and keep firing follow-up ops at it. Same seam as the two above, same reason.
         assert!(CONCIERGE_PERSONA.contains("agentExists"));
+    // Same seam, same reason: the persona now tells the model to USE these two keys instead of
+    // imposing its own chronology, and both are produced in TypeScript (conciergeTools/lifecycle.ts)
+    // with no type system spanning the two languages. Rename either there and the persona keeps
+    // naming a key that no longer exists — and the documented fallback is the model re-inventing the
+    // chronology, which is the exact defect naming them was meant to close.
+    assert!(CONCIERGE_PERSONA.contains("briefFailure"));
+    assert!(CONCIERGE_PERSONA.contains("briefDelivery"));
         // …and the RULE, not just the field name: knowing the flag exists is useless without being
         // told what false means and what not to do about it.
         assert!(CONCIERGE_PERSONA.contains("do NOT render a pill"));

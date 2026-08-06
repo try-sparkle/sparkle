@@ -66,6 +66,84 @@ describe("AgentPane — the opening brief is delivered as launch argv", () => {
     expect(code).toMatch(/noteBriefFailed\(agent\.id/);
   });
 
+  it("retracts the in-flight mark when the run ends without reaching the PTY", () => {
+    // THE OTHER HALF OF THE SAME JOIN, and the one with no runtime test at all: `inFlight` is set by
+    // `briefForLaunch` and has exactly two ways back down — `noteBriefFailed` (spawn error /
+    // no-claude) and this. Delete this call and a pane that unmounts between reading the brief and
+    // `pty_spawn` leaves the flag stuck true, so a wait that times out afterwards answers `launching`
+    // — "give it a moment rather than re-sending" — about a launch that is not happening. The
+    // service's own behaviour is asserted in `services/agentBrief.test.ts`; nothing but this pins the
+    // CALL, and the service is inert without it.
+    //
+    // Pinned INSIDE the prepare effect's cleanup, not file-wide: the defect is that nothing ran on an
+    // abandoned launch, so the same call in any other effect would satisfy a bare grep and still
+    // never fire for the case it exists for. The capture is bounded by that effect's own dep array,
+    // so it cannot quietly swallow a later effect.
+    const cleanup = code.match(
+      /void prepare\(\);[\s\S]*?return \(\) => \{([\s\S]*?)\n {2}\}, \[agent\.id, agent\.runtime\]/,
+    );
+    expect(cleanup).not.toBeNull();
+    // Gated on the ref — `ptyReady` clears it, so a launch that DID reach the pty (and already
+    // reported `submitted`) must not be retracted — and the ref is cleared with it, so a second
+    // cleanup pass cannot re-retract a brief a remount has since taken.
+    expect(cleanup![1]).toMatch(
+      /if \(launchBriefRef\.current\) \{[^}]*launchBriefRef\.current = undefined;[^}]*noteBriefLaunchAbandoned\(agent\.id\);/,
+    );
+  });
+
+  it("reports a REJECTED spawn to the brief, not just to the terminal's own overlay", () => {
+    // THE THIRD WAY A LAUNCH CAN END, and the one that reached nobody. `Terminal` catches a rejected
+    // spawn chain and sets its OWN "Couldn't start the agent" state; that never touches this pane's
+    // `phase`, so the phase-driven `noteBriefFailed` below never fired and the brief stayed marked
+    // in-flight. `spawn_build_agent` then answered `launching` — "give it a moment" — 45s after the
+    // pane had already told the user the agent could not start: two surfaces contradicting each other
+    // about one launch.
+    //
+    // BOUNDED TO THE ARROW BODY (`[^{}]*`), not `[\s\S]*?`. The unbounded form could run past the
+    // callback's closing brace to ANY later `noteBriefFailed(agent.id` in the file, so emptying this
+    // callback while such a call existed below would still pass — non-vacuous only by the accident
+    // that no later occurrence exists today. The sibling guard above bounds its capture for the same
+    // reason; verify this one by emptying the BODY, not by deleting the prop.
+    expect(code).toMatch(/onSpawnFailed=\{\(\) => \{[^{}]*giveUpOnLaunch\(/);
+  });
+
+  it("gives up through ONE helper, so no path can report a subset of the three consequences", () => {
+    // Giving up must publish `setPaneFailed` (or paneReadiness stays "starting" forever and every
+    // later send is queued against a delivery nobody can make), `abandonPendingSends` (or text typed
+    // while starting dangles — nothing ages a hold out), and `noteBriefFailed`. This shipped once
+    // with the terminal-rejection path wired to `noteBriefFailed` ALONE, so the brief was told and
+    // the other two waiters were stranded. Pinned as: the helper does all three, and it is what both
+    // give-up paths call — a future path that picks a subset has to route around this to do it.
+    const helper = code.match(/const giveUpOnLaunch = useCallback\(\s*\(reason: string\) => \{([^}]*)\}/);
+    expect(helper).not.toBeNull();
+    expect(helper![1]).toMatch(/setGaveUp\(true\)/);
+    expect(helper![1]).toMatch(/abandonPendingSends\(agent\.id\)/);
+    expect(helper![1]).toMatch(/noteBriefFailed\(agent\.id, reason\)/);
+    // …and the phase-driven path uses it too, rather than keeping its own copy of the three.
+    expect(code).toMatch(/giveUpOnLaunch\(\s*phase === "no-claude"/);
+    // THE REGISTRY VALUE STAYS DERIVED. `paneReadiness`'s contract is that the pane republishes
+    // through its guard; writing `setPaneFailed` straight from the terminal path broke it BOTH ways —
+    // reverted to "starting" by any later re-run, and able to STICK on `failed` through a successful
+    // retry (ptyReady is already true, so React bails and the effect never re-runs). So the helper
+    // must set pane STATE, and the publish effect must read it.
+    expect(helper![1]).not.toMatch(/setPaneFailed\(/);
+    expect(code).toMatch(/if \(gaveUp \|\| phase === "error"/);
+    // AND IT MUST BE CLEARED ON `onReady`, not only in `prepare()`. Terminal's own "Start again" is
+    // an internal attempt bump that re-runs ITS spawn effect and never re-enters `prepare()`, so a
+    // prepare-only clear made the latch PERMANENT for the exact path that sets it: rejected spawn
+    // publishes `failed`, the next attempt succeeds, and the pane stays `failed` for the rest of its
+    // mount — every send to a healthy agent answering "agent-failed", strictly worse than the
+    // self-healing bug the latch replaced. `prepare()`'s clear also sits below its think/shell early
+    // returns. Ready is the honest inverse of gave-up, so ready is where it must clear.
+    const onReadyBody = code.match(/onReady=\{\(\) => \{([^{}]*)\}\}/);
+    expect(onReadyBody).not.toBeNull();
+    expect(onReadyBody![1]).toMatch(/setGaveUp\(false\)/);
+    // KEPT ALONGSIDE, not replaced by the line above: `prepare()`'s clear is belt-and-braces for the
+    // paths that DO re-enter it, and swapping one assertion for the other left it unpinned and
+    // silently deletable. Both clears are load-bearing for different paths.
+    expect(code).toMatch(/setPhase\("preparing"\);\s*setGaveUp\(false\)/);
+  });
+
   it("no longer routes the opening brief through the PTY paste that lost the submit", () => {
     // `flushPendingSends` stays — it serves free-text sends typed at a starting agent — but the pane
     // must not gain a `submitPrompt`/`pasteIntoPty` call for the BRIEF. That path writes on

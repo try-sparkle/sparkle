@@ -9,7 +9,7 @@
 // Each test here asserts the SIDE EFFECT (the brief rides claude's argv, so claude submits it; and
 // `briefed` reflects an observation) rather than the precondition (a prompt was passed in) — the
 // latter was already true of the broken code, which is exactly why nothing caught this.
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 vi.mock("../logger", () => ({
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -19,10 +19,12 @@ import {
   __heldWaiterCount,
   attachBrief,
   awaitBriefDelivery,
+  BRIEF_DELIVERY_TIMEOUT_MS,
   briefForLaunch,
   clearBrief,
   hasUndeliveredBrief,
   noteBriefFailed,
+  noteBriefLaunchAbandoned,
   noteBriefLaunched,
   resetAgentBriefs,
 } from "./agentBrief";
@@ -222,5 +224,174 @@ describe("`briefed` is an OBSERVATION — it may not be inferred from the input"
     await expect(awaitBriefDelivery("never-briefed", { timeoutMs: 10_000 })).resolves.toEqual({
       state: "submitted",
     });
+  });
+});
+
+// THE BOUND MUST COVER THE LAUNCH LATENCY THAT ACTUALLY OCCURS.
+//
+// These use the REAL default bound deliberately — passing `timeoutMs` would test the plumbing and
+// leave the constant, which is the thing that was wrong, unpinned.
+//
+// The incident: three consecutive concierge spawns reported `unconfirmed` for briefs that were
+// delivered. Measured from the app's own logs, the time from a pane starting its launch to
+// `pty_spawn` returning had a p50 of 7.5s and a p90 of 24.5s across 108 spawns that day — so the 20s
+// bound was under the real distribution and 13.9% of spawns raised a false alarm about an agent that
+// was briefed and working. The three were 18.5s, 18.7s and 39.8s (and the wait starts before the
+// pane's launch does, so even the sub-20s pair ran out of patience).
+describe("the delivery bound vs how long a launch really takes", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  // Fails against the 20s bound: the timer fires at 20s and resolves `unconfirmed` before the launch
+  // this test then reports. That is exactly the false alarm the incident produced.
+  it("still confirms a launch that takes 25s — the p90 of real spawns, which the old bound cut off", async () => {
+    attachBrief("slow", BRIEF);
+    const pending = awaitBriefDelivery("slow");
+    await vi.advanceTimersByTimeAsync(25_000);
+    // The pane's launch lands here, later than the old bound but well within a realistic spawn.
+    expect(briefForLaunch("slow", false)).toBe(BRIEF);
+    expect(noteBriefLaunched("slow")).toBe(BRIEF);
+    await expect(pending).resolves.toEqual({ state: "submitted" });
+  });
+
+  // The counterweight: the bound must still EXIST. A test that only proved "25s confirms" would pass
+  // against an unbounded wait, which would hang the concierge's whole round trip.
+  it("still gives up eventually, so the reply cannot hang on a launch that never comes", async () => {
+    attachBrief("never", BRIEF);
+    const pending = awaitBriefDelivery("never");
+    await vi.advanceTimersByTimeAsync(BRIEF_DELIVERY_TIMEOUT_MS + 1_000);
+    await expect(pending).resolves.toEqual({ state: "unconfirmed" });
+  });
+});
+
+// WHICH SILENCE WAS IT? — the distinction that stops a duplicate brief.
+//
+// A timeout used to report `unconfirmed` whether or not a launch was already carrying the brief in
+// its argv. Those are different facts with opposite remedies, and the reply's copy acted on the wrong
+// one: told to "check that it picked up the task", the concierge re-sent the brief into three agents
+// that had already received it.
+describe("a timeout says WHICH silence it was", () => {
+  it("reports `launching` when a launch is already carrying the brief in its argv", async () => {
+    attachBrief("c1", BRIEF);
+    // The pane reads the brief into its spawn — delivery is committed to a command line from here.
+    expect(briefForLaunch("c1", false)).toBe(BRIEF);
+    let fire: (() => void) | undefined;
+    const pending = awaitBriefDelivery("c1", {
+      setTimer: (fn) => {
+        fire = fn;
+        return 1;
+      },
+      clearTimer: () => {},
+    });
+    fire!();
+    await expect(pending).resolves.toEqual({ state: "launching" });
+  });
+
+  // Guards the test above against vacuity: if `launching` were returned unconditionally, this fails.
+  it("still reports `unconfirmed` when NOTHING has read the brief to launch with", async () => {
+    attachBrief("c2", BRIEF);
+    let fire: (() => void) | undefined;
+    const pending = awaitBriefDelivery("c2", {
+      setTimer: (fn) => {
+        fire = fn;
+        return 1;
+      },
+      clearTimer: () => {},
+    });
+    fire!();
+    await expect(pending).resolves.toEqual({ state: "unconfirmed" });
+  });
+
+  // A pane that GAVE UP is not a launch in flight. The brief is retained for its Retry, so the entry
+  // survives — but nothing is carrying it, and saying `launching` would tell the human to sit and
+  // wait for a launch that is over.
+  it("goes back to `unconfirmed` after a failed launch, since nothing is carrying the brief now", async () => {
+    attachBrief("c3", BRIEF);
+    expect(briefForLaunch("c3", false)).toBe(BRIEF);
+    noteBriefFailed("c3", "claude not found");
+    // The brief is still deliverable by a Retry…
+    expect(hasUndeliveredBrief("c3")).toBe(true);
+    // …but a fresh wait must not claim a launch is in flight.
+    let fire: (() => void) | undefined;
+    const pending = awaitBriefDelivery("c3", {
+      setTimer: (fn) => {
+        fire = fn;
+        return 1;
+      },
+      clearTimer: () => {},
+    });
+    fire!();
+    await expect(pending).resolves.toEqual({ state: "unconfirmed" });
+  });
+
+  // AN ABANDONED LAUNCH MUST NOT KEEP CLAIMING TO BE IN FLIGHT.
+  //
+  // `inFlight` was set on read and cleared ONLY by `noteBriefFailed`, which the pane calls just for
+  // `error`/`no-claude`. A pane that unmounted between reading the brief and `pty_spawn` (tab closed,
+  // project switched, run superseded) left the flag stuck true, so a later timeout said `launching` —
+  // "give it a moment rather than re-sending" — about a launch that had stopped happening. That is
+  // the wrong-remedy shape this module exists to close, relocated into the flag added to close it.
+  it("stops reporting `launching` once the launch carrying the brief was abandoned", async () => {
+    attachBrief("c5", BRIEF);
+    expect(briefForLaunch("c5", false)).toBe(BRIEF);
+    // The pane unmounts before the PTY is spawned.
+    noteBriefLaunchAbandoned("c5");
+    let fire: (() => void) | undefined;
+    const pending = awaitBriefDelivery("c5", {
+      setTimer: (fn) => {
+        fire = fn;
+        return 1;
+      },
+      clearTimer: () => {},
+    });
+    fire!();
+    // `unconfirmed`, whose copy correctly says to go and check — not `launching`.
+    await expect(pending).resolves.toEqual({ state: "unconfirmed" });
+  });
+
+  // …but abandoning is NOT a failure: nothing is reported, and the brief stays deliverable so the
+  // next mount still carries it. Guards the fix against being written as a `settle`.
+  it("keeps the brief deliverable after an abandoned launch, answering no waiter", async () => {
+    attachBrief("c6", BRIEF);
+    expect(briefForLaunch("c6", false)).toBe(BRIEF);
+    let settled: unknown;
+    // Braces, not a bare assignment expression: `(settled = o)` would make this promise RESOLVE to
+    // the outcome, so the "nothing was reported" assertion below would read the value it is meant to
+    // prove absent.
+    const pending = awaitBriefDelivery("c6", { timeoutMs: 10_000 }).then((o) => {
+      settled = o;
+    });
+    noteBriefLaunchAbandoned("c6");
+    await Promise.resolve();
+    // No outcome was pushed to the waiter — abandoning is not an answer.
+    expect(settled).toBeUndefined();
+    expect(hasUndeliveredBrief("c6")).toBe(true);
+    // The remount re-reads it and really delivers.
+    expect(briefForLaunch("c6", false)).toBe(BRIEF);
+    expect(noteBriefLaunched("c6")).toBe(BRIEF);
+    await expect(pending).resolves.toBeUndefined();
+    expect(settled).toEqual({ state: "submitted" });
+  });
+
+  // `inFlight` is set by whatever read happens DURING the wait, which is the ordinary case for a slow
+  // spawn: the concierge is already waiting when the pane finally gets to its launch. Reading the
+  // flag captured at call time instead of the current entry would report `unconfirmed` here.
+  it("reports `launching` when the launch reads the brief AFTER the wait began", async () => {
+    attachBrief("c4", BRIEF);
+    let fire: (() => void) | undefined;
+    const pending = awaitBriefDelivery("c4", {
+      setTimer: (fn) => {
+        fire = fn;
+        return 1;
+      },
+      clearTimer: () => {},
+    });
+    expect(briefForLaunch("c4", false)).toBe(BRIEF);
+    fire!();
+    await expect(pending).resolves.toEqual({ state: "launching" });
   });
 });

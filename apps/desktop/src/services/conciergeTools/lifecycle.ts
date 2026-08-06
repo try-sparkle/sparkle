@@ -79,7 +79,7 @@ import { localAgentCapacity, type CapacityReading } from "../agentCapacity";
 import { shouldPromptOnClose } from "../../engine/closeAgent";
 import { resolveStage, stageIndex, type WorkflowStageId } from "../../engine/workflowStage";
 import { spawnBuildAgentInProject } from "../buildAgentSpawn";
-import { awaitBriefDelivery } from "../agentBrief";
+import { awaitBriefDelivery, type BriefDeliveryOutcome } from "../agentBrief";
 import { getModelCatalog, isDefaultModel, DEFAULT_MODEL_ID } from "../models";
 import { isTornOut } from "../satelliteWindows";
 import { atCapacitySentence } from "../agentCapacity";
@@ -409,11 +409,20 @@ export interface SpawnedBuildAgent {
    *                      from "launch-failed" because the two leave OPPOSITE worlds: here the row is
    *                      gone and the brief with it, so a retry remedy would name a control on a
    *                      deleted row (roborev 55850).
-   *  • "unconfirmed"   — no launch and no failure within the wait. The brief may yet go out, so this
-   *                      is explicitly not "failed" — but it is not success either, and nothing may
-   *                      upgrade it to one.
-   */
-  briefDelivery: "submitted" | "no-brief" | "launch-failed" | "agent-closed" | "unconfirmed";
+   *  • "launching"     — the wait ran out WHILE A LAUNCH WAS CARRYING THE BRIEF in its argv. Not a
+   *                      silence: claude is being exec'd with the prompt, so the only outcomes left
+   *                      are delivery or a launch failure that reports itself. The remedy is to WAIT,
+   *                      and explicitly NOT to re-send — re-sending double-briefs the agent.
+   *  • "unconfirmed"   — no launch has taken the brief and nothing failed within the wait. The brief
+   *                      may yet go out, so this is explicitly not "failed" — but it is not success
+   *                      either, and nothing may upgrade it to one. This is the only remaining value
+   *                      that leaves "the agent is sitting there briefless" on the table.
+   *
+   * Derived from {@link SpawnBriefDelivery} rather than re-listing the six literals: this field and
+   * `briefFailureCopy` must agree about what states exist, and a hand-copied union is exactly how
+   * they drift apart. Adding an outcome now updates this automatically and fails the copy function's
+   * exhaustiveness guard until someone decides what to say about it. */
+  briefDelivery: SpawnBriefDelivery["state"];
   /** Present only when `briefed` is false and a brief WAS asked for: what to tell the human, in the
    *  concierge's own voice, so an undelivered brief surfaces as a thing to act on instead of a
    *  silence. Absent when there was nothing to deliver or delivery succeeded. */
@@ -636,13 +645,6 @@ export async function spawnBuildAgent(
   const delivery = input.prompt
     ? await awaitBriefDelivery(agentId)
     : ({ state: "no-brief" } as const);
-  // THE REMEDY MUST BE AN ACTION THAT ACTUALLY WORKS under the conditions that triggered it — this
-  // repo treats a wrong remedy string as a bug, not phrasing.
-  //
-  // `launch-failed` means the agent's TERMINAL never started (spawn error, or no claude on PATH), so
-  // it is NOT "running with no objective" — an earlier draft said that, and it described the wrong
-  // state entirely. The row exists and its brief is still attached, so "Start again" is the correct
-  // action: `noteBriefFailed` deliberately RETAINS the brief precisely so a retry re-emits it.
   // OBSERVED AT REPLY TIME, never inferred from the delivery state.
   //
   // This was `delivery.state !== "agent-closed"`, which is a proxy for the question, not the answer —
@@ -659,31 +661,7 @@ export async function spawnBuildAgent(
     .getState()
     .projects.find((p) => p.id === project.id)
     ?.agents.some((a) => a.id === agentId) === true;
-  // THE ROW BEING GONE OUTRANKS THE DELIVERY OUTCOME, and this ordering is load-bearing.
-  //
-  // Making `agentExists` observed created a combination the copy never anticipated: `unconfirmed`
-  // TOGETHER WITH `agentExists: false` — which is not a corner but the whole reason the flag is
-  // observed (a row destroyed by any path that doesn't settle the brief leaves the delivery reading
-  // `unconfirmed`). Keyed on `delivery.state` alone, that reply told the human to "check that it
-  // picked up the task" about an agent that no longer exists, beside `agentExists: false` and a
-  // persona instruction to say it was closed. Same remedy-copy defect as the three before it,
-  // relocated into the one sentence still left unconditional (roborev 55888).
-  //
-  // So: if the row is gone, say so — whatever the delivery outcome was. Only a SURVIVING row gets
-  // the outcome-specific wording, because only then is there something to go and look at.
-  const briefFailure = !agentExists
-    ? "That agent is gone — it was closed before its opening brief went in, so nothing is running " +
-      "and the brief went with it. Say the word and I'll start a fresh one with the same brief."
-    : delivery.state === "launch-failed"
-      ? // The row survives and `noteBriefFailed` retained the brief, so the retry really does send it.
-        `I created the agent, but its terminal didn't start — ${delivery.reason} — so its opening ` +
-        `brief hasn't gone in yet. Its brief is still attached, so "Start again" on that agent will ` +
-        `send it; nothing needs re-typing.`
-      : delivery.state === "unconfirmed"
-        ? // The row is still THERE (checked above), so "go look at it" is an action they can take.
-          "I created the agent, but I couldn't confirm its opening brief went in. Check that it " +
-          "picked up the task before relying on it."
-        : undefined;
+  const briefFailure = briefFailureCopy(delivery, agentExists);
   return ok("spawn_build_agent", {
     agentId,
     projectId: project.id,
@@ -701,6 +679,113 @@ export async function spawnBuildAgent(
     mode: input.mode === "plan" ? "plan" : "build",
     model: isDefaultModel(input.model) ? DEFAULT_MODEL_ID : input.model!,
   });
+}
+
+/**
+ * Every delivery state a spawn REPLY can carry: the module's own outcomes plus `no-brief`, which is
+ * not one of them. `no-brief` is a fact about the REQUEST (none was asked for), settled here without
+ * ever consulting `agentBrief` — so it is deliberately not in `BriefDeliveryOutcome`, and this union
+ * is where the two meet.
+ */
+type SpawnBriefDelivery = BriefDeliveryOutcome | { readonly state: "no-brief" };
+
+/**
+ * What to tell the human when a brief did not confirm — `undefined` when there is nothing to say.
+ *
+ * ══ THE REMEDY MUST BE AN ACTION THAT ACTUALLY WORKS ══════════════════════════════════════════
+ *
+ * …under the conditions that triggered it. This repo treats a wrong remedy string as a bug, not as
+ * phrasing, and this one function has now been wrong four times in the same shape. Extracted from the
+ * reply body so each branch is directly testable: the defect is always a STATE reaching copy written
+ * for a different state, which is a property of this mapping and of nothing else.
+ *
+ *   • THE ROW BEING GONE OUTRANKS THE DELIVERY OUTCOME, and that ordering is load-bearing. Making
+ *     `agentExists` an observation created a combination the copy never anticipated — a timed-out
+ *     delivery TOGETHER WITH `agentExists: false` — because any path that destroys a row without
+ *     settling the brief leaves the delivery reading as a timeout. Keyed on the delivery state alone,
+ *     that reply told the human to "check that it picked up the task" about an agent that no longer
+ *     exists (roborev 55888). So: if the row is gone, say so, whatever the delivery outcome was. Only
+ *     a SURVIVING row gets outcome-specific wording, because only then is there something to look at.
+ *   • `launch-failed` means the agent's TERMINAL never started (spawn error, or no claude on PATH),
+ *     so it is NOT "running with no objective" — an earlier draft said that and described the wrong
+ *     state entirely. The row exists and `noteBriefFailed` deliberately RETAINS the brief, so
+ *     "Start again" genuinely re-emits it.
+ *   • `launching` vs `unconfirmed` is the newest split, and it exists because one string covered both.
+ *     Its "check that it picked up the task" was followed exactly as written on three consecutive
+ *     spawns whose briefs were already in claude's argv: the brief was re-sent by hand, double-briefing
+ *     each agent (one re-send the full-screen-app write guard refused outright). A brief committed to
+ *     a live launch needs patience, and saying anything that reads as "go make sure" invites the
+ *     duplicate — so that branch names waiting as the action and names re-sending as the harm.
+ */
+export function briefFailureCopy(
+  delivery: SpawnBriefDelivery,
+  agentExists: boolean,
+): string | undefined {
+  // THE ROW BEING GONE IS TESTED FIRST, and this ordering is the invariant the docstring states.
+  //
+  // Extracting this function once put the `submitted`/`no-brief` early return ABOVE this check, which
+  // silently reversed it: an agent whose brief HAD gone in and which was then closed during the reply
+  // window produced no `briefFailure` at all, where it previously said the row was gone. That is not
+  // cosmetic — `conciergeReceiptClassifier.spawnShortfall` marks the receipt fatal on
+  // `agentExists === false` and words it from this sentence, so dropping it downgraded the receipt to
+  // a generic "that agent is already gone" for the one case the human most needs the specifics of.
+  if (!agentExists) {
+    // …but the CLAUSE ABOUT THE BRIEF has to match what actually happened to it, or this becomes the
+    // same wrong-remedy defect one layer down: telling someone the brief never went in, when it did,
+    // invites them to re-send it to the replacement agent on top of a brief it already has.
+    const briefClause =
+      delivery.state === "submitted"
+        ? "it was closed right after its opening brief went in, so nothing is running"
+        : delivery.state === "no-brief"
+          ? "it was closed, so nothing is running"
+          : "it was closed before its opening brief went in, so nothing is running and the brief " +
+            "went with it";
+    const restart =
+      delivery.state === "no-brief"
+        ? "Say the word and I'll start a fresh one."
+        : "Say the word and I'll start a fresh one with the same brief.";
+    return `That agent is gone — ${briefClause}. ${restart}`;
+  }
+  if (delivery.state === "submitted" || delivery.state === "no-brief") return undefined;
+  switch (delivery.state) {
+    case "launch-failed":
+      return (
+        `I created the agent, but its terminal didn't start — ${delivery.reason} — so its opening ` +
+        `brief hasn't gone in yet. Its brief is still attached, so "Start again" on that agent will ` +
+        `send it; nothing needs re-typing.`
+      );
+    case "launching":
+      return (
+        "I created the agent and its opening brief is in the launch command claude is starting " +
+        "with, but it's still coming up, so I can't call it delivered yet. It should pick the task " +
+        "up on its own — give it a moment rather than re-sending, which would brief it twice."
+      );
+    case "unconfirmed":
+      // Reaching here now means something stronger than it used to: nothing ever read the brief to
+      // launch with, so this really is the "it may be sitting there briefless" case.
+      return (
+        "I created the agent, but I couldn't confirm its opening brief went in — nothing had " +
+        "picked it up to launch with. Check that it got the task before relying on it."
+      );
+    case "agent-closed":
+      // The row is gone, so the `!agentExists` branch above has already said so with the right
+      // sentence. Listed explicitly rather than falling into a default — see the exhaustiveness
+      // guard below for why this function may not have a catch-all arm.
+      return undefined;
+    default: {
+      // EXHAUSTIVE BY CONSTRUCTION — a `default: return undefined` here was a silent trapdoor.
+      //
+      // This is the one function whose documented defect mode is "a STATE reaching copy written for
+      // a different state", and a catch-all removes the compiler's only way to catch it: adding a
+      // sixth `BriefDeliveryOutcome` would yield `briefed: false` with NO `briefFailure`, so
+      // `conciergeReceiptClassifier.spawnShortfall` returns undefined and the receipt reads as a
+      // clean success for a brief that never arrived. Now a new outcome fails the typecheck here
+      // until someone decides what to say about it.
+      const _never: never = delivery;
+      void _never;
+      return undefined;
+    }
+  }
 }
 
 /**

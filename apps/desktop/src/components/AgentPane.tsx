@@ -69,7 +69,12 @@ import {
   flushPendingSends,
   recordPromptSideEffects,
 } from "../services/conciergeDispatch";
-import { briefForLaunch, noteBriefFailed, noteBriefLaunched } from "../services/agentBrief";
+import {
+  briefForLaunch,
+  noteBriefFailed,
+  noteBriefLaunchAbandoned,
+  noteBriefLaunched,
+} from "../services/agentBrief";
 import { setPaneFailed, setPaneReady, unregisterPane } from "../services/paneReadiness";
 import { isTypingInProgress } from "../engine/focusGuard";
 import { markTerminalAutoFocus } from "../services/terminalFocusIntent";
@@ -203,6 +208,18 @@ function AgentPaneInner({
   const resolvedTheme = useResolvedTheme();
 
   const [phase, setPhase] = useState<Phase>("preparing");
+  // THE PANE GAVE UP ON A LAUNCH THAT NEVER TOUCHED `phase` — i.e. the terminal's own spawn rejection.
+  //
+  // Pane STATE, not a direct `setPaneFailed` write, because paneReadiness's contract says the value
+  // must stay derivable: "the PANE owns the rule (AgentPane republishes through its phase guard)".
+  // Writing the registry from a path the publish effect cannot see broke that both ways — the write
+  // was silently reverted to "starting" by any later re-run of that effect, and worse it could STICK:
+  // pane ready → PTY exits → Terminal's own "Start again" (an internal attempt bump that never
+  // re-enters prepare()) rejects → published `failed`; the next attempt succeeds and calls
+  // `setPtyReady(true)`, but `ptyReady` is ALREADY true, so React bails out, the publish effect never
+  // re-runs, and a healthy running agent stays `failed` for the rest of its mount — every concierge
+  // send to it answering "agent-failed". Cleared in prepare(), so a retry recovers.
+  const [gaveUp, setGaveUp] = useState(false);
   const [errorMsg, setErrorMsg] = useState("");
   const [spawn, setSpawn] = useState<SpawnCmd | null>(null);
   const [ptyReady, setPtyReady] = useState(false);
@@ -523,6 +540,7 @@ function AgentPaneInner({
     // Rust resolves the base itself, so an as-yet-unresolved defaultBranch is fine here.
     void warmWorktreePool(project.rootPath, project.id, project.defaultBranch ?? "").catch(() => {});
     setPhase("preparing");
+    setGaveUp(false);
     setErrorMsg("");
     setPtyReady(false);
     // A re-prepare (Try again) restarts the agent from scratch — drop any prior hook watcher so
@@ -894,6 +912,17 @@ function AgentPaneInner({
       // startOrchestrationBridge resolves AFTER this cleanup runs, the build branch's token
       // comparison (myRun !== prepareRunRef.current) will detect the staleness and stop the bridge.
       prepareRunRef.current++;
+      // THIS RUN HAD READ THE OPENING BRIEF INTO ITS ARGV AND IS NOW OVER WITHOUT REACHING THE PTY.
+      //
+      // Retract the "a launch is carrying it" mark, or a concierge wait that times out after this
+      // answers `launching` — whose copy is "give it a moment rather than re-sending" — about a
+      // launch that is not happening (services/agentBrief.noteBriefLaunchAbandoned). `ptyReady`
+      // clears the ref, so this fires only for a launch abandoned BEFORE the child was exec'd; the
+      // brief itself stays held and deliverable for the next mount.
+      if (launchBriefRef.current) {
+        launchBriefRef.current = undefined;
+        noteBriefLaunchAbandoned(agent.id);
+      }
       stopHookWatch();
       // A build agent owns an orchestration bridge for its lifetime — stop it on close so its
       // socket + accept thread don't linger. Present THIS run's owner token so a fast close-reopen
@@ -978,9 +1007,9 @@ function AgentPaneInner({
   // prepare()) is what avoids latching not-ready on a same-runtime early-return re-prepare, where
   // nothing remounts Terminal to clear a reset flag (roborev 58063).
   useEffect(() => {
-    if (phase === "error" || phase === "no-claude") setPaneFailed(agent.id);
+    if (gaveUp || phase === "error" || phase === "no-claude") setPaneFailed(agent.id);
     else setPaneReady(agent.id, ptyReady && spawnMatchesTargetRuntime);
-  }, [agent.id, ptyReady, phase, spawnMatchesTargetRuntime]);
+  }, [agent.id, ptyReady, phase, spawnMatchesTargetRuntime, gaveUp]);
   useEffect(
     () => () => {
       unregisterPane(agent.id);
@@ -1023,15 +1052,39 @@ function AgentPaneInner({
   // between telling the user now that the message didn't go, and going silent for the rest of the
   // session on a pane that may never unmount. Telling them wins: the concierge names the agent and
   // says to send it again once it's running, which is exactly what a successful Retry allows.
+  // GIVING UP HAS THREE CONSEQUENCES, AND THEY MUST NOT DRIFT APART.
+  //
+  // Each one owns a different waiter, and any of them left out strands somebody:
+  //   • `setGaveUp`            — publishes pane FAILURE (via the derive effect above, never written
+  //     directly — see the `gaveUp` declaration for why). Without it `paneReadiness` stays "starting"
+  //     FOREVER, and that registry's own docstring says a prompt sent after the pane settles there
+  //     "would re-queue and dangle forever" (roborev 46924): every later send is then promised a
+  //     delivery nobody can make.
+  //   • `abandonPendingSends`  — free text typed while the agent was coming up is otherwise never
+  //     reported; nothing ages a hold out (roborev 46897), so it dangles until an unmount that the
+  //     comment below says may never happen.
+  //   • `noteBriefFailed`      — the opening brief no longer rides pendingSends, so the concierge's
+  //     `spawn_build_agent` must be told rather than left waiting on a delivery that cannot arrive.
+  //
+  // Written once because there are now TWO ways to reach it: the `phase` effect below, and the
+  // terminal's own spawn rejection, which never touches `phase` at all. Wiring only `noteBriefFailed`
+  // into that second path is a defect this file already shipped — the brief heard about the rejection
+  // while the send path and the readiness registry did not, which is the same "the fix relocates the
+  // bug" shape one door over. A single helper is what stops the next path from picking a subset.
+  const giveUpOnLaunch = useCallback(
+    (reason: string) => {
+      setGaveUp(true);
+      abandonPendingSends(agent.id);
+      noteBriefFailed(agent.id, reason);
+    },
+    [agent.id],
+  );
+
   useEffect(() => {
     if (phase === "error" || phase === "no-claude") {
-      abandonPendingSends(agent.id);
-      // Same reasoning for the opening brief, which no longer rides pendingSends: this pane will
-      // never launch it, so the concierge's `spawn_build_agent` must be told rather than left
-      // waiting on a delivery that cannot arrive. Reported, never dropped.
-      noteBriefFailed(agent.id, phase === "no-claude" ? "claude not found" : "agent spawn failed");
+      giveUpOnLaunch(phase === "no-claude" ? "claude not found" : "agent spawn failed");
     }
-  }, [phase, agent.id]);
+  }, [phase, agent.id, giveUpOnLaunch]);
 
   // Flush any prompt the user sent while this agent's PTY was still coming up (services/
   // pendingSends): "create an agent, then tell it what to do" reaches the dispatch path before the
@@ -1204,8 +1257,36 @@ function AgentPaneInner({
               active={visible}
               onStatus={(s) => routerRef.current!.fromScreen(s)}
               onReady={() => {
+                // CLEARED HERE, NOT ONLY IN `prepare()` — this is the one signal that means the agent
+                // is actually up, whichever path got it there.
+                //
+                // Clearing only in `prepare()` made the latch permanent for the very path that sets
+                // it: Terminal's own "Start again" is an internal attempt bump that re-runs ITS spawn
+                // effect and never re-enters `prepare()`. So a rejected spawn published `failed`, the
+                // next attempt succeeded, and the pane stayed `failed` for the rest of its mount —
+                // every concierge send to a healthy, running agent answering "agent-failed". That is
+                // strictly worse than the bug the latch replaced, which at least self-healed.
+                // (`prepare()`'s clear also sits below its think/shell early returns, so it does not
+                // even cover every path that DOES re-enter it.) Ready is the honest inverse of gave-up.
+                setGaveUp(false);
                 perfEnd(agent.id, "pty ready"); // final milestone of the spawn waterfall
                 setPtyReady(true);
+              }}
+              onSpawnFailed={() => {
+                // THE TERMINAL'S FAILURE HAS TO REACH EVERY WAITER, not just the brief. A rejected
+                // spawn chain sets Terminal's own "Couldn't start the agent" state WITHOUT going
+                // through this pane's `phase`, so none of the give-up effects fire on their own.
+                //
+                // Routed through the shared helper rather than calling `noteBriefFailed` alone —
+                // which is what this first shipped as, stranding the send path and the readiness
+                // registry while the brief was correctly told. Each call is idempotent, so this is
+                // safe alongside the phase-driven path; whichever sees the failure first wins.
+                //
+                // NOT `setPhase("error")`, tempting as it is: that would fire the same three effects
+                // for free, but it also renders this pane's own full-plane "Couldn't start this
+                // agent" panel ON TOP OF the overlay Terminal is already showing for the same
+                // rejection — two error screens for one failure, with `errorMsg` never set.
+                giveUpOnLaunch("the terminal could not start");
               }}
               onExit={() => {
                 // NOTE (Plan-1 limitation): this block fires only when the PTY process actually

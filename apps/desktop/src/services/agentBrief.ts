@@ -67,16 +67,47 @@ export type BriefDeliveryOutcome =
    * trap the rest of this module exists to close, so the state is split rather than the copy patched.
    */
   | { state: "agent-closed"; reason: string }
-  /** No launch and no failure within the caller's patience. NOT the same as failure: the brief may
-   *  still go out. Reported as unconfirmed so nobody upgrades a silence into a success. */
+  /**
+   * The caller's patience ran out while a launch WAS ALREADY CARRYING this brief in its argv —
+   * `briefForLaunch` had handed the text to a pane's spawn, but that spawn had not yet reported
+   * `ptyReady`. Distinct from `unconfirmed`, and the distinction is the whole point.
+   *
+   * This is not a silence. The brief is committed to a specific launch's command line, and only two
+   * futures remain: the exec returns (`submitted`) or the pane gives up (`launch-failed`, reported
+   * promptly and loudly by `noteBriefFailed`). Neither of them is "the agent sits there briefless",
+   * which is the state `unconfirmed` cannot rule out and this one can.
+   *
+   * WHY IT EXISTS AT ALL — a bound cannot be made big enough to delete the tail. Measured over 108
+   * spawns in one day, the time from the pane starting its launch to `pty_spawn` returning had a p50
+   * of 7.5s, a p90 of 24.5s and a max of 39.8s; it tracks worktree-prep cost, so a busy machine or a
+   * large repo moves the whole distribution right. Any fixed patience is therefore a race, and the
+   * honest fix is to say WHICH race you lost rather than picking a bigger number and calling it
+   * certainty.
+   *
+   * The remedy that fits it is WAIT, not re-send. That matters concretely: three consecutive
+   * concierge spawns reported the old bare `unconfirmed`, whose copy said "check that it picked up
+   * the task", and the recovery was a hand re-send of the brief — into agents that had already
+   * received it as argv, i.e. a duplicate brief. One of those re-sends was refused outright by the
+   * full-screen-app write guard.
+   */
+  | { state: "launching" }
+  /** No launch has read this brief AND nothing failed within the caller's patience — nothing has
+   *  taken delivery of it at all. The genuinely unknown case (no pane mounted, most likely), and the
+   *  only one that leaves "briefless agent" on the table. Never upgraded into a success. */
   | { state: "unconfirmed" };
 
 interface Held {
   text: string;
-  /** Set once a launch actually CARRIED this brief, so a later relaunch does not re-submit it. Note
-   *  this is NOT "an outcome was reported": a `launch-failed` answers the waiters but leaves the
-   *  brief deliverable, because the pane's Retry is expected to carry it (see `noteBriefFailed`). */
-  launched: boolean;
+  /**
+   * A launch has READ this brief into its argv (`briefForLaunch` returned the text) but has not yet
+   * reported an outcome. The difference between "we are waiting on a launch we can name" and "we are
+   * waiting on nothing" — see the `launching` outcome for why that distinction is load-bearing.
+   *
+   * Cleared by `noteBriefFailed`, because that launch is over: the brief is retained for the pane's
+   * Retry, and until that Retry reads it again there is once more no launch carrying it. Leaving it
+   * set would report `launching` for a pane that had already given up.
+   */
+  inFlight: boolean;
   waiters: Array<(o: BriefDeliveryOutcome) => void>;
 }
 
@@ -85,7 +116,7 @@ const held = new Map<string, Held>();
 /** Hold `text` as `agentId`'s opening brief, to be emitted as claude's positional prompt by the
  *  pane's next FRESH launch. Replaces any brief not yet delivered (a re-spawn supersedes it). */
 export function attachBrief(agentId: string, text: string): void {
-  held.set(agentId, { text, launched: false, waiters: [] });
+  held.set(agentId, { text, inFlight: false, waiters: [] });
 }
 
 /**
@@ -99,13 +130,20 @@ export function attachBrief(agentId: string, text: string): void {
 export function briefForLaunch(agentId: string, resume: boolean): string | undefined {
   if (resume) return undefined;
   const h = held.get(agentId);
-  return h && !h.launched ? h.text : undefined;
+  if (!h) return undefined;
+  // THE MOMENT THE BRIEF STOPS BEING A SILENCE. Returning the text here IS the commitment: the caller
+  // puts it in the launch's argv, so from now on a wait that runs out of patience can say `launching`
+  // (a named launch is carrying it) instead of `unconfirmed` (nothing has taken it). Marked here
+  // rather than at `setSpawn` because this is the only read — and a superseded run does not falsify
+  // it: the brief is retained until delivery settles, so the pane's next attempt reads it again and a
+  // launch really is still in progress. Only `noteBriefFailed` — a pane that gave up — clears it.
+  h.inFlight = true;
+  return h.text;
 }
 
 /** Is a brief still waiting to go out for this agent? (For UI copy and tests.) */
 export function hasUndeliveredBrief(agentId: string): boolean {
-  const h = held.get(agentId);
-  return !!h && !h.launched;
+  return held.has(agentId);
 }
 
 /**
@@ -149,9 +187,8 @@ function settle(agentId: string, outcome: BriefDeliveryOutcome, drop: boolean): 
  */
 export function noteBriefLaunched(agentId: string): string | undefined {
   const h = held.get(agentId);
-  if (!h || h.launched) return undefined;
+  if (!h) return undefined;
   log.debug("agent-brief", "brief delivered as launch argv", { agentId });
-  h.launched = true;
   // Consumed: a real launch carried it, so no relaunch may submit it a second time.
   settle(agentId, { state: "submitted" }, true);
   // Handed back so the caller can record the prompt side-effects for it (pinned header, prompt
@@ -161,14 +198,43 @@ export function noteBriefLaunched(agentId: string): string | undefined {
 }
 
 /**
+ * The launch that had read this brief is OVER without having reached the PTY — the pane unmounted
+ * (tab closed, project switched, run superseded) between `briefForLaunch` and `pty_spawn`.
+ *
+ * WITHOUT THIS, `inFlight` HAD NO WAY BACK DOWN except `noteBriefFailed`, which the pane calls only
+ * for `phase === "error" | "no-claude"`. Every other abandonment left the flag stuck true, so a wait
+ * that timed out afterwards answered `launching` — "give it a moment rather than re-sending" — about
+ * a launch that was not happening. That is the very wrong-remedy shape this module exists to close,
+ * relocated into the flag added to close it: before `inFlight` existed the same path reported
+ * `unconfirmed` and correctly said to go check. The window is the 7–40s a real launch takes, so it
+ * is not a corner.
+ *
+ * DELIBERATELY NOT A SETTLE. No outcome is reported and no waiter is answered: nothing has failed —
+ * the brief is still held and still deliverable, and a caller mid-wait should keep waiting in case
+ * the pane remounts. This only retracts the "a launch is carrying it" claim, so a LATER timeout tells
+ * the truth. No-op once the brief has actually launched.
+ */
+export function noteBriefLaunchAbandoned(agentId: string): void {
+  const h = held.get(agentId);
+  if (!h || !h.inFlight) return;
+  log.debug("agent-brief", "launch abandoned before the brief reached the pty", { agentId });
+  h.inFlight = false;
+}
+
+/**
  * The pane will never launch this brief: its spawn errored, or there is no claude to run. Reported
  * rather than dropped — a brief that was promised and then silently vanished is exactly the failure
  * this module exists to end (and it is the same reason `abandonPendingSends` exists).
  */
 export function noteBriefFailed(agentId: string, reason: string): void {
   const h = held.get(agentId);
-  if (!h || h.launched) return;
+  if (!h) return;
   log.warn("agent-brief", "brief was never launched", { agentId, reason });
+  // That launch is OVER, so nothing is carrying the brief any more. Cleared before the settle so a
+  // wait that times out after this reports `unconfirmed` (nothing has taken delivery) rather than
+  // `launching` (a live launch has it in its argv) — the latter would tell the human to sit and wait
+  // for a pane that has already given up, which is the remedy-copy trap this module exists to close.
+  h.inFlight = false;
   // RETAINED, not dropped: the pane offers Retry, and a Retry must carry the brief. Dropping it here
   // is what made a restart produce a silently briefless agent while the failure copy recommended
   // restarting. Only `clearBrief` (the agent is gone) discards an unlaunched brief.
@@ -183,22 +249,48 @@ export function noteBriefFailed(agentId: string, reason: string): void {
  * ══ IT MUST STAY UNDER THE MCP BRIDGE'S OWN TIMEOUT ═══════════════════════════════════════════
  *
  * `spawn_build_agent` is reachable from the sparkle-control MCP server, whose
- * `bridge.request("concierge_tool", …)` bounds the round trip at `DEFAULT_TIMEOUT_MS = 30_000`
- * (apps/mcp-control/src/bridgeClient.ts) and passes no override. This was 45s, which outlived that
- * transport: any briefed spawn slower than 30s killed the socket first, so the caller got a thrown
- * `bridge request timeout` for a spawn that HAD created the agent and consumed a capacity slot — and
- * the natural response to a timeout is a retry, which duplicates the agent. The honest
- * `unconfirmed` / `launch-failed` payloads this whole change exists to deliver could never reach an
- * MCP caller at all. Before the wait was introduced the op answered in milliseconds, so the 30s
- * bound was never in play.
+ * `bridge.request("concierge_tool", …)` bounds the round trip. This was once 45s against that
+ * transport's 30s DEFAULT, which inverted the whole point of the change: any briefed spawn slower
+ * than 30s killed the socket first, so the caller got a thrown `bridge request timeout` for a spawn
+ * that HAD created the agent and consumed a capacity slot — and the natural response to a timeout is
+ * a retry, which duplicates the agent. The honest `unconfirmed` / `launch-failed` payloads this whole
+ * change exists to deliver could never reach an MCP caller at all. Before the wait was introduced the
+ * op answered in milliseconds, so the 30s bound was never in play.
  *
- * So this is deliberately well under it, leaving room for the rest of the round trip.
- * `agentBrief.bridgeBound.test.ts` reads the bridge's constant and fails if the two ever cross.
+ * The answer to that was to cut this to 20s — and THAT number was measured against nothing. It sits
+ * under the real launch latency, so it manufactured false alarms out of ordinary slow spawns (see
+ * below). The transport bound is a knob, not a law of nature: `conciergeToolCall` now passes an
+ * explicit `CONCIERGE_TOOL_TIMEOUT_MS`, so the ceiling is raised for the one op that needs it instead
+ * of the wait being squeezed under a default meant for cheap synchronous reads.
+ * `agentBrief.bridgeBound.test.ts` reads the bridge call's ACTUAL bound and fails if the two cross.
  *
- * Waiting for `ptyReady` (which is `pty_spawn` returning, not a booted TUI) does not need tens of
- * seconds — worktree prep, the Claude check and the bridge start are what it actually covers.
+ * ══ WHY 45s, AND WHERE THE NUMBER COMES FROM ══════════════════════════════════════════════════
+ *
+ * Waiting for `ptyReady` (which is `pty_spawn` returning, not a booted TUI) covers worktree prep, the
+ * Claude check and the bridge start — and on a machine running a fleet those are not fast. Measured
+ * over 108 spawns in one day: p50 7.5s, p75 14.8s, p90 24.5s, p95 26.3s, max 39.8s. **13.9% exceeded
+ * the old 20s bound.** That is not a corner case; it is one spawn in seven raising a false alarm
+ * about a brief that had been delivered, on an agent that was working.
+ *
+ * It is what happened on three consecutive concierge spawns: 18.5s, 18.7s and 39.8s from the pane
+ * starting its launch to `pty_spawn` — and the wait starts BEFORE that, at the spawn call, so even
+ * the sub-20s pair ran out of patience. All three agents launched, took the brief from their argv and
+ * worked normally. Because the reply said the brief could not be confirmed, it was re-sent by hand:
+ * a duplicate brief into an already-briefed agent, one of which the full-screen write guard refused.
+ *
+ * 45s clears the observed maximum (39.8s) — and it is a CEILING, not just a floor. It cannot simply
+ * be raised to buy more comfort: the concierge's liveness clock treats a tool call as silence, so the
+ * worst-case quiet is the TRANSPORT bound plus the MCP return plus the model's first delta, against a
+ * 60s sticky-RED latch. Widening the wait widens the transport above it and eats that margin, which
+ * is how a fix for a false alarm becomes a different false alarm one layer up. The three constants
+ * are solved together in `agentBrief.bridgeBound.test.ts`; the real release valve is to stop counting
+ * tool-wait as silence at all (bead `sparkle-t85dj`).
+ *
+ * It is NOT a claim that no spawn can be slower — the distribution moves with machine load and repo
+ * size (tkmx-client's median was 17.7s against sparkle-desktop's 7.6s on the same day). The tail is
+ * handled by being HONEST about it (`launching`), not by pretending a bigger number is certainty.
  */
-export const BRIEF_DELIVERY_TIMEOUT_MS = 20_000;
+export const BRIEF_DELIVERY_TIMEOUT_MS = 45_000;
 
 /**
  * Resolve when this agent's brief is either launched or known to have failed — WITHOUT polling and
@@ -237,7 +329,19 @@ export function awaitBriefDelivery(
       // closure is what stops a timed-out wait from pinning it for the life of the process.
       const h2 = held.get(agentId);
       if (h2) h2.waiters = h2.waiters.filter((w) => w !== waiter);
-      resolve({ state: "unconfirmed" });
+      // WHICH silence was it? A launch already carrying the brief in its argv is not the same fact as
+      // nothing having taken it, and reporting both as `unconfirmed` is what sent a human to re-send
+      // a brief that had already gone (see the `launching` outcome). Read from the CURRENT entry, not
+      // the one captured at call time: `inFlight` is set by a `briefForLaunch` that may well have run
+      // during this very wait, which is the ordinary case for a slow spawn.
+      const state = h2?.inFlight ? ("launching" as const) : ("unconfirmed" as const);
+      // Never silent, whichever it was: the timeout is the one outcome nobody observes from the UI.
+      log.warn("agent-brief", "brief delivery not confirmed within the wait", {
+        agentId,
+        state,
+        waitedMs: opts.timeoutMs ?? BRIEF_DELIVERY_TIMEOUT_MS,
+      });
+      resolve({ state });
     }, opts.timeoutMs ?? BRIEF_DELIVERY_TIMEOUT_MS);
     h.waiters.push(waiter);
   });

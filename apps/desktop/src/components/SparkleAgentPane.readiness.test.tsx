@@ -19,7 +19,7 @@ import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const captured = vi.hoisted(() => ({
-  terminal: [] as Array<{ onReady?: () => void }>,
+  terminal: [] as Array<{ onReady?: () => void; onSpawnFailed?: () => void }>,
   prepareCalls: { n: 0 },
 }));
 
@@ -27,7 +27,7 @@ vi.mock("./Terminal", async (importOriginal) => {
   const real = await importOriginal<typeof import("./Terminal")>();
   return {
     ...real,
-    Terminal: (props: { onReady?: () => void }) => {
+    Terminal: (props: { onReady?: () => void; onSpawnFailed?: () => void }) => {
       captured.terminal.push(props);
       return null;
     },
@@ -129,6 +129,13 @@ async function mountPane() {
   return view;
 }
 
+/** Report the spawn chain REJECTED, the way the real Terminal does — without touching `phase`. */
+async function reportSpawnFailed() {
+  await act(async () => {
+    captured.terminal[captured.terminal.length - 1]!.onSpawnFailed?.();
+  });
+}
+
 /** Report the PTY up, the way the real Terminal does. */
 async function reportReady() {
   await act(async () => {
@@ -163,6 +170,30 @@ describe("SparkleAgentPane — the send path can tell starting from gone", () =>
 
     render(<SparkleAgentPane visible agentId={SPARKLE_ID} />);
     await waitFor(() => expect(paneState(SPARKLE_ID)).toBe("failed"));
+  });
+
+  // THE TERMINAL'S OWN REJECTION NEVER TOUCHES `phase`, so before this pane wired `onSpawnFailed` it
+  // stayed published `starting` forever and every concierge send queued against a launch that had
+  // already failed — the re-queue-and-dangle shape the `failed` state exists to prevent, reached by a
+  // path the phase-driven effects cannot see.
+  it("publishes `failed` when the TERMINAL rejects, not just when prepare() gives up", async () => {
+    await mountPane();
+    await reportReady();
+    expect(paneState(SPARKLE_ID)).toBe("ready");
+    await reportSpawnFailed();
+    expect(paneState(SPARKLE_ID)).toBe("failed");
+  });
+
+  // …and a retry recovers. `ptyReady` is ALREADY true here, so `setPtyReady(true)` is a no-op and
+  // React bails out of the re-render: only clearing the gave-up latch on ready can republish, which
+  // is exactly what a prepare()-only clear would miss (Terminal's "Start again" never re-enters it).
+  it("recovers to `ready` when a retry succeeds after a terminal rejection", async () => {
+    await mountPane();
+    await reportReady();
+    await reportSpawnFailed();
+    expect(paneState(SPARKLE_ID)).toBe("failed");
+    await reportReady();
+    expect(paneState(SPARKLE_ID)).toBe("ready");
   });
 
   it("drops its entry on unmount, so a send fails truthfully instead of queueing", async () => {
@@ -282,6 +313,40 @@ describe("SparkleAgentPane — a prompt sent during start-up is held, then deliv
       expect(vi.mocked(submitPrompt).mock.calls.map((c) => c[1])).toContain(
         "review the last hour of logs",
       );
+    } finally {
+      off();
+    }
+  });
+
+  // …AND THROUGH THE TERMINAL'S OWN REJECTION, which reaches the same give-up state by a route the
+  // arm below never travels. Without this, deleting `gaveUp ||` from the ABANDON effect leaves both
+  // readiness arms green — `failed` is published by the OTHER effect — while a prompt held during
+  // start-up dangles with nothing ever reporting it. That is the silent-drop shape this file already
+  // pins for the phase path, and its comment there records that a weaker assertion (queue length
+  // instead of the outcome) kept all ten cases green while the user's promised prompt vanished. So
+  // this asserts the OUTCOME, with the count only as corroboration.
+  it("REPORTS a held prompt when the TERMINAL rejects, not only when prepare() gives up", async () => {
+    await mountPane();
+    await dispatchConciergeAnswer(SPARKLE_ID, "review the last hour of logs", {
+      authority: TEST_AUTHORITY,
+      userPrompt: true,
+    });
+    const { pendingSendCount } = await import("../services/pendingSends");
+    expect(pendingSendCount(SPARKLE_ID)).toBe(1);
+    const { seen, off } = collectOutcomes();
+
+    try {
+      await reportSpawnFailed();
+      await waitFor(() => expect(paneState(SPARKLE_ID)).toBe("failed"));
+      expect(seen).toEqual([
+        expect.objectContaining({
+          ok: false,
+          path: "abandoned",
+          agentId: SPARKLE_ID,
+          sent: "review the last hour of logs",
+        }),
+      ]);
+      expect(pendingSendCount(SPARKLE_ID)).toBe(0);
     } finally {
       off();
     }
