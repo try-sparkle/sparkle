@@ -171,9 +171,27 @@ export async function readProbeGate(root: string, number: number): Promise<Babys
     if (!gate || typeof gate !== "object" || typeof gate.applicable !== "boolean") {
       return { applicable: true, probes: undefined, error: "unrecognised probe-gate reply", overridden: false };
     }
-    // `?? undefined` maps BOTH `null` and a missing field to `undefined`, so if the Rust side ever
-    // grows a `skip_serializing_if` (making these fields absent instead) nothing here has to change.
-    return { ...gate, probes: gate.probes ?? undefined, reviewedHead: gate.reviewedHead ?? undefined };
+    // NORMALISE ON SHAPE, NOT ON NULLISHNESS — the class, not the one value.
+    //
+    // `?? undefined` (which this was) maps BOTH `null` and a missing field to `undefined`, so it
+    // defeats the one non-conforming value serde is known to send TODAY. It defeats nothing else:
+    // `invoke` returns `unknown` and the `WireProbeGate` cast is unchecked, so ANY other shape — a
+    // `probes` that became `{ items: [...] }` in a Rust refactor, a renamed serde field, a frontend
+    // newer than the backend it is talking to — sails past `??` and is then read as AUTHORITATIVE
+    // by every consumer downstream. That is the argument the `applicable` check above already makes
+    // ("the one thing a cast cannot do is notice that the two sides have drifted"), applied to the
+    // two fields whose values are subsequently ITERATED and INDEXED rather than merely compared.
+    //
+    // A value that is not the declared shape is UNKNOWN, which is the fail-closed direction here:
+    // the decision core holds `probe-read-unknown` and dispatches nothing, rather than claiming
+    // "we looked; this PR is fine" about a reply nobody could read. `Array.isArray`/`typeof` also
+    // still map `null` and an absent field to `undefined`, so the `skip_serializing_if` case the
+    // previous `??` was written for keeps working unchanged.
+    return {
+      ...gate,
+      probes: Array.isArray(gate.probes) ? gate.probes : undefined,
+      reviewedHead: typeof gate.reviewedHead === "string" ? gate.reviewedHead : undefined,
+    };
   } catch (e) {
     return { applicable: true, probes: undefined, error: String(e), overridden: false };
   }
@@ -390,6 +408,14 @@ export interface BabysitSweepOutcome {
   holds: Record<string, number>;
   /** PRs whose repo slug could not be parsed, so they were never judged at all. */
   unidentified: number;
+  /**
+   * PRs whose evaluation THREW and were therefore skipped.
+   *
+   * Distinct from `unidentified` (a PR we declined to judge because we could not name its repo)
+   * and from a `hold` (a PR we judged and decided against): this one is a PR we FAILED to judge,
+   * and it is the only outcome here that indicates a bug rather than a decision.
+   */
+  failed: number;
   /** True when this sweep was superseded mid-flight and stopped early rather than writing stale
    *  state. Surfaced so an abandoned sweep is visible rather than looking like a quiet one. */
   abandoned?: boolean;
@@ -422,7 +448,7 @@ export async function babysitSweepProject(
    */
   dispatchClock: () => number = () => now,
 ): Promise<BabysitSweepOutcome> {
-  const out: BabysitSweepOutcome = { dispatched: [], holds: {}, unidentified: 0 };
+  const out: BabysitSweepOutcome = { dispatched: [], holds: {}, unidentified: 0, failed: 0 };
   const hold = (reason: string): void => {
     out.holds[reason] = (out.holds[reason] ?? 0) + 1;
   };
@@ -447,119 +473,144 @@ export async function babysitSweepProject(
       out.abandoned = true;
       return out;
     }
-    const repo = repoSlugFromPrUrl(pr.url);
-    if (!repo) {
-      out.unidentified += 1;
-      continue;
-    }
-    // SKIP THE READ WHEN THE PR HAS NOT CHANGED — see `lastGate`.
+    // ONE BAD PR MUST NOT STARVE THE REST OF ITS PROJECT.
     //
-    // ONE GUARD, NOT TWO. An empty stamp is excluded on the WRITE side below, so nothing with an
-    // empty `updatedAt` is ever in the map and re-checking it here could not change an outcome. A
-    // second `stamp !== ""` on this line reads like defence in depth but is unreachable, and an
-    // unreachable condition is one no test can pin — which is exactly how the rest of this module
-    // accumulated guards that looked wired and were not.
-    const k0 = key(repo, pr.number);
-    const cached = lastGate.get(k0);
-    const stamp = pr.updatedAt ?? "";
-    let gate: BabysitProbeGate;
-    if (cached && cached.updatedAt === stamp) {
-      gate = cached.gate;
-    } else {
-      gate = await readProbeGate(project.rootPath, pr.number);
-      // Only an AUTHORITATIVE reading is worth caching. Caching an UNKNOWN would pin the PR at
-      // `probe-read-unknown` for as long as nobody touched it, turning one failed `gh` call into a
-      // PR that is never looked at again — the opposite of what this sweep exists to do.
-      if (stamp !== "" && gate.probes !== undefined) lastGate.set(k0, { updatedAt: stamp, gate });
-    }
-    // FENCE AGAIN, AFTER THE AWAIT — this is the check that actually matters (roborev 58533). The
-    // sweep that gets abandoned is the one parked INSIDE this loop, on the probe-gate read under a
-    // 45 s `gh` timeout. It passed the check at the top of the iteration and, without this, walks
-    // straight into `observeLease` below holding a `now` and a `leases` snapshot from before the
-    // deadline — stamping `lastDriverExitAt` with an ancient timestamp and clearing the replacement
-    // sweep's `sawLive`. A fence checked only before the await covers PRs 2..N of an abandoned
-    // sweep and misses the single PR it was written for.
-    if (!isCurrent()) {
-      out.abandoned = true;
-      return out;
-    }
-    const snapshot: BabysitPrSnapshot = {
-      repo,
-      number: pr.number,
-      state: "open",
-      mergeStateStatus: pr.mergeStateStatus,
-      checks: checkRollupOf(pr),
-      // `|| undefined` IS THE UNKNOWN MAPPING, not a tidy-up. The Rust decoder fills `headRefOid`
-      // with `str_field`, which yields an EMPTY STRING when the field is absent — and an empty head
-      // passed through as-is would satisfy the core's `headSha !== undefined` guard and then fail
-      // every prefix test, manufacturing `commits-pushed-since-last-review` for a PR whose head we
-      // could not read. That is precisely the "an unknown never becomes evidence" rule the core
-      // states, defeated at the boundary rather than in the decision.
-      headSha: pr.headRefOid || undefined,
-      gate,
-    };
-    const k = key(repo, pr.number);
-    const lease = standingFor(leases, repo, pr.number);
-    // Before the decision, so a driver that exited during THIS interval is already cooling down by
-    // the time the cooldown is evaluated rather than one sweep later.
-    observeLease(k, lease, now);
-    const clocks = clocksFor(k);
-    // One reading, used twice — two calls could disagree and produce a negative slot count.
-    const capacity = localAgentCapacity();
-    const decision = decideBabysitDispatch({
-      now,
-      config,
-      pr: snapshot,
-      lease,
-      prior: lastObservation.get(k),
-      fleet: {
-        recentDispatchAt,
-        freeAgentSlots: Math.max(0, capacity.limit - capacity.used),
-        lastDriverExitAt: clocks.lastDriverExitAt,
-      },
-    });
+    // Everything below judges a SINGLE PR, and every throw it can produce is about that PR alone —
+    // an unreadable probe-gate reply, a shape the wire contract did not anticipate, a slug that
+    // parses but resolves to nothing. Without this the throw escapes the loop and is caught only by
+    // `sweepAllProjects`, which is PER PROJECT: the first bad PR aborts every PR after it in the
+    // same project, on every tick, for as long as the condition holds. That is not hypothetical —
+    // it is how one malformed reply kept nine open PRs unjudged for hours while the sweep reported
+    // nothing but a single warn line.
+    //
+    // The fences above stay OUTSIDE: an abandoned sweep `return`s, and a return is not a throw, so
+    // it still unwinds the whole function rather than being mistaken for one PR failing.
+    try {
+      const repo = repoSlugFromPrUrl(pr.url);
+      if (!repo) {
+        out.unidentified += 1;
+        continue;
+      }
+      // SKIP THE READ WHEN THE PR HAS NOT CHANGED — see `lastGate`.
+      //
+      // ONE GUARD, NOT TWO. An empty stamp is excluded on the WRITE side below, so nothing with an
+      // empty `updatedAt` is ever in the map and re-checking it here could not change an outcome. A
+      // second `stamp !== ""` on this line reads like defence in depth but is unreachable, and an
+      // unreachable condition is one no test can pin — which is exactly how the rest of this module
+      // accumulated guards that looked wired and were not.
+      const k0 = key(repo, pr.number);
+      const cached = lastGate.get(k0);
+      const stamp = pr.updatedAt ?? "";
+      let gate: BabysitProbeGate;
+      if (cached && cached.updatedAt === stamp) {
+        gate = cached.gate;
+      } else {
+        gate = await readProbeGate(project.rootPath, pr.number);
+        // Only an AUTHORITATIVE reading is worth caching. Caching an UNKNOWN would pin the PR at
+        // `probe-read-unknown` for as long as nobody touched it, turning one failed `gh` call into a
+        // PR that is never looked at again — the opposite of what this sweep exists to do.
+        if (stamp !== "" && gate.probes !== undefined) lastGate.set(k0, { updatedAt: stamp, gate });
+      }
+      // FENCE AGAIN, AFTER THE AWAIT — this is the check that actually matters (roborev 58533). The
+      // sweep that gets abandoned is the one parked INSIDE this loop, on the probe-gate read under a
+      // 45 s `gh` timeout. It passed the check at the top of the iteration and, without this, walks
+      // straight into `observeLease` below holding a `now` and a `leases` snapshot from before the
+      // deadline — stamping `lastDriverExitAt` with an ancient timestamp and clearing the replacement
+      // sweep's `sawLive`. A fence checked only before the await covers PRs 2..N of an abandoned
+      // sweep and misses the single PR it was written for.
+      if (!isCurrent()) {
+        out.abandoned = true;
+        return out;
+      }
+      const snapshot: BabysitPrSnapshot = {
+        repo,
+        number: pr.number,
+        state: "open",
+        mergeStateStatus: pr.mergeStateStatus,
+        checks: checkRollupOf(pr),
+        // `|| undefined` IS THE UNKNOWN MAPPING, not a tidy-up. The Rust decoder fills `headRefOid`
+        // with `str_field`, which yields an EMPTY STRING when the field is absent — and an empty head
+        // passed through as-is would satisfy the core's `headSha !== undefined` guard and then fail
+        // every prefix test, manufacturing `commits-pushed-since-last-review` for a PR whose head we
+        // could not read. That is precisely the "an unknown never becomes evidence" rule the core
+        // states, defeated at the boundary rather than in the decision.
+        headSha: pr.headRefOid || undefined,
+        gate,
+      };
+      const k = key(repo, pr.number);
+      const lease = standingFor(leases, repo, pr.number);
+      // Before the decision, so a driver that exited during THIS interval is already cooling down by
+      // the time the cooldown is evaluated rather than one sweep later.
+      observeLease(k, lease, now);
+      const clocks = clocksFor(k);
+      // One reading, used twice — two calls could disagree and produce a negative slot count.
+      const capacity = localAgentCapacity();
+      const decision = decideBabysitDispatch({
+        now,
+        config,
+        pr: snapshot,
+        lease,
+        prior: lastObservation.get(k),
+        fleet: {
+          recentDispatchAt,
+          freeAgentSlots: Math.max(0, capacity.limit - capacity.used),
+          lastDriverExitAt: clocks.lastDriverExitAt,
+        },
+      });
 
-    if (!decision.dispatch) {
-      hold(decision.hold);
-      // REMEMBER WHAT WE SAW EVEN WHEN HOLDING — that is the entire two-observation rule. A hold of
-      // `single-observation` that did not record this sighting could never become a dispatch, and
-      // the sweep would report "waiting for a second look" forever.
-      lastObservation.set(k, { evidenceIds: babysitEvidenceIds(babysitEvidenceFor(snapshot)) });
-      continue;
-    }
+      if (!decision.dispatch) {
+        hold(decision.hold);
+        // REMEMBER WHAT WE SAW EVEN WHEN HOLDING — that is the entire two-observation rule. A hold of
+        // `single-observation` that did not record this sighting could never become a dispatch, and
+        // the sweep would report "waiting for a second look" forever.
+        lastObservation.set(k, { evidenceIds: babysitEvidenceIds(babysitEvidenceFor(snapshot)) });
+        continue;
+      }
 
-    lastObservation.set(k, { evidenceIds: babysitEvidenceIds(decision.evidence) });
-    const agentId = await dispatchOne(project, repo, pr.number, now, isCurrent);
-    // NO FENCE HERE, DELIBERATELY (roborev 58537). There WAS one, and it was strictly permissive in
-    // the two directions this module says matter most, because neither write below is a stale-clock
-    // hazard — they record FACTS about a driver that demonstrably exists:
-    //
-    //   * `recentDispatchAt` is the hourly budget, and a real driver costs a full Claude session on
-    //     the founder's own quota. Writing it with a stale `now` would only age the entry out early;
-    //     SKIPPING it never charges the driver at all, so the hour permits N+1. Strictly worse.
-    //   * `clocks.sawLive` records that a driver was just spawned. Without it, if that driver's lease
-    //     goes free before any sweep observes it `held-live`, `observeLease` never takes the exit
-    //     edge, `lastDriverExitAt` — THE SOLE PER-PR LIMITER — is never stamped, and the PR is
-    //     re-dispatchable with NO cooldown at all. The fence reintroduced exactly the crash loop
-    //     `BABYSIT_RECOVERY_COOLDOWN_MS` exists to slow.
-    //
-    // The fence that matters is the one after `readProbeGate` above, which guards `observeLease` —
-    // the write that stamps a TIMESTAMP and can therefore be poisoned by a stale clock.
-    if (agentId) {
-      const dispatchedAt = dispatchClock();
-      recentDispatchAt = [
-        ...recentDispatchAt.filter((t) => dispatchedAt - t < BABYSIT_RATE_WINDOW_MS),
-        dispatchedAt,
-      ];
-      // Stamped only on a dispatch that actually produced a driver. A lost acquire or a refused
-      // spawn created nothing, so recording that a driver existed would charge the PR a cooldown
-      // for an event that never happened — and since the exit clock is the sole per-PR limiter,
-      // `sawLive` is the field that guard now protects. Hoisting it out of `if (agentId)` is what
-      // the two refusal tests fail on.
-      clocks.sawLive = true;
-      out.dispatched.push({ repo, pr: pr.number, agentId });
-    } else {
-      hold("lease-lost-or-spawn-refused");
+      lastObservation.set(k, { evidenceIds: babysitEvidenceIds(decision.evidence) });
+      const agentId = await dispatchOne(project, repo, pr.number, now, isCurrent);
+      // NO FENCE HERE, DELIBERATELY (roborev 58537). There WAS one, and it was strictly permissive in
+      // the two directions this module says matter most, because neither write below is a stale-clock
+      // hazard — they record FACTS about a driver that demonstrably exists:
+      //
+      //   * `recentDispatchAt` is the hourly budget, and a real driver costs a full Claude session on
+      //     the founder's own quota. Writing it with a stale `now` would only age the entry out early;
+      //     SKIPPING it never charges the driver at all, so the hour permits N+1. Strictly worse.
+      //   * `clocks.sawLive` records that a driver was just spawned. Without it, if that driver's lease
+      //     goes free before any sweep observes it `held-live`, `observeLease` never takes the exit
+      //     edge, `lastDriverExitAt` — THE SOLE PER-PR LIMITER — is never stamped, and the PR is
+      //     re-dispatchable with NO cooldown at all. The fence reintroduced exactly the crash loop
+      //     `BABYSIT_RECOVERY_COOLDOWN_MS` exists to slow.
+      //
+      // The fence that matters is the one after `readProbeGate` above, which guards `observeLease` —
+      // the write that stamps a TIMESTAMP and can therefore be poisoned by a stale clock.
+      if (agentId) {
+        const dispatchedAt = dispatchClock();
+        recentDispatchAt = [
+          ...recentDispatchAt.filter((t) => dispatchedAt - t < BABYSIT_RATE_WINDOW_MS),
+          dispatchedAt,
+        ];
+        // Stamped only on a dispatch that actually produced a driver. A lost acquire or a refused
+        // spawn created nothing, so recording that a driver existed would charge the PR a cooldown
+        // for an event that never happened — and since the exit clock is the sole per-PR limiter,
+        // `sawLive` is the field that guard now protects. Hoisting it out of `if (agentId)` is what
+        // the two refusal tests fail on.
+        clocks.sawLive = true;
+        out.dispatched.push({ repo, pr: pr.number, agentId });
+      } else {
+        hold("lease-lost-or-spawn-refused");
+      }
+    } catch (e) {
+      // Counted, not just logged. `failed` is the only outcome in a sweep that means a BUG rather
+      // than a decision, so it has to be visible in the summary a human reads — a warn line alone
+      // is what let this run unnoticed at 143 occurrences a day.
+      out.failed += 1;
+      log.warn("babysit", "skipped a PR whose evaluation threw", {
+        project: project.id,
+        pr: pr.number,
+        error: String(e),
+      });
+      continue;
     }
   }
   return out;
@@ -748,13 +799,25 @@ export async function sweepAllProjects(
     try {
       if (!isCurrent()) return;
       const outcome = await babysitSweepProject(project, now, resolved, isCurrent, deps.dispatchClock);
-      if (outcome.dispatched.length > 0 || Object.keys(outcome.holds).length > 0) {
-        log.debug("babysit", "sweep", {
+      // A SWEEP THAT ONLY FAILED IS THE ONE THE OPERATOR MOST NEEDS TO SEE, and it was the one
+      // shape this predicate did not match: a project whose every PR threw dispatches nothing and
+      // holds nothing, so without `failed` here it emitted no summary at all. Counting the skips
+      // and then not reporting them repeats — inside the fix — the exact defect this PR is about:
+      // `logger.ts` only forwards `debug` when `import.meta.env.DEV`, so a release build discards
+      // it, which is how 143 failures a day went unnoticed.
+      const failures = outcome.failed > 0;
+      if (failures || outcome.dispatched.length > 0 || Object.keys(outcome.holds).length > 0) {
+        const summary = {
           project: project.id,
           dispatched: outcome.dispatched.length,
           holds: outcome.holds,
           unidentified: outcome.unidentified,
-        });
+          failed: outcome.failed,
+        };
+        // `warn` ONLY when something failed. A healthy sweep stays at `debug` so the ordinary
+        // 180-second beat does not become log noise that trains the reader to ignore the level.
+        if (failures) log.warn("babysit", "sweep skipped PRs that threw", summary);
+        else log.debug("babysit", "sweep", summary);
       }
     } catch (e) {
       // One project's failure must never starve the projects after it.

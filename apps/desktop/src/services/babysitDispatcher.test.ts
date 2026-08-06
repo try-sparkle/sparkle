@@ -40,6 +40,7 @@ import {
   repoSlugFromPrUrl,
   standingFor,
 } from "./babysitDispatcher";
+import { log } from "../logger";
 import { resolveBabysitConfig } from "@sparkle/core";
 import { useProjectStore } from "../stores/projectStore";
 import type { Project } from "../types";
@@ -994,5 +995,198 @@ describe("the updatedAt gate", () => {
     const out = await babysitSweepProject(PROJECT, T0 + 60_000, CONFIG);
     expect(gateReads()).toBe(1);
     expect(out.dispatched).toHaveLength(1);
+  });
+});
+
+// ── ONE BAD PR MUST NOT STARVE THE PRs BEHIND IT ────────────────────────────────────────────────
+//
+// The failure this closes is NOT a crash — it is the blast radius of one. Until now the only
+// `catch` was `sweepAllProjects`'s, one level up and OUTSIDE the per-PR loop, so ANY throw while
+// judging a single PR abandoned that project's whole sweep: every PR behind it went unjudged, on
+// every 180 s tick, for as long as the condition held. Measured on 2026-08-05/06: 143 `sweep failed
+// for a project` warnings across three projects in five hours, zero dispatches ever, and nine PRs
+// nobody looked at.
+//
+// Two causes have already been fixed one at a time (`reviewedHead: null` reading `.length` in
+// `aa0ed31e`, the IPC boundary in PR #1317) and the blast radius survived both, which is the
+// argument for pinning the RADIUS rather than the causes. So these tests deliberately use two
+// UNRELATED throw sites: what is asserted is that the PRs behind the bad one were still judged.
+describe("per-PR failure isolation", () => {
+  const GOOD_A = 4001;
+  const BAD = 4002;
+  const GOOD_B = 4003;
+
+  /** Route each PR its own gate, keyed on the `number` the sweep passes to the command. */
+  function wirePerPr(gates: Record<number, unknown>): void {
+    invokeMock.mockImplementation(async (cmd: string, args?: { number?: number }) => {
+      if (cmd === BABYSIT_LEASE_LIST_COMMAND) return [];
+      if (cmd === KNIGHTWATCH_PROBE_GATE_COMMAND) return gates[args?.number ?? -1];
+      if (cmd === BABYSIT_LEASE_ACQUIRE_COMMAND) return { acquired: true };
+      if (cmd === BABYSIT_LEASE_RELEASE_COMMAND) return null;
+      throw new Error(`unexpected command ${cmd}`);
+    });
+  }
+
+  it("a PR that THROWS while being judged is skipped; the PRs behind it still dispatch", async () => {
+    fetchOpenPrsMock.mockResolvedValue([prWithProbe(GOOD_A), prWithProbe(BAD), prWithProbe(GOOD_B)]);
+    wirePerPr({
+      [GOOD_A]: gateWithUnansweredBlocking(),
+      // The gate EXACTLY as serde writes it — every `Option::None` a PRESENT `null`, never an
+      // absent field — carrying one member the TypeScript type says cannot exist. serde cannot
+      // write a null INSIDE `Vec<Probe>` today, and that is precisely the point: the type also said
+      // `reviewedHead` could not be `null`, and it was, three releases running. What the isolation
+      // has to survive is the NEXT cause, so the test picks one no current fix addresses.
+      [BAD]: {
+        applicable: true,
+        probes: [null],
+        error: null,
+        overridden: false,
+        reviewedHead: null,
+        reviewStale: false,
+      },
+      [GOOD_B]: gateWithUnansweredBlocking(),
+    });
+
+    const out = await sweepTwice();
+
+    // THE ASSERTION THAT FAILS WITHOUT THE FIX: GOOD_B — the PR sitting BEHIND the bad one — was
+    // judged at all. Without per-PR isolation the throw leaves `babysitSweepProject` entirely and
+    // this call rejects, so nothing behind BAD is ever reached.
+    expect(out.dispatched.map((d) => d.pr)).toEqual([GOOD_A, GOOD_B]);
+    expect(out.failed).toBe(1);
+  });
+
+  it("a spawn that throws is isolated too — the radius is closed, not one throw site", async () => {
+    // `dispatchOne` calls `spawnBuildAgentInProject` OUTSIDE any try/catch, and that function
+    // reaches into three zustand stores to do its work. A second, unrelated throw site proves the
+    // fix is the loop's isolation rather than a guard aimed at one payload.
+    fetchOpenPrsMock.mockResolvedValue([prWithProbe(BAD), prWithProbe(GOOD_B)]);
+    wirePerPr({ [BAD]: gateWithUnansweredBlocking(), [GOOD_B]: gateWithUnansweredBlocking() });
+    spawnMock.mockImplementation((_project: unknown, opts: { prompt: string }) => {
+      if (opts.prompt === babysitPrompt(BAD)) throw new Error("addAgent blew up");
+      return "agent-2";
+    });
+
+    const out = await sweepTwice();
+
+    expect(out.failed).toBe(1);
+    expect(out.dispatched).toEqual([{ repo: "drodio/sparkle", pr: GOOD_B, agentId: "agent-2" }]);
+  });
+
+  it("a sweep whose every PR threw still reports it, at a level a release build keeps", async () => {
+    // THE SHAPE THAT EMITTED NOTHING. A project where every PR throws dispatches nothing and holds
+    // nothing, so the old summary predicate (dispatched OR holds) did not match and no line was
+    // written at all. Counting skips and then not reporting them would repeat, inside this fix, the
+    // very defect it is for: `logger.ts` forwards `debug` only when `import.meta.env.DEV`, so a
+    // release build discards it — which is how 143 failures a day went unseen.
+    const warn = vi.spyOn(log, "warn").mockImplementation(() => {});
+    const debug = vi.spyOn(log, "debug").mockImplementation(() => {});
+    try {
+      fetchOpenPrsMock.mockResolvedValue([prWithProbe(BAD)]);
+      wirePerPr({
+        [BAD]: { applicable: true, probes: [null], error: null, overridden: false, reviewedHead: null, reviewStale: false },
+      });
+
+      await sweepAllProjects(CONFIG, {
+        ownsProject: () => true,
+        projects: () => [PROJECT],
+        dispatchClock: () => Date.now(),
+        sweepClock: () => Date.now(),
+      });
+
+      const summaries = warn.mock.calls.filter((c) => c[1] === "sweep skipped PRs that threw");
+      expect(summaries).toHaveLength(1);
+      const summary = summaries[0]?.[2] as { failed: number } | undefined;
+      expect(summary?.failed).toBe(1);
+      // and it must NOT be hidden at debug, which production drops
+      expect(debug.mock.calls.filter((c) => c[1] === "sweep")).toHaveLength(0);
+    } finally {
+      warn.mockRestore();
+      debug.mockRestore();
+    }
+  });
+
+  it("a healthy sweep reports failed: 0, so the counter cannot read as always-on", async () => {
+    fetchOpenPrsMock.mockResolvedValue([prWithProbe(GOOD_A), prWithProbe(GOOD_B)]);
+    wirePerPr({ [GOOD_A]: gateWithUnansweredBlocking(), [GOOD_B]: gateWithUnansweredBlocking() });
+
+    const out = await sweepTwice();
+
+    expect(out.failed).toBe(0);
+    expect(out.dispatched).toHaveLength(2);
+  });
+});
+
+// ── THE BOUNDARY NORMALISES ON SHAPE, NOT ON NULLISHNESS ────────────────────────────────────────
+//
+// `?? undefined` defeats exactly one non-conforming value — the `null` serde is known to write
+// today. `invoke` returns `unknown` and the `WireProbeGate` cast is unchecked, so any OTHER drift
+// between the two sides is passed through and read as an AUTHORITATIVE answer by every consumer.
+describe("readProbeGate — a reply that drifted from the contract is UNKNOWN", () => {
+  it("a `probes` that is not an array is UNKNOWN rather than something to iterate", async () => {
+    invokeMock.mockResolvedValueOnce({
+      applicable: true,
+      probes: { items: [] },
+      error: null,
+      overridden: false,
+      reviewedHead: null,
+      reviewStale: false,
+    });
+    expect((await readProbeGate("/repo", 1)).probes).toBeUndefined();
+  });
+
+  it("a `reviewedHead` that is not a string is UNKNOWN rather than something to index", async () => {
+    invokeMock.mockResolvedValueOnce({
+      applicable: true,
+      probes: [],
+      error: null,
+      overridden: false,
+      reviewedHead: 12345,
+      reviewStale: false,
+    });
+    expect((await readProbeGate("/repo", 1)).reviewedHead).toBeUndefined();
+  });
+
+  it("an authoritative reply is passed through untouched — the guard only ever narrows", async () => {
+    const probes = gateWithUnansweredBlocking().probes;
+    invokeMock.mockResolvedValueOnce({
+      applicable: true,
+      probes,
+      error: null,
+      overridden: false,
+      reviewedHead: "9c65efe",
+      reviewStale: false,
+    });
+    const gate = await readProbeGate("/repo", 1);
+    expect(gate.probes).toEqual(probes);
+    expect(gate.reviewedHead).toBe("9c65efe");
+  });
+
+  it("through the whole sweep: a drifted reply HOLDS probe-read-unknown and never throws", async () => {
+    // The discriminator between the two fixes on this branch. Without the SHAPE normalisation the
+    // non-array reaches `babysitEvidenceFor`, which does `for (const probe of probes ?? [])` and
+    // throws — which per-PR isolation would then record as `failed: 1`. Only the boundary fix
+    // produces the honest verdict: we could not read this PR, so we hold.
+    fetchOpenPrsMock.mockResolvedValue([prWithProbe(4100)]);
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === BABYSIT_LEASE_LIST_COMMAND) return [];
+      if (cmd === KNIGHTWATCH_PROBE_GATE_COMMAND) {
+        return {
+          applicable: true,
+          probes: { items: [] },
+          error: null,
+          overridden: false,
+          reviewedHead: null,
+          reviewStale: false,
+        };
+      }
+      throw new Error(`unexpected command ${cmd}`);
+    });
+
+    const out = await babysitSweepProject(PROJECT, T0, CONFIG);
+
+    expect(out.holds["probe-read-unknown"]).toBe(1);
+    expect(out.failed).toBe(0);
+    expect(out.holds["no-evidence"]).toBeUndefined();
   });
 });
