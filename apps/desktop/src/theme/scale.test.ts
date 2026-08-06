@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { ALLOWED_RADIUS, ALLOWED_TYPE, PILL, RADIUS, SPACE, TYPE } from "./scale";
+import { offScaleMessage } from "./scaleGuardTestUtils";
 
 // fileURLToPath, NOT `.pathname` — this repo's worktrees live under "Application Support", so the
 // URL form is percent-encoded and `.pathname` hands back a directory that does not exist.
@@ -142,21 +143,17 @@ const MAX_OFF_SCALE_RADIUS = 0;
 describe("the type and radius scales are a ratchet", () => {
   it("the off-scale fontSize count never rises above the recorded ceiling", () => {
     const hits = offScale("fontSize", ALLOWED_TYPE);
-    const byValue = [...new Set(hits.map((h) => h.value))].sort((a, b) => a - b);
     expect(
       hits.length,
-      `${hits.length} off-scale fontSize values (${byValue.join(", ")}) vs recorded ceiling ${MAX_OFF_SCALE_TYPE}. ` +
-        `You added off-scale sprawl — use TYPE. (If you MIGRATED some, this passes; lower the constant to ${hits.length} in this PR to keep the ceiling tight.)`,
+      offScaleMessage("fontSize", "use TYPE", hits, MAX_OFF_SCALE_TYPE),
     ).toBeLessThanOrEqual(MAX_OFF_SCALE_TYPE);
   });
 
   it("the off-scale borderRadius count never rises above the recorded ceiling", () => {
     const hits = offScale("borderRadius", ALLOWED_RADIUS);
-    const byValue = [...new Set(hits.map((h) => h.value))].sort((a, b) => a - b);
     expect(
       hits.length,
-      `${hits.length} off-scale borderRadius values (${byValue.join(", ")}) vs recorded ceiling ${MAX_OFF_SCALE_RADIUS}. ` +
-        `You added off-scale sprawl — use RADIUS/PILL. (If you MIGRATED some, this passes; lower the constant to ${hits.length} in this PR to keep the ceiling tight.)`,
+      offScaleMessage("borderRadius", "use RADIUS/PILL", hits, MAX_OFF_SCALE_RADIUS),
     ).toBeLessThanOrEqual(MAX_OFF_SCALE_RADIUS);
   });
 
@@ -179,5 +176,50 @@ describe("the type and radius scales are a ratchet", () => {
 
   it("nothing is smaller than the legibility floor", () => {
     expect(Math.min(...Object.values(TYPE))).toBeGreaterThanOrEqual(10);
+  });
+});
+
+// The ratchet assertions run against the real source tree and so cannot be forced red on demand,
+// which is exactly why the failure message was allowed to drop the file locations for so long. These
+// tests exercise the message builder directly on synthetic hits, so they DO go red if it stops
+// naming the files — the gap this change closes. (Run /mutation-check on scaleGuard.ts to confirm.)
+describe("offScaleMessage names the files each off-scale value came from", () => {
+  it("lists every value alongside the file(s) it was found in, plus the ceiling and total", () => {
+    const hits = [
+      { file: "components/appChrome.ts", value: 12.5 },
+      { file: "components/modal.tsx", value: 12.5 },
+      { file: "components/badge.tsx", value: 17 },
+    ];
+    const msg = offScaleMessage("fontSize", "use TYPE", hits, 0);
+    // the distinct values still appear (the old behaviour, preserved)
+    expect(msg).toContain("(12.5, 17)");
+    // the FILES now appear — this is the enrichment, and the assertion that would fail if it were dropped
+    expect(msg).toContain("components/appChrome.ts");
+    expect(msg).toContain("components/modal.tsx");
+    expect(msg).toContain("components/badge.tsx");
+    // and each value is tied to the specific file(s) it came from
+    expect(msg).toContain("12.5 → components/appChrome.ts, components/modal.tsx");
+    expect(msg).toContain("17 → components/badge.tsx");
+    // the header count and recorded ceiling survive
+    expect(msg).toContain("3 off-scale fontSize values");
+    expect(msg).toContain("recorded ceiling 0");
+    // the migration guidance is intact
+    expect(msg).toContain("use TYPE");
+    expect(msg).toContain("lower the constant to 3");
+  });
+
+  it("dedupes repeated files and caps a long list with 'and N more' without losing the true count", () => {
+    // nine distinct files at one value, plus a duplicate of the first — the duplicate must not be listed twice
+    const hits = [
+      ...Array.from({ length: 9 }, (_, i) => ({ file: `f${i}.tsx`, value: 5 })),
+      { file: "f0.tsx", value: 5 },
+    ];
+    const msg = offScaleMessage("borderRadius", "use RADIUS/PILL", hits, 0);
+    // f0.tsx appears exactly once despite being present twice in the hits
+    expect(msg.split("f0.tsx").length - 1).toBe(1);
+    // the display is capped, but the header count reflects ALL ten hits, not the six shown
+    expect(msg).toMatch(/and \d+ more/);
+    expect(msg).toContain("10 off-scale borderRadius values");
+    expect(msg).toContain("use RADIUS/PILL");
   });
 });
