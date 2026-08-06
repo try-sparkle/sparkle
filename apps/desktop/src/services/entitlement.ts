@@ -24,11 +24,12 @@ export interface Me {
   /** Auto-top-up settings (credits-menu spec §3). Optional so an older orchestration server that
    *  doesn't send it yet reads as "settings unavailable" rather than breaking /me parsing. */
   autoTopup?: AutoTopup;
-  /** Cloud Agents (Service B) capability for this account — the server advertises it only when the
-   *  feature is switched on for the caller (spec §Feature flag: "ships dark"). Absent (an older
-   *  server, or the flag off) reads as FALSE everywhere, which hides every cloud surface. Never
-   *  infer it from anything else: this is the single source for "may this account run agents in the
-   *  cloud". */
+  /** The server's cloud-agents KILL SWITCH — global, never per-account, and on by default. It is
+   *  NOT an entitlement and must not be used to gate any surface: doing that hid every cloud
+   *  control from every user and produced a refusal with nothing to click. "May this account run
+   *  agents in the cloud" is answered by credits + a saved Claude credential
+   *  (services/cloudAgents/gating.ts). Kept on the type because the server still sends it and a
+   *  future outage banner is the one legitimate reader. */
   cloudAgentsEnabled?: boolean;
 }
 

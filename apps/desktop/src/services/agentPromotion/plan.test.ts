@@ -90,18 +90,13 @@ describe("planPromotion — refusals", () => {
     expect(p.ok === false && p.refusal).toBe("cloud_gate");
     expect(p.ok === false && p.message).toBe(gate.message);
     expect(p.ok === false && p.deepLink).toBe("credits");
-  });
-
-  it("omits deepLink when the gate has none", () => {
-    const gate: CloudGate = {
-      ok: false,
-      reason: "feature_disabled",
-      message: "Cloud agents aren't available on your account yet.",
-    };
-    const p = planPromotion(input({ gate }));
-    expect(p.ok === false && "deepLink" in p).toBe(false);
+    // The absent key is omitted rather than carried as undefined — a deep-linked gate is not a
+    // sign-in gate, and the dialog branches on `"needsSignIn" in p`.
     expect(p.ok === false && "needsSignIn" in p).toBe(false);
   });
+
+  // (A test for "a gate with NEITHER deepLink nor needsSignIn" was deleted with `feature_disabled`:
+  // that state is now unreachable, and gating.test.ts asserts it can never come back.)
 
   it("carries needsSignIn — the signed-out gate is the one with NO deep link", () => {
     // Its remedy is a sign-in hand-off, not a Settings section. Dropping the flag would leave the

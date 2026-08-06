@@ -15,6 +15,7 @@ import { ensureCloudProjectId } from "../services/cloudAgents/projectLink";
 import { projectRepoUrl } from "../services/cloudAgents/repoUrl";
 import { classifyStartError, type StartGuidance } from "../services/cloudAgents/startError";
 import { openSignIn } from "../services/sparkleApi";
+import { deepLinkActionLabel } from "../services/cloudAgents/gating";
 import { ModalLayer } from "./ModalLayer";
 
 // "New cloud agent" (Service B, W5). A cloud agent is started server-side BEFORE it has a tab, and
@@ -137,9 +138,9 @@ export function NewCloudAgentDialog({ project, onClose }: { project: Project; on
                   Sign in
                 </button>
               )}
-              {blocked.deepLink && (
+              {blocked.deepLink && deepLinkActionLabel(blocked.deepLink) && (
                 <button type="button" style={actionBtn} onClick={() => goToSettings(blocked.deepLink!)}>
-                  {blocked.deepLink === "cloudauth" ? "Add Claude auth" : "Open credits"}
+                  {deepLinkActionLabel(blocked.deepLink)}
                 </button>
               )}
             </div>
@@ -197,9 +198,9 @@ export function NewCloudAgentDialog({ project, onClose }: { project: Project; on
                   Sign in
                 </button>
               )}
-              {guidance.deepLink && (
+              {guidance.deepLink && deepLinkActionLabel(guidance.deepLink) && (
                 <button type="button" style={actionBtn} onClick={() => goToSettings(guidance.deepLink!)}>
-                  {guidance.deepLink === "cloudauth" ? "Add Claude auth" : "Open credits"}
+                  {deepLinkActionLabel(guidance.deepLink)}
                 </button>
               )}
             </div>

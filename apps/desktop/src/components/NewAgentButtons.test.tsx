@@ -66,10 +66,16 @@ const GATE_STATES: Array<{
   reason: RegExp | null;
 }> = [
   {
-    name: "no capability advertised (a local-only account)",
-    seed: () => useAuthStore.setState({ me: me({ cloud: false }), tokenPresent: true }),
-    cloudDisabled: true,
-    reason: /aren't available on your account yet/,
+    // The capability is no longer part of the gate at all. An account whose `/me` omits it — an
+    // older server, or the kill switch down — is now judged on credentials and credits like any
+    // other, so this row asserts the state that USED to render the dead end now WORKS.
+    name: "no capability advertised, but funded and authed",
+    seed: () => {
+      useAuthStore.setState({ me: me({ cloud: false }), tokenPresent: true });
+      useCloudAuthStore.setState({ method: "byok", loaded: true });
+    },
+    cloudDisabled: false,
+    reason: null,
   },
   {
     name: "signed out with a stale capability still in the store",
@@ -246,9 +252,12 @@ describe("NewAgentButtons — a COLD auth store is not evidence of missing auth"
     expect(cloudBtn().disabled).toBe(false);
   });
 
-  it("does NOT probe for a user who cannot have cloud at all (no capability, or signed out)", async () => {
+  it("does NOT probe for a SIGNED-OUT user — the GET would be unauthenticated", async () => {
+    // The probe used to also be gated on the advertised capability. That is gone, so signed-in is
+    // the only condition left — and it is the one that mattered: without a bearer token the request
+    // can only 401. (A signed-in account whose /me omits the capability now probes normally.)
     const refresh = vi.fn(async () => {});
-    useAuthStore.setState({ me: me({ cloud: false }), tokenPresent: true });
+    useAuthStore.setState({ me: null, tokenPresent: false });
     useCloudAuthStore.setState({ method: null, loaded: false, attempted: false, refresh });
 
     render(<NewAgentButtons onLocalClick={() => {}} projectId={PROJECT} />);
@@ -291,15 +300,47 @@ describe("NewAgentButtons — the reason line is a live way OUT, not just copy",
     expect(openSignIn).toHaveBeenCalled();
   });
 
-  it("a block with no self-serve fix does not pretend to be actionable", () => {
-    // feature_disabled carries no deepLink — clicking must not open a Settings section.
-    useAuthStore.setState({ me: me({ cloud: false }), tokenPresent: true });
-    render(<NewAgentButtons onLocalClick={() => {}} projectId={PROJECT} />);
+  // (A test for "a block with no self-serve fix does not pretend to be actionable" lived here. Its
+  // subject was `feature_disabled`, the one reason that carried neither a deepLink nor needsSignIn —
+  // i.e. the dead end this change deletes. There is no such block left to assert about, and
+  // gating.test.ts now fails if one is ever added back.)
 
-    fireEvent.click(screen.getByTestId("new-cloud-agent-reason"));
+  it("EVERY blocked state offers a control that actually does something", () => {
+    // The positive form of what that deleted test was circling. Walk the blocked states this
+    // component can render and require each one's reason line to DO something when clicked —
+    // either open Settings or start sign-in. Text alone is the failure mode being guarded.
+    const cases: Array<{ name: string; seed: () => void }> = [
+      { name: "signed out", seed: () => useAuthStore.setState({ me: null, tokenPresent: false }) },
+      {
+        name: "no credits",
+        seed: () => {
+          useAuthStore.setState({ me: me({ balanceCents: 0 }), tokenPresent: true });
+          useCloudAuthStore.setState({ method: "byok", loaded: true });
+        },
+      },
+      {
+        name: "no Claude auth",
+        seed: () => {
+          useAuthStore.setState({ me: me(), tokenPresent: true });
+          useCloudAuthStore.setState({ method: null, loaded: true });
+        },
+      },
+    ];
 
-    expect(useUiStore.getState().settingsRequest).toBeNull();
-    expect(openSignIn).not.toHaveBeenCalled();
+    for (const c of cases) {
+      cleanup();
+      useUiStore.setState({ settingsRequest: null });
+      vi.mocked(openSignIn).mockClear();
+      useCloudAuthStore.getState().reset();
+      c.seed();
+      render(<NewAgentButtons onLocalClick={() => {}} projectId={PROJECT} />);
+
+      fireEvent.click(screen.getByTestId("new-cloud-agent-reason"));
+
+      const acted =
+        useUiStore.getState().settingsRequest !== null || vi.mocked(openSignIn).mock.calls.length > 0;
+      expect(acted, `"${c.name}" rendered a reason that does nothing when clicked`).toBe(true);
+    }
   });
 });
 

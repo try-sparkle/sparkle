@@ -1,7 +1,7 @@
 // Pure gating logic for creating a CLOUD agent (Service B, W5). No IO — the creation UI feeds
-// these the current auth/entitlement/credit state and renders the derived decision. Kept pure so
-// the "no auth / no credits / feature disabled / not signed in / happy path" matrix is exhaustively
-// unit-testable without a live server (design spec §"Desktop: a transport seam", plan §W5).
+// these the current auth/credit state and renders the derived decision. Kept pure so the
+// "not signed in / no auth / no credits / happy path" matrix is exhaustively unit-testable without
+// a live server (design spec §"Desktop: a transport seam", plan §W5).
 //
 // The DEFINITIVE gate is server-side: POST /sessions/start verifies auth + affordability and
 // returns an honest error (see startError.ts). This module is the CLIENT pre-check that decides
@@ -11,22 +11,31 @@
 
 import type { CategoryId } from "../../stores/uiStore";
 
-/** Why a cloud create is blocked, most-fundamental first. */
+/**
+ * Why a cloud create is blocked, most-fundamental first.
+ *
+ * EVERY MEMBER MUST BE SELF-SERVE — each one ships with either a `deepLink` to the Settings section
+ * that fixes it or `needsSignIn`. That is pinned by a test in gating.test.ts, so adding a reason
+ * with no way out fails the suite rather than shipping as a dead end.
+ *
+ * Two reasons were REMOVED on 2026-08-05 and should not come back:
+ *  - `feature_disabled` mirrored `Me.cloudAgentsEnabled`, read as a per-account entitlement. It never
+ *    was one — that is a single global env var on the server with no per-account representation, so
+ *    the message ("Cloud agents aren't available on your account yet") was a claim about an account
+ *    nobody had looked at, pointing at nothing the user could do. It is now a kill switch, on by
+ *    default, and a server-side outage is classified by startError.ts instead.
+ *  - `no_paid_account` required `paid_at`. The founder's rule is that any FUNDED user may start one,
+ *    and the check was near-vacuous regardless (credits arrive by a top-up that sets `paid_at`).
+ */
 export type CloudBlockReason =
-  | "feature_disabled" // server hasn't advertised CLOUD_AGENTS_ENABLED for this account
   | "signed_out" //       no desktop bearer token
-  | "no_paid_account" //  cloud agents require a paid account (no trial-funded sandboxes, v1)
   | "no_auth" //          no Claude auth saved (GET /claude-auth is null)
   | "insufficient_credits"; // balance below the minimum affordable run
 
 /** The inputs the creation UI knows locally at click time. */
 export interface CloudGateInput {
-  /** Server-advertised capability (Me.cloudAgentsEnabled). Undefined/false → option hidden. */
-  featureEnabled: boolean;
   /** A desktop bearer token is present (signed in). */
   signedIn: boolean;
-  /** The account is entitled/paid (Me.entitled). Cloud requires a paid account in v1. */
-  entitled: boolean;
   /** GET /claude-auth returned a method (a key/token is saved server-side). */
   authConfigured: boolean;
   /** Current credit balance in cents (Me.balanceCents). */
@@ -43,8 +52,8 @@ export type CloudGate =
       reason: CloudBlockReason;
       /** User-facing one-liner explaining the block. */
       message: string;
-      /** The Settings section to deep-link to so the user can fix it (undefined = no deep link,
-       *  e.g. a pure feature-disabled state that the user can't self-serve). */
+      /** The Settings section to deep-link to so the user can fix it. Every reason carries this or
+       *  {@link CloudGate.needsSignIn}; a block with neither is a dead end and is not allowed. */
       deepLink?: CategoryId;
       /** True when the fix is to sign in (the creation UI offers the sign-in hand-off, not Settings). */
       needsSignIn?: boolean;
@@ -70,50 +79,35 @@ export type CloudGate =
 export const CLOUD_MIN_START_CENTS = 1;
 
 /**
- * Whether the Cloud runtime option is even OFFERED. The whole toggle/option is hidden unless the
- * server advertises the capability for this account — the feature "ships dark" (spec §Feature flag).
- * A signed-out user can't have a capability yet, so this is also false for them.
+ * Whether the Cloud runtime option is even OFFERED — now simply "is this user signed in".
+ *
+ * It used to also require `featureEnabled`, which HID every cloud surface from everyone, because the
+ * capability it read is a global server flag that shipped off. Hiding is the worst of the options
+ * here: a user who cannot see the button cannot be told why, so there is nothing to click and
+ * nothing to read. Showing it and letting {@link evaluateCloudGate} name the one fixable
+ * precondition is what makes the feature discoverable at all.
  */
-export function cloudOptionVisible(input: Pick<CloudGateInput, "featureEnabled" | "signedIn">): boolean {
-  return input.featureEnabled && input.signedIn;
+export function cloudOptionVisible(input: Pick<CloudGateInput, "signedIn">): boolean {
+  return input.signedIn;
 }
 
 /**
  * Decide whether a cloud-agent create can proceed, or which precondition blocks it. Checks run
  * most-fundamental first so the surfaced reason is the one the user must fix first:
- * signed in → feature → paid → auth → credits.
+ * signed in → auth → credits. Each is one click from its own fix.
  */
 export function evaluateCloudGate(input: CloudGateInput): CloudGate {
   const minStart = input.minStartCents ?? CLOUD_MIN_START_CENTS;
 
-  // SIGNED-IN FIRST, and the order is the whole point of this pair.
-  //
-  // `featureEnabled` comes from `/me`, so a signed-out user has no `/me` at all and reads as
-  // feature-disabled — which would tell someone who has simply not signed in that "Cloud agents
-  // aren't available on your account yet". That is a false statement about an account we have not
-  // looked at, and it is unactionable: it points at nothing they can do, when the fix is one click.
-  // We cannot know a capability we were never told, so "sign in" is the honest first answer.
+  // SIGNED-IN FIRST. Everything below is read from `/me` or from a server-side credential, and a
+  // signed-out user has neither — so any other reason would be a statement about an account we have
+  // never looked at. "Sign in" is the only honest first answer, and the fix is one click.
   if (!input.signedIn) {
     return {
       ok: false,
       reason: "signed_out",
       message: "Sign in to run agents in the cloud.",
       needsSignIn: true,
-    };
-  }
-  if (!input.featureEnabled) {
-    return {
-      ok: false,
-      reason: "feature_disabled",
-      message: "Cloud agents aren't available on your account yet.",
-    };
-  }
-  if (!input.entitled) {
-    return {
-      ok: false,
-      reason: "no_paid_account",
-      message: "Cloud agents require a paid account. Upgrade to run agents in the cloud.",
-      deepLink: "credits",
     };
   }
   if (!input.authConfigured) {
@@ -133,4 +127,19 @@ export function evaluateCloudGate(input: CloudGateInput): CloudGate {
     };
   }
   return { ok: true };
+}
+
+/**
+ * The label for the button that takes a blocked user to the fix. ONE definition, because the
+ * ternary it replaces (`deepLink === "cloudauth" ? "Add Claude auth" : "Open credits"`) was written
+ * out verbatim at three call sites — the create dialog twice and the promote dialog once — so a
+ * fourth Settings destination would have silently read "Open credits" at whichever site was missed.
+ *
+ * Returns null for a destination with no copy of its own rather than guessing, so the caller renders
+ * nothing instead of a button that lies about where it goes.
+ */
+export function deepLinkActionLabel(deepLink: CategoryId): string | null {
+  if (deepLink === "cloudauth") return "Add Claude auth";
+  if (deepLink === "credits") return "Open credits";
+  return null;
 }

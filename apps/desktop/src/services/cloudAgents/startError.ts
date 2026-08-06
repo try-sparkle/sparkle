@@ -7,12 +7,15 @@
 
 import type { CategoryId } from "../../stores/uiStore";
 
-/** Recovery buckets for a start failure. Mirrors the client-side {@link CloudBlockReason} set plus
- *  a `generic` fallback and an `offline` transport bucket. */
+/** Recovery buckets for a start failure. Covers the client-side {@link CloudBlockReason} set plus a
+ *  `generic` fallback, an `offline` transport bucket, and `service_unavailable` — which has NO
+ *  client-side twin, because it is the one thing only the server can tell us. */
 export type StartErrorReason =
-  | "feature_disabled"
+  /** The server refused with 403 `cloud_agents_disabled`: the ops kill switch is down. This is an
+   *  OUTAGE, not an entitlement — it used to be called `feature_disabled` and said "not available on
+   *  your account yet", which was a claim about the caller's account for a switch that is global. */
+  | "service_unavailable"
   | "signed_out"
-  | "no_paid_account"
   | "no_auth"
   | "insufficient_credits"
   | "offline"
@@ -45,16 +48,20 @@ export interface StartGuidance {
 // Code fragments the server uses (matched case-insensitively as substrings so a namespaced code
 // like "cloud_agents_disabled" or "billing.insufficient_credits" still classifies).
 const CODE_HINTS: Array<{ frag: string; reason: StartErrorReason }> = [
-  { frag: "cloud_agents_disabled", reason: "feature_disabled" },
-  { frag: "feature_disabled", reason: "feature_disabled" },
-  { frag: "not_enabled", reason: "feature_disabled" },
+  { frag: "cloud_agents_disabled", reason: "service_unavailable" },
+  { frag: "feature_disabled", reason: "service_unavailable" },
+  { frag: "not_enabled", reason: "service_unavailable" },
   { frag: "no_claude_auth", reason: "no_auth" },
   { frag: "claude_auth", reason: "no_auth" },
   { frag: "missing_auth", reason: "no_auth" },
   { frag: "insufficient_credits", reason: "insufficient_credits" },
   { frag: "out_of_credits", reason: "insufficient_credits" },
-  { frag: "not_entitled", reason: "no_paid_account" },
-  { frag: "paid_account", reason: "no_paid_account" },
+  // An OLDER server still refuses an unpaid account with `not_entitled`. Cloud no longer requires a
+  // paid account, so there is no `no_paid_account` bucket to route this to — and "add credits" is
+  // both the right advice and the right deep link for anyone who could still receive it, since a
+  // top-up is what clears `paid_at` on that server too.
+  { frag: "not_entitled", reason: "insufficient_credits" },
+  { frag: "paid_account", reason: "insufficient_credits" },
   { frag: "payment_required", reason: "insufficient_credits" },
 ];
 
@@ -141,7 +148,7 @@ export function classifyStartError(raw: unknown): StartGuidance {
       : e.status === 402
         ? "insufficient_credits"
         : e.status === 403
-          ? "feature_disabled"
+          ? "service_unavailable"
           : // Offline only when there is NO status — a real transport failure (fetch rejects) carries
             // none, while any server response (incl. a 500 mentioning "timed out"/"connect") does and
             // stays generic. `!e.status` also treats a `status: 0` (some wrappers use it for network
@@ -208,19 +215,16 @@ function guidanceFor(
   status?: number | null,
 ): StartGuidance {
   switch (reason) {
-    case "feature_disabled":
-      return { reason, message: "Cloud agents aren't available on your account yet." };
+    // No deep link, and that is correct HERE in a way it never was for the old account-level
+    // message: the kill switch is ours, so there is genuinely nothing in Settings for the user to
+    // change. Waiting is the real remedy, so the copy says so rather than pointing somewhere useless.
+    case "service_unavailable":
+      return { reason, message: "Cloud agents are temporarily unavailable. Try again shortly." };
     case "signed_out":
       return {
         reason,
         message: "Your session expired. Sign in again to run agents in the cloud.",
         needsSignIn: true,
-      };
-    case "no_paid_account":
-      return {
-        reason,
-        message: "Cloud agents require a paid account. Upgrade to continue.",
-        deepLink: "credits",
       };
     case "no_auth":
       return {

@@ -90,21 +90,26 @@ describe("reattachProjectOnOpen", () => {
     await expect(reattachProjectOnOpen(pid)).resolves.toEqual(["live"]);
   });
 
-  it("does nothing at all — not one request — when the capability isn't advertised", async () => {
+  // Re-attach used to require the advertised capability, and that was the wrong thing to hang it
+  // on: the field is a GLOBAL server switch, so an older server — or simply the moment before `/me`
+  // lands — meant a user's ALREADY-RUNNING cloud sessions were never reconciled. Their tabs did not
+  // come back while the sandbox kept billing, which is the one outcome this path exists to prevent.
+  it("still reconciles when /me carries no cloud capability — the sessions are real either way", async () => {
     const pid = seedProject({ cloudProjectId: "srv-1" });
     useAuthStore.setState({ me: me(false), tokenPresent: true });
+    listSessions.mockResolvedValue([{ id: "live", status: "paused" }]);
+    await expect(reattachProjectOnOpen(pid)).resolves.toEqual(["live"]);
+    expect(listSessions).toHaveBeenCalled();
+  });
+
+  it("does nothing at all — not one request — when signed out", async () => {
+    const pid = seedProject({ cloudProjectId: "srv-1" });
+    useAuthStore.setState({ me: me(true), tokenPresent: false });
     // null = "never got a useful answer" — the caller keeps the project eligible for a retry,
     // because on a cold boot this same shape means "auth hasn't settled yet".
     await expect(reattachProjectOnOpen(pid)).resolves.toBeNull();
     expect(listSessions).not.toHaveBeenCalled();
     expect(listProjects).not.toHaveBeenCalled();
-  });
-
-  it("does nothing when signed out", async () => {
-    const pid = seedProject({ cloudProjectId: "srv-1" });
-    useAuthStore.setState({ me: me(true), tokenPresent: false });
-    await expect(reattachProjectOnOpen(pid)).resolves.toBeNull();
-    expect(listSessions).not.toHaveBeenCalled();
   });
 
   it("never CREATES a server project row just because a project was opened", async () => {

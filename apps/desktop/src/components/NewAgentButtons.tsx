@@ -214,8 +214,10 @@ function NewCloudAgentButton({ projectId, dataHint }: { projectId: string | null
  * contradiction of this component's own claim to be the way out. Both dialogs that render this gate
  * (`NewCloudAgentDialog`, `CreditsPanel`) offer sign-in for exactly this case; so does this row.
  *
- * A block with NEITHER — `feature_disabled`, which the user cannot self-serve at all — stays inert
- * text on purpose, because offering a control that opens nothing is worse than stating the fact.
+ * There is no longer any block with NEITHER. `feature_disabled` was the one, and it was deleted
+ * along with the flag it read — so `act` is non-null for every reason the gate can now return, and
+ * `gating.test.ts` fails if that ever stops being true. The null branch below is kept as a
+ * defensive render, not as a state anyone should be able to reach.
  */
 function BlockReason({
   blocked,

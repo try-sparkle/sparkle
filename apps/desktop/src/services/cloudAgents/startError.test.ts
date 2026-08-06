@@ -58,10 +58,14 @@ describe("parseStartError", () => {
 });
 
 describe("classifyStartError", () => {
-  it("classifies the feature-disabled error (CLOUD_AGENTS_ENABLED off)", () => {
+  it("classifies the kill-switch refusal as an OUTAGE, not an account problem", () => {
     const g = classifyStartError({ status: 403, code: "cloud_agents_disabled" });
-    expect(g.reason).toBe("feature_disabled");
+    expect(g.reason).toBe("service_unavailable");
+    // No deep link, and here that is right: the switch is ours, so Settings holds no fix.
     expect(g.deepLink).toBeUndefined();
+    // The copy must not blame the caller's account — that sentence was the original dead end.
+    expect(g.message).not.toMatch(/your account/i);
+    expect(g.message).toMatch(/temporarily unavailable/i);
   });
 
   it("classifies a missing-Claude-auth error → deep-link to cloudauth", () => {
@@ -82,14 +86,17 @@ describe("classifyStartError", () => {
     expect(g.needsSignIn).toBe(true);
   });
 
-  it("classifies not-entitled → no_paid_account", () => {
+  // Cloud no longer requires a paid account, so there is no `no_paid_account` bucket. An OLDER
+  // server can still send `not_entitled`, and "add credits" is both the right advice and the right
+  // destination for anyone who receives it — a top-up is what clears `paid_at` on that server too.
+  it("routes an older server's not_entitled to credits rather than a dead end", () => {
     const g = classifyStartError({ status: 403, code: "not_entitled" });
-    expect(g.reason).toBe("no_paid_account");
+    expect(g.reason).toBe("insufficient_credits");
     expect(g.deepLink).toBe("credits");
   });
 
   it("prefers the stable code over the status when both are present", () => {
-    // 403 alone would read feature_disabled, but the code says it's really an auth problem.
+    // 403 alone would read service_unavailable, but the code says it is really an auth problem.
     const g = classifyStartError({ status: 403, code: "missing_auth" });
     expect(g.reason).toBe("no_auth");
   });
@@ -138,15 +145,15 @@ describe("classifyStartError", () => {
     // And a CloudApiError with a code still classifies by code.
     expect(
       classifyStartError(new CloudApiError(403, "cloud_agents_disabled", "off")).reason,
-    ).toBe("feature_disabled");
+    ).toBe("service_unavailable");
   });
 
   it("pins CODE_HINTS precedence: the first matching fragment (array order) wins", () => {
     // A code containing two fragments must resolve deterministically by CODE_HINTS order, so a
     // future reorder can't silently change the deep-link target.
-    // "cloud_agents_disabled" precedes "claude_auth" → feature_disabled.
+    // "cloud_agents_disabled" precedes "claude_auth" → service_unavailable.
     expect(classifyStartError({ code: "cloud_agents_disabled_no_claude_auth" }).reason).toBe(
-      "feature_disabled",
+      "service_unavailable",
     );
     // The genuinely ambiguous overlap: "insufficient_credits" (earlier) precedes "paid_account".
     expect(classifyStartError({ code: "billing.paid_account_insufficient_credits" }).reason).toBe(

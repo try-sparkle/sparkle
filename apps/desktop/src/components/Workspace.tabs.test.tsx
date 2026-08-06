@@ -501,8 +501,19 @@ describe("Workspace — Plan mode fills that column’s terminal slot", () => {
 // the ONE reconciliation pass a project gets is the difference between finding your agent where you
 // left it and an empty sidebar with an invisible meter still billing.
 describe("Workspace — cloud re-attach is attempted once, and retried when it never answered", () => {
-  it("does not even try while the cloud capability is absent (a local-only user)", async () => {
+  // Re-attach used to require the server-advertised capability, and that was the wrong thing to
+  // hang it on: the field is a GLOBAL switch, so an older server — or simply the moment before
+  // `/me` lands — meant a user's already-running cloud sessions were never reconciled and their
+  // tabs did not come back, with the meter still billing. Signed-in is the only gate now; the
+  // lookup is cheap and fails soft, so trying and finding nothing is the better error.
+  it("still tries for a signed-in user whose /me carries no cloud capability", async () => {
     useAuthStore.setState({ me: { clerkUserId: "u1", entitled: true, balanceCents: 0, tokenVersion: 1 }, tokenPresent: true } as never);
+    render(<Workspace />);
+    await waitFor(() => expect(reattach).toHaveBeenCalledWith("p1"));
+  });
+
+  it("does not try while SIGNED OUT — the request could only be unauthenticated", async () => {
+    useAuthStore.setState({ me: null, tokenPresent: false } as never);
     render(<Workspace />);
     await waitFor(() => expect(screen.getByTestId("sidebar")).toBeTruthy());
     expect(reattach).not.toHaveBeenCalled();

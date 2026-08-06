@@ -62,13 +62,13 @@ describe("createCloudAgent", () => {
     });
   });
 
-  it("on a feature-disabled start error returns guidance and creates NO tab", async () => {
+  it("on a kill-switch start error returns guidance and creates NO tab", async () => {
     const { d, addAgent } = deps(async () => {
       throw new CloudApiError(403, "cloud_agents_disabled", "off");
     });
     const res = await createCloudAgent({ projectId: "p", goal: "g", repoUrl: "r" }, d);
     expect(res.ok).toBe(false);
-    if (!res.ok) expect(res.guidance.reason).toBe("feature_disabled");
+    if (!res.ok) expect(res.guidance.reason).toBe("service_unavailable");
     expect(addAgent).not.toHaveBeenCalled();
   });
 

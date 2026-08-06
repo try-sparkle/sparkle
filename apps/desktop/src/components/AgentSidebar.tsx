@@ -3936,8 +3936,8 @@ const AgentRow = memo(function AgentRow({
   const unjudgedAsk = useRuntimeStore((s) => s.unjudgedAsk[a.id] !== undefined);
   // May the "Move to cloud" item be OFFERED at all? Subscribed here (not threaded down) for the
   // same reason as `unjudgedAsk` above: it is a boolean read through a selector, so a change
-  // re-renders the rows rather than the column. This is `cloudOptionVisible` — capability advertised
-  // AND signed in — exactly what the creation flow gates its Cloud option on.
+  // re-renders the rows rather than the column. This is `cloudOptionVisible` — SIGNED IN, and
+  // nothing else — exactly what the creation flow gates its Cloud option on.
   const cloudOfferable = useCloudAgentsEnabled();
   const openPromoteToCloud = useUiStore((s) => s.openPromoteToCloud);
   // The OTHER direction. Deliberately NOT gated on `cloudOfferable` (see the button below).
@@ -5180,13 +5180,13 @@ const AgentRow = memo(function AgentRow({
           (Land, rebase, the model picker, the path reveal), so this belongs here rather than as one
           more control on the dense in-flow row.
 
-          THREE CONDITIONS, ALL OF THEM NARROW, and the last is why most users will never see this:
+          THREE CONDITIONS, AND THE LAST IS JUST "SIGNED IN":
             • `runtime === "local"` — there is nothing to promote about an agent already in a sandbox;
             • `kind === "build"` — a shell agent has no conversation and no branch (spec §Not in scope);
-            • `cloudOfferable` — the SAME `cloudOptionVisible` gate the creation flow uses. Cloud
-              agents ship dark (`CLOUD_AGENTS_ENABLED` defaults off), so for essentially every user
-              today this item is simply absent, and that absence is asserted alongside its presence.
-          The full precondition ladder (paid / Claude auth / credits) is the DIALOG's job — it can
+            • `cloudOfferable` — the SAME `cloudOptionVisible` gate the creation flow uses, which is
+              now only "is this user signed in". It used to also require an advertised capability,
+              which hid the item from everyone — and a control that vanishes cannot say why.
+          The rest of the precondition ladder (Claude auth / credits) is the DIALOG's job — it can
           state the block and deep-link the fix, which a missing menu item cannot. */}
       {a.runtime === "local" && a.kind === "build" && cloudOfferable && (
         <div style={{ marginTop: 8 }}>
@@ -5223,8 +5223,8 @@ const AgentRow = memo(function AgentRow({
             • `kind === "build"` — a shell agent has no conversation and no branch (spec §Not in scope).
 
           What is deliberately ABSENT from that list is the point. There is no `cloudOfferable`
-          check: a cloud tab cannot exist unless the feature was on when it was made, so re-asking
-          would only strand agents if the flag ever went off. And there is no `evaluateCloudGate`
+          check: a cloud tab is a running sandbox, so gating its exit on anything would strand it.
+          And there is no `evaluateCloudGate`
           check: a user whose credits ran out is exactly the user who needs to bring work down, and
           a gate that hides the exit is a trap. */}
       {a.runtime === "cloud" && a.kind === "build" && (

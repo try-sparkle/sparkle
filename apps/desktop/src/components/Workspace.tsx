@@ -1356,7 +1356,9 @@ export function Workspace() {
   // exactly one attempt and the un-mark had nothing to trigger it again, which made the retry a
   // no-op for the very case it was written for. Now the settling token IS the retry trigger.
   // The same gate every other cloud surface reads (services/cloudAgents/gating, via the hook) —
-  // not a fourth hand-rolled copy of `tokenPresent && me?.cloudAgentsEnabled` (roborev 52648).
+  // not a fourth hand-rolled copy of it (roborev 52648). It is now just "signed in": the
+  // `me.cloudAgentsEnabled` half was dropped because that flag is a global server switch, so
+  // gating re-attach on it meant a user's already-running cloud sessions never came back.
   const cloudAuthReady = useCloudAgentsEnabled();
   // …and CONNECTIVITY, because auth-settling is only half of what produces a retryable null. On an
   // offline cold boot for an already-signed-in user the persisted token rehydrates `tokenPresent`

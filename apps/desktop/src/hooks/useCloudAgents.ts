@@ -1,11 +1,13 @@
 // React bindings for the cloud-agents gating layer (Service B, W5). The DECISIONS live in
 // services/cloudAgents/gating.ts (pure, exhaustively tested); these hooks only assemble that
-// module's inputs from the two stores that hold them — authStore (`/me`: capability, entitlement,
-// balance) and cloudAuthStore (whether a Claude credential is saved server-side).
+// module's inputs from the two stores that hold them — authStore (`/me`: balance) and cloudAuthStore
+// (whether a Claude credential is saved server-side).
 //
-// Everything cloud is gated on ONE fact: the server advertised `cloudAgentsEnabled` for this
-// account. Absent (older server, flag off, signed out) ⇒ false ⇒ no cloud surface renders at all,
-// which is what "ships dark" means for a local-only user.
+// Cloud surfaces render for any SIGNED-IN user. They used to be gated on `me.cloudAgentsEnabled`
+// too, which hid them from everyone — that capability is a global server switch, not a per-account
+// entitlement, and it shipped off. Hiding is the worst failure mode available here: a user who
+// cannot see the button cannot be told why. Now the button is always there and the gate names the
+// one precondition to fix.
 
 import { useEffect } from "react";
 
@@ -17,19 +19,16 @@ import {
   type CloudGate,
 } from "../services/cloudAgents/gating";
 
-/** True when the Cloud runtime may be OFFERED at all (server capability + signed in). */
+/** True when the Cloud runtime may be OFFERED at all — i.e. the user is signed in. */
 export function useCloudAgentsEnabled(): boolean {
-  const featureEnabled = useAuthStore((s) => s.me?.cloudAgentsEnabled === true);
   const signedIn = useAuthStore((s) => s.tokenPresent);
-  return cloudOptionVisible({ featureEnabled, signedIn });
+  return cloudOptionVisible({ signedIn });
 }
 
-/** The full precondition check for STARTING a cloud agent (feature → signed in → paid → auth →
- *  credits), including the Settings section to deep-link to for a self-serve fix. */
+/** The full precondition check for STARTING a cloud agent (signed in → auth → credits), including
+ *  the Settings section to deep-link to for a self-serve fix. */
 export function useCloudGate(): CloudGate {
-  const featureEnabled = useAuthStore((s) => s.me?.cloudAgentsEnabled === true);
   const signedIn = useAuthStore((s) => s.tokenPresent);
-  const entitled = useAuthStore((s) => s.me?.entitled === true);
   const balanceCents = useAuthStore((s) => s.me?.balanceCents ?? 0);
   const saved = useCloudAuthStore((s) => s.method != null);
   const probed = useCloudAuthStore((s) => s.loaded);
@@ -51,11 +50,11 @@ export function useCloudGate(): CloudGate {
   // once per sign-in; `reset` clears it, so signing back in probes again.
   //
   // Concurrent consumers are deduped INSIDE the store, not here: a value read at render is stale by
-  // the time a sibling's effect runs in the same flush. Gated on feature+signed-in because an
-  // account that cannot have cloud at all would otherwise fire an unauthenticated GET for nothing.
+  // the time a sibling's effect runs in the same flush. Still gated on signed-in, which is the part
+  // that mattered — without a bearer token the GET is unauthenticated and can only 401.
   useEffect(() => {
-    if (featureEnabled && signedIn && !attempted) void refresh();
-  }, [featureEnabled, signedIn, attempted, refresh]);
+    if (signedIn && !attempted) void refresh();
+  }, [signedIn, attempted, refresh]);
 
   // UNPROBED IS UNKNOWN, AND UNKNOWN IS NOT "NO CREDENTIAL" — for every consumer, which is why this
   // is unconditional rather than an opt-in. `loaded` is false in two situations and neither is
@@ -66,8 +65,8 @@ export function useCloudGate(): CloudGate {
   // that guesses ahead of it can only be wrong in the direction that blocks a working account.
   const authConfigured = saved || !probed;
   // Fed through the SAME `evaluateCloudGate` rather than patched afterwards, and that matters: the
-  // checks are ORDERED (feature → signed in → paid → auth → credits) and return the FIRST block, so
-  // rewriting a `no_auth` result to "ok" after the fact would also swallow the `insufficient_credits`
-  // the evaluation never reached. Adjusting the INPUT lets the ordering carry on to the next check.
-  return evaluateCloudGate({ featureEnabled, signedIn, entitled, authConfigured, balanceCents });
+  // checks are ORDERED (signed in → auth → credits) and return the FIRST block, so rewriting a
+  // `no_auth` result to "ok" after the fact would also swallow the `insufficient_credits` the
+  // evaluation never reached. Adjusting the INPUT lets the ordering carry on to the next check.
+  return evaluateCloudGate({ signedIn, authConfigured, balanceCents });
 }

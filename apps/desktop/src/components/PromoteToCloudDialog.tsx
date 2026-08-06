@@ -13,6 +13,8 @@ import { useUiStore } from "../stores/uiStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useCloudGate } from "../hooks/useCloudAgents";
 import { cloudApi } from "../services/cloudAgents/api";
+import { deepLinkActionLabel } from "../services/cloudAgents/gating";
+import { openSignIn } from "../services/sparkleApi";
 import { projectRepoUrl } from "../services/cloudAgents/repoUrl";
 import { ensureCloudProjectId } from "../services/cloudAgents/projectLink";
 import { projectBindingSets } from "../services/cloudAgents/projectBinding";
@@ -331,13 +333,21 @@ export function PromoteToCloudDialog({
           ) : !plan.ok ? (
             <div style={panel} data-testid="promote-refusal">
               <div style={{ fontSize: 13, color: C.cream, lineHeight: 1.5 }}>{plan.message}</div>
-              {plan.deepLink && (
+              {/* `needsSignIn` was MISSING here, and it is the one reason that carries no deepLink —
+                  so a signed-out user read "Sign in to run agents in the cloud" beside no control at
+                  all. NewAgentButtons had handled this for the identical gate all along. */}
+              {plan.needsSignIn && (
+                <button type="button" style={actionBtn} onClick={() => void openSignIn()}>
+                  Sign in
+                </button>
+              )}
+              {plan.deepLink && deepLinkActionLabel(plan.deepLink) && (
                 <button
                   type="button"
                   style={actionBtn}
                   onClick={() => goToSettings(plan.deepLink!)}
                 >
-                  {plan.deepLink === "cloudauth" ? "Add Claude auth" : "Open credits"}
+                  {deepLinkActionLabel(plan.deepLink)}
                 </button>
               )}
             </div>

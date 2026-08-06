@@ -1,42 +1,42 @@
 import { describe, it, expect } from "vitest";
 import {
   cloudOptionVisible,
+  deepLinkActionLabel,
   evaluateCloudGate,
   CLOUD_MIN_START_CENTS,
+  type CloudBlockReason,
   type CloudGateInput,
 } from "./gating";
 
 // A fully-passing baseline; each test flips exactly one field to isolate that precondition.
 const OK: CloudGateInput = {
-  featureEnabled: true,
   signedIn: true,
-  entitled: true,
   authConfigured: true,
   balanceCents: 10_000,
 };
 
 describe("cloudOptionVisible", () => {
-  it("shows the option only when the feature is enabled AND signed in", () => {
-    expect(cloudOptionVisible({ featureEnabled: true, signedIn: true })).toBe(true);
-    expect(cloudOptionVisible({ featureEnabled: false, signedIn: true })).toBe(false);
-    expect(cloudOptionVisible({ featureEnabled: true, signedIn: false })).toBe(false);
-    expect(cloudOptionVisible({ featureEnabled: false, signedIn: false })).toBe(false);
+  // It used to also require a server-advertised capability, which hid every cloud surface from
+  // everyone — and a hidden button cannot explain itself. Being visible-but-blocked is the whole
+  // point: the gate below then names the one thing to fix.
+  it("shows the option to any signed-in user", () => {
+    expect(cloudOptionVisible({ signedIn: true })).toBe(true);
+    expect(cloudOptionVisible({ signedIn: false })).toBe(false);
   });
 });
 
 describe("evaluateCloudGate", () => {
-  it("allows a fully-configured, funded, paid, signed-in, feature-enabled account (happy path)", () => {
+  it("allows a funded, authed, signed-in account (happy path)", () => {
     expect(evaluateCloudGate(OK)).toEqual({ ok: true });
   });
 
-  it("blocks with feature_disabled when the server hasn't advertised the capability", () => {
-    const g = evaluateCloudGate({ ...OK, featureEnabled: false });
-    expect(g.ok).toBe(false);
-    if (!g.ok) {
-      expect(g.reason).toBe("feature_disabled");
-      // Not self-serviceable — no deep link.
-      expect(g.deepLink).toBeUndefined();
-    }
+  // THE POLICY CHANGE. A paid account is no longer required — credits are the whole gate — and the
+  // capability flag is gone from the client entirely. Neither input exists any more, so this asserts
+  // the OUTCOME: an account that would previously have been refused twice over now passes.
+  it("allows an account that is merely funded — no paid tier, no advertised capability", () => {
+    expect(evaluateCloudGate({ signedIn: true, authConfigured: true, balanceCents: 1 })).toEqual({
+      ok: true,
+    });
   });
 
   it("blocks with signed_out (and offers sign-in) when there is no token", () => {
@@ -45,15 +45,6 @@ describe("evaluateCloudGate", () => {
     if (!g.ok) {
       expect(g.reason).toBe("signed_out");
       expect(g.needsSignIn).toBe(true);
-    }
-  });
-
-  it("blocks with no_paid_account (deep-links to Credits) when unentitled", () => {
-    const g = evaluateCloudGate({ ...OK, entitled: false });
-    expect(g.ok).toBe(false);
-    if (!g.ok) {
-      expect(g.reason).toBe("no_paid_account");
-      expect(g.deepLink).toBe("credits");
     }
   });
 
@@ -89,49 +80,92 @@ describe("evaluateCloudGate", () => {
   });
 
   it("surfaces the MOST FUNDAMENTAL block first when several fail at once", () => {
-    // Everything wrong → signed_out wins, and that ordering is deliberate: `featureEnabled` comes
-    // from `/me`, which a signed-out user does not have, so "not available on your account" would
-    // be a false claim about an account nobody looked at — and unactionable, when the real fix is
-    // one click. This is the exact shape a signed-out trial user hits.
-    const all = evaluateCloudGate({
-      featureEnabled: false,
-      signedIn: false,
-      entitled: false,
-      authConfigured: false,
-      balanceCents: 0,
-    });
+    // Everything wrong → signed_out wins, and that ordering is deliberate: every other input is read
+    // from `/me` or a server-side credential, which a signed-out user has neither of. Any other
+    // answer would be a claim about an account nobody looked at. This is the shape a signed-out
+    // trial user hits.
+    const all = evaluateCloudGate({ signedIn: false, authConfigured: false, balanceCents: 0 });
     expect(all.ok).toBe(false);
     if (!all.ok) expect(all.reason).toBe("signed_out");
 
-    // Signed in but the account genuinely lacks the capability → feature_disabled next.
-    const g2 = evaluateCloudGate({
-      featureEnabled: false,
-      signedIn: true,
-      entitled: false,
-      authConfigured: false,
-      balanceCents: 0,
-    });
-    if (!g2.ok) expect(g2.reason).toBe("feature_disabled");
+    // Signed in but no auth + no credits → no_auth before credits: a credential is the thing you
+    // cannot buy your way past, so it is the more fundamental of the two.
+    const g2 = evaluateCloudGate({ signedIn: true, authConfigured: false, balanceCents: 0 });
+    if (!g2.ok) expect(g2.reason).toBe("no_auth");
+  });
+});
 
-    // Signed in but unpaid + no auth + no credits → no_paid_account next.
-    const g3 = evaluateCloudGate({
-      featureEnabled: true,
-      signedIn: true,
-      entitled: false,
-      authConfigured: false,
-      balanceCents: 0,
-    });
-    if (!g3.ok) expect(g3.reason).toBe("no_paid_account");
+// ── The guarantee this whole change exists to make ────────────────────────────────────────────────
+describe("NO reason is a dead end", () => {
+  // The founder clicked Cloud and got "Cloud agents aren't available on your account yet" with
+  // nothing to click, because one reason shipped with neither a deepLink nor needsSignIn — by
+  // design, since the thing it named was not self-serviceable. That reason is gone, and this test is
+  // what stops a replacement from arriving unnoticed: it walks EVERY blocking input and demands a
+  // way out, then pins the exact reason set so a sixth reason cannot be added without touching it.
+  //
+  // EXHAUSTIVE OVER THE UNION, not just over the inputs. The walk below can only reach reasons that
+  // some entry in BLOCKING_INPUTS happens to produce, so a reason born of a NEW optional input
+  // (`regionAllowed?`) would slip past it green. This `Record` makes that a COMPILE error instead.
+  const WAY_OUT: Record<CloudBlockReason, "deepLink" | "signIn"> = {
+    signed_out: "signIn",
+    no_auth: "deepLink",
+    insufficient_credits: "deepLink",
+  };
 
-    // Paid but no auth + no credits → no_auth before credits.
-    const g4 = evaluateCloudGate({
-      featureEnabled: true,
-      signedIn: true,
-      entitled: true,
-      authConfigured: false,
-      balanceCents: 0,
-    });
-    if (!g4.ok) expect(g4.reason).toBe("no_auth");
+  const BLOCKING_INPUTS: ReadonlyArray<{ label: string; input: CloudGateInput }> = [
+    { label: "signed out", input: { ...OK, signedIn: false } },
+    { label: "no Claude auth", input: { ...OK, authConfigured: false } },
+    { label: "empty wallet", input: { ...OK, balanceCents: 0 } },
+    {
+      label: "everything wrong at once",
+      input: { signedIn: false, authConfigured: false, balanceCents: 0 },
+    },
+    {
+      label: "signed in, no auth, no credits",
+      input: { signedIn: true, authConfigured: false, balanceCents: 0 },
+    },
+  ];
+
+  it.each(BLOCKING_INPUTS)("offers a way out when $label", ({ input }) => {
+    const g = evaluateCloudGate(input);
+    expect(g.ok).toBe(false);
+    if (!g.ok) {
+      // A block must be actionable: either it deep-links to the Settings section that fixes it, or
+      // it hands off to sign-in. Never neither — that is the dead end, and it is what shipped.
+      const hasWayOut = g.deepLink !== undefined || g.needsSignIn === true;
+      expect(hasWayOut, `"${g.message}" gives the user nothing to do`).toBe(true);
+      // And it must be the way out this reason DECLARED above — the Record is the exhaustive half,
+      // and this is what keeps the two from drifting into agreeing about nothing.
+      expect(g.needsSignIn === true ? "signIn" : "deepLink").toBe(WAY_OUT[g.reason]);
+      // A deep link must have a real button label, or the fix is unreachable in practice.
+      if (g.deepLink) expect(deepLinkActionLabel(g.deepLink)).not.toBeNull();
+    }
+  });
+
+  it("produces EXACTLY the reasons declared above — a new one must come here to be blessed", () => {
+    const seen = new Set<CloudBlockReason>();
+    for (const { input } of BLOCKING_INPUTS) {
+      const g = evaluateCloudGate(input);
+      if (!g.ok) seen.add(g.reason);
+    }
+    // Both directions: no reason is emitted that WAY_OUT never blessed, and none is blessed that no
+    // input can actually reach — so adding a union member forces both a way out and an input here.
+    expect([...seen].sort()).toEqual(Object.keys(WAY_OUT).sort());
+  });
+});
+
+describe("deepLinkActionLabel", () => {
+  it("names both destinations the gate can emit", () => {
+    expect(deepLinkActionLabel("cloudauth")).toBe("Add Claude auth");
+    expect(deepLinkActionLabel("credits")).toBe("Open credits");
+  });
+
+  // Null, not a guess: a button labelled "Open credits" that opens the notifications pane is worse
+  // than no button, and the three call sites that used to inline this ternary did exactly that for
+  // any destination other than cloudauth.
+  it("returns null for a destination it has no copy for, rather than defaulting", () => {
+    expect(deepLinkActionLabel("notifications")).toBeNull();
+    expect(deepLinkActionLabel("appearance")).toBeNull();
   });
 });
 

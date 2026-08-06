@@ -148,6 +148,34 @@ describe("refusals and failures", () => {
     expect(screen.queryByTestId("promote-confirm")).toBeNull();
   });
 
+  // THE DEAD END THIS DIALOG SHIPPED. It rendered `deepLink` but ignored `needsSignIn`, and
+  // `signed_out` is the one cloud-gate reason that carries no deepLink — so the most common blocked
+  // state showed "Sign in to run agents in the cloud" beside no control whatsoever. NewAgentButtons
+  // had handled the identical gate correctly all along.
+  it("offers Sign in for a signed-out refusal, which carries NO deep link", async () => {
+    mount({
+      ok: false,
+      refusal: "cloud_gate",
+      message: "Sign in to run agents in the cloud.",
+      needsSignIn: true,
+    });
+    await screen.findByTestId("promote-refusal");
+    expect(screen.getByRole("button", { name: /sign in/i })).toBeTruthy();
+  });
+
+  it("offers the Settings hand-off for a deep-linked refusal", async () => {
+    mount({
+      ok: false,
+      refusal: "cloud_gate",
+      message: "Add your Claude authentication to run agents in the cloud.",
+      deepLink: "cloudauth",
+    });
+    await screen.findByTestId("promote-refusal");
+    // The label comes from the shared `deepLinkActionLabel`, so this also pins that the dialog no
+    // longer carries its own copy of the cloudauth/credits ternary.
+    expect(screen.getByRole("button", { name: "Add Claude auth" })).toBeTruthy();
+  });
+
   // The single most important sentence on a failure: their agent is fine.
   it("says the local agent is still running when a step fails", async () => {
     mount(okPlan(), async () => ({

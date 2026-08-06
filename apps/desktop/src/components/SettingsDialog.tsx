@@ -30,7 +30,6 @@ import { ConciergeToolsPane, CONCIERGE_TOOLS_SEARCH_TERMS } from "./ConciergeToo
 import { ConciergeGuidelinesPane } from "./ConciergeGuidelinesPane";
 import { CloudAuthPane } from "./CloudAuthPane";
 import { OnePasswordPane } from "./OnePasswordPane";
-import { useCloudAgentsEnabled } from "../hooks/useCloudAgents";
 import { useSettingsStore } from "../stores/settingsStore";
 
 // The ⋯ settings dialog. A focused, centered dialog with a left rail of categories driving a
@@ -122,26 +121,24 @@ export function SettingsDialog({ onClose, onManageAccounts, initialCategory }: S
     if (initialCategory) setActive(initialCategory);
   }, [initialCategory]);
 
-  // Cloud Agents ships dark (spec §Feature flag): the "Claude auth for cloud agents" category
-  // exists only for an account the SERVER has advertised the capability to. A local-only user must
-  // see no trace of it — not in the rail, not in search results.
-  const cloudEnabled = useCloudAgentsEnabled();
-  // The 1Password pane follows its Tools switch: it only has anything to say once the user has
+  // "Claude auth for cloud agents" is ALWAYS in the rail now. It used to be filtered on the same
+  // capability the cloud gate read, which made the pane disappear exactly when it was needed: the
+  // gate's `no_auth` block deep-links HERE, and a filtered-out destination silently fell through to
+  // `categories[0]` below — so the one button offered to a blocked user opened the wrong pane.
+  // Saving a Claude credential is also a perfectly reasonable thing to do BEFORE starting a cloud
+  // agent, so there is nothing to hide.
+  //
+  // The 1Password pane still follows its Tools switch: it only has anything to say once the user has
   // opted the tool in, and a rail entry for a tool you've never turned on is noise. Turning the
   // switch on makes it appear immediately (the Tools hint says where to go).
   const onepasswordEnabled = useSettingsStore((s) => s.onepasswordEnabled);
   const categories = useMemo(
-    () =>
-      CATEGORIES.filter(
-        (c) =>
-          (cloudEnabled || c.id !== "cloudauth") &&
-          (onepasswordEnabled || c.id !== "onepassword"),
-      ),
-    [cloudEnabled, onepasswordEnabled],
+    () => CATEGORIES.filter((c) => onepasswordEnabled || c.id !== "onepassword"),
+    [onepasswordEnabled],
   );
-  // `active` is normally one of `categories`' ids — but a deep-link can name a category that this
-  // account doesn't have (a cloudauth link resolved just as the capability went away), so fall back
-  // to the first pane rather than rendering `undefined`.
+  // `active` is normally one of `categories`' ids — but a deep-link can still name a filtered-out
+  // category (a onepassword link resolved just as the tool was switched off), so fall back to the
+  // first pane rather than rendering `undefined`.
   const current = categories.find((c) => c.id === active) ?? categories[0]!;
 
   // Rail search: filter the categories by label OR their keyword set, so "voice" surfaces both

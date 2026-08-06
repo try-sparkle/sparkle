@@ -3,10 +3,11 @@
 // The ENTRY POINT for local→cloud promotion (bead sparkle-8zpvc): one item in the agent row's
 // detail card.
 //
-// Its ABSENCE is as much of the contract as its presence. Cloud agents ship dark
-// (`CLOUD_AGENTS_ENABLED` defaults off), so for essentially every user today this item must simply
-// not be there — and it must never appear on the two kinds of row it means nothing for: an agent
-// already in the cloud, and a shell agent with no branch and no conversation to move.
+// Its ABSENCE is as much of the contract as its presence — but the list of things that hide it is
+// now SHORT. It used to be hidden from anyone whose server had not advertised `CLOUD_AGENTS_ENABLED`,
+// i.e. from essentially everyone; that gate is gone, because a control that vanishes teaches the
+// user the feature was deleted. What remains: signed out, and the two kinds of row it means nothing
+// for — an agent already in the cloud, and a shell agent with no branch and no conversation to move.
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -72,8 +73,9 @@ function mkProject(agents: AgentTab[]): Project {
   };
 }
 
-/** Cloud offered: the server advertised the capability AND we're signed in — `cloudOptionVisible`,
- *  the same predicate the creation flow's Cloud option is gated on. */
+/** Cloud offered: SIGNED IN — `cloudOptionVisible`, the same predicate the creation flow's Cloud
+ *  option is gated on. `cloudAgentsEnabled` is still settable here only so the test below can prove
+ *  it no longer hides anything. */
 function cloudAdvertised(over: { cloudAgentsEnabled?: boolean; signedIn?: boolean } = {}) {
   useAuthStore.setState({
     me: {
@@ -120,11 +122,15 @@ describe("AgentSidebar — Move to cloud", () => {
   // ── THE ABSENCES ─────────────────────────────────────────────────────────────────────────────
   // Every one of these renders the SAME row that shows the item above, changing exactly one fact.
 
-  it("is absent when the server has not advertised cloud agents (it ships dark)", () => {
+  // Moved out of THE ABSENCES: the advertised capability no longer hides anything. It is a global
+  // server switch, not a per-account entitlement, so hiding on it removed the control from everyone
+  // — and a control that vanishes teaches the user the feature was deleted (sparkle-lcx8y). The
+  // promote dialog's own gate states the fixable reason instead.
+  it("is PRESENT for a signed-in user whose /me carries no cloud capability", () => {
     cloudAdvertised({ cloudAgentsEnabled: false });
     render(<AgentSidebar project={mkProject([mkAgent()])} />);
     openCard("Parser Agent");
-    expect(item()).toBeNull();
+    expect(item()).not.toBeNull();
   });
 
   it("is absent when signed out", () => {

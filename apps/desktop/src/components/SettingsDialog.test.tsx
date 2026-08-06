@@ -299,10 +299,11 @@ describe("SettingsDialog — 1Password category (follows the Tools switch)", () 
   });
 });
 
-// Cloud Agents (Service B) ships dark: the "Claude auth for cloud agents" category exists ONLY for
-// an account the server advertised `cloudAgentsEnabled` to. These pin both halves — invisible by
-// default (the local-only user's experience is unchanged) and reachable by deep link when on.
-describe("SettingsDialog — cloudauth category (server-gated)", () => {
+// The cloudauth pane is ALWAYS present now. It used to be filtered on the same capability the cloud
+// gate read, which hid it exactly when it was needed: the gate's `no_auth` block deep-links HERE, so
+// a filtered-out destination meant the one button offered to a blocked user silently resolved to
+// `categories[0]` — the AI pane. Saving a Claude credential ahead of time is reasonable anyway.
+describe("SettingsDialog — cloudauth category", () => {
   const CLOUD_LABEL = "Claude auth for cloud agents";
   const enableCloud = () =>
     useAuthStore.setState({
@@ -317,14 +318,22 @@ describe("SettingsDialog — cloudauth category (server-gated)", () => {
       },
     });
 
-  it("is absent from the rail, from search, and from deep-linking when the server hasn't enabled it", () => {
+  // THE BUG THIS PINS: an account with no advertised capability is precisely the one whose gate
+  // says "Add your Claude authentication" and deep-links to cloudauth. If the pane is missing, that
+  // button lands on the wrong screen and the block is unfixable.
+  it("resolves a cloudauth deep link even when /me carries no cloud capability", () => {
     render(<SettingsDialog onClose={vi.fn()} onManageAccounts={vi.fn()} initialCategory="cloudauth" />);
-    expect(screen.queryByRole("button", { name: CLOUD_LABEL })).toBeNull();
-    // A deep link to a category this account doesn't have falls back to the first pane rather than
-    // rendering an empty dialog.
-    expect(heading("AI features")).toBeTruthy();
+    expect(screen.getByRole("button", { name: CLOUD_LABEL })).toBeTruthy();
+    expect(heading(CLOUD_LABEL)).toBeTruthy();
+    expect(screen.getByTestId("cloudauth-current")).toBeTruthy();
+    // It must NOT have fallen back to the first pane, which is what used to happen.
+    expect(heading("AI features")).toBeNull();
+  });
+
+  it("is findable by search without the capability", () => {
+    render(<SettingsDialog onClose={vi.fn()} onManageAccounts={vi.fn()} />);
     fireEvent.change(screen.getByLabelText("Search settings"), { target: { value: "cloud" } });
-    expect(screen.queryByRole("button", { name: CLOUD_LABEL })).toBeNull();
+    expect(screen.getByRole("button", { name: CLOUD_LABEL })).toBeTruthy();
   });
 
   it("appears and renders the Claude-auth pane once the server advertises the capability", () => {
@@ -351,20 +360,13 @@ describe("SettingsDialog — cloudauth category (server-gated)", () => {
     expect(screen.queryByRole("button", { name: "Workers" })).toBeNull();
   });
 
-  it("stays hidden for a signed-OUT user even if a stale capability sits in the store", () => {
-    useAuthStore.setState({
-      tokenPresent: false,
-      loading: false,
-      me: {
-        clerkUserId: "user_1",
-        entitled: true,
-        balanceCents: 5000,
-        tokenVersion: 1,
-        cloudAgentsEnabled: true,
-      },
-    });
+  // Signed out too. There is nothing account-specific behind this pane — it is a place to save a
+  // credential — and hiding it would only re-create the dead end for the user who has just been
+  // told to come here.
+  it("is present for a signed-OUT user", () => {
+    useAuthStore.setState({ tokenPresent: false, loading: false, me: null });
     render(<SettingsDialog onClose={vi.fn()} onManageAccounts={vi.fn()} />);
-    expect(screen.queryByRole("button", { name: CLOUD_LABEL })).toBeNull();
+    expect(screen.getByRole("button", { name: CLOUD_LABEL })).toBeTruthy();
   });
 });
 

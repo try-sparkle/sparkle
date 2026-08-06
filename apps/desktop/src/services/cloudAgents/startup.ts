@@ -29,10 +29,13 @@ export async function reattachProjectOnOpen(localProjectId: string): Promise<str
   const project = ps.projects.find((p) => p.id === localProjectId);
   if (!project) return null;
 
-  // The capability gate, read the same way every other cloud surface reads it: absent ⇒ off. A
-  // local-only user never issues a single request from this path.
+  // SIGNED IN is the only gate, the same way every other cloud surface now reads it. This used to
+  // also require `me.cloudAgentsEnabled`, which was the wrong thing to hang re-attach on: that field
+  // is a global server switch, so an older server (or a moment before `/me` lands) meant a user's
+  // ALREADY-RUNNING cloud sessions were never re-attached — the tabs simply did not come back. The
+  // lookup is cheap and fails soft, so trying and finding nothing is the better error.
   const auth = useAuthStore.getState();
-  if (auth.me?.cloudAgentsEnabled !== true || !auth.tokenPresent) return null;
+  if (!auth.tokenPresent) return null;
 
   try {
     // Look up WITHOUT creating: opening a project must not mint a server project row for one that

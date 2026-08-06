@@ -725,9 +725,7 @@ async function readCloudGate() {
   if (!cloudAuth.loaded) await cloudAuth.refresh(); // never throws; sets `error` and leaves method
   const auth = useAuthStore.getState();
   return evaluateCloudGate({
-    featureEnabled: auth.me?.cloudAgentsEnabled === true,
     signedIn: auth.tokenPresent,
-    entitled: auth.me?.entitled === true,
     // Re-read AFTER the await: the refresh above is the whole point of asking. And an unprobed or
     // FAILED probe still reads as allowed — `refresh` leaves `loaded` false when the GET fails, and
     // refusing on that would state as fact something we never learned, for the rest of the sign-in.
