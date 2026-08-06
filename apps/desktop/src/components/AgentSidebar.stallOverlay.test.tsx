@@ -263,10 +263,18 @@ describe("GRAY IS A TERMINAL STATE — the founder's rule, end to end through th
     // THE INTEGRATION TRAP. The row derives its stall report from its own status, and `stallReport`
     // answers `active` for the whole red tier — so composing the escalation naively deleted the chip
     // at exactly the moment the row turned red: colour with no cause. `calmSt` exists for this.
-    // The mark's HOVER is where the cause lives now (bead sparkle-tyter); the trap this guards is
-    // unchanged — the mark must still be THERE, naming the cause, on a row that has gone red.
-    const mark = within(renderStalled()).getByTestId("row-notice-glyph");
-    expect(mark.getAttribute("title")).toContain("goal unmet");
+    // The trap this guards is unchanged — the row must still SAY what is outstanding after it turns
+    // red — but the goal cause moved off the notice mark (roborev 59322): the goal chip already
+    // draws that fact and is clickable, so marking it twice put two identical glyphs on one row.
+    // Both halves asserted here, because "the cause is named somewhere" is the actual property.
+    const row = within(renderStalled());
+    const goal = row.getByTestId("row-goal");
+    expect(goal.getAttribute("data-goal-state")).toBe("unmet");
+    expect(goal.getAttribute("aria-label")).toContain("Goal");
+    // …and the OTHER outstanding cause (the dirty tree) still gets its own mark, so a red row is
+    // never left with colour and no cause.
+    const mark = row.getByTestId("row-notice-glyph");
+    expect(mark.getAttribute("title")).toContain("uncommitted changes");
   });
 
   it("the whole ACKNOWLEDGE cycle works through the real sidebar", () => {
@@ -699,14 +707,15 @@ describe("EVERY goal state is visible on the row, and an ESCALATED one is still 
     // Escalation is categorically different from "needs merging eventually": nothing is coming for
     // this row at all, so the mark takes DANGER rather than the caution ink every other cause gets.
     expect(goal.style.color).toBe(DANGER);
-    // The WORDS are the notice mark's HOVER now (bead sparkle-tyter) — the row itself renders no
-    // notice prose at all. The escalated glyph is the loudest in its class, so it wins the mark
-    // even though the goal chip beside it is already saying DANGER.
-    const mark = row.getByTestId("row-notice-glyph");
-    expect(mark.getAttribute("title")).toContain("auto-continue gave up");
-    expect(mark.getAttribute("data-notice-lead")).toBe("stall:escalated-goal");
-    expect(mark.style.color).toBe(DANGER);
+    // ONE MARK FOR THIS FACT, and it is the chip (roborev 59322). The escalated goal used to draw a
+    // notice mark as well; that put two DANGER-inked glyphs side by side saying one thing, so the
+    // aliased notice is now dropped from the row's marks. The chip is clickable and carries the
+    // words on its hover and in its accessible name, which is what this row was really asserting.
+    expect(goal.getAttribute("aria-label")).toContain("Goal escalated");
+    expect(goal.getAttribute("title")).toContain("auto-continue gave up");
+    // No second mark for the same fact — the escalated cause is the ONLY outstanding one here.
+    expect(row.queryByTestId("row-notice-glyph")).toBeNull();
     // Digits only, never words — the invariant this whole bead exists to establish.
-    expect(mark.textContent).toBe("");
+    expect(goal.textContent).toBe("");
   });
 });

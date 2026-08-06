@@ -153,7 +153,12 @@ import {
 import type { GoalBadge } from "./rowAttention";
 // ONE producer for what an agent is complaining about, shared with the composer's pill row so the
 // two surfaces cannot drift — the taxonomy drift engine/workerRollup.ts warns about twice.
-import { agentNotices, rowGlyphsFor, type NoticeGlyph } from "./agentNotices";
+import {
+  agentNotices,
+  rowGlyphsFor,
+  withoutSeparatelyDrawn,
+  type NoticeGlyph,
+} from "./agentNotices";
 import { splitStatusPollTargets } from "../engine/statusPollTargets";
 import { useNewAgentCalm, useNewAgentGraceTick } from "../hooks/useNewAgentCalm";
 
@@ -4513,7 +4518,13 @@ const AgentRow = memo(function AgentRow({
   // because a stall cause standing in for the goal takes the goal's glyph. Omitting it made this row
   // compute an amber triangle for `stall:unmet-goal` while the composer drew a blue target for the
   // very same notice, so a click still crossed from one mark to a different-looking pill.
-  const noticeMarks = rowGlyphsFor(agentNotices({ thrash, stall, goal: goalBadge }));
+  // The goal is passed as an INPUT (so a goal-derived stall cause is recognised) and then its notice
+  // is REMOVED from the row's marks, because the goal chip beside them already draws that fact and is
+  // itself clickable (roborev 59322). Without the removal the row drew `FiTarget` twice for one
+  // fact, and a row whose only warning was the goal lost its amber "something is wrong" triangle.
+  const noticeMarks = rowGlyphsFor(
+    withoutSeparatelyDrawn(agentNotices({ thrash, stall, goal: goalBadge }), goalBadge),
+  );
   /**
    * MOUNT THIS AGENT AND OPEN THE PILL THAT EXPLAINS `noticeId`. Bead sparkle-tyter, the founder's
    * second scope addition.

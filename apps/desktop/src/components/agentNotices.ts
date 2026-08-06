@@ -512,6 +512,35 @@ const GLYPH_RANK: Record<NoticeGlyph, number> = {
 };
 
 /**
+ * Drop the notices a surface ALREADY DRAWS ITS OWN MARK FOR. Bead sparkle-tyter, roborev 59322.
+ *
+ * ══ WHY (and it is the second bug one fix produced) ═══════════════════════════════════════════
+ * Passing the goal into `agentNotices` gave the row's warning mark the goal's glyph, which fixed
+ * one parity gap and opened two more. The row draws the goal CHIP as well, so `unmet` rendered
+ * `FiTarget` twice side by side — two byte-identical glyphs for ONE fact, against `GOAL_CHIP_ICON`'s
+ * own stated rule that "two different facts must not share a shape on the same row". And when a
+ * goal-derived cause was the only warning, the amber triangle that means "something is wrong here"
+ * vanished from the row entirely, which is the whole reading the `warning` class carries.
+ *
+ * Suppressing the aliased notice — rather than teaching the mark a second colour table — closes both
+ * at once: the row's mark can no longer take a goal glyph at all, so its ink cannot diverge from the
+ * pill's either. Nothing is lost, because the goal chip IS that fact's mark on the row and it is
+ * clickable; `resolveNoticeId` maps its `goal:<state>` onto whichever pill actually carries it.
+ *
+ * The COMPOSER passes no `drawnSeparately`, so the pill row still shows every fact once.
+ */
+export function withoutSeparatelyDrawn(
+  notices: readonly AgentNotice[],
+  goal: GoalBadge | null | undefined,
+): AgentNotice[] {
+  if (goal == null) return [...notices];
+  const cause = GOAL_STALL_ALIAS[goal.state];
+  return notices.filter(
+    (n) => n.id !== `goal:${goal.state}` && (cause === undefined || n.id !== `stall:${cause}`),
+  );
+}
+
+/**
  * Collapse a notice list into the marks a row may render.
  *
  * Returns `[]` for an agent with nothing to say — a row with no notice renders exactly as it always

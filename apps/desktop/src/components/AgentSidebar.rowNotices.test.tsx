@@ -349,24 +349,71 @@ describe("clicking a notice mark mounts the agent and names the pill to open", (
     expect(rowFor(AGENT_NAME).textContent).not.toContain("land the retry PR");
   });
 
-  it("draws the GOAL's glyph on the row when the stall cause IS the goal", () => {
-    // ══ THE PARITY BUG WHERE IT ACTUALLY LIVES (roborev 59278) ════════════════════════════════
-    // A goal-derived stall pill takes the goal's glyph on the composer. The ROW computed its mark
-    // from `agentNotices({ thrash, stall })` with no goal, so it drew an amber alert triangle for
-    // `stall:unmet-goal` while the composer drew a blue target for the same notice id — click an
-    // amber triangle, land on a blue target.
-    //
-    // THIS MUST BE ASSERTED ON THE ROW, not on the model: `agentNotices` called directly with a
-    // goal passes whether or not the ROW supplies one, which is why the divergence survived a
-    // model-level parity test. FAILS when AgentSidebar stops passing `goal` into agentNotices.
+  it("draws ONE glyph per fact — the goal chip, not a second identical mark beside it", () => {
+    // ══ THE BUG THE LAST FIX PRODUCED (roborev 59322) ═════════════════════════════════════════
+    // Passing the goal into `agentNotices` so the mark could take the goal's glyph meant the row
+    // drew `FiTarget` TWICE for one fact — the goal chip and the notice mark, side by side, against
+    // GOAL_CHIP_ICON's own rule that two different facts must not share a shape on one row. The
+    // goal chip is that fact's mark here and it is clickable, so the aliased notice is dropped from
+    // the marks. FAILS if `withoutSeparatelyDrawn` stops filtering.
     render(
       <AgentSidebar
         project={seed({ a1: "idle" }, { a1: CLEAN_BS }, { a1: BARE_WS }, {}, { goal: UNMET_GOAL })}
       />,
     );
-    const mark = within(rowFor(AGENT_NAME)).getByTestId("row-notice-glyph");
-    expect(mark.getAttribute("data-notice-lead")).toBe("stall:unmet-goal");
-    expect(mark.getAttribute("data-notice-glyph")).toBe("target");
+    const row = rowFor(AGENT_NAME);
+    // The goal is still marked…
+    expect(within(row).getByTestId("row-goal")).toBeTruthy();
+    // …and it is NOT marked a second time.
+    expect(within(row).queryByTestId("row-notice-glyph")).toBeNull();
+  });
+
+  it("still marks a warning that is NOT the goal, beside the goal chip", () => {
+    // The control. Without it, dropping every mark whenever a goal exists would pass the test above
+    // — and would delete the amber "something is wrong here" reading the warning class carries.
+    render(
+      <AgentSidebar
+        project={seed({ a1: "idle" }, { a1: CLEAN_BS }, { a1: OPEN_PR_WS }, {}, { goal: UNMET_GOAL })}
+      />,
+    );
+    const row = rowFor(AGENT_NAME);
+    expect(within(row).getByTestId("row-goal")).toBeTruthy();
+    const mark = within(row).getByTestId("row-notice-glyph");
+    expect(mark.getAttribute("data-notice-lead")).toBe("stall:open-pr");
+    // Amber alert, not the goal's blue target — one fact, one mark, and the right one.
+    expect(mark.getAttribute("data-notice-glyph")).toBe("alert");
+  });
+
+  it("NEVER wears a goal glyph on a row mark — the chip owns that shape", () => {
+    // ══ THE PARITY RULE, IN THE FORM THAT SURVIVED (roborev 59278 → 59322) ════════════════════
+    // Round one: the row passed no goal, so it drew an amber triangle where the composer drew a blue
+    // target for one notice id — click one shape, land on another. Round two fixed that by giving
+    // the row's mark the goal glyph, and produced a row drawing FiTarget twice for one fact, plus an
+    // ink table the two surfaces disagreed on.
+    //
+    // The form that holds: the row does not MARK a fact its goal chip already draws, so its marks
+    // can never take a goal glyph — and with no goal glyph there is no second colour table to
+    // diverge. Asserted over every mark rather than on one fixture, so the rule cannot be satisfied
+    // by the particular agent this test happens to seed.
+    render(
+      <AgentSidebar
+        project={seed(
+          { a1: "idle" },
+          { a1: { ...CLEAN_BS, ahead: 3, dirty: true } },
+          { a1: OPEN_PR_WS },
+          {},
+          { goal: UNMET_GOAL },
+        )}
+      />,
+    );
+    const row = rowFor(AGENT_NAME);
+    const marks = within(row).getAllByTestId("row-notice-glyph");
+    expect(marks.length).toBeGreaterThan(0);
+    for (const mark of marks) {
+      expect(["target", "clock", "check"]).not.toContain(mark.getAttribute("data-notice-glyph"));
+    }
+    // …and the goal is still marked, once, by its own chip.
+    expect(within(row).getAllByTestId("row-goal")).toHaveLength(1);
   });
 
   it("is operable from the keyboard, not pointer-only", () => {
