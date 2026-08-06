@@ -3,8 +3,19 @@
 //
 // It said "bottom-left, so it reads as belonging to the paragraph above it" until 2026-08-05, when
 // the founder moved it: *"For the content that the concierge sends I would rather have it be at the
-// beginning of the row instead of top right."* The placement now lives in ConciergeMessageRow, which
-// is what floats it — this component owns the glyph, not where the row puts it.
+// beginning of the row instead of top right."*
+//
+// PLACEMENT IS SPLIT BETWEEN TWO FILES, and an earlier version of this paragraph got that wrong —
+// it claimed "this component owns the glyph, not where the row puts it", which its own `kind`
+// switch contradicts twice below (the edge it is pulled onto, and the negative margin that swaps
+// sides with it). The honest division:
+//
+//   • ConciergeMessageRow decides WHERE IN THE ROW the glyph sits — before the prose or after it,
+//     and which way it floats. That is what moved on 2026-08-05.
+//   • This component decides WHICH EDGE it hugs once placed, keyed on `kind`, because that follows
+//     from the message's own alignment rather than from the row's ordering.
+//
+// So a placement change touches BOTH, and reading either file alone will mislead.
 //
 // IT SERVES BOTH SIDES OF THE CONVERSATION. The founder asked for "a copy button like we do for the
 // concierge's responses" on his OWN messages, and the operative word is *like*: one component with a
