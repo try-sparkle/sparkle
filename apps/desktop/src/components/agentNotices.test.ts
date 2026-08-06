@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   agentNotices,
+  withoutSeparatelyDrawn,
   GOAL_STALL_ALIAS,
   NOTICE_EXPLAINER,
   resolveNoticeId,
@@ -342,6 +343,57 @@ describe("the pill that stands in for a goal keeps the goal's MARK and WORDS", (
   it("does not staple a goal onto a stall cause that has nothing to do with it", () => {
     const [n] = agentNotices({ stall: stallOf(["open-pr"]), goal: goalOf("unmet") });
     expect(n?.detail).not.toContain("land the retry PR");
+  });
+});
+
+describe("withoutSeparatelyDrawn — the row must not mark a fact its goal chip draws", () => {
+  // ══ WHERE THIS INVARIANT CAN ACTUALLY FAIL (roborev 59342) ════════════════════════════════
+  // The DOM test that was carrying this rule COULD NOT FAIL, and the reason is worth stating: the
+  // row collapses the whole warning class into ONE mark and keeps the loudest glyph by GLYPH_RANK,
+  // where `alert` outranks `target` and `clock`. Its fixture seeded a dirty tree and an open PR
+  // alongside the goal, so the surviving mark was `alert` whether or not the goal notice was
+  // filtered — the extra warnings, added to make the test general, are exactly what neutered it.
+  // A goal glyph can only reach a row mark when the goal cause is the SOLE warning, which is the
+  // one fixture that test avoided.
+  //
+  // So the rule is asserted HERE instead: fixture-independent, over every aliased state, at the
+  // layer where the filter runs.
+  it.each(Object.entries(GOAL_STALL_ALIAS))(
+    "leaves no row mark at all when the %s goal is the only warning",
+    (state, cause) => {
+      const goal = goalOf(state as GoalBadge["state"]);
+      const marks = rowGlyphsFor(
+        withoutSeparatelyDrawn(agentNotices({ stall: stallOf([cause as StallCause]), goal }), goal),
+      );
+      // The goal chip is that fact's mark on the row, so a second mark would be the duplicate glyph
+      // this helper exists to remove. FAILS if the filter stops filtering: the mark comes back
+      // wearing the goal's own glyph.
+      expect(marks).toEqual([]);
+    },
+  );
+
+  it.each(Object.entries(GOAL_STALL_ALIAS))(
+    "still marks a NON-goal warning beside the %s goal, and never with a goal glyph",
+    (state, cause) => {
+      // The control. Without it, filtering everything whenever a goal exists would pass above — and
+      // would delete the amber "something is wrong here" reading the warning class carries.
+      const goal = goalOf(state as GoalBadge["state"]);
+      const marks = rowGlyphsFor(
+        withoutSeparatelyDrawn(
+          agentNotices({ stall: stallOf([cause as StallCause, "open-pr"]), goal }),
+          goal,
+        ),
+      );
+      expect(marks).toHaveLength(1);
+      expect(marks[0]?.leadNoticeId).toBe("stall:open-pr");
+      expect(marks[0]?.count).toBe(1);
+      expect(["target", "clock", "check"]).not.toContain(marks[0]?.glyph);
+    },
+  );
+
+  it("leaves a row with NO goal exactly as it was", () => {
+    const notices = agentNotices({ stall: stallOf(["open-pr"]) });
+    expect(withoutSeparatelyDrawn(notices, null)).toEqual(notices);
   });
 });
 

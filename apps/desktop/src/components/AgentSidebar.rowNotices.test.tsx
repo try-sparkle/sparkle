@@ -384,7 +384,7 @@ describe("clicking a notice mark mounts the agent and names the pill to open", (
     expect(mark.getAttribute("data-notice-glyph")).toBe("alert");
   });
 
-  it("NEVER wears a goal glyph on a row mark — the chip owns that shape", () => {
+  it("keeps ONE mark for several warnings on a row that also has a goal — the CONTROL", () => {
     // ══ THE PARITY RULE, IN THE FORM THAT SURVIVED (roborev 59278 → 59322) ════════════════════
     // Round one: the row passed no goal, so it drew an amber triangle where the composer drew a blue
     // target for one notice id — click one shape, land on another. Round two fixed that by giving
@@ -393,8 +393,19 @@ describe("clicking a notice mark mounts the agent and names the pill to open", (
     //
     // The form that holds: the row does not MARK a fact its goal chip already draws, so its marks
     // can never take a goal glyph — and with no goal glyph there is no second colour table to
-    // diverge. Asserted over every mark rather than on one fixture, so the rule cannot be satisfied
-    // by the particular agent this test happens to seed.
+    // diverge.
+    //
+    // ══ THIS ROW IS THE CONTROL, NOT THE GUARD (roborev 59342) ═══════════════════════════════
+    // An earlier comment here claimed it asserted the rule "over every mark rather than on one
+    // fixture". That was backwards, and it made the test unable to fail: `rowGlyphsFor` collapses
+    // the warning class to ONE mark and keeps the loudest glyph, where `alert` outranks `target`
+    // and `clock` — so with a dirty tree and an open PR in the fixture the surviving mark is
+    // `alert` whether or not the goal notice was filtered. A goal glyph can only reach a mark when
+    // the goal cause is the SOLE warning, which is precisely what this fixture is not.
+    //
+    // What it does prove, and what it is kept for: a row carrying several warnings AND a goal still
+    // shows one mark plus one chip — no duplication, nothing swallowed. The rule itself is guarded
+    // fixture-independently over every aliased state in `agentNotices.test.ts`.
     render(
       <AgentSidebar
         project={seed(
