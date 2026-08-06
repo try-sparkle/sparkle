@@ -29,10 +29,13 @@
 
 import { bead, line, plain, ref, type Line } from "./conciergeLine";
 import type { ConciergeActionReceipt } from "../../services/conciergeReceipts";
+import type { ConciergeReceiptMark } from "./types";
 
 /** The agent lookup the host supplies — the FEED's view, so a pill's id is one the app can open.
  *  Returning null means unresolved, and unresolved must degrade to words rather than to a guess. */
-export type ResolveReceiptAgent = (id: string) => { id: string; name: string } | null;
+export type ResolveReceiptAgent = (
+  id: string,
+) => { id: string; name: string } | null;
 
 /** The subject slot: a pill when the agent resolves, the words the app used before pills otherwise. */
 function who(receipt: ConciergeActionReceipt, resolve: ResolveReceiptAgent) {
@@ -42,6 +45,49 @@ function who(receipt: ConciergeActionReceipt, resolve: ResolveReceiptAgent) {
   // still more useful than "that agent". It just cannot be a pill.
   const named = receipt.agentName?.trim();
   return plain(named ? named : "that agent");
+}
+
+/**
+ * What the posted line REMEMBERS about the receipt behind it — the mark that lets a run of identical
+ * receipts fold to one row (./receiptRuns).
+ *
+ * ══ WHY IT LIVES HERE, BESIDE THE SENTENCE ══════════════════════════════════════════════════════
+ * Because the subject must be the SAME subject. `who()` above decides whether the sentence gets a
+ * clickable pill or degrades to words, and the folded row has to make the identical call — a fold
+ * that named an agent its unfolded rows could not, or minted a pill where they showed plain text,
+ * would be a reference the reader can click to nowhere. Sharing the module means sharing `resolve`
+ * and the one rule, rather than restating it somewhere it can drift.
+ *
+ * ══ EVERY FIELD IS COPIED, NONE IS DERIVED ══════════════════════════════════════════════════════
+ * `ok`, `failed`, `fanout` and `viaPicker` come straight off the receipt, because the fold rule
+ * turns on them: a mark that inferred `ok` from the wording could fold a REFUSAL into a success
+ * count, which is the single outcome folding must never produce.
+ */
+export function receiptMark(
+  receipt: ConciergeActionReceipt,
+  resolve: ResolveReceiptAgent,
+): ConciergeReceiptMark {
+  const found = receipt.agentId ? resolve(receipt.agentId) : null;
+  return {
+    kind: receipt.kind,
+    ok: receipt.ok === true,
+    channel: receipt.channel,
+    fanout: receipt.fanout,
+    viaPicker: receipt.viaPicker,
+    failed: receipt.failed,
+    // A SUCCESS CAN STILL CARRY SOMETHING THE READER HAS TO ACT ON. `reason` on an `ok` receipt is
+    // the spawn shortfall — the agent is up but unbriefed — and the success arm below renders it as
+    // a second sentence. Marked here so `foldKeyOf` can refuse the row: a count cannot say it, so
+    // folding would delete it. Read off the SAME field that arm reads, so the two cannot disagree
+    // about whether this line says more than its standard wording.
+    ...(receipt.ok === true && receipt.reason?.trim()
+      ? { hasDetail: true as const }
+      : {}),
+    // ONLY WHEN THE LOOKUP HIT. A `subjectId` present means the sentence drew a real pill, so the
+    // fold may draw one too; absent means it did not, and the fold shows the same words it did.
+    subjectId: found ? found.id : undefined,
+    subjectName: found ? found.name : receipt.agentName?.trim() || undefined,
+  };
 }
 
 /**
@@ -65,7 +111,8 @@ export function actionReceiptLine(
   // the very failure this module exists to prevent. Plurality is now carried, not guessed, and the
   // terminal fan-out branch is gone because no producer can generate one.
   const fanout = receipt.fanout === true;
-  const hasCounts = typeof receipt.queued === "number" && typeof receipt.failed === "number";
+  const hasCounts =
+    typeof receipt.queued === "number" && typeof receipt.failed === "number";
 
   // ══ THE REFUSAL ARM, FIRST ════════════════════════════════════════════════════════════════════
   // Checked before the success wording below, exactly as `receiptText` checks `refused` before its
@@ -171,7 +218,9 @@ export function actionReceiptLine(
 
     case "merged": {
       const n = receipt.prNumber;
-      return Number.isFinite(n) ? line`Merged PR #${plain(String(n))}.` : line`Merged.`;
+      return Number.isFinite(n)
+        ? line`Merged PR #${plain(String(n))}.`
+        : line`Merged.`;
     }
 
     default:

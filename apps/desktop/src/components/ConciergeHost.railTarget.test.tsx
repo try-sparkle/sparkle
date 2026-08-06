@@ -34,6 +34,9 @@ const h = vi.hoisted(() => ({
     reason: "test",
     source: "heuristic" as const,
   })),
+  /** Which side the cable is patched to. "off" = the concierge floats free (unmounted), which is
+   *  what every row above the mounted block runs under. */
+  wired: vi.fn(() => "off" as "off" | "left" | "right"),
 }));
 
 vi.mock("../services/openProjectTab", () => ({
@@ -67,6 +70,12 @@ vi.mock("../services/conciergeDispatch", () => ({
   onDeferredSendOutcome: () => () => {},
 }));
 vi.mock("../services/conciergeRouter", () => ({ routeMessage: h.routeMessage }));
+// THE MOUNT, as one knob — same seam ConciergeHost.mounted.test.tsx drives. `useEffectiveWired` is
+// the host's only reader of the cable, and `mountedAgentId` is that cable plus the prompt target.
+vi.mock("../hooks/useEffectiveWired", () => ({
+  useEffectiveWired: () => h.wired(),
+  usePairIsLive: () => false,
+}));
 vi.mock("../stores/sparklePrefsStore", () => ({
   useSparklePrefsStore: {
     getState: () => ({ setInterruptPreference: vi.fn(), shouldInterrupt: () => true }),
@@ -113,6 +122,7 @@ import { armedIntents, cancelIntent, fireIntent } from "../services/dispatchInte
 import { setConciergeChat } from "../stores/conciergeThreadStore";
 import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
 import { useUiStore } from "../stores/uiStore";
+import { useProjectStore } from "../stores/projectStore";
 
 function agent(id: string, name: string) {
   return {
@@ -171,6 +181,25 @@ beforeEach(() => {
   h.dispatchConciergeAnswer.mockClear();
   h.routeMessage.mockReset();
   h.routeMessage.mockResolvedValue({ target: "sparkle", reason: "test", source: "heuristic" });
+  h.wired.mockReset();
+  h.wired.mockReturnValue("off");
+  // THE MOUNTED NAME IS READ OFF THIS ROW, not off the feed: `mountedName` is
+  // `mountedRow?.name`, looked up in `projectStore` (the host needs that row's worktree path for
+  // the transcript). Without it a mount resolves an id but NO name, and every mounted row below
+  // would fall back to "Concierge" and pass against the unfixed code.
+  useProjectStore.setState({
+    projects: [
+      {
+        id: "p1",
+        name: "sparkle",
+        path: "/tmp/sparkle",
+        agents: [
+          { id: "ag1", name: "Blueprint UI/UX", worktreePath: "/tmp/wt/ag1" },
+          { id: "ag2", name: "Kraken Auth", worktreePath: "/tmp/wt/ag2" },
+        ],
+      },
+    ] as unknown as ReturnType<typeof useProjectStore.getState>["projects"],
+  });
 });
 afterEach(() => {
   for (const i of armedIntents()) cancelIntent(i.id);
@@ -298,6 +327,67 @@ describe("the rail names the agent the TEXT addresses, not the one on screen", (
     // visible string is pinned to "Speak" two lines up. `expect(name).toContain("Speak")` could not
     // fail. The containment invariant is tested where it can actually break: across widths in
     // SendModeTray.test.tsx, and across the two label tables in voice/sendMode.test.ts.
+  });
+});
+
+// ══ AND WHILE MOUNTED, THE DEFAULT DESTINATION IS THE MOUNTED AGENT — SO THE RAIL MUST SAY SO ═══
+// The damage at the top of this file, with the destinations swapped. Once a plain mounted message
+// started routing to the mounted agent's TERMINAL, this rail still announced "Concierge" for it —
+// so the founder dictating hands-free reads "Sending to Concierge shortly", lets the countdown
+// fire, and his words land on a PTY. One value feeds both surfaces (`useAutoSend` returns
+// `targetName` to the tray and to `voice/autoSendTimer`'s "Sending to X shortly." / "Sent to X."),
+// so pinning the pill's accessible name pins the spoken announcement too.
+//
+// EVERY ROW HERE IS A PAIR — the same text mounted and unmounted. A single mounted expectation
+// would pass against a rail hard-coded to the mount, and the unmounted half of this file would not
+// catch that alone; stating both is what makes the MOUNT the thing being measured.
+describe("the rail names the MOUNTED agent when nothing in the text overrides it", () => {
+  it("REGRESSION: says the mounted agent for plain text, and Concierge without the mount", async () => {
+    h.wired.mockReturnValue("left");
+    mount();
+    await type("move the button 5px left");
+    expect(await railTarget()).toBe("Blueprint UI/UX");
+    expect(await railTarget()).not.toBe("Concierge");
+
+    cleanup();
+    h.wired.mockReturnValue("off");
+    mount();
+    await type("move the button 5px left");
+    expect(await railTarget()).toBe("Concierge");
+  });
+
+  // THE ESCAPE HATCH, rendered. A leading @Sparkle beats the mount in `classifyComposerRoute`, so
+  // the label has to leave the mounted agent's name — otherwise the one way out of the mount is the
+  // one send the rail misreports.
+  it("says Concierge for a leading @Sparkle, mounted or not", async () => {
+    h.wired.mockReturnValue("left");
+    mount();
+    await type("@Sparkle what is the status of the build?");
+    expect(await railTarget()).toBe("Concierge");
+    expect(await railTarget()).not.toBe("Blueprint UI/UX");
+  });
+
+  // AN ADDRESS OVERRULES THE MOUNT, so the label follows the address rather than the cable.
+  it("names an addressed agent over the mounted one", async () => {
+    h.wired.mockReturnValue("left");
+    mount();
+    await type("@Kraken Auth ship the DMG");
+    expect(await railTarget()).toBe("Kraken Auth");
+  });
+
+  // ── A NAME THAT DOES NOT LEAD IS THE SENTENCE'S SUBJECT ──────────────────────────────────────
+  // This rail used to read `mentionsIn(...)[0]` by ORDINAL while the send routed POSITIONALLY, so
+  // this message was announced as going to Kraken Auth and delivered to the mount. Deriving the
+  // label from `classifyComposerRoute` is what closes that, and this is the row that proves it —
+  // the pair below shows the same text becomes a real address once the name leads.
+  it("follows the mount for a mid-sentence name, and the name once it leads", async () => {
+    h.wired.mockReturnValue("left");
+    mount();
+    await type("why is @Kraken Auth just sitting there?");
+    expect(await railTarget()).toBe("Blueprint UI/UX");
+
+    await type("@Kraken Auth why are you just sitting there?");
+    expect(await railTarget()).toBe("Kraken Auth");
   });
 });
 

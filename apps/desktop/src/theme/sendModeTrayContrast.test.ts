@@ -247,7 +247,7 @@ describe("send tray — the selected label stays as legible as an unselected one
     }
   });
 
-  it("KNOWN GAP (UNFILED): under the countdown sweep the unselected label drops below AA in light", () => {
+  it("KNOWN GAP (sparkle-sco96): under the countdown sweep the unselected label drops below AA in light", () => {
     // Dark is unaffected — it keeps a comfortable margin under the sweep.
     for (const wired of WIRED) {
       expect(
@@ -281,11 +281,11 @@ describe("send tray — the selected label stays as legible as an unselected one
   // so it is measured here — and measuring it turned up a PRE-EXISTING failure that is out of scope
   // for the selected-but-idle fix.
   //
-  // IT IS NOT FILED AS A BEAD, and this comment says so rather than implying otherwise: the beads
-  // Dolt store was locked by another process across every attempt while this branch was written
-  // (~12 tries over ~20 minutes). Saying "tracked separately" when nothing tracks it is how a real
-  // AA failure becomes permanent — the next reader sees "tracked" and moves on (roborev 59015).
-  // FILE IT, then put the id in the test titles below and delete this paragraph.
+  // TRACKED AS sparkle-sco96, together with the sweep gap below. It went unfiled at first because
+  // the beads store was locked by another process for the whole session; roborev 59015 was right
+  // that a pin claiming a tracker that does not exist is how a real AA failure becomes permanent,
+  // so the title carried "UNFILED" until the bead actually existed. Delete both pins, the
+  // ACTING_KNOWN_GAP set, and this paragraph when sparkle-sco96 lands.
   //
   // THE GAP: the acting branch paints `onGoldFill` for all three positions, but that token is the
   // partner of `goldFill` alone. In LIGHT mode it is #ffffff, and Push to talk's fill is brand amber
@@ -308,7 +308,7 @@ describe("send tray — the selected label stays as legible as an unselected one
   // PINNED so the gap cannot silently WIDEN, and so fixing it turns this test red on purpose rather
   // than leaving a stale exemption behind. When the acting label gets an ink paired with the fill it
   // actually sits on, delete this test and `ACTING_KNOWN_GAP` above.
-  it("KNOWN GAP (UNFILED — beads store locked): light-mode Push to talk acting label is white on amber, under AA", () => {
+  it("KNOWN GAP (sparkle-sco96): light-mode Push to talk acting label is white on amber, under AA", () => {
     const ratio = contrast(ink("light", PILL_LABEL_TOKEN.acting), ink("light", MODE_INK_TOKEN.ptt));
     expect(ratio).toBeLessThan(AA_NORMAL);
     expect(ratio).toBeCloseTo(2.41, 1);

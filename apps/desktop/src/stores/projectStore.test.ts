@@ -655,3 +655,35 @@ describe("adoptWorker (sparkle-3xus disk reconcile)", () => {
   });
 });
 
+
+describe("setProjectRepoKey", () => {
+  beforeEach(() => useProjectStore.setState({ projects: [], selectedProjectId: null }));
+
+  it("records a resolved repository", () => {
+    const id = useProjectStore.getState().addProject("Demo", "/tmp/demo");
+    useProjectStore.getState().setProjectRepoKey(id, "/tmp/demo/.git");
+    expect(useProjectStore.getState().projects[0]!.repoKey).toBe("/tmp/demo/.git");
+  });
+
+  // A `null` IS DROPPED, and this is the assertion that matters. It means "could not resolve" —
+  // not a repo, or missing, or git failed, or `ensure_project_repo` has not run yet — and the
+  // store is PERSISTED, so recording one would retire the project from every future backfill
+  // sweep (services/repoKey.needsKey reads a stored value as answered) in this session and every
+  // later launch, silently reverting it to path-only identity forever.
+  it("drops a null rather than persisting 'we could not tell' as an answer", () => {
+    const id = useProjectStore.getState().addProject("Demo", "/tmp/demo");
+    useProjectStore.getState().setProjectRepoKey(id, null);
+    expect(useProjectStore.getState().projects[0]!.repoKey).toBeUndefined();
+    // …and the project is still writable once a real answer arrives.
+    useProjectStore.getState().setProjectRepoKey(id, "/tmp/demo/.git");
+    expect(useProjectStore.getState().projects[0]!.repoKey).toBe("/tmp/demo/.git");
+  });
+
+  it("is a no-op write when nothing changes, so the sweep cannot churn the persisted blob", () => {
+    const id = useProjectStore.getState().addProject("Demo", "/tmp/demo");
+    useProjectStore.getState().setProjectRepoKey(id, "/tmp/demo/.git");
+    const before = useProjectStore.getState().projects;
+    useProjectStore.getState().setProjectRepoKey(id, "/tmp/demo/.git");
+    expect(useProjectStore.getState().projects).toBe(before);
+  });
+});

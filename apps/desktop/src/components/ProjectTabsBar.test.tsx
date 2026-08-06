@@ -15,8 +15,17 @@ const resolveOpenTarget = vi.fn(() => ({ kind: "existing", id: "p2" }) as const)
 vi.mock("../services/openTarget", () => ({ resolveOpenTarget: () => resolveOpenTarget() }));
 
 const openProjectTab = vi.fn();
+const focusExistingProject = vi.fn();
 vi.mock("../services/openProjectTab", () => ({
   openProjectTab: (...a: unknown[]) => openProjectTab(...a),
+  focusExistingProject: (...a: unknown[]) => focusExistingProject(...a),
+}));
+// The repo-key seam reaches Tauri; in jsdom it would answer `null` anyway (services/repoKey never
+// throws), but stubbing it keeps this suite free of the async store writes the backfill sweep makes.
+vi.mock("../services/repoKey", () => ({
+  backfillRepoKeys: async () => {},
+  repoKeyFor: async () => null,
+  resolveRepoKeyFor: async () => null,
 }));
 
 // Chrome that self-fetches over Tauri — out of scope here.
@@ -78,7 +87,11 @@ beforeEach(() => {
     projects: [mkProject("p1", "Alpha"), mkProject("p2", "Beta")],
     selectedProjectId: "p1",
   } as never);
-  useUiStore.setState({ pinnedProjectId: null } as never);
+  // RESET THE OPEN SET TOO. Several tests below close a project to reach the open path (a project
+  // that already has a tab is FOCUSED, not re-opened), and without this reset that leaks into the
+  // next test as a missing tab — which surfaces as "cannot find tab-p2" in a test about something
+  // else entirely. `null` is the never-seeded state: every project open.
+  useUiStore.setState({ pinnedProjectId: null, openProjectIds: null, pairAssignment: {} } as never);
   // Entitled + loaded → not in trial, so the trial chip stays out of the way by default.
   useAuthStore.setState({
     loading: false,
@@ -135,6 +148,11 @@ describe("ProjectTabsBar", () => {
   });
 
   it('"+" → picker → selects the resolved project\'s TAB (never opens a window)', async () => {
+    // p2 is CLOSED here, and that is now load-bearing rather than incidental: opening a project
+    // that already HAS a tab focuses it instead of re-opening it (the idempotent-open gate — see
+    // ProjectTabsBar.alreadyOpen.test.tsx). This test is about the open path, so it needs the case
+    // where there is genuinely something to open.
+    useUiStore.setState({ openProjectIds: ["p1"] } as never);
     render(<ProjectTabsBar feed={feed} onOpenProjectSettings={() => {}} />);
     fireEvent.click(screen.getByTestId("tab-add"));
     fireEvent.click(screen.getByTestId("from-folder"));
@@ -213,15 +231,22 @@ describe("ProjectTabsBar — the left strip", () => {
     openProjectTab.mockClear();
   });
 
-  it("refuses a folder whose project is OPEN in the other pair, and says where it is", () => {
+  it("FOCUSES a folder whose project is OPEN in the other pair, and says it is already open", () => {
     // p2 is right-assigned (absent from the map) and its tab is open, so the left strip genuinely
     // cannot show it — and moving it would remount its panes and kill its PTYs.
+    //
+    // THIS USED TO REFUSE with "switch to that strip to see it", which was right about the
+    // situation and wrong about the remedy: it made the user go and find the tab themselves. The
+    // founder's ask is that a second open BRINGS THE EXISTING TAB INTO FOCUS and says so, so the
+    // strip now does the navigating. Still no second tab — that part is unchanged and is asserted.
     useUiStore.setState({ pairAssignment: {}, openProjectIds: ["p1", "p2"] } as never);
     render(<ProjectTabsBar side="left" feed={feed} onOpenProjectSettings={() => {}} />);
     fireEvent.click(screen.getByTestId("tab-add"));
     fireEvent.click(screen.getByTestId("from-folder"));
     return waitFor(() => {
-      expect(screen.getByTestId("tear-off-error").textContent).toContain("right pair");
+      expect(screen.getByTestId("already-open-notice").textContent).toContain("already open");
+      expect(screen.getByTestId("already-open-notice").textContent).toContain("right pair");
+      expect(focusExistingProject).toHaveBeenCalledWith("p2");
       expect(openProjectTab).not.toHaveBeenCalled();
     });
   });
@@ -243,17 +268,25 @@ describe("ProjectTabsBar — the left strip", () => {
     });
   });
 
-  it("clears a stale refusal on the REOPEN path too, not just the picker", () => {
+  it("does not leave a stale notice over the REOPEN path, not just the picker", () => {
     // The clear used to live in `pickAndOpen`, so the reopen list — reached by hitting "+" again
-    // after the dialog closed on the refusing click — still showed the old message over a project
-    // it had nothing to do with.
+    // after the dialog closed on the notifying click — still showed the old message over a project
+    // it had nothing to do with. Same concern, now against the already-open notice: raise it, then
+    // reopen p2 once it is CLOSED (which the reopen list is the affordance for) and the notice must
+    // not survive the successful open.
     useUiStore.setState({ pairAssignment: {}, openProjectIds: ["p1", "p2"] } as never);
     render(<ProjectTabsBar side="left" feed={feed} onOpenProjectSettings={() => {}} />);
     fireEvent.click(screen.getByTestId("tab-add"));
     fireEvent.click(screen.getByTestId("from-folder"));
-    return waitFor(() => expect(screen.getByTestId("tear-off-error")).toBeTruthy()).then(() => {
+    return waitFor(() => expect(screen.getByTestId("already-open-notice")).toBeTruthy()).then(() => {
+      act(() => {
+        useUiStore.setState({ openProjectIds: ["p1"] } as never);
+      });
       fireEvent.click(screen.getByTestId("reopen-p2"));
-      expect(screen.queryByTestId("tear-off-error")).toBeNull();
+      return waitFor(() => {
+        expect(openProjectTab).toHaveBeenCalledWith("p2");
+        expect(screen.queryByTestId("already-open-notice")).toBeNull();
+      });
     });
   });
 
@@ -274,23 +307,24 @@ describe("ProjectTabsBar — the left strip", () => {
     });
   });
 
-  it("clears a stale refusal once a later pick succeeds", () => {
-    // The banner only ever got set, so a refusal outlived the situation it described and sat over a
+  it("clears a stale notice once a later pick succeeds", () => {
+    // The banner only ever got set, so a message outlived the situation it described and sat over a
     // freshly opened project telling the user it was somewhere else.
     useUiStore.setState({ pairAssignment: {}, openProjectIds: ["p1", "p2"] } as never);
     render(<ProjectTabsBar side="left" feed={feed} onOpenProjectSettings={() => {}} />);
     fireEvent.click(screen.getByTestId("tab-add"));
     fireEvent.click(screen.getByTestId("from-folder"));
-    return waitFor(() => expect(screen.getByTestId("tear-off-error")).toBeTruthy()).then(() => {
-      // Now the same pick resolves to a project this strip CAN open. `act`, so the component
-      // actually re-reads the assignment rather than refusing again off a stale closure.
+    return waitFor(() => expect(screen.getByTestId("already-open-notice")).toBeTruthy()).then(() => {
+      // Now the same pick resolves to a project with no tab, so there is genuinely something to
+      // open. `act`, so the component actually re-reads the open set rather than gating again off a
+      // stale closure.
       act(() => {
-        useUiStore.setState({ pairAssignment: { p2: "left" } } as never);
+        useUiStore.setState({ openProjectIds: ["p1"] } as never);
       });
       fireEvent.click(screen.getByTestId("from-folder"));
       return waitFor(() => {
         expect(openProjectTab).toHaveBeenCalledWith("p2");
-        expect(screen.queryByTestId("tear-off-error")).toBeNull();
+        expect(screen.queryByTestId("already-open-notice")).toBeNull();
       });
     });
   });

@@ -154,6 +154,11 @@ export interface ProjectState {
    *  restores. Accepts null (main window showing no project) so restart falls back to the first
    *  project. Secondary windows never call this; each owns its own current project. */
   setSelectedProject: (id: string | null) => void;
+  /** Record which REPOSITORY a project's folder belongs to (services/repoKey resolves it). A
+   *  `null` is DROPPED, not stored — it means "could not resolve", and persisting it would retire
+   *  the project from every future backfill sweep. Idempotent: a write that changes nothing is
+   *  dropped too. */
+  setProjectRepoKey: (id: string, repoKey: string | null) => void;
   /** Bump lastOpenedAt only (for Recent ordering) without claiming the shared
    *  selectedProjectId — multi-window: each window owns its own current project. */
   touchProjectOpened: (id: string) => void;
@@ -1225,6 +1230,23 @@ export const useProjectStore = create<ProjectState>()(
         })),
 
       setSelectedProject: (id) => set({ selectedProjectId: id }),
+
+      setProjectRepoKey: (id, repoKey) =>
+        set((s) => {
+          const p = s.projects.find((x) => x.id === id);
+          // A NULL IS NEVER PERSISTED, and that is the whole guard. `null` cannot mean "resolved,
+          // not a repo": the resolver answers `null` for a folder that is missing, on a volume
+          // that has not mounted, or that `ensure_project_repo` is about to `git init` a
+          // millisecond later — all indistinguishable from a plain directory. This store is
+          // PERSISTED and `services/repoKey.needsKey` reads a stored value as "answered", so
+          // writing one `null` would retire the project from every future sweep, in this session
+          // and every later launch, silently reverting it to path-only identity. Re-asking costs
+          // one `rev-parse` per session (the resolver caches within one), so the cheap direction is
+          // also the safe one. The equality check is the no-op guard: the sweep re-runs on every
+          // project-list change and must not churn the persisted blob.
+          if (!p || repoKey === null || p.repoKey === repoKey) return s;
+          return { projects: mapProject(s.projects, id, (x) => ({ ...x, repoKey })) };
+        }),
 
       touchProjectOpened: (id) =>
         set((s) => ({

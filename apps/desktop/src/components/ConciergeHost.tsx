@@ -43,7 +43,7 @@ import {
   type ConciergeReceipt,
   type ConciergeViewModel,
 } from "./Concierge";
-import type { ConciergeMountedAgent } from "./Concierge/types";
+import type { ConciergeMountedAgent, ConciergeReceiptMark } from "./Concierge/types";
 // The reply-anchoring RULE — which of the user's messages a reply is answering — lives in its own
 // pure module (no React, no stores) so the inference is unit-testable without mounting this file, and
 // so the stub that draws an anchor reads the same declaration the host writes.
@@ -147,7 +147,7 @@ import { ConciergeApprovals } from "./Concierge/ConciergeApprovals";
 import { CountdownBanner } from "./Concierge/CountdownBanner";
 import { flat, line, plain, ref } from "./Concierge/conciergeLine";
 import type { Line, ReferencableAgent } from "./Concierge/conciergeLine";
-import { actionReceiptLine } from "./Concierge/actionReceiptLine";
+import { actionReceiptLine, receiptMark } from "./Concierge/actionReceiptLine";
 import {
   noteConciergeTurnForPromises,
   promiseVerbPhrase,
@@ -1745,17 +1745,27 @@ export function ConciergeHost({
    * dictated speech reaches a PTY with no deliberate act at all.
    *
    * The router half of the fix is in services/conciergeRouter (it can no longer return `agent` at
-   * all), so the ONLY thing that can aim a send at a terminal is an explicit `@Name` in the text.
-   * This is that same fact, rendered: no mention → "Concierge", always.
+   * all), so the only two things that can aim a send at a terminal are an explicit `@Name` in the
+   * text and the CABLE — a MOUNT, which is a gesture the user made and the column reports back to
+   * them, never an inherited target. This is that same fact, rendered.
    *
    * ══ THE CONTRACT ═══════════════════════════════════════════════════════════════════════════════
    * THE LABEL AND THE DESTINATION MUST BE COMPUTED THE SAME WAY, or the rail goes back to lying —
    * quietly this time, since a label that is merely stale looks identical to a correct one. So this
-   * resolves mentions exactly as the send does: `mentionRoster(mentionAgents, preferredAgentId)`
-   * over the SAME two inputs `ComposeBox` is handed below (its `mentionAgents` / `preferredAgentId`
-   * props), then `mentionsIn` over the live text. ComposeBox builds that roster from those props and
-   * resolves against it at submit; feeding this the same inputs is what makes drift impossible
-   * rather than merely unlikely. If you change either input here, change it in the JSX below too.
+   * does not restate the rule, it CALLS it: `classifyComposerRoute`, the same pure function `send`
+   * routes by, over the same inputs. Mentions resolve exactly as the send resolves them —
+   * `mentionRoster(mentionAgents, preferredAgentId)` over the SAME two inputs `ComposeBox` is handed
+   * below (its `mentionAgents` / `preferredAgentId` props), then `mentionsIn` over the live text —
+   * and the mount handed in is the one `send` reads through `mountedAgentIdRef`. If you change
+   * either input here, change it in the JSX below too.
+   *
+   * THE BUG THAT MADE THIS A SHARED CALL RATHER THAN A SECOND COPY OF THE RULE: while mounted, a
+   * plain message goes to the mounted agent's terminal, and this said "Concierge" — so the founder
+   * dictated hands-free, read "Sending to Concierge shortly", let it fire, and his words went to a
+   * PTY. That is the original damage above with the destinations swapped. Deriving the label from
+   * the verdict also retired a second disagreement for free: a name that does not LEAD is the
+   * sentence's SUBJECT, so "why is @Kraken Auth just sitting there?" no longer announces Kraken
+   * Auth over a message the send delivers elsewhere.
    *
    * The mention's `name` is the ADDRESS the user typed, which for two same-named agents is the
    * disambiguated `@Docs (web)` rather than a bare "Docs" that names neither (Concierge/mentions,
@@ -1764,10 +1774,17 @@ export function ConciergeHost({
    */
   const railTargetName = useMemo(() => {
     const roster = mentionRoster(mentionAgents, routingTarget?.agentId ?? null);
-    // The FIRST mention, because that is the one `send` routes at — a message goes to one terminal,
-    // and every other name in it is content (see `send`'s `mentions?.[0]`).
-    return mentionsIn(composedText, roster)[0]?.name ?? "Concierge";
-  }, [composedText, mentionAgents, routingTarget?.agentId]);
+    const mentions = mentionsIn(composedText, roster);
+    const route = classifyComposerRoute({
+      text: composedText,
+      mentions,
+      mountedAgentId: routableMountedAgentId,
+    });
+    if (route.kind === "sparkle") return "Concierge";
+    // `mentions[0]` IS the addressing mention: `addressingSpan` can only ever qualify the FIRST
+    // span (every later one has an earlier literal to its left), and `mentionsIn` keeps that order.
+    return (route.via === "address" ? mentions[0]?.name : mountedName) ?? "Concierge";
+  }, [composedText, mentionAgents, routingTarget?.agentId, routableMountedAgentId, mountedName]);
 
   const autoSendRail = useAutoSend({
     // ARMED IS NOW A TRAY POSITION, not a switch: only `speak` counts down, and only while the
@@ -1791,9 +1808,9 @@ export function ConciergeHost({
     interim: dictation.interim,
     // THE MIS-ROUTE SAFETY NET: the rail's only label is where this send would land, so the
     // countdown is also the moment you can notice you are about to dictate into the wrong agent.
-    // Derived from the compose box's own text — the agent the user NAMED, never the one they
-    // happen to be looking at. See `railTargetName` for the misroute that made that distinction
-    // load-bearing, and for the resolve-it-the-same-way contract it keeps with the send.
+    // Computed by the same function that routes the send — the agent the user NAMED, or the one the
+    // cable is patched to, never one merely on screen. See `railTargetName` for both misroutes that
+    // made this load-bearing, and for the resolve-it-the-same-way contract it keeps with the send.
     targetName: railTargetName,
     // Returns whether a send actually went out (see UseAutoSendArgs.onFire), and BOTH ways of not
     // sending are reported rather than just the first:
@@ -3333,8 +3350,23 @@ export function ConciergeHost({
   // emit `[@Name](sparkle-agent:<id>)` and the app was instructed nothing. A `string` parameter is
   // what let twenty-five call sites interpolate `${a.name}`; a `Line` cannot be built without going
   // through `line`, and `line` will not interpolate anything but a `Slot`. See Concierge/conciergeLine.
-  const postSparkle = useCallback((l: Line, collapsed?: TextBlock) => {
-    setChat((prev) => [...prev, { id: nextId("sparkle"), kind: "sparkle", text: l.md, collapsed }]);
+  //
+  // `actionReceipt` MARKS THIS LINE AS AN ACTION RECEIPT and carries what it recorded — see
+  // Concierge/types `ConciergeReceiptMark`. Without it a receipt row is indistinguishable from every
+  // other app-authored line (no kind, no status, no marker survives this function), which is why the
+  // column could show sixteen copies of one fact and nothing could tell they were the same fact. It
+  // is stamped from the receipt, never inferred from `l`: the folding rule turns on `ok`, and a mark
+  // that guessed it could fold a refusal into a success count.
+  //
+  // NAMED `actionReceipt`, NOT `receipt`, and the collision was real rather than stylistic:
+  // `ConciergeUserMessage.receipt` is the ROUTING receipt (where a message the USER sent went), a
+  // different type on a different kind. Reusing the word made a spread across the message union fail
+  // to typecheck, which was the honest signal that two unrelated things were being called one name.
+  const postSparkle = useCallback((l: Line, collapsed?: TextBlock, actionReceipt?: ConciergeReceiptMark) => {
+    setChat((prev) => [
+      ...prev,
+      { id: nextId("sparkle"), kind: "sparkle", text: l.md, collapsed, actionReceipt },
+    ]);
     // A send outcome is exactly what a screen-reader user needs told, and it arrives whole. Two
     // sends to the same pinned agent produce the same line twice; both must be announced.
     //
@@ -3759,7 +3791,13 @@ export function ConciergeHost({
         const l = actionReceiptLine(receipt, resolveAgent);
         // `null` means "this receipt has no sentence the app can stand behind" — an unknown kind.
         // Posting nothing is the safe failure: a receipt line means the thing happened.
-        if (l) postSparkle(l);
+        //
+        // THE MARK RIDES WITH THE LINE so a run of identical receipts can fold to one row
+        // (Concierge/receiptRuns). The SUBJECT is stamped from the same `resolveAgent` call the
+        // sentence above just used — resolved, not re-resolved later — so a folded row can only
+        // name an agent the row it replaced already named, and can only make it a pill if that
+        // row's pill was real.
+        if (l) postSparkle(l, undefined, receiptMark(receipt, resolveAgent));
       }),
     [postSparkle, resolveAgent],
   );

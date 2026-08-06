@@ -196,6 +196,17 @@ export interface Project {
    *  Absent for every project that has never run a cloud agent, i.e. all of them until the
    *  feature is switched on for the account. */
   cloudProjectId?: string | null;
+  /** The REPOSITORY this project's folder belongs to — the canonical `.git` common dir, resolved
+   *  once by `services/repoKey` (Rust `project_repo_key`). It is what makes "already open" mean the
+   *  same repo rather than the same folder: a linked git worktree has its OWN `rootPath` but shares
+   *  this, which is how `~/Projects/sparkle` and `~/Projects/sparkle-desktop` ended up on screen as
+   *  two projects (engine/projectIdentity).
+   *
+   *  Absent until a repository is actually found — a folder we could not resolve one for (not a
+   *  repo, missing, unmounted, git failed) is left ABSENT rather than recorded as `null`, so a
+   *  later sweep still gets to ask (projectStore.setProjectRepoKey). Absent falls back to path
+   *  identity, which is exactly the dedupe the app already had. */
+  repoKey?: string | null;
 }
 
 export type { AgentTabStatus };

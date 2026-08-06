@@ -17,7 +17,11 @@ import type { DigestVariant } from "../../services/conciergeDigest";
 // …and the collapsed-text block for the same reason: `TextBlock` is the one declaration of "a long
 // block of text, carried whole, shown as a pill" (see components/composer/attachments), and a second
 // one here is how a transcript pill and a composer pill would drift about what a block is.
-import type { Attachment, CollapsedSend, TextBlock } from "../composer/attachments";
+import type {
+  Attachment,
+  CollapsedSend,
+  TextBlock,
+} from "../composer/attachments";
 // TYPE-ONLY, and that is the whole reason it is allowed. The rule this module's header states is
 // that nothing under components/Concierge may TOUCH a store; a type import is erased at compile time
 // and creates no subscription, no import cycle and no runtime dependency. Naming the store's own
@@ -37,6 +41,12 @@ import type { ReplyAnchor } from "./replyAnchors";
 // no React, no stores), so the host that records a finding and the line that draws it cannot drift
 // about what a finding is.
 import type { MessageLintMark } from "./lintMarks";
+// The receipt vocabulary, borrowed rather than restated: a second copy of "which kinds exist" or
+// "which channels exist" would drift from the service that mints them, and the fold rule reads both.
+import type {
+  ConciergeActionKind,
+  ConciergeSendChannel,
+} from "../../services/conciergeReceipts";
 // The rail's view-model lives with the component that RENDERS it, for the same reason `Attachment`
 // lives with the composer's model and the mention shapes live with ./mentions: one declaration, so
 // the host that builds a rail state and the strip that draws it cannot drift about what one is.
@@ -169,11 +179,76 @@ export interface ConciergeUserMessage {
   collapsed?: TextBlock[];
 }
 
+/**
+ * THIS SPARKLE LINE IS AN ACTION RECEIPT, and what it recorded — so a RUN of identical ones can be
+ * folded to a single row (./receiptRuns).
+ *
+ * ══ WHY THE MESSAGE HAS TO CARRY IT ═════════════════════════════════════════════════════════════
+ * `postSparkle` renders a receipt to `text` and drops everything else, so a receipt row is
+ * structurally indistinguishable from any other app-authored line: no kind, no status, no marker.
+ * That is exactly why the column could show sixteen near-identical "Sent to @X's terminal." rows and
+ * nothing could tell they were the same fact sixteen times.
+ *
+ * ══ EVERY FIELD IS AN OBSERVATION, COPIED — NEVER RE-DERIVED ════════════════════════════════════
+ * These mirror `ConciergeActionReceipt`'s own fields and are stamped from it at post time. They must
+ * never be inferred from the rendered sentence: the folding rule turns on {@link ok} and
+ * {@link failed}, and a mark that guessed them could fold a REFUSAL into a success count — the one
+ * thing folding is forbidden to do (see ./receiptRuns for why that would be worse than no folding
+ * at all).
+ */
+export interface ConciergeReceiptMark {
+  /** The action, as the reader should understand it. Verbatim from the receipt. */
+  kind: ConciergeActionKind;
+  /** Did it actually happen? Verbatim from the receipt's own `ok`, which came from the dispatch
+   *  reply's. A `false` here is what pins this row open on its own forever. */
+  ok: boolean;
+  /** For `sent`: which channel, because the three are visible at different times and must not share
+   *  a folded sentence. */
+  channel?: ConciergeSendChannel;
+  /** This receipt was already plural (a broadcast). Never folded — see ./receiptRuns. */
+  fanout?: true;
+  /** This `sent` was a picker press, not a message. Folds in its own bucket. */
+  viaPicker?: true;
+  /** How many recipients REFUSED, on a fan-out that reported `ok` anyway. Any value above zero
+   *  keeps this row standing alone. */
+  failed?: number;
+  /**
+   * THIS LINE SAYS MORE THAN ITS STANDARD SENTENCE, so it can never fold.
+   *
+   * `ok: true` is not the same as "nothing to read here". A spawn that came up but could not be
+   * BRIEFED stays ok and carries the shortfall as its reason (services/conciergeReceiptClassifier —
+   * "it stays ok and carries the shortfall as the reason"), which `actionReceiptLine` renders as a
+   * whole second sentence: *"I created the agent, but its terminal didn't start … its opening brief
+   * hasn't gone in yet."* An agent that starts unbriefed sits there doing nothing, and this line is
+   * the only place the reader learns it.
+   *
+   * A fold replaces the sentence with a count, so that second sentence would simply be gone —
+   * hiding the actionable half of a receipt behind a chevron, which is the one thing folding is
+   * forbidden to do. A BOOLEAN rather than the text itself: the fold's only question is whether
+   * this row must stand alone, the text is already in `text`, and every field here is written to
+   * localStorage on every turn.
+   */
+  hasDetail?: true;
+  /**
+   * The subject AS THE LINE ITSELF RENDERED IT — resolved through the feed at post time by the same
+   * lookup `actionReceiptLine` used, not re-resolved later.
+   *
+   * `subjectId` is present only when that lookup HIT, which is what makes a pill safe: a folded row
+   * must not be able to name an agent the row it replaced could not, and must never mint a reference
+   * to an id the app cannot open. `subjectName` is the label that was shown either way.
+   */
+  subjectId?: string;
+  subjectName?: string;
+}
+
 /** Left-aligned plain Sparkle reply. No "Sparkle" label, no glow — just warm text. */
 export interface ConciergeSparkleMessage {
   id: string;
   kind: "sparkle";
   text: string;
+  /** Set when this line is an action receipt — see {@link ConciergeReceiptMark}. Absent on every
+   *  other app-authored line and on every brain reply, which is what keeps those out of a fold. */
+  actionReceipt?: ConciergeReceiptMark;
   /** True when the brain authored this WITHOUT a user message behind it — the proactive push
    *  channel (services/conciergeProactive). An ordinary reply leaves it unset. */
   proactive?: boolean;
@@ -696,7 +771,10 @@ export interface ConciergeColumnProps {
    *  Absent means pills still RENDER (with their live name and status dot) but report a failed
    *  open when clicked, which is the honest default for a surface that has not wired the reveal
    *  path — it cannot navigate, so it must not pretend it did. */
-  onOpenAgent?: (target: { agentId: string; projectId: string }) => RevealOutcome;
+  onOpenAgent?: (target: {
+    agentId: string;
+    projectId: string;
+  }) => RevealOutcome;
   /** Search the prompt history of an agent that can no longer be opened — the destination that
    *  replaces the dead end. Absent → an unresolvable pill stays plain prose rather than becoming a
    *  button with nowhere to go. */

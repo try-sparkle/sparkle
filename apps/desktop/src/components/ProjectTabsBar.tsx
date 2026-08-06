@@ -28,7 +28,8 @@
 // services/projectTabs. Closing (the tab's ×) hides the tab and NOTHING else: the project, its
 // agents and its live PTYs all survive, and the "+" dialog lists what you closed for one-click
 // reopen.
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { FiX } from "react-icons/fi";
 import type { Project } from "../types";
 import { ProjectTabs, type ProjectTabCounts } from "./ProjectTabs";
 import { TrialIndicator } from "./TrialChrome";
@@ -41,9 +42,15 @@ import { deriveAuthView } from "../services/entitlement";
 import { performTrialUnlock } from "../services/trialUnlock";
 import { pickProjectFolder, basename } from "../services/dialog";
 import { resolveOpenTarget } from "../services/openTarget";
-import { openProjectTab } from "../services/openProjectTab";
+import { focusExistingProject, openProjectTab } from "../services/openProjectTab";
 import { closeProjectTab, closedProjects } from "../services/projectTabs";
-import { isProjectOpen, openProjectsOf } from "../engine/openProjects";
+import { backfillRepoKeys, repoKeyFor, resolveRepoKeyFor } from "../services/repoKey";
+import {
+  alreadyOpenMessage,
+  findDuplicateOpen,
+  openAlreadyOpen,
+} from "../engine/projectIdentity";
+import { openProjectsOf } from "../engine/openProjects";
 import { useProjectStaleness, useStalenessTargets } from "../hooks/useProjectStaleness";
 import { projectsOnSide, resolveSideSelection, sideOf } from "../engine/pairs";
 import type { ConciergeFeed } from "../services/conciergeFeed";
@@ -98,6 +105,17 @@ async function readScreens(): Promise<Rect[]> {
   }
 }
 
+/**
+ * The id a not-yet-created project is compared under.
+ *
+ * `findDuplicateOpen` skips the record whose id matches the candidate's, so a folder with no record
+ * yet needs an id that CANNOT collide with a real project id (those are uuids). Using `""` or the
+ * eventual path would be fine today and is a trap tomorrow — the moment anything else adopts the
+ * same convention, a real project starts excluding itself from the comparison and the dedupe
+ * silently stops firing for it.
+ */
+export const NEW_PROJECT_CANDIDATE = "sparkle:new-project-candidate";
+
 /** Per-project status-band totals, keyed by project id — the tab glow + count badge (ProjectTabs). */
 export function countsFromFeed(feed: ConciergeFeed): Record<string, ProjectTabCounts> {
   const out: Record<string, ProjectTabCounts> = {};
@@ -143,6 +161,16 @@ export function ProjectTabsBar({
   // Pool exhaustion (all four `project-N` labels taken) is the one tear-off failure a user can
   // actually act on, so it gets a sentence rather than a console line.
   const [tearOffError, setTearOffError] = useState<string | null>(null);
+  /**
+   * The "already open" notice — the visible half of an idempotent open, kept SEPARATE from
+   * `tearOffError` because it carries an action and that one is plain text.
+   *
+   * `onOpenAnyway: null` renders the sentence with no button, for the case where a second open is
+   * not representable at all (one record, one tab).
+   */
+  const [notice, setNotice] = useState<{ text: string; onOpenAnyway: (() => void) | null } | null>(
+    null,
+  );
   const pinnedProjectId = useUiStore((s) => s.pinnedProjectId);
   const togglePinnedProject = useUiStore((s) => s.togglePinnedProject);
   const openProjectIds = useUiStore((s) => s.openProjectIds);
@@ -198,6 +226,11 @@ export function ProjectTabsBar({
     // stale banner alive on the other two: refuse once, hit "+" again, reopen something from the
     // list, and the banner still named a different project in the other pair. (roborev 55211)
     setTearOffError(null);
+    // And the already-open notice, for the same reason and in the same place: this is the one seam
+    // all three strip-opening paths commit through, so a notice raised by a PREVIOUS attempt cannot
+    // survive a later successful open. Putting it only in `pickAndOpen` was what left the reopen
+    // path showing a stale message (roborev 55211, now re-learned against the notice).
+    setNotice(null);
     if (isNew) assignProjectToPair(id, side);
     openProjectTab(id);
   };
@@ -235,6 +268,83 @@ export function ProjectTabsBar({
     }) === "trial";
   const [trialFailedUrl, setTrialFailedUrl] = useState<string | null>(null);
 
+  // Fill in `repoKey` for projects recorded before the field existed — without this the fix does
+  // nothing for a store that ALREADY holds two records for one repository, which is every store
+  // that has the bug. Re-runs when the project list changes and is a no-op once every project has
+  // an answer (services/repoKey). Right strip only: both strips mount this component, and the sweep
+  // is app-wide, so running it on each would double every git subprocess for no added coverage.
+  useEffect(() => {
+    if (side === "right") void backfillRepoKeys();
+  }, [side, projects]);
+
+  /** The stored record a candidate id names, if it is a real project (rather than a picked folder
+   *  with no record yet). */
+  const findSelf = (id: string) => projects.find((p) => p.id === id) ?? null;
+
+  /**
+   * IS THIS PROJECT ALREADY ON SCREEN? — the idempotent-open gate, in front of every path that
+   * would otherwise put a second tab up for one project.
+   *
+   * Returns true when it HANDLED the open: it has focused the incumbent and posted a notice, and
+   * the caller must not proceed. False means "nothing already open matches — carry on".
+   *
+   * `candidate` may be a project that exists or a synthetic stand-in for a freshly picked folder
+   * that has no record yet (see `findDuplicateOpen`) — the second is the case that matters, because
+   * that is where a second RECORD gets created.
+   *
+   * IT NEVER FORBIDS. The founder chose focus-and-tell over a hard refusal deliberately: Sparkle's
+   * whole agent model is git worktrees, and opening two worktrees of one repository side by side is
+   * a legitimate thing to want. `overrideRef` is that escape hatch — the notice carries an "Open
+   * anyway" action, and taking it re-runs the same open with the gate suppressed for exactly one
+   * attempt. So the guarantee is "never SILENTLY duplicates", not "cannot duplicate".
+   */
+  const dedupeOpen = (
+    candidate: { id: string; name: string; rootPath: string; repoKey?: string | null },
+    openAnyway: () => void,
+  ): boolean => {
+    // TWO DIFFERENT "ALREADY OPEN"S, and only the second is a duplicate.
+    //
+    //   • THIS EXACT RECORD already has a tab — re-picking the folder of a project you can already
+    //     see. `findDuplicateOpen` deliberately answers null here (it excludes the candidate by id,
+    //     because a record is not a duplicate of itself), so it has to be handled on its own.
+    //     Focusing and saying so is still the right behaviour: the founder's standing requirement is
+    //     that a second open is never a silent no-op he would read as a failed click.
+    //   • a DIFFERENT record naming the same project — the worktree case, below.
+    const self = findSelf(candidate.id);
+    if (self && openAlreadyOpen(self.id, openProjectIds)) {
+      focusExistingProject(self.id);
+      setNotice({
+        text: alreadyOpenMessage(
+          { existing: self, side: sideOf(pairAssignment, self.id), viaWorktree: false },
+          self.name,
+        ),
+        // No override offered. "Open anyway" would mean opening a SECOND tab for one record, which
+        // is not representable — a project has at most one tab (engine/openProjects). The escape
+        // hatch exists for two distinct records sharing a repository, which is the case below.
+        onOpenAnyway: null,
+      });
+      return true;
+    }
+    const dup = findDuplicateOpen(candidate, projects, openProjectIds, pairAssignment);
+    if (!dup) return false;
+    // FOCUS FIRST, then say so. The founder's ask was "it tells me it's already open and brings it
+    // into focus" — a message alone reads as a refusal, and a silent focus reads as a mis-click.
+    focusExistingProject(dup.existing.id);
+    setNotice({
+      text: alreadyOpenMessage(dup, candidate.name),
+      // `openAnyway` is the COMMIT half of whichever path called us, never the gated entry point —
+      // so taking the override simply does not run this check again. There is no suppression flag
+      // to set and, more to the point, none to leak: an earlier version parked the candidate id in
+      // a ref and cleared it on the next `dedupeOpen`, which meant the override was spent on
+      // whatever the user opened NEXT rather than on the open it authorized.
+      onOpenAnyway: () => {
+        setNotice(null);
+        openAnyway();
+      },
+    });
+    return true;
+  };
+
   // Pop the native folder picker, map the folder to an existing project (reuse) or a brand-new one
   // (created only on commit, so a cancelled picker adds nothing), then select its tab.
   const pickAndOpen = async (title: string) => {
@@ -244,40 +354,58 @@ export function ProjectTabsBar({
     // picker is cancelled or refuses again, so a previous refusal does not linger either.
     // (roborev 55207)
     setTearOffError(null);
+    // Same expiry rule for the already-open notice: a new picker gesture is the next deliberate
+    // act, so a notice about the LAST folder must not sit above the result of this one.
+    setNotice(null);
     const picked = await pickProjectFolder(title);
     if (!picked) return;
     const target = resolveOpenTarget(picked, projects, basename);
-    // AN EXISTING PROJECT THAT LIVES IN THE OTHER PAIR HAS TO SAY SO.
+    // THE IDEMPOTENT-OPEN GATE, and it REPLACES the old cross-pair refusal that stood here.
     //
-    // Unlike the reopen list, the picker cannot be filtered — the user chose a folder, and it maps
-    // to a project that already has a side. Committing silently would route the tab to the other
-    // pair, so the strip the user acted on visibly does nothing: the exact defect the reopen filter
-    // exists to prevent. Moving it here instead is not an option either — that remounts its panes
-    // and kills its PTYs (engine/pairs). So: say it, and leave the project where it is.
-    // (roborev 55196)
-    // REFUSE ONLY WHEN IT IS ACTUALLY OPEN OVER THERE.
+    // That refusal ("X is open in the other pair — switch to that strip to see it") was right about
+    // the situation and wrong about the remedy: it made the user go and find the tab themselves,
+    // and it only ever recognised a project the picker had already matched BY PATH. Both of those
+    // are the bug the founder hit — his `~/Projects/sparkle` and `~/Projects/sparkle-desktop` are
+    // one repository reached through a linked worktree, so the path match never fired and he got a
+    // second tab. `dedupeOpen` compares on REPOSITORY (engine/projectIdentity) and focuses the
+    // incumbent itself, which is what "bring it into focus" means.
     //
-    // `sideOf` answers "which pair owns it", not "does it have a tab" — and it answers "right" for
-    // any project with no entry at all, which is every pre-existing one. Refusing on that alone told
-    // the user "X is already open in the other pair" about a project that was not open ANYWHERE, and
-    // broke a path that used to work: picking a closed project's folder from the left strip
-    // previously reopened its tab (in the right pair — visible, just not on this strip). A refusal
-    // string is an instruction the user will follow, so it has to describe a state that exists and
-    // name a way out (AGENTS.md). Closed → reopen it on its own side, as before. (roborev 55200)
-    if (
-      target.kind === "existing" &&
-      sideOf(pairAssignment, target.id) !== side &&
-      isProjectOpen(target.id, openProjectIds)
-    ) {
-      const name = projects.find((p) => p.id === target.id)?.name ?? "That project";
-      setTearOffError(
-        `${name} is open in the ${side === "left" ? "right" : "left"} pair — switch to that strip to see it.`,
-      );
-      return;
-    }
+    // THE KEY IS RESOLVED BEFORE THE COMPARISON, not after. A folder with no project record has no
+    // stored `repoKey`, and asking git afterwards would be asking about a project we had already
+    // decided to create — the duplicate would exist by then. This is the one place the await has to
+    // happen before the branch. The picker is already async, so it costs nothing the user can feel.
+    const pickedKey = await repoKeyFor(target.kind === "existing" ? picked : target.path);
+    const self = target.kind === "existing" ? findSelf(target.id) : null;
+    const candidate =
+      target.kind === "existing"
+        ? {
+            id: target.id,
+            name: self?.name ?? "That project",
+            rootPath: self?.rootPath ?? picked,
+            // `pickedKey` WINS OVER THE STORED ONE WHEN THERE ISN'T ONE. `existing` means the
+            // picked folder IS this record's folder, so the key we just resolved describes it —
+            // and until the backfill sweep reaches that record its own field is empty, which would
+            // drop identity back to path and put a second tab up for the same repository. That is
+            // the reported bug, in the window before the sweep lands.
+            repoKey: self?.repoKey ?? pickedKey,
+          }
+        : { id: NEW_PROJECT_CANDIDATE, name: target.name, rootPath: target.path, repoKey: pickedKey };
+    if (dedupeOpen(candidate, () => void pickAndOpenCommitted(target))) return;
+    await pickAndOpenCommitted(target);
+  };
+
+  /**
+   * The COMMIT half of `pickAndOpen`, split out so "Open anyway" can re-run exactly this and
+   * nothing else — re-running the whole of `pickAndOpen` would pop the native folder picker a
+   * second time and ask the user to choose the same folder again.
+   */
+  const pickAndOpenCommitted = async (target: ReturnType<typeof resolveOpenTarget>) => {
     const id = target.kind === "existing" ? target.id : addProject(target.name, target.path);
     // `existing` keeps whatever side it is already on — see openFromThisStrip.
     openFromThisStrip(id, target.kind !== "existing");
+    // Record which repository the new project belongs to, so the NEXT open can dedupe on repo
+    // identity rather than waiting for the startup sweep to reach it.
+    if (target.kind !== "existing") void resolveRepoKeyFor(id);
     // SAY WHERE IT WENT. Reopening a closed project on its own side is right — moving it would kill
     // its PTYs — but doing it SILENTLY from this strip is the very defect the reopen list is
     // side-filtered to prevent: the tab appears in the other pair and the strip the user acted on
@@ -299,6 +427,7 @@ export function ProjectTabsBar({
       return;
     }
     setTearOffError(null);
+    setNotice(null);
     const pos = satellitePosition(screenPoint, await readScreens());
     try {
       await tearOffProject(projectId, pos);
@@ -347,6 +476,7 @@ export function ProjectTabsBar({
           // inside `selectOnThisSide` would therefore miss it, which also made the single-tab case
           // untestable. (roborev 55211)
           setTearOffError(null);
+          setNotice(null);
           if (tornOut.has(id)) void focusSatellite(id);
           if (id !== selectedProjectId) selectOnThisSide(id);
         }}
@@ -373,6 +503,66 @@ export function ProjectTabsBar({
           </>
         }
       />
+
+      {notice && (
+        <div
+          role="status"
+          data-testid="already-open-notice"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 10,
+            padding: "6px 12px",
+            fontSize: 12,
+            color: C.cream,
+            background: C.deepForest,
+            borderBottom: `1px solid ${C.muted}`,
+          }}
+        >
+          <span style={{ flex: 1 }}>{notice.text}</span>
+          {notice.onOpenAnyway && (
+            // THE OVERRIDE. Two worktrees of one repository side by side is a real workflow (that
+            // is how this repo's own agents work), so the gate informs rather than forbids.
+            <button
+              type="button"
+              data-testid="already-open-anyway"
+              onClick={notice.onOpenAnyway}
+              style={{
+                background: "transparent",
+                color: C.cream,
+                border: `1px solid ${C.muted}`,
+                borderRadius: 4,
+                padding: "2px 8px",
+                fontSize: 12,
+                cursor: "pointer",
+              }}
+            >
+              Open anyway
+            </button>
+          )}
+          {/* `FiX`, not a "×" character: affordances are react-icons here, and the glyph ratchet
+              (components/glyphIcons.test.ts) counts a bare multiplication sign as an icon site. */}
+          <button
+            type="button"
+            data-testid="already-open-dismiss"
+            aria-label="Dismiss"
+            title="Dismiss"
+            onClick={() => setNotice(null)}
+            style={{
+              background: "transparent",
+              color: C.cream,
+              border: "none",
+              display: "flex",
+              alignItems: "center",
+              lineHeight: 1,
+              padding: 0,
+              cursor: "pointer",
+            }}
+          >
+            <FiX size={13} aria-hidden />
+          </button>
+        </div>
+      )}
 
       {tearOffError && (
         <div
@@ -402,12 +592,25 @@ export function ProjectTabsBar({
           reopenable={reopenable.map((p) => ({ id: p.id, name: p.name, rootPath: p.rootPath }))}
           onReopen={(id) => {
             setNewProjectOpen(false);
+            // GATED TOO. The reopen list is side-filtered and only offers CLOSED projects, so it
+            // cannot re-open something that already has a tab — but it can absolutely reopen a
+            // project whose REPOSITORY is already on screen under another record, which is the
+            // founder's case with the roles reversed (close `sparkle-desktop`, reopen it while
+            // `sparkle` is up). Covering only the picker is how this bug comes back.
+            const p = findSelf(id);
+            if (p && dedupeOpen(p, () => openFromThisStrip(id, false))) return;
             // REOPEN IS NOT A MOVE. This project already exists and already has a side; taking it
             // over would kill its PTYs (see openFromThisStrip).
             openFromThisStrip(id, false);
           }}
           // Clone & Open: create + select the cloned project's tab (no window question to ask).
-          onCloned={(name, path) => openFromThisStrip(addProject(name, path), true)}
+          // NOT GATED, and deliberately: a clone writes a brand-new directory that nothing else can
+          // already be open on. Its repo key is still recorded, so the NEXT open dedupes against it.
+          onCloned={(name, path) => {
+            const id = addProject(name, path);
+            openFromThisStrip(id, true);
+            void resolveRepoKeyFor(id);
+          }}
         />
       )}
     </div>

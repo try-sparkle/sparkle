@@ -17,6 +17,7 @@ import { useUiStore } from "../stores/uiStore";
 import { selectAndOpen } from "./agentReveal";
 import { emitFocusAgent, emitSelectProject } from "./attention";
 import { markProjectOpen } from "./projectTabs";
+import { focusSatellite } from "./satelliteWindows";
 import { sideOf } from "../engine/pairs";
 
 /**
@@ -139,6 +140,31 @@ export function openProjectTab(projectId: string, agentId?: string | null): bool
   // With an agent asked for, the reveal is the point: a tab selection alone, while the agent the
   // caller named is gone, is not "it worked". Without one, selecting the tab IS the whole job.
   return agentId ? selectAndOpen(projectId, agentId) : true;
+}
+
+/**
+ * BRING AN ALREADY-OPEN PROJECT TO THE FRONT — the "focus" half of an idempotent open.
+ *
+ * When an open is deduped (engine/projectIdentity found the same project already on screen), the
+ * user must land ON the incumbent rather than getting a message about it. Two things have to
+ * happen, and only one of them is a store write:
+ *
+ *   • select its tab on the side that owns it, and
+ *   • if it has been TORN OUT into its own window, raise that window — otherwise the "focus" is a
+ *     selection in a strip whose panes live on another display, which from the user's seat is
+ *     indistinguishable from nothing happening.
+ *
+ * The satellite raise is fire-and-forget rather than awaited: `focusSatellite` is a no-op returning
+ * false outside Tauri and for a still-pending claim, and the tab selection below is correct either
+ * way. Failing to raise a window must not prevent the selection.
+ *
+ * Deliberately NOT `openProjectTab`: this is only ever called for a project that already HAS a tab,
+ * so `markProjectOpen` has nothing to do, and clearing `activeSpecial` would be wrong — the user
+ * did not ask to leave the Sparkle pane, they asked for a project they already had.
+ */
+export function focusExistingProject(projectId: string): void {
+  void focusSatellite(projectId);
+  selectProjectOnItsSide(projectId);
 }
 
 /**

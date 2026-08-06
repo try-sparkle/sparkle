@@ -111,6 +111,7 @@ mod conflict_watch;
 mod concierge;
 mod concierge_guidelines;
 mod concierge_lint_log;
+mod webview_drop_gate;
 
 use pty::PtyManager;
 use tauri::{Emitter, Manager};
@@ -257,6 +258,12 @@ pub fn run() {
             // best-effort — it only writes to the user's own disk here; upload is consent-gated in
             // the `flush_crash_reports` command.
             crash::install(app.handle());
+            // Supply the `prepareForDragOperation:` override wry leaves unimplemented, so a file
+            // released over a TERMINAL is delivered at all. Without it AppKit stops the drag after
+            // the hover phase for any drop outside a natively-droppable element, which is why the
+            // terminal painted its drop affordance and then swallowed the release, silently, from
+            // 2026-07-30 until this landed. See webview_drop_gate for the full mechanism.
+            webview_drop_gate::install(app.handle());
             // Watch for monitors being plugged/unplugged so a window spanned across displays can be
             // re-fitted instead of stranded at a geometry no remaining display can show.
             display_span::start_display_watch(app.handle().clone());
@@ -657,6 +664,7 @@ pub fn run() {
             hooks::plugin_install_outcomes,
             hooks::read_events_since,
             worktree::project_default_branch,
+            worktree::project_repo_key,
             worktree::reconcile_default_branch,
             worktree::agent_branch_status,
             repo_freshness::repo_root_staleness,

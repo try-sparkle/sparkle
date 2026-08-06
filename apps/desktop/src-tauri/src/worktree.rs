@@ -746,6 +746,69 @@ pub async fn project_default_branch(root: String) -> Result<String, String> {
         .map_err(|e| format!("project_default_branch task failed: {e}"))?
 }
 
+/// The REPOSITORY a folder belongs to, as a canonical absolute path — or `None` when the folder is
+/// not the root of a git checkout.
+///
+/// This is the identity behind "is this project already open?" (engine/projectIdentity). The
+/// founder had `~/Projects/sparkle` and `~/Projects/sparkle-desktop` on screen at once and called
+/// it the same project twice — correctly, because the second is a linked WORKTREE of the first.
+/// Two different folders, so every path-based dedupe the app had was right in its own terms and
+/// still produced two tabs.
+///
+/// `--git-common-dir` is the flag that collapses them: from a linked worktree it names the MAIN
+/// repository's `.git`, not the worktree's own `.git/worktrees/<name>` admin dir (that is
+/// `--git-dir`, which is DIFFERENT per worktree and would defeat the whole purpose). Do not
+/// "simplify" this to `--git-dir`; a test below pins the distinction.
+///
+/// Three normalizations, each load-bearing:
+///   * git answers RELATIVE to the cwd it was run in for the common case (a bare `.git`), so it is
+///     joined onto `root` before anything else — otherwise every project in the app would share the
+///     key `.git` and the app would treat all of them as one project.
+///   * `canonicalize` resolves symlinks, so `/tmp/x` and `/private/tmp/x` (macOS) agree. Two
+///     projects reached by different symlinked routes to one repo are the same repo.
+///   * failure is `None`, never a guess. A folder that is not a repo has no repository identity,
+///     and inventing one would merge every non-repo project into a single phantom.
+///
+/// ONLY A CHECKOUT ROOT GETS A KEY, and that is the other half of the rule. `--git-common-dir`
+/// answers the same thing from ANYWHERE inside a repository, so without the `--show-toplevel` gate
+/// below a monorepo package opened as its own project (`sparkle/apps/desktop`) would identify as
+/// the repository itself — deduped away against `sparkle`, and told by the concierge that it is "a
+/// linked git worktree", which it is not. A linked worktree IS its own toplevel, so this keeps the
+/// case the feature exists for and drops the one it would have broken.
+pub fn repo_key_at(root: &str) -> Option<String> {
+    let top = git(root, &["rev-parse", "--show-toplevel"]).ok()?;
+    let top = std::fs::canonicalize(top.trim()).ok()?;
+    if top != std::fs::canonicalize(root).ok()? {
+        return None;
+    }
+    let raw = git(root, &["rev-parse", "--git-common-dir"]).ok()?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let joined = {
+        let p = std::path::Path::new(raw);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            std::path::Path::new(root).join(p)
+        }
+    };
+    // Canonicalize when the path exists; fall back to the joined form otherwise so a readable
+    // answer is never thrown away just because the filesystem call failed.
+    let resolved = std::fs::canonicalize(&joined).unwrap_or(joined);
+    Some(resolved.to_string_lossy().to_string())
+}
+
+/// `repo_key_at` for the frontend. `Ok(None)` — not an error — for a folder that is not a repo:
+/// the caller falls back to path identity, which is a normal state, not a failure.
+#[tauri::command]
+pub async fn project_repo_key(root: String) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || Ok(repo_key_at(&root)))
+        .await
+        .map_err(|e| format!("project_repo_key task failed: {e}"))?
+}
+
 /// Reconcile a project's PERSISTED integration branch against reality (AppHandle-free, testable).
 /// A non-empty `recorded` that still resolves — local `refs/heads/<recorded>` OR a remote-tracking
 /// `refs/remotes/origin/<recorded>` — is honored verbatim, so a deliberate non-default choice (a
@@ -8405,6 +8468,64 @@ mod tests {
         git(&root, &["config", "user.name", "T"]).unwrap();
         git(&root, &["commit", "--allow-empty", "-m", "init"]).unwrap();
         d
+    }
+
+    // THE FOUNDER'S BUG, at the layer that decides it. He had `~/Projects/sparkle` and
+    // `~/Projects/sparkle-desktop` open as two projects; the second is a linked WORKTREE of the
+    // first, so they are one repository and the app should have said so.
+    #[test]
+    fn repo_key_is_shared_by_a_linked_worktree_and_its_main_checkout() {
+        let d = scratch_repo();
+        let root = d.path().to_string_lossy().to_string();
+        let wt_dir = tempfile::tempdir().unwrap();
+        let wt = wt_dir.path().join("linked").to_string_lossy().to_string();
+        git(&root, &["worktree", "add", "--detach", &wt]).unwrap();
+
+        let main_key = repo_key_at(&root).expect("main checkout has a repo key");
+        let wt_key = repo_key_at(&wt).expect("linked worktree has a repo key");
+        // The whole feature: same repository ⇒ same key, from two different folders.
+        assert_eq!(main_key, wt_key, "a linked worktree must share its origin's repo key");
+        assert!(main_key.ends_with(".git"), "expected a .git common dir, got {main_key}");
+
+        // And the distinction that makes `--git-common-dir` the right flag: `--git-dir` is DIFFERENT
+        // per worktree, so a version of this built on it would answer "two projects" and the bug
+        // would survive the fix.
+        let main_git_dir = git(&root, &["rev-parse", "--absolute-git-dir"]).unwrap();
+        let wt_git_dir = git(&wt, &["rev-parse", "--absolute-git-dir"]).unwrap();
+        assert_ne!(main_git_dir, wt_git_dir, "precondition: --git-dir differs per worktree");
+    }
+
+    #[test]
+    fn repo_key_is_absolute_and_distinguishes_two_unrelated_repos() {
+        let a = scratch_repo();
+        let b = scratch_repo();
+        let ka = repo_key_at(&a.path().to_string_lossy()).unwrap();
+        let kb = repo_key_at(&b.path().to_string_lossy()).unwrap();
+        assert_ne!(ka, kb, "unrelated repos must not collapse into one project");
+        // Absolute, because git answers a bare `.git` relative to the cwd — joining it onto the root
+        // is what stops every project in the app sharing the key ".git".
+        assert!(std::path::Path::new(&ka).is_absolute(), "repo key must be absolute: {ka}");
+    }
+
+    // A SUBDIRECTORY IS NOT THE REPOSITORY. `--git-common-dir` answers from anywhere inside a
+    // checkout, so without the `--show-toplevel` gate a monorepo package opened as its own project
+    // would carry the repo's key and be deduped away against it — refused, in the concierge's
+    // words, as "a linked git worktree".
+    #[test]
+    fn repo_key_is_none_for_a_subdirectory_of_a_repo() {
+        let d = scratch_repo();
+        let root = d.path().to_string_lossy().to_string();
+        let sub = d.path().join("apps").join("desktop");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert!(repo_key_at(&root).is_some(), "precondition: the root itself has a key");
+        assert_eq!(repo_key_at(&sub.to_string_lossy()), None);
+    }
+
+    #[test]
+    fn repo_key_is_none_for_a_folder_that_is_not_a_repo() {
+        // `None`, never a guess: a fabricated identity would merge every non-repo project into one.
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(repo_key_at(&d.path().to_string_lossy()), None);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { actionReceiptLine } from "./actionReceiptLine";
+import { actionReceiptLine, receiptMark } from "./actionReceiptLine";
+import { foldKeyOf } from "./receiptRuns";
 import type { ConciergeActionReceipt } from "../../services/conciergeReceipts";
 
 const AGENT = { id: "11111111-2222-3333-4444-555555555555", name: "Left Pair" };
@@ -248,6 +249,33 @@ describe("the spawn shortfall reads as prose, not a spliced clause", () => {
     expect(actionReceiptLine(receipt({ kind: "spawned" }), resolve)?.spoken).toBe(
       "Spawned Left Pair.",
     );
+  });
+
+  // ══ AND THE FOLD MUST NOT BE ABLE TO DELETE IT ════════════════════════════════════════════════
+  // The sentence above is the ONLY place the reader learns an agent came up unbriefed, and a folded
+  // run replaces the sentence with a count. `hasDetail` is what makes `foldKeyOf` refuse the row;
+  // asserted HERE, at the stamp, because the fold rule's own test can only prove what it does with
+  // the flag — not that the flag is ever set on the receipt that needs it.
+  it("MARKS the shortfall on the mark, so a run of spawns cannot fold it away", () => {
+    const mark = receiptMark(
+      receipt({ kind: "spawned", ok: true, reason: LAUNCH_FAILED }),
+      resolve,
+    );
+    expect(mark.hasDetail).toBe(true);
+    expect(foldKeyOf(mark)).toBeNull();
+
+    // The positive control, on the same path: an ordinary spawn is unmarked and still folds, so the
+    // guard is a guard and not a blanket refusal to fold spawns.
+    const clean = receiptMark(receipt({ kind: "spawned" }), resolve);
+    expect(clean.hasDetail).toBeUndefined();
+    expect(foldKeyOf(clean)).toBe("spawned");
+
+    // A REFUSAL's `reason` must NOT be read as a shortfall: it is already refused by `ok`, and
+    // marking it too would say the two guards were one.
+    expect(
+      receiptMark(receipt({ kind: "spawned", ok: false, reason: "nope" }), resolve)
+        .hasDetail,
+    ).toBeUndefined();
   });
 });
 

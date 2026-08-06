@@ -17,6 +17,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const invoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invoke(...a) }));
 
+// services/repoKey memoizes per rootPath for the life of the module, so a test that changes what
+// `project_repo_key` answers must clear it or it reads the previous test's answer.
+import { __resetRepoKeyCache } from "../repoKey";
+
 import {
   CONFIRM_GATED_OPS,
   WORKSPACE_OPS,
@@ -354,6 +358,83 @@ describe("reorderProjectTab", () => {
 
   it("refuses a no-op drop on itself", () => {
     expect(reorderProjectTab("p1", "p1")).toMatchObject({ ok: false, reason: "no-op" });
+  });
+});
+
+// THE FOUNDER'S BUG, on the CONCIERGE path. This tool had its own dedupe — an exact
+// `p.rootPath === rootPath` compare — which was strictly weaker than the human picker's, so the
+// model could mint a duplicate record the "+" flow would have reused. It is now the one shared rule
+// (engine/projectIdentity), which is both case/Unicode-tolerant AND repository-aware.
+describe("addProjectFromFolder — one folder is one project", () => {
+  beforeEach(() => {
+    __resetRepoKeyCache();
+    useProjectStore.setState({
+      projects: [
+        { ...mkProject("keep"), name: "widget", rootPath: "/Users/me/code/Widget" },
+      ],
+    } as never);
+  });
+
+  it("refuses a folder that differs from an existing project only by CASE", async () => {
+    // macOS volumes are case-insensitive by default, so these name ONE directory. Against the old
+    // exact compare this added a second project for the same folder — two agent sets, two worktree
+    // pools, two tabs.
+    const before = useProjectStore.getState().projects.length;
+    const res = await addProjectFromFolder("/Users/me/code/widget", undefined, deps);
+    expect(res).toMatchObject({ ok: false, reason: "already-added" });
+    expect(useProjectStore.getState().projects.length).toBe(before);
+    expect(ensureRepo).not.toHaveBeenCalled();
+    // AND IT SAYS THE RIGHT THING. One directory spelled two ways is not a worktree, and the
+    // refusal is an instruction the model acts on — an exact-string compare here narrated this as
+    // "a linked git worktree, not a separate project", which is false.
+    if (res.ok) return;
+    expect(res.message).not.toMatch(/worktree/i);
+    expect(res.message).toContain("is already the project");
+  });
+
+  it("refuses a LINKED WORKTREE of a project that is already recorded, and names it", async () => {
+    // Different folder, same repository — the exact shape the founder hit. `project_repo_key` is
+    // what makes the two comparable at all.
+    useProjectStore.setState({
+      projects: [
+        { ...mkProject("keep"), name: "sparkle", rootPath: "/repos/sparkle", repoKey: "/repos/sparkle/.git" },
+      ],
+    } as never);
+    invoke.mockImplementation(async (cmd: string) =>
+      cmd === "project_repo_key" ? "/repos/sparkle/.git" : undefined,
+    );
+    const before = useProjectStore.getState().projects.length;
+    const res = await addProjectFromFolder("/repos/sparkle-desktop", undefined, deps);
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+    expect(res.reason).toBe("already-added");
+    // The refusal has to point the model at the action that DOES work, or it just stops.
+    expect(res.message).toMatch(/worktree/i);
+    expect(res.message).toMatch(/open_project_tab/);
+    expect(useProjectStore.getState().projects.length).toBe(before);
+  });
+
+  it("still adds a genuinely different folder", async () => {
+    const res = await addProjectFromFolder("/Users/me/code/other", undefined, deps);
+    expect(res.ok).toBe(true);
+  });
+
+  it("records the repo key resolved AFTER ensure_project_repo, not the answer from before it", async () => {
+    // `ensure_project_repo` GIT-INITS an empty folder, so the key asked for during the dedupe above
+    // is "not a repo" and is already stale by the time the project is recorded. Reading it before
+    // the init left the project permanently keyless — and a later worktree of it dedupes against
+    // nothing, which is the whole feature.
+    let initialized = false;
+    ensureRepo.mockImplementationOnce(async () => {
+      initialized = true;
+    });
+    invoke.mockImplementation(async (cmd: string) =>
+      cmd === "project_repo_key" ? (initialized ? "/repos/fresh/.git" : null) : null,
+    );
+    const res = await addProjectFromFolder("/repos/fresh", undefined, deps);
+    expect(res.ok).toBe(true);
+    const added = useProjectStore.getState().projects.find((p) => p.rootPath === "/repos/fresh");
+    expect(added?.repoKey).toBe("/repos/fresh/.git");
   });
 });
 

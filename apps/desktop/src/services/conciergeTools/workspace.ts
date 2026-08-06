@@ -54,6 +54,8 @@ import { useRuntimeStore } from "../../stores/runtimeStore";
 import { useUiStore } from "../../stores/uiStore";
 import { useHelperPrefs } from "../../helper/helperPrefs";
 import { isProjectOpen, openProjectsOf } from "../../engine/openProjects";
+import { isSameProject, pathKey } from "../../engine/projectIdentity";
+import { forgetRepoKey, repoKeyFor, resolveRepoKeyFor } from "../repoKey";
 import { openProjectTab as openProjectTabService } from "../openProjectTab";
 import { closeProjectTab as closeProjectTabService } from "../projectTabs";
 import { projectsWithOpenAgents, stopOpenProjectAgents } from "../windowClose";
@@ -554,17 +556,45 @@ export async function addProjectFromFolder(
   if (problem) return refuse("add_project_from_folder", "invalid-path", problem);
   const rootPath = normalizePath(path);
 
-  const existing = useProjectStore.getState().projects.find((p) => p.rootPath === rootPath);
+  // ALREADY A PROJECT? — and "already" means the same REPOSITORY, not the same string.
+  //
+  // This compared `p.rootPath === rootPath` exactly, which was strictly weaker than the human
+  // picker's own dedupe (`services/openTarget.resolveOpenTarget` case-folds and NFC-normalizes)
+  // — so the concierge could mint a duplicate record for a folder the "+" flow would have reused,
+  // purely over casing or Unicode form. Two dedupe implementations for one question is how they
+  // came to disagree; there is one now, and it is the engine's.
+  //
+  // It is also REPO-aware, which is the founder's bug: `~/Projects/sparkle` and
+  // `~/Projects/sparkle-desktop` are one repository reached through a linked worktree, and an
+  // exact-path compare was never going to see it (engine/projectIdentity).
+  const projects = useProjectStore.getState().projects;
+  const candidate = { id: "", name: folderName(rootPath), rootPath, repoKey: await repoKeyFor(rootPath) };
+  const existing = projects.find((p) => isSameProject(p, candidate));
   if (existing) {
-    return refuse(
-      "add_project_from_folder",
-      "already-added",
-      `${rootPath} is already the project "${existing.name}" (${existing.id}).`,
-    );
+    // STILL A REFUSAL HERE, and deliberately not the focus-and-tell the tab bar does. This tool's
+    // contract is "ADD a folder as a project", and the folder already is one — there is nothing to
+    // add, and the model needs to be told so it can pick a different next action. The refusal names
+    // the project so the model can call `open_project_tab` on it, which IS the focusing path.
+    // WHICH SENTENCE — decided by the SAME normalizer the match was made with. An exact string
+    // compare here called a case-only or NFD/NFC difference "a linked git worktree", which is
+    // false: it is one directory spelled two ways, and a refusal message is an instruction the
+    // model will act on (AGENTS.md).
+    const why =
+      pathKey(existing.rootPath) === pathKey(rootPath)
+        ? `${rootPath} is already the project "${existing.name}" (${existing.id}).`
+        : `${rootPath} is the same repository as the project "${existing.name}" (${existing.id}, ` +
+          `at ${existing.rootPath}) — a linked git worktree, not a separate project. ` +
+          `Use open_project_tab with ${existing.id} to show it.`;
+    return refuse("add_project_from_folder", "already-added", why);
   }
 
   try {
     await deps.ensureProjectRepo(rootPath);
+    // …which GIT-INITS an empty folder, so the answer cached above ("not a repo") is now stale and
+    // would be what this whole session sees. Drop it, and resolve again below against the folder
+    // as it now is — otherwise a concierge-added project never acquires a repo key and a later
+    // worktree of it dedupes against nothing.
+    forgetRepoKey(rootPath);
   } catch (e) {
     // Nothing is added on failure: a project row pointing at a folder we could not prepare is a
     // tab that breaks on its first agent spawn.
@@ -577,6 +607,10 @@ export async function addProjectFromFolder(
 
   const finalName = name?.trim() || folderName(rootPath);
   const projectId = useProjectStore.getState().addProject(finalName, rootPath);
+  // Record the repository this folder belongs to, so the next add/open dedupes against it without
+  // waiting for the startup sweep — and read it AFTER `ensureProjectRepo`, which is what may have
+  // made it a repository in the first place.
+  await resolveRepoKeyFor(projectId);
   // …and OPEN it. `addProject` only sets `selectedProjectId`; it does not touch the open set, so on
   // its own it leaves the new project SELECTED WITH NO TAB for anyone whose `openProjectIds` is a
   // real array — i.e. anyone who has ever closed a tab (roborev 54174). The state would even be

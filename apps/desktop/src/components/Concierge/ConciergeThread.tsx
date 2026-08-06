@@ -22,6 +22,10 @@ import { ANCHOR_HIGHLIGHT_MS } from "./ReplyAnchorViews";
 import { TextPillModal } from "../composer/TextPillModal";
 // WHICH BLOCKS AN ENTRY CARRIES — one rule, shared with the row that draws them (./collapsedBlocks).
 import { blockKey, collapsedBlocksOf, shownIdsFor } from "./collapsedBlocks";
+// A RUN OF IDENTICAL RECEIPTS, folded to one row — the rule in ./receiptRuns, the drawing in
+// ./ReceiptRunRow. Sixteen "Sent to @X's terminal." rows were one fact costing the whole column.
+import { foldReceiptRuns } from "./receiptRuns";
+import { ReceiptRunRow } from "./ReceiptRunRow";
 import { CONCIERGE_THREAD_TESTID } from "../../engine/composeBoxHeight";
 import type {
   ConciergeCopyKind,
@@ -37,7 +41,6 @@ export {
   FAILURE_BUBBLE_TESTID,
   FAILURE_EVIDENCE_TESTID,
 } from "./ConciergeMessageRow";
-
 
 /** The id of the NEWEST message the user themselves sent, or "" when the thread has none.
  *
@@ -172,19 +175,34 @@ export function ConciergeThread({
     onDigestClick,
     onCopied,
   };
-  const onAnswerCopied = useCallback(() => handlers.current.onCopied?.("answer"), []);
+  const onAnswerCopied = useCallback(
+    () => handlers.current.onCopied?.("answer"),
+    [],
+  );
   // The user's own bubble reports a DIFFERENT kind, so the live region can say "Message copied"
   // rather than telling him his own words were an answer. Stabilised exactly like the one above —
   // it reaches every memoised row, so an unstable identity here would re-render the whole transcript
   // on every feed tick and bring back the drag-stutter this file's memo exists to kill.
-  const onMessageCopied = useCallback(() => handlers.current.onCopied?.("message"), []);
-  const nudgeClick = useCallback((n: ConciergeNudge) => handlers.current.onNudgeClick(n), []);
+  const onMessageCopied = useCallback(
+    () => handlers.current.onCopied?.("message"),
+    [],
+  );
+  const nudgeClick = useCallback(
+    (n: ConciergeNudge) => handlers.current.onNudgeClick(n),
+    [],
+  );
   const nudgeAction = useCallback(
     (n: ConciergeNudge, a: string) => handlers.current.onNudgeAction(n, a),
     [],
   );
-  const revealAgent = useCallback((id: string) => handlers.current.onRevealAgent?.(id), []);
-  const redirect = useCallback((id: string) => handlers.current.onRedirect?.(id), []);
+  const revealAgent = useCallback(
+    (id: string) => handlers.current.onRevealAgent?.(id),
+    [],
+  );
+  const redirect = useCallback(
+    (id: string) => handlers.current.onRedirect?.(id),
+    [],
+  );
   const digestClick = useCallback(
     (d: ConciergeDigestMessage) => handlers.current.onDigestClick?.(d),
     [],
@@ -211,14 +229,21 @@ export function ConciergeThread({
   const [openPayloadId, setOpenPayloadId] = useState<string | null>(null);
   /** Blocks the reader asked to see as regular text, IN PLACE — the founder's literal ask ("show as
    *  regular text" puts it back in the bubble, not in a panel). */
-  const [shownAsText, setShownAsText] = useState<ReadonlySet<string>>(() => new Set());
+  const [shownAsText, setShownAsText] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
   // Only walked while a modal is actually open, so the common render costs nothing. The message is
   // held through the flatMap because the identity being matched is the pair, not the block.
   const openPayload =
     openPayloadId === null
       ? undefined
       : visible
-          .flatMap((m) => collapsedBlocksOf(m).map((b) => ({ key: blockKey(m.id, b.id), block: b })))
+          .flatMap((m) =>
+            collapsedBlocksOf(m).map((b) => ({
+              key: blockKey(m.id, b.id),
+              block: b,
+            })),
+          )
           .find((e) => e.key === openPayloadId)?.block;
   /** Open the full-text modal for a block. Stable, so it does not un-memoise every row. */
   const openPayloadFor = useCallback((id: string) => setOpenPayloadId(id), []);
@@ -287,9 +312,9 @@ export function ConciergeThread({
   const jumpTo = useCallback((id: string) => {
     const root = scrollRef.current;
     if (!root) return;
-    const target = Array.from(root.querySelectorAll<HTMLElement>("[data-message-id]")).find(
-      (el) => el.dataset.messageId === id,
-    );
+    const target = Array.from(
+      root.querySelectorAll<HTMLElement>("[data-message-id]"),
+    ).find((el) => el.dataset.messageId === id);
     if (!target) return;
     target.scrollIntoView?.({ block: "center", behavior: "smooth" });
     setHighlightId(id);
@@ -320,7 +345,10 @@ export function ConciergeThread({
   // the follow chasing it. Guard 3 defers the scroll for the length of the gesture and guard 4
   // releases on the same `mouseup`, so the catch-up happens once, from the truth.
   const last = visible.length > 0 ? visible[visible.length - 1]! : undefined;
-  const totalLength = visible.reduce((n, m) => n + ("text" in m ? m.text.length : 0), 0);
+  const totalLength = visible.reduce(
+    (n, m) => n + ("text" in m ? m.text.length : 0),
+    0,
+  );
   const contentKey = `${visible.length}:${last?.id ?? ""}:${totalLength}:${typing ? 1 : 0}`;
   // The re-arm key is the newest message the USER sent — never "a user message exists". A thread the
   // user has ever typed in contains a `you` bubble forever, and the host hands this component a fresh
@@ -332,6 +360,39 @@ export function ConciergeThread({
     scrollRef,
   });
 
+  // ONE MESSAGE, DRAWN — extracted so the transcript and a folded run's expanded members go through
+  // the SAME call rather than two prop lists that drift. A receipt inside a fold must render exactly
+  // as it does outside one; the fold is a display grouping, not a different kind of row.
+  //
+  // NOT memoised, and it does not need to be: every prop below is either the message itself or a
+  // callback already stabilised above, and `ConciergeMessageRow` is `memo`'d on those props — so a
+  // settled entry still re-renders exactly never. See the row's header for why that inertness
+  // matters (a transcript that re-diffs on every token makes a click-drag selection stutter).
+  const renderRow = (m: ConciergeMessage) => (
+    // KEYED BY MESSAGE ID.
+    <ConciergeMessageRow
+      key={m.id}
+      message={m}
+      wired={wired}
+      shownBlockIds={shownIdsFor(m, shownAsText)}
+      onOpenPayload={openPayloadFor}
+      onNudgeClick={nudgeClick}
+      onNudgeAction={nudgeAction}
+      onRevealAgent={revealAgent}
+      onRedirect={redirect}
+      onDigestClick={digestClick}
+      onAnswerCopied={onAnswerCopied}
+      onMessageCopied={onMessageCopied}
+      answeredBy={m.kind === "you" ? answeredBy.get(m.id) : undefined}
+      // RESOLVED HERE, so the row never sees the map. See the `statuses` prop doc: handing
+      // down the container (or a closure over it) would defeat the memo for the whole
+      // transcript on every tick, which is what this component's stabilisation work is for.
+      status={m.kind === "you" ? statuses?.[m.id] : undefined}
+      highlighted={highlightId === m.id}
+      onJump={jumpTo}
+    />
+  );
+
   return (
     // THE POSITIONED ANCESTOR THE TOAST HANGS OFF, and the reason there is a wrapper at all. The
     // confirmation must not shift the layout by a pixel (PRD 1 §1), which rules out a flow element;
@@ -341,7 +402,13 @@ export function ConciergeThread({
     // ComposeBox's measurement of it, which finds the thread by testid from the section — is
     // unchanged.
     <div
-      style={{ position: "relative", flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}
+      style={{
+        position: "relative",
+        flex: 1,
+        minHeight: 0,
+        display: "flex",
+        flexDirection: "column",
+      }}
     >
       <div
         ref={scrollRef}
@@ -368,34 +435,22 @@ export function ConciergeThread({
           gap: 12,
         }}
       >
-        {visible.map((m) => (
-          // KEYED BY MESSAGE ID, and memoised (./ConciergeMessageRow). Every prop below either is
-          // the message itself — stable identity for anything that is not the bubble currently
-          // being streamed into — or a callback stabilised above, so a settled entry re-renders
-          // exactly never. That inertness is the point: see the row's header for why a transcript
-          // that re-diffs itself on every token makes a click-drag selection stutter.
-          <ConciergeMessageRow
-            key={m.id}
-            message={m}
-            wired={wired}
-            shownBlockIds={shownIdsFor(m, shownAsText)}
-            onOpenPayload={openPayloadFor}
-            onNudgeClick={nudgeClick}
-            onNudgeAction={nudgeAction}
-            onRevealAgent={revealAgent}
-            onRedirect={redirect}
-            onDigestClick={digestClick}
-            onAnswerCopied={onAnswerCopied}
-            onMessageCopied={onMessageCopied}
-            answeredBy={m.kind === "you" ? answeredBy.get(m.id) : undefined}
-            // RESOLVED HERE, so the row never sees the map. See the `statuses` prop doc: handing
-            // down the container (or a closure over it) would defeat the memo for the whole
-            // transcript on every tick, which is what this component's stabilisation work is for.
-            status={m.kind === "you" ? statuses?.[m.id] : undefined}
-            highlighted={highlightId === m.id}
-            onJump={jumpTo}
-          />
-        ))}
+        {/* FOLDED FIRST, DRAWN SECOND. `foldReceiptRuns` decides which rows collapse; every message
+            it does not fold comes through exactly as it always did, and the folded ones are the
+            SAME rows rendered inside a disclosure rather than different ones. A refused or partly
+            refused send is never foldable, so it keeps its own row here by construction rather than
+            by anything this JSX has to remember. */}
+        {foldReceiptRuns(visible).map((row) =>
+          row.type === "message" ? (
+            renderRow(row.message)
+          ) : (
+            // KEYED BY THE RUN'S FIRST MEMBER — a message id, so it is unique in the thread and
+            // stable while the run is.
+            <ReceiptRunRow key={row.id} run={row}>
+              {row.members.map((m) => renderRow(m))}
+            </ReceiptRunRow>
+          ),
+        )}
         {/* The pulse, plus what the concierge is actually doing when it is doing something the app
             observed AND no bubble is already saying it — see ThinkingIndicator and `activityClaimed`
             above. It falls back to exactly the bare "…" this used to be. */}
@@ -453,7 +508,9 @@ export function ConciergeThread({
             // The KEY that is open, not the block's own id — the set is keyed on the pair too, or
             // expanding one paste would expand every same-id block in the thread.
             const key = openPayloadId;
-            setShownAsText((prev) => (key === null ? prev : new Set(prev).add(key)));
+            setShownAsText((prev) =>
+              key === null ? prev : new Set(prev).add(key),
+            );
             setOpenPayloadId(null);
           }}
         />
