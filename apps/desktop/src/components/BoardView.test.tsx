@@ -2,7 +2,7 @@
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bead, Board } from "../services/beads";
-import type { Project } from "../types";
+import type { AgentTab, Project } from "../types";
 
 // Mock the beads store so no real `bd`/Tauri invoke happens. startPolling/stopPolling are spies;
 // the snapshot is whatever `snapshot` holds when the component reads it (selector form).
@@ -115,6 +115,9 @@ import { claimBead, labelBead, closeBead, markBeadDelivered } from "../services/
 import { useCriteriaStore } from "../services/criteriaStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useUiStore } from "../stores/uiStore";
+import { NO_BOARD_FILTER } from "../services/boardFilters";
+import { dismissibleSurfaceOpen, unbindsOnKey } from "../engine/cable";
+import { useCableStore } from "../stores/cableStore";
 import { waitFor } from "@testing-library/react";
 
 /** Point the mocked config at a defined "Done" (a single criterion of the given kind). */
@@ -314,6 +317,155 @@ describe("BoardView", () => {
     expect(screen.getByLabelText("Close")).toBeTruthy();
   });
 
+  // ══ ESCAPE CLOSES THE OVERLAY — AND MUST NOT COST THE CABLE ══════════════════════════════════
+  // Adding an Escape handler made this an Escape-owning surface. `engine/cable.ts` decides whether
+  // a press unbinds the concierge by PROBING THE DOM (`dismissibleSurfaceOpen`), and Workspace's
+  // listener is registered at app mount so it runs BEFORE this one. Without a marker the probe can
+  // see, rung 1 unwires the cable and arms rung 2, and the user's NEXT Escape clears the build row
+  // in every pair — the failure roborev 55478 was closed to prevent (roborev 59115, High).
+  describe("BoardView — the detail overlay's Escape contract", () => {
+    function overlaySnapshot() {
+      snapshot = {
+        beads: [],
+        board: {
+          backlog: [bead({ id: "p1-x1", title: "Detailed task", priority: 2 })],
+          blocked: [],
+          inProgress: [],
+          done: [],
+          delivered: [],
+        },
+        loadedAt: Date.now(),
+      };
+    }
+
+    it("marks the panel as a dismissible surface, so Escape does not unbind the cable", () => {
+      overlaySnapshot();
+      render(<BoardView project={project} side="right" />);
+      expect(dismissibleSurfaceOpen(document)).toBe(false);
+
+      fireEvent.click(screen.getByText("Detailed task"));
+      // THE ASSERTION THAT MATTERS: the cable's own probe must see this overlay. Asserting
+      // `role="dialog"` directly would pin the attribute; asserting the probe pins the BEHAVIOUR,
+      // and still fails if someone swaps the marker for one the selector does not list.
+      expect(dismissibleSurfaceOpen(document)).toBe(true);
+      // …which is what makes the cable decline to unbind on this press.
+      expect(unbindsOnKey({ ...useCableStore.getState() }, "Escape", { dismissibleOpen: true })).toBe(
+        false,
+      );
+    });
+
+    it("closes on Escape", () => {
+      overlaySnapshot();
+      render(<BoardView project={project} side="right" />);
+      fireEvent.click(screen.getByText("Detailed task"));
+      expect(screen.getByTestId("board-bead-card")).toBeTruthy();
+
+      fireEvent.keyDown(window, { key: "Escape" });
+      expect(screen.queryByTestId("board-bead-card")).toBeNull();
+    });
+
+    it("yields the press to an OPEN priority menu instead of closing underneath it", () => {
+      overlaySnapshot();
+      render(<BoardView project={project} side="right" />);
+      fireEvent.click(screen.getByText("Detailed task"));
+      // Open the priority menu — it is the innermost layer. The `-trigger` suffix matters: the bare
+      // testid is the wrapper span, and clicking that does nothing.
+      fireEvent.click(screen.getByTestId("board-bead-card-priority-trigger"));
+      expect(screen.getByTestId("board-bead-card-priority-menu")).toBeTruthy();
+
+      fireEvent.keyDown(window, { key: "Escape" });
+      // Same-phase listeners fire in REGISTRATION order, so this overlay's handler runs FIRST —
+      // without the beadCardMenuIsOpen() guard it would close the card out from under the menu and
+      // the menu's own defaultPrevented bail would swallow the press entirely.
+      expect(screen.getByTestId("board-bead-card")).toBeTruthy();
+    });
+
+    it("leaves a press another layer already claimed alone", () => {
+      overlaySnapshot();
+      render(<BoardView project={project} side="right" />);
+      fireEvent.click(screen.getByText("Detailed task"));
+
+      const e = new KeyboardEvent("keydown", { key: "Escape", cancelable: true });
+      e.preventDefault();
+      window.dispatchEvent(e);
+      expect(screen.getByTestId("board-bead-card")).toBeTruthy();
+    });
+  });
+
+  // The batch button is gated on the bead being an EPIC, not merely on its body naming a PRD.
+  // `parsePrdRef` matches a "PRD file:" line in ANY body, so a task carrying a back-link resolved a
+  // non-empty prdEpics — and a length-only gate offered "Build all N epics in this PRD" on a card
+  // for a bead that is not one of them, one press from claiming every epic in that PRD.
+  it("does NOT offer build-all-PRD on a non-epic that merely links a PRD", () => {
+    const prd = "PRD file: PRD/2026-06-27-build-the-app.md";
+    const task = bead({ id: "p1-t1", title: "A mere task", type: "task", description: prd });
+    const e1 = bead({ id: "p1-e1", title: "Epic one", type: "epic", description: prd });
+    const e2 = bead({ id: "p1-e2", title: "Epic two", type: "epic", description: prd });
+    snapshot = {
+      beads: [task, e1, e2],
+      board: { backlog: [task, e1, e2], blocked: [], inProgress: [], done: [], delivered: [] },
+      loadedAt: Date.now(),
+    };
+    render(<BoardView project={project} side="right" />);
+    fireEvent.click(screen.getByText("A mere task"));
+    // Two epics DO share this PRD, so a length-only gate would render the batch button here.
+    expect(screen.queryByTestId("board-bead-card-build-all-prd")).toBeNull();
+    // The single-bead Build It is still correct for a task.
+    expect(screen.getByTestId("board-bead-card-build-it")).toBeTruthy();
+  });
+
+  // ══ THE OPEN CARD FOLLOWS THE POLL ═══════════════════════════════════════════════════════════
+  // The overlay used to hold the clicked Bead OBJECT, and `beadsStore` replaces its snapshot
+  // wholesale every 5s — so an open card was a photograph. That silently broke the priority write:
+  // `BeadCard` clears its optimistic value only when `bead.priority` agrees, an acknowledgement a
+  // frozen object can never deliver (knightwatch probe 5199421526#6).
+  it("shows the LATEST bead, not the one captured at click time", () => {
+    const before = bead({ id: "p1-x1", title: "Old title", priority: 3 });
+    snapshot = {
+      beads: [before],
+      board: { backlog: [before], blocked: [], inProgress: [], done: [], delivered: [] },
+      loadedAt: Date.now(),
+    };
+    const { rerender } = render(<BoardView project={project} side="right" />);
+    fireEvent.click(screen.getByText("Old title"));
+    expect(screen.getByTestId("board-bead-card")).toBeTruthy();
+
+    // A poll lands with a NEW title and priority for the same id.
+    const after = bead({ id: "p1-x1", title: "New title", priority: 0 });
+    snapshot = {
+      beads: [after],
+      board: { backlog: [after], blocked: [], inProgress: [], done: [], delivered: [] },
+      loadedAt: Date.now() + 1,
+    };
+    rerender(<BoardView project={project} side="right" />);
+
+    // The OPEN card re-reads it. Holding the object showed "Old title" forever.
+    const card = screen.getByTestId("board-bead-card");
+    expect(card.textContent).toContain("New title");
+    expect(card.textContent).not.toContain("Old title");
+  });
+
+  it("closes the overlay when the bead leaves the board entirely", () => {
+    const b = bead({ id: "p1-x1", title: "Vanishing" });
+    snapshot = {
+      beads: [b],
+      board: { backlog: [b], blocked: [], inProgress: [], done: [], delivered: [] },
+      loadedAt: Date.now(),
+    };
+    const { rerender } = render(<BoardView project={project} side="right" />);
+    fireEvent.click(screen.getByText("Vanishing"));
+    expect(screen.getByTestId("board-bead-card")).toBeTruthy();
+
+    snapshot = {
+      beads: [],
+      board: { backlog: [], blocked: [], inProgress: [], done: [], delivered: [] },
+      loadedAt: Date.now() + 1,
+    };
+    rerender(<BoardView project={project} side="right" />);
+    // A detail card for a bead the board no longer has would contradict everything else on screen.
+    expect(screen.queryByTestId("board-bead-card")).toBeNull();
+  });
+
   it("has no free-form edit controls — no inputs, selects, or textareas", () => {
     const { container } = render(<BoardView project={project} side="right" />);
     // No edit controls anywhere on the board (buttons exist: cards open detail, epics get Start).
@@ -367,8 +519,11 @@ describe("BoardView — Build It (epic handoff)", () => {
     snapshot = epicSnapshot("Ship the app.");
     render(<BoardView project={project} side="right" />);
     fireEvent.click(screen.getByText("Build the app"));
-    const statusRow = screen.getByText("not started").parentElement as HTMLElement;
-    fireEvent.click(within(statusRow).getByText("Build It"));
+    // BY TESTID. This used to walk up from the epic status pill ("not started") to find a sibling
+    // Build It — a pill the unified card replaced with the workflow stage, per the founder's call
+    // that the Think→Plan→Build vocabulary wins. The card exposes the button directly, which also
+    // disambiguates it from the backlog CARD's own Build It without any DOM walking.
+    fireEvent.click(screen.getByTestId("board-bead-card-build-it"));
 
     await waitFor(() => expect(screen.getByText(/8 of its 8 agent slots/)).toBeTruthy());
     expect(sendToBuild).not.toHaveBeenCalled();
@@ -386,8 +541,11 @@ describe("BoardView — Build It (epic handoff)", () => {
     snapshot = epicSnapshot("Ship the app.");
     render(<BoardView project={project} side="right" />);
     fireEvent.click(screen.getByText("Build the app"));
-    const statusRow = screen.getByText("not started").parentElement as HTMLElement;
-    fireEvent.click(within(statusRow).getByText("Build It"));
+    // BY TESTID. This used to walk up from the epic status pill ("not started") to find a sibling
+    // Build It — a pill the unified card replaced with the workflow stage, per the founder's call
+    // that the Think→Plan→Build vocabulary wins. The card exposes the button directly, which also
+    // disambiguates it from the backlog CARD's own Build It without any DOM walking.
+    fireEvent.click(screen.getByTestId("board-bead-card-build-it"));
 
     // SETTLE the handler before returning: it now suspends at `await claimBead(...)`, so without
     // this its continuation (sendToBuild / onClose / setBuildBusy) runs after the test body — outside
@@ -397,9 +555,14 @@ describe("BoardView — Build It (epic handoff)", () => {
 
     const epicCall = blockedReasonMock.mock.calls.at(-1)!;
     expect(epicCall[1]).toBe("p1-e1");
-    // `?? "epic"` would have passed for `undefined` too, so it could not fail against a call site
-    // that passed nothing — assert the absence directly (roborev 55155).
-    expect(epicCall[2]).toBeUndefined();
+    // NOW EXPLICITLY "epic", where this used to assert the absence of a mode.
+    //
+    // The original assertion existed because the call site passed NOTHING and leaned on the
+    // preflight's "epic" default, so `?? "epic"` would have passed against `undefined` too
+    // (roborev 55155). The shared hook states the mode on both paths, which removes the ambiguity
+    // that assertion was defending against rather than weakening it — and this still fails if the
+    // epic path ever starts announcing itself as a task, which is the fact the row is here to pin.
+    expect(epicCall[2]).toBe("epic");
   });
 
   // The build-all LOOP: the ceiling can be reached partway through a batch, and claiming an epic we
@@ -423,7 +586,7 @@ describe("BoardView — Build It (epic handoff)", () => {
 
     render(<BoardView project={project} side="right" />);
     fireEvent.click(screen.getByText("Epic one")); // open the detail overlay
-    fireEvent.click(screen.getByTitle("Claim and build all 2 epics that share this PRD"));
+    fireEvent.click(screen.getByTestId("board-bead-card-build-all-prd"));
 
     // Stopped partway, and SAID so — the number is what tells the user the batch is incomplete.
     await waitFor(() => expect(screen.getByText(/Started 1 of 2/)).toBeTruthy());
@@ -461,9 +624,7 @@ describe("BoardView — Build It (epic handoff)", () => {
     render(<BoardView project={project} side="right" />);
     fireEvent.click(screen.getByText("Another small task"));
     fireEvent.click(
-      screen.getByTitle(
-        "Build It — build this single task on one isolated worker branch, then verify and integrate it",
-      ),
+      screen.getByTestId("board-bead-card-build-it"),
     );
 
     await waitFor(() => expect(screen.getByText(/Building this task/)).toBeTruthy());
@@ -487,9 +648,7 @@ describe("BoardView — Build It (epic handoff)", () => {
     render(<BoardView project={project} side="right" />);
     fireEvent.click(screen.getByText("One small task")); // open the detail overlay
     fireEvent.click(
-      screen.getByTitle(
-        "Build It — build this single task on one isolated worker branch, then verify and integrate it",
-      ),
+      screen.getByTestId("board-bead-card-build-it"),
     );
 
     // Same reason as above: settle the async handler inside the test.
@@ -506,11 +665,17 @@ describe("BoardView — Build It (epic handoff)", () => {
     snapshot = epicSnapshot("Ship the app.\n\nPRD file: PRD/2026-06-27-build-the-app.md");
     render(<BoardView project={project} side="right" />);
     fireEvent.click(screen.getByText("Build the app")); // open the epic's detail overlay
-    expect(screen.getByText("not started")).toBeTruthy(); // rollup of an epic with no children
+    // The epic rollup pill ("not started") is gone; the unified card states progress in the
+    // Think→Plan→Build vocabulary instead — one status vocabulary across every surface, which was
+    // the point. An open epic with no worker reads "Planned".
+    expect(screen.getByTestId("board-bead-card-stage-label").textContent).toBe("Planned");
     // The backlog card ALSO carries a "Build It" (renamed from Start), so scope the click to the
     // overlay's status row — the "not started" pill and the overlay's Build It button are siblings.
-    const statusRow = screen.getByText("not started").parentElement as HTMLElement;
-    fireEvent.click(within(statusRow).getByText("Build It"));
+    // BY TESTID. This used to walk up from the epic status pill ("not started") to find a sibling
+    // Build It — a pill the unified card replaced with the workflow stage, per the founder's call
+    // that the Think→Plan→Build vocabulary wins. The card exposes the button directly, which also
+    // disambiguates it from the backlog CARD's own Build It without any DOM walking.
+    fireEvent.click(screen.getByTestId("board-bead-card-build-it"));
     // AWAITED: with the store seeded, `await claimBead(...)` genuinely runs before the handoff, so
     // this is a microtask later. It only read as synchronous while the claim was dead code.
     await waitFor(() =>
@@ -518,6 +683,11 @@ describe("BoardView — Build It (epic handoff)", () => {
         projectId: "p1",
         epicId: "p1-e1",
         prdPath: "PRD/2026-06-27-build-the-app.md",
+        // EXPLICIT now. The old call site omitted `mode` and leaned on sendToBuild's "epic"
+        // default; the shared hook states it. Behaviourally identical (sendToBuild.ts branches
+        // only on `=== "task"`), and stating it is what roborev 55145 asked for after an omitted
+        // mode made a single-task build announce itself as a plan.
+        mode: "epic",
       }),
     );
     // …and the claim really happened, which the null-rootPath fixture could never show.
@@ -530,10 +700,18 @@ describe("BoardView — Build It (epic handoff)", () => {
     snapshot = epicSnapshot("no PRD link in this body");
     render(<BoardView project={project} side="right" />);
     fireEvent.click(screen.getByText("Build the app"));
-    const statusRow = screen.getByText("not started").parentElement as HTMLElement;
-    fireEvent.click(within(statusRow).getByText("Build It"));
+    // BY TESTID. This used to walk up from the epic status pill ("not started") to find a sibling
+    // Build It — a pill the unified card replaced with the workflow stage, per the founder's call
+    // that the Think→Plan→Build vocabulary wins. The card exposes the button directly, which also
+    // disambiguates it from the backlog CARD's own Build It without any DOM walking.
+    fireEvent.click(screen.getByTestId("board-bead-card-build-it"));
     await waitFor(() =>
-      expect(sendToBuild).toHaveBeenCalledWith({ projectId: "p1", epicId: "p1-e1", prdPath: null }),
+      expect(sendToBuild).toHaveBeenCalledWith({
+        projectId: "p1",
+        epicId: "p1-e1",
+        prdPath: null,
+        mode: "epic",
+      }),
     );
   });
 });
@@ -819,16 +997,83 @@ describe("BoardView — per-agent feedback filter (feedback-pill-and-filter)", (
     expect(screen.queryByText("Someone elses bead")).toBeNull();
   });
 
-  it("shows a clearable banner naming the agent, and Clear restores the full board", () => {
+  it("shows a clearable banner, and Clear restores the full board", () => {
     labeledSnapshot();
     useUiStore.getState().setBoardAgentFilter("right", "agent-x");
     render(<BoardView project={project} side="right" />);
     const banner = screen.getByTestId("board-agent-filter-banner");
+    // No agent by that id is registered on the project here, so this exercises the CLOSED-AGENT
+    // fallback — see the two tests below, which pin each branch explicitly.
     expect(banner.textContent).toContain("agent-x");
     // Clear drops the filter → the store goes null AND the hidden bead comes back.
     fireEvent.click(within(banner).getByText("Clear"));
     expect(useUiStore.getState().boardAgentFilterBySide.right).toBeNull();
     expect(screen.getByText("Someone elses bead")).toBeTruthy();
+  });
+
+  // ── THE BANNER NAMES THE AGENT, NOT ITS UUID ────────────────────────────────────────────────
+  // The founder's report: 'it tells me "Showing feedback from agent a4e23b93-0b03-…" but I need to
+  // know what that agent name is'. The id was always resolvable — `agents` is scoped to this
+  // board's project and already read for the worker rows — so this is a lookup that was simply
+  // never done, not missing data.
+  //
+  // MUTATION TARGET: reverting the banner to `{boardAgentFilter}` makes the name assertion fail AND
+  // the not-the-uuid assertion fail. A test that only asserted the name were present would stay
+  // green if both were printed, so the negative is the load-bearing half.
+  it("resolves the filtered agent's id to its DISPLAY NAME and does not print the uuid", () => {
+    labeledSnapshot();
+    const agentId = "a4e23b93-0b03-4be8-bd6f-f8c5df274c84";
+    const mine = bead({ id: "p1-mine", title: "My feedback bead", labels: [`agent:${agentId}`] });
+    snapshot = {
+      beads: [mine],
+      board: { backlog: [mine], blocked: [], inProgress: [], done: [], delivered: [] },
+      loadedAt: Date.now(),
+    };
+    useProjectStore.setState({
+      projects: [
+        {
+          ...project,
+          agents: [
+            {
+              id: agentId,
+              name: "Stripe Checkout Flow",
+              namePinned: true,
+              selfNamed: false,
+              aiTitle: null,
+              autoNameVariants: null,
+            } as AgentTab,
+          ],
+        },
+      ],
+      selectedProjectId: project.id,
+    });
+    useUiStore.getState().setBoardAgentFilter("right", agentId);
+    render(<BoardView project={project} side="right" />);
+
+    const label = screen.getByTestId("board-agent-filter-label");
+    expect(label.textContent).toContain("Stripe Checkout Flow");
+    // The whole point: the uuid is GONE from the banner.
+    expect(label.textContent).not.toContain(agentId);
+  });
+
+  // The agent was closed, or the project switched under an open board. The filter is NOT cleared
+  // (the beads are still labelled `agent:<id>`, so the board really is narrowed and this banner is
+  // the only explanation for why) — but it must say so in words rather than printing a bare uuid as
+  // if it were a name, and it must never render an empty <strong>.
+  it("says the agent is closed, with a truncated id, when the id does not resolve", () => {
+    labeledSnapshot();
+    useUiStore.getState().setBoardAgentFilter("right", "a4e23b93-0b03-4be8-bd6f-f8c5df274c84");
+    render(<BoardView project={project} side="right" />);
+
+    const label = screen.getByTestId("board-agent-filter-label");
+    expect(label.textContent).toContain("closed agent");
+    expect(label.textContent).toContain("a4e23b93");
+    // Truncated, not the whole uuid.
+    expect(label.textContent).not.toContain("f8c5df274c84");
+    // The filter survives — dropping it would leave a silently short board.
+    expect(useUiStore.getState().boardAgentFilterBySide.right).toBe(
+      "a4e23b93-0b03-4be8-bd6f-f8c5df274c84",
+    );
   });
 
   it("renders the full board (and NO banner) when no filter is set", () => {
@@ -837,6 +1082,158 @@ describe("BoardView — per-agent feedback filter (feedback-pill-and-filter)", (
     expect(screen.queryByTestId("board-agent-filter-banner")).toBeNull();
     expect(screen.getByText("My feedback bead")).toBeTruthy();
     expect(screen.getByText("Someone elses bead")).toBeTruthy();
+  });
+});
+
+// ── PRIORITY + DATE-RANGE FILTER ──────────────────────────────────────────────────────────────
+// The founder: "I want to be able to only look at cards of a certain priority status and also a
+// certain date range." The rules themselves are unit-tested in services/boardFilters.test.ts; what
+// these cover is that BoardView actually APPLIES them, and that an emptied board explains itself.
+describe("BoardView — priority and date filters", () => {
+  afterEach(() => {
+    useUiStore.getState().setBoardFilter("right", NO_BOARD_FILTER);
+  });
+
+  const RECENT = new Date(Date.now() - 3600_000).toISOString();
+  const OLD = new Date(Date.now() - 60 * 24 * 3600_000).toISOString();
+
+  function mixedSnapshot() {
+    const p0 = bead({ id: "p1-p0", title: "Urgent one", priority: 0, updatedAt: RECENT });
+    const p2 = bead({ id: "p1-p2", title: "Later one", priority: 2, updatedAt: RECENT });
+    const stale = bead({ id: "p1-old", title: "Ancient one", priority: 0, updatedAt: OLD });
+    snapshot = {
+      beads: [p0, p2, stale],
+      board: { backlog: [p0, p2, stale], blocked: [], inProgress: [], done: [], delivered: [] },
+      loadedAt: Date.now(),
+    };
+  }
+
+  // MUTATION TARGET: dropping `matchesBoardFilter` from BoardView's keep() renders all three.
+  it("shows only the selected priority and hides the others", () => {
+    mixedSnapshot();
+    useUiStore.getState().setBoardFilter("right", { ...NO_BOARD_FILTER, priority: 0 });
+    render(<BoardView project={project} side="right" />);
+    expect(screen.getByText("Urgent one")).toBeTruthy();
+    expect(screen.getByText("Ancient one")).toBeTruthy();
+    expect(screen.queryByText("Later one")).toBeNull();
+  });
+
+  it("applies the date window, and the created/updated switch selects which date", () => {
+    mixedSnapshot();
+    useUiStore.getState().setBoardFilter("right", { ...NO_BOARD_FILTER, dateWindow: "24h" });
+    const { unmount } = render(<BoardView project={project} side="right" />);
+    expect(screen.getByText("Urgent one")).toBeTruthy();
+    // 60 days old on `updatedAt` — outside a 24h window.
+    expect(screen.queryByText("Ancient one")).toBeNull();
+    unmount();
+
+    // The same bead has NO createdAt, and an unreadable date must KEEP a bead rather than hide it
+    // (sparkle-qogah). Flipping the field therefore brings it back.
+    useUiStore
+      .getState()
+      .setBoardFilter("right", { ...NO_BOARD_FILTER, dateWindow: "24h", dateField: "created" });
+    render(<BoardView project={project} side="right" />);
+    expect(screen.getByText("Ancient one")).toBeTruthy();
+  });
+
+  it("both axes combine — a recent bead of the wrong priority is still hidden", () => {
+    mixedSnapshot();
+    useUiStore
+      .getState()
+      .setBoardFilter("right", { ...NO_BOARD_FILTER, priority: 0, dateWindow: "24h" });
+    render(<BoardView project={project} side="right" />);
+    expect(screen.getByText("Urgent one")).toBeTruthy();
+    expect(screen.queryByText("Later one")).toBeNull(); // recent, wrong priority
+    expect(screen.queryByText("Ancient one")).toBeNull(); // right priority, too old
+  });
+
+  // ══ AN EMPTIED BOARD MUST SAY WHY ═══════════════════════════════════════════════════════════
+  // Five empty columns read as "this project has no work". The count is the honest part: it says
+  // the cards exist and the filter is why they are not on screen.
+  it("explains an emptied board and reports how many cards are hidden", () => {
+    mixedSnapshot();
+    // No bead has priority 3, so everything is filtered out.
+    useUiStore.getState().setBoardFilter("right", { ...NO_BOARD_FILTER, priority: 3 });
+    render(<BoardView project={project} side="right" />);
+
+    const notice = screen.getByTestId("board-filter-empty-notice");
+    expect(notice.textContent).toContain("No cards match this filter");
+    expect(notice.textContent).toContain("3");
+    // And Clear restores every card.
+    fireEvent.click(within(notice).getByText("Clear filters"));
+    expect(screen.getByText("Urgent one")).toBeTruthy();
+    expect(screen.getByText("Later one")).toBeTruthy();
+    expect(screen.getByText("Ancient one")).toBeTruthy();
+  });
+
+  // A PARTIAL narrow is self-evident — cards are on screen — so the notice must not fire. Without
+  // this the banner would appear over a board that is visibly working.
+  it("shows NO empty notice while the filter still leaves cards on screen", () => {
+    mixedSnapshot();
+    useUiStore.getState().setBoardFilter("right", { ...NO_BOARD_FILTER, priority: 0 });
+    render(<BoardView project={project} side="right" />);
+    expect(screen.queryByTestId("board-filter-empty-notice")).toBeNull();
+  });
+
+  // ══ THE TWO FILTERS STACK, AND THE NOTICE MUST ONLY SPEAK FOR ITS OWN ═══════════════════════
+  // The agent filter and the priority/date filter sit on the same seam. Measuring the doubly
+  // filtered board against the UNfiltered snapshot attributes the agent filter's removals to this
+  // notice (roborev 59075). Both rows below failed before the baseline was moved.
+  describe("with the per-agent feedback filter ALSO active", () => {
+    afterEach(() => {
+      useUiStore.getState().setBoardAgentFilter("right", null);
+    });
+
+    function stackedSnapshot() {
+      // 4 beads; only 1 belongs to agent-x; that one is P2.
+      const mine = bead({ id: "p1-m", title: "Mine P2", priority: 2, labels: ["agent:agent-x"] });
+      const others = [1, 2, 3].map((n) =>
+        bead({ id: `p1-o${n}`, title: `Other ${n}`, priority: 0, labels: ["agent:agent-y"] }),
+      );
+      const all = [mine, ...others];
+      snapshot = {
+        beads: all,
+        board: { backlog: all, blocked: [], inProgress: [], done: [], delivered: [] },
+        loadedAt: Date.now(),
+      };
+    }
+
+    it("counts only what the PRIORITY filter hid, not the agent filter's removals", () => {
+      stackedSnapshot();
+      useUiStore.getState().setBoardAgentFilter("right", "agent-x");
+      // The agent filter leaves 1 bead (P2); filtering to P0 hides that ONE.
+      useUiStore.getState().setBoardFilter("right", { ...NO_BOARD_FILTER, priority: 0 });
+      render(<BoardView project={project} side="right" />);
+
+      const notice = screen.getByTestId("board-filter-empty-notice");
+      // ONE, not four. The other three were never this filter's to hide.
+      expect(notice.textContent).toContain("1");
+      expect(notice.textContent).not.toContain("4");
+    });
+
+    it("stays silent when the AGENT filter is what emptied the board", () => {
+      stackedSnapshot();
+      // No bead carries this agent, so the agent filter alone empties the board…
+      useUiStore.getState().setBoardAgentFilter("right", "agent-nobody");
+      // …while a board filter is set but is not the cause.
+      useUiStore.getState().setBoardFilter("right", { ...NO_BOARD_FILTER, priority: 0 });
+      render(<BoardView project={project} side="right" />);
+
+      // Firing here would blame the wrong control AND offer a "Clear filters" button that resets
+      // only boardFilter — leaving the board just as empty. The agent banner above owns this case.
+      expect(screen.queryByTestId("board-filter-empty-notice")).toBeNull();
+      expect(screen.getByTestId("board-agent-filter-banner")).toBeTruthy();
+    });
+  });
+
+  it("shows NO empty notice when the board is genuinely empty and no filter is set", () => {
+    snapshot = {
+      beads: [],
+      board: { backlog: [], blocked: [], inProgress: [], done: [], delivered: [] },
+      loadedAt: Date.now(),
+    };
+    render(<BoardView project={project} side="right" />);
+    expect(screen.queryByTestId("board-filter-empty-notice")).toBeNull();
   });
 });
 

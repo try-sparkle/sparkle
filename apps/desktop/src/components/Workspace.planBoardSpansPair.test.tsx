@@ -221,6 +221,36 @@ describe("the Plan board takes over the whole pair", () => {
     expect(screen.getByTestId("terminal-stage-left")).toBeTruthy();
   });
 
+  // ── THE BOARD'S TOGGLE IS THE MINI CHICLET, NOT THE WIDE CHEVRON ────────────────────────────
+  // The founder: "on the plan board it should have a build plan toggle that looks the same as it
+  // does on the build board. Right now it's got the old Chevron." `PlanBuildToggle` already had
+  // both variants — the Build header renders `mini` and the board was simply never passing it.
+  //
+  // `plan-build-mini` is the real component's own testid (PlanBuildToggle is deliberately NOT
+  // stubbed in this file), so this asserts the VARIANT that actually rendered. MUTATION TARGET:
+  // dropping `variant="mini"` in PlanBoardSlot brings the chevron back and fails this.
+  it("renders the mini slider chiclet (the Build board's control), not the wide chevron", () => {
+    render(<Workspace />);
+    planOn("left");
+
+    const overlay = planColumn("left");
+    expect(overlay.querySelector("[data-testid='plan-build-mini']")).toBeTruthy();
+  });
+
+  // Top right on BOTH sides. This used to align to the pair's inboard edge — right for the left
+  // pair, left for the right pair — which the founder overruled ("just have it be top right").
+  it("puts the toggle at the top right of either pair", () => {
+    render(<Workspace />);
+    for (const side of ["left", "right"] as const) {
+      planOn(side);
+      const mini = planColumn(side).querySelector("[data-testid='plan-build-mini']");
+      expect(mini).toBeTruthy();
+      // The flex row that positions it is the toggle's parent.
+      const row = mini!.parentElement as HTMLElement;
+      expect(row.style.justifyContent).toBe("flex-end");
+    }
+  });
+
   // ── 3 ── THE LAYOUT IS NOT SPENT. This is the "do not lose his layout" requirement, and the
   // strongest form of it available in jsdom: nothing UNMOUNTS across the flip (same DOM nodes, so
   // no column is re-created and no PTY torn down) and no stored width is rewritten.

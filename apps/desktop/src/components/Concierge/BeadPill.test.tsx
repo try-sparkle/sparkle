@@ -33,6 +33,14 @@ vi.mock("../../services/beads", async (importOriginal) => {
     ensureBeadsDb: (...a: unknown[]) => ensureBeadsDb(...a),
   };
 });
+// The card's priority control performs a REAL write through `beads_update`, which reaches Tauri.
+// Mocked at the command seam rather than at `invoke`, so the assertion can be on the patch the
+// command receives — the thing that has to be right for `bd` to accept it.
+const beadsUpdate = vi.fn();
+vi.mock("../../services/beadsCommands", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../services/beadsCommands")>();
+  return { ...actual, beadsUpdate: (...a: unknown[]) => beadsUpdate(...a) };
+});
 import { Markdown } from "../Markdown";
 import { ConciergeThread } from "./ConciergeThread";
 import { BeadPillHost, BeadPillProvider, type BeadPillContextValue } from "./BeadPill";
@@ -778,5 +786,206 @@ describe("BeadPill — what the linkifier leaves alone", () => {
   it("leaves a dangerous scheme inert", () => {
     const { container } = mountMarkdown(ctx([T6]), "[x](javascript:alert(1))");
     expect(container.querySelector("a")!.hasAttribute("href")).toBe(false);
+  });
+});
+
+// ── 7. THE CARD IS THE BOARD'S CARD ─────────────────────────────────────────────────────────────
+//
+// The founder's ask, verbatim: "I want the card on the concierge column to look exactly like the
+// card when it's in an open state on the actual plan board, with one exception: it would scroll
+// after a certain height." These rows assert the fields that were MISSING from the concierge card,
+// which is what "exactly like" cashes out to.
+
+describe("BeadPill — the card is the shared BeadCard", () => {
+  it("shows the workflow status line and its stage word", () => {
+    mountMarkdown(ctx([T6]), "see sparkle-t6wje");
+    fireEvent.click(pills()[0]!);
+    // THE REGRESSION THIS WHOLE BEAD IS ABOUT. The line was on the board's collapsed card, vanished
+    // when it opened, and had never existed here at all.
+    expect(screen.getByTestId("concierge-bead-card-stage")).not.toBeNull();
+    expect(screen.getByTestId("concierge-bead-card-stage-label").textContent).toBe("Planned");
+  });
+
+  it("shows the bead id, which the concierge card never had", () => {
+    mountMarkdown(ctx([T6]), "see sparkle-t6wje");
+    fireEvent.click(pills()[0]!);
+    expect(screen.getByTestId("concierge-bead-card-id").textContent).toBe("sparkle-t6wje");
+  });
+
+  it("shows labels and the parent epic", () => {
+    mountMarkdown(
+      ctx([bead({ id: "sparkle-t6wje", labels: ["ui", "concierge"], parent: "sparkle-epic1" })]),
+      "see sparkle-t6wje",
+    );
+    fireEvent.click(pills()[0]!);
+    expect(screen.getByTestId("concierge-bead-card-labels").textContent).toBe("ui, concierge");
+    expect(screen.getByTestId("concierge-bead-card-parent").textContent).toBe("sparkle-epic1");
+  });
+
+  // The founder explicitly KEPT 180px when it was reconsidered at 90. jsdom has no layout engine,
+  // so the style value is the fact — a measured height would be all zeroes.
+  it("keeps the 180px description clamp", () => {
+    mountMarkdown(ctx([bead({ id: "sparkle-t6wje", description: "line\n".repeat(500) })]), "see sparkle-t6wje");
+    fireEvent.click(pills()[0]!);
+    expect(screen.getByTestId("concierge-bead-card-description").style.maxHeight).toBe("180px");
+  });
+});
+
+// ── 8. THE CARD IS NO LONGER A DEAD END ─────────────────────────────────────────────────────────
+//
+// The only way out used to be clicking the SAME pill again — "a dead end nobody discovers". Each
+// row below asserts the card is GONE from the DOM, not that a listener was registered.
+
+describe("BeadPill — Escape and click-outside close the card", () => {
+  it("closes on Escape, and consumes the press", () => {
+    mountMarkdown(ctx([T6]), "see sparkle-t6wje");
+    fireEvent.click(pills()[0]!);
+    expect(card()).not.toBeNull();
+    // WRAPPED IN `act`, or the listener's state change is never flushed and a correct component
+    // reads as a red row.
+    const e = new KeyboardEvent("keydown", { key: "Escape", cancelable: true, bubbles: true });
+    act(() => {
+      window.dispatchEvent(e);
+    });
+    expect(card()).toBeNull();
+    // Cable etiquette: one press peels ONE layer, so the press is consumed on the way out.
+    expect(e.defaultPrevented).toBe(true);
+  });
+
+  it("leaves an Escape a layer above already consumed alone", () => {
+    mountMarkdown(ctx([T6]), "see sparkle-t6wje");
+    fireEvent.click(pills()[0]!);
+    const e = new KeyboardEvent("keydown", { key: "Escape", cancelable: true, bubbles: true });
+    e.preventDefault();
+    act(() => {
+      window.dispatchEvent(e);
+    });
+    expect(card()).not.toBeNull();
+  });
+
+  it("closes on a press outside it", () => {
+    mountMarkdown(ctx([T6]), "see sparkle-t6wje");
+    fireEvent.click(pills()[0]!);
+    fireEvent.mouseDown(document.body);
+    expect(card()).toBeNull();
+  });
+
+  it("stays open on a press INSIDE it", () => {
+    mountMarkdown(ctx([T6]), "see sparkle-t6wje");
+    fireEvent.click(pills()[0]!);
+    fireEvent.mouseDown(screen.getByTestId("concierge-bead-card-title"));
+    expect(card()).not.toBeNull();
+  });
+
+  // THE ANCHOR-CONTAINS GUARD. Without it the capture-phase mousedown ALSO sees the pill's own
+  // press, closes the card, and the click handler immediately reopens it — one gesture, no visible
+  // response, and the pill would appear never to close.
+  it("still toggles shut from the pill itself, in one gesture", () => {
+    mountMarkdown(ctx([T6]), "see sparkle-t6wje");
+    fireEvent.click(pills()[0]!);
+    expect(card()).not.toBeNull();
+    fireEvent.mouseDown(pills()[0]!);
+    fireEvent.click(pills()[0]!);
+    expect(card()).toBeNull();
+  });
+
+  // Registered ONLY while open: a thread can hold dozens of pills, and a listener each for a card
+  // nobody opened is a real cost.
+  it("registers no listener while the card is shut", () => {
+    const add = vi.spyOn(window, "addEventListener");
+    mountMarkdown(ctx([T6]), "see sparkle-t6wje");
+    const keys = add.mock.calls.filter((c) => c[0] === "keydown" || c[0] === "mousedown");
+    expect(keys).toHaveLength(0);
+    add.mockRestore();
+  });
+});
+
+// ── 9. THE PRIORITY WRITE, END TO END ───────────────────────────────────────────────────────────
+
+describe("BeadPill — picking a priority writes it through beads_update", () => {
+  const PROJECT: Project = {
+    id: "p1",
+    name: "sparkle",
+    rootPath: "/tmp/sparkle",
+    defaultBranch: "main",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    agents: [],
+    selectedAgentId: null,
+  };
+
+  function mountHostedWithProject(beads: Bead[]) {
+    act(() => {
+      useSettingsStore.setState({ beadsEnabled: true });
+      useProjectStore.setState({ projects: [PROJECT], selectedProjectId: "p1" });
+      useBeadsStore.setState({ byProject: { p1: { beads, board: {} as never, loadedAt: 1 } } });
+    });
+    return render(
+      <BeadPillHost>
+        <Markdown text="see sparkle-t6wje" />
+      </BeadPillHost>,
+    );
+  }
+
+  // THE SIDE EFFECT, through the REAL wiring: pill → card → menu → `beadsUpdate`. Asserting that a
+  // menu option rendered would pass against a pill connected to nothing.
+  it("calls beadsUpdate with the project path and the picked priority", async () => {
+    beadsUpdate.mockResolvedValue(undefined);
+    mountHostedWithProject([bead({ id: "sparkle-t6wje", priority: 0 })]);
+    fireEvent.click(pills()[0]!);
+    fireEvent.click(screen.getByTestId("concierge-bead-card-priority-trigger"));
+    fireEvent.click(screen.getByTestId("concierge-bead-card-priority-option-1"));
+    await waitFor(() =>
+      expect(beadsUpdate).toHaveBeenCalledWith("/tmp/sparkle", "sparkle-t6wje", { priority: "1" }),
+    );
+  });
+
+  // `bd` is heavily contended — a timed-out write is the LIKELY failure here, and "try again in a
+  // moment" is the whole remedy, which a generic message hides.
+  it("names a bd timeout specifically, and rolls the pill back", async () => {
+    beadsUpdate.mockRejectedValue({ kind: "timeout", message: "timed out", exitCode: null });
+    mountHostedWithProject([bead({ id: "sparkle-t6wje", priority: 0 })]);
+    fireEvent.click(pills()[0]!);
+    fireEvent.click(screen.getByTestId("concierge-bead-card-priority-trigger"));
+    fireEvent.click(screen.getByTestId("concierge-bead-card-priority-option-2"));
+    await waitFor(() =>
+      expect(screen.getByTestId("concierge-bead-card-error").textContent).toBe(
+        "bd is busy — priority not saved",
+      ),
+    );
+    expect(
+      screen.getByTestId("concierge-bead-card-priority-trigger").getAttribute("data-priority"),
+    ).toBe("0");
+  });
+
+  // The priority menu PORTALS to document.body, so in DOM ancestry it is outside the card. Without
+  // the card's menu-aware guard, picking a priority would close the card under the click.
+  it("does not close the card when the press lands on the portaled menu", () => {
+    beadsUpdate.mockResolvedValue(undefined);
+    mountHostedWithProject([bead({ id: "sparkle-t6wje", priority: 0 })]);
+    fireEvent.click(pills()[0]!);
+    fireEvent.click(screen.getByTestId("concierge-bead-card-priority-trigger"));
+    fireEvent.mouseDown(screen.getByTestId("concierge-bead-card-priority-option-1"));
+    expect(card()).not.toBeNull();
+  });
+
+  // Escape with the menu open peels the MENU, not the card — the card's listener was registered
+  // first (it opened first), so without the guard it would take the press.
+  it("Escape peels the priority menu before the card", () => {
+    beadsUpdate.mockResolvedValue(undefined);
+    mountHostedWithProject([bead({ id: "sparkle-t6wje", priority: 0 })]);
+    fireEvent.click(pills()[0]!);
+    fireEvent.click(screen.getByTestId("concierge-bead-card-priority-trigger"));
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByTestId("concierge-bead-card-priority-menu")).toBeNull();
+    expect(card()).not.toBeNull();
+  });
+
+  // A surface with no project path is READ-ONLY, which is the property `BeadPillProvider` already
+  // had for every fixture-driven caller (SupportModal, agent replies, tests).
+  it("offers no priority control on a surface with no project path", () => {
+    mountMarkdown(ctx([T6]), "see sparkle-t6wje");
+    fireEvent.click(pills()[0]!);
+    expect(screen.queryByTestId("concierge-bead-card-priority-trigger")).toBeNull();
+    expect(screen.queryByTestId("concierge-bead-card-build-it")).toBeNull();
   });
 });

@@ -92,6 +92,43 @@ describe("listBeads", () => {
     ]);
   });
 
+  // ── THE TIMESTAMPS WERE ALWAYS ON THE WIRE ──────────────────────────────────────────────────
+  // `bd list --json` returns created_at / updated_at on every row (verified against bd 1.1.2) and
+  // the Rust side passes stdout through untouched — `normalizeBead` was the only thing dropping
+  // them, which is why the board could not offer a date filter. MUTATION TARGET: deleting either
+  // line from normalizeBead makes these undefined and fails here.
+  it("carries created_at / updated_at through as createdAt / updatedAt", async () => {
+    invokeMock.mockResolvedValue(
+      JSON.stringify([
+        {
+          id: "sparkle-1",
+          title: "First",
+          status: "open",
+          created_at: "2026-08-05T20:06:27Z",
+          updated_at: "2026-08-05T20:15:52Z",
+        },
+      ]),
+    );
+    const [b] = await listBeads("/proj");
+    expect(b?.createdAt).toBe("2026-08-05T20:06:27Z");
+    expect(b?.updatedAt).toBe("2026-08-05T20:15:52Z");
+  });
+
+  it("also reads camelCase spellings, and leaves them undefined when bd omits them", async () => {
+    invokeMock.mockResolvedValue(
+      JSON.stringify([
+        { id: "a", title: "camel", status: "open", createdAt: "2026-08-01T00:00:00Z" },
+        { id: "b", title: "none", status: "open" },
+      ]),
+    );
+    const [camel, none] = await listBeads("/proj");
+    expect(camel?.createdAt).toBe("2026-08-01T00:00:00Z");
+    // Absent, not "" — the date filter keys on undefined to mean "cannot tell", and an empty
+    // string would parse to NaN down a different branch.
+    expect(none?.createdAt).toBeUndefined();
+    expect(none?.updatedAt).toBeUndefined();
+  });
+
   it("throws a clear error on non-array JSON", async () => {
     invokeMock.mockResolvedValue('{"id":"x"}');
     await expect(listBeads("/proj")).rejects.toThrow(/Expected list_beads to return a JSON array/);

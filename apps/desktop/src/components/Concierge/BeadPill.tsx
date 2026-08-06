@@ -43,21 +43,30 @@ import {
   useEffect,
   useId,
   useMemo,
+  useRef,
   useState,
   type CSSProperties,
   type ReactNode,
 } from "react";
-import { FiExternalLink } from "react-icons/fi";
+import { useShallow } from "zustand/react/shallow";
 import { C } from "../../theme/colors";
-import { TYPE } from "../../theme/scale";
 import { MD_CODE_FACE } from "../mdCodeFace";
 import { MENTION_PILL_FILL } from "./MentionPill";
 import { sideOf } from "../../engine/pairs";
 import { BEADS_CROSS_PROJECT_REFRESH_MS, useBeadsStore } from "../../stores/beadsStore";
 import { useProjectStore } from "../../stores/projectStore";
+import { useRuntimeStore } from "../../stores/runtimeStore";
 import { useSettingsStore } from "../../stores/settingsStore";
 import { useUiStore } from "../../stores/uiStore";
-import type { Bead, BeadStatus } from "../../services/beads";
+import { DELIVERED_LABEL, type Bead } from "../../services/beads";
+import { beadStage, workersForBead } from "../../services/planView";
+import type { WorkflowStageId } from "../../engine/workflowStage";
+import type { AgentTab } from "../../types";
+import { BeadCard } from "../BeadCard/BeadCard";
+import { setBeadPriority } from "../BeadCard/beadPriority";
+import { beadCardMenuIsOpen } from "../BeadCard/PriorityPill";
+import { statusDot, statusLabel } from "../BeadCard/beadStatus";
+import { useBeadBuildActions } from "../BeadCard/useBeadBuildActions";
 
 /** A resolved bead, and WHICH PROJECT'S board holds it. The project id is not decoration: the
  *  concierge is cross-project by construction ("the concierge is not any project at all",
@@ -65,6 +74,21 @@ import type { Bead, BeadStatus } from "../../services/beads";
 export interface ResolvedBead {
   bead: Bead;
   projectId: string;
+  /**
+   * The project's checkout root — the path every WRITE needs.
+   *
+   * ══ WHY IT TRAVELS WITH THE BEAD RATHER THAN BEING LOOKED UP ═══════════════════════════════
+   * The card can now change a bead's priority and hand it to the Build orchestrator, and both go
+   * through `bd`, which is addressed by PATH. `BeadPillHost` has the selected project's id but the
+   * card may be showing a bead from a DIFFERENT project entirely (see `projectName`) — so a lookup
+   * at the point of use would have to re-derive which project the bead came from, which is exactly
+   * the question `indexBeads` has already answered.
+   *
+   * OPTIONAL, and its absence is what makes a surface READ-ONLY. A `BeadPillProvider` handed a
+   * fixture (a support modal, an agent reply, a test) supplies no paths, so its cards render
+   * without the priority control and without Build It rather than with controls that cannot work.
+   */
+  rootPath?: string;
   /**
    * The project's name, set ONLY when the bead lives outside the SELECTED project.
    *
@@ -310,10 +334,12 @@ export function BeadPillHost({ children }: { children: ReactNode }) {
   // clearing path, and it cannot go stale because it is recomputed from the live stores.
   const value = useMemo<BeadPillContextValue>(
     () => ({
-      beads: beadsEnabled ? indexBeads(byProject, foreignProjects(others), projectId) : EMPTY_BEADS,
+      beads: beadsEnabled
+        ? indexBeads(byProject, foreignProjects(others), projectId, rootPath)
+        : EMPTY_BEADS,
       onViewOnBoard: viewOnBoard,
     }),
-    [byProject, others, projectId, beadsEnabled],
+    [byProject, others, projectId, rootPath, beadsEnabled],
   );
   return <BeadPillProvider value={value}>{children}</BeadPillProvider>;
 }
@@ -342,9 +368,16 @@ function indexBeads(
   /** The selected project, indexed before all others. `undefined` when nothing is selected, in
    *  which case there is no "reader's own" to prefer and insertion order decides as before. */
   selectedProjectId: string | undefined,
+  /** The SELECTED project's checkout root. The foreign projects carry their own in the tuple; this
+   *  is the one the tuple list deliberately excludes. */
+  selectedRootPath: string | undefined,
 ): ReadonlyMap<string, ResolvedBead> {
   const out = new Map<string, ResolvedBead>();
   const names = new Map(foreign.map(([id, , name]) => [id, name]));
+  const roots = new Map(foreign.map(([id, root]) => [id, root]));
+  if (selectedProjectId !== undefined && selectedRootPath !== undefined) {
+    roots.set(selectedProjectId, selectedRootPath);
+  }
   // The selected project FIRST, then every other registered one. Anything still sitting in
   // `byProject` that is no longer registered is simply not visited.
   const ordered = [
@@ -355,8 +388,12 @@ function indexBeads(
     const name = names.get(projectId);
     // Empty string is treated as "no name to show" rather than rendering `in ` with nothing after.
     const projectName = name === undefined || name === "" ? undefined : name;
+    // Same reading for the path: an empty root cannot address `bd`, so it is an ABSENT path rather
+    // than a path that happens to be "" — which would render write controls that fail on every use.
+    const root = roots.get(projectId);
+    const rootPath = root === undefined || root === "" ? undefined : root;
     for (const bead of byProject[projectId]?.beads ?? []) {
-      if (!out.has(bead.id)) out.set(bead.id, { bead, projectId, projectName });
+      if (!out.has(bead.id)) out.set(bead.id, { bead, projectId, projectName, rootPath });
     }
   }
   return out;
@@ -427,34 +464,9 @@ const base: CSSProperties = {
   verticalAlign: "baseline",
 };
 
-/**
- * The status dot's colour.
- *
- * THE SAME THREE COLOURS `BoardView` ALREADY USES for a unit of work's progress — done is the teal
- * accent, running is full-strength cream, not-started is muted. Written as one function rather than
- * inline so the pill and the board it points at cannot drift apart, which is the failure
- * `MENTION_PILL_FILL` was extracted to prevent for the fill.
- */
-function statusColor(status: BeadStatus): string {
-  if (status === "closed") return C.teal;
-  if (status === "in_progress") return C.cream;
-  return C.muted;
-}
-
-/** What a reader calls the status. `in_progress` is a wire value, never words on screen. */
-function statusLabel(status: BeadStatus): string {
-  if (status === "closed") return "closed";
-  if (status === "in_progress") return "in progress";
-  return "open";
-}
-
-const dot = (status: BeadStatus): CSSProperties => ({
-  flex: "0 0 auto",
-  width: 6,
-  height: 6,
-  borderRadius: "50%",
-  background: statusColor(status),
-});
+// `statusColor` / `statusLabel` / `statusDot` MOVED to `BeadCard/beadStatus.ts` when the card
+// became shared. They were duplicated by construction the moment a second surface drew a bead, and
+// the pill and the card it opens must not be able to disagree about what "closed" looks like.
 
 /** How much description the card shows before it scrolls instead of growing.
  *
@@ -491,6 +503,56 @@ export function BeadPill({ beadId }: { beadId: string }) {
   // update, React bails out, and the reader's retry click paints and announces nothing.
   const [misses, setMisses] = useState(0);
   const cardId = useId();
+  const anchorRef = useRef<HTMLButtonElement>(null);
+
+  // ── ESCAPE AND CLICK-OUTSIDE CLOSE THE CARD ─────────────────────────────────────────────────
+  //
+  // ══ THE DEAD END THIS CLOSES ═══════════════════════════════════════════════════════════════
+  // The only way out of an open card used to be clicking the SAME pill again — which the founder
+  // called "a dead end nobody discovers", and he is right: nothing on screen says the pill is still
+  // the exit, and by the time a card has scrolled a paragraph the pill is off screen. Every other
+  // popover in this app closes on Escape and on a press outside itself, and a bead card is not
+  // special enough to be the exception.
+  //
+  // Built to `AgentInboxBadge`'s template, including the two subtleties that template exists for:
+  //
+  //   * REGISTERED ONLY WHILE OPEN. A concierge thread can hold dozens of pills, and a permanent
+  //     listener each would be a real cost for a card nobody has opened.
+  //   * THE ANCHOR-CONTAINS GUARD. The pill's own click toggles the card; without this the
+  //     capture-phase mousedown would ALSO see that press, close the card, and the toggle would
+  //     immediately reopen it — one gesture, no visible response.
+  //
+  // A THIRD GUARD IS NEW HERE, and it is the one the template could not have: the card's priority
+  // menu PORTALS to `document.body`, so a press on a menu row is, in DOM ancestry, outside this
+  // card. Without `beadCardMenuIsOpen()` picking a priority would close the card underneath the
+  // click, and Escape — whose listener this component registered FIRST, since the card opened
+  // first — would close the card instead of peeling the menu.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      // Cable etiquette: honour a prior consumer, then consume, so one press peels one layer.
+      if (e.key !== "Escape" || e.defaultPrevented) return;
+      if (beadCardMenuIsOpen()) return; // the menu is the innermost layer; let it take this press
+      e.preventDefault();
+      setOpen(false);
+    };
+    const onDown = (e: MouseEvent) => {
+      const t = e.target as Node | null;
+      if (t === null) return;
+      if (anchorRef.current?.contains(t) === true) return;
+      const el = t instanceof Element ? t : t.parentElement;
+      if (el?.closest(`[data-testid="${CARD_TESTID}"]`) != null) return;
+      if (beadCardMenuIsOpen() && el?.closest("[data-bead-card-menu]") != null) return;
+      setOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    window.addEventListener("mousedown", onDown, true);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("mousedown", onDown, true);
+    };
+  }, [open]);
+
   // RE-READ EVERY RENDER — the bead's fourth requirement, and the whole of its implementation. There
   // is deliberately no `useState`/`useRef` holding a bead anywhere in this component: a bead cited
   // as open an hour ago and since closed shows CLOSED, in the pill's dot and in an already-open
@@ -507,12 +569,13 @@ export function BeadPill({ beadId }: { beadId: string }) {
   // what arrives here is an ordinary hyphenated word like "auto-heal" that must come out unchanged.
   if (resolved === undefined) return <>{beadId}</>;
 
-  const { bead, projectId, projectName } = resolved;
+  const { bead } = resolved;
   const showMiss = misses > 0;
 
   return (
     <span style={{ display: "inline" }}>
       <button
+        ref={anchorRef}
         type="button"
         data-testid="concierge-bead-pill"
         data-bead-id={bead.id}
@@ -550,16 +613,16 @@ export function BeadPill({ beadId }: { beadId: string }) {
           fontFamily: MD_CODE_FACE,
         }}
       >
-        <span style={dot(bead.status)} aria-hidden />
+        <span style={statusDot(bead.status)} aria-hidden />
         {bead.id}
       </button>
       {open && (
-        <BeadCard
+        <ConciergeBeadCard
           id={cardId}
-          bead={bead}
-          projectName={projectName}
-          missSentence={showMiss ? noBoardSentence(bead.id) : undefined}
-          missKey={misses}
+          resolved={resolved}
+          onClose={() => setOpen(false)}
+          notice={showMiss ? noBoardSentence(bead.id) : undefined}
+          noticeKey={misses}
           // THE NAVIGATION RUNS IN THE HANDLER, NEVER INSIDE THE UPDATER.
           //
           // React re-invokes a state updater whenever it discards and replays a render — an
@@ -577,7 +640,7 @@ export function BeadPill({ beadId }: { beadId: string }) {
             onViewOnBoard === undefined
               ? undefined
               : () => {
-                  const landed = onViewOnBoard({ beadId: bead.id, projectId });
+                  const landed = onViewOnBoard({ beadId: bead.id, projectId: resolved.projectId });
                   setMisses((n) => (landed ? 0 : n + 1));
                 }
           }
@@ -587,136 +650,91 @@ export function BeadPill({ beadId }: { beadId: string }) {
   );
 }
 
+/** The testid the concierge card carries. Named because the pill's own click-outside guard has to
+ *  ask "was that press inside the card?" and a literal in two places is a literal that drifts. */
+const CARD_TESTID = "concierge-bead-card";
+
+/** A STABLE empty roster / backlog, so a project with neither does not hand the selectors below a
+ *  fresh array on every store write. */
+const NO_AGENTS: AgentTab[] = [];
+const NO_BEADS: Bead[] = [];
+
 /**
- * The card, drawn IN PLACE under the pill.
+ * The shared `BeadCard`, wired to the concierge.
  *
- * ══ EVERY ELEMENT HERE IS PHRASING CONTENT ══════════════════════════════════════════════════════
- * `<span>`, never `<div>`. This mounts inside `<Markdown>`'s `<p>`, and a `<div>` in a `<p>` is
- * invalid nesting: React emits it without complaint and the browser silently closes the paragraph
- * and reparents the node — moving the card away from the sentence that referenced it. `display:
- * block` on a span gets the layout without the invalidity (HTML validity is a question about the
- * ELEMENT, not about its CSS box), which is the same trick `AgentPill`'s `LiveNotice` uses.
+ * ══ WHY THIS IS A COMPONENT AND NOT JSX INSIDE `BeadPill` ══════════════════════════════════════
+ * It reads four live things the card needs — the project's agents, their workflow stages, the
+ * project's backlog, and the build actions — and `BeadPill` returns EARLY for the common case of an
+ * id that does not resolve. Hooks cannot live behind that return, and hoisting them above it would
+ * make every ordinary hyphenated word in the thread subscribe to three stores.
  *
- * ══ IT IS A LIVE REGION, AND IT IS THE CARD ITSELF ══════════════════════════════════════════════
- * `role="status"` here rather than a separate always-mounted announcer: unlike `AgentPill`'s notice,
- * the thing that appears IS the result of the click, so there is nothing to announce separately. The
- * failure sentence is re-keyed on `missKey` so a second failed open registers as a live-region
- * update rather than an identical re-render React drops on the floor (roborev 55590).
+ * ══ THE CARD IS THE BOARD'S CARD ═══════════════════════════════════════════════════════════════
+ * Everything below is a prop, not a variant. `BeadCard` decides what a bead looks like; this decides
+ * which project's data answers for it and what the buttons do. The founder's ask was that the two
+ * surfaces stop being two surfaces, so the only difference this file is allowed to introduce is the
+ * one he named: the description scrolls at `DESC_MAX_H`.
  */
-function BeadCard({
+function ConciergeBeadCard({
   id,
-  bead,
-  projectName,
+  resolved,
   onViewOnBoard,
-  missSentence,
-  missKey,
+  onClose,
+  notice,
+  noticeKey,
 }: {
   id: string;
-  bead: Bead;
-  /** Set only for a bead outside the reader's selected project — see `ResolvedBead.projectName`. */
-  projectName?: string;
+  resolved: ResolvedBead;
   /** Absent when the surface has no board to open. The card is still the result of the click, so
    *  this is a missing SECOND step, not a dead end. */
   onViewOnBoard?: () => void;
-  missSentence?: string;
-  missKey: number;
+  onClose: () => void;
+  notice?: string;
+  noticeKey: number;
 }) {
-  const meta = [
-    statusLabel(bead.status),
-    bead.priority === undefined ? null : `P${bead.priority}`,
-    bead.type ?? null,
-    // LAST in the row, and only when the bead is somewhere else. Appended to the existing meta line
-    // rather than given a line of its own: a card that grows is the thing DESC_MAX_H exists to
-    // prevent, and "which board" is the same class of fact as status and priority.
-    projectName === undefined || projectName === "" ? null : `in ${projectName}`,
-  ].filter((v): v is string => v !== null && v !== "");
+  const { bead, projectId, projectName, rootPath } = resolved;
+  // The bead's OWN project's agents, which is not necessarily the selected one — a concierge answer
+  // is cross-project by construction, and a worker on another project's bead still belongs on the
+  // card for that bead.
+  const agents = useProjectStore(
+    (s) => s.projects.find((p) => p.id === projectId)?.agents ?? NO_AGENTS,
+  );
+  const workerIds = agents.filter((a) => a.kind === "worker" && a.beadId === bead.id).map((a) => a.id);
+  // Subscribe to ONLY this bead's workers' stages (shallow-compared), the same way the board's card
+  // does, so a stage tick on an unrelated agent does not repaint every open card in the thread.
+  const workerStages = useRuntimeStore(
+    useShallow((s) => workerIds.map((wid) => s.workflowStage[wid]).filter(Boolean) as WorkflowStageId[]),
+  );
+  const stage = beadStage(bead.status, bead.labels.includes(DELIVERED_LABEL), workerStages);
+  const allBeads = useBeadsStore((s) => s.byProject[projectId]?.beads ?? NO_BEADS);
+  const build = useBeadBuildActions({ bead, projectId, allBeads, onStarted: onClose });
+  // WRITES NEED A PATH. Without one the card is a read-only view of the bead — which is exactly
+  // what every surface that supplies no project (a support modal, an agent reply, a test fixture)
+  // rendered before any of these controls existed.
+  const canWrite = rootPath !== undefined && rootPath !== "";
   return (
-    <span
+    <BeadCard
       id={id}
-      role="status"
-      data-testid="concierge-bead-card"
-      data-bead-id={bead.id}
-      style={{
-        display: "block",
-        margin: "6px 0",
-        padding: "8px 10px",
-        background: C.forest,
-        border: `1px solid ${C.hairline}`,
-        borderRadius: 6,
-        // The card carries prose, and the pill above it is `nowrap`.
-        whiteSpace: "normal",
-        // A long title or an unbroken token in a description must not widen the column.
-        overflowWrap: "anywhere",
-      }}
-    >
-      <span
-        data-testid="concierge-bead-card-title"
-        style={{ display: "block", color: C.cream, fontWeight: 600, marginBottom: 2 }}
-      >
-        {bead.title || bead.id}
-      </span>
-      <span
-        data-testid="concierge-bead-card-meta"
-        style={{ display: "block", color: C.conciergeMuted, fontSize: TYPE.small, marginBottom: 6 }}
-      >
-        <span style={{ ...dot(bead.status), display: "inline-block", marginRight: 5 }} aria-hidden />
-        {meta.join(" · ")}
-      </span>
-      {bead.description !== "" && (
-        <span
-          data-testid="concierge-bead-card-description"
-          style={{
-            display: "block",
-            // SCROLLS RATHER THAN GROWS — see DESC_MAX_H. The founder is reading a sentence and
-            // wants the referent, not a card that pushes the sentence off the screen.
-            maxHeight: DESC_MAX_H,
-            overflowY: "auto",
-            color: C.cream,
-            fontSize: TYPE.small,
-            lineHeight: 1.5,
-            // A bead description is written as plain text with its own line breaks (`bd` stores it
-            // verbatim); rendering it as markdown would re-linkify ids inside it and nest this card
-            // inside itself.
-            whiteSpace: "pre-wrap",
-          }}
-        >
-          {bead.description}
-        </span>
-      )}
-      {onViewOnBoard !== undefined && (
-        <span style={{ display: "block", marginTop: 6 }}>
-          <button
-            type="button"
-            data-testid="concierge-bead-card-view-on-board"
-            onClick={onViewOnBoard}
-            style={{
-              display: "inline-flex",
-              alignItems: "center",
-              gap: 4,
-              border: "none",
-              background: "transparent",
-              padding: 0,
-              cursor: "pointer",
-              color: C.accentInk,
-              font: "inherit",
-              fontSize: TYPE.small,
-              textDecoration: "underline",
-            }}
-          >
-            <FiExternalLink size={12} aria-hidden />
-            View on board
-          </button>
-        </span>
-      )}
-      {missSentence !== undefined && (
-        <span
-          key={missKey}
-          data-testid="concierge-bead-card-notice"
-          style={{ display: "block", marginTop: 4, color: C.conciergeMuted, fontSize: TYPE.small }}
-        >
-          {missSentence}
-        </span>
-      )}
-    </span>
+      chrome="concierge"
+      bead={bead}
+      stage={stage}
+      workers={workersForBead(agents, bead.id)}
+      projectName={projectName}
+      // THE FOUNDER CHOSE TO KEEP 180px. It was reconsidered at 90 and he said no: a card that
+      // shows six lines of a description is a card you have to open the board to read.
+      descMaxHeight={DESC_MAX_H}
+      onViewOnBoard={onViewOnBoard}
+      onClose={onClose}
+      onSetPriority={
+        canWrite ? (p) => setBeadPriority(rootPath, bead.id, p) : undefined
+      }
+      onBuildIt={canWrite ? (build.buildIt ?? undefined) : undefined}
+      // `build.buildAllPrd` is already null unless this bead is an epic with siblings in its PRD —
+      // that gate moved into the hook after BOTH surfaces independently shipped a `length > 1`-only
+      // check, which offered "Build all N epics" on a task that merely carried a PRD back-link.
+      onBuildAllPrd={canWrite ? (build.buildAllPrd ?? undefined) : undefined}
+      prdEpicCount={build.prdEpics.length}
+      notice={notice}
+      noticeKey={noticeKey}
+    />
   );
 }

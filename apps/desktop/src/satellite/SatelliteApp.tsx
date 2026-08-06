@@ -41,6 +41,7 @@ import type { PairSide } from "../engine/cable";
 import { useSettingsStore } from "../stores/settingsStore";
 import { AgentSidebar } from "../components/AgentSidebar";
 import { PlanBuildToggle } from "../components/PlanBuildToggle";
+import { BoardFilterBar } from "../components/BoardFilterBar";
 import { PLAN_COLUMN_Z } from "../components/layers";
 import { ErrorBoundary, AgentPaneErrorCard } from "../components/ErrorBoundary";
 import { TERMINAL_STAGE_DND_TARGET } from "../services/dndTargets";
@@ -377,13 +378,25 @@ export function SatelliteApp({ projectId }: { projectId: string }) {
               zIndex: PLAN_COLUMN_Z,
             }}
           >
-            <div style={{ paddingTop: 12 }}>
+            {/* Same mini chiclet, same top-right placement as the main window's PlanBoardSlot —
+                a satellite board that kept the wide chevron would be the one surface still showing
+                the control the founder asked to retire. */}
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "flex-end",
+                gap: 8,
+                padding: "12px 12px 8px",
+              }}
+            >
+              {workMode === "plan" && <BoardFilterBar side={SATELLITE_PAIR_SIDE} />}
               <PlanBuildToggle
                 mode={workMode}
                 beadsEnabled={beadsEnabled}
+                variant="mini"
                 onPickPlan={onPickPlan}
                 onPickBuild={onPickBuild}
-                style={{ margin: "0 12px 8px", maxWidth: 320 }}
               />
             </div>
             <div style={{ flex: 1, position: "relative", minHeight: 0 }}>

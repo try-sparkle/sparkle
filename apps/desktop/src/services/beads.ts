@@ -15,6 +15,20 @@ export interface Bead {
   priority?: number;
   labels: string[];
   parent?: string | null;
+  /**
+   * ISO-8601 Z timestamps, straight from bd.
+   *
+   * These were always on the wire and were simply not read: `bd list --json` returns `created_at`,
+   * `updated_at` and `started_at` on EVERY row, and the Rust side passes bd's stdout through
+   * untouched (`notes.rs` `list_beads`) — `normalizeBead` below was the only thing dropping them.
+   * The board's date-range filter is the first consumer.
+   *
+   * Optional because they are read tolerantly like every other field here: a bd version that
+   * renames or omits them must degrade to "no date" rather than throw, and a filter that cannot
+   * read a date must not silently hide the bead (see `withinDateRange`).
+   */
+  createdAt?: string;
+  updatedAt?: string;
 }
 
 // bd's JSON is loosely typed and the key names vary by version (status vs state,
@@ -54,6 +68,10 @@ function normalizeBead(raw: RawBead): Bead {
     priority,
     labels: normalizeLabels(raw.labels),
     parent,
+    // Both key spellings, same tolerance as every field above: bd emits snake_case today, and a
+    // camelCase build must not silently produce a board where every date filter matches nothing.
+    createdAt: asString(raw.created_at) ?? asString(raw.createdAt),
+    updatedAt: asString(raw.updated_at) ?? asString(raw.updatedAt),
   };
 }
 

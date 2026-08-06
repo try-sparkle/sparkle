@@ -31,6 +31,7 @@ import { useNewBuildAgentDrop } from "../hooks/useNewBuildAgentDrop";
 import { AgentSidebar } from "./AgentSidebar";
 import { PLAN_COLUMN_Z } from "./layers";
 import { PlanBuildToggle } from "./PlanBuildToggle";
+import { BoardFilterBar } from "./BoardFilterBar";
 import { ProjectTabsBar } from "./ProjectTabsBar";
 import { OfflineBanner } from "./OfflineBanner";
 import { ZeroCreditBanner } from "./ZeroCreditBanner";
@@ -2220,23 +2221,36 @@ function PlanBoardSlot({ project, side }: { project: Project; side: PairSide }) 
         zIndex: PLAN_COLUMN_Z,
       }}
     >
-      {/* THE TOGGLE SITS OVER THE COLUMN IT REPLACED. A pair's Build column is its INBOARD one
-          (`TERM │ BUILD │ concierge │ BUILD │ TERM`), so the left pair's is on the right and the
-          right pair's on the left — align to that edge and the control stays where the user's eye
-          and cursor already were, instead of jumping across the pair on one side. */}
+      {/* TOP RIGHT, BOTH SIDES, AND THE SAME MINI CHICLET THE BUILD BOARD USES.
+          This used to be the wide `chevron` variant, aligned to the pair's INBOARD edge (left pair
+          right, right pair left) so the control stayed under the cursor that opened it. The founder
+          overruled both halves in one instruction — "just have it be top right … and the same build
+          plan slider style chiclet that the build board has" — so it is `flex-end` unconditionally
+          and `variant="mini"`, which is exactly what AgentSidebar renders in the Build header.
+          No `width` either: the mini segment is intrinsically sized (`flex: 0 0 auto`), and a 320px
+          box would stretch the two segments back into a strip. */}
       <div
         style={{
-          paddingTop: 12,
           display: "flex",
-          justifyContent: side === "left" ? "flex-end" : "flex-start",
+          alignItems: "center",
+          justifyContent: "flex-end",
+          gap: 8,
+          // Was the toggle's own `margin: "0 12px 8px"`. Moved onto the row now that the row holds
+          // two things — a margin on one child cannot space both, and the shorthand must not sit
+          // beside a `paddingTop` it silently overrides.
+          padding: "12px 12px 8px",
         }}
       >
+        {/* The filters sit LEFT of the toggle: the toggle is the way OUT of the board and stays
+            pinned to the corner it has always been in, so a growing filter bar pushes inward
+            rather than moving the exit. */}
+        {mode === "plan" && <BoardFilterBar side={side} />}
         <PlanBuildToggle
           mode={mode}
           beadsEnabled={beadsEnabled}
+          variant="mini"
           onPickPlan={() => openPlanBoard(side)}
           onPickBuild={() => showBuildStage(side)}
-          style={{ margin: "0 12px 8px", width: 320, maxWidth: "100%" }}
         />
       </div>
       <div style={{ flex: 1, position: "relative", minHeight: 0 }}>

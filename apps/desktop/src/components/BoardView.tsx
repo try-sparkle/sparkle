@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
-import { C, FONT_WEIGHT, MODAL_SHADOW, ON_BRAND_FILL, SCRIM } from "../theme/colors";
+import { C, FONT_WEIGHT, MODAL_SHADOW, SCRIM } from "../theme/colors";
 import { RADIUS } from "../theme/scale";
 import type { Project } from "../types";
 import {
@@ -9,6 +9,7 @@ import {
   mergeShaOf,
   DELIVERED_LABEL,
   type Bead,
+  type Board,
   type BoardColumn,
 } from "../services/beads";
 import { DECOMPOSE_FAILED_LABEL, DECOMPOSING_LABEL } from "../services/epicDecompose";
@@ -23,16 +24,16 @@ import { useShallow } from "zustand/react/shallow";
 import { sendToBuild, sendToBuildBlockedReason } from "../services/sendToBuild";
 import {
   workersForBead,
-  epicStatus,
   beadStage,
   epicChildViews,
   orchestratorNameForEpic,
-  type EpicStatus,
   type EpicChildView,
 } from "../services/planView";
 import { WorkflowLine } from "./WorkflowLine";
-import { FiUsers, FiX } from "react-icons/fi";
+import { FiUsers } from "react-icons/fi";
 import { stageMeta, stageLineColor, type WorkflowStageId } from "../engine/workflowStage";
+import { agentDisplayName } from "../engine/agentDisplayName";
+import { boardFilterIsActive, matchesBoardFilter, NO_BOARD_FILTER } from "../services/boardFilters";
 import type { AgentTab } from "../types";
 import { getConfig, onConfigChanged } from "../services/config";
 import { readStageDef, isDefined, type StageKey, type StageDefinition } from "../services/stageDefs";
@@ -45,8 +46,11 @@ import {
 import { DefineStageModal } from "./DefineStageModal";
 import { StageColumnHeader, DefineStageCta, definableStageKey, type DeliveryChip } from "./StageColumnHeader";
 import { CardCriteria } from "./CardCriteria";
+import { BeadCard } from "./BeadCard/BeadCard";
+import { useBeadBuildActions } from "./BeadCard/useBeadBuildActions";
+import { setBeadPriority } from "./BeadCard/beadPriority";
+import { beadCardMenuIsOpen } from "./BeadCard/PriorityPill";
 import { FONT_MONO, FONT_UI } from "../theme/scale";
-import { TAG } from "./labelTreatment";
 
 /** The next board stage a card in `columnKey` is progressing toward (whose criteria we evaluate):
  *  Backlog / In Progress → Done; Done → Delivered; Delivered is terminal (none). */
@@ -159,8 +163,16 @@ export function boardScrollDelta(
 export function BoardView({ project, side }: { project: Project; side: PairSide }) {
   const snapshot = useBeadsStore((s) => s.byProject[project.id]);
   const error = useBeadsStore((s) => s.error[project.id]);
-  // Which bead's detail overlay is open (null = none). Cleared when the board unmounts.
-  const [selected, setSelected] = useState<Bead | null>(null);
+  // ══ THE OPEN CARD IS ADDRESSED BY ID, AND READ BACK FROM THE LIVE POLL ═══════════════════════
+  // An ID, never the Bead OBJECT. `beadsStore` replaces its snapshot wholesale every 5s, so a held
+  // object is a photograph: an open card would show the title, status and priority the bead had at
+  // click time, forever.
+  //
+  // That is not cosmetic here — it silently breaks the priority write. `BeadCard` holds its
+  // optimistic value until `bead.priority` agrees with it, which is exactly the acknowledgement a
+  // frozen object can never deliver, so a priority set from the board would stay latched on the
+  // optimistic number with no way to tell a saved value from an unsaved one.
+  const [selectedId, setSelectedId] = useState<string | null>(null);
 
   // The horizontally scrolling row of columns, and the wheel that drives it — see boardScrollDelta.
   const colsRef = useRef<HTMLDivElement | null>(null);
@@ -184,6 +196,31 @@ export function BoardView({ project, side }: { project: Project; side: PairSide 
 
   const board = snapshot?.board;
   const allBeads = snapshot?.beads ?? [];
+
+  /**
+   * The bead the open overlay is showing, read from the CURRENT poll rather than held.
+   *
+   * BOTH SOURCES, because they can legitimately disagree. `snapshot.beads` is the flat list and
+   * `snapshot.board` is the bucketed one; production derives the second from the first, but they
+   * are separate fields and nothing forces a bead present in a LANE to also appear in the flat
+   * list. Resolving from only one would make an open card vanish for a bead the board is visibly
+   * still rendering.
+   *
+   * `undefined` — and so no overlay — once the bead is in neither. That is the honest outcome: a
+   * detail card for a bead the board no longer has would show a row nothing else on screen agrees
+   * exists.
+   */
+  const selectedBead = useMemo(() => {
+    if (selectedId === null) return undefined;
+    const hit = allBeads.find((b) => b.id === selectedId);
+    if (hit) return hit;
+    if (!board) return undefined;
+    for (const lane of [board.backlog, board.blocked, board.inProgress, board.done, board.delivered]) {
+      const inLane = lane.find((b) => b.id === selectedId);
+      if (inLane) return inLane;
+    }
+    return undefined;
+  }, [selectedId, allBeads, board]);
 
   // ── Definable Done & Delivered (Unit 5) ──────────────────────────────────────────────────────
   // Which stage's Define/Edit modal is open (null = none).
@@ -272,7 +309,7 @@ export function BoardView({ project, side }: { project: Project; side: PairSide 
     if (!boardFocusBeadId || !snapshot) return;
     const hit = snapshot.beads.find((b) => b.id === boardFocusBeadId);
     if (hit) {
-      setSelected(hit);
+      setSelectedId(hit.id);
       useUiStore.getState().setBoardFocusBeadId(null);
     }
   }, [boardFocusBeadId, snapshot]);
@@ -286,8 +323,14 @@ export function BoardView({ project, side }: { project: Project; side: PairSide 
   // string had both of them narrowing to whatever the last pill clicked — including across two
   // different projects. See uiStore.boardAgentFilterBySide.
   const boardAgentFilter = useUiStore((s) => s.boardAgentFilterBySide[side]);
-  const displayBoard = useMemo(() => {
-    if (!board || !boardAgentFilter) return board;
+  // The priority + date-range filter rides the SAME seam as the agent filter — one predicate over
+  // the five already-bucketed lanes — so the poll, the fetch and the bucketing stay untouched.
+  const boardFilter = useUiStore((s) => s.boardFilterBySide[side]);
+  const filterActive = boardFilterIsActive(boardFilter);
+  /** The board narrowed by the AGENT filter alone — the baseline the priority/date notice measures
+   *  against. See `hiddenByFilter`. */
+  const agentOnlyBoard = useMemo(() => {
+    if (!board || boardAgentFilter === null) return board;
     const label = `agent:${boardAgentFilter}`;
     const keep = (arr: Bead[]) => arr.filter((b) => b.labels.includes(label));
     return {
@@ -298,8 +341,71 @@ export function BoardView({ project, side }: { project: Project; side: PairSide 
       delivered: keep(board.delivered),
     };
   }, [board, boardAgentFilter]);
+
+  const displayBoard = useMemo(() => {
+    if (!agentOnlyBoard || !filterActive) return agentOnlyBoard;
+    // ONE `now` FOR THE WHOLE PASS. Reading the clock per bead would let a bead near the window's
+    // edge fall on a different side of it than its neighbour in the same render.
+    const now = Date.now();
+    const keep = (arr: Bead[]) => arr.filter((b) => matchesBoardFilter(b, boardFilter, now));
+    return {
+      backlog: keep(agentOnlyBoard.backlog),
+      blocked: keep(agentOnlyBoard.blocked),
+      inProgress: keep(agentOnlyBoard.inProgress),
+      done: keep(agentOnlyBoard.done),
+      delivered: keep(agentOnlyBoard.delivered),
+    };
+  }, [agentOnlyBoard, boardFilter, filterActive]);
+
+  /**
+   * How many cards the PRIORITY/DATE filter removed — and only when it removed all of them.
+   *
+   * ══ THE BASELINE IS THE AGENT-FILTERED BOARD, NOT THE WHOLE SNAPSHOT ═════════════════════════
+   * These are two independent filters stacked on one seam, and measuring the doubly-filtered board
+   * against the UNfiltered one attributes the agent filter's removals to this notice. Two ways that
+   * went wrong (roborev 59075), both of which tell the reader something false:
+   *   - 50 beads, the agent filter leaves 2, a P0 filter hides those 2 → "50 cards are hidden".
+   *     The priority filter hid two.
+   *   - The agent filter alone empties the board while any board filter is set → the notice fires,
+   *     blames the priority/date filter, and offers a "Clear filters" button that resets only
+   *     `boardFilter` and leaves the board just as empty. A remedy that cannot work is worse than
+   *     no remedy: the reader follows it, nothing happens, and the real cause (named in the agent
+   *     banner directly above) goes unread.
+   * Requiring a NON-EMPTY agent-filtered baseline is what keeps the two explanations from
+   * competing — an agent-filter emptiness belongs to the agent banner.
+   */
+  const hiddenByFilter = useMemo(() => {
+    if (!agentOnlyBoard || !displayBoard || !filterActive) return 0;
+    const size = (b: Board) =>
+      b.backlog.length + b.blocked.length + b.inProgress.length + b.done.length + b.delivered.length;
+    const baseline = size(agentOnlyBoard);
+    return baseline > 0 && size(displayBoard) === 0 ? baseline : 0;
+  }, [agentOnlyBoard, displayBoard, filterActive]);
   // Workers live in the agent store; the Plan view reads them to show who's building each bead.
   const agents = useProjectStore((s) => s.projects.find((p) => p.id === project.id)?.agents ?? NO_AGENTS);
+
+  /**
+   * The NAME of the agent the board is filtered to, for the banner below.
+   *
+   * The banner used to print `boardAgentFilter` raw — a uuid the founder never chose and cannot
+   * read, which told him the board was narrowed without telling him by whom. The id was always
+   * resolvable: `agents` is right there, scoped to this board's project, and the filter is set from
+   * a FEEDBACK pill on the same pair side (uiStore keys it per side precisely so a cross-project id
+   * cannot land here).
+   *
+   * `agentDisplayName`, never `a.name` raw — a pinned or self-chosen name outranks the auto-name,
+   * and reading the field directly is the stale-name split that helper exists to close.
+   *
+   * `null` means the agent is genuinely gone (closed, or the project switched under an open board).
+   * The filter is deliberately NOT auto-cleared in that case: the beads are still labelled
+   * `agent:<id>`, so the board really is narrowed, and this banner is the only visible explanation
+   * for why. Dropping it would leave a silently short board with nothing to say why.
+   */
+  const filterAgentName = useMemo(() => {
+    if (!boardAgentFilter) return null;
+    const hit = agents.find((a) => a.id === boardAgentFilter);
+    return hit ? agentDisplayName(hit) : null;
+  }, [agents, boardAgentFilter]);
 
   return (
     <div
@@ -355,8 +461,20 @@ export function BoardView({ project, side }: { project: Project; side: PairSide 
             flexShrink: 0,
           }}
         >
-          <span>
-            Showing feedback from agent <strong>{boardAgentFilter}</strong>
+          <span data-testid="board-agent-filter-label">
+            {filterAgentName === null ? (
+              // The agent is gone. Say so in words rather than printing a bare uuid as if it were a
+              // name, but still show a truncated id — it is the only handle left for "which one was
+              // that", and an empty <strong> would read as a rendering bug.
+              <>
+                Showing feedback from a closed agent{" "}
+                <strong>{boardAgentFilter.slice(0, 8)}…</strong>
+              </>
+            ) : (
+              <>
+                Showing feedback from <strong>{filterAgentName}</strong>
+              </>
+            )}
           </span>
           <span style={{ color: C.muted }}>·</span>
           <button
@@ -373,6 +491,50 @@ export function BoardView({ project, side }: { project: Project; side: PairSide 
             }}
           >
             Clear
+          </button>
+        </div>
+      )}
+
+      {/* ══ A FILTER THAT EMPTIES THE BOARD MUST SAY SO ══════════════════════════════════════════
+          Five empty columns are indistinguishable from a project with no work — the board would
+          report "nothing here" while concealing every card, which is precisely the failure
+          `sparkle-qogah` names ("never hide a row that needs action"). The count of what was hidden
+          is the honest part: it says the work exists and the filter is why you cannot see it. The
+          Clear here is a second copy of the bar's, deliberately, because the bar lives in a host row
+          this component does not own and may be scrolled away from the empty space. */}
+      {displayBoard && filterActive && hiddenByFilter > 0 && (
+        <div
+          data-testid="board-filter-empty-notice"
+          style={{
+            padding: "10px 16px",
+            borderBottom: `1px solid ${C.hairline}`,
+            background: C.deepForest,
+            color: C.cream,
+            fontSize: 12,
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            flexShrink: 0,
+          }}
+        >
+          <span>
+            No cards match this filter — <strong>{hiddenByFilter}</strong>{" "}
+            {hiddenByFilter === 1 ? "card is" : "cards are"} hidden.
+          </span>
+          <button
+            type="button"
+            onClick={() => useUiStore.getState().setBoardFilter(side, NO_BOARD_FILTER)}
+            style={{
+              background: "transparent",
+              border: "none",
+              padding: 0,
+              color: C.accentInk,
+              cursor: "pointer",
+              font: "inherit",
+              textDecoration: "underline",
+            }}
+          >
+            Clear filters
           </button>
         </div>
       )}
@@ -415,19 +577,19 @@ export function BoardView({ project, side }: { project: Project; side: PairSide 
               deliveryChip={deliveryChip}
               inReleaseByBead={inReleaseByBead}
               onDefine={setDefineStage}
-              onOpen={(b) => setSelected(b)}
+              onOpen={(b) => setSelectedId(b.id)}
             />
           ))}
         </div>
       )}
 
-      {selected && (
+      {selectedBead && (
         <DetailOverlay
-          bead={selected}
+          bead={selectedBead}
           projectId={project.id}
           allBeads={allBeads}
           agents={agents}
-          onClose={() => setSelected(null)}
+          onClose={() => setSelectedId(null)}
         />
       )}
 
@@ -938,113 +1100,75 @@ function DetailOverlay({
   agents: AgentTab[];
   onClose: () => void;
 }) {
-  const [buildErr, setBuildErr] = useState("");
-  const [buildBusy, setBuildBusy] = useState(false);
   const isEpic = bead.type === "epic";
-  const isTask = bead.type === "task";
-  const status: EpicStatus | null = isEpic ? epicStatus(allBeads, bead.id) : null;
   const workers = workersForBead(agents, bead.id);
-  // The project's checkout root, needed to claim beads before the Build handoff (same as
-  // StartControls). Looked up from the store since DetailOverlay only receives the projectId.
+  // The project's checkout root — every WRITE is addressed by PATH. Looked up here because the
+  // overlay only receives a projectId.
   const rootPath = useProjectStore(
     (s) => s.projects.find((p) => p.id === projectId)?.rootPath ?? null,
   );
-  // The epic body carries "PRD file: <path>" (see tasks.ts / parsePrdRef); pull it back out with the
-  // robust parser — null for a PRD-less epic, which NO LONGER blocks the handoff (sendToBuild seeds
-  // off `bd show <epicId>` instead).
-  const prdPath = parsePrdRef(bead.description)?.relPath ?? null;
-  // Sibling epics that share this epic's PRD → offer a "Build all N epics in this PRD" when >1.
-  const prdEpics = prdPath
-    ? allBeads.filter((b) => b.type === "epic" && parsePrdRef(b.description)?.relPath === prdPath)
-    : [];
 
-  // "Build It" (epic): claim this epic (→ in_progress), then hand it to the Build orchestrator,
-  // which fans one worker out per child task. A PRD-less epic is fine now — no hard block.
-  async function handleBuildIt() {
-    if (buildBusy) return;
-    setBuildErr("");
-    setBuildBusy(true);
-    try {
-      const blocked = sendToBuildBlockedReason(projectId, bead.id);
-      if (blocked) {
-        setBuildErr(blocked);
-        return;
-      }
-      if (rootPath) await claimBead(rootPath, bead.id); // match StartControls' claim+handoff
-      sendToBuild({ projectId, epicId: bead.id, prdPath });
+  // THE THREE BUILD HANDOFFS, from the shared hook rather than three local copies.
+  // They used to be ~75 lines of `handleBuildIt`/`handleBuildTask`/`handleBuildAllPrd` right here,
+  // which is precisely why the concierge card could not offer them: the logic was welded to this
+  // component. `onStarted: onClose` preserves the old behaviour of dismissing on a successful
+  // handoff.
+  const buildActions = useBeadBuildActions({ bead, projectId, allBeads, onStarted: onClose });
+
+  // The unified Think→Plan→Build stage — the SAME computation the collapsed `Card` does. Its
+  // absence here is the founder's item 1: the blue line and its word were on the closed card and
+  // vanished the moment he opened it, because these were two components sharing no code.
+  const workerIds = agents
+    .filter((a) => a.kind === "worker" && a.beadId === bead.id)
+    .map((a) => a.id);
+  const workerStages = useRuntimeStore(
+    useShallow(
+      (s) => workerIds.map((id) => s.workflowStage[id]).filter(Boolean) as WorkflowStageId[],
+    ),
+  );
+  const stage = beadStage(bead.status, bead.labels.includes(DELIVERED_LABEL), workerStages);
+
+  // ── ESCAPE CLOSES IT ─────────────────────────────────────────────────────────────────────────
+  // The scrim already dismissed on an outside click; Escape was simply absent from this file. The
+  // founder hit the same dead end on the concierge card ("right now I have to click back on the
+  // bead pill to close it"), and the two surfaces get the same contract.
+  //
+  // `defaultPrevented` first, then `preventDefault`: Escape has a global consumer (engine/cable),
+  // so one press must peel exactly one layer.
+  //
+  // ══ THE MENU GUARD IS NOT OPTIONAL, AND THE OBVIOUS REASONING ABOUT IT IS BACKWARDS ══════════
+  // An earlier version of this comment claimed the priority menu "registers its listener LATER and
+  // therefore runs first". That is inverted: same-target, same-phase listeners fire in REGISTRATION
+  // order, so THIS handler — registered when the overlay mounted — runs BEFORE the menu's, which is
+  // registered only when the menu opens. Without the guard, one Escape with the menu open closes
+  // the whole overlay, and the menu's own `defaultPrevented` bail then swallows the press it was
+  // supposed to consume. `BeadPill` already guards exactly this way; the component that exists so
+  // these two surfaces cannot diverge had diverged here.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || e.defaultPrevented) return;
+      if (beadCardMenuIsOpen()) return; // the menu is the innermost layer; let it take this press
+      e.preventDefault();
       onClose();
-    } catch (e) {
-      setBuildErr(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBuildBusy(false);
-    }
-  }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
 
-  // "Build It" (single task): claim this bead, then hand it to the orchestrator in task mode — build
-  // THIS one bead on a single isolated worker branch, no fan-out.
-  async function handleBuildTask() {
-    if (buildBusy) return;
-    setBuildErr("");
-    setBuildBusy(true);
-    try {
-      // "task" MUST be passed: the preflight defaults to "epic", and the early return below means
-      // sendToBuild — the only other place that derives the lead from the mode — is never reached at
-      // capacity. Omitting it rendered "Starting this plan…" for a handoff that builds one bead on
-      // one worker branch (roborev 55145).
-      const blocked = sendToBuildBlockedReason(projectId, bead.id, "task");
-      if (blocked) {
-        setBuildErr(blocked);
-        return;
-      }
-      if (rootPath) await claimBead(rootPath, bead.id);
-      sendToBuild({ projectId, epicId: bead.id, prdPath, mode: "task" });
-      onClose();
-    } catch (e) {
-      setBuildErr(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBuildBusy(false);
-    }
-  }
-
-  // "Build all N epics in this PRD": claim + hand off every epic sharing this PRD, in turn.
-  async function handleBuildAllPrd() {
-    if (buildBusy) return;
-    setBuildErr("");
-    setBuildBusy(true);
-    try {
-      // Per-epic, INSIDE the loop: the ceiling can be reached partway through, and claiming an epic
-      // we then cannot hand off would mark it in progress with no orchestrator. Stop cleanly and say
-      // how far we got, rather than throwing out of the middle of a batch (roborev 55139).
-      let built = 0;
-      for (const epic of prdEpics) {
-        const blocked = sendToBuildBlockedReason(projectId, epic.id);
-        if (blocked) {
-          setBuildErr(
-            `${blocked} Started ${built} of ${prdEpics.length}; the rest are untouched.`,
-          );
-          return;
-        }
-        if (rootPath) await claimBead(rootPath, epic.id);
-        sendToBuild({ projectId, epicId: epic.id, prdPath });
-        built += 1;
-      }
-      onClose();
-    } catch (e) {
-      setBuildErr(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBuildBusy(false);
-    }
-  }
-
-  const meta: { label: string; value: string }[] = [];
-  if (bead.type) meta.push({ label: "Type", value: bead.type });
-  if (bead.priority !== undefined) meta.push({ label: "Priority", value: String(bead.priority) });
-  if (bead.labels.length > 0) meta.push({ label: "Labels", value: bead.labels.join(", ") });
-  if (bead.parent) meta.push({ label: "Epic", value: bead.parent });
-
+  // ── THE OVERLAY IS NOW A FRAME AROUND THE SHARED CARD ────────────────────────────────────────
+  // Everything the panel used to draw by hand — title, close, id, priority, type, labels, epic,
+  // description, workers — is `BeadCard`, the SAME component the concierge renders. That is the
+  // whole point of the change: the two presentations diverged field by field precisely because
+  // they were two hand-maintained copies, and the founder could not trust either view to be
+  // complete. What stays here is what is genuinely board-only: the scrim, the panel box, and the
+  // epic child roll-up.
+  //
+  // The card also brings the STATUS LINE the open card was missing (his item 1): it was on the
+  // collapsed card and vanished on open, because `Card` and `DetailOverlay` shared no JSX.
   return (
     <div
-      // Click-outside (the scrim) dismisses. No native confirm/alert — this is a plain overlay.
+      // Click-outside (the scrim) dismisses — and so does Escape now; see the effect above. The
+      // pair is the app's standard modal contract (ModalShell), and the overlay had only half of it.
       onClick={onClose}
       style={{
         position: "absolute",
@@ -1058,6 +1182,17 @@ function DetailOverlay({
       }}
     >
       <div
+        // ══ IT MUST ANNOUNCE ITSELF AS AN ESCAPE-OWNING SURFACE ═══════════════════════════════
+        // `engine/cable.ts`'s `dismissibleSurfaceOpen` probes for exactly
+        // `[role="dialog"], [role="menu"], [data-dismissible-open="true"]`. Workspace's Escape
+        // listener is registered at APP MOUNT — before this overlay's — so it runs FIRST, and with
+        // nothing here for that probe to find, `unbindsOnKey` returned true: rung 1 unwired the
+        // concierge from its row and, since `defaultPrevented` was still false at that instant,
+        // ARMED rung 2. The overlay then closed, so the user's next Escape hit rung 2 and cleared
+        // the build row in every pair on screen. That is the precise failure roborev 55478 was
+        // closed to prevent, re-created through a surface the DOM probe could not see.
+        role="dialog"
+        aria-modal="true"
         // Stop clicks inside the card from bubbling to the scrim (which would close it).
         onClick={(e) => e.stopPropagation()}
         style={{
@@ -1074,162 +1209,32 @@ function DetailOverlay({
           gap: 12,
         }}
       >
-        <div style={{ display: "flex", alignItems: "flex-start", gap: 12 }}>
-          <div style={{ flex: 1, fontSize: 17, fontWeight: FONT_WEIGHT.semibold, color: C.cream }}>
-            {bead.title}
-          </div>
-          <button
-            aria-label="Close"
-            title="Close"
-            onClick={onClose}
-            style={{
-              background: "transparent",
-              border: `1px solid ${C.hairline}`,
-              borderRadius: 6,
-              color: C.muted,
-              cursor: "pointer",
-              padding: "2px 8px",
-              fontSize: 13,
-              lineHeight: 1.2,
-              fontFamily: FONT_UI,
-            }}
-          >
-            <FiX size={13} aria-hidden />
-          </button>
-        </div>
+        <BeadCard
+          bead={bead}
+          chrome="board"
+          stage={stage}
+          workers={workers}
+          // NO `descMaxHeight` — the panel above is already the scroller (`maxHeight: 100%` +
+          // `overflowY: auto`). Capping the description again would put a second scrollbar inside
+          // the first. The concierge passes 180 because it has no such panel of its own.
+          onClose={onClose}
+          // A project missing from the store has no path, and every bd write is addressed by path —
+          // so the card degrades to read-only rather than offering a control that cannot work.
+          onSetPriority={
+            rootPath === null ? undefined : (p) => setBeadPriority(rootPath, bead.id, p)
+          }
+          onBuildIt={buildActions.buildIt ?? undefined}
+          // `buildAllPrd` is null for anything that is not an epic — the gate lives in the hook now,
+          // so this surface and the concierge cannot drift apart on it again.
+          onBuildAllPrd={buildActions.buildAllPrd ?? undefined}
+          prdEpicCount={buildActions.prdEpics.length}
+        />
 
-        <div
-          style={{
-            color: C.muted,
-            opacity: 0.8,
-            fontSize: 12,
-            fontFamily: FONT_MONO,
-          }}
-        >
-          {bead.id}
-        </div>
-
-        {isEpic && (
-          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-            <span
-              style={{
-                // `TAG`, not `CHIP` plus a hand-typed uppercase and tracking — that is precisely the
-                // near-copy the treatment exists to retire, and hard-coding `0.1em` would have made
-                // this the one site a change to the scale silently skipped (roborev 54772).
-                ...TAG,
-                color: status === "done" ? C.teal : status === "in_progress" ? C.cream : C.muted,
-                // The hairline edge wins over the ink edge here: the status colour is carried by the
-                // TEXT, and a coloured box around it would read as three different chips.
-                border: `1px solid ${C.hairline}`,
-                padding: "2px 10px",
-              }}
-            >
-              {status === "in_progress" ? "in progress" : status === "done" ? "done" : "not started"}
-            </span>
-            <button
-              onClick={handleBuildIt}
-              disabled={buildBusy}
-              title="Build It — claim this epic and hand it to the Build orchestrator, which spawns one worker per task"
-              style={{
-                background: C.teal,
-                color: ON_BRAND_FILL,
-                border: "none",
-                borderRadius: 6,
-                padding: "6px 16px",
-                fontSize: 13,
-                fontWeight: FONT_WEIGHT.semibold,
-                cursor: buildBusy ? "default" : "pointer",
-                opacity: buildBusy ? 0.7 : 1,
-                fontFamily: FONT_UI,
-              }}
-            >
-              {buildBusy ? "Building…" : "Build It"}
-            </button>
-            {/* When this epic shares its PRD with sibling epics, offer to build them all at once. */}
-            {prdEpics.length > 1 && (
-              <button
-                onClick={handleBuildAllPrd}
-                disabled={buildBusy}
-                title={`Claim and build all ${prdEpics.length} epics that share this PRD`}
-                style={{
-                  background: "transparent",
-                  color: C.tealInk,
-                  border: `1px solid ${C.teal}`,
-                  borderRadius: 6,
-                  padding: "6px 16px",
-                  fontSize: 13,
-                  fontWeight: FONT_WEIGHT.semibold,
-                  cursor: buildBusy ? "default" : "pointer",
-                  opacity: buildBusy ? 0.7 : 1,
-                  fontFamily: FONT_UI,
-                }}
-              >
-                {`Build all ${prdEpics.length} epics in this PRD`}
-              </button>
-            )}
-            {buildErr && <span style={{ color: C.sienna, fontSize: 12 }}>{buildErr}</span>}
-          </div>
-        )}
-
-        {/* Task-level Build It: build THIS single bead on one isolated worker branch (no fan-out). */}
-        {isTask && (
-          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-            <button
-              onClick={handleBuildTask}
-              disabled={buildBusy}
-              title="Build It — build this single task on one isolated worker branch, then verify and integrate it"
-              style={{
-                background: C.teal,
-                color: ON_BRAND_FILL,
-                border: "none",
-                borderRadius: 6,
-                padding: "6px 16px",
-                fontSize: 13,
-                fontWeight: FONT_WEIGHT.semibold,
-                cursor: buildBusy ? "default" : "pointer",
-                opacity: buildBusy ? 0.7 : 1,
-                fontFamily: FONT_UI,
-              }}
-            >
-              {buildBusy ? "Building…" : "Build It"}
-            </button>
-            {buildErr && <span style={{ color: C.sienna, fontSize: 12 }}>{buildErr}</span>}
-          </div>
-        )}
-
-        {/* Live epic status (spec §7): orchestrator + per-child WorkflowLine stages + workers. */}
+        {/* BOARD-ONLY, and the reason this overlay still exists as more than a frame: the per-child
+            stage roll-up for an epic. It is a view of OTHER beads, not of this one, so it is not a
+            field the concierge card is missing — it is a different surface that happens to live
+            here. */}
         {isEpic && <EpicLiveStatus epicId={bead.id} allBeads={allBeads} agents={agents} />}
-
-        {bead.description && (
-          <div
-            style={{
-              color: C.cream,
-              fontSize: 13,
-              lineHeight: 1.6,
-              whiteSpace: "pre-wrap", // preserve newlines in the full description
-            }}
-          >
-            {bead.description}
-          </div>
-        )}
-
-        {meta.length > 0 && (
-          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-            {meta.map((m) => (
-              <div key={m.label} style={{ display: "flex", gap: 8, fontSize: 13 }}>
-                <span style={{ color: C.muted, minWidth: 90 }}>{m.label}</span>
-                <span style={{ color: C.cream }}>{m.value}</span>
-              </div>
-            ))}
-          </div>
-        )}
-
-        {workers.length > 0 && (
-          <div style={{ display: "flex", gap: 8, fontSize: 13 }}>
-            <span style={{ color: C.muted, minWidth: 90 }}>Workers</span>
-            <span style={{ color: C.tealInk }}>{workers.join(", ")}</span>
-          </div>
-        )}
       </div>
     </div>
   );

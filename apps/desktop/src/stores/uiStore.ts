@@ -2,6 +2,10 @@
 // composer height, so the size you drag it to sticks across tabs and relaunches.
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
+// SAFE AS A VALUE IMPORT — `services/boardFilters` has no runtime imports of its own (it takes only
+// `type { Bead }`, which is erased), so this reaches neither theme/colors nor a component and
+// cannot close the cycle the notes below describe.
+import { NO_BOARD_FILTER, type BoardFilter } from "../services/boardFilters";
 import {
   migratePersistedUi,
   repairActiveSpecial,
@@ -64,6 +68,10 @@ const TRANSIENT_UI_KEYS = [
   "buildAgentHover",
   "boardFocusBeadId",
   "boardAgentFilterBySide",
+  // A restored filter would show a board that looks EMPTY with no visible cause — the control that
+  // narrowed it is off screen and the user never touched it this session. Same reasoning as
+  // boardAgentFilterBySide directly above.
+  "boardFilterBySide",
   "settingsRequest",
   "composeFocusSeq",
   "revealAgentId",
@@ -316,6 +324,18 @@ interface UiState {
   // renders empty under "Showing feedback from agent <id>" with no visible cause in that column.
   boardAgentFilterBySide: Record<PairSide, string | null>;
   setBoardAgentFilter: (side: PairSide, id: string | null) => void;
+  // The board's PRIORITY + DATE-RANGE filter (founder: "I want to be able to only look at cards of
+  // a certain priority status and also a certain date range").
+  //
+  // KEYED BY SIDE for exactly the reason boardAgentFilterBySide above is, and the failure mode is
+  // the same one: two boards can be open at once, on two different projects, and a single global
+  // filter would silently narrow the one the user is not looking at.
+  //
+  // Transient — NOT persisted (see partialize). A relaunch showing a filtered board with the
+  // control scrolled out of view is a board that looks EMPTY for no visible reason, which is the
+  // failure `sparkle-qogah` names. The filter must always be something the user just did.
+  boardFilterBySide: Record<PairSide, BoardFilter>;
+  setBoardFilter: (side: PairSide, filter: BoardFilter) => void;
   // Whether ANY "+ New Build Agent" button is currently hovered. Shared so hovering the empty-state
   // start button on the Workspace also lights up the sidebar's button blue (and vice versa),
   // pointing the user at where that affordance normally lives. Transient — NOT persisted.
@@ -657,6 +677,22 @@ export const useUiStore = create<UiState>()(
             ? {}
             : { boardAgentFilterBySide: { ...st.boardAgentFilterBySide, [side]: id } },
         ),
+      boardFilterBySide: { left: NO_BOARD_FILTER, right: NO_BOARD_FILTER },
+      // Identity-stable when nothing actually changed, matching setBoardAgentFilter above: the
+      // filter bar re-asserts the current value on every render of its controls, and a fresh object
+      // each time would re-run BoardView's narrowing memo (and re-render every card) on a no-op.
+      setBoardFilter: (side, filter) =>
+        set((st) => {
+          const cur = st.boardFilterBySide[side];
+          if (
+            cur.priority === filter.priority &&
+            cur.dateField === filter.dateField &&
+            cur.dateWindow === filter.dateWindow
+          ) {
+            return {};
+          }
+          return { boardFilterBySide: { ...st.boardFilterBySide, [side]: filter } };
+        }),
       buildAgentHover: false,
       setBuildAgentHover: (v) => set({ buildAgentHover: v }),
       cloudCreateProjectId: null,
