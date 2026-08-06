@@ -26,6 +26,7 @@ import {
   type SubmitVerdict,
 } from "./sparkleAgent";
 import { registerSparkleTranscript } from "./sparkleTranscript";
+import { claimPass, releasePass } from "./improvementPassLatch";
 import { accountConfigDirFor } from "./accountSelection";
 import {
   assertWorkspaceIntegrity,
@@ -392,14 +393,14 @@ export function isTransientPassFailure(message: string): boolean {
   return TRANSIENT_FAILURE_PATTERNS.some((p) => lower.includes(p));
 }
 
-/** In-flight latch. Module-level (not store state): it guards a real child process in THIS
- *  webview, and must reset with the page. */
-let passRunning = false;
-
-/** True while a headless pass is in flight (read by the scheduler's gate). */
-export function isPassRunning(): boolean {
-  return passRunning;
-}
+/** True while a headless pass is in flight (read by the scheduler's gate).
+ *
+ *  RE-EXPORTED, not defined here. The latch itself lives in the leaf `improvementPassLatch` so that
+ *  a module wanting only this boolean — `services/sparkleBusy`, and through it every UI component
+ *  whose graph reaches `stores/settingsStore` — does not acquire THIS module's dependencies with it.
+ *  That header explains what it cost when it did. Importers of `isPassRunning` from here keep
+ *  working; new readers of the bare boolean should take the leaf. */
+export { isPassRunning } from "./improvementPassLatch";
 
 /** How a pass ended. `cancelled` marks the deliberate-handoff path — an `ok: false` that is NOT
  *  a failure, so it must not warn or park the agent on "blocked". */
@@ -655,8 +656,10 @@ export async function runImprovementPass(
   consent: SparkleImprovementConsent,
   freshSlot = false,
 ): Promise<void> {
-  if (passRunning || consent === "never") return;
-  passRunning = true;
+  if (consent === "never") return;
+  // Claim-or-bail in ONE call: the check and the set used to be two statements, which is the shape
+  // a second pass can slip between.
+  if (!claimPass()) return;
   // Consume the armed retry before anything can fail: whatever happens next re-decides the
   // wait, and leaving it armed would make the gate fire again on the very next tick.
   //
@@ -888,6 +891,6 @@ export async function runImprovementPass(
     armRetryIfTransient(e instanceof Error ? e.message : String(e));
     setStatus(SPARKLE_AGENT_ID, "blocked");
   } finally {
-    passRunning = false;
+    releasePass();
   }
 }

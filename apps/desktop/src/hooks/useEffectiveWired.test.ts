@@ -39,7 +39,15 @@ beforeEach(() => {
   resetCable();
   // `openProjectIds: null` is the pre-feature state and means "every project is open"
   // (engine/openProjects) — the seed a fresh install has, so it is what these resolve against.
-  useUiStore.setState({ pairAssignment: {}, leftProjectId: null, openProjectIds: null } as never);
+  // `activeSpecial: null` explicitly — `setState` MERGES, so a suite that leaves the Sparkle pane up
+  // would light every later case's far end through `useFarEndOccupied` and quietly make the
+  // build-agent rows above assert nothing.
+  useUiStore.setState({
+    pairAssignment: {},
+    leftProjectId: null,
+    openProjectIds: null,
+    activeSpecial: null,
+  } as never);
   useProjectStore.setState({ projects: [mkProject("p1", "p1-a1")], selectedProjectId: "p1" } as never);
 });
 
@@ -193,5 +201,77 @@ describe("useEffectiveWired — the subscription", () => {
     expect(renderHook(() => useEffectiveWired()).result.current).toBe("off");
     expect(renderHook(() => usePairIsLive("right")).result.current).toBe(false);
     expect(renderHook(() => usePairIsLive("left")).result.current).toBe(false);
+  });
+});
+
+// THE IMPROVE-SPARKLE FAR END — the arm `useEffectiveWired` had and `usePairIsLive` did not.
+//
+// Bead sparkle-x0pvw. `useEffectiveWired` got its sparkle arm in c8cc17072 (bead sparkle-0rf5); its
+// sibling never did, and NOTHING pinned that they agree about this far end — the row above only ever
+// compared them with the pane CLOSED, where both answer from `farEndHasAgent` alone and cannot
+// disagree. So the concierge column flooded (it reads the fixed hook) while the sidebar row's joint
+// stayed shut (it reads the unfixed one): the half-drawn mount the founder reported.
+//
+// Every case here sets ZERO selected build agents, which is what makes the sparkle arm the ONLY
+// thing that can light the far end. With `selectedAgentId` non-null these would pass against the
+// unfixed hook and prove nothing.
+describe("the Improve-Sparkle pane as a far end", () => {
+  beforeEach(() => {
+    useProjectStore.setState({ projects: [mkProject("p1", null)] } as never);
+    useUiStore.setState({ activeSpecial: "sparkle" } as never);
+  });
+
+  it("lights the patched pair's JOINT with the Sparkle pane up and no agent selected", () => {
+    // THE REGRESSION GUARD. Against the pre-fix `patched && farEndHasAgent` this is false, which is
+    // the shut joint — the row not bleeding into the concierge column.
+    useCableStore.getState().patch("right");
+    expect(renderHook(() => usePairIsLive("right")).result.current).toBe(true);
+  });
+
+  it("makes the joint and the flood agree — the contradiction, stated as one assertion", () => {
+    useCableStore.getState().patch("right");
+    expect(renderHook(() => useEffectiveWired()).result.current).toBe("right");
+    expect(renderHook(() => usePairIsLive("right")).result.current).toBe(true);
+  });
+
+  // THE LEFT PAIR CANNOT BORROW THE SPARKLE PANE (roborev 58795). `activeSpecial` is a GLOBAL and
+  // the pane only ever mounts on SPARKLE_PANE_SIDE ("right"), so an unscoped arm reads a Sparkle
+  // reveal as an occupied far end for the LEFT pair too. That was harmless while a left-column
+  // Sparkle click patched the cable left — and stopped being harmless in the same commit that
+  // removed the left row, since the left pair can no longer originate a reveal at all.
+  //
+  // IT IS REACHABLE, not theoretical: `handleNavigate({view: "sparkle"})` (services/controlListener)
+  // sets `activeSpecial` with NO cable write, so a concierge navigate plus a left pair whose
+  // selection empties gets here with the cable genuinely patched left. Painting that joint open
+  // points the left rows at a concierge column showing the RIGHT pair's pane — the exact "joint
+  // drawn open onto a pair with nothing selected" this projection exists to prevent.
+  it("does not light the LEFT pair just because the Sparkle pane is up", () => {
+    useCableStore.getState().patch("left");
+    useUiStore.setState({ pairAssignment: { p1: "left" }, leftProjectId: "p1" } as never);
+    // The left pair's own project has nothing selected — so `farEndHasAgent` is false and the
+    // sparkle arm is the ONLY thing that could light it.
+    useProjectStore.setState({ projects: [mkProject("p1", null)] } as never);
+    expect(renderHook(() => usePairIsLive("left")).result.current).toBe(false);
+    // BOTH consumers, because the point of the shared helper is that they cannot disagree — and the
+    // unscoped version got this wrong in `useEffectiveWired` too, not just in `usePairIsLive`.
+    expect(renderHook(() => useEffectiveWired()).result.current).toBe("off");
+  });
+
+  it("does NOT light a pair the cable is not patched to", () => {
+    // The inverse guard: without it, `useFarEndOccupied` returning true for everything would satisfy
+    // the rows above. `patched` still has to hold.
+    useCableStore.getState().patch("right");
+    expect(renderHook(() => usePairIsLive("left")).result.current).toBe(false);
+  });
+
+  it("goes dark again when the Sparkle pane is dismissed", () => {
+    // Proves the value tracks `activeSpecial` rather than being unconditionally true, and that the
+    // hook WAKES on that store — the joint must shut when the pane closes, with no cable write.
+    useCableStore.getState().patch("right");
+    const { result } = renderHook(() => usePairIsLive("right"));
+    expect(result.current).toBe(true);
+
+    act(() => useUiStore.setState({ activeSpecial: null } as never));
+    expect(result.current).toBe(false);
   });
 });

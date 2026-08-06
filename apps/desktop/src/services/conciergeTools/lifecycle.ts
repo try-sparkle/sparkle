@@ -96,6 +96,16 @@ import { spinDownWorker } from "../workerSpawn";
 import { terminateIfCloud } from "../cloudAgents/terminate";
 import { log } from "../../logger";
 import type { AgentKind, AgentTab, Project, Runtime } from "../../types";
+// RESOLUTION FOR THE TWO PROCESS OPS. `locate` below scans `projects[].agents` and is why every
+// other op in this file answers `unknown-agent` for the app-owned Improve Sparkle agent — it is
+// deliberately not a member of that array (services/knownAgents). `findKnownAgent` is the resolver
+// built for "can I address this id?", and it has the Sparkle arm. Bead sparkle-x0pvw.
+import { findKnownAgent } from "../knownAgents";
+import { restartPane } from "../paneControl";
+import { killPty } from "../../pty";
+import { isSparkleAgentId } from "../sparkleAgent";
+// The ONE "is Improve Sparkle mid-work" rule, shared with the write gate and the get_state row.
+import { sparkleBusyNow } from "../sparkleBusy";
 
 // ── Operations + their risk ─────────────────────────────────────────────────────────────────────
 
@@ -111,6 +121,16 @@ export const LIFECYCLE_OPS = [
   "save_agent",
   "discard_agent",
   "spin_down_worker",
+  // THE TWO OPS THAT ACT ON A RUNNING PROCESS WITHOUT TOUCHING ITS RECORDS (bead sparkle-x0pvw).
+  // Every op above resolves its target through `locate`, a scan of `projects[].agents` — which is
+  // why all of them answer `unknown-agent` for the app-owned Improve Sparkle agent, an agent
+  // deliberately absent from that array. These two resolve through `findKnownAgent` instead, so the
+  // concierge can restart and stop the app's own agent as well as a build agent. They are the only
+  // members of this list that are safe to point at it: the rest assume a project row and a
+  // user-owned branch that do not exist for it, and `discard_agent` would delete the app-owned
+  // clone the hourly scheduler works in.
+  "restart_agent",
+  "stop_agent",
 ] as const;
 
 export type LifecycleOp = (typeof LIFECYCLE_OPS)[number];
@@ -148,6 +168,16 @@ export const LIFECYCLE_RISK: Record<LifecycleOp, LifecycleRisk> = {
   discard_agent: "irreversible",
   // Drops a worker's tab, PTY and worktree; its branch is kept.
   spin_down_worker: "routine",
+  // Re-spawns the PTY in place. `routine` because it is genuinely reversible: the spawn path
+  // resumes the agent's Claude session (`--resume <id>`), so the conversation survives — see
+  // services/paneControl, which calls this "safe by construction". It is the remedy for a pane
+  // wedged on a screen its CLI will not leave (a login prompt that ignores Escape).
+  restart_agent: "routine",
+  // Kills the PTY and nothing else — no tab, no worktree, no branch, and for Improve Sparkle no
+  // scheduler state. `routine` on the same grounds as restart: `restart_agent` brings it straight
+  // back. The RISK_OVERRIDES table in policy.ts still raises both to the `disruptive` approval
+  // tier, because "reversible" and "may stop work in flight" are different questions.
+  stop_agent: "routine",
 };
 
 /** One line per risk class, for the concierge to say when it explains itself. */
@@ -182,6 +212,10 @@ export type LifecycleRefusalReason =
   | "intent-mismatch" //        the intent names a different agent than the one targeted
   | "unknown-model" //          a spawn named a model this app does not offer (never downgraded)
   | "project-torn-out" //      ANY spawn into a project owned by a satellite (neither window mounts it)
+  | "agent-busy" //             restart/stop aimed at the app-owned agent while its hourly
+  //                            improvement pass is mutating the worktree it shares with its pane
+  | "no-pane" //                restart/stop aimed at an agent with no mounted pane — nothing to act
+  //                            on, and NOT an error: a closed agent simply has no PTY
   | "action-failed"; //         the underlying path failed (details in `message`)
 
 export interface LifecycleOk<T> {
@@ -1376,6 +1410,101 @@ function workerHasUncommittedWork(workerId: string): boolean {
   const bs = useRuntimeStore.getState().branchStatus[workerId];
   if (!bs) return true;
   return bs.dirty || bs.worktreeOnBranch === false;
+}
+
+
+// ── Restart / Stop — the two ops that act on a PROCESS, not on records ───────────────────────────
+//
+// WHY THESE RESOLVE DIFFERENTLY FROM EVERYTHING ELSE IN THIS FILE (bead sparkle-x0pvw). The founder
+// asked for the concierge to be able to restart and stop the app's own Improve Sparkle agent — the
+// motivating case being a pane wedged on a Claude CLI login screen that ignores Escape, where a
+// restart is the only real remedy. Every other op here goes through `locate`, and `locate` cannot
+// find that agent by construction. These two go through `findKnownAgent`.
+//
+// THEY DELIBERATELY DO NOT WIDEN WHAT CAN BE DESTROYED. A restart re-spawns a PTY and a stop kills
+// one; neither touches a tab, a worktree, a branch, a bead, or — for Improve Sparkle — one byte of
+// scheduler state. The destructive ops keep their `locate`-only resolution, which is what keeps
+// `discard_agent` unable to delete the app-owned clone the hourly pass works in.
+
+/** What a restart or a stop acted on. `agentId` echoes the target so a caller batching several can
+ *  tell the replies apart. */
+export interface ProcessActed {
+  agentId: string;
+  outcome: "restart" | "stop";
+}
+
+/** The shared preamble for both ops: resolve the agent, and refuse if acting now would collide with
+ *  the app-owned agent's hourly pass.
+ *
+ *  THE BUSY CHECK APPLIES TO RESTART AND STOP EXACTLY AS IT APPLIES TO A SEND, and that is a
+ *  deliberate reading of the founder's constraint rather than an omission. He asked for full access
+ *  "but I don't want you to break anything the agent is currently doing" — and a restart mid-pass is
+ *  strictly MORE disruptive than a send mid-pass: it kills the `claude` that is writing the shared
+ *  worktree and leaves whatever it had uncommitted behind for the next pass to clean up. There is no
+ *  force flag: a genuinely wedged pass already clears itself (a 30-minute client watchdog with a
+ *  35-minute Rust reclaim behind it), so the escape hatch would only ever be used to do the damage. */
+function resolveForProcessOp(
+  op: "restart_agent" | "stop_agent",
+  agentId: string,
+): LifecycleRefused | null {
+  if (findKnownAgent(agentId) === undefined) {
+    return refuse(op, "unknown-agent", unknownAgent(agentId));
+  }
+  if (isSparkleAgentId(agentId)) {
+    const busy = sparkleBusyNow(Date.now());
+    if (busy) return refuse(op, "agent-busy", busy.detail);
+  }
+  return null;
+}
+
+/**
+ * Re-spawn an agent's terminal in place.
+ *
+ * The conversation SURVIVES: the spawn path resumes the agent's Claude session (`--resume <id>`),
+ * which is why services/paneControl calls restarting "safe by construction". This is the remedy for
+ * a pane stuck on a screen its CLI will not leave — the login prompt that ignores Escape being the
+ * case that prompted it.
+ *
+ * `restartPane` returns false when no pane is mounted, and that is reported as `no-pane` rather than
+ * `action-failed`: a closed agent picks up a fresh spawn the next time it opens, so there is nothing
+ * wrong, nothing to retry, and nothing that happened.
+ */
+export async function restartAgent(agentId: string): Promise<LifecycleResult<ProcessActed>> {
+  const refusal = resolveForProcessOp("restart_agent", agentId);
+  if (refusal) return refusal;
+  if (!restartPane(agentId)) {
+    return refuse(
+      "restart_agent",
+      "no-pane",
+      `${agentId} has no terminal open right now, so there was nothing to restart. It will start fresh the next time it is opened.`,
+    );
+  }
+  log.info("concierge", "restarted an agent's terminal", { agentId });
+  return ok("restart_agent", { agentId, outcome: "restart" });
+}
+
+/**
+ * Kill an agent's terminal, and nothing else.
+ *
+ * NARROW BY DESIGN. The tab, the worktree, the branch and (for Improve Sparkle) the hourly scheduler
+ * are all untouched — `restart_agent` brings the process straight back. It is emphatically NOT a
+ * cancel for the headless improvement pass: that pass runs as its own child with its own watchdog,
+ * and killing it mid-write is the thing this whole change was conditioned on not doing. A pass in
+ * flight refuses this op, same as a send.
+ */
+export async function stopAgent(agentId: string): Promise<LifecycleResult<ProcessActed>> {
+  const refusal = resolveForProcessOp("stop_agent", agentId);
+  if (refusal) return refusal;
+  try {
+    await killPty(agentId);
+  } catch (e) {
+    // `killPty` does NOT swallow the "no such pty" teardown race the way the other PTY ops do, so a
+    // stop aimed at an agent whose terminal has already gone lands here. Reported honestly rather
+    // than as a success: the caller asked for a state change and none was made.
+    return refuse("stop_agent", "action-failed", `Could not stop ${agentId}: ${errText(e)}`);
+  }
+  log.info("concierge", "stopped an agent's terminal", { agentId });
+  return ok("stop_agent", { agentId, outcome: "stop" });
 }
 
 // ── Small shared bits ───────────────────────────────────────────────────────────────────────────

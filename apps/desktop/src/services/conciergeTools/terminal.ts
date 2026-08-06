@@ -86,7 +86,10 @@ import {
   knownAgentLiveness,
   type KnownAgentSource,
 } from "../knownAgents";
-import { SPARKLE_AGENT_ID } from "../sparkleAgent";
+import { SPARKLE_AGENT_ID, isSparkleAgentId } from "../sparkleAgent";
+// The ONE "is Improve Sparkle mid-work" rule, shared with the `get_state` row that publishes it as
+// `activity` — so the write gate and the roster cannot disagree about the same agent in one turn.
+import { sparkleBusyNow } from "../sparkleBusy";
 import { calmNewAgent } from "../../engine/newAgentAttention";
 import { useInteractionStore } from "../../stores/interactionStore";
 import { useRuntimeStore } from "../../stores/runtimeStore";
@@ -257,9 +260,15 @@ export interface AgentStatusReport {
   detail: string;
 }
 
-/** Where a tool send ended up. The dispatcher's own taxonomy plus the one refusal this layer makes
- *  on its own behalf. */
-export type ConciergeSendPath = ConciergeDispatchPath | "unknown-agent";
+/** Where a tool send ended up. The dispatcher's own taxonomy plus the two refusals this layer makes
+ *  on its own behalf.
+ *
+ *  `sparkle-busy` is the second (bead sparkle-x0pvw): the app-owned Improve Sparkle agent shares ONE
+ *  worktree between its interactive pane and its hourly headless pass, and the app enforces one
+ *  `claude` per worktree — so a send landing mid-pass puts a second mutator in that tree. It is a
+ *  path of its OWN rather than folded into an existing refusal because the remedy is unlike every
+ *  other one here: nothing is wrong, nothing needs retrying, and the correct action is to wait. */
+export type ConciergeSendPath = ConciergeDispatchPath | "unknown-agent" | "sparkle-busy";
 
 export interface ConciergeSendResult {
   ok: boolean;
@@ -840,6 +849,14 @@ function sendDetail(path: ConciergeSendPath, agentId: string): string {
       return "Not sent: the agent is waiting on something on screen (a prompt or a credential field), which this text would have been submitted into.";
     case "unknown-agent":
       return `Not sent: there is no open agent with id ${agentId}.`;
+    // THE GENERIC FORM. The refusal site passes the LIVE sentence from services/sparkleBusy instead
+    // of this, because "which hold, and how long" is exactly what makes the answer actionable — a
+    // 30-minute headless pass and a 20-second pane turn call for very different waits. This line is
+    // the honest fallback for any caller that reaches `sendDetail` with the path alone, and it says
+    // "wait" rather than offering an alternative, because there is no rephrasing that makes a second
+    // writer in that worktree safe (AGENTS.md: a remedy string is an instruction).
+    case "sparkle-busy":
+      return "Not sent: the Improve Sparkle agent is mid-work in the worktree this would write to. Wait for it rather than retrying.";
     default: {
       const unhandled: never = path;
       void unhandled;
@@ -884,11 +901,14 @@ export async function sendToAgentTerminal(
   authority: ConciergeToolAuthority,
   opts: SendToAgentTerminalOptions = {},
 ): Promise<ConciergeSendResult> {
-  const refuse = (path: ConciergeSendPath): ConciergeSendResult => ({
+  // `detailOverride` exists for ONE caller: gate 2.5 below, whose sentence depends on live state
+  // (which hold, and for how long) rather than on the path alone. Everything else takes the
+  // path-derived line, so the taxonomy stays the single source of the wording.
+  const refuse = (path: ConciergeSendPath, detailOverride?: string): ConciergeSendResult => ({
     ok: false,
     agentId,
     path,
-    detail: sendDetail(path, agentId),
+    detail: detailOverride ?? sendDetail(path, agentId),
   });
 
   // Gate 1. Fails closed on every shape TypeScript can't see — including a `concierge-tool`
@@ -912,6 +932,35 @@ export async function sendToAgentTerminal(
     }
     // Otherwise it's a cloud agent: fall through, so the refusal comes from the dispatcher that
     // owns it rather than from a second copy of the same sentence invented here.
+  }
+
+  // Gate 2.5. THE APP'S OWN AGENT SHARES ITS WORKTREE WITH A SCHEDULER (bead sparkle-x0pvw).
+  //
+  // Improve Sparkle has two bodies — the interactive pane whose PTY this write targets, and an
+  // hourly HEADLESS `claude -p` pass — and they work in ONE worktree, under the app's one-claude-
+  // per-worktree invariant. A send delivered mid-pass is therefore not merely ill-timed: it puts a
+  // second mutator into a tree another process is committing from. Giving the concierge access to
+  // this agent was explicitly conditioned on not breaking what it is already doing, and this gate is
+  // where that condition lives.
+  //
+  // HERE, NOT IN `agentCanAcceptInput`. That predicate answers "does this agent have a local PTY",
+  // and `sendControlKey`, dictation and the API-recovery ping all gate on it too — overloading it
+  // would silently block those paths as well, including the `esc` that is the way to interrupt a
+  // runaway agent. This refusal belongs to the free-text send alone.
+  //
+  // The refusal carries the LIVE sentence, and it is the SAME reading the agent's `get_state` row
+  // publishes as its `activity` (services/sparkleBusy) — so a caller cannot be told "idle" by the
+  // roster and "busy" by the write in the same turn. That contradiction is not a cosmetic one: a
+  // model reads a refusal that disagrees with the roster as a malfunctioning tool, and retries.
+  if (isSparkleAgentId(agentId)) {
+    const busy = sparkleBusyNow(Date.now());
+    if (busy) {
+      log.info("concierge", "tool send held — Improve Sparkle is mid-work", {
+        agentId,
+        kind: busy.kind,
+      });
+      return refuse("sparkle-busy", busy.detail);
+    }
   }
 
   const r = await dispatchConciergeAnswer(agentId, text, {
@@ -973,18 +1022,31 @@ export interface ConciergeToolDescriptor {
 // `string` union routes nothing and catches nothing). `satisfies` keeps the shape check this
 // annotation was doing while preserving the literal names, so adding a descriptor here is a
 // TYPECHECK FAILURE in the registry until it is routed.
-/** The one sentence that makes "Improve Sparkle" REACHABLE rather than merely resolvable.
+/** The one sentence that names "Improve Sparkle" at the point of use.
  *
- *  Its id is the only agent address in the app that a caller cannot discover: it is app-owned, so it
- *  is deliberately absent from `get_state`'s roster, and the concierge's whole model of "which
- *  agents exist" comes from that roster. Fixing the resolver without saying the id out loud would
- *  leave the capability present and undiscoverable — which is indistinguishable, from the user's
- *  seat, from the bug it fixes. Appended to all three descriptions because a caller may reach for
- *  any of them first, and the read ops are the ones it will reach for before it dares a write. */
+ *  IT USED TO SAY THE OPPOSITE, and updating it is not housekeeping — it is the same change. This
+ *  note existed because the id was "the only agent address in the app that a caller cannot
+ *  discover": app-owned, deliberately absent from `get_state`'s roster, while the concierge's whole
+ *  model of "which agents exist" comes from that roster. `get_state` now LISTS the agent (bead
+ *  sparkle-x0pvw, services/controlListener), so the sentence "it does NOT appear in get_state's
+ *  roster" became false the moment that landed — and a false line in a tool description is worse
+ *  than a missing one, because a model will act on it and skip the roster lookup that would now
+ *  answer. The repo rule is explicit: a fix that changes behaviour must update every string that
+ *  described the old behaviour.
+ *
+ *  What is left worth saying is the part that is still true and still not derivable from the roster
+ *  row: the id is STABLE (so it can be written down rather than re-discovered each turn), and the
+ *  agent is APP-OWNED, which is why the destructive lifecycle ops refuse it. Appended to all three
+ *  descriptions because a caller may reach for any of them first, and the read ops are the ones it
+ *  will reach for before it dares a write. */
 const SPARKLE_AGENT_TOOL_NOTE =
   `Works for the built-in Improve Sparkle agent too, at the stable id \`${SPARKLE_AGENT_ID}\` — ` +
-  "it is the app's own self-improvement agent, so it does NOT appear in get_state's roster, but " +
-  "these ops reach it exactly as they reach a build agent.";
+  "the app's own self-improvement agent. It appears in get_state's roster like any other agent " +
+  "(marked `appOwned: true`), and these ops reach it exactly as they reach a build agent. Because " +
+  "the app owns it, the destructive lifecycle ops (discard/close/ship/save) refuse it; restart and " +
+  "stop do not. It runs an hourly improvement pass in a worktree its interactive pane shares, so a " +
+  "send while that pass is running is refused with a reason rather than queued — its roster row's " +
+  "`activity` says when it is mid-pass, so read that before writing.";
 
 export const CONCIERGE_TERMINAL_TOOLS = [
   {

@@ -485,6 +485,14 @@ const RISK_OVERRIDES: Partial<Record<ConciergeToolName, ConciergeRiskClass>> = {
   close_agent: "disruptive",
   // Same, for a worker: stops its session and deletes its worktree.
   spin_down_worker: "disruptive",
+  // BOTH ARE `routine` IN THEIR DOMAIN AND `disruptive` HERE, which is exactly the split this table
+  // exists for. Their domain word answers "is this reversible" — it is: a stop is undone by a
+  // restart, and a restart resumes the Claude session rather than starting it over. This table
+  // answers a different question: may it stop work IN FLIGHT without asking a human first? It may —
+  // a restart kills a `claude` mid-turn — and that is the property the `disruptive` tier gates on,
+  // the same reason close_agent and spin_down_worker are listed above. Bead sparkle-x0pvw.
+  restart_agent: "disruptive",
+  stop_agent: "disruptive",
   // Registers an ARBITRARY absolute path as a project. Not destructive, but it is the one
   // workspace op that takes a filesystem path from the model and gives it standing in the app.
   add_project_from_folder: "disruptive",

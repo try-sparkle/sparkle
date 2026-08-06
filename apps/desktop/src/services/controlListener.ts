@@ -39,6 +39,9 @@ import { useUiStore, type ThemePref } from "../stores/uiStore";
 import type { StatusBand } from "../engine/buildSections";
 import { rollupDotAccessor } from "../engine/workerRollup";
 import { agentDisplayName } from "../engine/agentDisplayName";
+import { sparkleAgentIdFor, SPARKLE_AGENT_DISPLAY_NAME } from "./sparkleAgent";
+import { sparkleActivityLine } from "./sparkleBusy";
+import { APP_WINDOW_LABEL } from "../windowContext";
 import { getConfig, setConfigValue, setConfigValues } from "./config";
 import { appendConciergeGuideline } from "./conciergeGuidelines";
 import { getModelCatalog } from "./models";
@@ -779,7 +782,9 @@ function handleGetState(req: ControlRequest): {
     if (!kids.length) return dot; // a childless or worker row speaks only for itself
     return kids.every(wasObserved) ? dot : null;
   };
-  const all = projects.flatMap((p) =>
+  // THE USER'S BUILD AGENTS. `all` — the list every count below is derived from — is this plus the
+  // app-owned Improve Sparkle row appended after it; see the block below.
+  const rosterAgents = projects.flatMap((p) =>
     p.agents.map((a) => ({
       id: a.id,
       // The SHARED rule (engine/agentDisplayName), not `a.name`. A bare `a.name` is right only for
@@ -830,6 +835,73 @@ function handleGetState(req: ControlRequest): {
       ...goalAndStallFields(a, calmStatus[a.id] ?? "stopped", now),
     })),
   );
+  // ── THE IMPROVE-SPARKLE ROW ───────────────────────────────────────────────────────────────────
+  //
+  // THE BUG THIS CLOSES (bead sparkle-x0pvw). The concierge pulled the FULL roster — scope "all",
+  // 47 agents — and the app's own Improve Sparkle agent was not in it. Its id was therefore
+  // undiscoverable, so when the founder asked the concierge to unstick it from a wedged login
+  // screen, the concierge could do nothing: not refused by policy, simply unaddressable. The terminal
+  // ops had ALREADY been able to reach it since 462c32f79 (services/knownAgents, arm 2) — that commit
+  // documented the id in three tool descriptions precisely because this roster does not list it, and
+  // said outright that a capability nobody can discover is, from the user's seat, the bug.
+  //
+  // WHY IT WAS ABSENT, AND WHY THIS IS NOT AN OVERTURN. The omission is by DATA SOURCE, one level
+  // upstream of any predicate: `all` above flat-maps `projects[].agents`, and the app-owned Sparkle
+  // agent is deliberately never a member of that array (services/knownAgents:42-45 — persistence,
+  // reaping, worker rollups and the sidebar's ordering all iterate it). That reasoning still holds
+  // and `projectStore` is untouched here. Only the WIRE REPLY gains a row.
+  //
+  // IT ALSO FIXES AN INCONSISTENCY THIS REPLY ALREADY HAD. Improve Sparkle's WORKERS are ordinary
+  // roster rows carrying `parentId === <the sparkle id>` (AgentSidebar builds its `+N` from exactly
+  // that predicate), so before this the reply emitted workers whose parent was not in it and whose
+  // rollup belonged to no head. The head row gives them a parent that exists.
+  //
+  // BEFORE THE SCOPE FILTER, deliberately: `totalAgents`, `omitted` and `omittedIds` are all derived
+  // from `all`, so appending here keeps every one of them arithmetically correct with no other edit.
+  // It needs no special case in the "active" filter either — the pane's id is in `openAgentIds`
+  // whenever it is open, so the existing `openIds.has(a.id)` clause carries it.
+  const sparkleId = sparkleAgentIdFor(APP_WINDOW_LABEL);
+  // ONE READING for both the status and the activity below, off the SAME clock `now` every other
+  // field here uses — two calls milliseconds apart could report a pass as running for one field and
+  // finished for the other, which is the self-contradictory row this reply already had to be fixed
+  // for once (roborev 55451/55525, the calm-map notes above).
+  const sparkleBusy = sparkleActivityLine(now);
+  const sparkleRow = {
+    id: sparkleId,
+    // THE NAME THE ROW ON SCREEN USES, not `SPARKLE_AGENT_NAME` (which is the @-mention handle,
+    // "Sparkle"). A roster and a screen naming one id two different things is the failure
+    // engine/agentDisplayName's header was written about, and the founder calls this agent
+    // "Improve Sparkle".
+    name: SPARKLE_AGENT_DISPLAY_NAME,
+    // `"build"`, NOT a fourth `AgentKind`. This row is a wire shape, not an `AgentTab`, and
+    // `AgentKind` is switched on exhaustively across the app — a new variant would ripple through
+    // all of it to describe an agent services/knownAgents already calls "a build-ish agent with a
+    // PTY". `appOwned` below is what actually distinguishes it.
+    kind: "build" as const,
+    // "working" WHILE A HEADLESS PASS IS IN FLIGHT, even with no pane open — and that is a
+    // correctness fix, not a cosmetic one. This agent has TWO bodies: the interactive pane (which
+    // owns the PTY the status map tracks) and the hourly `claude -p` pass, which has no pane at all.
+    // Reading the pane's map alone reports "stopped" for an agent that is at that moment mutating
+    // its worktree, and "stopped" is exactly what the scope-"active" filter below drops — so the one
+    // state in which the concierge most needs to see this row is the state that hid it. Saying
+    // "working" is both true and sufficient: the existing `a.status !== "stopped"` clause then
+    // carries the row, with no special case in the filter.
+    status: sparkleBusy ? "working" : (calmStatus[sparkleId] ?? "stopped"),
+    rollupDot: observableDotOf(sparkleId),
+    liveness: livenessOf(sparkleId, status, openIds),
+    parentId: null,
+    // THE SHARED BUSY RULE (services/sparkleBusy), the same one the write gate refuses on — so the
+    // roster can never say "idle" about an agent the very next send will refuse as busy. That
+    // disagreement is worse than either fact alone: a model reads a refusal contradicting the roster
+    // as a broken tool and retries.
+    activity: sparkleBusy,
+    // THE ONE FIELD NO OTHER ROW CARRIES, and it is absent rather than `false` on them — this reply
+    // is the largest thing the control API puts in a context window and the budget is permanent.
+    // It says: the app owns this agent, so the destructive lifecycle ops (discard/close/ship/save)
+    // will refuse it. Without it a caller can only learn that by being refused.
+    appOwned: true as const,
+  };
+  const all = [...rosterAgents, sparkleRow];
   const agents = all.filter((a) => {
     if (scope === "all") return true;
     // A ROW filter, and the concierge has no row — so this is legitimately empty for it. That is

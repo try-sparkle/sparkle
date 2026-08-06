@@ -13,7 +13,19 @@ import { retroEmissionProtocol } from "./buildAgent";
  *  normal agents but is never part of any project's `agents` array — the double-underscore
  *  namespace keeps it from ever colliding with a real UUID. */
 export const SPARKLE_AGENT_ID = "__sparkle_self__";
+/** THE MENTION HANDLE — what a human types after `@` to address this agent, and what the mounted
+ *  pane's chip falls back to. Deliberately the short form; see Concierge/mentions. */
 export const SPARKLE_AGENT_NAME = "Sparkle";
+/** WHAT THE ROW ON SCREEN CALLS ITSELF, and therefore what any surface NAMING this agent to a human
+ *  or to a model must use — the sidebar row, and `get_state`'s roster.
+ *
+ *  It is a constant rather than the string literal it replaces because the roster and the screen
+ *  naming one id two different things is a bug this repo has already paid for once: see the header
+ *  of engine/agentDisplayName for the pair that sent a user chasing a bug that did not exist. The
+ *  row said "Improve Sparkle" while every programmatic surface said `SPARKLE_AGENT_NAME`, so listing
+ *  the agent in `get_state` (bead sparkle-x0pvw) would have introduced exactly that split — the
+ *  founder asks for "Improve Sparkle" and the roster would have answered "Sparkle". */
+export const SPARKLE_AGENT_DISPLAY_NAME = "Improve Sparkle";
 /** Synthetic project id used only to namespace this agent's worktree under app-data. */
 export const SPARKLE_PROJECT_ID = "sparkle-self";
 

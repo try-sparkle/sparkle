@@ -241,6 +241,13 @@ const LIFECYCLE_PHRASES: Record<LifecycleOp, OpPhrase> = {
   preview_close: phrase("Checking what closing %s would do", "Checked what closing %s would do", AGENT),
   preview_discard: phrase("Checking what discarding %s would lose", "Checked what discarding %s would lose", AGENT),
   close_agent: phrase("Closing %s", "Closed %s", AGENT),
+  // "Restarting", not "Closing" or "Starting": a human reading this column must not think their
+  // agent was torn down and replaced. It is the same terminal with the same resumed conversation.
+  restart_agent: phrase("Restarting %s's terminal", "Restarted %s's terminal", AGENT),
+  // "Stopping ... terminal", with the noun spelled out for the same reason. A bare "Stopping %s"
+  // reads as the agent being ended, which is `close_agent`'s meaning — this kills only the process,
+  // and the tab, worktree and branch all survive.
+  stop_agent: phrase("Stopping %s's terminal", "Stopped %s's terminal", AGENT),
   ship_agent: phrase("Shipping %s's work", "Shipped %s's work", AGENT),
   save_agent: phrase("Saving %s's work", "Saved %s's work", AGENT),
   discard_agent: phrase("Discarding %s", "Discarded %s", AGENT),

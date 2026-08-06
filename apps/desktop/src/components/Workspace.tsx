@@ -1714,8 +1714,22 @@ export function Workspace() {
             }
           >
             {/* `slotSide` because `leftProject` is null whenever this pair's tab is closed, and a
-                column with no project cannot ask the assignment map which side it is on. */}
-            <MemoAgentSidebar project={leftProject} slotSide="left" covered={leftBoardActive} />
+                column with no project cannot ask the assignment map which side it is on.
+
+                `showSparkleRow={false}` CARRIES OUT THE SENTENCE ABOVE, which was written and then
+                not applied: the Sparkle PANE was excluded from this pair, the pinned ROW was not, so
+                Improve Sparkle appeared in BOTH build columns. The left copy could not even work —
+                `paneCoversMe` (AgentSidebar) is `pairSide === SPARKLE_PANE_SIDE && …`, permanently
+                false here, so the row painted transparent over `C.deepForest` (the black row the
+                founder reported) with no fillets, while a click patched the cable LEFT and mounted
+                the pane RIGHT. It stays fully mountable from the right column — this hides a
+                duplicate, it does not remove the agent from the build columns. Bead sparkle-x0pvw. */}
+            <MemoAgentSidebar
+              project={leftProject}
+              slotSide="left"
+              covered={leftBoardActive}
+              showSparkleRow={false}
+            />
             {/* NO `AgentPaneList` HERE. The panes are mounted once, elsewhere, and portalled in —
                 this stage contributes the destination (`ref`) and nothing else, which is what keeps
                 a project moving to the other pair from unmounting its terminals. See `PaneHost`. */}

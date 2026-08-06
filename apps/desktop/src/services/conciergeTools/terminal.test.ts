@@ -16,7 +16,7 @@
 // unresolved policy must not produce a write, an agent that can't take input must not produce a
 // write, and a cloud agent must come back with the EXISTING honest refusal rather than a new lie.
 // Those assertions all check that nothing reached the PTY, not merely that `ok` was false.
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // The write primitives — mocked so "did this reach the PTY?" is directly observable. Every refusal
 // test below asserts against these, because `ok: false` alone would still pass if the text had gone
@@ -65,6 +65,10 @@ import { NEW_AGENT_GRACE_MS } from "../../engine/newAgentAttention";
 // hook events seen" (no reading at all) from a real repeating-command verdict.
 import { noteThrashEvent, resetThrashTracking } from "../../engine/agentThrash";
 import { SPARKLE_AGENT_ID } from "../sparkleAgent";
+// THE REAL LATCH, not a mock of it: `improvementPassLatch` is a leaf with `claimPass`/`releasePass`,
+// so the pass branch of the Improve-Sparkle write gate is driven through services/sparkleBusy end to
+// end rather than by standing in the rule under test.
+import { claimPass, releasePass } from "../improvementPassLatch";
 import {
   conciergeToolAuthority,
   type ConciergeToolAuthority,
@@ -1176,6 +1180,60 @@ describe("the Improve Sparkle agent is addressable", () => {
     const r = await sendToAgentTerminal(ghost, "hello", ALLOWED);
     expect(r.path).toBe("unknown-agent");
     expect(submitPrompt).not.toHaveBeenCalled();
+  });
+
+  // ── A SEND MUST NOT LAND WHILE A HEADLESS PASS IS WRITING THE WORKTREE ──────────────────────
+  //
+  // Improve Sparkle has TWO bodies sharing ONE worktree — the interactive pane whose PTY a send
+  // targets, and an hourly headless `claude -p` pass — under the app's one-claude-per-worktree
+  // invariant. A send mid-pass puts a SECOND claude in a tree the first is committing from.
+  //
+  // ONLY the pass is a hold. A pane mid-turn is the same claude the write is addressed to, and the
+  // test above ("delivers a message to it, exactly as it would to a build agent") seeds exactly that
+  // and demands delivery — holding on it would have made this the one agent you cannot type at
+  // while it thinks.
+  //
+  // WHAT EACH CASE ASSERTS IS THE ABSENCE OF THE WRITE, not the presence of a refusal: a test
+  // checking only `r.path` would pass against a gate that refused AFTER dispatching, which is the
+  // defect that matters here — the damage is the second mutator, not the reply.
+  describe("and it is refused while a headless improvement pass is in flight", () => {
+    beforeEach(() => {
+      seedSparkle("working");
+      claimPass();
+    });
+    afterEach(() => releasePass());
+
+    it("refuses without writing", async () => {
+      const r = await sendToAgentTerminal(SPARKLE_AGENT_ID, "status?", ALLOWED);
+      expect(r.ok).toBe(false);
+      expect(r.path).toBe("sparkle-busy");
+      // THE ASSERTION THAT MATTERS.
+      expect(submitPrompt).not.toHaveBeenCalled();
+    });
+
+    it("says WAIT rather than offering a retry", async () => {
+      const r = await sendToAgentTerminal(SPARKLE_AGENT_ID, "status?", ALLOWED);
+      expect(r.detail).toEqual(expect.stringContaining("wait"));
+      expect(r.detail).not.toMatch(/try again/i);
+    });
+
+    it("DELIVERS once the pass ends — the inverse guard", async () => {
+      // Without this, a gate hardwired to refuse would satisfy both rows above while making the
+      // agent permanently unreachable, which is the opposite of what this work is for.
+      releasePass();
+      const r = await sendToAgentTerminal(SPARKLE_AGENT_ID, "status?", ALLOWED);
+      expect(r.path).toBe("free-text");
+      expect(submitPrompt).toHaveBeenCalled();
+    });
+
+    it("holds ONLY the app-owned agent — an ordinary build agent is unaffected", async () => {
+      // The pass latch is global module state. Without the `isSparkleAgentId` scope, a pass in
+      // flight would silently freeze sends to every agent in the app.
+      seedAgent("local"); // `seedSparkle` above empties `projects`; put the build agent back
+      const r = await sendToAgentTerminal(AGENT, "run the tests", ALLOWED);
+      expect(r.path).toBe("free-text");
+      expect(submitPrompt).toHaveBeenCalled();
+    });
   });
 });
 

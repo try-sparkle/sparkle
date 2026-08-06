@@ -11,7 +11,7 @@
 // `effectiveWired`.
 import { useCableStore } from "../stores/cableStore";
 import { useProjectStore } from "../stores/projectStore";
-import { useUiStore } from "../stores/uiStore";
+import { useUiStore, SPARKLE_PANE_SIDE } from "../stores/uiStore";
 import { effectiveWired, type PairSide, type WiredSide } from "../engine/cable";
 import { resolveSideProject } from "../engine/pairs";
 
@@ -51,21 +51,45 @@ function useFarEndHasAgent(side: PairSide | null): boolean {
   });
 }
 
+/** IS THE FAR END OCCUPIED — the ONE join, for both hooks below.
+ *
+ *  THE IMPROVE-SPARKLE PANE IS A VALID FAR END EVEN WITH ZERO BUILD AGENTS (bead sparkle-0rf5). The
+ *  app-owned Sparkle agent is never a `project.agents` member (services/knownAgents), so
+ *  `useFarEndHasAgent` — which asks `project.selectedAgentId !== null` — reads the patched side as
+ *  empty and the projection darkens the cable on the exact surface whose whole purpose is that
+ *  connection: the click patches the store, the projection forces the side back to "off", and the
+ *  mount is a visual no-op. Counting an active sparkle pane as an occupied far end lights it.
+ *
+ *  SCOPED TO `SPARKLE_PANE_SIDE`, and that scoping is load-bearing NOW in a way it was not before
+ *  (roborev 58795). `activeSpecial` is a GLOBAL, and the original arm rode it unscoped on the
+ *  argument that "the patched side is whichever the click chose". That argument died in the same
+ *  commit that added this helper: removing the duplicate Improve-Sparkle row from the LEFT build
+ *  column means the left pair can no longer originate a Sparkle reveal at all, so on the left the
+ *  bare global is now reachable only as a FALSE POSITIVE. And it is genuinely reachable —
+ *  `handleNavigate({view: "sparkle"})` (services/controlListener) sets `activeSpecial` with no cable
+ *  write whatsoever, so a concierge navigate plus a left pair whose selection later empties would
+ *  paint the left rows' joints open toward a concierge column showing the RIGHT pair's pane. That is
+ *  exactly "a joint drawn open onto a pair with nothing selected", the lie this projection exists to
+ *  prevent. Sharing the join unscoped would have propagated the stale assumption into a second
+ *  consumer instead of retiring it. No-op for the right pair, which is the case the mount fix is about.
+ *
+ *  IT IS A FUNCTION RATHER THAN THE EXPRESSION WRITTEN TWICE, and that is the fix, not a tidy-up
+ *  (bead sparkle-x0pvw). `useEffectiveWired` got the sparkle arm and `usePairIsLive` did not, so the
+ *  concierge column flooded while the sidebar row kept its joint SHUT — no bleed, an unbroken
+ *  vertical boundary, a half-drawn mount. That is the SAME contradiction this file's header was
+ *  written about ("each consumer having its own copy of that join"), one arm later: the two hooks
+ *  agreed only about build agents. Sharing the join is what makes a third divergence unwritable. */
+function useFarEndOccupied(side: PairSide | null): boolean {
+  const farEndHasAgent = useFarEndHasAgent(side);
+  const sparkleActive = useUiStore((s) => s.activeSpecial === "sparkle");
+  return farEndHasAgent || (sparkleActive && side === SPARKLE_PANE_SIDE);
+}
+
 /** The side the shell should DRAW as wired: the patched side, or `"off"` when nothing is selected in
  *  it. */
 export function useEffectiveWired(): WiredSide {
   const wired = useCableStore((s) => s.wired);
-  const farEndHasAgent = useFarEndHasAgent(wired === "off" ? null : wired);
-  // THE IMPROVE-SPARKLE PANE IS A VALID FAR END EVEN WITH ZERO BUILD AGENTS (bead sparkle-0rf5). The
-  // app-owned Sparkle agent is never a `project.agents` member (services/knownAgents), so
-  // `useFarEndHasAgent` — which asks `project.selectedAgentId !== null` — reads the patched side as
-  // empty and `effectiveWired` darkens the cable on the exact surface whose whole purpose is that
-  // connection: the click patches the store, the projection forces the side back to "off", and the
-  // mount is a visual no-op. Counting an active sparkle pane as an occupied far end lights it. (This
-  // rides the GLOBAL `activeSpecial` — the pane is not yet pair-scoped; see the bead — so with two
-  // pairs the patched side is whichever the click chose, which is exactly the side the cable names.)
-  const sparkleActive = useUiStore((s) => s.activeSpecial === "sparkle");
-  return effectiveWired(wired, farEndHasAgent || sparkleActive);
+  return effectiveWired(wired, useFarEndOccupied(wired === "off" ? null : wired));
 }
 
 /** Does THIS pair hold a cable that is actually connected? The projected form of `pairIsLive`, for
@@ -77,6 +101,9 @@ export function useEffectiveWired(): WiredSide {
  *  silently dropped that narrowing while the comment at its call site still promised it. */
 export function usePairIsLive(pair: PairSide): boolean {
   const patched = useCableStore((s) => s.wired === pair);
-  const farEndHasAgent = useFarEndHasAgent(patched ? pair : null);
-  return patched && farEndHasAgent;
+  // BOUND TO A LOCAL FIRST, never inlined into the `&&`. `patched && useFarEndOccupied(...)` reads
+  // fine and short-circuits the CALL, which makes it a conditional hook — the subscription count
+  // changes with the cable and React tears the render on the next patch.
+  const occupied = useFarEndOccupied(patched ? pair : null);
+  return patched && occupied;
 }

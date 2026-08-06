@@ -4,6 +4,17 @@ import { useProjectStore } from "../stores/projectStore";
 import { buildConciergeFeed } from "./conciergeFeed";
 import { useRuntimeStore, RUNTIME_PERSIST_KEY } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
+// The app-owned Improve Sparkle agent (bead sparkle-x0pvw). `SPARKLE_AGENT_ID` is the canonical id
+// this window answers for — `sparkleAgentIdFor(APP_WINDOW_LABEL)` resolves to exactly it, and the
+// tests spell the constant rather than the literal so a rename cannot leave them asserting a string
+// nothing produces. `notePaneStatus` / `resetPaneBusyForTests` drive the REAL busy latch, so these
+// exercise services/sparkleBusy end to end instead of mocking the thing under test.
+import { SPARKLE_AGENT_ID } from "./sparkleAgent";
+// THE SHARED BUSY RULE IS THE SEAM, not `improvementPass` behind it. What this file is responsible
+// for is PUBLISHING that rule on the roster row — promoting `status` to "working" and carrying the
+// line as `activity`. Whether a pass is actually in flight is `sparkleBusy`'s own question, asserted
+// in sparkleBusy.test.ts, so standing this in tests the contract rather than restating it.
+import { sparkleActivityLine } from "./sparkleBusy";
 import { ZOOM_COLUMNS } from "../engine/columnZoom";
 
 // --- mock the Tauri event layer: capture the registered handler so tests can fire events. ---
@@ -114,6 +125,7 @@ vi.mock("./conciergeTools/registry", async (importOriginal) => {
 // which is before an ordinary module-level const has initialised. The other mocks in this file only
 // touch their spies inside an arrow, so they get away with it; this one would be a TDZ error.
 const { classifyReceiptMock } = vi.hoisted(() => ({ classifyReceiptMock: vi.fn() }));
+vi.mock("./sparkleBusy", () => ({ sparkleActivityLine: vi.fn(() => null) }));
 vi.mock("./conciergeReceiptClassifier", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./conciergeReceiptClassifier")>();
   classifyReceiptMock.mockImplementation(actual.classifyConciergeActionReceipt);
@@ -197,6 +209,10 @@ describe("controlListener", () => {
     // Same reason as the two above: without it, a loop staged by one case leaves every later case
     // reading its agent as thrashing.
     resetThrashTracking();
+    // Same class of leak as the three above: a case that leaves the busy line set would leave every
+    // later case reading the Improve Sparkle row as "working" — quietly flipping it INTO the
+    // scope-"active" roster and changing the omission counts two tests here assert.
+    vi.mocked(sparkleActivityLine).mockReturnValue(null);
     // A BOOTED app: config has been read, and the human has set no per-tool overrides. Without the
     // hydrated flag the policy layer deliberately holds back `allow` for anything that can change
     // something, since it cannot yet tell "no rule" from "a rule we haven't loaded".
@@ -314,8 +330,14 @@ describe("controlListener", () => {
     expect(res.agents.map((a) => a.id)).not.toContain(strangerId);
     // The dropped rows must be COUNTED, not silently truncated — a narrowed roster that claims to
     // be the whole fleet is worse than an expensive one.
-    expect(res.totalAgents).toBe(3);
-    expect(res.omitted).toBe(1);
+    //
+    // 4 AND 2, NOT 3 AND 1: the app-owned Improve Sparkle row is part of `all` now (bead
+    // sparkle-x0pvw), and with no pass running and no pane open it reads "stopped" like any other
+    // dormant agent — so it is the SECOND legitimately-omitted row here, not an exemption. Both
+    // numbers move together, which is the property that keeps this assertion meaningful: a change
+    // that added the row to the total without counting it as dropped would fail.
+    expect(res.totalAgents).toBe(4);
+    expect(res.omitted).toBe(2);
   });
 
   // roborev #53406: `status` is window-local and never persisted, but control:request is broadcast
@@ -331,7 +353,102 @@ describe("controlListener", () => {
     await flush();
     const res = lastReply() as { agents: Array<Record<string, unknown>>; omitted: number };
     expect(res.agents.map((a) => a.id).sort()).toEqual([callerId, otherId].sort());
-    expect(res.omitted).toBe(0);
+    // 1, not 0 — the dormant Improve Sparkle row (bead sparkle-x0pvw). The assertion this test
+    // exists for is the LINE ABOVE (an other-window agent is kept); this count moving from 0 to 1
+    // is the app-owned row being dropped for the ordinary reason, which is what it should be.
+    expect(res.omitted).toBe(1);
+  });
+
+  // ── THE APP'S OWN AGENT IS IN THE ROSTER ──────────────────────────────────────────────────────
+  //
+  // THE MEASUREMENT THAT MOTIVATED THIS (bead sparkle-x0pvw): the concierge pulled the FULL roster
+  // — scope "all", 47 agents — and Improve Sparkle was not in it. Its id was therefore
+  // undiscoverable, so when the founder asked the concierge to unstick it from a wedged login
+  // screen, the concierge could do nothing. It was not refused by policy; it was unaddressable.
+  //
+  // The terminal ops could ALREADY reach it (services/knownAgents arm 2, since 462c32f79) — that
+  // commit documented the id in three tool descriptions precisely BECAUSE this roster omitted it,
+  // and said outright that a capability nobody can discover is, from the user's seat, the bug. So
+  // what is asserted here is DISCOVERABILITY, and scope "all" is where it has to hold: it is the
+  // scope that promises every agent, and the one the founder's concierge actually called.
+  describe("get_state — the app-owned Improve Sparkle row", () => {
+    it("lists Improve Sparkle under scope 'all', named as the sidebar names it", async () => {
+      fire({ reqId: "sp1", op: "get_state", callerAgentId: callerId, payload: { scope: "all" } });
+      await flush();
+      const res = lastReply() as { agents: Array<Record<string, unknown>> };
+      const row = res.agents.find((a) => a.id === SPARKLE_AGENT_ID);
+      // Against the pre-fix listener this is `undefined` — the whole bug, in one line.
+      expect(row).toBeTruthy();
+      // THE NAME THE SCREEN USES. `SPARKLE_AGENT_NAME` ("Sparkle") is the @-mention handle; a
+      // roster and a screen naming one id two different things is the failure
+      // engine/agentDisplayName's header was written about.
+      expect(row).toMatchObject({ name: "Improve Sparkle", kind: "build", parentId: null });
+      // The one field that tells a caller why the destructive lifecycle ops will refuse it. Absent
+      // — not false — on every other row, because this payload's budget is permanent.
+      expect(row!.appOwned).toBe(true);
+      expect(res.agents.find((a) => a.id === callerId)!.appOwned).toBeUndefined();
+    });
+
+    it("counts it in totalAgents — the roster and its own count cannot disagree", async () => {
+      fire({ reqId: "sp2", op: "get_state", callerAgentId: callerId, payload: { scope: "all" } });
+      await flush();
+      const res = lastReply() as {
+        agents: Array<Record<string, unknown>>;
+        totalAgents: number;
+      };
+      // Guards the injection POINT, not just the row: appending after the scope filter would list
+      // the row while leaving `totalAgents` (and `omitted`) describing a roster one shorter.
+      expect(res.totalAgents).toBe(res.agents.length);
+      expect(res.agents.map((a) => a.id)).toContain(SPARKLE_AGENT_ID);
+    });
+
+    // THE PRE-EXISTING INCONSISTENCY THIS CLOSES. Improve Sparkle's workers ARE ordinary roster rows
+    // carrying `parentId === <the sparkle id>` (AgentSidebar builds its `+N` badge from exactly that
+    // predicate). Before the head row existed, this reply emitted workers whose parent was not in
+    // it — a dangling reference a caller could not resolve, and a rollup dot belonging to no head.
+    it("gives its worker rows a parent that resolves inside the same reply", async () => {
+      const sparkleWorker = useProjectStore
+        .getState()
+        .addAgent(projectId, { kind: "worker", parentId: SPARKLE_AGENT_ID })!;
+      useRuntimeStore.getState().setStatus(sparkleWorker, "working");
+      fire({ reqId: "sp3", op: "get_state", callerAgentId: callerId, payload: { scope: "all" } });
+      await flush();
+      const res = lastReply() as { agents: Array<Record<string, unknown>> };
+      const worker = res.agents.find((a) => a.id === sparkleWorker)!;
+      expect(worker.parentId).toBe(SPARKLE_AGENT_ID);
+      // The assertion that would have failed before: the parent is IN the reply.
+      expect(res.agents.map((a) => a.id)).toContain(worker.parentId);
+    });
+
+    // TWO BODIES, ONE ROW. This agent runs an interactive pane AND an hourly headless pass. The
+    // status map only ever tracks the pane, so reading it alone reports "stopped" for an agent that
+    // is at that moment mutating its worktree — and "stopped" is exactly what scope "active" drops,
+    // hiding the row in the one state the concierge most needs it. The row reports the SHARED busy
+    // rule (services/sparkleBusy), the same one the write gate refuses on, so the roster can never
+    // say idle about an agent the very next send refuses as busy.
+    it("reports it as WORKING and keeps it in scope 'active' while a pass runs", async () => {
+      vi.mocked(sparkleActivityLine).mockReturnValue("running its hourly improvement pass");
+      fire({ reqId: "sp4", op: "get_state", callerAgentId: callerId, payload: {} });
+      await flush();
+      const res = lastReply() as { agents: Array<Record<string, unknown>>; scope: string };
+      expect(res.scope).toBe("active");
+      const row = res.agents.find((a) => a.id === SPARKLE_AGENT_ID);
+      // Pre-fix: absent from the roster entirely. Mid-fix (row added, status left on the pane map):
+      // present under "all" but still dropped from "active" while genuinely working.
+      expect(row).toBeTruthy();
+      expect(row!.status).toBe("working");
+      expect(row!.activity).toEqual(expect.stringContaining("improvement pass"));
+    });
+
+    it("says nothing in `activity` when it is NOT busy — the inverse guard", async () => {
+      // Without this, an `activity` hardcoded to a non-null string would satisfy the row above.
+      fire({ reqId: "sp5", op: "get_state", callerAgentId: callerId, payload: { scope: "all" } });
+      await flush();
+      const res = lastReply() as { agents: Array<Record<string, unknown>> };
+      const row = res.agents.find((a) => a.id === SPARKLE_AGENT_ID)!;
+      expect(row.activity).toBeNull();
+      expect(row.status).toBe("stopped");
+    });
   });
 
   // roborev #53407: "stopped" is ALSO what an agent with no runtime entry reads as — a just-spawned
@@ -345,7 +462,9 @@ describe("controlListener", () => {
     const res = lastReply() as { agents: Array<Record<string, unknown>>; omitted: number };
     const worker = res.agents.find((a) => a.id === otherId);
     expect(worker).toMatchObject({ kind: "worker", parentId: callerId, status: "stopped" });
-    expect(res.omitted).toBe(0);
+    // +1 for the dormant app-owned Improve Sparkle row (bead sparkle-x0pvw), which is omitted
+    // here for the ordinary reason: no pass running, no pane open, so it reads "stopped".
+    expect(res.omitted).toBe(1);
   });
 
   // AN ORCHESTRATOR'S ROW MUST NOT READ CALM WHILE ITS WORKERS DO NOT. `status` is the agent's own
@@ -693,7 +812,9 @@ describe("controlListener", () => {
     await flush();
     const res = lastReply() as { agents: unknown[]; omitted: number; omittedIds: string[] };
     expect(res.agents).toHaveLength(1);
-    expect(res.omitted).toBe(6); // exact count still reported…
+    // +1 for the dormant app-owned Improve Sparkle row (bead sparkle-x0pvw), which is omitted
+    // here for the ordinary reason: no pass running, no pane open, so it reads "stopped".
+    expect(res.omitted).toBe(7); // exact count still reported…
     expect(res.omittedIds).toEqual([]); // …but no id list, which "self" cannot act on anyway
   });
 
@@ -704,7 +825,11 @@ describe("controlListener", () => {
     fire({ reqId: "s10", op: "get_state", callerAgentId: callerId, payload: {} });
     await flush();
     const res = lastReply() as { omitted: number; omittedIds: string[] };
-    expect(res.omitted).toBe(25);
+    // +1 for the dormant app-owned Improve Sparkle row (bead sparkle-x0pvw), which is omitted
+    // here for the ordinary reason: no pass running, no pane open, so it reads "stopped".
+    expect(res.omitted).toBe(26);
+    // The CAP is unchanged at 20, which is the property this test exists for: one more omitted row
+    // must move the exact count and NOT the truncated list.
     expect(res.omittedIds).toHaveLength(20);
   });
 
@@ -716,8 +841,12 @@ describe("controlListener", () => {
     fire({ reqId: "s6", op: "get_state", callerAgentId: callerId, payload: {} });
     await flush();
     const res = lastReply() as { omitted: number; omittedIds: string[] };
-    expect(res.omitted).toBe(1);
-    expect(res.omittedIds).toEqual([strangerId]);
+    // +1 for the dormant app-owned Improve Sparkle row (bead sparkle-x0pvw), which is omitted
+    // here for the ordinary reason: no pass running, no pane open, so it reads "stopped".
+    expect(res.omitted).toBe(2);
+    // SPELLED OUT rather than loosened to `toContain`: the Improve Sparkle row is appended after
+    // the roster, so its position here is part of what is being pinned.
+    expect(res.omittedIds).toEqual([strangerId, SPARKLE_AGENT_ID]);
   });
 
   // roborev 53476: once "active" started keeping rows on evidence OTHER than a live status entry,
@@ -770,7 +899,9 @@ describe("controlListener", () => {
     const res = lastReply() as { agents: Array<Record<string, unknown>>; scope: string; omitted: number };
     expect(res.scope).toBe("self");
     expect(res.agents.map((a) => a.id)).toEqual([callerId]);
-    expect(res.omitted).toBe(1);
+    // +1 for the dormant app-owned Improve Sparkle row (bead sparkle-x0pvw), which is omitted
+    // here for the ordinary reason: no pass running, no pane open, so it reads "stopped".
+    expect(res.omitted).toBe(2);
   });
 
   it("get_state scope 'all' still returns dormant agents (the pre-scope behavior)", async () => {
@@ -779,7 +910,11 @@ describe("controlListener", () => {
     await flush();
     const res = lastReply() as { agents: Array<Record<string, unknown>>; scope: string; omitted: number };
     expect(res.scope).toBe("all");
-    expect(res.agents).toHaveLength(2);
+    // 3: the two project agents plus the app-owned Improve Sparkle row (bead sparkle-x0pvw).
+    // Kept as an EXACT length rather than relaxed to a `toContain` — "all" returning everything is
+    // this test's whole subject, so a row silently appearing or vanishing must still fail here.
+    expect(res.agents).toHaveLength(3);
+    expect(res.agents.map((a) => a.id)).toContain(SPARKLE_AGENT_ID);
     expect(res.agents.find((a) => a.id === otherId)).toMatchObject({ status: "stopped" });
     expect(res.omitted).toBe(0);
   });
@@ -3286,7 +3421,8 @@ describe("controlListener", () => {
       fire({ reqId: "c10", op: "get_state", callerAgentId: CONCIERGE_CALLER_AGENT_ID, payload: { scope: "all" } });
       await flush();
       const all = lastReply() as { agents: Array<{ id: string }> };
-      expect(all.agents).toHaveLength(2); // it can read the whole roster...
+      // 3 = the two project agents + the app-owned Improve Sparkle row (bead sparkle-x0pvw).
+      expect(all.agents).toHaveLength(3); // it can read the whole roster...
       // ...and is not one of the rows. `scope: "self"` filters on the caller's own row, so it
       // returns none — which is why the identity has to travel in a field of its own (next suite).
       expect(all.agents.map((a) => a.id)).not.toContain(CONCIERGE_CALLER_AGENT_ID);

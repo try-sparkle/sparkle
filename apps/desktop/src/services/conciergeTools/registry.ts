@@ -89,6 +89,8 @@ import {
   spinDownWorkerAgent,
   type LifecycleOp,
   type LifecycleResult,
+  restartAgent,
+  stopAgent,
 } from "./lifecycle";
 import {
   REVIEW_OPS,
@@ -717,6 +719,10 @@ const LIFECYCLE_ROUTES: Record<LifecycleOp, Handler> = {
   spin_down_worker: route(spinDownArgs, async (a, ctx) =>
     fromLifecycle(ctx, await spinDownWorkerAgent(a.agentId, { discardUncommitted: a.discardUncommitted })),
   ),
+  // `agentOnly` like the previews: both take just an id. The DOMAIN owns every refusal — unknown
+  // agent, no pane, and the app-owned agent being mid-pass — so this layer invents no sentence.
+  restart_agent: route(agentOnly, async (a, ctx) => fromLifecycle(ctx, await restartAgent(a.agentId))),
+  stop_agent: route(agentOnly, async (a, ctx) => fromLifecycle(ctx, await stopAgent(a.agentId))),
 };
 
 /**
@@ -737,6 +743,9 @@ const LIFECYCLE_WRITE: Record<LifecycleOp, boolean> = {
   save_agent: true,
   discard_agent: true,
   spin_down_worker: true,
+  // Both change the world: one re-spawns a process, the other kills one.
+  restart_agent: true,
+  stop_agent: true,
 };
 
 // ---------------------------------------------------------------------------------------------

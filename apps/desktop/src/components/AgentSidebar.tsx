@@ -79,7 +79,7 @@ import {
   maybeNameFromWork,
   WORK_BACKSTOP_WINDOW_TICKS,
 } from "../services/agentNaming";
-import { sparkleAgentIdFor } from "../services/sparkleAgent";
+import { sparkleAgentIdFor, SPARKLE_AGENT_DISPLAY_NAME } from "../services/sparkleAgent";
 import { handleImproveSparkleClick } from "../services/sparkleReveal";
 import { consentPillLabel } from "./sparkleRowStatus";
 import { useBeadsStore } from "../stores/beadsStore";
@@ -5978,7 +5978,10 @@ const SparkleAgentRow = memo(function SparkleAgentRow({
               whiteSpace: "nowrap",
             }}
           >
-            Improve Sparkle
+            {/* THE CONSTANT, not the literal it used to be. `get_state`'s roster now names this
+                agent too (bead sparkle-x0pvw), and the row and the roster answering differently is
+                the exact failure engine/agentDisplayName's header was written about. */}
+            {SPARKLE_AGENT_DISPLAY_NAME}
           </span>
           {/* Same `+N` a collapsed orchestrator shows. 0 today; see the prop's note. */}
           {workerCount > 0 && (

@@ -2,7 +2,13 @@
 // operation (discard) must be unreachable without an explicit intent, every operation must be
 // classified, and a spawn must refuse rather than overrun the machine's RAM budget or quietly bill
 // the user for a cloud sandbox.
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
+
+// The PTY kill is the stop primitive; mocked so a stop asserts what the domain ASKS for without
+// touching a real terminal. `paneControl` and the pass latch are used REAL — the pane registry is an
+// in-memory map and `improvementPassLatch` exports claim/release, so mocking either would mean
+// testing a stand-in for the rule under test.
+vi.mock("../../pty", () => ({ killPty: vi.fn(async () => {}) }));
 
 // bd is not available in a unit test; the spawn path fires a best-effort `bd create`.
 vi.mock("../tasks", () => ({ createBeadFull: vi.fn(async () => "bd-new") }));
@@ -89,9 +95,17 @@ import {
   saveAgent,
   discardAgent,
   spinDownWorkerAgent,
+  restartAgent,
+  stopAgent,
   type LifecycleOp,
   type LifecycleRisk,
 } from "./lifecycle";
+import { registerPaneRestart, clearPaneRestarts } from "../paneControl";
+// THE REAL LATCH, not a mock of it: `improvementPassLatch` is a leaf with `claimPass`/`releasePass`,
+// so the restart/stop guard is driven through services/sparkleBusy end to end.
+import { claimPass, releasePass } from "../improvementPassLatch";
+import { SPARKLE_AGENT_ID } from "../sparkleAgent";
+import { killPty } from "../../pty";
 
 const CLEAN: BranchStatus = {
   ahead: 0,
@@ -1085,5 +1099,131 @@ describe("typed results", () => {
       expect(LIFECYCLE_OPS).toContain(op);
       expect(r.risk).toBe(LIFECYCLE_RISK[op]);
     }
+  });
+});
+
+// ── Restart / Stop — the two ops that act on a PROCESS ─────────────────────────────────────────
+//
+// Bead sparkle-x0pvw. The founder asked for the concierge to be able to restart and stop the
+// app-owned Improve Sparkle agent, the motivating case being a pane wedged on a Claude CLI login
+// screen that ignores Escape — where a restart is the only real remedy.
+//
+// TWO PROPERTIES ARE UNDER TEST AND THEY PULL IN OPPOSITE DIRECTIONS. These two ops must REACH that
+// agent (every other op in this file cannot, because `locate` scans `projects[].agents` and the
+// app-owned agent is deliberately not in it); and the DESTRUCTIVE ops must go on being unable to,
+// because `discard_agent` pointed at it would delete the app-owned clone the hourly scheduler works
+// in. A change that widened resolution for the whole file would satisfy the first and silently break
+// the second, so both are asserted here, together.
+describe("restart_agent / stop_agent", () => {
+  beforeEach(() => {
+    clearPaneRestarts();
+    releasePass();
+    vi.mocked(killPty).mockClear();
+    vi.mocked(killPty).mockResolvedValue(undefined);
+  });
+  afterEach(() => {
+    clearPaneRestarts();
+    releasePass();
+  });
+
+  /** Make `agentId` look like it has a mounted pane and a live status, which is what
+   *  `findKnownAgent`'s Sparkle/observed arms resolve on. Returns the restart spy. */
+  function mountPane(agentId: string) {
+    const restart = vi.fn();
+    registerPaneRestart(agentId, restart);
+    useRuntimeStore.setState({ status: { [agentId]: "working" } } as never);
+    return restart;
+  }
+
+  it("restarts the app-owned Improve Sparkle agent — the op that motivated this", async () => {
+    const restart = mountPane(SPARKLE_AGENT_ID);
+    const r = await restartAgent(SPARKLE_AGENT_ID);
+    expect(r.ok).toBe(true);
+    // THE SIDE EFFECT, not the reply: a result object saying "restart" proves nothing about whether
+    // the pane was actually re-spawned.
+    expect(restart).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops it by killing the PTY and nothing else", async () => {
+    mountPane(SPARKLE_AGENT_ID);
+    const r = await stopAgent(SPARKLE_AGENT_ID);
+    expect(r.ok).toBe(true);
+    expect(killPty).toHaveBeenCalledWith(SPARKLE_AGENT_ID);
+    // The narrow reading, asserted as the ABSENCE of the destructive calls: a stop must not reach
+    // the teardown paths that remove worktrees or branches.
+    expect(spinDownGitMock).not.toHaveBeenCalled();
+    expect(discardGitMock).not.toHaveBeenCalled();
+  });
+
+  // THE OTHER HALF, and the one that must not regress. If a later change routes the whole file
+  // through `findKnownAgent`, these flip to `ok` and the app-owned worktree becomes destroyable.
+  it("leaves the DESTRUCTIVE ops still unable to resolve it", async () => {
+    mountPane(SPARKLE_AGENT_ID);
+    const closed = await closeAgent(SPARKLE_AGENT_ID);
+    expect(closed.ok).toBe(false);
+    expect(closed.ok === false && closed.reason).toBe("unknown-agent");
+    const discarded = await discardAgent(SPARKLE_AGENT_ID, {
+      agentId: SPARKLE_AGENT_ID,
+      confirm: "discard",
+    } as never);
+    expect(discarded.ok).toBe(false);
+    expect(discardGitMock).not.toHaveBeenCalled();
+  });
+
+  it("works on an ORDINARY build agent too — this is not a Sparkle-only lever", async () => {
+    const projectId = seedProject();
+    const agentId = seedBuild(projectId);
+    const restart = mountPane(agentId);
+    expect((await restartAgent(agentId)).ok).toBe(true);
+    expect(restart).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses an id nothing has ever seen, without acting", async () => {
+    const r = await restartAgent("no-such-agent");
+    expect(r.ok).toBe(false);
+    expect(r.ok === false && r.reason).toBe("unknown-agent");
+  });
+
+  it("reports no-pane — not a failure — when there is no terminal to restart", async () => {
+    // Resolvable (a live status entry) but with no registered pane: nothing is wrong and nothing
+    // happened, which is a different fact from an error.
+    useRuntimeStore.setState({ status: { [SPARKLE_AGENT_ID]: "idle" } } as never);
+    const r = await restartAgent(SPARKLE_AGENT_ID);
+    expect(r.ok).toBe(false);
+    expect(r.ok === false && r.reason).toBe("no-pane");
+  });
+
+  // ── The scheduler guard — the founder's actual constraint ─────────────────────────────────────
+  //
+  // "I don't want you to break anything the agent is currently doing." A restart mid-pass is
+  // strictly MORE disruptive than a send mid-pass: it kills the `claude` writing the shared
+  // worktree. Each of these asserts the ABSENCE of the action, which is the whole point — a test
+  // that only checked `reason` would pass against a guard that refused AFTER restarting.
+  it("refuses to restart while the improvement pass is mid-work, and does not restart", async () => {
+    const restart = mountPane(SPARKLE_AGENT_ID);
+    claimPass();
+    const r = await restartAgent(SPARKLE_AGENT_ID);
+    expect(r.ok).toBe(false);
+    expect(r.ok === false && r.reason).toBe("agent-busy");
+    expect(restart).not.toHaveBeenCalled();
+  });
+
+  it("refuses to stop while it is mid-work, and does not kill the PTY", async () => {
+    mountPane(SPARKLE_AGENT_ID);
+    claimPass();
+    const r = await stopAgent(SPARKLE_AGENT_ID);
+    expect(r.ok === false && r.reason).toBe("agent-busy");
+    expect(killPty).not.toHaveBeenCalled();
+  });
+
+  it("does NOT hold an ordinary build agent while Sparkle is busy — the inverse guard", async () => {
+    // The pass latch is global module state, so without the `isSparkleAgentId` scope a pass in
+    // flight would freeze restart for every agent in the app.
+    const projectId = seedProject();
+    const agentId = seedBuild(projectId);
+    const restart = mountPane(agentId);
+    claimPass();
+    expect((await restartAgent(agentId)).ok).toBe(true);
+    expect(restart).toHaveBeenCalledTimes(1);
   });
 });

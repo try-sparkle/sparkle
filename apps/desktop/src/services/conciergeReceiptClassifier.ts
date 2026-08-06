@@ -94,6 +94,14 @@ const LIFECYCLE_RULES: Record<LifecycleOp, OpRule> = {
   save_agent: null,
   discard_agent: { kind: "closed" },
   spin_down_worker: { kind: "closed" },
+  // BOTH `null`, and for the reason ship/save are: this vocabulary has no honest arm for them.
+  // `closed` is the tempting one and it would be a plain falsehood — the agent is NOT gone after
+  // either op; a restart leaves it running with its conversation resumed, and a stop leaves its
+  // tab, worktree and branch in place for a restart to pick up. `spawned` is equally wrong: nothing
+  // was created. Understating by staying silent is the lesser failure here, exactly as it is for
+  // ship_agent, and the alternative is inventing an arm to describe two ops.
+  restart_agent: null,
+  stop_agent: null,
 };
 
 /** Review. `close_finding` is deliberately NOT `closed`: that arm reads as an AGENT closing, and
