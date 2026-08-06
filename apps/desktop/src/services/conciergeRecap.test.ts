@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildRecap,
   formatAwayFor,
+  isActionableChange,
   recapSummary,
   MIN_AWAY_MS,
   type AwaySnapshot,
@@ -445,5 +446,32 @@ describe("buildRecap — a rolled-up head does not report its worker's finish as
       id: "recap-1",
     });
     expect(recap!.finished.map((f) => f.agentId).sort()).toEqual(["orch", "w1"]);
+  });
+});
+
+// ── "We should never hide a row that needs action from me." (the founder, bead sparkle-ws8gd) ─────
+// RecapCard's section cap asks this predicate which rows it is allowed to collapse, and two
+// docblocks say this module "owns the test" — so the test has to actually be here. Without it the
+// rule was pinned only through the card, where narrowing the predicate (e.g. also excluding `idle`)
+// left the whole suite green while reintroducing the reported bug (roborev 59105).
+describe("isActionableChange — what the cap may never hide", () => {
+  it("protects every status that owes the reader something", () => {
+    // FINISHED IS NOT SETTLED, which is the whole subtlety. `idle` is THE ordinary finish and its
+    // label is "Done — your turn" — the turn is the reader's, so it is an ask. `unmerged` is work
+    // sitting on a branch waiting to be landed.
+    expect(isActionableChange({ status: "idle" })).toBe(true);
+    expect(isActionableChange({ status: "unmerged" })).toBe(true);
+    // Everything the needsYou bucket is built from. Asserted individually rather than as a set, so
+    // a new red status that someone forgets to protect shows up as a missing line here.
+    expect(isActionableChange({ status: "waiting" })).toBe(true);
+    expect(isActionableChange({ status: "approval" })).toBe(true);
+    expect(isActionableChange({ status: "errored" })).toBe(true);
+    expect(isActionableChange({ status: "blocked" })).toBe(true);
+  });
+
+  it("allows the cap to collapse ONLY a landed row", () => {
+    // `done` is finished AND landed: nothing is owed, so it is the one kind of row that may be
+    // hidden behind "+N more".
+    expect(isActionableChange({ status: "done" })).toBe(false);
   });
 });

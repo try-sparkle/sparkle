@@ -71,6 +71,37 @@ const FINISHED_STATUSES: ReadonlySet<AgentTabStatus> = new Set<AgentTabStatus>([
 ]);
 
 /**
+ * Does this row OWE THE USER SOMETHING? The founder's rule, in one predicate:
+ * *"We should never hide a row that needs action from me."* (bead `sparkle-ws8gd`)
+ *
+ * `RecapCard` caps each section at `SECTION_CAP` and collapses the rest into "+N more". That cap
+ * may only ever eat rows that ask nothing — so the card needs to know which rows those are, and it
+ * asks HERE rather than matching on the rendered label, because the label is prose that gets
+ * reworded and a truncation rule keyed on prose would fail silently the first time it was.
+ *
+ * FINISHED IS NOT THE SAME AS SETTLED, which is the whole subtlety and is exactly what the founder
+ * saw. Two of the three finished statuses still want him:
+ *
+ *   • `idle`     — "Done — your turn". The turn is HIS. That is an ask.
+ *   • `unmerged` — "Needs merge". Work is sitting on a branch waiting to be landed. An ask.
+ *   • `done`     — finished cleanly AND LANDED. Nothing is owed. The only settled status, and
+ *                  therefore the only kind of row the cap may hide.
+ *
+ * Everything in the `needsYou` bucket is actionable by construction (`waiting`/`approval`/
+ * `errored`/`blocked` are what put a row there), so this returns true for those without
+ * enumerating them — a new red status must not have to be added here to be protected.
+ *
+ * THE EVIDENCE THIS IS THE RIGHT LINE: the founder's screenshot showed "2 need you, 16 finished"
+ * with five finished rows visible, and EVERY visible one read "Done — your turn" or "Needs merge".
+ * So the eleven behind "+11 more" were overwhelmingly rows that wanted him, hidden behind flat grey
+ * text that did not look like a control. The card reported a count that sounded complete while
+ * making actionable items invisible.
+ */
+export function isActionableChange(change: Pick<RecapChange, "status">): boolean {
+  return change.status !== "done";
+}
+
+/**
  * The resting statuses — an agent that is neither working nor asking. Same three the `unmerged`
  * overlay treats as eligible (`engine/unmergedAttention.RESTING`), plus `unmerged` itself.
  *

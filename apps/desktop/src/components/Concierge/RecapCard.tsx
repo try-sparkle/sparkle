@@ -1,10 +1,29 @@
 // The return-from-Away card: "here's what happened while you were gone."
 //
-// DELIBERATELY NOT INTERACTIVE, which is the design decision most likely to look like an omission.
+// IT CARRIES NO ACTION BUTTONS, which is the design decision most likely to look like an omission.
 // Every agent this card names as needing you is ALREADY in the thread as a nudge card, with its own
 // "Show me" / "Approve" buttons (ConciergeHost.surfacedAgents). Duplicating those buttons here would
 // give the same agent two live action surfaces one scroll apart, which is how a user ends up
 // approving the same thing twice. So this card summarises and the nudge cards act.
+//
+// IT IS NOT, HOWEVER, INERT — and this header used to say it was. The agent pills are clickable
+// (they reveal), and the "+N more" line is a disclosure BUTTON that expands its section in place
+// (bead `sparkle-ws8gd`). Neither acts ON an agent; both only bring you to what is already there,
+// which is the line this card actually holds. "Summarises rather than acts" is the rule; "nothing
+// here responds to a click" was a description that had already stopped being true.
+//
+// ══ NEVER HIDE A ROW THAT NEEDS ACTION ══════════════════════════════════════════════════════════
+// The founder's rule, verbatim: "We should never hide a row that needs action from me."
+//
+// The section cap may only ever collapse rows that ask nothing — `status: "done"`, i.e. finished
+// AND landed (see `isActionableChange` in services/conciergeRecap, which owns the test). Rows that
+// owe the reader something — everything under WANTS YOU, plus "Done — your turn" (`idle`) and
+// "Needs merge" (`unmerged`) — render in full, however many there are.
+//
+// CONSEQUENCE, AND IT IS INTENDED: this card can grow tall when a lot of agents want you. That is
+// the correct failure direction. Do NOT reintroduce a cap to control height — if height ever
+// becomes a real problem, make the card scroll. A short card that has hidden the thing you needed
+// to do is worse than a long one, which is the bug this rule exists to close.
 //
 // NO LIVE REGION HERE. The summary is announced through the concierge column's existing single
 // `role="status"` node, fed by the host (`announce`). A second region would double-announce — that
@@ -13,10 +32,12 @@
 // Accent is the brand cyan rather than the nudge sienna: this is not itself an alarm. It is a
 // briefing that may CONTAIN alarms, and painting it red would make every return from lunch look
 // like an incident.
-import type { CSSProperties } from "react";
+import { useState, type CSSProperties } from "react";
+import { FiChevronDown, FiChevronRight } from "react-icons/fi";
 import { C, CARD_WASH_PCT, FONT_WEIGHT } from "../../theme/colors";
 import { AgentPill } from "./AgentPill";
 import {
+  isActionableChange,
   recapSummary,
   type ConciergeRecapMessage,
   type GateDecision,
@@ -269,46 +290,97 @@ function decisionVerb(kind: GateDecision["kind"]): string {
 }
 
 /**
- * Rows per section before the rest collapse into a count.
+ * SETTLED rows per section before the rest collapse into a count.
  *
- * Returning after a night on a large fleet is exactly when this card has the most to say and the
- * least room to say it: uncapped, thirty changed agents push the chat off screen above the compose
- * box — the same failure `buildDigest` exists to prevent on the nudge side. Nothing is lost by
- * capping, because the summary sentence already carries the totals; the rows are the detail, and
- * five of them is enough to recognise WHICH fleet moved.
+ * READ THIS WITH `isActionableChange`, NOT ON ITS OWN. The cap no longer applies to a section's rows
+ * — it applies only to the rows that ask nothing (`status: "done"`, finished AND landed). An
+ * actionable row is never counted against it and never collapsed, however many there are, because
+ * the founder's rule is that a row needing action is never hidden.
+ *
+ * WHAT THIS MEANS IN PRACTICE, stated plainly because the number below now does much less than it
+ * looks like it does: `done` is the comparatively rare status and `idle` ("Done — your turn") is the
+ * ordinary finish, so on the very case this cap was written for — a night away, thirty agents
+ * finished — most rows are actionable and this collapses little or nothing.
+ *
+ * THE HEIGHT PROTECTION THEREFORE DOES NOT LIVE HERE ANY MORE. It is `maxHeight` + `overflowY` on
+ * the card container (see the note there): the card scrolls rather than hiding, which keeps the
+ * compose box on screen without putting an ask behind a click. This docblock used to claim "nothing
+ * is lost by capping" — true when the cap was a display detail over rows the summary already
+ * counted, and false the moment the rows it ate could carry work.
+ *
+ * Five is retained for the settled remainder: enough to recognise WHICH fleet moved, and the summary
+ * sentence still carries the totals.
  */
 const SECTION_CAP = 5;
 
-/** The overflow line. Muted and inert — it is a count, not a control; opening the rest is what the
- *  agent list itself is for, and the card is deliberately non-interactive (see the header).
+/** The overflow line — A DISCLOSURE BUTTON, not a caption.
+ *
+ *  IT USED TO BE AN INERT `div`, and that is the bug (bead `sparkle-ws8gd`). The founder pointed at
+ *  it and said two words: *"The '+11 more'"*. The terseness was the signal — flat grey text,
+ *  visually identical to the muted captions around it, offering no way in. It announced that eleven
+ *  things existed and gave no means of seeing them, on a card that had just claimed "16 finished".
+ *
+ *  SO IT LOOKS LIKE A CONTROL NOW, and that half matters as much as the behaviour: a chevron that
+ *  turns, the cream ink the card uses for live text rather than the muted ink it uses for asides,
+ *  and a pointer cursor. A control the reader cannot recognise is not a control.
+ *
+ *  `aria-expanded` is honest here in a way it is not on `AgentPill`'s retry button: this genuinely
+ *  toggles both ways, so advertising it as expandable promises nothing it cannot do.
  *
  *  The night-away case this cap exists for overflows ALL THREE sections at once, so three bare
  *  "+7 more" lines need telling apart TWICE OVER, by two different readers (roborev 53655-M /
  *  53665-M / 53674-M): `data-section` is for the tests, and the section name is spoken via a
- *  VISUALLY HIDDEN span — not `aria-label`, which was the first attempt and does nothing here. A
- *  bare `div` maps to ARIA's `generic` role, where name-from-author is PROHIBITED: conforming
- *  browsers drop the author name and screen readers read the text content instead, so the label
- *  was invisible to exactly the users it was for. Content is the reliable carrier. Sighted users
- *  get the same fact from the heading directly above. */
+ *  VISUALLY HIDDEN span. That was originally needed because a bare `div` maps to ARIA's `generic`
+ *  role, where name-from-author is PROHIBITED — so an `aria-label` was dropped by conforming
+ *  browsers and invisible to exactly the users it was for. A `<button>` DOES take a name from the
+ *  author, so the hidden span is no longer load-bearing for that reason — it is kept because it is
+ *  what the tests and screen readers already read, and content is still the reliable carrier.
+ *  Sighted users get the same fact from the heading directly above. */
 function MoreLine({
   n,
   word,
   section,
   label,
+  expanded,
+  onToggle,
 }: {
   n: number;
   word: string;
   section: string;
   label: string;
+  expanded: boolean;
+  onToggle: () => void;
 }) {
+  const Chevron = expanded ? FiChevronDown : FiChevronRight;
   return (
-    <div
-      style={{ ...rowStyle, color: C.conciergeMuted }}
+    <button
+      type="button"
+      onClick={onToggle}
+      aria-expanded={expanded}
       data-testid="recap-more"
       data-section={section}
+      style={{
+        ...rowStyle,
+        // A control, not an aside: the card's live ink rather than the muted ink of a caption.
+        color: C.cream,
+        border: "none",
+        background: "transparent",
+        font: "inherit",
+        fontSize: 12,
+        cursor: "pointer",
+        textAlign: "left",
+        // `rowStyle` is `align-items: baseline`; a button defaults to `center` and would sit the
+        // chevron off the text it labels.
+        alignItems: "baseline",
+        width: "100%",
+      }}
     >
+      {/* An ICON, never a glyph typed into the string — this repo bans emoji-as-icons and uses
+          react-icons/fi (Feather) for exactly this. `flex: none` so the narrow-column reflow never
+          shrinks the one part that says "this opens". */}
+      <Chevron size={12} aria-hidden style={{ flex: "none", alignSelf: "center" }} />
       <span>
-        +{n} {word}
+        {expanded ? "Show fewer" : `+${n} ${word}`}
       </span>
       {/* Same clip-rect shape as the column's announcer (ConciergeColumn) — this codebase has no
           sr-only utility, and inventing a second one would be the thing that drifts. */}
@@ -326,8 +398,17 @@ function MoreLine({
         {" "}
         in {label}
       </span>
-    </div>
+    </button>
   );
+}
+
+/** Wraps a section's rows so the cap logic and the disclosure state live in ONE place rather than
+ *  being re-derived by each caller. `hidden` is what the cap collapsed; `shown` is everything else,
+ *  in the ORIGINAL order — the cap removes rows, it never reorders them, so an expanded section
+ *  reads the same as an uncapped one. */
+function useDisclosure(): [boolean, () => void] {
+  const [expanded, setExpanded] = useState(false);
+  return [expanded, () => setExpanded((v) => !v)];
 }
 
 function ChangeSection({
@@ -341,16 +422,37 @@ function ChangeSection({
   section: string;
   onRevealAgent?: (agentId: string) => void;
 }) {
+  const [expanded, toggle] = useDisclosure();
   if (changes.length === 0) return null; // a section with nothing in it is a heading and a gap
-  const shown = changes.slice(0, SECTION_CAP);
+
+  // ── THE CAP MAY ONLY EAT SETTLED ROWS ─────────────────────────────────────────────────────────
+  // "We should never hide a row that needs action from me." So the overflow is computed over the
+  // NON-ACTIONABLE rows alone: every actionable row is shown no matter how many there are, and only
+  // settled ones past the cap can collapse. `isActionableChange` owns the test (see its docblock in
+  // services/conciergeRecap) — this file must not re-decide it by reading the rendered label, which
+  // is prose and gets reworded.
+  //
+  // ORDER IS PRESERVED. `hidden` is a set of ids removed from the original list rather than a
+  // partition that hoists actionable rows to the top, so expanding a section reproduces exactly the
+  // uncapped card instead of reshuffling it under the reader.
+  const settled = changes.filter((c) => !isActionableChange(c));
+  const hiddenIds = new Set(settled.slice(SECTION_CAP).map((c) => c.agentId));
+  const shown = expanded ? changes : changes.filter((c) => !hiddenIds.has(c.agentId));
   return (
     <>
       <div style={sectionLabel}>{label}</div>
       {shown.map((c) => (
         <ChangeRow key={c.agentId} change={c} onRevealAgent={onRevealAgent} />
       ))}
-      {changes.length > shown.length && (
-        <MoreLine n={changes.length - shown.length} word="more" section={section} label={label} />
+      {hiddenIds.size > 0 && (
+        <MoreLine
+          n={hiddenIds.size}
+          word="more"
+          section={section}
+          label={label}
+          expanded={expanded}
+          onToggle={toggle}
+        />
       )}
     </>
   );
@@ -423,6 +525,25 @@ export function RecapCard({
         // min-content, so a flex/grid item sized from its content would keep the unbroken word's
         // width as a floor and overflow anyway.
         overflowWrap: "anywhere",
+        // ── THE CARD IS BOUNDED, THE ROW SET IS NOT (roborev 59105) ────────────────────────────
+        // `SECTION_CAP` may now only collapse SETTLED rows, and `done` is the rare status while
+        // `idle` ("Done — your turn") is the ordinary finish — so on the very case the cap was
+        // written for (a night away, thirty agents finished) almost every row is actionable and the
+        // cap collapses nothing. Uncapped, that card pushes the chat off screen above the compose
+        // box, which is exactly the failure the cap existed to prevent.
+        //
+        // So the height is bounded HERE instead, which is the founder's own instruction for this
+        // situation: "If height becomes a real problem, make the card scroll rather than hide."
+        // Scrolling keeps every actionable row REACHABLE — the rule is that nothing is hidden
+        // behind a click, and a scroll container hides nothing; it just does not paint it all at
+        // once. That is categorically different from "+N more", which required a click to learn
+        // that the rows even existed.
+        //
+        // `vh` rather than a pixel constant so it scales with the window, and it is a MAX: a short
+        // card is untouched, and `overflow-y: auto` shows no scrollbar until there is something to
+        // scroll. 60% leaves the summary, the thread above and the compose box below all visible.
+        maxHeight: "60vh",
+        overflowY: "auto",
         background: `color-mix(in srgb, ${accent} ${CARD_WASH_PCT}%, transparent)`,
         border: `1px solid color-mix(in srgb, ${accent} 32%, transparent)`,
         borderRadius: 6,
@@ -446,38 +567,57 @@ export function RecapCard({
         onRevealAgent={onRevealAgent}
       />
 
-      {recap.decisions.length > 0 && (
-        <>
-          <div style={sectionLabel}>What I did</div>
-          {/* Capped from the OTHER end than the change sections, and the marker leads rather than
-              trails. Decisions arrive oldest-first because the card reads as a narrative, but the
-              ones you can still do something about are the most RECENT — a cancelled deploy from
-              two minutes ago must not be the line that got dropped. */}
-          {recap.decisions.length > SECTION_CAP && (
-            <MoreLine
-              n={recap.decisions.length - SECTION_CAP}
-              word="earlier"
-              section="decisions"
-              label="What I did"
-            />
-          )}
-          {recap.decisions.slice(-SECTION_CAP).map((d) => (
-            <div key={d.id} style={rowStyle} data-testid="recap-decision" data-kind={d.kind}>
-              <span className={CLIP_CLASS} style={decisionVerbCell}>
-                {decisionVerb(d.kind)}
-              </span>
-              <span data-testid="recap-decision-prose" style={decisionProse}>
-                {d.summary} —{" "}
-                <AgentPill
-                  agentId={d.agentId}
-                  fallbackName={d.agentName}
-                  onOpen={onRevealAgent ? () => onRevealAgent(d.agentId) : undefined}
-                />
-              </span>
-            </div>
-          ))}
-        </>
-      )}
+      <DecisionSection decisions={recap.decisions} onRevealAgent={onRevealAgent} />
     </div>
+  );
+}
+
+/** "What I did" — the concierge's own actions, and the one section whose rows ask NOTHING of the
+ *  reader: they are a record of what already happened. So the never-hide-an-action rule does not
+ *  bite here and the plain cap stands; the line is expandable anyway, because a "+N earlier" that
+ *  cannot be opened is the same dead end the change sections just stopped being. */
+function DecisionSection({
+  decisions,
+  onRevealAgent,
+}: {
+  decisions: ConciergeRecapMessage["decisions"];
+  onRevealAgent?: (agentId: string) => void;
+}) {
+  const [expanded, toggle] = useDisclosure();
+  if (decisions.length === 0) return null;
+  // Capped from the OTHER end than the change sections, and the marker leads rather than trails.
+  // Decisions arrive oldest-first because the card reads as a narrative, but the ones you can still
+  // do something about are the most RECENT — a cancelled deploy from two minutes ago must not be
+  // the line that got dropped.
+  const shown = expanded ? decisions : decisions.slice(-SECTION_CAP);
+  return (
+    <>
+      <div style={sectionLabel}>What I did</div>
+      {decisions.length > SECTION_CAP && (
+        <MoreLine
+          n={decisions.length - SECTION_CAP}
+          word="earlier"
+          section="decisions"
+          label="What I did"
+          expanded={expanded}
+          onToggle={toggle}
+        />
+      )}
+      {shown.map((d) => (
+        <div key={d.id} style={rowStyle} data-testid="recap-decision" data-kind={d.kind}>
+          <span className={CLIP_CLASS} style={decisionVerbCell}>
+            {decisionVerb(d.kind)}
+          </span>
+          <span data-testid="recap-decision-prose" style={decisionProse}>
+            {d.summary} —{" "}
+            <AgentPill
+              agentId={d.agentId}
+              fallbackName={d.agentName}
+              onOpen={onRevealAgent ? () => onRevealAgent(d.agentId) : undefined}
+            />
+          </span>
+        </div>
+      ))}
+    </>
   );
 }

@@ -99,14 +99,32 @@ describe("RecapCard", () => {
     expect(rows[1]!.textContent!.startsWith("Sent")).toBe(true);
   });
 
-  /** Agents for a section, named so a row can tell which ones survived the cap. */
-  const changes = (n: number, prefix: string) =>
+  /** Agents for a section, named so a row can tell which ones survived the cap.
+   *
+   *  THE STATUS IS A PARAMETER NOW, and that is the whole point of bead `sparkle-ws8gd`: the cap
+   *  may only ever hide a SETTLED row (`done` — finished AND landed). `waiting` here is an
+   *  actionable row and must survive the cap however many there are. */
+  const LABEL = {
+    waiting: "Needs you",
+    unmerged: "Needs merge",
+    // `idle` is THE ordinary finish (services/conciergeRecap says so in as many words), so it is the
+    // highest-traffic row type there is — and it was the one this helper could not express, which
+    // left the founder's rule untested on the case it will meet most often (roborev 59105).
+    idle: "Done — your turn",
+    done: "Done",
+  } as const;
+
+  const changes = (
+    n: number,
+    prefix: string,
+    status: "waiting" | "done" | "unmerged" | "idle" = "waiting",
+  ) =>
     Array.from({ length: n }, (_, i) => ({
       agentId: `${prefix}${i}`,
       agentName: `${prefix} ${i}`,
       projectName: "sparkle",
-      status: "waiting" as const,
-      statusLabel: "Needs you",
+      status,
+      statusLabel: LABEL[status],
     }));
 
   const decisions = (n: number) =>
@@ -125,15 +143,105 @@ describe("RecapCard", () => {
     screen.queryAllByTestId("recap-more").find((n) => n.getAttribute("data-section") === section) ??
     null;
 
-  it("caps a long section and says how many it kept back", () => {
+  it("caps a long section of SETTLED rows and says how many it kept back", () => {
     // A night away on a large fleet is when this card has the most to say and the least room: 30
     // rows push the chat off screen above the compose box, the failure buildDigest exists to
     // prevent on the nudge side. The summary sentence still carries the totals.
-    render(<RecapCard recap={recap({ needsYou: changes(12, "a"), finished: [] })} />);
+    //
+    // `done` rows, deliberately — those are the only ones the cap may eat. This test used to use
+    // `waiting`, which is exactly the defect the founder reported (bead sparkle-ws8gd).
+    render(<RecapCard recap={recap({ needsYou: [], finished: changes(12, "a", "done") })} />);
     expect(screen.getAllByTestId("recap-change")).toHaveLength(5);
-    expect(more("needsYou")!.textContent).toBe("+7 more in Wants you");
+    expect(more("finished")!.textContent).toBe("+7 more in Finished");
     // Nothing is hidden from the sentence — it still counts all twelve.
-    expect(screen.getByText(/12 need you/)).toBeTruthy();
+    expect(screen.getByText(/12 finished/)).toBeTruthy();
+  });
+
+  // ── "We should never hide a row that needs action from me." (the founder, bead sparkle-ws8gd) ──
+  describe("the cap may never hide a row that needs action", () => {
+    it("shows every actionable row however many there are, and offers no +N more", () => {
+      // Twelve rows that all want something. Under the old cap five rendered and SEVEN ASKS WERE
+      // INVISIBLE behind flat grey text — the card reporting a count that sounded complete while
+      // hiding the things the reader had to do.
+      render(<RecapCard recap={recap({ needsYou: changes(12, "a"), finished: [] })} />);
+      expect(screen.getAllByTestId("recap-change")).toHaveLength(12);
+      expect(more("needsYou")).toBeNull();
+    });
+
+    it("protects 'Needs merge' and 'Done — your turn', which live under FINISHED", () => {
+      // The subtle half, and the one the screenshot proved: finished is NOT settled. `unmerged`
+      // ("Needs merge") and `idle` ("Done — your turn") sit in the finished bucket and both owe the
+      // reader something. In the founder's screenshot every visible finished row was one of these.
+      const mixed = [
+        ...changes(4, "merge", "unmerged"),
+        // `idle`, NOT a `waiting` stand-in. This test names "Done — your turn", and that IS `idle`;
+        // substituting a red status would have left the ordinary-finish case unexercised while the
+        // test's own title claimed otherwise (roborev 59105).
+        ...changes(4, "turn", "idle"),
+        ...changes(9, "landed", "done"),
+      ];
+      render(<RecapCard recap={recap({ needsYou: [], finished: mixed })} />);
+      // 8 actionable + the 5 settled the cap allows = 13; the other 4 settled collapse.
+      expect(screen.getAllByTestId("recap-change")).toHaveLength(13);
+      expect(more("finished")!.textContent).toBe("+4 more in Finished");
+      // Every actionable agent is on screen by name — none of them is behind the disclosure.
+      for (let i = 0; i < 4; i++) {
+        expect(screen.getByText(`@merge ${i}`)).toBeTruthy();
+        expect(screen.getByText(`@turn ${i}`)).toBeTruthy();
+      }
+    });
+
+    it("keeps the ORIGINAL row order rather than hoisting actionable rows", () => {
+      // The cap removes rows; it must not reshuffle them, or expanding would rearrange the card
+      // under the reader.
+      const mixed = [
+        ...changes(1, "first", "done"),
+        ...changes(1, "second", "unmerged"),
+        ...changes(1, "third", "done"),
+      ];
+      render(<RecapCard recap={recap({ needsYou: [], finished: mixed })} />);
+      const names = screen.getAllByTestId("recap-change").map((r) => r.textContent ?? "");
+      expect(names[0]).toContain("first 0");
+      expect(names[1]).toContain("second 0");
+      expect(names[2]).toContain("third 0");
+    });
+  });
+
+  describe("the +N more line is a control, not a caption", () => {
+    it("expands in place on click, revealing every hidden row, and collapses again", () => {
+      render(<RecapCard recap={recap({ needsYou: [], finished: changes(12, "a", "done") })} />);
+      expect(screen.getAllByTestId("recap-change")).toHaveLength(5);
+
+      fireEvent.click(more("finished")!);
+      // ALL twelve, in place — not a modal, not a paged list (the founder: "should be expandable
+      // when clicked to see everything").
+      expect(screen.getAllByTestId("recap-change")).toHaveLength(12);
+
+      fireEvent.click(more("finished")!);
+      expect(screen.getAllByTestId("recap-change")).toHaveLength(5);
+    });
+
+    it("is a real button that advertises its expanded state", () => {
+      // "Make it LOOK clickable" — it was a bare div in muted caption ink, visually identical to
+      // the asides around it, which is why the founder could not tell it did anything.
+      render(<RecapCard recap={recap({ needsYou: [], finished: changes(12, "a", "done") })} />);
+      const line = more("finished")!;
+      expect(line.tagName).toBe("BUTTON");
+      expect(line.getAttribute("aria-expanded")).toBe("false");
+      // It carries an icon, not an emoji glyph typed into the string (this repo bans emoji-as-icons).
+      expect(line.querySelector("svg")).toBeTruthy();
+
+      fireEvent.click(line);
+      expect(more("finished")!.getAttribute("aria-expanded")).toBe("true");
+      expect(more("finished")!.textContent).toContain("Show fewer");
+    });
+
+    it("expands the decisions section too, so no overflow line is a dead end", () => {
+      render(<RecapCard recap={recap({ decisions: decisions(9) })} />);
+      expect(screen.getAllByTestId("recap-decision")).toHaveLength(5);
+      fireEvent.click(more("decisions")!);
+      expect(screen.getAllByTestId("recap-decision")).toHaveLength(9);
+    });
   });
 
   it("caps decisions from the RECENT end — the earliest are the ones that collapse", () => {
@@ -151,11 +259,17 @@ describe("RecapCard", () => {
     // Every earlier cap row overflows exactly ONE section, which is not the shape that motivated
     // the cap. Here each section overflows, so the three markers have to stay distinguishable and
     // count their own section (roborev 53655-M).
+    //
+    // SETTLED rows in both change sections, because only those can overflow at all now — an
+    // actionable row is never hidden (bead sparkle-ws8gd). WANTS YOU is populated with `done` rows
+    // purely to force a third marker: the bucketing is the producer's job (services/conciergeRecap
+    // puts red statuses there), and this test is about the three MARKERS being tellable apart, not
+    // about which bucket a status belongs in.
     render(
       <RecapCard
         recap={recap({
-          needsYou: changes(12, "n"),
-          finished: changes(9, "f"),
+          needsYou: changes(12, "n", "done"),
+          finished: changes(9, "f", "done"),
           decisions: decisions(8),
         })}
       />,
