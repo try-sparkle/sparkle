@@ -119,7 +119,7 @@ import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
 import type { ConciergeFeed } from "../useConciergeFeed";
 import type { StatusBand } from "../engine/buildSections";
 
-const COUNTS: Record<StatusBand, number> = { needs_you: 0, running: 1, done: 0 };
+const COUNTS: Record<StatusBand, number> = { needs_you: 0, questions: 0, running: 1, done: 0 };
 
 function feed(): ConciergeFeed {
   const agent = {

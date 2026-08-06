@@ -56,7 +56,7 @@ function feedOf(n: number, band: StatusBand = "needs_you", projectName = "sparkl
     // Nothing above it in the tree, so no ancestor row can be speaking for it.
     representedElsewhere: false,
   }));
-  const counts = { needs_you: 0, running: 0, done: 0, [band]: n };
+  const counts = { needs_you: 0, questions: 0, running: 0, done: 0, [band]: n };
   return {
     projects: [
       { id: "p1", name: projectName, inScope: true, counts, scopedCounts: counts, agents },
@@ -102,6 +102,7 @@ describe("clicking the digest narrows the Build column", () => {
     render(<ConciergeHost feed={feedOf(17, "needs_you")} />);
     expect(useUiStore.getState().statusFilter).toEqual({
       needs_you: true,
+      questions: true,
       running: true,
       done: true,
     });
@@ -113,6 +114,7 @@ describe("clicking the digest narrows the Build column", () => {
     // clears with the ordinary "Show all" rather than being an invisible mode.
     expect(useUiStore.getState().statusFilter).toEqual({
       needs_you: true,
+      questions: false,
       running: false,
       done: false,
     });

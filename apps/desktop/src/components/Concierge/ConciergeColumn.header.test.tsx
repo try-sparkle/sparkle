@@ -49,7 +49,7 @@ afterEach(cleanup);
 
 const model: ConciergeViewModel = {
   scope: {},
-  vitals: { needs_you: 2, running: 5, done: 1 },
+  vitals: { needs_you: 2, questions: 0, running: 5, done: 1 },
   messages: [{ id: "m1", kind: "you", text: "Retry the failing one" }],
 };
 
@@ -182,7 +182,7 @@ describe("the header's pills", () => {
   it("stays mounted at a zero count while the filter is still ON", () => {
     render(
       <ConciergeColumn
-        model={{ ...model, vitals: { needs_you: 0, running: 0, done: 0 }, needsYouFilter: true }}
+        model={{ ...model, vitals: { needs_you: 0, questions: 0, running: 0, done: 0 }, needsYouFilter: true }}
         controller={controller({ onNeedsYouFilterToggle: vi.fn() })}
       />,
     );
@@ -197,7 +197,7 @@ describe("the header's pills", () => {
   it("renders no filter pill when there is nothing behind it", () => {
     render(
       <ConciergeColumn
-        model={{ ...model, vitals: { needs_you: 0, running: 0, done: 0 } }}
+        model={{ ...model, vitals: { needs_you: 0, questions: 0, running: 0, done: 0 } }}
         controller={controller({ onNeedsYouFilterToggle: vi.fn() })}
       />,
     );
@@ -423,7 +423,7 @@ describe("the header says NOTHING beside the wordmark", () => {
   // beside them (roborev 57364). jsdom lays nothing out, so the assertable artefact is the token:
   // exactly one growing child, and it is the spacer, sitting before the right-hand cluster.
   it("keeps exactly one growing child, so the right cluster is not dragged to the wordmark", () => {
-    const h = headerOnly({ vitals: { needs_you: 0, running: 0, done: 0 } });
+    const h = headerOnly({ vitals: { needs_you: 0, questions: 0, running: 0, done: 0 } });
     const spacer = screen.getByTestId("concierge-header-spacer");
     expect(h.contains(spacer)).toBe(true);
     expect(spacer.style.flex).toBe("1 1 auto");
@@ -444,7 +444,7 @@ describe("the header says NOTHING beside the wordmark", () => {
   });
 
   it("CALM: nothing needs you, so the row carries the wordmark and no words at all", () => {
-    const h = headerOnly({ vitals: { needs_you: 0, running: 5, done: 12 } });
+    const h = headerOnly({ vitals: { needs_you: 0, questions: 0, running: 5, done: 12 } });
     // The mark is still there — this is a deletion of the LINE, not of the header.
     expect(h.contains(screen.getByRole("img", { name: "Sparkle" }))).toBe(true);
     // ScopeVitals' two handles, gone from the whole column, not merely from this row.
@@ -460,7 +460,7 @@ describe("the header says NOTHING beside the wordmark", () => {
   });
 
   it("ALARM: the red pill is the ONLY thing that appears, and it carries the count", () => {
-    const h = headerOnly({ vitals: { needs_you: 3, running: 5, done: 12 } });
+    const h = headerOnly({ vitals: { needs_you: 3, questions: 0, running: 5, done: 12 } });
     const pill = screen.getByTestId("concierge-needs-filter");
     expect(h.contains(pill)).toBe(true);
     expect(pill.textContent).toBe("3");
@@ -476,7 +476,7 @@ describe("the header says NOTHING beside the wordmark", () => {
   it("PINNED: a pinned scope still prints nothing — this is the one he complained about last", () => {
     const h = headerOnly({
       scope: { pinnedProjectName: "sparkle-desktop-experiments" },
-      vitals: { needs_you: 0, running: 2, done: 0 },
+      vitals: { needs_you: 0, questions: 0, running: 2, done: 0 },
     });
     // The pin is still MODELLED — `scope.pinnedProjectName` is fed and simply not printed here.
     // Where a human sees it instead: the project tab's solid, rotated, accent-ink pin
@@ -489,7 +489,7 @@ describe("the header says NOTHING beside the wordmark", () => {
 
   it("no per-project switch buttons anywhere: the split moved out of the header entirely", () => {
     headerOnly({
-      vitals: { needs_you: 3, running: 0, done: 0 },
+      vitals: { needs_you: 3, questions: 0, running: 0, done: 0 },
       needsYouByProject: [
         { projectId: "p1", projectName: "web", needsYou: 2, isActive: true },
         { projectId: "p2", projectName: "mobile", needsYou: 1, isActive: false },

@@ -90,8 +90,8 @@ import { PARTIAL_SETTLE_CAP_MS } from "../voice/useSendMode";
 
 const FEED = {
   projects: [],
-  counts: { needs_you: 0, running: 0, done: 0 },
-  scopedCounts: { needs_you: 0, running: 0, done: 0 },
+  counts: { needs_you: 0, questions: 0, running: 0, done: 0 },
+  scopedCounts: { needs_you: 0, questions: 0, running: 0, done: 0 },
   pinnedProjectId: null,
 } as unknown as ConciergeFeed;
 

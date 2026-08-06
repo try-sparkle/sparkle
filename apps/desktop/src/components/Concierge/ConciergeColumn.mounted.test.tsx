@@ -46,7 +46,7 @@ const TRANSCRIPT_HUMAN = "add a test for the retry path";
 
 const model: ConciergeViewModel = {
   scope: {},
-  vitals: { needs_you: 0, running: 0, done: 0 },
+  vitals: { needs_you: 0, questions: 0, running: 0, done: 0 },
   messages: [{ id: "m1", kind: "you", text: CONCIERGE_ONLY }],
 };
 

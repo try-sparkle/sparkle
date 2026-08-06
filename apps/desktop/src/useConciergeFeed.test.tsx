@@ -41,13 +41,13 @@ describe("useConciergeFeed", () => {
   it("returns the live feed and re-renders when a status changes", () => {
     const { result } = renderHook(() => useConciergeFeed());
     // a1 waiting → needs_you; b1 working → running.
-    expect(result.current.scopedCounts).toEqual({ needs_you: 1, running: 1, done: 0 });
+    expect(result.current.scopedCounts).toEqual({ needs_you: 1, questions: 0, running: 1, done: 0 });
 
     act(() => {
       useRuntimeStore.setState({ status: { a1: "waiting", b1: "blocked" } });
     });
     // b1 moved out of Running and joined a1 in Needs-you — `blocked` is no longer its own tier.
-    expect(result.current.scopedCounts).toEqual({ needs_you: 2, running: 0, done: 0 });
+    expect(result.current.scopedCounts).toEqual({ needs_you: 2, questions: 0, running: 0, done: 0 });
   });
 
   it("re-renders when a mute rule lands, dimming the item out of the scoped counts", () => {
@@ -64,8 +64,8 @@ describe("useConciergeFeed", () => {
 
   it("scopes to the pinned project while still listing everything", () => {
     const { result } = renderHook(() => useConciergeFeed({ pinnedProjectId: "pB" }));
-    expect(result.current.scopedCounts).toEqual({ needs_you: 0, running: 1, done: 0 }); // pA is out of scope
-    expect(result.current.counts).toEqual({ needs_you: 1, running: 1, done: 0 }); // full truth unchanged
+    expect(result.current.scopedCounts).toEqual({ needs_you: 0, questions: 0, running: 1, done: 0 }); // pA is out of scope
+    expect(result.current.counts).toEqual({ needs_you: 1, questions: 0, running: 1, done: 0 }); // full truth unchanged
     expect(result.current.projects).toHaveLength(2);
   });
 

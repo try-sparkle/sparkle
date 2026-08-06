@@ -32,12 +32,19 @@ export function bandColor(band: StatusBand): string {
 }
 
 /**
- * A band label carrying a COUNT, agreeing in number: "1 Needs you" · "3 Need you" · "2 Running".
+ * A band label carrying a COUNT, agreeing in number: "1 Needs you" · "3 Need you" · "1 Question" ·
+ * "2 Questions" · "2 Running".
  *
- * Only `needs_you` inflects — it is a sentence ("this one needs you"), not a noun, so a plural
- * subject takes the plural verb. "Running" and "Done" are adjectives and never change.
+ * TWO bands inflect, and they inflect DIFFERENT PARTS OF SPEECH — which is the whole reason this
+ * is one helper and not a per-surface `${n} ${label}`:
+ *   • `needs_you` is a SENTENCE ("this one needs you"), so a plural subject takes the plural VERB:
+ *     1 Needs you → 3 Need you. The count grows, the verb loses its -s.
+ *   • `questions` is a NOUN, so it inflects the opposite way: 1 Question → 3 Questions. The count
+ *     grows, the noun GAINS its -s. Reusing the needs_you rule here would produce "1 Questions".
+ * "Running" and "Done" are adjectives and never change.
  */
 export function bandCountLabel(band: StatusBand, n: number): string {
   if (band === "needs_you") return `${n} ${n === 1 ? "Needs you" : "Need you"}`;
+  if (band === "questions") return `${n} ${n === 1 ? "Question" : "Questions"}`;
   return `${n} ${bandLabel(band)}`;
 }

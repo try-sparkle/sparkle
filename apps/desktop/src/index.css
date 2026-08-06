@@ -75,6 +75,7 @@
   --c-amber-ink: #ecb968;
   --c-mixed-ink: #ecb968;
   --c-violet-ink: #a185f5;
+  --c-questions-ink: #7dd3fc;
 }
 :root[data-theme="light"] {
   --c-input-surface: #ffffff;
@@ -109,6 +110,7 @@
   --c-amber-ink: #664200;
   --c-mixed-ink: #ab4e07;
   --c-violet-ink: #5636b8;
+  --c-questions-ink: #075985;
 }
 
 * {

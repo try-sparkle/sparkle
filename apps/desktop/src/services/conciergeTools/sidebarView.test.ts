@@ -258,23 +258,23 @@ describe("readSidebarView", () => {
     expect(v.projectId).toBe("p1");
     expect(v.projectName).toBe("web");
     expect(v.workMode).toBe("build");
-    expect(v.bands).toEqual({ needs_you: true, running: true, done: true });
+    expect(v.bands).toEqual({ needs_you: true, questions: true, running: true, done: true });
     // Counts are over TOP-LEVEL rows only — workers never claim a row of their own.
-    expect(v.bandCounts).toEqual({ needs_you: 1, running: 1, done: 1 });
+    expect(v.bandCounts).toEqual({ needs_you: 1, questions: 0, running: 1, done: 1 });
     expect(v.hiddenByFilter).toBe(false);
   });
 
   it("counts a band that is switched OFF, so the concierge can say what turning it back on reveals", () => {
     isolateStatusBand("needs_you");
     const v = value(readSidebarView());
-    expect(v.bands).toEqual({ needs_you: true, running: false, done: false });
-    expect(v.bandCounts).toEqual({ needs_you: 1, running: 1, done: 1 });
+    expect(v.bands).toEqual({ needs_you: true, questions: false, running: false, done: false });
+    expect(v.bandCounts).toEqual({ needs_you: 1, questions: 0, running: 1, done: 1 });
     expect(v.visibleRows).toBe(1);
   });
 
   it("distinguishes 'you filtered everything out' from 'there is nothing here'", () => {
     expect(value(readSidebarView()).hiddenByFilter).toBe(false);
-    setStatusBands({ needs_you: false, running: false, done: false });
+    setStatusBands({ needs_you: false, questions: false, running: false, done: false });
     expect(value(readSidebarView()).hiddenByFilter).toBe(true);
     // An empty project is NOT hiddenByFilter — there is nothing to reveal.
     useProjectStore.setState({ projects: [mkProject("p1", "web", [])], selectedProjectId: "p1" } as never);
@@ -438,7 +438,7 @@ describe("a head's subtree mirrors the column's own predicate", () => {
   it("bands a non-worker child on its HEAD — the row the filter actually keys on", () => {
     isolateStatusBand("needs_you"); // b1's band; b2 (running) is hidden, and sh2 lives under it
     const v = value(selectRow("sh2"));
-    expect(v.priorBands).toEqual({ needs_you: true, running: false, done: false });
+    expect(v.priorBands).toEqual({ needs_you: true, questions: false, running: false, done: false });
     expect(useUiStore.getState().statusFilter.running).toBe(true);
     expect(rowsById(value(listBuildRows()))("sh2").visible).toBe(true);
   });
@@ -477,16 +477,17 @@ describe("status-band filtering", () => {
   it("isolates to one band and reports the whole prior set", () => {
     toggleStatusBand("running"); // start from a non-default state
     const v = value(isolateStatusBand("needs_you"));
-    expect(v.bands).toEqual({ needs_you: true, running: false, done: false });
-    expect(v.priorBands).toEqual({ needs_you: true, running: false, done: true });
+    expect(v.bands).toEqual({ needs_you: true, questions: false, running: false, done: false });
+    expect(v.priorBands).toEqual({ needs_you: true, questions: true, running: false, done: true });
   });
 
   it("is REVERSIBLE — the prior set restores the column exactly", () => {
-    const before: BandVisibility = { needs_you: true, running: false, done: true };
+    const before: BandVisibility = { needs_you: true, questions: true, running: false, done: true };
     setStatusBands(before);
     const isolated = value(isolateStatusBand("running"));
     expect(useUiStore.getState().statusFilter).toEqual({
       needs_you: false,
+      questions: false,
       running: true,
       done: false,
     });
@@ -495,8 +496,8 @@ describe("status-band filtering", () => {
   });
 
   it("allows turning every band off — the empty column explains itself", () => {
-    const v = value(setStatusBands({ needs_you: false, running: false, done: false }));
-    expect(v.bands).toEqual({ needs_you: false, running: false, done: false });
+    const v = value(setStatusBands({ needs_you: false, questions: false, running: false, done: false }));
+    expect(v.bands).toEqual({ needs_you: false, questions: false, running: false, done: false });
     expect(value(listBuildRows()).every((r) => !r.visible)).toBe(true);
   });
 
@@ -538,7 +539,9 @@ describe("status-band filtering", () => {
   });
 
   it("exposes the band vocabulary rather than making callers guess it", () => {
-    expect([...STATUS_BAND_IDS]).toEqual(["needs_you", "running", "done"]);
+    // FOUR bands since 2026-08-05: `questions` (BLUE) sits between the alarm and the calm bands.
+    // Order is the chip order, and the concierge reads this to name bands back to the founder.
+    expect([...STATUS_BAND_IDS]).toEqual(["needs_you", "questions", "running", "done"]);
   });
 });
 
@@ -754,7 +757,7 @@ describe("selectRow", () => {
   it("unhides the row first: turns its band back on and reports the prior set", () => {
     isolateStatusBand("needs_you");
     const v = value(selectRow("b3"));
-    expect(v.priorBands).toEqual({ needs_you: true, running: false, done: false });
+    expect(v.priorBands).toEqual({ needs_you: true, questions: false, running: false, done: false });
     expect(useUiStore.getState().statusFilter.done).toBe(true);
     const row = rowsById(value(listBuildRows()));
     expect(row("b3").visible).toBe(true);
@@ -762,6 +765,7 @@ describe("selectRow", () => {
     setStatusBands(v.priorBands as BandVisibility);
     expect(useUiStore.getState().statusFilter).toEqual({
       needs_you: true,
+      questions: false,
       running: false,
       done: false,
     });
@@ -784,6 +788,7 @@ describe("selectRow", () => {
     expect(v.priorCollapsed).toBeNull();
     expect(useUiStore.getState().statusFilter).toEqual({
       needs_you: true,
+      questions: false,
       running: false,
       done: false,
     });

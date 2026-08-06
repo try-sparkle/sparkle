@@ -11,21 +11,41 @@
 //   1. self-healing auto-open (workersNeedingOpen) — re-assert open() so the strand can't persist;
 //   2. a RED overlay (withUnstartedWorkerAttention) — when a strand DOES linger, paint the worker
 //      and its orchestrator red so it surfaces at the top instead of hiding in gray.
-import type { AgentTab, LastObserved } from "../types";
+import type { AgentTab, AgentTabStatus, LastObserved } from "../types";
 import { livenessOf } from "../services/agentLiveness";
 import { needsAttention, type StatusMap } from "./attention";
 import { isInMotion } from "./inMotion";
 import { isRedStatus } from "../services/windowStatus";
+
+/** "This parent is ALREADY asking you something, in RED." — needs-you-now AND red-tier.
+ *
+ *  Exists because those two stopped being the same question on 2026-08-05. Until then every
+ *  `needsAttention` status was also red, so `needsAttention` alone meant "already asking in red" and
+ *  this module said so in a comment. `questions` (BLUE) broke that: it is needs-you-now and NOT red,
+ *  so a questioning parent started reading as "already asking" and suppressed a genuinely RED worker
+ *  underneath it — which is precisely backwards, because red outranks blue.
+ *
+ *  Use this wherever the intent is "do not overwrite a parent's own red ask". Use plain
+ *  `needsAttention` only where the intent really is "is anything, of any colour, waiting on the
+ *  human". They are different sets now and the difference is a hidden red worker. */
+function isRedAsk(status: AgentTabStatus | undefined): boolean {
+  return needsAttention(status) && isRedStatus(status);
+}
 
 // TWO predicates, used for two different questions — see the trap note in packages/ui/tokens.ts.
 // This module previously used `needsAttention` for BOTH, behind comments that said "RED", which is
 // how a `blocked` worker ended up never bubbling to its orchestrator at all (2026-07-26).
 //
 //   isRedStatus(s)   — "is this row painted red?"          waiting | approval | errored | blocked
-//   needsAttention(s) — "is this stopping ME, right now?"   waiting | approval | errored
+//   needsAttention(s) — "is this stopping ME, right now?"   waiting | approval | errored | questions
+//   isRedAsk(s)       — "already asking, IN RED?"           waiting | approval | errored
 //
-// `blocked` is the status that separates them: the agent went quiet and may need unsticking, but
-// nothing is waiting on your answer. That distinction decides two things below — what the in-motion
+// `blocked` is in the first but not the second: the agent went quiet and may need unsticking, but
+// nothing is waiting on your answer. `questions` (added 2026-08-05) is in the second but NOT the
+// first — it is BLUE — which is why the third predicate had to exist. Before it, `needsAttention`
+// was a subset of the red tier and doubled as "already asking in red"; `questions` broke that
+// coincidence, and every site that meant the THIRD thing while calling the second would suppress a
+// red worker under a merely-questioning parent. That distinction decides two things below — what the in-motion
 // suppression may swallow, and which red may overwrite which on the orchestrator's row.
 //
 // Both are called by their real names at every site, deliberately: the first cut aliased them to
@@ -154,12 +174,15 @@ export function withUnstartedWorkerAttention(
     // plain color-tier guard was inconsistent AND cosmetic-only — the pipeline runs
     // withRedWorkerAttention over this map immediately afterward, where the ask would overwrite the
     // parent's `blocked` anyway — so the two functions now simply agree (roborev on f7b43dc8).
-    // `needsAttention` alone, not `!isRedStatus(p) || !needsAttention(p)`: the needs-you-now set is a
-    // SUBSET of the red tier, so that longer form reduced to exactly this while implying a status
-    // that is needs-you-now but not red — which cannot exist — and inviting the wrong simplification.
+    // `isRedAsk`, NOT `needsAttention`. This used to read `!needsAttention(p)` under a comment
+    // arguing the two were interchangeable because "the needs-you-now set is a SUBSET of the red
+    // tier, so [the longer form] implies a status that is needs-you-now but not red — which cannot
+    // exist". That premise was true until 2026-08-05 and is now false: `questions` is needs-you-now
+    // and BLUE. Left alone, a questioning parent counted as "already asking" and SWALLOWED this
+    // worker's synthesized red — the strand vanished from the one view that exists to show it.
     // The local binding is what lets TS see the non-null parentId the predicate above guarantees.
     const parentId = a.parentId;
-    if (parentId !== null && !needsAttention(statusMap[parentId])) {
+    if (parentId !== null && !isRedAsk(statusMap[parentId])) {
       ensure()[parentId] = "approval";
     }
   }
@@ -242,8 +265,13 @@ export function withRedWorkerAttention(
     // `blocked` is the single non-ask red, so the write it would wrongly allow is `blocked` over
     // `blocked` — the same value. Add a second non-ask red and it silently re-opens the
     // first-writer-wins bug from 4b3ede48. Keep both conjuncts.
+    // `isRedAsk` on the parent, for the reason spelled out at the other call site: `needsAttention`
+    // now admits BLUE `questions`, so a questioning orchestrator read as "already asking" and this
+    // red worker never bubbled at all — the row went blue, filed under `questions`, and the stopped
+    // worker disappeared from an isolated "Needs you" view. Red outranks blue, so a blue parent must
+    // NOT suppress a red child. The second conjunct is unchanged and still load-bearing.
     const parentStatus = src[a.parentId];
-    if (!needsAttention(parentStatus) && (!isRedStatus(parentStatus) || needsAttention(ws))) {
+    if (!isRedAsk(parentStatus) && (!isRedStatus(parentStatus) || needsAttention(ws))) {
       ensure()[a.parentId] = ws;
     }
   }

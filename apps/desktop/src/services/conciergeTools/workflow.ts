@@ -485,7 +485,17 @@ export function resolveLandTarget(ctx: AgentWorkflowContext): string {
  * (`services/improvementPass` still sets `blocked` for the Sparkle self-improve agent, so the entry
  * is live code, not a leftover.)
  */
-const LIVE_AGENT_STATUSES = new Set<AgentTabStatus>(["working", "waiting", "approval", "blocked"]);
+// `questions` is LIVE. An agent sitting on an AskUserQuestion picker has a turn open and a
+// half-written working tree; treating it as idle would let a workflow tool mutate the tree under it
+// (or act as though the work were finished) while it waits on an answer. It reads calm only in the
+// sense that nothing is moving — which is precisely the reading this set exists to prevent.
+const LIVE_AGENT_STATUSES = new Set<AgentTabStatus>([
+  "working",
+  "waiting",
+  "approval",
+  "questions",
+  "blocked",
+]);
 
 /** Live PTY-busy reading for an agent. Read at CALL time, never passed in — see the module header. */
 function isWorking(agentId: string): boolean {

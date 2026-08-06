@@ -44,7 +44,8 @@ const agent = (over: Partial<ConciergeAgent> & { id: string }): ConciergeAgent =
 function feed(agents: ConciergeAgent[]): ConciergeFeed {
   const count = (band: string) =>
     agents.filter((a) => a.band === band && a.inScope && !a.muted).length;
-  const counts = { needs_you: count("needs_you"), running: count("running"), done: count("done") };
+  const counts = { needs_you: count("needs_you"),
+    questions: count("questions"), running: count("running"), done: count("done") };
   return {
     projects: [{ id: "p1", name: "sparkle-desktop", inScope: true, counts, agents }],
     counts,

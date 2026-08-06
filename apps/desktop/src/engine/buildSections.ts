@@ -261,11 +261,17 @@ export function honestStageMeta(
 }
 
 // ── Status bands (the filter) ────────────────────────────────────────────────────────────────
-// The three buckets the filter chips toggle. These are EXACTLY the three color tiers in
-// packages/ui/tokens.ts AGENT_STATUS (RED / GREEN / GRAY) — deliberately so, because the row's dot
-// is painted from that same taxonomy. A chip therefore hides precisely the rows whose dot matches
-// its own color, which is the only mapping a user can predict without being told.
-export type StatusBand = "needs_you" | "running" | "done";
+// The four buckets the filter chips toggle. These are EXACTLY the four color tiers in
+// packages/ui/tokens.ts AGENT_STATUS (RED / BLUE / GREEN / GRAY) — deliberately so, because the
+// row's dot is painted from that same taxonomy. A chip therefore hides precisely the rows whose dot
+// matches its own color, which is the only mapping a user can predict without being told.
+//
+// It was THREE until 2026-08-05. `questions` (BLUE) is the fourth, and the 1:1 pin is why it had to
+// become a band rather than ride inside `needs_you`: statusBandLabels.test.ts asserts every band is
+// a different color and that each band's color comes from its own `colorFrom` status, so a fourth
+// hue with no fourth band fails there. That pin is doing its job — read the AGENT_STATUS header in
+// tokens.ts for why the hue split was taken.
+export type StatusBand = "needs_you" | "questions" | "running" | "done";
 
 export interface StatusBandMeta {
   id: StatusBand;
@@ -276,16 +282,28 @@ export interface StatusBandMeta {
   colorFrom: AgentTabStatus;
 }
 
+// ORDER IS THE CHIP ORDER, and `questions` sits second — after the alarm, ahead of the calm bands.
+// Not first: a genuine red still outranks a question, because red means work has STOPPED and blue
+// means work is about to be done right. Not last either — a question the founder never scrolls to
+// is a stalled agent.
 export const STATUS_BANDS: readonly StatusBandMeta[] = [
   { id: "needs_you", label: "Needs you", colorFrom: "waiting" },
+  { id: "questions", label: "Questions", colorFrom: "questions" },
   { id: "running", label: "Running", colorFrom: "working" },
   { id: "done", label: "Done", colorFrom: "idle" },
 ] as const;
 
 // Which band a status falls in. Mirrors the AGENT_STATUS color tiers exactly:
 //   RED   → needs_you  (waiting/approval/blocked/errored)
+//   BLUE  → questions  (questions)
 //   GREEN → running    (working)
 //   GRAY  → done       (idle/done/stopped/unmerged)
+//
+// `questions` gets its own band rather than joining `needs_you`, and the difference is not cosmetic:
+// `needs_you` is the band the concierge digest COUNTS and the red filter chip narrows, so folding
+// questions into it would make "N agents need you" include the agents that are working exactly as
+// intended — the same false-alarm inflation that `new` and `unmerged` were moved out of that band
+// to fix. A question is an ask, but it is not an alarm.
 // `unmerged` is GRAY and therefore lands in "done", which is correct here: it means "finished, but
 // the work hasn't landed" — and WHERE that work got to is now carried by the stage section it sits
 // in, not by its status. That's the whole division of labor: section = how far the work got,
@@ -304,6 +322,8 @@ export function bandOfStatus(status: AgentTabStatus): StatusBand {
     case "blocked":
     case "errored":
       return "needs_you";
+    case "questions":
+      return "questions";
     case "working":
       return "running";
     case "idle":
@@ -317,7 +337,7 @@ export function bandOfStatus(status: AgentTabStatus): StatusBand {
 
 // All bands visible — the default, and the shape the filter state is stored in.
 export function allBandsVisible(): Record<StatusBand, boolean> {
-  return { needs_you: true, running: true, done: true };
+  return { needs_you: true, questions: true, running: true, done: true };
 }
 
 // NOTE: the band's LABELS and COLORS live in engine/statusBandLabels (bandLabel / bandColor /

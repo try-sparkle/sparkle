@@ -137,7 +137,7 @@ const CHECKS_PAYLOAD = {
   },
 };
 
-const COUNTS: Record<StatusBand, number> = { needs_you: 0, running: 1, done: 0 };
+const COUNTS: Record<StatusBand, number> = { needs_you: 0, questions: 0, running: 1, done: 0 };
 
 function feed(): ConciergeFeed {
   const agent = {

@@ -80,6 +80,16 @@ export const C = {
   // New brand-aligned colors for the desktop status taxonomy (spec §6).
   violet: "#8b6df0", // blocked / stalled on something external
   success: "#34c759", // done / completed cleanly
+
+  // THE FOURTH STATUS TIER — an agent has QUESTIONS for you. Added 2026-08-05 at the founder's
+  // explicit instruction; see the AGENT_STATUS header for the decision this overrules.
+  //
+  // WHY IT IS NOT `teal`, the accent blue you would reach for first. `teal`/`gold`/`goldHot` are the
+  // PRIMARY ACCENT (the Send button, the wordmark, the keycaps) — a status dot painted #2f6bff would
+  // be the same blue as the button beside it, and the whole value of a status color is that it means
+  // one thing. This is deliberately cyan-ward of the accent and far more saturated than `muted`
+  // (#8aa0c4, the gray tier, which is itself a blue-gray) so it separates from BOTH at 8px.
+  azure: "#38bdf8", // an agent is asking you something — good news, not an alarm
 } as const;
 
 /**
@@ -107,20 +117,33 @@ export const C = {
  * deliberately does NOT add to the badge count or fire a banner (it's "needs you eventually", not
  * "answer this now"). Notifications stay user-configurable per status (settingsStore).
  *
- * ── RED IS ASKED TO DO TWO JOBS, AND THE ANSWER IS TREATMENT, NOT A SECOND HUE ──────────────────
- * The 2026-07-27 UI refresh asked that red stop meaning both "needs you" and "error". It was
- * NOT split, deliberately, and this is the record of why: the nine-states-to-three-colors collapse
- * documented above is the design, and the whole app reads the tier (windowStatus.isRedStatus, the
- * cross-project banding, the filter chips, the tab badges). Adding a fourth colour re-opens that
- * settled decision and costs the glance-readability it bought — a user does not act differently on
- * "it crashed" than on "it is asking you something": both mean go look.
+ * ── THE HUE SPLIT THAT WAS DECLINED IN 2026-07, AND TAKEN IN 2026-08 ────────────────────────────
+ * The 2026-07-27 UI refresh asked that red stop meaning both "needs you" and "error". It was NOT
+ * split then, and the paragraph recording that refusal ended: "If the founder wants the hue split
+ * anyway, this is the paragraph to overrule." On 2026-08-05 he did, in these words: "I wouldn't
+ * want it to be red. Maybe it should be blue. And not red." This is that overrule, and the reason
+ * it is a GOOD trade now when it was a bad one then — because the argument has changed, not just
+ * the verdict:
  *
- * The distinction the request actually wants is available WITHOUT a hue. `StatusFilterBar` already
- * differentiates state by FILL — a solid dot when a band is showing, a hollow ring when it is not —
- * and that treatment is what carries the difference wherever one is needed, including on the shared
- * `BandBadge`. Same red, different shape.
+ * The 2026-07 refusal rested on one claim — "a user does not act differently on 'it crashed' than
+ * on 'it is asking you something': both mean go look." That is true of CRASHED vs ASKING. It is
+ * false of the state added here. `questions` is not a failure at all: it is an agent doing exactly
+ * what we want — stopping to interview the founder BEFORE building the wrong thing. Painting the
+ * good state in the alarm colour teaches him to dread the behaviour we are trying to get more of,
+ * which is a strictly worse outcome than the glance-readability the three-tier collapse bought.
+ * The 2026-07 request wanted to split red into two REDS (both bad news, differing only in cause);
+ * this splits an alarm off from a NON-alarm. Different question, different answer.
  *
- * If the founder wants the hue split anyway, this is the paragraph to overrule.
+ * The FILL treatment that was offered instead (solid vs hollow, per StatusFilterBar) is still the
+ * right answer for two states that are both bad news, and it is still used — `questions` uses it
+ * for AGE (see engine/questionAge.ts). It cannot carry this distinction, because fill is a
+ * second-glance signal and "is this good news or bad news" has to survive the first glance.
+ *
+ * WHAT IT COST, so nobody pays it twice: the three-tier collapse is now a FOUR-tier collapse, and
+ * every consumer of the tier had to grow a fourth arm — `StatusBand`/`STATUS_BANDS`/`bandOfStatus`
+ * (engine/buildSections), `RollupDot` (engine/workerRollup), `statusInk` (theme/colors), the filter
+ * chips, and the tab badges. `windowStatus.isRedStatus` did NOT change and MUST NOT: `questions` is
+ * blue, so it is not red, and that is the entire point.
  *
  * THE TWO SETS ARE DIFFERENT ON PURPOSE, AND THAT IS A TRAP. Code that means "is this row red?"
  * must call windowStatus.isRedStatus; code that means "is this agent asking me something right
@@ -131,6 +154,7 @@ export const C = {
 const GREEN = C.success; // #34c759 — running, leave it be
 const RED = C.sienna; //   #e0533f — needs your action
 const GRAY = C.muted; //   #8aa0c4 — not active (legible on navy)
+const BLUE = C.azure; //   #38bdf8 — asking you something (GOOD news, deliberately not red)
 export const AGENT_STATUS = {
   working: { color: GREEN, label: "Working" }, // actively producing output
   idle: { color: GRAY, label: "Done — your turn" }, // finished its turn, nothing left for you
@@ -143,6 +167,22 @@ export const AGENT_STATUS = {
   // asked. That made red mean "an agent exists" on any fleet where agents are spawned ahead of
   // being briefed. See engine/newAgentAttention.ts for the derivation and the 5-minute backstop.
   new: { color: GRAY, label: "New — not briefed" },
+  // THE AGENT HAS QUESTIONS FOR YOU, and this is the one attention state that is GOOD NEWS.
+  //
+  // It means an agent stopped to interview the founder before building — the behaviour we most want
+  // to encourage. BLUE, not red, and that is load-bearing rather than cosmetic: `waiting` below is
+  // the same fact wearing the alarm colour, and painting "I'm about to build the right thing
+  // instead of the wrong thing" in the same hue as "I crashed" trains the founder to dread it.
+  //
+  // It is NOT a quieter `waiting`. It is as loud — it counts toward the dock badge and fires a
+  // banner (engine/attention.ts) exactly like the red asks do, because a question nobody sees is a
+  // stalled agent. What differs is only the emotional register of the colour.
+  //
+  // IT NEVER AGES INTO RED (founder's call, 2026-08-05). An unanswered question sorts to the top of
+  // the list and shows its elapsed time (engine/questionAge.ts), which is urgency WITHOUT dread;
+  // recolouring it after N hours would re-couple the good state to the alarm and reintroduce the
+  // exact bug this state exists to fix.
+  questions: { color: BLUE, label: "Questions" },
   waiting: { color: RED, label: "Needs you" }, // asked a question (on-screen prompt)
   approval: { color: RED, label: "Approve?" }, // caution/dangerous action pending
   blocked: { color: RED, label: "Blocked" }, // went quiet / stalled — needs you to unstick it

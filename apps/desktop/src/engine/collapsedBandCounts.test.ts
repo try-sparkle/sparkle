@@ -54,7 +54,7 @@ function bandCounts(
   // what the sibling agreement test passes for the same reason. (The 4th parameter arrived on main
   // after this file was written; vitest does not typecheck, so only `tsc` catches the arity.)
   const { dotOf } = rollupViewFor(agents, status, new Set<string>(), {}, () => "building_unsaved");
-  const counts: Record<StatusBand, number> = { needs_you: 0, running: 0, done: 0 };
+  const counts: Record<StatusBand, number> = { needs_you: 0, questions: 0, running: 0, done: 0 };
   for (const a of agents) {
     if (a.parentId) continue; // top-level rows only, as the chips do
     counts[bandOfRollup(dotOf(a.id))] += 1;

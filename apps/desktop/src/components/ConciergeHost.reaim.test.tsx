@@ -167,7 +167,7 @@ function agent(id: string, name: string) {
     muted: false,
   };
 }
-const COUNTS = { needs_you: 0, running: 0, done: 2 };
+const COUNTS = { needs_you: 0, questions: 0, running: 0, done: 2 };
 const FEED = {
   projects: [
     {

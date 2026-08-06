@@ -128,7 +128,7 @@ import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
 import { MOUNTED_NOTICE_TESTID } from "./Concierge/MountedNotice";
 import { CONCIERGE_THREAD_TESTID } from "../engine/composeBoxHeight";
 
-const COUNTS = { needs_you: 0, running: 0, done: 1 };
+const COUNTS = { needs_you: 0, questions: 0, running: 0, done: 1 };
 const FEED = {
   projects: [
     {

@@ -180,7 +180,7 @@ describe("migratePersistedUi — the filter repair is not version-gated", () => 
   });
 
   it("still preserves a deliberately-hidden band at the current version", () => {
-    const out = migratePersistedUi({ statusFilter: { needs_you: true, running: true, done: false } }, 2, 72) as {
+    const out = migratePersistedUi({ statusFilter: { needs_you: true, questions: true, running: true, done: false } }, 2, 72) as {
       statusFilter: Record<string, boolean>;
     };
     expect(out.statusFilter.done).toBe(false);

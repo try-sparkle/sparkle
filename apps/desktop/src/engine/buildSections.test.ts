@@ -126,6 +126,7 @@ describe("status bands", () => {
     const statuses = Object.keys(AGENT_STATUS) as AgentTabStatus[];
     const colorOfBand: Record<StatusBand, string> = {
       needs_you: AGENT_STATUS.waiting.color,
+      questions: AGENT_STATUS.questions.color,
       running: AGENT_STATUS.working.color,
       done: AGENT_STATUS.idle.color,
     };
@@ -148,7 +149,7 @@ describe("status bands", () => {
   });
 
   it("defaults to all three bands visible", () => {
-    expect(allBandsVisible()).toEqual({ needs_you: true, running: true, done: true });
+    expect(allBandsVisible()).toEqual({ needs_you: true, questions: true, running: true, done: true });
   });
 });
 
@@ -244,6 +245,7 @@ describe("grouping rows into sections", () => {
     );
     const onlyRed = groupAgentsByStage(agents, stageOf, statusOf, {
       needs_you: true,
+      questions: false,
       running: false,
       done: false,
     });
@@ -251,6 +253,7 @@ describe("grouping rows into sections", () => {
 
     const noRed = groupAgentsByStage(agents, stageOf, statusOf, {
       needs_you: false,
+      questions: true,
       running: true,
       done: true,
     });
@@ -266,6 +269,7 @@ describe("grouping rows into sections", () => {
     // Turn Running off: the Uncommitted section loses its only row and must disappear entirely.
     const groups = groupAgentsByStage(agents, stageOf, statusOf, {
       needs_you: true,
+      questions: true,
       running: false,
       done: true,
     });
@@ -276,7 +280,10 @@ describe("grouping rows into sections", () => {
     const agents = [row("a"), row("b")];
     const { stageOf, statusOf } = lookups({ a: "building_saved", b: "pull_request" });
     const groups = groupAgentsByStage(agents, stageOf, statusOf, {
+      // `questions: false` is load-bearing here, not filler: the test's name claims EVERY band is
+      // off, and a missed band would leave it asserting something weaker than it says.
       needs_you: false,
+      questions: false,
       running: false,
       done: false,
     });

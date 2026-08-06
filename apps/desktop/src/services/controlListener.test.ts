@@ -2523,7 +2523,7 @@ describe("controlListener", () => {
     expect(res.models).toContain("claude-opus-4-8"); // curated catalog fallback id
     // agentOrdering was dropped with the attention sort; statusFilter took its slot.
     expect((res as Record<string, unknown>).agentOrdering).toBeUndefined();
-    expect(res.statusFilter).toEqual({ needs_you: true, running: false, done: true });
+    expect(res.statusFilter).toEqual({ needs_you: true, questions: true, running: false, done: true });
     // PER COLUMN — get_state reports the map, because there is no single "the zoom" to report.
     expect(res.zoomByColumn.concierge).toBe(1.3);
     expect(res.zoomByColumn["build-left"]).toBe(1);

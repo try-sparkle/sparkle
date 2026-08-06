@@ -113,7 +113,7 @@ const BODY = `${PASTE}\n\n${TYPED}`;
 const target = { projectId: "p1", agentId: "ag1", name: "CI Hardening" };
 
 function feed(): ConciergeFeed {
-  const counts = { needs_you: 1, running: 0, done: 0 };
+  const counts = { needs_you: 1, questions: 0, running: 0, done: 0 };
   const agent = {
     id: "ag1",
     name: "CI Hardening",

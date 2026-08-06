@@ -45,6 +45,12 @@ export const DEFAULT_NOTIFY_STATUSES: Record<AgentTabStatus, boolean> = {
   waiting: true,
   approval: true,
   errored: true,
+  // ON by default, with the red asks — `questions` is BLUE but it is not passive. An agent that
+  // has stopped to ask something is losing time until the founder answers, exactly like `waiting`,
+  // and the founder's ask was that this be as impossible to miss as the blocked pill. The colour is
+  // what differs, not the loudness. (Contrast `blocked`/`unmerged` below, which really are "when
+  // you get to it" and stay off.)
+  questions: true,
   idle: true,
   done: true,
   working: false,

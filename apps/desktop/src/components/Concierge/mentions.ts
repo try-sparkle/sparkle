@@ -490,8 +490,11 @@ export function matchScore(name: string, query: string): number {
 }
 
 /** Band ordering for the default list — an agent that needs you is the likeliest one you opened the
- *  picker to address. `needs_you` first, then whatever is running, then everything settled. */
-const BAND_RANK: Record<StatusBand, number> = { needs_you: 0, running: 1, done: 2 };
+ *  picker to address. `needs_you` first, then anything ASKING you something, then whatever is
+ *  running, then everything settled. `questions` ranks second for the same reason it is second in
+ *  STATUS_BANDS: an agent waiting on your answer is a far likelier mention target than a healthy
+ *  running one, and it is the agent you most want to reach without hunting for it. */
+const BAND_RANK: Record<StatusBand, number> = { needs_you: 0, questions: 1, running: 2, done: 3 };
 
 /**
  * The picker's list: filtered by `query`, best match first, most relevant first within a tier.

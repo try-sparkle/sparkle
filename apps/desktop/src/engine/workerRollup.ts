@@ -5,15 +5,25 @@
 // case that matters: an orchestrator sitting in `idle` while three of its workers are blocked on a
 // question renders GRAY — "nothing to do here" — and the fold hides the only rows that disagree.
 //
-// THE LAW, in one sentence: grey is ignored; red and green together make orange. Plus one
-// exception — an orchestrator's OWN red wins outright, because a question the head is asking is one
-// you are directly blocking, and healthy workers must not paint over it.
+// THE LAW, in one sentence: grey is ignored; red and green together make orange; blue loses to red
+// and beats green. Plus one exception — an orchestrator's OWN red or OWN blue wins outright,
+// because a question the head is asking is one you are directly blocking, and healthy workers must
+// not paint over it.
 //
-// Two deliberate non-symmetries, both load-bearing:
+// Three deliberate non-symmetries, all load-bearing:
 //   • own RED wins, own GREEN does not. A head busy delegating while every worker under it is
 //     blocked is not a healthy row; "all red → red" is flat.
 //   • grey is absorbed, never mixed. A finished worker beside a running one says "still going",
 //     not "partly done" — there is no fourth color for that and there shouldn't be.
+//   • BLUE DOES NOT MIX EITHER, and it is the newest of the three (2026-08-05). There is no
+//     blue+green blend and there must not be one: `orange` exists because red+green is a genuine
+//     CONFLICT (something is stopping you while other things run, and you cannot tell which the row
+//     means). Blue+green is not a conflict — a question you can answer is strictly more actionable
+//     than "something is running", so blue simply wins and the green is not lost (the head keeps its
+//     +N badge and its workers). Blue LOSES to red for the mirror-image reason: red means work has
+//     STOPPED, blue means work is about to be done right, and the stopped thing is the one you must
+//     see first. Red+blue+green is therefore `orange`, not a fourth blend — the red is what the
+//     orange is reporting, and orange already files under `needs_you`.
 //
 // TIERS COME FROM `bandOfStatus`, NOT FROM A LIST SPELLED OUT HERE. That function is already pinned
 // 1:1 to the three AGENT_STATUS color tiers by engine/statusBandLabels.test.ts, so a status added
@@ -28,10 +38,13 @@
 import { bandOfStatus, type StatusBand } from "./buildSections";
 import type { AgentTabStatus } from "../types";
 
-/** The four marks a head row's disc can take. `orange` is NOT an agent status — there is no such
+/** The five marks a head row's disc can take. `orange` is NOT an agent status — there is no such
  *  PTY state — it is a summary of disagreement among workers, which is why it lives here and not in
- *  AGENT_STATUS (that enum's three color tiers are pinned to the three filter bands). */
-export type RollupDot = "green" | "red" | "orange" | "gray";
+ *  AGENT_STATUS (that enum's color tiers are pinned 1:1 to the filter bands).
+ *
+ *  `blue` IS an agent status (`questions`) and files under the `questions` band, exactly as red
+ *  files under `needs_you`. There is deliberately NO blue+green mix color: see the LAW above. */
+export type RollupDot = "green" | "red" | "blue" | "orange" | "gray";
 
 /** The dot for a row, given its own status and the statuses of the workers folded under it.
  *
@@ -46,20 +59,38 @@ export function rollupDot(
   // The exception, checked first: a head asking you something is red no matter what is underneath.
   if (ownBand === "needs_you") return "red";
 
+  // OWN BLUE IS *NOT* AN EARLY RETURN, and that asymmetry with own-red is the whole point.
+  //
+  // It was one, briefly, and it silently contradicted THE LAW two paragraphs up: a questioning head
+  // with a `blocked` worker returned "blue" before the worker list was ever read, `bandOfRollup`
+  // filed it under `questions`, and the red worker then VANISHED from an isolated "Needs you" view —
+  // the one view whose entire job is to show you everything that has stopped. "Blue loses to red"
+  // has to be true of a head's own blue too, or it is not a law, just a preference about workers.
+  //
+  // Own RED can short-circuit because nothing outranks it. Own BLUE cannot, because red does. So the
+  // head's question becomes a blue CONTRIBUTOR (`ownAsks` below) weighed with the workers, rather
+  // than a verdict reached before they are counted.
+  const ownAsks = ownBand === "questions";
+
   // No subtree → nothing to summarize. This is also the worker-row and shell-row path.
   if (workerStatuses.length === 0) return dotOfBand(ownBand);
 
   let anyRed = false;
+  let anyBlue = ownAsks;
   let anyGreen = false;
   for (const s of workerStatuses) {
     const band = bandOfStatus(s);
     if (band === "needs_you") anyRed = true;
+    else if (band === "questions") anyBlue = true;
     else if (band === "running") anyGreen = true;
     // "done" is grey and deliberately contributes nothing.
   }
 
   if (anyRed && anyGreen) return "orange";
   if (anyRed) return "red";
+  // Blue beats green and does not blend with it — see THE LAW. Checked after both red arms so a
+  // red worker is never swallowed by a blue one, the head's own included.
+  if (anyBlue) return "blue";
   // GREEN DOES NOT OVERRIDE `unmerged`. Every other calm status means "nothing here wants you", so
   // letting a running worker speak for the row loses nothing. `unmerged` is different: it is gray by
   // deliberate choice (tokens.ts — a LANDING state, not an alarm) but it is still an ASK, "open or
@@ -84,6 +115,11 @@ export function bandOfRollup(dot: RollupDot): StatusBand {
     case "red":
     case "orange":
       return "needs_you";
+    // Blue files under its OWN band, not under needs_you — that separation is the entire feature.
+    // Sending it to `needs_you` would put every question back into the count the red chip narrows
+    // and the concierge digest reports, which is the conflation this state exists to undo.
+    case "blue":
+      return "questions";
     case "green":
       return "running";
     case "gray":
@@ -142,6 +178,14 @@ export function rollupDotAccessor<
     // own status went calm, but the rollup re-read the worker's still-red status, repainted the row
     // red and re-filed it under "Needs you". De-escalating to the head's own tier is what the
     // pre-existing withDismissedAlerts did to the bubbled red before the rollup replaced it.
+    // `blue` IS DELIBERATELY ABSENT from this gate, and so is `questions` from the filter below.
+    // Dismissal silences an ALARM — it is the "I've seen the red, stop shouting" control. A pending
+    // question is not an alarm and cannot be resolved by acknowledging it: it is resolved by
+    // ANSWERING it, and until then the agent is genuinely stopped. So a dismissed head with a
+    // `questions` worker re-rolls to BLUE rather than to green/gray, which is the truth — the red is
+    // silenced, the question is still outstanding. Adding "blue" here would give the founder a way
+    // to make a waiting agent invisible without answering it, which is the failure mode the whole
+    // state was built to prevent.
     if ((dot === "red" || dot === "orange") && isDismissed(id)) {
       // Drop the REDS and re-roll — do not collapse to an empty list. Dismissal silences an alarm;
       // it does not mean "nothing is happening here". A dismissed head with a `waiting` worker AND a
@@ -200,6 +244,8 @@ export function rollupLabel(dot: RollupDot): string {
       return "Workers need you";
     case "orange":
       return "Workers running — some need you";
+    case "blue":
+      return "Workers have questions";
     case "green":
       return "Workers running";
     case "gray":
@@ -211,6 +257,8 @@ function dotOfBand(band: StatusBand): RollupDot {
   switch (band) {
     case "needs_you":
       return "red";
+    case "questions":
+      return "blue";
     case "running":
       return "green";
     case "done":

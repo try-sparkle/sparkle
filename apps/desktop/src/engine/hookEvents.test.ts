@@ -18,12 +18,24 @@ describe("hookEventToStatus", () => {
     }
   });
 
-  it("maps a PreToolUse for a BLOCKING tool to red — the mid-turn picker (sparkle-t2up)", () => {
+  it("maps a PreToolUse for a BLOCKING tool to an ATTENTION state — the mid-turn picker (sparkle-t2up)", () => {
     // AskUserQuestion / ExitPlanMode block the turn on the user with no Stop and no Notification,
-    // so their PreToolUse must read as "answer me" (red), not the agent working. A non-blocking
+    // so their PreToolUse must read as "answer me", not the agent working. A non-blocking
     // tool's PreToolUse (and a PreToolUse with no tool) still maps to working (green).
-    expect(hookEventToStatus({ event: "PreToolUse", tool: "AskUserQuestion" })).toBe("waiting");
+    //
+    // AskUserQuestion is `questions` (BLUE) as of 2026-08-05, NOT `waiting` (red). This assertion
+    // is the entire detection path for the Questions state: Claude Code fires this hook
+    // deterministically whenever an agent opens a question menu, so re-routing this one mapping is
+    // what makes every already-running agent surface blue instead of red. See the header note in
+    // hookEvents.ts for why the rejected alternative (scraping terminal prose) is not used.
+    expect(hookEventToStatus({ event: "PreToolUse", tool: "AskUserQuestion" })).toBe("questions");
+    // ExitPlanMode stays `approval` (red) ON PURPOSE — it is the agent DELIVERING a finished plan,
+    // not asking a question, and "Questions" is the wrong word on a pill for it.
     expect(hookEventToStatus({ event: "PreToolUse", tool: "ExitPlanMode" })).toBe("approval");
+    // The two blocking tools must NOT collapse to one state — that separation is the feature.
+    expect(hookEventToStatus({ event: "PreToolUse", tool: "AskUserQuestion" })).not.toBe(
+      hookEventToStatus({ event: "PreToolUse", tool: "ExitPlanMode" }),
+    );
     expect(hookEventToStatus({ event: "PreToolUse", tool: "Bash" })).toBe("working");
     expect(hookEventToStatus({ event: "PreToolUse", tool: "Read" })).toBe("working");
     expect(hookEventToStatus({ event: "PreToolUse" })).toBe("working");
@@ -149,17 +161,20 @@ describe("HookStatusEngine", () => {
     expect(onStatus).toHaveBeenLastCalledWith("idle");
   });
 
-  it("a mid-turn blocking-tool picker goes red, then self-clears on its PostToolUse (sparkle-t2up)", () => {
+  it("a mid-turn question picker goes BLUE, then self-clears on its PostToolUse (sparkle-t2up)", () => {
     // The founder's mid-turn-picker bug, at the engine level: Claude renders an AskUserQuestion
-    // picker mid-turn (PreToolUse, no Stop) — the row must go red — and returns to green the instant
-    // the user answers (PostToolUse). No screen signal is involved, so the status router's hook
-    // authority is untouched.
+    // picker mid-turn (PreToolUse, no Stop) — the row must surface — and returns to green the
+    // instant the user answers (PostToolUse). No screen signal is involved, so the status router's
+    // hook authority is untouched.
+    //
+    // The SELF-CLEAR is what makes the blue state safe to raise automatically: the app never has to
+    // decide when a question stopped being outstanding, because Claude's own PostToolUse says so.
     const onStatus = vi.fn();
     const engine = new HookStatusEngine({ agentId: "a1", onStatus });
     engine.ingest({ event: "UserPromptSubmit" }); // turn opens → working
     engine.ingest({ event: "PreToolUse", tool: "Bash" }); // real work → still working (deduped)
-    engine.ingest({ event: "PreToolUse", tool: "AskUserQuestion" }); // picker → red
-    expect(onStatus).toHaveBeenLastCalledWith("waiting");
+    engine.ingest({ event: "PreToolUse", tool: "AskUserQuestion" }); // picker → BLUE
+    expect(onStatus).toHaveBeenLastCalledWith("questions");
     engine.ingest({ event: "PostToolUse", tool: "AskUserQuestion" }); // answered → back to working
     expect(onStatus).toHaveBeenLastCalledWith("working");
   });

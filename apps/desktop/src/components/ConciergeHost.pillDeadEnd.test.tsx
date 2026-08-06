@@ -64,7 +64,7 @@ function feedAgent(id: string, name: string) {
   };
 }
 
-const COUNTS = { needs_you: 0, running: 0, done: 1 };
+const COUNTS = { needs_you: 0, questions: 0, running: 0, done: 1 };
 const FEED = {
   projects: [
     {
@@ -263,7 +263,7 @@ describe("(e) the host tells the reader when the reveal had nothing to do", () =
    *  this fix on precisely the surfaces that name freshly-spawned agents (roborev 58643). */
   function nudgeFeed() {
     const feed = JSON.parse(JSON.stringify(FEED_P2));
-    const counts = { needs_you: 1, running: 0, done: 0 };
+    const counts = { needs_you: 1, questions: 0, running: 0, done: 0 };
     feed.projects[1].agents[0].band = "needs_you";
     feed.projects[1].agents[0].status = "waiting";
     feed.counts = counts;
@@ -296,7 +296,7 @@ describe("(e) the host tells the reader when the reveal had nothing to do", () =
    *  nudge for it is suppressed, so a same-band pair renders no card to click at all. */
   function nestedNudgeFeed(headBand = "done", workerBand = "needs_you") {
     const feed = JSON.parse(JSON.stringify(FEED_P2));
-    const counts = { needs_you: 1, running: 0, done: 0 };
+    const counts = { needs_you: 1, questions: 0, running: 0, done: 0 };
     const head = {
       ...feed.projects[1].agents[0],
       id: "head2",
@@ -326,7 +326,7 @@ describe("(e) the host tells the reader when the reveal had nothing to do", () =
     // "nothing moved" sentence beside it would contradict the screen.
     useUiStore.setState({
       collapsedOrchestrators: { head2: true },
-      statusFilter: { needs_you: true, running: true, done: true },
+      statusFilter: { needs_you: true, questions: true, running: true, done: true },
     } as never);
     render(<ConciergeHost feed={nestedNudgeFeed()} />);
 
@@ -343,7 +343,7 @@ describe("(e) the host tells the reader when the reveal had nothing to do", () =
     // Head expanded AND this agent's own band shown — nothing was hidden, so nothing moved.
     useUiStore.setState({
       collapsedOrchestrators: { head2: false },
-      statusFilter: { needs_you: true, running: true, done: true },
+      statusFilter: { needs_you: true, questions: true, running: true, done: true },
     } as never);
     render(<ConciergeHost feed={nestedNudgeFeed()} />);
 
@@ -364,7 +364,7 @@ describe("(e) the host tells the reader when the reveal had nothing to do", () =
       collapsedOrchestrators: { head2: false },
       // `done` — the HEAD's band, which is what gates the row — stays on. `running` is the band
       // belonging to nobody here, and switching it off must change nothing.
-      statusFilter: { needs_you: true, running: false, done: true },
+      statusFilter: { needs_you: true, questions: true, running: false, done: true },
     } as never);
     render(<ConciergeHost feed={nestedNudgeFeed()} />);
 
@@ -388,7 +388,7 @@ describe("(e) the host tells the reader when the reveal had nothing to do", () =
       // on screen with it. The WORKER's own band (`needs_you`) is OFF — which is irrelevant, because
       // workers are never band-filtered. Reading the worker's band here calls this "a row appeared"
       // and swallows the sentence; reading the head's band gets it right.
-      statusFilter: { needs_you: false, running: true, done: true },
+      statusFilter: { needs_you: false, questions: true, running: true, done: true },
     } as never);
     render(<ConciergeHost feed={nestedNudgeFeed()} />);
 
@@ -408,7 +408,7 @@ describe("(e) the host tells the reader when the reveal had nothing to do", () =
     setConciergeChat(() => []);
     useUiStore.setState({
       collapsedOrchestrators: { head2: false },
-      statusFilter: { needs_you: false, running: true, done: false },
+      statusFilter: { needs_you: false, questions: true, running: true, done: false },
     } as never);
     render(<ConciergeHost feed={nestedNudgeFeed("needs_you", "running")} />);
 
@@ -429,7 +429,7 @@ describe("(e) the host tells the reader when the reveal had nothing to do", () =
     useUiStore.setState({
       collapsedOrchestrators: {},
       // `nudgeFeed()`'s agent is `needs_you`, and it is TOP-LEVEL — so this is its own row's band.
-      statusFilter: { needs_you: false, running: true, done: true },
+      statusFilter: { needs_you: false, questions: true, running: true, done: true },
     } as never);
     render(<ConciergeHost feed={nudgeFeed()} />);
 

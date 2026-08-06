@@ -59,7 +59,7 @@ import type { ConciergeFeed } from "../useConciergeFeed";
 import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
 
 function feed(): ConciergeFeed {
-  const counts = { needs_you: 0, running: 1, done: 0 };
+  const counts = { needs_you: 0, questions: 0, running: 1, done: 0 };
   const agent = {
     id: "ag1",
     name: "Composer Polish Esc Thumbs",
@@ -223,7 +223,7 @@ describe("the host reveals what a CARD's pill names, and says so when it cannot"
     a.band = "needs_you";
     a.status = "approval";
     a.statusLabel = "Approve?";
-    f.counts = { needs_you: 1, running: 0, done: 0 };
+    f.counts = { needs_you: 1, questions: 0, running: 0, done: 0 };
     f.scopedCounts = f.counts;
     return f as unknown as ConciergeFeed;
   }

@@ -43,7 +43,7 @@ import type { ConciergeController, ConciergeViewModel } from "./types";
 /** The mock's column, in view-model form: three projects with someone waiting in each. */
 const model: ConciergeViewModel = {
   scope: {},
-  vitals: { needs_you: 3, running: 0, done: 0 },
+  vitals: { needs_you: 3, questions: 0, running: 0, done: 0 },
   needsYouByProject: [
     { projectId: "p1", projectName: "web", needsYou: 1, isActive: true },
     { projectId: "p2", projectName: "api", needsYou: 1, isActive: false },

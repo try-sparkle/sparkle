@@ -300,6 +300,7 @@ describe("focus-tier routing (helper island chiclets)", () => {
     // bespoke dismiss control (which is what the retired attentionTierFocus needed).
     expect(useUiStore.getState().statusFilter).toEqual({
       needs_you: true,
+      questions: false,
       running: false,
       done: false,
     });
@@ -321,6 +322,7 @@ describe("focus-tier routing (helper island chiclets)", () => {
     await waitFor(() =>
       expect(useUiStore.getState().statusFilter).toEqual({
         needs_you: false,
+        questions: false,
         running: true,
         done: false,
       }),

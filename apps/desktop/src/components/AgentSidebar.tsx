@@ -1967,7 +1967,7 @@ export function AgentSidebar({
   // make a project with no agents report "All agents are hidden by the status filter" — a way back
   // from a filter nobody applied.
   const agentBandCounts = useMemo(() => {
-    const counts: Record<StatusBand, number> = { needs_you: 0, running: 0, done: 0 };
+    const counts: Record<StatusBand, number> = { needs_you: 0, questions: 0, running: 0, done: 0 };
     if (!project) return counts;
     for (const a of topLevelOf(project.agents, mode)) {
       // Same rollup the row's disc and the ladder's filter use. A chip counting raw statuses while
@@ -3339,13 +3339,16 @@ function ActiveFillets({ ends, paneSide }: { ends: PairSide[]; paneSide: PairSid
   );
 }
 
-// What a rolled-up disc is painted. The three definite marks reuse the AGENT_STATUS tier colors
+// What a rolled-up disc is painted. The four definite marks reuse the AGENT_STATUS tier colors
 // straight (NOT statusInk — that resolves a color to a legible TEXT ink, and this is a filled
 // shape), so a rolled-up green is pixel-identical to a working agent's own dot rather than a near
 // miss. `mixed` is the one color with no status behind it; see theme/colors mixedInk.
 const ROLLUP_DOT_COLOR: Record<RollupDot, string> = {
   green: AGENT_STATUS.working.color,
   red: AGENT_STATUS.waiting.color,
+  // Raw brand azure, for the same reason the other three are raw: this is a FILL. The themed
+  // `questionsInk` twin is for the word "Questions" as text, not for the disc.
+  blue: AGENT_STATUS.questions.color,
   gray: AGENT_STATUS.idle.color,
   orange: C.mixedInk,
 };

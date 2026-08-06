@@ -51,8 +51,8 @@ function mkProject(id: string, name: string, agents: AgentTab[] = []): Project {
 
 const feed: ConciergeFeed = {
   projects: [],
-  counts: { needs_you: 0, running: 0, done: 0 },
-  scopedCounts: { needs_you: 0, running: 0, done: 0 },
+  counts: { needs_you: 0, questions: 0, running: 0, done: 0 },
+  scopedCounts: { needs_you: 0, questions: 0, running: 0, done: 0 },
   pinnedProjectId: null,
 };
 

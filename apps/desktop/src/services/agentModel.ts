@@ -47,7 +47,12 @@ function canInject(agentId: string): boolean {
   const s = useRuntimeStore.getState();
   if (!s.isOpen(agentId)) return false;
   const st = s.status[agentId];
-  return st !== "waiting" && st !== "approval";
+  // `questions` belongs in this MODAL list for the same reason `waiting` does, and it is the more
+  // dangerous of the two: it is raised by AskUserQuestion's PreToolUse hook, so it means a question
+  // PICKER is literally on screen. Injecting `/model …` there types into the picker and the
+  // MODEL_SUBMIT_DELAY_MS Enter that follows SELECTS an option the founder never read — silently
+  // answering his own interview on his behalf, which is the exact opposite of the point.
+  return st !== "waiting" && st !== "approval" && st !== "questions";
 }
 
 async function deliver(agentId: string, modelId: string): Promise<void> {

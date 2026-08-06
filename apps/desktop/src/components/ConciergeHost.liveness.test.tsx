@@ -118,7 +118,7 @@ import { waitingLine } from "../services/conciergeMessageStatuses";
 import type { ConciergeFeed } from "../useConciergeFeed";
 import type { StatusBand } from "../engine/buildSections";
 
-const COUNTS: Record<StatusBand, number> = { needs_you: 0, running: 1, done: 0 };
+const COUNTS: Record<StatusBand, number> = { needs_you: 0, questions: 0, running: 1, done: 0 };
 
 /** A one-agent feed — enough for the column to render its thread. */
 function feed(): ConciergeFeed {

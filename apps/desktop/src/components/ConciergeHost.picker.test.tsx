@@ -152,7 +152,7 @@ const shot: Attachment = {
 };
 
 const target = { projectId: "p1", agentId: "ag1", name: "CI Hardening" };
-const COUNTS = { needs_you: 1, running: 0, done: 0 };
+const COUNTS = { needs_you: 1, questions: 0, running: 0, done: 0 };
 const FEED = {
   projects: [
     {

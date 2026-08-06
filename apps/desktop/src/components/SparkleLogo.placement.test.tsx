@@ -91,7 +91,7 @@ function seed(): Project {
 
 const model: ConciergeViewModel = {
   scope: {},
-  vitals: { needs_you: 0, running: 0, done: 0 },
+  vitals: { needs_you: 0, questions: 0, running: 0, done: 0 },
   messages: [],
 };
 

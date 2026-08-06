@@ -105,8 +105,8 @@ beforeEach(enableAiEnhancementsForTests);
 
 const calmFeed = {
   projects: [],
-  counts: { needs_you: 0, running: 0, done: 0 },
-  scopedCounts: { needs_you: 0, running: 0, done: 0 },
+  counts: { needs_you: 0, questions: 0, running: 0, done: 0 },
+  scopedCounts: { needs_you: 0, questions: 0, running: 0, done: 0 },
   pinnedProjectId: null,
 };
 
@@ -145,8 +145,8 @@ const feedWithAgent = {
       id: "p1",
       name: "sparkle",
       inScope: true,
-      counts: { needs_you: 0, running: 0, done: 0 },
-      scopedCounts: { needs_you: 0, running: 0, done: 0 },
+      counts: { needs_you: 0, questions: 0, running: 0, done: 0 },
+      scopedCounts: { needs_you: 0, questions: 0, running: 0, done: 0 },
       agents: [
         {
           id: "ag1",
@@ -167,8 +167,8 @@ const feedWithAgent = {
       ],
     },
   ],
-  counts: { needs_you: 0, running: 0, done: 0 },
-  scopedCounts: { needs_you: 0, running: 0, done: 0 },
+  counts: { needs_you: 0, questions: 0, running: 0, done: 0 },
+  scopedCounts: { needs_you: 0, questions: 0, running: 0, done: 0 },
   pinnedProjectId: null,
 };
 const AIM = { projectId: "p1", agentId: "ag1", name: "CI Hardening" };

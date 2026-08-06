@@ -134,7 +134,7 @@ function feed(): ConciergeFeed {
     // Nothing above it in the tree, so no ancestor row can be speaking for it.
     representedElsewhere: false,
   };
-  const counts = { needs_you: 1, running: 0, done: 0 };
+  const counts = { needs_you: 1, questions: 0, running: 0, done: 0 };
   return {
     projects: [
       { id: "p1", name: "sparkle", inScope: true, counts, scopedCounts: counts, agents: [agent] },

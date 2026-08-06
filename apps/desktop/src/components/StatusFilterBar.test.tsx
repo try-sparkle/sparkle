@@ -15,7 +15,7 @@ import { asRgb } from "./statusDotTestUtils";
 
 afterEach(cleanup);
 
-const counts: Record<StatusBand, number> = { needs_you: 3, running: 2, done: 5 };
+const counts: Record<StatusBand, number> = { needs_you: 3, questions: 0, running: 2, done: 5 };
 
 function renderBar(over: Partial<Parameters<typeof StatusFilterBar>[0]> = {}) {
   const props = { counts, visible: allBandsVisible(), onToggle: vi.fn(), onReset: vi.fn(), ...over };
@@ -59,7 +59,7 @@ describe("StatusFilterBar — what the chip shows", () => {
   });
 
   it("keeps an OFF chip's count visible — nothing is silently lost behind a filter", () => {
-    renderBar({ visible: { needs_you: false, running: true, done: true } });
+    renderBar({ visible: { needs_you: false, questions: true, running: true, done: true } });
     const chip = screen.getByTestId("status-chip-needs_you");
     expect(chip.getAttribute("data-on")).toBe("false");
     expect(chip.getAttribute("aria-pressed")).toBe("false");
@@ -88,7 +88,7 @@ describe("StatusFilterBar — what the chip shows", () => {
     rerender(
       <StatusFilterBar
         counts={counts}
-        visible={{ needs_you: false, running: true, done: true }}
+        visible={{ needs_you: false, questions: true, running: true, done: true }}
         onToggle={vi.fn()}
         onReset={vi.fn()}
       />,
@@ -101,7 +101,7 @@ describe("StatusFilterBar — what the chip shows", () => {
     // multiplies against whatever ink the badge resolved, so the OFF count was landing at 2.24:1 on
     // light's sidebar rather than the token's own 3.86:1. The empty string, not "1": that is the
     // only value that proves the property was never set rather than set back to a safe-looking one.
-    renderBar({ visible: { needs_you: false, running: true, done: true } });
+    renderBar({ visible: { needs_you: false, questions: true, running: true, done: true } });
     expect(screen.getByTestId("status-chip-needs_you").style.opacity).toBe("");
     expect(screen.getByTestId("status-chip-running").style.opacity).toBe("");
   });
@@ -121,7 +121,7 @@ describe("StatusFilterBar — Reset", () => {
   it("appears as soon as ANY band is hidden, and calls the shared clear action", () => {
     // Not a second filter state: the integration passes uiStore.showAllStatusBands, the same action
     // the concierge scope line and the helper island's chiclets write.
-    const props = renderBar({ visible: { needs_you: true, running: false, done: true } });
+    const props = renderBar({ visible: { needs_you: true, questions: true, running: false, done: true } });
     // Pin the POSITIVE state too. Since the slot is permanent, presence in the DOM no longer
     // distinguishes offered from not-offered, and `fireEvent.click` succeeds on a hidden button —
     // so without these, hard-coding `visibility: "hidden"` would leave the suite green while the
@@ -140,7 +140,7 @@ describe("StatusFilterBar — Reset", () => {
     const { rerender } = render(
       <StatusFilterBar
         counts={counts}
-        visible={{ needs_you: true, running: false, done: true }}
+        visible={{ needs_you: true, questions: true, running: false, done: true }}
         onToggle={vi.fn()}
         onReset={vi.fn()}
       />,
@@ -164,7 +164,7 @@ describe("StatusFilterBar — Reset", () => {
     // are content-sized and Reset is `nowrap`, so nothing in the row can shrink; at MIN_WIDTH 160
     // the list's `overflowY: auto` makes overflow-x `auto` too and `marginLeft: auto` collapses,
     // which would push Reset — the one way back out of the filter — off the visible edge.
-    renderBar({ visible: { needs_you: true, running: false, done: true } });
+    renderBar({ visible: { needs_you: true, questions: true, running: false, done: true } });
     expect(screen.getByTestId("status-filter-bar").style.flexWrap).toBe("wrap");
     expect(screen.getByTestId("status-chip-running").style.flex).toBe("0 0 auto");
   });
@@ -172,7 +172,7 @@ describe("StatusFilterBar — Reset", () => {
 
 describe("StatusFilterBar — toggling", () => {
   it("multi-select: each chip toggles only its own band", () => {
-    const props = renderBar({ visible: { needs_you: true, running: false, done: true } });
+    const props = renderBar({ visible: { needs_you: true, questions: true, running: false, done: true } });
     fireEvent.click(screen.getByTestId("status-chip-done"));
     expect(props.onToggle).toHaveBeenCalledWith("done");
     expect(props.onToggle).toHaveBeenCalledTimes(1);
@@ -207,7 +207,7 @@ describe("StatusFilterBar — Reset focus re-homing", () => {
     const { rerender } = render(
       <StatusFilterBar
         counts={counts}
-        visible={{ needs_you: true, running: false, done: true }}
+        visible={{ needs_you: true, questions: true, running: false, done: true }}
         onToggle={vi.fn()}
         onReset={vi.fn()}
       />,
@@ -232,7 +232,7 @@ describe("StatusFilterBar — Reset focus re-homing", () => {
     const { rerender } = render(
       <StatusFilterBar
         counts={counts}
-        visible={{ needs_you: true, running: false, done: true }}
+        visible={{ needs_you: true, questions: true, running: false, done: true }}
         onToggle={vi.fn()}
         onReset={vi.fn()}
       />,
@@ -259,7 +259,7 @@ describe("StatusFilterBar — Reset focus re-homing", () => {
     const { rerender } = render(
       <StatusFilterBar
         counts={counts}
-        visible={{ needs_you: true, running: false, done: true }}
+        visible={{ needs_you: true, questions: true, running: false, done: true }}
         onToggle={vi.fn()}
         onReset={vi.fn()}
       />,
@@ -288,7 +288,7 @@ describe("StatusFilterBar — Reset focus re-homing", () => {
     const { rerender } = render(
       <StatusFilterBar
         counts={counts}
-        visible={{ needs_you: true, running: false, done: true }}
+        visible={{ needs_you: true, questions: true, running: false, done: true }}
         onToggle={vi.fn()}
         onReset={vi.fn()}
       />,
@@ -315,7 +315,7 @@ describe("StatusFilterBar — Reset focus re-homing", () => {
     const { rerender } = render(
       <StatusFilterBar
         counts={counts}
-        visible={{ needs_you: true, running: false, done: true }}
+        visible={{ needs_you: true, questions: true, running: false, done: true }}
         onToggle={vi.fn()}
         onReset={vi.fn()}
       />,
@@ -341,7 +341,7 @@ describe("StatusFilterBar — Reset focus re-homing", () => {
     const { rerender } = render(
       <StatusFilterBar
         counts={counts}
-        visible={{ needs_you: true, running: false, done: true }}
+        visible={{ needs_you: true, questions: true, running: false, done: true }}
         onToggle={vi.fn()}
         onReset={vi.fn()}
       />,
@@ -366,7 +366,7 @@ describe("StatusFilterBar — Reset focus re-homing", () => {
     const { rerender } = render(
       <StatusFilterBar
         counts={counts}
-        visible={{ needs_you: true, running: false, done: true }}
+        visible={{ needs_you: true, questions: true, running: false, done: true }}
         onToggle={vi.fn()}
         onReset={vi.fn()}
       />,
@@ -394,7 +394,7 @@ describe("StatusFilterBar — Reset focus re-homing", () => {
     const { rerender } = render(
       <StatusFilterBar
         counts={counts}
-        visible={{ needs_you: true, running: false, done: true }}
+        visible={{ needs_you: true, questions: true, running: false, done: true }}
         onToggle={vi.fn()}
         onReset={vi.fn()}
       />,
@@ -419,7 +419,7 @@ describe("StatusFilterBar — Reset focus re-homing", () => {
     const { rerender } = render(
       <StatusFilterBar
         counts={counts}
-        visible={{ needs_you: true, running: false, done: true }}
+        visible={{ needs_you: true, questions: true, running: false, done: true }}
         onToggle={vi.fn()}
         onReset={vi.fn()}
       />,
@@ -452,7 +452,7 @@ describe("StatusFilterBar — Reset focus re-homing", () => {
     const { rerender } = render(
       <StatusFilterBar
         counts={counts}
-        visible={{ needs_you: true, running: false, done: true }}
+        visible={{ needs_you: true, questions: true, running: false, done: true }}
         onToggle={vi.fn()}
         onReset={vi.fn()}
       />,
@@ -482,7 +482,7 @@ describe("StatusFilterBar — Reset focus re-homing", () => {
     const { rerender } = render(
       <StatusFilterBar
         counts={counts}
-        visible={{ needs_you: true, running: false, done: true }}
+        visible={{ needs_you: true, questions: true, running: false, done: true }}
         onToggle={vi.fn()}
         onReset={vi.fn()}
       />,
@@ -511,7 +511,7 @@ describe("StatusFilterBar — Reset focus re-homing", () => {
     const { rerender } = render(
       <StatusFilterBar
         counts={counts}
-        visible={{ needs_you: true, running: false, done: true }}
+        visible={{ needs_you: true, questions: true, running: false, done: true }}
         onToggle={vi.fn()}
         onReset={vi.fn()}
       />,
@@ -541,7 +541,7 @@ describe("StatusFilterBar — Reset focus re-homing", () => {
     const { rerender } = render(
       <StatusFilterBar
         counts={counts}
-        visible={{ needs_you: true, running: false, done: true }}
+        visible={{ needs_you: true, questions: true, running: false, done: true }}
         onToggle={vi.fn()}
         onReset={vi.fn()}
       />,

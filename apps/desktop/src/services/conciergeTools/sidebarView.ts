@@ -167,7 +167,7 @@ export type SidebarViewRefusalReason =
   | "unknown-agent" // no agent by that id exists at all
   | "no-row" // the agent EXISTS, but the column renders no row for it (e.g. an orphan worker)
   | "not-an-orchestrator" // the id names a row, but not one with a subtree to open
-  | "unknown-band" // a band name outside needs_you | running | done
+  | "unknown-band" // a band name outside needs_you | questions | running | done
   | "incomplete-bands" // every key was a real band, but the record did not name all of them
   | "unknown-mode" // a work mode outside plan | build
   | "no-ids" // an empty id list — almost always a caller bug, never a silent no-op
@@ -460,7 +460,7 @@ export function readSidebarView(): SidebarViewResult<SidebarViewState> {
       ...base,
       projectId: null,
       projectName: null,
-      bandCounts: { needs_you: 0, running: 0, done: 0 },
+      bandCounts: { needs_you: 0, questions: 0, running: 0, done: 0 },
       hiddenByFilter: false,
       selectedAgentId: null,
       totalRows: 0,
@@ -469,7 +469,12 @@ export function readSidebarView(): SidebarViewResult<SidebarViewState> {
   }
 
   const view = columnView(project);
-  const bandCounts: Record<StatusBand, number> = { needs_you: 0, running: 0, done: 0 };
+  const bandCounts: Record<StatusBand, number> = {
+    needs_you: 0,
+    questions: 0,
+    running: 0,
+    done: 0,
+  };
   for (const a of view.topLevel) bandCounts[view.bandOf(a.id)] += 1;
   const rows = buildRows(view);
   return ok("read_sidebar_view", {
@@ -631,7 +636,10 @@ export function setStatusBands(bands: Partial<Record<string, boolean>>): Sidebar
     return refuse(
       "set_status_bands",
       "incomplete-bands",
-      `A band filter must name all three bands; ${missing.join(", ")} ${missing.length === 1 ? "is" : "are"} missing.`,
+      // COUNT COMES FROM BAND_IDS, never a literal. This said "all three bands" and went stale the
+      // day `questions` was added — the caller was then told to supply three keys by a validator
+      // that would refuse anything but four.
+      `A band filter must name all ${BAND_IDS.length} bands; ${missing.join(", ")} ${missing.length === 1 ? "is" : "are"} missing.`,
     );
   }
   const target = Object.fromEntries(BAND_IDS.map((b) => [b, bands[b] === true])) as BandVisibility;

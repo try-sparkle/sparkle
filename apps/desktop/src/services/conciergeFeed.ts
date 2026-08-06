@@ -186,7 +186,7 @@ export type ConciergeCounts = Record<StatusBand, number>;
 
 /** All-zero counts — the shape every accumulator starts from. */
 export function emptyCounts(): ConciergeCounts {
-  return { needs_you: 0, running: 0, done: 0 };
+  return { needs_you: 0, questions: 0, running: 0, done: 0 };
 }
 
 export interface ConciergeProject {
@@ -318,9 +318,16 @@ export function conciergeBand(status: AgentTabStatus | undefined): StatusBand {
  *  Note `working` is in here even though it is its own band now: a running agent is not asking you
  *  for anything, and the terminal you are watching desaturating the moment it starts working would
  *  be a treatment nobody wants. The band split running from done for POSITION and COUNTS; it did not
- *  change what dims. */
+ *  change what dims.
+ *
+ *  `questions` IS EXCLUDED TOO, for the plainest possible reason: an agent that has stopped to ask
+ *  the founder something is not calm. Desaturating its terminal would be the mirror of the trap
+ *  above — the row the founder most needs to read is the one this would make hardest to read. Note
+ *  it must be named explicitly, because the predicate is written as "not needs_you" and `questions`
+ *  is its own band; the negative form is exactly what let a fourth band silently fall into "calm". */
 export function isCalmBand(status: AgentTabStatus | undefined): boolean {
-  return conciergeBand(status) !== "needs_you" && status !== "unmerged";
+  const band = conciergeBand(status);
+  return band !== "needs_you" && band !== "questions" && status !== "unmerged";
 }
 
 /** The do-not-interrupt topics a feed item is keyed under, for sparklePrefsStore.shouldInterrupt:

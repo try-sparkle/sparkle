@@ -70,7 +70,7 @@ const BRIEF = [
 ].join("\n");
 
 function feed(): ConciergeFeed {
-  const counts = { needs_you: 1, running: 0, done: 0 };
+  const counts = { needs_you: 1, questions: 0, running: 0, done: 0 };
   const agent = {
     id: "ag1",
     name: "CI Hardening",

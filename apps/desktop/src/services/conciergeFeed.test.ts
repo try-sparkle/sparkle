@@ -282,13 +282,13 @@ describe("buildConciergeFeed — counts", () => {
   it("aggregates every band across all projects and per project", () => {
     const feed = buildConciergeFeed({ projects: twoProjects, status });
     // a-wait + a-block + b-appr are all needs_you now (blocked stopped being its own tier).
-    expect(feed.counts).toEqual({ needs_you: 3, running: 1, done: 1 });
+    expect(feed.counts).toEqual({ needs_you: 3, questions: 0, running: 1, done: 1 });
     expect(feed.projects.map((p) => p.counts)).toEqual([
-      { needs_you: 2, running: 0, done: 1 },
-      { needs_you: 1, running: 1, done: 0 },
+      { needs_you: 2, questions: 0, running: 0, done: 1 },
+      { needs_you: 1, questions: 0, running: 1, done: 0 },
     ]);
     // Unpinned + unmuted: the scoped view equals the full truth.
-    expect(feed.scopedCounts).toEqual({ needs_you: 3, running: 1, done: 1 });
+    expect(feed.scopedCounts).toEqual({ needs_you: 3, questions: 0, running: 1, done: 1 });
     expect(feed.pinnedProjectId).toBeNull();
   });
 
@@ -298,8 +298,8 @@ describe("buildConciergeFeed — counts", () => {
   it("per-project scopedCounts sum to the feed's scopedCounts, band by band", () => {
     const feed = buildConciergeFeed({ projects: twoProjects, status });
     expect(feed.projects.map((p) => p.scopedCounts)).toEqual([
-      { needs_you: 2, running: 0, done: 1 },
-      { needs_you: 1, running: 1, done: 0 },
+      { needs_you: 2, questions: 0, running: 0, done: 1 },
+      { needs_you: 1, questions: 0, running: 1, done: 0 },
     ]);
     for (const band of ["needs_you", "running", "done"] as const) {
       expect(feed.projects.reduce((n, p) => n + p.scopedCounts[band], 0)).toBe(
@@ -311,7 +311,7 @@ describe("buildConciergeFeed — counts", () => {
   it("a pinned-away project's scoped share is ZERO while its raw counts stand", () => {
     const feed = buildConciergeFeed({ projects: twoProjects, status, pinnedProjectId: "pB" });
     const pA = feed.projects.find((p) => p.id === "pA")!;
-    expect(pA.counts).toEqual({ needs_you: 2, running: 0, done: 1 }); // the tab badge's truth
+    expect(pA.counts).toEqual({ needs_you: 2, questions: 0, running: 0, done: 1 }); // the tab badge's truth
     expect(pA.scopedCounts).toEqual(emptyCounts()); // …but the header says nothing about it
     expect(feed.projects.find((p) => p.id === "pB")!.scopedCounts).toEqual(feed.scopedCounts);
   });
@@ -334,7 +334,7 @@ describe("buildConciergeFeed — counts", () => {
   });
 
   it("emptyCounts is the all-zero shape every accumulator starts from", () => {
-    expect(emptyCounts()).toEqual({ needs_you: 0, running: 0, done: 0 });
+    expect(emptyCounts()).toEqual({ needs_you: 0, questions: 0, running: 0, done: 0 });
     const feed = buildConciergeFeed({ projects: [project("pEmpty", [])], status: {} });
     expect(feed.counts).toEqual(emptyCounts());
   });
@@ -342,8 +342,8 @@ describe("buildConciergeFeed — counts", () => {
   it("pin scope: scoped counts collapse to the pinned project while the full feed lists all", () => {
     const feed = buildConciergeFeed({ projects: twoProjects, status, pinnedProjectId: "pB" });
     // Only pB's two agents. The pin scopes EVERY band, not just the interrupting one.
-    expect(feed.scopedCounts).toEqual({ needs_you: 1, running: 1, done: 0 });
-    expect(feed.counts).toEqual({ needs_you: 3, running: 1, done: 1 }); // full truth unchanged
+    expect(feed.scopedCounts).toEqual({ needs_you: 1, questions: 0, running: 1, done: 0 });
+    expect(feed.counts).toEqual({ needs_you: 3, questions: 0, running: 1, done: 1 }); // full truth unchanged
     expect(feed.projects.map((p) => p.id)).toEqual(["pA", "pB"]); // nothing hidden
     expect(feed.projects.map((p) => p.inScope)).toEqual([false, true]);
     const byId = Object.fromEntries(flat(feed).map((a) => [a.id, a]));
@@ -365,9 +365,9 @@ describe("buildConciergeFeed — mute (sparklePrefsStore.shouldInterrupt)", () =
     expect(byId["hushed"]).toMatchObject({ muted: true, band: "needs_you" });
     expect(byId["loud"]).toMatchObject({ muted: false });
     // hushed doesn't surface
-    expect(feed.scopedCounts).toEqual({ needs_you: 1, running: 0, done: 0 });
+    expect(feed.scopedCounts).toEqual({ needs_you: 1, questions: 0, running: 0, done: 0 });
     // full truth keeps it
-    expect(feed.counts).toEqual({ needs_you: 2, running: 0, done: 0 });
+    expect(feed.counts).toEqual({ needs_you: 2, questions: 0, running: 0, done: 0 });
   });
 
   it("a muted event-kind slug (status:approval) mutes every agent in that state", () => {
@@ -379,7 +379,7 @@ describe("buildConciergeFeed — mute (sparklePrefsStore.shouldInterrupt)", () =
     const byId = Object.fromEntries(flat(feed).map((a) => [a.id, a]));
     expect(byId["appr"]!.muted).toBe(true);
     expect(byId["ask"]!.muted).toBe(false);
-    expect(feed.scopedCounts).toEqual({ needs_you: 1, running: 0, done: 0 });
+    expect(feed.scopedCounts).toEqual({ needs_you: 1, questions: 0, running: 0, done: 0 });
   });
 
   it("conciergeTopics keys by agent id and status slug", () => {
@@ -466,7 +466,7 @@ describe("buildConciergeFeed — representedElsewhere", () => {
     // is speaking for w1.
     expect(byId["orch"]!.band).toBe("running");
     expect(byId["w1"]).toMatchObject({ band: "needs_you", representedElsewhere: false });
-    expect(feed.scopedCounts).toEqual({ needs_you: 1, running: 1, done: 0 });
+    expect(feed.scopedCounts).toEqual({ needs_you: 1, questions: 0, running: 1, done: 0 });
   });
 
   it("a parentless worker is never represented", () => {

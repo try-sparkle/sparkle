@@ -532,7 +532,7 @@ describe("Build column — the filter chips agree with the discs", () => {
     useUiStore.setState({
       collapsedOrchestrators: {},
       activeSpecial: null,
-      statusFilter: { needs_you: true, running: false, done: false },
+      statusFilter: { needs_you: true, questions: true, running: false, done: false },
     } as never);
     const project = seed({ a1: "idle", w1: "blocked", w2: "idle", solo: "done" });
     render(<AgentSidebar project={project} />);
@@ -1043,7 +1043,7 @@ describe("Build column — an unmerged head outranks its green rollup, and what 
     useUiStore.setState({
       collapsedOrchestrators: { a1: false },
       activeSpecial: null,
-      statusFilter: { needs_you: true, running: true, done: false },
+      statusFilter: { needs_you: true, questions: true, running: true, done: false },
     } as never);
     const project = seedUnmerged({ a1: "idle", w1: "working", w2: "idle" });
     render(<AgentSidebar project={project} />);

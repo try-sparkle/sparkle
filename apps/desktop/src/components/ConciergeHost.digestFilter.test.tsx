@@ -181,7 +181,12 @@ function sidebarRows(project: Project, status: Record<string, AgentTabStatus>, b
       topLevelAgents(project.agents, "build"),
       () => resolveStage(undefined, undefined),
       (id) => eff[id] ?? "stopped",
-      { needs_you: band === "needs_you", running: band === "running", done: band === "done" },
+      {
+        needs_you: band === "needs_you",
+        questions: band === "questions",
+        running: band === "running",
+        done: band === "done",
+      },
     ),
   );
 }
@@ -232,6 +237,7 @@ describe("clicking a digest line filters the Build column", () => {
     // promise at all.
     expect(useUiStore.getState().statusFilter).toEqual({
       needs_you: true,
+      questions: false,
       running: false,
       done: false,
     });
@@ -245,7 +251,7 @@ describe("clicking a digest line filters the Build column", () => {
     // `isolateStatusBand` narrows whichever project is SELECTED. Captured at the moment the project
     // was opened, the filter must still be WIDE — if it had already been isolated, the narrowing
     // landed on the previously-selected project's list, which reads as "my agents just vanished".
-    expect(h.filterWhenOpened).toEqual({ needs_you: true, running: true, done: true });
+    expect(h.filterWhenOpened).toEqual({ needs_you: true, questions: true, running: true, done: true });
   });
 
   it("leaves the filter in a state the chips can show and Show-all can clear", () => {
@@ -256,6 +262,7 @@ describe("clicking a digest line filters the Build column", () => {
     useUiStore.getState().showAllStatusBands();
     expect(useUiStore.getState().statusFilter).toEqual({
       needs_you: true,
+      questions: true,
       running: true,
       done: true,
     });
@@ -293,6 +300,7 @@ describe("clicking a digest line filters the Build column", () => {
     // this whole invariant is about.
     expect(useUiStore.getState().statusFilter).toEqual({
       needs_you: true,
+      questions: true,
       running: true,
       done: true,
     });
@@ -421,6 +429,7 @@ describe("the stated count equals the rows the click leaves standing", () => {
     expect(h.openProjectTab).toHaveBeenCalledWith("p2", expect.stringMatching(/^(a|b)$/));
     expect(useUiStore.getState().statusFilter).toEqual({
       needs_you: true,
+      questions: false,
       running: false,
       done: false,
     });
@@ -529,6 +538,7 @@ describe("rowless agents digest like everything else", () => {
     // revealed worker pops out UNDER `orch`, so the filter would remove the thing it just opened.
     expect(useUiStore.getState().statusFilter).toEqual({
       needs_you: true,
+      questions: true,
       running: true,
       done: true,
     });
@@ -571,6 +581,7 @@ describe("rowless agents digest like everything else", () => {
     expect(h.openProjectTab).toHaveBeenCalledWith("p2", expect.stringMatching(/^(a|b)$/));
     expect(useUiStore.getState().statusFilter).toEqual({
       needs_you: true,
+      questions: false,
       running: false,
       done: false,
     });
@@ -650,6 +661,7 @@ describe("the header prints no cross-project line, whatever the feed says", () =
     // hide the very rows the user switched over to look at.
     expect(useUiStore.getState().statusFilter).toEqual({
       needs_you: true,
+      questions: true,
       running: true,
       done: true,
     });

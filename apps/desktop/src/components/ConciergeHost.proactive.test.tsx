@@ -71,6 +71,7 @@ import { ConciergeHost } from "./ConciergeHost";
 import { useConciergeThreadStore } from "../stores/conciergeThreadStore";
 import { PROACTIVE_COALESCE_MS } from "../services/conciergeProactive";
 import type { ConciergeFeed } from "../useConciergeFeed";
+import type { StatusBand } from "../engine/buildSections";
 
 
 // The concierge column now replaces its thread with the AI-enhancements lock when the gate is shut
@@ -82,9 +83,12 @@ function openConciergeAiGate() {
 }
 
 /** One project, one agent, in whatever state the case needs. */
-function feedOf(status: string, band: "needs_you" | "running" | "done"): ConciergeFeed {
+// `band` takes the SHARED StatusBand rather than a hand-written union: the union went stale the
+// day `questions` was added, and a re-listed taxonomy is exactly what buildSections warns against.
+function feedOf(status: string, band: StatusBand): ConciergeFeed {
   const counts = {
     needs_you: band === "needs_you" ? 1 : 0,
+    questions: band === "questions" ? 1 : 0,
     running: band === "running" ? 1 : 0,
     done: band === "done" ? 1 : 0,
   };

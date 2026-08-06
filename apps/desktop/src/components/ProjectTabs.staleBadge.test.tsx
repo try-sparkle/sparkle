@@ -18,7 +18,7 @@ import type { StatusBand } from "../engine/buildSections";
 import { ProjectTabs, staleTitle, type ProjectTabStaleness } from "./ProjectTabs";
 
 function counts(over: Partial<Record<StatusBand, number>> = {}): Record<StatusBand, number> {
-  return { needs_you: 0, running: 0, done: 0, ...over };
+  return { needs_you: 0, questions: 0, running: 0, done: 0, ...over };
 }
 
 const projects = [

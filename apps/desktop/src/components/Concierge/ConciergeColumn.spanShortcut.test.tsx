@@ -77,7 +77,7 @@ afterEach(cleanup);
 
 const model: ConciergeViewModel = {
   scope: {},
-  vitals: { needs_you: 2, running: 5, done: 1 },
+  vitals: { needs_you: 2, questions: 0, running: 5, done: 1 },
   messages: [{ id: "m1", kind: "you", text: "Retry the failing one" }],
 };
 

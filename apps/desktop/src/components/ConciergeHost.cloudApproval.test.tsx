@@ -39,7 +39,7 @@ const AGENT_ID = "ag-cloudy";
 
 /** One project, one agent. `approval` is the only status that carries a labelled button. */
 function feed(status = "approval"): ConciergeFeed {
-  const counts = { needs_you: 1, running: 0, done: 0 };
+  const counts = { needs_you: 1, questions: 0, running: 0, done: 0 };
   const agent = {
     id: AGENT_ID,
     name: "Kraken Auth",

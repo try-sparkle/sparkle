@@ -55,9 +55,10 @@ describe("uiStore statusFilter", () => {
     useUiStore.getState().showAllStatusBands();
   });
 
-  it("defaults to showing all three bands", () => {
+  it("defaults to showing all four bands", () => {
     expect(useUiStore.getState().statusFilter).toEqual({
       needs_you: true,
+      questions: true,
       running: true,
       done: true,
     });
@@ -67,6 +68,7 @@ describe("uiStore statusFilter", () => {
     useUiStore.getState().toggleStatusBand("running");
     expect(useUiStore.getState().statusFilter).toEqual({
       needs_you: true,
+      questions: true,
       running: false,
       done: true,
     });
@@ -75,11 +77,15 @@ describe("uiStore statusFilter", () => {
   });
 
   it("allows turning EVERY band off — a filter that refuses its stated state is worse than an empty list", () => {
-    for (const b of ["needs_you", "running", "done"] as const) {
-      useUiStore.getState().toggleStatusBand(b);
+    // Driven off STATUS_BANDS rather than a literal list: the test's claim is "EVERY band", and a
+    // hand-written list silently stops meaning that the moment a band is added (which is exactly
+    // what happened when `questions` landed).
+    for (const b of STATUS_BANDS) {
+      useUiStore.getState().toggleStatusBand(b.id);
     }
     expect(useUiStore.getState().statusFilter).toEqual({
       needs_you: false,
+      questions: false,
       running: false,
       done: false,
     });
@@ -90,6 +96,7 @@ describe("uiStore statusFilter", () => {
     useUiStore.getState().showAllStatusBands();
     expect(useUiStore.getState().statusFilter).toEqual({
       needs_you: true,
+      questions: true,
       running: true,
       done: true,
     });
@@ -109,6 +116,7 @@ describe("uiStore statusFilter", () => {
     await useUiStore.persist.rehydrate();
     expect(useUiStore.getState().statusFilter).toEqual({
       needs_you: true,
+      questions: true,
       running: true,
       done: true,
     });
@@ -128,6 +136,7 @@ describe("uiStore statusFilter", () => {
     // The band the user really did hide is preserved; the missing ones default to VISIBLE.
     expect(useUiStore.getState().statusFilter).toEqual({
       needs_you: false,
+      questions: true,
       running: true,
       done: true,
     });

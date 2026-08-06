@@ -140,22 +140,42 @@ export function pinTitle(isPinned: boolean): string {
 }
 
 /** The band a tab's glow/badge reflects: `needs_you` when anything in the project is asking for you,
- *  otherwise nothing.
+ *  then `questions` when an agent there is waiting on an answer, otherwise nothing.
  *
- *  There is exactly ONE alarm treatment now. The old two-tier version also lit a YELLOW glow for the
- *  "wants you eventually" tier, so a bar of tabs carried two competing alarm colors for a
- *  distinction the user never acted on differently — both meant "go look". `running` and `done`
- *  deliberately do NOT badge: a tab that glows whenever any agent is working glows permanently, and
- *  a signal that is always on is not a signal. */
+ *  TWO BANDS BADGE, NOT ONE — and the second is not a re-run of the two-alarm mistake below. The old
+ *  two-tier version lit a YELLOW glow for a "wants you eventually" tier, so the bar carried two
+ *  competing ALARM colors for a distinction the user never acted on differently — both meant "go
+ *  look". `questions` is different in kind: it is not an alarm at all, and the founder's whole ask
+ *  was that it be distinguishable from one. Omitting it here would have been the actual bug — a
+ *  question asked in a project you are not currently looking at would have had NO surface anywhere
+ *  in the app, which is precisely "an agent stalled where nobody can see it".
+ *
+ *  RED STILL WINS when a project has both. A tab is one glow and one number; work that has STOPPED
+ *  outranks work that is about to be done right. The question is not lost — it is one click away on
+ *  the tab's own chips.
+ *
+ *  `running` and `done` still deliberately do NOT badge: a tab that glows whenever any agent is
+ *  working glows permanently, and a signal that is always on is not a signal. */
 export function tabBand(counts: ProjectTabCounts | undefined): StatusBand | null {
   if (!counts) return null;
-  return counts.needs_you > 0 ? "needs_you" : null;
+  if (counts.needs_you > 0) return "needs_you";
+  if (counts.questions > 0) return "questions";
+  return null;
 }
 
-// The one alarm color, taken from the band itself so the tab, the dots it counts, and the sidebar's
-// filter chips can't drift apart. This is the GLOW/edge value — a shape, not text. The badge's
-// NUMERAL is `C.dangerInk` instead; see `TabCountBadge`.
-const RED = bandColor("needs_you");
+// The GLOW/edge value for whichever band the tab is reporting, taken from the band itself so the
+// tab, the dots it counts, and the sidebar's filter chips can't drift apart. This is a shape, not
+// text — the badge's NUMERAL uses the themed ink instead; see `TabCountBadge`.
+function tabGlowColor(band: StatusBand): string {
+  return bandColor(band);
+}
+
+// The NUMERAL's ink, per band. Both raw brand colors fail AA as text on `barSurface` (the red
+// measures 4.29:1 dark / 3.66:1 light; the azure is worse in light), so each maps to its themed
+// twin. Pinned numerically in ProjectTabs.test.tsx rather than asserted by comment.
+function tabBadgeInk(band: StatusBand): string {
+  return band === "questions" ? C.questionsInk : C.dangerInk;
+}
 
 /**
  * Does this tab show a count badge, and of what?
@@ -198,15 +218,25 @@ export function tabBadgeCount(counts: ProjectTabCounts | undefined, active: bool
  * themed twin that exists for exactly this and clears it in both themes. Pinned numerically in
  * ProjectTabs.test.tsx rather than asserted by comment.
  */
-function TabCountBadge({ projectId, count }: { projectId: string; count: number }) {
+function TabCountBadge({
+  projectId,
+  count,
+  band,
+}: {
+  projectId: string;
+  count: number;
+  band: StatusBand;
+}) {
   return (
     <span
       data-testid={`count-${projectId}`}
       role="img"
-      aria-label={bandCountLabel("needs_you", count)}
+      // The spoken name carries the band's own words, so a screen reader hears "2 Questions" rather
+      // than the "2 Need you" every tab used to announce regardless of why it was lit.
+      aria-label={bandCountLabel(band, count)}
       style={{ display: "inline-flex", alignItems: "center", flex: "none" }}
     >
-      <BandBadge band="needs_you" count={count} silent ink={C.dangerInk} />
+      <BandBadge band={band} count={count} silent ink={tabBadgeInk(band)} />
     </span>
   );
 }
@@ -484,7 +514,11 @@ export function ProjectTabs({
         // The GLOW still lights on the active tab; only the numeric badge is suppressed there. They
         // say different things: the glow is "something in here wants you", which is true of the tab
         // you are on too, while the number is the count the chips below already render.
-        const glow = band ? `0 0 0 1px ${RED}73, 0 -2px 14px ${RED}29` : undefined;
+        // The glow takes the REPORTING band's colour, so a project lit for a question glows blue
+        // and one lit for a stopped agent glows red — the distinction survives all the way out to
+        // the tab strip, which is the only place a background project is visible at all.
+        const glowInk = band ? tabGlowColor(band) : undefined;
+        const glow = glowInk ? `0 0 0 1px ${glowInk}73, 0 -2px 14px ${glowInk}29` : undefined;
         const badgeCount = tabBadgeCount(counts, active);
         // Bound once here rather than indexed twice at the render site: under
         // `noUncheckedIndexedAccess` the second lookup is independently `| undefined`.
@@ -625,7 +659,9 @@ export function ProjectTabs({
               <TabStaleBadge projectId={p.id} projectName={p.name} staleness={staleness} />
             )}
             {/* ● N, and ONLY on a tab you are not looking at. See `tabBadgeCount`. */}
-            {badgeCount !== null && <TabCountBadge projectId={p.id} count={badgeCount} />}
+            {badgeCount !== null && band !== null && (
+              <TabCountBadge projectId={p.id} count={badgeCount} band={band} />
+            )}
             {/* NO close button while the project is torn out. Closing the tab hides it and nothing
                 else — but the tab is also the ONLY doorway to that satellite ("Show that window" /
                 "Bring it back here" live behind it), so closing it would leave a live window owning

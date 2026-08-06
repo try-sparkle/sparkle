@@ -29,7 +29,7 @@ function contrast(a: string, b: string): number {
 
 /** Counts with only the named bands set — a tab takes the full per-band Record. */
 function counts(over: Partial<Record<StatusBand, number>> = {}): Record<StatusBand, number> {
-  return { needs_you: 0, running: 0, done: 0, ...over };
+  return { needs_you: 0, questions: 0, running: 0, done: 0, ...over };
 }
 
 const projects = [
@@ -133,7 +133,7 @@ describe("ProjectTabs", () => {
   });
 
   it("an inactive tab whose count is ZERO shows no badge", () => {
-    renderTabs({ countsByProject: { website: counts({ needs_you: 0, running: 3, done: 5 }) } });
+    renderTabs({ countsByProject: { website: counts({ needs_you: 0, questions: 0, running: 3, done: 5 }) } });
     expect(screen.queryByTestId("count-website")).toBeNull();
     expect(screen.getByTestId("tab-website").textContent).toBe("drodio-website");
   });

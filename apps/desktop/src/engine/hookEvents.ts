@@ -55,14 +55,35 @@ const PERMISSION_RE = /\b(permission|approve|allow)\b/i;
 // A handful of tools BLOCK the turn on the user rather than doing work: their PreToolUse fires and
 // then Claude sits waiting for an answer, with NO Stop and — unlike a permission request — NO
 // Notification (sparkle-t2up). So a PreToolUse for one of these is a real mid-turn "answer me", not
-// the agent working, and must go red. AskUserQuestion is a question menu → `waiting` ("your turn");
-// ExitPlanMode presents a plan for you to approve → `approval`. Every OTHER tool (Bash, Read, Edit,
-// Task, …) is the agent working. This is the only place the tool name changes the status; the
-// matching PostToolUse maps back to `working` (below), so the red self-clears the instant Claude
-// resumes — no screen signal involved, so the status-router's mid-turn hook authority (and the
-// founder's false-handback protection) is untouched.
+// the agent working. Every OTHER tool (Bash, Read, Edit, Task, …) is the agent working. This is the
+// only place the tool name changes the status; the matching PostToolUse maps back to `working`
+// (below), so the state self-clears the instant Claude resumes — no screen signal involved, so the
+// status-router's mid-turn hook authority (and the founder's false-handback protection) is
+// untouched.
+//
+// `AskUserQuestion` → `questions` (BLUE), NOT `waiting` (RED), as of 2026-08-05.
+//
+// THIS ONE LINE IS THE WHOLE DETECTION STORY, and it is worth saying why it is not something
+// cleverer. Claude Code fires this hook DETERMINISTICALLY whenever an agent opens a question menu:
+// no string matching, no model call, no inference from "plan mode plus an idle terminal". The app
+// already received this event and already knew the tool's name — it was simply painting the result
+// in the alarm colour. So every agent running right now gets the blue treatment with no change to
+// how agents behave and nothing new to remember.
+//
+// The alternative that was explicitly rejected: scraping the terminal for question-shaped prose.
+// This repo has tried that twice and both attempts are still in the tree as cautionary tales —
+// services/suggestions/pendingQuestion.ts (a regex list, with a documented false-negative
+// regression) and services/turnFollowup.ts (which gave up on regex and pays for a Haiku call per
+// turn, and whose header records being wrong in BOTH directions, including a fleet-wide false-alarm
+// storm on 2026-07-28). A false blue pill trains the founder to ignore the pill, which costs more
+// than the state is worth. Structured signal or nothing.
+//
+// `ExitPlanMode` deliberately stays `approval` (RED). It is the agent DELIVERING a finished plan,
+// not asking a question, and "Questions" is the wrong word on a pill for it. That is a judgement
+// call about labelling, not a claim that plan delivery is bad news — if the founder wants plan
+// hand-offs blue too, this is the line to change and nothing else.
 const BLOCKING_TOOL_STATUS: Record<string, AgentTabStatus> = {
-  AskUserQuestion: "waiting",
+  AskUserQuestion: "questions",
   ExitPlanMode: "approval",
 };
 

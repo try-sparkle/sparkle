@@ -17,10 +17,16 @@ import type { AgentTabStatus } from "../types";
 // `.color` against a known red status (waiting) and a known gray status (idle) rather than
 // re-listing the tiers here.
 const RED_CIRCLE = "🔴";
+const BLUE_CIRCLE = "🔵"; // the `questions` tier — an ask, but not an alarm
 const GRAY_CIRCLE = "🔘"; // radio-button RING glyph
 function statusGlyph(status: AgentTabStatus): string {
   const color = AGENT_STATUS[status].color;
   if (color === AGENT_STATUS.waiting.color) return RED_CIRCLE;
+  // BLUE tier (`questions`). The glyph carries the whole distinction in a notification, where
+  // there is no dot and no chip — just a title string. A question arriving under a red circle
+  // reads as bad news before the founder has read a word of it, which is precisely the
+  // conflation this tier exists to undo.
+  if (color === AGENT_STATUS.questions.color) return BLUE_CIRCLE;
   if (color === AGENT_STATUS.idle.color) return GRAY_CIRCLE;
   return ""; // green (working) — no glyph
 }
@@ -35,10 +41,22 @@ export type StatusMap = Record<string, AgentTabStatus>;
 // "needs you eventually" (unstick it), not "answer this now", so it doesn't inflate the dock badge
 // or fire a banner. `unmerged` isn't even red — see tokens.ts. Keep this set = the "answer now"
 // subset, and reach for windowStatus.isRedStatus when the question is "is this row red".
+//
+// `questions` IS IN THIS SET, even though it is not red. This set is not "the red statuses" — it is
+// "the agent cannot proceed without you, right now", and a pending question satisfies that as
+// completely as `waiting` does. Leaving it out would have made the state cosmetic: a blue dot the
+// founder only discovers by scrolling, on a fleet where a question can sit unanswered for hours.
+// The founder's ask was that this be "as visually obvious as the blocked pill" — so it counts and
+// it pings, and only the COLOR differs (see the glyph above and tokens.ts AGENT_STATUS).
+//
+// Note this makes ATTENTION no longer a subset of the red tier, which it was for its whole life.
+// Code that wants "is this row red" must call windowStatus.isRedStatus and will now get `false` for
+// a questioning agent — correct, and the reason the two predicates were always kept separate.
 const ATTENTION: ReadonlySet<AgentTabStatus> = new Set<AgentTabStatus>([
   "waiting",
   "approval",
   "errored",
+  "questions",
 ]);
 
 /** True when a status means the agent is waiting on the user's answer/approval. */
@@ -128,6 +146,10 @@ export function notificationFor(
   const reason: Record<AgentTabStatus, string> = {
     waiting: "Needs your answer",
     approval: "Wants your approval",
+    // NOT "needs you" / "blocked" / "stuck". The banner is where the founder meets this state
+    // first, and the whole point is that it reads as an agent doing the right thing rather than an
+    // agent in trouble. Phrased as what the agent HAS (questions), not as what it lacks.
+    questions: "Has questions before it builds",
     errored: "Errored or stalled — needs you",
     idle: "Finished — your turn",
     done: "Done",

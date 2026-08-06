@@ -279,7 +279,7 @@ beforeEach(enableAiEnhancementsForTests);
 // Cleared here rather than at the end of the one case that writes it: the next writer will forget.
 beforeEach(() => h.proactiveIds.clear());
 
-const EMPTY_COUNTS: Record<StatusBand, number> = { needs_you: 0, running: 0, done: 0 };
+const EMPTY_COUNTS: Record<StatusBand, number> = { needs_you: 0, questions: 0, running: 0, done: 0 };
 
 /** A one-agent feed. The band defaults to `needs_you` because that IS the surfacing gate — an agent
  *  in any other band produces no nudge card, which is what the `done` case below pins. */
@@ -307,7 +307,7 @@ function feedWith(status: string, band: StatusBand = "needs_you", statusLabel = 
     // double-count guard look like it works. See the promoted-head rows at the end of this file.
     rolledUpGreen: false,
   };
-  const counts = { needs_you: 0, running: 0, done: 0, [band]: 1 };
+  const counts = { needs_you: 0, questions: 0, running: 0, done: 0, [band]: 1 };
   return {
     projects: [
       { id: "p1", name: "sparkle", inScope: true, counts, scopedCounts: counts, agents: [agent] },
@@ -2384,7 +2384,7 @@ describe("ConciergeHost — Away → Here recap", () => {
       mk("ag1", "Kraken Auth", headStatus, { topLevel: true, rolledUpGreen }),
       mk("w1", "Parser Worker", workerStatus, { topLevel: false, parentId: "ag1" }),
     ];
-    const counts = { needs_you: 0, running: 0, done: 0 };
+    const counts = { needs_you: 0, questions: 0, running: 0, done: 0 };
     return {
       projects: [
         { id: "p1", name: "sparkle", inScope: true, counts, scopedCounts: counts, agents },
@@ -2510,7 +2510,7 @@ describe("ConciergeHost — capture handoffs land in the compose box", () => {
       topLevel: true,
       representedElsewhere: false,
     }));
-    const counts = { needs_you: agents.length, running: 0, done: 0 };
+    const counts = { needs_you: agents.length, questions: 0, running: 0, done: 0 };
     return {
       projects: [
         { id: "p1", name: "sparkle", inScope: true, counts, scopedCounts: counts, agents },

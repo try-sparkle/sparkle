@@ -26,7 +26,7 @@ afterEach(() => cleanup());
 
 const model: ConciergeViewModel = {
   scope: {},
-  vitals: { needs_you: 0, running: 0, done: 0 },
+  vitals: { needs_you: 0, questions: 0, running: 0, done: 0 },
   messages: [{ id: "a1", kind: "sparkle", text: "**Answer** with `source`." }],
 };
 

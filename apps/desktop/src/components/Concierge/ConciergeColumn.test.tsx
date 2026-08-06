@@ -44,7 +44,7 @@ const nudge: ConciergeNudge = {
 
 const model: ConciergeViewModel = {
   scope: {},
-  vitals: { needs_you: 1, running: 2, done: 0 },
+  vitals: { needs_you: 1, questions: 0, running: 2, done: 0 },
   messages: [
     { id: "m1", kind: "sparkle", text: "Morning — I'm watching every open project." },
     { id: "m2", kind: "you", text: "Thanks, keep me posted." },

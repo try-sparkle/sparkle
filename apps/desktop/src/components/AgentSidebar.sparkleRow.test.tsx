@@ -463,7 +463,7 @@ describe("Improve Sparkle row — its state reaches the filter chips", () => {
     useUiStore.setState({
       collapsedOrchestrators: {},
       activeSpecial: null,
-      statusFilter: { needs_you: true, running: false, done: false },
+      statusFilter: { needs_you: true, questions: true, running: false, done: false },
     } as never);
     render(<AgentSidebar project={seed({ a1: "idle", [SPARKLE_AGENT_ID]: "idle" })} />);
     expect(screen.queryByText("Alpha")).toBeNull(); // the project row IS filtered away…

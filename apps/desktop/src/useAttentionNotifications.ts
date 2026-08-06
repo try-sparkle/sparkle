@@ -16,6 +16,7 @@ import { useEffect, useMemo, useRef } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   countAttention,
+  needsAttention,
   newlyEntered,
   notificationFor,
   suppressNotification,
@@ -71,15 +72,10 @@ import { resolveStage } from "./engine/workflowStage";
 import type { AgentTab, AgentTabStatus } from "./types";
 import { projectNameForAgent } from "./services/creditProject";
 
-/** The "answer now" red statuses relayed to the phone + counted by the badge (mirrors
- *  engine/attention's ATTENTION set). Includes `errored`: a crashed or mid-stream-stalled agent is
- *  stuck until you step in (the "never lose time" intent). This is the NARROW subset — it
- *  intentionally DIVERGES from the broader red-COLOR tier windowStatus.isRedStatus now covers
- *  (which also includes `blocked` and `unmerged`): those recolor the dot + surface cross-project but
- *  are "needs you eventually", not "answer this now", so they are NOT relayed to the phone or the
- *  dock badge. Keep this set = waiting|approval|errored; do not widen it to match isRedStatus. */
-const isRelayRed = (s: AgentTabStatus | undefined): boolean =>
-  s === "approval" || s === "waiting" || s === "errored";
+// `isRelayRed` USED TO LIVE HERE and was deleted, not renamed. Once `questions` joined the set it
+// was character-for-character `engine/attention.needsAttention` — two seams answering one question,
+// which is the drift this file's own header warns about. Call `needsAttention` directly; the phone
+// payload already distinguishes the kinds (`kind: "question"` for anything that is not an approval).
 
 /** The PUBLISHED status map — the same chain AgentSidebar's `effectiveStatus` applies to color its
  *  own rows, kept here as one exported function so the two can be compared (and tested) instead of
@@ -439,7 +435,7 @@ export function useAttentionNotifications(): void {
         const agent = agents.find((a) => a.id === id);
         if (!agent || pid == null) continue;
         const agentName = agent.name;
-        const relay = isRelayRed(st); // mirrored to the phone regardless of local suppression
+        const relay = needsAttention(st); // mirrored to the phone regardless of local suppression
         const suppressed = suppressNotification({ windowFocused, selectedAgentId, agentId: id });
         if (!relay && suppressed) continue; // not relayed and locally suppressed — nothing to send
         // Phase-2b: if the agent FRESHLY self-reported what it's doing (within ACTIVITY_FRESH_MS of
@@ -490,7 +486,7 @@ export function useAttentionNotifications(): void {
           // race the resolve-cleanup below and leave a stale card on the phone. With no await we run
           // synchronously in the same tick `newlyEntered` validated `st`, so the captured status holds
           // and no re-check is needed (it would only re-read the same snapshot).
-          if (relay && (!awaited || isRelayRed(useRuntimeStore.getState().status[id]))) {
+          if (relay && (!awaited || needsAttention(useRuntimeStore.getState().status[id]))) {
             const attentionId = crypto.randomUUID();
             attentionIds.current[id] = attentionId;
             const approval = st === "approval";
@@ -546,7 +542,7 @@ export function useAttentionNotifications(): void {
     // Clear the phone's card for any agent we raised that is no longer red — including agents
     // that left the owned set entirely (project switch / removed), which the loop above misses.
     for (const [id, attentionId] of Object.entries(attentionIds.current)) {
-      if (!isRelayRed(status[id])) {
+      if (!needsAttention(status[id])) {
         emitResolved(attentionId);
         delete attentionIds.current[id];
       }

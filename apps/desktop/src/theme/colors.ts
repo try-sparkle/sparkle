@@ -195,7 +195,7 @@ export const THEME_HEX = {
     tealInk: BLUEPRINT.dark.primary, goldHotInk: BLUEPRINT.dark.primary,
     goldFill: BLUEPRINT.dark.primary, onGoldFill: BLUEPRINT.dark.onPrimary,
     successInk: "#34c759", dangerInk: "#f4968f", amberInk: "#ecb968",
-    mixedInk: "#ecb968", violetInk: "#a185f5",
+    mixedInk: "#ecb968", violetInk: "#a185f5", questionsInk: "#7dd3fc",
   },
   light: {
     inputSurface: BLUEPRINT.light.input,
@@ -215,7 +215,7 @@ export const THEME_HEX = {
     tealInk: BLUEPRINT.light.primary, goldHotInk: BLUEPRINT.light.primary,
     goldFill: BLUEPRINT.light.primary, onGoldFill: BLUEPRINT.light.onPrimary,
     successInk: "#0d5326", dangerInk: "#8f1d16", amberInk: "#664200",
-    mixedInk: "#ab4e07", violetInk: "#5636b8",
+    mixedInk: "#ab4e07", violetInk: "#5636b8", questionsInk: "#075985",
   },
 } as const;
 
@@ -402,6 +402,11 @@ export const C = {
   // on the surface the label is actually read on. Both stops of the gradient are enforced in
   // theme/chromeContrast.test.ts; the badge's own layer is composited there, not assumed.
   dangerInk: "var(--c-danger-ink)",
+  // The BLUE status tier (`questions`) as TEXT. Same job dangerInk does for red: BRAND.azure
+  // (#38bdf8) is a FILL color chosen to read on an 8px dot, and it is far too pale as text on
+  // light's white column. These are the themed twins — #7dd3fc measures 10.2:1 on the dark shell,
+  // #075985 measures 7.6:1 on white. Paint dots with C.azure and words with this.
+  questionsInk: "var(--c-questions-ink)",
   // The ACCENT as TEXT — the exact same fill/ink split as accent/accentInk and success/successInk,
   // for the same reason.
   //
@@ -603,6 +608,10 @@ export function statusInk(color: string): string {
   // and it paints the NAME of a worker row, which is an underlined-on-hover link. `dangerInk` is
   // the themed alarm-red-as-text tier that already existed for exactly this (see above).
   if (color === AGENT_STATUS.waiting.color) return C.dangerInk;
+  // Brand BLUE (`questions`) — same reasoning as the red above, and it matters MORE here because
+  // this tier paints a row NAME beside a count the founder is meant to act on. BRAND.azure is a
+  // dot fill; `questionsInk` is its themed as-text twin.
+  if (color === AGENT_STATUS.questions.color) return C.questionsInk;
   return color;
 }
 

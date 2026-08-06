@@ -73,11 +73,11 @@ const feed: ConciergeFeed = {
     // Alpha needs you twice over; Beta only has work in flight, which must not badge.
     // `scopedCounts` mirrors `counts` here — nothing is muted or pinned away in this fixture. The
     // BADGES read `counts` (the raw truth); the concierge header reads the scoped share.
-    { id: "p1", name: "Alpha", inScope: true, counts: { needs_you: 2, running: 1, done: 0 }, scopedCounts: { needs_you: 2, running: 1, done: 0 }, agents: [] },
-    { id: "p2", name: "Beta", inScope: true, counts: { needs_you: 0, running: 3, done: 4 }, scopedCounts: { needs_you: 0, running: 3, done: 4 }, agents: [] },
+    { id: "p1", name: "Alpha", inScope: true, counts: { needs_you: 2, questions: 0, running: 1, done: 0 }, scopedCounts: { needs_you: 2, questions: 0, running: 1, done: 0 }, agents: [] },
+    { id: "p2", name: "Beta", inScope: true, counts: { needs_you: 0, questions: 0, running: 3, done: 4 }, scopedCounts: { needs_you: 0, questions: 0, running: 3, done: 4 }, agents: [] },
   ],
-  counts: { needs_you: 2, running: 4, done: 4 },
-  scopedCounts: { needs_you: 2, running: 4, done: 4 },
+  counts: { needs_you: 2, questions: 0, running: 4, done: 4 },
+  scopedCounts: { needs_you: 2, questions: 0, running: 4, done: 4 },
   pinnedProjectId: null,
 };
 
@@ -105,8 +105,8 @@ afterEach(() => cleanup());
 describe("countsFromFeed", () => {
   it("keys each project's raw per-band totals by project id", () => {
     expect(countsFromFeed(feed)).toEqual({
-      p1: { needs_you: 2, running: 1, done: 0 },
-      p2: { needs_you: 0, running: 3, done: 4 },
+      p1: { needs_you: 2, questions: 0, running: 1, done: 0 },
+      p2: { needs_you: 0, questions: 0, running: 3, done: 4 },
     });
   });
   it("is empty for an empty feed (no tab claims a count it doesn't have)", () => {
@@ -140,7 +140,7 @@ describe("ProjectTabsBar", () => {
   it("shows no badge for a calm project", () => {
     const calm = {
       ...feed,
-      projects: feed.projects.map((p) => ({ ...p, counts: { needs_you: 0, running: 0, done: 0 } })),
+      projects: feed.projects.map((p) => ({ ...p, counts: { needs_you: 0, questions: 0, running: 0, done: 0 } })),
     };
     useProjectStore.setState({ selectedProjectId: "p2" } as never);
     render(<ProjectTabsBar feed={calm} onOpenProjectSettings={() => {}} />);

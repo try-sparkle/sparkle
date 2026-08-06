@@ -23,6 +23,12 @@ import {
 // theme/theme.ts imports THIS store. A value import would close that loop into a runtime cycle; a
 // type import is erased at compile time, so it can't. The default below is spelled inline for the
 // same reason (rather than calling allBandsVisible()).
+//
+// SO THE BAND LIST IS SPELLED OUT THREE TIMES BELOW, and that is a knowing exception to "never
+// re-list the taxonomy" — the cycle is the reason. What keeps it honest is `Record<StatusBand, …>`:
+// every one of the three is exhaustive, so adding a band is a COMPILE ERROR here rather than a
+// silent omission. That is how `questions` was caught when it was added on 2026-08-05. If you add a
+// fifth band and the compiler sends you here, add the key; do not reach for a value import.
 import type { StatusBand } from "../engine/buildSections";
 // TYPE-ONLY for the same reason as StatusBand above: voice/sendMode pulls in components/MicButton
 // for `MicIntent`, which reaches theme/colors — and theme/theme.ts imports this store.
@@ -592,13 +598,20 @@ export const useUiStore = create<UiState>()(
       setThemePref: (v) => set({ themePref: v }),
       conciergeComposeH: null,
       setConciergeComposeH: (h) => set({ conciergeComposeH: h }),
-      statusFilter: { needs_you: true, running: true, done: true },
+      statusFilter: { needs_you: true, questions: true, running: true, done: true },
       toggleStatusBand: (b) =>
         set((s) => ({ statusFilter: { ...s.statusFilter, [b]: !s.statusFilter[b] } })),
       showAllStatusBands: () =>
-        set({ statusFilter: { needs_you: true, running: true, done: true } }),
+        set({ statusFilter: { needs_you: true, questions: true, running: true, done: true } }),
       isolateStatusBand: (b) =>
-        set({ statusFilter: { needs_you: b === "needs_you", running: b === "running", done: b === "done" } }),
+        set({
+          statusFilter: {
+            needs_you: b === "needs_you",
+            questions: b === "questions",
+            running: b === "running",
+            done: b === "done",
+          },
+        }),
       workModeBySide: { ...DEFAULT_WORK_MODE_BY_SIDE },
       // Writes ONLY the named side. The other side's entry is carried through untouched — that
       // non-clobbering is the whole point of the map, and it is what the per-column board test
