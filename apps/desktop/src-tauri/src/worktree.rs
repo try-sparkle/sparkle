@@ -3274,6 +3274,17 @@ pub async fn project_pr_list_url(root: String) -> Result<Option<String>, String>
 #[serde(rename_all = "camelCase")]
 pub struct PrRow {
     pub number: u64,
+    /// GitHub's `updatedAt` for this PR, verbatim (ISO-8601), or empty when the field was absent.
+    ///
+    /// A CHANGE DETECTOR, not a clock. It is never parsed or compared for ordering — only for
+    /// equality against the previous sighting — so a format change or a skewed server clock costs
+    /// an extra read rather than a wrong answer. GitHub bumps it on any comment, review, push or
+    /// label, which is exactly the set of events that can change a PR's knightwatch probes.
+    ///
+    /// EMPTY MEANS "DO NOT SKIP". An absent value must never compare equal to a previous absent
+    /// value and suppress a read, because that would silence a PR permanently on a `gh` that
+    /// stopped returning the field — the consumer treats empty as always-changed.
+    pub updated_at: String,
     pub title: String,
     pub head_ref_name: String,
     pub url: String,
@@ -3479,6 +3490,7 @@ fn decode_open_prs(stdout: &str) -> Option<Vec<PrRow>> {
                         .to_string();
                 Some(PrRow {
                     number,
+                    updated_at: str_field("updatedAt"),
                     title: str_field("title"),
                     head_ref_name: str_field("headRefName"),
                     url: str_field("url"),
@@ -3524,7 +3536,7 @@ fn probe_open_prs(root: &str, project_id: &str, app_data: &Path) -> Option<Vec<P
             "--limit",
             "100",
             "--json",
-            "number,title,headRefName,headRefOid,url,mergeable,mergeStateStatus,statusCheckRollup,body",
+            "number,title,headRefName,headRefOid,url,mergeable,mergeStateStatus,statusCheckRollup,body,updatedAt",
         ])
         .current_dir(root)
         .env("GH_PROMPT_DISABLED", "1")
@@ -8835,6 +8847,7 @@ mod tests {
             r#"[
                 {
                     "number": 42,
+                    "updatedAt": "2026-08-05T10:00:00Z",
                     "title": "fix: a thing",
                     "headRefName": "sparkle/agent-abc",
                     "url": "https://github.com/o/r/pull/42",
@@ -8850,6 +8863,13 @@ mod tests {
             rows[0],
             PrRow {
                 number: 42,
+                // EXTRACTED, not defaulted. The fixture above carries `updatedAt`, so this pins the
+                // decoder actually reading it — without it, deleting `str_field("updatedAt")` from
+                // the decoder left every test green, and the babysit sweep's whole skip-the-read
+                // optimisation is keyed on this value arriving. Row 7 below, which carries no
+                // `updatedAt`, is the paired case: absent must decode as empty, which the sweep
+                // treats as always-changed rather than as a cache hit.
+                updated_at: "2026-08-05T10:00:00Z".into(),
                 title: "fix: a thing".into(),
                 head_ref_name: "sparkle/agent-abc".into(),
                 url: "https://github.com/o/r/pull/42".into(),
@@ -8875,6 +8895,7 @@ mod tests {
             rows[1],
             PrRow {
                 number: 7,
+                updated_at: String::new(),
                 title: String::new(),
                 head_ref_name: String::new(),
                 url: String::new(),

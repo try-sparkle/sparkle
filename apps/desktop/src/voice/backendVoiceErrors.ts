@@ -43,6 +43,20 @@ export const BACKEND_MIC_RESTRICTED =
  *  reword fails SOFT (the user still sees the raw string) but loses the tailored remedy. → `no-audio` */
 export const BACKEND_NO_AUDIO_PREFIX = 'No audio from "';
 
+/** The watchdog's STALE-GRANT report — the durable opening clause only, for the same reason as
+ *  BACKEND_NO_AUDIO_PREFIX: the rest interpolates an OS-supplied device name.
+ *
+ *  Distinct from BACKEND_NO_AUDIO_PREFIX because the CAUSE is known and different, and so is the
+ *  remedy. This is emitted when `zero_source=Os` and `tcc=Authorized` agree: macOS says the grant is
+ *  live and is handing the process digital silence anyway. Restarting re-establishes it; the Privacy
+ *  pane shows Sparkle already switched ON, so the ordinary `permission` remedy is a dead end here.
+ *
+ *  ORDERING IS LOAD-BEARING. This sentence contains both "microphone permission" and "Privacy &
+ *  Security → Microphone", so it satisfies MIC_CONTEXT *and* DENIAL and would otherwise be
+ *  classified `permission` — handing the user the exact remedy that cannot work. Its pattern is
+ *  matched FIRST in dictationCopy's PATTERNS. → `stale-grant` */
+export const BACKEND_STALE_GRANT_PREFIX = 'macOS is sending silence instead of audio from "';
+
 /** We prompted and timed out waiting. Deliberately carries NO denial word, so it lands in `unknown`
  *  (which renders it verbatim) rather than `permission`: the status is still NotDetermined, so the
  *  Privacy pane has no Sparkle entry yet and sending the user there would be a dead end. → `unknown` */

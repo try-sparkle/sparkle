@@ -9,6 +9,7 @@ import type { AgentTabStatus, LastObserved } from "../types";
 import { isRedStatus } from "../services/windowStatus";
 import type { BranchStatus, WorkflowState, AgentStatusResult } from "../services/branchStatus";
 import type { WorkflowStageId } from "../engine/workflowStage";
+import type { MovementEvidence } from "../engine/movementRetraction";
 import type { FollowupSignal } from "../services/turnFollowup";
 import { agentBranchStatus, agentWorkflowState, projectAgentsStatus } from "../services/branchStatus";
 import { deriveLiveStage, stageIndex } from "../engine/workflowStage";
@@ -559,6 +560,29 @@ function sameStringOrder(a: string[], b: string[]): boolean {
   return true;
 }
 
+/** Are two artifact-evidence maps the same reading? Field-by-field, because `fleet_digest` hands
+ *  back fresh objects on every poll, so reference equality is never true and a whole-map subscriber
+ *  would re-render every ten seconds over facts that did not move. */
+function sameMovement(
+  a: Record<string, MovementEvidence>,
+  b: Record<string, MovementEvidence>,
+): boolean {
+  const ka = Object.keys(a);
+  if (ka.length !== Object.keys(b).length) return false;
+  for (const k of ka) {
+    const x = a[k];
+    const y = b[k];
+    if (y === undefined || x === undefined) return false;
+    if (
+      x.lastEvent !== y.lastEvent ||
+      x.lastEventMs !== y.lastEventMs ||
+      x.sessionId !== y.sessionId
+    )
+      return false;
+  }
+  return true;
+}
+
 interface RuntimeState {
   status: Record<string, AgentTabStatus>; // agentId -> status (live-only, never persisted)
   // agentId -> the LAST status this window observed for the agent + when, captured by close() from
@@ -566,6 +590,17 @@ interface RuntimeState {
   // PERSISTED. Its whole job is to let a surface tell "ran, then closed" from "never started": a
   // closed worker used to read as statusless and get a synthetic red "Approve?" overlay (sparkle-w340).
   lastObserved: Record<string, LastObserved>;
+  // agentId -> the ARTIFACT evidence of that agent having acted, refreshed by services/fleetWatch
+  // from `fleet_digest` every FLEET_POLL_INTERVAL_MS. Live-only, like `status`.
+  //
+  // WHY THIS EXISTS AS A SEPARATE MAP FROM `status`. `status` has exactly ONE writer,
+  // components/AgentPane's status engine, so it is live only while a pane is MOUNTED for that agent
+  // — and panes mount lazily, per project, on first visit (Workspace.tsx). For every agent this
+  // window is not hosting, `status` is a frozen last reading that nothing can retract, which is how
+  // a BLOCKED pill outlived the block and had to be cleared by hand (bead sparkle-7ba9e). This map
+  // is the second witness: it is read off disk for the whole `openAgentIdSet()` population, needs no
+  // pane, and costs no agent turn. `engine/movementRetraction` is what compares the two.
+  agentMovement: Record<string, MovementEvidence>;
   // agentId -> the terminal screen text captured the moment the agent entered an "ask" status
   // (waiting/approval), so the notification path can summarize WHAT it's asking. Live-only (never
   // persisted, like `status`); cleared whenever `status` is cleared for an agent.
@@ -611,6 +646,11 @@ interface RuntimeState {
    *  Unlike `close`, the pane stays mounted; the new session repopulates status from its own hooks. */
   resetProgress: (agentId: string) => void;
   setStatus: (agentId: string, status: AgentTabStatus) => void;
+  /** Replace the whole artifact-evidence map from one `fleet_digest` tick. WHOLE-MAP, not per-agent:
+   *  the digest is a complete reading over `openAgentIdSet()`, so an agent MISSING from a tick has no
+   *  evidence this tick and must not keep a previous tick's — a retraction is only ever as good as
+   *  its most recent reading. */
+  setAgentMovement: (movement: Record<string, MovementEvidence>) => void;
   /** Store the terminal screen captured when an agent entered an "ask" status, for the notification
    *  summarizer. Live-only (mirrors `status`). */
   setAttentionScreen: (agentId: string, text: string) => void;
@@ -667,6 +707,7 @@ export const useRuntimeStore = create<RuntimeState>()(
     (set, get) => ({
       status: {},
       lastObserved: {},
+      agentMovement: {},
       attentionScreen: {},
       unjudgedAsk: {},
       openAgentIds: [],
@@ -778,6 +819,13 @@ export const useRuntimeStore = create<RuntimeState>()(
         // map ref, which every whole-map subscriber (sidebar/TopBar) re-renders on. A redundant tick
         // of the SAME status (e.g. repeated "working"/"listening"/"blocked") must not churn a render.
         set((s) => (s.status[agentId] === status ? s : { status: { ...s.status, [agentId]: status } })),
+
+      setAgentMovement: (movement) =>
+        // Same no-op guard `setStatus` uses, for the same reason: this map has whole-map subscribers
+        // (the concierge feed), and a poll that reads the same facts as the last one — the common
+        // case for a quiet fleet, every ten seconds — must not churn a render. Shallow-compared by
+        // the three fields that matter, because the digest hands back fresh objects each tick.
+        set((s) => (sameMovement(s.agentMovement, movement) ? s : { agentMovement: movement })),
 
       setAttentionScreen: (agentId, text) =>
         set((s) => ({ attentionScreen: { ...s.attentionScreen, [agentId]: text } })),

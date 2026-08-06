@@ -984,8 +984,8 @@ describe("conflicting PRs reach the report through the sweep", () => {
     ownerAgentId: null,
     kind: "conflicting" as const,
     commitsBehind: 220,
-    untested: true,
     unresolvedSecs: 4 * 60 * 60,
+    evidence: "no-checks-ran",
   };
 
   it("reports a conflicting PR to the recipient with the untested fact intact", async () => {

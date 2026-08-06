@@ -43,6 +43,7 @@ import {
   type JudgedDigest,
 } from "./conciergeTools/fleet";
 import type { FleetAgentFacts, FleetVerdict } from "../engine/fleetVerdict";
+import type { MovementEvidence } from "../engine/movementRetraction";
 
 /**
  * Poll cadence.
@@ -357,6 +358,41 @@ export interface FleetWatchDeps {
   /** Atomically claim an idle agent's pending messages. Returns only what this call WON. */
   claimForIdle(agentId: string): Promise<ClaimedMessage[]>;
   deliver(agentId: string, text: string): Promise<void>;
+  /**
+   * Publish this tick's artifact evidence of who has ACTED, for `engine/movementRetraction`.
+   *
+   * A SECOND READER of a digest that is already being fetched — this loop's real job is idle
+   * delivery, and the same payload happens to answer "has this agent moved" for free. It is here
+   * rather than in a poll of its own precisely so the app does not open a second ten-second sweep
+   * over every worktree to learn something this one already read (the module header's rule: reading
+   * artifacts is free, asking an agent is not).
+   *
+   * REQUIRED rather than optional, deliberately. An optional dep that the app happens to wire is
+   * indistinguishable from one it forgot to, and this is the only thing that keeps a BLOCKED pill
+   * from outliving its block (bead sparkle-7ba9e) — a silently-unwired version would restore the
+   * bug with every test still green.
+   */
+  publishMovement(movement: Record<string, MovementEvidence>): void;
+}
+
+/** The artifact evidence, keyed by agent, that `engine/movementRetraction` compares against a red's
+ *  raise time. A projection of the digest, not a second reading of anything.
+ *
+ *  `sessionId` RIDES ALONG BECAUSE THE LOG IS PER-WORKTREE. `fleet.rs` reduces one file that holds
+ *  the agent's own session, its subagents', and every background one-shot `claude` ever run in that
+ *  worktree — so an event NAME on its own does not say whose work it was, and a background call's
+ *  `PostToolUse` would read as the blocked agent resuming. The consumer scopes on it; this is the
+ *  only place it can be carried across. */
+export function movementFrom(agents: readonly FleetAgentFacts[]): Record<string, MovementEvidence> {
+  const out: Record<string, MovementEvidence> = {};
+  for (const f of agents) {
+    out[f.agentId] = {
+      lastEvent: f.hooks.lastEvent,
+      lastEventMs: f.hooks.lastEventMs,
+      sessionId: f.hooks.sessionId,
+    };
+  }
+  return out;
 }
 
 /** What one tick observed and did. Exposed so a surface can render the fleet's state without
@@ -436,6 +472,7 @@ export function defaultFleetWatchDeps(): FleetWatchDeps {
     // message landed. `services/requery` reaches for the same function for the same reason.
     // `machine: true` — fleetWatch delivers on its own schedule, with no human in the loop.
     deliver: (agentId, text) => submitPrompt(agentId, text, { machine: true }),
+    publishMovement: (movement) => useRuntimeStore.getState().setAgentMovement(movement),
   };
 }
 
@@ -543,10 +580,16 @@ export async function pollFleetOnce(deps: FleetWatchDeps): Promise<FleetWatchTic
   const agents = deps.liveAgents();
   const atMs = deps.now();
   if (agents.length === 0) {
+    // PUBLISH THE EMPTY READING rather than skipping the call. Leaving the previous tick's evidence
+    // standing would let a retraction rest on facts about a fleet that is no longer there.
+    deps.publishMovement({});
     return { atMs, verdicts: [], skipped: {}, delivered: [], failed: [] };
   }
 
   const digest = await deps.digest(agents);
+  // Published from the RAW facts, before any of the delivery reasoning below, so the evidence a red
+  // is retracted against never depends on whether this loop decided to write to the agent.
+  deps.publishMovement(movementFrom(digest.agents));
   const verdictOf = new Map(digest.verdicts.map((v) => [v.agentId, v]));
   const skipped: Record<string, NoDeliveryReason> = {};
   const candidates: FleetAgentFacts[] = [];

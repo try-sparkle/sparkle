@@ -1141,6 +1141,11 @@ impl Drop for DecodeWorker {
                              rather than blocking teardown (the app must stay responsive)"
                         );
                         drop(handle); // detach; it will exit if it ever unwedges
+                        // A worker wedged past the abort is plausibly wedged INSIDE
+                        // `Decoder::transcribe`, which holds the recognizer mutex for the whole FFI
+                        // decode — and `DECODER_CACHE` would hand that same decoder to every later
+                        // arm. See `retire_cached_decoder` for why that trade is the wrong way round.
+                        retire_cached_decoder();
                     }
                 }
             }
@@ -1204,6 +1209,14 @@ pub struct DictationSession {
     /// Reset whenever a capture is installed, so every rebuild gets exactly one silent recovery
     /// attempt and a permanently dead device escalates to the user instead of looping forever.
     audio_reacquired: bool,
+    /// Silence evidence for the bound device, accumulated ACROSS captures.
+    ///
+    /// Deliberately NOT cleared by `clear_audio_fault` — that clears the per-capture latches on
+    /// every install, which is exactly the reset this field exists to survive (see [`SilenceWatch`]).
+    /// It is retired instead by the two things that genuinely make the evidence stale: audio
+    /// arriving again (the `Recovered` arm) and the device changing (the UID key, in
+    /// `fold_silence_evidence`).
+    silence_watch: Option<SilenceWatch>,
     /// WHEN the currently-running `build_capture` started (set by `take_reconcile_step`, cleared by
     /// `install_capture` or its error path). Builds happen OFF the session lock and CoreAudio init
     /// blocks on the main thread, so without this the watchdog cannot tell a slow build from a
@@ -1466,7 +1479,19 @@ impl DictationState {
         // it hands back, after the guard is released. That is the same shape `reconcile_capture`
         // (`ReconcileStep::Teardown`) and `stop_dictation` already use — this path was the last one
         // that still tore down under the lock.
-        match plan_capture(capture_should_be_live(sess.armed, sess.focused), sess.capture.is_some()) {
+        // Same reasoning as `take_reconcile_step`'s: log the DECISION and both of its inputs on
+        // every path, so a mic that silently never comes up is visible in the log.
+        let plan = plan_capture(capture_should_be_live(sess.armed, sess.focused), sess.capture.is_some());
+        tracing::info!(
+            target: "dictation",
+            armed = sess.armed,
+            focused = sess.focused,
+            has_capture = sess.capture.is_some(),
+            has_transcriber = sess.transcriber.is_some(),
+            plan = ?plan,
+            "reconcile decision (focus edge)",
+        );
+        match plan {
             CapturePlan::Idle => CaptureLeftovers::default(),
             CapturePlan::Build => {
             // transcriber is always Some while armed; the guard is belt-and-suspenders.
@@ -1583,7 +1608,26 @@ impl DictationState {
         if self.1.load(Ordering::SeqCst) == focus_gen {
             sess.focused = sampled_focus;
         }
-        match plan_capture(capture_should_be_live(sess.armed, sess.focused), sess.capture.is_some()) {
+        // ── LOG THE DECISION, ALWAYS — INCLUDING `Idle` ──────────────────────────────────────────
+        // The 2026-08-05 "captures no audio" hunt was blind here for hours. Dictation logged only
+        // the chatty paths (`build_capture`, "capture paused"), so a session that armed and then
+        // reconciled to `Idle` — the mic silently never coming up — produced NO line at all, and
+        // looked identical in the log to a mic nobody had asked for. Worse, the two inputs that
+        // decide it (`armed`, `focused`) were never recorded, so "which term is false" could not be
+        // answered from a log at all; it had to be inferred, and was inferred wrongly.
+        //
+        // Cheap: this runs on arm and on focus edges, not per audio frame.
+        let plan = plan_capture(capture_should_be_live(sess.armed, sess.focused), sess.capture.is_some());
+        tracing::info!(
+            target: "dictation",
+            armed = sess.armed,
+            focused = sess.focused,
+            has_capture = sess.capture.is_some(),
+            has_transcriber = sess.transcriber.is_some(),
+            plan = ?plan,
+            "reconcile decision",
+        );
+        match plan {
             // `transcriber` is always Some while armed; the guard mirrors reconcile_locked's
             // belt-and-suspenders — a Build with nothing to build from is simply Idle.
             CapturePlan::Build => match sess.transcriber.clone() {
@@ -1650,8 +1694,26 @@ impl DictationState {
                 // Fresh capture → fresh liveness verdict. Carrying the latches over would let a
                 // rebuild inherit "already reported", silently suppressing the notice for a mic
                 // that is still dead.
-                retract = sess.audio_reported;
+                //
+                // BUT A REBUILD IS NOT EVIDENCE OF AUDIO, and under churn that distinction became
+                // load-bearing: a device with a standing silent run would have its notice retracted
+                // here on every install and re-reported by the next tick, flapping the warning once
+                // every couple of seconds (knightwatch probe 2). The retraction is claimed only when
+                // nothing durably contradicts it; real recovery still fires it from the watchdog's
+                // `Recovered` arm, which has actually seen a voiced sample.
+                //
+                // AND WITHHOLDING THE RETRACTION MUST NOT ALSO DISARM THE REAL ONE. `Recovered`
+                // fires only when `reported` is still set, so clearing the latch unconditionally
+                // here left the notice with NO route down at all: if the rebuild is what fixed the
+                // mic — the remedy this branch's own copy tells the user to try — the next tick
+                // folds a voiced delta, `durably_silent` goes false, and both the `Warming` and
+                // `Live` arms return `Idle` with `reported` already false. The sticky frontend
+                // error then stands over a working microphone, which is the exact bug class this
+                // branch exists to delete (knightwatch probe 3).
+                retract = install_retracts(sess.audio_reported, sess.silence_watch.as_ref());
+                let keep_reported = reported_after_install(sess.audio_reported, retract);
                 sess.clear_audio_fault();
+                sess.audio_reported = keep_reported;
                 // Resume a socket parked by the blur that preceded this rebuild — only on the
                 // still_current path, so a capture discarded by a stop/blur race never revives the
                 // cloud session it raced.
@@ -1968,6 +2030,132 @@ fn build_suppresses_watch(since: Option<std::time::Duration>) -> bool {
     matches!(since, Some(elapsed) if elapsed < BUILD_STALL_GRACE)
 }
 
+/// How many raw device samples we must have seen from ONE device — with not a single non-zero one
+/// among them — before that device is silent as a matter of evidence rather than of timing.
+///
+/// 48_000 is one second of audio at the built-in mic's rate. The point is not the duration: it is
+/// that this evidence is CUMULATIVE ACROSS CAPTURE REBUILDS, so it is reachable even when no single
+/// capture ever survives [`WATCHDOG_GRACE`]. See [`SilenceWatch`] for why that matters.
+const SILENCE_EVIDENCE_SAMPLES: u64 = 48_000;
+
+/// Silence evidence for one device, carried ACROSS the captures that observe it.
+///
+/// ── WHY THIS EXISTS: THE CHURN STARVES THE WATCHDOG ─────────────────────────────────────────────
+/// Every latch the watchdog owns is per-CAPTURE — `install_capture` calls `clear_audio_fault` on
+/// each install, deliberately, so a rebuild cannot inherit "already reported" and go quiet on a mic
+/// that is still dead. That is right in isolation and it has an unguarded converse: if captures are
+/// REPLACED faster than one can survive `WATCHDOG_GRACE`, the escalation ladder is reset before it
+/// can ever be climbed, and the user is told nothing at all.
+///
+/// That is not hypothetical. In the 2026-08-05 log the mic churned for six minutes — a stop landing
+/// during each model load (`start_dictation aborted: … mic stays muted`) tore the capture down every
+/// ~2s, under the 4s grace — so `assess_capture_health` returned `Warming` on nearly every tick and
+/// the ONE `Silent` verdict that got through was reset by the next rebuild. Exactly one `Reacquire`
+/// was logged in that window and no `Report` ever followed it. The user sat talking to a dead
+/// microphone while the app knew, tick after tick, that 219,136 raw samples had arrived and every
+/// one of them was zero.
+///
+/// So the evidence has to outlive the capture that gathered it. The device UID keys it: a real
+/// device change is a new question and resets the watch, but a rebuild of the SAME device keeps
+/// accumulating. Nothing at the capture-lifecycle sites has to cooperate, which is what keeps this
+/// from becoming a fourth latch to forget to clear.
+///
+/// ── WHY A RUN AND NOT A TOTAL ───────────────────────────────────────────────────────────────────
+/// The first version banked lifetime totals and required the total non-zero count to be zero, which
+/// made the verdict UNREACHABLE for a mic that worked and then died inside one session: a single
+/// voiced sample from ten minutes ago disqualified every second of silence that followed it
+/// (knightwatch probe 2 on PR #1344). "Worked, then went silent" is not an exotic case — it is the
+/// ordinary shape of a mic that a call app grabs mid-session. So what is carried is the CONSECUTIVE
+/// silent run, measured in counter DELTAS: any voiced delta resets it to zero, and everything after
+/// that point accumulates again.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct SilenceWatch {
+    /// The device this evidence is about. A different UID means a different question.
+    uid: String,
+    /// The previous reading, so each tick contributes only what is NEW. A fresh `Capture` starts its
+    /// counters at zero, so a reading below this one means the capture was rebuilt under us.
+    prev_raw: u64,
+    prev_nonzero: u64,
+    /// Raw samples seen since the last voiced one — across as many captures as it takes.
+    silent_run: u64,
+}
+
+impl SilenceWatch {
+    /// Enough raw audio has passed through this device, with none of it voiced, that "too early to
+    /// judge" is no longer an honest reading.
+    fn is_durably_silent(&self) -> bool {
+        self.silent_run >= SILENCE_EVIDENCE_SAMPLES
+    }
+}
+
+/// Fold one watchdog reading into the running silence evidence for a device.
+///
+/// Pure, and separated from the tick for the reason every other decision in this module is: the
+/// sampling needs a live `AppHandle` and a real audio device, so the only way the fold gets covered
+/// is if it can be called without either. Four transitions, all of them load-bearing:
+///
+///  * **Different device** — a new question. Start over rather than blaming a fresh device for the
+///    old one's silence.
+///  * **Counter went backwards** — the capture was REBUILT (a `Capture`'s counters start at zero),
+///    so the whole of this reading is new. Adding it to the run rather than restarting is the single
+///    transition this struct exists for.
+///  * **Counter advanced** — same capture: add only the DELTA, or one capture sampled every second
+///    would count its own samples once per tick and reach the threshold on timing alone.
+///  * **Any voiced delta** — audio is reaching us. The run is over; start it at zero, whatever it
+///    had reached. This is what makes a mic that dies mid-session reportable.
+///
+/// The one imprecision is deliberate and one-directional: a rebuilt capture whose first reading is
+/// ≥ the retiring one's last cannot be told from the same capture advancing, so its delta is
+/// UNDERSTATED (knightwatch probe 3). That delays a verdict by at most one tick's worth of samples
+/// and can never manufacture one, which is the right way for this to be wrong.
+fn fold_silence_evidence(
+    prev: Option<SilenceWatch>,
+    uid: &str,
+    raw_samples: u64,
+    raw_nonzero: u64,
+) -> SilenceWatch {
+    let (base, d_raw, d_nonzero) = match &prev {
+        Some(w) if w.uid == uid && raw_samples >= w.prev_raw && raw_nonzero >= w.prev_nonzero => {
+            // Same capture, newer reading.
+            (w.silent_run, raw_samples - w.prev_raw, raw_nonzero - w.prev_nonzero)
+        }
+        Some(w) if w.uid == uid => {
+            // A counter that went backwards is a rebuild: this reading is entirely new evidence,
+            // and it CONTINUES the run the retiring capture was building.
+            (w.silent_run, raw_samples, raw_nonzero)
+        }
+        // No watch yet, or a different device: this reading is the whole of what we know.
+        _ => (0, raw_samples, raw_nonzero),
+    };
+    SilenceWatch {
+        uid: uid.to_string(),
+        prev_raw: raw_samples,
+        prev_nonzero: raw_nonzero,
+        silent_run: if d_nonzero > 0 { 0 } else { base.saturating_add(d_raw) },
+    }
+}
+
+/// Whether installing a capture may claim the audio fault is OVER.
+///
+/// Installing one says a stream was built, which is not the same fact as audio arriving through it.
+/// The retraction exists for the missing-capture path (roborev 55286), where the rebuild genuinely
+/// is the recovery; a device sitting on a standing silent run is the case where it is not, and
+/// claiming it there flaps the notice once per rebuild for as long as the churn lasts.
+fn install_retracts(reported: bool, watch: Option<&SilenceWatch>) -> bool {
+    reported && !watch.is_some_and(SilenceWatch::is_durably_silent)
+}
+
+/// The report latch's value AFTER an install, given whether that install retracted.
+///
+/// Named rather than inlined so the test drives the production expression instead of a copy of it —
+/// a guard tested against a re-spelled mechanism proves nothing the moment the two drift. The rule:
+/// a retraction consumes the latch (the notice is down, so there is nothing left to retract), while
+/// a WITHHELD retraction must preserve it, because `Recovered` is gated on `reported` and is the
+/// only remaining way the notice can ever come down.
+fn reported_after_install(reported: bool, retracted: bool) -> bool {
+    reported && !retracted
+}
+
 /// What the watchdog should do about the current reading.
 ///
 /// Pure (see [`fault_action`]) so the escalation order is unit-tested: we always try to RECOVER
@@ -1994,15 +2182,37 @@ enum FaultAction {
 /// `muted` is the device's own `kAudioDevicePropertyMute` reading, and it short-circuits the
 /// recovery attempt: rebuilding a stream cannot unmute hardware, so re-acquiring a muted device is
 /// pure churn that delays telling the user the one thing they need to hear.
+///
+/// `durably_silent` is [`SilenceWatch::is_durably_silent`] — a consecutive silent RUN for the bound
+/// device, folded across capture rebuilds. It makes the `Warming` arm below conditional, and that
+/// is the whole of the 2026-08-05 fix: a capture torn down and rebuilt every two seconds is forever
+/// "too early to judge" on its own, so a churning mic could never reach a verdict no matter how
+/// long the user talked at it. Cumulative evidence is not early.
+///
+/// WHAT IT DOES NOT PROVE, since the run semantics landed: it does NOT establish that rebuilding
+/// has already been tried. A run is reachable by a single capture sitting silent past the grace, so
+/// it is evidence of SILENCE, not of exhausted recovery — which is why the `NoFrames | Silent` arm
+/// still spends its one free re-acquire regardless of it. Read the note on that arm before widening
+/// this flag's reach again.
 fn fault_action(
     health: AudioHealth,
     muted: bool,
     reacquired: bool,
     reported: bool,
+    durably_silent: bool,
 ) -> FaultAction {
     match health {
-        // Too early to judge — a just-built stream has not necessarily delivered a buffer yet.
-        AudioHealth::Warming => FaultAction::Idle,
+        // Too early to judge THIS capture — a just-built stream has not necessarily delivered a
+        // buffer yet. But "this capture is young" is not the same as "we know nothing": if the same
+        // device has already handed us a second of pure zeros across earlier captures, waiting for
+        // one of them to survive the grace is waiting for something the churn prevents.
+        AudioHealth::Warming => {
+            if durably_silent && !reported {
+                FaultAction::Report
+            } else {
+                FaultAction::Idle
+            }
+        }
         // Audio is flowing. Retract a previous complaint, but only if we actually made one.
         AudioHealth::Live => {
             if reported {
@@ -2019,6 +2229,21 @@ fn fault_action(
             if reported {
                 FaultAction::Idle
             } else if muted || reacquired {
+                // `durably_silent` DELIBERATELY DOES NOT SHORT-CIRCUIT HERE, and it used to.
+                //
+                // The justification was that durable evidence proves "rebuilding is exactly what
+                // has already been happening", so a further re-acquire is wasted. That premise died
+                // with run semantics (knightwatch probe 3): a run is now reachable by ONE capture
+                // sitting silent past the grace — 4s is ~192k raw zeros against a 48k threshold —
+                // so a device that was voicing minutes ago, then went quiet across an ordinary
+                // blur/refocus rebuild, would skip its one free recovery attempt and go straight to
+                // accusing the user. Nothing on the `Report` path rebuilds the capture, so that
+                // reads as "we told you and then did nothing".
+                //
+                // This arm has a capture that SURVIVED the grace, which is the ordinary
+                // flapping-device case the free re-acquire exists for. The churn case — where the
+                // ladder cannot climb at all — is the `Warming` arm above, and that is the only
+                // place the cross-capture evidence is load-bearing.
                 FaultAction::Report
             } else {
                 FaultAction::Reacquire
@@ -2038,9 +2263,66 @@ const NO_CAPTURE_MESSAGE: &str =
     "Sparkle couldn't open a microphone. Connect one, then pick it in Sparkle's mic menu \
      (hover the mic).";
 
+/// The stale-grant report: macOS is handing this process pure digital silence from a microphone it
+/// says we are allowed to use.
+///
+/// ── THIS IS THE MESSAGE THE 2026-08-05 LOG WAS ASKING FOR ───────────────────────────────────────
+/// `watchdog_tick` has re-read TCC at the one moment it is diagnostic and already writes the
+/// contradiction to the log: `tcc=Authorized` alongside `zero_source=Os` means the grant is
+/// nominally live and the OS is delivering zeros anyway. The module's own comment spelled out what
+/// that means — "this process's mic grant is dead; restart Sparkle" — and then said none of it to
+/// the user, who instead got the generic branch below telling him another app was holding a
+/// microphone that nothing was holding. A remedy that sends someone hunting a fault that does not
+/// exist is worse than no remedy (AGENTS.md), so the evidence now picks the sentence.
+///
+/// Restart FIRST, Privacy pane last, and that order is the finding rather than a preference: the
+/// pane will show Sparkle already enabled — the grant is stale, not withheld — so leading with it
+/// sends the user to a switch that is already on. Re-launching is what re-establishes the grant.
+///
+/// ORDERED REMEDIES, NOT AN EXCLUSIVE DIAGNOSIS. `zero_source == Os` says only that the zeros came
+/// from the OS rather than from our own downmix, and audio.rs's own note records that a BUSY device
+/// reads exactly the same ("a muted or busy device, or the very fault this guard was written for");
+/// muted is ruled out by [`is_stale_grant`], held is not. Claiming the grant is dead would therefore
+/// be the original defect with the blame moved — a confident wrong cause. So the sentence leads with
+/// the free remedy that fixes the case this was written for and keeps the held-device check as the
+/// next step instead of denying it (knightwatch probe 1 on PR #1344).
+const STALE_GRANT_MESSAGE: &str =
+    "macOS is sending silence instead of audio from \"{device}\", even though Sparkle's microphone \
+     permission looks granted. Quit Sparkle and open it again — that usually re-establishes the \
+     grant. If it comes back, quit anything else that might be holding the mic (a video call or a \
+     screen recorder), then switch Sparkle off and on in System Settings → Privacy & Security → \
+     Microphone.";
+
+/// Whether this reading is the stale-grant signature rather than an ordinary dead mic.
+///
+/// All four conditions, because each one rules out a DIFFERENT story that has its own remedy: a
+/// muted device needs unmuting, a virtual device needs rebinding, `zero_source` other than `Os`
+/// means the zeros are ours or the stream never negotiated, and a TCC status that is NOT
+/// `Authorized` is an ordinary denial the permission path already words correctly. What is left is
+/// the one combination no other branch explains.
+fn is_stale_grant(
+    device: &crate::audio::BoundDevice,
+    muted: bool,
+    zero_source: ZeroSource,
+    tcc: crate::mic_permission::MicAuth,
+) -> bool {
+    !muted
+        && !device.is_virtual
+        && zero_source == ZeroSource::Os
+        && tcc == crate::mic_permission::MicAuth::Authorized
+}
+
 /// The whole of what [`FaultAction::Report`] says, for both device states.
-fn watchdog_report_message(device: Option<&crate::audio::BoundDevice>, muted: bool) -> String {
+fn watchdog_report_message(
+    device: Option<&crate::audio::BoundDevice>,
+    muted: bool,
+    zero_source: ZeroSource,
+    tcc: crate::mic_permission::MicAuth,
+) -> String {
     match device {
+        Some(d) if is_stale_grant(d, muted, zero_source, tcc) => {
+            STALE_GRANT_MESSAGE.replace("{device}", &d.name)
+        }
         Some(d) => no_audio_message(d, muted),
         None => NO_CAPTURE_MESSAGE.to_string(),
     }
@@ -2078,10 +2360,14 @@ fn watchdog_emission(
     action: FaultAction,
     device: Option<&crate::audio::BoundDevice>,
     muted: bool,
+    zero_source: ZeroSource,
+    tcc: crate::mic_permission::MicAuth,
 ) -> WatchdogEmission {
     match action {
         FaultAction::Idle | FaultAction::Reacquire => WatchdogEmission::Silent,
-        FaultAction::Report => WatchdogEmission::Error(watchdog_report_message(device, muted)),
+        FaultAction::Report => {
+            WatchdogEmission::Error(watchdog_report_message(device, muted, zero_source, tcc))
+        }
         FaultAction::Recovered => WatchdogEmission::Recovered,
     }
 }
@@ -2210,6 +2496,10 @@ impl DictationState {
         // The RAW-vs-converted evidence, sampled alongside the verdict so the fault log can say
         // WHO zeroed the audio. Defaults are the "no capture to measure" reading.
         let mut counts = SampleCounts::default();
+        // Whether this DEVICE has produced enough zeros across enough captures to be judged, even
+        // if the capture in front of us right now is too young to judge on its own. See
+        // `SilenceWatch` for the churn this defeats.
+        let mut durably_silent = false;
         // Sample under the lock, then RELEASE before doing anything that emits or touches audio.
         let sampled = {
             let mut sess = self.0.lock().unwrap_or_else(|p| p.into_inner());
@@ -2232,6 +2522,19 @@ impl DictationState {
                     };
                     // Ends the borrow of `sess.capture` before the counter reset below.
                     sess.audio_missing_ticks = 0;
+                    // Fold this reading into the evidence that OUTLIVES this capture. Keyed by UID,
+                    // so a device with no UID (rare, but the type allows it) simply gets no durable
+                    // watch rather than sharing one with every other unnamed device.
+                    if let Some(uid) = device.uid.as_deref() {
+                        let folded = fold_silence_evidence(
+                            sess.silence_watch.take(),
+                            uid,
+                            counts.raw_samples,
+                            counts.raw_nonzero,
+                        );
+                        durably_silent = folded.is_durably_silent();
+                        sess.silence_watch = Some(folded);
+                    }
                     Some((health, Some(device), sess.audio_reacquired, sess.audio_reported))
                 }
                 // The mic SHOULD be capturing but there is no capture. That is what a FAILED
@@ -2285,7 +2588,11 @@ impl DictationState {
             .and_then(crate::audio_devices::is_muted)
             .unwrap_or(false);
 
-        let action = fault_action(health, muted, reacquired, reported);
+        let action = fault_action(health, muted, reacquired, reported, durably_silent);
+        // The TCC status, read only on the path that needs it (the Report arm below sets it). It
+        // feeds BOTH the fault log and — new as of the 2026-08-05 fix — the sentence the user reads,
+        // so the contradiction the log has always recorded is now the thing that picks the remedy.
+        let mut tcc = crate::mic_permission::MicAuth::Authorized;
         match action {
             FaultAction::Idle => {}
             FaultAction::Reacquire => {
@@ -2315,7 +2622,7 @@ impl DictationState {
                 // contradiction: `Authorized` alongside `zero_source=Os` is the stale-grant
                 // reading, and it is the difference between "your microphone is broken" (it is
                 // not) and "this process's mic grant is dead; restart Sparkle" (it is).
-                let tcc = crate::mic_permission::status();
+                tcc = crate::mic_permission::status();
                 tracing::error!(
                     target: "dictation",
                     device = device.as_ref().map(|d| d.name.as_str()).unwrap_or("<none>"),
@@ -2335,13 +2642,19 @@ impl DictationState {
                     device = device.as_ref().map(|d| d.name.as_str()).unwrap_or("<none>"),
                     "audio is arriving again"
                 );
-                self.0.lock().unwrap_or_else(|p| p.into_inner()).clear_audio_fault();
+                let mut sess = self.0.lock().unwrap_or_else(|p| p.into_inner());
+                sess.clear_audio_fault();
+                // Retire the cross-capture evidence too. This is the one place it is right to: the
+                // device is demonstrably voiced now, so the zeros we banked describe a state that is
+                // over. Leaving it would let a device that recovered stay permanently one tick away
+                // from being re-reported.
+                sess.silence_watch = None;
             }
         }
         // EVERY user-visible output of this tick, decided in one tested place and dispatched here.
         // This site holds no copy and makes no choice about who gets told what — see
         // `WatchdogEmission` for why that separation is the point rather than tidiness.
-        match watchdog_emission(action, device.as_ref(), muted) {
+        match watchdog_emission(action, device.as_ref(), muted, counts.zero_source, tcc) {
             WatchdogEmission::Silent => {}
             WatchdogEmission::Error(message) => {
                 let _ = app.emit("dictation://error", message);
@@ -2456,13 +2769,53 @@ unsafe impl Sync for DictationState {}
 /// precisely the crash `verify_for_load` exists to prevent, and a concurrent promote defeats it: the
 /// hole is between that check and the open, so no amount of checking first can close it.
 ///
-/// Hence the lock must span ensure + verify_for_load + `ParakeetTdt::new` — the whole
-/// verify-then-open sequence — not just the download. Narrowing it to `ensure` reopens the crash.
+/// Hence the lock must span ensure + verify_for_load + the recognizer open (`ParakeetTdt::armed`,
+/// whether it loads or is served from the decoder cache) — the whole verify-then-open sequence —
+/// not just the download. Narrowing it to `ensure` reopens the crash.
 ///
 /// Taken only inside `spawn_blocking` (never across an await) and never together with the session
 /// lock, so it cannot deadlock against either. Poison-tolerant, like every other lock here: a
 /// panicked load must not brick the mic for the rest of the process's life.
 static MODEL_LOAD: Mutex<()> = Mutex::new(());
+
+/// Forget the cached decoder, because a worker teardown had to DETACH may still be inside
+/// `Decoder::transcribe` — which holds the recognizer mutex for the whole FFI decode, for as long
+/// as it stays wedged. Reuse it and every later arm's decode worker blocks on that lock, its queue
+/// fills, and the callback drops segments: dictation silently deaf for the life of the process.
+/// That is strictly worse than the ONE reload this cache exists to avoid, so the next arm pays it.
+/// Before the cache the detached thread held only its own per-arm recognizer, so the wedge cost
+/// nothing but a parked thread; sharing the decoder is what turned it into a process-wide outage.
+///
+/// Contention on this lock is only possible against a COLD load — `cached_or_build` holds the slot
+/// across `load_decoder` (the ONNX init, not the download); a warm hit holds it for one clone. The
+/// detach path already spent `DECODE_JOIN_TIMEOUT` waiting, so that rare extra wait is in budget.
+///
+/// The slot itself lives in `transcribe`, beside the constructors, so `load_decoder` and
+/// `with_decoder` can stay private and `ParakeetTdt::armed` can be the only reachable session
+/// constructor — see its doc. This is the one thing outside that module allowed to clear it.
+fn retire_cached_decoder() {
+    crate::transcribe::retire_cached_decoder();
+    #[cfg(test)]
+    DECODERS_RETIRED.fetch_add(1, Ordering::Release);
+}
+
+/// Serializes every test that can DETACH a decode worker.
+///
+/// `retire_cached_decoder` bumps the process-global `DECODERS_RETIRED`, and
+/// `only_a_detaching_teardown_retires_the_cached_decoder` asserts a DELTA of exactly one across a
+/// single teardown. cargo runs tests in parallel, so without this the other detaching teardowns land
+/// inside that window and the delta reads 4 where the test expects 1 — observed exactly that, and it
+/// would have been a red CI check rather than a local curiosity, since the failure needs parallelism.
+///
+/// Poison-tolerant like every other lock here: one failing test must not cascade into the rest.
+#[cfg(test)]
+static DETACH_TESTS: Mutex<()> = Mutex::new(());
+
+/// Test-only observable. The slot holds an `Arc<Decoder>`, which cannot exist without the ~661 MB
+/// model, so a test can never seed it and watch it clear — counting the retires is the only way to
+/// drive the real `Drop` end to end and assert which branch of it fired.
+#[cfg(test)]
+static DECODERS_RETIRED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// The slow half of `start_dictation`, factored out so the serialization above is impossible to
 /// apply to only part of it. Blocking and lock-holding — callers MUST run it off the main thread.
@@ -2477,7 +2830,11 @@ fn load_model(root: &std::path::Path, progress: impl Fn(u64, Option<u64>)) -> Re
     // re-downloads it. Sound only because MODEL_LOAD means no other promote can run between this
     // check and the open below.
     model::verify_for_load(root, &paths)?;
-    ParakeetTdt::new(&paths)
+    // The ONNX recognizer is loaded at most once per process; only the per-arm VAD/window are
+    // rebuilt here. `armed` is the ONLY session constructor this module can reach — the uncached
+    // ones are private to `transcribe` — so the per-arm reload that broke dictation is not something
+    // this call site can drift back into. See `ParakeetTdt::armed`.
+    ParakeetTdt::armed(&paths)
 }
 
 /// Arm the mic, downloading + loading the on-device model first if this is a fresh install.
@@ -2671,6 +3028,10 @@ pub async fn start_dictation(app: AppHandle, state: State<'_, DictationState>) -
     // them from this async-runtime worker — while the main thread waits on the SAME lock in the
     // Focused handler — was the sparkle-sfxu launch deadlock. reconcile_capture also re-validates the
     // arm intent under the lock before installing, so a stop/blur landing in this gap is handled.
+    // The ARM itself was silent too — the counterpart to the reconcile logging above. Without it the
+    // log showed only the starts that COALESCED or ABORTED, so "did anything ever actually arm?"
+    // could not be answered, and a wrong inference about it cost hours on 2026-08-05.
+    tracing::info!(target: "dictation", "start_dictation armed the session; reconciling capture");
     drop(sess);
     // Builds the capture now iff a window is focused; otherwise the focus event brings it up later.
     state.reconcile_capture(&app);
@@ -3173,6 +3534,7 @@ pub async fn stop_dictation(app: AppHandle, state: State<'_, DictationState>) ->
 #[cfg(test)]
 mod tests {
     use super::{AppHandle, State, AudioHealth, FaultAction, fault_action, no_audio_message,
+        fold_silence_evidence, install_retracts, reported_after_install, watchdog_report_message, ZeroSource,
         missing_tick, build_suppresses_watch, BUILD_STALL_GRACE, DictationSession, MISSING_CAPTURE_TICKS, watchdog_emission, WatchdogEmission,
         begin_start_decision, capture_should_be_live, choose_engine, cloud_reuse, frame_on_device_speech, frame_speaking, segment_cloud_latch, park_cloud_for_blur, plan_capture,
         apply_decode_plan, plan_decode_emit, DecodeEmitPlan, DecodeEmitSink, DecodeOutcome,
@@ -3451,6 +3813,7 @@ mod tests {
     // caller is — or is blocking — the main thread.
     #[test]
     fn dropping_a_worker_that_never_exits_gives_up_instead_of_blocking_forever() {
+        let _serial = super::DETACH_TESTS.lock().unwrap_or_else(|p| p.into_inner());
         let wedged = Arc::new(AtomicBool::new(true));
         let wedged_thread = wedged.clone();
         let (_exited_tx, exited) = channel::<()>();
@@ -3525,6 +3888,7 @@ mod tests {
     // test; it shares the exact teardown shape with `reconcile_locked`, which the same change fixed.
     #[test]
     fn a_teardown_does_not_hold_the_session_lock_while_waiting_for_the_decode_worker() {
+        let _serial = super::DETACH_TESTS.lock().unwrap_or_else(|p| p.into_inner());
         let wedged = Arc::new(AtomicBool::new(true));
         let wedged_thread = wedged.clone();
         let (_exited_tx, exited) = channel::<()>();
@@ -3580,6 +3944,7 @@ mod tests {
     // detach, which is precisely the defect: the caller is unblocked while the thread runs forever.
     #[test]
     fn dropping_an_un_aborted_worker_over_a_live_sender_still_terminates_the_thread() {
+        let _serial = super::DETACH_TESTS.lock().unwrap_or_else(|p| p.into_inner());
         let (tx, rx) = sync_channel::<Vec<f32>>(4);
         let abort = Arc::new(AtomicBool::new(false));
         let abort_worker = abort.clone();
@@ -3721,6 +4086,7 @@ mod tests {
     // whose callers are discarding the backlog); both set the flag, the drain escalation does not.
     #[test]
     fn a_decode_finishing_after_the_worker_was_detached_does_not_emit() {
+        let _serial = super::DETACH_TESTS.lock().unwrap_or_else(|p| p.into_inner());
         assert!(
             emits_after_teardown_flags(false, true).is_empty(),
             "a detached worker emitted past teardown — that fragment lands after dictation://final"
@@ -3742,6 +4108,7 @@ mod tests {
     // is released during the grace. It must still reach `emit`.
     #[test]
     fn a_drain_escalation_still_lets_the_in_flight_decode_emit() {
+        let _serial = super::DETACH_TESTS.lock().unwrap_or_else(|p| p.into_inner());
         let (tx, rx) = sync_channel::<Vec<f32>>(4);
         let abort = Arc::new(AtomicBool::new(false));
         let emits_are_unsafe = Arc::new(AtomicBool::new(false));
@@ -3809,6 +4176,7 @@ mod tests {
     // the user just muted. Drives the real `abort()` + real `Drop`, and asserts the side effect.
     #[test]
     fn a_worker_aborted_to_abandon_its_backlog_emits_nothing_for_the_in_flight_segment() {
+        let _serial = super::DETACH_TESTS.lock().unwrap_or_else(|p| p.into_inner());
         let (tx, rx) = sync_channel::<Vec<f32>>(4);
         let abort = Arc::new(AtomicBool::new(false));
         let emits_are_unsafe = Arc::new(AtomicBool::new(false));
@@ -3858,6 +4226,7 @@ mod tests {
     // `run_decode_loop`, and assert the SIDE EFFECT: the released decode emits nothing.
     #[test]
     fn a_real_teardown_that_detaches_silences_the_worker_it_left_running() {
+        let _serial = super::DETACH_TESTS.lock().unwrap_or_else(|p| p.into_inner());
         let (tx, rx) = sync_channel::<Vec<f32>>(4);
         let abort = Arc::new(AtomicBool::new(false));
         let emits_are_unsafe = Arc::new(AtomicBool::new(false));
@@ -3903,6 +4272,94 @@ mod tests {
              fragment lands after dictation://final, re-populating the composer and re-arming \
              auto-send over speech the user already finished"
         );
+        drop(tx);
+    }
+
+    /// THE CACHE'S ONE SHARP EDGE (knightwatch 5198234927#1). `DECODER_CACHE` hands every arm the
+    /// SAME `Arc<Decoder>`, and `Decoder::transcribe` holds the recognizer mutex for the whole FFI
+    /// decode. A worker teardown had to DETACH is wedged by definition — plausibly inside that very
+    /// decode — so it keeps that mutex. Before the cache that cost one parked thread holding its own
+    /// per-arm recognizer; with it, every later arm's worker blocks on `recognizer.lock()`, its
+    /// queue fills, and the callback drops segments: the mic goes deaf for the life of the process.
+    ///
+    /// BOTH directions are asserted here, in ONE test on purpose: the counter is process-global, so
+    /// two tests reading it would race each other. The negative half is the load-bearing one —
+    /// retiring on an ORDINARY teardown would re-run the ONNX init on every push-to-talk release,
+    /// which IS the founder-blocking regression this PR exists to remove.
+    #[test]
+    fn only_a_detaching_teardown_retires_the_cached_decoder() {
+        let _serial = super::DETACH_TESTS.lock().unwrap_or_else(|p| p.into_inner());
+        use std::sync::atomic::Ordering as AtomicOrdering;
+        let retires = || super::DECODERS_RETIRED.load(AtomicOrdering::Acquire);
+
+        // ── The ordinary teardown: the worker observes the abort and exits, so `Drop` joins it.
+        let before_ordinary = retires();
+        let (tx, rx) = sync_channel::<Vec<f32>>(4);
+        let abort = Arc::new(AtomicBool::new(false));
+        let abort_worker = abort.clone();
+        let (exited_tx, exited) = channel::<()>();
+        let handle = std::thread::spawn(move || {
+            let _exited_tx = exited_tx;
+            run_decode_loop(&rx, &abort_worker, &never(), |_: Vec<f32>| {}, |()| {});
+        });
+        let worker = DecodeWorker {
+            handle: Some(handle),
+            abort,
+            emits_are_unsafe: Arc::new(AtomicBool::new(false)),
+            exited,
+        };
+        worker.abort();
+        within(Duration::from_secs(20), "dropping a healthy worker", move || drop(worker));
+        assert_eq!(
+            retires(),
+            before_ordinary,
+            "a teardown that JOINED its worker retired the cached decoder anyway — that makes every \
+             push-to-talk release pay for another ONNX init, which is exactly the multi-second \
+             window the release lands in, and the mic goes deaf again",
+        );
+        drop(tx);
+
+        // ── The detach: a worker wedged inside the decode, so `Drop` gives up and leaves it running
+        // while it still holds the recognizer mutex the cached decoder is made of.
+        let (tx, rx) = sync_channel::<Vec<f32>>(4);
+        let abort = Arc::new(AtomicBool::new(false));
+        let abort_loop = abort.clone();
+        let (in_decode_tx, in_decode_rx) = channel::<()>();
+        let (release_tx, release_rx) = channel::<()>();
+        let (exited_tx, exited) = channel::<()>();
+        let handle = std::thread::spawn(move || {
+            let _exited_tx = exited_tx;
+            run_decode_loop(
+                &rx,
+                &abort_loop,
+                &never(),
+                move |samples: Vec<f32>| {
+                    let _ = in_decode_tx.send(());
+                    let _ = release_rx.recv(); // wedged: it ignores the abort, forcing the detach
+                    samples[0]
+                },
+                |_| {},
+            );
+        });
+        let worker = DecodeWorker {
+            handle: Some(handle),
+            abort,
+            emits_are_unsafe: Arc::new(AtomicBool::new(false)),
+            exited,
+        };
+        tx.send(vec![42.0]).expect("queue a segment");
+        in_decode_rx.recv_timeout(Duration::from_secs(5)).expect("worker reached the decode");
+
+        within(Duration::from_secs(20), "tearing down a wedged worker", move || drop(worker));
+
+        assert_eq!(
+            retires(),
+            before_ordinary + 1,
+            "teardown detached a worker that may still be inside Decoder::transcribe and left the \
+             cached decoder installed — every later arm now blocks on that recognizer mutex, so \
+             dictation is silently deaf for the rest of the process",
+        );
+        let _ = release_tx.send(());
         drop(tx);
     }
 
@@ -3987,12 +4444,12 @@ mod tests {
         // So: silent recovery FIRST, complain only if that failed.
         for health in [AudioHealth::NoFrames, AudioHealth::Silent] {
             assert_eq!(
-                fault_action(health, false, false, false),
+                fault_action(health, false, false, false, false),
                 FaultAction::Reacquire,
                 "{health:?} must first try to recover silently"
             );
             assert_eq!(
-                fault_action(health, false, true, false),
+                fault_action(health, false, true, false, false),
                 FaultAction::Report,
                 "{health:?} that survived a re-acquire must reach the user"
             );
@@ -4003,24 +4460,24 @@ mod tests {
     fn the_user_is_told_once_per_capture_not_once_per_poll() {
         // The watchdog ticks every second. Without the `reported` latch a dead mic would emit an
         // error 540 times over the nine minutes this bug actually lasted.
-        assert_eq!(fault_action(AudioHealth::Silent, false, true, true), FaultAction::Idle);
-        assert_eq!(fault_action(AudioHealth::NoFrames, false, true, true), FaultAction::Idle);
+        assert_eq!(fault_action(AudioHealth::Silent, false, true, true, false), FaultAction::Idle);
+        assert_eq!(fault_action(AudioHealth::NoFrames, false, true, true, false), FaultAction::Idle);
     }
 
     #[test]
     fn a_permanently_dead_device_does_not_re_acquire_forever() {
         // The failure mode of a naive retry loop: rebuild, still dead, rebuild… never surfacing.
         // Once we have spent the one free attempt, the next verdict must escalate, not retry.
-        assert_ne!(fault_action(AudioHealth::Silent, false, true, false), FaultAction::Reacquire);
+        assert_ne!(fault_action(AudioHealth::Silent, false, true, false, false), FaultAction::Reacquire);
     }
 
     #[test]
     fn recovery_is_announced_only_if_something_was_announced_first() {
         // Retracting a notice nobody saw would clear an UNRELATED error the user does need — the
         // frontend keys its "audio is back" handling off this event.
-        assert_eq!(fault_action(AudioHealth::Live, false, true, true), FaultAction::Recovered);
+        assert_eq!(fault_action(AudioHealth::Live, false, true, true, false), FaultAction::Recovered);
         assert_eq!(
-            fault_action(AudioHealth::Live, false, true, false),
+            fault_action(AudioHealth::Live, false, true, false, false),
             FaultAction::Idle,
             "healthy audio with no complaint outstanding must not emit a retraction"
         );
@@ -4029,10 +4486,335 @@ mod tests {
     #[test]
     fn a_warming_capture_is_never_condemned_or_recovered() {
         // Before the grace window expires we have no evidence either way; acting on it would emit
-        // a spurious fault on every single rebuild.
+        // a spurious fault on every single rebuild. Still true — but only for a capture we have no
+        // OTHER evidence about, which is what the `false` in the last position now says. The
+        // companion case (evidence carried over from earlier captures) is the test below.
         for (reacquired, reported) in [(false, false), (true, false), (true, true)] {
-            assert_eq!(fault_action(AudioHealth::Warming, false, reacquired, reported), FaultAction::Idle);
+            assert_eq!(
+                fault_action(AudioHealth::Warming, false, reacquired, reported, false),
+                FaultAction::Idle
+            );
         }
+    }
+
+    /// THE 2026-08-05 SILENCE, AT THE DECISION THAT SWALLOWED IT.
+    ///
+    /// A stop landing during each model load tore the capture down every ~2s — under the 4s grace —
+    /// so `assess_capture_health` answered `Warming` on nearly every tick and the escalation ladder
+    /// was reset by the next rebuild before it could be climbed. Six minutes, one `Reacquire`, no
+    /// `Report`, and a founder talking to a dead microphone.
+    ///
+    /// The assertion is on the OUTPUT (a Report is produced) rather than on the input flag, so it
+    /// fails if the `Warming` arm ever goes back to an unconditional `Idle`.
+    #[test]
+    fn cross_capture_silence_evidence_breaks_through_the_warming_gate() {
+        // The exact shape of the churn: a young capture, no per-capture latch spent, and nothing
+        // yet reported — the state every one of those six minutes' ticks was in.
+        assert_eq!(
+            fault_action(AudioHealth::Warming, false, false, false, true),
+            FaultAction::Report,
+            "a capture too young to judge, on a device already proven silent, must still speak up"
+        );
+        // Once said, it is not said again — the churn would otherwise emit an error every second.
+        assert_eq!(
+            fault_action(AudioHealth::Warming, false, false, true, true),
+            FaultAction::Idle,
+            "the report latch still holds under durable silence"
+        );
+        // And durable evidence must not invent a fault on a HEALTHY capture.
+        assert_eq!(
+            fault_action(AudioHealth::Live, false, false, false, true),
+            FaultAction::Idle
+        );
+    }
+
+    /// THE STALE-GRANT REPORT NAMES A CAUSE, AND IT IS NOT THE GENERIC ONE.
+    ///
+    /// The 2026-08-05 reading — built-in mic, not muted, not virtual, `zero_source=Os`,
+    /// `tcc=Authorized` — used to produce "Another app … may be holding the microphone", sending the
+    /// founder to hunt a screen recorder that did not exist. Asserted through `watchdog_emission`
+    /// (the real dispatch path) rather than the message helper, so a Report that stopped consulting
+    /// the evidence would fail here.
+    #[test]
+    fn os_silence_on_an_authorized_grant_is_reported_as_a_permission_fault() {
+        let physical = crate::audio::BoundDevice {
+            name: "MacBook Pro Microphone".into(),
+            uid: Some("BuiltInMicrophoneDevice".into()),
+            is_virtual: false,
+            was_default: true,
+        };
+        let WatchdogEmission::Error(msg) = watchdog_emission(
+            FaultAction::Report,
+            Some(&physical),
+            false,
+            ZeroSource::Os,
+            crate::mic_permission::MicAuth::Authorized,
+        ) else {
+            panic!("a Report must speak");
+        };
+        assert!(msg.contains("MacBook Pro Microphone"), "the device is still named: {msg}");
+        assert!(
+            msg.to_lowercase().contains("permission"),
+            "the cause the log already knew must reach the user: {msg}"
+        );
+        assert!(
+            msg.contains("Quit Sparkle"),
+            "the remedy that actually re-establishes the grant must be named: {msg}"
+        );
+        // ORDER, not absence. `zero_source=Os` covers a held device too (audio.rs says so), so
+        // denying that possibility would be a confident wrong cause — the original defect with the
+        // blame moved. What must hold is that the free remedy that fixes the observed case leads,
+        // and the held-device check follows it (knightwatch probe 1).
+        let restart = msg.find("Quit Sparkle").expect("the relaunch remedy must be present: {msg}");
+        let held = msg.find("holding the mic").expect("the held-device check must survive: {msg}");
+        assert!(restart < held, "relaunch must be offered BEFORE hunting another app: {msg}");
+        assert!(
+            !msg.contains("Another app (a screen recorder"),
+            "must not fall back to the generic no-audio sentence, which leads with the wrong cause: \
+             {msg}"
+        );
+
+        // THE DISCRIMINATOR. Same silence, but our own downmix ate it (`SelfInflicted`) — that is a
+        // Sparkle bug, not a grant problem, and must keep the generic wording rather than sending
+        // the user to quit and relaunch over a fault relaunching cannot fix.
+        let WatchdogEmission::Error(ours) = watchdog_emission(
+            FaultAction::Report,
+            Some(&physical),
+            false,
+            ZeroSource::SelfInflicted,
+            crate::mic_permission::MicAuth::Authorized,
+        ) else {
+            panic!("a Report must speak");
+        };
+        assert!(
+            !ours.contains("Quit Sparkle"),
+            "only the OS-sourced zeros earn the restart remedy: {ours}"
+        );
+
+        // A muted device keeps its own message: unmuting is the fix, and it outranks the grant story.
+        let WatchdogEmission::Error(muted) = watchdog_emission(
+            FaultAction::Report,
+            Some(&physical),
+            true,
+            ZeroSource::Os,
+            crate::mic_permission::MicAuth::Authorized,
+        ) else {
+            panic!("a Report must speak");
+        };
+        assert!(muted.contains("is muted"), "a muted device is still named as muted: {muted}");
+    }
+
+    /// The cross-language pin the `BACKEND_NO_AUDIO_PREFIX` comment asked for and never got ("HALF A
+    /// PIN, deliberately noted as such"). The frontend routes this message by its opening clause, so
+    /// a reword here silently drops the user into the `permission` bucket — whose remedy points at a
+    /// switch that is already on in exactly this state.
+    #[test]
+    fn the_stale_grant_message_matches_the_prefix_the_frontend_pins() {
+        let pinned = std::fs::read_to_string("../src/voice/backendVoiceErrors.ts")
+            .expect("read the frontend contract file");
+        // The literal is SINGLE-quoted in the TS (like BACKEND_NO_AUDIO_PREFIX beside it) precisely
+        // so it can contain a bare `"` and be read back with a naive split. A double-quoted literal
+        // would need `\"` inside it, and this parse would stop at the backslash — which is exactly
+        // what it did on the first run, so the failure mode is not hypothetical.
+        let want = pinned
+            .split("BACKEND_STALE_GRANT_PREFIX =")
+            .nth(1)
+            .and_then(|s| s.split('\'').nth(1))
+            .expect("BACKEND_STALE_GRANT_PREFIX literal (single-quoted)");
+        let device = crate::audio::BoundDevice {
+            name: "MacBook Pro Microphone".into(),
+            uid: Some("BuiltInMicrophoneDevice".into()),
+            is_virtual: false,
+            was_default: true,
+        };
+        let msg = watchdog_report_message(
+            Some(&device),
+            false,
+            ZeroSource::Os,
+            crate::mic_permission::MicAuth::Authorized,
+        );
+        assert!(
+            msg.starts_with(&want),
+            "backend message and frontend pin have drifted:\n  backend: {msg}\n  pinned:  {want}"
+        );
+    }
+
+    /// THE FOLD, at the transition it exists for: a capture REPLACED mid-silence.
+    ///
+    /// Asserts the accumulated run, not the struct's shape — a fold that dropped the retiring
+    /// capture's samples would leave the run at the new capture's count and never reach the
+    /// threshold, which is the production bug in miniature.
+    #[test]
+    fn silence_evidence_survives_the_capture_being_rebuilt_under_it() {
+        // A capture that saw 30k silent samples and then died — on its own, under the threshold.
+        let first = fold_silence_evidence(None, "BuiltInMicrophoneDevice", 30_000, 0);
+        assert!(!first.is_durably_silent(), "one short capture is not yet evidence");
+
+        // Rebuild: the fresh Capture's counter restarts near zero. THIS is the transition — a naive
+        // implementation reads it as "samples went down" and either resets or double-counts.
+        let second = fold_silence_evidence(Some(first), "BuiltInMicrophoneDevice", 5_000, 0);
+        assert_eq!(second.silent_run, 35_000, "the retiring capture's samples must be kept");
+        assert!(!second.is_durably_silent());
+
+        // Same capture, later tick: add only the DELTA, or one capture sampled every second would
+        // count its own samples once per tick and cross the threshold on timing alone.
+        let same = fold_silence_evidence(Some(second), "BuiltInMicrophoneDevice", 20_000, 0);
+        assert_eq!(same.silent_run, 50_000, "a newer reading contributes its delta, not its total");
+        assert!(
+            same.is_durably_silent(),
+            "30k + 20k of unbroken zeros from one device is a verdict, however it was split"
+        );
+    }
+
+    #[test]
+    fn silence_evidence_resets_on_a_different_device_and_on_any_voiced_sample() {
+        let silent = fold_silence_evidence(None, "BuiltInMicrophoneDevice", 60_000, 0);
+        assert!(silent.is_durably_silent());
+
+        // A DIFFERENT device is a different question — it must not inherit the old one's verdict.
+        let other = fold_silence_evidence(Some(silent.clone()), "USBMicrophone", 1_000, 0);
+        assert_eq!(other.silent_run, 1_000, "a device change starts the evidence over");
+        assert!(!other.is_durably_silent());
+
+        // A voiced sample in THIS tick's delta ends the run: the device is reaching us now, so the
+        // zeros behind it describe a state that is over.
+        let voiced = fold_silence_evidence(Some(silent), "BuiltInMicrophoneDevice", 70_000, 1);
+        assert!(
+            !voiced.is_durably_silent(),
+            "one non-zero sample means audio is reaching us; that is not a silent device"
+        );
+        assert_eq!(voiced.silent_run, 0, "the run restarts from the voiced sample, not from zero-ish");
+    }
+
+    /// A MIC THAT WORKED AND THEN DIED — the case a lifetime total could never report.
+    ///
+    /// The first version of this struct required the total non-zero count to be zero, so one voiced
+    /// sample from earlier in the session disqualified every second of silence that followed it
+    /// (knightwatch probe 2). That is the ordinary shape of a mic another app grabs mid-session, and
+    /// it is precisely when the user is talking and being heard by nobody.
+    #[test]
+    fn a_device_that_voiced_earlier_can_still_be_judged_silent_later() {
+        // Working: audio flowing, the run stays at zero however many samples arrive.
+        let mut w = fold_silence_evidence(None, "BuiltInMicrophoneDevice", 100_000, 40_000);
+        w = fold_silence_evidence(Some(w), "BuiltInMicrophoneDevice", 150_000, 60_000);
+        assert!(!w.is_durably_silent(), "a voiced device is not silent");
+
+        // Then it dies: every later delta is pure zeros, and only those deltas count.
+        w = fold_silence_evidence(Some(w), "BuiltInMicrophoneDevice", 190_000, 60_000);
+        assert_eq!(w.silent_run, 40_000, "only the silence SINCE the last voiced sample counts");
+        assert!(!w.is_durably_silent(), "40k is still under the threshold");
+        w = fold_silence_evidence(Some(w), "BuiltInMicrophoneDevice", 240_000, 60_000);
+        assert!(
+            w.is_durably_silent(),
+            "a mic that stopped delivering mid-session must become reportable, not be excused by \
+             audio it delivered ten minutes ago"
+        );
+    }
+
+    /// The one imprecision, pinned in the direction it is allowed to be wrong: a rebuild whose fresh
+    /// counter is ABOVE the retiring one's last reading cannot be distinguished from the same
+    /// capture advancing, so its delta is understated (knightwatch probe 3). Understating delays a
+    /// verdict; overstating would invent one, and only the second is a bug the user can see.
+    #[test]
+    fn an_indistinguishable_rebuild_undercounts_and_never_overcounts() {
+        let first = fold_silence_evidence(None, "BuiltInMicrophoneDevice", 30_000, 0);
+        // The replacement's own count (40k) exceeds the retiring capture's last (30k), so this reads
+        // as the same capture advancing. TRUE evidence is 30k + 40k = 70k; we credit 40k.
+        let after = fold_silence_evidence(Some(first), "BuiltInMicrophoneDevice", 40_000, 0);
+        assert_eq!(after.silent_run, 40_000, "the delta, not the sum — an UNDER-count by design");
+        assert!(
+            after.silent_run <= 70_000,
+            "the fold must never credit more silence than the device actually produced"
+        );
+    }
+
+    /// A REBUILD IS NOT EVIDENCE OF AUDIO.
+    ///
+    /// `install_capture` retracts a standing notice so the missing-capture path can recover (roborev
+    /// 55286). Under the churn this PR is about, that same retraction fires once per rebuild — so
+    /// the user would watch the warning appear and vanish every couple of seconds while the mic
+    /// stayed dead. Real recovery is unaffected: it comes from the watchdog's `Recovered` arm, which
+    /// has seen a voiced sample.
+    #[test]
+    fn installing_a_capture_does_not_retract_a_notice_the_evidence_still_supports() {
+        let silent = fold_silence_evidence(None, "BuiltInMicrophoneDevice", 60_000, 0);
+        assert!(silent.is_durably_silent(), "fixture must actually be durably silent");
+        assert!(
+            !install_retracts(true, Some(&silent)),
+            "a rebuild on a provably silent device must not claim the fault is over"
+        );
+        // The path the retraction exists for is untouched: no evidence of silence, so a rebuild is
+        // still the only recovery signal the missing-capture case ever gets.
+        assert!(install_retracts(true, None), "the missing-capture retraction must still fire");
+        let voiced = fold_silence_evidence(None, "BuiltInMicrophoneDevice", 60_000, 10);
+        assert!(install_retracts(true, Some(&voiced)));
+        // And nothing is retracted when nothing was ever reported.
+        assert!(!install_retracts(false, None));
+    }
+
+    /// Durable evidence spends no second recovery attempt: rebuilding is precisely what has already
+    /// been happening, so another grace period of silence helps nobody.
+    #[test]
+    fn a_durably_silent_device_still_gets_its_one_free_re_acquire() {
+        // THE SHORT-CIRCUIT WAS REMOVED, and this is the test that used to assert it (knightwatch
+        // probe 3). A run is reachable by ONE capture sitting silent past the 4s grace — ~192k raw
+        // zeros against a 48k threshold — so a device that voiced minutes ago and then went quiet
+        // across an ordinary blur/refocus rebuild would have skipped recovery entirely and gone
+        // straight to accusing the user, with nothing on the Report path to rebind it.
+        assert_eq!(
+            fault_action(AudioHealth::Silent, false, false, false, true),
+            FaultAction::Reacquire,
+            "durable silence is evidence of SILENCE, not of exhausted recovery"
+        );
+        // Unchanged: without the evidence, same answer. The two now agree by construction, which is
+        // the point — this arm's behaviour no longer depends on the cross-capture flag at all.
+        assert_eq!(
+            fault_action(AudioHealth::Silent, false, false, false, false),
+            FaultAction::Reacquire
+        );
+        // The genuine short-circuits are untouched: a muted device, and a spent re-acquire.
+        assert_eq!(
+            fault_action(AudioHealth::Silent, true, false, false, true),
+            FaultAction::Report
+        );
+        assert_eq!(
+            fault_action(AudioHealth::Silent, false, true, false, true),
+            FaultAction::Report
+        );
+    }
+
+    /// A WITHHELD RETRACTION MUST NOT ALSO REMOVE THE ROUTE BACK DOWN.
+    ///
+    /// `install_retracts` correctly refuses to claim recovery on a provably silent device, but the
+    /// install then cleared `audio_reported` anyway — and `Recovered` is gated on exactly that
+    /// latch. So if the REBUILD was what fixed the mic (the remedy the copy tells the user to try),
+    /// the voiced tick found `reported == false` and returned `Idle`: no all-clear, ever, and the
+    /// sticky frontend error stood over a working microphone.
+    ///
+    /// Composed through the production helpers rather than re-spelling the expression, so the two
+    /// cannot drift; asserts the OUTPUT (`Recovered` fires) rather than the latch's value.
+    #[test]
+    fn a_withheld_retraction_keeps_the_latch_that_real_recovery_needs() {
+        let silent = fold_silence_evidence(None, "BuiltInMicrophoneDevice", 60_000, 0);
+        assert!(silent.is_durably_silent(), "fixture must actually be durably silent");
+
+        let retract = install_retracts(true, Some(&silent));
+        assert!(!retract, "a rebuild on a provably silent device claims nothing");
+        let reported = reported_after_install(true, retract);
+        assert!(reported, "the withheld retraction must PRESERVE the report latch");
+
+        // The rebuild turns out to have fixed it: the next tick sees audio. That must retract.
+        assert_eq!(
+            fault_action(AudioHealth::Live, false, false, reported, false),
+            FaultAction::Recovered,
+            "recovery-by-rebuild must still be able to bring the notice down"
+        );
+
+        // And a retraction that DID fire consumes the latch, so it cannot fire twice.
+        let voiced = fold_silence_evidence(None, "BuiltInMicrophoneDevice", 60_000, 10);
+        let retract = install_retracts(true, Some(&voiced));
+        assert!(retract);
+        assert!(!reported_after_install(true, retract), "a fired retraction consumes the latch");
     }
 
     #[test]
@@ -4238,7 +5020,7 @@ mod tests {
         // constant proved nothing: it is a precondition, not an output, so reverting the emitting
         // arm to an inline "System Settings → Sound → Input" literal left the constant merely
         // unreferenced and this test still green while the regression shipped.
-        let WatchdogEmission::Error(msg) = watchdog_emission(FaultAction::Report, None, false)
+        let WatchdogEmission::Error(msg) = watchdog_emission(FaultAction::Report, None, false, ZeroSource::NotApplicable, crate::mic_permission::MicAuth::Authorized)
         else {
             panic!("a Report with no device bound must still TELL the user something");
         };
@@ -4260,7 +5042,7 @@ mod tests {
             was_default: true,
         };
         let WatchdogEmission::Error(named) =
-            watchdog_emission(FaultAction::Report, Some(&bound), false)
+            watchdog_emission(FaultAction::Report, Some(&bound), false, ZeroSource::NotApplicable, crate::mic_permission::MicAuth::Authorized)
         else {
             panic!("a Report with a device bound must tell the user something");
         };
@@ -4279,20 +5061,20 @@ mod tests {
         let quiet = [FaultAction::Idle, FaultAction::Reacquire];
         for action in quiet {
             assert_eq!(
-                watchdog_emission(action, None, false),
+                watchdog_emission(action, None, false, ZeroSource::NotApplicable, crate::mic_permission::MicAuth::Authorized),
                 WatchdogEmission::Silent,
                 "{action:?} is a silent internal step; the user must not be told about it"
             );
         }
         assert!(
             matches!(
-                watchdog_emission(FaultAction::Report, None, false),
+                watchdog_emission(FaultAction::Report, None, false, ZeroSource::NotApplicable, crate::mic_permission::MicAuth::Authorized),
                 WatchdogEmission::Error(_)
             ),
             "a Report is the ONLY thing that surfaces a fault — going quiet here is the incident"
         );
         assert_eq!(
-            watchdog_emission(FaultAction::Recovered, None, false),
+            watchdog_emission(FaultAction::Recovered, None, false, ZeroSource::NotApplicable, crate::mic_permission::MicAuth::Authorized),
             WatchdogEmission::Recovered,
             "recovery must RETRACT the notice; sending an error here would leave it up forever"
         );
@@ -4364,17 +5146,17 @@ mod tests {
         // only delays the one message the user needs. Same inputs as the un-muted case below, so
         // the ONLY difference is the mute flag — which is what proves the flag does the work.
         assert_eq!(
-            fault_action(AudioHealth::Silent, true, false, false),
+            fault_action(AudioHealth::Silent, true, false, false, false),
             FaultAction::Report,
             "a muted device must skip the pointless re-acquire"
         );
         assert_eq!(
-            fault_action(AudioHealth::Silent, false, false, false),
+            fault_action(AudioHealth::Silent, false, false, false, false),
             FaultAction::Reacquire,
             "an un-muted device still gets its silent recovery attempt first"
         );
         // Still exactly once, muted or not.
-        assert_eq!(fault_action(AudioHealth::Silent, true, false, true), FaultAction::Idle);
+        assert_eq!(fault_action(AudioHealth::Silent, true, false, true, false), FaultAction::Idle);
     }
 
     #[test]
@@ -4944,6 +5726,90 @@ mod tests {
         ) {
         }
         stop_cloud_off_the_main_thread(super::stop_cloud_stream);
+    }
+
+    /// ── THE 2026-08-05 "DICTATION CAPTURES NO AUDIO" REGRESSION ──────────────────────────────────
+    ///
+    /// The founder held push-to-talk, the button lit, the waveform turned blue, and NOTHING was ever
+    /// captured. Cause: commit 1732ed7f5 made push-to-talk release the mic at rest, so
+    /// `stop_dictation` dropped the transcriber on every release and the next hold re-ran the full
+    /// ONNX transducer init (1977 of 2578 samples in that morning's hang stacks, inside
+    /// `SherpaOnnxCreateOfflineRecognizer`). That load outlasts a hold, so the release always landed
+    /// mid-load, `start_after_load` aborted the arm, and `sess.capture` stayed `None` — which then
+    /// made every cloud handshake hit the stop/again discard guard, 261 times in one day.
+    ///
+    /// THE ASSERTION IS THE LOAD COUNT, not that a value came back. "It returned a decoder" was
+    /// already true before the fix; what was false — and what actually broke the microphone — is that
+    /// the SECOND arm paid for another ONNX init. A test that only checked the return value would
+    /// have passed against the broken build.
+    ///
+    /// ── WHAT THIS DOES *NOT* PROVE, AND WHERE THAT GAP IS CLOSED INSTEAD (roborev 59063/59101) ──
+    /// It pins the CONTRACT OF `cached_or_build`, not the WIRING — so do not read a green here as
+    /// "the arm path is cached". That gap is not closeable by a unit test: pinning the wiring means
+    /// constructing an `Arc<Decoder>`, which needs a real `OfflineRecognizer`, i.e. the ~661 MB
+    /// model CI does not have.
+    ///
+    /// It is closed by the API SHAPE instead. `transcribe`'s uncached constructors (`load_decoder`,
+    /// `with_decoder`) are private to that module and the cache sits beside them, so
+    /// `ParakeetTdt::armed` is the only session constructor this module can reach and there is no
+    /// uncached path for `load_model` to drift back into. An earlier attempt used `#[cfg(test)]` on
+    /// an uncached `new()` and claimed the same thing; that was FALSE while the two builders stayed
+    /// `pub`, because `with_decoder(m, load_decoder(m)?)` reproduced the bug and compiled.
+    #[test]
+    fn a_re_arm_reuses_the_loaded_decoder_instead_of_paying_for_another_onnx_init() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        let cache: Mutex<Option<Arc<&'static str>>> = Mutex::new(None);
+        let loads = AtomicUsize::new(0);
+        let build = || -> Result<Arc<&'static str>, String> {
+            loads.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(Arc::new("onnx-recognizer"))
+        };
+
+        let first_arm = crate::transcribe::cached_or_build(&cache, build).expect("first arm loads");
+        let second_arm = crate::transcribe::cached_or_build(&cache, build).expect("second arm reuses");
+
+        assert_eq!(
+            loads.load(AtomicOrdering::SeqCst),
+            1,
+            "the re-arm must NOT re-run the ONNX init — that multi-second window is what the \
+             push-to-talk release lands in, aborting the arm and leaving the mic deaf",
+        );
+        assert!(
+            Arc::ptr_eq(&first_arm, &second_arm),
+            "and it must be the SAME recognizer, not an equal-looking second one",
+        );
+    }
+
+    /// A load that FAILS must not be remembered. `verify_for_load` legitimately rejects a
+    /// half-downloaded model, and caching that failure would brick the mic for the whole process —
+    /// trading a transient error for a permanent one, which is the same shape of bug as the
+    /// regression above.
+    #[test]
+    fn a_failed_load_is_not_cached_so_the_next_arm_can_still_recover() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        let cache: Mutex<Option<Arc<&'static str>>> = Mutex::new(None);
+        let attempts = AtomicUsize::new(0);
+
+        let failed = crate::transcribe::cached_or_build(&cache, || -> Result<Arc<&'static str>, String> {
+            attempts.fetch_add(1, AtomicOrdering::SeqCst);
+            Err("model incomplete".into())
+        });
+        assert!(failed.is_err(), "the first arm surfaces the failure");
+        assert!(
+            cache.lock().unwrap().is_none(),
+            "and nothing is cached, or every later arm would replay this failure",
+        );
+
+        let recovered = crate::transcribe::cached_or_build(&cache, || -> Result<Arc<&'static str>, String> {
+            attempts.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(Arc::new("onnx-recognizer"))
+        });
+        assert_eq!(*recovered.expect("the retry succeeds"), "onnx-recognizer");
+        assert_eq!(
+            attempts.load(AtomicOrdering::SeqCst),
+            2,
+            "the second arm genuinely retried the build rather than reading a cached failure",
+        );
     }
 
     /// The model load must be mutually exclusive process-wide. Two concurrent loads promote into the

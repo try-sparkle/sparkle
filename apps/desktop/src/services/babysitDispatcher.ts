@@ -117,6 +117,38 @@ export function checkRollupOf(pr: PrRow): BabysitCheckRollup {
 }
 
 /**
+ * The gate EXACTLY as it arrives over IPC — which is NOT `BabysitProbeGate` (knightwatch #1317
+ * probe 1).
+ *
+ * `ProbeGate` in `knightwatch.rs` derives a plain `serde::Serialize` with NO `skip_serializing_if`
+ * anywhere on it, so every `Option::None` is serialised as JSON `null` and arrives as a PRESENT
+ * field holding `null` — never as an absent field reading `undefined`. Two fields the core types as
+ * optional are therefore mis-declared at this boundary, and each fails its own way if passed on:
+ *
+ *   * `probes: null` — the core's UNKNOWN test is `probes === undefined`
+ *     (`babysitDispatch.ts`, the `probe-read-unknown` hold), and `null` does not satisfy it. So a
+ *     failed or saturated read reads as AUTHORITATIVE: `probes ?? []` contributes no evidence and
+ *     the PR reports the healthy-sounding `no-evidence`. Worse, `lastGate`'s "only cache an
+ *     authoritative reading" test is the same `!== undefined`, so that UNKNOWN is CACHED and the PR
+ *     is never read again until something bumps its `updatedAt` — exactly the "one failed `gh` call
+ *     retires the PR" outcome that guard was written to prevent.
+ *   * `reviewedHead: null` — the core reads `reviewedHead !== undefined && reviewedHead.length > 0`,
+ *     and `null !== undefined` is TRUE, so `.length` THROWS. `reviewed_head: None` is a NORMAL
+ *     successful reading, not an error: a PR whose newest knightwatch comment is a lifecycle status
+ *     post, or whose status form the parser does not recognise, produces it (`knightwatch.rs` tests
+ *     `the_form_is_genuinely_unknown` and the lifecycle cases). One such PR therefore throws out of
+ *     the per-PR loop and aborts the WHOLE project's sweep at `sweepAllProjects`'s catch — every
+ *     tick, for every PR behind it, with a single `log.warn` as the only evidence.
+ *
+ * Declaring the wire shape honestly is what makes the normalisation below type-checked rather than
+ * remembered.
+ */
+type WireProbeGate = Omit<BabysitProbeGate, "probes" | "reviewedHead"> & {
+  probes: BabysitProbeGate["probes"] | null;
+  reviewedHead?: string | null;
+};
+
+/**
  * Read one PR's knightwatch probes.
  *
  * NEVER throws, and a failure is `probes: undefined` — UNKNOWN, the state `knightwatch.rs` and
@@ -124,17 +156,24 @@ export function checkRollupOf(pr: PrRow): BabysitCheckRollup {
  * holds `probe-read-unknown` on it. Collapsing it to "no probes" would turn every unreadable read
  * into a confident "this PR needs nothing", which is the bug the three-state discipline exists to
  * close — and it is the reading a rate-limited or unauthenticated `gh` produces most easily.
+ *
+ * IT IS ALSO THE null→undefined BOUNDARY. See {@link WireProbeGate}: serde puts `null` where the
+ * core's contract says `undefined`, and every consumer downstream tests for `undefined`. Normalising
+ * once, here, is the same call `headSha: pr.headRefOid || undefined` makes further down — an unknown
+ * is defeated at the boundary rather than in the decision.
  */
 export async function readProbeGate(root: string, number: number): Promise<BabysitProbeGate> {
   try {
-    const gate = await invoke<BabysitProbeGate>(KNIGHTWATCH_PROBE_GATE_COMMAND, { root, number });
+    const gate = await invoke<WireProbeGate>(KNIGHTWATCH_PROBE_GATE_COMMAND, { root, number });
     // A reply we cannot recognise is UNKNOWN too. `invoke` hands back `unknown` that TypeScript is
     // happy to have asserted into a typed object, and the one thing a cast cannot do is notice that
     // the two sides have drifted (the argument `conflictFlags.parseConflictFlags` makes at length).
     if (!gate || typeof gate !== "object" || typeof gate.applicable !== "boolean") {
       return { applicable: true, probes: undefined, error: "unrecognised probe-gate reply", overridden: false };
     }
-    return gate;
+    // `?? undefined` maps BOTH `null` and a missing field to `undefined`, so if the Rust side ever
+    // grows a `skip_serializing_if` (making these fields absent instead) nothing here has to change.
+    return { ...gate, probes: gate.probes ?? undefined, reviewedHead: gate.reviewedHead ?? undefined };
   } catch (e) {
     return { applicable: true, probes: undefined, error: String(e), overridden: false };
   }
@@ -273,6 +312,32 @@ interface PrClocks {
 }
 const prClocks = new Map<string, PrClocks>();
 
+/**
+ * The last probe-gate reading per PR, with the `updatedAt` it was read at.
+ *
+ * WHY: the sweep costs one `knightwatch_probe_gate` per open PR per tick, and each is a `gh`
+ * subprocess under a 45 s read timeout. At ten open PRs on a 180 s cadence that is ~200 calls an
+ * hour against a 5000/hour budget, spent almost entirely re-reading PRs that did not change.
+ *
+ * GitHub bumps `updatedAt` on any comment, review, push or label, so an unchanged value means the
+ * previous reading is still current for every event that CREATES probe evidence.
+ *
+ * ONE KNOWN HOLE, and it is narrow (knightwatch #1317 probe 4). `answered` is derived from reply
+ * BODIES — `knightwatch.rs` computes it as `repliers.iter().any(|c| cites_probe(&c.body, index))` —
+ * and editing an existing comment in place bumps that COMMENT's `updatedAt`, never the parent PR's.
+ * So a probe answered by EDITING an old reply, rather than posting a new one, changes the gate's
+ * answer while this key holds still, and the PR keeps reading from the cached gate until any other
+ * event bumps the stamp. The normal answer path posts a NEW comment, which does bump it; the cache
+ * is also process-local, so an app restart clears it. Accepted deliberately: the alternative is
+ * re-reading every PR every tick, which is the cost this map exists to avoid.
+ *
+ * THE CACHE IS ONLY EVER A SHORTCUT PAST A READ, NEVER A SOURCE OF A DIFFERENT ANSWER. It is used
+ * only when the stored `updatedAt` is non-empty and equal to the current one; an absent or empty
+ * value on either side always re-reads. That matters because "absent" is what a `gh` that stopped
+ * returning the field produces, and two absents comparing equal would silence that PR forever.
+ */
+const lastGate = new Map<string, { updatedAt: string; gate: BabysitProbeGate }>();
+
 function clocksFor(k: string): PrClocks {
   let c = prClocks.get(k);
   if (!c) {
@@ -387,7 +452,26 @@ export async function babysitSweepProject(
       out.unidentified += 1;
       continue;
     }
-    const gate = await readProbeGate(project.rootPath, pr.number);
+    // SKIP THE READ WHEN THE PR HAS NOT CHANGED — see `lastGate`.
+    //
+    // ONE GUARD, NOT TWO. An empty stamp is excluded on the WRITE side below, so nothing with an
+    // empty `updatedAt` is ever in the map and re-checking it here could not change an outcome. A
+    // second `stamp !== ""` on this line reads like defence in depth but is unreachable, and an
+    // unreachable condition is one no test can pin — which is exactly how the rest of this module
+    // accumulated guards that looked wired and were not.
+    const k0 = key(repo, pr.number);
+    const cached = lastGate.get(k0);
+    const stamp = pr.updatedAt ?? "";
+    let gate: BabysitProbeGate;
+    if (cached && cached.updatedAt === stamp) {
+      gate = cached.gate;
+    } else {
+      gate = await readProbeGate(project.rootPath, pr.number);
+      // Only an AUTHORITATIVE reading is worth caching. Caching an UNKNOWN would pin the PR at
+      // `probe-read-unknown` for as long as nobody touched it, turning one failed `gh` call into a
+      // PR that is never looked at again — the opposite of what this sweep exists to do.
+      if (stamp !== "" && gate.probes !== undefined) lastGate.set(k0, { updatedAt: stamp, gate });
+    }
     // FENCE AGAIN, AFTER THE AWAIT — this is the check that actually matters (roborev 58533). The
     // sweep that gets abandoned is the one parked INSIDE this loop, on the probe-gate read under a
     // 45 s `gh` timeout. It passed the check at the top of the iteration and, without this, walks
@@ -682,6 +766,7 @@ export async function sweepAllProjects(
 
 /** Test seam: forget every remembered observation and dispatch. */
 export function _resetBabysitDispatcherForTests(): void {
+  lastGate.clear();
   sweepStartedAt = null;
   sweepGeneration = 0;
   lastObservation.clear();

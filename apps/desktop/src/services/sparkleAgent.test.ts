@@ -356,6 +356,16 @@ describe("sparklePersona — agent-feedback inbox drain", () => {
     expect(p).toMatch(/severity/i);
   });
 
+  // The fallback must NOT swallow the script's LOCKED exit. Triage classifies a locked store and
+  // exits 2 having read nothing; the fallback `bd list` is UNBOUNDED, so following it there blocks
+  // on the very lock the classification exists to report — the convoy this drain must not join.
+  // The fallback is for a script that is absent, not for a store that is refusing.
+  it.each(MINING_MODES)("%s: the raw-list fallback excludes a LOCKED store", (mode) => {
+    const p = sparklePersona(LOG_DIR, REPO, mode, "unknown", { attended: false });
+    expect(p).toContain("missing or not executable");
+    expect(p).toMatch(/LOCKED, do NOT raw-list/);
+  });
+
   it.each(MINING_MODES)("%s: each arm's step 1 references the drain, ordered before log review", (mode) => {
     const p = sparklePersona(LOG_DIR, REPO, mode, "unknown", { attended: false });
     // The whatYouDo arm names the drain STEP (not just the section), so the ordered numbered list

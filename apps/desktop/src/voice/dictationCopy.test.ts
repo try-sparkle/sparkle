@@ -20,6 +20,7 @@ import {
   BACKEND_MIC_RESTRICTED,
   BACKEND_MIC_NOT_ANSWERED,
   BACKEND_NO_AUDIO_PREFIX,
+  BACKEND_STALE_GRANT_PREFIX,
 } from "./backendVoiceErrors";
 // The advanced opt-in's own label, imported rather than retyped: the no-device remedy tells the user
 // to turn it on, and an instruction naming a control by a stale label is worse than none.
@@ -148,6 +149,62 @@ describe("modelPercent / preparing copy — the first-run download", () => {
 const noAudioError = (device: string) =>
   `${BACKEND_NO_AUDIO_PREFIX}${device}". Another app (a screen recorder or virtual audio device) ` +
   `may be holding the microphone. Pick a different input in the mic menu, or turn the mic off and on.`;
+
+/** The watchdog's STALE-GRANT report, assembled the way the backend does. Built from
+ *  `BACKEND_STALE_GRANT_PREFIX` for the same reason as `noAudioError` — and this one IS fully
+ *  pinned: dictation.rs's `the_stale_grant_message_matches_the_prefix_the_frontend_pins` reads that
+ *  constant out of backendVoiceErrors.ts and asserts its own message starts with it. */
+const staleGrantError = (device: string) =>
+  `${BACKEND_STALE_GRANT_PREFIX}${device}", even though Sparkle's microphone permission looks ` +
+  `granted. Quit Sparkle and open it again — that usually re-establishes the grant. If it comes ` +
+  `back, quit anything else that might be holding the mic (a video call or a screen recorder), ` +
+  `then switch Sparkle off and on in System Settings → Privacy & Security → Microphone.`;
+
+describe("stale-grant — the OS is sending silence on a grant it says is live", () => {
+  // THE REGRESSION THIS BUCKET EXISTS TO PREVENT, asserted at the routing rather than the copy.
+  // The sentence names "microphone permission" AND "Privacy & Security → Microphone", so it
+  // satisfies MIC_CONTEXT and DENIAL both — it lands in `permission` the moment its pattern stops
+  // being matched first. That bucket tells the user to ALLOW the microphone, and in this exact
+  // state they open the pane and find Sparkle already switched on: a remedy that cannot work.
+  it("outranks the permission bucket its own words would otherwise match", () => {
+    expect(classifyVoiceError(staleGrantError("MacBook Pro Microphone"))).toBe("stale-grant");
+  });
+
+  it("is not swallowed by no-audio either", () => {
+    // Distinct symptoms, distinct emphasis: `no-audio` LEADS with another app holding the device,
+    // which is the wrong first move when macOS itself is the proven source of the zeros.
+    const n = voiceErrorNotice(staleGrantError("MacBook Pro Microphone"));
+    expect(n?.kind).toBe("stale-grant");
+    expect(n?.detail).not.toMatch(/^another app/i);
+  });
+
+  it("names the device and orders the remedies by what the evidence supports", () => {
+    const n = voiceErrorNotice(staleGrantError("MacBook Pro Microphone"));
+    // The device is the one fact only the backend has, and the notice is unfollowable without it.
+    expect(n?.detail).toContain("MacBook Pro Microphone");
+    // Relaunch FIRST — the Privacy pane shows the switch already on, so leading with it strands
+    // the user at a control that is already in the position it recommends.
+    const restart = n!.detail.search(/quit sparkle/i);
+    expect(restart).toBeGreaterThanOrEqual(0);
+    // …and the held-device check SECOND rather than denied. `zero_source=Os` is also what a busy
+    // device reads as (audio.rs), so a copy that ruled it out would be a confident wrong cause —
+    // the same defect this bucket exists to fix, pointed somewhere else.
+    const held = n!.detail.search(/holding the mic/i);
+    expect(held).toBeGreaterThan(restart);
+    // The Privacy pane is LAST: it is the least likely to help and the most likely to look wrong.
+    expect(n!.detail.search(/Privacy & Security/)).toBeGreaterThan(held);
+    // And the headline must say the silence is real and not the user's fault.
+    expect(n?.headline).toMatch(/silence/i);
+  });
+
+  it("falls back to the raw string when the sentence no longer parses", () => {
+    // Same fail-soft contract as the other parsed bucket: a reworded backend must not produce a
+    // confident remedy about a device we can no longer name.
+    const n = voiceErrorNotice("macOS is sending silence instead of audio from the mic");
+    expect(n?.kind).toBe("stale-grant");
+    expect(n?.detail).toBe("macOS is sending silence instead of audio from the mic");
+  });
+});
 
 describe("classifyVoiceError — bucket the raw backend error string", () => {
   const cases: [VoiceErrorKind, string][] = [

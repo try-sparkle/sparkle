@@ -8,7 +8,7 @@ import { useAuthStore } from "./stores/authStore";
 import { openCloudDictationWindow, nextBalanceCents } from "./services/cloudDictation";
 import { safeUnlisten } from "./services/safeUnlisten";
 import { selectedProjectName } from "./services/creditProject";
-import { classifyVoiceError } from "./voice/dictationCopy";
+import { classifyVoiceError, isWatchdogFault } from "./voice/dictationCopy";
 import type { Phase } from "./voice/dictationPhase";
 import { routeDictationToTerminal } from "./services/dictationTerminalSink";
 import {
@@ -671,7 +671,10 @@ export async function createDictationController(
       // the user dismissed THAT notice the mic was drawn as paused over a live capture — the same
       // incident by a different route (roborev 55351). Only the recovery event, which is the only
       // positive evidence frames resumed, may clear it.
-      if (classifyVoiceError(e.payload) === "no-audio") {
+      // The WHOLE watchdog family, not just `no-audio`: the same watchdog also reports the
+      // stale-grant case, and testing one kind here latched nothing for the other — so its
+      // all-clear early-returned below and the notice never came down (knightwatch probe 1).
+      if (isWatchdogFault(classifyVoiceError(e.payload))) {
         useDictationStore.getState().setDeadMicSilent(true);
       }
     }),
@@ -701,7 +704,7 @@ export async function createDictationController(
       // are flowing, which is no evidence at all about a failed model download or a denied
       // permission. Trading the bug where the UI hid a dead mic for the bug where it hides a denied
       // one would be no trade at all.
-      if (store.error && classifyVoiceError(store.error) === "no-audio") setError(null);
+      if (store.error && isWatchdogFault(classifyVoiceError(store.error))) setError(null);
       // Clearing the notice is only half the retraction. `setError(null)` moves status "error" →
       // "idle", but the mic never actually stopped: the watchdog fires MID-SESSION, so capture is
       // still live and `enabled` is still true. Left at idle, deriveMicState(enabled=true, "idle",

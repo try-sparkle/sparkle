@@ -16,6 +16,19 @@ import { invoke } from "@tauri-apps/api/core";
  *  drive `prMergeEligibility`. */
 export interface PrRow {
   number: number;
+  /**
+   * GitHub's `updatedAt`, verbatim, or `""`/absent when the probe could not supply it.
+   *
+   * A CHANGE DETECTOR, not a clock — compared only for equality against the previous sighting,
+   * never parsed or ordered, so a format change costs an extra read rather than a wrong answer.
+   * GitHub bumps it on any comment, review, push or label, which is exactly the set of events that
+   * can change a PR's knightwatch probes.
+   *
+   * OPTIONAL because a Rust backend predating the field omits it, and EMPTY MUST MEAN "changed":
+   * treating two absent values as equal would suppress the probe read forever on a `gh` that
+   * stopped returning it, silencing that PR with no signal.
+   */
+  updatedAt?: string;
   title: string;
   headRefName: string;
   url: string;

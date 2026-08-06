@@ -33,8 +33,8 @@ const raw = {
   ownerAgentId: null,
   kind: "conflicting",
   commitsBehind: 220,
-  untested: true,
   unresolvedSecs: 14400,
+  evidence: "no-checks-ran",
   blockedBy: null,
 };
 
@@ -52,8 +52,8 @@ describe("parseConflictFlags", () => {
         ownerAgentId: null,
         kind: "conflicting",
         commitsBehind: 220,
-        untested: true,
         unresolvedSecs: 14400,
+        evidence: "no-checks-ran",
       },
     ]);
   });
@@ -83,13 +83,16 @@ describe("parseConflictFlags", () => {
       ownerAgentId: null,
       kind: "conflicting",
       commitsBehind: 219,
-      untested: true,
       unresolvedSecs: 420,
       blockedBy: null,
+      // HOW the producer knows the fields above, and the one field here the consumer must NOT
+      // discard: a conflicting row is equally what a first-hand absence of CI and an inherited
+      // verdict produce, so a parser that drops this hands the report a not-current reading it then
+      // narrates as "no CI has ever run on it".
+      evidence: "last-known",
       // Fields the real `ConflictFlag` also carries (conflict_watch.rs, `rename_all = "camelCase"`)
       // that this consumer has no use for. They must not make the payload unreadable — a stricter
       // parser here would fail closed on its own producer.
-      evidence: "mergeStateStatus=DIRTY",
       target: "agent",
       raisedAtMs: 1785866624974,
       rung: 2,
@@ -100,7 +103,30 @@ describe("parseConflictFlags", () => {
     // `null` means "no hold reason", which is the same fact as an absent key — so it must normalise
     // to absent rather than surviving as a null the consumers would have to re-check.
     expect(parsed![0]!.blockedBy).toBeUndefined();
-    expect(parsed![0]!.untested).toBe(true);
+    expect(parsed![0]!.evidence).toBe("last-known");
+  });
+
+  // THE FIELD THAT SAYS WHETHER THE ROW IS CURRENT. Rust states it on every flag (a plain `String`),
+  // and the consumer that composes the founder's sentence branches on it — so an absent key is drift
+  // of the same kind as an absent `ownerAgentId`, and it fails closed.
+  it("requires the evidence field, which is the only thing separating a read row from an unread one", () => {
+    const { evidence, ...withoutEvidence } = raw;
+    void evidence;
+    expect(parseConflictFlags([withoutEvidence])).toBeUndefined();
+    expect(parseConflictFlags([{ ...raw, evidence: null }])).toBeUndefined();
+    expect(parseConflictFlags([{ ...raw, evidence: 7 }])).toBeUndefined();
+    expect(parseConflictFlags([{ ...raw, evidence: "" }])).toBeUndefined();
+  });
+
+  // ...AND THE VALUE IS NOT AN ALLOWLIST, deliberately. This parser is all-or-nothing, so rejecting
+  // a value the producer added later would turn every sweep into "we did not look" — for the whole
+  // fleet, at once, which is the failure the producer's own evidence split exists to prevent. It is
+  // kept verbatim; the report is what decides that an unfamiliar value cannot claim first-hand
+  // knowledge.
+  it("keeps an evidence value this build does not recognise rather than muting the sweep", () => {
+    const parsed = parseConflictFlags([{ ...raw, evidence: "some-future-value" }]);
+    expect(parsed).toHaveLength(1);
+    expect(parsed![0]!.evidence).toBe("some-future-value");
   });
 
   it("distinguishes an empty ANSWER from no answer", () => {
@@ -118,7 +144,6 @@ describe("parseConflictFlags", () => {
   it("rejects the WHOLE payload when one entry is unreadable, rather than reporting the rest", () => {
     expect(parseConflictFlags([raw, { ...raw, pr: 42, kind: "mergeable" }])).toBeUndefined();
     expect(parseConflictFlags([raw, { ...raw, commitsBehind: "220" }])).toBeUndefined();
-    expect(parseConflictFlags([raw, { ...raw, untested: "yes" }])).toBeUndefined();
     expect(parseConflictFlags([raw, { ...raw, branch: 7 }])).toBeUndefined();
     expect(parseConflictFlags([raw, null])).toBeUndefined();
   });

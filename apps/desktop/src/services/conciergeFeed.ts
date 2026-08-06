@@ -31,6 +31,14 @@ import { agentDisplayName } from "../engine/agentDisplayName";
 import { isTopLevelAgent } from "../engine/agentOrdering";
 import { STATUS_BANDS, bandOfStatus, type StatusBand } from "../engine/buildSections";
 import { resolveStage, type WorkflowStageId } from "../engine/workflowStage";
+import { isDismissibleRed } from "../engine/alertDismissal";
+import {
+  noteMovement,
+  noteRedEpochs,
+  withMovementRetraction,
+  type MovementEvidence,
+  type RetractionLedger,
+} from "../engine/movementRetraction";
 import { publishedStatusFor } from "../useAttentionNotifications";
 import type { BranchStatus } from "./branchStatus";
 import type { Roster } from "./rosterTypes";
@@ -233,6 +241,19 @@ export interface ConciergeFeedInput {
    *  agent covered by NEITHER falls back to "stopped" (same default as buildRoster). Local status
    *  always wins over the tray's. */
   roster?: Roster | null;
+  /** Artifact evidence of who has ACTED (runtimeStore.agentMovement, refreshed by
+   *  services/fleetWatch off `fleet_digest`). Omit in tests for no retraction. */
+  agentMovement?: Record<string, MovementEvidence>;
+  /** WHEN EACH RED BEGAN, AND WHAT MOVEMENT HAS BEEN SEEN SINCE — a caller-owned ledger this builder
+   *  both STAMPS and reads.
+   *
+   *  An out-param in the same spirit as `rolledUpGreen` below: the epoch has to be taken from the
+   *  MERGED status (local plus the cross-window roster), and that merge only exists in here. The
+   *  caller (`useConciergeFeed`) holds the window's shared ledger. Omit in tests for no retraction —
+   *  a red whose beginning was never observed is never retracted. */
+  retraction?: RetractionLedger;
+  /** The clock, for tests. Defaults to `Date.now()`; only the red-epoch stamp reads it. */
+  nowMs?: number;
   /** The mute gate (sparklePrefsStore.shouldInterrupt). Defaults to allow-everything. */
   shouldInterrupt?: (topic: string) => boolean;
   /** Pin scope: set → only that project's alerts count toward scopedCounts; null/omitted → all. */
@@ -368,7 +389,7 @@ export function buildConciergeFeed(input: ConciergeFeedInput): ConciergeFeed {
 
   // Cross-window completeness: the tray's merged fleet fills statuses this window doesn't run;
   // the local live map wins wherever both know the agent.
-  const mergedStatus: Record<string, AgentTabStatus> = {
+  const observedStatus: Record<string, AgentTabStatus> = {
     ...trayStatusMap(input.roster),
     ...input.status,
   };
@@ -376,6 +397,51 @@ export function buildConciergeFeed(input: ConciergeFeedInput): ConciergeFeed {
   // The same overlaid status every other surface bands/colors on. Run over the FLATTENED fleet so
   // a worker's red bubbles to its orchestrator regardless of which project holds them.
   const allAgents = projects.flatMap((p) => p.agents);
+
+  // ── A RED IS A CLAIM ABOUT NOW (bead sparkle-7ba9e) ──────────────────────────────────────────
+  //
+  // Neither map above has a writer for an agent this window is not hosting: `input.status` is
+  // written only by a MOUNTED `components/AgentPane`, and panes mount lazily per project, so an
+  // unhosted agent's red is a frozen last reading that nothing can retract. The founder saw the
+  // consequence — a "● BLOCKED:" pill above the composer naming an agent that was working, clearable
+  // only by hand. `engine/movementRetraction` is the second witness: it retracts a red that the
+  // agent's own artifacts show it has ACTED past.
+  //
+  // APPLIED HERE, BEFORE `publishedStatusFor`, and the order is load-bearing. That call bubbles a
+  // worker's red onto its orchestrator and rolls subtrees up; retracting afterwards would clear the
+  // worker while leaving the parent wearing a copy of a red whose owner is no longer red — a card
+  // naming an agent that is fine, which is the exact shape `ConciergeAgent.redIsInherited` exists to
+  // prevent. Retracting first means the stale red never enters the bubble at all.
+  // Stamp the epochs from what was OBSERVED, before anything below can change it. Feeding the
+  // post-retraction map instead would be circular and self-defeating: a retracted red leaves the
+  // map, its epoch is dropped, and the next tick reads the still-frozen red as a NEW episode with a
+  // NEW raise time that no earlier movement can beat — so the pill would return on every tick,
+  // forever. The epoch belongs to when the red was first SEEN, not to whether it survived.
+  //
+  // PRUNED AGAINST THE FLEET, NOT AGAINST `observedStatus` — see `noteRedEpochs`. This window's
+  // status view is PARTIAL until the cross-window roster arrives, and the ledger is shared, so
+  // pruning on "absent from the status map" would let a just-mounted consumer wipe the very frozen
+  // reds only the roster can see, for every consumer at once.
+  //
+  // MOVEMENT IS FOLDED IN AFTER the epochs are stamped, so a red raised THIS tick already has its
+  // raise time to be compared against, and accumulated as a high-water mark so a later quiet tick
+  // cannot un-retract it (the `Stop`-overwrites-the-work-event case).
+  const ledger = input.retraction;
+  const nowMs = input.nowMs ?? Date.now();
+  if (ledger !== undefined) {
+    noteRedEpochs(
+      ledger,
+      observedStatus,
+      isDismissibleRed,
+      nowMs,
+      allAgents.map((a) => a.id),
+    );
+    noteMovement(ledger, (id) => input.agentMovement?.[id], nowMs);
+  }
+  const mergedStatus =
+    ledger === undefined
+      ? observedStatus
+      : withMovementRetraction(allAgents, observedStatus, isDismissibleRed, ledger);
   // `rolledUpGreen` collects the heads whose `working` is their SUBTREE's, not their own. The away-
   // recap needs that distinction: a promoted head goes idle→working→idle purely because its worker
   // ran, which reads as the head finishing a job it never started (roborev 53886).

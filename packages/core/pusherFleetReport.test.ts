@@ -372,8 +372,8 @@ describe("conflicting PRs reach the report", () => {
     ownerAgentId: null,
     kind: "conflicting",
     commitsBehind: 220,
-    untested: true,
     unresolvedSecs: 4 * 60 * 60,
+    evidence: "no-checks-ran",
   };
 
   it("delivers the untested fact and the PR number, with every number cited", () => {

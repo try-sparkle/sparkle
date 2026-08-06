@@ -81,6 +81,24 @@ function gateWithUnansweredBlocking() {
 }
 
 /** Route the three commands the sweep issues. `leases` undefined ⇒ the list call throws. */
+/**
+ * `ProbeGate::unknown("boom")` EXACTLY as serde puts it on the wire.
+ *
+ * Every `Option::None` on the Rust struct is `null`, not an absent field — there is no
+ * `skip_serializing_if` on `ProbeGate`. Building the fixture by hand with `undefined` is how the
+ * null path stayed untested through several passes over this file.
+ */
+function unknownGateOnTheWire() {
+  return {
+    applicable: true,
+    probes: null,
+    error: "boom",
+    overridden: false,
+    reviewedHead: null,
+    reviewStale: false,
+  };
+}
+
 function wireInvoke(opts: {
   gate?: unknown;
   leases?: unknown[];
@@ -686,6 +704,28 @@ describe("commits pushed since the last review — through the whole sweep", () 
     expect(spawnMock).toHaveBeenCalledTimes(1);
   });
 
+  it("survives `reviewedHead: null` on the wire — a lifecycle post must not abort the sweep", async () => {
+    // knightwatch #1317 probe 1, the second half. `reviewed_head: None` is a NORMAL successful
+    // reading — a PR whose newest knightwatch comment is a `👀 reviewing` lifecycle post, or whose
+    // status form the parser does not recognise, produces it — and serde writes it as `null`.
+    // The core tests `reviewedHead !== undefined && reviewedHead.length > 0`, and `null !==
+    // undefined` is TRUE, so an unnormalised `null` THROWS on `.length`, out of the per-PR loop and
+    // through the whole project's sweep. Every fixture above passes `undefined`, which cannot.
+    fetchOpenPrsMock.mockResolvedValue([greenPr()]);
+    wireInvoke({
+      leases: [],
+      gate: { applicable: true, probes: [], error: null, overridden: false, reviewedHead: null, reviewStale: false },
+    });
+
+    const out = await sweepTwice();
+
+    // No coverage claim can be made from an unknown, so nothing is dispatched — but the sweep must
+    // REACH that verdict rather than dying on the way to it.
+    expect(out.holds["no-evidence"]).toBe(1);
+    expect(out.dispatched).toHaveLength(0);
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
   it("does NOT dispatch when the review covers the head — the healthy steady state", async () => {
     fetchOpenPrsMock.mockResolvedValue([greenPr()]);
     wireInvoke({ leases: [], gate: coverage(HEAD.slice(0, 7)) });
@@ -883,5 +923,76 @@ describe("the stopper cancels a running sweep", () => {
     releaseGate(gateWithUnansweredBlocking());
     await vi.waitFor(() => expect(spawnMock).toHaveBeenCalledTimes(1));
     stop();
+  });
+});
+
+// ── THE updatedAt GATE (the probe read is the sweep's only real cost) ───────────────────────────
+//
+// One `knightwatch_probe_gate` per open PR per tick, each a `gh` subprocess under a 45 s timeout —
+// ~200 calls/hour at ten PRs, almost all re-reading PRs that did not change. Every assertion here
+// is on the SIDE EFFECT (did a probe read happen), never on cache internals.
+describe("the updatedAt gate", () => {
+  const gateReads = () =>
+    invokeMock.mock.calls.filter((c) => c[0] === KNIGHTWATCH_PROBE_GATE_COMMAND).length;
+
+  it("SKIPS the probe read when updatedAt is unchanged", async () => {
+    fetchOpenPrsMock.mockResolvedValue([{ ...prWithProbe(5001), updatedAt: "2026-08-05T10:00:00Z" }]);
+    wireInvoke({ leases: [] });
+
+    await babysitSweepProject(PROJECT, T0, CONFIG);
+    expect(gateReads()).toBe(1);
+    await babysitSweepProject(PROJECT, T0 + 60_000, CONFIG);
+    expect(gateReads()).toBe(1); // reused, not re-read
+  });
+
+  it("RE-READS when updatedAt moves — a new comment must be seen", async () => {
+    fetchOpenPrsMock.mockResolvedValue([{ ...prWithProbe(5002), updatedAt: "2026-08-05T10:00:00Z" }]);
+    wireInvoke({ leases: [] });
+    await babysitSweepProject(PROJECT, T0, CONFIG);
+    expect(gateReads()).toBe(1);
+
+    fetchOpenPrsMock.mockResolvedValue([{ ...prWithProbe(5002), updatedAt: "2026-08-05T11:00:00Z" }]);
+    await babysitSweepProject(PROJECT, T0 + 60_000, CONFIG);
+    expect(gateReads()).toBe(2);
+  });
+
+  it("an ABSENT updatedAt always re-reads — two absents must not compare equal", async () => {
+    // A gh that stopped returning the field would otherwise silence this PR forever.
+    fetchOpenPrsMock.mockResolvedValue([prWithProbe(5003)]); // no updatedAt
+    wireInvoke({ leases: [] });
+    await babysitSweepProject(PROJECT, T0, CONFIG);
+    await babysitSweepProject(PROJECT, T0 + 60_000, CONFIG);
+    expect(gateReads()).toBe(2);
+  });
+
+  it("an UNKNOWN reading is never cached — one failed gh must not retire the PR", async () => {
+    // THE REAL WIRE SHAPE, NOT A FABRICATED ONE (knightwatch #1317 probe 1). This used to pass
+    // `probes: undefined`, which no `invoke` can ever produce: `ProbeGate` in `knightwatch.rs`
+    // carries no `skip_serializing_if`, so `ProbeGate::unknown(..)` serialises `probes` as JSON
+    // `null` — a PRESENT field. The old fixture therefore tested a value the boundary never sees
+    // and the `!== undefined` cache test passed a `null` straight through into the cache.
+    fetchOpenPrsMock.mockResolvedValue([{ ...prWithProbe(5004), updatedAt: "2026-08-05T10:00:00Z" }]);
+    wireInvoke({ leases: [], gate: unknownGateOnTheWire() });
+    const first = await babysitSweepProject(PROJECT, T0, CONFIG);
+    expect(gateReads()).toBe(1);
+    // The side effect that says the UNKNOWN survived the boundary: the core must SAY it could not
+    // look. `no-evidence` here would be the same "we looked; this PR is fine" claim a failed `gh`
+    // read cannot support.
+    expect(first.holds["probe-read-unknown"]).toBe(1);
+    expect(first.holds["no-evidence"]).toBeUndefined();
+    // Same updatedAt, but the cached value would have been UNKNOWN — it must re-read anyway.
+    await babysitSweepProject(PROJECT, T0 + 60_000, CONFIG);
+    expect(gateReads()).toBe(2);
+  });
+
+  it("the skip does NOT stop a dispatch — a cached gate still carries its evidence", async () => {
+    // The gate exists to save a subprocess, not to change the verdict. Two sweeps, one read, and
+    // the second still dispatches on the cached probe.
+    fetchOpenPrsMock.mockResolvedValue([{ ...prWithProbe(5005), updatedAt: "2026-08-05T10:00:00Z" }]);
+    wireInvoke({ leases: [] });
+    await babysitSweepProject(PROJECT, T0, CONFIG);
+    const out = await babysitSweepProject(PROJECT, T0 + 60_000, CONFIG);
+    expect(gateReads()).toBe(1);
+    expect(out.dispatched).toHaveLength(1);
   });
 });

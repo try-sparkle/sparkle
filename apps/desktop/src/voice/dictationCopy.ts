@@ -185,12 +185,34 @@ export type VoiceErrorKind =
   // This is the one bucket that describes a mic which looks perfectly healthy: the device is open,
   // the stream is running, and it delivers silence forever. See the ordering note on PATTERNS.
   | "no-audio"
+  // Same observable symptom as `no-audio`, but the backend has NAMED the cause: macOS reports the
+  // mic grant as Authorized and is delivering digital silence anyway (zero_source=Os). A different
+  // bucket rather than a variant of `no-audio` because the remedy inverts — nothing is holding the
+  // device and no other input will help; the process's grant has to be re-established.
+  | "stale-grant"
   | "no-device"
   | "unsupported-format"
   | "download"
   | "disk-space"
   | "permission"
   | "unknown";
+
+/** The kinds the frame-liveness WATCHDOG emits — the family that its `dictation://audio-recovered`
+ *  all-clear is allowed to retract.
+ *
+ *  ONE PREDICATE BECAUSE THE SEAM DRIFTED THE MOMENT IT WAS SPLIT. `stale-grant` was added as a
+ *  second watchdog kind while `useDictation` still tested `=== "no-audio"` at both ends of the
+ *  retraction: the fault was never latched, so the all-clear early-returned, and a stale-grant
+ *  notice stayed on screen — with the mic drawn as paused — over a microphone that had recovered.
+ *  A third kind added later must land here rather than at those two call sites (knightwatch probe 1
+ *  on PR #1344).
+ *
+ *  Membership is decided by WHO EMITS IT, not by what the copy says: only the watchdog retracts, so
+ *  only the watchdog's own notices may be cleared by its all-clear. A model-download failure or a
+ *  permission denial is still true when frames resume. */
+export function isWatchdogFault(kind: VoiceErrorKind): boolean {
+  return kind === "no-audio" || kind === "stale-grant";
+}
 
 export interface VoiceErrorNotice {
   kind: VoiceErrorKind;
@@ -206,7 +228,16 @@ export interface VoiceErrorNotice {
 // pinning exact sentences, and anything we don't recognize falls through to `unknown` (which shows
 // the raw string) rather than being forced into a bucket that would misattribute the cause.
 const PATTERNS: [VoiceErrorKind, RegExp][] = [
-  // FIRST, and that placement is load-bearing — not stylistic.
+  // BEFORE EVERYTHING, INCLUDING `no-audio`, AND FOR A SHARPER REASON THAN THE NOTE BELOW.
+  //
+  // This sentence names microphone permission and the Privacy pane, so it matches MIC_CONTEXT AND
+  // DENIAL and would fall into `permission` on its own. That bucket's remedy is "allow it in System
+  // Settings → Privacy & Security → Microphone" — and in THIS state the user goes there and finds
+  // Sparkle already switched on, because the grant is stale rather than withheld. A remedy that
+  // sends someone to a control that is already in the position it recommends is the dead end
+  // AGENTS.md's remedy rule exists to prevent, so the specific cause must win over the generic one.
+  ["stale-grant", /sending silence instead of audio/],
+  // FIRST among the rest, and that placement is load-bearing — not stylistic.
   //
   // The frame-liveness watchdog's message INTERPOLATES A DEVICE NAME the OS handed us verbatim
   // (`No audio from "MacBook Pro Microphone". …`). Device names are arbitrary third-party strings:
@@ -273,6 +304,13 @@ function noAudioDevice(text: string): string | null {
   return m?.[1] ?? null;
 }
 
+/** The device name out of the STALE-GRANT report, which quotes it in a different clause than
+ *  {@link noAudioDevice} parses. Same null-means-fall-back-to-raw contract. */
+function staleGrantDevice(text: string): string | null {
+  const m = /sending silence instead of audio from\s+"([^"]+)"/i.exec(text);
+  return m?.[1] ?? null;
+}
+
 /** Bucket a raw backend error string. Pure + exported so the mapping is unit-tested directly
  *  (this codebase's convention — cf. deriveMicState / shouldBlockMicArm in MicButton). */
 export function classifyVoiceError(raw: string): VoiceErrorKind {
@@ -327,6 +365,36 @@ export function voiceErrorNotice(raw: string | null | undefined): VoiceErrorNoti
         // that omits the only detail that mattered.
         detail: device
           ? `Another app may be holding "${device}" — a screen recorder or a virtual audio device. Pick a different input in ${INPUT_PICKER_LOCATION}, or turn the mic off and on.`
+          : text,
+      };
+    }
+    case "stale-grant": {
+      // THE COPY THE 2026-08-05 SILENCE NEEDED. The founder sat talking to a dead microphone while
+      // the app knew, every second, that the OS was handing it pure zeros. What he was shown (the
+      // `no-audio` branch above) told him another app might be holding the mic — nothing was.
+      //
+      // So this branch says the two things the evidence actually supports: it is NOT you and not
+      // your hardware, and relaunching is the first thing to try. The Privacy pane is named last and
+      // framed as off-and-on rather than "allow it", because the grant is stale rather than missing
+      // and the switch is already on — telling someone to enable something they can see is enabled
+      // reads as the app being confused, and leaves them with nothing to try.
+      //
+      // ORDERED, NOT EXCLUSIVE — and that is a correction. `zero_source=Os` says the zeros came from
+      // the OS rather than from our downmix; audio.rs's own note spells out that a BUSY device reads
+      // the same way ("a muted or busy device, or the very fault this guard was written for"), and
+      // muted is already ruled out upstream. So a held device is still on the table, and asserting a
+      // stale grant as fact would reproduce the original defect with the blame moved: a confident
+      // wrong cause. Relaunch leads because it is free, fixes the case the founder actually hit, and
+      // is harmless if the real cause is a held device; the held-device check follows it rather than
+      // being denied (knightwatch probe 1).
+      const device = staleGrantDevice(text);
+      return {
+        kind,
+        // Names macOS as the actor. The mic is armed, the ring is lit and the user is talking, so
+        // the first job of this line is to say the silence is real and it is not theirs.
+        headline: "macOS is sending silence, not audio.",
+        detail: device
+          ? `macOS says Sparkle may use "${device}" and is sending zeros anyway. Quit Sparkle and open it again — that usually fixes it. If it comes back, quit anything else that might be holding the mic (a video call or a screen recorder), then switch Sparkle off and on in System Settings → Privacy & Security → Microphone.`
           : text,
       };
     }

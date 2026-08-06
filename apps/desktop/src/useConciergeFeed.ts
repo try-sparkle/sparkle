@@ -10,6 +10,7 @@
 // agent wherever it is" path a notification click takes.
 import { useEffect, useMemo, useState } from "react";
 import { useNewAgentGraceTick } from "./hooks/useNewAgentCalm";
+import { windowRetractionLedger } from "./engine/movementRetraction";
 import { getRoster, onRosterChanged } from "./services/attention";
 import { safeUnlisten } from "./services/safeUnlisten";
 import { buildConciergeFeed, type ConciergeFeed } from "./services/conciergeFeed";
@@ -48,7 +49,29 @@ export function useConciergeFeed(opts?: UseConciergeFeedOpts): ConciergeFeed {
   const branchStatus = useRuntimeStore((s) => s.branchStatus);
   const openAgentIds = useRuntimeStore((s) => s.openAgentIds);
   const lastObserved = useRuntimeStore((s) => s.lastObserved);
+  const agentMovement = useRuntimeStore((s) => s.agentMovement);
   const interaction = useInteractionStore((s) => s.lastAt);
+
+  // WHEN EACH RED BEGAN — the other half of `engine/movementRetraction` (bead sparkle-7ba9e).
+  //
+  // NOT state: recording an epoch must never itself cause a render (it would loop — the render is
+  // what records it), and it is read inside the memo rather than rendered.
+  //
+  // AND NOT A `useRef` EITHER, which is what this was first written as. A per-instance ledger dies
+  // with the component, and it is the ONLY record of when a red began: this hook has two live
+  // callers with different lifetimes — `Workspace` (inside ReadinessGate/AuthGate/Suspense, so it
+  // unmounts) and `useHelperVitalsPublisher` (App.tsx, never unmounts) — so a ref both LOSES the
+  // epochs on a remount, re-stamping every frozen red with a time no earlier movement can beat, and
+  // gives the island and the column two different answers about the same agent. See
+  // `windowRetractionLedger` for the full argument.
+  //
+  // FILLED BY THE BUILDER, not here, and that is deliberate. The epoch has to be stamped from the
+  // MERGED status — local plus the cross-window roster — because the reds that freeze are precisely
+  // the ones this window does not host, and those arrive via the roster. That merge happens inside
+  // `buildConciergeFeed`, so the ledger is threaded in as an out-param and stamped there, exactly as
+  // `rolledUpGreen` already is. Stamping it here off local `status` alone would leave every unhosted
+  // red with no epoch — and a red with no epoch is never retracted, which is the whole bug.
+  const retraction = windowRetractionLedger();
 
   // The store's shouldInterrupt is a STABLE function reference, so subscribing to it alone would
   // never re-render when a rule is added/cleared. Subscribe to the rules map and rebuild the gate
@@ -100,6 +123,8 @@ export function useConciergeFeed(opts?: UseConciergeFeedOpts): ConciergeFeed {
         roster,
         shouldInterrupt,
         pinnedProjectId,
+        agentMovement,
+        retraction,
       }),
     // `graceTick` is not referenced in the body BY DESIGN — it is the only input that changes when a
     // grace window closes with nothing else happening in the app, which is the whole point of it.
@@ -112,6 +137,7 @@ export function useConciergeFeed(opts?: UseConciergeFeedOpts): ConciergeFeed {
       branchStatus,
       openAgentIds,
       lastObserved,
+      agentMovement,
       interaction,
       roster,
       shouldInterrupt,

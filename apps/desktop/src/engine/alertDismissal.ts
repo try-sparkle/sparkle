@@ -73,6 +73,18 @@ function isRedStatus(status: AgentTabStatus | undefined): status is RedStatus {
   return status !== undefined && DISMISSIBLE.has(status);
 }
 
+/** The same predicate, for the other overlays that act on "is this a red the user could be asked
+ *  about" — today `engine/movementRetraction`.
+ *
+ *  EXPORTED SO THERE IS NO SECOND COPY. The distinct name is deliberate: `services/windowStatus`
+ *  exports its own `isRedStatus` answering the COLOUR question, and the two coincide today but are
+ *  not the same question (see the trap note in packages/ui/tokens.ts). A file importing both under
+ *  one name is how they would quietly become one. This one stays Tauri-free, which is the whole
+ *  reason this module does not simply reach for windowStatus's. */
+export function isDismissibleRed(status: AgentTabStatus | undefined): status is RedStatus {
+  return isRedStatus(status);
+}
+
 /** A never-seen agent's implicit record: no episodes, not dismissed. */
 export const EMPTY_ALERT: AgentAlertRecord = { seq: 0, lastRed: null, dismissedSeq: null };
 

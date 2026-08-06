@@ -141,6 +141,27 @@ export interface HookStatusEngineOpts {
   onStatus: (s: AgentTabStatus) => void;
 }
 
+/**
+ * THE SESSION RULE, as a pure function so there is exactly ONE of it.
+ *
+ * The per-agent hook log is keyed by WORKTREE, not by session, so it interleaves the main
+ * interactive agent with every background one-shot `claude` run in the same worktree (each a full
+ * SessionStart→…→SessionEnd) and with its subagents (whose events carry the MAIN session_id). Any
+ * consumer of that log has to answer this before it believes anything — {@link HookStatusEngine} and
+ * {@link createHookEventHandler} gate on it for the watcher path, and `engine/movementRetraction`
+ * gates on it for the `fleet_digest` path, which reads the SAME log off disk and would otherwise
+ * read a background one-shot's tool call as the agent resuming.
+ *
+ * Permissive in both directions where it has to be: an event with no `session_id` (an older emitter)
+ * is accepted, and so is anything seen before a lock is adopted — before adoption there is no
+ * "other" session to reject it in favour of. Every caller adopts before it gates.
+ */
+export function isMainSessionId(main: string | null, session: string | null | undefined): boolean {
+  if (!session) return true;
+  if (main === null) return true;
+  return session === main;
+}
+
 /** Events that (re)open the main turn — only a new prompt or session start. Notably NOT tool
  *  events: a background subagent's PreToolUse/PostToolUse must not reopen a turn closed by Stop. */
 const TURN_OPENERS = new Set(["SessionStart", "UserPromptSubmit"]);
@@ -193,9 +214,7 @@ export class HookStatusEngine {
    *  adopts before it gates, so the lock is always already set by the same event. A caller that
    *  gated WITHOUT adopting first would accept one foreign event; don't add one. */
   isMainSession(ev: HookEvent): boolean {
-    if (!ev.session_id) return true;
-    if (this.mainSession === null) return true;
-    return ev.session_id === this.mainSession;
+    return isMainSessionId(this.mainSession, ev.session_id);
   }
 
   /** Adopt the first session_id seen as the main agent's. A COMMAND, named as one — the single

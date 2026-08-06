@@ -412,6 +412,12 @@ describe("dictation://audio-recovered (the frame-liveness watchdog's all-clear)"
     `No audio from "MacBook Pro Microphone". Another app (a screen recorder or virtual audio ` +
     `device) may be holding the microphone. Pick a different input in the mic menu, or turn the ` +
     `mic off and on.`;
+  /** The SAME watchdog's other report — macOS handing the process zeros on a grant it calls live.
+   *  A second kind, one emitter: the all-clear has to retract this one too. */
+  const STALE_GRANT_ERROR =
+    `macOS is sending silence instead of audio from "MacBook Pro Microphone", even though ` +
+    `Sparkle's microphone permission looks granted. Quit Sparkle and open it again — that usually ` +
+    `re-establishes the grant.`;
   /** A failure that is STILL TRUE when frames resume — audio flowing again says nothing about a
    *  half-downloaded voice model, so this notice must survive the all-clear. */
   const UNRELATED_ERROR = "model download completed but expected files are missing";
@@ -447,6 +453,25 @@ describe("dictation://audio-recovered (the frame-liveness watchdog's all-clear)"
     expect(useDictationStore.getState().status).toBe("idle");
 
     emit("dictation://audio-recovered", null);
+    expect(useDictationStore.getState().status).toBe("listening");
+    expect(useDictationStore.getState().deadMicSilent).toBe(false);
+  });
+
+  it("retracts the STALE-GRANT report too — it is the same watchdog (knightwatch probe 1)", () => {
+    // The seam this asserts drifted the moment a second watchdog kind was added: both ends of the
+    // retraction tested `classifyVoiceError(...) === "no-audio"`, so a stale-grant report latched
+    // no fault, the all-clear early-returned on `!deadMicSilent`, and the notice stayed up over a
+    // microphone that had recovered — with the mic drawn as paused until the user cycled it.
+    //
+    // Asserted on the OUTPUT of the recovery (notice gone, mic listening again), not on the flag:
+    // a version that latched the fault but still refused to clear the notice would pass a
+    // `deadMicSilent === true` assertion while shipping the visible half of the bug.
+    emit("dictation://error", STALE_GRANT_ERROR);
+    expect(useDictationStore.getState().error).toBe(STALE_GRANT_ERROR);
+    expect(useDictationStore.getState().status).toBe("error");
+
+    emit("dictation://audio-recovered", null);
+    expect(useDictationStore.getState().error).toBeNull();
     expect(useDictationStore.getState().status).toBe("listening");
     expect(useDictationStore.getState().deadMicSilent).toBe(false);
   });

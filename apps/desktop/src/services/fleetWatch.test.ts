@@ -134,6 +134,7 @@ interface Spies {
   deliver: ReturnType<typeof vi.fn>;
   liveAgents: ReturnType<typeof vi.fn>;
   observedStatus: ReturnType<typeof vi.fn>;
+  publishMovement: ReturnType<typeof vi.fn>;
 }
 
 /** Deps whose every outward call is a spy, so a test asserts on SIDE EFFECTS (a claim, a write) and
@@ -161,6 +162,7 @@ function fakeDeps(opts: {
     ),
     claimForIdle: vi.fn(async (agentId: string) => opts.claimed?.[agentId] ?? []),
     deliver: vi.fn(async () => {}),
+    publishMovement: vi.fn(() => {}),
     // Defaults to a MOUNTED, resting pane for every agent, because that is the only state in which
     // delivery is even possible — an agent with no status entry has no PTY. A test that wants the
     // pane-less case passes `statuses: {}`.
@@ -177,6 +179,7 @@ function fakeDeps(opts: {
     inboxStatus: spies.inboxStatus as unknown as FleetWatchDeps["inboxStatus"],
     claimForIdle: spies.claimForIdle as unknown as FleetWatchDeps["claimForIdle"],
     deliver: spies.deliver as unknown as FleetWatchDeps["deliver"],
+    publishMovement: spies.publishMovement as unknown as FleetWatchDeps["publishMovement"],
   };
   return { deps, spies };
 }
@@ -775,5 +778,78 @@ describe("defaultFleetWatchDeps().liveAgents", () => {
     } as never);
 
     expect(defaultFleetWatchDeps().liveAgents()).toEqual([{ agentId: "keep", projectId: "p1" }]);
+  });
+});
+
+// ── ARTIFACT EVIDENCE OF MOVEMENT (bead sparkle-7ba9e) ─────────────────────────────────────────
+//
+// This loop's own job is idle delivery, but the digest it already fetches also answers "has this
+// agent acted", which is the only thing that can retract a red on an agent no pane is watching.
+// These cases pin that the second reading is actually PUBLISHED — an unwired publish would restore
+// the latched-BLOCKED-pill bug with every other test here still green.
+describe("publishing artifact movement", () => {
+  it("publishes each agent's last hook event, and NOT its commits", async () => {
+    const { deps, spies } = fakeDeps({
+      agents: ["a1"],
+      digest: digestOf(
+        [facts("a1", { hooks: { lastEvent: "PostToolUse", lastEventMs: NOW - 1_000 }, git: { lastCommitMs: NOW - 9_000 } })],
+        [verdict("a1")],
+      ),
+    });
+    await pollFleetOnce(deps);
+    // The COMMIT is deliberately absent: a branch tip is advanced by any process sharing the
+    // worktree — including the human, in the very scenario this feature is written around — so it is
+    // not attributable to the agent. See engine/movementRetraction's header.
+    expect(spies.publishMovement).toHaveBeenCalledWith({
+      a1: { lastEvent: "PostToolUse", lastEventMs: NOW - 1_000, sessionId: "s1" },
+    });
+  });
+
+  // A tick with nothing to look at must SAY so. Leaving the previous reading standing would let a
+  // retraction rest on facts about a fleet that is no longer there.
+  it("publishes an empty reading when there are no live agents", async () => {
+    const { deps, spies } = fakeDeps({ agents: [] });
+    await pollFleetOnce(deps);
+    expect(spies.publishMovement).toHaveBeenCalledWith({});
+  });
+
+  // Published from the RAW facts, before the delivery reasoning — so evidence never depends on
+  // whether this loop decided to write to the agent.
+  it("publishes for an agent it declined to deliver to", async () => {
+    const { deps, spies } = fakeDeps({
+      agents: ["a1"],
+      statuses: { a1: "working" }, // observed-not-resting: no delivery
+      digest: digestOf(
+        [facts("a1", { hooks: { lastEvent: "PreToolUse", lastEventMs: NOW - 2_000 } })],
+        [verdict("a1")],
+      ),
+    });
+    const tick = await pollFleetOnce(deps);
+    expect(tick.delivered).toEqual([]);
+    expect(spies.publishMovement).toHaveBeenCalledWith({
+      a1: { lastEvent: "PreToolUse", lastEventMs: NOW - 2_000, sessionId: "s1" },
+    });
+  });
+
+  // WHOSE work was it? The hook log is keyed by WORKTREE, so it also holds every background one-shot
+  // `claude` ever run there — and an event NAME alone cannot tell those apart from the agent's own.
+  // Carrying the session across is the only way the consumer can refuse a foreign one, so a
+  // projection that dropped it would silently retract live reds. See engine/movementRetraction 4(b).
+  it("publishes the session the event belongs to, not just its name", async () => {
+    const { deps, spies } = fakeDeps({
+      agents: ["a1"],
+      digest: digestOf(
+        [
+          facts("a1", {
+            hooks: { lastEvent: "PostToolUse", lastEventMs: NOW - 1_000, sessionId: "bg-oneshot" },
+          }),
+        ],
+        [verdict("a1")],
+      ),
+    });
+    await pollFleetOnce(deps);
+    expect(spies.publishMovement).toHaveBeenCalledWith({
+      a1: { lastEvent: "PostToolUse", lastEventMs: NOW - 1_000, sessionId: "bg-oneshot" },
+    });
   });
 });

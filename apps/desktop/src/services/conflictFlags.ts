@@ -69,7 +69,23 @@ function parseOne(v: unknown): ConflictingPr | undefined {
   if (owner !== null && typeof owner !== "string") return undefined;
   if (kind !== "conflicting" && kind !== "stale") return undefined;
   if (!Number.isSafeInteger(o["commitsBehind"]) || (o["commitsBehind"] as number) < 0) return undefined;
-  if (typeof o["untested"] !== "boolean") return undefined;
+  // MANDATORY KEY, UNCONSTRAINED VALUE — and the asymmetry is the point.
+  //
+  // `evidence` is a Rust `String` with no `Option` and no `skip_serializing_if`, so an absent key is
+  // real drift and takes the all-or-nothing branch like every other stated field. Dropping it was
+  // not free: it is the ONLY field that separates a first-hand reading from an inherited or unread
+  // one, so `last-known`, `last-known-unconfirmed` and `unknown` rows reached `conflictCondition`
+  // as ordinary conflicting data and were narrated "no CI has ever run on it". Rust's `untested`
+  // cannot stand in for it — it is `is_dirty || refusal.is_some()`, so it answers `true` for both —
+  // and it is not parsed at all: nothing downstream reads a field that cannot discriminate.
+  //
+  // The VALUE is not checked against the six documented strings. That set has grown three times, and
+  // this parser is all-or-nothing: rejecting a seventh value would turn every sweep into "we did not
+  // look" for the whole fleet at once — the precise failure the value set was split to prevent. An
+  // unrecognised value survives verbatim and is classified as NOT CURRENT downstream, which is the
+  // weaker claim and the safe one.
+  const evidence = o["evidence"];
+  if (typeof evidence !== "string" || evidence === "") return undefined;
   if (!Number.isSafeInteger(o["unresolvedSecs"]) || (o["unresolvedSecs"] as number) < 0) return undefined;
   // `null` AND absent both mean "no hold reason", and the producer sends the first: `blocked_by` is
   // a Rust `Option<String>`, and serde with no `skip_serializing_if` renders `None` as JSON `null`.
@@ -84,8 +100,8 @@ function parseOne(v: unknown): ConflictingPr | undefined {
     ownerAgentId: owner,
     kind,
     commitsBehind: o["commitsBehind"] as number,
-    untested: o["untested"],
     unresolvedSecs: o["unresolvedSecs"] as number,
+    evidence,
     ...(typeof blockedBy === "string" ? { blockedBy } : {}),
   };
 }

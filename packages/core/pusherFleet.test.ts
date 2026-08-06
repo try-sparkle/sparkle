@@ -495,8 +495,10 @@ describe("pr-conflicting", () => {
     ownerAgentId: null,
     kind: "conflicting",
     commitsBehind: 220,
-    untested: true,
     unresolvedSecs: 3 * 60 * 60 + 5 * 60,
+    // THE FULLY-CONFIRMED CASE by default, so the tests that pin the strongest sentence say which
+    // evidence earns it. Every other value is exercised by the block at the bottom of this file.
+    evidence: "no-checks-ran",
     ...over,
   });
 
@@ -584,14 +586,14 @@ describe("pr-conflicting", () => {
     expect(c!.text).toContain("Owner recorded, but not an agent this window can see");
   });
 
-  // THE ONE THAT KEEPS THE HEADLINE HONEST. `untested` is claimed for conflicting PRs only; a
+  // THE ONE THAT KEEPS THE HEADLINE HONEST. "Untested" is claimed for conflicting PRs only; a
   // mergeable-but-behind PR has had CI, and blurring the two costs the headline its credibility.
   it("never calls a STALE pr untested", () => {
     const [c] = evaluateFleetConditions(
       [],
       T0,
       [],
-      [pr({ pr: 1050, kind: "stale", untested: false, commitsBehind: 40 })],
+      [pr({ pr: 1050, kind: "stale", evidence: "n/a", commitsBehind: 40 })],
     );
     const line = c!.text.split("\n").find((l) => l.includes("#1050"));
     expect(line).toBeDefined();
@@ -601,7 +603,7 @@ describe("pr-conflicting", () => {
   });
 
   it("does not offer the conflict remedy in a stale-only report", () => {
-    const [c] = evaluateFleetConditions([], T0, [], [pr({ kind: "stale", untested: false })]);
+    const [c] = evaluateFleetConditions([], T0, [], [pr({ kind: "stale", evidence: "n/a" })]);
     expect(c!.text).not.toMatch(/resolvable without judgement/);
     expect(c!.text).not.toMatch(/untested/i);
     expect(citable(c!.text, c!.measured)).toBe(true);
@@ -612,7 +614,7 @@ describe("pr-conflicting", () => {
       [],
       T0,
       [],
-      [pr({ pr: 700, kind: "stale", untested: false }), pr({ pr: 800 })],
+      [pr({ pr: 700, kind: "stale", evidence: "n/a" }), pr({ pr: 800 })],
     );
     expect(c!.text.indexOf("#800")).toBeLessThan(c!.text.indexOf("#700"));
     expect(c!.text).toContain("1 more can still merge");
@@ -651,13 +653,155 @@ describe("pr-conflicting owner naming", () => {
       ownerAgentId: "nameless",
       kind: "conflicting",
       commitsBehind: 3,
-      untested: true,
       unresolvedSecs: 60,
+      evidence: "no-checks-ran",
     };
     const [c] = evaluateFleetConditions([{ agentId: "nameless" }], T0, [], [base]);
     expect(c!.text).toContain("Owner recorded, but that agent has no name");
     expect(c!.text).not.toContain("an unnamed agent");
     expect(c!.agentIds).toEqual(["nameless"]);
+    expect(citable(c!.text, c!.measured)).toBe(true);
+  });
+});
+
+// EVIDENCE IS WHAT LICENSES THE STRONGEST SENTENCE, AND MOST VALUES DO NOT LICENSE IT.
+//
+// A CONFLICTING row is what a directly-observed absence of CI produces AND what an inherited or
+// never-taken verdict produces — Rust computes `untested` as `is_dirty || refusal.is_some()`, which
+// is why the consumer does not carry the field at all. A report composed without `evidence` told the
+// founder "no CI has ever run on it" about rows the producer
+// had explicitly marked as not-read-this-look. Every assertion here is on the LINE the reader sees:
+// a test that checked the fixture carried `evidence` would pass against a `conflictCondition` that
+// ignores the field entirely, which is exactly the bug.
+describe("pr-conflicting evidence", () => {
+  // Its own fixture: the factory above is scoped to its describe, and every case here differs from
+  // the default in exactly one field — the one under test.
+  const pr = (over: Partial<ConflictingPr> = {}): ConflictingPr => ({
+    pr: 1091,
+    branch: "sparkle/roborev-backlog-notice-collapse",
+    ownerAgentId: null,
+    kind: "conflicting",
+    commitsBehind: 220,
+    unresolvedSecs: 3 * 60 * 60 + 5 * 60,
+    evidence: "no-checks-ran",
+    ...over,
+  });
+  const lineFor = (text: string, n: number) => text.split("\n").find((l) => l.includes(`#${n}`));
+
+  it("claims no CI has EVER run only for the directly-observed case", () => {
+    const [c] = evaluateFleetConditions([], T0, [], [pr({ evidence: "no-checks-ran" })]);
+    expect(lineFor(c!.text, 1091)).toContain("no CI has ever run on it");
+  });
+
+  // THE TWO INHERITED STATES. Both carry a real, recent verdict for this head — so the PR is still
+  // named, still called conflicting, still called untested. What it may not do is present a verdict
+  // nobody re-read as one somebody did.
+  for (const evidence of ["last-known", "last-known-unconfirmed"] as const) {
+    it(`says a ${evidence} reading is not current instead of claiming first-hand knowledge`, () => {
+      const [c] = evaluateFleetConditions([], T0, [], [pr({ evidence })]);
+      const line = lineFor(c!.text, 1091);
+      expect(line).not.toContain("no CI has ever run on it");
+      expect(line).toContain("NOT current");
+      expect(line).toContain("not re-read on the last look");
+      // Reported and actionable, not dropped or hedged into uselessness.
+      expect(line).toContain("conflicting, and therefore untested");
+      expect(line).toContain("220 commits behind main");
+      expect(citable(c!.text, c!.measured)).toBe(true);
+    });
+  }
+
+  // `unknown` is the one with nothing confirmable behind it — and it still must not be dropped:
+  // during a `gh` outage that would suppress a genuine standing conflict for the whole outage.
+  it("says an unknown reading is not current, and still reports the PR", () => {
+    const [c] = evaluateFleetConditions([], T0, [], [pr({ evidence: "unknown" })]);
+    const line = lineFor(c!.text, 1091);
+    expect(line).not.toContain("no CI has ever run on it");
+    expect(line).toContain("nothing about this commit could be confirmed");
+    expect(line).toContain("#1091");
+    expect(citable(c!.text, c!.measured)).toBe(true);
+  });
+
+  // Checks that EXIST but predate the conflict are not an absence of CI. Same conclusion, different
+  // route, and the report states the route.
+  it("does not call stale checks an absence of CI", () => {
+    const [c] = evaluateFleetConditions([], T0, [], [pr({ evidence: "checks-are-stale" })]);
+    const line = lineFor(c!.text, 1091);
+    expect(line).not.toContain("no CI has ever run on it");
+    expect(line).toContain("its only checks ran before the conflict arose");
+    expect(citable(c!.text, c!.measured)).toBe(true);
+  });
+
+  // ── THE AGGREGATE IS A CLAIM TOO, AND IT COVERS EVERY ROW ────────────────────────────────────
+  // The headline used to say "they have never been tested" unconditionally, one line above a row
+  // that says its checks DID run, or that nobody re-read the verdict. Same defect as the row-level
+  // one, one level up: the strongest sentence stated where the evidence does not license it.
+  it("does not claim the fleet was NEVER tested when a row's checks merely predate the conflict", () => {
+    const [c] = evaluateFleetConditions([], T0, [], [pr({ evidence: "checks-are-stale" })]);
+    const head = c!.text.split("\n")[0];
+    expect(head).not.toContain("never been tested");
+    expect(head).toContain("nothing current has tested it");
+    // And the remedy, which promised "the CI run it has never had" over the same rows.
+    expect(c!.text).not.toContain("the CI run it has never had");
+    expect(c!.text).toContain("the CI run it is missing");
+    expect(citable(c!.text, c!.measured)).toBe(true);
+  });
+
+  it("does not claim the fleet was NEVER tested over a verdict nobody re-read", () => {
+    const [c] = evaluateFleetConditions([], T0, [], [pr({ evidence: "unknown" }), pr({ pr: 92 })]);
+    const head = c!.text.split("\n")[0];
+    expect(head).not.toContain("never been tested");
+    expect(head).toContain("nothing current has tested them");
+    expect(citable(c!.text, c!.measured)).toBe(true);
+  });
+
+  // The strongest sentence is still SAID when every row earns it — a fix that just weakened the
+  // headline everywhere would pass the two above and cost the report its whole point.
+  it("still says NEVER TESTED when every row is the directly-observed absence", () => {
+    const [c] = evaluateFleetConditions([], T0, [], [pr(), pr({ pr: 92 })]);
+    expect(c!.text.split("\n")[0]).toContain("they have never been tested");
+    expect(c!.text).toContain("the CI run it has never had");
+  });
+
+  // ── A `stale` ROW IS A MERGEABILITY CLAIM, AND A REFUSED READ CANNOT MAKE IT ──────────────────
+  // Rust answers `kind: "stale"` from `!is_dirty`, and on a refused look that is the LAST value
+  // `gh` reported rather than a current one — so `kind: "stale", evidence: "unknown"` is a real
+  // payload, and the row used to be narrated as flatly "mergeable".
+  it("does not call a stale pr mergeable in the present tense on a reading nobody took", () => {
+    const [c] = evaluateFleetConditions(
+      [],
+      T0,
+      [],
+      [pr({ pr: 1050, kind: "stale", evidence: "unknown", commitsBehind: 40 })],
+    );
+    const line = lineFor(c!.text, 1050);
+    expect(line).not.toContain("— mergeable, but");
+    expect(line).toContain("last known to be mergeable");
+    expect(line).toContain("NOT current");
+    // Still reported, still actionable, and still never called untested.
+    expect(line).toContain("40 commits behind main");
+    expect(line).not.toMatch(/untested/i);
+    expect(citable(c!.text, c!.measured)).toBe(true);
+  });
+
+  it("does not tell the founder a stale-only fleet can still merge TODAY on an unread verdict", () => {
+    const [c] = evaluateFleetConditions(
+      [],
+      T0,
+      [],
+      [pr({ pr: 1050, kind: "stale", evidence: "last-known", commitsBehind: 40 })],
+    );
+    expect(c!.text).not.toContain("can still merge today");
+    expect(c!.text).toContain("was last known to merge, on a reading that is NOT current");
+    expect(citable(c!.text, c!.measured)).toBe(true);
+  });
+
+  // FAIL SAFE ON A VALUE THIS BUILD HAS NEVER SEEN. The producer's value set has grown three times;
+  // the next growth must degrade to the WEAKER sentence, never to a claim of knowledge nobody has.
+  it("treats an evidence value it does not recognise as not current", () => {
+    const [c] = evaluateFleetConditions([], T0, [], [pr({ evidence: "some-future-value" })]);
+    const line = lineFor(c!.text, 1091);
+    expect(line).not.toContain("no CI has ever run on it");
+    expect(line).toContain("NOT current");
     expect(citable(c!.text, c!.measured)).toBe(true);
   });
 });
@@ -679,8 +823,8 @@ describe("pr-conflicting citation safety", () => {
           ownerAgentId: null,
           kind: "conflicting",
           commitsBehind: -5,
-          untested: true,
           unresolvedSecs: -1,
+          evidence: "no-checks-ran",
         },
       ],
     );

@@ -268,6 +268,26 @@ impl ConflictFlags {
     }
 }
 
+/// The payload for `conflict://detected` — the CURRENT FULL SET, identical to what
+/// [`conflict_flags`] returns.
+///
+/// A THIN WRAPPER OVER `list()`, AND THAT IS THE POINT. The emit used to send the one flag that had
+/// just escalated, which is a delta, and the consumer parses the event with the same all-or-nothing
+/// array parser it uses for the poll. A bare object is not an array, so EVERY event was dropped with
+/// "payload unreadable; keeping the last reading" — the listener has never once updated the store
+/// since it was written. The poll masked it: the store still caught up on the ten-minute floor, so
+/// the only symptom was latency the event exists to remove, plus a warn line per escalation.
+///
+/// The full set is the shape the consumer's contract asks for, and it is deliberately not a delta:
+/// a delta would need a merge rule on the TypeScript side, and that rule would be a second opinion
+/// about state this module already holds authoritatively.
+///
+/// Named rather than inlined so the wire shape is assertable without an `AppHandle` — the emit
+/// itself cannot be driven in a unit test, which is how the mismatch survived.
+fn detected_payload(flags: &ConflictFlags) -> Vec<ConflictFlag> {
+    flags.list()
+}
+
 // ══ COMMANDS ════════════════════════════════════════════════════════════════════════════════════
 
 /// Every conflict flag currently raised. The consumer polls this.
@@ -1086,7 +1106,10 @@ fn tick<R: Runtime>(app: &AppHandle<R>, watch: &mut Watch, now: u64) {
                 blocked_by = flag.blocked_by.as_deref().unwrap_or("none"),
                 "conflict watch escalated"
             );
-            let _ = app.emit("conflict://detected", &flag);
+            // The FULL SET, not `flag` — see [`detected_payload`]. `flag` is still what the warn
+            // line above reports, because "which PR just escalated" is the useful thing to log; it
+            // is not the useful thing to send, because the consumer replaces its whole reading.
+            let _ = app.emit("conflict://detected", detected_payload(&flags));
         }
     }
 
@@ -1549,6 +1572,50 @@ mod tests {
         assert_eq!(rows.len(), 1, "the flag must still be standing, not retracted 12 times over");
         assert_eq!(rows[0].target, "founder");
         assert_eq!(rows[0].commits_behind, 220 + 12 * 3, "and it reports the CURRENT drift");
+    }
+
+    /// THE EVENT PAYLOAD IS A JSON ARRAY, because the consumer parses it with an all-or-nothing
+    /// array parser and drops anything else on the floor.
+    ///
+    /// This asserts the SERIALIZED shape rather than the Rust type: `Vec<ConflictFlag>` is an array
+    /// by construction, so a test over the Rust value would pass against the bug it is here to
+    /// catch. The regression was `emit(..., &flag)` — one flag, serializing to a JSON object — and
+    /// the only place that difference is observable is after serde.
+    #[test]
+    fn the_detected_event_payload_serializes_as_an_array() {
+        let flags = ConflictFlags::default();
+        let facts = conflicting_facts();
+        let (state, decision) = climb(&observation(&facts, None), 3);
+        assert!(apply_flags(&flags, &facts, None, &decision, &state).is_some(), "a flag stands");
+
+        let json = serde_json::to_value(detected_payload(&flags)).expect("payload serializes");
+        let rows = json.as_array().expect("a JSON OBJECT here is the bug: the consumer needs an array");
+        assert_eq!(rows.len(), 1, "the full set, which is the one standing flag");
+        assert_eq!(rows[0]["pr"], facts.number, "and the entry is the flag, not a wrapper around it");
+        // The per-entry field names are pinned by `the_flag_serializes_with_the_contract_field_names`;
+        // what is asserted HERE is only the container, which is what the emit got wrong.
+    }
+
+    /// A SECOND standing flag must ride along on an escalation for the FIRST one.
+    ///
+    /// The delta this replaced could not do that: it sent only the PR that had just escalated. The
+    /// consumer REPLACES its whole reading rather than merging, so under a delta every event would
+    /// have told it that every other conflicting PR had resolved. Whole-set semantics are what make
+    /// replace-don't-merge correct over there.
+    #[test]
+    fn the_payload_carries_every_standing_flag_not_just_the_one_that_escalated() {
+        let flags = ConflictFlags::default();
+        let first = conflicting_facts();
+        let second = PrFacts { number: first.number + 1, ..conflicting_facts() };
+
+        for facts in [&second, &first] {
+            let (state, decision) = climb(&observation(facts, None), 3);
+            apply_flags(&flags, facts, None, &decision, &state);
+        }
+
+        let prs: Vec<u64> = detected_payload(&flags).iter().map(|f| f.pr).collect();
+        assert_eq!(prs.len(), 2, "both standing flags travel on every emit");
+        assert!(prs.contains(&first.number) && prs.contains(&second.number));
     }
 
     /// The three oid-shaped fields go straight into a `git` argument.

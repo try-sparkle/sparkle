@@ -131,6 +131,27 @@ export interface StandingDuty {
 export const DUTY_OVERDUE_FACTOR = 2;
 
 /**
+ * HOW the producer knows a conflicting PR is untested — the complete value set of Rust's
+ * `ConflictFlag.evidence` (`conflict_ladder::untested_evidence`), which is the only field that tells
+ * a reading taken NOW from one inherited or never taken at all.
+ *
+ * The three-way rule the producer's own doc states, and the one {@link conflictCondition} follows:
+ *   * FIRST-HAND now — `no-checks-ran`, `checks-are-stale`, `n/a`.
+ *   * A REAL VERDICT, not read this look — `last-known`, `last-known-unconfirmed`. Act on it; say it
+ *     is not current. Never silently drop it.
+ *   * NO CONFIRMABLE VERDICT for this commit — `unknown`. Still not an empty row: `kind` may be
+ *     inherited from a real earlier reading, so it licenses "we cannot vouch for this verdict",
+ *     never "there is no verdict".
+ */
+export type ConflictEvidence =
+  | "no-checks-ran"
+  | "checks-are-stale"
+  | "last-known"
+  | "last-known-unconfirmed"
+  | "unknown"
+  | "n/a";
+
+/**
  * One open pull request that cannot merge, or can but is drifting.
  *
  * ── WHAT NOTHING WAS WATCHING ────────────────────────────────────────────────────────────────────
@@ -172,10 +193,23 @@ export interface ConflictingPr {
   kind: "conflicting" | "stale";
   /** How far behind the base branch. The number that says whether this is a minute or an afternoon. */
   commitsBehind: number;
-  /** Has CI never run on this PR? See the header — for a conflicting PR this is the mechanism. */
-  untested: boolean;
   /** How long it has been in this state, as the producer measured it. Not recomputed here. */
   unresolvedSecs: number;
+  /**
+   * HOW we know what `kind` says — see {@link ConflictEvidence}. Mandatory, because the producer
+   * always states it and because without it a reading that is NOT CURRENT is indistinguishable from
+   * one taken this second: a conflicting row is equally what a directly-observed absence of CI and
+   * an inherited-or-unread verdict produce, and the report used to narrate both as "no CI has ever
+   * run on it". It is also the ONLY field that separates them — Rust's `untested` answers `true` for
+   * both, which is why the consumer no longer carries it.
+   *
+   * WIDENED WITH `string` ON PURPOSE. This value set has grown three times already, so a strict
+   * union would make a seventh value a PARSE FAILURE — and the parser is all-or-nothing, so one
+   * unrecognised value would mute the detector for the whole fleet at once. That is the exact
+   * failure the value set was split to prevent. An unrecognised value is retained verbatim and
+   * narrated as NOT CURRENT, which is the weaker and therefore safe claim.
+   */
+  evidence: ConflictEvidence | (string & {});
   /** Whatever the producer knows is holding it, quoted verbatim. Absent when nothing is recorded. */
   blockedBy?: string;
 }
@@ -631,6 +665,54 @@ function behindOf(c: ConflictingPr): number {
   return Math.max(0, Math.trunc(c.commitsBehind));
 }
 
+/**
+ * The `evidence` values that mean WE READ THIS PR ON THIS LOOK. Everything else — the two inherited
+ * states, `unknown`, and any value this build has never heard of — is a reading that is not current.
+ *
+ * A whitelist rather than a blacklist, and that direction is the safety property: an evidence value
+ * added on the Rust side later falls into "not current" and gets the weaker sentence, instead of
+ * being narrated as first-hand knowledge nobody has.
+ */
+const FIRST_HAND_EVIDENCE = new Set<string>([
+  "no-checks-ran",
+  "checks-are-stale",
+  "n/a",
+] satisfies ConflictEvidence[]);
+
+/** Is this row a reading somebody actually took on the last look? Everything else is NOT current. */
+const notCurrent = (c: ConflictingPr): boolean => !FIRST_HAND_EVIDENCE.has(c.evidence);
+
+/**
+ * The compound "conflicting — and therefore untested" clause for one PR, qualified by HOW the
+ * producer knows it.
+ *
+ * ── A READING THAT IS NOT CURRENT IS STILL REPORTED, AND IS STILL SAID TO BE UNTESTED ────────────
+ * It just stops claiming to have been taken now. `last-known` and `last-known-unconfirmed` carry a
+ * real, recent verdict for this head; `unknown` carries one that may belong to a head that has since
+ * moved. Dropping or greying any of them would suppress a genuine standing conflict for the whole of
+ * a `gh` outage — and for an unrecognised `mergeStateStatus` that is every tracked PR at once, which
+ * is the failure the producer's evidence split exists to prevent. So: report it, act on it, and say
+ * the reading is not current.
+ */
+function testingPhrase(c: ConflictingPr): string {
+  if (notCurrent(c)) {
+    const why =
+      c.evidence === "unknown"
+        ? "nothing about this commit could be confirmed on the last look"
+        : "the verdict is real and recent, but was not re-read on the last look";
+    return `conflicting, and therefore untested — but this reading is NOT current: ${why}`;
+  }
+  // Checks that EXIST but ran before the conflict arose are not "no CI has ever run": they ran, and
+  // they ran against a merge that no longer applies. Same conclusion — nothing current has tested
+  // this PR — reached by a different route, and stating the wrong route is a citable falsehood in a
+  // report whose whole credibility is that it does not overstate.
+  if (c.evidence === "checks-are-stale") {
+    return "conflicting, and therefore untested — its only checks ran before the conflict arose, and no new run can be created";
+  }
+  // The only value left that a CONFLICTING row can carry: Rust returns `"n/a"` for `!is_dirty` only.
+  return "conflicting, and therefore untested — no CI has ever run on it";
+}
+
 function ownerPhrase(c: ConflictingPr, labels: ReadonlyMap<string, string | undefined>): string {
   if (c.ownerAgentId === null) return "Owner unresolved";
   if (!labels.has(c.ownerAgentId)) return "Owner recorded, but not an agent this window can see";
@@ -647,13 +729,13 @@ function ownerPhrase(c: ConflictingPr, labels: ReadonlyMap<string, string | unde
  * for the mechanism (no `pull_request` event → no run ever created → checks ABSENT, not failing).
  *
  * ── STALE ENTRIES ARE REPORTED, AND ARE NEVER CALLED UNTESTED ────────────────────────────────────
- * `untested` is claimed for `kind: "conflicting"` only. A mergeable-but-behind PR has had CI; its
+ * "Untested" is claimed for `kind: "conflicting"` only. A mergeable-but-behind PR has had CI; its
  * problem is that the rebase gets more expensive, not that its correctness is unknown, and blurring
  * the two would cost the headline exactly the credibility it is built on. They are still reported,
  * because the moment a drifting PR goes conflicting is the moment it is too late to have noticed.
  *
  * ── WHAT IS NOT DECIDED HERE ─────────────────────────────────────────────────────────────────────
- * `kind` and `untested` are the producer's classification and are taken as given. Re-deriving either
+ * `kind` and `evidence` are the producer's classification and are taken as given. Re-deriving either
  * from `commitsBehind` would be a second opinion about the same PR, invisible to the tests that
  * cover the producer — the failure `fleetVerdict` names and `pusherSnapshots` refuses for the same
  * reason. This module composes sentences from evidence; it does not re-judge it.
@@ -690,34 +772,45 @@ export function conflictCondition(
     // holds for any caller.
     const behind = `${behindOf(c)} commits behind main`;
     if (c.kind === "conflicting") {
-      // The compound fact, in one clause, on every line. `untested` is affirmative evidence that no
-      // run exists; without it the mechanism still holds — GitHub creates no NEW run for a PR it
-      // cannot merge — so the weaker sentence states that instead of guessing at history.
-      const testing = c.untested
-        ? "conflicting, and therefore untested — no CI has ever run on it"
-        : "conflicting, and therefore untested from here on — GitHub creates no new run for a PR it cannot merge";
-      return `  - #${c.pr} ${c.branch} — ${testing}. ${behind}, unresolved for ${h}h ${m}m. ${who}.${held}`;
+      // The compound fact, in one clause, on every line — and never stronger than `evidence` allows.
+      // See {@link testingPhrase}: `kind` alone cannot tell a directly-observed absence from an
+      // inherited or unread verdict, because both arrive here as `conflicting`.
+      return `  - #${c.pr} ${c.branch} — ${testingPhrase(c)}. ${behind}, unresolved for ${h}h ${m}m. ${who}.${held}`;
     }
-    return `  - #${c.pr} ${c.branch} — mergeable, but ${behind} and drifting further with every merge. Unresolved for ${h}h ${m}m. ${who}.${held}`;
+    // "Mergeable" is `is_dirty: false` AS LAST READ. A refused look carries that value forward
+    // rather than re-establishing it, so a `stale` row whose evidence is not current may not claim
+    // it in the present tense — the same rule the conflicting lines above already follow.
+    const merges = notCurrent(c)
+      ? "last known to be mergeable — that reading is NOT current — but"
+      : "mergeable, but";
+    return `  - #${c.pr} ${c.branch} — ${merges} ${behind} and drifting further with every merge. Unresolved for ${h}h ${m}m. ${who}.${held}`;
   });
 
   const nC = conflicting.length;
   const nS = stale.length;
+  // AN AGGREGATE MAY BE NO STRONGER THAN THE WEAKEST ROW IT COVERS. "Never been tested" is licensed
+  // by the directly-observed absence and nothing else: a `checks-are-stale` row DID run CI, and an
+  // inherited or unread row is a verdict nobody re-read — so the old absolute headline contradicted
+  // the very sentence `testingPhrase` composes one line below it.
+  const neverRan = conflicting.every((c) => c.evidence === "no-checks-ran");
+  const staleRead = stale.every((c) => !notCurrent(c));
   const head =
     nC > 0
-      ? `${nC} open ${nC === 1 ? "PR cannot" : "PRs cannot"} merge — and that means ${nC === 1 ? "it has" : "they have"} never been tested. ` +
+      ? `${nC} open ${nC === 1 ? "PR cannot" : "PRs cannot"} merge — and that means ${neverRan ? `${nC === 1 ? "it has" : "they have"} never been tested` : `nothing current has tested ${nC === 1 ? "it" : "them"}`}. ` +
         `A conflicting PR never fires GitHub's pull_request event, so no CI run is ever created for it: the checks ` +
         `are not failing, they are ABSENT. Conflicting and untested are one fact, not two.` +
-        (nS > 0 ? ` ${nS} more can still merge, but ${nS === 1 ? "is" : "are"} drifting behind main.` : "")
+        (nS > 0
+          ? ` ${nS} more ${staleRead ? "can still merge" : `${nS === 1 ? "was" : "were"} last known to merge`}, but ${nS === 1 ? "is" : "are"} drifting behind main.`
+          : "")
       : `${nS} open ${nS === 1 ? "PR is" : "PRs are"} behind main and drifting further with every merge. ` +
-        `Each can still merge today; what grows is the rebase.`;
+        `Each ${staleRead ? "can still merge today" : "was last known to merge, on a reading that is NOT current"}; what grows is the rebase.`;
 
   // Only when there IS a conflict to resolve. A remedy sentence about conflicts appended to a
   // stale-only report is advice about a situation the report just said does not hold.
   const remedy =
     nC > 0
       ? `\nA conflict on a branch that is only one commit ahead of main is usually resolvable without ` +
-        `judgement: rebase onto main and push, and the CI run it has never had arrives with it.`
+        `judgement: rebase onto main and push, and ${neverRan ? "the CI run it has never had" : "the CI run it is missing"} arrives with it.`
       : "";
 
   return {
