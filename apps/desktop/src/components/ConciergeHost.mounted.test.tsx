@@ -161,6 +161,7 @@ import { armedIntents, cancelIntent, fireIntent } from "../services/dispatchInte
 import { setConciergeChat } from "../stores/conciergeThreadStore";
 import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
 import { useProjectStore } from "../stores/projectStore";
+import { CONCIERGE_CHATTING_WITH_TESTID } from "./Concierge/ConciergeColumn";
 import { MOUNTED_THREAD_TESTID } from "./Concierge/MountedAgentThread";
 import { MOUNTED_NOTICE_TESTID } from "./Concierge/MountedNotice";
 import { CONCIERGE_THREAD_TESTID } from "../engine/composeBoxHeight";
@@ -453,6 +454,29 @@ describe("ConciergeHost — the suite is actually in the mounted state", () => {
     mount();
     expect(screen.getByTestId("concierge-thread")).toBeTruthy();
     expect(screen.queryByTestId(MOUNTED_THREAD_TESTID)).toBeNull();
+  });
+
+  // ══ …AND IT STAYS MOUNTED WHEN THE AGENT HAS NO projectStore ROW (roborev 59232) ═══════════════
+  // `mountedName` used to be `mountedRow?.name ?? (mountedIsSparkle ? … )`, so an agent with no row
+  // that is not the app-owned Sparkle one resolved NO NAME — and `mountedAgent` is gated on
+  // `mountedAgentId && mountedName`, so a missing name did not degrade one label, it silently
+  // unmounted the whole column: the chip vanished and the SPARKLE conversation rendered, while
+  // `send` still aimed at that agent's PTY because routing reads `mountedAgentId`, which stays
+  // non-null. That is the founder's original defect — the pane says one thing, the words go
+  // somewhere else — and bead `sparkle-gw8yi` records the app really producing this state.
+  //
+  // Fixing it at `railTargetName` alone left THIS surface lying, which is why the row lives here and
+  // not only in the rail suite.
+  it("REGRESSION: stays mounted, with the chip, when the agent has no projectStore row", () => {
+    useProjectStore.setState({
+      projects: [] as unknown as ReturnType<typeof useProjectStore.getState>["projects"],
+    });
+    mount();
+    // The discriminator, as above: the concierge thread's ABSENCE is what proves the mount held.
+    expect(screen.queryByTestId("concierge-thread")).toBeNull();
+    expect(screen.getByTestId(MOUNTED_THREAD_TESTID)).toBeTruthy();
+    // And the chip still names him the agent — from `promptTarget.name`, the value the send aims at.
+    expect(screen.getByTestId(CONCIERGE_CHATTING_WITH_TESTID).textContent).toContain(MOUNTED.name);
   });
 });
 

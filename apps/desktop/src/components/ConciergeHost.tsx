@@ -1468,7 +1468,28 @@ export function ConciergeHost({
     subscribeAgentTranscriptWorktrees,
     () => (mountedIsSparkle ? (agentTranscriptWorktree(mountedAgentId!) ?? null) : null),
   );
-  const mountedName = mountedRow?.name ?? (mountedIsSparkle ? SPARKLE_AGENT_NAME : undefined);
+  // ══ A ROUTABLE MOUNT ALWAYS HAS A NAME — THE FALLBACK BELONGS HERE, NOT AT ONE CONSUMER ════════
+  // The third `??` is the whole of roborev 59232, and it is at the SOURCE deliberately. Without it
+  // `mountedName` is `undefined` for a mounted, routable agent that has no `projectStore` row and is
+  // not the app-owned Sparkle one — a state bead `sparkle-gw8yi` records the app actually producing
+  // — and `undefined` there does not degrade one label, it silently unmounts the whole column:
+  //
+  //   • `mountedAgent` (gated on `mountedAgentId && mountedName`) goes null, so `ConciergeColumn`
+  //     drops the "Chatting with ● <Agent>" chip AND renders the SPARKLE conversation…
+  //   • …while `send` still aims at that agent's PTY, because routing reads `mountedAgentId`, which
+  //     is non-null throughout;
+  //   • and the composer's `draftKey` falls back to `"concierge"` while this file stashes and
+  //     restores attachments under `agent:<id>`, so the draft and its files part company.
+  //
+  // That is the founder's original defect exactly — the pane says one thing, the words go somewhere
+  // else — so fixing it at `railTargetName` alone (the first cut) left the lie standing on every
+  // surface but the rail. `target` is what `mountedAgentId` is derived from and
+  // `ConciergePromptTarget` requires `name`, so this resolves whenever the mount routes. Gated on
+  // `mountedAgentId` so an UNMOUNTED selection cannot lend its name to a mount that does not exist.
+  const mountedName =
+    mountedRow?.name ??
+    (mountedIsSparkle ? SPARKLE_AGENT_NAME : undefined) ??
+    (mountedAgentId ? target?.name : undefined);
   const mountedWorktreePath = mountedRow?.worktreePath ?? sparkleWorktreePath;
   const mountedThread = useMountedThread(mountedAgentId);
   const { pageBack } = useAgentTranscript(mountedAgentId, mountedWorktreePath ?? null);
@@ -1783,7 +1804,18 @@ export function ConciergeHost({
     if (route.kind === "sparkle") return "Concierge";
     // `mentions[0]` IS the addressing mention: `addressingSpan` can only ever qualify the FIRST
     // span (every later one has an earlier literal to its left), and `mentionsIn` keeps that order.
-    return (route.via === "address" ? mentions[0]?.name : mountedName) ?? "Concierge";
+    if (route.via === "address") return mentions[0]?.name ?? "Concierge";
+    // ══ AN AGENT-BOUND VERDICT MUST NEVER RENDER AS "Concierge" (roborev 59212 / 59232) ═══════════
+    // The `?? "Concierge"` that used to close this expression restored the exact defect the commit
+    // above it exists to remove: hands-free, `voice/autoSendTimer` says *"Sending to Concierge
+    // shortly."* over words about to land on a command line.
+    //
+    // The RESOLUTION of the name now lives at `mountedName` rather than here (59232) — fixing it at
+    // this one consumer left the chip, the transcript swap and the draft key still reading a mount
+    // with no name as "not mounted". So all this arm owes is the terminal placeholder, and that is a
+    // truthful non-destination rather than a fallback: `mountedName` resolves whenever the mount
+    // routes, so reaching it would mean a routable mount with no target at all.
+    return mountedName ?? "the mounted agent";
   }, [composedText, mentionAgents, routingTarget?.agentId, routableMountedAgentId, mountedName]);
 
   const autoSendRail = useAutoSend({

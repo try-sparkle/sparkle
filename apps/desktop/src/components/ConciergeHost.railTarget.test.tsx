@@ -375,6 +375,31 @@ describe("the rail names the MOUNTED agent when nothing in the text overrides it
     expect(await railTarget()).toBe("Kraken Auth");
   });
 
+  // ══ AND IT MUST NOT SAY "Concierge" WHEN THE MOUNT HAS NO projectStore ROW (roborev 59212) ═════
+  // Every other mounted row here seeds that row, so all of them passed while a `?? "Concierge"`
+  // still closed the expression — the fallback was unreachable from this suite and the lie was
+  // invisible exactly where it mattered. `mountedName` is `mountedRow?.name ?? (mountedIsSparkle ?
+  // … )`, so it is `undefined` for a mounted agent with no row that is not the app-owned Sparkle
+  // one, while `routableMountedAgentId` stays non-null and the send still aims at that PTY.
+  //
+  // Bead `sparkle-gw8yi` records a real agent in exactly that state, so this is a shape the app
+  // has already produced once. The rail must name the target the send aims at, and above all must
+  // NOT name the concierge over a message bound for a terminal.
+  it("REGRESSION: names the mount, not Concierge, when the agent has no projectStore row", async () => {
+    useProjectStore.setState({
+      projects: [] as unknown as ReturnType<typeof useProjectStore.getState>["projects"],
+    });
+    h.wired.mockReturnValue("left");
+    mount();
+    await type("move the button 5px left");
+    // The lie this row exists to catch. Asserted first and on its own, so a future refactor that
+    // returns some third string still cannot quietly reintroduce "Concierge" here.
+    expect(await railTarget()).not.toBe("Concierge");
+    // …and it names the agent the send actually aims at — `promptTarget.name`, which
+    // `ConciergePromptTarget` requires and which the mount is derived from.
+    expect(await railTarget()).toBe(SELECTED.name);
+  });
+
   // ── A NAME THAT DOES NOT LEAD IS THE SENTENCE'S SUBJECT ──────────────────────────────────────
   // This rail used to read `mentionsIn(...)[0]` by ORDINAL while the send routed POSITIONALLY, so
   // this message was announced as going to Kraken Auth and delivered to the mount. Deriving the
