@@ -685,3 +685,49 @@ export function clearPin(agentId: string): void {
 export function clearAllPins(): void {
   writePins(new Map());
 }
+
+/** What a just-completed login into a fresh config dir turned out to be.
+ *
+ *  The founder's question was "do I need to type the email in manually?" — the answer is no, and
+ *  this is where that answer is computed. Claude Code writes `oauthAccount.emailAddress` into the
+ *  config dir it was pointed at, Rust surfaces it as {@link Identity.email}, so the nickname can be
+ *  derived rather than typed. */
+export type AdoptionOutcome =
+  /** A new, distinct login. `nickname` is the email to name it by. */
+  | { kind: "named"; nickname: string }
+  /** This login is ALREADY registered under another account row. */
+  | { kind: "duplicate"; existingNickname: string }
+  /** No readable identity behind the dir — the login did not complete, or was cancelled. */
+  | { kind: "unidentified" };
+
+/** Decide what to do with `accountId` once its login flow reported success. PURE — no IO.
+ *
+ *  Refusing a duplicate is not tidiness, it is the core invariant of the whole multi-account
+ *  feature. Two rows sharing ONE Anthropic login re-create the exact failure this exists to end:
+ *  their quota is shared but their tallies are not, so each looks half-used, both win auto-pick,
+ *  and the learned ceiling is computed from a fraction of the real consumption. `identityKey`
+ *  decides sameness by `accountUuid` (falling back to a verified email) — never by nickname, which
+ *  is user-typed and proves nothing.
+ *
+ *  An UNIDENTIFIED result is deliberately not treated as "new". A dir with no `oauthAccount` is a
+ *  login that did not finish; naming it from a guess would register an account that cannot run. */
+export function adoptionOutcome(
+  accountId: string,
+  accounts: readonly Account[],
+  identities: readonly Identity[],
+): AdoptionOutcome {
+  const mine = identities.find((i) => i.id === accountId);
+  const key = identityKey(mine);
+  if (key == null) return { kind: "unidentified" };
+
+  for (const other of identities) {
+    if (other.id === accountId) continue;
+    if (identityKey(other) !== key) continue;
+    const row = accounts.find((a) => a.id === other.id);
+    return { kind: "duplicate", existingNickname: row?.nickname ?? other.email ?? "another account" };
+  }
+
+  // Prefer the email; a login can carry a uuid with no readable email (see `accountSentenceName`),
+  // and naming that row after a raw uuid would be worse than leaving the placeholder alone.
+  return mine?.email ? { kind: "named", nickname: mine.email } : { kind: "unidentified" };
+}

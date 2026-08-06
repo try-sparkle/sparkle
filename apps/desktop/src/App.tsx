@@ -39,6 +39,7 @@ import { AccountSwitchHost } from "./components/AccountSwitchHost";
 import { HintOverlay } from "./components/HintOverlay";
 import { RoborevConsentModal } from "./components/RoborevConsentModal";
 import { BuilderIndexConsentModal } from "./components/BuilderIndexConsentModal";
+import { AccountLimitModal } from "./components/AccountLimitModal";
 import { startUpdater } from "./services/updaterService";
 import { startStaleBuildWatch } from "./services/staleBuildService";
 import { startGoalContinuationRunner } from "./services/goalContinuationRunner";
@@ -518,6 +519,10 @@ export function App() {
             settingsStore.roborevConsentOpen (flipped at the first reviewable commit). */}
         <RoborevConsentModal />
         <BuilderIndexConsentModal />
+        {/* Raised by <LimitSync/> when a REAL account limit lands. Self-gated on
+            accountLimitStore.current, so it costs nothing until an account is actually blocked —
+            and it is the one place the user can log into another account without a terminal. */}
+        <AccountLimitModal />
         {/* Vimium-style keyboard hints: a clean ⌘ tap overlays gold chiclets on the primary
             controls. Mounted last so its portal sits above the whole UI. */}
         <HintOverlay />

@@ -11,6 +11,7 @@
 import { useEffect } from "react";
 import { loadAccountState, invalidateAccountState } from "../services/accountSelection";
 import { syncLimitsOnce, LIMIT_POLL_MS } from "../services/limitSync";
+import { raiseFirstLimit } from "../stores/accountLimitStore";
 
 /** Poll for real rate-limit events and bench the affected accounts until their true reset time.
  *  Best-effort throughout — a failure is logged by `syncLimitsOnce` and retried on the next tick,
@@ -41,7 +42,12 @@ export function useLimitSync(pollMs: number = LIMIT_POLL_MS): void {
       const applied = await syncLimitsOnce(usage, Date.now(), accounts, identities);
       // Only bust the cache when something actually changed, so the common (unlimited) case costs
       // one transcript walk and nothing else.
-      if (!cancelled && applied.length > 0) invalidateAccountState();
+      if (cancelled || applied.length === 0) return;
+      invalidateAccountState();
+      // A landed exhaustion is the deterministic "you are blocked" signal the founder asked for —
+      // `syncLimitsOnce` returns only writes that PERSISTED, and re-seeing the same event is a
+      // no-op, so this fires on a genuinely new (or extended) limit rather than on every tick.
+      raiseFirstLimit(applied);
     };
 
     void tick(); // check immediately on mount — a limit hit while the app was closed still applies

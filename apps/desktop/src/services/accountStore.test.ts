@@ -10,6 +10,7 @@ import {
   accountLabel,
   accountDisplay,
   accountSentenceName,
+  adoptionOutcome,
   forkNotice,
   identityChanged,
   NOT_SIGNED_IN,
@@ -743,5 +744,59 @@ describe("duplicateAccountGroups — two registrations, one real login", () => {
     );
     expect(groups).toHaveLength(1);
     expect(groups[0]!.accounts.map((a) => a.id)).toEqual(["s", "g", "t"]);
+  });
+});
+
+describe("adoptionOutcome — naming a fresh login, and refusing one that is already registered", () => {
+  // The founder's question: "Do I need to type it in manually?" No — Claude Code writes the email
+  // into the config dir it was pointed at, so the nickname is DERIVED.
+  it("names a new login from its email", () => {
+    const outcome = adoptionOutcome(
+      "new",
+      [acct("new", { nickname: "Signing in…" }), acct("old")],
+      [ident("new", { email: "drodio@storytell.ai", accountUuid: "u-new" }), ident("old", { accountUuid: "u-old" })],
+    );
+    expect(outcome).toEqual({ kind: "named", nickname: "drodio@storytell.ai" });
+  });
+
+  // THE INVARIANT THIS WHOLE FEATURE EXISTS TO PROTECT. Two rows for one Anthropic login share a
+  // quota but not their tallies, so each reads as half-used, both win auto-pick, and the learned
+  // ceiling is computed from a fraction of real consumption — exactly the state the founder was in.
+  it("refuses a login already registered under another account, by accountUuid", () => {
+    const outcome = adoptionOutcome(
+      "new",
+      [acct("new"), acct("old", { nickname: "DROdio Personal" })],
+      [ident("new", { email: "drodio@storytell.ai", accountUuid: "SAME" }), ident("old", { accountUuid: "SAME" })],
+    );
+    expect(outcome).toEqual({ kind: "duplicate", existingNickname: "DROdio Personal" });
+  });
+
+  // identityKey falls back to the email for a login predating accountUuid; sameness must follow it,
+  // or a pre-uuid account and its twin both stay in rotation on one quota.
+  it("refuses a duplicate proven only by a shared email", () => {
+    const outcome = adoptionOutcome(
+      "new",
+      [acct("new"), acct("old", { nickname: "Legacy" })],
+      [ident("new", { email: "same@x.com" }), ident("old", { email: "same@x.com" })],
+    );
+    expect(outcome).toEqual({ kind: "duplicate", existingNickname: "Legacy" });
+  });
+
+  it("an abandoned login is UNIDENTIFIED, never named", () => {
+    // A dir with no oauthAccount is a login that did not finish. Registering it would put an
+    // account that cannot run into the rotation.
+    expect(adoptionOutcome("new", [acct("new")], [ident("new")])).toEqual({ kind: "unidentified" });
+    expect(adoptionOutcome("new", [acct("new")], [])).toEqual({ kind: "unidentified" });
+  });
+
+  it("a login with a uuid but no readable email is not named after the uuid", () => {
+    expect(adoptionOutcome("new", [acct("new")], [ident("new", { accountUuid: "u" })])).toEqual({
+      kind: "unidentified",
+    });
+  });
+
+  it("does not call its own row a duplicate of itself", () => {
+    const outcome = adoptionOutcome("solo", [acct("solo")], [ident("solo", { email: "a@b.c", accountUuid: "u" })]);
+    expect(outcome).toEqual({ kind: "named", nickname: "a@b.c" });
   });
 });
