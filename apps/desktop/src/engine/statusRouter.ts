@@ -35,8 +35,16 @@ import type { AgentTabStatus } from "@sparkle/ui";
  *   session-limit-picker  Claude Code's account session-limit dialog is on the rendered screen and
  *                         the agent is parked on it. The ONE screen state that outranks a frozen
  *                         `working` hook (see `resolve`). This is W-RESUME's only safe trigger.
+ *   tool-approval-prompt  A permission / tool-approval dialog is on the RENDERED VIEWPORT and the
+ *                         agent is parked on it — an MCP "Approve?" box, an AskUserQuestion menu, a
+ *                         `/model` picker. Like the session limit it opens MID-TURN, so it needs the
+ *                         same pierce; unlike it, it is not latched (see `approvalPrompt`).
+ *                         VIEWPORT-CONFIRMED is the load-bearing word: only statusEngine's re-read of
+ *                         the rendered grid may raise this. A prompt seen in the streamed lines is
+ *                         not enough, because scrollback has no bottom and an answered menu still
+ *                         sits in it.
  */
-export type StatusReason = "session-limit-picker";
+export type StatusReason = "session-limit-picker" | "tool-approval-prompt";
 
 // ── The screen-reason hand-off ──────────────────────────────────────────────────────────────────
 //
@@ -168,6 +176,26 @@ export function createStatusRouter(
   // than read live, and that is the whole design — see the pierce in `resolve` and `clearedByProgress`
   // below for why "the picker is gone" is NOT allowed to retract it.
   let sessionLimitPicker = false;
+  // The band a VIEWPORT-CONFIRMED approval/permission prompt is currently asking for ("approval" or
+  // "waiting"), or null when the newest screen emit did not carry that reason.
+  //
+  // NOT LATCHED, and that asymmetry with `sessionLimitPicker` above is the whole design. The picker
+  // must survive its own disappearance because a recovery service can press Esc without the wall
+  // actually lifting, so "the dialog is gone" proves nothing about whether the agent can work. An
+  // approval dialog has no such gap: the only thing that dismisses it is a human answering it, and
+  // the agent then visibly resumes. Latching it anyway would buy nothing and cost the property this
+  // family of bugs keeps re-learning — a red that cannot retract becomes a stale "Needs you" row
+  // (the same defect as the errored dot that never retracts, sparkle PR #1325). Recomputing it from
+  // the newest screen emit makes the pierce self-correcting for free, exactly like the idle-only
+  // screen escalation below.
+  //
+  // This is safe ONLY because every viewport-confirmed awaiting emit carries the reason — settle and
+  // the late re-check both tag it (statusEngine). If one of those paths ever emits a bare `waiting`
+  // for a prompt that is genuinely on screen, the pierce drops and the row falls back to the frozen
+  // hook. The `StatusEngine — a tool-approval prompt never reads green` suite in
+  // `statusEngine.test.ts` pins that contract from the engine side, driving the real engine+router
+  // pair rather than this module alone — a router-only test cannot catch a dropped reason.
+  let approvalPrompt: AgentTabStatus | null = null;
 
   // The one case the hook stream genuinely can't see: Claude fires the same `Stop` (→ idle)
   // whether a turn ended *done* or ended sitting at its own interactive selection menu
@@ -205,6 +233,29 @@ export function createStatusRouter(
     // here to `blocked` would turn the rows red and still page nobody — the letter of the report
     // with its reason dropped. `waiting` ("Needs you") already alerts.
     if (sessionLimitPicker) return "waiting";
+    // THIRD FAIL-CLOSED OVERRIDE — a tool-approval / permission prompt on the rendered viewport.
+    // Ordered directly under the session limit and for the identical reason, because it is the
+    // identical bug one case over: an MCP "Approve?" dialog also opens MID-TURN, so no `Stop` fires,
+    // `lastHook` freezes at `working`, and the idle-only escalation below never gets a look. The
+    // founder found rows reading GREEN while their agents sat on an unanswered `rename_agent`
+    // approval — the same invisible-green state, reached by a different dialog.
+    //
+    // BELOW the session limit: a walled agent is the more urgent read of the same screen, and a
+    // session limit is not merely something to approve.
+    //
+    // The BAND is whatever statusEngine chose, not a flattened `waiting`. It decides
+    // approval-vs-waiting from whether a dangerous action was seen, and collapsing that would report
+    // a destructive-action prompt as an ordinary question. Both bands are covered by
+    // `attention.needsAttention()`, so either way it pages — this is about the row telling the truth.
+    // `hook !== "done"` makes the release DURABLE rather than momentary. Clearing `approvalPrompt`
+    // when the `done` arrived was not enough: a dead session emits no further hook events, so
+    // `lastHook` stays `done` while the SCREEN can still emit — statusEngine's armed re-check, or a
+    // settle, will re-raise `tool-approval-prompt` off any viewport `screenAwaitsInput` still
+    // matches (a leftover `❯` frame, or after `claude` exits, the bare shell prompt underneath).
+    // That re-raise outranked the terminal `done` and pinned the row red again, permanently. Note
+    // `sessionLimitPicker` is not exposed this way: only the actual picker text can re-set it,
+    // whereas a plain shell prompt satisfies this reason.
+    if (approvalPrompt && hook !== "done") return approvalPrompt;
     if (hook !== "idle") return hook;
     if (screenAwaits()) return lastScreen!;
     if (judgeAwaits()) return lastJudge!;
@@ -213,8 +264,12 @@ export function createStatusRouter(
 
   /** The reason behind whatever `resolve` just returned. Mirrors its precedence: an `errored` screen
    *  outranks the picker, so it must not be reported as one. */
-  const resolveReason = (): StatusReason | null =>
-    lastScreen !== "errored" && sessionLimitPicker ? "session-limit-picker" : null;
+  const resolveReason = (): StatusReason | null => {
+    if (lastScreen === "errored") return null;
+    if (sessionLimitPicker) return "session-limit-picker";
+    if (approvalPrompt && lastHook !== "done") return "tool-approval-prompt";
+    return null;
+  };
 
   // POSITIVE PROGRESS retracts the picker pierce — nothing else does, and "the picker left the
   // screen" explicitly does NOT (PRD §6c). The weaker rule reverts straight to the bug: the instant a
@@ -242,6 +297,14 @@ export function createStatusRouter(
   // into any wait, including this one, and that is the picker being unanswered — not progress past it.
   const clearedByProgress = (s: AgentTabStatus): void => {
     if (s === "working" || s === "done") sessionLimitPicker = false;
+    // BOTH halves are needed, and the gate in `resolve` does NOT subsume this clear — it only MASKS
+    // the flag while `lastHook === "done"`. Without this line `approvalPrompt` survives the session
+    // end (only reset() or a later fromScreen recomputes it), so the next non-`done` hook status —
+    // a SessionStart after `/clear`, a trailing Notification, a UserPromptSubmit on a resumed
+    // session — lifts the mask and resurrects the OLD band with no new screen evidence at all. That
+    // is the "red that outlives its evidence" this flag's declaration says it must never be.
+    // The clear makes the release stick; the gate makes it durable against a screen re-raise.
+    if (s === "done") approvalPrompt = null;
   };
 
   // Dedup: only forward a genuine change. The router re-resolves on every event from either
@@ -286,6 +349,7 @@ export function createStatusRouter(
       lastHookAt = null;
       // A re-prepare is a new run; whatever the previous one was parked on is not this one's news.
       sessionLimitPicker = false;
+      approvalPrompt = null;
     },
     fromHook: (s) => {
       lastHook = s;
@@ -302,8 +366,15 @@ export function createStatusRouter(
       // Read the hand-off slot FIRST: statusEngine set it around this very call (see
       // `withScreenReason`), and it is gone the moment this returns. Latch before the progress
       // check, so a single call can never both raise and retract the pierce.
-      if (currentScreenReason() === "session-limit-picker") sessionLimitPicker = true;
+      const screenReason = currentScreenReason();
+      if (screenReason === "session-limit-picker") sessionLimitPicker = true;
       else clearedByProgress(s);
+      // Recomputed from THIS emit, never accumulated — see `approvalPrompt`'s declaration for why
+      // this one is not latched. Any screen emit that does not carry the reason (a resumed spinner,
+      // a quiet settle, an exit) drops the pierce in the same breath, so it cannot outlive the
+      // evidence. `s` is normalised to the two bands `resolve` may return.
+      approvalPrompt =
+        screenReason === "tool-approval-prompt" ? (s === "approval" ? "approval" : "waiting") : null;
       // A screen `working` is positive evidence the agent is RUNNING, which disproves any live
       // judge verdict ("this turn is blocked on the user"). Without this the judge escalation had
       // exactly one clear path — a non-idle hook event (see fromHook) — so when the hook stream

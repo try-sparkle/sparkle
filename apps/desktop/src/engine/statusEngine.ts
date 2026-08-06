@@ -653,7 +653,14 @@ export class StatusEngine {
       awaiting ? (risky && !picker ? "approval" : "waiting") : "idle",
       trigger,
       blank ? "blank" : awaiting ? "awaiting" : "calm",
-      picker ? "session-limit-picker" : null,
+      // `awaiting` here is a VIEWPORT verdict — `screenAwaitsInput` ran against the snapshot read a
+      // few lines up, not against streamed scrollback — so it is exactly the evidence the router's
+      // approval pierce requires. Tagging it is what keeps a settle from silently DROPPING a pierce
+      // the late re-check already raised: the reason is part of `set`'s dedup key, so a bare
+      // `waiting` here would count as a change, reach the router, and clear the pierce — handing the
+      // row straight back to a frozen `working` hook. Every viewport-confirmed awaiting emit must
+      // carry a reason for that reason.
+      picker ? "session-limit-picker" : awaiting ? "tool-approval-prompt" : null,
     );
   }
 
@@ -695,9 +702,24 @@ export class StatusEngine {
     //
     // So: re-read the viewport, and if it IS the session-limit picker, re-emit the same `waiting`
     // carrying the reason. Raises the reason, never lowers the status.
-    if (this.status === "waiting" && this.statusReason === null) {
-      if (this.noteSessionLimitPicker(this.opts.getScreen?.() ?? ""))
+    // The SAME hole exists for an ordinary permission dialog, and it is the one the founder hit: an
+    // MCP tool-approval box ("Approve rename_agent?") opens mid-turn exactly like a session limit,
+    // so no `Stop` fires and the hook freezes at `working`. Before this branch also handled the
+    // non-picker case it read the viewport, asked only "is it the session limit?", and returned —
+    // so an approval prompt left `statusReason` null, the router had nothing to pierce with, and the
+    // row stayed GREEN on an agent that was stopped waiting for a human.
+    //
+    // `approval` as well as `waiting`: the mid-stream path picks the band from `sawRecentRisk`, so a
+    // DANGEROUS-action prompt arrives here as `approval`. Matching only `waiting` left exactly the
+    // riskiest dialog unable to reach a reason — it fell past this branch into the calm-states guard
+    // below and returned. The re-emit keeps whichever band is already set; this raises the reason and
+    // never changes the status.
+    if ((this.status === "waiting" || this.status === "approval") && this.statusReason === null) {
+      const snapshot = this.opts.getScreen?.() ?? "";
+      if (this.noteSessionLimitPicker(snapshot))
         this.set("waiting", "screen-recheck", undefined, "session-limit-picker");
+      else if (screenAwaitsInput(snapshot))
+        this.set(this.status, "screen-recheck", undefined, "tool-approval-prompt");
       return;
     }
     // Only from the two calm states. Anything else is either already red (nothing to promote) or a
@@ -715,7 +737,15 @@ export class StatusEngine {
     const risky = this.sawRecentRisk || this.settledTurnRisk;
     this.sawRecentRisk = false;
     this.settledTurnRisk = false;
-    this.set(risky && !picker ? "approval" : "waiting", "screen-recheck", undefined, picker ? "session-limit-picker" : null);
+    // `screenAwaitsInput(snapshot)` returned true a few lines up, so this emit is viewport-confirmed
+    // and carries a reason either way — the pierce works from here too, for a dialog that painted
+    // late enough to miss settle entirely.
+    this.set(
+      risky && !picker ? "approval" : "waiting",
+      "screen-recheck",
+      undefined,
+      picker ? "session-limit-picker" : "tool-approval-prompt",
+    );
   }
 
   // Fallback path only: arm the legacy time-based settle timer plus the late screen re-check (used
@@ -968,14 +998,49 @@ export class StatusEngine {
       // not "it is the session-limit one", and that distinction is what pierces a frozen hook. Read
       // it now (usually already painted), and arm ONE late re-read for the async-render race, since
       // this path returns without arming a settle and a walled agent emits nothing further.
-      const picker = this.noteSessionLimitPicker(this.opts.getScreen?.() ?? "");
+      const snapshot = this.opts.getScreen?.() ?? "";
+      const picker = this.noteSessionLimitPicker(snapshot);
+      // CARRY the viewport-confirmed reason forward, but ONLY while the viewport still shows a
+      // prompt. Keying the carry off `this.statusReason` alone (as this first shipped) re-latched the
+      // pierce: `prompt` is sticky across chunks — `screenAwaitsInput(this.partial)` scans the whole
+      // unterminated tail — so after the human answers, spinner frames appended to a partial still
+      // holding the pre-answer `❯ 1.` line re-trip this path, re-carry the reason, and `clearTimers()`
+      // kills the settle that would have corrected it. The row then sits on "Needs you" while the
+      // agent is demonstrably generating: exactly the un-retractable red `approvalPrompt`'s
+      // declaration in statusRouter says this design exists to avoid.
+      //
+      // Reusing the snapshot read above keeps the boundary intact — this path still never RAISES a
+      // reason from stream-only evidence — while giving the carry the same viewport evidence that
+      // settle and the late re-check use, so an answered dialog retracts on its own.
+      // The VIEWPORT still shows a prompt. This — not the carried reason — is what the BAND is gated
+      // on, because the reason is only ever raised by the late re-check ~2s later: gating the band on
+      // `carried` protected a redraw AFTER the reason existed and left the ordinary ordering (a redraw
+      // inside that 2s window) demoting `approval` to `waiting` exactly as before, permanently, since
+      // the re-check then re-emits the CURRENT band and never re-consults risk.
+      const stillOnScreen = !picker && screenAwaitsInput(snapshot);
+      const carried = stillOnScreen && this.statusReason === "tool-approval-prompt";
       // The prompt was detected in the STREAM, not on the rendered screen, so there is no screen
       // verdict to record here — `screenAwaitsInput` ran against the ingested lines, not a snapshot.
       this.set(
-        this.sawRecentRisk && !picker ? "approval" : "waiting",
+        // The BAND is carried with the reason, not just the reason. `sawRecentRisk` is consumed by
+        // this very path, so on the SECOND detection of the same dialog it always reads false — a
+        // redraw would silently demote a live `approval` to `waiting`, relabelling a
+        // destructive-action prompt as an ordinary question for the life of the dialog (and it never
+        // recovers, since the re-check's reason-only branch is gated on a null reason). Narrower than
+        // the green flash, since the row stays red, but it is the same class of lie.
+        !picker && (this.sawRecentRisk || (stillOnScreen && this.status === "approval")) ? "approval" : "waiting",
         "prompt-detected-midstream",
         undefined,
-        picker ? "session-limit-picker" : null,
+        // NEVER LOWERS AN ALREADY-RAISED REASON. This path may not RAISE `tool-approval-prompt` — it
+        // read the stream, not the viewport, and that boundary is what keeps a menu still sitting in
+        // scrollback from piercing a healthy agent. But writing a bare `null` here would be worse
+        // than not raising it: the reason is part of `set`'s dedup key, so once the late re-check has
+        // confirmed a dialog on the rendered grid, a subsequent mid-stream prompt detection (the
+        // dialog redrawing, or a second prompt streaming past) would emit `waiting` with no reason,
+        // the router would drop the pierce, and the row would fall straight back to the frozen
+        // `working` hook — green again, on an agent still parked on the dialog. So carry the
+        // viewport-confirmed reason forward and let only real progress clear it.
+        picker ? "session-limit-picker" : carried ? "tool-approval-prompt" : null,
       );
       if (!picker) this.recheckTimer = setTimeout(() => this.recheckScreen(), SPINNER_GRACE_MS);
       this.sawRecentRisk = false;

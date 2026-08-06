@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
+import type { AgentTabStatus } from "@sparkle/ui";
 import { createStatusRouter, HOOK_STALE_MS, withScreenReason, type StatusTransition } from "./statusRouter";
 
 describe("createStatusRouter", () => {
@@ -661,5 +662,193 @@ describe("createStatusRouter — the session-limit picker pierces hook authority
     r.fromHook("working");
     r.fromScreen("waiting"); // this one merely has some prompt on screen
     expect(emit.mock.calls.map((x) => x[0])).toEqual(["working"]); // …so it stays green
+  });
+});
+
+// A screen emit carrying the tool-approval reason, the way statusEngine delivers it.
+const fromApprovalPrompt = (r: ReturnType<typeof createStatusRouter>, s: AgentTabStatus = "waiting") =>
+  withScreenReason("tool-approval-prompt", () => r.fromScreen(s));
+
+describe("createStatusRouter — an approval prompt pierces hook authority", () => {
+  it("THE TEST: a frozen `working` hook + an on-screen approval prompt is NOT green", () => {
+    // The founder's second sighting of the invisible-green state, one case over from the session
+    // limit: an MCP tool-approval dialog (`rename_agent`) also opens MID-TURN, so no Stop fires,
+    // `lastHook` freezes at "working", and the idle-only escalation never gets a look. Against the
+    // router as it stood, the last assertion read ["working"] — the whole fleet rendered green while
+    // every agent sat on an unanswered "Approve?" dialog.
+    const emit = vi.fn();
+    const transitions: StatusTransition[] = [];
+    const r = createStatusRouter(emit, () => 0, (t) => transitions.push(t));
+    r.activate();
+    r.fromHook("working");
+    fromApprovalPrompt(r);
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["working", "waiting"]);
+    expect(transitions.at(-1)?.reason).toBe("tool-approval-prompt");
+    // The frozen hook is overridden, not repaired.
+    expect(transitions.at(-1)?.lastHook).toBe("working");
+  });
+
+  it("keeps the engine's band — a risky action reads `approval`, not a flattened `waiting`", () => {
+    // statusEngine picks approval-vs-waiting from whether a dangerous action was seen. The router
+    // must carry that through rather than flattening it, or a destructive-action prompt is reported
+    // as an ordinary question. (`attention.needsAttention()` covers both, so either way it pages —
+    // this is about the row telling the truth.)
+    const emit = vi.fn();
+    const r = createStatusRouter(emit);
+    r.activate();
+    r.fromHook("working");
+    fromApprovalPrompt(r, "approval");
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["working", "approval"]);
+  });
+
+  it("a REASONLESS screen `waiting` still does not pierce (the idle-only rule is untouched)", () => {
+    // The guard on the whole change. Only a VIEWPORT-CONFIRMED prompt — one statusEngine tagged with
+    // the reason after re-reading the rendered grid — may override a hook `working`. A bare
+    // mid-turn screen guess must keep losing to the hook, or the prose-question false-red the hook
+    // migration killed comes straight back.
+    const emit = vi.fn();
+    const r = createStatusRouter(emit);
+    r.activate();
+    r.fromHook("working");
+    r.fromScreen("waiting");
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["working"]);
+  });
+
+  it("retracts on POSITIVE PROGRESS — the human answered and the agent resumed", () => {
+    // Unlike the session-limit latch, this pierce is NOT latched: it tracks the latest screen emit.
+    // A session limit needs the latch because a machine may press Esc without the wall actually
+    // lifting, so "the picker is gone" proves nothing. An approval dialog has no such gap — the only
+    // thing that dismisses it is a human answering it, and the agent then visibly resumes.
+    const emit = vi.fn();
+    const r = createStatusRouter(emit);
+    r.activate();
+    r.fromHook("working");
+    fromApprovalPrompt(r);
+    r.fromScreen("working"); // the answer landed; the spinner is redrawing again
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["working", "waiting", "working"]);
+  });
+
+  it("self-corrects: a screen that stops reporting the prompt drops the pierce", () => {
+    // The property the session-limit latch deliberately gives up, and the one this family of bugs
+    // keeps re-learning: a red that cannot retract becomes a stale "Needs you" row. Because the
+    // pierce is recomputed from the newest screen emit, a calm screen releases it immediately.
+    const emit = vi.fn();
+    const r = createStatusRouter(emit);
+    r.activate();
+    r.fromHook("working");
+    fromApprovalPrompt(r);
+    r.fromScreen("idle"); // dialog gone, turn quiet — the frozen hook is the only claim left
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["working", "waiting", "working"]);
+  });
+
+  it("an `errored` screen still outranks it, and is not reported as an approval", () => {
+    // Same ordering `resolve` already gives the session-limit picker: a crashed agent is the more
+    // urgent read of the same screen.
+    const emit = vi.fn();
+    const transitions: StatusTransition[] = [];
+    const r = createStatusRouter(emit, () => 0, (t) => transitions.push(t));
+    r.activate();
+    r.fromHook("working");
+    fromApprovalPrompt(r);
+    r.fromScreen("errored");
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["working", "waiting", "errored"]);
+    expect(transitions.at(-1)?.reason).toBeNull();
+  });
+
+  it("the session-limit picker outranks it — a walled agent is not merely awaiting an approval", () => {
+    const emit = vi.fn();
+    const transitions: StatusTransition[] = [];
+    const r = createStatusRouter(emit, () => 0, (t) => transitions.push(t));
+    r.activate();
+    r.fromHook("working");
+    fromApprovalPrompt(r);
+    withScreenReason("session-limit-picker", () => r.fromScreen("waiting"));
+    expect(transitions.at(-1)?.reason).toBe("session-limit-picker");
+  });
+
+  it("releases when the SESSION ENDS on the hook stream, so an exited agent is not red forever", () => {
+    // The hole the session-limit pierce documents and handles with its own `done` clause, which this
+    // one failed to mirror. `approvalPrompt` is recomputed in fromScreen, so a hook `done`
+    // (SessionEnd / PTY exit) left it standing and `resolve` returned it OVER the `done` — a
+    // permanently red "Needs you" row on a session that is over. Worse than the false green it
+    // replaces, because a false green on a LIVE agent self-corrects the moment the agent speaks
+    // again, and a dead process never speaks.
+    const emit = vi.fn();
+    const r = createStatusRouter(emit);
+    r.activate();
+    r.fromHook("working");
+    fromApprovalPrompt(r);
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["working", "waiting"]);
+    r.fromHook("done"); // the agent exited while the dialog was still up
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["working", "waiting", "done"]);
+  });
+
+  it("a prompt reported AFTER the session ended cannot RE-RAISE the pierce", () => {
+    // The durable half, and why clearing the flag when the `done` arrived was not enough. A dead
+    // session emits no further hook events, so `lastHook` stays `done` while the SCREEN can still
+    // speak: statusEngine's armed re-check re-raises `tool-approval-prompt` off any viewport
+    // `screenAwaitsInput` still matches — a leftover `❯` frame, or once `claude` exits, the bare
+    // shell prompt underneath. That re-raise outranked the terminal `done` and pinned the row red
+    // again, permanently. (`sessionLimitPicker` is not exposed this way: only the actual picker text
+    // can re-set it, whereas a plain shell prompt satisfies this reason.)
+    const emit = vi.fn();
+    const transitions: StatusTransition[] = [];
+    const r = createStatusRouter(emit, () => 0, (t) => transitions.push(t));
+    r.activate();
+    r.fromHook("working");
+    fromApprovalPrompt(r);
+    r.fromHook("done");
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["working", "waiting", "done"]);
+    // Snapshot the COUNT, not `at(-1)`: a fully-absorbed late emit pushes no transition at all, so
+    // `transitions.at(-1)` would still be the one `fromHook("done")` produced and the assertion
+    // would pass without observing this call. The real claim is that nothing came out of it.
+    const before = transitions.length;
+    fromApprovalPrompt(r); // a late re-check against a still-prompt-shaped viewport
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["working", "waiting", "done"]);
+    expect(transitions.length).toBe(before);
+  });
+
+  it("a later non-`done` hook cannot resurrect the pierce either", () => {
+    // `resolve`'s `hook !== "done"` gate MASKS the flag; it does not clear it. Leaving the release
+    // to the gate alone meant the flag survived the session end, so the next hook status that is not
+    // `done` — a SessionStart after `/clear`, a trailing Notification, a UserPromptSubmit on a
+    // resumed session — lifted the mask and brought back the OLD band with no new screen evidence.
+    const emit = vi.fn();
+    const transitions: StatusTransition[] = [];
+    const r = createStatusRouter(emit, () => 0, (t) => transitions.push(t));
+    r.activate();
+    r.fromHook("working");
+    fromApprovalPrompt(r);
+    r.fromHook("done");
+    // A NON-IDLE hook is the discriminator here. A later hook `idle` would resolve to `waiting`
+    // anyway via the long-standing idle-only screen escalation (`lastScreen` is still the prompt),
+    // which would pass whether or not the pierce had been cleared — it would prove nothing about
+    // this flag. `working` (a UserPromptSubmit on a resumed session) can only come back red if the
+    // stale `approvalPrompt` outranked it.
+    r.fromHook("working");
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["working", "waiting", "done", "working"]);
+    expect(transitions.at(-1)?.reason).toBeNull();
+  });
+
+  it("reset() drops the pierce — a re-prepare is a new run", () => {
+    const emit = vi.fn();
+    const r = createStatusRouter(emit);
+    r.activate();
+    r.fromHook("working");
+    fromApprovalPrompt(r);
+    r.reset();
+    r.fromScreen("idle");
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["working", "waiting", "idle"]);
+  });
+
+  it("the reason does not leak to another agent's router", () => {
+    const emit = vi.fn();
+    const other = createStatusRouter(vi.fn());
+    const r = createStatusRouter(emit);
+    fromApprovalPrompt(other); // a DIFFERENT agent is the one at the dialog
+    r.activate();
+    r.fromHook("working");
+    r.fromScreen("waiting");
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["working"]);
   });
 });

@@ -9,7 +9,7 @@ import {
   type SessionLimitPickerDetail,
 } from "./statusEngine";
 import { createStatusRouter, type StatusTransition } from "./statusRouter";
-import { SESSION_LIMIT_PICKER } from "./capturedScreens.fixture";
+import { SESSION_LIMIT_PICKER, APPROVAL_2_1_220 } from "./capturedScreens.fixture";
 // The SAME predicate the concierge tool surface derives `needsYou` from, so the no-false-alarm
 // tests below assert the tier the human is actually paged on rather than a status name.
 import { isRedStatus } from "../services/windowStatus";
@@ -1490,7 +1490,18 @@ describe("StatusEngine — the session-limit picker", () => {
     }
   });
 
-  it("says nothing for any OTHER picker — no reason, no announcement", () => {
+  it("announces nothing for any OTHER picker, and does not call it a session limit", () => {
+    // WHAT THIS TEST USED TO PIN, and why it changed. It asserted `emitted === ["working"]` — an
+    // ordinary permission dialog behind a frozen hook left the row GREEN — citing sparkle-7wij, the
+    // known mid-turn gap. That green is precisely the bug the founder then reported: several agents
+    // sat on an unanswered `rename_agent` approval while every row read green, and he found it only
+    // by opening panes one at a time. The session-limit pierce was carved narrowly because the
+    // router had no other signal to trust; it now has one (a VIEWPORT-CONFIRMED prompt reason), so
+    // the carve-out is no longer the whole answer and this row goes red like any other blocked agent.
+    //
+    // Everything this test was GENUINELY guarding is unchanged and still asserted below: an ordinary
+    // permission dialog must not be mistaken for a session limit — no `session-limit-picker` reason,
+    // and no announcement on the picker channel (which arms a machine keystroke).
     const seen: SessionLimitPickerDetail[] = [];
     const off = onSessionLimitPicker((d) => seen.push(d));
     try {
@@ -1499,11 +1510,187 @@ describe("StatusEngine — the session-limit picker", () => {
       router.fromHook("working"); // same frozen hook…
       engine.ingest(SPINNER);
       vi.advanceTimersByTime(2000);
-      expect(emitted).toEqual(["working"]); // …and the row stays green, as sparkle-7wij pins
-      expect(transitions.every((t) => t.reason === null)).toBe(true);
+      // …and the row is now RED, because the human really is on the hook.
+      expect(isRedStatus(emitted.at(-1)!)).toBe(true);
+      // The still-load-bearing half: classified as an approval, never as a session limit.
+      expect(transitions.at(-1)?.reason).toBe("tool-approval-prompt");
+      expect(transitions.every((t) => t.reason !== "session-limit-picker")).toBe(true);
       expect(seen).toEqual([]);
     } finally {
       off();
     }
+  });
+});
+
+// BUG 1, the founder's second sighting of the invisible-green state: several agents sat on an MCP
+// tool-approval dialog (`rename_agent`) while their rows read GREEN, and he found it only by opening
+// panes one at a time. Same mechanism as the session-limit suite above — the dialog opens MID-TURN,
+// so no `Stop` fires, the hook freezes at `working`, and the router's idle-only escalation never
+// gets a look. Driven through the REAL engine+router pair, because neither half fixes it alone.
+describe("StatusEngine — a tool-approval prompt never reads green", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  const SPINNER = "✻ Cogitating… (12s · ↑ 1.2k tokens · esc to interrupt)";
+
+  function wired(getScreen: () => string) {
+    const emitted: AgentTabStatus[] = [];
+    const transitions: StatusTransition[] = [];
+    const router = createStatusRouter(
+      (s) => emitted.push(s),
+      undefined,
+      (t) => transitions.push(t),
+    );
+    const engine = new StatusEngine({ agentId: "wired-approval", onStatus: (s) => router.fromScreen(s), getScreen });
+    return { engine, router, emitted, transitions };
+  }
+
+  it("THE TEST: turns the row RED behind a hook frozen at `working` — an unanswered Approve? dialog", () => {
+    const screen = { v: "⏺ Working on it." };
+    const { engine, router, emitted, transitions } = wired(() => screen.v);
+    router.activate();
+    router.fromHook("working"); // the turn opens…
+    engine.ingest(SPINNER);
+    // …and the approval dialog lands INSIDE it. Claude draws the permission box and waits; because
+    // the turn never ends, no Stop event ever follows and `lastHook` is frozen at "working" forever.
+    screen.v = APPROVAL_2_1_220;
+    vi.advanceTimersByTime(2000); // spinner stops re-drawing → settle reads the viewport
+    // Against the code as it stood this read ["working"]: green, on an agent stopped waiting for a
+    // human. `isRedStatus` is the predicate the human is actually paged on.
+    expect(emitted.at(-1)).not.toBe("working");
+    expect(isRedStatus(emitted.at(-1)!)).toBe(true);
+    expect(transitions.at(-1)?.reason).toBe("tool-approval-prompt");
+    expect(transitions.at(-1)?.lastHook).toBe("working"); // frozen hook overridden, not repaired
+  });
+
+  it("retracts the moment the human answers and the agent resumes", () => {
+    // The property the session-limit latch deliberately gives up and this one keeps: no stale
+    // "Needs you" row. Answering an approval dialog is the only thing that dismisses it, so the
+    // resumed spinner is trustworthy evidence in a way an Esc'd session-limit picker is not.
+    const screen = { v: "⏺ Working on it." };
+    const { engine, router, emitted } = wired(() => screen.v);
+    router.activate();
+    router.fromHook("working");
+    engine.ingest(SPINNER);
+    screen.v = APPROVAL_2_1_220;
+    vi.advanceTimersByTime(2000);
+    expect(isRedStatus(emitted.at(-1)!)).toBe(true);
+    // The human presses 1. The dialog goes away and output resumes.
+    screen.v = IDLE_SCREEN;
+    engine.ingest(SPINNER);
+    expect(emitted.at(-1)).toBe("working");
+  });
+
+  it("a redrawn dialog does not silently retract the pierce (mid-stream must not lower the reason)", () => {
+    // The subtle one. The late re-check confirms the dialog on the rendered grid and raises
+    // `tool-approval-prompt`. Then the dialog REDRAWS, so `ingest` detects a prompt in the stream
+    // again and re-emits. Because the reason is part of `set`'s dedup key, emitting a bare `waiting`
+    // there counts as a change, reaches the router, and drops the pierce — handing the row back to
+    // the frozen `working` hook. Green again, on an agent still parked on the dialog.
+    const screen = { v: "⏺ Working on it." };
+    const { engine, router, emitted } = wired(() => screen.v);
+    router.activate();
+    router.fromHook("working");
+    engine.ingest(SPINNER);
+    screen.v = APPROVAL_2_1_220;
+    vi.advanceTimersByTime(2000);
+    expect(isRedStatus(emitted.at(-1)!)).toBe(true);
+    expect(emitted).toEqual(["working", "waiting"]);
+    // The dialog is still on screen and streams another frame of itself.
+    engine.ingest(APPROVAL_2_1_220);
+    vi.advanceTimersByTime(2000);
+    // ASSERT THE WHOLE SEQUENCE, not just the final state. The bug is a TRANSIENT green: without the
+    // reason carried forward the row goes working -> waiting -> WORKING -> waiting, flashing green for
+    // the ~2s until the late re-check re-raises the reason. Reading only `emitted.at(-1)` sees the
+    // recovered red and passes vacuously — which is how this very test first shipped green against the
+    // broken code. A row that blinks green while its agent is parked on a dialog is the whole defect.
+    expect(emitted).toEqual(["working", "waiting"]);
+  });
+
+  it("the carried reason RETRACTS on a calm viewport, even while the stream still trips `prompt`", () => {
+    // The retraction half of the carry-forward, and the one that keeps it from becoming a latch.
+    // `prompt` is sticky across chunks — screenAwaitsInput scans the whole unterminated partial — so
+    // after the human answers, spinner frames appended to a partial still holding the pre-answer
+    // "❯ 1." line keep re-tripping the mid-stream path. If the carry keyed off `statusReason` alone
+    // it would re-raise the reason forever and clearTimers() would kill the settle that corrects it,
+    // pinning the row on "Needs you" while the agent is demonstrably generating. Gating the carry on
+    // the VIEWPORT is what lets it self-correct.
+    const screen = { v: "⏺ Working on it." };
+    const { engine, router, emitted } = wired(() => screen.v);
+    router.activate();
+    router.fromHook("working");
+    engine.ingest(SPINNER);
+    screen.v = APPROVAL_2_1_220;
+    vi.advanceTimersByTime(2000);
+    expect(emitted).toEqual(["working", "waiting"]);
+    // The human answers. The GRID is calm now, but the stream still carries the old menu text.
+    screen.v = IDLE_SCREEN;
+    engine.ingest(APPROVAL_2_1_220);
+    expect(emitted).toEqual(["working", "waiting", "working"]);
+  });
+
+  it("a redraw does not demote a risky `approval` to a plain `waiting`", () => {
+    // `sawRecentRisk` is consumed by the mid-stream path, so the SECOND detection of the same dialog
+    // reads false and would silently relabel a destructive-action prompt as an ordinary question for
+    // the life of the dialog. The row stays red either way, so this is narrower than the green flash
+    // — but it is the same class of lie, and it never recovers on its own.
+    const RISKY = "Bash(rm -rf build/)\n"; // classifies as approval_needed → arms the risk flag
+    const screen = { v: "⏺ Working on it." };
+    const { engine, router, emitted } = wired(() => screen.v);
+    router.activate();
+    router.fromHook("working");
+    engine.ingest(SPINNER);
+    engine.ingest(RISKY);
+    screen.v = APPROVAL_2_1_220;
+    vi.advanceTimersByTime(2000);
+    expect(emitted.at(-1)).toBe("approval");
+    // The dialog redraws while still on the grid — the band must survive it.
+    engine.ingest(APPROVAL_2_1_220);
+    vi.advanceTimersByTime(2000);
+    expect(emitted.filter((s) => s === "waiting")).toEqual([]);
+    expect(emitted.at(-1)).toBe("approval");
+  });
+
+  it("a redraw BEFORE the reason is raised does not demote the risky band either", () => {
+    // The ordinary ordering, and the half the first band test missed. The reason is only raised by
+    // the late re-check ~2s after the dialog appears, so a redraw inside that window sees
+    // sawRecentRisk already consumed AND no reason yet. Gating the band on the carried reason left
+    // this path demoting approval -> waiting exactly as before — permanently, because the re-check
+    // then re-emits the CURRENT band and never re-consults risk. The band is gated on the viewport
+    // instead, which is true from the very first detection.
+    const RISKY = "Bash(rm -rf build/)\n"; // classifies as approval_needed → arms the risk flag
+    const screen = { v: "⏺ Working on it." };
+    const { engine, router, emitted } = wired(() => screen.v);
+    router.activate();
+    router.fromHook("working");
+    engine.ingest(SPINNER);
+    engine.ingest(RISKY);
+    screen.v = APPROVAL_2_1_220;
+    engine.ingest(APPROVAL_2_1_220); // first mid-stream detection → engine `approval`, reason null
+    // The ROUTER does not pierce yet, and must not: this detection came from the stream, so it
+    // carries no reason and the frozen `working` hook still wins. That is the boundary working.
+    expect(emitted.at(-1)).toBe("working");
+    // A repaint of the same dialog, still inside the pre-re-check window. It does NOT re-emit the
+    // risky line — a cursor/footer repaint alone is enough to re-trip `prompt`. This is where the
+    // band was being demoted.
+    engine.ingest(APPROVAL_2_1_220);
+    // Now the late re-check fires, confirms the viewport and raises the reason — re-emitting the
+    // CURRENT band. If the redraw above demoted it, the row locks on `waiting` forever.
+    vi.advanceTimersByTime(2000);
+    expect(emitted.at(-1)).toBe("approval");
+    expect(emitted.filter((s) => s === "waiting")).toEqual([]);
+  });
+
+  it("a calm screen behind a frozen hook still reads green — no new false red", () => {
+    // The other half of the trade. The pierce must fire ONLY on a viewport that really shows a
+    // prompt; a long tool call (hooks legitimately silent, nothing on screen) must stay green, or
+    // this fix would page the founder on every healthy agent.
+    const screen = { v: IDLE_SCREEN };
+    const { engine, router, emitted } = wired(() => screen.v);
+    router.activate();
+    router.fromHook("working");
+    engine.ingest(SPINNER);
+    vi.advanceTimersByTime(60_000);
+    expect(emitted.at(-1)).toBe("working");
   });
 });
