@@ -1023,6 +1023,22 @@ export function OpenPrMenu({
     // in the repo now on screen (roborev 56187).
     const key = keyOfScope(scope);
     const listed = () => aliveRef.current && liveKeysRef.current.has(key);
+    /**
+     * THE HEAD THIS CLICK WAS ABOUT — the sha of the row as it was rendered, which is the same
+     * snapshot `prMergeEligibility` read to enable the button. It is sent with the merge so GitHub
+     * refuses one whose branch has moved since, instead of merging a head this gate never judged.
+     *
+     * Reading the RENDER-TIME `groups` is the point, not a stale-closure bug: the question is what
+     * the user approved, and a fresher sha would silently re-approve someone else's push. `undefined`
+     * (a build or fixture with no `headRefOid`) merges unguarded, exactly as before.
+     */
+    const headOidOf = (n: number) => {
+      const group = groups.find((g) => g.key === key);
+      const row =
+        group?.prs.find((pr) => pr.number === n) ??
+        group?.dismissed.find((pr) => pr.number === n);
+      return row?.headRefOid;
+    };
     const prKeys = nums.map((n) => prKeyOf(key, n));
     setError(null);
     setMerging((prev) => new Set([...prev, ...prKeys]));
@@ -1041,7 +1057,12 @@ export function OpenPrMenu({
         // THE REASON IS SPENT ON EXACTLY ONE PR — see `knightwatchReasonFor`, which is a named
         // function precisely so the binding can be asserted against without a UI path that merges a
         // batch WITH an override. A batch and a single-row merge take this same line.
-        await mergePr(scope.rootPath, n, knightwatchReasonFor(n, override));
+        await mergePr(
+          scope.rootPath,
+          n,
+          knightwatchReasonFor(n, override),
+          headOidOf(n),
+        );
         merged.push(prKey);
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);

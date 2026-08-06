@@ -549,6 +549,7 @@ describe("open_agent_pr", () => {
 });
 
 describe("merge_pr", () => {
+  const HEAD_OID = "c0ffee1deadbeef2222333344445555666677778";
   const openPr = {
     number: 7,
     title: "t",
@@ -556,6 +557,7 @@ describe("merge_pr", () => {
     url: "u",
     checks: "passing" as const,
     mergeable: "mergeable" as const,
+    headRefOid: HEAD_OID,
   };
 
   it("CANNOT be asked to squash or to auto-merge", async () => {
@@ -584,7 +586,42 @@ describe("merge_pr", () => {
     // The third argument is the knightwatch override, and an ordinary merge sends NO reason —
     // asserted positionally, because "undefined" here is the difference between merging on the
     // gate's terms and merging past a reviewer's unanswered question.
-    expect(m.mergePr).toHaveBeenCalledWith("/repo", 7, undefined);
+    //
+    // The FOURTH is the head this decision was made against, and it is asserted for the same reason:
+    // a row that carries `headRefOid` and a merge that drops it look identical from here — the mock
+    // resolves either way — while in production the dropped case merges whatever the branch points
+    // at now. That is the `--match-head-commit` this PR exists to send.
+    expect(m.mergePr).toHaveBeenCalledWith("/repo", 7, undefined, HEAD_OID);
+  });
+
+  it("sends the head the GATE READ, not one refetched after the gates ran", async () => {
+    // The window is real: gates 4-6 (claim registry, roborev probe, override validation) each take
+    // time, and a push landing inside it moves the branch. What must reach `gh` is the sha
+    // `prMergeEligibility` judged — so this asserts the oid comes from the row that was gated,
+    // even when a later poll would answer differently.
+    m.fetchOpenPrs.mockResolvedValue([{ ...openPr, headRefOid: "aaaa111" }]);
+    m.mergePr.mockResolvedValue(undefined);
+    m.fetchPrClaims.mockImplementation(async () => {
+      // A push lands mid-gate: any FRESH read of the PR would now see a different head.
+      m.fetchOpenPrs.mockResolvedValue([{ ...openPr, headRefOid: "bbbb222" }]);
+      return [];
+    });
+    expect(await mergePrTool({ root: "/repo", projectId: "p1", number: 7 })).toMatchObject({ ok: true });
+    expect(m.mergePr).toHaveBeenCalledWith("/repo", 7, undefined, "aaaa111");
+  });
+
+  it("merges UNGUARDED when the head is unknown — an absent oid must not become an empty flag", async () => {
+    // `headRefOid` is optional on the row and empty means "cannot compare" everywhere else in the
+    // app. Forwarding "" would put `--match-head-commit ""` on the argv, which gh rejects on EVERY
+    // merge — turning a guard into an outage. `mergePr` drops falsy values; this pins that the tool
+    // layer hands it the raw row value rather than inventing one.
+    for (const oid of [undefined, ""]) {
+      m.mergePr.mockClear();
+      m.fetchOpenPrs.mockResolvedValue([{ ...openPr, headRefOid: oid }]);
+      m.mergePr.mockResolvedValue(undefined);
+      expect(await mergePrTool({ root: "/repo", projectId: "p1", number: 7 })).toMatchObject({ ok: true });
+      expect(m.mergePr, JSON.stringify(oid)).toHaveBeenCalledWith("/repo", 7, undefined, oid);
+    }
   });
 
   it("refuses to merge over pending or failing checks, or a conflict", async () => {
@@ -631,6 +668,51 @@ describe("merge_pr", () => {
       code: "checks-blocked",
     });
   });
+
+  it("classifies a MOVED HEAD as a coded REFUSAL, not a failure", async () => {
+    // This is the outcome `--match-head-commit` exists to produce, so it is expected traffic rather
+    // than an anomaly. GitHub evaluates the flag BEFORE merging, so `kind` is load-bearing: `failed`
+    // means "it ran and the repo may have moved" (see `WorkflowRefusal.kind`), and here nothing ran.
+    // Uncoded, this message matches none of the patterns above and lands on `unknown-error`.
+    //
+    // Both rejection shapes, because Rust errors reach `errText` as bare strings as often as Errors.
+    for (const thrown of [
+      new Error("GraphQL: Head branch was modified. Review and try the merge again."),
+      "GraphQL: Head branch was modified. Review and try the merge again.",
+    ]) {
+      m.fetchOpenPrs.mockResolvedValue([openPr]);
+      m.mergePr.mockRejectedValue(thrown);
+      const r = await mergePrTool({ root: "/repo", projectId: "p1", number: 7 });
+      expect(r, String(thrown)).toMatchObject({ ok: false, kind: "refused", code: "head-moved" });
+      const msg = (r as { message: string }).message;
+      // The remedy is the coded one — call the same tool again — and the sha the gate judged is
+      // named, since that is what makes the retry's re-gate meaningful rather than superstitious.
+      expect(msg).toContain("merge_pr again");
+      expect(msg).toContain(HEAD_OID);
+      // It must NOT imply anything landed. That claim is the expensive one to get wrong: a model
+      // that believes the PR merged goes on to delete the branch.
+      expect(msg).toMatch(/NOTHING was merged/);
+      // gh's own words survive, so a human reading the transcript sees what GitHub actually said.
+      expect(msg).toContain("Head branch was modified");
+    }
+  });
+
+  it("does NOT mistake a knightwatch refusal for a moved head", async () => {
+    // Ordering guard. The head-moved branch sits directly after the knightwatch one; if it were
+    // ever moved above it, a probe refusal whose prose happened to mention the flag would be
+    // reported with the wrong code and the wrong remedy ("retry" instead of "answer the probe").
+    m.fetchOpenPrs.mockResolvedValue([openPr]);
+    m.mergePr.mockRejectedValue(
+      new Error(
+        "PR #7 still carries 1 unanswered knightwatch [blocking] probe. Supply a knightwatchOverride reason to merge past it.",
+      ),
+    );
+    expect(await mergePrTool({ root: "/repo", projectId: "p1", number: 7 })).toMatchObject({
+      ok: false,
+      kind: "refused",
+      code: "knightwatch-unanswered",
+    });
+  });
 });
 
 /**
@@ -649,6 +731,7 @@ describe("merge_pr honours roborev, not just CI", () => {
     // EXACTLY the state that produced the incident: green, mergeable, ready by every GitHub signal.
     checks: "passing" as const,
     mergeable: "mergeable" as const,
+    headRefOid: "2ead6070aaaabbbbccccddddeeeeffff00001111",
   };
 
   function roborevJob(over: Record<string, unknown> = {}) {
@@ -712,7 +795,7 @@ describe("merge_pr honours roborev, not just CI", () => {
   it("MERGES when roborev is not in play on this machine — the gate is a no-op, not a deadlock", async () => {
     m.fetchRoborevProbe.mockResolvedValue({ enabled: false, jobs: null });
     expect(await mergePrTool({ root: "/repo", projectId: "p1", number: 806 })).toMatchObject({ ok: true });
-    expect(m.mergePr).toHaveBeenCalledWith("/repo", 806, undefined);
+    expect(m.mergePr).toHaveBeenCalledWith("/repo", 806, undefined, openPr.headRefOid);
   });
 
   it("MERGES when a closed FAIL is all that is left — roborev close is somebody's judgement", async () => {
@@ -814,6 +897,7 @@ describe("merge_pr and unanswered knightwatch probes", () => {
     url: "https://github.com/drodio/sparkle/pull/1176",
     checks: "passing" as const,
     mergeable: "mergeable" as const,
+    headRefOid: "1176aaaabbbbccccddddeeeeffff000011112222",
   };
   const RUST_REFUSAL = [
     "PR #1176 still carries 1 unanswered knightwatch [blocking] probe.",
@@ -863,7 +947,7 @@ describe("merge_pr and unanswered knightwatch probes", () => {
     expect(r).toMatchObject({ ok: true });
     // POSITIONALLY. A reason collected, validated and then dropped looks identical from here — the
     // merge succeeds either way in this mock — and in production Rust would refuse it forever.
-    expect(m.mergePr).toHaveBeenCalledWith("/repo", 1176, REASON);
+    expect(m.mergePr).toHaveBeenCalledWith("/repo", 1176, REASON, openPr.headRefOid);
   });
 
   it("trims the reason rather than recording the caller's whitespace on the PR", async () => {
@@ -873,7 +957,7 @@ describe("merge_pr and unanswered knightwatch probes", () => {
       number: 1176,
       knightwatchOverride: { reason: `  ${REASON}  ` },
     });
-    expect(m.mergePr).toHaveBeenCalledWith("/repo", 1176, REASON);
+    expect(m.mergePr).toHaveBeenCalledWith("/repo", 1176, REASON, openPr.headRefOid);
   });
 
   it("rejects a BOOLEAN override — a waiver has to say why", async () => {

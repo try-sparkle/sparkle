@@ -351,6 +351,12 @@ export type WorkflowFailureCode =
   // "answer the reviewer's question on the pull request". Measured before it was built — of the
   // last 40 merged PRs, 24 carried a blocking probe and all 24 merged with zero probe-citing reply.
   | "knightwatch-unanswered"
+  // The PR's head moved between the gate reading it and the merge running, so GitHub declined the
+  // merge (`--match-head-commit`). A DISTINCT code because it is the only merge outcome whose
+  // remedy is "do the identical thing again": nothing merged, and a second `merge_pr` re-reads the
+  // rows and re-gates against the NEW head. Uncoded it reads as a tool error, which is the one
+  // thing it is not.
+  | "head-moved"
   | "gh-unavailable" // the gh CLI is missing or unusable
   | "auth-failed" // credentials expired / rejected
   | "rejected-non-fast-forward"
@@ -1071,7 +1077,15 @@ export async function mergePrTool(
     );
 
   try {
-    await mergePr(root, req.number, knightwatch?.reason);
+    // THE HEAD THIS DECISION WAS MADE AGAINST. `pr` is the polled row `prMergeEligibility` read at
+    // gate 3, so `pr.headRefOid` is the exact sha whose checks every gate above judged. Rust turns it
+    // into `gh pr merge --match-head-commit`, so a branch that moved while gates 4-6 ran (a claim
+    // read, a roborev probe and an override validation, none of them instant) is refused loudly
+    // rather than merged at a head nobody evaluated. Without it the race is silent in the direction
+    // that loses work: a commit pushed while the merge settles is simply absent from the default
+    // branch afterwards and NOTHING looks wrong — the PR reads MERGED and the branch is back,
+    // recreated by the push. Absent or empty merges unguarded, exactly as before.
+    await mergePr(root, req.number, knightwatch?.reason, pr.headRefOid);
     return ok(op, { number: req.number, method: "merge", url: pr.url });
   } catch (e) {
     const msg = errText(e);
@@ -1080,6 +1094,19 @@ export async function mergePrTool(
     // `unknown-error` with Rust's prose and no code, which is a message a model retries verbatim.
     if (isKnightwatchRefusal(msg))
       return refused(op, "knightwatch-unanswered", knightwatchRefusalMessage(req.number, msg));
+    // ALSO A REFUSAL, for the same reason and one more. GitHub evaluates `--match-head-commit`
+    // BEFORE it merges anything, so a moved head means the repo did not move either — reporting it
+    // as `failed` would tell the model an operation half-happened when none of it did. And it is
+    // the guard added by this very call site doing its job, not a fault: the remedy is exact and
+    // mechanical, so it gets a code rather than gh's prose. Ordered after the knightwatch branch
+    // (whose test requires the word "knightwatch", so neither can shadow the other) and before the
+    // generic patterns, none of which match this message.
+    if (/head branch was modified|match-head-commit/i.test(msg))
+      return refused(
+        op,
+        "head-moved",
+        `Refused: PR #${req.number}'s head moved after this merge was gated — every check was judged at ${pr.headRefOid || "the head the poll reported"}, and GitHub declined the merge because the branch no longer points there. NOTHING was merged and the repository did not move. Call merge_pr again: it re-reads the PR and re-runs every gate against the new head. gh said: ${msg}`,
+      );
     if (/not mergeable|conflict/i.test(msg)) return failed(op, "conflict", msg);
     if (/required status check|checks have not passed|blocked/i.test(msg)) return failed(op, "checks-blocked", msg);
     if (/auth|not logged|401|403|token/i.test(msg)) return failed(op, "auth-failed", msg);

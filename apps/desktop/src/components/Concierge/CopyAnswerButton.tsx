@@ -1,5 +1,10 @@
-// The copy affordance under a concierge ANSWER (PRD 1 §2) — bottom-left, on the message's own left
-// text edge, so it reads as belonging to the paragraph above it rather than floating in the column.
+// The copy affordance beside a concierge ANSWER (PRD 1 §2) — at the LEADING edge, floated onto the
+// message's own left text edge so the prose flows around it and the glyph is where the eye starts.
+//
+// It said "bottom-left, so it reads as belonging to the paragraph above it" until 2026-08-05, when
+// the founder moved it: *"For the content that the concierge sends I would rather have it be at the
+// beginning of the row instead of top right."* The placement now lives in ConciergeMessageRow, which
+// is what floats it — this component owns the glyph, not where the row puts it.
 //
 // IT SERVES BOTH SIDES OF THE CONVERSATION. The founder asked for "a copy button like we do for the
 // concierge's responses" on his OWN messages, and the operative word is *like*: one component with a

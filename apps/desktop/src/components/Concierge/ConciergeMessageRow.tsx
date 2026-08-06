@@ -572,11 +572,25 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
           <FiBell size={11} aria-hidden />
           <span>{m.stale ? "Sparkle noticed — no longer current" : "Sparkle noticed"}</span>
         </div>
+        {/* ══ AT THE BEGINNING OF THE ROW, NOT THE END (founder, 2026-08-05) ═══════════════════════
+            *"For the content that the concierge sends I would rather have it be at the beginning of
+            the row instead of top right. I do like it being top right for what I send."*
+            The two sides are deliberately DIFFERENT, and that is the point rather than an
+            inconsistency: a user bubble is a right-aligned BOX whose corner is its natural control
+            slot, while an answer is left-aligned prose with no box — so its leading edge is where the
+            eye starts, and a glyph there is found without hunting for it.
+            FLOATED, mirroring the user side's `float: right`, and for the same reason: the prose flows
+            around it instead of being pushed down a line, and absolute positioning would sit ON the
+            text — which jsdom has no layout engine to catch.
+            Rendered ALWAYS, never on hover, so the entry's height cannot change under a reader who is
+            only moving the mouse (see CopyAnswerButton's header). */}
+        <span style={{ float: "left", marginRight: 6, marginLeft: -2, marginTop: -1 }}>
+          <CopyAnswerButton text={m.text} onCopied={onAnswerCopied} />
+        </span>
         <Markdown text={m.text} mergeQuotes />
         {collapsedPayload(m.collapsed ? [m.collapsed] : [])}
         {/* A push is still an ANSWER — the same words, arrived unasked — so it gets the same copy
             affordance. Copying its markdown source, like the branch below. */}
-        <CopyAnswerButton text={m.text} onCopied={onAnswerCopied} />
         {/* …and it is linted like one: a push streams over the same events and reaches the same
             `concierge:done`, so a promise made in an unprompted line is exactly as checkable as one
             made in a reply. Omitting it here would have left a whole channel unmarked. */}
@@ -605,7 +619,30 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
           Rewriting this reply…
         </div>
       ) : (
-        <Markdown text={m.text} mergeQuotes />
+        <>
+          {/* ══ AT THE BEGINNING OF THE ROW, NOT THE END (founder, 2026-08-05) ═══════════════════
+              *"For the content that the concierge sends I would rather have it be at the beginning
+              of the row instead of top right. I do like it being top right for what I send."*
+              The two sides are deliberately DIFFERENT, and that is the point rather than an
+              inconsistency: a user bubble is a right-aligned BOX whose corner is its natural
+              control slot, while an answer is left-aligned prose with no box — so its leading edge
+              is where the eye starts, and a glyph there is found without hunting for it.
+              FLOATED, mirroring the user side's `float: right`, and for the same reason: the prose
+              flows around it instead of being pushed down a line, and absolute positioning would
+              sit ON the text — which jsdom has no layout engine to catch.
+              Rendered ALWAYS, never on hover, so the entry's height cannot change under a reader
+              who is only moving the mouse (see CopyAnswerButton's header).
+
+              INSIDE THE NOT-HELD ARM, which is the merge decision worth recording rather than a
+              placement detail. A HELD reply is one whose words are being withheld because a lint
+              finding blocked them — so a copy control there would hand the reader, on one click,
+              exactly the sentence the block exists to keep off screen. The glyph is absent while
+              held and returns with the words. */}
+          <span style={{ float: "left", marginRight: 6, marginLeft: -2, marginTop: -1 }}>
+            <CopyAnswerButton text={m.text} onCopied={onAnswerCopied} />
+          </span>
+          <Markdown text={m.text} mergeQuotes />
+        </>
       )}
       {/* AFTER the sentence, because it is what the sentence is about — a relayed brief the
           transcript used to echo inline and push the conversation off screen. */}
@@ -615,7 +652,6 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
           state, not words anyone wants in a doc, and the negative assertions in
           ConciergeThread.copy.test are what stops this glyph spreading to every card. Copies
           `m.text`, the markdown SOURCE, so a table stays a table on paste (see CopyAnswerButton). */}
-      <CopyAnswerButton text={m.text} onCopied={onAnswerCopied} />
       {/* WHAT THE LINTER CAUGHT IN THIS REPLY (bead sparkle-kr2jz) — one quiet line, or nothing.
           LAST, under the copy glyph, mirroring the `you` arm's order: the words, then the control
           that acts on them, then the annotations ABOUT them (there: the routing receipt and the

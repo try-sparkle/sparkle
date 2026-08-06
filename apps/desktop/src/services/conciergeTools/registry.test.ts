@@ -78,6 +78,8 @@ vi.mock("../branchStatus", () => ({
   projectAgentsStatus: vi.fn(async () => []),
 }));
 const mergePrMock = vi.fn(async () => {});
+/** A polled head sha, so a merge that DROPS it is distinguishable from one that forwards it. */
+const HEAD_OID = "7ac0ffee11112222333344445555666677778888";
 /** The repo's open PRs, as the merge path reads them. A module-level handle (rather than an inline
  *  `vi.fn`) so one test can put a mergeable PR in front of `merge_pr` and assert what reaches the
  *  service — the registry's job on that op is to FORWARD arguments, and an empty list refuses at
@@ -472,6 +474,7 @@ describe("dispatchConciergeTool — normalization", () => {
         checks: "passing",
         mergeable: "mergeable",
         mergeStateStatus: "clean",
+        headRefOid: HEAD_OID,
       },
     ]);
     const reason = "the probe asks about a file this PR does not touch";
@@ -486,7 +489,11 @@ describe("dispatchConciergeTool — normalization", () => {
     // THE POINT OF THE TEST: the reason reaches the service. `.strict()` on the args schema means a
     // key it does not declare is a bad-args error, and a declared-but-unforwarded key is a merge
     // that silently drops the founder's sentence — both invisible from the result alone.
-    expect(mergePrMock).toHaveBeenCalledWith("/repos/app", 7, reason);
+    //
+    // The FOURTH argument is the polled head the merge decision was gated on, forwarded for the
+    // same reason and equally invisible from the result: dropped, the merge lands at whatever the
+    // branch points at when `gh` runs rather than the sha this dispatch approved.
+    expect(mergePrMock).toHaveBeenCalledWith("/repos/app", 7, reason, HEAD_OID);
   });
 
   it("workflow: a malformed knightwatchOverride is refused by the DOMAIN, not by the schema", async () => {

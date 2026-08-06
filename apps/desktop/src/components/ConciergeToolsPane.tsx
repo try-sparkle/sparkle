@@ -135,7 +135,7 @@ export function ConciergeToolsPane() {
         />
         <p style={settingBlurb}>
           Highlight anything Sparkle said and it goes straight to your clipboard. The copy button
-          under each answer works either way — and copies the original markdown, so tables and code
+          beside each answer works either way — and copies the original markdown, so tables and code
           blocks paste intact.
         </p>
       </section>

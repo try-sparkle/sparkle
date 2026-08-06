@@ -139,16 +139,28 @@ export function fetchPrOwner(
  * decode — but every existing caller and test asserts the exact payload `{ root, number }`, and a
  * key that materialises on every merge is a change to the wire for no gain. Passing a reason is the
  * exceptional path and it looks like one.
+ *
+ * `expectedHeadOid` is the head commit THIS merge decision was made against — the polled row's
+ * `headRefOid`, i.e. the sha the checks-green/mergeable gate read. Rust turns it into
+ * `gh pr merge --match-head-commit`, so a branch that moved since the poll is refused by GitHub
+ * ("Head branch was modified") rather than merged at a head nobody evaluated. That window is not
+ * theoretical: a commit pushed while a merge settles is absent from the default branch afterwards
+ * and NOTHING looks wrong — the PR reads MERGED and the branch is there again, recreated by the
+ * push. Same omit-when-absent rule, with one addition: an EMPTY string is dropped too, because
+ * empty `headRefOid` means "cannot compare" everywhere else (see `services/prDismissals.ts`) and
+ * `gh` would reject an empty flag value on every merge.
  */
 export async function mergePr(
   root: string,
   number: number,
   knightwatchOverride?: string,
+  expectedHeadOid?: string,
 ): Promise<void> {
   await invoke("merge_pr", {
     root,
     number,
     ...(knightwatchOverride === undefined ? {} : { knightwatchOverride }),
+    ...(expectedHeadOid ? { expectedHeadOid } : {}),
   });
 }
 

@@ -3715,6 +3715,39 @@ pub async fn pr_owner(
 /// so a slightly longer wait is acceptable where a stalled poll would not be.
 const MERGE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The `gh pr merge` argv, built purely so the `--match-head-commit` rule is testable without
+/// spawning `gh`.
+///
+/// `expected_head_oid` is the head commit the CALLER's merge decision was made against — the sha
+/// the checks-green/mergeable gate read, not whatever the branch happens to point at now. When it
+/// is supplied, `--match-head-commit` makes GitHub refuse the merge if the branch has moved since.
+///
+/// WHY THAT MATTERS: a merge and a push to the same branch race, and the race is silent in the
+/// direction that loses work. A commit pushed while a merge is settling is simply absent from the
+/// default branch afterwards, and nothing looks wrong — the PR reads MERGED and the branch exists
+/// (the merge deleted it, the push recreated it), so the pushed fix reads as landed when it is not.
+/// The same window also merges a head whose checks were never the ones the gate approved. Asserting
+/// the head converts both into a loud, retryable `gh` error ("Head branch was modified") that the
+/// menu already surfaces verbatim.
+///
+/// EMPTY IS ABSENT. `PrRow.headRefOid` is optional and empty means "cannot compare" everywhere else
+/// in this codebase (see `services/prDismissals.ts`), so an empty string must not become a
+/// `--match-head-commit ""` that `gh` would reject on every merge. Unknown head → unguarded merge,
+/// which is exactly the behaviour that existed before.
+fn merge_argv(number: u64, expected_head_oid: Option<&str>) -> Vec<String> {
+    let mut argv = vec![
+        "pr".to_string(),
+        "merge".to_string(),
+        number.to_string(),
+        "--merge".to_string(),
+    ];
+    if let Some(oid) = expected_head_oid.map(str::trim).filter(|o| !o.is_empty()) {
+        argv.push("--match-head-commit".to_string());
+        argv.push(oid.to_string());
+    }
+    argv
+}
+
 /// Merge an open PR by number with a MERGE COMMIT. This is the human gate the workflow is built
 /// around, invoked from the TopBar PR menu — for a PR whose opening agent has already left the
 /// sidebar, it is the only way to merge from the app at all.
@@ -3747,12 +3780,13 @@ pub async fn merge_pr(
     root: String,
     number: u64,
     knightwatch_override: Option<String>,
+    expected_head_oid: Option<String>,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         // BEFORE the merge, and returning `Err` on refusal: the merge is the irreversible half.
         crate::knightwatch::enforce(&root, number, knightwatch_override.as_deref())?;
         let mut cmd = Command::new(crate::preflight::gh_program());
-        cmd.args(["pr", "merge", &number.to_string(), "--merge"])
+        cmd.args(merge_argv(number, expected_head_oid.as_deref()))
             .current_dir(&root)
             .env("GH_PROMPT_DISABLED", "1")
             .env("GH_NO_UPDATE_NOTIFIER", "1");
@@ -5969,6 +6003,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// A known head is ASSERTED on the wire. This is the whole point of the change: without the
+    /// flag the merge takes whatever the branch points at when `gh` runs, so a commit pushed in
+    /// that window is dropped silently and the result is indistinguishable from success.
+    #[test]
+    fn a_known_head_becomes_match_head_commit() {
+        let argv = merge_argv(1309, Some("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"));
+        assert_eq!(
+            argv,
+            vec![
+                "pr",
+                "merge",
+                "1309",
+                "--merge",
+                "--match-head-commit",
+                "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+            ],
+            "the expected head must reach gh, adjacent to its flag and AFTER --merge"
+        );
+    }
+
+    /// An UNKNOWN head merges exactly as before. A build (or caller) that cannot supply the oid
+    /// must not lose the ability to merge — the guard is an upgrade where the sha is known, never
+    /// a new requirement.
+    #[test]
+    fn an_unknown_head_leaves_the_argv_untouched() {
+        let expected = vec!["pr", "merge", "1309", "--merge"];
+        assert_eq!(merge_argv(1309, None), expected, "absent oid: no flag");
+        assert_eq!(merge_argv(1309, Some("")), expected, "empty oid means 'cannot compare'");
+        assert_eq!(merge_argv(1309, Some("   ")), expected, "whitespace is not a sha");
+    }
+
+    /// `--merge` survives. A squash rewrites the commits so the branch tip stops being an ancestor
+    /// of main, which breaks Sparkle's landed-by-ancestry proof — the flag added above must not be
+    /// able to displace it.
+    #[test]
+    fn the_merge_strategy_is_always_a_merge_commit() {
+        for oid in [None, Some("deadbeef")] {
+            let argv = merge_argv(7, oid);
+            assert!(argv.iter().any(|a| a == "--merge"), "merge commit, always: {argv:?}");
+            assert!(
+                !argv.iter().any(|a| a == "--squash" || a == "--rebase" || a == "--auto"),
+                "no strategy or auto-merge flag may appear: {argv:?}"
+            );
+        }
     }
 
     /// `exited_without_reaping` must report the exit WITHOUT collecting it — the property the

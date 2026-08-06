@@ -553,6 +553,41 @@ describe("mergePr — the knightwatch override is passed THROUGH", () => {
     expect(payload).toEqual({ root: "/repo", number: 1176 });
   });
 
+  // ── AND SO DOES THE HEAD THE DECISION WAS MADE AGAINST ─────────────────────────────────────
+  //
+  // Same reasoning, opposite failure: dropping `expectedHeadOid` does not refuse a merge, it merges
+  // a head this app never judged — and a commit pushed in that window is absent from main with the
+  // PR reading MERGED. There is no visible symptom, so the payload is the only place to assert it.
+  it("carries the polled head to the Rust command as `expectedHeadOid`", async () => {
+    const oid = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0";
+    await mergePr("/repo", 1176, undefined, oid);
+    const payload = h.invoke.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(payload).toEqual({ root: "/repo", number: 1176, expectedHeadOid: oid });
+  });
+
+  it("sends BOTH when a red PR is waived at a known head", async () => {
+    await mergePr("/repo", 1176, "answered in the thread", "deadbeefcafe");
+    const payload = h.invoke.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(payload).toEqual({
+      root: "/repo",
+      number: 1176,
+      knightwatchOverride: "answered in the thread",
+      expectedHeadOid: "deadbeefcafe",
+    });
+  });
+
+  it("OMITS an unknown head — empty means 'cannot compare', never a merge that gh rejects", async () => {
+    for (const oid of [undefined, ""]) {
+      h.invoke.mockClear();
+      await mergePr("/repo", 1176, undefined, oid);
+      const payload = h.invoke.mock.calls[0]?.[1] as Record<string, unknown>;
+      expect("expectedHeadOid" in payload, `oid=${JSON.stringify(oid)}`).toBe(
+        false,
+      );
+      expect(payload).toEqual({ root: "/repo", number: 1176 });
+    }
+  });
+
   it("does not swallow a refusal — the caller must see why the merge did not happen", async () => {
     h.invoke.mockRejectedValueOnce(
       new Error("knightwatch: 1 unanswered [blocking] probe"),

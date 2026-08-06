@@ -16,6 +16,7 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConciergeThread } from "./ConciergeThread";
+import { HELD_REPLY_TESTID } from "./ConciergeMessageRow";
 import { MESSAGE_ATTACHMENTS_TESTID } from "../composer/AttachmentStrip";
 import type { ConciergeMessage } from "./types";
 
@@ -390,4 +391,75 @@ describe("ConciergeThread — copy affordances", () => {
       strip.compareDocumentPosition(wrapper!.parentElement!) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
   });
+
+describe("where each copy glyph sits — the two sides differ on purpose", () => {
+  /**
+   * THE FOUNDER'S PLACEMENT (2026-08-05): *"For the content that the concierge sends I would rather
+   * have it be at the beginning of the row instead of top right. I do like it being top right for
+   * what I send."*
+   *
+   * Pinned because nothing else can hold it: the answer glyph sat AFTER the prose for its whole
+   * life, every existing case asserts only that it exists, and a later edit moving it back would be
+   * green. Both facts are readable in jsdom — document order within the row, and the float — so
+   * neither needs a layout engine.
+   */
+  it("puts the ANSWER glyph at the leading edge, before the prose", () => {
+    render(
+      <ConciergeThread
+        messages={[{ id: "s1", kind: "sparkle", text: "here is the answer", settled: true }]}
+        onNudgeClick={noop}
+        onNudgeAction={noop}
+      />,
+    );
+    const button = screen.getByTestId("concierge-copy-answer");
+    let wrapper = button.parentElement as HTMLElement | null;
+    while (wrapper && wrapper.style.float !== "left") wrapper = wrapper.parentElement;
+    expect(wrapper).toBeTruthy();
+    expect(wrapper!.style.float).toBe("left");
+    // FIRST in its row — that is what "the beginning of the row" means, and it is the half a float
+    // assertion alone would miss.
+    expect(wrapper!.parentElement!.firstElementChild).toBe(wrapper);
+  });
+
+  /**
+   * NO COPY GLYPH ON A HELD REPLY — the decision the merge with `main` forced, and it is a safety
+   * property rather than a layout one.
+   *
+   * A held reply is one whose words are WITHHELD because a lint finding blocked them. Putting a copy
+   * control there would hand the reader, in one click, exactly the sentence the block exists to keep
+   * off screen — so the glyph is absent while held and returns with the words.
+   */
+  it("shows no copy glyph while a reply is held back by a lint finding", () => {
+    render(
+      <ConciergeThread
+        messages={[
+          { id: "s1", kind: "sparkle", text: "the blocked sentence", settled: true, held: true },
+        ]}
+        onNudgeClick={noop}
+        onNudgeAction={noop}
+      />,
+    );
+    expect(screen.queryByTestId("concierge-copy-answer")).toBeNull();
+    // The row itself is still there — an empty row would read as a turn that produced nothing.
+    expect(screen.getByTestId(HELD_REPLY_TESTID)).toBeTruthy();
+  });
+
+  // …and the USER glyph stays floated RIGHT. Asserted alongside so the two placements are pinned in
+  // one place: they are deliberately opposite, and a future "make these consistent" edit should have
+  // to delete an explicit assertion rather than quietly unify them.
+  it("keeps the USER glyph floated right, not left", () => {
+    render(
+      <ConciergeThread
+        messages={[{ id: "u1", kind: "you", text: "my question" }]}
+        onNudgeClick={noop}
+        onNudgeAction={noop}
+      />,
+    );
+    const button = screen.getByTestId("concierge-copy-message");
+    let wrapper = button.parentElement as HTMLElement | null;
+    while (wrapper && wrapper.style.float !== "right") wrapper = wrapper.parentElement;
+    expect(wrapper).toBeTruthy();
+    expect(wrapper!.style.float).toBe("right");
+  });
+});
 });

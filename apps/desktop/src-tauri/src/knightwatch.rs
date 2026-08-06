@@ -1794,7 +1794,9 @@ mod tests {
         // Slice from the signature, so the doc comment above it cannot satisfy the search.
         let start = src.find("pub async fn merge_pr(").expect("merge_pr's signature");
         let body = &src[start..];
-        let merge = body.find(r#"["pr", "merge","#).expect("the merge argv");
+        // The argv is built by `merge_argv(…)` — the pure builder that owns the `--merge` and
+        // `--match-head-commit` rules — so THAT call is the merge landmark, not the literal.
+        let merge = body.find("merge_argv(number,").expect("the merge argv");
         assert!(
             body[..merge].lines().any(|l| l.trim() == CALL),
             "merge_pr must call the gate as a STATEMENT, with `?`, BEFORE `gh pr merge`. Matching a \
