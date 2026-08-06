@@ -20,6 +20,8 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { copyToClipboard } from "../clipboard";
 import { C } from "../theme/colors";
 import { FONT_MONO, FONT_UI } from "../theme/scale";
+import { TERM_BODY_BASE_SIZE, TERM_BODY_FONT } from "./terminalChrome";
+import { MD_CODE_FACE, MD_CODE_FACE_VAR } from "./mdCodeFace";
 import { parseAgentRefHref } from "./Concierge/agentRefs";
 import { AgentPill } from "./Concierge/AgentPill";
 import { parseBeadRefHref } from "./Concierge/beadRefs";
@@ -27,7 +29,22 @@ import { remarkBeadRefs } from "./Concierge/remarkBeadRefs";
 import { remarkMergeQuotes } from "./Concierge/remarkMergeQuotes";
 import { BeadPill } from "./Concierge/BeadPill";
 
-const MONO = FONT_MONO;
+/**
+ * THE FACE CODE SPANS WEAR — the custom property this component's ROOT publishes, not a literal.
+ *
+ * A hardcoded `FONT_MONO` here survives `face="terminal"`, and that is not a cosmetic leftover: the
+ * root's face reaches ordinary prose by INHERITANCE, but every `code` element re-declares its own
+ * family, so a terminal-faced surface would render its paragraphs in the terminal's mono and its
+ * code — the thing an agent writes most of — in a DIFFERENT one. Same defect as the `FONT_UI` root
+ * this `face` prop exists to fix, hiding for the same reason: both faces are monospace.
+ *
+ * A custom property rather than threading `face` into `components`: the map is hoisted so
+ * ReactMarkdown receives a STABLE reference across renders (see `REMARK_PLUGINS`' note on why that
+ * matters), and rebuilding it per face would defeat exactly that. The var is inherited, so one
+ * declaration on the root reaches every monospace descendant at any depth — including `BeadPill`,
+ * which this file renders inline and which therefore reads the same constant. See `mdCodeFace.ts`.
+ */
+const MONO = MD_CODE_FACE;
 
 /** The testid the code block's own copy control answers to. */
 export const CODE_COPY_TESTID = "markdown-copy-code";
@@ -205,7 +222,10 @@ const prose: CSSProperties = {
 };
 
 const heading = (size: number, top: number): CSSProperties => ({
-  fontFamily: FONT_UI,
+  // INHERITED, so a heading follows whatever face the root set (see the `face` prop). Identical to
+  // the old hardcoded `FONT_UI` for every default caller, because the root's own `prose` sets exactly
+  // that — but it means a terminal-faced block does not sprout sans-serif headings mid-render.
+  fontFamily: "inherit",
   fontWeight: 600,
   fontSize: size,
   lineHeight: 1.3,
@@ -414,20 +434,60 @@ const components: Components = {
 
 /** Render `text` as compact, theme-styled GitHub-flavored markdown for a chat bubble.
  *  Memoized: ReactMarkdown re-parses the whole string on every render, so in a streaming chat the
- *  unchanged bubbles would re-parse their full text on every token. Both props are primitives, so
- *  the default shallow-equal memo skips the re-parse whenever neither has changed.
+ *  unchanged bubbles would re-parse their full text on every token. All props are primitives, so
+ *  the default shallow-equal memo skips the re-parse whenever none has changed.
  *
  *  `mergeQuotes` folds adjacent blockquotes into one bar and is OPT-IN — see
- *  `REMARK_PLUGINS_MERGED_QUOTES` for why only the concierge may ask for it. */
+ *  `REMARK_PLUGINS_MERGED_QUOTES` for why only the concierge may ask for it.
+ *
+ *  ══ `face` — AND WHY THIS PROP HAD TO EXIST ═════════════════════════════════════════════════════
+ *  `prose` hardcodes `FONT_UI` on the ROOT, which every paragraph and list item then inherits. That
+ *  makes this component the last word on typeface no matter what its container says — and it is why
+ *  the founder asked three times for the mounted concierge thread to read as the terminal and saw it
+ *  fail each time. Three separate changes correctly set `TERM_BODY_FONT` on the thread's scroll
+ *  container; all three were silently overridden HERE, two layers below where anyone was looking, and
+ *  the guarding test asserted the container (where everything was right) rather than the rendered
+ *  prose. See MountedAgentThread's header.
+ *
+ *  So the face is a PROP rather than something a parent can set by cascade: a caller that needs the
+ *  terminal's face asks for it explicitly and gets it, and the default stays exactly as it was.
+ *
+ *  IT REACHES CODE TOO. Fenced and inline code keep their slab treatment — their own background,
+ *  size and border — but NOT their own typeface: the root publishes `--md-code-face` and the code
+ *  renderers read it, so a terminal-faced surface is monospace in ONE face rather than two. Leaving
+ *  them on `FONT_MONO` would have reproduced this bug one level down, in the content an agent emits
+ *  most; see `MD_CODE_FACE_VAR`. */
 export const Markdown = memo(function Markdown({
   text,
   mergeQuotes = false,
+  face = "ui",
 }: {
   text: string;
   mergeQuotes?: boolean;
+  /** `"terminal"` renders the prose in xterm's own face/size, for surfaces that must read as the
+   *  terminal (the mounted concierge thread). Defaults to the UI face — unchanged for every other
+   *  caller. */
+  face?: "ui" | "terminal";
 }) {
+  // ONE declaration site for both channels: the family every text node inherits, and the family the
+  // code renderers read out of `--md-code-face`. They move together by construction, so a future
+  // face cannot arrive with its prose converted and its code left behind — which is the shape of
+  // this bug, twice over now.
+  const rootStyle = (
+    face === "terminal"
+      ? {
+          ...prose,
+          fontFamily: TERM_BODY_FONT,
+          fontSize: TERM_BODY_BASE_SIZE,
+          [MD_CODE_FACE_VAR]: TERM_BODY_FONT,
+        }
+      : { ...prose, [MD_CODE_FACE_VAR]: FONT_MONO }
+  ) as CSSProperties;
   return (
-    <div style={prose}>
+    // `data-md-face` names the decision in the DOM so a surface's face is assertable and greppable.
+    // Without it the only way to test "this prose renders in the terminal's face" is to walk to the
+    // root div by position — which is how the previous guard ended up asserting a container instead.
+    <div data-md-face={face} style={rootStyle}>
       <ReactMarkdown
         remarkPlugins={mergeQuotes ? REMARK_PLUGINS_MERGED_QUOTES : REMARK_PLUGINS}
         components={components}

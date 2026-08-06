@@ -12,15 +12,31 @@
 // Sparkle history and a transcript read on one code path, which is how the "unmount restores the
 // concierge conversation" requirement gets broken by accident. Kept apart, it holds by construction.
 //
-// THE RENDERING IS "SPLIT REGISTER" (Preview E, locked with the founder 2026-07-30).
-// Two voices, two typographic faces, one column:
-//   • YOUR words keep the chat register — a right-aligned bubble — because they are the same act of
-//     typing they always were, and because the bubble is what tells you at a glance that a line is
-//     yours rather than the agent's.
-//   • THE AGENT speaks in the terminal register: monospace, flush left, no bubble, over the flooded
-//     terminal plane the column already paints.
+// ONE FACE, TWO SHAPES. The whole mounted thread renders in the TERMINAL's face — `TERM_BODY_FONT` at
+// `TERM_BODY_BASE_SIZE`, set once on the scroll container and inherited by every turn:
+//   • YOUR words: a right-aligned bubble over the flooded terminal plane.
+//   • THE AGENT: flush left, no bubble, full width.
 //   • TOOL MACHINERY collapses into one expandable ActivityChip per stretch of work.
-// Which voice is speaking is legible from across the room — the thing a same-face thread cannot do.
+// Shape and alignment are what make the two voices legible apart — NOT a second typeface.
+//
+// ══ THIS PARAGRAPH USED TO SAY THE OPPOSITE, AND THAT IS WHY THE BUG SURVIVED TWICE ══════════════
+// It described a "SPLIT REGISTER (Preview E, locked with the founder 2026-07-30)" in which the
+// founder's own words stayed in the chat face while only the agent spoke in mono. The founder asked
+// for the mounted thread to match the terminal at least three separate times AFTER that, and each
+// time an agent opened this file, read a header attributing the split to him, and correctly declined
+// to touch it. A contract comment narrating a superseded decision is not documentation — it is a
+// lock, and it outlived the decision it recorded.
+//
+// Two things follow, and both are load-bearing:
+//   1. The founder's ask is UNIFORM: the mounted column should read as the terminal beside it. If a
+//      future change wants to reintroduce a typographic split, that needs a fresh decision recorded
+//      with a fresh date — not a revert to this note.
+//   2. NEITHER `FONT_MONO` NOR `TERM_TYPE` (theme/scale) IS THE TERMINAL'S. `--k-mono` is
+//      `ui-monospace, "SF Mono", …` and `--t-term` is 12px; xterm is built with `TERM_BODY_FONT`
+//      (`"Source Code Pro", …`) at 13. They are all monospace, so a surface set in the wrong pair
+//      looks plausible, matches nothing, and goes red nowhere. Import from `../terminalChrome` for
+//      anything meant to match the terminal. (Beware also that `TERM_TYPE` is exported TWICE with two
+//      different types — a number from `theme/scale`, an object from `../terminalChrome`.)
 import { useLayoutEffect, useMemo, useRef } from "react";
 
 import { ActivityChip } from "./ActivityChip";
@@ -33,7 +49,11 @@ import { DELIVERY_A11Y, DELIVERY_LABEL, QUEUED_BLOCK_HEADING } from "../inboxCop
 import { useAutoFollow } from "../../hooks/useAutoFollow";
 import { TERM_BODY_BASE_SIZE, TERM_BODY_FONT, termMuted } from "../terminalChrome";
 import { useResolvedTheme, type ResolvedTheme } from "../../theme/theme";
-import { FONT_MONO, TERM_TYPE, TYPE } from "../../theme/scale";
+// `TYPE.micro` and `FONT_MONO` here are for CHROME ONLY — timestamps, provenance marks, the
+// queued-block heading — which is deliberately smaller-than-body furniture rather than conversation.
+// Nothing that renders a TURN may read from this module: see the header on why `--k-mono` / `--t-term`
+// are not the terminal's face and size.
+import { FONT_MONO, TYPE } from "../../theme/scale";
 
 export const MOUNTED_THREAD_TESTID = "mounted-agent-thread";
 export const MOUNTED_HUMAN_TESTID = "mounted-human-turn";
@@ -275,7 +295,10 @@ function QueuedMessage({ entry, muted }: { entry: InboxEntry; muted: string }) {
         style={{
           display: "inline-block",
           textAlign: "left",
-          fontSize: TYPE.body,
+          // Same register as the settled bubble it becomes (see `Entry`'s human turn): face inherited
+          // from the scroller, size named from the terminal's own constant. A queued message that
+          // changed typeface on delivery would make "it delivered" read as a different object.
+          fontSize: TERM_BODY_BASE_SIZE,
           background: "color-mix(in srgb, currentColor 10%, transparent)",
           borderRadius: "4px 4px 0 4px",
           padding: "9px 12px",
@@ -328,10 +351,17 @@ function Entry({
           style={{
             display: "inline-block",
             textAlign: "left",
-            // The UI face, NOT the mono face. This is the split register: your words stay in the
-            // chat voice while the agent speaks in the terminal voice, which is what makes the two
-            // legible apart at a glance.
-            fontSize: TYPE.body,
+            // NO FACE DECLARED — the scroller's terminal font cascades in here too, and that is
+            // correct: the founder asked for the WHOLE mounted thread in the terminal's face, his own
+            // words included. What separates his voice from the agent's is the BUBBLE and the
+            // right-alignment, not a second typeface.
+            //
+            // The comment that used to sit here claimed this bubble was set in "the UI face, NOT the
+            // mono face". It never was: declaring only a size leaves the family to inherit, so the
+            // stated split was already defeated by the cascade and the note was describing an
+            // intention rather than the render. Naming the terminal's own size constant now, so this
+            // bubble cannot drift from the plane it sits on.
+            fontSize: TERM_BODY_BASE_SIZE,
             // `currentColor` is the terminal ink the column set on its section, so the bubble reads
             // as belonging to the flooded plane rather than punching a chat-coloured hole in it.
             // Same treatment ConciergeThread's `wired` bubble already uses.
@@ -359,18 +389,28 @@ function Entry({
       style={{
         maxWidth: "100%",
         alignSelf: "flex-start",
-        // THE TERMINAL REGISTER. Mono at TERM_TYPE (12px) rather than the 13px the chat face uses —
-        // monospace reads visually larger at the same nominal size, so matching the numbers would
-        // make the agent's voice louder than the founder's. The looser line-height is what keeps
-        // mono prose readable at length, which is the one real cost of this register.
-        fontFamily: FONT_MONO,
-        fontSize: TERM_TYPE,
+        // NO FACE AND NO SIZE DECLARED HERE, DELIBERATELY — the scroller's `TERM_BODY_FONT` /
+        // `TERM_BODY_BASE_SIZE` cascade in, which is the entire reason they are set on the container
+        // (see the block above the scroller's `style`).
+        //
+        // THIS DIV IS WHY THE FOUNDER KEPT ASKING FOR A FIX THAT HAD ALREADY SHIPPED. It used to
+        // override BOTH with `FONT_MONO` at `TERM_TYPE`, and neither is the terminal's:
+        // `--k-mono` resolves to `ui-monospace, "SF Mono", Menlo` (SF Mono on macOS) while xterm is
+        // constructed with `"Source Code Pro", …` at 13px — a different typeface at 12px. The agent's
+        // prose is the BULK of what this column shows, so the one element that ignored the cascade was
+        // also the one he was reading. The container was right; its child overrode it.
+        //
+        // The looser line-height stays: it keeps mono prose readable at length, and it is a spacing
+        // decision rather than a face decision, so it does not fight the cascade.
         lineHeight: 1.62,
         width: "100%",
       }}
     >
-      {/* Markdown still renders — the agent writes lists, code and links — just in the mono face. */}
-      <Markdown text={entry.text} />
+      {/* Markdown still renders — the agent writes lists, code and links.
+          `face="terminal"` IS THE FIX, and it is not redundant with the cascade above: `Markdown`
+          hardcodes `FONT_UI` on its own root, so it overrides any inherited face. Three earlier
+          attempts set the thread's container correctly and were defeated exactly here. */}
+      <Markdown text={entry.text} face="terminal" />
     </div>
   );
 }

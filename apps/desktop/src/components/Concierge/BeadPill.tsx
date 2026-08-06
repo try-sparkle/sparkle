@@ -49,7 +49,8 @@ import {
 } from "react";
 import { FiExternalLink } from "react-icons/fi";
 import { C } from "../../theme/colors";
-import { FONT_MONO, TYPE } from "../../theme/scale";
+import { TYPE } from "../../theme/scale";
+import { MD_CODE_FACE } from "../mdCodeFace";
 import { MENTION_PILL_FILL } from "./MentionPill";
 import { sideOf } from "../../engine/pairs";
 import { BEADS_CROSS_PROJECT_REFRESH_MS, useBeadsStore } from "../../stores/beadsStore";
@@ -538,7 +539,15 @@ export function BeadPill({ beadId }: { beadId: string }) {
           // theme/scale.test.ts ratchets exactly that — there is no scale step between body and
           // small, so a pill mid-sentence takes the sentence's own size or a TYPE value, never a
           // fraction of one.
-          fontFamily: FONT_MONO,
+          //
+          // WHICH mono is the surface's decision, not this pill's — the same argument the size
+          // comment above makes, applied to the face. A hardcoded `FONT_MONO` here paints SF Mono
+          // mid-sentence inside the mounted concierge thread, whose prose is the terminal's Source
+          // Code Pro: a second monospace, invisible because it is monospace too. This pill is
+          // rendered INSIDE `Markdown` (by `remarkBeadRefs`), so it reads the same custom property
+          // the code renderers do and follows whatever face that root declared, with `FONT_MONO` as
+          // the fallback for a pill rendered outside one.
+          fontFamily: MD_CODE_FACE,
         }}
       >
         <span style={dot(bead.status)} aria-hidden />
