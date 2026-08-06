@@ -32,10 +32,13 @@
 //
 // ── THE LEAF, NOT `improvementPass` ────────────────────────────────────────────────────────────
 // This imports the LATCH module, never the pass. `conciergeTools/lifecycle` reads this file,
-// `conciergeTools/policy` reads that, and `stores/settingsStore` reads THAT — so anything this file
-// imports is acquired by every UI component whose graph reaches the settings store. Importing
-// `improvementPass` for the boolean did exactly that, and dragged `sparkleTranscript` and
-// `conciergeTools/terminal` in behind it; the header of `improvementPassLatch` records what broke.
+// `conciergeTools/policy` reads that, `services/configActions` reads that, and an ordinary composer
+// component (`components/composer/ApprovalNudge`) reads THAT — so anything this file imports is
+// acquired by that whole slice of the component tree. Importing `improvementPass` for the boolean
+// did exactly that, and dragged `sparkleTranscript` and `conciergeTools/terminal` in behind it; the
+// header of `improvementPassLatch` records what broke, and its suite asserts the chain rather than
+// asserting a plausible-sounding one (roborev 59144 caught the first cut naming a chain of
+// type-only imports, which esbuild erases and no bundle contains).
 import { isPassRunning } from "./improvementPassLatch";
 
 /** Why a write to the Improve Sparkle agent is being held off, or `null` when it is free.

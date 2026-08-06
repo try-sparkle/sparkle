@@ -6,12 +6,13 @@
 //   • the pass itself (services/improvementPass) — which owns the child process, and is a heavy
 //     module: it reaches the worktree/park stack, the transcript registry, and through that
 //     `conciergeTools/terminal`; and
-//   • the SHARED busy rule (services/sparkleBusy) — which is read by `conciergeTools/lifecycle`,
-//     and therefore by `conciergeTools/policy`, and therefore by `stores/settingsStore`, which is
-//     imported by ordinary UI components.
+//   • the SHARED busy rule (services/sparkleBusy) — which sits under an ordinary composer
+//     component. The measured chain (see improvementPassLatch.test.ts, which asserts it) is
+//     `components/Composer -> components/composer/ApprovalNudge -> services/configActions
+//     -> conciergeTools/policy -> conciergeTools/lifecycle -> services/sparkleBusy`.
 //
-// When the second reader imported the FIRST module for this one boolean, every component whose graph
-// touches settingsStore pulled the entire pass stack in behind it. That is not a theoretical cost:
+// When the second reader imported the FIRST module for this one boolean, every component in that
+// slice pulled the entire pass stack in behind it. That is not a theoretical cost:
 // it broke `Composer.suggestionDeadPty.test.tsx` at COLLECTION, because the newly-reachable
 // `conciergeTools/terminal` reads `SNAPSHOT_MAX_LINES` at module scope from a `terminalScrollback`
 // that the Composer test mocks with one export. The failure named a file the change never touched
