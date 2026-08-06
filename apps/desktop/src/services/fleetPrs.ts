@@ -15,7 +15,11 @@
 //
 // So scope is no longer a choice between projects. It is EVERY open project tab, and the answer is
 // grouped by the tab's own name.
-import { prReadyCount, type PrRow } from "./openPrs";
+import {
+  prProbeBlockedCount,
+  prReadyCount,
+  type JudgedPrRow,
+} from "./openPrs";
 
 /**
  * One repo the menu is asking about — an open project tab, flattened to the three things the menu
@@ -90,8 +94,9 @@ export function prKeyOf(scopeKey: string, number: number): string {
 export interface PrGroup {
   scope: PrScope;
   key: string;
-  /** The rows the menu LISTS — everything open in this scope MINUS anything dismissed. */
-  prs: PrRow[];
+  /** The rows the menu LISTS — everything open in this scope MINUS anything dismissed. Carries the
+   *  probe reading when one has landed; see {@link JudgedPrRow}. */
+  prs: JudgedPrRow[];
   /**
    * The rows the user has dismissed, in the same order the probe returned them.
    *
@@ -102,7 +107,7 @@ export interface PrGroup {
    * render what was dismissed and offer it back: a silently disappeared pull request is the one
    * failure worse than the un-pressable Merge button this feature exists to remove.
    */
-  dismissed: PrRow[];
+  dismissed: JudgedPrRow[];
   /** A probe for this scope has succeeded at least once, so `prs` is an answer rather than a gap. */
   known: boolean;
   /** This scope's most recent probe FAILED. Says nothing about whether we have an older list —
@@ -116,6 +121,18 @@ export interface PrGroup {
   unreadable: boolean;
   /** How many of `prs` are green — the same rule the per-row Merge button follows. */
   readyCount: number;
+  /**
+   * How many of `prs` are blocked on unanswered knightwatch probes — the "8 blocked" the header
+   * shows beside the ready count.
+   *
+   * A SEPARATE FACT FROM `total - readyCount`. Most non-green PRs are waiting on CI, which resolves
+   * itself and needs nothing from the reader; a probe-blocked one needs them to go and answer a
+   * question. Reporting them as one number is what let eleven PRs read as eleven ready ones.
+   *
+   * ZERO WHEN NO PROBE READ HAS LANDED, which is honest rather than optimistic: the reads arrive
+   * after the list, and an unknown reading is never counted as blocked (see `prProbeBlockedCount`).
+   */
+  blockedCount: number;
 }
 
 /**
@@ -136,7 +153,7 @@ export interface PrGroup {
  */
 export function buildPrGroups(
   scopes: readonly PrScope[],
-  byKey: ReadonlyMap<string, PrRow[] | null>,
+  byKey: ReadonlyMap<string, JudgedPrRow[] | null>,
   failedKeys: ReadonlySet<string>,
   dismissedByKey: ReadonlyMap<string, ReadonlySet<number>> = new Map(),
 ): PrGroup[] {
@@ -167,6 +184,9 @@ export function buildPrGroups(
       // `prReadyCount` owns that rule, and a caller that recomputes it inline is a second copy
       // nothing keeps in step (roborev 56050 made exactly this point about the header pill).
       readyCount: prReadyCount(prs),
+      // Same discipline as `readyCount` directly above: through the exported helper, never a
+      // re-implemented filter, so the header and the rows cannot disagree about what "blocked" is.
+      blockedCount: prProbeBlockedCount(prs),
     };
   });
 }

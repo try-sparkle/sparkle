@@ -50,6 +50,7 @@ import {
 } from "react";
 import {
   FiChevronDown,
+  FiChevronRight,
   FiExternalLink,
   FiEyeOff,
   FiGitBranch,
@@ -66,9 +67,20 @@ import {
   mergePr,
   prMergeReadiness,
   OPEN_PR_POLL_MS,
+  type JudgedPrRow,
   type PrDotTone,
+  type PrProbeState,
   type PrRow,
 } from "../services/openPrs";
+import {
+  evictProbeGates,
+  fetchProbeGates,
+  probeStateOf,
+  refreshProbeGates,
+  unansweredBlockingProbes,
+  type ProbeDetail,
+  type ProbeGateTarget,
+} from "../services/probeGate";
 import {
   buildPrGroups,
   fleetHeadline,
@@ -331,6 +343,18 @@ function dotColor(tone: PrDotTone): string {
     case "blocked":
       return C.sienna;
   }
+}
+
+/**
+ * The probe disclosure's name, used for BOTH its `aria-label` and its `title`.
+ *
+ * One function so the two cannot drift: the tooltip a mouse reader gets and the name a screen
+ * reader announces are the same sentence, and the count is stated in both.
+ */
+function probeDisclosureLabel(count: number, open: boolean): string {
+  return open
+    ? "Hide the probes blocking this PR"
+    : `Show the ${count} unanswered ${count === 1 ? "probe" : "probes"} blocking this PR`;
 }
 
 /** Shown in the panel's own staleness slot — BENEATH any merge error, never in place of one — when
@@ -620,6 +644,30 @@ export function OpenPrMenu({
   // needs that: opening a fourth project tab cannot make the other three's rows wrong, so the effect
   // below PRUNES departed scopes instead of blanking the lot, and the tabs you kept keep their data.
   /** What the last probe returned per scope. A missing key is UNKNOWN; `null` never lands here. */
+  /**
+   * Per scope, per PR number: what the knightwatch probe read said.
+   *
+   * A SEPARATE MAP FROM `byKey`, NOT A FIELD ON THE ROW, and that is deliberate. `PrRow` mirrors
+   * Rust's `project_open_prs` payload, which carries no probe data and must not start carrying it:
+   * one probe read is a `gh api ... --paginate` SUBPROCESS under a 45 s timeout, and the PR list is
+   * on the panel's critical path. Keeping them separate is what lets the rows PAINT IMMEDIATELY and
+   * refine as the reads land, instead of the whole panel waiting on the slowest repo.
+   *
+   * An absent entry means "no read has landed", which the readiness rule treats exactly like an
+   * unknown read: it withholds nothing and manufactures nothing.
+   */
+  const [probesByKey, setProbesByKey] = useState<
+    ReadonlyMap<string, ReadonlyMap<number, PrProbeState>>
+  >(() => new Map());
+  /** The unanswered blocking probes themselves, for the expanded row. Kept beside the counts rather
+   *  than inside them so the readiness projection stays three small fields. */
+  const [probeDetailByKey, setProbeDetailByKey] = useState<
+    ReadonlyMap<string, ReadonlyMap<number, ProbeDetail[]>>
+  >(() => new Map());
+  /** Which row has its probe detail expanded, as `prKeyOf(groupKey, number)`. One at a time: this
+   *  panel is already a scrolling list and two open drawers push the rest off screen. */
+  const [probeExpanded, setProbeExpanded] = useState<string | null>(null);
+
   const [byKey, setByKey] = useState<ReadonlyMap<string, PrRow[]>>(
     () => new Map(),
   );
@@ -674,6 +722,16 @@ export function OpenPrMenu({
    * NOT inside `refetch`, because `runMerge` calls `refetch` itself and would erase the refusal it
    * had just recorded, taking the override affordance with it. A PR that is still refusing simply
    * re-enters the ledger on the next merge attempt, which costs one click and cannot get stuck.
+   *
+   * THE TWO SIGNALS ARE NOT THE SAME STRENGTH FOR PROBE GATES, and this ledger is only half the
+   * row's state. Open evicts the readings for rows whose REPORTED BLOCKER IS PROBES
+   * (`evictProbeGates`, targets from `probeBlockedTargets`); Refresh drops all of them and bumps
+   * the generation. So on open, a row whose probe read is cached clean — or whose probes are
+   * outranked by a conflict, by missing merge rights, or waived by a recorded override — keeps that
+   * reading while its refusal is dropped, which is correct: the refusal is the older fact, and
+   * re-reading buys nothing when no value of the reading can change the row.
+   *
+   * Do not read "cleared on open" as "everything about probes is re-asked on open".
    */
   const clearProbeRefusals = useCallback(() => {
     setProbeRefusals((prev) => (prev.size === 0 ? prev : new Map()));
@@ -722,6 +780,14 @@ export function OpenPrMenu({
   // What the last SUCCESSFUL probe returned per scope. Read by `refetch` to tell "GitHub says there
   // are no PRs" apart from "we could not ask", which `fetchOpenPrs` collapses into one `null`.
   const lastGoodRef = useRef<Map<string, PrRow[] | null>>(new Map());
+  // PER SCOPE, WHICH PROBE BATCH IS THE LATEST ONE ASKED FOR. The reads below are fired and never
+  // awaited (see the block that issues them), so a 3-minute poll and a Refresh press overlap freely
+  // — and `gh` gives no ordering guarantee, so the SLOWER batch can resolve last and write its older
+  // answer over the newer one. That is the panel's whole failure mode wearing a different hat: a PR
+  // that has just become probe-blocked paints green again, or an answered probe stays red, and the
+  // next write is 180 s away. `fetchProbeGates` fences its own CACHE on a module generation; these
+  // two React setters had no fence at all, which is where the stale answer landed.
+  const probeSeqRef = useRef<Map<string, number>>(new Map());
   // THE ANCHOR the compact panel hangs off — the badge's own box. Measured, not guessed, because the
   // concierge can be docked to either side of the shell and moved while the app is running.
   const anchorRef = useRef<HTMLDivElement | null>(null);
@@ -802,6 +868,45 @@ export function OpenPrMenu({
           }
           lastGoodRef.current.set(key, rows);
           setByKey((prev) => new Map(prev).set(key, rows));
+          // ── PROBE READS: FIRED, NEVER AWAITED ──────────────────────────────────────────────
+          //
+          // Deliberately NOT awaited here, and not inside the `Promise.all` above. Each read is its
+          // own `gh` subprocess; the panel routinely lists 27 PRs across 6 projects, so awaiting
+          // them would hold the rows off screen behind the slowest repo's slowest PR — trading the
+          // founder's "these look ready" for a blank panel, which is not a better failure. The rows
+          // are already set on the line above; these arrive and refine them.
+          //
+          // `fetchProbeGates` never rejects and caches by `updatedAt`, so a poll that changes
+          // nothing costs no subprocesses at all.
+          void (async () => {
+            // Claimed BEFORE the read, so a batch issued later always outranks this one.
+            const seq = (probeSeqRef.current.get(key) ?? 0) + 1;
+            probeSeqRef.current.set(key, seq);
+            const gates = await fetchProbeGates(scope.rootPath!, rows);
+            if (!aliveRef.current || !liveKeysRef.current.has(key)) return;
+            if (probeSeqRef.current.get(key) !== seq) return; // a newer batch already answered
+            const states = new Map<number, PrProbeState>();
+            const details = new Map<number, ProbeDetail[]>();
+            for (const [number, gate] of gates) {
+              const st = probeStateOf(gate);
+              if (st) states.set(number, st);
+              // PURE DATA — every unanswered blocking probe, with NO judgement applied here.
+              //
+              // The judgement (does this row REPORT probes as its blocker?) belongs at render, not
+              // here, and putting it here was a second computation site of exactly the kind this
+              // whole line of work removes. The row's label comes from `prMergeReadiness` over
+              // `judgedByKey` at render time; deciding the drawer at READ time meant hand-rebuilding
+              // that join against the rows captured in this closure, and the two snapshots can
+              // disagree: a PR that has just become conflicting (its base moved, so `updatedAt` is
+              // unchanged and the gate is a cache hit) would render "Conflicts" with the previous
+              // poll's disclosure still hanging off it, and two overlapping refetches could leave
+              // the map computed against the older rows with nothing to re-run it.
+              const unanswered = unansweredBlockingProbes(gate);
+              if (unanswered && unanswered.length > 0) details.set(number, unanswered);
+            }
+            setProbesByKey((prev) => new Map(prev).set(key, states));
+            setProbeDetailByKey((prev) => new Map(prev).set(key, details));
+          })();
           // ── RECONCILE THE DISMISSALS AGAINST WHAT WE JUST READ ────────────────────────────
           //
           // Only on a SUCCESSFUL probe, and that is the whole safety rule here. `rows` is a
@@ -910,11 +1015,54 @@ export function OpenPrMenu({
     for (const [k, ds] of dismissedByKey) out.set(k, dismissedNumbers(ds));
     return out;
   }, [dismissedByKey]);
+  /**
+   * The listed rows with their probe reading attached — what every count and every dot is taken from.
+   *
+   * JOINED HERE, IN ONE PLACE, for the same reason `buildPrGroups` splits dismissals in one place:
+   * the row's dot, the row's word, the section's ready count, the section's blocked count and the
+   * merge-all button's scope must all be reading the SAME judgement. They all bottom out in
+   * `prMergeReadiness`, so attaching the probe state once — before the groups are built — is what
+   * makes that one fact instead of five that have to be kept in agreement.
+   *
+   * A row with no reading yet is passed through UNCHANGED, not defaulted to "no probes". The
+   * readiness rule reads an absent `probes` exactly as it reads an unknown one.
+   */
+  const judgedByKey = useMemo(() => {
+    const out = new Map<string, JudgedPrRow[]>();
+    for (const [k, rows] of byKey) {
+      const states = probesByKey.get(k);
+      out.set(
+        k,
+        states ? rows.map((r) => ({ ...r, probes: states.get(r.number) })) : rows,
+      );
+    }
+    return out;
+  }, [byKey, probesByKey]);
+  /**
+   * The PRs whose row is REPORTING probes as its blocker, as `(root, number)` pairs.
+   *
+   * A function rather than a memo: it is read once per panel-open, and closing over the current
+   * `judgedByKey` is the point — this must reflect what the rows say right now.
+   */
+  const probeBlockedTargets = useCallback((): ProbeGateTarget[] => {
+    const out: ProbeGateTarget[] = [];
+    for (const scope of scopesRef.current) {
+      if (!scope.rootPath) continue;
+      const rows = judgedByKey.get(keyOfScope(scope));
+      if (!rows) continue;
+      for (const row of rows) {
+        if (prMergeReadiness(row).blocker === "probes")
+          out.push({ root: scope.rootPath, number: row.number });
+      }
+    }
+    return out;
+  }, [judgedByKey]);
+
   const groups = useMemo(
-    () => buildPrGroups(scopes, byKey, failedKeys, hiddenByKey),
+    () => buildPrGroups(scopes, judgedByKey, failedKeys, hiddenByKey),
     // Same reasoning as the effect: recompute when the scope SET, the data, or the staleness moves.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [scopesKey, byKey, failedKeys, hiddenByKey],
+    [scopesKey, judgedByKey, failedKeys, hiddenByKey],
   );
   const totals = fleetTotals(groups);
   // The wide pill's sentence ("3 PRs waiting"), which is also what the accessible name falls back to
@@ -1215,6 +1363,17 @@ export function OpenPrMenu({
           setOverrideReason("");
           if (!open) {
             clearProbeRefusals(); // see clearProbeRefusals — answering the probe is the remedy
+            // RE-ASK, BUT ONLY FOR THE ROWS ACTUALLY REPORTING PROBES. A full `refreshProbeGates()`
+            // here is the 27-subprocesses-per-open cost `probeGate.ts` exists to prevent; dropping
+            // nothing leaves a row pinned at "Blocked: N probes" after a probe answered by EDITING
+            // an existing reply (that bumps the comment's stamp, never the PR's), recoverable only
+            // via a Refresh the reader has no cue to press.
+            //
+            // The TARGETS come from the same `prMergeReadiness` call the label and the count use.
+            // Deriving them inside probeGate could only ever re-implement the probe branch, never
+            // the ranking — the cache holds no row facts — so a conflicting or unmergeable-by-this
+            // -viewer PR got re-read on every open for a reading that cannot change its row.
+            evictProbeGates(probeBlockedTargets());
             void refetch(); // refresh on open so the user acts on current state
           }
         }}
@@ -1391,6 +1550,7 @@ export function OpenPrMenu({
                   const scope = scopesKey;
                   setRefreshingScope(scope);
                   clearProbeRefusals(); // see clearProbeRefusals — answering the probe is the remedy
+                  refreshProbeGates(); // ...and re-ASK, rather than re-showing the cached reading
                   // DISARM ALONGSIDE THE CLEAR, for the same reason the open/close toggle does it.
                   // Dropping the refusal takes the row out of the `probeRefusal` branch, so if the
                   // refetch shows the PR as not-green-but-overridable it renders the `unstable`
@@ -1532,7 +1692,22 @@ export function OpenPrMenu({
                     >
                       {group.scope.projectName}
                     </span>
+                    {/* THE NUMBER THE FOUNDER READ AS "ELEVEN READY".
+                        It was `group.prs.length` — the total open — sitting beside a "Merge all
+                        ready" button, while eight of those eleven were hard-blocked on unanswered
+                        knightwatch probes. One number cannot carry both facts, and the one it did
+                        carry was the one nobody needed. So: split it, and only once there is a
+                        second fact to tell. With nothing probe-blocked this is the plain total it
+                        has always been, because "3 ready · 0 blocked" is chrome noise. */}
                     <span
+                      data-testid="pr-group-count"
+                      data-ready={group.readyCount}
+                      data-blocked={group.blockedCount}
+                      title={
+                        group.blockedCount > 0
+                          ? `${group.readyCount} ready to merge · ${group.blockedCount} blocked on unanswered knightwatch probes (${group.prs.length} open)`
+                          : `${group.prs.length} open`
+                      }
                       style={{
                         flex: "0 0 auto",
                         color: C.muted,
@@ -1540,7 +1715,15 @@ export function OpenPrMenu({
                         whiteSpace: "nowrap",
                       }}
                     >
-                      {group.prs.length}
+                      {group.blockedCount > 0 ? (
+                        <>
+                          {group.readyCount} ready
+                          <span style={{ opacity: 0.5 }}> · </span>
+                          <span style={{ color: C.sienna }}>{group.blockedCount} blocked</span>
+                        </>
+                      ) : (
+                        group.prs.length
+                      )}
                     </span>
                     {/* PRESENT EVEN WITH NOTHING GREEN, and disabled — not omitted. A button that
                         vanishes when it cannot act takes its own EXPLANATION with it, and the
@@ -1553,11 +1736,15 @@ export function OpenPrMenu({
                       data-project-id={group.scope.projectId}
                       disabled={group.readyCount === 0 || groupMerging}
                       title={
+                        // NAMES THE PROBE CASE TOO. This copy enumerated the reasons a PR is held
+                        // back and predates probes being one of them — so in the founder's own
+                        // scenario (green CI, eight PRs blocked on unanswered probes) it sent the
+                        // reader to go and look at a CI that was never the problem.
                         group.readyCount === 0
-                          ? `No PRs in ${group.scope.projectName} are ready to merge — checks pending or failing, conflicts, or GitHub has not finished working out whether they can merge`
+                          ? `No PRs in ${group.scope.projectName} are ready to merge — checks pending or failing, conflicts, unanswered knightwatch probes, or GitHub has not finished working out whether they can merge`
                           : `Merge the ${group.readyCount} PR${
                               group.readyCount === 1 ? "" : "s"
-                            } in ${group.scope.projectName} whose checks have passed`
+                            } in ${group.scope.projectName} whose checks have passed and that are not showing an unanswered probe`
                       }
                       onClick={() =>
                         void runMerge(
@@ -1596,15 +1783,41 @@ export function OpenPrMenu({
                         whiteSpace: "nowrap",
                       }}
                     >
+                      {/* "Merge N ready", not "Merge all ready (N)". The old wording put the
+                          COUNT in a parenthetical after the word "all", so a section reading
+                          "11 · Merge all ready" invited exactly the reading the founder gave it.
+                          Naming the number the button will actually act on makes the exclusion
+                          visible BEFORE the click, which is why nothing is ever "skipped"
+                          afterwards. */}
                       {groupMerging
                         ? "Merging…"
-                        : `Merge all ready${group.readyCount ? ` (${group.readyCount})` : ""}`}
+                        : group.readyCount
+                          ? `Merge ${group.readyCount} ready`
+                          : "Merge all ready"}
                     </button>
                   </div>
 
                   {group.prs.map((pr) => {
                     const ready = prMergeReadiness(pr);
                     const rowKey = prKeyOf(group.key, pr.number);
+                    /** The unanswered blocking probes on this row, when a read has landed and found
+                     *  any. Drives the disclosure — an ACTION-free STATUS, which is the distinction
+                     *  the "Override probes…" button could not carry on its own: it looked identical
+                     *  whether the PR had zero probes or five. */
+                    // GATED ON THE ROW'S OWN VERDICT — the same `prMergeReadiness` call the label
+                    // above comes from, so the count, the word and the drawer are three views of
+                    // ONE decision rather than two calls over two snapshots.
+                    //
+                    // Only two facts outrank probes: a CONFLICT and NO MERGE RIGHTS. Probes rank
+                    // above every check state and above draft and protection — an earlier version
+                    // of this comment claimed draft and protection outranked them, which is simply
+                    // wrong (see `prMergeReadiness`), and in this codebase a comment like that is
+                    // read as the contract.
+                    const probeDetail =
+                      ready.blocker === "probes"
+                        ? probeDetailByKey.get(group.key)?.get(pr.number)
+                        : undefined;
+                    const probesOpen = probeExpanded === rowKey;
                     const busy = merging.has(rowKey);
                     const armed = overrideArmed === rowKey;
                     const agent = resolveAgent(pr);
@@ -1693,6 +1906,51 @@ export function OpenPrMenu({
                                 >
                                   {ready.label}
                                 </span>
+                              ) : null}
+                              {/* BEHIND A CLICK, which is what the founder chose. The probe's text,
+                                its durable id and how to answer it are several lines each; inline
+                                they would push every other row off screen, and above the list they
+                                were the wall of red prose whose decisive line got cut off at the
+                                fold. So the row carries the FACT and this opens the DETAIL. */}
+                              {probeDetail ? (
+                                <button
+                                  data-testid={`probe-disclosure-${pr.number}`}
+                                  aria-expanded={probesOpen}
+                                  // NAMED, not left to the icon. A `title` is ignored for the
+                                  // accessible name the moment an element has text content, and an
+                                  // icon-only button has none to fall back on either — the same
+                                  // trap `open-pr-badge` documents 500 lines up (roborev 56141).
+                                  // This is the control that carries the blocking detail, so it may
+                                  // not announce itself as an unlabelled button.
+                                  aria-label={probeDisclosureLabel(probeDetail.length, probesOpen)}
+                                  title={probeDisclosureLabel(probeDetail.length, probesOpen)}
+                                  onClick={() => setProbeExpanded(probesOpen ? null : rowKey)}
+                                  style={{
+                                    flex: "0 0 auto",
+                                    marginLeft: 5,
+                                    background: "transparent",
+                                    border: "none",
+                                    padding: "0 2px",
+                                    color: C.sienna,
+                                    fontSize: TYPE.small,
+                                    lineHeight: 1,
+                                    cursor: "pointer",
+                                    display: "flex",
+                                    alignItems: "center",
+                                  }}
+                                >
+                                  {/* AN ICON, NOT A GLYPH. `▸`/`▾` are typed characters wearing an
+                                    affordance's clothes: they inherit the text font, so they render
+                                    differently on every machine and read as punctuation to a screen
+                                    reader. The `glyphIcons` ratchet fails on exactly this, and it
+                                    is a founder-stated rule for the whole app — react-icons/fi,
+                                    which is already imported here for the other three. */}
+                                  {probesOpen ? (
+                                    <FiChevronDown aria-hidden size={12} />
+                                  ) : (
+                                    <FiChevronRight aria-hidden size={12} />
+                                  )}
+                                </button>
                               ) : null}
                               {/* PADDING, not the literal spaces this used to be written with. Making
                                 the line a flex row BLOCKIFIES every child, and leading/trailing
@@ -1956,6 +2214,96 @@ export function OpenPrMenu({
                           state, its branch) hidden behind it. Not inline in the row either — the row
                           is a ranked flex line whose rule is that the action never truncates, and a
                           text box in it would fight the title for the same space. */}
+                        {/* ONE PROBE PER BLOCK: its specialist, its DURABLE id, its words, and a
+                          way to open the comment that raised it. The durable `<commentId>#<index>`
+                          form is the one that keeps working from any later comment — a bare
+                          "Probe 1" is read against the review the reply follows, so a newer review
+                          puts older probes out of its reach. That is why it is the thing rendered
+                          and the thing the copy button copies. */}
+                        {probeDetail && probesOpen && (
+                          <div
+                            data-testid={`probe-detail-${pr.number}`}
+                            style={{
+                              padding: "0 8px 8px 24px",
+                              display: "flex",
+                              flexDirection: "column",
+                              gap: 6,
+                            }}
+                          >
+                            {probeDetail.map((probe) => {
+                              const id = `${probe.commentId}#${probe.index}`;
+                              return (
+                                <div
+                                  key={id}
+                                  data-testid={`probe-item-${pr.number}-${probe.index}`}
+                                  style={{
+                                    borderLeft: `2px solid ${C.sienna}`,
+                                    paddingLeft: 8,
+                                    display: "flex",
+                                    flexDirection: "column",
+                                    gap: 3,
+                                  }}
+                                >
+                                  <div
+                                    style={{
+                                      display: "flex",
+                                      alignItems: "center",
+                                      gap: 6,
+                                      flexWrap: "wrap",
+                                      fontSize: TYPE.micro,
+                                      color: C.muted,
+                                    }}
+                                  >
+                                    <span style={{ fontWeight: FONT_WEIGHT.semibold }}>
+                                      Probe {probe.index}
+                                    </span>
+                                    <code data-testid={`probe-id-${pr.number}-${probe.index}`}>
+                                      {id}
+                                    </code>
+                                    {probe.from ? <span>from: {probe.from}</span> : null}
+                                  </div>
+                                  <div style={{ fontSize: 12, color: C.cream }}>{probe.text}</div>
+                                  <div style={{ display: "flex", gap: 8 }}>
+                                    <button
+                                      data-testid={`probe-open-${pr.number}-${probe.index}`}
+                                      title="Open the review comment that raised this probe"
+                                      onClick={() => openGithub(probe.url)}
+                                      disabled={!probe.url}
+                                      style={{
+                                        background: "transparent",
+                                        border: `1px solid ${C.accentMid}`,
+                                        borderRadius: 6,
+                                        color: C.accentInk,
+                                        padding: "2px 8px",
+                                        fontSize: TYPE.micro,
+                                        cursor: probe.url ? "pointer" : "default",
+                                      }}
+                                    >
+                                      Open on GitHub
+                                    </button>
+                                    <button
+                                      data-testid={`probe-copy-${pr.number}-${probe.index}`}
+                                      title="Copy the durable probe id — cite it in a reply on the PR to answer it"
+                                      onClick={() => void navigator.clipboard?.writeText(id)}
+                                      style={{
+                                        background: "transparent",
+                                        border: `1px solid ${C.accentMid}`,
+                                        borderRadius: 6,
+                                        color: C.accentInk,
+                                        padding: "2px 8px",
+                                        fontSize: TYPE.micro,
+                                        cursor: "pointer",
+                                      }}
+                                    >
+                                      Copy probe id
+                                    </button>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+
                         {probeRefusal && armed && (
                           <div
                             data-testid={`probe-override-row-${pr.number}`}

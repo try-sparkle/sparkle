@@ -63,6 +63,8 @@ import {
   BABYSIT_RATE_WINDOW_MS,
 } from "@sparkle/core";
 import { fetchOpenPrs, OPEN_PR_POLL_MS, type PrRow } from "./openPrs";
+// ONE adapter for `knightwatch_probe_gate`, owned by `probeGate.ts` — see `readProbeGate` there.
+import { readProbeGate } from "./probeGate";
 import { spawnBuildAgentInProject } from "./buildAgentSpawn";
 import { localAgentCapacity } from "./agentCapacity";
 import { useProjectStore } from "../stores/projectStore";
@@ -74,8 +76,6 @@ import type { Project } from "../types";
 export const BABYSIT_LEASE_LIST_COMMAND = "babysit_leases";
 export const BABYSIT_LEASE_ACQUIRE_COMMAND = "babysit_lease_acquire";
 export const BABYSIT_LEASE_RELEASE_COMMAND = "babysit_lease_release";
-/** MUST match `knightwatch.rs`'s `#[tauri::command]`. */
-export const KNIGHTWATCH_PROBE_GATE_COMMAND = "knightwatch_probe_gate";
 
 /** How often the sweep runs. See the header for why this is the PR-poll cadence and not faster. */
 export const BABYSIT_SWEEP_MS = OPEN_PR_POLL_MS;
@@ -116,86 +116,6 @@ export function checkRollupOf(pr: PrRow): BabysitCheckRollup {
   }
 }
 
-/**
- * The gate EXACTLY as it arrives over IPC — which is NOT `BabysitProbeGate` (knightwatch #1317
- * probe 1).
- *
- * `ProbeGate` in `knightwatch.rs` derives a plain `serde::Serialize` with NO `skip_serializing_if`
- * anywhere on it, so every `Option::None` is serialised as JSON `null` and arrives as a PRESENT
- * field holding `null` — never as an absent field reading `undefined`. Two fields the core types as
- * optional are therefore mis-declared at this boundary, and each fails its own way if passed on:
- *
- *   * `probes: null` — the core's UNKNOWN test is `probes === undefined`
- *     (`babysitDispatch.ts`, the `probe-read-unknown` hold), and `null` does not satisfy it. So a
- *     failed or saturated read reads as AUTHORITATIVE: `probes ?? []` contributes no evidence and
- *     the PR reports the healthy-sounding `no-evidence`. Worse, `lastGate`'s "only cache an
- *     authoritative reading" test is the same `!== undefined`, so that UNKNOWN is CACHED and the PR
- *     is never read again until something bumps its `updatedAt` — exactly the "one failed `gh` call
- *     retires the PR" outcome that guard was written to prevent.
- *   * `reviewedHead: null` — the core reads `reviewedHead !== undefined && reviewedHead.length > 0`,
- *     and `null !== undefined` is TRUE, so `.length` THROWS. `reviewed_head: None` is a NORMAL
- *     successful reading, not an error: a PR whose newest knightwatch comment is a lifecycle status
- *     post, or whose status form the parser does not recognise, produces it (`knightwatch.rs` tests
- *     `the_form_is_genuinely_unknown` and the lifecycle cases). One such PR therefore throws out of
- *     the per-PR loop and aborts the WHOLE project's sweep at `sweepAllProjects`'s catch — every
- *     tick, for every PR behind it, with a single `log.warn` as the only evidence.
- *
- * Declaring the wire shape honestly is what makes the normalisation below type-checked rather than
- * remembered.
- */
-type WireProbeGate = Omit<BabysitProbeGate, "probes" | "reviewedHead"> & {
-  probes: BabysitProbeGate["probes"] | null;
-  reviewedHead?: string | null;
-};
-
-/**
- * Read one PR's knightwatch probes.
- *
- * NEVER throws, and a failure is `probes: undefined` — UNKNOWN, the state `knightwatch.rs` and
- * `mergeGuard/types.ts` both insist on keeping distinct from an empty answer. The decision core
- * holds `probe-read-unknown` on it. Collapsing it to "no probes" would turn every unreadable read
- * into a confident "this PR needs nothing", which is the bug the three-state discipline exists to
- * close — and it is the reading a rate-limited or unauthenticated `gh` produces most easily.
- *
- * IT IS ALSO THE null→undefined BOUNDARY. See {@link WireProbeGate}: serde puts `null` where the
- * core's contract says `undefined`, and every consumer downstream tests for `undefined`. Normalising
- * once, here, is the same call `headSha: pr.headRefOid || undefined` makes further down — an unknown
- * is defeated at the boundary rather than in the decision.
- */
-export async function readProbeGate(root: string, number: number): Promise<BabysitProbeGate> {
-  try {
-    const gate = await invoke<WireProbeGate>(KNIGHTWATCH_PROBE_GATE_COMMAND, { root, number });
-    // A reply we cannot recognise is UNKNOWN too. `invoke` hands back `unknown` that TypeScript is
-    // happy to have asserted into a typed object, and the one thing a cast cannot do is notice that
-    // the two sides have drifted (the argument `conflictFlags.parseConflictFlags` makes at length).
-    if (!gate || typeof gate !== "object" || typeof gate.applicable !== "boolean") {
-      return { applicable: true, probes: undefined, error: "unrecognised probe-gate reply", overridden: false };
-    }
-    // NORMALISE ON SHAPE, NOT ON NULLISHNESS — the class, not the one value.
-    //
-    // `?? undefined` (which this was) maps BOTH `null` and a missing field to `undefined`, so it
-    // defeats the one non-conforming value serde is known to send TODAY. It defeats nothing else:
-    // `invoke` returns `unknown` and the `WireProbeGate` cast is unchecked, so ANY other shape — a
-    // `probes` that became `{ items: [...] }` in a Rust refactor, a renamed serde field, a frontend
-    // newer than the backend it is talking to — sails past `??` and is then read as AUTHORITATIVE
-    // by every consumer downstream. That is the argument the `applicable` check above already makes
-    // ("the one thing a cast cannot do is notice that the two sides have drifted"), applied to the
-    // two fields whose values are subsequently ITERATED and INDEXED rather than merely compared.
-    //
-    // A value that is not the declared shape is UNKNOWN, which is the fail-closed direction here:
-    // the decision core holds `probe-read-unknown` and dispatches nothing, rather than claiming
-    // "we looked; this PR is fine" about a reply nobody could read. `Array.isArray`/`typeof` also
-    // still map `null` and an absent field to `undefined`, so the `skip_serializing_if` case the
-    // previous `??` was written for keeps working unchanged.
-    return {
-      ...gate,
-      probes: Array.isArray(gate.probes) ? gate.probes : undefined,
-      reviewedHead: typeof gate.reviewedHead === "string" ? gate.reviewedHead : undefined,
-    };
-  } catch (e) {
-    return { applicable: true, probes: undefined, error: String(e), overridden: false };
-  }
-}
 
 /** One lease as `babysit_leases` reports it, narrowed to what this module reads. */
 interface LeaseView {

@@ -27,7 +27,6 @@ import {
   BABYSIT_LEASE_ACQUIRE_COMMAND,
   BABYSIT_LEASE_LIST_COMMAND,
   BABYSIT_LEASE_RELEASE_COMMAND,
-  KNIGHTWATCH_PROBE_GATE_COMMAND,
   _resetBabysitDispatcherForTests,
   babysitPrompt,
   sweepAllProjects,
@@ -36,10 +35,11 @@ import {
   BABYSIT_SWEEP_MS,
   babysitSweepProject,
   checkRollupOf,
-  readProbeGate,
   repoSlugFromPrUrl,
   standingFor,
 } from "./babysitDispatcher";
+// The ONE command constant lives with the ONE adapter that uses it.
+import { KNIGHTWATCH_PROBE_GATE_COMMAND, readProbeGate } from "./probeGate";
 import { log } from "../logger";
 import { resolveBabysitConfig } from "@sparkle/core";
 import { useProjectStore } from "../stores/projectStore";
@@ -175,19 +175,6 @@ describe("standingFor — three states, and unknown never reads as free", () => 
   it("keys on (repo, pr) — the same number in another repo is a different lease", () => {
     const held = [{ lease: { repo: "c/d", pr: 1 }, standing: "live" }];
     expect(standingFor(held, "a/b", 1)).toBe("free");
-  });
-});
-
-describe("readProbeGate — a failed read is UNKNOWN, never 'no probes'", () => {
-  it("an invoke that throws yields probes: undefined", async () => {
-    invokeMock.mockRejectedValueOnce(new Error("gh unauthenticated"));
-    const gate = await readProbeGate("/repo", 1);
-    expect(gate.probes).toBeUndefined();
-    expect(gate.applicable).toBe(true);
-  });
-  it("an unrecognised reply shape is UNKNOWN too", async () => {
-    invokeMock.mockResolvedValueOnce({ nonsense: true });
-    expect((await readProbeGate("/repo", 1)).probes).toBeUndefined();
   });
 });
 

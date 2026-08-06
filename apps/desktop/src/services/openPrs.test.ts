@@ -13,9 +13,11 @@ import {
   OPEN_PR_QUERY_LIMIT,
   prMergeEligibility,
   prMergeReadiness,
+  prProbeBlockedCount,
   prReadyCount,
   prStatusDot,
   type PrJudgeable,
+  type PrProbeState,
   type PrRow,
 } from "./openPrs";
 
@@ -240,15 +242,42 @@ const ALL_STATES: (PrRow["mergeStateStatus"] | undefined)[] = [
   "has_hooks",
   "unknown",
 ];
+/**
+ * The probe axis. Every value a real read can produce, INCLUDING the two that must not block:
+ * `undefined` (no read has landed) and a `null` count (the read did not answer). Adding this axis
+ * to the sweep is what stops the probe branch quietly breaking the tone⟺canMerge equivalence, or
+ * an existing guard below going vacuous because the new branch intercepts its case.
+ */
+const ALL_PROBES: (PrProbeState | undefined)[] = [
+  undefined,
+  { unansweredBlocking: null, overridden: false, applicable: true },
+  { unansweredBlocking: 0, overridden: false, applicable: true },
+  { unansweredBlocking: 1, overridden: false, applicable: true },
+  { unansweredBlocking: 4, overridden: false, applicable: true },
+  { unansweredBlocking: 2, overridden: true, applicable: true },
+  { unansweredBlocking: 0, overridden: false, applicable: false },
+];
 const EVERY_COMBINATION: PrJudgeable[] = ALL_CHECKS.flatMap((checks) =>
   ALL_MERGEABLE.flatMap((mergeable) =>
-    ALL_STATES.map((mergeStateStatus) => ({
-      checks,
-      mergeable,
-      mergeStateStatus,
-    })),
+    ALL_STATES.flatMap((mergeStateStatus) =>
+      ALL_PROBES.map((probes) => ({
+        checks,
+        mergeable,
+        mergeStateStatus,
+        probes,
+      })),
+    ),
   ),
 );
+
+/** Does this PR carry a probe block the rule must act on? Spelled out here rather than reusing the
+ *  implementation's own predicate, so a bug in that predicate cannot make these guards agree with
+ *  it by construction. */
+const isProbeBlocked = (pr: PrJudgeable): boolean =>
+  !!pr.probes &&
+  pr.probes.unansweredBlocking !== null &&
+  pr.probes.unansweredBlocking > 0 &&
+  !pr.probes.overridden;
 
 describe("the invariant that keeps the dot and the button honest", () => {
   it("holds tone==='ready' ⟺ canMerge across EVERY combination", () => {
@@ -302,7 +331,243 @@ describe("the invariant that keeps the dot and the button honest", () => {
       expect(pr.mergeable).toBe("mergeable");
       expect(["passing", "none"]).toContain(pr.checks);
       expect([undefined, "clean", "has_hooks"]).toContain(pr.mergeStateStatus);
+      // NEW AXIS: no green PR may carry an unanswered blocking probe. This is the assertion that
+      // would have caught the founder's report — before the fix, green was reachable with any
+      // probe state at all.
+      expect(isProbeBlocked(pr), "green PR with an unanswered blocking probe").toBe(false);
     }
+  });
+
+  it("blocks EVERY probe-blocked combination that is not already conflicting or unmergeable", () => {
+    // The reordering claim, swept rather than spot-checked: wherever a probe block is the most
+    // durable outstanding fact, it is the one the row names. Conflicts and merge rights still
+    // outrank it, and those are the ONLY two that may.
+    const outranking = new Set(["Conflicts", "No merge rights"]);
+    let named = 0;
+    for (const pr of EVERY_COMBINATION) {
+      if (!isProbeBlocked(pr)) continue;
+      const r = prMergeReadiness(pr);
+      const shape = `${pr.checks}/${pr.mergeable}/${pr.mergeStateStatus}`;
+      // Whatever it names, a probe-blocked PR is NEVER mergeable and NEVER amber.
+      expect(r.canMerge, `probe-blocked but mergeable: ${shape}`).toBe(false);
+      expect(r.tone, `probe-blocked but not red: ${shape}`).toBe("blocked");
+      if (r.label?.startsWith("Blocked: ")) named += 1;
+      else expect(outranking, `probe block lost to '${r.label}': ${shape}`).toContain(r.label);
+    }
+    // And it is not satisfied by never naming the probe.
+    expect(named).toBeGreaterThan(0);
+  });
+
+  it("never blocks on a probe read that did not answer", () => {
+    // The counter-guard to the one above, and the reason the axis includes `undefined` and a `null`
+    // count: an unknown read must leave the verdict EXACTLY as it was without the field. If this
+    // ever fails, one slow `gh` disables every Merge button in the app.
+    for (const pr of EVERY_COMBINATION) {
+      if (pr.probes && pr.probes.unansweredBlocking !== null) continue;
+      const { probes: _dropped, ...withoutField } = pr;
+      expect(
+        prMergeReadiness(pr),
+        `an unknown probe read changed the verdict: ${pr.checks}/${pr.mergeable}/${pr.mergeStateStatus}`,
+      ).toEqual(prMergeReadiness(withoutField));
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// KNIGHTWATCH PROBES — the founder's screenshot (2026-08-05)
+//
+// A section headed "11" with a "Merge all ready" button, whose rows read "Checking mergeability",
+// while EIGHT of the eleven were hard-blocked on unanswered [blocking] probes. The rule below could
+// not see probes at all, so a probe-blocked PR with clean CI rendered GREEN with a live one-click
+// Merge, counted toward the ready count, and sat inside the merge-all scope. The app only learned
+// the truth by ATTEMPTING the merge and catching Rust's refusal.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+/** Shorthand: a probe read that answered, with `n` unanswered blocking probes. */
+const probed = (n: number, overridden = false): PrProbeState => ({
+  unansweredBlocking: n,
+  overridden,
+  applicable: true,
+});
+/** A probe read that did NOT answer — gh missing, offline, timed out, or a saturated comment page. */
+const PROBE_UNKNOWN: PrProbeState = {
+  unansweredBlocking: null,
+  overridden: false,
+  applicable: true,
+};
+
+describe("prMergeReadiness — unanswered knightwatch probes block the row", () => {
+  it("names the probe instead of 'Checking mergeability' — the screenshot's exact row", () => {
+    // #1325/#1323/#1322 as the founder saw them: amber, "Checking mergeability", visually identical
+    // to a PR merely waiting on CI, while in fact carrying an unanswered blocking probe.
+    const r = prMergeReadiness({
+      checks: "passing",
+      mergeable: "unknown",
+      mergeStateStatus: "unknown",
+      probes: probed(1),
+    });
+    expect(r.tone).toBe("blocked");
+    expect(r.label).toBe("Blocked: 1 probe");
+    expect(r.label).not.toBe("Checking mergeability");
+    expect(r.canMerge).toBe(false);
+  });
+
+  it("stops a CLEAN-CI probe-blocked PR rendering green with a live Merge", () => {
+    // The worse half of the bug, and the one the screenshot could not show: nothing about this PR
+    // is amber. Before the fix this was tone "ready", canMerge true, one click from landing over an
+    // unanswered reviewer question.
+    const r = prMergeReadiness({
+      checks: "passing",
+      mergeable: "mergeable",
+      mergeStateStatus: "clean",
+      probes: probed(2),
+    });
+    expect(r.tone).toBe("blocked");
+    expect(r.label).toBe("Blocked: 2 probes");
+    expect(r.canMerge).toBe(false);
+  });
+
+  it("outranks every check state, because finishing the checks cannot rescue it", () => {
+    // The founder chose this ordering explicitly. A probe block is DURABLE: when the checks finish
+    // this PR still cannot merge, so amber would be a promise the row cannot keep.
+    const running = prMergeReadiness({
+      checks: "pending",
+      mergeable: "mergeable",
+      pendingChecks: ["ci/build", "ci/test", "ci/lint"],
+      probes: probed(1),
+    });
+    expect(running.tone).toBe("blocked");
+    expect(running.label).toBe("Blocked: 1 probe");
+    // ...but nothing is HIDDEN: the other blocker is still named in the tooltip.
+    expect(running.title).toMatch(/check/i);
+  });
+
+  it("still yields to the blockers that no probe answer could fix", () => {
+    // Conflicts and missing merge rights are more fundamental: answering the probe would leave the
+    // reader with a row that still cannot merge and no longer says why.
+    expect(
+      prMergeReadiness({
+        checks: "passing",
+        mergeable: "conflicting",
+        probes: probed(1),
+      }).label,
+    ).toBe("Conflicts");
+    expect(
+      prMergeReadiness({
+        checks: "passing",
+        mergeable: "mergeable",
+        viewerCanMerge: false,
+        probes: probed(1),
+      }).label,
+    ).toBe("No merge rights");
+  });
+
+  it("offers no 'Merge anyway' — the probe override is its own written two-step", () => {
+    // The generic override's justification is "GitHub would accept this merge", which is true here
+    // and beside the point: Rust refuses it, and the only way past is a recorded written reason.
+    const r = prMergeReadiness({
+      checks: "passing",
+      mergeable: "mergeable",
+      mergeStateStatus: "unstable",
+      probes: probed(1),
+    });
+    expect(r.override).toBeNull();
+  });
+
+  it("a recorded override clears the block rather than repeating it", () => {
+    const r = prMergeReadiness({
+      checks: "passing",
+      mergeable: "mergeable",
+      mergeStateStatus: "clean",
+      probes: probed(3, true),
+    });
+    expect(r.tone).toBe("ready");
+    expect(r.canMerge).toBe(true);
+  });
+
+  it("says 'probe' for one and 'probes' for many", () => {
+    expect(prMergeReadiness({ checks: "passing", mergeable: "mergeable", probes: probed(1) }).label)
+      .toBe("Blocked: 1 probe");
+    expect(prMergeReadiness({ checks: "passing", mergeable: "mergeable", probes: probed(5) }).label)
+      .toBe("Blocked: 5 probes");
+  });
+
+  it("an UNKNOWN read never manufactures a confident NO", () => {
+    // The rule this whole module is written around: not knowing may withhold a YES, but it may not
+    // invent a NO. A slow or unauthed `gh` must not turn all 27 rows red and disable every Merge —
+    // and it costs nothing, because Rust's merge_pr gate is the real backstop and cannot be routed
+    // around. Same shape as `viewerCanMerge: undefined` two branches up.
+    const r = prMergeReadiness({
+      checks: "passing",
+      mergeable: "mergeable",
+      mergeStateStatus: "clean",
+      probes: PROBE_UNKNOWN,
+    });
+    expect(r.tone).toBe("ready");
+    expect(r.canMerge).toBe(true);
+  });
+
+  it("zero unanswered probes is a real answer, not a block", () => {
+    const r = prMergeReadiness({
+      checks: "passing",
+      mergeable: "mergeable",
+      mergeStateStatus: "clean",
+      probes: probed(0),
+    });
+    expect(r.tone).toBe("ready");
+  });
+
+  it("a PR with no probe read at all behaves exactly as it did before the field existed", () => {
+    const withField = prMergeReadiness({
+      checks: "passing",
+      mergeable: "mergeable",
+      mergeStateStatus: "clean",
+      probes: undefined,
+    });
+    const without = prMergeReadiness({
+      checks: "passing",
+      mergeable: "mergeable",
+      mergeStateStatus: "clean",
+    });
+    expect(withField).toEqual(without);
+    expect(withField.tone).toBe("ready");
+  });
+});
+
+describe("prReadyCount excludes probe-blocked PRs — the '11' in the screenshot", () => {
+  it("does not count a probe-blocked PR as ready", () => {
+    // THE GOAL'S REQUIRED ASSERTION. The header said 11 and the founder read it as "eleven ready".
+    const mergeable = { checks: "passing", mergeable: "mergeable", mergeStateStatus: "clean" } as const;
+    const rows: PrJudgeable[] = [
+      { ...mergeable, probes: probed(0) },
+      { ...mergeable, probes: probed(1) },
+      { ...mergeable, probes: probed(2) },
+    ];
+    expect(prReadyCount(rows)).toBe(1);
+  });
+
+  it("renders a probe-blocked PR visibly DISTINCT from a mergeable one", () => {
+    // Distinct on all three channels the row paints: dot tone, the word beside it, and whether a
+    // Merge button exists at all. Colour alone is not an accessible channel.
+    const base = { checks: "passing", mergeable: "mergeable", mergeStateStatus: "clean" } as const;
+    const ready = prStatusDot({ ...base, probes: probed(0) });
+    const blocked = prStatusDot({ ...base, probes: probed(1) });
+    expect(blocked.tone).not.toBe(ready.tone);
+    expect(blocked.label).not.toBe(ready.label);
+    expect(blocked.tone).toBe("blocked");
+    expect(blocked.label).toBe("Blocked: 1 probe");
+    expect(prMergeEligibility({ ...base, probes: probed(1) }).canMerge).toBe(false);
+  });
+
+  it("keeps the concierge's own merge gate in lockstep", () => {
+    const e = prMergeEligibility({
+      checks: "passing",
+      mergeable: "mergeable",
+      mergeStateStatus: "clean",
+      probes: probed(1),
+    });
+    expect(e.canMerge).toBe(false);
+    expect(e.reason).toMatch(/probe/i);
   });
 });
 
@@ -595,5 +860,81 @@ describe("mergePr — the knightwatch override is passed THROUGH", () => {
     await expect(mergePr("/repo", 1176)).rejects.toThrow(
       /unanswered \[blocking\] probe/,
     );
+  });
+});
+
+describe("prProbeBlockedCount — the header's blocked number asks the RULE", () => {
+  const probed = (n: number, overridden = false): PrProbeState => ({
+    unansweredBlocking: n,
+    overridden,
+    applicable: true,
+  });
+
+  it("does NOT count a PR whose row reports a different blocker", () => {
+    // THE DRIFT THIS EXISTS TO PREVENT. Conflicts outrank probes, so this row reads "Conflicts" —
+    // counting it under "N blocked on unanswered knightwatch probes" would send the reader to
+    // answer a probe on a PR whose visible blocker is something else, and answering it would not
+    // make the PR mergeable either.
+    const conflicting: PrJudgeable = {
+      checks: "passing",
+      mergeable: "conflicting",
+      mergeStateStatus: "dirty",
+      probes: probed(2),
+    };
+    expect(prMergeReadiness(conflicting).label).toBe("Conflicts");
+    expect(prProbeBlockedCount([conflicting])).toBe(0);
+  });
+
+  it("does not count a PR the viewer cannot merge at all", () => {
+    const noRights: PrJudgeable = {
+      checks: "passing",
+      mergeable: "mergeable",
+      viewerCanMerge: false,
+      probes: probed(1),
+    };
+    expect(prMergeReadiness(noRights).label).toBe("No merge rights");
+    expect(prProbeBlockedCount([noRights])).toBe(0);
+  });
+
+  it("counts the ones whose row really does say 'Blocked: N probes'", () => {
+    const rows: PrJudgeable[] = [
+      { checks: "passing", mergeable: "mergeable", mergeStateStatus: "clean", probes: probed(1) },
+      { checks: "pending", mergeable: "mergeable", probes: probed(3) },
+      { checks: "passing", mergeable: "unknown", mergeStateStatus: "unknown", probes: probed(2) },
+    ];
+    expect(prProbeBlockedCount(rows)).toBe(3);
+    for (const r of rows) expect(prMergeReadiness(r).label).toMatch(/^Blocked: \d+ probes?$/);
+  });
+
+  it("does not count an OVERRIDDEN PR — a human wrote a reason for merging past it", () => {
+    const waived: PrJudgeable = {
+      checks: "passing",
+      mergeable: "mergeable",
+      mergeStateStatus: "clean",
+      probes: probed(3, true),
+    };
+    expect(prMergeReadiness(waived).tone).toBe("ready");
+    expect(prProbeBlockedCount([waived])).toBe(0);
+  });
+
+  it("does not count an unknown read", () => {
+    const unknown: PrJudgeable = {
+      checks: "passing",
+      mergeable: "mergeable",
+      mergeStateStatus: "clean",
+      probes: { unansweredBlocking: null, overridden: false, applicable: true },
+    };
+    expect(prProbeBlockedCount([unknown])).toBe(0);
+  });
+
+  it("gives every blocked PR a blocker, and green PRs none", () => {
+    // The discriminator has to be total, or a caller asking "which fact is this row reporting"
+    // gets null for a row that is visibly reporting something.
+    for (const pr of EVERY_COMBINATION) {
+      const r = prMergeReadiness(pr);
+      const shape = `${pr.checks}/${pr.mergeable}/${pr.mergeStateStatus}`;
+      if (r.tone === "ready") expect(r.blocker, shape).toBeNull();
+      else expect(r.blocker, `no blocker for ${shape}`).not.toBeNull();
+    }
   });
 });

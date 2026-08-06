@@ -211,10 +211,47 @@ export function prMergeEligibility(pr: PrJudgeable): MergeEligibility {
   return { canMerge: r.canMerge, reason: r.canMerge ? null : r.title };
 }
 
+/**
+ * What a knightwatch probe read said about one PR, reduced to the three facts a merge gate needs.
+ *
+ * Mirrors the Rust `ProbeGate` (`knightwatch.rs`), which is the authority — this is deliberately a
+ * PROJECTION of it, not a second model. The full reading carries each probe's text, specialist and
+ * comment URL; a readiness rule needs none of that, and pulling it in here would put kilobytes of
+ * review prose behind a function that runs on every render.
+ *
+ * THE FIELD THAT MATTERS IS `unansweredBlocking`, AND `null` IS NOT ZERO. `null` means the read did
+ * not answer — `gh` absent, unauthed, offline, timed out, or the comment window saturated at 100
+ * (`knightwatch.rs` treats exactly-100 as unknown, because a truncated window is not an empty one).
+ * A consumer that collapses `null` into 0 is claiming a PR is probe-clean on the strength of a read
+ * that failed, which is the single failure mode this whole module is written against.
+ */
+export interface PrProbeState {
+  /**
+   * How many `[blocking]` probes on this PR are still unanswered, or `null` for "could not find
+   * out". `0` is a real and different answer: asked, and there are none.
+   */
+  unansweredBlocking: number | null;
+  /**
+   * Does the PR already carry a written override record NEWER than its newest knightwatch review?
+   *
+   * Honoured because ignoring it produces the worst possible refusal: a red row telling the reader
+   * to go and do the thing they have already done. A new review re-arms the gate, which is what
+   * stops one override silencing a PR forever.
+   */
+  overridden: boolean;
+  /** Did this PR carry any knightwatch review at all? `false` means the gate does not apply here —
+   *  the state every non-Sparkle project is in — and is never a synonym for "clean". */
+  applicable: boolean;
+}
+
 /** The subset of a PR this module judges. The newer fields are optional so a partial fixture (or a
  *  caller predating them) still typechecks — see `mergeStateStatus` for why absent ≠ "unknown". */
 export type PrJudgeable = Pick<PrRow, "checks" | "mergeable"> &
-  Partial<Pick<PrRow, "mergeStateStatus" | "failingChecks" | "pendingChecks" | "viewerCanMerge">>;
+  Partial<Pick<PrRow, "mergeStateStatus" | "failingChecks" | "pendingChecks" | "viewerCanMerge">> & {
+    /** Absent = the probe read has not landed yet (or this caller does not do probe reads at all).
+     *  Treated exactly like an unknown read: it withholds nothing and manufactures nothing. */
+    probes?: PrProbeState;
+  };
 
 /**
  * The ONE question the status dot answers: **is this PR safe to merge right now?**
@@ -250,6 +287,27 @@ export type PrJudgeable = Pick<PrRow, "checks" | "mergeable"> &
  * strict one: **`canMerge` implies `tone === "ready"`, and `tone === "ready"` implies `canMerge`** —
  * asserted exhaustively in the test file over every field combination.
  */
+/**
+ * WHICH fact this PR's row is reporting — the single most-blocking one, after the ranking in
+ * {@link prMergeReadiness} has run.
+ *
+ * Exists so a caller that needs "is this one blocked ON PROBES specifically" asks the RULE instead
+ * of writing a second rule. The header's blocked count did exactly that and drifted immediately: it
+ * counted any PR carrying unanswered probes, including ones whose row said "Conflicts" because
+ * conflicts outrank probes — so the header sent the reader to answer a probe on a PR whose visible
+ * blocker was something else entirely. One ranking, one answer.
+ */
+export type PrBlocker =
+  | "merge-rights"
+  | "conflicts"
+  | "probes"
+  | "checks"
+  | "protection"
+  | "draft"
+  | "mergeability"
+  | "behind"
+  | null;
+
 export interface PrReadiness {
   /** Green / amber / red. There is no fourth "informational" tone: every PR is either safe to
    *  merge now or it is not, and a muted dot for "no checks ran" was a third answer to a
@@ -277,6 +335,8 @@ export interface PrReadiness {
    * BEHIND is reported precisely when GitHub is likely to refuse. See `githubWouldAccept`.
    */
   override: { label: string; reason: string } | null;
+  /** The one fact this row reports. Null exactly when green. See {@link PrBlocker}. */
+  blocker: PrBlocker;
 }
 
 /** `["a","b","c"]` → `"a, b and c"`, capped so a 12-check rollup does not produce a paragraph. */
@@ -333,6 +393,7 @@ export function prMergeReadiness(pr: PrJudgeable): PrReadiness {
     return {
       tone: "blocked",
       label: "No merge rights",
+      blocker: "merge-rights",
       title:
         "You don't have permission to merge in this repository — someone with write access has to merge it, or you can dismiss it to stop it being offered here",
       canMerge: false,
@@ -343,10 +404,77 @@ export function prMergeReadiness(pr: PrJudgeable): PrReadiness {
     return {
       tone: "blocked",
       label: "Conflicts",
+      blocker: "conflicts",
       title: "Conflicts with the base branch — this cannot be merged until they are resolved",
       canMerge: false,
       override: null,
     };
+
+  // ── UNANSWERED KNIGHTWATCH PROBES — ABOVE EVERY CHECK STATE (the founder's 2026-08-05 report) ──
+  //
+  // THE BUG THIS FIXES. This function judged `checks`/`mergeable`/`mergeStateStatus`/`viewerCanMerge`
+  // and nothing else, so it could not see probes AT ALL. A probe-blocked PR with clean CI rendered
+  // GREEN with a live one-click Merge, counted toward `prReadyCount`, and sat inside "Merge all
+  // ready"'s scope; the ones in the founder's screenshot read amber "Checking mergeability" only
+  // because GitHub had not settled their mergeability yet. Either way the row claimed something the
+  // Rust gate would refuse — the app learned the truth ONLY by attempting the merge and catching
+  // `merge_pr`'s refusal, into a ledger wiped on every Refresh.
+  //
+  // WHY IT OUTRANKS THE CHECK BRANCHES (the founder chose this ordering explicitly). Every check
+  // state below describes something that RESOLVES ITSELF: checks finish, GitHub settles a
+  // mergeability it had not computed. A probe block does not. When the checks finish this PR still
+  // cannot merge, so "Checks running" — amber, NOT-YET — is a promise the row cannot keep. Same
+  // reasoning as the `viewerCanMerge` branch above: most-blocking first means most-DURABLE first.
+  // Nothing is hidden by the reordering; the other outstanding facts are named in the tooltip.
+  //
+  // WHY IT SITS BELOW CONFLICTS AND MERGE RIGHTS. Those cannot be answered or overridden away.
+  // Naming the probe on a conflicting PR would send the reader to answer a question that still
+  // leaves them unable to merge, with the real reason no longer on screen.
+  //
+  // AND NO `override` AFFORDANCE. The generic one means "GitHub would accept this merge", which is
+  // both true and beside the point here — Rust refuses it regardless, and the only way past is a
+  // WRITTEN reason recorded on the PR. That is its own deliberate two-step in the menu; offering
+  // the one-click "Merge anyway" beside it would be the cheaper path, and the gate would be worth
+  // nothing.
+  const probes = pr.probes;
+  const unansweredProbes = probes?.unansweredBlocking ?? null;
+  // `null`/absent is UNKNOWN and must fall straight through. Not knowing may withhold a confident
+  // YES, but it may never manufacture a confident NO — the same rule `viewerCanMerge` follows, and
+  // it matters practically: one slow or unauthed `gh` would otherwise redden every row in the panel
+  // and disable every Merge button. Nothing is risked by falling through, because Rust's `merge_pr`
+  // gate is the real backstop and cannot be routed around from here.
+  if (probes && unansweredProbes !== null && unansweredProbes > 0 && !probes.overridden) {
+    const label = `Blocked: ${unansweredProbes} ${plural(unansweredProbes, "probe", "probes")}`;
+    // The tooltip carries what the LABEL had to give up to stay one short phrase. A probe-blocked
+    // PR with red CI is still a PR with red CI, and the reader must not have to click Merge to
+    // rediscover that.
+    const also: string[] = [];
+    if (anyFailing)
+      also.push(
+        failing.length > 0
+          ? `${failing.length} ${plural(failing.length, "check is", "checks are")} also failing (${nameList(failing)})`
+          : "checks are also failing",
+      );
+    if (anyPending)
+      also.push(
+        pending.length > 0
+          ? `${pending.length} ${plural(pending.length, "check is", "checks are")} also still running (${nameList(pending)})`
+          : "checks are also still running",
+      );
+    if (state === "behind") also.push("the branch is also behind its base");
+    if (state === "draft") also.push("it is also still a draft");
+    return {
+      tone: "blocked",
+      label,
+      blocker: "probes",
+      title:
+        `${unansweredProbes} unanswered [blocking] knightwatch ${plural(unansweredProbes, "probe", "probes")} — ` +
+        `reply on the PR citing the probe by its durable id, or merge with a written override reason` +
+        (also.length > 0 ? `. ${also.join("; ")}` : ""),
+      canMerge: false,
+      override: null,
+    };
+  }
 
   if (anyFailing) {
     const n = failing.length;
@@ -354,6 +482,7 @@ export function prMergeReadiness(pr: PrJudgeable): PrReadiness {
     return {
       tone: "blocked",
       label,
+      blocker: "checks",
       title: n > 0 ? `${label}: ${nameList(failing)}` : "Checks are failing",
       canMerge: false,
       override: githubWouldAccept
@@ -374,6 +503,7 @@ export function prMergeReadiness(pr: PrJudgeable): PrReadiness {
     return {
       tone: "waiting",
       label,
+      blocker: "checks",
       title:
         n > 0
           ? `${label}: ${nameList(pending)} — merging now is merging blind`
@@ -397,6 +527,7 @@ export function prMergeReadiness(pr: PrJudgeable): PrReadiness {
     return {
       tone: "blocked",
       label: "Checks not clean",
+      blocker: "checks",
       title:
         "GitHub reports this PR as unstable — a check is failing or still running, even though the rollup looks clear",
       canMerge: false,
@@ -412,6 +543,7 @@ export function prMergeReadiness(pr: PrJudgeable): PrReadiness {
     return {
       tone: "blocked",
       label: "Blocked",
+      blocker: "protection",
       title: "Branch protection is blocking this merge (a required review or check is missing)",
       canMerge: false,
       override: null,
@@ -421,6 +553,7 @@ export function prMergeReadiness(pr: PrJudgeable): PrReadiness {
     return {
       tone: "blocked",
       label: "Draft",
+      blocker: "draft",
       title: "This PR is still a draft — mark it ready for review before merging",
       canMerge: false,
       override: null,
@@ -433,6 +566,7 @@ export function prMergeReadiness(pr: PrJudgeable): PrReadiness {
     return {
       tone: "waiting",
       label: "Checking mergeability",
+      blocker: "mergeability",
       title: "GitHub has not finished working out whether this can merge — wait for it to settle",
       canMerge: false,
       override: null,
@@ -442,6 +576,7 @@ export function prMergeReadiness(pr: PrJudgeable): PrReadiness {
     return {
       tone: "waiting",
       label: "Behind base",
+      blocker: "behind",
       title: "This branch is behind the base branch — update it so it is tested against current main",
       canMerge: false,
       // NO OVERRIDE — and this is the one branch where that differs from the others.
@@ -463,6 +598,7 @@ export function prMergeReadiness(pr: PrJudgeable): PrReadiness {
   return {
     tone: "ready",
     label: null,
+    blocker: null,
     title:
       pr.checks === "none"
         ? "No checks on this PR, and GitHub reports it clean — ready to merge"
@@ -534,6 +670,28 @@ export function prStatusDot(pr: PrJudgeable): PrStatusDot {
  */
 export function prReadyCount(prs: readonly PrJudgeable[]): number {
   return prs.filter((p) => prMergeReadiness(p).tone === "ready").length;
+}
+
+/**
+ * A listed PR plus the probe reading the panel fetched for it SEPARATELY.
+ *
+ * `PrRow` mirrors the Rust `PrRow` field for field and must keep doing so — `project_open_prs` does
+ * not return probe data and should not start, because probes cost a `gh` subprocess per PR and the
+ * PR list is on the panel's critical path. So the reading is a decoration applied client-side after
+ * `fetchProbeGates` lands, and this type is the honest name for the result.
+ */
+export type JudgedPrRow = PrRow & { probes?: PrProbeState };
+
+/**
+ * How many of `prs` are blocked on unanswered knightwatch probes — the "8 blocked" in the header.
+ *
+ * DELIBERATELY NOT "not ready minus ready". A PR blocked on a conflict is also not ready, and
+ * counting it here would put it behind a word that tells the reader to go and answer a probe that
+ * does not exist. This counts the PRs whose SPECIFIC blocker is a probe, which is what the header
+ * claims and what the reader will act on.
+ */
+export function prProbeBlockedCount(prs: readonly PrJudgeable[]): number {
+  return prs.filter((p) => prMergeReadiness(p).blocker === "probes").length;
 }
 
 /**

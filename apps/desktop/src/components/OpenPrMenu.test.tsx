@@ -39,6 +39,7 @@ import {
   type PrAgentLink,
 } from "./OpenPrMenu";
 import type { PrRow } from "../services/openPrs";
+import { __resetProbeGateCacheForTests } from "../services/probeGate";
 import type { FleetTotals, PrScope } from "../services/fleetPrs";
 import type { AgentTab, Project } from "../types";
 
@@ -71,6 +72,11 @@ function stubList(rows: PrRow[] | null) {
 beforeEach(() => {
   h.invoke.mockReset();
   h.openUrl.mockReset();
+  // THE PROBE CACHE IS MODULE STATE, so it outlives a test the way a `vi.fn()` does not. Two cases
+  // below list the SAME PR number at the SAME `updatedAt` with different probe answers, and without
+  // this the second one reads the first one's cached gate and asserts against a fixture it never
+  // stubbed. Resetting the mocks is not enough; the cache has to be dropped by name.
+  __resetProbeGateCacheForTests();
 });
 afterEach(cleanup);
 
@@ -878,7 +884,10 @@ describe("OpenPrMenu — no Merge affordance when the answer is not yes", () => 
     );
     await openMenu();
     const all = await screen.findByTestId("merge-all");
-    expect(all.textContent).toContain("(1)");
+    // "Merge 1 ready", not "Merge all ready (1)". The count moved OUT of a parenthetical and into
+    // the verb phrase, so the button names what it will act on rather than implying it acts on
+    // everything listed — the reading the founder gave "11 · Merge all ready".
+    expect(all.textContent).toBe("Merge 1 ready");
 
     fireEvent.click(all);
     await waitFor(() =>
@@ -2032,7 +2041,7 @@ describe("OpenPrMenu — fleet-wide, grouped by project tab", () => {
     const groups = await screen.findAllByTestId("pr-group");
     expect(groups).toHaveLength(2);
     const siteMergeAll = within(groups[1]!).getByTestId("merge-all");
-    expect(siteMergeAll.textContent).toBe("Merge all ready (2)");
+    expect(siteMergeAll.textContent).toBe("Merge 2 ready");
     fireEvent.click(siteMergeAll);
 
     await waitFor(() => expect(mergeCalls()).toHaveLength(2));
@@ -3353,5 +3362,679 @@ describe("OpenPrMenu — Dismiss", () => {
       screen.getAllByTestId("pr-row")[0]!.getAttribute("data-project-id"),
     ).toBe("p2");
     expect(dismissed).toEqual([{ projectId: "p1", number: 39 }]);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// THE FOUNDER'S SCREENSHOT (2026-08-05)
+//
+// "27 open pull requests across 6 projects" / "SPARKLE-DESKTOP  11  [Merge all ready]", with rows
+// reading "Checking mergeability" while EIGHT of the eleven were hard-blocked on unanswered
+// [blocking] knightwatch probes. The blocking fact lived only in a wall of red prose above the
+// list, whose decisive line — "Skipped 8 PRs with unanswered knightwatch probes (#1325, #1323, …"
+// — was cut off mid-sentence at the fold.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+/** #1325 as the founder saw it: GitHub had not settled mergeability, so it read amber. */
+const PR_1325: PrRow = {
+  number: 1325,
+  title: "fix(concierge): the BLOCKED pill retracts",
+  headRefName: "sparkle/agent-380b0df",
+  url: "https://github.com/drodio/sparkle/pull/1325",
+  checks: "passing",
+  mergeable: "unknown",
+  mergeStateStatus: "unknown",
+  updatedAt: "2026-08-05T20:00:00Z",
+};
+/** The WORSE shape, which the screenshot could not show: nothing about this PR is amber. Before the
+ *  fix it rendered fully green with a live one-click Merge, over an unanswered reviewer question. */
+const PR_CLEAN_BUT_PROBED: PrRow = {
+  number: 1322,
+  title: "perf(fleet): memoize fleet_digest",
+  headRefName: "sparkle/agent-1f9a44c",
+  url: "https://github.com/drodio/sparkle/pull/1322",
+  checks: "passing",
+  mergeable: "mergeable",
+  mergeStateStatus: "clean",
+  updatedAt: "2026-08-05T20:00:00Z",
+};
+/** Genuinely ready — the control the blocked rows must look DIFFERENT from. */
+const PR_READY: PrRow = {
+  number: 1316,
+  title: "docs: update the runner guide",
+  headRefName: "sparkle/agent-9de00a1",
+  url: "https://github.com/drodio/sparkle/pull/1316",
+  checks: "passing",
+  mergeable: "mergeable",
+  mergeStateStatus: "clean",
+  updatedAt: "2026-08-05T20:00:00Z",
+};
+
+const blockingProbe = (index: number) => ({
+  commentId: 5196781304,
+  index,
+  severity: "blocking" as const,
+  from: "shape",
+  text: "[bypass] The new raw-event overlay bypasses HookStatusEngine's tool, session and turn semantics",
+  url: `https://github.com/drodio/sparkle/pull/1325#issuecomment-5196781304`,
+  answered: false,
+});
+
+/** List `rows`, and answer `knightwatch_probe_gate` from `probesFor`. A PR absent from the map
+ *  reads as "asked; no probes", which is the authoritative empty answer — not an unknown. */
+function stubListWithProbes(
+  rows: PrRow[],
+  probesFor: Record<number, ReturnType<typeof blockingProbe>[]>,
+  /** PR numbers carrying a recorded override — a human wrote a reason for merging past their
+   *  probes. Parameterised because the drawer's override suppression is inline in the component,
+   *  so a component test is the only place it can be pinned, and a hardcoded `false` made that
+   *  impossible. */
+  overriddenFor: readonly number[] = [],
+) {
+  h.invoke.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+    if (cmd === "project_open_prs") return Promise.resolve(rows);
+    if (cmd === "merge_pr") return Promise.resolve(null);
+    if (cmd === "knightwatch_probe_gate") {
+      const n = args?.number as number;
+      return Promise.resolve({
+        applicable: true,
+        probes: probesFor[n] ?? [],
+        error: null,
+        overridden: overriddenFor.includes(n),
+      });
+    }
+    return Promise.resolve(null);
+  });
+}
+
+/** Resolves once the probe read for `number` has actually been ISSUED. Asserting probe-derived
+ *  state without this is the fired-not-awaited race: rows paint before the read lands, so a
+ *  fixture that is already `ready` pre-probe satisfies `waitFor` on its first invocation and the
+ *  assertion describes the state the panel had BEFORE any probe data existed. */
+const probeReadIssued = (number: number) =>
+  waitFor(() =>
+    expect(h.invoke).toHaveBeenCalledWith(
+      "knightwatch_probe_gate",
+      expect.objectContaining({ number }),
+    ),
+  );
+
+describe("OpenPrMenu — a probe-blocked PR does not look ready", () => {
+  it("renders it VISIBLY DISTINCT from a mergeable one, on every channel", async () => {
+    // THE GOAL'S REQUIRED COMPONENT ASSERTION. Distinct in the WORD (not just the colour, which is
+    // not an accessible channel), and distinct in whether a Merge button exists at all.
+    stubListWithProbes([PR_READY, PR_CLEAN_BUT_PROBED], {
+      [PR_CLEAN_BUT_PROBED.number]: [blockingProbe(1)],
+    });
+    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    await openMenu();
+
+    // WAIT ON THE CONTENT, not on the element. The probe read is deliberately fired-not-awaited so
+    // rows paint immediately, which means the row is on screen with its pre-probe label first —
+    // `findByTestId` resolves on that, and a bare assertion after it races the read. This test was
+    // green run alone and red under a loaded machine until it polled.
+    await waitFor(() =>
+      expect(
+        screen.getByTestId(`pr-state-${PR_CLEAN_BUT_PROBED.number}`).textContent,
+      ).toBe("Blocked: 1 probe"),
+    );
+    // The genuinely-ready row has NO state word at all — its enabled Merge button is the label.
+    expect(screen.queryByTestId(`pr-state-${PR_READY.number}`)).toBeNull();
+    expect(
+      (screen.getByTestId(`merge-${PR_READY.number}`) as HTMLButtonElement).disabled,
+    ).toBe(false);
+    // ...and the blocked one offers no live Merge.
+    const blockedMerge = screen.queryByTestId(`merge-${PR_CLEAN_BUT_PROBED.number}`);
+    if (blockedMerge) expect((blockedMerge as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("says 'Blocked: N probes' instead of 'Checking mergeability' — the screenshot's row", async () => {
+    stubListWithProbes([PR_1325], { [PR_1325.number]: [blockingProbe(1)] });
+    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    await openMenu();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("pr-state-1325").textContent).toBe("Blocked: 1 probe"),
+    );
+    expect(screen.getByTestId("pr-state-1325").textContent).not.toMatch(
+      /checking mergeability/i,
+    );
+  });
+
+  // OVERLAPPING BATCHES, ANSWERED OUT OF ORDER. The probe reads are fired and never awaited, so the
+  // 180 s poll and a Refresh press are freely in flight together — and `gh` promises no ordering, so
+  // the SLOWER, OLDER batch can resolve last. `fetchProbeGates` fences its own CACHE on a module
+  // generation, but the two React setters accepted every completion, so the older answer repainted
+  // the row and stayed there until the next poll: a probe the user just ANSWERED goes red again.
+  it("a slower EARLIER probe batch cannot repaint over a newer one's answer", async () => {
+    const answer: Array<(g: unknown) => void> = [];
+    h.invoke.mockImplementation((cmd: string) => {
+      if (cmd === "project_open_prs") return Promise.resolve([PR_CLEAN_BUT_PROBED]);
+      if (cmd === "knightwatch_probe_gate")
+        return new Promise((resolve) => answer.push(resolve as (g: unknown) => void));
+      return Promise.resolve(null);
+    });
+    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    await openMenu();
+    await waitFor(() => expect(answer).toHaveLength(1)); // batch A (the poll) is in flight
+
+    // Refresh evicts the cache and bumps the generation, so this really is a SECOND read.
+    fireEvent.click(screen.getByTestId("pr-refresh"));
+    await waitFor(() => expect(answer).toHaveLength(2)); // batch B (the press) is in flight
+
+    // B — the newer ask — answers first: the probe has been answered, nothing blocks.
+    await act(async () => {
+      answer[1]!({ applicable: true, probes: [], error: null, overridden: false });
+    });
+    const count = await screen.findByTestId("pr-group-count");
+    await waitFor(() => expect(count.getAttribute("data-blocked")).toBe("0"));
+
+    // ...and now A, the older and slower ask, lands with its pre-answer reading.
+    await act(async () => {
+      answer[0]!({
+        applicable: true,
+        probes: [blockingProbe(1)],
+        error: null,
+        overridden: false,
+      });
+    });
+    expect(screen.getByTestId("pr-group-count").getAttribute("data-blocked")).toBe("0");
+    expect(screen.queryByTestId(`pr-state-${PR_CLEAN_BUT_PROBED.number}`)).toBeNull();
+  });
+
+  it("nor can it repaint a NEWLY BLOCKED row back to ready — the dangerous direction", async () => {
+    // THE INVERSION OF THE CASE ABOVE, and the one that matters (roborev 59477). That test lands on
+    // `data-blocked === "0"`, which is also the PRE-PROBE default — so it cannot tell "the fence
+    // held" from "the probe pipeline did nothing at all", and it exercises only the safe direction
+    // (a stale reading making a ready PR look blocked, which is annoying). Here the newer batch
+    // says BLOCKED and the stale one says answered, so the assertion is a NON-default state: if the
+    // older batch wins, a PR that has just become blocked renders ready with a live Merge, which is
+    // precisely the defect this whole branch exists to remove.
+    const answer: Array<(g: unknown) => void> = [];
+    h.invoke.mockImplementation((cmd: string) => {
+      if (cmd === "project_open_prs") return Promise.resolve([PR_CLEAN_BUT_PROBED]);
+      if (cmd === "knightwatch_probe_gate")
+        return new Promise((resolve) => answer.push(resolve as (g: unknown) => void));
+      return Promise.resolve(null);
+    });
+    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    await openMenu();
+    await waitFor(() => expect(answer).toHaveLength(1)); // batch A (the poll)
+
+    fireEvent.click(screen.getByTestId("pr-refresh"));
+    await waitFor(() => expect(answer).toHaveLength(2)); // batch B (the press)
+
+    // B — the newer ask — answers first, and it found a probe.
+    await act(async () => {
+      answer[1]!({
+        applicable: true,
+        probes: [blockingProbe(1)],
+        error: null,
+        overridden: false,
+      });
+    });
+    const count = await screen.findByTestId("pr-group-count");
+    await waitFor(() => expect(count.getAttribute("data-blocked")).toBe("1"));
+    expect(screen.getByTestId(`pr-state-${PR_CLEAN_BUT_PROBED.number}`).textContent).toBe(
+      "Blocked: 1 probe",
+    );
+
+    // ...then A, older and slower, lands carrying the now-superseded "nothing blocks" reading.
+    await act(async () => {
+      answer[0]!({ applicable: true, probes: [], error: null, overridden: false });
+    });
+
+    // The row must STAY blocked. Without the fence it goes green here, with a live Merge.
+    expect(count.getAttribute("data-blocked")).toBe("1");
+    expect(screen.getByTestId(`pr-state-${PR_CLEAN_BUT_PROBED.number}`).textContent).toBe(
+      "Blocked: 1 probe",
+    );
+    const merge = screen.queryByTestId(`merge-${PR_CLEAN_BUT_PROBED.number}`);
+    if (merge) expect((merge as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("excludes it from the section count AND from the merge-all scope", async () => {
+    stubListWithProbes([PR_READY, PR_CLEAN_BUT_PROBED, PR_1325], {
+      [PR_CLEAN_BUT_PROBED.number]: [blockingProbe(1), blockingProbe(2)],
+      [PR_1325.number]: [blockingProbe(1)],
+    });
+    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    await openMenu();
+
+    // The header stops being one number that reads as "three ready".
+    const count = await screen.findByTestId("pr-group-count");
+    await waitFor(() => expect(count.getAttribute("data-blocked")).toBe("2"));
+    expect(count.getAttribute("data-ready")).toBe("1");
+    expect(count.textContent).toContain("1 ready");
+    expect(count.textContent).toContain("2 blocked");
+
+    // And the button names what it will act on...
+    const all = screen.getByTestId("merge-all");
+    await waitFor(() => expect(all.textContent).toBe("Merge 1 ready"));
+
+    // ...and acts on exactly that, so nothing is "skipped" after the fact.
+    fireEvent.click(all);
+    await waitFor(() =>
+      expect(h.invoke.mock.calls.filter((c) => c[0] === "merge_pr")).toHaveLength(1),
+    );
+    expect(h.invoke.mock.calls.find((c) => c[0] === "merge_pr")?.[1]).toMatchObject({
+      number: PR_READY.number,
+    });
+  });
+
+  it("keeps the probe DETAIL behind a click, then shows the durable id and a link", async () => {
+    // The real `openUrl` returns a promise the caller attaches a `.catch` to; a bare `vi.fn()`
+    // returns undefined, so the click below would throw INSIDE React's dispatch and surface as an
+    // unhandled error rather than a failed assertion. Same setup the "opens the PR" case does.
+    h.openUrl.mockResolvedValue(undefined);
+    stubListWithProbes([PR_1325], { [PR_1325.number]: [blockingProbe(1)] });
+    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    await openMenu();
+
+    const toggle = await screen.findByTestId("probe-disclosure-1325");
+    // Collapsed by default — the wall of prose is what this replaces.
+    expect(screen.queryByTestId("probe-detail-1325")).toBeNull();
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    // NAMED, not an unlabelled icon button — the accessible name states the count.
+    expect(
+      screen.getByRole("button", { name: /1 unanswered probe blocking this PR/i }),
+    ).toBe(toggle);
+
+    fireEvent.click(toggle);
+    expect(await screen.findByTestId("probe-detail-1325")).toBeTruthy();
+    // The DURABLE `<commentId>#<index>` form, which is the one that still reaches an older probe
+    // from any later comment — a bare "Probe 1" is read against the review the reply follows.
+    expect(screen.getByTestId("probe-id-1325-1").textContent).toBe("5196781304#1");
+
+    fireEvent.click(screen.getByTestId("probe-open-1325-1"));
+    expect(h.openUrl).toHaveBeenCalledWith(
+      "https://github.com/drodio/sparkle/pull/1325#issuecomment-5196781304",
+    );
+  });
+
+  it("leaves a PR alone when the probe read did not answer", async () => {
+    // Not knowing may withhold a YES but may never manufacture a NO. If this breaks, one slow `gh`
+    // reddens every row in the panel and disables every Merge button.
+    h.invoke.mockImplementation((cmd: string) => {
+      if (cmd === "project_open_prs") return Promise.resolve([PR_READY]);
+      if (cmd === "merge_pr") return Promise.resolve(null);
+      if (cmd === "knightwatch_probe_gate") return Promise.reject(new Error("gh: not found"));
+      return Promise.resolve(null);
+    });
+    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    await openMenu();
+
+    const merge = (await screen.findByTestId(`merge-${PR_READY.number}`)) as HTMLButtonElement;
+    expect(merge.disabled).toBe(false);
+    expect(screen.queryByTestId(`pr-state-${PR_READY.number}`)).toBeNull();
+    // The header keeps its plain total rather than inventing a blocked count.
+    expect(screen.getByTestId("pr-group-count").getAttribute("data-blocked")).toBe("0");
+  });
+
+  it("shows the plain total when nothing is probe-blocked", async () => {
+    // "3 ready · 0 blocked" would be chrome noise on the overwhelmingly common case.
+    stubListWithProbes([PR_READY, PR_CLEAN_BUT_PROBED], {});
+    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    await openMenu();
+
+    const count = await screen.findByTestId("pr-group-count");
+    // WAIT FOR THE READ TO HAVE HAPPENED, not for a value that was already true. Both fixtures are
+    // `passing/mergeable/clean` with no probes, so `prMergeReadiness` returns ready for both on the
+    // PRE-probe paint — `data-ready` is "2" and `data-blocked` is "0" on the very first render.
+    // Without this the test could not tell "the read returned no probes" from "the read never
+    // happened", which is the exact failure its own title claims to cover.
+    await probeReadIssued(PR_READY.number);
+    await probeReadIssued(PR_CLEAN_BUT_PROBED.number);
+    await waitFor(() => expect(count.getAttribute("data-ready")).toBe("2"));
+    expect(count.getAttribute("data-blocked")).toBe("0");
+    expect(count.textContent).toBe("2");
+  });
+});
+
+describe("OpenPrMenu — what OPEN re-asks, and what only Refresh does", () => {
+  const probeCalls = () =>
+    h.invoke.mock.calls.filter((c) => c[0] === "knightwatch_probe_gate").length;
+
+  it("does NOT re-read a CLEAN probe row on reopen — that is the per-open subprocess cost", () => {
+    // Dropping the whole cache on every panel open is 27 `gh` subprocesses per open, which is the
+    // cost probeGate.ts exists to prevent. Re-adding a blanket refreshProbeGates() to the open
+    // handler reds this.
+    stubListWithProbes([PR_READY], {});
+    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    return (async () => {
+      await openMenu();
+      await waitFor(() => expect(probeCalls()).toBe(1));
+      // LET THE READ FINISH BEFORE CLOSING, on a MACROTASK. `waitFor` above proves the read was
+      // ISSUED, not that it RESOLVED and was written to the cache — and the cache write is what
+      // the reopen is supposed to hit. A fixed number of microtask ticks cannot promise that: if
+      // it comes up short the reopen JOINS the still-in-flight read instead, which also leaves
+      // probeCalls() at 1 — so the test would silently degrade into a dedup test without failing.
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 30));
+      });
+      const listCallsBeforeReopen = h.invoke.mock.calls.filter(
+        (c) => c[0] === "project_open_prs",
+      ).length;
+      fireEvent.click(await screen.findByTestId("open-pr-badge")); // close
+      await openMenu(); // reopen, same rows at the same updatedAt
+      // THE MACROTASK SETTLE BELOW IS THE SYNCHRONIZATION — not the listCalls check.
+      const listCalls = () =>
+        h.invoke.mock.calls.filter((c) => c[0] === "project_open_prs").length;
+      // Being honest about which line does the work: `refetch` issues `project_open_prs`
+      // SYNCHRONOUSLY inside the click (the map callbacks run up to their first await, and
+      // `fetchOpenPrs` invokes before its own), so this delta is already satisfied by the time
+      // `openMenu()` resolves. It is a cheap sanity check that the reopen refetched at all, and
+      // nothing more — an earlier comment claimed it synchronised the negative assertion, which
+      // would have let a reader delete the settle below as redundant and silently restore the
+      // 27-subprocesses-per-open regression. A DELTA, not an absolute: the panel also refetches on
+      // mount, so the absolute is 3 by this point.
+      expect(listCalls()).toBe(listCallsBeforeReopen + 1);
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 30));
+      });
+      expect(probeCalls()).toBe(1);
+    })();
+  });
+
+  it("DOES re-read a BLOCKED row on reopen, so an edited-reply answer is not pinned", async () => {
+    // The one hole `updatedAt` cannot cover: answering by EDITING an existing reply bumps that
+    // comment's stamp, never the PR's. Without the scoped eviction the row stays red forever and
+    // the reader has no cue that Refresh is the way out.
+    stubListWithProbes([PR_1325], { [PR_1325.number]: [blockingProbe(1)] });
+    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    await openMenu();
+    await waitFor(() => expect(probeCalls()).toBe(1));
+    await waitFor(() =>
+      expect(screen.getByTestId("pr-state-1325").textContent).toBe("Blocked: 1 probe"),
+    );
+
+    fireEvent.click(await screen.findByTestId("open-pr-badge")); // close
+    await openMenu(); // reopen
+    await waitFor(() => expect(probeCalls()).toBe(2));
+  });
+
+  // NOTE ON WHY THE TEST ABOVE DOES NOT ALSO ASSERT "Refresh then takes it to exactly 2".
+  // Pressing Refresh while the reopen's refetch is still in flight is the case the generation
+  // counter exists for: Refresh bumps the generation, so the in-flight read is no longer joinable
+  // and a fresh one is issued — correctly, since joining would answer the press with the very
+  // reading it rejected. The count is therefore 2 OR 3 depending on that overlap, and pinning it to
+  // 2 pins the absence of a guard we deliberately have. The positive fact gets its own test, below,
+  // where nothing is outstanding.
+  // ── THE MIDDLE OF THE PREDICATE, which is where every earlier version of this rule went wrong ──
+  //
+  // The two tests above bound only the EXTREMES: a row with no probes (never a target under any
+  // predicate) and a row blocked purely on probes (a target under every one). Neither can tell
+  // `blocker === "probes"` apart from the two predicates it replaced — "has unanswered probes", and
+  // that plus `overridden`. The cases below are the ones that separate them, and each is a
+  // permanent cost if it regresses: an override, missing merge rights and a conflict are none of
+  // them answered away by replying to a probe, so such a PR would pay a `gh` subprocess on every
+  // panel open forever, for a reading no value of which can change its row.
+  /** Probe reads issued for ONE pull request. Per-PR, because a total cannot tell a row-scoped
+   *  eviction from a fleet-wide one that merely happened to fire. */
+  const probeCallsFor = (number: number) =>
+    h.invoke.mock.calls.filter(
+      (c) => c[0] === "knightwatch_probe_gate" && (c[1] as { number: number })?.number === number,
+    ).length;
+
+  /**
+   * `row` must NOT be re-read on reopen, while a genuinely probe-blocked PR on screen beside it
+   * MUST be.
+   *
+   * BOTH ROWS, AND COUNTED SEPARATELY — that pairing is the point. With a single-PR fixture the
+   * suite pins only the all-or-nothing shape: mutating the open handler to
+   * `if (probeBlockedTargets().length > 0) refreshProbeGates()` — a fleet-wide blanket drop gated
+   * on "any row qualifies", which IS the 27-subprocesses-per-open regression — stayed green,
+   * because every fixture computed either an empty target set or a set containing its only row.
+   * Putting a target and a non-target on screen together is what makes "which rows get re-read"
+   * observable at all, and one row on screen is not the normal case.
+   */
+  const staysCachedAcrossReopen = async (row: PrRow, overridden: readonly number[] = []) => {
+    stubListWithProbes(
+      [row, PR_1325],
+      { [row.number]: [blockingProbe(1)], [PR_1325.number]: [blockingProbe(1)] },
+      overridden,
+    );
+    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    await openMenu();
+    await waitFor(() => expect(probeCallsFor(row.number)).toBeGreaterThanOrEqual(1));
+    await waitFor(() => expect(probeCallsFor(PR_1325.number)).toBeGreaterThanOrEqual(1));
+    // Macrotask, so the reads have RESOLVED and been written — not merely issued. See the clean-row
+    // test for why a fixed microtask drain would silently turn this into a dedup test.
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 30));
+    });
+
+    // DELTAS ACROSS THE REOPEN, not absolutes. The panel refetches on mount as well as on open, so
+    // the absolute counts carry a prefix that has nothing to do with what the reopen decided.
+    const beforeTarget = probeCallsFor(PR_1325.number);
+    const beforeRow = probeCallsFor(row.number);
+
+    fireEvent.click(await screen.findByTestId("open-pr-badge")); // close
+    await openMenu(); // reopen
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 30));
+    });
+
+    // The probe-blocked sibling IS re-read — positive proof the eviction ran at all, so the
+    // negative below cannot pass by the handler simply doing nothing.
+    expect(probeCallsFor(PR_1325.number)).toBe(beforeTarget + 1);
+    // ...and this row, whose blocker is not probes, is not.
+    expect(probeCallsFor(row.number)).toBe(beforeRow);
+  };
+
+  it("does not re-read a probed row whose blocker is a CONFLICT", async () => {
+    await staysCachedAcrossReopen({
+      number: 1409,
+      title: "fix: conflicting",
+      headRefName: "sparkle/agent-c",
+      url: "https://github.com/drodio/sparkle/pull/1409",
+      checks: "passing",
+      mergeable: "conflicting",
+      mergeStateStatus: "dirty",
+      updatedAt: "2026-08-05T20:00:00Z",
+    });
+  });
+
+  it("does not re-read a probed row the viewer cannot merge", async () => {
+    await staysCachedAcrossReopen({
+      number: 1408,
+      title: "chore: no rights",
+      headRefName: "sparkle/agent-n",
+      url: "https://github.com/drodio/sparkle/pull/1408",
+      checks: "passing",
+      mergeable: "mergeable",
+      mergeStateStatus: "clean",
+      viewerCanMerge: false,
+      updatedAt: "2026-08-05T20:00:00Z",
+    });
+  });
+
+  it("does not re-read a probed row whose probes are OVERRIDDEN", async () => {
+    // This guard existed as a service test and was deleted when `evictProbeGates` stopped deriving
+    // its own predicate. Nothing replaced it, so the override half of the rule was unpinned.
+    await staysCachedAcrossReopen(
+      {
+        number: 1407,
+        title: "feat: waived",
+        headRefName: "sparkle/agent-w",
+        url: "https://github.com/drodio/sparkle/pull/1407",
+        checks: "passing",
+        mergeable: "mergeable",
+        mergeStateStatus: "clean",
+        updatedAt: "2026-08-05T20:00:00Z",
+      },
+      [1407],
+    );
+  });
+
+  it("Refresh re-reads even a CLEAN row — it is the fleet-wide escape hatch", async () => {
+    stubListWithProbes([PR_READY], {});
+    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    await openMenu();
+    await waitFor(() => expect(probeCalls()).toBe(1));
+
+    fireEvent.click(await screen.findByTestId("pr-refresh"));
+    await waitFor(() => expect(probeCalls()).toBe(2));
+  });
+});
+
+describe("OpenPrMenu — an OVERRIDDEN PR reads ready, drawer included", () => {
+  it("suppresses the probe drawer, so nothing contradicts the row above it", async () => {
+    // The readiness rule treats a recorded override as clearing the block, so the row reads ready.
+    // A drawer under it headed "unanswered probes blocking this PR" would contradict the row it
+    // hangs from. This was fixed inline in the component and shipped with nothing pinning it —
+    // deleting `gate.overridden ? null :` left the whole suite green.
+    // A SECOND, GENUINELY BLOCKED PR AS THE POSITIVE SIGNAL. Every assertion below is true on the
+    // PRE-PROBE paint too — this fixture is passing/mergeable/clean, so before any gate arrives the
+    // row is already ready and the disclosure already absent. `probeReadIssued` only proves the
+    // call was ISSUED, not that `setProbeDetailByKey` committed, so without something that can ONLY
+    // be true after the map is written, the mutation reds by luck.
+    stubListWithProbes(
+      [PR_CLEAN_BUT_PROBED, PR_1325],
+      {
+        [PR_CLEAN_BUT_PROBED.number]: [blockingProbe(1), blockingProbe(2)],
+        [PR_1325.number]: [blockingProbe(1)],
+      },
+      [PR_CLEAN_BUT_PROBED.number],
+    );
+    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    await openMenu();
+    // Resolves only once the detail map has been committed for this scope.
+    await screen.findByTestId("probe-disclosure-1325");
+
+    // The row is ready: no state word, and a live Merge.
+    await waitFor(() =>
+      expect(
+        (screen.getByTestId(`merge-${PR_CLEAN_BUT_PROBED.number}`) as HTMLButtonElement).disabled,
+      ).toBe(false),
+    );
+    expect(screen.queryByTestId(`pr-state-${PR_CLEAN_BUT_PROBED.number}`)).toBeNull();
+
+    // ...and there is no disclosure to open, so the contradiction cannot be reached at all.
+    expect(
+      screen.queryByTestId(`probe-disclosure-${PR_CLEAN_BUT_PROBED.number}`),
+    ).toBeNull();
+    expect(screen.getByTestId("pr-group-count").getAttribute("data-blocked")).toBe("1"); // only #1325
+  });
+});
+
+describe("OpenPrMenu — the drawer follows the same ranking as the row and the count", () => {
+  /** Unanswered probes, but the row's reported blocker is a CONFLICT — which outranks probes. */
+  const PR_CONFLICTING_AND_PROBED: PrRow = {
+    number: 1309,
+    title: "fix(x): something",
+    headRefName: "sparkle/agent-conf",
+    url: "https://github.com/drodio/sparkle/pull/1309",
+    checks: "passing",
+    mergeable: "conflicting",
+    mergeStateStatus: "dirty",
+    updatedAt: "2026-08-05T20:00:00Z",
+  };
+
+  it("shows no probe disclosure on a row whose blocker is something else", async () => {
+    // The drawer used to gate on `gate.overridden` alone — a SECOND ad-hoc rule, and an override is
+    // only one of the ways the row's blocker isn't probes. This PR renders "Conflicts", the header
+    // does not count it as probe-blocked, and a disclosure announcing "1 unanswered probe blocking
+    // this PR" underneath it would contradict both.
+    stubListWithProbes([PR_CONFLICTING_AND_PROBED, PR_1325], {
+      [PR_CONFLICTING_AND_PROBED.number]: [blockingProbe(1)],
+      [PR_1325.number]: [blockingProbe(1)],
+    });
+    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    await openMenu();
+    // POSITIVE PROOF the detail map was committed — the assertions below are all true on the
+    // pre-probe paint, so a wait on issuance alone would let the mutant pass by timing.
+    await screen.findByTestId("probe-disclosure-1325");
+
+    expect(
+      screen.getByTestId(`pr-state-${PR_CONFLICTING_AND_PROBED.number}`).textContent,
+    ).toBe("Conflicts");
+    expect(
+      screen.queryByTestId(`probe-disclosure-${PR_CONFLICTING_AND_PROBED.number}`),
+    ).toBeNull();
+    expect(screen.getByTestId("pr-group-count").getAttribute("data-blocked")).toBe("1");
+  });
+
+  it("shows none on a row the viewer cannot merge — the OTHER fact that outranks probes", async () => {
+    // Exactly two facts outrank probes: a conflict and no merge rights. Only the first was pinned,
+    // so half the new rule shipped untested.
+    const PR_NO_RIGHTS: PrRow = {
+      number: 1307,
+      title: "chore: something in a repo I cannot merge",
+      headRefName: "sparkle/agent-nr",
+      url: "https://github.com/drodio/sparkle/pull/1307",
+      checks: "passing",
+      mergeable: "mergeable",
+      mergeStateStatus: "clean",
+      viewerCanMerge: false,
+      updatedAt: "2026-08-05T20:00:00Z",
+    };
+    stubListWithProbes([PR_NO_RIGHTS, PR_1325], {
+      [PR_NO_RIGHTS.number]: [blockingProbe(1)],
+      [PR_1325.number]: [blockingProbe(1)],
+    });
+    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    await openMenu();
+    await screen.findByTestId("probe-disclosure-1325");
+
+    expect(screen.getByTestId(`pr-state-${PR_NO_RIGHTS.number}`).textContent).toBe(
+      "No merge rights",
+    );
+    expect(screen.queryByTestId(`probe-disclosure-${PR_NO_RIGHTS.number}`)).toBeNull();
+  });
+
+  it("DOES show one on a DRAFT or protection-blocked row — probes outrank both", async () => {
+    // The counter-guard to the comment fix. An earlier comment claimed draft and protection
+    // outranked probes; they do not, so these rows report `blocker: "probes"` and must keep their
+    // disclosure. Without this, over-tightening the rule would look correct.
+    const PR_DRAFT: PrRow = {
+      number: 1306,
+      title: "wip: draft",
+      headRefName: "sparkle/agent-draft",
+      url: "https://github.com/drodio/sparkle/pull/1306",
+      checks: "passing",
+      mergeable: "mergeable",
+      mergeStateStatus: "draft",
+      updatedAt: "2026-08-05T20:00:00Z",
+    };
+    // BOTH branches, because they are two separate returns in `prMergeReadiness`. Exercising only
+    // the draft one would let a future reordering that lifts `state === "blocked"` above the probe
+    // branch strip the disclosure from every protection-blocked row while this suite stayed green —
+    // and the test NAME would tell the next reader the case was covered.
+    const PR_PROTECTED: PrRow = {
+      number: 1305,
+      title: "feat: needs a required review",
+      headRefName: "sparkle/agent-prot",
+      url: "https://github.com/drodio/sparkle/pull/1305",
+      checks: "passing",
+      mergeable: "mergeable",
+      mergeStateStatus: "blocked",
+      updatedAt: "2026-08-05T20:00:00Z",
+    };
+    stubListWithProbes([PR_DRAFT, PR_PROTECTED], {
+      [PR_DRAFT.number]: [blockingProbe(1)],
+      [PR_PROTECTED.number]: [blockingProbe(1)],
+    });
+    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    await openMenu();
+
+    expect(await screen.findByTestId(`probe-disclosure-${PR_DRAFT.number}`)).toBeTruthy();
+    expect(screen.getByTestId(`pr-state-${PR_DRAFT.number}`).textContent).toBe(
+      "Blocked: 1 probe",
+    );
+
+    // Protection-blocked: the row says "Blocked: 1 probe", NOT "Blocked" (branch protection).
+    expect(screen.getByTestId(`probe-disclosure-${PR_PROTECTED.number}`)).toBeTruthy();
+    expect(screen.getByTestId(`pr-state-${PR_PROTECTED.number}`).textContent).toBe(
+      "Blocked: 1 probe",
+    );
+  });
+
+  it("still shows it when probes ARE the reported blocker", async () => {
+    // The counter-guard: the rule above must not suppress the drawer everywhere.
+    stubListWithProbes([PR_1325], { [PR_1325.number]: [blockingProbe(1)] });
+    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    await openMenu();
+    expect(await screen.findByTestId("probe-disclosure-1325")).toBeTruthy();
   });
 });
