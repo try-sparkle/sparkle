@@ -565,6 +565,16 @@ async function dispatchOne(
   }
   if (!acquired) return null;
 
+  /** Give the holder back. Every exit after the acquire that did NOT leave a driver running must
+   *  call this, or the PR is silent until the lease goes stale 90 minutes later. */
+  const releaseHolder = async (why: string): Promise<void> => {
+    try {
+      await invoke(BABYSIT_LEASE_RELEASE_COMMAND, { repo, pr, agentId: holder });
+    } catch (e) {
+      log.warn("babysit", `lease release after ${why} failed`, { repo, pr, error: String(e) });
+    }
+  };
+
   // CHECK AFTER THE ACQUIRE, BEFORE THE SPAWN (knightwatch #1298 probe 1).
   //
   // The acquire is an await, so `stop()` can land during it. Until here the sweep held nothing a
@@ -576,35 +586,34 @@ async function dispatchOne(
   // Past `spawnBuildAgentInProject` it really is uncancellable: the agent exists and is about to
   // start replying on a human's PR, and the writes after it record facts about it.
   if (!isCurrent()) {
-    try {
-      await invoke(BABYSIT_LEASE_RELEASE_COMMAND, { repo, pr, agentId: holder });
-    } catch (e) {
-      log.warn("babysit", "lease release after a cancelled dispatch failed", {
-        repo,
-        pr,
-        error: String(e),
-      });
-    }
+    await releaseHolder("a cancelled dispatch");
     log.debug("babysit", "dispatch cancelled after acquire: the sweep was superseded", { repo, pr });
     return null;
   }
 
-  const agentId = spawnBuildAgentInProject(project, {
-    prompt: babysitPrompt(pr),
-    name: `Babysit #${pr}`,
-    // THE WHOLE REASON `background` EXISTS. This fires on a timer; landing the human in an agent
-    // they never asked for, several times an hour, is worse than not watching the PR at all.
-    background: true,
-  });
+  let agentId: string | null;
+  try {
+    agentId = spawnBuildAgentInProject(project, {
+      prompt: babysitPrompt(pr),
+      name: `Babysit #${pr}`,
+      // THE WHOLE REASON `background` EXISTS. This fires on a timer; landing the human in an agent
+      // they never asked for, several times an hour, is worse than not watching the PR at all.
+      background: true,
+    });
+  } catch (e) {
+    // A THROWN spawn is a REFUSED spawn as far as the lease is concerned — no driver exists either
+    // way. Only the falsy return released, so a throw left the holder standing for the full 90-minute
+    // stale threshold, and the sweep's per-PR isolation now swallows the throw and moves on, making
+    // that leak silent and repeatable. Release, then rethrow so the PR is still counted `failed`.
+    await releaseHolder("a spawn that threw");
+    throw e;
+  }
 
   if (!agentId) {
-    // The spawn refused — at capacity, torn out, or the project is not on screen. Give the lease
-    // back, or this PR is silent until the lease goes stale.
-    try {
-      await invoke(BABYSIT_LEASE_RELEASE_COMMAND, { repo, pr, agentId: holder });
-    } catch (e) {
-      log.warn("babysit", "lease release after a refused spawn failed", { repo, pr, error: String(e) });
-    }
+    // The spawn refused — at capacity, torn out, the project is not on screen, or a step after the
+    // row was added threw and it was torn back down. All of them mean no agent exists, which is the
+    // only fact the release depends on.
+    await releaseHolder("a refused spawn");
     return null;
   }
   log.info("babysit", "dispatched a driver", { repo, pr, agentId });

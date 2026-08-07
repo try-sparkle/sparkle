@@ -457,14 +457,36 @@ describe("spawnBuildAgent", () => {
     expect(pid).toBeTruthy();
   });
 
-  it("refuses (typed) when the project vanishes mid-spawn — nothing was created", async () => {
+  it("refuses (typed) when the project vanishes mid-spawn — and SAYS the project closed", async () => {
     const pid = seedProject();
-    spawnOverride = () => null; // spawnBuildAgentInProject's "project closed in another window" branch
+    // The actual race: the lookup above succeeds, and the project is removed by another window
+    // WHILE the spawn runs — so it has to vanish inside the override, not before the call.
+    spawnOverride = () => {
+      useProjectStore.setState({ projects: [] });
+      return null;
+    };
     const r = await spawnBuildAgent({ projectId: pid });
     expect(r.ok).toBe(false);
     if (r.ok) return;
     expect(r.op).toBe("spawn_build_agent");
     expect(r.reason).toBe("action-failed");
+    expect(r.message).toMatch(/project closed/i);
+  });
+
+  it("a null from an INTERNAL failure does not blame the project for closing", async () => {
+    // `spawnBuildAgentInProject` returns null for two different reasons now: the project-removal race
+    // above, and a step between `addAgent` and the brief throwing, after which it tears the row back
+    // down. Both guarantee "nothing was created", but only one is a closed project — and telling a
+    // human their project closed sends them looking for a tab nobody closed.
+    const pid = seedProject();
+    spawnOverride = () => null; // project deliberately left OPEN
+    const r = await spawnBuildAgent({ projectId: pid });
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toBe("action-failed");
+    expect(r.message).not.toMatch(/project closed/i);
+    expect(r.message).toMatch(/went wrong/i);
+    // The guarantee both causes share still holds.
     expect(useProjectStore.getState().projects[0]!.agents).toHaveLength(0);
   });
 

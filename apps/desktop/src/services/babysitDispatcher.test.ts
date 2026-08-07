@@ -1099,9 +1099,8 @@ describe("per-PR failure isolation", () => {
   });
 
   it("a spawn that throws is isolated too — the radius is closed, not one throw site", async () => {
-    // `dispatchOne` calls `spawnBuildAgentInProject` OUTSIDE any try/catch, and that function
-    // reaches into three zustand stores to do its work. A second, unrelated throw site proves the
-    // fix is the loop's isolation rather than a guard aimed at one payload.
+    // `spawnBuildAgentInProject` reaches into three zustand stores, so it is a second, unrelated
+    // throw site: what is proven is the loop's isolation, not a guard aimed at one payload.
     fetchOpenPrsMock.mockResolvedValue([prWithProbe(BAD), prWithProbe(GOOD_B)]);
     wirePerPr({ [BAD]: gateWithUnansweredBlocking(), [GOOD_B]: gateWithUnansweredBlocking() });
     spawnMock.mockImplementation((_project: unknown, opts: { prompt: string }) => {
@@ -1113,6 +1112,27 @@ describe("per-PR failure isolation", () => {
 
     expect(out.failed).toBe(1);
     expect(out.dispatched).toEqual([{ repo: "drodio/sparkle", pr: GOOD_B, agentId: "agent-2" }]);
+  });
+
+  it("a spawn that throws GIVES THE LEASE BACK — a counted failure is not a held PR", async () => {
+    // Only the falsy-return path released. A THROW skipped it and left the synthetic holder standing
+    // for the full 90-minute stale threshold, so the PR was un-babysittable — and the per-PR
+    // isolation above swallows the throw, which makes that leak silent and repeatable.
+    fetchOpenPrsMock.mockResolvedValue([prWithProbe(BAD)]);
+    wirePerPr({ [BAD]: gateWithUnansweredBlocking() });
+    spawnMock.mockImplementation(() => {
+      throw new Error("addAgent blew up");
+    });
+
+    const out = await sweepTwice();
+
+    expect(out.failed).toBe(1);
+    // THE SIDE EFFECT, not the count: the holder acquired for this PR was handed back.
+    // One release, not two: the two-observation rule means only the SECOND sweep gets as far as
+    // acquiring, so exactly one holder is ever taken — and it is handed back.
+    const released = invokeMock.mock.calls.filter((c) => c[0] === BABYSIT_LEASE_RELEASE_COMMAND);
+    expect(released).toHaveLength(1);
+    expect(released[0]?.[1]).toMatchObject({ repo: "drodio/sparkle", pr: BAD });
   });
 
   it("a sweep whose every PR threw still reports it, at a level a release build keeps", async () => {
@@ -1147,46 +1167,27 @@ describe("per-PR failure isolation", () => {
       debug.mockRestore();
     }
   });
-
-  it("a healthy sweep reports failed: 0, so the counter cannot read as always-on", async () => {
-    fetchOpenPrsMock.mockResolvedValue([prWithProbe(GOOD_A), prWithProbe(GOOD_B)]);
-    wirePerPr({ [GOOD_A]: gateWithUnansweredBlocking(), [GOOD_B]: gateWithUnansweredBlocking() });
-
-    const out = await sweepTwice();
-
-    expect(out.failed).toBe(0);
-    expect(out.dispatched).toHaveLength(2);
-  });
 });
 
 // ── THE BOUNDARY NORMALISES ON SHAPE, NOT ON NULLISHNESS ────────────────────────────────────────
 //
-// `?? undefined` defeats exactly one non-conforming value — the `null` serde is known to write
-// today. `invoke` returns `unknown` and the `WireProbeGate` cast is unchecked, so any OTHER drift
-// between the two sides is passed through and read as an AUTHORITATIVE answer by every consumer.
+// `?? undefined` defeats exactly one non-conforming value — the `null` serde writes today. The cast
+// on `invoke` is unchecked, so any OTHER drift is passed through and read as AUTHORITATIVE.
 describe("readProbeGate — a reply that drifted from the contract is UNKNOWN", () => {
-  it("a `probes` that is not an array is UNKNOWN rather than something to iterate", async () => {
+  // Each row gives one field whose value is subsequently ITERATED or INDEXED a value of the wrong
+  // SHAPE — not merely null, which is the only drift a `??` can see.
+  it.each([
+    { field: "probes" as const, drifted: { probes: { items: [] }, reviewedHead: null } },
+    { field: "reviewedHead" as const, drifted: { probes: [], reviewedHead: 12345 } },
+  ])("a `$field` of the wrong shape is UNKNOWN, not something to read", async ({ field, drifted }) => {
     invokeMock.mockResolvedValueOnce({
       applicable: true,
-      probes: { items: [] },
       error: null,
       overridden: false,
-      reviewedHead: null,
       reviewStale: false,
+      ...drifted,
     });
-    expect((await readProbeGate("/repo", 1)).probes).toBeUndefined();
-  });
-
-  it("a `reviewedHead` that is not a string is UNKNOWN rather than something to index", async () => {
-    invokeMock.mockResolvedValueOnce({
-      applicable: true,
-      probes: [],
-      error: null,
-      overridden: false,
-      reviewedHead: 12345,
-      reviewStale: false,
-    });
-    expect((await readProbeGate("/repo", 1)).reviewedHead).toBeUndefined();
+    expect((await readProbeGate("/repo", 1))[field]).toBeUndefined();
   });
 
   it("an authoritative reply is passed through untouched — the guard only ever narrows", async () => {

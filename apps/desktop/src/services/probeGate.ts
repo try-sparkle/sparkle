@@ -220,67 +220,27 @@ const unknownGate = (error: string): BabysitProbeGate => ({
 });
 
 /**
- * The gate EXACTLY as it arrives over IPC — which is NOT `BabysitProbeGate`.
- *
- * `ProbeGate` in `knightwatch.rs` derives a plain `serde::Serialize` with NO `skip_serializing_if`
- * anywhere on it, so every `Option::None` is serialised as JSON `null` and arrives as a PRESENT
- * field holding `null` — never as an absent field reading `undefined`. Two fields the core types as
- * optional are therefore mis-declared at this boundary, and each fails its own way if passed on:
- *
- *   * `probes: null` — the core's UNKNOWN test is `probes === undefined`
- *     (`babysitDispatch.ts`, the `probe-read-unknown` hold), and `null` does not satisfy it. So a
- *     failed or saturated read reads as AUTHORITATIVE and the PR reports the healthy-sounding
- *     `no-evidence`, then gets CACHED as one.
- *   * `reviewedHead: null` — the core reads `reviewedHead !== undefined && reviewedHead.length > 0`,
- *     and `null !== undefined` is TRUE, so `.length` THROWS and aborts the whole project's sweep.
- *
- * Declaring the wire shape honestly is what makes the normalisation below type-checked rather than
- * remembered.
- */
-type WireProbeGate = Omit<BabysitProbeGate, "probes" | "reviewedHead"> & {
-  probes: BabysitProbeGate["probes"] | null;
-  reviewedHead?: string | null;
-};
-
-/**
  * Read one PR's probes. NEVER throws; a failure is the UNKNOWN reading.
  *
- * THE ONLY ADAPTER FOR `knightwatch_probe_gate`. The panel and the babysit sweep used to each own a
- * near-identical copy plus its own command constant, on the reasoning that the sweep's lifecycle
- * should not couple to the panel's render — but an adapter is not a lifecycle, and two of them for
- * one Rust response is two places for the wire contract to drift. `babysitDispatcher` imports this.
- *
- * IT IS THE null→undefined BOUNDARY. See {@link WireProbeGate}: serde puts `null` where the core's
- * contract says `undefined`, and `unansweredBlockingProbes` here tests `== null`, which is satisfied
- * by either — so normalising once, at the boundary, is safe for both callers and required by one.
+ * THE ONLY ADAPTER FOR `knightwatch_probe_gate`, and the only place the wire's shape is judged.
+ * `BabysitProbeGate` already declares the nullability serde produces (`Option::None` is a PRESENT
+ * `null`, never an absent field — `ProbeGate` carries no `skip_serializing_if`), so this reads that
+ * one type and narrows it. A second wire-shaped type here said nothing the core's did not.
  */
 export async function readProbeGate(root: string, number: number): Promise<BabysitProbeGate> {
   try {
-    const gate = await invoke<WireProbeGate>(KNIGHTWATCH_PROBE_GATE_COMMAND, { root, number });
+    const gate = await invoke<BabysitProbeGate>(KNIGHTWATCH_PROBE_GATE_COMMAND, { root, number });
     // A reply we cannot RECOGNISE is unknown too. `invoke` returns `unknown`, and a cast is happy to
     // assert any shape onto it — the one thing a cast cannot do is notice the two sides have
     // drifted. Check the discriminating field rather than trusting the annotation.
     if (!gate || typeof gate !== "object" || typeof gate.applicable !== "boolean") {
       return unknownGate("unrecognised probe-gate reply");
     }
-    // NORMALISE ON SHAPE, NOT ON NULLISHNESS — the class, not the one value.
-    //
-    // CARRIED FROM `main` WHEN THIS ADAPTER MOVED HERE. The merge that brought the two copies
-    // together kept this file's side and deleted the dispatcher's — and `main` had meanwhile
-    // improved the dispatcher's normalisation, so resolving in our favour wholesale would have
-    // silently dropped it. That is exactly the conflict git resolves happily and nobody notices.
-    //
-    // `?? undefined` (which this was) maps BOTH `null` and a missing field to `undefined`, so it
-    // defeats the one non-conforming value serde is known to send TODAY and nothing else: `invoke`
-    // returns `unknown` and the `WireProbeGate` cast is unchecked, so any OTHER shape — a `probes`
-    // that became `{ items: [...] }` in a Rust refactor, a renamed serde field, a frontend newer
-    // than its backend — sails past `??` and is then read as AUTHORITATIVE by every consumer. Same
-    // argument the `applicable` check above makes, applied to the two fields whose values are
-    // subsequently ITERATED and INDEXED rather than merely compared.
-    //
-    // A value that is not the declared shape is UNKNOWN, the fail-closed direction here.
-    // `Array.isArray`/`typeof` still map `null` and an absent field to `undefined`, so the
-    // `skip_serializing_if` case the previous `??` was written for keeps working unchanged.
+    // NORMALISE ON SHAPE, NOT ON NULLISHNESS — the class, not the one value. A `??` defeats only the
+    // `null` serde writes today; any other drift — a `probes` that became `{ items: [...] }`, a
+    // renamed field, a frontend newer than its backend — is passed on and read as AUTHORITATIVE by
+    // every consumer. Narrowing on shape still maps `null` and an absent field to `undefined`, so it
+    // strictly subsumes the `??` it replaced, and an unreadable value stays fail-closed as UNKNOWN.
     return {
       ...gate,
       probes: Array.isArray(gate.probes) ? gate.probes : undefined,

@@ -600,10 +600,24 @@ export async function spawnBuildAgent(
     mode: input.mode,
   });
   if (!agentId) {
+    // TWO CAUSES REACH THIS LINE NOW, AND THEY READ DIFFERENTLY TO A HUMAN. Capacity and torn-out
+    // are pre-checked above and `background` is never passed, so `null` used to mean exactly one
+    // thing: `addAgent` lost a race with the project being removed. `spawnBuildAgentInProject` now
+    // also returns `null` when a step between `addAgent` and the brief threw and it tore the row
+    // back down — same "nothing was created" guarantee, completely different cause. Reporting that
+    // as a closed project sends the human looking for a tab nobody closed, and leaves the real
+    // reason only in a WARN.
+    const projectStillOpen = useProjectStore.getState().projects.some((p) => p.id === project.id);
     return refuse(
       "spawn_build_agent",
       "action-failed",
-      "The project closed while I was starting the agent, so nothing was created.",
+      projectStillOpen
+        ? // NOT "nothing was created" — narrower on purpose. The teardown guarantees no AGENT
+          // exists, but it runs after the foreground trio, so a tab the human closed may have
+          // reopened and the selection may have moved. Promising more than that would send them
+          // looking for a change that did happen.
+          "Something went wrong while starting the agent, so no agent was created — though your project view may have moved. The project is still open, so it's worth trying again."
+        : "The project closed while I was starting the agent, so nothing was created.",
     );
   }
   // ══ THE NAME IS PROVISIONAL, AND THE FIELD SAYS SO ════════════════════════════════════════════

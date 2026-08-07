@@ -16,12 +16,12 @@ import { landInAgent } from "./landInAgent";
 import { createBeadFull } from "./tasks";
 import { isBeadsUnavailable, AUTO_LABEL } from "./beads";
 import { localAgentCapacity } from "./agentCapacity";
-import { attachBrief } from "./agentBrief";
+import { attachBrief, clearBrief } from "./agentBrief";
 import { markProjectVisited, wasProjectVisited } from "./sessionProjects";
 import { markProjectOpen } from "./projectTabs";
 import { isTornOut } from "./satelliteWindows";
 import { log } from "../logger";
-import { perfStart } from "../perfTrace";
+import { perfStart, perfCancel } from "../perfTrace";
 import type { Project } from "../types";
 
 /**
@@ -93,9 +93,20 @@ export interface SpawnBuildAgentOpts {
 
 /** Create + open a local Build agent in `project`, returning its id — or null when the spawn did not
  *  happen: the project is gone from the store (closed in another window between the caller's read
- *  and this call, roborev 46278), the machine is at its agent ceiling, or this is a BACKGROUND spawn
- *  into a torn-out project OR into one the human has not looked at this session. In every case
- *  NOTHING was created and no UI side-effect fired. */
+ *  and this call, roborev 46278), the machine is at its agent ceiling, this is a BACKGROUND spawn
+ *  into a torn-out project OR into one the human has not looked at this session, or a step between
+ *  `addAgent` and the brief THREW and the row was torn back down (see the fence in the body).
+ *
+ *  IN EVERY CASE NO AGENT EXISTS — that is the guarantee callers may rely on, and the teardown
+ *  restores it by removing the row, clearing the brief, and closing the persisted open-set entry.
+ *
+ *  IT IS NOT "no side-effect fired", and the difference matters to anything that narrates a null to
+ *  a human. The four pre-checks refuse before touching anything, but on the FOREGROUND path the
+ *  teardown runs after `markProjectOpen`/`selectProjectOnItsSide`/`markProjectVisited` have already
+ *  fired — so a tab the human closed may have reopened, the selection may have moved, and the
+ *  project is in the monotonic visited set for the rest of the session. Those three are genuinely
+ *  irreversible; everything the teardown CAN undo (the row, the brief, the persisted open entry, the
+ *  perf trace) it does. Say "no agent was created", not "nothing happened". */
 export function spawnBuildAgentInProject(
   project: Project,
   opts: SpawnBuildAgentOpts = {},
@@ -184,135 +195,194 @@ export function spawnBuildAgentInProject(
     ...(opts.mode === "plan" ? { permissionMode: "plan" as const } : {}),
   });
   if (!id) return null;
-  // Start the spawn-latency waterfall the instant the agent is added — AgentPane.prepare() and
-  // Terminal add the remaining milestones through to "pty ready" under the same key (perfTrace).
-  perfStart(id, "spawn", { kind: "build" });
-  // LAND the user in it (§13): leave the special (Sparkle/board) view, select, open, and scroll the
-  // new row into view. Those four steps were written out here, which is how the OTHER hand-off
-  // paths ended up with partial copies — services/sendToBuild called `open()` alone, so clicking
-  // "Start"/"Build It" on the Plan board left the user on the board with nothing visibly changed.
-  // They live in services/landInAgent now, one implementation for every path.
+  // "A NULL OR A THROW MEANS NOTHING WAS CREATED" — HELD BY CONSTRUCTION, NOT BY ASSERTION
+  // (roborev 59548 then 59562).
   //
-  // …unless `opts.background`, in which case everything below still runs EXCEPT the attention move —
-  // see SpawnBuildAgentOpts.background. The paragraphs that follow are why the mount half is NOT
-  // optional even then.
-  // GUARANTEE A PANE BEFORE PROMISING DELIVERY (roborev 55088).
+  // Every refusal above returns `null` BEFORE `addAgent`, which is what lets a caller read a
+  // non-answer as "the store is as I found it". Past this line the row exists, so that has to be
+  // re-established rather than claimed. `babysitDispatcher.dispatchOne` is the caller that makes it
+  // load-bearing: the synthetic lease is the ONLY exclusion for that PR, and it releases on a
+  // null-or-throw. Get this wrong in either direction and the damage is published to a human's PR —
+  // release when an agent DOES exist and the next sweep adds a SECOND driver; return a truthy id
+  // when the agent will never start and the lease is held for 90 minutes while nothing is watching.
   //
-  // `landInAgent` selects the AGENT but never the PROJECT — `selectAgent` writes only that project's
-  // own `selectedAgentId`. Workspace mounts panes solely for projects that are visited-or-current,
-  // so a spawn into a project the user has not opened this session mounts nothing, and a queued
-  // brief has no `flushPendingSends` to drain it: the queue does not self-age, so the entry would sit
-  // forever with no delivery AND no expiry outcome, while the reply claimed `briefed: true`.
-  //
-  // `spawn_build_agent` takes an arbitrary `projectId`, so that is a reachable call, not a corner.
-  // Switching the window is also what `landInAgent` already promises ("the thing you just asked for
-  // is what you are now looking at") — it simply could not deliver it from inside that helper.
-  // A TORN-OUT project is left alone entirely. `Workspace.tsx` bails on `tornOut.has(p.id)` BEFORE
-  // the visited-or-current check, so main mounts nothing for it no matter what we select — and
-  // selecting it would navigate main onto the re-dock placeholder, away from the user's work, to a
-  // view that renders no agents. The satellite window owns that project's panes. Callers that need
-  // delivery must refuse before reaching here (see lifecycle.spawnBuildAgent's `project-torn-out`),
-  // because the satellite has its OWN pendingSends module instance and cannot see this queue.
-  if (!isTornOut(project.id)) {
-    // `markProjectOpen` BEFORE `selectProject`, never bare. The two are paired at every other seam
-    // (openProjectTab, useReplaceCurrentProject, agentReveal.selectAndOpen) for a reason spelled out
-    // in agentReveal's header: selecting a project whose tab is closed leaves the strip with no tab
-    // for it and every tab reading aria-selected="false" — and it self-heals the WRONG way, since
-    // the next tab close treats a selection with no tab as stale and yanks the user elsewhere
-    // (engine/openProjects.selectionAfterClose). A bare selectProject here was a fourth seam
-    // reintroducing exactly that (roborev 55095).
+  // So the split below is BY CONSEQUENCE, not by position:
+  //   * Before the brief is attached, nothing is running yet. A throw there tears the row back down
+  //     and returns `null` — the contract holds because the agent really is gone, the capacity slot
+  //     is freed, and the caller's ordinary refusal path does the right thing with no special case.
+  //   * After it, the agent is live and briefed and claude is launching. A throw in the cosmetic
+  //     tail must NOT unmake that, so it is logged and the id is returned.
+  let launched = false;
+  try {
+    // Telemetry only, and deliberately inside the fence: if the waterfall cannot start, that is not
+    // a reason to refuse a spawn, but tearing down below is still the safe direction.
+    perfStart(id, "spawn", { kind: "build" });
+    // LAND the user in it (§13): leave the special (Sparkle/board) view, select, open, and scroll the
+    // new row into view. Those four steps were written out here, which is how the OTHER hand-off
+    // paths ended up with partial copies — services/sendToBuild called `open()` alone, so clicking
+    // "Start"/"Build It" on the Plan board left the user on the board with nothing visibly changed.
+    // They live in services/landInAgent now, one implementation for every path.
     //
-    // ALL THREE OF THESE ARE FOREGROUND-ONLY (knightwatch #1251 probes 1 and 3). A background spawn
-    // takes none of them, and needs none of them: the refusal above has already established that the
-    // project is on screen, which is the whole of the mount gate. Each would otherwise be a visible
-    // change to the human's window made on behalf of a spawn they never asked for —
-    //   * `markProjectOpen` re-opens a tab the human deliberately CLOSED (probe 3),
-    //   * `selectProjectOnItsSide` moves which project they are looking at,
-    //   * `markProjectVisited` writes the human-only, monotonic visited set and thereby publishes the
-    //     project and its prompt snippets to the tray and phone relay for the rest of the session
-    //     (probe 1) — see the refusal above for why that set is not ours to write.
-    if (!background) {
-      markProjectOpen(project.id);
-      // Side-aware (engine/pairs): "the thing you just asked for is what you are now looking at" only
-      // holds if the selection lands in the pair that OWNS the project. For a left-assigned one, a
-      // bare selectProject is reverted by the Workspace's reconcile effect and `leftProjectId` never
-      // moves, so the freshly spawned agent lands off-screen (roborev 55158).
-      selectProjectOnItsSide(project.id);
-      // Visited is the OTHER half of the mount gate: a project selected but never marked is skipped
-      // again as soon as the user navigates elsewhere.
-      markProjectVisited(project.id);
-    }
-  }
-  if (background) {
-    // JUST STEP 3 OF `landInAgent` — `open`, the one that "mount[s] that pane / drive[s] the PTY
-    // launch". Its other three steps (leave the special/board view, `selectAgent`,
-    // `requestRevealAgent`) are precisely the attention move a spawn the human did not ask for has
-    // not earned, and its header forbids machine-created agents from calling it at all. Calling
-    // `runtime.open` directly is what services/workerSpawn already does for the same reason; this is
-    // that precedent, not a second one.
+    // …unless `opts.background`, in which case everything below still runs EXCEPT the attention move —
+    // see SpawnBuildAgentOpts.background. The paragraphs that follow are why the mount half is NOT
+    // optional even then.
+    // GUARANTEE A PANE BEFORE PROMISING DELIVERY (roborev 55088).
     //
-    // Dropping this instead would not make the spawn quiet — it would make it fictional. No pane ⇒
-    // no launch ⇒ the brief's argv is never emitted, while everything downstream reports success.
-    useRuntimeStore.getState().open(id);
-  } else {
-    landInAgent(project.id, id);
-  }
-  if (opts.prompt) {
-    // ATTACH the brief for the LAUNCH ARGV — do NOT call `appendPrompt`, and no longer
-    // `queuePendingSend` either.
+    // `landInAgent` selects the AGENT but never the PROJECT — `selectAgent` writes only that project's
+    // own `selectedAgentId`. Workspace mounts panes solely for projects that are visited-or-current,
+    // so a spawn into a project the user has not opened this session mounts nothing, and a queued
+    // brief has no `flushPendingSends` to drain it: the queue does not self-age, so the entry would sit
+    // forever with no delivery AND no expiry outcome, while the reply claimed `briefed: true`.
     //
-    // `appendPrompt` is pure bookkeeping: it moves `lastPrompt` and appends to `promptHistory`, and
-    // writes nothing to the terminal. Seeding it directly would have been strictly WORSE than the
-    // two-step it replaced (roborev 55057): the prompt would never reach claude, while
-    // `engine/newAgentAttention.isBriefless` — which keys off exactly those two fields — would read
-    // the row as briefed. Instead of a false red, the human would get a falsely CALM agent idling
-    // at an empty prompt forever, with the pinned header confidently showing the brief that was
-    // never sent.
-    //
-    // `queuePendingSend` was the previous answer, and it delivered the text but LOST THE SUBMIT on
-    // five of five spawns: it writes into the PTY on `ptyReady`, which fires when `pty_spawn`
-    // returns — before claude's TUI is reading stdin at all. The brief sat at the prompt with the
-    // cursor after it until a human pressed Enter, while the reply said `briefed: true`. The full
-    // measurement, and why an idle-output or fixed-delay heuristic cannot fix it, is in the header
-    // of services/agentBrief.
-    //
-    // `attachBrief` hands it to the pane's launch instead, which emits it as claude's positional
-    // prompt — the same mechanism worker agents have always used, and one claude submits itself at
-    // startup. There is no paste, no carriage return, and so no window in which the submit can be
-    // dropped. The prompt side-effects still happen on the delivery path, once (AgentPane), which is
-    // what keeps the brief atomic *and* real.
-    attachBrief(id, opts.prompt);
-  } else if (!background) {
-    // The caret is the half landInAgent deliberately leaves to the caller, and the EMPTY spawn has
-    // earned it: the next thing the user does is type. A briefed spawn has not — sendToBuild skips
-    // the focus request for exactly this reason, since taking the caret for a composer the user has
-    // nothing to type into steals focus from whatever they were doing.
-    //
-    // Neither has a BACKGROUND spawn, for a stronger reason: nobody is about to type into it. The
-    // uiStore doc restricts this seam to "the user asking for the caret", and an automatic sweep is
-    // by definition not the user asking.
-    useUiStore.getState().requestComposeFocus();
-  }
-  // Title the bead with the agent's (default) name so beads stay distinguishable on the board rather
-  // than a row of identical placeholders. Best-effort: if the agent is removed within the sub-second
-  // `bd create` window the bead is orphaned, which the Discard/prune flows mop up.
-  const title =
-    useProjectStore
-      .getState()
-      .projects.find((p) => p.id === project.id)
-      ?.agents.find((a) => a.id === id)?.name ?? "Build task";
-  // Labeled `sparkle-auto` so the board can tell app-generated telemetry from beads a human filed —
-  // see AUTO_LABEL. Without it these are indistinguishable from real backlog once the agent is gone.
-  void createBeadFull(project.rootPath, title, "", "task", "", "", AUTO_LABEL)
-    .then((beadId) => useProjectStore.getState().setAgentBeadId(project.id, id, beadId))
-    .catch((e) => {
-      // A project with no beads DB is a normal, supported state (bd is optional) — don't cry WARN on
-      // every build-agent spawn for it; keep only genuine failures loud.
-      if (isBeadsUnavailable(e)) {
-        log.debug("build-agent", "auto-bead skipped: project has no beads database");
-      } else {
-        log.warn("build-agent", "auto-bead creation failed", e);
+    // `spawn_build_agent` takes an arbitrary `projectId`, so that is a reachable call, not a corner.
+    // Switching the window is also what `landInAgent` already promises ("the thing you just asked for
+    // is what you are now looking at") — it simply could not deliver it from inside that helper.
+    // A TORN-OUT project is left alone entirely. `Workspace.tsx` bails on `tornOut.has(p.id)` BEFORE
+    // the visited-or-current check, so main mounts nothing for it no matter what we select — and
+    // selecting it would navigate main onto the re-dock placeholder, away from the user's work, to a
+    // view that renders no agents. The satellite window owns that project's panes. Callers that need
+    // delivery must refuse before reaching here (see lifecycle.spawnBuildAgent's `project-torn-out`),
+    // because the satellite has its OWN pendingSends module instance and cannot see this queue.
+    if (!isTornOut(project.id)) {
+      // `markProjectOpen` BEFORE `selectProject`, never bare. The two are paired at every other seam
+      // (openProjectTab, useReplaceCurrentProject, agentReveal.selectAndOpen) for a reason spelled out
+      // in agentReveal's header: selecting a project whose tab is closed leaves the strip with no tab
+      // for it and every tab reading aria-selected="false" — and it self-heals the WRONG way, since
+      // the next tab close treats a selection with no tab as stale and yanks the user elsewhere
+      // (engine/openProjects.selectionAfterClose). A bare selectProject here was a fourth seam
+      // reintroducing exactly that (roborev 55095).
+      //
+      // ALL THREE OF THESE ARE FOREGROUND-ONLY (knightwatch #1251 probes 1 and 3). A background spawn
+      // takes none of them, and needs none of them: the refusal above has already established that the
+      // project is on screen, which is the whole of the mount gate. Each would otherwise be a visible
+      // change to the human's window made on behalf of a spawn they never asked for —
+      //   * `markProjectOpen` re-opens a tab the human deliberately CLOSED (probe 3),
+      //   * `selectProjectOnItsSide` moves which project they are looking at,
+      //   * `markProjectVisited` writes the human-only, monotonic visited set and thereby publishes the
+      //     project and its prompt snippets to the tray and phone relay for the rest of the session
+      //     (probe 1) — see the refusal above for why that set is not ours to write.
+      if (!background) {
+        markProjectOpen(project.id);
+        // Side-aware (engine/pairs): "the thing you just asked for is what you are now looking at" only
+        // holds if the selection lands in the pair that OWNS the project. For a left-assigned one, a
+        // bare selectProject is reverted by the Workspace's reconcile effect and `leftProjectId` never
+        // moves, so the freshly spawned agent lands off-screen (roborev 55158).
+        selectProjectOnItsSide(project.id);
+        // Visited is the OTHER half of the mount gate: a project selected but never marked is skipped
+        // again as soon as the user navigates elsewhere.
+        markProjectVisited(project.id);
       }
+    }
+    if (background) {
+      // JUST STEP 3 OF `landInAgent` — `open`, the one that "mount[s] that pane / drive[s] the PTY
+      // launch". Its other three steps (leave the special/board view, `selectAgent`,
+      // `requestRevealAgent`) are precisely the attention move a spawn the human did not ask for has
+      // not earned, and its header forbids machine-created agents from calling it at all. Calling
+      // `runtime.open` directly is what services/workerSpawn already does for the same reason; this is
+      // that precedent, not a second one.
+      //
+      // Dropping this instead would not make the spawn quiet — it would make it fictional. No pane ⇒
+      // no launch ⇒ the brief's argv is never emitted, while everything downstream reports success.
+      useRuntimeStore.getState().open(id);
+    } else {
+      landInAgent(project.id, id);
+    }
+    if (opts.prompt) {
+      // ATTACH the brief for the LAUNCH ARGV — do NOT call `appendPrompt`, and no longer
+      // `queuePendingSend` either.
+      //
+      // `appendPrompt` is pure bookkeeping: it moves `lastPrompt` and appends to `promptHistory`, and
+      // writes nothing to the terminal. Seeding it directly would have been strictly WORSE than the
+      // two-step it replaced (roborev 55057): the prompt would never reach claude, while
+      // `engine/newAgentAttention.isBriefless` — which keys off exactly those two fields — would read
+      // the row as briefed. Instead of a false red, the human would get a falsely CALM agent idling
+      // at an empty prompt forever, with the pinned header confidently showing the brief that was
+      // never sent.
+      //
+      // `queuePendingSend` was the previous answer, and it delivered the text but LOST THE SUBMIT on
+      // five of five spawns: it writes into the PTY on `ptyReady`, which fires when `pty_spawn`
+      // returns — before claude's TUI is reading stdin at all. The brief sat at the prompt with the
+      // cursor after it until a human pressed Enter, while the reply said `briefed: true`. The full
+      // measurement, and why an idle-output or fixed-delay heuristic cannot fix it, is in the header
+      // of services/agentBrief.
+      //
+      // `attachBrief` hands it to the pane's launch instead, which emits it as claude's positional
+      // prompt — the same mechanism worker agents have always used, and one claude submits itself at
+      // startup. There is no paste, no carriage return, and so no window in which the submit can be
+      // dropped. The prompt side-effects still happen on the delivery path, once (AgentPane), which is
+      // what keeps the brief atomic *and* real.
+      attachBrief(id, opts.prompt);
+      // PAST THE POINT OF NO RETURN: the pane is mounted and the brief will be claude's argv. From
+      // here a failure is the caller's to hear about, not a reason to unmake a running agent.
+      launched = true;
+    } else {
+      // An empty spawn has no brief to attach, so its pane mounting IS its launch — for the
+      // background flavour too, which takes neither branch below.
+      launched = true;
+      if (!background) {
+        // The caret is the half landInAgent deliberately leaves to the caller, and the EMPTY spawn
+        // has earned it: the next thing the user does is type. A briefed spawn has not — sendToBuild
+        // skips the focus request for exactly this reason, since taking the caret for a composer the
+        // user has nothing to type into steals focus from whatever they were doing.
+        //
+        // Neither has a BACKGROUND spawn, for a stronger reason: nobody is about to type into it. The
+        // uiStore doc restricts this seam to "the user asking for the caret", and an automatic sweep
+        // is by definition not the user asking.
+        useUiStore.getState().requestComposeFocus();
+      }
+    }
+    // Title the bead with the agent's (default) name so beads stay distinguishable on the board rather
+    // than a row of identical placeholders. Best-effort: if the agent is removed within the sub-second
+    // `bd create` window the bead is orphaned, which the Discard/prune flows mop up.
+    const title =
+      useProjectStore
+        .getState()
+        .projects.find((p) => p.id === project.id)
+        ?.agents.find((a) => a.id === id)?.name ?? "Build task";
+    // Labeled `sparkle-auto` so the board can tell app-generated telemetry from beads a human filed —
+    // see AUTO_LABEL. Without it these are indistinguishable from real backlog once the agent is gone.
+    void createBeadFull(project.rootPath, title, "", "task", "", "", AUTO_LABEL)
+      .then((beadId) => useProjectStore.getState().setAgentBeadId(project.id, id, beadId))
+      .catch((e) => {
+        // A project with no beads DB is a normal, supported state (bd is optional) — don't cry WARN on
+        // every build-agent spawn for it; keep only genuine failures loud.
+        if (isBeadsUnavailable(e)) {
+          log.debug("build-agent", "auto-bead skipped: project has no beads database");
+        } else {
+          log.warn("build-agent", "auto-bead creation failed", e);
+        }
+      });
+  } catch (e) {
+    if (!launched) {
+      // NOTHING IS RUNNING YET, so make that true of the store as well and refuse. Returning a
+      // truthy id here would be the worst of the three outcomes: `dispatchOne` would log
+      // "dispatched a driver", hold the lease for its full 90-minute stale window, and never retry —
+      // while the row sits mounted-but-briefless, holding a machine-wide capacity slot that nothing
+      // can even flag as needing attention, because nothing ever briefed it.
+      log.warn("build-agent", "spawn failed before launch; tearing the row back down", {
+        id,
+        error: String(e),
+      });
+      clearBrief(id, "spawn failed before launch");
+      // The trace `perfStart` opened can only be removed by `perfEnd`/`perfCancel`, and neither can
+      // ever fire for a row being torn down — the pane that would call them is never going to exist.
+      // Left behind it is not cosmetic: `openTraceKinds()` is the jank monitor's only attribution
+      // channel on macOS WKWebView and reports every entry still in the map, so each failed spawn
+      // would add a permanent phantom in-flight `spawn` and misattribute every later stall in the
+      // session. `perfCancel` exists for exactly this ("teardown before completion").
+      perfCancel(id);
+      // `open(id)` writes the id into the PERSISTED open set, so removing the row alone would leave
+      // it in localStorage until something happened to run the reconcile prune. Closed first,
+      // because after `removeAgent` there is no row for a reconcile to match it against.
+      useRuntimeStore.getState().close(id);
+      useProjectStore.getState().removeAgent(project.id, id);
+      return null;
+    }
+    // The agent is live and briefed; only the cosmetic tail failed. Unmaking it would be worse.
+    log.warn("build-agent", "post-launch setup failed; the agent is running", {
+      id,
+      error: String(e),
     });
+  }
   return id;
 }
