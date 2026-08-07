@@ -478,12 +478,50 @@ export const DEFAULT_NEAR_CAP: NearCap = {
   tokens7d: Number.MAX_SAFE_INTEGER,
 };
 
+/** Fraction of an account's LEARNED ceiling at which new spawns stop landing on it.
+ *
+ *  This is the ACT line, and it is deliberately a different number from `headroom.WARN_FRACTION`
+ *  (0.8), which is the WARN line. Two stages, one meaning each: at 0.8 the banner tells the human an
+ *  account is getting close; at 0.9 Sparkle stops sending it new work of its own accord. Chosen by
+ *  the founder ("switch later") against the alternative of collapsing both onto 0.8.
+ *
+ *  Why acting on an imperfect estimate is safe HERE specifically: the learned ceiling has a measured
+ *  CoV of 0.24, which `headroom.ts` correctly judged too loose to re-spawn a RUNNING fleet unasked.
+ *  A NEW spawn carries no such risk — it has no conversation to lose, so a wrong guess costs nothing
+ *  beyond starting on a slightly-less-loaded account. That asymmetry is the whole reason the spawn
+ *  path can be automatic while the fleet migration stays gated. */
+export const CEILING_AVOID_FRACTION = 0.9;
+
+/** `tokens5h` as a fraction of this account's learned ceiling, or null when we can't say.
+ *
+ *  Null is a real answer and must never be coerced to 0: an account with too few observed limit
+ *  episodes has `ceiling: null`, and treating that as "0% used" would make an unmeasured account
+ *  look like the emptiest one in the pool and win every pick.
+ *
+ *  Deliberately NOT imported from `headroom.ts`, which computes the same ratio for the banner. That
+ *  module imports VALUES from this one, so importing back would be a runtime cycle on the spawn
+ *  path. `headroom.test.ts` and `accountStore.test.ts` each pin the ratio, and the shared constant
+ *  above is what keeps the two thresholds from drifting. */
+function ceilingFraction(u: Usage, ceiling: number | null | undefined): number | null {
+  if (ceiling == null || ceiling <= 0) return null;
+  return u.tokens5h / ceiling;
+}
+
 export interface PickOptions {
   /** Manual per-agent override. If set and it names an existing account, that account wins
    *  unconditionally (even if exhausted/near-cap/not signed in) — a human chose it on purpose. */
   pinnedAccountId?: string;
   /** Soft window ceilings; defaults to {@link DEFAULT_NEAR_CAP}. */
   nearCap?: NearCap;
+  /** Per-account LEARNED ceilings (Rust `accounts_ceilings`). When supplied, an account at or above
+   *  {@link CEILING_AVOID_FRACTION} of its OWN ceiling is excluded from auto-pick — the proactive
+   *  half of rotation, and the thing that makes a switch happen BEFORE the wall rather than after.
+   *
+   *  Per-account rather than a single global threshold because that is the shape of the truth: two
+   *  accounts learn different ceilings, so a raw token count is not comparable across them. Omitting
+   *  this (or passing ceilings that are all null) leaves selection exactly as it was — lowest raw
+   *  usage, with `exhaustedUntil` as the reactive backstop. */
+  ceilings?: readonly Ceiling[];
   /** Ids of accounts that are actually `claude login`ed (see {@link signedInAccountIds}). When
    *  supplied and at least one listed account matches, auto-pick considers ONLY these. Omit (or pass
    *  a set matching no account) to skip the filter entirely — see the rationale on `pickAccount`. */
@@ -538,11 +576,23 @@ export function pickAccount(
 
   const { eligible, candidates } = partitionAccounts(accounts, usage, opts);
   const usageFor = usageLookup(usage);
+  const ceilingFor = ceilingLookup(opts.ceilings);
+  const now = opts.now ?? Date.now();
 
   if (candidates.length === 0) {
-    // Everyone is exhausted / near-cap: fall back rather than block. Prefer the default account.
-    // eligible is non-empty (accounts is guarded above), so eligible[0] is defined.
-    return eligible.find((a) => a.isDefault) ?? (eligible[0] as Account);
+    // Everyone is exhausted / near-cap: fall back rather than block, because refusing to spawn on an
+    // ESTIMATE would let a mis-learned ceiling halt the fleet.
+    //
+    // Which one, though. This used to prefer the DEFAULT account, and that is precisely backwards
+    // under rotation: the default is the account everything lands on by default, so it is the most
+    // likely to be the one that just ran out — on the machine this was written for, the default
+    // (`DROdio Personal`) was the account carrying an `exhaustedUntil` at the time. Falling back to
+    // it sends the whole fleet at the deadest account in the pool.
+    //
+    // So: LEAST-BAD, ranked by the same evidence used to exclude them. A genuinely rate-limited
+    // account still sorts behind a merely near-cap one, since `exhaustedUntil` is observed fact
+    // while the ceiling is an estimate.
+    return leastBad(eligible, usageFor, ceilingFor, now);
   }
 
   // Lowest 7d tally wins; tie-break on lowest 5h. Stable — equal entries keep input order.
@@ -578,7 +628,7 @@ function partitionAccounts(
   usage: Usage[],
   opts: PickOptions = {},
 ): { eligible: Account[]; candidates: Account[] } {
-  const { nearCap = DEFAULT_NEAR_CAP, signedInIds, now = Date.now() } = opts;
+  const { nearCap = DEFAULT_NEAR_CAP, signedInIds, now = Date.now(), ceilings } = opts;
 
   // Signed-in accounts only — unless that would eliminate everything, in which case we keep the
   // full list so a spawn still happens (better a login prompt than a dead agent).
@@ -587,14 +637,87 @@ function partitionAccounts(
   const eligible = authed.length > 0 ? authed : accounts;
 
   const usageFor = usageLookup(usage);
+  const ceilingFor = ceilingLookup(ceilings);
   const isExhausted = (u: Usage) => u.exhaustedUntil != null && u.exhaustedUntil > now;
-  const isNearCap = (u: Usage) => u.tokens5h >= nearCap.tokens5h || u.tokens7d >= nearCap.tokens7d;
+  // Two independent tests, and an account trips on EITHER.
+  //
+  // The static one is the historical behaviour, still defaulting to no cap at all. The learned one
+  // is the proactive gate: when Rust has enough limit episodes to know this account's ceiling, an
+  // account at >= 90% of it stops receiving new work. An account with no learned ceiling yet reads
+  // null and is simply not judged by it — never treated as 0% and never as 100%.
+  const isNearStaticCap = (u: Usage) =>
+    u.tokens5h >= nearCap.tokens5h || u.tokens7d >= nearCap.tokens7d;
+  const isNearLearnedCeiling = (a: Account, u: Usage) => {
+    const f = ceilingFraction(u, ceilingFor(a));
+    return f != null && f >= CEILING_AVOID_FRACTION;
+  };
 
   const candidates = eligible.filter((a) => {
     const u = usageFor(a);
-    return !isExhausted(u) && !isNearCap(u);
+    return !isExhausted(u) && !isNearStaticCap(u) && !isNearLearnedCeiling(a, u);
   });
   return { eligible, candidates };
+}
+
+/** The best of a bad pool, when every account is exhausted or near its ceiling.
+ *
+ *  Ordered on the strength of the evidence, worst-evidence-last:
+ *   1. NOT currently rate-limited beats currently rate-limited. `exhaustedUntil` is an observed
+ *      failure; the ceiling is an estimate, and an estimate never outranks a fact.
+ *   2. Within a tier, lower fraction-of-own-ceiling wins — the account with the most real room.
+ *   3. An account with no learned ceiling sorts behind every quantified one, ordered among its peers
+ *      by raw 5h usage. Same rule as `headroom.headroomRank`, and for the same reason: "unknown" is
+ *      not evidence of room, so it must not beat a measured 91%.
+ *   4. On an EXACT tie, the default account. This is all that remains of the old rule, and the
+ *      demotion is the point: when the pool is genuinely indistinguishable (every account limited,
+ *      no usage recorded) the default is as good a choice as any, so nothing is gained by changing
+ *      it. What must not happen is the default winning over an account with real headroom, which is
+ *      what the old unconditional preference did.
+ *
+ *  Stable: equal entries keep input order. */
+function leastBad(
+  eligible: Account[],
+  usageFor: (a: Account) => Usage,
+  ceilingFor: (a: Account) => number | null,
+  now: number,
+): Account {
+  const rank = (a: Account): [number, number, number, number] => {
+    const u = usageFor(a);
+    const limited = u.exhaustedUntil != null && u.exhaustedUntil > now ? 1 : 0;
+    const f = ceilingFraction(u, ceilingFor(a));
+    // KNOWN-vs-UNKNOWN IS ITS OWN TIER, not a number folded into the score.
+    //
+    // It was folded in, by mapping unknowns into [1, 2) on the premise that a real fraction "tops
+    // out near 1". That premise is false precisely here (roborev 59923): the ceiling is the MEDIAN
+    // 5h consumption at past limit episodes, so by construction about half of all limit episodes sit
+    // ABOVE it — `f > 1` is the ordinary case in the very fallback this function serves. So a
+    // measured account at 1.2 lost to an unknown one whose only evidence was a low tally, and
+    // `usageLookup` synthesises a ZERO row for an account with no usage entry at all, meaning a
+    // completely unmeasured account could win the fallback outright.
+    //
+    // As separate tiers the documented rule actually holds: every quantified account sorts ahead of
+    // every unquantified one, and raw usage only orders the unquantified among themselves.
+    const known = f != null;
+    return [limited, known ? 0 : 1, known ? f : u.tokens5h, a.isDefault ? 0 : 1];
+  };
+  // eligible is non-empty at every call site (pickAccount guards `accounts.length === 0`).
+  return eligible.reduce((best, a) => {
+    const ra = rank(a);
+    const rb = rank(best);
+    for (let i = 0; i < ra.length; i++) {
+      if (ra[i] !== rb[i]) return (ra[i] as number) < (rb[i] as number) ? a : best;
+    }
+    return best;
+  }, eligible[0] as Account);
+}
+
+/** Learned ceiling per account id. Missing entries and explicit nulls both read as "unknown". */
+function ceilingLookup(
+  ceilings: readonly Ceiling[] | undefined,
+): (a: Account) => number | null {
+  if (!ceilings || ceilings.length === 0) return () => null;
+  const byId = new Map(ceilings.map((c) => [c.id, c.ceiling ?? null]));
+  return (a) => byId.get(a.id) ?? null;
 }
 
 /** The accounts auto-pick would consider RIGHT NOW: signed in, not exhausted, not near a cap.

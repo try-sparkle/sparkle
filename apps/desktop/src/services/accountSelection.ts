@@ -11,6 +11,7 @@ import {
   listAccounts,
   getUsage,
   getIdentities,
+  listCeilings,
   pickAccount,
   eligibleAccounts,
   getPin,
@@ -18,13 +19,20 @@ import {
   type Account,
   type Usage,
   type Identity,
+  type PickOptions,
 } from "./accountStore";
+import type { Ceiling } from "./headroom";
 
 export interface AccountState {
   accounts: Account[];
   usage: Usage[];
   /** Real authenticated identity (email + org) per account id — the trustworthy badge label. */
   identities: Identity[];
+  /** Per-account LEARNED rate-limit ceilings. Feeds the PROACTIVE half of selection: an account at
+   *  or above `CEILING_AVOID_FRACTION` of its own ceiling stops receiving new spawns, so rotation
+   *  happens before the wall instead of after it. Empty means "nothing learned yet", which degrades
+   *  selection to the previous lowest-usage rule rather than to a guess. */
+  ceilings: Ceiling[];
   /** The load did not succeed, so the empty arrays above mean "unknown", NOT "no accounts".
    *
    *  Both cases degrade to the same spawn (no `CLAUDE_CONFIG_DIR`), which is why nothing needed to
@@ -34,7 +42,7 @@ export interface AccountState {
   failed?: boolean;
 }
 
-const EMPTY: AccountState = { accounts: [], usage: [], identities: [], failed: true };
+const EMPTY: AccountState = { accounts: [], usage: [], identities: [], ceilings: [], failed: true };
 
 /** How long a loaded (accounts, usage) snapshot is reused before re-fetching. Short: usage drifts
  *  as agents run, but a few seconds collapses a mount storm into one IPC pair. */
@@ -60,10 +68,18 @@ export async function loadAccountState(opts: { force?: boolean; now?: number } =
   const gen = generation;
   const p = (async () => {
     try {
-      const [accounts, usage, identities] = await Promise.all([
+      const [accounts, usage, identities, ceilings] = await Promise.all([
         listAccounts(),
         getUsage(),
         getIdentities(),
+        // SWALLOWED SEPARATELY, and that asymmetry is deliberate. The other three are load-bearing:
+        // if they fail, the load genuinely failed. Ceilings only ever REFINE the pick — with none,
+        // selection is exactly the lowest-usage rule that shipped before. So a backend that predates
+        // `accounts_ceilings` (or one that rejects it) must degrade to "nothing learned yet", NOT to
+        // `failed: true`, which is a signal `concierge.ts` acts on by discarding its live
+        // conversation pointer. Letting an optional refinement trigger that path would trade a
+        // slightly worse account choice for a lost conversation.
+        listCeilings().catch(() => [] as Ceiling[]),
       ]);
       // Shape-checked, not just error-checked. The `catch` below only covers a REJECTED invoke; a
       // bridge that resolves something that isn't an array (an older/absent command, a non-Tauri
@@ -76,6 +92,9 @@ export async function loadAccountState(opts: { force?: boolean; now?: number } =
         accounts: Array.isArray(accounts) ? accounts : [],
         usage: Array.isArray(usage) ? usage : [],
         identities: Array.isArray(identities) ? identities : [],
+        // Not part of `shapeOk` for the same reason it has its own catch: a malformed ceilings reply
+        // costs us a refinement, not the load.
+        ceilings: Array.isArray(ceilings) ? ceilings : [],
         // A malformed reply is a FAILURE, not an empty account list — same as a rejection below.
         // Without this the coercion above would quietly launder "the bridge is broken" into "you
         // have no accounts", which is precisely the confusion `failed` exists to end.
@@ -139,7 +158,15 @@ export async function chooseAccountForAgent(
   // EXISTING account, so a pin left behind by a deleted account falls through to auto-pick — and
   // without the signed-in filter a never-logged-in config dir wins on its zero usage and strands
   // the job at a login prompt.
-  const base = { signedInIds: signedInAccountIds(state.identities), now: opts.now };
+  // `ceilings` rides in the SHARED base for the same reason `signedInIds` does: both the pinned and
+  // the auto-pick branch read it, and the one time these were built separately the pinned path
+  // silently lost `signedInIds` and re-opened sparkle-gms0. A pin still overrides everything —
+  // `pickAccount` honours it even for a near-cap account, because a human chose it on purpose.
+  const base = {
+    signedInIds: signedInAccountIds(state.identities),
+    now: opts.now,
+    ceilings: state.ceilings,
+  };
   // A pin only counts if it still names a REAL account. Branching on the pin's mere presence let a
   // STALE pin — one left behind by a deleted account — bypass everything below it: `pickAccount`
   // ignores an unmatched `pinnedAccountId` and falls through to plain lowest-usage auto-pick, so a
@@ -158,20 +185,39 @@ export async function chooseAccountForAgent(
   return { chosen, state };
 }
 
-/** Auto-pick for `agentId` — sticky for the keys that need it, plain `pickAccount` otherwise. */
-function autoPick(
-  agentId: string,
-  state: AccountState,
-  base: { signedInIds: string[]; now?: number },
-): Account | null {
+/** Auto-pick for `agentId` — sticky for the keys that need it, plain `pickAccount` otherwise.
+ *
+ *  `base` is typed as the full `PickOptions` on purpose. It was once narrowed to the two fields this
+ *  function reads, which typechecked cleanly while silently dropping `ceilings` for anyone who
+ *  rebuilt it from its declared type — the same drift that lost `signedInIds` and re-opened
+ *  sparkle-gms0, one level up (roborev 59923). */
+function autoPick(agentId: string, state: AccountState, base: PickOptions): Account | null {
   if (!isStickyAccountKey(agentId)) return pickAccount(state.accounts, state.usage, base);
   const previousId = stickySelections.get(agentId);
   if (previousId) {
-    const stillHealthy = eligibleAccounts(state.accounts, state.usage, base).find(
+    // THE LEARNED CEILING DOES NOT GET A VOTE ON KEEPING AN ACCOUNT — only on choosing one.
+    //
+    // This asymmetry is the whole point, and getting it wrong is a live conversation. The safety
+    // argument for acting on an estimate is that a FRESH spawn has nothing to lose. That does not
+    // hold here: the concierge resolves this key once per TURN, and a changed answer runs
+    // `rebindSessionToAccount`, which nulls both session pointers and re-probes. An ordinary turn
+    // self-heals into a fresh session (visible, survivable). A PROACTIVE push does not — it has no
+    // stale-resume retry by design, so a resume aimed at the old account's tree just dies silently,
+    // and nobody asked for that push, so nobody notices it is missing.
+    //
+    // So a sticky key moves only on `exhaustedUntil` — an OBSERVED rate limit, which is fact rather
+    // than estimate, and which is exactly what moved it before this gate existed. That is strictly
+    // no worse than the previous behaviour for these two consumers, while fresh spawns still rotate
+    // proactively, which is where the fleet-wide win actually is.
+    const keepOpts: PickOptions = { ...base, ceilings: undefined };
+    const stillHealthy = eligibleAccounts(state.accounts, state.usage, keepOpts).find(
       (a) => a.id === previousId,
     );
     if (stillHealthy) return stillHealthy;
   }
+  // FIRST pick for this key (or its previous account just hit a real limit): the ceilings DO apply.
+  // There is no conversation to strand yet, so this is the fresh-spawn case and gets the fresh-spawn
+  // rule — a sticky key should not settle onto an account that is already nearly spent.
   const chosen = pickAccount(state.accounts, state.usage, base);
   if (chosen) stickySelections.set(agentId, chosen.id);
   return chosen;

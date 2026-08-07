@@ -140,6 +140,91 @@ describe("pickAccount", () => {
     expect(pickAccount(accounts, u, { now: NOW, pinnedAccountId: "ghost" })?.id).toBe("b");
   });
 
+  it("skips an account at/above CEILING_AVOID_FRACTION of its OWN learned ceiling", () => {
+    const accounts = [acct("hot"), acct("cool")];
+    // hot has FEWER tokens than cool and would win the lowest-usage rule outright. It is excluded
+    // only because 90 against a learned ceiling of 100 is 0.90 — the act line. This is the whole
+    // proactive mechanism, and the fixture is built so raw usage points the other way.
+    const u = [usage("hot", { tokens5h: 90, tokens7d: 90 }), usage("cool", { tokens5h: 200, tokens7d: 200 })];
+    const ceilings = [
+      { id: "hot", samples: [100], ceiling: 100 },
+      { id: "cool", samples: [1000], ceiling: 1000 }, // 0.2 — plenty of room
+    ];
+    expect(pickAccount(accounts, u, { now: NOW, ceilings })?.id).toBe("cool");
+    // Withhold the ceilings and the old rule reasserts itself, which is what proves the assertion
+    // above is caused by the ceiling and not by something incidental to the fixture.
+    expect(pickAccount(accounts, u, { now: NOW })?.id).toBe("hot");
+  });
+
+  it("treats an unlearned ceiling as unknown, never as zero", () => {
+    // A null ceiling must not read as "0 tokens used, infinite room" — that would make an account
+    // Sparkle knows nothing about beat one it has measured as healthy, on every single pick.
+    const accounts = [acct("known"), acct("unlearned")];
+    const u = [usage("known", { tokens5h: 10, tokens7d: 10 }), usage("unlearned", { tokens5h: 500, tokens7d: 500 })];
+    const ceilings = [
+      { id: "known", samples: [1000], ceiling: 1000 },
+      { id: "unlearned", samples: [], ceiling: null },
+    ];
+    // Neither is near a cap, so ordinary lowest-usage ranking applies and the null changes nothing.
+    expect(pickAccount(accounts, u, { now: NOW, ceilings })?.id).toBe("known");
+  });
+
+  it("honours a pin even when the pinned account is over its learned ceiling", () => {
+    // A human choosing an account on purpose outranks an estimate. Pinned selection must not quietly
+    // acquire the proactive gate — that would make a deliberate choice un-actionable.
+    const accounts = [acct("hot"), acct("cool")];
+    const u = [usage("hot", { tokens5h: 99 }), usage("cool", { tokens5h: 1 })];
+    const ceilings = [{ id: "hot", samples: [100], ceiling: 100 }];
+    expect(pickAccount(accounts, u, { now: NOW, ceilings, pinnedAccountId: "hot" })?.id).toBe("hot");
+  });
+
+  it("prefers a MEASURED account over an unmeasured one in the fallback, even at f > 1", () => {
+    // The tier this pins is the one the other fallback tests structurally cannot reach: they give
+    // BOTH accounts a learned ceiling or NEITHER, so known-vs-unknown is equal in both and reverting
+    // `leastBad` to its old folded score `f ?? 1 + tokens5h/(tokens5h+1)` leaves them all green
+    // (roborev 59940). That is the vacuity shape, sitting on the very assertion the re-tiering was
+    // written for.
+    //
+    // Why f > 1 is the ordinary case and not an exotic one: the ceiling is the MEDIAN 5h consumption
+    // at past limit episodes, so by construction about half of all episodes sit ABOVE it. Under the
+    // old scoring a measured account at 1.2 lost to an unmeasured one scoring 1.0 — and an account
+    // with no usage row at all gets a synthesized ZERO from `usageLookup`, so the least-known
+    // account in the pool could win the fallback outright.
+    //
+    // Both accounts are exhausted so the pool is empty and the fallback runs, and so that the
+    // limited tier is EQUAL — otherwise the assertion would pass on tier 1 without ever consulting
+    // the known/unknown tier this test exists for.
+    const accounts = [acct("known"), acct("unknown", { isDefault: true })];
+    const u = [
+      usage("known", { tokens5h: 120, exhaustedUntil: NOW + 60_000 }),
+      usage("unknown", { tokens5h: 0, exhaustedUntil: NOW + 60_000 }),
+    ];
+    const ceilings = [{ id: "known", samples: [100], ceiling: 100 }]; // f = 1.2; `unknown` has none
+    // `unknown` is ALSO the default, so the isDefault tie-break would hand it the win if the tiers
+    // above it ever compared equal. `known` winning can therefore only come from the known/unknown
+    // tier — which is exactly the discrimination being pinned.
+    expect(pickAccount(accounts, u, { now: NOW, ceilings })?.id).toBe("known");
+  });
+
+  it("falls back to the LEAST-BAD account, not the default, when the default is the dead one", () => {
+    // The shape observed on the real machine: the default account is the one everything lands on, so
+    // it is the one that runs out first. `DROdio Personal` was both `isDefault` and the account
+    // carrying an `exhaustedUntil` when the fleet stalled. An unconditional default-preference sends
+    // every new agent at exactly that account.
+    const accounts = [acct("dead", { isDefault: true }), acct("tired")];
+    const u = [
+      usage("dead", { tokens5h: 100, exhaustedUntil: NOW + 60_000 }), // observed rate limit
+      usage("tired", { tokens5h: 95 }), // merely near its ceiling — no observed failure
+    ];
+    const ceilings = [
+      { id: "dead", samples: [100], ceiling: 100 },
+      { id: "tired", samples: [100], ceiling: 100 }, // 0.95 → excluded, but not LIMITED
+    ];
+    // Both are excluded from `candidates`, so this exercises the fallback. An observed limit is fact
+    // and a ceiling is an estimate, so the un-limited account wins despite both being over the line.
+    expect(pickAccount(accounts, u, { now: NOW, ceilings })?.id).toBe("tired");
+  });
+
   it("falls back to the DEFAULT account when all are excluded", () => {
     const accounts = [acct("a"), acct("b", { isDefault: true }), acct("c")];
     const u = [

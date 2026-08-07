@@ -29,12 +29,13 @@ function mockBackend() {
     if (cmd === "accounts_list") return Promise.resolve(ACCOUNTS);
     if (cmd === "accounts_usage") return Promise.resolve([]); // no usage rows → all zero headroom
     if (cmd === "accounts_identities") return Promise.resolve([]); // no identities → nickname fallback
+    if (cmd === "accounts_ceilings") return Promise.resolve([]); // nothing learned → lowest-usage rule
     return Promise.reject(new Error(`unexpected command ${cmd}`));
   });
 }
 
-// listAccounts + getUsage + getIdentities fire together per (uncached) load.
-const CALLS_PER_LOAD = 3;
+// listAccounts + getUsage + getIdentities + listCeilings fire together per (uncached) load.
+const CALLS_PER_LOAD = 4;
 
 describe("accountSelection cache", () => {
   beforeEach(() => {
@@ -395,5 +396,140 @@ describe("accountSelection cache", () => {
     const { chosen, state } = await chooseAccountForAgent("agent-x", { now: 6_000_000 });
     expect(chosen).toBeNull();
     expect(state.accounts).toEqual([]);
+  });
+});
+
+// ── PROACTIVE rotation: the spawn path avoids an account approaching its LEARNED ceiling ────────
+//
+// The founder's ask, verbatim: "switch login accounts BEFORE the session limit hits."
+//
+// Before this, the ONLY thing that removed an account from auto-pick was `exhaustedUntil` — set
+// after a real rate-limit message is observed, i.e. AFTER the wall. `PickOptions.nearCap` existed
+// but `DEFAULT_NEAR_CAP` is MAX_SAFE_INTEGER on both windows and no production caller ever passed
+// one, so the near-cap branch was dead code in production.
+//
+// WHY THE FIXTURE LOOKS BACKWARDS, and why it must: `hot` has the LOWEST raw usage of the two, so
+// today's lowest-usage rule picks it — while it sits at 90% of its own learned ceiling and `cool`
+// sits at 20% of a ceiling ten times larger. That is the real shape (accounts learn different
+// ceilings), and it is what makes this test non-vacuous: a fixture where the near-limit account
+// also had the most tokens would pass against unchanged code, proving nothing.
+describe("proactive rotation on the spawn path", () => {
+  // hot: 90/100 of its learned ceiling = 0.90 — at the ACT line, and the lowest raw tally.
+  // cool: 200/1000 = 0.20 — more tokens, far more room.
+  const ROT_ACCOUNTS = [
+    { id: "hot", nickname: "Hot", configDir: "/data/accounts/hot", isDefault: true, createdAt: 1 },
+    { id: "cool", nickname: "Cool", configDir: "/data/accounts/cool", isDefault: false, createdAt: 2 },
+  ];
+  const ROT_USAGE = [
+    { id: "hot", tokens5h: 90, tokens7d: 90, exhaustedUntil: null },
+    { id: "cool", tokens5h: 200, tokens7d: 200, exhaustedUntil: null },
+  ];
+  const ROT_CEILINGS = [
+    { id: "hot", samples: [98, 100, 102], ceiling: 100 },
+    { id: "cool", samples: [990, 1000, 1010], ceiling: 1000 },
+  ];
+  const ROT_IDENTITIES = [
+    { id: "hot", email: "hot@example.com", organization: null, accountUuid: "uuid-hot" },
+    { id: "cool", email: "cool@example.com", organization: null, accountUuid: "uuid-cool" },
+  ];
+
+  beforeEach(() => {
+    invoke.mockReset();
+    invalidateAccountState();
+    resetStickyAccounts();
+    clearAllPins();
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "accounts_list") return Promise.resolve(ROT_ACCOUNTS);
+      if (cmd === "accounts_usage") return Promise.resolve(ROT_USAGE);
+      if (cmd === "accounts_identities") return Promise.resolve(ROT_IDENTITIES);
+      if (cmd === "accounts_ceilings") return Promise.resolve(ROT_CEILINGS);
+      return Promise.reject(new Error(`unexpected command ${cmd}`));
+    });
+  });
+
+  it("resolves the NEXT spawn to a different account's config dir, with no human acting", async () => {
+    // The goal, stated as an assertion: an account approaching its limit does not get the next
+    // agent. Nothing here clicks a banner, accepts a recommendation, or sets a pin.
+    const dir = await accountConfigDirFor("agent-next", { now: 7_000_000 });
+    expect(dir).toBe("/data/accounts/cool");
+  });
+
+  it("does NOT move a STICKY key off its account on the ESTIMATE alone", async () => {
+    // The inverse of the test above, and the more important of the two. An earlier revision of this
+    // change let the ceiling gate reach the sticky "is my previous account still healthy?" check,
+    // which reads as a free win and is not one: the concierge resolves this key once per TURN, and a
+    // changed answer runs `rebindSessionToAccount` — both session pointers nulled, conversation
+    // re-probed. An ordinary turn self-heals into a fresh session; a PROACTIVE push has no
+    // stale-resume retry by design, so it dies silently and nobody notices, because nobody asked for
+    // it. A 0.9 estimate is not enough evidence to spend a live conversation on.
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "accounts_list") return Promise.resolve(ROT_ACCOUNTS);
+      if (cmd === "accounts_usage") return Promise.resolve(ROT_USAGE);
+      if (cmd === "accounts_identities") return Promise.resolve(ROT_IDENTITIES);
+      if (cmd === "accounts_ceilings") return Promise.resolve([]);
+      return Promise.reject(new Error(`unexpected command ${cmd}`));
+    });
+    // Settles on `hot` while nothing is known.
+    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: 7_200_000 })).toBe(
+      "/data/accounts/hot",
+    );
+
+    // `hot` is now measured at 0.90 of its ceiling. The sticky key STAYS — an estimate may not
+    // abandon a conversation.
+    invalidateAccountState();
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "accounts_list") return Promise.resolve(ROT_ACCOUNTS);
+      if (cmd === "accounts_usage") return Promise.resolve(ROT_USAGE);
+      if (cmd === "accounts_identities") return Promise.resolve(ROT_IDENTITIES);
+      if (cmd === "accounts_ceilings") return Promise.resolve(ROT_CEILINGS);
+      return Promise.reject(new Error(`unexpected command ${cmd}`));
+    });
+    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: 7_300_000 })).toBe(
+      "/data/accounts/hot",
+    );
+
+    // But an OBSERVED rate limit is fact, not estimate, and still moves it — the pre-existing
+    // behaviour this change must not weaken. Without this half the test above would be satisfied by
+    // a sticky key that never moves at all.
+    invalidateAccountState();
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "accounts_list") return Promise.resolve(ROT_ACCOUNTS);
+      if (cmd === "accounts_usage")
+        return Promise.resolve([
+          { id: "hot", tokens5h: 90, tokens7d: 90, exhaustedUntil: 7_400_000 / 1000 + 600 },
+          { id: "cool", tokens5h: 200, tokens7d: 200, exhaustedUntil: null },
+        ]);
+      if (cmd === "accounts_identities") return Promise.resolve(ROT_IDENTITIES);
+      if (cmd === "accounts_ceilings") return Promise.resolve(ROT_CEILINGS);
+      return Promise.reject(new Error(`unexpected command ${cmd}`));
+    });
+    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: 7_400_000 })).toBe(
+      "/data/accounts/cool",
+    );
+  });
+
+  it("applies the ceiling to a sticky key's FIRST pick, where no conversation exists yet", async () => {
+    // The other half of the asymmetry: ceilings may not END a sticky selection, but they must inform
+    // one that hasn't been made. Settling a fresh concierge onto an account that is already nearly
+    // spent would just move the problem to its first turn.
+    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: 7_500_000 })).toBe(
+      "/data/accounts/cool",
+    );
+  });
+
+  it("would have picked the near-limit account under the lowest-usage rule alone", async () => {
+    // Pins the fixture's own premise, so this suite can never quietly become vacuous: with the
+    // ceilings withheld, `hot` (the lower raw tally) still wins. If a future refactor makes `cool`
+    // win for some unrelated reason, THIS test fails and tells you the one above stopped proving
+    // anything.
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "accounts_list") return Promise.resolve(ROT_ACCOUNTS);
+      if (cmd === "accounts_usage") return Promise.resolve(ROT_USAGE);
+      if (cmd === "accounts_identities") return Promise.resolve(ROT_IDENTITIES);
+      if (cmd === "accounts_ceilings") return Promise.resolve([]); // no learned ceilings yet
+      return Promise.reject(new Error(`unexpected command ${cmd}`));
+    });
+    const dir = await accountConfigDirFor("agent-next", { now: 7_100_000 });
+    expect(dir).toBe("/data/accounts/hot");
   });
 });
