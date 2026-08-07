@@ -167,10 +167,14 @@ describe("screenOffersAnswer — a LIVE picker under Claude's real chrome tail",
     // keep its cursor, arm 2 would answer, and this case would go on passing while asserting
     // nothing about the below-footer walk. That is the same silent-degradation hole this whole
     // commit exists to close, so the premise is ASSERTED rather than assumed.
+    // Asserted on the COMPOSED screen, not on `cursorless` alone. Arm 2 reads the BOTTOM of what
+    // is actually passed in — which is the derived tail, now free to change on the next re-capture.
+    // A capture ending in a cursored numbered row would let arm 2 supply the `true` while a premise
+    // checked against `cursorless` looked away. Holds today only because the composer caret has no
+    // `N.` after it, so this costs nothing and removes the blind spot.
     const cursorless = APPROVAL_2_1_220.replace(/[❯›]/g, " ");
-    expect(SELECTION_CURSOR.test(cursorless)).toBe(false);
-    expect(
-      screenOffersAnswer(`${cursorless}\n${PERSISTENT_CHROME_TAIL_2_1_220}`),
-    ).toBe(true);
+    const screen = `${cursorless}\n${PERSISTENT_CHROME_TAIL_2_1_220}`;
+    expect(SELECTION_CURSOR.test(screen)).toBe(false);
+    expect(screenOffersAnswer(screen)).toBe(true);
   });
 });
