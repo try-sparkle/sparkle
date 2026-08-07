@@ -133,20 +133,46 @@ export function diagnoseStale(root: string): Promise<StaleDiagnosis> {
  * real outcome instead of being told nothing happened — the two callers want the same answer, and
  * a silent skip would leave the panel's row spinning forever.
  */
-const inFlight = new Map<string, Promise<RemedyOutcome>>();
+const inFlight = new Map<string, { unattended: boolean; p: Promise<RemedyOutcome> }>();
 
 /** Apply whatever remedy the diagnosis named. Rejects on an IPC failure; a git refusal comes back as
  *  a resolved `{ ok: false, reason }` so the panel can show git's own words rather than a toast.
- *  Concurrent calls for the SAME root share one invocation — see `inFlight`. */
-export function remedyStale(root: string): Promise<RemedyOutcome> {
+ *  Concurrent calls for the SAME root share one invocation — see `inFlight`.
+ *
+ *  `unattended` is the POLICY, not a hint: the backend re-diagnoses and acts on its own fresh
+ *  reading, so it is the only thing that stops the background poll from taking an action that
+ *  stopped being automatic in the meantime. Omitting it means "a human clicked". */
+export function remedyStale(
+  root: string,
+  { unattended = false }: { unattended?: boolean } = {},
+): Promise<RemedyOutcome> {
   const running = inFlight.get(root);
-  if (running) return running;
-  const p = invoke<RemedyOutcome>("repo_stale_remedy", { root }).finally(() => {
+  // SHARING IS NOT SYMMETRIC. An unattended caller may ride on any run — a click is strictly more
+  // permissive, and its outcome is a real answer to "is this checkout advanced now". A CLICK must
+  // never inherit an unattended REFUSAL: that run declines anything not `auto_safe`, so the user
+  // would read their own deliberate press as a failure of a remedy the panel had just offered them.
+  if (running && (unattended || !running.unattended)) return running.p;
+  // A click arriving mid-poll waits that poll out rather than racing it — two `merge --ff-only`
+  // processes on one root is the thing this map exists to prevent.
+  //
+  // …and it takes its own turn ONLY if that poll did not already do the job. THE REFUSAL IS THE
+  // THING A CLICK MUST NOT INHERIT, not the run: a SUCCEEDED poll advanced this checkout, which is
+  // exactly what the button asked for, so it is the click's answer too. Re-running there would
+  // re-diagnose a checkout that is now up to date, get `StaleRemedy::None` back as `ok:false`
+  // ("up to date with origin/main"), and the panel paints every `!ok` outcome in its DANGER colour
+  // — a red refusal for a fast-forward that had just succeeded, which is the exact failure this
+  // map was written to prevent (roborev 59437).
+  if (running)
+    return running.p.then(
+      (out) => (out.ok ? out : remedyStale(root)),
+      () => remedyStale(root),
+    );
+  const p = invoke<RemedyOutcome>("repo_stale_remedy", { root, unattended }).finally(() => {
     // Cleared unconditionally, including on rejection — a root left in the map would be
     // permanently unfixable for the rest of the session.
     inFlight.delete(root);
   });
-  inFlight.set(root, p);
+  inFlight.set(root, { unattended, p });
   return p;
 }
 

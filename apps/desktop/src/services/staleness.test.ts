@@ -24,17 +24,92 @@ describe("remedyStale coalesces per checkout", () => {
     let settle!: (v: unknown) => void;
     invoke.mockReturnValue(new Promise((r) => (settle = r)));
 
-    // The poll's auto-fix and the panel's click, overlapping — the real race.
-    const fromPoll = remedyStale("/repos/sparkle");
-    const fromClick = remedyStale("/repos/sparkle");
+    // Two clicks — the panel's bulk run and a per-row press, overlapping.
+    const first = remedyStale("/repos/sparkle");
+    const second = remedyStale("/repos/sparkle");
 
     expect(invoke).toHaveBeenCalledTimes(1);
 
     settle(OK);
     // The late caller gets the WINNER'S real outcome, not a silent skip — a skip would leave the
     // panel's row spinning forever with nothing to render.
+    await expect(first).resolves.toEqual(OK);
+    await expect(second).resolves.toEqual(OK);
+  });
+
+  // ── SHARING IS NOT SYMMETRIC ──────────────────────────────────────────────────────────────────
+  //
+  // Coalescing two callers onto one invocation also merges their POLICIES, and the two policies are
+  // not interchangeable: an unattended run refuses anything that is not still `auto_safe`. So the
+  // direction matters, and each direction is wrong in a different way if collapsed.
+  it("lets the POLL ride on a click's run — a click is strictly more permissive", async () => {
+    let settle!: (v: unknown) => void;
+    invoke.mockReturnValue(new Promise((r) => (settle = r)));
+
+    const fromClick = remedyStale("/repos/sparkle");
+    const fromPoll = remedyStale("/repos/sparkle", { unattended: true });
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledWith("repo_stale_remedy", {
+      root: "/repos/sparkle",
+      unattended: false,
+    });
+
+    settle(OK);
+    await expect(fromClick).resolves.toEqual(OK);
+    // A real answer to "is this checkout advanced now", which is all the poll wanted.
+    await expect(fromPoll).resolves.toEqual(OK);
+  });
+
+  // …AND THE OTHER ORDERING OF THE SAME RACE. The asymmetry is about the poll's REFUSAL, not about
+  // the poll's run: when the poll SUCCEEDED there is nothing left for the click to do, and making
+  // it take its own turn anyway is how the original bug comes back.
+  it("lets a click ride on a poll that SUCCEEDED — the checkout is advanced, which is the answer", async () => {
+    let settle!: (v: unknown) => void;
+    invoke.mockReturnValue(new Promise((r) => (settle = r)));
+
+    const fromPoll = remedyStale("/repos/sparkle", { unattended: true });
+    const fromClick = remedyStale("/repos/sparkle");
+
+    settle(OK);
     await expect(fromPoll).resolves.toEqual(OK);
     await expect(fromClick).resolves.toEqual(OK);
+    // THE POINT, and it is the call COUNT that carries it. A second `repo_stale_remedy` would
+    // re-diagnose a checkout the poll had just brought up to date, come back `remedy: None` →
+    // `ok:false` "up to date with origin/main", and the panel renders every `!ok` outcome in its
+    // danger colour: a red refusal for a fast-forward that worked (roborev 59437).
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it("does NOT let a click ride on the poll's REFUSAL — it would report their press as a failure", async () => {
+    // The poll's invocation refuses: by the time it reached the backend the tree was dirty, which
+    // is exactly the case the unattended policy exists to stop.
+    const REFUSED = { ok: false, reason: "dirty", action: "", beforeBehind: 3, afterBehind: 3 };
+    invoke.mockResolvedValueOnce(REFUSED).mockResolvedValueOnce(OK);
+
+    const fromPoll = remedyStale("/repos/sparkle", { unattended: true });
+    const fromClick = remedyStale("/repos/sparkle");
+
+    await expect(fromPoll).resolves.toEqual(REFUSED);
+    // The user pressed a button the panel had just offered them. Handing them the poll's refusal
+    // would report their own deliberate act as a failure of a remedy that is theirs to take.
+    await expect(fromClick).resolves.toEqual(OK);
+    expect(invoke).toHaveBeenCalledTimes(2);
+    // …and it waited rather than racing: two `merge --ff-only` on one root is what this map exists
+    // to prevent, so the click's call is issued only after the poll's has settled.
+    expect(invoke.mock.calls[1]).toEqual([
+      "repo_stale_remedy",
+      { root: "/repos/sparkle", unattended: false },
+    ]);
+  });
+
+  it("carries the unattended flag to the backend, since that is where it is enforced", async () => {
+    invoke.mockResolvedValue(OK);
+    await remedyStale("/repos/sparkle", { unattended: true });
+    expect(invoke).toHaveBeenCalledWith("repo_stale_remedy", {
+      root: "/repos/sparkle",
+      unattended: true,
+    });
   });
 
   it("does NOT coalesce across different checkouts", async () => {

@@ -20,11 +20,14 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import type { RemedyOutcome, StaleDiagnosis } from "../services/staleness";
 
 const diagnoseStale = vi.fn<(root: string) => Promise<StaleDiagnosis>>();
-const remedyStale = vi.fn<(root: string) => Promise<RemedyOutcome>>();
+const remedyStale =
+  vi.fn<(root: string, opts?: { unattended?: boolean }) => Promise<RemedyOutcome>>();
 
 vi.mock("../services/staleness", () => ({
   diagnoseStale: (root: string) => diagnoseStale(root),
-  remedyStale: (root: string) => remedyStale(root),
+  // FORWARD EVERY ARGUMENT. A wrapper that names only `root` silently drops the options object, so
+  // a panel that started passing a policy would keep this whole suite green while sending nothing.
+  remedyStale: (...a: Parameters<typeof remedyStale>) => remedyStale(...a),
   autoFastForwardEnabled: () => Promise.resolve(false),
 }));
 

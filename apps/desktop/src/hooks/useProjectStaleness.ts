@@ -122,7 +122,13 @@ export function useProjectStaleness(
             // is the one thing this feature is not allowed to do.
             if (!d.autoSafe) return;
             if (!(await autoFastForwardEnabled(t.rootPath))) return;
-            const out = await remedyStale(t.rootPath);
+            // …AND THE GUARD AGAIN, DOWN WHERE IT IS DECIDED. The check above reads a diagnosis that
+            // is already at least one `await` old by the time the merge runs, and `remedy_at`
+            // deliberately ignores it and re-classifies. So the reading that MATTERS is the backend's
+            // own, and `unattended` is what makes it apply this same rule to it. Not belt-and-braces:
+            // without the flag a tree that went dirty in this window is re-classified as
+            // `FastForwardDirty` and merged by a timer (knightwatch 5207191879#1, 5209038072#1).
+            const out = await remedyStale(t.rootPath, { unattended: true });
             if (!out.ok || cancelled) return;
             // Re-read through the SAME fail-closed mapping rather than patching the entry by hand,
             // so a post-remedy reading can no more produce a bogus badge than the first one could.

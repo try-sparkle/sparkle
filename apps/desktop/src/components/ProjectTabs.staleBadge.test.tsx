@@ -24,7 +24,8 @@ const remedyStale = vi.fn();
 // BADGE (its tooltip, its click, its keyboard), not about what the panel does with the answer.
 vi.mock("../services/staleness", () => ({
   diagnoseStale: (root: string) => diagnoseStale(root),
-  remedyStale: (root: string) => remedyStale(root),
+  // FORWARD EVERY ARGUMENT — naming only `root` drops the options object a caller may pass.
+  remedyStale: (...a: unknown[]) => remedyStale(...a),
   autoFastForwardEnabled: () => Promise.resolve(false),
 }));
 

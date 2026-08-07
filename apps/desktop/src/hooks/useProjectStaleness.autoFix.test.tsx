@@ -26,7 +26,10 @@ const autoFastForwardEnabled = vi.fn<(root: string) => Promise<boolean>>();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invoke(...a) }));
 vi.mock("../services/staleness", () => ({
   diagnoseStale: (root: string) => diagnoseStale(root),
-  remedyStale: (root: string) => remedyStale(root),
+  // FORWARD EVERY ARGUMENT. This used to be `(root: string) => remedyStale(root)`, which silently
+  // dropped the options object — so the unattended policy could not be asserted here at all, and a
+  // hook that stopped passing it would have kept this suite green.
+  remedyStale: (...a: unknown[]) => remedyStale(...a),
   autoFastForwardEnabled: (root: string) => autoFastForwardEnabled(root),
 }));
 
@@ -94,7 +97,13 @@ describe("unattended fast-forward", () => {
 
     render(<Harness targets={[{ id: "sparkle", rootPath: "/repos/sparkle" }]} />);
 
-    await waitFor(() => expect(remedyStale).toHaveBeenCalledWith("/repos/sparkle"));
+    // WITH THE UNATTENDED POLICY, not merely with the root. The `autoSafe` check above this call is
+    // already at least one await old by the time the merge runs, and `remedy_at` re-classifies and
+    // acts on its OWN fresh reading — so this flag is the only thing that applies the automation
+    // rule to the reading that actually decides (knightwatch 5207191879#1, 5209038072#1).
+    await waitFor(() =>
+      expect(remedyStale).toHaveBeenCalledWith("/repos/sparkle", { unattended: true }),
+    );
   });
 
   // ── THE GUARD ─────────────────────────────────────────────────────────────────────────────────

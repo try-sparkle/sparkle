@@ -470,7 +470,15 @@ fn behind_after(root: &str, default_branch: &str, threshold: u32, fallback: u32)
 /// Re-diagnoses first and acts on THAT reading, never on one handed in. The panel may have sat open
 /// for minutes while the fleet committed, merged and fetched underneath it, and acting on a stale
 /// diagnosis is exactly how a "safe" fast-forward becomes a surprise.
-pub fn remedy_at(root: &str, default_branch: &str, threshold: u32) -> RemedyOutcome {
+///
+/// `unattended` is the CALLER'S POLICY, and it exists because the re-diagnosis above is the very
+/// thing that makes it necessary. See the guard below.
+pub fn remedy_at(
+    root: &str,
+    default_branch: &str,
+    threshold: u32,
+    unattended: bool,
+) -> RemedyOutcome {
     let d = diagnose_at(root, default_branch, threshold);
     let before = d.behind;
     let refuse = |reason: String| RemedyOutcome {
@@ -481,6 +489,22 @@ pub fn remedy_at(root: &str, default_branch: &str, threshold: u32) -> RemedyOutc
         after_behind: before,
     };
     let ff = format!("merge --ff-only {}", d.base);
+
+    // AN UNATTENDED CALL GETS ONLY THE PROVABLY-SAFE SHAPE, judged on THIS reading.
+    //
+    // The timer checks `auto_safe` before it calls, but that answer is older than this one by a
+    // diagnosis and a config round trip — and this function deliberately ignores what it was handed
+    // and re-classifies. So the fresh verdict can be `FastForwardDirty`, which the automation rule
+    // states is offerable on a click and NEVER automatic, and the merge would run anyway because
+    // nothing down here knew no human was watching. That is a timer writing to a tree the user had
+    // just started editing (knightwatch 5207191879#1, 5209038072#1).
+    //
+    // Checked against `auto_safe` rather than the remedy kind so this cannot drift from the rule:
+    // `auto_safe` is the one definition of "cannot possibly lose anything", and it already means
+    // clean + on the default branch + a strict ancestor.
+    if unattended && !d.auto_safe {
+        return refuse(d.cause.clone());
+    }
 
     match d.remedy {
         // Verdicts, not buttons. `cause` already says why in one sentence, so say exactly that
@@ -548,11 +572,18 @@ pub async fn repo_stale_diagnose(root: String) -> Result<StaleDiagnosis, String>
 
 /// Apply the safe remedy for a stale project root — or refuse, and say why.
 #[tauri::command]
-pub async fn repo_stale_remedy(root: String) -> Result<RemedyOutcome, String> {
+pub async fn repo_stale_remedy(
+    root: String,
+    // Absent or false = a click. True = the background poll, which may only ever advance a checkout
+    // that is STILL `auto_safe` on the re-diagnosis inside `remedy_at`. `Option` so an older
+    // frontend (or any caller that omits it) gets the CLICK policy — the safe default is the one
+    // that refuses nothing the user asked for; the unattended path has to opt IN to the restriction.
+    unattended: Option<bool>,
+) -> Result<RemedyOutcome, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let threshold = crate::config::for_project(&root).config.freshness.staleness_warn_commits;
         let default_branch = crate::worktree::resolve_default_branch(&root);
-        remedy_at(&root, &default_branch, threshold)
+        remedy_at(&root, &default_branch, threshold, unattended.unwrap_or(false))
     })
     .await
     .map_err(|e| format!("repo_stale_remedy: {e}"))
@@ -883,7 +914,7 @@ mod tests {
 
         // And the remedy REFUSES rather than half-landing a branch claim.
         let before = git(&root, &["rev-parse", "HEAD"]).unwrap();
-        let out = remedy_at(&root, "main", 25);
+        let out = remedy_at(&root, "main", 25, false);
         assert!(!out.ok, "a detached checkout is never advanced from here");
         assert_eq!(out.action, "", "nothing was run");
         assert_eq!(git(&root, &["rev-parse", "HEAD"]).unwrap(), before, "HEAD must not move");
@@ -935,7 +966,7 @@ mod tests {
         assert!(!d.auto_safe);
 
         let before = git(&root, &["rev-parse", "HEAD"]).unwrap();
-        let out = remedy_at(&root, "main", 25);
+        let out = remedy_at(&root, "main", 25, false);
         assert!(!out.ok, "must refuse rather than lose the local commit");
         assert_eq!(out.action, "", "a refusal runs NOTHING");
         assert_eq!(out.after_behind, out.before_behind);
@@ -961,7 +992,7 @@ mod tests {
         assert!(!d.auto_safe);
         assert!(d.cause.contains("origin/main"), "cause names what did not resolve: {}", d.cause);
 
-        let out = remedy_at(&root, "main", 25);
+        let out = remedy_at(&root, "main", 25, false);
         assert!(!out.ok);
         assert_eq!(out.action, "");
     }
@@ -987,7 +1018,7 @@ mod tests {
         let (_d, _up, _p, root) = behind_by("remedy-ff", 3);
         let base_sha = git(&root, &["rev-parse", "origin/main"]).unwrap();
 
-        let out = remedy_at(&root, "main", 25);
+        let out = remedy_at(&root, "main", 25, false);
         assert!(out.ok, "reason was: {}", out.reason);
         assert_eq!(out.action, "merge --ff-only origin/main", "NOT `pull` — that would fetch");
         assert_eq!(out.before_behind, 3);
@@ -1005,7 +1036,7 @@ mod tests {
         let linked = linked.to_str().unwrap().to_string();
 
         let before = git(&linked, &["rev-parse", "HEAD"]).unwrap();
-        let out = remedy_at(&linked, "main", 25);
+        let out = remedy_at(&linked, "main", 25, false);
         assert!(!out.ok);
         assert_eq!(out.action, "", "never attempts `checkout --detach` — that button never ends");
         assert_eq!(out.after_behind, out.before_behind);
@@ -1023,7 +1054,7 @@ mod tests {
         std::fs::write(format!("{root}/f.txt"), "LOCAL EDIT\n").unwrap();
         assert_eq!(diagnose_at(&root, "main", 25).remedy, StaleRemedy::FastForwardDirty);
 
-        let out = remedy_at(&root, "main", 25);
+        let out = remedy_at(&root, "main", 25, false);
         assert!(!out.ok, "git must refuse this one");
         assert_eq!(out.action, "merge --ff-only origin/main", "attempted, not pre-refused");
         assert!(
@@ -1033,5 +1064,47 @@ mod tests {
         );
         // ...and the local edit survived.
         assert_eq!(std::fs::read_to_string(format!("{root}/f.txt")).unwrap(), "LOCAL EDIT\n");
+    }
+
+    // 11. THE UNATTENDED POLICY, asserted as the side effect it prevents.
+    //
+    // A tree that goes dirty AFTER the caller's `auto_safe` check re-classifies here as
+    // `FastForwardDirty` — which the automation rule says is offerable on a click and never
+    // automatic. Before the policy flag, `remedy_at` could not tell the two callers apart and ran
+    // the merge either way, so a 60-second timer could write to a tree the user had just started
+    // editing (knightwatch 5207191879#1, 5209038072#1).
+    //
+    // Note this is a tree git would ACCEPT: the local edit is in a file origin did not touch, so
+    // `merge --ff-only` succeeds and the assertion below is about our refusal, not git's. Using the
+    // clobbering shape above would have passed no matter what this function did.
+    #[test]
+    fn an_unattended_remedy_refuses_a_tree_that_went_dirty_after_the_callers_check() {
+        let (_d, _up, _p, root) = behind_by("remedy-unattended-dirty", 2);
+        std::fs::write(format!("{root}/scratch.txt"), "started typing\n").unwrap();
+        let d = diagnose_at(&root, "main", 25);
+        assert_eq!(d.remedy, StaleRemedy::FastForwardDirty);
+        assert!(!d.auto_safe, "a dirty tree is never the automatic shape");
+        let before_head = git(&root, &["rev-parse", "HEAD"]).unwrap();
+
+        let out = remedy_at(&root, "main", 25, true);
+        assert!(!out.ok, "unattended must refuse this");
+        assert_eq!(out.action, "", "and must not even attempt the merge");
+        assert_eq!(out.reason, d.cause, "it refuses in the diagnosis's own words");
+        assert_eq!(
+            git(&root, &["rev-parse", "HEAD"]).unwrap(),
+            before_head,
+            "THE POINT: no timer-driven commit moved this checkout",
+        );
+
+        // The same tree, same instant, on a CLICK: allowed, and it actually advances. Without this
+        // half the test would pass against a `remedy_at` that had simply stopped working.
+        let out = remedy_at(&root, "main", 25, false);
+        assert!(out.ok, "a click may still take the dirty fast-forward: {}", out.reason);
+        assert_ne!(git(&root, &["rev-parse", "HEAD"]).unwrap(), before_head);
+        assert_eq!(
+            std::fs::read_to_string(format!("{root}/scratch.txt")).unwrap(),
+            "started typing\n",
+            "and the local work is still there",
+        );
     }
 }
