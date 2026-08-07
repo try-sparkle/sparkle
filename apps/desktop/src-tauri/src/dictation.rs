@@ -1852,6 +1852,12 @@ fn build_capture(
     // Same edge bookkeeping for the on-device speech level. Fresh per capture (starts false), so a
     // newly (re)built capture never begins by claiming the user is mid-sentence.
     let mut last_on_device_speech = false;
+    // Retains audio while the relay is not routing, so the words spoken before it comes up are not
+    // lost (sparkle-oyapv). FRESH PER CAPTURE, like the two flags above, and for the same reason
+    // sharpened by what this one holds: a rebuilt capture must never begin by flushing audio from
+    // the PREVIOUS capture into the new socket. That would be both a wrong transcript and a
+    // retention the user did not consent to when they released the key.
+    let mut preroll = crate::audio::PreRoll::new(crate::audio::PREROLL_SAMPLES);
     // NOTE: the transcriber is locked on every CoreAudio callback frame, but ONLY for the cheap VAD
     // windowing / segment extraction (`accept_segments`) — the hundreds-of-ms transducer decode runs
     // on the decode worker, never here. finalize() is always called *after* Capture (and the worker)
@@ -1929,17 +1935,35 @@ fn build_capture(
             }
             spk
         };
-        if cloud {
+        // ── THE PRE-ROLL (sparkle-oyapv) ─────────────────────────────────────────────────────────
+        // `preroll.note` is offered EVERY frame, `cloud` or not, and that is the whole mechanism:
+        // while the relay is not routing it retains the audio (bounded, RAM only) instead of
+        // letting it fall on the floor, and on the frame the relay comes up it hands back the
+        // retained history followed by this frame — so the socket receives one continuous utterance
+        // with its leading words in front of it.
+        //
+        // Measured, on the founder's machine: `Capture::start` plus CoreAudio's first buffer is
+        // ~456 ms cold / ~212 ms warm, and the handshake is "~hundreds of ms" on top. That is the
+        // audio this recovers; without it the user's first words are simply never captured.
+        let to_send = preroll.note(&frame, cloud);
+        if !to_send.is_empty() {
             // Route to the relay WITHOUT locking the `cloud` teardown mutex. `try_lock` on the
             // dedicated sender slot NEVER blocks the audio thread: if a start/stop is mid-swap we
             // simply drop this frame (the same tens-of-ms transition window that already drops
             // frames), rather than contend with start/stop_cloud_stream/stop_dictation.
             if let Ok(guard) = cloud_tx.try_lock() {
                 if let Some(s) = guard.as_ref() {
-                    s.send_audio(&frame);
+                    for f in &to_send {
+                        s.send_audio(f);
+                    }
                 }
             }
-        };
+            // NOTE the deliberate asymmetry with the old code: a failed `try_lock` drops the
+            // retained pre-roll along with the current frame. `note` has already cleared the ring,
+            // so it cannot be re-offered. That is the correct trade rather than an oversight —
+            // holding it back would mean replaying stale audio into a socket that has since been
+            // swapped, and this is the same tens-of-ms window the comment above already accepts.
+        }
         // The on-device cancel signal, on its OWN edge — see frame_on_device_speech for why it is
         // not `speaking` below. Reported before the waveform edge so a resume can never be observed
         // by the frontend after the arm it is meant to prevent.
@@ -2851,6 +2875,16 @@ fn load_model(root: &std::path::Path, progress: impl Fn(u64, Option<u64>)) -> Re
 /// times shorter than this.
 #[tauri::command]
 pub async fn start_dictation(app: AppHandle, state: State<'_, DictationState>) -> Result<(), String> {
+    // ── THE PUSH-TO-TALK COLD-START BUDGET (sparkle-oyapv) ───────────────────────────────────────
+    // Push to talk rests with the mic RELEASED (`voice/sendMode` micIntentForMode -> "off"), so on a
+    // hold this entire command sits between the key going down and the first sample existing. The
+    // founder reported losing the first FIVE words of an utterance. Every stage below was previously
+    // unmeasured, so the budget could be reasoned about but never read.
+    //
+    // Only the stages this command actually awaits are timed here; `Capture::start`'s own four
+    // sub-spans (device resolve / format negotiation / stream build / play) and CoreAudio's
+    // first-buffer delay are logged in `audio.rs`, because that is where they can be separated.
+    let t_cmd = std::time::Instant::now();
     // "Arm" the mic. The cpal capture itself is gated on focus by reconcile_locked: it comes up now
     // only if a Sparkle window is the active OS window, and is (re)built later by the focus event.
     //
@@ -2939,6 +2973,10 @@ pub async fn start_dictation(app: AppHandle, state: State<'_, DictationState>) -
     tauri::async_runtime::spawn_blocking(crate::mic_permission::ensure_access_blocking)
         .await
         .map_err(|e| format!("microphone permission check failed: {e}"))??;
+    // The comment above claims "no measurable latency" for an already-authorized user. That is an
+    // assertion nobody had checked, and it omits the `spawn_blocking` hop itself — which on a busy
+    // machine queues behind other blocking work (the very scenario the abort below exists for).
+    let permission_ms = t_cmd.elapsed().as_millis() as u64;
 
     // Early-out: re-check the epoch BEFORE committing to the load. The permission check above is
     // itself an await, and on a busy machine `spawn_blocking` can sit queued behind other work for a
@@ -2988,6 +3026,10 @@ pub async fn start_dictation(app: AppHandle, state: State<'_, DictationState>) -
     // JoinError: the blocking task panicked. The panic hook already logged it; surface it as an
     // ordinary Err so the mic click reports a failure instead of silently doing nothing.
     .map_err(|e| format!("voice model load task failed: {e}"))??;
+    // The ASR decoder is cached process-static, so a warm hold does NOT pay the ~2.5s ONNX
+    // recognizer init here. It DOES still pay a fresh Silero VAD session plus three rounds of file
+    // verification, and that cost has never been separated from the cached case in any log.
+    let model_ms = t_cmd.elapsed().as_millis() as u64 - permission_ms;
     let transcriber = Arc::new(Mutex::new(transcriber));
 
     let mut sess = state.0.lock().unwrap_or_else(|p| p.into_inner());
@@ -3034,7 +3076,20 @@ pub async fn start_dictation(app: AppHandle, state: State<'_, DictationState>) -
     tracing::info!(target: "dictation", "start_dictation armed the session; reconciling capture");
     drop(sess);
     // Builds the capture now iff a window is focused; otherwise the focus event brings it up later.
+    let t_reconcile = std::time::Instant::now();
     state.reconcile_capture(&app);
+    // `reconcile_ms` INCLUDES `Capture::start` when a window is focused, and is near-zero when one
+    // is not (the capture then comes up on the focus event instead). So it is not comparable across
+    // holds on its own — read it against `audio.rs`'s "capture start timing" line, which is emitted
+    // only when a capture was actually built.
+    tracing::info!(
+        target: "dictation",
+        permission_ms,
+        model_ms,
+        reconcile_ms = t_reconcile.elapsed().as_millis() as u64,
+        total_ms = t_cmd.elapsed().as_millis() as u64,
+        "start_dictation timing"
+    );
     Ok(())
 }
 

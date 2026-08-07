@@ -169,7 +169,19 @@ impl DeepgramSession {
         // Project this dictation belongs to, for credit-history attribution. None when unknown.
         project: Option<String>,
     ) -> Result<DeepgramSession, String> {
+        // ── THE HANDSHAKE, MEASURED (sparkle-oyapv) ──────────────────────────────────────────────
+        // DNS + TCP + TLS + the WS upgrade, and the dominant cost of the second window in which
+        // push-to-talk loses speech: while this is in flight `cloud_active` is still false, and when
+        // it completes MID-SEGMENT the cloud branch discards the leading audio the on-device VAD had
+        // accumulated — which the relay never received either. The repo describes this as "~hundreds
+        // of ms" in two places and bounds it at CONNECT_TIMEOUT (8s); neither is a measurement.
+        //
+        // It is also the cost `WARM_STANDBY` exists to avoid — and a push-to-talk RELEASE currently
+        // tears the session down (`stop_dictation` take()s and finish()es it), so every hold pays
+        // this again. This line is what will show that reuse actually started working.
+        let t_handshake = std::time::Instant::now();
         let socket = connect(&base_url, &token, SAMPLE_RATE, project.as_deref())?;
+        let handshake_ms = t_handshake.elapsed().as_millis() as u64;
         let (tx, rx) = std::sync::mpsc::channel::<AudioMsg>();
         let suppress_ended = Arc::new(AtomicBool::new(false));
         let suppress_cb = suppress_ended.clone();
@@ -181,7 +193,7 @@ impl DeepgramSession {
             .name("deepgram-relay".into())
             .spawn(move || run_session(app, socket, rx, suppress_cb, alive_cb, muted_cb))
             .map_err(|e| format!("spawn relay worker: {e}"))?;
-        tracing::info!(target: "dictation", "cloud relay stream opened");
+        tracing::info!(target: "dictation", handshake_ms, "cloud relay stream opened");
         Ok(DeepgramSession {
             audio_tx: tx,
             worker: Some(worker),

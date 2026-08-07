@@ -130,6 +130,126 @@ pub enum ZeroSource {
     SelfInflicted,
 }
 
+/// How much audio [`PreRoll`] retains while nothing is routing, in 16 kHz mono samples (2 s).
+///
+/// Sized against the MEASURED cost of the window it exists to cover, not guessed: `Capture::start`
+/// plus CoreAudio's first buffer is ~456 ms cold / ~212 ms warm on the founder's machine
+/// (`measure_push_to_talk_cold_start`), and the relay handshake on top of that is documented as
+/// "~hundreds of ms" with an 8 s ceiling. 2 s covers the realistic sum with headroom.
+///
+/// It is also the PRIVACY bound, which is why it is deliberately small and stated here rather than
+/// left implicit: at rest this is the entire extent of what the microphone's history can be. 2 s of
+/// 16 kHz mono f32 is ~128 KB, held in RAM, overwritten in place, never written to disk, and never
+/// transmitted — nothing leaves the ring until `routing` goes true.
+pub const PREROLL_SAMPLES: usize = 16_000 * 2;
+
+/// Retains the most recent audio while nothing is routing it, so speech is not lost to the gap
+/// between the user asking to talk and the pipeline being ready to listen.
+///
+/// ── WHY THIS EXISTS (sparkle-oyapv) ────────────────────────────────────────────────────────────
+/// The founder held push-to-talk, said *"push to talk is not working super well"*, and the app
+/// transcribed *"super well"* — five leading words gone. Two separate gaps ate them, and this one
+/// type closes both, which is the reason it is shaped as "retain while not routing" rather than as
+/// anything push-to-talk-specific:
+///
+///   * the mic is not open yet (push to talk rests released), and
+///   * the mic IS open but the relay socket is not up, so frames have nowhere to go.
+///
+/// ── WHY A BUFFER AND NOT "MAKE IT FASTER" ──────────────────────────────────────────────────────
+/// Because the cost was measured and it does not go away. ~212 ms of it is `Capture::start` on a
+/// WARM machine — device resolve, format negotiation, stream build, first buffer — and no amount of
+/// pre-warming a socket or caching a model touches one millisecond of that. Pre-warming makes the
+/// loss smaller; retaining the audio makes it STRUCTURALLY IMPOSSIBLE, which is the bar the founder
+/// set ("zero words lost, ever"). A fix that merely narrows the window is one the user still hits
+/// on a slow morning.
+///
+/// ── THE PRIVACY TRADE, STATED ──────────────────────────────────────────────────────────────────
+/// This only helps if the stream is open while at rest, which REVERSES `sparkle-u81cz`, where the
+/// founder demanded the opposite: *"IT SHOULD NOT BE CAPTURING ANY WAVEFORM."* He was asked
+/// directly and accepted it (2026-08-06). The bound above is what makes that acceptance meaningful:
+/// RAM only, [`PREROLL_SAMPLES`] and no more, never persisted, and never sent anywhere until
+/// `routing` goes true. Do not widen the capacity without asking him again — the number IS the
+/// promise.
+#[derive(Debug)]
+pub struct PreRoll {
+    /// Frames retained oldest-first while `routing` is false.
+    ring: std::collections::VecDeque<Vec<f32>>,
+    /// Samples currently retained across `ring`, tracked so eviction is not O(n) per frame.
+    retained: usize,
+    /// Ceiling on `retained`; the oldest frames are evicted to honour it.
+    capacity: usize,
+    /// The routing state as of the previous frame — the false→true EDGE is what flushes.
+    routing: bool,
+}
+
+impl PreRoll {
+    pub fn new(capacity: usize) -> Self {
+        Self { ring: std::collections::VecDeque::new(), retained: 0, capacity, routing: false }
+    }
+
+    /// Offer one captured frame, and get back the frames to route RIGHT NOW, in order.
+    ///
+    /// * not routing → `[]`; the frame is retained (oldest evicted past `capacity`).
+    /// * routing, first frame of the hold → the whole retained ring, then this frame.
+    /// * routing, thereafter → just this frame.
+    ///
+    /// Returning a `Vec` rather than sending internally is what makes the policy testable without
+    /// an audio device, a relay socket, or a 482 MB model — the same reason `plan_capture` and
+    /// `classify_zero_source` in this file are pure. The caller does the sending.
+    pub fn note(&mut self, frame: &[f32], routing: bool) -> Vec<Vec<f32>> {
+        if !routing {
+            // A hold that just ended leaves `routing` true; drop back and resume retaining, so the
+            // NEXT hold is covered too. This is the ordinary steady state at rest.
+            self.routing = false;
+            if self.capacity == 0 {
+                return Vec::new();
+            }
+            self.ring.push_back(frame.to_vec());
+            self.retained += frame.len();
+            // Evict oldest-first. `while`, not `if`: one oversized frame can exceed the capacity on
+            // its own, and a single-shot eviction would leave the ring permanently over budget —
+            // which is the privacy bound, not just a memory one.
+            while self.retained > self.capacity {
+                match self.ring.pop_front() {
+                    Some(dropped) => self.retained -= dropped.len(),
+                    // Unreachable while `retained` and `ring` agree; bail rather than spin forever
+                    // if they ever disagree, because this runs on the realtime audio thread.
+                    None => {
+                        self.retained = 0;
+                        break;
+                    }
+                }
+            }
+            return Vec::new();
+        }
+        if self.routing {
+            // Steady state mid-hold: nothing is being retained, so this is a straight pass-through.
+            return vec![frame.to_vec()];
+        }
+        // ── THE EDGE: routing just became possible. Everything held comes out, oldest first, with
+        // this frame last — so the destination receives one continuous utterance with the leading
+        // audio in front of it, which is the entire point of the type.
+        self.routing = true;
+        let mut out = Vec::with_capacity(self.ring.len() + 1);
+        out.extend(self.ring.drain(..));
+        self.retained = 0;
+        out.push(frame.to_vec());
+        out
+    }
+
+    /// Forget everything retained, without routing it. For teardown paths that must not leak one
+    /// hold's audio into the next session.
+    pub fn clear(&mut self) {
+        self.ring.clear();
+        self.retained = 0;
+    }
+
+    /// Samples currently retained — for tests and for asserting the privacy bound holds.
+    pub fn retained(&self) -> usize {
+        self.retained
+    }
+}
+
 /// Pure classifier for [`ZeroSource`], so the policy is unit-tested without an audio device.
 pub fn classify_zero_source(
     raw_samples: u64,
@@ -530,10 +650,26 @@ impl Capture {
         choice: &DeviceChoice,
         on_frame: impl FnMut(Vec<f32>) + Send + 'static,
     ) -> Result<Capture, String> {
+        // ── WHY THIS IS TIMED (sparkle-oyapv) ────────────────────────────────────────────────────
+        // Push to talk rests with the mic RELEASED, so this whole function sits between the founder
+        // pressing the key and the first sample existing — and everything spoken during it is lost
+        // outright, because there is no buffer anywhere upstream of `Capture`. The founder reported
+        // losing five leading words. Nothing on this path was measured: every latency figure in this
+        // repo is a timeout constant or an adjective ("CoreAudio init is milliseconds"), so the
+        // budget could be argued about but never read. These four sub-spans make it readable.
+        //
+        // They are SEPARATE rather than one total because they have different fixes: `resolve` is
+        // `2 + 4N` CoreAudio HAL round trips through eight third-party plug-ins (see dictation.rs
+        // `list_input_devices`), `config` is format negotiation, and `build`+`play` are the stream
+        // itself. A single number would say "slow" without saying which one to attack.
+        let t0 = std::time::Instant::now();
         let (device, bound) = Self::resolve_device(choice)?;
+        let resolve_ms = t0.elapsed().as_millis();
+        let t_cfg = std::time::Instant::now();
         let cfg = device
             .default_input_config()
             .map_err(|e| e.to_string())?;
+        let config_ms = t_cfg.elapsed().as_millis();
         let channels = cfg.channels();
         let in_rate = cfg.sample_rate().0;
         let sample_format = cfg.sample_format();
@@ -559,6 +695,34 @@ impl Capture {
         // contained, not propagated into CoreAudio's extern "C" callback (see the fn doc). The
         // firewall also honors the teardown gate so a callback racing teardown becomes a no-op,
         // and records each delivered frame for the liveness watchdog.
+        // ── FIRST-FRAME LATENCY (sparkle-oyapv) ──────────────────────────────────────────────────
+        // The sub-spans above end when `stream.play()` returns, which is NOT when audio starts
+        // arriving: CoreAudio still has to deliver its first buffer, and that delay is pure loss on
+        // a push-to-talk hold. Nothing measured it — the closest the repo came was WATCHDOG_GRACE
+        // being "long enough to cover CoreAudio's first-buffer latency", a bound chosen around a
+        // number nobody had.
+        //
+        // Wrapped AROUND the caller's handler rather than added to `firewall_frame_handler`, whose
+        // 3-arg signature two existing tests drive directly; widening it would have made this
+        // measurement a reason for those tests to change, which is how unrelated coverage rots.
+        //
+        // Logged ONCE per capture (`Relaxed` swap on a flag) — this runs on the realtime CoreAudio
+        // IO thread, where a per-frame `tracing` call would be a genuine audio-dropout hazard.
+        let first_frame_logged = Arc::new(AtomicBool::new(false));
+        let on_frame = {
+            let seen = first_frame_logged.clone();
+            let mut inner = on_frame;
+            move |frame: Vec<f32>| {
+                if !seen.swap(true, Ordering::Relaxed) {
+                    tracing::info!(
+                        target: "dictation",
+                        since_capture_start_ms = t0.elapsed().as_millis() as u64,
+                        "first audio frame delivered"
+                    );
+                }
+                inner(frame)
+            }
+        };
         let mut on_frame = firewall_frame_handler(active.clone(), health.clone(), on_frame);
         // A second handle for the RAW-buffer counters. It must be read inside the cpal callback,
         // which is the only place the device's own buffer exists — `firewall_frame_handler` runs
@@ -569,6 +733,7 @@ impl Capture {
         // so we never ask cpal to reinterpret bytes incorrectly.
         // On macOS the default format is typically F32, but we handle the common
         // alternatives (I16, I32) so the code is portable.
+        let t_build = std::time::Instant::now();
         let stream = match sample_format {
             SampleFormat::F32 => device.build_input_stream(
                 &stream_config,
@@ -612,7 +777,24 @@ impl Capture {
         }
         .map_err(|e| e.to_string())?;
 
+        let build_ms = t_build.elapsed().as_millis();
+
+        let t_play = std::time::Instant::now();
         stream.play().map_err(|e| e.to_string())?;
+        let play_ms = t_play.elapsed().as_millis();
+
+        // INFO, not DEBUG, and deliberately so: the reports this exists to answer arrive hours later
+        // from someone on a release build, where a DEBUG line would never have been recorded. It
+        // fires once per capture build (per push-to-talk hold), not per frame, so it cannot flood.
+        tracing::info!(
+            target: "dictation",
+            resolve_ms = resolve_ms as u64,
+            config_ms = config_ms as u64,
+            build_ms = build_ms as u64,
+            play_ms = play_ms as u64,
+            total_ms = t0.elapsed().as_millis() as u64,
+            "capture start timing"
+        );
         Ok(Capture { stream, device: bound, health, started_at: std::time::Instant::now(), active })
     }
 }
@@ -1048,5 +1230,191 @@ mod tests {
              (found: {:.20}) — otherwise macOS denies mic capture ().",
             after
         );
+    }
+
+    // ── THE GOAL'S PIN (sparkle-oyapv) ─────────────────────────────────────────────────────────
+    //
+    // "With push-to-talk, the transcript contains the words spoken in the first 800 ms after the key
+    // goes down." These rows feed a known utterance starting at t=0 relative to the keydown and
+    // assert NO leading audio is missing.
+    //
+    // WHY THE UTTERANCE IS SYNTHETIC AND EVERY SAMPLE IS DISTINCT. Each 160-sample frame (10 ms at
+    // 16 kHz) is filled with its own index, so a frame is identifiable on arrival and the assertion
+    // can be about WHICH audio came out and IN WHAT ORDER — not merely how much. A test that
+    // counted samples would pass against a buffer that flushed them backwards.
+    //
+    // WHY THIS CANNOT PASS VACUOUSLY. The assertion is on the OUTPUT of `note` — the frames actually
+    // handed to the destination. On `origin/main` there is no retention of any kind: audio captured
+    // before the relay is routing is simply not sent, so the first 800 ms are absent from the
+    // output and these rows fail. `PREROLL_SAMPLES` is not what is being tested; the ORDERING and
+    // COMPLETENESS of the flush is.
+
+    /// 10 ms of 16 kHz mono, every sample carrying `idx` so the frame is identifiable on arrival.
+    fn utterance_frame(idx: usize) -> Vec<f32> {
+        vec![idx as f32 + 1.0; 160]
+    }
+
+    #[test]
+    fn the_first_800ms_after_keydown_survives_a_relay_that_is_still_connecting() {
+        // 800 ms at 10 ms per frame. The founder loses FIVE WORDS, which is ~2 s — this is the
+        // goal's stated floor, not the worst case observed.
+        const LEADING_FRAMES: usize = 80;
+        let mut pre = PreRoll::new(PREROLL_SAMPLES);
+        let mut routed: Vec<Vec<f32>> = Vec::new();
+
+        // t=0 is the keydown. He starts talking IMMEDIATELY — the case the bug is about — while the
+        // mic and the relay are both still coming up, so nothing can be routed yet.
+        for i in 0..LEADING_FRAMES {
+            let out = pre.note(&utterance_frame(i), false);
+            assert!(out.is_empty(), "frame {i} must be retained, not routed, before the relay is up");
+        }
+        // The relay finishes its handshake mid-utterance and he keeps talking.
+        for i in LEADING_FRAMES..LEADING_FRAMES + 20 {
+            routed.extend(pre.note(&utterance_frame(i), true));
+        }
+
+        // THE ASSERTION THE GOAL NAMES: every frame from t=0 onward reached the destination, in the
+        // order it was spoken, with nothing missing off the FRONT.
+        assert_eq!(
+            routed.len(),
+            LEADING_FRAMES + 20,
+            "the utterance was {} frames; {} arrived — leading audio was dropped, which is exactly \
+             the five words the founder lost",
+            LEADING_FRAMES + 20,
+            routed.len(),
+        );
+        for (i, frame) in routed.iter().enumerate() {
+            assert_eq!(
+                frame,
+                &utterance_frame(i),
+                "frame {i} of the utterance is out of order or missing — the transcript would read \
+                 as though the user started speaking later than they did"
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_is_routed_before_the_hold_and_the_retained_history_is_bounded() {
+        // The privacy half of the same mechanism, and it is a real assertion, not a formality: the
+        // capacity IS the promise made to the founder when he accepted an open mic at rest
+        // (sparkle-u81cz reversal). A ring that grew without bound would be a different product.
+        let mut pre = PreRoll::new(320); // 2 frames' worth
+        for i in 0..50 {
+            assert!(pre.note(&utterance_frame(i), false).is_empty(), "at rest, nothing is ever routed");
+            assert!(
+                pre.retained() <= 320,
+                "retained {} samples, over the {} bound — the privacy ceiling must hold on EVERY \
+                 frame, not merely on average",
+                pre.retained(),
+                320,
+            );
+        }
+        // What survives is the most RECENT audio, not the oldest: a hold flushes what was just said.
+        let flushed = pre.note(&utterance_frame(50), true);
+        assert_eq!(
+            flushed,
+            vec![utterance_frame(48), utterance_frame(49), utterance_frame(50)],
+            "the ring must retain the most recent audio and flush it in spoken order"
+        );
+    }
+
+    #[test]
+    fn a_big_frame_evicts_as_many_small_ones_as_it_takes_to_stay_in_budget() {
+        // PINS `while`, NOT `if`, IN THE EVICTION LOOP — and the shape here is load-bearing, which
+        // is why it is spelled out. The obvious version of this test (push ONE oversized frame into
+        // an EMPTY ring) is VACUOUS: a single `pop_front` removes that same frame and the bound
+        // holds either way. It was written that way first, survived the single-shot mutation, and
+        // proved nothing. Real capture frames also vary in size — CoreAudio's buffer is not a
+        // constant — so over-budget-by-several-frames is an ordinary state, not a contrived one.
+        //
+        // So: fill the ring with SMALL frames, then push one big enough that staying in budget
+        // requires evicting SEVERAL of them. Single-shot eviction leaves it over the bound, which
+        // is the privacy promise broken, not merely memory wasted.
+        let mut pre = PreRoll::new(100);
+        for _ in 0..5 {
+            pre.note(&vec![1.0; 20], false); // ring is now exactly full: 5 x 20 = 100
+        }
+        assert_eq!(pre.retained(), 100, "precondition: the ring starts exactly at capacity");
+        pre.note(&vec![2.0; 90], false); // 190 retained — needs FIVE evictions, not one
+        assert!(
+            pre.retained() <= 100,
+            "retained {} samples against a {} bound: one big frame evicted only a single small one, \
+             so the ring is parked over its privacy ceiling",
+            pre.retained(),
+            100
+        );
+    }
+
+    #[test]
+    fn a_second_hold_is_covered_too() {
+        // The release drops `routing` back to false, and the type must resume retaining rather than
+        // stay in pass-through — otherwise the fix works exactly once per app launch.
+        let mut pre = PreRoll::new(PREROLL_SAMPLES);
+        pre.note(&utterance_frame(0), true); // hold 1
+        pre.note(&utterance_frame(1), false); // released; retained
+        pre.note(&utterance_frame(2), false); // retained
+        let flushed = pre.note(&utterance_frame(3), true); // hold 2 begins
+        assert_eq!(
+            flushed,
+            vec![utterance_frame(1), utterance_frame(2), utterance_frame(3)],
+            "the second hold must flush its own pre-roll; a one-shot buffer fixes only the first \
+             utterance after launch"
+        );
+    }
+
+    /// MEASUREMENT, not an assertion (sparkle-oyapv). Prints what a push-to-talk keydown actually
+    /// costs on THIS machine: `Capture::start` wall time, and how long after it CoreAudio delivers
+    /// the first buffer. Everything in that span is speech the founder has already spoken and the
+    /// app will never see, because push to talk rests with the mic released.
+    ///
+    /// `#[ignore]` because it opens the real microphone and sleeps — run it deliberately:
+    ///   cargo test --lib measure_push_to_talk_cold_start -- --ignored --nocapture
+    ///
+    /// It asserts NOTHING and can therefore never flake the suite. That is on purpose: whether a
+    /// device is present, warm, or busy is a property of the machine, and the sibling guard above
+    /// already records why an assertion on real-device behaviour is the kind that gets deleted
+    /// rather than read. Three rounds, so a cold first open is visible against warm re-opens.
+    #[test]
+    #[ignore = "opens the real microphone and sleeps; run with --ignored --nocapture"]
+    fn measure_push_to_talk_cold_start() {
+        for round in 1..=3 {
+            let t0 = std::time::Instant::now();
+            let first_us = Arc::new(AtomicU64::new(0));
+            let sink = first_us.clone();
+            let capture = match Capture::start(
+                &DeviceChoice::Auto { allow_virtual: true },
+                move |_frame: Vec<f32>| {
+                    // Only the FIRST delivery is recorded; later frames leave the 0 sentinel alone.
+                    let _ = sink.compare_exchange(
+                        0,
+                        t0.elapsed().as_micros().max(1) as u64,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    );
+                },
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("SKIPPED measure_push_to_talk_cold_start: no usable input device ({e})");
+                    return;
+                }
+            };
+            let start_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(3000);
+            while first_us.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            match first_us.load(Ordering::Relaxed) {
+                0 => eprintln!("round {round}: Capture::start {start_ms:7.1} ms | NO FRAME within 3000 ms"),
+                us => eprintln!(
+                    "round {round}: Capture::start {start_ms:7.1} ms | first frame at {:7.1} ms \
+                     (= audio lost if the user speaks at t=0)",
+                    us as f64 / 1000.0
+                ),
+            }
+            drop(capture);
+            std::thread::sleep(std::time::Duration::from_millis(400));
+        }
     }
 }
