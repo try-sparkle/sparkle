@@ -25,6 +25,8 @@
 // input. Program-emitted forms like OSC (`ESC ] … BEL`) are not modeled: they appear in terminal
 // OUTPUT, effectively never in USER onData, so handling them would be dead weight.
 
+import { useTerminalOverlayStore } from "../stores/terminalOverlayStore";
+
 export interface LineScanState {
   /** Printable text the user has typed since the last submit. */
   buf: string;
@@ -179,4 +181,93 @@ export function scanSubmittedLines(state: LineScanState, chunk: string): number 
     killPendingLine(state);
   }
   return submits;
+}
+
+// ══ THE APP'S OWN WRITES TO THE SAME INPUT LINE ══════════════════════════════════════════════════
+//
+// Everything above models the USER's line, because `onData` is a user-only signal. But the app also
+// writes to that line — the dictation sink types a phrase into it (`pasteIntoPty`), the concierge
+// submits through it (`deliverSubmit`), the model picker clears it and types `/model …`. None of
+// those reach `onData`, so the scanner cannot see them, and `hasPendingInput` answers about a line
+// that is no longer the one on screen.
+//
+// PUBLISHING THE DERIVED FLAG FROM THOSE CALL SITES IS NOT ENOUGH, and that is the lesson this
+// registry encodes (roborev 59728/59742). `Terminal.tsx` recomputes `setDraft(agentId,
+// hasPendingInput(state))` on EVERY chunk, so a publish that does not also update `state` survives
+// exactly until the user's next non-printable keystroke: an arrow key or a Backspace against a
+// pasted line recomputes from an empty `buf` and writes `false` back over it, while the CLI prompt
+// still holds the dictated words. Those are precisely the keys a user presses after dictation
+// inserts a line, so the guard flickered off one keystroke into the scenario it exists for. The
+// mirror case is worse: `/model`'s Ctrl-U wipes a line the scanner still believes in, so the next
+// keystroke recomputes a stale `true` over an EMPTY prompt and declines every compose-focus pull.
+//
+// So the app's writes go through the SAME state the user's do, and the flag is derived in one place
+// for both. `noteUserInput` is what `Terminal.tsx` calls; the three `noteProgrammatic*` functions
+// are what the writers call.
+
+
+/** agentId → the live scanner for that terminal's input line, while its Terminal is mounted. */
+const scans = new Map<string, LineScanState>();
+
+/** Publish the ONE derived fact, from the ONE state. Called after every mutation, user or app. */
+function publish(agentId: string, state: LineScanState): void {
+  // The store no-ops unless emptiness actually flips, so this stays one write per word.
+  useTerminalOverlayStore.getState().setDraft(agentId, hasPendingInput(state));
+}
+
+/** Start tracking this agent's input line. Returns the state so the caller can hold a reference. */
+export function registerLineScan(agentId: string): LineScanState {
+  const state = makeLineScanState();
+  scans.set(agentId, state);
+  return state;
+}
+
+/** Stop tracking (the terminal was torn down). Does NOT touch the draft flag: the teardown path
+ *  owns that decision, and clears it explicitly. */
+export function unregisterLineScan(agentId: string): void {
+  scans.delete(agentId);
+}
+
+/** Feed one chunk of USER input: scan it, publish the derived flag, and return the submit count.
+ *  The one entry point `Terminal.tsx`'s `onData` uses, so a test that drives this drives the app. */
+export function noteUserInput(agentId: string, chunk: string): number {
+  const state = scans.get(agentId);
+  if (!state) return 0;
+  const submits = scanSubmittedLines(state, chunk);
+  publish(agentId, state);
+  return submits;
+}
+
+/** The app INSERTED text at the prompt without submitting it — a dictated phrase, a dropped path.
+ *  Appended to the same buffer a keystroke would append to, so the next recompute agrees. */
+export function noteProgrammaticInsert(agentId: string, text: string): void {
+  const state = scans.get(agentId);
+  if (!state) {
+    // No terminal mounted for this agent (so nothing will recompute over us). Publish the fact
+    // anyway: the flag outlives the pane, and a mount that arrives later starts from a fresh
+    // scanner rather than from a lie.
+    if (text.trim() !== "") useTerminalOverlayStore.getState().setDraft(agentId, true);
+    return;
+  }
+  state.buf += text;
+  publish(agentId, state);
+}
+
+/** The app EMPTIED the prompt without submitting — `/model`'s Ctrl-U kill. */
+export function noteProgrammaticClear(agentId: string): void {
+  const state = scans.get(agentId);
+  if (!state) {
+    useTerminalOverlayStore.getState().setDraft(agentId, false);
+    return;
+  }
+  state.buf = "";
+  state.esc = "none";
+  publish(agentId, state);
+}
+
+/** The app SUBMITTED the line — a carriage return went to the PTY, so the prompt is empty again.
+ *  Identical effect to a clear today; kept separate because the two are different events and a
+ *  future submit-counting consumer must not be forced to guess which one happened. */
+export function noteProgrammaticSubmit(agentId: string): void {
+  noteProgrammaticClear(agentId);
 }

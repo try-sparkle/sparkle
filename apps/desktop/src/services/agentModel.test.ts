@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const invoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invoke(...a) }));
@@ -7,6 +7,11 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
 import { applyModelToRunningAgent } from "./agentModel";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useTerminalOverlayStore } from "../stores/terminalOverlayStore";
+import {
+  registerLineScan,
+  unregisterLineScan,
+  noteUserInput,
+} from "../components/terminalSubmit";
 
 const CLEAR_LINE = "\x05\x15"; // Ctrl-E + Ctrl-U — whole-line clear regardless of cursor position
 
@@ -15,6 +20,13 @@ beforeEach(() => {
   invoke.mockResolvedValue(undefined);
   useRuntimeStore.setState({ openAgentIds: [], status: {} });
   useTerminalOverlayStore.setState({ drafts: {} });
+  // A LIVE SCANNER, as a mounted Terminal would have: without one the registry falls back to
+  // writing the derived flag, which is exactly the blind path these cases exist to rule out.
+  registerLineScan("a1");
+});
+
+afterEach(() => {
+  unregisterLineScan("a1");
 });
 
 describe("applyModelToRunningAgent (mid-session /model, sparkle-i6rw)", () => {
@@ -166,5 +178,33 @@ describe("the /model delivery publishes the input line it rewrites", () => {
       vi.useRealTimers();
     }
     expect(useTerminalOverlayStore.getState().drafts.a1).toBe(true);
+    // AND IT SURVIVES THE USER'S NEXT KEYSTROKE. The publish alone did not: `Terminal.tsx`
+    // recomputes the flag from the line scanner on every chunk, so an arrow key wrote `false` back
+    // over it while `/model …` sat on the prompt (roborev 59742). Driving `noteUserInput` — the same
+    // function that handler calls — is what makes this assertion able to fail.
+    noteUserInput("a1", "\x1b[D");
+    expect(useTerminalOverlayStore.getState().drafts.a1).toBe(true);
+  });
+
+  it("clears the claim when the PTY turned out to be GONE, leaving nothing stale behind", async () => {
+    // `writePty` is the TOLERANT variant, so the command write above resolves even when it never
+    // landed — and the dead-PTY case takes the same bail as a modal prompt. Left as-is the `true`
+    // has no writer to retract it (clearDraft fires on teardown, which has already run), and agent
+    // ids are stable across respawn, so the NEXT terminal for this agent would open declining every
+    // compose-focus pull (roborev 59742).
+    useRuntimeStore.setState({ openAgentIds: ["a1"] });
+    vi.useFakeTimers();
+    try {
+      const p = applyModelToRunningAgent("a1", "claude-opus-4-8");
+      await vi.advanceTimersByTimeAsync(0);
+      useRuntimeStore.setState({ openAgentIds: [] }); // the pane closed mid-delivery
+      await vi.runAllTimersAsync();
+      await p;
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(useTerminalOverlayStore.getState().drafts.a1).toBeFalsy();
+    noteUserInput("a1", "\x1b[D");
+    expect(useTerminalOverlayStore.getState().drafts.a1).toBeFalsy();
   });
 });

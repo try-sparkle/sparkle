@@ -17,10 +17,13 @@
 // pill's "go to compose". It also justified itself with "there is no way to ask a terminal otherwise",
 // which is not true: the app already computes the answer (roborev 59610).
 //
-// `Terminal.tsx`'s `onData` scanner publishes `terminalOverlayStore.drafts[agentId]` on every
-// keystroke — "the user has an unsubmitted, non-whitespace line pending at the CLI prompt" — and the
-// terminal-anchored action pill already hides on it. `onData` sees USER input only, never the agent's
-// output, so it is exactly the signal wanted: unsent text the user would lose the place of.
+// `components/terminalSubmit`'s per-agent line scanner publishes
+// `terminalOverlayStore.drafts[agentId]` — "the user has an unsubmitted, non-whitespace line pending
+// at the CLI prompt" — and the terminal-anchored action pill already hides on it. It is fed from two
+// sides: `Terminal.tsx`'s `onData` for the user's keystrokes (USER input only, never the agent's
+// output), and the app's own writers (`pasteIntoPty`, `deliverSubmit`, `/model`) for the lines this
+// app puts there itself. Both edit ONE state, so the flag cannot be recomputed out from under a
+// writer — which it was, one keystroke after any dictated insert, until roborev 59728/59742.
 import { classifyFocusOwner, terminalAgentIdOf } from "../voice/dictationFocus";
 import { useTerminalOverlayStore } from "../stores/terminalOverlayStore";
 

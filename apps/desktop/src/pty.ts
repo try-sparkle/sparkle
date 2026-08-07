@@ -5,13 +5,16 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { noteUserInputForAgent } from "./engine/engineRegistry";
-// The CLI input line's emptiness is PUBLISHED, not observed: xterm's `onData` sees only what the
-// user types, so every write this module makes to an agent's input line is invisible to the scanner
-// that maintains `drafts`. Two consumers read that flag — the terminal-anchored action pill and the
-// compose-focus veto (services/terminalMidCommand) — and both were wrong in the gap. See the writes
-// in `pasteIntoPty` / `deliverSubmit` below (roborev 59689). The store imports zustand and nothing
-// else, so this cannot cycle.
-import { useTerminalOverlayStore } from "./stores/terminalOverlayStore";
+// The CLI input line is TOLD what we did to it: xterm's `onData` sees only what the user types, so
+// every write this module makes to an agent's input line is invisible to the scanner that derives
+// `drafts` — the flag the terminal-anchored action pill hides on and the compose-focus veto declines
+// on (roborev 59689). These go through the scanner's own state rather than writing that flag
+// directly, because `Terminal.tsx` recomputes it from that state on every user chunk: a publish the
+// scanner disagrees with survives only until the next arrow key (roborev 59728).
+import {
+  noteProgrammaticInsert,
+  noteProgrammaticSubmit,
+} from "./components/terminalSubmit";
 
 export interface PtyOutput {
   id: string;
@@ -204,19 +207,20 @@ export function pasteIntoPty(id: string, text: string): Promise<void> {
   const body = stripPasteMarkers(text);
   return chainPtyOp(id, async () => {
     await writePtyStrict(id, `${PASTE_START}${body}${PASTE_END}`);
-    // The prompt now HOLDS this text, and nothing else will say so: `drafts` is maintained by
-    // xterm's `onData`, which sees the user's keystrokes and never ours. Left unpublished, the
-    // dictation sink's whole contract — "it types, it does not submit, the human's Enter is the
-    // consent" — produced a terminal holding unsent words that the compose-focus veto read as idle
-    // and pulled the caret out of, which is sparkle-d2ec's own symptom in the scenario the guard was
-    // written for (roborev 59689).
+    // The prompt now HOLDS this text, and nothing else will say so. Left untold, the dictation
+    // sink's whole contract — "it types, it does not submit, the human's Enter is the consent" —
+    // produced a terminal holding unsent words that the compose-focus veto read as idle and pulled
+    // the caret out of: sparkle-d2ec's own symptom, in the scenario the guard was written for.
     //
-    // Only ever set TRUE here, and only for non-whitespace: this write ADDS to whatever the user
-    // already had on the line, so it can never be evidence that the line went empty. It self-heals
-    // on the user's next Enter, when `scanSubmittedLines` clears the scanner's buffer.
+    // APPENDED TO THE SCANNER'S BUFFER, not published as a bare flag. The two differ the moment the
+    // user presses a non-printable key: `Terminal.tsx` recomputes the flag from that buffer on every
+    // chunk, so an arrow key or a Backspace against the pasted line would write `false` straight
+    // back over a bare publish while the words were still on screen (roborev 59728). Appending also
+    // makes those edits behave — a Backspace now deletes from the pasted text rather than from an
+    // empty buffer.
     //
     // After the await, so a paste that never landed (PtyGoneError on a dead PTY) claims nothing.
-    if (body.trim() !== "") useTerminalOverlayStore.getState().setDraft(id, true);
+    if (body !== "") noteProgrammaticInsert(id, body);
   });
 }
 
@@ -238,12 +242,12 @@ async function deliverSubmit(id: string, text: string, machine?: boolean): Promi
   await new Promise((r) => setTimeout(r, SUBMIT_CR_DELAY_MS));
   await writePtyStrict(id, "\r");
   // The CR submitted the WHOLE line — this text and anything the user had already typed in front of
-  // it — so the prompt is now empty. Published for the same reason as the paste above and with the
-  // opposite value: `drafts` is scanner-maintained and the scanner cannot see this CR, so a flag
-  // left `true` from the user's own half-typed line would stay true indefinitely (nothing resets it
-  // short of unmount) and decline every compose-focus pull with the caret in this terminal for that
-  // whole window — the roborev 59610 High, reproduced through the writer gap (roborev 59689).
-  useTerminalOverlayStore.getState().setDraft(id, false);
+  // it — so the prompt is empty again. Told to the scanner for the same reason as the paste above
+  // and with the opposite effect: it cannot see this CR, so a buffer left holding the user's own
+  // half-typed line would keep answering `true` (nothing resets it short of unmount) and decline
+  // every compose-focus pull with the caret in this terminal for that whole window — the roborev
+  // 59610 High, reproduced through the writer gap.
+  noteProgrammaticSubmit(id);
 }
 
 /** Submit a full prompt to an agent's PTY: deliver it as one bracketed paste, then (after a

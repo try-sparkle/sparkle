@@ -44,7 +44,7 @@ import { TERMINAL_AGENT_ATTR, TERMINAL_SURFACE_ATTR } from "../voice/dictationFo
 // terminals that are not cockpit columns at all — the setup checklist's and the login modal's —
 // which would let a press in a modal address the right-hand terminal's zoom level.
 import { useColumnZoom, useZoomColumn } from "../hooks/useZoomColumn";
-import { makeLineScanState, scanSubmittedLines, hasPendingInput } from "./terminalSubmit";
+import { registerLineScan, unregisterLineScan, noteUserInput } from "./terminalSubmit";
 import { useKeybindingsStore } from "../stores/keybindingsStore";
 import { matchesChord } from "../keyboardHints/keybindings";
 import { dismissibleSurfaceOpen } from "../engine/cable";
@@ -827,7 +827,11 @@ export function Terminal({
     // permission/y-n confirmation pressed without typing, or menu navigation (arrow keys + Enter)
     // must not burn a free trial prompt. See terminalSubmit.ts. onData never sees programmatic
     // agent output, so this can't be triggered by the agent itself.
-    const lineScan = makeLineScanState();
+    // REGISTERED, not merely constructed: the app writes to this same input line through paths
+    // `onData` never sees (the dictation sink types into it, the concierge submits through it,
+    // the model picker clears it), and those writers update THIS state through the registry so a
+    // later recompute here cannot contradict them — see the registry note in terminalSubmit.
+    registerLineScan(agentId);
     term.onData((d) => {
       useInteractionStore.getState().touch(agentId);
       // THE USER IS WORKING IN THIS TERMINAL. `onData` is the honest signal for that, and the only
@@ -842,14 +846,13 @@ export function Terminal({
       // presence store would call someone Away after five minutes of driving an agent by hand, and
       // the concierge would start acting alone with the user watching (stores/presenceStore).
       usePresenceStore.getState().noteInput();
-      const submits = scanSubmittedLines(lineScan, d);
+      // Scans the chunk AND publishes "is the user mid-line at the CLI prompt right now?" — the
+      // signal the terminal-anchored action pill hides on and the compose-focus veto declines on.
+      // There is no React `value` to read here; the input line is painted by the CLI inside this
+      // canvas. One call rather than scan-then-publish so the app's own writes to the line, which
+      // go through the same registry, cannot be overwritten by a recompute that never saw them.
+      const submits = noteUserInput(agentId, d);
       for (let i = 0; i < submits; i += 1) onSubmitLineRef.current?.();
-      // The same scan answers "is the user mid-line at the CLI prompt right now?", which is what
-      // the terminal-anchored action pill hides on — there is no React `value` to read here, the
-      // input line is painted by the CLI inside this canvas. Published rather than passed up as a
-      // prop because the pill is owned by the concierge, not by this pane. The store no-ops unless
-      // emptiness actually FLIPS, so this stays one write per word, not one per keystroke.
-      useTerminalOverlayStore.getState().setDraft(agentId, hasPendingInput(lineScan));
       transport.write(d);
     });
 
@@ -1479,9 +1482,10 @@ export function Terminal({
       // is pending at the CLI prompt"; the text itself lives in the local Claude's readline buffer,
       // inside the PTY this very cleanup kills (detach() == kill for LocalTransport). So the line is
       // destroyed by the cutover no matter what we do here, and keeping the flag preserves only a
-      // claim about something that no longer exists. Worse, the flag's sole writer is the per-effect
-      // `lineScan`, recreated empty by the new binding and fed only by the user's next keystroke in
-      // THIS terminal — which on a promoted pane may never come. It would sit `true` for the life of
+      // claim about something that no longer exists. Worse, the flag is derived from the per-agent
+      // scanner registered above, which this cleanup unregisters and the new binding re-registers
+      // EMPTY — after which it is fed only by the user's next keystroke in THIS terminal, which on a
+      // promoted pane may never come. It would sit `true` for the life of
       // the tab, and ConciergeSuggestions hides the recommended-action pill on `drafts[agentId]`:
       // exactly the "true forever, pill hidden forever" failure this call was added to prevent
       // (roborev 57372).
@@ -1490,6 +1494,7 @@ export function Terminal({
       // promoted pane redraws the resumed conversation from the sandbox's own backfill, so keeping
       // the local buffer would paint the same transcript twice.
       useTerminalOverlayStore.getState().clearDraft(agentId);
+      unregisterLineScan(agentId);
       if (focusRef) focusRef.current = null;
       if (apiRef) apiRef.current = null;
       ro.disconnect();

@@ -4,6 +4,11 @@
 // (projectStore.setAgentModel) is separate and always happens; this is only the live delivery.
 import { chainPtyOp, writePty } from "../pty";
 import { useRuntimeStore } from "../stores/runtimeStore";
+import {
+  noteProgrammaticClear,
+  noteProgrammaticInsert,
+  noteProgrammaticSubmit,
+} from "../components/terminalSubmit";
 import { useTerminalOverlayStore } from "../stores/terminalOverlayStore";
 import { isDefaultModel } from "./models";
 
@@ -61,23 +66,39 @@ async function deliver(agentId: string, modelId: string): Promise<void> {
   // call time.
   if (!canInject(agentId)) return;
   await writePty(agentId, `${CLEAR_LINE}/model ${modelId}`);
-  // PUBLISH WHAT THIS WRITE DID TO THE INPUT LINE. `terminalOverlayStore.drafts[agentId]` is
-  // maintained by xterm's `onData`, which sees the user's keystrokes and never ours, so a write
-  // this module makes is invisible to it — the same writer gap `pty.ts` closes for
-  // paste/submit (roborev 59689). Here the Ctrl-U CLEARED whatever the user had pending and put
-  // `/model …` there instead: still a non-empty line they could Enter themselves, so `true` is the
-  // truthful answer, and it is the ONE the bail-out below leaves behind.
-  useTerminalOverlayStore.getState().setDraft(agentId, true);
+  // TELL THE LINE SCANNER WHAT THIS WRITE DID, both halves of it. Its buffer is fed by xterm's
+  // `onData`, which sees the user's keystrokes and never ours, and `Terminal.tsx` recomputes the
+  // `drafts` flag FROM that buffer on every chunk — so writing the flag alone would be undone by the
+  // user's next arrow key (roborev 59728/59742). Here the Ctrl-U destroyed whatever they had pending
+  // (the `\x15` went straight to the PTY, so the scanner's own kill branch never ran) and `/model …`
+  // took its place: a non-empty line they could Enter themselves, which is what the bail-out below
+  // deliberately leaves behind.
+  //
+  // `pty.ts`'s one-directional rule — "a paste ADDS to the line, so it can never mean the line went
+  // empty" — does NOT hold here, and that is exactly why this site clears before it inserts.
+  noteProgrammaticClear(agentId);
+  noteProgrammaticInsert(agentId, `/model ${modelId}`);
   await new Promise((r) => setTimeout(r, MODEL_SUBMIT_DELAY_MS));
   // Re-check before the hazardous keystroke: a working agent can pop a permission prompt
   // DURING the submit delay (roborev 23548/23549). Skipping the Enter leaves benign text in
   // the composer — strictly safer than confirming a dialog the user never approved.
-  if (!canInject(agentId)) return;
+  if (!canInject(agentId)) {
+    // TWO CAUSES, ONE BAIL, AND THEY OWE THE USER DIFFERENT THINGS. A modal status means the line is
+    // real and still on screen, so the pending claim above stands. A CLOSED PTY means there is no
+    // line at all — and `writePty` is the TOLERANT variant, so the write above may never have landed
+    // (roborev 59742). Left as-is, that claim has no writer to retract it: `clearDraft` fires on
+    // terminal teardown, which in this ordering has already run, and agent ids are stable across a
+    // respawn — so the next terminal for this agent would start life declining every compose-focus
+    // pull until the user pressed Enter in it themselves.
+    if (!useRuntimeStore.getState().isOpen(agentId)) {
+      noteProgrammaticClear(agentId);
+      useTerminalOverlayStore.getState().clearDraft(agentId);
+    }
+    return;
+  }
   await writePty(agentId, "\r");
-  // …and the CR submitted it, so the line is empty again. Without this the flag stays `true` until
-  // the terminal unmounts, and every compose-focus pull with the caret in it is declined for that
-  // whole window.
-  useTerminalOverlayStore.getState().setDraft(agentId, false);
+  // …and the CR submitted it, so the line is empty again.
+  noteProgrammaticSubmit(agentId);
 }
 
 /**
