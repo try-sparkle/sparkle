@@ -1,0 +1,284 @@
+// socialStore — WHO you can chat with, keyed by `social_id`. Design:
+// docs/superpowers/specs/2026-08-05-social-coding-design.md §5, §6.1, §6.3, §10.
+//
+// ⚠️ THE NAME. This is `socialStore`, and it may never be renamed to `presenceStore` — that name is
+// ALREADY TAKEN, by "is the human at the keyboard", and it is read synchronously from the non-React
+// concierge dispatch path where a destructive action queues on it. Two stores called presence, one
+// about a peer's socket and one about whether the user can cancel a countdown, is a collision that
+// would be both easy to make and damaging. For the same reason the field here is `availability` and
+// never `presence`, and the dot is `AvailabilityDot`, never `PresenceDot`.
+//
+// NOT PERSISTED, deliberately, and each of the three things in it fails differently if it were:
+//   • `availability` is socket liveness. A rehydrated dot would assert a peer is online on the
+//     strength of a fact from the last time the app ran — the one claim this feature must never
+//     make wrongly, since a human decides whether to type based on it.
+//   • the roster and the requests are server state with a server-side authz gate on top (a block, a
+//     visibility change, a declined request all happen while you are closed). A cached copy would
+//     render people you may no longer see, which is a §5 disclosure, not a stale-UI annoyance.
+//   • `me` is re-read from `/me` + the profile endpoint on every boot anyway.
+// The whole store is repopulated from `services/socialApi` on connect, so persistence would buy a
+// flash of possibly-wrong state and nothing else.
+//
+// WHAT IS DELIBERATELY ABSENT: `clerkUserId`, email, real name, last-seen timestamps, device or
+// machine identity. Per §5 none of those may reach a client at all, so there is no field here to
+// put them in — a projection you cannot express is a projection that cannot leak.
+
+import { create } from "zustand";
+
+import { personAgentId, type Availability, type Visibility } from "../engine/social";
+import type { MentionAgent } from "../components/Concierge/mentions";
+
+/** How the viewer stands to a person. `stranger` is a real, addressable state (§6.1 `state='none'`),
+ *  not "unknown" — you can message a stranger; it lands in their request tray. */
+export type Relationship = "self" | "connected" | "pending_in" | "pending_out" | "stranger";
+
+/** A person the app knows about — EXACTLY the four fields §5 permits a client to hold, plus the
+ *  viewer-derived edge facts (`relationship`, `availability`) which are about the EDGE, not about
+ *  the profile row, and so compose without widening the projection. */
+export interface Person {
+  /** The opaque public uuid. THE key for everything: the row, the mount id, the thread cache. */
+  socialId: string;
+  username: string;
+  /** Optional and user-set; never auto-filled from the account name or email (§5). */
+  displayName: string | null;
+  availability: Availability;
+  relationship: Relationship;
+}
+
+/** The signed-in user's own social identity. `username: null` means "has no social identity yet" —
+ *  row existence server-side is what means "claimed", so null here is the honest mirror of that. */
+export interface MyProfile {
+  username: string | null;
+  displayName: string | null;
+  /** Defaults to `unavailable`: social is opt-in and nobody becomes discoverable by upgrading. */
+  visibility: Visibility;
+  socialId: string | null;
+}
+
+/** One pending connection request, in either direction. `id` is the connection row's uuid — what
+ *  `POST /social/connections/:id/accept` takes — and is NOT the peer's `socialId`. */
+export interface ConnectionRequest {
+  id: string;
+  socialId: string;
+  username: string;
+  displayName: string | null;
+}
+
+/**
+ * A person row AS IT MAY ACTUALLY ARRIVE, which is not the same thing as {@link Person}.
+ *
+ * `socialApi`'s JSON read is an unchecked `as T` — there is no runtime validator at that boundary —
+ * and the wire shape (§5) carries `online`, not `availability`, so a caller adapting a response can
+ * hand this store a row with no availability at all and TypeScript will never have known. Saying so
+ * in the type is what lets {@link SocialState.setPeople} normalize rather than *claim* to.
+ */
+export type IncomingPerson = Omit<Person, "availability"> & { availability?: Availability };
+
+/** A partial update to one person. Only `socialId` is required — that is what makes `upsertPerson`
+ *  a merge rather than a replace wearing a merge's docstring. */
+export type PersonPatch = Partial<Person> & Pick<Person, "socialId">;
+
+/** The fail-closed default. A peer with no availability evidence is OFFLINE — never "available on
+ *  the strength of a missing field". */
+export const DEFAULT_AVAILABILITY: Availability = "offline";
+
+const NO_PEOPLE: Readonly<Record<string, Person>> = Object.freeze({});
+/** Module-level frozen empties so a selector returns a STABLE reference in the common case; a fresh
+ *  `[]` per render re-renders every consumer on every store touch. */
+const NO_REQUESTS: readonly ConnectionRequest[] = Object.freeze([]);
+
+export const EMPTY_PROFILE: MyProfile = Object.freeze({
+  username: null,
+  displayName: null,
+  visibility: "unavailable" as Visibility,
+  socialId: null,
+});
+
+interface SocialState {
+  me: MyProfile;
+  /** Everyone with a row, keyed by `socialId`. A record, not an array: every write path
+   *  (`peer_presence`, an accepted request, an unread bump) arrives keyed by that id. */
+  people: Record<string, Person>;
+  incoming: readonly ConnectionRequest[];
+  outgoing: readonly ConnectionRequest[];
+  /** Unread message count per `socialId`. Absent = zero. */
+  unread: Record<string, number>;
+
+  setMyProfile: (patch: Partial<MyProfile>) => void;
+  /** Replace the whole roster (a directory/connections refetch). Availability defaults to `offline`
+   *  for anyone the payload does not carry one for — the fail-CLOSED direction: never assert a peer
+   *  is reachable on missing evidence. See {@link IncomingPerson} for why that can happen at all. */
+  setPeople: (people: readonly IncomingPerson[]) => void;
+  /** Add or merge one person. A genuine MERGE: every field but `socialId` is optional, so a
+   *  `peer_presence` frame that arrives before the profile fetch carries only the availability and
+   *  cannot blank the name, and a profile fetch that lands after it cannot blank the dot. */
+  upsertPerson: (patch: PersonPatch) => void;
+  removePerson: (socialId: string) => void;
+  /** The `peer_presence` write path. A no-op for an unknown id rather than creating a nameless
+   *  ghost row — a person you have no profile for must not appear in the column. */
+  setAvailability: (socialId: string, availability: Availability) => void;
+  setRequests: (requests: {
+    incoming?: readonly ConnectionRequest[];
+    outgoing?: readonly ConnectionRequest[];
+  }) => void;
+  bumpUnread: (socialId: string, by?: number) => void;
+  clearUnread: (socialId: string) => void;
+  /** Sign-out / account switch. Everything here is another account's view of other people. */
+  reset: () => void;
+}
+
+const INITIAL = {
+  me: EMPTY_PROFILE,
+  people: NO_PEOPLE as Record<string, Person>,
+  incoming: NO_REQUESTS,
+  outgoing: NO_REQUESTS,
+  unread: {} as Record<string, number>,
+};
+
+export const useSocialStore = create<SocialState>((set) => ({
+  ...INITIAL,
+
+  setMyProfile: (patch) => set((s) => ({ me: { ...s.me, ...patch } })),
+
+  setPeople: (people) =>
+    set(() => ({
+      people: Object.fromEntries(
+        people.map((p): [string, Person] => [
+          p.socialId,
+          { ...p, availability: p.availability ?? DEFAULT_AVAILABILITY },
+        ]),
+      ),
+    })),
+
+  upsertPerson: (patch) =>
+    set((s) => {
+      const existing = s.people[patch.socialId];
+      // No row and no name is a presence frame for a stranger: a no-op, for the same reason
+      // `setAvailability` refuses one. A nameless ghost must not appear in the column.
+      if (!existing && patch.username == null) return {};
+      // Strip explicit `undefined`s so "field omitted" and "field passed as undefined" mean the
+      // same thing. Without this the spread below would blank a name the caller never touched —
+      // which is precisely the failure the merge exists to prevent.
+      const defined = Object.fromEntries(
+        Object.entries(patch).filter(([, v]) => v !== undefined),
+      ) as Partial<Person>;
+      const base: Person = existing ?? {
+        socialId: patch.socialId,
+        username: patch.username as string,
+        displayName: null,
+        availability: DEFAULT_AVAILABILITY,
+        relationship: "stranger",
+      };
+      return { people: { ...s.people, [patch.socialId]: { ...base, ...defined } } };
+    }),
+
+  removePerson: (socialId) =>
+    set((s) => {
+      if (!(socialId in s.people)) return {};
+      const { [socialId]: _gone, ...rest } = s.people;
+      const { [socialId]: _unread, ...unread } = s.unread;
+      return { people: rest, unread };
+    }),
+
+  setAvailability: (socialId, availability) =>
+    set((s) => {
+      const person = s.people[socialId];
+      if (!person || person.availability === availability) return {};
+      return { people: { ...s.people, [socialId]: { ...person, availability } } };
+    }),
+
+  setRequests: ({ incoming, outgoing }) =>
+    set((s) => ({
+      incoming: incoming ?? s.incoming,
+      outgoing: outgoing ?? s.outgoing,
+    })),
+
+  bumpUnread: (socialId, by = 1) =>
+    set((s) => ({ unread: { ...s.unread, [socialId]: (s.unread[socialId] ?? 0) + by } })),
+
+  clearUnread: (socialId) =>
+    set((s) => {
+      if (!(socialId in s.unread)) return {};
+      const { [socialId]: _gone, ...rest } = s.unread;
+      return { unread: rest };
+    }),
+
+  reset: () => set(() => ({ ...INITIAL })),
+}));
+
+// ── Selectors (pure over a snapshot, so they unit-test without a React tree) ─────────────────────
+
+const AVAILABILITY_RANK: Record<Availability, number> = { available: 0, away: 1, offline: 2 };
+
+/**
+ * Sort rank. An unrecognized value ranks **AS `offline`** — not as a fourth tier below it.
+ *
+ * Said precisely because the obvious phrasing ("fail-closed to last") is *wrong* about what this
+ * does: the fallback is `offline`'s own rank, so an unknown value TIES with offline and the
+ * display-name tiebreak decides between them. That is deliberate and it is the consistent choice —
+ * `setPeople` already defaults a missing availability to `offline`, and `AvailabilityDot`'s
+ * `availabilityMeta` degrades an unknown one to the offline MARK, so a person who renders as offline
+ * sorting among the offline people is what the user actually sees. A distinct fourth rank would put
+ * them somewhere the dot does not explain.
+ *
+ * The `??` is not dead code even though the parameter is typed: the value can reach here from an
+ * unchecked API cast (see {@link IncomingPerson}), and `undefined` would make the subtraction `NaN`.
+ * A `NaN` comparator does not sort that row to the end — it makes the WHOLE sort
+ * implementation-defined, so one bad row scrambles everyone. Hence the widened index.
+ */
+function availabilityRank(availability: Availability): number {
+  return (
+    (AVAILABILITY_RANK as Record<string, number | undefined>)[availability] ??
+    AVAILABILITY_RANK.offline
+  );
+}
+
+/** Everyone with a row, ordered the way the column paints them: available first (the people you can
+ *  actually reach right now), then by display name, case-insensitively. Ties broken on `username`
+ *  so the order is total and cannot flap between renders. */
+export function peopleList(people: Record<string, Person>): Person[] {
+  return Object.values(people).sort(
+    (a, b) =>
+      availabilityRank(a.availability) - availabilityRank(b.availability) ||
+      personName(a).localeCompare(personName(b), undefined, { sensitivity: "base" }) ||
+      a.username.localeCompare(b.username),
+  );
+}
+
+/** What a person is CALLED on screen and in a mention. The display name when they set one, else the
+ *  username — one function so the row, the avatar letter and the @mention address can never
+ *  disagree about who a message is addressed to. */
+export function personName(person: Pick<Person, "username" | "displayName">): string {
+  return person.displayName?.trim() || person.username;
+}
+
+/**
+ * The @MENTION SEAM, and the reason it is here rather than in the stage that needs it: it costs
+ * nothing now and retrofitting it costs a second, laxer notion of who is addressable.
+ *
+ * Returns exactly the {@link MentionAgent} shape `Concierge/mentions` already consumes — the same
+ * shape `rosterFromMentions` synthesises — so a person can be dropped into the picker's roster with
+ * no adapter and no second matcher. `id` is the `person:` MOUNT id, not the raw `socialId`, because
+ * that is the id every downstream consumer of a mention routes on.
+ *
+ * The filler fields mirror `rosterFromMentions` with ONE deliberate difference: `canAcceptInput` is
+ * TRUE. That field means "can receive a prompt at all"; `rosterFromMentions` hardcodes false because
+ * its inputs are finished messages, history that addresses nothing. A person can always receive —
+ * an offline peer's message is durably written and delivered on reconnect (§6, persist-then-fan-out),
+ * so availability is not a routing gate and must not be read as one.
+ */
+export function roster(people: Record<string, Person>): MentionAgent[] {
+  return peopleList(people).map((p) => ({
+    id: personAgentId(p.socialId),
+    name: personName(p),
+    projectId: "",
+    projectName: "",
+    band: "running" as const,
+    canAcceptInput: true,
+  }));
+}
+
+/** Total unread across everyone — the number the Chat section header badges. */
+export function totalUnread(unread: Record<string, number>): number {
+  return Object.values(unread).reduce((sum, n) => sum + n, 0);
+}
