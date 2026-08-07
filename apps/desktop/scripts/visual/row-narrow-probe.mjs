@@ -43,9 +43,11 @@
 // ── WIDTHS, AND WHY THESE ONES ─────────────────────────────────────────────────────────────────
 // `BUILD_COLUMN_DEFAULT_WIDTH` is 220 and `BUILD_COLUMN_MIN_WIDTH` is 50. 220 is the width every
 // user boots into and the width the founder's screenshot was taken at, so it is the primary case.
-// 190 is `STAGE_CHIP_MIN_COLUMN_PX` — the exact threshold the stage chip disappears at, where an
-// off-by-one shows up. 160 and 120 are below it, which is the band a dragged-narrow column reaches
-// and where the previous fix's "the chip is simply deleted" bug lived unmeasured for a day.
+// 240 sits in the 220-259 band where the name's tight floor and the strict legibility rule are both
+// active — a band nothing sampled while the floor was (wrongly) keyed to the stage chip's 260.
+// 190 is below `STAGE_CHIP_MIN_COLUMN_PX` (260), so the stage chip is silent and the collapse is on.
+// 160 and 120 are the dragged-narrow band, where the previous fix's "the chip is simply deleted"
+// bug lived unmeasured for a day.
 
 import { pathToFileURL } from "node:url";
 import { launch } from "./cdp.mjs";
@@ -65,7 +67,7 @@ export function parseArgs(argv) {
  * The default width sweep. 320 is a comfortably wide control — every check must pass there too, so
  * a "fix" that simply hides everything at every width cannot pass this probe.
  */
-export const DEFAULT_WIDTHS = [320, 220, 190, 160, 120];
+export const DEFAULT_WIDTHS = [320, 240, 220, 190, 160, 120];
 
 /**
  * How many characters of its own name a row must actually render.
@@ -212,9 +214,15 @@ const MEASURE = `
     const visibleRect = (el, row) => {
       let r = el.getBoundingClientRect();
       let box = { left: r.left, right: r.right, top: r.top, bottom: r.bottom };
+      // ANY overflow other than 'visible' clips — 'auto', 'scroll' and 'clip' included. Treating
+      // only 'hidden' as clipping under-reports, and every under-report here is a SILENT PASS on a
+      // check whose whole purpose is that a warning may never be hidden.
+      // The walk runs to the COLUMN, not to row.parentElement: the list scroll container sets
+      // overflowX hidden ABOVE the row, so stopping at the row missed the column's own clip and
+      // counted a mark painted past the column's right edge as fully visible.
       for (let p = el.parentElement; p; p = p.parentElement) {
         const cs = getComputedStyle(p);
-        if (cs.overflowX === 'hidden' || cs.overflowY === 'hidden' || cs.overflow === 'hidden') {
+        if (cs.overflowX !== 'visible' || cs.overflowY !== 'visible') {
           const pr = p.getBoundingClientRect();
           box = {
             left: Math.max(box.left, pr.left),
@@ -223,7 +231,7 @@ const MEASURE = `
             bottom: Math.min(box.bottom, pr.bottom),
           };
         }
-        if (p === row.parentElement) break;
+        if (p === col) break;
       }
       box.width = Math.max(0, box.right - box.left);
       box.height = Math.max(0, box.bottom - box.top);
@@ -331,7 +339,11 @@ const MEASURE = `
           const v = visibleRect(el, row);
           // MOST of the mark must survive the clip. A glyph showing two of its ten pixels is not a
           // warning anybody can read, so "visible at all" is the wrong bar; half is the honest one.
-          return r.width > 0 && v.width < r.width * 0.5;
+          // AREA, not width: one clipping ancestor is a FIXED-HEIGHT box (height: GLYPH_SLOT_H), so
+          // a width-only test reports a vertically-clipped mark as fully painted — a silent pass on
+          // a hidden warning, which is the exact failure this check exists to prevent.
+          const area = r.width * r.height;
+          return area > 0 && v.width * v.height < area * 0.5;
         }).length,
         prose: ${JSON.stringify(FORBIDDEN_ROW_PROSE)}.filter((p) => text.includes(p)),
         // A row wider than the column is the horizontal-overflow case.
@@ -466,8 +478,17 @@ export function verdictFor(width, m) {
   // The component's call to `noticeClusterCollapses` was verified by nothing: the unit test pins the
   // PREDICATE, and jsdom pins `columnWidth` at 0 so the row always renders the wide branch there.
   // This reads the rendered result at a real width.
+  // DERIVED FROM OBSERVED BEHAVIOUR, NOT A LITERAL. This read `width < 260`, hardcoding
+  // NOTICE_CLUSTER_MIN_COLUMN_PX — a constant this file cannot import and which has already drifted
+  // once (the header below still said 190 after it became 260). Lower the app threshold and the
+  // probe would have failed at 220 claiming "the call site regressed" on a component behaving
+  // correctly: a false red, which this file's own header argues is worse than no check.
+  // The two rules share ONE threshold by construction (NOTICE_CLUSTER_MIN_COLUMN_PX is defined as
+  // STAGE_CHIP_MIN_COLUMN_PX), so the stage chip's own silence is the app telling us which side of
+  // it we are on — no literal required, and the binding cannot rot.
   const collapsedRows = m.rows.filter((r) => r.hasOverflowMark);
-  if (width < 260) {
+  const narrowByBehaviour = !m.rows.some((r) => r.hasStage);
+  if (narrowByBehaviour) {
     if (collapsedRows.length === 0) {
       fail(
         "the notice cluster COLLAPSES below its threshold",

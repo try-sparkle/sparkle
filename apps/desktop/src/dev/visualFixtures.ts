@@ -1093,11 +1093,17 @@ export function applyVisualFixtures(
     labels: ["agent-feedback", `agent:${agentId}`],
     priority: 2,
   });
+  // TWELVE ON ONE ROW, AND THAT COUNT IS THE POINT — it makes the pill TWO DIGITS.
+  // The compact pill exists because "FEEDBACK 18" is ~70px, and an earlier version of this fixture
+  // seeded three beads, so every measurement was taken against a one-digit pill ~7px narrower than
+  // the case the change was written for. The widest real form has to be the form the probe grades,
+  // or the checks pass on a state production never reaches — the same "the fixture cannot reach it"
+  // hole this seed was added to close, one digit shallower.
   const fixtureBeads: Bead[] = [
     feedbackBead("vfx-bead-1", "vfx-agent-4", "Row chrome outbids the agent name on a narrow column"),
-    feedbackBead("vfx-bead-2", "vfx-agent-6", "The stage chip repeats its own section heading"),
-    feedbackBead("vfx-bead-3", "vfx-agent-6", "Notice marks need one collapsed affordance"),
-    feedbackBead("vfx-bead-4", "vfx-agent-6", "A clipped mark must never hide what needs you"),
+    ...Array.from({ length: 12 }, (_, i) =>
+      feedbackBead(`vfx-bead-${i + 2}`, "vfx-agent-6", `Narrow-row finding ${i + 1}`),
+    ),
   ];
   useBeadsStore.setState({
     byProject: {

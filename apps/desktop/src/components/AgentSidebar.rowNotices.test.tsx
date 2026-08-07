@@ -59,7 +59,12 @@ import {
   noticeClusterCollapses,
   NOTICE_CLUSTER_MIN_COLUMN_PX,
 } from "./AgentSidebar";
-import { AGENT_NAME_MIN_WIDTH_PX } from "./FittedAgentName";
+import {
+  agentNameFloorFor,
+  AGENT_NAME_MIN_WIDTH_PX,
+  AGENT_NAME_TIGHT_MIN_WIDTH_PX,
+  AGENT_NAME_TIGHT_FLOOR_BELOW_PX,
+} from "./FittedAgentName";
 import { BUILD_COLUMN_DEFAULT_WIDTH } from "../engine/columnResize";
 import { THRASH_VERDICT_LABEL } from "./rowAttention";
 import { useProjectStore } from "../stores/projectStore";
@@ -528,6 +533,38 @@ describe("stageChipShows — the narrow-column rule, as a pure predicate", () =>
     // collapse from being applied blindly to every narrow row.
     expect(noticeClusterCollapses(NOTICE_CLUSTER_MIN_COLUMN_PX - 1, 1)).toBe(false);
     expect(noticeClusterCollapses(NOTICE_CLUSTER_MIN_COLUMN_PX - 1, 0)).toBe(false);
+  });
+
+  // ── THE NAME'S FLOOR ─────────────────────────────────────────────────────────────────────────
+  // These exist because the floor SHIPPED keyed to the wrong threshold and nothing could fail.
+  // The call site read `stageChipShows(columnWidth) ? wide : tight`, and `stageChipShows(0)` is
+  // TRUE while jsdom pins columnWidth at 0 — so every jsdom render took the wide branch, the
+  // existing `minWidth` assertion pinned only that branch, and the narrow branch that actually
+  // ships was unguarded. Extracting the decision into a pure function is what makes both
+  // reachable.
+  it("KEEPS THE FULL FLOOR AT THE WIDTH THE APP OPENS AT", () => {
+    // THE REGRESSION THIS PINS. The tight floor was gated on the stage chip's 260 while its own
+    // docs said 220, so the whole 220-259 band — including BUILD_COLUMN_DEFAULT_WIDTH — got the
+    // 16px floor. A row carrying enough badges could then squeeze the name to about one character
+    // plus an ellipsis: the "G." / "F" reading AGENT_NAME_MIN_WIDTH_PX exists to prevent, at the
+    // one width every user boots into.
+    expect(agentNameFloorFor(BUILD_COLUMN_DEFAULT_WIDTH)).toBe(AGENT_NAME_MIN_WIDTH_PX);
+    // The whole band, not just its edge — asserted as a RELATIONSHIP so moving either constant
+    // re-fails this rather than leaving a literal that silently goes stale.
+    expect(AGENT_NAME_TIGHT_FLOOR_BELOW_PX).toBeLessThanOrEqual(BUILD_COLUMN_DEFAULT_WIDTH);
+    expect(agentNameFloorFor(STAGE_CHIP_MIN_COLUMN_PX - 1)).toBe(AGENT_NAME_MIN_WIDTH_PX);
+  });
+
+  it("drops to the tight floor only BELOW its own threshold, so a warning outranks unreadable letters", () => {
+    expect(agentNameFloorFor(AGENT_NAME_TIGHT_FLOOR_BELOW_PX - 1)).toBe(
+      AGENT_NAME_TIGHT_MIN_WIDTH_PX,
+    );
+    expect(agentNameFloorFor(AGENT_NAME_TIGHT_FLOOR_BELOW_PX)).toBe(AGENT_NAME_MIN_WIDTH_PX);
+    expect(agentNameFloorFor(120)).toBe(AGENT_NAME_TIGHT_MIN_WIDTH_PX);
+  });
+
+  it("treats NOT-YET-MEASURED as the WIDE floor, so booting never flashes a one-character name", () => {
+    expect(agentNameFloorFor(0)).toBe(AGENT_NAME_MIN_WIDTH_PX);
   });
 
   it("treats NOT-YET-MEASURED as wide, so booting does not flicker every row at once (collapse too)", () => {

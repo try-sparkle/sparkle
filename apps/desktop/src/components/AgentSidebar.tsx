@@ -174,8 +174,7 @@ import { StatusDot } from "./StatusDot";
 import {
   FittedAgentName,
   AGENT_NAME_FONT_SIZE,
-  AGENT_NAME_MIN_WIDTH_PX,
-  AGENT_NAME_TIGHT_MIN_WIDTH_PX,
+  agentNameFloorFor,
   rowTitleWeight,
 } from "./FittedAgentName";
 import { ModelPill } from "./ModelPill";
@@ -4947,6 +4946,16 @@ const AgentRow = memo(function AgentRow({
         title={`${feedbackCount} feedback ${feedbackCount === 1 ? "bead" : "beads"} from this agent — open in Plan`}
         style={{
           flex: "0 0 auto",
+          // A FLEX CONTAINER, because the compact branch below puts an <svg> beside a number. In an
+          // inline span an SVG aligns to the TEXT BASELINE — the glyph rides high against the digits
+          // and the descender grows the pill's line box, on the one row element whose pixel budget
+          // this whole change is about — and `flex: "0 0 auto"` on the icon is inert with no flex
+          // parent to honour it. Every sibling that pairs a glyph with a count (the goal chip, the
+          // notice mark) already does this; the wide branch is a bare string, which is why the
+          // omission was invisible until the compact form existed.
+          display: "inline-flex",
+          alignItems: "center",
+          gap: 2,
           fontFamily: FONT_MONO,
           fontSize: TYPE.micro,
           lineHeight: 1,
@@ -5218,12 +5227,11 @@ const AgentRow = memo(function AgentRow({
                   active={isActive}
                   // Below the width where a readable name is achievable, the floor drops so a
                   // notice mark is never pushed out of the clip by letters nobody can act on.
-                  // See AGENT_NAME_TIGHT_MIN_WIDTH_PX.
-                  minWidthPx={
-                    stageChipShows(columnWidth ?? 0)
-                      ? AGENT_NAME_MIN_WIDTH_PX
-                      : AGENT_NAME_TIGHT_MIN_WIDTH_PX
-                  }
+                  // `agentNameFloorFor` owns that decision and its OWN threshold: this used to read
+                  // `stageChipShows(...) ? wide : tight`, which borrowed the stage chip's 260 for a
+                  // rule documented at 220 and so applied the 16px floor across the whole 220–259
+                  // band — including the default width. See AGENT_NAME_TIGHT_FLOOR_BELOW_PX.
+                  minWidthPx={agentNameFloorFor(columnWidth ?? 0)}
                   onDoubleClick={(e) => {
                     e.stopPropagation();
                     setEditing(a.id);

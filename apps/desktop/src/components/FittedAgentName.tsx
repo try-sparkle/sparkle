@@ -80,17 +80,63 @@ export const AGENT_NAME_MIN_WIDTH_PX = 64;
  * way round. Bead sparkle-tyter.
  *
  * The 64px floor above is the right answer while a readable name is achievable. Below
- * `NAME_LEGIBLE_MIN_COLUMN_PX` (220) it stops being: `row-narrow-probe` measured a 120px column
+ * `AGENT_NAME_TIGHT_FLOOR_BELOW_PX` it stops being: `row-narrow-probe` measured a 120px column
  * where the floor held its 64px and pushed the row's notice mark clean outside the clip — the name
  * kept 8 characters nobody could act on, and the amber mark saying something needs you was painted
  * where nothing is drawn. That is the one outcome this row may never produce (the invariant
  * `sparkle/agent-5e4caa2c` owns), and the 64px floor was the thing producing it.
  *
- * So at those widths the floor drops far enough for the marks to survive. 32px is still ~4
- * 16px is ~2 characters, which keeps the ORIGINAL bug fixed — the name degrades, it never vanishes — while
- * ranking a warning above the 5th through 8th letters of a name that is already truncated.
+ * 16px is ~2 characters plus the ellipsis. That keeps the ORIGINAL bug fixed — the name degrades,
+ * it never vanishes — while ranking a warning above the 3rd through 8th letters of a name that is
+ * already truncated past usefulness at those widths.
  */
 export const AGENT_NAME_TIGHT_MIN_WIDTH_PX = 16;
+
+/**
+ * THE WIDTH THIS FLOOR SWAPS AT — its OWN constant, not the stage chip's.
+ *
+ * ══ THE BUG THIS FIXES, WHICH SHIPPED ═════════════════════════════════════════════════════════
+ * The tight floor was first gated on `stageChipShows()`, whose threshold is
+ * `STAGE_CHIP_MIN_COLUMN_PX` = 260 — while this constant's own docs said "below 220" and cited a
+ * 120px column as the motivation. Those are not the same rule, and the gap between them is the
+ * 220–259px band, which INCLUDES `BUILD_COLUMN_DEFAULT_WIDTH` (220): the width the app opens at and
+ * the width the founder's screenshot was taken at.
+ *
+ * So at the default width the name's floor was 16px rather than 64px. It did not bind for the
+ * fixture's rows — removing the timer and the pill's word bought enough slack — but any row
+ * carrying the worker-count badge, the inbox badge, an unjudged-ask chip and a cloud glyph could
+ * squeeze the name to about one character plus an ellipsis. That is precisely the `"G."` / `"F"`
+ * reading `AGENT_NAME_MIN_WIDTH_PX` exists to prevent, re-introduced at the one width that matters
+ * most, by a threshold borrowed from a different decision.
+ *
+ * ══ WHY A SEPARATE CONSTANT AND NOT A SHARED ONE ══════════════════════════════════════════════
+ * `stageChipShows` answers "is there room to spend on a status readout"; this answers "has a
+ * readable name become unachievable, so a warning should outrank the letters". They agreed by
+ * coincidence, not by meaning, and reusing one for the other is what let the two drift apart
+ * silently. Sharing a number is only safe when the QUESTION is the same.
+ *
+ * 220 is `BUILD_COLUMN_DEFAULT_WIDTH`, and it is the same boundary `row-narrow-probe` grades name
+ * legibility at — above it a readable name is required, so the 64px floor must hold; below it the
+ * probe stops grading legibility, which is exactly where trading letters for a visible warning
+ * becomes the right call.
+ */
+export const AGENT_NAME_TIGHT_FLOOR_BELOW_PX = 220;
+
+/**
+ * The floor this column width gets. Pure and exported for the same reason `stageChipShows` is:
+ * jsdom has no layout engine and pins the measured width at 0, so a test that rendered the row and
+ * measured would read one branch forever. The component measures; this decides — and BOTH branches
+ * are unit-testable, which the inlined `stageChipShows(...) ? A : B` at the call site was not.
+ *
+ * 0 means "not measured yet" and takes the WIDE floor, matching `stageChipShows`: booting into the
+ * tight floor and widening a frame later is a visible reflow on every row at once.
+ */
+export function agentNameFloorFor(columnWidthPx: number): number {
+  if (!(columnWidthPx > 0)) return AGENT_NAME_MIN_WIDTH_PX;
+  return columnWidthPx < AGENT_NAME_TIGHT_FLOOR_BELOW_PX
+    ? AGENT_NAME_TIGHT_MIN_WIDTH_PX
+    : AGENT_NAME_MIN_WIDTH_PX;
+}
 
 export function FittedAgentName({
   title,
