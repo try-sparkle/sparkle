@@ -34,7 +34,9 @@
 //! for things that no longer exist, and flags that are PULLED by command with an event as an
 //! optimisation on top. One pattern, not two.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -916,6 +918,70 @@ struct Watch {
     tracked: HashMap<u64, Tracked>,
     /// Earliest moment it is worth shelling out to `gh` again.
     next_scan_at_ms: u64,
+    /// Identity of the LAST cross-project PR-number collision set we announced, so a steady state
+    /// is announced once instead of once per PR per sweep. `None` = no collisions last sweep, which
+    /// is what makes a recurrence after a clean sweep announce itself again.
+    last_collision_fp: Option<u64>,
+}
+
+/// How many `project#pr` pairs a collision announcement names before it elides the rest.
+const COLLISION_SAMPLE: usize = 8;
+
+/// One sweep's cross-project PR-number collisions, collapsed into ONE line.
+///
+/// The collision itself is deliberate and documented at the call site: [`ConflictFlags`] is keyed by
+/// PR NUMBER alone, so two projects' `#12` cannot both be tracked and the loser is skipped. That is
+/// a real degradation and it must stay visible — but it is also a STEADY state, re-derived
+/// identically on every sweep, and it used to be announced once per colliding PR per sweep. On a
+/// machine with a dozen sibling projects that is ~9 warnings every 20s: measured at 26,587 lines
+/// across two days, ~88% of all WARN volume, which buries every other signal in the log (including
+/// the unreadable-repo arm right below it, and the crash and hang traces the log exists for).
+/// Drowning a degradation notice in copies of itself is indistinguishable from not reporting it.
+struct CollisionDigest {
+    /// How many PRs were skipped this sweep.
+    total: usize,
+    /// How many distinct projects lost at least one PR to a collision.
+    projects: usize,
+    /// Stable identity of the collision SET — equal iff the same projects lost the same PRs, so an
+    /// unchanged set is not re-announced and a CHANGED one always is.
+    fingerprint: u64,
+    /// Sorted, bounded `project#pr` sample, so the line still names names.
+    sample: String,
+}
+
+/// Collapse this sweep's collisions into one announcement, or `None` if there were none.
+fn collision_digest(collisions: &[(String, u64)]) -> Option<CollisionDigest> {
+    if collisions.is_empty() {
+        return None;
+    }
+    // Sort so the fingerprint is a property of the SET, not of the order `discover_repos` happened
+    // to return the projects in — otherwise a reordered but identical set re-announces itself.
+    let mut pairs: Vec<(&str, u64)> = collisions.iter().map(|(p, n)| (p.as_str(), *n)).collect();
+    pairs.sort_unstable();
+    pairs.dedup();
+
+    let mut projects: Vec<&str> = pairs.iter().map(|(p, _)| *p).collect();
+    projects.dedup();
+
+    let mut hasher = DefaultHasher::new();
+    pairs.hash(&mut hasher);
+
+    let mut sample = pairs
+        .iter()
+        .take(COLLISION_SAMPLE)
+        .map(|(p, n)| format!("{p}#{n}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if pairs.len() > COLLISION_SAMPLE {
+        sample.push_str(&format!(", …+{}", pairs.len() - COLLISION_SAMPLE));
+    }
+
+    Some(CollisionDigest {
+        total: pairs.len(),
+        projects: projects.len(),
+        fingerprint: hasher.finish(),
+        sample,
+    })
 }
 
 /// One PR's turn this tick.
@@ -1067,6 +1133,8 @@ fn tick<R: Runtime>(app: &AppHandle<R>, watch: &mut Watch, now: u64) {
     let mut saturated: HashSet<String> = HashSet::new();
     let mut unreadable = 0usize;
     let mut last_error: Option<&'static str> = None;
+    // `(project, pr)` for every PR this sweep skipped because another project claimed the number.
+    let mut collisions: Vec<(String, u64)> = Vec::new();
 
     for repo in &repos {
         match probe_repo(repo, probe_open_prs) {
@@ -1078,12 +1146,9 @@ fn tick<R: Runtime>(app: &AppHandle<R>, watch: &mut Watch, now: u64) {
                     // collide. First project (sorted) wins and the collision is LOGGED rather than
                     // silently merged — a visible degradation beats cross-project cross-talk.
                     if !seen.insert(f.number) {
-                        tracing::warn!(
-                            target: "conflict_watch",
-                            pr = f.number,
-                            project = %repo.project_id,
-                            "PR number already claimed by another project this sweep; skipping"
-                        );
+                        // Announced ONCE per distinct collision set, after the loop — see
+                        // `CollisionDigest` for why this is not a per-PR warning.
+                        collisions.push((repo.project_id.clone(), f.number));
                         continue;
                     }
                     // NOTE: commits-behind is deliberately NOT computed here. It costs a `git`
@@ -1135,6 +1200,33 @@ fn tick<R: Runtime>(app: &AppHandle<R>, watch: &mut Watch, now: u64) {
             }
         }
     }
+    // Announce the sweep's collisions ONCE, and only when the set actually changed. A steady state
+    // stays discoverable at debug level; a NEW or CHANGED collision is always a warning.
+    match collision_digest(&collisions) {
+        Some(d) => {
+            if watch.last_collision_fp == Some(d.fingerprint) {
+                tracing::debug!(
+                    target: "conflict_watch",
+                    prs = d.total,
+                    projects = d.projects,
+                    "PR-number collisions unchanged since the last announcement"
+                );
+            } else {
+                tracing::warn!(
+                    target: "conflict_watch",
+                    prs = d.total,
+                    projects = d.projects,
+                    sample = %d.sample,
+                    "PR numbers claimed by another project this sweep; these PRs are NOT being \
+                     watched for conflicts. Announced once per distinct collision set."
+                );
+            }
+            watch.last_collision_fp = Some(d.fingerprint);
+        }
+        // Cleared: the next collision, even an identical one, is news again.
+        None => watch.last_collision_fp = None,
+    }
+
     // Record readability even when NOTHING is tracked — the cold-start case, where the per-PR
     // fail-closed path above has nothing to act on and `conflict_flags` would otherwise return an
     // empty list that reads as "no conflicts". See `ProbeStatus`.
@@ -1251,6 +1343,83 @@ fn tick<R: Runtime>(app: &AppHandle<R>, watch: &mut Watch, now: u64) {
 mod tests {
     use super::*;
     use conflict_ladder::Observation;
+
+    fn collisions(pairs: &[(&str, u64)]) -> Vec<(String, u64)> {
+        pairs.iter().map(|(p, n)| ((*p).to_string(), *n)).collect()
+    }
+
+    #[test]
+    fn no_collisions_produces_no_announcement() {
+        assert!(collision_digest(&[]).is_none());
+    }
+
+    #[test]
+    fn digest_counts_prs_and_distinct_projects() {
+        let d = collision_digest(&collisions(&[("alpha", 12), ("alpha", 13), ("beta", 12)]))
+            .expect("collisions present");
+        assert_eq!(d.total, 3, "every skipped PR is counted");
+        assert_eq!(d.projects, 2, "distinct projects, not rows");
+    }
+
+    /// The whole point: the same collision set re-derived next sweep must fingerprint EQUAL, so it
+    /// is announced once rather than once per PR per sweep.
+    #[test]
+    fn identical_set_fingerprints_equal_regardless_of_order() {
+        let a = collision_digest(&collisions(&[("alpha", 12), ("beta", 30), ("alpha", 13)]))
+            .expect("collisions present");
+        // `discover_repos` gives no order guarantee, so an identical set may arrive permuted.
+        let b = collision_digest(&collisions(&[("beta", 30), ("alpha", 13), ("alpha", 12)]))
+            .expect("collisions present");
+        assert_eq!(a.fingerprint, b.fingerprint);
+    }
+
+    /// …and the other half: a set that CHANGED must never be silently swallowed by the dedupe.
+    #[test]
+    fn changed_set_fingerprints_differently() {
+        let base = collision_digest(&collisions(&[("alpha", 12)])).expect("collisions present");
+
+        let added = collision_digest(&collisions(&[("alpha", 12), ("alpha", 13)]))
+            .expect("collisions present");
+        assert_ne!(base.fingerprint, added.fingerprint, "a NEW skipped PR is news");
+
+        let other_pr = collision_digest(&collisions(&[("alpha", 13)])).expect("collisions present");
+        assert_ne!(base.fingerprint, other_pr.fingerprint, "a different PR is news");
+
+        // Same PR number, different loser project — the cross-project case this module is about.
+        let other_project =
+            collision_digest(&collisions(&[("beta", 12)])).expect("collisions present");
+        assert_ne!(
+            base.fingerprint, other_project.fingerprint,
+            "a different project losing the same number is news"
+        );
+    }
+
+    /// A duplicate row is the same fact twice, not a second collision.
+    #[test]
+    fn repeated_pair_is_counted_once() {
+        let d = collision_digest(&collisions(&[("alpha", 12), ("alpha", 12)]))
+            .expect("collisions present");
+        assert_eq!(d.total, 1);
+        assert_eq!(d.sample, "alpha#12");
+    }
+
+    #[test]
+    fn sample_names_names_and_is_bounded() {
+        let many: Vec<(String, u64)> = (0..COLLISION_SAMPLE as u64 + 5)
+            .map(|n| ("alpha".to_string(), 100 + n))
+            .collect();
+        let d = collision_digest(&many).expect("collisions present");
+
+        assert_eq!(d.total, COLLISION_SAMPLE + 5);
+        assert!(d.sample.starts_with("alpha#100, alpha#101"), "sample: {}", d.sample);
+        assert!(d.sample.ends_with("…+5"), "the elision states how many it dropped: {}", d.sample);
+        assert_eq!(
+            d.sample.matches("alpha#").count(),
+            COLLISION_SAMPLE,
+            "the line must stay one readable line, not all {} pairs",
+            d.total
+        );
+    }
 
     /// A PR that went DIRTY and stayed there, with no checks at all — the shape the bead describes.
     fn conflicting_facts() -> PrFacts {
