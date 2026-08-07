@@ -192,32 +192,40 @@ describe("installDictationFocusTracker — the event wiring", () => {
     hasFocus.mockRestore();
   });
 
-  it("still reports the FIRST real background transition — the edge fires once", () => {
-    // The half that makes the case above non-vacuous: a guard that suppressed every blur would pass
-    // it too, while breaking the window-focus handoff this listener exists for.
+  it("still reports the FIRST real background transition, and the SECOND blur is not another edge", () => {
+    // ONE tracker instance throughout, and a terminal mounted BEFORE install — both load-bearing.
+    //
+    // My previous rewrite of this half was vacuous in a way the comment denied (roborev 59936): it
+    // mounted no terminal, so `lastOwner` was already "other" at install, and clearing the DOM left
+    // `activeElement` as <body>. Deleting the guard then changed nothing observable — the re-read
+    // reclassified <body> as "other", equal to `lastOwner`, so `setFocusOwner` stayed silent either
+    // way. It also tore down and re-installed, which reset `domWindowFocused` from the seed and
+    // meant the second blur was never evaluated against the real true -> false edge the first half
+    // had just made — the exact thing this test's name promises.
+    const term = mountTerminal();
+    term.focus();
     const hasFocus = vi.spyOn(document, "hasFocus").mockReturnValue(true);
+    const setFocusOwner = vi.fn();
     const setWindowFocused = vi.fn();
-    uninstall = installDictationFocusTracker({ setFocusOwner: vi.fn(), setWindowFocused });
+    uninstall = installDictationFocusTracker({ setFocusOwner, setWindowFocused });
+    setFocusOwner.mockClear();
     setWindowFocused.mockClear();
 
-    hasFocus.mockReturnValue(false); // the window really went background
+    // A REAL background transition — the edge fires.
+    hasFocus.mockReturnValue(false);
     window.dispatchEvent(new Event("blur"));
     expect(setWindowFocused).toHaveBeenCalledWith(false);
 
-    // …and a SECOND blur while still background is not another edge. ASSERTED ON setFocusOwner,
-    // for the reason the sibling case documents at length: `writeWindowFocused` dedupes by VALUE, so
-    // `setWindowFocused` is silent on a repeat whether the edge guard exists or not — that half of
-    // this test used to survive deleting the very line it names. The unconditional caret re-read is
-    // the observable difference, so tear the terminal out first and watch for that instead.
-    const setFocusOwner2 = vi.fn();
-    uninstall?.();
-    uninstall = installDictationFocusTracker({ setFocusOwner: setFocusOwner2, setWindowFocused });
-    setFocusOwner2.mockClear();
-    document.body.innerHTML = ""; // activeElement -> <body>, with NO focusin to announce it
+    // A SECOND blur while still background is not another edge. Asserted on the caret re-read,
+    // because `writeWindowFocused` dedupes by VALUE and so says nothing here either way — and the
+    // terminal is torn out first so a re-read WOULD report a different owner ("terminal" -> "other")
+    // if the guard were gone.
+    setFocusOwner.mockClear();
+    document.body.innerHTML = "";
 
     window.dispatchEvent(new Event("blur"));
 
-    expect(setFocusOwner2).not.toHaveBeenCalled();
+    expect(setFocusOwner).not.toHaveBeenCalled();
     hasFocus.mockRestore();
   });
 
