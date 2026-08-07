@@ -62,7 +62,11 @@ const ERROR_MESSAGE_CHARS: usize = 600;
 /// How long any single bd invocation may run before it is killed and reported as `timeout`.
 /// Generous because bd's Dolt-backed storage can be slow to open a cold database, but finite:
 /// the whole point is that a wedged bd surfaces as a typed error instead of hanging the caller.
-const BD_TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// `pub(crate)` so `notes::run_bd` bounds its own bd calls with THIS budget rather than declaring a
+/// second one. Both modules drive the same Dolt store through the same binary, so two constants
+/// would be two policies that silently drift apart.
+pub(crate) const BD_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long we wait for the pipe readers once the child itself is gone.
 ///
 /// This is NOT a second timeout for bd; it is the bound that makes BD_TIMEOUT mean anything. bd is
@@ -518,12 +522,16 @@ fn parse_links(stdout: &str, id: &str) -> (Vec<BeadLink>, Vec<BeadLink>, bool) {
 // ── The runner ────────────────────────────────────────────────────────────────────────────────
 
 /// Raw result of one bd invocation.
+///
+/// `pub(crate)` because `notes::run_bd` returns this instead of `std::process::Output`: an
+/// `ExitStatus` cannot be constructed portably on stable (`ExitStatusExt::from_raw` is unix-only)
+/// and this crate must keep building on Windows, so a bounded runner has to hand back its own type.
 #[derive(Debug)]
-struct BdOutput {
-    status: Option<i32>,
-    success: bool,
-    stdout: String,
-    stderr: String,
+pub(crate) struct BdOutput {
+    pub(crate) status: Option<i32>,
+    pub(crate) success: bool,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
 }
 
 /// Extra environment applied to the CHILD only, as `(name, value)` pairs.
@@ -532,10 +540,10 @@ struct BdOutput {
 /// without calling `std::env::set_var`, which mutates this whole process — `cargo test` runs tests
 /// on parallel threads, so a process-wide set leaks into every other test in the binary and is
 /// `unsafe` under the 2024 edition besides.
-type ChildEnv<'a> = &'a [(&'a str, &'a str)];
+pub(crate) type ChildEnv<'a> = &'a [(&'a str, &'a str)];
 
 /// The production child environment: nothing beyond what `run_cmd_timed` already sets.
-const NO_EXTRA_ENV: ChildEnv<'static> = &[];
+pub(crate) const NO_EXTRA_ENV: ChildEnv<'static> = &[];
 
 /// Reject a project root that does not exist, BEFORE spawning.
 ///
@@ -574,11 +582,15 @@ fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::sync::mpsc::Receiver
 /// Run `bd <args>` in `project_path` with a hard timeout, returning typed errors.
 ///
 /// Reuses `notes::cached_bd_path` / `notes::bd_exec_path` so bd is located and PATH-augmented
-/// EXACTLY as the board's path does it (see the module note). Differences from `notes::run_bd`, and
-/// the reason this exists at all:
-///   * a TIMEOUT — `notes::run_bd` uses `.output()`, which blocks forever on a wedged bd. bd is
-///     Dolt-backed and takes a lock; a hung call there hangs the caller with no way out.
-///   * typed errors instead of `String`.
+/// EXACTLY as the board's path does it (see the module note). The remaining difference from
+/// `notes::run_bd` is the error type: typed `BeadsError` here, `String` there (the board's frontend
+/// contract is stringly).
+///
+/// The BOUND is no longer a difference. `notes::run_bd` used `.output()`, which blocks forever on a
+/// wedged bd — bd is Dolt-backed and takes a lock on a store shared by every worktree, so a hung
+/// call there hung the caller with no way out, and surfaced to the concierge as
+/// `bridge request timeout: concierge_tool`. It now delegates to `run_cmd_timed` with this same
+/// `BD_TIMEOUT`, so both surfaces are bounded by one budget.
 fn run_bd_timed(
     project_path: &str,
     args: &[String],
@@ -601,7 +613,12 @@ fn run_bd_timed(
 /// unix-gated in Cargo.toml). Output is drained on threads so a child that fills a pipe buffer
 /// cannot deadlock against our own wait, and the wait on those threads is itself bounded — see
 /// READER_DRAIN_GRACE.
-fn run_cmd_timed(
+///
+/// `pub(crate)` so `notes::run_bd` delegates here rather than growing a SECOND timeout
+/// implementation. The subtleties above (drain threads, kill-on-expiry, the deliberate refusal to
+/// touch the readers on the timeout path) are the whole reason a second one would be wrong: each is
+/// a hang this already survives, and a re-implementation would have to rediscover all three.
+pub(crate) fn run_cmd_timed(
     program: &str,
     project_path: &str,
     args: &[String],

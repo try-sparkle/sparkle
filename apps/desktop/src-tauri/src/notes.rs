@@ -10,6 +10,8 @@ use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::beads_cmd::{self, BdOutput, BeadsError, BeadsErrorKind};
+
 // ---------------------------------------------------------------------------
 // `bd` resolution — kill the per-call login shell (PERF)
 //
@@ -246,17 +248,141 @@ pub(crate) fn bd_exec_path() -> String {
 /// path and an augmented PATH (so bd's `git` subprocess resolves under a GUI app's bare PATH).
 /// Replaces the old `/bin/zsh -l -c 'cd "$N" && bd …'` on every call — see the module note on why
 /// the login shell was a hot-path tax. `args` are real argv tokens (never a shell string), so they
-/// stay injection-safe exactly as the old positional-`$N` scheme was. `.current_dir` replaces the
-/// script's `cd "$N"` (and, as a bonus, drops the dotfile-`cd` hazard the old comment guarded).
-fn run_bd(project_path: &str, args: &[&str]) -> Result<std::process::Output, String> {
+/// stay injection-safe exactly as the old positional-`$N` scheme was. The cwd is pinned by the
+/// runner (and, as a bonus, that drops the dotfile-`cd` hazard the old comment guarded).
+///
+/// BOUNDED — this is the fix for `bridge request timeout: concierge_tool` on board writes. This fn
+/// used to end in `.output()`, which waits FOREVER. bd is Dolt/git-backed and takes a lock on a
+/// store every worktree in the repo shares, and `beadsStore.ts` polls `bd list`/`bd blocked` on a 5s
+/// interval concurrently with writes — so under contention bd BLOCKS rather than failing, and every
+/// call site here could hang permanently. The timeout ladder above it is all finite (30s MCP socket
+/// < 60s liveness stall << 600s Rust rendezvous), so an unbounded call at the bottom meant the
+/// caller was told "timeout" by a transport while the real work sat wedged with nothing to cancel
+/// it. See `beads_cmd::run_cmd_timed`, whose own doc named this exact defect.
+///
+/// Returns `beads_cmd::BdOutput`, not `std::process::Output`: a bounded runner has to synthesize its
+/// result when it kills the child, and `ExitStatus` cannot be constructed portably on stable
+/// (`ExitStatusExt::from_raw` is unix-only) while this crate must keep building on Windows. Callers
+/// read `success` / `stdout` / `stderr`, which is what they did with `Output` anyway.
+fn run_bd(project_path: &str, args: &[&str]) -> Result<BdOutput, String> {
     let bd = cached_bd_path()
         .ok_or_else(|| "bd not found — install beads or add `bd` to your PATH".to_string())?;
-    Command::new(&bd)
-        .args(args)
-        .current_dir(project_path)
-        .env("PATH", bd_exec_path())
-        .output()
-        .map_err(|e| format!("failed to run bd: {e}"))
+    run_cmd_bounded(&bd, project_path, args, beads_cmd::BD_TIMEOUT)
+}
+
+/// The delegation proper, with the program and the bound as parameters so BOTH are testable without
+/// a bd that hangs on demand — `run_cmd_timed` takes the program explicitly for the same reason.
+///
+/// Reuses `beads_cmd`'s runner rather than growing a second timeout here: that one already drains
+/// both pipes on their own threads (a child filling a 64 KB pipe buffer would otherwise deadlock
+/// against our wait — `bd list` over this repo emits ~2.9 MB), kills the child on expiry, and
+/// deliberately returns WITHOUT touching the readers on the timeout path, because bd's background
+/// `dolt sql-server` grandchild can hold the pipes open forever. Each of those is a hang; a
+/// re-implementation would have to rediscover all three.
+fn run_cmd_bounded(
+    program: &str,
+    project_path: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<BdOutput, String> {
+    let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+    beads_cmd::run_cmd_timed(program, project_path, &owned, timeout, beads_cmd::NO_EXTRA_ENV)
+        .map_err(|e| describe_bd_failure(&e, bd_subcommand_mutates(args)))
+}
+
+/// The bd subcommands this module issues that only READ. Everything else is treated as a mutation.
+///
+/// Defaulting an UNKNOWN subcommand to "mutation" is the safe direction, and the asymmetry is the
+/// whole reason to state it: over-caution on a read merely tells someone to look before retrying,
+/// while under-caution on a write invites exactly the duplicate this message exists to prevent.
+const BD_READ_SUBCOMMANDS: [&str; 4] = ["list", "show", "blocked", "where"];
+
+/// Does this invocation change the store? Pure, so the classification is testable without bd.
+///
+/// Derived from the SUBCOMMAND rather than threaded through all twelve call sites, because the
+/// subcommand IS the operation — a marker passed by hand at each site is one more thing to get
+/// wrong, and it would silently disagree with the argv actually sent.
+fn bd_subcommand_mutates(args: &[&str]) -> bool {
+    match args.first() {
+        Some(sub) => !BD_READ_SUBCOMMANDS.contains(sub),
+        None => true,
+    }
+}
+
+/// Flatten a typed `BeadsError` into the `String` this module's frontend contract speaks — and, for
+/// a TIMEOUT, say plainly that the outcome is UNKNOWN.
+///
+/// This is half the fix, not polish. Nothing cancels bd when we stop waiting: the transport that
+/// gave up at 30s left the `bd create` running to completion, so the bead very probably WAS created
+/// and only the ack was lost — and now that we kill bd ourselves, bd may equally have committed the
+/// row in the instant before the kill. A message that reads like a clean "it failed" invites exactly
+/// the wrong next action from a human and from a model.
+///
+/// And it must NOT invite a retry. `bd create` has no idempotency key, so a blind retry after a
+/// create that actually committed files a SECOND bead. The remedy is to look, not to re-send —
+/// which is why the copy names the board rather than offering a retry.
+/// `mutates` is what keeps this copy HONEST, and it was missing (roborev 59622). `run_bd` is the
+/// single choke point for reads and writes alike, so an unconditional write-ambiguity message told a
+/// timed-out `bd list` that "the item may or may not have been created" — about a call that created
+/// nothing — and warned it off the retry that is precisely the right next action for a read. That is
+/// the repo's own "a remedy string is an instruction the reader follows" failure, in the code added
+/// to fix an instance of it.
+///
+/// The Timeout variants are also NOT one outcome, and there are THREE of them, not two — an earlier
+/// version of this comment said two and the code agreed with it, which is how the bug below shipped.
+///
+///   * `None` — the KILL path. bd was still running when the bound fired, so whether it committed
+///     first is genuinely unknown. (A drain-path child killed by a SIGNAL also lands here, because
+///     `status.code()` is `None` for it. That is fine: "unknown" is the honest answer there too.)
+///   * `Some(0)` — the DRAIN path, succeeding. bd EXITED cleanly and only its output pipe stayed
+///     open (a background `dolt sql-server` grandchild holding the write end). The operation ran to
+///     completion; what was lost is the reply, not the write.
+///   * `Some(non-zero)` — the DRAIN path, FAILING. bd ran and rejected the operation, so the change
+///     most likely did NOT land.
+///
+/// Branching on `Some(_)` instead of on SUCCESS is what made the failing case claim the write had
+/// landed (roborev 59629) — the inverse of the truth, and inverted in the costly direction: a caller
+/// following that copy looks at a board showing nothing, concludes the item was already filed, and
+/// never re-files it. Keep this list in step with the match arms; a doc that still described two
+/// variants is what made the third one easy to miss.
+fn describe_bd_failure(e: &BeadsError, mutates: bool) -> String {
+    if e.kind != BeadsErrorKind::Timeout {
+        return e.message.clone();
+    }
+    if !mutates {
+        return format!(
+            "{} — this was a read, so nothing was written and retrying is safe.",
+            e.message
+        );
+    }
+    match e.exit_code {
+        // Drain path, bd SUCCEEDED: it ran to completion and only its reply was lost.
+        Some(0) => format!(
+            "{} — bd itself finished successfully; what was lost is its reply, not the write, so \
+             the change most likely LANDED. Verify on the board rather than retrying: bd create has \
+             no idempotency key, so a retry can file a second item.",
+            e.message
+        ),
+        // Drain path, bd FAILED. Branching on the presence of a code rather than on SUCCESS claimed
+        // the write landed for a non-zero exit too (roborev 59629) — the inverse of the truth, and
+        // the costly inversion: a caller following that copy looks at a board showing nothing and
+        // concludes the item was already filed, so it never gets re-filed. `bd create` losing the
+        // store lock is exactly this shape. Third occurrence of "who is this advice wrong for?" in
+        // one change; the axis moved from read-vs-write to success-vs-failure, the defect did not.
+        Some(code) => format!(
+            "{} — bd exited with a FAILING status (exit {code}), so the change most likely did NOT \
+             land; its diagnostics could not be read. Re-check the board, then retry if the change \
+             is absent.",
+            e.message
+        ),
+        // Kill path: bd was still running, so it may or may not have committed first.
+        None => format!(
+            "{} — whether the change landed is UNKNOWN: the item may or may not have been created \
+             or updated. Check the board before retrying; do not retry blindly, because bd create \
+             is not idempotent and a retry can file a second item.",
+            e.message
+        ),
+    }
 }
 
 /// Constrain `project_path` to a legitimate project root before we touch the filesystem under it
@@ -332,9 +458,7 @@ pub async fn create_bead(
             args.push(l);
         }
         let output = run_bd(&project_path, &args)?;
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        select_bd_result(output.status.success(), &stdout, &stderr)
+        select_bd_result(output.success, output.stdout.trim(), output.stderr.trim())
     })
     .await
     .map_err(|e| format!("bd task failed: {e}"))?
@@ -514,9 +638,7 @@ pub fn copy_capture_asset(
 pub async fn list_beads(project_path: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let output = run_bd(&project_path, &["list", "--all", "--limit", "0", "--json"])?;
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        select_bd_raw(output.status.success(), &stdout, &stderr)
+        select_bd_raw(output.success, output.stdout.trim(), output.stderr.trim())
     })
     .await
     .map_err(|e| format!("bd task failed: {e}"))?
@@ -541,9 +663,9 @@ pub async fn list_beads(project_path: String) -> Result<String, String> {
 pub async fn blocked_beads(project_path: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         match run_bd(&project_path, &["blocked", "--json"]) {
-            Ok(output) if output.status.success() => {
-                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                Ok(if stdout.is_empty() { "[]".to_string() } else { stdout })
+            Ok(output) if output.success => {
+                let stdout = output.stdout.trim();
+                Ok(if stdout.is_empty() { "[]".to_string() } else { stdout.to_string() })
             }
             // Non-zero exit or a spawn failure: degrade to "nothing is blocked".
             _ => Ok("[]".to_string()),
@@ -568,17 +690,17 @@ pub async fn ensure_beads_db(project_path: String) -> Result<String, String> {
         // Probe: does bd already resolve a workspace here (own DB, a parent's, or a redirect)?
         // `bd where` exits 0 when one resolves, non-zero when none does.
         let probe = run_bd(&project_path, &["where"])?;
-        if probe.status.success() {
+        if probe.success {
             return Ok("exists".to_string());
         }
 
         // No workspace resolved — create one in the project root.
         let init = run_bd(&project_path, &["init", "--non-interactive", "--quiet"])?;
-        if init.status.success() {
+        if init.success {
             return Ok("initialized".to_string());
         }
-        let stderr = String::from_utf8_lossy(&init.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&init.stdout).trim().to_string();
+        let stderr = init.stderr.trim().to_string();
+        let stdout = init.stdout.trim().to_string();
         Err(if !stderr.is_empty() {
             stderr
         } else if !stdout.is_empty() {
@@ -600,9 +722,7 @@ pub async fn bead_show(project_path: String, id: String) -> Result<String, Strin
     }
     tauri::async_runtime::spawn_blocking(move || {
         let output = run_bd(&project_path, &["show", &id, "--json"])?;
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        select_bd_raw(output.status.success(), &stdout, &stderr)
+        select_bd_raw(output.success, output.stdout.trim(), output.stderr.trim())
     })
     .await
     .map_err(|e| format!("bd task failed: {e}"))?
@@ -666,9 +786,7 @@ pub async fn create_bead_full(
         let args = build_create_bead_args(&title, &body, &issue_type, &parent, &deps, &labels);
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let output = run_bd(&project_path, &arg_refs)?;
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        select_bd_result(output.status.success(), &stdout, &stderr)
+        select_bd_result(output.success, output.stdout.trim(), output.stderr.trim())
     })
     .await
     .map_err(|e| format!("bd task failed: {e}"))?
@@ -690,9 +808,7 @@ pub async fn bead_dep_add(
     }
     tauri::async_runtime::spawn_blocking(move || {
         let output = run_bd(&project_path, &["dep", "add", &blocked_id, &blocker_id])?;
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        select_bd_action(output.status.success(), &stdout, &stderr)
+        select_bd_action(output.success, output.stdout.trim(), output.stderr.trim())
     })
     .await
     .map_err(|e| format!("bd task failed: {e}"))?
@@ -707,9 +823,7 @@ fn bead_claim_inner(project_path: String, id: String) -> Result<String, String> 
         return Err(format!("invalid bead id: {id}"));
     }
     let output = run_bd(&project_path, &["update", &id, "--claim"])?;
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    select_bd_action(output.status.success(), &stdout, &stderr)
+    select_bd_action(output.success, output.stdout.trim(), output.stderr.trim())
 }
 
 #[tauri::command]
@@ -727,9 +841,7 @@ pub async fn bead_close(project_path: String, id: String) -> Result<String, Stri
     }
     tauri::async_runtime::spawn_blocking(move || {
         let output = run_bd(&project_path, &["close", &id])?;
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        select_bd_action(output.status.success(), &stdout, &stderr)
+        select_bd_action(output.success, output.stdout.trim(), output.stderr.trim())
     })
     .await
     .map_err(|e| format!("bd task failed: {e}"))?
@@ -752,9 +864,7 @@ fn bead_label_inner(
         return Err(format!("invalid bead id: {id}"));
     }
     let output = run_bd(&project_path, &["label", &action, &id, &label])?;
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    select_bd_action(output.status.success(), &stdout, &stderr)
+    select_bd_action(output.success, output.stdout.trim(), output.stderr.trim())
 }
 
 #[tauri::command]
@@ -788,9 +898,7 @@ fn delete_bead_inner(project_path: String, id: String) -> Result<String, String>
         return Err(format!("invalid bead id: {id}"));
     }
     let output = run_bd(&project_path, &["delete", &id, "--force"])?;
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    select_bd_action(output.status.success(), &stdout, &stderr)
+    select_bd_action(output.success, output.stdout.trim(), output.stderr.trim())
 }
 
 #[tauri::command]
@@ -1231,5 +1339,547 @@ mod tests {
         }
         // Cached: a second call returns the identical string.
         assert_eq!(bd_exec_path(), path);
+    }
+
+    // ── The bd bound ──────────────────────────────────────────────────────────────────────────
+    //
+    // These guard the fix for `bridge request timeout: concierge_tool` on board writes: every bd
+    // invocation in this module used to end in `.output()`, which waits forever, and bd BLOCKS
+    // rather than failing when another worktree holds the Dolt lock.
+
+    /// A directory that certainly exists, for the runner's project-root precondition. The bound is
+    /// what is under test here, not `require_project_dir`.
+    fn a_real_dir() -> String {
+        std::env::temp_dir().to_string_lossy().to_string()
+    }
+
+    /// THE BOUND FIRES. Against the pre-fix `.output()` path this test does not fail, it HANGS —
+    /// which is why it is asserted on a watchdog channel rather than inline: an unbounded call would
+    /// never return and would take the whole test binary down with it, and a timed-out `recv` is a
+    /// readable failure instead.
+    ///
+    /// Driven through `run_cmd_bounded` with an explicit program and an explicit 1s bound, exactly
+    /// as `run_cmd_timed` is parameterised for: no bd needs to be installed, and no bd needs to be
+    /// coaxed into wedging. The child sleeps 60s against a 1s bound, so a pass cannot come from the
+    /// child finishing on its own.
+    #[test]
+    fn the_bd_bound_fires_instead_of_waiting_forever() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let r = run_cmd_bounded(
+                "/bin/sh",
+                &a_real_dir(),
+                &["-c", "sleep 60"],
+                Duration::from_secs(1),
+            );
+            tx.send(r.map(|_| ())).ok();
+        });
+        let got = rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("run_bd's runner never returned — the bd invocation is UNBOUNDED again");
+        let err = got.expect_err("a 60s child under a 1s bound must not report success");
+
+        // The duration in the message is the one that was actually applied, not a fixed string —
+        // this is what makes the "30s" the production path advertises a true statement, since
+        // `run_bd` passes `beads_cmd::BD_TIMEOUT` (pinned below and by the source guard).
+        assert!(
+            err.contains("within 1s") && err.contains("terminated"),
+            "the message must say bd was killed, and after how long: {err}"
+        );
+        assert_eq!(beads_cmd::BD_TIMEOUT, Duration::from_secs(30), "the production bound is 30s");
+    }
+
+    /// NEGATIVE CONTROL. Without this, a runner that returned `Timeout` unconditionally would
+    /// satisfy every "it did not hang" assertion above while destroying the entire feature — the
+    /// board would answer "bd was killed" for every read and write on a perfectly healthy machine.
+    #[test]
+    fn a_healthy_command_still_returns_its_output_successfully() {
+        let out = run_cmd_bounded(
+            "/bin/sh",
+            &a_real_dir(),
+            &["-c", "printf 'bd-is-fine'"],
+            Duration::from_secs(10),
+        )
+        .expect("a fast, healthy program must succeed under the bound");
+        assert!(out.success, "a zero exit must be reported as success");
+        assert_eq!(out.stdout.trim(), "bd-is-fine", "stdout must survive the bounded runner");
+    }
+
+    /// THE OUTCOME IS AMBIGUOUS, AND THE COPY MUST SAY SO. Nothing cancels bd when we stop waiting:
+    /// the transport that gave up at 30s left the `bd create` running to completion, and now that we
+    /// kill bd ourselves it may still have committed the row just before the kill. A message that
+    /// reads like a clean "it failed" invites the wrong next action — and the wrong action here is
+    /// specifically a retry, because `bd create` has no idempotency key and a retry after a create
+    /// that landed files a SECOND bead.
+    ///
+    /// Pinned so a later edit cannot quietly shorten this back to a bare failure.
+    #[test]
+    fn a_timeout_is_reported_as_an_unknown_outcome_never_a_clean_failure() {
+        let timed_out = BeadsError {
+            kind: BeadsErrorKind::Timeout,
+            message: "bd did not finish within 30s and was terminated".to_string(),
+            exit_code: None,
+        };
+        let msg = describe_bd_failure(&timed_out, true);
+        assert!(msg.contains("30s") && msg.contains("terminated"), "must name the bound: {msg}");
+        assert!(msg.contains("UNKNOWN"), "must say the outcome is unknown: {msg}");
+        assert!(
+            msg.contains("may or may not have been created"),
+            "must say the write may have landed anyway: {msg}"
+        );
+        assert!(msg.contains("Check the board"), "must tell the caller how to find out: {msg}");
+        assert!(
+            msg.contains("not idempotent"),
+            "must say why a blind retry is wrong, not merely that it is: {msg}"
+        );
+
+        // NOT a blanket suffix: a genuine failure must stay a genuine failure, or the ambiguity
+        // wording means nothing because every error carries it.
+        let failed = BeadsError {
+            kind: BeadsErrorKind::BdFailed,
+            message: "issue not found: sparkle-nope".to_string(),
+            exit_code: Some(1),
+        };
+        let msg = describe_bd_failure(&failed, true);
+        assert_eq!(msg, "issue not found: sparkle-nope");
+        assert!(!msg.contains("UNKNOWN"), "a definite failure must not be dressed up as ambiguous");
+    }
+
+    /// A READ that times out must not be handed the write-ambiguity copy (roborev 59622).
+    ///
+    /// `run_bd` is the single choke point for reads and writes alike, so the unconditional version
+    /// told a timed-out `bd list` that "the item may or may not have been created" — about a call
+    /// that created nothing — and warned it off the retry that is the correct next action. A remedy
+    /// string is an instruction the reader follows, so pointing it away from the right remedy is the
+    /// same defect class the ambiguity copy was written to fix.
+    #[test]
+    fn a_read_that_times_out_is_told_retrying_is_safe_not_to_check_the_board() {
+        let timed_out = BeadsError {
+            kind: BeadsErrorKind::Timeout,
+            message: "bd did not finish within 30s and was terminated".to_string(),
+            exit_code: None,
+        };
+        let msg = describe_bd_failure(&timed_out, false);
+        assert!(msg.contains("retrying is safe"), "a read must be told to retry: {msg}");
+        assert!(msg.contains("nothing was written"), "must say why it is safe: {msg}");
+        // The write-only copy must be ABSENT, not merely accompanied — asserting only the presence
+        // of the new sentence would pass on a message that said both and contradicted itself.
+        assert!(!msg.contains("may or may not have been created"), "read got write copy: {msg}");
+        assert!(!msg.contains("do not retry blindly"), "read told not to retry: {msg}");
+    }
+
+    /// The two Timeout variants are DIFFERENT outcomes, and conflating them overstates the doubt.
+    ///
+    /// `exit_code: Some(_)` is the drain path — bd EXITED with a status we read, and only its output
+    /// pipe stayed open because a background `dolt sql-server` grandchild holds the write end. The
+    /// operation ran to completion there; what was lost is the reply, not the write. Reporting that
+    /// as "may or may not have been created" tells the caller to doubt something that happened.
+    #[test]
+    fn a_drained_pipe_timeout_says_the_write_most_likely_landed() {
+        let drained = BeadsError {
+            kind: BeadsErrorKind::Timeout,
+            message: "bd exited but its output pipe stayed open".to_string(),
+            exit_code: Some(0),
+        };
+        let msg = describe_bd_failure(&drained, true);
+        assert!(msg.contains("most likely LANDED"), "must not overstate the doubt: {msg}");
+        assert!(msg.contains("finished successfully"), "must say WHY it likely landed: {msg}");
+        assert!(msg.contains("Verify"), "must still say to look before retrying: {msg}");
+        assert!(
+            !msg.contains("may or may not have been created"),
+            "the kill-path copy must not be reused where the child demonstrably exited: {msg}"
+        );
+    }
+
+    /// A drained pipe over a FAILING exit is the opposite claim, and getting it backwards is the
+    /// costly direction (roborev 59629).
+    ///
+    /// The first version branched on the PRESENCE of an exit code rather than on SUCCESS, so a
+    /// `bd create` that lost the store lock — exit 1 with a `dolt sql-server` grandchild still
+    /// holding stdout, exactly this shape — was reported as "the change most likely LANDED". A
+    /// caller following that instruction looks at a board showing nothing, concludes the item was
+    /// already filed, and never re-files it. The bead is then lost precisely as in the incident this
+    /// whole branch exists to fix.
+    #[test]
+    fn a_drained_pipe_over_a_failing_exit_says_the_write_most_likely_did_not_land() {
+        let failed_drain = BeadsError {
+            kind: BeadsErrorKind::Timeout,
+            message: "bd exited but its output pipe stayed open".to_string(),
+            exit_code: Some(1),
+        };
+        let msg = describe_bd_failure(&failed_drain, true);
+        assert!(msg.contains("did NOT"), "a failing exit must not claim the write landed: {msg}");
+        assert!(msg.contains("exit 1"), "must name the failing status: {msg}");
+        // The success copy must be ABSENT, not merely accompanied — a message carrying both would
+        // contradict itself and still pass a presence-only assertion.
+        assert!(!msg.contains("most likely LANDED"), "success copy leaked onto a failure: {msg}");
+        assert!(!msg.contains("finished successfully"), "claims success on exit 1: {msg}");
+    }
+
+    /// A drain-path timeout whose child died to a SIGNAL has `status.code() == None`, so it lands in
+    /// the kill-path arm. That arm is still HONEST there — we genuinely do not know whether the row
+    /// was committed — but the two halves of the sentence must not contradict each other, since
+    /// `e.message` says bd exited while the suffix speaks to what is unknown (roborev 59629,
+    /// secondary). Pinned rather than argued.
+    #[test]
+    fn a_signal_killed_drain_reads_coherently_rather_than_contradicting_itself() {
+        let signalled = BeadsError {
+            kind: BeadsErrorKind::Timeout,
+            message: "bd exited but its output pipe stayed open".to_string(),
+            exit_code: None,
+        };
+        let msg = describe_bd_failure(&signalled, true);
+        assert!(msg.contains("UNKNOWN"), "an unreadable outcome must be called unknown: {msg}");
+        // It must NOT assert the opposite of its own prefix in either direction.
+        assert!(!msg.contains("most likely LANDED"), "cannot claim success it did not read: {msg}");
+        assert!(!msg.contains("did NOT land"), "cannot claim failure it did not read: {msg}");
+    }
+
+    /// The read/write split is derived from the SUBCOMMAND, so pin the classification itself —
+    /// otherwise the two tests above only prove `describe_bd_failure` branches, not that anything
+    /// ever reaches it with the right flag.
+    #[test]
+    fn the_read_write_split_matches_the_subcommands_this_module_actually_sends() {
+        for read in ["list", "show", "blocked", "where"] {
+            assert!(!bd_subcommand_mutates(&[read, "--json"]), "`bd {read}` only reads");
+        }
+        // Every mutating subcommand this module issues, from the real call sites.
+        for write in ["create", "update", "close", "label", "delete", "dep", "init"] {
+            assert!(bd_subcommand_mutates(&[write, "x"]), "`bd {write}` mutates");
+        }
+        // UNKNOWN and EMPTY both default to "mutation" — the safe direction. Over-caution on a read
+        // only costs a look; under-caution on a write invites the duplicate this all exists to stop.
+        assert!(bd_subcommand_mutates(&["some-future-subcommand"]), "unknown must default to write");
+        assert!(bd_subcommand_mutates(&[]), "empty argv must default to write");
+    }
+
+    /// Scan Rust source for `.output()` calls, returning `(allowed_resolver_probes, offenders)`.
+    ///
+    /// Extracted so the guard and its anti-vacuity test exercise the SAME code — a negative test
+    /// that re-implements the loop can drift, and would then keep passing while the real guard rots.
+    ///
+    /// Comment lines are skipped: `run_bd`'s own doc comment quotes `.output()` when explaining the
+    /// defect it fixed, and a real call is never on a comment line. Ownership is resolved by walking
+    /// back to the nearest `fn` declaration, so the allowlist is by FUNCTION rather than by line
+    /// number (which every later edit would invalidate).
+    fn unbounded_output_calls_in(src: &str) -> (usize, Vec<String>) {
+        // The bd RESOLVER probes. These run once per session to find out WHERE bd is; they are not
+        // bd operations against the Dolt store, so they cannot be caught behind its lock.
+        const ALLOWED_PROBES: [&str; 2] = ["login_shell_which_bd", "windows_which_bd"];
+
+        /// Name of the function DECLARED on this line, if any.
+        ///
+        /// Visibility is stripped GENERICALLY rather than matched against a list of prefixes
+        /// (roborev 59622). The list form accepted `pub ` but not `pub(crate) `, which this very
+        /// file uses three times — so a `.output()` added inside a `pub(crate) fn` was not
+        /// attributed to it. The scan then walked further back to the nearest RECOGNISED
+        /// declaration, and if that happened to be one of the allow-listed resolver probes, the
+        /// guard went green over a genuinely unbounded bd call: a hole in the shape of the very
+        /// thing it exists to catch.
+        fn declared_fn_name(line: &str) -> Option<String> {
+            let mut rest = line.trim_start();
+            // `pub`, `pub(crate)`, `pub(super)`, `pub(in path)` — strip the keyword and any group.
+            if let Some(after) = rest.strip_prefix("pub") {
+                rest = match after.strip_prefix('(') {
+                    Some(group) => group[group.find(')')? + 1..].trim_start(),
+                    None => after.trim_start(),
+                };
+            }
+            // Modifiers that may precede `fn`, in any order.
+            loop {
+                let next = ["const ", "async ", "unsafe ", "extern "]
+                    .iter()
+                    .find_map(|m| rest.strip_prefix(m));
+                match next {
+                    Some(r) => rest = r.trim_start(),
+                    None => break,
+                }
+            }
+            // `extern "C" fn` leaves a quoted ABI behind.
+            if let Some(after_quote) = rest.strip_prefix('"') {
+                rest = after_quote[after_quote.find('"')? + 1..].trim_start();
+            }
+            let name = rest.strip_prefix("fn ")?.trim_start();
+            let end = name.find(|c: char| !(c.is_alphanumeric() || c == '_'))?;
+            Some(name[..end].to_string())
+        }
+
+        let lines: Vec<&str> = src.lines().collect();
+        let mut probes = 0usize;
+        let mut offenders = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if line.trim_start().starts_with("//") || !line.contains(".output()") {
+                continue;
+            }
+            let owner = lines[..=i]
+                .iter()
+                .rev()
+                .find_map(|l| declared_fn_name(l))
+                .unwrap_or_else(|| "<unknown fn>".to_string());
+            if ALLOWED_PROBES.contains(&owner.as_str()) {
+                probes += 1;
+            } else {
+                offenders.push(format!("{owner} (line {})", i + 1));
+            }
+        }
+        (probes, offenders)
+    }
+
+    /// The production half of this file, i.e. everything before its test module.
+    ///
+    /// The guard is about shipped code, and the tests below deliberately carry `.output()` inside
+    /// sample fixtures. Returned with the split asserted so "the marker moved and we scanned
+    /// nothing" cannot pass as "no offenders".
+    fn production_source() -> &'static str {
+        let src = include_str!("notes.rs");
+        let cut = src.split("\n#[cfg(test)]").next().unwrap_or(src);
+        assert!(
+            cut.len() < src.len(),
+            "could not find the test-module marker, so the scan region is wrong"
+        );
+        cut
+    }
+
+    /// NO bd INVOCATION HERE MAY BE UNBOUNDED. Asserted against this file's own SOURCE because the
+    /// defect is the ABSENCE of a bound — invisible to every behavioural test on a healthy machine,
+    /// and it was the actual shape of the bug (all 12 call sites went through one `.output()`).
+    ///
+    /// bd takes a lock on a Dolt store shared by every worktree in this repo, and `beadsStore.ts`
+    /// polls `bd list`/`bd blocked` concurrently with writes, so under contention bd blocks instead
+    /// of failing. Every timeout above this call is finite (30s MCP socket < 60s liveness stall <<
+    /// 600s Rust rendezvous), so an unbounded call at the bottom hands the user a transport error
+    /// while the real work stays wedged with nothing able to cancel it.
+    #[test]
+    fn no_bd_invocation_in_this_module_is_unbounded() {
+        let (probes, offenders) = unbounded_output_calls_in(production_source());
+        // POSITIVE assertion first, so "the matcher found nothing" FAILS instead of passing
+        // silently — the vacuous shape this repo hits most. Both resolver probes are in the source
+        // text regardless of which one `cfg` compiles.
+        assert!(
+            probes >= 2,
+            "expected the two bd RESOLVER probes (login_shell_which_bd, windows_which_bd), found \
+             {probes} — the scanner matched nothing, so this guard is not guarding anything"
+        );
+        assert!(
+            offenders.is_empty(),
+            "these run bd with an UNBOUNDED `.output()`, so a wedged bd hangs the caller forever \
+             and surfaces as `bridge request timeout: concierge_tool`. Route them through \
+             `run_bd` / `run_cmd_bounded` (beads_cmd::run_cmd_timed): {offenders:#?}"
+        );
+    }
+
+    /// The guard is only meaningful if its scanner can actually SEE an unbounded bd call. Feeds the
+    /// REAL scanner the shape it must reject, so a green guard means "everything is bounded" rather
+    /// than "matched nothing".
+    #[test]
+    fn the_bound_guard_would_notice_an_unbounded_bd_call() {
+        // The pre-fix `run_bd`, plus a doc line quoting `.output()` — the comment must be ignored
+        // and the call must still be caught, which is exactly the pair the real file contains.
+        let regressed = "/// used to end in `.output()`, which waits FOREVER\n\
+                         fn run_bd(project_path: &str) -> Result<Output, String> {\n\
+                         \x20   Command::new(&bd).args(args).current_dir(project_path).output()\n\
+                         }\n";
+        let (probes, offenders) = unbounded_output_calls_in(regressed);
+        assert_eq!(probes, 0, "a bd operation is not a resolver probe");
+        assert_eq!(offenders.len(), 1, "scanner must flag the unbounded call: {offenders:?}");
+        assert!(offenders[0].starts_with("run_bd"), "must name the offender: {offenders:?}");
+
+        // …and it must NOT flag the resolver probe, or the guard could never go green and would be
+        // switched off rather than fixed.
+        let probe = "fn login_shell_which_bd() -> Option<String> {\n\
+                     \x20   Command::new(shell).args([\"-lc\", \"command -v bd\"]).output().ok()\n\
+                     }\n";
+        let (probes, offenders) = unbounded_output_calls_in(probe);
+        assert_eq!(probes, 1, "the resolver probe must be recognised as allowed");
+        assert!(offenders.is_empty(), "the resolver probe must not be flagged: {offenders:?}");
+    }
+
+    /// THE HOLE THIS GUARD HAD, IN THE SHAPE OF THE THING IT EXISTS TO CATCH (roborev 59622).
+    ///
+    /// Ownership was matched against a list of prefixes that accepted `pub ` but not `pub(crate) `
+    /// — a form used three times in this very file. An unbounded call inside such a function was
+    /// therefore not attributed to it; the scan walked further back to the nearest RECOGNISED
+    /// declaration, and when that was one of the allow-listed resolver probes the guard counted the
+    /// offender as an allowed probe and went GREEN.
+    ///
+    /// The fixture reproduces exactly that adjacency: a `pub(crate) fn` placed AFTER an allow-listed
+    /// probe, so the pre-fix parser would credit it to `windows_which_bd`. Asserting only "one
+    /// offender" would not have caught it — the misattribution turns it into a probe, so the counts
+    /// are what pin the bug.
+    #[test]
+    fn the_guard_attributes_a_call_inside_a_pub_crate_fn_to_that_fn() {
+        let sneaky = "fn windows_which_bd() -> Option<String> {\n\
+                      \x20   Command::new(\"where\").arg(\"bd\").output().ok()\n\
+                      }\n\
+                      pub(crate) fn wedged(project_path: &str) -> Result<Output, String> {\n\
+                      \x20   Command::new(&bd).args(args).current_dir(project_path).output()\n\
+                      }\n";
+        let (probes, offenders) = unbounded_output_calls_in(sneaky);
+        assert_eq!(probes, 1, "only the real resolver probe may count as one: {offenders:?}");
+        assert_eq!(offenders.len(), 1, "the pub(crate) call must be flagged: {offenders:?}");
+        assert!(
+            offenders[0].starts_with("wedged"),
+            "must name the pub(crate) fn itself, not the probe above it: {offenders:?}"
+        );
+    }
+
+    /// The visibility/modifier stripping is now generic, so pin the forms it must handle. Without
+    /// this, the fix above is only proven for the single shape that motivated it.
+    #[test]
+    fn the_guard_recognises_every_declaration_form_this_crate_uses() {
+        let forms = [
+            ("fn plain() {\n    x.output()\n}\n", "plain"),
+            ("pub fn public() {\n    x.output()\n}\n", "public"),
+            ("pub(crate) fn crate_vis() {\n    x.output()\n}\n", "crate_vis"),
+            ("pub(super) fn super_vis() {\n    x.output()\n}\n", "super_vis"),
+            ("async fn asyncy() {\n    x.output()\n}\n", "asyncy"),
+            ("pub(crate) async fn both() {\n    x.output()\n}\n", "both"),
+            ("pub unsafe fn unsafey() {\n    x.output()\n}\n", "unsafey"),
+        ];
+        for (src, expected) in forms {
+            let (_, offenders) = unbounded_output_calls_in(src);
+            assert_eq!(offenders.len(), 1, "{expected}: expected one offender, got {offenders:?}");
+            assert!(
+                offenders[0].starts_with(expected),
+                "{expected}: misattributed to {offenders:?}"
+            );
+        }
+    }
+
+    /// The two surfaces that drive bd must share ONE budget. A second constant here would be a
+    /// second policy, and the two would drift — which is the reason `BD_TIMEOUT` was widened to
+    /// `pub(crate)` instead of being copied.
+    /// Every bound `run_bd` actually passes to `run_cmd_bounded`, as raw argument-list text.
+    ///
+    /// EXTRACTED AS A PURE FUNCTION because the inline version had a real defect found in it on
+    /// THREE consecutive review rounds — scope, then anchor, then comment-blindness — and each fix
+    /// could only be validated by a hand mutation recorded in a commit message, which the next
+    /// editor cannot re-run (roborev 59650). Straight-line code inside a test is unpinnable; a pure
+    /// function fed fixture strings fails loudly when its parsing rules regress. This file already
+    /// demonstrates the pattern with `unbounded_output_calls_in`, so this is adopting the local
+    /// remedy rather than inventing one.
+    ///
+    /// Returns EVERY call's arguments, not the first. Binding only the first textual match is its
+    /// own hole: a `run_bd` that grew an early-return path would have a second, unchecked call, and
+    /// the guard would pass on the strength of the one that happened to come first.
+    fn bd_bounds_passed_by_run_bd(src: &str) -> Result<Vec<String>, String> {
+        // Anchor on the SIGNATURE: `find` returns the first match, so a helper merely STARTING with
+        // the name (`run_bd_json`) declared above the funnel would otherwise capture the slice.
+        // A declaration at the very start of the input has no preceding newline, so match that case
+        // too rather than requiring one. Anchoring on `\nfn` alone is a real limitation, not merely
+        // a fixture quirk — it would silently report "no run_bd" for a file that opens with it.
+        let start = if src.starts_with("fn run_bd(") {
+            0
+        } else {
+            src.find("\nfn run_bd(").ok_or("no `fn run_bd(` declaration")? + 1
+        };
+        // Top-level fn bodies close on a column-0 brace (rustfmt guarantees it).
+        let len = src[start..].find("\n}").ok_or("run_bd has no closing brace")? + 1;
+        // Strip whole-line comments: otherwise a `//` line quoting the call form is what gets read,
+        // while the real call underneath passes something else.
+        let body: String = src[start..start + len]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // BALANCE THE PARENS rather than stopping at the first `)`. A naive scan truncates
+        // `Duration::from_secs(300)` to `Duration::from_secs(300`, which happens to still contain
+        // the substring the caller greps for — so it works BY LUCK on today's text and silently
+        // truncates before a later argument the moment any call nests a paren. Correct here is
+        // cheap; relying on the accident is how the last three rounds of holes got in.
+        let mut calls = Vec::new();
+        let mut rest = body.as_str();
+        while let Some(i) = rest.find("run_cmd_bounded(") {
+            let after = &rest[i + "run_cmd_bounded(".len()..];
+            let mut depth = 1usize;
+            let mut end = None;
+            for (j, c) in after.char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(j);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let end = end.ok_or("unterminated run_cmd_bounded( call")?;
+            calls.push(after[..end].to_string());
+            rest = &after[end..];
+        }
+        if calls.is_empty() {
+            return Err("run_bd does not delegate to run_cmd_bounded at all".to_string());
+        }
+        Ok(calls)
+    }
+
+    /// The extractor's PARSING RULES, pinned against fixtures — the coverage whose absence let three
+    /// rounds of defects through (roborev 59650). Each case is one rule that regressed once.
+    #[test]
+    fn the_bd_bound_extractor_reads_the_real_call_and_nothing_else() {
+        // A decoy declared ABOVE the funnel, carrying the CORRECT call, must not be read instead.
+        let decoy = "fn run_bd_json(p: &str) -> R {\n\
+                     \x20   run_cmd_bounded(&bd, p, args, beads_cmd::BD_TIMEOUT)\n\
+                     }\n\
+                     fn run_bd(p: &str) -> R {\n\
+                     \x20   run_cmd_bounded(&bd, p, args, Duration::from_secs(300))\n\
+                     }\n";
+        let got = bd_bounds_passed_by_run_bd(decoy).expect("must find run_bd");
+        assert_eq!(got.len(), 1, "must read exactly run_bd's call: {got:?}");
+        assert!(got[0].contains("from_secs(300)"), "must read run_bd's own args: {got:?}");
+
+        // A COMMENT quoting the correct call must not satisfy the check.
+        let commented = "fn run_bd(p: &str) -> R {\n\
+                         \x20   // delegates to run_cmd_bounded(&bd, p, args, beads_cmd::BD_TIMEOUT)\n\
+                         \x20   run_cmd_bounded(&bd, p, args, Duration::from_secs(300))\n\
+                         }\n";
+        let got = bd_bounds_passed_by_run_bd(commented).expect("must find run_bd");
+        assert_eq!(got.len(), 1, "the comment must be stripped, not counted: {got:?}");
+        assert!(got[0].contains("from_secs(300)"), "must read the REAL call: {got:?}");
+
+        // EVERY call is returned, so a second one on an early-return path cannot hide behind the
+        // first. This is the finding the extraction was written alongside.
+        let two = "fn run_bd(p: &str) -> R {\n\
+                   \x20   if x { return run_cmd_bounded(&bd, p, args, beads_cmd::BD_TIMEOUT); }\n\
+                   \x20   run_cmd_bounded(&bd, p, args, Duration::from_secs(300))\n\
+                   }\n";
+        let got = bd_bounds_passed_by_run_bd(two).expect("must find run_bd");
+        assert_eq!(got.len(), 2, "both calls must be reported: {got:?}");
+
+        // And it must FAIL LOUDLY rather than silently pass when its assumptions break.
+        assert!(bd_bounds_passed_by_run_bd("fn other() {}\n").is_err(), "no run_bd => Err");
+        assert!(
+            bd_bounds_passed_by_run_bd("fn run_bd(p: &str) -> R {\n    todo!()\n}\n").is_err(),
+            "run_bd that does not delegate => Err, never an empty pass"
+        );
+    }
+
+    #[test]
+    fn the_bd_timeout_constant_is_reused_not_redeclared() {
+        let src = production_source();
+
+        // The extractor above is fixture-pinned, so this reads the REAL binding rather than
+        // re-deriving it inline. EVERY call must pass the shared constant — not merely the first.
+        let calls = bd_bounds_passed_by_run_bd(src).expect("run_bd must delegate to the bounded runner");
+        for call in &calls {
+            assert!(
+                call.contains("beads_cmd::BD_TIMEOUT"),
+                "run_bd must PASS beads_cmd::BD_TIMEOUT, not merely mention it: args were `{call}`"
+            );
+            assert!(
+                !call.contains("Duration::from_secs"),
+                "run_bd must not inline its own duration — an inlined literal is not a `const` \
+                 declaration, so the check below would never catch it: args were `{call}`"
+            );
+        }
+
+        assert!(
+            !src.contains("const BD_TIMEOUT"),
+            "this module must not declare its own bd timeout — the two would drift apart"
+        );
     }
 }
