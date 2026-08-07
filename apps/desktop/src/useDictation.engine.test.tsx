@@ -18,7 +18,7 @@
  * false for an unauthenticated fixture and `openCloud` early-returns before any invoke, so the test
  * would pass while proving nothing about the relay's answer.
  */
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { act, renderHook } from "@testing-library/react";
 
 const listeners: Record<string, Array<(e: { payload: unknown }) => void>> = {};
@@ -104,6 +104,64 @@ beforeEach(() => {
     focusOwner: "other",
   });
   useDictationEngineStore.setState({ fallbackReason: null, dismissed: false });
+});
+
+describe("the window-blur guard — a broadcast stand-down must not close the global relay", () => {
+  // NOTHING covered this direction. useDictation.test.ts runs in the node env, where `hasWindow` is
+  // false so the listener is never attached, and every window-focus case there drives
+  // `notifyWindowFocus` directly — bypassing the guard entirely. So deleting the guard, or inverting
+  // it, kept the whole suite green while silently disabling the per-window ownership handoff the
+  // listener exists for (sparkle-ozvr / roborev 59711).
+  //
+  // Both cases mount with the window FOCUSED, because the guard is an EDGE: the controller seeds
+  // `domWindowFocused` from `isWindowActive()` at creation, so a window that was already background
+  // at mount has no true → false transition to make and would pass the first assertion vacuously.
+  let hasFocus: ReturnType<typeof vi.spyOn> | null = null;
+  afterEach(() => {
+    // Restored here rather than at the end of each case: a case that fails before its own restore
+    // would otherwise leak `hasFocus === false` into every later test in this file, where it blocks
+    // the routing gate and turns unrelated relay assertions red. That is exactly what happened.
+    hasFocus?.mockRestore();
+    hasFocus = null;
+  });
+
+  const mountFocusedAndGoActive = async () => {
+    hasFocus = vi.spyOn(document, "hasFocus").mockReturnValue(true);
+    invoke.mockImplementation((cmd: string) =>
+      cmd === "start_cloud_stream" ? Promise.resolve(true) : Promise.resolve(undefined),
+    );
+    await mountVoice();
+    await goActive();
+    // PRECONDITION, ASSERTED. `tearDownOwnedStream` early-returns unless phase is "active", so if
+    // this were not true both cases below would pass without the guard doing anything at all.
+    expect(useDictationStore.getState().phase).toBe("active");
+    invoke.mockClear();
+  };
+
+  it("IGNORES a blur the DOM contradicts — the hatch's synthetic stand-down pulse", async () => {
+    await mountFocusedAndGoActive();
+
+    // The window is STILL focused; only the event claims otherwise.
+    await act(async () => {
+      window.dispatchEvent(new Event("blur"));
+    });
+
+    expect(invoke).not.toHaveBeenCalledWith("stop_cloud_stream");
+  });
+
+  it("still tears down on a REAL blur — the direction that must keep working", async () => {
+    // The other half, and what makes the case above non-vacuous: a guard that suppressed EVERY blur
+    // would also pass that assertion while breaking the window-to-window handoff that closes the
+    // billable relay.
+    await mountFocusedAndGoActive();
+
+    hasFocus!.mockReturnValue(false); // the window really did go background
+    await act(async () => {
+      window.dispatchEvent(new Event("blur"));
+    });
+
+    expect(invoke).toHaveBeenCalledWith("stop_cloud_stream");
+  });
 });
 
 describe("the relay's own answer to start_cloud_stream drives the engine signal", () => {

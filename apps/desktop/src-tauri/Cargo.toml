@@ -229,6 +229,12 @@ libc = "0.2"
 [dev-dependencies]
 hound = "3.5"
 tempfile = "3"
+# The menu-accelerator parser, so `app_menu`'s "Release Input" key equivalent can be asserted to
+# actually parse. Tauri owns muda but does not re-export `Accelerator`, and an unparseable
+# accelerator is SILENT — the item still builds, just with no shortcut, which is precisely the state
+# in which nobody can reach the escape hatch. Already in the lock file as tauri's own dependency, so
+# this pulls in nothing new to compile; pinned to the same 0.19 line.
+muda = "0.19"
 # `tauri::test::mock_app`, so the nudger's tick loop can be driven end to end against a real
 # AppHandle. Without it `tick` is the one function in nudger.rs with no coverage at all — and it is
 # where the outcome-to-state wiring lives, which roborev 57738 flagged as deletable with every test

@@ -98,8 +98,28 @@ export function installDictationFocusTracker(deps: DictationFocusTrackerDeps): (
       readOwner();
     }, 0);
   };
-  const onWinFocus = () => writeWindowFocused(true);
-  const onWinBlur = () => writeWindowFocused(false);
+  let domWindowFocused = doc.hasFocus?.() ?? true;
+  const onWinFocus = () => {
+    domWindowFocused = true;
+    writeWindowFocused(true);
+  };
+  // See the matching guard in useDictation: this latch is LEVEL-HELD (it drives the `"window"` pause
+  // reason and clears only on a real `focus`), so a blur the DOM contradicts must not be believed —
+  // it would pause the mic with nothing able to un-pause it until the user left the app and came
+  // back. The input-release hatch dispatches such a blur deliberately as a stand-down pulse for the
+  // edge-triggered latches (roborev 59651). Missing `hasFocus` means "trust the event", which
+  // matches how the seed below fails OPEN.
+  // EDGE, not level — same two guards as useDictation's, and for the same reason. The hatch's
+  // stand-down pulse is broadcast to every webview, so guard 1 (the DOM contradicts the event) only
+  // covers the FOCUSED window; in a background window `hasFocus()` is already false and the pulse
+  // would fall straight through. Acting only on a true → false transition for THIS window makes it
+  // a no-op wherever the window is already background.
+  const onWinBlur = () => {
+    if (doc.hasFocus?.()) return;
+    if (!domWindowFocused) return;
+    domWindowFocused = false;
+    writeWindowFocused(false);
+  };
 
   doc.addEventListener("focusin", onFocusIn, true);
   doc.addEventListener("focusout", onFocusOut, true);

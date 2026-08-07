@@ -43,6 +43,62 @@ pub const HELPER_TOGGLE_EVENT: &str = "helper://toggle-requested";
 /// Full Screen), so we extend that one rather than adding a second menu titled the same thing.
 pub const VIEW_SUBMENU_TEXT: &str = "View";
 
+// ── THE ESCAPE HATCH THAT CANNOT ITSELF BE WEDGED (bead sparkle-thm9o) ────────────────────────────
+//
+// The founder's app wedged today with "I could not unmount the concierge", and the audit that
+// followed found there was NO global "release all input capture" path at all. Every hatch that
+// existed ran through the webview's own DOM event pipeline, which is exactly the thing that had
+// stopped answering:
+//
+//   - The Escape ladder failed closed on `dismissibleOpen`, and one leaked hidden `role="dialog"`
+//     node disabled it app-wide (fixed separately, in engine/cable.ts).
+//   - ⌘⇧U worked, but it is a `window` keydown listener like the rest: an earlier CAPTURE-phase
+//     listener that stops propagation, a rebinding capture stuck latched, or focus sitting outside
+//     the document entirely all defeat it — and nothing in the UI told the user it existed.
+//
+// A NATIVE MENU ITEM IS NOT ON THAT PIPELINE. macOS dispatches a key equivalent through the menu
+// bar before the webview is consulted, and the item can be reached with the MOUSE even when the
+// keyboard is captured outright — so this hatch works while the thing that trapped input is still
+// mounted. The webview handler is a plain listener, but it is only ever the SECOND way in.
+//
+// The frontend's DOM keydown fallback (services/inputRelease.ts) is deliberately secondary for the
+// same reason: it exists for the non-Tauri dev server and for a build where `build()` below could
+// not attach the item, not as the mechanism.
+
+/// Menu-item id for the input-release hatch. Matched in `on_menu_event`.
+pub const INPUT_RELEASE_ID: &str = "view-release-input";
+
+/// Emitted when the user picks the item (or presses its key equivalent). Payload-free: "let go of
+/// everything" takes no argument, and Rust knows nothing about what the webview is holding.
+///
+/// Must match `INPUT_RELEASE_EVENT` in src/services/inputRelease.ts — asserted by a test below, not
+/// merely by this comment.
+pub const INPUT_RELEASE_EVENT: &str = "input://release-requested";
+
+/// Says what it DOES, in the imperative, like every other menu verb. Not "Unstick" or "Panic":
+/// someone reading this menu is already confused about why the app stopped responding, and the item
+/// has to read as a deliberate action rather than as a diagnostic.
+pub const INPUT_RELEASE_LABEL: &str = "Release Input";
+
+/// ⌘⇧⎋ — "Escape, harder", which is what the gesture is.
+///
+/// UNLIKE the helper toggle, this item DOES take a key equivalent, and the reasoning that denied one
+/// there ("a floating panel toggled by accident is worse than one that takes two clicks") inverts
+/// here: an escape hatch you can only reach by opening a menu with the mouse is not much of an
+/// escape hatch, and firing it by accident costs a blurred field.
+///
+/// IT IS DELIBERATELY NOT ⌘⇧U, the rebindable `unmountCable` chord. A native key equivalent is
+/// consumed by the menu bar BEFORE the webview sees it, so giving this item ⌘⇧U would make that
+/// chord permanently un-rebindable in Settings and silently dead in the webview handler that owns
+/// it. Two different keys for two different scopes: ⌘⇧U unmounts the cable, ⌘⇧⎋ lets go of
+/// everything.
+///
+/// ⌘⇧⎋ is free on macOS — ⌥⌘⎋ is Force Quit and ⌘⇧⎋ is unclaimed (the Windows Task Manager chord is
+/// ⌃⇧⎋, a different modifier). `input_release_accelerator_parses` below asserts the string is one
+/// muda can actually parse, because an unparseable accelerator is silent: the item still builds,
+/// just without the key.
+pub const INPUT_RELEASE_ACCELERATOR: &str = "CmdOrCtrl+Shift+Escape";
+
 /// Dynamic label rather than a checkmark. A checkbox would have to be titled something static like
 /// "Show Helper", which reads wrong while the island is already showing; "Hide Helper" ⇄ "Show
 /// Helper" is the macOS idiom for this (Safari's Hide/Show Tab Bar) and says what the click does.
@@ -90,19 +146,39 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         None::<&str>,
     )?;
 
+    // The input-release hatch. Built FAIL-SOFT, and unlike the helper item above it never uses `?`:
+    // its accelerator string is parsed by muda at construction, so a `?` here would turn one
+    // unparseable accelerator into "the app has no menu bar at all" — the exact catastrophic
+    // failure this module's header says a `?` must not be allowed to cause. A parse failure falls
+    // back to the item with NO key equivalent, because a hatch reachable only by mouse still beats
+    // no hatch, and only a failure to build even that drops it.
+    let release = build_input_release_item(app);
+
     match view_submenu(&menu) {
         Some(view) => {
             // Top of View, above Enter Full Screen, with a separator under it.
             let separator = PredefinedMenuItem::separator(app)?;
-            let items: [&dyn IsMenuItem<R>; 2] = [&item, &separator];
+            let mut items: Vec<&dyn IsMenuItem<R>> = Vec::with_capacity(3);
+            // RELEASE INPUT FIRST. Someone opening this menu because the app stopped responding
+            // should meet the hatch before anything else on it.
+            if let Some(r) = release.as_ref() {
+                items.push(r);
+            }
+            items.push(&item);
+            items.push(&separator);
             if let Err(e) = view.insert_items(&items, 0) {
-                tracing::warn!("could not add the helper toggle to the View menu: {e}");
+                tracing::warn!("could not add Sparkle's items to the View menu: {e}");
             }
         }
         None => {
             // No default View menu on this platform. Append our own rather than dropping the item —
             // the whole point is that the way back is always reachable.
-            match Submenu::with_items(app, VIEW_SUBMENU_TEXT, true, &[&item]) {
+            let mut items: Vec<&dyn IsMenuItem<R>> = Vec::with_capacity(2);
+            if let Some(r) = release.as_ref() {
+                items.push(r);
+            }
+            items.push(&item);
+            match Submenu::with_items(app, VIEW_SUBMENU_TEXT, true, &items) {
                 Ok(view) => {
                     if let Err(e) = menu.append(&view) {
                         tracing::warn!("could not append a View menu: {e}");
@@ -115,6 +191,28 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     Ok(menu)
 }
 
+/// The "Release Input" item, degrading rather than failing — see the call site.
+fn build_input_release_item<R: Runtime>(app: &AppHandle<R>) -> Option<MenuItem<R>> {
+    match MenuItem::with_id(
+        app,
+        INPUT_RELEASE_ID,
+        INPUT_RELEASE_LABEL,
+        true,
+        Some(INPUT_RELEASE_ACCELERATOR),
+    ) {
+        Ok(i) => Some(i),
+        Err(e) => {
+            tracing::warn!(
+                "could not build \"{INPUT_RELEASE_LABEL}\" with accelerator \
+                 {INPUT_RELEASE_ACCELERATOR} ({e}); retrying without a key equivalent"
+            );
+            MenuItem::with_id(app, INPUT_RELEASE_ID, INPUT_RELEASE_LABEL, true, None::<&str>)
+                .map_err(|e| tracing::warn!("could not build \"{INPUT_RELEASE_LABEL}\": {e}"))
+                .ok()
+        }
+    }
+}
+
 /// The default menu's View submenu, if this platform has one.
 fn view_submenu<R: Runtime>(menu: &Menu<R>) -> Option<Submenu<R>> {
     menu.items().ok()?.into_iter().find_map(|kind| {
@@ -124,14 +222,27 @@ fn view_submenu<R: Runtime>(menu: &Menu<R>) -> Option<Submenu<R>> {
     })
 }
 
-/// Wired into the builder's `on_menu_event`. Only the toggle is ours; every other id belongs to a
-/// predefined item Tauri handles itself, so anything unrecognised is ignored rather than logged.
+/// Wired into the builder's `on_menu_event`. Only our two items are handled; every other id belongs
+/// to a predefined item Tauri handles itself, so anything unrecognised is ignored rather than logged.
 pub fn on_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEvent) {
     if event.id() == HELPER_TOGGLE_ID {
         // Broadcast. Exactly ONE listener acts on it (HelperApp, the webview that owns the island);
         // a second handler would flip the store twice and the toggle would look dead.
         if let Err(e) = app.emit(HELPER_TOGGLE_EVENT, ()) {
             tracing::warn!("could not emit {HELPER_TOGGLE_EVENT}: {e}");
+        }
+    } else if event.id() == INPUT_RELEASE_ID {
+        // LOGGED AT INFO, unlike the toggle. This item only ever fires because the app stopped
+        // responding to the user, and the whole reason it exists is that we could not tell from the
+        // logs whether that had happened. A line here plus the frontend's own (services/inputRelease
+        // .ts) brackets the release: if only this one appears, the webview never received the event,
+        // which is a materially different failure from a release that ran and did not help.
+        tracing::info!("input release requested from the app menu");
+        // Broadcast to every webview. Unlike the helper toggle, MULTIPLE listeners acting on this
+        // is correct and harmless — releasing input capture is idempotent, and a wedged helper
+        // webview deserves the same escape as the main one.
+        if let Err(e) = app.emit(INPUT_RELEASE_EVENT, ()) {
+            tracing::warn!("could not emit {INPUT_RELEASE_EVENT}: {e}");
         }
     }
 }
@@ -238,6 +349,112 @@ mod tests {
         assert!(
             HELPER_TS.contains("set_helper_menu_state"),
             "src/services/helper.ts must invoke set_helper_menu_state to sync the menu label"
+        );
+    }
+
+    /// THE ACCELERATOR MUST ACTUALLY PARSE.
+    ///
+    /// This is the one failure in the hatch that is completely SILENT: muda parses the string at
+    /// `MenuItem::with_id`, and `build_input_release_item` deliberately degrades to an item with no
+    /// key equivalent rather than taking the whole menu bar down with it. So a typo
+    /// ("Cmd+Shift+Esc ", "Escape+Shift+Cmd", a renamed key token) ships a menu item that looks
+    /// entirely correct, has no shortcut, and is therefore not reachable at all by someone whose
+    /// keyboard is the thing that stopped working. Parsing it here is the only place that can catch
+    /// it — a menu built against a real runtime cannot be exercised in a unit test (muda needs an
+    /// event loop and the main thread), which is why the sibling guards read source instead.
+    #[test]
+    fn input_release_accelerator_parses_to_the_chord_we_documented() {
+        use muda::accelerator::{Accelerator, Code, Modifiers};
+        use std::str::FromStr;
+
+        let accel = Accelerator::from_str(INPUT_RELEASE_ACCELERATOR)
+            .expect("INPUT_RELEASE_ACCELERATOR must be a string muda can parse");
+        // COMPARED WHOLE, not field by field: muda keeps `key`/`mods` private, so an equality
+        // against a chord we build here is the only way to assert this from outside the crate — and
+        // it is the stronger assertion anyway, since it pins the modifier set exactly rather than
+        // checking that two specific bits are present and letting a third slip in.
+        //
+        // `CmdOrCtrl` resolves to Meta on macOS and Control elsewhere; build whichever this target
+        // uses rather than hard-coding one and going red on the other.
+        let primary = if cfg!(target_os = "macos") { Modifiers::META } else { Modifiers::CONTROL };
+        let expected = Accelerator::new(Some(primary | Modifiers::SHIFT), Code::Escape);
+        assert_eq!(accel, expected, "the hatch is CmdOrCtrl+Shift+Escape");
+        // NOT the plain Escape the cable ladder already owns: a bare Escape as a menu key
+        // equivalent would be swallowed by the menu bar and would break every in-app Escape.
+        // Implied by the equality above, asserted separately because it is the failure that would
+        // actually ship — a modifier dropped from the constant still parses.
+        assert_ne!(
+            accel,
+            Accelerator::new(None, Code::Escape),
+            "a bare Escape would steal the key from the whole app"
+        );
+    }
+
+    /// ⌘⇧U MUST STAY THE WEBVIEW'S. A native key equivalent is consumed by the menu bar before the
+    /// webview is consulted, so giving this item the rebindable `unmountCable` chord would make that
+    /// chord permanently un-rebindable in Settings and silently dead in the handler that owns it.
+    #[test]
+    fn the_hatch_does_not_steal_the_rebindable_unmount_chord() {
+        let upper = INPUT_RELEASE_ACCELERATOR.to_ascii_uppercase();
+        assert!(
+            !upper.ends_with("+U"),
+            "INPUT_RELEASE_ACCELERATOR must not be the ⌘⇧U unmountCable chord — a menu key \
+             equivalent is consumed before the webview sees it, which would kill the rebindable one"
+        );
+    }
+
+    #[test]
+    fn our_two_menu_items_have_distinct_ids() {
+        // They are matched by id in `on_menu_event`; a collision would route one item's click to
+        // the other's branch, and the `if/else if` would make it look like the second item was dead.
+        assert_ne!(HELPER_TOGGLE_ID, INPUT_RELEASE_ID);
+        assert_ne!(HELPER_TOGGLE_EVENT, INPUT_RELEASE_EVENT);
+    }
+
+    #[test]
+    fn the_input_release_listener_uses_the_same_event_name() {
+        // Same coherence check the helper toggle runs: a renamed event is otherwise silent on both
+        // sides, and this one fails in the state where nobody can report it.
+        const RELEASE_TS: &str = include_str!("../../src/services/inputRelease.ts");
+        assert!(
+            RELEASE_TS.contains(INPUT_RELEASE_EVENT),
+            "src/services/inputRelease.ts must listen for {INPUT_RELEASE_EVENT}"
+        );
+    }
+
+    /// THE HATCH MUST NOT BE ABLE TO TAKE THE MENU BAR DOWN.
+    ///
+    /// `build()`'s header says a `?` that bailed would leave the app with no menu bar at all. The
+    /// helper item predates the accelerator and has no string to misparse; this one does, so a `?`
+    /// on it would convert a typo into "Sparkle launched with no menus, including Edit → Copy".
+    /// Source-read for the same reason `build_augments_the_default_menu` is.
+    #[test]
+    fn the_input_release_item_is_built_fail_soft() {
+        let src = include_str!("app_menu.rs");
+        // BOUNDED TO THIS FUNCTION. Terminating the capture at `#[cfg(test)]` instead swept up the
+        // whole rest of the file — 88 lines and four other functions — so `view_submenu`'s perfectly
+        // ordinary `kind.as_submenu()?` failed this assertion and the pin reported a defect that was
+        // not there. A source-scan that over-captures is not merely noisy: had those `?` reads not
+        // existed, the same scan would have gone green over any function added later, which is the
+        // failure that actually costs you. `\n}\n` is the function's own closing brace at column 0,
+        // which rustfmt guarantees.
+        let after_sig = src
+            .split_once("fn build_input_release_item<R: Runtime>")
+            .expect("build_input_release_item() should still exist")
+            .1;
+        let f = after_sig
+            .split_once("\n}\n")
+            .map(|(body, _)| body)
+            .expect("build_input_release_item() should have a top-level closing brace");
+        assert!(
+            !f.contains(")?;") && !f.contains(")?\n"),
+            "build_input_release_item must never use `?` — a failed accelerator parse has to \
+             degrade to an item without a key equivalent, not abort the whole menu"
+        );
+        assert!(
+            f.contains("None::<&str>"),
+            "build_input_release_item must retry with no accelerator; a mouse-reachable hatch \
+             still beats no hatch"
         );
     }
 

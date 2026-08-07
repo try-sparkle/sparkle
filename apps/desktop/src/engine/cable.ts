@@ -126,7 +126,83 @@ export const CIRCUIT_SELECTOR = [
 export const DISMISSIBLE_SELECTOR =
   '[role="dialog"], [role="menu"], [data-dismissible-open="true"]';
 
-/** Is a surface that owns Escape currently open? The `dismissibleOpen` input, read from the live DOM.
+/** Signals on ONE element that mean "the DOM is not showing this", each of which jsdom evaluates for
+ *  real — no layout engine required. Checked cheapest-first: the two attribute reads before the
+ *  single `getComputedStyle`, which is a style recalc in a real browser and this runs on a keypress.
+ *
+ *  `getComputedStyle` covers three things an attribute read cannot: an inline `display:none`, the UA
+ *  stylesheet's `dialog:not([open]) { display: none }` (so a `<dialog>` left in the tree unopened is
+ *  correctly not-open), and `visibility`, which is INHERITED and so answers for ancestors too. It is
+ *  still not enough on its own, which is why the caller walks — see {@link surfaceIsRendered}.
+ *
+ *  THERE IS DELIBERATELY NO `hasAttribute("hidden")` TEST, and its absence is load-bearing rather
+ *  than an omission. Every engine's UA sheet carries `[hidden] { display: none }`, so the computed
+ *  read below already answers it — a hand-mutation removing the explicit check left the whole suite
+ *  green, i.e. the branch was unfalsifiable, which AGENTS.md rules out. It is also the more correct
+ *  reading of the two: `[hidden]` is an ordinary UA rule an author stylesheet can outrank, and an
+ *  element whose class puts `display: block` back really IS on screen. Only the attributes that are
+ *  not styles in ANY engine need to be read directly. */
+function elementIsHiddenHere(el: Element, view: Window | null): boolean {
+  if (el.getAttribute("aria-hidden") === "true") return true;
+  if (el.hasAttribute("inert")) return true;
+  const style = view?.getComputedStyle(el);
+  if (style === undefined || style === null) return false;
+  return (
+    style.display === "none" || style.visibility === "hidden" || style.visibility === "collapse"
+  );
+}
+
+/** Is this element actually being rendered — i.e. would a user SEE the surface it belongs to?
+ *
+ *  ══ WHY A PRESENCE TEST WAS NOT ENOUGH (bead sparkle-thm9o) ═══════════════════════════════════
+ *  `dismissibleSurfaceOpen` used to be a bare `querySelector`, so a single node ANYWHERE in the
+ *  document carrying one of `DISMISSIBLE_SELECTOR`'s markers — hidden, `inert`, `aria-hidden`, zero
+ *  size, or simply left behind by a surface that had already closed — made `dismissibleOpen`
+ *  permanently true. Both Escape paths read that one value, so ESC-to-unmount died APP-WIDE and
+ *  SILENTLY while `ConciergeColumn` kept drawing its "ESC to unmount" hint. That is the founder's
+ *  "I could not unmount the concierge", and bead sparkle-gielc (agents parked in `status:"approval"`
+ *  with no dialog visible in the pane) is the same leaked-node shape from another direction.
+ *
+ *  ══ WHY IT WALKS ANCESTORS RATHER THAN READING THE NODE ═══════════════════════════════════════
+ *  A dismissible left inside a collapsed panel is the realistic leak, and no single read finds it.
+ *  `aria-hidden` and `inert` are not styles in ANY engine, so they never reach a descendant's
+ *  computed style; and jsdom in particular does not propagate a parent's `display:none` down either
+ *  (probed on jsdom 25: the child still computes `display: block`). Walking is what makes the guard
+ *  assertable under test instead of only in a browser.
+ *
+ *  ══ WHY `checkVisibility` IS AN EXTRA, NEVER THE MECHANISM ════════════════════════════════════
+ *  It is the browser's own answer and sees what an attribute walk cannot — a `display:none` that
+ *  came from a STYLESHEET, `content-visibility`, a closed popover. jsdom 25 does not implement it at
+ *  all, so it is a strict narrowing in the shipped app and a no-op under test. Deliberately NOT the
+ *  load-bearing check: docs/jsdom-test-caveats.md is explicit that a guard whose only proof would be
+ *  a mocked measurement proves nothing, so the walk below is what the suite asserts and this is
+ *  bonus. `opacityProperty` is left off — a dialog mid-fade-in is open, not leaked.
+ *
+ *  ══ THE DIRECTION OF SAFETY ═══════════════════════════════════════════════════════════════════
+ *  Over-reporting "open" kills Escape everywhere with no recovery short of a relaunch.
+ *  Under-reporting means one Escape both closes a dialog and unbinds the cable — recoverable by
+ *  clicking a row. So this is deliberately conservative about calling a node open. It is NOT a
+ *  licence to keep narrowing: `cable.test.ts` pins that a real `<dialog open>` still owns Escape. */
+export function surfaceIsRendered(el: Element): boolean {
+  const check = (el as Element & { checkVisibility?: (o?: object) => boolean }).checkVisibility;
+  if (
+    typeof check === "function" &&
+    !check.call(el, { checkVisibilityCSS: true, contentVisibilityAuto: true })
+  ) {
+    return false;
+  }
+  const view = el.ownerDocument?.defaultView ?? null;
+  for (let node: Element | null = el; node !== null; node = node.parentElement) {
+    if (elementIsHiddenHere(node, view)) return false;
+  }
+  return true;
+}
+
+/** Is a surface that owns Escape currently open AND ON SCREEN? The `dismissibleOpen` input, read
+ *  from the live DOM.
+ *
+ *  "OPEN" IS NOT "PRESENT" — see {@link surfaceIsRendered} for the wedge that distinction cost, and
+ *  for why the visibility test is attribute-derived rather than measured.
  *
  *  `doc` IS REQUIRED, with no default and no optional chain. Both call sites pass a live `document`, so a
  *  document-less host is not a reachable state — and the version that guarded against it came with a test
@@ -135,7 +211,9 @@ export const DISMISSIBLE_SELECTOR =
  *  preceding cleanup had emptied `body`. Deleting the `?.` left it green. An unfalsifiable guard plus the
  *  test that appears to cover it is worse than neither, so both are gone. */
 export function dismissibleSurfaceOpen(doc: Document): boolean {
-  return doc.querySelector(DISMISSIBLE_SELECTOR) != null;
+  // `some`, not "find the first match and test it": one leaked hidden node must not mask a live
+  // dialog sitting beside it, which is what reading only `querySelector`'s single answer would do.
+  return Array.from(doc.querySelectorAll(DISMISSIBLE_SELECTOR)).some(surfaceIsRendered);
 }
 
 /** Is this event target inside the live circuit? */

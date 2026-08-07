@@ -135,10 +135,80 @@ describe("installDictationFocusTracker — the event wiring", () => {
     vi.runAllTimers();
     setFocusOwner.mockClear();
 
+    // `hasFocus` is stubbed FALSE because this case is a REAL window blur, and the tracker now
+    // refuses a blur the DOM contradicts (see the next test). jsdom reports `hasFocus() === true`
+    // regardless of dispatched events, so without this the event here would describe a window that
+    // is simultaneously blurred and focused — a state the app never reaches.
+    const hasFocus = vi.spyOn(document, "hasFocus").mockReturnValue(false);
     window.dispatchEvent(new Event("blur"));
     expect(setWindowFocused).toHaveBeenCalledWith(false);
+    hasFocus.mockReturnValue(true);
     window.dispatchEvent(new Event("focus"));
     expect(setWindowFocused).toHaveBeenCalledWith(true);
+    hasFocus.mockRestore();
+  });
+
+  it("IGNORES a blur the DOM contradicts, so a stand-down pulse cannot strand the mic", () => {
+    // This latch is LEVEL-HELD: it drives the `"window"` pause reason and clears only on a real
+    // `focus`. The input-release hatch (services/inputRelease) dispatches a synthetic blur on
+    // purpose, to stand down the EDGE-triggered latches (hint mode, push-to-talk, the drag shield).
+    // Believing it would pause dictation with nothing able to un-pause it until the user left the
+    // app and came back — the hatch wedging the mic to free the keyboard (roborev 59651).
+    const hasFocus = vi.spyOn(document, "hasFocus").mockReturnValue(true);
+    const setWindowFocused = vi.fn();
+    uninstall = installDictationFocusTracker({ setFocusOwner: vi.fn(), setWindowFocused });
+    setWindowFocused.mockClear();
+
+    window.dispatchEvent(new Event("blur"));
+
+    expect(setWindowFocused).not.toHaveBeenCalled();
+    hasFocus.mockRestore();
+  });
+
+  it("IGNORES a blur in a window that is ALREADY background — the edge, not the level", () => {
+    // The contradicted-blur guard only covers the FOCUSED window. `app_menu.rs` broadcasts the
+    // release to every webview, and in a BACKGROUND window `hasFocus()` is already false — so that
+    // guard falls straight through exactly where believing the pulse is destructive (the relay is
+    // global; see useDictation). Acting only on a true -> false transition makes it a no-op there.
+    //
+    // ASSERTED ON `setFocusOwner`, NOT `setWindowFocused` — and that is the whole difficulty.
+    // `writeWindowFocused` already dedupes by VALUE, and the install seeds `false` here, so a
+    // re-write of `false` is invisible and an assertion on it passes with the guard REMOVED. It did:
+    // the first version of this test survived deleting the very line it names. `writeWindowFocused`
+    // also unconditionally re-reads the caret, and THAT is observable — so the terminal is torn out
+    // of the DOM first, making a re-read report a different owner (roborev 59763).
+    const term = mountTerminal();
+    term.focus();
+    const hasFocus = vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    const setFocusOwner = vi.fn();
+    uninstall = installDictationFocusTracker({ setFocusOwner, setWindowFocused: vi.fn() });
+    setFocusOwner.mockClear();
+
+    // activeElement falls back to <body> with NO focusin, so only a re-read would notice.
+    document.body.innerHTML = "";
+    window.dispatchEvent(new Event("blur"));
+
+    expect(setFocusOwner).not.toHaveBeenCalled();
+    hasFocus.mockRestore();
+  });
+
+  it("still reports the FIRST real background transition — the edge fires once", () => {
+    // The half that makes the case above non-vacuous: a guard that suppressed every blur would pass
+    // it too, while breaking the window-focus handoff this listener exists for.
+    const hasFocus = vi.spyOn(document, "hasFocus").mockReturnValue(true);
+    const setWindowFocused = vi.fn();
+    uninstall = installDictationFocusTracker({ setFocusOwner: vi.fn(), setWindowFocused });
+    setWindowFocused.mockClear();
+
+    hasFocus.mockReturnValue(false); // the window really went background
+    window.dispatchEvent(new Event("blur"));
+    expect(setWindowFocused).toHaveBeenCalledWith(false);
+
+    // …and a SECOND blur while still background is not another edge.
+    setWindowFocused.mockClear();
+    window.dispatchEvent(new Event("blur"));
+    expect(setWindowFocused).not.toHaveBeenCalled();
+    hasFocus.mockRestore();
   });
 
   it("uninstall detaches every listener AND cancels a pending deferred read", () => {

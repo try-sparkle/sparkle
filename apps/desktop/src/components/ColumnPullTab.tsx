@@ -224,15 +224,74 @@ export function publishColumnWidthVar(name: string, px: number): void {
  * It earns its place twice over: it also stops text selection and stops the pointer being stolen by
  * a canvas or an iframe mid-drag. It is created and destroyed with the gesture, so nothing is left
  * covering the app if a render happens to land in the middle.
+ *
+ * ── AND IT MUST HAVE A DISMISS PATH, because it froze the whole app once (bead sparkle-thm9o) ───
+ *
+ * This is a TRANSPARENT, FULL-VIEWPORT, POINTER-TAKING sheet at the maximum z-index appended
+ * straight to `document.body`. Stranded, it is indistinguishable from a working app that has stopped
+ * accepting input: everything paints correctly, every click lands on the sheet, no text box can be
+ * focused, and the control that would tear the offending column down cannot be hit either. The
+ * founder had to force-restart Sparkle over exactly that. The log signature is
+ * `keydown reached NON-editable target=body … activeElement=body` — focus stranded on `body` with
+ * keys NOT prevented, which is a pointer-blocking overlay rather than a stuck key handler.
+ *
+ * The drag effect now ends the gesture on every way the app can stop seeing the pointer, so in
+ * principle the sheet cannot be stranded. The two defences here are deliberately independent of
+ * that: they do not consult `dragging`, because "the flag was wrong" is precisely what the freeze
+ * WAS, and a sheet with no exit that does not route through the suspect flag is the failure mode
+ * itself.
+ *
+ *   • SWEEP. Any pre-existing shield is removed before this one is appended, so however many are
+ *     stranded, the next drag anyone starts — at any of the three seams — clears them. Removing a
+ *     concurrently-live instance's node is safe: its cleanup calls `remove()` on a detached node,
+ *     which is a no-op, and one pointer cannot drive two gestures anyway.
+ *   • SELF-DISMISS. A fresh press landing on the sheet ends it. During a live gesture the button is
+ *     already down and the pointer is captured, so what follows is a move or an up — a *new* press
+ *     arriving here means the app is no longer tracking the gesture this sheet belongs to. It calls
+ *     `onStrandedPress` as well as removing itself, so the flag behind it is cleared too rather than
+ *     merely uncovered; otherwise the next render would raise a second sheet.
+ *
+ * `mousedown` as well as `pointerdown`: the two are separate dispatches, and a path that delivers
+ * only the compatibility event still has to be able to get the sheet off the screen.
  */
-function makeDragShield(): HTMLDivElement {
+export const DRAG_SHIELD_SELECTOR = '[data-testid="column-drag-shield"]';
+
+function makeDragShield(onStrandedPress: () => void): HTMLDivElement {
+  document.querySelectorAll(DRAG_SHIELD_SELECTOR).forEach((n) => n.remove());
   const el = document.createElement("div");
   el.setAttribute("data-testid", "column-drag-shield");
   el.style.cssText =
     "position:fixed;inset:0;z-index:2147483647;cursor:col-resize;background:transparent";
+  let dismissed = false;
+  const dismiss = () => {
+    if (dismissed) return;
+    dismissed = true;
+    el.remove();
+    onStrandedPress();
+  };
+  el.addEventListener("pointerdown", dismiss);
+  el.addEventListener("mousedown", dismiss);
   document.body.appendChild(el);
   return el;
 }
+
+/**
+ * WHY A GESTURE ENDED — three of these are ways the app STOPPED SEEING THE POINTER, and naming them
+ * separately in the log is the only way to tell "the user let go" apart from "the release never
+ * arrived", which is the whole of bead sparkle-thm9o.
+ *
+ *   release        the ordinary one: `pointerup`, or a `pointercancel` from the OS.
+ *   release-lost   a `pointermove` carrying `buttons === 0` — the button went up somewhere we could
+ *                  not see it, and the next move over the window is how we find out (roborev 54730).
+ *   window-blur    the window lost focus mid-gesture. macOS delivers no `pointerup` for a release
+ *                  that happens over another application, so this is the only end that drag gets —
+ *                  the same shape `voice/usePushToTalk.ts` solves for the missing `keyup`.
+ *   hidden         the document went hidden (space switch, app hidden, display sleep).
+ *   capture-lost   the OS or the browser took the pointer away from the captured element.
+ *   shield-press   a fresh press landed on the drag shield, which means the shield outlived its
+ *                  gesture. See `makeDragShield`.
+ */
+type EndReason = "release" | "release-lost" | "window-blur" | "hidden" | "capture-lost" | "shield-press";
 
 export function ColumnPullTab({
   width,
@@ -396,10 +455,42 @@ export function ColumnPullTab({
    *
    *  AND IT IS WHERE THE WIDTH IS COMMITTED NOW — the one `onWidth` call a drag makes. See `cssVar`:
    *  the moves paint a CSS variable and do no React work at all, so the state change that used to
-   *  happen hundreds of times per gesture happens exactly once, here. */
-  const endDrag = useCallback((reason: "release" | "release-lost") => {
+   *  happen hundreds of times per gesture happens exactly once, here.
+   *
+   *  ── A LOST GESTURE COMMITS. IT DOES NOT ABANDON. ────────────────────────────────────────────
+   *
+   *  Deliberate, and the alternative was considered rather than skipped (bead sparkle-thm9o). The
+   *  argument for abandoning is real: the user was mid-way through choosing a width when the app
+   *  stopped seeing the pointer, so the width it settled on is not necessarily the one they meant.
+   *
+   *  Committing wins anyway, for a reason specific to how this drag paints. Every move has ALREADY
+   *  written that width onto the CSS variable the columns read (`preview`), and nothing in a lost
+   *  gesture un-writes it. So abandoning does not restore the pre-drag column — it leaves the column
+   *  PAINTED at the dragged width and STORED at the old one. That split is a known-bad state in this
+   *  shell: the tab's own width, its `aria-value*` and the next `pointerdown`'s origin all come from
+   *  the STORED number, so the following press starts however-many pixels inward and the seam is
+   *  dead for exactly that distance before it moves — the "divider registers but nothing moves" bug
+   *  that `readGestureMax` exists to close, re-opened from the other side. Undoing it properly means
+   *  republishing the pre-drag width to the variable, i.e. the user's whole drag visibly snapping
+   *  back because they cmd-tabbed away, which is a worse surprise than keeping what is on screen.
+   *
+   *  It is also what `release-lost` already does, and has done since roborev 54730 — the two paths
+   *  are the same event (a release the app never saw) reached by different routes, so they must not
+   *  disagree. The "only if it moved" guard below still applies to all of them: a press with no
+   *  travel is a click however it ends, and may not rewrite a stored width. */
+  const endDrag = useCallback((reason: EndReason) => {
     const g = drag.current;
-    const settled = g?.applied ?? lastApplied.current;
+    // IDEMPOTENT, because the new exits overlap by design. `lostpointercapture` fires immediately
+    // after the `pointerup` that implicitly released the capture, and a stranded-shield press can
+    // land on the same gesture a `blur` just ended. Without this guard each duplicate logs a
+    // "drag end … unchanged" line for a gesture that already finished — noise on the one channel
+    // that has to stay readable to diagnose this component. `setDragging(false)` still runs: a flag
+    // stuck true is the thing being defended against, so clearing it is never skipped.
+    if (!g) {
+      setDragging(false);
+      return;
+    }
+    const settled = g.applied ?? lastApplied.current;
     log.info(
       "resize",
       `${cfg.current.label}: drag end (${reason}) at ${settled ?? "unchanged"}${
@@ -414,7 +505,12 @@ export function ColumnPullTab({
     setDragging(false);
     // ONLY IF IT MOVED. A press-and-release on the dots with no travel is a click, not a resize, and
     // committing there would mark the width dirty and persist a value the user never chose.
-    if (g && settled != null && settled !== g.width) cfg.current.onWidth(settled);
+    // EVERY reason commits, not just `release` — see the "A LOST GESTURE COMMITS" note above. Gating
+    // this on `reason === "release"` is the bug that shipped it: it made `release-lost` stop
+    // committing too, silently reverting roborev 54730, and it left every new exit painting a width
+    // it never stored — the painted/stored split the note above explains at length. The `settled`
+    // and "only if it moved" terms still apply: a press with no travel is a click however it ended.
+    if (settled != null && settled !== g.width) cfg.current.onWidth(settled);
   }, []);
 
   /** Paint an intermediate width WITHOUT touching React. Clamps and logs exactly as a commit does —
@@ -490,7 +586,7 @@ export function ColumnPullTab({
     if (!dragging) return;
     // THE SHIELD GOES UP WITH THE GESTURE AND COMES DOWN WITH IT — tied to the effect's lifetime so
     // there is no path where a stuck flag leaves the app covered by an invisible sheet.
-    const shield = makeDragShield();
+    const shield = makeDragShield(() => endDrag("shield-press"));
 
     // WINDOW LISTENERS, STILL — pointer capture is an ADDITION to them, not a replacement.
     //
@@ -514,15 +610,49 @@ export function ColumnPullTab({
       preview(g.width + (cfg.current.grows === "left" ? dx : -dx) * cfg.current.widthPerPx);
     };
     const onUp = () => endDrag("release");
+    // ── THE EXITS THAT DO NOT REQUIRE SEEING THE POINTER (bead sparkle-thm9o) ────────────────────
+    //
+    // Every exit above is an event ABOUT the pointer: a `pointerup`, a `pointercancel`, or a move
+    // carrying `buttons === 0`. All three assume the app is still being delivered pointer events for
+    // this gesture. When it is not — the release happens over another application, the window loses
+    // focus mid-drag, the OS takes the pointer — not one of them ever arrives, `dragging` stays true
+    // and the shield sits over the entire app until a restart. That is the freeze the founder hit.
+    //
+    // `blur` is the load-bearing one and it is the same fix `voice/usePushToTalk.ts:145` makes for
+    // the same class of problem: macOS never delivers the `keyup` after ⌘Tab, and it never delivers
+    // the `pointerup` for a release that happens over another app either. The founder's session had
+    // constant focus churn, which is exactly the condition in which a release goes missing.
+    //
+    // IN THE BUBBLE PHASE, NOT CAPTURE, and that is not incidental. A native element `blur` does not
+    // bubble, so a bubble-phase window listener hears only the WINDOW losing focus; registering it
+    // with `capture: true` would instead hear every element blur in the app and kill a live drag the
+    // moment focus moved anywhere — a fix strictly worse than the bug. `ColumnPullTab.test.tsx`
+    // pins both halves.
+    const onBlur = () => endDrag("window-blur");
+    // BOTH DIRECTIONS FIRE THIS EVENT, so it must read the state rather than assume one. Ending on a
+    // change back to `visible` would kill the drag the instant the user came back to the app.
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") endDrag("hidden");
+    };
+    // The capture taken in `startResize` being revoked — the OS or the browser deciding this element
+    // no longer owns the pointer. Ordinarily this ALSO fires just after a normal `pointerup` (the
+    // implicit release), which is harmless: `endDrag` early-returns once the gesture is over.
+    const onLostCapture = () => endDrag("capture-lost");
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
     // A cancelled pointer (the OS taking over, a touch turning into a scroll) ends the gesture too —
     // without this the drag would hang with no release ever arriving.
     window.addEventListener("pointercancel", onUp);
+    window.addEventListener("blur", onBlur);
+    window.addEventListener("lostpointercapture", onLostCapture);
+    document.addEventListener("visibilitychange", onVisibility);
     return () => {
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
       window.removeEventListener("pointercancel", onUp);
+      window.removeEventListener("blur", onBlur);
+      window.removeEventListener("lostpointercapture", onLostCapture);
+      document.removeEventListener("visibilitychange", onVisibility);
       shield.remove();
     };
     // `dragging` ALONE. Everything else the handlers read comes through `cfg`/`drag` refs, which is

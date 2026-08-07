@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
+import { log } from "../logger";
 import type { Phase } from "../voice/dictationPhase";
 import type { FocusOwner } from "../voice/dictationFocus";
 
@@ -17,6 +18,27 @@ export const OUT_OF_CREDITS_NOTICE_MS = 5000;
 // zustand state) so a fresh attempt can cancel-and-restart the 5s countdown without threading a
 // timer id through the store — see showOutOfCreditsNotice/clearOutOfCreditsNotice.
 let outOfCreditsTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** The mic master-mute transition line, or `null` when nothing actually changed.
+ *
+ *  The app used to log NOTHING on enable/disable, which is precisely why one of the two candidate
+ *  causes of the founder's app-wide input freeze could not be ruled out from the logs: nobody could
+ *  say what the master mute was doing at the time (bead sparkle-thm9o). The freeze trace's keydown
+ *  line now carries `micPhase`, but that only fires on a keystroke — a freeze in which no key ever
+ *  reaches the webview would still say nothing, so the transition needs its own record.
+ *
+ *  PURE and exported so the contract that matters — log the TRANSITION, never the poll — is
+ *  unit-assertable without driving the store. `null` on a no-op is that contract: `setEnabled` is
+ *  called with the value it already holds on ordinary paths, and a line per call would be noise
+ *  that buries the one real flip. */
+export function micMuteTransitionLine(
+  prev: boolean,
+  next: boolean,
+  reason: string,
+): string | null {
+  if (prev === next) return null;
+  return `mic master-mute: ${prev ? "on" : "off"} -> ${next ? "on" : "off"} (${reason})`;
+}
 
 type Status = "idle" | "listening" | "error";
 
@@ -254,7 +276,14 @@ export const useDictationStore = create<DictationState>()(
       setDeadMicSilent: (deadMicSilent) => set({ deadMicSilent }),
       setModelProgress: (modelProgress) => set({ modelProgress }),
 
-      setEnabled: (enabled) => set({ enabled }),
+      // The ONE funnel every mic on/off in the app goes through (MicButton, useDictation's
+      // permission-denied fallback, the helper island menu, the no-credits guard), so recording the
+      // transition here catches all of them without threading a reason through each call site.
+      setEnabled: (enabled) => {
+        const line = micMuteTransitionLine(get().enabled, enabled, "toggle");
+        if (line) log.info("dictation", line);
+        set({ enabled });
+      },
       setPhase: (phase) => set({ phase }),
       togglePhase: () => set((s) => ({ phase: s.phase === "passive" ? "active" : "passive" })),
       showOutOfCreditsNotice: () => {
@@ -264,6 +293,14 @@ export const useDictationStore = create<DictationState>()(
         outOfCreditsTimer = setTimeout(() => {
           outOfCreditsTimer = null;
           // Force the mic off (belt-and-braces: an arm attempt never armed it) and drop the notice.
+          // This path bypasses `setEnabled`, so it records its OWN reason: an unattributed "the mic
+          // went off" is the kind of half-signal that costs an investigation an hour.
+          const line = micMuteTransitionLine(
+            get().enabled,
+            false,
+            "out-of-credits auto-deactivate",
+          );
+          if (line) log.info("dictation", line);
           set({ enabled: false, outOfCreditsNotice: false });
         }, OUT_OF_CREDITS_NOTICE_MS);
       },

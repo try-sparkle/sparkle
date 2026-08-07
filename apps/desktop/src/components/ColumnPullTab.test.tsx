@@ -65,6 +65,10 @@ function release() {
 
 afterEach(() => {
   document.documentElement.removeAttribute("style");
+  // The shield is appended to `document.body` directly, so RTL's `cleanup` does not reach it. A case
+  // that leaves one behind must not hand the strand to the NEXT case — every assertion about the
+  // shield is made inside its own case, so clearing here isolates them without masking anything.
+  document.querySelectorAll('[data-testid="column-drag-shield"]').forEach((n) => n.remove());
 });
 
 // ── THE WHOLE SEAM IS THE HANDLE ───────────────────────────────────────────────────────────────
@@ -740,6 +744,198 @@ describe("the drag shield", () => {
     press(dots(), 500);
     fireEvent.pointerCancel(window, { pointerId: 1 });
     expect(shield()).toBeNull();
+  });
+});
+
+// ── THE STRANDED SHIELD — bead sparkle-thm9o ───────────────────────────────────────────────────
+//
+// The app-wide input freeze the founder had to force-restart Sparkle over. Every exit from
+// `dragging === true` used to require the app to OBSERVE the pointer: a `pointerup`, a
+// `pointercancel`, or a `pointermove` carrying `buttons === 0`. All three are events about a pointer
+// the app can still see. When it cannot — the release happens over another application, the window
+// loses focus mid-gesture, the OS takes the pointer — none of them ever arrive, `dragging` stays
+// true, and a transparent full-viewport sheet at z-index 2147483647 sits over the whole app with no
+// click handler and no dismiss path. The app paints perfectly and every click lands on the sheet: no
+// text box can be focused, and the concierge's own unmount control cannot be hit. Only a restart
+// cleared it.
+//
+// The corroborating line from the founder's session log is
+// `focus-trace: keydown reached NON-editable target=body … defaultPrevented=false activeElement=body`
+// — focus stranded on `body` with keys NOT prevented, which is a pointer-blocking overlay rather
+// than a stuck key handler.
+//
+// jsdom has no layout and `setPointerCapture` silently does nothing here (the component says so), so
+// every case below asserts the shield node's PRESENCE/ABSENCE and the committed width — never
+// geometry, and never that the sheet "blocks" anything, which jsdom cannot answer.
+describe("a gesture the app can no longer observe — the stranded drag shield", () => {
+  const shield = () => document.querySelector('[data-testid="column-drag-shield"]');
+
+  it("ends the gesture on window BLUR, with no pointerup ever arriving", () => {
+    // THE HEADLINE CASE. Before the fix this leaves the shield up forever: there is no `blur`, no
+    // `visibilitychange`, no `lostpointercapture` and no timeout in the drag effect's teardown set.
+    setup({ cssVar: VAR });
+    press(dots(), 500);
+    moveTo(540);
+    expect(shield()).not.toBeNull();
+    fireEvent.blur(window);
+    expect(shield()).toBeNull();
+  });
+
+  it("COMMITS the width the user last saw when the gesture is lost, rather than abandoning it", () => {
+    // A DELIBERATE CHOICE, and the same one `release-lost` already makes — see `endDrag`'s comment.
+    // The preview has already painted that width onto the CSS variable, so abandoning would leave
+    // the column PAINTED at one width and STORED at another: the stored-vs-painted split, which the
+    // next mousedown resolves by jumping the seam back. Committing keeps the two in step.
+    const { onWidth } = setup({ cssVar: VAR });
+    press(dots(), 500);
+    moveTo(540);
+    expect(painted()).toBe("400px");
+    fireEvent.blur(window);
+    expect(onWidth).toHaveBeenCalledTimes(1);
+    expect(onWidth).toHaveBeenCalledWith(400);
+    // …and the gesture is genuinely over: later moves must not keep dragging a column nobody is
+    // holding. This is the half that `dragging === false` alone would not prove.
+    onWidth.mockClear();
+    moveTo(900);
+    expect(painted()).toBe("400px");
+    expect(onWidth).not.toHaveBeenCalled();
+  });
+
+  it("commits NOTHING on blur when the gesture never moved — a lost click is still a click", () => {
+    // The `endDrag` "only if it moved" rule has to survive the new exits too, or cmd-tabbing away
+    // with the seam merely pressed would mark the width dirty and persist a value nobody chose.
+    const { onWidth } = setup({ cssVar: VAR });
+    press(dots(), 500);
+    fireEvent.blur(window);
+    expect(onWidth).not.toHaveBeenCalled();
+    expect(shield()).toBeNull();
+  });
+
+  it("ends the gesture when the document is HIDDEN mid-drag", () => {
+    const { onWidth } = setup({ cssVar: VAR });
+    press(dots(), 500);
+    moveTo(540);
+    const spy = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+    fireEvent(document, new Event("visibilitychange"));
+    spy.mockRestore();
+    expect(shield()).toBeNull();
+    expect(onWidth).toHaveBeenCalledWith(400);
+  });
+
+  it("does NOT end the gesture on a visibilitychange back to VISIBLE", () => {
+    // The event fires in both directions. Ending on either would kill a live drag the moment the
+    // user alt-tabs BACK to the app, which is the opposite of the fix.
+    const { onWidth } = setup({ cssVar: VAR });
+    press(dots(), 500);
+    moveTo(540);
+    fireEvent(document, new Event("visibilitychange")); // jsdom's default state is "visible"
+    expect(shield()).not.toBeNull();
+    expect(onWidth).not.toHaveBeenCalled();
+    release();
+  });
+
+  it("ends the gesture when the OS takes the pointer away — lostpointercapture", () => {
+    const { onWidth } = setup({ cssVar: VAR });
+    press(dots(), 500);
+    moveTo(540);
+    fireEvent(window, new Event("lostpointercapture"));
+    expect(shield()).toBeNull();
+    expect(onWidth).toHaveBeenCalledWith(400);
+  });
+
+  it("is not confused by an ELEMENT losing focus — only the WINDOW's blur ends a drag", () => {
+    // A native element `blur` does not bubble, so a window-level listener registered in the BUBBLE
+    // phase must not hear it. Registering it in the capture phase instead would kill every drag the
+    // instant focus moved anywhere inside the app — including the focus change the press itself can
+    // cause. This is the case that keeps the fix from being worse than the bug.
+    const { onWidth } = setup({ cssVar: VAR });
+    dots().focus();
+    press(dots(), 500);
+    moveTo(540);
+    fireEvent.blur(dots());
+    expect(shield()).not.toBeNull();
+    expect(onWidth).not.toHaveBeenCalled();
+    release();
+    expect(onWidth).toHaveBeenCalledWith(400);
+  });
+
+  it("a blur with NO gesture in flight commits nothing and touches nothing", () => {
+    const { onWidth } = setup({ cssVar: VAR });
+    fireEvent.blur(window);
+    fireEvent(window, new Event("lostpointercapture"));
+    expect(onWidth).not.toHaveBeenCalled();
+    expect(shield()).toBeNull();
+  });
+
+  // ── BELT AND BRACES ──────────────────────────────────────────────────────────────────────────
+  // The cases above all still route through the `dragging` flag. These two are the defences that
+  // do NOT: a transparent sheet at the maximum z-index must not be able to outlive its gesture even
+  // if the flag is wrong, because "the flag was wrong" is exactly what the freeze was.
+  it("DISMISSES ITSELF on a press it receives — a shield taking a fresh pointerdown is stranded", () => {
+    // During a live gesture the button is already down and the pointer is captured, so the next
+    // event is a move or an up. A fresh press landing ON the sheet therefore means the app is no
+    // longer tracking the gesture the sheet belongs to.
+    const { onWidth } = setup({ cssVar: VAR });
+    press(dots(), 500);
+    moveTo(540);
+    const el = shield() as HTMLElement;
+    fireEvent.pointerDown(el, { pointerId: 2, button: 0, buttons: 1, clientX: 700 });
+    expect(shield()).toBeNull();
+    // And the gesture behind it is ended too, not merely uncovered — otherwise the flag stays true
+    // and the next render could raise a second sheet.
+    expect(onWidth).toHaveBeenCalledWith(400);
+    onWidth.mockClear();
+    moveTo(900);
+    expect(onWidth).not.toHaveBeenCalled();
+  });
+
+  it("dismisses itself on a plain MOUSEDOWN too, for pointer-eventless paths", () => {
+    setup({ cssVar: VAR });
+    press(dots(), 500);
+    fireEvent.mouseDown(shield() as HTMLElement, { button: 0, clientX: 700 });
+    expect(shield()).toBeNull();
+  });
+
+  it("SWEEPS any orphan shield when a new gesture starts — there is never more than one", () => {
+    // The last line of defence: a sheet left behind by an instance that went away without its
+    // cleanup running (a crashed render, a hot reload, the freeze itself) is cleared by the next
+    // drag anyone starts, anywhere in the app.
+    const orphan = document.createElement("div");
+    orphan.setAttribute("data-testid", "column-drag-shield");
+    document.body.appendChild(orphan);
+    setup({ cssVar: VAR });
+    press(dots(), 500);
+    expect(document.querySelectorAll('[data-testid="column-drag-shield"]').length).toBe(1);
+    expect(orphan.isConnected).toBe(false);
+    release();
+    expect(shield()).toBeNull();
+  });
+
+  // ── ALL THREE MOUNT SITES ────────────────────────────────────────────────────────────────────
+  // The shell mounts this component three times (the concierge seam, and both of the sidebar's
+  // pair boundaries). The fix lives in the component, so it holds for every instance — but the
+  // failure mode it replaces was ONE stranded sheet covering the whole app regardless of which
+  // seam raised it, so the guarantee worth pinning is a fleet-wide one, not a per-instance one.
+  it("leaves NO shield anywhere when any one of three mounted tabs loses its gesture", () => {
+    const onA = vi.fn();
+    const onB = vi.fn();
+    const onC = vi.fn();
+    render(
+      <>
+        <ColumnPullTab width={360} onWidth={onA} min={280} max={560} label="Sparkle column" testId="a" />
+        <ColumnPullTab width={240} onWidth={onB} min={180} max={480} label="Build column" testId="b" />
+        <ColumnPullTab width={300} onWidth={onC} min={180} max={480} label="agent column" testId="c" grows="right" />
+      </>,
+    );
+    press(screen.getByTestId("b-dots"), 500);
+    fireEvent.pointerMove(window, { pointerId: 1, buttons: 1, clientX: 530 });
+    expect(document.querySelectorAll('[data-testid="column-drag-shield"]').length).toBe(1);
+    fireEvent.blur(window);
+    expect(document.querySelectorAll('[data-testid="column-drag-shield"]').length).toBe(0);
+    // Only the seam that was actually grabbed committed anything.
+    expect(onB).toHaveBeenCalledWith(270);
+    expect(onA).not.toHaveBeenCalled();
+    expect(onC).not.toHaveBeenCalled();
   });
 });
 

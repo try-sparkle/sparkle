@@ -59,6 +59,7 @@ mod hooks;
 mod identity_log;
 mod inbox;
 mod judge;
+mod key_window;
 mod knightwatch;
 mod logging;
 mod mac_panel;
@@ -224,6 +225,13 @@ pub fn run() {
                 // non-activating panel, so letting it through to dictation would resume microphone
                 // capture the moment the user clicked the floating island while working in another
                 // app — a worse failure than the island's own.
+                // A THIRD consumer, and deliberately not folded into `focus_consumers`: it asks a
+                // different question from either of those two. They decide app BEHAVIOUR (release
+                // the mic, hide the island); this one only RECORDS, so that an app-wide input
+                // freeze can be diagnosed from the log file afterwards (bead sparkle-thm9o). It is
+                // the one signal that survives a wedged webview, because the webview is what it
+                // exists to check on — see key_window.rs.
+                key_window::note_focus(label, *focused);
                 let consumers = frontmost::focus_consumers(label);
                 if consumers.dictation {
                     app.state::<dictation::DictationState>()
@@ -559,6 +567,9 @@ pub fn run() {
             let handler: Box<dyn Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync> =
                 Box::new(tauri::generate_handler![
             notify_frontend_shown,
+            // ASYNC on purpose: it is read from the input-freeze trace, so it must not be able to
+            // block on the main thread it exists to report on. See key_window.rs.
+            key_window::main_window_key_state,
             cmd_timing::cmd_timing_report,
             fleet::fleet_digest,
             fleet::fleet_read_hook_stream,

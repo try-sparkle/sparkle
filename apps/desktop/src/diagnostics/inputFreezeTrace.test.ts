@@ -9,6 +9,7 @@ import {
   describeFocusTarget,
   installInputFreezeTrace,
   isTextKeystroke,
+  micPhaseLabel,
   traceGates,
 } from "./inputFreezeTrace";
 import { log } from "../logger";
@@ -74,14 +75,64 @@ describe("installInputFreezeTrace", () => {
     uninstall();
   });
 
-  it("is inert while dictation is disabled", () => {
+  // REPLACES an "is inert while dictation is disabled" test that asserted the OPPOSITE of this.
+  // That gate is the bug this commit removes (bead sparkle-thm9o): during the founder's app-wide
+  // freeze the trace wrote nothing, and the log could not distinguish "keystrokes never reached the
+  // webview" from "the mic happened to be off, so the arm was gated out". The old assertion was
+  // pinning exactly the ambiguity, so it is UPDATED deliberately rather than deleted — the
+  // focus-stream half of its claim survives below, because only the keydown arm changes.
+  it("STILL records the keydown fingerprint when the mic is OFF (the gap that made a freeze unreadable)", () => {
     const uninstall = installInputFreezeTrace({ dictationState: OFF });
     const div = document.createElement("div");
     document.body.appendChild(div);
     div.dispatchEvent(new KeyboardEvent("keydown", { key: "a", bubbles: true }));
-    expect(log.warn).not.toHaveBeenCalled();
+    expect(log.warn).toHaveBeenCalledTimes(1);
+    expect((log.warn as any).mock.calls[0][1]).toContain("NON-editable");
+    uninstall();
+  });
+
+  // The three-valued label is what makes the un-gated arm READABLE: "off" says the mic was muted
+  // AND the trace still ran, so a silent log can never again be blamed on the gate. Reporting the
+  // mic-off case as "passive" would resurrect the false claim roborev 54719 removed.
+  it("labels the mic-off case as micPhase=off, distinctly from paused", () => {
+    const uninstall = installInputFreezeTrace({ dictationState: OFF });
+    const div = document.createElement("div");
+    document.body.appendChild(div);
+    div.dispatchEvent(new KeyboardEvent("keydown", { key: "a", bubbles: true }));
+    expect((log.warn as any).mock.calls[0][1]).toContain("micPhase=off");
+    uninstall();
+  });
+
+  // Un-gating the keydown arm must NOT widen the focus stream — that gate is the volume fix
+  // (roborev 54719) and is the half of the old "inert while disabled" test that still holds.
+  it("does NOT stream focus transitions while the mic is off", () => {
+    const uninstall = installInputFreezeTrace({ dictationState: OFF });
+    const ta = document.createElement("textarea");
+    document.body.appendChild(ta);
+    ta.dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
     expect(log.info).not.toHaveBeenCalled();
     expect(log.debug).not.toHaveBeenCalled();
+    uninstall();
+  });
+
+  // The filter and the throttle are what stopped the unbounded WARN stream (roborev 56020/56006).
+  // Removing the mic gate widens WHEN the arm runs, so both bounds now carry the whole load — and
+  // with the mic off is exactly the configuration in which nothing else would catch a regression.
+  it("still applies the text-keystroke filter and the 1/s throttle with the mic off", () => {
+    let t = 0;
+    const uninstall = installInputFreezeTrace({ dictationState: OFF, now: () => t });
+    const div = document.createElement("div");
+    document.body.appendChild(div);
+    div.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    div.dispatchEvent(new KeyboardEvent("keydown", { key: "k", metaKey: true, bubbles: true }));
+    expect(log.warn).not.toHaveBeenCalled(); // filtered, not throttled
+    div.dispatchEvent(new KeyboardEvent("keydown", { key: "a", bubbles: true }));
+    t = 999;
+    div.dispatchEvent(new KeyboardEvent("keydown", { key: "b", bubbles: true }));
+    expect(log.warn).toHaveBeenCalledTimes(1); // second one throttled
+    t = 1000;
+    div.dispatchEvent(new KeyboardEvent("keydown", { key: "c", bubbles: true }));
+    expect(log.warn).toHaveBeenCalledTimes(2);
     uninstall();
   });
 
@@ -191,6 +242,56 @@ describe("traceGates", () => {
     const off = { enabled: false, phase: "passive" } satisfies StorePhaseSlice;
     expect(traceGates(on)).toEqual({ enabled: false, active: false });
     expect(traceGates(off)).toEqual({ enabled: false, active: false });
+  });
+});
+
+// `micPhase` is now THREE-valued. The keydown arm runs unconditionally, so the mic state stopped
+// being a precondition of the line and became a FIELD of it — which is the whole diagnostic gain:
+// the reader can tell "the mic was off" from "the trace did not run".
+describe("micPhaseLabel", () => {
+  it("is 'active' only while speech is actually routing", () => {
+    expect(micPhaseLabel({ enabled: true, active: true })).toBe("active");
+  });
+
+  it("is 'passive' when the mic is hot but paused", () => {
+    expect(micPhaseLabel({ enabled: true, active: false })).toBe("passive");
+  });
+
+  it("is 'off' when the master mute is on — NOT 'passive'", () => {
+    expect(micPhaseLabel({ enabled: false, active: false })).toBe("off");
+  });
+
+  it("reports 'off' even if a stale `active` says otherwise (master mute wins)", () => {
+    expect(micPhaseLabel({ enabled: false, active: true })).toBe("off");
+  });
+});
+
+// `defaultPrevented=false` was the ONE useful field the trace produced during the real freeze: it
+// tells a stuck global capture handler (true) apart from plain focus loss (false). Nothing asserted
+// it, so it could have been dropped in this un-gating with the suite green.
+describe("installInputFreezeTrace — defaultPrevented is the capture-vs-focus-loss discriminator", () => {
+  it("reports defaultPrevented=false when no handler consumed the key", () => {
+    const uninstall = installInputFreezeTrace({ dictationState: ACTIVE });
+    const div = document.createElement("div");
+    document.body.appendChild(div);
+    div.dispatchEvent(new KeyboardEvent("keydown", { key: "a", bubbles: true }));
+    expect((log.warn as any).mock.calls[0][1]).toContain("defaultPrevented=false");
+    uninstall();
+  });
+
+  it("reports defaultPrevented=true when a handler already consumed the key", () => {
+    // A capture listener that swallows the key BEFORE ours — the "stuck global handler" shape.
+    // Registered on window/capture and BEFORE the install, since same-target same-phase listeners
+    // run in registration order and there is no earlier point in the propagation path than this.
+    const eat = (e: Event) => e.preventDefault();
+    window.addEventListener("keydown", eat, true);
+    const uninstall = installInputFreezeTrace({ dictationState: ACTIVE });
+    const div = document.createElement("div");
+    document.body.appendChild(div);
+    div.dispatchEvent(new KeyboardEvent("keydown", { key: "a", bubbles: true, cancelable: true }));
+    window.removeEventListener("keydown", eat, true);
+    expect((log.warn as any).mock.calls[0][1]).toContain("defaultPrevented=true");
+    uninstall();
   });
 });
 

@@ -42,6 +42,15 @@ const EXEMPT: Record<string, string> = {
     "this overlay is not open behind the Shortcuts pane (Settings uses ModalShell).",
   "diagnostics/inputFreezeTrace.ts":
     "read-only diagnostic — logs and returns, calls no action, no preventDefault/stopPropagation.",
+  "services/inputRelease.ts":
+    "the escape hatch, and standing down would disable it in the one state it exists for. The " +
+    "recorder is ITSELF a way to wedge the app: while capturingShortcut is set, " +
+    "KeyboardShortcutsMenu preventDefaults every keydown AND keyup app-wide, and it has no blur " +
+    "reset — cmd-tab away mid-capture and the keyboard is dead with no visible cause. Releasing " +
+    "that latch is step 3 of the release, so a hatch that deferred to it could never fire. The " +
+    "cost of the exemption is bounded: the chord is CmdOrCtrl+Shift+Escape, so the only binding it " +
+    "can shadow is that exact one, and it is a fixed menu key equivalent rather than a rebindable " +
+    "chord (app_menu.rs INPUT_RELEASE_ACCELERATOR).",
 };
 
 /** Every .ts/.tsx under src, excluding tests. */

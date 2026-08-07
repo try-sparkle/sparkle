@@ -25,6 +25,17 @@ vi.mock("@tauri-apps/api/window", () => ({
   currentMonitor: vi.fn(async () => PRIMARY),
 }));
 
+// The input-release hatch subscribes here. Mocked deliberately rather than left to reject: without
+// it every test in this file exercises the `listen`-rejection branch, and the helper's own hatch
+// coverage below could not tell a wired subscriber from an unwired one.
+let fireInputRelease: (() => void) | null = null;
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn(async (_e: string, cb: () => void) => {
+    fireInputRelease = cb;
+    return () => {};
+  }),
+}));
+
 vi.mock("../screenshot", () => ({
   captureScreenRegion: (...a: unknown[]) => captureScreenRegion(...a),
   showCaptureWindow: (...a: unknown[]) => showCaptureWindow(...a),
@@ -85,6 +96,7 @@ vi.mock("../services/helper", () => ({
 
 import { availableMonitors } from "@tauri-apps/api/window";
 import { HelperApp } from "./HelperApp";
+import { resetInputReleaseCoalescing } from "../services/inputRelease";
 import { useHelperPrefs } from "./helperPrefs";
 // Derived, never hand-copied: a change to TAB_W in helperGeometry moves this test with it. The
 // invariant it relies on is stated once, at STRADDLE_INSET below.
@@ -99,6 +111,16 @@ describe("HelperApp", () => {
     vi.clearAllMocks();
     localStorage.clear();
     fireCaptureShortcut = null;
+  // Reset like its five siblings: a stale capture makes a later case pass for the wrong reason —
+  // `waitFor(() => expect(fireInputRelease).not.toBeNull())` would be satisfied instantly by an
+  // EARLIER test's assignment, and the captured handler closes over module state with no per-install
+  // identity, so firing it still performs a full release. That made the mutation-check result
+  // ordering-dependent rather than structural (roborev 59717).
+  fireInputRelease = null;
+  // The release is DEBOUNCED (services/inputRelease), and successive cases run milliseconds apart —
+  // well inside the window — so without this the second and later release cases are suppressed by
+  // the FIRST one's release rather than exercising their own trigger.
+  resetInputReleaseCoalescing();
     fireCaptureClosed = null;
     fireCaptureSend = null;
     fireFrontmost = null;
@@ -120,6 +142,53 @@ describe("HelperApp", () => {
     captureScreenRegion.mockReset();
     captureScreenRegion.mockResolvedValue(null);
     useHelperPrefs.setState(DEFAULTS as never);
+  });
+
+  // THE HELPER GETS THE HATCH TOO. `app_menu.rs` broadcasts the release to every webview on the
+  // stated grounds that "a wedged helper webview deserves the same escape as the main one", and that
+  // broadcast landed nowhere until HelperApp subscribed — documented-but-absent, which is the exact
+  // failure bead sparkle-thm9o is about. Asserts a real side effect (a seeded drag shield being
+  // swept) rather than that a listener was registered.
+  const seedShield = () => {
+    const el = document.createElement("div");
+    el.setAttribute("data-testid", "column-drag-shield");
+    document.body.appendChild(el);
+    return el;
+  };
+  const shieldGone = () => document.querySelector('[data-testid="column-drag-shield"]') == null;
+
+  it("releases input in the helper window when the native menu broadcasts", async () => {
+    render(<HelperApp />);
+    await waitFor(() => expect(fireInputRelease).not.toBeNull());
+    seedShield();
+    expect(shieldGone()).toBe(false);
+
+    fireInputRelease!();
+
+    expect(shieldGone()).toBe(true);
+  });
+
+  it("releases input in the helper window on the keyboard fallback", async () => {
+    render(<HelperApp />);
+    await waitFor(() => expect(fireInputRelease).not.toBeNull());
+    seedShield();
+
+    fireEvent.keyDown(window, { key: "Escape", shiftKey: true, metaKey: true });
+
+    expect(shieldGone()).toBe(true);
+  });
+
+  it("stops listening once the helper unmounts", async () => {
+    render(<HelperApp />);
+    await waitFor(() => expect(fireInputRelease).not.toBeNull());
+    cleanup();
+    const shield = seedShield();
+
+    fireEvent.keyDown(window, { key: "Escape", shiftKey: true, metaKey: true });
+
+    // Still there: a listener that outlives its window keeps firing, and both roots mount one.
+    expect(shieldGone()).toBe(false);
+    shield.remove();
   });
 
   it("renders the island with vitals fetched on mount", async () => {

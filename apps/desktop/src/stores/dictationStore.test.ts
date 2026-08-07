@@ -1,5 +1,16 @@
-import { describe, it, expect, beforeEach } from "vitest";
-import { useDictationStore, DICTATION_PERSIST_KEY } from "./dictationStore";
+import { describe, it, expect, beforeEach, vi, afterEach } from "vitest";
+
+vi.mock("../logger", () => ({
+  log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+}));
+
+import {
+  useDictationStore,
+  DICTATION_PERSIST_KEY,
+  micMuteTransitionLine,
+  OUT_OF_CREDITS_NOTICE_MS,
+} from "./dictationStore";
+import { log } from "../logger";
 
 const reset = () =>
   useDictationStore.setState({
@@ -68,5 +79,75 @@ describe("dictationStore — ambient fields", () => {
     useDictationStore.getState().registerInsert(null);
     useDictationStore.getState().insert("should not appear");
     expect(seen).toEqual([]);
+  });
+});
+
+// The app logged NOTHING when the mic was enabled or disabled, which is why one of the two
+// candidate causes of the founder's app-wide freeze could not be ruled out from the logs: there was
+// no way to know what the master mute was doing at the time (bead sparkle-thm9o). The trace's
+// keydown line now carries `micPhase`, but that only fires on a keystroke — the transition itself
+// has to be its own record, or a freeze with no keystrokes at all still says nothing.
+describe("micMuteTransitionLine", () => {
+  it("is null when nothing changed — the contract is TRANSITION, not per-poll", () => {
+    expect(micMuteTransitionLine(true, true, "toggle")).toBeNull();
+    expect(micMuteTransitionLine(false, false, "toggle")).toBeNull();
+  });
+
+  it("names both ends of the transition and the reason", () => {
+    expect(micMuteTransitionLine(false, true, "toggle")).toBe("mic master-mute: off -> on (toggle)");
+    expect(micMuteTransitionLine(true, false, "toggle")).toBe("mic master-mute: on -> off (toggle)");
+  });
+});
+
+describe("dictationStore — mic master-mute transitions are logged", () => {
+  beforeEach(() => {
+    useDictationStore.setState({ enabled: false, outOfCreditsNotice: false });
+    vi.clearAllMocks();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("logs once when setEnabled actually flips the mute", () => {
+    useDictationStore.getState().setEnabled(true);
+    expect(log.info).toHaveBeenCalledTimes(1);
+    expect((log.info as any).mock.calls[0][1]).toBe("mic master-mute: off -> on (toggle)");
+  });
+
+  it("logs NOTHING when setEnabled is called with the value it already has", () => {
+    useDictationStore.getState().setEnabled(true);
+    vi.clearAllMocks();
+    useDictationStore.getState().setEnabled(true);
+    useDictationStore.getState().setEnabled(true);
+    expect(log.info).not.toHaveBeenCalled();
+  });
+
+  it("logs the reverse transition too", () => {
+    useDictationStore.getState().setEnabled(true);
+    vi.clearAllMocks();
+    useDictationStore.getState().setEnabled(false);
+    expect((log.info as any).mock.calls[0][1]).toBe("mic master-mute: on -> off (toggle)");
+  });
+
+  // The out-of-credits countdown forces the mute on WITHOUT going through setEnabled. An
+  // unattributed "the mic went off" line is exactly the kind of half-signal that sent today's
+  // investigation down a blind alley, so this path names itself.
+  it("attributes the out-of-credits auto-deactivate to its own reason", () => {
+    vi.useFakeTimers();
+    useDictationStore.getState().setEnabled(true);
+    vi.clearAllMocks();
+    useDictationStore.getState().showOutOfCreditsNotice();
+    vi.advanceTimersByTime(OUT_OF_CREDITS_NOTICE_MS);
+    expect(useDictationStore.getState().enabled).toBe(false);
+    expect((log.info as any).mock.calls[0][1]).toBe(
+      "mic master-mute: on -> off (out-of-credits auto-deactivate)",
+    );
+  });
+
+  it("does not log the out-of-credits deactivate when the mic was already off", () => {
+    vi.useFakeTimers();
+    useDictationStore.getState().showOutOfCreditsNotice();
+    vi.advanceTimersByTime(OUT_OF_CREDITS_NOTICE_MS);
+    expect(log.info).not.toHaveBeenCalled();
   });
 });

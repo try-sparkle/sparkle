@@ -2,9 +2,15 @@
 // The app logs no first-responder / keyboard-focus transitions, so a recurrence could not be pinned
 // from logs. This records — PII-SAFELY — the two signals that were missing: which element holds the
 // DOM caret (the first responder within the webview, recorded while speech is actively routing),
-// and whether keystrokes are reaching an editable target at all (recorded whenever the mic is HOT,
-// because the freeze outlives a pause). It NEVER logs key values or field contents.
-// The two gates are deliberately different — see `installInputFreezeTrace`.
+// and whether keystrokes are reaching an editable target at all (recorded ALWAYS — see below).
+// It NEVER logs key values or field contents.
+//
+// The keydown arm is deliberately UN-gated from the mic (bead sparkle-thm9o). It used to require the
+// persisted master mute to be off, which meant an app-wide freeze with dictation idle produced an
+// empty log — indistinguishable from a freeze in which keystrokes never reached the webview at all.
+// That ambiguity is the thing this module now exists to remove. The mic state is a FIELD of the
+// line, and a `focus-trace` silence is now evidence in itself.
+// The two arms' gates are still different — see `installInputFreezeTrace`.
 
 import { isEditableElement } from "../engine/focusGuard";
 import { log } from "../logger";
@@ -55,6 +61,22 @@ export function traceGates(s: { enabled: boolean; phase: Phase }): TraceGates {
   return { enabled: s.enabled, active: s.enabled && s.phase === "active" };
 }
 
+/** The mic's state as a FIELD of the fingerprint line, three-valued.
+ *
+ *  The keydown arm used to early-return on `!enabled`, so the mic was a PRECONDITION of the line.
+ *  That is what made the founder's app-wide freeze unreadable (bead sparkle-thm9o): the trace wrote
+ *  nothing, and no one could tell "keystrokes never reached the webview" from "the master mute was
+ *  off, so the arm was gated out". Now the arm always runs and the mic is reported instead of
+ *  gating — a silent log means keys are not arriving, full stop.
+ *
+ *  "off" must stay distinct from "passive": `enabled` is the persisted master mute and `active` is
+ *  speech actually routing, so collapsing them would re-introduce the false claim roborev 54719
+ *  removed (a merely-hot-but-paused mic described as live). */
+export function micPhaseLabel(g: TraceGates): "active" | "passive" | "off" {
+  if (!g.enabled) return "off";
+  return g.active ? "active" : "passive";
+}
+
 /** Does this keystroke represent the user trying to TYPE TEXT?
  *
  *  The fingerprint is "I typed a character and nothing received it" — not "a key reached a
@@ -87,18 +109,25 @@ export interface InputFreezeTraceDeps {
  *  - **focusin** (the first-responder stream) runs only while `active` — speech actually routing.
  *    Bare `enabled` is the persisted master mute, so gating this stream on it meant every user who
  *    had ever switched the mic on kept emitting a line per focus change forever (roborev 54719).
- *  - **keydown** (the freeze FINGERPRINT) runs whenever `enabled`. The freeze outlives the segment
- *    that caused it — it is "a global-looking freeze recoverable only by restart" — and a user whose
- *    keyboard has gone dead clicks the mic to `passive` as their first move. Narrowing this one to
- *    `active` would go quiet at exactly the moment they react, and `defaultPrevented` (which tells a
- *    stuck global capture apart from plain focus loss) is precisely the case that survives a pause.
- *    It is throttled to 1/s, so the broader gate costs essentially nothing (roborev 56006). */
+ *  - **keydown** (the freeze FINGERPRINT) runs ALWAYS — no mic gate at all. It was gated on
+ *    `enabled` (the persisted master mute), and that gate is what made the founder's app-wide
+ *    freeze undiagnosable: the trace wrote nothing, and the log could not tell "keystrokes never
+ *    reached the webview" from "the mic was off, so the arm never ran" (bead sparkle-thm9o). The
+ *    freeze is not a dictation-only failure and it outlives the segment that caused it — it is "a
+ *    global-looking freeze recoverable only by restart" — so ANY mic gate goes quiet at exactly the
+ *    moment a user reacts by muting. The mic is a FIELD of the line now (`micPhaseLabel`), which is
+ *    strictly more information than the gate ever provided. Bounded by `isTextKeystroke` and the
+ *    1/s throttle, which is what made the previous stream tolerable (roborev 56020 / 56006). */
 export function installInputFreezeTrace(deps: InputFreezeTraceDeps): () => void {
   const doc = deps.doc ?? document;
   const win = deps.win ?? window;
   const now = deps.now ?? (() => Date.now());
   let lastFocus = "";
-  let lastNonEditableLogAt = 0;
+  // -Infinity, not 0: the throttle compares against `now()`, and seeding it at 0 swallows the FIRST
+  // line for any clock whose epoch starts near zero (an injected `now` in a test, a monotonic
+  // `performance.now`). Under `Date.now` it never mattered, which is exactly why it would have gone
+  // unnoticed until the one line that matters went missing.
+  let lastNonEditableLogAt = -Infinity;
 
   const onFocusIn = () => {
     if (!deps.dictationState().active) return;
@@ -117,8 +146,10 @@ export function installInputFreezeTrace(deps: InputFreezeTraceDeps): () => void 
     }
   };
   const onKeyDown = (e: KeyboardEvent) => {
-    const { enabled, active } = deps.dictationState();
-    if (!enabled) return;
+    // NO mic gate. See `micPhaseLabel`: the master mute is reported as a field, never used as a
+    // precondition, so the freeze is visible whatever the mic is doing (bead sparkle-thm9o).
+    // The two bounds that stopped the unbounded WARN stream are unchanged and now carry the whole
+    // load — do not remove either (roborev 56020 = the filter, 56006 = the throttle).
     if (!isTextKeystroke(e)) return;
     if (isEditableElement(e.target as Element)) return;
     const t = now();
@@ -128,11 +159,16 @@ export function installInputFreezeTrace(deps: InputFreezeTraceDeps): () => void 
     // that, and said it anyway on a merely-hot-but-paused mic (roborev 54719). Carrying the phase
     // also makes the paused case readable in the log, which is the case that matters most: the
     // user has just clicked the mic down because their keyboard went dead.
+    //
+    // `defaultPrevented` is the discriminator this line exists for: TRUE means a global capture
+    // handler swallowed the key (a stuck shortcut/menu path), FALSE means nothing consumed it and
+    // the caret is simply nowhere. It was the ONE useful field the trace produced during the real
+    // freeze — it is unit-pinned now so it cannot be dropped silently.
     log.warn(
       "dictation",
       `focus-trace: keydown reached NON-editable target=${describeFocusTarget(
         e.target as Element,
-      )} micPhase=${active ? "active" : "passive"} defaultPrevented=${
+      )} micPhase=${micPhaseLabel(deps.dictationState())} defaultPrevented=${
         e.defaultPrevented
       } activeElement=${describeFocusTarget(doc.activeElement)}`,
     );

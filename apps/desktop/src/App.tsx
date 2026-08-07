@@ -3,6 +3,7 @@ import { AuthGate } from "./components/AuthGate";
 import { ReadinessGate } from "./components/ReadinessGate";
 import { useAmbientVoice } from "./useDictation";
 import { installInputFreezeTrace, traceGates } from "./diagnostics/inputFreezeTrace";
+import { installInputRelease } from "./services/inputRelease";
 import { installDictationFocusTracker } from "./voice/dictationFocusTracker";
 import { useDictationStore } from "./stores/dictationStore";
 import { useApplyTheme } from "./theme/theme";
@@ -276,6 +277,13 @@ export function App() {
     () => installInputFreezeTrace({ dictationState: () => traceGates(useDictationStore.getState()) }),
     [],
   );
+  // THE WAY OUT, beside the instrument that records the way in. The trace above says a freeze
+  // happened; this is what lets the user leave one without force-quitting the app (sparkle-thm9o).
+  // Installed at the ROOT and never gated: a hatch that is conditional on app state is unavailable
+  // in exactly the states nobody predicted, which is the only kind this exists for. The trigger is
+  // a native menu item, so it survives a webview whose own event pipeline is the broken thing —
+  // see services/inputRelease.
+  useEffect(() => installInputRelease(), []);
   // DICTATION FOLLOWS FOCUS. Records who holds the caret (and whether this window is active) into
   // the dictation store; the routing gate in useDictation and the paused copy on both mic surfaces
   // read the ONE verdict derived from it (voice/dictationFocus). Installed here, beside the trace

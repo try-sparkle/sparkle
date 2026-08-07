@@ -789,8 +789,42 @@ export async function createDictationController(
   // app-level `dictation://focus` never covers (sparkle-ozvr). Guarded for the window-less test/node
   // env (tests drive `notifyWindowFocus` directly instead).
   const hasWindow = typeof window !== "undefined" && typeof window.addEventListener === "function";
-  const onWinBlur = () => notifyWindowFocus(false);
-  const onWinFocus = () => notifyWindowFocus(true);
+  // A BLUR THE DOM CONTRADICTS IS NOT A BLUR. This latch is LEVEL-HELD — it tears the owned relay
+  // down and only a real `focus` builds it back — so believing a spurious blur strands dictation
+  // until the user switches apps and returns. The input-release hatch (services/inputRelease)
+  // dispatches exactly such a blur on purpose, as a stand-down pulse for the EDGE-triggered latches
+  // (hint mode, push-to-talk, the drag shield). Answering it here, rather than having the hatch
+  // dispatch a corrective `focus`, is what keeps the correction cheap: that focus would have run
+  // `maybeResumeOwnedStream` in the same tick as the teardown — a fresh first-minute relay debit for
+  // the user, and an unordered stop/start race on one global resource that can leave the relay dead
+  // (roborev 59651). `hasFocus` guarded for exotic hosts; missing it means "trust the event".
+  // TWO guards, because the hatch's stand-down pulse reaches EVERY window and the relay is GLOBAL.
+  //
+  // `app_menu.rs` emits INPUT_RELEASE_EVENT with a broadcast `app.emit`, and both App and HelperApp
+  // subscribe — so `releaseAllInputCapture`, and its synthetic blur, run in every webview at once.
+  //
+  //   1. NOT A REAL BLUR. In the FOCUSED window the DOM contradicts the event, so ignore it. Routed
+  //      through `isWindowActive()` — the module's documented injectable seam — rather than reading
+  //      `document` directly, so the suite that owns every focus-handoff test can reach it.
+  //   2. NOT AN EDGE. `isWindowActive()` is false in a BACKGROUND window, so guard 1 falls through
+  //      there — and believing it is destructive precisely there: `tearDownOwnedStream` gates only
+  //      on `store.phase`, which is cross-window synced, so a backgrounded window would `invoke`
+  //      `stop_cloud_stream` and close the FOCUSED window's live relay. That window never tore down,
+  //      so `maybeResumeOwnedStream` early-returns on `!streamTornDown` forever: its UI keeps
+  //      painting "listening" over a closed socket until Speak is toggled. Acting only on a true →
+  //      false EDGE for this window makes the pulse a no-op wherever the window is already
+  //      background, which mirrors the ownership guard the idle park needed (roborev 56061).
+  let domWindowFocused = isWindowActive();
+  const onWinBlur = () => {
+    if (isWindowActive()) return;
+    if (!domWindowFocused) return;
+    domWindowFocused = false;
+    notifyWindowFocus(false);
+  };
+  const onWinFocus = () => {
+    domWindowFocused = true;
+    notifyWindowFocus(true);
+  };
   if (hasWindow) {
     window.addEventListener("blur", onWinBlur);
     window.addEventListener("focus", onWinFocus);

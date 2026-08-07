@@ -348,6 +348,85 @@ describe("dismissibleSurfaceOpen", () => {
   });
 });
 
+// ── THE PROBE MUST COUNT ONLY SURFACES THAT ARE ACTUALLY ON SCREEN (bead sparkle-thm9o) ─────────
+//
+// The founder's app wedged with "I could not unmount the concierge". The probe used to be a bare
+// `querySelector`, so ONE node anywhere in the document carrying `role="dialog"`/`role="menu"`/
+// `data-dismissible-open="true"` — hidden, `inert`, `aria-hidden`, or simply left behind by a
+// surface that had already closed — made `dismissibleOpen` permanently true. Both Escape paths read
+// that one value, so ESC-to-unmount died APP-WIDE, silently, while ConciergeColumn kept drawing the
+// "ESC to unmount" hint. Related: bead sparkle-gielc, agents parked in `status:"approval"` with no
+// dialog visible in the pane, which is exactly the leaked-node shape.
+//
+// EVERY CASE BELOW IS ATTRIBUTE- OR INLINE-STYLE-DERIVED, on purpose. jsdom has no layout engine
+// (docs/jsdom-test-caveats.md): `getBoundingClientRect` is always 0, `offsetParent` is always null,
+// and jsdom 25 does not implement `checkVisibility` at all — so a guard asserted through a
+// measurement would be asserted through a MOCK, which proves nothing. These are the signals jsdom
+// genuinely evaluates, and they are the ones the fix is built on.
+//
+// THE DIRECTION OF SAFETY. Over-reporting "open" kills Escape everywhere and is unrecoverable
+// without a relaunch; under-reporting means one Escape both closes a dialog and unbinds the cable,
+// which is recoverable by clicking. So the probe is deliberately conservative about calling a node
+// open — but the last case here pins that a REAL dialog still protects Escape, or the fix would
+// have traded one silent breakage for another.
+describe("dismissibleSurfaceOpen only counts surfaces that are genuinely rendered", () => {
+  afterEach(() => {
+    document.body.innerHTML = "";
+  });
+
+  // SELF-HIDDEN. Each of these is a node the DOM itself says is not being shown.
+  //
+  // `hidden` and `<dialog>`-without-`open` are BEHAVIOUR, not a branch: both are answered by the UA
+  // stylesheet through `getComputedStyle`, not by an attribute read — see `elementIsHiddenHere`,
+  // where an explicit `hidden` check was removed precisely because deleting it left this suite
+  // green. They stay pinned here because the CONTRACT is "these do not own Escape", regardless of
+  // which mechanism delivers it.
+  it.each([
+    ["the hidden attribute", `<div role="dialog" hidden></div>`],
+    ["inline display:none", `<div role="menu" style="display: none"></div>`],
+    ["inline visibility:hidden", `<div role="dialog" style="visibility: hidden"></div>`],
+    ["aria-hidden", `<div data-dismissible-open="true" aria-hidden="true"></div>`],
+    ["inert", `<div role="dialog" inert></div>`],
+    // The UA stylesheet's `dialog:not([open]) { display: none }` — jsdom implements it, so a
+    // <dialog> that was never shown (or was closed and left in the tree) reads as not rendered.
+    ["a <dialog> that is not open", `<dialog role="dialog"></dialog>`],
+  ])("ignores a leaked surface hidden by %s", (_why, html) => {
+    document.body.innerHTML = html;
+    expect(dismissibleSurfaceOpen(document)).toBe(false);
+  });
+
+  // ANCESTORS — the case a computed-style read CANNOT answer. jsdom does not propagate a parent's
+  // `display:none`/`hidden` down to a child's computed style (probed: the child still reads
+  // `display: block`), and neither `aria-hidden` nor `inert` is a style at all in any engine. A
+  // dismissible left inside a collapsed panel is the realistic leak shape, so the probe walks the
+  // ancestor chain rather than reading the matched node alone.
+  it.each([
+    ["a hidden ancestor", `<div hidden><div role="dialog"></div></div>`],
+    ["a display:none ancestor", `<section style="display: none"><div role="menu"></div></section>`],
+    ["an aria-hidden ancestor", `<div aria-hidden="true"><div role="dialog"></div></div>`],
+    ["an inert ancestor", `<div inert><div data-dismissible-open="true"></div></div>`],
+  ])("ignores a surface buried under %s", (_why, html) => {
+    document.body.innerHTML = html;
+    expect(dismissibleSurfaceOpen(document)).toBe(false);
+  });
+
+  // ONE LEAKED NODE MUST NOT MASK A LIVE ONE. The probe answers "is ANY of them open", so a hidden
+  // leak sitting beside a real dialog has to leave the real dialog's answer alone.
+  it("still sees a live surface standing next to a leaked one", () => {
+    document.body.innerHTML = `<div role="dialog" hidden></div><div role="menu"></div>`;
+    expect(dismissibleSurfaceOpen(document)).toBe(true);
+  });
+
+  // THE REGRESSION GUARD. An <dialog open> and a plain rendered div must both still own Escape —
+  // a probe that answered `false` for everything would "fix" the wedge by breaking every modal.
+  it("still sees a surface that is genuinely on screen", () => {
+    document.body.innerHTML = `<dialog role="dialog" open></dialog>`;
+    expect(dismissibleSurfaceOpen(document)).toBe(true);
+    document.body.innerHTML = `<div hidden></div><div role="dialog"></div>`;
+    expect(dismissibleSurfaceOpen(document)).toBe(true);
+  });
+});
+
 describe("Escape in a terminal — rung 2 stays out of reach", () => {
   const wired: CableState = { wired: "right", overlay: "off" };
 

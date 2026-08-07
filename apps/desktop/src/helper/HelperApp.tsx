@@ -10,6 +10,7 @@ import { HelperIsland, type Tier } from "./HelperIsland";
 import { HelperTab } from "./HelperTab";
 import { useHelperPrefs, type HelperMode } from "./helperPrefs";
 import { shouldShowHelper } from "./helperVisibility";
+import { installInputRelease } from "../services/inputRelease";
 import {
   clampToScreen, snapTabToEdge, screenFor, windowSize, hitTestPoint, pillSize,
   usableContentSize, sameSize, monitorToRect, type Rect, type Size,
@@ -211,6 +212,14 @@ export function HelperApp() {
   // NOTE: `x`/`y` are always the PILL's top-left, never the window's. They are only written while
   // no overlay is open (a drag cannot coexist with the menu — the scrim swallows the pointerdown),
   // so the two coincide at write time.
+
+  // THE INPUT-RELEASE HATCH, IN THIS WINDOW TOO. `app_menu.rs` broadcasts the release event to every
+  // webview on the argument that "a wedged helper webview deserves the same escape as the main one"
+  // — and that broadcast landed nowhere until this was wired, because the only subscriber was the
+  // main window's App root. A hatch documented but not installed is the failure it exists to prevent
+  // (bead sparkle-thm9o). Installs the keyboard fallback here as well, which is what covers the
+  // helper in a dev server or a build whose menu item lost its key equivalent.
+  useEffect(() => installInputRelease(), []);
 
   // Vitals: seed once (covering a reload that missed the last push), then follow pushes.
   useEffect(() => {
