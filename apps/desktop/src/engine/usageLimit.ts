@@ -62,8 +62,24 @@ export function currentUsageLimit(
 ): UsageLimitState | null {
   if (accountId === null) return null;
   const mine = usage.find((u) => u.id === accountId);
-  // `<= now` rather than `< now`: the reset instant itself already counts as recovered, so the
-  // banner cannot outlive its own stated deadline by even a tick.
+
+  // HOW THIS SELF-CLEARS — TWO MECHANISMS, BOTH LIVE (knightwatch 5203897279#1, roborev 59675).
+  //
+  //   1. THE NULL ARM, once the next fetch lands. `effective_exhaustion` (`accounts.rs:1805`) opens
+  //      with `acct.exhausted_until.filter(|&e| e > now)?`, so an expired bench is never serialized
+  //      — it arrives as `null`. This is why a PAST instant cannot come off the wire.
+  //
+  //   2. THE `<= now` COMPARISON, in the window before that fetch. This is NOT defence-in-depth,
+  //      and an earlier revision of this comment wrongly said it was. The consumer holds the
+  //      account snapshot in React state and refetches on `USAGE_LIMIT_RECHECK_MS` (10s) through
+  //      `loadAccountState`, which itself serves from a ~5s TTL cache. So a row fetched while the
+  //      bench was live AGES IN THE CLIENT: for up to ~15s past the reset instant this function is
+  //      called with a future-at-fetch-time `exhaustedUntil` and a later `now`. Across that window
+  //      the comparison is the ONLY thing stopping a stale "paused until 5:12 PM" from rendering.
+  //      The null arm cannot take over until the next fetch resolves.
+  //
+  // Both are load-bearing, and bead .5 (make the clear precise by letting written timestamps
+  // survive `effective_exhaustion`) must not be read as licence to drop the comparison.
   if (mine?.exhaustedUntil == null || mine.exhaustedUntil <= now) return null;
   return { accountId, until: mine.exhaustedUntil };
 }

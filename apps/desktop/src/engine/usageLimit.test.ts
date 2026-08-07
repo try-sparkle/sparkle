@@ -16,20 +16,34 @@ describe("currentUsageLimit", () => {
     expect(currentUsageLimit([acct(MINE, until)], MINE, T0)).toEqual({ accountId: MINE, until });
   });
 
-  // THE SELF-CLEARING PROPERTY, reduced to arithmetic: the only thing that changes between these
-  // assertions is the clock. No successful AI call, no reload, no dismissal.
-  it("stops reporting once the reset instant passes, with no user action", () => {
+  // ── THE SELF-CLEARING PROPERTY — BOTH LIVE PATHS ────────────────────────────────────────────
+  // Neither of these is hypothetical (roborev 59675). The consumer polls every 10s over a ~5s TTL
+  // cache, so a snapshot fetched while the bench was live is still in hand for up to ~15s after the
+  // reset instant — during which the clock comparison is the only thing clearing the banner.
+
+  it("clears a snapshot the client is still holding, once its reset instant passes", () => {
+    // ONE array, two clocks: exactly the stale snapshot the poll interval leaves in React state.
+    // Nothing changes but time — no fetch, no successful AI call, no reload, no user action.
     const until = T0 + 60_000;
-    const usage = [acct(MINE, until)];
-    expect(currentUsageLimit(usage, MINE, T0)).not.toBeNull();
-    expect(currentUsageLimit(usage, MINE, until)).toBeNull();
-    expect(currentUsageLimit(usage, MINE, until + 1)).toBeNull();
+    const stale = [acct(MINE, until)];
+    expect(currentUsageLimit(stale, MINE, T0)).not.toBeNull();
+    expect(currentUsageLimit(stale, MINE, until)).toBeNull();
+    expect(currentUsageLimit(stale, MINE, until + 1)).toBeNull();
   });
 
+  // ── THE ACCOUNT-SCOPING PROPERTY (the High finding this PR exists for) ──────────────────────
   // Sparkle's one-shots keep the ambient CLAUDE_CONFIG_DIR and never rotate accounts — only AGENT
-  // spawns do. So a free OTHER account does not mean AI works.
+  // spawns do. So a free OTHER account does not mean AI works. This pins the regression against a
+  // future rule that suppresses the banner because some other account is available; that rule
+  // shipped once and hid a true banner on a multi-account machine.
   it("still reports a limit when MY account is benched and another is free", () => {
     expect(currentUsageLimit([acct(MINE, T0 + 60_000), acct("other", null)], MINE, T0)).not.toBeNull();
+  });
+
+  it("stays clear once the next fetch lands, because accounts.rs stops sending the flag", () => {
+    // The second mechanism: an expired bench is filtered out before serialization, so it arrives as
+    // null rather than as a past instant.
+    expect(currentUsageLimit([acct(MINE, null)], MINE, T0 + 60_001)).toBeNull();
   });
 
   it.each([
