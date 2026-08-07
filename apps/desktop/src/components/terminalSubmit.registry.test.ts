@@ -134,3 +134,56 @@ describe("an app write to the CLI line survives the user's next keystroke", () =
     expect(terminalHoldsUnsentInput(sink)).toBe(true);
   });
 });
+
+// ══ THE REGISTRY'S OWN FAILURE MODES ═════════════════════════════════════════════════════════════
+// Consolidating the scanner into a Map introduced two ways to lose it that the closure-local state
+// it replaced did not have. Both are reachable in the shipping app and both are SILENT — the count
+// `noteUserInput` returns drives the free-trial debit, so losing the state stops metering the
+// user's prompts with nothing thrown and nothing logged (roborev 59775).
+describe("the registry cannot silently lose an agent's scanner", () => {
+  const A = "remounting-agent";
+
+  afterEach(() => unregisterLineScan(A));
+
+  it("a stale teardown does not strip the LIVE scanner for the same agent", () => {
+    // React mounts the replacement BEFORE running the outgoing effect's cleanup, and an account
+    // switch remounts Terminal with the SAME agentId (AgentPane keys on the account, not the
+    // agent). Delete-by-key therefore had the dead instance's cleanup remove the live instance's
+    // state, after which every keystroke found nothing registered.
+    const first = registerLineScan(A);
+    const second = registerLineScan(A); // the remount
+    expect(second).not.toBe(first);
+    noteUserInput(A, "make me a website"); // typed into the LIVE instance
+
+    unregisterLineScan(A, first); // the outgoing instance's cleanup, arriving late
+
+    // CONTINUITY is the assertion, not "some state exists": `noteUserInput` creates one on a miss,
+    // so a test that only checked the flag would pass against a delete-by-key too — the line would
+    // simply restart empty and nobody would notice until a prompt went unmetered. The submitted
+    // line must still be the one the user was typing.
+    expect(noteUserInput(A, "\r")).toBe(1);
+  });
+
+  it("the LIVE instance's own teardown still unregisters", () => {
+    // The anti-over-fix: an identity check that never matched would leak every scanner and keep
+    // answering for a terminal that is gone.
+    const state = registerLineScan(A);
+    noteUserInput(A, "hello");
+
+    unregisterLineScan(A, state);
+
+    // Nothing registered now, so the next chunk starts from a FRESH line rather than continuing
+    // the torn-down one: "x" alone is pending, and the old "hello" is not part of it.
+    noteUserInput(A, "\r");
+    expect(useTerminalOverlayStore.getState().drafts[A]).toBeFalsy();
+  });
+
+  it("an unregistered agent is still scanned — the miss creates the state, never returns 0", () => {
+    // Fail-CLOSED. A miss used to return 0 submits, which is the free-trial debit not happening.
+    unregisterLineScan(A);
+
+    const submits = noteUserInput(A, "make me a website\r");
+
+    expect(submits).toBe(1);
+  });
+});

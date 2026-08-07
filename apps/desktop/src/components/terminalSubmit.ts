@@ -26,6 +26,7 @@
 // OUTPUT, effectively never in USER onData, so handling them would be dead weight.
 
 import { useTerminalOverlayStore } from "../stores/terminalOverlayStore";
+import { log } from "../logger";
 
 export interface LineScanState {
   /** Printable text the user has typed since the last submit. */
@@ -215,24 +216,50 @@ function publish(agentId: string, state: LineScanState): void {
   useTerminalOverlayStore.getState().setDraft(agentId, hasPendingInput(state));
 }
 
-/** Start tracking this agent's input line. Returns the state so the caller can hold a reference. */
+/** Start tracking this agent's input line. RETURNS the state, and the caller must keep it: it is the
+ *  identity {@link unregisterLineScan} checks against. */
 export function registerLineScan(agentId: string): LineScanState {
   const state = makeLineScanState();
   scans.set(agentId, state);
   return state;
 }
 
-/** Stop tracking (the terminal was torn down). Does NOT touch the draft flag: the teardown path
- *  owns that decision, and clears it explicitly. */
-export function unregisterLineScan(agentId: string): void {
+/** Stop tracking (the terminal was torn down). Does NOT touch the draft flag: the teardown path owns
+ *  that decision, and clears it explicitly.
+ *
+ *  IDENTITY-CHECKED, and that is not a nicety. Agent ids are stable while `Terminal` instances are
+ *  not — `AgentPane` remounts the terminal on an account switch (`key={chosenAccount?.id}`) with the
+ *  same `agentId`, and a promotion rebind does the same. React mounts the replacement BEFORE it runs
+ *  the outgoing effect's cleanup, so a delete-by-key would have the old instance's teardown remove
+ *  the NEW instance's scanner. Every keystroke after that would find nothing registered
+ *  (roborev 59775). Passing the state you were given makes the stale teardown a no-op.
+ *
+ *  The parameter is optional so a caller that never held the state still gets the old behaviour —
+ *  but `Terminal.tsx` holds it, and any new caller should. */
+export function unregisterLineScan(agentId: string, state?: LineScanState): void {
+  if (state !== undefined && scans.get(agentId) !== state) return;
   scans.delete(agentId);
 }
 
 /** Feed one chunk of USER input: scan it, publish the derived flag, and return the submit count.
- *  The one entry point `Terminal.tsx`'s `onData` uses, so a test that drives this drives the app. */
+ *  The one entry point `Terminal.tsx`'s `onData` uses, so a test that drives this drives the app.
+ *
+ *  A MISS CREATES THE STATE RATHER THAN RETURNING 0. This used to fail open and silently, which is
+ *  the worst shape available here: the count it returns drives `onSubmitLine` → the free-trial
+ *  debit, so an unregistered agent would stop metering prompts AND stop publishing `drafts`
+ *  (unhiding the action pill, un-vetoing the compose-focus pull) with nothing thrown and nothing
+ *  logged. Before the registry existed `Terminal.tsx` owned a closure-local state that could not be
+ *  absent, so this failure mode is one the registry introduced — it is repaid here rather than
+ *  documented (roborev 59775). Creating on demand keeps the invariant the old code had: user input
+ *  is ALWAYS scanned. The warn is what makes the missing `registerLineScan` findable. */
 export function noteUserInput(agentId: string, chunk: string): number {
-  const state = scans.get(agentId);
-  if (!state) return 0;
+  let state = scans.get(agentId);
+  if (!state) {
+    log.warn("terminal", "line scan not registered for this agent — creating one on demand", {
+      agentId,
+    });
+    state = registerLineScan(agentId);
+  }
   const submits = scanSubmittedLines(state, chunk);
   publish(agentId, state);
   return submits;

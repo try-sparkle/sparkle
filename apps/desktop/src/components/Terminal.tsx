@@ -831,7 +831,7 @@ export function Terminal({
     // `onData` never sees (the dictation sink types into it, the concierge submits through it,
     // the model picker clears it), and those writers update THIS state through the registry so a
     // later recompute here cannot contradict them — see the registry note in terminalSubmit.
-    registerLineScan(agentId);
+    const lineScan = registerLineScan(agentId);
     term.onData((d) => {
       useInteractionStore.getState().touch(agentId);
       // THE USER IS WORKING IN THIS TERMINAL. `onData` is the honest signal for that, and the only
@@ -1494,7 +1494,10 @@ export function Terminal({
       // promoted pane redraws the resumed conversation from the sandbox's own backfill, so keeping
       // the local buffer would paint the same transcript twice.
       useTerminalOverlayStore.getState().clearDraft(agentId);
-      unregisterLineScan(agentId);
+      // BY IDENTITY: an account switch remounts this terminal with the SAME agentId, and React
+      // mounts the replacement before running this cleanup — so a delete-by-key here would strip
+      // the new instance's scanner and silently stop metering its keystrokes (roborev 59775).
+      unregisterLineScan(agentId, lineScan);
       if (focusRef) focusRef.current = null;
       if (apiRef) apiRef.current = null;
       ro.disconnect();
