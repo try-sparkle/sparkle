@@ -44,6 +44,7 @@ import { shouldPollTickets, ticketsSignature } from "./supportTicketPoll";
 import { BUILD_COLUMN_Z, SIDEBAR_OVERLAY_Z } from "./layers";
 import { ColumnPullTab, publishColumnWidthVar } from "./ColumnPullTab";
 import { ZOOM_COLUMN_ATTR } from "../engine/columnZoom";
+import { formatElapsed } from "../engine/elapsed";
 import { useColumnZoom, useZoomColumnForSide } from "../hooks/useZoomColumn";
 import { useWindowWidth } from "../hooks/useWindowWidth";
 import {
@@ -3422,20 +3423,17 @@ const ROLLUP_DOT_COLOR: Record<RollupDot, string> = {
 // Format an elapsed duration (ms) for the sidebar timer: integer seconds while under 100s (each
 // second is visible there), then minutes / hours / days each to one decimal with a trailing ".0"
 // stripped (so 2 minutes reads "2m", 1.5 reads "1.5m"). Pure + exported for testing.
-export function formatElapsed(ms: number): string {
-  const SEC = 1000;
-  const MIN = 60 * SEC;
-  const HOUR = 60 * MIN;
-  const DAY = 24 * HOUR;
-  if (ms < 100 * SEC) return `${Math.floor(ms / SEC)}s`;
-  const oneDp = (n: number) => {
-    const s = n.toFixed(1);
-    return s.endsWith(".0") ? s.slice(0, -2) : s;
-  };
-  if (ms < 100 * MIN) return `${oneDp(ms / MIN)}m`;
-  if (ms < 24 * HOUR) return `${oneDp(ms / HOUR)}h`;
-  return `${oneDp(ms / DAY)}d`;
-}
+//
+// MOVED to `engine/elapsed` and RE-EXPORTED from here, so the concierge's RESOLVED nudge card can
+// spell a duration the same way this row does without importing a 3,300-line component. Re-exported
+// rather than relocated outright because this is the import path every existing caller and
+// `AgentSidebar.elapsedTimer.test` already names.
+//
+// Imported at the top of the file AND re-exported here, not `export { … } from "…"`: the bare
+// re-export form creates no LOCAL binding, so the row's own call site below would have stopped
+// resolving — a compile error, but only for this file, which is the sort of thing a re-export looks
+// like it handles and does not.
+export { formatElapsed };
 
 /**
  * One ticking clock per agent row. Returns a `now` (epoch ms) that advances every 1s while the

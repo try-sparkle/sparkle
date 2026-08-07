@@ -155,6 +155,27 @@ export function orderByArrival<T extends { id: string }>(
   return sortBySlot(order, items);
 }
 
+/**
+ * Drop an id's slot, so its NEXT appearance is treated as a brand-new arrival and lands at the
+ * bottom of the thread. Mutates `order`.
+ *
+ * WHY A CARD WOULD EVER NEED THIS. The grace window above re-slots an id that has been GONE too
+ * long, and that is the only way a recycled id normally earns a new position. A nudge card that
+ * resolves does not go anywhere — it stays in the thread, greyed, wearing the same agent id (see
+ * `engine/resolvedNudges`) — so from this ledger's point of view it is continuously present. When
+ * that agent blocks AGAIN, the card would therefore go loud at the slot it has occupied all along,
+ * which for a long conversation is far above the fold. The header already names this as the worse of
+ * the two failure directions: "An alert you cannot see is worse than one in the wrong place."
+ *
+ * So the caller tells the ledger explicitly, at the one moment the absence rule cannot infer:
+ * a resolved card going live again is a NEW event.
+ *
+ * Idempotent, and a no-op for an id the ledger has never seen.
+ */
+export function forgetArrival(order: ArrivalOrder, id: string): void {
+  order.entries.delete(id);
+}
+
 /** Slice first: sort mutates, and `items` belongs to the caller. */
 function sortBySlot<T extends { id: string }>(order: ArrivalOrder, items: readonly T[]): T[] {
   return items

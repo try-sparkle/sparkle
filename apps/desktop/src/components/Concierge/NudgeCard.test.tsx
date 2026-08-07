@@ -18,9 +18,11 @@ import { C } from "../../theme/colors";
 import {
   NUDGE_CARD_TESTID,
   NUDGE_DISMISS_ACTION,
+  NUDGE_LEAD_TESTID,
   NUDGE_MUTE_ACTION,
   NudgeCard,
   nudgeAccent,
+  resolvedAccent,
 } from "./NudgeCard";
 import { AgentPillProvider } from "./AgentPill";
 import type { ConciergeNudge } from "./types";
@@ -299,5 +301,135 @@ describe("NudgeCard — the card is still one big click target", () => {
   it("labels itself for assistive tech in the same words it shows", () => {
     renderCard(nudge);
     expect(card().getAttribute("aria-label")).toBe("BLOCKED: OG Image Pipeline in drodio-website");
+  });
+});
+
+// ══ THE RESOLVED TREATMENT ═══════════════════════════════════════════════════════════════════════
+//
+// THE REPORT (founder, 2026-08-06, bead `sparkle-9adzg`, with a screenshot). A red
+// "BLOCKED: @<agent> in <project>" card sat in the thread describing an agent that had already
+// unblocked — the cause was a transient `API Error: Unable to connect to API (ENOTFOUND)` that
+// self-healed within minutes. His words: "The blocked card should go away or show as resolved and be
+// grayed out if it's no longer blocked in the concierge chat thread." Asked which of the two, he
+// chose to KEEP it: a card that deletes itself takes the record of what happened with it.
+//
+// THESE CASES COME IN PAIRS, AND THE SECOND OF EACH PAIR IS THE IMPORTANT ONE. Sparkle's standing
+// rule is that nothing which needs the founder may be hidden, so the risk this feature introduces is
+// not a lingering red — it is a LIVE blocker quietly rendered as finished. Every assertion that a
+// resolved card went grey is therefore matched by one that a live card did NOT, on the same
+// property. A one-sided suite here would go green on a component that greyed out everything.
+const resolvedNudge: ConciergeNudge = {
+  ...nudge,
+  // 40 seconds — the founder's own "cleared in 40 seconds" case, the one that must not read like a
+  // three-hour stall.
+  resolved: { raisedAt: 1_000_000, resolvedAt: 1_040_000 },
+};
+
+describe("resolvedAccent — unmistakably not the alarm", () => {
+  it("is the muted ink, and is not the red a live card wears", () => {
+    // Not a washed-out sienna: a faded red still reads as red at a glance, which would leave a
+    // finished episode competing for attention with a live one.
+    expect(resolvedAccent()).toBe(C.muted);
+    expect(resolvedAccent()).not.toBe(nudgeAccent());
+  });
+});
+
+describe("NudgeCard — a resolved episode is history, not an alarm", () => {
+  it("leads with RESOLVED and how long the block lasted, in the app's elapsed vocabulary", () => {
+    renderCard(resolvedNudge);
+    // "40s" and not "40 seconds" / "0.7m": `engine/elapsed.formatElapsed` is the ONE spelling the
+    // Build column's rows a few hundred pixels away already use.
+    expect(screen.getByTestId(NUDGE_LEAD_TESTID).textContent).toBe("RESOLVED after 40s:");
+    // And the word it replaced is GONE — a card that said both would assert the stale fact anyway.
+    expect(screen.queryByText("BLOCKED:")).toBeNull();
+  });
+
+  it("spells a long block differently from a short one", () => {
+    // The whole point of carrying the duration: a card that cleared in 40s must not read like one
+    // that was stuck for three hours. Same component, same slot, two clearly different sentences.
+    const THREE_H_TWELVE_M = (3 * 60 + 12) * 60 * 1000;
+    renderCard({
+      ...nudge,
+      resolved: { raisedAt: 0, resolvedAt: THREE_H_TWELVE_M },
+    });
+    expect(screen.getByTestId(NUDGE_LEAD_TESTID).textContent).toBe("RESOLVED after 3.2h:");
+  });
+
+  it("reads 0s rather than a negative duration when the clock steps backwards", () => {
+    // The two instants are OBSERVATIONS taken at different times, so an NTP correction between them
+    // can invert them. "RESOLVED after -4s:" is the kind of thing that ships.
+    renderCard({ ...nudge, resolved: { raisedAt: 5_000, resolvedAt: 1_000 } });
+    expect(screen.getByTestId(NUDGE_LEAD_TESTID).textContent).toBe("RESOLVED after 0s:");
+  });
+
+  it("goes grey and loses the glow — while a live card keeps both", () => {
+    renderCard(resolvedNudge);
+    expect(card().getAttribute("data-resolved")).toBe("true");
+    expect(screen.getByTestId(NUDGE_LEAD_TESTID).style.color).toBe(resolvedAccent());
+    expect(screen.getByTestId(NUDGE_LEAD_TESTID).style.color).not.toBe(C.dangerInk);
+    // The glow IS the alarm. `none`, not a grey glow — a grey glow still lifts the card off the
+    // thread exactly as far as a red one does.
+    expect(card().style.boxShadow).toBe("none");
+    expect(card().style.border).not.toContain(rgb(C.sienna));
+
+    // THE OTHER DIRECTION, on the same three properties. Without this the suite would pass against
+    // a component that painted EVERY card grey.
+    cleanup();
+    renderCard(nudge);
+    expect(card().getAttribute("data-resolved")).toBeNull();
+    expect(screen.getByTestId(NUDGE_LEAD_TESTID).style.color).toBe(C.dangerInk);
+    expect(card().style.boxShadow).not.toBe("none");
+    // The RAW hex here, not `rgb(…)`: jsdom's `box-shadow` parser stores the declaration verbatim
+    // (custom colour functions and all), while its `border` parser normalises the same hex to
+    // `rgb(…)`. Two properties, two serializations, one stylesheet — assert what each actually says.
+    expect(card().style.boxShadow).toContain(C.sienna);
+    expect(card().style.border).toContain(rgb(C.sienna));
+  });
+
+  it("draws its dot as a hollow ring, where a live card draws a filled disc", () => {
+    // The redundant signal, for a reader who cannot separate muted grey from sienna at a glance —
+    // or who has the two cards in different themes.
+    const dotOf = () => card().querySelector("span[aria-hidden]") as HTMLElement;
+    renderCard(resolvedNudge);
+    expect(dotOf().style.background).toBe("transparent");
+    expect(dotOf().style.borderStyle).toBe("solid");
+
+    cleanup();
+    renderCard(nudge);
+    expect(dotOf().style.background).toBe(rgb(C.sienna));
+    expect(dotOf().style.borderStyle).toBe("");
+  });
+
+  it("drops the action buttons — while an identical LIVE card keeps them", () => {
+    // Approve on a finished episode relays an approval into a terminal that is not waiting for one,
+    // or approves whatever that agent is sitting on NOW. `approvalNudge` is the card that carries an
+    // Approve, so resolving it is the exact A/B.
+    renderCard({ ...approvalNudge, resolved: resolvedNudge.resolved });
+    expect(screen.queryByText("Approve")).toBeNull();
+
+    cleanup();
+    renderCard(approvalNudge);
+    expect(screen.getByText("Approve")).toBeTruthy();
+  });
+
+  it("keeps [x] and mute reachable, so history can be cleared and an agent silenced", () => {
+    // [x] on a resolved card means "take this out of my history" rather than the per-episode
+    // acknowledgement it performs on a live one — the host branches on `resolved`. Mute stays
+    // because it is a durable preference about the AGENT, and this card is the feature's only entry
+    // point; a thread of resolved cards is precisely how you notice one agent keeps interrupting.
+    const { onNudgeAction } = renderCard(resolvedNudge);
+    fireEvent.click(screen.getByTestId("concierge-nudge-dismiss"));
+    expect(onNudgeAction).toHaveBeenCalledWith(resolvedNudge, NUDGE_DISMISS_ACTION);
+    fireEvent.click(screen.getByTestId("concierge-nudge-mute"));
+    expect(onNudgeAction).toHaveBeenCalledWith(resolvedNudge, NUDGE_MUTE_ACTION);
+  });
+
+  it("tells assistive tech it is resolved, in the same words it shows", () => {
+    // A screen-reader user gets the stale-fact bug in its purest form otherwise: the visual card
+    // greys out and the label still says BLOCKED.
+    renderCard(resolvedNudge);
+    expect(card().getAttribute("aria-label")).toBe(
+      "RESOLVED after 40s: OG Image Pipeline in drodio-website",
+    );
   });
 });

@@ -76,6 +76,21 @@ if (!hasUsableStorage()) {
 beforeEach(async () => {
   const { useConciergeThreadStore } = await import("./stores/conciergeThreadStore");
   useConciergeThreadStore.setState({ chat: [] });
+  // The RESOLVED-nudge ledger is the same shape of problem as the thread store above: a
+  // module-level singleton that outlives a `render()`. It is worse in one respect — the thread store
+  // leaks bubbles a test can SEE, whereas this leaks a grey card for an agent id the next test never
+  // blocked, so the failure surfaces as an off-by-one in an unrelated count ("expected 2 to be 1")
+  // with nothing on screen to explain it. Ten cases across three suites went red exactly that way.
+  //
+  // Reset HERE, not per suite, for the reason already given above: the leak is a property of the
+  // ledger, not of any one file, and EVERY host suite now runs the resolution pass on each render —
+  // so a suite written next year inherits the clean slate without knowing this module exists.
+  //
+  // Dynamic import to match the pattern above. This module touches no store and no storage, so it
+  // does not strictly need the deferral; it is imported this way so the two hooks cannot drift into
+  // two different rules about when a global may be imported.
+  const { resetResolvedLedgerForTests } = await import("./engine/resolvedNudges");
+  resetResolvedLedgerForTests();
 });
 
 // Global RTL auto-cleanup. This suite runs WITHOUT vitest `globals` (see vite.config.ts

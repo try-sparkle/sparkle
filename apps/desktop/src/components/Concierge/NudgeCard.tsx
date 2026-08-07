@@ -43,6 +43,7 @@ import { FiBellOff, FiX } from "react-icons/fi";
 import { C, CHAT_USER_BUBBLE, FONT_WEIGHT } from "../../theme/colors";
 import { AgentPill } from "./AgentPill";
 import { RADIUS } from "../../theme/scale";
+import { formatElapsed } from "../../engine/elapsed";
 import type { ConciergeNudge } from "./types";
 
 /** The card's accent — brand sienna, for every nudge.
@@ -58,6 +59,18 @@ import type { ConciergeNudge } from "./types";
  *  inviting the amber back. */
 export function nudgeAccent(): string {
   return C.sienna;
+}
+
+/** The accent a RESOLVED card wears — the themed muted ink, the app's ordinary "this is quiet now"
+ *  grey.
+ *
+ *  A SECOND NAMED SOURCE rather than a ternary at each of the four use sites, for the same reason
+ *  {@link nudgeAccent} is a function: the whole point of the resolved treatment is that it is
+ *  UNMISTAKABLY not the red one, and a test that pins "these two differ" needs both by name. It is
+ *  `muted` and not, say, a 40%-alpha sienna, because a washed-out red still reads as red at a glance
+ *  — which would leave a finished episode competing for attention with a live one. */
+export function resolvedAccent(): string {
+  return C.muted;
 }
 
 /** How a test finds a nudge card. Paired with `data-agent-id` (the nudge's id IS its source agent
@@ -83,14 +96,34 @@ export const NUDGE_MUTE_ACTION = "mute";
  *  a grep for the constant finds it. */
 const LEAD = "BLOCKED:";
 
-/** The red circle. Decorative — the word beside it carries the meaning — so it is `aria-hidden`
- *  and exempt from the text-contrast floor the ink below is held to. */
-const dot = (accent: string): CSSProperties => ({
+/** The word a card leads with once its episode is OVER, and the stem the duration is appended to:
+ *  "RESOLVED after 40s:". Same position, same weight, opposite colour — so the line the reader has
+ *  learned to scan tells them, in the first word, that this one is finished. */
+const RESOLVED_LEAD = "RESOLVED";
+
+/** How a test finds the lead word without matching the whole sentence. */
+export const NUDGE_LEAD_TESTID = "concierge-nudge-lead";
+
+/** The dot. FILLED while the episode is live, a HOLLOW RING once it has resolved.
+ *
+ *  Decorative — the word beside it carries the meaning — so it is `aria-hidden` and exempt from the
+ *  text-contrast floor the ink below is held to. The ring is the second, redundant signal that this
+ *  card is finished (colour is the first): a reader who cannot separate muted grey from sienna at a
+ *  glance, or who has the two in different themes, still sees a filled disc versus an outline. */
+const dot = (accent: string, resolved: boolean): CSSProperties => ({
   flex: "0 0 auto",
   width: 8,
   height: 8,
+  boxSizing: "border-box",
   borderRadius: "50%",
-  background: accent,
+  background: resolved ? "transparent" : accent,
+  // LONGHANDS, not the `border` shorthand. `resolvedAccent()` is a `var(--…)` token, and a shorthand
+  // carrying a custom property is stored verbatim rather than expanded — so `borderStyle` reads back
+  // EMPTY and a test asserting the ring is drawn cannot see it. The distinction is invisible in a
+  // browser (which resolves the var at paint) and decisive in jsdom.
+  borderStyle: resolved ? "solid" : undefined,
+  borderWidth: resolved ? 1.5 : undefined,
+  borderColor: resolved ? accent : undefined,
 });
 
 /** The two icon controls. Identical here on purpose — the difference between them is ONE class.
@@ -127,8 +160,19 @@ export function NudgeCard({
   onNudgeClick: (nudge: ConciergeNudge) => void;
   onNudgeAction: (nudge: ConciergeNudge, actionId: string) => void;
 }) {
-  const accent = nudgeAccent();
-  const label = `${LEAD} ${nudge.agentName} in ${nudge.projectName}`;
+  // ONE boolean, read from the DATA. Everything below branches on this and nothing re-derives it,
+  // so a card cannot be half-resolved: grey chrome under a red lead, or a quiet card that still
+  // offers Approve. See `ConciergeNudge.resolved` for why it must be positively set to go quiet.
+  const resolved = nudge.resolved;
+  const accent = resolved ? resolvedAccent() : nudgeAccent();
+  // "RESOLVED after 40s:" — the app's ONE elapsed vocabulary (`engine/elapsed`), the same spelling
+  // the Build column's rows use, so "40s" and "3.2h" here mean exactly what they mean there. Clamped
+  // at zero because the two instants are observations, and a clock correction between them must
+  // read as "0s", never as a negative duration.
+  const lead = resolved
+    ? `${RESOLVED_LEAD} after ${formatElapsed(Math.max(0, resolved.resolvedAt - resolved.raisedAt))}:`
+    : LEAD;
+  const label = `${lead} ${nudge.agentName} in ${nudge.projectName}`;
   const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
     // ONLY THE CARD ITSELF. Without this guard a keydown on a nested control bubbles up here, and
     // `preventDefault()` below cancels the very thing it was: for a <button>, Enter/Space activation
@@ -159,6 +203,10 @@ export function NudgeCard({
       data-testid={NUDGE_CARD_TESTID}
       data-agent-id={nudge.id}
       data-band={nudge.band}
+      // The machine-readable form of the treatment, so a case can assert "this card is presented as
+      // finished" without reading colours out of a style attribute — and, more importantly, so the
+      // opposite case can assert a LIVE card is still absent from this attribute.
+      data-resolved={resolved ? "true" : undefined}
       aria-label={label}
       onClick={() => onNudgeClick(nudge)}
       onKeyDown={onKeyDown}
@@ -176,7 +224,11 @@ export function NudgeCard({
         // Tighter than the three-row card's `12px 13px`: a single row does not need the vertical
         // air three did, and the padding was a third of the old card's height.
         padding: "8px 11px",
-        boxShadow: `0 0 26px color-mix(in srgb, ${accent} 10%, transparent)`,
+        // THE GLOW IS THE ALARM, so a finished episode does not get one. Branched here rather than
+        // spread in above, because a later `boxShadow` key in the same object literal would simply
+        // win — the override would have looked applied and painted a grey glow, which keeps a
+        // resolved card lifted off the thread exactly as far as a live one.
+        boxShadow: resolved ? "none" : `0 0 26px color-mix(in srgb, ${accent} 10%, transparent)`,
         cursor: "pointer",
         display: "flex",
         alignItems: "center",
@@ -191,11 +243,20 @@ export function NudgeCard({
       // whole reason the control is rendered rather than conditionally mounted.
       className="nudge-card"
     >
-      <span style={dot(accent)} aria-hidden />
+      <span style={dot(accent, Boolean(resolved))} aria-hidden />
       {/* THE THEMED ink, not the literal accent: raw sienna is under the AA floor as TEXT on the
-          concierge column. Same split, and same reason, as the badge this replaced. */}
-      <strong style={{ color: C.dangerInk, fontWeight: FONT_WEIGHT.bold, letterSpacing: "0.02em" }}>
-        {LEAD}
+          concierge column. Same split, and same reason, as the badge this replaced.
+          `resolvedAccent()` needs no such twin — it IS the themed muted ink, already held to that
+          floor as body text everywhere else in this column. */}
+      <strong
+        data-testid={NUDGE_LEAD_TESTID}
+        style={{
+          color: resolved ? accent : C.dangerInk,
+          fontWeight: FONT_WEIGHT.bold,
+          letterSpacing: "0.02em",
+        }}
+      >
+        {lead}
       </strong>
       {/* THE REAL PILL — live status dot, live name (so a rename repaints in place), and a click
           that opens the agent. `onOpen` routes through the card's own reveal rather than the
@@ -227,7 +288,11 @@ export function NudgeCard({
           RUNTIME in services/nudgeActions: Approve for a local agent, and Open for a cloud one —
           whose approval relay the dispatcher refuses by design, so an Approve there could only ever
           produce a refusal. Show me and Mute left `actionsFor` when this card became a line. */}
-      {nudge.actions.map((a) => (
+      {/* NOT ON A RESOLVED CARD. Every entry in `actions` is something to do about a LIVE block —
+          Approve relays an approval into a terminal that is no longer waiting for one, and Open is
+          the pill's job. Offering either on a finished episode invites a click that does nothing, or
+          worse, approves whatever that agent happens to be sitting on NOW. */}
+      {(resolved ? [] : nudge.actions).map((a) => (
         <button
           key={a.id}
           type="button"
@@ -275,6 +340,17 @@ export function NudgeCard({
       ))}
       {/* PUSHED TO THE END of whatever row they land on, so [x] is where the founder's spec puts it
           however the line wraps. */}
+      {/* BOTH CONTROLS SURVIVE A RESOLUTION, unlike the action buttons above, and for opposite
+          reasons to each other:
+            • MUTE is a durable preference about the AGENT, not about this episode — "this one keeps
+              interrupting me" is a judgement you form by seeing it block repeatedly, which is
+              precisely what a thread of resolved cards now shows you. It is also still the feature's
+              only call site, so dropping it here would delete do-not-interrupt from the one card
+              that outlives the block.
+            • [x] on a resolved card is the reader saying "I've read this, take it out of my
+              history" — a plain removal, not the per-episode acknowledgement it performs on a live
+              one. Same action id; the host branches on `nudge.resolved`. See ConciergeHost's
+              NUDGE_DISMISS_ACTION handler. */}
       <span style={{ marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: 2 }}>
         <button
           type="button"

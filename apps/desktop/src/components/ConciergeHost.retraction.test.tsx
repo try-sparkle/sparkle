@@ -75,6 +75,7 @@ import { useUiStore } from "../stores/uiStore";
 import { buildConciergeFeed } from "../services/conciergeFeed";
 import { accountedNeedsYou } from "../services/conciergeProactive";
 import { useProjectStore } from "../stores/projectStore";
+import { useSparklePrefsStore } from "../stores/sparklePrefsStore";
 import { NUDGE_CARD_TESTID } from "./Concierge/NudgeCard";
 import type { AgentTab, AgentTabStatus, Project } from "../types";
 import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
@@ -120,8 +121,22 @@ const feedFrom = (projects: Project[], status: Record<string, AgentTabStatus>) =
 
 /** Which agent each nudge card on screen is ABOUT — read off the card's own data attribute rather
  *  than by matching its prose, so these cases keep holding through the card's copy redesign. */
+// THE LOUD CARDS ONLY. Since bead `sparkle-9adzg` a card whose agent leaves the red band is not
+// removed — it is greyed and relabelled "RESOLVED after <duration>" and kept as history (the
+// founder's call). Filtering on `data-resolved` is what preserves the original meaning of every
+// `toEqual([])` below: "nothing is being shouted about", not "nothing is on screen".
 const cardAgentIds = (): string[] =>
-  screen.queryAllByTestId(NUDGE_CARD_TESTID).map((el) => el.getAttribute("data-agent-id")!);
+  screen
+    .queryAllByTestId(NUDGE_CARD_TESTID)
+    .filter((el) => el.getAttribute("data-resolved") === null)
+    .map((el) => el.getAttribute("data-agent-id")!);
+
+/** The GREY cards — a block that is over, kept in the thread as history. */
+const resolvedCardAgentIds = (): string[] =>
+  screen
+    .queryAllByTestId(NUDGE_CARD_TESTID)
+    .filter((el) => el.getAttribute("data-resolved") === "true")
+    .map((el) => el.getAttribute("data-agent-id")!);
 
 /** The same question asked of a feed WITHOUT rendering — for stating a case's premise before the
  *  gesture under test, where a second mounted column would just be noise. */
@@ -145,6 +160,10 @@ beforeEach(() => {
   // still reads the genuine projectStore, and `dismissAlert` is the one write these cases are about.
   h.dismissAlert.mockClear();
   useProjectStore.setState({ dismissAlert: h.dismissAlert });
+  // A mute is `scope: "forever"` and this store is a module singleton, so one case's mute would
+  // silence an agent named `solo` in every case after it — a leak that presents as a card simply
+  // failing to appear, with nothing on screen to say why.
+  useSparklePrefsStore.setState({ rules: {} });
 });
 afterEach(() => {
   cleanup();
@@ -279,6 +298,42 @@ describe("[x] acknowledges the alarm, not just the agent named on the card", () 
     expect(dismissed().map((d) => d.agentId).sort()).toEqual(["leaf", "mid", "orch"]);
   });
 
+  // AN ACKNOWLEDGED RED IS NOT A RESOLVED ONE (roborev, 2026-08-07). `dismissAlert` de-escalates the
+  // PUBLISHED status while the agent goes on waiting — that is the feature's whole design, "[x]
+  // acknowledges the red WITHOUT resolving it" — and the resolved-card ledger reads exactly that
+  // published band. So the acknowledgement looked identical to an unblock, and left a grey
+  // "RESOLVED after 0s:" card asserting a finished episode for an agent still stopped dead waiting
+  // for the reader. The de-escalation is rendered here as the rerender it really is: the same feed,
+  // rebuilt from the same statuses, with the dismissed agent's published status calmed.
+  it("leaves no RESOLVED receipt when [x] acknowledges a red that is still standing", () => {
+    const p = projectOf("p1", "sparkle-desktop", [tab("solo")]);
+    const { rerender } = render(<ConciergeHost feed={feedFrom([p], { solo: "waiting" })} />);
+    expect(cardAgentIds()).toEqual(["solo"]);
+
+    fireEvent.click(screen.getByTestId("concierge-nudge-dismiss"));
+    // What `withDismissedAlerts` does to the next tick: the red is calmed, the agent is still there.
+    rerender(<ConciergeHost feed={feedFrom([p], { solo: "idle" })} />);
+
+    expect(cardAgentIds()).toEqual([]);
+    // THE ASSERTION. Not a grey twin the reader has to dismiss a second time, and — the part that
+    // matters — not a card claiming a block finished when nothing about it did.
+    expect(resolvedCardAgentIds()).toEqual([]);
+  });
+
+  // THE OPPOSITE DIRECTION, without which the case above would pass against a host that had simply
+  // stopped producing receipts at all. Same agent, same de-escalated end state, no [x] — the only
+  // difference is who caused the calm, and that difference is exactly what decides whether a receipt
+  // is honest.
+  it("still leaves a receipt when the same agent calms WITHOUT being dismissed", () => {
+    const p = projectOf("p1", "sparkle-desktop", [tab("solo")]);
+    const { rerender } = render(<ConciergeHost feed={feedFrom([p], { solo: "waiting" })} />);
+    expect(cardAgentIds()).toEqual(["solo"]);
+
+    rerender(<ConciergeHost feed={feedFrom([p], { solo: "idle" })} />);
+    expect(cardAgentIds()).toEqual([]);
+    expect(resolvedCardAgentIds()).toEqual(["solo"]);
+  });
+
   it("dismisses only the named agent when the card speaks for nobody else", () => {
     // The narrow case, so the fix cannot quietly become "dismiss the whole subtree": a leaf card
     // must not acknowledge alarms the reader never saw.
@@ -301,6 +356,81 @@ describe("a red card retracts when its agent goes back to working", () => {
 
     rerender(<ConciergeHost feed={feedFrom([p], { solo: "working" })} />);
     expect(cardAgentIds()).toEqual([]);
+    // AND IT DID NOT SIMPLY VANISH (bead `sparkle-9adzg`). The founder's ask was "go away OR show as
+    // resolved and be grayed out", and he chose the second: the card stays as history, quiet. This
+    // is the assertion that makes the pair above meaningful — without it, a host that deleted the
+    // card outright and one that greys it are indistinguishable here.
+    expect(resolvedCardAgentIds()).toEqual(["solo"]);
+  });
+
+  // MUTE MUST NOT BE ANSWERED WITH A RECEIPT (roborev, 2026-08-07). Mute is one of the three gates
+  // `accountedNeedsYou` applies, so it withdraws the LIVE card while the agent is still red — which
+  // reads to the ledger exactly like the digest case, except that here the reader has positively
+  // asked not to hear about this agent. Resolving it anyway puts the silenced agent straight back in
+  // the thread as a grey card, through the very control the card offers to silence it with.
+  it("gives a MUTED agent no grey card when it later unblocks", () => {
+    const p = projectOf("p1", "sparkle-desktop", [tab("solo")]);
+    const { rerender } = render(<ConciergeHost feed={feedFrom([p], { solo: "waiting" })} />);
+    // The premise: it was loud first, so there IS an open episode to mishandle.
+    expect(cardAgentIds()).toEqual(["solo"]);
+
+    useSparklePrefsStore.getState().setInterruptPreference("solo", "mute");
+    // `shouldInterrupt` is an INPUT to the feed (it defaults to allow-everything), so the mute has
+    // to be handed to the builder the way the app hands it over — setting the store alone would
+    // leave the feed unmuted and the case would prove nothing.
+    const muted = (status: Record<string, AgentTabStatus>) =>
+      buildConciergeFeed({
+        projects: [p],
+        status,
+        openAgentIds: openIds([p]),
+        shouldInterrupt: useSparklePrefsStore.getState().shouldInterrupt,
+      });
+    rerender(<ConciergeHost feed={muted({ solo: "waiting" })} />);
+    expect(cardAgentIds()).toEqual([]);
+
+    rerender(<ConciergeHost feed={muted({ solo: "working" })} />);
+    expect(cardAgentIds()).toEqual([]);
+    expect(resolvedCardAgentIds()).toEqual([]);
+
+    // AND UNMUTING BRINGS IT BACK, WITH THE REAL DURATION. This half is what makes the gate a HIDE
+    // rather than a DELETE (roborev 59945-M2). The first implementation destroyed the ledger record,
+    // which is unrecoverable: a mute can carry an `expiresAt`, and `muted` is re-derived every tick
+    // from the agent's CURRENT status, so a permanent deletion keyed on a momentary fact throws away
+    // history the reader never asked to lose.
+    useSparklePrefsStore.getState().clearPreference("solo");
+    rerender(<ConciergeHost feed={feedFrom([p], { solo: "working" })} />);
+    expect(resolvedCardAgentIds()).toEqual(["solo"]);
+  });
+
+  // THE PIN — the same gate's other half, and the one with no coverage at all until now (roborev
+  // 59945-M3). `inScope` is nothing but "is this project the pinned one right now", so it is the
+  // most transient fact either branch reads. Deleting `|| !a.inScope` left the whole suite green.
+  it("hides an out-of-scope receipt while a pin is held, and restores it on unpin", () => {
+    const here = projectOf("p1", "sparkle-desktop", [tab("mine")]);
+    const there = projectOf("p2", "drodio-website", [tab("theirs")]);
+    const feedWith = (status: Record<string, AgentTabStatus>, pinnedProjectId?: string) =>
+      buildConciergeFeed({
+        projects: [here, there],
+        status,
+        openAgentIds: openIds([here, there]),
+        pinnedProjectId,
+      });
+
+    // `theirs` blocks and clears while nothing is pinned, so it has an honestly-earned receipt.
+    const { rerender } = render(
+      <ConciergeHost feed={feedWith({ mine: "working", theirs: "waiting" })} />,
+    );
+    expect(cardAgentIds()).toEqual(["theirs"]);
+    rerender(<ConciergeHost feed={feedWith({ mine: "working", theirs: "working" })} />);
+    expect(resolvedCardAgentIds()).toEqual(["theirs"]);
+
+    // Pin project one. "Disregard other projects' alerts" covers their receipts too.
+    rerender(<ConciergeHost feed={feedWith({ mine: "working", theirs: "working" }, "p1")} />);
+    expect(resolvedCardAgentIds()).toEqual([]);
+
+    // Unpin. THE RECEIPT IS STILL THERE — a pin hid it, it did not spend it.
+    rerender(<ConciergeHost feed={feedWith({ mine: "working", theirs: "working" })} />);
+    expect(resolvedCardAgentIds()).toEqual(["theirs"]);
   });
 
   // The founder's case again, as a transition. The worker answers and resumes; the orchestrator
@@ -315,5 +445,9 @@ describe("a red card retracts when its agent goes back to working", () => {
 
     rerender(<ConciergeHost feed={feedFrom([p], { orch: "working", w1: "working" })} />);
     expect(cardAgentIds()).toEqual([]);
+    // The resolved card names the WORKER — the agent the loud card named — not the orchestrator
+    // whose red was only inherited. A rollup that resolved to the parent would put a grey card
+    // against an agent that was never blocked.
+    expect(resolvedCardAgentIds()).toEqual(["w1"]);
   });
 });

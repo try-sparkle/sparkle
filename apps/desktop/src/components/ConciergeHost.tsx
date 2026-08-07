@@ -190,7 +190,15 @@ import {
   subscribeAgentTranscriptWorktrees,
 } from "../services/agentTranscriptRegistry";
 import { findKnownAgent } from "../services/knownAgents";
-import { createArrivalOrder, orderByArrival } from "../engine/conciergeStreamOrder";
+import { createArrivalOrder, forgetArrival, orderByArrival } from "../engine/conciergeStreamOrder";
+import {
+  forgetEpisode,
+  forgetResolved,
+  noteCardsShown,
+  noteResolutions,
+  resolvedNudges,
+  windowResolvedLedger,
+} from "../engine/resolvedNudges";
 import { useEffectiveWired } from "../hooks/useEffectiveWired";
 import { isAskingIsolated } from "../engine/buildSections";
 import { useUiStore } from "../stores/uiStore";
@@ -1095,6 +1103,12 @@ export function ConciergeHost({
   // building. Assign-once semantics keep a digest that flickers (a group needs >= 2 agents, so it
   // collapses at 1 and re-forms at 2) from leaping to the bottom of the thread each time.
   const arrivalRef = useRef(createArrivalOrder());
+  // A bump counter for the RESOLVED-card ledger, which is module state (`engine/resolvedNudges`) and
+  // therefore invisible to React. Every other change to that ledger happens while the view model is
+  // being rebuilt for some other reason — a feed tick — so this exists for the one write that does
+  // not: the reader pressing [x] on a resolved card. STATE rather than a ref for exactly that
+  // reason; a ref would record the removal and never repaint it.
+  const [resolvedRev, setResolvedRev] = useState(0);
   // Agents seen WORKING during the current away stretch — the recap's evidence that a finish was
   // real rather than an overlay repopulating (services/conciergeRecap.buildRecap sawWorking,
   // roborev 53669-M). Accumulated here because this effect is the only thing that observes the
@@ -5450,6 +5464,21 @@ export function ConciergeHost({
         openProjectTab(live.projectId, live.leadAgentId);
       },
       onNudgeAction: (n: ConciergeNudge, actionId: string) => {
+        // [x] ON A RESOLVED CARD IS A DIFFERENT GESTURE, and it is handled BEFORE `resolveAgent`
+        // deliberately. On a live card [x] is the app's per-EPISODE acknowledgement, which
+        // de-escalates a red that is still standing; a finished episode has nothing left to
+        // acknowledge, so the only thing left for the control to mean is "take this out of my
+        // history". Routing it into `dismissAlert` instead would write a dismissal against an alert
+        // record whose episode has already closed — seeding the NEXT red as pre-dismissed, which is
+        // how a genuinely new blocker would come up already silenced.
+        if (n.resolved && actionId === NUDGE_DISMISS_ACTION) {
+          forgetResolved(windowResolvedLedger(), n.id);
+          // The ledger is module state, so removing the record changes nothing React can see. The
+          // view model is keyed on `feed`, and a feed tick may be seconds away — without this bump
+          // the card the reader just dismissed sits there until something unrelated moves.
+          setResolvedRev((r) => r + 1);
+          return;
+        }
         const a = resolveAgent(n.id);
         if (!a) return;
         if (actionId === "approve") {
@@ -5518,6 +5547,19 @@ export function ConciergeHost({
             }
             if (!grew) break;
           }
+          // CLOSE THE EPISODE WITHOUT A RECEIPT — before the dismissals, so no tick can land in
+          // between (roborev, 2026-08-07). An acknowledged red is NOT a resolved one: `dismissAlert`
+          // de-escalates the PUBLISHED status (`withDismissedAlerts` in the chain above) while the
+          // agent goes on waiting, so the resolution pass below — which reads exactly that published
+          // band — would see the agent leave `needs_you` and mint a grey "RESOLVED after 4s:" card
+          // for an agent that is still stopped dead waiting for the reader. That is a live blocker
+          // rendered as history, the one thing this feature may not do, and it would also turn [x]
+          // into two clicks: one to acknowledge, one to clear the receipt.
+          //
+          // The SAME set that gets dismissed, for the same reason it is the transitive closure: a
+          // descendant whose alarm is being acknowledged here must not leave a receipt either.
+          const ledger = windowResolvedLedger();
+          for (const id of spokenFor) forgetEpisode(ledger, id);
           for (const agent of fleet) {
             if (spokenFor.has(agent.id)) {
               store.dismissAlert(agent.projectId, agent.id, agent.status);
@@ -5615,7 +5657,76 @@ export function ConciergeHost({
     // `unmerged.cards` IS DELIBERATELY NOT SPREAD HERE. buildDigest never emits one for this variant
     // (see its singleton branch): un-landed work surfaces only as a LINE, never as an interrupting
     // card carrying Approve/Open affordances that do not apply to it.
-    const nudges = [...cards, ...rowless.cards, ...strandedAgents(feed)].map(agentToNudge);
+    //
+    // AND IT MUST NOT BE SPREAD INTO `cardAgents` EITHER. That list is what opens a resolved-card
+    // episode below, so adding un-landed work here would give every un-landed agent a grey
+    // "RESOLVED after …" card the moment its PR merged — a receipt for something that was never an
+    // alarm.
+    const cardAgents = [...cards, ...rowless.cards, ...strandedAgents(feed)];
+    const nudges = cardAgents.map(agentToNudge);
+    // ── RESOLVED CARDS ──────────────────────────────────────────────────────────────────────────
+    // A card whose agent has left the red band does not vanish; it stays here, greyed, saying how
+    // long the block lasted (founder 2026-08-06, bead `sparkle-9adzg`). See `engine/resolvedNudges`
+    // for why this needs a ledger at all — the live set above is derived, so the moment an agent
+    // stops being red it stops being derivable, and a card nobody remembered is a card that is gone.
+    //
+    // THE RED SET IS THE BAND, NEVER `cardAgents`. Two agents sharing a band collapse into a digest
+    // LINE, which withdraws their individual cards while both are still blocked; resolving on card
+    // absence would grey a live blocker, which is the one thing this must never do.
+    // READ, not merely listed as a dependency. `resolvedRev` is the repaint signal for the one write
+    // to the resolved ledger that does not come with a feed tick ([x] on a resolved card) — the
+    // ledger is module state, so the removal changes nothing React can see. Its VALUE is meaningless;
+    // its CHANGE is the whole signal. Referencing it here makes it a genuine dependency instead of
+    // one `react-hooks/exhaustive-deps` reports as unnecessary — which mattered concretely: the
+    // package lints at `--max-warnings 12` and that warning was the 13th, so it failed CI.
+    void resolvedRev;
+    const now = Date.now();
+    const everyone = allAgents(feed);
+    const stillRed = new Set(everyone.filter((a) => a.band === "needs_you").map((a) => a.id));
+    const known = new Set(everyone.map((a) => a.id));
+    const ledger = windowResolvedLedger();
+    // A resolved card going LOUD again is a new event, and it is the one re-slot the arrival ledger
+    // cannot infer: the card never left the stream, so its absence timer never started. Without this
+    // the re-raised red renders at its original slot — for a long thread, far above the fold.
+    for (const a of cardAgents) if (ledger.resolved.has(a.id)) forgetArrival(arrivalRef.current, a.id);
+    noteCardsShown(ledger, cardAgents, now);
+    noteResolutions(ledger, stillRed, known, (id) => everyone.find((a) => a.id === id), now);
+    const live = new Set(nudges.map((n) => n.id));
+    // THE READER ASKED NOT TO HEAR ABOUT THESE — so they are HIDDEN, not deleted (roborev 59945-M2).
+    //
+    // `muted` and out-of-scope are the other two gates `accountedNeedsYou` applies, and both withdraw
+    // a LIVE card while the agent is still red; without this the later unblock would put the silenced
+    // agent back in the thread as a grey card, through the very control the card offers to silence it
+    // with. But BOTH ARE CURRENT-VIEW FACTS, so acting on them by destroying ledger state was wrong in
+    // a way that only shows up later: `inScope` is just "this project is pinned right now", so a pin
+    // held for a minute would irreversibly erase every receipt already earned in every other project,
+    // and — worse — drop the OPEN episode of a still-red agent there, so on unpin its raise restamps
+    // to `now` and the eventual card reports a fraction of the real block. The duration is the entire
+    // reason the founder chose "keep it, greyed" over "delete it". `muted` has the same shape: it is
+    // re-derived each tick from `conciergeTopics(a.id, status)` and a mute can carry an `expiresAt`.
+    //
+    // A filter is the whole fix: the ledger keeps the truth, and the view shows what the reader has
+    // asked to see. Unpin or unmute and the receipt is there, with its real duration.
+    const eligible = new Map(everyone.map((a) => [a.id, a.inScope && !a.muted]));
+    const resolved: ConciergeNudge[] = resolvedNudges(ledger)
+      // Defensive: `noteCardsShown` already drops a resolved record the moment its agent goes live,
+      // so this cannot fire today. It stays because the failure it prevents is a DUPLICATE REACT KEY
+      // — two cards with one agent id — which React reports as a warning and then renders wrongly,
+      // rather than as the loud contradiction (one agent, red here and grey there) that it is.
+      .filter((r) => !live.has(r.id))
+      .filter((r) => eligible.get(r.id) === true)
+      .map((r) => ({
+        id: r.id,
+        kind: "nudge" as const,
+        band: r.band,
+        projectName: r.projectName,
+        agentName: r.agentName,
+        // No prose and no actions: the card draws neither (see NudgeCard), and every action is a
+        // thing to do about a LIVE block.
+        text: "",
+        actions: [],
+        resolved: { raisedAt: r.raisedAt, resolvedAt: r.resolvedAt },
+      }));
     const digests: ConciergeMessage[] = [...groups, ...rowless.groups, ...unmerged.groups].map(
       (g) => ({
         id: g.id,
@@ -5630,7 +5741,14 @@ export function ConciergeHost({
     // Order the whole stream by WHEN EACH ITEM FIRST APPEARED, not by what kind it is. Concatenated
     // as [chat, digests, nudges] only to tie-break items that arrive in the SAME tick; anything
     // already placed keeps its slot (see engine/conciergeStreamOrder for why assign-once matters).
-    const stream = orderByArrival(arrivalRef.current, [...chat, ...digests, ...nudges]);
+    // `resolved` last in the concatenation, so that if a card resolves in the SAME tick a chat
+    // message or a digest first appears, the tie-break puts the finished thing under the new one.
+    const stream = orderByArrival(arrivalRef.current, [
+      ...chat,
+      ...digests,
+      ...nudges,
+      ...resolved,
+    ]);
     return {
       scope: { pinnedProjectName },
       vitals: feed.scopedCounts,
@@ -5659,6 +5777,9 @@ export function ConciergeHost({
     dropActive,
     attachNotice,
     needsYouIsolated,
+    // Not read in the body — it is the repaint signal for the resolved-card ledger's one
+    // out-of-band write ([x] on a resolved card). See `resolvedRev`.
+    resolvedRev,
   ]);
 
   /**

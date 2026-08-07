@@ -121,8 +121,27 @@ const tickAt = (
 
 /** Which agent each pill on screen is ABOUT — read off the card's own data attribute rather than by
  *  matching prose, so these cases survive the card's copy being redesigned. */
+// THE LOUD CARDS ONLY — the ones still asserting "this agent needs you".
+//
+// This used to be every rendered card, and `toEqual([])` therefore meant "the pill retracted". Since
+// bead `sparkle-9adzg` a retraction no longer REMOVES the card: it greys it and relabels it
+// "RESOLVED after <duration>", because the founder asked to keep the record of what happened rather
+// than have it disappear. So a card that is present-and-grey and a card that is absent are now
+// different outcomes, and the filter below is what keeps every assertion in this file meaning what
+// it meant when it was written — "no agent is being shouted about" — instead of silently weakening
+// to "nothing is on screen".
 const cardAgentIds = (): string[] =>
-  screen.queryAllByTestId(NUDGE_CARD_TESTID).map((el) => el.getAttribute("data-agent-id")!);
+  screen
+    .queryAllByTestId(NUDGE_CARD_TESTID)
+    .filter((el) => el.getAttribute("data-resolved") === null)
+    .map((el) => el.getAttribute("data-agent-id")!);
+
+/** The GREY cards — a block that is over, kept in the thread as history. */
+const resolvedCardAgentIds = (): string[] =>
+  screen
+    .queryAllByTestId(NUDGE_CARD_TESTID)
+    .filter((el) => el.getAttribute("data-resolved") === "true")
+    .map((el) => el.getAttribute("data-agent-id")!);
 
 /** The agent's own Claude Code session — the one its hook events carry. */
 const MAIN = "sess-main";
@@ -172,6 +191,11 @@ describe("the BLOCKED pill retracts on evidence of movement, with no dismissal",
     expect(cardAgentIds()).toEqual([]);
     // THE POINT OF THE WHOLE BEAD: it went by itself. Nothing acknowledged it.
     expect(h.dismissAlert).not.toHaveBeenCalled();
+    // …AND IT LEFT A RECORD (bead `sparkle-9adzg`). A retraction on artifact evidence is exactly the
+    // case where a silently-deleted card is worst: the founder never touched this alarm, so if it
+    // vanishes he has no way to know it was ever raised, or that answering in the terminal is what
+    // cleared it. Grey, with the duration, is the receipt.
+    expect(resolvedCardAgentIds()).toEqual(["publisher"]);
   });
 
   // ── THE FULL SEQUENCE, WHICH IS WHERE A SNAPSHOT READ FAILS ─────────────────────────────────
@@ -293,6 +317,11 @@ describe("the BLOCKED pill retracts on evidence of movement, with no dismissal",
       />,
     );
     expect(cardAgentIds()).toEqual(["asker"]);
+    // AND IT IS NOT QUIETLY GREY EITHER. `cardAgentIds` filtering on `data-resolved` means a card
+    // that got wrongly RESOLVED would drop out of the list above and read exactly like the card
+    // being correctly withheld — so the loud direction has to be asserted on both halves, or the
+    // resolved treatment becomes a new way for a live blocker to disappear.
+    expect(resolvedCardAgentIds()).toEqual([]);
   });
 
   // Claude fires a `Notification` idle ping roughly a minute into any unanswered wait. It is the
@@ -314,6 +343,8 @@ describe("the BLOCKED pill retracts on evidence of movement, with no dismissal",
       />,
     );
     expect(cardAgentIds()).toEqual(["asker"]);
+    // Same both-halves rule as above: an unanswered question must be neither withdrawn NOR greyed.
+    expect(resolvedCardAgentIds()).toEqual([]);
   });
 
   // A red that recurs must be able to raise itself again: the second block is a NEW episode, and the

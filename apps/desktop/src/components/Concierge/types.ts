@@ -93,12 +93,42 @@ export interface ConciergeNudgeAction {
   kind?: "primary" | "ghost";
 }
 
+/**
+ * A red episode that is OVER — the card stays, greyed, instead of vanishing.
+ *
+ * WHY THE CARD DOES NOT SIMPLY DISAPPEAR (founder, 2026-08-06, bead `sparkle-9adzg`): "The blocked
+ * card should go away or show as resolved and be grayed out if it's no longer blocked." Asked which,
+ * he chose to KEEP it — a card that deletes itself takes the record of what happened with it, and
+ * the thread is where he reads that record back. So a resolved card is history: quiet, dateable, and
+ * still naming its agent.
+ *
+ * The two instants are carried rather than a pre-formatted string so the card can spell the duration
+ * in the app's ONE elapsed vocabulary (`engine/elapsed.formatElapsed`) — the same one the Build
+ * column's rows a few hundred pixels away already use — and so a test can assert the duration
+ * without matching prose.
+ */
+export interface NudgeResolution {
+  /** When this red episode was first seen — the moment the loud card went up. */
+  raisedAt: number;
+  /** When the agent was first seen to have left the red band. */
+  resolvedAt: number;
+}
+
 /** A cross-project alert card in the thread. The WHOLE card is clickable (→ onNudgeClick,
  *  "open the source project/agent"); its action buttons fire onNudgeAction and never bubble
  *  into the card click. */
 export interface ConciergeNudge {
   id: string;
   kind: "nudge";
+  /**
+   * Set ONLY once the agent has left the red band — absent on every live card.
+   *
+   * OPTIONAL AND ABSENT-BY-DEFAULT ON PURPOSE. The dangerous direction here is not a red that
+   * lingers, it is a live blocker rendered quiet: Sparkle's standing rule is that nothing which
+   * needs the founder may be hidden. An optional field that must be positively SET to go grey means
+   * every path that forgets it fails loud, which is the safe way round.
+   */
+  resolved?: NudgeResolution;
   /** The source agent's band. Every nudge surfaced today is `needs_you` (that IS the surfacing
    *  gate); the field is carried rather than assumed so the card labels itself from data. */
   band: StatusBand;
