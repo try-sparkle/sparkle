@@ -1,6 +1,6 @@
 {
   "name": "@sparkle/desktop",
-  "version": "0.86.0",
+  "version": "0.87.0",
   "private": true,
   "license": "Apache-2.0",
   "type": "module",
