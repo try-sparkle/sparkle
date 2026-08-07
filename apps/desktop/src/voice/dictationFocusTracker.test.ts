@@ -204,10 +204,20 @@ describe("installDictationFocusTracker — the event wiring", () => {
     window.dispatchEvent(new Event("blur"));
     expect(setWindowFocused).toHaveBeenCalledWith(false);
 
-    // …and a SECOND blur while still background is not another edge.
-    setWindowFocused.mockClear();
+    // …and a SECOND blur while still background is not another edge. ASSERTED ON setFocusOwner,
+    // for the reason the sibling case documents at length: `writeWindowFocused` dedupes by VALUE, so
+    // `setWindowFocused` is silent on a repeat whether the edge guard exists or not — that half of
+    // this test used to survive deleting the very line it names. The unconditional caret re-read is
+    // the observable difference, so tear the terminal out first and watch for that instead.
+    const setFocusOwner2 = vi.fn();
+    uninstall?.();
+    uninstall = installDictationFocusTracker({ setFocusOwner: setFocusOwner2, setWindowFocused });
+    setFocusOwner2.mockClear();
+    document.body.innerHTML = ""; // activeElement -> <body>, with NO focusin to announce it
+
     window.dispatchEvent(new Event("blur"));
-    expect(setWindowFocused).not.toHaveBeenCalled();
+
+    expect(setFocusOwner2).not.toHaveBeenCalled();
     hasFocus.mockRestore();
   });
 

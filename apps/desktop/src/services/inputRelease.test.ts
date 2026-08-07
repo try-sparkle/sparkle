@@ -198,6 +198,27 @@ describe("releaseAllInputCapture — the way out of an app that stopped acceptin
     wiredAgain();
   };
 
+  it("pins the window to an ABSOLUTE range, not just to its own constant", () => {
+    // Every other case here is expressed in terms of the imported COALESCE_MS, so they all stay
+    // green if someone widens it to 3000 — while that silently breaks the contract the deliberate-
+    // press case claims to protect, since a real second press ~1s later would then be eaten
+    // (roborev 59911). These bounds are absolute on purpose.
+    //
+    // Lower bound: must outlast an OS auto-repeat interval (~30ms) by a wide margin, or the burst
+    // this exists to collapse leaks through. Upper bound: must stay under the ~1s at which a
+    // deliberate second press — press, read the screen, press again — becomes plausible.
+    expect(COALESCE_MS).toBeGreaterThanOrEqual(100);
+    expect(COALESCE_MS).toBeLessThanOrEqual(500);
+  });
+
+  it("does NOT eat a deliberate second press one second later — on an absolute clock", () => {
+    // The contract stated in absolute time rather than in units of the thing under test. This is
+    // what actually goes red if COALESCE_MS is widened past a second.
+    leadingEdgeAt(1_000);
+    atTime(2_000, () => releaseAllInputCapture("a real second press"));
+    expect(released()).toBe(true);
+  });
+
   it("suppresses a repeat just INSIDE the window", () => {
     leadingEdgeAt(1_000);
     atTime(1_000 + COALESCE_MS - 1, () => releaseAllInputCapture("inside"));
