@@ -16,6 +16,10 @@
 // cannot be relied on, since PICKER_FOOTER exists precisely for when the cursor glyph drifts.
 import { SELECTION_CURSOR, SHELL_PROMPTS } from "./screenClassifier";
 import {
+  AMBIENT_CHROME_LINE,
+  MAX_CHROME_BELOW_FOOTER,
+} from "../services/sessionLimitScreen";
+import {
   RENDERED_OPTION_ROW,
   pickerBlockBounds,
   pickerWindow,
@@ -27,6 +31,20 @@ import {
 // visible, a typed line — satisfied them. `isSessionLimitPicker` learned this exact lesson and now
 // tests per option row (roborev 58159); re-adopting the rejected form re-opened the hole.
 const LIVE_TAIL_LINES = 12;
+
+/** True when everything below `footerIdx` is ambient chrome — i.e. the dialog is still up. New
+ *  agent output below the footer means it was answered and the screen moved on. Mirrors
+ *  `isSessionLimitPicker`'s below-footer rule and shares its constants. */
+function liveBelowFooter(lines: readonly string[], footerIdx: number): boolean {
+  let chromeBelow = 0;
+  for (let i = footerIdx + 1; i < lines.length; i++) {
+    const line = lines[i]!;
+    if (!line.trim()) continue;
+    if (!AMBIENT_CHROME_LINE.test(line) || chromeBelow >= MAX_CHROME_BELOW_FOOTER) return false;
+    chromeBelow++;
+  }
+  return true;
+}
 
 function tailContent(snapshot: string, n: number): string[] {
   return snapshot
@@ -64,13 +82,23 @@ export function screenOffersAnswer(snapshot: string): boolean {
     const cursored = block.some((l) => SELECTION_CURSOR.test(l));
     // "Immediately above" in NON-EMPTY line terms, which is the unit the parser's own bounds use.
     const abutsFooter = RENDERED_OPTION_ROW.test(lines[bounds.footer - 1] ?? "");
-    // LIVE, not merely present. `pickerBlockBounds` searches the last 50 non-empty lines, so a
-    // dialog the human ALREADY ANSWERED still satisfies it while output keeps streaming below —
-    // which is the same "already-answered dialog still on the grid" case arms 2 and 3 are anchored
-    // against, and arm 1 runs first and is the most permissive. Requiring the footer to sit in the
-    // live tail is the same anchor, applied to the same question.
-    const footerIsLive = bounds.footer >= lines.length - LIVE_TAIL_LINES;
-    if (footerIsLive && (cursored || abutsFooter)) return true;
+    // LIVE, not merely present — but anchored STRUCTURALLY, never by a line budget.
+    //
+    // `pickerBlockBounds` searches the last 50 non-empty lines, so a dialog the human ALREADY
+    // ANSWERED still satisfies it while output streams below. A bottom-anchor is the wrong way to
+    // exclude that, and it was tried and reverted: Ink KEEPS RENDERING BELOW A LIVE DIALOG — "the
+    // footer is never the last line" (heuristics.ts:63-67, capturedScreens.fixture.ts:154-158),
+    // which is precisely why the parser was given PICKER_WINDOW/PICKER_SPAN rather than a bottom
+    // anchor. A fixed budget therefore rejects live, fully-visible, pressable dialogs, and arms 2
+    // and 3 cannot rescue them (the cursor sits ABOVE the footer, so it is further from the bottom
+    // still). That loses the one-tap Approve relay on a real menu and re-creates the very
+    // two-detectors-disagree bug this module exists to close.
+    //
+    // The discriminator is WHAT is below the footer, not HOW MUCH: persistent chrome and a task
+    // checklist mean the dialog is still up; genuine new agent output means it has been answered.
+    // That is exactly `isSessionLimitPicker`'s rule, so this reuses its constants rather than
+    // inventing a second answer to the same question.
+    if (liveBelowFooter(lines, bounds.footer) && (cursored || abutsFooter)) return true;
   }
 
   const tail = tailContent(snapshot, LIVE_TAIL_LINES);

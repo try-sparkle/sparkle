@@ -57,6 +57,16 @@ describe("screenOffersAnswer — arm 1 must be LIVE, not merely present", () => 
     expect(screenOffersAnswer(answered)).toBe(true); // control: live, it qualifies
     expect(screenOffersAnswer(`${answered}\n${after}`)).toBe(false);
   });
+
+  it("ACCEPTS a live dialog with chrome still rendering BELOW its footer", () => {
+    // The boundary in the other direction, and the one a line budget got wrong. Ink keeps drawing
+    // below a live dialog — "the footer is never the last line" — so anchoring by distance rejected
+    // real, pressable menus and cost them the Approve relay. The discriminator is WHAT is below the
+    // footer (ambient chrome = still up), not HOW MUCH.
+    const dialog = [" Do you want to proceed?", " ❯ 1. Yes", "   2. No", FOOTER].join("\n");
+    const chrome = ["  ⏵⏵ accept edits on (shift+tab to cycle)", "  ? for shortcuts"].join("\n");
+    expect(screenOffersAnswer(`${dialog}\n${chrome}`)).toBe(true);
+  });
 });
 
 describe("screenOffersAnswer — real captured screens are all answerable", () => {
