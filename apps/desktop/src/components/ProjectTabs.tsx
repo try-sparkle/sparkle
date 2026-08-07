@@ -14,21 +14,36 @@ import {
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
 } from "react";
+import { createPortal } from "react-dom";
 import { MdOutlinePushPin } from "react-icons/md";
 import { FiPlus, FiX, FiExternalLink, FiAlertTriangle } from "react-icons/fi";
 import type { StatusBand } from "../engine/buildSections";
 import { bandColor, bandCountLabel } from "../engine/statusBandLabels";
 import { BandBadge } from "./BandBadge";
 import { C, FONT_WEIGHT } from "../theme/colors";
+import { TYPE } from "../theme/scale";
 import { PROJECT_TAB_HINT } from "../keyboardHints/hintTargets";
 import { resolveTabDrag, type TabDragResult, type TabRect } from "./tabDrag";
+import { StaleCheckoutPanel, type StaleTarget } from "./StaleCheckoutPanel";
 
 export interface ProjectTabItem {
   id: string;
   name: string;
+  /**
+   * The project's checkout directory — what the stale-checkout panel diagnoses and remedies.
+   *
+   * OPTIONAL, and its absence means NO BADGE rather than a crash. Every live caller has it (the
+   * project store carries `rootPath` on every record), but this component is presentational and is
+   * rendered from fixtures in half a dozen test files; a required field would turn "this fixture
+   * predates the panel" into a type error in files that have nothing to do with staleness. A badge
+   * with no root to diagnose would be a button that can only ever fail, so it simply does not
+   * render — the same fail-closed reading `stalenessByProject` itself follows.
+   */
+  rootPath?: string;
 }
 /** Per-project status-band counts (from the concierge feed) that drive the tab glow + count badge. */
 export type ProjectTabCounts = Record<StatusBand, number>;
@@ -262,46 +277,171 @@ export function staleTitle(projectName: string, s: ProjectTabStaleness): string 
  * the moment it matters most is while you are working in it — hiding it on focus would hide it
  * exactly when it is doing its job.
  *
- * AND IT KEEPS ITS TOOLTIP, also unlike that badge. There the `title` was dropped so a hover would
- * not put back the words the badge deliberately dropped. Here the words ARE the feature: "1,696"
- * alone tells you nothing, and the tab's own title cannot say what to do instead. `staleTitle`
- * carries the whole sentence to both the tooltip and the accessible name.
+ * AND IT KEEPS ITS EXPLANATION, also unlike that badge. There the `title` was dropped so a hover
+ * would not put back the words the badge deliberately dropped. Here the words ARE the feature:
+ * "1,696" alone tells you nothing, and the tab's own title cannot say what to do instead.
+ *
+ * ── THE EXPLANATION IS NOT A `title`, AND CANNOT BE (bead sparkle-7h01z) ───────────────────────
+ *
+ * It used to be one, and it never showed. `disableNativeTooltips()` (wired at `main.tsx`) installs a
+ * CAPTURE-PHASE `mouseover` listener that walks the hovered element and every ancestor and STRIPS
+ * `title` app-wide, before the webview's tooltip delay elapses. It moves the text to `aria-label`
+ * first — but only when the element has no accessible name yet, and this badge has always carried
+ * one. So the attribute was removed with no replacement, every hover, forever: a native `title` on
+ * this control is not "unreliable", it is dead by construction, and re-adding one is the regression
+ * this component's test exists to catch.
+ *
+ * So the hover explanation is a real element: local hover state and a PORTALED fixed-position card,
+ * following `composer/SuggestionRow`, which worked this out first for the same reason. Portaled
+ * because the tab strip clips its overflow — a card rendered in-flow would be cut off at the strip's
+ * own edge, which for a badge sitting near the right end of the bar means most of the sentence.
+ *
+ * ── AND IT IS A BUTTON ────────────────────────────────────────────────────────────────────────
+ *
+ * It was a `role="img"` span inside the tab's own onClick, so the one gesture anybody would try on
+ * it — clicking — selected the project and did nothing else. A real `<button>` is what makes the
+ * panel reachable by mouse AND keyboard, and it fixes the drag interaction for free: the strip's
+ * `onTabPointerDown` already bails on `e.target.closest("button")`, so a press that starts here can
+ * no longer drag the tab out from under the badge.
  */
 function TabStaleBadge({
   projectId,
   projectName,
   staleness,
+  onOpen,
+  registerEl,
 }: {
   projectId: string;
   projectName: string;
   staleness: ProjectTabStaleness;
+  /** Open the remedy panel for this project. */
+  onOpen: () => void;
+  /** Hand the button element up so the strip can restore focus to it when the panel closes. */
+  registerEl: (el: HTMLButtonElement | null) => void;
 }) {
   const label = staleTitle(projectName, staleness);
+  const ref = useRef<HTMLButtonElement | null>(null);
+  const [hovered, setHovered] = useState(false);
+  const [at, setAt] = useState<{ left: number; top: number } | null>(null);
+
+  // Measured in a LAYOUT effect for the same reason the panel is: placed after paint, the card
+  // appears at the window's top-left for a frame before snapping under the badge.
+  useLayoutEffect(() => {
+    if (!hovered) {
+      setAt(null);
+      return;
+    }
+    const el = ref.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    // Clamped so a badge near the right edge does not push the card off-window. jsdom reports zeros
+    // for every rect, which lands the card at the left margin — fine, since what the test asserts is
+    // the SENTENCE being on screen, not where.
+    const w = typeof window === "undefined" ? 0 : window.innerWidth;
+    setAt({
+      left: Math.max(TOOLTIP_MARGIN, Math.min(r.left, w - TOOLTIP_MAX_W - TOOLTIP_MARGIN)),
+      top: r.bottom + TOOLTIP_GAP,
+    });
+  }, [hovered]);
+
   return (
-    <span
-      data-testid={`stale-${projectId}`}
-      data-behind={staleness.behind}
-      role="img"
-      aria-label={label}
-      title={label}
-      style={{
-        display: "inline-flex",
-        alignItems: "center",
-        gap: 3,
-        flex: "none",
-        // `dangerInk`, not the brand red: this is TEXT on `barSurface`, where the raw red misses AA
-        // in both themes. Same rule (and same reason) as TabCountBadge's ink.
-        color: C.dangerInk,
-        fontWeight: FONT_WEIGHT.semibold,
-        fontVariantNumeric: "tabular-nums",
-      }}
-    >
-      {/* An icon from react-icons, never an emoji — this repo renders every icon that way. */}
-      <FiAlertTriangle size={11} />
-      {staleness.behind.toLocaleString()}
-    </span>
+    <>
+      <button
+        type="button"
+        ref={(el) => {
+          ref.current = el;
+          registerEl(el);
+        }}
+        data-testid={`stale-${projectId}`}
+        data-behind={staleness.behind}
+        // The accessible name stays the whole sentence, exactly as it was — the visible card is an
+        // addition for sighted users, not a replacement for what a screen reader hears. NO `title`:
+        // see the note above.
+        aria-label={label}
+        onMouseEnter={() => setHovered(true)}
+        onMouseLeave={() => setHovered(false)}
+        // Keyboard parity: the card is the only place the sentence is VISIBLE, so reaching the badge
+        // by Tab has to show it too.
+        onFocus={() => setHovered(true)}
+        onBlur={() => setHovered(false)}
+        onClick={(e) => {
+          // The badge sits inside the tab's own onClick. Without this, opening the panel would also
+          // switch projects — which is the defect, not a bonus.
+          e.stopPropagation();
+          onOpen();
+        }}
+        // A <button> turns Enter/Space into a click, and BOTH events bubble to the tab's
+        // onClick/onKeyDown — so without this, opening the panel from the keyboard would select the
+        // tab as well. Same guard, same reason, as the close × below.
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") e.stopPropagation();
+        }}
+        // …and a double-click on the badge must not open project settings.
+        onDoubleClick={(e) => e.stopPropagation()}
+        style={{
+          display: "inline-flex",
+          alignItems: "center",
+          gap: 3,
+          flex: "none",
+          background: "transparent",
+          border: "none",
+          padding: 0,
+          cursor: "pointer",
+          font: "inherit",
+          // `dangerInk`, not the brand red: this is TEXT on `barSurface`, where the raw red misses AA
+          // in both themes. Same rule (and same reason) as TabCountBadge's ink.
+          color: C.dangerInk,
+          fontWeight: FONT_WEIGHT.semibold,
+          fontVariantNumeric: "tabular-nums",
+        }}
+      >
+        {/* An icon from react-icons, never an emoji — this repo renders every icon that way. */}
+        <FiAlertTriangle size={11} />
+        {staleness.behind.toLocaleString()}
+      </button>
+      {hovered &&
+        at &&
+        typeof document !== "undefined" &&
+        createPortal(
+          <div
+            data-testid={`stale-tip-${projectId}`}
+            role="tooltip"
+            style={{
+              position: "fixed",
+              left: at.left,
+              top: at.top,
+              maxWidth: TOOLTIP_MAX_W,
+              zIndex: STALE_TOOLTIP_Z,
+              pointerEvents: "none",
+              background: C.deepForest,
+              color: C.cream,
+              border: `1px solid ${C.hairline}`,
+              borderRadius: 6,
+              boxShadow: "0 8px 24px rgba(0,0,0,0.4)",
+              padding: "6px 8px",
+              // `TYPE.small` (12), not a hand-picked 11: this is a hint, which is exactly the
+              // register that token names. The scale is a hard-zero ratchet — an off-scale literal
+              // here reds `scale.test.ts`, and rightly so.
+              fontSize: TYPE.small,
+              lineHeight: 1.4,
+              animation: "sparkle-tooltip-in .12s ease-out",
+            }}
+          >
+            {label}
+          </div>,
+          document.body,
+        )}
+    </>
   );
 }
+
+/** Hover-card geometry. `MAX_W` is also the clamp's width term, so the two cannot disagree. */
+const TOOLTIP_MAX_W = 320;
+const TOOLTIP_MARGIN = 8;
+const TOOLTIP_GAP = 6;
+/** Above the remedy panel it explains (`STALE_PANEL_Z`), below the app-modal band at 61 — a tooltip
+ *  that lost to the panel would be invisible exactly when the badge is hovered with it open. */
+const STALE_TOOLTIP_Z = 54;
 
 /** How wide a tab's project name may get before it ellipsizes. Sized so a typical repo folder name
  *  fits whole and only genuinely long ones truncate — the point is a bar of UNIFORM-height tabs, not
@@ -404,6 +544,72 @@ export function ProjectTabs({
     kind: "reorder" | "tearoff";
     beforeId: string | null;
   } | null>(null);
+  // Which project's stale-checkout panel is open, and the badge elements to hand focus back to when
+  // it closes. Kept at the STRIP level rather than inside the badge because the panel lists every
+  // stale project, not just the one clicked — see `staleTargetsFor`.
+  const [stalePanelFor, setStalePanelFor] = useState<string | null>(null);
+  const staleBadgeEls = useRef(new Map<string, HTMLButtonElement>());
+
+  /**
+   * Every stale checkout the panel should account for, THE CLICKED ONE FIRST.
+   *
+   * A project with no `rootPath` is dropped rather than listed: the panel's whole job is to diagnose
+   * and remedy a directory, and a row naming a project it cannot look at is a row that can only say
+   * "unknown" forever. It has no badge either (see the render site), so it cannot be the clicked one.
+   */
+  function staleTargetsFor(primaryId: string): StaleTarget[] {
+    const out: StaleTarget[] = [];
+    const add = (p: ProjectTabItem) => {
+      const s = stalenessByProject?.[p.id];
+      if (!s || !p.rootPath) return;
+      out.push({ id: p.id, name: p.name, rootPath: p.rootPath, behind: s.behind, base: s.base });
+    };
+    const primary = projects.find((p) => p.id === primaryId);
+    if (primary) add(primary);
+    for (const p of projects) if (p.id !== primaryId) add(p);
+    return out;
+  }
+
+  /** Close the panel and put focus back on the badge that opened it — the keyboard user's way out
+   *  lands nowhere otherwise, since the panel is portaled away from the strip. Falls back to the
+   *  TAB when the badge is gone, which is exactly the successful-remedy case below. */
+  function closeStalePanel(): void {
+    const el = stalePanelFor ? staleBadgeEls.current.get(stalePanelFor) : null;
+    const tab = stalePanelFor ? tabEls.current.get(stalePanelFor) : null;
+    setStalePanelFor(null);
+    if (el?.isConnected) el.focus();
+    else tab?.focus();
+  }
+
+  /**
+   * THE PANEL'S ROW LIST IS FROZEN AT OPEN — and that is what keeps it honest.
+   *
+   * Two bad behaviours are avoided by the same decision, and the second one is why this is a
+   * snapshot rather than an auto-close:
+   *
+   * 1. Deriving rows live meant a successful fast-forward — which drops the project from
+   *    `stalenessByProject` and unmounts its badge — left the panel rendering `targets: []`: a
+   *    header and a disabled button pinned to a badge that no longer exists (roborev 59437).
+   *
+   * 2. CLOSING on that absence was worse, and was the first attempt. `stalenessByProject` omits
+   *    three different things: `unknown`, not-stale, AND a read that FAILED — `useProjectStaleness`
+   *    swallows a failed `repo_root_staleness` deliberately, because it runs on a timer. So a
+   *    transient `index.lock` on the 60s poll — exactly the contention `dirty_at` now fails closed
+   *    against — was indistinguishable from "the remedy landed", and it tore down the panel. The
+   *    user presses Fast-forward on a dirty tree, git refuses, the row shows git's own words, and
+   *    one tick later the whole panel vanishes with the refusal unread. A feature built on
+   *    fail-closed reads must not treat a MISSING MEASUREMENT as a SUCCESS (roborev 59454).
+   *
+   * Frozen, the rows persist with their outcomes and skip reasons until the user dismisses the
+   * panel, and each row re-diagnoses itself after its own remedy — so what it shows is the result
+   * of an action that actually happened, never the absence of a reading.
+   */
+  const [staleTargets, setStaleTargets] = useState<StaleTarget[]>([]);
+
+  function openStalePanel(projectId: string): void {
+    setStaleTargets(staleTargetsFor(projectId));
+    setStalePanelFor(projectId);
+  }
 
   /** Measure the strip and every rendered tab in CLIENT space — the space `clientX/clientY` reports,
    *  so the resolver's inputs are all consistent (its header only requires ONE space, not a
@@ -655,8 +861,19 @@ export function ProjectTabs({
             )}
             {/* ⚠ N — on EVERY tab, including the active one: a stale checkout matters most while
                 you are working in it. Absent unless this project is actually stale. */}
-            {staleness && (
-              <TabStaleBadge projectId={p.id} projectName={p.name} staleness={staleness} />
+            {staleness && p.rootPath && (
+              <TabStaleBadge
+                projectId={p.id}
+                projectName={p.name}
+                staleness={staleness}
+                onOpen={() => openStalePanel(p.id)}
+                registerEl={(el) => {
+                  // Same discipline as `tabEls`: delete on unmount, so a closed project's dead node
+                  // is never the thing focus is restored to.
+                  if (el) staleBadgeEls.current.set(p.id, el);
+                  else staleBadgeEls.current.delete(p.id);
+                }}
+              />
             )}
             {/* ● N, and ONLY on a tab you are not looking at. See `tabBadgeCount`. */}
             {badgeCount !== null && band !== null && (
@@ -745,6 +962,15 @@ export function ProjectTabs({
         >
           {topRight}
         </div>
+      )}
+      {/* The remedy panel for whichever badge was clicked. Rendered once at the strip level (it
+          lists every stale project, not just that one) and portaled to root by `ModalLayer`. */}
+      {stalePanelFor && (
+        <StaleCheckoutPanel
+          anchorEl={staleBadgeEls.current.get(stalePanelFor) ?? null}
+          targets={staleTargets}
+          onClose={closeStalePanel}
+        />
       )}
     </div>
   );

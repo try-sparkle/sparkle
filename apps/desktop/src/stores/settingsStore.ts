@@ -284,6 +284,54 @@ export function effectiveChiefPat(keychain: string, stored: string, runtime = ""
 }
 
 /**
+ * Which OTHER Sparkle project already syncs into `chiefProjectId`, if any.
+ *
+ * Exported so the picker can mark those options rather than letting the store refuse a choice the
+ * UI presented as available — a silent no-op is the worst of both.
+ */
+export function chiefLibraryOwner(
+  links: Record<string, string>,
+  chiefProjectId: string,
+  exceptSparkleProjectId: string,
+): string | null {
+  for (const [sparkleId, chiefId] of Object.entries(links)) {
+    if (chiefId === chiefProjectId && sparkleId !== exceptSparkleProjectId) return sparkleId;
+  }
+  return null;
+}
+
+function isChiefLibraryClaimed(
+  links: Record<string, string>,
+  chiefProjectId: string,
+  exceptSparkleProjectId: string,
+): boolean {
+  return chiefLibraryOwner(links, chiefProjectId, exceptSparkleProjectId) !== null;
+}
+
+/**
+ * Drop `previous`'s ledger ONLY when no other Sparkle project still syncs into it.
+ *
+ * The ledger is keyed by CHIEF project id, so it is shared state whenever two Sparkle projects
+ * point at one library. Deleting it unconditionally when one of them moves away destroys the
+ * record the OTHER is still using: its next sync loses every recorded `assetId`, so its stale docs
+ * can never be deleted (orphans linger forever) and it re-uploads its whole tree. `relinkChiefProject`
+ * now refuses to create that sharing in the first place, but persisted state from before this
+ * guard can already contain it, so the drop has to be conditional regardless.
+ */
+function dropLedgerIfUnused(
+  s: { chiefProjectByProject: Record<string, string>; chiefDocStateByProject: Record<string, Record<string, ChiefDocState>> },
+  movingSparkleProjectId: string,
+  previous: string | undefined,
+): Record<string, Record<string, ChiefDocState>> {
+  if (!previous) return s.chiefDocStateByProject;
+  if (isChiefLibraryClaimed(s.chiefProjectByProject, previous, movingSparkleProjectId)) {
+    return s.chiefDocStateByProject; // someone else still needs it
+  }
+  const { [previous]: _dropped, ...rest } = s.chiefDocStateByProject;
+  return rest;
+}
+
+/**
  * The worker-concurrency limit to actually enforce: the MIN of what the user configured and what
  * this machine's RAM can hold. Both are ceilings — neither may raise the other — so taking the min
  * is correct in every ordering, including before the first hydrate lands.
@@ -575,6 +623,10 @@ interface SettingsState {
   setChiefProject: (sparkleProjectId: string, chiefProjectId: string) => void;
   setChiefProjectDocState: (chiefProjectId: string, map: Record<string, ChiefDocState>) => void;
   clearChiefDocState: (chiefProjectId: string) => void;
+  /** Point a Sparkle project at a DIFFERENT Chief project, dropping the outgoing ledger. */
+  relinkChiefProject: (sparkleProjectId: string, chiefProjectId: string) => void;
+  /** Forget the link entirely, so the next sync resolves one by name (or creates it). */
+  unlinkChiefProject: (sparkleProjectId: string) => void;
   setMaxConcurrentWorkers: (n: number) => void;
   setCloudDictation: (on: boolean) => void;
   /** Toggle auto-apply of desktop updates (the "Automatically apply updates" checkbox). */
@@ -823,6 +875,71 @@ export const useSettingsStore = create<SettingsState>()(
         set((s) => {
           const { [chiefProjectId]: _drop, ...rest } = s.chiefDocStateByProject;
           return { chiefDocStateByProject: rest };
+        }),
+
+      // --- Re-pointing a project's Chief link (sparkle-ojgvp) ---------------------------------
+      // Until now `setChiefProject` had exactly ONE caller — inside runChiefSync — so a link, once
+      // established, could not be changed from anywhere in the app. That is fine while the link is
+      // only ever discovered, and wrong the moment a human wants to consolidate two libraries into
+      // one or recover from a project they deleted.
+
+      /**
+       * Re-point `sparkleProjectId` at a different Chief project.
+       *
+       * DROPS THE OUTGOING LEDGER, and that is the whole reason this is not just `setChiefProject`.
+       * `chiefDocStateByProject` is keyed by CHIEF project id and records "path -> {hash, assetId}"
+       * for assets that live in THAT project. Carrying it across a re-link would leave the sync
+       * holding asset ids belonging to the old library: it would skip uploads whose hash "matches"
+       * an asset the new project does not contain, and issue deletes against ids that are not
+       * there. Dropping it makes the next run treat the new project as unseen and reconcile from
+       * scratch — safe, because upload dedups on content MD5 server-side, so identical docs already
+       * in the destination are not re-ingested.
+       *
+       * A no-op when the target is already the current link, so a stray click cannot throw away a
+       * healthy ledger and force a full re-reconcile.
+       */
+      relinkChiefProject: (sparkleProjectId, chiefProjectId) =>
+        set((s) => {
+          const previous = s.chiefProjectByProject[sparkleProjectId];
+          if (previous === chiefProjectId) return {};
+          // REFUSED when another Sparkle project already owns that library, because the sync's
+          // current-state model makes sharing one MUTUALLY DESTRUCTIVE, not merely redundant.
+          // syncProjectMarkdown treats the ledger as the complete desired state for the ONE
+          // worktree it just read: every ledger path absent from that tree is deleted from Chief,
+          // and the result is persisted wholesale. Two projects on one library therefore delete
+          // each other's documents every round — the "Think agent sees half the picture" failure
+          // this pane exists to cure, except now with data loss. See `chiefLibraryOwner`, which
+          // the picker uses to mark these options so the refusal is never a surprise.
+          if (isChiefLibraryClaimed(s.chiefProjectByProject, chiefProjectId, sparkleProjectId)) {
+            return {};
+          }
+          return {
+            chiefProjectByProject: {
+              ...s.chiefProjectByProject,
+              [sparkleProjectId]: chiefProjectId,
+            },
+            chiefDocStateByProject: dropLedgerIfUnused(s, sparkleProjectId, previous),
+          };
+        }),
+
+      /**
+       * Forget the link entirely.
+       *
+       * The next sync falls back to `ensureChiefProject`'s name matching, which will REUSE a Chief
+       * project of the same name if one exists and otherwise CREATE one. That makes this the
+       * deliberate opposite of the `project_gone` behaviour, where the dead id is left in place
+       * precisely to stop that recreation from happening behind the user's back — here the user is
+       * asking for it.
+       */
+      unlinkChiefProject: (sparkleProjectId) =>
+        set((s) => {
+          const previous = s.chiefProjectByProject[sparkleProjectId];
+          if (!previous) return {};
+          const { [sparkleProjectId]: _unlinked, ...links } = s.chiefProjectByProject;
+          return {
+            chiefProjectByProject: links,
+            chiefDocStateByProject: dropLedgerIfUnused(s, sparkleProjectId, previous),
+          };
         }),
 
       setMaxConcurrentWorkers: (n) => set({ maxConcurrentWorkers: Math.max(1, Math.floor(n)) }),

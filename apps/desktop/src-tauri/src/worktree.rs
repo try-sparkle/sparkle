@@ -5150,7 +5150,7 @@ pub enum LandOutcome {
 
 /// Path of the worktree that currently has `branch` checked out (`refs/heads/<branch>`), via
 /// `git worktree list --porcelain`. None when no worktree has it checked out.
-fn worktree_on_branch(root: &str, branch: &str) -> Option<String> {
+pub(crate) fn worktree_on_branch(root: &str, branch: &str) -> Option<String> {
     let listing = git(root, &["worktree", "list", "--porcelain"]).ok()?;
     let want = format!("refs/heads/{branch}");
     let mut cur_path: Option<String> = None;

@@ -37,6 +37,22 @@ const STALE = {
   unknown: false,
 };
 
+/**
+ * The `repo_root_staleness` calls ONLY — this suite is about that one command by name.
+ *
+ * The hook now issues a SECOND command against the same `invoke` for stale projects
+ * (`repo_stale_diagnose`, the unattended fast-forward path, bead sparkle-7h01z), so a bare
+ * `toHaveBeenCalledTimes` here would count the measurement AND the diagnosis together and would
+ * read as "the poll fired twice" the moment either changed. Filtering by command keeps each
+ * assertion pinned to the thing it names — the count and the roots below are still exact, so a
+ * project that stopped being measured still fails this.
+ */
+function staleCalls(): { root: string }[] {
+  return invokeMock.mock.calls
+    .filter((c) => c[0] === "repo_root_staleness")
+    .map((c) => c[1] as { root: string });
+}
+
 describe("useProjectStaleness — the invoke boundary", () => {
   it("calls repo_root_staleness with { root } for each project and badges the result", async () => {
     invokeMock.mockResolvedValue(STALE);
@@ -60,8 +76,8 @@ describe("useProjectStaleness — the invoke boundary", () => {
         { id: "p2", rootPath: "/repo/two" },
       ]),
     );
-    await waitFor(() => expect(invokeMock).toHaveBeenCalledTimes(2));
-    const roots = invokeMock.mock.calls.map((c) => (c[1] as { root: string }).root).sort();
+    await waitFor(() => expect(staleCalls()).toHaveLength(2));
+    const roots = staleCalls().map((a) => a.root).sort();
     expect(roots).toEqual(["/repo/one", "/repo/two"]);
   });
 
@@ -89,11 +105,11 @@ describe("useProjectStaleness — the invoke boundary", () => {
     invokeMock.mockResolvedValue(STALE);
     renderHook(() => useProjectStaleness([{ id: "p1", rootPath: "/repo/one" }], 1000));
     await vi.advanceTimersByTimeAsync(0);
-    expect(invokeMock).toHaveBeenCalledTimes(1);
+    expect(staleCalls()).toHaveLength(1);
     // A one-shot read would leave the badge frozen for the whole session, which is the failure the
     // poll exists to prevent — so the SECOND call is the assertion that matters.
     await vi.advanceTimersByTimeAsync(1000);
-    expect(invokeMock).toHaveBeenCalledTimes(2);
+    expect(staleCalls()).toHaveLength(2);
   });
 
   it("stops polling after unmount", async () => {
@@ -104,8 +120,8 @@ describe("useProjectStaleness — the invoke boundary", () => {
     );
     await vi.advanceTimersByTimeAsync(0);
     unmount();
-    const after = invokeMock.mock.calls.length;
+    const after = staleCalls().length;
     await vi.advanceTimersByTimeAsync(5000);
-    expect(invokeMock).toHaveBeenCalledTimes(after);
+    expect(staleCalls()).toHaveLength(after);
   });
 });

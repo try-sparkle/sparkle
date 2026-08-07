@@ -49,6 +49,28 @@ export interface ProjectSyncParams {
   chiefProjectId?: string;
   /** Current per-path ledger for this Chief project (path -> {hash, assetId}). */
   docState: Record<string, ChiefDocState>;
+  /**
+   * Chief project ids that OTHER Sparkle projects already sync into. Resolving onto one of these
+   * aborts the run before a single byte moves — see `ChiefLibraryClaimedError`.
+   */
+  claimedChiefProjectIds?: readonly string[];
+}
+
+/**
+ * The resolved Chief library already belongs to a DIFFERENT Sparkle project.
+ *
+ * Two Sparkle projects on one library is not merely redundant, it is mutually destructive: the
+ * sweep below treats the ledger as the complete desired state for the ONE worktree it just read,
+ * so every path the other project owns is deleted from Chief on this run, and the same happens in
+ * reverse on theirs. Refusing is the only non-lossy answer, and it has to happen HERE rather than
+ * at the point the link is persisted: `ensureChiefProject` reuses an existing project by NAME, so
+ * by the time the caller sees which id was chosen the deletes have already been committed.
+ */
+export class ChiefLibraryClaimedError extends Error {
+  constructor(readonly chiefProjectId: string) {
+    super(`Chief project ${chiefProjectId} is already linked to another Sparkle project`);
+    this.name = "ChiefLibraryClaimedError";
+  }
 }
 
 export interface ProjectSyncResult {
@@ -69,6 +91,7 @@ export interface ProjectSyncResult {
  */
 export async function syncProjectMarkdown(params: ProjectSyncParams): Promise<ProjectSyncResult | null> {
   const { pat, sparkleProjectId, projectName, agentId, chiefProjectId, docState } = params;
+  const claimed = params.claimedChiefProjectIds ?? [];
   if (!pat) return null;
 
   const change = await invoke<MarkdownSince>("markdown_changed_since", {
@@ -84,6 +107,11 @@ export async function syncProjectMarkdown(params: ProjectSyncParams): Promise<Pr
   }
 
   const pid = await ensureChiefProject(pat, projectName, chiefProjectId);
+  // Checked on EVERY run, not just when the id was freshly discovered: `ensureChiefProject` name-
+  // matches whenever nothing is linked, so an unlinked project silently lands on a library another
+  // Sparkle project already owns — and persisted state from before this guard can already hold the
+  // sharing outright. Both are equally destructive, and both are caught before the first upload.
+  if (claimed.includes(pid)) throw new ChiefLibraryClaimedError(pid);
 
   // Library health check: a ledger hash match normally skips a path, but that trusts that the
   // recorded asset actually holds bytes. A failed run can leave a 1-byte reservation whose md5

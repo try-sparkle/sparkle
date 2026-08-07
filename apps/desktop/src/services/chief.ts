@@ -129,6 +129,31 @@ export async function createProject(
   return (await parseOrThrow(res)) as ChiefProject;
 }
 
+/**
+ * Does `projectId` still exist in the caller's Chief account?
+ *
+ * Three-valued ON PURPOSE — `null` means "could not tell", and it is NOT a synonym for `false`.
+ * The whole point is to tell a DELETED project apart from an UNREACHABLE endpoint, which is the
+ * distinction the sync could never make: both presented as the same silent backoff. Collapsing
+ * `null` into `false` would let one failed request declare the user's library gone and strand the
+ * project in a state only a human can clear, so every caller must handle the third case.
+ *
+ * WHY A DELETED PROJECT IS NOT RE-CREATED. `ensureChiefProject` matches by NAME when nothing is
+ * linked, so if a vanished link were simply cleared, the very next sync would create a fresh Chief
+ * project under the same name and re-upload the whole markdown tree into it — undoing, within the
+ * hour, a deliberate consolidation of two libraries into one. The stored id is therefore LEFT IN
+ * PLACE and the project is reported as `project_gone` (see chiefSyncStore) for a human to re-link
+ * or unlink. Once a link existed, its disappearance is a decision we must not overrule.
+ */
+export async function chiefProjectExists(pat: string, projectId: string): Promise<boolean | null> {
+  try {
+    const projects = await listProjects(pat);
+    return projects.some((p) => p.project_id === projectId);
+  } catch {
+    return null; // fail closed: unknown, never "gone"
+  }
+}
+
 /** List the caller's Chief projects (so we can reuse one named after the Sparkle project). */
 export async function listProjects(pat: string): Promise<ChiefProject[]> {
   const res = await httpFetch(`${BASE}/v1/projects`, { headers: headers(pat) });

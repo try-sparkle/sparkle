@@ -1,0 +1,157 @@
+// WHY A STALE CHECKOUT NEEDS A DIAGNOSIS AND NOT JUST A NUMBER (bead sparkle-7h01z).
+//
+// The tab badge already says `⚠ 1,935` — measured, and behind. That is the whole of what it knows,
+// and it is not enough to act on: the ONE thing a person wants at that moment is "make it not be
+// stale", and whether that is possible depends on facts the badge never asked about. A clean
+// checkout sitting on the default branch is a `git merge --ff-only` away from current. A checkout
+// with local edits is the same command with a real chance of refusal. A checkout parked on a
+// feature branch needs a checkout first. And a linked worktree whose branch is held by ANOTHER
+// worktree cannot be moved at all, from here or ever, by any button this app could draw.
+//
+// So the backend answers the diagnosis question, and this module is a thin wrapper over it —
+// deliberately shaped like `services/openPrs.ts`: `invoke` calls and types, no store, no derived
+// state. The one rule that matters at this seam:
+//
+//   `cause` IS THE BACKEND'S SENTENCE AND IS RENDERED VERBATIM.
+//
+// Not a code the UI switches on to pick wording. The backend is the only layer that knows which
+// worktree holds the branch, how many files are dirty, and what the base resolved to — so it is the
+// only layer that can write a true sentence about it. Re-deriving the wording in TS means two
+// descriptions of one fact that drift the first time either side changes, and the one on screen is
+// the one that goes wrong. `remedy` decides WHICH CONTROL (if any) to draw; `cause` decides what is
+// SAID. Those are the only two jobs these fields have.
+import { invoke } from "@tauri-apps/api/core";
+
+/**
+ * What can be DONE about a stale checkout — the field that decides which control the panel draws.
+ *
+ * - `none` — nothing to do (not stale, or already current).
+ * - `fast-forward` — clean tree, on the default branch, a strict ancestor of the base. `git merge
+ *   --ff-only` cannot lose anything here, which is why this is also the only shape that may be
+ *   fixed with no click at all (see {@link StaleDiagnosis.autoSafe}).
+ * - `fast-forward-dirty` — the same fast-forward, but with uncommitted changes in the tree. Offered
+ *   with a warning naming the files, because git may still refuse it and the person should know
+ *   what is at stake before pressing.
+ * - `blocked-detached` — HEAD is on no branch. NO BUTTON, deliberately: the fast-forwardability we
+ *   measured was against the DETACHED head, so a "check out the branch, then fast-forward" action
+ *   would move a commit the check never covered — and a diverged local branch would let the
+ *   checkout succeed (claiming the branch away from every other worktree) before the fast-forward
+ *   failed. The cause names the manual step instead. See `repo_freshness.rs` arm 6b.
+ * - `blocked-held-elsewhere` — a linked worktree whose branch is checked out in a DIFFERENT
+ *   worktree. Git allows a branch in exactly one worktree, so this is not a transient condition and
+ *   there is no button. See the panel for why offering one anyway would be worse than nothing.
+ * - `blocked-diverged` — the checkout has commits the base does not, so no fast-forward exists and
+ *   any automatic move would be a merge or a rebase decision that is not this app's to make.
+ * - `unknown` — could not work it out. Renders the cause and no control, on the same fail-closed
+ *   rule the badge itself follows: never offer a confident action over an answer we do not have.
+ */
+export type StaleRemedy =
+  | "none"
+  | "fast-forward"
+  | "fast-forward-dirty"
+  | "blocked-detached"
+  | "blocked-held-elsewhere"
+  | "blocked-diverged"
+  | "unknown";
+
+/** Everything the panel needs about ONE checkout. Mirrors the Rust `StaleDiagnosis` (camelCase). */
+export interface StaleDiagnosis {
+  /** Commits this checkout is behind `base`. */
+  behind: number;
+  /** What it is behind, e.g. `origin/main`. */
+  base: string;
+  /** The branch this checkout is actually on (empty when detached). */
+  headBranch: string;
+  /** The repository's default branch, named in the `blocked-detached` cause sentence. */
+  defaultBranch: string;
+  /** HEAD is not on a branch at all. */
+  detached: boolean;
+  /** This root is a linked worktree rather than the main checkout. */
+  linkedWorktree: boolean;
+  /** The worktree path holding `headBranch`, when another one does; empty otherwise. */
+  heldBy: string;
+  /** How many files have uncommitted changes. */
+  dirtyCount: number;
+  /** A sample of those paths — enough to recognise what is at risk, not the whole list. */
+  dirtySample: string[];
+  /** Whether a `--ff-only` merge would succeed on the tree as it stands. */
+  canFastForward: boolean;
+  /** Which control to draw. See {@link StaleRemedy}. */
+  remedy: StaleRemedy;
+  /**
+   * A COMPLETE SENTENCE explaining the situation, written by the backend.
+   *
+   * Rendered verbatim. Never re-derived, never templated over, never switched on — see the module
+   * header for why the only layer that can write a true sentence about a checkout is the one that
+   * inspected it.
+   */
+  cause: string;
+  /**
+   * May this be fixed with NO CLICK AT ALL?
+   *
+   * True only for the provably-lossless shape: clean tree, on the default branch, a strict ancestor
+   * of the base. The founder's ruling is that automation is allowed exactly where it cannot destroy
+   * anything and nowhere else — so this is a SEPARATE field from `remedy` rather than being inferred
+   * from it, because `fast-forward-dirty` is offerable-on-click and must never be auto-safe.
+   */
+  autoSafe: boolean;
+  /**
+   * The diagnosis could not be made. Fail-closed exactly like `RootStaleness.unknown`: this is never
+   * "nothing is wrong", it is "we could not look", and it draws no action.
+   */
+  unknown: boolean;
+}
+
+/** What came of trying a remedy. `reason` is the backend's own sentence — including git's refusal
+ *  text when git refused — and is shown verbatim beside the row that asked for it. */
+export interface RemedyOutcome {
+  ok: boolean;
+  /** Why it failed, or what it did. Rendered verbatim; never re-worded here. */
+  reason: string;
+  /** What was actually attempted, e.g. `merge --ff-only`. */
+  action: string;
+  beforeBehind: number;
+  afterBehind: number;
+}
+
+/** Diagnose one checkout. Rejects on an IPC failure; an undiagnosable tree is a SUCCESSFUL answer
+ *  with `unknown: true`, so callers distinguish "could not ask" from "asked, and don't know". */
+export function diagnoseStale(root: string): Promise<StaleDiagnosis> {
+  return invoke<StaleDiagnosis>("repo_stale_diagnose", { root });
+}
+
+/**
+ * One in-flight remedy per checkout, PROCESS-WIDE.
+ *
+ * There are two independent callers — the staleness poll's unattended `autoSafe` fast-forward and
+ * the panel's click — and neither can see the other's guard. Without this, pressing "Fast-forward"
+ * while the 60s poll is mid-flight on the same root runs two concurrent `git merge --ff-only` in
+ * one checkout: the second dies on `index.lock`, or lands "already current" as a red failure, and
+ * either way the user is shown a scary refusal for a remedy that actually worked (roborev 59437).
+ *
+ * A Map of the in-flight promise rather than a Set of roots, so the late caller AWAITS the winner's
+ * real outcome instead of being told nothing happened — the two callers want the same answer, and
+ * a silent skip would leave the panel's row spinning forever.
+ */
+const inFlight = new Map<string, Promise<RemedyOutcome>>();
+
+/** Apply whatever remedy the diagnosis named. Rejects on an IPC failure; a git refusal comes back as
+ *  a resolved `{ ok: false, reason }` so the panel can show git's own words rather than a toast.
+ *  Concurrent calls for the SAME root share one invocation — see `inFlight`. */
+export function remedyStale(root: string): Promise<RemedyOutcome> {
+  const running = inFlight.get(root);
+  if (running) return running;
+  const p = invoke<RemedyOutcome>("repo_stale_remedy", { root }).finally(() => {
+    // Cleared unconditionally, including on rejection — a root left in the map would be
+    // permanently unfixable for the rest of the session.
+    inFlight.delete(root);
+  });
+  inFlight.set(root, p);
+  return p;
+}
+
+/** Is unattended fast-forwarding turned on for this repo? Consulted ONLY on the `autoSafe` path —
+ *  the click-driven remedies are the user's deliberate act and are never gated by it. */
+export function autoFastForwardEnabled(root: string): Promise<boolean> {
+  return invoke<boolean>("repo_auto_fast_forward", { root });
+}

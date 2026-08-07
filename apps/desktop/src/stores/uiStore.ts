@@ -52,6 +52,7 @@ export type CategoryId =
   | "accounts"
   | "cloudauth"
   | "onepassword"
+  | "chief"
   | "mobile"
   | "voice"
   | "approvals"

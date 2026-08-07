@@ -46,10 +46,23 @@ vi.mock("../services/beads", async (importOriginal) => {
 
 // Mocked Chief sync so the store-glue tests don't touch Tauri/Chief.
 const syncProjectMarkdown = vi.fn();
-vi.mock("../services/chiefSync", () => ({
+vi.mock("../services/chiefSync", async (importOriginal) => ({
+  // The refusal error stays REAL: the store discriminates on `instanceof`, so a stubbed stand-in
+  // would make the claimed-library arm untestable (and, worse, silently unreachable in the app).
+  ...(await importOriginal<typeof import("../services/chiefSync")>()),
   syncProjectMarkdown: (...a: unknown[]) => syncProjectMarkdown(...a),
   MARKDOWN_DIRS: ["PRD", "docs/superpowers/specs"],
 }));
+
+// The link-liveness probe runChiefSync uses to tell a DELETED Chief project apart from an
+// unreachable endpoint. Keep the rest of chief.ts real so nothing else is stubbed out from under
+// the store. Default `null` = "could not tell", the fail-closed answer, so a case that does not
+// opt in cannot accidentally assert the project was deleted.
+const chiefProjectExists = vi.fn<(pat: string, id: string) => Promise<boolean | null>>();
+vi.mock("../services/chief", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/chief")>();
+  return { ...actual, chiefProjectExists: (...a: [string, string]) => chiefProjectExists(...a) };
+});
 
 async function freshStore() {
   vi.resetModules();
@@ -71,6 +84,8 @@ beforeEach(() => {
   agentBranchStatus.mockReset();
   agentWorkflowState.mockReset();
   syncProjectMarkdown.mockReset();
+  chiefProjectExists.mockReset();
+  chiefProjectExists.mockResolvedValue(null); // fail-closed default: "could not tell"
   (globalThis as unknown as { localStorage: Storage }).localStorage =
     new MemoryStorage() as unknown as Storage;
 });
@@ -662,6 +677,162 @@ describe("runChiefSync — store glue ()", () => {
     });
     // Confirm syncProjectMarkdown was called (so the run did execute).
     expect(syncProjectMarkdown).toHaveBeenCalledTimes(1);
+  });
+});
+
+// sparkle-ojgvp. Every one of these asserts an OBSERVABLE record, never merely that the sync
+// returned early — returning early is exactly what the old code already did, so an assertion on
+// `syncProjectMarkdown` not being called would pass unchanged against the code before this change
+// and prove nothing. The defect being fixed is that the six early returns were indistinguishable
+// from outside, so each case reads the REASON back out.
+describe("runChiefSync — the silent returns are now distinguishable (sparkle-ojgvp)", () => {
+  // Read through the store's own reader, from the same post-reset module graph the code under test
+  // writes to. `chiefSyncFor` falls back to the zero-state, so an unrecorded project reads as
+  // phase "unknown" / reason null — which still fails every assertion below rather than throwing.
+  const syncRec = async (projectId: string) => {
+    const mod = await import("./chiefSyncStore");
+    return mod.chiefSyncFor(mod.useChiefSyncStore.getState(), projectId);
+  };
+
+  it("records no_pat when there is no Chief key", async () => {
+    const { runtime, settings, projectId, agentId } = await setup("build");
+    settings.useSettingsStore.setState({ chiefPat: "" });
+    await runtime.runChiefSync(projectId, agentId);
+    const rec = await syncRec(projectId);
+    expect(rec.phase).toBe("blocked");
+    expect(rec.reason).toBe("no_pat");
+  });
+
+  it("records no_worktree when only shell agents exist", async () => {
+    const { runtime, projectId, agentId } = await setup("shell");
+    await runtime.runChiefSync(projectId, agentId);
+    const rec = await syncRec(projectId);
+    expect(rec.phase).toBe("blocked");
+    expect(rec.reason).toBe("no_worktree");
+  });
+
+  it("records a success WITH what it wrote and which Chief project it wrote to", async () => {
+    const { runtime, projectId, agentId } = await setup("build");
+    syncProjectMarkdown.mockResolvedValue({
+      chiefProjectId: "project_created",
+      docState: {},
+      uploaded: ["PRD/a.md", "PRD/b.md"],
+      deletedAssetIds: ["asset_old"],
+    });
+    await runtime.runChiefSync(projectId, agentId);
+    const rec = await syncRec(projectId);
+    expect(rec.phase).toBe("ok");
+    expect(rec.reason).toBeNull();
+    expect(rec.lastUploaded).toBe(2);
+    expect(rec.lastDeleted).toBe(1);
+    expect(rec.chiefProjectId).toBe("project_created");
+    expect(rec.lastSuccessAt).toBeGreaterThan(0);
+  });
+
+  it("records unreachable — not project_gone — when the liveness probe cannot tell", async () => {
+    // The fail-closed arm. A down endpoint cannot answer whether a project exists, and reading its
+    // silence as "deleted" would strand the project in a state only a human can clear.
+    const { runtime, settings, projectId, agentId } = await setup("build");
+    runtime.__resetChiefSyncBackoff();
+    settings.useSettingsStore.setState({ chiefProjectByProject: { [projectId]: "project_known" } });
+    chiefProjectExists.mockResolvedValue(null);
+    syncProjectMarkdown.mockRejectedValue(new TypeError("Load failed"));
+
+    await runtime.runChiefSync(projectId, agentId);
+
+    const rec = await syncRec(projectId);
+    expect(rec.reason).toBe("unreachable");
+    expect(rec.consecutiveFailures).toBe(1);
+  });
+
+  it("records project_gone when the linked Chief project has been deleted", async () => {
+    const { runtime, settings, projectId, agentId } = await setup("build");
+    runtime.__resetChiefSyncBackoff();
+    settings.useSettingsStore.setState({ chiefProjectByProject: { [projectId]: "project_deleted" } });
+    chiefProjectExists.mockResolvedValue(false); // the listing SUCCEEDED and the id was absent
+    syncProjectMarkdown.mockRejectedValue(new Error("404 not found"));
+
+    await runtime.runChiefSync(projectId, agentId);
+
+    const rec = await syncRec(projectId);
+    expect(rec.phase).toBe("blocked");
+    expect(rec.reason).toBe("project_gone");
+    expect(chiefProjectExists).toHaveBeenCalledWith("pat_x", "project_deleted");
+  });
+
+  it("does not probe the link when no Chief project is linked yet", async () => {
+    // Nothing to be 'gone' — asking would be a wasted request on every failure of a fresh project.
+    const { runtime, projectId, agentId } = await setup("build");
+    runtime.__resetChiefSyncBackoff();
+    syncProjectMarkdown.mockRejectedValue(new TypeError("Load failed"));
+    await runtime.runChiefSync(projectId, agentId);
+    expect(chiefProjectExists).not.toHaveBeenCalled();
+    expect((await syncRec(projectId)).reason).toBe("unreachable");
+  });
+
+  it("a later success clears project_gone — a re-link that restores the id heals by itself", async () => {
+    const { runtime, settings, projectId, agentId } = await setup("build");
+    runtime.__resetChiefSyncBackoff();
+    settings.useSettingsStore.setState({ chiefProjectByProject: { [projectId]: "project_deleted" } });
+    chiefProjectExists.mockResolvedValue(false);
+    syncProjectMarkdown.mockRejectedValue(new Error("404 not found"));
+    await runtime.runChiefSync(projectId, agentId);
+    expect((await syncRec(projectId)).reason).toBe("project_gone");
+
+    runtime.__resetChiefSyncBackoff(); // stand in for the hourly re-probe elapsing
+    syncProjectMarkdown.mockResolvedValue({
+      chiefProjectId: "project_relinked",
+      docState: {},
+      uploaded: ["PRD/a.md"],
+      deletedAssetIds: [],
+    });
+    await runtime.runChiefSync(projectId, agentId);
+
+    const rec = await syncRec(projectId);
+    expect(rec.phase).toBe("ok");
+    expect(rec.reason).toBeNull();
+    expect(rec.chiefProjectId).toBe("project_relinked");
+  });
+
+  // The picker refuses to CREATE a shared library, but that only guards the deliberate path.
+  // `ensureChiefProject` name-matches whenever nothing is linked, so the sync can land on another
+  // project's library with no user action — which is where the actual data loss would happen.
+  it("hands the sync every OTHER project's library, and not its own", async () => {
+    const { runtime, settings, projects, projectId, agentId } = await setup("build");
+    const other = projects.useProjectStore.getState().addProject("other", "/root/other");
+    settings.useSettingsStore.setState({
+      chiefProjectByProject: { [projectId]: "project_mine", [other]: "project_theirs" },
+    });
+    syncProjectMarkdown.mockResolvedValue({
+      chiefProjectId: "project_mine",
+      docState: {},
+      uploaded: [],
+      deletedAssetIds: [],
+    });
+
+    await runtime.runChiefSync(projectId, agentId);
+
+    const passed = syncProjectMarkdown.mock.calls[0]![0] as { claimedChiefProjectIds: string[] };
+    // Including its own id would make every healthy project refuse to sync at all.
+    expect(passed.claimedChiefProjectIds).toEqual(["project_theirs"]);
+  });
+
+  it("records library_claimed — a REFUSAL, with no liveness probe and no failure count", async () => {
+    const { runtime, settings, projectId, agentId } = await setup("build");
+    runtime.__resetChiefSyncBackoff();
+    const { ChiefLibraryClaimedError } = await import("../services/chiefSync");
+    settings.useSettingsStore.setState({ chiefProjectByProject: { other: "project_shared" } });
+    syncProjectMarkdown.mockRejectedValue(new ChiefLibraryClaimedError("project_shared"));
+
+    await runtime.runChiefSync(projectId, agentId);
+
+    const rec = await syncRec(projectId);
+    expect(rec.phase).toBe("blocked");
+    expect(rec.reason).toBe("library_claimed");
+    // Nothing about a claimed library is an outage: probing liveness would be a wasted request,
+    // and counting it as a failure would escalate a backoff over a state only a human can change.
+    expect(chiefProjectExists).not.toHaveBeenCalled();
+    expect(rec.consecutiveFailures).toBe(0);
   });
 });
 

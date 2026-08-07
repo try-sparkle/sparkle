@@ -22,7 +22,9 @@ import {
   isBeadsUnavailable,
   AUTO_LABEL,
 } from "../services/beads";
-import { syncProjectMarkdown } from "../services/chiefSync";
+import { syncProjectMarkdown, ChiefLibraryClaimedError } from "../services/chiefSync";
+import { chiefProjectExists } from "../services/chief";
+import { useChiefSyncStore } from "./chiefSyncStore";
 import { useSettingsStore, effectiveChiefPat } from "./settingsStore";
 import { useProjectStore } from "./projectStore";
 import { useInteractionStore } from "./interactionStore";
@@ -59,6 +61,21 @@ const syncBackoff = new Map<string, { until: number; fails: number }>();
 // signal, just not once per flap).
 const SYNC_FAIL_RELOG_QUIET_MS = 60 * 60_000;
 const syncFailLoggedAt = new Map<string, number>();
+
+/**
+ * Let ONE project retry immediately, discarding its cooldown.
+ *
+ * For the re-link path (sparkle-ojgvp): a `project_gone` failure parks the project at the hourly
+ * re-probe deliberately, because nothing about a deleted library is transient. Re-linking makes it
+ * transient after all — the user just supplied the missing fact — so the cooldown that was correct
+ * a moment ago is now the only thing standing between them and a working sync.
+ *
+ * Deliberately NOT `syncFailLoggedAt`: that window bounds LOG NOISE across flaps and is not cleared
+ * by success either (). Clearing it here would let a re-link re-open the log flood.
+ */
+export function clearChiefSyncBackoff(projectId: string): void {
+  syncBackoff.delete(projectId);
+}
 
 /** Test-only: clear the Chief-sync backoff state between cases. */
 export function __resetChiefSyncBackoff(): void {
@@ -161,9 +178,15 @@ export function scheduleChiefSync(projectId: string, agentId: string): void {
  *  a Chief/git hiccup must not break the UI, and an un-persisted ledger simply retries next run. */
 export async function runChiefSync(projectId: string, agentId: string): Promise<void> {
   const settings = useSettingsStore.getState();
+  const sync = useChiefSyncStore.getState();
   const pat = effectiveChiefPat(settings.keychainChiefPat, settings.chiefPat, settings.runtimeChiefPat);
-  if (!pat) return;
+  if (!pat) {
+    sync.noteBlocked(projectId, "no_pat");
+    return;
+  }
   const project = useProjectStore.getState().projects.find((p) => p.id === projectId);
+  // Deliberately UNRECORDED: there is no project to render a status against, so a record here would
+  // be unreachable state keyed by an id the UI has already forgotten.
   if (!project) return;
   // Read markdown from a real worktree — prefer the triggering agent, else any workflow agent.
   // shell agents have no worktree (mirrors the predicate in refreshWorkflowStage).
@@ -173,11 +196,19 @@ export async function runChiefSync(projectId: string, agentId: string): Promise<
     triggering && hasWorktree(triggering.kind)
       ? triggering
       : project.agents.find((a) => hasWorktree(a.kind));
-  if (!syncAgent) return;
+  if (!syncAgent) {
+    sync.noteBlocked(projectId, "no_worktree");
+    return;
+  }
+  // The next two returns are NORMAL operation, not states to report: a run already in flight, and
+  // the cooldown between retries. Both leave the existing record alone — overwriting it here would
+  // replace the reason the user needs ("Chief could not be reached") with a restatement of our own
+  // retry mechanics, which is the thing they cannot act on.
   if (syncingProjects.has(projectId)) return;
   const backoff = syncBackoff.get(projectId);
   if (backoff && Date.now() < backoff.until) return; // cooling down after a recent failure
   syncingProjects.add(projectId);
+  sync.noteStart(projectId);
   try {
     const chiefProjectId = settings.chiefProjectByProject[projectId];
     const res = await syncProjectMarkdown({
@@ -187,9 +218,28 @@ export async function runChiefSync(projectId: string, agentId: string): Promise<
       agentId: syncAgent.id,
       chiefProjectId,
       docState: chiefProjectId ? (settings.chiefDocStateByProject[chiefProjectId] ?? {}) : {},
+      // The picker refuses to CREATE this sharing, but that only covers the deliberate path.
+      // `ensureChiefProject` name-matches whenever nothing is linked, so an unlinked project can
+      // land on a library another Sparkle project owns with no user action at all — and older
+      // persisted state can already hold the sharing. Handing the claimed set down lets the sync
+      // abort before its current-state sweep deletes the other project's documents.
+      claimedChiefProjectIds: Object.entries(settings.chiefProjectByProject)
+        .filter(([sparkleId]) => sparkleId !== projectId)
+        .map(([, chiefId]) => chiefId),
     });
     syncBackoff.delete(projectId); // round-trip succeeded → endpoint healthy, reset backoff
-    if (!res) return;
+    if (!res) {
+      // syncProjectMarkdown returns null ONLY for an empty PAT, which the guard above already
+      // excluded — so this is unreachable today and recorded as the same cause rather than as a
+      // fourth mystery silence if that ever changes.
+      sync.noteBlocked(projectId, "no_pat");
+      return;
+    }
+    sync.noteSuccess(projectId, {
+      chiefProjectId: res.chiefProjectId || chiefProjectId || null,
+      uploaded: res.uploaded.length,
+      deleted: res.deletedAssetIds.length,
+    });
     if (res.chiefProjectId && res.chiefProjectId !== chiefProjectId) {
       settings.setChiefProject(projectId, res.chiefProjectId);
     }
@@ -199,6 +249,34 @@ export async function runChiefSync(projectId: string, agentId: string): Promise<
       settings.setChiefProjectDocState(res.chiefProjectId, res.docState);
     }
   } catch (e) {
+    // A REFUSAL, not a failure: nothing was written, the endpoint is fine, and the liveness probe
+    // below would be a wasted request. Parked at the quiet hourly re-probe like `project_gone` —
+    // only a human re-pointing one of the two projects can change the answer, and a re-link clears
+    // this cooldown explicitly (clearChiefSyncBackoff).
+    if (e instanceof ChiefLibraryClaimedError) {
+      sync.noteBlocked(projectId, "library_claimed", e.message);
+      syncBackoff.set(projectId, { until: Date.now() + SYNC_GIVEUP_COOLDOWN_MS, fails: SYNC_GIVE_UP_FAILS });
+      return;
+    }
+    // Tell a DELETED project apart from an UNREACHABLE endpoint before recording a reason. Both
+    // present here as the same thrown error, and they need opposite responses from the user: one
+    // resolves itself, the other never will. We only ask when a link actually exists, and only on
+    // the failure path — which the backoff already rate-limits — so the healthy path pays nothing.
+    //
+    // `chiefProjectExists` is three-valued and `null` (could not tell) must fall through to
+    // `unreachable`: an endpoint that is down cannot answer whether a project exists, and reading
+    // its silence as "deleted" would strand the project in a state only a human can clear.
+    const linkedId = settings.chiefProjectByProject[projectId];
+    const stillThere = linkedId ? await chiefProjectExists(pat, linkedId) : null;
+    if (stillThere === false) {
+      sync.noteBlocked(projectId, "project_gone", String(e));
+      // Nothing about this is transient, so skip the escalating retry entirely and sit at the quiet
+      // hourly re-probe. That both stops the pointless hammering and lets the project heal by itself
+      // if the id comes back (a restore, or a re-link that reuses it).
+      syncBackoff.set(projectId, { until: Date.now() + SYNC_GIVEUP_COOLDOWN_MS, fails: SYNC_GIVE_UP_FAILS });
+      return;
+    }
+    sync.noteBlocked(projectId, "unreachable", String(e));
     // Back off so we don't retry a dead endpoint every run; the un-persisted ledger is reattempted
     // once the cooldown elapses. After SYNC_GIVE_UP_FAILS in a row, give up the tight loop and drop
     // to a quiet hourly re-probe ().

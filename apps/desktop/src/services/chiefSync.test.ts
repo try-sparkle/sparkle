@@ -15,7 +15,12 @@ vi.mock("./chief", async (importOriginal) => ({
   listAllAssets: (...a: unknown[]) => listAllAssets(...a),
 }));
 
-import { syncProjectMarkdown, hashContent, MARKDOWN_DIRS } from "./chiefSync";
+import {
+  syncProjectMarkdown,
+  hashContent,
+  MARKDOWN_DIRS,
+  ChiefLibraryClaimedError,
+} from "./chiefSync";
 
 describe("syncProjectMarkdown — current-state, content-hash, delete-and-replace", () => {
   beforeEach(() => {
@@ -240,5 +245,62 @@ describe("syncProjectMarkdown — current-state, content-hash, delete-and-replac
 
     expect(res?.deletedAssetIds).toEqual([]);
     expect(res?.docState["PRD/a.md"]).toEqual({ hash: hashContent("keep"), assetId: "asset_a" });
+  });
+
+  // Sharing one library is MUTUALLY DESTRUCTIVE, not merely redundant: the vanished-path sweep
+  // treats the ledger as the complete desired state for the one worktree it just read, so each
+  // project would delete the other's documents every round. The settings picker refuses to create
+  // the sharing, but `ensureChiefProject` name-matches with no user action at all — so the refusal
+  // has to exist HERE too, and it has to land before the first write.
+  describe("a library another Sparkle project already owns", () => {
+    it("aborts before writing anything when the link name-matches onto a claimed library", async () => {
+      invoke.mockResolvedValue({ headSha: "h", files: [{ path: "PRD/a.md", content: "# v1" }] });
+      ensureChiefProject.mockResolvedValue("project_theirs"); // matched by NAME — nothing was linked
+
+      await expect(
+        syncProjectMarkdown({
+          ...pbase,
+          chiefProjectId: undefined,
+          docState: {},
+          claimedChiefProjectIds: ["project_theirs"],
+        }),
+      ).rejects.toThrow(ChiefLibraryClaimedError);
+
+      // The assertion that matters: not that it threw, but that the other project's library is
+      // untouched. An abort after the sweep would be no better than no guard at all.
+      expect(uploadAsset).not.toHaveBeenCalled();
+      expect(deleteAsset).not.toHaveBeenCalled();
+    });
+
+    it("refuses a STORED link that is shared too — old state predates the picker's guard", async () => {
+      invoke.mockResolvedValue({ headSha: "h", files: [{ path: "PRD/a.md", content: "# v1" }] });
+      ensureChiefProject.mockResolvedValue("project_shared");
+
+      await expect(
+        syncProjectMarkdown({
+          ...pbase,
+          chiefProjectId: "project_shared",
+          // A ledger the other project also writes — exactly the state the sweep would act on.
+          docState: { "PRD/gone.md": { hash: "h", assetId: "asset_theirs" } },
+          claimedChiefProjectIds: ["project_shared"],
+        }),
+      ).rejects.toThrow(ChiefLibraryClaimedError);
+
+      expect(deleteAsset).not.toHaveBeenCalled();
+    });
+
+    it("syncs normally when the claimed set holds only OTHER libraries", async () => {
+      invoke.mockResolvedValue({ headSha: "h", files: [{ path: "PRD/a.md", content: "# v1" }] });
+      ensureChiefProject.mockResolvedValue("project_known");
+      uploadAsset.mockResolvedValue({ assetId: "asset_1", alreadyExists: false });
+
+      const res = await syncProjectMarkdown({
+        ...pbase,
+        docState: {},
+        claimedChiefProjectIds: ["project_elsewhere"],
+      });
+
+      expect(res?.uploaded).toEqual(["PRD/a.md"]);
+    });
   });
 });

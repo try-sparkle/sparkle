@@ -3525,12 +3525,35 @@ pub async fn stop_dictation(app: AppHandle, state: State<'_, DictationState>) ->
         // anything to do; the rest must NOT advance the epoch again, or one mute invalidates
         // in-flight starts N times over — the amplifier behind the 2026-07-26 lockout.
         let start_could_still_arm = sess.start_in_flight == Some(sess.stop_epoch);
-        if stop_is_noop(
+        let noop = stop_is_noop(
             sess.armed,
             sess.capture.is_some(),
             sess.transcriber.is_some(),
             start_could_still_arm,
-        ) {
+        );
+        // LOG EVERY ARRIVAL, INCLUDING THE NO-OPS — the count is the diagnostic (sparkle-lc55u).
+        //
+        // Only the first arrival does work, and the rest return silently, so the log shows ONE
+        // "capture dropped" line whether the mute came from one window or six. That hides the single
+        // fact that separates the live hypotheses for "a stop lands ~200ms after every arm and
+        // discards the freshly-built capture": a multi-window `[enabled]` broadcast arrives as a
+        // CLUSTER within milliseconds, a push-to-talk release arrives ONCE at hold-duration, and a
+        // focus/blur edge arrives once but uncorrelated with any key. Same teardown line for all
+        // three today, which is why the cause could not be named from the log.
+        //
+        // INFO rather than DEBUG on purpose: it fires per user mute, not per frame, and the reports
+        // this exists to diagnose arrive as "the mic did nothing" hours later — from a user running
+        // a release build, where a DEBUG line would not have been recorded.
+        tracing::info!(
+            target: "dictation",
+            noop,
+            armed = sess.armed,
+            has_capture = sess.capture.is_some(),
+            has_transcriber = sess.transcriber.is_some(),
+            start_could_still_arm,
+            "stop_dictation arrived",
+        );
+        if noop {
             return Ok(());
         }
         sess.armed = false;             // disarm so a later focus event can't resurrect the mic

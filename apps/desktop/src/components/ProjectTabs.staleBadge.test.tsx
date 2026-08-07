@@ -12,19 +12,60 @@
 // The fail-closed property is the one worth stating twice: a project we could not MEASURE and a
 // project that is FRESH are both simply absent from `stalenessByProject`. There is no third
 // rendering, so an `unknown` reading from `repo_freshness` can never surface as a reassuring badge.
-import { afterEach, describe, expect, it } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { StatusBand } from "../engine/buildSections";
+import type { StaleDiagnosis } from "../services/staleness";
+
+const diagnoseStale = vi.fn<(root: string) => Promise<StaleDiagnosis>>();
+const remedyStale = vi.fn();
+
+// The badge's panel diagnoses on open, so the service is stubbed here — this file is about the
+// BADGE (its tooltip, its click, its keyboard), not about what the panel does with the answer.
+vi.mock("../services/staleness", () => ({
+  diagnoseStale: (root: string) => diagnoseStale(root),
+  remedyStale: (root: string) => remedyStale(root),
+  autoFastForwardEnabled: () => Promise.resolve(false),
+}));
+
 import { ProjectTabs, staleTitle, type ProjectTabStaleness } from "./ProjectTabs";
 
 function counts(over: Partial<Record<StatusBand, number>> = {}): Record<StatusBand, number> {
   return { needs_you: 0, questions: 0, running: 0, done: 0, ...over };
 }
 
+// `rootPath` is what the badge's panel diagnoses. A project without one renders NO badge — see the
+// dedicated test below — so every fixture that expects a badge has to carry it.
 const projects = [
-  { id: "sparkle", name: "sparkle" },
-  { id: "website", name: "drodio-website" },
+  { id: "sparkle", name: "sparkle", rootPath: "/repos/sparkle" },
+  { id: "website", name: "drodio-website", rootPath: "/repos/website" },
 ];
+
+function diag(over: Partial<StaleDiagnosis> = {}): StaleDiagnosis {
+  return {
+    behind: 1696,
+    base: "origin/main",
+    headBranch: "main",
+    defaultBranch: "main",
+    detached: false,
+    linkedWorktree: false,
+    heldBy: "",
+    dirtyCount: 0,
+    dirtySample: [],
+    canFastForward: true,
+    remedy: "fast-forward",
+    cause: "This checkout is clean and on main, so it can be fast-forwarded.",
+    autoSafe: true,
+    unknown: false,
+    ...over,
+  };
+}
+
+beforeEach(() => {
+  diagnoseStale.mockReset();
+  diagnoseStale.mockResolvedValue(diag());
+  remedyStale.mockReset();
+});
 
 afterEach(() => {
   cleanup();
@@ -34,14 +75,16 @@ afterEach(() => {
 function renderTabs(
   staleness?: Record<string, ProjectTabStaleness>,
   selected: string | null = "sparkle",
+  onSelect: (id: string) => void = () => {},
+  items: { id: string; name: string; rootPath?: string }[] = projects,
 ) {
   return render(
     <ProjectTabs
-      projects={projects}
+      projects={items}
       selectedProjectId={selected}
       pinnedProjectId={null}
       countsByProject={{ sparkle: counts(), website: counts() }}
-      onSelect={() => {}}
+      onSelect={onSelect}
       onTogglePin={() => {}}
       stalenessByProject={staleness}
     />,
@@ -60,17 +103,16 @@ describe("project tab staleness badge", () => {
   });
 
   // The whole point of the badge is the sentence, not the number: "1,696" alone does not tell you
-  // what it is behind or what to do instead. Both the tooltip and the accessible name carry it.
-  it("names the base and says what to do instead", () => {
+  // what it is behind or what to do instead. The accessible name carries it unconditionally; the
+  // VISIBLE half is the hover card asserted in its own describe block below.
+  it("names the base and says what to do instead in its accessible name", () => {
     renderTabs({ sparkle: STALE });
     const badge = screen.getByTestId("stale-sparkle");
-    const title = badge.getAttribute("title") ?? "";
-    expect(title).toBe(staleTitle("sparkle", STALE));
-    expect(title).toContain("origin/main");
-    expect(title).toContain("STALE");
-    expect(title).toMatch(/read from origin\/main instead/i);
-    // Spoken name matches the tooltip, so the badge is not silent to a screen reader.
-    expect(badge.getAttribute("aria-label")).toBe(title);
+    const label = badge.getAttribute("aria-label") ?? "";
+    expect(label).toBe(staleTitle("sparkle", STALE));
+    expect(label).toContain("origin/main");
+    expect(label).toContain("STALE");
+    expect(label).toMatch(/read from origin\/main instead/i);
   });
 
   // FAIL-CLOSED. Absence must render nothing at all — never a "0 behind"/"fresh" affordance. A
@@ -105,8 +147,15 @@ describe("project tab staleness badge", () => {
     const web = screen.getByTestId("stale-website");
     expect(web.textContent).toContain("7");
     // The base is per-project, not hardcoded to origin/main.
-    expect(web.getAttribute("title")).toContain("origin/trunk");
-    expect(web.getAttribute("title")).toContain("drodio-website");
+    expect(web.getAttribute("aria-label")).toContain("origin/trunk");
+    expect(web.getAttribute("aria-label")).toContain("drodio-website");
+  });
+
+  // A badge with no directory behind it would be a button that can only ever fail, so it is not
+  // rendered at all — the same fail-closed reading `stalenessByProject` itself follows.
+  it("renders no badge for a project with no rootPath", () => {
+    renderTabs({ sparkle: STALE }, "sparkle", () => {}, [{ id: "sparkle", name: "sparkle" }]);
+    expect(screen.queryByTestId("stale-sparkle")).toBeNull();
   });
 
   // No emoji-as-icon anywhere in this repo — the warning mark is a react-icons SVG.
@@ -115,6 +164,155 @@ describe("project tab staleness badge", () => {
     const badge = screen.getByTestId("stale-sparkle");
     expect(badge.querySelector("svg")).toBeTruthy();
     expect(badge.textContent ?? "").not.toMatch(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u);
+  });
+});
+
+// ── THE HOVER EXPLANATION IS A RENDERED ELEMENT, NOT A `title` (bead sparkle-7h01z) ─────────────
+//
+// This is the test that must go RED if anyone puts `title={label}` back. It deliberately does NOT
+// import `disableNativeTooltips` — mocking or invoking the kill-switch would make the assertion
+// about the switch rather than about the badge. It asserts the thing that SURVIVES the switch: an
+// element in the document carrying the sentence. A `title` attribute produces no such element, so a
+// revert cannot pass this however the attribute is spelled.
+describe("the stale badge's hover explanation", () => {
+  it("renders no explanation element until the badge is hovered", () => {
+    renderTabs({ sparkle: STALE });
+    expect(screen.queryByTestId("stale-tip-sparkle")).toBeNull();
+    expect(screen.queryByRole("tooltip")).toBeNull();
+  });
+
+  it("renders a VISIBLE element carrying the whole sentence on hover", () => {
+    renderTabs({ sparkle: STALE });
+    fireEvent.mouseEnter(screen.getByTestId("stale-sparkle"));
+
+    const tip = screen.getByRole("tooltip");
+    expect(tip.textContent).toBe(staleTitle("sparkle", STALE));
+    expect(tip.getAttribute("data-testid")).toBe("stale-tip-sparkle");
+    // A native `title` would show nothing at all here — `disableNativeTooltips()` strips it on the
+    // very `mouseover` that would have shown it, and it never replaces one on a named element.
+    expect(screen.getByTestId("stale-sparkle").hasAttribute("title")).toBe(false);
+  });
+
+  it("takes the explanation away again when the pointer leaves", () => {
+    renderTabs({ sparkle: STALE });
+    const badge = screen.getByTestId("stale-sparkle");
+    fireEvent.mouseEnter(badge);
+    expect(screen.queryByRole("tooltip")).toBeTruthy();
+    fireEvent.mouseLeave(badge);
+    expect(screen.queryByRole("tooltip")).toBeNull();
+  });
+
+  // The card is the ONLY place the sentence is visible, so reaching the badge by Tab has to show it.
+  it("shows the explanation on keyboard focus too", () => {
+    renderTabs({ sparkle: STALE });
+    fireEvent.focus(screen.getByTestId("stale-sparkle"));
+    expect(screen.getByRole("tooltip").textContent).toBe(staleTitle("sparkle", STALE));
+  });
+});
+
+describe("the stale badge opens the remedy panel", () => {
+  it("is a real button, not a decorative image", () => {
+    renderTabs({ sparkle: STALE });
+    const badge = screen.getByTestId("stale-sparkle");
+    expect(badge.tagName).toBe("BUTTON");
+    // `onTabPointerDown` bails on `e.target.closest("button")`, so being a button is also what stops
+    // a press on the badge dragging the tab out from under it.
+    expect(badge.closest("button")).toBe(badge);
+  });
+
+  // ── THE SIDE EFFECT THAT WOULD REGRESS ────────────────────────────────────────────────────────
+  // The badge sits inside the tab's own onClick. Before this change, clicking it selected the
+  // project and did nothing else — so asserting only that the panel opened would pass against a
+  // badge that ALSO switches projects under the user. The absence of the onSelect call is the half
+  // that pins the fix.
+  it("opens the panel and does NOT select the tab", async () => {
+    const onSelect = vi.fn();
+    renderTabs({ sparkle: STALE }, "website", onSelect);
+
+    fireEvent.click(screen.getByTestId("stale-sparkle"));
+
+    expect(await screen.findByTestId("stale-panel")).toBeTruthy();
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it("opens the panel from the keyboard without selecting the tab", async () => {
+    const onSelect = vi.fn();
+    renderTabs({ sparkle: STALE }, "website", onSelect);
+
+    // A <button> turns Enter into a click; the badge stops that click reaching the tab.
+    const badge = screen.getByTestId("stale-sparkle");
+    fireEvent.keyDown(badge, { key: "Enter" });
+    fireEvent.click(badge);
+
+    expect(await screen.findByTestId("stale-panel")).toBeTruthy();
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it("diagnoses the clicked project's own root", async () => {
+    renderTabs({ sparkle: STALE });
+    fireEvent.click(screen.getByTestId("stale-sparkle"));
+    await waitFor(() => expect(diagnoseStale).toHaveBeenCalledWith("/repos/sparkle"));
+  });
+
+  // Every OTHER stale project gets a row too — that is the founder's ask, and it is why the panel
+  // lives at the strip rather than inside the badge.
+  it("lists every other stale project alongside the clicked one", async () => {
+    renderTabs({ sparkle: STALE, website: { behind: 7, base: "origin/trunk" } });
+    fireEvent.click(screen.getByTestId("stale-sparkle"));
+
+    await screen.findByTestId("stale-row-sparkle");
+    expect(await screen.findByTestId("stale-row-website")).toBeTruthy();
+    await waitFor(() => expect(diagnoseStale).toHaveBeenCalledWith("/repos/website"));
+  });
+
+  // OpenPrMenu has no Escape handler; this panel's buttons move a git checkout, so it gets one —
+  // and focus has to come BACK, because the panel is portaled away from the strip and a keyboard
+  // user who escapes to nowhere has lost their place entirely.
+  it("closes on Escape and returns focus to the badge", async () => {
+    renderTabs({ sparkle: STALE });
+    const badge = screen.getByTestId("stale-sparkle");
+    badge.focus();
+    fireEvent.click(badge);
+    await screen.findByTestId("stale-panel");
+
+    fireEvent.keyDown(window, { key: "Escape" });
+
+    await waitFor(() => expect(screen.queryByTestId("stale-panel")).toBeNull());
+    expect(document.activeElement).toBe(badge);
+  });
+
+  // THE ROW LIST IS FROZEN AT OPEN, and this is the case that decides it.
+  //
+  // `stalenessByProject` omits THREE different things — unknown, not-stale, and a read that FAILED
+  // (the poll swallows a failed `repo_root_staleness` on purpose, since it runs on a timer). So an
+  // entry disappearing does NOT mean "the remedy landed". An earlier version closed the panel on
+  // that absence, which meant a transient index.lock on the 60s poll destroyed a refusal the user
+  // was still reading (roborev 59454). The panel must survive it and keep its rows.
+  it("keeps its rows when the project's staleness entry disappears mid-read", async () => {
+    const { rerender } = renderTabs({ sparkle: STALE });
+    fireEvent.click(screen.getByTestId("stale-sparkle"));
+    await screen.findByTestId("stale-panel");
+    await screen.findByTestId("stale-row-sparkle");
+
+    // Could be a landed remedy — or could be a failed git read. Indistinguishable from here, which
+    // is exactly why the panel must not act on it.
+    rerender(
+      <ProjectTabs
+        projects={projects}
+        selectedProjectId="sparkle"
+        pinnedProjectId={null}
+        countsByProject={{ sparkle: counts(), website: counts() }}
+        onSelect={() => {}}
+        onTogglePin={() => {}}
+        stalenessByProject={{}}
+      />,
+    );
+
+    // The badge goes (it is driven by the live map) — but the panel and its row stay, so whatever
+    // the user was reading is still on screen.
+    await waitFor(() => expect(screen.queryByTestId("stale-sparkle")).toBeNull());
+    expect(screen.getByTestId("stale-panel")).toBeTruthy();
+    expect(screen.getByTestId("stale-row-sparkle")).toBeTruthy();
   });
 });
 

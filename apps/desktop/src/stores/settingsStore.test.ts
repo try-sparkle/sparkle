@@ -1008,3 +1008,152 @@ describe("1Password setters", () => {
     expect(useSettingsStore.getState().onepasswordSeedWorktrees).toBe(true);
   });
 });
+
+// sparkle-ojgvp. Until this, `setChiefProject` had exactly one caller — inside runChiefSync — so a
+// link could never be re-pointed from anywhere in the app. Each case asserts the LEDGER's fate as
+// well as the link's, because carrying a ledger across a re-link is the failure these actions
+// exist to prevent: it is keyed by CHIEF project id and holds asset ids from the OLD library.
+describe("relink / unlink a project's Chief library (sparkle-ojgvp)", () => {
+  const seed = (links: Record<string, string>, ledgers: Record<string, unknown>) =>
+    useSettingsStore.setState({
+      chiefProjectByProject: links,
+      chiefDocStateByProject: ledgers as Record<string, Record<string, never>>,
+    });
+  const s = () => useSettingsStore.getState();
+
+  beforeEach(() => seed({}, {}));
+
+  it("re-points the link and DROPS the outgoing ledger", () => {
+    seed(
+      { "sparkle-proj": "chief_old" },
+      { chief_old: { "PRD/a.md": { hash: "h", assetId: "asset_in_old_library" } } },
+    );
+
+    s().relinkChiefProject("sparkle-proj", "chief_new");
+
+    expect(s().chiefProjectByProject["sparkle-proj"]).toBe("chief_new");
+    // Holding asset ids from the old library would make the next run skip uploads whose hash
+    // "matches" an asset the new project does not contain, and delete ids that are not there.
+    expect(s().chiefDocStateByProject["chief_old"]).toBeUndefined();
+  });
+
+  it("leaves OTHER projects' ledgers alone", () => {
+    seed(
+      { a: "chief_a", b: "chief_b" },
+      { chief_a: { "PRD/a.md": { hash: "h", assetId: "x" } }, chief_b: { "PRD/b.md": { hash: "h", assetId: "y" } } },
+    );
+
+    s().relinkChiefProject("a", "chief_new");
+
+    expect(s().chiefDocStateByProject["chief_b"]).toEqual({ "PRD/b.md": { hash: "h", assetId: "y" } });
+    expect(s().chiefProjectByProject["b"]).toBe("chief_b");
+  });
+
+  it("is a no-op when the target is already the current link", () => {
+    const ledger = { "PRD/a.md": { hash: "h", assetId: "x" } };
+    seed({ a: "chief_a" }, { chief_a: ledger });
+
+    s().relinkChiefProject("a", "chief_a");
+
+    // A stray click must not throw away a healthy ledger and force a full re-reconcile.
+    expect(s().chiefDocStateByProject["chief_a"]).toEqual(ledger);
+  });
+
+  it("re-links a project that had no link yet, without disturbing any ledger", () => {
+    seed({}, { chief_other: { "PRD/x.md": { hash: "h", assetId: "z" } } });
+
+    s().relinkChiefProject("fresh", "chief_new");
+
+    expect(s().chiefProjectByProject["fresh"]).toBe("chief_new");
+    expect(s().chiefDocStateByProject["chief_other"]).toBeDefined();
+  });
+
+  it("unlink forgets both the link and its ledger", () => {
+    seed({ a: "chief_a" }, { chief_a: { "PRD/a.md": { hash: "h", assetId: "x" } } });
+
+    s().unlinkChiefProject("a");
+
+    expect(s().chiefProjectByProject["a"]).toBeUndefined();
+    expect(s().chiefDocStateByProject["chief_a"]).toBeUndefined();
+  });
+
+  it("unlink is a no-op for a project that was never linked", () => {
+    seed({ b: "chief_b" }, { chief_b: { "PRD/b.md": { hash: "h", assetId: "y" } } });
+
+    s().unlinkChiefProject("never-linked");
+
+    expect(s().chiefProjectByProject["b"]).toBe("chief_b");
+    expect(s().chiefDocStateByProject["chief_b"]).toBeDefined();
+  });
+});
+
+// The multi-linker cases roborev flagged. The ledger is keyed by CHIEF project id, so it is SHARED
+// state whenever two Sparkle projects point at one library — and the earlier tests only ever used
+// distinct ids, so none of this was covered.
+describe("two Sparkle projects, one Chief library (sparkle-ojgvp)", () => {
+  const s = () => useSettingsStore.getState();
+
+  beforeEach(() =>
+    useSettingsStore.setState({ chiefProjectByProject: {}, chiefDocStateByProject: {} }),
+  );
+
+  it("REFUSES to link a library another project already syncs into", () => {
+    useSettingsStore.setState({ chiefProjectByProject: { b: "chief_shared" } });
+
+    s().relinkChiefProject("a", "chief_shared");
+
+    // Sharing is mutually destructive, not merely redundant: syncProjectMarkdown treats the ledger
+    // as the complete desired state for the one worktree it read, so each project would delete the
+    // other's documents every round.
+    expect(s().chiefProjectByProject["a"]).toBeUndefined();
+    expect(s().chiefProjectByProject["b"]).toBe("chief_shared");
+  });
+
+  it("still allows re-selecting the library THIS project already owns", () => {
+    useSettingsStore.setState({ chiefProjectByProject: { a: "chief_a" } });
+    s().relinkChiefProject("a", "chief_a");
+    expect(s().chiefProjectByProject["a"]).toBe("chief_a");
+  });
+
+  it("relink KEEPS a shared ledger that another project still needs", () => {
+    // Pre-existing persisted state can already contain sharing (it predates the guard above), so
+    // the drop has to be conditional regardless of the refusal.
+    const shared = { "PRD/a.md": { hash: "h", assetId: "x" } };
+    useSettingsStore.setState({
+      chiefProjectByProject: { a: "chief_shared", b: "chief_shared" },
+      chiefDocStateByProject: { chief_shared: shared },
+    });
+
+    s().relinkChiefProject("a", "chief_new");
+
+    // Dropping it would strip B of every recorded assetId: its stale docs could never be deleted
+    // (orphans forever) and it would re-upload its whole tree.
+    expect(s().chiefDocStateByProject["chief_shared"]).toEqual(shared);
+    expect(s().chiefProjectByProject["a"]).toBe("chief_new");
+  });
+
+  it("unlink KEEPS a shared ledger that another project still needs", () => {
+    const shared = { "PRD/a.md": { hash: "h", assetId: "x" } };
+    useSettingsStore.setState({
+      chiefProjectByProject: { a: "chief_shared", b: "chief_shared" },
+      chiefDocStateByProject: { chief_shared: shared },
+    });
+
+    s().unlinkChiefProject("a");
+
+    expect(s().chiefDocStateByProject["chief_shared"]).toEqual(shared);
+    expect(s().chiefProjectByProject["b"]).toBe("chief_shared");
+  });
+
+  it("drops the ledger once the LAST linker leaves", () => {
+    useSettingsStore.setState({
+      chiefProjectByProject: { a: "chief_shared", b: "chief_shared" },
+      chiefDocStateByProject: { chief_shared: { "PRD/a.md": { hash: "h", assetId: "x" } } },
+    });
+
+    s().unlinkChiefProject("a");
+    expect(s().chiefDocStateByProject["chief_shared"]).toBeDefined(); // b still there
+    s().unlinkChiefProject("b");
+    expect(s().chiefDocStateByProject["chief_shared"]).toBeUndefined();
+  });
+});

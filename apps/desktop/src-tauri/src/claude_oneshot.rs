@@ -1006,16 +1006,26 @@ fn spawn_claude(claude_path: &str, args: &[String], timeout: Duration) -> Result
         // `--no-session-persistence` are all version-dependent). The reason is on stderr, and
         // reporting the JSON parse error instead would throw the diagnosis away.
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail: String = stderr.trim().chars().take(200).collect();
+        // CLASSIFY THE FULL STDERR, CLAMP ONLY WHAT A HUMAN READS. Clamping first meant an echo
+        // beginning past char 168 left a residual fragment shorter than one detection window, so
+        // the argv-echo guard could not see it while a fragment carrying `usage limit reached`
+        // still voted — the exact false positive the guard exists to stop.
+        let full = stderr.trim();
+        let detail: String = full.chars().take(200).collect();
         let code = output.status.code();
+        // CLASSIFY BEFORE LOGGING, and log the SENTINEL — never the raw body. On the shape this
+        // path exists for, stderr begins with our own argv, so `detail` is up to 200 characters of
+        // the user's terminal. This log is persisted and rides along in consented support and crash
+        // uploads, whose redaction removes credentials and paths but deliberately not ordinary
+        // free-form text — so quoting it here exports a customer's screen. `loggable_sentinel` is
+        // the same filter `log_outcome` uses for exactly this reason.
+        let error = unusable_output_error_from(full, &detail, code, args);
         tracing::warn!(
             exit_code = ?code,
-            detail = %detail,
+            sentinel = %loggable_sentinel(&error),
             "claude one-shot produced no usable output"
         );
-        // `args` goes in so the classifier can tell the CLI's diagnosis from our own prompt quoted
-        // back at it — an argv-parser error or usage dump prints argv, and the prompt is in argv.
-        return Err(unusable_output_error(&detail, code, args));
+        return Err(error);
     }
     Ok(stdout)
 }
@@ -1043,18 +1053,200 @@ fn spawn_claude(claude_path: &str, args: &[String], timeout: Duration) -> Result
 /// `None` for `api_error_status`: there is no result JSON, so there is no status to read, and
 /// inventing one would route a dead CLI into the rate-limit arm.
 fn unusable_output_error(detail: &str, code: Option<i32>, args: &[String]) -> String {
-    // CLASSIFY THE CLI'S OWN WORDS, NEVER OUR PROMPT QUOTED BACK — see `strip_argv_echo`.
-    if let Some(sentinel) = typed_cli_failure(&strip_argv_echo(detail, args), None) {
+    unusable_output_error_from(detail, detail, code, args)
+}
+
+/// As `unusable_output_error`, but classifying `full` (the whole stderr) while reporting `shown`
+/// (the clamped, human-facing slice). Those are different jobs and clamping before classifying
+/// silently weakens the guard — see the call site.
+fn unusable_output_error_from(full: &str, shown: &str, code: Option<i32>, args: &[String]) -> String {
+    // CLASSIFY THE CLI'S OWN WORDS, NEVER OUR PROMPT QUOTED BACK — and the discriminator is what
+    // SURVIVES the strip, not a guess about whether the body "looks like" an argv dump.
+    //
+    // Two shapes have to come out differently, and they are not distinguishable by inspecting the
+    // echo alone:
+    //
+    //   AN ECHO — an argv dump or usage line quotes our prompt, and the CLI's real diagnosis sits
+    //   BESIDE it. Cutting the echo leaves that diagnosis behind, so the stripped body still
+    //   classifies, and it is the honest answer.
+    //
+    //   A CORRELATED COLLISION — the CLI's own one-line diagnosis happens to be a sentence our
+    //   prompt also contains, because the same outage produced both. (The fleet is signed out; the
+    //   terminal we are summarising says `Failed to authenticate: session expired` and so does our
+    //   own stderr.) Cutting it leaves NOTHING classifiable — and that emptiness is the tell. The
+    //   shared text was the whole message, so it was the CLI's, and stripping it would erase a TRUE
+    //   diagnosis exactly when it is true. That arm is the STICKY one, unfixable by retrying, so
+    //   losing it is worse than the false positive the strip exists for.
+    //
+    // So: prefer the stripped reading; fall back to the unstripped one only when stripping left
+    // nothing to read.
+    // BOUNDED, not unbounded. Classifying the whole stream was the fix for an echo starting past
+    // the 200-char clamp, but `strip_argv_echo` allocates a `String` per starting index per
+    // argument — so a CLI that dumps a large stack trace, or replays a big prompt, turns a bounded
+    // scan into O(len x 32) allocations over megabytes. This path is hit once per agent summarised
+    // and the auth-lapse case fires fleet-wide at once. A few KB holds any plausible echo.
+    let (scanned, truncated) = bounded_scan(full);
+    let stripped = strip_argv_echo(&scanned, args);
+    if let Some(sentinel) = typed_cli_failure(&stripped, None) {
         return sentinel.to_string();
     }
-    // The unrecognised message keeps the ORIGINAL stderr. Stripping is a classification-time
-    // precaution against our own text voting; the diagnosis a human reads should be verbatim.
-    if detail.is_empty() {
+    // THE RESCUE, AND THE TWO THINGS IT REQUIRES.
+    //
+    // It exists for one shape: the CLI's own one-line diagnosis IS a sentence our prompt also
+    // contains, because the same outage produced both. (The fleet is signed out; the terminal we
+    // were asked to summarise says `Failed to authenticate: session expired`, and so does our own
+    // stderr.) Stripping our argv then removes a TRUE diagnosis, and that arm is STICKY — unfixable
+    // by retrying — so losing it is worse than the false positive the strip exists for.
+    //
+    // 1. THE RESIDUE MUST BE EMPTY. If anything survived the strip, the CLI said something we did
+    //    not take from our own argv, and that is what it died of — `error: unknown option
+    //    '--safe-mode'` beside an echoed prompt is the CLI's reason, not a collision.
+    // 2. THE BODY MUST HAVE BEEN READ WHOLE. Over a truncated scan an empty residue can equally
+    //    mean the reason was in the middle we skipped. A one-line collision is never an 8 KB body,
+    //    so requiring the full read costs nothing.
+    //
+    // ACCEPTED LOSS, recorded because it is a real one: a CLI that FRAMES its own auth line
+    // (`Error: Failed to authenticate: …\n    at auth (…)`) leaves residue and is no longer
+    // rescued — it degrades to the generic message. An earlier revision carried a grammar for that
+    // (`Error:`/`[tag]` prefixes, `at …` frames), but every witness for it was a literal invented
+    // here, nothing in the wild was observed printing it, and it needed its own exception because
+    // one of its arms was actively wrong in this position. If a framed collision is ever OBSERVED,
+    // add that shape with a witness taken from the observation — do not reinstate the grammar.
+    //
+    // There is no kind allowlist either. One existed and inverted both outcomes: it re-admitted
+    // `claude_not_authenticated` only — while `aiServiceHealthStore.ts:231` puts that in the SAME
+    // `yield` bucket as `claude_usage_limit`, so it is not the safer arm — and it dropped
+    // `claude_usage_limit`, which collides identically (the allowance that spent itself is the one
+    // the summarised terminal is complaining about) and so lost its named banner to a generic
+    // outage. Survivorship alone decides.
+    if !truncated && stripped.trim().is_empty() {
+        if let Some(sentinel) = typed_cli_failure(&scanned, None) {
+            return sentinel.to_string();
+        }
+    }
+    // THE MESSAGE MUST NOT BE OUR OWN PROMPT READ BACK TO THE USER — and must not claim more than
+    // it knows.
+    //
+    // `shown` is the caller's 200-char head clamp, and on the shape this whole guard exists for the
+    // head is ARGV: `build_args` puts `-p <user>` first, so a usage dump begins with the prompt.
+    // Printing it verbatim hands the reader 200 characters of the terminal they asked us to
+    // summarise, prose that can read exactly like an auth lapse. Same failure as the classifier
+    // had, one channel over.
+    //
+    // Three conditions, in order, because each earlier revision of this got one of them wrong:
+    //
+    //   1. AN ECHO MUST ACTUALLY HAVE BEEN FOUND. `strip_argv_echo` returns its input unchanged
+    //      when no argv window matches, so "what is left is only a banner" is true of a genuine
+    //      `Usage: claude [options] [command]` that quoted nothing. Announcing an echo there is
+    //      false AND suppresses the only text the reader had.
+    //   2. THE REASON WE ALREADY HOLD WINS. `stripped` is the argv-stripped scan of the WHOLE
+    //      bounded body, so the CLI's own reason may sit just past the 200-char clamp — in hand,
+    //      and previously discarded while telling the reader nothing was found.
+    //   3. ONLY THEN say the output was our echo, and say it with the count actually scanned
+    //      rather than the constant, and as "no recognised sentinel" rather than "no diagnosis" —
+    //      the code cannot back the stronger claim.
+    let shown_stripped = strip_argv_echo(shown, args);
+    let echo_found = shown_stripped != shown;
+    let banner_only = |t: &str| t.lines().all(|l| l.trim().is_empty() || is_usage_banner(l));
+    // RECOVER ONLY LINES THE STRIP NEVER TOUCHED. `strip_argv_echo` blanks a span only when a FULL
+    // 32-char window matches, so any contiguous run of echoed prompt shorter than that survives —
+    // and agent terminal output, which is what the prompt is on this path, is full of short lines.
+    // Collecting every non-banner line therefore rebuilt a montage of the user's own terminal and
+    // printed it as the CLI's error: the exact leak the synthesized message exists to prevent,
+    // reintroduced by the recovery meant to improve it.
+    //
+    // BOTH FILTERS, over the STRIPPED lines. Reading `scanned` here threw away the protection that
+    // was already working: `strip_argv_echo` blanks any >=32-char echoed window WHEREVER it sits, so
+    // a line mixing CLI framing with a long echoed run — `  argv: -p <a summarised terminal line>`,
+    // exactly the decorated dump this path names as its failure class — arrives with the echo
+    // already gone. Line-level membership alone cannot do that: it asks whether the WHOLE trimmed
+    // line is inside an argument, so a mixed line fails the test and is emitted raw, echo included.
+    //
+    // Membership stays as the second filter because the strip cannot reach a remnant shorter than
+    // one window. There is no alignment problem: `stripped.lines()` is filtered on its own, never
+    // zipped with `scanned.lines()`, and a blanked span that swallowed newlines only ever merges
+    // non-echoed remnants, so the merge cannot leak.
+    let is_ours = |line: &str| {
+        let t = line.trim();
+        !t.is_empty() && args.iter().any(|a| a.chars().count() >= ARGV_ECHO_WINDOW && a.contains(t))
+    };
+    let recovered: String = stripped
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !is_usage_banner(l) && !is_ours(l))
+        .map(|l| l.trim())
+        .collect::<Vec<_>>()
+        // JOINED WITH A VISIBLE SEPARATOR, never a bare space. `bounded_scan` puts a newline at the
+        // head/tail cut precisely because a head ending "…Claude usage " abutting a tail starting
+        // "limit reached…" fabricates a phrase present in neither half — and this recovery spans
+        // that cut. Re-gluing it with a space rebuilds the seam and then shows the result to the
+        // user as the CLI's own words. Classification is unaffected (that reads `stripped`), but
+        // the message is a claim the code cannot back.
+        .join(" / ");
+    let recovered = recovered
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if shown.is_empty() {
         format!("ai request failed: claude exited {code:?} with no output")
+    } else if echo_found && banner_only(&shown_stripped) {
+        if !recovered.is_empty() {
+            let clamped: String = recovered.chars().take(200).collect();
+            format!("ai request failed: claude exited {code:?}: {clamped}")
+        } else {
+            format!(
+                "ai request failed: claude exited {code:?}; its output was our own invocation \
+                 echoed back, and no recognised failure was found in the {} characters scanned",
+                scanned.chars().count()
+            )
+        }
     } else {
-        format!("ai request failed: claude exited {code:?}: {detail}")
+        format!("ai request failed: claude exited {code:?}: {shown}")
     }
 }
+
+/// Is this line the CLI's usage banner — our own invocation read back?
+///
+/// The ONE shape of framing this file recognises, and the only one it has ever observed. An earlier
+/// revision carried a general grammar (`Error:` / `[tag]` prefixes, `at …` stack frames) so a
+/// "framed" collision could still be rescued — but nothing in the wild was ever seen printing that,
+/// every witness for it was a literal invented here, and it needed its own exception at the rescue
+/// anyway. Case-insensitive, and used by BOTH callers: a divergent exact-case copy meant an
+/// uppercase `USAGE:` passed the rescue screen and failed the display screen, which replayed 200
+/// characters of the user's terminal as the CLI's error.
+fn is_usage_banner(line: &str) -> bool {
+    line.trim_start().to_lowercase().starts_with("usage:")
+}
+
+/// Read BOTH ENDS of stderr, not the head. `build_args` puts `-p <user>` first, so an argv dump
+/// begins with the prompt — and a prompt is legal up to `MAX_PROMPT_BYTES` (128 KiB) of agent
+/// terminal output, an order of magnitude over the bound. A head-only read therefore discards the
+/// CLI's own diagnosis by construction: the echo is at the front, the reason the process died is at
+/// the back. Taking the head alone made a long echo classify as our own prompt and a genuine
+/// `claude_not_authenticated` printed after it invisible.
+///
+/// The two halves are joined with a newline so the seam cannot manufacture a phrase that is in
+/// neither end.
+fn bounded_scan(full: &str) -> (String, bool) {
+    let chars: Vec<char> = full.chars().collect();
+    if chars.len() <= CLASSIFY_MAX_CHARS {
+        return (full.to_string(), false);
+    }
+    let half = CLASSIFY_MAX_CHARS / 2;
+    let head: String = chars[..half].iter().collect();
+    let tail: String = chars[chars.len() - half..].iter().collect();
+    // THE NEWLINE IS LOAD-BEARING, not formatting. Every phrase `typed_cli_failure` matches is
+    // newline-free, so without a separator the splice can fabricate one that is in NEITHER half —
+    // a head ending "…Claude usage " abutting a tail starting "limit reached…", which repetitive
+    // terminal output makes reachable — and the spliced span matches no argv window, so the strip
+    // cannot remove it either.
+    (format!("{head}\n{tail}"), true)
+}
+
+/// How much of stderr is read for CLASSIFICATION. Large enough for any plausible argv echo, small
+/// enough that a megabyte stack trace cannot turn this into a quadratic scan. Distinct from the
+/// 200-char clamp on the human-facing message, which is about readability, not safety.
+const CLASSIFY_MAX_CHARS: usize = 8192;
 
 /// The shortest run of characters that may be treated as OUR TEXT rather than the CLI's.
 ///
@@ -1076,11 +1268,11 @@ const ARGV_ECHO_WINDOW: usize = 32;
 /// argv back at you. That is also the only class of failure that reaches this function, since it
 /// runs only when the CLI died before writing any result JSON.
 ///
-/// The cost of getting it wrong is not symmetric. A false `claude_usage_limit` YIELDS in
-/// `classifyServiceFailure`, and a yield RESETS the consecutive-failure run — so a broken install
-/// whose usage dump happens to contain the user's own words would hold a genuine sustained outage
-/// permanently below threshold, and light a banner making a specific false claim about their
-/// account. Losing the sentinel costs a less-actionable message; inventing one costs the detector.
+/// Inventing a sentinel costs the detector: a false one YIELDS in `classifyServiceFailure`, and a
+/// yield RESETS the consecutive-failure run, so a broken install quoting the user's own words would
+/// hold a genuine sustained outage below threshold. That is true of EVERY sentinel — an earlier
+/// version of this doc claimed the auth arm was the safer one to invent, which
+/// `aiServiceHealthStore.ts:231` refutes by putting it in the same `yield` bucket.
 ///
 /// Spans are replaced by a SPACE rather than deleted so a cut cannot glue the two halves of
 /// unrelated text into a phrase that matches, and the adjacent real diagnosis survives: a stderr
@@ -1337,6 +1529,452 @@ mod tests {
             unusable_output_error("Claude usage limit reached|resets 5pm", Some(1), &args),
             "claude_usage_limit",
             "a genuine allowance message must still classify"
+        );
+    }
+
+    /// A prompt that contains the CLI's own AUTH sentence — the correlated collision, which is the
+    /// shape that made an unconditional strip dangerous.
+    const PROMPT_QUOTING_AN_AUTH_FAILURE: &str =
+        "Summarise this terminal: [agent-3] Failed to authenticate: session expired - stopping.";
+
+    #[test]
+    fn an_echo_straddling_the_human_clamp_is_still_stripped() {
+        // THE FULL-VS-SHOWN SPLIT, and the fixture has to be built precisely or it proves nothing.
+        //
+        // The hole: `detail` was clamped to 200 chars BEFORE classifying, so an echo that STRADDLES
+        // the clamp left a residual fragment shorter than one 32-char detection window — invisible
+        // to the strip — while still carrying the 19-char phrase `usage limit reached`, which is
+        // long enough to vote. Clamped-then-classified therefore returns the false sentinel.
+        //
+        // So the prompt must BEGIN with the voting phrase, and the padding must place exactly a
+        // sub-window slice of it inside the clamp. Both facts are asserted below, because a fixture
+        // where the clamp simply misses the phrase passes whether or not the bug is present — the
+        // first cut of this test did exactly that and its mutation came back green.
+        let prompt = "usage limit reached on agent-7; summarise the terminal above for the reader";
+        let args = build_args("claude-haiku-4-5", "you are a summariser", prompt);
+        let padding = "x".repeat(176);
+        let full = format!("{padding}{prompt}");
+        let shown: String = full.chars().take(200).collect();
+
+        let inside: String = shown.chars().skip(176).collect();
+        assert!(
+            inside.chars().count() < ARGV_ECHO_WINDOW,
+            "the slice inside the clamp must be too short to detect as an echo, got {}",
+            inside.chars().count()
+        );
+        assert!(
+            shown.contains("usage limit reached"),
+            "but long enough to carry the voting phrase, or this proves nothing"
+        );
+
+        let verdict = unusable_output_error_from(&full, &shown, Some(2), &args);
+        assert_ne!(
+            verdict, "claude_usage_limit",
+            "an echo straddling the clamp still decided the verdict: {verdict}"
+        );
+    }
+
+    #[test]
+    fn a_sentinel_our_prompt_also_contains_is_not_stripped_away() {
+        // THE CORRELATED COLLISION, and the reason the strip is survivorship-gated rather than
+        // unconditional. When the fleet is signed out, the SAME lapse puts
+        // "Failed to authenticate: session expired" in the terminal we are summarising AND in our
+        // own CLI's stderr. An unconditional strip blanks it as "ours" and the auth arm goes silent
+        // exactly when it is true — and that arm is the STICKY one, unfixable by retrying, so
+        // losing it is strictly worse than the false positive the strip was added for.
+        //
+        // What distinguishes this from an echo is what SURVIVES: here the shared span is the whole
+        // message, so cutting it leaves nothing to read, and the honest reading is the original.
+        let args = build_args("claude-haiku-4-5", "you are a summariser", PROMPT_QUOTING_AN_AUTH_FAILURE);
+        assert_eq!(
+            unusable_output_error("Failed to authenticate: session expired", Some(1), &args),
+            "claude_not_authenticated",
+            "a true diagnosis our prompt happens to quote must survive the strip"
+        );
+    }
+
+    #[test]
+    fn a_diagnosis_after_a_huge_echo_is_still_read() {
+        // THE CLASSIFICATION BOUND, which no fixture reached before: the other witnesses are a few
+        // hundred chars and can only observe the 200-char HUMAN clamp.
+        //
+        // `build_args` puts `-p <user>` first and a prompt may be 128 KiB of terminal output, so an
+        // argv dump is echo-at-the-front and diagnosis-at-the-back by construction. Reading only the
+        // head therefore discarded the reason the process died — and worse, with the whole head
+        // being echo the strip blanked all of it, so the fallback classified our own prompt.
+        let mut prompt = String::new();
+        while prompt.chars().count() < CLASSIFY_MAX_CHARS + 2_000 {
+            prompt.push_str("[agent-9] Claude usage limit reached; retrying shortly. ");
+        }
+        let args = build_args("claude-haiku-4-5", "you are a summariser", &prompt);
+        let full = format!("Usage: claude -p {prompt}\nFailed to authenticate: session expired");
+        assert!(
+            full.chars().count() > CLASSIFY_MAX_CHARS,
+            "the fixture must exceed the classification bound, or it proves nothing"
+        );
+
+        assert_eq!(
+            unusable_output_error_from(&full, &full.chars().take(200).collect::<String>(), Some(1), &args),
+            "claude_not_authenticated",
+            "a diagnosis printed after a huge echo must still be read"
+        );
+    }
+
+    #[test]
+    fn an_argv_echo_cannot_fake_the_AUTH_arm_either() {
+        // THE FALSE POSITIVE ONE ARM OVER, and the case that killed the kind-only gate. A CLI
+        // upgrade removes a flag — the failure class this whole path was written for — and the
+        // usage dump echoes a prompt that happens to contain an auth sentence. The CLI's own reason
+        // (`unknown option`) survives the strip, so it is what died, and an auth phrase living only
+        // inside our own text must not overrule it.
+        //
+        // A false auth sentinel is not the safer trade: `aiServiceHealthStore` puts it in the SAME
+        // `yield` bucket as `claude_usage_limit` (so it resets the consecutive-failure run exactly
+        // the same way), and it additionally raises a sign-in banner for a failure that signing in
+        // cannot fix.
+        let args = build_args("claude-haiku-4-5", "you are a summariser", PROMPT_QUOTING_AN_AUTH_FAILURE);
+        let dump = format!(
+            "error: unknown option '--safe-mode'\nUsage: claude -p {PROMPT_QUOTING_AN_AUTH_FAILURE} --model <model>"
+        );
+        let verdict = unusable_output_error(&dump, Some(2), &args);
+        assert_ne!(
+            verdict, "claude_not_authenticated",
+            "our own prompt faked an auth lapse: {verdict}"
+        );
+        assert!(
+            verdict.contains("unknown option"),
+            "and the CLI's own reason must be what the reader sees: {verdict}"
+        );
+    }
+
+    #[test]
+    fn the_seam_between_the_two_halves_cannot_fabricate_a_phrase() {
+        // THE SPLICE, and the fixture has to keep the abutting text OUT of argv or it proves
+        // nothing. My first cut made the whole body an echo of the prompt: `strip_argv_echo` then
+        // blanked both halves, no phrase could survive the seam either way, and the mutation came
+        // back green. The text that meets at the seam must be the CLI's own.
+        //
+        // Every phrase the classifier matches is newline-free, so the separator is the only thing
+        // stopping a head ending "…Claude usage " from abutting a tail starting "limit reached…"
+        // and manufacturing a verdict present in NEITHER half.
+        let half = CLASSIFY_MAX_CHARS / 2;
+        let head_tail = "Claude usage ";
+        let tail_head = "limit reached";
+        let head: String = "z".repeat(half - head_tail.chars().count()) + head_tail;
+        let tail: String = tail_head.to_string() + &"t".repeat(half - tail_head.chars().count());
+        let full = format!("{head}{}{tail}", "m".repeat(100));
+        assert_eq!(head.chars().count(), half, "the head must land exactly on the cut");
+        assert_eq!(tail.chars().count(), half, "and the tail must start exactly at it");
+
+        // An UNRELATED prompt, so nothing at the seam is ours and the strip cannot blank it.
+        let args = build_args("claude-haiku-4-5", "you are a summariser", "summarise the terminal output above for the reader");
+        assert!(
+            !args.iter().any(|a| a.contains("usage limit")),
+            "no argument may contain the phrase, or the strip would remove it for the wrong reason"
+        );
+
+        assert_ne!(
+            unusable_output_error_from(&full, "clipped", Some(2), &args),
+            "claude_usage_limit",
+            "the head/tail seam fabricated a phrase that is in neither half"
+        );
+    }
+
+    #[test]
+    fn the_no_output_log_names_the_sentinel_and_never_the_raw_stderr() {
+        // A SOURCE-SHAPE PIN, and its limits are stated rather than implied. The `tracing::warn!`
+        // this guards lives in `spawn_claude`, which needs a real child process — `run_isolated`
+        // replaces the spawn entirely, so no behavioural harness in this file can reach that line.
+        // The sibling `the_failure_log_never_carries_the_clis_own_result_body` covers the JSON path
+        // because that one IS reachable.
+        //
+        // What it proves: the raw-stderr field cannot come back silently. On this path stderr
+        // begins with our own argv, so `detail` is up to 200 characters of the user's terminal, and
+        // this log is persisted into consented support and crash uploads whose redaction removes
+        // credentials and paths but deliberately not ordinary prose.
+        let src = include_str!("claude_oneshot.rs");
+        let start = src.find("fn spawn_claude").expect("spawn_claude must exist");
+        let end = src[start..].find("\nfn ").map_or(src.len(), |o| start + o);
+        let body = &src[start..end];
+        assert!(
+            body.contains("sentinel = %loggable_sentinel"),
+            "the no-output warn must log the classified sentinel"
+        );
+        // PINNED ON SUBSTANCE, not one spelling. `detail = %detail` was the only banned literal, so
+        // `detail = ?detail`, `stderr = %detail`, `head = %full`, or an ADDITIONAL raw field beside
+        // the sentinel all reintroduced the leak with this assertion green.
+        let warn_start = body.find("tracing::warn!").expect("the no-output warn must exist");
+        let warn_end = warn_start + body[warn_start..].find(");").expect("unterminated warn!") ;
+        let warn = &body[warn_start..warn_end];
+        // BAN THE IDENTIFIER, not a list of sigil spellings. The previous list missed `{detail:?}`
+        // — it contains `{detail` but not `{detail}` — which is the shape a future edit is most
+        // likely to reach for, because the surrounding messages already write `{code:?}` five
+        // times. A `{<id>` prefix covers `{detail}`, `{detail:?}` and `{detail:#?}` at once.
+        for id in ["detail", "full", "stderr"] {
+            for spelling in [format!("%{id}"), format!("?{id}"), format!("{{{id}")] {
+                assert!(
+                    !warn.contains(&spelling),
+                    "the no-output warn interpolates {spelling} — that is raw stderr, which on this \
+                     path is the user's own terminal: {warn}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_usage_banner_that_quoted_nothing_is_still_shown_to_the_reader() {
+        // "WHAT SURVIVED IS ONLY A BANNER" IS NOT "WE FOUND AN ECHO". `strip_argv_echo` returns its
+        // input unchanged when no argv window matches, so a genuine `Usage: claude [options]` —
+        // which quoted nothing of ours — satisfied the banner test and got told it was our own
+        // invocation echoed back. False, and it suppressed the only text the reader had.
+        let args = build_args("claude-haiku-4-5", "you are a summariser", "summarise the terminal output above for the reader");
+        let stderr = "Usage: claude [options] [command]";
+        let verdict = unusable_output_error(stderr, Some(64), &args);
+        assert!(
+            verdict.contains("Usage: claude [options]"),
+            "a banner that quoted nothing must still reach the reader: {verdict}"
+        );
+        assert!(
+            !verdict.contains("echoed back"),
+            "and must not be announced as an echo that never happened: {verdict}"
+        );
+    }
+
+    #[test]
+    fn a_reason_past_the_clamp_is_recovered_rather_than_declared_absent() {
+        // THE DIAGNOSIS WE ALREADY HOLD. `stripped` is the argv-stripped scan of the whole bounded
+        // body, so the CLI's reason can sit just past the 200-char clamp — in hand, and previously
+        // thrown away while telling the reader nothing was found. Inside the scan bound, so this is
+        // distinct from the truncated case where the reason genuinely is unreachable.
+        let mut prompt = String::new();
+        while prompt.chars().count() < 400 {
+            prompt.push_str("[agent-8] type /login to continue; the session expired earlier. ");
+        }
+        let args = build_args("claude-haiku-4-5", "you are a summariser", &prompt);
+        let full = format!("Usage: claude -p {prompt}\nerror: unknown option '--safe-mode'");
+        let shown: String = full.chars().take(200).collect();
+        assert!(full.chars().count() < CLASSIFY_MAX_CHARS, "must fit the scan, or it tests the wrong gate");
+        assert!(!shown.contains("unknown option"), "and must NOT fit the clamp, or it proves nothing");
+
+        let verdict = unusable_output_error_from(&full, &shown, Some(2), &args);
+        assert!(
+            verdict.contains("unknown option '--safe-mode'"),
+            "the reason was already read and must reach the reader: {verdict}"
+        );
+        assert!(
+            !verdict.contains("/login"),
+            "without replaying the user's terminal: {verdict}"
+        );
+    }
+
+    #[test]
+    fn short_echoed_lines_never_reach_the_reader_through_the_recovery() {
+        // THE LEAK THE RECOVERY ITSELF OPENED. `strip_argv_echo` blanks a span only when a full
+        // 32-char window matches, so any echoed line SHORTER than that survives the strip — and
+        // agent terminal output, which is exactly what the prompt is on this path, is full of short
+        // lines. Collecting every surviving non-banner line rebuilt a montage of the user's own
+        // terminal and printed it as the CLI's error.
+        //
+        // The fixture is that shape: a long line to fill the clamp, then short ones the strip
+        // cannot reach, and one genuine CLI reason. Only the reason may come back.
+        let long_line = "[agent-3] ".to_string() + &"a summarised terminal line long enough to be stripped. ".repeat(6);
+        let shorts = "kubectl top\npsql -c 'x'\nvim notes.md\nssh box-2\ngit push -f";
+        let prompt = format!("{long_line}\n{shorts}");
+        let args = build_args("claude-haiku-4-5", "you are a summariser", &prompt);
+        let full = format!("Usage: claude -p {prompt}\nerror: unknown option '--safe-mode'");
+        let shown: String = full.chars().take(200).collect();
+
+        let verdict = unusable_output_error_from(&full, &shown, Some(2), &args);
+        for leaked in ["kubectl", "psql", "vim notes", "ssh box-2", "git push -f"] {
+            assert!(
+                !verdict.contains(leaked),
+                "a short echoed line reached the reader through the recovery ({leaked}): {verdict}"
+            );
+        }
+        assert!(
+            verdict.contains("unknown option '--safe-mode'"),
+            "while the CLI's own reason must still come back: {verdict}"
+        );
+    }
+
+    #[test]
+    fn the_recovery_never_re_glues_the_head_tail_seam() {
+        // `bounded_scan` separates the halves with a newline because a head ending "…Claude usage "
+        // abutting a tail starting "limit reached…" fabricates a phrase in neither half. The
+        // recovery spans that cut, so joining its lines with a bare space rebuilt the seam and then
+        // showed the result to the user as the CLI's own words.
+        let half = CLASSIFY_MAX_CHARS / 2;
+        let head = "z".repeat(half - "Claude usage ".chars().count()) + "Claude usage ";
+        let tail = "limit reached".to_string() + &"t".repeat(half - "limit reached".chars().count());
+        let full = format!("{head}{}{tail}", "m".repeat(100));
+        let args = build_args("claude-haiku-4-5", "you are a summariser", "summarise the terminal output above for the reader");
+
+        let verdict = unusable_output_error_from(&full, "clipped", Some(2), &args);
+        assert!(
+            !verdict.contains("Claude usage limit reached"),
+            "the recovery re-glued the seam into a phrase present in neither half: {verdict}"
+        );
+    }
+
+    #[test]
+    fn a_mixed_line_of_framing_and_echo_does_not_leak_the_echo() {
+        // THE DECORATED DUMP — framing and echo on ONE line, which is the shape this path names as
+        // its own failure class (`a usage dump or a Node stack trace`). Whole-line membership
+        // cannot help here: the line is not wholly inside any argument, so it passes that test and
+        // would be emitted raw. Only the span-level strip reaches the echoed run inside it.
+        let mut prompt = String::new();
+        while prompt.chars().count() < 400 {
+            prompt.push_str("[agent-3] a summarised terminal line long enough to be stripped. ");
+        }
+        let args = build_args("claude-haiku-4-5", "you are a summariser", &prompt);
+        let full = format!("Usage: claude -p {prompt}\nerror: unknown option '--safe-mode'\n  argv: -p {prompt}");
+        let shown: String = full.chars().take(200).collect();
+
+        let verdict = unusable_output_error_from(&full, &shown, Some(2), &args);
+        assert!(
+            verdict.contains("unknown option '--safe-mode'"),
+            "the CLI's own reason must survive: {verdict}"
+        );
+        assert!(
+            !verdict.contains("summarised terminal line"),
+            "a line mixing framing with an echoed run leaked the user's terminal: {verdict}"
+        );
+    }
+
+    #[test]
+    fn an_uppercase_usage_banner_is_screened_by_both_paths() {
+        // ONE PREDICATE, BOTH CALLERS. The rescue screen was case-insensitive and the display
+        // screen exact-case, so `USAGE:` passed one and failed the other — and the path that
+        // failed is the one that decides what a human reads, which then replayed 200 characters of
+        // their own terminal as the CLI's error.
+        assert!(is_usage_banner("USAGE: claude -p ..."), "the banner is recognised in any case");
+        assert!(is_usage_banner("  usage: claude"), "and after leading whitespace");
+        assert!(!is_usage_banner("error: unknown option"), "but a real reason is not a banner");
+
+        let mut prompt = String::new();
+        while prompt.chars().count() < 400 {
+            prompt.push_str("[agent-2] type /login to continue; the session expired earlier. ");
+        }
+        let args = build_args("claude-haiku-4-5", "you are a summariser", &prompt);
+        let full = format!("USAGE: claude -p {prompt}");
+        let shown: String = full.chars().take(200).collect();
+
+        let verdict = unusable_output_error_from(&full, &shown, Some(2), &args);
+        assert_ne!(
+            verdict, "claude_not_authenticated",
+            "an uppercase usage dump faked an auth lapse: {verdict}"
+        );
+        assert!(
+            !verdict.contains("/login"),
+            "and it must not replay the user's own terminal: {verdict}"
+        );
+    }
+
+    #[test]
+    fn a_truncated_body_whose_residue_IS_empty_still_refuses_the_rescue() {
+        // THE ONLY SHAPE WHERE `!truncated` DECIDES, and until now nothing covered it: the sibling
+        // test's residue is a `Usage:` line, so `stripped.trim().is_empty()` refuses on its own and
+        // mutating `!truncated` out left every test green.
+        //
+        // Here the whole body is the prompt — no banner, no framing — so after the strip the
+        // residue really is empty, while the body far exceeds the scan bound. That is ordinary: a
+        // prompt may be MAX_PROMPT_BYTES (128 KiB), an order of magnitude over it. The middle we
+        // never read is where the CLI's reason would be, so an empty residue proves nothing and the
+        // rescue must not classify off the user's own terminal.
+        let mut prompt = String::new();
+        while prompt.chars().count() < CLASSIFY_MAX_CHARS * 2 {
+            prompt.push_str("[agent-6] type /login to continue; the session expired earlier. ");
+        }
+        let args = build_args("claude-haiku-4-5", "you are a summariser", &prompt);
+
+        // THE PRECONDITIONS ARE ASSERTED, not assumed. This fixture pins `!truncated` only while
+        // BOTH hold: the body exceeds the scan bound (guaranteed by the loop) and the strip blanks
+        // the whole scan so the residue is empty (NOT guaranteed — it depends on `build_args`
+        // passing the prompt as one verbatim contiguous argument and on ARGV_ECHO_WINDOW staying
+        // small enough to match the repeated sentence). If either drifts, the rescue is refused by
+        // the residue check alone, the assertions below still pass, and `!truncated` is silently
+        // un-pinned — the exact relocation this test was written to close.
+        let (scan, trunc) = bounded_scan(&prompt);
+        assert!(trunc, "the fixture must exceed the scan bound, or it tests the wrong gate");
+        assert!(
+            strip_argv_echo(&scan, &args).trim().is_empty(),
+            "the residue must be EMPTY, or the residue check refuses on its own and !truncated \
+             decides nothing"
+        );
+
+        let verdict = unusable_output_error_from(&prompt, "clipped", Some(2), &args);
+        assert_ne!(
+            verdict, "claude_not_authenticated",
+            "a truncated body with an empty residue was treated as a collision: {verdict}"
+        );
+        assert_ne!(verdict, "claude_usage_limit", "nor any other sentinel: {verdict}");
+    }
+
+    #[test]
+    fn a_truncated_scan_is_not_evidence_of_a_collision() {
+        // THE TRUNCATION GATE. "Only framing survived" means "the shared span was the whole
+        // message" ONLY when the whole message was read. Over a cut body it can equally mean the
+        // CLI's reason was in the middle we skipped — so the rescue must not run at all.
+        //
+        // Built so the residue really is pure framing and the reason really is unreachable: head is
+        // `Usage: claude -p ` plus echo, tail is pure echo, and `error: unknown option` sits in the
+        // middle. The prompt carries `/login`, which `typed_cli_failure` matches loosely — a
+        // summarised Claude Code terminal very often does.
+        let mut prompt = String::new();
+        while prompt.chars().count() < CLASSIFY_MAX_CHARS {
+            prompt.push_str("[agent-4] type /login to continue; the session expired earlier. ");
+        }
+        let args = build_args("claude-haiku-4-5", "you are a summariser", &prompt);
+        let full = format!("Usage: claude -p {prompt}\nerror: unknown option '--safe-mode'\n{prompt}");
+        assert!(
+            full.chars().count() > CLASSIFY_MAX_CHARS * 2,
+            "the reason must be unreachable from BOTH ends, or the gate is not what is tested"
+        );
+
+        // `shown` DERIVED THE WAY THE CALL SITE DERIVES IT, not hand-supplied. Feeding the answer
+        // in made the old second assertion true of the test and false of production: for this
+        // `full` the first 200 chars are pure argv echo, so the reader would have got 200
+        // characters of their own summarised terminal.
+        let shown: String = full.chars().take(200).collect();
+        assert!(
+            !shown.contains("unknown option"),
+            "the clamp must NOT contain the reason, or this asserts nothing about the real path"
+        );
+
+        let verdict = unusable_output_error_from(&full, &shown, Some(2), &args);
+        assert_ne!(
+            verdict, "claude_not_authenticated",
+            "a truncated scan was treated as evidence and our own prompt decided the verdict"
+        );
+        // The reason is past both the clamp AND the classification bound, so it genuinely cannot
+        // reach the reader. The message must say THAT rather than quote our prompt at them.
+        assert!(
+            !verdict.contains("/login"),
+            "the message read our own prompt back to the user: {verdict}"
+        );
+        assert!(
+            verdict.contains("echoed back"),
+            "and it must name the echo as the reason there is nothing else: {verdict}"
+        );
+    }
+
+    #[test]
+    fn a_lone_usage_banner_echoing_our_prompt_is_not_a_collision() {
+        // THE FALSE SIGN-IN BANNER. A usage dump is the failure shape that prints argv, so when the
+        // whole body is `Usage: claude -p <our prompt>` the strip leaves only the banner — and the
+        // rescue read that emptiness as "the CLI's own sentence was the shared span". It was not:
+        // the CLI said nothing but "you invoked me wrong", and the `/login` deciding the verdict
+        // lives only inside the terminal we were asked to summarise. Signing in cannot fix it.
+        let args = build_args("claude-haiku-4-5", "you are a summariser", PROMPT_QUOTING_AN_AUTH_FAILURE);
+        let dump = format!("Usage: claude -p {PROMPT_QUOTING_AN_AUTH_FAILURE} --model <model>");
+        let verdict = unusable_output_error(&dump, Some(2), &args);
+        assert_ne!(
+            verdict, "claude_not_authenticated",
+            "a bare usage banner faked an auth lapse from our own prompt: {verdict}"
+        );
+        assert!(
+            verdict.contains("echoed back"),
+            "and the reader must be told the output was our invocation: {verdict}"
         );
     }
 

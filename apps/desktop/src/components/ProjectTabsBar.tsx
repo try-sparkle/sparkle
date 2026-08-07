@@ -442,7 +442,10 @@ export function ProjectTabsBar({
   return (
     <div className="ptabstrip" data-side={side} data-testid="project-tabs-strip">
       <ProjectTabs
-        projects={openProjects.map((p) => ({ id: p.id, name: p.name }))}
+        // `rootPath` travels with the tab because the stale badge's panel diagnoses and remedies a
+        // DIRECTORY — the badge could always say "1,935 behind", but nothing downstream of it knew
+        // which checkout that was about (bead sparkle-7h01z).
+        projects={openProjects.map((p) => ({ id: p.id, name: p.name, rootPath: p.rootPath }))}
         // The left strip paints right-to-left (index.css `.ptabstrip[data-side="left"]`), so the
         // drag resolver has to be told: it compares screen x against tabs given in ARRAY order, and
         // those two disagree exactly when the flow is reversed.

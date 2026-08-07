@@ -6,6 +6,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invoke(...
 
 import {
   ensureChiefProject,
+  chiefProjectExists,
   uploadAsset,
   resolveEnvChiefPat,
   listAssets,
@@ -36,6 +37,35 @@ function jsonResponse(body: unknown, ok = true, status = 200): Response {
 }
 
 afterEach(() => vi.restoreAllMocks());
+
+describe("chiefProjectExists — deleted vs unreachable (sparkle-ojgvp)", () => {
+  it("returns true when the id is in the listing", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      jsonResponse([{ project_id: "project_live", name: "sparkle" }]),
+    );
+    await expect(chiefProjectExists("pat_test", "project_live")).resolves.toBe(true);
+  });
+
+  it("returns false when the listing SUCCEEDED and the id is absent", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      jsonResponse([{ project_id: "project_other", name: "something-else" }]),
+    );
+    await expect(chiefProjectExists("pat_test", "project_deleted")).resolves.toBe(false);
+  });
+
+  it("returns null — NOT false — when the listing itself fails", async () => {
+    // The load-bearing case. A down endpoint cannot answer "does this project exist", and reading
+    // its silence as `false` would let one failed request declare the user's library deleted and
+    // strand the project in a state only a human can clear.
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new TypeError("Load failed"));
+    await expect(chiefProjectExists("pat_test", "project_live")).resolves.toBeNull();
+  });
+
+  it("returns null on a non-2xx listing too", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse({ error: "nope" }, false, 500));
+    await expect(chiefProjectExists("pat_test", "project_live")).resolves.toBeNull();
+  });
+});
 
 describe("ensureChiefProject — truncated-name reuse/create", () => {
   it("reuses an existing project matched against the 128-char-truncated name", async () => {

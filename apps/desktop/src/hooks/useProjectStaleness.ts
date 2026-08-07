@@ -16,6 +16,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { ProjectTabStaleness } from "../components/ProjectTabs";
+import { autoFastForwardEnabled, diagnoseStale, remedyStale } from "../services/staleness";
 
 /** What `repo_root_staleness` returns. `unknown` means "could not measure" — never "fresh". */
 export interface RootStaleness {
@@ -61,11 +62,15 @@ export function useProjectStaleness(
   const key = targets.map((t) => `${t.id}\u0000${t.rootPath}`).join("");
   const targetsRef = useRef(targets);
   targetsRef.current = targets;
+  // Roots with an auto-fix already in flight. A poll every `pollMs` must not stack a second
+  // fast-forward on top of one that is still running — git would be operating on a tree the first
+  // call is mid-way through moving.
+  const autoFixing = useRef(new Set<string>());
 
   useEffect(() => {
     let cancelled = false;
 
-    const read = async () => {
+    const read = async (autoFix: boolean) => {
       const list = targetsRef.current.filter((t) => t.rootPath);
       const entries = await Promise.all(
         list.map(async (t) => {
@@ -83,10 +88,56 @@ export function useProjectStaleness(
       const next: Record<string, ProjectTabStaleness> = {};
       for (const [id, badge] of entries) if (badge) next[id] = badge;
       setByProject((prev) => (shallowEqual(prev, next) ? prev : next));
+      if (autoFix) {
+        const stale = list.filter((t) => next[t.id]);
+        if (stale.length > 0) void autoFastForward(stale);
+      }
     };
 
-    void read();
-    const timer = setInterval(() => void read(), pollMs);
+    /**
+     * FIX THE ONES THAT CANNOT POSSIBLY LOSE ANYTHING, WITHOUT ASKING (bead sparkle-7h01z).
+     *
+     * The founder's ruling: automation is allowed exactly where it is provably safe and nowhere
+     * else. `autoSafe` is the backend's name for that shape — clean tree, on the default branch, a
+     * strict ancestor of the base — so a `--ff-only` merge cannot destroy work, cannot produce a
+     * conflict, and cannot change which branch the user is on. EVERYTHING ELSE WAITS FOR A CLICK,
+     * including `fast-forward-dirty`, which is offerable but never automatic: a dirty tree is the
+     * user's call.
+     *
+     * ONLY STALE PROJECTS ARE DIAGNOSED, and that is what keeps this affordable on a 60s timer. The
+     * badge map has already filtered to "measured, and behind" — usually 0–3 projects — so a fresh
+     * checkout costs nothing beyond the `repo_root_staleness` call it was already paying.
+     *
+     * SILENT ON FAILURE, like the read above and for the same reason: this runs unattended, and a
+     * remedy that could not be applied simply leaves the badge exactly where it was.
+     */
+    const autoFastForward = async (stale: StalenessTarget[]) => {
+      await Promise.all(
+        stale.map(async (t) => {
+          if (autoFixing.current.has(t.rootPath)) return;
+          autoFixing.current.add(t.rootPath);
+          try {
+            const d = await diagnoseStale(t.rootPath);
+            // THE GUARD. Without it a dirty or diverged checkout would be touched unattended, which
+            // is the one thing this feature is not allowed to do.
+            if (!d.autoSafe) return;
+            if (!(await autoFastForwardEnabled(t.rootPath))) return;
+            const out = await remedyStale(t.rootPath);
+            if (!out.ok || cancelled) return;
+            // Re-read through the SAME fail-closed mapping rather than patching the entry by hand,
+            // so a post-remedy reading can no more produce a bogus badge than the first one could.
+            await read(false);
+          } catch {
+            // Unattended path — see the doc comment.
+          } finally {
+            autoFixing.current.delete(t.rootPath);
+          }
+        }),
+      );
+    };
+
+    void read(true);
+    const timer = setInterval(() => void read(true), pollMs);
     return () => {
       cancelled = true;
       clearInterval(timer);

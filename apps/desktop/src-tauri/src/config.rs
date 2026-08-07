@@ -1060,6 +1060,11 @@ pub struct FreshnessConfig {
     pub stale_build_block_commits: u32,
     /// Advisory: new work should start from a fresh-from-origin/main branch (e.g. new-feature.sh).
     pub require_fresh_branch: bool,
+    /// When true, a checkout that is PROVABLY safe to advance — clean working tree, sitting on the
+    /// default branch, and a strict ancestor of `origin/<default>` — may be fast-forwarded without
+    /// a click. Every other shape (dirty, detached, a feature branch, or diverged) still waits for
+    /// an explicit user action, and nothing destructive is ever run. See `repo_freshness`.
+    pub auto_fast_forward: bool,
 }
 
 /// Pre-warmed git worktree pool. At idle, Sparkle parks a few detached-HEAD worktrees checked out
@@ -1283,6 +1288,7 @@ impl Default for SparkleConfig {
                 staleness_warn_commits: 25,
                 stale_build_block_commits: 25,
                 require_fresh_branch: true,
+                auto_fast_forward: true,
             },
             // Pre-warm a small pool by default so the common fan-out spawn skips `git worktree add`.
             worktree_pool: WorktreePoolConfig { enabled: true, size: 2 },
@@ -1559,6 +1565,7 @@ struct PartialFreshness {
     staleness_warn_commits: Option<u32>,
     stale_build_block_commits: Option<u32>,
     require_fresh_branch: Option<bool>,
+    auto_fast_forward: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1707,6 +1714,9 @@ fn apply_freshness(into: &mut FreshnessConfig, p: Option<PartialFreshness>) {
     }
     if let Some(v) = p.require_fresh_branch {
         into.require_fresh_branch = v;
+    }
+    if let Some(v) = p.auto_fast_forward {
+        into.auto_fast_forward = v;
     }
 }
 
@@ -3781,6 +3791,10 @@ stale_build_block_commits = 25
 # Advisory reminder that new work should start from a fresh-from-origin/main branch
 # (e.g. scripts/new-feature.sh), not an inherited stale one.
 require_fresh_branch      = true
+# When a checkout is PROVABLY safe to advance — clean tree, on the default branch, and a strict
+# ancestor of origin/<default> — Sparkle may fast-forward it for you with no click. Anything else
+# (dirty, detached, a feature branch, or diverged) still waits for you. Set false to always ask.
+auto_fast_forward         = true
 
 # --- Pre-warmed worktree pool (repo-scoped; overridable in a project file) --------------
 # The slow part of spawning an agent is `git worktree add`, which materializes the whole working
