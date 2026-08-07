@@ -163,8 +163,11 @@ describe("a mounted Terminal routes its onData through the shared line scanner",
 
     act(() => dataHandler.fn!("git comm"));
 
-    // Only true if `registerLineScan` ran AND `onData` went through `noteUserInput`: the flag is
-    // derived from the registered state, so a missing registration leaves this undefined.
+    // What this pins: the keystroke was SCANNED and the flag PUBLISHED, i.e. `onData` went through
+    // `noteUserInput`. It does NOT pin that `registerLineScan` ran — the fail-closed lookup creates
+    // the state on a miss, so this is `true` with the registration deleted. See the header; an
+    // earlier version of this comment claimed the opposite and contradicted it (roborev 60086),
+    // which is how a maintainer ends up believing a gap is covered when nothing covers it.
     expect(useTerminalOverlayStore.getState().drafts[AGENT]).toBe(true);
   });
 

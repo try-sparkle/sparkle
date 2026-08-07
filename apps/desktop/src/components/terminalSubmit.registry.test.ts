@@ -172,9 +172,13 @@ describe("the registry cannot silently lose an agent's scanner", () => {
 
     unregisterLineScan(A, state);
 
-    // Nothing registered now, so the next chunk starts from a FRESH line rather than continuing
-    // the torn-down one: "x" alone is pending, and the old "hello" is not part of it.
-    noteUserInput(A, "\r");
+    // ASSERTED ON THE SUBMIT COUNT, because the draft flag cannot tell the two branches apart —
+    // and the first version of this case asserted exactly that and was vacuous (roborev 60086).
+    // Unregistered, the next chunk starts from a FRESH line, so a bare Enter submits nothing: 0.
+    // Leaked (an identity check that never matches), the retained state still holds "hello", so
+    // the SAME Enter submits it: 1 — and a free-trial prompt is debited for a terminal that is
+    // gone. Both branches end with an empty buffer, so `drafts` reads false either way.
+    expect(noteUserInput(A, "\r")).toBe(0);
     expect(useTerminalOverlayStore.getState().drafts[A]).toBeFalsy();
   });
 
