@@ -168,6 +168,14 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  // RESTORE, not merely clear — they are different operations and only this one puts a `vi.spyOn`
+  // original back (roborev 60087). One case below spies `Date.now`; if its restore lived at the end
+  // of the test body it would be skipped by the first failing assertion, pinning the clock for every
+  // later case in the file — and with `retry: 2` the retry would re-spy on top of the live spy. The
+  // regression that case exists to catch would then present as a cascade of unrelated failures with
+  // every duration frozen, instead of the one clean red it was written to produce. Here it covers
+  // any future spy in this file without each author having to remember a `finally`.
+  vi.restoreAllMocks();
 });
 
 describe("a red card names the agent that is actually red", () => {
@@ -483,8 +491,8 @@ describe("a red card retracts when its agent goes back to working", () => {
       .queryAllByTestId(NUDGE_CARD_TESTID)
       .find((el) => el.getAttribute("data-resolved") === "true")!;
     expect(within(grey).getByTestId(NUDGE_LEAD_TESTID).textContent).toBe("RESOLVED after 3m:");
-
-    clock.mockRestore();
+    // No `clock.mockRestore()` here on purpose: a restore at the end of a test body is skipped by
+    // the first failing assertion, which is precisely when it matters. `afterEach` does it.
   });
 
   // THE REPAINT (roborev 60007-M2). `[x]` on a RESOLVED card writes to module state, so nothing
