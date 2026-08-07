@@ -120,7 +120,7 @@ import { publishedStatusFor } from "../useAttentionNotifications";
 import { resolveStage } from "../engine/workflowStage";
 import type { AgentTab, AgentTabStatus, Project } from "../types";
 import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
-import { NUDGE_CARD_TESTID } from "./Concierge/NudgeCard";
+import { PINNED_BLOCKER_TESTID } from "./Concierge/PinnedBlockers";
 
 // PRECONDITION, stated rather than inherited: this suite's subject is the concierge CONVERSATION,
 // and the column locks that half — thread and composer both — whenever the AI gate is shut
@@ -475,7 +475,7 @@ describe("the stated count equals the rows the click leaves standing", () => {
     // agent. That affordance used to be a "Show me" button; since the one-line rewrite it is the
     // card's `AgentPill`, so the count is of CARDS.
     expect(screen.queryByTestId("concierge-rowless-digest")).toBeNull();
-    expect(screen.queryAllByTestId(NUDGE_CARD_TESTID)).toHaveLength(2);
+    expect(screen.queryAllByTestId(PINNED_BLOCKER_TESTID)).toHaveLength(2);
   });
 
   // The partial version, which is the one that actually happens: a red worker paints its
@@ -570,9 +570,13 @@ describe("rowless agents digest like everything else", () => {
   /** The nudge cards on screen, by the agent each names — read off the card's `AgentPill`, which is
    *  both the name on screen and the thing the reader clicks. It used to be matched out of the
    *  card's prose sentence; that sentence is gone with the one-line rewrite (Concierge/NudgeCard). */
+  // SINCE 2026-08-07 A LIVE BLOCKER IS NOT IN THE THREAD. The founder asked for them pinned above
+  // the composer so they cannot scroll away, so the population these cases have always meant —
+  // "the agents column one is shouting about" — is now the pinned zone. Only the SURFACE moved;
+  // every rule below (who gets a card, who is digested, who is suppressed) is unchanged.
   const cardNames = () =>
     screen
-      .queryAllByTestId(NUDGE_CARD_TESTID)
+      .queryAllByTestId(PINNED_BLOCKER_TESTID)
       .map((el) => el.querySelector('[data-testid^="concierge-agent-pill"]')?.textContent ?? "")
       .map((t) => t.replace(/^@/, ""));
 

@@ -25,6 +25,7 @@ import { LogoWaveform } from "../LogoWaveform";
 import { WAVE_HEIGHT } from "../waveGeometry";
 import { SparkleLogoLink } from "../SparkleLogoLink";
 import { ComposeBox } from "./ComposeBox";
+import { PinnedBlockers } from "./PinnedBlockers";
 import { ConciergeAiLocked } from "./ConciergeAiLocked";
 import { ConciergeUnavailable } from "./ConciergeUnavailable";
 import { useConciergeAiLock } from "./conciergeAiLock";
@@ -39,7 +40,7 @@ import { BeadPillHost } from "./BeadPill";
 import { KeyPill } from "./KeyPill";
 import { pillStyle } from "./pillStyle";
 import { wordmarkRamp } from "./wordmarkRamp";
-import type { ConciergeAnnouncement, ConciergeColumnProps } from "./types";
+import type { ConciergeAnnouncement, ConciergeColumnProps, ConciergeNudge } from "./types";
 import { FONT_UI, TYPE } from "../../theme/scale";
 // The SAME dot the sidebar row draws, so the chip and the row cannot disagree about what
 // green/gray/red mean — the chip exists to report how that agent is doing (bead sparkle-wj3ya).
@@ -47,6 +48,11 @@ import { StatusDot } from "../StatusDot";
 
 /** Nothing announced yet. Module-level so the default prop is referentially stable. */
 const EMPTY_ANNOUNCEMENT: ConciergeAnnouncement = { seq: 0, text: "" };
+
+/** Nothing acknowledged. Module-level for the same reason as the line above: a fresh `[]` in the
+ *  JSX would be a new identity on every render, so every memoised consumer downstream would see a
+ *  changed prop on a tick where nothing changed. */
+const EMPTY_ACKNOWLEDGED: ConciergeNudge[] = [];
 
 /** LogoWaveform carries its own 14px side padding (it used to be a direct child of the builder
  *  column, which had none). Pull it back out so the bars line up with the column's own inset
@@ -736,6 +742,45 @@ export function ConciergeColumn({
           It deliberately carries NO live region of its own — the single announcer below is fed by
           the host when an intent arms (a second region double-announces). */}
       {countdownSlot}
+      {/* LIVE BLOCKERS, PINNED. The founder's 2026-08-07 ask: *"any sort of blocked notices… right
+          above the compose window. And not in line in the chat thread… they should stay
+          persistently above the composed window so that I see them regardless of how much the chat
+          thread moves."*
+
+          THIS ROW, and not a new region: the zone directly above the composer already holds the
+          countdown banner and the mounted-agent pills, so a blocker joins a strip the eye is
+          already trained on instead of inventing a fourth place to look.
+
+          BELOW `countdownSlot` on purpose. The banner is a few-second countdown the reader may want
+          to Cancel — it is the more perishable of the two, so it keeps the position nearest the eye
+          after a send. A blocker persists until it is resolved and can afford to sit under it.
+
+          GATED ON `!aiLock` like every other member of this strip, and for the reason spelled out
+          on its neighbours: `aiLock && isWired` is REACHABLE and there is NO COMPOSER in that
+          state, so a surface whose whole promise is "above the composer" would be pointing at
+          something that is not on screen. NOT gated on `isWired` — unlike the mounted pills, a
+          blocker is about the FLEET rather than about the mounted agent, and the founder must see
+          it whether or not a cable happens to be patched. */}
+      {!aiLock && (
+        // ITS OWN `AgentPillProvider`, and this is NOT optional. The provider above wraps the
+        // THREAD, and a blocker is no longer in the thread — so without this the strip's pills
+        // resolve to nothing and render the "…is closed" dead-end variant, naming an agent the
+        // reader cannot open. That is the exact failure `AgentPill.deadEnd.test.tsx` exists to
+        // forbid, and it appears as a working-looking pill rather than as an error.
+        //
+        // A second provider rather than hoisting the first one around both: the thread's is inside
+        // the mount SWAP (it is rendered on the unmounted branch only), and widening its scope
+        // would put a context around a subtree that swaps out from under it. `agentPills` is one
+        // memoised value, so both readers see the same roster.
+        <AgentPillProvider value={agentPills}>
+          <PinnedBlockers
+            blockers={model.pinnedBlockers ?? []}
+            acknowledged={model.acknowledgedBlockers ?? EMPTY_ACKNOWLEDGED}
+            onNudgeClick={controller.onNudgeClick}
+            onNudgeAction={controller.onNudgeAction}
+          />
+        </AgentPillProvider>
+      )}
       {/* THE ONE EXPLANATION THAT SURVIVES THE MOUNT SWAP. Mounted, the thread above is the AGENT's
           transcript and `ConciergeThread` is not rendered at all — so a terminal refusal, or the
           @Sparkle escape hatch's reply, is written to a component that is off screen (roborev 57360).

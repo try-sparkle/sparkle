@@ -267,6 +267,7 @@ import { usePendingAttachmentsStore } from "../stores/pendingAttachmentsStore";
 import { log } from "../logger";
 import type { Project } from "../types";
 import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
+import { PINNED_BLOCKERS_TESTID, PINNED_BLOCKER_TESTID } from "./Concierge/PinnedBlockers";
 import { NUDGE_CARD_TESTID } from "./Concierge/NudgeCard";
 
 // PRECONDITION, stated rather than inherited: this suite's subject is the concierge CONVERSATION,
@@ -408,7 +409,22 @@ async function elapseCountdowns() {
  *  region carrying the last finished line (roborev 53010), so a document-wide getByText would match
  *  the same string twice — and would pass even if the visible thread stopped rendering it. */
 const thread = () => screen.getByTestId("concierge-thread");
-const inThread = (re: RegExp | string) => within(thread()).getByText(spans(re));
+// …AND THE PINNED ALERT STRIP COUNTS AS VISIBLE TOO. Since 2026-08-07 a LIVE blocker is not in the
+// transcript at all — the founder asked for blockers pinned above the composer so they cannot
+// scroll away — so its Approve/Mute/[x] are outside `thread()`. These helpers therefore search the
+// transcript FIRST and the pinned strip second, which keeps every existing case meaning what it
+// meant (act on what the reader can see) without re-pointing each one at a surface the case was
+// never about. The hidden `role="status"` region is still excluded, which was the whole reason for
+// scoping in the first place.
+const pinnedZone = () => screen.queryByTestId(PINNED_BLOCKERS_TESTID);
+const inThread = (re: RegExp | string) => {
+  const hit = within(thread()).queryByText(spans(re));
+  if (hit) return hit;
+  const pinned = pinnedZone();
+  // Falls back to the thread's own getByText when there is no strip, so a genuine miss still fails
+  // with the transcript in the message rather than with "no pinned zone".
+  return pinned ? within(pinned).getByText(spans(re)) : within(thread()).getByText(spans(re));
+};
 /** Match a concierge line that is SPLIT ACROSS ELEMENTS.
  *
  *  Every app-authored line names its agent as an agent pill — a `<button>` inside the sentence — so
@@ -426,8 +442,28 @@ const spans = (re: RegExp | string) => (_t: string, el: Element | null) => {
     return typeof re === "string" ? kid === re : re.test(kid);
   });
 };
-const findInThread = (re: RegExp | string) => within(thread()).findByText(spans(re));
-const queryInThread = (re: RegExp | string) => within(thread()).queryByText(spans(re));
+const findInThread = async (re: RegExp | string) => {
+  // RE-READ BOTH SURFACES ON EVERY POLL. Sampling the strip once up front is wrong for an ASYNC
+  // matcher: `PinnedBlockers` renders `null` while nothing is live, so `pinnedZone()` is `null` for
+  // any case awaiting content that arrives there a tick later — and the lookup would then wait out
+  // its full timeout against the transcript, failing with a message pointing at the wrong surface
+  // (roborev 60158). The sync helpers are fine because they re-read at call time.
+  let found: HTMLElement | null = null;
+  await waitFor(() => {
+    const pinned = pinnedZone();
+    found =
+      within(thread()).queryByText(spans(re)) ??
+      (pinned ? within(pinned).queryByText(spans(re)) : null);
+    expect(found).not.toBeNull();
+  });
+  return found!;
+};
+const queryInThread = (re: RegExp | string) => {
+  const hit = within(thread()).queryByText(spans(re));
+  if (hit) return hit;
+  const pinned = pinnedZone();
+  return pinned ? within(pinned).queryByText(spans(re)) : null;
+};
 
 /**
  * THE RENDERED CAPTION — the observed activity line, wherever it legitimately lives.
@@ -509,7 +545,13 @@ describe("ConciergeHost", () => {
     // names a WORKER and a worker's row has to be un-hidden before the reader can see it.
     h.feed = feedWith("approval");
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
-    fireEvent.click(within(thread()).getByTestId("concierge-agent-pill"));
+    // The pill now lives on the PINNED strip, not in the transcript — the card moved, the
+    // affordance did not change.
+    // The pill now lives on the PINNED strip rather than in the transcript — the surface moved,
+    // the affordance did not. Scoped to the strip so this cannot start matching some other pill.
+    fireEvent.click(
+      within(screen.getByTestId(PINNED_BLOCKER_TESTID)).getByTestId("concierge-agent-pill"),
+    );
     expect(h.openProjectTab).toHaveBeenCalledWith("p1", "ag1");
   });
 
@@ -526,7 +568,8 @@ describe("ConciergeHost", () => {
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
     // ONE red treatment, stated once — the card's lead word — and never a "P1" badge in a second
     // alarm color. (`blocked` used to render its own amber tier; that tier is gone.)
-    expect(within(thread()).getByTestId(NUDGE_CARD_TESTID)).toBeTruthy();
+    // PINNED, not threaded — the surface moved on 2026-08-07; the treatment did not.
+    expect(screen.getByTestId(PINNED_BLOCKER_TESTID)).toBeTruthy();
     expect(inThread("BLOCKED:")).toBeTruthy();
     expect(screen.queryByText("P1")).toBeNull();
   });
@@ -538,7 +581,7 @@ describe("ConciergeHost", () => {
     // ALWAYS rendered (painted on hover) precisely so it stays reachable like this — by its
     // accessible name, without a pointer. Dropping it would have deleted the do-not-interrupt
     // feature outright: this is its only call site in the app.
-    fireEvent.click(within(thread()).getByLabelText("Mute alerts about CI Hardening"));
+    fireEvent.click(screen.getByLabelText("Mute alerts about CI Hardening"));
     expect(h.setInterruptPreference).toHaveBeenCalledWith("ag1", "mute");
   });
 

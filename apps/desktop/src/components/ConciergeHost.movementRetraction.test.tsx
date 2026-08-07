@@ -63,6 +63,7 @@ import { ConciergeHost } from "./ConciergeHost";
 import { useUiStore } from "../stores/uiStore";
 import { buildConciergeFeed } from "../services/conciergeFeed";
 import { useProjectStore } from "../stores/projectStore";
+import { PINNED_BLOCKER_TESTID } from "./Concierge/PinnedBlockers";
 import { NUDGE_CARD_TESTID } from "./Concierge/NudgeCard";
 import { emptyLedger, type MovementEvidence, type RetractionLedger } from "../engine/movementRetraction";
 import type { AgentTab, AgentTabStatus, Project } from "../types";
@@ -130,10 +131,13 @@ const tickAt = (
 // different outcomes, and the filter below is what keeps every assertion in this file meaning what
 // it meant when it was written — "no agent is being shouted about" — instead of silently weakening
 // to "nothing is on screen".
+// …AND SINCE 2026-08-07 THE LOUD ONES ARE NOT IN THE THREAD AT ALL. The founder asked for live
+// blockers to be pinned above the composer so they cannot scroll away, so "being shouted about" now
+// means "in the pinned zone". Redefining the helper — rather than rewriting the cases — is what
+// keeps every assertion below meaning exactly what it meant when it was written.
 const cardAgentIds = (): string[] =>
   screen
-    .queryAllByTestId(NUDGE_CARD_TESTID)
-    .filter((el) => el.getAttribute("data-resolved") === null)
+    .queryAllByTestId(PINNED_BLOCKER_TESTID)
     .map((el) => el.getAttribute("data-agent-id")!);
 
 /** The GREY cards — a block that is over, kept in the thread as history. */

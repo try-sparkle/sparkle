@@ -598,8 +598,25 @@ export interface ConciergeViewModel {
    *  scoped to the selected one. STILL FED, NO LONGER PRINTED: the header's per-project segments
    *  ("2 here · 1 in mobile") went with the scope line in bead sparkle-ircc3. */
   needsYouByProject?: ProjectNeedsYou[];
-  /** The thread, oldest first. Nudges are messages of kind "nudge". */
+  /** The thread, oldest first. The only nudges left here are RESOLVED ones — a finished episode is
+   *  history, and history belongs in the transcript. Live ones are in {@link pinnedBlockers}. */
   messages: ConciergeMessage[];
+  /**
+   * LIVE blockers, pinned directly above the composer and never scrolling with the thread.
+   *
+   * Founder, 2026-08-07: *"I want any sort of blocked notices to be right above the compose window.
+   * And not in line in the chat thread… they should stay persistently above the composed window so
+   * that I see them regardless of how much the chat thread moves."*
+   *
+   * DISJOINT FROM {@link messages} BY CONSTRUCTION — the host puts a live nudge in exactly one of
+   * the two. Rendering both would show one agent's blocker twice, and the scrolling copy is the one
+   * that goes stale, which is the bug the move exists to end.
+   */
+  pinnedBlockers?: ConciergeNudge[];
+  /** Blockers the reader has ACKNOWLEDGED, drawn as quiet chips that stay on the strip. Snapshots,
+   *  not live feed items: acknowledging de-escalates the published band, so these agents are no
+   *  longer derivable from the feed at all. See `PinnedBlockers`. */
+  acknowledgedBlockers?: ConciergeNudge[];
   /** True while Sparkle is composing a reply — renders the typing indicator row. */
   typing?: boolean;
   /**

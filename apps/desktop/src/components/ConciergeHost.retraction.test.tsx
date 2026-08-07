@@ -77,6 +77,10 @@ import { accountedNeedsYou } from "../services/conciergeProactive";
 import { useProjectStore } from "../stores/projectStore";
 import { useSparklePrefsStore } from "../stores/sparklePrefsStore";
 import { NUDGE_CARD_TESTID, NUDGE_LEAD_TESTID } from "./Concierge/NudgeCard";
+import {
+  PINNED_BLOCKER_CHIP_TESTID,
+  PINNED_BLOCKER_TESTID,
+} from "./Concierge/PinnedBlockers";
 import type { AgentTab, AgentTabStatus, Project } from "../types";
 import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
 
@@ -121,14 +125,21 @@ const feedFrom = (projects: Project[], status: Record<string, AgentTabStatus>) =
 
 /** Which agent each nudge card on screen is ABOUT — read off the card's own data attribute rather
  *  than by matching its prose, so these cases keep holding through the card's copy redesign. */
-// THE LOUD CARDS ONLY. Since bead `sparkle-9adzg` a card whose agent leaves the red band is not
-// removed — it is greyed and relabelled "RESOLVED after <duration>" and kept as history (the
-// founder's call). Filtering on `data-resolved` is what preserves the original meaning of every
-// `toEqual([])` below: "nothing is being shouted about", not "nothing is on screen".
+// WHO IS BEING SHOUTED ABOUT — which is what every `cardAgentIds()` assertion in this file has
+// always meant, and the reason this helper is redefined rather than the assertions rewritten.
+//
+// It has now moved TWICE, and both times the meaning was preserved here so the cases below did not
+// have to be re-reasoned:
+//   • bead `sparkle-9adzg`: a card whose agent leaves the red band is no longer removed, it is
+//     greyed and relabelled "RESOLVED after <duration>". So a `data-resolved` card stopped counting
+//     as loud — otherwise `toEqual([])` would have weakened to "nothing is on screen".
+//   • 2026-08-07, the founder's move: a LIVE blocker is no longer in the transcript at all. It is
+//     pinned above the composer, where it cannot scroll away. So the loud population is the pinned
+//     zone, and a thread that contains no loud nudge card is now the NORMAL state rather than
+//     evidence of anything.
 const cardAgentIds = (): string[] =>
   screen
-    .queryAllByTestId(NUDGE_CARD_TESTID)
-    .filter((el) => el.getAttribute("data-resolved") === null)
+    .queryAllByTestId(PINNED_BLOCKER_TESTID)
     .map((el) => el.getAttribute("data-agent-id")!);
 
 /** The GREY cards — a block that is over, kept in the thread as history. */
@@ -176,6 +187,114 @@ afterEach(() => {
   // every duration frozen, instead of the one clean red it was written to produce. Here it covers
   // any future spy in this file without each author having to remember a `finally`.
   vi.restoreAllMocks();
+});
+
+// ══ THE MOVE ═════════════════════════════════════════════════════════════════════════════════════
+// Founder, 2026-08-07: *"I want any sort of blocked notices to be right above the compose window.
+// And not in line in the chat thread… they should stay persistently above the composed window so
+// that I see them regardless of how much the chat thread moves."*
+//
+// The rule these cases pin is the SPLIT, and it is the pair that makes each half meaningful: a LIVE
+// blocker is pinned and absent from the transcript; a RESOLVED one is in the transcript and absent
+// from the pinned zone. Either assertion alone would pass against a component that put everything
+// in one place.
+describe("a live blocker is pinned above the composer, not threaded", () => {
+  it("moves the live card out of the transcript and into the pinned zone", () => {
+    const p = projectOf("p1", "sparkle-desktop", [tab("solo")]);
+    render(<ConciergeHost feed={feedFrom([p], { solo: "waiting" })} />);
+
+    // PINNED — present, and naming the blocked agent.
+    expect(cardAgentIds()).toEqual(["solo"]);
+    // AND GONE FROM THE THREAD. Read directly off the transcript's own card testid rather than
+    // through a helper, because the helper now reads the pinned zone: this is the one assertion in
+    // the file that has to name the OLD surface to prove the blocker is no longer on it. Rendering
+    // both would show one agent's blocker twice, and the scrolling copy is the one that goes
+    // stale — the exact bug the move exists to end.
+    expect(screen.queryAllByTestId(NUDGE_CARD_TESTID)).toEqual([]);
+  });
+
+  it("leaves the RESOLVED receipt in the transcript and OUT of the pinned zone", () => {
+    // The other half. Only real, live blockers pin: a finished episode that could not scroll away
+    // would be worse than the inline card it replaced, not better.
+    const p = projectOf("p1", "sparkle-desktop", [tab("solo")]);
+    const { rerender } = render(<ConciergeHost feed={feedFrom([p], { solo: "waiting" })} />);
+    rerender(<ConciergeHost feed={feedFrom([p], { solo: "working" })} />);
+
+    expect(resolvedCardAgentIds()).toEqual(["solo"]);
+    expect(cardAgentIds()).toEqual([]);
+  });
+
+  it("drops the acknowledged chip once the agent visibly gets going again", () => {
+    // ROBOREV 60158-H1. The chip could only be dropped when the agent left the fleet or went red
+    // again, so an agent that simply got UNBLOCKED kept a permanent "BLOCKED … (acknowledged)"
+    // claim on the ONE surface in this column that cannot be scrolled away from — the staleness
+    // this whole move exists to end, reintroduced where it is most durable.
+    const p = projectOf("p1", "sparkle-desktop", [tab("solo")]);
+    const { rerender } = render(<ConciergeHost feed={feedFrom([p], { solo: "waiting" })} />);
+    fireEvent.click(screen.getByTestId("concierge-nudge-dismiss"));
+
+    // Acknowledged: de-escalated to idle, chip present. This is the state that must PERSIST.
+    rerender(<ConciergeHost feed={feedFrom([p], { solo: "idle" })} />);
+    expect(
+      screen
+        .queryAllByTestId(PINNED_BLOCKER_CHIP_TESTID)
+        .map((el) => el.getAttribute("data-agent-id")),
+    ).toEqual(["solo"]);
+
+    // …and the moment it is demonstrably working, the chip goes. Nothing on the strip claims a
+    // block any more, loud or quiet.
+    rerender(<ConciergeHost feed={feedFrom([p], { solo: "working" })} />);
+    expect(screen.queryAllByTestId(PINNED_BLOCKER_CHIP_TESTID)).toEqual([]);
+    expect(cardAgentIds()).toEqual([]);
+  });
+
+  it("takes the acknowledged chip away when the reader MUTES that agent", () => {
+    // ROBOREV 60158-M2. The chips were filtered only by fleet membership, unlike both neighbouring
+    // populations — so a reader who acknowledged a blocker and then asked not to hear about that
+    // agent still had it pinned above the composer, on the un-scrollable strip. Same `eligible`
+    // gate the receipts use, and the same reason.
+    const p = projectOf("p1", "sparkle-desktop", [tab("solo")]);
+    const { rerender } = render(<ConciergeHost feed={feedFrom([p], { solo: "waiting" })} />);
+    fireEvent.click(screen.getByTestId("concierge-nudge-dismiss"));
+    rerender(<ConciergeHost feed={feedFrom([p], { solo: "idle" })} />);
+    expect(screen.queryAllByTestId(PINNED_BLOCKER_CHIP_TESTID)).toHaveLength(1);
+
+    useSparklePrefsStore.getState().setInterruptPreference("solo", "mute");
+    rerender(
+      <ConciergeHost
+        feed={buildConciergeFeed({
+          projects: [p],
+          status: { solo: "idle" },
+          openAgentIds: openIds([p]),
+          shouldInterrupt: useSparklePrefsStore.getState().shouldInterrupt,
+        })}
+      />,
+    );
+    expect(screen.queryAllByTestId(PINNED_BLOCKER_CHIP_TESTID)).toEqual([]);
+  });
+
+  it("leaves a chip when [x] acknowledges it, instead of vanishing", () => {
+    // THE FOUNDER'S ANSWER, end to end on the live host: acknowledging de-escalates the published
+    // band, so `solo` drops out of the live set and the row WOULD simply disappear from the one
+    // surface built so that it cannot. The chip is what closes that, and only a host-level case can
+    // see it — the component alone never experiences the de-escalation.
+    const p = projectOf("p1", "sparkle-desktop", [tab("solo")]);
+    const { rerender } = render(<ConciergeHost feed={feedFrom([p], { solo: "waiting" })} />);
+    fireEvent.click(screen.getByTestId("concierge-nudge-dismiss"));
+
+    // The acknowledgement itself still happened — this is the same gesture the inline card fired,
+    // and it is what calms the Build row.
+    expect(dismissed()).toEqual([{ projectId: "p1", agentId: "solo", status: "waiting" }]);
+
+    // Now the de-escalated tick the dismissal causes.
+    rerender(<ConciergeHost feed={feedFrom([p], { solo: "idle" })} />);
+    expect(cardAgentIds()).toEqual([]);
+    expect(
+      screen
+        .queryAllByTestId(PINNED_BLOCKER_CHIP_TESTID)
+        .map((el) => el.getAttribute("data-agent-id")),
+    ).toEqual(["solo"]);
+  });
 });
 
 describe("a red card names the agent that is actually red", () => {

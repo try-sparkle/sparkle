@@ -72,6 +72,7 @@ import { ConciergeSuggestions } from "./Concierge/ConciergeSuggestions";
 // fires them and this file handles them, and a literal on each side is a silent no-op waiting to
 // happen — the handler would simply never match.
 import { NUDGE_DISMISS_ACTION, NUDGE_MUTE_ACTION } from "./Concierge/NudgeCard";
+import { PINNED_CLEAR_ACTION } from "./Concierge/PinnedBlockers";
 import type { ConciergeAgent, ConciergeFeed } from "../useConciergeFeed";
 import { accountedUnmerged } from "../services/conciergeFeed";
 import type { AgentTabStatus } from "../types";
@@ -1109,6 +1110,25 @@ export function ConciergeHost({
   // not: the reader pressing [x] on a resolved card. STATE rather than a ref for exactly that
   // reason; a ref would record the removal and never repaint it.
   const [resolvedRev, setResolvedRev] = useState(0);
+  // BLOCKERS THE READER HAS ACKNOWLEDGED, kept as SNAPSHOTS so they can still be drawn.
+  //
+  // The founder's answer for what `[x]` does to a pinned blocker: *collapse to a quiet chip, never
+  // vanish.* Both halves are load-bearing and they were in tension. `[x]` stays the app's
+  // per-episode acknowledgement — the same transitive `dismissAlert` the inline card wrote, which
+  // calms the Build row and is what stopped the rollup whack-a-mole — but acknowledging
+  // de-escalates the PUBLISHED band, so the agent drops out of the live set and the row would
+  // simply vanish from the one surface built so that it cannot.
+  //
+  // A snapshot rather than an id set, for the same reason `engine/resolvedNudges` keeps one: the
+  // moment the agent leaves the red band it stops being derivable from the feed, so an id alone
+  // would name a card nothing can reconstruct.
+  //
+  // Component state rather than a module ledger, unlike the resolved one, and the difference is
+  // deliberate: that ledger holds `raisedAt`, a fact about the episode that must survive a remount.
+  // This holds "I have already looked at this one", which is a view preference about right now and
+  // SHOULD be forgotten on remount — a blocker acknowledged an hour ago deserves to speak up again
+  // in a fresh session.
+  const [acknowledged, setAcknowledged] = useState<readonly ConciergeNudge[]>([]);
   // Agents seen WORKING during the current away stretch — the recap's evidence that a finish was
   // real rather than an overlay repopulating (services/conciergeRecap.buildRecap sawWorking,
   // roborev 53669-M). Accumulated here because this effect is the only thing that observes the
@@ -5471,6 +5491,21 @@ export function ConciergeHost({
         // history". Routing it into `dismissAlert` instead would write a dismissal against an alert
         // record whose episode has already closed — seeding the NEXT red as pre-dismissed, which is
         // how a genuinely new blocker would come up already silenced.
+        // CLEAR AN ACKNOWLEDGED CHIP. The one gesture that takes a blocker off the pinned strip on
+        // purpose, and it is deliberately NOT `[x]` — see the acknowledgement below. Nothing else
+        // happens: the agent's alarm was already acknowledged when the chip was created.
+        if (actionId === PINNED_CLEAR_ACTION) {
+          setAcknowledged((prev) => prev.filter((a) => a.id !== n.id));
+          return;
+        }
+        // ACKNOWLEDGING A PINNED BLOCKER LEAVES A CHIP BEHIND. Recorded BEFORE the dismissal runs,
+        // because the dismissal is what makes `n` un-derivable: it de-escalates the published band,
+        // so by the next tick there is no live nudge left to snapshot. Without this the founder's
+        // "never vanishes" is broken by the very control he asked to keep.
+        if (!n.resolved && actionId === NUDGE_DISMISS_ACTION) {
+          setAcknowledged((prev) => (prev.some((a) => a.id === n.id) ? prev : [...prev, n]));
+          // Falls THROUGH on purpose — the acknowledgement itself still has to happen below.
+        }
         if (n.resolved && actionId === NUDGE_DISMISS_ACTION) {
           forgetResolved(windowResolvedLedger(), n.id);
           // The ledger is module state, so removing the record changes nothing React can see. The
@@ -5689,7 +5724,23 @@ export function ConciergeHost({
     // cannot infer: the card never left the stream, so its absence timer never started. Without this
     // the re-raised red renders at its original slot — for a long thread, far above the fold.
     for (const a of cardAgents) if (ledger.resolved.has(a.id)) forgetArrival(arrivalRef.current, a.id);
-    noteCardsShown(ledger, cardAgents, now);
+    // AN ACKNOWLEDGED AGENT OPENS NO EPISODE, so it can never earn a "RESOLVED after …" receipt.
+    // That is the rule the live [x] already established (an acknowledged red is not a resolved one),
+    // and it has to be enforced HERE as well as in the handler, because acknowledging now sets React
+    // state: that re-render arrives while the feed still reports the agent red, so the handler's
+    // `forgetEpisode` would be undone by a `noteCardsShown` running one render later on stale data,
+    // and the next real tick would mint exactly the false receipt the earlier fix removed.
+    //
+    // CONSERVATIVE IN THE SAFE DIRECTION. An acknowledged agent that genuinely blocks AGAIN goes
+    // loud again — that is the feed's own re-alert, and this filter does not touch it — but it earns
+    // no receipt for that second episode until the chip is cleared. A missing receipt is a gap in
+    // history; a false one is a wrong statement about a live agent. Only one of those is acceptable.
+    const acknowledgedIds = new Set(acknowledged.map((a) => a.id));
+    noteCardsShown(
+      ledger,
+      cardAgents.filter((a) => !acknowledgedIds.has(a.id)),
+      now,
+    );
     noteResolutions(ledger, stillRed, known, (id) => everyone.find((a) => a.id === id), now);
     const live = new Set(nudges.map((n) => n.id));
     // THE READER ASKED NOT TO HEAR ABOUT THESE — so they are HIDDEN, not deleted (roborev 59945-M2).
@@ -5738,17 +5789,58 @@ export function ConciergeHost({
         memberIds: g.memberIds,
       }),
     );
+    // ── LIVE BLOCKERS LEAVE THE TRANSCRIPT ──────────────────────────────────────────────────────
+    // Founder, 2026-08-07: *"I want any sort of blocked notices to be right above the compose
+    // window. And not in line in the chat thread… they should stay persistently above the composed
+    // window so that I see them regardless of how much the chat thread moves."*
+    //
+    // THE SPLIT IS BY KIND OF FACT, not by kind of item. A chat message is immutable history at a
+    // fixed position; a live blocker is neither, so inline gave it both wrong properties at once —
+    // it went stale AND it scrolled away. `engine/resolvedNudges` fixed the staleness half; this is
+    // the visibility half. So `nudges` (LIVE) is pinned above the composer and is deliberately
+    // absent from the stream below, while `resolved` (a finished episode, which IS history) stays
+    // in the transcript exactly where it was.
+    //
+    // NOT ALSO IN THE STREAM. Rendering both would put one agent's blocker on screen twice, and the
+    // scrolling copy is the one that goes stale — the precise bug this move exists to end.
+    const pinnedBlockers = nudges;
+    // ACKNOWLEDGED CHIPS, PRUNED THREE WAYS (roborev 60158-H1/M2). A chip asserts "BLOCKED" on the
+    // one surface in this column that CANNOT be scrolled away from, so a stale one is worse here
+    // than the inline card this feature replaced — which is the whole thing the move exists to end.
+    //
+    //   • GONE FROM THE FLEET — a dead-end chip naming an agent the reader can no longer open. Same
+    //     rule `resolvedNudges` applies to its receipts, for the same reason.
+    //   • MUTED or OUT OF SCOPE — the same `eligible` gate the receipts use. Acknowledging then
+    //     muting must not leave the silenced agent pinned above the composer, and a pin means
+    //     "disregard other projects" for chips as much as for anything else.
+    //   • MOVED ON — the fix for the chip that never left. It could only be dropped when the agent
+    //     left the fleet or went red again, so an agent that simply got UNBLOCKED kept a permanent
+    //     "BLOCKED … (acknowledged)" claim.
+    //
+    // THAT LAST ONE CANNOT BE `stillRed`, which is the obvious reading and is exactly backwards:
+    // acknowledging is WHAT removes the agent from `stillRed` (`withDismissedAlerts` de-escalates
+    // the published status), so filtering on it would delete every chip the instant it was created
+    // and break the founder's "never vanishes". The signal that survives is the de-escalated status
+    // itself: `alertDismissal.deEscalatedStatus` maps a red to `idle`/`stopped`, so while the block
+    // stands the agent reads as one of those, and the moment it genuinely resumes it reads
+    // `working` — and the chip goes.
+    //
+    // KNOWN RESIDUAL, stated rather than hidden: an acknowledged agent that finishes and comes to
+    // REST at `idle` is indistinguishable here from one still suppressed, so it keeps its chip until
+    // the reader clears it or it leaves the fleet. That is one click and it never hides anything —
+    // the failure being fixed was a chip that survived the agent visibly working again.
+    const liveAcknowledged = acknowledged.filter((a) => {
+      const now = everyone.find((x) => x.id === a.id);
+      if (now === undefined) return false;
+      if (eligible.get(a.id) !== true) return false;
+      return now.status === "idle" || now.status === "stopped";
+    });
     // Order the whole stream by WHEN EACH ITEM FIRST APPEARED, not by what kind it is. Concatenated
-    // as [chat, digests, nudges] only to tie-break items that arrive in the SAME tick; anything
-    // already placed keeps its slot (see engine/conciergeStreamOrder for why assign-once matters).
+    // as [chat, digests] only to tie-break items that arrive in the SAME tick; anything already
+    // placed keeps its slot (see engine/conciergeStreamOrder for why assign-once matters).
     // `resolved` last in the concatenation, so that if a card resolves in the SAME tick a chat
     // message or a digest first appears, the tie-break puts the finished thing under the new one.
-    const stream = orderByArrival(arrivalRef.current, [
-      ...chat,
-      ...digests,
-      ...nudges,
-      ...resolved,
-    ]);
+    const stream = orderByArrival(arrivalRef.current, [...chat, ...digests, ...resolved]);
     return {
       scope: { pinnedProjectName },
       vitals: feed.scopedCounts,
@@ -5757,6 +5849,9 @@ export function ConciergeHost({
       // notice below the entire conversation no matter when it arrived — so the digests read as
       // stuck to the bottom of the pane rather than as part of the thread.
       messages: stream,
+      // PINNED, not threaded — see the split above. Absent from `messages` by construction.
+      pinnedBlockers,
+      acknowledgedBlockers: liveAcknowledged,
       typing,
       attachments,
       quote: quoteApi.quote,
@@ -5780,6 +5875,9 @@ export function ConciergeHost({
     // Not read in the body — it is the repaint signal for the resolved-card ledger's one
     // out-of-band write ([x] on a resolved card). See `resolvedRev`.
     resolvedRev,
+    // Read in the body (it ships in the view model), so acknowledging repaints the strip on the
+    // same tick the reader clicks rather than at the next feed tick.
+    acknowledged,
   ]);
 
   /**

@@ -40,6 +40,14 @@ import { useHistoryStore } from "../stores/historyStore";
 import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
 import type { ConciergeFeed } from "../useConciergeFeed";
 
+// THE CARD'S PILL NOW LIVES ON THE PINNED STRIP. Since 2026-08-07 a LIVE blocker is not in the
+// transcript — the founder asked for blockers pinned above the composer so they cannot scroll
+// away — so "the pill a CARD names" is found in `concierge-pinned-blocker`. The affordance and
+// its reveal behaviour are unchanged; only the container moved.
+const cardPill = () =>
+  within(screen.getByTestId("concierge-pinned-blocker")).getByTestId("concierge-agent-pill");
+
+
 function feedAgent(id: string, name: string) {
   return {
     id,
@@ -279,7 +287,7 @@ describe("(e) the host tells the reader when the reveal had nothing to do", () =
     render(<ConciergeHost feed={nudgeFeed()} />);
 
     // The pill on the nudge card — the `onOpen` path, not the context one.
-    fireEvent.click(within(screen.getByTestId("concierge-nudge")).getByTestId("concierge-agent-pill"));
+    fireEvent.click(cardPill());
 
     // A line in the column, because the card pill has no live region of its own to speak with.
     expect(document.body.textContent ?? "").toMatch(/Build 8 is already open in other\./i);
@@ -331,7 +339,7 @@ describe("(e) the host tells the reader when the reveal had nothing to do", () =
     render(<ConciergeHost feed={nestedNudgeFeed()} />);
 
     fireEvent.click(
-      within(screen.getByTestId("concierge-nudge")).getByTestId("concierge-agent-pill"),
+      cardPill(),
     );
 
     expect(document.body.textContent ?? "").not.toMatch(/is already open in/i);
@@ -348,7 +356,7 @@ describe("(e) the host tells the reader when the reveal had nothing to do", () =
     render(<ConciergeHost feed={nestedNudgeFeed()} />);
 
     fireEvent.click(
-      within(screen.getByTestId("concierge-nudge")).getByTestId("concierge-agent-pill"),
+      cardPill(),
     );
 
     expect(document.body.textContent ?? "").toMatch(/Build 8 is already open in other\./i);
@@ -369,7 +377,7 @@ describe("(e) the host tells the reader when the reveal had nothing to do", () =
     render(<ConciergeHost feed={nestedNudgeFeed()} />);
 
     fireEvent.click(
-      within(screen.getByTestId("concierge-nudge")).getByTestId("concierge-agent-pill"),
+      cardPill(),
     );
 
     expect(document.body.textContent ?? "").toMatch(/Build 8 is already open in other\./i);
@@ -393,7 +401,7 @@ describe("(e) the host tells the reader when the reveal had nothing to do", () =
     render(<ConciergeHost feed={nestedNudgeFeed()} />);
 
     fireEvent.click(
-      within(screen.getByTestId("concierge-nudge")).getByTestId("concierge-agent-pill"),
+      cardPill(),
     );
 
     expect(document.body.textContent ?? "").toMatch(/is already open in other\./i);
@@ -413,7 +421,7 @@ describe("(e) the host tells the reader when the reveal had nothing to do", () =
     render(<ConciergeHost feed={nestedNudgeFeed("needs_you", "running")} />);
 
     fireEvent.click(
-      within(screen.getByTestId("concierge-nudge")).getByTestId("concierge-agent-pill"),
+      cardPill(),
     );
 
     expect(document.body.textContent ?? "").not.toMatch(/is already open in/i);
@@ -434,7 +442,7 @@ describe("(e) the host tells the reader when the reveal had nothing to do", () =
     render(<ConciergeHost feed={nudgeFeed()} />);
 
     fireEvent.click(
-      within(screen.getByTestId("concierge-nudge")).getByTestId("concierge-agent-pill"),
+      cardPill(),
     );
 
     expect(document.body.textContent ?? "").not.toMatch(/is already open in/i);

@@ -58,6 +58,14 @@ import { useUiStore } from "../stores/uiStore";
 import type { ConciergeFeed } from "../useConciergeFeed";
 import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
 
+// THE CARD'S PILL NOW LIVES ON THE PINNED STRIP. Since 2026-08-07 a LIVE blocker is not in the
+// transcript — the founder asked for blockers pinned above the composer so they cannot scroll
+// away — so "the pill a CARD names" is found in `concierge-pinned-blocker`. The affordance and
+// its reveal behaviour are unchanged; only the container moved.
+const cardPill = () =>
+  within(screen.getByTestId("concierge-pinned-blocker")).getByTestId("concierge-agent-pill");
+
+
 function feed(): ConciergeFeed {
   const counts = { needs_you: 0, questions: 0, running: 1, done: 0 };
   const agent = {
@@ -229,7 +237,7 @@ describe("the host reveals what a CARD's pill names, and says so when it cannot"
   }
 
   const nudgePill = () =>
-    within(screen.getByTestId("concierge-nudge")).getByTestId("concierge-agent-pill");
+    cardPill();
 
   it("says so in the thread when the reveal does not land", () => {
     render(<ConciergeHost feed={redFeed()} />);

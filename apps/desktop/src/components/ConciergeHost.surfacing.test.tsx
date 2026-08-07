@@ -86,7 +86,7 @@ vi.mock("../stores/sparklePrefsStore", () => ({
 import { ConciergeHost } from "./ConciergeHost";
 import { useUiStore } from "../stores/uiStore";
 import { buildConciergeFeed } from "../services/conciergeFeed";
-import { NUDGE_CARD_TESTID } from "./Concierge/NudgeCard";
+import { PINNED_BLOCKER_TESTID } from "./Concierge/PinnedBlockers";
 import { bandCountLabel } from "../engine/statusBandLabels";
 import type { AgentTab, AgentTabStatus, Project } from "../types";
 import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
@@ -142,9 +142,13 @@ const feedFrom = (projects: Project[], status: Record<string, AgentTabStatus>) =
  *  reader actually clicks. Taking the name from the pill keeps these cases asserting what is on
  *  screen rather than an internal id, and it fails loudly if the pill ever stops resolving — which
  *  would leave every card in this suite naming an agent the click cannot reach. */
+// SINCE 2026-08-07 A LIVE BLOCKER IS NOT IN THE THREAD. The founder asked for them pinned above
+// the composer so they cannot scroll away, so the population these cases have always meant —
+// "the agents column one is shouting about" — is now the pinned zone. Only the SURFACE moved;
+// every rule below (who gets a card, who is digested, who is suppressed) is unchanged.
 const cardNames = (): string[] =>
   screen
-    .queryAllByTestId(NUDGE_CARD_TESTID)
+    .queryAllByTestId(PINNED_BLOCKER_TESTID)
     .map((el) => el.querySelector('[data-testid^="concierge-agent-pill"]')?.textContent ?? "")
     .map((t) => t.replace(/^@/, ""));
 
@@ -356,7 +360,7 @@ describe("no red agent falls through the floor", () => {
     expect(cardNames()).toEqual(["w1"]);
     // The CARD, not a phrase inside it. This used to click the card's prose sentence, which the
     // one-line rewrite removed; clicking the card element is what the case is named for anyway.
-    fireEvent.click(screen.getByTestId(NUDGE_CARD_TESTID));
+    fireEvent.click(screen.getByTestId(PINNED_BLOCKER_TESTID));
 
     expect(useUiStore.getState().isOrchestratorCollapsed("orch")).toBe(false);
     expect(useUiStore.getState().statusFilter.running).toBe(true);
