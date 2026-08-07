@@ -295,9 +295,39 @@ export function isSessionLimitPicker(snapshot: string): boolean {
   // MAX_CHROME_BELOW_FOOTER ambient-chrome rows; and ONE closing border, which is not chrome (a
   // corner is outside the chrome class) but is the bordered dialog's own bottom edge. An OPENING
   // border is never free — a new frame starting below is what would arm Esc at a live dialog.
+  return nothingUnrecognizedBelowFooter(lines, footerAt);
+}
+
+/**
+ * Rule 2b, EXTRACTED so there is one implementation rather than a copy per caller.
+ *
+ * True when everything below `footerIdx` is recognized as belonging to a still-open dialog: blanks
+ * (unbounded), up to {@link MAX_CHROME_BELOW_FOOTER} {@link AMBIENT_CHROME_LINE} rows, and exactly
+ * ONE closing border — the bordered dialog's own bottom edge. An OPENING border is never free: a
+ * new frame starting below is positive evidence this footer belongs to an earlier one.
+ *
+ * Extracted for `engine/screenAnswerable`, which asks the same question ("is this footer the bottom
+ * of a LIVE dialog, or one the human already answered?") and shipped a partial copy that omitted the
+ * closing-border allowance — so it rejected a bordered dialog whose box closes beneath its footer,
+ * i.e. it was STRICTER than this rule while claiming to mirror it, and it silently drifted from the
+ * `nudge_gate.rs` twin these bytes are pinned to (roborev 59690).
+ *
+ * `lines` may be split with or without empty entries: blanks are skipped either way.
+ *
+ * DELIBERATELY NOT PARAMETERIZED. A caller wanting a narrower vocabulary composes an extra
+ * predicate beside this one rather than passing one in — see `screenAnswerable`. Threading an
+ * `isChrome` callback through here was tried and reverted: it rewrote the very line
+ * `nudge_gate.rs::ported_typescript_patterns_have_not_drifted` pins byte-for-byte, and that guard is
+ * the only thing keeping the Rust twin honest. Composition gets the same semantics and leaves the
+ * ported rule untouched, so the guard keeps working for the reason it exists.
+ */
+export function nothingUnrecognizedBelowFooter(
+  lines: readonly string[],
+  footerIdx: number,
+): boolean {
   let chromeBelow = 0;
   let closingBorderBudget = 1;
-  for (let i = footerAt + 1; i < lines.length; i++) {
+  for (let i = footerIdx + 1; i < lines.length; i++) {
     const line = lines[i]!;
     if (!line.trim()) continue;
     if (isOpeningBorder(line)) return false;

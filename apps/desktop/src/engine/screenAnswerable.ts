@@ -14,11 +14,11 @@
 // description rows or a `───` separator between their options (AskUserQuestion, /model) counted as
 // zero rows and survived only via the cursor short-circuit — the one fallback this family says
 // cannot be relied on, since PICKER_FOOTER exists precisely for when the cursor glyph drifts.
-import { SELECTION_CURSOR, SHELL_PROMPTS } from "./screenClassifier";
 import {
-  AMBIENT_CHROME_LINE,
-  MAX_CHROME_BELOW_FOOTER,
-} from "../services/sessionLimitScreen";
+  SELECTION_CURSOR,
+  SHELL_PROMPTS,
+  nothingUnrecognizedBelowFooter,
+} from "./screenClassifier";
 import {
   RENDERED_OPTION_ROW,
   pickerBlockBounds,
@@ -32,19 +32,28 @@ import {
 // tests per option row (roborev 58159); re-adopting the rejected form re-opened the hole.
 const LIVE_TAIL_LINES = 12;
 
-/** True when everything below `footerIdx` is ambient chrome — i.e. the dialog is still up. New
- *  agent output below the footer means it was answered and the screen moved on. Mirrors
- *  `isSessionLimitPicker`'s below-footer rule and shares its constants. */
-function liveBelowFooter(lines: readonly string[], footerIdx: number): boolean {
-  let chromeBelow = 0;
-  for (let i = footerIdx + 1; i < lines.length; i++) {
-    const line = lines[i]!;
-    if (!line.trim()) continue;
-    if (!AMBIENT_CHROME_LINE.test(line) || chromeBelow >= MAX_CHROME_BELOW_FOOTER) return false;
-    chromeBelow++;
-  }
-  return true;
-}
+// A NOTE ON WHAT THIS DELIBERATELY DOES NOT DO — an accepted residual, not an oversight.
+//
+// `AMBIENT_CHROME_LINE`'s status-glyph alternative is UNANCHORED, so it recognizes any prose behind
+// a glyph. Below a footer that admits a resumed turn's own output (the fixture's IDLE_AFTER_TURN
+// carries "\u273b Churned for 3s" as TURN OUTPUT), which keeps arm 1 alive on a dialog the human
+// already answered. roborev 59690 flagged that, and rejecting the glyph class was tried — and
+// REVERTED, because it costs strictly more than it buys:
+//
+//   Claude's live grid ENDS in five chrome rows, two of which are status bars ("\u26a0 Transcript
+//   saving is off", "\u23f8 manual mode on \u00b7 ? for shortcuts" — verbatim in
+//   capturedScreens.fixture.ts). Rejecting the class makes arm 1 false for a LIVE, fully-visible,
+//   pressable dialog, and arm 2 cannot backstop it: on a real grid the /model picker's cursor sits
+//   13 non-empty lines from the bottom, outside LIVE_TAIL_LINES. The result is a live menu that
+//   loses its one-tap Approve relay — the SAME false negative the line-budget version caused, which
+//   is what this module was fixing (roborev 59920).
+//
+// So the trade is deliberate: the residual costs a stale `approval` on an already-answered dialog
+// that is still fully on screen; the alternative costs the relay on a live one. The founder's actual
+// dead end — a footer with NO option block — is unaffected either way, since `pickerBlockBounds`
+// finds nothing to parse there. Fixing the residual properly means separating a persistent status
+// BAR from turn prose by shape, which belongs in AMBIENT_CHROME_LINE and its Rust twin, not in a
+// call-site denylist. Tracked in sparkle-7js2c.
 
 function tailContent(snapshot: string, n: number): string[] {
   return snapshot
@@ -96,9 +105,16 @@ export function screenOffersAnswer(snapshot: string): boolean {
     //
     // The discriminator is WHAT is below the footer, not HOW MUCH: persistent chrome and a task
     // checklist mean the dialog is still up; genuine new agent output means it has been answered.
-    // That is exactly `isSessionLimitPicker`'s rule, so this reuses its constants rather than
-    // inventing a second answer to the same question.
-    if (liveBelowFooter(lines, bounds.footer) && (cursored || abutsFooter)) return true;
+    // That is exactly `isSessionLimitPicker`'s rule, so this calls THE SAME FUNCTION rather than a
+    // copy. A first version copied only the constants and re-wrote the loop, which read as reuse but
+    // was a second implementation — and it drifted immediately, omitting the one-closing-border
+    // allowance and so REJECTING a bordered dialog whose box closes beneath its footer (roborev
+    // 59690). Sharing constants while rewriting the walk is not sharing the rule.
+    if (
+      nothingUnrecognizedBelowFooter(lines, bounds.footer) &&
+      (cursored || abutsFooter)
+    )
+      return true;
   }
 
   const tail = tailContent(snapshot, LIVE_TAIL_LINES);

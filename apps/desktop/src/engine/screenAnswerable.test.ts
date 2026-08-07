@@ -58,14 +58,38 @@ describe("screenOffersAnswer — arm 1 must be LIVE, not merely present", () => 
     expect(screenOffersAnswer(`${answered}\n${after}`)).toBe(false);
   });
 
-  it("ACCEPTS a live dialog with chrome still rendering BELOW its footer", () => {
-    // The boundary in the other direction, and the one a line budget got wrong. Ink keeps drawing
-    // below a live dialog — "the footer is never the last line" — so anchoring by distance rejected
-    // real, pressable menus and cost them the Approve relay. The discriminator is WHAT is below the
-    // footer (ambient chrome = still up), not HOW MUCH.
-    const dialog = [" Do you want to proceed?", " ❯ 1. Yes", "   2. No", FOOTER].join("\n");
-    const chrome = ["  ⏵⏵ accept edits on (shift+tab to cycle)", "  ? for shortcuts"].join("\n");
+  it("ACCEPTS a live dialog with real chrome rendering BELOW its footer", () => {
+    // The boundary a line budget got wrong: Ink keeps drawing below a live dialog, so anchoring by
+    // DISTANCE rejected real pressable menus. The discriminator is WHAT is below the footer.
+    //
+    // TWO THINGS MAKE THIS NON-VACUOUS, and the first draft had neither (roborev):
+    //   • the chrome lines really match AMBIENT_CHROME_LINE — `\u2500` (a rule) and `\u276f` (the
+    //     empty composer caret). The draft used `\u23f5`, which is NOT in that class at all, so its
+    //     premise was simply false.
+    //   • NO selection cursor on the option rows, so arm 2 cannot supply the `true`. The draft's
+    //     rows carried `❯`, so it passed through arm 2 and never exercised arm 1 at all.
+    const dialog = [" Do you want to proceed?", "   1. Yes", "   2. No", FOOTER].join("\n");
+    const chrome = ["  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500", "  \u276f"].join("\n");
     expect(screenOffersAnswer(`${dialog}\n${chrome}`)).toBe(true);
+  });
+
+  it("ACCEPTS a bordered dialog whose box CLOSES beneath its footer", () => {
+    // The one-closing-border allowance. A partial copy of the below-footer walk omitted it and so
+    // rejected this shape — stricter than the rule it claimed to mirror, in exactly the "renders
+    // below its footer" case (roborev 59690). Sharing the real function is what fixes it.
+    const dialog = [" Do you want to proceed?", "   1. Yes", "   2. No", FOOTER].join("\n");
+    expect(screenOffersAnswer(`${dialog}\n\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u256f`)).toBe(true);
+  });
+
+  it("ACCEPTS an answered dialog followed by status-glyph output — the documented residual", () => {
+    // NOT the behaviour we would choose, and pinned so it cannot change by accident. The glyph
+    // alternative is unanchored, so turn output reads as chrome and arm 1 stays alive. Rejecting the
+    // class was tried and reverted: it also rejects Claude's REAL bottom status bars, costing a live
+    // dialog its Approve relay, and arm 2's tail window cannot reach far enough to backstop it
+    // (roborev 59920). Residual documented in screenAnswerable.ts and tracked in sparkle-7js2c.
+    const answered = [" Do you want to proceed?", "   1. Yes", "   2. No", FOOTER].join("\n");
+    const output = ["\u273b Churned for 3s", "\u2713 Wrote src/foo.ts", "\u25cf Running tests"].join("\n");
+    expect(screenOffersAnswer(`${answered}\n${output}`)).toBe(true);
   });
 });
 
