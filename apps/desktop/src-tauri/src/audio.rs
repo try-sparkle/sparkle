@@ -133,9 +133,20 @@ pub enum ZeroSource {
 /// How much audio [`PreRoll`] retains while nothing is routing, in 16 kHz mono samples (2 s).
 ///
 /// Sized against the MEASURED cost of the window it exists to cover, not guessed: `Capture::start`
-/// plus CoreAudio's first buffer is ~456 ms cold / ~212 ms warm on the founder's machine
-/// (`measure_push_to_talk_cold_start`), and the relay handshake on top of that is documented as
-/// "~hundreds of ms" with an 8 s ceiling. 2 s covers the realistic sum with headroom.
+/// plus CoreAudio's first buffer is **~1.17 s cold / ~375-440 ms warm** on the founder's machine
+/// (`measure_push_to_talk_cold_start`, built-in mic, `allow_virtual: false`), and the relay
+/// handshake on top of that is documented as "~hundreds of ms" with an 8 s ceiling.
+///
+/// AN EARLIER REVISION SAID ~456 ms / ~212 ms AND CONCLUDED "2 s covers the realistic sum with
+/// headroom". Those numbers were measured against a VIRTUAL device and were ~2.5× optimistic; the
+/// arithmetic they supported no longer holds. State the residual margin honestly instead: 2 s
+/// comfortably covers a WARM hold (~375-440 ms plus a handshake), and covers a COLD one only if the
+/// handshake stays at the low end — ~1.17 s + "~hundreds of ms" leaves a few hundred ms of slack,
+/// and a slow cold open with a slow handshake can exceed it.
+///
+/// That is an ACCEPTED TRADE, not an oversight, because widening it is not a free win: the number
+/// below is a privacy promise the founder agreed to by its size (see [`PreRoll`]), so it is not
+/// something to raise silently when a measurement moves. Do not widen it without asking him again.
 ///
 /// It is also the PRIVACY bound, which is why it is deliberately small and stated here rather than
 /// left implicit: at rest this is the entire extent of what the microphone's history can be. 2 s of
@@ -156,9 +167,12 @@ pub const PREROLL_SAMPLES: usize = 16_000 * 2;
 ///   * the mic IS open but the relay socket is not up, so frames have nowhere to go.
 ///
 /// ── WHY A BUFFER AND NOT "MAKE IT FASTER" ──────────────────────────────────────────────────────
-/// Because the cost was measured and it does not go away. ~212 ms of it is `Capture::start` on a
-/// WARM machine — device resolve, format negotiation, stream build, first buffer — and no amount of
-/// pre-warming a socket or caching a model touches one millisecond of that. Pre-warming makes the
+/// Because the cost was measured and it does not go away. ~375-440 ms of it is `Capture::start` on
+/// a WARM machine, and ~1.17 s COLD. The dominant warm costs are `build_input_stream` (~270 ms) and
+/// `default_input_config` (~95-155 ms); device resolve is 4 ms warm and only dominates when cold
+/// (~448 ms) — an earlier revision blamed the enumeration path, which would have sent anyone
+/// optimising it after 4 ms. No amount of pre-warming a socket or caching a model touches one
+/// millisecond of any of it, because it is CoreAudio's. Pre-warming makes the
 /// loss smaller; retaining the audio makes it STRUCTURALLY IMPOSSIBLE, which is the bar the founder
 /// set ("zero words lost, ever"). A fix that merely narrows the window is one the user still hits
 /// on a slow morning.
@@ -237,14 +251,31 @@ impl PreRoll {
         out
     }
 
-    /// Forget everything retained, without routing it. For teardown paths that must not leak one
-    /// hold's audio into the next session.
+    /// Forget everything retained, WITHOUT routing it.
+    ///
+    /// ── THIS IS THE DOUBLE-TRANSCRIPTION GUARD, NOT A CONVENIENCE (roborev, High) ───────────────
+    /// A frame that is not being routed to the relay is NOT audio that fell on the floor: while the
+    /// relay is down the same frame is fed to the on-device VAD, and any segment that CLOSES there
+    /// is decoded and typed into the composer. If the ring kept holding that audio, the next
+    /// false→true edge would flush words the user can already see straight to Deepgram, which would
+    /// transcribe them a SECOND time — the exact duplication `segment_cloud_latch` exists to
+    /// prevent, reached from the other direction (that latch only suppresses a segment STRADDLING
+    /// the switch; one that opened and closed before it is already typed and still in the ring).
+    ///
+    /// So the caller clears the ring whenever the on-device engine takes a closed segment as the
+    /// engine of record. The invariant this maintains is worth stating in one line, because it is
+    /// what makes the type safe to reason about: **the ring only ever holds audio no engine has
+    /// claimed.**
+    ///
+    /// An earlier revision of this branch deleted this method as an unused convenience. It was
+    /// unused because it had not been wired yet, which is a different thing.
     pub fn clear(&mut self) {
         self.ring.clear();
         self.retained = 0;
     }
 
-    /// Samples currently retained — for tests and for asserting the privacy bound holds.
+    /// Samples currently retained — how the privacy bound is asserted.
+    #[cfg(test)]
     pub fn retained(&self) -> usize {
         self.retained
     }
@@ -1332,10 +1363,10 @@ mod tests {
         // is the privacy promise broken, not merely memory wasted.
         let mut pre = PreRoll::new(100);
         for _ in 0..5 {
-            pre.note(&vec![1.0; 20], false); // ring is now exactly full: 5 x 20 = 100
+            pre.note(&[1.0; 20], false); // ring is now exactly full: 5 x 20 = 100
         }
         assert_eq!(pre.retained(), 100, "precondition: the ring starts exactly at capacity");
-        pre.note(&vec![2.0; 90], false); // 190 retained — needs FIVE evictions, not one
+        pre.note(&[2.0; 90], false); // 190 retained — needs FIVE evictions, not one
         assert!(
             pre.retained() <= 100,
             "retained {} samples against a {} bound: one big frame evicted only a single small one, \
@@ -1343,6 +1374,39 @@ mod tests {
             pre.retained(),
             100
         );
+    }
+
+    #[test]
+    fn audio_the_on_device_engine_already_typed_is_never_re_sent_to_the_relay() {
+        // ── THE DOUBLE-TRANSCRIPTION GUARD (roborev, High) ────────────────────────────────────
+        // While the relay is down the same frames feed the on-device VAD, and a segment that CLOSES
+        // there is decoded and typed into the composer. Retaining that audio and flushing it on the
+        // next false→true edge would have Deepgram transcribe words the user can already see —
+        // duplicated text. `build_capture` clears the ring whenever it dispatches a closed segment,
+        // and this pins the resulting invariant: the ring only ever holds audio no engine claimed.
+        let mut pre = PreRoll::new(PREROLL_SAMPLES);
+        // Frames 0-2 are spoken on-device and a VAD segment closes over them.
+        for i in 0..3 {
+            pre.note(&utterance_frame(i), false);
+        }
+        pre.clear(); // what build_capture does when that closed segment goes to the decoder
+        // Frames 3-4 are spoken after it: not claimed by anything, so they MUST survive.
+        for i in 3..5 {
+            pre.note(&utterance_frame(i), false);
+        }
+        let flushed = pre.note(&utterance_frame(5), true);
+        assert_eq!(
+            flushed,
+            vec![utterance_frame(3), utterance_frame(4), utterance_frame(5)],
+            "the relay must receive only the UNCLAIMED audio; re-sending frames 0-2 would have \
+             Deepgram transcribe text the on-device engine already typed into the composer"
+        );
+        for claimed in 0..3 {
+            assert!(
+                !flushed.contains(&utterance_frame(claimed)),
+                "frame {claimed} was already decoded on-device and must never reach the relay"
+            );
+        }
     }
 
     #[test]
@@ -1377,12 +1441,57 @@ mod tests {
     #[test]
     #[ignore = "opens the real microphone and sleeps; run with --ignored --nocapture"]
     fn measure_push_to_talk_cold_start() {
+        // A SUBSCRIBER, or the whole per-stage breakdown is discarded (roborev, Medium). Without
+        // one, `Capture::start`'s `resolve_ms`/`config_ms`/`build_ms`/`play_ms` go to a no-op global
+        // dispatcher — so this printed a single aggregate while the commit message attributed it to
+        // specific stages, which is an attribution the run could not support. The stage split is the
+        // whole point: device resolve and the stream build have different fixes, and the corrected
+        // numbers say the second is what dominates a warm hold.
+        //
+        // ── WHICH EVENTS THIS ACTUALLY RECOVERS, AND WHICH IT CANNOT (roborev, Medium) ───────────
+        // `set_global_default`, NOT `with_default`. The latter installs a THREAD-LOCAL dispatcher,
+        // so it recovers only what is emitted on this test's own thread — the four sub-spans above.
+        // The `"first audio frame delivered"` event and the cpal error callback are emitted from the
+        // CoreAudio realtime IO thread, which would still resolve to the no-op GLOBAL dispatcher and
+        // discard them. An earlier revision of this comment claimed the first-frame line among the
+        // things it recovered, which was the same defect this test exists to correct: a comment
+        // asserting an observation the run cannot make. Going global covers every thread.
+        //
+        // A FAILED INSTALL IS TOLERATED BUT NEVER SILENT (roborev, Medium). `set_global_default`
+        // succeeds once per PROCESS, and these tests share one — so an earlier installer would make
+        // this a no-op and the stage split would vanish, leaving exactly the single-aggregate output
+        // this test was changed to stop producing, with nothing on screen saying so. Tolerating it
+        // is right (a test that asserts nothing should not panic over a logger); swallowing it is
+        // not, because "the breakdown is missing" would be indistinguishable from "the stages cost
+        // nothing". Note the first-frame number is unaffected either way — the body times it with
+        // its own `AtomicU64` rather than reading it back from a log — but the per-stage split comes
+        // solely from the subscriber, and that split is the whole point.
+        let subscriber = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        if let Err(e) = tracing::subscriber::set_global_default(subscriber) {
+            eprintln!(
+                "WARN: a global tracing subscriber was already installed ({e}); the per-stage \
+                 resolve/config/build/play breakdown below is MISSING, not zero — the first-frame \
+                 totals are still measured directly and remain trustworthy."
+            );
+        }
+        measure_push_to_talk_cold_start_body();
+    }
+
+    fn measure_push_to_talk_cold_start_body() {
         for round in 1..=3 {
             let t0 = std::time::Instant::now();
             let first_us = Arc::new(AtomicU64::new(0));
             let sink = first_us.clone();
+            // `allow_virtual: false` — the app's own push-to-talk default (roborev, Medium). With
+            // it true this could bind a HAL plug-in whose open cost bears no relation to a real
+            // microphone's, and the printed figure carried no device name, so a number measured
+            // against a virtual device was indistinguishable from a real one. These figures are
+            // quoted as the justification for the pre-roll design, so they have to be attributable.
             let capture = match Capture::start(
-                &DeviceChoice::Auto { allow_virtual: true },
+                &DeviceChoice::Auto { allow_virtual: false },
                 move |_frame: Vec<f32>| {
                     // Only the FIRST delivery is recorded; later frames leave the 0 sentinel alone.
                     let _ = sink.compare_exchange(
@@ -1394,9 +1503,16 @@ mod tests {
                 },
             ) {
                 Ok(c) => c,
+                // `continue`, not `return`, and the cause is NOT asserted (roborev, Medium). Only
+                // round 1 can mean "no input device"; rounds 2-3 open ~400 ms after a `Capture`
+                // drop, which is exactly when CoreAudio can transiently report the device busy —
+                // a state the sibling guard in this file documents as real and observed. Returning
+                // there silently discarded the WARM rounds, which are the ones establishing the
+                // per-hold floor the architecture rests on, under a message blaming an absent
+                // device.
                 Err(e) => {
-                    eprintln!("SKIPPED measure_push_to_talk_cold_start: no usable input device ({e})");
-                    return;
+                    eprintln!("round {round}: SKIPPED — Capture::start failed ({e})");
+                    continue;
                 }
             };
             let start_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -1405,11 +1521,22 @@ mod tests {
             while first_us.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
+            // NAME THE DEVICE on every round. Without it a reading is unattributable, and these
+            // numbers are the argument for the design.
+            let dev = capture.device();
             match first_us.load(Ordering::Relaxed) {
-                0 => eprintln!("round {round}: Capture::start {start_ms:7.1} ms | NO FRAME within 3000 ms"),
+                0 => eprintln!(
+                    "round {round}: device {:?} (virtual={} default={}) | Capture::start \
+                     {start_ms:7.1} ms | NO FRAME within 3000 ms",
+                    dev.name, dev.is_virtual, dev.was_default
+                ),
                 us => eprintln!(
-                    "round {round}: Capture::start {start_ms:7.1} ms | first frame at {:7.1} ms \
-                     (= audio lost if the user speaks at t=0)",
+                    "round {round}: device {:?} (virtual={} default={}) | Capture::start \
+                     {start_ms:7.1} ms | first frame at {:7.1} ms (= audio lost if the user speaks \
+                     at t=0)",
+                    dev.name,
+                    dev.is_virtual,
+                    dev.was_default,
                     us as f64 / 1000.0
                 ),
             }

@@ -9,7 +9,20 @@
 //!   - **cloud** (Deepgram Nova-3, `cloud.rs`): opened only once the user is actively dictating
 //!     (the frontend's dictation phase reaches ACTIVE and calls `start_cloud_stream`), and closed
 //!     on stop. While it's open the capture callback routes frames to Deepgram instead of the
-//!     on-device model, so the cloud only ever sees speech the user intended to dictate.
+//!     on-device model.
+//!
+//!     **WHAT THE CLOUD RECEIVES IS THE UTTERANCE PLUS A BOUNDED PRE-ROLL** (sparkle-oyapv). This
+//!     used to read "the cloud only ever sees speech the user intended to dictate", and that is no
+//!     longer the whole truth: on the frame the stream goes live, up to
+//!     [`crate::audio::PREROLL_SAMPLES`] (2 s) of audio captured BEFORE the phase reached ACTIVE is
+//!     flushed to Deepgram. That is the point — it is what stops the first words of a push-to-talk
+//!     hold being lost to the ~375 ms-to-1.2 s the mic and socket take to come up — but it means
+//!     audio from just before the key went down can leave the machine, so the boundary is stated
+//!     here rather than left to be discovered in `audio.rs`.
+//!
+//!     Two things bound it. The ring is capped at `PREROLL_SAMPLES` and holds nothing else; and it
+//!     is CLEARED whenever the on-device engine takes a closed segment as the engine of record, so
+//!     audio already transcribed locally is never re-sent (see `PreRoll::clear`).
 //!
 //! WHAT MOVES THE PHASE, since this module's job is to react to it: the three-position send tray
 //! (`voice/sendMode`, `voice/dictationPhase`). **Speak** holds ACTIVE for as long as the tray sits
@@ -541,6 +554,59 @@ fn segment_cloud_latch(touched: bool, cloud_now: bool, segment_closed: bool) -> 
     } else {
         (touched, false)
     }
+}
+
+/// Hand every closed segment to the decode worker, then let the pre-roll forget what the decoder
+/// ACCEPTED — in that order, which is the whole point of the function existing.
+///
+/// Returns how many segments the channel took, so a caller (and a test) can see the claim rather
+/// than infer it.
+///
+/// ── WHY THIS IS A FUNCTION AND NOT FOUR LINES IN THE AUDIO CALLBACK ────────────────────────────
+/// Because the bug was the ORDER, and an order is not something a pure predicate can pin. The first
+/// attempt at this extracted only `accepted > 0`; the call site still re-implemented the sequence by
+/// hand, so reverting it to the broken form (clear above the loop) left every test green — the
+/// helper was covered and the behaviour was not (roborev, Medium, twice).
+///
+/// ── THE INVARIANT ──────────────────────────────────────────────────────────────────────────────
+/// The ring only ever holds audio NO ENGINE HAS CLAIMED, and the subtlety is what counts as a claim.
+/// OFFERING a segment to the decoder is not one: `try_send` is deliberately lossy — a full queue
+/// drops it (`DECODE_QUEUE_CAP`, the documented "burst, or a slow machine") and a disconnected one
+/// swallows it. Clearing on the offer meant that on exactly those paths the audio was gone from BOTH
+/// engines: never decoded on-device, and no longer in the ring for the relay to recover. A slow
+/// machine is precisely when the queue fills AND precisely when the ring is what saves the words.
+///
+/// A claim is a segment the channel ACCEPTED — it will be decoded and typed into the composer as a
+/// `dictation://partial`, so re-sending its audio to Deepgram on the next false→true edge would
+/// transcribe it a second time. Any acceptance clears the whole ring: the ring is not per-segment,
+/// so there is nothing finer to express.
+pub(crate) fn dispatch_closed_segments(
+    decode_tx: &SyncSender<Vec<f32>>,
+    segs: Vec<Vec<f32>>,
+    preroll: &mut crate::audio::PreRoll,
+) -> usize {
+    let mut accepted = 0usize;
+    for samples in segs {
+        // Non-blocking, drop-on-full: the audio thread must never block. A full queue (worker fell
+        // behind) drops the newest segment; a disconnected channel (worker gone during teardown) is
+        // a silent no-op.
+        match decode_tx.try_send(samples) {
+            Ok(()) => accepted += 1,
+            Err(TrySendError::Full(_)) => tracing::warn!(
+                target: "dictation",
+                "decode queue full; dropping a segment (decoder fell behind); \
+                 the pre-roll KEEPS this audio so the relay can still recover it"
+            ),
+            Err(TrySendError::Disconnected(_)) => {}
+        }
+    }
+    // AFTER the loop, and only for what was taken. Moving this above the loop is the regression the
+    // tests beside `a_segment_the_decoder_refused_leaves_the_pre_roll_holding_the_audio` exist to
+    // catch.
+    if accepted > 0 {
+        preroll.clear();
+    }
+    accepted
 }
 
 /// THE ON-DEVICE "the user is talking RIGHT NOW" signal — the auto-send countdown's cancel.
@@ -1919,19 +1985,39 @@ fn build_capture(
                     "dropping a segment that straddled the cloud→on-device switch; the relay already transcribed it"
                 );
             } else {
-                for samples in segs {
-                    // Non-blocking, drop-on-full: the audio thread must never block. A full queue
-                    // (worker fell behind) drops the newest segment; a disconnected channel (worker
-                    // gone during teardown) is a silent no-op.
-                    match decode_tx.try_send(samples) {
-                        Ok(()) => {}
-                        Err(TrySendError::Full(_)) => tracing::warn!(
-                            target: "dictation",
-                            "decode queue full; dropping a segment (decoder fell behind)"
-                        ),
-                        Err(TrySendError::Disconnected(_)) => {}
-                    }
-                }
+                // ── THE ON-DEVICE ENGINE IS TAKING THIS AUDIO, SO THE RING MUST LET IT GO ────────
+                // (roborev, High.) A closed segment dispatched here is decoded on the DecodeWorker
+                // and typed into the composer as a `dictation://partial`. The pre-roll is holding
+                // those very frames, so without this the next time the relay comes up it would
+                // flush words the user can ALREADY SEE to Deepgram and have them transcribed a
+                // second time — duplicated text in the composer.
+                //
+                // `segment_cloud_latch` above does not cover this: it suppresses a segment that
+                // STRADDLES the switch, whereas this is a segment that opened and closed entirely
+                // before it. Reachable on every on-device↔cloud round trip inside one capture —
+                // socket death and reopen, out-of-credits then restored, and hold-to-hold when the
+                // capture survives the release.
+                //
+                // Clearing on `closed` (not per frame) is deliberate: mid-segment audio has NOT
+                // been claimed by anything yet, and that is precisely the audio the pre-roll exists
+                // to save.
+                //
+                // ── AND THE CLEAR HAPPENS *AFTER* THE HAND-OFF, NOT BEFORE (roborev, Medium) ─────
+                // "The on-device engine takes the segment" is not the same event as "we tried to
+                // give it one". `try_send` is deliberately lossy — a full queue drops the segment
+                // (`DECODE_QUEUE_CAP`, the documented "burst, or a slow machine") and a
+                // disconnected one swallows it silently. Clearing first meant that on exactly those
+                // paths the audio was gone from BOTH engines: never decoded on-device, and no
+                // longer in the ring for the relay to pick up. A slow machine is precisely when the
+                // queue fills AND precisely when the ring is supposed to save the words, so the two
+                // failures coincided.
+                //
+                // THE ORDERING IS THE FIX, so it lives inside `dispatch_closed_segments` where a
+                // test can drive it against a real channel — a predicate the call site re-implements
+                // by hand pins nothing (roborev, Medium: the first attempt at this extracted only
+                // `accepted > 0`, and reverting the call site to the broken order left the suite
+                // green).
+                dispatch_closed_segments(&decode_tx, segs, &mut preroll);
             }
             spk
         };
@@ -1943,8 +2029,11 @@ fn build_capture(
         // with its leading words in front of it.
         //
         // Measured, on the founder's machine: `Capture::start` plus CoreAudio's first buffer is
-        // ~456 ms cold / ~212 ms warm, and the handshake is "~hundreds of ms" on top. That is the
-        // audio this recovers; without it the user's first words are simply never captured.
+        // ~1.17 s cold / ~375-440 ms warm, and the handshake is "~hundreds of ms" on top. That is
+        // the audio this recovers; without it the user's first words are simply never captured.
+        // (The ~456/~212 this used to cite was measured against a VIRTUAL device — ~2.5× optimistic.
+        // `crate::audio::PREROLL_SAMPLES` carries the corrected figures and what they cost the
+        // ring's headroom.)
         let to_send = preroll.note(&frame, cloud);
         if !to_send.is_empty() {
             // Route to the relay WITHOUT locking the `cloud` teardown mutex. `try_lock` on the
@@ -2909,6 +2998,18 @@ pub async fn start_dictation(app: AppHandle, state: State<'_, DictationState>) -
                 // holding the session lock across them from this worker is the sparkle-sfxu deadlock.
                 drop(sess);
                 state.reconcile_capture(&app);
+                // EVERY EXIT EMITS A LINE (roborev, Medium), and this is the one that most needed
+                // it: `reconcile_capture` can invoke the blocking `Capture::start`, so a slow hold
+                // down this path produced an audio.rs "capture start timing" line with no
+                // start_dictation line to attach it to. Hours later in a release log, "no line" is
+                // indistinguishable from "the command never ran", and nothing recorded WHICH path
+                // the hold took. `outcome` makes the path part of the record.
+                tracing::info!(
+                    target: "dictation",
+                    outcome = "fast-path",
+                    total_ms = t_cmd.elapsed().as_millis() as u64,
+                    "start_dictation timing"
+                );
                 return Ok(());
             }
             BeginStart::CoalesceWithInFlight => {
@@ -2918,6 +3019,12 @@ pub async fn start_dictation(app: AppHandle, state: State<'_, DictationState>) -
                 tracing::info!(
                     target: "dictation",
                     "start_dictation coalesced onto the in-flight load (same intent, another window)"
+                );
+                tracing::info!(
+                    target: "dictation",
+                    outcome = "coalesced",
+                    total_ms = t_cmd.elapsed().as_millis() as u64,
+                    "start_dictation timing"
                 );
                 return Ok(());
             }
@@ -2970,13 +3077,24 @@ pub async fn start_dictation(app: AppHandle, state: State<'_, DictationState>) -
     //
     // The Authorized path (every existing user, the founder included) is one cached, process-local
     // status read and then straight through: no prompt, no state change, no measurable latency.
+    // ── EACH SPAN IS STAMPED AT ITS OWN STAGE, NOT FROM COMMAND ENTRY (roborev, Medium) ──────────
+    // These were all measured from `t_cmd`, so each billed the work of every stage before it —
+    // `permission_ms` absorbed the session-lock acquisition and `begin_start_decision`, and that
+    // lock is the one documented as contended with the main thread (sparkle-sfxu). A hold that
+    // stalled on the lock would have been reported as time in the mic-permission check, sending the
+    // reader to the wrong file. That is exactly the defect the instrumentation commit argued
+    // against ("one number would say 'slow' without saying which one to attack"), reached by
+    // mis-attribution rather than by aggregation. `prelude_ms` now carries that time under its own
+    // name rather than hiding inside a neighbour.
+    let prelude_ms = t_cmd.elapsed().as_millis() as u64;
+    let t_perm = std::time::Instant::now();
     tauri::async_runtime::spawn_blocking(crate::mic_permission::ensure_access_blocking)
         .await
         .map_err(|e| format!("microphone permission check failed: {e}"))??;
     // The comment above claims "no measurable latency" for an already-authorized user. That is an
     // assertion nobody had checked, and it omits the `spawn_blocking` hop itself — which on a busy
     // machine queues behind other blocking work (the very scenario the abort below exists for).
-    let permission_ms = t_cmd.elapsed().as_millis() as u64;
+    let permission_ms = t_perm.elapsed().as_millis() as u64;
 
     // Early-out: re-check the epoch BEFORE committing to the load. The permission check above is
     // itself an await, and on a busy machine `spawn_blocking` can sit queued behind other work for a
@@ -3003,6 +3121,14 @@ pub async fn start_dictation(app: AppHandle, state: State<'_, DictationState>) -
             //     broadcast can't be matched to per-window intent without an identity. Doing it
             //     properly needs a monotonic start id passed to this command and echoed back; see
             //     PRD/sparkle/mic-multi-window-start-stop-race.md.
+            tracing::info!(
+                target: "dictation",
+                outcome = "aborted-pre-load",
+                prelude_ms,
+                permission_ms,
+                total_ms = t_cmd.elapsed().as_millis() as u64,
+                "start_dictation timing"
+            );
             return Ok(());
         }
     }
@@ -3015,6 +3141,7 @@ pub async fn start_dictation(app: AppHandle, state: State<'_, DictationState>) -
     // load is off-thread the event loop is live throughout, so stop_dictation (and a second
     // start_dictation) genuinely can interleave here. `start_after_load` is the guard that makes
     // that safe, and it is now load-bearing.
+    let t_model = std::time::Instant::now();
     let root = crate::dev_identity::app_data_dir(&app)?.join("models");
     let app_for_progress = app.clone();
     let transcriber = tauri::async_runtime::spawn_blocking(move || {
@@ -3029,7 +3156,9 @@ pub async fn start_dictation(app: AppHandle, state: State<'_, DictationState>) -
     // The ASR decoder is cached process-static, so a warm hold does NOT pay the ~2.5s ONNX
     // recognizer init here. It DOES still pay a fresh Silero VAD session plus three rounds of file
     // verification, and that cost has never been separated from the cached case in any log.
-    let model_ms = t_cmd.elapsed().as_millis() as u64 - permission_ms;
+    // Stamped from `t_model`, so this is the load ALONE — it no longer absorbs the post-permission
+    // epoch re-check (a second acquisition of the contended session lock) or `app_data_dir`.
+    let model_ms = t_model.elapsed().as_millis() as u64;
     let transcriber = Arc::new(Mutex::new(transcriber));
 
     let mut sess = state.0.lock().unwrap_or_else(|p| p.into_inner());
@@ -3043,6 +3172,15 @@ pub async fn start_dictation(app: AppHandle, state: State<'_, DictationState>) -
             // Same two caveats as the pre-load abort above: `sess` is still held (drop it before any
             // webview emit — sparkle-sfxu), and this leaves the ring optimistically claiming to
             // listen until the `[enabled]` effect settles it.
+            tracing::info!(
+                target: "dictation",
+                outcome = "aborted-post-load",
+                prelude_ms,
+                permission_ms,
+                model_ms,
+                total_ms = t_cmd.elapsed().as_millis() as u64,
+                "start_dictation timing"
+            );
             return Ok(());
         }
         StartAfterLoad::AlreadyArmed => {
@@ -3051,6 +3189,17 @@ pub async fn start_dictation(app: AppHandle, state: State<'_, DictationState>) -
             // lock (drop the guard first) — the sparkle-sfxu deadlock rule.
             drop(sess);
             state.reconcile_capture(&app);
+            // Like the fast path, this reconciles — so it can build a capture and must not leave
+            // that capture's timing line unattributed.
+            tracing::info!(
+                target: "dictation",
+                outcome = "already-armed",
+                prelude_ms,
+                permission_ms,
+                model_ms,
+                total_ms = t_cmd.elapsed().as_millis() as u64,
+                "start_dictation timing"
+            );
             return Ok(());
         }
         StartAfterLoad::Arm => {}
@@ -3084,6 +3233,8 @@ pub async fn start_dictation(app: AppHandle, state: State<'_, DictationState>) -
     // only when a capture was actually built.
     tracing::info!(
         target: "dictation",
+        outcome = "armed",
+        prelude_ms,
         permission_ms,
         model_ms,
         reconcile_ms = t_reconcile.elapsed().as_millis() as u64,
@@ -3614,7 +3765,7 @@ mod tests {
     use super::{AppHandle, State, AudioHealth, FaultAction, fault_action, no_audio_message,
         fold_silence_evidence, install_retracts, reported_after_install, watchdog_report_message, ZeroSource,
         missing_tick, build_suppresses_watch, BUILD_STALL_GRACE, DictationSession, MISSING_CAPTURE_TICKS, watchdog_emission, WatchdogEmission,
-        begin_start_decision, capture_should_be_live, choose_engine, cloud_reuse, frame_on_device_speech, frame_speaking, segment_cloud_latch, park_cloud_for_blur, plan_capture,
+        begin_start_decision, capture_should_be_live, choose_engine, cloud_reuse, frame_on_device_speech, frame_speaking, dispatch_closed_segments, segment_cloud_latch, park_cloud_for_blur, plan_capture,
         apply_decode_plan, plan_decode_emit, DecodeEmitPlan, DecodeEmitSink, DecodeOutcome,
         segment_fingerprint, should_emit_blur, should_install_cloud, should_keep_warm_on_stop, should_log_interim, INTERIM_LOG_EVERY, next_interim_index, reset_interim_log_sampling,
         should_resume_on_focus, should_standby_on_blur, start_after_load, stop_is_noop, unpark_cloud_for_focus, BeginStart, CapturePlan,
@@ -4970,6 +5121,64 @@ mod tests {
         // stream ends would be judged by a stale `false`).
         let (l, _) = segment_cloud_latch(false, true, false);
         assert_eq!(segment_cloud_latch(l, true, true), (true, true));
+    }
+
+    #[test]
+    fn a_segment_the_decoder_refused_leaves_the_pre_roll_holding_the_audio() {
+        // roborev (Medium), the counterpart to the double-transcription guard. The ring may forget
+        // audio an engine CLAIMED — but offering a segment to the decoder is not a claim, because
+        // `try_send` is lossy by design (`DECODE_QUEUE_CAP` full → dropped; disconnected → silent).
+        // Clearing on the OFFER lost the words from both engines at once, on exactly the slow
+        // machine where the ring is what saves them.
+        // THE ORDER IS WHAT IS UNDER TEST, so this drives the real `dispatch_closed_segments`
+        // against a real `sync_channel` rather than re-implementing the sequence by hand. Moving
+        // the clear back above the send loop reds the first two cases (roborev, Medium: an earlier
+        // version of this test extracted only the predicate, and that revert stayed green).
+        let frame = vec![0.5f32; 160];
+        let seg = || vec![vec![0.25f32; 800]];
+
+        // 1. THE QUEUE IS FULL — the segment is dropped, so nobody has this audio and the ring must
+        //    still be holding it for the relay.
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(1);
+        tx.try_send(vec![0.0; 8]).expect("prefill the one slot");
+        let mut pre = crate::audio::PreRoll::new(crate::audio::PREROLL_SAMPLES);
+        pre.note(&frame, false);
+        assert_eq!(dispatch_closed_segments(&tx, seg(), &mut pre), 0, "a full queue accepts nothing");
+        assert_eq!(
+            pre.note(&frame, true).len(),
+            2,
+            "the refused segment's audio must survive in the ring — clearing on the OFFER leaves it \
+             transcribed by NOTHING: dropped by the decoder and gone from the relay's pre-roll"
+        );
+
+        // 2. THE WORKER IS GONE (teardown) — same reasoning, silent path.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(4);
+        drop(rx);
+        let mut pre = crate::audio::PreRoll::new(crate::audio::PREROLL_SAMPLES);
+        pre.note(&frame, false);
+        assert_eq!(dispatch_closed_segments(&tx, seg(), &mut pre), 0, "a dead channel accepts nothing");
+        assert_eq!(pre.note(&frame, true).len(), 2, "a disconnected decoder is not a claim either");
+
+        // 3. THE DECODER TOOK IT — it will be typed into the composer, so the ring MUST forget it or
+        //    Deepgram transcribes the same words a second time.
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(4);
+        let mut pre = crate::audio::PreRoll::new(crate::audio::PREROLL_SAMPLES);
+        pre.note(&frame, false);
+        assert_eq!(dispatch_closed_segments(&tx, seg(), &mut pre), 1, "the channel had room");
+        assert_eq!(
+            pre.note(&frame, true).len(),
+            1,
+            "only the current frame: re-sending the decoded span duplicates text the user can see"
+        );
+
+        // 4. A PARTIAL acceptance still claims the ring — several segments can close on one frame,
+        //    and the ring is not per-segment, so any acceptance means some of it is spoken for.
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(1);
+        let mut pre = crate::audio::PreRoll::new(crate::audio::PREROLL_SAMPLES);
+        pre.note(&frame, false);
+        let two = vec![vec![0.25f32; 800], vec![0.3f32; 800]];
+        assert_eq!(dispatch_closed_segments(&tx, two, &mut pre), 1, "one fit, one did not");
+        assert_eq!(pre.note(&frame, true).len(), 1, "partial acceptance still clears");
     }
 
     #[test]
