@@ -283,16 +283,27 @@ export function stageChipIsSilent(stage: WorkflowStageId, section?: BuildSection
 }
 
 // ── Status bands (the filter) ────────────────────────────────────────────────────────────────
-// The four buckets the filter chips toggle. These are EXACTLY the four color tiers in
-// packages/ui/tokens.ts AGENT_STATUS (RED / BLUE / GREEN / GRAY) — deliberately so, because the
-// row's dot is painted from that same taxonomy. A chip therefore hides precisely the rows whose dot
-// matches its own color, which is the only mapping a user can predict without being told.
+// The four buckets the filter chips toggle. These are the color tiers in packages/ui/tokens.ts
+// AGENT_STATUS (RED / BLUE / GREEN / GRAY) — deliberately so, because the row's dot is painted from
+// that same taxonomy. A chip therefore hides precisely the rows whose dot matches its own color,
+// which is the only mapping a user can predict without being told.
 //
-// It was THREE until 2026-08-05. `questions` (BLUE) is the fourth, and the 1:1 pin is why it had to
-// become a band rather than ride inside `needs_you`: statusBandLabels.test.ts asserts every band is
-// a different color and that each band's color comes from its own `colorFrom` status, so a fourth
-// hue with no fourth band fails there. That pin is doing its job — read the AGENT_STATUS header in
-// tokens.ts for why the hue split was taken.
+// It was THREE until 2026-08-05, when `questions` (BLUE) became the fourth. The 1:1 pin is why THAT
+// one had to become a band rather than ride inside `needs_you`: statusBandLabels.test.ts asserts
+// every band is a different color and that each band's color comes from its own `colorFrom` status.
+//
+// ⚠️ `lapsed` (AMBER, 2026-08-06) IS THE ONE STATUS COLOR WITH NO BAND OF ITS OWN, and that is a
+// decision rather than an omission. The pins above constrain BAND colors — that they are mutually
+// distinct and each sourced from its own status — and say nothing about every STATUS color having a
+// band. So the amber dot the founder asked for costs no fifth chip.
+//
+// It rides in `done` ("nothing is stopping you"), which is exactly true of it, and the only property
+// this change actually needed is that it is NOT in `needs_you` — the band the concierge digest
+// COUNTS and the red chip narrows. A fifth band was built first and then withdrawn: it forced a
+// `lapsed: 0` into ~40 `Record<StatusBand, number>` literals across the concierge, the project tabs
+// and their suites, which is a lot of churn and regression surface to buy a filter chip nobody
+// asked for. If a "show me what gave up" chip is ever wanted, THAT is the change that earns the
+// band — the taxonomy is ready for it, and this comment is the argument to overrule.
 export type StatusBand = "needs_you" | "questions" | "running" | "done";
 
 export interface StatusBandMeta {
@@ -308,6 +319,7 @@ export interface StatusBandMeta {
 // Not first: a genuine red still outranks a question, because red means work has STOPPED and blue
 // means work is about to be done right. Not last either — a question the founder never scrolls to
 // is a stalled agent.
+//
 export const STATUS_BANDS: readonly StatusBandMeta[] = [
   { id: "needs_you", label: "Needs you", colorFrom: "waiting" },
   { id: "questions", label: "Questions", colorFrom: "questions" },
@@ -364,6 +376,14 @@ export function bandOfStatus(status: AgentTabStatus): StatusBand {
       return "questions";
     case "working":
       return "running";
+    // AMBER → `done`, and the load-bearing half is which band it is kept OUT of. `needs_you` is the
+    // band the concierge digest COUNTS and the red chip narrows, and an agent whose auto-continue
+    // budget ran out is not asking the human for anything — banding it there would re-create the
+    // exact "N agents need you" inflation this tier was added to answer. `done` ("nothing is
+    // stopping you") is true of it; the amber DOT is what carries "the machinery stopped", the same
+    // division of labor `unmerged` and `new` already use. See the StatusBand comment above for why
+    // it has no band of its own.
+    case "lapsed":
     case "idle":
     case "done":
     case "stopped":

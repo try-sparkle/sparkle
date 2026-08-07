@@ -15,6 +15,7 @@ import {
 import type { GoalBadge } from "./rowAttention";
 import { STALL_CAUSE_LABEL, THRASH_VERDICT_LABEL } from "./rowAttention";
 import type { StallCause, StallReport } from "../engine/agentStall";
+import { escalationFor } from "../engine/stallEscalation";
 import type { ThrashReport, ThrashVerdict } from "../engine/agentThrash";
 
 function thrashOf(verdict: ThrashReport["verdict"], detail = "d"): ThrashReport {
@@ -69,11 +70,76 @@ describe("agentNotices", () => {
     const notices = agentNotices({
       stall: stallOf(["uncommitted-changes", "escalated-goal", "open-pr"]),
     });
+    // THIS EXPECTATION LED WITH `escalated-goal` UNTIL 2026-08-06, and that became wrong the moment
+    // escalation stopped being red: the list would open with the one cause that needs NOTHING from
+    // the human and push the uncommitted files to the end. Red work first now.
     expect(notices.map((n) => n.id)).toEqual([
-      "stall:escalated-goal",
       "stall:open-pr",
       "stall:uncommitted-changes",
+      "stall:escalated-goal",
     ]);
+  });
+
+  it("never leads with a non-red cause while a RED one is present", () => {
+    // The generalisation, and the partition is DERIVED FROM THE ENGINE rather than restated here
+    // (roborev 59949). The first version hardcoded its own WORK/LIFECYCLE lists — and had already
+    // drifted on the day it was written, filing `expired-goal` under LIFECYCLE when
+    // stallEscalation puts it in neither set. Worse, that shape is unenforceable: if
+    // `escalated-goal` ever returns to OUTSTANDING, a local copy still calls it lifecycle, the
+    // assertion still passes, and the ordering is wrong in exactly the direction this guards.
+    // A guard tested against a copy of its own mechanism proves nothing about the mechanism.
+    //
+    // `escalationFor` on a SINGLE-cause report is the engine's own answer for that cause's tier.
+    // THE DOMAIN IS COMPILER-ENFORCED TOO (roborev 59969). Deriving the PARTITION from the engine
+    // closed the tier drift, but the set of causes was still a hand-written array — so a newly added
+    // `StallCause` would satisfy `STALL_CAUSE_RANK`'s Record type, never appear here, never be
+    // exercised, and could ship ranked above a red cause with the suite green. `satisfies` makes
+    // omitting one a type error at this line instead of a silent gap.
+    const ALL = Object.keys({
+      "unmet-goal": 0,
+      "open-pr": 0,
+      "unlanded-work": 0,
+      "uncommitted-changes": 0,
+      "escalated-goal": 0,
+      "expired-goal": 0,
+    } satisfies Record<StallCause, number>) as StallCause[];
+    const isRed = (c: StallCause) =>
+      escalationFor({ verdict: "stalled", causes: [c], detail: "" }) === "blocked";
+    const red = ALL.filter(isRed);
+    const notRed = ALL.filter((c) => !isRed(c));
+    // The partition must be non-trivial in BOTH directions, or the loop below is vacuous.
+    expect(red.length).toBeGreaterThan(0);
+    expect(notRed.length).toBeGreaterThan(0);
+
+    for (const r of red) {
+      for (const n of notRed) {
+        // Fed in the WRONG order on purpose, so the sort is what produces the result.
+        expect(agentNotices({ stall: stallOf([n, r]) }).map((x) => x.id)).toEqual([
+          `stall:${r}`,
+          `stall:${n}`,
+        ]);
+        // …and the ROW's collapsed mark must agree — a different map (GLYPH_RANK) picks the glyph
+        // and the click target, and reordering STALL_CAUSE_RANK alone did not reach it.
+        const mark = rowGlyphsFor(agentNotices({ stall: stallOf([n, r]) }))[0];
+        expect(mark?.leadNoticeId).toBe(`stall:${r}`);
+      }
+    }
+  });
+
+  it("never claims nothing is outstanding — the explainer cannot see the other causes", () => {
+    // roborev 59924 (High). The first rewrite of this text ended "Nothing is outstanding either, so
+    // this may simply be finished". But NOTICE_EXPLAINER is keyed on the CAUSE and `agentNotices`
+    // emits one notice per cause, so that sentence also renders on a row whose report carries real
+    // work — telling the founder nothing is owed on a row holding uncommitted files. False in the
+    // dangerous direction, and the tier is not knowable here (`escalationFor` folds ALL causes).
+    const mixed = NOTICE_EXPLAINER["stall:escalated-goal"] ?? "";
+    expect(mixed).not.toMatch(/nothing is outstanding/i);
+    expect(mixed).toMatch(/other marks on this row/i);
+    // It still says the thing that IS true of the cause on its own.
+    expect(mixed).toMatch(/given up/i);
+    // And the row really can carry both at once, work-cause first.
+    const ids = agentNotices({ stall: stallOf(["escalated-goal", "unlanded-work"]) }).map((n) => n.id);
+    expect(ids).toEqual(["stall:unlanded-work", "stall:escalated-goal"]);
   });
 
   it("marks an escalated goal with its own glyph, not the ordinary alert", () => {
@@ -150,8 +216,13 @@ describe("rowGlyphsFor", () => {
       glyph: "escalated",
       label: "auto-continue gave up",
     };
-    expect(rowGlyphsFor([mild, loud])[0]?.glyph).toBe("escalated");
-    expect(rowGlyphsFor([loud, mild])[0]?.glyph).toBe("escalated");
+    // THESE PINNED `escalated` UNTIL 2026-08-06, when it was the loudest warning glyph. It is now
+    // the QUIETEST (roborev 59949): `alert` carries the causes that genuinely need the founder,
+    // `escalated` carries our own retry budget running out. What the case still proves is the part
+    // that matters — the winner does not depend on ARRIVAL ORDER, which is why both directions are
+    // asserted.
+    expect(rowGlyphsFor([mild, loud])[0]?.glyph).toBe("alert");
+    expect(rowGlyphsFor([loud, mild])[0]?.glyph).toBe("alert");
   });
 
   it("puts every label in the hover, which is the no-mount reading path", () => {
@@ -197,9 +268,14 @@ describe("rowGlyphsFor", () => {
     );
     const warning = marks.find((m) => m.cls === "warning");
     const message = marks.find((m) => m.cls === "message");
-    // escalated-goal is the only `escalated` glyph in the class, so it leads regardless of the
-    // fact that the thrash notice was produced first.
-    expect(warning?.leadNoticeId).toBe("stall:escalated-goal");
+    // THIS EXPECTED `stall:escalated-goal` UNTIL 2026-08-06, because `escalated` was the loudest
+    // glyph and it is the only notice carrying it. Inverting GLYPH_RANK (roborev 59949) moves the
+    // lead to the first `alert` in the class — the quota block — and that is the better answer on
+    // its own merits: a rate-limited agent CANNOT PROCEED, while "auto-continue gave up" means our
+    // retry budget ran out on an agent that may be perfectly finished. The click should open the
+    // former. What the case still proves is unchanged: a lead id exists, it is deterministic, and
+    // it does not depend on which notice was produced first.
+    expect(warning?.leadNoticeId).toBe("thrash:quota-blocked");
     expect(message?.leadNoticeId).toBe("inbox");
   });
 

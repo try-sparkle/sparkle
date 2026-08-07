@@ -17,6 +17,7 @@ import {
   rollupHoldsWork,
   uncommittedWorkEvidence,
 } from "./workflowStage";
+import { sectionOfRow } from "./buildSections";
 import type { BranchStatus, WorkflowState } from "../services/branchStatus";
 
 const bs = (ahead: number, dirty = false): BranchStatus => ({
@@ -514,14 +515,51 @@ describe("uncommittedWorkEvidence — attribution, not safety", () => {
     expect(uncommittedWorkEvidence({ ...BS, dirty: true, worktreeOnBranch: true })).toBe(true);
   });
 
-  it("declines a PARKED tree's dirt — neither dirty nor proof of clean", () => {
+  it("declines a PARKED tree's DIRT — neither dirty nor proof of clean", () => {
     // A parked tree holds whatever branch was checked out into it, so its dirt is not attributable
     // here. `undefined` (not `false`) is what keeps `sectionOfRow` from calling such a row empty.
     expect(uncommittedWorkEvidence({ ...BS, dirty: true, worktreeOnBranch: false })).toBe(undefined);
-    expect(uncommittedWorkEvidence({ ...BS, dirty: false, worktreeOnBranch: false })).toBe(undefined);
   });
 
   it("reports a clean on-branch tree as positively empty", () => {
     expect(uncommittedWorkEvidence(BS)).toBe(false);
+  });
+
+  // ── The founder's false "LOCAL: UNCOMMITTED" heading (2026-08-06) ──────────────────────────────
+  // This assertion USED TO READ `undefined`, and that was the bug, encoded as a passing test.
+  it("reports a CLEAN parked tree as positively empty — attribution needs dirt to be about", () => {
+    // Two rows were filed under "Local: Uncommitted" — "edits exist only in the working tree —
+    // closing this agent loses them" — with `git status --porcelain` EMPTY, fully pushed, every PR
+    // merged. `worktree_on_branch: false` is reported whenever the minted `sparkle/agent-<id>` ref
+    // survives while the tree sits elsewhere, which is exactly what `git checkout -b <topic>`
+    // leaves behind, and AGENTS.md encourages descriptive branch names.
+    //
+    // The parked gate answers "whose dirt is this?" — a question that only exists when there IS
+    // dirt. A porcelain read of the DIRECTORY returning empty means no uncommitted files are in it,
+    // whichever branch is checked out. So this is `false`, not `undefined`: we looked, and it was
+    // empty. The arm above keeps the dirty case unknown, which is the case that gate was written for.
+    expect(uncommittedWorkEvidence({ ...BS, dirty: false, worktreeOnBranch: false })).toBe(false);
+  });
+
+  it("keeps a clean parked row OUT of the alarming section, end to end", () => {
+    // The consequence the heading is actually derived from — one rung up, so a future refactor that
+    // re-splits these two functions cannot quietly restore the false copy.
+    const holds = uncommittedWorkEvidence({ ...BS, dirty: false, worktreeOnBranch: false });
+    expect(sectionOfRow("building_unsaved", holds)).toBe("local_none");
+    // …while a DIRTY parked row still gets the cautious heading, because we genuinely do not know.
+    const dirtyHolds = uncommittedWorkEvidence({ ...BS, dirty: true, worktreeOnBranch: false });
+    expect(sectionOfRow("building_unsaved", dirtyHolds)).toBe("local_uncommitted");
+  });
+
+  it("does not let one clean parked worker drag its orchestrator into UNCOMMITTED", () => {
+    // `rollupHoldsWork` is `true > undefined > false`, so a single `undefined` worker used to pull a
+    // head with a spotless tree of its own under the heading too. That is how the second of the
+    // founder's two rows got there: its own worktree was clean and on its own branch.
+    const head = uncommittedWorkEvidence(BS);
+    const renamedWorker = uncommittedWorkEvidence({ ...BS, dirty: false, worktreeOnBranch: false });
+    expect(rollupHoldsWork([head, renamedWorker])).toBe(false);
+    expect(sectionOfRow("building_unsaved", rollupHoldsWork([head, renamedWorker]))).toBe(
+      "local_none",
+    );
   });
 });

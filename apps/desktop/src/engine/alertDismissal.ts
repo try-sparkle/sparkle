@@ -25,9 +25,13 @@ import type { AgentTabStatus, AgentAlertRecord } from "../types";
 // import the type alongside these helpers from the one engine module that operates on it.
 export type { AgentAlertRecord };
 
-/** The DISMISSIBLE red statuses.
+/** The RED statuses — the red-COLOR tier, spelled locally.
  *
- *  This set currently COINCIDES with the red-COLOR tier (services/windowStatus.isRedStatus) and is
+ *  ⚠️ THE DISMISSIBLE SET IS NO LONGER THIS SET. It gained the amber `lapsed` on 2026-08-06; see
+ *  {@link AlertingStatus} below for what widened and, more importantly, what did not. Everything
+ *  the paragraphs below say about `blocked` still holds.
+ *
+ *  This set COINCIDES with the red-COLOR tier (services/windowStatus.isRedStatus) and is
  *  deliberately NOT the narrower needs-you-now set (engine/attention.needsAttention). An earlier
  *  version of this docstring asserted the exact opposite, which is the belief that made the whole
  *  feature inert for `blocked`; if you are here to check whether `blocked` is dismissible, it is.
@@ -63,13 +67,47 @@ export type RedStatus = "waiting" | "approval" | "errored" | "blocked";
 //  one acknowledgement can hide five unrelated stalls from the top-level row. That limit predates
 //  this and is accepted for waiting/errored; it is recorded here because `blocked` is the status most
 //  likely to recur across different workers, so it is the one where it will actually bite.
-const DISMISSIBLE: ReadonlySet<AgentTabStatus> = new Set<RedStatus>([
+const RED: ReadonlySet<AgentTabStatus> = new Set<RedStatus>([
   "waiting",
   "approval",
   "errored",
   "blocked",
 ]);
 function isRedStatus(status: AgentTabStatus | undefined): status is RedStatus {
+  return status !== undefined && RED.has(status);
+}
+
+/** A status the human can ACKNOWLEDGE — the reds above plus the one amber that is not red.
+ *
+ *  `lapsed` ("Auto-continue stopped", packages/ui/tokens.ts) joined on 2026-08-06 with the tier
+ *  itself. It is NOT an alarm — no dock badge, no banner, not in `windowStatus.isRedStatus` — but it
+ *  is still a row the founder may have seen and want quiet, and the acknowledge machinery is the
+ *  only thing that can quiet it. Without membership here the whole apparatus is inert for it:
+ *  `advanceAlertRecord` records no episode, so `isAlertSuppressed` can never be true and
+ *  `alertControlKind` renders no control — the undismissable red that had to be rolled back on
+ *  2026-07-26, in amber.
+ *
+ *  ── THE THREE THINGS THAT DELIBERATELY DID *NOT* WIDEN ───────────────────────────────────────────
+ *  Each is a different question that happens to have had the same answer until now, and conflating
+ *  them is the trap packages/ui/tokens.ts names:
+ *    • {@link isDismissibleRed} — "is this a RED the user could be asked about". Still red-only, so
+ *      `engine/movementRetraction` and `services/conciergeFeed` see exactly what they saw before.
+ *    • {@link withDismissedAlerts} — still red-only, so {@link deEscalatedStatus} (which maps to
+ *      `idle`/`stopped`) never sees a lapsed row. A dismissed lapsed row is restored to the band it
+ *      came FROM by `stallEscalation.withDismissedStallAttention`, which is the module that produced
+ *      it — the same division of labour `blocked`-from-`unmerged` already uses, and for the same
+ *      reason: de-escalating to `idle` would erase which band the row belongs in.
+ *    • `RedStatus` above — still the four reds, because that name is a claim about colour. */
+export type AlertingStatus = RedStatus | "lapsed";
+
+const DISMISSIBLE: ReadonlySet<AgentTabStatus> = new Set<AlertingStatus>([
+  "waiting",
+  "approval",
+  "errored",
+  "blocked",
+  "lapsed",
+]);
+function isAlertingStatus(status: AgentTabStatus | undefined): status is AlertingStatus {
   return status !== undefined && DISMISSIBLE.has(status);
 }
 
@@ -88,9 +126,12 @@ export function isDismissibleRed(status: AgentTabStatus | undefined): status is 
 /** A never-seen agent's implicit record: no episodes, not dismissed. */
 export const EMPTY_ALERT: AgentAlertRecord = { seq: 0, lastRed: null, dismissedSeq: null };
 
-/** The red signature of a status: the red status itself, or null when non-red. */
-function redSignature(status: AgentTabStatus | undefined): RedStatus | null {
-  return isRedStatus(status) ? status : null;
+/** The alert signature of a status: the alerting status itself, or null when it isn't one.
+ *
+ *  Named `lastRed` on the record for continuity (it is persisted), but the question it answers is
+ *  "which alarm is this episode about" — see {@link AlertingStatus}. */
+function redSignature(status: AgentTabStatus | undefined): AlertingStatus | null {
+  return isAlertingStatus(status) ? status : null;
 }
 
 /**
@@ -123,7 +164,7 @@ export function isAlertSuppressed(
   record: AgentAlertRecord | undefined,
   status: AgentTabStatus | undefined,
 ): boolean {
-  if (!isRedStatus(status)) return false;
+  if (!isAlertingStatus(status)) return false;
   return record != null && record.dismissedSeq != null && record.dismissedSeq === record.seq;
 }
 
@@ -152,12 +193,13 @@ export function deEscalatedStatus(status: RedStatus): AgentTabStatus {
 }
 
 /** The alert-toggle button a row should show, from its TRUE (pre-dismissal) status + record:
- *  "dismiss" when red & not dismissed, "reenable" when red & dismissed, null when not red. */
+ *  "dismiss" when alerting & not dismissed, "reenable" when alerting & dismissed, null otherwise.
+ *  "Alerting" is {@link AlertingStatus} — the four reds plus the amber `lapsed`. */
 export function alertControlKind(
   record: AgentAlertRecord | undefined,
   status: AgentTabStatus | undefined,
 ): "dismiss" | "reenable" | null {
-  if (!isRedStatus(status)) return null;
+  if (!isAlertingStatus(status)) return null;
   return isAlertSuppressed(record, status) ? "reenable" : "dismiss";
 }
 
@@ -167,6 +209,12 @@ export function alertControlKind(
  * BOTH row color and sort order shows the row calm and out of the red zone. Compose LAST, after the
  * worker-attention transforms. Returns the SAME reference when nothing is suppressed (no render
  * churn), matching the other transforms' no-op contract; never mutates the input.
+ *
+ * STILL RED-ONLY, on purpose, now that {@link AlertingStatus} is wider than the red tier. A
+ * dismissed `lapsed` row is restored by `stallEscalation.withDismissedStallAttention` instead —
+ * that module produced the status and knows which band the row came from, whereas
+ * {@link deEscalatedStatus} here would flatten it to `idle` and erase that. Same division of labour
+ * an escalated `blocked`-from-`unmerged` row already relies on.
  */
 export function withDismissedAlerts<T extends { id: string; alert?: AgentAlertRecord }>(
   agents: readonly T[],

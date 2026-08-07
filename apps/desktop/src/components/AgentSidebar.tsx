@@ -4093,7 +4093,14 @@ const NOTICE_GLYPH_ICON: Record<NoticeGlyph, IconType> = {
 };
 
 const GOAL_CHIP_COLOR: Record<GoalChipState, string> = {
-  escalated: DANGER,
+  // AMBER SINCE 2026-08-06, and it must move together with the composer's `goal:escalated` PILL
+  // (Concierge/MountedAgentNotices) — `GOAL_GLYPH`'s own rule is that the chip and the pill must not
+  // diverge for one state. Dropping the pill's `escalated -> DANGER` case while this stayed DANGER
+  // made one fact read amber on the composer and red here, which is the cross-surface tier split
+  // this whole change exists to close, relocated from the stall pill to the goal pill (roborev
+  // 59986). The tier is the founder's: auto-continue giving up is our retry budget ending, not a
+  // demand on him.
+  escalated: C.amberInk,
   // Amber, not danger: the mandate ran out on unfinished work. Loud, but not the top of the row.
   expired: C.amberInk,
   met: C.successInk,
@@ -4101,9 +4108,15 @@ const GOAL_CHIP_COLOR: Record<GoalChipState, string> = {
 };
 
 /** Escalated is the loudest of the four, and with no words to bold it that has to be carried by the
- *  MARK. Two px of diameter plus the only DANGER ink in the set reads at a glance without spending
- *  the horizontal space a phrase would; every other state shares one size so the eye reads the
- *  bigger one as exceptional rather than as a fifth category. */
+ *  MARK. Two extra px of diameter is now the SOLE distinction: the ink half of this justification
+ *  retired on 2026-08-06, when `GOAL_CHIP_COLOR.escalated` moved to amber with the rest of the tier
+ *  (roborev 60018). That makes this map MORE load-bearing than it was, not less — it is the only
+ *  visual signal left that escalated is exceptional. Both sides of the comparison are pinned in
+ *  stallOverlay.test.tsx under "ESCALATED IS EXCEPTIONAL, AND BOTH SIDES OF THAT COMPARISON ARE
+ *  PINNED", in "renders every goal state as an icon-only mark that cannot shrink away" — NOT the
+ *  escalated-only width check, which would stay green if the other three states were raised to 12
+ *  (roborev 57417/60030). Every other state shares one size so the eye reads the bigger one as
+ *  exceptional rather than as a fifth category. */
 const GOAL_CHIP_SIZE: Record<GoalChipState, number> = {
   escalated: 12,
   expired: 10,
@@ -4777,9 +4790,12 @@ const AgentRow = memo(function AgentRow({
   // `active` for the whole red tier (waiting/approval/blocked/errored), so this chip can only ever
   // appear on a row the color system already calls calm — the gray rows nobody looks at, which are
   // the target. Amber is the status token for "this is waiting on something" (packages/ui/tokens.ts)
-  // and is the right weight for a landing state that needs a human eventually. An ESCALATED goal
-  // takes DANGER instead, because it is categorically different: auto-continue has given up and
-  // handed the agent back, so nothing is coming for it at all.
+  // and is the right weight for a landing state that needs a human eventually. An ESCALATED goal is
+  // amber TOO as of 2026-08-06 — it used to take DANGER on the reasoning that auto-continue having
+  // given up is "categorically different", and the founder overruled exactly that: nothing is coming
+  // for the agent, but nothing is being asked of HIM either, and red is reserved for what he must
+  // act on. The difference is carried by weight and glyph size instead. Red on this surface now
+  // means only the causes in `stallEscalation.OUTSTANDING`.
   // ══ THE NOTICE MARKS — A GLYPH, NEVER THE WORDS. Bead sparkle-tyter. ═══════════════════════════
   //
   // WHAT THIS REPLACES, and why it was not a styling nit. `stallChipEl` and `thrashChipEl` used to
@@ -4876,7 +4892,13 @@ const AgentRow = memo(function AgentRow({
           fontSize: 10,
           fontWeight: FONT_WEIGHT.semibold,
           cursor: "pointer",
-          color: mark.glyph === "escalated" ? DANGER : C.amberInk,
+          // AMBER FOR BOTH WARNING GLYPHS SINCE 2026-08-06 (roborev 59949). `escalated` used to be
+          // the ONLY one inked DANGER — which had it exactly backwards once `escalated-goal` moved
+          // to the amber `lapsed` tier: the lifecycle cause was painted red while `alert`, which
+          // carries the causes that genuinely need the founder (uncommitted changes, unlanded work,
+          // an open PR), was already amber. The two now differ by SHAPE, which is the distinction
+          // that survives colour-blindness anyway; the row's DOT is what carries the red/amber tier.
+          color: C.amberInk,
         }}
       >
         <Glyph size={10} style={{ flex: "0 0 auto" }} />
@@ -4893,18 +4915,25 @@ const AgentRow = memo(function AgentRow({
   // See `noticeClusterCollapses` for why this exists. Two properties matter and both are load
   // bearing:
   //
-  //   IT CARRIES THE WORST INK IT STANDS FOR. A row whose goal was escalated, or whose warning
-  //   class is escalated, still reads DANGER when collapsed. Collapsing must never downgrade a row
-  //   the founder owes into a calm-looking one — that is the invariant `sparkle/agent-5e4caa2c`
-  //   owns, and it is the reason this is a summary rather than a truncation.
+  //   IT CARRIES THE WORST INK IT STANDS FOR — and since 2026-08-06 an escalated goal is no longer
+  //   among the worst. Collapsing must never downgrade a row the founder owes into a calm-looking
+  //   one; that invariant is unchanged. What changed is which causes he is owed BY: `escalated-goal`
+  //   moved to the amber `lapsed` tier, and the goal chip moved with it, so there is no longer any
+  //   DANGER ink on this surface for a merely-escalated row to summarise.
   //
   //   IT OPENS WHAT IT HID. Same gesture as an individual mark (mount + reveal the pill), targeting
   //   the most actionable notice — `rowGlyphsFor` orders its marks that way, so the head is the
   //   right one; the goal is the fallback when the cluster is goal-plus-nothing-severe.
   const clusterMarkCount = noticeMarks.length + (goalBadge ? 1 : 0);
   const clusterCollapsed = noticeClusterCollapses(columnWidth ?? 0, clusterMarkCount);
-  const clusterEscalated =
-    goalBadge?.escalated === true || noticeMarks.some((m) => m.glyph === "escalated");
+  // The `m.glyph === "escalated"` term was dropped as REDUNDANT, not as a behaviour change — and
+  // that correction matters, because the first version of this comment claimed it fixed a
+  // width-dependent tier, which cannot happen here (roborev 59986). An `escalated` glyph can only
+  // come from `stall:escalated-goal`, whose cause derives from `goalStateOf`; whenever that holds,
+  // `goalBadgeFor` returns a badge with `escalated: true` AND `withoutSeparatelyDrawn` strips the
+  // notice before it reaches `noticeMarks`. So the dropped term was true only when the remaining one
+  // already was. Row marks cannot carry `escalated` at all — do not read this as evidence they can.
+  const clusterEscalated = goalBadge?.escalated === true;
   const clusterLeadNoticeId =
     noticeMarks[0]?.leadNoticeId ?? (goalBadge ? `goal:${goalBadge.state}` : null);
   const collapsedClusterEl =
@@ -4941,7 +4970,11 @@ const AgentRow = memo(function AgentRow({
           fontSize: 10,
           fontWeight: FONT_WEIGHT.semibold,
           cursor: "pointer",
-          color: clusterEscalated ? DANGER : C.amberInk,
+          // Unconditionally amber now: nothing this cluster stands for is DANGER any more. The
+          // warning marks are amber, and the goal chip's escalated state moved to amber with them
+          // (GOAL_CHIP_COLOR). `clusterEscalated` is kept only as the `data-notice-escalated`
+          // signal, which is a FACT about the row rather than a colour.
+          color: C.amberInk,
         }}
       >
         <FiMoreHorizontal size={10} style={{ flex: "0 0 auto" }} />
@@ -4974,8 +5007,13 @@ const AgentRow = memo(function AgentRow({
         whiteSpace: "nowrap",
         lineHeight: 1.4,
         fontSize: 10,
+        // BOLD stays as the escalated distinction; the INK does not (2026-08-06, roborev 60001).
+        // `stallChipFor` sets `escalated` from the same `escalated-goal` cause that GOAL_CHIP_COLOR
+        // moved to amber, and this chip renders immediately beside the goal chip on the card — so
+        // leaving it DANGER put an amber goal chip next to a red "auto-continue gave up" chip for
+        // ONE fact. Same argument as the chip's size: the weight carries the emphasis.
         fontWeight: stallChip.escalated ? FONT_WEIGHT.bold : FONT_WEIGHT.semibold,
-        color: stallChip.escalated ? DANGER : C.amberInk,
+        color: C.amberInk,
       }}
     >
       <FiAlertTriangle size={10} style={{ flex: "0 0 auto" }} />
@@ -5854,7 +5892,9 @@ const AgentRow = memo(function AgentRow({
           <span
             data-testid="card-goal"
             style={{
-              color: goalBadge.escalated ? DANGER : C.muted,
+              // Amber, not DANGER — same tier decision as GOAL_CHIP_COLOR.escalated above. The
+              // WEIGHT below is what still makes it stand out, without spending the alarm colour.
+              color: goalBadge.escalated ? C.amberInk : C.muted,
               fontSize: 12,
               fontWeight: goalBadge.escalated ? FONT_WEIGHT.semibold : FONT_WEIGHT.regular,
               minWidth: 0,
@@ -5875,7 +5915,9 @@ const AgentRow = memo(function AgentRow({
           <span
             data-testid="card-stall-detail"
             style={{
-              color: stallChip.escalated ? DANGER : C.amberInk,
+              // Amber for the same reason as the row chip above — this detail line sits directly
+              // under `card-goal`, which is amber, and repeated the retired red for one fact.
+              color: C.amberInk,
               fontSize: 12,
               minWidth: 0,
             }}

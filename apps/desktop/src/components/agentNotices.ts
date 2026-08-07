@@ -144,10 +144,22 @@ export const NOTICE_EXPLAINER: Record<string, string> = {
     "answers will drift. Better to hand the remaining work to a fresh agent than to push on.",
 
   // ── Stall: the agent has stopped, and something is still owed ────────────────────────────────
+  // AMBER, NOT RED, SINCE 2026-08-06 — and this sentence had to move with the colour. It used to
+  // end "it needs you to say so", which is the claim the founder disproved: both rows he measured
+  // wore it with spotless worktrees and every PR merged.
+  //
+  // ⚠️ IT MUST ALSO NOT OVERREACH THE OTHER WAY, which the first rewrite did (roborev 59924). It
+  // claimed "nothing is outstanding either" — but this explainer is keyed on the CAUSE, and
+  // `agentNotices` emits one per cause, so the very same sentence renders on a row whose report is
+  // `["escalated-goal", "uncommitted-changes"]`. There it is simply false, and false in the
+  // dangerous direction: it tells the founder nothing is owed on a row holding uncommitted files.
+  // The tier is not knowable from here — `escalationFor` folds ALL causes together, and this table
+  // sees one at a time — so the text stays TIER-AGNOSTIC and points at the row's other marks, which
+  // are ordered work-first (STALL_CAUSE_RANK) precisely so they can carry that answer.
   "stall:escalated-goal":
-    "Auto-continue has given up on this agent's goal and handed it back to you. Nothing is coming " +
-    "for it — no retry is scheduled and no other agent is watching it. If it is still worth doing, " +
-    "it needs you to say so.",
+    "Auto-continue has given up on this agent's goal and handed it back. Nothing is coming for it " +
+    "— no retry is scheduled and no other agent is watching it. The other marks on this row say " +
+    "whether anything is still owed.",
   "stall:expired-goal":
     "The time budget for this agent's goal ran out before the goal was met. The work is unfinished; " +
     "only the window auto-continue was allowed to spend on it has closed.",
@@ -202,15 +214,37 @@ export const NOTICE_EXPLAINER: Record<string, string> = {
 };
 
 /** Warning-class ordering: worst first, so a row's single glyph and a pill row's first pill both
- *  lead with the thing most worth doing something about. `escalated-goal` heads it because nothing
- *  is coming for that agent at all — auto-continue has handed it back to the human. */
+ *  lead with the thing most worth doing something about.
+ *
+ *  ⚠️ THE WORK CAUSES COME FIRST, AND THIS WAS INVERTED UNTIL 2026-08-06. `escalated-goal` used to
+ *  head the list, on the reasoning that "nothing is coming for that agent at all". That ranked it
+ *  above `unmet-goal` / `open-pr` / `unlanded-work` / `uncommitted-changes` — and once
+ *  `escalated-goal` moved to the amber `lapsed` tier (engine/stallEscalation LIFECYCLE), the list
+ *  led with the one cause that needs NOTHING from the human and buried the ones that do. A row
+ *  holding uncommitted files would have shown "auto-continue gave up" as its single glyph.
+ *
+ *  So the order now mirrors `withStallAttention`'s: everything in `OUTSTANDING` (red — work that
+ *  exists and nothing is coming to finish) sorts ahead of every cause that is NOT red. Relative
+ *  order WITHIN the red group is unchanged. A cause that stops being red must move down here in the
+ *  same change, or this list starts leading with the quiet one again — `agentNotices.test.ts`
+ *  derives that partition from `escalationFor` rather than restating it, so a membership change in
+ *  the engine fails there instead of silently invalidating this.
+ *
+ *  ⚠️ THIS GOVERNS PILL ORDER. The row's collapsed GLYPH and its click target are chosen by
+ *  {@link GLYPH_RANK}, which overrides input order — reordering this map alone does NOT reach them,
+ *  and that gap is what roborev 59949 caught. Both are fixed; keep them in step. */
 const STALL_CAUSE_RANK: Record<StallCause, number> = {
-  "escalated-goal": 0,
-  "expired-goal": 1,
-  "unmet-goal": 2,
-  "open-pr": 3,
-  "unlanded-work": 4,
-  "uncommitted-changes": 5,
+  // RED — `stallEscalation.OUTSTANDING`: the founder has something to do.
+  "unmet-goal": 0,
+  "open-pr": 1,
+  "unlanded-work": 2,
+  "uncommitted-changes": 3,
+  // NEVER RED — and these two are NOT the same tier, which is why this comment does not name one
+  // set. `escalated-goal` is `stallEscalation.LIFECYCLE` → the amber `lapsed` status.
+  // `expired-goal` is in NEITHER engine set → calm gray. Do not "keep them in step" by adding
+  // expiry to LIFECYCLE; that module's own ⚠️ block explains at length why it must stay out.
+  "escalated-goal": 4,
+  "expired-goal": 5,
 };
 
 // NO THRASH RANK HERE, deliberately (roborev 58710/58721). A `ThrashReport` carries exactly ONE
@@ -501,10 +535,27 @@ const CLASS_A11Y: Record<NoticeClass, (n: number, labels: string) => string> = {
   goal: (_n, labels) => labels,
 };
 
-/** Loudest-wins within a class. Only `warning` has two glyphs today. */
+/**
+ * Loudest-wins within a class. Only `warning` has two glyphs today.
+ *
+ * ⚠️ `alert` OUTRANKS `escalated`, AND THAT WAS REVERSED UNTIL 2026-08-06 (roborev 59949). This map
+ * decides both the class's rendered glyph AND its `leadNoticeId` — the thing the click opens — and
+ * it deliberately overrides input order, so reordering `STALL_CAUSE_RANK` did NOT reach it. With
+ * `escalated: 0`, a row reporting `["escalated-goal", "uncommitted-changes"]` still collapsed to the
+ * escalated octagon, which `AgentSidebar` inks red: the amber lifecycle cause kept both the loudest
+ * mark and the click, over work that is genuinely at risk. That is the founder's original complaint,
+ * one component below the fix for it — and on the sidebar it was masked, because
+ * `withoutSeparatelyDrawn` strips `stall:escalated-goal` whenever a goal badge exists (always, since
+ * the cause derives from `goalStateOf`). The composer, which passes no `drawnSeparately`, showed it.
+ *
+ * `escalated` is now the QUIETEST warning glyph, which is what its tier means: `alert` marks work
+ * that exists and nothing is coming to finish; `escalated` marks our own retry budget running out.
+ * Keep this ordering consistent with `STALL_CAUSE_RANK` above and with
+ * `engine/stallEscalation`'s OUTSTANDING-before-LIFECYCLE test order.
+ */
 const GLYPH_RANK: Record<NoticeGlyph, number> = {
-  escalated: 0,
-  alert: 1,
+  alert: 0,
+  escalated: 1,
   clock: 2,
   target: 3,
   check: 4,

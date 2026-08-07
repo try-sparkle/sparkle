@@ -71,6 +71,16 @@ const ESCALATABLE: ReadonlySet<AgentTabStatus> = new Set<AgentTabStatus>(["idle"
 export const ESCALATED_STATUS: AgentTabStatus = "blocked";
 
 /**
+ * What a LIFECYCLE-only row is escalated to instead. Amber, "Auto-continue stopped", no badge, no
+ * banner, and NOT in `windowStatus.isRedStatus`.
+ *
+ * The whole reason there are two escalation targets: the founder, on two rows that owed nothing —
+ * *"why are they red when they don't require my assistance?"* See {@link LIFECYCLE} and the token's
+ * own comment in packages/ui/tokens.ts.
+ */
+export const LAPSED_STATUS: AgentTabStatus = "lapsed";
+
+/**
  * The causes that mean "this row is not finished".
  *
  * Kept as an explicit set rather than "any cause at all" so that adding a new cause to `agentStall`
@@ -78,7 +88,13 @@ export const ESCALATED_STATUS: AgentTabStatus = "blocked";
  * rows. Each member is work that EXISTS and that nothing is coming to finish — which is what the
  * founder's rule licenses painting red.
  *
- * ── `expired-goal` IS DELIBERATELY ABSENT. EXPIRY IS NOT AN ALARM. ───────────────────────────────
+ * ── `expired-goal` AND `escalated-goal` ARE BOTH DELIBERATELY ABSENT — BUT NOT TO THE SAME PLACE. ─
+ * `expired-goal` left first (sparkle-biezi, the argument below) and is in NEITHER set: it renders
+ * calm gray, which already satisfies "not red". `escalated-goal` left on 2026-08-06 for the same
+ * reason one notch further and went to {@link LIFECYCLE}, which paints AMBER. Read LIFECYCLE for why
+ * the two were separated; what follows is the original expiry argument, the derivation both rest on.
+ *
+ * ── EXPIRY IS NOT AN ALARM. ──────────────────────────────────────────────────────────────────────
  * It was in this set and it was the single biggest source of false red on the fleet (sparkle-biezi).
  * Verified live on agent 11a52157: status `idle`, `needsYou` false, thrash `healthy`, a spotless
  * worktree, zero commits of its own — and `stallReport` returned `stalled` with the ONE cause
@@ -108,24 +124,81 @@ export const ESCALATED_STATUS: AgentTabStatus = "blocked";
  * and `goalBadgeFor` still renders "ran out of time — never met" in amber. The reader still learns
  * the TTL lapsed; they just no longer learn it in the colour reserved for "a human is blocking this".
  * Do NOT fix a future "expiry is invisible" report by adding it back here — the affordance exists,
- * one layer up.
+ * one layer up, and now also in {@link LIFECYCLE}'s own amber tier.
  */
 const OUTSTANDING: ReadonlySet<StallCause> = new Set<StallCause>([
   "unmet-goal",
-  "escalated-goal",
   "open-pr",
   "unlanded-work",
   "uncommitted-changes",
 ]);
 
-/** Does this report describe a row that must not render calm? */
+/**
+ * The causes that mean "the AUTO-CONTINUE MACHINERY stopped", which is not the same claim at all.
+ *
+ * ONE MEMBER: `escalated-goal`. Every member of `OUTSTANDING` above is a fact about the WORK — a
+ * goal nobody met, a PR nobody merged, commits that never landed, files nobody committed. This is a
+ * fact about Sparkle's own retry budget: how much it was willing to SPEND chasing a goal before
+ * handing it back. It does not say the human is required, and it does not say the work is unfinished.
+ *
+ * ⚠️ `expired-goal` IS DELIBERATELY NOT HERE, and it WAS in the first cut of this change — so if you
+ * are reading this because the set looks like it is missing one, it is not. Expiry is already calm
+ * gray by the sparkle-biezi decision above, and gray already satisfies the founder's rule that red
+ * is reserved for "a human is blocking this"; his 2026-08-06 answer said expiry must not be RED,
+ * which was already true of it. Promoting it would relitigate a settled decision AND it is the
+ * higher-volume cause — every agent that outlives its TTL earns one — so the tier that exists to
+ * stop a wall of false red would have started building a wall of amber. `escalated-goal` is both the
+ * narrower signal and the one he actually reported. If expiry ever needs to be louder, that is its
+ * own change with its own evidence.
+ *
+ * ── WHY `escalated-goal` MOVED HERE (2026-08-06) ─────────────────────────────────────────────────
+ * It was in `OUTSTANDING`, so an escalated row was repainted RED. The founder spent a day triaging
+ * rows that needed nothing and asked, verbatim: *"why are they red when they don't require my
+ * assistance?"* The two rows in his screenshot had spotless worktrees and every PR they owned
+ * merged — and both wore the loudest signal the app has. That is how real red stops meaning
+ * anything, which costs more than every stall this module was commissioned to surface.
+ *
+ * `expired-goal` had already been cut from `OUTSTANDING` for exactly this reason (sparkle-biezi);
+ * the argument above it is the derivation. Escalation is one notch further along the same line: a
+ * retry budget is even more clearly OUR machinery's business than a clock is.
+ *
+ * ── RED WINS OVER AMBER, AND THAT IS THE SAFETY PROPERTY ─────────────────────────────────────────
+ * `withStallAttention` tests `OUTSTANDING` FIRST. So an agent that gave up AND still holds unlanded
+ * work stays RED, on the strength of the WORK — `unmet-goal` / `open-pr` / `unlanded-work` /
+ * `uncommitted-changes` are untouched and still fire on their own evidence. Only a row that owes
+ * NOTHING goes quiet. Without that ordering this change would silence real stalls, which is the
+ * opposite failure and the more expensive one.
+ *
+ * The same ordering is mirrored one component out, in `components/agentNotices.STALL_CAUSE_RANK`,
+ * so the row's single glyph leads with a work cause too. Keep the two in step.
+ */
+const LIFECYCLE: ReadonlySet<StallCause> = new Set<StallCause>(["escalated-goal"]);
+
+/** Does this report describe a row that must not render calm? True for BOTH tiers — red and amber.
+ *
+ *  Callers that need to know WHICH tier want {@link escalationFor}; this predicate answers only
+ *  "may this row stay gray", which is what the founder's original rule ("gray is a terminal state")
+ *  is about. */
 export function mustLeaveCalm(report: StallReport | undefined): boolean {
-  if (report === undefined) return false;
+  return escalationFor(report) !== undefined;
+}
+
+/**
+ * The status a calm row is repainted to, or `undefined` to leave it alone.
+ *
+ * RED FIRST, deliberately — see {@link LIFECYCLE}. A row with any `OUTSTANDING` cause is `blocked`
+ * exactly as it was before this tier existed, whatever else is also true of it; only a row whose
+ * ONLY causes are lifecycle facts drops to the amber `lapsed`.
+ */
+export function escalationFor(report: StallReport | undefined): AgentTabStatus | undefined {
+  if (report === undefined) return undefined;
   // `unknown` is deliberately NOT escalated. It means "we did not read the git state", and a red dot
   // on missing evidence is the false alarm that trains the human to ignore the colour — the same
   // reason `agentStall.isStalled` is false for it. Evidence, not inference.
-  if (report.verdict !== "stalled") return false;
-  return report.causes.some((c) => OUTSTANDING.has(c));
+  if (report.verdict !== "stalled") return undefined;
+  if (report.causes.some((c) => OUTSTANDING.has(c))) return ESCALATED_STATUS;
+  if (report.causes.some((c) => LIFECYCLE.has(c))) return LAPSED_STATUS;
+  return undefined;
 }
 
 /**
@@ -182,8 +255,12 @@ export function withStallAttention<T extends MotionAgent & { id: string; alert?:
     // must avoid, and the class of red that made the previous version worthless. The row's own status
     // cannot see this: delegation is work the PARENT is not doing itself.
     if (isInMotion(a.id, agents, statusMap)) continue;
-    if (!mustLeaveCalm(reportOf(a.id))) continue;
-    ensure()[a.id] = ESCALATED_STATUS;
+    // WHICH tier, not just whether. RED FIRST — a row with outstanding WORK is `blocked` even when
+    // auto-continue also gave up on it; only a row whose sole causes are lifecycle facts goes amber.
+    // See LIFECYCLE for why that ordering is the safety property of this whole change.
+    const to = escalationFor(reportOf(a.id));
+    if (to === undefined) continue;
+    ensure()[a.id] = to;
   }
   return out ?? statusMap;
 }
@@ -217,12 +294,18 @@ export function withDismissedStallAttention<T extends { id: string; alert?: Agen
   let out: Record<string, AgentTabStatus> | null = null;
   const ensure = (): Record<string, AgentTabStatus> => (out ??= { ...escalatedMap });
   for (const a of agents) {
-    if (escalatedMap[a.id] !== ESCALATED_STATUS) continue;
+    // BOTH TIERS THIS MODULE PRODUCES, not just the red one. An amber `lapsed` row is acknowledgeable
+    // exactly like an escalated `blocked` row — `alertDismissal.AlertingStatus` includes it, and
+    // `withDismissedAlerts` deliberately does NOT (it would flatten the row to `idle` and lose the
+    // band it came from), so this pass is the only thing that can hand a dismissed amber row back.
+    const escalated = escalatedMap[a.id];
+    if (escalated !== ESCALATED_STATUS && escalated !== LAPSED_STATUS) continue;
     // Only a row THIS pass escalated: an agent whose own status is genuinely `blocked` (statusEngine's
     // stall timer, improvementPass) is not ours to restore, and `calmMap` would say `blocked` for it
-    // anyway, so the guard is about intent rather than about the value.
+    // anyway, so the guard is about intent rather than about the value. Compared against the row's
+    // OWN escalated value rather than the constant, so the same reasoning covers the amber tier.
     const calm = calmMap[a.id];
-    if (calm === undefined || calm === ESCALATED_STATUS) continue;
+    if (calm === undefined || calm === escalated) continue;
     // THE DISMISSAL MUST BE ABOUT THIS ALARM. `isAlertSuppressed` only says "the acknowledgement
     // matches the current episode"; it never says WHICH red was acknowledged. So an agent that went
     // `waiting` once, had it dismissed, and recovered carries `dismissedSeq === seq` FOREVER (leaving
@@ -233,8 +316,8 @@ export function withDismissedStallAttention<T extends { id: string; alert?: Agen
     // acknowledgement to this alarm. Escalating unconditionally is what keeps that field truthful:
     // the recorder is handed the pre-undo map, so a genuinely stalled row always presents `blocked`
     // to it.
-    if (a.alert?.lastRed !== ESCALATED_STATUS) continue;
-    if (!isAlertSuppressed(a.alert, ESCALATED_STATUS)) continue;
+    if (a.alert?.lastRed !== escalated) continue;
+    if (!isAlertSuppressed(a.alert, escalated)) continue;
     ensure()[a.id] = calm;
   }
   return out ?? escalatedMap;

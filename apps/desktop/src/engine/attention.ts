@@ -28,6 +28,14 @@ function statusGlyph(status: AgentTabStatus): string {
   // conflation this tier exists to undo.
   if (color === AGENT_STATUS.questions.color) return BLUE_CIRCLE;
   if (color === AGENT_STATUS.idle.color) return GRAY_CIRCLE;
+  // AMBER tier (`lapsed`) → the GRAY ring, deliberately rather than a fourth glyph. Without an arm
+  // it fell through to the green `return ""`, so an opted-in "Auto-continue stopped" banner arrived
+  // with NO glyph — visually identical to a `working` notification, which is the exact conflation
+  // the BLUE arm above was added to prevent. Gray is the honest neighbour: this is the "nothing is
+  // stopping you" register, and it is the band `lapsed` files under (buildSections.bandOfStatus).
+  // A distinct amber glyph was considered and declined — the notification is OFF by default, so it
+  // would be a new symbol to learn for a surface almost nobody enables.
+  if (color === AGENT_STATUS.lapsed.color) return GRAY_CIRCLE;
   return ""; // green (working) — no glyph
 }
 
@@ -155,6 +163,11 @@ export function notificationFor(
     done: "Done",
     working: "Started working",
     blocked: "Blocked / stalled — needs you",
+    // Deliberately says what STOPPED, not that anything is wanted. `blocked` above is the same
+    // shape of event wearing "needs you", and this state exists precisely because that phrasing was
+    // being applied to agents that needed nothing. OFF by default in DEFAULT_NOTIFY_STATUSES, so
+    // this copy only ever fires for someone who opted in.
+    lapsed: "Auto-continue stopped — nothing is waiting on you",
     unmerged: "Done — but not merged to main yet",
     // OFF by default, but LIVE user-facing copy — not dead code. `new` is false in
     // DEFAULT_NOTIFY_STATUSES and has no checkbox in NotificationsMenu, which deliberately omits the

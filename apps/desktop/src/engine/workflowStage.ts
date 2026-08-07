@@ -121,6 +121,34 @@ export function hasUnmergedCommittedWork(stage: WorkflowStageId): boolean {
  */
 export function uncommittedWorkEvidence(bs?: BranchStatus | undefined): boolean | undefined {
   if (bs === undefined) return undefined;
+  // A CLEAN TREE HOLDS NOTHING, WHOEVER IT BELONGS TO — and this arm must come FIRST (2026-08-06).
+  //
+  // The founder measured two rows filed under "Local: Uncommitted" — whose copy states flatly that
+  // "edits exist only in the working tree — closing this agent loses them" — whose worktrees were
+  // `git status --porcelain` EMPTY, fully pushed, and every PR they owned merged.
+  //
+  // The parked gate below is an ATTRIBUTION rule, and attribution is only ever a question about
+  // dirt that EXISTS: if a tree has uncommitted files, whose work are they? When `dirty` is false
+  // there is no such question to get wrong. The porcelain read is of the DIRECTORY, so `false`
+  // means "no uncommitted files in this worktree", and that is true no matter which branch is
+  // checked out into it. Answering `undefined` there reported a tree we HAD read as if we had not.
+  //
+  // Why that fired so widely: `resolve_agent_branch` reports `worktree_on_branch: false` whenever
+  // the minted `sparkle/agent-<id>` ref still exists while the tree sits elsewhere — which is
+  // exactly what `git checkout -b <topic>` leaves behind, and AGENTS.md actively encourages
+  // descriptive branch names. Measured on this machine: 21 worktrees were off their minted branch
+  // and 15 of them were spotless, so two thirds of the "parked" population was being reported as
+  // unknown when it was positively, readably empty. `rollupHoldsWork` then propagates one such
+  // worker to its whole orchestrator (`true > undefined > false`), which is how a head with a clean
+  // tree of its own got dragged under the heading too.
+  //
+  // THE CAUTIOUS ARM IS UNCHANGED FOR THE CASE IT WAS WRITTEN FOR. A tree that is DIRTY and parked
+  // still returns `undefined`, because whose files those are is genuinely unknown — that is the
+  // sparkle-rhgm contract and the remaining 6 of those 21. This narrows the gate to the question it
+  // can actually answer; it does not remove it. Nor does it touch `sectionOfRow`'s
+  // `undefined → local_uncommitted` default: "we did not look" still must not buy the calm heading.
+  // What changed is that a clean tree is no longer mistaken for one we did not look at.
+  if (bs.dirty === false) return false;
   if (bs.worktreeOnBranch === false) return undefined;
   return bs.dirty;
 }

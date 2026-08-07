@@ -45,33 +45,42 @@ const allAlive = () => true;
 describe("THE FOUNDER'S ACCEPTANCE TEST — gray is a terminal state", () => {
   // "An agent with an unmet goal, or with uncommitted changes, or with an open unmerged branch, must
   // never render gray. If your state model can produce that combination, it is not finished."
-  const cases: Array<[string, StallInput]> = [
-    ["an unmet goal", resting({ goal: newGoal("ship the ladder", T0) })],
-    ["uncommitted changes", resting({ hasUncommittedChanges: true })],
-    ["an open unmerged PR", resting({ hasOpenPr: true })],
-    ["committed work that never landed", resting({ hasUnlandedWork: true })],
-    ["an escalated goal", resting({ goal: { ...newGoal("hard", T0), escalatedAt: T0 + 1 } })],
+  // The third element is the tier the row must land in. It was implicitly `blocked` for every case
+  // until 2026-08-06; `an escalated goal` now lands AMBER instead, because auto-continue's retry
+  // budget running out is a fact about our machinery rather than about the work (see LIFECYCLE in
+  // stallEscalation.ts). The founder's rule is unchanged and still asserted for all five: NOT GRAY.
+  const cases: Array<[string, StallInput, AgentTabStatus]> = [
+    ["an unmet goal", resting({ goal: newGoal("ship the ladder", T0) }), "blocked"],
+    ["uncommitted changes", resting({ hasUncommittedChanges: true }), "blocked"],
+    ["an open unmerged PR", resting({ hasOpenPr: true }), "blocked"],
+    ["committed work that never landed", resting({ hasUnlandedWork: true }), "blocked"],
+    [
+      "an escalated goal",
+      resting({ goal: { ...newGoal("hard", T0), escalatedAt: T0 + 1 } }),
+      "lapsed",
+    ],
     // NOTE: "an expired goal" USED TO BE A CASE HERE and was removed on purpose (sparkle-biezi).
     // Expiry is a fact about the clock, not about the work, so it is no longer sufficient on its own
     // — see the `expiry is not an alarm` describe block below, which pins both halves of the rule.
   ];
 
-  it.each(cases)("a row with %s does not render gray", (_label, input) => {
+  it.each(cases)("a row with %s does not render gray", (_label, input, expected) => {
     const out = withStallAttention(AGENTS, { a: "idle", b: "working" }, reportFor(input), allAlive);
-    expect(out.a).toBe("blocked");
+    expect(out.a).toBe(expected);
     // The actual requirement, asserted against the token table rather than a status name — a future
     // rename cannot quietly satisfy the letter of this test while breaking the rule.
     expect(AGENT_STATUS[out.a as AgentTabStatus].color).not.toBe(AGENT_STATUS.idle.color);
   });
 
-  it.each(cases)("...and the same holds from the `unmerged` band, with %s", (_label, input) => {
+  it.each(cases)("...and the same holds from the `unmerged` band, with %s", (_label, input, expected) => {
     const out = withStallAttention(
       AGENTS,
       { a: "unmerged", b: "working" },
       reportFor(input),
       allAlive,
     );
-    expect(out.a).toBe("blocked");
+    expect(out.a).toBe(expected);
+    expect(AGENT_STATUS[out.a as AgentTabStatus].color).not.toBe(AGENT_STATUS.idle.color);
   });
 
   it("STUCK IS RED — the founder's second complaint, asserted as colour", () => {
@@ -144,13 +153,39 @@ describe("EXPIRY IS NOT AN ALARM — sparkle-biezi", () => {
     expect(out.a).toBe("blocked");
   });
 
-  it("an ESCALATED goal is still red — auto-continue giving up is not a clock fact", () => {
-    // The neighbouring state, kept apart deliberately: escalation means the mechanism meant to keep
-    // this moving HANDED IT BACK, which is a human's problem. Expiry means a timer elapsed.
+  it("an ESCALATED goal leaves calm — but AMBER, not the red it used to be", () => {
+    // THIS ASSERTION READ `blocked` UNTIL 2026-08-06, on the reasoning that auto-continue handing
+    // the agent back "is a human's problem". The founder overruled that with two measured rows:
+    // both escalated, both with spotless worktrees and every PR they owned merged, both painted the
+    // loudest colour the app has. *"why are they red when they don't require my assistance?"*
+    //
+    // The distinction the old membership missed is the same one `expired-goal` taught: escalation is
+    // a fact about OUR retry budget — how long auto-continue was willing to keep spending — not
+    // about the work, and not about whether a human is required. It still leaves calm, because the
+    // agent really did stop and nothing is coming to restart it; it just no longer says that in the
+    // colour reserved for "a human is blocking this".
     const out = withStallAttention(
       AGENTS,
       { a: "idle" },
       reportFor(resting({ goal: { ...newGoal("hard", T0), escalatedAt: T0 + 1 } })),
+      allAlive,
+    );
+    expect(out.a).toBe("lapsed");
+    expect(AGENT_STATUS.lapsed.color).not.toBe(AGENT_STATUS.waiting.color);
+  });
+
+  it("…but an escalated goal WITH outstanding work is still RED", () => {
+    // The safety property, and the reason the change above is not a way to silence real stalls:
+    // `OUTSTANDING` is tested before `LIFECYCLE`, so work that exists still outranks the amber tier.
+    const out = withStallAttention(
+      AGENTS,
+      { a: "idle" },
+      reportFor(
+        resting({
+          goal: { ...newGoal("hard", T0), escalatedAt: T0 + 1 },
+          hasUncommittedChanges: true,
+        }),
+      ),
       allAlive,
     );
     expect(out.a).toBe("blocked");
@@ -405,5 +440,57 @@ describe("the red it produces is a red the human can ACKNOWLEDGE", () => {
       allAlive,
     );
     expect(out).toEqual({ stalled: "blocked", clean: "idle", busy: "working" });
+  });
+});
+
+// ── The AMBER tier must be acknowledgeable too (roborev 59922) ────────────────────────────────────
+//
+// The amber tier widened three coupled paths — `alertDismissal.DISMISSIBLE`/`isAlertingStatus`,
+// `redSignature` returning an `AlertingStatus`, and `withDismissedStallAttention`'s two comparisons
+// — and every case in the acknowledge suite above drives the `unmerged → blocked` fixture, while the
+// `redAttentionTaxonomy` cases stop at `escalationFor`. So the end-to-end property nothing else
+// covered: escalate → the recorder sees `lapsed` → dismiss → the row is handed back to its OWN band
+// rather than flattened to `idle`, and re-enabling restores the amber.
+//
+// The failure this guards is named at alertDismissal.ts's own header: an UNDISMISSABLE coloured row
+// is what forced the 2026-07-26 rollback. An amber one would be the same bug in a new hue.
+describe("an AMBER `lapsed` row is dismissible exactly like the red one", () => {
+  const lapsedInput = resting({ goal: { ...newGoal("hard", T0), escalatedAt: T0 + 1 } });
+  const CALM: Record<string, AgentTabStatus> = { a: "idle" };
+
+  function pipeline(alert?: AgentAlertRecord): {
+    recorded: Record<string, AgentTabStatus>;
+    presented: Record<string, AgentTabStatus>;
+  } {
+    const agents = [{ id: "a", kind: "build" as const, parentId: null, alert }];
+    const recorded = withStallAttention(agents, CALM, () => stallReport(lapsedInput), allAlive);
+    return { recorded, presented: withDismissedStallAttention(agents, recorded, CALM) };
+  }
+
+  it("escalates to `lapsed`, and the alert recorder is fed that status", () => {
+    const { recorded, presented } = pipeline();
+    expect(recorded.a).toBe("lapsed");
+    // Un-acknowledged, the row PRESENTS the amber — the undo pass must not swallow it.
+    expect(presented.a).toBe("lapsed");
+  });
+
+  it("offers a Dismiss control for the amber row", () => {
+    // If `alertControlKind` returned null here the row would be a colour the human cannot clear.
+    expect(alertControlKind(undefined, pipeline().recorded.a ?? "stopped")).toBe("dismiss");
+  });
+
+  it("hands a dismissed amber row back to its OWN band, not to a flattened `idle`", () => {
+    const rec = advanceAlertRecord(undefined, pipeline().recorded.a ?? "stopped");
+    const dismissed = dismissedRecord(rec);
+    // `withDismissedStallAttention` restores the pre-escalation status, which here IS `idle` —
+    // asserted against CALM rather than the literal so this stays honest if the fixture's band moves.
+    expect(pipeline(dismissed).presented.a).toBe(CALM.a);
+    // The signature really was the amber one — this is what ties the acknowledgement to THIS alarm.
+    expect(rec.lastRed).toBe("lapsed");
+  });
+
+  it("re-raises the amber after the human re-enables it", () => {
+    const rec = advanceAlertRecord(undefined, pipeline().recorded.a ?? "stopped");
+    expect(pipeline(reenabledRecord(dismissedRecord(rec))).presented.a).toBe("lapsed");
   });
 });

@@ -92,12 +92,17 @@ export const C = {
   azure: "#38bdf8", // an agent is asking you something — good news, not an alarm
 } as const;
 
+// THE FIFTH STATUS TIER reuses `amber` above rather than adding a hue. See the `lapsed` entry in
+// AGENT_STATUS for why "auto-continue stopped" is amber and what it must never do.
+
 /**
- * Agent tab status taxonomy + colors (desktop workspace spec §6). The taxonomy keeps
- * nine states for precise tooltips/legends, but they collapse to exactly THREE colors
- * so a glance tells you only what you need to act on:
+ * Agent tab status taxonomy + colors (desktop workspace spec §6). The taxonomy keeps the states
+ * separate for precise tooltips/legends, but they collapse to a small set of colors so a glance
+ * tells you only what you need to act on:
  *   GREEN  — running                              (working)
  *   RED    — needs your action                    (waiting, approval, errored, blocked)
+ *   BLUE   — asking you something                 (questions)
+ *   AMBER  — the machinery stopped, you don't have to (lapsed)
  *   GRAY   — nothing is stopping you              (idle, done, stopped, unmerged, new)
  * RED means the agent needs YOU before it can make progress: it's waiting on your input (a question
  * or an approval it drew on screen, OR a finished-turn ask the followup judge flagged as blocked on
@@ -155,6 +160,7 @@ const GREEN = C.success; // #34c759 — running, leave it be
 const RED = C.sienna; //   #e0533f — needs your action
 const GRAY = C.muted; //   #8aa0c4 — not active (legible on navy)
 const BLUE = C.azure; //   #38bdf8 — asking you something (GOOD news, deliberately not red)
+const AMBER = C.amber; //  #e0982f — the machinery stopped; nothing is owed BY you
 export const AGENT_STATUS = {
   working: { color: GREEN, label: "Working" }, // actively producing output
   idle: { color: GRAY, label: "Done — your turn" }, // finished its turn, nothing left for you
@@ -187,6 +193,52 @@ export const AGENT_STATUS = {
   approval: { color: RED, label: "Approve?" }, // caution/dangerous action pending
   blocked: { color: RED, label: "Blocked" }, // went quiet / stalled — needs you to unstick it
   errored: { color: RED, label: "Errored" }, // process crashed/exited with an error — red so it stands out
+  // THE FIFTH STATUS TIER — AUTO-CONTINUE STOPPED, AND THAT IS NOT AN ALARM. Added 2026-08-06 at
+  // the founder's explicit instruction, in these words: "why are they red when they don't require
+  // my assistance?"
+  //
+  // WHAT IT MEANS. The auto-continue machinery spent its retry budget on this agent's goal and
+  // handed it back — `escalated-goal`, and that ONE cause is the whole tier
+  // (`engine/stallEscalation.LIFECYCLE`). It is a fact about the MACHINERY — how much Sparkle was
+  // willing to spend chasing a goal — not about the work, and not about whether a human is
+  // required. Its `OUTSTANDING` neighbour is the set that still paints red.
+  //
+  // ⚠️ `expired-goal` IS NOT IN THIS TIER. It renders calm GRAY and always did (sparkle-biezi); an
+  // earlier cut of this change moved it to amber and it was moved back, because expiry is the
+  // higher-volume cause — every agent outliving its TTL earns one — so the tier built to stop a wall
+  // of false red would have begun a wall of amber. See LIFECYCLE's own comment for the full argument.
+  //
+  // WHY AMBER AND NOT RED. It WAS red (`escalated-goal` was in `OUTSTANDING`), and the founder
+  // triaged a day of rows that needed nothing: two of them — clean worktrees, every PR merged, both
+  // wearing the loudest signal the app has. `expired-goal` had already been cut from that set for
+  // the identical reason (sparkle-biezi); this is the same argument one notch further. A colour
+  // that fires on rows needing nothing is how real red stops meaning anything, and red is the only
+  // signal here that cannot be rebuilt once it is spent.
+  //
+  // WHY AMBER AND NOT GRAY. Gray says "nothing is stopping you". Something DID stop — the agent is
+  // not going to pick its goal back up on its own, and if the human wants it finished they have to
+  // say so. That is worth a glance, just not an alarm. `amber` is already the app's caution/waiting
+  // hue everywhere else, so this reads as "paused" without being taught.
+  //
+  // ⚠️ AS TEXT IT IS `C.amberInk`, NEVER THIS HEX. The value here is a FILL (the row dot). Raw brand
+  // amber measures ≈1.7:1 on light's builder column, so `theme/colors.statusInk` maps it — the third
+  // tier to need that arm after red and blue, which makes it a rule rather than an exception: a new
+  // status tier owes a `statusInk` arm, or it paints unreadable text wherever the status colour is
+  // used for a label or border (here: `AlertToggleButton`).
+  //
+  // WHAT IT MUST NEVER DO, and each of these is pinned by a test:
+  //   • It must NOT be in `services/windowStatus.isRedStatus`. That predicate asks this table for
+  //     the red hex, so amber excludes it by construction — but the subtype `RedStatus` beside it
+  //     is written by hand and must not gain this key.
+  //   • It must NOT be in `engine/attention.needsAttention`. No dock badge, no banner, no
+  //     inflation of "N agents need you". Unlike `questions` (blue, and deliberately IN that set
+  //     because a question nobody sees is a stalled agent), nothing here is addressed to the human.
+  //   • It must NOT outrank a genuine red. `withStallAttention` checks `OUTSTANDING` FIRST, so an
+  //     agent that gave up AND still holds unlanded work stays RED on the strength of the WORK.
+  //     Only a row that owes nothing goes quiet.
+  // Sparkle's standing rule is never to hide a row that needs the founder; making rows less red is
+  // only safe while those three hold.
+  lapsed: { color: AMBER, label: "Auto-continue stopped" },
   // Done, but committed work isn't on main yet — open/merge the PR. GRAY, deliberately: this is a
   // LANDING state, not an alarm. It was red until 2026-07-26, and on a real fleet that made red
   // meaningless — 27 of 51 agents sat in the committed-but-unlanded band, so the wall of red said

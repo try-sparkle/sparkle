@@ -197,9 +197,19 @@ export function stallReport(input: StallInput): StallReport {
   // with nothing about its work having changed. That is a real de-escalation of the 09:00/09:30 case
   // above, and it is DELIBERATE: the founder's rule of 2026-08-04 is that red is reserved for "a human
   // is blocking this", and a lapsed timer is not that. The row does not go silent — it keeps the chip
-  // — it just stops shouting. The channel for "this genuinely needs a human now" is `escalated-goal`,
-  // which is still red; an agent that expires WITHOUT escalating is one auto-continue never engaged
-  // with, and the fix for that belongs in goalContinuation/turn-end authority, not in this colour.
+  // — it just stops shouting. An agent that expires WITHOUT escalating is one auto-continue never
+  // engaged with, and the fix for that belongs in goalContinuation/turn-end authority, not here.
+  //
+  // ⚠️ THIS PARAGRAPH USED TO END "the channel for 'this genuinely needs a human now' is
+  // `escalated-goal`, which is still red". THAT IS NO LONGER TRUE (2026-08-06) and it is corrected
+  // here rather than left to narrate retired behaviour. `escalated-goal` left `OUTSTANDING` too: it
+  // reports that auto-continue's RETRY BUDGET ran out, which is a fact about our machinery, not a
+  // claim that a human is required — the founder measured two escalated rows that needed nothing and
+  // were painted red for it. It now routes to the amber `lapsed` tier (engine/stallEscalation
+  // LIFECYCLE). There is no cause in this file that means "a human is required" on its own; the red
+  // tier is reached by the WORK causes (`unmet-goal` / `open-pr` / `unlanded-work` /
+  // `uncommitted-changes`), and by the statuses `statusEngine` derives from the PTY (waiting /
+  // approval / errored), which never pass through here.
   if (goalState === "expired") causes.push("expired-goal");
   if (hasOpenPr === true) causes.push("open-pr");
   // FOLDED INTO `open-pr` WHENEVER BOTH HOLD. An agent with an open PR has unlanded commits by

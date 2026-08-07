@@ -55,6 +55,11 @@ export const DEFAULT_NOTIFY_STATUSES: Record<AgentTabStatus, boolean> = {
   done: true,
   working: false,
   blocked: false,
+  // OFF, and for the same reason `blocked` is: this is a "when you get to it" state, not an ask.
+  // It is the whole point of the amber tier — the founder spent a day triaging rows that needed
+  // nothing, so a state meaning "auto-continue stopped and nothing is waiting on you" must not
+  // arrive as a banner. One toggle away for anyone who wants it.
+  lapsed: false,
   // `unmerged` floats the row above the calm tier but is GRAY, not red (see packages/ui/tokens.ts),
   // and does NOT ping by default — a finished agent's un-merged branch is a passive "when you get to
   // it" nudge, not a banner-worthy event.

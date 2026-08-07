@@ -57,7 +57,11 @@ export interface PromptHistoryEntry {
 // branch, which starts a fresh episode rather than crashing.
 export interface AgentAlertRecord {
   seq: number;
-  lastRed: "waiting" | "approval" | "errored" | "blocked" | null;
+  // The last ALERTING status this row presented, not strictly the last RED one: `lapsed` (amber,
+  // "Auto-continue stopped") is acknowledgeable the same way even though it is not red, so it can
+  // be the episode's signature. Widening a persisted union needs no migration — an older record
+  // simply never carries the new value. See engine/alertDismissal.AlertingStatus.
+  lastRed: "waiting" | "approval" | "errored" | "blocked" | "lapsed" | null;
   dismissedSeq: number | null;
 }
 

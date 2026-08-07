@@ -50,6 +50,15 @@ const ALL_STATUSES: Record<AgentTabStatus, true> = {
   // TYPECHECK until it was acknowledged here — which is exactly what this shape was written to do.
   // The retirement pill still contributes nothing to the taxonomy.
   questions: true,
+  // …and it caught a second one the same way: `lapsed` (the amber "Auto-continue stopped" tier,
+  // 2026-08-06) failed this TYPECHECK the moment it was added to AGENT_STATUS, on a branch whose
+  // author was not thinking about retirement at all. That is the whole value of the shape.
+  //
+  // It contributes nothing to the retirement taxonomy, and deliberately: `lapsed` means our retry
+  // budget stopped, not that the agent is finished. It is NOT in `UNREACHABLE` below either — a
+  // lapsed agent's PTY is alive (stallEscalation only escalates rows `aliveOf` does not deny), so
+  // it can still answer a retro ping exactly like `idle`.
+  lapsed: true,
 };
 const ALL = Object.keys(ALL_STATUSES) as AgentTabStatus[];
 
@@ -115,9 +124,14 @@ describe("the attention taxonomy is UNTOUCHED by this feature", () => {
   // `bandOfStatus` or `rollupDot` to make it filterable, this block fails and they have to come
   // read the reasoning first — which is the whole point of earning the state rather than adding one.
 
-  it("adds no AgentTabStatus — bandOfStatus still knows exactly eleven", () => {
-    // "Exactly eleven" is an assertion rather than a claim in a test name (see ALL_STATUSES above).
-    expect(ALL).toHaveLength(11);
+  it("adds no AgentTabStatus of ITS OWN — bandOfStatus still knows exactly twelve", () => {
+    // "Exactly twelve" is an assertion rather than a claim in a test name (see ALL_STATUSES above).
+    // It was ELEVEN until 2026-08-06, when `lapsed` (the amber "Auto-continue stopped" tier) landed
+    // from a different branch. That is not this feature adding a status — which is what this block
+    // locks — so the count moves and the four-band literal below does NOT: `lapsed` bands into the
+    // gray `done` chip rather than earning a fifth, and the assertion that every status still lands
+    // in one of exactly those four is the part that had to keep holding.
+    expect(ALL).toHaveLength(12);
     // THE BAND SET IS PINNED TO A LITERAL, and that is the whole lock (roborev 59482). Deriving
     // `BAND_IDS` from `STATUS_BANDS` and asserting `toContain` was a TAUTOLOGY: `bandOfStatus`
     // returns `StatusBand` and `STATUS_BANDS` enumerates every `StatusBand`, so it could not fail
@@ -172,7 +186,9 @@ describe("canAnswerRetroPing — the confirm dialog's WORDING, no longer a gate"
     // up had no assertion here at all (roborev 59482). Derived from `ALL`, a new status is covered
     // the moment the typecheck lock forces it into `ALL_STATUSES`.
     const reachable = ALL.filter((s) => !UNREACHABLE.includes(s));
-    expect(reachable).toHaveLength(9);
+    // 10 since 2026-08-06: `lapsed` is reachable. A lapsed agent's PTY is ALIVE — stallEscalation
+    // refuses to escalate a row `aliveOf` denies — so it answers a retro ping exactly like `idle`.
+    expect(reachable).toHaveLength(10);
     for (const s of reachable) expect(canAnswerRetroPing(s)).toBe(true);
     // And the two that cannot, from the same source — so the split is exhaustive by construction.
     for (const s of UNREACHABLE) expect(canAnswerRetroPing(s)).toBe(false);

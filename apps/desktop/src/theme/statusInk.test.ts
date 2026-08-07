@@ -37,6 +37,33 @@ describe("statusInk (raw AGENT_STATUS color → themed text ink)", () => {
     expect(C.dangerInk).not.toBe(AGENT_STATUS.waiting.color);
   });
 
+  it("flips the brand AMBER tier ('lapsed') to the themed amberInk", () => {
+    // The third tier to need an arm, after red and blue, which is what makes it a rule: raw brand
+    // amber measures ~1.7:1 on light's builder column — under HALF the 3.83:1 that was judged
+    // insufficient for red above — and `lapsed` reaches TEXT directly, via AlertToggleButton's
+    // label and border (alertControlKind returns a dismiss/re-enable control for it). Without this
+    // arm it fell through `return color` and painted the raw fill hex.
+    expect(statusInk(AGENT_STATUS.lapsed.color)).toBe(C.amberInk);
+    expect(C.amberInk).not.toBe(AGENT_STATUS.lapsed.color);
+  });
+
+  it("gives EVERY status colour an ink that is not the raw fill, except the ones that pass through", () => {
+    // The generalisation of the four cases above, so a SIXTH tier cannot be added without either an
+    // arm here or a deliberate decision recorded in this list. Green/gray/red/blue/amber all map;
+    // nothing else in the taxonomy may silently rely on the fallthrough.
+    const MAPPED = new Set([
+      AGENT_STATUS.working.color,
+      AGENT_STATUS.idle.color,
+      AGENT_STATUS.waiting.color,
+      AGENT_STATUS.questions.color,
+      AGENT_STATUS.lapsed.color,
+    ]);
+    for (const st of Object.keys(AGENT_STATUS) as (keyof typeof AGENT_STATUS)[]) {
+      expect(MAPPED.has(AGENT_STATUS[st].color)).toBe(true);
+      expect(statusInk(AGENT_STATUS[st].color)).not.toBe(AGENT_STATUS[st].color);
+    }
+  });
+
   it("leaves a colour outside the taxonomy alone", () => {
     // The fallthrough still exists and still means "not a status colour I know" — without this,
     // the three mappings above could be replaced by an unconditional `return C.dangerInk` and the

@@ -612,6 +612,14 @@ export function statusInk(color: string): string {
   // this tier paints a row NAME beside a count the founder is meant to act on. BRAND.azure is a
   // dot fill; `questionsInk` is its themed as-text twin.
   if (color === AGENT_STATUS.questions.color) return C.questionsInk;
+  // Brand AMBER (`lapsed`) — the third repeat of the same lesson, so it is worth stating as a rule:
+  // ANY new status tier owes an arm here, because the fall-through paints raw brand colour as TEXT.
+  // BRAND.amber measures ≈1.7:1 on light's builder column — less than half the 3.83:1 that was
+  // judged insufficient for red — and `lapsed` reaches text directly: `alertControlKind` returns a
+  // dismiss/re-enable control for it, and `AlertToggleButton` uses the status colour for its label
+  // and border. `amberInk` is the themed as-text twin that already existed for this ("amber TEXT
+  // only — keep BRAND.amber for fills").
+  if (color === AGENT_STATUS.lapsed.color) return C.amberInk;
   return color;
 }
 

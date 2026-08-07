@@ -116,6 +116,20 @@ describe("newlyEntered", () => {
 });
 
 describe("notificationFor", () => {
+  it("gives the AMBER tier a glyph — never the green tier's empty one", () => {
+    // `statusGlyph` branches on colour value, so a tier with no arm falls through to the `return ""`
+    // meant for green (`working`). An opted-in "Auto-continue stopped" banner then arrived with NO
+    // glyph, reading exactly like a `working` notification — the same conflation the BLUE arm was
+    // added to prevent, in the one surface (a notification title) that has no dot and no chip to
+    // carry the tier. Gray is the deliberate choice: `lapsed` bands with `done`.
+    const n = notificationFor("lapsed", "Backlog", "sparkle");
+    expect(n.title).toBe("🔘 Backlog");
+    expect(n.title).not.toBe("Backlog"); // the empty-glyph fallthrough
+    expect(n.body).toBe("Auto-continue stopped — nothing is waiting on you · sparkle");
+    // …and it must not borrow the alarm glyph either.
+    expect(n.title.startsWith("🔴")).toBe(false);
+  });
+
   it("prefixes the title with a status-colored circle and keeps the reason + project body", () => {
     // RED tier (waiting/approval/errored) → 🔴.
     expect(notificationFor("waiting", "Fixer", "sparkle")).toEqual({

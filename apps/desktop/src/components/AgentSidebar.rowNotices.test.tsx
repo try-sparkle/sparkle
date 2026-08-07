@@ -67,6 +67,7 @@ import {
 } from "./FittedAgentName";
 import { BUILD_COLUMN_DEFAULT_WIDTH } from "../engine/columnResize";
 import { THRASH_VERDICT_LABEL } from "./rowAttention";
+import { C } from "../theme/colors";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
@@ -118,6 +119,17 @@ const UNMET_GOAL = {
   ttlMs: 4 * 60 * 60_000,
   continues: 0,
   totalContinues: 0,
+} as AgentTab["goal"];
+
+/** A goal auto-continue GAVE UP on — `escalatedAt` is what latches the state. */
+const ESCALATED_GOAL_FIXTURE = {
+  text: "land the retry PR",
+  setAt: Date.now(),
+  ttlMs: 4 * 60 * 60_000,
+  continues: 3,
+  totalContinues: 3,
+  escalatedAt: Date.now(),
+  escalationReason: "retry ceiling reached",
 } as AgentTab["goal"];
 
 function mkAgent(id: string, name: string, over: Partial<AgentTab> = {}): AgentTab {
@@ -344,6 +356,28 @@ describe("clicking a notice mark mounts the agent and names the pill to open", (
     // The pill NAMED, not merely "something about this agent" — the composer has to know which of
     // its pills to open, and `goal:unmet` is the one whose explainer says what a blue target is.
     expect(useUiStore.getState().focusedNoticeBySide[side]).toBe("goal:unmet");
+  });
+
+  it("inks the ESCALATED goal chip amber, matching the composer's goal pill", () => {
+    // roborev 59986. The composer pill's `escalated -> DANGER` case was dropped when escalation
+    // moved to the amber `lapsed` tier, and this chip was left red — so one fact read amber on the
+    // composer and red here, which is the cross-surface split the branch exists to close, relocated
+    // onto the goal notice. GOAL_GLYPH's rule is that the chip and the pill must not diverge for a
+    // single state, and nothing pinned this side: reverting GOAL_CHIP_COLOR.escalated to DANGER left
+    // the whole suite green, which is why this assertion exists rather than only its pill twin in
+    // Concierge/MountedAgentNotices.test.tsx.
+    render(
+      <AgentSidebar
+        project={seed({ a1: "idle" }, {}, {}, {}, { goal: ESCALATED_GOAL_FIXTURE })}
+      />,
+    );
+    const goal = within(rowFor(AGENT_NAME)).getByTestId("row-goal");
+    // THE STATE FIRST. `GOAL_CHIP_COLOR.expired` is ALSO amber, so an ink-only assertion would stay
+    // green if the fixture ever stopped producing `escalated` — a changed default TTL, a reordering
+    // in `goalStateOf`, a dropped `escalatedAt` — and would then be guarding the wrong state
+    // entirely (roborev 60001). Its sibling in stallOverlay pins the state for the same reason.
+    expect(goal.getAttribute("data-goal-state")).toBe("escalated");
+    expect(goal.style.color).toBe(C.amberInk);
   });
 
   it("still renders the goal as a GLYPH — clickable did not mean wordy", () => {

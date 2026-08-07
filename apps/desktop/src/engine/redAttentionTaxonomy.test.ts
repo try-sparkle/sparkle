@@ -2,6 +2,11 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { StatusEngine } from "./statusEngine";
 import { isApiErrorLine, isSelfPromptLine, StreamFailureDetector } from "./streamFailure";
 import { needsAttention } from "./attention";
+import { escalationFor } from "./stallEscalation";
+import { bandOfStatus } from "./buildSections";
+import { isRedStatus } from "../services/windowStatus";
+import { AGENT_STATUS } from "@sparkle/ui";
+import type { StallCause, StallReport } from "./agentStall";
 import { mightNeedFollowup } from "../services/turnFollowup";
 import type { AgentTabStatus } from "../types";
 
@@ -145,5 +150,69 @@ describe("RED needs-you taxonomy (sparkle-vgub / sparkle-blpf / sparkle-pqxh)", 
     expect(isSelfPromptLine("Are you there?")).toBe(true);
     expect(isSelfPromptLine("Hey, Sparkler. Are you there?")).toBe(true);
     expect(isSelfPromptLine("Running the test suite now.")).toBe(false);
+  });
+});
+
+// ── The OTHER half of the contract: RED must also mean something ─────────────────────────────────
+//
+// Everything above pins "a genuine ask stays RED". This block pins the converse, added 2026-08-06
+// after the founder spent a day triaging red rows that needed nothing: *"why are they red when they
+// don't require my assistance?"* Both rows in his screenshot had spotless worktrees and every PR
+// they owned merged, and both wore `auto-continue gave up` in the alarm colour.
+//
+// A taxonomy where red means two different things is a taxonomy that means one thing: go look.
+// These cases fail if `escalated-goal` is ever put back in `OUTSTANDING`.
+describe("AMBER lifecycle vs RED needs-you — red is reserved for the human", () => {
+  const report = (causes: StallCause[]): StallReport => ({
+    verdict: causes.length ? "stalled" : "finished",
+    causes,
+    detail: "",
+  });
+
+  it("auto-continue gave up, nothing outstanding → AMBER, never red", () => {
+    expect(escalationFor(report(["escalated-goal"]))).toBe("lapsed");
+    expect(isRedStatus("lapsed")).toBe(false);
+    expect(AGENT_STATUS.lapsed.color).not.toBe(AGENT_STATUS.waiting.color);
+  });
+
+  it("a lapsed goal never becomes a badge or a banner", () => {
+    // The "N agents need you" count and the dock badge key off this set, NOT off the colour tier.
+    // An amber row that still inflated the count would have moved the false alarm, not removed it.
+    expect(needsAttention("lapsed")).toBe(false);
+    expect(bandOfStatus("lapsed")).not.toBe("needs_you");
+  });
+
+  it("goal expired, nothing outstanding → still CALM, not amber and not red", () => {
+    // `expired-goal` was already cut from the red tier by sparkle-biezi, and it stays calm here on
+    // purpose: it is the higher-volume cause (every agent outliving its TTL earns one), so routing
+    // it to amber would trade a wall of false red for a wall of amber. See LIFECYCLE's comment.
+    expect(escalationFor(report(["expired-goal"]))).toBe(undefined);
+  });
+
+  // ── DO NOT REGRESS THE OPPOSITE FAILURE ────────────────────────────────────────────────────────
+  // Sparkle's standing rule is never to hide a row that needs the founder. `OUTSTANDING` is tested
+  // FIRST, so real work still outranks the amber tier whatever else is true of the row.
+  it("gave up AND still holds unlanded work → STILL RED", () => {
+    expect(escalationFor(report(["escalated-goal", "unlanded-work"]))).toBe("blocked");
+    expect(isRedStatus("blocked")).toBe(true);
+  });
+
+  it("every OUTSTANDING cause still outranks a lifecycle one", () => {
+    for (const c of ["unmet-goal", "open-pr", "unlanded-work", "uncommitted-changes"] as const) {
+      expect(escalationFor(report(["escalated-goal", c]))).toBe("blocked");
+    }
+  });
+
+  it("the asking statuses are untouched — still red, still notified", () => {
+    for (const s of ["waiting", "approval", "errored", "blocked"] as const) {
+      expect(isRedStatus(s)).toBe(true);
+    }
+    expect(needsAttention("waiting")).toBe(true);
+    expect(needsAttention("approval")).toBe(true);
+  });
+
+  it("a row with no causes is still calm — amber is not a new default", () => {
+    expect(escalationFor(report([]))).toBe(undefined);
+    expect(escalationFor(undefined)).toBe(undefined);
   });
 });

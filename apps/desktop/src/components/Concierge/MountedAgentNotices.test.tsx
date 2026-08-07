@@ -20,6 +20,8 @@ import {
   NOTICE_OWN_WORDS_TESTID,
 } from "./MountedAgentNotices";
 import { NOTICE_EXPLAINER } from "../agentNotices";
+import { C, DANGER } from "../../theme/colors";
+
 import { useProjectStore } from "../../stores/projectStore";
 import { useRuntimeStore } from "../../stores/runtimeStore";
 import { useUiStore } from "../../stores/uiStore";
@@ -176,6 +178,86 @@ describe("MountedAgentNotices", () => {
     render(<MountedAgentNotices agentId="a1" side="left" />);
     expect(pills()).toHaveLength(1);
     expect(pills()[0]!.textContent).toContain("Looping");
+  });
+
+  it("does NOT ink the escalated pill with the alarm colour — this is the only surface that shows it", () => {
+    // roborev 59969, and the surface matters. `escalated-goal` moved to the amber `lapsed` tier, but
+    // the pill kept an `escalated → DANGER` special case, so the one cause that needs NOTHING from
+    // the founder was still painted in the alarm colour, text and border both.
+    //
+    // IT HAD TO BE ASSERTED *HERE*, not on the sidebar: `withoutSeparatelyDrawn` strips
+    // `stall:escalated-goal` from the row's marks whenever a goal badge exists — always, since the
+    // cause derives from `goalStateOf` — so the sidebar's escalated branch is unreachable and a test
+    // there would pass against the bug. The first attempt at this fix corrected that unreachable
+    // branch and left this one live, which is exactly what an unreachable-surface test would hide.
+    const project: Project = {
+      id: "p1",
+      name: "Demo",
+      rootPath: "/tmp/demo",
+      defaultBranch: "main",
+      createdAt: new Date(0).toISOString(),
+      selectedAgentId: null,
+      agents: [agent({ goal: ESCALATED_GOAL })],
+    };
+    useProjectStore.setState({ projects: [project] } as never);
+    useRuntimeStore.setState({
+      status: { a1: "idle" },
+      branchStatus: { a1: CLEAN_BS },
+      workflowState: { a1: BARE_WS },
+      workflowStage: {},
+    } as never);
+
+    render(<MountedAgentNotices agentId="a1" side="left" />);
+    const pill = pills().find((p) => p.getAttribute("data-notice-id") === "stall:escalated-goal");
+    expect(pill).toBeDefined();
+    // Assert against the TOKENS, not hex literals, so a palette retune cannot silently re-red it.
+    // Compared as the raw inline value rather than a computed colour: these are themed CSS vars and
+    // jsdom does not resolve `var(...)`, so a computed-style comparison would be testing nothing.
+    const ink = (pill as HTMLElement).style.color;
+    expect(ink).not.toBe(DANGER);
+    expect(ink).toBe(C.amberInk);
+    // NOT asserted via `style.borderColor` — that reads "" whichever colour is painted, because the
+    // pill sets the SHORTHAND `border: 1px solid ${ink}` and cssstyle clears the longhands whenever
+    // the value contains a `var()`. An earlier version of this test did exactly that and could not
+    // fail in either direction (roborev 59986), which is the vacuous shape this file exists to
+    // catch. The shorthand is where the value survives, and it comes from the same `ink`.
+    expect((pill as HTMLElement).style.border).toBe(`1px solid ${C.amberInk}`);
+  });
+
+  it("keeps the goal:escalated PILL at the same tier as the sidebar's goal CHIP", () => {
+    // roborev 59986. Dropping the pill's `escalated -> DANGER` case changed the ink of EVERY
+    // escalated-glyph notice, not just the stall cause -- including the `goal:escalated` pill, which
+    // is reachable whenever the stall does not pre-empt it (stall causes are raised only for a quiet
+    // agent, so an escalated-then-resumed one renders this). That briefly made one fact read amber
+    // on the composer and red on the sidebar chip: the cross-surface tier split this branch exists
+    // to close, relocated onto the goal pill. GOAL_GLYPH's own rule is that the two must not
+    // diverge for a single state, so the chip moved to amber too and this pins them together.
+    const project: Project = {
+      id: "p1",
+      name: "Demo",
+      rootPath: "/tmp/demo",
+      defaultBranch: "main",
+      createdAt: new Date(0).toISOString(),
+      selectedAgentId: null,
+      agents: [agent({ goal: ESCALATED_GOAL })],
+    };
+    useProjectStore.setState({ projects: [project] } as never);
+    useRuntimeStore.setState({
+      // WORKING, deliberately: a quiet agent raises stall causes, and `stall:escalated-goal` would
+      // then be the notice under test instead of the goal pill.
+      status: { a1: "working" },
+      branchStatus: { a1: CLEAN_BS },
+      workflowState: { a1: BARE_WS },
+      workflowStage: {},
+    } as never);
+
+    render(<MountedAgentNotices agentId="a1" side="left" />);
+    const pill = pills().find((p) => p.getAttribute("data-notice-id") === "goal:escalated");
+    expect(pill).toBeDefined();
+    // GOAL_CHIP_COLOR.escalated is the sidebar chip's ink; the two are asserted equal rather than
+    // both spelled out, so moving the tier again moves both or fails here.
+    expect((pill as HTMLElement).style.color).toBe(C.amberInk);
+    expect((pill as HTMLElement).style.color).not.toBe(DANGER);
   });
 
   it("gives EVERY stall cause its own pill, not a head plus '+2'", () => {

@@ -13,9 +13,9 @@
 // Every assertion is on the row's DOM, not on an input to it. Asserting that the store holds an
 // open PR would pass against the code as it was before this change and prove nothing; asserting
 // that the text "PR unmerged" appears inside that agent's row would not.
-import { cleanup, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { AGENT_STATUS, C, DANGER } from "../theme/colors";
+import { AGENT_STATUS, C, DANGER, FONT_WEIGHT } from "../theme/colors";
 import { alertControlKind } from "../engine/alertDismissal";
 
 vi.mock("@tauri-apps/plugin-opener", () => ({
@@ -632,9 +632,16 @@ describe("EVERY goal state is visible on the row, and an ESCALATED one is still 
     expect(chip.getAttribute("data-goal-state")).toBe("escalated");
     expect(chip.textContent).toBe("");
     expect(chip.getAttribute("aria-label")).toBe("Goal escalated — land PR #42");
-    expect(chip.style.color).toBe(DANGER);
-    // STILL the loudest of the four, and with no words to bold that has to be carried by the MARK:
-    // the biggest icon in the set, and the only DANGER ink.
+    // AMBER SINCE 2026-08-06, and this line read DANGER until then. The founder overruled that
+    // tier on two measured rows: *"why are they red when they don't require my assistance?"* --
+    // both escalated, both with spotless worktrees and every PR merged. Auto-continue giving up is
+    // our retry budget ending, not a demand on him. The chip moved together with the composer's
+    // `goal:escalated` pill, because GOAL_GLYPH's rule is that the two must not diverge for one
+    // state (roborev 59986).
+    expect(chip.style.color).toBe(C.amberInk);
+    expect(chip.style.color).not.toBe(DANGER);
+    // STILL the loudest of the four, and with the alarm ink gone that now rests ENTIRELY on the
+    // MARK: the biggest icon in the set. Which is why this assertion matters more than it did.
     expect(chip.querySelector("svg")?.getAttribute("width")).toBe("12");
     expect(chip.getAttribute("title")).toContain("land PR #42");
     expect(chip.getAttribute("title")).toContain("auto-continue gave up — 20 continues, no progress");
@@ -683,6 +690,67 @@ describe("EVERY goal state is visible on the row, and an ESCALATED one is still 
     expect(within(rowFor("Busy One")).queryByTestId("row-goal")).toBeNull();
   });
 
+  it("inks the card's STALL chip and detail amber — the third surface of one fact", () => {
+    // roborev 60018, and the correction that produced it is worth keeping: an earlier version of
+    // this file carried a comment claiming these two inks COULD NOT be pinned because nothing
+    // renders a card. That was false — `fireEvent.contextMenu` on a row opens `agent-hover-card`,
+    // which several suites already assert against — and a false impossibility claim is worse than
+    // the gap it describes, because it reads as an instruction not to close it.
+    //
+    // `stallChipFor` sets `escalated` from the same `escalated-goal` cause as the goal chip, and
+    // these render in the card strip and its detail block, beside `card-goal`. While they stayed
+    // DANGER the card showed an amber goal chip next to a red "auto-continue gave up" chip for ONE
+    // fact. The three surfaces must share a tier.
+    render(
+      <AgentSidebar
+        project={seed({
+          status: { stalled: "idle" },
+          branchStatus: { stalled: CLEAN_BS },
+          workflowState: { stalled: MERGED_WS },
+          goals: {
+            stalled: escalateGoal(newGoal("land PR #42", NOW), NOW, "the build never went green"),
+          },
+        })}
+      />,
+    );
+    // Captured BEFORE the card opens: the card repeats the agent's name, so a name lookup afterwards
+    // is ambiguous.
+    const row = rowFor("Stalled One");
+    fireEvent.contextMenu(row);
+    const card = screen.getByTestId("agent-hover-card");
+    // EVERY LOOKUP IS `getByTestId`, WHICH THROWS — no `query…`/`??`/`if` hedging (roborev 60040).
+    // All three render behind the same `stallChip &&` / goalBadge conditions, so the hedging bought
+    // nothing and cost the assertions their teeth: an optional lookup that returns null is silently
+    // SKIPPED by the loop below, so a surface disappearing or being renamed would return it to the
+    // unpinned state this test exists to fix, while staying green.
+    const stall = within(card).getByTestId("row-stall");
+    const detail = within(card).getByTestId("card-stall-detail");
+
+    // PIN THE FLAG THE INK BRANCH ACTUALLY READ, not a parallel derivation of the same fact
+    // (roborev 60030). An earlier version asserted `row-goal`'s `data-goal-state`, which comes from
+    // `goalBadgeFor`/`goalStateOf` — but the reverted branch was `stallChip.escalated ? DANGER : …`,
+    // and that flag comes from `stallChipFor`'s `causes.includes("escalated-goal")`. If those two
+    // derivations ever drift, the chip renders with `escalated: false`, which is amber under BOTH
+    // the current and the reverted code, and the test would go green guarding nothing. `fontWeight`
+    // is the other thing that flag still drives, so it witnesses the flag itself.
+    // Asserted on the CHIP specifically, not `stall ?? detail`: the detail line's own sentence
+    // ("auto-continue gave up on its goal — …") contains the same phrase, so falling back to it
+    // would let the text check pass while the chip was absent. `fontWeight` is unconditional for
+    // the same reason — it is the one assertion that reads `stallChip.escalated` directly, and a
+    // skipped witness is not a witness.
+    expect(stall.textContent).toContain("auto-continue gave up");
+    expect(stall.style.fontWeight).toBe(String(FONT_WEIGHT.bold));
+
+    // ALL THREE SURFACES, which is what the deleted note asked for and what this test's own comment
+    // claims. `card-goal` was left unasserted once already — its ink is referenced by no other test,
+    // so a revert of it to DANGER stayed green.
+    const goalLine = within(card).getByTestId("card-goal");
+    for (const el of [stall, detail, goalLine]) {
+      expect(el.style.color).toBe(C.amberInk);
+      expect(el.style.color).not.toBe(DANGER);
+    }
+  });
+
   it("still spends the row's WORDED slot on the stall chip, not on the goal", () => {
     // The division of labour that makes both fit: the mark says WHICH GOAL STATE (colour, size),
     // the stall chip says WHAT IS OUTSTANDING (words). An escalated goal is also a stall cause, so
@@ -705,8 +773,10 @@ describe("EVERY goal state is visible on the row, and an ESCALATED one is still 
     expect(goal.getAttribute("data-goal-state")).toBe("escalated");
     expect(goal.textContent).toBe("");
     // Escalation is categorically different from "needs merging eventually": nothing is coming for
-    // this row at all, so the mark takes DANGER rather than the caution ink every other cause gets.
-    expect(goal.style.color).toBe(DANGER);
+    // this row at all. That distinction is now carried by the chip's SIZE and its own glyph rather
+    // than by the alarm ink -- red is reserved for causes the founder must act on, and an agent
+    // whose retry budget ran out may be perfectly finished (2026-08-06; see GOAL_CHIP_COLOR).
+    expect(goal.style.color).toBe(C.amberInk);
     // ONE MARK FOR THIS FACT, and it is the chip (roborev 59322). The escalated goal used to draw a
     // notice mark as well; that put two DANGER-inked glyphs side by side saying one thing, so the
     // aliased notice is now dropped from the row's marks. The chip is clickable and carries the

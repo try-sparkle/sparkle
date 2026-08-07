@@ -122,9 +122,16 @@ describe("status bands", () => {
     }
   });
 
-  it("bands agree EXACTLY with the AGENT_STATUS color tiers", () => {
+  it("bands agree EXACTLY with the AGENT_STATUS color tiers, except `lapsed`", () => {
     // This is the contract that makes the filter predictable: a chip hides precisely the rows whose
     // dot is that chip's color. If someone recolors a status without rebanding it, this fails.
+    //
+    // `lapsed` (AMBER, 2026-08-06) is the ONE deliberate exception: it rides in the gray `done` band
+    // rather than earning a fifth chip. The exception is NAMED rather than the loop being loosened,
+    // so the guard keeps all of its force — a second status drifting off its band still fails here,
+    // and deleting `lapsed` from the taxonomy fails the companion assertion below rather than
+    // silently leaving a dead exemption behind. See the StatusBand comment in buildSections.ts for
+    // why the fifth band was built and then withdrawn.
     const statuses = Object.keys(AGENT_STATUS) as AgentTabStatus[];
     const colorOfBand: Record<StatusBand, string> = {
       needs_you: AGENT_STATUS.waiting.color,
@@ -132,9 +139,17 @@ describe("status bands", () => {
       running: AGENT_STATUS.working.color,
       done: AGENT_STATUS.idle.color,
     };
+    const EXEMPT: readonly AgentTabStatus[] = ["lapsed"];
     for (const s of statuses) {
+      if (EXEMPT.includes(s)) continue;
       expect(AGENT_STATUS[s].color).toBe(colorOfBand[bandOfStatus(s)]);
     }
+    // The exemption is real, and it is exactly one status wide.
+    expect(statuses).toContain("lapsed");
+    expect(AGENT_STATUS.lapsed.color).not.toBe(colorOfBand[bandOfStatus("lapsed")]);
+    expect(statuses.filter((s) => AGENT_STATUS[s].color !== colorOfBand[bandOfStatus(s)])).toEqual([
+      "lapsed",
+    ]);
   });
 
   it("puts every red-tier status in Needs you", () => {

@@ -85,7 +85,7 @@ import { pendingCount, useAgentInbox } from "../../stores/inboxStore";
 import { useProjectStore } from "../../stores/projectStore";
 import { useRuntimeStore } from "../../stores/runtimeStore";
 import { useUiStore } from "../../stores/uiStore";
-import { C, DANGER, FONT_WEIGHT } from "../../theme/colors";
+import { C, FONT_WEIGHT } from "../../theme/colors";
 import { FONT_MONO, RADIUS, TYPE } from "../../theme/scale";
 import { DELIVERY_LABEL } from "../inboxCopy";
 import type { PairSide } from "../../engine/cable";
@@ -293,7 +293,17 @@ function NoticePill({
   inbox?: readonly { id: string; text: string; state: string; severity: string }[];
 }) {
   const Glyph = GLYPH_ICON[notice.glyph];
-  const ink = notice.glyph === "escalated" ? DANGER : (GOAL_PILL_INK[notice.glyph] ?? C.amberInk);
+  // THE `escalated → DANGER` SPECIAL CASE IS GONE (2026-08-06, roborev 59969). `escalated-goal`
+  // moved to the amber `lapsed` tier, and THIS is the surface that actually renders it: the sidebar
+  // strips the notice via `withoutSeparatelyDrawn` whenever a goal badge exists — always, since the
+  // cause derives from `goalStateOf` — so the composer pill was the only place the founder ever saw
+  // it, and it was painting the one cause that needs NOTHING from him in the alarm colour, text and
+  // border both. (The first pass at this fixed the sidebar's unreachable branch and left this one:
+  // the ink was corrected on the surface where the notice is invisible.)
+  //
+  // The octagon SHAPE stays the distinction, exactly as argued for the sidebar mark, and the row's
+  // DOT is what carries the red/amber tier.
+  const ink = GOAL_PILL_INK[notice.glyph] ?? C.amberInk;
   // ── BOTH, NOT ONE OR THE OTHER (roborev 59253) ───────────────────────────────────────────────
   // This read `NOTICE_EXPLAINER[id] ?? notice.detail`, so the moment a notice HAD an explainer its
   // `detail` became unreachable — and every notice has one. For a goal pill that detail is the
