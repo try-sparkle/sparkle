@@ -5585,6 +5585,115 @@ fn remove_via_git(root: &str, wt: &Path, wt_str: &str) -> Result<(), String> {
     }
 }
 
+/// Is `child` strictly underneath `parent`? Both are canonicalized first, because git reports
+/// worktree paths symlink-resolved (`/private/var/...`) while ours may not be (`/var/...`), and a
+/// raw `starts_with` between the two forms answers `false` for the same directory.
+fn path_is_inside(child: &Path, parent: &Path) -> bool {
+    let c = std::fs::canonicalize(child).unwrap_or_else(|_| child.to_path_buf());
+    let p = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+    c != p && c.starts_with(&p)
+}
+
+/// A ref name for a rescued commit: `refs/rescue/<dir>-<short sha>`. Every character outside
+/// `[A-Za-z0-9_-]` is replaced, which sidesteps git's ref-name rules wholesale — no `..`, no
+/// leading `.`, no `@{`, and a trailing `.lock` is impossible once a sha is appended.
+fn rescue_ref_name(dir_name: &str, sha: &str) -> String {
+    let mut stem: String = dir_name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    while stem.starts_with('-') {
+        stem.remove(0);
+    }
+    if stem.is_empty() {
+        stem = "nested".to_string();
+    }
+    format!("refs/rescue/{stem}-{}", &sha[..sha.len().min(12)])
+}
+
+/// Give a ref to any commit that a teardown of `parent` would otherwise orphan.
+///
+/// A nested worktree cut inside an agent's checkout with a **detached** HEAD has no ref pointing at
+/// its commits. Deleting the parent therefore does not just remove a directory — it makes that work
+/// unreachable: absent from every command that lists work, and recoverable only for as long as the
+/// reflog happens to keep it (bead `sparkle-pqwte`, where a nested checkout held 14 unmerged commits
+/// contained by zero refs and was recovered only inside that window). Commits live in the shared
+/// object store, so the fix is not to copy anything — it is to write the ref that was missing.
+///
+/// Deliberately narrow: most detached checkouts are **not** at risk. The worktree pool cuts its
+/// slots detached at `origin/main`, whose commits are already contained by a ref, so a healthy pool
+/// slot produces nothing here. Only a HEAD that no ref reaches is rescued.
+///
+/// Best-effort by construction — a teardown must not fail because a rescue could not be written —
+/// so every step logs and continues. Returns the refs written, for the tests and the log line.
+///
+/// MUST be called with the per-project git lock held: it reads git's worktree records and writes a
+/// ref, and it runs immediately before the same teardown mutates both.
+fn rescue_nested_detached_heads(root: &str, parent: &Path) -> Vec<String> {
+    let listing = match git(root, &["worktree", "list", "--porcelain"]) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not list worktrees before a teardown; nested detached checkouts went unchecked for rescue");
+            return Vec::new();
+        }
+    };
+
+    // `worktree <path>` opens a record; `HEAD <sha>` and a bare `detached` fill it in. A record
+    // carrying `branch <ref>` simply never sets `detached`, which is exactly the skip we want.
+    struct Rec {
+        path: String,
+        head: String,
+        detached: bool,
+    }
+    let mut recs: Vec<Rec> = Vec::new();
+    for line in listing.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            recs.push(Rec { path: p.trim().to_string(), head: String::new(), detached: false });
+        } else if let Some(h) = line.strip_prefix("HEAD ") {
+            if let Some(r) = recs.last_mut() {
+                r.head = h.trim().to_string();
+            }
+        } else if line.trim() == "detached" {
+            if let Some(r) = recs.last_mut() {
+                r.detached = true;
+            }
+        }
+    }
+
+    let mut written = Vec::new();
+    for r in recs {
+        if !r.detached || r.head.is_empty() || !path_is_inside(Path::new(&r.path), parent) {
+            continue;
+        }
+        match git(root, &["for-each-ref", "--contains", &r.head, "--count=1", "--format=%(refname)"])
+        {
+            // Some ref already reaches it, so teardown cannot orphan it. The common case.
+            Ok(refs) if !refs.trim().is_empty() => continue,
+            Ok(_) => {}
+            // Fail OPEN: an unreadable containment answer must not be read as "contained". A
+            // redundant rescue ref is inert clutter; a skipped one loses the commits for good.
+            Err(e) => {
+                tracing::warn!(error = %e, "could not tell whether a nested detached HEAD is reached by a ref; rescuing it rather than risk orphaning it");
+            }
+        }
+        let dir = Path::new(&r.path)
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let name = rescue_ref_name(&dir, &r.head);
+        match git(root, &["update-ref", &name, &r.head]) {
+            Ok(_) => {
+                tracing::warn!(rescue_ref = %name, "a nested detached checkout inside a worktree being torn down held commits no ref reached; wrote a rescue ref so they survive the teardown");
+                written.push(name);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to write a rescue ref for a nested detached checkout; its commits may not survive this teardown");
+            }
+        }
+    }
+    written
+}
+
 /// Core (AppHandle-free, testable): remove an agent's external worktree (force, to discard
 /// any uncommitted changes). The branch is intentionally left in place so reopening the agent
 /// can resume it. Idempotent: a missing worktree is not an error.
@@ -5626,6 +5735,11 @@ pub fn remove_worktree_at(
         let lock_since = std::time::Instant::now();
         let _g = gl.lock().unwrap_or_else(|e| e.into_inner());
         log_repo_lock_wait("remove_agent_worktree", lock_since.elapsed());
+        // Before anything is deleted, give a ref to commits that only a nested detached checkout
+        // inside this worktree is holding — otherwise the teardown below makes them unreachable
+        // rather than merely removing a directory. Costs one `worktree list` when there is nothing
+        // nested, which is the overwhelmingly common case.
+        rescue_nested_detached_heads(root, &wt);
         // The expensive half of a teardown is walking the checkout to delete it, and since
         // dependencies started being installed into every fresh worktree that walk has a populated
         // `node_modules` in it. Measured on this path: 11–31s per removal, ALL of it with this lock
@@ -9841,6 +9955,118 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// Cut a nested worktree inside `parent_wt` at `at`, detached, and return its path.
+    fn add_nested_detached(parent_wt: &str, name: &str, at: &str) -> String {
+        let nested = Path::new(parent_wt).join(name);
+        let nested_str = nested.to_string_lossy().to_string();
+        git(parent_wt, &["worktree", "add", "--detach", &nested_str, at]).unwrap();
+        nested_str
+    }
+
+    /// Commit a file in `wt` and return the new sha.
+    fn commit_in(wt: &str, file: &str) -> String {
+        std::fs::write(Path::new(wt).join(file), "nested work").unwrap();
+        git(wt, &["add", "-A"]).unwrap();
+        git(
+            wt,
+            &["-c", "user.email=t@example.invalid", "-c", "user.name=t", "commit", "-m", "nested"],
+        )
+        .unwrap();
+        git(wt, &["rev-parse", "HEAD"]).unwrap().trim().to_string()
+    }
+
+    /// Which refs reach `sha`, if any. Empty string = the commit is unreachable.
+    fn refs_reaching(root: &str, sha: &str) -> String {
+        git(root, &["for-each-ref", "--contains", sha, "--count=1", "--format=%(refname)"])
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    /// A nested worktree cut `--detach` holds its commits by nothing but its own HEAD, so tearing
+    /// the parent down makes them unreachable rather than merely deleting a directory. Teardown
+    /// must leave a ref behind (bead `sparkle-pqwte`).
+    ///
+    /// The precondition assert is what keeps this test honest: it proves no ref reached the commit
+    /// BEFORE the teardown ran, so the post-condition cannot pass vacuously.
+    #[test]
+    fn teardown_rescues_a_nested_detached_head_that_no_ref_reaches() {
+        let root = unique_root("rescue-orphan");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("rescue-orphan-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        let info = create_worktree_at(&root_str, "p", "a", "HEAD", &app_data).unwrap();
+
+        let nested = add_nested_detached(&info.path, ".wt-scratch", "HEAD");
+        let orphan = commit_in(&nested, "scratch.txt");
+        assert!(
+            refs_reaching(&root_str, &orphan).is_empty(),
+            "precondition: nothing may reach the nested commit before teardown"
+        );
+
+        remove_worktree_at(&root_str, "p", "a", &app_data).unwrap();
+
+        let reached = refs_reaching(&root_str, &orphan);
+        assert!(
+            reached.starts_with("refs/rescue/"),
+            "teardown must leave a rescue ref reaching the nested commit, got {reached:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// The narrowing half of the contract: the worktree pool cuts its slots detached at a commit
+    /// that `origin/main` already reaches, and rescuing those would litter `refs/rescue/` with a
+    /// ref per teardown forever. Only an unreachable HEAD is rescued.
+    #[test]
+    fn teardown_does_not_rescue_a_nested_detached_head_a_ref_already_reaches() {
+        let root = unique_root("rescue-reached");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("rescue-reached-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        let info = create_worktree_at(&root_str, "p", "a", "HEAD", &app_data).unwrap();
+
+        // Detached at the branch tip, and left there — a ref reaches it, so it is not at risk.
+        let nested = add_nested_detached(&info.path, ".wt-pool", "HEAD");
+        let head = git(&nested, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        assert!(
+            !refs_reaching(&root_str, &head).is_empty(),
+            "precondition: a ref must already reach the pool-shaped nested HEAD"
+        );
+
+        remove_worktree_at(&root_str, "p", "a", &app_data).unwrap();
+
+        let rescued = git(&root_str, &["for-each-ref", "--format=%(refname)", "refs/rescue/"])
+            .unwrap();
+        assert!(
+            rescued.trim().is_empty(),
+            "a nested HEAD a ref already reaches must not be rescued, got {rescued:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// Ref names are built from a directory name, which is attacker-adjacent only in the sense that
+    /// scratch dirs are named freely — but git rejects a malformed ref outright, which would turn a
+    /// rescue into a silent no-op exactly when it matters.
+    #[test]
+    fn rescue_ref_names_are_valid_git_refs() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        for dir in ["..", ".wt-scratch", "-lead", "", "a b/c", "x.lock", "@{now}"] {
+            let name = rescue_ref_name(dir, sha);
+            assert!(name.starts_with("refs/rescue/"), "{dir:?} -> {name}");
+            let tail = name.trim_start_matches("refs/rescue/");
+            assert!(!tail.is_empty(), "{dir:?} produced an empty ref component");
+            assert!(
+                tail.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+                "{dir:?} -> {name} has a character git may reject"
+            );
+            assert!(!tail.starts_with('-'), "{dir:?} -> {name} starts with a dash");
+        }
     }
 
     /// Closing one agent fans teardown out to every open window, so the same worktree takes several
