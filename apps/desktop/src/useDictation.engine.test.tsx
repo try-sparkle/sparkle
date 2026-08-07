@@ -73,6 +73,16 @@ async function goActive(): Promise<void> {
   await flush();
 }
 
+/** Drop back to passive, so a following `goActive()` is a real EDGE. The passive→active subscriber
+ *  fires on the transition, so two `goActive()` calls in a row open the relay only once — which
+ *  would silently make a "two consecutive refusals" case a one-refusal case. */
+async function goPassive(): Promise<void> {
+  await act(async () => {
+    useDictationStore.setState({ phase: "passive" });
+  });
+  await flush();
+}
+
 /** Focus a real composer textarea. TWO separate things depend on this, and missing either one makes
  *  the relay never open — which presents as the confusing "only `start_dictation` was invoked":
  *    1. `isWindowActive()` defaults to `document.hasFocus()`, and **jsdom reports `false` until
@@ -103,7 +113,16 @@ beforeEach(() => {
     windowFocused: true,
     focusOwner: "other",
   });
-  useDictationEngineStore.setState({ fallbackReason: null, dismissed: false });
+  // `openRefusals` BELONGS IN THIS RESET (roborev 59941). Corroboration state is what decides
+  // whether a refusal speaks, so leaving it out let the counter leak between cases and made this
+  // file order-dependent — the refusal case below passed only because an earlier case had already
+  // put the counter at 1. A green that depends on execution order is not coverage.
+  useDictationEngineStore.setState({
+    fallbackReason: null,
+    dismissed: false,
+    observedAt: null,
+    openRefusals: 0,
+  });
 });
 
 describe("the window-blur guard — a broadcast stand-down must not close the global relay", () => {
@@ -165,11 +184,34 @@ describe("the window-blur guard — a broadcast stand-down must not close the gl
 });
 
 describe("the relay's own answer to start_cloud_stream drives the engine signal", () => {
-  it("a REFUSAL (false) records the fallback — dictation is on-device now", async () => {
+  // THIS FILE IS THE ONLY PLACE THE `startCloudStream` CLOSURE IS ACTUALLY CONSTRUCTED (see the
+  // header), so the corroboration contract has to be pinned HERE or it is pinned nowhere on the
+  // wiring path — the node-env suites drive the store directly and would stay green if the closure
+  // called the wrong action entirely.
+
+  it("ONE refusal stays silent — the open seam cannot tell a refusal from an already-live stream", async () => {
+    // The actual new contract. `cloud_reuse` answers `AlreadyRouting -> Ok(false)` for a socket that
+    // is alive and actively routing, so a lone `false` is not evidence of an outage; treating it as
+    // one is what made the banner flap on every repeated hold.
     invoke.mockImplementation((cmd: string) =>
       cmd === "start_cloud_stream" ? Promise.resolve(false) : Promise.resolve(undefined),
     );
     await mountVoice();
+    await goActive();
+    expect(invoke).toHaveBeenCalledWith("start_cloud_stream", expect.anything());
+    expect(useDictationEngineStore.getState().fallbackReason).toBeNull();
+    // …and it was COUNTED, not ignored — otherwise a real outage could never accumulate a verdict.
+    expect(useDictationEngineStore.getState().openRefusals).toBe(1);
+  });
+
+  it("a SECOND consecutive refusal records the fallback — dictation is on-device now", async () => {
+    invoke.mockImplementation((cmd: string) =>
+      cmd === "start_cloud_stream" ? Promise.resolve(false) : Promise.resolve(undefined),
+    );
+    await mountVoice();
+    await goActive();
+    // A second passive→active edge, i.e. the user dictating again and being refused again.
+    await goPassive();
     await goActive();
     // The invoke really happened — otherwise the assertion below would be reading an untouched
     // store and would pass for a fixture that never opened anything.

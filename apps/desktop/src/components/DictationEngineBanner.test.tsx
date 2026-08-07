@@ -7,12 +7,22 @@
 // (the live preview), and it must not blame the network or the user's Claude allowance, which are
 // other banners' jobs.
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DictationEngineBanner } from "./DictationEngineBanner";
-import { useDictationEngineStore } from "../stores/dictationEngineStore";
+import { FALLBACK_NOTICE_TTL_MS, useDictationEngineStore } from "../stores/dictationEngineStore";
 
-beforeEach(() => useDictationEngineStore.setState({ fallbackReason: null, dismissed: false }));
-afterEach(cleanup);
+beforeEach(() =>
+  useDictationEngineStore.setState({
+    fallbackReason: null,
+    dismissed: false,
+    observedAt: null,
+    openRefusals: 0,
+  }),
+);
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+});
 
 describe("DictationEngineBanner", () => {
   it("renders nothing at rest — no fallback has been reported", () => {
@@ -114,5 +124,122 @@ describe("DictationEngineBanner", () => {
     act(() => useDictationEngineStore.getState().noteCloudLive());
 
     expect(container.innerHTML).toBe("");
+  });
+
+  // ══ THE FOUNDER'S REPORT: "I have no idea why" ═════════════════════════════════════════════════
+  // Two failures, and they compound. (1) BOTH sentences opened with the identical 30-character
+  // clause "Live dictation preview is off —", so the part that DISCRIMINATES — unreachable relay vs
+  // out of credits, which have completely different remedies — arrived after a half-sentence the
+  // reader had already seen before. The bar WRAPS rather than truncating (no `whiteSpace: nowrap`,
+  // no ellipsis), so this is a recognition failure and not a clipping one: nothing is hidden, so
+  // nothing prompts a re-read, and an opening you recognise gets dismissed as "that banner again".
+  // (2) Only the `exhausted` case ever named a remedy, so the common case told the user what broke
+  // and nothing they could do. A banner you cannot act on and cannot tell apart from its sibling is
+  // indistinguishable from noise.
+
+  it("leads with the CAUSE, so the two reasons are told apart at a glance", () => {
+    useDictationEngineStore.setState({
+      fallbackReason: "unavailable",
+      dismissed: false,
+    });
+    render(<DictationEngineBanner />);
+    const unavailable = screen.getByRole("status").textContent ?? "";
+
+    cleanup();
+    useDictationEngineStore.setState({
+      fallbackReason: "exhausted",
+      dismissed: false,
+    });
+    render(<DictationEngineBanner />);
+    const exhausted = screen.getByRole("status").textContent ?? "";
+
+    // A shared prefix is exactly what let the two be conflated: the opening clause is what a reader
+    // takes in at a glance, so the opening clause has to be the part that differs.
+    expect(unavailable.slice(0, 30)).not.toBe(exhausted.slice(0, 30));
+  });
+
+  it("gives the UNAVAILABLE case a remedy too — not just the billable one", () => {
+    useDictationEngineStore.setState({
+      fallbackReason: "unavailable",
+      dismissed: false,
+    });
+    render(<DictationEngineBanner />);
+    const text = screen.getByRole("status").textContent ?? "";
+
+    // The relay recovers by itself and the next dictation re-tries it, so there IS something to
+    // tell the user. Saying nothing is what left the founder with "I have no idea why".
+    expect(text).toMatch(/try (dictating )?again/i);
+  });
+
+  // ══ NO BANNER WHEN THE RELAY IS ACTUALLY WORKING ═══════════════════════════════════════════════
+  // The bar used to come down for exactly one reason: a LATER `start_cloud_stream` returning true.
+  // Nothing else cleared it — so a transient refusal (tonight: repeated ENOTFOUND waves) left a
+  // present-tense outage notice standing over a relay that had been healthy for hours, and the only
+  // way out was a restart.
+
+  it("takes itself down once the outage stops being observed — no restart, no re-dictation", () => {
+    vi.useFakeTimers();
+    act(() =>
+      useDictationEngineStore.getState().noteCloudUnavailable("unavailable"),
+    );
+    const { container } = render(<DictationEngineBanner />);
+    expect(container.innerHTML).not.toBe("");
+
+    // The relay healed on its own and the user never dictated again, so nothing re-reported.
+    act(() => void vi.advanceTimersByTime(FALLBACK_NOTICE_TTL_MS + 1000));
+
+    // THE SIDE EFFECT: the bar is gone from the DOM — not merely that a timestamp went stale.
+    expect(container.innerHTML).toBe("");
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("comes down even when the wall clock lags the timer — the deadline travels with the timer", () => {
+    // roborev 59968, and a correction to my own earlier test. `setTimeout` counts MONOTONIC time
+    // while `isStale` compares WALL time, and `vi.advanceTimersByTime` moves both together — so no
+    // amount of advancing exercises the skew, and the store-level test I wrote first passed against
+    // the pre-fix tree because the store already accepted a `now` override. The defect lives at the
+    // CALL SITE (dropping the argument), so the test has to be here, and the skew has to be forced.
+    //
+    // If the effect calls `retireStaleNotice()` bare, the store re-reads a wall clock that is 1 ms
+    // short of the deadline, retires nothing, and — since `reason`/`observedAt` never change — no
+    // replacement timer is armed and the bar is stuck forever.
+    vi.useFakeTimers();
+    act(() => useDictationEngineStore.getState().noteCloudUnavailable("unavailable"));
+    const observedAt = useDictationEngineStore.getState().observedAt as number;
+    const { container } = render(<DictationEngineBanner />);
+    expect(container.innerHTML).not.toBe("");
+
+    // `vi.setSystemTime` is NOT enough on its own, and that is the subtlety: running the pending
+    // timer advances vitest's faked clock, and the faked `Date` moves with it — erasing the very
+    // divergence under test. (My first draft did exactly that and passed against the broken code.)
+    // Spying on `Date.now` pins WALL time independently of the TIMER clock, which is precisely the
+    // real-world condition: an NTP step or a sleep/wake correction between arming and firing.
+    const wallClock = vi
+      .spyOn(Date, "now")
+      .mockReturnValue(observedAt + FALLBACK_NOTICE_TTL_MS); // 1 ms short of the deadline
+    try {
+      // The timer fires anyway — it counted its own elapsed delay, not the wall clock.
+      act(() => void vi.runOnlyPendingTimers());
+      expect(container.innerHTML).toBe("");
+    } finally {
+      wallClock.mockRestore();
+    }
+  });
+
+  it("stays up while the outage is still live — expiry must not swallow a real one", () => {
+    vi.useFakeTimers();
+    act(() =>
+      useDictationEngineStore.getState().noteCloudUnavailable("unavailable"),
+    );
+    const { container } = render(<DictationEngineBanner />);
+
+    // Nearly stale, then the user dictates again and the relay refuses again.
+    act(() => void vi.advanceTimersByTime(FALLBACK_NOTICE_TTL_MS - 1000));
+    act(() =>
+      useDictationEngineStore.getState().noteCloudUnavailable("unavailable"),
+    );
+    act(() => void vi.advanceTimersByTime(2000));
+
+    expect(container.innerHTML).not.toBe("");
   });
 });

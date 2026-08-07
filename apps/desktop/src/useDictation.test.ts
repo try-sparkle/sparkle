@@ -626,6 +626,241 @@ describe("multi-window routing (isWindowActive gate)", () => {
     expect(useDictationStore.getState().interim).toBe("live words");
     ctrl.cleanup();
   });
+
+  // ══ THE FALLBACK NOTICE IS PER-WINDOW TOO — AND ONLY ONE WINDOW CAN EVER CLEAR IT ══════════════
+  // `dictation://cloud-ended` is an app-wide broadcast and every project window mounts its own
+  // DictationEngineBanner (Workspace.tsx). This handler reported the fallback UNGATED, so one relay
+  // death lit the bar in EVERY open window — while `noteCloudLive` only ever fires in the window
+  // that reopens the stream. The others had no path back at all: the founder would have to dictate
+  // into each window separately to clear a notice none of them had earned. Same defect the level
+  // meter already had (sparkle-ozvr), on the same broadcast, one listener away.
+
+  it("a background window does not claim the fallback from another window's relay death", async () => {
+    useDictationEngineStore.setState({
+      fallbackReason: null,
+      dismissed: false,
+      observedAt: null,
+      openRefusals: 0,
+    });
+    const ctrl = await createDictationController({
+      onSegment: vi.fn(),
+      isWindowActive: () => false,
+    });
+    try {
+      emit("dictation://cloud-ended", false);
+      // Not this window's dictation, so not this window's banner.
+      expect(useDictationEngineStore.getState().fallbackReason).toBeNull();
+    } finally {
+      // UNCONDITIONAL: cleanup() unsubscribes this controller's `useDictationStore` subscriber, and
+      // the file-level beforeEach only clears the EVENT bus — it cannot reach a zustand
+      // subscription. A cleanup skipped by a failing assertion therefore leaks a live controller
+      // into every later test in the file, where it answers a `setPhase` by invoking
+      // `stop_cloud_stream` and reds two unrelated terminal-routing rows. Cost me one debugging
+      // round; try/finally is what makes the red phase of TDD safe here.
+      ctrl.cleanup();
+    }
+  });
+
+  it("the window that was actually dictating DOES report the fallback", async () => {
+    useDictationEngineStore.setState({
+      fallbackReason: null,
+      dismissed: false,
+      observedAt: null,
+      openRefusals: 0,
+    });
+    const ctrl = await createDictationController({
+      onSegment: vi.fn(),
+      isWindowActive: () => true,
+    });
+    try {
+      emit("dictation://cloud-ended", false);
+      expect(useDictationEngineStore.getState().fallbackReason).toBe(
+        "unavailable",
+      );
+    } finally {
+      ctrl.cleanup();
+    }
+  });
+
+  // ══ THE BANNER MUST NOT STAND OVER A WORKING LIVE PREVIEW ══════════════════════════════════════
+  // `start_cloud_stream` returns a bare bool meaning "I opened a socket", and `cloud_reuse` answers
+  // `AlreadyRouting` → `Ok(false)` for a socket that is ALIVE, matches the project and is actively
+  // routing. The frontend reads that `false` as a refusal, so a repeated passive→active edge or a
+  // focus-regain onto a warm socket raises "Sparkle can't reach the cloud transcription service"
+  // while relay text is arriving. An interim can only come from the relay — the on-device engine has
+  // none — so it is the evidence that settles it.
+
+  it("out-of-credits still reaches a window that is NOT capturable — it is not window-scoped", async () => {
+    // roborev 59964. The per-window gate fixes over-reporting but opens the opposite gap: a
+    // teardown landing after focus moved is reported by NO window. For an ordinary outage that is
+    // fine (the next attempt re-reports it). For `exhausted` it is not — the balance refresh beside
+    // it is ungated, so the credits pill would drop to zero with nothing anywhere saying why, and
+    // refilling is the one remedy the user can act on.
+    useDictationEngineStore.setState({
+      fallbackReason: null,
+      dismissed: false,
+      observedAt: null,
+      openRefusals: 0,
+    });
+    const ctrl = await createDictationController({
+      onSegment: vi.fn(),
+      isWindowActive: () => false,
+    });
+    try {
+      emit("dictation://cloud-ended", true);
+      expect(useDictationEngineStore.getState().fallbackReason).toBe("exhausted");
+    } finally {
+      ctrl.cleanup();
+    }
+  });
+
+  it("a healthy session never accumulates corroboration — an interim clears a partial count", async () => {
+    // roborev 59964/59966, and the finding that broke my original premise. `cloud_reuse` answers
+    // `AlreadyRouting -> Ok(false)` on EVERY passive→active edge onto a warm socket, so consecutive
+    // no-ops are the NORMAL case; the counter climbed through a healthy session because nothing
+    // reset it while no notice was painted, and two holds onto one live socket then raised the
+    // banner over visibly streaming relay text.
+    useDictationEngineStore.setState({
+      fallbackReason: null,
+      dismissed: false,
+      observedAt: null,
+      openRefusals: 0,
+    });
+    const ctrl = await createDictationController({
+      onSegment: vi.fn(),
+      isWindowActive: () => true,
+    });
+    try {
+      // A no-op refusal, then the stream it was a no-op FOR proves itself, then another no-op.
+      useDictationEngineStore.getState().noteCloudOpenRefused();
+      emit("dictation://interim", "the relay is plainly alive");
+      expect(useDictationEngineStore.getState().openRefusals).toBe(0);
+
+      useDictationEngineStore.getState().noteCloudOpenRefused();
+
+      // Two refusals total, an interim between them: no verdict, no banner.
+      expect(useDictationEngineStore.getState().fallbackReason).toBeNull();
+    } finally {
+      ctrl.cleanup();
+    }
+  });
+
+  it("TERMINAL dictation discharges corroboration too — evidence is not about the destination", async () => {
+    // roborev 59975. The counter is FED under `isCapturable()` but was CLEARED under
+    // `isRoutable()`, and those disagree on exactly one supported mode: caret in a terminal with
+    // routing armed makes `isTerminalRoutable()` true, so `isCapturable()` is true while
+    // `isRoutable()` is false. Terminal dictation therefore banked refusals it could never
+    // discharge and would raise the banner over a live relay — the same flap, surviving in the one
+    // mode the earlier fix did not reach.
+    useDictationStore.setState({
+      enabled: true,
+      status: "listening",
+      phase: "active",
+      focusOwner: "terminal",
+    });
+    useDictationEngineStore.setState({
+      fallbackReason: null,
+      dismissed: false,
+      observedAt: null,
+      openRefusals: 1,
+    });
+    const ctrl = await createDictationController({
+      onSegment: vi.fn(),
+      isWindowActive: () => true,
+      focusOwner: () => "terminal",
+    });
+    try {
+      emit("dictation://interim", "spoken straight into the terminal");
+
+      expect(useDictationEngineStore.getState().openRefusals).toBe(0);
+    } finally {
+      ctrl.cleanup();
+      useDictationStore.setState({ phase: "passive", focusOwner: "other" });
+    }
+  });
+
+  it("a relay interim retires a standing fallback notice — the preview is demonstrably working", async () => {
+    useDictationEngineStore.setState({
+      fallbackReason: "unavailable",
+      dismissed: false,
+      observedAt: Date.now(),
+    });
+    const ctrl = await createDictationController({
+      onSegment: vi.fn(),
+      isWindowActive: () => true,
+    });
+    try {
+      emit("dictation://interim", "these words came from the relay");
+
+      expect(useDictationEngineStore.getState().fallbackReason).toBeNull();
+    } finally {
+      ctrl.cleanup();
+    }
+  });
+
+  it("a background window's interim does not retire the notice (it never painted one either)", async () => {
+    useDictationEngineStore.setState({
+      fallbackReason: "unavailable",
+      dismissed: false,
+      observedAt: Date.now(),
+    });
+    const ctrl = await createDictationController({
+      onSegment: vi.fn(),
+      isWindowActive: () => false,
+    });
+    try {
+      emit("dictation://interim", "another window's words");
+
+      // Same ONE GATE as everywhere else: a window dictation is not routing into makes no claim
+      // about the engine in either direction.
+      expect(useDictationEngineStore.getState().fallbackReason).toBe(
+        "unavailable",
+      );
+    } finally {
+      ctrl.cleanup();
+    }
+  });
+
+  it("one relay death, two windows: exactly ONE of them reports it", async () => {
+    useDictationEngineStore.setState({
+      fallbackReason: null,
+      dismissed: false,
+      observedAt: null,
+      openRefusals: 0,
+    });
+    // Count the REPORTS, not the resulting state. Both controllers share one module-level store in
+    // this harness, so "fallbackReason === 'exhausted'" is satisfied by one window or by both — it
+    // cannot tell the fix from the bug. The call count can.
+    //
+    // mockImplementation(() => {}), NOT a call-through: the real action runs zustand's `set`, which
+    // swaps the state OBJECT the spy was installed on. The second controller's `getState()` would
+    // then return a fresh object without the spy, so a call-through would record 1 call even with
+    // the gate absent — a vacuous green.
+    const report = vi
+      .spyOn(useDictationEngineStore.getState(), "noteCloudUnavailable")
+      .mockImplementation(() => {});
+    const active = await createDictationController({
+      onSegment: vi.fn(),
+      isWindowActive: () => true,
+    });
+    const background = await createDictationController({
+      onSegment: vi.fn(),
+      isWindowActive: () => false,
+    });
+    try {
+      // ONE backend emission, fanned out to both windows' listeners (real Tauri behavior).
+      // `false` (an ordinary outage) on purpose: `exhausted` is deliberately NOT window-scoped —
+      // see the exhausted case below — so it would legitimately report twice here.
+      emit("dictation://cloud-ended", false);
+
+      expect(report).toHaveBeenCalledTimes(1);
+      expect(report).toHaveBeenCalledWith("unavailable");
+    } finally {
+      report.mockRestore();
+      active.cleanup();
+      background.cleanup();
+    }
+  });
 });
 
 describe("dictation://focus (window-focus capture gate)", () => {

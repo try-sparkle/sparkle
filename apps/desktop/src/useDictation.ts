@@ -523,10 +523,50 @@ export async function createDictationController(
       // ghost. Anywhere else clears any stale preview it might still be showing and ignores the
       // rest — a ghost left up in a terminal-paused composer would advertise a live transcription
       // that is not happening.
+      // ══ EVIDENCE FIRST, ROUTING SECOND — THEY ARE DIFFERENT QUESTIONS ══════════════════════════
+      // This block sits ABOVE the routing gate deliberately (roborev 59975). Whether an interim may
+      // be PAINTED depends on `isRoutable()`; what it PROVES about the relay does not depend on
+      // which destination is consuming the words. Below the gate, the two predicates disagreed on
+      // exactly one supported mode: with the caret in a terminal and routing armed,
+      // `isTerminalRoutable()` is true, so `isCapturable()` is true (the counter is FED) while
+      // `isRoutable()` is false (the counter was never CLEARED). Terminal dictation therefore
+      // accumulated refusals with no way to discharge them and would raise the banner over a
+      // perfectly live relay — the same flap, surviving in the one mode the fix had not covered.
+      // `isCapturable()` matches the predicate that feeds the counter, which is what keeps the two
+      // sides of this ledger in step.
+      if (isCapturable()) {
+        const eng = useDictationEngineStore.getState();
+        if (eng.fallbackReason !== null || eng.openRefusals > 0) eng.noteCloudLive();
+      }
+      // Same ONE GATE as the partial path for the PAINT: only a window dictation may route into
+      // shows the live ghost; anywhere else clears any stale preview and ignores the rest.
       if (!isRoutable()) {
         useDictationStore.getState().setInterim("");
         return;
       }
+      // ══ AN INTERIM IS PROOF THE CLOUD ENGINE IS LIVE — SO IT RETIRES ANY STANDING NOTICE ═══════
+      // The on-device engine is an OFFLINE transducer with no interim results at all, so this event
+      // can only have come from the relay. That is stronger evidence of cloud health than the
+      // boolean the notice is raised on, and a banner claiming "Sparkle can't reach the cloud
+      // transcription service" while relay text is arriving is simply false. Reachable because
+      // `cloud_reuse` answers `AlreadyRouting -> Ok(false)` for a socket that is alive and actively
+      // routing (see the open seam below, and bead sparkle-omznw).
+      //
+      // IT ALSO CLEARS PARTIAL CORROBORATION, NOT ONLY A PAINTED NOTICE (roborev 59964/59966).
+      // Gating on `fallbackReason !== null` alone left the counter climbing through a HEALTHY
+      // session, because nothing else brings it down: the open path zeroes it only when
+      // `start_cloud_stream` returns TRUE, and a warm socket answers `AlreadyRouting -> Ok(false)`
+      // on EVERY passive→active edge. So consecutive no-ops are the normal case, not the exception
+      // — which makes the design note I first wrote here ("the no-op is followed by a working
+      // stream rather than another refusal") simply false at this seam. Two holds onto one live
+      // socket would reach the threshold and paint "Sparkle can't reach the cloud transcription
+      // service" while relay text was visibly streaming in, with the next interim clearing it: the
+      // reported flap made rarer rather than removed. Evidence of a live cloud has to reset the
+      // count whether or not a notice is up.
+      //
+      // Still gated, because this fires ~25x/sec while speaking and an unconditional write would
+      // churn the store and every subscriber for a no-op. Both terms are false in the steady state.
+      // (The write itself lives above the routing gate — see the block at the top of this handler.)
       useDictationStore.getState().setInterim(e.payload);
     }),
 
@@ -575,7 +615,35 @@ export async function createDictationController(
       // letting the user read a silent engine swap as a broken feature (see dictationEngineStore).
       // `e.payload` is the relay's `exhausted` flag: out-of-credits is the one cause the user can act
       // on, so it is reported distinctly from an ordinary outage.
-      useDictationEngineStore.getState().noteCloudUnavailable(e.payload ? "exhausted" : "unavailable");
+      //
+      // ══ THE SAME ONE GATE AS THE TEXT AND THE METER, AND FOR THE SAME REASON ═══════════════════
+      // This is an app-wide broadcast, and EVERY project window mounts its own
+      // DictationEngineBanner (Workspace.tsx). Ungated, one relay death lit the bar in every open
+      // window — but `noteCloudLive` fires only in the window that reopens the stream, so the others
+      // had no path back at all: a notice they never earned, clearable only by dictating into each
+      // of them in turn. Same defect the level meter already had (sparkle-ozvr), on the same
+      // broadcast, one listener away.
+      //
+      // `isCapturable()`, not `isRoutable()`: the question is whether THIS window's capture was
+      // being consumed by the stream that just died, and a phrase on its way into a terminal counts
+      // exactly as much as one bound for the composer. It is the predicate the relay's own lifetime
+      // keys on. The teardown above and the balance refresh below stay UNGATED on purpose: those
+      // are app-wide, and only the user-facing claim is per-window.
+      // …EXCEPT FOR OUT-OF-CREDITS, WHICH IS NOT WINDOW-SCOPED (roborev 59964). The gate above fixes
+      // over-reporting but introduces the opposite gap: `isCapturable()` needs this window focused
+      // AND a live routing destination, so a teardown landing after focus moved — blurred
+      // mid-stream, caret in a non-routable terminal — is reported by NO window at all. Losing an
+      // ordinary outage that way is acceptable (the next attempt re-reports it, and the notice is
+      // about a stream that is no longer running). Losing `exhausted` is not: the balance refresh
+      // below is deliberately ungated because the balance is app-wide, so the credits pill would
+      // drop to zero with nothing anywhere explaining why — and refilling is the one remedy the
+      // user can act on. An empty balance is equally true in every window, so it speaks in all of
+      // them, exactly like the refresh it accompanies.
+      if (isCapturable() || e.payload) {
+        useDictationEngineStore
+          .getState()
+          .noteCloudUnavailable(e.payload ? "exhausted" : "unavailable");
+      }
       // Out-of-credits teardown → refresh the balance so the credits pill reflects the now-depleted
       // balance (the last relay `balance` frame was pre-decline). A clean close (payload false) skips
       // the round-trip.
@@ -1041,7 +1109,9 @@ export function useAmbientVoice(): void {
       // THE RELAY'S OWN ANSWER, RECORDED. `true` = the socket opened, so the cloud engine is live and
       // any standing fallback notice retires; `false` = the relay REFUSED (signed out, not entitled,
       // can't afford the first minute) and dictation silently continues on-device without interim
-      // results. That refusal is definitive, not a blip to be de-flapped — see dictationEngineStore.
+      // results. That refusal is NOT definitive and must be corroborated before it is reported —
+      // `cloud_reuse` returns the same `false` for an already-routing socket. See
+      // dictationEngineStore's OPEN_REFUSALS_BEFORE_WARNING, and the call below.
       //
       // THE ONE PLACE THIS INVOKE LIVES, which is why wiring it here covers every opener: both the
       // passive→active phase edge and the focus-regain resume reach the relay through
@@ -1054,8 +1124,26 @@ export function useAmbientVoice(): void {
           project: selectedProjectName(),
         });
         const engine = useDictationEngineStore.getState();
+        // `noteCloudOpenRefused`, NOT `noteCloudUnavailable`: this seam cannot tell a refusal from
+        // a success. `cloud_reuse` answers `AlreadyRouting -> Ok(false)` for a socket that is alive,
+        // matches the project and is actively routing, so one `false` means both "the relay said
+        // no" and "one is already running, nothing to do". Reporting that as an outage is what made
+        // the banner flap on every repeated hold and focus-regain, with the relay verified healthy
+        // throughout. The store corroborates before speaking; the unambiguous mid-stream
+        // `cloud-ended` path still reports immediately. Root cause tracked as sparkle-omznw.
         if (opened) engine.noteCloudLive();
-        else engine.noteCloudUnavailable("unavailable");
+        else engine.noteCloudOpenRefused();
+        // THE CAUSE, AT THE SOURCE — deliberately in the log and NOT in the banner. The store holds
+        // only a coarse reason on purpose (copy rules: no raw errors, no status codes), which is
+        // right for the user and useless for diagnosis. This is the transition record that answers
+        // "is it flapping, and how often": one line per open attempt with the running count of
+        // consecutive refusals and whether this one crossed into a warning. No transcript, no PII.
+        console.info("[dictation] cloud open attempt", {
+          opened,
+          consecutiveRefusals: useDictationEngineStore.getState().openRefusals,
+          warning: useDictationEngineStore.getState().fallbackReason,
+          at: new Date().toISOString(),
+        });
         return opened;
       },
       stopCloudStream: () => void invoke("stop_cloud_stream").catch(() => {}),
