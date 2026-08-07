@@ -259,11 +259,9 @@ describe("a remount's stale teardown does not strip the LIVE terminal's scanner"
   });
 
   it("STILL clears the flag when the ONLY terminal tears down", async () => {
-    // The anti-over-fix, and it is load-bearing: `clearDraft` is unconditional on purpose for a
-    // promotion rebind, where the local CLI's readline buffer dies with the PTY — keeping the flag
-    // there would hide the action pill for the life of the tab (roborev 57372). Ownership is the
-    // distinction that serves both: the instance that registered the scanner still clears, a stale
-    // one does not.
+    // The anti-over-fix, and it is load-bearing: leaving the flag alone on teardown would hide the
+    // action pill for the life of the tab (roborev 57372). No ownership test is involved — this
+    // teardown removed the only scanner, so the re-derivation finds none and lands on `false`.
     const view = await mountTerminal();
     act(() => dataHandler.fn!("half a command"));
     expect(useTerminalOverlayStore.getState().drafts[AGENT]).toBe(true);

@@ -225,7 +225,7 @@ export function registerLineScan(agentId: string): LineScanState {
 }
 
 /** Stop tracking (the terminal was torn down). Does NOT touch the draft flag: the teardown path owns
- *  that decision, and clears it explicitly.
+ *  that decision, and RE-DERIVES it explicitly — see {@link republishDraft}.
  *
  *  IDENTITY-CHECKED, and that is not a nicety. Agent ids are stable while `Terminal` instances are
  *  not — `AgentPane` remounts the terminal on an account switch (`key={chosenAccount?.id}`) with the
@@ -259,8 +259,22 @@ export function unregisterLineScan(agentId: string, state?: LineScanState): void
  *     stays `true` over a prompt that is empty — the "true forever, pill hidden forever" shape
  *     roborev 57372 named, since nothing republishes until the user types again (roborev 60124).
  *
- *  Re-deriving is correct in both: live instance mid-line → stays `true`; live instance empty, or no
- *  terminal left at all → `false`. The old readline buffer died with its PTY either way. */
+ *  Re-deriving is right in both: live instance mid-line → stays `true`; live instance empty, or no
+ *  terminal left at all → `false`.
+ *
+ *  ══ THE `false` IS A CHOICE, NOT A DEDUCTION — SAY SO ══════════════════════════════════════════
+ *  An earlier version of this paragraph justified it with "the old readline buffer died with its PTY
+ *  either way". That holds for a LOCAL transport, where `detach()` IS the kill
+ *  (`services/agentTransport`), and NOT for a cloud one, whose `detach()` is unwatch-only: the server
+ *  session outlives the pane, so a remounted cloud terminal can reattach to a prompt that really does
+ *  hold the user's half-typed line while the replacement's scanner is empty. Nothing in the DOM or in
+ *  this module can see that line — the flag is genuinely unknowable there (roborev 60135).
+ *
+ *  `false` is chosen because the two errors are not symmetric. A stranded `true` is UNRECOVERABLE
+ *  without user action: nothing republishes until the next keystroke, so the action pill stays hidden
+ *  and the compose-focus veto stays on indefinitely (that is roborev 57372's shape). A stranded
+ *  `false` self-corrects on the very first keystroke into the reattached prompt. Pick the error that
+ *  fixes itself. */
 export function republishDraft(agentId: string): void {
   const state = scans.get(agentId);
   useTerminalOverlayStore.getState().setDraft(agentId, state ? hasPendingInput(state) : false);

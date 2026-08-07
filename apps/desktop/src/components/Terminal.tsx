@@ -1500,12 +1500,10 @@ export function Terminal({
       // BY IDENTITY, AND THE FLAG FOLLOWS THE SCANNER. An account switch remounts this terminal with
       // the SAME agentId, and React mounts the replacement before running this cleanup — so a
       // delete-by-key here would strip the new instance's scanner and silently stop metering its
-      // keystrokes (roborev 59775). `clearDraft` had exactly the same hazard and is the WORSE half:
-      // nothing republishes the flag until the user's next keystroke, so wiping the live instance's
-      // `drafts[agentId]` un-hides the recommended-action pill and lifts the compose-focus veto over
-      // a prompt they are mid-typing (roborev 60111). So the clear happens only when this instance
-      // still OWNED the registration — when it does not, a live terminal is answering for this agent
-      // and the flag is its business, not ours.
+      // keystrokes (roborev 59775). The `drafts` flag had exactly the same hazard and is the WORSE
+      // half: nothing republishes it until the user's next keystroke, so wiping the live instance's
+      // entry un-hides the recommended-action pill and lifts the compose-focus veto over a prompt
+      // they are mid-typing (roborev 60111).
       unregisterLineScan(agentId, lineScan);
       // …then RE-DERIVE the flag from whatever scanner is live now, rather than clearing it (which
       // wipes a live instance's pending line) or skipping the clear (which strands a `true` over the
