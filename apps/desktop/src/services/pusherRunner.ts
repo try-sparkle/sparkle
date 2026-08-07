@@ -41,6 +41,8 @@
 // period of one full interval before anything can be said.
 
 import {
+  claimsForConditions,
+  claimsForTriggers,
   decidePusherAction,
   decideFleetReport,
   emptyFleetMemory,
@@ -52,7 +54,11 @@ import {
   fleetObservationMemory,
   isQuotaWalled,
   observeFleet,
+  pruneRefutedFleetEvidence,
+  pruneRefutedObservation,
+  type ClaimVerdicts,
   type ConflictingPr,
+  type PusherClaim,
   type FleetMemory,
   type FleetSnapshot,
   type StandingDuty,
@@ -120,8 +126,55 @@ export interface PusherRunnerDeps {
    * evidence, and an empty list would say "we checked, every PR is fine".
    */
   conflicts(): readonly ConflictingPr[] | undefined;
+  /**
+   * RE-READ these facts NOW, at the moment we are about to speak about them.
+   *
+   * ── WHY THIS IS THE ONE PLACE THE SWEEP AWAITS TWICE ────────────────────────────────────────────
+   * Every other input above is a store read, deliberately synchronous, because the sweep runs on a
+   * one-minute tick and must not queue behind IPC. This one is different in kind: `conflicts()` reads
+   * a store a poller refreshes every TEN minutes, `hasUnlandedWork` comes from a branch poll keyed on
+   * the DISPLAYED project, and an escalation is latched and never clears itself — while the report's
+   * own cooldown is FOUR HOURS. So the gap between measuring and speaking is measured in hours, and
+   * the sentences are written in the present tense. Two merged PRs, an escalated goal that was
+   * already met, and two "safe to retire" claims about agents mid-merge all shipped through that gap
+   * on one afternoon.
+   *
+   * ── IT IS CALLED ONLY ON THE SEND PATH ─────────────────────────────────────────────────────────
+   * A sweep that has nothing to say verifies nothing, so the overwhelmingly common case costs no
+   * additional I/O at all. What it costs is one round-trip on the sweeps that were about to
+   * interrupt the founder — which is exactly the moment being right is worth a round-trip.
+   *
+   * ── AN UNANSWERED CLAIM IS NOT A REFUTATION ────────────────────────────────────────────────────
+   * Return whatever could be read. A claim omitted from the map, and a throw from this function, both
+   * read as `unreadable` and change NOTHING — see `pusherVerify`'s header. Failing the other way
+   * would let one `gh` outage silence a genuine fleet-wide block, and silence is the failure this
+   * whole feature exists to eliminate.
+   */
+  verifyClaims(claims: readonly PusherClaim[]): Promise<ClaimVerdicts>;
   /** Structured record of every decision, sent or refused. */
   record(entry: PusherLogEntry): void;
+}
+
+/**
+ * Ask the verifier, and turn every way of failing into "we learned nothing".
+ *
+ * A THROW MUST NOT BE A REFUTATION and must not be a crash. `sweepPushers` already catches at the
+ * tick, but a throw here would abandon the rest of the roster mid-sweep — so an offline machine
+ * would stop reporting quota walls, not merely stop verifying them.
+ */
+async function readVerdicts(
+  deps: PusherRunnerDeps,
+  claims: readonly PusherClaim[],
+): Promise<ClaimVerdicts> {
+  if (claims.length === 0) return new Map();
+  try {
+    return await deps.verifyClaims(claims);
+  } catch (e) {
+    log.warn("pusher", "claim verification failed; every claim reads as unreadable", {
+      error: String(e),
+    });
+    return new Map();
+  }
 }
 
 /** One line of the hit-rate log. `sent` is the only outcome that spends budget. */
@@ -370,7 +423,28 @@ export async function sweepPushers(
     /** Strip the merged view back to this partner's own ledger before storing. */
     const ownPartner = (m: PartnerMemory): PartnerMemory => ({ ...m, budget: memory.budget });
 
-    const decision = decidePusherAction({ policy, observation, memory: forDecision, inbox, now });
+    let decision = decidePusherAction({ policy, observation, memory: forDecision, inbox, now });
+
+    // VERIFY BEFORE SPEAK. Only once something is actually about to be said, and then over EVERY
+    // trigger currently firing rather than only the top one — because pruning can promote the
+    // second, and a promoted trigger nobody verified would walk straight through this gate.
+    //
+    // The re-decision is the whole point: what comes back out is composed by `decidePusherAction`
+    // from corrected evidence, so a surviving challenge is byte-identical to the one it would have
+    // had and the citation gate is satisfied by construction. Filtering the finished text instead
+    // would leave `measured` describing a challenge that is no longer being made.
+    if (decision.action === "send") {
+      const verdicts = await readVerdicts(
+        deps,
+        claimsForTriggers(evaluateTriggers(observation), s.agentId),
+      );
+      const verified = pruneRefutedObservation(observation, s.agentId, verdicts);
+      // Identity, not deep-equality: `pruneRefutedObservation` returns the same object when nothing
+      // was contradicted, so the ordinary path does no second decide at all.
+      if (verified !== observation) {
+        decision = decidePusherAction({ policy, observation: verified, memory: forDecision, inbox, now });
+      }
+    }
 
     if (decision.action === "quiet") {
       partners.set(s.agentId, ownPartner(decision.memory));
@@ -541,15 +615,59 @@ async function reportFleet(
     ],
   };
 
-  const decision = decideFleetReport({
+  const decisionInput = {
     policy: deps.policy(),
-    snapshots: owned,
+    snapshots: owned as readonly FleetSnapshot[],
     duties,
     conflicts,
     memory: { ...memory, budget: shared },
     inbox,
     now,
-  });
+  };
+  let decision = decideFleetReport(decisionInput);
+
+  // VERIFY BEFORE SPEAK — the report channel's half. See `PusherRunnerDeps.verifyClaims`.
+  //
+  // The two calls to `decideFleetReport` are not a wasteful double-run: the first is what decides
+  // whether anything would be said AT ALL, and it is what keeps the I/O off every quiet sweep. It is
+  // pure, allocates a few strings, and is dwarfed by the round-trip it guards.
+  //
+  // WHAT THE SECOND CALL FIXES THAT A FILTER COULD NOT. A condition is a finished paragraph over a
+  // cohort — "3 open PRs cannot merge…" and three lines under it. Removing one merged PR changes the
+  // headline count, the plural, the remedy sentence and the `measured` whitelist together, and a
+  // text that cites a number `measured` no longer holds is refused wholesale by `gateChallenge` as
+  // `fabricated-citation` — which presents as SILENCE. So the correction is applied to the EVIDENCE
+  // and `pusherFleet` recomposes; there is still exactly one composer.
+  //
+  // A condition may also VANISH here, and that is the intended outcome rather than an edge case: a
+  // class whose every member turned out to be merged genuinely does not hold, and the memory stored
+  // below then records that verified absence — so the condition is heard again immediately if it
+  // returns, instead of sitting behind a stamp it never earned.
+  if (decision.action === "send") {
+    const claims: readonly PusherClaim[] = claimsForConditions(decision.conditions, owned, conflicts);
+    if (claims.length > 0) {
+      const verdicts = await readVerdicts(deps, claims);
+      const verified = pruneRefutedFleetEvidence({ snapshots: owned, conflicts }, verdicts);
+      decision = decideFleetReport({
+        ...decisionInput,
+        snapshots: verified.snapshots,
+        conflicts: verified.conflicts,
+      });
+      if (decision.action === "quiet") {
+        // NAMED SEPARATELY IN THE LOG. `no-condition` from this path would read as "the fleet is
+        // healthy" when what actually happened is "everything we were about to say turned out to be
+        // false" — and the hit-rate log is the only place the difference is recoverable.
+        deps.record({
+          at: now,
+          agentId: recipient,
+          outcome: "refused",
+          reason: "verified-false",
+          scope: "fleet",
+        });
+        return { ...decision.memory, budget: memory.budget };
+      }
+    }
+  }
 
   // The merged view is for the DECISION only; what is stored is this channel's own budget, or the
   // partner's sends would be double-counted against it forever.

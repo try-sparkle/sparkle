@@ -63,6 +63,9 @@ import { buildFleetSnapshots, buildStandingDuties } from "./pusherSnapshots";
 import { cachedReceipt, loadRetroReceipts } from "./retroReceipts";
 import { retroSettled } from "../engine/retroReceiptTypes";
 import { startPusherRunner, type PusherLogEntry, type PusherRunnerDeps } from "./pusherRunner";
+import { makePusherVerifier, type PusherVerifierDeps, type VerifyScope } from "./pusherVerifier";
+import { agentBranchStatus, agentWorkflowState } from "./branchStatus";
+import { fetchOpenPrs } from "./openPrs";
 
 /**
  * The recipient id that means "the concierge", reusing the identity the control bridge already
@@ -271,7 +274,57 @@ export function buildPusherDeps(): PusherRunnerDeps {
     // they are the ones no partner can act on.
     reportRecipient: () => CONCIERGE_RECIPIENT_ID,
     duties,
+    // VERIFY BEFORE SPEAK, bound to the real git and the real GitHub API. Called only when this
+    // sweep is about to say something, so the quiet path stays IPC-free.
+    verifyClaims: makePusherVerifier(verifierDeps()),
     record: recordDecision,
+  };
+}
+
+/**
+ * The verifier's sources, bound to the same live stores the snapshot reads.
+ *
+ * ── WHY THE READS HERE ARE FRESH IPC AND THE SNAPSHOT'S ARE A STORE ─────────────────────────────
+ * That difference IS the feature. `snapshots()` reads `runtimeStore.branchStatus`, which is filled
+ * by a poll keyed on the DISPLAYED project — so for most agents it is minutes to hours old, or
+ * absent. `verifyClaims` asks Rust directly, right now, about the handful of agents and PRs a report
+ * is about to name. Routing this through the same store would make verification a re-read of the
+ * value that was already wrong.
+ *
+ * ── EVERY PROJECT IS A PR SCOPE ─────────────────────────────────────────────────────────────────
+ * Not just the one being reported on: a `ConflictingPr` carries no repository (Rust keys its flag
+ * map by PR number alone), so the only safe question is "is this number open in ANY repo we have".
+ * See `verifyPrOpen` for why that ambiguity can only ever cost a refutation rather than invent one.
+ */
+function verifierDeps(): PusherVerifierDeps {
+  /** The project an agent lives in, and the checkout to ask about it from. */
+  const locate = (agentId: string): VerifyScope | undefined => {
+    for (const p of useProjectStore.getState().projects) {
+      if (p.agents.some((a) => a.id === agentId)) return { projectId: p.id, rootPath: p.rootPath || null };
+    }
+    return undefined;
+  };
+
+  return {
+    scopes: () =>
+      useProjectStore.getState().projects.map((p) => ({ projectId: p.id, rootPath: p.rootPath || null })),
+    scopeForAgent: locate,
+    goalFor: (agentId) => {
+      for (const p of useProjectStore.getState().projects) {
+        const agent = p.agents.find((a) => a.id === agentId);
+        if (agent !== undefined) return agent.goal;
+      }
+      return undefined;
+    },
+    openPrs: fetchOpenPrs,
+    // BASE BRANCH EMPTY: Rust resolves the project's default branch itself, which is what every
+    // other caller of this command does. Naming one here would be this file inventing a base.
+    branchStatus: (root, projectId, agentId) => agentBranchStatus(root, projectId, agentId, ""),
+    // PR PROBE ON — `prState: "open"` is what catches an agent WAITING TO MERGE its own PR, which a
+    // branch read cannot see (everything is pushed, so `ahead` is 0 and the tree is clean). That is
+    // the exact shape of the two "safe to retire" claims made about mid-merge agents.
+    workflowState: (root, projectId, agentId) =>
+      agentWorkflowState(root, agentId, "", true, projectId),
   };
 }
 

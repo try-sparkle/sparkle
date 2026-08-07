@@ -11,5 +11,6 @@ export * from "./pusherObserve";
 export * from "./pusherDecide";
 export * from "./pusherFleet";
 export * from "./pusherFleetReport";
+export * from "./pusherVerify";
 export * from "./pusherBlocker";
 export * from "./babysitDispatch";

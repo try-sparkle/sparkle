@@ -207,6 +207,17 @@ export interface FleetReportSend {
   action: "send";
   /** The condition ids this report covers, most-blocking first. */
   conditionIds: string[];
+  /**
+   * The conditions themselves, in the same order — what verify-before-speak reads to work out which
+   * facts this report would rest on.
+   *
+   * CARRIED RATHER THAN RE-DERIVED, and rather than left to be parsed back out of `conditionIds` or
+   * the text. A caller handed only the ids cannot know WHICH agents `goals-escalated` covers, and one
+   * that parses `pr:1358` out of `members` (or a PR number out of the prose) is keyed on DISPLAY —
+   * so a reworded sentence silently stops it asking about anything, which refutes nothing and
+   * restores the unverified behaviour with no test able to see it. See `pusherVerify`.
+   */
+  conditions: readonly FleetCondition[];
   text: string;
   /** The measured numbers the text cites, for the log. */
   cited: string[];
@@ -347,6 +358,7 @@ export function decideFleetReport(input: FleetReportInput): FleetReportDecision 
   return {
     action: "send",
     conditionIds: fresh.map((c) => c.id),
+    conditions: fresh,
     text: verdict.text,
     cited: verdict.cited,
     memoryOnDelivered: {
