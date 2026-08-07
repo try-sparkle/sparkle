@@ -719,12 +719,20 @@ export async function sweepAllProjects(
     try {
       if (!isCurrent()) return;
       const outcome = await babysitSweepProject(project, now, resolved, isCurrent, deps.dispatchClock);
-      // A SWEEP THAT ONLY FAILED IS THE ONE THE OPERATOR MOST NEEDS TO SEE, and it was the one
-      // shape this predicate did not match: a project whose every PR threw dispatches nothing and
-      // holds nothing, so without `failed` here it emitted no summary at all. Counting the skips
-      // and then not reporting them repeats — inside the fix — the exact defect this PR is about:
-      // `logger.ts` only forwards `debug` when `import.meta.env.DEV`, so a release build discards
-      // it, which is how 143 failures a day went unnoticed.
+      // TWO PROMOTIONS, ONE CAUSE, AND BOTH BELONG HERE. `logger.ts` forwards `debug` only when
+      // `import.meta.env.DEV`, so anything logged at debug is discarded by the shipped build —
+      // which is how a sweep that threw on every PR, dispatched nothing and emitted 143 identical
+      // warns a day went undiagnosed for a full day. Two branches found that independently:
+      //
+      //   * a sweep that ONLY failed matched no predicate at all, so it said nothing whatsoever;
+      //     `failed` therefore has to enter the condition, not just the payload.
+      //   * even when a sweep did report, the rollup naming WHICH hold fired sat at debug, so the
+      //     one record of the decision existed only in a devtools console nobody had open.
+      //
+      // So: report on failure OR activity, `warn` when something failed, `info` otherwise. `info`
+      // rather than `debug` because a quiet sweep should still say so — the failure this system is
+      // most likely to have is silence. Cost is one small JSON line per owned project per 180 s
+      // sweep, and only when there is something to say.
       const failures = outcome.failed > 0;
       if (failures || outcome.dispatched.length > 0 || Object.keys(outcome.holds).length > 0) {
         const summary = {
@@ -734,10 +742,8 @@ export async function sweepAllProjects(
           unidentified: outcome.unidentified,
           failed: outcome.failed,
         };
-        // `warn` ONLY when something failed. A healthy sweep stays at `debug` so the ordinary
-        // 180-second beat does not become log noise that trains the reader to ignore the level.
         if (failures) log.warn("babysit", "sweep skipped PRs that threw", summary);
-        else log.debug("babysit", "sweep", summary);
+        else log.info("babysit", "sweep", summary);
       }
     } catch (e) {
       // One project's failure must never starve the projects after it.

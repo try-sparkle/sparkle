@@ -794,6 +794,218 @@ fn unknown_refusal(number: u64, error: &str) -> String {
     )
 }
 
+// ── THE CONVERGENCE GATE ────────────────────────────────────────────────────────────────────────
+//
+// "Addressed" is not "converged". A review landing is not evidence it reviewed YOUR code: a run
+// snapshots the head when it starts and takes 20–40 minutes, so anything pushed in that window is
+// outside it. Merging on such a review reports a clean bill for code nobody looked at.
+//
+// This is the gap the reviewer's author found in PR #1273 and called the single hard gate of the
+// whole loop: the last fix commit landed at 16:01, the newest review covered only up to `275f462`,
+// and the merge ran at 16:23 with NO review ever having seen the final head.
+//
+// EVERYTHING THIS NEEDS WAS ALREADY HERE. `parse_review_coverage` has been populating
+// `reviewed_head` and `review_stale` for the dispatcher all along; `decide` simply never consulted
+// them, so the merge gate blocked on unanswered probes and waved through unreviewed code. The fix
+// is a second, separate verdict — not a new field, and not a change to how probes are judged.
+//
+// WHY IT IS SEPARATE FROM `decide` RATHER THAN A FOURTH ARM OF IT: the two answer different
+// questions ("were the reviewer's findings answered?" vs "did the reviewer read this code?") and a
+// PR can fail either independently. Keeping them apart also keeps `decide`'s signature and its
+// fourteen existing tests untouched, so this cannot silently change what any of them assert.
+
+/// Whether the newest knightwatch review actually read the head we are about to merge.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Coverage {
+    /// knightwatch never posted on this PR. The gate DOES NOT APPLY — warns, never blocks.
+    ///
+    /// Deliberately not a refusal, and this is the one place we knowingly depart from the skill's
+    /// prose (which argues an unreviewed PR "has not converged, it has merely not been looked at").
+    /// True, but the reviewer is an external service on someone else's machine: blocking every PR
+    /// it never posted on would stall merges on every branch it simply is not watching, which is a
+    /// fleet-wide outage traded for a gap this repo has never actually been bitten by. Blocking
+    /// only when the reviewer IS engaged is the minimal change that makes #1273 impossible.
+    NotApplicable,
+    /// A non-stale review names a SHA that prefixes the current head.
+    Covered,
+    /// Authoritatively NOT covered, carrying the reason to show a human.
+    NotCovered(String),
+}
+
+/// THE COVERAGE VERDICT, PURE — no clock, no network, so every branch is a unit test.
+///
+/// `head` is `None` when the head could not be read. That is UNKNOWN, and it lands in `NotCovered`
+/// rather than in a third state on purpose: an unreadable head cannot be shown to be covered, and
+/// the sibling roborev gate sets the same precedent that "could not find out" blocks.
+pub(crate) fn coverage(gate: &ProbeGate, head: Option<&str>) -> Coverage {
+    if !gate.applicable {
+        return Coverage::NotApplicable;
+    }
+    // KNOWN GAP, deliberately left open rather than half-closed (roborev 59267 finding 3). A PR
+    // whose only knightwatch comments are lifecycle posts (`⏸ knightwatch paused`, `👀 reviewing`)
+    // has `applicable == true` and states no coverage, so it lands in NotCovered and BLOCKS —
+    // during an outage, behind a remedy that cannot complete until the outage ends.
+    //
+    // Two candidate fixes were tried and both were wrong. A `reviewed` flag built from
+    // `review_positions` is exactly equal to `applicable` (that list holds EVERY marker-carrying
+    // comment, lifecycle ones included), so it would have been INERT — reading as a fix while
+    // changing nothing. And keying on "no probes and no sha" cannot distinguish a lifecycle post
+    // from a clean review that happened to name no sha; it silently turned
+    // `a_review_that_names_no_sha_is_not_covered` from a refusal into a pass, which is the gate
+    // failing open on the exact silence it exists to distrust.
+    //
+    // The real discriminator is the lifecycle PREFIX itself, which the skill already recognises.
+    // Until that is implemented, the escape hatch is the recorded override.
+    // AUTHORITATIVE, and checked FIRST because it beats any arithmetic we could do: the bot knows
+    // what it actually diffed, and it co-occurs with a recognised status form rather than replacing
+    // one — so a stale run can still name a SHA, and trusting that SHA would read as covered.
+    if gate.review_stale {
+        return Coverage::NotCovered(
+            "the newest knightwatch review self-labelled \"⚠️ Stale: head moved mid-run\", so it \
+             diffed a snapshot that is no longer this PR"
+                .to_string(),
+        );
+    }
+    let Some(reviewed) = gate.reviewed_head.as_deref().filter(|s| !s.is_empty()) else {
+        return Coverage::NotCovered(
+            "no knightwatch review on this PR names the SHA it read, so nothing establishes that \
+             the current head has been reviewed. Never infer coverage from silence"
+                .to_string(),
+        );
+    };
+    let Some(head) = head else {
+        return Coverage::NotCovered(format!(
+            "the newest knightwatch review read {reviewed}, but this PR's current head could not \
+             be read, so coverage cannot be established. This is \"could not find out\", not \
+             \"covered\""
+        ));
+    };
+    // PREFIX, never equality, and SHORT against the start of LONG — knightwatch abbreviates to ~7
+    // chars while `headRefOid` is the full 40. Flipping these operands reports a stale review as
+    // covered, which is the exact bug this gate exists to prevent.
+    if head.starts_with(reviewed) {
+        Coverage::Covered
+    } else {
+        Coverage::NotCovered(format!(
+            "the newest knightwatch review read {reviewed}, but this PR's head is now {} — the \
+             commits between them have never been reviewed",
+            short_sha(head)
+        ))
+    }
+}
+
+/// Abbreviate an oid for a human, without assuming it is 40 chars.
+fn short_sha(sha: &str) -> String {
+    sha.chars().take(7).collect()
+}
+
+/// The refusal for an unreviewed head. Says what to do, and the remedy is one a caller can follow.
+fn coverage_refusal(number: u64, reason: &str) -> String {
+    format!(
+        "Merge blocked: PR #{number} has not CONVERGED — no knightwatch review covers its current \
+         head.\n\n  {reason}\n\n\
+         \"Addressed\" is not \"converged\": applying a fix moves the head, which invalidates the \
+         coverage of the review that asked for it. A clean review pinned to the exact SHA you are \
+         merging is the gate.\n\n\
+         To clear this, trigger an incremental re-review by posting `/srosro-update-review` as a \
+         comment on the PR, wait for the review to land, and confirm its status names your current \
+         head. Then merge again.\n\
+         To merge anyway, supply a knightwatch override reason (at least {MIN_OVERRIDE_REASON} \
+         characters, more than one word) saying why this head does not need review. It is posted to \
+         the PR as a permanent record BEFORE the merge runs."
+    )
+}
+
+/// BOTH gates failed and one rationale was supplied. It buys one bypass, not two.
+///
+/// EVERY REMEDY NAMED HERE MUST ACTUALLY WORK, and one earlier version's first remedy did not.
+/// It said "if the head genuinely needs no review, say so about THE HEAD specifically and merge
+/// again" — but there is only ONE override channel, and with blocking probes outstanding [`decide`]
+/// consumes whatever sentence is supplied and returns `RecordThenAllow`, so `enforce` lands right
+/// back here. The retry produced this identical refusal forever, and the author was told to keep
+/// trying it. A refusal's suggested alternative is an instruction the reader will follow, so it
+/// needs the same scrutiny as the path it replaces; the two exits below are the two that exist.
+///
+/// TWO STATES REACH THIS, and only one of them has probes to answer. `read_gate` returns
+/// [`ProbeGate::unknown`] when the comment read fails or saturates, and that gate is
+/// `applicable: true` with `probes: None` — so `decide` still consumes the rationale
+/// (`RecordThenAllow { unknown: true }`) and `coverage` still reports `NotCovered`, landing here
+/// with NO probe list in existence. Telling that author to "answer the [blocking] probes" is the
+/// same unfollowable instruction this function was just rewritten to remove: there is nothing to
+/// answer, and on a saturated read answering everything would not change what was read. So the
+/// exit list is state-dependent, and `unknown` is carried in from the arm that already binds it.
+fn both_gates_refusal(number: u64, reason: &str, unknown: bool) -> String {
+    let (opening, first_exit) = if unknown {
+        (
+            format!(
+                "Merge blocked: the [blocking] probes on PR #{number} could not be READ, so the \
+                 override you supplied was taken as the bypass for that gate — but this PR ALSO \
+                 has not converged, and one reason cannot bypass two different gates."
+            ),
+            "1. Re-run the merge once the probe read succeeds. It is a `gh` read, so a transient \
+             failure or a comment thread too long to enumerate is the usual cause — and until it \
+             succeeds there is no probe list to answer. With the probes readable and clear, your \
+             rationale is the one that gets judged and recorded as the convergence override."
+                .to_string(),
+        )
+    } else {
+        (
+            format!(
+                "Merge blocked: the override you supplied answers the [blocking] probes on PR \
+                 #{number}, but this PR ALSO has not converged — and one reason cannot bypass two \
+                 different gates."
+            ),
+            "1. Answer the [blocking] probes, then merge again with a rationale about THE HEAD. \
+             With the probes clear, that sentence is the one that gets judged and recorded as the \
+             convergence override — so the thread shows someone decided about the unreviewed code \
+             and not only about the probes."
+                .to_string(),
+        )
+    };
+    format!(
+        "{opening}\n\n  \
+         {reason}\n\n\
+         The probe rationale was NOT posted; nothing has been recorded and nothing has merged.\n\n\
+         Rewording this reason will not clear it: while the probe gate is unsatisfied, any \
+         rationale you supply is read as the PROBE bypass — however you phrase it — so a retry \
+         arrives back here unchanged. Two exits work:\n\n\
+         {first_exit}\n\
+         2. Or post `/srosro-update-review` on the PR, wait for the review to land, confirm its \
+         status names your current head, and merge with your probe rationale as before."
+    )
+}
+
+/// The exact `gh` argv for the head oid. PURE so the flags are assertable.
+fn head_argv(number: u64) -> Vec<String> {
+    [
+        "pr".to_string(),
+        "view".to_string(),
+        number.to_string(),
+        "--json".to_string(),
+        "headRefOid".to_string(),
+        "-q".to_string(),
+        ".headRefOid".to_string(),
+    ]
+    .to_vec()
+}
+
+/// Read the PR's current head oid. `None` is UNKNOWN — never a guess, and never an empty string.
+fn read_head(root: &str, number: u64) -> Option<String> {
+    let mut cmd = Command::new(crate::preflight::gh_program());
+    cmd.args(head_argv(number)).current_dir(root);
+    apply_noninteractive(&mut cmd);
+    let output = crate::worktree::output_with_timeout(cmd, READ_TIMEOUT).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let head = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if head.is_empty() {
+        None
+    } else {
+        Some(head)
+    }
+}
+
 /// Validate an override reason. Returns the TRIMMED reason, or the refusal that says why not.
 ///
 /// Two tests, both cheap for a real explanation and both fatal to a keystroke: it must survive
@@ -1015,10 +1227,42 @@ pub(crate) fn enforce(
         );
     }
 
+    // PROBES FIRST, then coverage. Both can fail at once, and answering the findings is the more
+    // actionable instruction — it is also the order the loop runs in: answer the probes, push, then
+    // re-review the new head. Leading with "go get a re-review" while findings sit unanswered would
+    // send the author back for a round that the next review would only reopen.
+    // BOTH GATES ARE JUDGED BEFORE EITHER ACTS, and that ordering is the fix — not a style choice.
+    //
+    // Two earlier cuts both let a PROBES rationale silently clear the HEAD check. The first
+    // returned outright on an override. The second fell through but still ran the probe gate FIRST,
+    // which is worse than it looks: a human blocked on probes only ever sees `blocking_refusal`,
+    // types a rationale about the probes, retries — and that SAME string is handed to
+    // `decide_coverage`, which validates it with the identical `validate_override` and so can never
+    // reject it. `coverage_refusal`, the message that says the head is unreviewed and names
+    // `/srosro-update-review`, was unreachable on that path. The author was never told. Only the
+    // paper trail changed, and it changed into a FALSE one: a probes rationale quoted under
+    // "convergence gate overridden", which is exactly the false-record shape `decide` argues
+    // against.
+    //
+    // So a reason buys ONE bypass. When both gates fail and only one rationale was supplied, we
+    // refuse and say the head is also unreviewed — the author decides about the head knowing it is
+    // the head, or does not decide at all.
+    let coverage_verdict = if gate.applicable {
+        coverage(&gate, read_head(root, number).as_deref())
+    } else {
+        // The head read is skipped entirely when the reviewer was never here, so a repo it does
+        // not watch pays no extra `gh` call per merge.
+        Coverage::NotApplicable
+    };
+
     match decide(&gate, number, knightwatch_override) {
-        Decision::Allow => Ok(()),
-        Decision::Refuse(msg) => Err(msg),
+        Decision::Refuse(msg) => return Err(msg),
         Decision::RecordThenAllow { body, bypassed, unknown } => {
+            if let Coverage::NotCovered(reason) = &coverage_verdict {
+                // Refuse BEFORE posting: the probe record must not land on the PR describing a
+                // merge that is about to be declined for a different reason.
+                return Err(both_gates_refusal(number, reason, unknown));
+            }
             post_override_comment(root, number, &body)?;
             tracing::warn!(
                 target: "knightwatch",
@@ -1027,9 +1271,84 @@ pub(crate) fn enforce(
                 unknown,
                 "knightwatch probe gate overridden; the reason is recorded on the PR"
             );
+            return Ok(());
+        }
+        Decision::Allow => {}
+    }
+
+    match decide_coverage_from(&coverage_verdict, number, knightwatch_override) {
+        Decision::Allow => Ok(()),
+        Decision::Refuse(msg) => Err(msg),
+        Decision::RecordThenAllow { body, .. } => {
+            post_override_comment(root, number, &body)?;
+            tracing::warn!(
+                target: "knightwatch",
+                pr = number,
+                "knightwatch convergence gate overridden; the reason is recorded on the PR"
+            );
             Ok(())
         }
     }
+}
+
+/// THE COVERAGE DECISION, PURE — extracted from [`enforce`] for the same reason [`decide`] was.
+/// With the head read and the comment post inlined, no test could reach this wiring: deleting the
+/// call from `enforce` left every `coverage` test green while the gate was entirely inert, which is
+/// the vacuous-coverage shape AGENTS.md names as the repo's #1 fleet-wide finding.
+pub(crate) fn decide_coverage(
+    gate: &ProbeGate,
+    head: Option<&str>,
+    number: u64,
+    knightwatch_override: Option<&str>,
+) -> Decision {
+    decide_coverage_from(&coverage(gate, head), number, knightwatch_override)
+}
+
+/// The same decision, over an ALREADY-COMPUTED verdict — so `enforce` can judge both gates before
+/// either acts without reading the head twice.
+pub(crate) fn decide_coverage_from(
+    verdict: &Coverage,
+    number: u64,
+    knightwatch_override: Option<&str>,
+) -> Decision {
+    let Coverage::NotCovered(reason) = verdict else {
+        return Decision::Allow;
+    };
+    // DELIBERATELY NOT CLEARED BY `gate.overridden`, unlike the probe gate. That flag means "a
+    // record exists newer than the newest REVIEW" — it is bounded against reviews, not against
+    // commits, so it cannot express "I accept this specific unreviewed head". Honouring it here
+    // would let one override permanently waive review for every commit pushed after it, which is
+    // the failure this gate exists to stop. An explicit reason on THIS merge is the only exit.
+    let Some(supplied) = knightwatch_override else {
+        return Decision::Refuse(coverage_refusal(number, reason));
+    };
+    match validate_override(supplied) {
+        Ok(text) => Decision::RecordThenAllow {
+            body: coverage_override_body(reason, &text),
+            bypassed: 0,
+            unknown: false,
+        },
+        Err(e) => Decision::Refuse(e),
+    }
+}
+
+/// The permanent record posted when an unreviewed head is merged anyway.
+fn coverage_override_body(reason: &str, supplied: &str) -> String {
+    // EVERY line quoted, not just the first. A multi-line reason with a bare leading `> ` renders
+    // its second line onward as body text, breaking out of the blockquote — the same defect
+    // `override_comment_body` documents on its own reason.
+    let quoted = supplied
+        .lines()
+        .map(|l| format!("> {l}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "{OVERRIDE_MARKER}\n\n\
+         **knightwatch convergence gate overridden** — this PR was merged without a review \
+         covering its final head.\n\n\
+         {reason}.\n\n\
+         Reason given:\n\n{quoted}\n"
+    )
 }
 
 /// The WHOLE probe reading for one PR — blocking and open, answered and not.
@@ -1887,6 +2206,293 @@ mod tests {
         let gate = evaluate(&[comment(1, &body)]);
         assert_eq!(gate.reviewed_head.as_deref(), Some("e129301"), "the head it read");
         assert_ne!(gate.reviewed_head.as_deref(), Some("9150dfe"), "not the base it could not use");
+    }
+
+    // ── THE CONVERGENCE GATE ────────────────────────────────────────────────────────────────────
+    //
+    // These assert the VERDICT, not the parse. The fields these read have been parsed correctly for
+    // as long as they have existed — the defect was that nothing consulted them — so a test that
+    // asserted `reviewed_head` was populated would have passed before this gate existed and proven
+    // nothing about whether a merge is refused.
+
+    /// A gate with a review that read `reviewed`, not self-labelled stale.
+    fn covering(reviewed: &str) -> ProbeGate {
+        let body = format!(
+            "{REVIEW_MARKER}\n> 📋 First review of this PR — reviewed `{reviewed}`.\n"
+        );
+        evaluate(&[comment(1, &body)])
+    }
+
+    #[test]
+    fn a_review_naming_the_current_head_is_covered() {
+        // The bot abbreviates to 7; the oid is 40. Prefix, and this is the only Covered branch.
+        assert_eq!(coverage(&covering("9c65efe"), Some("9c65efe1122334455667788990011223344556677")), Coverage::Covered);
+    }
+
+    /// PR #1273 VERBATIM — the merge this whole gate exists to refuse. The review read `275f462`;
+    /// the head had moved to `1867679` by the time the merge ran.
+    #[test]
+    fn a_head_that_outran_the_review_is_not_covered() {
+        let Coverage::NotCovered(why) = coverage(&covering("275f462"), Some("1867679aabbccddeeff00112233445566778899a"))
+        else {
+            panic!("a head the reviewer never read must not be covered");
+        };
+        assert!(why.contains("275f462"), "names what was reviewed: {why}");
+        assert!(why.contains("1867679"), "names what is being merged: {why}");
+    }
+
+    /// The operand order, pinned on its own because flipping it is silent and inverts the gate:
+    /// `reviewed.starts_with(head)` is false for a genuinely covered PR and true for nothing
+    /// useful, so the gate would block every merge and get "fixed" by being deleted.
+    #[test]
+    fn the_prefix_runs_short_against_long_never_the_reverse() {
+        let full = "9c65efe1122334455667788990011223344556677";
+        assert_eq!(coverage(&covering("9c65efe"), Some(full)), Coverage::Covered);
+        // The reverse relation does not hold, which is what makes the direction load-bearing.
+        assert!(!"9c65efe".starts_with(full));
+    }
+
+    /// AUTHORITATIVE, and it must beat the SHA arithmetic: a stale run still NAMES a sha, and here
+    /// that sha matches the head exactly. Trusting the arithmetic alone would call this covered.
+    #[test]
+    fn a_self_labelled_stale_review_blocks_even_when_its_sha_matches_the_head() {
+        let body = format!(
+            "{REVIEW_MARKER}\n> 📋 First review of this PR — reviewed `9c65efe`. ⚠️ Stale: head \
+             moved from `9c65efe` to `4d3030a` mid-run — see commands below to re-run.\n"
+        );
+        let gate = evaluate(&[comment(1, &body)]);
+        assert_eq!(gate.reviewed_head.as_deref(), Some("9c65efe"), "precondition: it names a sha");
+        let Coverage::NotCovered(why) = coverage(&gate, Some("9c65efe1122334455667788990011223344556677"))
+        else {
+            panic!("the bot's own stale label outranks our sha comparison");
+        };
+        assert!(why.contains("Stale"), "says the bot self-labelled it: {why}");
+    }
+
+    /// Never infer coverage from silence. A lifecycle status post, or a form this parser does not
+    /// recognise, names no sha — and "no evidence it was reviewed" is not "it was reviewed".
+    #[test]
+    fn a_review_that_names_no_sha_is_not_covered() {
+        let gate = evaluate(&[comment(1, &format!("{REVIEW_MARKER}\n> 📋 Something new.\n"))]);
+        assert_eq!(gate.reviewed_head, None, "precondition: nothing parsed a sha");
+        assert!(matches!(coverage(&gate, Some("9c65efe112233")), Coverage::NotCovered(_)));
+    }
+
+    /// UNKNOWN blocks, the same doctrine the probe gate applies to an unreadable comment list.
+    #[test]
+    fn an_unreadable_head_is_not_covered() {
+        let Coverage::NotCovered(why) = coverage(&covering("9c65efe"), None) else {
+            panic!("\"could not find out\" is not \"covered\"");
+        };
+        assert!(why.contains("could not be read"), "says which read failed: {why}");
+    }
+
+    /// The deliberate carve-out. A repo the reviewer does not watch must keep merging — this is the
+    /// one branch that intentionally departs from the skill's prose, so it is pinned explicitly.
+    #[test]
+    fn a_pr_the_reviewer_never_posted_on_does_not_block() {
+        let gate = ProbeGate::not_applicable();
+        assert_eq!(coverage(&gate, None), Coverage::NotApplicable);
+        assert_eq!(coverage(&gate, Some("9c65efe112233")), Coverage::NotApplicable);
+    }
+
+    /// THE WIRING, not the pure verdict. Deleting `decide_coverage`'s call from `enforce` left
+    /// every `coverage` test above green while the gate was entirely inert, so the decision that
+    /// actually refuses a merge is asserted here.
+    #[test]
+    fn an_uncovered_head_refuses_the_merge_and_an_override_records_it() {
+        let gate = covering("275f462");
+        let head = Some("1867679aabbccddeeff00112233445566778899a");
+
+        assert!(matches!(decide_coverage(&gate, head, 1273, None), Decision::Refuse(_)));
+
+        // A covered head is simply allowed — the gate must not block what it has no quarrel with.
+        let covered = Some("275f462aabbccddeeff00112233445566778899a");
+        assert_eq!(decide_coverage(&gate, covered, 1273, None), Decision::Allow);
+
+        // An override RECORDS before it allows, and the record is what makes the bypass auditable.
+        let good = "the runner was offline and this head is a version bump only";
+        let Decision::RecordThenAllow { body, .. } = decide_coverage(&gate, head, 1273, Some(good))
+        else {
+            panic!("a valid override must record and allow");
+        };
+        assert!(body.contains(OVERRIDE_MARKER), "the record is machine-findable");
+        assert!(body.contains("275f462"), "it names the head that WAS reviewed: {body}");
+
+        // A keystroke is not a reason.
+        assert!(matches!(decide_coverage(&gate, head, 1273, Some("ok")), Decision::Refuse(_)));
+    }
+
+    /// A multi-line reason must stay inside the blockquote. With a bare leading `> ` the second
+    /// line onward renders as body text — the same defect `override_comment_body` documents.
+    #[test]
+    fn every_line_of_an_override_reason_is_quoted() {
+        let body = coverage_override_body("the review read 275f462", "first line\nsecond line");
+        assert!(body.contains("> first line"), "{body}");
+        assert!(body.contains("> second line"), "the second line must be quoted too: {body}");
+    }
+
+    /// THE WIRING, STRUCTURALLY — because calling `decide_coverage` from a test asserts the same
+    /// pure verdict the `coverage` tests already did. Deleting the call from `enforce`, or
+    /// restoring the `return Ok(())` in the probe override arm, left all 55 of those green: the
+    /// vacuity had been RELOCATED from `coverage` to `decide_coverage`, not closed.
+    ///
+    /// So this reds on the exact two edits the fix consists of, using the same `include_str!` +
+    /// body-scoped whole-line technique as `merge_pr_actually_runs_the_gate`.
+    #[test]
+    fn enforce_judges_coverage_and_no_override_arm_returns_before_it() {
+        let src = include_str!("knightwatch.rs");
+        // Slice from the signature so the doc comment above it cannot satisfy the search.
+        let start = src.find("pub(crate) fn enforce(").expect("enforce's signature");
+        let body = &src[start..];
+        // TERMINATE ON AN ITEM THAT REALLY FOLLOWS `enforce`, and hard-fail if it moves. The
+        // previous delimiter (`\n/// BOTH gates`) is the doc comment on `both_gates_refusal`, which
+        // sits ABOVE `enforce` — so the search never matched, `unwrap_or(body.len())` widened the
+        // slice to EOF, and the first assertion below then found its own source literal inside
+        // `mod tests`. It passed with the head read deleted from `enforce`: this guard against
+        // relocated vacuity was itself vacuous. Never `unwrap_or(body.len())` for a delimiter whose
+        // absence silently widens the scope.
+        let end = body
+            .find("\n/// THE COVERAGE DECISION, PURE")
+            .expect("the item that follows enforce — re-scope this slice rather than widening it");
+        let body = &body[..end];
+
+        assert!(
+            body.contains("coverage(&gate, read_head(root, number).as_deref())"),
+            "enforce must actually READ the head and compute coverage; without this call the whole \
+             gate is inert while every `coverage` unit test stays green"
+        );
+        assert!(
+            body.lines().any(|l| l.trim().starts_with("match decide_coverage_from(")),
+            "enforce must dispatch on the coverage verdict as a STATEMENT — `let _ = …` compiles \
+             and silently swallows the refusal, and a substring test passes for it"
+        );
+
+        // The probe override arm must NOT return before coverage is judged. That early return is
+        // precisely how a probes rationale silently waived the head check, twice.
+        let probe_arm = body
+            .find("Decision::RecordThenAllow { body, bypassed, unknown } => {")
+            .expect("the probe override arm");
+        let arm = &body[probe_arm..];
+        // Same rule as the slice above: an absent delimiter must FAIL, never silently widen.
+        let arm_end = arm.find("Decision::Allow => {}").expect("the arm that ends the probe match");
+        assert!(
+            arm[..arm_end].contains("both_gates_refusal(number, reason, unknown)"),
+            "the probe override arm must refuse when coverage ALSO failed — one rationale buys one \
+             bypass, and without this the same string clears both gates and `coverage_refusal` is \
+             never shown to the author"
+        );
+    }
+
+    /// One reason does not buy two bypasses, asserted on the decision rather than the wiring.
+    #[test]
+    fn a_probes_rationale_does_not_also_clear_an_unreviewed_head() {
+        let msg = both_gates_refusal(1273, "the newest review read 275f462", false);
+        assert!(msg.contains("275f462"), "names what was reviewed: {msg}");
+        assert!(
+            msg.contains("NOT posted"),
+            "must say nothing was recorded — a refusal that leaves a record implies a merge: {msg}"
+        );
+        assert!(msg.contains("/srosro-update-review"), "names the remedy: {msg}");
+    }
+
+    /// THE REMEDY IT NAMES HAS TO BE REACHABLE. Asserted on the DECISION, not on the sentence: the
+    /// old copy told the author to re-type the reason "about THE HEAD specifically and merge
+    /// again", and that retry cannot work — there is one override channel, and while blocking
+    /// probes are outstanding `decide` consumes any supplied rationale as the PROBE bypass and
+    /// returns `RecordThenAllow`, so `enforce` refuses in the same place with the same words. A
+    /// text-only test could not see that; this drives the same input the retry would.
+    #[test]
+    fn the_retry_the_refusal_used_to_promise_takes_the_identical_path() {
+        let body = format!(
+            "{REVIEW_MARKER}\n> 📋 First review of this PR — reviewed `275f462`.\n\n\
+             1. [blocking] [from: tests] [bug] an unanswered finding\n"
+        );
+        let gate = evaluate(&[comment(1, &body)]);
+
+        // Precondition: BOTH gates fail — that is the only state this refusal is reached from.
+        assert_eq!(ids(&gate.unanswered_blocking()), vec!["1#1"], "the probe gate must fail");
+        let head = "1867679aabbccddeeff00112233445566778899a";
+        assert!(
+            matches!(coverage(&gate, Some(head)), Coverage::NotCovered(_)),
+            "the coverage gate must fail too"
+        );
+
+        // A rationale written squarely about the head is STILL taken as the probe bypass, so the
+        // second attempt reaches `both_gates_refusal` exactly as the first did.
+        for reason in [
+            "the newest review read 275f462 and that is the code that matters",
+            "THE HEAD specifically needs no review: the delta is comments only",
+        ] {
+            assert!(
+                matches!(decide(&gate, 1273, Some(reason)), Decision::RecordThenAllow { .. }),
+                "a supplied reason is always consumed by the probe gate, so re-typing it cannot \
+                 reach decide_coverage_from — reason: {reason}"
+            );
+        }
+
+        // …so the copy must name the two exits that DO work, and say the retry does not.
+        let msg = both_gates_refusal(1273, "the newest review read 275f462", false);
+        assert!(
+            msg.contains("Rewording this reason will not clear it"),
+            "must not send the author back for a retry that lands here again: {msg}"
+        );
+        assert!(msg.contains("Answer the [blocking] probes"), "names the first working exit: {msg}");
+        assert!(msg.contains("/srosro-update-review"), "names the second working exit: {msg}");
+    }
+
+    /// THE UNREADABLE GATE REACHES THE SAME REFUSAL WITH NOTHING TO ANSWER. `read_gate` returns
+    /// `ProbeGate::unknown` on a failed or saturated comment read; that gate is `applicable: true`
+    /// with `probes: None`, so `decide` still consumes the rationale and `coverage` still reports
+    /// `NotCovered` — landing on `both_gates_refusal` in a state where "answer the [blocking]
+    /// probes" names a list that does not exist, and where a saturated read would not change if
+    /// the author answered every probe on the PR. The first exit has to be state-dependent, so
+    /// this pins BOTH branches: the readable one keeps the answer-the-probes exit, the unreadable
+    /// one must not offer it.
+    #[test]
+    fn the_unreadable_probe_gate_is_not_told_to_answer_probes_it_cannot_list() {
+        let gate = ProbeGate::unknown("gh: could not read the comment thread".to_string());
+        let head = "1867679aabbccddeeff00112233445566778899a";
+
+        // Precondition: this really is the both-gates state — the arm that calls the refusal.
+        assert!(
+            matches!(
+                decide(&gate, 1273, Some("the head needs no review, the delta is comments only")),
+                Decision::RecordThenAllow { unknown: true, .. }
+            ),
+            "an unreadable gate still consumes the rationale as the probe bypass"
+        );
+        assert!(
+            matches!(coverage(&gate, Some(head)), Coverage::NotCovered(_)),
+            "and coverage still fails, since no review named this head"
+        );
+
+        let msg = both_gates_refusal(1273, "no review names 1867679", true);
+        assert!(
+            !msg.contains("Answer the [blocking] probes"),
+            "must not name a probe list that could not be read: {msg}"
+        );
+        assert!(
+            msg.contains("could not be READ") && msg.contains("Re-run the merge once the probe read succeeds"),
+            "must say the read failed and name the exit that exists for it: {msg}"
+        );
+        assert!(msg.contains("/srosro-update-review"), "the review exit works in this state too: {msg}");
+    }
+
+    #[test]
+    fn the_head_read_asks_github_for_the_head_ref_oid() {
+        let argv = head_argv(1273);
+        assert!(argv.contains(&"headRefOid".to_string()), "must request the oid: {argv:?}");
+        assert!(argv.contains(&"1273".to_string()), "for the PR it was asked about: {argv:?}");
+    }
+
+    /// The refusal has to be followable. A remedy naming no command is an obstacle, and AGENTS.md
+    /// calls out the remedy-that-cannot-be-followed shape specifically.
+    #[test]
+    fn the_coverage_refusal_names_the_trigger_that_clears_it() {
+        let msg = coverage_refusal(1273, "the newest review read 275f462");
+        assert!(msg.contains("/srosro-update-review"), "names the re-review trigger: {msg}");
+        assert!(msg.contains("override"), "names the escape hatch: {msg}");
     }
 
     /// The self-label CO-OCCURS with a recognised form — it does not replace one. Both facts must

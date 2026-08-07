@@ -11,6 +11,20 @@ const invokeMock = vi.fn();
 const spawnMock = vi.fn();
 const fetchOpenPrsMock = vi.fn();
 const capacityMock = vi.fn(() => ({ atCapacity: false, used: 0, limit: 8, basis: "test" }));
+const logInfoMock = vi.fn();
+const logDebugMock = vi.fn();
+
+// The logger is mocked so the sweep rollup's LEVEL is assertable. `logger.ts` does not forward
+// DEBUG to the persistent log in production, so "which hold fired" is only answerable if this line
+// is info — see the rollup-level describe at the bottom of this file for what that cost once.
+vi.mock("../logger", () => ({
+  log: {
+    info: (...a: unknown[]) => logInfoMock(...a),
+    debug: (...a: unknown[]) => logDebugMock(...a),
+    warn: vi.fn(),
+    error: vi.fn(),
+  },
+}));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invokeMock(...a) }));
 vi.mock("./buildAgentSpawn", () => ({ spawnBuildAgentInProject: (...a: unknown[]) => spawnMock(...a) }));
@@ -131,6 +145,8 @@ beforeEach(() => {
   invokeMock.mockReset();
   spawnMock.mockReset();
   fetchOpenPrsMock.mockReset();
+  logInfoMock.mockReset();
+  logDebugMock.mockReset();
   capacityMock.mockReturnValue({ atCapacity: false, used: 0, limit: 8, basis: "test" });
   spawnMock.mockReturnValue("agent-1");
   fetchOpenPrsMock.mockResolvedValue([prWithProbe()]);
@@ -445,6 +461,45 @@ describe("sweepAllProjects — the single-owner election", () => {
       sweepClock: () => T0,
     });
     expect(fetchOpenPrsMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ── THE HOLD ROLLUP MUST REACH THE PERSISTENT LOG ───────────────────────────────────────────────
+//
+// This asserts a LEVEL, which is unusual, so here is why it earns a test. The rollup is the only
+// record of WHICH hold fired. `logger.ts` skips forwarding DEBUG to disk in production builds, so
+// while this line was `log.debug` the answer to "why has nothing dispatched?" existed only in a
+// devtools console nobody had open.
+//
+// It cost a full day. The shipped build threw out of every sweep and dispatched nothing; the sole
+// evidence was 128 identical per-project catch WARNs that named the throw but never the decision.
+// The module header calls silence this system's most likely failure — a rollup that cannot be read
+// in the shipped build is that silence.
+//
+// Asserted against the SIDE EFFECT (which mock received the call), not against a precondition: a
+// test that merely checked "a rollup was emitted" passes identically at either level and would have
+// proven nothing.
+describe("sweepAllProjects — the hold rollup is INFO, so it survives to the log file", () => {
+  it("emits the rollup at info and NOT at debug", async () => {
+    wireInvoke({ leases: [] });
+    fetchOpenPrsMock.mockResolvedValue([prWithProbe()]);
+
+    // One sweep: the two-observation rule holds it at `single-observation`, which is exactly the
+    // shape whose invisibility this pins — a hold, no dispatch, and nothing else to see.
+    await sweepAllProjects(CONFIG, {
+      ownsProject: () => true,
+      projects: () => [PROJECT],
+      dispatchClock: () => T0,
+      sweepClock: () => T0,
+    });
+
+    const rollups = logInfoMock.mock.calls.filter((c) => c[0] === "babysit" && c[1] === "sweep");
+    expect(rollups).toHaveLength(1);
+    expect((rollups[0]?.[2] as { holds: Record<string, number> }).holds["single-observation"]).toBe(1);
+
+    // The half that makes this non-vacuous: at `log.debug` the assertion above would be empty and
+    // this one would hold the call instead.
+    expect(logDebugMock.mock.calls.filter((c) => c[0] === "babysit" && c[1] === "sweep")).toHaveLength(0);
   });
 });
 
