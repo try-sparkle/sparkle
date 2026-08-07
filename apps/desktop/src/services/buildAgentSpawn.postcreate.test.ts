@@ -150,7 +150,7 @@ describe("spawnBuildAgentInProject: a failure BEFORE launch leaves nothing behin
     expect(useRuntimeStore.getState().openAgentIds).toEqual([]);
   });
 
-  it("and cancels the perf trace, so a failed spawn cannot haunt the jank monitor", () => {
+  it("and leaves NO open perf trace — neither the spawn one nor the close one removeAgent opens", () => {
     // `perfStart` inserts into a module-level map whose only removers are `perfEnd`/`perfCancel`,
     // and neither can ever fire for a torn-down row — the pane that would call them never exists.
     // `openTraceKinds()` is the jank monitor's only attribution channel on macOS WKWebView and
@@ -165,7 +165,10 @@ describe("spawnBuildAgentInProject: a failure BEFORE launch leaves nothing behin
     expect(spawnBuildAgentInProject(p, { prompt: "watch this PR", background: true })).toBeNull();
 
     expect(clearBriefSpy).toHaveBeenCalled(); // the intended path ran
-    expect(openTraceKinds() ?? "").not.toMatch(/spawn/);
+    // NOT `not.toMatch(/spawn/)` — that was narrow enough to pass over the residue. `removeAgent`
+    // opens its OWN `close:<id>` trace, so cancelling only the spawn one swapped one permanent
+    // phantom for another. Assert the map is EMPTY: any leaked kind reds this.
+    expect(openTraceKinds()).toBeUndefined();
   });
 });
 

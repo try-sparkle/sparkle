@@ -8,6 +8,7 @@ import { useRuntimeStore } from "../stores/runtimeStore";
 import { maybeAutoName } from "./agentNaming";
 import { aiFeatureNow } from "./aiGate";
 import { useStaleBuildStore } from "./staleBuildService";
+import { removeAgentWithoutPane } from "./agentTeardown";
 
 /** The authoritative identity of a freshly-spawned worker. Returned straight from the worktree
  *  cut (createWorkerWorktree) — NOT re-derived from a later store read — so callers (the
@@ -115,7 +116,11 @@ export async function spawnWorker(args: {
     const selectedWasDoomed =
       useProjectStore.getState().projects.find((p) => p.id === args.projectId)?.selectedAgentId ===
       workerId;
-    useProjectStore.getState().removeAgent(args.projectId, workerId);
+    // The worker's pane NEVER mounted: the row is added with `select: false` and
+    // `runtime.open(workerId)` does not run until `runSpawn`, which this rollback is the failure to
+    // reach. Fan-out reaches this path (worktree cut failures) far more often than the build-agent
+    // teardown where the same leak was first found.
+    removeAgentWithoutPane(args.projectId, workerId);
     if (selectedWasDoomed) {
       useProjectStore.getState().selectAgent(args.projectId, args.parentAgentId);
     }
@@ -209,6 +214,12 @@ export async function spinDownWorker(args: { projectId: string; workerId: string
   // Removing the row synchronously up front is what makes the × feel immediate. It's safe because
   // removeAgent now TOMBSTONES the id (pendingLocalRemovals), so the disk reconcile can't re-adopt
   // this worker from its still-present manifest during the teardown window (sparkle-close-resurrect).
+  // DELIBERATELY UNCHANGED, and the leak here is KNOWN — see bead sparkle-vmfda. A `close:` trace can
+  // dangle when no pane was mounted, but "was one?" has no answer this call site can give: it is
+  // false in the main window for an unvisited or torn-out project, and TRUE in the satellite window
+  // for that same torn-out project (SatelliteApp mounts on `openAgentIds` alone). Guessing wrong in
+  // the other direction cancels a LIVE trace and silently stops measuring closes, which is worse
+  // than the dangle. Left alone until the ownership question is settled where it belongs.
   useRuntimeStore.getState().close(args.workerId);
   useProjectStore.getState().removeAgent(args.projectId, args.workerId);
   // Then the slow disk teardown — still AWAITED so the orchestrator's spin_down reply only resolves

@@ -22,6 +22,7 @@ import { markProjectOpen } from "./projectTabs";
 import { isTornOut } from "./satelliteWindows";
 import { log } from "../logger";
 import { perfStart, perfCancel } from "../perfTrace";
+import { removeAgentWithoutPane } from "./agentTeardown";
 import type { Project } from "../types";
 
 /**
@@ -375,7 +376,9 @@ export function spawnBuildAgentInProject(
       // it in localStorage until something happened to run the reconcile prune. Closed first,
       // because after `removeAgent` there is no row for a reconcile to match it against.
       useRuntimeStore.getState().close(id);
-      useProjectStore.getState().removeAgent(project.id, id);
+      // No pane ever mounted (the throw is synchronous, before React renders), so the `close:` trace
+      // `removeAgent` opens has nothing to end it — see `removeAgentWithoutPane`.
+      removeAgentWithoutPane(project.id, id);
       return null;
     }
     // The agent is live and briefed; only the cosmetic tail failed. Unmaking it would be worse.

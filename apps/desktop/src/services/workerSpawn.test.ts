@@ -496,6 +496,37 @@ describe("spawnWorker", () => {
     expect(proj.selectedAgentId).toBe(buildId);
   });
 
+  // A ROLLED-BACK WORKER MUST NOT LEAVE A PHANTOM `close:` TRACE (roborev 60088).
+  //
+  // `removeAgent` opens `close:<id>` unconditionally, and its only remover is `perfEnd` in
+  // AgentPane's unmount cleanup. On this path the worker's pane NEVER mounted — the row is added
+  // with `select: false` and `runtime.open(workerId)` does not run until `runSpawn`, which is
+  // exactly what this rollback is the failure to reach. Left behind, the entry is reported by
+  // `openTraceKinds()` as an in-flight interaction on every later jank warning, growing by one per
+  // failed spawn — and fan-out reaches this path (worktree cut failures) far more often than the
+  // build-agent teardown where the same leak was first found.
+  it("leaves no dangling close trace when the spawn rolls back", async () => {
+    const store = useProjectStore.getState();
+    const projectId = store.addProject("Demo", "/tmp/demo");
+    const buildId = store.addAgent(projectId, { kind: "build" })!;
+    store.setAgentWorktree(projectId, buildId, "/wt/build", "sparkle/agent-build1");
+
+    invokeMock.mockImplementation((cmd: string) =>
+      cmd === "create_worker_worktree"
+        ? Promise.reject(new Error("git failed"))
+        : Promise.resolve(undefined),
+    );
+
+    await expect(spawnWorker({ projectId, parentAgentId: buildId, task: "x" })).rejects.toThrow(
+      /git failed/,
+    );
+
+    // The row really is gone — so any `close` entry still open is a leak, not a live interaction.
+    const proj = useProjectStore.getState().projects.find((p) => p.id === projectId)!;
+    expect(proj.agents.some((a) => a.kind === "worker")).toBe(false);
+    expect(openTraceKinds() ?? "").not.toContain("close");
+  });
+
   it("does NOT try to remove a worktree when the cut itself failed (nothing to roll back)", async () => {
     const store = useProjectStore.getState();
     const projectId = store.addProject("Demo", "/tmp/demo");
@@ -520,6 +551,10 @@ describe("spinDownWorker", () => {
     vi.restoreAllMocks(); // restore any vi.spyOn (e.g. runtime-store close) so it can't leak between tests
     useProjectStore.setState({ projects: [], selectedProjectId: null });
     useRuntimeStore.setState({ status: {}, openAgentIds: [], branchStatus: {} });
+    // The "a pane could end it" case below deliberately LEAVES `close:<id>` open, so without this
+    // it persists in the module-level map and poisons any later openTraceKinds() assertion — and
+    // the file's current order is the only reason it doesn't already (roborev 60107).
+    __resetTracesForTest();
     killPtyMock.mockReset();
     killPtyMock.mockResolvedValue(undefined);
     removeWsMock.mockReset();
