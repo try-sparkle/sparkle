@@ -103,6 +103,29 @@ describe("remedyStale coalesces per checkout", () => {
     ]);
   });
 
+  // …AND THE THIRD ARM OF THE SAME BRANCH. The wait decides three ways — the poll RESOLVED ok, the
+  // poll RESOLVED a refusal, the poll REJECTED — and an IPC rejection is not the click's answer any
+  // more than a refusal is. Without the rejection handler the click's promise rejects with the
+  // POLL's error, which `runRemedy` stores as `{ ok: false, reason: String(e) }` and the panel
+  // paints in its danger colour: a red failure for a press that never reached the backend at all.
+  it("does NOT let a click inherit the poll's IPC REJECTION either — it takes its own turn", async () => {
+    invoke.mockRejectedValueOnce(new Error("ipc died")).mockResolvedValueOnce(OK);
+
+    const fromPoll = remedyStale("/repos/sparkle", { unattended: true });
+    const fromClick = remedyStale("/repos/sparkle");
+
+    await expect(fromPoll).rejects.toThrow("ipc died");
+    // The press is answered by ITS OWN run, not by the poll's transport failure.
+    await expect(fromClick).resolves.toEqual(OK);
+    expect(invoke).toHaveBeenCalledTimes(2);
+    // …and it still waited rather than racing: the click's call is issued only after the poll's
+    // has settled, under the click's own policy.
+    expect(invoke.mock.calls[1]).toEqual([
+      "repo_stale_remedy",
+      { root: "/repos/sparkle", unattended: false },
+    ]);
+  });
+
   it("carries the unattended flag to the backend, since that is where it is enforced", async () => {
     invoke.mockResolvedValue(OK);
     await remedyStale("/repos/sparkle", { unattended: true });
