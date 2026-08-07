@@ -8,6 +8,7 @@ import {
   APPROVAL_2_1_220,
   ASK_USER_QUESTION_2_1_220,
   MODEL_PICKER_2_1_220,
+  PERSISTENT_CHROME_TAIL_2_1_220,
 } from "./capturedScreens.fixture";
 
 const FOOTER = " Esc to cancel · Tab to amend · ctrl+e to explain";
@@ -132,5 +133,37 @@ describe("streamOffersAnswer — the single-row stream form", () => {
     // The stream form needs only one row, so without the cursor requirement any numbered prose
     // line would arm the approval band for the rest of the turn.
     expect(streamOffersAnswer("  2. Patch it")).toBe(false);
+  });
+});
+
+// THE EXPENSIVE FAILURE MODE, which had no guard until now.
+//
+// This family has narrowed the below-footer vocabulary TWICE — first by a line budget, then by
+// rejecting the status-glyph class — and reverted both, because each rejected a live, fully-visible,
+// pressable picker and cost it the one-tap Approve relay. Both narrowings shipped GREEN: every
+// captured picker ends AT its footer, so nothing exercised a below-footer walk at all, and the two
+// status bars that motivated the reverts live only in a fixture with no picker in it.
+//
+// Composing the two is what makes a third narrowing go red instead of shipping (roborev 59946).
+describe("screenOffersAnswer — a LIVE picker under Claude's real chrome tail", () => {
+  it("accepts the /model picker with the five real persistent rows below its footer", () => {
+    expect(
+      screenOffersAnswer(`${MODEL_PICKER_2_1_220}\n${PERSISTENT_CHROME_TAIL_2_1_220}`),
+    ).toBe(true);
+  });
+
+  it("accepts a CURSOR-LESS permission dialog under that same tail — arm 1 alone", () => {
+    // Strips the selection cursor so arm 2 cannot supply the `true`: whatever answers here read the
+    // below-footer walk. That is the assertion the previous two positives were missing, and its
+    // absence is why both narrowings shipped green.
+    //
+    // The permission dialog, not /model, because its option rows ABUT its footer. /model draws two
+    // description rows between its last option and its footer, so it never satisfies arm 1's
+    // belongs-to-this-footer check at all and leans on the cursor — which is exactly why the case
+    // above is kept too: together they say a real picker qualifies whichever way it is built.
+    const cursorless = APPROVAL_2_1_220.replace(/❯/g, " ");
+    expect(
+      screenOffersAnswer(`${cursorless}\n${PERSISTENT_CHROME_TAIL_2_1_220}`),
+    ).toBe(true);
   });
 });

@@ -139,6 +139,22 @@ export const IDLE_AFTER_TURN_2_1_220 = [
   "  ⏸ manual mode on · ? for shortcuts",
 ].join("\n");
 
+/** The five rows Claude Code's live grid ENDS in, lifted verbatim from the tail of
+ *  {@link IDLE_AFTER_TURN_2_1_220}: a rule, the empty composer caret, a rule, and TWO status bars.
+ *
+ *  Exported because they render below ANY live dialog, which makes them the below-footer input that
+ *  matters — and no captured picker carries them (every one terminates at its own footer), so the
+ *  "live dialog with real chrome under it" case was untestable without composing the two. That gap
+ *  is why the below-footer vocabulary could be narrowed twice, each time rejecting a live pressable
+ *  picker, with the whole suite green both times (roborev 59946). */
+export const PERSISTENT_CHROME_TAIL_2_1_220 = [
+  "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+  "❯ ",
+  "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+  "  ⚠ Transcript saving is off — inherited CLAUDE_CODE_CHILD_SESSION marker · restart with CLAUDE_CODE_FORCE_SESSION_PERS…",
+  "  ⏸ manual mode on · ? for shortcuts",
+].join("\n");
+
 /**
  * Claude Code's SESSION-LIMIT picker — the screen the founder's whole fleet was parked on while
  * every row still read green (PRD/sparkle/claude-account-identity-truth.md §6).
