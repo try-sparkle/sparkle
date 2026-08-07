@@ -1,4 +1,5 @@
 mod accounts;
+mod agent_life;
 mod ai;
 /// The native menu bar. Carries "View → Hide/Show Helper", which is the guaranteed way back for a
 /// dismissed helper island — the menu bar is the one surface that cannot itself be hidden.

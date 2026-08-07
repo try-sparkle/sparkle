@@ -516,7 +516,7 @@ fn hold_instance_lock(app_data: &Path, epoch: &str) {
 /// Errs toward ALIVE on anything ambiguous — the direction that KEEPS a lease rather than stealing
 /// it — but returns `false` when the liveness file is simply absent, because an epoch that never
 /// registered cannot be a sibling of ours and must stay instantly reclaimable (that is rule 1).
-fn epoch_is_alive(app_data: &Path, epoch: &str) -> bool {
+pub(crate) fn epoch_is_alive(app_data: &Path, epoch: &str) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
