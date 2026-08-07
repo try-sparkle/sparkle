@@ -4,6 +4,7 @@
 // (roborev 59613). These pin each arm, in both directions.
 import { describe, it, expect } from "vitest";
 import { screenOffersAnswer, streamOffersAnswer } from "./screenAnswerable";
+import { SELECTION_CURSOR } from "./screenClassifier";
 import {
   APPROVAL_2_1_220,
   ASK_USER_QUESTION_2_1_220,
@@ -161,7 +162,13 @@ describe("screenOffersAnswer — a LIVE picker under Claude's real chrome tail",
     // description rows between its last option and its footer, so it never satisfies arm 1's
     // belongs-to-this-footer check at all and leans on the cursor — which is exactly why the case
     // above is kept too: together they say a real picker qualifies whichever way it is built.
-    const cursorless = APPROVAL_2_1_220.replace(/❯/g, " ");
+    // The WHOLE class, not just one glyph. SELECTION_CURSOR accepts [❯›] because the highlighted-
+    // option glyph drifts between builds — so stripping only `❯` would let a re-captured fixture
+    // keep its cursor, arm 2 would answer, and this case would go on passing while asserting
+    // nothing about the below-footer walk. That is the same silent-degradation hole this whole
+    // commit exists to close, so the premise is ASSERTED rather than assumed.
+    const cursorless = APPROVAL_2_1_220.replace(/[❯›]/g, " ");
+    expect(SELECTION_CURSOR.test(cursorless)).toBe(false);
     expect(
       screenOffersAnswer(`${cursorless}\n${PERSISTENT_CHROME_TAIL_2_1_220}`),
     ).toBe(true);

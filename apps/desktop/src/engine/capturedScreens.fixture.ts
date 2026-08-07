@@ -139,21 +139,22 @@ export const IDLE_AFTER_TURN_2_1_220 = [
   "  ⏸ manual mode on · ? for shortcuts",
 ].join("\n");
 
-/** The five rows Claude Code's live grid ENDS in, lifted verbatim from the tail of
- *  {@link IDLE_AFTER_TURN_2_1_220}: a rule, the empty composer caret, a rule, and TWO status bars.
+/** The five rows Claude Code's live grid ENDS in: a rule, the empty composer caret, a rule, and TWO
+ *  status bars.
  *
- *  Exported because they render below ANY live dialog, which makes them the below-footer input that
- *  matters — and no captured picker carries them (every one terminates at its own footer), so the
- *  "live dialog with real chrome under it" case was untestable without composing the two. That gap
- *  is why the below-footer vocabulary could be narrowed twice, each time rejecting a live pressable
- *  picker, with the whole suite green both times (roborev 59946). */
-export const PERSISTENT_CHROME_TAIL_2_1_220 = [
-  "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-  "❯ ",
-  "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-  "  ⚠ Transcript saving is off — inherited CLAUDE_CODE_CHILD_SESSION marker · restart with CLAUDE_CODE_FORCE_SESSION_PERS…",
-  "  ⏸ manual mode on · ? for shortcuts",
-].join("\n");
+ *  DERIVED from {@link IDLE_AFTER_TURN_2_1_220}, never hand-copied. A copy would claim to be
+ *  "verbatim" while nothing kept it so: this file's stated procedure is to RE-CAPTURE these screens
+ *  when Claude Code's TUI moves, and a re-capture that changed a status bar or a rule width would
+ *  leave the copy behind as SYNTHETIC rows corresponding to no real screen — with the tests that
+ *  depend on it still green against them. That is the same partial-copy-drift failure recorded for
+ *  the below-footer walk itself (roborev 59690), and it would re-create the exact condition that let
+ *  two below-footer narrowings ship green: a guard running on invented chrome.
+ *
+ *  Exported because these rows render below ANY live dialog, while every captured picker terminates
+ *  AT its own footer — so composing the two is the only way to exercise the below-footer walk. */
+export const PERSISTENT_CHROME_TAIL_2_1_220 = IDLE_AFTER_TURN_2_1_220.split("\n")
+  .slice(-5)
+  .join("\n");
 
 /**
  * Claude Code's SESSION-LIMIT picker — the screen the founder's whole fleet was parked on while
