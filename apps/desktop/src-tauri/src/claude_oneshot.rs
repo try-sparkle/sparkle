@@ -1155,24 +1155,191 @@ fn unusable_output_error_from(full: &str, shown: &str, code: Option<i32>, args: 
     // printed it as the CLI's error: the exact leak the synthesized message exists to prevent,
     // reintroduced by the recovery meant to improve it.
     //
-    // BOTH FILTERS, over the STRIPPED lines. Reading `scanned` here threw away the protection that
-    // was already working: `strip_argv_echo` blanks any >=32-char echoed window WHEREVER it sits, so
-    // a line mixing CLI framing with a long echoed run — `  argv: -p <a summarised terminal line>`,
-    // exactly the decorated dump this path names as its failure class — arrives with the echo
-    // already gone. Line-level membership alone cannot do that: it asks whether the WHOLE trimmed
-    // line is inside an argument, so a mixed line fails the test and is emitted raw, echo included.
+    // OVER THE STRIPPED LINES, never `scanned`. Reading `scanned` here threw away the protection
+    // that was already working: `strip_argv_echo` blanks any >=32-char echoed window WHEREVER it
+    // sits, so a line mixing CLI framing with a long echoed run — `  argv: -p <a summarised terminal
+    // line>`, exactly the decorated dump this path names as its failure class — arrives with the
+    // echo already gone. There is no alignment problem: `stripped.lines()` is filtered on its own,
+    // never zipped with `scanned.lines()`, and a blanked span that swallowed newlines only ever
+    // merges non-echoed remnants, so the merge cannot leak.
     //
-    // Membership stays as the second filter because the strip cannot reach a remnant shorter than
-    // one window. There is no alignment problem: `stripped.lines()` is filtered on its own, never
-    // zipped with `scanned.lines()`, and a blanked span that swallowed newlines only ever merges
-    // non-echoed remnants, so the merge cannot leak.
-    let is_ours = |line: &str| {
-        let t = line.trim();
-        !t.is_empty() && args.iter().any(|a| a.chars().count() >= ARGV_ECHO_WINDOW && a.contains(t))
+    // EVIDENCE THE LINE IS THE CLI'S, not "the whole line is ours". An earlier filter asked whether
+    // the WHOLE trimmed line sat inside an argument, which cannot reach a short echoed run that
+    // shares its line with framing — the failure class this path names for itself. A CLI that
+    // decorates each echoed line (`  > ls -la`) produces lines too short for the span strip and
+    // contained in no argument, so every one was kept and joined into a montage of the user's
+    // terminal presented as the CLI's error.
+    //
+    // Inverted: keep a line only if, after its decoration is peeled, it carries a contiguous run
+    // that appears in NO argument. `error: unknown option '--safe-mode'` does; `> psql -c 'x'` does
+    // not, because peeling `> ` leaves text that is entirely ours.
+    //
+    // THE NOVEL RUN MUST SURVIVE DROPPING THE LINE'S FIRST TOKEN, not merely trimming punctuation
+    // off its ends. Edge-trimming alone reads two ordinary decoration shapes as the CLI's own words:
+    //
+    //   TAG-SHAPED — `[stderr] ls -la`, `[12:03:04] kubectl top`. Trimming reaches the `[` but the
+    //   novelty is INSIDE the core: the window straddling the tag's own `] ` (`stderr] ls`) is in no
+    //   argument, so every echoed line looks novel and the whole montage returns.
+    //
+    //   TRAILING — a CLI that wraps the block in quotes or suffixes each line (`|`, a continuation
+    //   backslash) leaves `  > git push -f"`, whose window `t push -f"` is novel only because the
+    //   quote is not in the prompt.
+    //
+    // ONE dropped token is not enough, and the fix is not a bracket grammar. Double tagging is an
+    // ordinary log shape — level plus timestamp, or level plus stream — and
+    // `[stderr] [12:03:04] kubectl top` keeps `12:03:04] ` as its novel window past a single drop,
+    // so it rejoins the montage. An earlier revision of this comment recorded that as an "accepted
+    // loss"; it was the opposite, a live leak described as a degradation, which in this file is the
+    // worse error because the comments are the contract later changes argue from.
+    //
+    // So: PEEL LEADING TOKENS UNTIL THE REMAINDER IS TOO SHORT TO JUDGE, and if ANY remainder along
+    // the way is entirely ours, everything before it was decoration and the line is an echo.
+    // A CLI's real sentence stays novel however far you peel (`error: unknown option '--safe-mode'`
+    // -> `unknown option '--safe-mode` -> `option '--safe-mode`), while an echo reaches a remainder
+    // that is verbatim prompt no matter how many tags precede it.
+    //
+    // The `core` test is the base case and is NOT redundant here: it is what rejects a line whose
+    // remainders are all under `NOVEL_RUN` (`  > ls -la`), which the peel loop alone would keep
+    // vacuously.
+    //
+    // ONLY A MULTI-TOKEN REMAINDER MAY CONDEMN THE LINE. Without that clause the loop over-peels and
+    // takes the arm's FLAGSHIP case with it: `error: unknown option '--strict-mcp-config'` peels to
+    // `strict-mcp-config`, which is a substring of the flag we ourselves passed, so an all-ours
+    // remainder read as proof-of-echo drops the one diagnosis this recovery exists to surface (a CLI
+    // too old for a flag we send). Same for `--no-session-persistence`, `--system-prompt`,
+    // `--output-format`, and for `error: invalid model claude-haiku-4-5`. The decorated fixture
+    // could not catch it: `'--safe-mode'` trims to `safe-mode`, NINE characters, one under the
+    // threshold, so it breaks out of the loop instead of being judged — the only flag in
+    // `build_args` short enough to survive by accident.
+    //
+    // THE CONDEMNATION IS LINE-ANCHORED: a remainder condemns its line only when it EQUALS a whole
+    // line of one of our arguments, decoration trimmed off both sides — never merely because it is a
+    // substring of one. That distinction is the whole filter, and it took four wrong answers to
+    // find:
+    //
+    //   An echoed line is, by construction, a COMPLETE line of the summarised terminal. Whatever
+    //   tags the CLI puts in front of it, what remains after the tags is exactly one of the lines we
+    //   passed — `ls -la`, `kubectl top`, `git push -f`.
+    //
+    //   A real diagnosis that happens to end in our argv ends in an INTERIOR FRAGMENT of it: a flag
+    //   name (`strict-mcp-config`), a model id, or a phrase quoted out of the middle of a line
+    //   (`error: unexpected token near 'timed out while'`). None of those is a whole line of the
+    //   prompt.
+    //
+    // Substring membership cannot tell those apart and kept taking the diagnosis with the echo: it
+    // dropped `error: timed out` whenever the terminal we were summarising happened to contain the
+    // phrase anywhere, and on the long path it dropped any reason quoting a 10-31 char fragment
+    // (anything longer is already blanked by the span strip, so that window is precisely what
+    // reaches here). Line anchoring costs nothing to state and removes both.
+    //
+    // THE MULTI-TOKEN REQUIREMENT SURVIVES THE MOVE TO ANCHORING, and briefly did not — which cost a
+    // regression worth recording. Deleting it looked safe: it had existed only because `safe-mode` is
+    // a SUBSTRING of `--safe-mode`, and no argument has a LINE equal to `safe-mode`. But `args` is
+    // mostly single-token elements, and `a.lines()` on a one-line string yields that string, so
+    // every element is trivially a whole line: the pinned model id, every flag in its unquoted form,
+    // and the value `json` all became condemnations. The quoted forms survived only because trimming
+    // the tail eats its `--` while the argument keeps it. The rule the comment states — an echoed
+    // line is a command line — is a MULTI-TOKEN claim, so the guard is part of it, not scaffolding.
+    //
+    // THREE LOSSES:
+    //
+    //   1. A line whose ENTIRE core is under `NOVEL_RUN` is dropped before the loop runs.
+    //   2. An echoed line whose content is NOT verbatim one of our lines survives — the CLI
+    //      re-wrapped it, or `bounded_scan` cut through it. Anchoring buys its precision by trusting
+    //      that the echo is intact, and a reflowed dump is the case where that is false.
+    //   3. A SINGLE-TOKEN echoed line behind a tag survives — `[warn] make`, `[stderr] /usr/bin/x`.
+    //      The price of the requirement above, and the cheaper side: it leaks one word the user's
+    //      own terminal already showed them, where the other direction deletes the CLI's reason.
+    //      `a_single_token_echoed_line_behind_a_tag_is_a_recorded_leak` PINS it, so this stays a
+    //      decision rather than an oversight — making that test fail is an improvement.
+    //   4. An echoed line whose decoration is SYMMETRIC survives — `[stderr] "kubectl top"`, a wrap
+    //      applied per line rather than around the block. A quotation and a symmetric wrap are the
+    //      same string, so the rule that saves a quoting diagnosis necessarily lets this through.
+    //      Pinned by `a_symmetrically_wrapped_echo_line_is_a_recorded_leak`.
+    //
+    // The loss that used to be recorded here — a terse reason discarded because its tail appeared
+    // somewhere in the prompt — is GONE, and the test that pinned it now asserts the survival. That
+    // is the outcome its own comment asked for. Recording an avoidable loss as unavoidable is the
+    // expensive error in this file, because the next change argues from this paragraph rather than
+    // retrying it: an earlier revision declared "no rule reading only argv membership" could
+    // separate the two shapes and that a tag grammar was the only alternative. Line anchoring is
+    // such a rule, it needs no grammar, and it was sitting one clause away.
+    let novel_run_in = |core: &[char]| {
+        core.len() >= NOVEL_RUN
+            && (0..=(core.len() - NOVEL_RUN)).any(|i| {
+                let run: String = core[i..i + NOVEL_RUN].iter().collect();
+                !args.iter().any(|a| a.contains(&run))
+            })
+    };
+    let has_novel_run = |line: &str| {
+        let decoration = |c: char| !c.is_alphanumeric();
+        let raw = line.trim();
+        let core = raw.trim_matches(decoration);
+        if !novel_run_in(&core.chars().collect::<Vec<_>>()) {
+            return false;
+        }
+        // COMPARED AGAINST THE ARGUMENT LINE AS WE PASSED IT, and the tail in BOTH forms — as it
+        // stands and with its decoration trimmed. Trimming the argument side instead makes
+        // `--strict-mcp-config` equal `strict-mcp-config` and condemns the flag diagnosis all over
+        // again; not trimming the tail side at all misses `  > psql -c 'x'` when the CLI wrapped the
+        // block in quotes. Peeling walks the RAW line for the same reason: taking tokens off the
+        // decoration-trimmed core silently eats a trailing quote that the argument line still has.
+        let is_whole_argv_line = |t: &str| {
+            let bare = t.trim_matches(decoration);
+            // MULTI-TOKEN, on the anchored test too. `args` is mostly SINGLE-token elements and
+            // `a.lines()` on a one-line string yields the string itself, so without this every
+            // element is a "whole line": `error: invalid model claude-haiku-4-5` peels to the model
+            // id we pinned, `error: unknown option --strict-mcp-config` (unquoted) peels to the flag
+            // itself, `error: unsupported output format json` peels to `json`. Each was condemned,
+            // and the quoted forms escaped only because trimming the tail eats its `--` while the
+            // argument keeps it — an accident of leading dashes, not a rule. An echoed terminal line
+            // is a command line; a bare argv element is not.
+            // THE `bare` FALLBACK IS WITHHELD FROM A SYMMETRICALLY QUOTED TAIL. It exists so a
+            // quote-wrapped echo still matches when the wrap is ASYMMETRIC — `  > kubectl top"`
+            // carries one stray quote the prompt line does not have, which is what a wrap AROUND THE
+            // BLOCK leaves on its last line. But the same trimming strips the quotes off a CLI that
+            // QUOTES a short line back at us: `error: cannot parse 'ls -la'` peels to `'ls -la'`,
+            // trims to a prompt line, and the diagnosis is condemned as echo. Asymmetry tells those
+            // apart — decoration is a prefix or a suffix, a quotation closes what it opens — so a
+            // tail that opens and closes with the same non-alphanumeric character must match the
+            // argument line EXACTLY, quotes and all.
+            //
+            // THE COST IS LOSS 4, and it is not closable here: a wrap applied PER LINE
+            // (`[stderr] "kubectl top"`) is symmetric too, so it takes the same exit and survives.
+            // `"kubectl top"` (echo) and `'ls -la'` (diagnosis quoting a line) are the same string
+            // shape; no rule at this level can separate them, so the leak is recorded rather than
+            // traded for the drop.
+            let quoted_both_ends = {
+                let mut cs = t.chars();
+                match (cs.next(), t.chars().last()) {
+                    (Some(a), Some(b)) => a == b && !a.is_alphanumeric() && t.chars().count() > 1,
+                    _ => false,
+                }
+            };
+            t.contains(char::is_whitespace)
+                && args.iter().any(|a| {
+                    a.lines().any(|l| {
+                        let l = l.trim();
+                        l == t || (!quoted_both_ends && !bare.is_empty() && l == bare)
+                    })
+                })
+        };
+        let mut rest = raw;
+        while let Some((_, tail)) = rest.split_once(char::is_whitespace) {
+            let tail = tail.trim();
+            if is_whole_argv_line(tail) {
+                return false;
+            }
+            if tail.trim_matches(decoration).chars().count() < NOVEL_RUN {
+                break;
+            }
+            rest = tail;
+        }
+        true
     };
     let recovered: String = stripped
         .lines()
-        .filter(|l| !l.trim().is_empty() && !is_usage_banner(l) && !is_ours(l))
+        .filter(|l| !l.trim().is_empty() && !is_usage_banner(l) && has_novel_run(l))
         .map(|l| l.trim())
         .collect::<Vec<_>>()
         // JOINED WITH A VISIBLE SEPARATOR, never a bare space. `bounded_scan` puts a newline at the
@@ -1204,6 +1371,13 @@ fn unusable_output_error_from(full: &str, shown: &str, code: Option<i32>, args: 
         format!("ai request failed: claude exited {code:?}: {shown}")
     }
 }
+
+/// The shortest contiguous run that, absent from every argument, marks a line as the CLI's own.
+///
+/// Shorter than `ARGV_ECHO_WINDOW` on purpose: the span strip already removes anything that long,
+/// so what reaches this filter is by definition sub-window. Long enough that a decoration artifact
+/// (`> `, a trailing quote) cannot pass for novel content.
+const NOVEL_RUN: usize = 10;
 
 /// Is this line the CLI's usage banner — our own invocation read back?
 ///
@@ -1803,13 +1977,51 @@ mod tests {
         // abutting a tail starting "limit reached…" fabricates a phrase in neither half. The
         // recovery spans that cut, so joining its lines with a bare space rebuilt the seam and then
         // showed the result to the user as the CLI's own words.
+        //
+        // THE FIXTURE HAS TO REACH THE RECOVERY, and an earlier one did not: it passed a `shown` of
+        // `"clipped"`, which is under `ARGV_ECHO_WINDOW`, so `strip_argv_echo` returned it unchanged,
+        // `echo_found` was false, the function took the plain `{shown}` arm and `recovered` was
+        // computed and thrown away. The assertion below then held of a string that could not have
+        // contained the phrase under ANY separator — green against the bare-space join it exists to
+        // ban. So `shown` is derived the way the call site derives it, from a body whose head really
+        // is an argv dump.
         let half = CLASSIFY_MAX_CHARS / 2;
-        let head = "z".repeat(half - "Claude usage ".chars().count()) + "Claude usage ";
-        let tail = "limit reached".to_string() + &"t".repeat(half - "limit reached".chars().count());
-        let full = format!("{head}{}{tail}", "m".repeat(100));
-        let args = build_args("claude-haiku-4-5", "you are a summariser", "summarise the terminal output above for the reader");
+        let mut echo = String::new();
+        while echo.chars().count() < half {
+            echo.push_str("[agent-9] a summarised terminal line long enough to be stripped. ");
+        }
+        let args = build_args("claude-haiku-4-5", "you are a summariser", &echo);
 
-        let verdict = unusable_output_error_from(&full, "clipped", Some(2), &args);
+        // Head: the usage dump, ending on the CLI's own half-phrase as its own line. Exactly `half`
+        // chars, so `bounded_scan` cuts precisely here.
+        // Both halves are whole CLI sentences, not bare fragments: `has_novel_run` requires a novel
+        // run to survive dropping the line's first token, so a two-word fragment is filtered as
+        // decoration and the fixture would test nothing.
+        let seam_head = "\nError: Claude usage ";
+        let prefix: String = format!("Usage: claude -p {echo}")
+            .chars()
+            .take(half - seam_head.chars().count())
+            .collect();
+        let head = format!("{prefix}{seam_head}");
+        // Tail: the other half-phrase first, then more echo. Also exactly `half` chars.
+        let mut suffix = String::from("limit reached; retry after the reset window\n");
+        while suffix.chars().count() < half {
+            suffix.push_str(&echo);
+        }
+        let tail: String = suffix.chars().take(half).collect();
+        // A middle that is dropped, which is what makes the scan truncate and the seam exist.
+        let full = format!("{head}{}{tail}", "m".repeat(200));
+        assert_eq!(head.chars().count(), half, "the head must land exactly on the cut");
+        assert_eq!(tail.chars().count(), half, "and so must the tail");
+
+        let shown: String = full.chars().take(200).collect();
+        let verdict = unusable_output_error_from(&full, &shown, Some(2), &args);
+
+        // The recovery arm ran — without this the assertion below can pass by not being reached.
+        assert!(
+            verdict.contains("Claude usage") && verdict.contains("limit reached"),
+            "the fixture must reach the recovery and carry BOTH halves: {verdict}"
+        );
         assert!(
             !verdict.contains("Claude usage limit reached"),
             "the recovery re-glued the seam into a phrase present in neither half: {verdict}"
@@ -1838,6 +2050,346 @@ mod tests {
         assert!(
             !verdict.contains("summarised terminal line"),
             "a line mixing framing with an echoed run leaked the user's terminal: {verdict}"
+        );
+    }
+
+    #[test]
+    fn a_decorated_echo_block_is_not_montaged_into_the_message() {
+        // THE SHAPE BOTH EARLIER FILTERS MISSED. The CLI decorates each echoed line (`  > ls -la`)
+        // and wraps the block in quotes, so every line is too SHORT for the span strip and — being
+        // prefixed — contained in no argument, which whole-line membership reads as "not ours" and
+        // keeps. The result was a montage of the user's terminal presented as the CLI's error.
+        //
+        // THE ECHO MUST REACH THE READER THROUGH THE RECOVERY, not through the raw `{shown}` arm.
+        // A first cut decorated EVERY line, including the long one — so the 200-char clamp still
+        // held decorated short lines, `banner_only(shown_stripped)` was false, and the function took
+        // the plain `{shown}` arm without ever building `recovered`. It leaked, but through a
+        // different gate, and this filter was never exercised. So: an UNDECORATED long echoed run
+        // right after the banner (that is what the clamp sees, and it strips to banner-only), with
+        // the decorated block past the clamp where only `recovered` can carry it.
+        let long_line = "a summarised terminal line long enough that the span strip reaches it on its own".repeat(3);
+        // `ls -la` is deliberately UNDER `NOVEL_RUN` (6 chars): the window test cannot reach a tail
+        // that short, so it is what pins the short-tail membership check. The fixture used to stand
+        // on a one-character accident — `psql -c 'x` is exactly 10 and `git push -f` is 11 — and
+        // would have leaked silently had either lost a character.
+        let shorts = ["ls -la", "kubectl top", "psql -c 'x'", "vim notes.md", "git push -f"];
+        let filler = "cd /tmp && tail -f build.log";
+        let prompt = format!("{long_line}\n{filler}\n{}", shorts.join("\n"));
+        let args = build_args("claude-haiku-4-5", "you are a summariser", &prompt);
+        // FIVE DECORATION SHAPES, not one. Each appears in NO argument, so the span strip cannot
+        // reach it and whole-line membership cannot recognise it — but they defeat DIFFERENT parts
+        // of the peel, and a fixture carrying only `  > ` cannot tell "peels punctuation at the
+        // head" from "recognises decoration":
+        //   `  > x`             leading sigil  — edge trimming reaches it
+        //   `  > x"`            trailing quote — `t push -f"` is novel purely because the quote is
+        //                                        not in the prompt
+        //   `[stderr] x`        tag            — novelty is INSIDE the core (`stderr] ls`), which no
+        //                                        edge trim can reach; needs a token dropped
+        //   `  > x |`           trailing pipe  — as the quote, with a suffix instead of a wrapper
+        //   `[stderr] [12:03] x` DOUBLE tag    — survives ONE dropped token (`12:03] kubectl` is
+        //                                        novel), so it pins the peel as a LOOP. Level plus
+        //                                        timestamp is an ordinary log shape, and this was
+        //                                        once mis-recorded in the source as an accepted
+        //                                        loss when it was a live leak.
+        //   `[stderr] ls -la`   tag + SHORT    — the content is under NOVEL_RUN, so the window test
+        //                       content          cannot reach it at all and the loop's short-tail
+        //                                        membership check is the only thing that drops it.
+        //                                        This is the file's own example of the tag leak, and
+        //                                        it was still open while the fixture stood on
+        //                                        `psql -c 'x` being exactly 10 characters.
+        //
+        // THE FIRST DECORATED LINE IS A FILLER, and that is load-bearing rather than padding. The
+        // strip's blanked span reaches one window PAST the end of the long echoed run — the prompt
+        // ends that run with a newline too, so the window `<31 chars>\n` matches — which swallows the
+        // newline and merges the next line into the `Usage:` line. Whatever sits there is therefore
+        // dropped as a banner, by a path that has nothing to do with this filter. The first version
+        // of this fixture put `[stderr] ls -la` there and pinned nothing: removing the short-tail
+        // check entirely left the suite green.
+        let decorated = [
+            format!("  > {}", filler),
+            format!("[stderr] {}", shorts[0]),
+            format!("  > {}\"", shorts[1]),
+            format!("[stderr] {}", shorts[2]),
+            format!("  > {} |", shorts[3]),
+            format!("[stderr] [12:03:04] {}", shorts[4]),
+        ]
+        .join("\n");
+        let full = format!("Usage: claude -p {long_line}\n{decorated}\nerror: unknown option '--safe-mode'");
+        let shown: String = full.chars().take(200).collect();
+        assert!(
+            shown.chars().count() == 200 && !shown.contains("unknown option"),
+            "the clamp must be pure banner-plus-echo, or the recovery is never reached: {shown}"
+        );
+
+        let verdict = unusable_output_error_from(&full, &shown, Some(2), &args);
+        assert!(
+            verdict.contains("unknown option '--safe-mode'"),
+            "the CLI's own reason must survive: {verdict}"
+        );
+        for leaked in ["kubectl", "psql", "git push -f", "vim notes.md", "ls -la"] {
+            assert!(
+                !verdict.contains(leaked),
+                "a decorated echo line leaked the user's terminal ({leaked}): {verdict}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_diagnosis_naming_a_flag_we_passed_is_not_filtered_away_as_echo() {
+        // THE FLAGSHIP CASE OF THIS ARM: a CLI too old for a flag we send. The reason names the flag,
+        // so the line ENDS in our own argv — and a peel that lets any all-ours remainder condemn the
+        // line reads that as proof of echo and discards the one diagnosis worth surfacing.
+        // `--safe-mode` cannot catch this: it trims to `safe-mode`, nine chars, one under NOVEL_RUN,
+        // so it breaks out of the loop rather than being judged. Every longer flag in `build_args`
+        // is exposed, which is why this fixture uses one.
+        let long_line = "a summarised terminal line long enough that the span strip reaches it on its own".repeat(3);
+        let args = build_args("claude-haiku-4-5", "you are a summariser", &long_line);
+        assert!(
+            args.iter().any(|a| a == "--strict-mcp-config"),
+            "the fixture must name a flag we really pass, or it proves nothing"
+        );
+        let full = format!("Usage: claude -p {long_line}\nerror: unknown option '--strict-mcp-config'");
+        let shown: String = full.chars().take(200).collect();
+
+        let verdict = unusable_output_error_from(&full, &shown, Some(2), &args);
+        assert!(
+            verdict.contains("unknown option '--strict-mcp-config'"),
+            "a diagnosis naming our own flag was filtered away as echo: {verdict}"
+        );
+        // THE PERMISSIVE DIRECTION NEEDS ITS OWN GUARD. This is the one fixture arguing for KEEPING
+        // a line, so without a negative assertion a future loosening that keeps the diagnosis AND
+        // rebuilds the montage passes it — the direction that can only fail by leaking would be the
+        // one left unchecked.
+        assert!(
+            !verdict.contains("summarised terminal line"),
+            "the echo reached the reader alongside the diagnosis: {verdict}"
+        );
+    }
+
+    #[test]
+    fn a_reason_ending_in_a_BARE_argv_element_still_reaches_the_reader() {
+        // THE SINGLE-TOKEN DIRECTION, which nothing pinned while a whitespace guard was briefly
+        // deleted. `args` is mostly one-token elements and `a.lines()` on a one-line string yields
+        // that string, so each is trivially a "whole line" — the pinned model id, every flag in its
+        // UNQUOTED form, and the value `json`. The two existing fixtures both use QUOTED flags and
+        // pass by an accident: trimming the tail eats its `--` while the argument keeps it. These
+        // cases have no such escape.
+        let long_line = "a summarised terminal line long enough that the span strip reaches it on its own".repeat(3);
+        let args = build_args("claude-haiku-4-5", "you are a summariser", &long_line);
+        for reason in [
+            "error: invalid model claude-haiku-4-5",
+            "error: unknown option --strict-mcp-config",
+            "error: unsupported output format json",
+        ] {
+            let bare = reason.rsplit(' ').next().unwrap();
+            assert!(
+                args.iter().any(|a| a == bare),
+                "the fixture must end in a REAL argv element, or it proves nothing: {bare}"
+            );
+            let full = format!("Usage: claude -p {long_line}\n{reason}");
+            let shown: String = full.chars().take(200).collect();
+            let verdict = unusable_output_error_from(&full, &shown, Some(2), &args);
+            assert!(
+                verdict.contains(reason),
+                "a diagnosis ending in a bare argv element was condemned as echo: {verdict}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_diagnosis_QUOTING_a_whole_prompt_line_is_not_condemned() {
+        // THE ASYMMETRY RULE. The `bare` fallback exists so a quote-WRAPPED echo still matches
+        // (`  > kubectl top"` carries one stray quote the prompt line does not have) — but it also
+        // strips the quotes off a CLI that QUOTES a short line back at us, which is not an interior
+        // fragment and had been asserted away as impossible. Decoration is a prefix or a suffix; a
+        // quotation closes what it opens.
+        let long_line = "a summarised terminal line long enough that the span strip reaches it on its own".repeat(3);
+        let prompt = format!("{long_line}\nls -la\nkubectl top");
+        let args = build_args("claude-haiku-4-5", "you are a summariser", &prompt);
+        assert!(
+            prompt.lines().any(|l| l.trim() == "ls -la"),
+            "the quoted phrase must be a WHOLE prompt line, or the fallback never fires"
+        );
+        assert!(
+            args.iter().any(|a| a.lines().any(|l| l.trim() == "kubectl top")),
+            "and the guard's line must be one too, or the rule under test never condemns it"
+        );
+        // The filler absorbs the strip's span-merge: the prompt ends its long run with a newline
+        // too, so the window `<31 chars>\n` matches and the next line is pulled into the `Usage:`
+        // line and dropped as a banner. Without it this fixture reds for a reason unrelated to its
+        // name — as it did on first run.
+        let full = format!(
+            "Usage: claude -p {long_line}\n  > cd /tmp\n[stderr] kubectl top\nerror: cannot parse 'ls -la'"
+        );
+        let shown: String = full.chars().take(200).collect();
+        // THE FILLER DEPENDENCY IS ASSERTED, not just described. Declaring it load-bearing in prose
+        // is what the previous commit did, and prose does not fail: delete `  > cd /tmp` and the
+        // span-merge pulls `[stderr] kubectl top` into the `Usage:` line, where the banner test
+        // drops it — the positive assertion still passes, and the negative guard passes BECAUSE the
+        // line never reached the filter. Both green, rule never exercised.
+        assert!(
+            strip_argv_echo(&full, &args)
+                .lines()
+                .any(|l| l.trim() == "[stderr] kubectl top"),
+            "the filler must keep the guard's line out of the merged banner, or both assertions below are vacuous"
+        );
+
+        let verdict = unusable_output_error_from(&full, &shown, Some(2), &args);
+        assert!(
+            verdict.contains("cannot parse 'ls -la'"),
+            "a diagnosis quoting a whole prompt line was condemned as echo: {verdict}"
+        );
+        // THE PERMISSIVE DIRECTION NEEDS ITS OWN GUARD — and this fixture argues for keeping a line
+        // by LOOSENING the condemnation path, so it is exactly the one that must fail if the rule
+        // stops condemning altogether. The guard has to be aimed at a line only THIS rule can drop:
+        // `long_line` is removed by the span strip, and the filler never reaches the filter at all
+        // (the merge described above pulls it into the `Usage:` line, where the banner test drops
+        // it) — so asserting on either would have been another guard no mutation could red. The
+        // `[stderr] kubectl top` line is condemned by the rule under test and nothing else.
+        //
+        // WHICH MAKES THE FILLER LOAD-BEARING FOR THIS GUARD, not decoration: delete it and the
+        // merge eats `[stderr] kubectl top` instead, the rule is never exercised, and BOTH
+        // assertions below pass vacuously.
+        assert!(
+            !verdict.contains("kubectl top"),
+            "the echo reached the reader alongside the diagnosis: {verdict}"
+        );
+        assert!(
+            !verdict.contains("summarised terminal line"),
+            "and the long echoed run must still be gone: {verdict}"
+        );
+    }
+
+    #[test]
+    fn a_symmetrically_wrapped_echo_line_is_a_recorded_leak() {
+        // THIS TEST ASSERTS A LEAK, deliberately — loss 4, and the direct price of the rule that
+        // stops a quoting diagnosis being condemned. A wrap applied PER LINE is symmetric, so
+        // `"kubectl top"` takes the same exit as `'ls -la'`. The two are the same string shape; no
+        // rule at this level can separate them.
+        //
+        // IF YOU MAKE THIS FAIL, that is an improvement: update the assertion deliberately rather
+        // than deleting the test.
+        let long_line = "a summarised terminal line long enough that the span strip reaches it on its own".repeat(3);
+        let prompt = format!("{long_line}\nkubectl top");
+        let args = build_args("claude-haiku-4-5", "you are a summariser", &prompt);
+        // WITHOUT THIS PRECONDITION THE LEAK TEST DISARMS ITSELF SILENTLY: if a prompt edit stops
+        // `kubectl top` being a standalone line, the line is genuinely novel, `contains` still
+        // passes, and the fixture reports green while pinning nothing about the symmetric-quote
+        // exit it exists for.
+        assert!(
+            args.iter().any(|a| a.lines().any(|l| l.trim() == "kubectl top")),
+            "the echoed content must be a WHOLE argument line, or the rule never had a chance to condemn"
+        );
+        let full = format!(
+            "Usage: claude -p {long_line}\n  > cd /tmp\n[stderr] \"kubectl top\"\nerror: unknown option '--safe-mode'"
+        );
+        let shown: String = full.chars().take(200).collect();
+
+        let verdict = unusable_output_error_from(&full, &shown, Some(2), &args);
+        assert!(
+            verdict.contains("unknown option '--safe-mode'"),
+            "the CLI's own reason must still survive: {verdict}"
+        );
+        assert!(
+            verdict.contains("kubectl top"),
+            "the recorded leak no longer happens — good; update this assertion on purpose: {verdict}"
+        );
+    }
+
+    #[test]
+    fn a_single_token_echoed_line_behind_a_tag_is_a_recorded_leak() {
+        // THIS TEST ASSERTS A LEAK, deliberately — the price of requiring a condemning remainder to
+        // be multi-token, which is what stops `error: invalid model claude-haiku-4-5` from being
+        // read as echo. Without a fixture the loss is indistinguishable from an oversight, and this
+        // file's convention is to pin the ones it accepts.
+        //
+        // IF YOU MAKE THIS FAIL, that is an improvement: update the assertion deliberately rather
+        // than deleting the test.
+        let long_line = "a summarised terminal line long enough that the span strip reaches it on its own".repeat(3);
+        let prompt = format!("{long_line}\nmake");
+        let args = build_args("claude-haiku-4-5", "you are a summariser", &prompt);
+        // Same disarm as loss 4's fixture: reflow the prompt and `make` is genuinely novel, so the
+        // line survives for a reason unrelated to the guard whose price this test records.
+        assert!(
+            args.iter().any(|a| a.lines().any(|l| l.trim() == "make")),
+            "the echoed content must be a WHOLE argument line, or the rule never had a chance to condemn"
+        );
+        let full = format!("Usage: claude -p {long_line}\n  > cd /tmp\n[warn] make\nerror: unknown option '--safe-mode'");
+        let shown: String = full.chars().take(200).collect();
+
+        let verdict = unusable_output_error_from(&full, &shown, Some(2), &args);
+        assert!(
+            verdict.contains("unknown option '--safe-mode'"),
+            "the CLI's own reason must still survive: {verdict}"
+        );
+        assert!(
+            verdict.contains("make"),
+            "the recorded leak no longer happens — good; update this assertion on purpose: {verdict}"
+        );
+    }
+
+    #[test]
+    fn a_short_cli_reason_is_not_filtered_away_as_decoration() {
+        // THE OTHER SIDE OF THE PEEL: the recovery arm exists to hand the reader the CLI's own
+        // reason, so a terse one must not degrade to "no recognised failure was found".
+        //
+        // WHAT ACTUALLY SAVES THIS LINE — restated a second time, because the mechanism moved out
+        // from under the comment. It is NOT that the loop breaks early (it does not), and it is no
+        // longer that the prompt omits the phrase (there is no substring test any more): `timed out`
+        // survives because no argument has a LINE equal to it. The sibling below proves the phrase's
+        // presence is now irrelevant by asserting survival with a prompt that contains it.
+        let long_line = "a summarised terminal line long enough that the span strip reaches it on its own".repeat(3);
+        assert!(
+            !long_line.lines().any(|l| l.trim() == "timed out"),
+            "no argument line may EQUAL the tail, which is the only thing that condemns"
+        );
+        let args = build_args("claude-haiku-4-5", "you are a summariser", &long_line);
+        let full = format!("Usage: claude -p {long_line}\nerror: timed out");
+        let shown: String = full.chars().take(200).collect();
+
+        let verdict = unusable_output_error_from(&full, &shown, Some(2), &args);
+        assert!(
+            verdict.contains("error: timed out"),
+            "a terse CLI reason was filtered away as decoration: {verdict}"
+        );
+        assert!(
+            !verdict.contains("summarised terminal line"),
+            "and the echo must still not reach the reader: {verdict}"
+        );
+    }
+
+    #[test]
+    fn a_terse_reason_whose_tail_is_inside_a_prompt_line_survives() {
+        // THIS TEST USED TO ASSERT A LOSS, and the loss is gone — recorded here because its own
+        // comment asked for exactly this: "if you make this pass, that is an improvement; update the
+        // assertion deliberately rather than deleting the test."
+        //
+        // Under substring membership, a reason was discarded whenever the terminal we were
+        // summarising happened to contain its trailing phrase anywhere. The source declared that
+        // unavoidable — "no rule reading only argv membership" could separate an echoed `ls -la`
+        // from a real `timed out`, only a tag grammar could. That was wrong, and the rule was one
+        // clause away: an echoed line is a WHOLE line of the prompt, while a reason's tail is an
+        // interior fragment of one. Anchoring the comparison to whole lines keeps both.
+        //
+        // The prompt here is a single unbroken line CONTAINING `timed out`, so substring membership
+        // condemns and line anchoring does not. That is the whole difference, isolated.
+        let long_line = "curl: operation timed out while summarising the terminal for the reader".repeat(3);
+        assert!(
+            long_line.contains("timed out") && !long_line.lines().any(|l| l.trim() == "timed out"),
+            "the prompt must CONTAIN the tail without having it as a whole line, or nothing is tested"
+        );
+        let args = build_args("claude-haiku-4-5", "you are a summariser", &long_line);
+        let full = format!("Usage: claude -p {long_line}\nerror: timed out");
+        let shown: String = full.chars().take(200).collect();
+
+        let verdict = unusable_output_error_from(&full, &shown, Some(2), &args);
+        assert!(
+            verdict.contains("error: timed out"),
+            "a real reason was discarded because its tail appears mid-line in the prompt: {verdict}"
+        );
+        assert!(
+            !verdict.contains("operation timed out while summarising"),
+            "and the echo itself must still not reach the reader: {verdict}"
         );
     }
 
