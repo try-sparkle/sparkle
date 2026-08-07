@@ -43,6 +43,8 @@ import { useRuntimeStore } from "../stores/runtimeStore";
 import { useConnectionStore } from "../stores/connectionStore";
 import { useCableStore } from "../stores/cableStore";
 import { useUiStore } from "../stores/uiStore";
+import { useBeadsStore } from "../stores/beadsStore";
+import { bucketBeads, type Bead } from "../services/beads";
 import { useDictationStore } from "../stores/dictationStore";
 import { useInboxStore } from "../stores/inboxStore";
 // THE APP'S OWN KEYS AND FLOOR, imported rather than re-spelled. `engine/columnResize` is a true
@@ -1063,6 +1065,44 @@ export function applyVisualFixtures(
     ...(left
       ? { pairAssignment: { [left.project.id]: "left" }, leftProjectId: left.project.id }
       : { pairAssignment: {}, leftProjectId: null }),
+  });
+
+  // ── FEEDBACK BEADS, SO THE FEEDBACK PILL EXISTS TO BE PHOTOGRAPHED AND MEASURED ────────────────
+  //
+  // WHY THIS IS HERE AT ALL. The row's FEEDBACK pill renders only when `feedbackCount > 0`, and that
+  // count is `beads.filter(b => b.labels.includes("agent:<id>")).length`. This fixture seeded NO
+  // beads, so the count was 0 on every row, so the pill was unreachable in every capture and in
+  // `row-narrow-probe`. That made the probe's ONE TAIL PILL check — "no row renders BOTH the
+  // feedback pill and the stage chip", the founder's own requirement that feedback REPLACES
+  // Merged/Saved/Shipped — **vacuously true**: it passed because neither element could appear, not
+  // because the rule held. It is the repo's #1 fleet-wide finding shape, guarding the exact
+  // instruction the founder had to repeat.
+  //
+  // TWO AGENTS, DELIBERATELY, because one cannot separate the two halves of the rule:
+  //   • `vfx-agent-4` is in `pull_request` — a stage that WOULD draw "In PR". It proves the pill
+  //     REPLACES the chip, which a row with no stage chip could never show.
+  //   • `vfx-agent-6` gets several, so the pill renders a multi-digit count and its widest form is
+  //     the one measured. A one-bead pill is the narrowest case and would flatter the layout.
+  // `vfx-agent-1` is left WITHOUT feedback on purpose: the probe needs a control row that still
+  // draws its stage chip, or "feedback replaced it" is indistinguishable from "there was none".
+  const feedbackBead = (id: string, agentId: string, title: string): Bead => ({
+    id,
+    title,
+    description: "Seeded by dev/visualFixtures for the build-row capture and the narrow-row probe.",
+    status: "open",
+    labels: ["agent-feedback", `agent:${agentId}`],
+    priority: 2,
+  });
+  const fixtureBeads: Bead[] = [
+    feedbackBead("vfx-bead-1", "vfx-agent-4", "Row chrome outbids the agent name on a narrow column"),
+    feedbackBead("vfx-bead-2", "vfx-agent-6", "The stage chip repeats its own section heading"),
+    feedbackBead("vfx-bead-3", "vfx-agent-6", "Notice marks need one collapsed affordance"),
+    feedbackBead("vfx-bead-4", "vfx-agent-6", "A clipped mark must never hide what needs you"),
+  ];
+  useBeadsStore.setState({
+    byProject: {
+      [project.id]: { beads: fixtureBeads, board: bucketBeads(fixtureBeads), loadedAt: 0 },
+    },
   });
 
   // `status` is the only live-only key here — it is never persisted, so it must be written on every

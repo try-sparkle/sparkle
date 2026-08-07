@@ -75,15 +75,37 @@ export const rowTitleWeight = (active: boolean) =>
  */
 export const AGENT_NAME_MIN_WIDTH_PX = 64;
 
+/**
+ * THE FLOOR BELOW THE LEGIBILITY CONTRACT, where the name yields to a WARNING rather than the other
+ * way round. Bead sparkle-tyter.
+ *
+ * The 64px floor above is the right answer while a readable name is achievable. Below
+ * `NAME_LEGIBLE_MIN_COLUMN_PX` (220) it stops being: `row-narrow-probe` measured a 120px column
+ * where the floor held its 64px and pushed the row's notice mark clean outside the clip — the name
+ * kept 8 characters nobody could act on, and the amber mark saying something needs you was painted
+ * where nothing is drawn. That is the one outcome this row may never produce (the invariant
+ * `sparkle/agent-5e4caa2c` owns), and the 64px floor was the thing producing it.
+ *
+ * So at those widths the floor drops far enough for the marks to survive. 32px is still ~4
+ * 16px is ~2 characters, which keeps the ORIGINAL bug fixed — the name degrades, it never vanishes — while
+ * ranking a warning above the 5th through 8th letters of a name that is already truncated.
+ */
+export const AGENT_NAME_TIGHT_MIN_WIDTH_PX = 16;
+
 export function FittedAgentName({
   title,
   name,
   color,
   active,
   onDoubleClick,
+  minWidthPx = AGENT_NAME_MIN_WIDTH_PX,
 }: {
   /** The auto-name title to show, or null for legacy/manual agents (falls back to `name`). */
   title: string | null;
+  /** The floor this name may not shrink below. Defaults to `AGENT_NAME_MIN_WIDTH_PX`; the collapsed
+   *  row passes `AGENT_NAME_TIGHT_MIN_WIDTH_PX` on a column too narrow for a readable name, so a
+   *  notice mark is never squeezed out of view by letters nobody can act on. */
+  minWidthPx?: number;
   /** Canonical fallback name. */
   name: string;
   color: string;
@@ -100,7 +122,7 @@ export function FittedAgentName({
       // it to nothing.
       style={{
         flex: 1,
-        minWidth: AGENT_NAME_MIN_WIDTH_PX,
+        minWidth: minWidthPx,
         display: "block",
         overflow: "hidden",
       }}

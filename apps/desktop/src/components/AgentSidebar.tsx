@@ -31,6 +31,8 @@ import {
   FiClock,
   FiAlertOctagon,
   FiInbox,
+  FiMoreHorizontal,
+  FiMessageSquare,
 } from "react-icons/fi";
 import type { IconType } from "react-icons";
 import { C, AGENT_STATUS, FONT_WEIGHT, ON_BRAND_FILL, DANGER, statusInk } from "../theme/colors";
@@ -169,7 +171,13 @@ import { AlertToggleButton } from "./AlertToggleButton";
 import { reconcileWorkMode, type WorkMode } from "../engine/workMode";
 import { PlanBuildToggle } from "./PlanBuildToggle";
 import { StatusDot } from "./StatusDot";
-import { FittedAgentName, AGENT_NAME_FONT_SIZE, rowTitleWeight } from "./FittedAgentName";
+import {
+  FittedAgentName,
+  AGENT_NAME_FONT_SIZE,
+  AGENT_NAME_MIN_WIDTH_PX,
+  AGENT_NAME_TIGHT_MIN_WIDTH_PX,
+  rowTitleWeight,
+} from "./FittedAgentName";
 import { ModelPill } from "./ModelPill";
 import { applyModelToRunningAgent } from "../services/agentModel";
 import { WorkflowLine } from "./WorkflowLine";
@@ -3368,17 +3376,36 @@ function ElapsedTimer({ since, now, color }: { since: number; now: number; color
  * The FEEDBACK pill is deliberately NOT covered by this: it is an action ("open this agent's
  * feedback in Plan"), not a status readout, and the founder asked for it to take this very slot.
  *
- * ══ THIS NUMBER MUST SIT BELOW `BUILD_COLUMN_DEFAULT_WIDTH` (roborev 58758) ═══════════════════
- * It shipped at 260 against a default column of **220**, which is not "hidden when narrow" — it is
- * the chip DELETED for every user until they drag the column wider, which is not what was asked
- * for. The rule is a degradation, so the threshold has to be below the width the app opens at, and
- * `AgentSidebar.rowNotices.test.tsx` asserts exactly that relationship rather than the literal so
- * a later change to either constant cannot quietly re-open it.
+ * ══ IT WENT 260 → 190 → 260, AND THE ROUND TRIP IS THE POINT ══════════════════════════════════
+ * It shipped at 260 against a default column of 220 and was cut to 190 (roborev 58758) on the
+ * reasoning that a threshold above the default width is not "hidden when narrow" but the chip
+ * DELETED for every user until they drag the column wider.
  *
- * 190 ≈ the width at which the row's fixed chrome (dot · timer · glyph slots) plus the name's own
- * `AGENT_NAME_MIN_WIDTH_PX` floor leaves nothing for a pill worth reading.
+ * That reasoning optimised for the CHIP. It is now reversed, on the founder's own evidence, because
+ * it was measured: at 220 — the width the app opens at, the width his screenshot was taken at —
+ * `row-narrow-probe` reads the chip alive and the NAME down to **9 characters**, rendering rows as
+ * "Concierge…" / "Settings d…" / "G." and, at that squeeze, painting the name's own box 269px²
+ * ON TOP of the chip. The founder, seeing it: *"I can't even read the names of the build agents
+ * because of all of the messages."*
+ *
+ * So the ranking that decides this constant is his: **the name wins.** A row exists to say which
+ * agent it belongs to; "Saved" is a status readout, and — the part that makes this cheap — it is a
+ * status readout the row's own SECTION HEADING already carries. Every row under "LOCAL: COMMITTED"
+ * says Saved; every row under "REMOTE: MERGED TO MAIN" says Merged. The chip is the second printing
+ * of a fact three pixels above it, and it was outbidding the one fact nothing else on the row says.
+ *
+ * Nothing is lost that was not already on screen: the section heading carries the stage, and the
+ * expanded card renders the full `WorkflowLine` with its detail sentence.
+ *
+ * `AgentSidebar.rowNotices.test.tsx` pins the RELATIONSHIP rather than the literal — it now asserts
+ * the chip is silent at `BUILD_COLUMN_DEFAULT_WIDTH`, which is the reversal stated as a test, so
+ * moving either constant back re-fails it.
+ *
+ * 260 ≈ the width at which the row's fixed chrome (dot · timer · glyph slots) plus a name long
+ * enough to tell two agents apart (`NAME_MIN_LEGIBLE_CHARS` in row-narrow-probe) leaves room for a
+ * pill worth reading.
  */
-export const STAGE_CHIP_MIN_COLUMN_PX = 190;
+export const STAGE_CHIP_MIN_COLUMN_PX = 260;
 
 /**
  * Does the row draw a stage chip at this COLUMN width?
@@ -3392,6 +3419,52 @@ export const STAGE_CHIP_MIN_COLUMN_PX = 190;
  */
 export function stageChipShows(columnWidthPx: number): boolean {
   return !(columnWidthPx > 0) || columnWidthPx >= STAGE_CHIP_MIN_COLUMN_PX;
+}
+
+/**
+ * The column width at or above which the row draws its notice marks SEPARATELY. Bead sparkle-tyter.
+ *
+ * The founder's rule, verbatim: *"THE NAME WINS. It gets its space first; badges take what is left
+ * and truncate or collapse themselves, never the name. If everything cannot fit, collapse badges
+ * into a single overflow affordance — do NOT clip the name to one letter."*
+ *
+ * Hiding the stage chip alone did not buy that. `row-narrow-probe` measured the remaining row at
+ * 220px: 24px glyph slot + 24px close slot + a 119px name-and-chips box, of which the goal chip,
+ * the warning mark and their gaps took ~34px — leaving the name **9 characters**. The chips are
+ * individually tiny and collectively decisive, which is exactly the case a per-chip width
+ * convention cannot fix and a collapse can.
+ *
+ * ══ WHY A COLLAPSE AND NOT A CLIP ═════════════════════════════════════════════════════════════
+ * The two boxes around these chips now clip (see the row), so an un-collapsed mark at a narrow
+ * width would simply be CUT OFF — silently. That is the one failure this row may never have:
+ * `sparkle/agent-5e4caa2c` owns the invariant that no surface may hide a row that needs the
+ * founder, and a warning mark scrolled out of a hidden-overflow box is precisely that. Collapsing
+ * keeps the signal ON the row at a fixed, always-affordable width, and the collapsed mark carries
+ * the WORST ink it stands for — so a row with something escalated still reads red at any width.
+ *
+ * ══ WHY IT MATCHES `STAGE_CHIP_MIN_COLUMN_PX` ═════════════════════════════════════════════════
+ * Same number, and deliberately the same one rather than a second knob: both answer "is this
+ * column wide enough to spend pixels on something other than the name". Two thresholds would drift,
+ * and there is no width at which the right answer differs between them.
+ */
+export const NOTICE_CLUSTER_MIN_COLUMN_PX = STAGE_CHIP_MIN_COLUMN_PX;
+
+/**
+ * Does the row collapse its notice cluster into one overflow mark at this COLUMN width?
+ *
+ * Pure and exported for the same reason `stageChipShows` is: jsdom has no layout engine, so a test
+ * that rendered the row and measured would read 0 for every width and pass vacuously. The component
+ * measures; this decides.
+ *
+ * 0 means "not measured yet" and takes the WIDE form, matching `stageChipShows` — booting into the
+ * collapsed state and expanding a frame later is a visible flicker on every row at once.
+ *
+ * ONE mark never collapses. An overflow affordance standing for a single mark is strictly worse
+ * than the mark: same width, less meaning, one more click to read it.
+ */
+export function noticeClusterCollapses(columnWidthPx: number, markCount: number): boolean {
+  if (!(columnWidthPx > 0)) return false;
+  return markCount > 1 && columnWidthPx < NOTICE_CLUSTER_MIN_COLUMN_PX;
 }
 
 function StageChip({
@@ -4597,6 +4670,67 @@ const AgentRow = memo(function AgentRow({
     );
   });
 
+  // ── THE COLLAPSED CLUSTER — one affordance standing for the goal chip AND every notice mark ────
+  //
+  // See `noticeClusterCollapses` for why this exists. Two properties matter and both are load
+  // bearing:
+  //
+  //   IT CARRIES THE WORST INK IT STANDS FOR. A row whose goal was escalated, or whose warning
+  //   class is escalated, still reads DANGER when collapsed. Collapsing must never downgrade a row
+  //   the founder owes into a calm-looking one — that is the invariant `sparkle/agent-5e4caa2c`
+  //   owns, and it is the reason this is a summary rather than a truncation.
+  //
+  //   IT OPENS WHAT IT HID. Same gesture as an individual mark (mount + reveal the pill), targeting
+  //   the most actionable notice — `rowGlyphsFor` orders its marks that way, so the head is the
+  //   right one; the goal is the fallback when the cluster is goal-plus-nothing-severe.
+  const clusterMarkCount = noticeMarks.length + (goalBadge ? 1 : 0);
+  const clusterCollapsed = noticeClusterCollapses(columnWidth ?? 0, clusterMarkCount);
+  const clusterEscalated =
+    goalBadge?.escalated === true || noticeMarks.some((m) => m.glyph === "escalated");
+  const clusterLeadNoticeId =
+    noticeMarks[0]?.leadNoticeId ?? (goalBadge ? `goal:${goalBadge.state}` : null);
+  const collapsedClusterEl =
+    clusterCollapsed && clusterLeadNoticeId !== null ? (
+      <span
+        data-testid="row-notice-overflow"
+        data-notice-count={clusterMarkCount}
+        data-notice-escalated={clusterEscalated ? "true" : "false"}
+        role="button"
+        tabIndex={0}
+        // EVERY label it stands for, one per line — the same no-mount reading path the individual
+        // marks offer, so collapsing costs a hover rather than the information.
+        title={`${[
+          ...(goalBadge ? [`Goal — ${goalBadge.label}`] : []),
+          ...noticeMarks.map((m) => m.title),
+        ].join("\n\n")}\n\nClick to open on the composer`}
+        aria-label={`${clusterMarkCount} notices on this agent — open on the composer`}
+        onClick={(e) => {
+          e.stopPropagation();
+          openNoticePill(clusterLeadNoticeId);
+        }}
+        onKeyDown={(e) => {
+          if (e.key !== "Enter" && e.key !== " ") return;
+          e.stopPropagation();
+          e.preventDefault();
+          openNoticePill(clusterLeadNoticeId);
+        }}
+        style={{
+          display: "inline-flex",
+          alignItems: "center",
+          gap: 2,
+          flex: "0 0 auto",
+          lineHeight: 1.4,
+          fontSize: 10,
+          fontWeight: FONT_WEIGHT.semibold,
+          cursor: "pointer",
+          color: clusterEscalated ? DANGER : C.amberInk,
+        }}
+      >
+        <FiMoreHorizontal size={10} style={{ flex: "0 0 auto" }} />
+        {clusterMarkCount}
+      </span>
+    ) : null;
+
   // RETAINED BUT NO LONGER RENDERED ON THE COLLAPSED ROW — the expanded CARD still uses it (see
   // `stallChip &&` further down), where there is room for the sentence and no name to crowd out.
   const stallChipEl = stallChip ? (
@@ -4824,7 +4958,24 @@ const AgentRow = memo(function AgentRow({
           cursor: "pointer",
         }}
       >
-        {`FEEDBACK ${feedbackCount}`}
+        {/* THE WORD GOES ON A NARROW COLUMN; THE PILL DOES NOT. Bead sparkle-tyter.
+             "FEEDBACK 18" is ~70px of a 183px row — by far the widest thing in the tail, wider
+             than the stage chip it replaces. Measured with the fixture finally seeding beads,
+             `row-narrow-probe` found it starving the name back to 9 characters on exactly the rows
+             that have feedback, and pushing the row's warning mark clean outside the clip — a
+             notice hidden, which is the one outcome this row may never produce.
+             Hiding the pill is not the answer: it is the ACTIONABLE thing in that slot and the
+             founder asked for it there. So it degrades like everything else on this row — the
+             glyph and the count survive (a count is the part that cannot be inferred), the word is
+             what goes, and the full label stays on the hover title. */}
+        {stageChipShows(columnWidth ?? 0) ? (
+          `FEEDBACK ${feedbackCount}`
+        ) : (
+          <>
+            <FiMessageSquare size={10} style={{ flex: "0 0 auto" }} />
+            {feedbackCount}
+          </>
+        )}
       </span>
     ) : null;
 
@@ -5008,16 +5159,71 @@ const AgentRow = memo(function AgentRow({
             // column — so the thin progress line below spans under the timer too, not just the name.
             // gap:8 matches the glyph↔content spacing; the name+pin sub-row keeps its tighter gap:4.
             // Fixed to the glyph-slot height so the title line aligns with the glyph.
-            <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0, height: GLYPH_SLOT_H }}>
-              {lastTouchAt != null && (
+            //
+            // `overflow: hidden` for the same reason the name+chips box inside it carries one, and
+            // it has to be BOTH. This box's siblings include the trailing × slot, so when it is
+            // squeezed its children paint over the CLOSE CONTROL instead — `row-narrow-probe`
+            // measured the name overlapping [×] by 273px² at a 160px column. Clipping only the
+            // inner box moved the collision up a level rather than ending it, which is the shape
+            // every previous pass at this row got wrong: a fix verified where it was looked for.
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                minWidth: 0,
+                overflow: "hidden",
+                height: GLYPH_SLOT_H,
+              }}
+            >
+              {/* THE TIMER IS THE THIRD AND LAST THING TO YIELD, under the same rule as the stage
+                  chip and the × — chrome gives way to the name when the column is narrow, and the
+                  expanded card (which renders this same timer) is where it goes.
+                  It is here because it was measured, not guessed: with the fixture finally seeding
+                  feedback beads, `row-narrow-probe` found the worst 220px row fully packed —
+                  24px disc + 18px timer + a name PINNED AT ITS 64px FLOOR + an 18px collapsed mark
+                  + a 28px feedback pill = 182 of 183px. Nothing was overlapping and nothing was
+                  hidden; there was simply no slack left, so the name could not reach a readable
+                  length while the timer held its 26px (with gap). "24m" is metadata — how long
+                  since the last prompt — while the name is what the row is FOR. */}
+              {lastTouchAt != null && stageChipShows(columnWidth ?? 0) && (
                 <ElapsedTimer since={lastTouchAt} now={clockNow} color={metaColor} />
               )}
-              <div style={{ flex: 1, display: "flex", alignItems: "center", gap: 4, minWidth: 0 }}>
+              {/* `overflow: hidden` IS THE ANTI-OVERLAP FIX, and it is structural rather than a
+                  tuning. This container is `minWidth: 0` ("shrink me first") while its children are
+                  `flex: 0 0 auto` chips plus a name carrying a hard `AGENT_NAME_MIN_WIDTH_PX`
+                  floor — a min-content width this box is routinely squeezed below. With visible
+                  overflow the children simply PAINT PAST its right edge, over the stage chip that
+                  follows: `row-narrow-probe` measured the name's box overlapping "Unsaved" by
+                  269px² at the default 220px column, which is the two-labels-in-one-place the
+                  founder photographed (FEEDBACK 3 and Looping painted in the same pixels).
+                  Clipping here cannot be re-opened by the next chip anyone adds, which a
+                  bounded-width convention on each chip can. It is paired with the collapse below —
+                  clipping ALONE would silently swallow a mark that says something needs him, and
+                  hiding that is the one thing this row may never do. */}
+              <div
+                style={{
+                  flex: 1,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 4,
+                  minWidth: 0,
+                  overflow: "hidden",
+                }}
+              >
                 <FittedAgentName
                   title={autoTitle}
                   name={a.name}
                   color={nameColor}
                   active={isActive}
+                  // Below the width where a readable name is achievable, the floor drops so a
+                  // notice mark is never pushed out of the clip by letters nobody can act on.
+                  // See AGENT_NAME_TIGHT_MIN_WIDTH_PX.
+                  minWidthPx={
+                    stageChipShows(columnWidth ?? 0)
+                      ? AGENT_NAME_MIN_WIDTH_PX
+                      : AGENT_NAME_TIGHT_MIN_WIDTH_PX
+                  }
                   onDoubleClick={(e) => {
                     e.stopPropagation();
                     setEditing(a.id);
@@ -5031,9 +5237,19 @@ const AgentRow = memo(function AgentRow({
                     (bead sparkle-zm0c8). Renders nothing when the queue is empty. */}
                 <AgentInboxBadge agentId={a.id} />
                 {unjudgedAskChip}
-                {/* The never-idle overlay leads the metadata chips: it is the one thing on a calm
-                    row that changes what you do about it. See the chip definitions above. */}
-                {goalChipEl}
+                {/* THE NAME WINS, so on a narrow column the goal chip and the notice marks fold
+                    into ONE affordance instead of each taking a slot — see
+                    `noticeClusterCollapses`. Wide, they render separately exactly as before; this
+                    is a degradation, not a removal, and the collapsed mark keeps the worst ink and
+                    every label it stands for. */}
+                {clusterCollapsed ? (
+                  collapsedClusterEl
+                ) : (
+                  <>
+                    {/* The never-idle overlay leads the metadata chips: it is the one thing on a
+                        calm row that changes what you do about it. See the chip definitions
+                        above. */}
+                    {goalChipEl}
                 {/* ONE WORDLESS MARK PER NOTICE CLASS, replacing the stall and thrash chips that
                     used to render their labels here and squeeze the name to zero (bead
                     sparkle-tyter — see `noticeMarksEl`). The words live on the hover and in the
@@ -5056,7 +5272,9 @@ const AgentRow = memo(function AgentRow({
                     That leaves the collapsed row at three icon slots (goal · warnings · mailbox),
                     plus the rare cloud mark and one right-hand pill — the budget he asked for:
                     "one, two, or maybe three max". */}
-                {noticeMarksEl}
+                    {noticeMarksEl}
+                  </>
+                )}
                 {cloudChip}
               </div>
               {/* `.stg` — LAST before the close slot, exactly as the mock orders the row
@@ -5139,7 +5357,19 @@ const AgentRow = memo(function AgentRow({
             put (nothing shifts, and the column is still scannable straight down) and the close
             control is still one click away on the row it applies to. Fixed-height like the glyph
             slot so it can't drive the row's height. */}
-        {(expanded || isActive) && (
+        {/* ON A NARROW COLUMN THE COLLAPSED ROW GIVES THIS SLOT BACK TO THE NAME, and it is the
+            single largest thing left that can be given back: the slot plus its gap is 32px of a
+            183px row — `row-narrow-probe` measured the active row's name at 66px (9 characters)
+            with it, and 98px (13) without, against every other row in the column already passing.
+            It was the last reason the founder's own row — the one he is working in — stayed the
+            least readable one on screen.
+
+            NOT A REMOVAL: `expanded` still renders it, and the expanded card is one hover away on
+            the very row this drops it from. That is the same trade the stage chip and the epic pill
+            already take (`STAGE_CHIP_MIN_COLUMN_PX`, `epicPill`), so the column has ONE rule —
+            chrome yields to the name when the column is narrow, and the card is where it goes —
+            rather than a third convention. Wide columns are untouched. */}
+        {(expanded || (isActive && stageChipShows(columnWidth ?? 0))) && (
           <div
             style={{
               flex: "0 0 auto",

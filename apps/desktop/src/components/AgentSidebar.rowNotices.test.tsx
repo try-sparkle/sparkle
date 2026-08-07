@@ -52,7 +52,13 @@ vi.mock("../services/branchStatus", () => ({
   landAgentBranch: vi.fn(() => Promise.resolve({ ok: true })),
 }));
 
-import { AgentSidebar, stageChipShows, STAGE_CHIP_MIN_COLUMN_PX } from "./AgentSidebar";
+import {
+  AgentSidebar,
+  stageChipShows,
+  STAGE_CHIP_MIN_COLUMN_PX,
+  noticeClusterCollapses,
+  NOTICE_CLUSTER_MIN_COLUMN_PX,
+} from "./AgentSidebar";
 import { AGENT_NAME_MIN_WIDTH_PX } from "./FittedAgentName";
 import { BUILD_COLUMN_DEFAULT_WIDTH } from "../engine/columnResize";
 import { THRASH_VERDICT_LABEL } from "./rowAttention";
@@ -482,19 +488,52 @@ describe("stageChipShows — the narrow-column rule, as a pure predicate", () =>
     expect(stageChipShows(600)).toBe(true);
   });
 
-  it("SHOWS THE CHIP AT THE WIDTH THE APP ACTUALLY OPENS AT", () => {
-    // ══ THE FINDING THIS PINS (roborev 58758) ═══════════════════════════════════════════════
-    // The threshold shipped at 260 against a default column of 220, so the chip was not "hidden on
-    // a narrow column" — it was gone for every user on every row until they dragged the column
-    // wider. Nothing caught it: jsdom delivers no ResizeObserver callback, so `columnWidth` stays 0
-    // and every other chip test in the repo takes the unmeasured-is-wide branch and never reads the
-    // threshold at all.
+  it("IS SILENT AT THE WIDTH THE APP ACTUALLY OPENS AT — the name outranks the chip", () => {
+    // ══ THIS ASSERTION IS THE REVERSE OF WHAT IT USED TO BE, DELIBERATELY ════════════════════
+    // It previously read `expect(stageChipShows(BUILD_COLUMN_DEFAULT_WIDTH)).toBe(true)`, pinning
+    // roborev 58758's rule that the threshold must sit BELOW the default width so the chip is not
+    // "deleted for every user until they drag the column wider".
     //
-    // Asserted as a RELATIONSHIP against the real constant, not as a literal, so it keeps failing if
-    // either number moves — a literal `expect(stageChipShows(220)).toBe(true)` would go stale the
-    // moment the default column width changed and would pin nothing.
-    expect(stageChipShows(BUILD_COLUMN_DEFAULT_WIDTH)).toBe(true);
-    expect(STAGE_CHIP_MIN_COLUMN_PX).toBeLessThan(BUILD_COLUMN_DEFAULT_WIDTH);
+    // That rule optimised for the chip, and it was reversed on the founder's own evidence once the
+    // row could finally be MEASURED. `scripts/visual/row-narrow-probe.mjs` reads the real column in
+    // real Chrome at exactly this width and found the chip alive while the agent's NAME was down to
+    // 9 characters — rows reading "Concierge…" / "G." / "F" — and, at that squeeze, the name's own
+    // box painting 269px² ON TOP of the chip. His instruction: *"THE NAME WINS. It gets its space
+    // first; badges take what is left and truncate or collapse themselves, never the name."*
+    //
+    // Nothing is lost that was not already on screen: every row under "LOCAL: COMMITTED" says
+    // Saved and every row under "REMOTE: MERGED TO MAIN" says Merged, so the chip was the second
+    // printing of a fact its own section heading carries three pixels above it — while the name is
+    // the one fact nothing else on the row says at all.
+    //
+    // Still a RELATIONSHIP against the real constants rather than a literal, so it keeps failing if
+    // either number moves; only the DIRECTION of the relationship changed.
+    expect(stageChipShows(BUILD_COLUMN_DEFAULT_WIDTH)).toBe(false);
+    expect(STAGE_CHIP_MIN_COLUMN_PX).toBeGreaterThan(BUILD_COLUMN_DEFAULT_WIDTH);
+  });
+
+  // ── THE COLLAPSE ─────────────────────────────────────────────────────────────────────────────
+  // The other half of "the name wins": hiding the stage chip alone still left the name at 9
+  // characters, because the goal chip and the warning marks are individually tiny and collectively
+  // decisive. These pin the DECISION; `scripts/visual/row-narrow-probe.mjs` is what can observe the
+  // resulting geometry, since jsdom cannot measure a flex line at all.
+  it("collapses the notice cluster on a narrow column, and not on a wide one", () => {
+    expect(noticeClusterCollapses(NOTICE_CLUSTER_MIN_COLUMN_PX - 1, 2)).toBe(true);
+    expect(noticeClusterCollapses(NOTICE_CLUSTER_MIN_COLUMN_PX, 2)).toBe(false);
+    expect(noticeClusterCollapses(600, 5)).toBe(false);
+  });
+
+  it("NEVER collapses a single mark — an overflow affordance for one mark is strictly worse", () => {
+    // Same width, less meaning, one more click to read it. This is the assertion that stops the
+    // collapse from being applied blindly to every narrow row.
+    expect(noticeClusterCollapses(NOTICE_CLUSTER_MIN_COLUMN_PX - 1, 1)).toBe(false);
+    expect(noticeClusterCollapses(NOTICE_CLUSTER_MIN_COLUMN_PX - 1, 0)).toBe(false);
+  });
+
+  it("treats NOT-YET-MEASURED as wide, so booting does not flicker every row at once (collapse too)", () => {
+    // Same convention as `stageChipShows`, and it has to be: booting into the COLLAPSED state and
+    // expanding a frame later is a visible flicker on every row in the column at once.
+    expect(noticeClusterCollapses(0, 3)).toBe(false);
   });
 
   it("treats NOT-YET-MEASURED as wide, so booting does not flicker every row at once", () => {
