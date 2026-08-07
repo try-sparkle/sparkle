@@ -248,6 +248,33 @@ describe("a live blocker is pinned above the composer, not threaded", () => {
     expect(cardAgentIds()).toEqual([]);
   });
 
+  it("mints a receipt for the NEXT block, once the acknowledged one is over", () => {
+    // ROBOREV 60209. Acknowledging suppresses the resolved-episode ledger for that agent — correct,
+    // an acknowledged red is not a resolved one — but the suppression is keyed on the acknowledged
+    // RECORD, so it has to end when the record does. Filtering the chip away at render left the
+    // suppression standing with nothing left to clear it: the agent could block again, genuinely
+    // resolve, and never earn a receipt, for that episode or any after it. This is the full round
+    // trip the finding said nothing covered.
+    const p = projectOf("p1", "sparkle-desktop", [tab("solo")]);
+    const { rerender } = render(<ConciergeHost feed={feedFrom([p], { solo: "waiting" })} />);
+    fireEvent.click(screen.getByTestId("concierge-nudge-dismiss"));
+    rerender(<ConciergeHost feed={feedFrom([p], { solo: "idle" })} />);
+    expect(screen.queryAllByTestId(PINNED_BLOCKER_CHIP_TESTID)).toHaveLength(1);
+
+    // It gets going again — the record is dropped, chip and suppression together.
+    rerender(<ConciergeHost feed={feedFrom([p], { solo: "working" })} />);
+    expect(screen.queryAllByTestId(PINNED_BLOCKER_CHIP_TESTID)).toEqual([]);
+
+    // A genuinely NEW block, and this one is never acknowledged.
+    rerender(<ConciergeHost feed={feedFrom([p], { solo: "waiting" })} />);
+    expect(cardAgentIds()).toEqual(["solo"]);
+
+    // It clears on its own — and THIS one earns its receipt.
+    rerender(<ConciergeHost feed={feedFrom([p], { solo: "working" })} />);
+    expect(cardAgentIds()).toEqual([]);
+    expect(resolvedCardAgentIds()).toEqual(["solo"]);
+  });
+
   it("takes the acknowledged chip away when the reader MUTES that agent", () => {
     // ROBOREV 60158-M2. The chips were filtered only by fleet membership, unlike both neighbouring
     // populations — so a reader who acknowledged a blocker and then asked not to hear about that

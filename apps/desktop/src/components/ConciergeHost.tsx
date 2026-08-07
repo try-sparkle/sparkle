@@ -1129,6 +1129,31 @@ export function ConciergeHost({
   // SHOULD be forgotten on remount — a blocker acknowledged an hour ago deserves to speak up again
   // in a fresh session.
   const [acknowledged, setAcknowledged] = useState<readonly ConciergeNudge[]>([]);
+  // AND THE RECORD IS DROPPED ONCE THE AGENT HAS DEMONSTRABLY MOVED ON (roborev 60209).
+  //
+  // This has to prune the STATE, not the rendered list. `acknowledgedIds` is derived from this array
+  // and is what stops `noteCardsShown` opening a resolved episode — so a chip filtered away at
+  // render left the SUPPRESSION standing with nothing left to clear it: the agent could block again,
+  // genuinely resolve, and never earn a receipt, for that episode or any later one.
+  //
+  // `working` AND NOTHING ELSE. Deliberately not "left the red band", which is the one-render lag
+  // that re-opens the false-receipt bug: acknowledging de-escalates the published status, so the
+  // agent reads `idle`/`stopped` the instant the reader clicks, and pruning on that would drop the
+  // record before it has done its job. `working` is positive evidence of movement — the same
+  // standard `engine/movementRetraction` holds a stale red to — and it cannot be produced by the
+  // acknowledgement itself. An agent that leaves the fleet goes too; its chip would be a dead end.
+  //
+  // In an EFFECT rather than the view-model memo: this is a write, and a memo that sets state during
+  // render is the loop that pattern is famous for. Guarded on a real change for the same reason.
+  useEffect(() => {
+    setAcknowledged((prev) => {
+      const next = prev.filter((a) => {
+        const now = allAgents(feed).find((x) => x.id === a.id);
+        return now !== undefined && now.status !== "working";
+      });
+      return next.length === prev.length ? prev : next;
+    });
+  }, [feed]);
   // Agents seen WORKING during the current away stretch — the recap's evidence that a finish was
   // real rather than an overlay repopulating (services/conciergeRecap.buildRecap sawWorking,
   // roborev 53669-M). Accumulated here because this effect is the only thing that observes the
@@ -5804,37 +5829,17 @@ export function ConciergeHost({
     // NOT ALSO IN THE STREAM. Rendering both would put one agent's blocker on screen twice, and the
     // scrolling copy is the one that goes stale — the precise bug this move exists to end.
     const pinnedBlockers = nudges;
-    // ACKNOWLEDGED CHIPS, PRUNED THREE WAYS (roborev 60158-H1/M2). A chip asserts "BLOCKED" on the
-    // one surface in this column that CANNOT be scrolled away from, so a stale one is worse here
-    // than the inline card this feature replaced — which is the whole thing the move exists to end.
+    // ACKNOWLEDGED CHIPS — MUTE AND SCOPE ONLY, because those are the two CURRENT-VIEW facts and a
+    // current-view fact may only ever HIDE (roborev 59945-M2 established this for the receipts; the
+    // same rule holds here). Unmute or unpin and the chip is back.
     //
-    //   • GONE FROM THE FLEET — a dead-end chip naming an agent the reader can no longer open. Same
-    //     rule `resolvedNudges` applies to its receipts, for the same reason.
-    //   • MUTED or OUT OF SCOPE — the same `eligible` gate the receipts use. Acknowledging then
-    //     muting must not leave the silenced agent pinned above the composer, and a pin means
-    //     "disregard other projects" for chips as much as for anything else.
-    //   • MOVED ON — the fix for the chip that never left. It could only be dropped when the agent
-    //     left the fleet or went red again, so an agent that simply got UNBLOCKED kept a permanent
-    //     "BLOCKED … (acknowledged)" claim.
-    //
-    // THAT LAST ONE CANNOT BE `stillRed`, which is the obvious reading and is exactly backwards:
-    // acknowledging is WHAT removes the agent from `stillRed` (`withDismissedAlerts` de-escalates
-    // the published status), so filtering on it would delete every chip the instant it was created
-    // and break the founder's "never vanishes". The signal that survives is the de-escalated status
-    // itself: `alertDismissal.deEscalatedStatus` maps a red to `idle`/`stopped`, so while the block
-    // stands the agent reads as one of those, and the moment it genuinely resumes it reads
-    // `working` — and the chip goes.
-    //
-    // KNOWN RESIDUAL, stated rather than hidden: an acknowledged agent that finishes and comes to
-    // REST at `idle` is indistinguishable here from one still suppressed, so it keeps its chip until
-    // the reader clears it or it leaves the fleet. That is one click and it never hides anything —
-    // the failure being fixed was a chip that survived the agent visibly working again.
-    const liveAcknowledged = acknowledged.filter((a) => {
-      const now = everyone.find((x) => x.id === a.id);
-      if (now === undefined) return false;
-      if (eligible.get(a.id) !== true) return false;
-      return now.status === "idle" || now.status === "stopped";
-    });
+    // "THE AGENT MOVED ON" IS NOT FILTERED HERE — it prunes the STATE, in the effect below, and the
+    // difference is the whole of roborev 60209. Filtering it at render made the chip disappear while
+    // `acknowledgedIds` (derived from the raw state) went on suppressing `noteCardsShown` forever:
+    // the agent could never open a resolved episode again, and the escape hatch — clearing the chip
+    // — was gone with the chip. A display filter cannot express "this is over"; only removing the
+    // record can.
+    const liveAcknowledged = acknowledged.filter((a) => eligible.get(a.id) === true);
     // Order the whole stream by WHEN EACH ITEM FIRST APPEARED, not by what kind it is. Concatenated
     // as [chat, digests] only to tie-break items that arrive in the SAME tick; anything already
     // placed keeps its slot (see engine/conciergeStreamOrder for why assign-once matters).
