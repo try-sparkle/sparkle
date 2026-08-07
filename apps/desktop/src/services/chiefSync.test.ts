@@ -262,7 +262,7 @@ describe("syncProjectMarkdown — current-state, content-hash, delete-and-replac
           ...pbase,
           chiefProjectId: undefined,
           docState: {},
-          claimedChiefProjectIds: ["project_theirs"],
+          claimLibrary: (pid: string) => pid !== "project_theirs",
         }),
       ).rejects.toThrow(ChiefLibraryClaimedError);
 
@@ -282,11 +282,54 @@ describe("syncProjectMarkdown — current-state, content-hash, delete-and-replac
           chiefProjectId: "project_shared",
           // A ledger the other project also writes — exactly the state the sweep would act on.
           docState: { "PRD/gone.md": { hash: "h", assetId: "asset_theirs" } },
-          claimedChiefProjectIds: ["project_shared"],
+          claimLibrary: (pid: string) => pid !== "project_shared",
         }),
       ).rejects.toThrow(ChiefLibraryClaimedError);
 
       expect(deleteAsset).not.toHaveBeenCalled();
+    });
+
+    it("reconciles against the ledger for the RESOLVED library, not the caller's pre-await guess", async () => {
+      // An unlinked project can only pass `{}` — the id is not known until `ensureChiefProject`
+      // returns. That matters because a removed project's link and ledger are never pruned, so
+      // re-adding the same folder name-matches straight back onto its library. Sweeping that with
+      // an empty ledger deletes nothing and then OVERWRITES the ledger wholesale, stranding every
+      // doc that changed while the project was gone with no record that could ever delete it.
+      invoke.mockResolvedValue({ headSha: "h", files: [{ path: "PRD/a.md", content: "# v1" }] });
+      ensureChiefProject.mockResolvedValue("project_inherited"); // matched by NAME
+      uploadAsset.mockResolvedValue({ assetId: "asset_new", alreadyExists: false });
+
+      const res = await syncProjectMarkdown({
+        ...pbase,
+        chiefProjectId: undefined,
+        docState: {},
+        resolveDocState: (pid: string) =>
+          pid === "project_inherited"
+            ? { "PRD/gone.md": { hash: "h", assetId: "asset_stale" } }
+            : ({} as Record<string, { hash: string; assetId: string }>),
+      });
+
+      // The side effect that matters: the inherited library's vanished doc is actually deleted.
+      expect(deleteAsset).toHaveBeenCalledWith("pat_test", "project_inherited", "asset_stale");
+      expect(res?.deletedAssetIds).toEqual(["asset_stale"]);
+      expect(res?.docState).toEqual({
+        "PRD/a.md": { hash: hashContent("# v1"), assetId: "asset_new" },
+      });
+    });
+
+    it("the resolved ledger also drives the hash SKIP, so an inherited doc is not re-uploaded", async () => {
+      invoke.mockResolvedValue({ headSha: "h", files: [{ path: "PRD/a.md", content: "keep" }] });
+      ensureChiefProject.mockResolvedValue("project_inherited");
+
+      const res = await syncProjectMarkdown({
+        ...pbase,
+        chiefProjectId: undefined,
+        docState: {},
+        resolveDocState: () => ({ "PRD/a.md": { hash: hashContent("keep"), assetId: "asset_a" } }),
+      });
+
+      expect(uploadAsset).not.toHaveBeenCalled();
+      expect(res?.docState).toEqual({ "PRD/a.md": { hash: hashContent("keep"), assetId: "asset_a" } });
     });
 
     it("syncs normally when the claimed set holds only OTHER libraries", async () => {
@@ -297,7 +340,7 @@ describe("syncProjectMarkdown — current-state, content-hash, delete-and-replac
       const res = await syncProjectMarkdown({
         ...pbase,
         docState: {},
-        claimedChiefProjectIds: ["project_elsewhere"],
+        claimLibrary: (pid: string) => pid !== "project_elsewhere",
       });
 
       expect(res?.uploaded).toEqual(["PRD/a.md"]);

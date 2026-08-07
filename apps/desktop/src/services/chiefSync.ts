@@ -50,10 +50,27 @@ export interface ProjectSyncParams {
   /** Current per-path ledger for this Chief project (path -> {hash, assetId}). */
   docState: Record<string, ChiefDocState>;
   /**
-   * Chief project ids that OTHER Sparkle projects already sync into. Resolving onto one of these
-   * aborts the run before a single byte moves — see `ChiefLibraryClaimedError`.
+   * Reserve the resolved library for this project, returning false if another Sparkle project
+   * holds it. Called once, immediately after the id resolves and BEFORE a single byte moves; a
+   * false return aborts the run with `ChiefLibraryClaimedError`.
+   *
+   * A CALLBACK rather than a precomputed id list because the answer must be decided ATOMICALLY
+   * against live store state at this instant — the id is only known after an `await`, and a list
+   * snapshotted before it cannot see a project that claimed the same library in the meantime.
    */
-  claimedChiefProjectIds?: readonly string[];
+  claimLibrary?: (chiefProjectId: string) => boolean;
+  /**
+   * Re-read the ledger for the library that was actually RESOLVED, replacing `docState` when given.
+   *
+   * `docState` has to be chosen before the call, when all the caller knows is the link it already
+   * had — so an UNLINKED project always passes `{}`, even when a ledger for the resolved library is
+   * sitting in the store. That happens for real: a removed project's link and ledger are never
+   * pruned, so re-adding the same folder name-matches straight back onto its library. Sweeping it
+   * with an empty ledger deletes nothing, re-uploads everything, and then overwrites the ledger
+   * wholesale — losing the asset ids of every doc that changed while the project was gone, which
+   * strands them in the library with no record that can ever delete them.
+   */
+  resolveDocState?: (chiefProjectId: string) => Record<string, ChiefDocState>;
 }
 
 /**
@@ -91,7 +108,6 @@ export interface ProjectSyncResult {
  */
 export async function syncProjectMarkdown(params: ProjectSyncParams): Promise<ProjectSyncResult | null> {
   const { pat, sparkleProjectId, projectName, agentId, chiefProjectId, docState } = params;
-  const claimed = params.claimedChiefProjectIds ?? [];
   if (!pat) return null;
 
   const change = await invoke<MarkdownSince>("markdown_changed_since", {
@@ -107,11 +123,14 @@ export async function syncProjectMarkdown(params: ProjectSyncParams): Promise<Pr
   }
 
   const pid = await ensureChiefProject(pat, projectName, chiefProjectId);
-  // Checked on EVERY run, not just when the id was freshly discovered: `ensureChiefProject` name-
+  // Claimed on EVERY run, not just when the id was freshly discovered: `ensureChiefProject` name-
   // matches whenever nothing is linked, so an unlinked project silently lands on a library another
   // Sparkle project already owns — and persisted state from before this guard can already hold the
   // sharing outright. Both are equally destructive, and both are caught before the first upload.
-  if (claimed.includes(pid)) throw new ChiefLibraryClaimedError(pid);
+  if (params.claimLibrary && !params.claimLibrary(pid)) throw new ChiefLibraryClaimedError(pid);
+  // Everything below reconciles against the ledger for the id we actually LANDED on, which is not
+  // necessarily the one the caller could name before the await — see `resolveDocState`.
+  const ledger = params.resolveDocState ? params.resolveDocState(pid) : docState;
 
   // Library health check: a ledger hash match normally skips a path, but that trusts that the
   // recorded asset actually holds bytes. A failed run can leave a 1-byte reservation whose md5
@@ -140,7 +159,7 @@ export async function syncProjectMarkdown(params: ProjectSyncParams): Promise<Pr
   for (const f of change.files) {
     currentPaths.add(f.path);
     const hash = hashContent(f.content);
-    const prev = docState[f.path];
+    const prev = ledger[f.path];
     const prevStuck = prev?.assetId ? stuckIds?.has(prev.assetId) === true : false;
     if (prev && prev.hash === hash && !prevStuck) {
       next[f.path] = prev; // unchanged and verifiably (or presumably) live — keep the asset
@@ -166,7 +185,7 @@ export async function syncProjectMarkdown(params: ProjectSyncParams): Promise<Pr
   // crashed between the DELETE landing and docState persisting). Throwing would wedge the
   // sync forever on the same 404: the entry is dropped from `next` either way, so a live
   // leftover is caught by a later sweep once it looks stuck, or lingers harmlessly if real.
-  for (const [path, st] of Object.entries(docState)) {
+  for (const [path, st] of Object.entries(ledger)) {
     if (!currentPaths.has(path) && st.assetId) {
       try {
         await deleteAsset(pat, pid, st.assetId);

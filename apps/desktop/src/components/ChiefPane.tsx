@@ -163,8 +163,9 @@ export function ChiefPane() {
                 onChange={(e) => {
                   const next = e.target.value;
                   const before = useSettingsStore.getState().chiefProjectByProject[p.id];
-                  if (next === "") unlink(p.id);
-                  else relink(p.id, next);
+                  const liveIds = projects.map((x) => x.id);
+                  if (next === "") unlink(p.id, liveIds);
+                  else relink(p.id, next, liveIds);
                   // ONLY when the link actually moved. Both actions can refuse — relink rejects a
                   // library another project owns — and clearing on a refusal would erase a real
                   // `project_gone` record and replace it with an honest-looking zero-state that is
@@ -195,7 +196,14 @@ export function ChiefPane() {
                   // mutually destructive under the current-state model (each project deletes the
                   // other's docs every round). Marked here so the store's refusal is never a
                   // silent no-op on an option the UI offered.
-                  const owner = chiefLibraryOwner(links, cp.project_id, p.id);
+                  // Live ids only: a link left behind by a REMOVED project owns nothing, and
+                  // disabling its library would strand it with no in-app way back.
+                  const owner = chiefLibraryOwner(
+                    links,
+                    cp.project_id,
+                    p.id,
+                    projects.map((x) => x.id),
+                  );
                   const ownerName = owner
                     ? (projects.find((x) => x.id === owner)?.name ?? "another project")
                     : null;

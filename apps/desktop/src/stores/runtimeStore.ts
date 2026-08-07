@@ -221,11 +221,27 @@ export async function runChiefSync(projectId: string, agentId: string): Promise<
       // The picker refuses to CREATE this sharing, but that only covers the deliberate path.
       // `ensureChiefProject` name-matches whenever nothing is linked, so an unlinked project can
       // land on a library another Sparkle project owns with no user action at all — and older
-      // persisted state can already hold the sharing. Handing the claimed set down lets the sync
-      // abort before its current-state sweep deletes the other project's documents.
-      claimedChiefProjectIds: Object.entries(settings.chiefProjectByProject)
-        .filter(([sparkleId]) => sparkleId !== projectId)
-        .map(([, chiefId]) => chiefId),
+      // persisted state can already hold the sharing. This RESERVES the resolved library before
+      // the sweep can delete the other project's documents.
+      //
+      // Both stores are re-read HERE rather than reused from the snapshot at the top of this
+      // function: the id is only known after an await, and a decision made from a stale read is
+      // exactly the race this replaced. Live project ids are required because a link belonging to
+      // a REMOVED project owns nothing — counting one would let a ghost block its library forever.
+      claimLibrary: (pid) =>
+        useSettingsStore
+          .getState()
+          .claimChiefLibrary(
+            projectId,
+            pid,
+            useProjectStore.getState().projects.map((p) => p.id),
+          ),
+      // The ledger above is the best guess available BEFORE the id resolves, and for an unlinked
+      // project that guess is always `{}`. Re-read it for the id actually landed on so a project
+      // that inherits an existing library (a removed project's link and ledger are never pruned,
+      // so re-adding the same folder name-matches right back onto it) reconciles against what is
+      // really there instead of overwriting the record of it.
+      resolveDocState: (pid) => useSettingsStore.getState().chiefDocStateByProject[pid] ?? {},
     });
     syncBackoff.delete(projectId); // round-trip succeeded → endpoint healthy, reset backoff
     if (!res) {

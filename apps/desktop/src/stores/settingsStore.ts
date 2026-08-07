@@ -288,14 +288,28 @@ export function effectiveChiefPat(keychain: string, stored: string, runtime = ""
  *
  * Exported so the picker can mark those options rather than letting the store refuse a choice the
  * UI presented as available — a silent no-op is the worst of both.
+ *
+ * `liveProjectIds` is REQUIRED, and passing the wrong thing here is the whole bug this parameter
+ * exists to prevent. `chiefProjectByProject` is persisted and is NOT pruned by every path that can
+ * destroy a project, so it accumulates entries for projects that no longer exist. Counting one of
+ * those as an owner makes a ghost claim its library FOREVER: closing a project and re-adding the
+ * same folder mints a new id, `ensureChiefProject` name-matches back onto the old library, and the
+ * claim check then refuses every sync against an owner the UI cannot even name — with no in-app
+ * remedy, because the picker disables the option too. Ownership is only meaningful for a project
+ * that still exists.
  */
 export function chiefLibraryOwner(
   links: Record<string, string>,
   chiefProjectId: string,
   exceptSparkleProjectId: string,
+  liveProjectIds: Iterable<string>,
 ): string | null {
+  const live = liveProjectIds instanceof Set ? liveProjectIds : new Set(liveProjectIds);
   for (const [sparkleId, chiefId] of Object.entries(links)) {
-    if (chiefId === chiefProjectId && sparkleId !== exceptSparkleProjectId) return sparkleId;
+    if (chiefId !== chiefProjectId) continue;
+    if (sparkleId === exceptSparkleProjectId) continue;
+    if (!live.has(sparkleId)) continue; // ghost link from a removed project — owns nothing
+    return sparkleId;
   }
   return null;
 }
@@ -304,8 +318,9 @@ function isChiefLibraryClaimed(
   links: Record<string, string>,
   chiefProjectId: string,
   exceptSparkleProjectId: string,
+  liveProjectIds: Iterable<string>,
 ): boolean {
-  return chiefLibraryOwner(links, chiefProjectId, exceptSparkleProjectId) !== null;
+  return chiefLibraryOwner(links, chiefProjectId, exceptSparkleProjectId, liveProjectIds) !== null;
 }
 
 /**
@@ -322,9 +337,10 @@ function dropLedgerIfUnused(
   s: { chiefProjectByProject: Record<string, string>; chiefDocStateByProject: Record<string, Record<string, ChiefDocState>> },
   movingSparkleProjectId: string,
   previous: string | undefined,
+  liveProjectIds: Iterable<string>,
 ): Record<string, Record<string, ChiefDocState>> {
   if (!previous) return s.chiefDocStateByProject;
-  if (isChiefLibraryClaimed(s.chiefProjectByProject, previous, movingSparkleProjectId)) {
+  if (isChiefLibraryClaimed(s.chiefProjectByProject, previous, movingSparkleProjectId, liveProjectIds)) {
     return s.chiefDocStateByProject; // someone else still needs it
   }
   const { [previous]: _dropped, ...rest } = s.chiefDocStateByProject;
@@ -624,9 +640,23 @@ interface SettingsState {
   setChiefProjectDocState: (chiefProjectId: string, map: Record<string, ChiefDocState>) => void;
   clearChiefDocState: (chiefProjectId: string) => void;
   /** Point a Sparkle project at a DIFFERENT Chief project, dropping the outgoing ledger. */
-  relinkChiefProject: (sparkleProjectId: string, chiefProjectId: string) => void;
+  relinkChiefProject: (
+    sparkleProjectId: string,
+    chiefProjectId: string,
+    liveProjectIds: Iterable<string>,
+  ) => void;
   /** Forget the link entirely, so the next sync resolves one by name (or creates it). */
-  unlinkChiefProject: (sparkleProjectId: string) => void;
+  unlinkChiefProject: (sparkleProjectId: string, liveProjectIds: Iterable<string>) => void;
+  /**
+   * Atomically RESERVE `chiefProjectId` for `sparkleProjectId`, or refuse. Returns whether it now
+   * holds the link. The check and the write happen in one `set`, which is what a plain read-then-
+   * check cannot do — see the doc on the implementation.
+   */
+  claimChiefLibrary: (
+    sparkleProjectId: string,
+    chiefProjectId: string,
+    liveProjectIds: Iterable<string>,
+  ) => boolean;
   setMaxConcurrentWorkers: (n: number) => void;
   setCloudDictation: (on: boolean) => void;
   /** Toggle auto-apply of desktop updates (the "Automatically apply updates" checkbox). */
@@ -898,7 +928,7 @@ export const useSettingsStore = create<SettingsState>()(
        * A no-op when the target is already the current link, so a stray click cannot throw away a
        * healthy ledger and force a full re-reconcile.
        */
-      relinkChiefProject: (sparkleProjectId, chiefProjectId) =>
+      relinkChiefProject: (sparkleProjectId, chiefProjectId, liveProjectIds) =>
         set((s) => {
           const previous = s.chiefProjectByProject[sparkleProjectId];
           if (previous === chiefProjectId) return {};
@@ -910,7 +940,14 @@ export const useSettingsStore = create<SettingsState>()(
           // each other's documents every round — the "Think agent sees half the picture" failure
           // this pane exists to cure, except now with data loss. See `chiefLibraryOwner`, which
           // the picker uses to mark these options so the refusal is never a surprise.
-          if (isChiefLibraryClaimed(s.chiefProjectByProject, chiefProjectId, sparkleProjectId)) {
+          if (
+            isChiefLibraryClaimed(
+              s.chiefProjectByProject,
+              chiefProjectId,
+              sparkleProjectId,
+              liveProjectIds,
+            )
+          ) {
             return {};
           }
           return {
@@ -918,7 +955,7 @@ export const useSettingsStore = create<SettingsState>()(
               ...s.chiefProjectByProject,
               [sparkleProjectId]: chiefProjectId,
             },
-            chiefDocStateByProject: dropLedgerIfUnused(s, sparkleProjectId, previous),
+            chiefDocStateByProject: dropLedgerIfUnused(s, sparkleProjectId, previous, liveProjectIds),
           };
         }),
 
@@ -931,16 +968,58 @@ export const useSettingsStore = create<SettingsState>()(
        * precisely to stop that recreation from happening behind the user's back — here the user is
        * asking for it.
        */
-      unlinkChiefProject: (sparkleProjectId) =>
+      unlinkChiefProject: (sparkleProjectId, liveProjectIds) =>
         set((s) => {
           const previous = s.chiefProjectByProject[sparkleProjectId];
           if (!previous) return {};
           const { [sparkleProjectId]: _unlinked, ...links } = s.chiefProjectByProject;
           return {
             chiefProjectByProject: links,
-            chiefDocStateByProject: dropLedgerIfUnused(s, sparkleProjectId, previous),
+            chiefDocStateByProject: dropLedgerIfUnused(s, sparkleProjectId, previous, liveProjectIds),
           };
         }),
+
+      claimChiefLibrary: (sparkleProjectId, chiefProjectId, liveProjectIds) => {
+        // ATOMIC, and that is the entire point. The previous version of this guard read the store
+        // at the top of runChiefSync, resolved the library over an `await`, and only then compared
+        // — so two projects with NO persisted link (first sync, or both freshly unlinked) each
+        // computed an EMPTY claimed set, each name-matched onto the same library, and each passed.
+        // That established exactly the mutually-destructive sharing the guard exists to prevent,
+        // and it is the likeliest way to reach it: two same-named projects, no user action, two
+        // debounced syncs in one tick. Deciding and writing inside a single `set` closes the
+        // window, because nothing else can interleave between them.
+        let held = false;
+        set((s) => {
+          // ANOTHER project's claim is tested FIRST, ahead of the "we already hold it" shortcut,
+          // and the order is load-bearing. Persisted state can hold the sharing OUTRIGHT — two
+          // live projects whose links both name this library, from before this guard existed, or
+          // because a `project_gone` link neither project dropped got re-pointed onto it. If
+          // "already ours" answered first, BOTH projects would pass their claim and each sweep
+          // would delete the other's documents: exactly the mutual destruction this refuses.
+          // Refusing both parks them at `library_claimed` until a human re-points one, which is
+          // the only non-lossy answer available.
+          if (
+            isChiefLibraryClaimed(
+              s.chiefProjectByProject,
+              chiefProjectId,
+              sparkleProjectId,
+              liveProjectIds,
+            )
+          ) {
+            held = false;
+            return {};
+          }
+          held = true;
+          if (s.chiefProjectByProject[sparkleProjectId] === chiefProjectId) return {}; // already ours
+          return {
+            chiefProjectByProject: {
+              ...s.chiefProjectByProject,
+              [sparkleProjectId]: chiefProjectId,
+            },
+          };
+        });
+        return held;
+      },
 
       setMaxConcurrentWorkers: (n) => set({ maxConcurrentWorkers: Math.max(1, Math.floor(n)) }),
 

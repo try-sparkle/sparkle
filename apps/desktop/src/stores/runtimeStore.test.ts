@@ -797,11 +797,11 @@ describe("runChiefSync — the silent returns are now distinguishable (sparkle-o
   // The picker refuses to CREATE a shared library, but that only guards the deliberate path.
   // `ensureChiefProject` name-matches whenever nothing is linked, so the sync can land on another
   // project's library with no user action — which is where the actual data loss would happen.
-  it("hands the sync every OTHER project's library, and not its own", async () => {
+  it("hands the sync a claim callback that refuses ANOTHER live project's library", async () => {
     const { runtime, settings, projects, projectId, agentId } = await setup("build");
     const other = projects.useProjectStore.getState().addProject("other", "/root/other");
     settings.useSettingsStore.setState({
-      chiefProjectByProject: { [projectId]: "project_mine", [other]: "project_theirs" },
+      chiefProjectByProject: { [other]: "project_theirs" },
     });
     syncProjectMarkdown.mockResolvedValue({
       chiefProjectId: "project_mine",
@@ -812,9 +812,67 @@ describe("runChiefSync — the silent returns are now distinguishable (sparkle-o
 
     await runtime.runChiefSync(projectId, agentId);
 
-    const passed = syncProjectMarkdown.mock.calls[0]![0] as { claimedChiefProjectIds: string[] };
-    // Including its own id would make every healthy project refuse to sync at all.
-    expect(passed.claimedChiefProjectIds).toEqual(["project_theirs"]);
+    const passed = syncProjectMarkdown.mock.calls[0]![0] as {
+      claimLibrary: (pid: string) => boolean;
+    };
+    // Someone else's live library is refused...
+    expect(passed.claimLibrary("project_theirs")).toBe(false);
+    // ...an unowned one is taken, and taking it IS the persistence (no separate write to race).
+    expect(passed.claimLibrary("project_mine")).toBe(true);
+    expect(settings.useSettingsStore.getState().chiefProjectByProject[projectId]).toBe(
+      "project_mine",
+    );
+  });
+
+  it("the claim ignores a link left behind by a REMOVED project", async () => {
+    // The ghost would otherwise hold its library forever, with no in-app way back: the picker
+    // disables the option and names an owner that no longer exists.
+    const { runtime, settings, projectId, agentId } = await setup("build");
+    settings.useSettingsStore.setState({
+      chiefProjectByProject: { "ghost-project-id": "project_ghosted" },
+    });
+    syncProjectMarkdown.mockResolvedValue({
+      chiefProjectId: "project_ghosted",
+      docState: {},
+      uploaded: [],
+      deletedAssetIds: [],
+    });
+
+    await runtime.runChiefSync(projectId, agentId);
+
+    const passed = syncProjectMarkdown.mock.calls[0]![0] as {
+      claimLibrary: (pid: string) => boolean;
+    };
+    expect(passed.claimLibrary("project_ghosted")).toBe(true);
+  });
+
+  it("resolves the ledger for the library the sync actually LANDS on", async () => {
+    // The `docState` argument is chosen before the id is known, so an unlinked project can only
+    // pass `{}` — and the ghost path above makes inheriting a library with an existing ledger a
+    // routine outcome, not a curiosity. Reading it back for the resolved id is what stops the run
+    // from re-uploading everything and then overwriting the record of what is already there.
+    const { runtime, settings, projectId, agentId } = await setup("build");
+    const inherited = { "PRD/gone.md": { hash: "h", assetId: "asset_stale" } };
+    settings.useSettingsStore.setState({
+      chiefProjectByProject: {},
+      chiefDocStateByProject: { project_ghosted: inherited },
+    });
+    syncProjectMarkdown.mockResolvedValue({
+      chiefProjectId: "project_ghosted",
+      docState: {},
+      uploaded: [],
+      deletedAssetIds: [],
+    });
+
+    await runtime.runChiefSync(projectId, agentId);
+
+    const passed = syncProjectMarkdown.mock.calls[0]![0] as {
+      docState: Record<string, unknown>;
+      resolveDocState: (pid: string) => Record<string, unknown>;
+    };
+    expect(passed.docState).toEqual({}); // nothing better was knowable up front
+    expect(passed.resolveDocState("project_ghosted")).toEqual(inherited);
+    expect(passed.resolveDocState("project_never_seen")).toEqual({});
   });
 
   it("records library_claimed — a REFUSAL, with no liveness probe and no failure count", async () => {

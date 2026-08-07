@@ -4,6 +4,7 @@ import {
   aiFeatureMode,
   migrateSettings,
   useSettingsStore,
+  chiefLibraryOwner,
   enforcedWorkerCap,
   concurrencyBasis,
   AI_FEATURE_FIELD,
@@ -1009,6 +1010,11 @@ describe("1Password setters", () => {
   });
 });
 
+// Every Sparkle project id these cases use. Ownership is only meaningful for a project that still
+// EXISTS: `chiefProjectByProject` is persisted and outlives removed projects, so a ghost entry must
+// not be able to claim a library. Passing the live set explicitly is what enforces that.
+const LIVE = ["a", "b", "fresh", "sparkle-proj", "never-linked"];
+
 // sparkle-ojgvp. Until this, `setChiefProject` had exactly one caller — inside runChiefSync — so a
 // link could never be re-pointed from anywhere in the app. Each case asserts the LEDGER's fate as
 // well as the link's, because carrying a ledger across a re-link is the failure these actions
@@ -1029,7 +1035,7 @@ describe("relink / unlink a project's Chief library (sparkle-ojgvp)", () => {
       { chief_old: { "PRD/a.md": { hash: "h", assetId: "asset_in_old_library" } } },
     );
 
-    s().relinkChiefProject("sparkle-proj", "chief_new");
+    s().relinkChiefProject("sparkle-proj", "chief_new", LIVE);
 
     expect(s().chiefProjectByProject["sparkle-proj"]).toBe("chief_new");
     // Holding asset ids from the old library would make the next run skip uploads whose hash
@@ -1043,7 +1049,7 @@ describe("relink / unlink a project's Chief library (sparkle-ojgvp)", () => {
       { chief_a: { "PRD/a.md": { hash: "h", assetId: "x" } }, chief_b: { "PRD/b.md": { hash: "h", assetId: "y" } } },
     );
 
-    s().relinkChiefProject("a", "chief_new");
+    s().relinkChiefProject("a", "chief_new", LIVE);
 
     expect(s().chiefDocStateByProject["chief_b"]).toEqual({ "PRD/b.md": { hash: "h", assetId: "y" } });
     expect(s().chiefProjectByProject["b"]).toBe("chief_b");
@@ -1053,7 +1059,7 @@ describe("relink / unlink a project's Chief library (sparkle-ojgvp)", () => {
     const ledger = { "PRD/a.md": { hash: "h", assetId: "x" } };
     seed({ a: "chief_a" }, { chief_a: ledger });
 
-    s().relinkChiefProject("a", "chief_a");
+    s().relinkChiefProject("a", "chief_a", LIVE);
 
     // A stray click must not throw away a healthy ledger and force a full re-reconcile.
     expect(s().chiefDocStateByProject["chief_a"]).toEqual(ledger);
@@ -1062,7 +1068,7 @@ describe("relink / unlink a project's Chief library (sparkle-ojgvp)", () => {
   it("re-links a project that had no link yet, without disturbing any ledger", () => {
     seed({}, { chief_other: { "PRD/x.md": { hash: "h", assetId: "z" } } });
 
-    s().relinkChiefProject("fresh", "chief_new");
+    s().relinkChiefProject("fresh", "chief_new", LIVE);
 
     expect(s().chiefProjectByProject["fresh"]).toBe("chief_new");
     expect(s().chiefDocStateByProject["chief_other"]).toBeDefined();
@@ -1071,7 +1077,7 @@ describe("relink / unlink a project's Chief library (sparkle-ojgvp)", () => {
   it("unlink forgets both the link and its ledger", () => {
     seed({ a: "chief_a" }, { chief_a: { "PRD/a.md": { hash: "h", assetId: "x" } } });
 
-    s().unlinkChiefProject("a");
+    s().unlinkChiefProject("a", LIVE);
 
     expect(s().chiefProjectByProject["a"]).toBeUndefined();
     expect(s().chiefDocStateByProject["chief_a"]).toBeUndefined();
@@ -1080,7 +1086,7 @@ describe("relink / unlink a project's Chief library (sparkle-ojgvp)", () => {
   it("unlink is a no-op for a project that was never linked", () => {
     seed({ b: "chief_b" }, { chief_b: { "PRD/b.md": { hash: "h", assetId: "y" } } });
 
-    s().unlinkChiefProject("never-linked");
+    s().unlinkChiefProject("never-linked", LIVE);
 
     expect(s().chiefProjectByProject["b"]).toBe("chief_b");
     expect(s().chiefDocStateByProject["chief_b"]).toBeDefined();
@@ -1100,7 +1106,7 @@ describe("two Sparkle projects, one Chief library (sparkle-ojgvp)", () => {
   it("REFUSES to link a library another project already syncs into", () => {
     useSettingsStore.setState({ chiefProjectByProject: { b: "chief_shared" } });
 
-    s().relinkChiefProject("a", "chief_shared");
+    s().relinkChiefProject("a", "chief_shared", LIVE);
 
     // Sharing is mutually destructive, not merely redundant: syncProjectMarkdown treats the ledger
     // as the complete desired state for the one worktree it read, so each project would delete the
@@ -1111,7 +1117,7 @@ describe("two Sparkle projects, one Chief library (sparkle-ojgvp)", () => {
 
   it("still allows re-selecting the library THIS project already owns", () => {
     useSettingsStore.setState({ chiefProjectByProject: { a: "chief_a" } });
-    s().relinkChiefProject("a", "chief_a");
+    s().relinkChiefProject("a", "chief_a", LIVE);
     expect(s().chiefProjectByProject["a"]).toBe("chief_a");
   });
 
@@ -1124,7 +1130,7 @@ describe("two Sparkle projects, one Chief library (sparkle-ojgvp)", () => {
       chiefDocStateByProject: { chief_shared: shared },
     });
 
-    s().relinkChiefProject("a", "chief_new");
+    s().relinkChiefProject("a", "chief_new", LIVE);
 
     // Dropping it would strip B of every recorded assetId: its stale docs could never be deleted
     // (orphans forever) and it would re-upload its whole tree.
@@ -1139,7 +1145,7 @@ describe("two Sparkle projects, one Chief library (sparkle-ojgvp)", () => {
       chiefDocStateByProject: { chief_shared: shared },
     });
 
-    s().unlinkChiefProject("a");
+    s().unlinkChiefProject("a", LIVE);
 
     expect(s().chiefDocStateByProject["chief_shared"]).toEqual(shared);
     expect(s().chiefProjectByProject["b"]).toBe("chief_shared");
@@ -1151,9 +1157,75 @@ describe("two Sparkle projects, one Chief library (sparkle-ojgvp)", () => {
       chiefDocStateByProject: { chief_shared: { "PRD/a.md": { hash: "h", assetId: "x" } } },
     });
 
-    s().unlinkChiefProject("a");
+    s().unlinkChiefProject("a", LIVE);
     expect(s().chiefDocStateByProject["chief_shared"]).toBeDefined(); // b still there
-    s().unlinkChiefProject("b");
+    s().unlinkChiefProject("b", LIVE);
     expect(s().chiefDocStateByProject["chief_shared"]).toBeUndefined();
+  });
+});
+
+// The two bugs roborev found in the anti-sharing guard itself (job 59752).
+describe("claimChiefLibrary — atomic, and blind to ghosts (sparkle-ojgvp)", () => {
+  const s = () => useSettingsStore.getState();
+
+  beforeEach(() =>
+    useSettingsStore.setState({ chiefProjectByProject: {}, chiefDocStateByProject: {} }),
+  );
+
+  it("a link left by a REMOVED project owns nothing", () => {
+    // HIGH. chiefProjectByProject is persisted and is not pruned on every project-destruction
+    // path, so it accumulates ghosts. Counting one as an owner is unrecoverable in-app: close a
+    // project, re-add the same folder (new id, same name), ensureChiefProject name-matches back,
+    // and every sync is refused against an owner the UI cannot even name.
+    useSettingsStore.setState({ chiefProjectByProject: { ghost: "chief_x" } });
+
+    expect(chiefLibraryOwner(s().chiefProjectByProject, "chief_x", "reborn", ["reborn"])).toBeNull();
+    expect(s().claimChiefLibrary("reborn", "chief_x", ["reborn"])).toBe(true);
+    expect(s().chiefProjectByProject["reborn"]).toBe("chief_x");
+  });
+
+  it("a link held by a LIVE project still owns it", () => {
+    useSettingsStore.setState({ chiefProjectByProject: { b: "chief_x" } });
+    expect(chiefLibraryOwner(s().chiefProjectByProject, "chief_x", "a", ["a", "b"])).toBe("b");
+    expect(s().claimChiefLibrary("a", "chief_x", ["a", "b"])).toBe(false);
+    expect(s().chiefProjectByProject["a"]).toBeUndefined();
+  });
+
+  it("two projects resolving onto the SAME library: exactly one wins", () => {
+    // MEDIUM. The previous guard read the store, then resolved the library over an await, then
+    // compared — so two projects with NO persisted link each computed an EMPTY claimed set and
+    // each passed. Deciding and writing in one `set` is what makes the second call see the first.
+    const first = s().claimChiefLibrary("a", "chief_shared", ["a", "b"]);
+    const second = s().claimChiefLibrary("b", "chief_shared", ["a", "b"]);
+    expect([first, second]).toEqual([true, false]);
+    expect(s().chiefProjectByProject["a"]).toBe("chief_shared");
+    expect(s().chiefProjectByProject["b"]).toBeUndefined();
+  });
+
+  it("re-claiming a library this project already holds succeeds and is idempotent", () => {
+    useSettingsStore.setState({ chiefProjectByProject: { a: "chief_x" } });
+    expect(s().claimChiefLibrary("a", "chief_x", ["a"])).toBe(true);
+    expect(s().chiefProjectByProject["a"]).toBe("chief_x");
+  });
+
+  it("REFUSES BOTH projects when the persisted links already hold the sharing", () => {
+    // The "we already hold it" shortcut must not answer ahead of the ownership check. Two live
+    // projects whose links both name one library is reachable from state written before this guard
+    // existed (and from a `project_gone` link neither project dropped) — and letting each through
+    // because it "already holds" the link IS the mutual deletion: every round, each project's
+    // sweep removes the other's documents. Neither may proceed until a human re-points one.
+    useSettingsStore.setState({ chiefProjectByProject: { a: "chief_shared", b: "chief_shared" } });
+
+    expect(s().claimChiefLibrary("a", "chief_shared", ["a", "b"])).toBe(false);
+    expect(s().claimChiefLibrary("b", "chief_shared", ["a", "b"])).toBe(false);
+    // A refusal, never a silent repair: the store does not get to pick which project loses its link.
+    expect(s().chiefProjectByProject).toEqual({ a: "chief_shared", b: "chief_shared" });
+  });
+
+  it("a GHOST co-holder does not block the live project that also holds the link", () => {
+    // The mirror of the case above: same shape, but the second holder no longer exists, so there
+    // is nothing to destroy and refusing would strand the live project with no in-app remedy.
+    useSettingsStore.setState({ chiefProjectByProject: { a: "chief_shared", ghost: "chief_shared" } });
+    expect(s().claimChiefLibrary("a", "chief_shared", ["a"])).toBe(true);
   });
 });
