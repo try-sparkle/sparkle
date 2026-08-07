@@ -241,7 +241,24 @@ describe("a remount's stale teardown does not strip the LIVE terminal's scanner"
     expect(outgoing).not.toHaveBeenCalled();
   });
 
-  it("STILL clears the flag when the terminal that OWNS it tears down", async () => {
+  it("clears the flag when the LINE BELONGED TO THE OUTGOING instance", async () => {
+    // The mirror of the case above, and the one an ownership check gets wrong: the user typed into
+    // the FIRST terminal, then the account switch mounted a replacement whose scanner starts EMPTY.
+    // "Skip the clear because I no longer own the registration" strands `true` over that empty
+    // prompt — the pill stays hidden and the compose-focus veto stays on until the user types again,
+    // which is roborev 57372's "true forever" shape relocated to the remount (roborev 60124).
+    const first = await mountTerminal();
+    act(() => dataHandler.fn!("half a command"));
+    expect(useTerminalOverlayStore.getState().drafts[AGENT]).toBe(true);
+
+    await remountTerminal(); // the replacement registers an EMPTY scanner
+    act(() => first.unmount());
+
+    // The live prompt is empty — the outgoing instance's readline buffer died with its PTY.
+    expect(useTerminalOverlayStore.getState().drafts[AGENT]).toBeFalsy();
+  });
+
+  it("STILL clears the flag when the ONLY terminal tears down", async () => {
     // The anti-over-fix, and it is load-bearing: `clearDraft` is unconditional on purpose for a
     // promotion rebind, where the local CLI's readline buffer dies with the PTY — keeping the flag
     // there would hide the action pill for the life of the tab (roborev 57372). Ownership is the

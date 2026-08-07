@@ -237,14 +237,33 @@ export function registerLineScan(agentId: string): LineScanState {
  *  The parameter is optional so a caller that never held the state still gets the old behaviour —
  *  but `Terminal.tsx` holds it, and any new caller should.
  *
- *  RETURNS whether this call actually unregistered, i.e. whether the caller still OWNED the
- *  registration. That answer is what a teardown needs before touching anything else keyed on the
- *  agent id: the `drafts` flag has exactly the same stale-teardown hazard as the scanner, and it is
- *  worse, because nothing republishes it until the user's next keystroke (roborev 60111). */
-export function unregisterLineScan(agentId: string, state?: LineScanState): boolean {
-  if (state !== undefined && scans.get(agentId) !== state) return false;
+ *  Returns nothing on purpose. An earlier cut returned "did I still own it" so the teardown could
+ *  decide whether to also clear the `drafts` flag — but ownership answers the wrong question. See
+ *  {@link republishDraft}: what a teardown owes that flag is a RE-DERIVATION from whatever scanner is
+ *  live now, which is right in both directions and needs no such answer (roborev 60124). */
+export function unregisterLineScan(agentId: string, state?: LineScanState): void {
+  if (state !== undefined && scans.get(agentId) !== state) return;
   scans.delete(agentId);
-  return true;
+}
+
+/** Re-derive `drafts[agentId]` from the scanner that is live RIGHT NOW — or clear it when none is.
+ *
+ *  WHAT A TEARDOWN OWES THE FLAG, and the reason it is not "clear it" or "leave it alone". Both of
+ *  those are wrong half the time, and each half shipped once:
+ *
+ *   • Clear it unconditionally, and an account-switch remount's LATE cleanup wipes the flag out from
+ *     under the live instance while its prompt holds an unsubmitted line — un-hiding the action pill
+ *     and lifting the compose-focus veto over a prompt the user is mid-typing (roborev 60111).
+ *   • Skip the clear whenever the caller no longer owns the registration, and the mirror appears: the
+ *     user typed into the OUTGOING instance, the remount registered an EMPTY state, and the flag
+ *     stays `true` over a prompt that is empty — the "true forever, pill hidden forever" shape
+ *     roborev 57372 named, since nothing republishes until the user types again (roborev 60124).
+ *
+ *  Re-deriving is correct in both: live instance mid-line → stays `true`; live instance empty, or no
+ *  terminal left at all → `false`. The old readline buffer died with its PTY either way. */
+export function republishDraft(agentId: string): void {
+  const state = scans.get(agentId);
+  useTerminalOverlayStore.getState().setDraft(agentId, state ? hasPendingInput(state) : false);
 }
 
 /** Feed one chunk of USER input: scan it, publish the derived flag, and return the submit count.

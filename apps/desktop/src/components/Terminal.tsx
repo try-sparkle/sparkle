@@ -30,7 +30,6 @@ import { useUiStore } from "../stores/uiStore";
 import { useInteractionStore } from "../stores/interactionStore";
 import { usePresenceStore } from "../stores/presenceStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
-import { useTerminalOverlayStore } from "../stores/terminalOverlayStore";
 import { isComposerToggleKey } from "./composerToggle";
 import { shouldReclaimPlainDrag } from "./terminalSelectionReclaim";
 import { isCopySelectionKey } from "./copySelectionKey";
@@ -44,7 +43,12 @@ import { TERMINAL_AGENT_ATTR, TERMINAL_SURFACE_ATTR } from "../voice/dictationFo
 // terminals that are not cockpit columns at all — the setup checklist's and the login modal's —
 // which would let a press in a modal address the right-hand terminal's zoom level.
 import { useColumnZoom, useZoomColumn } from "../hooks/useZoomColumn";
-import { registerLineScan, unregisterLineScan, noteUserInput } from "./terminalSubmit";
+import {
+  registerLineScan,
+  unregisterLineScan,
+  noteUserInput,
+  republishDraft,
+} from "./terminalSubmit";
 import { useKeybindingsStore } from "../stores/keybindingsStore";
 import { matchesChord } from "../keyboardHints/keybindings";
 import { dismissibleSurfaceOpen } from "../engine/cable";
@@ -1502,8 +1506,13 @@ export function Terminal({
       // a prompt they are mid-typing (roborev 60111). So the clear happens only when this instance
       // still OWNED the registration — when it does not, a live terminal is answering for this agent
       // and the flag is its business, not ours.
-      const owned = unregisterLineScan(agentId, lineScan);
-      if (owned) useTerminalOverlayStore.getState().clearDraft(agentId);
+      unregisterLineScan(agentId, lineScan);
+      // …then RE-DERIVE the flag from whatever scanner is live now, rather than clearing it (which
+      // wipes a live instance's pending line) or skipping the clear (which strands a `true` over the
+      // empty prompt of the instance that replaced us). One call is correct in both directions —
+      // including the ordinary case, where this teardown just removed the only scanner and the
+      // re-derivation therefore lands on `false`. See republishDraft (roborev 60111 / 60124).
+      republishDraft(agentId);
       if (focusRef) focusRef.current = null;
       if (apiRef) apiRef.current = null;
       ro.disconnect();
