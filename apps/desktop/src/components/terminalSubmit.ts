@@ -235,10 +235,16 @@ export function registerLineScan(agentId: string): LineScanState {
  *  (roborev 59775). Passing the state you were given makes the stale teardown a no-op.
  *
  *  The parameter is optional so a caller that never held the state still gets the old behaviour —
- *  but `Terminal.tsx` holds it, and any new caller should. */
-export function unregisterLineScan(agentId: string, state?: LineScanState): void {
-  if (state !== undefined && scans.get(agentId) !== state) return;
+ *  but `Terminal.tsx` holds it, and any new caller should.
+ *
+ *  RETURNS whether this call actually unregistered, i.e. whether the caller still OWNED the
+ *  registration. That answer is what a teardown needs before touching anything else keyed on the
+ *  agent id: the `drafts` flag has exactly the same stale-teardown hazard as the scanner, and it is
+ *  worse, because nothing republishes it until the user's next keystroke (roborev 60111). */
+export function unregisterLineScan(agentId: string, state?: LineScanState): boolean {
+  if (state !== undefined && scans.get(agentId) !== state) return false;
   scans.delete(agentId);
+  return true;
 }
 
 /** Feed one chunk of USER input: scan it, publish the derived flag, and return the submit count.

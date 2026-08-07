@@ -223,12 +223,36 @@ describe("a remount's stale teardown does not strip the LIVE terminal's scanner"
     // …and now the outgoing instance tears down, late, for the same agentId.
     act(() => first.unmount());
 
+    // THE FLAG MUST SURVIVE THAT TEARDOWN TOO, and this assertion is why the case is here twice.
+    // An earlier version of this file called the flag undiscriminating because it read `false` in
+    // both worlds — but `false` here IS the bug: the live scanner is holding an unsubmitted line, so
+    // the honest answer is `true`. The outgoing instance's `clearDraft(agentId)` was keyed on the
+    // agent id alone, so it wiped the live instance's flag, and nothing republishes it until the
+    // user's next keystroke — un-hiding the recommended-action pill and lifting the compose-focus
+    // veto over a prompt they are mid-typing (roborev 60111).
+    expect(useTerminalOverlayStore.getState().drafts[AGENT]).toBe(true);
+
     act(() => dataHandler.fn!("\r"));
 
-    // ASSERTED ON THE SUBMIT, not on the flag: a stripped scanner is lazily recreated EMPTY, so the
-    // Enter would submit nothing and this call would never come — which is a prompt the user typed
-    // and sent going unmetered and unreported.
+    // …and the scanner kept the line: a stripped one is lazily recreated EMPTY, so the Enter would
+    // submit nothing and this call would never come — a prompt the user typed and sent, going
+    // unmetered and unreported.
     expect(live).toHaveBeenCalledTimes(1);
     expect(outgoing).not.toHaveBeenCalled();
+  });
+
+  it("STILL clears the flag when the terminal that OWNS it tears down", async () => {
+    // The anti-over-fix, and it is load-bearing: `clearDraft` is unconditional on purpose for a
+    // promotion rebind, where the local CLI's readline buffer dies with the PTY — keeping the flag
+    // there would hide the action pill for the life of the tab (roborev 57372). Ownership is the
+    // distinction that serves both: the instance that registered the scanner still clears, a stale
+    // one does not.
+    const view = await mountTerminal();
+    act(() => dataHandler.fn!("half a command"));
+    expect(useTerminalOverlayStore.getState().drafts[AGENT]).toBe(true);
+
+    act(() => view.unmount());
+
+    expect(useTerminalOverlayStore.getState().drafts[AGENT]).toBeFalsy();
   });
 });

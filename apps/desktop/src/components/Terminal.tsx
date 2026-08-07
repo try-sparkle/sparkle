@@ -1493,11 +1493,17 @@ export function Terminal({
       // The visible SCROLLBACK is likewise not preserved: xterm is disposed either way, and the
       // promoted pane redraws the resumed conversation from the sandbox's own backfill, so keeping
       // the local buffer would paint the same transcript twice.
-      useTerminalOverlayStore.getState().clearDraft(agentId);
-      // BY IDENTITY: an account switch remounts this terminal with the SAME agentId, and React
-      // mounts the replacement before running this cleanup — so a delete-by-key here would strip
-      // the new instance's scanner and silently stop metering its keystrokes (roborev 59775).
-      unregisterLineScan(agentId, lineScan);
+      // BY IDENTITY, AND THE FLAG FOLLOWS THE SCANNER. An account switch remounts this terminal with
+      // the SAME agentId, and React mounts the replacement before running this cleanup — so a
+      // delete-by-key here would strip the new instance's scanner and silently stop metering its
+      // keystrokes (roborev 59775). `clearDraft` had exactly the same hazard and is the WORSE half:
+      // nothing republishes the flag until the user's next keystroke, so wiping the live instance's
+      // `drafts[agentId]` un-hides the recommended-action pill and lifts the compose-focus veto over
+      // a prompt they are mid-typing (roborev 60111). So the clear happens only when this instance
+      // still OWNED the registration — when it does not, a live terminal is answering for this agent
+      // and the flag is its business, not ours.
+      const owned = unregisterLineScan(agentId, lineScan);
+      if (owned) useTerminalOverlayStore.getState().clearDraft(agentId);
       if (focusRef) focusRef.current = null;
       if (apiRef) apiRef.current = null;
       ro.disconnect();
