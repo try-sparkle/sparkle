@@ -12,14 +12,29 @@
 
 import type { AutoTopup } from "./creditsMenuApi";
 
-/** The server's cloud-agent price list, quoted verbatim on `/me`. Both fields are the SERVER's
- *  numbers — the client never computes, adjusts or defaults them. */
+/** The server's cloud-agent price list, quoted verbatim on `/me`. Every field is the SERVER's
+ *  number — the client never computes, adjusts or defaults them. */
 export interface CloudAgentPricing {
   /** Charged per RUNNING sandbox-minute. Fractional (0.9 today); paused minutes are free. */
   centsPerMinute: number;
   /** Balance required to START, which is a floor and NOT a charge — a run cancelled after ten
    *  seconds costs ten seconds, not this. */
   minStartCents: number;
+  /**
+   * Balance required to RESUME a paused agent — a DIFFERENT and much lower bar than
+   * {@link minStartCents}, because the server enforces two rules, not one.
+   *
+   * Starting applies the flat $1 floor; resuming applies only "can you afford the next few
+   * minutes" (5¢ at today's rate). Applying the START number to a resume decision is a real bug
+   * with real money behind it: a user holding 99¢ can afford ~110 running minutes, but a client
+   * gating continuation on `minStartCents` would abandon their paused agent and strand credit
+   * they paid for, with nothing on screen to explain the stall.
+   *
+   * Optional because an older orchestration server does not send it. Absent ⇒ do NOT substitute
+   * `minStartCents`; treat continuation as ungated locally and let the server refuse, which is
+   * the direction that cannot silently destroy purchased runway.
+   */
+  minContinueCents?: number;
 }
 
 export interface Me {

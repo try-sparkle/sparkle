@@ -180,8 +180,11 @@ pub struct Me {
     visibility: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     social_enabled: Option<bool>,
-    /// What a cloud agent COSTS: `{ centsPerMinute, minStartCents }`, straight from the server's own
-    /// pricing constants. Passed through verbatim — and this field is the reason the desktop can
+    /// What a cloud agent COSTS: `{ centsPerMinute, minStartCents, minContinueCents }`, straight
+    /// from the server's own pricing constants. `minStartCents` gates SPAWNING and the much lower
+    /// `minContinueCents` gates RESUMING a paused agent — two different server rules, so a client
+    /// must never apply the start number to a continuation decision.
+    /// Passed through verbatim as a `Value` — and this field is the reason the desktop can
     /// quote a price at all: the client deliberately holds NO rate of its own, because a duplicated
     /// pricing rule already shipped a bug here once (see `CLOUD_MIN_START_CENTS` in
     /// `services/cloudAgents/gating.ts`). Absent (an older server) ⇒ the UI shows no estimate rather

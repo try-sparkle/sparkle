@@ -80,11 +80,22 @@ export const MAX_CONTINUES_TOTAL = 20;
 /**
  * The balance a cloud auto-continue must clear, in cents.
  *
- * DERIVED, NOT A SECOND NUMBER. Resuming a cloud agent asks a sandbox to keep burning minutes,
- * which is the same purchase `services/cloudAgents/gating` pre-checks before a START — so the two
- * share one floor. Spelling a literal here would let the start gate be retuned while a background
- * timer went on resuming agents the user can no longer afford, which is the failure this whole
- * arm exists to prevent.
+ * A TEMPORARY FAIL-OPEN PLACEHOLDER, aliased to the start floor only because both are currently the
+ * 1¢ "obviously empty wallet" check, where the alias cannot refuse anything a start would allow.
+ *
+ * **Do not read the alias as a rule that resume and start SHARE a floor — the server says they do
+ * not.** Starting requires a flat $1 minimum balance; resuming requires only that the next few
+ * minutes are affordable (5¢ at today's rate), and `/me` states both as `cloudAgentPricing`'s
+ * `minStartCents` and `minContinueCents`. Deriving this from the start floor is a money bug waiting
+ * for the moment someone raises `CLOUD_MIN_START_CENTS` toward the server's $1, or feeds
+ * `me.cloudAgentPricing.minStartCents` in here the way `useCloudAgents` and `conciergeTools/
+ * lifecycle` already do on the START path: the resume bar silently jumps 5¢ → $1, and a user holding
+ * 99¢ — about 110 affordable running minutes — has their paused agent abandoned by a background
+ * timer with nothing on screen to explain it.
+ *
+ * So when this is wired, take `minContinueCents` from `/me`; do NOT substitute `minStartCents` when
+ * it is absent (an older server) — leave continuation ungated locally and let the server refuse,
+ * which is the only direction that cannot destroy runway the user paid for.
  */
 export const CLOUD_MIN_CONTINUE_CENTS = CLOUD_MIN_START_CENTS;
 
