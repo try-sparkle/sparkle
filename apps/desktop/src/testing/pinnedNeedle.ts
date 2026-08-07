@@ -29,6 +29,22 @@ const IMPORT_START = /^(?:import\b|export\b[^=]*\bfrom\b|(?:pub\s+)?use\b|(?:con
 /** A line that is nothing but a comment. `*` catches the continuation lines of a block comment. */
 const WHOLE_LINE_COMMENT = /^(?:\/\/|#(?!\[)|\/\*|\*)/;
 
+/** True once `line` opens a block comment that it does not also close.
+ *
+ *  `WHOLE_LINE_COMMENT` only recognises a continuation line by its leading `*`, which is a
+ *  convention, not a requirement. A block comment written without the asterisk rail —
+ *
+ *      \/*
+ *        CHECKS drives the loop below.
+ *      *\/
+ *
+ *  — leaves its body lines looking like ordinary code, so a needle appearing ONLY there passes the
+ *  vacuity check. That is the same defect this file exists to catch, one comment style over. */
+function opensBlockComment(line: string): boolean {
+  const opened = line.lastIndexOf("/*");
+  return opened !== -1 && line.indexOf("*/", opened + 2) === -1;
+}
+
 /** Classify every line of `source` as "can satisfy a pin" or not.
  *
  *  Import statements span lines (`import {\n  A,\n} from "x";`, `use foo::{\n  A,\n};`), so this
@@ -37,9 +53,16 @@ const WHOLE_LINE_COMMENT = /^(?:\/\/|#(?!\[)|\/\*|\*)/;
 function usableLines(source: string): string[] {
   const usable: string[] = [];
   let insideImport = false;
+  let insideBlockComment = false;
 
   for (const raw of source.split("\n")) {
     const line = raw.trim();
+
+    if (insideBlockComment) {
+      // A body line is never usable, and the line carrying `*/` can still open a new comment after it.
+      if (line.includes("*/")) insideBlockComment = opensBlockComment(line);
+      continue;
+    }
 
     if (insideImport) {
       // An import ends at the `;` that closes it. Bare-specifier lines have no `;`, so they stay in.
@@ -53,7 +76,14 @@ function usableLines(source: string): string[] {
       continue;
     }
 
-    if (line === "" || WHOLE_LINE_COMMENT.test(line)) continue;
+    if (line === "" || WHOLE_LINE_COMMENT.test(line)) {
+      // A whole-line `/*` opens a block whose body may not carry the asterisk rail.
+      if (opensBlockComment(line)) insideBlockComment = true;
+      continue;
+    }
+
+    // A code line can trail an unterminated `/*`; the code is a real use, the lines after it are not.
+    if (opensBlockComment(line)) insideBlockComment = true;
 
     usable.push(raw);
   }

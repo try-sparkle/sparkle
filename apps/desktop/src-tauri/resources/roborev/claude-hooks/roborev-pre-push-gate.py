@@ -189,7 +189,11 @@ def _format_block(jobs: list[dict], cmd: str = "") -> str:
         "Resolve each before re-pushing — the goal is to CLEAR every open "
         "fail-verdict review by fixing or declining it, with judgment per "
         "finding, not to push over them:",
-        "  1. `roborev show <id>` — read the findings.",
+        "  1. `roborev show --job <id>` — read the findings. `--job` is "
+        "REQUIRED for a numeric id: `show` resolves its argument as a git ref "
+        "FIRST, so a bare job id is read as a commit SHA prefix and answers "
+        "\"no review found\". (For an `@<sha>` row above, pass that sha "
+        "WITHOUT `--job`.) `close`/`comment` take the bare id either way.",
         "  2. VALID finding: fix it in a new commit, then `roborev close <id>` "
         "(the fix is covered by the new commit's own review; the old review "
         "stays open until you close it).",

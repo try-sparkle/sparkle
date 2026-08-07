@@ -100,4 +100,23 @@ describe("needleIsUsed — multi-line import blocks", () => {
     );
     expect(needleIsUsed(COMMENTED, "HANDLE_RESET")).toBe(false);
   });
+
+  it("does not count a block comment whose body lines have no asterisk rail", () => {
+    // The asterisk rail is a convention, not a requirement. Without it every body line looks like
+    // ordinary code, so a needle mentioned only here used to read as a real use.
+    const BARE = [`/*`, `  HANDLE_RESET drives the loop below.`, `*/`, `export const x = 1;`].join("\n");
+    expect(needleIsUsed(BARE, "HANDLE_RESET")).toBe(false);
+    expect(needleIsUsed(BARE, "export const x = 1;")).toBe(true);
+  });
+
+  it("still counts the code on a line that trails an unterminated block comment", () => {
+    const TRAILING = [`const x = HANDLE_RESET; /*`, `  dead HANDLE_OTHER note`, `*/`].join("\n");
+    expect(needleIsUsed(TRAILING, "HANDLE_RESET")).toBe(true);
+    expect(needleIsUsed(TRAILING, "HANDLE_OTHER")).toBe(false);
+  });
+
+  it("resumes counting code after the block comment closes", () => {
+    const AFTER = [`/*`, `  HANDLE_RESET note`, `*/`, `run(HANDLE_RESET);`].join("\n");
+    expect(needleIsUsed(AFTER, "run(HANDLE_RESET)")).toBe(true);
+  });
 });

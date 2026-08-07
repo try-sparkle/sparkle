@@ -19,7 +19,9 @@ Usage:
   roborev-list-all.py --json     # the raw [{repo, root_path, branch, id}] rows
 
 Every `id` it prints (both surfaces) is a JOB id — pass it straight to
-`roborev show/close/comment <id>`.
+`roborev close/comment <id>`, but `roborev show` needs `--job <id>`: it
+resolves its argument as a git ref FIRST, so a bare numeric job id is read as
+a commit SHA prefix and answers "no review found".
 
 Exit status: 0 on a clean read (including an empty backlog), 1 if the DB can't
 be read (missing/locked/schema-drift) — distinct so a wrapper can tell "all

@@ -588,7 +588,9 @@ def open_fail_backlog(db_path: Path = ROBOREV_DB) -> list[dict] | None:
 
     Returns a list of `{repo, root_path, branch, id}` dicts (one per open-FAIL job),
     where `id` is the JOB id (`review_jobs.id`) — the namespace every CLI verb
-    (`roborev show/close/comment <id>`) resolves. Surfacing `reviews.id` here
+    (`roborev show --job <id>`, `roborev close/comment <id>`) resolves. Note the
+    `--job`: `show` resolves its argument as a git ref FIRST, so a bare numeric
+    job id is read as a commit SHA prefix. Surfacing `reviews.id` here
     instead handed agents ids the CLI answers "no review found" for, killing
     the backlog sweep. SELECT DISTINCT because the emitted id is no longer the
     row's primary key: should a job ever carry two open FAIL reviews, one
