@@ -508,6 +508,39 @@ mod tests {
         tempfile::tempdir().unwrap()
     }
 
+    /// The TS side re-ranks these sources, and a stale copy there is SILENT — it picks the wrong
+    /// owning agent rather than failing.
+    ///
+    /// `services/fleetPrs.ts` folds two project tabs that are one repository into one section, and
+    /// both tabs can answer "who owns #1433". Only the entry an agent lives in holds the
+    /// authoritative `created` record; `branch-name` is the one source that ignores the project id
+    /// entirely, so EVERY tab produces it. Without the ranking the weak guess wins by arriving
+    /// first, and the panel offers a pill that opens the wrong agent — which the reader cannot tell
+    /// from a right one. Same discipline as `the_js_side_mirrors_the_same_open_pr_row_cap`: pinned
+    /// by a test rather than by a comment, because a comment cannot fail.
+    #[test]
+    fn the_js_side_mirrors_the_same_owner_source_ranks() {
+        let ts = include_str!("../../src/services/fleetPrs.ts");
+        for source in [
+            SOURCE_CREATED,
+            SOURCE_PR_BODY,
+            SOURCE_WORKTREE_BRANCH,
+            SOURCE_BRANCH_NAME,
+        ] {
+            let rank = source_rank(source);
+            // Both spellings an object literal can use for these keys — `created` is a bare
+            // identifier, the hyphenated ones must be quoted.
+            let bare = format!("{source}: {rank},");
+            let quoted = format!("\"{source}\": {rank},");
+            assert!(
+                ts.contains(&bare) || ts.contains(&quoted),
+                "services/fleetPrs.ts must rank `{source}` at {rank} — its OWNER_SOURCE_RANK has \
+                 drifted from source_rank, so folding two tabs on one repo would pick the owner \
+                 by arrival order and can name the wrong agent"
+            );
+        }
+    }
+
     #[test]
     fn agent_id_from_branch_reads_only_the_minted_convention() {
         assert_eq!(

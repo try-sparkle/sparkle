@@ -4118,3 +4118,344 @@ describe("OpenPrMenu — the drawer follows the same ranking as the row and the 
     expect(await screen.findByTestId("probe-disclosure-1325")).toBeTruthy();
   });
 });
+
+// ── THE RENDERED PANEL, WITH ONE REPOSITORY OPEN UNDER TWO TABS ────────────────────────────────
+//
+// `fleetPrs.test.ts` pins the arithmetic; this pins what the founder actually SEES. His panel read
+// "47 open pull requests across 6 projects" over two headings — SPARKLE 23 and SPARKLE-DESKTOP 23 —
+// carrying the same PR numbers, titles and branches, because `sparkle-desktop` is a linked git
+// WORKTREE of `sparkle` and they share one repository, one origin and one set of pull requests.
+describe("OpenPrMenu — two project tabs on ONE repository", () => {
+  /** The founder's arrangement: different folders, one shared `.git` common dir. */
+  const WORKTREE_PAIR: readonly PrScope[] = [
+    {
+      projectId: "p-main",
+      projectName: "sparkle",
+      rootPath: "/Users/x/Projects/sparkle",
+      repoKey: "/Users/x/Projects/sparkle/.git",
+    },
+    {
+      projectId: "p-wt",
+      projectName: "sparkle-desktop",
+      rootPath: "/Users/x/Projects/sparkle-desktop",
+      repoKey: "/Users/x/Projects/sparkle/.git",
+    },
+  ];
+
+  /**
+   * Answer `project_open_prs` PER ROOT and record which roots were asked (roborev 59916, Medium).
+   *
+   * The shared `stubList` ignores its arguments, so a test built on it cannot tell whether the
+   * component probed BOTH members or only the primary — and probing only the primary is the exact
+   * regression `buildPrGroups` is written against, because Rust resolves a PR's owning agent through
+   * a store keyed by PROJECT ID. A plausible future "optimization" (fold first, fetch once per
+   * group) would leave the fold tests green while silently making every PR opened from the second
+   * checkout read as owner-unknown. `fleetPrs.test.ts` cannot cover it either: it feeds `byKey`
+   * directly, so it exercises the MERGE of two members' rows and never the decision to ISSUE two
+   * probes.
+   */
+  function stubPerRoot(byRoot: Record<string, PrRow[] | null>) {
+    const probed: string[] = [];
+    h.invoke.mockImplementation((cmd: string, args: Record<string, unknown> = {}) => {
+      if (cmd === "project_open_prs") {
+        const root = (args.root as string) ?? "";
+        probed.push(root);
+        return Promise.resolve(byRoot[root] ?? null);
+      }
+      if (cmd === "merge_pr") return Promise.resolve(null);
+      return Promise.resolve(null);
+    });
+    return { probed };
+  }
+
+  const MAIN_ROOT = "/Users/x/Projects/sparkle";
+  const WT_ROOT = "/Users/x/Projects/sparkle-desktop";
+
+  it("renders ONE section and lists each PR once, however many tabs point at the repo", async () => {
+    // Both roots answer with the same list, because it IS the same repo — the situation that used
+    // to render every row twice.
+    const { probed } = stubPerRoot({ [MAIN_ROOT]: [PASS, FAILING], [WT_ROOT]: [PASS, FAILING] });
+    render(
+      <OpenPrMenu scopes={WORKTREE_PAIR} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
+    fireEvent.click(await screen.findByTestId("open-pr-badge"));
+    const names = (await screen.findAllByTestId("pr-group-name")).map((n) => n.textContent ?? "");
+    expect(names).toHaveLength(1);
+    // Each PR's row appears exactly once in the DOM. Before the fold there were two of each.
+    expect(screen.getAllByTestId(`pr-dot-${PASS.number}`)).toHaveLength(1);
+    expect(screen.getAllByTestId(`pr-dot-${FAILING.number}`)).toHaveLength(1);
+    // …and the badge counts them once, which is the "47" the founder read.
+    expect(screen.getByTestId("open-pr-badge").textContent).toContain("2 PRs waiting");
+    // ONE SECTION, TWO PROBES. The fold is a presentation change; it must not cost a probe.
+    expect(new Set(probed)).toEqual(new Set([MAIN_ROOT, WT_ROOT]));
+  });
+
+  it("keeps probing BOTH checkouts, so the owner only one of them can name survives", async () => {
+    // The attribution half, end to end through the mounted component. The main checkout resolves the
+    // legacy branch-name guess (the one source that ignores the project id, so every tab produces
+    // it); only the worktree entry holds the authoritative `created` record. If the panel stopped
+    // probing the second member — or merged by arrival order — this row would carry "agent-old".
+    const { probed } = stubPerRoot({
+      [MAIN_ROOT]: [{ ...PASS, agentId: "agent-old", agentIdSource: "branch-name" }],
+      [WT_ROOT]: [{ ...PASS, agentId: "agent-real", agentIdSource: "created" }],
+    });
+    const seen: (string | null)[] = [];
+    render(
+      <OpenPrMenu
+        scopes={WORKTREE_PAIR}
+        resolveAgent={(row) => {
+          seen.push(row.agentId ?? null);
+          return null;
+        }}
+        onOpenAgent={noop}
+      />,
+    );
+    fireEvent.click(await screen.findByTestId("open-pr-badge"));
+    await waitFor(() => expect(screen.queryByTestId(`pr-dot-${PASS.number}`)).toBeTruthy());
+    // BOTH roots, not just the one holding the strong answer. Asserting only WT_ROOT passes by luck
+    // against a "fold first, probe once per repo" regression whenever the surviving scope happens to
+    // be the worktree — which is exactly what a Map-based dedupe keeping the last entry produces.
+    expect(new Set(probed)).toEqual(new Set([MAIN_ROOT, WT_ROOT]));
+    // THE SETTLED OWNER, NOT THE WHOLE HISTORY (roborev 59935). `refetch` writes state PER SCOPE, so
+    // a render carrying only the main checkout's rows legitimately shows `agent-old` until the second
+    // `gh` returns — that transient is correct production behaviour, and the module argues explicitly
+    // against withholding rows until every scope answers. Asserting `not.toContain("agent-old")`
+    // pinned that transient, so it held only because both stubs resolve at identical await depth and
+    // land in one React batch; staggering a stub to simulate a slow repo would have turned it red
+    // naming a regression that did not happen. The tail still reddens under "probe only the primary",
+    // where the LAST owner rendered is `agent-old`.
+    await waitFor(() => expect(seen.at(-1)).toBe("agent-real"));
+  });
+
+  it("names the other checkout in the heading rather than dropping it", async () => {
+    // The founder's constraint on the fix: a duplicate may not disappear in a way that hides which
+    // local checkout an agent is working in. Agents live in a PROJECT ENTRY, and both entries hold
+    // real, distinct agents even though the repository is one.
+    stubPerRoot({ [MAIN_ROOT]: [PASS], [WT_ROOT]: [PASS] });
+    render(
+      <OpenPrMenu scopes={WORKTREE_PAIR} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
+    fireEvent.click(await screen.findByTestId("open-pr-badge"));
+    const heading = await screen.findByTestId("pr-group-name");
+    expect(heading.textContent).toBe("sparkle · also open as sparkle-desktop");
+    // The tooltip carries the PATHS, which is the fact that tells the reader which working copy is
+    // which — the names alone cannot.
+    //
+    // ASSERTED WHOLE, not with a `toContain` of the worktree path (roborev 59916, Medium). The
+    // primary's path is a strict PREFIX of the worktree's, so `toContain(WT_ROOT)` is satisfied by a
+    // title holding only the second line — meaning a regression to `members.slice(1)` would drop the
+    // primary from the tooltip and this test, and the heading test beside it, would both stay green.
+    // Both entries are the entire point: the reader is trying to tell the two working copies apart.
+    expect(heading.getAttribute("title")).toBe(
+      `sparkle: ${MAIN_ROOT}\nsparkle-desktop: ${WT_ROOT}`,
+    );
+  });
+
+  it("leaves the heading alone for an ordinary one-tab repository", async () => {
+    // The negative control: without it, an aside that rendered unconditionally would pass the case
+    // above while corrupting every other heading in the app.
+    stubList([PASS]);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
+    fireEvent.click(await screen.findByTestId("open-pr-badge"));
+    const heading = await screen.findByTestId("pr-group-name");
+    expect(heading.textContent).toBe("repo");
+    expect(screen.queryByTestId("pr-group-also-open-as")).toBeNull();
+  });
+});
+
+// ── RESTORE ACROSS A FOLDED SECTION (roborev 59902, Medium) ────────────────────────────────────
+//
+// Dismissals are stored by Rust PER PROJECT ID. A section that folds two tabs on one repository
+// reads them as a union, so a row can be hidden by a record belonging to the NON-PRIMARY tab —
+// which is the ordinary case for anything dismissed before the fold existed, or from that tab.
+// Restore addressed only the primary, so it wrote to a store that did not hold the record: the IPC
+// succeeded, and the row stayed hidden. A Restore button that reports success and restores nothing
+// is worse than a missing one — the row is gone and the only way back appears to have been used.
+describe("OpenPrMenu — Restore reaches the tab that actually holds the dismissal", () => {
+  const PAIR: readonly PrScope[] = [
+    {
+      projectId: "p-main",
+      projectName: "sparkle",
+      rootPath: "/Users/x/Projects/sparkle",
+      repoKey: "/Users/x/Projects/sparkle/.git",
+    },
+    {
+      projectId: "p-wt",
+      projectName: "sparkle-desktop",
+      rootPath: "/Users/x/Projects/sparkle-desktop",
+      repoKey: "/Users/x/Projects/sparkle/.git",
+    },
+  ];
+
+  /**
+   * A dismissal store keyed BY PROJECT, which is the fact the shared `stubWithDismissals` helper
+   * flattens away — and flattening it is exactly what would hide this bug, since a number-only store
+   * answers every project identically.
+   */
+  function stubPerProjectDismissals(rows: PrRow[], seeded: Record<string, number[]>) {
+    const store = new Map<string, Set<number>>(
+      Object.entries(seeded).map(([p, ns]) => [p, new Set(ns)]),
+    );
+    const rowsFor = (projectId: string) =>
+      [...(store.get(projectId) ?? [])].map((number) => ({
+        number,
+        headRefOid: "",
+        tone: "ready",
+        viewerCanMerge: true,
+        dismissedAt: 1_700_000_000,
+      }));
+    const calls: { cmd: string; args: Record<string, unknown> }[] = [];
+    h.invoke.mockImplementation((cmd: string, args: Record<string, unknown> = {}) => {
+      calls.push({ cmd, args });
+      const projectId = args.projectId as string;
+      if (cmd === "project_open_prs") return Promise.resolve(rows);
+      if (cmd === "pr_dismissals") return Promise.resolve(rowsFor(projectId));
+      if (cmd === "restore_pr") {
+        store.get(projectId)?.delete(args.number as number);
+        return Promise.resolve(rowsFor(projectId));
+      }
+      return Promise.resolve(null);
+    });
+    return { store, calls };
+  }
+
+  it("un-hides a row whose dismissal record belongs to the NON-PRIMARY tab", async () => {
+    // Seeded ONLY under the worktree entry — the primary's store has never heard of #1.
+    const { store, calls } = stubPerProjectDismissals([PASS], { "p-wt": [PASS.number] });
+    render(<OpenPrMenu scopes={PAIR} resolveAgent={noAgent} onOpenAgent={noop} />);
+    fireEvent.click(await screen.findByTestId("open-pr-badge"));
+    // It starts hidden, which is the union doing its job.
+    await waitFor(() => expect(screen.queryByTestId(`merge-${PASS.number}`)).toBeNull());
+
+    fireEvent.click(await screen.findByTestId("pr-dismissed-toggle"));
+    fireEvent.click(await screen.findByTestId(`restore-${PASS.number}`));
+
+    // THE ASSERTION THE BUG FAILS: the row actually comes back. Asserting only that `restore_pr` was
+    // called would have passed against the broken code — it WAS called, at the wrong project.
+    await waitFor(() => expect(screen.queryByTestId(`merge-${PASS.number}`)).toBeTruthy());
+    expect(store.get("p-wt")?.has(PASS.number)).toBe(false);
+    expect(
+      calls.some((c) => c.cmd === "restore_pr" && c.args.projectId === "p-wt"),
+    ).toBe(true);
+  });
+});
+
+// ── THE LABEL AND THE DRAWER MUST NAME THE SAME PROBES (roborev 59958) ─────────────────────────
+//
+// `probeDetailByKey` is written per SCOPE and the row read it at the PRIMARY's key, while the count
+// beside it comes from the MERGED row — which carries the strongest probe reading across members.
+// Once two tabs on one repository fold into one section those two stopped agreeing: the row could
+// say "Blocked: 2 probes" on the worktree's reading and its disclosure find nothing in the primary's
+// map. A row that names a blocker and then cannot show it is the worst version of this feature —
+// the reader is told to go and answer probes the panel will not name.
+describe("OpenPrMenu — a folded section shows the probes it says are blocking", () => {
+  const MAIN = "/Users/x/Projects/sparkle";
+  const WT = "/Users/x/Projects/sparkle-desktop";
+  const PAIR: readonly PrScope[] = [
+    { projectId: "p-main", projectName: "sparkle", rootPath: MAIN, repoKey: `${MAIN}/.git` },
+    { projectId: "p-wt", projectName: "sparkle-desktop", rootPath: WT, repoKey: `${MAIN}/.git` },
+  ];
+
+  it("renders the detail from the member whose reading the row is REPORTING", async () => {
+    // The two checkouts disagree, which is reachable in production: probe reads fire per scope and
+    // un-awaited, and the gate caches by `updatedAt` — whose known hole (a probe answered by EDITING
+    // an existing reply never bumps the PR's stamp) is exactly a mechanism for one member to hold a
+    // stale reading while the other holds the fresh one. Only the WORKTREE saw the probes.
+    h.invoke.mockImplementation((cmd: string, args: Record<string, unknown> = {}) => {
+      if (cmd === "project_open_prs") return Promise.resolve([PASS]);
+      if (cmd === "merge_pr") return Promise.resolve(null);
+      if (cmd === "knightwatch_probe_gate")
+        return Promise.resolve({
+          applicable: true,
+          probes: (args.root as string) === WT ? [blockingProbe(0), blockingProbe(1)] : [],
+          error: null,
+          overridden: false,
+        });
+      return Promise.resolve(null);
+    });
+
+    render(<OpenPrMenu scopes={PAIR} resolveAgent={noAgent} onOpenAgent={noop} />);
+    fireEvent.click(await screen.findByTestId("open-pr-badge"));
+
+    // The label takes the strongest reading — this half already worked.
+    await waitFor(() =>
+      expect(screen.getByTestId(`pr-state-${PASS.number}`).textContent).toMatch(/Blocked: 2 probes/),
+    );
+
+    // …and the DRAWER must name those same two. Reading the primary's map found nothing, so the
+    // disclosure did not render at all and the row could not say WHICH probes it meant.
+    const disclosure = await screen.findByTestId(`probe-disclosure-${PASS.number}`);
+    // The disclosure's accessible name states the same count the label does, while COLLAPSED (the
+    // expanded name is a plain "Hide…"). One number, read in three places, all of them now the
+    // merged answer.
+    expect(disclosure.getAttribute("aria-label")).toMatch(/2 unanswered probes/i);
+    fireEvent.click(disclosure);
+    const detail = await screen.findByTestId(`probe-detail-${PASS.number}`);
+    expect(detail.querySelectorAll('[data-testid^="probe-item-"]').length).toBe(2);
+  });
+});
+
+// ── THE DRAWER SELECTS BY THE SAME RANK THE LABEL DOES (roborev 59974) ─────────────────────────
+//
+// "Longest list wins" was the first attempt at merging the detail and it DIVERGES from
+// `probeStrength` on overridden readings: the strength rank calls an overridden gate not-blocking
+// whatever its count, while the detail map stores the unanswered list for an overridden gate too.
+// So a member holding a fresh {overridden: true, unansweredBlocking: 4} beat a member holding a
+// stale {overridden: false, unansweredBlocking: 1} on LENGTH while losing to it on STRENGTH — the
+// row said "Blocked: 1 probe" while the drawer announced four, three of them already waived.
+describe("OpenPrMenu — folded probe detail follows the rank, not the list length", () => {
+  const MAIN = "/Users/x/Projects/sparkle";
+  const WT = "/Users/x/Projects/sparkle-desktop";
+  const PAIR: readonly PrScope[] = [
+    { projectId: "p-main", projectName: "sparkle", rootPath: MAIN, repoKey: `${MAIN}/.git` },
+    { projectId: "p-wt", projectName: "sparkle-desktop", rootPath: WT, repoKey: `${MAIN}/.git` },
+  ];
+
+  /** `overriddenRoot` holds the LONGER but WAIVED reading; the other holds the shorter live one. */
+  function stubSplit(overriddenRoot: string) {
+    h.invoke.mockImplementation((cmd: string, args: Record<string, unknown> = {}) => {
+      if (cmd === "project_open_prs") return Promise.resolve([PASS]);
+      if (cmd === "merge_pr") return Promise.resolve(null);
+      if (cmd === "knightwatch_probe_gate") {
+        const isOverridden = (args.root as string) === overriddenRoot;
+        return Promise.resolve({
+          applicable: true,
+          probes: isOverridden
+            ? [blockingProbe(0), blockingProbe(1), blockingProbe(2), blockingProbe(3)]
+            : [blockingProbe(0)],
+          error: null,
+          overridden: isOverridden,
+        });
+      }
+      return Promise.resolve(null);
+    });
+  }
+
+  for (const overriddenRoot of [MAIN, WT]) {
+    const which = overriddenRoot === MAIN ? "primary" : "worktree";
+    it(`shows the ONE live probe, not the four waived ones (waived on the ${which})`, async () => {
+      // Both member orders, because a selection that falls back to position passes one of them by
+      // luck — the same reason the fleetPrs ordering cases are written in pairs.
+      stubSplit(overriddenRoot);
+      render(
+        <OpenPrMenu scopes={PAIR} resolveAgent={noAgent} onOpenAgent={noop} />,
+      );
+      fireEvent.click(await screen.findByTestId("open-pr-badge"));
+
+      await waitFor(() =>
+        expect(screen.getByTestId(`pr-state-${PASS.number}`).textContent).toMatch(
+          /Blocked: 1 probe$/,
+        ),
+      );
+      const disclosure = await screen.findByTestId(`probe-disclosure-${PASS.number}`);
+      // The accessible name is derived from the DETAIL's length, so it is where the divergence
+      // surfaced: it announced four while the row beside it claimed one.
+      expect(disclosure.getAttribute("aria-label")).toMatch(/1 unanswered probe blocking/i);
+      fireEvent.click(disclosure);
+      const detail = await screen.findByTestId(`probe-detail-${PASS.number}`);
+      expect(detail.querySelectorAll('[data-testid^="probe-item-"]').length).toBe(1);
+    });
+  }
+});

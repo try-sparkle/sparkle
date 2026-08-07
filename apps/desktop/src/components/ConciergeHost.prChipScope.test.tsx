@@ -40,19 +40,45 @@ describe("prChipScopes", () => {
     // PR numbers collide across repos. The pairing has to survive this mapping intact.
     const scopes = prChipScopes([P("a", "a", "/code/a"), P("b", "b", "/code/b")]);
     expect(scopes).toEqual([
-      { projectId: "a", projectName: "a", rootPath: "/code/a" },
-      { projectId: "b", projectName: "b", rootPath: "/code/b" },
+      { projectId: "a", projectName: "a", rootPath: "/code/a", repoKey: null },
+      { projectId: "b", projectName: "b", rootPath: "/code/b", repoKey: null },
     ]);
   });
 
   it("keeps a project with no rootPath as a scope, normalising the absence to null", () => {
     // The tab exists, so it is listed; the menu declines to probe or merge a null path itself.
     expect(prChipScopes([P("p1", "p1", null)])).toEqual([
-      { projectId: "p1", projectName: "p1", rootPath: null },
+      { projectId: "p1", projectName: "p1", rootPath: null, repoKey: null },
     ]);
     expect(prChipScopes([{ id: "p2", name: "p2" }])).toEqual([
-      { projectId: "p2", projectName: "p2", rootPath: null },
+      { projectId: "p2", projectName: "p2", rootPath: null, repoKey: null },
     ]);
+  });
+
+  it("carries the repo key, so two tabs on ONE repository can be folded into one section", () => {
+    // The founder had `sparkle` and `sparkle-desktop` open — a checkout and a linked WORKTREE of it,
+    // so two tabs over one repository and one set of pull requests. The panel counted them twice
+    // (47 across 6 projects; the same 23 PRs under both headings) because this mapping dropped the
+    // one field that can tell: `git rev-parse --git-common-dir`, which answers the SAME `.git` from
+    // either folder. It cannot be re-derived downstream — a linked worktree's `.git` is a FILE, so
+    // no path test and no `is .git a directory` check sees it.
+    const scopes = prChipScopes([
+      { id: "p1", name: "sparkle", rootPath: "/code/sparkle", repoKey: "/code/sparkle/.git" },
+      {
+        id: "p2",
+        name: "sparkle-desktop",
+        rootPath: "/code/sparkle-desktop",
+        repoKey: "/code/sparkle/.git",
+      },
+    ]);
+    expect(scopes.map((s) => s.repoKey)).toEqual(["/code/sparkle/.git", "/code/sparkle/.git"]);
+  });
+
+  it("normalises an unresolved repo key to null rather than dropping the field", () => {
+    // Resolution is a git subprocess that answers a beat after hydrate. `null` is "not yet / not a
+    // repo", which the fold reads as "fall back to the path" — the pre-change behaviour, not a
+    // wrong one.
+    expect(prChipScopes([P("p1")])[0]!.repoKey).toBeNull();
   });
 
   // The one case that yields nothing: a shell with no project tab at all — the app's "open a project

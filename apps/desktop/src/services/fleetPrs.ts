@@ -15,6 +15,7 @@
 //
 // So scope is no longer a choice between projects. It is EVERY open project tab, and the answer is
 // grouped by the tab's own name.
+import { pathKey } from "../engine/projectIdentity";
 import {
   prProbeBlockedCount,
   prReadyCount,
@@ -22,17 +23,73 @@ import {
 } from "./openPrs";
 
 /**
- * One repo the menu is asking about — an open project tab, flattened to the three things the menu
- * needs. `projectName` is in here because it is RENDERED (it is the group's section header, which
- * is the founder's literal ask: "listed by project tab name"), not merely to identify the row.
+ * One repo the menu is asking about — an open project tab, flattened to the things the menu needs.
+ * `projectName` is in here because it is RENDERED (it is the group's section header, which is the
+ * founder's literal ask: "listed by project tab name"), not merely to identify the row.
  *
  * `rootPath` is nullable because a project record can carry an empty one; such a scope is listed
  * (the tab exists) but is never probed and never merged into.
+ *
+ * `repoKey` is the canonical `.git` common dir (`services/repoKey`, Rust `project_repo_key`) — the
+ * value that says WHICH REPOSITORY this folder belongs to. It is what makes two tabs over one repo
+ * fold into one section; see {@link repoIdentityOf}. Absent until the resolver has answered, and
+ * never invented.
  */
 export interface PrScope {
   projectId: string;
   projectName: string;
   rootPath: string | null;
+  repoKey?: string | null;
+}
+
+/**
+ * WHICH REPOSITORY a scope belongs to — the value two project tabs are folded ON.
+ *
+ * THE BUG THIS EXISTS FOR (the founder's 2026-08-06 report). The panel read "47 open pull requests
+ * across 6 projects" and listed SPARKLE with 23 PRs and SPARKLE-DESKTOP with the SAME 23 — same
+ * numbers, same titles, same branches. `/Users/…/Projects/sparkle-desktop` is a linked git WORKTREE
+ * of `/Users/…/Projects/sparkle`: two folders, two project records, ONE repository and therefore one
+ * set of pull requests. Every count here was taken per PROJECT ENTRY, so one repo registered twice
+ * was counted twice — the total, the "across N projects", and the list itself.
+ *
+ * DELIBERATELY NOT A PATH TEST, and specifically not `[ -d "$path/.git" ]`'s shape: a linked
+ * worktree's `.git` is a FILE, not a directory, so anything keyed on the path or on `.git` being a
+ * directory reports these two as unrelated. `repoKey` is `git rev-parse --git-common-dir`, which
+ * resolves to the SAME `<main>/.git` from either checkout and is the one signal that collapses them.
+ *
+ * The same rule as `engine/projectIdentity.identityKey`, and the prefix is load-bearing for the same
+ * reason: a `.git` common dir is itself a real absolute path, so without a kind prefix a project
+ * whose ROOT happened to be another's `.git` dir would read as the same repository.
+ *
+ * FALLS BACK TO THE PATH, then to the PROJECT ID. A repo key is resolved by a git subprocess, so it
+ * is absent for a folder that is not a repo, for a record predating the field, and for the window
+ * between hydrate and the first sweep. Falling back keeps this TOTAL and MONOTONIC: with no keys it
+ * degrades to exactly the per-tab behaviour the panel had before, and every key that arrives can
+ * only ever merge two sections, never split one. The project-id tier is the floor — a scope with no
+ * root path has no repository at all and must never be folded into another one on the strength of
+ * two empty strings.
+ */
+export function repoIdentityOf(scope: PrScope): string {
+  const repo = scope.repoKey?.trim();
+  if (repo) return `repo:${pathKey(repo)}`;
+  const root = scope.rootPath?.trim();
+  if (root) return `path:${pathKey(root)}`;
+  return `project:${scope.projectId}`;
+}
+
+/**
+ * The repo identities of `scopes`, joined — a dependency that changes exactly when the FOLDING
+ * would.
+ *
+ * SEPARATE FROM {@link scopeSetKey}, which the poll effect keys on, and that separation is the
+ * point. A repo key arrives asynchronously (the backfill sweep resolves it a beat after hydrate),
+ * so the grouping has to recompute when it lands — but folding two sections into one is a rendering
+ * change, not a reason to re-probe GitHub for every open repo. Putting this in `scopeSetKey` would
+ * restart the 3-minute poll and spend a `gh` round trip per repo for a fact that changes nothing
+ * about what to ask.
+ */
+export function scopeIdentitySetKey(scopes: readonly PrScope[]): string {
+  return scopes.map(repoIdentityOf).join("\u0001");
 }
 
 /**
@@ -92,7 +149,37 @@ export function prKeyOf(scopeKey: string, number: number): string {
  * zero on a machine that merely failed to look.
  */
 export interface PrGroup {
+  /**
+   * The section's PRIMARY scope — the FIRST open tab of this repository in tab order.
+   *
+   * "First in tab order" is the founder's choice and it costs no new state: sections already read
+   * top-to-bottom in the order the tabs read left-to-right, so the primary is simply the one that
+   * would have come first anyway. Everything scoped to a section — its ledger key, the root a merge
+   * runs from, where a dismissal is written — comes from this one scope, so the section has exactly
+   * one identity rather than a set of them.
+   */
   scope: PrScope;
+  /**
+   * EVERY open tab folded into this section, primary first — including the primary itself, so this
+   * is never empty and `members[0] === scope`.
+   *
+   * Carried rather than discarded because THE OTHER TABS ARE REAL. Agents live in a project entry,
+   * not in a repository: the founder has agents working in `sparkle` and agents working in
+   * `sparkle-desktop`, and they are distinct even though the repo is one. This is what lets the
+   * section name both checkouts instead of making one of them silently vanish, and it is what the
+   * row merge reads to keep every entry's ownership answer.
+   */
+  members: PrScope[];
+  /**
+   * The names of the OTHER tabs on this repository — `members` after the primary, deduplicated.
+   * Empty for the ordinary one-tab-one-repo case, which is what keeps the heading unchanged there.
+   *
+   * RENDERED, not merely recorded. The founder's instruction was explicit: a duplicate may not
+   * disappear in a way that hides which local checkout an agent is working in. So the heading says
+   * `SPARKLE · also open as sparkle-desktop` — the fold is stated on screen, in the one place
+   * someone looking for the missing section would look.
+   */
+  alsoOpenAs: string[];
   key: string;
   /** The rows the menu LISTS — everything open in this scope MINUS anything dismissed. Carries the
    *  probe reading when one has landed; see {@link JudgedPrRow}. */
@@ -150,28 +237,178 @@ export interface PrGroup {
  * scope means "none dismissed", which is also what a failed read of the dismissal store degrades
  * to — showing a row the user waved away is a far better failure than hiding one they did not.
  * The numbers are per-scope because PR numbers collide across repositories; see `prKeyOf`.
+ *
+ * ONE SECTION PER REPOSITORY, NOT PER TAB. Scopes that resolve to the same repository — two tabs on
+ * one repo, which is what a linked git worktree is — are folded into a single group whose primary is
+ * the first of them in tab order, with the others named in `alsoOpenAs`. See {@link repoIdentityOf}
+ * for the fold and {@link mergeRepoRows} for what merging their rows preserves. Every count in this
+ * file is taken from these groups, so the fold fixes the fleet total, the per-section count and the
+ * "across N projects" in one move — they were three readings of the same miscount.
  */
+/**
+ * How much a `pr_owner` answer is WORTH — mirrored from Rust's `pr_owner::source_rank`.
+ *
+ * Needed because two tabs on one repository can BOTH answer "who owns #1433" and disagree, and the
+ * disagreement is systematic rather than rare. The bottom tier, `branch-name`, is the legacy
+ * `sparkle/agent-<id>` convention and is the ONE source that does not consult the project id at all
+ * — so every member resolves it identically. Taking the first member's answer would therefore hand
+ * a weak branch-name guess the win over the authoritative `created` record held by the OTHER tab,
+ * on every PR opened from the second checkout. Rank, then order.
+ *
+ * An unrecognised source ranks 0 — above nothing but a missing owner. A Rust build that adds a fifth
+ * source must not have it silently outrank `created` here.
+ */
+const OWNER_SOURCE_RANK: Readonly<Record<string, number>> = {
+  created: 4,
+  "pr-body": 3,
+  "worktree-branch": 2,
+  "branch-name": 1,
+};
+
+/** The strength of one row's ownership answer. `0` means "no owner", which every real source beats;
+ *  `agentId: null` is UNKNOWN and never outranks a resolved one. */
+function ownerStrength(row: JudgedPrRow): number {
+  if (!row.agentId) return 0;
+  return OWNER_SOURCE_RANK[row.agentIdSource ?? ""] ?? 0.5;
+}
+
+/**
+ * How much a knightwatch reading actually SAYS:
+ * **absent < unknown < answered-clean < answered-blocking (by count)**.
+ *
+ * `PrProbeState.unansweredBlocking` is `null` for "could not find out" (no `gh`, unauthed, offline,
+ * timed out, or a saturated comment window), which is a DIFFERENT answer from `0`. A merge of two
+ * readings that only asks "is one defined" therefore lets a present-but-unknown reading beat a
+ * present-and-answered one — see {@link mergeRepoRows}, where that was the first defect.
+ *
+ * THE TOP TWO TIERS ARE SEPARATE FOR THE SAME REASON, ONE DOOR OVER (roborev 59927). Collapsing
+ * every answered reading into one rank makes two answered members TIE, and a tie resolves by
+ * position — so the primary's `{unansweredBlocking: 0}` suppressed the other tab's
+ * `{unansweredBlocking: 2}` and the row went green with a live one-click Merge that Rust's
+ * `merge_pr` refuses. That divergence is not hypothetical: probe reads are fired per scope and
+ * un-awaited, and `fetchProbeGates` caches by `updatedAt` — whose known hole (a probe answered by
+ * EDITING an existing reply never bumps the PR's stamp) is precisely a mechanism for one member to
+ * hold a stale-but-answered count while the other holds the fresh one.
+ *
+ * So the tie breaks toward the BLOCKING reading, and within blocking toward the larger count, which
+ * takes position out of the answer entirely. That is this module's stated safe direction: withholding
+ * a green we are unsure of costs a Refresh, while suppressing a block the app already knows about
+ * costs an irreversible-looking button that fails. `overridden` counts as not-blocking, because a
+ * written override is exactly the thing that unblocks it.
+ */
+export function probeStrength(probes: JudgedPrRow["probes"]): number {
+  if (!probes) return 0;
+  const unanswered = probes.unansweredBlocking;
+  if (unanswered === null) return 1;
+  if (probes.overridden || unanswered <= 0) return 2;
+  // 3 + count, so a blocking reading always outranks a clean one AND the larger block wins.
+  return 3 + unanswered;
+}
+
+/**
+ * The rows of one REPOSITORY, from every tab open on it, reduced to one row per pull request.
+ *
+ * The lists are the same list — same repo, same `gh pr list` — so this is a de-duplication, not a
+ * union of different things. What differs between them is only what is resolved PER PROJECT ENTRY,
+ * and those are the fields merged here:
+ *
+ * - **Owner** — taken from the strongest answer across the members (see {@link ownerStrength}), not
+ *   from the first. This is the field the whole fold has to be careful with: an agent lives in a
+ *   project entry, so only that entry's probe can name it.
+ * - **Probes** — the knightwatch reading lands asynchronously and per scope, so one member can have
+ *   it while another does not, and a member that HAS one may still have failed to find anything out.
+ *   Merged by {@link probeStrength}, so a less informative reading never wins: re-hiding a block the
+ *   app already knows about is the one direction that costs something, and it costs a green dot over
+ *   a live Merge button on a PR the Rust gate will refuse.
+ * - **Saturation** — ORed. A truncated read from either member means rows are missing from this
+ *   section, and `prListSaturated` must still be able to say so.
+ *
+ * Everything else describes the pull request itself and is identical by construction; the first
+ * member's row supplies it, which keeps the section's rows in the primary's order.
+ */
+function mergeRepoRows(perMember: readonly (JudgedPrRow[] | null)[]): JudgedPrRow[] {
+  const order: number[] = [];
+  const seen = new Map<number, JudgedPrRow>();
+  for (const rows of perMember) {
+    for (const row of rows ?? []) {
+      const prev = seen.get(row.number);
+      if (!prev) {
+        order.push(row.number);
+        seen.set(row.number, row);
+        continue;
+      }
+      seen.set(row.number, {
+        ...prev,
+        ...(ownerStrength(row) > ownerStrength(prev)
+          ? { agentId: row.agentId, agentIdSource: row.agentIdSource }
+          : {}),
+        // BY STRENGTH, NOT BY PRESENCE (roborev 59902, Medium). `probes !== undefined` was the test,
+        // and a reading that came back UNKNOWN — `unansweredBlocking: null`, which is what an
+        // unauthed or timed-out `gh` produces — is present. So the primary's failed read beat the
+        // other tab's answered one, and a PR the app KNEW was blocked on unanswered probes rendered
+        // green with a live one-click Merge. That is the exact failure `PrProbeState` spends its
+        // doc-comment warning about, reached through the fold.
+        ...(probeStrength(row.probes) > probeStrength(prev.probes)
+          ? { probes: row.probes }
+          : {}),
+        ...(row.listSaturated ? { listSaturated: true } : {}),
+      });
+    }
+  }
+  return order.map((n) => seen.get(n)!);
+}
+
 export function buildPrGroups(
   scopes: readonly PrScope[],
   byKey: ReadonlyMap<string, JudgedPrRow[] | null>,
   failedKeys: ReadonlySet<string>,
   dismissedByKey: ReadonlyMap<string, ReadonlySet<number>> = new Map(),
 ): PrGroup[] {
-  return scopes.map((scope) => {
+  // ── FOLD THE TABS ONTO THEIR REPOSITORIES FIRST ──────────────────────────────────────────────
+  //
+  // Insertion order is preserved by `Map`, so the sections still come out in tab order and each
+  // repository lands where its FIRST tab was — the primary rule, for free.
+  const byRepo = new Map<string, PrScope[]>();
+  for (const scope of scopes) {
+    const id = repoIdentityOf(scope);
+    const bucket = byRepo.get(id);
+    if (bucket) bucket.push(scope);
+    else byRepo.set(id, [scope]);
+  }
+
+  return [...byRepo.values()].map((members) => {
+    const scope = members[0]!;
     const key = keyOfScope(scope);
-    const rows = byKey.get(key) ?? null;
-    const all = rows ?? [];
-    const hidden = dismissedByKey.get(key);
+    // EVERY MEMBER'S PROBE IS READ, not just the primary's — this is the half that keeps agent
+    // attribution intact. `project_open_prs` resolves each PR's owning agent through a store keyed
+    // BY PROJECT ID (Rust `pr_owner::resolve_owner`), so the entry an agent lives in is the only one
+    // that can answer for its PRs. Probing only the primary would have made every PR opened from the
+    // second checkout read as owner-unknown — a silent attribution regression traded for one saved
+    // `gh` call. Instead the folding is purely a presentation and counting change: the same probes
+    // run as before, and their answers are merged.
+    const perMember = members.map((m) => byKey.get(keyOfScope(m)) ?? null);
+    const known = perMember.some((r) => r !== null);
+    const all = mergeRepoRows(perMember);
+    // DISMISSAL IS A STATEMENT ABOUT A PULL REQUEST, so it is a UNION across the members. One repo
+    // has one #1433; waving it away in one tab and having it come straight back under the other
+    // would make the dismissal look broken, and the section it would come back in no longer exists.
+    const hidden = new Set<number>();
+    for (const m of members) for (const n of dismissedByKey.get(keyOfScope(m)) ?? []) hidden.add(n);
     // ONE PASS, TWO BUCKETS. `prs` is what the list shows and what every count is taken from;
     // `dismissed` is what the Dismissed section offers back.
-    const prs = hidden && hidden.size > 0 ? all.filter((p) => !hidden.has(p.number)) : all;
-    const dismissed = hidden && hidden.size > 0 ? all.filter((p) => hidden.has(p.number)) : [];
-    const known = rows !== null;
+    const prs = hidden.size > 0 ? all.filter((p) => !hidden.has(p.number)) : all;
+    const dismissed = hidden.size > 0 ? all.filter((p) => hidden.has(p.number)) : [];
     // A scope with no `rootPath` is listed (the tab exists) but never probed, so it is neither
     // failed nor unreadable — there is nothing we tried and could not do.
-    const failed = failedKeys.has(key);
+    //
+    // ANY member failing marks the section stale, because a section showing merged rows is only as
+    // trustworthy as its worst read. But `unreadable` still needs `!known`: if one tab answered, the
+    // section HAS a list, and calling it unreadable would hide rows we are holding.
+    const failed = members.some((m) => failedKeys.has(keyOfScope(m)));
     return {
       scope,
+      members,
+      alsoOpenAs: [...new Set(members.slice(1).map((m) => m.projectName))],
       key,
       prs,
       dismissed,
@@ -230,7 +467,12 @@ export interface FleetTotals {
    */
   pending: number;
   /**
-   * Scopes we could ever ask about at all — those with a `rootPath`.
+   * REPOSITORIES we could ever ask about at all — groups whose primary has a `rootPath`.
+   *
+   * THIS IS THE "ACROSS 6 PROJECTS" THE FOUNDER READ, and it was inflated by exactly the same fault
+   * as the total beside it: two tabs on one repository counted twice. It counts groups, and groups
+   * are now per repository, so a repo open in two tabs contributes one — the same number the list
+   * below it now has sections.
    *
    * "NOTHING TO ASK" AND "NOT ASKED YET" ARE DIFFERENT, and without this they were the same number.
    * A fleet whose only project has no root path settles at `known: false, pending: 0, unreadable: 0`

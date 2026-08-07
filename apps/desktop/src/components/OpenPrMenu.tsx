@@ -89,6 +89,8 @@ import {
   fleetTotals,
   keyOfScope,
   prKeyOf,
+  probeStrength,
+  scopeIdentitySetKey,
   scopeSetKey,
   staleProjectNames,
   unreadableProjectNames,
@@ -1060,31 +1062,103 @@ export function OpenPrMenu({
     return out;
   }, [byKey, probesByKey]);
   /**
+   * A dep the POLL deliberately does not share — see `scopeIdentitySetKey`.
+   *
+   * Repo keys are resolved by a git subprocess and backfilled a beat after hydrate, so the grouping
+   * has to recompute when one lands or two tabs on one repository would stay unfolded for the rest
+   * of the session. Folding two sections into one changes nothing about WHAT to ask GitHub, though,
+   * so putting it in `scopesKey` would restart the 3-minute poll and spend a `gh` round trip per
+   * open repo for a purely local fact.
+   */
+  const repoIdentityKey = useMemo(() => scopeIdentitySetKey(scopes), [scopes]);
+  const groups = useMemo(
+    () => buildPrGroups(scopes, judgedByKey, failedKeys, hiddenByKey),
+    // Same reasoning as the effect: recompute when the scope SET, the data, or the staleness moves —
+    // plus `repoIdentityKey`, which moves when a repo key arrives and two sections become one.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [scopesKey, repoIdentityKey, judgedByKey, failedKeys, hiddenByKey],
+  );
+  /**
+   * The probe DETAIL a section's rows should show, keyed by group — merged across the group's
+   * members exactly like the counts are.
+   *
+   * THE BUG THIS FIXES (roborev 59958). `probeDetailByKey` is written per SCOPE, and the row read it
+   * at `group.key` — the PRIMARY's scope key. Once two tabs on one repository fold into one section
+   * the count and the detail stopped coming from the same place: the merged row takes the STRONGEST
+   * probe reading across members (`fleetPrs.probeStrength`), so a row could say "Blocked: 2 probes"
+   * on the worktree's reading while its disclosure read the primary's map and found NOTHING. A row
+   * that names a blocker and then cannot show it is the worst version of this feature — the reader
+   * is told to go and answer probes the panel will not name.
+   *
+   * SELECTED BY `probeStrength` — THE SAME FUNCTION `mergeRepoRows` USES, not a rule that merely
+   * resembles it (roborev 59974). "Longest list wins" was the first attempt and it diverges on
+   * OVERRIDDEN readings: `probeStrength` ranks an overridden gate as not-blocking whatever its
+   * count, while `probeDetailByKey` stores the unanswered list for an overridden gate too. So a
+   * member holding a fresh `{overridden: true, unansweredBlocking: 4}` beat a member holding a stale
+   * `{overridden: false, unansweredBlocking: 1}` on LENGTH while losing to it on STRENGTH — the row
+   * said "Blocked: 1 probe" and the drawer announced four, three of them already waived. That is the
+   * same contradiction this whole memo exists to remove, pointed the other way.
+   *
+   * Ties keep the EARLIER member, exactly as `mergeRepoRows` does, so the two selections are the
+   * same selection rather than two that happen to agree.
+   */
+  const probeDetailByGroup = useMemo(() => {
+    const out = new Map<string, Map<number, ProbeDetail[]>>();
+    for (const g of groups) {
+      const merged = new Map<number, ProbeDetail[]>();
+      const strongest = new Map<number, number>();
+      for (const member of g.members) {
+        const memberKey = keyOfScope(member);
+        const detail = probeDetailByKey.get(memberKey);
+        if (!detail) continue;
+        const states = probesByKey.get(memberKey);
+        for (const [number, list] of detail) {
+          const strength = probeStrength(states?.get(number));
+          const prev = strongest.get(number);
+          if (prev !== undefined && strength <= prev) continue;
+          strongest.set(number, strength);
+          merged.set(number, list);
+        }
+      }
+      out.set(g.key, merged);
+    }
+    return out;
+  }, [groups, probeDetailByKey, probesByKey]);
+
+  /**
    * The PRs whose row is REPORTING probes as its blocker, as `(root, number)` pairs.
    *
    * A function rather than a memo: it is read once per panel-open, and closing over the current
-   * `judgedByKey` is the point — this must reflect what the rows say right now.
+   * `groups` is the point — this must reflect what the rows say right now.
+   *
+   * DERIVED FROM THE RENDERED ROWS, NOT FROM THE PER-SCOPE LISTS (roborev 59958). It used to walk
+   * `scopesRef.current` and judge `judgedByKey`'s unmerged rows, which put a SECOND ranking beside
+   * the one the panel paints — the exact "one ranking, one answer" discipline `PrBlocker` was
+   * introduced to enforce. Once two tabs on one repository fold into one section the two can
+   * disagree: the merged row carries the strongest probe reading across members (see
+   * `fleetPrs.probeStrength`), so a section the panel shows as clean could still be listed here by
+   * whichever member happened to hold a blocking reading the merge declined to use, and every PR in
+   * a folded section was emitted once per tab.
+   *
+   * IT STILL WALKS EVERY MEMBER'S ROOT, though, and that half is deliberate: the gate cache is keyed
+   * `(root, number)` (`probeGate.cacheKey`), so a repo open under two checkouts has an entry per
+   * checkout and evicting only the primary's would leave the other stale — the next read would serve
+   * the pre-answer verdict from cache. One decision, taken from the rendered row; every cache entry
+   * that decision implicates, dropped.
    */
   const probeBlockedTargets = useCallback((): ProbeGateTarget[] => {
     const out: ProbeGateTarget[] = [];
-    for (const scope of scopesRef.current) {
-      if (!scope.rootPath) continue;
-      const rows = judgedByKey.get(keyOfScope(scope));
-      if (!rows) continue;
-      for (const row of rows) {
-        if (prMergeReadiness(row).blocker === "probes")
-          out.push({ root: scope.rootPath, number: row.number });
+    for (const group of groups) {
+      for (const row of group.prs) {
+        if (prMergeReadiness(row).blocker !== "probes") continue;
+        for (const member of group.members) {
+          if (member.rootPath) out.push({ root: member.rootPath, number: row.number });
+        }
       }
     }
     return out;
-  }, [judgedByKey]);
+  }, [groups]);
 
-  const groups = useMemo(
-    () => buildPrGroups(scopes, judgedByKey, failedKeys, hiddenByKey),
-    // Same reasoning as the effect: recompute when the scope SET, the data, or the staleness moves.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [scopesKey, judgedByKey, failedKeys, hiddenByKey],
-  );
   const totals = fleetTotals(groups);
   /**
    * DID ANY SCOPE'S PROBE COME BACK TRUNCATED — i.e. is the number below a FLOOR rather than a total?
@@ -1333,7 +1407,7 @@ export function OpenPrMenu({
   };
 
   /** Put a dismissed PR back in the ready list — the user's Restore. Same optimistic shape. */
-  const runRestore = async (scope: PrScope, key: string, number: number) => {
+  const runRestoreIn = async (scope: PrScope, key: string, number: number) => {
     const before = dismissedByKey.get(key) ?? [];
     setDismissedByKey((prev) =>
       new Map(prev).set(
@@ -1344,6 +1418,27 @@ export function OpenPrMenu({
     const stored = await restorePr(scope.projectId, number);
     if (!aliveRef.current || !liveKeysRef.current.has(key)) return;
     setDismissedByKey((prev) => new Map(prev).set(key, stored ?? before));
+  };
+
+  /**
+   * Restore across EVERY member of the section that is holding this dismissal.
+   *
+   * THE BUG THIS FIXES (roborev 59902, Medium). Dismissals are stored by Rust per PROJECT ID, and a
+   * section that folds two tabs on one repository reads them as a UNION — so a row can be hidden by
+   * a record belonging to the NON-PRIMARY tab. Restore addressed only `group.scope`, the primary, so
+   * clicking it wrote to a store that did not hold the record: the IPC succeeded, the local map for
+   * the primary's key was already empty, and the union kept the row hidden. A Restore button that
+   * reports success and restores nothing is worse than a missing one — the row is gone and the one
+   * affordance for getting it back appears to have been used.
+   *
+   * Every member is asked rather than just the one we think holds it, because "who holds it" is
+   * exactly the state that can be stale here, and `restorePr` on a record that is not there is a
+   * no-op. Sequential so two writes to the same store cannot race.
+   */
+  const runRestore = async (group: PrGroup, number: number) => {
+    for (const member of group.members) {
+      await runRestoreIn(member, keyOfScope(member), number);
+    }
   };
 
   const openGithub = (url: string) => {
@@ -1714,7 +1809,18 @@ export function OpenPrMenu({
                   >
                     <span
                       data-testid="pr-group-name"
-                      title={group.scope.rootPath ?? group.scope.projectName}
+                      data-also-open-as={group.alsoOpenAs.join(", ") || undefined}
+                      title={
+                        // THE FOLD IS STATED, NEVER SILENT. When two tabs are one repository the
+                        // section that vanished has to be findable, and the tooltip is where someone
+                        // hunting for it will look — so it names every checkout's PATH, which is the
+                        // fact that tells an agent's owner which working copy they are in.
+                        group.members.length > 1
+                          ? group.members
+                              .map((m) => `${m.projectName}: ${m.rootPath ?? "(no folder)"}`)
+                              .join("\n")
+                          : (group.scope.rootPath ?? group.scope.projectName)
+                      }
                       style={{
                         // Yields before the button does — same ranking as the panel header, same
                         // reason: the action must never be the thing that truncates.
@@ -1731,6 +1837,26 @@ export function OpenPrMenu({
                       }}
                     >
                       {group.scope.projectName}
+                      {group.alsoOpenAs.length > 0 && (
+                        // ONE REPOSITORY, TWO TABS — said out loud in the heading (the founder's
+                        // choice of the three presentations offered). A linked worktree means the
+                        // two tabs share every pull request, so the rows are listed once here; the
+                        // other checkout is named rather than dropped, because agents live in a
+                        // PROJECT ENTRY and the reader has to be able to tell which one they are
+                        // looking at. Lowercase and un-tracked so it reads as an aside against the
+                        // uppercase project name rather than a second heading.
+                        <span
+                          data-testid="pr-group-also-open-as"
+                          style={{
+                            fontWeight: FONT_WEIGHT.regular,
+                            letterSpacing: "normal",
+                            textTransform: "none",
+                            opacity: 0.75,
+                          }}
+                        >
+                          {` · also open as ${group.alsoOpenAs.join(", ")}`}
+                        </span>
+                      )}
                     </span>
                     {/* THE NUMBER THE FOUNDER READ AS "ELEVEN READY".
                         It was `group.prs.length` — the total open — sitting beside a "Merge all
@@ -1855,7 +1981,7 @@ export function OpenPrMenu({
                     // read as the contract.
                     const probeDetail =
                       ready.blocker === "probes"
-                        ? probeDetailByKey.get(group.key)?.get(pr.number)
+                        ? probeDetailByGroup.get(group.key)?.get(pr.number)
                         : undefined;
                     const probesOpen = probeExpanded === rowKey;
                     const busy = merging.has(rowKey);
@@ -2508,7 +2634,7 @@ export function OpenPrMenu({
                           aria-label={`Restore PR #${pr.number} to the list`}
                           title="Restore — list and count this PR again"
                           onClick={() =>
-                            void runRestore(group.scope, group.key, pr.number)
+                            void runRestore(group, pr.number)
                           }
                           style={{
                             flex: "0 0 auto",

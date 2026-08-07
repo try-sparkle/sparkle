@@ -44,8 +44,11 @@ const conflicting = (number: number): PrRow => ({
 
 describe("scope identity", () => {
   it("distinguishes two projects that point at the SAME checkout", () => {
-    // Two tabs on one repo are two rows the user opened, so they are two groups — and two distinct
-    // ledger namespaces. Collapsing them would make one tab's in-flight merge grey out the other.
+    // Two tabs on one repo are two distinct LEDGER NAMESPACES, and that stays true even though the
+    // two now render as one section: `scopeKeyOf` keys the in-flight-merge and arm ledgers, and
+    // collapsing it would make one tab's in-flight merge grey out the other. The fold happens a
+    // layer up, on repository identity, and deliberately leaves this key alone — see
+    // `repoIdentityOf` and the "one repository open under two project entries" block below.
     expect(scopeKeyOf("/code/sparkle", "p1")).not.toBe(scopeKeyOf("/code/sparkle", "p2"));
   });
 
@@ -438,5 +441,358 @@ describe("fleetTotals + fleetHeadline — dismissals", () => {
     const t = fleetTotals(buildPrGroups([sparkle], new Map([[keyOfScope(sparkle), []]]), new Set()));
     expect(t.dismissed).toBe(0);
     expect(fleetHeadline(t)).toBe("No open pull requests");
+  });
+});
+
+// ── ONE REPOSITORY, TWO PROJECT ENTRIES ────────────────────────────────────────────────────────
+//
+// THE FOUNDER'S 2026-08-06 REPORT, pinned. The panel read "47 open pull requests across 6 projects"
+// and listed SPARKLE-DESKTOP with 23 PRs and SPARKLE with the SAME 23 — identical numbers, titles
+// and branches under both headings. `/Users/…/Projects/sparkle-desktop` is a linked git WORKTREE of
+// `/Users/…/Projects/sparkle`: two folders, two project records, ONE repository, ONE origin
+// (`https://github.com/drodio/sparkle.git`) and therefore one set of pull requests.
+//
+// The detection subtlety these tests exist to keep honest: a linked worktree's `.git` is a FILE, so
+// nothing about the path or the folder's shape distinguishes it. Identity comes from the RESOLVED
+// repository — `git rev-parse --git-common-dir`, which answers `<main>/.git` from either checkout —
+// carried in as `repoKey`. Every assertion below is over a value the UI renders (the rows, the
+// section count, the headline), never over the input that was handed in.
+describe("one repository open under two project entries", () => {
+  /** The two entries the founder had open: different folders, one shared `.git` common dir — which
+   *  is exactly what "they resolve to the same origin remote" looks like on disk. */
+  const mainCheckout: PrScope = {
+    projectId: "p-main",
+    projectName: "sparkle",
+    rootPath: "/Users/x/Projects/sparkle",
+    repoKey: "/Users/x/Projects/sparkle/.git",
+  };
+  const worktree: PrScope = {
+    projectId: "p-wt",
+    projectName: "sparkle-desktop",
+    // A DIFFERENT FOLDER, and its `.git` is a file pointing into the main checkout's. Both facts
+    // matter: the path differs (so a path dedupe fails) and the common dir does not (so this one
+    // works).
+    rootPath: "/Users/x/Projects/sparkle-desktop",
+    repoKey: "/Users/x/Projects/sparkle/.git",
+  };
+  /** The same `gh pr list` answer, because it IS the same repo — what both probes come back with. */
+  const sharedRows = [green(1433), green(1432), conflicting(1431)];
+
+  it("lists each pull request EXACTLY ONCE across the whole panel", () => {
+    const groups = buildPrGroups(
+      [mainCheckout, worktree],
+      new Map([
+        [keyOfScope(mainCheckout), sharedRows],
+        [keyOfScope(worktree), sharedRows],
+      ]),
+      new Set(),
+    );
+    // THE ASSERTION THE BUG WOULD FAIL: every number the panel renders, counted. Before the fold
+    // this was [1433, 1433, 1432, 1432, 1431, 1431].
+    const rendered = groups.flatMap((g) => g.prs.map((p) => p.number));
+    expect(rendered).toEqual([1433, 1432, 1431]);
+    expect(new Set(rendered).size).toBe(rendered.length);
+  });
+
+  it("counts the repository once in the total and once in 'across N projects'", () => {
+    const t = fleetTotals(
+      buildPrGroups(
+        [mainCheckout, worktree, site],
+        new Map([
+          [keyOfScope(mainCheckout), sharedRows],
+          [keyOfScope(worktree), sharedRows],
+          [keyOfScope(site), [green(7)]],
+        ]),
+        new Set(),
+      ),
+    );
+    // 3 + 1, not 3 + 3 + 1 — and "across 2 projects", not 3. The founder read 47/6; both numbers
+    // were the same miscount seen twice.
+    expect(t.total).toBe(4);
+    expect(t.askable).toBe(2);
+    expect(fleetHeadline(t)).toBe("4 open pull requests across 2 projects");
+  });
+
+  it("names the folded checkout in the heading instead of making it disappear", () => {
+    // The founder's explicit constraint: a duplicate may not vanish in a way that hides which local
+    // checkout an agent is working in. Agents live in a PROJECT ENTRY, so both entries stay visible.
+    const g = firstGroup(
+      [mainCheckout, worktree],
+      new Map([[keyOfScope(mainCheckout), sharedRows]]),
+      new Set(),
+    );
+    expect(g.scope.projectName).toBe("sparkle");
+    expect(g.alsoOpenAs).toEqual(["sparkle-desktop"]);
+    expect(g.members.map((m) => m.rootPath)).toEqual([
+      "/Users/x/Projects/sparkle",
+      "/Users/x/Projects/sparkle-desktop",
+    ]);
+  });
+
+  it("makes the FIRST entry in tab order the primary, whichever checkout that is", () => {
+    // The founder chose first-in-tab-order over "prefer the main checkout": sections already read in
+    // tab order, so the primary is the one that would have come first anyway. Reversing the input
+    // must therefore reverse the answer — a rule that ignored order would return "sparkle" twice.
+    const g = firstGroup([worktree, mainCheckout], new Map(), new Set());
+    expect(g.scope.projectName).toBe("sparkle-desktop");
+    expect(g.alsoOpenAs).toEqual(["sparkle"]);
+    expect(g.key).toBe(keyOfScope(worktree));
+  });
+
+  it("keeps the ownership answer only ONE entry can give", () => {
+    // THE ATTRIBUTION HALF, and the reason both entries are still probed. Rust resolves a PR's
+    // owning agent through a store keyed BY PROJECT ID, so an agent living in the worktree entry can
+    // only be named by the worktree entry's probe. Folding must not cost that answer — and it must
+    // not let the weak legacy branch-name guess (the one source that ignores the project id, so
+    // every entry produces it) beat the authoritative `created` record held by the other entry.
+    const fromMain = { ...green(1433), agentId: "agent-old", agentIdSource: "branch-name" };
+    const fromWorktree = { ...green(1433), agentId: "agent-real", agentIdSource: "created" };
+    const g = firstGroup(
+      [mainCheckout, worktree],
+      new Map([
+        [keyOfScope(mainCheckout), [fromMain]],
+        [keyOfScope(worktree), [fromWorktree]],
+      ]),
+      new Set(),
+    );
+    expect(g.prs).toHaveLength(1);
+    expect(g.prs[0]!.agentId).toBe("agent-real");
+    expect(g.prs[0]!.agentIdSource).toBe("created");
+  });
+
+  it("takes the ANSWERED probe reading over a present-but-unknown one", () => {
+    // roborev 59902 (Medium). The merge used to ask "is a reading defined", and an UNKNOWN reading —
+    // `unansweredBlocking: null`, what an unauthed, offline or timed-out `gh` produces — is defined.
+    // So the primary's failed read beat the other tab's answered one and a PR the app KNEW was
+    // probe-blocked rendered GREEN with a live one-click Merge, which Rust's merge_pr would then
+    // refuse. Order matters here: the weaker reading is FIRST, which is the case presence-testing
+    // got wrong.
+    const unknownRead = {
+      ...green(1433),
+      probes: { unansweredBlocking: null, overridden: false, applicable: true },
+    };
+    const answeredRead = {
+      ...green(1433),
+      probes: { unansweredBlocking: 2, overridden: false, applicable: true },
+    };
+    const g = firstGroup(
+      [mainCheckout, worktree],
+      new Map([
+        [keyOfScope(mainCheckout), [unknownRead]],
+        [keyOfScope(worktree), [answeredRead]],
+      ]),
+      new Set(),
+    );
+    expect(g.prs[0]!.probes?.unansweredBlocking).toBe(2);
+    // The whole point of the field: the row must not be offered as ready to merge.
+    expect(g.blockedCount).toBe(1);
+    expect(g.readyCount).toBe(0);
+  });
+
+  it("does not let an unknown reading arriving second erase an answered one", () => {
+    // The mirror image, so the fix cannot be "always take the later reading".
+    const answeredRead = {
+      ...green(1433),
+      probes: { unansweredBlocking: 2, overridden: false, applicable: true },
+    };
+    const unknownRead = {
+      ...green(1433),
+      probes: { unansweredBlocking: null, overridden: false, applicable: true },
+    };
+    const g = firstGroup(
+      [mainCheckout, worktree],
+      new Map([
+        [keyOfScope(mainCheckout), [answeredRead]],
+        [keyOfScope(worktree), [unknownRead]],
+      ]),
+      new Set(),
+    );
+    expect(g.prs[0]!.probes?.unansweredBlocking).toBe(2);
+    expect(g.blockedCount).toBe(1);
+  });
+
+  // TWO ANSWERED READINGS THAT DISAGREE — the tie an absent<unknown<answered rank could not break
+  // (roborev 59927). Both orders, because a rank that ties resolves by POSITION and would pass one
+  // of them by luck. This is reachable in production, not a contrivance: probe reads fire per scope
+  // and un-awaited, and the gate cache keys on `updatedAt`, which a probe answered by EDITING an
+  // existing reply never bumps — so one member can hold a stale-but-answered count while the other
+  // holds the fresh one.
+  for (const [label, first, second] of [
+    ["clean first", 0, 2],
+    ["blocking first", 2, 0],
+  ] as const) {
+    it(`takes the BLOCKING answered reading over an answered-clean one (${label})`, () => {
+      const reading = (n: number) => ({
+        ...green(1433),
+        probes: { unansweredBlocking: n, overridden: false, applicable: true },
+      });
+      const g = firstGroup(
+        [mainCheckout, worktree],
+        new Map([
+          [keyOfScope(mainCheckout), [reading(first)]],
+          [keyOfScope(worktree), [reading(second)]],
+        ]),
+        new Set(),
+      );
+      // Withholding a green we are unsure of costs a Refresh; suppressing a block the app already
+      // knows about costs a one-click Merge that Rust's merge_pr refuses.
+      expect(g.prs[0]!.probes?.unansweredBlocking).toBe(2);
+      expect(g.blockedCount).toBe(1);
+      expect(g.readyCount).toBe(0);
+    });
+  }
+
+  // TWO BLOCKING READINGS THAT DISAGREE ON THE COUNT — the `3 + unanswered` half of the rank
+  // (roborev 59958). Without this the count-max branch is unpinned: a rank of a flat `3` for any
+  // block would pass every other case in this file while resolving this pair by POSITION, which is
+  // the one thing the tie-break exists to remove. Both orders, for the same reason as above.
+  for (const [label, first, second] of [
+    ["smaller first", 1, 3],
+    ["larger first", 3, 1],
+  ] as const) {
+    it(`takes the LARGER block count when both members answered blocking (${label})`, () => {
+      const reading = (n: number) => ({
+        ...green(1433),
+        probes: { unansweredBlocking: n, overridden: false, applicable: true },
+      });
+      const g = firstGroup(
+        [mainCheckout, worktree],
+        new Map([
+          [keyOfScope(mainCheckout), [reading(first)]],
+          [keyOfScope(worktree), [reading(second)]],
+        ]),
+        new Set(),
+      );
+      // The row says "Blocked: 3 probes", not "1" — the reader must not be sent to answer fewer
+      // questions than the PR actually carries.
+      expect(g.prs[0]!.probes?.unansweredBlocking).toBe(3);
+      expect(g.blockedCount).toBe(1);
+    });
+  }
+
+  it("does not let an OVERRIDDEN block outrank a clean reading — an override is what unblocks it", () => {
+    // The boundary of the tie-break above. `overridden` means a written reason is already recorded
+    // on the PR, so that reading is not a block and must not be preferred as one.
+    //
+    // ASSERTED ON WHICH READING SURVIVED, not only on the readiness outcome. `prMergeReadiness`
+    // already declines to block on an overridden reading, so a counts-only assertion here is
+    // VACUOUS — it passes whether or not `probeStrength` honours `overridden`, which is exactly what
+    // a mutation check showed. The observable this branch actually controls is which of the two
+    // readings the merged row carries.
+    const overridden = {
+      ...green(1433),
+      probes: { unansweredBlocking: 3, overridden: true, applicable: true },
+    };
+    const clean = {
+      ...green(1433),
+      probes: { unansweredBlocking: 0, overridden: false, applicable: true },
+    };
+    const g = firstGroup(
+      [mainCheckout, worktree],
+      new Map([
+        [keyOfScope(mainCheckout), [clean]],
+        [keyOfScope(worktree), [overridden]],
+      ]),
+      new Set(),
+    );
+    expect(g.prs[0]!.probes).toEqual(clean.probes);
+    expect(g.blockedCount).toBe(0);
+    expect(g.readyCount).toBe(1);
+  });
+
+  it("keeps a probe reading that landed for only one of the two entries", () => {
+    // Probe reads are per scope and land after the list, so one member can carry the blocking
+    // reading while the other has none. Absent must never win over present: an unknown reading
+    // switches the probe gate off, which would re-hide a block the app already knows about.
+    const blocked = {
+      ...green(1433),
+      probes: { unansweredBlocking: 2, overridden: false, applicable: true },
+    };
+    const g = firstGroup(
+      [mainCheckout, worktree],
+      new Map([
+        [keyOfScope(mainCheckout), [green(1433)]],
+        [keyOfScope(worktree), [blocked]],
+      ]),
+      new Set(),
+    );
+    expect(g.prs[0]!.probes?.unansweredBlocking).toBe(2);
+    expect(g.blockedCount).toBe(1);
+    expect(g.readyCount).toBe(0);
+  });
+
+  it("honours a dismissal made under EITHER entry", () => {
+    // One repo has one #1433. Waving it away in one tab and having it come straight back under the
+    // other would read as a broken dismissal — and the section it would come back in no longer
+    // exists.
+    const g = firstGroup(
+      [mainCheckout, worktree],
+      new Map([[keyOfScope(mainCheckout), sharedRows]]),
+      new Set(),
+      new Map([[keyOfScope(worktree), new Set([1433])]]),
+    );
+    expect(g.prs.map((p) => p.number)).toEqual([1432, 1431]);
+    expect(g.dismissed.map((p) => p.number)).toEqual([1433]);
+  });
+
+  it("shows the list one entry could read when the other's probe failed", () => {
+    // `stale` (we have rows, one read failed) and `unreadable` (no rows at all) stay different
+    // facts. Calling a section unreadable while holding a good list would hide rows we have.
+    const g = firstGroup(
+      [mainCheckout, worktree],
+      new Map([[keyOfScope(mainCheckout), sharedRows]]),
+      new Set([keyOfScope(worktree)]),
+    );
+    expect(g.prs).toHaveLength(3);
+    expect(g.known).toBe(true);
+    expect(g.stale).toBe(true);
+    expect(g.unreadable).toBe(false);
+  });
+
+  it("leaves genuinely separate repositories alone", () => {
+    // MONOTONIC, NEVER SPLITS. Two different repos keep two sections and two totals — the fold may
+    // only ever merge, so nothing that worked before this change can regress.
+    const other = { ...site, repoKey: "/code/site/.git" };
+    const groups = buildPrGroups(
+      [mainCheckout, other],
+      new Map([
+        [keyOfScope(mainCheckout), [green(1)]],
+        [keyOfScope(other), [green(1)]],
+      ]),
+      new Set(),
+    );
+    expect(groups).toHaveLength(2);
+    expect(groups.every((g) => g.alsoOpenAs.length === 0)).toBe(true);
+    expect(fleetTotals(groups).total).toBe(2);
+  });
+
+  it("degrades to the per-path behaviour when no repo key has been resolved yet", () => {
+    // Repo keys arrive from a git subprocess a beat after hydrate. Until one lands the rule falls
+    // back to the path, which is exactly what the panel did before — so the pre-resolution window is
+    // the old behaviour rather than a new wrong one.
+    const groups = buildPrGroups(
+      [
+        { ...mainCheckout, repoKey: null },
+        { ...worktree, repoKey: undefined },
+      ],
+      new Map(),
+      new Set(),
+    );
+    expect(groups).toHaveLength(2);
+  });
+
+  it("never folds two rootPath-less tabs together on the strength of two empty paths", () => {
+    // The floor tier. A project with no folder has no repository at all, so it can only ever be its
+    // own section — otherwise every unconfigured tab would collapse into one.
+    const groups = buildPrGroups(
+      [
+        { projectId: "a", projectName: "A", rootPath: null },
+        { projectId: "b", projectName: "B", rootPath: null },
+      ],
+      new Map(),
+      new Set(),
+    );
+    expect(groups).toHaveLength(2);
+    expect(fleetTotals(groups).askable).toBe(0);
   });
 });

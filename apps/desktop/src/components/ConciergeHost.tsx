@@ -926,15 +926,28 @@ function LivenessAnnouncer({ announce }: { announce: (text: string) => void }) {
  * `leftProjectId` is deliberately no longer read: with every open project listed, which pair
  * selected what stopped being able to hide anything.
  *
+ * ONE THING IS CARRIED BEYOND THE TAB ITSELF: `repoKey`, the canonical `.git` common dir. Two tabs
+ * can be one REPOSITORY — `sparkle-desktop` is a linked worktree of `sparkle`, and the founder had
+ * both open — and without this the menu counted that repo's pull requests twice and listed all 23 of
+ * them under both headings. It is passed straight through, never derived here: a linked worktree's
+ * `.git` is a FILE, so nothing about the path or the folder's shape can tell you this. See
+ * `services/fleetPrs.repoIdentityOf`.
+ *
  * Pure and exported so the mapping is tested without mounting the host.
  */
 export function prChipScopes(
-  openProjects: readonly { id: string; name: string; rootPath?: string | null }[],
+  openProjects: readonly {
+    id: string;
+    name: string;
+    rootPath?: string | null;
+    repoKey?: string | null;
+  }[],
 ): PrScope[] {
   return openProjects.map((p) => ({
     projectId: p.id,
     projectName: p.name,
     rootPath: p.rootPath ?? null,
+    repoKey: p.repoKey ?? null,
   }));
 }
 
