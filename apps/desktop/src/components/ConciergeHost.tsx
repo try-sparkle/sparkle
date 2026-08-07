@@ -48,6 +48,22 @@ import type { ConciergeMountedAgent, ConciergeReceiptMark } from "./Concierge/ty
 // pure module (no React, no stores) so the inference is unit-testable without mounting this file, and
 // so the stub that draws an anchor reads the same declaration the host writes.
 import { anchorQuote, pendingAnchors, type ReplyAnchor } from "./Concierge/replyAnchors";
+import { quoteFace, quotePrompt, type ComposeQuote } from "./Concierge/composeQuote";
+
+/**
+ * One send's quote, carried WITH that send.
+ *
+ * `restore` is captured at send time because `useConciergeQuote.restore` is bound to `draftKey`;
+ * resolving it later would write to whatever conversation is current then. The pair travels as an
+ * argument (through `deliver` to `restoreDraft`) rather than living in a ref, because several sends
+ * can be outstanding simultaneously — see `restoreDraft`.
+ */
+interface SentQuote {
+  quote: ComposeQuote | null;
+  /** Returns whether the quote actually came back — false when a newer one has been staged since
+   *  (see `useConciergeQuote.restore`), which DISCARDS this one. */
+  restore: (quote: ComposeQuote | null) => boolean;
+}
 // The linter's findings, projected to the metadata-only shape a message carries, plus the wording
 // rule the mounted-column notice below reuses so the banner and the inline mark say ONE thing.
 import { lintMarkText, toLintMarks, type MessageLintMark } from "./Concierge/lintMarks";
@@ -181,6 +197,7 @@ import { useUiStore } from "../stores/uiStore";
 import { openProjectsOf } from "../engine/openProjects";
 import { attachedDisplay, attachedPayload } from "../services/conciergeAttach";
 import { useConciergeAttachments } from "../hooks/useConciergeAttachments";
+import { useConciergeQuote, type ConciergeQuoteApi } from "../hooks/useConciergeQuote";
 // The collapsed-text primitive, used here to keep a relayed payload OUT of the transcript's prose:
 // `shouldPasteAsPill` is the one threshold rule and `collapseText` the one place a block is built, so a
 // transcript pill and the build-agent composer's pill (components/composer/AttachmentRow — the only
@@ -1303,7 +1320,18 @@ export function ConciergeHost({
    * in the thread bubble regardless. Takes the TYPED text, never the payload — restoring quoted
    * attachment temp paths into the box would be the leak roborev 46911/46925 removed.
    */
-  const restoreDraft = useCallback((text: string): boolean => {
+  // ══ SELECTION-TO-QUOTE, the two refs the restore path needs ═══════════════════════════════════
+  // The quote API itself is created further down, where `draftKey` is known (it is keyed per
+  // conversation). These refs let the callbacks defined ABOVE that point reach it without hoisting
+  // `draftKey` — the same ref-indirection `insertRef` uses one function up.
+  const quoteRef = useRef<ConciergeQuoteApi | null>(null);
+
+  // `sentQuote` is REQUIRED, not optional, and that is the guard rather than a style choice: this
+  // defect has now been fixed at three different call sites (roborev 59801/59803/59804), each time
+  // because some path reached the restore without the sending context. A required parameter makes
+  // the compiler ask the question at every call site — `null` is a deliberate "this send carried no
+  // quote", which an omitted argument would not be.
+  const restoreDraft = useCallback((text: string, sentQuote: SentQuote | null): boolean => {
     if (text.trim() === "") return false;
     // VERBATIM: this is the user's own message coming back, and the box's ordinary insert path is
     // the DICTATION one, which trims. A restored body that contains a collapsed paste would arrive
@@ -1311,6 +1339,37 @@ export function ConciergeHost({
     const insert = insertRef.current;
     if (!insert) return false;
     insert(text, { verbatim: true });
+    // AND THE QUOTE THAT RODE **THIS** SEND — an argument, exactly like `text` beside it, never a
+    // shared slot (roborev 59804). A restored draft that lost its quote is a message the founder has
+    // to go re-select the fragment for, which is the same class of silent loss the attachments
+    // restore above exists against.
+    //
+    // A ref could not be correct here however carefully it was written, because several sends can be
+    // outstanding at once: `armIntent` keeps a MAP of armed intents, and one held while the founder is
+    // Away survives until he returns. A single slot is overwritten by every send in between, so
+    // cancelling the older intent would restore the NEWER send's quote — re-staging a fragment that
+    // has already gone out, `sourceId` and all — or, in the mirror case, restore nothing and drop the
+    // older one silently. Capturing the *binding* per send fixed which DRAFT was written; only
+    // passing the quote itself fixes which QUOTE.
+    //
+    // Conditional on the send having carried one: `restore(null)` is a WRITE that empties the slot,
+    // so firing it unconditionally would wipe a quote staged for the NEXT message just because this
+    // quote-less send was cancelled.
+    if (sentQuote?.quote && !sentQuote.restore(sentQuote.quote)) {
+      // DECLINED: the founder selected a quote of his own while this send was armed, and his choice
+      // stands (see `useConciergeQuote.restore` — a decline can ONLY mean that now). This send's
+      // fragment is therefore gone, recorded rather than dropped in silence, because the restored
+      // TEXT is now sitting against his newer quote and a Send without looking would pair these
+      // words with a different passage's `sourceId`. Both are on screen, so it is a papercut rather
+      // than a hidden misdelivery; telling him in the UI is bead sparkle-ojhnt.
+      //
+      // BOTH ids are logged: the dropped one alone cannot tell you what the composer actually ended
+      // up paired with, which is the question anyone reading this line is asking (roborev 59808).
+      log.warn("composer", "cancelled send's quote not restored — the user staged a newer one", {
+        droppedSourceId: sentQuote.quote.sourceId,
+        keptSourceId: quoteRef.current?.peek()?.sourceId ?? null,
+      });
+    }
     // RETURNS WHETHER THE WORDS ACTUALLY GOT BACK, which `retractSend` needs (bead sparkle-k5kit).
     // This used to be `void` and best-effort, and the doc above leaned on the thread bubble as the
     // backstop for the drop. A refused send now RETRACTS that bubble, so the backstop and the thing
@@ -1521,6 +1580,15 @@ export function ConciergeHost({
       restoreAttachments(waiting);
     }
   }, [draftKey, takeAttachments, restoreAttachments]);
+
+  // THE STAGED QUOTE, keyed by the same `draftKey` the composer keys its text on. It needs no stash
+  // effect like the attachments above: `useConciergeQuote` holds one quote PER KEY rather than a
+  // single slot, so switching conversations already leaves each one's quote where it was staged.
+  const quoteApi = useConciergeQuote(draftKey);
+  // Published for the callbacks defined above this point (see `quoteRef`'s declaration). Assigned
+  // during render on purpose and idempotently — the value is a stable object from a memo, and the
+  // consumers are event callbacks that cannot run before this line has.
+  quoteRef.current = quoteApi;
 
   // ══ THE MOUNT THAT ROUTES *IS* THE MOUNT THE COLUMN NAMES — ONE VALUE, UNGATED ═════════════════
   // The founder's rule, which supersedes the `promptTargetShown` gate that used to stand here:
@@ -4213,6 +4281,11 @@ export function ConciergeHost({
        *  instruction in it to pass anywhere. Decided in `send`, which is where the strip is computed;
        *  passed rather than recomputed so the flag and the remembered replay cannot disagree. */
       redirectable: boolean,
+      /** The quote that rode THIS send, with its restore bound to the draft it left from, so a
+       *  refusal or a cancelled countdown hands back this send's fragment rather than whichever one
+       *  happened to be staged most recently. Per-send like `staged` above, and for the same reason:
+       *  several intents can be armed at once (roborev 59804). */
+      sentQuote: SentQuote | null,
     ): Promise<boolean> => {
       // Has this send already claimed the mounted notice row with something SPECIFIC? The row holds
       // one line, so a later, vaguer notice would silently replace the explanation the founder needs.
@@ -4289,7 +4362,7 @@ export function ConciergeHost({
           // (roborev 57424): unmounted, this refusal is already visible twice (the thread line and
           // the receipt), and a third copy in a row that could never clear would outlive the send.
           if (displayMountedRef.current) noteMounted(terminalRefusalText(aim.name, blocked), "warn");
-          const returned = restoreDraft(text);
+          const returned = restoreDraft(text, sentQuote);
           restoreAttachments(staged);
           // NO BUBBLE FOR A SEND THAT DID NOT HAPPEN (bead sparkle-k5kit part 2). Only once the words
           // are demonstrably back in the box, though — see `retractSend`: on the rare path where the
@@ -4411,7 +4484,7 @@ export function ConciergeHost({
                 // which names it and offers the route to what it did. That is strictly more than
                 // the bare text said.
                 postSparkle(line`${ref(asAgent(aim))} isn't open any more, so I didn't send that.`);
-                restoreDraft(text);
+                restoreDraft(text, sentQuote);
                 restoreAttachments(staged);
                 return false;
               }
@@ -4430,7 +4503,7 @@ export function ConciergeHost({
                 postSparkle(terminalRefusalLine(asAgent(aim), blocked));
                 if (displayMountedRef.current)
                   noteMounted(terminalRefusalText(aim.name, blocked), "warn");
-                const returned = restoreDraft(text);
+                const returned = restoreDraft(text, sentQuote);
                 restoreAttachments(staged);
                 // BOTH refusal instants retract, for the reason roborev 57360 made both of them post
                 // a receipt: the two must tell the identical story about an identical outcome, and
@@ -4508,7 +4581,7 @@ export function ConciergeHost({
               }
               // A failed delivery must not cost the user their files any more than their words
               // (roborev 46922/48172/49293).
-              restoreDraft(text);
+              restoreDraft(text, sentQuote);
               restoreAttachments(staged);
               return false;
             }, false);
@@ -4537,7 +4610,7 @@ export function ConciergeHost({
             // Everything the send was carrying comes back — the draft and the files — for exactly
             // the reasons the failure path above restores them. Cancelling must cost the user
             // nothing, or they learn not to use the button.
-            restoreDraft(text);
+            restoreDraft(text, sentQuote);
             restoreAttachments(staged);
             postSparkle(line`Okay — I didn't send that to ${ref(asAgent(aim))}.`);
           },
@@ -4818,7 +4891,45 @@ export function ConciergeHost({
       //   text    — what the user actually typed, for naming, the ghost-text corpus, and what the
       //             ROUTER classifies. Empty on an attachments-only send.
       // The temp paths must never reach any of them but the first (roborev 46911/46925).
-      const payload = attachedPayload(text, staged);
+      // ══ THE STAGED QUOTE, TAKEN IN THE SAME TICK THE TEXT LEAVES ════════════════════════════════
+      // Exactly like `takeAttachments()` above, and for the same reason: the next message must start
+      // clean, and a second Send must not attach the same quote twice. `peek` reads through the
+      // hook's ref rather than its state, because a founder who stages a quote and hits Enter in one
+      // turn would otherwise send the PREVIOUS quote (or none).
+      // THROUGH THE REF, not through `quoteApi` directly. The hook's returned object changes
+      // identity whenever the staged quote changes, so closing over it would put `quoteApi` in this
+      // callback's deps and give `send` a new identity on every stage — which propagates to
+      // `sendFromComposer`, the controller, and a re-register of the box's submit seam, for a value
+      // that is only ever read at the moment of a send. The ref keeps `send` as stable as it was.
+      const stagedQuote = quoteRef.current?.peek() ?? null;
+      quoteRef.current?.clear();
+      // THE RESTORE IS BOUND TO **THIS** DRAFT, SNAPSHOTTED NOW (roborev 59801).
+      //
+      // `peek`/`clear` above run in the send tick, so reading them off the ref is equivalent to
+      // closing over the object. The failure-restore is not: it runs after `deliver` settles, which
+      // for a QUEUED send can be much later — and `restore` is a `useCallback` bound to `draftKey`.
+      // Resolving it through the ref at settle time would write to whatever conversation is current
+      // THEN, so patching the cable mid-flight and having that send refused would re-stage the quote
+      // above a different thread, carrying a `sourceId` that would ride out with the next message
+      // there. That is exactly the cross-draft leak `useConciergeQuote`'s header says a single slot
+      // would cause. Capturing the bound function keeps the send-time binding without putting
+      // `quoteApi` back into this callback's deps.
+      const restoreQuote = quoteRef.current?.restore;
+      // THE ONE PLACE the binding is captured, and it travels WITH this send from here on — down
+      // through `deliver` into `restoreDraft`. Nothing about the quote lives in a shared slot, so a
+      // second send arriving while this one is armed cannot redirect this one's restore.
+      const sentQuote: SentQuote | null = restoreQuote
+        ? { quote: stagedQuote, restore: restoreQuote }
+        : null;
+      // WHAT THE BRAIN READS gets the quote; the PTY copies do not.
+      //
+      // That split is structural rather than a policy check, and it is worth naming: `askSparkle`
+      // is handed `payload`, while the terminal path builds its own string from `text`
+      // (`mentionAim.payload`, below). So prefixing the quote here reaches the concierge — the
+      // surface this feature is for — and cannot type a blockquote into a live Claude Code CLI.
+      const payload = stagedQuote
+        ? quotePrompt(stagedQuote, attachedPayload(text, staged))
+        : attachedPayload(text, staged);
       const display = attachedDisplay(text, staged);
       // ══ AND A RENDERING THAT IS THE BUBBLE'S ALONE ══════════════════════════════════════════════
       // A long paste rides as a pill in the transcript instead of as forty rows of wall (the
@@ -4909,6 +5020,16 @@ export function ConciergeHost({
           // would erase them the moment that agent was closed. ALL of them, not just the one that
           // was used — the user wrote those names and should see them back.
           mentions: mentions?.length ? mentions : undefined,
+          // WHAT THIS MESSAGE WAS REPLYING TO, snapshotted onto the bubble like the files and the
+          // mentions beside it — the founder asked for the quote to stay visible above his message
+          // rather than vanish once sent. A `ReplyAnchor`, so `ReplyAnchorStubs` draws it with the
+          // same left bar the concierge's own quoted originals use.
+          //
+          // The FACE, not the whole selection: the stub is one line by contract, and the full text
+          // has already gone to the brain in `payload`.
+          quoting: stagedQuote
+            ? { id: stagedQuote.sourceId, quote: quoteFace(stagedQuote) }
+            : undefined,
         },
       ]);
       // ══ THREE RENDERINGS REMEMBERED, ONE PER CONSUMER ═══════════════════════════════════════════
@@ -4936,7 +5057,17 @@ export function ConciergeHost({
       rememberSentText(sentTextRef.current, id, text);
       rememberSentText(sentPayloadRef.current, id, payload);
       rememberSentText(sentWireRef.current, id, wirePayload);
-      return enqueue(
+      // A REFUSED SEND HANDS THE QUOTE BACK, the way `restoreAttachments` hands back the files. The
+      // box restores the typed words on `false`; without this the fragment he selected would be the
+      // one part of the message that did not come back, and he would have to go find it again.
+      //
+      // THE COUNTDOWN PATHS DO NOT COME THROUGH HERE. `deliver` resolves TRUE the moment an intent is
+      // armed, so a cancel or a post-countdown failure leaves `outcome === true` and restores through
+      // `restoreDraft` instead. Both now write through the SAME send-time binding captured above, so
+      // a path that somehow took both would write one slot twice rather than staging the quote in two
+      // conversations — which is what the previous cut of this comment wrongly claimed was already
+      // true (roborev 59803).
+      const outcome = enqueue(
         () =>
           deliver(
             id,
@@ -4953,9 +5084,12 @@ export function ConciergeHost({
             forceSparkle || conciergeAddressed,
             mentionAim,
             redirectable,
+            sentQuote,
           ),
         false,
       );
+      if (stagedQuote) void outcome.then((ok) => { if (!ok) restoreQuote?.(stagedQuote); });
+      return outcome;
     },
     [deliver, enqueue, takeAttachments],
   );
@@ -5154,6 +5288,11 @@ export function ConciergeHost({
       onAttach: attach,
       onRemoveAttachment: removeAttachment,
       onDismissAttachNotice: dismissAttachNotice,
+      // "Quote in response": the thread reports the snapshot it took when the selection finished,
+      // and staging it touches ONLY the quote slot — the founder's typed draft is untouched, which
+      // is the behaviour he asked for (his hand-rolled version pastes above what he has written).
+      onQuote: quoteApi.stage,
+      onRemoveQuote: quoteApi.remove,
       onCopied,
       // PRD §3 (cross-project surfacing): clicking a nudge card "opens that project's tab,
       // switches to Build, and selects the referenced agent". openProjectTab does all three — the
@@ -5379,6 +5518,11 @@ export function ConciergeHost({
     // `resolveAgent` + `revealAgent` and adds the reporting they were missing — so it is the
     // identity this memo has to track.
     [
+      // Both are `useCallback`s off the quote hook, so they are as stable as the rest of this list —
+      // named individually rather than as `quoteApi` so the memo does not re-run whenever the staged
+      // quote CHANGES, which is every keystroke-free stage and would churn every memoised row.
+      quoteApi.stage,
+      quoteApi.remove,
       resolveAgent,
       revealAgentById,
       approve,
@@ -5484,11 +5628,15 @@ export function ConciergeHost({
       messages: stream,
       typing,
       attachments,
+      quote: quoteApi.quote,
       dropActive,
       attachNotice,
       needsYouFilter: needsYouIsolated,
     };
   }, [
+    // The staged quote is part of the view model, so the model must rebuild when it changes —
+    // otherwise the chip would not appear until some other input happened to invalidate this memo.
+    quoteApi.quote,
     feed,
     chat,
     typing,

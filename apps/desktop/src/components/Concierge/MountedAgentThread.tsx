@@ -47,6 +47,8 @@ import type { MountedThread } from "../../stores/mountedThreadStore";
 import { inFlight, useAgentInbox } from "../../stores/inboxStore";
 import { DELIVERY_A11Y, DELIVERY_LABEL, QUEUED_BLOCK_HEADING } from "../inboxCopy";
 import { useAutoFollow } from "../../hooks/useAutoFollow";
+import { useQuoteOnSelection, type PendingQuote } from "./useQuoteOnSelection";
+import { QuoteChiclet } from "./QuoteChiclet";
 import { TERM_BODY_BASE_SIZE, TERM_BODY_FONT, termMuted } from "../terminalChrome";
 import { useResolvedTheme, type ResolvedTheme } from "../../theme/theme";
 // `TYPE.micro` and `FONT_MONO` here are for CHROME ONLY — timestamps, provenance marks, the
@@ -83,6 +85,7 @@ export function MountedAgentThread({
   agentId,
   agentName,
   onReachTop,
+  onQuote,
 }: {
   thread: MountedThread;
   /** Whose inbox to show alongside the transcript. Empty string = no agent, and nothing is queried. */
@@ -91,6 +94,9 @@ export function MountedAgentThread({
    *  the typographic register carries authorship, exactly as it does in ConciergeThread. */
   agentName: string;
   onReachTop: () => void;
+  /** A fragment of THIS agent's transcript was quoted into the compose box. Same contract as
+   *  ConciergeThread's: absent → the affordance is not mounted at all. */
+  onQuote?: (quote: PendingQuote) => void;
 }) {
   const mode = useResolvedTheme();
   const muted = termMuted(mode);
@@ -155,6 +161,13 @@ export function MountedAgentThread({
     prevFirstIdRef.current = firstId;
     if (grewAtTop) restoreAfterPrepend(prevHeightRef.current);
   }, [firstId, restoreAfterPrepend]);
+
+  // "Quote in response" over a BUILD AGENT's transcript — the same hook ConciergeThread mounts, on
+  // this thread's own scroller. Both scrollers already carry `data-concierge-scroller`, and the
+  // affordance follows: the founder asked to be able to quote an agent's claim back at the concierge.
+  const { pending: pendingQuote, dismiss: dismissQuote } = useQuoteOnSelection(scrollRef, {
+    enabled: !!onQuote,
+  });
 
   return (
     <div style={{ position: "relative", flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
@@ -221,7 +234,7 @@ export function MountedAgentThread({
         {!thread.hasMore && entries.length > 0 && <Notice mode={mode}>Start of this agent's history</Notice>}
 
         {entries.map((e) => (
-          <Entry key={e.id} entry={e} mode={mode} muted={muted} />
+          <Entry key={e.id} entry={e} mode={mode} muted={muted} agentName={agentName} />
         ))}
 
         {/* THE QUEUE, AT THE TAIL. Below every real turn because that is where it belongs in time —
@@ -265,6 +278,18 @@ export function MountedAgentThread({
         )}
         {entries.length === 0 && thread.loading && <Notice mode={mode}>Reading transcript…</Notice>}
       </div>
+      {/* Portalled to `document.body`, so the terminal-flooded scroller's overflow cannot clip it. */}
+      {onQuote && pendingQuote && (
+        <QuoteChiclet
+          x={pendingQuote.x}
+          y={pendingQuote.y}
+          onQuote={() => {
+            onQuote(pendingQuote);
+            dismissQuote();
+          }}
+          onDismiss={dismissQuote}
+        />
+      )}
     </div>
   );
 }
@@ -335,17 +360,29 @@ function Entry({
   entry,
   mode,
   muted,
+  agentName,
 }: {
   entry: TranscriptEntry;
   mode: ResolvedTheme;
   muted: string;
+  /** Captions a quote taken from this agent's words (see composeQuote.quoteLabel). */
+  agentName: string;
 }) {
   if (entry.kind === "activity") return <ActivityChip entry={entry} mode={mode} />;
 
   if (entry.kind === "human") {
     const provenance = provenanceLabel(entry.promptSource);
     return (
-      <div style={{ maxWidth: "92%", alignSelf: "flex-end", textAlign: "right" }}>
+      // `data-message-id` + `data-quote-source` are what make this row QUOTABLE — the founder asked
+      // for build-agent messages to be in scope alongside the concierge's own (see
+      // useQuoteOnSelection.quoteSourceOf, which reads exactly these two attributes). An activity
+      // chip deliberately carries neither: it is chrome the app generated about state, not words
+      // anyone said.
+      <div
+        data-message-id={entry.id}
+        data-quote-source="you"
+        style={{ maxWidth: "92%", alignSelf: "flex-end", textAlign: "right" }}
+      >
         <div
           data-testid={MOUNTED_HUMAN_TESTID}
           style={{
@@ -386,6 +423,12 @@ function Entry({
   return (
     <div
       data-testid={MOUNTED_AGENT_TESTID}
+      // See the `human` arm above: this is the build-agent half of the founder's quote scope. The
+      // agent's NAME rides along so the chip is captioned with who said it rather than a generic
+      // "Agent" — `quoteSourceOf` reads it, `quoteLabel` falls back if it is ever empty.
+      data-message-id={entry.id}
+      data-quote-source="agent"
+      data-quote-label={agentName}
       style={{
         maxWidth: "100%",
         alignSelf: "flex-start",

@@ -278,9 +278,18 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
       // Carried by the two kinds an anchor can name, `you` and `sparkle`; nothing else is jumpable.
       <div
         data-message-id={m.id}
+        // WHICH SURFACE A SELECTION CAME FROM, declared rather than parsed out of the id's prefix
+        // (see useQuoteOnSelection.quoteSourceOf). Only decides the quote chip's caption; the id is
+        // what the brain resolves against.
+        data-quote-source="you"
         data-highlighted={highlighted ? "yes" : "no"}
         style={{ maxWidth: "92%", alignSelf: "flex-end", textAlign: "right", ...flash }}
       >
+        {/* WHAT THIS MESSAGE IS REPLYING TO — the other direction of the same iMessage idiom the
+            `sparkle` arm draws below (see ./replyAnchors). Deliberately WITHOUT `onJump`: the
+            founder chose attribution the brain can resolve over a clickable back-reference, so this
+            takes the stub's existing non-clickable form rather than growing a second one. */}
+        <ReplyAnchorStubs anchors={m.quoting ? [m.quoting] : undefined} />
         <div
           data-testid="you-bubble"
           data-wired={wired ? "yes" : "no"}
@@ -561,6 +570,10 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
       <div
         data-testid="concierge-push"
         data-message-id={m.id}
+        // A push is still the concierge's own words — the same copy affordance applies below, and
+        // the same quote one does. Quoting an unprompted line back at it is exactly as meaningful as
+        // quoting a reply.
+        data-quote-source="sparkle"
         data-highlighted={highlighted ? "yes" : "no"}
         data-stale={m.stale ? "true" : "false"}
         style={{ maxWidth: "92%", alignSelf: "flex-start", opacity: m.stale ? 0.5 : 1, ...flash }}
@@ -606,6 +619,10 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
   return (
     <div
       data-message-id={m.id}
+      // See the `you` arm: declares the surface a selection was taken from, for the quote chip's
+      // caption. This is the branch the founder's request is actually about — the long, dense
+      // answers he wants to reply to one claim inside.
+      data-quote-source="sparkle"
       data-highlighted={highlighted ? "yes" : "no"}
       style={{ maxWidth: "92%", alignSelf: "flex-start", minWidth: 0, ...flash }}
     >

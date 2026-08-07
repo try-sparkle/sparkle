@@ -7,6 +7,8 @@ import { useAutoFollow } from "../../hooks/useAutoFollow";
 import { C } from "../../theme/colors";
 import { TYPE } from "../../theme/scale";
 import { useCopyOnSelection } from "./useCopyOnSelection";
+import { useQuoteOnSelection, type PendingQuote } from "./useQuoteOnSelection";
+import { QuoteChiclet } from "./QuoteChiclet";
 import { useSelectionStableThread } from "./useSelectionStableThread";
 import { ThinkingIndicator } from "./ThinkingIndicator";
 import { ConciergeMessageRow } from "./ConciergeMessageRow";
@@ -66,6 +68,7 @@ export function ConciergeThread({
   onDigestClick,
   copyOnSelection = true,
   onCopied,
+  onQuote,
   wired = false,
   statuses,
   turnFloor,
@@ -116,6 +119,10 @@ export function ConciergeThread({
   /** Something was copied. Routed up so the integration layer announces it through the column's ONE
    *  live region; this component adds no `aria-live` node (see ./types ConciergeController). */
   onCopied?: (what: ConciergeCopyKind) => void;
+  /** A highlighted fragment was sent to the compose box via the "Quote in response" chiclet. Absent
+   *  → the affordance is not mounted at all (the hook listens for nothing), which is how a thread
+   *  with no composer under it opts out. */
+  onQuote?: (quote: PendingQuote) => void;
 }) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   // GUARD 4 — WHAT THE READER ACTUALLY SEES, which is `messages` except while a selection is being
@@ -144,6 +151,13 @@ export function ConciergeThread({
   const selectionCopied = useCopyOnSelection(scrollRef, {
     enabled: copyOnSelection,
     onCopied: useCallback(() => onCopied?.("selection"), [onCopied]),
+  });
+  // "Quote in response", mounted BESIDE the copy hook on the same scroller rather than folded into
+  // it. The two are independent answers to one gesture — copy writes the clipboard, this stages a
+  // reply — and they can both fire on the same `mouseup` without either knowing about the other.
+  // Gated on `onQuote` so a thread with no compose box under it listens for nothing.
+  const { pending: pendingQuote, dismiss: dismissQuote } = useQuoteOnSelection(scrollRef, {
+    enabled: !!onQuote,
   });
   // ── Handlers, STABILISED ───────────────────────────────────────────────────────────────────────
   //
@@ -493,6 +507,22 @@ export function ConciergeThread({
           <FiCheck size={12} />
           Copied
         </div>
+      )}
+      {/* THE CHICLET. Portalled to `document.body`, so it is outside this scroller's `overflow-y`
+          and cannot be clipped near the bottom edge where most selections end.
+          It hands back the SNAPSHOT taken when the selection finished, never a fresh read of the
+          live Selection — by the time this fires, `useCopyOnSelection` may already have torn the
+          selection down and rebuilt it, and Tab-ing to the button has cleared it outright. */}
+      {onQuote && pendingQuote && (
+        <QuoteChiclet
+          x={pendingQuote.x}
+          y={pendingQuote.y}
+          onQuote={() => {
+            onQuote(pendingQuote);
+            dismissQuote();
+          }}
+          onDismiss={dismissQuote}
+        />
       )}
       {/* The full text behind a collapsed payload: read it, copy it verbatim, or put it back into the
           bubble as regular text. ONE instance for the whole thread — the overlay portals to

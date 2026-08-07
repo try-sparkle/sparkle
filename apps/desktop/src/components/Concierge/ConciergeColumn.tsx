@@ -631,6 +631,9 @@ export function ConciergeColumn({
           agentId={mountedAgent.agentId}
           agentName={mountedAgent.name}
           onReachTop={mountedAgent.onReachTop}
+          // The quote affordance follows the conversation on screen: mounted, a selection over the
+          // AGENT's transcript stages into the same compose box below.
+          onQuote={controller.onQuote}
         />
       ) : (
         // `BeadPillHost` supplies the LIVE beads board to every bead id in the thread, and keeps it
@@ -656,6 +659,9 @@ export function ConciergeColumn({
               // Straight through to the host, which speaks it into the ONE live region below. The
               // thread deliberately owns no announcer of its own.
               onCopied={controller.onCopied}
+              // "Quote in response". Straight through as well: the thread raises the chiclet and
+              // reports the snapshot, the host decides what a staged quote means.
+              onQuote={controller.onQuote}
             />
           </AgentPillProvider>
         </BeadPillHost>
@@ -920,6 +926,8 @@ export function ConciergeColumn({
           onAttach={controller.onAttach}
           onRemoveAttachment={controller.onRemoveAttachment}
           attachments={model.attachments}
+          quote={model.quote}
+          onRemoveQuote={controller.onRemoveQuote}
           dropActive={model.dropActive}
           attachNotice={model.attachNotice}
           onDismissAttachNotice={controller.onDismissAttachNotice}

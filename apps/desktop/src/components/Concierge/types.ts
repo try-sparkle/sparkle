@@ -37,6 +37,8 @@ import type { ConciergeMention, MentionAgent } from "./mentions";
 // what an anchor is (./replyAnchors — no React, no stores), so the reply that records one and the
 // stub that draws it cannot drift about what one is.
 import type { ReplyAnchor } from "./replyAnchors";
+import type { ComposeQuote } from "./composeQuote";
+import type { PendingQuote } from "./useQuoteOnSelection";
 // Same rule again: the shape lives with the pure module that owns the WORDING rule (./lintMarks —
 // no React, no stores), so the host that records a finding and the line that draws it cannot drift
 // about what a finding is.
@@ -141,6 +143,27 @@ export interface ConciergeUserMessage {
    *  `undefined` rather than `[]` on an unaddressed message, matching `attachments`: this thread is
    *  persisted, and an empty array per message buys nothing the absent field doesn't. */
   mentions?: ConciergeMention[];
+  /**
+   * The fragment of the transcript this message was replying TO — selection-to-quote's record.
+   *
+   * The MIRROR of {@link ConciergeSparkleMessage.answers}: that field draws quoted originals above a
+   * concierge reply, this one draws the quoted original above the USER's message. Same
+   * {@link ReplyAnchor} shape and the same `ReplyAnchorStubs` renderer, so the two halves of one
+   * visual idiom cannot drift apart.
+   *
+   * A SNAPSHOT, like `attachments` and `mentions` above and for the same reason — the thread is
+   * trimmed from the front and rewritten on restore, so a live lookup would blank the quote the
+   * moment its source aged out, silently turning a message that says what it is about into one that
+   * doesn't.
+   *
+   * RENDERED WITHOUT `onJump` (see ConciergeMessageRow). The founder chose attribution the brain can
+   * resolve over a clickable back-reference, so this draws as the degraded text form the stub
+   * already has for an anchor whose target is gone — deliberately, not by omission.
+   *
+   * Its `id` goes through `remapAnchors` on rehydrate alongside `answers`; see
+   * stores/conciergeThreadStore.
+   */
+  quoting?: ReplyAnchor;
   /**
    * The long blocks this message PASTED, carried whole and drawn as pills instead of as a wall of
    * text — the user-side twin of {@link ConciergeSparkleMessage.collapsed}, and the founder's ask
@@ -567,6 +590,11 @@ export interface ConciergeViewModel {
   /** Files riding along with the NEXT send (parity row #21), rendered as removable chips above the
    *  compose row. The integration layer owns the list; the box only reports removals. */
   attachments?: Attachment[];
+  /** The transcript fragment the NEXT send is replying to, staged by the "Quote in response"
+   *  chiclet and drawn as a removable chip above the draft. Owned by the integration layer for the
+   *  same reason `attachments` is — the box only reports removals, and the host reads this at send
+   *  time so `onSend`'s arity contract is untouched (see ComposeBox's `quote` prop). */
+  quote?: ComposeQuote | null;
   /** True while a native file drag is over the compose box — lights the drop affordance. The
    *  webview drag event is window-global, so only the integration layer can hit-test it. */
   dropActive?: boolean;
@@ -665,6 +693,11 @@ export interface ConciergeController {
   onRemoveAttachment?(id: string): void;
   /** The user acknowledged the attach-failure notice. */
   onDismissAttachNotice?(): void;
+  /** A highlighted fragment of the transcript was sent to the compose box via the "Quote in
+   *  response" chiclet. Optional: a column with no composer under it never raises the affordance. */
+  onQuote?(quote: PendingQuote): void;
+  /** The staged quote's × was pressed. */
+  onRemoveQuote?(): void;
   /** A digest line was clicked — open that project's tab and reveal its lead agent. This is the
    *  handoff to column two that the digest exists to make (bead sparkle-4562.4). */
   onDigestClick?(digest: ConciergeDigestMessage): void;

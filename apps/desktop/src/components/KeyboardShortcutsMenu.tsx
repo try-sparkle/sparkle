@@ -23,7 +23,12 @@ import { bindingConflict } from "../keyboardHints/reservedChords";
 // Hand-maintained so the ORDER is a design decision rather than object-key order. An id missing from
 // here has no Settings row and cannot be rebound, so `keybindingsStore.test.ts` asserts this list
 // covers every `ShortcutId`.
-export const SHORTCUT_ROW_ORDER: ShortcutId[] = ["toggleHints", "toggleComposer", "unmountCable"];
+export const SHORTCUT_ROW_ORDER: ShortcutId[] = [
+  "toggleHints",
+  "toggleComposer",
+  "unmountCable",
+  "quoteSelection",
+];
 const IDS = SHORTCUT_ROW_ORDER;
 
 export function KeyboardShortcutsMenu() {

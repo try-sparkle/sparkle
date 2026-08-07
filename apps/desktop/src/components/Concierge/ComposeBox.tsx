@@ -130,6 +130,8 @@ import { nextId } from "../composer/attachmentsApi";
 import { AttachmentStrip } from "../composer/AttachmentStrip";
 import { TextPill } from "../composer/TextPill";
 import { TextPillModal } from "../composer/TextPillModal";
+import { QuoteChip } from "./QuoteChip";
+import type { ComposeQuote } from "./composeQuote";
 import { useVoicePlaceholder } from "../../voice/useVoicePlaceholder";
 import { useDictationStore } from "../../stores/dictationStore";
 import {
@@ -574,6 +576,8 @@ export function ComposeBox({
   sendChord = DEFAULT_SEND_CHORD,
   onComposedText,
   registerSubmit,
+  quote = null,
+  onRemoveQuote,
   draftKey = "concierge",
 }: {
   /** Reports the trimmed text (empty only when something is attached), plus the agents that text
@@ -598,6 +602,21 @@ export function ComposeBox({
   onRemoveAttachment?: (id: string) => void;
   /** Staged files, owned by the host — rendered as chips, cleared by the host on send. */
   attachments?: Attachment[];
+  /**
+   * The transcript fragment this message is replying to, staged by the "Quote in response" chiclet.
+   *
+   * HOST-OWNED, exactly like `attachments` above, and that is the load-bearing choice rather than a
+   * stylistic one. `onSend`'s ARITY is meaningful (see `submit`: one argument when nothing is
+   * addressed, never an explicit `undefined`), so threading the quote through as a fourth parameter
+   * would force `onSend(text, undefined, undefined, quote)` and break that contract. Attachments
+   * already solve this by living on the host and being read at send time; the quote does the same,
+   * and `onSend` keeps the signature it has always had.
+   *
+   * Consequently this box neither clears it on send nor restores it on a failed one — the host owns
+   * both, in the same place it owns them for attachments.
+   */
+  quote?: ComposeQuote | null;
+  onRemoveQuote?: () => void;
   /** A native file drag is over this box (the host hit-tests the window-global event). */
   dropActive?: boolean;
   /** Set when an attach attempt lost files — the box states it instead of leaving the user to
@@ -1842,6 +1861,13 @@ export function ComposeBox({
           </button>
         </div>
       )}
+      {/* WHAT THIS MESSAGE IS REPLYING TO — topmost of the four rows above the textarea, because it
+          is CONTEXT for the draft rather than cargo riding along with it: the pills and chips below
+          are things being sent, this is the thing being answered.
+          THE DRAFT IS NEVER TOUCHED. Staging a quote sets this slot and nothing else — the founder
+          asked for his typed text to be preserved with the quote attached above it, which is what he
+          has been doing by hand. */}
+      {quote && <QuoteChip quote={quote} onRemove={onRemoveQuote} />}
       {/* COLLAPSED PASTES, in their own row directly above the attachment chips — the same register,
           and the same place in the box, because a pill and a chip are the same statement ("this is
           riding along with the next message"). Its own row rather than mixed in with the chips so a

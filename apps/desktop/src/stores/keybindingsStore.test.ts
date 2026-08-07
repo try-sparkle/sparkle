@@ -18,6 +18,7 @@ import {
 } from "./keybindingsStore";
 import { SHORTCUT_ROW_ORDER } from "../components/KeyboardShortcutsMenu";
 import { matchesChord, type KeyEventLike } from "../keyboardHints/keybindings";
+import { bindingConflict } from "../keyboardHints/reservedChords";
 
 /** A ⌘⇧U keydown, with any field overridden. Typed as `KeyEventLike` so the overrides are the
  *  EVENT's field names (`metaKey`) and not the binding's (`meta`) — the two vocabularies are easy to
@@ -79,6 +80,82 @@ describe("the registry stays internally consistent", () => {
   it("gives every shortcut a Settings row", () => {
     const ids = Object.keys(SHORTCUT_DEFAULTS) as ShortcutId[];
     expect([...SHORTCUT_ROW_ORDER].sort()).toEqual([...ids].sort());
+  });
+
+  // ══ EVERY SHIPPED DEFAULT MUST BE A CHORD A REAL KEYBOARD CAN PRODUCE ═══════════════════════════
+  //
+  // `matchesChord` compares `e.key.toLowerCase() === b.key`, and `KeyboardEvent.key` carries the
+  // SHIFTED character. So a shifted default is only reachable when its key round-trips through
+  // Shift — which LETTERS do (Shift+u emits "U", lowercasing back to "u") and PUNCTUATION does not
+  // (Shift+' emits '"', which never equals "'").
+  //
+  // `quoteSelection` shipped for exactly one commit as ⌘⇧' and was dead on arrival: the Settings row
+  // advertised ⇧⌘' while no keystroke could ever match it (roborev 59799). The unit test that was
+  // supposed to cover it synthesized `{ key: "'", shiftKey: true }` — a combination no browser emits
+  // — so it passed against a binding that could not work. This guard is the non-circular one: it
+  // constrains the DEFAULT rather than restating it.
+  //
+  // Deliberately scoped to `shift: true`. An unshifted punctuation key is fine (⌘' emits "'"), and
+  // the REBIND path is already safe because `captureReduce` records `e.key.toLowerCase()` from a real
+  // press — whatever the user actually typed is by construction producible.
+  // THE UNCONDITIONAL HALF, and the one that covers the larger class. `matchesChord` compares
+  // `e.key.toLowerCase() === b.key`, so ANY default whose key is not already lowercase-normalised is
+  // unreachable — Shift has nothing to do with it. The literal `KeyboardEvent.key` values a developer
+  // would naturally copy out of the spec are exactly the trap: "Enter", "Escape", "ArrowUp", "F1",
+  // "J" all lowercase to something that never equals the stored key.
+  //
+  // Both write paths already normalise (`captureReduce` records `e.key.toLowerCase()`, and so does
+  // `setBinding`'s caller), which leaves this hand-written table as the ONE unnormalised place —
+  // precisely what this guard exists to protect (roborev 59802).
+  it("ships no chord default whose key is not lowercase-normalised", () => {
+    for (const [id, b] of Object.entries(SHORTCUT_DEFAULTS)) {
+      if (b.kind !== "chord") continue;
+      expect(b.key, `${id} has an empty key`).not.toBe("");
+      expect(
+        b.key,
+        `${id} binds key "${b.key}", but matchesChord compares e.key.toLowerCase() — a key that is ` +
+          `not already lowercase can never match. Store "${b.key.toLowerCase()}".`,
+      ).toBe(b.key.toLowerCase());
+    }
+  });
+
+  it("ships no shifted default whose key a real keypress could never produce", () => {
+    for (const [id, b] of Object.entries(SHORTCUT_DEFAULTS)) {
+      if (b.kind !== "chord" || !b.shift) continue;
+      expect(
+        b.key,
+        `${id} binds Shift+"${b.key}", but KeyboardEvent.key reports the SHIFTED character — only ` +
+          `single letters round-trip through toLowerCase(). This chord can never fire.`,
+      ).toMatch(/^[a-z]$/);
+    }
+  });
+
+  // THE VALUE AND ITS UNIQUENESS, which the shape guards above deliberately do not cover. Deriving
+  // the quote test's event from this table made every suite agree with whatever the table said — so
+  // `quoteSelection` could have become ⌘J (firing `toggleComposer` too) or ⌘K (the command palette,
+  // refused from the rebind UI but never from this table) with everything still green.
+  // `bindingConflict` is the app's own predicate, so this covers reserved chords AND pairwise
+  // collisions in one property rather than restating either (roborev 59802).
+  it("ships no default that collides with another default or a reserved chord", () => {
+    for (const id of Object.keys(SHORTCUT_DEFAULTS) as ShortcutId[]) {
+      expect(
+        bindingConflict(SHORTCUT_DEFAULTS[id], SHORTCUT_DEFAULTS, id),
+        `the default for ${id} is not free`,
+      ).toBeNull();
+    }
+  });
+
+  // The literal pin for selection-to-quote's chord, mirroring `unmountCable`'s. The founder asked for
+  // a keyboard path; ⌘' is the apostrophe — the quote key — and unshifted so it can actually match.
+  it("defaults selection-to-quote to ⌘'", () => {
+    expect(SHORTCUT_DEFAULTS.quoteSelection).toEqual({
+      kind: "chord",
+      meta: true,
+      ctrl: false,
+      alt: false,
+      shift: false,
+      key: "'",
+    });
   });
 
   it("lists no row for a shortcut that does not exist", () => {

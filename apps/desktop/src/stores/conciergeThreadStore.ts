@@ -455,9 +455,19 @@ export function rehydrateThread(chat: ConciergeMessage[]): ConciergeMessage[] {
         answers: remapAnchors(next.answers, idMap),
         lint: normalizeLintMarks(next.lint),
       };
-    return next.kind === "you" && next.receipt?.redirectable
-      ? { ...next, receipt: { ...next.receipt, redirectable: false } }
-      : next;
+    if (next.kind === "you") {
+      // A `you` message's QUOTE is an id reference too (selection-to-quote; see
+      // ConciergeUserMessage.quoting), so it needs the identical rewrite `answers` gets above — this
+      // function REINDEXES every id by position, and a quote left un-remapped would point at whatever
+      // message now happens to hold its old id. `remapAnchors` takes an array, so the single anchor
+      // goes through it as a one-element list rather than growing a second copy of the rule.
+      const quoting = next.quoting ? remapAnchors([next.quoting], idMap)?.[0] : undefined;
+      const withQuote = next.quoting ? { ...next, quoting } : next;
+      return withQuote.receipt?.redirectable
+        ? { ...withQuote, receipt: { ...withQuote.receipt, redirectable: false } }
+        : withQuote;
+    }
+    return next;
   });
 }
 

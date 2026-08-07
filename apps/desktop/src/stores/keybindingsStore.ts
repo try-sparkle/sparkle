@@ -9,7 +9,7 @@ import type { KeyBinding } from "../keyboardHints/keybindings";
 // The shortcuts a user can rebind. Add an id here + a default below + a row in KeyboardShortcutsMenu.
 // (`KeyboardShortcutsMenu.IDS` is hand-maintained, so a new id with no row would be unreachable in
 // Settings — keybindingsStore.test.ts asserts the two lists agree.)
-export type ShortcutId = "toggleHints" | "toggleComposer" | "unmountCable";
+export type ShortcutId = "toggleHints" | "toggleComposer" | "unmountCable" | "quoteSelection";
 
 export const SHORTCUT_DEFAULTS: Record<ShortcutId, KeyBinding> = {
   // Tap Control to show/hide the keyboard-hint chiclets.
@@ -30,6 +30,23 @@ export const SHORTCUT_DEFAULTS: Record<ShortcutId, KeyBinding> = {
   // ⌘⇧U is free — the app had no other ⌘⇧ chord — and `captureReduce` accepts it as a rebindable
   // shape, since it carries ⌘.
   unmountCable: { kind: "chord", meta: true, ctrl: false, alt: false, shift: true, key: "u" },
+  // ⌘' quotes the current selection into the next message — the KEYBOARD half of selection-to-quote
+  // (the founder asked for a shortcut as well as the clickable chiclet, so the gesture never forces a
+  // reach for the mouse).
+  //
+  // THE APOSTROPHE IS THE MNEMONIC: it is the quote key. ⌘' is free — ⌘K is the command palette and
+  // ⌘, is Settings, and it carries ⌘, so `captureReduce` accepts it as a rebindable shape.
+  //
+  // NO SHIFT, AND THAT IS A CORRECTNESS CONSTRAINT RATHER THAN A TASTE ONE. This shipped for one
+  // commit as ⌘⇧' and was DEAD: `matchesChord` compares `e.key.toLowerCase() === b.key`, and
+  // `KeyboardEvent.key` carries the SHIFTED character — so the physical chord ⌘⇧' emits `key: '"'`,
+  // which never equals `"'"`. The Settings row still advertised ⇧⌘', so the user saw a shortcut that
+  // did nothing (roborev 59799).
+  //
+  // `unmountCable` above survives shift only because letters round-trip: Shift+u emits `"U"`, which
+  // lowercases back to `"u"`. Punctuation does not. `keybindingsStore.test.ts` now refuses any
+  // shifted default whose key is not a single letter, so this class of dead chord cannot come back.
+  quoteSelection: { kind: "chord", meta: true, ctrl: false, alt: false, shift: false, key: "'" },
 };
 
 // `allowsTap`: whether a lone-modifier TAP is a valid gesture for this shortcut. Only the hint
@@ -57,6 +74,8 @@ export const SHORTCUT_LABELS: Record<ShortcutId, { title: string; blurb: string;
   // NAMES NO TEXT SURFACE EITHER, for the reason above: this blurb is rendered in the same Settings
   // pane, and `keybindingsStore.labels.test.ts` asserts that no wording promises a prompt box.
   unmountCable: { title: "Unmount the concierge", blurb: "Detach the concierge from the build row it is wired to. Works from inside a terminal, where Escape belongs to the running program instead.", allowsTap: false },
+  // Matched in a keydown handler like the two chords above, so a lone-modifier tap would never fire.
+  quoteSelection: { title: "Quote in response", blurb: "Attach the highlighted part of the conversation to your next message, so Sparkle knows exactly which claim you are answering.", allowsTap: false },
 };
 
 interface KeybindingsState {
