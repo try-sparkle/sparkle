@@ -370,6 +370,11 @@ const ANSWERS_AGENTS_PROMPT: Record<DispatchAuthorityKind, boolean> = {
   // agent's question — the thing being approved is what we are about to send, not what it asked.
   approval: false,
   countdown: false,
+  // A MOUNTED send is prose the user composed for the agent, exactly like an addressed one — the
+  // cable changes how fast it goes, never what it is. It also agrees with the `userPrompt: true`
+  // that same path already hands the dispatcher, which is what stops a terse mounted line being
+  // matched against a live picker and pressing a button (roborev 54569).
+  mount: false,
   redirect: false,
   // A TERMINAL-kind suggestion pill writes its keystroke straight to the PTY and never reaches this
   // module (see `applySuggestion`); anything that does reach here is prose.

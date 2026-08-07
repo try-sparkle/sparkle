@@ -4507,13 +4507,17 @@ export function ConciergeHost({
         // conciergeRouter's header for the damage that forced it). What remains here is therefore
         // the ADDRESSED path — a destination the user stated in words.
         //
-        // The gate stays anyway, and that is deliberate: even a named agent ARMS an intent rather
-        // than dispatching. The send becomes visible, counts down, and can be cancelled; only an
-        // expiry the user didn't stop dispatches, and it does so carrying
-        // `{ kind: "countdown", intentId }`. That is why there is no `router` arm in
-        // DispatchAuthority and must never be one — a heuristic verdict is not a user gesture, and
-        // the union having no legal variant for it is what makes the old behavior unrepresentable
-        // rather than merely discouraged. Explicitness buys a skipped classify, never a skipped gate.
+        // THE AUTHORITY GATE STAYS ON EVERY PATH — but the COUNTDOWN no longer does, and the two
+        // are different things. Nothing reaches a terminal without naming the user gesture that
+        // authorized it: an ADDRESSED send still arms an intent, becomes visible, counts down and
+        // can be cancelled, dispatching only on an expiry the user didn't stop and carrying
+        // `{ kind: "countdown", intentId }`; a MOUNTED send goes immediately carrying
+        // `{ kind: "mount", agentId }` (see the mount block below for why the veto window buys
+        // nothing there). That is why there is no `router` arm in DispatchAuthority and must never
+        // be one — a heuristic verdict is not a user gesture, and the union having no legal variant
+        // for it is what makes the old behavior unrepresentable rather than merely discouraged.
+        // Explicitness buys a skipped classify — and, for a mount, a skipped WAIT — never a skipped
+        // gate.
         // What actually goes down the wire. For an ADDRESSED message that is the version with the
         // `@…` stripped: the agent on the far end is a Claude Code CLI, where a leading `@` opens
         // its own file-reference autocomplete, so relaying the address verbatim would pop a picker
@@ -4521,6 +4525,225 @@ export function ConciergeHost({
         // mentionFreeText). Every other send is unchanged.
         const wire = mentionAim && addressable ? mentionAim.payload : payload;
         const namingBasis = mentionAim && addressable ? mentionAim.text : text;
+        // ══ THE DISPATCH ITSELF, LIFTED OUT OF THE ARMING ═══════════════════════════════════════
+        // ONE body, two callers, and the sharing is a safety property rather than a tidiness one. A
+        // MOUNTED send calls this immediately (just below); an ADDRESSED send calls it when its
+        // countdown elapses. Everything between the decision and `submitPrompt` is identical and all
+        // of it is load-bearing: the agent-still-exists re-check, the screen re-check, both refusal
+        // paths, the receipt, and the draft/attachment restore. A second copy of that for the
+        // immediate path is exactly how one branch quietly loses a guard the other keeps.
+        const dispatchToTerminal = (authority: DispatchAuthority) => {
+          // Through the queue, so a send that armed first still lands first — dispatching must not
+          // silently reorder messages relative to an Approve or a redirect.
+          void enqueue(async () => {
+            // The agent can be closed between the route decision and this write, and dispatching
+            // at a corpse would report a delivery that cannot happen — the same re-check `deliver`
+            // does around the route call, for the same reason.
+            //
+            // HOW WIDE THAT GAP IS DEPENDS ON THE CALLER, which is why the check is here rather
+            // than at either call site. On the ADDRESSED path seconds have passed — a whole
+            // countdown — and the gap is much wider than `deliver`'s. On the MOUNTED path there is
+            // no countdown and this runs on the same tick as the submit, so the check is nearly
+            // free and nearly always true. Nearly is not always: `enqueue` still serializes this
+            // behind whatever was already in flight, so the agent can be gone even here.
+            if (!agentStillExists(aim.agentId)) {
+              // STILL A PILL, even though the agent is gone. The id is real — it is the agent
+              // that closed, not the reference — so the pill resolves to its known-closed state,
+              // which names it and offers the route to what it did. That is strictly more than
+              // the bare text said.
+              postSparkle(line`${ref(asAgent(aim))} isn't open any more, so I didn't send that.`);
+              restoreDraft(text, sentQuote);
+              restoreAttachments(staged);
+              return false;
+            }
+            // ══ AND THE SCREEN AGAIN, IMMEDIATELY BEFORE THE WRITE ═══════════════════════════
+            // The same re-check the block above makes for the agent's existence, over the same
+            // gap and for the same reason. On the ADDRESSED path that gap is a whole countdown —
+            // exactly long enough to open `vim` or hit a `sudo` prompt in — so the submit-time
+            // check is the fast cheap answer and THIS one is the load-bearing one: it is the last
+            // thing between the founder's text and `submitPrompt`'s paste-and-carriage-return. Do
+            // not delete either as redundant; they observe two different instants, and only the
+            // second observes the instant that matters.
+            //
+            // THE MOUNTED PATH NEEDS THIS JUST AS MUCH, and the reason is easy to get wrong — an
+            // earlier version of this comment claimed the two instants "coincide" once the
+            // countdown is gone, and that is FALSE. `enqueue` chains every dispatch onto ONE
+            // GLOBAL send queue, so this body can run well after the submit even with no countdown
+            // at all: long enough to open vim, exactly like the addressed path. The window is
+            // narrower, not absent — so do not "tidy" this away as redundant on the mount.
+            //
+            // ITS TEST IS THE ADDRESSED ONE, and that is now sufficient rather than a gap: both
+            // paths run THIS function, so these are the only post-write screen-check lines in the
+            // code and the addressed row exercises them literally. Mutating this to `null` kills
+            // that row. A mounted equivalent is unwritable — the send-while-busy queue re-runs the
+            // submit-time check when it drains a held message, so the earlier guard always refuses
+            // first. See the note on the mounted screen row for the full reasoning.
+            const blocked = mentionAim
+              ? terminalWriteBlocked(aim.agentId, mentionAim.via)
+              : null;
+            if (blocked) {
+              postSparkle(terminalRefusalLine(asAgent(aim), blocked));
+              if (displayMountedRef.current)
+                noteMounted(terminalRefusalText(aim.name, blocked), "warn");
+              const returned = restoreDraft(text, sentQuote);
+              restoreAttachments(staged);
+              // BOTH refusal instants retract, for the reason roborev 57360 made both of them post
+              // a receipt: the two must tell the identical story about an identical outcome. This
+              // is the LATER instant — on the addressed path, the one the founder reaches after
+              // watching a countdown run; on the mounted path, the same tick as the submit.
+              if (returned) {
+                retractSend(id);
+                return false;
+              }
+              // THE SAME RECEIPT THE SUBMIT-TIME REFUSAL POSTS. This used to post none at all, so
+              // the two refusal instants told the user different stories about the identical
+              // outcome — and the later one, the one an addressed send reaches after they have
+              // watched a countdown run, was the silent one (roborev 57360).
+              setReceipt(id, {
+                target: "agent",
+                refused: true,
+                agentName: aim.name,
+                agentId: aim.agentId,
+                redirectable: false,
+              });
+              return false;
+            }
+            // announceSuccess: false — the receipt below already reads "→ Sent to <agent>".
+            const ok = await promptAgent(
+              aim,
+              wire,
+              { display, namingBasis },
+              staged,
+              false,
+              authority,
+              // An ADDRESSED message is a message. Without this the dispatcher would still match
+              // it against a live picker and press a button (roborev 54569).
+              !!mentionAim && addressable,
+            );
+            // A FAILED delivery gets no receipt: promptAgent has already said what went wrong in
+            // the thread, and "→ Sent to X" over a message that never arrived would be a plain lie.
+            if (ok) {
+              setReceipt(id, {
+                target: "agent",
+                agentName: aim.name,
+                agentId: aim.agentId,
+                redirectable: true,
+              });
+              // ══ THE CONCIERGE STAYS IN THE CONVERSATION ═══════════════════════════════════
+              // The founder's headline requirement for this feature: "the concierge sends it over
+              // to that builder agent, but ALSO still participates in the conversation… I want
+              // the concierge to be a thought partner."
+              //
+              // Only for an ADDRESSED send. A message the ROUTER decided belonged to an agent is
+              // one the user wrote to that agent — following it with an unbidden chat turn would
+              // put a paragraph of commentary after every terse "yes" typed at a picker, and bill
+              // a brain turn for it. Naming an agent is different: it is a message sent THROUGH
+              // the concierge, which is a conversation the concierge is a party to.
+              //
+              // AFTER delivery, never at arm time. The countdown is cancellable, and a reply
+              // saying "sent it" over a send the user then stopped would be exactly the kind of
+              // small lie the receipt rules in this file exist to prevent.
+              //
+              // Quotes the DISPLAY rendering, never the wire: `payload` carries the attachments'
+              // temp paths, and this text reaches the brain's context (roborev 46925).
+              //
+              // ══ AND NOT FOR A MOUNTED SEND EITHER (`via === "mount"`) ══════════════════════
+              // Same reasoning as the router-decided case above, arrived at from the other side.
+              // A message ADDRESSED to an agent is sent THROUGH the concierge — the founder
+              // handed it something to relay, so the concierge is a party to that. A MOUNTED
+              // message is the founder talking straight to the agent: the column has swapped to
+              // that agent's own conversation, the compose box is keyed to that agent's draft,
+              // and Sparkle is not in the room. Following every line of that conversation with a
+              // paragraph of unbidden commentary — and billing a brain turn for each one — is not
+              // a thought partner, it is a tax on typing. The receipt still names where the
+              // message went, and the redirect is still one tap away when the founder does want
+              // Sparkle's read on it.
+              if (mentionAim?.via === "address" && addressable)
+                askSparkle(relayFollowUp(aim.name, display));
+              return true;
+            }
+            // A failed delivery must not cost the user their files any more than their words
+            // (roborev 46922/48172/49293).
+            restoreDraft(text, sentQuote);
+            restoreAttachments(staged);
+            return false;
+          }, false);
+        };
+
+        // ══ MOUNTED: IT GOES NOW, WITH NO COUNTDOWN ═════════════════════════════════════════════
+        // THE FOUNDER'S ASK, verbatim: "when the concierge is mounted and I'm sending something to a
+        // build agent, I don't need this countdown. I just want it to be sent immediately."
+        //
+        // WHY THIS IS THE RIGHT SEAM AND NOT A HOLE IN THE FORWARDING FIX. The countdown was built
+        // for a bug where concierge-aimed text was SILENTLY forwarded to an agent the ROUTER chose —
+        // the user never picked that destination, so they were owed a chance to veto it. That verdict
+        // is now unrepresentable: `routeMessage` cannot return `agent` at all (see the block above).
+        // The only two destinations that still reach here are ones the user STATED — an `@Name` they
+        // typed, or a cable they patched — and a mount is the more explicit of the two. The column
+        // has swapped to that agent's conversation and the compose box is keyed to that agent's
+        // draft; there is no ambiguity left for a banner to resolve, so the three seconds buy nothing
+        // and cost every line they type.
+        //
+        // THE ADDRESSED PATH KEEPS ITS COUNTDOWN. `@Name` is a message relayed THROUGH the concierge
+        // — sent from a surface aimed somewhere else — so a mistyped or mis-resolved name is still a
+        // real misroute with a real veto window. Narrowest correct predicate, not "kill the
+        // countdown".
+        //
+        // THE DICTATION COUNTDOWN IS UNTOUCHED. That is a different engine entirely
+        // (voice/autoSendTimer, whose header explains why it is a SIBLING of services/dispatchIntent
+        // rather than a caller). Speak still ends an utterance on silence exactly as before, and
+        // nothing on this path can reach it.
+        //
+        // ══ ...BUT ONLY WHILE HE IS ACTUALLY AT THE MACHINE ═════════════════════════════════════
+        // THE INVARIANT, and it is the whole of the safety argument in one line: **a mount skips the
+        // countdown only when presence says HERE; while Away a mounted send behaves exactly as an
+        // addressed one does.** Nothing about the mount is special when nobody is watching.
+        //
+        // WHY PRESENCE AND NOT THE DANGER CLASSIFIER. The obvious carve-out is "instant unless the
+        // text is destructive", and it was tried and REJECTED here — it does almost nothing.
+        // `DESTRUCTIVE_CATEGORIES` is `APPROVAL_CATEGORIES` minus `NON_BASH_CATEGORIES`, which is
+        // exactly `["bash"]`, and `approvalClassifier` was tuned on permission-prompt HEADERS, not
+        // free-form prose (its own header says so). Measured against the real classifier: `rm -rf .`,
+        // `force push to main`, `drop the users table`, `deploy to production` and `land the PR and
+        // delete the branch` ALL classify as `routine`. Only text happening to contain "command",
+        // "execute" or "bash" reads destructive — so a classifier gate would have protected the
+        // phrasing nobody uses while waving through every phrasing they do, and made the banner's
+        // appearance look arbitrary to the user. Do not re-add it here: if that taxonomy should
+        // recognise destructive prose, that is a fix in services/dispatchClass (the ONE taxonomy,
+        // per its locked decision) with its own table-driven test, not a second opinion in this file.
+        //
+        // WHAT PRESENCE BUYS THAT THE CLASSIFIER CANNOT. The thing actually worth protecting is
+        // `shouldDispatchOnExpiry`, which HOLDS a destructive send when nobody is at the machine.
+        // Falling through to `armIntent` whenever presence is Away preserves that rule untouched and
+        // costs the classifier's false negatives nothing — an Away machine gets the identical
+        // treatment an addressed send has always had.
+        //
+        // AND IT COSTS HIM NOTHING WHILE HERE, which is why this is not a hedge. With presence Here,
+        // `shouldDispatchOnExpiry` returns true for BOTH classes — so arming would never have HELD
+        // anything, it would only have added the cancel window he explicitly said he does not want.
+        // Skipping it while Here gives up a veto that was never going to fire.
+        //
+        // (An earlier draft argued the away-rule could not bite on an immediate path at all, since
+        // presence is read at expiry and with no delay the expiry IS the submit. THAT IS WRONG and
+        // is why this gate exists: `enqueue` chains every dispatch onto one global queue, so the
+        // body can run well after the submit. No instant here is "demonstrably the submit".)
+        //
+        // THE SCREEN RE-CHECK IS *NOT* REDUNDANT HERE EITHER, for that same `enqueue` reason: the
+        // submit-time check and the one inside `dispatchToTerminal` still observe different
+        // instants on this path, so both are load-bearing and neither may be "tidied" away.
+        if (
+          mentionAim?.via === "mount" &&
+          addressable &&
+          usePresenceStore.getState().mode === "here"
+        ) {
+          dispatchToTerminal({ kind: "mount", agentId: aim.agentId });
+          // TRUE — the text is in hand and on its way. There is no banner to announce and no cancel
+          // window to describe; the receipt the dispatch posts is what says where it went, and the
+          // failure and refusal paths inside `dispatchToTerminal` are what put the words and the
+          // files back if it never lands.
+          return true;
+        }
+
         const armed = armIntent({
           text: wire,
           // The BANNER and the live region quote this, never `payload`. `attachedPayload` prefixes
@@ -4542,122 +4765,7 @@ export function ConciergeHost({
           // no red test, and destructive sends fired at an unattended machine. `presence` is a
           // required field for that reason — do not give it a default.
           presence: () => usePresenceStore.getState().mode,
-          onDispatch: (_intent, authority) => {
-            // Through the queue, so a send that armed first still lands first — the countdown must
-            // not silently reorder messages relative to an Approve or a redirect.
-            void enqueue(async () => {
-              // Seconds have passed since the route decision. The agent can be closed inside the
-              // countdown window, and dispatching at a corpse would report a delivery that cannot
-              // happen — the same re-check `deliver` does around the route call, for the same
-              // reason and over a much wider gap.
-              if (!agentStillExists(aim.agentId)) {
-                // STILL A PILL, even though the agent is gone. The id is real — it is the agent
-                // that closed, not the reference — so the pill resolves to its known-closed state,
-                // which names it and offers the route to what it did. That is strictly more than
-                // the bare text said.
-                postSparkle(line`${ref(asAgent(aim))} isn't open any more, so I didn't send that.`);
-                restoreDraft(text, sentQuote);
-                restoreAttachments(staged);
-                return false;
-              }
-              // ══ AND THE SCREEN AGAIN, IMMEDIATELY BEFORE THE WRITE ═══════════════════════════
-              // The same re-check the block above makes for the agent's existence, over the same
-              // gap and for the same reason: seconds have passed, and the countdown is exactly long
-              // enough to open `vim` or hit a `sudo` prompt in. The submit-time check is the one
-              // that gives a fast, cheap answer; THIS one is the one that is actually load-bearing,
-              // because it is the last thing between the founder's text and `submitPrompt`'s
-              // paste-and-carriage-return. Do not delete either as redundant — they observe two
-              // different instants, and only the second observes the instant that matters.
-              const blocked = mentionAim
-                ? terminalWriteBlocked(aim.agentId, mentionAim.via)
-                : null;
-              if (blocked) {
-                postSparkle(terminalRefusalLine(asAgent(aim), blocked));
-                if (displayMountedRef.current)
-                  noteMounted(terminalRefusalText(aim.name, blocked), "warn");
-                const returned = restoreDraft(text, sentQuote);
-                restoreAttachments(staged);
-                // BOTH refusal instants retract, for the reason roborev 57360 made both of them post
-                // a receipt: the two must tell the identical story about an identical outcome, and
-                // this is the one the founder reaches AFTER watching a countdown run.
-                if (returned) {
-                  retractSend(id);
-                  return false;
-                }
-                // THE SAME RECEIPT THE SUBMIT-TIME REFUSAL POSTS. This used to post none at all, so
-                // the two refusal instants told the user different stories about the identical
-                // outcome — and the later one, which is the one that happens after they have watched
-                // a countdown run, was the silent one (roborev 57360).
-                setReceipt(id, {
-                  target: "agent",
-                  refused: true,
-                  agentName: aim.name,
-                  agentId: aim.agentId,
-                  redirectable: false,
-                });
-                return false;
-              }
-              // announceSuccess: false — the receipt below already reads "→ Sent to <agent>".
-              const ok = await promptAgent(
-                aim,
-                wire,
-                { display, namingBasis },
-                staged,
-                false,
-                authority,
-                // An ADDRESSED message is a message. Without this the dispatcher would still match
-                // it against a live picker and press a button (roborev 54569).
-                !!mentionAim && addressable,
-              );
-              // A FAILED delivery gets no receipt: promptAgent has already said what went wrong in
-              // the thread, and "→ Sent to X" over a message that never arrived would be a plain lie.
-              if (ok) {
-                setReceipt(id, {
-                  target: "agent",
-                  agentName: aim.name,
-                  agentId: aim.agentId,
-                  redirectable: true,
-                });
-                // ══ THE CONCIERGE STAYS IN THE CONVERSATION ═══════════════════════════════════
-                // The founder's headline requirement for this feature: "the concierge sends it over
-                // to that builder agent, but ALSO still participates in the conversation… I want
-                // the concierge to be a thought partner."
-                //
-                // Only for an ADDRESSED send. A message the ROUTER decided belonged to an agent is
-                // one the user wrote to that agent — following it with an unbidden chat turn would
-                // put a paragraph of commentary after every terse "yes" typed at a picker, and bill
-                // a brain turn for it. Naming an agent is different: it is a message sent THROUGH
-                // the concierge, which is a conversation the concierge is a party to.
-                //
-                // AFTER delivery, never at arm time. The countdown is cancellable, and a reply
-                // saying "sent it" over a send the user then stopped would be exactly the kind of
-                // small lie the receipt rules in this file exist to prevent.
-                //
-                // Quotes the DISPLAY rendering, never the wire: `payload` carries the attachments'
-                // temp paths, and this text reaches the brain's context (roborev 46925).
-                //
-                // ══ AND NOT FOR A MOUNTED SEND EITHER (`via === "mount"`) ══════════════════════
-                // Same reasoning as the router-decided case above, arrived at from the other side.
-                // A message ADDRESSED to an agent is sent THROUGH the concierge — the founder
-                // handed it something to relay, so the concierge is a party to that. A MOUNTED
-                // message is the founder talking straight to the agent: the column has swapped to
-                // that agent's own conversation, the compose box is keyed to that agent's draft,
-                // and Sparkle is not in the room. Following every line of that conversation with a
-                // paragraph of unbidden commentary — and billing a brain turn for each one — is not
-                // a thought partner, it is a tax on typing. The receipt still names where the
-                // message went, and the redirect is still one tap away when the founder does want
-                // Sparkle's read on it.
-                if (mentionAim?.via === "address" && addressable)
-                  askSparkle(relayFollowUp(aim.name, display));
-                return true;
-              }
-              // A failed delivery must not cost the user their files any more than their words
-              // (roborev 46922/48172/49293).
-              restoreDraft(text, sentQuote);
-              restoreAttachments(staged);
-              return false;
-            }, false);
-          },
+          onDispatch: (_intent, authority) => dispatchToTerminal(authority),
           // The precedence rule held it: destructive, and nobody is at the machine. Say so plainly
           // — a queued action the user never hears about is its own silent failure, the mirror of
           // the one this whole change removes.
@@ -4672,6 +4780,21 @@ export function ConciergeHost({
             postSparkle(
               line`That looked like it could break something and you were away, so I'm holding it rather than sending it to ${ref(asAgent(aim))}. I'll bring it back when you return.`,
             );
+            // ══ AND SAY IT ON THE MOUNTED SURFACE TOO ═══════════════════════════════════════════
+            // A mount can now reach this handler (mounted + Away falls through to the arming), and
+            // `postSparkle` alone is INVISIBLE there: the mounted column does not render
+            // `ConciergeThread`. The banner cannot cover for it either — it renders `armedIntents()`
+            // and a queued intent lives in `queuedSnapshot`, so it leaves the banner as well. Without
+            // this line the composer clears, the banner empties, and NOTHING on screen says the
+            // message is held — the exact silent hold this handler's own copy exists to prevent, and
+            // worse than the original bug because `onQueue` deliberately restores no draft either.
+            // Every other user-visible line in this function mirrors to `noteMounted` for this
+            // reason; these two were the omissions.
+            if (displayMountedRef.current)
+              noteMounted(
+                `That could break something and you were away, so I'm holding it for ${aim.name} rather than sending it. I'll bring it back when you return.`,
+                "warn",
+              );
           },
           // Back from the queue and in front of the user again. Feed the column's ONE live region:
           // a re-presented send nobody announces is exactly as silent as the bug this fixes.
@@ -4685,6 +4808,11 @@ export function ConciergeHost({
             restoreDraft(text, sentQuote);
             restoreAttachments(staged);
             postSparkle(line`Okay — I didn't send that to ${ref(asAgent(aim))}.`);
+            // Mirrored for the same reason as `onQueue` above — a mounted column renders no thread,
+            // so the Sparkle line lands nowhere the founder can see. Less severe here (the draft IS
+            // restored, so the words visibly come back), but the two must tell one story.
+            if (displayMountedRef.current)
+              noteMounted(`Okay — I didn't send that to ${aim.name}.`, "info");
           },
         });
         // Feed the column's ONE live region (see setReceipt): a countdown a screen-reader user
@@ -4798,6 +4926,23 @@ export function ConciergeHost({
       // queued cannot retroactively redirect it.
       const forceSparkle = forceSparkleRef.current;
       forceSparkleRef.current = false;
+      // ══ SUBMITTING IS INPUT, EVEN WHEN NOBODY TOUCHED THE KEYBOARD ══════════════════════════════
+      // `noteInput` is fed from exactly two places — the composer's own `onChange` and the
+      // terminal's `onData` — and BOTH only ever see keystrokes. ComposeBox pokes it on the user's
+      // edits only, deliberately (a dictated segment landing in the box must not report Here on its
+      // own; see its `onChange`). The consequence is that a hands-free session looks IDLE: read
+      // terminal output for five minutes without typing, dictate a line, and auto-send fires with
+      // presence already resolved to Away.
+      //
+      // That matters here specifically, because the immediate mounted path is gated on presence. Left
+      // alone, a voice-only founder gets the countdown banner back — the exact complaint this whole
+      // change removes, resurrected in precisely the mode where he is not typing.
+      //
+      // A SUBMIT IS NOT A SEGMENT. `services/dictationTerminalSink` already made this call for the
+      // terminal sink and its reasoning transfers verbatim: dictating is input, say so. This is the
+      // narrower version of that — poked once per SUBMIT, not per dictated segment, so an utterance
+      // still accumulating in the box does not keep the app reporting Here on its own.
+      usePresenceStore.getState().noteInput();
       // ══ WHERE THIS MESSAGE GOES ═════════════════════════════════════════════════════════════════
       // The founder's rule, whole, in one pure function (Concierge/composerRoute):
       //

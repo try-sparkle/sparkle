@@ -70,6 +70,24 @@ export type DispatchAuthority =
   | { kind: "approval"; proposalId: string }
   /** An armed send countdown elapsed without the user cancelling (services/dispatchIntent). */
   | { kind: "countdown"; intentId: string }
+  /**
+   * The concierge is MOUNTED to this agent and the user pressed Send — the cable itself is the
+   * authorization, so the send goes immediately with no countdown in between.
+   *
+   * ITS OWN ARM RATHER THAN A BORROWED `countdown`, for the reason `goal-continue` gives below: this
+   * union's whole job is that the audit line names the REAL cause. A mounted send claiming
+   * `{kind:"countdown"}` would answer "why did it type that?" with "a send countdown elapsed without
+   * being cancelled" — naming a countdown that never ran and a cancel window the user never had.
+   * The write is real and a human authorized it; the union should say how.
+   *
+   * WHY IT IS A LEGITIMATE GESTURE, where a router verdict is not. Patching the cable is an
+   * explicit, standing, visible act: the column has swapped to that agent's conversation and the
+   * compose box is keyed to that agent's draft. The user is not being guessed at — they are typing
+   * into a terminal they opened. That is the same class of thing as `mention` (they named the
+   * agent), which is why both skip the classify; this one skips the ARMING too, because unlike an
+   * address there is nothing being relayed on their behalf for them to veto.
+   */
+  | { kind: "mount"; agentId: string }
   /** The user tapped the redirect on a routing receipt (components/Concierge/RoutingReceipt). */
   | { kind: "redirect"; receiptId: string }
   /** The user clicked Approve on a nudge card. */
@@ -141,6 +159,7 @@ const HUMAN_AUTHORED: Record<DispatchAuthorityKind, boolean> = {
   mention: true,
   approval: true, // the user approved THIS text before it went
   countdown: true,
+  mount: true, // they typed it into a terminal they had patched a cable into
   redirect: true,
   "nudge-approve": true,
   suggestion: true,
@@ -166,6 +185,7 @@ const AUTHORITY_REF_FIELD: Readonly<Record<DispatchAuthorityKind, string>> = Obj
   mention: "agentId",
   approval: "proposalId",
   countdown: "intentId",
+  mount: "agentId",
   redirect: "receiptId",
   "nudge-approve": "agentId",
   suggestion: "agentId",
@@ -202,6 +222,11 @@ const AUTHORITY_EXTRA_CHECK: Readonly<
   mention: () => true,
   approval: () => true,
   countdown: () => true,
+  // Nothing beyond the agent id. What makes a mounted send legal is that the cable IS patched, and
+  // that is checked at the call site against the live wiring (ConciergeHost `mountRouted`) before
+  // this authority is built — re-stating a slice of it here would be a second copy that can
+  // disagree with the first, exactly as `goal-continue` explains below.
+  mount: () => true,
   redirect: () => true,
   "nudge-approve": () => true,
   suggestion: () => true,
@@ -292,6 +317,8 @@ export function authorityRef(a: DispatchAuthority): string {
       return a.proposalId;
     case "countdown":
       return a.intentId;
+    case "mount":
+      return a.agentId;
     case "redirect":
       return a.receiptId;
     case "nudge-approve":
@@ -325,6 +352,8 @@ export function describeAuthority(a: DispatchAuthority): string {
       return "the user approved a proposed message";
     case "countdown":
       return "a send countdown elapsed without being cancelled";
+    case "mount":
+      return "the user sent this straight to the agent the concierge is mounted to";
     case "redirect":
       return "the user tapped redirect on a routing receipt";
     case "nudge-approve":

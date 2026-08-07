@@ -9,15 +9,18 @@
 // pure test cannot see, and it is the half that matters most, because this is the path where the
 // founder's typing becomes bytes on a live command line:
 //
-//   • a mounted send actually reaches `dispatchConciergeAnswer`, at the mounted agent, through the
-//     same armed-and-cancellable countdown every other routed send passes through;
+//   • a mounted send actually reaches `dispatchConciergeAnswer`, at the mounted agent — IMMEDIATELY,
+//     with no countdown armed in between, under a `{kind:"mount"}` authority of its own. An
+//     ADDRESSED send from the same box still arms the cancellable countdown, and that pair is the
+//     discriminator: this is a narrowing, not the removal of the gate;
 //   • `@Sparkle` pulls it back out again, deterministically, without spending a router call;
 //   • `@Other` overrules the mount for that one message and the mount does not follow it;
 //   • the SCREEN GUARDS shipped for dictation apply here too — a full-screen app, a credential
 //     prompt, or a screen that cannot be read all refuse, and the words come back to the composer
 //     rather than vanishing;
-//   • and the refusal is asked AGAIN after the countdown, because that is the instant the write
-//     actually happens.
+//   • and the refusal is asked AGAIN at the write, on BOTH paths. Not only after a countdown: the
+//     send queue is global, so an immediate mounted write can still sit behind an in-flight task
+//     long enough for the screen to change under it. Pinned on each path separately.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
@@ -157,7 +160,16 @@ vi.mock("../stores/runtimeStore", () => ({
 
 import { ConciergeHost, type ConciergePromptTarget } from "./ConciergeHost";
 import type { ConciergeFeed } from "../useConciergeFeed";
-import { armedIntents, cancelIntent, fireIntent } from "../services/dispatchIntent";
+import {
+  armedIntents,
+  cancelIntent,
+  clearAllIntents,
+  fireIntent,
+  queuedIntents,
+} from "../services/dispatchIntent";
+// The REAL store, not a mock: the immediate mounted path is gated on it, so a stubbed presence would
+// make every row here assert against a value the production gate never reads.
+import { IDLE_AWAY_MS, usePresenceStore } from "../stores/presenceStore";
 import { setConciergeChat } from "../stores/conciergeThreadStore";
 import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
 import { useProjectStore } from "../stores/projectStore";
@@ -259,10 +271,28 @@ beforeEach(() => {
   h.viewport.mockReturnValue(CLEAN);
   h.wired.mockReset();
   h.wired.mockReturnValue("left");
+  // HERE by default, so every row that does not say otherwise exercises the immediate path. Reset
+  // per test rather than relied on: the away rows below write this store, and a leaked "away" would
+  // silently turn every later mounted row back into a countdown row — which they would still PASS,
+  // because `elapse()` is a no-op when nothing is armed and most rows call it.
+  usePresenceStore.getState().reset();
   seedMountedRow();
 });
 afterEach(() => {
-  for (const i of armedIntents()) cancelIntent(i.id);
+  // ══ BOTH REGISTRIES, NOT JUST THE ARMED ONE ═══════════════════════════════════════════════════
+  // This used to be `for (const i of armedIntents()) cancelIntent(i.id)`, which cannot see a QUEUED
+  // intent — and the away rows below are the first in this file to leave one. A leaked queue entry
+  // survives `cleanup()` in the module-scoped registry, and `presentNextQueued` runs at the tail of
+  // every later `fireIntent`/`cancelIntent` and re-checks presence per intent. Since `beforeEach`
+  // resets presence to Here, the next row that elapses a countdown would RE-ARM the stale intent
+  // inside its own test: a banner in a host that never sent it, a fresh timer, and
+  // `onRepresent`/`onCancel` firing against the previous test's unmounted host. A row that elapses
+  // twice would fire it outright and add a phantom `dispatchConciergeAnswer` call — an
+  // order-dependent flake in every `toHaveBeenCalledTimes` assertion downstream.
+  //
+  // `clearAllIntents` is the API that exists for exactly this ("test teardown and app shutdown
+  // only") and drops armed and queued alike, without delivering or reporting.
+  clearAllIntents();
   cleanup();
   vi.clearAllMocks();
   // The store is a module singleton shared across cases — leaving rows behind would silently mount a
@@ -281,7 +311,13 @@ async function send(text: string) {
   });
 }
 
-/** Let every armed countdown elapse — the gate a mounted send still passes through. */
+/** Let every armed countdown elapse — the gate an ADDRESSED send still passes through.
+ *
+ *  A NO-OP AFTER A MOUNTED SEND, deliberately, rather than something to strip from those rows: a
+ *  mounted send dispatches on submit and leaves nothing armed, so this returns early. Keeping the
+ *  call in the mounted rows means they read identically whichever path they exercise, and a
+ *  regression that re-armed a mounted send would surface on the rows that assert `armedIntents()`
+ *  is empty rather than being quietly absorbed here. */
 async function elapse() {
   const pending = armedIntents();
   if (pending.length === 0) return;
@@ -504,30 +540,69 @@ describe("ConciergeHost — while MOUNTED, what you type goes to that agent's te
     expect(h.startConciergeTurn).toHaveBeenCalledTimes(1);
   });
 
-  // Explicitness — or a mount — buys a skipped CLASSIFY, never a skipped GATE. A mounted send is
-  // still armed, visible in the banner, and cancellable; only an expiry the founder did not stop
-  // dispatches.
-  it("arms a cancellable countdown rather than dispatching outright", async () => {
+  // ══ A MOUNTED SEND HAS NO COUNTDOWN AT ALL ══════════════════════════════════════════════════
+  // THE FOUNDER'S ASK, verbatim: "when the concierge is mounted and I'm sending something to a build
+  // agent, I don't need this countdown. I just want it to be sent immediately."
+  //
+  // THE ROW DELIBERATELY DOES NOT CALL `elapse()`, and that is the whole assertion: there is nothing
+  // left to elapse, because the send already happened on submit. Against the build before this
+  // change both lines read the other way — one armed intent, zero dispatches — so this cannot pass
+  // by accident on the old behaviour.
+  it("dispatches on submit, with no countdown armed in between", async () => {
     mount();
     await send("move the button 5px left");
+    expect(armedIntents()).toHaveLength(0);
+    expect(h.dispatchConciergeAnswer).toHaveBeenCalledTimes(1);
+    expect(h.dispatchConciergeAnswer.mock.calls[0]![0]).toBe("ag1");
+  });
+
+  // THE CONTROL, and the reason this is a NARROWING rather than a deletion. An ADDRESSED message is
+  // relayed THROUGH the concierge from a surface aimed somewhere else, so a mistyped or mis-resolved
+  // name is still a real misroute and still gets its veto window. A build that ripped the countdown
+  // out globally passes the row above and fails this one.
+  it("still arms a cancellable countdown for an ADDRESSED send, even while mounted", async () => {
+    mount();
+    await send("@Kraken Auth ship the DMG");
     expect(armedIntents()).toHaveLength(1);
-    expect(armedIntents()[0]!.targetName).toBe("Blueprint UI/UX");
+    expect(armedIntents()[0]!.targetName).toBe("Kraken Auth");
     expect(h.dispatchConciergeAnswer).not.toHaveBeenCalled();
   });
 
-  it("delivers nothing when that countdown is cancelled", async () => {
+  it("delivers nothing when that addressed countdown is cancelled", async () => {
     mount();
-    await send("move the button 5px left");
+    await send("@Kraken Auth ship the DMG");
     await act(async () => {
       cancelIntent(armedIntents()[0]!.id);
       await Promise.resolve();
     });
     expect(h.dispatchConciergeAnswer).not.toHaveBeenCalled();
+    // ══ AND THE MOUNTED COLUMN IS TOLD ════════════════════════════════════════════════════════════
+    // `onCancel` announces through `postSparkle`, which a MOUNTED column does not render — so
+    // without the `noteMounted` mirror the founder watches a banner vanish with no word about what
+    // happened to the message. Asserting only "nothing dispatched" (which this row did) leaves that
+    // branch unobservable, so deleting it would keep the suite green: the same unobservable-branch
+    // class the rows further down were written to close.
+    await waitFor(() => expect(notice().textContent).toContain("didn't send that to Kraken Auth"));
   });
 
-  it("dispatches through the countdown authority, like every other routed send", async () => {
+  // The audit line has to name the REAL gesture. A mounted send claiming `{kind:"countdown"}` would
+  // answer "why did it type that?" with "a send countdown elapsed without being cancelled" — naming
+  // a countdown that never ran and a cancel window the founder never had. See the `mount` arm in
+  // services/dispatchAuthority.
+  it("dispatches under the MOUNT authority, not a countdown it never ran", async () => {
     mount();
     await send("move the button 5px left");
+    expect(h.dispatchConciergeAnswer.mock.calls[0]![2]).toMatchObject({
+      userPrompt: true,
+      authority: { kind: "mount", agentId: "ag1" },
+    });
+  });
+
+  // ...and the addressed path still reports the countdown that genuinely DID run. The pair is the
+  // discriminator: one authority per gesture, neither borrowing the other's.
+  it("still dispatches an ADDRESSED send under the countdown authority", async () => {
+    mount();
+    await send("@Kraken Auth ship the DMG");
     await elapse();
     expect(h.dispatchConciergeAnswer.mock.calls[0]![2]).toMatchObject({
       userPrompt: true,
@@ -819,16 +894,167 @@ describe("ConciergeHost — a terminal that must not receive free text refuses",
   // answer; THIS one is the last thing between the founder's text and `submitPrompt`'s
   // paste-and-carriage-return, so it is the load-bearing one. A build that checks only at submit
   // passes every row above and fails this one.
+  //
+  // ══ WHY THIS ROW IS *ADDRESSED* AND NOT MOUNTED ═══════════════════════════════════════════════
+  // It used to be a mounted send, and it cannot be one any more: a mounted send now dispatches on
+  // submit, so there is no window between the two checks to open vim in — they observe the same
+  // instant, and the "vim opened while the banner counted down" scenario is unreachable there BY
+  // CONSTRUCTION rather than by a missing guard. The ADDRESSED path still counts down, so it is where
+  // the two-instants property is still real and still worth pinning. The column stays MOUNTED so the
+  // refusal is asserted through `notice()`, which is the mounted surface's channel — the unmounted
+  // `postSparkle` half of the same refusal is pinned by the row below.
   it("re-checks the screen after the countdown, not only before it", async () => {
     mount();
-    await send("move the button 5px left");
+    await send("@Kraken Auth ship the DMG");
     expect(armedIntents()).toHaveLength(1);
     // vim opened while the banner was counting down.
     h.viewport.mockReturnValue({ text: "~\n~\n:", alternateBuffer: true });
     await elapse();
     expect(h.dispatchConciergeAnswer).not.toHaveBeenCalled();
     await waitFor(() => expect(notice().textContent).toContain("full-screen app"));
+    await waitFor(() => expect(box().value).toBe("@Kraken Auth ship the DMG"));
+  });
+
+  // ══ THE IMMEDIATE MOUNTED PATH STILL HONOURS THE SUBMIT-TIME GUARD ════════════════════════════
+  // WHAT THIS ROW PROVES, STATED HONESTLY, because roborev's Medium on the first attempt was that it
+  // claimed more than it showed. It proves ONLY that skipping the countdown did not also skip the
+  // SUBMIT-TIME screen check — a guard that predates this change. It is a REGRESSION GUARD on the
+  // mounted path, not evidence about the second check, and it would pass against the old build too.
+  //
+  // THE POST-WRITE RE-CHECK IS COVERED, but by the addressed row above rather than here, and after
+  // this change that is sufficient rather than a gap: both paths now run the SAME
+  // `dispatchToTerminal`, so there is exactly one post-write screen check in the code and the
+  // addressed row exercises those literal lines. Hand-mutating that check to `null` kills the
+  // addressed row; it cannot kill a mounted row, because the concierge's send-while-busy queue
+  // re-runs the submit-time check when it drains a held message, so the earlier guard refuses first
+  // and the later one is never reached. A mounted "post-write" row is therefore unwritable at this
+  // seam — better to say so than to ship a row whose name promises it.
+  it("refuses an immediate mounted send when the screen is in a full-screen app", async () => {
+    mount();
+    h.viewport.mockReturnValue({ text: "~\n~\n:", alternateBuffer: true });
+    await send("move the button 5px left");
+    expect(h.dispatchConciergeAnswer).not.toHaveBeenCalled();
+    // NOTHING WAS ARMED EITHER: the refusal happens before the class check and before any dispatch,
+    // so the founder gets the reason immediately rather than after a countdown he cannot see.
+    expect(armedIntents()).toHaveLength(0);
+    await waitFor(() => expect(notice().textContent).toContain("full-screen app"));
     await waitFor(() => expect(box().value).toBe("move the button 5px left"));
+  });
+
+  // ══ AWAY: A MOUNT STOPS BEING SPECIAL ══════════════════════════════════════════════════════════
+  // THE SAFETY INVARIANT, and the fix for roborev's High on the previous commit. The immediate path
+  // is gated on presence, NOT on the danger classifier. That is deliberate and the reason is
+  // measurable: `DESTRUCTIVE_CATEGORIES` is exactly `["bash"]` and `approvalClassifier` was tuned on
+  // permission-prompt headers, so `rm -rf .`, `force push to main`, `drop the users table` and
+  // `deploy to production` all classify ROUTINE. A classifier gate would have protected the phrasing
+  // nobody uses and waved through every phrasing they do. Presence has no such gap.
+  //
+  // These rows use ROUTINE text on purpose. A destructive-classified sample would pass even against
+  // a classifier-gated build, which is exactly the vacuity roborev caught in the row this replaces —
+  // the previous version used "run the deploy command", destructive solely because of the trailing
+  // word "command". Routine text discriminates: only a presence gate holds it.
+  it("arms rather than dispatching while AWAY, even mounted", async () => {
+    // `setAway()`, NOT `setState({mode:"away"})`. `mode` is DERIVED and re-resolved on every
+    // keystroke via `noteInput`, so a seeded mode is wiped by the act of typing the message — the
+    // row then silently tests the Here path while claiming to test Away. `manualAway` is first in
+    // `resolveMode`, so an explicit Away survives the typing that follows it.
+    usePresenceStore.getState().setAway();
+    mount();
+    await send("move the button 5px left");
+    expect(h.dispatchConciergeAnswer).not.toHaveBeenCalled();
+    expect(armedIntents()).toHaveLength(1);
+    expect(armedIntents()[0]!.targetName).toBe("Blueprint UI/UX");
+  });
+
+  // ...and the precedence rule it exists to preserve actually fires: a DESTRUCTIVE send while Away
+  // is HELD, not sent. Asserted against `queuedIntents()` — a real, inspectable place — because
+  // "did not dispatch" alone passes against an implementation that threw the message away.
+  it("QUEUES a destructive mounted send while away, rather than sending it", async () => {
+    // `setAway()`, NOT `setState({mode:"away"})`. `mode` is DERIVED and re-resolved on every
+    // keystroke via `noteInput`, so a seeded mode is wiped by the act of typing the message — the
+    // row then silently tests the Here path while claiming to test Away. `manualAway` is first in
+    // `resolveMode`, so an explicit Away survives the typing that follows it.
+    usePresenceStore.getState().setAway();
+    mount();
+    await send("run the deploy command");
+    await elapse();
+    expect(h.dispatchConciergeAnswer).not.toHaveBeenCalled();
+    expect(queuedIntents()).toHaveLength(1);
+    expect(queuedIntents()[0]!.class).toBe("destructive");
+    // ══ AND THE MOUNTED COLUMN SAYS SO ═══════════════════════════════════════════════════════════
+    // The second half of roborev's Medium. `onQueue` announces through `postSparkle`, which a
+    // mounted column does not render, and a queued intent is not in `armedIntents()` so it leaves
+    // the banner too. Without the `noteMounted` mirror the composer clears, the banner empties and
+    // nothing on screen says the message is held — and `onQueue` restores no draft, so that is a
+    // silent hold with the words gone from view.
+    await waitFor(() => expect(notice().textContent).toContain("holding it"));
+  });
+
+  // THE CONTROL for both rows above: the same routine text, Here, goes instantly. Without this the
+  // pair passes against a build that simply never dispatches from a mount.
+  it("dispatches that same routine text immediately while HERE", async () => {
+    usePresenceStore.getState().setHere();
+    mount();
+    await send("move the button 5px left");
+    expect(armedIntents()).toHaveLength(0);
+    expect(h.dispatchConciergeAnswer).toHaveBeenCalledTimes(1);
+  });
+
+  // ══ A VOICE-ONLY SESSION MUST NOT LOOK IDLE ═══════════════════════════════════════════════════
+  // THE REGRESSION THIS GUARDS, and it is the founder's own complaint coming back in the mode he
+  // uses most. `noteInput` is fed only by the composer's `onChange` and the terminal's `onData` —
+  // both keystroke-only, deliberately, so a dictated segment landing in the box does not report Here
+  // on its own. So: read terminal output for five minutes without typing, dictate a line, and the
+  // idle clock has already resolved presence to Away — the presence gate falls through and the
+  // countdown banner is back.
+  //
+  // IDLE Away, not MANUAL away, which is the distinction that makes this row mean something. The
+  // rows above use `setAway()` (an explicit "I'm stepping out", which `resolveMode` honours first
+  // and a submit must NOT override). This one ages `lastInputAt` past the idle threshold instead,
+  // which is the only kind of Away a submit is allowed to clear.
+  // THE HELPER CANNOT BE `send()` HERE, and getting that wrong made the first version of this row
+  // VACUOUS — it passed with the fix removed. `send()` uses `fireEvent.change`, which is a USER
+  // EDIT: it runs ComposeBox's own `onChange`, which pokes `noteInput` and resolves presence back to
+  // Here before the click ever happens. So the row could never reach the state it claimed to test.
+  // Dictation is different precisely because it does NOT go through `onChange` (segments land via
+  // `setText`), so here the text goes in first, presence is aged AFTERWARDS, and only then is Send
+  // pressed — which is exactly the state an auto-sent dictated utterance submits in.
+  it("treats a submit as input, so an idle voice-only session still sends immediately", async () => {
+    mount();
+    const ta = box();
+    const text = "move the button 5px left";
+    fireEvent.change(ta, {
+      target: { value: text, selectionStart: text.length, selectionEnd: text.length },
+    });
+    // NOW nobody touches the keyboard for longer than the idle threshold — the words are already
+    // sitting in the box, as they would be after dictation appended them.
+    usePresenceStore.setState({
+      pinnedHere: false,
+      manualAway: false,
+      focused: true,
+      lastInputAt: Date.now() - (IDLE_AWAY_MS + 60_000),
+    });
+    usePresenceStore.getState().evaluate();
+    expect(usePresenceStore.getState().mode).toBe("away");
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Send" }));
+      for (let i = 0; i < 6; i++) await Promise.resolve();
+    });
+    // The submit itself counted as input, so the send took the immediate path.
+    expect(armedIntents()).toHaveLength(0);
+    expect(h.dispatchConciergeAnswer).toHaveBeenCalledTimes(1);
+  });
+
+  // ...and the poke does NOT trample an explicit Away. `resolveMode` puts `manualAway` first, so
+  // "I'm stepping out" survives a submit — otherwise the fix above would quietly delete the one
+  // presence signal the user set on purpose.
+  it("does not let a submit override an EXPLICIT away", async () => {
+    usePresenceStore.getState().setAway();
+    mount();
+    await send("move the button 5px left");
+    expect(usePresenceStore.getState().mode).toBe("away");
+    expect(armedIntents()).toHaveLength(1);
+    expect(h.dispatchConciergeAnswer).not.toHaveBeenCalled();
   });
 
   // ══ AND THE POST-COUNTDOWN REFUSAL RETRACTS ITS BUBBLE TOO (roborev 57776) ═══════════════════

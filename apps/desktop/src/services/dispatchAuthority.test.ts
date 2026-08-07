@@ -6,6 +6,7 @@ import {
   conciergeToolAuthority,
   describeAuthority,
   isDispatchAuthority,
+  isHumanAuthored,
   type DispatchAuthority,
   type DispatchAuthorityKind,
 } from "./dispatchAuthority";
@@ -22,6 +23,7 @@ const SAMPLES: Record<DispatchAuthorityKind, DispatchAuthority> = {
   mention: { kind: "mention", agentId: "ag-1" },
   approval: { kind: "approval", proposalId: "prop-1" },
   countdown: { kind: "countdown", intentId: "intent-1" },
+  mount: { kind: "mount", agentId: "ag-5" },
   redirect: { kind: "redirect", receiptId: "you-7" },
   "nudge-approve": { kind: "nudge-approve", agentId: "ag-2" },
   suggestion: { kind: "suggestion", agentId: "ag-3" },
@@ -33,11 +35,22 @@ describe("DISPATCH_AUTHORITY_KINDS", () => {
   it("lists every kind the union declares", () => {
     expect([...DISPATCH_AUTHORITY_KINDS].sort()).toEqual(Object.keys(SAMPLES).sort());
   });
-  it("covers the six user gestures the design names, plus the two machine arms", () => {
+  it("covers the seven user gestures, plus the two machine arms", () => {
     // `concierge-tool` (an AI tool call under a resolved policy) and `goal-continue` (the goal
     // auto-continue runner) are the two writes NO human gesture authorizes. Each carries its own
     // arm so the audit line names the real cause rather than borrowing another's.
-    expect(DISPATCH_AUTHORITY_KINDS).toHaveLength(8);
+    //
+    // `mount` is the seventh gesture: the user patched a cable into an agent and typed into it. It
+    // exists so an IMMEDIATE mounted send need not claim a countdown that never ran.
+    expect(DISPATCH_AUTHORITY_KINDS).toHaveLength(9);
+  });
+  // A mounted send is a HUMAN gesture, and its audit line must not describe it as a countdown —
+  // that is the entire reason the arm was added rather than reusing `countdown`.
+  it("treats a mounted send as human-authored, and never describes it as a countdown", () => {
+    expect(isHumanAuthored(SAMPLES.mount)).toBe(true);
+    expect(describeAuthority(SAMPLES.mount)).not.toMatch(/countdown/i);
+    expect(describeAuthority(SAMPLES.mount)).toMatch(/mounted/i);
+    expect(authorityRef(SAMPLES.mount)).toBe("ag-5");
   });
   // The arm that must NEVER exist. A heuristic verdict is not a user gesture, and neither is an AI
   // deciding to call a tool — `concierge-tool` is admissible only because it carries the POLICY

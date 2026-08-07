@@ -37,6 +37,9 @@ const SAMPLES: Record<string, DispatchAuthority> = {
   mention: { kind: "mention", agentId: "a1" },
   approval: { kind: "approval", proposalId: "p1" },
   countdown: { kind: "countdown", intentId: "i1" },
+  // The concierge is mounted to this agent and the user pressed Send, so the send goes IMMEDIATELY
+  // with no countdown. Skipping the countdown is not skipping the gate — this walk is what says so.
+  mount: { kind: "mount", agentId: "a1" },
   redirect: { kind: "redirect", receiptId: "r1" },
   "nudge-approve": { kind: "nudge-approve", agentId: "a1" },
   suggestion: { kind: "suggestion", agentId: "a1" },
