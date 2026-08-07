@@ -24,7 +24,7 @@
 // The retraction case is the same rule stated over time, and it is the founder's literal ask:
 // bound to the agent whose own status is red, a card cannot outlive that status.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 
 const h = vi.hoisted(() => ({ dismissAlert: vi.fn() }));
 
@@ -76,7 +76,7 @@ import { buildConciergeFeed } from "../services/conciergeFeed";
 import { accountedNeedsYou } from "../services/conciergeProactive";
 import { useProjectStore } from "../stores/projectStore";
 import { useSparklePrefsStore } from "../stores/sparklePrefsStore";
-import { NUDGE_CARD_TESTID } from "./Concierge/NudgeCard";
+import { NUDGE_CARD_TESTID, NUDGE_LEAD_TESTID } from "./Concierge/NudgeCard";
 import type { AgentTab, AgentTabStatus, Project } from "../types";
 import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
 
@@ -431,6 +431,79 @@ describe("a red card retracts when its agent goes back to working", () => {
     // Unpin. THE RECEIPT IS STILL THERE — a pin hid it, it did not spend it.
     rerender(<ConciergeHost feed={feedWith({ mine: "working", theirs: "working" })} />);
     expect(resolvedCardAgentIds()).toEqual(["theirs"]);
+  });
+
+  // THE HALF THE PAIR ABOVE CANNOT REACH, and the one the original finding was actually about
+  // (roborev 60007-M1). Both cases above resolve the episode BEFORE the pin/mute goes on, so there
+  // is no OPEN episode for a destructive gate to damage — re-inserting `openedAt.delete(a.id)` for
+  // an out-of-scope agent leaves them both green. The damage that regression does is to the
+  // DURATION: `raisedAt` is the only record of when a block started, so losing it across a pin
+  // turns a three-minute block into "RESOLVED after 0s:" (or into no receipt at all). The duration
+  // is the entire reason the founder chose "keep it, greyed" over "delete it", and until now no
+  // host case asserted the text of one.
+  it("reports the FULL duration when the block spans a pin held while it was still red", () => {
+    const here = projectOf("p1", "sparkle-desktop", [tab("mine")]);
+    const there = projectOf("p2", "drodio-website", [tab("theirs")]);
+    const feedWith = (status: Record<string, AgentTabStatus>, pinnedProjectId?: string) =>
+      buildConciergeFeed({
+        projects: [here, there],
+        status,
+        openAgentIds: openIds([here, there]),
+        pinnedProjectId,
+      });
+    // The ledger stamps from `Date.now`, so the clock is the fixture. Spied rather than faked:
+    // `vi.useFakeTimers` would also take React's scheduler, and the thing under test is one call.
+    const T0 = 1_800_000_000_000;
+    const clock = vi.spyOn(Date, "now").mockReturnValue(T0);
+
+    // The block is raised with nothing pinned.
+    const { rerender } = render(
+      <ConciergeHost feed={feedWith({ mine: "working", theirs: "waiting" })} />,
+    );
+    expect(cardAgentIds()).toEqual(["theirs"]);
+
+    // A minute in, the reader pins the OTHER project — while `theirs` is STILL BLOCKED. This is the
+    // moment a destructive gate would drop the open episode.
+    clock.mockReturnValue(T0 + 60_000);
+    rerender(<ConciergeHost feed={feedWith({ mine: "working", theirs: "waiting" }, "p1")} />);
+    expect(cardAgentIds()).toEqual([]);
+    expect(resolvedCardAgentIds()).toEqual([]);
+
+    // It clears at T+3m, still out of scope, so the receipt is minted but not shown.
+    clock.mockReturnValue(T0 + 180_000);
+    rerender(<ConciergeHost feed={feedWith({ mine: "working", theirs: "working" }, "p1")} />);
+    expect(resolvedCardAgentIds()).toEqual([]);
+
+    // Unpin much later. The card is back AND it says three minutes — not "0s", and not a duration
+    // measured from the unpin.
+    clock.mockReturnValue(T0 + 900_000);
+    rerender(<ConciergeHost feed={feedWith({ mine: "working", theirs: "working" })} />);
+    expect(resolvedCardAgentIds()).toEqual(["theirs"]);
+    const grey = screen
+      .queryAllByTestId(NUDGE_CARD_TESTID)
+      .find((el) => el.getAttribute("data-resolved") === "true")!;
+    expect(within(grey).getByTestId(NUDGE_LEAD_TESTID).textContent).toBe("RESOLVED after 3m:");
+
+    clock.mockRestore();
+  });
+
+  // THE REPAINT (roborev 60007-M2). `[x]` on a RESOLVED card writes to module state, so nothing
+  // React can see changes; a bump counter is what repaints, and its own lint rule's suggested fix
+  // is to DELETE it. Without this case that dep is defended only by a comment, and dropping it
+  // regresses the feature to "the card you just dismissed sits there until something unrelated
+  // ticks" with the whole suite green. NO RERENDER below, deliberately — that is the assertion.
+  it("takes a dismissed grey card off screen immediately, with no feed tick", () => {
+    const p = projectOf("p1", "sparkle-desktop", [tab("solo")]);
+    const { rerender } = render(<ConciergeHost feed={feedFrom([p], { solo: "waiting" })} />);
+    rerender(<ConciergeHost feed={feedFrom([p], { solo: "working" })} />);
+    expect(resolvedCardAgentIds()).toEqual(["solo"]);
+
+    fireEvent.click(screen.getByTestId("concierge-nudge-dismiss"));
+    expect(resolvedCardAgentIds()).toEqual([]);
+    // AND IT ACKNOWLEDGED NOTHING. [x] on a finished episode is a plain removal; routing it into
+    // `dismissAlert` would write against an episode that has already closed, seeding the NEXT red
+    // as pre-dismissed — a genuinely new blocker coming up already silenced.
+    expect(dismissed()).toEqual([]);
   });
 
   // The founder's case again, as a transition. The worker answers and resumes; the orchestrator
