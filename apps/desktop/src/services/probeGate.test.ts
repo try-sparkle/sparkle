@@ -141,6 +141,88 @@ describe("readProbeGate — never throws", () => {
     });
   });
 
+  it("fails a probe LIST whose elements are not probes — the container is not the contract", async () => {
+    // `Array.isArray` validated the box and trusted its contents. `probes: [null]` — the drifted
+    // reply `babysitDispatcher.test.ts` already models — passed that check and then TypeError'd on
+    // `p.severity` one call later, inside a fired-not-awaited IIFE where the rejection is silent and
+    // the whole scope loses its probe state. UNKNOWN, and it says why.
+    h.invoke.mockResolvedValueOnce({ ...gate(), probes: [null] });
+    const g = await readProbeGate("/repo", 1325);
+    expect(g.probes).toBeUndefined();
+    expect(unansweredBlockingProbes(g)).toBeNull(); // the call that used to throw
+    expect(g.error).toMatch(/unrecognised/i);
+    expect(g.applicable).toBe(true); // still not "this PR has no knightwatch review"
+  });
+
+  it("fails on a MISSING dereferenced field, not just on a non-object element", async () => {
+    // One good probe and one that lost `answered` in a producer refactor. Reading the good half and
+    // dropping the bad one would report a SHORTER, healthier-looking list than Rust actually sent —
+    // so the whole reading is unknown, and the surviving probe is not silently believed.
+    const { answered: _dropped, ...noAnswered } = probe({ index: 2 });
+    h.invoke.mockResolvedValueOnce({ ...gate(), probes: [probe(), noAnswered] });
+    const g = await readProbeGate("/repo", 1325);
+    expect(g.probes).toBeUndefined();
+    expect(g.error).toMatch(/unrecognised/i);
+  });
+
+  it("COUNTS an unrecognised severity as blocking rather than dropping it", async () => {
+    // A third spelling — a typo, or a severity a newer producer adds — matches neither arm of a
+    // `=== "blocking"` filter, so it would count ZERO unanswered blockers and report the PR
+    // probe-CLEAN with a live one-click Merge: fail-OPEN on the one field the merge gate turns on,
+    // decided by a frontend merely older than its backend. The filter tests `!== "open"` instead,
+    // so an unfamiliar severity at worst over-reports a block, which reading the PR corrects.
+    h.invoke.mockResolvedValueOnce({ ...gate(), probes: [probe({ severity: "blokcing" as never })] });
+    const typo = await readProbeGate("/repo", 1325);
+    expect(typo.probes).toHaveLength(1); // AUTHORITATIVE — an odd spelling is not an unreadable reply
+    expect(typo.error).toBeNull();
+    expect(unansweredBlockingProbes(typo)).toHaveLength(1);
+
+    h.invoke.mockResolvedValueOnce({ ...gate(), probes: [probe({ severity: "open" })] });
+    const open = await readProbeGate("/repo", 1326);
+    expect(open.probes).toHaveLength(1); // "open" is a REAL severity — not blocking, still a probe
+    expect(unansweredBlockingProbes(open)).toEqual([]); // asked; nothing BLOCKING is unanswered
+  });
+
+  it("a MIXED list keeps its real blocker — rejecting the list would hide it (roborev 59770)", async () => {
+    // THE FAIL-OPEN THIS REPLACES, and the reason the spelling check does not live in `isProbeList`.
+    // Failing the whole list to UNKNOWN on one novel severity looks conservative and is not: the
+    // reading becomes `unansweredBlocking: null`, and `prMergeReadiness` lets a null fall straight
+    // through — so a PR with a genuine unanswered blocker renders GREEN with a live Merge, reachable
+    // by Rust merely ADDING a severity. The recognisable blocker must survive its odd neighbour.
+    h.invoke.mockResolvedValueOnce({
+      ...gate(),
+      probes: [probe(), probe({ index: 2, severity: "info" as never })],
+    });
+    const g = await readProbeGate("/repo", 1325);
+    expect(g.probes).toHaveLength(2); // the reading stays AUTHORITATIVE, not UNKNOWN
+    // The panel-visible consequence, which is what the fail-open actually destroyed: a count, not a
+    // `null`. Both are unanswered and neither is "open", so both count.
+    expect(unansweredBlockingProbes(g)).toHaveLength(2);
+    expect(probeStateOf(g)?.unansweredBlocking).toBe(2);
+  });
+
+  it("still passes a WELL-FORMED list straight through, elements untouched", async () => {
+    // The guard above must not be a filter. A conforming reply is AUTHORITATIVE and arrives whole —
+    // if this ever came back undefined, every row would render unknown and the panel would stop
+    // reporting probes at all, which is the guard failing in the expensive direction.
+    const good = [probe(), probe({ index: 2, answered: true })];
+    h.invoke.mockResolvedValueOnce({ ...gate(), probes: good });
+    const g = await readProbeGate("/repo", 1325);
+    expect(g.probes).toEqual(good);
+    expect(g.error).toBeNull();
+    expect(unansweredBlockingProbes(g)).toHaveLength(1);
+  });
+
+  it("keeps the PRODUCER's reason on a nullish reading rather than overwriting it", async () => {
+    // `probes: null` is the read that FAILED, and Rust already said why. The drifted-shape reason
+    // belongs only to a value that was present and unreadable; pinning it on every unknown would
+    // erase the one explanation the row has to show.
+    h.invoke.mockResolvedValueOnce({ ...gate(), probes: null, error: "gh: rate limited" });
+    const g = await readProbeGate("/repo", 1325);
+    expect(g.probes).toBeUndefined();
+    expect(g.error).toBe("gh: rate limited");
+  });
+
   it("passes root and number through under the names Rust expects", async () => {
     h.invoke.mockResolvedValueOnce(gate());
     await readProbeGate("/repo", 1325);

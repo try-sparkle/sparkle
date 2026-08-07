@@ -220,6 +220,44 @@ const unknownGate = (error: string): BabysitProbeGate => ({
 });
 
 /**
+ * Is this a probe list we can actually READ — every element included?
+ *
+ * Checks the two fields consumers dereference on each element (`severity`, which
+ * {@link unansweredBlockingProbes} compares, and `answered`, which it negates) plus element
+ * objecthood, which is what `null` fails.
+ *
+ * `severity` IS CHECKED FOR TYPE, NOT FOR SPELLING — and that split is the whole point (roborev
+ * 59770). An unrecognised spelling is a real hazard: it is compared with `===` downstream, so it
+ * matches nothing and would count ZERO blockers. But rejecting the LIST over it is worse than the
+ * hazard, because rejection is not conservative here. A mixed reply — one genuine unanswered
+ * `blocking` probe beside one novel spelling — would fail WHOLE to UNKNOWN, `probeStateOf` would
+ * yield `unansweredBlocking: null`, and `prMergeReadiness` lets a null fall straight through: a
+ * genuinely probe-blocked PR back to a green row with a live one-click Merge, reachable by Rust
+ * merely ADDING a severity. So the spelling hazard is answered where it actually bites, in
+ * {@link unansweredBlockingProbes}, which now treats anything that is not the known non-blocking
+ * spelling AS blocking. Validation stays about DEREFERENCE SAFETY, which is all this guard can be
+ * conservative about: `severity` must be a string, `answered` a boolean, the element an object —
+ * which is what `null` fails.
+ *
+ * Deliberately NOT a full-shape check of every field: the render-only fields (`text`, `url`, `from`,
+ * `index`) cannot throw when absent — they render as nothing — and demanding them would turn an
+ * otherwise-usable reading UNKNOWN the first time Rust adds a field or makes one optional. Validate
+ * what you dereference, not what you declare.
+ */
+function isProbeList(v: unknown): v is BabysitProbe[] {
+  return (
+    Array.isArray(v) &&
+    v.every(
+      (p) =>
+        !!p &&
+        typeof p === "object" &&
+        typeof (p as BabysitProbe).severity === "string" &&
+        typeof (p as BabysitProbe).answered === "boolean",
+    )
+  );
+}
+
+/**
  * Read one PR's probes. NEVER throws; a failure is the UNKNOWN reading.
  *
  * THE ONLY ADAPTER FOR `knightwatch_probe_gate`, and the only place the wire's shape is judged.
@@ -241,9 +279,25 @@ export async function readProbeGate(root: string, number: number): Promise<Babys
     // renamed field, a frontend newer than its backend — is passed on and read as AUTHORITATIVE by
     // every consumer. Narrowing on shape still maps `null` and an absent field to `undefined`, so it
     // strictly subsumes the `??` it replaced, and an unreadable value stays fail-closed as UNKNOWN.
+    //
+    // THE ELEMENTS, NOT JUST THE CONTAINER. `Array.isArray` alone validated the box and trusted
+    // whatever was in it, which is the wrong half for the one field this module ITERATES: a
+    // `probes: [null]` sails past the container check and then TypeErrors on `p.severity` inside
+    // `unansweredBlockingProbes`, one call later. One bad element fails the WHOLE reading to UNKNOWN
+    // rather than being filtered out, because a reply we cannot parse is a reply we did not
+    // understand: silently dropping the element would report a shorter, healthier-looking probe list
+    // than the producer actually sent. See {@link isProbeList} for which fields are checked and why.
+    const probes = isProbeList(gate.probes) ? gate.probes : undefined;
     return {
       ...gate,
-      probes: Array.isArray(gate.probes) ? gate.probes : undefined,
+      probes,
+      // A DRIFTED value SAYS SO; a nullish one keeps the producer's own reason. Both are UNKNOWN,
+      // but only one of them has an explanation already — `error` is the field the row shows when
+      // it cannot report probes, and leaving a drifted reply's `error: null` renders an unknown
+      // reading with nothing to say about itself, which reads to the user as a silent read.
+      error: probes === undefined && gate.probes != null
+        ? "unrecognised probe-gate reply: probes"
+        : (gate.error ?? null),
       reviewedHead: typeof gate.reviewedHead === "string" ? gate.reviewedHead : undefined,
     };
   } catch (e) {
@@ -262,7 +316,17 @@ export function unansweredBlockingProbes(gate: BabysitProbeGate | undefined): Ba
   // serde serialises `Option::None` as literal `null`, so an `=== undefined` guard misses every
   // real unknown the producer sends.
   if (!gate || gate.probes == null) return null;
-  return gate.probes.filter((p) => p.severity === "blocking" && !p.answered);
+  // NOT `=== "blocking"` — anything that is not the known NON-blocking spelling counts (roborev
+  // 59770). The contract has exactly two severities today, so the two forms agree on every reply
+  // Rust can currently send; they diverge only on a severity a NEWER producer adds, and there the
+  // directions are opposite. `=== "blocking"` drops it, counts zero blockers, and reports the PR
+  // probe-CLEAN with a live one-click Merge — fail-OPEN on the one field the merge gate turns on,
+  // decided by a frontend that is simply older than its backend. `!== "open"` counts it, so an
+  // unfamiliar severity at worst says "Blocked: 1 probe" on a probe that turns out to be advisory:
+  // a row that over-reports and is corrected by reading the PR, which is the recoverable direction.
+  // Whole-list rejection is NOT the third option — see {@link isProbeList} for why that is
+  // fail-open too, via the `null` that `prMergeReadiness` lets fall through.
+  return gate.probes.filter((p) => p.severity !== "open" && !p.answered);
 }
 
 /**

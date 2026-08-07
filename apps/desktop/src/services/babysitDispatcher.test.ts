@@ -1069,22 +1069,65 @@ describe("per-PR failure isolation", () => {
     });
   }
 
+  /**
+   * A gate that PASSES the adapter's validation and throws afterwards — the only fault shape that
+   * still reaches the sweep.
+   *
+   * This used to be `probes: [null]`, chosen because no fix addressed it. `readProbeGate` now
+   * validates probe ELEMENTS, so that reply is normalised to the UNKNOWN reading at the boundary
+   * and never throws again: the fixture stopped injecting a fault and the two assertions below —
+   * `failed`, and the summary line that is emitted only when `failed > 0` — silently stopped being
+   * about isolation at all. The radius is what these tests pin, so the injection has to move ahead
+   * of the newest guard rather than be deleted with it.
+   *
+   * `severity` reads clean ONCE (that is `isProbeList`, which short-circuits on the first spelling)
+   * and throws on every read after it — which is the filter inside the judgement, past every
+   * boundary check. `readProbeGate` wraps its whole body in a `try`, so a value that threw any
+   * EARLIER would be caught there and returned as UNKNOWN; a lazily-throwing element is what
+   * survives the adapter and lands in the loop this describe block is about.
+   *
+   * FRESH PER READ, and that is load-bearing: `prWithProbe` carries no `updatedAt`, so the gate is
+   * never cached and `sweepTwice` reads it again — a shared counter would be exhausted by the first
+   * sweep, throw inside the adapter on the second, and hand the assertions the sweep whose fault
+   * never fired.
+   */
+  function gateThatThrowsAfterValidation(): unknown {
+    let severityReads = 0;
+    return {
+      applicable: true,
+      probes: [
+        {
+          commentId: 9,
+          index: 1,
+          get severity(): string {
+            severityReads += 1;
+            if (severityReads > 1) throw new TypeError("probe reading is unreadable");
+            return "blocking";
+          },
+          from: null,
+          text: "x",
+          url: "u",
+          answered: false,
+        },
+      ],
+      error: null,
+      overridden: false,
+      reviewedHead: null,
+      reviewStale: false,
+    };
+  }
+
   it("a PR that THROWS while being judged is skipped; the PRs behind it still dispatch", async () => {
     fetchOpenPrsMock.mockResolvedValue([prWithProbe(GOOD_A), prWithProbe(BAD), prWithProbe(GOOD_B)]);
     wirePerPr({
       [GOOD_A]: gateWithUnansweredBlocking(),
-      // The gate EXACTLY as serde writes it — every `Option::None` a PRESENT `null`, never an
-      // absent field — carrying one member the TypeScript type says cannot exist. serde cannot
-      // write a null INSIDE `Vec<Probe>` today, and that is precisely the point: the type also said
-      // `reviewedHead` could not be `null`, and it was, three releases running. What the isolation
-      // has to survive is the NEXT cause, so the test picks one no current fix addresses.
-      [BAD]: {
-        applicable: true,
-        probes: [null],
-        error: null,
-        overridden: false,
-        reviewedHead: null,
-        reviewStale: false,
+      // A reply that is well-formed to every boundary check and unreadable to the judgement — see
+      // `gateThatThrowsAfterValidation`. The type also said `reviewedHead` could not be `null`, and
+      // it was, three releases running; what the isolation has to survive is the NEXT cause, so the
+      // fixture stays deliberately ahead of the newest guard rather than modelling a shape that
+      // guard already neutralises.
+      get [BAD]() {
+        return gateThatThrowsAfterValidation();
       },
       [GOOD_B]: gateWithUnansweredBlocking(),
     });
@@ -1146,7 +1189,9 @@ describe("per-PR failure isolation", () => {
     try {
       fetchOpenPrsMock.mockResolvedValue([prWithProbe(BAD)]);
       wirePerPr({
-        [BAD]: { applicable: true, probes: [null], error: null, overridden: false, reviewedHead: null, reviewStale: false },
+        get [BAD]() {
+          return gateThatThrowsAfterValidation();
+        },
       });
 
       await sweepAllProjects(CONFIG, {
