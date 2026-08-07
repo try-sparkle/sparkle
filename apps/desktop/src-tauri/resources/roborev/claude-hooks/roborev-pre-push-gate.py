@@ -59,6 +59,7 @@ from _roborev_hooklib import (
     _list_jobs,
     _is_open_fail,
     _in_flight,
+    scope_to_branch_commits,
     _deny,
     _emit_hook,
     _git_stdout,
@@ -250,7 +251,14 @@ def main() -> int:
     # be cleared by waiting, so never hang up to WAIT_TIMEOUT_SECS on unrelated
     # in-flight reviews first (the common case: an old verdict=F plus a freshly
     # enqueued review for the new commit).
-    outstanding = [j for j in jobs if _is_open_fail(j)]
+    # ...then narrow to the ones this branch can actually fix. `--branch` scoping
+    # is only as good as the branch roborev recorded, and a repo full of agent
+    # worktrees shares one `.git`, so a sibling branch's FAIL can surface here
+    # (bead sparkle-4yp7v). Dropping is proof-gated — see the helper's docstring;
+    # anything git can't positively attribute elsewhere still blocks.
+    outstanding = scope_to_branch_commits(
+        cwd, branch, [j for j in jobs if _is_open_fail(j)]
+    )
     if outstanding:
         return _deny(_format_block(outstanding, cmd))
 

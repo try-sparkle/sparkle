@@ -480,6 +480,27 @@ def _git_stdout(cwd: str, *args: str) -> str:
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
+def _git_rc(cwd: str, *args: str) -> int | None:
+    """Exit CODE of `git <args>` in `cwd`; `None` if git couldn't be run at all.
+
+    Deliberately NOT `_git_stdout`: that folds a nonzero exit into `""`, which is
+    fine for commands whose answer is their stdout but wrong for a PREDICATE like
+    `merge-base --is-ancestor`, whose whole answer IS the return code. Conflating
+    "the answer is no" with "I couldn't ask" is what turns a fail-closed gate into
+    a silently permissive one, so callers get the code and decide."""
+    git = _find_git()
+    if git is None:
+        return None
+    try:
+        r = subprocess.run(
+            [git, *args],
+            cwd=cwd, capture_output=True, text=True, timeout=5,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    return r.returncode
+
+
 def _inside_git_repo(cwd: str) -> bool:
     return _git_stdout(cwd, "rev-parse", "--is-inside-work-tree") == "true"
 
@@ -528,6 +549,60 @@ def _is_open_fail(job: object) -> bool:
         and job.get("verdict") == "F"
         and not job.get("closed", False)
     )
+
+
+def scope_to_branch_commits(cwd: str, branch: str, jobs: list[dict]) -> list[dict]:
+    """Narrow already-open-FAIL rows to the ones this branch can actually fix.
+
+    `roborev list --branch` is the primary scope, but it is only as good as the
+    branch roborev RECORDED at enqueue time — and roborev keys a repo by its MAIN
+    checkout, so in a repo full of agent worktrees (all sharing one `.git`) a
+    review enqueued from a sibling worktree can surface under the branch you are
+    pushing. The agent then has to read, judge and close a finding on a commit it
+    did not write and cannot fix; the only way to clear its own gate is to close
+    someone else's review, which either strands a real finding or forces a relay
+    comment to another PR (bead sparkle-4yp7v — the same wrong-branch commit hit
+    two separate agents).
+
+    So: drop a row only when git can PROVE it belongs to someone else — the
+    reviewed commit is not an ancestor of the branch being pushed, AND some other
+    local branch contains it. Everything else is kept, because every uncertain
+    case is a case where the gate should still fire:
+
+      - no/blank `git_ref`, or an object this repo doesn't have → keep (unknown)
+      - the branch ref itself won't resolve → keep ALL of them (nothing to scope
+        against; the gate degrades to today's `--branch`-only behaviour)
+      - an ancestor of the branch tip → keep (it IS this branch's work)
+      - contained by no other local branch → keep, since a rebased-away or
+        orphaned commit's finding still describes content this branch carries
+      - any git invocation that can't run → keep
+
+    Non-dict rows are passed through untouched; callers have already filtered to
+    `_is_open_fail`, and dropping a drifted row here would silently weaken the
+    gate rather than fail it loudly."""
+    if not branch or not jobs:
+        return jobs
+    if _git_rc(cwd, "rev-parse", "--verify", "--quiet", f"{branch}^{{commit}}") != 0:
+        return jobs  # can't resolve the branch → can't scope; keep everything
+    kept = []
+    for j in jobs:
+        ref = j.get("git_ref") if isinstance(j, dict) else None
+        if not isinstance(ref, str) or not ref.strip():
+            kept.append(j)
+            continue
+        ref = ref.strip()
+        if _git_rc(cwd, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}") != 0:
+            kept.append(j)  # unknown object → can't prove it's foreign
+            continue
+        if _git_rc(cwd, "merge-base", "--is-ancestor", ref, branch) != 1:
+            kept.append(j)  # ancestor (0), or git couldn't answer (None/other)
+            continue
+        owners = _git_stdout(
+            cwd, "for-each-ref", "--contains", ref, "--format=%(refname)", "refs/heads"
+        )
+        if not owners:
+            kept.append(j)  # contained by no other branch → keep (fail-closed)
+    return kept
 
 
 def _list_jobs(roborev: str, repo_root: str, branch: str) -> list[dict] | None:
