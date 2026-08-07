@@ -223,6 +223,37 @@ describe("hourlyMissionPrompt", () => {
     }
   });
 
+  // ...AND WITH `--apply`, which is the half that was missing. Triage's age-out is the ONLY
+  // mechanism that has ever removed a bead from this queue, and it is gated behind a flag the
+  // prompt used to talk the pass OUT of ("a dry run that writes nothing, so it is always safe").
+  // Every pass obeyed that, so the mechanism shipped and then never executed once: inflow ran at
+  // roughly a pain point per pass while outflow stayed at zero, and the inbox went 415 -> 1500+.
+  // Pin the flag ON THE INVOCATION, not merely somewhere in the prompt — a loose `--apply` in
+  // adjacent prose is exactly the wording an agent does not act on.
+  it("invokes triage with --apply, so the inbox is not a one-way queue", () => {
+    for (const mode of ["always", "case_by_case"] as const) {
+      const p = hourlyMissionPrompt(mode);
+      expect(p).toContain("scripts/retro-inbox-triage.sh --apply");
+      // The retired claim must be GONE, not merely contradicted later in the paragraph.
+      expect(p).not.toMatch(/dry run that writes nothing/);
+      expect(p).not.toMatch(/always safe to run/);
+    }
+  });
+
+  // A bead whose fix already landed is retired by CLOSING it with the sha — the `Refs:` trailer
+  // that demotes it in triage expires with the 500-commit scan window, so an open bead simply
+  // returns to the top of the ranking and is re-investigated again. Landed rows reached seen-6
+  // this way: the same finished work re-derived from scratch by six separate passes.
+  it("tells the pass to close an item it confirms is already fixed", () => {
+    for (const mode of ["always", "case_by_case"] as const) {
+      const p = hourlyMissionPrompt(mode);
+      expect(p).toContain("bd close");
+      expect(p).toMatch(/sha/);
+      // Confirmation first: LANDED is a read-the-commit marker, never a closure on its own.
+      expect(p).toMatch(/confirmed|read and confirmed/);
+    }
+  });
+
   // The mission prompt is the LAST thing the model reads, so it must not contradict the persona's
   // propose-only override on the one instruction that cannot succeed.
   it("drops the submit instruction entirely when this machine cannot open PRs", () => {

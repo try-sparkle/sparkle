@@ -356,6 +356,28 @@ describe("sparklePersona — agent-feedback inbox drain", () => {
     expect(p).toMatch(/severity/i);
   });
 
+  // ...AND THE INVOCATION CARRIES `--apply`. Age-out is the only mechanism that has ever taken a
+  // bead OUT of this inbox, and this persona used to tell the drain it was "a dry run and writes
+  // nothing, so it is always safe" — so the mechanism shipped and never ran. Inflow is about a
+  // pain point per pass, outflow was zero, and the queue grew 415 -> 1500+. Pin the flag on the
+  // command line, since a loose mention in nearby prose is not an instruction anyone acts on.
+  it.each(MINING_MODES)("%s: invokes triage with --apply, not as a dry run", (mode) => {
+    const p = sparklePersona(LOG_DIR, REPO, mode, "unknown", { attended: false });
+    expect(p).toContain("scripts/retro-inbox-triage.sh --apply");
+    expect(p).not.toMatch(/dry run and writes nothing/);
+  });
+
+  // Retiring a finding is a `bd close` citing the sha. The `Refs:` trailer that demotes a landed
+  // bead in triage expires with the scan window, so an open bead returns to the top of the ranking
+  // and is re-investigated — which is how landed rows reached seen-6.
+  it.each(MINING_MODES)("%s: closes an item confirmed already fixed, citing the sha", (mode) => {
+    const p = sparklePersona(LOG_DIR, REPO, mode, "unknown", { attended: false });
+    expect(p).toContain("bd close");
+    expect(p).toMatch(/citing that sha/);
+    // Confirmation first — LANDED is a read-the-commit marker, never a closure on its own.
+    expect(p).toMatch(/read and confirmed/);
+  });
+
   // The fallback must NOT swallow the script's LOCKED exit. Triage classifies a locked store and
   // exits 2 having read nothing; the fallback `bd list` is UNBOUNDED, so following it there blocks
   // on the very lock the classification exists to report — the convoy this drain must not join.
