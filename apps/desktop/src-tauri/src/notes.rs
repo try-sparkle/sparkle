@@ -1822,7 +1822,15 @@ mod tests {
     #[test]
     fn the_bd_bound_extractor_reads_the_real_call_and_nothing_else() {
         // A decoy declared ABOVE the funnel, carrying the CORRECT call, must not be read instead.
-        let decoy = "fn run_bd_json(p: &str) -> R {\n\
+        // The decoy MUST be newline-preceded, or this case cannot fail on the rule it names
+        // (roborev 59688). With `run_bd_json` at offset 0 there is no `\nfn run_bd_json(` in the
+        // input at all, so mutating the anchor back to the bare prefix `\nfn run_bd` — the exact
+        // 59636 regression this fixture exists to catch — still selects `run_bd` and the case stays
+        // green. A leading line makes the decoy actually reachable by the buggy anchor, so the
+        // assertion can fail. That is the "would this pass against the code as it was before?" test
+        // this file's other guards exist to enforce, applied to itself.
+        let decoy = "fn unrelated() {}\n\
+                     fn run_bd_json(p: &str) -> R {\n\
                      \x20   run_cmd_bounded(&bd, p, args, beads_cmd::BD_TIMEOUT)\n\
                      }\n\
                      fn run_bd(p: &str) -> R {\n\
