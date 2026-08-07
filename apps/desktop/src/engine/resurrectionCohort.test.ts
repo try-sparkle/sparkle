@@ -765,3 +765,29 @@ describe("a drained cohort's bindings age out rather than vanishing", () => {
     expect(returned.binding.get("agent-000")).toBe(key);
   });
 });
+
+describe("a binding from another incident is never a return (roborev 60155)", () => {
+  it("keeps the supersedes link when a drained cohort's agent joins a live one", () => {
+    // Comparing only anchors let a foreign key join priorKeys purely because the two incidents were
+    // within half an hour, collapsing `candidate` and taking the evidence link down with it.
+    const wall = (id: string, min: number) =>
+      member({ agentId: id, cause: "wall-session", message: SESSION_WALL, epoch: undefined, diedAt: NOW + min * 60_000 });
+
+    // X and Y die in an app-restart cohort, then are fully resurrected — that namespace can never recur.
+    const drained = stabilizeCohortKeys(new Map(), groupCohorts([
+      member({ agentId: "X", epoch: "epoch-Q", diedAt: NOW }),
+      member({ agentId: "Y", epoch: "epoch-Q", diedAt: NOW + 1_000 }),
+    ]));
+
+    // A wall cohort forms five minutes later; its canary is proven and departs.
+    const wallCohort = stabilizeCohortKeys(drained.binding, groupCohorts([wall("C", 5), wall("D", 6)]));
+    const releasedKey = wallCohort.binding.get("D");
+
+    // X then hits the same wall and clusters with the survivor.
+    const grown = stabilizeCohortKeys(wallCohort.binding, groupCohorts([wall("D", 6), wall("X", 10)]));
+    const newKey = grown.binding.get("X");
+
+    expect(newKey).not.toBe(releasedKey);
+    expect(grown.supersedes.get(newKey!)).toBe(releasedKey);
+  });
+});

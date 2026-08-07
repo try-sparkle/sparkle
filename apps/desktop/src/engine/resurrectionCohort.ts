@@ -254,6 +254,9 @@ export function stabilizeCohortKeys(
   const RETURN_WINDOW_MS =
     SHARED_FAILURE_MIN_VICTIMS * SHARED_FAILURE_WINDOW_MINUTES * 60_000;
 
+  /** The cause-and-message part of a key, i.e. everything `cohortKeyOf` produced. */
+  const namespaceOf = (key: string) => key.slice(0, key.lastIndexOf("@"));
+
   /** The anchor instant a key was minted from, or `undefined` if it does not parse. */
   const anchorOf = (key: string): number | undefined => {
     const at = key.lastIndexOf("@");
@@ -315,6 +318,14 @@ export function stabilizeCohortKeys(
         bound !== undefined &&
         boundAnchor !== undefined &&
         clusterAnchor !== undefined &&
+        // NAMESPACE MUST AGREE. Comparing only anchors let a binding from an entirely DIFFERENT
+        // incident count as a return purely because the two happened within half an hour of each
+        // other — so its foreign key joined `priorKeys`, collapsed `candidate` to undefined, and
+        // took the `supersedes` link down with it. Measured shape: an `app-restart:<epoch>` cohort
+        // drains (its namespace can never recur), one of its agents later hits a wall and joins a
+        // live wall cohort, and the wall cohort's `released` phase is orphaned with no evidence
+        // link — the starvation, reached by a cross-namespace route.
+        namespaceOf(bound) === namespaceOf(freshKey) &&
         Math.abs(clusterAnchor - boundAnchor) <= RETURN_WINDOW_MS;
       if (!isReturn) allBound = false;
       else {
@@ -322,18 +333,19 @@ export function stabilizeCohortKeys(
         returning.add(m.agentId);
       }
     }
+    // ONE definition of the namespace rule, and it lives in `isReturn` above (roborev 60155). A
+    // second comparison here — "the inherited key must belong to THIS cohort's namespace" — used to
+    // be the guard against carrying an unrelated cause's key over. It can no longer fail: `priorKeys`
+    // is fed only by members that already passed `namespaceOf(bound) === namespaceOf(freshKey)`, so
+    // restating it would be a third hand-inlined copy of `namespaceOf` that no test can exercise.
     const candidate = priorKeys.size === 1 ? [...priorKeys][0]! : undefined;
-    // …and the inherited key must belong to THIS cohort's namespace. A bound agent can die again
-    // under a different cause, and without this an unrelated cause's key would be carried over.
-    const sameNamespace =
-      candidate !== undefined && candidate.slice(0, candidate.lastIndexOf("@")) === freshKey.slice(0, freshKey.lastIndexOf("@"));
 
     // A key already taken by another cluster is NOT merged into (roborev 60101). Concatenating two
     // clusters that `groupCohorts` deliberately separated undoes the span bounding, and because the
     // merge re-binds every member to that key it is STICKY — the next tick's split gets undone
     // again, so a drip chains into one multi-hour incident exactly as it did before the split
     // existed. The later cluster takes its own fresh key instead.
-    const inherit = allBound && sameNamespace && !outGroups.has(candidate);
+    const inherit = allBound && candidate !== undefined && !outGroups.has(candidate);
     // A "fresh" key must actually be DIFFERENT from the one it replaces. Anchoring on the earliest
     // death means a cohort that merely GAINED a member mints the identical string — so the caller
     // would apply the old `released` phase to the newcomers anyway, which is the whole hazard.
@@ -343,7 +355,7 @@ export function stabilizeCohortKeys(
     let key = freshKey;
     if (inherit) {
       key = candidate;
-    } else if (candidate !== undefined && sameNamespace) {
+    } else if (candidate !== undefined) {
       // NOT-A-RETURN, not merely unbound (roborev 60140). Testing `previous.get(...) === undefined`
       // meant a member carrying a stale binding from some OTHER, long-finished incident counted as
       // neither a return nor a newcomer — so the cluster minted a bare key with no generation marker
@@ -371,28 +383,34 @@ export function stabilizeCohortKeys(
     if (outGroups.has(prior)) supersedes.delete(fresh);
   }
 
-  // Prune bindings that can no longer describe a return, so the map cannot grow for the life of the
-  // app. The newest death in this call is the only clock a pure function has.
+  // ── THE PRUNE, STATED ONCE ────────────────────────────────────────────────────────────────────
+  // Bindings are dropped so the map cannot grow for the life of the app. A DEPARTED member's
+  // binding survives while EITHER is true, and is deleted only when both fail:
+  //   (a) some live cluster in its own namespace is within `RETURN_WINDOW_MS` of its anchor, or
+  //   (b) the newest death observed anywhere is within `RETURN_WINDOW_MS` of its anchor.
+  // (a) is `isReturn` restated over this tick's output. (b) is an AGE BOUND ONLY — it is never
+  // consulted to decide whether a namespace's incident is over, so it can only ever KEEP a binding
+  // longer than (a) alone would. The two are deliberately asymmetric with `isReturn`; do not
+  // "restore" them to a mirror of it.
+  //
   // ONLY departed agents. A member present in this tick's output was just bound above, and dropping
   // it here would make it read as a newcomer on the very next tick — re-keying a live cohort, which
   // is the bug the retention was added to fix.
-  // SCOPED PER NAMESPACE, not to a global clock (roborev 60132). Pruning against the newest death
-  // across every cluster in the tick let an UNRELATED incident evict the binding the return rule
-  // depends on: a 20-agent app-restart cohort at +45min would delete a canary's binding from a
-  // wall-session cohort anchored at 0, so its re-death at +35min — which single-links straight back
-  // into its own cohort — read as unbound and re-keyed the cluster. That is the 60113 shape yet
-  // again, arriving through the prune instead of through the test it feeds. A binding is judged
-  // against the newest ANCHOR among live clusters that share its namespace, which is the only clock
-  // that can say anything about whether its incident is over.
-  // PRUNE ON WHETHER A RETURN IS STILL POSSIBLE, mirroring `isReturn` exactly (roborev 60140). An
-  // earlier form kept a binding whenever its namespace had no live cluster — which reads as "we
-  // cannot tell", but is in fact the NORMAL terminal state: a cohort drains, its deaths leave the
-  // input, and the namespace never returns. For `app-restart:<epoch>` it is guaranteed, since an
-  // epoch is a dead one-time id, so all 103 bindings from the measured 18:20/18:47 restarts would
-  // have been permanent. Worse than the leak, a retained stale binding suppressed newcomer
-  // detection, so a week-old member trickling into a live cohort orphaned its `released` phase with
-  // no `supersedes` link — the starvation this module documents.
-  const namespaceOf = (key: string) => key.slice(0, key.lastIndexOf("@"));
+  //
+  // WHY NOT THE SIMPLER FORMS, each of which shipped and was wrong:
+  //  • A GLOBAL newest-death clock used to EVICT (roborev 60132) let an unrelated incident delete the
+  //    binding the return rule depends on: a 20-agent app-restart cohort at +45min deleted a canary's
+  //    binding from a wall-session cohort anchored at 0, so its re-death at +35min — which
+  //    single-links straight back into its own cohort — read as unbound and re-keyed the cluster.
+  //    Hence (a) is scoped per namespace, and (b) can only keep, never evict on its own.
+  //  • KEEPING a binding whenever its namespace had no live cluster (roborev 60140) read as "we
+  //    cannot tell", but that is in fact the NORMAL terminal state: a cohort drains, its deaths leave
+  //    the input, and the namespace never returns. For `app-restart:<epoch>` it is guaranteed, since
+  //    an epoch is a dead one-time id, so all 103 bindings from the measured 18:20/18:47 restarts
+  //    would have been permanent — and a retained stale binding also suppressed newcomer detection.
+  //  • DELETING on "no live cluster" alone (roborev 60147) had no time component at all, so a binding
+  //    went the instant the last member left the death list — exactly when a respawned canary is
+  //    mid-probation and about to re-die into it. Hence (b).
   const liveAnchors = new Map<string, number[]>();
   for (const key of outGroups.keys()) {
     const anchor = anchorOf(key);
