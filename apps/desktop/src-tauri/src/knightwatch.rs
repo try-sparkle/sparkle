@@ -933,19 +933,34 @@ fn coverage_refusal(number: u64, reason: &str) -> String {
 /// with NO probe list in existence. Telling that author to "answer the [blocking] probes" is the
 /// same unfollowable instruction this function was just rewritten to remove: there is nothing to
 /// answer, and on a saturated read answering everything would not change what was read. So the
-/// exit list is state-dependent, and `unknown` is carried in from the arm that already binds it.
-fn both_gates_refusal(number: u64, reason: &str, unknown: bool) -> String {
-    let (opening, first_exit) = if unknown {
+/// exit list is state-dependent, and the READ ERROR is carried in — not a bool.
+///
+/// The bool was the previous cut of this, and it flattened two failures that need different
+/// instructions. `read_gate` reaches `unknown` either from a transient `gh` failure OR from
+/// SATURATION (`gate_from_stdout` when `comments.len() == PER_PAGE`), and saturation is
+/// deterministic: the comment count does not change by itself, so "re-run once the read succeeds"
+/// re-reads the same page forever — the unfollowable-remedy defect relocated, not removed. It also
+/// disarms exit 2 for a reason that is easy to miss: a review posted in response to
+/// `/srosro-update-review` is read through the SAME saturated call, so `reviewed_head` stays
+/// `None` and coverage stays `NotCovered`. What actually clears it is that posting anything moves
+/// the count off exactly `PER_PAGE`, which is why the exit is worded as a post rather than a wait.
+/// `gate.error` already holds the specific text (for saturation, with its own `jq length` command),
+/// and it is `Some` exactly when `probes` is `None`, so it subsumes the bool.
+fn both_gates_refusal(number: u64, reason: &str, read_error: Option<&str>) -> String {
+    let (opening, first_exit) = if let Some(err) = read_error {
         (
             format!(
                 "Merge blocked: the [blocking] probes on PR #{number} could not be READ, so the \
                  override you supplied was taken as the bypass for that gate — but this PR ALSO \
-                 has not converged, and one reason cannot bypass two different gates."
+                 has not converged, and one reason cannot bypass two different gates.\n\n  \
+                 The read failed like this: {err}"
             ),
-            "1. Re-run the merge once the probe read succeeds. It is a `gh` read, so a transient \
-             failure or a comment thread too long to enumerate is the usual cause — and until it \
-             succeeds there is no probe list to answer. With the probes readable and clear, your \
-             rationale is the one that gets judged and recorded as the convergence override."
+            "1. Make the read succeed — until it does there is no probe list to answer, and every \
+             rationale you type is consumed by the probe gate. A transient `gh` failure clears on \
+             a re-run. A SATURATED read does not: the comment count is deterministic, so re-running \
+             re-reads the same page. Post any comment on the PR (the `/srosro-update-review` in \
+             exit 2 will do) — that moves the count off the exact page size and the read stops \
+             being ambiguous."
                 .to_string(),
         )
     } else {
@@ -1261,7 +1276,7 @@ pub(crate) fn enforce(
             if let Coverage::NotCovered(reason) = &coverage_verdict {
                 // Refuse BEFORE posting: the probe record must not land on the PR describing a
                 // merge that is about to be declined for a different reason.
-                return Err(both_gates_refusal(number, reason, unknown));
+                return Err(both_gates_refusal(number, reason, gate.error.as_deref()));
             }
             post_override_comment(root, number, &body)?;
             tracing::warn!(
@@ -2377,7 +2392,7 @@ mod tests {
         // Same rule as the slice above: an absent delimiter must FAIL, never silently widen.
         let arm_end = arm.find("Decision::Allow => {}").expect("the arm that ends the probe match");
         assert!(
-            arm[..arm_end].contains("both_gates_refusal(number, reason, unknown)"),
+            arm[..arm_end].contains("both_gates_refusal(number, reason, gate.error.as_deref())"),
             "the probe override arm must refuse when coverage ALSO failed — one rationale buys one \
              bypass, and without this the same string clears both gates and `coverage_refusal` is \
              never shown to the author"
@@ -2387,7 +2402,7 @@ mod tests {
     /// One reason does not buy two bypasses, asserted on the decision rather than the wiring.
     #[test]
     fn a_probes_rationale_does_not_also_clear_an_unreviewed_head() {
-        let msg = both_gates_refusal(1273, "the newest review read 275f462", false);
+        let msg = both_gates_refusal(1273, "the newest review read 275f462", None);
         assert!(msg.contains("275f462"), "names what was reviewed: {msg}");
         assert!(
             msg.contains("NOT posted"),
@@ -2432,7 +2447,7 @@ mod tests {
         }
 
         // …so the copy must name the two exits that DO work, and say the retry does not.
-        let msg = both_gates_refusal(1273, "the newest review read 275f462", false);
+        let msg = both_gates_refusal(1273, "the newest review read 275f462", None);
         assert!(
             msg.contains("Rewording this reason will not clear it"),
             "must not send the author back for a retry that lands here again: {msg}"
@@ -2467,16 +2482,59 @@ mod tests {
             "and coverage still fails, since no review named this head"
         );
 
-        let msg = both_gates_refusal(1273, "no review names 1867679", true);
+        let msg = both_gates_refusal(1273, "no review names 1867679", gate.error.as_deref());
         assert!(
             !msg.contains("Answer the [blocking] probes"),
             "must not name a probe list that could not be read: {msg}"
         );
+        assert!(msg.contains("could not be READ"), "must say the read failed: {msg}");
+        // The WHY is quoted, not summarised — see the saturated case below for why that matters.
         assert!(
-            msg.contains("could not be READ") && msg.contains("Re-run the merge once the probe read succeeds"),
-            "must say the read failed and name the exit that exists for it: {msg}"
+            msg.contains("gh: could not read the comment thread"),
+            "must show which read failure happened: {msg}"
         );
         assert!(msg.contains("/srosro-update-review"), "the review exit works in this state too: {msg}");
+    }
+
+    /// A SATURATED READ IS DETERMINISTIC, so "re-run it" is not an exit — it is the same
+    /// unfollowable remedy one level down. `gate_from_stdout` returns `unknown` whenever the read
+    /// comes back exactly `PER_PAGE` long, and the comment count does not change by itself: every
+    /// retry re-reads the same page, `decide` consumes the rationale again, and coverage still
+    /// fails. It also disarms the OTHER exit in a way that is easy to miss — a review posted in
+    /// response to `/srosro-update-review` is read through the same saturated call, so
+    /// `reviewed_head` stays `None`. What actually clears it is that POSTING anything moves the
+    /// count off the exact page size. So the refusal must carry the read error itself, which for
+    /// this construction already contains the `--paginate` command that diagnoses it.
+    #[test]
+    fn a_saturated_read_gets_the_saturation_text_not_a_bare_re_run() {
+        let rows: Vec<String> = (0..PER_PAGE)
+            .map(|i| format!(r#"{{"id":{i},"body":"chatter","html_url":"u"}}"#))
+            .collect();
+        let gate = gate_from_stdout(&format!("[{}]", rows.join(",")), 1273);
+        assert!(gate.probes.is_none(), "precondition: a page-sized read is not authoritative");
+
+        // Precondition: it lands on the both-gates arm exactly like the transient failure does.
+        assert!(
+            matches!(
+                decide(&gate, 1273, Some("the head needs no review, the delta is comments only")),
+                Decision::RecordThenAllow { unknown: true, .. }
+            ),
+            "a saturated gate still consumes the rationale as the probe bypass"
+        );
+        assert!(
+            matches!(coverage(&gate, Some("1867679aabbccddeeff00112233445566778899a")), Coverage::NotCovered(_)),
+            "and coverage still fails — the same read fed reviewed_head"
+        );
+
+        let msg = both_gates_refusal(1273, "no review names 1867679", gate.error.as_deref());
+        // THE ASSERTION THAT FAILS AGAINST A BOOL: the specific cause, and its runnable remedy,
+        // survive into the refusal instead of being flattened to "the read failed somehow".
+        assert!(msg.contains("100 comments long"), "names the saturation, not a generic failure: {msg}");
+        assert!(msg.contains("--paginate"), "and carries the command that diagnoses it: {msg}");
+        assert!(
+            msg.contains("A SATURATED read does not"),
+            "must say re-running will not clear a saturated read: {msg}"
+        );
     }
 
     #[test]
