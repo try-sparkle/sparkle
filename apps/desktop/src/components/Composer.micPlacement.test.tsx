@@ -1,5 +1,11 @@
 // @vitest-environment jsdom
 //
+// DEAD SUBJECT — THIS FILE DOES NOT COVER THE SHIPPED APP. Nothing mounts <Composer>: it went with
+// SparkleAgentPane's composer, and `Composer.unreachable.test.ts` asserts mechanically that no
+// non-test file imports it. Every case below really runs and really passes, against a component no
+// user can reach — which is why it does not LOOK vacuous. The live compose surface is
+// `Concierge/ComposeBox`; a behaviour you need guarded must be pinned there to mean anything.
+//
 // The composer mic must sit beside the INPUT BOX, always — never beside a pasted
 // attachment tile. The mic is `alignSelf: flex-start` inside a flex row, so it aligns
 // to the top of whatever column it shares that row with. When the attachment tiles

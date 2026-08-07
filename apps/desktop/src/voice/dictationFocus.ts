@@ -81,7 +81,17 @@ export const TERMINAL_AGENT_ATTR = "data-terminal-agent-id";
  */
 export function focusedTerminalAgentId(): string | null {
   if (typeof document === "undefined") return null;
-  const el = document.activeElement;
+  return terminalAgentIdOf(document.activeElement);
+}
+
+/** {@link focusedTerminalAgentId} for an element you already hold, rather than for the live caret.
+ *
+ *  Split out so a caller that was HANDED an element (a focus guard inspecting the element that holds
+ *  the caret, say) answers about THAT element instead of re-reading `document.activeElement` — two
+ *  reads of a moving value in one decision is how a guard ends up describing one element and acting
+ *  on another. `focusedTerminalAgentId` is this function applied to the live caret, so the two cannot
+ *  disagree about what a terminal is. */
+export function terminalAgentIdOf(el: Element | null | undefined): string | null {
   if (!el || typeof el.closest !== "function") return null;
   try {
     // Scoped to the ATTRIBUTE, not to TERMINAL_SELECTOR: matching the wider selector and then

@@ -100,11 +100,33 @@ export function KeyboardShortcutsMenu() {
         setListening(null);
       }
     };
+    // Losing the window ENDS the capture (bead sparkle-thm9o). `onKey` above preventDefaults
+    // unconditionally, on keydown and keyup alike, so for as long as `listening` is set every key in
+    // the app is dead. That is the intended cost of recording a chord and it is only survivable
+    // because the gesture always ends — except ⌘Tab, where macOS never delivers the keyup, so the
+    // combo sits in flight forever: the capture never completes, the flag never clears, and the
+    // keyboard stays dead with no visible cause and no way back short of a relaunch. Blur is the only
+    // end that gesture will get, exactly as it is the only end a push-to-talk hold gets
+    // (voice/usePushToTalk).
+    //
+    // On `window` and NOT in the capture phase, both deliberate: `blur` does not bubble, so a
+    // bubble-phase window listener hears the WINDOW losing focus and not a button inside this pane
+    // losing it. Registering it with `capture: true` — or on `focusout`, which does bubble — would
+    // make clicking anywhere in the app cancel a capture the user had just started, trading the latch
+    // for a recorder nobody can use.
+    const onBlur = () => {
+      // Clear the refusal for the same reason Escape does: the gesture is being abandoned, so a
+      // leftover "⌘K already opens…" must not survive to greet a user who has pressed nothing yet.
+      setRejected(null);
+      setListening(null);
+    };
     window.addEventListener("keydown", onKey, true);
     window.addEventListener("keyup", onKey, true);
+    window.addEventListener("blur", onBlur);
     return () => {
       window.removeEventListener("keydown", onKey, true);
       window.removeEventListener("keyup", onKey, true);
+      window.removeEventListener("blur", onBlur);
     };
     // `bindings` is a dep because the conflict check reads it. Re-registering on a change is
     // harmless: the only change that happens mid-capture is the successful setBinding above, which

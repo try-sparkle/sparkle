@@ -1,5 +1,11 @@
 // @vitest-environment jsdom
 //
+// DEAD SUBJECT — THIS FILE DOES NOT COVER THE SHIPPED APP. Nothing mounts <Composer>: it went with
+// SparkleAgentPane's composer, and `Composer.unreachable.test.ts` asserts mechanically that no
+// non-test file imports it. Every case below really runs and really passes, against a component no
+// user can reach — which is why it does not LOOK vacuous. The live compose surface is
+// `Concierge/ComposeBox`; a behaviour you need guarded must be pinned there to mean anything.
+//
 // Wiring tests for the Composer imperative `insertPrompt` API used by the pinned-prompt
 // "Send to Composer" action: replace-only-if-empty, append-on-a-new-line otherwise, and the
 // un-minimize side effect. Mirrors the boundary mocks from Composer.dictation.test.tsx.

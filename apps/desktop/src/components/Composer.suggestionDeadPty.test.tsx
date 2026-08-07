@@ -1,5 +1,11 @@
 // @vitest-environment jsdom
 //
+// DEAD SUBJECT — THIS FILE DOES NOT COVER THE SHIPPED APP. Nothing mounts <Composer>: it went with
+// SparkleAgentPane's composer, and `Composer.unreachable.test.ts` asserts mechanically that no
+// non-test file imports it. Every case below really runs and really passes, against a component no
+// user can reach — which is why it does not LOOK vacuous. The live compose surface is
+// `Concierge/ComposeBox`; a behaviour you need guarded must be pinned there to mean anything.
+//
 // A suggestion click whose keystroke reaches a DEAD PTY (roborev 54409).
 //
 // The click races the exit rather than being caught by the gate: `disabled` is derived from

@@ -4,6 +4,7 @@
 // (projectStore.setAgentModel) is separate and always happens; this is only the live delivery.
 import { chainPtyOp, writePty } from "../pty";
 import { useRuntimeStore } from "../stores/runtimeStore";
+import { useTerminalOverlayStore } from "../stores/terminalOverlayStore";
 import { isDefaultModel } from "./models";
 
 /** Delay between typing the slash command and sending Enter. Claude Code's TUI pops a
@@ -60,12 +61,23 @@ async function deliver(agentId: string, modelId: string): Promise<void> {
   // call time.
   if (!canInject(agentId)) return;
   await writePty(agentId, `${CLEAR_LINE}/model ${modelId}`);
+  // PUBLISH WHAT THIS WRITE DID TO THE INPUT LINE. `terminalOverlayStore.drafts[agentId]` is
+  // maintained by xterm's `onData`, which sees the user's keystrokes and never ours, so a write
+  // this module makes is invisible to it — the same writer gap `pty.ts` closes for
+  // paste/submit (roborev 59689). Here the Ctrl-U CLEARED whatever the user had pending and put
+  // `/model …` there instead: still a non-empty line they could Enter themselves, so `true` is the
+  // truthful answer, and it is the ONE the bail-out below leaves behind.
+  useTerminalOverlayStore.getState().setDraft(agentId, true);
   await new Promise((r) => setTimeout(r, MODEL_SUBMIT_DELAY_MS));
   // Re-check before the hazardous keystroke: a working agent can pop a permission prompt
   // DURING the submit delay (roborev 23548/23549). Skipping the Enter leaves benign text in
   // the composer — strictly safer than confirming a dialog the user never approved.
   if (!canInject(agentId)) return;
   await writePty(agentId, "\r");
+  // …and the CR submitted it, so the line is empty again. Without this the flag stays `true` until
+  // the terminal unmounts, and every compose-focus pull with the caret in it is declined for that
+  // whole window.
+  useTerminalOverlayStore.getState().setDraft(agentId, false);
 }
 
 /**

@@ -1,5 +1,11 @@
 // @vitest-environment jsdom
 //
+// DEAD SUBJECT — THIS FILE DOES NOT COVER THE SHIPPED APP. Nothing mounts <Composer>: it went with
+// SparkleAgentPane's composer, and `Composer.unreachable.test.ts` asserts mechanically that no
+// non-test file imports it. Every case below really runs and really passes, against a component no
+// user can reach — which is why it does not LOOK vacuous. The live compose surface is
+// `Concierge/ComposeBox`; a behaviour you need guarded must be pinned there to mean anything.
+//
 // "Instant composer" while an agent is starting: with `preparing` true the agent's PTY isn't up
 // yet, so a send must be QUEUED (not written to a non-existent PTY, not dropped) and then delivered
 // exactly once the moment `preparing` clears. This is what lets the user click New Build Agent and

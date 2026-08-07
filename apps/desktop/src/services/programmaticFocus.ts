@@ -29,7 +29,11 @@
 // The counter is kept alongside the tag for the synchronous case, where it is the cheaper answer,
 // and because nesting must not clear the flag early.
 
-import { isEditableElement } from "../engine/focusGuard";
+import { isEditableElement, isTypingInProgress } from "../engine/focusGuard";
+// `services/terminalMidCommand` reaches `voice/dictationFocus` (imports nothing) and
+// `stores/terminalOverlayStore` (imports zustand and nothing else), so depending on it here cannot
+// cycle — the same property that makes `engine/focusGuard` safe to depend on above.
+import { terminalHoldsUnsentInput } from "./terminalMidCommand";
 
 let depth = 0;
 /** The element the app most recently focused whose focus event has not arrived yet. ONE slot, not a
@@ -135,6 +139,70 @@ export function resetProgrammaticFocusForTest(): void {
  *  nothing, so depending on it here cannot cycle. */
 export const isEditableTarget = isEditableElement;
 
+/** Shared core for the two guarded variants below: focus `el` quietly UNLESS `veto` says the element
+ *  that currently holds the caret has to be left alone.
+ *
+ *  One implementation rather than two near-copies, for the reason the `isEditableTarget` note above
+ *  gives: three copies of a DOM predicate had drifted, and the drift is what shipped the bug. The
+ *  variants differ ONLY in their veto, so that is the only thing either of them states.
+ *
+ *  `active !== el` is part of the core, not of a veto: a box must never veto its OWN refocus on the
+ *  strength of what it itself contains. */
+function focusQuietlyUnless(
+  el: HTMLElement | null | undefined,
+  veto: (active: Element, doc: Document | null) => boolean,
+): boolean {
+  if (!el) return false;
+  const doc = el.ownerDocument ?? null;
+  const active = doc?.activeElement ?? null;
+  if (active && active !== el && veto(active, doc)) return false;
+  focusQuietly(el);
+  return true;
+}
+
+/** {@link focusQuietly}, but a NO-OP when the caret sits somewhere the user is MID-INPUT — either a
+ *  different editable element holding unsent text, or a terminal.
+ *
+ *  The variant to reach for on a focus pull whose callers are MOSTLY the user asking for the caret but
+ *  not provably all of them. `focusQuietlyUnlessTypingElsewhere` is too strict for that job and the
+ *  difference is not a nuance: in a terminal-first shell the xterm key sink holds focus whenever the
+ *  user is not typing into something else, so vetoing on mere editable-focus would decline nearly
+ *  every legitimate pull — spawning an empty agent, the drop pill's "go to compose" — and delete the
+ *  feature while looking like a safety fix.
+ *
+ *  ══ WHY THE TERMINAL NEEDS ITS OWN TERM, AND WHY `isTypingInProgress` ALONE IS A FALSE GUARD ══
+ *  `isTypingInProgress` answers by reading `activeElement.value`, and for the surface sparkle-d2ec is
+ *  actually about that value is ALWAYS EMPTY. xterm cancels the keystroke and forwards it to the PTY;
+ *  the half-typed command lives in the SHELL'S LINE BUFFER, not in the DOM. `.xterm-helper-textarea`
+ *  is only ever written by xterm on blur and on CR/ETX. So a user mid-command in the terminal — the
+ *  founder's literal symptom, "the terminal and the composer both went dead to the keyboard" — reads
+ *  as `isTypingInProgress() === false`, and a guard resting on that predicate alone declines nothing
+ *  and steals the caret anyway. A test can only make such a guard look correct by hand-setting a
+ *  `value` the real terminal never has, which is the same vacuity this whole guard was moved off
+ *  `Composer.tsx` to escape (roborev 59595, High).
+ *
+ *  ══ BUT THE TERM IS UNSENT INPUT, NOT FOCUS ═══════════════════════════════════════════════════
+ *  The first attempt at that vetoed on terminal FOCUS, and over-corrected into the very failure the
+ *  paragraph above warns about: the xterm key sink holds the caret whenever the user is not typing
+ *  into something else, so it declined the empty spawn, the drop pill, and — worst — the
+ *  capture-window handoff, which STAGES A DRAFT and then could not deliver the caret to it, leaving
+ *  the user's next Enter pointed at a shell that executes the pending line (roborev 59610, High).
+ *
+ *  `terminalHoldsUnsentInput` asks the question properly: `Terminal.tsx`'s `onData` scanner already
+ *  publishes "this agent's CLI prompt holds an unsubmitted line" per keystroke, so the terminal CAN
+ *  be asked what it holds — the claim that it could not was simply wrong. A terminal the app cannot
+ *  name still answers "mid-command", because the cost of declining a pull is a caret that did not
+ *  move and the cost of taking one is keystrokes vanishing into a box the user is not looking at.
+ *
+ *  Returns whether it actually focused, so a caller can keep a paired claim (naming the voice surface,
+ *  say) consistent with whether the caret really moved. Safe on null. */
+export function focusQuietlyUnlessMidMessage(el: HTMLElement | null | undefined): boolean {
+  return focusQuietlyUnless(
+    el,
+    (active, doc) => terminalHoldsUnsentInput(active) || isTypingInProgress(doc ?? undefined),
+  );
+}
+
 /** {@link focusQuietly}, but a NO-OP when the caret currently sits in a DIFFERENT editable element.
  *
  *  Use for a BACKGROUND focus pull — one driven by a timer or an incoming event rather than by the
@@ -150,9 +218,5 @@ export const isEditableTarget = isEditableElement;
  *
  *  Returns whether it actually focused. Safe on null. */
 export function focusQuietlyUnlessTypingElsewhere(el: HTMLElement | null | undefined): boolean {
-  if (!el) return false;
-  const active = el.ownerDocument?.activeElement ?? null;
-  if (active && active !== el && isEditableTarget(active)) return false;
-  focusQuietly(el);
-  return true;
+  return focusQuietlyUnless(el, (active) => isEditableTarget(active));
 }

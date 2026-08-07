@@ -1,5 +1,11 @@
 // @vitest-environment jsdom
 //
+// DEAD SUBJECT — THIS FILE DOES NOT COVER THE SHIPPED APP. Nothing mounts <Composer>: it went with
+// SparkleAgentPane's composer, and `Composer.unreachable.test.ts` asserts mechanically that no
+// non-test file imports it. Every case below really runs and really passes, against a component no
+// user can reach — which is why it does not LOOK vacuous. The live compose surface is
+// `Concierge/ComposeBox`; a behaviour you need guarded must be pinned there to mean anything.
+//
 // The composer's side of the "+ New Build Agent" drop target (see useNewBuildAgentDrop):
 // drags/drops over the button are the button's — the composer suppresses its drop outline
 // and must NOT attach the files — while drops anywhere else keep attaching here. Plus the

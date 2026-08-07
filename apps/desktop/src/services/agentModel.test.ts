@@ -6,6 +6,7 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
 
 import { applyModelToRunningAgent } from "./agentModel";
 import { useRuntimeStore } from "../stores/runtimeStore";
+import { useTerminalOverlayStore } from "../stores/terminalOverlayStore";
 
 const CLEAR_LINE = "\x05\x15"; // Ctrl-E + Ctrl-U — whole-line clear regardless of cursor position
 
@@ -13,6 +14,7 @@ beforeEach(() => {
   invoke.mockReset();
   invoke.mockResolvedValue(undefined);
   useRuntimeStore.setState({ openAgentIds: [], status: {} });
+  useTerminalOverlayStore.setState({ drafts: {} });
 });
 
 describe("applyModelToRunningAgent (mid-session /model, sparkle-i6rw)", () => {
@@ -121,5 +123,48 @@ describe("applyModelToRunningAgent (mid-session /model, sparkle-i6rw)", () => {
     useRuntimeStore.setState({ openAgentIds: ["a1"] });
     await applyModelToRunningAgent("a1", "default");
     expect(invoke).not.toHaveBeenCalled();
+  });
+});
+
+// ══ WHAT THIS DELIVERY DOES TO THE CLI INPUT LINE, PUBLISHED ═════════════════════════════════════
+// `terminalOverlayStore.drafts[agentId]` answers "does this agent's prompt hold an unsubmitted
+// line". Its other writer is xterm's `onData`, which sees only what the USER types — so this
+// module's writes are invisible to it, and the flag desyncs exactly the way `pty.ts`'s did
+// (roborev 59689). It matters twice here: the Ctrl-U CLEARS the user's pending line, and the Enter
+// submits what replaced it. Two consumers read the flag — the terminal-anchored action pill and the
+// compose-focus veto — so a stale `true` declines every compose-focus pull with the caret in this
+// terminal until it unmounts.
+describe("the /model delivery publishes the input line it rewrites", () => {
+  it("leaves the line EMPTY after the Enter, even if the user had one pending", async () => {
+    useRuntimeStore.setState({ openAgentIds: ["a1"] });
+    useTerminalOverlayStore.getState().setDraft("a1", true); // the user was mid-command
+    vi.useFakeTimers();
+    try {
+      const p = applyModelToRunningAgent("a1", "claude-opus-4-8");
+      await vi.runAllTimersAsync();
+      await p;
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(useTerminalOverlayStore.getState().drafts.a1).toBeFalsy();
+  });
+
+  it("leaves it PENDING when the Enter is skipped — the /model text is still sitting there", async () => {
+    // The bail-out path: a permission prompt appears during the submit delay, so the Enter is
+    // withheld and `/model …` stays on the line. That IS unsent input, and the same benign text the
+    // implementation comment describes — so the flag must say so rather than reporting an empty
+    // prompt the user would then lose the caret from.
+    useRuntimeStore.setState({ openAgentIds: ["a1"] });
+    vi.useFakeTimers();
+    try {
+      const p = applyModelToRunningAgent("a1", "claude-opus-4-8");
+      await vi.advanceTimersByTimeAsync(0);
+      useRuntimeStore.setState({ status: { a1: "approval" } });
+      await vi.runAllTimersAsync();
+      await p;
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(useTerminalOverlayStore.getState().drafts.a1).toBe(true);
   });
 });

@@ -132,7 +132,13 @@ import { TextPill } from "../composer/TextPill";
 import { TextPillModal } from "../composer/TextPillModal";
 import { useVoicePlaceholder } from "../../voice/useVoicePlaceholder";
 import { useDictationStore } from "../../stores/dictationStore";
-import { focusQuietly, isProgrammaticFocus } from "../../services/programmaticFocus";
+import {
+  focusQuietly,
+  focusQuietlyUnlessMidMessage,
+  isProgrammaticFocus,
+} from "../../services/programmaticFocus";
+import { classifyFocusOwner } from "../../voice/dictationFocus";
+import { log } from "../../logger";
 import {
   CONCIERGE_THREAD_TESTID,
   composeDragH,
@@ -802,14 +808,53 @@ export function ComposeBox({
     handledFocusSeq.current = composeFocusSeq;
     // Quiet, because this effect runs a render after the request: it is the app moving the caret,
     // and the focus event it produces must not be mistaken for the user's.
-    focusQuietly(textareaRef.current);
+    //
+    // …and GUARDED, because "every caller of requestComposeFocus is a user gesture" is a documented
+    // invariant with nothing enforcing it, and it is already stretched: ConciergeHost's
+    // capture-window handoff reaches this seam from an inbound EVENT rather than from a gesture in
+    // this window. An event-driven pull that lands while the user is mid-message somewhere else is
+    // sparkle-d2ec verbatim — the caret leaves the box they are looking at, so their keystrokes go
+    // somewhere they cannot see, and with dictation live it repeats every few seconds until the
+    // whole app reads as dead to the keyboard. The box defends the caret itself rather than trusting
+    // the caller list to stay honest.
+    //
+    // The veto is UNSENT TEXT elsewhere — never "some other editable element has focus", and never
+    // "a terminal has focus" either. Each surface is asked in the only way it can answer: an ordinary
+    // editable by its `value`, a terminal by the draft flag its `onData` scanner publishes, since its
+    // half-typed command lives in the shell's line buffer and never appears in the DOM. Both looser
+    // forms decline nearly every legitimate pull in a terminal-first shell — where the xterm key sink
+    // holds the caret whenever the user is not typing into something else — which is the same feature
+    // deleted by a different route, and the capture handoff below is the one it hurts most: it stages
+    // a draft the caret then never reaches. See focusQuietlyUnlessMidMessage.
+    const took = focusQuietlyUnlessMidMessage(textareaRef.current);
     // …but dictation DOES follow, said outright rather than inferred from that focus. Every caller
     // of requestComposeFocus is a user gesture (the drop pill's "go to compose", a file drop,
     // spawning an agent, the capture-window handoff), so reaching this effect at all IS the user
     // asking for this box. Stating it here rather than carrying an intent flag through the focus
     // event is what makes it survive the caret arriving late — or already being here, in which case
     // no focus event fires at all (roborev 54259).
-    ownVoiceRef.current();
+    //
+    // ONLY when the caret actually came, though. Claiming the mic for a box we just declined to focus
+    // is the mirror of the bug above and every bit as invisible: the user would be typing in the
+    // terminal and speaking into the concierge, with nothing on screen saying so.
+    if (took) {
+      ownVoiceRef.current();
+      return;
+    }
+    // A DECLINE IS A HALF-COMPLETED OPERATION, so it must not be silent. `handledFocusSeq` is already
+    // consumed above, so this request will not be retried when the other box empties — and on the
+    // capture-window handoff the draft and attachments ARE staged, so the user is looking at a compose
+    // box that filled itself but never took the caret, with dictation still aimed elsewhere. Nothing
+    // on screen distinguishes that from a handoff that worked. This file's own handoff path logs far
+    // less consequential outcomes, so a declined caret earns a line (roborev 59595).
+    const active = document.activeElement;
+    log.warn("composer", "compose-focus request declined — the user is mid-input elsewhere", {
+      activeTag: active?.tagName ?? null,
+      // The CLASS, not the content: an editable's text is the user's message and must never reach a
+      // log. `logSafePaths` exists for the same reason on the attachment side.
+      activeClass: active instanceof Element ? active.className || null : null,
+      owner: classifyFocusOwner(active),
+    });
   }, [composeFocusSeq]);
   // The live roster, readable from the dictation callback below without re-registering it.
   //
@@ -995,6 +1040,20 @@ export function ComposeBox({
     // default prevented (see MentionPicker), so focus was never taken — but a box that was not
     // focused to begin with (the user clicked the picker straight after a dictated segment landed)
     // still needs it, or the words they type next go nowhere.
+    //
+    // DELIBERATELY UNGUARDED, unlike the composeFocusSeq seam above. This looks like the same shape and
+    // is the opposite kind of event: `applyEdit` runs from a mention pick or a pill deletion, i.e. an
+    // explicit user gesture on THIS box, and MentionPicker chooses on mousedown with the default
+    // prevented precisely so focus is never taken — which means `activeElement` is still whatever the
+    // user last focused. Vetoing on that would break the exact case this call was added for ("a box
+    // that was not focused to begin with … still needs it, or the words they type next go nowhere"):
+    // the pick would silently not restore the caret whenever some other field held text. A
+    // background-pull guard applied to a foreground gesture is a category error (roborev 59595).
+    //
+    // What actually bounds this effect is the `restoreCaret.current === null` early-return above — it
+    // has no dependency array and so runs after every render, but it does nothing unless `applyEdit`
+    // just armed it. That gate is the invariant, so it is pinned by a test rather than defended by a
+    // predicate that would cost a real behaviour to guard a hypothetical one.
     if (document.activeElement !== ta) focusQuietly(ta);
   });
 

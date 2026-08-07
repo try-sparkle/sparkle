@@ -5,6 +5,13 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { noteUserInputForAgent } from "./engine/engineRegistry";
+// The CLI input line's emptiness is PUBLISHED, not observed: xterm's `onData` sees only what the
+// user types, so every write this module makes to an agent's input line is invisible to the scanner
+// that maintains `drafts`. Two consumers read that flag — the terminal-anchored action pill and the
+// compose-focus veto (services/terminalMidCommand) — and both were wrong in the gap. See the writes
+// in `pasteIntoPty` / `deliverSubmit` below (roborev 59689). The store imports zustand and nothing
+// else, so this cannot cycle.
+import { useTerminalOverlayStore } from "./stores/terminalOverlayStore";
 
 export interface PtyOutput {
   id: string;
@@ -194,9 +201,23 @@ export function writePtyChainedStrict(id: string, data: string): Promise<void> {
  * reportable rather than swallowed as the teardown race {@link writePty} tolerates.
  */
 export function pasteIntoPty(id: string, text: string): Promise<void> {
-  return chainPtyOp(id, () =>
-    writePtyStrict(id, `${PASTE_START}${stripPasteMarkers(text)}${PASTE_END}`),
-  );
+  const body = stripPasteMarkers(text);
+  return chainPtyOp(id, async () => {
+    await writePtyStrict(id, `${PASTE_START}${body}${PASTE_END}`);
+    // The prompt now HOLDS this text, and nothing else will say so: `drafts` is maintained by
+    // xterm's `onData`, which sees the user's keystrokes and never ours. Left unpublished, the
+    // dictation sink's whole contract — "it types, it does not submit, the human's Enter is the
+    // consent" — produced a terminal holding unsent words that the compose-focus veto read as idle
+    // and pulled the caret out of, which is sparkle-d2ec's own symptom in the scenario the guard was
+    // written for (roborev 59689).
+    //
+    // Only ever set TRUE here, and only for non-whitespace: this write ADDS to whatever the user
+    // already had on the line, so it can never be evidence that the line went empty. It self-heals
+    // on the user's next Enter, when `scanSubmittedLines` clears the scanner's buffer.
+    //
+    // After the await, so a paste that never landed (PtyGoneError on a dead PTY) claims nothing.
+    if (body.trim() !== "") useTerminalOverlayStore.getState().setDraft(id, true);
+  });
 }
 
 async function deliverSubmit(id: string, text: string, machine?: boolean): Promise<void> {
@@ -216,6 +237,13 @@ async function deliverSubmit(id: string, text: string, machine?: boolean): Promi
   await writePtyStrict(id, `${PASTE_START}${stripPasteMarkers(text)}${PASTE_END}`);
   await new Promise((r) => setTimeout(r, SUBMIT_CR_DELAY_MS));
   await writePtyStrict(id, "\r");
+  // The CR submitted the WHOLE line — this text and anything the user had already typed in front of
+  // it — so the prompt is now empty. Published for the same reason as the paste above and with the
+  // opposite value: `drafts` is scanner-maintained and the scanner cannot see this CR, so a flag
+  // left `true` from the user's own half-typed line would stay true indefinitely (nothing resets it
+  // short of unmount) and decline every compose-focus pull with the caret in this terminal for that
+  // whole window — the roborev 59610 High, reproduced through the writer gap (roborev 59689).
+  useTerminalOverlayStore.getState().setDraft(id, false);
 }
 
 /** Submit a full prompt to an agent's PTY: deliver it as one bracketed paste, then (after a

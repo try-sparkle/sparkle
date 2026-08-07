@@ -189,6 +189,94 @@ describe("the recorder refuses a chord another handler already owns", () => {
   });
 });
 
+// bead sparkle-thm9o. The recorder's `onKey` calls `preventDefault()` UNCONDITIONALLY, on keydown
+// AND keyup, from a capture-phase listener on `window` — which is what lets it record a chord
+// without the chord also typing somewhere. The cost is that while `capturingShortcut` is set, EVERY
+// key in the app is dead. That is fine for the length of a keypress and catastrophic if the gesture
+// can be left mid-flight: ⌘Tab away from a live "Press a combo…" and macOS never delivers the
+// keyup, so the capture never completes, the flag never clears, and the keyboard stays dead with no
+// visible cause and no way back short of a relaunch.
+//
+// These assert the SIDE EFFECT — that a subsequent keypress is no longer swallowed — not just that
+// the flag went null. The flag is the mechanism; a live keyboard is the thing the user cares about,
+// and asserting it means a future change that clears the flag without releasing the keys still goes
+// red.
+describe("losing the window ends a capture instead of latching the keyboard", () => {
+  /** Dispatch a keydown at `window` the way the app's own global handlers would receive it, and
+   *  report whether the recorder swallowed it.
+   *
+   *  `cancelable: true` is load-bearing: `preventDefault()` on a non-cancelable event is a silent
+   *  no-op, so `defaultPrevented` would read false even with the latch fully live — the assertion
+   *  would pass for the wrong reason in BOTH directions and prove nothing. */
+  function keyIsSwallowed(): boolean {
+    const ev = new KeyboardEvent("keydown", { key: "a", cancelable: true, bubbles: true });
+    act(() => {
+      window.dispatchEvent(ev);
+    });
+    return ev.defaultPrevented;
+  }
+
+  it("releases the keyboard on window blur", () => {
+    const { container } = render(<KeyboardShortcutsMenu />);
+    act(() => captureButton(container).click());
+    expect(useKeybindingsStore.getState().capturingShortcut).toBe("toggleHints");
+    // The baseline the fix must not break: while a capture really is live, keys ARE swallowed.
+    // Without this the test below could pass because the recorder never swallowed anything.
+    expect(keyIsSwallowed()).toBe(true);
+
+    // ⌘Tab / clicking another app. The keyup for the combo in flight is never delivered.
+    act(() => {
+      window.dispatchEvent(new Event("blur"));
+    });
+
+    expect(useKeybindingsStore.getState().capturingShortcut).toBeNull();
+    // The part that matters to the user: typing works again.
+    expect(keyIsSwallowed()).toBe(false);
+  });
+
+  it("forgets a refusal when the window is lost, so it can't greet the next capture", () => {
+    // Same argument as Escape: abandoning the gesture must not leave "⌘K already opens…" behind for
+    // a user who has pressed nothing yet. Re-entry goes through the STORE rather than the button,
+    // because the button's own onClick clears the message — a button-driven re-entry would pass
+    // whether or not blur clears anything, which is the vacuous shape.
+    const { container } = render(<KeyboardShortcutsMenu />);
+    const label = formatBinding(useKeybindingsStore.getState().bindings.toggleComposer);
+    const btn = [...container.querySelectorAll("button")].find((b) => b.textContent === label);
+    if (!btn) throw new Error(`no button labelled "${label}" — the Shortcuts pane changed shape`);
+    act(() => (btn as HTMLButtonElement).click());
+    act(() => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "k", metaKey: true }));
+    });
+    expect(container.textContent).toMatch(/command palette/);
+
+    act(() => {
+      window.dispatchEvent(new Event("blur"));
+    });
+    expect(useKeybindingsStore.getState().capturingShortcut).toBeNull();
+
+    act(() => useKeybindingsStore.getState().setCapturingShortcut("toggleComposer"));
+
+    expect(container.textContent).not.toMatch(/command palette/);
+  });
+
+  it("does not cancel a capture when focus merely moves INSIDE the app", () => {
+    // The counterpart guard. `blur` does not bubble, so a non-capture listener on `window` hears the
+    // window losing focus and not a button inside the pane losing it. Registering this in the
+    // capture phase — or on `focusout`, which does bubble — would make clicking anywhere in the app
+    // cancel a capture the user just started, trading a latch for an unusable recorder.
+    const { container } = render(<KeyboardShortcutsMenu />);
+    const btn = captureButton(container);
+    act(() => btn.click());
+    expect(useKeybindingsStore.getState().capturingShortcut).toBe("toggleHints");
+
+    act(() => {
+      btn.dispatchEvent(new FocusEvent("blur"));
+    });
+
+    expect(useKeybindingsStore.getState().capturingShortcut).toBe("toggleHints");
+  });
+});
+
 describe("keybindingsStore.capturingShortcut is transient", () => {
   it("is not written to the persisted blob", () => {
     // A relaunch that came back believing it was mid-capture would leave every global chord
