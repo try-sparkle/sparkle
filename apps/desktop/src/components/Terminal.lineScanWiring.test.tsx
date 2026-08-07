@@ -157,6 +157,17 @@ async function mountTerminal(onSubmitLine?: () => void) {
   return view;
 }
 
+/** Mount ANOTHER Terminal for the same agent and wait until xterm hands us ITS `onData` — the
+ *  account-switch shape (`AgentPane` keys the terminal on the account while `agentId` stays put).
+ *  The mock's `onData` is last-writer-wins, so a changed function identity is the signal that the
+ *  new instance is the live one. */
+async function remountTerminal(onSubmitLine?: () => void) {
+  const previous = dataHandler.fn;
+  const view = render(<Terminal {...baseProps} onSubmitLine={onSubmitLine} />);
+  await waitFor(() => expect(dataHandler.fn).not.toBe(previous));
+  return view;
+}
+
 describe("a mounted Terminal routes its onData through the shared line scanner", () => {
   it("publishes the pending-line flag as the user types", async () => {
     await mountTerminal();
@@ -190,5 +201,34 @@ describe("a mounted Terminal routes its onData through the shared line scanner",
     act(() => dataHandler.fn!("\r"));
 
     expect(onSubmitLine).not.toHaveBeenCalled();
+  });
+});
+
+// ══ THE CALLER SIDE OF THE IDENTITY CONTRACT ═════════════════════════════════════════════════════
+// `terminalSubmit.registry.test.ts` proves `unregisterLineScan` HONOURS the state it is given. That
+// says nothing about whether this component still GIVES it one: dropping the second argument at the
+// `unregisterLineScan(agentId, lineScan)` call site restores the exact defect roborev 59775 found —
+// a remount's outgoing cleanup stripping the live instance's scanner — and left all fourteen tests
+// green, under a code comment claiming the invariant was protected. Guard vacuity relocated one
+// layer up (roborev 60097).
+describe("a remount's stale teardown does not strip the LIVE terminal's scanner", () => {
+  it("keeps the line the user is typing across an account-switch remount", async () => {
+    const outgoing = vi.fn();
+    const live = vi.fn();
+    const first = await mountTerminal(outgoing);
+    await remountTerminal(live); // React mounts the replacement BEFORE the old effect's cleanup
+
+    // Typed into the LIVE instance, while both are mounted.
+    act(() => dataHandler.fn!("make me a website"));
+    // …and now the outgoing instance tears down, late, for the same agentId.
+    act(() => first.unmount());
+
+    act(() => dataHandler.fn!("\r"));
+
+    // ASSERTED ON THE SUBMIT, not on the flag: a stripped scanner is lazily recreated EMPTY, so the
+    // Enter would submit nothing and this call would never come — which is a prompt the user typed
+    // and sent going unmetered and unreported.
+    expect(live).toHaveBeenCalledTimes(1);
+    expect(outgoing).not.toHaveBeenCalled();
   });
 });
