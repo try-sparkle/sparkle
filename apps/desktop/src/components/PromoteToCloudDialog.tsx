@@ -14,6 +14,8 @@ import { useProjectStore } from "../stores/projectStore";
 import { useCloudGate } from "../hooks/useCloudAgents";
 import { cloudApi } from "../services/cloudAgents/api";
 import { deepLinkActionLabel } from "../services/cloudAgents/gating";
+import { cloudCostLine } from "../services/cloudAgents/cloudCostEstimate";
+import { useAuthStore } from "../stores/authStore";
 import { openSignIn } from "../services/sparkleApi";
 import { projectRepoUrl } from "../services/cloudAgents/repoUrl";
 import { ensureCloudProjectId } from "../services/cloudAgents/projectLink";
@@ -207,6 +209,21 @@ export function PromoteToCloudDialog({
   onClose: () => void;
 }) {
   const openSettings = useUiStore((s) => s.openSettings);
+  // Server-stated rate, server-enforced floor, server-held balance; the arithmetic is the shared
+  // pure helper. Nothing about the price is decided here.
+  const rate = useAuthStore((s) => s.me?.cloudAgentPricing?.centsPerMinute);
+  const minStartCents = useAuthStore((s) => s.me?.cloudAgentPricing?.minStartCents);
+  const balanceCents = useAuthStore((s) => s.me?.balanceCents ?? 0);
+  const refreshMe = useAuthStore((s) => s.refresh);
+  const costLine = cloudCostLine(rate, balanceCents, minStartCents);
+
+  // RE-READ THE BALANCE ON OPEN — see the identical note in NewCloudAgentDialog. A running cloud
+  // agent debits every minute and nothing pushes that back to the desktop, so a persisted `me`
+  // quotes runtime that is already spent. This dialog is the more exposed of the two: the user is
+  // promoting BECAUSE something has been running.
+  useEffect(() => {
+    void refreshMe();
+  }, [refreshMe]);
   const [plan, setPlan] = useState<PromotionPlan | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   // COMMIT IS THE DEFAULT, and it is the default because the failure this feature exists to prevent
@@ -358,6 +375,14 @@ export function PromoteToCloudDialog({
                 is stopped before then. Once it&apos;s in the cloud it bills credits for each running
                 minute.
               </div>
+              {/* The same sentence the creation dialog shows, from the same helper — this is a
+                  price, and two hand-written copies of a price is how they drift. Absent when the
+                  server stated no rate; the client never invents one. */}
+              {costLine && (
+                <div style={hint} data-testid="promote-cost-estimate">
+                  {costLine}
+                </div>
+              )}
 
               <Section title="Branch">
                 <div data-testid="promote-branch" style={mono}>

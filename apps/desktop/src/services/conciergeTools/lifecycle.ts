@@ -832,6 +832,11 @@ async function readCloudGate() {
     authConfigured:
       useCloudAuthStore.getState().method != null || !useCloudAuthStore.getState().loaded,
     balanceCents: auth.me?.balanceCents ?? 0,
+    // The server's own start floor, transported — see the identical note in `useCloudGate`. The
+    // concierge must refuse on the same number the dialog's cost line quotes, or "you need $1.00 to
+    // start" and a tool that happily starts are two answers to one question. Absent falls back to
+    // CLOUD_MIN_START_CENTS, so an older `/me` behaves exactly as before.
+    minStartCents: auth.me?.cloudAgentPricing?.minStartCents,
   });
 }
 

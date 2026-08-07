@@ -30,6 +30,12 @@ export function useCloudAgentsEnabled(): boolean {
 export function useCloudGate(): CloudGate {
   const signedIn = useAuthStore((s) => s.tokenPresent);
   const balanceCents = useAuthStore((s) => s.me?.balanceCents ?? 0);
+  // THE SERVER'S OWN FLOOR, TRANSPORTED — not a second copy of the rule. Without it this gate falls
+  // back to CLOUD_MIN_START_CENTS (1¢, "obviously empty") while the cost line quotes the server's
+  // real floor, so a 50¢ balance reads "You need $1.00 to start" under a LIVE Start button and the
+  // start round-trips to a refusal. The button and the sentence must answer to the same number.
+  // Absent (an older `/me`) still falls back, so this can only ever narrow toward the server.
+  const minStartCents = useAuthStore((s) => s.me?.cloudAgentPricing?.minStartCents);
   const saved = useCloudAuthStore((s) => s.method != null);
   const probed = useCloudAuthStore((s) => s.loaded);
   const attempted = useCloudAuthStore((s) => s.attempted);
@@ -68,5 +74,5 @@ export function useCloudGate(): CloudGate {
   // checks are ORDERED (signed in → auth → credits) and return the FIRST block, so rewriting a
   // `no_auth` result to "ok" after the fact would also swallow the `insufficient_credits` the
   // evaluation never reached. Adjusting the INPUT lets the ordering carry on to the next check.
-  return evaluateCloudGate({ signedIn, authConfigured, balanceCents });
+  return evaluateCloudGate({ signedIn, authConfigured, balanceCents, minStartCents });
 }

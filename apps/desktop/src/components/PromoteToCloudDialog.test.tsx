@@ -11,7 +11,7 @@
 //
 // The plan is handed in as a value rather than derived, so every case here is a pure statement
 // about the dialog: given this plan, the user sees this. `planPromotion` has its own tests.
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 vi.mock("../stores/uiStore", () => ({
@@ -20,6 +20,7 @@ vi.mock("../stores/uiStore", () => ({
 }));
 
 import { PromoteToCloudDialog, type PromoteToCloudDeps } from "./PromoteToCloudDialog";
+import { useAuthStore } from "../stores/authStore";
 import { WIP_COMMIT_MESSAGE } from "../services/agentPromotion/plan";
 import type { PromotionPlan } from "../services/agentPromotion/plan";
 import type { PromoteResult } from "../services/agentPromotion/promote";
@@ -57,7 +58,97 @@ function mount(plan: PromotionPlan, promote?: PromoteToCloudDeps["promote"]) {
 
 const confirm = () => screen.getByTestId("promote-confirm");
 
-afterEach(cleanup);
+/** `/me` as the server sends it. `centsPerMinute: null` models an OLDER server: no price at all. */
+const me = (over: { balanceCents?: number; centsPerMinute?: number | null } = {}) => ({
+  clerkUserId: "u",
+  entitled: true,
+  balanceCents: over.balanceCents ?? 5000,
+  tokenVersion: 1,
+  ...(over.centsPerMinute === null
+    ? {}
+    : { cloudAgentPricing: { centsPerMinute: over.centsPerMinute ?? 0.9, minStartCents: 100 } }),
+});
+
+beforeEach(() => {
+  // The dialog re-reads /me on open; the real refresh would clear what a test seeded.
+  useAuthStore.setState({ refresh: vi.fn(async () => {}) } as never);
+});
+
+afterEach(() => {
+  cleanup();
+  // The store is module-global; a price left behind would leak into the suites that assert its
+  // ABSENCE, which is the assertion most easily made vacuous here.
+  useAuthStore.setState({ me: null, tokenPresent: false } as never);
+});
+
+// THE SECOND CONSUMER OF THE PRICE, and it needs its own proof. `cloudCostEstimate.test.ts` proves
+// the SENTENCE and `NewCloudAgentDialog.test.tsx` proves that ONE dialog is wired to it — neither
+// says anything about this one. Before these cases existed, `me` was null in every test here, so the
+// whole estimate block was inert: a wrong selector path, a `costLine` accidentally placed inside the
+// refusal branch, or a dropped `data-testid` would all have shipped with the suite green. That is
+// the same vacuity the Rust round-trip test exists to prevent, one layer up.
+describe("the cost estimate", () => {
+  it("states the server's rate and what the balance funds", async () => {
+    useAuthStore.setState({ me: me({ balanceCents: 1240 }), tokenPresent: true } as never);
+    mount(okPlan());
+
+    const line = (await screen.findByTestId("promote-cost-estimate")).textContent!;
+    expect(line).toContain("$0.54/hour");
+    expect(line).toContain("23 hours");
+  });
+
+  it("follows the server's rate rather than a number baked into the client", () => {
+    useAuthStore.setState({
+      me: me({ centsPerMinute: 4.5, balanceCents: 1240 }),
+      tokenPresent: true,
+    } as never);
+    mount(okPlan());
+
+    return waitFor(() =>
+      expect(screen.getByTestId("promote-cost-estimate").textContent).toContain("$2.70/hour"),
+    );
+  });
+
+  it("renders NOTHING when the server stated no price — never a guessed one", async () => {
+    useAuthStore.setState({ me: me({ centsPerMinute: null }), tokenPresent: true } as never);
+    mount(okPlan());
+
+    // Wait for the plan to land, so this is "the dialog rendered and chose not to show a price"
+    // rather than "the dialog had not rendered yet" — the difference between a real assertion and
+    // one that passes because nothing exists yet.
+    await screen.findByTestId("promote-confirm");
+    expect(screen.queryByTestId("promote-cost-estimate")).toBeNull();
+  });
+
+  it("is absent on a REFUSAL — there is no run to price", async () => {
+    useAuthStore.setState({ me: me(), tokenPresent: true } as never);
+    mount({ ok: false, refusal: "no_remote", message: "This project has no `origin` remote." });
+
+    await screen.findByTestId("promote-refusal");
+    expect(screen.queryByTestId("promote-cost-estimate")).toBeNull();
+  });
+
+  // Below the server's floor `canStartCloudAgent` refuses outright, so a runway would state a
+  // runtime the user cannot buy.
+  it("says what it takes to START rather than a runway, below the server's floor", async () => {
+    useAuthStore.setState({ me: me({ balanceCents: 50 }), tokenPresent: true } as never);
+    mount(okPlan());
+
+    const line = (await screen.findByTestId("promote-cost-estimate")).textContent!;
+    expect(line).toContain("You need $1.00 to start.");
+    expect(line).not.toMatch(/funds/);
+  });
+
+  // This dialog is the MORE exposed of the two to a stale balance: the user is promoting precisely
+  // because something has been running and burning credits.
+  it("re-reads /me on open, so the quote is not a pre-debit balance", () => {
+    const refresh = vi.fn(async () => {});
+    useAuthStore.setState({ me: me(), tokenPresent: true, refresh } as never);
+    mount(okPlan());
+
+    expect(refresh).toHaveBeenCalled();
+  });
+});
 
 describe("what the user is told before they can confirm", () => {
   it("names the branch the work will travel on", async () => {

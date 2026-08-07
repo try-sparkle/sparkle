@@ -12,6 +12,16 @@
 
 import type { AutoTopup } from "./creditsMenuApi";
 
+/** The server's cloud-agent price list, quoted verbatim on `/me`. Both fields are the SERVER's
+ *  numbers — the client never computes, adjusts or defaults them. */
+export interface CloudAgentPricing {
+  /** Charged per RUNNING sandbox-minute. Fractional (0.9 today); paused minutes are free. */
+  centsPerMinute: number;
+  /** Balance required to START, which is a floor and NOT a charge — a run cancelled after ten
+   *  seconds costs ten seconds, not this. */
+  minStartCents: number;
+}
+
 export interface Me {
   clerkUserId: string;
   entitled: boolean;
@@ -31,6 +41,11 @@ export interface Me {
    *  (services/cloudAgents/gating.ts). Kept on the type because the server still sends it and a
    *  future outage banner is the one legitimate reader. */
   cloudAgentsEnabled?: boolean;
+  /** What a cloud agent COSTS, stated by the server. The client holds NO rate of its own and must
+   *  not derive one — a duplicated pricing rule already shipped a bug here (the 50¢ client floor
+   *  that refused starts the server would have accepted; see `cloudAgents/gating.ts`). Absent means
+   *  an older server: show no estimate rather than guessing. */
+  cloudAgentPricing?: CloudAgentPricing;
 }
 
 export type AuthView = "loading" | "welcome" | "trial" | "unpaid" | "entitled";

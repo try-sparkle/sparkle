@@ -524,19 +524,43 @@ fn try_capture(
 ///
 /// `keep` is per-pool rather than global precisely so a hidden episode can never evict a visible
 /// one; see `dump_pool`.
+/// A pool is also capped in BYTES, not just in files. The file count is the cheap dimension to
+/// bound and the wrong one to bound alone: one dump is a full `sample(1)` call graph, which measured
+/// between 0.5 MB and 3.5 MB in practice, so a 20-file budget authorises anywhere from 10 MB to
+/// 70 MB. Observed on a real install: 23 dumps holding 41 MB of a user's log directory. Whichever
+/// limit binds first wins, so a run of unusually large stacks is evicted on size while the ordinary
+/// case still keeps the full `keep` files of history.
+#[cfg(target_os = "macos")]
+const MAX_HANG_DUMP_BYTES: u64 = 24 * 1024 * 1024;
+
 #[cfg(target_os = "macos")]
 fn prune_hang_dumps(dir: &std::path::Path, keep: usize) {
+    prune_hang_dumps_to(dir, keep, MAX_HANG_DUMP_BYTES)
+}
+
+#[cfg(target_os = "macos")]
+fn prune_hang_dumps_to(dir: &std::path::Path, keep: usize, max_bytes: u64) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     let mut dumps: Vec<_> = entries
         .flatten()
         .filter(|e| e.file_name().to_string_lossy().starts_with("hang-"))
-        .filter_map(|e| e.metadata().ok().and_then(|m| m.modified().ok()).map(|t| (t, e.path())))
+        .filter_map(|e| {
+            let m = e.metadata().ok()?;
+            Some((m.modified().ok()?, m.len(), e.path()))
+        })
         .collect();
-    if dumps.len() <= keep {
-        return;
+    dumps.sort_by_key(|(t, _, _)| *t); // oldest first
+
+    // Evict oldest-first until BOTH budgets are satisfied. Count first (cheap and exact), then
+    // size over what survived it.
+    let over_count = dumps.len().saturating_sub(keep);
+    let mut total: u64 = dumps.iter().skip(over_count).map(|(_, len, _)| *len).sum();
+    let mut evict = over_count;
+    while evict < dumps.len() && total > max_bytes {
+        total = total.saturating_sub(dumps[evict].1);
+        evict += 1;
     }
-    dumps.sort_by_key(|(t, _)| *t); // oldest first
-    for (_, path) in dumps.iter().take(dumps.len() - keep) {
+    for (_, _, path) in dumps.iter().take(evict) {
         let _ = std::fs::remove_file(path);
     }
 }
@@ -555,7 +579,6 @@ fn capture_stack_into(dir: &std::path::Path, stamp_ms: u64, keep: usize) {
         tracing::warn!(target: "watchdog", "could not create dump dir {dir:?}, stack skipped: {e}");
         return;
     }
-    prune_hang_dumps(dir, keep);
     let path = dir.join(format!("hang-{stamp_ms}.txt"));
     let pid = std::process::id().to_string();
     // 5 seconds at the default interval: long enough to show whether the blocking frame persists
@@ -572,8 +595,17 @@ fn capture_stack_into(dir: &std::path::Path, stamp_ms: u64, keep: usize) {
             // Reaped on its own thread: an unwaited child stays a zombie for the life of the app,
             // and the exit status is the only thing that distinguishes a real capture from a file
             // that was never written.
+            let prune_dir = dir.to_path_buf();
             std::thread::spawn(move || match child.wait() {
                 Ok(status) if status.success() => {
+                    // PRUNE HERE, not before the spawn. `sample(1)` writes the file asynchronously,
+                    // so pruning up-front measured a population that did not yet include the dump
+                    // about to land — the budget was enforced against the wrong set and the pool
+                    // settled ABOVE `keep` (observed: 23 files for keep=20, because overlapping
+                    // captures each passed the pre-write check and then all wrote). Pruning once the
+                    // capture has actually landed makes `keep` the real ceiling and costs nothing:
+                    // we are already on a helper thread, off the watchdog's tick.
+                    prune_hang_dumps(&prune_dir, keep);
                     tracing::warn!(target: "watchdog", path = %path.display(), "captured hang stack")
                 }
                 Ok(status) => {
@@ -940,6 +972,46 @@ mod tests {
         left.sort();
         assert_eq!(left, vec!["hang-3.txt", "hang-4.txt", "notes.txt"], "exactly the two newest");
         assert!(hidden.join("hang-9.txt").exists(), "the other pool must be untouched");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The COUNT budget alone let a pool of unusually large stacks hold tens of MB, because a dump is
+    // 0.5-3.5 MB and 20 of them is 10-70 MB. This asserts the surviving BYTES, which is the thing the
+    // count cannot bound: with keep=10 the count budget evicts nothing here, so anything that
+    // survives does so only because the size budget did the work.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_size_budget_evicts_when_the_count_budget_would_not() {
+        use std::io::Write;
+        let root =
+            std::env::temp_dir().join(format!("sparkle-prune-bytes-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        // Four 100-byte dumps, oldest first, distinct mtimes.
+        for name in ["hang-1.txt", "hang-2.txt", "hang-3.txt", "hang-4.txt"] {
+            let mut f = std::fs::File::create(root.join(name)).unwrap();
+            f.write_all(&[b'x'; 100]).unwrap();
+            drop(f);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // keep=10 is deliberately ABOVE the file count, so the count budget is satisfied and
+        // inert. A 250-byte ceiling admits only the two newest.
+        prune_hang_dumps_to(&root, 10, 250);
+
+        let mut left: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, vec!["hang-3.txt", "hang-4.txt"], "size budget kept the newest 200 bytes");
+
+        let total: u64 = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+            .sum();
+        assert!(total <= 250, "surviving bytes must be within budget, got {total}");
         let _ = std::fs::remove_dir_all(&root);
     }
 

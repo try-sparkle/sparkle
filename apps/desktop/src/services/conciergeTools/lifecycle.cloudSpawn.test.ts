@@ -202,6 +202,39 @@ describe("the three preconditions, each refusing with its OWN reason and startin
     expect(agentsOf()).toHaveLength(0);
   });
 
+  // THE SAME NUMBER THE DIALOG QUOTES. `cloudCostLine` tells a 50¢ user "You need $1.00 to start";
+  // the concierge must refuse on that floor too, or one surface states the price and the other
+  // cheerfully starts a run the server rejects. 50¢ clears the client's own 1¢ "obviously empty"
+  // fallback, so ONLY the server's `minStartCents` can produce this refusal.
+  it("the cloud gate: refuses below the SERVER's start floor, not just an empty wallet", async () => {
+    useAuthStore.setState({
+      tokenPresent: true,
+      me: {
+        cloudAgentsEnabled: true,
+        entitled: true,
+        balanceCents: 50,
+        cloudAgentPricing: { centsPerMinute: 0.9, minStartCents: 100 },
+      },
+    } as never);
+    const r = await spawnBuildAgent({ projectId: "p1", runtime: "cloud", prompt: "ship it" });
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toBe("cloud-blocked");
+    expect(r.deepLink).toBe("credits");
+    expect(startSession).not.toHaveBeenCalled();
+  });
+
+  // …and an older `/me` that carries no floor must not be narrowed on a number we never received.
+  it("the cloud gate: allows the same balance when the server stated no floor", async () => {
+    useAuthStore.setState({
+      tokenPresent: true,
+      me: { cloudAgentsEnabled: true, entitled: true, balanceCents: 50 },
+    } as never);
+    const r = await spawnBuildAgent({ projectId: "p1", runtime: "cloud", prompt: "ship it" });
+    expect(r.ok).toBe(true);
+    expect(startSession).toHaveBeenCalledTimes(1);
+  });
+
   it("the cloud gate: a signed-out user gets the gate's sign-in sentence, not an invented one", async () => {
     useAuthStore.setState({ tokenPresent: false, me: { cloudAgentsEnabled: true } } as never);
     const r = await spawnBuildAgent({ projectId: "p1", runtime: "cloud", prompt: "ship it" });

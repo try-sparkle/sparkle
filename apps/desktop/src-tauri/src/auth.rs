@@ -156,13 +156,22 @@ pub struct Me {
     /// Optional (and omitted when absent) to tolerate older orchestration servers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     auto_topup: Option<Value>,
-    /// Cloud Agents (Service B) capability — a GLOBAL server feature flag (`CLOUD_AGENTS_ENABLED`),
-    /// NOT a per-account allowlist; every caller sees the same value. Passed through verbatim for the same reason as
-    /// `auto_topup`: without the field serde drops the key and the desktop always reads undefined,
-    /// which the gating layer treats as "off". Absent/false ⇒ the desktop hides every cloud
-    /// surface, so the feature genuinely ships dark.
+    /// Cloud Agents (Service B) KILL SWITCH — a GLOBAL server flag (`CLOUD_AGENTS_ENABLED`), NOT a
+    /// per-account allowlist; every caller sees the same value, and it is ON by default. Passed
+    /// through verbatim for the same reason as `auto_topup`: without the field serde drops the key
+    /// and the desktop always reads undefined. It is NOT an entitlement and no surface gates on it —
+    /// whether an account may run a cloud agent is decided by credits + a saved Claude credential
+    /// (`services/cloudAgents/gating.ts`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cloud_agents_enabled: Option<bool>,
+    /// What a cloud agent COSTS: `{ centsPerMinute, minStartCents }`, straight from the server's own
+    /// pricing constants. Passed through verbatim — and this field is the reason the desktop can
+    /// quote a price at all: the client deliberately holds NO rate of its own, because a duplicated
+    /// pricing rule already shipped a bug here once (see `CLOUD_MIN_START_CENTS` in
+    /// `services/cloudAgents/gating.ts`). Absent (an older server) ⇒ the UI shows no estimate rather
+    /// than guessing one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cloud_agent_pricing: Option<Value>,
 }
 
 /// True if a (non-empty) desktop bearer token is stored.
@@ -746,6 +755,33 @@ mod tests {
         .unwrap();
         let round: Value = serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
         assert!(round.get("cloudAgentsEnabled").is_none());
+    }
+
+    #[test]
+    fn me_passes_through_the_cloud_agent_price_and_omits_it_when_absent() {
+        // THE ONLY PLACE THIS CAN BE CAUGHT. The dialogs quote a price they read off `/me`, and
+        // every JS test for that seeds the store DIRECTLY — so if serde dropped this key the UI
+        // would silently show no price forever while the whole desktop suite stayed green. The
+        // capability field above already learned this lesson; the price is worth more.
+        let priced: Me = serde_json::from_str(
+            r#"{"clerkUserId":"u1","entitled":true,"balanceCents":500,"tokenVersion":1,
+                "cloudAgentPricing":{"centsPerMinute":0.9,"minStartCents":100}}"#,
+        )
+        .unwrap();
+        let round: Value = serde_json::from_str(&serde_json::to_string(&priced).unwrap()).unwrap();
+        assert_eq!(round["cloudAgentPricing"]["centsPerMinute"], 0.9);
+        assert_eq!(round["cloudAgentPricing"]["minStartCents"], 100);
+
+        // An older orchestration deploy sends no price. The key must be OMITTED rather than null,
+        // so JS reads `undefined` and the estimate renders NOTHING — never a guessed rate, which is
+        // the failure the client-side pricing constant already caused once.
+        let unpriced: Me = serde_json::from_str(
+            r#"{"clerkUserId":"u1","entitled":true,"balanceCents":500,"tokenVersion":1}"#,
+        )
+        .unwrap();
+        let round: Value =
+            serde_json::from_str(&serde_json::to_string(&unpriced).unwrap()).unwrap();
+        assert!(round.get("cloudAgentPricing").is_none());
     }
 
     #[test]

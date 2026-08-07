@@ -1,10 +1,11 @@
-import { useState, type CSSProperties } from "react";
+import { useEffect, useState, type CSSProperties } from "react";
 import { FiCloud, FiX } from "react-icons/fi";
 import { C, DANGER, MODAL_SHADOW, ON_BRAND_FILL, SCRIM } from "../theme/colors";
 import { FONT_UI, RADIUS } from "../theme/scale";
 import { FONT_WEIGHT } from "@sparkle/ui";
 import type { Project } from "../types";
 import { useUiStore } from "../stores/uiStore";
+import { useAuthStore } from "../stores/authStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useCloudGate } from "../hooks/useCloudAgents";
@@ -16,6 +17,7 @@ import { projectRepoUrl } from "../services/cloudAgents/repoUrl";
 import { classifyStartError, type StartGuidance } from "../services/cloudAgents/startError";
 import { openSignIn } from "../services/sparkleApi";
 import { deepLinkActionLabel } from "../services/cloudAgents/gating";
+import { cloudCostLine } from "../services/cloudAgents/cloudCostEstimate";
 import { ModalLayer } from "./ModalLayer";
 
 // "New cloud agent" (Service B, W5). A cloud agent is started server-side BEFORE it has a tab, and
@@ -33,6 +35,21 @@ import { ModalLayer } from "./ModalLayer";
 export function NewCloudAgentDialog({ project, onClose }: { project: Project; onClose: () => void }) {
   const gate = useCloudGate();
   const openSettings = useUiStore((s) => s.openSettings);
+  // Every number comes from the SERVER (`/me`): the rate it bills, the floor it enforces, and the
+  // balance it bills against. Nothing is derived locally — see cloudCostEstimate.ts.
+  const rate = useAuthStore((s) => s.me?.cloudAgentPricing?.centsPerMinute);
+  const minStartCents = useAuthStore((s) => s.me?.cloudAgentPricing?.minStartCents);
+  const balanceCents = useAuthStore((s) => s.me?.balanceCents ?? 0);
+  const refreshMe = useAuthStore((s) => s.refresh);
+  const costLine = cloudCostLine(rate, balanceCents, minStartCents);
+
+  // RE-READ THE BALANCE ON OPEN. A running cloud agent debits the ledger every minute, and nothing
+  // pushes that back into the desktop — so a `me` persisted from before a run would quote runtime
+  // the user has already spent. Best-effort: on failure the store keeps its last value and the line
+  // is merely stale rather than absent, which beats blanking a price the user is reading.
+  useEffect(() => {
+    void refreshMe();
+  }, [refreshMe]);
 
   const [goal, setGoal] = useState("");
   const [name, setName] = useState("");
@@ -150,6 +167,14 @@ export function NewCloudAgentDialog({ project, onClose }: { project: Project; on
                 Runs in a Sparkle sandbox on {repoLabel(project)} — it keeps working with your laptop
                 closed, and bills credits for each running minute.
               </div>
+              {/* The PRICE, before the button. Absent when the server stated no rate (an older
+                  orchestration deploy) — the client holds none of its own, so it says nothing
+                  rather than quoting a number it made up. */}
+              {costLine && (
+                <div style={hint} data-testid="cloud-cost-estimate">
+                  {costLine}
+                </div>
+              )}
 
               <label htmlFor="cloud-goal" style={fieldLabel}>
                 What should it do?
