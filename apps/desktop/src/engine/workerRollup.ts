@@ -10,6 +10,24 @@
 // because a question the head is asking is one you are directly blocking, and healthy workers must
 // not paint over it.
 //
+// WHERE "NEEDS MERGE" IS HANDLED, AND WHY IT IS NOT HANDLED HERE. `unmerged` is an action the user
+// owes — the founder's rule (bead sparkle-qogah) names it explicitly — and a folded head DID hide
+// it: worker rows default to collapsed, so three workers each holding an un-landed PR painted one
+// grey row and nothing else. That is a real bug, and it is fixed in `engine/workerExpansion`, which
+// now draws a PEEK LINE naming such a worker under the folded head. Asked directly, the founder
+// endorsed exactly that surface: "it just peaks the one that's red and needs me and that's fine the
+// way that it's working now."
+//
+// It is NOT fixed by escalating this dot, and that was tried. `anyRed` is what `bandOfRollup` files
+// under the NEEDS YOU chip, so escalating made a folded head with an un-landed PR count as an ask.
+// Two costs, both already paid once: `tokens.ts` de-escalated `unmerged` from red on 2026-07-26
+// because 27 of 51 agents sat in that band and the wall of red carried no information — routing it
+// back in through the parent rebuilds that wall one level up; and the chip then means both "someone
+// is blocked on you" and "a PR is unlanded", which is the one-signal-many-meanings failure recorded
+// as sparkle-345q5. The rule says do not HIDE the row. The peek shows it; the dot need not shout it.
+// The same reasoning applies unchanged to the `questions` band added below: a calm-but-owed status
+// reaches the user through a surface, not by borrowing another band's alarm.
+//
 // Three deliberate non-symmetries, all load-bearing:
 //   • own RED wins, own GREEN does not. A head busy delegating while every worker under it is
 //     blocked is not a healthy row; "all red → red" is flat.
@@ -79,11 +97,23 @@ export function rollupDot(
   let anyBlue = ownAsks;
   let anyGreen = false;
   for (const s of workerStatuses) {
+    // A CHILD'S `unmerged` DELIBERATELY DOES NOT ESCALATE THIS DOT. It is an action the user owes —
+    // the founder's rule (bead sparkle-qogah) names "Needs merge" explicitly — but the dot is not
+    // where that rule is satisfied: `engine/workerExpansion` draws a PEEK LINE naming the worker
+    // under a folded head, which is the surface the founder endorsed when asked ("it just peaks the
+    // one that's red and needs me and that's fine the way that it's working now").
+    //
+    // Escalating here instead cost more than it bought. `anyRed` is what `bandOfRollup` files under
+    // the NEEDS YOU chip, so a folded head with an un-landed PR under it started counting as an ask
+    // — and `tokens.ts` de-escalated `unmerged` from red on 2026-07-26 precisely because 27 of 51
+    // agents sat in that band and the wall of red carried no information. Routing it back in through
+    // the parent rebuilds that wall one level up, and makes the chip mean two different things at
+    // once, which is the failure recorded as sparkle-345q5. The row is not hidden; it is peeked.
     const band = bandOfStatus(s);
     if (band === "needs_you") anyRed = true;
     else if (band === "questions") anyBlue = true;
     else if (band === "running") anyGreen = true;
-    // "done" is grey and deliberately contributes nothing.
+    // Every other "done" status is grey and deliberately contributes nothing.
   }
 
   if (anyRed && anyGreen) return "orange";
@@ -166,6 +196,13 @@ export function rollupDotAccessor<
     // that suppression was added for, painting a working orchestrator red and floating it into
     // "Needs you" while you watch it produce output. A worker that genuinely needs you now always
     // gets through, however busy its parent is.
+    //
+    // AN OWED MERGE IS NEVER SUPPRESSED, and it falls out of this condition for free (`unmerged`
+    // bands `done`, not `needs_you`) — stated here so nobody "fixes" the omission. The suppression
+    // is for a red that is not asking anything on a parent you can watch working; an un-landed PR
+    // is owed whether or not its orchestrator is busy, and it is still owed after that orchestrator
+    // stops. Swallowing it would restore the invisibility on exactly the busiest fleets, which is
+    // where un-landed branches actually pile up.
     if (bandOfStatus(ws) === "needs_you" && !isAsk(ws) && isInMotion(a.parentId)) continue;
     const arr = workersByParent.get(a.parentId);
     if (arr) arr.push(ws);
@@ -193,6 +230,13 @@ export function rollupDotAccessor<
       // it read "nothing to do" — the exact lie this whole module exists to remove — and with the
       // Done chip off, the head and its running subtree vanished from the column entirely.
       // Dropping just the reds degrades that head to GREEN, which is the truth.
+      //
+      // AN OWED MERGE IS DROPPED HERE TOO, for the same reason the reds are: "Dismiss Alert" is an
+      // explicit human gesture meaning "calm this row", and an escalation that outlived it would
+      // make the button look broken — the exact report this path was added to fix. That does not
+      // re-hide the work, which is what the founder's rule actually protects: the PEEK line naming
+      // that worker comes from engine/workerExpansion and never consults dismissal, so the row is
+      // still named under the closed head. Only the disc goes quiet, and only because he said so.
       const calm = (workersByParent.get(id) ?? []).filter(
         (s) => bandOfStatus(s) !== "needs_you",
       );

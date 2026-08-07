@@ -45,30 +45,80 @@ import { bandOfStatus } from "./buildSections";
 
 /** The workers under `headId` that are actually asking for you — the peek's content.
  *
- *  THREE predicates, and all three are load-bearing. A child that is not `kind: "worker"` never
- *  renders as a child row, so peeking for it would name a row the subtree cannot show. A worker with
- *  no live PTY status is excluded because its red would be SYNTHETIC — see the note on the
- *  open/evict race above. And the band comes from the shared `bandOfStatus` rather than a local
- *  "is it red" list, so the peek, the row dots and the filter chips cannot drift apart.
+ *  TWO KINDS OF ASK REACH THE PEEK, and the second one was the headline bug this module carried:
  *
- *  GREEN AND GRAY WORKERS NEVER APPEAR HERE — only the `needs_you` band does, which is what keeps
- *  the peek an attention affordance rather than a second, sneakier expansion. This is also the ONLY
- *  thing deciding whether a peek renders at all: the caller draws a line iff this returns non-empty.
- *  (A second gate in the component was deleted for exactly that reason — while both existed, each
- *  masked the other and neither could be shown by a test to matter.) */
+ *    1. The `needs_you` BAND — waiting/approval/errored/blocked. Taken from the shared
+ *       `bandOfStatus` rather than a local "is it red" list, so the peek, the row dots and the
+ *       filter chips cannot drift apart.
+ *    2. `unmerged` — "Needs merge". It bands `done` (buildSections) because it is GRAY, a landing
+ *       state rather than an alarm, and for a long time that kept it out of here entirely. But
+ *       worker rows default to COLLAPSED, so a worker has no row of its own by default; the peek
+ *       was its only surface, and the parent's gray dot said "nothing here". An orchestrator with
+ *       three workers each holding an un-landed PR rendered as ONE collapsed gray row — three
+ *       things the user owes, zero pixels, and he cannot know what he was not shown. The founder's
+ *       product rule (bead sparkle-qogah.3, P0) names "Needs merge" as an action he owes and says
+ *       such a row is never hidden. So it peeks. This is an ASK the user can act on, not an alarm:
+ *       nothing about the gray COLOUR of the row changes here, only whether it has a surface.
+ *
+ *  CALM WORKERS STILL NEVER APPEAR — green and the resting grays (idle/done/stopped/new) — which is
+ *  what keeps the peek an attention affordance rather than a second, sneakier expansion. This is
+ *  also the ONLY thing deciding whether a peek renders at all: the caller draws a line iff this
+ *  returns non-empty. (A second gate in the component was deleted for exactly that reason — while
+ *  both existed, each masked the other and neither could be shown by a test to matter.)
+ *
+ *  NO CAP, EVER. Eight workers owing a merge is eight entries. "If uncapping makes a surface tall,
+ *  that is CORRECT. Scroll it; do not hide it" — the same rule. (What the CALLER does with the list
+ *  is its own business: AgentSidebar's WorkerPeek renders one line and shows a COUNT when there are
+ *  several, which states the number rather than concealing it.)
+ *
+ *  `kind: "worker"` is required because a child that is not a worker never renders as a child row,
+ *  so peeking for it would name a row the subtree cannot show. */
 export function attentionWorkersOf<
   T extends { id: string; kind: AgentKind; parentId: string | null },
 >(
   agents: readonly T[],
   headId: string,
   statusOf: (id: string) => AgentTabStatus,
+  /** Does this worker have a live PTY reading? Gates the RED arm only — see {@link isOwedAsk}. */
   isLive: (id: string) => boolean,
 ): T[] {
-  return agents.filter(
-    (a) =>
-      a.kind === "worker" &&
-      a.parentId === headId &&
-      isLive(a.id) &&
-      bandOfStatus(statusOf(a.id)) === "needs_you",
-  );
+  return agents.filter((a) => {
+    if (a.kind !== "worker" || a.parentId !== headId) return false;
+    const status = statusOf(a.id);
+    // THE LIVENESS GUARD APPLIES TO THE RED ARM ONLY, and that asymmetry is the point rather than an
+    // oversight. `isLive` exists to reject a SYNTHETIC red: `withUnstartedWorkerAttention` paints a
+    // worker whose worktree is cut but whose pane never mounted — a condition produced by the
+    // internal open/evict race (orchestrationListener has observed the same worker re-opened ~10
+    // times in a sub-millisecond burst), not by anything the user did. Honouring it would make the
+    // peek flicker at that rate.
+    //
+    // `unmerged` cannot be manufactured that way. engine/unmergedAttention derives it from the
+    // workflow STAGE — durable git branch/PR evidence — and deliberately escalates agents sitting in
+    // `stopped`, i.e. precisely the ones with NO live reading ("a persisted-but-unlanded tab still
+    // lights up"). So a worker with an un-landed PR and no live pane is not an untrustworthy signal;
+    // it is the most STRANDED thing on the fleet and the case the user most needs to see. Gating it
+    // on liveness would have left the headline bug unfixed for exactly the workers it hurts most.
+    // The synthetic-red protection is untouched: a never-live `errored` worker is still excluded.
+    if (isOwedAsk(status)) return true;
+    // THE `questions` BAND PEEKS TOO. It is BLUE rather than red — an ask you can answer, not an
+    // alarm — but the peek's question is "does this dot hide something the user must act on", and a
+    // question is the most directly answerable thing on the fleet. Omitting it reopened, for the
+    // newest band, exactly the hole `unmerged` had: worker rows default to collapsed, so a
+    // questioning worker under a folded head had no row, no peek line, and a parent dot that files
+    // under someone else's chip. Gated on `isLive` with the reds, because a blue is a live screen
+    // reading like they are — only `unmerged` is derived from durable git evidence.
+    const band = bandOfStatus(status);
+    return isLive(a.id) && (band === "needs_you" || band === "questions");
+  });
+}
+
+/** A status that is CALM in colour but still owes the user an action.
+ *
+ *  Named rather than inlined so the reason travels with it, and kept to `unmerged` on purpose: this
+ *  is not a second copy of the band taxonomy (the header of workerRollup.ts explains at length why
+ *  spelling out status lists here is how the taxonomy drifts). It is the one documented exception —
+ *  a status whose gray COLOUR is a deliberate 2026-07-26 decision (27 of 51 agents in that band made
+ *  red meaningless) but whose MEANING is "open or merge the PR", an ask that must not be hidden. */
+function isOwedAsk(status: AgentTabStatus): boolean {
+  return status === "unmerged";
 }

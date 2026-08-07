@@ -115,7 +115,10 @@ describe("pushing a build agent — verified, or it did not happen", () => {
 describe("pushing the concierge — the target that did not exist", () => {
   it("routes to the registered sink instead of an inbox the concierge does not have", async () => {
     const seen: string[] = [];
-    setConciergeNotifier((t) => seen.push(t));
+    setConciergeNotifier((t) => {
+      seen.push(t);
+      return true;
+    });
     const ok = await buildPusherDeps().send(CONCIERGE_RECIPIENT_ID, "Agent A is quota-walled.");
     expect(ok).toBe(true);
     expect(seen).toEqual(["Agent A is quota-walled."]);
@@ -124,13 +127,41 @@ describe("pushing the concierge — the target that did not exist", () => {
 
   it("does NOT append the blocker ask — the concierge is not the one being asked", async () => {
     const seen: string[] = [];
-    setConciergeNotifier((t) => seen.push(t));
+    setConciergeNotifier((t) => {
+      seen.push(t);
+      return true;
+    });
     await buildPusherDeps().send(CONCIERGE_RECIPIENT_ID, "Agent A is quota-walled.");
     expect(seen[0]).not.toContain("```sparkle-blocker");
   });
 
   it("reports FAILURE when no window is listening, so the finding stays owed", async () => {
     expect(await buildPusherDeps().send(CONCIERGE_RECIPIENT_ID, "anything")).toBe(false);
+  });
+
+  it("reports FAILURE when the sink is listening but REFUSES the finding", async () => {
+    // THE HOLE THIS CLOSES (bead sparkle-qogah). A registered sink was proof enough: `notifyConcierge`
+    // called it and returned `true` whatever it did, so a scheduler that discarded the text on its
+    // own `disposed` guard — or by truncating its owed list — was reported here as a delivery.
+    // `sweepPushers` takes the `delivered` branch on that `true`: it spends one of four hourly slots
+    // and stamps the condition as reported for FOUR HOURS. So the destroyed finding was ALSO
+    // suppressed at source, by the very call that destroyed it.
+    //
+    // Asserted on what `send` reports — the value `sweepPushers` actually branches on — rather than
+    // on the sink having been called, which was true in the broken build too.
+    setConciergeNotifier(() => false);
+    expect(await buildPusherDeps().send(CONCIERGE_RECIPIENT_ID, "Agent A is quota-walled.")).toBe(
+      false,
+    );
+  });
+
+  it("still reports SUCCESS when the sink accepts, so a real delivery is not retried forever", async () => {
+    // The other half of the same contract: an honest `false` is only worth anything if `true` still
+    // means what it says. A sink that accepts must not be re-offered the same finding next sweep.
+    setConciergeNotifier(() => true);
+    expect(await buildPusherDeps().send(CONCIERGE_RECIPIENT_ID, "Agent A is quota-walled.")).toBe(
+      true,
+    );
   });
 
   it("every project reports to the concierge", () => {
@@ -174,8 +205,8 @@ describe("the notifier registration", () => {
     // React's strict-mode double-invoke and any remount order the effects this way. An unguarded
     // clear would leave the SURVIVOR unregistered — the concierge silently unreachable for the rest
     // of the session, which is the failure this whole branch is about.
-    const oldSink = vi.fn();
-    const newSink = vi.fn();
+    const oldSink = vi.fn(() => true);
+    const newSink = vi.fn(() => true);
     setConciergeNotifier(oldSink);
     setConciergeNotifier(newSink); // new mount
     clearConciergeNotifier(oldSink); // old cleanup, arriving late

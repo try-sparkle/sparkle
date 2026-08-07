@@ -21,7 +21,7 @@ vi.mock("../services/openProjectTab", () => ({ openProjectTab: h.openProjectTab 
 import { ConciergeHost } from "./ConciergeHost";
 import { useUiStore } from "../stores/uiStore";
 import type { ConciergeFeed } from "../useConciergeFeed";
-import type { StatusBand } from "../engine/buildSections";
+import { STATUS_BANDS, type StatusBand } from "../engine/buildSections";
 import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
 
 // PRECONDITION, stated rather than inherited: this suite's subject is the concierge CONVERSATION,
@@ -97,40 +97,47 @@ describe("the digest line renders in the thread", () => {
   });
 });
 
-describe("clicking the digest narrows the Build column", () => {
-  it("isolates that band in the sidebar filter", () => {
+// The click used to ISOLATE the line's band here — `isolateStatusBand(band)`, which sets
+// `running:false, done:false`. That concealed every "Needs merge" row (`done`) and every running
+// orchestrator head, from a line that reads as "show me these", and `statusFilter` was persisted so
+// it stayed concealed across relaunch. Removed under the founder's rule, "We should never hide a row
+// that needs action from me" (bead sparkle-qogah.4). What the click does now is widen, expand and
+// reveal; the row-level proof lives in ConciergeHost.digestFilter.test.tsx, which runs the sidebar's
+// own pipeline. These two pin the store state that feeds it.
+describe("clicking the digest widens the Build column, never narrows it", () => {
+  it("leaves every band visible, including the one the merge queue lives in", () => {
     render(<ConciergeHost feed={feedOf(17, "needs_you")} />);
+    // Start narrowed, so this cannot pass by the click doing nothing at all: someone hid `done` and
+    // `running` before the click landed.
+    useUiStore.setState({
+      statusFilter: { needs_you: true, questions: false, running: false, done: false },
+    } as never);
+
+    fireEvent.click(digest());
+
+    // Every band back. `done` is the assertion that matters — that is where `unmerged` bands.
     expect(useUiStore.getState().statusFilter).toEqual({
       needs_you: true,
       questions: true,
       running: true,
       done: true,
     });
-
-    fireEvent.click(digest());
-
-    // The point of the click: you asked to see those seventeen, so show those seventeen. This is
-    // the SAME statusFilter the sidebar's own chips render, so the effect is visible up there and
-    // clears with the ordinary "Show all" rather than being an invisible mode.
-    expect(useUiStore.getState().statusFilter).toEqual({
-      needs_you: true,
-      questions: false,
-      running: false,
-      done: false,
-    });
   });
 
-  it("reads the band off the LINE rather than hardcoding needs_you", () => {
+  it("does not narrow to the line's own band either, whatever band that is", () => {
     // Only `needs_you` reaches the thread today — surfacedAgents gates on it, so a "running" digest
-    // cannot currently exist and asserting one would be testing a fiction. What IS checkable is
-    // that the click and the rendered line agree: both come from the same `band` field, so if the
-    // surfacing gate ever widens, the filter follows without another edit.
+    // cannot currently exist and asserting one would be testing a fiction. What IS checkable is that
+    // the click leaves EVERY band on rather than the one the line names, so if the surfacing gate
+    // ever widens, a non-needs_you line cannot start hiding the other two.
     render(<ConciergeHost feed={feedOf(5, "needs_you")} />);
-    const band = digest().getAttribute("data-band") as "needs_you" | "running" | "done";
+    const band = digest().getAttribute("data-band") as StatusBand;
     fireEvent.click(digest());
     const filter = useUiStore.getState().statusFilter;
     expect(filter[band]).toBe(true);
-    expect(Object.values(filter).filter(Boolean)).toHaveLength(1);
+    // EVERY band on, counted against the taxonomy rather than a literal: this asserted
+    // `toHaveLength(1)` when the click isolated, and a hard-coded 3 silently became wrong the day a
+    // fourth band (`questions`) landed. Reading the length from STATUS_BANDS keeps it honest.
+    expect(Object.values(filter).filter(Boolean)).toHaveLength(STATUS_BANDS.length);
   });
 
   it("does not surface a non-needs_you band into the thread at all", () => {

@@ -65,6 +65,7 @@ import {
   fetchOpenPrs,
   formatPrBadge,
   mergePr,
+  prListSaturated,
   prMergeReadiness,
   OPEN_PR_POLL_MS,
   type JudgedPrRow,
@@ -517,7 +518,19 @@ function MergeErrorText({
 export function prBadgeTitle(
   label: string | null,
   totals: FleetTotals,
+  /**
+   * Whether any probe behind `totals` came back TRUNCATED, so `totals.total` is a floor.
+   *
+   * The `counted`-with-ready branch below builds its own sentence out of `totals.total` instead of
+   * reusing `label`, so the hedge `formatPrBadge` applies would not have reached it — the pill would
+   * read "300+ PRs waiting" while its own accessible name said "3 of 300 open pull requests". This
+   * is the audit AGENTS.md asks for when a behaviour's honesty changes: every string that restates
+   * the number has to restate the hedge too.
+   */
+  saturated = false,
 ): string {
+  // "at least N" wherever the total is spelled out. `label` already carries its own hedge.
+  const total = saturated ? `${totals.total}+` : `${totals.total}`;
   switch (fleetState(totals)) {
     case "nothing-askable":
       return "No project with a GitHub remote";
@@ -531,7 +544,7 @@ export function prBadgeTitle(
       return "No open pull requests";
     case "counted":
       return totals.ready > 0
-        ? `${totals.ready} of ${totals.total} open pull request${totals.total === 1 ? "" : "s"} ready to merge`
+        ? `${totals.ready} of ${total} open pull request${totals.total === 1 ? "" : "s"} ready to merge`
         : `${label ?? "Pull requests"} — none ready to merge yet`;
   }
 }
@@ -917,9 +930,17 @@ export function OpenPrMenu({
           // as "nothing is open" would erase the user's dismissals, and judging a dismissal against
           // rows we could not read would revive on missing data. Both directions of that mistake
           // end with the app deciding on the user's behalf what it may stop hiding.
+          // A SATURATED READ IS NOT A COMPLETE LIST, so it may not drive pruning. The rule above
+          // ("`rows` is a complete open list") was written before the probe could truncate: at the
+          // cap, a PR that is still open is simply ABSENT, and handing these numbers to Rust would
+          // delete its dismissal record as though it had merged. Omitting them keeps every stored
+          // dismissal — the same "we could not see all of it, so decide nothing" stance the failed
+          // probe takes one branch up. Judging fingerprints against the rows we DID read stays
+          // correct: a row present in a truncated list is still a row we actually read.
+          const listComplete = !rows.some((r) => r.listSaturated);
           const stored = await fetchDismissals(
             scope.projectId,
-            rows.map((r) => r.number),
+            listComplete ? rows.map((r) => r.number) : undefined,
           );
           if (!aliveRef.current || !liveKeysRef.current.has(key)) return;
           const { active, revived } = partitionDismissals(stored, rows);
@@ -1065,9 +1086,28 @@ export function OpenPrMenu({
     [scopesKey, judgedByKey, failedKeys, hiddenByKey],
   );
   const totals = fleetTotals(groups);
+  /**
+   * DID ANY SCOPE'S PROBE COME BACK TRUNCATED — i.e. is the number below a FLOOR rather than a total?
+   *
+   * `gh pr list --limit N` truncates with no signal, so a saturated read cannot be presented as an
+   * exact count: the panel is then missing pull requests, and "Needs merge" is work the founder owes
+   * (bead sparkle-qogah). Derived from the rows themselves rather than from `totals`, because
+   * `fleetTotals` sums lengths and a length cannot say "and there are more".
+   *
+   * ANY scope is enough. With four repos open, one truncated list is one set of hidden rows, and
+   * requiring all of them to be full would hedge exactly never.
+   */
+  const listSaturated = useMemo(
+    () => Array.from(byKey.values()).some((rows) => prListSaturated(rows)),
+    [byKey],
+  );
   // The wide pill's sentence ("3 PRs waiting"), which is also what the accessible name falls back to
-  // when nothing is green. Null at zero or unknown — see `formatPrBadge`.
-  const label = formatPrBadge(totals.known ? totals.total : null);
+  // when nothing is green. Null at zero or unknown — see `formatPrBadge`. Reads "N+ …" when any
+  // probe was truncated, so the pill never states a capped number as the total.
+  const label = formatPrBadge(
+    totals.known ? totals.total : null,
+    listSaturated,
+  );
   /**
    * The WIDE pill's text — the count sentence, or, when everything open has been DISMISSED, what
    * is being held back.
@@ -1126,7 +1166,7 @@ export function OpenPrMenu({
 
   if (compact ? scopes.length === 0 : !wideLabel) return null;
 
-  const badgeTitle = prBadgeTitle(label, totals);
+  const badgeTitle = prBadgeTitle(label, totals, listSaturated);
   const staleNames = staleProjectNames(groups);
   const unreadableNames = unreadableProjectNames(groups);
   /** Sections are drawn for groups that have something in them; an empty tab is covered by the

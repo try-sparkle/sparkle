@@ -9,22 +9,37 @@ import { describe, it, expect } from "vitest";
 import {
   decideFleetReport,
   emptyFleetMemory,
+  hasNewMember,
   type FleetMemory,
   type FleetReportDecision,
   type FleetReportInput,
+  type ReportStamp,
 } from "./pusherFleetReport";
 import {
   evaluateFleetConditions,
   type ConflictingPr,
+  type FleetCondition,
   type FleetConditionId,
   type FleetSnapshot,
+  type StandingDuty,
 } from "./pusherFleet";
+
+/**
+ * A stamp recording that `id` was reported at `at`, covering exactly what `conditions` holds.
+ *
+ * Built from a real `FleetCondition` rather than by hand on purpose: a hand-written stamp is free
+ * to disagree with what `decideFleetReport` actually writes, and a cooldown test whose stamp does
+ * not match the shape production stores proves nothing about production.
+ */
+function stampFor(conditions: readonly FleetCondition[], id: FleetConditionId, at: number) {
+  const c = conditions.find((x) => x.id === id);
+  if (!c) throw new Error(`no ${id} condition in fixture`);
+  return { [id]: { at, agentIds: c.agentIds, members: c.members } };
+}
 
 /** A stamp recording that `id` was reported at `at`, covering exactly `snapshots`. */
 function stamp(snapshots: readonly FleetSnapshot[], id: FleetConditionId, at: number) {
-  const c = evaluateFleetConditions(snapshots, T0).find((x) => x.id === id);
-  if (!c) throw new Error(`no ${id} condition in fixture`);
-  return { [id]: { at, agentIds: c.agentIds } };
+  return stampFor(evaluateFleetConditions(snapshots, T0), id, at);
 }
 import { resolvePusherPolicy } from "./pusherPolicy";
 import { MESSAGES_PER_HOUR, REPEAT_COOLDOWN_MS, numbersIn } from "./pusherGate";
@@ -409,5 +424,289 @@ describe("conflicting PRs reach the report", () => {
       action: "quiet",
       reason: "no-condition",
     });
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+// THE FOUR-HOUR BLIND SPOT, ROUND THREE — the growth rule was VACUOUSLY DEAD for every class whose
+// subject is not an agent.
+//
+// `hasNewMember` read `condition.agentIds`. `duty-overdue` hard-codes that to `[]`, and
+// `pr-conflicting` fills it from RESOLVED OWNERS ONLY — and the PRs that class was built for all
+// carry `ownerAgentId: null`. `[].some(...)` is always false, so for exactly the cases those two
+// classes exist for, growth could not be detected at all. Combined with `fleetObservationMemory`
+// keeping the stamp alive while the class stays active, and with conflicting PRs sitting conflicting
+// for days, a NEW conflicting untested PR was invisible for the full `REPEAT_COOLDOWN_MS` — every
+// time, forever.
+//
+// Every test here asserts the DECISION and the delivered TEXT, never `hasNewMember`'s return value,
+// because the failure being guarded is silence at the surface and nothing else would have caught it.
+// The negative controls sit next to the positives on purpose: "it reported" is only evidence the
+// blind spot is closed if "it stayed quiet when nothing changed" still holds beside it.
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+describe("growth is detectable for conditions with no agent", () => {
+  const TEN_MIN = 10 * 60_000;
+  const LATER = T0 + TEN_MIN;
+
+  const conflict = (over: Partial<ConflictingPr> = {}): ConflictingPr => ({
+    pr: 1091,
+    branch: "sparkle/roborev-backlog-notice-collapse",
+    // THE MOTIVATING CASE, and the reason the old rule was dead: a descriptive branch resolves to no
+    // owner, so this class's `agentIds` is empty for precisely the PRs it was built to report.
+    ownerAgentId: null,
+    kind: "conflicting",
+    commitsBehind: 220,
+    evidence: "no-checks-ran",
+    unresolvedSecs: 4 * 60 * 60,
+    ...over,
+  });
+
+  /** Memory that has already seen `conflicts` once AND reported them at `T0`. */
+  function reportedConflicts(
+    stamped: readonly ConflictingPr[],
+    current: readonly ConflictingPr[],
+  ): FleetMemory {
+    return {
+      ...emptyFleetMemory(),
+      lastConditions: evaluateFleetConditions([], LATER, [], current),
+      lastReported: stampFor(
+        evaluateFleetConditions([], T0, [], stamped),
+        "pr-conflicting",
+        T0,
+      ),
+    };
+  }
+
+  it("reports a NEW conflicting PR that appears inside the cooldown", () => {
+    const first = conflict();
+    const fresh = conflict({ pr: 1200, branch: "sparkle/fresh-conflict", unresolvedSecs: 60 });
+
+    const d = decide({
+      snapshots: [],
+      conflicts: [first, fresh],
+      now: LATER,
+      memory: reportedConflicts([first], [first, fresh]),
+    });
+
+    if (d.action !== "send") throw new Error(`expected a send, got ${JSON.stringify(d)}`);
+    expect(d.conditionIds).toEqual(["pr-conflicting"]);
+    // THE ACTUAL DELIVERABLE: the new PR's number reaches the founder, not merely a decision object.
+    expect(d.text).toContain("#1200");
+    expect(d.text).toContain("conflicting, and therefore untested");
+    expect(d.text).toContain("2 open PRs cannot merge");
+  });
+
+  it("stays quiet when the SAME conflicting PR merely persists", () => {
+    const only = conflict();
+    const d = decide({
+      snapshots: [],
+      conflicts: [only],
+      now: LATER,
+      memory: reportedConflicts([only], [only]),
+    });
+    expect(d).toMatchObject({ action: "quiet", reason: "all-conditions-cooled" });
+  });
+
+  // GROWTH-ONLY IS PRESERVED for the new fingerprint too — a PR that gets rebased and drops out is
+  // not news, and re-reporting the remainder would be the churn the header refuses.
+  it("stays quiet when the set of conflicting PRs SHRINKS", () => {
+    const kept = conflict();
+    const gone = conflict({ pr: 1200, branch: "sparkle/fresh-conflict" });
+    const d = decide({
+      snapshots: [],
+      conflicts: [kept],
+      now: LATER,
+      memory: reportedConflicts([kept, gone], [kept]),
+    });
+    expect(d).toMatchObject({ action: "quiet", reason: "all-conditions-cooled" });
+  });
+
+  // A PR is not merely ONE MORE thing when it goes conflicting — it is the moment it stops being
+  // tested at all, which is the whole fact this class carries. So the transition has to register as
+  // growth even though the PR was already in the report.
+  it("reports a PR that goes from stale to CONFLICTING inside the cooldown", () => {
+    const drifting = conflict({ kind: "stale", evidence: "n/a" });
+    const nowConflicting = conflict();
+    const d = decide({
+      snapshots: [],
+      conflicts: [nowConflicting],
+      now: LATER,
+      memory: reportedConflicts([drifting], [nowConflicting]),
+    });
+    if (d.action !== "send") throw new Error("expected a send about the newly conflicting PR");
+    expect(d.text).toContain("conflicting, and therefore untested");
+  });
+
+  // ...and the reverse trip is an IMPROVEMENT, so it must not re-open anything. This is what keeps
+  // the severity member growth-only rather than a flap generator: a conflicting PR emits BOTH
+  // members, so going stale is a strict subset of what was already said.
+  it("stays quiet when a conflicting PR becomes merely stale", () => {
+    const wasConflicting = conflict();
+    const nowStale = conflict({ kind: "stale", evidence: "n/a" });
+    const d = decide({
+      snapshots: [],
+      conflicts: [nowStale],
+      now: LATER,
+      memory: reportedConflicts([wasConflicting], [nowStale]),
+    });
+    expect(d).toMatchObject({ action: "quiet", reason: "all-conditions-cooled" });
+  });
+
+  const duty = (over: Partial<StandingDuty> = {}): StandingDuty => ({
+    name: "the hourly improvement pass (logs + beads backlog)",
+    intervalMs: HOUR,
+    lastRunAt: T0 - 9 * HOUR,
+    ...over,
+  });
+
+  function reportedDuties(
+    stamped: readonly StandingDuty[],
+    current: readonly StandingDuty[],
+  ): FleetMemory {
+    return {
+      ...emptyFleetMemory(),
+      lastConditions: evaluateFleetConditions([], LATER, current),
+      lastReported: stampFor(evaluateFleetConditions([], T0, stamped), "duty-overdue", T0),
+    };
+  }
+
+  it("reports a SECOND duty that falls over inside the cooldown", () => {
+    const first = duty();
+    const second = duty({ name: "the nightly release check", lastRunAt: T0 - 30 * HOUR });
+
+    const d = decide({
+      snapshots: [],
+      duties: [first, second],
+      now: LATER,
+      memory: reportedDuties([first], [first, second]),
+    });
+
+    if (d.action !== "send") throw new Error(`expected a send, got ${JSON.stringify(d)}`);
+    expect(d.conditionIds).toEqual(["duty-overdue"]);
+    expect(d.text).toContain("the nightly release check");
+    expect(d.text).toContain("2 standing duties have stopped running");
+  });
+
+  it("stays quiet when the SAME duty is merely still overdue", () => {
+    const only = duty();
+    const d = decide({
+      snapshots: [],
+      duties: [only],
+      now: LATER,
+      memory: reportedDuties([only], [only]),
+    });
+    expect(d).toMatchObject({ action: "quiet", reason: "all-conditions-cooled" });
+  });
+
+  // A stamp with no fingerprint cannot answer "did I already say this?", and the founder's rule is
+  // that a withheld item is invisible — nothing renders to say it was dropped. So the unanswerable
+  // case must resolve to SPEAKING. Nothing in the module writes such a stamp; this pins the
+  // behaviour for one written by an older build or by a caller outside it.
+  it("FAILS OPEN on a stamp that recorded no fingerprint", () => {
+    const only = conflict();
+    const legacy: Record<string, ReportStamp> = { "pr-conflicting": { at: T0, agentIds: [] } };
+    const d = decide({
+      snapshots: [],
+      conflicts: [only],
+      now: LATER,
+      memory: {
+        ...emptyFleetMemory(),
+        lastConditions: evaluateFleetConditions([], LATER, [], [only]),
+        lastReported: legacy,
+      },
+    });
+    if (d.action !== "send") throw new Error("a stamp that cannot be compared must not silence");
+    expect(d.text).toContain("#1091");
+  });
+
+  it("records the fingerprint on every stamp it writes", () => {
+    const only = conflict();
+    const d = decide({
+      snapshots: [],
+      conflicts: [only],
+      memory: {
+        ...emptyFleetMemory(),
+        lastConditions: evaluateFleetConditions([], T0, [], [only]),
+      },
+    });
+    if (d.action !== "send") throw new Error("expected a send");
+    // Without this the next sweep hits the fail-open branch and the cooldown stops existing.
+    expect(d.memoryOnDelivered.lastReported["pr-conflicting"]!.members).toEqual([
+      "pr:1091",
+      "pr:1091:conflicting",
+    ]);
+  });
+
+  // THE REGRESSION GUARD. `quota-blocked` already worked; the fingerprint must be an addition that
+  // leaves it byte-identical in behaviour, and its stamp must still carry the agents the surface
+  // reads. The shrink and flap tests above run through this same new code path.
+  it("leaves quota-blocked's stamp and growth behaviour unchanged", () => {
+    const two = [walled("q1"), walled("q2")];
+    const quiet = decide({
+      snapshots: two,
+      memory: seen(two, { lastReported: stamp(two, "quota-blocked", T0 - TEN_MIN) }),
+    });
+    expect(quiet).toMatchObject({ action: "quiet", reason: "all-conditions-cooled" });
+
+    const three = [...two, walled("q3")];
+    const grown = decide({
+      snapshots: three,
+      memory: seen(three, { lastReported: stamp(two, "quota-blocked", T0 - TEN_MIN) }),
+    });
+    if (grown.action !== "send") throw new Error("expected the new agent to be reported");
+    expect(grown.text).toContain("3 agents are quota-blocked");
+    const written = grown.memoryOnDelivered.lastReported["quota-blocked"]!;
+    expect(written.agentIds).toEqual(["q1", "q2", "q3"]);
+    expect(written.members).toEqual(["agent:q1", "agent:q2", "agent:q3"]);
+  });
+});
+
+// DIRECT UNIT TESTS for the growth predicate. The decision-level tests above are the ones that
+// matter — these pin the edges that are hard to reach through `decideFleetReport` (an empty
+// fingerprint is unreachable through it today, because every shipped class fills one).
+describe("hasNewMember", () => {
+  const conditionOf = (members: string[]): FleetCondition => ({
+    id: "pr-conflicting",
+    agentIds: [],
+    members,
+    measured: [],
+    text: "",
+  });
+
+  it("is not growth when the condition has never been reported", () => {
+    expect(hasNewMember(conditionOf(["pr:1"]), undefined)).toBe(false);
+  });
+
+  it("is growth when the fingerprint gains a member", () => {
+    expect(hasNewMember(conditionOf(["pr:1", "pr:2"]), { at: T0, agentIds: [], members: ["pr:1"] }))
+      .toBe(true);
+  });
+
+  it("is not growth when the fingerprint is unchanged", () => {
+    expect(
+      hasNewMember(conditionOf(["pr:2", "pr:1"]), { at: T0, agentIds: [], members: ["pr:1", "pr:2"] }),
+    ).toBe(false);
+  });
+
+  it("is not growth when the fingerprint shrinks", () => {
+    expect(
+      hasNewMember(conditionOf(["pr:1"]), { at: T0, agentIds: [], members: ["pr:1", "pr:2"] }),
+    ).toBe(false);
+  });
+
+  // THE CASE THAT WAS DEAD. Empty `agentIds` on both sides is the normal state of `pr-conflicting`
+  // and the ONLY state of `duty-overdue`; the old predicate could not return true for either.
+  it("sees growth even when BOTH sides have no agent ids at all", () => {
+    expect(
+      hasNewMember(conditionOf(["duty:a", "duty:b"]), { at: T0, agentIds: [], members: ["duty:a"] }),
+    ).toBe(true);
+  });
+
+  it("FAILS OPEN when the condition cannot be fingerprinted", () => {
+    expect(hasNewMember(conditionOf([]), { at: T0, agentIds: [], members: ["pr:1"] })).toBe(true);
+  });
+
+  it("FAILS OPEN when the stamp recorded no fingerprint", () => {
+    expect(hasNewMember(conditionOf(["pr:1"]), { at: T0, agentIds: [] })).toBe(true);
   });
 });

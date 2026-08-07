@@ -29,7 +29,7 @@
 import { AGENT_STATUS, type AgentTabStatus } from "@sparkle/ui";
 import { agentDisplayName } from "../engine/agentDisplayName";
 import { isTopLevelAgent } from "../engine/agentOrdering";
-import { STATUS_BANDS, bandOfStatus, type StatusBand } from "../engine/buildSections";
+import { ASKING_BANDS, STATUS_BANDS, bandOfStatus, type StatusBand } from "../engine/buildSections";
 import { resolveStage, type WorkflowStageId } from "../engine/workflowStage";
 import { isDismissibleRed } from "../engine/alertDismissal";
 import {
@@ -330,6 +330,111 @@ export function isCalmBand(status: AgentTabStatus | undefined): boolean {
   return band !== "needs_you" && band !== "questions" && status !== "unmerged";
 }
 
+/** Is this agent's work WAITING ON THE USER — i.e. is it something he owes an action on?
+ *
+ *  FOUNDER'S RULING, 2026-08-05 (bead sparkle-qogah): "We should never hide a row that needs action
+ *  from me." Asked directly whether "Needs merge" belongs in the concierge's WANTS YOU column, he
+ *  chose: "Yes, but as one honest group — one row reading '27 need merge' that expands in place.
+ *  Nothing hidden, count is true, column stays readable."
+ *
+ *  So this is DELIBERATELY WIDER THAN THE BAND, and the two must not be collapsed into each other:
+ *
+ *   • `band === "needs_you"` is the INTERRUPTION BUDGET — what earns a red nudge card and a tab
+ *     glow. `unmerged` is correctly out of it (see `conciergeBand`): landing state must not buy an
+ *     interruption, and 27 of 51 agents in that band would have meant 27 nudge cards.
+ *   • THIS predicate is the ACCOUNTING — what the column may not report zero of while it exists.
+ *     Excluding `unmerged` from the interruption was right; excluding it from the COUNT is what let
+ *     column one say "0 Need you" over a fleet with 27 un-landed PRs. A number that sounds complete
+ *     while concealing work is the exact false confidence the bead exists to remove.
+ *
+ *  The fix for "too many cards" is GROUPING, not exclusion — see conciergeDigest's `unmerged`
+ *  variant, which collapses them into the one honest line the founder asked for.
+ *
+ *  IT IS THE ASKING BANDS PLUS `unmerged`, and the narrowness is a ruling, not an oversight. In
+ *  the same interview he ruled "Done — your turn" / idle / finished INFORMATIONAL: those may be
+ *  capped, summarised, or dropped. Only a blocking prompt and un-landed work are actions he owes.
+ *  Widening this to `idle` would put the whole `done` band back in the count and make the number
+ *  meaningless again, in the other direction.
+ *
+ *  READS `ASKING_BANDS` RATHER THAN NAMING `needs_you`, because naming it was wrong the moment a
+ *  fourth band landed: `questions` means the agent cannot proceed without you, and this predicate
+ *  counted it as calm — so an all-questions fleet made column one say "0 Need you" while every
+ *  agent on it was blocked on him. Identical to the `unmerged` defect two paragraphs up, entered
+ *  through the newest band, and the FOURTH surface in this change set with one cause: a set of
+ *  askers enumerated by name or colour instead of derived from the taxonomy. Derived here, so the
+ *  fifth band is a decision in engine/buildSections rather than another silent omission. */
+export function isOwedAction(a: Pick<ConciergeAgent, "band" | "status">): boolean {
+  return ASKING_BANDS.includes(a.band) || a.status === "unmerged";
+}
+
+/** The THREE GATES the concierge surfaces anything through: in scope (per the pin), not muted, and
+ *  not already spoken for by an ancestor's row (either because it is represented there, or because
+ *  this agent is only a routing hop for a descendant's red).
+ *
+ *  ONE EXPRESSION, used by `buildConciergeFeed` to accumulate `scopedCounts` and by every selector
+ *  below. That is why it is a function and not four inline `&&`s repeated per call site: a count the
+ *  column STATES and a list the column SHOWS that are gated by two copies of this rule is precisely
+ *  how the vitals line and the thread came to disagree (see the `scopedCounts` accumulation below).
+ *
+ *  `services/conciergeProactive.accountedNeedsYou` still spells the same four terms out by hand —
+ *  it predates this helper and lives one layer up. It should delegate here; until it does, the two
+ *  are pinned equal by `conciergeFeed.test.ts` → "the two copies of the accounting gate agree",
+ *  which compares `accountedNeedsYou` against `accountedOwed`'s needs-you half over a mixed fleet.
+ *
+ *  That sentence used to claim the pin WITHOUT the test existing (roborev 59062): `accountedOwed`
+ *  had no reference outside this file, so a comment asserted a guarantee nobody had written. If you
+ *  make the hand-written copy delegate, delete the test with it — but never the other way round. */
+export function isAccounted(
+  a: Pick<ConciergeAgent, "inScope" | "muted" | "representedElsewhere" | "redIsInherited">,
+): boolean {
+  return a.inScope && !a.muted && !a.representedElsewhere && !a.redIsInherited;
+}
+
+/** Every agent in the feed, in rendered order, across all projects. */
+function allAgents(feed: ConciergeFeed): ConciergeAgent[] {
+  return feed.projects.flatMap((p) => p.agents);
+}
+
+/** What the column ACCOUNTS FOR, split by why. `total` is the number that may never read zero while
+ *  either half is non-empty — the founder's "nothing hidden, count is true".
+ *
+ *  The two halves are DISJOINT by construction (`unmerged` bands `done`, never `needs_you`), so
+ *  `total` is a sum and not a union that could double-count one agent. */
+export interface ConciergeOwedCounts {
+  /** Blocking prompts: waiting · approval · blocked · errored. Equal to `scopedCounts.needs_you`. */
+  needsYou: number;
+  /** Committed-but-unlanded work — "Needs merge". */
+  unmerged: number;
+  /** `needsYou + unmerged`. Kept as a field rather than left to each caller to add up: the whole
+   *  point is that one number is stated, and a caller that forgot a term is the bug again. */
+  total: number;
+}
+
+/** Agents the column owes an action on, in feed order (Needs you first, then the unmerged). */
+export function accountedOwed(feed: ConciergeFeed): ConciergeAgent[] {
+  return allAgents(feed).filter((a) => isAccounted(a) && isOwedAction(a));
+}
+
+/** The un-landed half of {@link accountedOwed} — the digest's `unmerged` pool.
+ *
+ *  NOT filtered to `topLevel`, unlike the needs-you digest's pool. A `rows` line's count is a
+ *  promise that its click leaves exactly that many ROWS standing in column two, so a worker folded
+ *  into it would state a number the click cannot produce. The unmerged line makes no such promise:
+ *  it EXPANDS IN PLACE (`ConciergeDigestGroup.memberIds`), so every member it counts is reachable
+ *  from the line itself whether or not column two would draw a row for it. Filtering here would
+ *  reintroduce the omission this whole change exists to remove — quietly, for exactly the workers
+ *  with the least other representation. */
+export function accountedUnmerged(feed: ConciergeFeed): ConciergeAgent[] {
+  return allAgents(feed).filter((a) => isAccounted(a) && a.status === "unmerged");
+}
+
+/** The honest tally column one states. See {@link ConciergeOwedCounts} and {@link isOwedAction}. */
+export function owedCounts(feed: ConciergeFeed): ConciergeOwedCounts {
+  const owed = accountedOwed(feed);
+  const unmerged = owed.filter((a) => a.status === "unmerged").length;
+  return { needsYou: owed.length - unmerged, unmerged, total: owed.length };
+}
+
 /** The do-not-interrupt topics a feed item is keyed under, for sparklePrefsStore.shouldInterrupt:
  *  the agent id ("never interrupt me about THIS agent") and a `status:<status>` event-kind slug
  *  ("never interrupt me about approvals"). Muting EITHER mutes the item. Exported so the
@@ -563,11 +668,12 @@ export function buildConciergeFeed(input: ConciergeFeedInput): ConciergeFeed {
       // hop is excluded, and the descendant it was standing in for stops being represented and is
       // counted in its place — so the total is unchanged and the vitals line still equals what
       // column one accounts for.
-      if (inScope && !muted && !representedElsewhere && !redIsInherited) {
-        scopedCounts[band]++;
-        projectScoped[band]++;
-      }
-      return {
+      //
+      // THE GATE ITSELF IS `isAccounted`, not four inline terms — the selectors above
+      // (`accountedOwed` / `accountedUnmerged` / `owedCounts`) apply the identical expression to the
+      // built feed, so the number the column states and the items it can show are one population by
+      // construction rather than two copies that have to be kept in step.
+      const out: ConciergeAgent = {
         id: a.id,
         name: displayName(a),
         // This row is `working` only because its workers are. See ConciergeAgent.rolledUpGreen.
@@ -589,6 +695,11 @@ export function buildConciergeFeed(input: ConciergeFeedInput): ConciergeFeed {
         representedElsewhere,
         representedBy: speaker,
       };
+      if (isAccounted(out)) {
+        scopedCounts[band]++;
+        projectScoped[band]++;
+      }
+      return out;
     });
     agents.sort(compareAgents);
     for (const b of STATUS_BANDS) counts[b.id] += projectCounts[b.id];

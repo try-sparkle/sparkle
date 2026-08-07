@@ -96,6 +96,19 @@ export interface PrRow {
   /** Which `pr_owner` source produced `agentId` ("created" | "pr-body" | "worktree-branch" |
    *  "branch-name"); absent alongside a null owner. */
   agentIdSource?: string | null;
+  /**
+   * Whether the LIST this row arrived in filled its {@link OPEN_PR_QUERY_LIMIT}-row window — i.e.
+   * whether there are open pull requests this menu is NOT showing.
+   *
+   * A property of the PROBE, identical on every row, carried per-row for the same reason
+   * `viewerCanMerge` is: it keeps the IPC reply a plain array. Losing it on an empty list costs
+   * nothing, because a zero-row list cannot be truncated.
+   *
+   * `undefined` means the Rust side did not say (a partial fixture, or a build predating the
+   * field), which is NOT `true` — see {@link prListSaturated}, which falls back to comparing the
+   * count against the cap so an absent flag still cannot present a truncated list as complete.
+   */
+  listSaturated?: boolean;
 }
 
 /** The open PRs waiting in `root`'s repo, or null when it could not be determined (no `gh`, unauthed,
@@ -703,20 +716,52 @@ export function prProbeBlockedCount(prs: readonly PrJudgeable[]): number {
  * reassurance the badge exists to prevent. Zero renders nothing because an always-present "0" is
  * chrome noise; unknown renders nothing because we have nothing to say.
  */
-export function formatPrBadge(count: number | null): string | null {
+export function formatPrBadge(
+  count: number | null,
+  saturated = false,
+): string | null {
   if (count === null || count <= 0) return null;
-  // The probe asks `gh` for at most OPEN_PR_QUERY_LIMIT rows, so a count AT the limit means "at
-  // least this many" — rendering a bare "100" would silently understate, which is the same
-  // false-reassurance failure the null-vs-zero rule guards against, one step further out.
-  if (count >= OPEN_PR_QUERY_LIMIT) return `${OPEN_PR_QUERY_LIMIT}+ PRs waiting`;
+  // A TRUNCATED COUNT IS A FLOOR, AND MUST READ AS ONE. `gh pr list --limit N` gives no truncation
+  // signal, so a full window means "at least this many" — and rendering a bare "100" against 400
+  // waiting PRs is the same false reassurance the null-vs-zero rule guards against, one step
+  // further out, on a number that counts work the founder OWES (bead sparkle-qogah).
+  //
+  // Two ways to know: the flag the Rust probe now stamps on every row (authoritative, and correct
+  // at any cap), and the count-vs-cap comparison (a BACKSTOP for a reply that carries no flag —
+  // a partial fixture, or a build predating the field). Either is enough to hedge.
+  if (saturated || count >= OPEN_PR_QUERY_LIMIT) return `${count}+ PRs waiting`;
   return count === 1 ? "1 PR waiting" : `${count} PRs waiting`;
 }
 
-/** Row cap on the `gh pr list` query, mirrored from the Rust probe. A count that reaches this is
- *  saturated, not exact — see `formatPrBadge`. Kept in sync deliberately rather than plumbed
- *  through the IPC boundary: it is a display concern, and the alternative is a second field on
- *  every reply that only ever means "was the query truncated". */
-export const OPEN_PR_QUERY_LIMIT = 100;
+/**
+ * Does this list of rows come from a probe that FILLED its window — i.e. are there open pull
+ * requests missing from it?
+ *
+ * Reads the flag Rust stamps on every row, and falls back to the row count against the cap when no
+ * row carries one. The fallback is the load-bearing half of the "absent is not false" rule: an
+ * `undefined` flag on a list that is exactly cap-length must not be read as "complete", or an older
+ * reply silently reinstates the very truncation this discloses.
+ *
+ * Takes `readonly PrRow[] | null` because that is what callers hold: `null` is "we could not ask",
+ * which is unknown-not-saturated — there is no list to have truncated.
+ */
+export function prListSaturated(rows: readonly PrRow[] | null): boolean {
+  if (!rows || rows.length === 0) return false;
+  return (
+    rows.some((r) => r.listSaturated === true) ||
+    rows.length >= OPEN_PR_QUERY_LIMIT
+  );
+}
+
+/** Row cap on the `gh pr list` query, mirrored from the Rust probe's `OPEN_PR_LIST_LIMIT`. A count
+ *  that reaches this is saturated, not exact — see `formatPrBadge`.
+ *
+ *  The mirror is PINNED from the Rust side by `the_js_side_mirrors_the_same_open_pr_row_cap`, which
+ *  reads this file. It used to be "kept in sync deliberately", i.e. by a comment — and a comment
+ *  cannot fail, so a stale copy here would silently understate the badge. The saturation FLAG on
+ *  each row is the authoritative channel now; this constant is the backstop for a reply that has
+ *  none. */
+export const OPEN_PR_QUERY_LIMIT = 300;
 
 /** How often to re-probe. This shells out to `gh` over the network, so it is deliberately far
  *  slower than the 30s sidebar poll — an unmerged PR is a slow-moving fact, and a chatty probe

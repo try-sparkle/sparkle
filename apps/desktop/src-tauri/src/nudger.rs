@@ -303,6 +303,13 @@ impl NudgeFlags {
             .unwrap_or_else(|e| e.into_inner())
             .remove(agent_id);
     }
+    fn get(&self, agent_id: &str) -> Option<NudgeFlag> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(agent_id)
+            .cloned()
+    }
     fn agent_ids(&self) -> Vec<String> {
         self.0
             .lock()
@@ -497,6 +504,19 @@ fn tick<R: Runtime>(app: &AppHandle<R>, tracked: &mut HashMap<String, Tracked>, 
             due_at_ms: now,
         });
         if now < entry.due_at_ms {
+            // NOTHING BETWEEN LOOKS. A repair here was tried and reverted (roborev 59061, High): its
+            // only gate was `state.escalated()`, which `nudge_ladder::step` refreshes ONLY on a due
+            // look, so on the last rung it is a snapshot up to 600s stale. Running it on the 1s tick
+            // made `nudger_clear_flag` a no-op for founder rows — a consumer's clear came back
+            // within a second, on recovered agents too, with a fresh `raised_at_ms` that reset the
+            // row's age. A channel that reports resolved problems stops being read, which is the
+            // failure this module's header names.
+            //
+            // The founder's rule is still met by `apply_flags`, which raises UNCONDITIONALLY on
+            // every flagging look, so a cleared row on a still-wedged agent returns on the next look
+            // rather than never. The cost is honest and bounded: up to one rung of latency. Gating a
+            // faster repair on OUTPUT rather than on stale ladder state is the real fix and is not
+            // attempted here.
             continue;
         }
 
@@ -619,12 +639,21 @@ fn record_outcome(state: &mut AgentState, action: &Action, outcome: &Result<Deli
     }
 }
 
-/// Drop flags whose agent's terminal is GONE.
+/// Retire flags whose agent's terminal is GONE — dropping the machine-consumed ones, and KEEPING
+/// the ones a human still owes an answer to.
 ///
 /// `spin_down` and a natural exit both detach the observer, but neither touched `NudgeFlags` — so a
-/// founder-level "stuck for 15m" row could outlive the session it described and have the pusher
-/// chase a terminal that no longer exists. Split out of `tick` so it is assertable without an
-/// `AppHandle`.
+/// "stuck for 15m" row could outlive the session it described and have the pusher chase a terminal
+/// that no longer exists. Split out of `tick` so it is assertable without an `AppHandle`.
+///
+/// A DEAD-TERMINAL ROW IS DROPPED, whatever its target. Keeping founder rows and marking them
+/// `terminal_gone` was tried and removed (knightwatch, PR #1353): NOTHING read the mark. The
+/// TypeScript `NudgeFlag` never mirrored the field and the Pusher does not consume nudger flags at
+/// all, so the retained row reached no surface — it bought an extra state, an unbounded table (a
+/// detached agent is never ticked again, so only an explicit `nudger_clear_flag` could remove it)
+/// and its own tests, in exchange for the owed action still being invisible. Deleting it is the
+/// honest answer: this module cannot be the thing that remembers an ask across a dead PTY, and
+/// pretending otherwise hid the gap instead of recording it.
 fn sweep_dead_flags(flags: &NudgeFlags, live_ids: &std::collections::HashSet<&str>) {
     for id in flags.agent_ids() {
         if !live_ids.contains(id.as_str()) {
@@ -749,11 +778,26 @@ fn deliver_with<W: FnMut(&str) -> Result<(), String>>(
     Ok(Delivery::Submitted)
 }
 
-/// Apply one tick's flag effects, and return a flag that was newly raised (so the caller can emit
-/// its event).
+/// Apply one tick's flag effects, and return a flag that was newly ESCALATED (so the caller can
+/// emit its event).
 ///
 /// Takes `&NudgeFlags` rather than an `AppHandle` so both halves — the raise AND the clear-on-
 /// recovery — are testable without standing up a Tauri app.
+///
+/// ── THE ROW'S EXISTENCE AND ITS ESCALATION ARE DIFFERENT QUESTIONS ───────────────────────────
+/// This used to read `let target = decision.escalate?;` ABOVE the only `flags.raise`, which tied
+/// the two together and lost the row. `escalate` is `Some` only on the tick a target RISES, and
+/// escalation is a high-water mark whose top is `Founder` — so once the founder has been flagged,
+/// `escalate` is `None` for the rest of the episode, and the episode only ends when the agent
+/// produces OUTPUT. `nudger_clear_flag` lets a consumer drop a row "once it has acted on it", and
+/// acting does not always unstick the agent (`authRecovery`'s resume can fail — that is what its
+/// `progressed` field is for). Compose the two and an agent stuck on a question the founder must
+/// answer was silently absent from `nudger_flags()` for the rest of its life, with nothing to
+/// report that it had been dropped. That is a row needing action hidden by the surface whose whole
+/// job is to raise it.
+///
+/// So the raise is UNCONDITIONAL on every flagging look — the shape `conflict_watch::apply_flags`
+/// already has — and `escalate` decides only what the caller emits.
 fn apply_flags(
     flags: &NudgeFlags,
     agent_id: &str,
@@ -766,19 +810,59 @@ fn apply_flags(
     if decision.hash_changed {
         flags.clear(agent_id);
     }
-    let target = decision.escalate?;
-    let flag = NudgeFlag {
+    let target = decision.flagged?;
+    // Carry the ORIGINAL raise time across the refresh, the same correction `conflict_watch` took
+    // (roborev 57873): a row whose age restarted every look would tell a reader the agent has been
+    // stuck for ten minutes when it has been stuck for six hours. `hash_changed` already cleared
+    // any previous row above, so a NEW episode correctly gets a new timestamp — and so does a row
+    // a consumer cleared, because there is then nothing left to carry.
+    let flag = build_flag(agent_id, target, state, flags.get(agent_id));
+    flags.raise(flag.clone());
+    decision.escalate.map(|_| flag)
+}
+
+/// Build the row for one flagging look. Shared by the per-look refresh and the between-looks
+/// repair so the two cannot drift into disagreeing about what a founder-level row says.
+fn build_flag(
+    agent_id: &str,
+    target: nudge_ladder::Escalation,
+    state: &AgentState,
+    previous: Option<NudgeFlag>,
+) -> NudgeFlag {
+    NudgeFlag {
         agent_id: agent_id.to_string(),
         target: target.as_str().to_string(),
-        raised_at_ms: now_ms(),
+        raised_at_ms: previous.map(|f| f.raised_at_ms).unwrap_or_else(now_ms),
         nudges: state.attempts(),
         delivered: state.delivered(),
         blocked_by: state.last_blocked().map(str::to_string),
         silent_secs: state.silent_secs(),
-    };
-    flags.raise(flag.clone());
-    Some(flag)
+        // Live by construction: this is only built while the agent is still being ticked, which
+        // requires a live observer. `sweep_dead_flags` is the one place that sets it.
+    }
 }
+
+/// Put back a FOUNDER-level row a consumer cleared, without waiting out the current rung.
+///
+/// ── WHY THE PER-LOOK REFRESH IS NOT ENOUGH ON ITS OWN ────────────────────────────────────────
+/// `apply_flags` only runs when an agent is DUE for a look, and the ladder's last rung is 600s. So
+/// with the refresh alone, a founder-level row cleared just after a look is invisible for up to ten
+/// minutes (plus the consumer's own 30s poll) while the agent is still wedged. Ten minutes is not
+/// hours — `conflict_watch`'s equivalent gap is its 7200s rung — but the rule it violates is
+/// absolute: a row the founder owes is never hidden, and "for a bounded while" is still hidden.
+///
+/// This runs on the 1s tick instead, so the window is one tick. It is deliberately NARROW:
+///
+///   * FOUNDER ONLY. A concierge row is consumed by machinery, which is exactly the consumer that
+///     benefits from `nudger_clear_flag` being able to suppress a row it just handled; it keeps its
+///     rung-long quiet period. The founder's row is the one the P0 rule is about.
+///   * ONLY WHEN THE ROW IS ABSENT. A present row is left alone — refreshing counters every second
+///     would rewrite the table 600 times per rung for no new information.
+///   * NO EVENT. `nudger://escalation` means a target rose; a restored row did not escalate. The
+///     pull (`nudger_flags`) is the channel — the module header is explicit that the event is "an
+///     optimisation on top, not the channel" — so the consumer picks this up on its next poll.
+///
+/// Nothing here can loop forever: the episode reset clears `escalated`, so an agent that produces
 
 fn action_name(action: &Action) -> &'static str {
     match action {
@@ -1320,7 +1404,7 @@ mod tests {
             delivered: 3,
             blocked_by: None,
             silent_secs: 900,
-        };
+            };
         flags.raise(mk("concierge", 1));
         flags.raise(mk("founder", 2));
         let listed = flags.list();
@@ -1337,13 +1421,31 @@ mod tests {
         );
     }
 
+    /// A look that both SITS AT `flagged` and newly escalated to it — the tick a threshold is
+    /// crossed. Every later look of the same episode is `refresh` below.
     fn decision(
+        escalate: Option<nudge_ladder::Escalation>,
+        hash_changed: bool,
+    ) -> nudge_ladder::Decision {
+        look(escalate, escalate, hash_changed)
+    }
+
+    /// A later look at a level already reached: still a flagging look, nothing NEW escalated. This
+    /// is every tick of a wedged agent after its first founder flag, and the shape the raise used
+    /// to return early on.
+    fn refresh(flagged: nudge_ladder::Escalation) -> nudge_ladder::Decision {
+        look(Some(flagged), None, false)
+    }
+
+    fn look(
+        flagged: Option<nudge_ladder::Escalation>,
         escalate: Option<nudge_ladder::Escalation>,
         hash_changed: bool,
     ) -> nudge_ladder::Decision {
         nudge_ladder::Decision {
             action: Action::Observe,
             escalate,
+            flagged,
             rung: 8,
             hash_changed,
             refusal: None,
@@ -1351,15 +1453,16 @@ mod tests {
         }
     }
 
-    /// A flag must not outlive the terminal it describes.
+    /// A MACHINE-CONSUMED flag must not outlive the terminal it describes: the concierge has
+    /// nothing to do about an agent whose PTY is gone, so chasing it is pure noise.
     #[test]
-    fn a_flag_is_dropped_when_its_terminal_is_gone() {
+    fn a_concierge_flag_is_dropped_when_its_terminal_is_gone() {
         let flags = NudgeFlags::default();
         for id in ["alive", "gone"] {
             apply_flags(
                 &flags,
                 id,
-                &decision(Some(nudge_ladder::Escalation::Founder), false),
+                &decision(Some(nudge_ladder::Escalation::Concierge), false),
                 &AgentState::default(),
             );
         }
@@ -1375,6 +1478,28 @@ mod tests {
             "the dead session's flag must go; the live one must stay"
         );
     }
+
+    /// ...and that is true of a FOUNDER row too. Keeping those and marking them `terminal_gone` was
+    /// removed because nothing read the mark (knightwatch, PR #1353): no TypeScript mirror, no
+    /// Pusher consumer. A retained row reached no surface, could only be removed by an explicit
+    /// clear (nothing ticks a detached agent), and so grew without bound. One rule for every target
+    /// is the smaller thing that behaves the same where it counts.
+    #[test]
+    fn a_dead_terminal_drops_a_founder_row_too() {
+        let flags = NudgeFlags::default();
+        apply_flags(
+            &flags,
+            "gone",
+            &decision(Some(nudge_ladder::Escalation::Founder), false),
+            &AgentState::default(),
+        );
+        assert_eq!(flags.list().len(), 1, "precondition: flagged at founder level");
+
+        sweep_dead_flags(&flags, &std::collections::HashSet::new());
+
+        assert!(flags.list().is_empty(), "a dead PTY takes its row with it, whatever the target");
+    }
+
 
     // ══ THE TICK ITSELF ═════════════════════════════════════════════════════════════════════════
 
@@ -1425,6 +1550,75 @@ mod tests {
             "and the pusher must be told WHY, not handed a null that reads as 'never writable'"
         );
     }
+
+    /// THE CLEARED FLAG THAT NEVER CAME BACK — the founder's rule is "never hide a row that needs
+    /// action from me", and this is that row vanishing from the surface whose whole job is to raise it.
+    ///
+    /// `nudger_clear_flag` lets a consumer drop a row "once it has acted on it", and acting does not
+    /// always unstick the agent (`authRecovery`'s resume can fail; its own `progressed` field exists
+    /// because it can). Escalation is a HIGH-WATER MARK, so once the founder level is reached
+    /// `decision.escalate` is `None` for the rest of the episode, and the episode only ends when the
+    /// agent produces OUTPUT — exactly what a wedged agent never does. With the raise sitting below
+    /// an early return on `escalate`, the row's EXISTENCE depended on the escalation RISING, so an
+    /// agent stuck on a question the founder must answer was silently absent from `nudger_flags()`
+    /// for the rest of its life, with nothing to report that it had been dropped.
+    ///
+    /// Asserted on what `nudger_flags()` RETURNS — `flags.list()` is that command's whole body —
+    /// rather than on any internal escalation field.
+    #[test]
+    fn a_cleared_founder_flag_is_re_raised_while_the_agent_is_still_wedged() {
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        handle.manage(Observers::default());
+        handle.manage(NudgeFlags::default());
+
+        // A clean, writable screen, so the only thing keeping this agent silent is that it emits
+        // nothing — the ladder climbs on the absence of output, not on a refusal.
+        let observer = handle.state::<Observers>().attach("agent-1", 120, 40);
+        observer.ingest(
+            "\x1b[2J\x1b[H────────────────────────\r\n❯\u{a0}\r\n────────────────────────",
+        );
+
+        let mut tracked: HashMap<String, Tracked> = HashMap::new();
+        let mut now = now_ms();
+        // Each call is one "look"; the due-time is advanced by hand so the test does not wait out
+        // 600-second rungs.
+        let mut looks = |tracked: &mut HashMap<String, Tracked>, n: usize, now: &mut u64| {
+            for _ in 0..n {
+                tick(&handle, tracked, *now);
+                *now = tracked.get("agent-1").map(|t| t.due_at_ms).unwrap_or(*now);
+            }
+        };
+
+        looks(&mut tracked, 20, &mut now);
+        let flags = handle.state::<NudgeFlags>();
+        assert_eq!(flags.list().len(), 1, "precondition: the founder was flagged");
+        assert_eq!(flags.list()[0].target, "founder");
+
+        // The consumer acts on the row and drops it — `authRecovery`'s `clearNudgeFlag` path.
+        flags.clear("agent-1");
+        assert!(
+            flags.list().is_empty(),
+            "precondition: the consumer's clear took effect"
+        );
+
+        // ...and whatever it did DID NOT WORK. The agent still emits nothing, so nothing ends the
+        // episode and nothing higher than `founder` is left to escalate to.
+        looks(&mut tracked, 3, &mut now);
+
+        let listed = flags.list();
+        assert_eq!(
+            listed.len(),
+            1,
+            "a still-wedged agent must not stay absent from nudger_flags() for the rest of its life"
+        );
+        assert_eq!(listed[0].target, "founder");
+        assert!(
+            listed[0].silent_secs > 0,
+            "and the re-raised row must carry the agent's real silence, not a blank"
+        );
+    }
+
 
     // ══ OUTCOME → STATE → FLAG ══════════════════════════════════════════════════════════════════
     // The chain the pusher actually reads. Asserted end to end, because the previous version wired
@@ -1533,6 +1727,107 @@ mod tests {
             "the agent moved; the flag must not outlive its truth"
         );
     }
+
+    /// An agent that has been silent for `looks` looks, driven through the REAL ladder so the
+    /// escalation state under test is the one production reaches rather than a hand-set field.
+    fn wedged_state(looks: usize) -> AgentState {
+        let mut state = AgentState::default();
+        let stalled = nudge_ladder::Observation {
+            hash: 1,
+            working: false,
+            refusal: None,
+            screen_readable: true,
+            prompt_has_text: false,
+            since_other_write_ms: u64::MAX,
+        };
+        for _ in 0..looks {
+            nudge_ladder::step(&mut state, &stalled);
+        }
+        state
+    }
+
+    /// RE-RAISED IS NOT RE-ESCALATED, and both halves matter.
+    ///
+    /// The row must come back on the next flagging look after a consumer clears it — otherwise a
+    /// still-wedged agent is hidden. But the caller emits `nudger://escalation` from this return
+    /// value, so returning `Some` on every look would turn one stuck agent into a stream of
+    /// identical notices, which is how a signal stops being read. The high-water mark decides the
+    /// EVENT; the flagging level decides the ROW.
+    #[test]
+    fn a_re_raised_row_is_not_a_second_escalation() {
+        let flags = NudgeFlags::default();
+        let state = wedged_state(20);
+
+        let first = apply_flags(
+            &flags,
+            "agent-1",
+            &decision(Some(nudge_ladder::Escalation::Founder), false),
+            &state,
+        );
+        assert!(first.is_some(), "the crossing look escalates and returns the flag to emit");
+
+        // The consumer acts and drops the row — and whatever it did did not work.
+        flags.clear("agent-1");
+
+        let again = apply_flags(
+            &flags,
+            "agent-1",
+            &refresh(nudge_ladder::Escalation::Founder),
+            &state,
+        );
+        assert!(
+            again.is_none(),
+            "nothing NEW escalated, so the caller must emit no second escalation event"
+        );
+        let listed = flags.list();
+        assert_eq!(listed.len(), 1, "but the row the founder owes must be back");
+        assert_eq!(listed[0].target, "founder");
+        assert_eq!(
+            listed[0].nudges,
+            state.attempts(),
+            "and it must carry the agent's real history, not a blank row"
+        );
+    }
+
+    /// A refreshed row must not restart its own age: a consumer reading `raisedAtMs` would be told
+    /// an agent stuck for six hours has been stuck for ten minutes, every ten minutes, forever.
+    #[test]
+    fn a_refreshed_row_keeps_the_age_it_was_first_raised_with() {
+        let flags = NudgeFlags::default();
+        let state = wedged_state(20);
+        apply_flags(
+            &flags,
+            "agent-1",
+            &decision(Some(nudge_ladder::Escalation::Founder), false),
+            &state,
+        );
+        let first_raised = flags.list()[0].raised_at_ms;
+
+        // THE SLEEP IS THE TEST. `build_flag` reads `raised_at_ms` from `previous` or else stamps
+        // `now_ms()`, and both calls otherwise land inside the same millisecond — so a restamping
+        // implementation produced an IDENTICAL number and this assertion passed while proving
+        // nothing (knightwatch 5203281832#4). Waiting past the clock's resolution is what makes the
+        // two branches distinguishable, and therefore what makes a regression able to redden this.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        apply_flags(&flags, "agent-1", &refresh(nudge_ladder::Escalation::Founder), &state);
+        assert_eq!(
+            flags.list()[0].raised_at_ms,
+            first_raised,
+            "a refresh is the same row, older — not a new row"
+        );
+        // ...and the wait really did cross a millisecond boundary, so the guard above cannot go
+        // vacuous again if the clock or the sleep changes underneath it.
+        assert!(
+            now_ms() > first_raised,
+            "precondition: the clock advanced, so a restamp would have been visible"
+        );
+    }
+
+    // ══ THE BETWEEN-LOOKS REPAIR ════════════════════════════════════════════════════════════════
+
+
+
 
     #[test]
     fn an_ordinary_quiet_tick_neither_raises_nor_clears() {

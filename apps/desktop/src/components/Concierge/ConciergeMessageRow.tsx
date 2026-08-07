@@ -446,7 +446,13 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
     return (
       <button
         type="button"
-        data-testid={m.variant === "rowless" ? "concierge-rowless-digest" : "concierge-digest"}
+        data-testid={
+          m.variant === "rowless"
+            ? "concierge-rowless-digest"
+            : m.variant === "unmerged"
+              ? "concierge-unmerged-digest"
+              : "concierge-digest"
+        }
         data-band={m.band}
         onClick={() => onDigestClick?.(m)}
         style={{

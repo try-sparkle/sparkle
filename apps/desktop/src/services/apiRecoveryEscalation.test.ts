@@ -80,7 +80,12 @@ let told: string[];
 beforeEach(() => {
   told = [];
   _resetConciergeNotifierForTests();
-  setConciergeNotifier((t) => told.push(t));
+  // The notifier returns whether the finding is actually now OWED — an honest delivery report, so
+  // the Pusher cannot stamp a 4h cooldown on something nobody received. This stub always accepts.
+  setConciergeNotifier((t) => {
+    told.push(t);
+    return true;
+  });
   seedAgent("a1", "Mount Tells The Truth");
 });
 afterEach(() => _resetConciergeNotifierForTests());

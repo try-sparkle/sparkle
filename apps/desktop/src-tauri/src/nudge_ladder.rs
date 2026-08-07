@@ -165,6 +165,14 @@ impl AgentState {
     pub fn last_blocked(&self) -> Option<&'static str> {
         self.last_blocked
     }
+    /// The highest flag level reached in this episode, or `None` before any threshold.
+    ///
+    /// Read by the driver BETWEEN looks, where there is no `Decision` to consult: the ladder's top
+    /// rung is 600s, so a row a consumer cleared would otherwise be invisible for ten minutes even
+    /// with the per-look refresh in place. Cleared by the episode reset, like everything else here.
+    pub fn escalated(&self) -> Option<Escalation> {
+        self.escalated
+    }
     pub fn silent_secs(&self) -> u64 {
         self.silent_secs
     }
@@ -180,6 +188,22 @@ pub struct Decision {
     /// A flag newly raised on THIS tick. `None` on every other tick, including later ticks of an
     /// episode that has already escalated.
     pub escalate: Option<Escalation>,
+    /// The flag level this look SITS AT, whatever was newly raised — `Some` on every look at or
+    /// above a threshold, for the whole rest of the episode.
+    ///
+    /// ── WHY THIS IS A SEPARATE FIELD FROM `escalate` ──────────────────────────────────────────
+    /// Escalation is a HIGH-WATER MARK: `escalate` is `Some` only on the tick a target RISES, and
+    /// once the founder level is reached there is nothing higher, so it is `None` forever after.
+    /// That makes it the right signal for "emit an escalation event" and the WRONG signal for
+    /// "this agent has a row a human owes". `nudger::apply_flags` used `escalate` for both, and a
+    /// consumer that cleared a founder flag on an agent the clear did not unstick deleted that row
+    /// permanently — the episode only ends when the agent produces output, which is exactly what a
+    /// wedged agent never does.
+    ///
+    /// So: `escalate` decides whether the row ESCALATES, `flagged` decides whether it EXISTS. Same
+    /// split `conflict_ladder` gets for free from `Action::Flag`, which this ladder has no
+    /// equivalent of because its flagging looks can carry any of three actions.
+    pub flagged: Option<Escalation>,
     /// 1-based rung, for humans reading the log.
     pub rung: u32,
     pub hash_changed: bool,
@@ -219,6 +243,9 @@ pub fn step(state: &mut AgentState, obs: &Observation) -> Decision {
         return Decision {
             action: Action::Observe,
             escalate: None,
+            // The episode just reset, so there is no level to be at. The consumer clears its row
+            // on `hash_changed` anyway; this says the same thing from the other side.
+            flagged: None,
             rung: 1,
             hash_changed: changed,
             // A first look has nothing to refuse — it is the baseline, not a declined write.
@@ -237,6 +264,10 @@ pub fn step(state: &mut AgentState, obs: &Observation) -> Decision {
     let observe = |refusal: &'static str| Decision {
         action: Action::Observe,
         escalate: None,
+        // NOT a flagging look. Every path that reaches here either sits below a nudge rung or was
+        // declined by `counts_as_attempt` — i.e. the ladder judged this agent to be FINE (a running
+        // turn, or somebody else having just typed), which is precisely what must not hold a row up.
+        flagged: None,
         rung: rung_1based,
         hash_changed: false,
         refusal: Some(refusal),
@@ -290,6 +321,8 @@ pub fn step(state: &mut AgentState, obs: &Observation) -> Decision {
         return Decision {
             action: Action::Enter,
             escalate: None,
+            // Rungs 4-6 are below the first escalation threshold by construction.
+            flagged: None,
             rung: rung_1based,
             hash_changed: false,
             refusal: None,
@@ -345,6 +378,10 @@ pub fn step(state: &mut AgentState, obs: &Observation) -> Decision {
         // The attempt counted either way; whether a BYTE goes out is a separate question.
         action: if blocked.is_some() { Action::Observe } else { Action::Nudge { n } },
         escalate,
+        // `target`, NOT `escalate`: the level this look sits at, which stays `Some` for the rest of
+        // the episode once a threshold is crossed. This is what keeps the row EXISTING after the
+        // high-water mark stops rising — see the field's doc comment.
+        flagged: target,
         rung: rung_1based,
         hash_changed: false,
         refusal: blocked,
@@ -786,6 +823,54 @@ mod tests {
             2,
             "exactly two flags for one episode, however long it runs"
         );
+    }
+
+    /// ESCALATING ONCE AND EXISTING THROUGHOUT ARE DIFFERENT FACTS, and conflating them is what let
+    /// a founder-level row vanish for the rest of an agent's life. `escalate` fires twice in an
+    /// episode however long it runs (above); `flagged` must hold from the first threshold on,
+    /// because that is what tells the driver the row still belongs on the surface.
+    #[test]
+    fn every_look_past_a_threshold_stays_flagged_though_only_two_escalate() {
+        let mut s = AgentState::default();
+        let decisions = run(&mut s, &stalled(), 40);
+
+        let first_flagged = decisions
+            .iter()
+            .position(|d| d.flagged.is_some())
+            .expect("a stalled agent must reach a flagging level");
+        assert_eq!(
+            decisions[first_flagged].escalate,
+            Some(Escalation::Concierge),
+            "the first flagging look is also the first escalation"
+        );
+        assert!(
+            decisions[first_flagged..].iter().all(|d| d.flagged.is_some()),
+            "once flagged, every later look of the episode is still a flagging look"
+        );
+        assert!(
+            decisions.iter().filter(|d| d.flagged.is_some()).count() > 2,
+            "otherwise this passes against a `flagged` that merely copies `escalate`"
+        );
+
+        // ...and the level only ever RISES within an episode. A row that silently downgraded from
+        // founder to concierge would tell the founder somebody else has it.
+        let levels: Vec<Escalation> = decisions.iter().filter_map(|d| d.flagged).collect();
+        assert!(levels.windows(2).all(|w| w[1] >= w[0]), "level must not drop: {levels:?}");
+        assert_eq!(*levels.last().unwrap(), Escalation::Founder);
+    }
+
+    /// The episode reset clears the LEVEL too, not just the escalation high-water mark — otherwise
+    /// a recovered agent's row would be re-raised forever by the driver's between-looks repair.
+    #[test]
+    fn output_clears_the_flag_level_and_the_state_that_drives_the_repair() {
+        let mut s = AgentState::default();
+        run(&mut s, &stalled(), 20);
+        assert_eq!(s.escalated(), Some(Escalation::Founder), "precondition: escalated");
+
+        let d = step(&mut s, &Observation { hash: 0xfeed, ..stalled() });
+        assert!(d.hash_changed);
+        assert_eq!(d.flagged, None, "a moving agent's look is not a flagging look");
+        assert_eq!(s.escalated(), None, "and nothing is left to re-raise it from");
     }
 
     /// Escalation is NOT a write. The module never addresses a human itself — it records a flag the

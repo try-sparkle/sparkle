@@ -6,13 +6,18 @@
 //    agents that need attention."
 //
 // Opening the project was already there. What was missing is everything below:
-//   • the click ISOLATES that band in the Build column, writing the SAME `statusFilter` the
-//     sidebar's own chips read — so one state, not two that can disagree
-//   • it selects the project FIRST and filters SECOND, because the filter narrows whichever project
-//     is selected
-//   • the number the sentence states EQUALS the number of rows left standing, which is what makes
-//     the sentence a promise rather than a report
-//   • a click that lands after its group resolved opens nothing and filters nothing
+//   • the click REVEALS the line's members in the Build column — every band on, every head the line
+//     names expanded, the lead selected
+//   • the number the sentence states EQUALS the number of rows in that band, which is what makes the
+//     sentence a promise rather than a report
+//   • a click that lands after its group resolved opens nothing and changes nothing
+//
+// IT USED TO ISOLATE THE BAND, and that half was removed (bead sparkle-qogah.4). Isolating
+// `needs_you` sets `done:false`, and `done` is where every "Needs merge" row lives — so the click
+// concealed the whole merge queue, persistently, from an affordance that reads as "show me these".
+// The founder's rule outranks the narrowing half of his original ask: "We should never hide a row
+// that needs action from me." The narrowing that survives is the needs-you pill, which renders its
+// own state as a filter. See the first describe block below.
 //
 // Lives apart from ConciergeHost.test.tsx (the dispatch/refusal ladder) because this file is about
 // NAVIGATION and the count-vs-rows invariant.
@@ -161,18 +166,22 @@ const feedFrom = (projects: Project[], status: Record<string, AgentTabStatus>) =
   buildConciergeFeed({ projects, status, openAgentIds: openIds(projects) });
 
 /**
- * The rows AgentSidebar would LEAVE STANDING after `isolateStatusBand(band)`.
+ * The rows AgentSidebar would DRAW under `bands`.
  *
  * This is the sidebar's OWN pipeline, called here: its exact stack (`topLevelAgents`) through its
- * exact filter (`groupAgentsByStage` with one band visible), flattened the way the column renders it
- * (`flattenSections`) — see AgentSidebar's `sections`/`ordered` memos. The expected side of the
- * invariant is therefore production code, not a re-derivation of it; a test that re-derived its own
- * expectation would go green on exactly the drift it exists to catch.
+ * exact filter (`groupAgentsByStage`), flattened the way the column renders it (`flattenSections`) —
+ * see AgentSidebar's `sections`/`ordered` memos. The expected side of the invariant is therefore
+ * production code, not a re-derivation of it; a test that re-derived its own expectation would go
+ * green on exactly the drift it exists to catch.
  *
  * The stage function is constant because stage decides which SECTION a row lands in, never whether
  * it is visible at all.
  */
-function sidebarRows(project: Project, status: Record<string, AgentTabStatus>, band: StatusBand) {
+function sidebarRowsUnder(
+  project: Project,
+  status: Record<string, AgentTabStatus>,
+  bands: Record<StatusBand, boolean>,
+) {
   const eff = publishedStatusFor(project.agents, status, new Set(openIds([project])), {}, () =>
     resolveStage(undefined, undefined),
   );
@@ -181,14 +190,26 @@ function sidebarRows(project: Project, status: Record<string, AgentTabStatus>, b
       topLevelAgents(project.agents, "build"),
       () => resolveStage(undefined, undefined),
       (id) => eff[id] ?? "stopped",
-      {
-        needs_you: band === "needs_you",
-        questions: band === "questions",
-        running: band === "running",
-        done: band === "done",
-      },
+      bands,
     ),
   );
+}
+
+/** The rows of ONE band — what a digest line's count is a statement about. */
+function sidebarRows(project: Project, status: Record<string, AgentTabStatus>, band: StatusBand) {
+  return sidebarRowsUnder(project, status, {
+    needs_you: band === "needs_you",
+    questions: band === "questions",
+    running: band === "running",
+    done: band === "done",
+  });
+}
+
+/** The rows column two is drawing RIGHT NOW — the sidebar's pipeline fed the LIVE `statusFilter`,
+ *  which is the one input a digest click can change. Read it either side of a click and the
+ *  difference is exactly what the click did to the reader's screen. */
+function visibleRowIds(project: Project, status: Record<string, AgentTabStatus>) {
+  return sidebarRowsUnder(project, status, useUiStore.getState().statusFilter).map((a) => a.id);
 }
 
 /** What each rendered digest line PROMISES: its band, its project, and the number it states.
@@ -218,7 +239,98 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-describe("clicking a digest line filters the Build column", () => {
+// ─────────────────────────────────────────────────────────────────────────────
+// A DIGEST CLICK MAY NEVER REDUCE WHAT IS ON SCREEN (bead sparkle-qogah.4).
+//
+// The founder's rule, verbatim: "We should never hide a row that needs action from me." A digest
+// line is an affordance whose whole purpose is to help him SEE more, and it used to call
+// `isolateStatusBand(live.band)` — which sets `running:false, done:false`. Every "Needs merge" row
+// lives in `done` (engine/buildSections bands `unmerged` there), so one click on "3 Need you in web"
+// concealed the entire merge queue, and — because `statusFilter` was persisted — kept it concealed
+// across relaunch, with nothing on screen recording that a filter had ever been set.
+//
+// These assert on the ROWS COLUMN TWO WOULD DRAW, through the sidebar's own pipeline fed the live
+// `statusFilter`, rather than on the fact that a handler ran. The rowless branch was already correct;
+// what the rows branch does now is the same thing — widen, expand, reveal.
+// ─────────────────────────────────────────────────────────────────────────────
+describe("a digest click never hides a row that needs action", () => {
+  /** Two asks (so a line is drawn at all) beside two agents WAITING TO BE MERGED — the population
+   *  the old click deleted from the column. `unmerged` bands `done`; see bandOfStatus. */
+  const asksBesideAMergeQueue = () => {
+    const p = projectOf("p2", "web", [tab("a"), tab("b"), tab("merge1"), tab("merge2")]);
+    const status: Record<string, AgentTabStatus> = {
+      a: "blocked",
+      b: "approval",
+      merge1: "unmerged",
+      merge2: "unmerged",
+    };
+    return { p, status };
+  };
+
+  it("leaves the merge queue standing — a Needs-merge row visible before the click still is after", () => {
+    const { p, status } = asksBesideAMergeQueue();
+    render(<ConciergeHost feed={feedFrom([p], status)} />);
+    // The premise, so a fixture that stopped producing merge rows can't pass this vacuously.
+    expect(visibleRowIds(p, status)).toEqual(expect.arrayContaining(["merge1", "merge2"]));
+
+    fireEvent.click(screen.getByTestId("concierge-digest"));
+
+    // THE RULE. Under the old `isolateStatusBand("needs_you")` these two rows were gone from the
+    // column — one click, no undo the reader knew to look for.
+    expect(visibleRowIds(p, status)).toEqual(expect.arrayContaining(["merge1", "merge2"]));
+  });
+
+  it("leaves a running orchestrator head standing — the reds underneath it live there", () => {
+    const p = projectOf("p2", "web", [tab("a"), tab("b"), tab("orch"), worker("w1", "orch")]);
+    const status: Record<string, AgentTabStatus> = {
+      a: "blocked",
+      b: "approval",
+      orch: "working",
+      w1: "working",
+    };
+    render(<ConciergeHost feed={feedFrom([p], status)} />);
+    expect(visibleRowIds(p, status)).toContain("orch");
+
+    fireEvent.click(screen.getByTestId("concierge-digest"));
+
+    // A head that bands `running` is where a red worker pops out. Hiding the head hides the subtree,
+    // which is how an ask disappears from the app entirely.
+    expect(visibleRowIds(p, status)).toContain("orch");
+  });
+
+  it("WIDENS a filter it inherits rather than narrowing it further", () => {
+    const { p, status } = asksBesideAMergeQueue();
+    // Someone (a chip, the needs-you pill, a concierge tool) has already hidden the merge queue.
+    useUiStore.setState({ statusFilter: { needs_you: true, questions: false, running: false, done: false } } as never);
+    render(<ConciergeHost feed={feedFrom([p], status)} />);
+    expect(visibleRowIds(p, status)).not.toContain("merge1");
+
+    fireEvent.click(screen.getByTestId("concierge-digest"));
+
+    // The click's promise is "show me these", so it can only ever add. Every band back on, and the
+    // merge queue with it.
+    expect(useUiStore.getState().statusFilter).toEqual({
+      needs_you: true,
+      questions: true,
+      running: true,
+      done: true,
+    });
+    expect(visibleRowIds(p, status)).toContain("merge1");
+  });
+
+  it("has every band on at the instant the project opens, so the revealed row is drawable", () => {
+    const { p, status } = asksBesideAMergeQueue();
+    useUiStore.setState({ statusFilter: { needs_you: false, questions: false, running: false, done: false } } as never);
+    render(<ConciergeHost feed={feedFrom([p], status)} />);
+    fireEvent.click(screen.getByTestId("concierge-digest"));
+    // Captured inside the `openProjectTab` mock: the ORDER matters the other way round now. The old
+    // click filtered last (narrowing whichever project was selected); this one widens FIRST, so the
+    // row it selects is already drawable when the selection lands.
+    expect(h.filterWhenOpened).toEqual({ needs_you: true, questions: true, running: true, done: true });
+  });
+});
+
+describe("clicking a digest line hands off to the Build column", () => {
   const twoInWeb = () => {
     const p = projectOf("p2", "web", [tab("a"), tab("b"), tab("calm")]);
     const status: Record<string, AgentTabStatus> = {
@@ -229,37 +341,13 @@ describe("clicking a digest line filters the Build column", () => {
     return { p, status };
   };
 
-  it("isolates the line's band in the SAME statusFilter the sidebar chips write", () => {
-    const { p, status } = twoInWeb();
-    render(<ConciergeHost feed={feedFrom([p], status)} />);
-    fireEvent.click(screen.getByTestId("concierge-digest"));
-    // The whole record, not one key: leaving `running`/`done` on would show every row and keep no
-    // promise at all.
-    expect(useUiStore.getState().statusFilter).toEqual({
-      needs_you: true,
-      questions: false,
-      running: false,
-      done: false,
-    });
-  });
-
-  it("selects the project FIRST, then filters — the order is load-bearing", () => {
+  it("opens the project on a member of the line, and narrows nothing", () => {
     const { p, status } = twoInWeb();
     render(<ConciergeHost feed={feedFrom([p], status)} />);
     fireEvent.click(screen.getByTestId("concierge-digest"));
     expect(h.openProjectTab).toHaveBeenCalledWith("p2", expect.any(String));
-    // `isolateStatusBand` narrows whichever project is SELECTED. Captured at the moment the project
-    // was opened, the filter must still be WIDE — if it had already been isolated, the narrowing
-    // landed on the previously-selected project's list, which reads as "my agents just vanished".
-    expect(h.filterWhenOpened).toEqual({ needs_you: true, questions: true, running: true, done: true });
-  });
-
-  it("leaves the filter in a state the chips can show and Show-all can clear", () => {
-    const { p, status } = twoInWeb();
-    render(<ConciergeHost feed={feedFrom([p], status)} />);
-    fireEvent.click(screen.getByTestId("concierge-digest"));
-    expect(useUiStore.getState().statusFilter.done).toBe(false);
-    useUiStore.getState().showAllStatusBands();
+    // The whole record, not one key: this is the assertion that used to read
+    // `{needs_you: true, running: false, done: false}` and is the defect itself.
     expect(useUiStore.getState().statusFilter).toEqual({
       needs_you: true,
       questions: true,
@@ -268,14 +356,15 @@ describe("clicking a digest line filters the Build column", () => {
     });
   });
 
-  it("reveals a lead agent the filter it just applied still SHOWS", () => {
+  it("reveals a lead agent the Build column is actually DRAWING", () => {
     const { p, status } = twoInWeb();
     render(<ConciergeHost feed={feedFrom([p], status)} />);
     fireEvent.click(screen.getByTestId("concierge-digest"));
     const [, revealedId] = h.openProjectTab.mock.calls[0]!;
-    // The selected row must survive its own filter, or the click lands the user on a row that is
-    // no longer in the column.
-    expect(sidebarRows(p, status, "needs_you").map((a) => a.id)).toContain(revealedId);
+    // The selected row must be one the live filter keeps, or the click lands the user on a row that
+    // is not in the column. Read against the LIVE filter, so it also fails if the click ever leaves
+    // a filter that excludes its own lead.
+    expect(visibleRowIds(p, status)).toContain(revealedId);
   });
 
   // ── Stale clicks ────────────────────────────────────────────────────────────
@@ -334,10 +423,12 @@ describe("clicking a digest line filters the Build column", () => {
 // ─────────────────────────────────────────────────────────────────────────────
 // The count is a PROMISE, not a report.
 //
-// "2 Need you in web" is a clickable phrase, and the click calls `isolateStatusBand`, which narrows
-// the sidebar's TOP-LEVEL rows and nothing else. So the sentence and the handoff must be counting
-// the same population, or column one promises rows column two cannot produce: with both asks being
-// workers the user clicked "2" and got an empty column plus an empty-state chip.
+// "2 Need you in web" is a clickable phrase, and what it hands off to is the sidebar's TOP-LEVEL
+// rows and nothing else. So the sentence and the handoff must be counting the same population, or
+// column one promises rows column two cannot produce: with both asks being workers the user clicked
+// "2" and got an empty column plus an empty-state chip. (The click no longer narrows to that band —
+// see the rule at the top of this file — but the count is still a statement about those rows, so
+// `sidebarRows` still measures the band.)
 //
 // These run the REAL builder over REAL AgentTab fixtures — worker nesting and the worker→
 // orchestrator red bubble only exist down there, and a hand-rolled ConciergeAgent literal
@@ -427,12 +518,8 @@ describe("the stated count equals the rows the click leaves standing", () => {
     expect(sidebarRows(p, status, "needs_you").map((a) => a.id)).toEqual(["a", "b"]);
     fireEvent.click(screen.getByTestId("concierge-digest"));
     expect(h.openProjectTab).toHaveBeenCalledWith("p2", expect.stringMatching(/^(a|b)$/));
-    expect(useUiStore.getState().statusFilter).toEqual({
-      needs_you: true,
-      questions: false,
-      running: false,
-      done: false,
-    });
+    // …and c, the idle one, is STILL DRAWN. The line named two; it did not delete the third.
+    expect(visibleRowIds(p, status)).toEqual(expect.arrayContaining(["a", "b", "c"]));
   });
 
   // The general statement, over a fleet that mixes bands, both kinds, two projects and a worker
@@ -576,15 +663,18 @@ describe("rowless agents digest like everything else", () => {
     expect(screen.getByTestId("concierge-rowless-digest").textContent).toBe(
       "2 workers inside web need you",
     );
-    // The row line still filters; the rowless one still reveals.
+    // Both lines reveal, and neither narrows — the row line used to be the one that did.
     fireEvent.click(screen.getByTestId("concierge-digest"));
     expect(h.openProjectTab).toHaveBeenCalledWith("p2", expect.stringMatching(/^(a|b)$/));
     expect(useUiStore.getState().statusFilter).toEqual({
       needs_you: true,
-      questions: false,
-      running: false,
-      done: false,
+      questions: true,
+      running: true,
+      done: true,
     });
+    // `orch` bands `running`, so isolating would have removed the head the two blocked workers pop
+    // out under — the rowless line's own members, hidden by the row line's click.
+    expect(visibleRowIds(p, status)).toContain("orch");
   });
 });
 // ── THE HEADER SAYS NOTHING ACROSS PROJECTS ANY MORE ────────────────────────────────────────────

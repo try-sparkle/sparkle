@@ -57,6 +57,7 @@ import { ConciergeSuggestions } from "./Concierge/ConciergeSuggestions";
 // happen — the handler would simply never match.
 import { NUDGE_DISMISS_ACTION, NUDGE_MUTE_ACTION } from "./Concierge/NudgeCard";
 import type { ConciergeAgent, ConciergeFeed } from "../useConciergeFeed";
+import { accountedUnmerged } from "../services/conciergeFeed";
 import type { AgentTabStatus } from "../types";
 import { bandCountLabel } from "../engine/statusBandLabels";
 import { rosterLine } from "../engine/conciergeRosterLine";
@@ -175,6 +176,7 @@ import {
 import { findKnownAgent } from "../services/knownAgents";
 import { createArrivalOrder, orderByArrival } from "../engine/conciergeStreamOrder";
 import { useEffectiveWired } from "../hooks/useEffectiveWired";
+import { isAskingIsolated } from "../engine/buildSections";
 import { useUiStore } from "../stores/uiStore";
 import { openProjectsOf } from "../engine/openProjects";
 import { attachedDisplay, attachedPayload } from "../services/conciergeAttach";
@@ -5173,9 +5175,13 @@ export function ConciergeHost({
       // hiding rows through separate mechanisms, which is called out in rev4.html.
       onNeedsYouFilterToggle: () => {
         const ui = useUiStore.getState();
-        const isolated = ui.statusFilter.needs_you && !ui.statusFilter.running && !ui.statusFilter.done;
-        if (isolated) ui.showAllStatusBands();
-        else ui.isolateStatusBand("needs_you");
+        // NARROWS TO BOTH ASKING BANDS, not to `needs_you` alone. `questions` means the agent cannot
+        // proceed without you just as squarely as `waiting`/`approval` do — `engine/attention` has
+        // always classified it that way — so isolating `needs_you` turned the blue band OFF and hid
+        // owed work behind a control the founder reads as "show me what needs me". Same defect as
+        // the digest click that hid the merge queue, entered through the newest band.
+        if (isAskingIsolated(ui.statusFilter)) ui.showAllStatusBands();
+        else ui.setStatusFilter({ needs_you: true, questions: true, running: false, done: false });
       },
       onProjectClick: (projectId: string) => openProjectTab(projectId),
       // Same destination as onNudgeClick, keyed on an id — the recap card's pills. `revealAgent`
@@ -5209,15 +5215,23 @@ export function ConciergeHost({
         // answered by a row group that happens to share a project and band (their ids differ for
         // exactly this reason).
         const feed = feedRef.current;
+        // THREE POPULATIONS, THREE RE-DERIVATIONS. A binary check sent an `unmerged` line down the
+        // `rows` arm, where its id does not exist — so `live` was undefined and the click silently
+        // did NOTHING, which is the dead-end affordance this whole bead started from.
         const live =
           d.variant === "rowless"
             ? buildDigest(nestedRowlessAgents(feed), "rowless").groups.find((g) => g.id === d.id)
-            : buildDigest(surfacedAgents(feed)).groups.find((g) => g.id === d.id);
-        if (!live) return; // resolved out from under the click — open nothing, filter nothing
-        // A ROWLESS line REVEALS, it does not NARROW. Its agents have no row of their own, so
-        // `isolateStatusBand` has nothing of theirs to leave standing — and worse, it would hide the
-        // very row the reveal needs: these are blocked workers under an orchestrator that bands
-        // `running`, so isolating `needs_you` removes the head they pop out under.
+            : d.variant === "unmerged"
+              ? buildDigest(accountedUnmerged(feed), "unmerged").groups.find((g) => g.id === d.id)
+              : buildDigest(surfacedAgents(feed)).groups.find((g) => g.id === d.id);
+        if (!live) return; // resolved out from under the click — open nothing, change nothing
+        // A DIGEST LINE REVEALS; IT NEVER NARROWS — either variant. That was always true of the
+        // ROWLESS one for a mechanical reason: its agents have no row of their own, so
+        // `isolateStatusBand` has nothing of theirs to leave standing, and it would hide the very row
+        // the reveal needs — these are blocked workers under an orchestrator that bands `running`, so
+        // isolating `needs_you` removes the head they pop out under. It is now true of the ROWS
+        // variant too, for the founder's rule rather than a mechanism; see the block below the
+        // numbered gates.
         //
         // But declining to SET a filter is not enough, and that was the bug (roborev 53734). The
         // line's promise is "click me and see these N", and TWO pieces of pre-existing UI state can
@@ -5240,37 +5254,48 @@ export function ConciergeHost({
         //      that effect expands the selected row's parent. So the lead's head would open without
         //      this line; every OTHER head the digest line names would not.
         //   2. A LEFTOVER BAND FILTER. The sidebar applies `statusFilter` to heads, so a `running`
-        //      orchestrator is not drawn at all if `running` is off — which a previous *rows*-
-        //      variant digest click turns off, by design.
+        //      orchestrator is not drawn at all if `running` is off. A *rows*-variant digest click
+        //      used to be the commonest way that happened; it no longer narrows anything, and the
+        //      remaining writers are the ones a reader can SEE — the filter chips, the needs-you
+        //      pill, and the concierge `sidebarView` tools. Within a session that is still a filter
+        //      to clear, which is why this call stays unconditional. Across sessions it is not:
+        //      `statusFilter` is in `uiStore.TRANSIENT_UI_KEYS`, so a launch starts all-on.
         //
         // So the click ENFORCES its premise rather than assuming it: show every band, then expand
         // EVERY head the line names. `rowHeadIds` is a list because grouping stays `project::band`
         // — keying it per head instead was tried and reverted, since that fragments the common
         // fleet shape into a card apiece and rebuilds the wall (roborev 53737). One line may span
         // several orchestrators; expanding only the lead's would strand the rest.
-        if (live.variant === "rowless") {
-          const ui = useUiStore.getState();
-          ui.showAllStatusBands();
-          // EVERY head the line stands for, not just the lead's: one line can span several
-          // in-motion orchestrators, and expanding one of them would strand the rest (roborev
-          // 53737). `expandOrchestrators` takes an array for exactly this.
-          ui.expandOrchestrators(live.rowHeadIds);
-          openProjectTab(live.projectId, live.leadAgentId);
-          return;
-        }
-        // ORDER IS LOAD-BEARING. `isolateStatusBand` narrows whichever project is SELECTED, so
-        // selecting first is what makes the filter land on the list the sentence named. Filtering
-        // first narrows somebody else's column for the frame in between, which reads as "my agents
-        // just vanished".
-        openProjectTab(live.projectId, live.leadAgentId);
-        // The SAME `statusFilter` the sidebar's own chips write (stores/uiStore.isolateStatusBand),
-        // deliberately not a filter of the digest's own: one state means the chips render what the
-        // click did, "Show all" clears it like any hand-toggled filter, and the two can never
-        // disagree about what column two is showing.
         //
-        // The revealed agent is safe from the filter it just turned on: `live.leadAgentId` comes
-        // from this band's surfaced set, so the selected row is one the filter keeps.
-        useUiStore.getState().isolateStatusBand(live.band);
+        // BOTH VARIANTS DO THE SAME THING NOW, AND THE ROWS ONE USED TO DO THE OPPOSITE.
+        //
+        // It called `isolateStatusBand(live.band)`, which sets `running:false, done:false`. Every
+        // "Needs merge" row lives in `done` (engine/buildSections bands `unmerged` there), so
+        // clicking "3 Need you in web" — an affordance whose whole purpose is to help the founder SEE
+        // more — concealed the entire merge queue in one click, plus every `running` orchestrator
+        // head whose red workers pop out underneath it. And `statusFilter` was persisted, so the
+        // concealment outlived the session: a filter he never knowingly set, still hiding work he
+        // owed, on a launch with no memory of the click. Against the rule this branch exists to
+        // enforce (bead sparkle-qogah.4): "We should never hide a row that needs action from me."
+        //
+        // So the click REVEALS and never narrows. Widening is not merely safe here, it is what makes
+        // the reveal land: the row `openProjectTab` selects is only drawn if its band is on, and an
+        // inherited filter from a chip, the needs-you pill or a concierge tool may have it off. The
+        // narrowing half of the founder's original ask ("filters the build column out to only show
+        // me the agents that need attention") stays available where it reads as a filter and says so
+        // on screen — the needs-you pill, which renders its own isolated state and toggles back —
+        // rather than on a sentence in the thread that reads as "take me to these".
+        const ui = useUiStore.getState();
+        // ORDER IS LOAD-BEARING, the other way round from the narrowing version this replaced: show
+        // every band FIRST, so the row the selection lands on is already drawable.
+        ui.showAllStatusBands();
+        // EVERY head the line stands for, not just the lead's: one line can span several
+        // in-motion orchestrators, and expanding one of them would strand the rest (roborev
+        // 53737). `expandOrchestrators` takes an array for exactly this. A `rows` line's members
+        // are heads themselves, so its `rowHeadIds` is empty and this is a no-op there — passed
+        // unconditionally so the two variants cannot drift into two behaviours again.
+        ui.expandOrchestrators(live.rowHeadIds);
+        openProjectTab(live.projectId, live.leadAgentId);
       },
       onNudgeAction: (n: ConciergeNudge, actionId: string) => {
         const a = resolveAgent(n.id);
@@ -5408,9 +5433,7 @@ export function ConciergeHost({
   // The pill's PRESSED state, read from the same store its toggle writes. Subscribed (not
   // `getState()`) so the pill re-renders when the sidebar's chips change the filter — one state,
   // reflected in both places, rather than a header control that can disagree with the column.
-  const needsYouIsolated = useUiStore(
-    (s) => s.statusFilter.needs_you && !s.statusFilter.running && !s.statusFilter.done,
-  );
+  const needsYouIsolated = useUiStore((s) => isAskingIsolated(s.statusFilter));
 
   const model: ConciergeViewModel = useMemo(() => {
     // DIGEST, don't enumerate (bead sparkle-4562.4). One item of a priority keeps its card; two or
@@ -5424,17 +5447,29 @@ export function ConciergeHost({
     // has no rows to leave standing; that is the variant's job, not an exemption from digesting.
     // See `unrepresentedAgents` and services/conciergeDigest.DigestVariant.
     const rowless = buildDigest(nestedRowlessAgents(feed), "rowless");
+    // FOUNDER'S RULING (bead sparkle-qogah, 2026-08-05): un-landed work is an action he owes, so it
+    // may NOT be omitted from this column — but it is 27 agents on the reported fleet, so it is ONE
+    // grouped line carrying a TRUE count, never 27 cards. Asked directly, he chose exactly that:
+    // "one honest group — one row reading '27 need merge' that expands in place". Excluding it is
+    // what let the column report "0 Need you" over 27 un-landed PRs.
+    const unmerged = buildDigest(accountedUnmerged(feed), "unmerged");
     // Never digested — every one of these keeps its own card, because its card is the only way to
     // reach it. See `strandedAgents`.
+    // `unmerged.cards` IS DELIBERATELY NOT SPREAD HERE. buildDigest never emits one for this variant
+    // (see its singleton branch): un-landed work surfaces only as a LINE, never as an interrupting
+    // card carrying Approve/Open affordances that do not apply to it.
     const nudges = [...cards, ...rowless.cards, ...strandedAgents(feed)].map(agentToNudge);
-    const digests: ConciergeMessage[] = [...groups, ...rowless.groups].map((g) => ({
-      id: g.id,
-      kind: "digest" as const,
-      band: g.band,
-      variant: g.variant,
-      text: g.text,
-      leadAgentId: g.leadAgentId,
-    }));
+    const digests: ConciergeMessage[] = [...groups, ...rowless.groups, ...unmerged.groups].map(
+      (g) => ({
+        id: g.id,
+        kind: "digest" as const,
+        band: g.band,
+        variant: g.variant,
+        text: g.text,
+        leadAgentId: g.leadAgentId,
+        memberIds: g.memberIds,
+      }),
+    );
     // Order the whole stream by WHEN EACH ITEM FIRST APPEARED, not by what kind it is. Concatenated
     // as [chat, digests, nudges] only to tie-break items that arrive in the SAME tick; anything
     // already placed keeps its slot (see engine/conciergeStreamOrder for why assign-once matters).

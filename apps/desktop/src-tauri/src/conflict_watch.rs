@@ -60,6 +60,24 @@ const TICK: Duration = Duration::from_secs(20);
 /// (~75s+ TCP timeout), and a stuck child on a repeating timer piles up.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Row cap on the open-PR list — and, far more importantly, the number a SATURATED read is detected
+/// at (see [`read_is_saturated`]).
+///
+/// This probe is the ONE in the app that lists EVERY author's open PRs, not just `@me`'s, so it is
+/// the most likely to fill its window. It sat at 100 with no truncation signal, which is the worst
+/// combination available: a PR past the hundredth was never entered into the ladder at all, so a
+/// conflicting-and-therefore-untested PR could sit there forever without ever being escalated to
+/// the founder — and, because [`prune_tracked`] treated a full page as an authoritative list, an
+/// already-tracked PR that fell off the end was silently FORGOTTEN and its raised flag swept
+/// (bead sparkle-qogah: "we should never hide a row that needs action from me").
+///
+/// THE NUMBER IS NOT THE FIX. 300 is headroom (this repo runs ~13 open PRs today), and any constant
+/// is eventually wrong; the durable part is that reaching it is now *disclosed* rather than rounded
+/// off. `gh` pages internally at 100 rows a request and stops as soon as a page comes back short,
+/// so raising the ceiling costs nothing at all on a repo below it — only a repo that would
+/// otherwise be silently truncated pays for the extra pages, which is exactly the trade to make.
+const PROBE_LIMIT: u32 = 300;
+
 /// Ceiling on how long we go without LISTING, so a brand-new PR is discovered even while every
 /// tracked PR is parked on the two-hour rung.
 ///
@@ -342,6 +360,64 @@ pub struct PrFacts {
     pub carried_looks: u32,
 }
 
+/// One repo's open-PR read: the facts, PLUS whether the read filled its window.
+///
+/// The two travel together on purpose. A `Vec<PrFacts>` alone cannot express "and there may be
+/// more", so every caller that received one was structurally unable to tell a complete list from a
+/// truncated one — and each of them then treated the list as complete, because that is the only
+/// thing a bare vec lets you do.
+#[derive(Debug, Clone, PartialEq)]
+struct Probed {
+    prs: Vec<PrFacts>,
+    /// The list came back at least [`PROBE_LIMIT`] rows long, so a PR past the cap is ABSENT from
+    /// `prs` and we cannot know whether it exists. Never read as "those PRs are gone": see
+    /// [`prune_tracked`], where reading it that way deleted state and swept raised flags.
+    saturated: bool,
+}
+
+/// Did the read come back with its window FULL?
+///
+/// Same reasoning, and deliberately the same shape, as `knightwatch::read_is_saturated` and
+/// `roborev_probe::window_saturated`: `gh pr list --limit N` returns the newest N rows with no
+/// truncation signal whatsoever, so a count that reaches the cap is the one ambiguous reading —
+/// either the repo really has exactly that many open PRs, or it has more and the remainder fell off
+/// the end unannounced. That ambiguity resolves to NOT-AUTHORITATIVE, which here means "do not
+/// prune anybody and keep the ones you know about climbing".
+///
+/// `>=` rather than `==` because a cap is a CEILING: a future `gh` that over-returns by a row must
+/// not read as an authoritative answer just because it missed the equality.
+fn read_is_saturated(raw_rows: usize, limit: u32) -> bool {
+    raw_rows >= limit as usize
+}
+
+/// One JSON row → facts, or `None` for a row with no PR number (nothing to flag or link, so drop
+/// just that row rather than failing the whole sweep).
+fn decode_pr_facts(r: &Value) -> Option<PrFacts> {
+    let number = r.get("number").and_then(Value::as_u64)?;
+    let s = |k: &str| r.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let merge_state = normalize_merge_state(&s("mergeStateStatus"));
+    Some(PrFacts {
+        number,
+        title: s("title"),
+        branch: s("headRefName"),
+        head_oid: s("headRefOid"),
+        base_oid: s("baseRefOid"),
+        is_dirty: merge_state == "dirty",
+        merge_state,
+        is_draft: r.get("isDraft").and_then(Value::as_bool).unwrap_or(false),
+        // An ABSENT rollup and an EMPTY one both mean "no check run exists", which is the
+        // observation that confirms an untested conflict.
+        has_ci: r
+            .get("statusCheckRollup")
+            .and_then(Value::as_array)
+            .is_some_and(|a| !a.is_empty()),
+        commits_behind: 0,
+        url: s("url"),
+        // A freshly decoded row is always first-hand; the carry is the driver's doing.
+        carried_looks: 0,
+    })
+}
+
 /// Pure decoder: `gh pr list --json …` → facts.
 ///
 /// Unparsable output yields `None` (unknown), NEVER an empty list — the same null-vs-zero
@@ -349,37 +425,25 @@ pub struct PrFacts {
 /// has no conflicts" and "we could not read this repo".
 fn decode_open_prs(stdout: &str) -> Option<Vec<PrFacts>> {
     let rows = serde_json::from_str::<Vec<Value>>(stdout).ok()?;
-    Some(
-        rows.iter()
-            .filter_map(|r| {
-                // A PR without a number cannot be flagged or linked, so drop just that row rather
-                // than failing the whole sweep.
-                let number = r.get("number").and_then(Value::as_u64)?;
-                let s = |k: &str| r.get(k).and_then(Value::as_str).unwrap_or("").to_string();
-                let merge_state = normalize_merge_state(&s("mergeStateStatus"));
-                Some(PrFacts {
-                    number,
-                    title: s("title"),
-                    branch: s("headRefName"),
-                    head_oid: s("headRefOid"),
-                    base_oid: s("baseRefOid"),
-                    is_dirty: merge_state == "dirty",
-                    merge_state,
-                    is_draft: r.get("isDraft").and_then(Value::as_bool).unwrap_or(false),
-                    // An ABSENT rollup and an EMPTY one both mean "no check run exists", which is
-                    // the observation that confirms an untested conflict.
-                    has_ci: r
-                        .get("statusCheckRollup")
-                        .and_then(Value::as_array)
-                        .is_some_and(|a| !a.is_empty()),
-                    commits_behind: 0,
-                    url: s("url"),
-                    // A freshly decoded row is always first-hand; the carry is the driver's doing.
-                    carried_looks: 0,
-                })
-            })
-            .collect(),
-    )
+    Some(rows.iter().filter_map(decode_pr_facts).collect())
+}
+
+/// Turn a completed `gh pr list` into a read. PURE, and extracted for exactly one reason: the
+/// saturation decision would otherwise live inside [`probe_open_prs`] next to a subprocess spawn,
+/// where no unit test can reach it — and a mutation that treated a full window as authoritative
+/// would stay GREEN, which is the vacuous-test failure this repo tracks as its #1 finding. The
+/// spawn is now a shell around this.
+///
+/// Saturation is judged on the RAW row count, before the numberless-row filter above: the cap `gh`
+/// applied was to the rows it sent, so a dropped row still proves the window was full. Judging it
+/// on the filtered count would let one malformed row read a full page as authoritative — the exact
+/// inversion of the failure this guards against. Same call `roborev_probe` makes.
+fn probe_from_stdout(stdout: &str, limit: u32) -> Option<Probed> {
+    let rows = serde_json::from_str::<Vec<Value>>(stdout).ok()?;
+    Some(Probed {
+        saturated: read_is_saturated(rows.len(), limit),
+        prs: rows.iter().filter_map(decode_pr_facts).collect(),
+    })
 }
 
 /// GitHub's `mergeStateStatus`, lowercased, with everything it does not define folded to
@@ -718,9 +782,9 @@ fn discover_repos(app_data: &Path) -> Vec<Repo> {
 /// assertable without a `gh` binary.
 /// Returns the worktree that answered alongside the PRs, because the caller needs a working
 /// directory for the local `git rev-list` that computes commits-behind.
-fn probe_repo<P>(repo: &Repo, mut probe: P) -> Result<(PathBuf, Vec<PrFacts>), &'static str>
+fn probe_repo<P>(repo: &Repo, mut probe: P) -> Result<(PathBuf, Probed), &'static str>
 where
-    P: FnMut(&Path) -> Result<Vec<PrFacts>, &'static str>,
+    P: FnMut(&Path) -> Result<Probed, &'static str>,
 {
     let mut last = "no-worktree";
     for dir in &repo.dirs {
@@ -732,12 +796,12 @@ where
     Err(last)
 }
 
-/// Every open PR in `dir`'s repo.
+/// Every open PR in `dir`'s repo, plus whether the list was TRUNCATED at [`PROBE_LIMIT`].
 ///
 /// `Err(reason)` — never an empty list — when `gh` is absent, unauthenticated, offline, or slow.
 /// The reason travels all the way to `ConflictFlag::blocked_by`, so a consumer can tell a real
 /// conflict from a repo we could not read.
-fn probe_open_prs(dir: &Path) -> Result<Vec<PrFacts>, &'static str> {
+fn probe_open_prs(dir: &Path) -> Result<Probed, &'static str> {
     let mut cmd = Command::new(crate::preflight::gh_program());
     cmd.arg("pr")
         .args([
@@ -745,7 +809,7 @@ fn probe_open_prs(dir: &Path) -> Result<Vec<PrFacts>, &'static str> {
             "--state",
             "open",
             "--limit",
-            "100",
+            &PROBE_LIMIT.to_string(),
             "--json",
             // `statusCheckRollup` is the ONLY source for `has_ci`, which is what turns "this PR is
             // untested" from an inference into an observation — see `ConflictFlag::untested`.
@@ -762,7 +826,7 @@ fn probe_open_prs(dir: &Path) -> Result<Vec<PrFacts>, &'static str> {
         // text is prose we would have to parse. One honest reason beats a guessed taxonomy.
         return Err("gh-failed");
     }
-    decode_open_prs(&String::from_utf8_lossy(&output.stdout)).ok_or("gh-unreadable")
+    probe_from_stdout(&String::from_utf8_lossy(&output.stdout), PROBE_LIMIT).ok_or("gh-unreadable")
 }
 
 /// Force `gh`/`git` to fail fast rather than block on an interactive credential or host-key prompt.
@@ -893,13 +957,52 @@ fn blind_facts(stored: &PrFacts) -> PrFacts {
 /// state AND their raised flags. "We cannot look at this repo any more" is the one thing this
 /// module refuses to read as "the PR was merged", so a project we did not probe keeps everything.
 ///
+/// Why a blind look is happening when the repo itself was perfectly readable: the LIST was
+/// truncated. Travels to `ConflictFlag::blocked_by`, so the row says which of the two it is rather
+/// than implying `gh` was down.
+const SATURATED_REASON: &str = "gh-list-saturated";
+
+/// Which of a project's TRACKED PRs a saturated list failed to mention — the ones that must keep
+/// climbing rather than quietly stop being looked at.
+///
+/// Sorted, so the looks a sweep produces are deterministic rather than dependent on `HashMap`
+/// iteration order. A named function only so it is ASSERTABLE: `tick` takes an `AppHandle` and has
+/// no test, and this repo has already recorded a case where a fix that lived there left every test
+/// green (see `blind_facts`).
+fn saturated_blind_fill(
+    tracked: &HashMap<u64, Tracked>,
+    project_id: &str,
+    seen: &HashSet<u64>,
+) -> Vec<u64> {
+    let mut out: Vec<u64> = tracked
+        .iter()
+        .filter(|(pr, t)| t.project_id == project_id && !seen.contains(*pr))
+        .map(|(pr, _)| *pr)
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+/// A SATURATED list is not evidence of absence either, and it used to be treated as exactly that
+/// (bead sparkle-qogah). `gh pr list --limit N` truncates silently, so a repo with more open PRs
+/// than the cap returns a full page whose tail is simply missing — and every PR in that tail is
+/// absent from `seen`. The naive predicate then deleted their ladder state AND, via the
+/// `sweep_closed_flags` call that keys off what survived this prune, their already-RAISED conflict
+/// flags. A conflicting-and-untested PR the founder owes a rebase would vanish from the surface
+/// because a page was full. "The window filled up" is no more a merge than "we cannot look".
+///
 /// Free function so it is assertable without an `AppHandle`.
 fn prune_tracked(
     tracked: &mut HashMap<u64, Tracked>,
     probed_ok: &HashSet<String>,
     seen: &HashSet<u64>,
+    saturated: &HashSet<String>,
 ) {
-    tracked.retain(|pr, t| !probed_ok.contains(&t.project_id) || seen.contains(pr));
+    tracked.retain(|pr, t| {
+        !probed_ok.contains(&t.project_id)
+            || saturated.contains(&t.project_id)
+            || seen.contains(pr)
+    });
 }
 
 /// Start the conflict watcher. Idempotent; safe to call more than once.
@@ -959,14 +1062,18 @@ fn tick<R: Runtime>(app: &AppHandle<R>, watch: &mut Watch, now: u64) {
     // Projects whose PR listing we actually READ this sweep. Only these may prune — see
     // `prune_tracked`.
     let mut probed_ok: HashSet<String> = HashSet::new();
+    // …of which THESE came back with a full window, so their listing is not the whole truth and
+    // nothing may be pruned on the strength of it.
+    let mut saturated: HashSet<String> = HashSet::new();
     let mut unreadable = 0usize;
     let mut last_error: Option<&'static str> = None;
 
     for repo in &repos {
         match probe_repo(repo, probe_open_prs) {
-            Ok((dir, prs)) => {
+            Ok((dir, probed)) => {
                 probed_ok.insert(repo.project_id.clone());
-                for f in prs {
+                let was_saturated = probed.saturated;
+                for f in probed.prs {
                     // The flag contract is keyed by PR NUMBER alone, so two projects' #12 would
                     // collide. First project (sorted) wins and the collision is LOGGED rather than
                     // silently merged — a visible degradation beats cross-project cross-talk.
@@ -984,6 +1091,26 @@ fn tick<R: Runtime>(app: &AppHandle<R>, watch: &mut Watch, now: u64) {
                     // spawns an hour for a number that only enriches a flag most of them will never
                     // raise (roborev 57873). It is computed below, for DUE looks only.
                     looks.push(Look::Read(repo.project_id.clone(), dir.clone(), f));
+                }
+                if was_saturated {
+                    saturated.insert(repo.project_id.clone());
+                    tracing::warn!(
+                        target: "conflict_watch",
+                        project = %repo.project_id,
+                        limit = PROBE_LIMIT,
+                        "this repo's open-PR list FILLED its window, so a PR past the cap is \
+                         missing from this sweep entirely; nothing is pruned and every tracked PR \
+                         the list omitted keeps climbing blind"
+                    );
+                    // FAIL CLOSED, exactly as the unreadable arm does: a tracked PR the truncated
+                    // page left out is not a merged PR. Without this it would simply stop being
+                    // looked at — retained by `prune_tracked` but never escalated again, which for
+                    // a conflicting PR the founder owes a rebase is indistinguishable from hiding
+                    // it (bead sparkle-qogah).
+                    for pr in saturated_blind_fill(&watch.tracked, &repo.project_id, &seen) {
+                        seen.insert(pr);
+                        looks.push(Look::Blind(pr, SATURATED_REASON));
+                    }
                 }
             }
             Err(reason) => {
@@ -1013,7 +1140,7 @@ fn tick<R: Runtime>(app: &AppHandle<R>, watch: &mut Watch, now: u64) {
     // empty list that reads as "no conflicts". See `ProbeStatus`.
     record_probe(repos.len(), unreadable, last_error, now);
 
-    prune_tracked(&mut watch.tracked, &probed_ok, &seen);
+    prune_tracked(&mut watch.tracked, &probed_ok, &seen, &saturated);
     if let Some(flags) = app.try_state::<ConflictFlags>() {
         // Sweep against what SURVIVED the prune, so a flag is only ever dropped when its PR was
         // dropped — never because its project went unreadable or its worktrees were removed.
@@ -1970,12 +2097,12 @@ mod tests {
             if dir.ends_with("broken") {
                 Err("gh-failed")
             } else {
-                Ok(vec![conflicting_facts()])
+                Ok(Probed { prs: vec![conflicting_facts()], saturated: false })
             }
         });
-        let (dir, prs) = got.expect("the second worktree answered");
+        let (dir, probed) = got.expect("the second worktree answered");
         assert_eq!(dir, PathBuf::from("/a/works"), "and the caller learns WHICH one answered");
-        assert_eq!(prs.len(), 1);
+        assert_eq!(probed.prs.len(), 1);
         assert_eq!(asked, vec!["/a/broken", "/a/works"], "in sorted order, first-answer-wins");
 
         // Only a probe that fails EVERYWHERE declares the project unreadable — and it reports the
@@ -2008,7 +2135,12 @@ mod tests {
         }
 
         // This sweep probed only `alive`, which still lists #1. `vanished` was never discovered.
-        prune_tracked(&mut tracked, &HashSet::from(["alive".to_string()]), &HashSet::from([1u64]));
+        prune_tracked(
+            &mut tracked,
+            &HashSet::from(["alive".to_string()]),
+            &HashSet::from([1u64]),
+            &HashSet::new(),
+        );
 
         let mut left: Vec<u64> = tracked.keys().copied().collect();
         left.sort();
@@ -2017,6 +2149,204 @@ mod tests {
             vec![1, 3],
             "#2 really is gone from a repo we READ; #3's project was never probed, so we know \
              nothing about it and must not delete it"
+        );
+    }
+
+    // ══ LIST SATURATION (bead sparkle-qogah) ════════════════════════════════════════════════════
+    //
+    // "We should never hide a row that needs action from me." This is the ONE probe in the app that
+    // lists every author's open PRs, so it is the likeliest to fill its window — and a conflicting
+    // PR is untestable until someone rebases it, which makes it work the founder owes.
+
+    /// A `gh pr list` reply carrying `n` open PRs, each DIRTY, numbered from `first`.
+    fn dirty_rows(first: u64, n: u64) -> String {
+        let rows: Vec<String> = (first..first + n)
+            .map(|i| {
+                format!(
+                    r#"{{"number":{i},"title":"t","headRefName":"b{i}","headRefOid":"aaaaaaa{i}",
+                        "baseRefOid":"bbbbbbb{i}","mergeStateStatus":"DIRTY","url":"u{i}"}}"#
+                )
+            })
+            .collect();
+        format!("[{}]", rows.join(","))
+    }
+
+    /// A read that FILLS its window is not an authoritative list, and the caller has to be able to
+    /// tell. Asserts the value `probe_open_prs`'s caller receives, not an internal boolean.
+    #[test]
+    fn a_full_window_is_reported_saturated_and_a_short_one_authoritative() {
+        // Exactly at the cap: ambiguous by construction — either that is every open PR, or more
+        // fell off the end unannounced. It must resolve to NOT-AUTHORITATIVE.
+        let full = probe_from_stdout(&dirty_rows(1, 4), 4).expect("decodes");
+        assert_eq!(full.prs.len(), 4, "the rows still come through");
+        assert!(full.saturated, "a full window cannot be presented as the whole truth");
+
+        // One short of the cap proves pagination ended: the list IS complete, and hedging it would
+        // make every ordinary sweep claim it might be missing something.
+        let short = probe_from_stdout(&dirty_rows(1, 3), 4).expect("decodes");
+        assert!(!short.saturated);
+
+        // Over the cap is saturated too — a ceiling is a ceiling, so this must not slip through an
+        // equality check.
+        assert!(probe_from_stdout(&dirty_rows(1, 5), 4).expect("decodes").saturated);
+
+        // An empty list can never be saturated, so the quiet case gains no hedge.
+        let empty = probe_from_stdout("[]", 4).expect("decodes");
+        assert!(!empty.saturated && empty.prs.is_empty());
+
+        // And garbage is still UNKNOWN, never a saturated empty list — the null-vs-zero discipline
+        // this module opens with is unaffected.
+        assert_eq!(probe_from_stdout("not json", 4), None);
+    }
+
+    /// Saturation is judged on the RAW rows `gh` sent, before the numberless-row filter. Judging it
+    /// after would let ONE malformed row make a truncated page read as complete — the exact
+    /// inversion of the failure this guards.
+    #[test]
+    fn a_dropped_row_does_not_make_a_full_window_look_authoritative() {
+        let stdout = r#"[{"title":"no number"},{"number":7,"mergeStateStatus":"DIRTY"}]"#;
+        let probed = probe_from_stdout(stdout, 2).expect("decodes");
+        assert_eq!(probed.prs.len(), 1, "the numberless row is dropped, as before");
+        assert!(
+            probed.saturated,
+            "gh's cap applied to what it SENT, so a dropped row is still proof the window was full"
+        );
+    }
+
+    /// THE DEFECT WITH REAL CONSEQUENCES: a saturated list must not be read as evidence that the
+    /// PRs it omitted went away.
+    ///
+    /// `prune_tracked` drops a tracked PR the moment a project it READ fails to list it, and
+    /// `tick` then feeds what survived to `sweep_closed_flags` — so a full page silently deleted the
+    /// ladder state AND the already-raised conflict flag of every PR past the cap. That is an
+    /// actionable row disappearing because a page was full, which is precisely what bead
+    /// sparkle-qogah exists to eliminate.
+    #[test]
+    fn a_saturated_sweep_does_not_forget_the_prs_its_page_could_not_hold() {
+        let mut tracked: HashMap<u64, Tracked> = HashMap::new();
+        for (pr, project) in [(1u64, "busy"), (2, "busy"), (3, "quiet")] {
+            tracked.insert(
+                pr,
+                Tracked {
+                    state: PrState::default(),
+                    due_at_ms: 0,
+                    project_id: project.into(),
+                    facts: PrFacts { number: pr, ..conflicting_facts() },
+                },
+            );
+        }
+
+        // Both projects were READ. `busy` filled its window and listed only #1 — #2 fell off the end.
+        // `quiet` answered completely and no longer lists #3, which really did close.
+        prune_tracked(
+            &mut tracked,
+            &HashSet::from(["busy".to_string(), "quiet".to_string()]),
+            &HashSet::from([1u64]),
+            &HashSet::from(["busy".to_string()]),
+        );
+
+        let mut left: Vec<u64> = tracked.keys().copied().collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![1, 2],
+            "#2 is missing only because the page was FULL, which is no more a merge than 'we could \
+             not look'; #3 is genuinely absent from a complete list and correctly forgotten"
+        );
+    }
+
+    /// RETAINING IS NOT ENOUGH — a retained PR nobody looks at is a PR that never escalates again.
+    ///
+    /// The tail of a saturated list is absent from `seen`, so without this it would keep its state
+    /// and simply stop being examined: no rung, no flag, no nudge. For a conflicting PR the founder
+    /// owes a rebase, "tracked but never looked at again" and "hidden" are the same thing to him.
+    #[test]
+    fn the_tail_of_a_saturated_list_keeps_climbing_blind() {
+        let mut tracked: HashMap<u64, Tracked> = HashMap::new();
+        for (pr, project) in [(11u64, "busy"), (12, "busy"), (13, "busy"), (99, "other")] {
+            tracked.insert(
+                pr,
+                Tracked {
+                    state: PrState::default(),
+                    due_at_ms: 0,
+                    project_id: project.into(),
+                    facts: PrFacts { number: pr, ..conflicting_facts() },
+                },
+            );
+        }
+
+        // The truncated page mentioned #12 only.
+        let fill = saturated_blind_fill(&tracked, "busy", &HashSet::from([12u64]));
+        assert_eq!(
+            fill,
+            vec![11, 13],
+            "every tracked PR of the saturated project that the page omitted — sorted, so the \
+             looks a sweep produces don't depend on HashMap order"
+        );
+        assert!(
+            !fill.contains(&99),
+            "another project's PRs are not this project's problem"
+        );
+
+        // A COMPLETE page mentioning everything produces no blind looks at all, so this cannot
+        // become a source of permanent unresolvable churn on a healthy repo.
+        assert!(saturated_blind_fill(
+            &tracked,
+            "busy",
+            &HashSet::from([11u64, 12, 13])
+        )
+        .is_empty());
+    }
+
+    /// The reason a blind look carries reaches the founder on the row as `blocked_by`, so a
+    /// truncated LIST must not present itself as `gh` being down — they call for different actions
+    /// (one is "your repo has more PRs than the cap", the other "fix your auth").
+    #[test]
+    fn a_saturated_blind_look_names_truncation_rather_than_a_broken_gh() {
+        let facts = conflicting_facts();
+        let (state, decision) = climb(&observation(&facts, Some(SATURATED_REASON)), 3);
+        let flag = build_flag(&facts, None, &decision, &state, None);
+        assert_eq!(
+            flag.blocked_by.as_deref(),
+            Some("gh-list-saturated"),
+            "'your repo has more PRs than the cap' and 'fix your gh auth' call for different \
+             actions, so the row must not conflate them"
+        );
+        assert_eq!(flag.kind, "conflicting", "the inherited verdict is still on the row");
+        assert_eq!(flag.target, "agent", "and it still reaches somebody");
+    }
+
+    /// The cap is now read from one constant on the argv, so a future edit cannot move the query's
+    /// limit without moving the number saturation is detected at. A literal in the argv is exactly
+    /// how the two drifted apart before.
+    /// SCANS ONLY THE NON-TEST HALF OF THE FILE, and that is load-bearing rather than tidiness.
+    /// The first version of this test read the whole of `include_str!` — including itself — so the
+    /// literal it searched for was present *because the assertion quoted it*, and the test failed
+    /// against correct source. The positive half was worse: `src.contains("&PROBE_LIMIT…")` is
+    /// satisfied by the assertion's own text, so it could never fail no matter what the argv said.
+    /// Self-reading source scans are vacuous in one direction and self-defeating in the other;
+    /// cutting the test module off leaves a needle that only real code can satisfy.
+    #[test]
+    fn the_probe_asks_for_exactly_the_limit_saturation_is_judged_against() {
+        let whole = include_str!("conflict_watch.rs");
+        let code = whole
+            .split_once("#[cfg(test)]")
+            .expect("the test module marker anchors this scan")
+            .0;
+        assert!(
+            code.contains("&PROBE_LIMIT.to_string(),"),
+            "the --limit argument must be PROBE_LIMIT itself, not a literal beside it"
+        );
+        // Any bare numeric literal on the argv is the drift this guards: the query's ceiling and the
+        // number saturation is judged against must be ONE constant, or a future edit moves one and
+        // silently truncates without disclosing it.
+        let limit_arg_is_literal = code
+            .split(r#""--limit","#)
+            .skip(1)
+            .any(|rest| rest.trim_start().starts_with('"'));
+        assert!(
+            !limit_arg_is_literal,
+            "a hard-coded number is back on the argv beside --limit"
         );
     }
 

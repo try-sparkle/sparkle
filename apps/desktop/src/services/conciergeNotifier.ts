@@ -32,11 +32,27 @@
 // Nobody listening is a REAL state, not a defect: no window is open, the host is unmounted, or this
 // is a satellite window that never had a concierge. The Pusher treats it as an undelivered push,
 // keeps the finding owed, and retries next sweep.
+//
+// AND FOR A LONG TIME THE BOOLEAN ONLY MEASURED THAT ONE STATE (bead sparkle-qogah). It answered
+// "was a sink registered", then returned `true` for everything the sink itself refused — a disposed
+// scheduler, an overflowing owed list. So this file made the fifth delivery path the fourth
+// false-success rather than the exception to them, in the middle of a header saying it must not be.
+// The sink type now returns a boolean and that answer is propagated verbatim; "somebody was
+// listening" and "the message was accepted" are two facts and only the second one is reported.
 
 import { log } from "../logger";
 
-/** What a registered sink looks like — `ProactiveScheduler.notify`, structurally. */
-export type ConciergeNotifier = (text: string) => void;
+/**
+ * What a registered sink looks like — `ProactiveScheduler.notify`, structurally.
+ *
+ * IT RETURNS A BOOLEAN, and that is the fix for the defect the header above describes arriving
+ * through this very file (bead sparkle-qogah). While this was `=> void` there was no way for a sink
+ * to refuse: `notifyConcierge` called it and returned `true` unconditionally, so the scheduler's own
+ * `disposed` guard and its overflow drop both read to the Pusher as successful deliveries. The
+ * contract is now the same one `notifyConcierge` publishes to its callers — true only if the text is
+ * genuinely owed and will be acted on.
+ */
+export type ConciergeNotifier = (text: string) => boolean;
 
 let sink: ConciergeNotifier | null = null;
 
@@ -74,9 +90,17 @@ export function conciergeNotifierAvailable(): boolean {
 }
 
 /**
- * Push one finding to the concierge. Returns whether it was actually handed over.
+ * Push one finding to the concierge. Returns whether it was actually ACCEPTED — not merely whether
+ * there was somebody to hand it to.
  *
  * `false` means the caller's message went NOWHERE and must stay owed — see the header.
+ *
+ * THE SINK'S OWN ANSWER IS THE ANSWER (bead sparkle-qogah). This used to be `fn(text); return true;`,
+ * which turned "a sink exists" into "the message was delivered" — two different facts, and the gap
+ * between them is where findings died. A registered-but-disposed scheduler, or one refusing at its
+ * ceiling, discards the text on its own guards; reporting that as success made `pusherRunner` spend
+ * a rate-budget slot and stamp the condition as reported for four hours, so the finding was not just
+ * lost but suppressed at source. A sink that says no is now propagated as no.
  */
 export function notifyConcierge(text: string): boolean {
   const fn = sink;
@@ -85,7 +109,14 @@ export function notifyConcierge(text: string): boolean {
     return false;
   }
   try {
-    fn(text);
+    const accepted = fn(text);
+    if (!accepted) {
+      // A REFUSAL IS NOT AN ERROR, and it is not silence either: the sink is alive and declining
+      // this specific text, so it is worth a line the way a failed inbox write is. The finding
+      // stays owed and comes back next sweep.
+      log.warn("pusher", "concierge push refused by the sink; the finding stays owed");
+      return false;
+    }
     return true;
   } catch (e) {
     // A throwing sink is a failed delivery, not a crashed sweep. Reported as false so the finding is

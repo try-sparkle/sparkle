@@ -88,16 +88,17 @@ describe("rollupDot — a childless row is just itself", () => {
     expect(rollupDot("idle", w())).toBe("gray");
   });
 
-  // `unmerged` is GRAY on purpose (tokens.ts: it is a LANDING state, not an alarm — it was red until
-  // 2026-07-26, when 27 of 51 agents sat in that band and made red meaningless). The rollup must
-  // inherit that judgement rather than quietly re-escalating it.
-  it("keeps `unmerged` calm", () => {
+  // A row's OWN `unmerged` stays GRAY (tokens.ts: it is a LANDING state, not an alarm — it was red
+  // until 2026-07-26, when 27 of 51 agents sat in that band and made red meaningless). The rollup
+  // inherits that judgement for the row's own status and does not re-escalate it.
+  //
+  // ⚠️ THIS CLAUSE IS ABOUT THE ROW'S OWN STATUS ONLY. A CHILD's `unmerged` now escalates — see the
+  // "a child that owes a merge" block at the bottom, and the header of workerRollup.ts for why the
+  // two are deliberately asymmetric (a head's own unmerged already has a row and a "Needs merge"
+  // label; a folded child has neither).
+  it("keeps a row's OWN `unmerged` calm", () => {
     expect(rollupDot("unmerged", w())).toBe("gray");
-    expect(rollupDot("idle", w("unmerged", "unmerged"))).toBe("gray");
-  });
-
-  it("does not let unmerged workers drag a green head off green", () => {
-    expect(rollupDot("idle", w("working", "unmerged"))).toBe("green");
+    expect(rollupDot("unmerged", w("idle", "done"))).toBe("gray");
   });
 });
 
@@ -255,6 +256,18 @@ describe("withWorkerRollupGreen — one truth for every surface", () => {
     );
     expect(out.p1).toBe("waiting");
     expect(out.solo).toBe("errored");
+  });
+
+  // THE SECOND LOCK, which nothing in this file pinned before: `withWorkerRollupGreen` skips a head
+  // whose current status is `unmerged`, and deleting that skip left the whole suite green (the
+  // rollupDot side is the FIRST lock, and it is tested through `rollupDot` directly — but this
+  // function is what WRITES into the shared status map, so losing `unmerged` here costs the "Needs
+  // merge" label, conciergeRecap's classification and isCalmBand all at once). A caller passing its
+  // own `dotOf` reaches this arm without going through rollupDot at all, which is exactly how a
+  // regression would arrive.
+  it("never promotes an `unmerged` head, even when handed a green dot", () => {
+    const out = withWorkerRollupGreen(agents, { p1: "unmerged", w1: "working", solo: "idle" }, green);
+    expect(out.p1).toBe("unmerged");
   });
 
   it("does not touch a head whose rollup is not green", () => {

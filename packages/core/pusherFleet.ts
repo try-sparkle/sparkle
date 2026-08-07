@@ -282,10 +282,56 @@ export interface FleetCondition {
   id: FleetConditionId;
   /** The agents this condition covers, in the order the report names them. */
   agentIds: string[];
+  /**
+   * WHAT THIS CONDITION IS ABOUT, as identity rather than as prose — the content fingerprint the
+   * report cooldown compares one episode against the next.
+   *
+   * ── WHY `agentIds` COULD NOT BE THIS ─────────────────────────────────────────────────────────
+   * The cooldown re-opens on GROWTH, and it used to read growth off `agentIds` alone. That is a
+   * fingerprint only for the classes whose subject IS an agent. Two classes here have no agent, or
+   * cannot resolve one:
+   *
+   *   • `duty-overdue` hard-codes `agentIds: []` on purpose — a duty is a CAPABILITY, and borrowing
+   *     an agent id would put an unrelated agent in the cooldown's key.
+   *   • `pr-conflicting` lists RESOLVED owners only, and the five PRs this class was built for all
+   *     resolve to `ownerAgentId: null` (see {@link ConflictingPr}). For exactly the case that
+   *     motivated it, the list is empty.
+   *
+   * An empty list can never gain a member, so `[].some(...)` is always false and growth was
+   * UNDETECTABLE: a brand-new conflicting, untested PR appearing sixty seconds after a report was
+   * invisible for the full `REPEAT_COOLDOWN_MS`, every time, forever — the four-hour blind spot
+   * `pusherFleetReport`'s header says was closed for `quota-blocked`, silently rebuilt for the two
+   * classes whose subject is not an agent.
+   *
+   * ── WHAT GOES IN IT ──────────────────────────────────────────────────────────────────────────
+   * The identity of each thing the report NAMES, namespaced so two classes cannot collide:
+   * `agent:<id>`, `duty:<name>`, `pr:<number>`. Never a measurement — a count that ticks up, an age
+   * that grows, a commits-behind that drifts are not new members, and treating them as such would
+   * re-send the same paragraph on a timer.
+   *
+   * ── EMPTY MEANS "CANNOT BE FINGERPRINTED", WHICH FAILS OPEN ──────────────────────────────────
+   * Every class below fills this, so `[]` is reachable only for a class added later that genuinely
+   * has no identity to name. `hasNewMember` treats that as a new episode and REPORTS it. Silence is
+   * the failure mode this whole mechanism exists to eliminate, so an unanswerable "has it changed?"
+   * must resolve to speaking, never to four more hours of quiet.
+   */
+  members: string[];
   /** Every number the report may quote for this condition — counts plus {@link quotedNumbers}. */
   measured: string[];
   /** The finished sentence(s). Built only from `measured`; no model composes it. */
   text: string;
+}
+
+/**
+ * The fingerprint of a set of agents — the identity half of {@link FleetCondition.members} for the
+ * four classes whose subject really is an agent.
+ *
+ * Namespaced rather than raw so that `agent:x` from one class can never be confused with a `pr:x`
+ * or `duty:x` from another, and deduplicated because one agent can appear twice in a class built
+ * from several cohorts (`shared-failure` flattens them).
+ */
+function agentMembers(snapshots: readonly FleetSnapshot[]): string[] {
+  return [...new Set(snapshots.map((s) => `agent:${s.agentId}`))];
 }
 
 /**
@@ -551,6 +597,7 @@ function quotaCondition(walled: readonly FleetSnapshot[]): FleetCondition {
     return {
       id: "quota-blocked",
       agentIds: walled.map((s) => s.agentId),
+      members: agentMembers(walled),
       measured: [String(n), ...quotedNumbers(earliest.quota.message)],
       text:
         `${n} ${plural} quota-blocked and cannot run at all. The earliest reset is the one ` +
@@ -563,6 +610,7 @@ function quotaCondition(walled: readonly FleetSnapshot[]): FleetCondition {
   return {
     id: "quota-blocked",
     agentIds: walled.map((s) => s.agentId),
+    members: agentMembers(walled),
     measured: [String(n)],
     text:
       `${n} ${plural} quota-blocked and cannot run at all. None of the limit messages named a ` +
@@ -603,6 +651,7 @@ function sharedFailureCondition(
   return {
     id: "shared-failure",
     agentIds: agents.map((s) => s.agentId),
+    members: agentMembers(agents),
     measured: [
       String(total),
       String(cohorts.length),
@@ -636,6 +685,11 @@ function dutyCondition(
     // A duty is not an agent, and the report must not imply one is stuck. Empty rather than
     // borrowing an agent id, which would put an unrelated agent in the cooldown's membership key.
     agentIds: [],
+    // ...which is exactly why this class needs `members`. With `agentIds: []` as the only
+    // fingerprint, a SECOND duty going overdue during the cooldown could not be seen as growth and
+    // went unreported for four hours. The duty's own name is its identity — it is what the line
+    // names, and it is stable across sweeps in a way the overdue-by age is not.
+    members: overdue.map(({ duty }) => `duty:${duty.name}`),
     measured: [
       String(n),
       ...overdue.flatMap(({ duty, overdueBy }) => {
@@ -820,6 +874,25 @@ export function conflictCondition(
     // are named in the text, and said to be unresolved, which is the whole reason the text carries
     // them rather than leaving the reader to infer them from a list of ids.
     agentIds: [...new Set(ordered.map((c) => c.ownerAgentId).filter((id): id is string => id !== null))],
+    // THE PR NUMBER IS THE IDENTITY, and it is what makes this class's cooldown work at all. The
+    // `agentIds` above are resolved owners ONLY, and the PRs this class was built for resolve to
+    // none — so the growth rule had nothing to compare and a new conflicting PR was silent for four
+    // hours. GitHub's number is the one handle that exists for every PR, resolved owner or not.
+    //
+    // A CONFLICTING PR CARRIES A SECOND MEMBER, so that a PR going stale → conflicting registers as
+    // GROWTH rather than as a change the growth-only rule ignores. That transition is the moment
+    // the PR stops being tested at all, which is the whole fact this class exists to carry, and it
+    // would otherwise wait out the cooldown in silence. Emitting BOTH members for a conflicting PR
+    // (rather than swapping one for the other) is what keeps the rule growth-only: the reverse trip
+    // conflicting → stale is an IMPROVEMENT and is a strict subset of what was already said, so it
+    // stays quiet, and a PR that flaps back finds the stamp already covering it.
+    members: [
+      ...new Set(
+        ordered.flatMap((c) =>
+          c.kind === "conflicting" ? [`pr:${c.pr}`, `pr:${c.pr}:conflicting`] : [`pr:${c.pr}`],
+        ),
+      ),
+    ],
     measured: [
       String(nC),
       String(nS),
@@ -850,6 +923,7 @@ function escalationCondition(escalated: readonly FleetSnapshot[]): FleetConditio
   return {
     id: "goals-escalated",
     agentIds: escalated.map((s) => s.agentId),
+    members: agentMembers(escalated),
     measured: [
       String(n),
       ...quotedNumbers(...escalated.flatMap((s) => [s.label, s.escalation?.reason])),
@@ -869,6 +943,7 @@ function retireCondition(retirable: readonly FleetSnapshot[]): FleetCondition {
   return {
     id: "done-not-retired",
     agentIds: retirable.map((s) => s.agentId),
+    members: agentMembers(retirable),
     measured: [String(n), ...quotedNumbers(...retirable.map((s) => s.label))],
     text:
       `${n} ${plural} met their goal with no unlanded work, and are still open — each one holds a ` +

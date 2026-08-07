@@ -10,6 +10,7 @@ import {
   PROACTIVE_MAX_PER_HOUR,
   PROACTIVE_MIN_INTERVAL_MS,
   MAX_PENDING_NOTICES,
+  PENDING_NOTICE_HARD_CAP,
   accountedNeedsYou,
   buildProactivePrompt,
   createProactiveScheduler,
@@ -709,16 +710,6 @@ describe("notify — the Pusher's second input (sparkle-4cd0x)", () => {
     expect(h.fired[1]!.prompt).toContain("Agent B is blocked on CI");
   });
 
-  it("bounds what one turn carries, keeping the newest", () => {
-    const h = harness();
-    const s = createProactiveScheduler(h.deps);
-    for (let i = 0; i < MAX_PENDING_NOTICES + 4; i++) s.notify(`finding ${i}`);
-    h.advance(PROACTIVE_COALESCE_MS);
-    const prompt = h.fired[0]!.prompt;
-    expect(prompt).not.toContain("finding 0");
-    expect(prompt).toContain(`finding ${MAX_PENDING_NOTICES + 3}`);
-  });
-
   it("ignores empty text and does nothing after dispose", () => {
     const h = harness();
     const s = createProactiveScheduler(h.deps);
@@ -730,6 +721,151 @@ describe("notify — the Pusher's second input (sparkle-4cd0x)", () => {
     s.notify("too late");
     h.advance(PROACTIVE_COALESCE_MS * 10);
     expect(h.fired).toHaveLength(0);
+  });
+});
+
+describe("NOTHING OWED IS EVER SILENTLY LOST (bead sparkle-qogah)", () => {
+  // FOUNDER'S RULE, VERBATIM, P0: "We should never hide a row that needs action from me."
+  //
+  // These findings are the most explicitly actionable items this app produces — the preamble that
+  // carries them says "they are yours to act on… Act on each one now". `notify` used to end with
+  // `while (pendingNotices.length > MAX_PENDING_NOTICES) pendingNotices.shift()`, discarding the
+  // OLDEST with no record, no count, no retry and no residue of any kind, while telling the Pusher
+  // it had been delivered. The test below this comment block used to PIN that behaviour as intended
+  // (`expect(prompt).not.toContain("finding 0")`); it is inverted here.
+  //
+  // Rule 3 of the same bead answers the objection this cap was defending against: if uncapping
+  // makes the surface tall, that is CORRECT. Prompt length is the "height" argument, and height is
+  // never a licence to conceal work the founder owes.
+
+  it("names EVERY finding in the emitted prompt, well past the readability threshold", () => {
+    // Asserted on the EMITTED PROMPT, not on the internal list — the prompt is the only thing the
+    // concierge can act on, so it is the only place "not lost" means anything.
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    const total = MAX_PENDING_NOTICES + 4;
+    for (let i = 0; i < total; i++) s.notify(`finding ${i}`);
+    h.advance(PROACTIVE_COALESCE_MS);
+
+    expect(h.fired).toHaveLength(1);
+    const prompt = h.fired[0]!.prompt;
+    // The one that used to be destroyed, first and by name.
+    expect(prompt).toContain("finding 0");
+    for (let i = 0; i < total; i++) expect(prompt).toContain(`finding ${i}`);
+    // Every one as its own bullet, so "accounted for" is not satisfied by a summary sentence that
+    // happens to contain the substring.
+    expect(prompt.match(/^• finding \d+$/gm)).toHaveLength(total);
+  });
+
+  it("discloses the count and states outright that nothing was withheld", () => {
+    // If a future change re-introduces a drop, this sentence becomes false — which is the point of
+    // asserting on it. A cap is only tolerable with an explicit, non-optional disclosure.
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    const total = MAX_PENDING_NOTICES + 4;
+    for (let i = 0; i < total; i++) s.notify(`finding ${i}`);
+    h.advance(PROACTIVE_COALESCE_MS);
+
+    const prompt = h.fired[0]!.prompt;
+    expect(prompt).toContain(`All ${total} are listed below`);
+    expect(prompt).toContain("none has been withheld");
+  });
+
+  it("keeps the short form when the list is short — the header is for the wall, not for two items", () => {
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    s.notify("Agent A is quota-walled");
+    s.notify("Agent B has an expired goal");
+    h.advance(PROACTIVE_COALESCE_MS);
+
+    const prompt = h.fired[0]!.prompt;
+    expect(prompt).toContain("• Agent A is quota-walled");
+    expect(prompt).toContain("• Agent B has an expired goal");
+    expect(prompt).not.toContain("none has been withheld");
+  });
+
+  it("carries every one across a DECLINE too — the overflow is not laundered by a retry", () => {
+    // The two mechanisms have to compose: surviving a decline is worthless if the list was already
+    // truncated before the turn was attempted.
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    h.decline();
+    const total = MAX_PENDING_NOTICES + 4;
+    for (let i = 0; i < total; i++) s.notify(`finding ${i}`);
+    h.advance(PROACTIVE_COALESCE_MS);
+    expect(h.fired).toHaveLength(1);
+
+    h.acceptAgain();
+    h.advance(PROACTIVE_MIN_INTERVAL_MS);
+    expect(h.fired).toHaveLength(2);
+    for (let i = 0; i < total; i++) expect(h.fired[1]!.prompt).toContain(`finding ${i}`);
+  });
+});
+
+describe("notify reports the truth about what it accepted (bead sparkle-qogah)", () => {
+  // `notify` returned `void`, and every caller in the chain read that as success:
+  // `notifyConcierge` did `fn(text); return true;`, `pusherMount.sendVerified` handed the `true`
+  // back, and `pusherRunner` took its `delivered` branch — recording outcome "sent", spending a
+  // rate-budget slot, and STAMPING the condition as reported for a four-hour cooldown. A finding
+  // discarded here was therefore also suppressed at source for four hours.
+
+  it("returns TRUE when the finding is genuinely now owed", () => {
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    expect(s.notify("Agent A is quota-walled")).toBe(true);
+  });
+
+  it("returns FALSE after dispose — the text reaches no prompt, ever", () => {
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    s.dispose();
+    expect(s.notify("Agent A is quota-walled")).toBe(false);
+    // ...and the boolean is not merely decorative: nothing is delivered either.
+    h.advance(PROACTIVE_COALESCE_MS * 10);
+    expect(h.fired).toHaveLength(0);
+  });
+
+  it("returns FALSE on empty text rather than counting a blank as delivered", () => {
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    expect(s.notify("   ")).toBe(false);
+  });
+
+  it("returns TRUE for an already-owed finding — it IS pending and WILL be delivered", () => {
+    // The one refusal that is honestly a success, and the reason this is not simply "false unless we
+    // pushed". The Pusher re-measures a standing condition every sweep; the work is owed either way,
+    // so the cooldown is legitimately earned and a second identical bullet would help nobody.
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    expect(s.notify("Agent A is quota-walled")).toBe(true);
+    expect(s.notify("Agent A is quota-walled")).toBe(true);
+    h.advance(PROACTIVE_COALESCE_MS);
+    expect(h.fired[0]!.prompt.match(/Agent A is quota-walled/g)).toHaveLength(1);
+  });
+
+  it("returns FALSE at the hard ceiling, refusing the NEWCOMER instead of destroying an incumbent", () => {
+    // The ceiling exists so an owed list cannot grow without bound when a transport declines for
+    // hours against a Pusher minting text that differs by a digit. Which END it refuses is the whole
+    // question: dropping the oldest destroys a finding whose condition is already stamped for four
+    // hours, with no retry. Refusing the arrival returns false, so `pusherRunner` records
+    // transport-failed, stamps nothing, and re-offers it next sweep.
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    for (let i = 0; i < PENDING_NOTICE_HARD_CAP; i++) {
+      expect(s.notify(`finding ${i}`)).toBe(true);
+    }
+    expect(s.notify("the one that arrives at a full list")).toBe(false);
+
+    // THE INCUMBENTS ARE ALL STILL THERE — the refusal cost nothing that was already owed.
+    h.advance(PROACTIVE_COALESCE_MS);
+    const prompt = h.fired[0]!.prompt;
+    expect(prompt).toContain("finding 0");
+    expect(prompt).toContain(`finding ${PENDING_NOTICE_HARD_CAP - 1}`);
+    expect(prompt.match(/^• finding \d+$/gm)).toHaveLength(PENDING_NOTICE_HARD_CAP);
+    expect(prompt).not.toContain("the one that arrives at a full list");
+
+    // ...and once they drain, the refused one is accepted on the retry the `false` bought.
+    expect(s.notify("the one that arrives at a full list")).toBe(true);
   });
 });
 

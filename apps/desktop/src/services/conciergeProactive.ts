@@ -108,8 +108,16 @@ export interface ProactiveScheduler {
    * IDEMPOTENT ON TEXT. The Pusher re-measures the same fleet every sweep, so the identical
    * sentence arrives repeatedly while the condition holds; re-sending it is a no-op until the one
    * that is already owed has been delivered.
+   *
+   * RETURNS WHETHER THE FINDING IS NOW OWED — i.e. whether it will reach a prompt. This used to
+   * return `void`, and the caller chain assumed that meant success: `notifyConcierge` did
+   * `fn(text); return true;`, `pusherMount.sendVerified` handed that `true` back, and
+   * `pusherRunner` took its `delivered` branch — recording outcome "sent", spending a rate-budget
+   * slot, and stamping the condition as reported for a four-hour cooldown. So on every path that
+   * silently refused the text, the finding was destroyed AND suppressed at source for four hours.
+   * `false` here is the caller's instruction to keep it owed and offer it again next sweep.
    */
-  notify(text: string): void;
+  notify(text: string): boolean;
   /** Stop scheduling and drop any armed timer. */
   dispose(): void;
   stats(): ProactiveStats;
@@ -128,9 +136,81 @@ export const PUSHER_NOTICE_PREAMBLE =
   "Act on each one now (read the job, arbitrate, restart, or say the one thing the founder has to " +
   "decide); do not simply relay them to him.\n";
 
-/** The most findings one turn will carry, newest kept. Beyond this the prompt stops being readable
- *  and a concierge that is handed thirty items acts on none of them. */
+/**
+ * A READABILITY THRESHOLD, NOT A DROP THRESHOLD — and the difference is the whole of bead
+ * sparkle-qogah.
+ *
+ * ── WHAT THIS USED TO BE, AND WHY IT WAS THE BUG ─────────────────────────────────────────────────
+ * This was the length `notify` truncated the owed list to, with `pendingNotices.shift()` discarding
+ * the OLDEST finding: no record, no count, no retry, no residue of any kind. That is the founder's
+ * P0 rule inverted at its sharpest point. The preamble directly above literally says these are "yours
+ * to act on… Act on each one now" — they are the most explicitly actionable items this app produces,
+ * and the ninth one to arrive was destroyed in silence.
+ *
+ * It compounded, too. `notify` returned `void`, so `notifyConcierge` reported the destroyed finding
+ * as DELIVERED, and `pusherRunner` then stamped its condition as reported for a four-hour cooldown
+ * and spent a rate-budget slot on it. The finding was not merely dropped; it was suppressed at
+ * source for four hours by the act of dropping it.
+ *
+ * Every sibling cap in this codebase announces its drops — `stores/conciergeApprovals` announces
+ * expiry, `engine/conciergeTurnQueue` returns `dropped`, `services/pendingSends` calls `onPruned`.
+ * This one alone was silent.
+ *
+ * ── WHAT IT IS NOW ───────────────────────────────────────────────────────────────────────────────
+ * Nothing owed is discarded. Past this count the prompt CHANGES SHAPE rather than losing entries: it
+ * states how many there are and says outright that none was withheld, then names every one. A long
+ * prompt is the "the surface got tall" argument, and height is never a reason to conceal work the
+ * founder owes — scroll it, do not hide it. See {@link buildNoticeSection}.
+ */
 export const MAX_PENDING_NOTICES = 8;
+
+/**
+ * The one hard ceiling on the owed list, and it REFUSES THE NEWCOMER rather than destroying
+ * something already owed.
+ *
+ * This is a memory backstop, not a concealment. Findings are deduplicated on exact text and cleared
+ * on delivery, so a real fleet never approaches it; what it bounds is the degenerate case where a
+ * transport declines for hours while the Pusher keeps minting text that differs by a digit ("walled
+ * for 3h07m", "walled for 3h08m") — an unbounded list held by a scheduler that lives as long as the
+ * window.
+ *
+ * THE DIRECTION OF THE REFUSAL IS THE POINT. Dropping the oldest destroys a finding whose condition
+ * the Pusher has already stamped as reported — gone, with no retry. Refusing the newest returns
+ * `false` to the caller, so `pusherRunner` takes its `transport-failed` branch: no cooldown stamped,
+ * no budget slot spent, and the finding is re-offered on the very next sweep. Nothing is lost either
+ * way round, and only one of the two is honest about it.
+ *
+ * Deliberately far above any real count: reaching it at all is a signal that something upstream is
+ * malfunctioning, and it should not be reachable by an ordinarily busy fleet.
+ */
+export const PENDING_NOTICE_HARD_CAP = 200;
+
+/**
+ * Render the owed findings into the half of the prompt that carries them. EVERY finding is named,
+ * however many there are.
+ *
+ * The old readability worry was real and is answered here rather than by dropping: a concierge handed
+ * thirty bare bullets acts on none of them, so past {@link MAX_PENDING_NOTICES} the list gets a
+ * header that states the count, says explicitly that nothing was withheld, and asks for triage. That
+ * turns "a wall of text" into "a long list with instructions", which is a readability problem the
+ * model can actually solve — unlike the previous answer, which solved it by destroying the evidence.
+ *
+ * The "none has been withheld" sentence is an assertion this function has to keep true. If a future
+ * change ever does withhold something here, that sentence must become an exact count of what was
+ * withheld and why — a cap without a disclosure is the bug this function was written to remove.
+ */
+export function buildNoticeSection(notices: readonly string[]): string {
+  if (notices.length === 0) return "";
+  const body = notices.map((n) => `• ${n}`).join("\n");
+  if (notices.length <= MAX_PENDING_NOTICES) return PUSHER_NOTICE_PREAMBLE + body;
+  return (
+    PUSHER_NOTICE_PREAMBLE +
+    `There are ${notices.length} of them — more than usual. All ${notices.length} are listed below; ` +
+    "none has been withheld. Work the list: act on what you can, group what is the same underlying " +
+    "problem, and name plainly the ones you cannot move.\n" +
+    body
+  );
+}
 
 /** Every agent in the feed, across projects. */
 function allAgents(feed: ConciergeFeed): ConciergeAgent[] {
@@ -321,6 +401,14 @@ export function createProactiveScheduler(deps: ProactiveDeps): ProactiveSchedule
    * been walled for three hours" does not stop being true because the roster settled. So notices are
    * cleared on exactly one event, DELIVERY, and a decline leaves them owed. That is the same
    * "the change is still OWED" rule `fire`'s settle path already applies to a feed change.
+   *
+   * ── AND NOTHING ELSE EVER REMOVES FROM IT (bead sparkle-qogah) ─────────────────────────────────
+   * There is exactly ONE `pendingNotices` removal in this file, in `settle`'s delivered branch, and
+   * it removes by identity. It used to have a sibling — `notify` truncated the list with `shift()`
+   * — and that sibling destroyed the oldest owed finding with no record, no count and no retry,
+   * while the caller was told the delivery had succeeded. If you are adding a second remover,
+   * you are re-introducing that defect; the ceiling is enforced at the DOOR instead
+   * (see {@link PENDING_NOTICE_HARD_CAP}), where a refusal can still be reported to the caller.
    */
   let pendingNotices: string[] = [];
   /** The digest we last seeded or spoke about. */
@@ -437,7 +525,9 @@ export function createProactiveScheduler(deps: ProactiveDeps): ProactiveSchedule
     if (!hasFeedChange && notices.length === 0) return;
     const prompt = [
       hasFeedChange ? buildProactivePrompt(feed) : null,
-      notices.length > 0 ? PUSHER_NOTICE_PREAMBLE + notices.map((n) => `• ${n}`).join("\n") : null,
+      // EVERY OWED FINDING GOES IN — `buildNoticeSection` names all of them however many there are,
+      // and changes shape rather than length past the readability threshold.
+      notices.length > 0 ? buildNoticeSection(notices) : null,
     ]
       .filter((part): part is string => part !== null)
       .join("\n\n");
@@ -565,16 +655,48 @@ export function createProactiveScheduler(deps: ProactiveDeps): ProactiveSchedule
   }
 
   return {
+    /**
+     * ── THE FOUR ANSWERS, AND WHY EACH ONE IS WHAT IT IS (bead sparkle-qogah) ────────────────────
+     *
+     * The return value is "is this finding now owed, and will it reach a prompt" — nothing weaker.
+     * All four paths below used to return `void` and were read by the caller as success, so it is
+     * worth stating each one rather than leaving the reader to infer it from the control flow:
+     *
+     *   1. DISPOSED → FALSE. The scheduler will never build another prompt, so this text reaches
+     *      nobody, ever. Reported honestly, the Pusher keeps the finding owed and the next window
+     *      to mount a concierge gets it. Reported as success — which is what happened — the
+     *      condition was stamped for four hours by a scheduler that was already dead. This is
+     *      exactly the false-success `conciergeNotifier`'s own header was written to prevent, and
+     *      it was arriving through the sink that header describes.
+     *   2. EMPTY TEXT → FALSE. Nothing is owed because there is nothing to say, but the caller
+     *      still must not record a delivery: an empty push is a bug upstream, and `false` surfaces
+     *      it as a `transport-failed` WARN instead of burning the condition's cooldown on a blank.
+     *   3. ALREADY OWED → TRUE, and this is the one refusal that is genuinely a success. The
+     *      identical sentence is ALREADY in `pendingNotices` and WILL be delivered; this call is
+     *      the Pusher re-measuring a condition that has not changed. The work is owed, so the
+     *      cooldown is legitimately earned — re-offering it would only duplicate the bullet.
+     *   4. AT THE HARD CEILING → FALSE. See {@link PENDING_NOTICE_HARD_CAP}: we refuse the arrival
+     *      rather than destroying something already owed, and `false` is what makes that refusal
+     *      recoverable — the Pusher re-offers it next sweep, by which time a delivery has drained
+     *      the list.
+     *
+     * There is deliberately NO path that returns `true` for text this scheduler did not accept.
+     */
     notify(text) {
-      if (disposed) return;
+      // (1) DISPOSED — see above.
+      if (disposed) return false;
       const finding = text.trim();
-      if (finding === "") return;
-      // Already owed — see the idempotence note on the interface. Returning early rather than
+      // (2) EMPTY — see above.
+      if (finding === "") return false;
+      // (3) ALREADY OWED — see the idempotence note on the interface. Returning early rather than
       // re-arming also means a Pusher sweeping every five minutes against a condition that lasts
-      // hours cannot keep pushing the coalescing window out in front of itself.
-      if (pendingNotices.includes(finding)) return;
+      // hours cannot keep pushing the coalescing window out in front of itself. TRUE, because the
+      // finding really is pending and really will be delivered.
+      if (pendingNotices.includes(finding)) return true;
+      // (4) THE HARD CEILING — refuse the newcomer, never destroy an incumbent. This replaces a
+      // `shift()` that discarded the oldest owed finding with no residue of any kind.
+      if (pendingNotices.length >= PENDING_NOTICE_HARD_CAP) return false;
       pendingNotices.push(finding);
-      while (pendingNotices.length > MAX_PENDING_NOTICES) pendingNotices.shift();
       // Opens the coalescing window if nothing else has. A finding that arrives while a feed change
       // is already pending rides the same turn, which is the cheaper outcome for both.
       if (pendingSince === null) {
@@ -582,6 +704,7 @@ export function createProactiveScheduler(deps: ProactiveDeps): ProactiveSchedule
         counted = new Set();
       }
       arm();
+      return true;
     },
     observe(feed) {
       if (disposed) return;

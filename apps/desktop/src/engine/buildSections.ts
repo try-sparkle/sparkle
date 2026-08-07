@@ -337,6 +337,22 @@ export const STATUS_BANDS: readonly StatusBandMeta[] = [
 // need you" that status was added to kill. "done" overstates it slightly — nothing was done — but
 // the vocabulary is three-valued (see STATUS_BANDS) and "nothing is stopping you" is the right one
 // of the three.
+/** Is the column narrowed to the ASKING bands and nothing else — the state the "Needs you" pill
+ *  renders as pressed, and the thing its click toggles?
+ *
+ *  ONE SEAM, because there were two copies and they drifted the moment a band was added. Both spelled
+ *  `needs_you && !running && !done`, which silently answered "yes" while the `questions` band was
+ *  also showing, and — worse — the toggle they guarded narrowed to `needs_you` ALONE, switching blue
+ *  off. `questions` means the agent cannot proceed without you exactly as `waiting`/`approval` do
+ *  (engine/attention has always classified it that way), so that hid owed work behind a control the
+ *  founder reads as "show me what needs me". Derived from STATUS_BANDS rather than listed, so a
+ *  fifth band is a compile-time decision here instead of a silent omission (bead sparkle-qogah). */
+export const ASKING_BANDS: readonly StatusBand[] = ["needs_you", "questions"];
+
+export function isAskingIsolated(filter: Record<StatusBand, boolean>): boolean {
+  return STATUS_BANDS.every((b) => filter[b.id] === ASKING_BANDS.includes(b.id));
+}
+
 export function bandOfStatus(status: AgentTabStatus): StatusBand {
   switch (status) {
     case "waiting":

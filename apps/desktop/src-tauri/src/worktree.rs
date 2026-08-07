@@ -3180,14 +3180,62 @@ fn probe_pr_by_commit(root: &str, tip: &str) -> (Option<String>, Option<u64>, Op
     decode_commit_pulls(&rows)
 }
 
+/// Row cap on both open-PR queries below — and the number a SATURATED read is detected at.
+///
+/// Mirrored on the JS side as `OPEN_PR_QUERY_LIMIT` in `services/openPrs.ts`, and the mirror is
+/// PINNED by `the_js_side_mirrors_the_same_open_pr_row_cap` rather than left to a comment, because a
+/// stale copy of this number silently understates the badge.
+///
+/// It was 100, with no truncation signal anywhere: the badge reported the truncated count as the
+/// total, and — the part with teeth — the PR MENU simply did not contain the 101st pull request, so
+/// a "Needs merge" row the founder owes was hidden behind a cap he had no way to see (bead
+/// sparkle-qogah: "we should never hide a row that needs action from me"). Raising it is not the
+/// fix; [`read_is_saturated`] is. `gh` pages internally at 100 rows a request and stops as soon as a
+/// page comes back short, so on any repo below the ceiling this costs exactly what 100 did.
+pub(crate) const OPEN_PR_LIST_LIMIT: u32 = 300;
+
+/// Did an open-PR read come back with its window FULL?
+///
+/// Same reasoning and deliberately the same shape as `knightwatch::read_is_saturated` and
+/// `roborev_probe::window_saturated`: `gh pr list --limit N` returns N rows with NO truncation
+/// signal of any kind, so a count that reaches the cap is the one ambiguous reading — either that
+/// is every open PR, or there are more and the remainder fell off the end unannounced. Reporting
+/// the second case as an authoritative total is how a `100` that means `400` reaches the founder.
+///
+/// `>=` rather than `==` because a cap is a CEILING: a `gh` that over-returned by one row must not
+/// read as authoritative merely for missing the equality.
+fn read_is_saturated(rows: usize, limit: u32) -> bool {
+    rows >= limit as usize
+}
+
+/// How many open PRs are waiting, and whether that number is a TOTAL or a FLOOR.
+///
+/// The two are inseparable, which is the whole point: a bare `u32` cannot say "at least", so every
+/// consumer of one was structurally forced to present a truncated count as exact.
+#[derive(Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenPrCount {
+    /// Rows `gh` returned. When `saturated`, this is a LOWER BOUND, never the total.
+    pub count: u32,
+    /// The query filled its [`OPEN_PR_LIST_LIMIT`]-row window, so `count` understates by an unknown
+    /// amount and must be rendered as "N+" rather than "N".
+    pub saturated: bool,
+}
+
 /// Pure decoder for a `gh pr list --json number` response → the number of open PRs. Kept separate
 /// from the spawn so the "what does this output mean" half is unit-testable without a network or a
 /// `gh` binary. Unparsable output reads as UNKNOWN (`None`), never as zero: the badge must be able
 /// to distinguish "no PRs waiting" from "couldn't find out", because rendering a confident `0` on a
 /// failed probe is exactly the false reassurance this feature exists to prevent.
-fn decode_open_pr_count(stdout: &str) -> Option<u32> {
+///
+/// A count AT `limit` carries `saturated: true` for the same family of reasons — it is the same
+/// null-vs-zero discipline one step further out, where the lie is not "zero" but "exactly 100".
+fn decode_open_pr_count(stdout: &str, limit: u32) -> Option<OpenPrCount> {
     let rows = serde_json::from_str::<Vec<Value>>(stdout).ok()?;
-    u32::try_from(rows.len()).ok()
+    Some(OpenPrCount {
+        count: u32::try_from(rows.len()).ok()?,
+        saturated: read_is_saturated(rows.len(), limit),
+    })
 }
 
 /// Best-effort count of OPEN pull requests in `root`'s repo authored by the current `gh` identity.
@@ -3200,10 +3248,20 @@ fn decode_open_pr_count(stdout: &str) -> Option<u32> {
 ///
 /// Best-effort by the same convention as `probe_pr`: gh absent, unauthed, offline, no remote, or a
 /// timeout all yield `None` (unknown) and never an error.
-fn probe_open_pr_count(root: &str) -> Option<u32> {
+fn probe_open_pr_count(root: &str) -> Option<OpenPrCount> {
     let mut cmd = Command::new(crate::preflight::gh_program());
     cmd.arg("pr")
-        .args(["list", "--state", "open", "--author", "@me", "--limit", "100", "--json", "number"])
+        .args([
+            "list",
+            "--state",
+            "open",
+            "--author",
+            "@me",
+            "--limit",
+            &OPEN_PR_LIST_LIMIT.to_string(),
+            "--json",
+            "number",
+        ])
         .current_dir(root)
         // Keep gh non-interactive and quiet; never let it block on a prompt or updater.
         .env("GH_PROMPT_DISABLED", "1")
@@ -3214,13 +3272,14 @@ fn probe_open_pr_count(root: &str) -> Option<u32> {
     if !output.status.success() {
         return None;
     }
-    decode_open_pr_count(&String::from_utf8_lossy(&output.stdout))
+    decode_open_pr_count(&String::from_utf8_lossy(&output.stdout), OPEN_PR_LIST_LIMIT)
 }
 
-/// How many open PRs authored by this identity are waiting in `root`'s repo. `Ok(None)` means
-/// "couldn't find out" (see `probe_open_pr_count`); the badge renders nothing for it.
+/// How many open PRs authored by this identity are waiting in `root`'s repo, and whether that
+/// number is exact. `Ok(None)` means "couldn't find out" (see `probe_open_pr_count`); the badge
+/// renders nothing for it, and renders `count` as a FLOOR ("N+") when `saturated`.
 #[tauri::command]
-pub async fn project_open_pr_count(root: String) -> Result<Option<u32>, String> {
+pub async fn project_open_pr_count(root: String) -> Result<Option<OpenPrCount>, String> {
     tauri::async_runtime::spawn_blocking(move || probe_open_pr_count(&root))
         .await
         .map_err(|e| format!("project_open_pr_count task failed: {e}"))
@@ -3325,6 +3384,20 @@ pub struct PrRow {
     /// the word and the button — can keep taking a single PR and stay pure. The value is a property
     /// of the REPO and is identical across every row in a probe.
     pub viewer_can_merge: Option<bool>,
+    /// Whether the LIST this row arrived in filled its [`OPEN_PR_LIST_LIMIT`]-row window — i.e.
+    /// whether there are pull requests the menu is not showing.
+    ///
+    /// Per-row for exactly the reason `viewer_can_merge` above is: it is a property of the PROBE,
+    /// identical across every row, and carrying it here is what keeps the IPC reply a plain array.
+    /// Wrapping the reply in `{ rows, saturated }` would have been tidier and would also have
+    /// silently broken every consumer that reads the array — including the dev visual harness's
+    /// shim. Losing the flag when the list is EMPTY costs nothing: a zero-row list cannot be
+    /// saturated.
+    ///
+    /// The founder's rule is that a row carrying an action he owes is never hidden. A cap cannot be
+    /// squared with that rule by being large; it can only be DISCLOSED, so that a menu which is not
+    /// the whole story says so.
+    pub list_saturated: bool,
     /// The agent that opened this PR, from the DURABLE mapping in `pr_owner` — `None` when nothing
     /// identifies it. Never inferred: a pill carrying the wrong id opens the wrong agent, which is
     /// worse than no pill, so "couldn't tell" stays null. See `pr_owner`'s module header.
@@ -3468,8 +3541,15 @@ fn normalize_mergeable(v: Option<&str>) -> &'static str {
 /// Unparsable output yields `None` (unknown), never an empty list — the same null-vs-zero discipline
 /// as `decode_open_pr_count`: an empty JSON *array* is a known "no PRs waiting", but garbage means
 /// "couldn't tell", and the menu must not render a confident empty state on a failed probe.
-fn decode_open_prs(stdout: &str) -> Option<Vec<PrRow>> {
+///
+/// `limit` is the row cap the query was issued with, so every row can carry whether the list it came
+/// from was TRUNCATED (see `PrRow::list_saturated`). It is judged on the RAW row count, before the
+/// numberless-row filter below: `gh`'s cap applied to what it SENT, so a dropped row is still proof
+/// the window was full — judging it after the filter would let one malformed row make a truncated
+/// page read as complete, which is the exact inversion of the failure this guards.
+fn decode_open_prs(stdout: &str, limit: u32) -> Option<Vec<PrRow>> {
     let rows = serde_json::from_str::<Vec<Value>>(stdout).ok()?;
+    let list_saturated = read_is_saturated(rows.len(), limit);
     Some(
         rows.iter()
             .filter_map(|r| {
@@ -3504,6 +3584,9 @@ fn decode_open_prs(stdout: &str) -> Option<Vec<PrRow>> {
                     // cannot know them, so every row leaves here UNKNOWN and `probe_open_prs` fills
                     // them in. `None` is not `false` — see `probe_viewer_permission`.
                     viewer_can_merge: None,
+                    // A LIST fact stamped on every row — see `PrRow::list_saturated`. Computed once
+                    // above from the raw row count, not per row.
+                    list_saturated,
                     // Ownership is resolved by the caller, which has the app-data store; the pure
                     // decoder only carries the raw material (`body`) forward.
                     agent_id: None,
@@ -3534,7 +3617,7 @@ fn probe_open_prs(root: &str, project_id: &str, app_data: &Path) -> Option<Vec<P
             "--author",
             "@me",
             "--limit",
-            "100",
+            &OPEN_PR_LIST_LIMIT.to_string(),
             "--json",
             "number,title,headRefName,headRefOid,url,mergeable,mergeStateStatus,statusCheckRollup,body,updatedAt",
         ])
@@ -3546,7 +3629,18 @@ fn probe_open_prs(root: &str, project_id: &str, app_data: &Path) -> Option<Vec<P
     if !output.status.success() {
         return None;
     }
-    let mut rows = decode_open_prs(&String::from_utf8_lossy(&output.stdout))?;
+    let mut rows = decode_open_prs(&String::from_utf8_lossy(&output.stdout), OPEN_PR_LIST_LIMIT)?;
+    // A TRUNCATED MENU IS A LOG LINE AS WELL AS A FLAG. The flag is what the UI discloses; this is
+    // what a human debugging "why isn't my PR in the list" can grep for, and it is the only record
+    // if the WebView is the thing that is broken.
+    if rows.first().is_some_and(|r| r.list_saturated) {
+        tracing::warn!(
+            target: "worktree",
+            limit = OPEN_PR_LIST_LIMIT,
+            rows = rows.len(),
+            "the open-PR list FILLED its window; pull requests past the cap are NOT in the menu"
+        );
+    }
     // ONLY WHEN THERE IS SOMETHING TO MERGE. The permission probe is a second network round trip,
     // and a repo with no open pull requests has no row that could carry the answer — so the common
     // quiet case costs exactly what it did before this field existed.
@@ -8413,11 +8507,18 @@ mod tests {
         assert_eq!(decode_pr_list_url(r#"{"url":"file:///etc/passwd"}"#), None);
     }
 
+    /// A `gh pr list --json number` reply with `n` rows.
+    fn pr_number_rows(n: usize) -> String {
+        let rows: Vec<String> = (1..=n).map(|i| format!(r#"{{"number":{i}}}"#)).collect();
+        format!("[{}]", rows.join(","))
+    }
+
     #[test]
     fn decode_open_pr_count_counts_rows() {
-        assert_eq!(decode_open_pr_count("[]"), Some(0));
-        assert_eq!(decode_open_pr_count(r#"[{"number":1}]"#), Some(1));
-        assert_eq!(decode_open_pr_count(r#"[{"number":1},{"number":2},{"number":3}]"#), Some(3));
+        let c = |s: &str| decode_open_pr_count(s, OPEN_PR_LIST_LIMIT).map(|o| o.count);
+        assert_eq!(c("[]"), Some(0));
+        assert_eq!(c(r#"[{"number":1}]"#), Some(1));
+        assert_eq!(c(r#"[{"number":1},{"number":2},{"number":3}]"#), Some(3));
     }
 
     #[test]
@@ -8425,13 +8526,103 @@ mod tests {
         // The whole point of the badge is that it must never claim "nothing is waiting" when it
         // simply failed to look. An empty array is a KNOWN zero; everything else that isn't a
         // JSON array is UNKNOWN, and the UI renders nothing rather than a reassuring "0".
-        assert_eq!(decode_open_pr_count(""), None);
-        assert_eq!(decode_open_pr_count("not json"), None);
-        assert_eq!(decode_open_pr_count("gh: command not found"), None);
+        let c = |s: &str| decode_open_pr_count(s, OPEN_PR_LIST_LIMIT);
+        assert_eq!(c(""), None);
+        assert_eq!(c("not json"), None);
+        assert_eq!(c("gh: command not found"), None);
         // A JSON object (e.g. an error payload) is not a row list either.
-        assert_eq!(decode_open_pr_count(r#"{"message":"Bad credentials"}"#), None);
+        assert_eq!(c(r#"{"message":"Bad credentials"}"#), None);
         // Known-zero and unknown are genuinely different values, not just different renderings.
-        assert_ne!(decode_open_pr_count("[]"), decode_open_pr_count("Bad credentials"));
+        assert_ne!(c("[]"), c("Bad credentials"));
+    }
+
+    // ══ QUERY SATURATION (bead sparkle-qogah) ═══════════════════════════════════════════════════
+    //
+    // "We should never hide a row that needs action from me." A `gh pr list --limit N` reply gives no
+    // truncation signal at all, so a read that fills its window is NOT an authoritative total — and
+    // the count that reaches the founder is a "Needs merge" tally, i.e. work he owes.
+
+    #[test]
+    fn a_count_that_fills_the_window_is_a_floor_and_says_so() {
+        // The CALLER'S value, not an internal boolean: a full window hands back `saturated: true`
+        // ALONGSIDE the count, which is what makes the badge able to render "N+" instead of "N".
+        let full = decode_open_pr_count(&pr_number_rows(7), 7).expect("decodes");
+        assert_eq!(full, OpenPrCount { count: 7, saturated: true });
+
+        // One row short of the cap is the whole truth, and must not be hedged — an "at least"
+        // rendering on an exact answer is its own (smaller) lie.
+        let short = decode_open_pr_count(&pr_number_rows(6), 7).expect("decodes");
+        assert_eq!(short, OpenPrCount { count: 6, saturated: false });
+
+        // Over the cap (a `gh` that over-returns) is saturated too: a ceiling is a ceiling, so this
+        // must not slip through an equality check.
+        let over = decode_open_pr_count(&pr_number_rows(8), 7).expect("decodes");
+        assert_eq!(over, OpenPrCount { count: 8, saturated: true });
+
+        // And an empty list can never be saturated, so the quiet case gains no hedge.
+        assert_eq!(
+            decode_open_pr_count("[]", 7).expect("decodes"),
+            OpenPrCount { count: 0, saturated: false }
+        );
+    }
+
+    #[test]
+    fn a_saturated_count_crosses_the_ipc_boundary_as_a_disclosed_floor() {
+        // The flag is worthless if the JS side cannot see it, and this struct is the reply shape of
+        // a `#[tauri::command]` — a rename here is invisible in Rust and silently blanks the field
+        // over there, which puts the bare "100" straight back on the badge.
+        let json = serde_json::to_value(
+            decode_open_pr_count(&pr_number_rows(3), 3).expect("decodes"),
+        )
+        .expect("serializes");
+        assert_eq!(json, json!({ "count": 3, "saturated": true }));
+    }
+
+    #[test]
+    fn the_pr_menu_rows_carry_whether_the_list_was_truncated() {
+        // The MENU is the surface the founder merges from, so this is the one that decides whether a
+        // "Needs merge" row past the cap is disclosed or silently missing. Assert the value on the
+        // rows the caller receives.
+        let three = r#"[{"number":1},{"number":2},{"number":3}]"#;
+        let full = decode_open_prs(three, 3).expect("decodes");
+        assert_eq!(full.len(), 3);
+        assert!(
+            full.iter().all(|r| r.list_saturated),
+            "every row must carry it — the menu reads it off whichever row it has"
+        );
+
+        let short = decode_open_prs(three, 4).expect("decodes");
+        assert!(
+            short.iter().all(|r| !r.list_saturated),
+            "a list below its cap is complete, and hedging it would cry wolf on every poll"
+        );
+
+        // Saturation is judged BEFORE the numberless-row filter: `gh`'s cap applied to what it sent,
+        // so a dropped row is still proof the window was full. Two rows arrive, one is unusable, one
+        // survives — and that survivor must still say the list was truncated.
+        let with_junk = decode_open_prs(r#"[{"title":"no number"},{"number":9}]"#, 2)
+            .expect("decodes");
+        assert_eq!(with_junk.len(), 1, "the numberless row is dropped");
+        assert!(
+            with_junk[0].list_saturated,
+            "judging saturation on the FILTERED count would let one malformed row make a truncated \
+             page read as complete"
+        );
+    }
+
+    /// The JS badge keeps its own copy of the row cap (`OPEN_PR_QUERY_LIMIT`) as a backstop for the
+    /// case where no row carries the flag. A comment asked for that copy to be kept in step; a
+    /// comment cannot fail. A stale copy understates the badge silently, which is the same
+    /// false-reassurance failure one level out, so pin it.
+    #[test]
+    fn the_js_side_mirrors_the_same_open_pr_row_cap() {
+        let ts = include_str!("../../src/services/openPrs.ts");
+        let needle = format!("export const OPEN_PR_QUERY_LIMIT = {OPEN_PR_LIST_LIMIT};");
+        assert!(
+            ts.contains(&needle),
+            "services/openPrs.ts must declare `{needle}` — its copy of the cap has drifted from \
+             OPEN_PR_LIST_LIMIT, so the badge's fallback would understate the count"
+        );
     }
 
     #[test]
@@ -8820,13 +9011,14 @@ mod tests {
         // as None and `probe_open_prs` fills them in.
         let rows = decode_open_prs(
             r#"[{"number":39,"title":"t","headRefName":"b","headRefOid":"deadbeef","url":"u"}]"#,
+            OPEN_PR_LIST_LIMIT,
         )
         .expect("decodes");
         assert_eq!(rows[0].head_ref_oid, "deadbeef");
         assert_eq!(rows[0].viewer_can_merge, None);
         // A row with no headRefOid yields an EMPTY sha, which the revival rule reads as "cannot
         // compare" — it must never look like a match.
-        let rows = decode_open_prs(r#"[{"number":40,"title":"t","url":"u"}]"#).expect("decodes");
+        let rows = decode_open_prs(r#"[{"number":40,"title":"t","url":"u"}]"#, OPEN_PR_LIST_LIMIT).expect("decodes");
         assert_eq!(rows[0].head_ref_oid, "");
     }
 
@@ -8857,6 +9049,7 @@ mod tests {
                 },
                 { "number": 7 }
             ]"#,
+            OPEN_PR_LIST_LIMIT,
         )
         .expect("valid array decodes");
         assert_eq!(
@@ -8882,6 +9075,8 @@ mod tests {
                 // Merge rights are a repo fact `probe_open_prs` attaches; the decoder leaves them
                 // UNKNOWN, which is not the same as "cannot merge".
                 viewer_can_merge: None,
+                // Two rows against a 300-row cap: this list is complete, so nothing is hedged.
+                list_saturated: false,
                 // Ownership is attached by `attach_pr_owners`, not by the pure decoder.
                 agent_id: None,
                 agent_id_source: None,
@@ -8906,6 +9101,7 @@ mod tests {
                 pending_checks: vec![],
                 head_ref_oid: String::new(),
                 viewer_can_merge: None,
+                list_saturated: false,
                 agent_id: None,
                 agent_id_source: None,
                 body: String::new(),
@@ -8933,6 +9129,7 @@ mod tests {
                     { "name": "Vercel Agent Review", "status": "IN_PROGRESS" }
                 ]
             }]"#,
+            OPEN_PR_LIST_LIMIT,
         )
         .expect("valid array decodes");
         let r = &rows[0];
@@ -8962,6 +9159,7 @@ mod tests {
                     { "context": "Vercel", "state": "SUCCESS" }
                 ]
             }]"#,
+            OPEN_PR_LIST_LIMIT,
         )
         .expect("valid array decodes");
         assert_eq!(rows[0].mergeable, "conflicting");
@@ -9058,6 +9256,7 @@ mod tests {
                 { "number": 802, "headRefName": "sparkle/router-skip-doomed-classify" },
                 { "number": 804, "headRefName": "sparkle/agent-9e48bf5c-02fb-499b-9bc7-d24034577799" }
             ]"#,
+            OPEN_PR_LIST_LIMIT,
         )
         .unwrap();
         let out = attach_pr_owners(rows, "p1", d.path());
@@ -9090,7 +9289,7 @@ mod tests {
         let marker = crate::pr_owner::pr_body_marker("agent-elsewhere", "p1");
         let rows = decode_open_prs(&format!(
             r#"[{{ "number": 12, "headRefName": "feature/no-id", "body": "hello\n\n{marker}" }}]"#
-        ))
+        ), OPEN_PR_LIST_LIMIT)
         .unwrap();
         let out = attach_pr_owners(rows, "p1", d.path());
         assert_eq!(out[0].agent_id.as_deref(), Some("agent-elsewhere"));
@@ -9116,14 +9315,14 @@ mod tests {
     fn decode_open_prs_reads_garbage_as_unknown_and_drops_only_numberless_rows() {
         // Garbage (not a JSON array) is UNKNOWN — the whole probe drops to None, never an empty list,
         // matching decode_open_pr_count's null-vs-zero discipline.
-        assert_eq!(decode_open_prs(""), None);
-        assert_eq!(decode_open_prs("not json"), None);
-        assert_eq!(decode_open_prs(r#"{"message":"Bad credentials"}"#), None);
+        assert_eq!(decode_open_prs("", OPEN_PR_LIST_LIMIT), None);
+        assert_eq!(decode_open_prs("not json", OPEN_PR_LIST_LIMIT), None);
+        assert_eq!(decode_open_prs(r#"{"message":"Bad credentials"}"#, OPEN_PR_LIST_LIMIT), None);
         // A known-empty array is Some(empty), not None.
-        assert_eq!(decode_open_prs("[]"), Some(vec![]));
+        assert_eq!(decode_open_prs("[]", OPEN_PR_LIST_LIMIT), Some(vec![]));
         // A row without a number is unusable (nothing to merge/link) and is dropped, but a valid
         // sibling still comes through — one bad row must not blank the menu.
-        let rows = decode_open_prs(r#"[{"title":"no number"},{"number":9}]"#).unwrap();
+        let rows = decode_open_prs(r#"[{"title":"no number"},{"number":9}]"#, OPEN_PR_LIST_LIMIT).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].number, 9);
     }

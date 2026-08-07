@@ -8,6 +8,8 @@ import {
   groupAgentsByStage,
   sectionOfRow,
   sectionOfStage,
+  ASKING_BANDS,
+  isAskingIsolated,
   type StatusBand,
 } from "./buildSections";
 import { bandCountLabel } from "./statusBandLabels";
@@ -371,5 +373,49 @@ describe("sectionOfRow — a row that holds NOTHING is not 'Uncommitted' (sparkl
     expect(groups[0]?.rows.map((r) => r.id)).toEqual(["empty"]);
     // The unread row rides with the dirty one — conservative, and input order is preserved.
     expect(groups[1]?.rows.map((r) => r.id)).toEqual(["dirty", "unread"]);
+  });
+});
+
+// ── the "Needs you" pill must not hide the band that also needs you ───────────────────────────
+//
+// There were TWO copies of this predicate (the pill's pressed state and its click), both spelled
+// `needs_you && !running && !done`. They drifted the instant a fourth band landed: the read
+// answered "isolated" while `questions` was also showing, and the click narrowed to `needs_you`
+// ALONE — switching blue OFF. `questions` means the agent cannot proceed without you exactly as
+// `waiting`/`approval` do, so a control the founder reads as "show me what needs me" was hiding
+// work he owed. One seam, derived from STATUS_BANDS, so a fifth band is a decision here rather
+// than a silent omission (bead sparkle-qogah).
+describe("isAskingIsolated — the asking bands, and only those", () => {
+  const f = (o: Partial<Record<StatusBand, boolean>>): Record<StatusBand, boolean> => ({
+    needs_you: false,
+    questions: false,
+    running: false,
+    done: false,
+    ...o,
+  });
+
+  it("is true when exactly the asking bands are on", () => {
+    expect(isAskingIsolated(f({ needs_you: true, questions: true }))).toBe(true);
+  });
+
+  // The regression the old spelling allowed: `needs_you` alone READ as isolated, so the pill showed
+  // pressed for a filter that had blue switched off.
+  it("is FALSE for needs_you alone — that state hides the questions band", () => {
+    expect(isAskingIsolated(f({ needs_you: true }))).toBe(false);
+  });
+
+  it("is false when a calm band is also on", () => {
+    expect(isAskingIsolated(f({ needs_you: true, questions: true, done: true }))).toBe(false);
+  });
+
+  it("is false when everything is showing", () => {
+    expect(
+      isAskingIsolated(f({ needs_you: true, questions: true, running: true, done: true })),
+    ).toBe(false);
+  });
+
+  // Every asking band is one `engine/attention` treats as "cannot proceed without you".
+  it("names exactly the bands that mean the agent is stuck on the user", () => {
+    expect([...ASKING_BANDS].sort()).toEqual(["needs_you", "questions"]);
   });
 });

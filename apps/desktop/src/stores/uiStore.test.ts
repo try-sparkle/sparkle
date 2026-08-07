@@ -124,22 +124,46 @@ describe("uiStore statusFilter", () => {
     expect((useUiStore.getState() as unknown as Record<string, unknown>).agentOrdering).toBeUndefined();
   });
 
-  it("repairs a PARTIAL persisted filter instead of trusting it", async () => {
+  // ── A BAND FILTER MAY NOT OUTLIVE THE SESSION (bead sparkle-qogah.4) ──────────────────────────
+  //
+  // The founder's rule is "we should never hide a row that needs action from me", and `done` is
+  // where every "Needs merge" row lives (engine/buildSections bands `unmerged` there). A persisted
+  // filter breaks the rule in its most invisible form: a band turned off yesterday — by a chip, by
+  // the needs-you pill, or by a digest click nobody read as a filter — is still hiding owed work on
+  // today's launch, with no memory of having been set and nothing on screen saying so. So the key is
+  // TRANSIENT: every launch starts showing everything, and narrowing stays a live, visible,
+  // this-session act that "Show all" clears.
+  //
+  // This replaces a test that asserted the opposite (a partial blob was REPAIRED and its hidden band
+  // preserved). The repair itself still exists and is still unit-tested in composerPersist — what
+  // changed is that no blob reaches it any more.
+  it("does NOT restore a band filter on rehydrate — every launch starts showing everything", async () => {
     localStorage.setItem(
       "sparkle-ui",
       JSON.stringify({
-        state: { statusFilter: { needs_you: false } },
-        version: 1,
+        // The exact blob `isolateStatusBand("needs_you")` used to leave behind: the merge queue off.
+        state: { statusFilter: { needs_you: true, questions: false, running: false, done: false }, composerHeight: 180 },
+        version: 4,
       }),
     );
     await useUiStore.persist.rehydrate();
-    // The band the user really did hide is preserved; the missing ones default to VISIBLE.
     expect(useUiStore.getState().statusFilter).toEqual({
-      needs_you: false,
+      needs_you: true,
       questions: true,
       running: true,
       done: true,
     });
+    // Not a vacuous pass on a blob that failed to hydrate at all: a persisted sibling did come back.
+    expect(useUiStore.getState().composerHeight).toBe(180);
+  });
+
+  it("does not WRITE a band filter to the blob either — both directions, or it comes back", async () => {
+    localStorage.clear();
+    useUiStore.getState().isolateStatusBand("needs_you");
+    // zustand persists on the store write above; read the blob rather than a second rehydrate, so
+    // this fails if `partialize` keeps the key even while `merge` strips it.
+    const blob = JSON.parse(localStorage.getItem("sparkle-ui")!) as { state: Record<string, unknown> };
+    expect("statusFilter" in blob.state).toBe(false);
   });
 });
 
@@ -500,7 +524,11 @@ describe("uiStore pinnedProjectId", () => {
 describe("uiStore persistence — exactly these keys reach the blob", () => {
   const PERSISTED = [
     "activeSpecial",
-    "statusFilter",
+    // NOTE: `statusFilter` used to sit here and is now TRANSIENT (bead sparkle-qogah.4). It is the
+    // one preference in this store that can HIDE ROWS, and two of its three bands carry work the
+    // user owes — the asks, and the "Needs merge" queue. Persisting it meant a band switched off
+    // yesterday was still concealing owed work today with nothing on screen saying so. Its absence
+    // from this list is the assertion; see TRANSIENT_UI_KEYS for the full reasoning.
     // Persisted because it is the USER'S choice, and the only thing that writes it is a user
     // gesture. It used to be joined here by an `autoExpandedOrchestrators` mark recording which
     // expansions the app had made so it could revoke them; with nothing but a gesture able to open
@@ -572,6 +600,7 @@ describe("uiStore persistence — exactly these keys reach the blob", () => {
       cloudCreateProjectId: null,
       zeroCreditBannerDismissed: false,
       zeroCreditBannerDismissedFor: null,
+      statusFilter: { needs_you: true, questions: true, running: true, done: true },
       themePref: "auto",
     });
   });
@@ -591,6 +620,9 @@ describe("uiStore persistence — exactly these keys reach the blob", () => {
       cloudCreateProjectId: "p-42",
       zeroCreditBannerDismissed: true,
       zeroCreditBannerDismissedFor: "acct-1",
+      // The band filter, narrowed the way a chip narrows it. If this key ever reaches the blob
+      // again, a founder who hid the merge queue once keeps it hidden on every later launch.
+      statusFilter: { needs_you: true, questions: false, running: false, done: false },
     });
     useUiStore.getState().setThemePref("dark");
 
@@ -622,6 +654,7 @@ describe("uiStore rehydrate — a stale transient key in the blob must not be re
       cloudCreateProjectId: null,
       zeroCreditBannerDismissed: false,
       zeroCreditBannerDismissedFor: null,
+      statusFilter: { needs_you: true, questions: true, running: true, done: true },
       themePref: "auto",
     });
   });
@@ -645,6 +678,7 @@ describe("uiStore rehydrate — a stale transient key in the blob must not be re
           cloudCreateProjectId: "p-42",
           zeroCreditBannerDismissed: true,
           zeroCreditBannerDismissedFor: "acct-1",
+          statusFilter: { needs_you: true, questions: false, running: false, done: false },
         },
       }),
     );
@@ -665,6 +699,8 @@ describe("uiStore rehydrate — a stale transient key in the blob must not be re
     expect(s.cloudCreateProjectId).toBeNull();
     expect(s.zeroCreditBannerDismissed).toBe(false);
     expect(s.zeroCreditBannerDismissedFor).toBeNull();
+    // The one whose default is "show everything": a stale blob may not re-hide a row.
+    expect(s.statusFilter).toEqual({ needs_you: true, questions: true, running: true, done: true });
   });
 });
 
@@ -835,17 +871,26 @@ describe("uiStore rehydrate — a retired persisted value is repaired at the CUR
     expect(useUiStore.getState().activeSpecial).toBe("sparkle");
   });
 
-  // The same unreachability applied to the pre-existing statusFilter repair, whose comment made the
-  // same "runs on EVERY rehydrate" claim. It does now.
-  it("completes a short statusFilter at the current version", async () => {
+  // `statusFilter` used to be REPAIRED on this path (a short blob completed to all-visible). It is
+  // now STRIPPED instead — see TRANSIENT_UI_KEYS — and the difference only shows on a blob whose
+  // bands are OFF, which repair would have preserved and stripping cannot. A blob at an OLD version
+  // takes the `migrate` path before `merge`, so this pins that the strip survives migration too;
+  // the current-version case is pinned in the statusFilter block above.
+  it("drops a persisted statusFilter on the migrate path, hidden bands and all", async () => {
     localStorage.setItem(
       "sparkle-ui",
-      JSON.stringify({ version: 2, state: { statusFilter: { needs_you: true } } }),
+      JSON.stringify({
+        version: 2,
+        state: { themePref: "dark", statusFilter: { needs_you: true, questions: false, running: false, done: false } },
+      }),
     );
 
     await useUiStore.persist.rehydrate();
 
+    // Every band back, including the two the blob had hidden — the merge queue among them.
     const filter = useUiStore.getState().statusFilter as Record<string, boolean>;
     for (const b of STATUS_BANDS) expect(filter[b.id]).toBe(true);
+    // Not a pass by the blob having been skipped: a persisted sibling did come through.
+    expect(useUiStore.getState().themePref).toBe("dark");
   });
 });

@@ -10,7 +10,6 @@ import {
   migratePersistedUi,
   repairActiveSpecial,
   repairSendMode,
-  repairStatusFilter,
   repairZoomByColumn,
 } from "./composerPersist";
 // A VALUE import, unlike StatusBand/SendMode below: engine/columnZoom imports only a TYPE from
@@ -94,6 +93,23 @@ const TRANSIENT_UI_KEYS = [
   "demoteAgentId",
   "zeroCreditBannerDismissed",
   "zeroCreditBannerDismissedFor",
+  // WHICH BANDS THE BUILD COLUMN SHOWS — transient on the founder's P0 rule (bead sparkle-qogah.4):
+  // "We should never hide a row that needs action from me."
+  //
+  // A band filter hides ROWS, and two of the three bands carry work he owes: `needs_you` is the
+  // asks, and `done` is where every "Needs merge" row lives (engine/buildSections bands `unmerged`
+  // there). Persisting it made concealment permanent AND invisible — a band turned off yesterday,
+  // by a chip or by a digest line nobody read as a filter, is still hiding the merge queue on
+  // today's launch, with nothing on screen recording that a filter was ever set and no memory of
+  // setting one. That is the false-confidence failure the rule is about: the sidebar reports a count
+  // that sounds complete while the rows behind it are filtered away.
+  //
+  // So narrowing stays a LIVE act: visible in the chips that render it, clearable with "Show all",
+  // and gone by the next launch. The alternative considered was exempting actionable rows from band
+  // filtering outright — a more faithful reading of the rule, but it belongs in the sidebar's filter
+  // (engine/buildSections), not here, and it would leave the "a filter I never set is still on"
+  // half of the defect standing for the bands it did not exempt. One of the two, not both halfway.
+  "statusFilter",
 ] as const satisfies readonly (keyof UiState)[];
 
 export const COMPOSER_MIN = 64;
@@ -299,6 +315,8 @@ interface UiState {
   /** Show ONLY this band — the helper island's chiclets. Writes the same `statusFilter` the chips
    *  render, so the resulting state is visible and clearable exactly like a hand-toggled one. */
   isolateStatusBand: (b: StatusBand) => void;
+  /** Set every band at once — for a control that narrows to a SET rather than to one band. */
+  setStatusFilter: (f: Record<StatusBand, boolean>) => void;
   // Active sidebar workflow mode (Plan/Build chevrons), KEYED BY PAIR SIDE — see WorkModeBySide.
   // Each build column owns its own chevron and its own Plan board; one column's mode is invisible
   // to the other. Shared so non-sidebar components can switch a column's tab. NOT persisted (see
@@ -646,6 +664,7 @@ export const useUiStore = create<UiState>()(
         set((s) => ({ statusFilter: { ...s.statusFilter, [b]: !s.statusFilter[b] } })),
       showAllStatusBands: () =>
         set({ statusFilter: { needs_you: true, questions: true, running: true, done: true } }),
+      setStatusFilter: (f) => set({ statusFilter: { ...f } }),
       isolateStatusBand: (b) =>
         set({
           statusFilter: {
@@ -889,7 +908,12 @@ export const useUiStore = create<UiState>()(
         const stored = { ...(persisted as Record<string, unknown>) };
         for (const key of TRANSIENT_UI_KEYS) delete stored[key];
         if ("activeSpecial" in stored) stored.activeSpecial = repairActiveSpecial(stored.activeSpecial);
-        if ("statusFilter" in stored) stored.statusFilter = repairStatusFilter(stored.statusFilter);
+        // NO `statusFilter` REPAIR HERE ANY MORE, and its absence is the stronger guarantee rather
+        // than a gap: the key is in TRANSIENT_UI_KEYS (see the note there), so the loop above has
+        // already deleted it and the store's own all-bands-visible default answers. A repair on this
+        // line would be unreachable code claiming to protect a band that no longer arrives. The pure
+        // `repairStatusFilter` still exists and is still unit-tested in composerPersist — it is the
+        // blob that stopped reaching it.
         // The send tray's position, repaired on EVERY rehydrate for the same reason as the two
         // above — `migrate` only runs on a version mismatch, so a corrupt blob already at the
         // current version would otherwise hydrate verbatim and leave the tray with no pill reading

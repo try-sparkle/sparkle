@@ -2392,6 +2392,20 @@ describe("prBadgeTitle — a zero it cannot stand behind", () => {
       ),
     ).toBe("1 of 2 open pull requests ready to merge");
   });
+
+  // A TRUNCATED TOTAL MUST BE HEDGED HERE TOO (bead sparkle-qogah). This branch spells the number out
+  // itself rather than reusing `label`, so the hedge `formatPrBadge` applies does not reach it — the
+  // pill read "300+ PRs waiting" while its own accessible name claimed "3 of 300". A string that
+  // restates the number has to restate the "at least".
+  it("says AT LEAST when a probe filled its window", () => {
+    expect(
+      prBadgeTitle("300+ PRs waiting", totals({ total: 300, ready: 3 }), true),
+    ).toBe("3 of 300+ open pull requests ready to merge");
+    // And an untruncated read is not hedged — an "at least" on an exact answer is its own small lie.
+    expect(
+      prBadgeTitle("4 PRs waiting", totals({ total: 4, ready: 3 }), false),
+    ).toBe("3 of 4 open pull requests ready to merge");
+  });
 });
 
 // The plural notice, rendered END TO END rather than only unit-tested — two projects unreadable at
@@ -3362,6 +3376,72 @@ describe("OpenPrMenu — Dismiss", () => {
       screen.getAllByTestId("pr-row")[0]!.getAttribute("data-project-id"),
     ).toBe("p2");
     expect(dismissed).toEqual([{ projectId: "p1", number: 39 }]);
+  });
+});
+
+// ── A CAPPED LIST MUST SAY IT IS CAPPED (bead sparkle-qogah) ───────────────────────────────────
+// "We should never hide a row that needs action from me." `gh pr list --limit N` truncates with no
+// signal, so a pull request past the cap is simply absent from this panel — and "Needs merge" is
+// work the founder owes. The cap cannot be squared with that rule by being large; it can only be
+// DISCLOSED, so the surface that shows a truncated list says the number is a floor.
+describe("OpenPrMenu — a truncated probe is disclosed, not rounded off", () => {
+  /** `n` passing PRs, each carrying the probe's `listSaturated` verdict. */
+  const rows = (n: number, listSaturated: boolean): PrRow[] =>
+    Array.from({ length: n }, (_, i) => ({
+      ...PASS,
+      number: i + 1,
+      url: `https://github.com/o/r/pull/${i + 1}`,
+      listSaturated,
+    }));
+
+  it("renders the count as a FLOOR when the probe filled its window", async () => {
+    stubList(rows(4, true));
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
+    const badge = await screen.findByTestId("open-pr-badge");
+    // The rendered pill, not an internal flag: four rows arrived from a saturated read, so there may
+    // be more and the pill must not state four as the total.
+    await waitFor(() => expect(badge.textContent).toContain("4+ PRs waiting"));
+    // The accessible name is a second, independently-built sentence about the same number — hover and
+    // screen-reader users get the hedge too.
+    expect(badge.getAttribute("aria-label")).toContain("4+");
+  });
+
+  it("renders an EXACT count when the same list was not truncated", async () => {
+    // The discriminator is the flag alone. Same row count, same everything else — so a green result
+    // here cannot come from anything but the saturation channel.
+    stubList(rows(4, false));
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
+    const badge = await screen.findByTestId("open-pr-badge");
+    await waitFor(() => expect(badge.textContent).toContain("4 PRs waiting"));
+    expect(badge.textContent).not.toContain("+");
+    expect(badge.getAttribute("aria-label")).not.toContain("+");
+  });
+
+  it("hedges when ANY of several open projects came back truncated", async () => {
+    // One truncated list is one set of hidden rows. Requiring every scope to be full would hedge
+    // essentially never — which is how a repo-wide blind spot stays invisible on a busy fleet.
+    h.invoke.mockImplementation((cmd: string, args?: unknown) => {
+      if (cmd !== "project_open_prs") return Promise.resolve(null);
+      const root = (args as { root?: string } | undefined)?.root;
+      return Promise.resolve(
+        root === "/repo"
+          ? rows(2, true)
+          : rows(1, false).map((r) => ({ ...r, number: 90 })),
+      );
+    });
+    const TWO: readonly PrScope[] = [
+      { projectId: "p1", projectName: "repo", rootPath: "/repo" },
+      { projectId: "p2", projectName: "other", rootPath: "/other" },
+    ];
+    render(
+      <OpenPrMenu scopes={TWO} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
+    const badge = await screen.findByTestId("open-pr-badge");
+    await waitFor(() => expect(badge.textContent).toContain("3+ PRs waiting"));
   });
 });
 

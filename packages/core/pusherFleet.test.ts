@@ -833,3 +833,110 @@ describe("pr-conflicting citation safety", () => {
     expect(c!.text).not.toContain("-5");
   });
 });
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+// THE CONTENT FINGERPRINT — `FleetCondition.members`.
+//
+// The report cooldown re-opens on GROWTH, and it used to measure growth over `agentIds`. That is a
+// fingerprint only for the classes whose subject IS an agent. `duty-overdue` hard-codes `agentIds:
+// []` and `pr-conflicting` fills it from resolved owners only — and the PRs it was built for resolve
+// to none. For exactly those cases the list is empty, `[].some(...)` is always false, and growth was
+// undetectable: a new conflicting untested PR stayed silent for the full four-hour cooldown.
+//
+// These pin the identity each class publishes. The four-hour behaviour itself is asserted at the
+// decision level in `pusherFleetReport.test.ts`, where the silence would actually be felt.
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+describe("the condition fingerprint", () => {
+  const conflicting: ConflictingPr = {
+    pr: 1091,
+    branch: "sparkle/roborev-backlog-notice-collapse",
+    ownerAgentId: null,
+    kind: "conflicting",
+    commitsBehind: 220,
+    evidence: "no-checks-ran",
+    unresolvedSecs: 4 * 60 * 60,
+  };
+  const hourly = {
+    name: "the hourly improvement pass",
+    intervalMs: HOUR,
+    lastRunAt: T0 - 9 * HOUR,
+  };
+
+  // THE INVARIANT A FUTURE CLASS MUST NOT BREAK. A class that publishes no fingerprint is not
+  // broken — `hasNewMember` fails it OPEN, so it reports rather than going quiet — but it also has
+  // no cooldown at all, so it would repeat on every sweep. Every class that ships today has one.
+  it("every condition a sweep can produce names what it covers", () => {
+    const conditions = evaluateFleetConditions(
+      [
+        walled("q1"),
+        { agentId: "f1", label: "F1", failure: { message: "API Error: ENOTFOUND", at: T0 - 60_000 } },
+        { agentId: "f2", label: "F2", failure: { message: "API Error: ENOTFOUND", at: T0 - 60_000 } },
+        { agentId: "e1", label: "E1", escalation: { reason: "gave up" } },
+        { agentId: "d1", label: "D1", goalMetAt: T0 - HOUR, hasUnlandedWork: false },
+      ],
+      T0,
+      [hourly],
+      [conflicting],
+    );
+    expect(conditions.map((c) => c.id)).toEqual([
+      "quota-blocked",
+      "shared-failure",
+      "duty-overdue",
+      "pr-conflicting",
+      "goals-escalated",
+      "done-not-retired",
+    ]);
+    for (const c of conditions) {
+      expect(c.members.length, `${c.id} publishes no fingerprint`).toBeGreaterThan(0);
+      // Namespaced, so two classes can never collide on a bare id.
+      for (const m of c.members) expect(m).toMatch(/^(agent|duty|pr):/);
+    }
+  });
+
+  // THE CASE THE OLD RULE COULD NOT SEE. An unresolved owner contributes no agent id, so this is the
+  // only handle the cooldown has on the PRs this class was actually built for.
+  it("fingerprints a conflicting PR by its NUMBER, which an unresolved owner still has", () => {
+    const [c] = evaluateFleetConditions([], T0, [], [conflicting]);
+    expect(c!.agentIds).toEqual([]);
+    expect(c!.members).toEqual(["pr:1091", "pr:1091:conflicting"]);
+  });
+
+  // A conflicting PR carries a second member so that stale → conflicting reads as GROWTH. Emitting
+  // both rather than swapping keeps the reverse trip a strict subset, so an improvement stays quiet.
+  it("gives a stale PR only the bare number, so going conflicting ADDS a member", () => {
+    const [c] = evaluateFleetConditions(
+      [],
+      T0,
+      [],
+      [{ ...conflicting, kind: "stale", evidence: "n/a" }],
+    );
+    expect(c!.members).toEqual(["pr:1091"]);
+  });
+
+  it("fingerprints a duty by name, which is the only identity a duty has", () => {
+    const [c] = evaluateFleetConditions([], T0, [hourly]);
+    expect(c!.agentIds).toEqual([]);
+    expect(c!.members).toEqual(["duty:the hourly improvement pass"]);
+  });
+
+  // The agent classes keep the set they always had, namespaced. This is the regression guard: the
+  // fingerprint is an ADDITION, and `quota-blocked`'s membership must not have moved.
+  it("fingerprints an agent class by exactly the agents it names", () => {
+    const [c] = evaluateFleetConditions([walled("q1"), walled("q2")], T0);
+    expect(c!.agentIds).toEqual(["q1", "q2"]);
+    expect(c!.members).toEqual(["agent:q1", "agent:q2"]);
+  });
+
+  // `shared-failure` flattens cohorts, so one agent can arrive twice; a duplicated member would make
+  // the set comparison ask the same question twice, harmlessly, but the set is the contract.
+  it("does not repeat an agent that appears in more than one cohort", () => {
+    const [c] = evaluateFleetConditions(
+      [
+        { agentId: "a", failure: { message: "boom", at: T0 } },
+        { agentId: "b", failure: { message: "boom", at: T0 } },
+      ],
+      T0,
+    );
+    expect(c!.members).toEqual(["agent:a", "agent:b"]);
+  });
+});

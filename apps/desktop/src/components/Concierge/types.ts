@@ -396,6 +396,10 @@ export interface ConciergeDigestMessage {
   text: string;
   /** The agent to reveal when the line is clicked. */
   leadAgentId: string;
+  /** EVERY agent this line stands for, in feed order — `memberIds.length` equals the line's count.
+   *  Carried so a line can name what it collapsed rather than only counting it: a number you cannot
+   *  open is the "+11 more" dead end this whole rule came from. */
+  memberIds?: string[];
 }
 
 /** The return-from-Away briefing. Its shape lives with the DIFF that builds it

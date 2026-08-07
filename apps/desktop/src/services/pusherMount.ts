@@ -115,9 +115,21 @@ function recordDecision(entry: PusherLogEntry): void {
  *
  * Two recipients, two verifications, and neither trusts the call's own return value:
  *
- *   • THE CONCIERGE — handed to the registered proactive sink. `notifyConcierge` returns whether a
- *     sink existed and accepted it; there is nothing further to read back, because the finding is
- *     now inside the scheduler's own owed-until-delivered list, which survives a decline by design.
+ *   • THE CONCIERGE — handed to the registered proactive sink. `notifyConcierge` returns whether the
+ *     scheduler ACCEPTED it, which is the same question the inbox read-back below asks: is the
+ *     message now sitting in a queue that will be drained. There is nothing further to read back
+ *     once it is, because the finding is then inside the scheduler's own owed-until-delivered list,
+ *     which survives a decline by design.
+ *
+ *     THIS BULLET USED TO BE A LIE AND IS WORTH THE PARAGRAPH (bead sparkle-qogah). It said "a sink
+ *     existed and accepted it" while `notifyConcierge` could only observe the first half: the sink
+ *     returned `void`, so a scheduler that discarded the text on its own `disposed` guard — or by
+ *     truncating its owed list — was reported here as a delivery. `sweepPushers` then took the
+ *     `delivered` branch on that `true`, spending one of four hourly slots and stamping the
+ *     condition as reported for FOUR HOURS. A destroyed finding was therefore also suppressed at
+ *     source for four hours, by the same call that destroyed it. Nothing in this file changed to fix
+ *     it and nothing needed to: the sink is honest now, so `sendVerified` passing its answer through
+ *     is finally the verification this header always claimed it was.
  *   • A BUILD AGENT — queued with `inbox_send`, then READ BACK with `inbox_status`: the message id
  *     must appear in that agent's `pendingIds`, or the push is treated as failed. `inbox_send` now
  *     reads back inside Rust too (sparkle-bbghz), so this is the second of two independent checks —

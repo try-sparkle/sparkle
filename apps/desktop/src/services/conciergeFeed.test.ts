@@ -1,12 +1,17 @@
 import { describe, it, expect } from "vitest";
 import {
+  accountedOwed,
+  accountedUnmerged,
   buildConciergeFeed,
   conciergeBand,
   conciergeTopics,
   emptyCounts,
   isCalmBand,
+  isOwedAction,
+  owedCounts,
   trayStatusMap,
 } from "./conciergeFeed";
+import { accountedNeedsYou } from "./conciergeProactive";
 import { bandOfStatus, type StatusBand } from "../engine/buildSections";
 import { AGENT_STATUS } from "@sparkle/ui";
 import type { Roster } from "./rosterTypes";
@@ -679,5 +684,254 @@ describe("buildConciergeFeed — parentRowId separates 'no row of its own' from 
     const byId = by(feed);
     expect(byId["mid"]!.topLevel).toBe(false);
     expect(byId["w1"]!.parentRowId).toBeNull();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WHAT THE COLUMN OWES HIM — the accounting, which is NOT the interruption budget.
+//
+// FOUNDER'S RULING, 2026-08-05 (bead sparkle-qogah): "We should never hide a row that needs action
+// from me." Asked whether "Needs merge" belongs in the concierge's WANTS YOU column — it was
+// deliberately excluded, so the column could state "0 Need you" over a fleet with 27 un-landed PRs —
+// he answered: "Yes, but as one honest group — one row reading '27 need merge' that expands in
+// place. Nothing hidden, count is true, column stays readable."
+//
+// These tests pin the two halves of that, in the two directions it can fail:
+//   • UNDER-REPORTING — the defect. `unmerged` must count. A count that sounds complete while
+//     concealing work is worse than no count.
+//   • OVER-WIDENING — the other failure. He ruled idle / "Done — your turn" INFORMATIONAL in the
+//     same interview, so pulling the rest of the `done` band in would make the number meaningless
+//     again, in the other direction.
+// ─────────────────────────────────────────────────────────────────────────────
+describe("isOwedAction — needs_you PLUS unmerged, and nothing else", () => {
+  const withStatus = (status: AgentTabStatus) =>
+    isOwedAction({ status, band: bandOfStatus(status) });
+
+  it.each<[AgentTabStatus, boolean]>([
+    // Blocking prompts — the founder is the only one who can move these.
+    ["waiting", true],
+    ["approval", true],
+    ["blocked", true],
+    ["errored", true],
+    // The ruling: un-landed work is an action he owes, even though its BAND is `done`.
+    ["unmerged", true],
+    // Informational, explicitly. Capping or summarising these is allowed; they are not owed actions.
+    ["idle", false],
+    ["done", false],
+    ["stopped", false],
+    ["working", false],
+  ])("%s → owed: %s", (status, owed) => {
+    expect(withStatus(status)).toBe(owed);
+  });
+
+  // The band and the accounting answer DIFFERENT questions about the same agent, and the whole bug
+  // was treating them as one. `unmerged` is out of the interruption budget (no nudge card, no tab
+  // glow — 27 of those is the card wall) and in the accounting (the column may not say zero).
+  it("is deliberately wider than the needs_you band, for unmerged and only unmerged", () => {
+    expect(conciergeBand("unmerged")).toBe("done");
+    expect(isOwedAction({ status: "unmerged", band: "done" })).toBe(true);
+  });
+});
+
+describe("owedCounts — the number column one may never under-state", () => {
+  /** A fleet of `n` committed-but-unlanded agents and nothing else — the reported shape. */
+  const unmergedFleet = (n: number, projectName = "sparkle") =>
+    buildConciergeFeed({
+      projects: [
+        project(
+          "p1",
+          Array.from({ length: n }, (_, i) => agent(`pr-${i}`)),
+          projectName,
+        ),
+      ],
+      status: Object.fromEntries(
+        Array.from({ length: n }, (_, i) => [`pr-${i}`, "unmerged" as AgentTabStatus]),
+      ),
+    });
+
+  // THE DEFECT, stated as the two numbers side by side. `scopedCounts.needs_you` is 0 and that is
+  // CORRECT — it is the interruption budget, and landing state must not buy an interruption. What
+  // was wrong is that it was the only number the column had, so "0 Need you" was the whole report
+  // over twenty-seven PRs sitting un-landed.
+  it("counts 27 un-landed agents as work he owes, over a column that reports 0 Need you", () => {
+    const feed = unmergedFleet(27);
+    expect(feed.scopedCounts.needs_you).toBe(0);
+    expect(owedCounts(feed)).toEqual({ needsYou: 0, unmerged: 27, total: 27 });
+  });
+
+  it("is never zero while un-landed work exists", () => {
+    for (const n of [1, 2, 27, 51]) {
+      expect(owedCounts(unmergedFleet(n)).total).toBe(n);
+    }
+  });
+
+  // Exact, not capped and not rounded: the founder's "count is true". A cap would show here as a
+  // total that stops climbing.
+  it("states the true total rather than a capped one", () => {
+    expect(owedCounts(unmergedFleet(51)).total).toBe(51);
+    expect(accountedUnmerged(unmergedFleet(51))).toHaveLength(51);
+  });
+
+  // OVER-WIDENING GUARD. Idle / done / stopped are informational — he said so in the same breath.
+  it("does not pull idle, done or stopped agents into the count", () => {
+    const feed = buildConciergeFeed({
+      projects: [project("p1", [agent("a"), agent("b"), agent("c"), agent("d")])],
+      status: { a: "idle", b: "done", c: "stopped", d: "working" },
+    });
+    expect(feed.scopedCounts.done).toBe(3); // they are all still in the feed, banded as before
+    expect(owedCounts(feed)).toEqual({ needsYou: 0, unmerged: 0, total: 0 });
+    expect(accountedUnmerged(feed)).toEqual([]);
+  });
+
+  // Both halves at once, and they are disjoint by construction (`unmerged` bands `done`, never
+  // `needs_you`), so `total` is a sum and cannot double-count one agent.
+  it("adds the blocking prompts and the un-landed work without double-counting", () => {
+    const feed = buildConciergeFeed({
+      projects: [project("p1", [agent("ask"), agent("crashed"), agent("m1"), agent("m2")])],
+      status: { ask: "waiting", crashed: "errored", m1: "unmerged", m2: "unmerged" },
+    });
+    expect(owedCounts(feed)).toEqual({ needsYou: 2, unmerged: 2, total: 4 });
+  });
+
+  // NO DRIFT. The needs-you half is the same population `scopedCounts.needs_you` counts — one gate
+  // (`isAccounted`), applied in both places, rather than two copies that have to be kept in step.
+  it("its needs-you half is exactly scopedCounts.needs_you", () => {
+    const feed = buildConciergeFeed({
+      projects: [
+        project("p1", [agent("ask"), agent("boss"), agent("w1", { kind: "worker", parentId: "boss" })]),
+        project("p2", [agent("m1"), agent("calm")]),
+      ],
+      status: { ask: "approval", boss: "idle", w1: "waiting", m1: "unmerged", calm: "idle" },
+    });
+    expect(owedCounts(feed).needsYou).toBe(feed.scopedCounts.needs_you);
+  });
+
+  // THE SAME THREE GATES as every other thing the column surfaces. Muting is the user asking not to
+  // be told; a pin is the user narrowing the question. Neither is the column hiding something.
+  it("respects the mute gate", () => {
+    const feed = buildConciergeFeed({
+      projects: [project("p1", [agent("m1"), agent("m2")])],
+      status: { m1: "unmerged", m2: "unmerged" },
+      shouldInterrupt: (topic) => topic !== "m1",
+    });
+    expect(owedCounts(feed)).toEqual({ needsYou: 0, unmerged: 1, total: 1 });
+  });
+
+  it("respects the pin", () => {
+    const feed = buildConciergeFeed({
+      projects: [
+        project("p1", [agent("m1")]),
+        project("p2", [agent("m2")], "other"),
+      ],
+      status: { m1: "unmerged", m2: "unmerged" },
+      pinnedProjectId: "p1",
+    });
+    expect(owedCounts(feed).unmerged).toBe(1);
+    expect(accountedUnmerged(feed).map((a) => a.id)).toEqual(["m1"]);
+  });
+});
+
+describe("accountedUnmerged — the digest's pool", () => {
+  it("hands the agents over in feed order, so the line leads with the one ranked first", () => {
+    const feed = buildConciergeFeed({
+      projects: [project("p1", [agent("zzz"), agent("aaa")])],
+      status: { zzz: "unmerged", aaa: "unmerged" },
+    });
+    expect(accountedUnmerged(feed).map((a) => a.id)).toEqual(["aaa", "zzz"]);
+  });
+
+  // NOT filtered to `topLevel`, unlike the needs-you digest's pool. That filter exists because a
+  // `rows` line's count promises the click leaves exactly that many ROWS standing; this line makes
+  // no such promise — it expands in place and names every member. Dropping workers here would
+  // reintroduce the omission this change exists to remove, for exactly the agents with the least
+  // other representation.
+  it("includes an un-landed worker, which has no row of its own", () => {
+    const feed = buildConciergeFeed({
+      projects: [
+        project("p1", [agent("boss"), agent("w1", { kind: "worker", parentId: "boss" })]),
+      ],
+      status: { boss: "working", w1: "unmerged" },
+      openAgentIds: ["boss", "w1"],
+    });
+    expect(accountedUnmerged(feed).map((a) => a.id)).toEqual(["w1"]);
+    expect(owedCounts(feed).unmerged).toBe(1);
+  });
+});
+
+// ── THE DUPLICATED GATE, PINNED ─────────────────────────────────────────────────────────────────
+//
+// `conciergeProactive.accountedNeedsYou` spells out the same four accounting terms by hand: it
+// predates `isAccounted` and lives one layer up. `isAccounted`'s doc asserted the two were "pinned
+// equal by test" — they were NOT. `accountedOwed` had zero references outside conciergeFeed.ts, so
+// the claim was a comment stating a guarantee nobody had written (roborev 59062).
+//
+// Two copies of a gate that decides what the column COUNTS and what it SHOWS is exactly how the
+// vitals line and the thread came to disagree. Until the hand-written copy delegates, this is the
+// thing that makes the claim true.
+describe("the two copies of the accounting gate agree", () => {
+  const feedWith = (tabs: AgentTab[], status: Record<string, AgentTabStatus>) =>
+    buildConciergeFeed({ projects: [project("p1", tabs)], status });
+
+  it("accountedNeedsYou equals accountedOwed's needs-you half, over a mixed fleet", () => {
+    const tabs = [
+      agent("waiting1"),
+      agent("approval1"),
+      agent("blocked1"),
+      agent("unmerged1"),
+      agent("idle1"),
+      agent("working1"),
+      agent("errored1"),
+    ];
+    const status: Record<string, AgentTabStatus> = {
+      waiting1: "waiting",
+      approval1: "approval",
+      blocked1: "blocked",
+      unmerged1: "unmerged",
+      idle1: "idle",
+      working1: "working",
+      errored1: "errored",
+    };
+    const feed = feedWith(tabs, status);
+
+    const owedNeedsYou = accountedOwed(feed)
+      .filter((a) => conciergeBand(a.status) === "needs_you")
+      .map((a) => a.id)
+      .sort();
+    const needsYou = accountedNeedsYou(feed)
+      .map((a) => a.id)
+      .sort();
+
+    expect(needsYou).toEqual(owedNeedsYou);
+    // Non-vacuous in both directions: the fleet really does contain needs-you rows AND owed rows
+    // that are NOT needs-you, so an implementation that returned everything (or nothing) fails.
+    expect(needsYou.length).toBeGreaterThan(0);
+    expect(accountedOwed(feed).length).toBeGreaterThan(needsYou.length);
+  });
+});
+
+// ── an all-questions fleet must not read CALM ─────────────────────────────────────────────────
+//
+// The fourth surface in this change set with one cause. `isOwedAction` NAMED `needs_you`, so when a
+// fourth band landed it counted `questions` as calm — and an all-questions fleet made column one
+// state "0 Need you" while every agent on it was blocked on the user. Identical in shape to the
+// `unmerged` defect this predicate was widened for, entered through the newest band. Derived from
+// ASKING_BANDS now, so the fifth band is a decision in engine/buildSections, not another omission.
+describe("isOwedAction — the newest asking band counts", () => {
+  it("counts a questioning agent as owed", () => {
+    expect(isOwedAction({ band: "questions", status: "questions" })).toBe(true);
+  });
+
+  it("still counts the red band and un-landed work", () => {
+    expect(isOwedAction({ band: "needs_you", status: "waiting" })).toBe(true);
+    expect(isOwedAction({ band: "done", status: "unmerged" })).toBe(true);
+  });
+
+  // The founder's ruling holds: "Done — your turn" is INFORMATIONAL and may be capped. Widening
+  // must not creep into the calm statuses, or the number is meaningless in the other direction.
+  it("does not count idle, done or stopped", () => {
+    for (const status of ["idle", "done", "stopped"] as const) {
+      expect(isOwedAction({ band: "done", status })).toBe(false);
+    }
+    expect(isOwedAction({ band: "running", status: "working" })).toBe(false);
   });
 });

@@ -11,6 +11,7 @@ import {
   mergePr,
   OPEN_PR_POLL_MS,
   OPEN_PR_QUERY_LIMIT,
+  prListSaturated,
   prMergeEligibility,
   prMergeReadiness,
   prProbeBlockedCount,
@@ -59,17 +60,81 @@ describe("formatPrBadge", () => {
   });
 });
 
-describe("formatPrBadge — query saturation (roborev 43840)", () => {
-  it("renders '100+' at the query limit rather than a bare, understated count", () => {
+describe("formatPrBadge — query saturation (roborev 43840, bead sparkle-qogah)", () => {
+  it("hedges at the query limit rather than rendering a bare, understated count", () => {
     // The probe asks gh for at most OPEN_PR_QUERY_LIMIT rows. A count AT the limit means "at least
-    // this many" — showing a plain "100" would silently understate, the same false-reassurance
-    // failure the null-vs-zero rule guards against, one step further out.
-    expect(formatPrBadge(OPEN_PR_QUERY_LIMIT)).toBe("100+ PRs waiting");
-    expect(formatPrBadge(OPEN_PR_QUERY_LIMIT + 25)).toBe("100+ PRs waiting");
+    // this many" — showing a plain count would silently understate, the same false-reassurance
+    // failure the null-vs-zero rule guards against, one step further out. This branch is the
+    // BACKSTOP for a reply carrying no saturation flag; the flag itself is asserted below.
+    expect(formatPrBadge(OPEN_PR_QUERY_LIMIT)).toBe(
+      `${OPEN_PR_QUERY_LIMIT}+ PRs waiting`,
+    );
+    // OVER the cap reads as its own floor, not as the cap's. Summed across four open project tabs
+    // the total legitimately exceeds one query's limit, and rendering `${LIMIT}+` there understated
+    // by everything above it — a hedge that lies by a smaller amount is still a lie.
+    expect(formatPrBadge(OPEN_PR_QUERY_LIMIT + 25)).toBe(
+      `${OPEN_PR_QUERY_LIMIT + 25}+ PRs waiting`,
+    );
   });
 
   it("still renders an exact count just below the limit", () => {
-    expect(formatPrBadge(OPEN_PR_QUERY_LIMIT - 1)).toBe("99 PRs waiting");
+    expect(formatPrBadge(OPEN_PR_QUERY_LIMIT - 1)).toBe(
+      `${OPEN_PR_QUERY_LIMIT - 1} PRs waiting`,
+    );
+    expect(formatPrBadge(OPEN_PR_QUERY_LIMIT - 1)).not.toContain("+");
+  });
+
+  it("discloses a truncated probe at ANY count, not only at the mirrored cap", () => {
+    // THE FLAG IS THE AUTHORITATIVE CHANNEL. `gh pr list --limit N` truncates with no signal, so
+    // Rust now stamps `listSaturated` on every row and the badge must hedge on it — a count of 12
+    // that the probe says was truncated is a FLOOR, whatever the JS-side constant happens to be.
+    // Keying only on the constant is what made this understate silently when the two drifted.
+    expect(formatPrBadge(12, true)).toBe("12+ PRs waiting");
+    expect(formatPrBadge(12, false)).toBe("12 PRs waiting");
+    // Absent saturation must behave exactly like an explicit false — never like true, which would
+    // cry wolf on every ordinary poll.
+    expect(formatPrBadge(12)).toBe(formatPrBadge(12, false));
+  });
+
+  it("never turns nothing-to-say into something, saturated or not", () => {
+    // A zero-row list cannot be truncated, and unknown is unknown. Neither may acquire a "0+".
+    expect(formatPrBadge(0, true)).toBeNull();
+    expect(formatPrBadge(null, true)).toBeNull();
+  });
+});
+
+describe("prListSaturated", () => {
+  const row = (over: Partial<PrRow> = {}): PrRow => ({
+    number: 1,
+    title: "t",
+    headRefName: "b",
+    url: "u",
+    checks: "passing",
+    mergeable: "mergeable",
+    ...over,
+  });
+
+  it("reads the flag the probe stamped on the rows", () => {
+    expect(prListSaturated([row({ listSaturated: true })])).toBe(true);
+    expect(prListSaturated([row({ listSaturated: false })])).toBe(false);
+  });
+
+  it("falls back to the row count when NO row carries a flag", () => {
+    // "Absent is not false" — a reply predating the field, or a partial fixture, must not be able to
+    // present a cap-length list as complete. This is the half that keeps an older Rust build honest.
+    const capped = Array.from({ length: OPEN_PR_QUERY_LIMIT }, (_, i) =>
+      row({ number: i + 1 }),
+    );
+    expect(capped.every((r) => r.listSaturated === undefined)).toBe(true);
+    expect(prListSaturated(capped)).toBe(true);
+    expect(prListSaturated(capped.slice(0, -1))).toBe(false);
+  });
+
+  it("is false for an empty list and for a probe that could not ask", () => {
+    // Zero rows cannot be truncated, and `null` is "we could not ask" — there is no list to have
+    // been cut short, so neither may render a hedge.
+    expect(prListSaturated([])).toBe(false);
+    expect(prListSaturated(null)).toBe(false);
   });
 });
 
