@@ -164,6 +164,22 @@ pub struct Me {
     /// (`services/cloudAgents/gating.ts`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cloud_agents_enabled: Option<bool>,
+    /// Social Coding identity (design §6.7). Passed through for the SAME reason as the two fields
+    /// above, and it is the whole reason this struct is touched in the same commit as the server
+    /// change: serde silently DROPS unknown keys, so a server-only `/me` addition is INERT — the JS
+    /// side would read `undefined` forever no matter what the server sends.
+    ///
+    /// `username` is null until the user claims one; `visibility` is their durable intent
+    /// (`public` | `connections` | `unavailable`, defaulting to unavailable — social is opt-in);
+    /// `social_enabled` is a SINGLE COMPUTED BOOLEAN, never the underlying per-account grant.
+    /// All `#[serde(default)]` so an older orchestration server that predates them still
+    /// deserializes; absent reads as "no identity, feature off", which hides every social surface.
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    visibility: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    social_enabled: Option<bool>,
     /// What a cloud agent COSTS: `{ centsPerMinute, minStartCents }`, straight from the server's own
     /// pricing constants. Passed through verbatim — and this field is the reason the desktop can
     /// quote a price at all: the client deliberately holds NO rate of its own, because a duplicated
@@ -854,6 +870,46 @@ mod tests {
         .unwrap();
         let out = serde_json::to_value(&without).unwrap();
         assert!(out.get("autoTopup").is_none());
+    }
+
+    #[test]
+    fn me_passes_the_social_identity_through_and_tolerates_an_older_server() {
+        // THE POINT OF THIS TEST: serde silently drops unknown keys, so adding these fields to the
+        // server's /me alone is INERT — the JS side reads `undefined` forever regardless of what
+        // the server sends. Only an explicit member on this struct makes the server change do
+        // anything, and only a round-trip assertion proves the member is really wired.
+        let claimed: Me = serde_json::from_str(
+            r#"{"clerkUserId":"u1","entitled":true,"balanceCents":100,"tokenVersion":1,
+                "username":"Ada","visibility":"public","socialEnabled":true}"#,
+        )
+        .unwrap();
+        let out = serde_json::to_value(&claimed).unwrap();
+        assert_eq!(out["username"], "Ada");
+        assert_eq!(out["visibility"], "public");
+        assert_eq!(out["socialEnabled"], true);
+
+        // A user who has not claimed a handle: the server sends explicit nulls, and they must not
+        // be confused with the feature being off.
+        let unclaimed: Me = serde_json::from_str(
+            r#"{"clerkUserId":"u1","entitled":true,"balanceCents":100,"tokenVersion":1,
+                "username":null,"visibility":"unavailable","socialEnabled":true}"#,
+        )
+        .unwrap();
+        let out = serde_json::to_value(&unclaimed).unwrap();
+        assert!(out["username"].is_null());
+        assert_eq!(out["visibility"], "unavailable");
+        assert_eq!(out["socialEnabled"], true);
+
+        // An older orchestration server that predates the fields must still deserialize, and
+        // `socialEnabled` must be OMITTED (not null) so JS reads a plain `undefined` ⇒ gated off,
+        // hiding every social surface.
+        let old: Me = serde_json::from_str(
+            r#"{"clerkUserId":"u1","entitled":true,"balanceCents":100,"tokenVersion":1}"#,
+        )
+        .unwrap();
+        let out = serde_json::to_value(&old).unwrap();
+        assert!(out.get("socialEnabled").is_none());
+        assert!(out["username"].is_null());
     }
 
     #[test]

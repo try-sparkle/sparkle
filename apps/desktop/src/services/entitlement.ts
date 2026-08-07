@@ -41,6 +41,19 @@ export interface Me {
    *  (services/cloudAgents/gating.ts). Kept on the type because the server still sends it and a
    *  future outage banner is the one legitimate reader. */
   cloudAgentsEnabled?: boolean;
+  /** The user's own Social Coding handle, or null/absent until they claim one. NEVER derive a
+   *  display name from `email`/`name` when this is absent — §5 of the social design forbids
+   *  auto-filling an identity from the Clerk account. */
+  username?: string | null;
+  /** The user's own durable availability INTENT: `public` | `connections` | `unavailable`. Distinct
+   *  from liveness (is a socket open right now) — a user is routinely public AND offline. Absent
+   *  reads as `unavailable`, since social is opt-in and nobody becomes discoverable by upgrading. */
+  visibility?: string | null;
+  /** Whether this account may use Social Coding — a single server-computed boolean folding the
+   *  global kill switch and the per-account state together. Absent (an older server, or the flag
+   *  off) reads as FALSE everywhere, which hides every social surface. Never infer it from
+   *  `username` being set: an account can hold a handle and still be cut off. */
+  socialEnabled?: boolean;
   /** What a cloud agent COSTS, stated by the server. The client holds NO rate of its own and must
    *  not derive one — a duplicated pricing rule already shipped a bug here (the 50¢ client floor
    *  that refused starts the server would have accepted; see `cloudAgents/gating.ts`). Absent means
