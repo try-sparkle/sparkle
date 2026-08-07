@@ -22,7 +22,7 @@
     "visual": "pnpm visual:capture && pnpm visual:compare",
     "lint": "eslint src --max-warnings 12",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
+    "test": "bash ../../scripts/vitest-run.sh",
     "test:coverage": "vitest run --coverage",
     "tauri": "tauri",
     "tauri:build:fresh": "cargo clean -p sparkle --manifest-path src-tauri/Cargo.toml && tauri build"
