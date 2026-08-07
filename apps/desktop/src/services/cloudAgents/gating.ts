@@ -10,6 +10,7 @@
 // the locally-known preconditions are met.
 
 import type { CategoryId } from "../../stores/uiStore";
+import { formatUsd } from "../../components/spendFormat";
 
 /**
  * Why a cloud create is blocked, most-fundamental first.
@@ -67,8 +68,11 @@ export type CloudGate =
  * constant is **5¢**. This constant said 50¢ and described itself as "small and generous so it
  * never blocks a genuinely-affordable balance", which was simply false: every balance from 5¢ to
  * 49¢ was refused locally with "you don't have enough credits" for a start the server would have
- * accepted, and — because `CLOUD_MIN_CONTINUE_CENTS` derives from it — a running agent's
- * auto-continue was silently abandoned in the same band.
+ * accepted — and, while `CLOUD_MIN_CONTINUE_CENTS` was ALIASED to this constant, a running agent's
+ * auto-continue was silently abandoned in the same band. **That alias is gone** (see
+ * `engine/goalContinuation`): the resume floor is its own literal and the continue arm reads the
+ * server's `minContinueCents`, so changing THIS constant no longer moves the resume bar. Stated as
+ * history because the blast radius is the thing a reader needs right, in both directions.
  *
  * A duplicated exact floor is a second copy of a pricing rule that can drift from the one that
  * decides, which is exactly what happened. So this is now only the check that needs no pricing
@@ -122,7 +126,16 @@ export function evaluateCloudGate(input: CloudGateInput): CloudGate {
     return {
       ok: false,
       reason: "insufficient_credits",
-      message: "You don't have enough credits to start a cloud agent. Add credits to continue.",
+      // STATE THE AMOUNT WHEN WE KNOW IT. Once this gate reads the server's floor, it also
+      // SUPPRESSES the cost line that used to name it — the create dialog renders this block
+      // instead of the form, so a generic "not enough credits" would drop the one number the user
+      // needs to act on, and the previous commit's whole gain with it. With no server floor there
+      // is no honest amount to quote (the 1¢ fallback is "obviously empty", not a price), so the
+      // sentence stays generic rather than inventing one.
+      message:
+        input.minStartCents !== undefined && Number.isFinite(input.minStartCents)
+          ? `You need ${formatUsd(input.minStartCents / 100)} in credits to start a cloud agent. Add credits to continue.`
+          : "You don't have enough credits to start a cloud agent. Add credits to continue.",
       deepLink: "credits",
     };
   }

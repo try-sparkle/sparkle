@@ -286,6 +286,42 @@ describe("the sandboxes that must never be resumed", () => {
     expect(outcomes[0]).toMatchObject({ agentId, action: "none", detail: "cloud-out-of-credits" });
   });
 
+  // THE FLOOR THIS ARM READS — pinned at the PRODUCER, because `cloudEvidenceFor` is where the wrong
+  // number would be picked up and the pure decision function cannot tell which field fed it.
+  it("refuses against the server's RESUME floor, which only the wiring can supply", async () => {
+    // 4¢ clears the 1¢ fallback, so this refusal is reachable ONLY if `cloudEvidenceFor` actually
+    // carried `minContinueCents` across. Delete that line and the sweep resumes instead.
+    useAuthStore.setState({
+      me: { balanceCents: 4, cloudAgentPricing: { centsPerMinute: 0.9, minContinueCents: 5 } },
+    } as never);
+    const { agentId } = seed({ goal: "land the cloud PR" });
+
+    const outcomes = await sweepTwice();
+
+    expect(inputs()).toEqual([]);
+    expect(outcomes[0]).toMatchObject({ agentId, action: "none", detail: "cloud-out-of-credits" });
+  });
+
+  it("does NOT apply the server's START floor to a resume — that strands purchased runway", async () => {
+    // THE MONEY BUG, guarded at its entry point. `/me` states the $1 spawn floor and NO resume floor
+    // (an older orchestration build). 50¢ is far below the start bar and far above the ~5¢ this
+    // resume actually costs — the server would allow it, and there is no round-trip afterwards to
+    // correct a local refusal. So the agent must be RESUMED. Substituting `minStartCents` here (as an
+    // earlier draft of this file did) reds this: the wallet is refused and the goal is abandoned by a
+    // background timer with nothing on screen to explain it.
+    useAuthStore.setState({
+      me: { balanceCents: 50, cloudAgentPricing: { centsPerMinute: 0.9, minStartCents: 100 } },
+    } as never);
+    const { agentId } = seed({ goal: "land the cloud PR" });
+
+    const outcomes = await sweepTwice();
+
+    // The SIDE EFFECT, not merely the absence of a refusal: the resume really went out on the relay.
+    expect(inputs()).toHaveLength(1);
+    expect(inputs()[0]!.text).toContain("land the cloud PR");
+    expect(outcomes[0]).toMatchObject({ agentId, action: "continue", sent: true });
+  });
+
   it("refuses a session this window has no CURRENT reading of", async () => {
     // The fail-closed arm. A lifecycle reading is a snapshot of a remote machine and expires; with
     // none, the honest answer is "I do not know", never "active".

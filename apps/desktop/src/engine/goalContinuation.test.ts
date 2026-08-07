@@ -489,7 +489,12 @@ describe("cloud agents", () => {
   function readyCloud(over: Partial<ContinuationInput> = {}): ContinuationInput {
     return ready({
       runtime: "cloud",
-      cloud: { sessionStatus: "active", balanceCents: 5_000, relayConnected: true },
+      cloud: {
+        sessionStatus: "active",
+        balanceCents: 5_000,
+        minContinueCents: undefined, // no server floor stated — the fail-open fallback applies
+        relayConnected: true,
+      },
       ...over,
     });
   }
@@ -561,6 +566,67 @@ describe("cloud agents", () => {
       decideContinuation(readyCloud({ cloud: cloudWith({ balanceCents: CLOUD_MIN_CONTINUE_CENTS }) }))
         .action,
     ).toBe("continue");
+  });
+
+  // THE FALLBACK, IN LITERAL CENTS. Stated as numbers on purpose: every other boundary in this file
+  // is phrased as `CLOUD_MIN_CONTINUE_CENTS ± 1`, so those tests follow the constant wherever it
+  // moves. An older `/me` states no resume floor, and the only defensible local bar for one of those
+  // is "the wallet is empty" — 1¢, not whatever the spawn bar happens to be this quarter.
+  it("falls back to ONE CENT — an empty wallet — when the server stated no resume floor", () => {
+    expect(CLOUD_MIN_CONTINUE_CENTS).toBe(1); // the value, not a band around it
+    expect(
+      decideContinuation(readyCloud({ cloud: cloudWith({ balanceCents: 0 }) })),
+    ).toEqual({ action: "none", reason: "cloud-out-of-credits" });
+    expect(
+      decideContinuation(readyCloud({ cloud: cloudWith({ balanceCents: 1 }) })).action,
+    ).toBe("continue");
+    // 99¢ is ~110 affordable minutes and is below the SERVER's $1 spawn floor. It continues — the
+    // spawn bar has no business here.
+    expect(
+      decideContinuation(readyCloud({ cloud: cloudWith({ balanceCents: 99 }) })).action,
+    ).toBe("continue");
+  });
+
+  // …AND THE DE-ALIASING ITSELF, which no value assertion above can reach. `CLOUD_MIN_START_CENTS`
+  // is 1¢ TODAY (it is the client's "obviously empty" check — the $1 rule lives only in the server's
+  // `me.cloudAgentPricing.minStartCents`), so restoring `= CLOUD_MIN_START_CENTS` changes no number
+  // and every assertion in this file stays green. The regression is therefore invisible to behaviour
+  // and has to be pinned at the SOURCE: the risk is that the client constant moves again — it was
+  // 50¢ before — and silently drags the resume bar with it. Same readFileSync idiom as the
+  // CONTROL_OPS check below.
+  it("does not import the START floor — the resume bar cannot be dragged by it again", () => {
+    const source = readFileSync(new URL("./goalContinuation.ts", import.meta.url), "utf8");
+    const imports = source
+      .split("\n")
+      .filter((l) => /^\s*import\b/.test(l) || /^\s*}\s*from\s+["']/.test(l))
+      .join("\n");
+    expect(imports).not.toContain("CLOUD_MIN_START_CENTS");
+    // And the definition is a literal, not a reference to anything.
+    expect(source).toMatch(/export const CLOUD_MIN_CONTINUE_CENTS = \d+;/);
+  });
+
+  // THE SERVER'S RESUME FLOOR, WHICH IS NOT ITS START FLOOR. `/me` publishes both and they differ by
+  // 20× ($1 to spawn, 5¢ to resume). This arm decides a resume, so it reads `minContinueCents`; the
+  // wiring that feeds it — and the money bug of feeding it `minStartCents` instead — is pinned at the
+  // producer in goalContinuationRunner.cloud.test.ts. 5¢ clears the 1¢ fallback, so only a stated
+  // floor can refuse these.
+  it("refuses on the SERVER's resume floor when it stated one, not just the 1¢ fallback", () => {
+    expect(
+      decideContinuation(
+        readyCloud({ cloud: cloudWith({ balanceCents: 4, minContinueCents: 5 }) }),
+      ),
+    ).toEqual({ action: "none", reason: "cloud-out-of-credits" });
+    // Exactly at the server's floor is affordable — the boundary, so a `<=` slip fails here too.
+    expect(
+      decideContinuation(
+        readyCloud({ cloud: cloudWith({ balanceCents: 5, minContinueCents: 5 }) }),
+      ).action,
+    ).toBe("continue");
+    // …and no floor stated means no floor invented: 50¢ continues on the fail-open fallback rather
+    // than being measured against a number this build never received.
+    expect(decideContinuation(readyCloud({ cloud: cloudWith({ balanceCents: 50 }) })).action).toBe(
+      "continue",
+    );
   });
 
   it("does NOT blame the wallet for a lifecycle an empty wallet cannot explain", () => {
@@ -641,5 +707,11 @@ describe("cloud agents", () => {
 /** A healthy cloud bundle with one or more facts overridden. Spelled out rather than spread from a
  *  shared object so a test that overrides `sessionStatus` cannot silently also change the balance. */
 function cloudWith(over: Partial<CloudEvidence>): CloudEvidence {
-  return { sessionStatus: "active", balanceCents: 5_000, relayConnected: true, ...over };
+  return {
+    sessionStatus: "active",
+    balanceCents: 5_000,
+    minContinueCents: undefined, // stated, not omitted — the field is required-but-nullable
+    relayConnected: true,
+    ...over,
+  };
 }

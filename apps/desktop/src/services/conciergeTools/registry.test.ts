@@ -1850,6 +1850,9 @@ describe("spawn_build_agent — atomic brief, name, model and mode", () => {
     useAuthStore.setState({
       tokenPresent: true,
       me: { cloudAgentsEnabled: true, entitled: true, balanceCents: 5_000 },
+      // The cloud gate re-reads /me before deciding; the real refresh reaches the keychain and
+      // would clear what this test just seeded.
+      refresh: vi.fn(async () => {}),
     } as never);
     useCloudAuthStore.setState({ method: "byok", loaded: true } as never);
 
@@ -1877,6 +1880,7 @@ describe("spawn_build_agent — atomic brief, name, model and mode", () => {
     useAuthStore.setState({
       tokenPresent: true,
       me: { cloudAgentsEnabled: true, entitled: true, balanceCents: 0 },
+      refresh: vi.fn(async () => {}),
     } as never);
     useCloudAuthStore.setState({ method: "byok", loaded: true } as never);
     const r = await dispatchConciergeTool(

@@ -830,7 +830,31 @@ export function briefFailureCopy(
 async function readCloudGate() {
   const cloudAuth = useCloudAuthStore.getState();
   if (!cloudAuth.loaded) await cloudAuth.refresh(); // never throws; sets `error` and leaves method
+  // RE-READ THE BALANCE, for the same reason both dialogs do — and more sharply here. `me` is
+  // persisted, and once a user is entitled `AuthGate` stops refreshing it on focus, so the only
+  // routine re-reads are the two dialogs' own effects, the credits panel, and deep-link/dictation
+  // events. A server-side auto-topup, or any top-up that did not come back through the
+  // `sparkle://auth` deep link, therefore leaves this store quoting a launch-time balance — and now
+  // that this gate refuses against the server's floor rather than 1¢, that stale number can refuse a
+  // spawn on an account that is funded. Best-effort exactly like the probe above. SWALLOWED
+  // deliberately — `refresh` reaches the keychain through `hasToken()`, which throws outside a Tauri
+  // webview, and a gate that cannot be read must not become a gate that cannot be passed.
+  const lastKnown = useAuthStore.getState().me;
+  await useAuthStore
+    .getState()
+    .refresh()
+    .catch(() => {});
   const auth = useAuthStore.getState();
+  // LAST-KNOWN, NEVER ZERO. `refresh` does not merely fail quietly: a `/me` it could not complete —
+  // network down, backend unreachable, an ambiguous 401 — CLEARS `me` outright once the entitlement
+  // grace window has lapsed. Reading `me?.balanceCents ?? 0` straight off that would convert a
+  // balance we just failed to LEARN into a definitive "you don't have enough credits", deep-linking
+  // a funded user to Credits they do not need. That is the same thing the cloud-auth probe above
+  // refuses to do — nobody may refuse on a fact nobody looked up — so a refresh that came back with
+  // no `me` decides on the reading we already had. (A refresh that finds no TOKEN is different and is
+  // not covered by this: it also clears `tokenPresent`, so the gate returns `signed_out` below,
+  // which is both true and actionable.)
+  const me = auth.me ?? lastKnown;
   return evaluateCloudGate({
     signedIn: auth.tokenPresent,
     // Re-read AFTER the await: the refresh above is the whole point of asking. And an unprobed or
@@ -839,12 +863,12 @@ async function readCloudGate() {
     // `POST /sessions/start` is the definitive check and refuses with the server's own reason.
     authConfigured:
       useCloudAuthStore.getState().method != null || !useCloudAuthStore.getState().loaded,
-    balanceCents: auth.me?.balanceCents ?? 0,
+    balanceCents: me?.balanceCents ?? 0,
     // The server's own start floor, transported — see the identical note in `useCloudGate`. The
     // concierge must refuse on the same number the dialog's cost line quotes, or "you need $1.00 to
     // start" and a tool that happily starts are two answers to one question. Absent falls back to
     // CLOUD_MIN_START_CENTS, so an older `/me` behaves exactly as before.
-    minStartCents: auth.me?.cloudAgentPricing?.minStartCents,
+    minStartCents: me?.cloudAgentPricing?.minStartCents,
   });
 }
 

@@ -56,6 +56,10 @@ function signedInAndFunded() {
   useAuthStore.setState({
     tokenPresent: true,
     me: { cloudAgentsEnabled: true, entitled: true, balanceCents: 5_000 },
+    // Stub `refresh`: the gate re-reads /me before deciding (a persisted balance can be stale for a
+    // user who was topped up outside the deep link), and the REAL one reaches the keychain and would
+    // clear the `me` each test seeds. Tests that seed their own `me` re-stub it with this shape.
+    refresh: vi.fn(async () => {}),
   } as never);
   // `loaded: true` so the gate reads the store rather than probing — the probe itself is asserted
   // in its own test below.
@@ -184,6 +188,7 @@ describe("the three preconditions, each refusing with its OWN reason and startin
     useAuthStore.setState({
       tokenPresent: true,
       me: { cloudAgentsEnabled: true, entitled: true, balanceCents: 0 },
+      refresh: vi.fn(async () => {}),
     } as never);
     const r = await spawnBuildAgent({ projectId: "p1", runtime: "cloud", prompt: "ship it" });
     expect(r.ok).toBe(false);
@@ -215,6 +220,7 @@ describe("the three preconditions, each refusing with its OWN reason and startin
         balanceCents: 50,
         cloudAgentPricing: { centsPerMinute: 0.9, minStartCents: 100 },
       },
+      refresh: vi.fn(async () => {}),
     } as never);
     const r = await spawnBuildAgent({ projectId: "p1", runtime: "cloud", prompt: "ship it" });
     expect(r.ok).toBe(false);
@@ -229,6 +235,62 @@ describe("the three preconditions, each refusing with its OWN reason and startin
     useAuthStore.setState({
       tokenPresent: true,
       me: { cloudAgentsEnabled: true, entitled: true, balanceCents: 50 },
+      refresh: vi.fn(async () => {}),
+    } as never);
+    const r = await spawnBuildAgent({ projectId: "p1", runtime: "cloud", prompt: "ship it" });
+    expect(r.ok).toBe(true);
+    expect(startSession).toHaveBeenCalledTimes(1);
+  });
+
+  // THE RE-READ ITSELF, asserted by its consequence rather than by spying on the call. `me` is
+  // persisted and nothing polls it once a user is entitled, so a top-up that did not arrive through
+  // the `sparkle://auth` deep link (a server-side auto-topup, a purchase on the web) leaves this
+  // store quoting a launch-time balance. Against the server's $1 floor that stale zero is a refusal
+  // for an account that can pay. Deleting the refresh from `readCloudGate` reds this test.
+  it("the cloud gate: re-reads /me, so a balance topped up elsewhere is not refused as stale", async () => {
+    useAuthStore.setState({
+      tokenPresent: true,
+      me: {
+        cloudAgentsEnabled: true,
+        entitled: true,
+        balanceCents: 0, // what this window last saw…
+        cloudAgentPricing: { centsPerMinute: 0.9, minStartCents: 100 },
+      },
+      // …and what the server says now. This is the whole point of the re-read.
+      refresh: vi.fn(async () => {
+        useAuthStore.setState({
+          me: {
+            cloudAgentsEnabled: true,
+            entitled: true,
+            balanceCents: 5_000,
+            cloudAgentPricing: { centsPerMinute: 0.9, minStartCents: 100 },
+          },
+        } as never);
+      }),
+    } as never);
+    const r = await spawnBuildAgent({ projectId: "p1", runtime: "cloud", prompt: "ship it" });
+    expect(r.ok).toBe(true);
+    expect(startSession).toHaveBeenCalledTimes(1);
+  });
+
+  // …and the OTHER direction, which is the one that bites. `refresh` does not merely fail quietly:
+  // a `/me` it cannot complete CLEARS `me` once the entitlement grace window has lapsed. Reading the
+  // balance straight off that would turn "we could not ask" into "you have no credits" — a refusal
+  // manufactured out of a network failure, on an account holding $50.
+  it("the cloud gate: a refresh that clears `me` decides on the last-known balance, not on zero", async () => {
+    useAuthStore.setState({
+      tokenPresent: true,
+      me: {
+        cloudAgentsEnabled: true,
+        entitled: true,
+        balanceCents: 5_000,
+        cloudAgentPricing: { centsPerMinute: 0.9, minStartCents: 100 },
+      },
+      // Exactly what authStore.refresh() does on a null fetchMe() past ENTITLEMENT_GRACE_MS. The
+      // token is still present, so this is NOT a sign-out — only an unanswered question.
+      refresh: vi.fn(async () => {
+        useAuthStore.setState({ tokenPresent: true, me: null } as never);
+      }),
     } as never);
     const r = await spawnBuildAgent({ projectId: "p1", runtime: "cloud", prompt: "ship it" });
     expect(r.ok).toBe(true);
@@ -236,7 +298,11 @@ describe("the three preconditions, each refusing with its OWN reason and startin
   });
 
   it("the cloud gate: a signed-out user gets the gate's sign-in sentence, not an invented one", async () => {
-    useAuthStore.setState({ tokenPresent: false, me: { cloudAgentsEnabled: true } } as never);
+    useAuthStore.setState({
+      tokenPresent: false,
+      me: { cloudAgentsEnabled: true },
+      refresh: vi.fn(async () => {}),
+    } as never);
     const r = await spawnBuildAgent({ projectId: "p1", runtime: "cloud", prompt: "ship it" });
     if (r.ok) throw new Error("expected refusal");
     expect(r.message).toBe("Sign in to run agents in the cloud.");

@@ -502,6 +502,12 @@ describe("spawnBuildAgent", () => {
     useAuthStore.setState({
       tokenPresent: true,
       me: { cloudAgentsEnabled: true, entitled: true, balanceCents: 5_000 },
+      // The gate re-reads /me before deciding. The REAL `refresh` reaches the keychain through
+      // `hasToken()`, which outside a Tauri webview finds no token and clears BOTH `me` and
+      // `tokenPresent` — so the seeded account above would evaporate and the gate would answer
+      // `signed_out`, masking the goal refusal this test is about. Same stub shape as the four
+      // suites that assert the gate itself.
+      refresh: vi.fn(async () => {}),
     } as never);
     useCloudAuthStore.setState({ method: "byok", loaded: true } as never);
     const r = await spawnBuildAgent({ projectId: pid, runtime: "cloud" });

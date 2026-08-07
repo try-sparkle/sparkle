@@ -200,6 +200,11 @@ export function cloudEvidenceFor(agentId: string, now: number): CloudEvidence {
   return {
     sessionStatus: cloudSessionStatusOf(agentId, now),
     balanceCents: useAuthStore.getState().me?.balanceCents,
+    // The server's RESUME floor — the number that actually governs the decision this evidence feeds.
+    // Deliberately NOT `minStartCents`, which is a different and much higher bar the server applies
+    // only to spawning: reading it here would abandon paused agents their owner can still afford.
+    // Undefined when the server stated none, which falls back to the 1¢ obviously-empty check.
+    minContinueCents: useAuthStore.getState().me?.cloudAgentPricing?.minContinueCents,
     // `CloudTransport.write` reads exactly this and silently no-ops when it is null, so a resume sent
     // over a dead relay would be recorded as delivered. Asked here, before the decision, rather than
     // discovered afterwards — the transport has no failure channel to read.

@@ -33,11 +33,11 @@ import { type AgentGoal, goalStateOf } from "./agentGoal";
 // would achieve nothing. See the gate order in `decideContinuation`.
 import { RESUME_PROMPT_MARKER } from "./agentOriginated";
 import { type QuotaBlock, isQuotaBlocked } from "./quotaBlock";
-// The client-side floor a cloud RUN must clear before we ask the server to buy sandbox minutes. An
-// auto-continue buys exactly that, so it clears the same floor rather than a second one invented
-// here — see CLOUD_MIN_CONTINUE_CENTS. (Pure module: `gating` imports one erased type and nothing
-// else, so this does not drag a store into the engine's runtime graph.)
-import { CLOUD_MIN_START_CENTS } from "../services/cloudAgents/gating";
+// NOTE: this module deliberately does NOT import `CLOUD_MIN_START_CENTS`. It used to, to alias
+// CLOUD_MIN_CONTINUE_CENTS to it — and that alias was the last route by which the START bar could
+// reach a RESUME decision. The two floors answer different questions and the server states them
+// separately, so the dependency is gone rather than merely unused. A test reads these import lines,
+// because the two constants hold the same value and no behavioural assertion can see a re-alias.
 
 /**
  * How long a row must sit CONTINUOUSLY idle before an auto-continue is allowed.
@@ -78,26 +78,36 @@ export const MAX_CONTINUES_WITHOUT_PROGRESS = 3;
 export const MAX_CONTINUES_TOTAL = 20;
 
 /**
- * The balance a cloud auto-continue must clear, in cents.
+ * The FALLBACK balance a cloud auto-continue must clear, in cents — used only when `/me` stated no
+ * resume floor of its own.
  *
- * A TEMPORARY FAIL-OPEN PLACEHOLDER, aliased to the start floor only because both are currently the
- * 1¢ "obviously empty wallet" check, where the alias cannot refuse anything a start would allow.
+ * The server's number is now wired: {@link CloudEvidence.minContinueCents} carries
+ * `cloudAgentPricing.minContinueCents` and {@link cloudRefusal} prefers it. This constant is what
+ * remains for an older orchestration build that does not send one, and it stays the 1¢ "obviously
+ * empty wallet" check — deliberately fail-open, because an un-stated floor is a floor we do not
+ * know, and the server refuses the resume itself if we are wrong.
  *
- * **Do not read the alias as a rule that resume and start SHARE a floor — the server says they do
- * not.** Starting requires a flat $1 minimum balance; resuming requires only that the next few
- * minutes are affordable (5¢ at today's rate), and `/me` states both as `cloudAgentPricing`'s
- * `minStartCents` and `minContinueCents`. Deriving this from the start floor is a money bug waiting
- * for the moment someone raises `CLOUD_MIN_START_CENTS` toward the server's $1, or feeds
- * `me.cloudAgentPricing.minStartCents` in here the way `useCloudAgents` and `conciergeTools/
- * lifecycle` already do on the START path: the resume bar silently jumps 5¢ → $1, and a user holding
- * 99¢ — about 110 affordable running minutes — has their paused agent abandoned by a background
- * timer with nothing on screen to explain it.
+ * **A LITERAL, no longer aliased to `CLOUD_MIN_START_CENTS`.** Be precise about which number that
+ * is: the CLIENT's start constant is also 1¢ today — it is the same "obviously empty" check — and
+ * the server's flat $1 spawn rule lives only in `me.cloudAgentPricing.minStartCents`, never in a
+ * constant here. So de-aliasing changed no value and fixes no live bug. It closes a FUTURE one: the
+ * client start constant has moved before (it was 50¢), and while the two were joined by
+ * `= CLOUD_MIN_START_CENTS`, moving it again would have dragged the resume bar along silently —
+ * every user on an older `/me` refused a resume at the spawn bar, which is the stranded-runway
+ * failure the rest of this doc exists to prevent. Two numbers that are equal today but answer
+ * different questions get two definitions. Because the values match, no behavioural test can catch
+ * a re-alias; `goalContinuation.test.ts` pins it by reading this file's imports instead.
  *
- * So when this is wired, take `minContinueCents` from `/me`; do NOT substitute `minStartCents` when
- * it is absent (an older server) — leave continuation ungated locally and let the server refuse,
- * which is the only direction that cannot destroy runway the user paid for.
+ * On the SERVER the two bars are far apart: starting requires a flat $1 minimum balance, resuming
+ * only that the next few minutes are affordable (5¢ at today's rate). Substituting
+ * `minStartCents` here — the way `useCloudAgents` and `conciergeTools/lifecycle` legitimately do on
+ * the START path — is a money bug: the resume bar silently jumps 5¢ → $1, and a user holding 99¢
+ * (about 110 affordable running minutes) has their paused agent abandoned by a background timer with
+ * nothing on screen to explain it. On this path no round-trip corrects the over-refusal, so it
+ * strands credit the user paid for. `goalContinuationRunner.cloud.test.ts` pins that a `/me`
+ * carrying only `minStartCents` leaves a 50¢ wallet continuing.
  */
-export const CLOUD_MIN_CONTINUE_CENTS = CLOUD_MIN_START_CENTS;
+export const CLOUD_MIN_CONTINUE_CENTS = 1;
 
 /** Why no auto-continue happened. Every arm is a REASON, never a bare false, because this is the
  *  field the concierge reads when it wants to know why a stalled-looking agent was left alone. */
@@ -177,6 +187,22 @@ export interface CloudEvidence {
    * be, because `sessionStatus` already refuses everything this window has not currently observed.
    */
   balanceCents: number | undefined;
+  /**
+   * The server's RESUME floor (`me.cloudAgentPricing.minContinueCents`), or `undefined` when the
+   * server stated none (an older orchestration build).
+   *
+   * THE RESUME NUMBER, NEVER THE START NUMBER. The server enforces two floors and publishes both;
+   * this arm decides a resume, so it reads the resume one. Absent falls back to
+   * {@link CLOUD_MIN_CONTINUE_CENTS} — the 1¢ obviously-empty check — and explicitly NOT to
+   * `minStartCents`: quoting the $1 start floor at a resume would abandon a paused agent whose owner
+   * can afford ~110 more minutes, and unlike the start path there is no server round-trip afterwards
+   * to correct the refusal. See {@link CLOUD_MIN_CONTINUE_CENTS} for the whole argument.
+   *
+   * REQUIRED-but-nullable, like `balanceCents` beside it: a producer must SAY it does not know,
+   * because omission here falls back to the permissive 1¢ constant, and a gate this file insists
+   * must fail closed should not be able to fail open by an oversight that still compiles.
+   */
+  minContinueCents: number | undefined;
   /**
    * Is the desktop's relay socket connected? Asked because `CloudTransport.write` emits into
    * `getSocket()?.emit(...)` and SILENTLY NO-OPS on a null socket — a dropped resume would otherwise
@@ -440,8 +466,10 @@ function whereItRuns(runtime: "local" | "cloud"): string {
  */
 function cloudRefusal(cloud: CloudEvidence | undefined): NoContinueReason | null {
   if (cloud === undefined) return "cloud-session-unknown";
-  const broke =
-    cloud.balanceCents !== undefined && cloud.balanceCents < CLOUD_MIN_CONTINUE_CENTS;
+  // The server's RESUME floor when it stated one, the 1¢ obviously-empty fallback otherwise. Not the
+  // start floor, ever — see CLOUD_MIN_CONTINUE_CENTS for why that substitution destroys paid runway.
+  const floor = cloud.minContinueCents ?? CLOUD_MIN_CONTINUE_CENTS;
+  const broke = cloud.balanceCents !== undefined && cloud.balanceCents < floor;
   switch (cloud.sessionStatus) {
     case "active":
       // Alive and reachable, so the wallet is the next thing that can stop us — and here it really

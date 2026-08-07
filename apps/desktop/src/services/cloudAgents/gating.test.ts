@@ -172,9 +172,10 @@ describe("deepLinkActionLabel", () => {
 describe("the credit floor is OBVIOUSLY-EMPTY only — the server owns the real rule", () => {
   // The client said 50¢ while `canStartCloudAgent` requires 5 minutes × 0.9¢/min = 5¢, so every
   // balance from 5¢ to 49¢ was refused locally for a start the server would have accepted — and,
-  // because CLOUD_MIN_CONTINUE_CENTS derives from this constant, a running agent's auto-continue
-  // was abandoned in the same band. A duplicated exact floor is a second copy of a pricing rule
-  // that can drift from the one that decides.
+  // while CLOUD_MIN_CONTINUE_CENTS was ALIASED to this constant, a running agent's auto-continue
+  // was abandoned in the same band. That alias no longer exists (engine/goalContinuation holds its
+  // own literal), so this constant's blast radius is the START path only. A duplicated exact floor
+  // is a second copy of a pricing rule that can drift from the one that decides.
   it("allows a balance the SERVER accepts but the old 50¢ floor refused", () => {
     for (const balanceCents of [5, 10, 25, 49]) {
       expect(evaluateCloudGate({ ...OK, balanceCents })).toEqual({ ok: true });
@@ -185,5 +186,38 @@ describe("the credit floor is OBVIOUSLY-EMPTY only — the server owns the real 
     const g = evaluateCloudGate({ ...OK, balanceCents: 0 });
     expect(g.ok).toBe(false);
     if (!g.ok) expect(g.reason).toBe("insufficient_credits");
+  });
+});
+
+// THE AMOUNT, WHEN THE SERVER STATED ONE. Feeding this gate the server's floor also SUPPRESSES the
+// cost line that used to name it — the create dialog renders this block instead of the form — so a
+// generic sentence here would drop the one number the user needs to act on. With no server floor
+// there is no honest amount to quote (the 1¢ fallback is "obviously empty", not a price).
+describe("the insufficient-credits sentence", () => {
+  const blocked = (over: { balanceCents: number; minStartCents?: number }) =>
+    evaluateCloudGate({ signedIn: true, authConfigured: true, ...over });
+
+  it("names the server's floor when it was supplied", () => {
+    const gate = blocked({ balanceCents: 50, minStartCents: 100 });
+    expect(gate.ok).toBe(false);
+    if (gate.ok) return;
+    expect(gate.message).toBe(
+      "You need $1.00 in credits to start a cloud agent. Add credits to continue.",
+    );
+    expect(gate.deepLink).toBe("credits");
+  });
+
+  it("follows the SERVER's number rather than one of its own", () => {
+    const gate = blocked({ balanceCents: 300, minStartCents: 500 });
+    if (gate.ok) return;
+    expect(gate.message).toContain("$5.00");
+  });
+
+  it("stays generic when the server stated no floor — an amount we never received is not quotable", () => {
+    const gate = blocked({ balanceCents: 0 });
+    if (gate.ok) return;
+    expect(gate.message).toBe(
+      "You don't have enough credits to start a cloud agent. Add credits to continue.",
+    );
   });
 });
