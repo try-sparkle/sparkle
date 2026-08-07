@@ -165,7 +165,7 @@ describe("escalated goals", () => {
 describe("done but not retired", () => {
   it("requires BOTH a met goal and affirmatively-clean work", () => {
     const [c] = evaluateFleetConditions(
-      [{ agentId: "a", label: "Finished One", goalMetAt: T0 - HOUR, hasUnlandedWork: false }],
+      [{ agentId: "a", label: "Finished One", goalMetAt: T0 - HOUR, hasUnlandedWork: false, retroSettled: true }],
       T0,
     );
     expect(c!.id).toBe("done-not-retired");
@@ -190,13 +190,41 @@ describe("done but not retired", () => {
   it("an unmet goal is never called safe to retire, however clean the tree", () => {
     expect(retirableAgents([{ agentId: "a", hasUnlandedWork: false }])).toEqual([]);
   });
+
+  it("an agent with NO retro on file is never called safe to retire", () => {
+    // knightwatch 5204094441#5, and this is contract drift rather than a new rule: engine/
+    // retroReceiptTypes already said in its own words that the Pusher "requires an affirmative
+    // `true` before it will recommend retiring anything". It did not. So the report told the
+    // founder a row was safe to retire moments before that row's × asked him to retire it
+    // "without its retro?" — two surfaces, one agent, opposite advice.
+    //
+    // FAILS against the pre-change code, where both of these returned the agent.
+    expect(retirableAgents([{ agentId: "a", goalMetAt: T0, hasUnlandedWork: false }])).toEqual([]);
+    expect(
+      retirableAgents([
+        { agentId: "a", goalMetAt: T0, hasUnlandedWork: false, retroSettled: false },
+      ]),
+    ).toEqual([]);
+    // …and the condition disappears from the report with it, not just from this list.
+    expect(
+      evaluateFleetConditions([{ agentId: "a", goalMetAt: T0, hasUnlandedWork: false }], T0),
+    ).toEqual([]);
+  });
+
+  it("…and IS called safe to retire once the retro is on file — the control", () => {
+    // Without this, deleting the condition outright would pass every test above. The rung must stay
+    // reachable: it returns on its own the day a captured/excused receipt exists for the agent.
+    const settled = { agentId: "a", goalMetAt: T0, hasUnlandedWork: false, retroSettled: true };
+    expect(retirableAgents([settled])).toEqual([settled]);
+    expect(evaluateFleetConditions([settled], T0).map((c) => c.id)).toContain("done-not-retired");
+  });
 });
 
 describe("ordering and persistence", () => {
   it("reports quota first — it is the one condition where retrying is actively wrong", () => {
     const ids = evaluateFleetConditions(
       [
-        { agentId: "c", goalMetAt: T0, hasUnlandedWork: false },
+        { agentId: "c", goalMetAt: T0, hasUnlandedWork: false, retroSettled: true },
         { agentId: "b", escalation: { reason: "gave up" } },
         walled("a"),
       ],
@@ -624,7 +652,7 @@ describe("pr-conflicting", () => {
   // already been done and is merely rotting.
   it("ranks below quota-blocked and above done-not-retired", () => {
     const ids = evaluateFleetConditions(
-      [{ agentId: "c", goalMetAt: T0, hasUnlandedWork: false }, walled("q")],
+      [{ agentId: "c", goalMetAt: T0, hasUnlandedWork: false, retroSettled: true }, walled("q")],
       T0,
       [],
       [pr()],
@@ -872,7 +900,7 @@ describe("the condition fingerprint", () => {
         { agentId: "f1", label: "F1", failure: { message: "API Error: ENOTFOUND", at: T0 - 60_000 } },
         { agentId: "f2", label: "F2", failure: { message: "API Error: ENOTFOUND", at: T0 - 60_000 } },
         { agentId: "e1", label: "E1", escalation: { reason: "gave up" } },
-        { agentId: "d1", label: "D1", goalMetAt: T0 - HOUR, hasUnlandedWork: false },
+        { agentId: "d1", label: "D1", goalMetAt: T0 - HOUR, hasUnlandedWork: false, retroSettled: true },
       ],
       T0,
       [hourly],

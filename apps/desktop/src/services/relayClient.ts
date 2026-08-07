@@ -20,6 +20,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { onPtyOutput, writePtyChained } from "../pty";
 import { getAgentScrollback } from "./terminalScrollback";
 import { closeBuildAgent } from "./closeBuildAgent";
+import { requestRetirementConfirm } from "./retirementConfirmRequest";
 import { parseControlAction, CLOSE_AGENT_ACTION } from "./suggestions/controlButtons";
 import { safeUnlisten } from "./safeUnlisten";
 import {
@@ -272,9 +273,29 @@ export async function startRelayHost(): Promise<void> {
     const r = resolveSuggestionClick(watched, c, lookupSuggestionValue);
     if (!r) return;
     if (parseControlAction(r.value) === CLOSE_AGENT_ACTION) {
-      void closeBuildAgent(r.agentId).catch((e) =>
-        console.debug("relay suggestion_click closeAgent failed", e),
-      );
+      // `false` — a tap on the PHONE cannot be the confirmation the retirement gate wants (bead
+      // sparkle-0l9xk). Not because the person holding it is not the founder, but because the gate
+      // is a confirm on WHAT THE AGENT REPORTED, and the retirement dialog — the thing that shows
+      // him the retro before the row goes — exists only on the desktop. A remote yes to a question
+      // that was never displayed is not consent.
+      //
+      // So the refusal raises the dialog on the DESKTOP and the phone tap stops there. He walks
+      // over, reads it, and confirms; nothing is torn down in the meantime.
+      void closeBuildAgent(r.agentId, false)
+        .then((closed) => {
+          if (closed.ok) return;
+          // The desktop dialog is the only place this confirm can be shown, so if no surface holds
+          // the agent the tap ends here. Logged rather than dropped (roborev 59153): a phone tap
+          // that closes nothing, opens nothing and leaves no trace is indistinguishable from the
+          // relay being down, and this is the one path with no channel back to the phone.
+          if (!requestRetirementConfirm(r.agentId)) {
+            console.debug(
+              "relay suggestion_click: landed agent needs a human confirm, and no open column can show it",
+              r.agentId,
+            );
+          }
+        })
+        .catch((e) => console.debug("relay suggestion_click closeAgent failed", e));
       return;
     }
     void writePtyChained(r.agentId, frameSubmit(r.value)).catch((e) =>

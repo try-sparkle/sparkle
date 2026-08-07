@@ -616,6 +616,13 @@ const agentIdArg = z.string().min(1, "an agent id is required");
 const projectIdArg = z.string().min(1, "a project id is required");
 const noArgs = z.object({}).strict();
 const agentOnly = z.object({ agentId: agentIdArg }).strict();
+/** close_agent, plus the agent's own stated reason for having no retro (bead sparkle-0l9xk). */
+const closeAgentArgs = z
+  .object({
+    agentId: agentIdArg,
+    noRetro: z.object({ reasonCode: z.unknown(), reasonText: z.unknown() }).optional(),
+  })
+  .strict();
 const projectOnly = z.object({ projectId: projectIdArg }).strict();
 
 /** The confirmation flag on workspace's destructive ops. Optional so the DOMAIN produces the
@@ -704,7 +711,12 @@ const LIFECYCLE_ROUTES: Record<LifecycleOp, Handler> = {
   ),
   preview_close: route(agentOnly, (a, ctx) => fromLifecycle(ctx, previewClose(a.agentId))),
   preview_discard: route(agentOnly, (a, ctx) => fromLifecycle(ctx, previewDiscard(a.agentId))),
-  close_agent: route(agentOnly, async (a, ctx) => fromLifecycle(ctx, await closeAgent(a.agentId))),
+  // `noRetro` is OPTIONAL and unvalidated beyond being an object: engine/retroMuster owns the
+  // vocabulary and the wording rules, and duplicating them in a zod schema here is how the two
+  // would drift. A malformed reason comes back as a refusal carrying muster's own phrase.
+  close_agent: route(closeAgentArgs, async (a, ctx) =>
+    fromLifecycle(ctx, await closeAgent(a.agentId, a.noRetro)),
+  ),
   ship_agent: route(agentOnly, async (a, ctx) => fromLifecycle(ctx, await shipAgent(a.agentId))),
   save_agent: route(agentOnly, async (a, ctx) => fromLifecycle(ctx, await saveAgent(a.agentId))),
   discard_agent: route(discardArgs, async (a, ctx) =>

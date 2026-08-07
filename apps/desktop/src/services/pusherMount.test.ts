@@ -14,6 +14,7 @@ vi.mock("../logger", () => ({
 }));
 
 import { buildPusherDeps, CONCIERGE_RECIPIENT_ID } from "./pusherMount";
+import { useProjectStore } from "../stores/projectStore";
 import {
   _resetConciergeNotifierForTests,
   setConciergeNotifier,
@@ -220,5 +221,33 @@ describe("the notifier registration", () => {
     setConciergeNotifier(sink);
     clearConciergeNotifier(sink);
     expect(notifyConcierge("hello")).toBe(false);
+  });
+});
+
+describe("the sweep's receipt cache — warmed for EVERY project, not just the open one", () => {
+  it("asks for each project's receipts before mapping snapshots", async () => {
+    // roborev 59899. `retirableAgents` now requires an affirmative `retroSettled`, and the lookup
+    // reads a module cache the SIDEBAR fills — inside a `projectId`-scoped effect, so only the open
+    // project is ever loaded. The Pusher sweeps every project, so for all the others the lookup
+    // answered `undefined` (⇒ false) and `done-not-retired` was permanently silent regardless of
+    // what was on disk. FAILS against the pre-change binding, which issued no `retro_receipt_all`
+    // at all.
+    invoke.mockImplementation(async () => ({}));
+    useProjectStore.setState({
+      projects: [
+        { id: "p1", name: "One", rootPath: "/tmp/one", defaultBranch: "main",
+          createdAt: new Date(0).toISOString(), selectedAgentId: null, agents: [] },
+        { id: "p2", name: "Two", rootPath: "/tmp/two", defaultBranch: "main",
+          createdAt: new Date(0).toISOString(), selectedAgentId: null, agents: [] },
+      ],
+    } as never);
+
+    buildPusherDeps().snapshots();
+
+    // The SIDE EFFECT — which projects were actually asked about — not that the dep exists.
+    const asked = invoke.mock.calls
+      .filter(([cmd]) => cmd === "retro_receipt_all")
+      .map(([, args]) => (args as { projectId: string }).projectId);
+    expect(new Set(asked)).toEqual(new Set(["p1", "p2"]));
   });
 });

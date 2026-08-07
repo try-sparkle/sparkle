@@ -17,6 +17,23 @@ import { removeAgentWorkspace } from "../services/worktree";
 // killPty shells out to a Tauri command that doesn't exist under jsdom; stub it so the teardown's
 // background reap is deterministic and never rejects into the test.
 vi.mock("../pty", () => ({ killPty: vi.fn(() => Promise.resolve()) }));
+// The receipt store crosses the Tauri boundary, which does not exist under jsdom — every write
+// would fail, and since knightwatch probe 4 a FAILED override write deliberately keeps the row. So
+// the record is stubbed successful here: these rows test the confirm FLOW, and the store's own
+// failure behaviour is owned by services/retroReceipts.test.ts.
+// `cachedReceipt` is stubbed too, and its DEFAULT is the real jsdom behaviour: the cache is only
+// ever filled by `loadRetroReceipts`, which invokes Tauri, so it answers `undefined` for every agent
+// in this file today. Routing it through a mock changes nothing about that and buys the one thing
+// the real module cannot give a test — a `captured` receipt, i.e. the pill's `ready` state, which
+// had no coverage at all while `retro-pending` had two (roborev 59545).
+const { cachedReceipt } = vi.hoisted(() => ({
+  cachedReceipt: vi.fn((): import("../engine/retroReceiptTypes").RetroReceipt | undefined => undefined),
+}));
+vi.mock("../services/retroReceipts", async (orig) => ({
+  ...(await orig<typeof import("../services/retroReceipts")>()),
+  recordRetroOverridden: vi.fn(() => Promise.resolve(true)),
+  cachedReceipt,
+}));
 
 const { refreshAgentBranch, landAgentBranch, pushAgentBranch, openAgentPr, deleteAgentBranch } =
   vi.hoisted(() => ({
@@ -116,6 +133,10 @@ beforeEach(() => {
   vi.mocked(removeAgentWorkspace).mockReset().mockResolvedValue(undefined);
   closeBead.mockClear();
   deleteBead.mockClear();
+  // Back to "no receipt on file", the state every test but the `ready` ones assumes. A bare
+  // `mockReset()` would do it, but naming the value keeps the default readable — and this is a
+  // block body, never an expression, so vitest cannot mistake the chainable mock for a teardown.
+  cachedReceipt.mockReset().mockReturnValue(undefined);
 });
 afterEach(cleanup);
 
@@ -249,5 +270,371 @@ describe("AgentSidebar — close → Ship/Save/Discard", () => {
     await waitFor(() => expect(deleteBead).toHaveBeenCalledWith("/tmp/demo", "bd-1"));
     expect(landAgentBranch).not.toHaveBeenCalled();
     expect(openAgentPr).not.toHaveBeenCalled();
+  });
+});
+
+describe("AgentSidebar — a LANDED agent needs the human's confirm (bead sparkle-0l9xk)", () => {
+  /** A build agent whose work reached `merged`. Before this bead these rows were the ONE population
+   *  that vanished on a single click: `shouldPromptOnClose` returned false for them and `×` read
+   *  that as permission to tear down — no prompt, no retro check, no way to get the row back. */
+  function landedProject(opts: { status?: Record<string, string> } = {}): Project {
+    const project = buildAgentProject();
+    useRuntimeStore.setState({
+      branchStatus: {
+        a1: { ahead: 0, behind: 0, dirty: false, filesChanged: 0, insertions: 0, deletions: 0 },
+      },
+      // STOPPED by default, but NOT load-bearing for the override any more: probe 8 gated the
+      // action on `!canAnswer` and roborev 59423 reversed that — `canAnswer` is not a liveness
+      // reading, so the gate left every landed row with no exit. The action is now always offered
+      // and `status` selects the WORDING only. Do not re-add the suppression.
+      status: opts.status ?? { a1: "stopped" },
+      workflowStage: { a1: "merged" },
+      pollBranchStatus: vi.fn(() => Promise.resolve()),
+    } as never);
+    return project;
+  }
+
+  function clickClose() {
+    const p = useProjectStore.getState().projects[0]!;
+    useProjectStore.setState({ projects: [{ ...p, selectedAgentId: "a1" }] } as never);
+    useUiStore.setState({ collapsedOrchestrators: {}, activeSpecial: null } as never);
+    render(<AgentSidebar project={useProjectStore.getState().projects[0]!} />);
+    fireEvent.click(screen.getByLabelText("Close agent"));
+  }
+
+  it("does NOT remove the row on the click — it asks first", () => {
+    // THE REGRESSION PROOF, at the surface the founder actually clicks. Against the pre-change code
+    // this row was already gone by now, synchronously, with nothing on screen.
+    landedProject();
+    clickClose();
+    expect(agentsNow()).toContain("a1");
+    // The dialog is up and it names the missing retro — this agent has no receipt, so the ask is a
+    // request rather than a recommendation.
+    expect(screen.getByText(/without its retro\?$/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^Retire/ })).toBeTruthy();
+  });
+
+  it("keeps the row when the human declines", () => {
+    landedProject();
+    clickClose();
+    fireEvent.click(screen.getByText(/^keep it in the list/));
+    expect(agentsNow()).toContain("a1");
+  });
+
+  // ── THE RECOMMENDATION HAS A SURFACE ON THE COLLAPSED ROW (roborev 59482) ──────────────────────
+  // The merge that brought main in sent the WORDED pill to the expanded hover card, because main
+  // had just stripped 18ch text pills off this row for width. Nothing pinned that move, so the
+  // feature could have left the list entirely and the suite would have stayed green — which is
+  // most of the way to what happened: the recommendation had no scannable surface at all, the very
+  // gap the PRD says it exists to close. These two assert the wordless mark, in both directions.
+  function renderRows() {
+    const p = useProjectStore.getState().projects[0]!;
+    useProjectStore.setState({ projects: [{ ...p, selectedAgentId: "a1" }] } as never);
+    useUiStore.setState({ collapsedOrchestrators: {}, activeSpecial: null } as never);
+    render(<AgentSidebar project={useProjectStore.getState().projects[0]!} />);
+  }
+
+  it("marks a LANDED row in the list itself — wordless, and it opens the same confirm", () => {
+    landedProject();
+    renderRows();
+    const mark = screen.getByTestId("row-retire-mark");
+    // Wordless is the whole reason it may live here: a text pill re-creates the collision main
+    // just fixed. The words ride in the accessible name and the tooltip instead.
+    expect(mark.textContent).toBe("");
+    expect(mark.getAttribute("data-retire-state")).toBe("retro-pending");
+    // Same gesture as the × and the pill — the mark's message is "this one is ready to go", so the
+    // obvious click must be the thing it recommends.
+    fireEvent.click(mark);
+    expect(screen.getByText(/without its retro\?$/)).toBeTruthy();
+    expect(agentsNow()).toContain("a1");
+  });
+
+  it("puts NO mark on a row whose work has not landed", () => {
+    // `buildAgentProject` is ahead:1 → building_saved. A mark on every row is chrome, not signal.
+    buildAgentProject();
+    renderRows();
+    expect(screen.queryByTestId("row-retire-mark")).toBeNull();
+  });
+
+  it("the mark is OPERABLE from the keyboard, not merely announced as a button", () => {
+    // roborev 59545. It carried `role="button"` with an `onClick` and nothing else — no tab stop
+    // and no key handler — so a screen-reader or keyboard user heard a control they could not
+    // press. That is the whole feature for them: the worded pill lives on the HOVER card, and a
+    // hover is not a keyboard gesture. Both sibling marks on this row (goal chip, notice marks)
+    // already carry the tabIndex+onKeyDown trio; this one was the odd one out.
+    landedProject();
+    renderRows();
+    const mark = screen.getByTestId("row-retire-mark");
+    expect(mark.getAttribute("tabindex")).toBe("0");
+    // The SIDE EFFECT, not the attribute: Enter must open the same confirm the click opens.
+    fireEvent.keyDown(mark, { key: "Enter" });
+    expect(screen.getByText(/without its retro\?$/)).toBeTruthy();
+    expect(agentsNow()).toContain("a1");
+  });
+
+  it("marks a row whose retro IS on file as ready, in accent ink and in its accessible name", () => {
+    // The `ready` half had no coverage at all — both existing mark tests drive `retro-pending`, so
+    // the branch that paints the recommendation the founder actually asked for ("done, landed, and
+    // logged") was unasserted in either direction.
+    cachedReceipt.mockReturnValue({ state: "captured", at: 1, source: "pr-marker", tldr: "did it" });
+    landedProject();
+    renderRows();
+    const mark = screen.getByTestId("row-retire-mark");
+    expect(mark.getAttribute("data-retire-state")).toBe("ready");
+    // The words the wordless glyph drops have to survive SOMEWHERE, and this is the only place they
+    // can: `RETIRE_COPY` is the single source both surfaces read, so a drifted edit fails here.
+    expect(mark.getAttribute("aria-label")).toBe("Ready to retire");
+    expect(mark.getAttribute("title")).toMatch(/its retro step is on file/);
+  });
+
+  it("says something TRUE about an EXCUSED row — the state that has no logged feedback at all", () => {
+    // roborev 59693. `retirementPill` returns `ready` for ANY receipt (`retroSettled` is
+    // `receipt != null`, it never reads `state`), so this same sentence paints a row whose agent
+    // reported it has NO retro. The copy claimed "its feedback is logged", which sends the founder
+    // looking for a bead that was never filed — a false-settled reading in the one direction
+    // retroReceipts is otherwise fail-closed against.
+    cachedReceipt.mockReturnValue({
+      state: "excused",
+      at: 1,
+      source: "agent-declared",
+      reasonCode: "absorbed",
+      reasonText: "folded into the orchestrator's branch and reported there",
+    });
+    landedProject();
+    renderRows();
+    const mark = screen.getByTestId("row-retire-mark");
+    expect(mark.getAttribute("data-retire-state")).toBe("ready");
+    // The claim that was false here, named so a revert cannot pass quietly.
+    expect(mark.getAttribute("title")).not.toMatch(/feedback is logged/);
+    expect(mark.getAttribute("title")).toMatch(/its retro step is on file/);
+  });
+
+  it("does not tell the founder an EXCUSED agent logged feedback — in the DIALOG, where he reads it", () => {
+    // roborev 59891. The tooltip fix above left the identical false sentence standing on the more
+    // prominent surface: `RetireAgentConfirm` gated its settled lede on `settled` (= `receipt !=
+    // null`, state-blind, same defect one layer up) and said "its feedback is logged". For an
+    // `excused` receipt — the ONLY state with a live production writer today — that modal then
+    // contradicted itself four lines later with "It gave no retro, and said why:" plus the agent's
+    // own excuse. Both sentences, one screen.
+    cachedReceipt.mockReturnValue({
+      state: "excused",
+      at: 1,
+      source: "agent-declared",
+      reasonCode: "absorbed",
+      reasonText: "folded into the orchestrator's branch and reported there",
+    });
+    landedProject();
+    renderRows();
+    fireEvent.click(screen.getByTestId("row-retire-mark"));
+    // The confirm is up…
+    expect(screen.getByRole("button", { name: /^Retire/ })).toBeTruthy();
+    // …and it does NOT make the claim. Asserted as the negative of the exact false sentence, so a
+    // revert to the `settled`-keyed copy cannot pass quietly.
+    expect(document.body.textContent).not.toMatch(/feedback is logged/);
+    // What it says instead, and the excuse it is consistent with — both, so this cannot pass by the
+    // dialog having failed to render at all.
+    expect(document.body.textContent).toMatch(/recorded why it has no retro to file/);
+    expect(document.body.textContent).toMatch(/It gave no retro, and said why/);
+  });
+
+  it("still says SOMETHING for a state this build has never heard of", () => {
+    // roborev 59893. The union is compile-time only: retro_receipt.rs types `state` as a String on
+    // purpose, so a receipt written by a NEWER frontend deserializes rather than being dropped, and
+    // the TS read path casts without validating. A fourth state therefore reaches the map, misses,
+    // and — before the fallback — rendered the settled paragraph with NO lede: a leading space, then
+    // "Retiring removes the row…". Missing copy is the worst outcome here, because the button under
+    // it is irreversible.
+    cachedReceipt.mockReturnValue({
+      state: "vouched" as never,
+      at: 1,
+      source: "pr-marker",
+    } as never);
+    landedProject();
+    renderRows();
+    fireEvent.click(screen.getByTestId("row-retire-mark"));
+    expect(screen.getByRole("button", { name: /^Retire/ })).toBeTruthy();
+    // A sentence that is true of EVERY settled receipt, and no lede-shaped hole in front of it.
+    expect(document.body.textContent).toMatch(/its retro step is on file\. Retiring removes/);
+  });
+
+  it("DOES say feedback is logged for a CAPTURED one — the control for the sentence above", () => {
+    // Without this, deleting the claim everywhere would pass the test above, and the one state where
+    // "its feedback is logged" is TRUE would lose the only wording that says so.
+    cachedReceipt.mockReturnValue({ state: "captured", at: 1, source: "pr-marker", tldr: "did it" });
+    landedProject();
+    renderRows();
+    fireEvent.click(screen.getByTestId("row-retire-mark"));
+    expect(document.body.textContent).toMatch(/its feedback is logged/);
+  });
+
+  it("puts the mark OUTSIDE the box that clips — the one surface it has cannot be cut off", () => {
+    // roborev 59785. The merge that brought main in dropped this mark inside the name-and-chips box
+    // main had just given `overflow: hidden` + `minWidth: 0` — the box flexbox shrinks FIRST, whose
+    // trailing children are silently cut off. `clusterMarkCount` counts only notice marks and the
+    // goal, so the notice collapse can never buy space for this one either. The row's own measured
+    // budget makes that certain rather than theoretical: `row-narrow-probe` read the worst 220px row
+    // (the width the app opens at) at 182 of 183px WITHOUT it.
+    //
+    // jsdom has no layout engine, so no test can render this row narrow and watch it disappear —
+    // `columnWidth` is measured and reads 0 here forever. The defect is STRUCTURAL, so this asserts
+    // the structure: the mark must not live inside the shrinking box. FAILS against the merge's
+    // placement, where it was a child of exactly that box.
+    landedProject();
+    renderRows();
+    const mark = screen.getByTestId("row-retire-mark");
+    const clipped = screen.getByTestId("row-agent-name").parentElement!;
+    // The box really is the shrinking, clipping one — without this the assertion below could pass
+    // for the boring reason that the DOM was reshaped and it is now some other container.
+    expect(clipped.style.overflow).toBe("hidden");
+    expect(clipped.style.minWidth).toBe("0");
+    // …and the mark is not in it.
+    expect(clipped.contains(mark)).toBe(false);
+  });
+
+  it("keeps the WORDED pill on the expanded card, reading the same source as the mark", () => {
+    // roborev 59693: `row-retire-pill` had zero coverage, so the surface that carries the actual
+    // words could have been dropped by the next merge with a green suite — which is exactly how it
+    // was lost once already. The pill is the expanded card's copy of the recommendation; the mark is
+    // the collapsed row's. Both must be present, and both must say the same thing.
+    cachedReceipt.mockReturnValue({ state: "captured", at: 1, source: "pr-marker", tldr: "did it" });
+    landedProject();
+    renderRows();
+    // The pill lives on the hover card, which is portalled and only mounts once the card is open —
+    // so it is absent from the scannable list by construction. That absence is exactly why the mark
+    // exists, and why this surface needs its own test rather than a shared one.
+    expect(screen.queryByTestId("row-retire-pill")).toBeNull();
+    fireEvent.contextMenu(screen.getByText("Build 1"));
+    const pill = screen.getByTestId("row-retire-pill");
+    expect(pill.getAttribute("data-retire-state")).toBe("ready");
+    // WORDED is the point of this surface — the mark deliberately has none.
+    expect(pill.textContent).toBe("READY TO RETIRE");
+    // ONE source for the sentence: a drifted edit on either surface breaks this equality.
+    expect(pill.getAttribute("title")).toBe(
+      screen.getByTestId("row-retire-mark").getAttribute("title"),
+    );
+    // And it opens the same confirm as the mark and the ×.
+    fireEvent.click(pill);
+    expect(screen.getByRole("button", { name: /^Retire/ })).toBeTruthy();
+    expect(agentsNow()).toContain("a1");
+  });
+
+  it("ALWAYS offers an exit when the status is UNKNOWN — the normal case after a relaunch", () => {
+    // roborev 59423, reversing my own probe-8 fix. `canAnswerRetroPing(undefined)` is TRUE by
+    // design (fail-closed toward asking) and `runtimeStore.status` is written only by a mounted
+    // AgentPane — so every landed row read as "still being asked" and was offered nothing but
+    // keep-it. With no `captured` producer yet, that was EVERY landed row: no way out of the list.
+    landedProject({ status: {} });
+    clickClose();
+    expect(screen.getByRole("button", { name: /^Retire/ })).toBeTruthy();
+    // AND IT SAYS WHAT THE BUTTON WRITES. The gap note used to be gated on `!canAnswer` alongside
+    // the button; restoring the button without moving that gate would have left "record the gap"
+    // unexplained in precisely this case — the one the reversal made normal.
+    expect(screen.getByTestId("retire-gap-note").textContent).toMatch(/no retro was on file/);
+  });
+
+  it("blocks the retire on a DIRTY reading even when the file preview is absent", () => {
+    // `dirtyFiles === undefined` means "this build cannot tell you", NOT "no files" (roborev
+    // 59423). Gating on the preview restored the button and force-removed the worktree — the exact
+    // data-loss path probe 1 exists to close.
+    buildAgentProject();
+    useRuntimeStore.setState({
+      branchStatus: {
+        a1: { ahead: 0, behind: 0, dirty: true, filesChanged: 3, insertions: 0, deletions: 0 },
+      },
+      status: { a1: "stopped" },
+      workflowStage: { a1: "merged" },
+      pollBranchStatus: vi.fn(() => Promise.resolve()),
+    } as never);
+    clickClose();
+    expect(screen.queryByRole("button", { name: /^Retire/ })).toBeNull();
+    expect(agentsNow()).toContain("a1");
+    // AND THE COPY GOES WITH THE BUTTON (roborev 59545). The gap note explains what the retire
+    // button WRITES, so with no button on the dialog it is describing an action nobody is being
+    // offered — "Retiring now records a note…" printed directly under "Commit or discard them
+    // first; the row stays until you do", with cancel as the only control. Widening its gate from
+    // `!settled && !canAnswer` to `!settled` opened this hole in the mirror direction; it is keyed
+    // on the button's own `!hasUncommitted` now, so neither gap can reopen without the other.
+    expect(screen.queryByTestId("retire-gap-note")).toBeNull();
+  });
+
+  it("names the capped preview and says how many more it could not name", () => {
+    buildAgentProject();
+    useRuntimeStore.setState({
+      branchStatus: {
+        a1: {
+          ahead: 0,
+          behind: 0,
+          dirty: true,
+          filesChanged: 12,
+          insertions: 0,
+          deletions: 0,
+          dirtyFiles: ["a.ts", "b.ts", "c.ts", "d.ts", "e.ts"],
+          dirtyCount: 12,
+        },
+      },
+      status: { a1: "stopped" },
+      workflowStage: { a1: "merged" },
+      pollBranchStatus: vi.fn(() => Promise.resolve()),
+    } as never);
+    clickClose();
+    // Without this the founder commits the five he was shown, retries, and is blocked again by
+    // seven the dialog never mentioned.
+    expect(screen.getByTestId("retire-uncommitted-block").textContent).toContain("+7 more");
+  });
+
+  it("still keeps the row when the agent can be asked, but no longer hides the exit", () => {
+    // The dialog still opens — the row must never vanish on a click — but the only action is to
+    // keep it. The Pusher is already pinging the agent; the honest move is to let the receipt
+    // arrive, not to record a permanent "could not be asked" about an agent that can.
+    landedProject({ status: { a1: "working" } });
+    clickClose();
+    expect(agentsNow()).toContain("a1");
+    // The dialog SAYS the agent may answer, and still lets him finish — the two are not in tension.
+    expect(screen.getByRole("button", { name: /^Retire/ })).toBeTruthy();
+    expect(screen.getByText(/may still be reachable/)).toBeTruthy();
+  });
+
+  it("BLOCKS the retire while the worktree holds uncommitted files (knightwatch probe 1)", () => {
+    // Landed work is safe; the worktree's post-merge edits are not, and teardown force-removes it.
+    // The dialog names the files and withdraws the action rather than destroying them behind a
+    // sentence that says the work landed.
+    buildAgentProject();
+    useRuntimeStore.setState({
+      branchStatus: {
+        a1: {
+          ahead: 0,
+          behind: 0,
+          dirty: true,
+          filesChanged: 1,
+          insertions: 0,
+          deletions: 0,
+          dirtyFiles: ["src/notes.ts"],
+        },
+      },
+      status: { a1: "stopped" },
+      workflowStage: { a1: "merged" },
+      pollBranchStatus: vi.fn(() => Promise.resolve()),
+    } as never);
+    clickClose();
+    expect(screen.getByTestId("retire-uncommitted-block").textContent).toContain("src/notes.ts");
+    expect(screen.queryByRole("button", { name: /^Retire/ })).toBeNull();
+    expect(agentsNow()).toContain("a1");
+  });
+
+  it("removes the row only after the human confirms", async () => {
+    landedProject();
+    clickClose();
+    fireEvent.click(screen.getByRole("button", { name: /^Retire/ }));
+    await waitFor(() => expect(agentsNow()).not.toContain("a1"));
+  });
+
+  it("does not offer Ship/Save/Discard — nothing is at risk, so it is not that question", () => {
+    // The two dialogs answer different questions. Showing the work-at-risk choice for landed work
+    // would tell the founder his merged work might be lost, which is false and alarming.
+    landedProject();
+    clickClose();
+    expect(screen.queryByText("Ship it")).toBeNull();
+    expect(screen.queryByText("Save for later")).toBeNull();
+    expect(screen.queryByText("Discard")).toBeNull();
   });
 });

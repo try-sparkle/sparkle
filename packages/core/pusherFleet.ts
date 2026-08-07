@@ -275,6 +275,21 @@ export interface FleetSnapshot {
    * unmerged commits.
    */
   hasUnlandedWork?: boolean;
+  /**
+   * Whether this agent's retro step is on file — a `RetroReceipt` exists for it.
+   *
+   * SAME RULE, SAME REASON AS `hasUnlandedWork`: it must be affirmatively `true` for the retire
+   * claim. `undefined` means "nothing has told us", which is the normal reading today, not an
+   * exceptional one.
+   *
+   * This field exists because the contract was already WRITTEN and not kept (knightwatch
+   * 5204094441#5). `engine/retroReceiptTypes` says, in its own words, that the Pusher *"requires an
+   * affirmative `true` before it will recommend retiring anything"* — while `retirableAgents`
+   * checked only the goal and the unlanded work. So the report said "safe to retire" about the very
+   * rows whose × then opens a dialog headed *"Retire … without its retro?"*: two surfaces, one
+   * agent, opposite advice, with the founder in between.
+   */
+  retroSettled?: boolean;
 }
 
 /** One condition, with the arithmetic and the quotes that make it true. */
@@ -347,13 +362,25 @@ export function isQuotaWalled(snap: FleetSnapshot, now: number): boolean {
 /**
  * Agents that are DONE and still open.
  *
- * The evidence bar is deliberately higher than anywhere else in the Pusher: the goal must be met AND
- * `hasUnlandedWork` must be affirmatively `false`. `undefined` — "no branch status was polled for
- * this agent" — fails the test, because the cost of being wrong here is not a noisy message. It is a
- * recommendation to retire an agent holding work nobody has merged.
+ * The evidence bar is deliberately higher than anywhere else in the Pusher: the goal must be met,
+ * `hasUnlandedWork` must be affirmatively `false`, AND `retroSettled` must be affirmatively `true`.
+ * `undefined` — "no branch status was polled for this agent", "nothing has told us about a retro" —
+ * fails all three, because the cost of being wrong here is not a noisy message. It is a
+ * recommendation to retire an agent holding work nobody has merged, or whose account of what it
+ * learned nobody has.
+ *
+ * THE THIRD CLAUSE IS NOT NEW POLICY — it is the policy `engine/retroReceiptTypes` already stated
+ * and this function did not implement (knightwatch 5204094441#5). Read the consequence plainly
+ * rather than as a footnote: no production path writes a `captured` receipt yet, so today this
+ * condition goes QUIET for almost every agent. That is the intended reading of a fail-closed rule
+ * whose input has no producer, and it is strictly better than the alternative it replaces — a
+ * report telling the founder a row is "safe to retire" moments before its × asks him to retire it
+ * "without its retro?". When the producer lands, the condition returns on its own.
  */
 export function retirableAgents(snapshots: readonly FleetSnapshot[]): FleetSnapshot[] {
-  return snapshots.filter((s) => s.goalMetAt !== undefined && s.hasUnlandedWork === false);
+  return snapshots.filter(
+    (s) => s.goalMetAt !== undefined && s.hasUnlandedWork === false && s.retroSettled === true,
+  );
 }
 
 /**

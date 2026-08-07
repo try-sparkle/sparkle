@@ -517,13 +517,37 @@ describe("spawnBuildAgent", () => {
 
 // ── previewClose ────────────────────────────────────────────────────────────────────────────────
 describe("previewClose", () => {
-  it("reports a SILENT close for a build agent whose work is merged", () => {
+  it("reports a RETIREMENT CONFIRM — not a silent close — for a build agent whose work is merged", () => {
+    // This test asserted `silentClose: true` and that assertion became the defect (roborev 59153).
+    // `wouldPrompt` answers the work-at-risk question ALONE, which is `false` for a landed agent —
+    // so the preview announced "safe and silent" for exactly the population `closeAgent` refuses
+    // with `needs-human-confirm`. The preview must describe the close that will actually happen.
     const pid = seedProject();
     const id = seedBuild(pid, { bs: CLEAN, stage: "merged" });
     const r = previewClose(id);
     expect(r.ok).toBe(true);
     if (!r.ok) return;
+    // A THIRD state, not a flavour of wouldPrompt: nothing is at risk and there is no
+    // ship/save/discard choice — what is owed is the founder's confirm.
     expect(r.data.wouldPrompt).toBe(false);
+    expect(r.data.retirementConfirm).toBe(true);
+    expect(r.data.silentClose).toBe(false);
+    expect(r.data.recommended).toBe("keep-open");
+    // The sentence matters as much as the flag: it is what the concierge says out loud, and the old
+    // one told the founder the row was free to remove.
+    expect(r.data.reason).not.toMatch(/safe and silent/);
+    expect(r.data.reason).toMatch(/yours to confirm/);
+  });
+
+  it("still reports a genuinely SILENT close for a build agent that made no work at all", () => {
+    // The other side of the same branch — this must not have been swept up by the change above, or
+    // every ordinary teardown in the app now tells the founder to go and confirm something.
+    const pid = seedProject();
+    const id = seedBuild(pid, { bs: CLEAN, stage: "building_unsaved" });
+    const r = previewClose(id);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.data.retirementConfirm).toBe(false);
     expect(r.data.silentClose).toBe(true);
     expect(r.data.recommended).toBe("close");
   });
@@ -568,6 +592,50 @@ describe("previewClose", () => {
       if (!r.ok) return;
       expect({ stage, rec: r.data.recommended }).toEqual({ stage, rec: "ship" });
     }
+  });
+
+  it("flags a LOCALLY-LANDED row as needing the confirm, while still recommending the push", () => {
+    // knightwatch 5204094441#3. `merged_local` is a no-remote "Ship it": the branch is merged into
+    // LOCAL main and stops there. It used to sit BELOW the retirement boundary, so a close resolved
+    // to `silent` (clean tree) or Ship/Save (commits ahead) and the row could be removed with no
+    // confirm at all — the hole the gate exists to close, reached through the gate rather than
+    // around it. Both halves are asserted because widening the boundary must not cost the
+    // recommendation: the row has landed AND still has somewhere to go.
+    const pid = seedProject();
+    const landed = previewClose(seedBuild(pid, { bs: AHEAD, stage: "merged_local" }));
+    expect(landed.ok).toBe(true);
+    if (!landed.ok) return;
+    expect(landed.data.retirementConfirm).toBe(true);
+    expect(landed.data.silentClose).toBe(false);
+    expect(landed.data.recommended).toBe("ship");
+    // The reason says BOTH facts — it is the only place the concierge learns why closing is gated.
+    expect(landed.data.reason).toMatch(/landed locally/i);
+    expect(landed.data.reason).toMatch(/yours to confirm/i);
+    // A ROW ON ORIGIN IS NOT "LANDED LOCALLY", however many commits it is ahead (roborev 59899).
+    // `ahead` is `rev-list --left-right --count`, so it only reaches 0 once the branch TIP is an
+    // ancestor of the base — a squash or rebase merge defeats that permanently and it stays N
+    // forever. Gating the split on the count alone therefore caught `merged` and `shipped` too, and
+    // told the founder their landed work "has not reached the remote yet" while recommending a
+    // `ship` that would ask `gh` for a second PR on an already-merged branch. FAILS against the
+    // count-only gate.
+    for (const stage of ["merged", "shipped"] as const) {
+      const r = previewClose(seedBuild(pid, { bs: AHEAD, stage }));
+      expect(r.ok).toBe(true);
+      if (!r.ok) return;
+      expect({ stage, rec: r.data.recommended }).toEqual({ stage, rec: "keep-open" });
+      expect(r.data.reason).not.toMatch(/landed locally/i);
+      expect(r.data.reason).not.toMatch(/reached the remote/i);
+      // Still gated, though — the confirm is what this bead is about.
+      expect(r.data.retirementConfirm).toBe(true);
+    }
+    // …and with nothing left to push, the recommendation is to leave the row alone, not to close it.
+    const done = previewClose(seedBuild(pid, { bs: CLEAN, stage: "merged_local" }));
+    expect(done.ok).toBe(true);
+    if (!done.ok) return;
+    expect(done.data.retirementConfirm).toBe(true);
+    expect(done.data.recommended).toBe("keep-open");
+    // The sentence roborev 59153 removed from landed rows must not come back through this door.
+    expect(done.data.reason).not.toMatch(/safe and silent/i);
   });
 
   it("recommends KEEPING an agent with uncommitted changes open — every close outcome drops the worktree", () => {
@@ -803,7 +871,9 @@ describe("discardAgent", () => {
 describe("closeAgent", () => {
   it("closes silently when nothing is at risk (worktree removed, BRANCH kept by default)", async () => {
     const pid = seedProject();
-    const id = seedBuild(pid, { bs: CLEAN, stage: "merged" });
+    // NOT `merged` — see the retirement-gate test below. A landed agent is now refused, so using a
+    // landed stage here would test the gate instead of the teardown this case is about.
+    const id = seedBuild(pid, { bs: CLEAN, stage: "building_saved" });
     const r = await closeAgent(id);
     expect(r.ok).toBe(true);
     if (!r.ok) return;
@@ -812,6 +882,57 @@ describe("closeAgent", () => {
     );
     expect(discardGitMock).not.toHaveBeenCalled();
     expect(useProjectStore.getState().projects[0]!.agents).toHaveLength(0);
+  });
+
+  it("REFUSES to close a LANDED agent — only the founder takes a row off the build list", async () => {
+    // THE BEAD, IN ONE TEST (sparkle-0l9xk). This case used to assert the opposite — a merged agent
+    // closed silently, worktree gone, row gone — and that assertion is the bug: the concierge is
+    // what closed three landed agents on its own judgement, each one leaving with its retro unread.
+    // The work is safe either way (it landed), so what is at stake is the feedback record and the
+    // founder's standing instruction that he confirms removals himself.
+    const pid = seedProject();
+    const id = seedBuild(pid, { bs: CLEAN, stage: "merged" });
+    const r = await closeAgent(id);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toBe("needs-human-confirm");
+    // Distinct from `needs-decision`: nothing is at risk and there is no ship/save/discard choice.
+    expect(r.reason).not.toBe("needs-decision");
+    // Nothing was torn down, and the row is still there for him to act on.
+    expect(spinDownGitMock).not.toHaveBeenCalled();
+    expect(useProjectStore.getState().projects[0]!.agents.map((a) => a.id)).toContain(id);
+  });
+
+  it("refuses a stated no-retro reason that fails muster, and closes NOTHING", async () => {
+    // The live path into recordRetroExcused (bead sparkle-0l9xk). `excused` is the one receipt state
+    // the agent being judged writes about itself, so the wording rules are enforced before anything
+    // is recorded — and the refusal carries muster's OWN phrase, because an agent told only "that
+    // failed" retries the exact text that was just refused.
+    const pid = seedProject();
+    const id = seedBuild(pid, { bs: CLEAN, stage: "building_saved" });
+    const r = await closeAgent(id, { reasonCode: "other", reasonText: "n/a" });
+
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toMatch(/too brief/);
+    expect(spinDownGitMock).not.toHaveBeenCalled();
+    expect(useProjectStore.getState().projects[0]!.agents.map((a) => a.id)).toContain(id);
+  });
+
+  it("a well-formed excuse does NOT buy a close for a landed agent", async () => {
+    // The receipt decides what the confirm dialog SAYS, never whether to ask. An excuse that could
+    // talk the gate open would be the silent skip wearing better manners.
+    const pid = seedProject();
+    const id = seedBuild(pid, { bs: CLEAN, stage: "merged" });
+    const r = await closeAgent(id, {
+      reasonCode: "absorbed",
+      reasonText: "Absorbed into the parent branch before this agent committed anything of its own.",
+    });
+
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toBe("needs-human-confirm");
+    expect(useProjectStore.getState().projects[0]!.agents.map((a) => a.id)).toContain(id);
   });
 
   it("REFUSES to close an agent with work at risk — the human must choose ship/save/discard", async () => {
@@ -897,7 +1018,14 @@ describe("shipAgent", () => {
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(r.data.ship).toMatchObject({ landed: true, prOpened: false, mergeSha: "abc123" });
-    expect(useProjectStore.getState().projects[0]!.agents).toHaveLength(0);
+    // THE ROW SURVIVES, and this assertion is the one that changed (knightwatch probe 2). It used
+    // to assert `toHaveLength(0)` — the row gone — which is the defect: a local land MERGES the
+    // branch, and merged work is precisely what the founder confirms before its row leaves the
+    // list. `closeBuildAgent`'s own gate could not catch this one because it reads the stage from
+    // branchStatus, polled BEFORE the ship and therefore still saying pre-merge.
+    expect(useProjectStore.getState().projects[0]!.agents.map((a) => a.id)).toContain(id);
+    expect(r.data.retirementPending).toBe(true);
+    expect(r.data.agentIds).toEqual([]);
   });
 
   it("does NOT claim a PR when the push landed but `gh` failed — the branch is safe, so it still closes", async () => {

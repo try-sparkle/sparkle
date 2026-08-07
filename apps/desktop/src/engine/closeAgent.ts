@@ -6,34 +6,131 @@ import { firstVisibleAgentId } from "./agentOrdering";
 import type { BranchStatus } from "../services/branchStatus";
 import type { AgentKind } from "../types";
 
-/** Whether closing an agent should pop the Ship/Save/Discard choice instead of silently tearing it
- *  down. Only a deliverable BUILD agent with UNMERGED work at risk prompts:
- *   - workers have their own "merged → close?" nudge, and think/shell have no worktree;
- *   - work that already landed ON ORIGIN (stage ≥ merged) is safe to close silently;
- *   - an agent that never did real work (no commits, clean tree) has nothing at risk.
- *  So we prompt iff: kind === "build" AND stage < merged AND (commits ahead OR a dirty tree).
- *  Note `merged` means ORIGIN main since the merged_local split, so work landed only on LOCAL main
- *  now prompts. That's deliberate: unpushed work IS still at risk, which is the whole reason the
- *  stage was split. */
-export function shouldPromptOnClose(
+/** What closing an agent should actually do.
+ *
+ *  Three outcomes, and the split exists because "prompt or don't" could not express the two
+ *  genuinely different reasons to stop and ask:
+ *   - `work-at-risk-prompt` — the Ship/Save/Discard choice. Something UNMERGED could be lost.
+ *   - `retirement-confirm`  — the work already landed; what is at stake is the FEEDBACK RECORD and
+ *                             the founder's standing instruction that he confirms removals himself.
+ *   - `silent`              — nothing at risk and nothing to confirm; tear it down.
+ *  Keeping them distinct matters downstream: the two prompts say different things, and the machine
+ *  close paths may proceed through neither. */
+export type CloseDecision = "silent" | "work-at-risk-prompt" | "retirement-confirm";
+
+/** Everything the close decision reads about the agent's retro step.
+ *
+ *  Deliberately a bare boolean rather than the `RetroReceipt` itself: this function decides WHETHER
+ *  to stop, not what to say when it does. The dialog reads the receipt for its wording; letting the
+ *  decision see the receipt's fields would invite a rule like "excused closes silently", which is
+ *  exactly the silent skip the founder asked to eliminate. */
+export interface CloseRetroState {
+  /** Has this agent completed the retro step (captured, excused, or a recorded human override)?
+   *
+   *  FAIL-CLOSED: `false` is also what "we have not been told" must produce — see
+   *  engine/retroReceiptTypes.retroSettled. There is no `undefined` here on purpose; the caller
+   *  collapses "no receipt" to `false` at the boundary so this function cannot be handed a third
+   *  state it might treat as permission. */
+  settled: boolean;
+}
+
+/**
+ * Decide what closing this agent should do.
+ *
+ * ── WHAT CHANGED, AND WHY IT IS THE WHOLE BEAD ───────────────────────────────────────────────────
+ * This used to be `shouldPromptOnClose`, and its third clause read:
+ *
+ *     if (stageIndex(stage) >= stageIndex("merged")) return false;   // "safe to close silently"
+ *
+ * That is true about the CODE — landed work cannot be lost by closing the row — and it was the
+ * only thing the function was asked about. But it made the merged and shipped rows the one
+ * population that vanished with no prompt of any kind, which is precisely the population the
+ * founder was looking at when he said *"there are a number of agents showing as ships to production
+ * where they should probably be closed. I want to make sure that they have all provided the retro
+ * feedback before they get closed"* and *"the build agent shouldn't be removed from the build list
+ * until I, as the human, confirm that."*
+ *
+ * So a landed build agent now returns `retirement-confirm` — ALWAYS, settled or not. The receipt
+ * does not decide whether to ask; it decides what the dialog says (a recommendation versus a
+ * request). Making a settled retro close silently would satisfy the retro half of his ask and
+ * discard the other half, which was the explicit one.
+ *
+ * ── ORDERING: THE LANDED ARM IS FIRST, AND THAT HAS A COST (roborev 58742) ───────────────────────
+ * This block used to claim work-at-risk was checked first. IT IS NOT, and the difference is not
+ * academic: a build agent at `merged`/`shipped` with a DIRTY worktree or unpushed follow-up commits
+ * returns `retirement-confirm`, never `work-at-risk-prompt`. `resolveStage` does not regress a
+ * merged row below its git-derived stage, so post-merge edits keep it landed — this is a normal
+ * state, not a corner.
+ *
+ * Kept in this order because the alternative is worse. Sending a dirty landed row to
+ * Ship/Save/Discard tears it down with no retirement confirm at all, which is exactly the silent
+ * skip this bead exists to close, and the founder's instruction ("shouldn't be removed from the
+ * build list until I, as the human, confirm that") is unconditional.
+ *
+ * WHAT HAPPENS TO THE DIRTY FILES, plainly: nothing here saves them, and the retirement dialog as
+ * written says the work landed — which is true of the CODE and misleading about the WORKTREE. The
+ * remedy belongs in the dialog, not in this ordering: `RetireAgentConfirm` should read
+ * `BranchStatus` and name the uncommitted files (`dirtyFiles` is already a capped preview) before
+ * offering to remove the row. Tracked as bead `sparkle-jcux2`. Below `merged` the old rules are
+ * unchanged and work-at-risk does win, because there nothing has landed to confirm.
+ */
+export function closeDecision(
   kind: string,
   stage: WorkflowStageId,
   bs: BranchStatus | undefined,
-): boolean {
-  if (kind !== "build") return false;
-  if (stageIndex(stage) >= stageIndex("merged")) return false;
+  retro: CloseRetroState,
+): CloseDecision {
+  // Workers have their own "merged → close?" nudge and report to an orchestrator, not to the build
+  // list; think/shell have no worktree and no branch. None of them is a row the founder retires.
+  if (kind !== "build") return "silent";
+
+  // `merged_local`, NOT `merged` (knightwatch 5204094441#3). A no-remote "Ship it" MERGES the branch
+  // into local main and stops there — the work has landed, which is the entire trigger for this gate.
+  // Keying on `merged` (origin) meant the dialog opened once, from the ship handler's own fresher
+  // `outcome.landed`, and then never again: dismiss it and the NEXT close re-asks this function,
+  // which reads a clean tree 0 ahead and answers `silent`. The row vanished with no confirm, through
+  // the gate rather than around it.
+  //
+  // That is a different question from `hasUnmergedCommittedWork`, which deliberately counts
+  // `merged_local` as still-unmerged (it needs you to get it to ORIGIN). Both are right: it needs a
+  // push, and it also already landed, so retiring the row is the founder's call and not ours.
+  if (stageIndex(stage) >= stageIndex("merged_local")) {
+    // `retro` is read here ONLY so this function has a reason to receive it and so the type makes
+    // the caller resolve it — the outcome is the same either way, by design (see above). Kept
+    // explicit rather than dropping the parameter, because the next person WILL ask "shouldn't a
+    // settled agent close silently?" and the answer needs to live at the branch, not in a header.
+    void retro.settled;
+    return "retirement-confirm";
+  }
+
   // Status not yet polled (undefined) ⇒ we can't rule out work at risk, so err toward the choice
   // rather than a silent teardown that could discard uncommitted changes. The undefined window is
   // sub-second after open (the poll sets it immediately), so this rarely surfaces a needless prompt.
-  if (!bs) return true;
+  if (!bs) return "work-at-risk-prompt";
   // SAFETY side of sparkle-xk3x, and the OPPOSITE call from runtimeStore's attribution gate. A
   // worktree parked on another branch still physically holds whatever was uncommitted when it
   // was moved — parking carries those files along. So a parked tree is work we cannot rule out,
   // exactly like the `!bs` case above: prompt rather than tear down. Never suppress `dirty` here
   // on the grounds that it "belongs to another branch" — the files are real and deleting the
   // worktree destroys them.
-  if (bs.worktreeOnBranch === false) return true;
-  return bs.ahead > 0 || bs.dirty;
+  if (bs.worktreeOnBranch === false) return "work-at-risk-prompt";
+  return bs.ahead > 0 || bs.dirty ? "work-at-risk-prompt" : "silent";
+}
+
+/** Whether closing an agent should pop the Ship/Save/Discard choice.
+ *
+ *  Now a thin projection of `closeDecision` so the two can never disagree. Kept as its own export
+ *  because it is the question the Ship/Save/Discard modal itself asks, and because several callers
+ *  and tests name it — but it is NO LONGER the whole close policy, and a caller that treats a
+ *  `false` here as "safe to tear down" is now wrong. Use `closeDecision`. */
+export function shouldPromptOnClose(
+  kind: string,
+  stage: WorkflowStageId,
+  bs: BranchStatus | undefined,
+): boolean {
+  // Any `settled` value gives the same answer for this projection: the retirement arm returns
+  // `retirement-confirm`, which is not `work-at-risk-prompt` either way.
+  return closeDecision(kind, stage, bs, { settled: false }) === "work-at-risk-prompt";
 }
 
 /** Minimal agent shape `selectionAfterClose` reads. */

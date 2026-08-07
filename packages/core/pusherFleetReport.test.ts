@@ -64,6 +64,10 @@ const finished = (id: string): FleetSnapshot => ({
   label: `Agent ${id}`,
   goalMetAt: T0 - HOUR,
   hasUnlandedWork: false,
+  // The THIRD piece of evidence `retirableAgents` requires since knightwatch 5204094441#5 — a retro
+  // on file. These cases are about the report's batching and cooldown, not about the retire bar, so
+  // the fixture clears the bar rather than restating it; `pusherFleet.test.ts` owns the bar itself.
+  retroSettled: true,
 });
 
 function decide(over: Partial<FleetReportInput> = {}): FleetReportDecision {

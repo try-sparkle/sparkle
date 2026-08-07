@@ -58,6 +58,17 @@ export interface FleetSnapshotInput {
   quotaFor(agentId: string, now: number): QuotaBlock | undefined;
   /** `engineRegistry.lastFailureForAgent`. */
   failureFor(agentId: string): { message: string; at: number } | undefined;
+  /**
+   * Is this agent's retro step on file? `retroSettled(cachedReceipt(projectId, agentId))`.
+   *
+   * INJECTED rather than read here, for the same reason `quotaFor` and `failureFor` are: this module
+   * maps agents to snapshots and owns no store lookups.
+   *
+   * It takes the PROJECT ID as well, unlike its two siblings, because the receipt cache is keyed by
+   * project — and `buildFleetSnapshots` is already inside the project loop when it calls this, so
+   * the id is free here and a store search anywhere else.
+   */
+  retroSettledFor(projectId: string, agentId: string): boolean;
   now: number;
 }
 
@@ -83,6 +94,7 @@ export function unlandedWorkOf(status: BranchStatus | undefined): boolean | unde
 export function snapshotOfAgent(
   agent: AgentTab,
   input: FleetSnapshotInput,
+  projectId: string,
 ): FleetSnapshot & { agentId: string } {
   const branch = input.branchStatus[agent.id];
   const quota = input.quotaFor(agent.id, input.now);
@@ -112,6 +124,11 @@ export function snapshotOfAgent(
       : {}),
     ...(goal?.metAt !== undefined ? { goalMetAt: goal.metAt } : {}),
     ...(unlandedWorkOf(branch) !== undefined ? { hasUnlandedWork: unlandedWorkOf(branch) } : {}),
+    // ALWAYS SET, unlike the fields above — `retroSettled` is a total function of the cache, where
+    // "no receipt" IS the answer `false` rather than a missing reading. Spreading it conditionally
+    // would make an unsettled agent indistinguishable from one nobody asked, and `retirableAgents`
+    // treats those the same anyway; setting it plainly keeps the snapshot readable in a log.
+    retroSettled: input.retroSettledFor(projectId, agent.id),
   };
 }
 
@@ -133,7 +150,7 @@ export function buildFleetSnapshots(
   for (const project of input.projects) {
     for (const agent of project.agents) {
       if (agent.kind !== "build") continue;
-      out.push({ ...snapshotOfAgent(agent, input), projectId: project.id });
+      out.push({ ...snapshotOfAgent(agent, input, project.id), projectId: project.id });
     }
   }
   return out;

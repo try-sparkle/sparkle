@@ -4,7 +4,7 @@
 // This module is a THIN WRAPPER over the paths the human's own clicks take. It owns no worktree, PTY,
 // git or bead logic of its own; every side-effect is delegated:
 //   • spawn      → services/buildAgentSpawn.spawnBuildAgentInProject (the "+ New Build Agent" body)
-//   • the policy → engine/closeAgent.shouldPromptOnClose (the ONE rule for "does closing need a
+//   • the policy → engine/closeAgent.closeDecision (the ONE rule for "does closing need a
 //                  decision?" — the sidebar × and the concierge must never disagree about this)
 //   • ship/save  → services/closeAgentActions.shipAgent / saveAgent
 //   • discard    → services/closeAgentActions.discardAgentGit
@@ -76,7 +76,9 @@ import { projectRepoUrl } from "../cloudAgents/repoUrl";
 import { classifyStartError } from "../cloudAgents/startError";
 import type { CategoryId } from "../../stores/uiStore";
 import { localAgentCapacity, type CapacityReading } from "../agentCapacity";
-import { shouldPromptOnClose } from "../../engine/closeAgent";
+import { closeDecision } from "../../engine/closeAgent";
+import { retroSettled } from "../../engine/retroReceiptTypes";
+import { cachedReceipt } from "../retroReceipts";
 import { resolveStage, stageIndex, type WorkflowStageId } from "../../engine/workflowStage";
 import { spawnBuildAgentInProject } from "../buildAgentSpawn";
 import { awaitBriefDelivery, type BriefDeliveryOutcome } from "../agentBrief";
@@ -92,6 +94,7 @@ import {
   type ShipOutcome,
 } from "../closeAgentActions";
 import { closeBuildAgent } from "../closeBuildAgent";
+import { recordRetroExcused } from "../retroReceipts";
 import { spinDownWorker } from "../workerSpawn";
 import { terminateIfCloud } from "../cloudAgents/terminate";
 import { log } from "../../logger";
@@ -205,6 +208,11 @@ export type LifecycleRefusalReason =
   //                            than given one this layer invented
   | "cloud-no-repo" //          the project has no GitHub remote for the sandbox to clone
   | "needs-decision" //         closing would put work at risk: the human picks ship/save/discard
+  | "needs-human-confirm" //    the agent LANDED its work, so only a person may take its row off the
+  //                            build list (bead sparkle-0l9xk). Distinct from `needs-decision`:
+  //                            nothing is at risk here and there is no ship/save/discard choice to
+  //                            make — what is owed is the founder's confirm and a look at what the
+  //                            agent reported. The concierge must relay `message`, not retry.
   | "uncommitted-work" //       a worker spin-down would delete a dirty worktree; the branch is kept
   //                            but uncommitted files are NOT, so this is refused until they are
   //                            committed (or the caller passes an explicit discard confirmation)
@@ -1027,9 +1035,21 @@ export interface ClosePreview {
   kind: AgentKind;
   runtime: Runtime;
   stage: WorkflowStageId;
-  /** engine/closeAgent.shouldPromptOnClose — the ONE policy. True ⇒ closing needs a decision. */
+  /** `closeDecision === "work-at-risk-prompt"` — closing needs the ship/save/discard decision. */
   wouldPrompt: boolean;
-  /** The complement of `wouldPrompt`, named for the thing the human asked about. */
+  /**
+   * `closeDecision === "retirement-confirm"` — the work LANDED, so only the founder may take the row
+   * off the build list (bead sparkle-0l9xk). A THIRD state, not a flavour of `wouldPrompt`: nothing
+   * is at risk here and there is no ship/save/discard choice to make.
+   *
+   * It exists because the preview and the action had come apart (roborev 59153): `wouldPrompt` is
+   * derived from the work-at-risk question alone, which is `false` for a landed agent — so the
+   * concierge announced "closing is safe and silent" for exactly the population `closeAgent` then
+   * refused. A preview that describes a different close than the one that will happen is worse than
+   * no preview.
+   */
+  retirementConfirm: boolean;
+  /** Neither prompt fires: nothing at risk AND nothing landed to confirm. Genuinely a teardown. */
   silentClose: boolean;
   commitsAhead: number;
   uncommittedChanges: boolean;
@@ -1054,8 +1074,15 @@ export function previewClose(agentId: string): LifecycleResult<ClosePreview> {
   const rt = useRuntimeStore.getState();
   const bs = rt.branchStatus[agentId];
   const stage = stageOf(agentId);
-  // The SAME call the sidebar × makes (AgentSidebar.requestClose). Never re-derived here.
-  const wouldPrompt = shouldPromptOnClose(agent.kind, stage, bs);
+  // THE SAME CALL THE SIDEBAR × MAKES (AgentSidebar.requestClose) — `closeDecision`, not the old
+  // `shouldPromptOnClose` boolean. The × moved to `closeDecision` when the retirement gate landed
+  // and this did not follow, which is precisely how the preview came to describe a silent teardown
+  // for a row the action refuses (roborev 59153). One decision, three outcomes, read once.
+  const decision = closeDecision(agent.kind, stage, bs, {
+    settled: retroSettled(cachedReceipt(project.id, agentId)),
+  });
+  const wouldPrompt = decision === "work-at-risk-prompt";
+  const retirementConfirm = decision === "retirement-confirm";
   const statusUnknown = !bs || bs.worktreeOnBranch === false;
   const commitsAhead = bs?.ahead ?? 0;
   // A parked worktree still physically holds whatever was uncommitted when it was moved, so an
@@ -1065,6 +1092,7 @@ export function previewClose(agentId: string): LifecycleResult<ClosePreview> {
   const unmergedCommittedWork = commitsAhead > 0 && isUnmerged(stage);
   const { recommended, reason } = recommend({
     wouldPrompt,
+    retirementConfirm,
     statusUnknown,
     uncommittedChanges,
     commitsAhead,
@@ -1080,7 +1108,8 @@ export function previewClose(agentId: string): LifecycleResult<ClosePreview> {
     runtime: agent.runtime,
     stage,
     wouldPrompt,
-    silentClose: !wouldPrompt,
+    retirementConfirm,
+    silentClose: !wouldPrompt && !retirementConfirm,
     commitsAhead,
     uncommittedChanges,
     unmergedCommittedWork,
@@ -1102,18 +1131,62 @@ export function previewClose(agentId: string): LifecycleResult<ClosePreview> {
  *  whether that work already has a PR (roborev 54175). */
 function recommend(i: {
   wouldPrompt: boolean;
+  retirementConfirm: boolean;
   statusUnknown: boolean;
   uncommittedChanges: boolean;
   commitsAhead: number;
   stage: WorkflowStageId;
   kind: AgentKind;
 }): { recommended: CloseRecommendation; reason: string } {
+  // CHECKED FIRST, and before the "safe and silent" sentence below — that sentence was the false one
+  // a landed agent used to get (roborev 59153). The work IS safe; the row is not free to remove.
+  if (i.retirementConfirm) {
+    // …BUT "the row needs your confirm" IS NOT "there is nothing left to do" (knightwatch
+    // 5204094441#3, second-order). Widening the gate to `merged_local` brought a stage into this rung
+    // that genuinely still has somewhere to go: landed on LOCAL main with commits origin has never
+    // seen. Answering `keep-open` there would drop the one recommendation that moves it forward, and
+    // falling through is not an option either — the next rung is the "safe and silent" sentence
+    // roborev 59153 removed from exactly these rows. So the rung splits on the outstanding work and
+    // says BOTH facts, since the retirement flag rides alongside in `retirementConfirm` regardless.
+    // GATED ON THE STAGE, NOT THE COUNT ALONE (roborev 59899). `commitsAhead > 0` does not mean
+    // "not on origin": `ahead` is `rev-list --left-right --count`, so it only reaches 0 once the
+    // branch TIP is an ancestor of the base — a squash or rebase merge defeats that permanently and
+    // `ahead` stays N forever (workflowStage.ts spells this out). `merged` and `shipped` rows
+    // therefore routinely carry a non-zero count, and gating on the count alone told the founder
+    // their work "has landed locally" with commits that "have not reached the remote yet" — false,
+    // it is on origin — and recommended `ship`, which asks `gh` for a second pull request on a
+    // branch whose PR already merged. That is the false-copy-on-landed-rows defect roborev 59153
+    // fixed, reintroduced one rung lower.
+    //
+    // `isUnmerged` is the predicate that already means what this needs (`building_saved` ≤ stage <
+    // `merged`), and `previewClose` computes `unmergedCommittedWork` from the same pair — so this
+    // rung and that field cannot disagree about one row. Within this branch only `merged_local` can
+    // satisfy it, which is why the old `pull_request ? "save" : "ship"` ternary was dead code:
+    // `pull_request` sorts BELOW the retirement boundary and can never reach here.
+    if (i.commitsAhead > 0 && isUnmerged(i.stage)) {
+      const n = i.commitsAhead;
+      return {
+        recommended: "ship",
+        reason:
+          `This agent's work has landed locally, so its code is safe — but ${n} commit${n === 1 ? " has" : "s have"} ` +
+          `not reached the remote yet, and that is worth doing before the row goes. Taking the row off the build ` +
+          `list is separately yours to confirm: close it from its row and I'll show you what it reported first.`,
+      };
+    }
+    return {
+      recommended: "keep-open",
+      reason:
+        "This agent's work has landed, so its code is safe — but taking the row off the build list " +
+        "is yours to confirm, and I'd want you to see what it reported on its way out. Close it from " +
+        "its row and I'll show you that first.",
+    };
+  }
   if (!i.wouldPrompt) {
     return {
       recommended: "close",
       reason:
         i.kind === "build"
-          ? "Nothing is at risk — this agent's work has either landed on main or it never made any. Closing is safe and silent."
+          ? "Nothing is at risk — this agent never made any work to lose. Closing is safe and silent."
           : "Workers are the orchestrator's business; closing one just drops its tab and worktree, and its branch is kept.",
     };
   }
@@ -1215,9 +1288,38 @@ export interface ClosedAgents {
  * risk. It deliberately does NOT fall back to any destructive outcome; the human (through the
  * concierge) picks ship, save, or discard explicitly.
  */
-export async function closeAgent(agentId: string): Promise<LifecycleResult<ClosedAgents>> {
+export async function closeAgent(
+  agentId: string,
+  /**
+   * The agent's stated reason for having NO retro, when it offers one (bead sparkle-0l9xk).
+   *
+   * This is the live path into `recordRetroExcused` — the agent side of the receipt store, and the
+   * only receipt state an agent writes about itself. Untyped on purpose: it arrives off the tool
+   * wire as whatever was typed, and `recordRetroExcused` runs it through muster.
+   *
+   * IT DOES NOT BUY A CLOSE. A landed row still comes back `needs-human-confirm` below, settled or
+   * not — the receipt decides what the dialog SAYS, never whether to ask. What it buys is that the
+   * founder reads the agent's own words at confirm time instead of "nothing on file".
+   */
+  noRetro?: { reasonCode?: unknown; reasonText?: unknown },
+): Promise<LifecycleResult<ClosedAgents>> {
   const found = locate(agentId);
   if (!found) return refuse("close_agent", "unknown-agent", unknownAgent(agentId));
+  if (noRetro) {
+    const excuse = await recordRetroExcused(found.project.id, agentId, noRetro);
+    // A rejected WORDING is relayed with muster's own phrase so the agent can rephrase; retrying the
+    // same text would fail identically. A failed WRITE is deliberately NOT fatal here — the excuse
+    // is a nicety, the close decision below is the gate, and refusing to close because a note could
+    // not be written would strand the row over the least important thing in the operation.
+    if (excuse.status === "rejected") {
+      return refuse(
+        "close_agent",
+        "action-failed",
+        `I can't record that as “${found.agent.name}”'s reason for having no retro: ` +
+          `${excuse.why}. Give me a reason in your own words and I'll put it on the record.`,
+      );
+    }
+  }
   const preview = previewClose(agentId);
   if (!preview.ok) return refuse("close_agent", preview.reason, preview.message);
   if (preview.data.wouldPrompt) {
@@ -1237,7 +1339,13 @@ export async function closeAgent(agentId: string): Promise<LifecycleResult<Close
   const ids = [agentId, ...childrenOf(found.project, agentId).map((a) => a.id)];
   // closeBuildAgent is the existing one-click "Close Build Agent": it terminates any cloud sandbox
   // in the subtree, drops the panes, removes the worktrees, and honors delete_merged_branch.
-  await closeBuildAgent(agentId);
+  //
+  // `false` — THE CONCIERGE IS NOT A HUMAN CONFIRMATION. It is the caller that produced this bead:
+  // it closed three landed agents on its own judgement, and each of them left with its retro
+  // unread. It may still close everything that has NOT landed; a landed row comes back refused and
+  // the refusal is relayed rather than worked around.
+  const closed = await closeBuildAgent(agentId, false);
+  if (!closed.ok) return refuse("close_agent", closed.reason, closed.message);
   return ok("close_agent", { agentIds: ids, projectId: found.project.id, outcome: "close" });
 }
 
@@ -1248,6 +1356,16 @@ export async function closeAgent(agentId: string): Promise<LifecycleResult<Close
 export interface ShippedAgents extends ClosedAgents {
   outcome: "ship";
   ship: ShipOutcome;
+  /**
+   * TRUE when the work shipped but the ROW IS STILL THERE, because shipping is precisely what makes
+   * the retirement gate apply (bead sparkle-0l9xk): a landed build agent may only be taken off the
+   * list by a person.
+   *
+   * Read it. `agentIds` is `[]` in that case, and announcing "shipped and closed" over a row the
+   * founder can still see is the same class of false report as announcing a PR that was never
+   * opened — the failure the `ShipOutcome` contract above exists to prevent.
+   */
+  retirementPending: boolean;
 }
 
 /**
@@ -1300,8 +1418,41 @@ export async function shipAgent(agentId: string): Promise<LifecycleResult<Shippe
         `I've left the agent open so nothing is lost.`,
     );
   }
-  await closeBuildAgent(agentId);
-  return ok("ship_agent", { agentIds: ids, projectId: project.id, outcome: "ship", ship: outcome });
+  // Ship SUCCEEDED — that fact is not up for revision below. What follows only decides whether the
+  // row also goes, and a refusal here must never be reported as a failed ship: the branch is landed
+  // or on the remote either way, and telling the founder his ship failed would send him to re-do a
+  // merge that is already done.
+  //
+  // `outcome.landed` SHORT-CIRCUITS THE GATE'S OWN STAGE READ (knightwatch probe 2). `closeBuildAgent`
+  // resolves the stage from `runtimeStore.branchStatus`, which was polled BEFORE this ship and still
+  // says pre-merge — so a local land that merged the branch seconds ago reads as unlanded and closes
+  // silently. The ship's own outcome is the fresher, more direct fact: it just did the merge.
+  if (outcome.landed) {
+    // …AND PERSIST IT, so the fact outlives this tick (knightwatch 5204094441#3). Nothing else
+    // remembers a no-remote land: the poll re-derives the stage from git, where a landed branch is a
+    // clean tree 0 ahead — the same reading as an agent that built nothing. Without this the gate
+    // holds exactly once and the next close resolves to `silent`. `resolveStage` maxes the override
+    // against the derived stage, so it can only ratchet up.
+    useRuntimeStore.getState().setWorkflowStage(agentId, "merged_local");
+    return ok("ship_agent", {
+      agentIds: [],
+      projectId: project.id,
+      outcome: "ship",
+      ship: outcome,
+      retirementPending: true,
+    });
+  }
+  const closed = await closeBuildAgent(agentId, false);
+  return ok("ship_agent", {
+    // `[]`, not `ids`, when the row survived: `agentIds` is what the concierge reads to say what it
+    // tore down, and naming agents that are still on the list is the misreport this field exists
+    // to make impossible.
+    agentIds: closed.ok ? ids : [],
+    projectId: project.id,
+    outcome: "ship",
+    ship: outcome,
+    retirementPending: !closed.ok,
+  });
 }
 
 // ── Save ────────────────────────────────────────────────────────────────────────────────────────

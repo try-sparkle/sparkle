@@ -16,6 +16,10 @@
 // Composer's approval-nudge pre-step is likewise host-local — it renders into the composer.
 import { writePtyChainedStrict } from "../../pty";
 import { closeBuildAgent } from "../closeBuildAgent";
+import {
+  requestRetirementConfirm,
+  RetirementConfirmUnreachableError,
+} from "../retirementConfirmRequest";
 import { getAgentScrollback } from "../terminalScrollback";
 import { useProjectStore } from "../../stores/projectStore";
 import { useSuggestionStore } from "../../stores/suggestionStore";
@@ -63,7 +67,24 @@ export async function applySuggestion(
 ): Promise<boolean> {
   if (b.kind === "control") {
     // Not a learnable "action" and not PTY-gated. Routed by action id.
-    if (parseControlAction(b.value) === CLOSE_AGENT_ACTION) await closeBuildAgent(agentId);
+    if (parseControlAction(b.value) === CLOSE_AGENT_ACTION) {
+      // `false` — a click on a suggestion chip is not the confirmation the gate wants. The button
+      // only appears for a SHIPPED agent, so this is the population the retirement gate refuses
+      // (bead sparkle-0l9xk), and passing `true` here would defeat the gate through its most-used
+      // door while looking like a wiring detail.
+      //
+      // A refusal is NOT the end of the click: it opens the confirm dialog, which is where the
+      // human can read what the agent reported and then say yes. If nothing is listening (no
+      // sidebar mounted for this agent), the click closed nothing and opened nothing, and the host
+      // must SAY so — see the throw below.
+      const closed = await closeBuildAgent(agentId, false);
+      if (!closed.ok && !requestRetirementConfirm(agentId)) {
+        // THROWS rather than returning `false` — see RetirementConfirmUnreachableError. `false`
+        // means "the host vetoed this" and every host answers it by staying quiet, which here would
+        // be a click that closed nothing, opened nothing and said nothing.
+        throw new RetirementConfirmUnreachableError(agentId);
+      }
+    }
     return true;
   }
   if (opts.disabled) return false;

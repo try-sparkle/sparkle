@@ -60,6 +60,8 @@ import { ownsProjectInThisWindow } from "./goalContinuationRunner";
 import { notifyConcierge } from "./conciergeNotifier";
 import { IMPROVEMENT_INTERVAL_MS } from "./improvementPass";
 import { buildFleetSnapshots, buildStandingDuties } from "./pusherSnapshots";
+import { cachedReceipt, loadRetroReceipts } from "./retroReceipts";
+import { retroSettled } from "../engine/retroReceiptTypes";
 import { startPusherRunner, type PusherLogEntry, type PusherRunnerDeps } from "./pusherRunner";
 
 /**
@@ -220,14 +222,37 @@ export function buildPusherDeps(): PusherRunnerDeps {
     now: () => Date.now(),
     policy: () => policy,
     ownsProject: ownsProjectInThisWindow,
-    snapshots: () =>
-      buildFleetSnapshots({
-        projects: useProjectStore.getState().projects,
+    snapshots: () => {
+      const projects = useProjectStore.getState().projects;
+      // WARM THE RECEIPT CACHE FOR EVERY PROJECT THIS SWEEP READS (roborev 59899). The sidebar loads
+      // receipts inside a `projectId`-scoped effect, so only the OPEN project's map is ever filled —
+      // but the Pusher iterates every project. Without this the lookup below answered `undefined`
+      // (⇒ `retroSettled` false) for all the others, and the third clause `retirableAgents` now
+      // requires could never be satisfied there: `done-not-retired` went permanently silent for
+      // every unopened project, whatever was actually on disk. It also made the claim below false —
+      // open that project and the row reads the receipt as settled while the report just said it
+      // was not.
+      //
+      // FIRE-AND-FORGET, because this callback is synchronous and the lookup must stay sync (it is
+      // called per agent during the map). The first sweep after launch can therefore still read a
+      // cold cache for a project; that is the fail-closed direction — a missing receipt suppresses
+      // the retire claim rather than manufacturing one — and it self-corrects on the next tick.
+      // `loadRetroReceipts` swallows its own errors and REPLACES one project's map, so a failed or
+      // slow load cannot corrupt another project's entry.
+      for (const p of projects) void loadRetroReceipts(p.id);
+      return buildFleetSnapshots({
+        projects,
         branchStatus: useRuntimeStore.getState().branchStatus,
         quotaFor: quotaBlockForAgent,
         failureFor: lastFailureForAgent,
+        // THE SEAM THE UNIT TESTS STRUCTURALLY CANNOT COVER (see pusherSnapshots' header, which
+        // names this call site for exactly that reason). Reads the same module cache the sidebar
+        // and the confirm dialog read, so — once warmed above — the report and the row cannot
+        // disagree about whether an agent's retro is on file (knightwatch 5204094441#5).
+        retroSettledFor: (projectId, agentId) => retroSettled(cachedReceipt(projectId, agentId)),
         now: Date.now(),
-      }),
+      });
+    },
     inboxUsage,
     // READ FROM THE STORE, SYNCHRONOUSLY, and `undefined` until the probe has answered even once —
     // which is the honest reading on a build whose Rust side has no `conflict_flags` command at all.

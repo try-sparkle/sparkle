@@ -75,6 +75,7 @@ import { SuggestionRow, SUGGESTION_PILL_HEIGHT } from "../composer/SuggestionRow
 import { terminalSuggestionAnchorStyle } from "../terminalStageAnchor";
 import { applySuggestion } from "../../services/suggestions/applySuggestion";
 import { PtyGoneError } from "../../pty";
+import { RetirementConfirmUnreachableError } from "../../services/retirementConfirmRequest";
 import { line, ref } from "./conciergeLine";
 import type { Line } from "./conciergeLine";
 import { useSuggestions } from "../../services/suggestions/useSuggestions";
@@ -148,12 +149,17 @@ export function ConciergeSuggestions({
         // rejection is already a `false` by the time it gets back here, indistinguishable from a
         // veto, and the click goes silent again. ConciergeHost's Approve path solves it the same
         // way, and says so.
-        let failed: "pty-gone" | "error" | null = null;
+        let failed: "pty-gone" | "error" | "retire-unreachable" | null = null;
         const acted = await onApply(async () => {
           try {
             return await applySuggestion(agentId, b, { disabled, deliverPrompt: onDeliverPrompt });
           } catch (e) {
-            failed = e instanceof PtyGoneError ? "pty-gone" : "error";
+            failed =
+              e instanceof RetirementConfirmUnreachableError
+                ? "retire-unreachable"
+                : e instanceof PtyGoneError
+                  ? "pty-gone"
+                  : "error";
             return false;
           }
         });
@@ -167,7 +173,14 @@ export function ConciergeSuggestions({
         // from runtimeStore, which lags the real exit, so the click that races it looks perfectly
         // live — but it is the same fact for the user, so it gets the same words.
         const who = ref({ id: agentId, name: agentName });
-        if (failed === "error") onFailure(line`I couldn't run that on ${who}.`);
+        // The landed-agent close reached no surface that can ask you (roborev 59153). It is NOT a
+        // dead agent and NOT a veto, so it gets its own sentence — and the remedy is safe under the
+        // same condition that produced the refusal: the row's own × runs the identical gate.
+        if (failed === "retire-unreachable")
+          onFailure(
+            line`${who} has landed its work, so only you can take it off the build list — and its column isn't open here. Close it from its row and I'll show you what it reported first.`,
+          );
+        else if (failed === "error") onFailure(line`I couldn't run that on ${who}.`);
         else if (failed || disabled) onFailure(line`${who} isn't running, so I couldn't do that.`);
       })();
     },

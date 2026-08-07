@@ -74,6 +74,7 @@ mod onepassword;
 mod pr_claims;
 mod pr_dismissal;
 mod pr_owner;
+mod retro_receipt;
 mod preflight;
 mod proc;
 mod promotion;
@@ -692,6 +693,12 @@ pub fn run() {
             worktree::project_pr_list_url,
             worktree::project_open_prs,
             worktree::pr_owner,
+            // The retirement gate's durable "did this agent report back" store (sparkle-0l9xk).
+            // Registered in the SAME commit as the module: a missing registration only fails at
+            // invoke time, and this one is read on every status poll.
+            retro_receipt::retro_receipt_record,
+            retro_receipt::retro_receipt_get,
+            retro_receipt::retro_receipt_all,
             worktree::merge_pr,
             // The read side of the merge gate `merge_pr` enforces. Registered in the SAME commit as
             // the module: a missing registration only fails at invoke time.

@@ -25,7 +25,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const h = vi.hoisted(() => ({
   writePtyChainedStrict: vi.fn(async () => {}),
   PtyGoneError: class PtyGoneError extends Error {},
-  closeBuildAgent: vi.fn(async () => {}),
+  // Resolves the real OUTCOME shape: `closeBuildAgent` now reports whether it actually closed, and
+  // a mock returning `undefined` would make every caller's `.ok` read throw.
+  closeBuildAgent: vi.fn(async () => ({ ok: true }) as { ok: boolean }),
+  requestRetirementConfirm: vi.fn(() => true),
   recordEvent: vi.fn(),
   appendPrompt: vi.fn(() => "p1"),
 }));
@@ -35,6 +38,13 @@ vi.mock("../../pty", () => ({
   PtyGoneError: h.PtyGoneError,
 }));
 vi.mock("../closeBuildAgent", () => ({ closeBuildAgent: h.closeBuildAgent }));
+// The ERROR CLASS is re-exported from the real module, not stubbed: `instanceof` is what the host
+// branches on, and a hand-rolled stand-in here would make the test pass against a class the app
+// never throws.
+vi.mock("../retirementConfirmRequest", async (importActual) => ({
+  ...(await importActual<typeof import("../retirementConfirmRequest")>()),
+  requestRetirementConfirm: h.requestRetirementConfirm,
+}));
 vi.mock("../terminalScrollback", () => ({ getAgentScrollback: () => "some screen" }));
 vi.mock("../../stores/suggestionStore", () => ({
   useSuggestionStore: { getState: () => ({ recordEvent: h.recordEvent }) },
@@ -50,6 +60,7 @@ vi.mock("../../stores/projectStore", () => ({
 
 import { applySuggestion } from "./applySuggestion";
 import { closeBuildAgentButton } from "./controlButtons";
+import { RetirementConfirmUnreachableError } from "../retirementConfirmRequest";
 import type { SuggestionButton } from "./types";
 
 const terminalBtn: SuggestionButton = {
@@ -70,6 +81,9 @@ const promptBtn: SuggestionButton = {
 beforeEach(() => {
   h.writePtyChainedStrict.mockClear();
   h.closeBuildAgent.mockClear();
+  h.closeBuildAgent.mockResolvedValue({ ok: true });
+  h.requestRetirementConfirm.mockClear();
+  h.requestRetirementConfirm.mockReturnValue(true);
   h.recordEvent.mockClear();
   h.appendPrompt.mockClear();
 });
@@ -79,7 +93,11 @@ describe("applySuggestion — control kind", () => {
     const deliverPrompt = vi.fn();
     return applySuggestion("ag1", closeBuildAgentButton(), { deliverPrompt }).then((did) => {
       expect(did).toBe(true);
-      expect(h.closeBuildAgent).toHaveBeenCalledWith("ag1");
+      // `false` is the SECOND ARGUMENT and it is the point: a suggestion click is not the human
+      // confirmation the retirement gate wants (bead sparkle-0l9xk). Passing `true` here would
+      // defeat the gate through its most-used door while looking like a wiring detail, so the
+      // literal is asserted rather than left to `toHaveBeenCalledWith("ag1")`.
+      expect(h.closeBuildAgent).toHaveBeenCalledWith("ag1", false);
       // No PTY write and no text delivery — that is WHY it works in a host whose only message
       // channel is text.
       expect(h.writePtyChainedStrict).not.toHaveBeenCalled();
@@ -99,6 +117,32 @@ describe("applySuggestion — control kind", () => {
   it("records no learning event (it is an app action, not a learnable answer)", async () => {
     await applySuggestion("ag1", closeBuildAgentButton(), { deliverPrompt: vi.fn() });
     expect(h.recordEvent).not.toHaveBeenCalled();
+  });
+
+  // ── The refusal path (bead sparkle-0l9xk) ─────────────────────────────────────────────────────
+  // This button ONLY appears once an agent has shipped, which is exactly the population the
+  // retirement gate refuses. So the refused case is not an edge case here — it is the common one,
+  // and if it dead-ends, the green button silently stops working for every agent that offers it.
+  it("asks for the confirm DIALOG when the gate refuses, instead of dying silently", async () => {
+    h.closeBuildAgent.mockResolvedValue({ ok: false });
+    const did = await applySuggestion("ag1", closeBuildAgentButton(), { deliverPrompt: vi.fn() });
+
+    expect(h.requestRetirementConfirm).toHaveBeenCalledWith("ag1");
+    // TRUE because the click DID something: the dialog is up. The host may clear its row.
+    expect(did).toBe(true);
+  });
+
+  it("THROWS when the refusal reaches nobody, so the host can say so", async () => {
+    // No sidebar is listening (a satellite window, a torn-out project). Nothing closed and no
+    // dialog opened — and a `false` return would have been read as "the host vetoed this", which
+    // every host answers by staying SILENT. That made the click a dead button that said nothing
+    // (roborev 59153). Same reasoning as PtyGoneError: the host has no idea, so it must be told.
+    h.closeBuildAgent.mockResolvedValue({ ok: false });
+    h.requestRetirementConfirm.mockReturnValue(false);
+
+    await expect(
+      applySuggestion("ag1", closeBuildAgentButton(), { deliverPrompt: vi.fn() }),
+    ).rejects.toBeInstanceOf(RetirementConfirmUnreachableError);
   });
 });
 

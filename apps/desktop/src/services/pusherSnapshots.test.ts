@@ -34,7 +34,8 @@ const agent = (over: Partial<AgentTab> = {}): AgentTab =>
     ...over,
   }) as AgentTab;
 
-const project = (agents: AgentTab[], id = "p"): Project =>
+const PROJECT_ID = "p";
+const project = (agents: AgentTab[], id = PROJECT_ID): Project =>
   ({ id, name: id, rootPath: "/tmp", defaultBranch: "main", createdAt: "", agents, selectedAgentId: null }) as Project;
 
 const branch = (over: Partial<BranchStatus> = {}): BranchStatus => ({
@@ -53,6 +54,9 @@ function input(over: Partial<FleetSnapshotInput> = {}): FleetSnapshotInput {
     branchStatus: {},
     quotaFor: () => undefined,
     failureFor: () => undefined,
+    // Default FALSE — the honest reading for an app with no captured-receipt producer yet, and the
+    // one that keeps `retirableAgents` fail-closed unless a case opts in.
+    retroSettledFor: () => false,
     now: T0,
     ...over,
   };
@@ -91,7 +95,7 @@ describe("unlandedWorkOf — the fail-closed rule with teeth", () => {
 
 describe("the mapping", () => {
   it("omits every optional the app could not supply, rather than defaulting it", () => {
-    const s = snapshotOfAgent(agent(), input());
+    const s = snapshotOfAgent(agent(), input(), PROJECT_ID);
     expect(s.quota).toBeUndefined();
     expect(s.failure).toBeUndefined();
     expect(s.escalation).toBeUndefined();
@@ -103,8 +107,7 @@ describe("the mapping", () => {
     const msg = "You've hit your weekly limit · resets Aug 4 at 11pm (America/Bogota)";
     const s = snapshotOfAgent(
       agent(),
-      input({ quotaFor: () => ({ message: msg, resetAt: T0 + 1000, resetParsed: true, at: T0 }) }),
-    );
+      input({ quotaFor: () => ({ message: msg, resetAt: T0 + 1000, resetParsed: true, at: T0 }) }), PROJECT_ID);
     expect(s.quota).toEqual({ message: msg, resetAt: T0 + 1000, resetParsed: true });
   });
 
@@ -112,44 +115,40 @@ describe("the mapping", () => {
   // event killed several agents at once.
   it("carries the failure banner through UNNORMALISED", () => {
     const msg = "API Error: Unable to connect to API (ENOTFOUND)";
-    const s = snapshotOfAgent(agent(), input({ failureFor: () => ({ message: msg, at: T0 - 5 }) }));
+    const s = snapshotOfAgent(agent(), input({ failureFor: () => ({ message: msg, at: T0 - 5 }) }), PROJECT_ID);
     expect(s.failure).toEqual({ message: msg, at: T0 - 5 });
   });
 
   it("maps an escalated goal, with its reason", () => {
     const s = snapshotOfAgent(
       agent({ goal: { text: "x", setAt: T0, ttlMs: 1, escalatedAt: T0, escalationReason: "gave up" } } as Partial<AgentTab>),
-      input(),
-    );
+      input(), PROJECT_ID);
     expect(s.escalation).toEqual({ reason: "gave up" });
   });
 
   it("maps an escalated goal with NO reason as escalated-but-unexplained", () => {
     const s = snapshotOfAgent(
       agent({ goal: { text: "x", setAt: T0, ttlMs: 1, escalatedAt: T0 } } as Partial<AgentTab>),
-      input(),
-    );
+      input(), PROJECT_ID);
     expect(s.escalation).toEqual({});
   });
 
   it("does not report an unescalated goal as escalated", () => {
     const s = snapshotOfAgent(
       agent({ goal: { text: "x", setAt: T0, ttlMs: 1 } } as Partial<AgentTab>),
-      input(),
-    );
+      input(), PROJECT_ID);
     expect(s.escalation).toBeUndefined();
   });
 
   it("maps a met goal", () => {
     const s = snapshotOfAgent(
       agent({ goal: { text: "x", setAt: T0, ttlMs: 1, metAt: T0 } } as Partial<AgentTab>),
-      input(),
-    );
+      input(), PROJECT_ID);
     expect(s.goalMetAt).toBe(T0);
   });
 
   it("uses the SHARED display-name rule, so the report names what the sidebar shows", () => {
-    const s = snapshotOfAgent(agent({ name: "Cockpit Resize", namePinned: true } as Partial<AgentTab>), input());
+    const s = snapshotOfAgent(agent({ name: "Cockpit Resize", namePinned: true } as Partial<AgentTab>), input(), PROJECT_ID);
     expect(s.label).toBe("Cockpit Resize");
   });
 });

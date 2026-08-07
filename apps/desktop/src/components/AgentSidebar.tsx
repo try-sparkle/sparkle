@@ -6,6 +6,7 @@ import {
   useMemo,
   useCallback,
   useContext,
+  useSyncExternalStore,
   createContext,
   memo,
   Fragment,
@@ -18,6 +19,7 @@ import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 // FiAlertTriangle/FiRepeat/FiTarget carry the never-idle overlay (stall / thrash / goal) — see
 // ./rowAttention and the chips in AgentRow. Icons, never emoji: this repo uses react-icons.
 import {
+  FiArchive,
   FiCloud,
   FiHelpCircle,
   FiPlus,
@@ -72,7 +74,19 @@ import { DemoteToLocalDialog, demoteDialogDeps } from "./DemoteToLocalDialog";
 import { killPty } from "../pty";
 import { refreshAgentBranch, landAgentBranch } from "../services/branchStatus";
 import type { BranchStatus } from "../services/branchStatus";
-import { shouldPromptOnClose, selectionAfterClose } from "../engine/closeAgent";
+import { closeDecision, selectionAfterClose } from "../engine/closeAgent";
+import { retroSettled } from "../engine/retroReceiptTypes";
+import { retirementPill, canAnswerRetroPing } from "../engine/retirementReadiness";
+import {
+  cachedReceipt,
+  loadRetroReceipts,
+  recordRetroOverridden,
+  retroReceiptsVersion,
+  subscribeRetroReceipts,
+} from "../services/retroReceipts";
+import { subscribeRetirementConfirmRequests } from "../services/retirementConfirmRequest";
+import { RetireAgentConfirm } from "./RetireAgentConfirm";
+import { log } from "../logger";
 import { shipAgent, saveAgent, discardAgentGit, type ShipOutcome } from "../services/closeAgentActions";
 import { AgentInboxBadge } from "./AgentInboxBadge";
 import { ModalShell } from "./ModalShell";
@@ -645,6 +659,16 @@ export function AgentSidebar({
         if (local.length > 0) {
           await pollProjectStatus(proj.rootPath, proj.id, local.map(toInput), false);
         }
+        // THE RETIREMENT RECEIPTS (bead sparkle-0l9xk). One Rust call for the whole project, on the
+        // same tick as the chevrons — `retirementPill` reads the cache SYNCHRONOUSLY during render
+        // and cannot await, exactly like branch status above.
+        //
+        // Without this line the cache is never populated and `cachedReceipt` returns `undefined`
+        // forever, which the fail-closed rule reads as "has not reported": every landed agent would
+        // wear RETRO PENDING permanently, including the ones that filed properly. A gate that says
+        // no to everyone is not a gate, it is an outage — and it would look exactly like working
+        // code, because the pill renders and the dialog opens.
+        await loadRetroReceipts(proj.id);
       } finally {
         inFlight = false;
       }
@@ -667,6 +691,11 @@ export function AgentSidebar({
   const [headerHover, setHeaderHover] = useState(false);
   // Which agent the Ship/Save/Discard close prompt is asking about (null = no prompt).
   const [closePromptId, setClosePromptId] = useState<string | null>(null);
+  // The RETIREMENT confirm (bead sparkle-0l9xk) — a landed build agent the human is removing.
+  // Separate state from `closePromptId` on purpose: the two dialogs answer different questions
+  // ("what about the work?" vs "are you done with this row?"), and sharing one id would make an
+  // Escape out of one able to leave the other half-open.
+  const [retireConfirmId, setRetireConfirmId] = useState<string | null>(null);
   // What the chosen close outcome ACTUALLY did, when that differs from what the button promised
   // (roborev 54225). Rendered as a ModalShell card — the same dialog chrome CloseAgentPrompt uses,
   // stepped into the slot it just vacated, rather than a new notification channel. `null` on the
@@ -1269,15 +1298,114 @@ export function AgentSidebar({
     if (!agent) return;
     // Read branch/workflow FRESH from the store rather than the render-scope maps: AgentRow is now
     // memoized, so its `onClose` closure can be a few renders stale — the close-prompt decision must
-    // reflect the live git state, not a snapshot (sparkle-alrm.3).
+    // reflect the live git state, not a snapshot (sparkle-alrm.3). The receipt is read the same way
+    // and for the same reason: an agent can file its retro while this row sits under the cursor.
     const rt = useRuntimeStore.getState();
     const stage = resolveStage(rt.branchStatus[id], rt.workflowStage[id]);
-    if (shouldPromptOnClose(agent.kind, stage, rt.branchStatus[id])) setClosePromptId(id);
+    const decision = closeDecision(agent.kind, stage, rt.branchStatus[id], {
+      settled: retroSettled(cachedReceipt(project.id, id)),
+    });
+    if (decision === "work-at-risk-prompt") setClosePromptId(id);
+    // THE FOUNDER'S GATE (bead sparkle-0l9xk): "the build agent shouldn't be removed from the build
+    // list until I, as the human, confirm that." Before this, `shouldPromptOnClose` returned false
+    // for a landed agent and this line read that as permission to tear down — so merged and shipped
+    // rows were the one population that vanished on a single click with no prompt at all.
+    else if (decision === "retirement-confirm") setRetireConfirmId(id);
     else void teardownAgent(id);
   };
 
   // ── Close-agent Ship / Save / Discard (sparkle-o341) ───────────────────────────────────────────
   const closingAgent = project?.agents.find((a) => a.id === closePromptId) ?? null;
+
+  // ── Retirement confirm (sparkle-0l9xk) ─────────────────────────────────────────────────────────
+  // SUBSCRIBED, so a receipt that lands mid-poll actually repaints. `retirementPill` reads the cache
+  // synchronously during render and `AgentRow` is memoized, so without this the 15s load updated a
+  // module-level Map that nothing was watching: the pill would keep saying RETRO PENDING until some
+  // unrelated state change happened to re-render the row, and an OPEN dialog would never update at
+  // all (roborev 59153). The version counter is the whole snapshot — it is bumped on every mutation.
+  const receiptVersion = useSyncExternalStore(subscribeRetroReceipts, retroReceiptsVersion);
+  const retiringAgent = project?.agents.find((a) => a.id === retireConfirmId) ?? null;
+
+  // A MACHINE CLOSE THAT GOT REFUSED ENDS UP HERE. `closeBuildAgent` turns the concierge, the phone
+  // and the green suggestion button away for a landed agent; each of them then asks for this dialog
+  // rather than giving up, so the click still leads to the human instead of nowhere.
+  //
+  // OWNERSHIP IS CHECKED, and that is the whole reason the listener returns a boolean: two sidebars
+  // are mounted (one per column) and each renders a DIFFERENT project. The one that does not hold
+  // this agent must decline, or it would open a confirm for a row it cannot show and report the
+  // human as asked.
+  useEffect(() => {
+    return subscribeRetirementConfirmRequests((agentId) => {
+      // Read the project FRESH from the store, not from the render-scope `project`: this closure
+      // outlives the render that created it, and a stale capture would decline a request for an
+      // agent this column has since taken on.
+      const p = useProjectStore.getState().projects.find((x) => x.id === projectId);
+      if (!p?.agents.some((a) => a.id === agentId)) return false;
+      setRetireConfirmId(agentId);
+      return true;
+    });
+  }, [projectId]);
+
+  /** The human said yes. Record the gap FIRST when there is one, then tear the row down.
+   *
+   *  ORDER IS LOAD-BEARING. `removeAgent` is a hard delete plus a tombstone — after it runs there is
+   *  no row, no `agent:<id>` to attribute a bead to, and no way to tell later that this agent left
+   *  owing a retro. So the override receipt is AWAITED before teardown, not fired alongside it.
+   *
+   *  A failed write does NOT block the retirement. The human has decided, and refusing to remove a
+   *  row because we could not write a note about it would strand exactly the dead agents this path
+   *  exists to clear — the failure mode the override was added to prevent. It is logged instead. */
+  const confirmRetire = async (id: string) => {
+    if (!project) return void teardownAgent(id);
+    const settled = retroSettled(cachedReceipt(project.id, id));
+    if (!settled) {
+      const rt = useRuntimeStore.getState();
+      const bs = rt.branchStatus[id];
+      const wrote = await recordRetroOverridden(project.id, id, {
+        // WHAT WAS ESTABLISHED, NOT WHAT WAS INFERRED (roborev 59153). This used to read "Retired
+        // without a retro: the agent could not be asked for one", which asserts a gap this app
+        // cannot see: nothing yet writes a `captured` receipt, so an agent that filed a perfectly
+        // good retro through the merge hook — into beads, where this store cannot look — reads as
+        // unsettled here. Recording that as "never reported" would put a false gap in the one store
+        // the whole feature exists to make trustworthy. The receipt survives the agent, so it says
+        // only what the app actually knows.
+        reasonText:
+          "Retired by the founder with no retro receipt on file at the time. That means none was " +
+          "recorded HERE — a retro filed through the merge hook is not visible to this store yet.",
+        // Display-only evidence, captured while the row still exists — see RetroReceipt.branchEvidence.
+        ...(bs ? { branchEvidence: `${bs.ahead} ahead, ${bs.dirty ? "dirty" : "clean"}` } : {}),
+      });
+      if (!wrote) {
+        // THE ROW STAYS (knightwatch probe 4). This used to log and tear down anyway, on the
+        // reasoning that refusing to remove a row over a failed note would strand the dead agents
+        // this path exists to clear. But the dialog's own button says "record the gap", and the
+        // teardown is a hard delete: proceeding destroys the row AND the record, leaving nothing to
+        // retry from and no trace that the gap ever existed — in the one store this feature exists
+        // to make trustworthy. Keeping the row is recoverable; he can press it again.
+        log.warn("retire", "override write FAILED — row kept for retry", { agentId: id });
+        setRetireConfirmId(null);
+        setCloseNotice({
+          title: `Couldn’t record the retro gap for “${project.agents.find((a) => a.id === id)?.name || "this agent"}”`,
+          body: "I’ve left the agent in your list rather than removing it, because retiring it now would take the row and the record with it. Try again in a moment.",
+        });
+        return;
+      }
+    }
+    // `teardownAgent`, DELIBERATELY, and not `closeBuildAgent(id, true)` — knightwatch 5204094441#1
+    // asks for the funnel and it was tried here. The probe is right that the two paths differ:
+    // `closeBuildAgent` also runs `spinDownAgentGit` with `deleteBranch: deleteMergedBranch`, so the
+    // founder's "delete merged branches" setting does not apply on the retirement path (tracked as
+    // bead `sparkle-a2uoq` — it is a real gap and it is not this one).
+    //
+    // What the funnel costs is the reason it is not taken: `closeBuildAgent` AWAITS the git teardown
+    // before dropping the rows, while this path drops them first and reclaims disk in the background
+    // — on purpose, and named in `teardownAgent`'s own comment as the fix for "× closes the terminal
+    // but the row lingers/comes back". Routing the human's most-clicked retire button through the
+    // awaiting version puts a multi-second worktree removal in front of the row disappearing, and
+    // makes a git failure leave the row standing with its panes already closed. Trading a settings
+    // gap for a re-opened UX regression is not an improvement; the gap gets its own fix.
+    void teardownAgent(id);
+  };
 
   // ── Move to cloud (promotion, bead sparkle-8zpvc) ──────────────────────────────────────────────
   // SCOPED TO THIS COLUMN'S PROJECT. `promoteAgentId` is one app-wide id; resolving it against
@@ -1364,10 +1492,28 @@ export function AgentSidebar({
       });
       return;
     }
+    // A SUCCESSFUL SHIP IS EXACTLY WHAT MAKES THE RETIREMENT GATE APPLY (knightwatch probe 2).
+    // This was an unconditional teardown, which meant the one gesture that MOST reliably lands work
+    // was also the one that removed the row without a confirm — the fifth door, after the four
+    // machine paths `closeBuildAgent` already gates. Shipping is not a reason to skip the founder's
+    // confirm; it is the reason he is owed one.
+    // `outcome.landed`, NOT `kind`: a `pr-opened` ship has `landed: false` — the branch is up for
+    // review, nothing is merged, and the gate does not apply. Only the local-land path merges here.
+    if (outcome.landed) {
+      // PERSIST IT, don't just open the dialog (knightwatch 5204094441#3). `outcome.landed` is a fact
+      // about THIS tick and nothing else remembers it: the 15s poll derives the stage from git, and a
+      // no-remote land leaves a clean tree 0 commits ahead — indistinguishable from an agent that
+      // never built anything. Dismiss the dialog and the next × resolved to `silent` and removed the
+      // row. `resolveStage` takes the MAX of derived and override, so this only ever ratchets up.
+      useRuntimeStore.getState().setWorkflowStage(id, "merged_local");
+      setRetireConfirmId(id);
+      return;
+    }
     await teardownAgent(id);
     if (outcome.kind === "pushed-no-pr") {
-      // The BRANCH is safe on the remote, so the teardown loses nothing — but there is no review
-      // open and the bead is still in progress, and neither is guessable from a tab that vanished.
+      // NOT landed: the branch is safe on the remote but nothing is merged, so the retirement gate
+      // does not apply and the teardown stands. There is no review open and the bead is still in
+      // progress, and neither is guessable from a tab that vanished.
       setCloseNotice({
         title: `Pushed “${name}”, but no pull request was opened`,
         body: `The branch is on the remote, so nothing is lost — but nothing is under review either (${outcome.reason}). Open the pull request when you’re ready; the task stays open until you do.`,
@@ -2607,6 +2753,7 @@ export function AgentSidebar({
               onDragEndAgent={onAgentDragEnd}
               onDropAgent={onAgentDrop}
               editing={editing === a.id}
+              receiptVersion={receiptVersion}
               setEditing={setEditing}
               onSelect={() => onSelect(a.id)}
               onLand={() => onLand(a)}
@@ -2771,6 +2918,36 @@ export function AgentSidebar({
           onSave={onSaveClose}
           onDiscard={onDiscardClose}
           onCancel={() => setClosePromptId(null)}
+        />
+      )}
+
+      {/* THE RETIREMENT CONFIRM (bead sparkle-0l9xk) — a landed build agent leaving the build list.
+          MOUNTED BY THE COLUMN, not by the row, for the same reason as the promote/demote dialogs
+          below: `AgentRow` is memoized and can unmount under an open dialog (a section fold, a
+          band chip, a project switch), and a half-made decision about removing a row must not
+          vanish with the row it is about. */}
+      {retiringAgent && (
+        <RetireAgentConfirm
+          agentName={retiringAgent.name || "this agent"}
+          receipt={project ? cachedReceipt(project.id, retiringAgent.id) : undefined}
+          // FRESH from the store, not from the render-scope maps: this dialog can sit open while the
+          // 15s poll updates the tree underneath it, and the files it names are the ones retirement
+          // would destroy (knightwatch probe 1).
+          dirtyFiles={useRuntimeStore.getState().branchStatus[retiringAgent.id]?.dirtyFiles}
+          // The raw safety field AND the true total, alongside the capped preview — the dialog gates
+          // on `dirty` and renders "+N more" from `dirtyCount` (roborev 59423).
+          dirty={useRuntimeStore.getState().branchStatus[retiringAgent.id]?.dirty}
+          dirtyCount={useRuntimeStore.getState().branchStatus[retiringAgent.id]?.dirtyCount}
+          canAnswer={canAnswerRetroPing(
+            status[retiringAgent.id],
+            Boolean(quotaBlockForAgent(retiringAgent.id, Date.now())),
+          )}
+          onRetire={() => {
+            const id = retiringAgent.id;
+            setRetireConfirmId(null);
+            void confirmRetire(id);
+          }}
+          onCancel={() => setRetireConfirmId(null)}
         />
       )}
 
@@ -3735,6 +3912,14 @@ type AgentRowProps = {
   onDragEndAgent: () => void;
   onDropAgent: (targetId: string, targetSection?: BuildSectionId) => void;
   editing: boolean;
+  /** `retroReceiptsVersion()` at render time — a CHANGE TOKEN, never read for its value.
+   *
+   *  The row's retirement pill reads the receipt cache synchronously through `cachedReceipt`, which
+   *  is a module-level Map: nothing about it is a prop, so `agentRowPropsEqual` could not see a
+   *  receipt arriving and the memoized row kept painting RETRO PENDING indefinitely (knightwatch
+   *  probe 6). Subscribing in the column alone was not enough — it re-renders the PARENT, and the
+   *  memo comparator then finds every prop unchanged and skips the row. */
+  receiptVersion: number;
   setEditing: (id: string | null) => void;
   /** Called on activation — a CLICK, a keyboard Enter/Space, or a right-click opening the card.
    *  There is no hover caller: selection is click-only (see HOVER_INTENT_MS's headstone). */
@@ -3830,6 +4015,8 @@ function agentRowPropsEqual(prev: AgentRowProps, next: AgentRowProps): boolean {
     // warns about, where an omitted prop silently freezes the row on stale data.
     prev.columnWidth === next.columnWidth &&
     prev.editing === next.editing &&
+    // The receipt cache is not a prop — this token is how its change crosses the memo boundary.
+    prev.receiptVersion === next.receiptVersion &&
     workerDetailsEqual(prev.workers, next.workers)
   );
 }
@@ -3932,6 +4119,38 @@ const GOAL_CHIP_A11Y: Record<GoalChipState, (b: GoalBadge) => string> = {
   expired: () => "Goal expired, never met",
   met: () => "Goal met",
   unmet: (b) => `Goal ${b.label.replace(" · ", ", ")}`,
+};
+
+/** The retirement recommendation's words, in ONE place for the TWO surfaces that say it.
+ *
+ *  The recommendation renders twice by design: `retirePill` (worded, expanded hover card) and
+ *  `retireMark` (wordless glyph, collapsed row — the only scannable surface, so the words it drops
+ *  have to survive in its tooltip and accessible name). Both were spelling the same two sentences
+ *  out inline, which is a copy-drift hazard the repo treats as a code defect: edit one surface and
+ *  the same fact is described two ways, with a green suite (roborev 59545). Hoisted so a single
+ *  edit reaches both, and so a test can compare the two surfaces against the same source. */
+const RETIRE_COPY: Record<"ready" | "retro-pending", { title: string; a11y: string }> = {
+  ready: {
+    // "ON FILE", NOT "LOGGED" — the words have to be true for all THREE receipt states, and only
+    // one of them is a retro anyone logged (roborev 59693). `retirementPill` returns `ready` for any
+    // receipt at all (`retroSettled` is `receipt != null`), so this same sentence also paints a row
+    // whose agent said it HAS no retro (`excused`) and a row a human retired over the gap
+    // (`overridden`). Promising "its feedback is logged" there tells the founder a bead exists to
+    // read when nothing was ever filed — the exact false-settled reading engine/retroReceiptTypes
+    // is fail-closed to avoid. This is the one sentence that must hold for whichever state it is.
+    //
+    // The dialog behind the click DOES word each state precisely — but only since roborev 59891,
+    // which found this same false sentence still standing there on the more prominent surface, and
+    // an earlier version of this very comment vouching for it. It is `SETTLED_LEDE` in
+    // RetireAgentConfirm.tsx now, keyed on `receipt.state`; a fourth state has to be worded there
+    // as well as here.
+    title: "Done, landed, and its retro step is on file — click to retire it",
+    a11y: "Ready to retire",
+  },
+  "retro-pending": {
+    title: "Landed, but it hasn’t reported back yet. It’s being asked; nothing is blocked on you.",
+    a11y: "Retro pending",
+  },
 };
 
 const AgentRow = memo(function AgentRow({
@@ -4988,6 +5207,112 @@ const AgentRow = memo(function AgentRow({
       </span>
     ) : null;
 
+  // THE RETIREMENT PILL (bead sparkle-0l9xk). The founder asked for "an informational pill, kind of
+  // like the plan pill... recommending that the agent be fully retired because it is done and the
+  // feedback has been completed and logged."
+  //
+  // INFORMATIONAL, NEVER AN ALARM. Both states take the calm accent ink and the same bordered,
+  // drawn-not-filled treatment as `feedbackPill` above — never `C.sienna`/`C.dangerInk`, and no
+  // warning glyph. It contributes NOTHING to the row's status dot, its band, or the filter chips:
+  // `retirementPill` is a derived overlay read alongside `AgentTabStatus`, exactly as `rollupDot`
+  // is, and engine/retirementReadiness.test.ts locks that. Routing it through `bandOfStatus` to
+  // make it filterable would land it in `needs_you` — the false "N agents need you" that
+  // buildSections.ts warns about — or in `done`, where it would be invisible. Neither is a pill.
+  //
+  // Clicking is the SAME action as the row's ×: it opens the retirement confirm. That is deliberate
+  // — the pill's whole message is "this one is ready to go", so the obvious click must be the thing
+  // it is recommending, and the human still confirms in the dialog either way.
+  const retirePillState = retirementPill({
+    kind: a.kind,
+    // `trackerStage` is the row's already-resolved stage, threaded down by the column. Re-deriving
+    // it here from a second source is how the row and the × would come to disagree about whether an
+    // agent has landed — and they must not, since one paints the pill and the other opens the gate.
+    stage: trackerStage ?? "thought",
+    receipt: cachedReceipt(project.id, a.id),
+  });
+  const retirePill = retirePillState ? (
+    <span
+      data-testid="row-retire-pill"
+      data-retire-state={retirePillState}
+      onClick={(e) => {
+        e.stopPropagation();
+        onClose();
+      }}
+      title={RETIRE_COPY[retirePillState].title}
+      style={{
+        flex: "0 0 auto",
+        fontFamily: FONT_MONO,
+        fontSize: TYPE.micro,
+        lineHeight: 1,
+        // `accentInk` for both states, differing only in border weight — the pending one is a
+        // quieter draw of the same idea, not a different severity. A second colour here would be
+        // the start of the fourth-hue drift tokens.ts spent a paragraph refusing.
+        color: C.accentInk,
+        border: `1px solid ${retirePillState === "ready" ? C.accentInk : C.hairline}`,
+        borderRadius: RADIUS.sm,
+        padding: "1px 5px",
+        whiteSpace: "nowrap",
+        cursor: "pointer",
+      }}
+    >
+      {retirePillState === "ready" ? "READY TO RETIRE" : "RETRO PENDING"}
+    </span>
+  ) : null;
+
+  // THE SAME FACT, WORDLESS, FOR THE COLLAPSED ROW (roborev 59482). The merge resolution above sent
+  // the worded pill to the expanded card, because `main` had just stripped 18ch text pills off this
+  // row for width (bead sparkle-tyter). Correct for the WORDS — but it left the recommendation with
+  // no surface on the scannable list at all, which is precisely the gap the PRD names as the thing
+  // this feature exists to close ("It has no surface on the build row at all — that absence is the
+  // pill the founder asked for"). A recommendation you can only find by hovering one row at a time
+  // is not a recommendation.
+  //
+  // So the row gets a MARK, on `cloudChip`'s terms: a single 11px icon carrying no text, which is
+  // the shape the merge comment already identifies as too cheap to reproduce the collision. Same
+  // click as the pill and the × — it opens the retirement confirm — and the words it replaces ride
+  // in the tooltip and the accessible name.
+  //
+  // NOT a notice mark. `noticeMarksEl` is the WARNING class (amber, `agentNotices`), and routing
+  // retirement through it would make an informational recommendation an alarm — the one thing the
+  // founder explicitly did not ask for. Accent ink when ready, muted while the retro is still owed:
+  // a quieter draw of one idea, never a second severity.
+  const retireMark = retirePillState ? (
+    <span
+      data-testid="row-retire-mark"
+      data-retire-state={retirePillState}
+      role="button"
+      // OPERABLE, not merely announced as operable (roborev 59545). `role="button"` without a tab
+      // stop and a key handler is a control a keyboard or screen-reader user can hear and cannot
+      // press — and this mark is now the ONLY surface the recommendation has on the scannable list
+      // (the worded pill lives one hover away, and a hover is not a keyboard gesture), so the whole
+      // feature was unreachable that way. Both sibling marks on this row — `goalChipEl` and
+      // `noticeMarksEl` — already carry exactly this trio; the mark was the odd one out.
+      tabIndex={0}
+      aria-label={RETIRE_COPY[retirePillState].a11y}
+      onClick={(e) => {
+        e.stopPropagation();
+        onClose();
+      }}
+      onKeyDown={(e) => {
+        if (e.key !== "Enter" && e.key !== " ") return;
+        e.stopPropagation();
+        // Space would scroll the list out from under the dialog that is about to open.
+        e.preventDefault();
+        onClose();
+      }}
+      title={RETIRE_COPY[retirePillState].title}
+      style={{
+        display: "inline-flex",
+        flex: "0 0 auto",
+        lineHeight: 1,
+        cursor: "pointer",
+        color: retirePillState === "ready" ? C.accentInk : C.muted,
+      }}
+    >
+      <FiArchive size={11} />
+    </span>
+  ) : null;
+
   // The card's TOP STRIP: glyph/× + timer + name (or rename input) + the progress bar. It's the
   // SAME element collapsed (in the column) and expanded (the unified hover card's top strip, which
   // spans the column into the terminal area) — `expanded` only swaps the glyph for the × close,
@@ -5152,6 +5477,7 @@ const AgentRow = memo(function AgentRow({
                 {stallChipEl}
                 {thrashChipEl}
                 {epicPill}
+                {retirePill}
                 {cloudChip}
               </div>
               {/* The model pill anchors the card's top-right corner, above the progress bar's
@@ -5285,6 +5611,32 @@ const AgentRow = memo(function AgentRow({
                 )}
                 {cloudChip}
               </div>
+              {/* OUTSIDE THE CLUSTER **AND OUTSIDE THE CLIP**, both on purpose (roborev 59785).
+                  `main` folds the goal chip and the notice marks into one affordance on a narrow
+                  column; the retirement mark is not one of them. The cluster stands for things
+                  that are HAPPENING to a row (a goal, a stall, a thrash) and opens the composer;
+                  this stands for an action the founder takes ON the row and opens the retire
+                  confirm, so folding it in would give the collapsed mark two different meanings and
+                  one click that can only serve one of them.
+
+                  But sitting beside the cluster INSIDE the name box — where the merge first put it —
+                  bought the separation at the price of the mark itself. That box is `minWidth: 0`
+                  with `overflow: hidden`, so it is the thing flexbox shrinks first and its trailing
+                  children are simply CUT OFF; and `clusterMarkCount` counts only notice marks and
+                  the goal, so the collapse can never buy space for this one. The row's own measured
+                  budget says that is not hypothetical: `row-narrow-probe` read the worst 220px row —
+                  the width the app opens at — at 182 of 183px WITHOUT it, so an 11px glyph plus its
+                  gap is over budget by construction, and the recommendation would vanish silently on
+                  exactly the rows that have one.
+
+                  So it lives here instead: a `flex: 0 0 auto` sibling of the name box rather than a
+                  child of it, in the same slot band as the stage chip below. Flexbox shrinks the
+                  `flex: 1, minWidth: 0` name box to zero before it overflows a fixed sibling, so this
+                  mark cannot be clipped at any width — which is what "the only scannable surface the
+                  recommendation has" has to mean (roborev 59482). The WORDED pill (RETRO PENDING /
+                  READY TO RETIRE) stays on the expanded card where `main` sent `epicPill`, which is
+                  the part of sparkle-tyter's width budget that actually bound. */}
+              {retireMark}
               {/* `.stg` — LAST before the close slot, exactly as the mock orders the row
                   (dot · el · nm · stg · close). Outside the name container so the title ellipsizes
                   against it rather than pushing it off the row. Collapsed only: the card already

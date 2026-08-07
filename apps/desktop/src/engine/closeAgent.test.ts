@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { shouldPromptOnClose, selectionAfterClose, type CloseSelectionAgent } from "./closeAgent";
+import {
+  shouldPromptOnClose,
+  closeDecision,
+  selectionAfterClose,
+  type CloseSelectionAgent,
+} from "./closeAgent";
 import type { BranchStatus } from "../services/branchStatus";
 import type { AgentKind } from "../types";
 
@@ -19,7 +24,13 @@ describe("shouldPromptOnClose", () => {
   it("prompts for a build agent with only uncommitted (dirty) changes", () => {
     expect(shouldPromptOnClose("build", "building_unsaved", bs(0, true))).toBe(true);
   });
-  it("does NOT prompt once the work has merged (safe to close silently)", () => {
+  it("does NOT raise the WORK-AT-RISK choice once the work has merged", () => {
+    // Still false, and the reason is unchanged: landed work cannot be lost by closing the row, so
+    // there is no Ship/Save/Discard decision to make. What changed is what `false` MEANS. It used
+    // to be the whole close policy — the sidebar read it as "tear down silently" — and a merged
+    // agent therefore vanished with no prompt at all. Now it is one projection of `closeDecision`,
+    // which returns `retirement-confirm` for exactly these rows. See the describe block below;
+    // reading a `false` here as permission to tear down is the bug this bead fixed.
     expect(shouldPromptOnClose("build", "merged", bs(2))).toBe(false);
     expect(shouldPromptOnClose("build", "shipped", bs(2))).toBe(false);
   });
@@ -46,7 +57,9 @@ describe("shouldPromptOnClose", () => {
   });
   it("prompts when branch status is unknown (unpolled) — err toward the choice, never silent loss", () => {
     expect(shouldPromptOnClose("build", "building_unsaved", undefined)).toBe(true);
-    // …but a merged build agent with unknown status is still safe to close silently.
+    // …but a merged build agent with unknown status raises no WORK-AT-RISK choice: nothing it holds
+    // can be lost. It is not closed silently either — `closeDecision` sends it to the retirement
+    // confirm. This projection just isn't the thing that says so.
     expect(shouldPromptOnClose("build", "merged", undefined)).toBe(false);
     // …and a non-build agent never prompts regardless.
     expect(shouldPromptOnClose("worker", "building_unsaved", undefined)).toBe(false);
@@ -131,5 +144,106 @@ describe("selectionAfterClose — the caller's preferred next row", () => {
   it("clears selection when the ladder is empty even though a preference was passed", () => {
     const d = selectionAfterClose("b1", "b1", [ag("b1", "build")], [], "build", null);
     expect(d).toEqual({ reselect: true, next: null });
+  });
+});
+
+describe("closeDecision — the retirement arm (bead sparkle-0l9xk)", () => {
+  const SETTLED = { settled: true } as const;
+  const UNSETTLED = { settled: false } as const;
+
+  it("asks for a HUMAN CONFIRM on a landed build agent instead of tearing it down", () => {
+    // THE REGRESSION PROOF. Against the pre-change code this whole block was `false`/silent, and
+    // the founder's merged-and-shipped rows disappeared on a single click with no prompt, no retro
+    // check, and no way to get the row back. His instruction was explicit: "the build agent
+    // shouldn't be removed from the build list until I, as the human, confirm that."
+    expect(closeDecision("build", "merged", bs(0), UNSETTLED)).toBe("retirement-confirm");
+    expect(closeDecision("build", "shipped", bs(0), UNSETTLED)).toBe("retirement-confirm");
+    // THE BOUNDARY IS `merged_local`, NOT `merged` (knightwatch 5204094441#3). It used to be
+    // `merged`, and the second line below used to assert `silent` — which is precisely the hole:
+    // a no-remote "Ship it" merges into LOCAL main and stops, so the landed row reads as a clean
+    // tree 0 ahead. The ship handler opened the dialog once from its own fresher `outcome.landed`;
+    // dismiss it, click × again, and this function answered `silent` and removed the row with no
+    // confirm at all. Both lines FAIL against the pre-change code.
+    expect(closeDecision("build", "merged_local", bs(0), UNSETTLED)).toBe("retirement-confirm");
+    expect(closeDecision("build", "merged_local", bs(2), UNSETTLED)).toBe("retirement-confirm");
+    // …and the stage BELOW it is untouched: nothing has landed there, so the old rules stand.
+    expect(closeDecision("build", "pull_request", bs(2), UNSETTLED)).toBe("work-at-risk-prompt");
+    expect(closeDecision("build", "pull_request", bs(0), UNSETTLED)).toBe("silent");
+  });
+
+  it("still asks even when the retro IS settled — the confirm is his, not the receipt's", () => {
+    // The receipt decides what the dialog SAYS (a recommendation rather than a request), never
+    // whether to ask. Letting a settled retro close silently would satisfy the retro half of the
+    // ask and quietly drop the half he stated in his own words.
+    expect(closeDecision("build", "merged", bs(0), SETTLED)).toBe("retirement-confirm");
+    expect(closeDecision("build", "shipped", bs(0), SETTLED)).toBe("retirement-confirm");
+  });
+
+  it("lets WORK AT RISK win over the retirement confirm — BELOW merged", () => {
+    // Below `merged` with a dirty tree, losing uncommitted changes is unrecoverable and an
+    // unconfirmed removal is not — so the Ship/Save/Discard choice is the more urgent thing to say.
+    expect(closeDecision("build", "building_unsaved", bs(0, true), SETTLED)).toBe("work-at-risk-prompt");
+    expect(closeDecision("build", "building_saved", bs(3), SETTLED)).toBe("work-at-risk-prompt");
+  });
+
+  it("does NOT let work at risk win once the work has LANDED — pinned, and it has a cost", () => {
+    // roborev 58742 read the doc block's old "work-at-risk is checked FIRST" and found the code
+    // does the opposite above `merged`. The ordering is deliberate — the founder's confirm is
+    // unconditional, and Ship/Save/Discard would tear the row down with no retro confirm at all —
+    // but it was UNTESTED IN EITHER DIRECTION, so nothing pinned which way it actually went.
+    //
+    // These are the real states: a merged row with uncommitted files, one with unpushed follow-up
+    // commits, one on a parked worktree, and one whose branch status has not polled yet.
+    expect(closeDecision("build", "merged", bs(0, true), UNSETTLED)).toBe("retirement-confirm");
+    expect(closeDecision("build", "merged", bs(3), SETTLED)).toBe("retirement-confirm");
+    expect(closeDecision("build", "shipped", bs(3, true), SETTLED)).toBe("retirement-confirm");
+    expect(
+      closeDecision("build", "merged", { ...bs(0, true), worktreeOnBranch: false }, UNSETTLED),
+    ).toBe("retirement-confirm");
+    expect(closeDecision("build", "merged", undefined, UNSETTLED)).toBe("retirement-confirm");
+    // The cost, stated so it cannot be mistaken for a solved problem: none of the above reaches a
+    // dialog that mentions the uncommitted files, and confirming removal destroys them. The remedy
+    // is in `RetireAgentConfirm`, not in this ordering — bead sparkle-jcux2.
+  });
+
+  it("leaves every non-build kind exactly as it was — silent", () => {
+    // Workers report to an orchestrator and shells have no branch; neither occupies a row he
+    // retires. Regressing these into a confirm would put a dialog in front of every worker teardown
+    // and the 60s orphan reaper.
+    for (const kind of ["worker", "shell", "think"]) {
+      expect(closeDecision(kind, "shipped", bs(3, true), UNSETTLED)).toBe("silent");
+      expect(closeDecision(kind, "building_unsaved", bs(3, true), UNSETTLED)).toBe("silent");
+    }
+  });
+
+  it("tears down silently only when nothing is at risk AND nothing has landed", () => {
+    expect(closeDecision("build", "building_unsaved", bs(0, false), UNSETTLED)).toBe("silent");
+    expect(closeDecision("build", "planned", bs(0, false), UNSETTLED)).toBe("silent");
+  });
+
+  it("keeps the unpolled and parked-worktree cases on the work-at-risk side", () => {
+    expect(closeDecision("build", "building_unsaved", undefined, SETTLED)).toBe("work-at-risk-prompt");
+    expect(
+      closeDecision("build", "building_unsaved", { ...bs(0, false), worktreeOnBranch: false }, SETTLED),
+    ).toBe("work-at-risk-prompt");
+  });
+});
+
+describe("shouldPromptOnClose stays a faithful projection of closeDecision", () => {
+  it("is true exactly when closeDecision says work-at-risk-prompt", () => {
+    // Pins the two together so a future edit to one cannot silently diverge from the other — the
+    // exact drift that let the sidebar and the concierge disagree about closing in the first place.
+    const kinds = ["build", "worker", "shell"];
+    const stages = ["planned", "building_unsaved", "building_saved", "merged_local", "merged", "shipped"] as const;
+    const statuses = [undefined, bs(0), bs(0, true), bs(3), { ...bs(0), worktreeOnBranch: false }];
+    for (const k of kinds) {
+      for (const st of stages) {
+        for (const b of statuses) {
+          expect(shouldPromptOnClose(k, st, b)).toBe(
+            closeDecision(k, st, b, { settled: false }) === "work-at-risk-prompt",
+          );
+        }
+      }
+    }
   });
 });
