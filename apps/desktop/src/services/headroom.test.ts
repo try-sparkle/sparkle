@@ -3,11 +3,13 @@ import {
   assessHeadroom,
   switchRecommendation,
   describeRecommendation,
+  rotationReadiness,
+  exhaustionOutlook,
   WARN_FRACTION,
   type Ceiling,
   type SwitchRecommendation,
 } from "./headroom";
-import { accountDisplay } from "./accountStore";
+import { accountDisplay, CEILING_AVOID_FRACTION } from "./accountStore";
 import type { Account, Usage, Identity } from "./accountStore";
 
 const NOW = 1_000_000;
@@ -338,4 +340,245 @@ describe("describeRecommendation", () => {
     );
   });
 
+});
+
+describe("rotationReadiness", () => {
+  // Identity helpers that can express every real state, including the two `ident()` above cannot:
+  // a config dir with no login at all, and a login carrying a uuid but no readable email.
+  const signedInAs = (id: string, email: string, uuid: string | null = `uuid-${id}`): Identity => ({
+    id,
+    email,
+    organization: null,
+    accountUuid: uuid,
+  });
+  const neverLoggedIn = (id: string): Identity => ({
+    id,
+    email: null,
+    organization: null,
+    accountUuid: null,
+  });
+
+  it("THE FOUNDER'S STATE: two registered accounts, exactly ONE of which can receive a spawn", () => {
+    // Measured on the real machine. `DROdio Personal` is signed in; `DROdio Gmail` is a config dir
+    // whose `.claude.json` has no `oauthAccount` key at all — registered, never `claude login`ed.
+    // The list showed two rows, so "rotation is broken" was the only conclusion available. It was
+    // never running: `signedInAccountIds` keeps only non-null emails and `pickAccount` narrows to
+    // those, so the candidate pool had ONE member and returned the same account every time.
+    const accounts = [
+      acct("personal", { nickname: "DROdio Personal", isDefault: true }),
+      acct("gmail", { nickname: "DROdio Gmail" }),
+    ];
+    const got = rotationReadiness(accounts, [
+      signedInAs("personal", "drodio@gmail.com"),
+      neverLoggedIn("gmail"),
+    ]);
+    // The whole point: TWO rows, ONE usable login.
+    expect(got.usableLogins).toBe(1);
+    expect(got.usable.map((a) => a.id)).toEqual(["personal"]);
+    // And the dead one is named, not silently dropped — being invisible is what made it look alive.
+    expect(got.notSignedIn.map((a) => a.nickname)).toEqual(["DROdio Gmail"]);
+    expect(got.noEmail).toEqual([]);
+    expect(got.redundant).toEqual([]);
+  });
+
+  it("counts ZERO usable logins when nothing is signed in", () => {
+    const accounts = [acct("a"), acct("b")];
+    const got = rotationReadiness(accounts, [neverLoggedIn("a"), neverLoggedIn("b")]);
+    expect(got.usableLogins).toBe(0);
+    expect(got.notSignedIn).toHaveLength(2);
+  });
+
+  it("counts an account with NO identity row at all as not signed in", () => {
+    // Identities can be missing entirely (never read, IPC hiccup), not merely null-valued.
+    const got = rotationReadiness([acct("a")], []);
+    expect(got.usableLogins).toBe(0);
+    expect(got.notSignedIn.map((a) => a.id)).toEqual(["a"]);
+  });
+
+  it("counts two genuinely different logins as two", () => {
+    const got = rotationReadiness(
+      [acct("a"), acct("b")],
+      [signedInAs("a", "one@example.com", "u1"), signedInAs("b", "two@example.com", "u2")],
+    );
+    expect(got.usableLogins).toBe(2);
+    expect(got.redundant).toEqual([]);
+  });
+
+  it("two registrations of the SAME login count as ONE usable account, not two", () => {
+    // Two config dirs, one Anthropic account, one quota — so "switch" moves sideways into the same
+    // wall. Reporting 2 here would announce rotation as available when it is not.
+    const UUID = "5fb3d67c-f4ed-417b-9bf2-f9156450eb73";
+    const got = rotationReadiness(
+      [acct("s", { nickname: "Storytell" }), acct("g", { nickname: "Gmail" })],
+      [signedInAs("s", "drodio@gmail.com", UUID), signedInAs("g", "drodio@gmail.com", UUID)],
+    );
+    expect(got.usableLogins).toBe(1);
+    expect(got.usable.map((a) => a.id)).toEqual(["s"]);
+    expect(got.redundant.map((a) => a.id)).toEqual(["g"]);
+  });
+
+  it("pairs a uuid-less registration with its uuid-bearing twin by email", () => {
+    // `accountUuid` is absent on logins predating the field, so an email-only row and its modern
+    // twin are the same login. Counting them as two is the same over-count one level down.
+    const got = rotationReadiness(
+      [acct("old"), acct("new")],
+      [signedInAs("old", "drodio@gmail.com", null), signedInAs("new", "drodio@gmail.com", "u1")],
+    );
+    expect(got.usableLogins).toBe(1);
+  });
+
+  it("does NOT merge an ambiguous email-only row — it stays its own login", () => {
+    // The canonical grouping refuses to pair a row whose email maps to more than one uuid group,
+    // because guessing benches an account that may not be a sibling. Deriving sameness from it
+    // rather than re-deciding here is what carries that guard over: a local "same email → same
+    // login" rule would report 2 usable logins for these three rows.
+    const got = rotationReadiness(
+      [acct("a"), acct("b"), acct("c")],
+      [
+        signedInAs("a", "shared@example.com", "u1"),
+        signedInAs("b", "shared@example.com", "u2"),
+        signedInAs("c", "shared@example.com", null),
+      ],
+    );
+    expect(got.usableLogins).toBe(3);
+    expect(got.redundant).toEqual([]);
+  });
+
+  it("counts a uuid-only login OUT of the pool — without calling it 'not signed in'", () => {
+    // It has a real login, so "not signed in" would be false; auto-pick keys on EMAIL, so it still
+    // cannot receive a spawn. Two different facts, two different buckets, so the copy can be honest
+    // about each.
+    const got = rotationReadiness(
+      [acct("a")],
+      [{ id: "a", email: null, organization: null, accountUuid: "u1" }],
+    );
+    expect(got.usableLogins).toBe(0);
+    expect(got.noEmail.map((a) => a.id)).toEqual(["a"]);
+    expect(got.notSignedIn).toEqual([]);
+  });
+
+  it("puts every registered account in exactly one bucket", () => {
+    // A partition, not a filter: an account that fell through every bucket would vanish from the
+    // banner's accounting entirely — which is precisely the failure being fixed.
+    const accounts = [acct("ok"), acct("dup"), acct("dead"), acct("uuidonly")];
+    const got = rotationReadiness(accounts, [
+      signedInAs("ok", "one@example.com", "u1"),
+      signedInAs("dup", "one@example.com", "u1"),
+      neverLoggedIn("dead"),
+      { id: "uuidonly", email: null, organization: null, accountUuid: "u9" },
+    ]);
+    const placed = [...got.usable, ...got.redundant, ...got.notSignedIn, ...got.noEmail].map(
+      (a) => a.id,
+    );
+    expect(placed.sort()).toEqual(accounts.map((a) => a.id).sort());
+    expect(new Set(placed).size).toBe(accounts.length);
+  });
+});
+
+describe("exhaustionOutlook (AC8)", () => {
+  const CEIL = 100;
+  // At/above the ACT line (0.9) but comfortably below the ceiling itself.
+  const OVER_ACT = CEILING_AVOID_FRACTION * CEIL;
+
+  it("reports every usable account at its limit, with the EARLIEST reset across them", () => {
+    const got = exhaustionOutlook(
+      ["a", "b"],
+      [usage("a", 1, NOW + 90 * 60_000), usage("b", 1, NOW + 20 * 60_000)],
+      [ceil("a", CEIL), ceil("b", CEIL)],
+      NOW,
+    );
+    expect(got.allAtLimit).toBe(true);
+    expect(got.earliestReset).toBe(NOW + 20 * 60_000);
+  });
+
+  it("is FALSE while any usable account still has room", () => {
+    const got = exhaustionOutlook(
+      ["a", "b"],
+      [usage("a", 1, NOW + 60_000), usage("b", 10)],
+      [ceil("a", CEIL), ceil("b", CEIL)],
+      NOW,
+    );
+    expect(got.allAtLimit).toBe(false);
+    // The reset is still reported — one account IS limited, and the caller may want to say so.
+    expect(got.earliestReset).toBe(NOW + 60_000);
+  });
+
+  it("counts an account over the ACT line as at its limit even with no observed rate limit", () => {
+    // This is the proactive half: auto-pick has already stopped sending it work, so the pool is
+    // empty of healthy candidates whether or not the wall was actually hit.
+    const got = exhaustionOutlook(["a"], [usage("a", OVER_ACT)], [ceil("a", CEIL)], NOW);
+    expect(got.allAtLimit).toBe(true);
+    // ...and NO time is invented for an account that never reported one.
+    expect(got.earliestReset).toBeNull();
+  });
+
+  it("uses the ACT line (0.9), NOT the WARN line (0.8)", () => {
+    // The two thresholds are deliberately different numbers and must not collapse: at 0.8 the human
+    // is told an account is getting close; at 0.9 Sparkle stops sending it new work. An account
+    // sitting between them is warn-worthy but is still receiving spawns, so "all accounts are at
+    // their limit" would be false about it.
+    expect(WARN_FRACTION).toBeLessThan(CEILING_AVOID_FRACTION);
+    const between = ((WARN_FRACTION + CEILING_AVOID_FRACTION) / 2) * CEIL;
+    expect(exhaustionOutlook(["a"], [usage("a", between)], [ceil("a", CEIL)], NOW).allAtLimit).toBe(
+      false,
+    );
+    expect(
+      exhaustionOutlook(["a"], [usage("a", OVER_ACT)], [ceil("a", CEIL)], NOW).allAtLimit,
+    ).toBe(true);
+  });
+
+  it("an UNMEASURED account is not evidence of exhaustion", () => {
+    // No learned ceiling → `unknown`. Treating that as at-the-limit would print "all accounts are
+    // at their limit" about a pool that was never measured.
+    const got = exhaustionOutlook(
+      ["a", "b"],
+      [usage("a", 1, NOW + 60_000), usage("b", 999_999_999)],
+      [ceil("a", CEIL), ceil("b", null)],
+      NOW,
+    );
+    expect(got.allAtLimit).toBe(false);
+  });
+
+  it("an account with no usage row at all has the most headroom, not the least", () => {
+    const got = exhaustionOutlook(
+      ["a", "silent"],
+      [usage("a", 1, NOW + 60_000)],
+      [ceil("a", CEIL)],
+      NOW,
+    );
+    expect(got.allAtLimit).toBe(false);
+  });
+
+  it("an EMPTY usable pool is not vacuously 'all at their limit'", () => {
+    // Zero usable accounts is a sign-in problem, not a rate-limit problem, and saying the latter
+    // sends the user to wait for a reset that will never fix it.
+    const got = exhaustionOutlook([], [usage("a", 999, NOW + 60_000)], [ceil("a", CEIL)], NOW);
+    expect(got.allAtLimit).toBe(false);
+    expect(got.earliestReset).toBeNull();
+  });
+
+  it("ignores an EXPIRED exhaustion when choosing the earliest reset", () => {
+    const got = exhaustionOutlook(
+      ["stale", "live"],
+      [usage("stale", 1, NOW - 60_000), usage("live", 1, NOW + 60_000)],
+      [ceil("stale", CEIL), ceil("live", CEIL)],
+      NOW,
+    );
+    expect(got.earliestReset).toBe(NOW + 60_000);
+    // ...and the expired one is back in play, so the pool is not all at its limit.
+    expect(got.allAtLimit).toBe(false);
+  });
+
+  it("only judges the accounts it was given", () => {
+    // An exhausted account that is NOT in the usable pool (never signed in, say) must not drag the
+    // verdict — it was never a rotation target.
+    const got = exhaustionOutlook(
+      ["healthy"],
+      [usage("healthy", 1), usage("dead", 999, NOW + 60_000)],
+      [ceil("healthy", CEIL), ceil("dead", CEIL)],
+      NOW,
+    );
+    expect(got.allAtLimit).toBe(false);
+    expect(got.earliestReset).toBeNull();
+  });
 });

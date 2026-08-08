@@ -16,7 +16,12 @@
 // hence a threshold well below 1.0 and a banner that RECOMMENDS rather than acts unilaterally.
 
 import type { Account, Usage, Identity, AccountDisplay } from "./accountStore";
-import { accountSentenceName, signedInAccountIds, duplicateAccountGroups } from "./accountStore";
+import {
+  accountSentenceName,
+  signedInAccountIds,
+  duplicateAccountGroups,
+  CEILING_AVOID_FRACTION,
+} from "./accountStore";
 
 /** Fraction of the learned ceiling at which we start recommending a switch. Chosen against the
  *  observed spread (CoV 0.24): at 0.8 a typical account still has real runway left, so the switch
@@ -230,4 +235,166 @@ export function describeRecommendation(
   // isn't its own" was false exactly where it appeared. The reset already expresses the doubt, by
   // yielding `null` while the evidence is insufficient.
   return base;
+}
+
+// ── Rotation readiness ────────────────────────────────────────────────────────────────────────
+//
+// "How many accounts can actually receive a spawn?" — the question the Accounts screen never
+// answered, and the whole of the founder's blocker.
+//
+// MEASURED on the real machine: `accounts.json` holds two accounts, of which ONE has ever been
+// `claude login`ed. The other's `.claude.json` carries no `oauthAccount` at all — registered, never
+// signed in, and rendered by the list as though it were a peer. `signedInAccountIds` keeps only
+// identities with a non-null email and `pickAccount` narrows auto-pick to those, so the candidate
+// pool had exactly ONE member and `pickAccount` returned the same account every single time.
+// Rotation was not broken; it was arithmetically impossible. Nothing in the UI said so, so the
+// visible evidence ("2 accounts") supported the opposite conclusion.
+//
+// This computes the count the UI has to state out loud, and it counts LOGINS rather than ROWS.
+
+/** Which registered accounts can actually receive a spawn, and which cannot — every account lands
+ *  in exactly one bucket, so a caller can name the excluded ones instead of silently dropping them.
+ *
+ *  See {@link rotationReadiness} for how each bucket is decided. */
+export interface RotationReadiness {
+  /** How many DISTINCT Anthropic logins can receive a spawn. This — not `accounts.length` — is the
+   *  number that decides whether rotation is possible at all: below 2 there is nowhere to rotate. */
+  usableLogins: number;
+  /** One representative account per distinct usable login, in input order. */
+  usable: Account[];
+  /** Signed in, but resolves to the SAME login as an earlier entry in `usable`. Two config dirs
+   *  holding one Anthropic account share one quota, so they are one usable account, not two. */
+  redundant: Account[];
+  /** No Claude login in the config dir at all (never `claude login`ed). The founder's second
+   *  account. It cannot receive agents, and the list used to present it as though it could. */
+  notSignedIn: Account[];
+  /** Has a login (an `accountUuid`) but no readable email. Real, but auto-pick keys on email
+   *  (`signedInAccountIds`), so it is not in the rotation pool either — stated rather than folded
+   *  into `notSignedIn`, which would be a different and false claim about it. */
+  noEmail: Account[];
+}
+
+/** Partition registered accounts into "can receive a spawn" and the reasons the rest cannot.
+ *
+ *  ELIGIBILITY IS DERIVED, NOT RE-DECIDED. Two rules are borrowed wholesale rather than restated:
+ *
+ *   * {@link signedInAccountIds} decides signed-in-ness (email != null). That is the exact predicate
+ *     `pickAccount` filters its candidate pool with, so the count shown to the user cannot describe
+ *     a different pool than the one selection actually uses.
+ *   * {@link duplicateAccountGroups} decides sameness. The repo has already shipped a bug from a
+ *     second, subtly-different sameness rule (see the docblock on {@link switchRecommendation}), so
+ *     this one asks the canonical grouping instead of comparing uuids or emails itself. Its
+ *     ambiguity guard carries over for free: an email-only row that cannot be paired on positive
+ *     evidence stays its own login rather than being silently merged away.
+ *
+ *  Deduping matters because a group of N registrations shares ONE quota: counting them separately
+ *  would report rotation as available when every "target" hits the same wall at the same moment. */
+export function rotationReadiness(
+  accounts: Account[],
+  identities: Identity[],
+): RotationReadiness {
+  const signedIn = new Set(signedInAccountIds(identities));
+  const identityById = new Map(identities.map((i) => [i.id, i]));
+  // Canonical sameness — one rule, shared with the duplicate banner and with benching.
+  const groupKeyById = new Map<string, string>();
+  for (const g of duplicateAccountGroups(accounts, identities)) {
+    for (const a of g.accounts) groupKeyById.set(a.id, g.key);
+  }
+
+  const usable: Account[] = [];
+  const redundant: Account[] = [];
+  const notSignedIn: Account[] = [];
+  const noEmail: Account[] = [];
+  const claimedLogins = new Set<string>();
+
+  for (const a of accounts) {
+    if (!signedIn.has(a.id)) {
+      // Not in the rotation pool. Which of the two reasons decides the copy, so keep them apart.
+      if (identityById.get(a.id)?.accountUuid) noEmail.push(a);
+      else notSignedIn.push(a);
+      continue;
+    }
+    const key = groupKeyById.get(a.id);
+    // An ungrouped account is its own login: `duplicateAccountGroups` only groups on positive
+    // evidence, so "no group" means "nothing proved it shares a login", never "unknown → merge".
+    if (key != null) {
+      if (claimedLogins.has(key)) {
+        redundant.push(a);
+        continue;
+      }
+      claimedLogins.add(key);
+    }
+    usable.push(a);
+  }
+
+  return { usableLogins: usable.length, usable, redundant, notSignedIn, noEmail };
+}
+
+// ── AC8: all accounts at the wall ─────────────────────────────────────────────────────────────
+
+/** Whether every usable account is out of room, and when the first one frees up. */
+export interface ExhaustionOutlook {
+  /** True when EVERY usable account is exhausted or at/above the ACT line
+   *  ({@link CEILING_AVOID_FRACTION}) — i.e. auto-pick has no healthy candidate left and is down to
+   *  its least-bad fallback.
+   *
+   *  False when there are no usable accounts at all: "all of nothing is at its limit" is a vacuous
+   *  truth that would render a limit warning for a user whose actual problem is having no login. */
+  allAtLimit: boolean;
+  /** Earliest epoch-MS instant a usable account's rate limit resets, or null when none of them is
+   *  actually rate-limited (they can all be over the ACT line on an ESTIMATE, with no observed
+   *  reset time to quote). Never invented: a null here means "we don't know when", and the caller
+   *  must not print a time. */
+  earliestReset: number | null;
+}
+
+/** Judge the usable pool as a whole (PRD acceptance criterion 8).
+ *
+ *  The ACT line is {@link CEILING_AVOID_FRACTION} (0.9), NOT {@link WARN_FRACTION} (0.8). They are
+ *  deliberately different numbers: 0.8 is where the human is told an account is getting close, 0.9
+ *  is where Sparkle itself stops sending that account new work. This function answers "has auto-pick
+ *  run out of healthy accounts", which is the 0.9 question, so it imports the constant rather than
+ *  restating it.
+ *
+ *  An account with NO usage row is treated as having no usage (the most headroom) — matching
+ *  `usageLookup` on the selection side — so it holds `allAtLimit` false rather than defaulting a
+ *  silent account into the wall. An `unknown` account (no learned ceiling) is likewise NOT at the
+ *  limit: an unmeasured account is not evidence of exhaustion, and treating it as such would print
+ *  "all accounts are at their limit" about a pool we have never measured. */
+export function exhaustionOutlook(
+  usableAccountIds: readonly string[],
+  usage: Usage[],
+  ceilings: Ceiling[],
+  now: number = Date.now(),
+): ExhaustionOutlook {
+  if (usableAccountIds.length === 0) return { allAtLimit: false, earliestReset: null };
+
+  const headroomById = new Map(assessHeadroom(usage, ceilings, now).map((h) => [h.accountId, h]));
+  const usageById = new Map(usage.map((u) => [u.id, u]));
+
+  const allAtLimit = usableAccountIds.every((id) => {
+    const h = headroomById.get(id);
+    if (!h) return false; // no usage row at all → no evidence of a limit
+    if (h.state === "exhausted") return true;
+    return h.fraction != null && h.fraction >= CEILING_AVOID_FRACTION;
+  });
+
+  const earliestReset = earliestResetAcross(usableAccountIds, usageById, now);
+  return { allAtLimit, earliestReset };
+}
+
+/** The soonest future `exhaustedUntil` among the named accounts, or null when none is exhausted.
+ *  Past instants are ignored — an expired exhaustion is not a reset the user is waiting on. */
+function earliestResetAcross(
+  ids: readonly string[],
+  usageById: Map<string, Usage>,
+  now: number,
+): number | null {
+  let earliest: number | null = null;
+  for (const id of ids) {
+    const until = usageById.get(id)?.exhaustedUntil;
+    if (until == null || until <= now) continue;
+    if (earliest == null || until < earliest) earliest = until;
+  }
+  return earliest;
 }

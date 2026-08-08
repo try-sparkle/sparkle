@@ -1,3 +1,4 @@
+mod account_ledger;
 mod accounts;
 mod agent_life;
 mod ai;
@@ -931,6 +932,8 @@ pub fn run() {
             accounts::accounts_ceilings,
             accounts::claude_signed_in,
             accounts::claude_auth_status,
+            account_ledger::accounts_record_spawn,
+            account_ledger::accounts_spawn_log,
             trial::trial_status,
             trial::trial_start,
             // The hot path. `trial_increment` (a device-local bump) is deliberately GONE: the

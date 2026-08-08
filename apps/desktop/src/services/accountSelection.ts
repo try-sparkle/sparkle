@@ -22,6 +22,12 @@ import {
   type PickOptions,
 } from "./accountStore";
 import type { Ceiling } from "./headroom";
+import {
+  recordSelection,
+  shouldLogSelection,
+  type SelectionReason,
+  type SpawnLogEntry,
+} from "./accountLedger";
 
 export interface AccountState {
   accounts: Account[];
@@ -179,7 +185,14 @@ export async function chooseAccountForAgent(
   // Nothing is remembered until something resolved, so a first-ever call with a broken backend still
   // reports "unknown" (no accounts → `chosen: null`) rather than inventing one.
   const remembered = state.failed ? lastResolvedAccount.get(agentId) : undefined;
-  if (remembered) return { chosen: remembered, state };
+  if (remembered) {
+    // `candidates: null`, NOT `[]`. This branch runs only when the backend could not be read, so
+    // there is no pool to report — and `[]` is already spoken for: it means "evaluated, and every
+    // account was over its line". Passing the empty array would file a transient IPC hiccup as a
+    // fleet-wide exhaustion event in the one file written to be trusted later.
+    logSelection(agentId, remembered, "remembered", state, null);
+    return { chosen: remembered, state };
+  }
   // Built ONCE and shared by both branches. Splitting them is how the pinned path silently lost
   // `signedInIds` and re-opened sparkle-gms0: `pickAccount` honours a pin only if it names an
   // EXISTING account, so a pin left behind by a deleted account falls through to auto-pick — and
@@ -204,12 +217,98 @@ export async function chooseAccountForAgent(
   // the very key it was written for.
   const pin = getPin(agentId);
   const pinnedAccountId = pin && state.accounts.some((a) => a.id === pin) ? pin : undefined;
+  // Read BEFORE `autoPick`, which writes it. Comparing the sticky key's account across the call is
+  // the only way to tell "reused the account it already had" from "picked one fresh" — and that
+  // distinction is exactly what a reader of the ledger is looking for, since a sticky key MOVING is
+  // a rotation while a sticky key staying put is not.
+  const previousSticky = stickySelections.get(agentId);
+  // The healthy pool at this instant, evaluated with the SAME options the pick uses. Its emptiness
+  // is what separates a real auto-pick from the least-bad fallback, and its size is what tells a
+  // reader whether rotation had anything to choose between at all — the founder's machine has one
+  // signed-in account, where every pick is unanimous and therefore proves nothing on its own.
+  // NULL WHEN THE BACKEND FAILED, even though `eligibleAccounts` happily returns [] for the EMPTY
+  // snapshot. This path is reached with `state.failed` on a key's FIRST-ever resolution — there is
+  // nothing remembered to carry it, so it falls through here rather than into the branch above. An
+  // empty array there is a measured claim ("evaluated, nothing healthy") produced by a read that
+  // never happened, and it is byte-identical to a genuinely empty registry: `signedInCount: 0`,
+  // `accountId: null`, `reason: "none"`. An IPC hiccup would be indistinguishable from "you have no
+  // accounts" forever after, in the file written to be trusted later.
+  const candidates = state.failed
+    ? null
+    : eligibleAccounts(state.accounts, state.usage, base);
   const chosen = pinnedAccountId
     ? pickAccount(state.accounts, state.usage, { ...base, pinnedAccountId })
     : autoPick(agentId, state, base);
+  const reason: SelectionReason = pinnedAccountId
+    ? "pinned"
+    : !chosen
+      ? "none"
+      : isStickyAccountKey(agentId) && previousSticky === chosen.id
+        ? "sticky"
+        : candidates != null && candidates.length === 0
+          ? "fallback"
+          : "auto";
+  logSelection(agentId, chosen, reason, state, candidates);
   // Remember it so the branch above can carry this key through a later hiccup.
   if (chosen) lastResolvedAccount.set(agentId, chosen);
   return { chosen, state };
+}
+
+/** Append this resolution to the on-disk ledger (`accountLedger.ts`), best-effort.
+ *
+ *  FIRE AND FORGET, deliberately un-awaited. `chooseAccountForAgent` sits on the spawn path and on
+ *  every concierge turn; awaiting an IPC round-trip here would put the ledger between the user and
+ *  their agent starting. `recordSelection` never rejects, so there is no unhandled rejection to
+ *  leak — losing a log line is always cheaper than delaying a spawn.
+ *
+ *  The COUNTS are the point, not just the chosen id. `signedInCount` is what makes an unanimous pick
+ *  legible: with one signed-in account every spawn lands on the same account no matter how good the
+ *  selection rule is, and a log that recorded only the winner would look identical to a broken
+ *  rotation. Recording how many accounts were even allowed to compete is what tells those two apart
+ *  after the fact. */
+function logSelection(
+  key: string,
+  chosen: Account | null,
+  reason: SelectionReason,
+  state: AccountState,
+  /** The healthy pool, or NULL when it was never evaluated (the backend was unreadable). The two are
+   *  different facts and the ledger records them differently — see the `remembered` call site. */
+  candidates: Account[] | null,
+): void {
+  if (!shouldLogSelection(key, chosen?.id ?? null, isStickyAccountKey(key))) return;
+  // `state` is the EMPTY snapshot whenever candidates are null, so every lookup below would return
+  // its "nothing found" answer — which is indistinguishable from a real zero. Decide once, here,
+  // that nothing was measured, rather than letting each field quietly default.
+  const measured = candidates != null;
+  const usage = chosen ? state.usage.find((u) => u.id === chosen.id) : undefined;
+  const ceiling = chosen
+    ? (state.ceilings.find((c) => c.id === chosen.id)?.ceiling ?? null)
+    : null;
+  const tokens5h = measured ? (usage?.tokens5h ?? 0) : null;
+  const entry: SpawnLogEntry = {
+    at: Date.now(),
+    key,
+    accountId: chosen?.id ?? null,
+    nickname: chosen?.nickname ?? null,
+    configDir: chosen?.configDir ?? null,
+    // The authenticated identity, NOT the nickname — a user-typed nickname has no bearing on which
+    // login a config dir actually holds, and on this machine one is literally named for the wrong
+    // account.
+    email: chosen ? (state.identities.find((i) => i.id === chosen.id)?.email ?? null) : null,
+    reason,
+    tokens5h,
+    ceiling,
+    // Guarded against a zero/absent ceiling rather than dividing blind: null is a real answer here
+    // and must never be coerced to 0, which would render an unmeasured account as the emptiest one.
+    fraction:
+      tokens5h != null && ceiling != null && ceiling > 0 ? tokens5h / ceiling : null,
+    eligibleCount: candidates?.length ?? null,
+    // Null rather than 0 when unmeasured. Zero here would state "nobody is signed in", which is the
+    // single most alarming thing this file can say, on the strength of no observation at all.
+    signedInCount: measured ? signedInAccountIds(state.identities).length : null,
+    candidateIds: candidates?.map((a) => a.id) ?? null,
+  };
+  void recordSelection(entry);
 }
 
 /** Auto-pick for `agentId` — sticky for the keys that need it, plain `pickAccount` otherwise.

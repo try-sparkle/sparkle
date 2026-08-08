@@ -1,21 +1,34 @@
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
-import { FiAlertTriangle } from "react-icons/fi";
+import { FiAlertTriangle, FiRotateCw, FiSlash, FiUserPlus } from "react-icons/fi";
 import { C, ON_BRAND_FILL } from "../theme/colors";
 import { FONT_UI } from "../theme/scale";
 import { tag } from "./labelTreatment";
+import { AccountSpawnLog } from "./AccountSpawnLog";
+import { readSpawnLog } from "../services/accountLedger";
 import {
   listAccounts,
   getUsage,
   getIdentities,
+  listCeilings,
   addAccount,
   setNickname,
   removeAccount,
   accountDisplay,
   duplicateAccountGroups,
+  CEILING_AVOID_FRACTION,
   type Account,
   type Usage,
   type Identity,
 } from "../services/accountStore";
+import {
+  assessHeadroom,
+  rotationReadiness,
+  exhaustionOutlook,
+  switchRecommendation,
+  describeRecommendation,
+  type Ceiling,
+  type Headroom,
+} from "../services/headroom";
 
 // Accounts settings screen for multi Claude Max account support (design spec
 // docs/superpowers/specs/2026-06-26-multi-max-account-design.md). Lists each registered Claude
@@ -35,7 +48,23 @@ import {
 // the nickname they typed — and shows an explicit not-signed-in state when nothing resolved.
 // Nothing here caps the number of accounts: add is a plain create-and-refresh loop, unbounded.
 
-const DEPS = { listAccounts, getUsage, getIdentities, addAccount, setNickname, removeAccount };
+const DEPS = {
+  listAccounts,
+  getUsage,
+  getIdentities,
+  // Per-account LEARNED ceilings. Without these the screen can show how accounts compare to EACH
+  // OTHER (the relative UsageBars) but never how close any of them is to its OWN limit — which is
+  // the number that decides whether rotation is about to matter.
+  listCeilings,
+  addAccount,
+  setNickname,
+  removeAccount,
+  // The spawn ledger read. Injectable like every other IO on this screen — without it the panel
+  // fell back to the real `invoke("accounts_spawn_log")` inside a component suite that mocks no
+  // Tauri bridge, so the call rejected, resolved to [] outside `act()` after the assertions had
+  // run, and the mount could not be asserted at all.
+  readSpawnLog,
+};
 export type AccountsDeps = typeof DEPS;
 
 export interface AccountsScreenProps {
@@ -46,6 +75,10 @@ export interface AccountsScreenProps {
   onLogin: (account: Account) => void | Promise<void>;
   /** IO overrides — defaults to the real accountStore functions. Injectable for tests. */
   deps?: Partial<AccountsDeps>;
+  /** The account agents are actually running under, for the runway warning (AC9). Omitted, it is
+   *  derived from `pickAccount` — the account a NEW spawn would land on right now — which is the
+   *  honest answer this screen can compute without importing the spawn path. */
+  currentAccountId?: string | null;
 }
 
 const fontStack = FONT_UI;
@@ -140,10 +173,195 @@ function UsageBar({
   );
 }
 
+/** Wall-clock time in the user's own locale ("8:20 PM"). One formatter, so the per-account line and
+ *  the all-exhausted banner can never quote the same instant two different ways. */
+function clockTime(epochMs: number): string {
+  return new Date(epochMs).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+}
+
 function exhaustedLabel(usage: Usage | undefined, now: number): string | null {
   if (!usage?.exhaustedUntil || usage.exhaustedUntil <= now) return null;
-  const d = new Date(usage.exhaustedUntil);
-  return `Exhausted until ${d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`;
+  return `Exhausted until ${clockTime(usage.exhaustedUntil)}`;
+}
+
+/** A bordered notice in one ink — the shape every banner on this screen takes. */
+function noticeCard(ink: string): CSSProperties {
+  return { ...card, borderColor: ink, color: ink, fontSize: 12, lineHeight: 1.5 };
+}
+
+/** How each headroom verdict reads and colours.
+ *
+ *  `unknown` is muted and says so IN WORDS. It must never borrow `ok`'s green or render as a
+ *  percentage: an account with too few observed limit episodes has no ceiling, and presenting that
+ *  as "0% used" would make the least-measured account look like the emptiest one. */
+const HEADROOM_TONE: Record<Headroom["state"], { ink: string; label: string }> = {
+  ok: { ink: C.successInk, label: "Room to spare" },
+  warn: { ink: C.amberInk, label: "Close to its limit" },
+  exhausted: { ink: C.dangerInk, label: "At its limit" },
+  unknown: { ink: C.muted, label: "Limit unknown" },
+};
+
+/** Where ONE account stands against its OWN learned ceiling — the per-account half of rotation
+ *  visibility. Distinct from {@link UsageBar}, which compares accounts to each other; this one
+ *  answers "how much room does this account have left", which is what decides when rotation bites.
+ *
+ *  With no ceiling learned yet it renders words and NO bar. A bar implies a denominator we do not
+ *  have, and either extreme of it would be a lie in one direction or the other. */
+function HeadroomLine({ headroom, accountId }: { headroom: Headroom; accountId: string }) {
+  const tone = HEADROOM_TONE[headroom.state];
+  const pct = headroom.fraction != null ? Math.round(headroom.fraction * 100) : null;
+  const actPct = Math.round(CEILING_AVOID_FRACTION * 100);
+  return (
+    <div data-testid={`account-headroom-${accountId}`} style={{ marginTop: 8, fontSize: 12 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 6, color: tone.ink }}>
+        <span style={{ fontWeight: 600 }}>{tone.label}</span>
+        {headroom.ceiling != null && pct != null && (
+          <span style={{ color: C.muted }}>
+            {fmtTokens(headroom.used)} of about {fmtTokens(headroom.ceiling)} · {pct}% of its usual
+            limit
+          </span>
+        )}
+      </div>
+      {headroom.ceiling == null ? (
+        <div style={{ color: C.muted, marginTop: 2 }}>
+          Not enough history to estimate a limit yet
+        </div>
+      ) : (
+        <>
+          <div
+            role="progressbar"
+            aria-label="Headroom against learned limit"
+            aria-valuenow={Math.min(100, pct ?? 0)}
+            aria-valuemin={0}
+            aria-valuemax={100}
+            style={{
+              height: 6,
+              borderRadius: 3,
+              background: C.deepForest,
+              border: `1px solid ${C.muted}`,
+              marginTop: 4,
+              overflow: "hidden",
+            }}
+          >
+            <div style={{ width: `${Math.min(100, pct ?? 0)}%`, height: "100%", background: tone.ink }} />
+          </div>
+          {/* The ACT line, not the WARN line. `CEILING_AVOID_FRACTION` is the fraction at which
+              auto-pick stops sending this account new work; `headroom.WARN_FRACTION` (0.8) is the
+              lower point at which the human is merely told. Two stages, one number each — imported
+              rather than typed out so the sentence cannot drift from the behaviour. */}
+          <div style={{ color: C.muted, marginTop: 2 }}>
+            Stops taking new agents at {actPct}% of that.
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/** THE HEADLINE OF THIS SCREEN: how many accounts can actually receive a spawn.
+ *
+ *  It exists because the count a user can SEE (rows in the list) is not the count that governs
+ *  rotation (distinct signed-in logins), and on the machine this was built for those numbers were 2
+ *  and 1. With a pool of one, `pickAccount` returns the same account every single time — rotation is
+ *  not failing, it is arithmetically impossible — and nothing on screen said so, so the visible
+ *  evidence supported exactly the wrong diagnosis.
+ *
+ *  Counting is delegated to {@link rotationReadiness}, which derives signed-in-ness from the same
+ *  predicate selection uses and sameness from the canonical grouping. This component only renders. */
+function RotationBanner({
+  readiness,
+  nameOf,
+  onAdd,
+}: {
+  readiness: ReturnType<typeof rotationReadiness>;
+  /** The VERIFIED identity for an account — never the nickname, which is user-typed and proves
+   *  nothing about which login a config dir holds. */
+  nameOf: (a: Account) => string;
+  onAdd: () => void;
+}) {
+  const n = readiness.usableLogins;
+  const rotates = n >= 2;
+  const ink = rotates ? C.successInk : C.dangerInk;
+  const Icon = n === 0 ? FiSlash : rotates ? FiRotateCw : FiAlertTriangle;
+
+  const headline =
+    n === 0
+      ? "No account is signed in."
+      : n === 1
+        ? "Only 1 account is signed in, so Sparkle has nothing to rotate to."
+        : `Rotation active — ${n} accounts available.`;
+
+  const body =
+    n === 0
+      ? "Agents will run on whatever your terminal is logged into. Sparkle has no account of its own to hand them."
+      : n === 1
+        ? `Every agent will run on ${nameOf(readiness.usable[0]!)} until it hits its limit. Sign in another account to enable rotation.`
+        : `New agents go to whichever of ${readiness.usable.map(nameOf).join(", ")} has the most room left.`;
+
+  // Registrations that are counted OUT, named one by one. This is the state that is invisible today:
+  // a config dir that was created but never signed into renders as an ordinary row, so two rows read
+  // as two accounts. Each sentence says which registration and WHY it doesn't count.
+  const excluded = [
+    ...readiness.notSignedIn.map(
+      (a) =>
+        `“${a.nickname}” is registered but has never been signed in, so it cannot receive agents.`,
+    ),
+    ...readiness.redundant.map(
+      (a) =>
+        `“${a.nickname}” is the same Claude login as another account, so they share one quota and count as one.`,
+    ),
+    ...readiness.noEmail.map(
+      (a) =>
+        `“${a.nickname}” has a Claude login with no readable email, so Sparkle cannot route agents to it.`,
+    ),
+  ];
+
+  return (
+    <div data-testid="rotation-banner" role="status" style={noticeCard(ink)}>
+      <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, fontWeight: 600 }}>
+        <Icon size={13} aria-hidden />
+        {headline}
+      </div>
+      <div style={{ marginTop: 4 }}>{body}</div>
+      {excluded.length > 0 && (
+        <ul style={{ margin: "6px 0 0", paddingLeft: 18 }}>
+          {excluded.map((line) => (
+            <li key={line}>{line}</li>
+          ))}
+        </ul>
+      )}
+      {!rotates && (
+        <button type="button" style={{ ...primaryBtn, marginTop: 8 }} onClick={onAdd}>
+          <FiUserPlus size={12} aria-hidden style={{ verticalAlign: "-1px", marginRight: 4 }} />
+          {n === 0 ? "Add an account" : "Add another account"}
+        </button>
+      )}
+    </div>
+  );
+}
+
+/** What a new Max account actually needs, in the order it happens. Four steps because the third one
+ *  — the browser `claude login` under the NEW config dir — is the one that gets skipped, and skipping
+ *  it leaves a registered row that looks exactly like a working account. */
+function AddAccountSteps() {
+  const steps = [
+    "Click “+ Add account” and give it a nickname (this is just a label for you).",
+    "Sparkle creates a separate Claude config folder for it. Your existing logins are untouched.",
+    "The sign-in window opens straight away — complete the normal Claude login in your browser. It signs in under the new folder, so it does not replace your other accounts.",
+    "The row then shows the email you signed in as. If it still reads “Not signed in”, the login never finished — click “Finish sign-in” on that row.",
+  ];
+  return (
+    <div style={{ ...card, fontSize: 12, color: C.muted, lineHeight: 1.5 }}>
+      <div style={{ fontWeight: 600, color: C.cream }}>Adding a Claude account takes two minutes</div>
+      <ol data-testid="add-account-steps" style={{ margin: "6px 0 0", paddingLeft: 18 }}>
+        {steps.map((s) => (
+          <li key={s} style={{ marginTop: 2 }}>
+            {s}
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
 }
 
 /** Whether this account has a real Claude login. Derived from accountUuid OR email: the Rust
@@ -171,10 +389,13 @@ function isSignedIn(identity: Identity | undefined): boolean {
  *  belongs there, beside `NOT_SIGNED_IN`, and both callers should defer to it. */
 export const SIGNED_IN_NO_EMAIL = "Signed in — no email on this login";
 
-export function AccountsScreen({ onLogin, deps }: AccountsScreenProps) {
+export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScreenProps) {
   const io: AccountsDeps = { ...DEPS, ...deps };
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [usage, setUsage] = useState<Usage[]>([]);
+  // Learned per-account ceilings. Empty is a valid state and means "unknown for every account",
+  // which the headroom line says in words rather than rendering as 0%.
+  const [ceilings, setCeilings] = useState<Ceiling[]>([]);
   // Real authenticated identity (email + org) per account id — the trustworthy label read from each
   // account's own .claude.json oauthAccount. The nickname is only a secondary alias.
   const [identities, setIdentities] = useState<Identity[]>([]);
@@ -202,17 +423,28 @@ export function AccountsScreen({ onLogin, deps }: AccountsScreenProps) {
   const listAccountsFn = deps?.listAccounts ?? DEPS.listAccounts;
   const getUsageFn = deps?.getUsage ?? DEPS.getUsage;
   const getIdentitiesFn = deps?.getIdentities ?? DEPS.getIdentities;
+  const listCeilingsFn = deps?.listCeilings ?? DEPS.listCeilings;
   const refresh = useCallback(async () => {
     setError(null);
     try {
-      const [a, u, ids] = await Promise.all([listAccountsFn(), getUsageFn(), getIdentitiesFn()]);
+      const [a, u, ids, cs] = await Promise.all([
+        listAccountsFn(),
+        getUsageFn(),
+        getIdentitiesFn(),
+        // Ceilings are an ENRICHMENT, not a prerequisite: they add the "% of its own limit" numbers.
+        // Sharing the rejection path with `listAccounts` would let a backend that cannot answer
+        // `accounts_ceilings` blank the entire account list — trading a missing percentage for a
+        // screen that shows no accounts at all. Degrade to "unknown" per account instead.
+        listCeilingsFn().catch(() => [] as Ceiling[]),
+      ]);
       setAccounts(a);
       setUsage(u);
       setIdentities(ids);
+      setCeilings(cs);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load accounts");
     }
-  }, [listAccountsFn, getUsageFn, getIdentitiesFn]);
+  }, [listAccountsFn, getUsageFn, getIdentitiesFn, listCeilingsFn]);
 
   useEffect(() => {
     void refresh();
@@ -230,6 +462,49 @@ export function AccountsScreen({ onLogin, deps }: AccountsScreenProps) {
   // (= most headroom). Floor at 1 so an all-zero set divides cleanly to empty bars, not NaN.
   const peak5h = Math.max(1, ...usage.map((u) => u.tokens5h));
   const peak7d = Math.max(1, ...usage.map((u) => u.tokens7d));
+
+  // ── Rotation visibility ─────────────────────────────────────────────────────────────────────
+  // Every number below is DERIVED from the same pure policy the spawn path uses. Nothing here
+  // decides anything; it reports what selection is already doing, which is the entire point — the
+  // bug was never that selection was wrong, it was that its input pool was invisible.
+  const displayFor = (a: Account) => accountDisplay(a, identityFor(a.id));
+  const readiness = rotationReadiness(accounts, identities);
+  const headroomById = new Map(assessHeadroom(usage, ceilings, now).map((h) => [h.accountId, h]));
+  const outlook = exhaustionOutlook(
+    readiness.usable.map((a) => a.id),
+    usage,
+    ceilings,
+    now,
+  );
+  // AC9 — the runway warning, raised BEFORE the wall.
+  //
+  // WHICH ACCOUNT(S) TO WARN ABOUT. An integrator that knows the fleet's real account names it via
+  // `currentAccountId` and only that one is judged. Absent that, this screen warns about EVERY
+  // account in the rotation pool that is running out — deliberately NOT about `pickAccount`'s
+  // answer, which was the first cut and is unreachable by construction: `pickAccount` returns the
+  // HEALTHIEST account, so it is never the one approaching its ceiling, and a warning keyed on it
+  // could only ever fire in the all-bad fallback that AC8's banner already covers. The pool is what
+  // agents actually run on over time, so the pool is what has runway.
+  const runwayIds = currentAccountId ? [currentAccountId] : readiness.usable.map((a) => a.id);
+  const runways = runwayIds
+    .map((id) => ({
+      account: accounts.find((a) => a.id === id),
+      headroom: headroomById.get(id),
+      // `switchRecommendation` + `describeRecommendation` ARE the policy and the sentence. This
+      // screen does not get a second opinion about either.
+      recommendation: switchRecommendation(id, accounts, usage, ceilings, identities, now),
+    }))
+    .filter(
+      (r) =>
+        r.account != null &&
+        (r.recommendation != null ||
+          // The no-target case: running out with nowhere to move. NOT a switch recommendation —
+          // there is nothing to recommend — so it cannot come from the formatter, but staying silent
+          // about it is exactly the founder's blind spot. Suppressed when AC8's banner is already
+          // saying the same thing about the whole pool.
+          (!outlook.allAtLimit &&
+            (r.headroom?.state === "warn" || r.headroom?.state === "exhausted"))),
+    );
 
   async function handleAdd() {
     const nickname = newName.trim();
@@ -323,11 +598,70 @@ export function AccountsScreen({ onLogin, deps }: AccountsScreenProps) {
         )}
       </div>
 
+      {/* THE GLANCE. How many accounts can actually receive a spawn, and what that means — stated
+          before anything else on the screen, because the row count is not that number. */}
+      <RotationBanner
+        readiness={readiness}
+        nameOf={(a) => displayFor(a).primary}
+        onAdd={() => setAdding(true)}
+      />
+
+      {/* AC8 — every usable account is out of room. Deliberately does NOT claim spawns are blocked:
+          `pickAccount` still returns a least-bad account rather than refusing, so promising a block
+          would be false, and so would implying everything is fine. */}
+      {outlook.allAtLimit && (
+        <div data-testid="all-at-limit-banner" role="alert" style={noticeCard(C.dangerInk)}>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, fontWeight: 600 }}>
+            <FiAlertTriangle size={13} aria-hidden />
+            {readiness.usableLogins === 1
+              ? "Your only signed-in account is at its limit."
+              : "All accounts are at their limit."}
+            {outlook.earliestReset != null
+              ? readiness.usableLogins === 1
+                ? ` It frees up at ${clockTime(outlook.earliestReset)}.`
+                : ` The first frees up at ${clockTime(outlook.earliestReset)}.`
+              : " No reset time has been reported yet."}
+          </div>
+          <div style={{ marginTop: 4 }}>
+            Sparkle keeps spawning — new agents go to the least-bad account — so work carries on, but
+            it may hit the wall straight away.
+          </div>
+        </div>
+      )}
+
+      {/* AC9 — the runway warning, BEFORE the wall. Where a target exists the sentence is
+          `describeRecommendation`'s, not a second copy of that policy written here. */}
+      {runways.map((r) => (
+        <div
+          key={r.account!.id}
+          data-testid={`runway-warning-${r.account!.id}`}
+          role="alert"
+          style={noticeCard(C.amberInk)}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <FiAlertTriangle size={13} aria-hidden />
+            {r.recommendation ? (
+              describeRecommendation(r.recommendation, displayFor)
+            ) : (
+              <span>
+                {displayFor(r.account!).primary}
+                {r.headroom?.fraction != null
+                  ? ` is at ${Math.round(r.headroom.fraction * 100)}% of its usual limit`
+                  : " has hit its limit"}
+                , and there is no other signed-in account to move to.
+              </span>
+            )}
+          </div>
+        </div>
+      ))}
+
       <p style={{ fontSize: 12, color: C.muted, marginTop: 0, lineHeight: 1.4 }}>
         Each account is a separate Claude login. New jobs run under the least-used account. Bars
         show each account&apos;s usage relative to your busiest one. Sparkle never sees your Claude
         credentials.
       </p>
+
+      <AddAccountSteps />
 
       {adding && (
         <div style={{ ...card, display: "flex", gap: 8, alignItems: "center" }}>
@@ -468,7 +802,11 @@ export function AccountsScreen({ onLogin, deps }: AccountsScreenProps) {
                   that was never signed into — or two that turned out to hold the SAME login — had no
                   route to a fix but delete-and-recreate. Highlighted for a duplicate, since
                   re-logging one of the pair into a different account is exactly the remedy. */}
+              {/* SIGNED-IN accounts only. An account with no login gets its one affordance from the
+                  loud block below instead — rendering "Finish sign-in" twice in one card would be
+                  noise, and an ambiguous target for a test. */}
               {!isEditing &&
+                signedIn &&
                 // The DEFAULT account's config dir is the user's real `~/.claude` (registered by
                 // reference, never copied — which is also why the Rust side refuses to delete it).
                 // Re-logging it in therefore replaces the login used by `claude` EVERYWHERE on this
@@ -486,7 +824,7 @@ export function AccountsScreen({ onLogin, deps }: AccountsScreenProps) {
                     // Scope named, not overstated — see AccountLoginModal (knightwatch probe 3).
                     title={`Changes the Claude login Sparkle uses for the default account (${a.configDir || "~/.claude.json"}).`}
                   >
-                    {isSignedIn(identity) ? "Switch login" : "Log in"}
+                    Switch login
                   </button>
                 ) : a.isDefault ? (
                   <>
@@ -514,13 +852,9 @@ export function AccountsScreen({ onLogin, deps }: AccountsScreenProps) {
                         : smallBtn
                     }
                     onClick={() => void handleLogin(a)}
-                    title={
-                      isSignedIn(identity)
-                        ? `Currently ${identity?.email ?? "signed in"}. Logging in again lets you point this account at a different Claude login.`
-                        : "Log this account into Claude"
-                    }
+                    title={`Currently ${identity?.email ?? "signed in"}. Logging in again lets you point this account at a different Claude login.`}
                   >
-                    {isSignedIn(identity) ? "Switch login" : "Log in"}
+                    Switch login
                   </button>
                 ))}
               {!isEditing && (
@@ -564,11 +898,72 @@ export function AccountsScreen({ onLogin, deps }: AccountsScreenProps) {
               </div>
             )}
 
+            {/* An account with no login at all is BROKEN, not merely unconfigured, and it must read
+                that way: it is a row that looks exactly like a working account while being unable to
+                receive a single agent. That resemblance is what let a never-signed-in registration
+                pass for a second Max account on the founder's machine. */}
+            {!signedIn && (
+              <div
+                data-testid={`account-blocked-${a.id}`}
+                style={{
+                  marginTop: 8,
+                  padding: 8,
+                  borderRadius: 6,
+                  border: `1px solid ${C.dangerInk}`,
+                  color: C.dangerInk,
+                  fontSize: 12,
+                  lineHeight: 1.5,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  flexWrap: "wrap",
+                }}
+              >
+                <FiSlash size={13} aria-hidden />
+                <span style={{ flex: 1, minWidth: 160 }}>
+                  <strong>Not signed in — this account cannot receive agents.</strong> Its config
+                  folder exists, but no Claude login was ever completed in it.
+                </span>
+                <button
+                  type="button"
+                  style={{ ...primaryBtn, borderColor: C.dangerInk, background: C.dangerInk }}
+                  onClick={() => void handleLogin(a)}
+                >
+                  Finish sign-in
+                </button>
+              </div>
+            )}
+
+            {/* Where this account stands against its OWN learned ceiling. An account with no usage
+                row yet has nothing measured — rendered as "unknown", never as 0%. */}
+            <HeadroomLine
+              accountId={a.id}
+              headroom={
+                headroomById.get(a.id) ?? {
+                  accountId: a.id,
+                  used: 0,
+                  ceiling: null,
+                  fraction: null,
+                  state: "unknown",
+                }
+              }
+            />
+
             <UsageBar label="5-hour window" tokens={u?.tokens5h ?? 0} peakTokens={peak5h} />
             <UsageBar label="7-day window" tokens={u?.tokens7d ?? 0} peakTokens={peak7d} />
           </div>
         );
       })}
+
+      {/* The RETROSPECTIVE half of rotation. Everything above says what Sparkle will do next; this
+          says what it actually did — which account each recent agent ran under, read from the
+          on-disk ledger. Both halves are needed: the state above cannot be checked after the fact,
+          and being told rotation "landed" twice with nothing to look at is what made it necessary. */}
+      {accounts.length > 0 && (
+        <div style={{ marginTop: 14 }}>
+          <AccountSpawnLog read={io.readSpawnLog} />
+        </div>
+      )}
     </div>
   );
 }
