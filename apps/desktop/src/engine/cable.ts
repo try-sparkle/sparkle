@@ -100,9 +100,25 @@ export function isBuildAgentRow(target: EventTarget | null): boolean {
   return target instanceof Element && target.closest(BUILD_ROW_SELECTOR) != null;
 }
 
+/** A PERSON row in the Chat block (components/ChatSection), matched the same structural way and for
+ *  the same reason: `role="treeitem"` inside the container the sidebar already publishes.
+ *
+ *  IT IS A SECOND SELECTOR RATHER THAN A WIDENING OF `BUILD_ROW_SELECTOR`, and that is the whole
+ *  point of it. A person row must be a CIRCUIT member — clicking one while wired must not drop the
+ *  cable, exactly as clicking a build row does not — so it belongs in {@link CIRCUIT_SELECTOR}. It
+ *  must NOT become a build agent row: `isBuildAgentRow` answers "did the user press a row that owns
+ *  an agent", which is a different question with different consumers, and a human is not an agent.
+ *  Folding the two would make every caller of that predicate quietly wrong about people.
+ *
+ *  The chat rows live in their OWN tree (`aria-label="Chats"`) because the build tree's roving
+ *  tabstop and ArrowDown ring are keyed on `AgentTab`; scoping to `[data-chat-tree]` is what keeps
+ *  the two selectors disjoint by construction rather than by convention. */
+export const CHAT_ROW_SELECTOR = '[data-chat-tree] [role="treeitem"]';
+
 /** Everything that is PART OF the live circuit, and therefore cannot be a press that leaves it. */
 export const CIRCUIT_SELECTOR = [
   BUILD_ROW_SELECTOR, // the rows — this is how you patch, not how you unbind
+  CHAT_ROW_SELECTOR, // a person is a row you patch into too; see the selector's own note
   "[data-concierge-root]", // Sparkle itself: the whole point of being wired is to talk to it
   '[data-pair][data-wired-pair="true"]', // the patched pair's own build column and terminal
   // PORTALLED SURFACES. The three above are found by DOM ANCESTRY (`closest`), and the surfaces

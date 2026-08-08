@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type ComponentType } from "react";
-import { FiZap, FiBell, FiCreditCard, FiEye, FiCpu, FiUsers, FiSliders, FiX, FiCommand, FiSmartphone, FiMic, FiTool, FiSearch, FiCheckCircle, FiCloud, FiLock, FiTrendingUp, FiShield, FiMessageSquare, FiBookOpen } from "react-icons/fi";
+import { FiZap, FiBell, FiCreditCard, FiEye, FiCpu, FiUsers, FiSliders, FiX, FiCommand, FiSmartphone, FiMic, FiTool, FiSearch, FiCheckCircle, FiCloud, FiLock, FiTrendingUp, FiShield, FiMessageSquare, FiMessageCircle, FiBookOpen } from "react-icons/fi";
 import { C, MODAL_SHADOW, ROW_ACTIVE_BUBBLE, SCRIM } from "../theme/colors";
 import { FONT_MONO, FONT_UI, LABEL, RADIUS, TYPE, WEIGHT } from "../theme/scale";
 import { openSignIn, signOut } from "../services/sparkleApi";
@@ -31,6 +31,7 @@ import { ConciergeGuidelinesPane } from "./ConciergeGuidelinesPane";
 import { CloudAuthPane } from "./CloudAuthPane";
 import { OnePasswordPane } from "./OnePasswordPane";
 import { ChiefPane } from "./ChiefPane";
+import { SettingsChatPane } from "./SettingsChatPane";
 import { useSettingsStore } from "../stores/settingsStore";
 
 // The ⋯ settings dialog. A focused, centered dialog with a left rail of categories driving a
@@ -95,6 +96,11 @@ const CATEGORIES: Category[] = [
   { id: "shortcuts", label: "Shortcuts", Icon: FiCommand, blurb: "Rebind keyboard shortcuts. Tap a modifier or press a combo.", keywords: ["keyboard keybindings hotkeys"] },
   { id: "workers", label: "Workers", Icon: FiCpu, blurb: "How many agents an orchestrator runs in parallel.", keywords: ["concurrency parallel agents"] },
   { id: "accounts", label: "Accounts", Icon: FiUsers, blurb: "Your Sparkle and Claude accounts.", keywords: ["sign in sign out claude sparkle login install id crash report support"] },
+  // ITS OWN CATEGORY, NOT A SECTION OF ACCOUNTS (design §10). The rail is searchable and the three
+  // words a person actually types — "username", "discoverable", "availability" — have to resolve
+  // somewhere; Accounts' keywords are every sign-in word and none of these. Accounts is also
+  // already the junk drawer (Sparkle account + Claude cloud accounts + the install id).
+  { id: "chat", label: "Chat", Icon: FiMessageCircle, blurb: "Your username, and who can see that you’re available to chat.", keywords: ["username handle discoverable availability visibility online status social people connect direct message dm chat profile"] },
   { id: "cloudauth", label: "Claude auth for cloud agents", Icon: FiCloud, blurb: "The Claude credential your cloud agents run with. Stored encrypted; never shown again.", keywords: ["cloud agents anthropic api key byok subscription setup-token credential sandbox"] },
   { id: "onepassword", label: "1Password", Icon: FiLock, blurb: "Back your .env files up to a vault, and restore them into fresh agent worktrees.", keywords: ["1password onepassword op cli env dotenv secrets vault backup restore seed worktree"] },
   { id: "chief", label: "Chief", Icon: FiBookOpen, blurb: "Which Chief library each project's docs are sent to, and whether they are arriving.", keywords: ["chief storytell think library markdown prd docs sync link relink project assets"] },
@@ -105,6 +111,45 @@ const CATEGORIES: Category[] = [
   { id: "conciergevoice", label: "How Sparkle talks to you", Icon: FiMessageSquare, blurb: "Rules Sparkle follows when it writes to you. It adds to these itself as you state preferences.", keywords: ["concierge guidelines communication style tone preferences rules markdown how sparkle talks writes voice"] },
   { id: "advanced", label: "Advanced", Icon: FiSliders, blurb: "Edit the configuration file directly.", keywords: ["config toml file raw editor"] },
 ];
+
+/**
+ * THE DECOUPLING EVENT: "open Settings on the Chat pane", from anywhere.
+ *
+ * A plain `window` CustomEvent rather than an import, because the two producers — the `[+]` on the
+ * Chat section (`openSettings("chat")` when you have no username yet) and the avatar button — live
+ * in files that must not take a dependency on this dialog, and this dialog must not take one on
+ * them. The string IS the contract; the constant exists so the tests and any future producer in
+ * this file spell it the same way.
+ */
+export const OPEN_SOCIAL_SETTINGS_EVENT = "sparkle:open-social-settings";
+
+/**
+ * Install the one listener for {@link OPEN_SOCIAL_SETTINGS_EVENT}. Returns a disposer.
+ *
+ * ══ WHY MODULE SCOPE AND NOT A `useEffect` IN THE COMPONENT ════════════════════════════════════
+ * Because the dialog is CONDITIONALLY MOUNTED. `KebabMenu` renders `<SettingsDialog/>` only while
+ * `settingsVisible`, so a listener living inside the component is registered exactly when the
+ * dialog is already open — i.e. never in the case this event exists for, which is "the user has no
+ * username yet, Settings is CLOSED, and the `[+]` needs to open it here". A listener that cannot
+ * fire in its only real case is a dead one, and it would test green: the test mounts the dialog.
+ *
+ * So it hangs off the module, which `KebabMenu` imports statically, and it routes through the
+ * SAME deep-open seam every other producer uses (`uiStore.openSettings`) rather than reaching into
+ * this component's state. That one route covers both cases at once: closed → `settingsRequest`
+ * makes it visible and seeds `initialCategory`; already open → `initialCategory` changes and the
+ * effect above follows it.
+ *
+ * The disposer is what an extra installation (a test) uses to unregister itself again; nothing in
+ * production removes the module-scope one, because it lives exactly as long as the window does.
+ */
+export function installOpenSocialSettingsListener(): () => void {
+  if (typeof window === "undefined") return () => {};
+  const onOpen = () => useUiStore.getState().openSettings("chat");
+  window.addEventListener(OPEN_SOCIAL_SETTINGS_EVENT, onOpen);
+  return () => window.removeEventListener(OPEN_SOCIAL_SETTINGS_EVENT, onOpen);
+}
+
+installOpenSocialSettingsListener();
 
 export interface SettingsDialogProps {
   /** Close the dialog (backdrop click, the ✕, or Escape — Escape is wired by the caller). */
@@ -282,6 +327,8 @@ function PaneBody({
       return <WorkerLimitControl />;
     case "accounts":
       return <AccountsPane onManageAccounts={onManageAccounts} />;
+    case "chat":
+      return <SettingsChatPane />;
     case "cloudauth":
       return <CloudAuthPane />;
     case "onepassword":

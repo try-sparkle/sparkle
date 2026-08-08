@@ -50,6 +50,10 @@ export type CategoryId =
   | "shortcuts"
   | "workers"
   | "accounts"
+  // Social Coding's own category (§10) — deliberately NOT part of "accounts", which is already the
+  // junk drawer and whose search keywords are all sign-in words. `openSettings("chat")` is the
+  // deep-open seam the `[+]` on the Chat section and the avatar button both take.
+  | "chat"
   | "cloudauth"
   | "onepassword"
   | "chief"

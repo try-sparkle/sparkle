@@ -1117,6 +1117,7 @@ const SETTINGS_PANES: Record<CategoryId, true> = {
   shortcuts: true,
   workers: true,
   accounts: true,
+  chat: true,
   cloudauth: true,
   onepassword: true,
   chief: true,

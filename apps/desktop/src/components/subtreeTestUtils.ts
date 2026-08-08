@@ -35,8 +35,24 @@ export function childRowOf(headId: string, name: string): boolean {
 export const subtreeGroupExists = (headId: string): boolean =>
   document.querySelector(`#${subtreeDomIdFor(headId)}`) !== null;
 
-/** The containers `strayTreeChildren` will ACTUALLY inspect: the tree plus every `role="group"`
- *  inside it, minus anything hidden from the accessibility tree.
+/** THE BUILD AGENTS TREE, named rather than "the first `[role=tree]` in the document".
+ *
+ *  THE SIDEBAR NOW RENDERS MORE THAN ONE TREE. The Chat block (`components/ChatSection`) publishes
+ *  its own `<div role="tree" aria-label="Chats" data-chat-tree>` ABOVE the stage ladder — a separate
+ *  tree on purpose, since the build tree's `tabStopId` / `renderedRowIds` / ArrowDown ring are all
+ *  keyed on `AgentTab`. So a bare `querySelector('[role="tree"]')` stopped answering the question
+ *  these probes ask: it returned the CHAT tree, which owns no `role="group"` at all, and
+ *  `treeContainerCount()` collapsed to 1 while `strayTreeChildren()` inspected the wrong subtree
+ *  entirely and reported `[]` — a probe looking at nothing, dressed as a pass. The positive control
+ *  is what caught it, which is precisely what it is for.
+ *
+ *  `[data-agent-tree]` is the build tree's own marker — the same one `engine/cable.ts`'s
+ *  `BUILD_ROW_SELECTOR` keys on — so this names the tree by identity rather than by document order,
+ *  and a fourth tree appearing above it cannot silently retarget these probes again. */
+export const buildTree = (): Element | null => document.querySelector('[data-agent-tree][role="tree"]');
+
+/** The containers `strayTreeChildren` will ACTUALLY inspect: the build tree plus every
+ *  `role="group"` inside it, minus anything hidden from the accessibility tree.
  *
  *  Exported so the probe and its positive control share ONE definition of "examined". They used to
  *  disagree: the control counted the unfiltered candidate set, so if `aria-hidden="true"` landed on
@@ -54,7 +70,7 @@ export const subtreeGroupExists = (headId: string): boolean =>
  *    * the test is `=== "true"`, not `!== null`. `aria-hidden="false"` IS exposed to the a11y tree,
  *      so treating any present attribute as hidden would skip a real violation. */
 export function examinedTreeContainers(): Element[] {
-  const tree = document.querySelector('[role="tree"]');
+  const tree = buildTree();
   if (!tree) return [];
   const hidden = (el: Element): boolean => {
     for (let cur: Element | null = el; cur && cur !== tree; cur = cur.parentElement) {
@@ -80,7 +96,7 @@ export function examinedTreeContainers(): Element[] {
  *  exist.
  */
 export function strayTreeChildren(): string[] {
-  if (!document.querySelector('[role="tree"]')) return ["<no [role=tree] in the document>"];
+  if (!buildTree()) return ["<no [data-agent-tree][role=tree] in the document>"];
   const containers = examinedTreeContainers();
   const hiddenChild = (el: Element) => el.getAttribute("aria-hidden") === "true";
   return containers

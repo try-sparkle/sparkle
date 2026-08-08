@@ -97,7 +97,13 @@ describe("the concierge header is ONE row", () => {
       // control and listed one fewer (roborev 54712). `enableAiEnhancementsForTests` seeds a `me` with no
       // name or email, so `authIdentity` resolves to null and the signed-in control names itself
       // "Account". It is the other half of the `ConciergeTopRight` cluster and has to be IN the row.
-      screen.getByRole("button", { name: "Account" }),
+      //
+      // The name now carries the user's own AVAILABILITY too ("Account — Offline"), because the
+      // avatar gained the self availability dot with Social Coding and a button takes its accessible
+      // name from its label rather than its contents — so without the word repeated onto the button,
+      // the dot would be colour and nothing else. Matched by prefix here: this test is about WHICH
+      // controls are in the row, and AuthStatusButton.test.tsx owns the exact wording.
+      screen.getByRole("button", { name: /^Account\b/ }),
       screen.getByRole("button", { name: "Settings" }),
     ]) {
       expect(h.contains(el), `${el.tagName} is not in the header row`).toBe(true);

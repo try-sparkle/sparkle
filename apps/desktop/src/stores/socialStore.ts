@@ -103,8 +103,59 @@ interface SocialState {
   outgoing: readonly ConnectionRequest[];
   /** Unread message count per `socialId`. Absent = zero. */
   unread: Record<string, number>;
+  /**
+   * Has a roster read ever SUCCEEDED this session?
+   *
+   * It exists because `people` being empty answers two completely different questions with the same
+   * value: "the directory really is empty" and "we have never managed to read it". Those diverge
+   * constantly — the first pass has not returned, the account has no handle yet so every
+   * `/social/*` path 404s, a 5xx or an offline pass left the previous (empty) roster in place — and
+   * a surface that narrates the first when the second is true is asserting a fact it does not hold.
+   * `setPeople` is the only writer, so this cannot drift from the data it describes.
+   */
+  rosterLoaded: boolean;
+  /**
+   * Has YOUR OWN profile been read back this session?
+   *
+   * The sibling of {@link rosterLoaded}, and it exists for the same reason: `me.username` is `null`
+   * both for "you have no social identity" and for "we have not read your profile yet" (and for
+   * "the read failed"). Those are opposite instructions to give a user — the first should be told
+   * to pick a username, the second must be told nothing at all — so a surface that reads only
+   * `username == null` will tell an already-registered user to go and register. `setMyProfile` is
+   * the only writer and it runs only on a successful read.
+   */
+  profileLoaded: boolean;
+
+  /**
+   * True once the SERVER has accepted a visibility in this session — i.e. once `me.visibility`
+   * stopped being the fail-closed default and became a fact.
+   *
+   * IT LIVES HERE, BESIDE THE VALUE IT QUALIFIES, AND NOT IN THE PANE THAT SETS IT. Two reasons,
+   * and the second is the one that made a component-local flag actually wrong rather than merely
+   * untidy:
+   *
+   *   • LIFETIME. `SettingsDialog` mounts only the ACTIVE pane and is itself conditionally
+   *     rendered, so the Chat pane remounts on every rail click. A `useState` flag resets there
+   *     while `me.visibility` — which outlives the pane — does not, so the pane would re-paint its
+   *     "this Mac may not know your setting" caveat over a value the server confirmed a moment ago
+   *     (roborev 60432).
+   *   • IDENTITY. This is a fact about a PERSON, and per-human state surviving a sign-out is a
+   *     recurring leak in this app. Here it cannot: {@link SocialState.reset} restores `INITIAL`,
+   *     which clears this with everything else. A module-level flag in a component file would have
+   *     the right lifetime for the first reason and the wrong one for this.
+   *
+   * FALSE means "not confirmed in this session", NEVER "unavailable" — nothing hydrates `me` from
+   * the server yet (`socialApi` has no `/me` read), so a returning user starts false with a
+   * server-side visibility that may be anything.
+   */
+  visibilityConfirmed: boolean;
 
   setMyProfile: (patch: Partial<MyProfile>) => void;
+  /** Record a visibility the server ACCEPTED: writes the value and raises
+   *  {@link SocialState.visibilityConfirmed}. One action rather than two calls, so a caller cannot
+   *  store the value while leaving it marked unconfirmed (or the reverse). Never call this for a
+   *  visibility the user merely picked — a 2xx is what it means. */
+  confirmVisibility: (visibility: Visibility) => void;
   /** Replace the whole roster (a directory/connections refetch). Availability defaults to `offline`
    *  for anyone the payload does not carry one for — the fail-CLOSED direction: never assert a peer
    *  is reachable on missing evidence. See {@link IncomingPerson} for why that can happen at all. */
@@ -129,16 +180,25 @@ interface SocialState {
 
 const INITIAL = {
   me: EMPTY_PROFILE,
+  visibilityConfirmed: false,
   people: NO_PEOPLE as Record<string, Person>,
   incoming: NO_REQUESTS,
   outgoing: NO_REQUESTS,
   unread: {} as Record<string, number>,
+  rosterLoaded: false,
+  profileLoaded: false,
 };
 
 export const useSocialStore = create<SocialState>((set) => ({
   ...INITIAL,
 
-  setMyProfile: (patch) => set((s) => ({ me: { ...s.me, ...patch } })),
+  // Reaching here IS the evidence the profile was read — `socialSync` calls this only on a
+  // successful `getMyProfile`, so `profileLoaded` cannot claim a read that did not happen. See the
+  // field's docstring for why `me.username == null` alone is not enough to tell a user anything.
+  setMyProfile: (patch) => set((s) => ({ me: { ...s.me, ...patch }, profileLoaded: true })),
+
+  confirmVisibility: (visibility) =>
+    set((s) => ({ me: { ...s.me, visibility }, visibilityConfirmed: true })),
 
   setPeople: (people) =>
     set(() => ({
@@ -148,6 +208,11 @@ export const useSocialStore = create<SocialState>((set) => ({
           { ...p, availability: p.availability ?? DEFAULT_AVAILABILITY },
         ]),
       ),
+      // Reaching here IS the evidence: `socialSync` calls this once per COMPLETE pass and never on
+      // a failed one, so marking it here rather than asking the caller to remember means the flag
+      // cannot claim a load that did not happen. An empty `people` with this true is the honest
+      // "we looked, there is nobody" — the state the roster alone cannot express.
+      rosterLoaded: true,
     })),
 
   upsertPerson: (patch) =>
@@ -236,6 +301,24 @@ function availabilityRank(availability: Availability): number {
 /** Everyone with a row, ordered the way the column paints them: available first (the people you can
  *  actually reach right now), then by display name, case-insensitively. Ties broken on `username`
  *  so the order is total and cannot flap between renders. */
+/**
+ * The people the Chat column LISTS — everyone but you.
+ *
+ * `socialSync` puts your own row in `people` (relationship `"self"`) deliberately: it is a real
+ * member of the roster, it feeds {@link roster} so `@`-mentioning yourself resolves, and it is the
+ * one row that exists for a solo user. But it must not be LISTED, for two reasons that point the
+ * same way. A row you click to open a chat with yourself is not a thing the founder asked for — the
+ * self view is the dot on your own avatar in `AuthStatusButton`, which is where U4 put it. And
+ * because the self row is pushed unconditionally, counting it makes `rows.length === 0` unreachable
+ * in the shipping app, so the entire empty state — and the "No one **else** has joined yet" line
+ * that already presumes this filter — became dead copy the moment the server went live. That was
+ * roborev 60423: a flag, a comment and four tests asserting a state no production writer could
+ * produce.
+ */
+export function otherPeopleList(people: Record<string, Person>): Person[] {
+  return peopleList(people).filter((p) => p.relationship !== "self");
+}
+
 export function peopleList(people: Record<string, Person>): Person[] {
   return Object.values(people).sort(
     (a, b) =>

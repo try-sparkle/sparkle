@@ -173,7 +173,12 @@ pub struct Me {
     /// (`public` | `connections` | `unavailable`, defaulting to unavailable — social is opt-in);
     /// `social_enabled` is a SINGLE COMPUTED BOOLEAN, never the underlying per-account grant.
     /// All `#[serde(default)]` so an older orchestration server that predates them still
-    /// deserializes; absent reads as "no identity, feature off", which hides every social surface.
+    /// deserializes. `social_enabled` is then OMITTED rather than sent as `null`, so JS reads a
+    /// plain `undefined` — and the JS side treats that as THREE-VALUED, not as false: `true` is
+    /// live, `false` is an affirmative revocation that hides the surface, and ABSENT means only
+    /// "older server" and does NOT gate anything. See `services/entitlement.ts`'s `socialEnabled`
+    /// docstring, which is the authority; absent is production's current state, so collapsing it
+    /// onto `false` would hide the feature on every build.
     #[serde(default)]
     username: Option<String>,
     #[serde(default)]
@@ -904,8 +909,10 @@ mod tests {
         assert_eq!(out["socialEnabled"], true);
 
         // An older orchestration server that predates the fields must still deserialize, and
-        // `socialEnabled` must be OMITTED (not null) so JS reads a plain `undefined` ⇒ gated off,
-        // hiding every social surface.
+        // `socialEnabled` must be OMITTED (not null) so JS reads a plain `undefined`. Absent is
+        // NOT "gated off": the JS reading is three-valued and absent means "older server, do not
+        // gate" (see the field's docstring above). What this pins is only that the key does not
+        // appear — `null` would be a third wire shape the JS side would have to disambiguate.
         let old: Me = serde_json::from_str(
             r#"{"clerkUserId":"u1","entitled":true,"balanceCents":100,"tokenVersion":1}"#,
         )

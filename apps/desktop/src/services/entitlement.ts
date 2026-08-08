@@ -64,10 +64,29 @@ export interface Me {
    *  from liveness (is a socket open right now) — a user is routinely public AND offline. Absent
    *  reads as `unavailable`, since social is opt-in and nobody becomes discoverable by upgrading. */
   visibility?: string | null;
-  /** Whether this account may use Social Coding — a single server-computed boolean folding the
-   *  global kill switch and the per-account state together. Absent (an older server, or the flag
-   *  off) reads as FALSE everywhere, which hides every social surface. Never infer it from
-   *  `username` being set: an account can hold a handle and still be cut off. */
+  /**
+   * Whether this account may use Social Coding — a single server-computed boolean folding the
+   * global kill switch and the per-account state together.
+   *
+   * ⚠️ **READ IT AS THREE-VALUED, NOT AS A BOOLEAN.** This docstring is the single authority every
+   * social surface cites, and the distinction is load-bearing:
+   *
+   *   • `true`    — live for this account. Render everything.
+   *   • `false`   — an AFFIRMATIVE no: the kill switch is off or this account is revoked. HIDE the
+   *                 surface.
+   *   • `absent`  — the server predates the field. **Do NOT gate on this.** Render, and say the
+   *                 feature is not switched on yet if you must say anything.
+   *
+   * **So never write `if (!socialEnabled)`.** That truthiness check collapses `false` and absent
+   * into one answer, and absent is the state of PRODUCTION today — orchestration was last deployed
+   * before this feature existed, so `/me` omits the key for every user. A surface gated that way
+   * hides itself on every build until the deploy lands, which is precisely the bug that produced
+   * "I don't see that in the build". `components/ChatSection.tsx` is the worked example and
+   * `ChatSection.socialEnabled.test.tsx` pins both directions.
+   *
+   * Never infer it from `username` being set either: an account can hold a handle and still be cut
+   * off.
+   */
   socialEnabled?: boolean;
   /** What a cloud agent COSTS, stated by the server. The client holds NO rate of its own and must
    *  not derive one — a duplicated pricing rule already shipped a bug here (the 50¢ client floor

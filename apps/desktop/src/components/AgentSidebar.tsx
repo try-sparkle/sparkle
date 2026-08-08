@@ -142,6 +142,7 @@ import {
   type RollupDot,
 } from "../engine/workerRollup";
 import { StageSectionHeader } from "./StageSectionHeader";
+import { ChatSection } from "./ChatSection";
 import { StatusFilterBar } from "./StatusFilterBar";
 import {
   withUnstartedWorkerAttention,
@@ -2570,6 +2571,18 @@ export function AgentSidebar({
           >
             {newAgentButton}
           </div>
+        )}
+        {/* CHAT — a fixed block at the TOP of the list, above the first stage header, which is what
+            the founder's "above the Local Nothing Yet row" looks like on his screen. Deliberately
+            NOT anchored to that header: `groupAgentsByStage` drops empty sections, so `local_none`
+            comes and goes with git state and Chat's position would come and go with it.
+
+            It renders even with ZERO people — its `[+]` is the only way to add the first one.
+            Primary pair only (the same "there is exactly one of these" rule `uiStore` names for
+            SPARKLE_PANE_SIDE) and never in Plan, whose sidebar list stays clear. Everything else
+            about it lives in ChatSection.tsx; this is the one line AgentSidebar owns. */}
+        {pairSide === SPARKLE_PANE_SIDE && mode !== "plan" && (
+          <ChatSection pairSide={pairSide} jointOpen={jointOpen} />
         )}
         {/* The status-band filter USED TO BE HERE, as the first thing inside the scroll container.
             It moved into the `.bhd` column header above: a control that governs which rows the list

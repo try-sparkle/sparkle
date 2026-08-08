@@ -181,6 +181,18 @@ export interface PublicProfile {
   online: boolean;
 }
 
+/** The signed-in user's OWN identity, as `GET /account/profile` answers it. It carries a
+ *  `visibility` where {@link PublicProfile} carries an `online`, and that asymmetry is the point:
+ *  visibility is the viewer's durable INTENT (§6.3), theirs to read and set and nobody else's to
+ *  see, while liveness is a fact about a socket this app already holds open. There is no
+ *  `clerkUserId` here for the same reason there is none anywhere else in this file. */
+export interface MyProfileResponse {
+  socialId: string;
+  username: string;
+  displayName: string | null;
+  visibility: Visibility;
+}
+
 /** The exact-lookup response: the projection plus the edge. */
 export interface UserLookup extends PublicProfile {
   relationship: string;
@@ -244,6 +256,18 @@ export function putUsername(username: string): Promise<PublicProfile> {
 
 export function putVisibility(visibility: Visibility): Promise<{ visibility: Visibility }> {
   return request("PUT", "/account/visibility", { visibility });
+}
+
+/** The signed-in user's OWN social identity — the one profile read that returns a `visibility`,
+ *  because that field is the viewer's own durable intent (§6.3) and is never part of anybody else's
+ *  public projection (§5).
+ *
+ *  **404 is a normal answer, not a failure**: it is what the caller gets before they have claimed a
+ *  username, and it is also what every path here answers while `SOCIAL_ENABLED` is off (§6.7). Both
+ *  mean "no social identity to show", and callers treat them identically — see `services/socialSync`,
+ *  which goes quiet on either rather than retrying a route that is not there. */
+export function getMyProfile(): Promise<MyProfileResponse> {
+  return request<MyProfileResponse>("GET", "/account/profile");
 }
 
 // ── Directory and lookup (§6.6) ─────────────────────────────────────────────────────────────────

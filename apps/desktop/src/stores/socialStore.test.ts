@@ -3,6 +3,7 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { personAgentId } from "../engine/social";
 import {
   useSocialStore,
+  otherPeopleList,
   peopleList,
   personName,
   roster,
@@ -235,5 +236,113 @@ describe("socialStore — selectors", () => {
     const got = roster({ "s-bob": bob });
     expect(got).toHaveLength(1);
     expect(got[0]!.canAcceptInput).toBe(true);
+  });
+});
+
+// ── `rosterLoaded`: evidence that a read HAPPENED, not that people exist ────────────────────────
+// roborev 60412. The flag backs a user-facing truth-claim ("No one else has joined yet."), so each
+// of its three guarantees is pinned separately — a comment asserting them is not coverage, and the
+// reducer is one refactor away from silently dropping the write.
+describe("rosterLoaded", () => {
+  beforeEach(() => {
+    useSocialStore.getState().reset();
+  });
+
+  it("starts FALSE — an app that has never synced has not looked", () => {
+    expect(useSocialStore.getState().rosterLoaded).toBe(false);
+  });
+
+  it("an EMPTY successful pass flips it — that is the whole point of the flag", () => {
+    // `setPeople([])` is "we asked and nobody is there", which is exactly the state an empty
+    // `people` record cannot express on its own.
+    useSocialStore.getState().setPeople([]);
+    expect(useSocialStore.getState().rosterLoaded).toBe(true);
+    expect(Object.keys(useSocialStore.getState().people)).toHaveLength(0);
+  });
+
+  it("reset() clears it, so an account switch cannot inherit the previous account's claim", () => {
+    useSocialStore.getState().setPeople([
+      { socialId: "s1", username: "ada", displayName: null, relationship: "connected" },
+    ]);
+    expect(useSocialStore.getState().rosterLoaded).toBe(true);
+
+    useSocialStore.getState().reset();
+
+    // Both, because a reset that cleared the people but kept the flag would tell the NEXT account
+    // that its empty directory had been read — the sign-out disclosure this store is built to avoid.
+    expect(useSocialStore.getState().rosterLoaded).toBe(false);
+    expect(Object.keys(useSocialStore.getState().people)).toHaveLength(0);
+  });
+
+  it("a MERGE does not claim a load — only a full pass does", () => {
+    // `upsertPerson` is the partial path (a `peer_presence` frame, a single accepted request). It
+    // adds a row without any statement about whether the roster as a whole was read.
+    useSocialStore.getState().upsertPerson({ socialId: "s1", username: "ada" });
+    expect(useSocialStore.getState().people.s1).toBeTruthy();
+    expect(useSocialStore.getState().rosterLoaded).toBe(false);
+  });
+});
+
+// ── `profileLoaded`: the sibling of rosterLoaded, for YOUR OWN row ──────────────────────────────
+// roborev 60423. `me.username == null` means both "no social identity" and "not read yet", which
+// are opposite instructions to give a user, so the read itself has to be recorded.
+describe("profileLoaded", () => {
+  beforeEach(() => {
+    useSocialStore.getState().reset();
+  });
+
+  it("starts FALSE — a null username is not yet evidence of anything", () => {
+    expect(useSocialStore.getState().profileLoaded).toBe(false);
+    expect(useSocialStore.getState().me.username).toBeNull();
+  });
+
+  it("a read that finds NO handle still counts as a read", () => {
+    // The 404-shaped answer: socialSync learned you have no identity. `username` is still null, so
+    // this is exactly the pair the flag exists to disambiguate.
+    useSocialStore.getState().setMyProfile({ username: null });
+    expect(useSocialStore.getState().profileLoaded).toBe(true);
+    expect(useSocialStore.getState().me.username).toBeNull();
+  });
+
+  it("reset() clears it, so an account switch cannot inherit the previous read", () => {
+    useSocialStore.getState().setMyProfile({ username: "ada" });
+    expect(useSocialStore.getState().profileLoaded).toBe(true);
+
+    useSocialStore.getState().reset();
+
+    expect(useSocialStore.getState().profileLoaded).toBe(false);
+    expect(useSocialStore.getState().me.username).toBeNull();
+  });
+});
+
+// ── otherPeopleList: the Chat column lists everyone BUT you ─────────────────────────────────────
+describe("otherPeopleList", () => {
+  it("drops the self row, so a solo user's roster reads as empty", () => {
+    // socialSync writes the self row unconditionally; counting it made the empty state unreachable.
+    const self: Person = {
+      socialId: "me-1",
+      username: "drodio",
+      displayName: null,
+      availability: "available",
+      relationship: "self",
+    };
+    expect(otherPeopleList({ "me-1": self })).toHaveLength(0);
+    // …while the underlying roster still holds it, because `roster()` needs it for @mentions.
+    expect(peopleList({ "me-1": self })).toHaveLength(1);
+  });
+
+  it("keeps everyone else, in the same order peopleList gives", () => {
+    const self: Person = {
+      socialId: "me-1",
+      username: "drodio",
+      displayName: null,
+      availability: "available",
+      relationship: "self",
+    };
+    const got = otherPeopleList({ "me-1": self, "s-ada": ada, "s-bob": bob });
+    expect(got.map((p) => p.username)).toEqual(
+      peopleList({ "s-ada": ada, "s-bob": bob }).map((p) => p.username),
+    );
+    expect(got.some((p) => p.relationship === "self")).toBe(false);
   });
 });

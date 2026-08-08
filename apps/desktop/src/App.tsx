@@ -49,6 +49,7 @@ import { startFleetWatch } from "./services/fleetWatch";
 import { startInboxWatch } from "./stores/inboxStore";
 import { startPusher } from "./services/pusherMount";
 import { startAuthRecovery } from "./services/authRecovery";
+import { startSocialSync } from "./services/socialSync";
 
 // The Workspace subtree pulls in the heavy authenticated UI — xterm, markdown rendering, modals,
 // the agent panes. Lazy-load it (code-split) so an unauthenticated / unpaid first-run user, who
@@ -231,6 +232,22 @@ function Pusher() {
 // both double-mount) and returns its own teardown.
 function AuthRecovery() {
   useEffect(() => startAuthRecovery(), []);
+  return null;
+}
+
+// THE WRITER socialStore never had. `services/socialApi` and `stores/socialStore` were both complete
+// and both had ZERO consumers, so the sidebar's Chat section was a component that would render if
+// only it had data (services/socialSync).
+//
+// Mounted INSIDE <AuthGate> rather than beside the sweeps above, because everything it reads is
+// authed and per-account. But note what the mount point does NOT buy: AuthGate renders its children
+// on the anonymous TRIAL branch too, so being here is not a proof of sign-in. The loop's own
+// `tokenPresent` gate is what keeps it from firing an unauthed request and earning a 401 that would
+// stop it for the whole session — see socialSync's `onePass`. Cheap when the feature is off:
+// `SOCIAL_ENABLED` is unset in production, so the first request 404s and the loop goes quiet after
+// exactly one round trip. Paints no UI.
+function SocialSync() {
+  useEffect(() => startSocialSync(), []);
   return null;
 }
 
@@ -531,6 +548,7 @@ export function App() {
           load for unauthenticated users. */}
       <ReadinessGate>
         <AuthGate>
+        <SocialSync />
         <AttentionController />
         <UpdateBanner />
         <StaleBuildBanner />
