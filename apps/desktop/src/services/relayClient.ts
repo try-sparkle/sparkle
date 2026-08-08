@@ -27,7 +27,7 @@ import {
   authorizeAgentInput,
   authorizeDecision,
   resolveSuggestionClick,
-  frameRelaySubmit,
+  frameRelayKeystroke,
   type FramedPtyText,
   type AgentInputPayload,
   type DecisionPayload,
@@ -322,11 +322,18 @@ export async function startRelayHost(): Promise<void> {
         .catch((e) => console.debug("relay suggestion_click closeAgent failed", e));
       return;
     }
-    // `frameRelaySubmit`, not `frameSubmit`: everything this file writes to a PTY came in over the
-    // remote socket, so it takes the bracketed-paste framing (see relayGate's header). The value
-    // itself was resolved from what the desktop pushed rather than sent by the phone, but it is
-    // derived from the agent's own screen, so it is framed like the other two relay paths.
-    writeFramedToPty(r.agentId, frameRelaySubmit(r.value), "suggestion_click");
+    // `frameRelayKeystroke`, NOT `frameRelaySubmit` (roborev 60573, High). A suggestion click is a
+    // picker KEYSTROKE — `"y\n"`, `"n\n"`, `"2\n"` answering a live raw-mode Ink dialog — and this
+    // path briefly wrapped it in a bracketed paste, which the rest of the codebase forbids in
+    // several places at once (conciergeDispatch's header rules, frameCloudSubmit refusing while a
+    // picker is live, dictationTerminalRoute.WRITE_BLOCKING_PROMPTS).
+    //
+    // The bug it caused: a phone tap on "Approve" sent `ESC[200~y ESC[201~\r` while the SAME button
+    // clicked on the desktop sent `y\r`. Against a permission dialog whose select component does
+    // not consume paste markers, that leading ESC reads as Escape and cancels the prompt. The
+    // keystroke framer still strips markers and scrubs control bytes — it just does not paste-wrap,
+    // so the phone and the desktop send identical bytes for the same button.
+    writeFramedToPty(r.agentId, frameRelayKeystroke(r.value), "suggestion_click");
   });
 
   // The phone answered an attention — authorize + inject into that agent's PTY (gate: relayGate).
