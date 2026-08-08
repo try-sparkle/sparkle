@@ -89,9 +89,11 @@ export async function routeDictationToTerminal(
   // starts behaving as if nobody is watching. Dictating is input; say so.
   //
   // THIS LINE IS THEREFORE THE THIRD FEEDER, and the only one that is not a keystroke. Say it that
-  // way rather than "fed by onData", which was true before this call existed and is now the
-  // retracted claim — ConciergeHost's mount-gate block owns the authoritative enumeration, and
-  // reasoning built on the two-feeder version has already had to be corrected once (roborev 60344).
+  // way rather than "fed by onData" — which was never true, not even before this call existed:
+  // ComposeBox's `onChange` feeder landed in f03d9f66b (2026-07-27), three days ahead of this one in
+  // e41eed4a1 (2026-07-30), so the single-feeder claim was already wrong the day it was written and
+  // this call only made it wrong twice over. ConciergeHost's mount-gate block owns the authoritative
+  // enumeration; reasoning built on the short count has had to be corrected once (roborev 60344).
   // Note the scope: this fires for a dictated delivery into a TERMINAL, so it does not cover a
   // dictated CONCIERGE send, which is why that path still needs its own inference.
   //

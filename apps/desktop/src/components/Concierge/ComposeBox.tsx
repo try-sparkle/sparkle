@@ -2023,11 +2023,12 @@ export function ComposeBox({
               // anywhere (a paste, a middle-of-word deletion, an IME commit), and the query depends
               // on where it actually landed.
               setCaret(e.target.selectionStart ?? e.target.value.length);
-              // One of the two things that resets the five-minute idle timer (the other is
-              // a terminal keystroke, Terminal.tsx's onData). Deliberately on the USER's
-              // edits only, for the same reason onTextEdit is: a dictated segment landing in
-              // the box, or the clear-on-send, would otherwise keep the app reporting Here
-              // while nobody is at the keyboard.
+              // One of the feeders that resets the five-minute idle timer — do not restate the
+              // list here; it is enumerated ONCE, in ConciergeHost's mount-gate block, because an
+              // earlier version of this comment named "the other" one and there are three
+              // (roborev 60364). Deliberately on the USER's edits only, for the same reason
+              // onTextEdit is: a dictated segment landing in the box, or the clear-on-send, would
+              // otherwise keep the app reporting Here while nobody is at the keyboard.
               usePresenceStore.getState().noteInput();
               // Only the user's OWN edits report — dictation appends go through setText directly.
               // That is what lets the host tell "this box was emptied by hand" (which retires the

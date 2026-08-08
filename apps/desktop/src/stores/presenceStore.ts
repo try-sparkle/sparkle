@@ -162,7 +162,9 @@ interface PresenceState extends PresenceFacts {
    * and it ends the Away for good (`setHere` clears this).
    */
   awayBeforePin: boolean;
-  /** The user typed — in the compose box or straight into a terminal. Resets the idle clock. */
+  /** The user produced input. Resets the idle clock. NOT keystrokes only, and not two callers —
+   *  the feeders are enumerated once, in ConciergeHost's mount-gate block; this docstring used to
+   *  name a pair and that count is retracted (roborev 60364). */
   noteInput: () => void;
   /** Frontmost changed. Already coalesced 120ms upstream in src-tauri/src/frontmost.rs, which is
    *  what keeps a window-to-window switch from flickering Away — see `startPresenceTracking`. */

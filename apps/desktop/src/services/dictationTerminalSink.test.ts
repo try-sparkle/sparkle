@@ -145,8 +145,9 @@ describe("routeDictationToTerminal", () => {
   // ══ PRESENCE ═════════════════════════════════════════════════════════════════════════════════
   // Every OTHER `noteInput` feeder is keystroke-only, so a voice-only session would look idle and
   // trip IDLE_AWAY_MS mid-conversation; the sink's post-write poke is what stops that, and is the
-  // one non-keystroke feeder. (Not "fed only by onData" — that was true before the sink existed and
-  // is the retracted claim; ConciergeHost's mount-gate block holds the authoritative list.) Assert
+  // one non-keystroke feeder. (Not "fed only by onData" — the retracted claim, and it was never
+  // true: ComposeBox's `onChange` feeder predates this sink by three days, so the short count was
+  // wrong when written. ConciergeHost's mount-gate block holds the authoritative list.) Assert
   // the SIDE EFFECT on the store, not that a spy was called — the store is what the timer reads.
   it("counts a delivered phrase as user input, so a voice-only session never goes Away", async () => {
     mountTerminal(IDLE_SCREEN);
