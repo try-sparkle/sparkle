@@ -324,6 +324,34 @@ pub struct AgentState {
     /// releases the latch. Comparing absolute stamps rather than a recency window means the release
     /// cannot be missed by looking at the wrong second.
     standdown_at_foreign_write: u64,
+    /// `foreign_write_ms` as it stood the first look we saw this agent's goal reported MET.
+    ///
+    /// `goal_met` is re-derived every look rather than latched, so the stand-down release above
+    /// cannot reach it — and `goalStateOf` returns "met" FOREVER once `metAt` is set, until somebody
+    /// constructs a whole new goal object. A founder typing a new task into a finished agent's
+    /// terminal does not do that. Without this stamp such an agent is exempt from the ladder for the
+    /// rest of its life: never written to, and `Done` raises no flag either, so it is silent in both
+    /// directions — the exact outcome this module's header forbids, reached by the most ordinary
+    /// flow there is.
+    goal_met_at_write: Option<u64>,
+    /// Somebody has typed at this agent SINCE its goal was reported met, so the met claim no longer
+    /// describes the work in front of it. Latched: the goal state cannot un-supersede itself,
+    /// because it has no way to notice the new work either.
+    goal_met_superseded: bool,
+    /// Did THIS module type at the agent on the previous look?
+    ///
+    /// ── WHY THE REPLY CANNOT ANSWER "WHOSE OUTPUT WAS THAT" ───────────────────────────────────
+    /// The nudge is typed into the PTY, so it ECHOES — and the echo lands whether or not the agent
+    /// ever answers. Keying the conversation reset on a parsed reply therefore closed the loop only
+    /// for agents that answer in the exact vocabulary: one that replies in prose, or whose answer
+    /// scrolled off, or that emits nothing but a redrawn spinner, still took the full-reset path and
+    /// still climbed back to `#1` forever. That is the founder's original symptom, surviving for
+    /// everyone who did not answer by the book.
+    ///
+    /// Our own write is provoked BY CONSTRUCTION, which is the property the reply was only ever a
+    /// proxy for. Cleared at the top of every look, so it means "the look immediately before this
+    /// one" and never leaks further.
+    wrote_last_look: bool,
 }
 
 impl AgentState {
@@ -432,6 +460,24 @@ pub const QUIET_AFTER_OTHER_WRITE_MS: u64 = 5_000;
 pub fn step(state: &mut AgentState, obs: &Observation) -> Decision {
     let previous = state.hash;
     let changed = previous.is_some_and(|h| h != obs.hash);
+    // Consumed immediately, so it can only ever mean "the look before this one".
+    let we_wrote_last_look = std::mem::take(&mut state.wrote_last_look);
+
+    // ── A MET GOAL GOES STALE WHEN SOMEBODY TYPES ─────────────────────────────────────────────
+    // `goal_met` is not latched — it is re-read every look — so the release below cannot reach it,
+    // and `goalStateOf` keeps answering "met" forever once `metAt` is set. Stamp the write clock at
+    // the first met look; any LATER foreign write means the agent has been handed something the met
+    // claim knows nothing about, and the claim stops being a reason to stay quiet.
+    if obs.goal_met {
+        match state.goal_met_at_write {
+            None => state.goal_met_at_write = Some(obs.foreign_write_ms),
+            Some(at) if obs.foreign_write_ms > at => state.goal_met_superseded = true,
+            _ => {}
+        }
+    } else {
+        state.goal_met_at_write = None;
+        state.goal_met_superseded = false;
+    }
 
     // ── NEW WORK RELEASES A STAND-DOWN ────────────────────────────────────────────────────────
     // "It has nothing to resume" stops being true the moment somebody gives it something to
@@ -480,7 +526,16 @@ pub fn step(state: &mut AgentState, obs: &Observation) -> Decision {
         // restarts (the agent did emit), but the nudge history, the escalation high-water mark and
         // the stand-down all survive. Output we did NOT provoke is still a full reset — that is a
         // genuinely working agent and it earns a clean slate.
-        let conversation = changed && state.attempts > 0 && obs.reply.is_some();
+        //
+        // KEYED ON OUR OWN WRITE, NOT ON A PARSED REPLY (roborev 60323, High). The echo lands
+        // whether or not the agent answers in the vocabulary, so keying on the reply left the loop
+        // wide open for anyone who answered in prose, whose answer had scrolled off, or who emitted
+        // nothing but a redrawn spinner — all of them still reset to `#1` forever. Our own write is
+        // provoked by construction; the reply was only ever a proxy for that, and a lossy one.
+        //
+        // It holds for exactly ONE look, so a nudge that genuinely revives an agent costs at most a
+        // single preserved look before the next unprovoked change wipes the slate.
+        let conversation = changed && state.attempts > 0 && we_wrote_last_look;
         state.hash = Some(obs.hash);
         state.rung = 0;
         state.silent_secs = 0;
@@ -489,8 +544,14 @@ pub fn step(state: &mut AgentState, obs: &Observation) -> Decision {
             state.delivered = 0;
             state.last_blocked = None;
             state.escalated = None;
-            state.standdown = None;
-            state.last_reply = None;
+            // NOTE what is NOT cleared: the stand-down. Output is the agent TALKING; a stand-down
+            // ends when somebody gives it something new to DO, which is the foreign-write release
+            // at the top of this function and nothing else. Clearing it here would mean any idle
+            // redraw — a spinner, a clock, a repaint — revived the pinging on an agent that had
+            // already said it was done, which is the founder's loop returning with a longer period
+            // rather than being fixed. The nudge only ever says "resume your goal", so for an agent
+            // that reported nothing to resume and has been handed nothing since, there is no
+            // content in asking again.
         }
 
         let stand = effective_standdown(state, obs);
@@ -671,9 +732,13 @@ pub fn step(state: &mut AgentState, obs: &Observation) -> Decision {
     // identical notices, which is how a signal stops being read.
     let escalate = raise(state, target);
 
+    // The attempt counted either way; whether a BYTE goes out is a separate question — and only a
+    // byte can echo, so only a byte makes the next hash change OURS.
+    let action = if blocked.is_some() { Action::Observe } else { Action::Nudge { n } };
+    state.wrote_last_look = matches!(action, Action::Nudge { .. });
+
     Decision {
-        // The attempt counted either way; whether a BYTE goes out is a separate question.
-        action: if blocked.is_some() { Action::Observe } else { Action::Nudge { n } },
+        action,
         escalate,
         // `target`, NOT `escalate`: the level this look sits at, which stays `Some` for the rest of
         // the episode once a threshold is crossed. This is what keeps the row EXISTING after the
@@ -717,7 +782,11 @@ fn effective_standdown(state: &AgentState, obs: &Observation) -> Option<Standdow
     if state.standdown == Some(Standdown::AwaitHuman) {
         return Some(Standdown::AwaitHuman);
     }
-    if obs.goal_met {
+    // `goal_met_superseded` is the "unless new work arrives" clause for the GOAL, and it has to be
+    // separate from the reply's because the two facts decay differently: a reply is a latch we own
+    // and can clear, whereas `goal_met` is recomputed upstream every look and will keep saying "met"
+    // about a goal the agent finished hours before the work now in front of it.
+    if obs.goal_met && !state.goal_met_superseded {
         return Some(Standdown::Done);
     }
     state.standdown
@@ -765,6 +834,13 @@ pub fn nudge_text(n: u32, silent_secs: u64) -> String {
 /// That would silence a genuinely stalled agent, which is the one outcome forbidden here.
 const NUDGE_TAIL: &str = "plus what you need.";
 
+/// How much of the screen after the question can be the ANSWER, in whitespace-stripped chars.
+///
+/// The nudge asks for one line, immediately. This is roughly three terminal rows once the spaces
+/// are gone — ample for a wrapped one-liner plus a bullet, and far short of the rest of a screen
+/// that might be showing a diff of this file or the agent quoting its instructions back.
+const REPLY_WINDOW_CHARS: usize = 240;
+
 /// Read the agent's one-line answer to the MOST RECENT nudge, if it has given one.
 ///
 /// ── FAIL CLOSED, AND WHICH DIRECTION THAT IS ──────────────────────────────────────────────────
@@ -790,11 +866,26 @@ pub fn parse_reply(screen: &str) -> Option<Reply> {
     // answer. A missing tail means the nudge is truncated, so the boundary is unknown: give up.
     let answer_from = flat[marker_at..].find(&tail).map(|i| marker_at + i + tail.len())?;
 
-    // The LAST token in the answer region wins: an agent that corrects itself ("not-blocked —
-    // actually blocked-on-ci") means the correction, and a scrolled-back older answer sits earlier.
+    // ── AND THE REGION IS BOUNDED (roborev 60323, Medium) ─────────────────────────────────────
+    // "Everything after the question to the end of the screen" is far too generous. The tokens are
+    // ordinary words that show up in ordinary output — an agent quoting the instruction back, a
+    // `git diff` of THIS VERY FILE (which contains the marker, the tail and all five tokens), a
+    // prompt that happens to mention being blocked. Absorbing any of those latches a stand-down and
+    // stops the typing on an agent that never answered: the false-positive direction this function
+    // is not allowed to fail in.
+    //
+    // The nudge asks for ONE LINE, immediately. A wrapped one-liner is comfortably inside this
+    // window and a stray token further down the screen is outside it.
+    // Taken in CHARS, not bytes: `·` and `—` are three bytes each, so a byte slice would land
+    // mid-codepoint and panic.
+    let region = &flat[answer_from..];
+    let window: String = region.chars().take(REPLY_WINDOW_CHARS).collect();
+
+    // The LAST token in the window wins: an agent that corrects itself ("not-blocked — actually
+    // blocked-on-ci") means the correction.
     REPLY_TOKENS
         .iter()
-        .filter_map(|(token, reply)| flat[answer_from..].rfind(token).map(|i| (i, *reply)))
+        .filter_map(|(token, reply)| window.rfind(token).map(|i| (i, *reply)))
         .max_by_key(|(i, _)| *i)
         .map(|(_, reply)| reply)
 }
@@ -886,8 +977,15 @@ mod tests {
         assert_eq!(d.rung, 1);
         assert_eq!(d.next_look_secs, 5);
         assert_eq!(d.action, Action::Observe);
-        assert_eq!(s.attempts(), 0, "a moving agent has no nudge history");
         assert_eq!(s.silent_secs(), 0);
+
+        // The nudge history needs one more look to clear, and that is deliberate rather than sloppy:
+        // the 8 looks above END on a nudge, so the FIRST change after them is our own echo and is
+        // ours by construction (see `our_own_echo_does_not_reset_the_counter_when_the_agent_never_
+        // answers`). The second change, with no write of ours in between, is the agent.
+        assert_eq!(s.attempts(), 2, "the echo of our own last nudge is not the agent moving");
+        step(&mut s, &Observation { hash: 0x5678, ..stalled() });
+        assert_eq!(s.attempts(), 0, "a moving agent has no nudge history");
     }
 
     /// The change detector is the WHOLE detector. A one-byte difference in the hashed window is a
@@ -1583,12 +1681,13 @@ mod tests {
         run(&mut s, &stalled(), 12);
         assert!(s.attempts() >= 3, "precondition: a real nudge history");
 
-        // Moving, with no answer to any nudge — the agent simply got back to work.
-        let working_again = Observation { hash: 0x1077, reply: None, ..stalled() };
-        step(&mut s, &working_again);
+        // Moving, with no answer to any nudge — the agent simply got back to work. The first change
+        // is our last nudge's echo; the second is the agent itself.
+        step(&mut s, &Observation { hash: 0x1077, reply: None, ..stalled() });
+        step(&mut s, &Observation { hash: 0x1078, reply: None, ..stalled() });
         assert_eq!(s.attempts(), 0, "unprovoked output earns a clean slate");
         assert_eq!(s.escalated(), None);
-        assert_eq!(s.standdown(), None);
+        assert_eq!(s.standdown(), None, "and it never stood down in the first place");
     }
 
     /// THE TERMINAL RUNG. Past `GIVE_UP_AFTER` identical ignored pings there is nothing another one
@@ -1650,6 +1749,137 @@ mod tests {
             Some(1),
             "a stand-down must not outlive the work that justified it"
         );
+    }
+
+    // ══ THE ECHO, WHICH IS THE PART THE FIRST FIX MISSED ════════════════════════════════════════
+
+    /// THE REALISTIC SEQUENCE, and the one every other loop test here fails to model.
+    ///
+    /// Those tests hold `hash` CONSTANT across looks, which cannot happen to an agent we are typing
+    /// at: the nudge is written into the PTY and ECHOES, so the hash moves after every single ping
+    /// whether or not the agent ever answers. Keying the conversation reset on a parsed reply
+    /// therefore left the founder's `#1`-forever loop fully intact for every agent that does not
+    /// answer in the exact vocabulary — prose, a scrolled-off answer, or nothing but a redrawn
+    /// spinner. `attempts` never got past 1, so the concierge flag, the founder flag and the
+    /// terminal rung were all unreachable (roborev 60323).
+    ///
+    /// Here the hash changes on the look after each nudge and the agent NEVER answers.
+    #[test]
+    fn our_own_echo_does_not_reset_the_counter_when_the_agent_never_answers() {
+        let mut s = AgentState::default();
+        let mut hash = 0xdead_beef_u64;
+        let mut pings: Vec<u32> = Vec::new();
+        let mut flagged_at_end = None;
+
+        for _ in 0..60 {
+            let obs = Observation { hash, reply: None, ..stalled() };
+            let d = step(&mut s, &obs);
+            flagged_at_end = d.flagged;
+            if let Action::Nudge { n } = d.action {
+                pings.push(n);
+                // The ping lands and echoes into the terminal — the hash moves, with no reply.
+                hash = hash.wrapping_add(1);
+            }
+        }
+
+        assert_eq!(
+            pings,
+            (1..=GIVE_UP_AFTER).collect::<Vec<u32>>(),
+            "the counter must climb through the echo, not restart at #1 on every one"
+        );
+        assert_eq!(
+            s.escalated(),
+            Some(Escalation::Founder),
+            "and the escalation thresholds must actually be reachable"
+        );
+        assert_eq!(flagged_at_end, Some(Escalation::Founder), "the row stays up afterwards");
+    }
+
+    /// The boundary of that rule: output we did NOT provoke still wipes the slate, even one look
+    /// after a nudge. Without this, "our write makes the next change ours" would creep into "the
+    /// counter never resets once we have nudged once".
+    #[test]
+    fn the_provoked_window_is_exactly_one_look() {
+        let mut s = AgentState::default();
+        run(&mut s, &stalled(), 7); // …ending in nudge #1
+        assert_eq!(s.attempts(), 1);
+
+        // Look 1 after the nudge: the echo. Provoked — history survives.
+        step(&mut s, &Observation { hash: 0x2001, reply: None, ..stalled() });
+        assert_eq!(s.attempts(), 1, "the echo is ours");
+
+        // Look 2: it moved again, and we wrote nothing in between. That is the agent working.
+        step(&mut s, &Observation { hash: 0x2002, reply: None, ..stalled() });
+        assert_eq!(s.attempts(), 0, "unprovoked output one look later is a clean slate");
+    }
+
+    // ══ A MET GOAL IS NOT A LIFETIME EXEMPTION ══════════════════════════════════════════════════
+
+    /// THE SILENT-FOREVER HOLE (roborev 60323, High).
+    ///
+    /// `goal_met` is re-derived every look rather than latched, so the stand-down release could not
+    /// reach it — and `goalStateOf` answers "met" FOREVER once `metAt` is set, until a whole new
+    /// goal object is constructed. A founder typing a new task into a finished agent's terminal
+    /// does not do that. So the agent was exempt from the ladder for the rest of its life: never
+    /// written to, and `Done` raises no flag either, so silent in BOTH directions — precisely what
+    /// this module's header forbids, via the most ordinary flow there is.
+    #[test]
+    fn a_met_goal_stops_excusing_an_agent_once_somebody_types_at_it() {
+        let mut s = AgentState::default();
+        let finished = Observation { goal_met: true, foreign_write_ms: 100, ..stalled() };
+        let quiet = run(&mut s, &finished, 20);
+        assert!(quiet.iter().all(|d| d.action == Action::Observe), "precondition: stood down");
+
+        // The founder types a new task. The goal object is untouched, so `goal_met` STAYS true —
+        // which is exactly why the stamp, and not the flag itself, has to be the test.
+        let new_work = Observation { hash: 0x3001, goal_met: true, foreign_write_ms: 200, ..stalled() };
+        step(&mut s, &new_work);
+
+        let after = run(&mut s, &Observation { hash: 0x3001, ..new_work }, 12);
+        assert!(
+            after.iter().any(|d| matches!(d.action, Action::Nudge { .. })),
+            "an agent handed new work must be watched again, however its stale goal still reads"
+        );
+    }
+
+    /// …and the exemption is not handed back by the next look. Once superseded it stays superseded,
+    /// because the goal state has no way to notice the new work either.
+    #[test]
+    fn a_superseded_goal_does_not_un_supersede_itself() {
+        let mut s = AgentState::default();
+        run(&mut s, &Observation { goal_met: true, foreign_write_ms: 100, ..stalled() }, 10);
+        step(&mut s, &Observation { hash: 0x4001, goal_met: true, foreign_write_ms: 200, ..stalled() });
+
+        // Many later looks, no further writes — the write stamp stops moving.
+        let d = run(&mut s, &Observation { hash: 0x4001, goal_met: true, foreign_write_ms: 200, ..stalled() }, 20);
+        assert!(
+            d.iter().any(|x| matches!(x.action, Action::Nudge { .. })),
+            "a stale met claim must not quietly re-exempt the agent once the work has moved on"
+        );
+    }
+
+    // ══ THE ANSWER REGION IS BOUNDED ════════════════════════════════════════════════════════════
+
+    /// A TOKEN IS NOT AN ANSWER JUST BECAUSE IT IS ON SCREEN (roborev 60323, Medium).
+    ///
+    /// The region used to run to the end of the screen, so any later appearance of a token was
+    /// absorbed as the agent's reply — including, deliciously, a `git diff` of THIS FILE, which
+    /// contains the marker, the tail and all five tokens. That latches a stand-down and stops the
+    /// typing on an agent that never answered.
+    #[test]
+    fn a_token_far_below_a_real_answer_is_not_read_as_one() {
+        let filler = "● working on the parser and reading some code\n".repeat(12);
+        let screen = format!("{}\n{}\n● not-blocked\n", nudge_text(1, 245), filler);
+        assert_eq!(
+            parse_reply(&screen),
+            None,
+            "a token beyond the reply window is incidental output, not an answer"
+        );
+
+        // The same token, in the position a real answer occupies, IS read — so the assertion above
+        // is about the WINDOW and not about the parser having quietly stopped working.
+        let answered = format!("{}\n● not-blocked\n{}", nudge_text(1, 245), filler);
+        assert_eq!(parse_reply(&answered), Some(Reply::NotBlocked));
     }
 
     /// A stand-down is NOT released by the passage of time or by the agent's own idle redraws —
