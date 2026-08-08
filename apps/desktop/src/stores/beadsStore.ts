@@ -11,6 +11,7 @@ import {
   isBeadsUnavailable,
   type Bead,
   type Board,
+  type BoardColumn,
 } from "../services/beads";
 import { runDecomposeWatcherForPoll } from "../services/epicDecompose";
 import { useSettingsStore } from "./settingsStore";
@@ -63,7 +64,130 @@ const BEADS_STEAL_BACKOFF_MAX_SHIFT = 5;
 interface ProjectSnapshot {
   beads: Bead[];
   board: Board;
+  /**
+   * When this snapshot's CONTENT was first observed — NOT when we last polled.
+   *
+   * An unchanged poll deliberately does not advance it, because advancing it would mint a new
+   * entry object and re-notify every subscriber for a backlog that did not move (see
+   * `snapshotUnchanged`). "When did we last shell out to `bd`" is a different question with a
+   * different reader; it lives in `beadsPolledAt` below, outside store state, for the same reason
+   * `timers`/`viewers` do — it is bookkeeping about the fetch, not data anything renders.
+   */
   loadedAt: number;
+}
+
+// ── Snapshot equality: what makes a poll a NO-OP ───────────────────────────────────────────────
+//
+// ══ WHY THIS EXISTS ═════════════════════════════════════════════════════════════════════════════
+// `refresh` runs every BEADS_POLL_INTERVAL_MS (5s) per watched project, and it used to write
+// `{ beads, board, loadedAt: Date.now() }` unconditionally on every success. That mints a fresh
+// `beads` ARRAY identity and a fresh `board` OBJECT identity every five seconds even when the
+// backlog is byte-for-byte identical — and a zustand selector notifies on identity, not on value.
+//
+// `AgentSidebar`'s `AgentRow` selects exactly those two, once per row:
+//     useBeadsStore((s) => s.byProject[project.id]?.beads ?? NO_BEADS)
+//     useBeadsStore((s) => s.byProject[project.id]?.board ?? null)
+// The row is `React.memo`'d, which does nothing here: the store notified, the selector returned a
+// new reference, so the row re-runs its whole body — `epicForBuild` (O(agents × beads)),
+// `epicPillFor` (allocates a fresh 4-way concatenated array), a `beads.filter(...)`, `stallReport`,
+// `thrashReportFor`. With the ~60 agents the founder actually runs, that is 60 full row re-renders
+// every 5 seconds for a backlog that did not move.
+//
+// ══ WHY A POSITIONAL COMPARE, AND NOT A NORMALISED ONE ══════════════════════════════════════════
+// `bucketBeads` preserves input order within each column and the board RENDERS that order, so a
+// reorder is a real change a reader can see. Normalising (sorting by id) before comparing would
+// report a genuine reorder as "equal" and freeze the board mid-shuffle. Compare positionally.
+//
+// ══ WHY THIS IS CHEAPER THAN WHAT IT PREVENTS ═══════════════════════════════════════════════════
+// O(beads) scalar comparisons plus O(beads) id comparisons across the five board columns — no
+// allocation, no serialisation. `JSON.stringify` was rejected: it allocates two strings the size of
+// the whole backlog (description fields included) every 5 seconds, which is the opposite of the
+// point. See `beadsStore.identity.test.ts` for the measured numbers.
+
+/**
+ * The `Bead` fields the equality check compares.
+ *
+ * Exported because it is a DRIFT GUARD, not documentation: `beadsStore.identity.test.ts` asserts
+ * (a) that this list plus `labels` covers every key of a fully-populated `Bead`, so a field added
+ * to `Bead` cannot silently become invisible to the comparison, and (b) that changing each listed
+ * field individually is actually detected, so the list cannot claim coverage it does not have.
+ */
+export const COMPARED_BEAD_FIELDS = [
+  "id",
+  "title",
+  "description",
+  "status",
+  "type",
+  "priority",
+  "parent",
+  "createdAt",
+  "updatedAt",
+] as const;
+
+/** Every board column, exhaustively. The `Record<BoardColumn, true>` literal is the tie: adding a
+ *  column to `BoardColumn` fails to compile here rather than silently dropping out of the compare. */
+const BOARD_COLUMNS = Object.keys({
+  backlog: true,
+  blocked: true,
+  inProgress: true,
+  done: true,
+  delivered: true,
+} satisfies Record<BoardColumn, true>) as BoardColumn[];
+
+function sameLabels(a: readonly string[], b: readonly string[]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+/** Field-wise equality over everything the UI reads off a bead. */
+function sameBead(a: Bead, b: Bead): boolean {
+  return (
+    a.id === b.id &&
+    a.title === b.title &&
+    a.description === b.description &&
+    a.status === b.status &&
+    a.type === b.type &&
+    a.priority === b.priority &&
+    a.parent === b.parent &&
+    a.createdAt === b.createdAt &&
+    a.updatedAt === b.updatedAt &&
+    sameLabels(a.labels, b.labels)
+  );
+}
+
+/**
+ * Whether a freshly-fetched (beads, board) pair is equivalent to the snapshot already in the store.
+ *
+ * THE BOARD IS COMPARED SEPARATELY, and that is not redundant. `board = bucketBeads(beads, blocked)`
+ * — and `blocked` is NOT part of the snapshot. So a poll can return beads that are field-for-field
+ * identical while the blocked set changed underneath, which moves a bead between the `backlog` and
+ * `blocked` columns. Comparing only `beads` would report that as unchanged and freeze the board on
+ * a stale bucketing. Per-column positional id equality is sufficient given the beads already match
+ * field-wise, since bucketing is a pure function of (beads, blocked) that preserves input order.
+ */
+export function snapshotUnchanged(prev: ProjectSnapshot, beads: Bead[], board: Board): boolean {
+  if (prev.beads.length !== beads.length) return false;
+  for (let i = 0; i < beads.length; i++) {
+    // `noUncheckedIndexedAccess` is on, so both reads are `Bead | undefined` even though the equal
+    // lengths make them present. A sparse array would land here as undefined; treat that as CHANGED
+    // rather than equal — the guard must never report "equal" for something it could not compare.
+    const a = prev.beads[i];
+    const b = beads[i];
+    if (a === undefined || b === undefined || !sameBead(a, b)) return false;
+  }
+  for (const col of BOARD_COLUMNS) {
+    const before = prev.board[col];
+    const after = board[col];
+    if (before.length !== after.length) return false;
+    for (let i = 0; i < after.length; i++) {
+      const x = before[i];
+      const y = after[i];
+      if (x === undefined || y === undefined || x.id !== y.id) return false;
+    }
+  }
+  return true;
 }
 
 /**
@@ -160,14 +284,57 @@ const refreshInFlight = new Map<string, InFlightClaim>();
  *  exponential backoff — see `BEADS_STEAL_BACKOFF_MAX_SHIFT`. Reset when an owning scan completes. */
 const staleSteals = new Map<string, number>();
 
-/** TEST-ONLY. Clear the module-scope in-flight guard between cases. Unlike `timers`/`viewers`, which
- *  the suites drain via `stopPolling`, the guard is no longer touched by teardown (recovery is
- *  time-based), so a case that leaves a scan latched — e.g. a hand-held or never-settling mock —
- *  would otherwise leak that claim into the next case reusing the same project id. Call in
+/**
+ * When each project last completed a SUCCESSFUL `bd` read — the freshness clock.
+ *
+ * ══ WHY THIS IS NOT `ProjectSnapshot.loadedAt` ANY MORE ═════════════════════════════════════════
+ * It used to be, and that is precisely what made the per-project entry a new object on every poll:
+ * even with `beads` and `board` preserved, a moving `loadedAt` re-minted the entry, so anything
+ * selecting the entry (`BoardView`) or the whole map (`BeadPillHost`) re-rendered every 5 seconds
+ * for a backlog that did not move. Freshness has to keep advancing on an unchanged poll, and the
+ * snapshot has to stay identical on one — those two requirements cannot share a field.
+ *
+ * Kept at module scope, like `timers`/`viewers`/`refreshInFlight`, because it is bookkeeping about
+ * the fetch rather than data anything renders: its one reader, `BeadPillHost`'s cross-project
+ * sweep, reads it imperatively at sweep time via `beadsPolledAt` and wants the freshest value, not
+ * a subscription. Storing it in state instead would put the churn back — one notification per poll
+ * per project — for a value no selector ever reads.
+ *
+ * STAMPED ONLY ON SUCCESS. A failed poll must leave it untouched so the sweep retries that project
+ * rather than treating a failure as a fresh read (the same reason the old `loadedAt` was only ever
+ * written inside the success commits).
+ */
+const polledAt = new Map<string, number>();
+
+/**
+ * When this project's beads were last successfully read, or `undefined` if never.
+ *
+ * The freshness gate in `BeadPillHost`'s cross-project sweep is the reader: `others` changes on
+ * every selection change and re-fires that sweep, so without a freshness check, clicking through
+ * the project strip produces back-to-back `bd` convoys against the shared store. That gate needs
+ * "when did we last READ this", which is why it must not be answered from the snapshot — an
+ * unchanged poll deliberately leaves the snapshot (and its `loadedAt`) alone.
+ */
+export function beadsPolledAt(projectId: string): number | undefined {
+  return polledAt.get(projectId);
+}
+
+/** TEST-ONLY. Drain the module-scope PER-PROJECT bookkeeping between cases — the in-flight claim,
+ *  its steal-backoff counter, and the freshness clock.
+ *
+ *  Unlike `timers`/`viewers`, which the suites drain via `stopPolling`, none of these is touched by
+ *  teardown (claim recovery is time-based), so a case that leaves a scan latched — e.g. a hand-held
+ *  or never-settling mock — would leak that claim into the next case reusing the same project id.
+ *  `polledAt` leaks the same way and is easier to miss, because it does not live in store state:
+ *  `setState({ byProject: {} })` looks like a full reset but leaves a project the previous case
+ *  read still looking freshly-read, so a freshness-gated sweep silently skips it. Call in
  *  `beforeEach`. Not part of the store's runtime surface. */
 export function __resetBeadsRefreshInFlightForTest(): void {
   refreshInFlight.clear();
   staleSteals.clear();
+  // Freshness is module-scope too, so a case that polled project "p1" would otherwise leave the
+  // next case's "p1" looking already-fresh.
+  polledAt.clear();
 }
 /**
  * How many mounted viewers currently want each project polled.
@@ -232,6 +399,10 @@ export const useBeadsStore = create<BeadsState>()((set) => ({
     // route through here), and it also gates the post-poll decompose watcher below. Drop any prior
     // snapshot so a board reached in some edge case shows empty, not stale.
     if (!beadsEnabled()) {
+      // Drop the freshness stamp with the snapshot. Leaving it would make the cross-project sweep
+      // treat a project whose snapshot we just discarded as recently read, so re-enabling beads
+      // would show dead ids for up to a full sweep interval.
+      polledAt.delete(projectId);
       set((s) => ({
         byProject: { ...s.byProject, [projectId]: undefined },
         loading: { ...s.loading, [projectId]: false },
@@ -267,6 +438,40 @@ export const useBeadsStore = create<BeadsState>()((set) => ({
     const commit = (updater: (s: BeadsState) => Partial<BeadsState>) => {
       if (ownsClaim()) set(updater);
     };
+    /**
+     * Write a SUCCESSFUL read.
+     *
+     * ══ AN UNCHANGED POLL REUSES THE PREVIOUS SNAPSHOT OBJECT ═════════════════════════════════
+     * …and with it the `beads` array and `board` object references that ~60 `AgentRow`s select
+     * every 5 seconds. `snapshotUnchanged` is the whole point of this branch; see its docstring
+     * for why a positional compare (and why comparing the board separately) is the right test.
+     * When it holds, the `byProject` MAP is returned unchanged too, so a selector reading the
+     * per-project entry (`BoardView`) or the whole map (`BeadPillHost`) is equally unaffected.
+     *
+     * Freshness is stamped either way — an unchanged read is still a read, and the cross-project
+     * sweep's back-to-back guard depends on that. It is deliberately NOT `snapshot.loadedAt`; see
+     * `polledAt`.
+     *
+     * `loading` and `error` are written exactly as before: `loading` genuinely toggles true→false
+     * around every fetch, so suppressing that would change the loading contract, and clearing
+     * `error` on success is the behaviour `clears a prior error on a subsequent successful
+     * refresh` pins. Neither is what re-renders the rows.
+     */
+    const commitSnapshot = (beads: Bead[], board: Board) => {
+      if (ownsClaim()) polledAt.set(projectId, Date.now());
+      commit((s) => {
+        const prev = s.byProject[projectId];
+        const next =
+          prev !== undefined && snapshotUnchanged(prev, beads, board)
+            ? prev
+            : { beads, board, loadedAt: Date.now() };
+        return {
+          byProject: next === prev ? s.byProject : { ...s.byProject, [projectId]: next },
+          loading: { ...s.loading, [projectId]: false },
+          error: { ...s.error, [projectId]: undefined },
+        };
+      });
+    };
     commit((s) => ({ loading: { ...s.loading, [projectId]: true } }));
     try {
       // CONCURRENTLY, not in sequence. `list_beads` is the 5s-poll hot path the perf work in
@@ -275,11 +480,7 @@ export const useBeadsStore = create<BeadsState>()((set) => ({
       // empty set), so this cannot turn a working board into a failed one.
       const [beads, blocked] = await Promise.all([listBeads(projectPath), blockedBeadIds(projectPath)]);
       const board = bucketBeads(beads, blocked);
-      commit((s) => ({
-        byProject: { ...s.byProject, [projectId]: { beads, board, loadedAt: Date.now() } },
-        loading: { ...s.loading, [projectId]: false },
-        error: { ...s.error, [projectId]: undefined },
-      }));
+      commitSnapshot(beads, board);
       // Post-poll auto-decompose watcher (spec §7). Every guard (main-window election, AI gate,
       // baseline, re-entrancy) lives in the service so the store stays dumb. Fire-and-forget —
       // it never throws, and the next poll picks up whatever labels/children it wrote.
@@ -317,11 +518,7 @@ export const useBeadsStore = create<BeadsState>()((set) => ({
             blockedBeadIds(projectPath),
           ]);
           const board = bucketBeads(beads, blocked);
-          commit((s) => ({
-            byProject: { ...s.byProject, [projectId]: { beads, board, loadedAt: Date.now() } },
-            loading: { ...s.loading, [projectId]: false },
-            error: { ...s.error, [projectId]: undefined },
-          }));
+          commitSnapshot(beads, board);
           if (runWatchers && ownsClaim()) void runDecomposeWatcherForPoll(projectId, projectPath, board);
           return;
         } catch (initErr) {

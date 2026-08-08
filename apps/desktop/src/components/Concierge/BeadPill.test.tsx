@@ -44,7 +44,7 @@ vi.mock("../../services/beadsCommands", async (importOriginal) => {
 import { Markdown } from "../Markdown";
 import { ConciergeThread } from "./ConciergeThread";
 import { BeadPillHost, BeadPillProvider, type BeadPillContextValue } from "./BeadPill";
-import { useBeadsStore } from "../../stores/beadsStore";
+import { useBeadsStore, __resetBeadsRefreshInFlightForTest } from "../../stores/beadsStore";
 import { useProjectStore } from "../../stores/projectStore";
 import { useSettingsStore } from "../../stores/settingsStore";
 import { useUiStore } from "../../stores/uiStore";
@@ -419,6 +419,12 @@ describe("BeadPill — a bead in a project the founder is not looking at", () =>
       .spyOn(useBeadsStore.getState(), "startPolling")
       .mockImplementation(() => {});
     stopPolling = vi.spyOn(useBeadsStore.getState(), "stopPolling").mockImplementation(() => {});
+    // Drain the store's MODULE-SCOPE per-project bookkeeping too. `setState` below resets the
+    // store's own maps, but the freshness clock the sweep gates on (`beadsPolledAt`) deliberately
+    // lives outside state — so without this, a case whose sweep successfully read "p2" leaves p2
+    // looking freshly-read to the NEXT case, whose sweep then skips it and never calls `refresh`.
+    // The in-flight/steal guards leak the same way; this drains all of them.
+    __resetBeadsRefreshInFlightForTest();
     act(() => {
       useBeadsStore.setState({ byProject: {}, loading: {}, error: {} });
       useSettingsStore.setState({ beadsEnabled: true });

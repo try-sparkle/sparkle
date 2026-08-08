@@ -53,7 +53,7 @@ import { C } from "../../theme/colors";
 import { MD_CODE_FACE } from "../mdCodeFace";
 import { MENTION_PILL_FILL } from "./MentionPill";
 import { sideOf } from "../../engine/pairs";
-import { BEADS_CROSS_PROJECT_REFRESH_MS, useBeadsStore } from "../../stores/beadsStore";
+import { BEADS_CROSS_PROJECT_REFRESH_MS, beadsPolledAt, useBeadsStore } from "../../stores/beadsStore";
 import { useProjectStore } from "../../stores/projectStore";
 import { useRuntimeStore } from "../../stores/runtimeStore";
 import { useSettingsStore } from "../../stores/settingsStore";
@@ -283,7 +283,6 @@ export function BeadPillHost({ children }: { children: ReactNode }) {
         return;
       }
       const now = Date.now();
-      const loaded = useBeadsStore.getState().byProject;
       for (const [id, path] of targets) {
         // ══ FRESHNESS, NOT EFFECT IDENTITY, DECIDES WHETHER TO SHELL OUT ═══════════════════════
         // `others` filters on `selectedProjectId`, so it changes on EVERY selection change and
@@ -293,7 +292,16 @@ export function BeadPillHost({ children }: { children: ReactNode }) {
         // otherwise produce back-to-back convoys of `bd` subprocesses against the shared store —
         // exactly the load the 6× interval was chosen to avoid. `refresh`'s in-flight guard does
         // not cover this: it coalesces CONCURRENT calls for one project, not back-to-back ones.
-        const at = loaded[id]?.loadedAt;
+        //
+        // READ FROM `beadsPolledAt`, NOT FROM THE SNAPSHOT. This gate needs "when did we last
+        // successfully READ this project", which is no longer the same thing as the snapshot's
+        // `loadedAt` ("when did this content last CHANGE"): a poll that finds an unchanged backlog
+        // now deliberately preserves the snapshot object so ~60 AgentRows are not re-rendered every
+        // 5s. Reading `loadedAt` here would therefore see a timestamp frozen at the last real
+        // change, and a project whose backlog is stable — the common case — would look permanently
+        // stale and be re-shelled-out on every sweep, which is the exact convoy this gate exists to
+        // prevent. Both stamps are written only on SUCCESS, so a failed read still re-tries.
+        const at = beadsPolledAt(id);
         if (at !== undefined && now - at < BEADS_CROSS_PROJECT_REFRESH_MS) continue;
         // `false, false` — no watchers, no auto-init. Both are WRITES (one spends AI and files
         // child beads, the other creates a `.beads/` store in the user's repo), and nobody asked a
