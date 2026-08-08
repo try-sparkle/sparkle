@@ -5008,6 +5008,26 @@ export function ConciergeHost({
       // decide whether the submit still counts as evidence the user is at the machine — see
       // `deliver`'s `submittedAt` param for why reading the clock down there instead is inert.
       const submittedAt = Date.now();
+      // ══ AND THE STORE IS STILL NOT POKED HERE — INCLUDING FOR A REAL CLICK ══════════════════════
+      // Recorded because the obvious follow-up was tried and REVERTED, and the next reader will
+      // otherwise try it again. The gap is real: queued intents drain on exactly ONE trigger — the
+      // store's away → here EDGE (`resumeQueuedIntents`) — and `presentNextQueued` re-checks presence
+      // per intent, so a held send cannot be released while the store still reads Away. `noteInput`
+      // is fed only by ComposeBox's `onChange` and xterm's `onData`, both keystroke-only, so neither
+      // a Send CLICK nor a dictated submit reaches it. A held message can therefore only age into
+      // needs-confirmation.
+      //
+      // WHY `if (!autoFiringRef.current) usePresenceStore.getState().noteInput()` IS NOT THE FIX,
+      // even though it looks like the same gesture gate `notifyManualSend` uses further down: it reds
+      // "leaves the idle clock alone, so an addressed destructive send still QUEUES while idle-away".
+      // A countdown reads presence AT EXPIRY, on purpose, so that walking away DURING it still
+      // queues. `noteInput` clears the idle clock for IDLE_AWAY_MS — orders of magnitude longer than
+      // the countdown — so a click, then a walk-away, then expiry would DISPATCH the destructive
+      // send. That is precisely the hole the scoped inference above was written to close; the gesture
+      // gate only narrows who reopens it.
+      //
+      // The drain needs its own trigger rather than a presence lie. Whether a manual submit should
+      // release a previously-held destructive send is a product question — filed, not inferred here.
       const forceSparkle = forceSparkleRef.current;
       forceSparkleRef.current = false;
       // ══ WHERE THIS MESSAGE GOES ═════════════════════════════════════════════════════════════════
