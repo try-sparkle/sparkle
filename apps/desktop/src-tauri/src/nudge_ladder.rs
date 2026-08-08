@@ -574,7 +574,7 @@ pub fn step(state: &mut AgentState, obs: &Observation) -> Decision {
             // silent-in-both-directions problem that justified this expiry. Clearing them destroyed
             // the very row they exist to put up: an agent answers `blocked-on-human`, the founder
             // is flagged, the rung resets to 0 so the NEXT look is five seconds later, and any
-            // further output — the "plus what you need" explanation we just asked it for, a footer
+            // further output — the "exact command or permission" explanation we just asked it for, a footer
             // repaint, the tail of the same turn — deleted the answer. `apply_flags` then cleared
             // the row and had no `flagged` to re-raise it from, and the reply could not even be
             // re-absorbed because absorption is gated on `attempts > 0`, which this block zeroes.
@@ -886,11 +886,19 @@ fn standdown_level(stand: Option<Standdown>, escalated: Option<Escalation>) -> O
 ///   * "Resume your goal" — the instruction, and it is idempotent: safe to receive twenty times.
 ///   * The typed reply vocabulary — the SAME small set the pusher loop (sparkle-4cd0x) parses, so a
 ///     blocked agent's answer is machine-readable by the layer above instead of dying in a terminal.
+///   * "the exact command or permission you need" — the token says WHO is owed; this says WHAT.
+///     Asking for "what you need" got prose that named no action, so the row reached a human with
+///     nothing on it to act on: one agent sat blocked on a privileged command for two days without
+///     ever stating the command, and its branch fell far enough behind to become a revert risk
+///     rather than a fix (bead `sparkle-afi6u`). A `blocked-on-human` row a human cannot act on
+///     without a round trip is the expensive half of blocking, and the round trip is what costs
+///     days — so the first answer has to carry the command.
 pub fn nudge_text(n: u32, silent_secs: u64) -> String {
     format!(
         "[sparkle-nudge #{n} · no output for {}] Automated ping, not a new task. Resume your \
          goal. If you are blocked, reply with ONE line: blocked-on-human | blocked-on-ci | \
-         blocked-on-another-agent | blocked-on-quota | not-blocked — plus what you need.",
+         blocked-on-another-agent | blocked-on-quota | not-blocked — plus the exact command or \
+         permission you need.",
         human_duration(silent_secs)
     )
 }
@@ -901,7 +909,7 @@ pub fn nudge_text(n: u32, silent_secs: u64) -> String {
 /// itself LISTS all five reply tokens, so any search over the raw screen matches our own question
 /// and reads it as the agent's answer, every single time, on an agent that has said nothing at all.
 /// That would silence a genuinely stalled agent, which is the one outcome forbidden here.
-const NUDGE_TAIL: &str = "plus what you need.";
+const NUDGE_TAIL: &str = "plus the exact command or permission you need.";
 
 /// How much of the screen after the question can be the ANSWER, in whitespace-stripped chars.
 ///
@@ -1320,7 +1328,24 @@ mod tests {
             text,
             "[sparkle-nudge #3 · no output for 15m] Automated ping, not a new task. Resume your \
              goal. If you are blocked, reply with ONE line: blocked-on-human | blocked-on-ci | \
-             blocked-on-another-agent | blocked-on-quota | not-blocked — plus what you need."
+             blocked-on-another-agent | blocked-on-quota | not-blocked — plus the exact command \
+             or permission you need."
+        );
+    }
+
+    /// THE ANCHOR MUST STAY A SUFFIX OF THE QUESTION, and this is the one drift that fails SILENTLY.
+    ///
+    /// `parse_reply` locates the question/answer boundary by finding `NUDGE_TAIL` inside the nudge.
+    /// Reword the nudge's last clause without moving the anchor and that `find` returns `None` on
+    /// every screen forever — so every blocked agent's answer goes unheard while the ladder keeps
+    /// pinging, and nothing anywhere reports an error. Pinning the suffix relationship (not the
+    /// literal text) lets the copy keep evolving while the parser stays wired to it.
+    #[test]
+    fn the_parse_anchor_is_the_last_clause_of_the_question() {
+        let text = nudge_text(7, 60);
+        assert!(
+            text.ends_with(NUDGE_TAIL),
+            "NUDGE_TAIL must be the literal tail of nudge_text, else parse_reply finds no boundary"
         );
     }
 
@@ -2006,8 +2031,8 @@ mod tests {
     /// …AND THE EXPIRY IS NARROW (roborev 60353, High). A stand-down that RAISES A FLAG is visible
     /// by construction, so it never had the silent-in-both-directions problem the expiry exists to
     /// close — and expiring it deletes the row it was put up for. The rung resets to 0 on the look
-    /// that reads the answer, so the next look is five seconds later: the "plus what you need"
-    /// explanation the nudge itself asked for was enough to destroy a founder row.
+    /// that reads the answer, so the next look is five seconds later: the "exact command or
+    /// permission" explanation the nudge itself asked for was enough to destroy a founder row.
     ///
     /// Every other test of these two answers holds the hash CONSTANT after the reply, which is why
     /// none of them could see it.
