@@ -74,6 +74,7 @@
                 CloudStreamOutcome::NotEntitled => "not_entitled",
                 CloudStreamOutcome::InsufficientCredits => "insufficient_credits",
                 CloudStreamOutcome::RelayUnconfigured => "relay_unconfigured",
+                CloudStreamOutcome::TooManyStreams => "too_many_streams",
                 CloudStreamOutcome::Unreachable => "unreachable",
             }
         }
@@ -89,6 +90,7 @@
             CloudStreamOutcome::NotEntitled,
             CloudStreamOutcome::InsufficientCredits,
             CloudStreamOutcome::RelayUnconfigured,
+            CloudStreamOutcome::TooManyStreams,
             CloudStreamOutcome::Unreachable,
         ];
 
@@ -128,6 +130,11 @@
         fn is_named(r: R) -> bool {
             match r {
                 R::Unauthorized | R::NotEntitled | R::InsufficientCredits | R::Unconfigured => true,
+                // NAMED. The relay counted this account's own streams to produce the 429, so it is
+                // demonstrably reachable and healthy — collapsing it onto `Unreachable` would report
+                // a working service as an outage, which is the failure this whole enum exists to
+                // prevent.
+                R::TooManyStreams => true,
                 R::Http(_) | R::Unreachable | R::Local => false,
             }
         }
@@ -138,6 +145,7 @@
             R::NotEntitled,
             R::InsufficientCredits,
             R::Unconfigured,
+            R::TooManyStreams,
             R::Http(500),
             R::Http(418),
             R::Unreachable,
@@ -169,12 +177,17 @@
             CloudStreamOutcome::from(R::Unconfigured),
             CloudStreamOutcome::RelayUnconfigured,
         );
+        assert_eq!(
+            CloudStreamOutcome::from(R::TooManyStreams),
+            CloudStreamOutcome::TooManyStreams,
+        );
 
         let named = [
             CloudStreamOutcome::from(R::Unauthorized),
             CloudStreamOutcome::from(R::NotEntitled),
             CloudStreamOutcome::from(R::InsufficientCredits),
             CloudStreamOutcome::from(R::Unconfigured),
+            CloudStreamOutcome::from(R::TooManyStreams),
         ];
         for (i, a) in named.iter().enumerate() {
             for (j, b) in named.iter().enumerate() {

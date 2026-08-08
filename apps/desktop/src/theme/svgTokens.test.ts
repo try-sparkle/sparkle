@@ -63,7 +63,10 @@ describe("themed var() tokens never reach an SVG presentation attribute", () => 
   // `stroke="currentColor"` with no `color` set inherits from whatever is above it, which is a
   // different silent failure — the icon draws, in the wrong colour.
   it("the sidebar's alert icon carries currentColor AND a color to resolve it", () => {
-    const src = readFileSync(join(SRC, "components/AgentSidebar.tsx"), "utf8");
+    // The icon moved out of AgentSidebar.tsx with SupportTicketRow, its only caller. Path only —
+    // the two assertions below are untouched, and they still fail loudly (not vacuously) if it
+    // moves again: a missing marker collapses `body` to "" and both `toContain`s go red.
+    const src = readFileSync(join(SRC, "components/SupportTicketRow.tsx"), "utf8");
     const icon = src.slice(src.indexOf("function AlertCircleIcon"));
     const body = icon.slice(0, icon.indexOf("</svg>"));
     expect(body, "alert icon lost its currentColor stroke").toContain('stroke="currentColor"');

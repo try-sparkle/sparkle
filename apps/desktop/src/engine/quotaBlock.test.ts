@@ -339,7 +339,17 @@ describe("the sidebar can actually show the wall", () => {
     const fs = await import("node:fs/promises");
     const url = await import("node:url");
     const here = url.fileURLToPath(new URL(".", import.meta.url));
-    const src = await fs.readFile(`${here}../components/AgentSidebar.tsx`, "utf8");
+    // BOTH files, because the three call sites now straddle them: the column's own status poll
+    // stayed in AgentSidebar.tsx when the row was extracted into AgentRow.tsx, and the row's two
+    // went with it. Reading only one file counts 2 of 3 and reds on a pure move. Source location
+    // only — the count below is unchanged.
+    const src = (
+      await Promise.all(
+        ["AgentSidebar.tsx", "AgentRow.tsx"].map((f) =>
+          fs.readFile(`${here}../components/${f}`, "utf8"),
+        ),
+      )
+    ).join("\n");
     // Twice for the two stallInputsFor sites, once for thrashReportFor.
     expect(src.match(/quotaBlockForAgent\(/g)?.length ?? 0).toBeGreaterThanOrEqual(3);
   });

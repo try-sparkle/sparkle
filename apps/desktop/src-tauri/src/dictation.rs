@@ -337,6 +337,11 @@ pub enum CloudStreamOutcome {
     InsufficientCredits,
     /// Relay answered 503: ITS Deepgram key is unset. A real service fault, nothing user-fixable.
     RelayUnconfigured,
+    /// Relay answered 429: this account already holds its limit of concurrent relay streams.
+    /// Actionable AND self-correcting — close another dictating window, or retry once the previous
+    /// socket's warm-standby window lapses. NOT a service fault, which is why it does not fold into
+    /// `Unreachable`.
+    TooManyStreams,
     /// No answer from the relay (DNS/TCP/TLS/timeout), an unexpected status, or a local failure.
     Unreachable,
 }
@@ -349,6 +354,7 @@ impl From<crate::cloud::RelayRefusal> for CloudStreamOutcome {
             R::NotEntitled => CloudStreamOutcome::NotEntitled,
             R::InsufficientCredits => CloudStreamOutcome::InsufficientCredits,
             R::Unconfigured => CloudStreamOutcome::RelayUnconfigured,
+            R::TooManyStreams => CloudStreamOutcome::TooManyStreams,
             // An unexpected status proves the relay ANSWERED, but we have no copy for it and must
             // not invent one — report it as unavailable and let the log carry the number.
             R::Http(_) | R::Unreachable | R::Local => CloudStreamOutcome::Unreachable,

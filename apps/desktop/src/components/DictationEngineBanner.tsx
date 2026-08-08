@@ -103,6 +103,16 @@ export const WARNING: Record<DictationFallbackReason, string> = {
   // rule that made `exhausted` say "Refill" rather than inventing a synonym.
   not_entitled:
     "Cloud dictation needs the full Sparkle app, so live dictation preview is off — dictation is running on the local engine. Your words are still captured; they appear when you finish speaking instead of word by word. Unlock Sparkle to get the live preview back",
+  // SAYS NOTHING ABOUT THE SERVICE BEING DOWN, because it is not: the relay answered, having counted
+  // this account's own streams. Naming the real cause is the whole point — this used to fall into
+  // the generic unmapped-status bucket and render `unavailable`, sending a user with two Sparkle
+  // windows open off to debug a cloud outage that never existed.
+  //
+  // "try again in a moment" IS safe under its own trigger here, unlike `too-slow`: the cap frees a
+  // slot as soon as a previous socket's warm-standby window lapses, so the retry can genuinely
+  // succeed. The window-closing remedy is offered first because it is the one the user controls.
+  too_many_streams:
+    "Too many Sparkle windows are dictating at once, so live dictation preview is off here — dictation is running on the local engine. Your words are still captured; they appear when you finish speaking instead of word by word. Close another dictating window, or try again in a moment, to get the live preview back",
 };
 
 // Brand amber is the theme-CONSTANT caution fill, so its ink is the constant brand navy (matching

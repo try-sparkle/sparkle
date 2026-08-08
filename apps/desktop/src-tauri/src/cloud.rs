@@ -631,6 +631,12 @@ pub(crate) enum RelayRefusal {
     NotEntitled,
     /// 503 — the RELAY is misconfigured (its own Deepgram key is unset). Nothing the user can do.
     Unconfigured,
+    /// 429 — this ACCOUNT already holds the relay's per-user limit of concurrent streams. Proves the
+    /// relay is healthy and serving; the cause is several Sparkle windows dictating at once, or a
+    /// warm-standby socket from the last utterance not yet released (WARM_STANDBY). Self-correcting,
+    /// so it must never be reported as an outage — see `as_str`, where the generic `Http` bucket
+    /// would have done exactly that.
+    TooManyStreams,
     /// Any other non-101 status. Carried numerically rather than collapsed, so an unexpected gate
     /// added server-side shows up in the log as itself instead of as a generic failure.
     Http(u16),
@@ -651,6 +657,7 @@ impl RelayRefusal {
             RelayRefusal::InsufficientCredits => "insufficient_credits",
             RelayRefusal::NotEntitled => "not_entitled",
             RelayRefusal::Unconfigured => "relay_unconfigured",
+            RelayRefusal::TooManyStreams => "too_many_streams",
             RelayRefusal::Http(_) => "unreachable",
             RelayRefusal::Unreachable => "unreachable",
             RelayRefusal::Local => "unreachable",
@@ -693,6 +700,7 @@ pub(crate) fn classify_handshake_error(err: &tungstenite::Error) -> RelayRefusal
             401 => RelayRefusal::Unauthorized,
             402 => RelayRefusal::InsufficientCredits,
             403 => RelayRefusal::NotEntitled,
+            429 => RelayRefusal::TooManyStreams,
             503 => RelayRefusal::Unconfigured,
             other => RelayRefusal::Http(other),
         },
@@ -1255,14 +1263,16 @@ mod tests {
         assert_eq!(classify_handshake_error(&http_err(401)), RelayRefusal::Unauthorized);
         assert_eq!(classify_handshake_error(&http_err(402)), RelayRefusal::InsufficientCredits);
         assert_eq!(classify_handshake_error(&http_err(403)), RelayRefusal::NotEntitled);
+        assert_eq!(classify_handshake_error(&http_err(429)), RelayRefusal::TooManyStreams);
         assert_eq!(classify_handshake_error(&http_err(503)), RelayRefusal::Unconfigured);
 
         // …and they are mutually distinct. This is the assertion the old `String` could never
-        // satisfy: four causes, four different answers.
+        // satisfy: five causes, five different answers.
         let all = [
             classify_handshake_error(&http_err(401)),
             classify_handshake_error(&http_err(402)),
             classify_handshake_error(&http_err(403)),
+            classify_handshake_error(&http_err(429)),
             classify_handshake_error(&http_err(503)),
         ];
         for (i, a) in all.iter().enumerate() {
@@ -1279,7 +1289,10 @@ mod tests {
     #[test]
     fn an_unmapped_status_keeps_its_number() {
         assert_eq!(classify_handshake_error(&http_err(500)), RelayRefusal::Http(500));
-        assert_eq!(classify_handshake_error(&http_err(429)), RelayRefusal::Http(429));
+        // 418 stands in for "a status this client has no arm for". 429 used to sit here; it is a
+        // MAPPED gate now (the relay's per-user concurrency cap), and leaving it in this test would
+        // have re-pinned the very collapse the cap's client arm exists to undo.
+        assert_eq!(classify_handshake_error(&http_err(418)), RelayRefusal::Http(418));
     }
 
     /// A transport failure is NOT a refusal — nothing was answered. Conflating the two is what let a
@@ -1305,7 +1318,11 @@ mod tests {
         assert_eq!(RelayRefusal::InsufficientCredits.as_str(), "insufficient_credits");
         assert_eq!(RelayRefusal::NotEntitled.as_str(), "not_entitled");
         assert_eq!(RelayRefusal::Unconfigured.as_str(), "relay_unconfigured");
+        assert_eq!(RelayRefusal::TooManyStreams.as_str(), "too_many_streams");
         assert_eq!(RelayRefusal::Unreachable.as_str(), "unreachable");
+        // The cap's whole point on this side: it must NOT share a token with the no-answer case, or
+        // a healthy relay gets reported as an outage again.
+        assert_ne!(RelayRefusal::TooManyStreams.as_str(), RelayRefusal::Unreachable.as_str());
     }
 
     #[test]

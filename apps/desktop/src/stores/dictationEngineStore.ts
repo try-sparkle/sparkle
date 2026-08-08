@@ -97,12 +97,16 @@ export type DictationFallbackReason =
    *  Actionable: sign in again. */
   | "signed_out"
   /** Signed in, but this account isn't entitled to cloud dictation. Actionable: upgrade. */
-  | "not_entitled";
+  | "not_entitled"
+  /** The relay refused with 429: this account already holds its limit of concurrent streams.
+   *  Actionable (close another dictating window) AND self-correcting (the previous socket's
+   *  warm-standby window lapses), and — the part that matters — NOT an outage. */
+  | "too_many_streams";
 
 /** What `start_cloud_stream` reports — the wire form of Rust's `CloudStreamOutcome`.
  *
  *  PINNED BY `outcome_wire_tokens_are_pinned` (dictation.rs), which serializes every variant through
- *  serde and asserts these exact ten strings. It deliberately does NOT lean on
+ *  serde and asserts these exact eleven strings. It deliberately does NOT lean on
  *  `refusal_tokens_are_pinned`: that test covers `RelayRefusal::as_str()`, whose only consumer is a
  *  tracing field — it never crosses IPC, so it could not have caught a rename here. The two string
  *  sets overlap by intent, not by construction. */
@@ -116,6 +120,7 @@ export type CloudStreamOutcome =
   | "not_entitled"
   | "insufficient_credits"
   | "relay_unconfigured"
+  | "too_many_streams"
   | "unreachable";
 
 /** What the store should DO with an outcome. Split out as a pure value so the policy is testable
@@ -166,6 +171,14 @@ export function classifyCloudOutcome(
     // rather than making them dictate twice to find out.
     case "relay_unconfigured":
       return { kind: "definitive", reason: "unavailable" };
+    // DEFINITIVE, and emphatically not `ambiguous`. A 429 proves the relay is reachable AND healthy —
+    // it counted this account's streams and answered. Left in the generic `Http(_)` bucket it would
+    // have arrived here as `unreachable`, i.e. the corroborate-then-report-an-outage path, telling a
+    // user whose only sin is a second Sparkle window that the service is down. That is exactly the
+    // false-outage failure `RelayRefusal` was introduced to end, and adding a server gate without
+    // this arm would have reintroduced it.
+    case "too_many_streams":
+      return { kind: "definitive", reason: "too_many_streams" };
     case "unreachable":
       return { kind: "ambiguous" };
     // TOTAL BY CONSTRUCTION, AND THAT IS NOT PEDANTRY. Without this arm the function returns
@@ -225,7 +238,12 @@ export function outcomeInstalledStream(outcome: CloudStreamOutcome): boolean {
     case "not_entitled":
     case "insufficient_credits":
     case "relay_unconfigured":
+    case "too_many_streams":
     case "unreachable":
+      // `too_many_streams` is refused during the UPGRADE, before the handshake completes, so no
+      // socket exists and there is nothing to tear down — the same standing as every other
+      // pre-handshake refusal already in this group. (The note lives in the shared body rather than
+      // between the labels because `no-fallthrough` counts a comment-only case as non-empty.)
       return false;
     default: {
       // A KNOWN new variant still fails TYPECHECK here, exactly as in `classifyCloudOutcome`.
@@ -494,9 +512,15 @@ export const useDictationEngineStore = create<DictationEngineState>()(
     //      both definitive and both carrying the only remedy that works ("Sign in", "Unlock
     //      Sparkle"). A test written as `=== "exhausted"` silently overwrites those two the moment
     //      a handshake lands late, which is the identical misdirection aimed at two new reasons.
-    //      The two NOT preserved are the two this seam outranks or owns: `unavailable`, which a
-    //      completed handshake disproves outright, and `too-slow` itself, whose re-report should
-    //      renew its own stamp.
+    //      THREE are NOT preserved — the ones this seam outranks, owns, or can disprove, each on its
+    //      own ground:
+    //        * `unavailable` — a completed handshake disproves it outright (the relay was reached).
+    //        * `too_many_streams` — a completed handshake disproves it just as outright, and for a
+    //          sharper reason: the relay checks the cap DURING the upgrade, so a handshake that
+    //          completed proves the account was UNDER the cap at that moment. Keeping it would go on
+    //          telling the user to close another Sparkle window to fix a condition already cleared.
+    //        * `too-slow` itself — this seam owns it, and its re-report should renew its own stamp.
+    //      Everything else is a relay-STATED account fact that a handshake does not contradict.
     //   2. IT MUST ZERO `openRefusals`. The counter's documented rule is that any EVIDENCE of a live
     //      cloud clears it, and a completed handshake is exactly that — it is this action's whole
     //      premise. Leaving it armed let refuse → late → refuse reach the threshold and then claim
@@ -529,16 +553,30 @@ export const useDictationEngineStore = create<DictationEngineState>()(
         // it. Retract `unavailable` once the count can no longer support it (0 is the strongest
         // form of that), and leave `exhausted` and `too-slow` standing, since those came from the relay SAYING something that a
         // reachability proof does not contradict.
+        //
+        // `too_many_streams` JOINS `unavailable` HERE, and for a stronger reason than reachability.
+        // The relay checks the cap DURING the upgrade, so a handshake that completed proves the
+        // account was under the cap at that moment — the condition is not merely unproven, it is
+        // disproven. Leaving it standing keeps telling the user to close another Sparkle window to
+        // fix something that has already cleared, which is the remedy-that-cannot-help shape.
         if (!speaks)
-          return s.fallbackReason === "unavailable"
+          return s.fallbackReason === "unavailable" || s.fallbackReason === "too_many_streams"
             ? { openRefusals: 0, fallbackReason: null, observedAt: null, dismissed: false }
             : { openRefusals: 0 };
         // Bound to a local first so the narrowing survives, for the same TypeScript reason
         // `noteCloudOpenRefused` states: an aliased condition written against a property of the
         // callback's argument does not narrow.
         const stated = s.fallbackReason;
+        // `too_many_streams` is excluded for the reason given in the `!speaks` branch above: the cap
+        // is enforced during the upgrade, so a completed handshake disproves it. The correct account
+        // of an utterance that refused at the cap and then connected after the user stopped talking
+        // is "connected too late" — not "too many windows are dictating", which is no longer true
+        // and whose remedy would do nothing.
         const preserved =
-          stated !== null && stated !== "unavailable" && stated !== "too-slow";
+          stated !== null &&
+          stated !== "unavailable" &&
+          stated !== "too-slow" &&
+          stated !== "too_many_streams";
         const reason: DictationFallbackReason = preserved ? stated : "too-slow";
         return {
           fallbackReason: reason,

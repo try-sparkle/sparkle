@@ -423,6 +423,30 @@ describe("a relay that CONNECTED is never reported as unreachable", () => {
     },
   );
 
+  // `too_many_streams` is deliberately NOT in the preserved table above, and this is the pair that
+  // pins the difference. The relay enforces the cap DURING the upgrade, so a handshake that
+  // completed proves the account was under the cap at that moment — the reason is not merely
+  // unproven, it is disproven. Keeping it would leave the banner telling the user to close another
+  // Sparkle window to fix a condition that has already cleared.
+  it("retracts a stated 'too_many_streams' on the evidence lap — a handshake disproves the cap", () => {
+    read().noteCloudUnavailable("too_many_streams");
+    expect(read().fallbackReason).toBe("too_many_streams");
+    read().noteCloudConnectedLate(false);
+    expect(read().fallbackReason).toBeNull();
+  });
+
+  it("re-reports a stated 'too_many_streams' as too-slow when the late connect speaks", () => {
+    // The honest account of "refused at the cap, then connected after the user stopped talking" is
+    // a timing fault, not a window count — and unlike a preserved reason, it takes a fresh stamp.
+    vi.useFakeTimers();
+    read().noteCloudUnavailable("too_many_streams");
+    const stamped = read().observedAt!;
+    vi.advanceTimersByTime(60_000);
+    read().noteCloudConnectedLate(true);
+    expect(read().fallbackReason).toBe("too-slow");
+    expect(read().observedAt).toBeGreaterThan(stamped);
+  });
+
   it("retracts ONLY 'unavailable' — a genuine too-slow of its own still stands", () => {
     // The counter-case that stops the table above from being satisfied by "never write anything":
     // an UNPRESERVED late connect does take the claim, and a following evidence-only lap leaves it.
@@ -531,6 +555,7 @@ describe("classifyCloudOutcome — one policy table, enumerated", () => {
     ["not_entitled", "not_entitled"],
     ["insufficient_credits", "exhausted"],
     ["relay_unconfigured", "unavailable"],
+    ["too_many_streams", "too_many_streams"],
   ] as const)("reports %s definitively as %s", (outcome, reason) => {
     expect(classifyCloudOutcome(outcome)).toEqual({
       kind: "definitive",
@@ -542,6 +567,23 @@ describe("classifyCloudOutcome — one policy table, enumerated", () => {
   // is exactly what the corroboration counter exists for.
   it("keeps an unreachable relay ambiguous, so it still needs corroboration", () => {
     expect(classifyCloudOutcome("unreachable")).toEqual({ kind: "ambiguous" });
+  });
+
+  // THE FALSE-OUTAGE GUARD FOR THE RELAY'S CONCURRENCY CAP. A 429 proves the relay is reachable and
+  // healthy: it counted this account's own streams and answered. Before its client arm existed it
+  // fell into the generic unmapped-status bucket, which resolves to `unreachable` → `ambiguous` →
+  // the "Sparkle can't reach the cloud transcription service" copy. Asserted as a NON-equality
+  // against that verdict, not just as an equality to the right one, because the failure being
+  // guarded is specifically the collapse onto the ambiguous path.
+  it("never reports a per-account stream cap as an unreachable relay", () => {
+    expect(classifyCloudOutcome("too_many_streams")).not.toEqual({ kind: "ambiguous" });
+    expect(classifyCloudOutcome("too_many_streams")).not.toEqual(
+      classifyCloudOutcome("unreachable"),
+    );
+    expect(classifyCloudOutcome("too_many_streams")).not.toEqual({
+      kind: "definitive",
+      reason: "unavailable",
+    });
   });
 
   // `live` and `installed by this call` differ on exactly one outcome; if they ever collapse, a
