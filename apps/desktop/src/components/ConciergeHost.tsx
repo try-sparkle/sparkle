@@ -1158,7 +1158,22 @@ export function ConciergeHost({
   // render is the loop that pattern is famous for. Guarded on a real change for the same reason.
   useEffect(() => {
     setAcknowledged((prev) => {
-      const loud = new Set(surfacedAgents(feed).map((a) => a.id));
+      // EVERY POPULATION THAT CAN PRODUCE A CARD, not just the row-owning one (roborev 60249-H1).
+      // `surfacedAgents` is `topLevel`-filtered and `isTopLevelAgent` excludes every worker, but
+      // `cardAgents` in the view model is `[cards, rowless.cards, strandedAgents]` — the last two
+      // are by definition NOT top-level. Built from the narrow set, an acknowledged WORKER could
+      // never re-enter `loud`, so its record was never released: `acknowledgedIds` suppressed its
+      // receipts forever, and the chip that would have let the reader clear it is hidden while the
+      // worker is red again. That is roborev 60209 exactly, re-created for the worker population.
+      //
+      // The PRE-digest populations, deliberately: digesting can withdraw a card while the agent is
+      // still red, and releasing too readily only costs a receipt-suppression that should have
+      // ended anyway. Under-releasing is the failure that lasts forever.
+      const loud = new Set(
+        [...surfacedAgents(feed), ...nestedRowlessAgents(feed), ...strandedAgents(feed)].map(
+          (a) => a.id,
+        ),
+      );
       const known = new Set(allAgents(feed).map((a) => a.id));
       // Gone from the fleet goes too — its chip would name an agent nobody can open.
       const next = prev.filter((a) => known.has(a.id) && !loud.has(a.id));
@@ -6043,11 +6058,20 @@ export function ConciergeHost({
         // for the receipts) — unmute or unpin and the chip is back.
         if (eligible.get(a.id) !== true) return false;
         // AND THE CHIP STANDS DOWN once the agent is visibly getting on with something (roborev
-        // 60158-H1): while the block stands it reads as the de-escalated `idle`/`stopped`. This is
-        // display only — the RECORD outlives it, and is released by the episode rule in the prune
-        // effect, which is what keeps the next block's receipt reachable.
+        // 60158-H1). THIS IS THE DISPLAY HALF OF A TWO-PART RULE, and the split is the whole design:
+        // the chip hides on `working`, while the RECORD is released only when the agent is surfaced
+        // again (the effect above). Display alone cannot end the receipt-suppression the record
+        // carries — that was roborev 60209 — and release alone would leave a chip up while the agent
+        // is visibly working, which was 60158-H1. Each half fixes what the other cannot.
+        // A DENYLIST ON `working`, not an allowlist of the two de-escalated statuses (roborev
+        // 60249-M2). `withDismissedAlerts` only guarantees `idle`/`stopped` while the acknowledged
+        // red still STANDS; every other status the agent can go on to publish — `done`, `unmerged`,
+        // `new`, `questions`, `lapsed` — is neither `needs_you` (so the record is not released) nor
+        // in an allowlist (so the chip is hidden). The blocker would then leave no trace at all: no
+        // chip, no receipt, and nothing to clear. Hiding only on `working` is the rule this filter
+        // has claimed all along.
         const now = everyone.find((x) => x.id === a.id);
-        return now !== undefined && (now.status === "idle" || now.status === "stopped");
+        return now !== undefined && now.status !== "working";
       });
     // Order the whole stream by WHEN EACH ITEM FIRST APPEARED, not by what kind it is. Concatenated
     // as [chat, digests] only to tie-break items that arrive in the SAME tick; anything already

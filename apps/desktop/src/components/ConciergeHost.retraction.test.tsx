@@ -276,50 +276,6 @@ describe("a live blocker is pinned above the composer, not threaded", () => {
   });
 
   it("mints a receipt for a re-block that never passes through `working`", () => {
-    // ROBOREV 60221-M1. A red epoch re-arms on ANY non-red status, so releasing the record only on
-    // `working` was too narrow: an `errored` blocker that is acknowledged, restarted and asks again
-    // never publishes `working`, so the record survived and suppressed the SECOND, never-acknowledged
-    // episode's receipt — with no chip on screen to clear, because a live blocker outranks its own
-    // snapshot. The release is keyed on the EPISODE now, so the path the status took does not matter.
-    const p = projectOf("p1", "sparkle-desktop", [tab("solo")]);
-    const { rerender } = render(<ConciergeHost feed={feedFrom([p], { solo: "errored" })} />);
-    fireEvent.click(screen.getByTestId("concierge-nudge-dismiss"));
-    rerender(<ConciergeHost feed={feedFrom([p], { solo: "stopped" })} />);
-    expect(screen.queryAllByTestId(PINNED_BLOCKER_CHIP_TESTID)).toHaveLength(1);
-
-    // Straight back to red without ever reading `working`.
-    rerender(<ConciergeHost feed={feedFrom([p], { solo: "approval" })} />);
-    expect(cardAgentIds()).toEqual(["solo"]);
-
-    // …and THIS episode, which nobody acknowledged, earns its receipt.
-    rerender(<ConciergeHost feed={feedFrom([p], { solo: "working" })} />);
-    expect(resolvedCardAgentIds()).toEqual(["solo"]);
-  });
-
-  it("keeps the chip when an inherited-red HEAD publishes its own work after the dismissal", () => {
-    // ROBOREV 60221-M2. The card names the working orchestrator only when it INHERITED a worker's
-    // red. `[x]` dismisses the whole subtree, the worker de-escalates, the bubble source goes — and
-    // the head then publishes its OWN `working`. Releasing the record on `working` therefore fired
-    // one tick after the click, so the chip vanished instead of persisting: the exact opposite of
-    // the founder's "collapse to a quiet chip, never vanishes".
-    const p = projectOf("p1", "sparkle-desktop", [tab("orch"), worker("w1", "orch")]);
-    const { rerender } = render(
-      <ConciergeHost feed={feedFrom([p], { orch: "working", w1: "waiting" })} />,
-    );
-    expect(cardAgentIds()).toEqual(["w1"]);
-    fireEvent.click(screen.getByTestId("concierge-nudge-dismiss"));
-
-    // The tick after: the worker is calmed, the head is plainly working — and the chip is still
-    // there, because nothing about that sequence is a NEW episode.
-    rerender(<ConciergeHost feed={feedFrom([p], { orch: "working", w1: "idle" })} />);
-    expect(
-      screen
-        .queryAllByTestId(PINNED_BLOCKER_CHIP_TESTID)
-        .map((el) => el.getAttribute("data-agent-id")),
-    ).toEqual(["w1"]);
-  });
-
-  it("mints a receipt for a re-block that never passes through `working`", () => {
     // ROBOREV 60221-M1. The release used to be "the agent published `working`", which is too narrow:
     // a red epoch re-arms on ANY non-red status, so an `errored` blocker that is acknowledged,
     // restarted and immediately asks again never passes through `working` at all. Its second episode
@@ -342,6 +298,46 @@ describe("a live blocker is pinned above the composer, not threaded", () => {
     rerender(<ConciergeHost feed={feedFrom([p], { solo: "working" })} />);
     expect(cardAgentIds()).toEqual([]);
     expect(resolvedCardAgentIds()).toEqual(["solo"]);
+  });
+
+  it("releases a WORKER's record too, so its next block still earns a receipt", () => {
+    // ROBOREV 60249-H1, and the population the release rule silently excluded. `surfacedAgents` is
+    // `topLevel`-filtered and `isTopLevelAgent` excludes every worker — but a rowless or stranded
+    // worker gets a card of its own (that card is its ONLY affordance). Built from the narrow set,
+    // an acknowledged worker could never re-enter the loud set, so its record was never released and
+    // `acknowledgedIds` suppressed its receipts forever, with no chip to clear because the chip is
+    // hidden while it is red again. A parentless worker is the stranded shape.
+    const p = projectOf("p1", "sparkle-desktop", [worker("lone", null)]);
+    const { rerender } = render(<ConciergeHost feed={feedFrom([p], { lone: "waiting" })} />);
+    expect(cardAgentIds()).toEqual(["lone"]);
+    fireEvent.click(screen.getByTestId("concierge-nudge-dismiss"));
+    rerender(<ConciergeHost feed={feedFrom([p], { lone: "idle" })} />);
+    expect(screen.queryAllByTestId(PINNED_BLOCKER_CHIP_TESTID)).toHaveLength(1);
+
+    // A genuinely new block for the same worker, never acknowledged…
+    rerender(<ConciergeHost feed={feedFrom([p], { lone: "waiting" })} />);
+    expect(cardAgentIds()).toEqual(["lone"]);
+
+    // …and it earns its receipt, which is what the record's release buys.
+    rerender(<ConciergeHost feed={feedFrom([p], { lone: "working" })} />);
+    expect(resolvedCardAgentIds()).toEqual(["lone"]);
+  });
+
+  it("keeps the chip while the agent rests at a NON-working status", () => {
+    // ROBOREV 60249-M2. The filter allowlisted `idle`/`stopped`, but those are only what
+    // `withDismissedAlerts` produces while the red still stands. Any later status — `unmerged` here
+    // — was neither surfaced (so the record was not released) nor allowlisted (so the chip was
+    // hidden), and the acknowledged blocker left NO trace: no chip, no receipt, nothing to clear.
+    const p = projectOf("p1", "sparkle-desktop", [tab("solo")]);
+    const { rerender } = render(<ConciergeHost feed={feedFrom([p], { solo: "waiting" })} />);
+    fireEvent.click(screen.getByTestId("concierge-nudge-dismiss"));
+
+    rerender(<ConciergeHost feed={feedFrom([p], { solo: "unmerged" })} />);
+    expect(
+      screen
+        .queryAllByTestId(PINNED_BLOCKER_CHIP_TESTID)
+        .map((el) => el.getAttribute("data-agent-id")),
+    ).toEqual(["solo"]);
   });
 
   it("keeps the chip on the tick right after [x], when the calm is the dismissal's own doing", () => {
