@@ -16,6 +16,7 @@ import { openCloudDictationWindow, nextBalanceCents } from "./services/cloudDict
 import { safeUnlisten } from "./services/safeUnlisten";
 import { selectedProjectName } from "./services/creditProject";
 import { classifyVoiceError, isWatchdogFault } from "./voice/dictationCopy";
+import { takeHoldOriginAge } from "./voice/holdOrigin";
 import type { Phase } from "./voice/dictationPhase";
 import { routeDictationToTerminal } from "./services/dictationTerminalSink";
 import {
@@ -1095,7 +1096,13 @@ export async function createDictationController(
         // The cloud-dictation preference is read LIVE at the passive→active phase edge
         // (start_cloud_stream), not frozen here, so toggling the menu mid-session takes effect
         // without restarting.
-        await invoke("start_dictation");
+        // Carries the origin too, even though `toggle` has NO CALLERS in the app today (roborev
+        // 55555 — the mic button and the voice menu both arm through `setEnabled(true)`, which
+        // lands in the `[enabled]` effect below). Deliberate rather than incidental: if this path
+        // is ever wired up, the alternative is an arm that silently reports no keydown, which is
+        // the exact shape of gap this whole change exists to close. `takeHoldOriginAge()` is safe
+        // to call from anywhere — one-shot and age-capped — so there is no cost to consistency.
+        await invoke("start_dictation", { keydownAgeMs: takeHoldOriginAge() });
       } catch (e) {
         state.setModelProgress(null);
         state.setError(String(e));
@@ -1326,7 +1333,14 @@ export function useAmbientVoice(): void {
       (controllerPromiseRef.current ?? Promise.resolve(null))
         .then(() => {
           if (!activeRun) return;
-          invoke("start_dictation").catch((e) => {
+          // TAKEN HERE, NOT WHEN THE EFFECT RAN, and the difference is the point. Everything
+          // between the keydown and this line — two store writes, React scheduling this effect, and
+          // the `await controllerPromiseRef` gate immediately above — is unmeasured time on the
+          // push-to-talk path, and reading the clock any earlier would exclude exactly the part
+          // nobody has ever seen a number for. `null` when there is no trustworthy origin (an arm
+          // from the mic button or the voice menu, not a hold); Rust treats that as "no keydown
+          // stage" rather than as an error. See voice/holdOrigin.
+          invoke("start_dictation", { keydownAgeMs: takeHoldOriginAge() }).catch((e) => {
             store.setModelProgress(null);
             store.setError(String(e));
             store.setEnabled(false); // permission denied / no device → fall back to muted

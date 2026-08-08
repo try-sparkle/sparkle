@@ -9,9 +9,10 @@
 // different target than the listener is registered on is the wrong-target vacuous test the repo's
 // `no-cross-target-event-dispatch` rule exists to catch.
 import { cleanup, fireEvent, render } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { TALK_KEY, usePushToTalk, type UsePushToTalkArgs } from "./usePushToTalk";
+import { clearHoldOrigin, holdOriginPending, takeHoldOriginAge } from "./holdOrigin";
 
 afterEach(cleanup);
 
@@ -180,6 +181,65 @@ describe("nothing is bound outside Push to talk", () => {
     view.unmount();
     down();
     expect(onHoldStart).not.toHaveBeenCalled();
+  });
+});
+
+describe("the keydown is STAMPED, so the latency it starts can be measured", () => {
+  // sparkle-oyapv. Push to talk rests with the mic released, so this keydown is the start of a
+  // ~200-600 ms span in which everything the founder says is lost — and until this stamp existed
+  // nothing upstream of Rust recorded when the gesture happened, so that span had never been
+  // measured. These rows assert the SIDE EFFECT (an origin is now pending) rather than that the
+  // callback fired, which the rows above already cover and which would stay green with the stamp
+  // deleted.
+  beforeEach(() => clearHoldOrigin());
+
+  it("a real keydown leaves an origin for the arm to bill against", () => {
+    mount();
+    down();
+    expect(holdOriginPending()).toBe(true);
+    // And it is a usable age, not merely a truthy slot: this is the number that reaches Rust.
+    expect(takeHoldOriginAge()).toBeGreaterThanOrEqual(0);
+  });
+
+  it("stamps BEFORE onHoldStart, because everything that callback does is what is being measured", () => {
+    // `onHoldStart` is what eventually reaches `invoke("start_dictation")` by way of applyIntent,
+    // two store writes and a React effect. A stamp taken after it would silently exclude the whole
+    // frontend half of the span — the half that had never been measured, i.e. the entire point.
+    const pendingWhenCalled: boolean[] = [];
+    mount({ onHoldStart: () => pendingWhenCalled.push(holdOriginPending()) });
+    down();
+    expect(pendingWhenCalled).toEqual([true]);
+  });
+
+  it("does not stamp for a key that is not the talk key", () => {
+    mount();
+    fireEvent.keyDown(window, { key: "a" });
+    expect(holdOriginPending()).toBe(false);
+  });
+
+  it("auto-repeat does not re-stamp, so the origin stays the moment the key went DOWN", () => {
+    // Re-stamping on repeat would reset the clock ~30×/second, so the reported latency would be
+    // the time since the last REPEAT — a number near zero, published for the exact hold that is
+    // losing words. Consuming the origin first makes the re-stamp observable: if a repeat stamped,
+    // the slot would be full again.
+    mount();
+    down();
+    expect(takeHoldOriginAge()).not.toBeNull();
+    down({ repeat: true });
+    down({ repeat: true });
+    expect(holdOriginPending()).toBe(false);
+  });
+
+  it("does not stamp when the tray is inert or the mode is not push to talk", () => {
+    // The listeners are unbound, so no gesture exists to bill.
+    mount({ inert: true });
+    down();
+    expect(holdOriginPending()).toBe(false);
+
+    cleanup();
+    mount({ active: false });
+    down();
+    expect(holdOriginPending()).toBe(false);
   });
 });
 

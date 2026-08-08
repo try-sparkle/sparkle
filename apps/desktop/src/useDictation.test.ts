@@ -227,7 +227,9 @@ describe("createDictationController (hook logic without renderHook)", () => {
     await ctrl.toggle();
     // No cloud arg: the cloud-dictation preference is read live at the wake→active transition
     // (start_cloud_stream), so toggling the menu takes effect without restarting dictation.
-    expect(invoke).toHaveBeenCalledWith("start_dictation");
+    // The one argument it DOES carry is the push-to-talk keydown origin (voice/holdOrigin), `null`
+    // here because no hold stamped one — this is `toggle`, not a key press.
+    expect(invoke).toHaveBeenCalledWith("start_dictation", { keydownAgeMs: null });
     expect(useDictationStore.getState().status).toBe("listening");
   });
 
@@ -1316,7 +1318,9 @@ describe("dictation follows focus — the caret in a TERMINAL redirects routing"
     expect(useDictationStore.getState().status).toBe("idle");
     // …and the arm genuinely happened — this must be a PAUSE, not a refusal to arm. Capture really
     // starts, and `enabled` is left exactly as the user set it, so this can never be read as a mute.
-    expect(invoke).toHaveBeenCalledWith("start_dictation");
+    // `keydownAgeMs: null` — no hold stamped an origin (voice/holdOrigin); this arm came from the
+    // store, not a key press.
+    expect(invoke).toHaveBeenCalledWith("start_dictation", { keydownAgeMs: null });
     expect(useDictationStore.getState().enabled).toBe(true);
     // And the mic is not stuck there: the existing focus-owner path restores it on the way out,
     // proving the pause is recoverable by moving the caret alone — no second click on the mic.

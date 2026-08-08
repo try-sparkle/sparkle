@@ -2239,6 +2239,43 @@ impl DictationState {
 /// the Capture first (closing the decode channel) then the DecodeWorker (a bounded join). The audio
 /// callback now does ONLY cheap, bounded work — level meter, VAD windowing, and non-blocking channel
 /// pushes — so it never overruns the CoreAudio capture ring buffer with a synchronous decode.
+// ── HANDING THE GESTURE ORIGIN TO THE CAPTURE IT BELONGS TO (sparkle-oyapv) ──────────────────────
+//
+// `start_dictation` knows when the key went down and what every stage before the capture cost;
+// `build_capture` is where a `Capture` is actually opened. Between them sit `reconcile_capture`,
+// `reconcile_locked` and the reconcile-step machinery — none of which have any business carrying a
+// diagnostic.
+//
+// A ONE-SLOT HANDOFF, NOT A WIDENED SIGNATURE, and that is a deliberate trade. Threading an
+// `Option<ArmOrigin>` through would have changed three production signatures and forced `None` at
+// every one of `reconcile_capture`'s other call sites (focus events, the watchdog, the device-change
+// path) so that a log line could be complete. The slot is set immediately before the synchronous
+// `reconcile_capture` call and taken by the capture that call builds, so in the ordinary case the
+// handoff is unambiguous.
+//
+// WHAT IT CAN GET WRONG, stated rather than defended against: a reconcile racing in from the focus
+// event between the set and the take would consume the origin and label ITS capture with this arm's
+// keydown. That mislabels one diagnostic line and changes no behaviour. `ARM_ORIGIN_MAX_AGE` bounds
+// the other direction — an origin nobody claimed (the arm aborted, or no window was focused so no
+// capture was built) must not be picked up minutes later by an unrelated rebuild.
+const ARM_ORIGIN_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(10);
+
+static ARM_ORIGIN: Mutex<Option<crate::audio::ArmOrigin>> = Mutex::new(None);
+
+/// Record the gesture origin for the capture the NEXT `build_capture` opens.
+fn set_arm_origin(origin: crate::audio::ArmOrigin) {
+    *ARM_ORIGIN.lock().unwrap_or_else(|p| p.into_inner()) = Some(origin);
+}
+
+/// Claim the pending gesture origin, if one is pending and still fresh.
+///
+/// Takes unconditionally — a stale origin is DISCARDED rather than left in place, so it cannot go on
+/// to mislabel a later capture after failing to label this one.
+fn take_arm_origin() -> Option<crate::audio::ArmOrigin> {
+    let taken = ARM_ORIGIN.lock().unwrap_or_else(|p| p.into_inner()).take()?;
+    (taken.keydown.elapsed() < ARM_ORIGIN_MAX_AGE).then_some(taken)
+}
+
 fn build_capture(
     app: AppHandle,
     transcriber: Arc<Mutex<ParakeetTdt>>,
@@ -2288,7 +2325,11 @@ fn build_capture(
     // underflow; this can't underflow on macOS uptime clocks, but the idiom is the robust one).
     let now0 = std::time::Instant::now();
     let mut last_level_emit = now0.checked_sub(LEVEL_EMIT_INTERVAL).unwrap_or(now0);
-    let capture = Capture::start(&current_device_choice(), move |frame: Vec<f32>| {
+    // Claim the gesture origin this capture is being built FOR, if there is one (see
+    // `take_arm_origin`). One-shot: a capture rebuilt later by a focus event or the watchdog finds
+    // the slot empty and reports no keydown span, which is correct — it had no keydown behind it.
+    let origin = take_arm_origin();
+    let capture = Capture::start(&current_device_choice(), origin, move |frame: Vec<f32>| {
         let now = std::time::Instant::now();
         if now.duration_since(last_level_emit) >= LEVEL_EMIT_INTERVAL {
             last_level_emit = now;
@@ -3166,6 +3207,15 @@ pub fn start_audio_watchdog(app: AppHandle) {
                 let Some(state) = app.try_state::<DictationState>() else { return };
 
                 if devices_changed.swap(false, Ordering::Acquire) {
+                    // FIRST, and unconditionally. The cached device format (`audio::
+                    // INPUT_CONFIG_TTL`) is only sound because this fires: a device list or default
+                    // input that moved is exactly when a remembered format stops describing the
+                    // microphone we are about to open. It must run BEFORE `on_device_list_changed`,
+                    // which deliberately returns early when the change does not move the binding —
+                    // and "the same device, renegotiated" is a change that leaves the binding alone
+                    // while invalidating the format. Dropping a still-valid entry costs one ~100 ms
+                    // read on the next hold; keeping an invalid one costs correct audio.
+                    crate::audio::invalidate_input_config_cache();
                     state.on_device_list_changed(&app);
                 }
                 state.watchdog_tick(&app);
@@ -3323,7 +3373,18 @@ fn load_model(root: &std::path::Path, progress: impl Fn(u64, Option<u64>)) -> Re
 /// commands either. Same shape as `preflight::claude_preflight` — for work that is millions of
 /// times shorter than this.
 #[tauri::command]
-pub async fn start_dictation(app: AppHandle, state: State<'_, DictationState>) -> Result<(), String> {
+pub async fn start_dictation(
+    app: AppHandle,
+    state: State<'_, DictationState>,
+    // How long ago the push-to-talk key went down, as the frontend measured it (`voice/holdOrigin`).
+    //
+    // `Option<u64>`, and BOTH empty shapes mean the same thing. Tauri's arg deserialization gives
+    // `None` for an absent key, and `voice/holdOrigin` sends an explicit `null` when it has no
+    // trustworthy origin — an arm that came from the mic button or the voice menu rather than a
+    // hold, or a stamp too old to believe. Neither is an error: the arm is still measured, it just
+    // reports no keydown stage rather than inventing one.
+    keydown_age_ms: Option<u64>,
+) -> Result<(), String> {
     // ── THE PUSH-TO-TALK COLD-START BUDGET (sparkle-oyapv) ───────────────────────────────────────
     // Push to talk rests with the mic RELEASED (`voice/sendMode` micIntentForMode -> "off"), so on a
     // hold this entire command sits between the key going down and the first sample existing. The
@@ -3334,6 +3395,12 @@ pub async fn start_dictation(app: AppHandle, state: State<'_, DictationState>) -
     // sub-spans (device resolve / format negotiation / stream build / play) and CoreAudio's
     // first-buffer delay are logged in `audio.rs`, because that is where they can be separated.
     let t_cmd = std::time::Instant::now();
+    // Reconstruct when the key went down. `checked_sub` because `Instant - Duration` PANICS on
+    // underflow, and this duration comes from the frontend — a value larger than the process has
+    // been running must degrade to "no origin", never abort the arm. See `audio::ArmOrigin::keydown`
+    // for why this is a LOWER BOUND (the IPC hop lands outside it).
+    let keydown = keydown_age_ms
+        .and_then(|ms| t_cmd.checked_sub(std::time::Duration::from_millis(ms)));
     // "Arm" the mic. The cpal capture itself is gated on focus by reconcile_locked: it comes up now
     // only if a Sparkle window is the active OS window, and is (re)built later by the focus event.
     //
@@ -3513,9 +3580,24 @@ pub async fn start_dictation(app: AppHandle, state: State<'_, DictationState>) -
     // JoinError: the blocking task panicked. The panic hook already logged it; surface it as an
     // ordinary Err so the mic click reports a failure instead of silently doing nothing.
     .map_err(|e| format!("voice model load task failed: {e}"))??;
-    // The ASR decoder is cached process-static, so a warm hold does NOT pay the ~2.5s ONNX
-    // recognizer init here. It DOES still pay a fresh Silero VAD session plus three rounds of file
-    // verification, and that cost has never been separated from the cached case in any log.
+    // The ASR decoder is cached process-static, so a warm hold does NOT pay the ONNX recognizer
+    // init here. It DOES still pay a fresh Silero VAD session plus file verification.
+    //
+    // ── THAT REMAINDER IS NOW MEASURED, AND IT IS ~5 ms (sparkle-oyapv) ──────────────────────────
+    // This comment used to say the per-arm cost "has never been separated from the cached case in
+    // any log", and that was the open question behind a proposal to cache the VAD session too.
+    // `measure_model_load_split` (below, `#[ignore]`d) answers it on real installed models:
+    //
+    //     round 1  2972.8 ms   ONNX transducer init + Silero VAD + file verification
+    //     round 2     5.4 ms   Silero VAD + file verification ONLY (transducer from DECODER_CACHE)
+    //     round 3     4.8 ms   ditto
+    //
+    // So a warm arm's `model_ms` is ~5 ms — under 3% of even the best measured hold (218 ms) and
+    // around 1% of a cold one. CACHING THE VAD IS THEREFORE NOT WORTH DOING, and that is a
+    // conclusion from a number rather than a preference: it holds per-session state (queued speech
+    // segments), so sharing it across arms would be a correctness risk taken to buy 5 ms. The
+    // remaining budget is `Capture::start`, which is where the effort belongs.
+    //
     // Stamped from `t_model`, so this is the load ALONE — it no longer absorbs the post-permission
     // epoch re-check (a second acquisition of the contended session lock) or `app_data_dir`.
     let model_ms = t_model.elapsed().as_millis() as u64;
@@ -3578,6 +3660,20 @@ pub async fn start_dictation(app: AppHandle, state: State<'_, DictationState>) -
     drop(sess);
     // Builds the capture now iff a window is focused; otherwise the focus event brings it up later.
     let t_reconcile = std::time::Instant::now();
+    // Hand the gesture origin to the capture this reconcile is about to build, so the first audio
+    // frame can report ONE complete keydown→first-sample span instead of three lines a human has to
+    // join by hand from a release log. Set only when the frontend actually gave us a keydown: an arm
+    // from the mic button has no gesture behind it and must not be reported as though it did.
+    if let Some(keydown) = keydown {
+        set_arm_origin(crate::audio::ArmOrigin {
+            keydown,
+            reconcile_at: t_reconcile,
+            js_to_invoke_ms: keydown_age_ms.unwrap_or(0),
+            prelude_ms,
+            permission_ms,
+            model_ms,
+        });
+    }
     state.reconcile_capture(&app);
     // `reconcile_ms` INCLUDES `Capture::start` when a window is focused, and is near-zero when one
     // is not (the capture then comes up on the focus event instead). So it is not comparable across
@@ -6843,7 +6939,7 @@ mod tests {
     #[test]
     fn start_dictation_is_async_and_its_future_is_send() {
         fn off_the_main_thread<'r, F: std::future::Future + Send>(
-            _: fn(AppHandle, State<'r, DictationState>) -> F,
+            _: fn(AppHandle, State<'r, DictationState>, Option<u64>) -> F,
         ) {
         }
         off_the_main_thread(super::start_dictation);
@@ -7003,6 +7099,146 @@ mod tests {
         });
         // `load_model` acquires exactly this way, so a later click still gets through.
         drop(super::MODEL_LOAD.lock().unwrap_or_else(|p| p.into_inner()));
+    }
+
+    // ── THE ARM-ORIGIN HANDOFF (sparkle-oyapv) ───────────────────────────────────────────────────
+    //
+    // The Rust half of the keydown handoff had NO test (roborev, Medium), while the TypeScript half
+    // (`voice/holdOrigin`) was pinned from every direction. That asymmetry mattered because the two
+    // guarantees below are the only thing stopping an abandoned hold from labelling an unrelated
+    // capture — one rebuilt by a focus event or the watchdog — with somebody else's keydown. As
+    // written before these rows, deleting the `< ARM_ORIGIN_MAX_AGE` check or turning the `.take()`
+    // into a peek left the whole Rust suite green.
+    //
+    // These drive the REAL `set_arm_origin` / `take_arm_origin` against the real static rather than
+    // an extracted predicate: a pure `is_fresh(age)` helper would be satisfied by a call site that
+    // no longer consults it, which is the same vacuity one level up.
+
+    /// Serializes the rows below. `ARM_ORIGIN` is ONE process-wide slot and cargo runs tests in
+    /// parallel in one process, so without this the two tests would consume each other's origin —
+    /// the same interference `audio::tests::DEVICE_TEST_LOCK` exists for, and the same reason it is
+    /// not a statement about production (one arm sets the slot at a time there).
+    static ARM_ORIGIN_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// An origin whose keydown is `age` in the past, or `None` when this process has not been alive
+    /// that long (`Instant::checked_sub` cannot go before the clock's base).
+    fn origin_aged(age: std::time::Duration) -> Option<crate::audio::ArmOrigin> {
+        let now = std::time::Instant::now();
+        Some(crate::audio::ArmOrigin {
+            keydown: now.checked_sub(age)?,
+            reconcile_at: now,
+            js_to_invoke_ms: 7,
+            prelude_ms: 0,
+            permission_ms: 0,
+            model_ms: 0,
+        })
+    }
+
+    #[test]
+    fn a_fresh_arm_origin_is_handed_over_exactly_once() {
+        let _serial = ARM_ORIGIN_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // ONE-SHOT is the property. A second capture — the focus-event rebuild that follows a hold,
+        // or the watchdog's — must find nothing, or it would publish a keydown span for a capture
+        // no key press produced.
+        super::set_arm_origin(origin_aged(std::time::Duration::ZERO).expect("zero age never fails"));
+
+        let first = super::take_arm_origin();
+        assert!(first.is_some(), "the capture this arm is building must receive the gesture");
+        assert_eq!(first.unwrap().js_to_invoke_ms, 7, "and receive it intact");
+        assert!(
+            super::take_arm_origin().is_none(),
+            "a SECOND capture must not be billed against the same keydown"
+        );
+    }
+
+    #[test]
+    fn a_stale_arm_origin_is_rejected_and_discarded() {
+        let _serial = ARM_ORIGIN_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(stale) = origin_aged(super::ARM_ORIGIN_MAX_AGE + std::time::Duration::from_secs(1))
+        else {
+            eprintln!("SKIPPED a_stale_arm_origin_is_rejected_and_discarded: process too young");
+            return;
+        };
+        super::set_arm_origin(stale);
+
+        assert!(
+            super::take_arm_origin().is_none(),
+            "an origin nobody claimed in time is not this capture's keydown"
+        );
+        // …and the slot is usable again, so one stale origin cannot wedge the reporting.
+        super::set_arm_origin(origin_aged(std::time::Duration::ZERO).unwrap());
+        assert!(super::take_arm_origin().is_some(), "a later real hold is still reported");
+
+        // ── WHY THERE IS NO "…AND THE STALE ONE WAS DISCARDED" ROW HERE ──────────────────────────
+        // The code review that asked for these tests also asked for that assertion — a second
+        // `take` after the stale rejection, "so the discard is what's pinned rather than just the
+        // rejection". It was written exactly that way, and MUTATION-CHECKED: rewriting
+        // `take_arm_origin` to peek and leave a stale origin in the slot left it GREEN.
+        //
+        // It has to, and the reason is worth recording rather than rediscovering. A stale origin
+        // that is left behind is STILL STALE on the next call, so it is rejected again — the two
+        // implementations are indistinguishable through this API. `.take()` on the reject path is
+        // defensive tidiness, not observable behaviour, and there is no test that can pin it.
+        // Writing the row anyway would have added a guard that can never fail, which is this
+        // repo's most common defect, arrived at by following a review suggestion literally.
+    }
+
+    /// MEASUREMENT, not an assertion (sparkle-oyapv, Task 3). What `model_ms` — the third stage of
+    /// the keydown→first-sample span — actually costs, split into the part that is paid ONCE per
+    /// process and the part every hold pays again.
+    ///
+    /// THE QUESTION IT ANSWERS. `transcribe::with_decoder` builds a fresh Silero VAD ORT session on
+    /// every arm; it is the one remaining un-cached ORT construction on the arm path, and until now
+    /// its cost had never been separated from the cached-decoder case in any log — the note at
+    /// `start_dictation`'s `model_ms` says exactly that. `DECODER_CACHE` makes the separation
+    /// trivial to observe: round 1 is `ONNX transducer init + VAD + verification`, and every later
+    /// round is `VAD + verification` alone, because the recognizer is served from the cache. The
+    /// difference between them IS the answer, and it needs no new instrumentation to read.
+    ///
+    /// `#[ignore]` because it loads ~661 MB of real model files from the user's app-data directory
+    /// and takes seconds — run it deliberately:
+    ///   cargo test --lib measure_model_load_split -- --ignored --nocapture
+    ///
+    /// It asserts NOTHING, for the same reason its `audio.rs` sibling does: whether the models are
+    /// installed at all is a property of the machine, not of this code, and an assertion on that is
+    /// the kind that gets deleted rather than read. It SKIPS loudly when they are absent.
+    #[test]
+    #[ignore = "loads ~661MB of real ONNX models; run with --ignored --nocapture"]
+    fn measure_model_load_split() {
+        // The real install location `start_dictation` reads (`app_data_dir(&app).join("models")`),
+        // resolved without an AppHandle — there is no Tauri app in a unit test.
+        let Some(home) = std::env::var_os("HOME") else {
+            eprintln!("SKIPPED measure_model_load_split: no HOME");
+            return;
+        };
+        let root = std::path::Path::new(&home)
+            .join("Library/Application Support/ai.sparkle.desktop/models");
+        if !root.join("silero_vad.onnx").exists() {
+            eprintln!(
+                "SKIPPED measure_model_load_split: no models installed at {} — arm the mic once \
+                 in the app first, or run this on a machine that has.",
+                root.display()
+            );
+            return;
+        }
+
+        for round in 1..=3 {
+            let t = std::time::Instant::now();
+            match super::load_model(&root, |_, _| {}) {
+                Ok(_session) => eprintln!(
+                    "round {round}: load_model {:7.1} ms  ({})",
+                    t.elapsed().as_secs_f64() * 1000.0,
+                    if round == 1 {
+                        "ONNX transducer init + Silero VAD + file verification"
+                    } else {
+                        "Silero VAD + file verification ONLY — the transducer came from DECODER_CACHE"
+                    }
+                ),
+                // Not a panic: a busy or half-installed model directory is a property of the
+                // machine. Later rounds are the interesting ones, so keep going.
+                Err(e) => eprintln!("round {round}: SKIPPED — load_model failed ({e})"),
+            }
+        }
     }
 
     /// A stand-in for the only two `DictationSession` fields the arm decision reads, so a whole

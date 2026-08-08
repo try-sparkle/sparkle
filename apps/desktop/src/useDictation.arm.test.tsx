@@ -39,6 +39,7 @@ vi.mock("./services/dictationTerminalSink", () => ({
 
 import { useDictationStore } from "./stores/dictationStore";
 import { useAmbientVoice } from "./useDictation";
+import { clearHoldOrigin, holdOriginPending, markHoldOrigin } from "./voice/holdOrigin";
 
 /** Emit a real Tauri broadcast into every registered listener. */
 function emit(name: string, payload: unknown) {
@@ -90,7 +91,10 @@ describe("arming the mic through the real path (setEnabled → the enabled effec
       await Promise.resolve();
       await Promise.resolve();
     });
-    expect(invoke).toHaveBeenCalledWith("start_dictation");
+    // The second argument carries the push-to-talk keydown origin (voice/holdOrigin) and is `null`
+    // here because this arm came from `setEnabled`, not from a hold. What this row is pinning is the
+    // arm, so it matches the command and leaves the payload to the rows that own it, below.
+    expect(invoke).toHaveBeenCalledWith("start_dictation", { keydownAgeMs: null });
     expect(useDictationStore.getState().enabled).toBe(true);
     // The pause survives the arm completing — nothing in the async tail re-claims "listening".
     expect(useDictationStore.getState().status).toBe("idle");
@@ -181,5 +185,76 @@ describe("committed speech, with the caret in a terminal", () => {
       emit("dictation://partial", "ls minus la");
     });
     expect(routeToTerminal).not.toHaveBeenCalled();
+  });
+});
+
+// ══ THE GESTURE ORIGIN REACHES RUST (sparkle-oyapv) ═══════════════════════════════════════════
+// Push to talk rests with the mic RELEASED, so the founder's keydown starts a span — measured at
+// 218-628 ms on a real device, before any of the frontend work below it — in which everything he
+// says is lost. Nothing upstream of Rust ever stamped that keydown, so the number he has complained
+// about most had never been measured at all.
+//
+// This is the seam where the stamp crosses into Rust, and it is the one that is easy to leave
+// broken: `voice/holdOrigin` can be perfectly correct and `usePushToTalk` can stamp faithfully while
+// this effect still invokes `start_dictation` with no payload, and every test on either side stays
+// green. So the assertion here is on the ARGUMENT the production effect actually sends.
+describe("the push-to-talk keydown origin is threaded into start_dictation", () => {
+  beforeEach(() => clearHoldOrigin());
+
+  /** The `start_dictation` call the arm effect made, if it made one. */
+  function armCall(): unknown[] | undefined {
+    return invoke.mock.calls.find((c) => c[0] === "start_dictation");
+  }
+
+  it("sends the age of a pending keydown", async () => {
+    // A hold that went down 40 ms ago and whose arm is only reaching `invoke` now — which is the
+    // shape this whole mechanism exists to expose, since the store writes and the effect scheduling
+    // in between are exactly the unmeasured part.
+    focusTheComposer();
+    markHoldOrigin(performance.now() - 40);
+    useDictationStore.setState({ enabled: true });
+    renderHook(() => useAmbientVoice());
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const call = armCall();
+    expect(call).toBeDefined();
+    const age = (call![1] as { keydownAgeMs: number | null }).keydownAgeMs;
+    // Not `toBe(40)`: the effect's own await adds real milliseconds, and pinning an exact number
+    // would make this a clock test. What must hold is that a REAL elapsed span crossed the seam —
+    // an implementation that dropped the payload sends `undefined`, and one that stamped at invoke
+    // time rather than at keydown sends ~0.
+    expect(age).toBeGreaterThanOrEqual(40);
+    expect(age).toBeLessThan(10_000);
+  });
+
+  it("sends null when the arm did not come from a hold", async () => {
+    // The mic button and the voice menu arm through this same effect. Reporting 0 for them would be
+    // indistinguishable in a log from an instantaneous hold; `null` says "there was no gesture",
+    // which is what Rust needs to know not to publish a keydown span it cannot support.
+    focusTheComposer();
+    useDictationStore.setState({ enabled: true });
+    renderHook(() => useAmbientVoice());
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(armCall()?.[1]).toEqual({ keydownAgeMs: null });
+  });
+
+  it("consumes the origin, so a re-arm cannot be billed against a stale keydown", async () => {
+    // One-shot at the far end too: after the arm has taken it, nothing is left for the next arm to
+    // pick up. Without this, a mute/re-arm minutes later would publish the old hold's keydown.
+    focusTheComposer();
+    markHoldOrigin(performance.now() - 5);
+    useDictationStore.setState({ enabled: true });
+    renderHook(() => useAmbientVoice());
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(holdOriginPending()).toBe(false);
   });
 });

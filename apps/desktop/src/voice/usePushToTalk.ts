@@ -42,6 +42,7 @@
 // asked for is the failure this whole feature exists to make impossible.
 
 import { useEffect, useRef } from "react";
+import { markHoldOrigin } from "./holdOrigin";
 
 /** The key that means "talk", as `KeyboardEvent.key` reports it. Held as a constant so the tray's
  *  chiclet (./sendMode `chicletFor`) and this listener are talking about the same key.
@@ -111,6 +112,13 @@ export function usePushToTalk({
       // starting; the rest would re-arm a mic that is already hot.
       if (e.key !== TALK_KEY || e.repeat || held.current) return;
       held.current = true;
+      // THE FIRST STAMP IN THE WHOLE CHAIN (sparkle-oyapv). This line is the moment the gesture
+      // happened, and until it existed nothing upstream of Rust recorded it — so "keydown → first
+      // captured sample", the number the founder's lost-words complaint is entirely about, had
+      // never once been measured. Taken BEFORE `onHoldStart`, because everything that callback goes
+      // on to do (`applyIntent`, the store writes, the React effect that eventually invokes
+      // `start_dictation`) is precisely the span being measured. See ./holdOrigin.
+      markHoldOrigin();
       cbs.current.onHoldStart();
     };
 

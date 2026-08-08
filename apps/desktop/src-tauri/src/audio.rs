@@ -1,6 +1,7 @@
 //! Microphone capture via cpal → 16 kHz mono f32 frames + RMS level.
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat};
 use crate::audio_devices::{self, DeviceChoice};
@@ -459,6 +460,283 @@ pub fn plan_device_acquisition(selected: &str, cpal_default_name: Option<&str>) 
     }
 }
 
+// ── THE KEYDOWN→FIRST-SAMPLE SPAN (sparkle-oyapv) ────────────────────────────────────────────────
+//
+// Push to talk rests with the mic RELEASED, so a hold pays for the WHOLE chain — a keydown handler,
+// two zustand writes, a React effect, an IPC hop, a permission check, a model load, and finally
+// `Capture::start` plus CoreAudio's first buffer — and everything spoken during it is lost outright.
+// The founder's most-repeated complaint is that the first words disappear, and he asked specifically
+// to have this number VERIFIED rather than argued about.
+//
+// Before this, it could not be verified, because nothing stamped the gesture. `audio.rs` timed
+// `Capture::start`, `dictation.rs` timed `start_dictation`, and the earliest stamp in either was
+// Rust command entry — so the three log lines a reader had to join by hand did not, between them,
+// contain the moment the key went down. `PRD/fix/push-to-talk-leading-words.md` reports three
+// carefully measured rounds and every one of them begins at `Capture::start`, which is the LAST
+// stage of six.
+//
+// `ArmOrigin` carries the missing half in: the reconstructed keydown instant plus the stages that
+// already ran, so the first frame can emit ONE complete line instead of leaving the join to a human
+// reading a release log hours later.
+#[derive(Clone, Copy, Debug)]
+pub struct ArmOrigin {
+    /// When the key went down, reconstructed at command entry as `t_cmd - js_to_invoke_ms`.
+    ///
+    /// A LOWER BOUND, and deliberately named as one wherever it is reported. The frontend stamps
+    /// `performance.now()` on the keydown and computes the age immediately before `invoke`, so the
+    /// one-way JS→Tauri IPC hop lands AFTER that stamp and BEFORE `t_cmd` — it is therefore excluded
+    /// from the reconstruction, not attributed to some stage. Measuring it would need a clock shared
+    /// across the two runtimes, which nothing here has; understating by it is the honest failure
+    /// direction, since the resulting total can only be better than the truth, never worse.
+    pub keydown: Instant,
+    /// When `reconcile_capture` was entered, so the work between it and this capture opening
+    /// (spawning the decode worker, the reconcile step machinery) is attributable rather than
+    /// silently folded into the residual.
+    pub reconcile_at: Instant,
+    /// Keydown → the frontend calling `invoke`. The stage that had never been measured at all: a
+    /// keydown handler, `setHeld`, `applyIntent`, two store writes, React scheduling the `[enabled]`
+    /// effect, and the `await controllerPromiseRef` gate.
+    pub js_to_invoke_ms: u64,
+    /// Rust command entry → the mic-permission check: the session-lock acquisition and
+    /// `begin_start_decision`. Contended with the main thread (sparkle-sfxu).
+    pub prelude_ms: u64,
+    /// The `spawn_blocking` mic-permission hop.
+    pub permission_ms: u64,
+    /// `load_model`. On the FIRST arm of a process this holds the multi-second ONNX transducer init;
+    /// on every later arm the recognizer is served from `transcribe::DECODER_CACHE`, so what is left
+    /// is the per-arm Silero VAD session plus three rounds of file verification. The two are not
+    /// separated here — see the note in `dictation::start_dictation` — but they are trivially told
+    /// apart by ARM ORDINAL, because the cache makes the first arm the only expensive one.
+    pub model_ms: u64,
+}
+
+/// One capture's own sub-spans, returned so the arm-span report can carry them without re-timing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CaptureTiming {
+    pub resolve_ms: u64,
+    pub config_ms: u64,
+    /// Did `config_ms` come from the cache? Without this the two are indistinguishable in a log —
+    /// a 0 ms read looks identical whether it was served warm or the device answered instantly.
+    pub config_cached: bool,
+    pub build_ms: u64,
+    pub play_ms: u64,
+    /// `Capture::start` end to end. NOT the sum of the four above — it also covers the device-bound
+    /// log line and the closure wiring between them.
+    pub total_ms: u64,
+}
+
+/// The complete keydown→first-sample span, decomposed.
+///
+/// Every field is milliseconds. The ADDITIVE stages are `js_to_invoke`, `prelude`, `permission`,
+/// `model`, `reconcile_pre_capture`, `capture`, `first_frame` and `unattributed`; those sum to
+/// `total` exactly. `resolve`/`config`/`build`/`play` are a BREAKDOWN OF `capture`, not extra terms
+/// — adding them into the sum would double-count the largest stage, which is precisely the mistake
+/// a flat struct of millisecond fields invites.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ArmSpan {
+    pub js_to_invoke_ms: u64,
+    pub prelude_ms: u64,
+    pub permission_ms: u64,
+    pub model_ms: u64,
+    /// `reconcile_capture` entry → `Capture::start` entry.
+    pub reconcile_pre_capture_ms: u64,
+    pub capture: CaptureTiming,
+    /// `Capture::start` returning → CoreAudio delivering the first buffer. Pure loss on a hold.
+    pub first_frame_ms: u64,
+    /// Whatever the named stages do not account for: the glue between them (await scheduling, the
+    /// Arc/Mutex wrapping, the tracing calls themselves) plus per-stage truncation, since every
+    /// stage floors to whole milliseconds and eight of them can shed up to 7 ms between them.
+    pub unattributed_ms: u64,
+    /// How much the named stages OVERSHOOT the independently measured total, when they do.
+    ///
+    /// This exists so the clamp below cannot lie. `unattributed_ms` is a saturating residual, so a
+    /// decomposition that over-counts would silently report 0 and still satisfy "the stages sum to
+    /// the total" — the sum identity would hold while the numbers were nonsense. Normally 0; a
+    /// non-zero value means the stage timers and the wall clock disagree, and by how much.
+    pub over_attributed_ms: u64,
+    /// Keydown → first sample, measured end-to-end against the origin rather than summed. This is
+    /// THE number the founder asked to have verified.
+    pub total_ms: u64,
+}
+
+impl ArmSpan {
+    /// Decompose an arm. Pure, so the arithmetic is testable without a microphone.
+    ///
+    /// `total_ms` is measured INDEPENDENTLY (elapsed since the origin) rather than summed from the
+    /// stages, which is what makes `unattributed_ms` meaningful instead of definitional.
+    pub fn new(
+        origin: &ArmOrigin,
+        reconcile_pre_capture_ms: u64,
+        capture: CaptureTiming,
+        first_frame_ms: u64,
+        total_ms: u64,
+    ) -> ArmSpan {
+        // `model_ms` is NOT joined by a nested VAD term here, and that omission is deliberate: a
+        // sub-stage of an additive stage must never be added again (see the struct doc).
+        let named = origin.js_to_invoke_ms
+            + origin.prelude_ms
+            + origin.permission_ms
+            + origin.model_ms
+            + reconcile_pre_capture_ms
+            + capture.total_ms
+            + first_frame_ms;
+        ArmSpan {
+            js_to_invoke_ms: origin.js_to_invoke_ms,
+            prelude_ms: origin.prelude_ms,
+            permission_ms: origin.permission_ms,
+            model_ms: origin.model_ms,
+            reconcile_pre_capture_ms,
+            capture,
+            first_frame_ms,
+            unattributed_ms: total_ms.saturating_sub(named),
+            over_attributed_ms: named.saturating_sub(total_ms),
+            total_ms,
+        }
+    }
+
+    /// Emit the one line this whole mechanism exists to produce.
+    ///
+    /// INFO, matching the convention the sibling timing lines already set: the reports this answers
+    /// arrive hours later from someone on a release build, where DEBUG would never be recorded. It
+    /// fires once per capture — per push-to-talk hold — so it cannot flood.
+    ///
+    /// Called from the CoreAudio realtime IO thread (the first frame is what triggers it), like the
+    /// `"first audio frame delivered"` line beside it. That is why everything here is plain integer
+    /// arithmetic over `Copy` fields with no allocation and no lock: this thread must not block.
+    fn emit(&self) {
+        tracing::info!(
+            target: "dictation",
+            js_to_invoke_ms = self.js_to_invoke_ms,
+            prelude_ms = self.prelude_ms,
+            permission_ms = self.permission_ms,
+            model_ms = self.model_ms,
+            reconcile_pre_capture_ms = self.reconcile_pre_capture_ms,
+            capture_ms = self.capture.total_ms,
+            resolve_ms = self.capture.resolve_ms,
+            config_ms = self.capture.config_ms,
+            config_cached = self.capture.config_cached,
+            build_ms = self.capture.build_ms,
+            play_ms = self.capture.play_ms,
+            first_frame_ms = self.first_frame_ms,
+            unattributed_ms = self.unattributed_ms,
+            over_attributed_ms = self.over_attributed_ms,
+            total_ms = self.total_ms,
+            "push-to-talk keydown to first audio sample"
+        );
+    }
+}
+
+// ── `default_input_config` IS CACHED, AND THE INVALIDATION IS THE POINT ──────────────────────────
+//
+// Measured on the founder's Mac and reproduced independently on a second machine: format
+// negotiation costs 95-155 ms of a ~375 ms warm hold — roughly a third of the window in which the
+// founder's words are being dropped — and it is pure device metadata. Nothing about it changes
+// between two holds on the same microphone.
+//
+// A STALE AUDIO CONFIG IS WORSE THAN A SLOW ONE, so the entry is discarded on three independent
+// signals rather than one:
+//
+//   1. A CoreAudio device-list or default-input change. `dictation::start_audio_watchdog` already
+//      owns a `DeviceChangeWatcher` for exactly these events and already funnels them through one
+//      flag; this hangs off that, rather than registering a second listener that could disagree
+//      with the first about when a device changed.
+//   2. A different resolved device. The key is the bound device's UID (its stable identity — see
+//      `audio_devices`' module docs on why the numeric id is not), so a capture that resolves
+//      somewhere else simply misses. One slot, not a map: a machine has one input at a time, and a
+//      map would keep entries alive for devices that are long gone.
+//   3. AGE. This is the backstop for the one change class the listener above genuinely cannot see:
+//      a device changing its own FORMAT without the device list or the default moving — a sample
+//      rate edited in Audio MIDI Setup, or a Bluetooth headset entering its headset profile. There
+//      is no system-object notification for that; catching it properly needs a per-device
+//      `kAudioDevicePropertyStreamFormat` listener in `audio_devices`, which is a larger change
+//      than this one and is NOT what is claimed here. So the exposure is bounded by time instead,
+//      and stated honestly: a format change is invisible for at most `INPUT_CONFIG_TTL`.
+//
+// A failed `build_input_stream` also drops the entry (see `Capture::start`), so even if a stale
+// config did reach cpal, the cost is one failed hold rather than a mic that stays broken until the
+// process restarts.
+const INPUT_CONFIG_TTL: Duration = Duration::from_secs(30);
+
+/// One cached device-format read. See [`INPUT_CONFIG_TTL`] for why all three fields are load-bearing.
+#[derive(Clone, Debug)]
+struct KeyedCache<T> {
+    key: String,
+    at: Instant,
+    value: T,
+}
+
+static INPUT_CONFIG_CACHE: Mutex<Option<KeyedCache<cpal::SupportedStreamConfig>>> = Mutex::new(None);
+
+/// Serve `key` from `cache`, or `fetch` it and store it. Returns `(value, was_cached)`.
+///
+/// Generic over the value so the reuse contract is unit-testable without a microphone, an audio
+/// host, or a cpal type — the same reasoning as `transcribe::cached_or_build`, and for the same
+/// reason: the interesting behaviour here is WHEN IT MISSES, and every miss condition (a different
+/// key, an expired entry, a failed fetch) is device-independent arithmetic.
+///
+/// A FAILED FETCH IS NOT CACHED, and it does not evict the existing entry either: a transient
+/// CoreAudio error must neither wedge the format at a bad value nor throw away a good one.
+///
+/// THE LOCK IS HELD ACROSS `fetch`, deliberately, so two concurrent misses cannot both pay the
+/// ~150 ms device read — the same trade `transcribe::cached_or_build` makes. It is safe here
+/// because the session mutex means production has one capture opening at a time, so this lock is
+/// uncontended on the arm path; the only caller that can contend is a test, and the real-device
+/// tests take `DEVICE_TEST_LOCK` for unrelated reasons anyway. Note the consequence if that ever
+/// changes: a second arm would BLOCK for the first's device read rather than racing it, which is
+/// the right direction (one read, not two) but is a wait, not a fast path.
+fn cached_by_key<T: Clone, E>(
+    cache: &Mutex<Option<KeyedCache<T>>>,
+    key: &str,
+    now: Instant,
+    ttl: Duration,
+    fetch: impl FnOnce() -> Result<T, E>,
+) -> Result<(T, bool), E> {
+    let mut slot = cache.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(hit) = slot.as_ref() {
+        // `checked_duration_since`, and the choice is load-bearing in BOTH directions.
+        //
+        // `Instant` subtraction PANICS on underflow, so a caller passing an earlier `now` — two
+        // threads reading the clock out of order — must not crash the arm path. But `saturating_`
+        // would return 0, which is `< ttl`, i.e. a HIT: an entry stamped in the future would have
+        // its life silently EXTENDED. That is the wrong direction for a cache whose whole risk is
+        // serving a format the device no longer has, and it contradicted this very comment
+        // (roborev, Medium — the comment said "miss", the code said "hit", and the test asserting
+        // it was named for the comment).
+        //
+        // `None` here means "the clock disagrees with itself", and the fail-safe answer to that is
+        // to go and ask the device again.
+        let fresh = now.checked_duration_since(hit.at).is_some_and(|age| age < ttl);
+        if hit.key == key && fresh {
+            return Ok((hit.value.clone(), true));
+        }
+    }
+    let fresh = fetch()?;
+    *slot = Some(KeyedCache { key: key.to_string(), at: now, value: fresh.clone() });
+    Ok((fresh, false))
+}
+
+/// Forget the cached device format.
+///
+/// Called on every CoreAudio device-list / default-input change (see [`INPUT_CONFIG_TTL`]) and on a
+/// failed stream build. Cheap and idempotent, so the caller never has to work out whether the change
+/// it saw was one that matters — dropping a still-valid entry costs one ~100 ms read on the next
+/// hold, while keeping an invalid one costs correct audio.
+pub fn invalidate_input_config_cache() {
+    *INPUT_CONFIG_CACHE.lock().unwrap_or_else(|p| p.into_inner()) = None;
+}
+
+/// The cache key for a bound device: its stable CoreAudio UID.
+///
+/// Falls back to the NAME when the UID is unknown — which happens when CoreAudio enumerated nothing
+/// and we took cpal's default (`Capture::default_device`). Prefixed so a name can never collide with
+/// a UID that happens to read the same.
+fn input_config_key(bound: &BoundDevice) -> String {
+    match bound.uid.as_deref() {
+        Some(uid) => uid.to_string(),
+        None => format!("name:{}", bound.name),
+    }
+}
+
 // wired into the dictation command in a later task
 #[allow(dead_code)]
 pub struct Capture {
@@ -479,6 +757,8 @@ pub struct Capture {
     /// synchronizes with the IOThread. Field order matters: `stream` is declared first so it drops
     /// (and drains the IOThread) before `active`, keeping the flag alive across the whole teardown.
     active: Arc<AtomicBool>,
+    /// What this capture's own start cost, so a caller can report it without re-timing anything.
+    timing: CaptureTiming,
 }
 
 /// Panic firewall (). cpal invokes the audio data callbacks from CoreAudio's
@@ -676,9 +956,15 @@ impl Capture {
         self.started_at.elapsed()
     }
 
+    /// This capture's own sub-spans, as `Capture::start` measured them.
+    pub fn timing(&self) -> CaptureTiming {
+        self.timing
+    }
+
     #[allow(dead_code)]
     pub fn start(
         choice: &DeviceChoice,
+        origin: Option<ArmOrigin>,
         on_frame: impl FnMut(Vec<f32>) + Send + 'static,
     ) -> Result<Capture, String> {
         // ── WHY THIS IS TIMED (sparkle-oyapv) ────────────────────────────────────────────────────
@@ -694,12 +980,25 @@ impl Capture {
         // `list_input_devices`), `config` is format negotiation, and `build`+`play` are the stream
         // itself. A single number would say "slow" without saying which one to attack.
         let t0 = std::time::Instant::now();
+        // Everything between `reconcile_capture` being entered and this line: the reconcile step
+        // machinery and `build_capture`'s prelude (spawning the decode worker). Sampled here, at the
+        // top of the only function that can attribute it, so it is a named stage rather than part of
+        // the residual.
+        let reconcile_pre_capture_ms =
+            origin.map(|o| o.reconcile_at.elapsed().as_millis() as u64).unwrap_or(0);
         let (device, bound) = Self::resolve_device(choice)?;
         let resolve_ms = t0.elapsed().as_millis();
         let t_cfg = std::time::Instant::now();
-        let cfg = device
-            .default_input_config()
-            .map_err(|e| e.to_string())?;
+        // Served from the cache when this is the same device we negotiated with recently — a third
+        // of a warm hold's budget, for metadata that does not change between holds. Every way it can
+        // go stale, and what happens then, is on `INPUT_CONFIG_TTL`.
+        let (cfg, config_cached) = cached_by_key(
+            &INPUT_CONFIG_CACHE,
+            &input_config_key(&bound),
+            Instant::now(),
+            INPUT_CONFIG_TTL,
+            || device.default_input_config().map_err(|e| e.to_string()),
+        )?;
         let config_ms = t_cfg.elapsed().as_millis();
         let channels = cfg.channels();
         let in_rate = cfg.sample_rate().0;
@@ -739,17 +1038,47 @@ impl Capture {
         //
         // Logged ONCE per capture (`Relaxed` swap on a flag) — this runs on the realtime CoreAudio
         // IO thread, where a per-frame `tracing` call would be a genuine audio-dropout hazard.
+        //
+        // ── AND IT IS WHERE THE COMPLETE KEYDOWN SPAN IS REPORTED (sparkle-oyapv) ────────────────
+        // The first frame is the only moment at which the whole span is knowable, so this is where
+        // the one line lands. `stages` is how the numbers this function measures reach a closure
+        // that was necessarily built before they existed: plain atomics, published with a Release
+        // store, read with an Acquire load, because this runs on the realtime CoreAudio IO thread
+        // where taking a lock is an audio-dropout hazard.
+        //
+        // PUBLISHED BEFORE `play()`, WHICH IS WHAT MAKES THE READ SAFE. Frames cannot arrive until
+        // the stream is playing, so ordering the publish ahead of that call means the closure can
+        // never observe an unpublished cell and report zeros as facts. `play_ms` and the refreshed
+        // total are stored just after `play()` returns; a frame landing inside that sub-millisecond
+        // window reads `play_ms = 0`, which every measured round says it is anyway.
         let first_frame_logged = Arc::new(AtomicBool::new(false));
+        let stages = Arc::new(CaptureTimingCell::default());
         let on_frame = {
             let seen = first_frame_logged.clone();
+            let stages = stages.clone();
             let mut inner = on_frame;
             move |frame: Vec<f32>| {
                 if !seen.swap(true, Ordering::Relaxed) {
+                    let since_capture_start_ms = t0.elapsed().as_millis() as u64;
                     tracing::info!(
                         target: "dictation",
-                        since_capture_start_ms = t0.elapsed().as_millis() as u64,
+                        since_capture_start_ms,
                         "first audio frame delivered"
                     );
+                    // Only when a gesture origin was threaded in — i.e. this capture belongs to an
+                    // arm the frontend stamped. A capture rebuilt by a focus event or the watchdog
+                    // has no keydown behind it, and inventing one would be worse than saying nothing.
+                    if let Some(origin) = origin {
+                        let capture = stages.read();
+                        ArmSpan::new(
+                            &origin,
+                            reconcile_pre_capture_ms,
+                            capture,
+                            since_capture_start_ms.saturating_sub(capture.total_ms),
+                            origin.keydown.elapsed().as_millis() as u64,
+                        )
+                        .emit();
+                    }
                 }
                 inner(frame)
             }
@@ -806,13 +1135,34 @@ impl Capture {
                 return Err(format!("unsupported sample format: {other}"));
             }
         }
-        .map_err(|e| e.to_string())?;
+        // A BUILD FAILURE DROPS THE CACHED FORMAT. If the entry we just served was stale enough that
+        // cpal refused it, keeping it would make every subsequent hold fail the same way — a mic
+        // that stays broken until the process restarts, caused by an optimisation. Invalidating here
+        // bounds that to the one hold that hit it: the next arm re-reads the device. Unconditional
+        // rather than gated on `config_cached`, because a fresh read that still failed says the
+        // device moved under us and any entry now in the slot is suspect too.
+        .map_err(|e| {
+            invalidate_input_config_cache();
+            e.to_string()
+        })?;
 
         let build_ms = t_build.elapsed().as_millis();
+
+        // Publish BEFORE `play()` — see the first-frame closure for why the ordering is the whole
+        // safety argument.
+        stages.publish(CaptureTiming {
+            resolve_ms: resolve_ms as u64,
+            config_ms: config_ms as u64,
+            config_cached,
+            build_ms: build_ms as u64,
+            play_ms: 0,
+            total_ms: t0.elapsed().as_millis() as u64,
+        });
 
         let t_play = std::time::Instant::now();
         stream.play().map_err(|e| e.to_string())?;
         let play_ms = t_play.elapsed().as_millis();
+        stages.finish(play_ms as u64, t0.elapsed().as_millis() as u64);
 
         // INFO, not DEBUG, and deliberately so: the reports this exists to answer arrive hours later
         // from someone on a release build, where a DEBUG line would never have been recorded. It
@@ -821,12 +1171,75 @@ impl Capture {
             target: "dictation",
             resolve_ms = resolve_ms as u64,
             config_ms = config_ms as u64,
+            // Without this a served entry and a genuinely fast device read the same in the log, so
+            // "did the cache do anything" could not be answered from a release log — which is the
+            // only place the question ever gets asked.
+            config_cached,
             build_ms = build_ms as u64,
             play_ms = play_ms as u64,
             total_ms = t0.elapsed().as_millis() as u64,
             "capture start timing"
         );
-        Ok(Capture { stream, device: bound, health, started_at: std::time::Instant::now(), active })
+        Ok(Capture {
+            stream,
+            device: bound,
+            health,
+            started_at: std::time::Instant::now(),
+            active,
+            timing: stages.read(),
+        })
+    }
+}
+
+/// The capture sub-spans, shared with the frame callback.
+///
+/// Atomics rather than a `Mutex<CaptureTiming>` because the reader is the realtime CoreAudio IO
+/// thread — the same thread the panic firewall and the teardown gate exist to keep unblocked. A
+/// lock there is a genuine audio-dropout hazard, and this is diagnostics.
+#[derive(Default)]
+struct CaptureTimingCell {
+    /// Release/Acquire gate. False until `publish`, so a frame can never read a half-written cell.
+    ready: AtomicBool,
+    resolve_ms: AtomicU64,
+    config_ms: AtomicU64,
+    config_cached: AtomicBool,
+    build_ms: AtomicU64,
+    play_ms: AtomicU64,
+    total_ms: AtomicU64,
+}
+
+impl CaptureTimingCell {
+    /// Store everything known before `play()`, then open the gate.
+    fn publish(&self, t: CaptureTiming) {
+        self.resolve_ms.store(t.resolve_ms, Ordering::Relaxed);
+        self.config_ms.store(t.config_ms, Ordering::Relaxed);
+        self.config_cached.store(t.config_cached, Ordering::Relaxed);
+        self.build_ms.store(t.build_ms, Ordering::Relaxed);
+        self.play_ms.store(t.play_ms, Ordering::Relaxed);
+        self.total_ms.store(t.total_ms, Ordering::Relaxed);
+        // Release: everything above is visible to any thread that observes `ready` as true.
+        self.ready.store(true, Ordering::Release);
+    }
+
+    /// Refine the two values `play()` itself produced. The gate is already open by design.
+    fn finish(&self, play_ms: u64, total_ms: u64) {
+        self.play_ms.store(play_ms, Ordering::Relaxed);
+        self.total_ms.store(total_ms, Ordering::Relaxed);
+    }
+
+    /// Read the published sub-spans, or all-zero if the gate is still shut.
+    fn read(&self) -> CaptureTiming {
+        if !self.ready.load(Ordering::Acquire) {
+            return CaptureTiming::default();
+        }
+        CaptureTiming {
+            resolve_ms: self.resolve_ms.load(Ordering::Relaxed),
+            config_ms: self.config_ms.load(Ordering::Relaxed),
+            config_cached: self.config_cached.load(Ordering::Relaxed),
+            build_ms: self.build_ms.load(Ordering::Relaxed),
+            play_ms: self.play_ms.load(Ordering::Relaxed),
+            total_ms: self.total_ms.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -1011,6 +1424,8 @@ mod tests {
     /// were freed via `default_input_device()`.)
     #[test]
     fn dropping_a_capture_frees_the_cpal_stream_and_its_frame_handler() {
+        // Shares the process-wide format cache with the other real-device test; see DEVICE_TEST_LOCK.
+        let _serial = DEVICE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let Some(cap_result) = try_start_probe_capture() else {
             eprintln!(
                 "SKIPPED dropping_a_capture_frees_the_cpal_stream_and_its_frame_handler: \
@@ -1085,16 +1500,35 @@ mod tests {
         );
     }
 
+    /// Serializes the tests that open a REAL device.
+    ///
+    /// `INPUT_CONFIG_CACHE` is one process-wide slot, and `cargo test` runs these in parallel in one
+    /// process — so a sibling test opening a capture repopulates the cache in the middle of another
+    /// test's invalidate→observe sequence, and `a_real_devices_format_is_read_once_…` failed on its
+    /// very first assertion for exactly that reason. Nothing about PRODUCTION is being worked around
+    /// here: the session mutex means one capture exists at a time there, and the only concurrency
+    /// this lock adds back is the concurrency the test harness invented.
+    ///
+    /// Poison-tolerant, so one failing device test does not cascade into "the others panicked too",
+    /// which would hide which guard actually broke.
+    static DEVICE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     /// Build a real `Capture` whose frame handler owns a sentinel `Arc`, or `None` when this
     /// machine has no input device to open (CI). Kept out of the test body so the skip path is
     /// obvious and the assertions above read as assertions.
     fn try_start_probe_capture() -> Option<(Capture, Arc<()>)> {
         let sentinel = Arc::new(());
         let held = sentinel.clone();
-        let capture = Capture::start(&DeviceChoice::Auto { allow_virtual: true }, move |_frame| {
-            // Keep the clone alive for as long as the closure is: the whole measurement.
-            let _keepalive = &held;
-        })
+        // No gesture origin: this capture is a leak probe, not an arm. Passing a synthetic one would
+        // publish a keydown→first-sample line for a hold that never happened.
+        let capture = Capture::start(
+            &DeviceChoice::Auto { allow_virtual: true },
+            None,
+            move |_frame| {
+                // Keep the clone alive for as long as the closure is: the whole measurement.
+                let _keepalive = &held;
+            },
+        )
         .ok()?;
         Some((capture, sentinel))
     }
@@ -1426,6 +1860,291 @@ mod tests {
         );
     }
 
+    // ── THE FORMAT CACHE (sparkle-oyapv, Task 2) ─────────────────────────────────────────────────
+    //
+    // Driven through the generic `cached_by_key` rather than the `cpal`-typed static, for the same
+    // reason `transcribe::cached_or_build` is generic: every behaviour worth pinning here — when it
+    // HITS and, far more importantly, every way it must MISS — is device-independent, and a test
+    // that needed a microphone to prove "a different device re-reads" would be a test that never
+    // runs on CI. The real static's own wiring is exercised end to end by
+    // `a_real_devices_format_is_read_once_and_re_read_after_a_device_change` below.
+
+    /// A fetch that counts itself, so "how many times did we ask the device" is an observable fact
+    /// rather than something inferred from a timing. Captures `reads` by shared reference, which is
+    /// what makes the closure `Copy` and therefore reusable across calls.
+    fn counting_fetch(reads: &std::cell::Cell<u32>) -> impl FnOnce() -> Result<u32, ()> + Copy + '_ {
+        move || {
+            reads.set(reads.get() + 1);
+            Ok(48_000)
+        }
+    }
+
+    #[test]
+    fn a_second_arm_on_the_same_device_reads_the_format_once() {
+        let cache = Mutex::new(None);
+        let reads = std::cell::Cell::new(0);
+        let now = Instant::now();
+
+        let (first, cached_first) =
+            cached_by_key(&cache, "uid-builtin", now, INPUT_CONFIG_TTL, counting_fetch(&reads))
+                .unwrap();
+        let (second, cached_second) =
+            cached_by_key(&cache, "uid-builtin", now, INPUT_CONFIG_TTL, counting_fetch(&reads))
+                .unwrap();
+
+        // THE OBSERVABLE EFFECT, which is the point: not "an entry exists" (that was true of the
+        // slot the moment the first call returned, and asserting it would pass against a cache that
+        // never served anything), but that the DEVICE WAS ASKED ONCE for two arms. `default_input_
+        // config` measured 95-155 ms on the founder's Mac and 101-120 ms on a second machine — a
+        // third of a warm hold's budget — and this is the assertion that says it is not paid twice.
+        assert_eq!(reads.get(), 1, "a second arm on the same device must not re-read the format");
+        assert_eq!((first, second), (48_000, 48_000), "the served value must be the read value");
+        assert!(!cached_first, "the first read cannot have been served from an empty cache");
+        assert!(cached_second, "the second must report itself as served, or a log cannot tell");
+    }
+
+    #[test]
+    fn a_device_change_forces_a_fresh_read() {
+        // THE PAIRED HALF, and the one that decides whether the cache is safe at all. A cache with
+        // no invalidation test is exactly the vacuous shape: the test above passes just as happily
+        // against a cache that NEVER re-reads, which is a microphone stuck on a format the device
+        // no longer has.
+        let cache = Mutex::new(None);
+        let reads = std::cell::Cell::new(0);
+        let now = Instant::now();
+
+        cached_by_key(&cache, "uid-builtin", now, INPUT_CONFIG_TTL, counting_fetch(&reads)).unwrap();
+        // What `invalidate_input_config_cache` does to the real static, and what
+        // `dictation::start_audio_watchdog` calls on every CoreAudio device-list / default-input
+        // change.
+        *cache.lock().unwrap() = None;
+        let (_, cached_after) =
+            cached_by_key(&cache, "uid-builtin", now, INPUT_CONFIG_TTL, counting_fetch(&reads))
+                .unwrap();
+
+        assert_eq!(reads.get(), 2, "a device change must send the next arm back to the device");
+        assert!(!cached_after, "the post-invalidation read must not claim to have been served");
+    }
+
+    #[test]
+    fn a_different_device_reads_its_own_format() {
+        let cache = Mutex::new(None);
+        let reads = std::cell::Cell::new(0);
+        let now = Instant::now();
+
+        cached_by_key(&cache, "uid-builtin", now, INPUT_CONFIG_TTL, counting_fetch(&reads)).unwrap();
+        let (_, cached_other) =
+            cached_by_key(&cache, "uid-usb-mic", now, INPUT_CONFIG_TTL, counting_fetch(&reads))
+                .unwrap();
+        assert_eq!(reads.get(), 2, "a capture that resolved elsewhere must not be served this entry");
+        assert!(!cached_other);
+
+        // …and going BACK re-reads too. One slot, not a map (see `INPUT_CONFIG_TTL`), so the
+        // second device evicted the first. Pinned because the opposite — a map quietly retaining a
+        // format for a device that has since been unplugged and replaced — is the failure this
+        // single slot exists to make impossible.
+        let (_, cached_back) =
+            cached_by_key(&cache, "uid-builtin", now, INPUT_CONFIG_TTL, counting_fetch(&reads))
+                .unwrap();
+        assert_eq!(reads.get(), 3, "the slot holds ONE device's format; returning re-reads");
+        assert!(!cached_back);
+    }
+
+    #[test]
+    fn an_entry_older_than_the_ttl_is_re_read() {
+        // The backstop for the change class the CoreAudio device-list listener genuinely cannot
+        // see: a device renegotiating its OWN format (a sample rate edited in Audio MIDI Setup, a
+        // Bluetooth headset entering its headset profile). See `INPUT_CONFIG_TTL`.
+        let cache = Mutex::new(None);
+        let reads = std::cell::Cell::new(0);
+        let now = Instant::now();
+
+        cached_by_key(&cache, "uid-builtin", now, INPUT_CONFIG_TTL, counting_fetch(&reads)).unwrap();
+        let just_inside = now + INPUT_CONFIG_TTL - Duration::from_millis(1);
+        let (_, cached) =
+            cached_by_key(&cache, "uid-builtin", just_inside, INPUT_CONFIG_TTL, counting_fetch(&reads))
+                .unwrap();
+        assert_eq!(reads.get(), 1, "an entry inside its TTL is still good");
+        assert!(cached);
+
+        let just_outside = now + INPUT_CONFIG_TTL;
+        let (_, cached) =
+            cached_by_key(&cache, "uid-builtin", just_outside, INPUT_CONFIG_TTL, counting_fetch(&reads))
+                .unwrap();
+        assert_eq!(reads.get(), 2, "an entry at or past its TTL must be re-read");
+        assert!(!cached);
+    }
+
+    #[test]
+    fn a_clock_that_went_backwards_misses_rather_than_panicking() {
+        // TWO failures in one, and the second is why the first is not enough.
+        //
+        // `Instant - Instant` PANICS on underflow, and this arithmetic sits on the arm path, so a
+        // caller handing an earlier `now` must not crash the microphone. But the obvious fix —
+        // `saturating_duration_since` — answers 0, which is inside any TTL, so an entry stamped in
+        // the FUTURE would be served and its life silently extended. This test is named for a MISS
+        // and it now asserts one: for a cache whose risk is serving a format the device no longer
+        // has, the fail-safe answer to a self-contradicting clock is to ask the device again.
+        let cache = Mutex::new(None);
+        let reads = std::cell::Cell::new(0);
+        let now = Instant::now();
+        cached_by_key(&cache, "uid-builtin", now, INPUT_CONFIG_TTL, counting_fetch(&reads)).unwrap();
+
+        let earlier = now - Duration::from_secs(5);
+        let (_, cached) =
+            cached_by_key(&cache, "uid-builtin", earlier, INPUT_CONFIG_TTL, counting_fetch(&reads))
+                .unwrap();
+        assert!(!cached, "an entry stamped after `now` must be re-read, not served");
+        assert_eq!(reads.get(), 2, "the fail-safe answer to a disordered clock is to ask again");
+    }
+
+    #[test]
+    fn a_failed_read_is_not_cached_and_does_not_evict() {
+        let cache = Mutex::new(None);
+
+        // A transient CoreAudio error must not wedge the format for the life of the process.
+        let failed: Result<(u32, bool), &str> =
+            cached_by_key(&cache, "uid-builtin", Instant::now(), INPUT_CONFIG_TTL, || Err("busy"));
+        assert!(failed.is_err());
+        let reads = std::cell::Cell::new(0);
+        let (_, cached) =
+            cached_by_key(&cache, "uid-builtin", Instant::now(), INPUT_CONFIG_TTL, counting_fetch(&reads))
+                .unwrap();
+        assert!(!cached, "a failure must leave nothing behind to serve");
+        assert_eq!(reads.get(), 1, "the arm after a failed read retries the device");
+
+        // …and a failure AFTER a good read must not throw the good one away either.
+        let still_good: Result<(u32, bool), &str> =
+            cached_by_key(&cache, "uid-builtin", Instant::now(), INPUT_CONFIG_TTL, || Err("busy"));
+        assert_eq!(
+            still_good.map(|(v, c)| (v, c)),
+            Ok((48_000, true)),
+            "a good entry is served without ever calling the failing fetch"
+        );
+    }
+
+    /// The real static, the real `cpal` call, the real device — the one place the whole Task 2
+    /// contract is observable end to end rather than through a generic stand-in.
+    ///
+    /// Skips (loudly) where no input device can be opened, following the sibling leak guard above:
+    /// CI runners have no microphone, and a guard that fails there is a guard that gets deleted.
+    #[test]
+    fn a_real_devices_format_is_read_once_and_re_read_after_a_device_change() {
+        let _serial = DEVICE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        invalidate_input_config_cache();
+        let Some((first, _s1)) = try_start_probe_capture() else {
+            eprintln!(
+                "SKIPPED a_real_devices_format_is_read_once_and_re_read_after_a_device_change: \
+                 no usable input device on this machine (expected on CI runners). The format-cache \
+                 contract is still pinned by the generic tests above; only the cpal wiring is not."
+            );
+            return;
+        };
+        assert!(
+            !first.timing().config_cached,
+            "the first capture after an invalidation must go to the device"
+        );
+
+        let Some((second, _s2)) = try_start_probe_capture() else {
+            panic!("the first capture opened, so the second must too");
+        };
+        assert!(
+            second.timing().config_cached,
+            "a second capture on the same device must be served the format it just negotiated — \
+             this is the ~100 ms that a push-to-talk hold stops paying"
+        );
+
+        // The paired half, against the REAL static this time: what the watchdog calls on a
+        // CoreAudio device-list change must actually send the next capture back to the device.
+        invalidate_input_config_cache();
+        let Some((third, _s3)) = try_start_probe_capture() else {
+            panic!("the first capture opened, so the third must too");
+        };
+        assert!(
+            !third.timing().config_cached,
+            "invalidate_input_config_cache must force a fresh negotiation — without this the \
+             cache would happily serve a format the device no longer has"
+        );
+    }
+
+    // ── THE KEYDOWN→FIRST-SAMPLE DECOMPOSITION (sparkle-oyapv, Task 1) ───────────────────────────
+
+    /// An origin with distinguishable stage values, so a report that drops or swaps one is visible.
+    fn test_origin() -> ArmOrigin {
+        let now = Instant::now();
+        ArmOrigin {
+            keydown: now,
+            reconcile_at: now,
+            js_to_invoke_ms: 7,
+            prelude_ms: 3,
+            permission_ms: 11,
+            model_ms: 29,
+        }
+    }
+
+    fn test_capture_timing() -> CaptureTiming {
+        CaptureTiming {
+            resolve_ms: 6,
+            config_ms: 102,
+            config_cached: false,
+            build_ms: 193,
+            play_ms: 0,
+            total_ms: 303,
+        }
+    }
+
+    #[test]
+    fn the_span_carries_a_keydown_stage_and_the_stages_sum_to_the_total() {
+        let origin = test_origin();
+        // 7 + 3 + 11 + 29 + 13 + 303 + 8 = 374 named; total is measured independently.
+        let span = ArmSpan::new(&origin, 13, test_capture_timing(), 8, 400);
+
+        // THE STAGE THAT DID NOT EXIST BEFORE THIS WORK. Everything else here was already
+        // measurable somewhere; the keydown→invoke span is the one that had never been recorded, so
+        // a report that silently dropped it would still look complete.
+        assert_eq!(span.js_to_invoke_ms, 7, "the gesture origin must reach the report");
+
+        let named = span.js_to_invoke_ms
+            + span.prelude_ms
+            + span.permission_ms
+            + span.model_ms
+            + span.reconcile_pre_capture_ms
+            + span.capture.total_ms
+            + span.first_frame_ms
+            + span.unattributed_ms;
+        assert_eq!(named, span.total_ms, "the additive stages must account for the whole span");
+        // The residual is the REAL gap, not a definitional filler: 400 - 374.
+        assert_eq!(span.unattributed_ms, 26, "unattributed is the measured shortfall, not a constant");
+        assert_eq!(span.over_attributed_ms, 0);
+    }
+
+    #[test]
+    fn the_capture_sub_spans_are_a_breakdown_and_are_never_added_twice() {
+        // resolve+config+build+play = 301, which is nearly all of capture.total_ms (303). If they
+        // were treated as additive terms alongside it, the residual would collapse and the largest
+        // stage in the whole span would be counted twice — the specific arithmetic mistake a flat
+        // struct of millisecond fields invites.
+        let span = ArmSpan::new(&test_origin(), 13, test_capture_timing(), 8, 400);
+        assert_eq!(
+            span.unattributed_ms, 26,
+            "capture's four sub-spans must not enter the sum; they describe capture_ms, not \
+             additional time"
+        );
+    }
+
+    #[test]
+    fn stages_that_overshoot_the_measured_total_are_reported_not_hidden() {
+        // Every stage floors to whole milliseconds independently, so the named stages can exceed a
+        // separately measured total by a few ms. `unattributed_ms` saturates — but silently
+        // clamping would let the sum identity hold while the numbers were nonsense, so the overshoot
+        // is published under its own name instead. Without `over_attributed_ms` this case is
+        // indistinguishable from a perfectly attributed span.
+        let span = ArmSpan::new(&test_origin(), 13, test_capture_timing(), 8, 370);
+        assert_eq!(span.unattributed_ms, 0, "the residual cannot go negative");
+        assert_eq!(span.over_attributed_ms, 4, "and by how much must be readable: 374 named vs 370");
+        assert_eq!(span.total_ms, 370, "the independently measured total is reported as measured");
+    }
+
     /// MEASUREMENT, not an assertion (sparkle-oyapv). Prints what a push-to-talk keydown actually
     /// costs on THIS machine: `Capture::start` wall time, and how long after it CoreAudio delivers
     /// the first buffer. Everything in that span is speech the founder has already spoken and the
@@ -1481,6 +2200,12 @@ mod tests {
     }
 
     fn measure_push_to_talk_cold_start_body() {
+        // START GENUINELY COLD. The format cache is a process-wide static, so a sibling test that
+        // opened a device first (`try_start_probe_capture`) would leave an entry behind and round 1
+        // — the round whose whole job is to show what a COLD open costs — would silently read it and
+        // report a warm number as the cold one. Dropping it here makes the run reproducible whatever
+        // ran before it, which matters because these figures are quoted as the design's evidence.
+        invalidate_input_config_cache();
         for round in 1..=3 {
             let t0 = std::time::Instant::now();
             let first_us = Arc::new(AtomicU64::new(0));
@@ -1490,8 +2215,25 @@ mod tests {
             // microphone's, and the printed figure carried no device name, so a number measured
             // against a virtual device was indistinguishable from a real one. These figures are
             // quoted as the justification for the pre-roll design, so they have to be attributable.
+            // A SYNTHETIC GESTURE ORIGIN, so the run exercises the real reporting path (sparkle-oyapv).
+            // Without one, `Capture::start` takes the `origin: None` branch and the whole
+            // keydown→first-sample line — the thing the founder asked to have verified — is never
+            // emitted, so a measurement run could not tell "the span is being reported" from "the
+            // span reporter is dead code". The pre-capture stage values are stand-ins for a real
+            // arm's (there is no `start_dictation` here to produce them) and are labelled as such in
+            // the printed output; the stages this harness genuinely measures are the capture
+            // sub-spans and the first-frame delay.
+            let origin = ArmOrigin {
+                keydown: t0,
+                reconcile_at: t0,
+                js_to_invoke_ms: 0,
+                prelude_ms: 0,
+                permission_ms: 0,
+                model_ms: 0,
+            };
             let capture = match Capture::start(
                 &DeviceChoice::Auto { allow_virtual: false },
+                Some(origin),
                 move |_frame: Vec<f32>| {
                     // Only the FIRST delivery is recorded; later frames leave the 0 sentinel alone.
                     let _ = sink.compare_exchange(
@@ -1524,19 +2266,26 @@ mod tests {
             // NAME THE DEVICE on every round. Without it a reading is unattributable, and these
             // numbers are the argument for the design.
             let dev = capture.device();
+            // `config_cached` on every round, because it is the OBSERVABLE EFFECT of the format
+            // cache and the only thing that distinguishes a served entry from a device that
+            // answered quickly. Round 1 must read false and rounds 2-3 true; if they ever all read
+            // false the cache has stopped working and `config_ms` is the number that will say so.
+            let t = capture.timing();
             match first_us.load(Ordering::Relaxed) {
                 0 => eprintln!(
                     "round {round}: device {:?} (virtual={} default={}) | Capture::start \
-                     {start_ms:7.1} ms | NO FRAME within 3000 ms",
-                    dev.name, dev.is_virtual, dev.was_default
+                     {start_ms:7.1} ms | config {} ms (cached={}) | NO FRAME within 3000 ms",
+                    dev.name, dev.is_virtual, dev.was_default, t.config_ms, t.config_cached
                 ),
                 us => eprintln!(
                     "round {round}: device {:?} (virtual={} default={}) | Capture::start \
-                     {start_ms:7.1} ms | first frame at {:7.1} ms (= audio lost if the user speaks \
-                     at t=0)",
+                     {start_ms:7.1} ms | config {} ms (cached={}) | first frame at {:7.1} ms \
+                     (= audio lost if the user speaks at t=0)",
                     dev.name,
                     dev.is_virtual,
                     dev.was_default,
+                    t.config_ms,
+                    t.config_cached,
                     us as f64 / 1000.0
                 ),
             }
