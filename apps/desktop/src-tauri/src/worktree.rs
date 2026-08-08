@@ -5184,6 +5184,24 @@ pub fn land_agent_branch_at(
     if target.is_empty() {
         return err("no-target", vec![]);
     }
+    // Argument-injection defence, matching every sibling in this file (`effective_base`:663,
+    // `create_worktree_from_local`:1587, the diff_* family). `target_branch` arrives from a Tauri
+    // command, i.e. from the frontend, and this function was the one place a ref reached `git`
+    // without passing `validate_ref` first.
+    //
+    // It is NOT exploitable as written — `target` is always concatenated with a suffix
+    // (`^{commit}`, `..branch`) before it reaches git, so it can never present as a bare `--flag`.
+    // That is exactly why this is worth pinning rather than leaving: the safety is an accident of
+    // the current call sites, not a property of the input, so the first edit that passes `target`
+    // as a standalone positional argument (`git(&wt, &["checkout", target])`) silently reopens the
+    // `--upload-pack=`/refspec class with nothing to catch it. Validating at the top makes the
+    // guarantee belong to the function.
+    //
+    // Reported as an invalid target rather than a hard `Err`, so a malformed ref surfaces through
+    // the same path as the empty case above instead of introducing a new error shape for callers.
+    if validate_ref(target).is_err() {
+        return err("no-target", vec![]);
+    }
     let branch = format!("sparkle/agent-{agent_id}");
     if git(root, &["rev-parse", "--verify", "--quiet", &format!("{branch}^{{commit}}")]).is_err() {
         return err("no-branch", vec![]);
@@ -12041,6 +12059,73 @@ mod tests {
             ws.ahead_of_base, 0,
             "no AUTHORED work ⇒ gate stays closed even though local main lags origin (regression)"
         );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// `land_agent_branch_at` must `validate_ref` its caller-supplied target, like every sibling
+    /// in this file (security audit 2026-08-08, finding L2).
+    ///
+    /// WHY THE OBVIOUS TEST WOULD BE VACUOUS, since that is the trap here: asserting that an
+    /// injection-shaped target like `--upload-pack=…` is refused PASSES WITHOUT THE FIX. Such a
+    /// target is always concatenated with a suffix (`^{commit}`) before reaching git, so git sees a
+    /// leading `--`, rejects it as an unknown option, and the function already reports `no-target`
+    /// — for a reason that has nothing to do with validation. That test would guard nothing.
+    ///
+    /// So this uses `main~1`: a target `validate_ref` rejects (it forbids `~`) but which git
+    /// resolves perfectly well. Before the fix it resolves, the function walks on past the target
+    /// check and reports `target-not-checked-out`; after the fix it is refused up front as
+    /// `no-target`. That difference is the validation itself, and nothing else produces it.
+    #[test]
+    fn land_validates_its_target_ref_and_still_accepts_ordinary_branches() {
+        let root = unique_root("land-validate");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("land-validate-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        git(&root_str, &["add", "-A"]).unwrap();
+        git(&root_str, &["commit", "-m", "chore: gitignore"]).unwrap();
+        // A second commit so `main~1` is a resolvable revision — the whole point of the case.
+        std::fs::write(root.join("seed.txt"), "seed\n").unwrap();
+        git(&root_str, &["add", "-A"]).unwrap();
+        git(&root_str, &["commit", "-m", "seed"]).unwrap();
+        let info = create_worktree_at(&root_str, "p", "LV", "main", &app_data).unwrap();
+        std::fs::write(Path::new(&info.path).join("f.txt"), "feature\n").unwrap();
+        git(&info.path, &["add", "-A"]).unwrap();
+        git(&info.path, &["commit", "-m", "agent feature"]).unwrap();
+
+        // Sanity: `main~1` really does resolve, so the refusal below cannot be git failing to
+        // parse it. Without this the test could pass for the wrong reason.
+        assert!(
+            git(&root_str, &["rev-parse", "--verify", "--quiet", "main~1^{commit}"]).is_ok(),
+            "main~1 must resolve, otherwise this test proves nothing"
+        );
+
+        // A rev-EXPRESSION where a branch NAME is required is refused by validation, not by git.
+        match land_agent_branch_at(&root_str, "LV", "main~1").unwrap() {
+            LandOutcome::Err { reason, .. } => assert_eq!(
+                reason, "no-target",
+                "a target `validate_ref` rejects must be refused up front"
+            ),
+            LandOutcome::Ok { .. } => panic!("a rev-expression is not a landable target"),
+        }
+
+        // …and an option-shaped target stays refused (belt-and-braces: this one already held).
+        match land_agent_branch_at(&root_str, "LV", "--upload-pack=touch /tmp/pwned").unwrap() {
+            LandOutcome::Err { reason, .. } => assert_eq!(reason, "no-target"),
+            LandOutcome::Ok { .. } => panic!("an option-shaped target is never landable"),
+        }
+
+        // REGRESSION GUARD: an ordinary branch must still land. A validator that rejected
+        // everything would satisfy both assertions above, so this is what makes them mean anything.
+        match land_agent_branch_at(&root_str, "LV", "main").unwrap() {
+            LandOutcome::Ok { .. } => {}
+            LandOutcome::Err { reason, .. } => {
+                panic!("an ordinary branch must still land, got {reason:?}")
+            }
+        }
+
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&app_data);
     }
