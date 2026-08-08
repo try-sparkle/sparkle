@@ -6,7 +6,9 @@
 // the path-less string. That lockstep is structural: both go through this one helper, and the bug
 // was one of them using a bare `map.set()` and growing for the whole session (roborev 53286).
 import { describe, expect, it } from "vitest";
-import { rememberSentText, SENT_TEXT_LIMIT } from "./ConciergeHost";
+// Imported from its own module rather than through ConciergeHost's re-export, so this suite does not
+// pull the whole host in to test two pure functions.
+import { rememberSentText, SENT_TEXT_LIMIT } from "./Concierge/sentTextLedger";
 
 describe("rememberSentText", () => {
   it("keeps entries under the cap", () => {

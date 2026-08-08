@@ -20,7 +20,7 @@
 //! loads context, reads, responds — and can END the turn it was in the middle of. Across 40 agents
 //! on a 10-minute ping that is ~240 turns an hour spent purely to learn who is alive. Reading these
 //! artifacts costs no agent TURN. That is the sense in which it is "free", and the only sense —
-//! measured, a pass costs ~0.27s per agent (five `git` spawns plus a bounded walk), so at 30 agents
+//! measured, a pass costs ~0.27s per agent (the git spawns plus a bounded walk), so at 30 agents
 //! it was ~8s of work against what used to be a ten-second poll. It runs every THIRTY seconds now,
 //! and an agent whose worktree, HEAD, index and base ref have not moved is served from a memo
 //! without spawning git at all. So: liveness and progress come from here,
@@ -143,7 +143,7 @@ pub struct GitFacts {
     /// distinction is the whole point of the idle-with-uncommitted-work contradiction. Untracked
     /// directories are expanded to their individual files rather than collapsed to one entry, so
     /// this really is a file count and not a count of `git status` lines (see
-    /// [`dirty_file_count`]). `None` = git could not tell us; it is NOT `Some(0)`.
+    /// [`branch_and_dirty`]). `None` = git could not tell us; it is NOT `Some(0)`.
     pub dirty_files: Option<u32>,
     /// Epoch ms of the branch tip's commit time. Nothing in the app computes this today, and it is
     /// the single most direct answer to "is this agent still landing work".
@@ -494,7 +494,26 @@ pub fn unread_diffs(agents: &[FleetAgentFacts]) -> Vec<String> {
 // Git observations
 // ---------------------------------------------------------------------------------------------
 
-/// Count of dirty paths in a worktree. `None` = git could not tell us, NOT "clean".
+/// Every `git` subprocess THIS MODULE spawns goes through here.
+///
+/// It exists so a test can count spawns. The per-pass cost of this module is dominated by the
+/// number of `git` children it forks — on the reference machine (108 worktrees sharing one `.git`
+/// with 552 branches) a trivial spawn costs ~48 ms purely in process setup and ref-store attach, so
+/// "how many spawns per agent" IS the performance contract. A test that asserted on the returned
+/// struct instead would pass identically against a version that forked five children per agent and
+/// against one that forks two; only the count distinguishes them.
+///
+/// Counting is `cfg(test)` so production pays nothing. `crate::worktree::git` is deliberately NOT
+/// counted directly: the test fixtures build their repos through it, and those setup commands are
+/// not the thing under measurement.
+fn git(cwd: &str, args: &[&str]) -> Result<String, String> {
+    #[cfg(test)]
+    tests::note_git_spawn();
+    crate::worktree::git(cwd, args)
+}
+
+/// The two facts a single `status --porcelain=v2 --branch` yields: the checked-out branch and the
+/// count of dirty paths. `None` on either = git could not tell us, NOT "clean" / "detached".
 ///
 /// `--no-optional-locks` matters and is not decoration: a plain `git status` refreshes and rewrites
 /// the index, which bumps its mtime — and the index mtime is a component of the status-cache
@@ -518,28 +537,383 @@ pub fn unread_diffs(agents: &[FleetAgentFacts]) -> Vec<String> {
 /// escalation, so writing a whole new module would read as trivially dirty. The extra scan is
 /// affordable here because `.gitignore` still applies (so `node_modules` and `target` are not
 /// walked) and because [`newest_write_ms`] already walks this same tree on every pass.
-fn dirty_file_count(worktree: &str) -> Option<u32> {
-    let args = &["--no-optional-locks", "status", "--porcelain", "--untracked-files=all"];
-    let out = match crate::worktree::git(worktree, args) {
+///
+/// WHY `--porcelain=v2 --branch` RATHER THAN TWO COMMANDS. `v2`'s `--branch` header carries
+/// `# branch.head <name>`, which is exactly what `rev-parse --abbrev-ref HEAD` used to be spawned
+/// separately to learn. Both facts come out of one process, so this is a spawn per agent per pass
+/// removed for free — measured at ~48 ms of pure fork/attach overhead each on a checkout with 552
+/// branches. The entry format changes (`?? path` becomes `? path`, `1 XY …` replaces ` M path`) but
+/// nothing here parses the entries: they are COUNTED, and every header line is prefixed `#`, so the
+/// count is "non-`#`, non-empty lines" in either format.
+///
+/// ONE ANSWER GENUINELY CHANGES, and it changes for the better: on an UNBORN branch — a worktree
+/// created but not yet committed into — `rev-parse --abbrev-ref HEAD` exits 128 ("ambiguous
+/// argument 'HEAD'"), so the old reader reported `branch: None`, conflating "has not committed yet"
+/// with "detached, or we could not read this worktree at all". `--porcelain=v2 --branch` answers
+/// `# branch.oid (initial)` alongside the real branch name, which is what `git status` tells a
+/// human. Measured against the real fleet this was 1 worktree in 117, and it is the ONLY field that
+/// differs across all of them. The facts that really do need a commit (`ahead`, `last_commit_ms`)
+/// stay `None` there, as they must.
+fn branch_and_dirty(worktree: &str) -> (Option<String>, Option<u32>) {
+    let args =
+        &["--no-optional-locks", "status", "--porcelain=v2", "--branch", "--untracked-files=all"];
+    let out = match git(worktree, args) {
         Ok(out) => out,
         Err(e) => {
             // `debug!`, not `warn!`: at 64 agents on a ten-second cadence a persistently
             // unreadable worktree (spun down mid-pass, mid-rebase) would flood the log. The text
             // is the whole git error, so the 129 above would have been one grep away.
-            tracing::debug!(worktree, error = %e, "fleet: dirty-file count unavailable; reporting None");
-            return None;
+            tracing::debug!(worktree, error = %e, "fleet: branch/dirty read unavailable; reporting None");
+            return (None, None);
         }
     };
+
+    let mut branch = None;
+    let mut dirty: u32 = 0;
+    for line in out.lines() {
+        if let Some(rest) = line.strip_prefix("# branch.head ") {
+            let name = rest.trim();
+            // `(detached)` is v2's spelling of what `rev-parse --abbrev-ref HEAD` reported as the
+            // literal string `HEAD`, and the old code filtered that to `None`. Same answer, so a
+            // detached worktree keeps reporting "no branch" rather than a branch named `(detached)`.
+            if !name.is_empty() && name != "(detached)" {
+                branch = Some(name.to_string());
+            }
+        } else if !line.starts_with('#') && !line.trim().is_empty() {
+            dirty += 1;
+        }
+    }
     // Reached only when git SUCCEEDED, so an empty result really is a clean tree: `Some(0)` and
     // `None` are different answers and this is the line that keeps them apart.
-    Some(out.lines().filter(|l| !l.trim().is_empty()).count() as u32)
+    (branch, Some(dirty))
 }
 
 /// Commit time of a ref, epoch ms. `%ct` is the committer date, which is what "when did this agent
 /// last land work" means; author date can be far older after a rebase.
 fn last_commit_ms(worktree: &str, git_ref: &str) -> Option<i64> {
-    let out = crate::worktree::git(worktree, &["log", "-1", "--format=%ct", git_ref]).ok()?;
+    let out = git(worktree, &["log", "-1", "--format=%ct", git_ref]).ok()?;
     out.trim().parse::<i64>().ok().map(|secs| secs * 1000)
+}
+
+// ---------------------------------------------------------------------------------------------
+// The fleet-wide ref prepass
+//
+// WHY. Two of the five facts [`git_facts`] used to gather — `ahead` and `last_commit_ms` — depend
+// on NOTHING but the branch TIP. They do not read the working tree, the index, or anything else
+// that is per-worktree. And in this app every agent worktree is a LINKED worktree of one shared
+// `.git`, so all of those tips live in ONE ref store that can be read in ONE spawn:
+//
+//   git for-each-ref --format='%(refname)<TAB>%(committerdate:unix)<TAB>%(ahead-behind:<base>)' \
+//       -- refs/heads/<b1> refs/heads/<b2> ...
+//
+// Measured on the reference machine (108 worktrees, 552 branches): the two per-agent spawns cost
+// 48 ms + 102 ms each, i.e. ~15 s across a 100-agent pass, while one scoped `for-each-ref` over the
+// 47 branches actually in use answers both for everyone in 107 ms. A whole pass drops from
+// 22,041 ms to 11,825 ms (220 ms → 117 ms per agent, 46 % faster).
+//
+// SCOPED, NOT WHOLESALE. The same command left unscoped — every ref under `refs/heads/` — costs
+// 630 ms here, because `%(ahead-behind:)` is a real revision walk per ref and this checkout carries
+// 552 branches for 47 live agents. Naming the branches is most of the win.
+//
+// IT IS A FAST PATH, NEVER A REPLACEMENT. On the reference machine only 42 of 101 worktrees had a
+// usable row: 58 were on a branch with no entry under `refs/heads` at all and 1 was on a DETACHED
+// HEAD. Every one of those falls back to the per-agent `rev-list --count` + `log -1`. A missing row
+// must NEVER be reported as `ahead: 0` / no commit time — this module's whole doctrine is that
+// `None` and `Some(0)` are different answers, and a batching optimisation that quietly turns
+// "unknown" into "zero" would be a correctness regression wearing a performance win's clothes.
+// ---------------------------------------------------------------------------------------------
+
+/// One branch tip's ref-derived facts, plus the branch they were read for.
+///
+/// Both extra fields exist so a lookup can be CHECKED rather than trusted. The prepass reads a
+/// worktree's state once, up front; the per-agent pass reads it again a moment later. Those two
+/// reads are not atomic, and agents COMMIT while a digest is running.
+///
+///   * `branch` — the prepass resolves it from the `HEAD` file, `git status` resolves it again. An
+///     agent that switched branches in between would otherwise be handed the previous branch's
+///     `ahead` count.
+///   * `head_ref_ms` — the mtime of the ref file the branch points at, i.e. the one thing that moves
+///     when a commit lands. This closes a window that would otherwise PIN staleness rather than
+///     merely show it: `agent_facts_with` fingerprints the worktree AFTER the table was built, so a
+///     commit landing in between would be stored in the memo as "already accounted for", and the
+///     stale `ahead`/`last_commit_ms` would be served until something else about the worktree
+///     changed. Re-stating the ref at lookup time and refusing a row that moved keeps facts at least
+///     as fresh as the fingerprint they are memoized under. It fails CLOSED — a ref that moved, or
+///     one we cannot stat now but could then, drops to the per-agent read, which is always correct.
+///     **It is sampled BEFORE the tip read, and that order is the guard.** A mtime taken afterwards
+///     absorbs whatever happened during the read, so the row would pair a pre-commit `ahead` with a
+///     post-commit mtime and the lookup would accept it — reintroducing the very bug, through a
+///     smaller window. See `sampled_ms` in [`ref_rows`].
+///     (A PACKED ref stats as `None` at both moments and is accepted; git writes a LOOSE ref when it
+///     updates one, so a packed ref that moves reads `None` → `Some` and is correctly refused.)
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RefRow {
+    branch: String,
+    head_ref_ms: Option<i64>,
+    ahead: u32,
+    committer_ms: i64,
+}
+
+/// The fleet-wide ref prepass, computed AT MOST ONCE and lazily.
+///
+/// Threaded as an explicit parameter rather than parked in a process-wide static, deliberately.
+/// `fleet_digest` has two callers with different populations AND potentially different bases (the
+/// fleet watch passes every open agent; the concierge tool passes a subset), so a global keyed on
+/// the wrong base would serve one caller's answer to the other's question — a real bug in a module
+/// whose entire contract is not faking absence.
+///
+/// LAZY because the memo above already answers most agents without any git at all. Building the
+/// table eagerly would spend a spawn on every pass, including the passes where the memo makes the
+/// answer free — turning a 0-spawn pass into a 1-spawn pass forever. `OnceLock::get_or_init` also
+/// makes the fan-out safe for free: the first of the 8 worker threads to need the table computes
+/// it, the rest block on that one computation rather than each spawning their own.
+pub struct RefTable {
+    rows: OnceLock<HashMap<String, RefRow>>,
+    worktrees: Vec<PathBuf>,
+    base: String,
+}
+
+impl RefTable {
+    /// A table over `worktrees`, measuring `ahead` against `base`. Nothing is read until [`Self::tip`]
+    /// is first called.
+    fn new(worktrees: Vec<PathBuf>, base: &str) -> Self {
+        Self { rows: OnceLock::new(), worktrees, base: base.to_string() }
+    }
+
+    /// A table that can never hold a row, so every caller takes the per-agent path. This is what
+    /// the public [`git_facts`] passes: a single-worktree read has nothing to batch, and paying a
+    /// `for-each-ref` to serve one agent would be slower than the two spawns it replaces.
+    fn empty() -> Self {
+        Self { rows: OnceLock::new(), worktrees: Vec::new(), base: String::new() }
+    }
+
+    /// The row for `worktree` — but only if it still describes this worktree: read for the branch
+    /// the caller is actually on, and read before the branch tip last moved. See [`RefRow`].
+    fn tip(&self, worktree: &str, branch: &str) -> Option<&RefRow> {
+        let row = self.rows.get_or_init(|| ref_rows(&self.worktrees, &self.base)).get(worktree)?;
+        (row.branch == branch && row.head_ref_ms == head_ref_ms(Path::new(worktree))).then_some(row)
+    }
+}
+
+/// The mtime of the ref file this worktree's `HEAD` points at — the file a commit rewrites.
+///
+/// `None` for a detached head (no separate ref file), for a packed ref, and for a worktree we
+/// cannot read. All three are compared as values rather than special-cased: what matters is only
+/// whether the answer is the SAME now as it was during the prepass.
+fn head_ref_ms(worktree: &Path) -> Option<i64> {
+    let (own_dir, common_dir) = crate::worktree::git_dirs(worktree);
+    head_ref_path(&own_dir, &common_dir).as_deref().and_then(mtime_ms)
+}
+
+/// Max ref patterns in one `for-each-ref` argv, and max bytes of them.
+///
+/// The prepass names every in-use branch on the command line, and a fleet is unbounded from this
+/// module's point of view. macOS `ARG_MAX` is ~1 MiB, so neither ceiling is close to it — they
+/// exist so that a pathological fleet degrades into a handful of spawns instead of an `E2BIG` that
+/// would silently drop the whole table (and with it, the optimisation) for everyone.
+const REF_CHUNK_MAX_PATTERNS: usize = 256;
+const REF_CHUNK_MAX_BYTES: usize = 96 * 1024;
+
+/// Does `base` denote the same commit no matter WHICH worktree resolves it?
+///
+/// This has to be an ALLOWLIST, and the reason is worth stating because the obvious version is a
+/// denylist and it is wrong. The prepass runs once per repository, from one member's directory, so
+/// a base whose meaning is per-worktree gets resolved against that one worktree and then applied to
+/// every other agent in the group — silently, with no fallback, because the command SUCCEEDS.
+/// `base` reaches here from the `fleet_digest` Tauri command (exposed to the concierge), and
+/// `validate_ref` does not exclude any of `ORIG_HEAD`, `FETCH_HEAD`, `MERGE_HEAD`, `REBASE_HEAD`,
+/// `@{u}`, `@{-1}`, `refs/bisect/…` or `refs/worktree/…` — all per-worktree, all plausible-looking.
+/// Excluding `HEAD` and `@` by name would have been a guard enumerated by VALUE: correct only for
+/// the two cases its author happened to think of, and quietly wrong for the rest.
+///
+/// So the question asked is the property itself: **does this name a ref that lives in the SHARED
+/// ref store?** Two ways to be sure without spawning anything:
+///   * a full object name (40 hex for sha-1, 64 for sha-256) is the same commit everywhere by
+///     construction;
+///   * otherwise the name must resolve to an existing ref under `refs/heads/` or `refs/remotes/`,
+///     the two namespaces git keeps in the common dir. Checked against the loose ref file and then
+///     `packed-refs`.
+///
+/// Everything else — pseudo-refs, reflog selectors, git's per-worktree ref namespaces, and names
+/// that simply do not exist — falls back to the per-agent read, which resolves in the right
+/// worktree and is always correct.
+fn base_names_a_shared_ref(common_dir: &Path, base: &str) -> bool {
+    if (base.len() == 40 || base.len() == 64) && base.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return true;
+    }
+    // Guards the joins below: no traversal, no absolute path, no empty segments.
+    if !is_plain_ref_path(base) {
+        return false;
+    }
+    let candidates: Vec<String> = if base.starts_with("refs/") {
+        vec![base.to_string()]
+    } else {
+        vec![format!("refs/heads/{base}"), format!("refs/remotes/{base}")]
+    };
+    let candidates: Vec<String> = candidates
+        .into_iter()
+        .filter(|r| r.starts_with("refs/heads/") || r.starts_with("refs/remotes/"))
+        .collect();
+    if candidates.is_empty() {
+        return false;
+    }
+    if candidates.iter().any(|r| common_dir.join(r).exists()) {
+        return true;
+    }
+    let Ok(packed) = std::fs::read_to_string(common_dir.join("packed-refs")) else {
+        return false;
+    };
+    packed.lines().any(|line| {
+        line.split_once(' ').is_some_and(|(_sha, name)| candidates.iter().any(|r| r == name.trim()))
+    })
+}
+
+/// The branch a worktree's `HEAD` file names, without spawning git.
+///
+/// `None` for a DETACHED head (the file holds a raw sha, not a `ref:` pointer) and for a symbolic
+/// head pointing outside `refs/heads/`. Both are honest "no fast path for this one" answers.
+fn head_branch(worktree: &Path) -> Option<String> {
+    let (own_dir, _common) = crate::worktree::git_dirs(worktree);
+    let contents = std::fs::read_to_string(own_dir.join("HEAD")).ok()?;
+    let target = contents.trim().strip_prefix("ref:")?.trim();
+    let name = target.strip_prefix("refs/heads/")?;
+    (!name.is_empty() && is_plain_ref_path(name)).then(|| name.to_string())
+}
+
+/// Read every worktree's branch tip in as few `git` spawns as the argv budget allows.
+///
+/// Keyed by WORKTREE path rather than by branch name, because grouping is per REPOSITORY: agents
+/// can span projects (`fleet_digest` takes a list of `(agent_id, project_id)`), and `main` in one
+/// project is not `main` in another. Keying a flat map on the branch name alone would let one
+/// project's tip answer for another's.
+fn ref_rows(worktrees: &[PathBuf], base: &str) -> HashMap<String, RefRow> {
+    let mut rows = HashMap::new();
+    // SECURITY. `base` is interpolated into the `--format` argument, and each branch name is passed
+    // as a positional pattern. `validate_ref` is the existing, tested guard for both hazards: it
+    // rejects a leading `-`/`+` (git would read the argument as an OPTION) and the glob
+    // metacharacters `? * [ \` (a positional here is a PATTERN, so an unvalidated name could match
+    // refs it does not name). The `--` below is belt-and-braces on top of that.
+    if worktrees.is_empty() || crate::worktree::validate_ref(base).is_err() {
+        return rows;
+    }
+
+    // repository common gitdir -> the (worktree, branch) pairs that live in it.
+    let mut groups: BTreeMap<PathBuf, Vec<(String, String)>> = BTreeMap::new();
+    for worktree in worktrees {
+        if !worktree.is_dir() {
+            continue;
+        }
+        let Some(branch) = head_branch(worktree) else { continue };
+        if crate::worktree::validate_ref(&branch).is_err() {
+            continue;
+        }
+        let (_own, common) = crate::worktree::git_dirs(worktree);
+        groups
+            .entry(common)
+            .or_default()
+            .push((worktree.to_string_lossy().to_string(), branch));
+    }
+
+    for (common, members) in groups {
+        // Asked PER REPOSITORY, because `base` resolving in one says nothing about another: a
+        // project that has never fetched `origin/main` must take the per-agent path even while its
+        // neighbour batches. See [`base_names_a_shared_ref`].
+        if !base_names_a_shared_ref(&common, base) {
+            continue;
+        }
+        // SAMPLED BEFORE THE READ, and the order is the entire guard. A recorded mtime can only
+        // prove "nothing moved" if it was taken no LATER than the data it guards: taken afterwards
+        // it absorbs any change that happened during the read, so the row stores a pre-commit
+        // `ahead` next to a post-commit mtime, the lookup re-stats and sees a match, and the stale
+        // pair is accepted — the exact failure this field exists to prevent, just through a smaller
+        // window. Not a sub-millisecond window either: with more than `REF_CHUNK_MAX_PATTERNS`
+        // branches the read is several spawns, so a tip read in the first chunk would be stat'd only
+        // after every later one returned. Sampling first makes the guard conservative in the safe
+        // direction — a ref that moves during the batch read is refused and falls back per-agent.
+        let sampled_ms: HashMap<&str, Option<i64>> = members
+            .iter()
+            .map(|(worktree, _)| (worktree.as_str(), head_ref_ms(Path::new(worktree))))
+            .collect();
+
+        // Any member works as the cwd — they share one ref store, which is the premise of batching.
+        let cwd = members[0].0.clone();
+        let mut names: Vec<&str> = members.iter().map(|(_, b)| b.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+
+        let format =
+            format!("--format=%(refname)%09%(committerdate:unix)%09%(ahead-behind:{base})");
+        let mut tips: HashMap<String, (u32, i64)> = HashMap::new();
+        for chunk in ref_chunks(&names) {
+            let patterns: Vec<String> =
+                chunk.iter().map(|n| format!("refs/heads/{n}")).collect();
+            let mut args: Vec<&str> = vec!["for-each-ref", &format, "--"];
+            args.extend(patterns.iter().map(String::as_str));
+            let out = match git(&cwd, &args) {
+                Ok(out) => out,
+                Err(e) => {
+                    // The commonest cause is an unresolvable `base` (never fetched), which fails the
+                    // WHOLE command — every branch in the chunk simply gets no row and takes the
+                    // per-agent path, which will fail the same way and report `None`. Silence here
+                    // would be indistinguishable from a fleet whose branches all vanished.
+                    tracing::debug!(cwd, base, error = %e, "fleet: ref prepass unavailable; falling back per agent");
+                    continue;
+                }
+            };
+            for line in out.lines() {
+                let mut parts = line.split('\t');
+                let (Some(refname), Some(date), Some(ahead_behind)) =
+                    (parts.next(), parts.next(), parts.next())
+                else {
+                    continue;
+                };
+                let Some(branch) = refname.strip_prefix("refs/heads/") else { continue };
+                let Ok(secs) = date.trim().parse::<i64>() else { continue };
+                // `%(ahead-behind:X)` prints `<ahead> <behind>`; only the first half is the
+                // `rev-list --count <base>..HEAD` this replaces.
+                let Some(Ok(ahead)) = ahead_behind.split_whitespace().next().map(str::parse::<u32>)
+                else {
+                    continue;
+                };
+                tips.insert(branch.to_string(), (ahead, secs * 1000));
+            }
+        }
+
+        for (worktree, branch) in &members {
+            if let Some(&(ahead, committer_ms)) = tips.get(branch.as_str()) {
+                // The mtime from BEFORE the read — never a fresh stat. See `sampled_ms` above.
+                let head_ref_ms = sampled_ms.get(worktree.as_str()).copied().flatten();
+                rows.insert(
+                    worktree.clone(),
+                    RefRow { branch: branch.clone(), head_ref_ms, ahead, committer_ms },
+                );
+            }
+        }
+    }
+    rows
+}
+
+/// Split branch names into argv-sized batches. See [`REF_CHUNK_MAX_PATTERNS`].
+fn ref_chunks<'a>(names: &'a [&'a str]) -> Vec<Vec<&'a str>> {
+    let mut out: Vec<Vec<&str>> = Vec::new();
+    let mut current: Vec<&str> = Vec::new();
+    let mut bytes = 0usize;
+    for name in names {
+        // `refs/heads/` + the name + the NUL the kernel counts per argv entry.
+        let cost = name.len() + 12;
+        if !current.is_empty()
+            && (current.len() >= REF_CHUNK_MAX_PATTERNS || bytes + cost > REF_CHUNK_MAX_BYTES)
+        {
+            out.push(std::mem::take(&mut current));
+            bytes = 0;
+        }
+        current.push(name);
+        bytes += cost;
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
 }
 
 /// Gather git facts for one worktree against `base`.
@@ -548,18 +922,33 @@ fn last_commit_ms(worktree: &str, git_ref: &str) -> Option<i64> {
 /// answer some of these and not others, and reporting the ones it can answer beats failing the
 /// whole agent. `base` is only used for the two comparison reads.
 pub fn git_facts(worktree: &str, base: &str) -> GitFacts {
-    let branch = crate::worktree::git(worktree, &["rev-parse", "--abbrev-ref", "HEAD"])
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty() && s != "HEAD");
+    git_facts_with(worktree, base, &RefTable::empty())
+}
 
-    let ahead = crate::worktree::git(worktree, &["rev-list", "--count", &format!("{base}..HEAD")])
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok());
+/// [`git_facts`] with the fleet-wide ref prepass available.
+///
+/// Two spawns when `refs` has a row for this worktree (`status`, `diff`), four when it does not
+/// (plus `rev-list` and `log`). It was FIVE before this: `rev-parse --abbrev-ref HEAD` folded into
+/// the `status` call, and `rev-list`/`log` into the prepass.
+fn git_facts_with(worktree: &str, base: &str, refs: &RefTable) -> GitFacts {
+    let (branch, dirty_files) = branch_and_dirty(worktree);
+
+    // No branch means detached, or git could not read this worktree at all. Either way there is no
+    // row to look up and no name to check one against, so take the per-agent path.
+    let tip = branch.as_deref().and_then(|b| refs.tip(worktree, b));
+    let (ahead, last_commit_ms) = match tip {
+        Some(row) => (Some(row.ahead), Some(row.committer_ms)),
+        None => (
+            git(worktree, &["rev-list", "--count", &format!("{base}..HEAD")])
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok()),
+            last_commit_ms(worktree, "HEAD"),
+        ),
+    };
 
     // `.ok()`, deliberately NOT `.unwrap_or_default()`: an unreadable diff must stay `None` so a
     // reader (and `find_conflicts`) can tell it apart from a branch that really changed nothing.
-    let changed_files = crate::worktree::git(worktree, &["diff", "--name-only", &format!("{base}...HEAD")])
+    let changed_files = git(worktree, &["diff", "--name-only", &format!("{base}...HEAD")])
         .map_err(|e| {
             tracing::debug!(worktree, base, error = %e, "fleet: changed-file diff unavailable; reporting None");
         })
@@ -572,19 +961,14 @@ pub fn git_facts(worktree: &str, base: &str) -> GitFacts {
                 .collect::<Vec<_>>()
         });
 
-    GitFacts {
-        ahead,
-        dirty_files: dirty_file_count(worktree),
-        last_commit_ms: last_commit_ms(worktree, "HEAD"),
-        branch,
-        changed_files,
-    }
+    GitFacts { ahead, dirty_files, last_commit_ms, branch, changed_files }
 }
 
 // ---------------------------------------------------------------------------------------------
 // The git-facts memo
 //
-// WHY. [`git_facts`] is five `git` subprocess spawns per agent, and the digest runs over every open
+// WHY. [`git_facts`] is two to four `git` subprocess spawns per agent (it was five before the ref
+// prepass below), and the digest runs over every open
 // agent on a timer. Measured on a real worktree: 0.15 s for the five spawns and 0.12 s for the
 // walk, so at 30 agents a pass was ~8.1 s of SEQUENTIAL work against a 10 s interval — an ~80 %
 // duty cycle that stopped fitting its own interval at ~37 agents. A profile of the running app
@@ -780,7 +1164,16 @@ pub fn agent_facts(
     now_ms: i64,
     window_ms: i64,
 ) -> FleetAgentFacts {
-    agent_facts_with(agent_id, worktree, hook_log, base, now_ms, window_ms, &git_facts)
+    agent_facts_with(
+        agent_id,
+        worktree,
+        hook_log,
+        base,
+        now_ms,
+        window_ms,
+        &git_facts_with,
+        &RefTable::empty(),
+    )
 }
 
 /// [`agent_facts`] with the git reader injected.
@@ -789,6 +1182,10 @@ pub fn agent_facts(
 /// zero git subprocesses", and the only assertion that actually proves that is one which observes
 /// the call count — asserting that a cache entry exists would pass just as happily against a
 /// version that re-ran git every time and then overwrote the entry.
+///
+/// `refs` is threaded rather than hidden in a static — see [`RefTable`] for why an implicit
+/// process-wide table keyed on one caller's base would be a correctness bug here.
+#[allow(clippy::too_many_arguments)]
 fn agent_facts_with(
     agent_id: &str,
     worktree: &Path,
@@ -796,7 +1193,8 @@ fn agent_facts_with(
     base: &str,
     now_ms: i64,
     window_ms: i64,
-    git_fn: &(dyn Fn(&str, &str) -> GitFacts + Sync),
+    git_fn: &(dyn Fn(&str, &str, &RefTable) -> GitFacts + Sync),
+    refs: &RefTable,
 ) -> FleetAgentFacts {
     let worktree_exists = worktree.is_dir();
 
@@ -833,7 +1231,7 @@ fn agent_facts_with(
         let git = match cached {
             Some(facts) => facts,
             None => {
-                let facts = git_fn(&wt, base);
+                let facts = git_fn(&wt, base, refs);
                 if let Some(fp) = fingerprint {
                     if let Ok(mut memo) = git_memo().lock() {
                         memo.insert(
@@ -882,7 +1280,7 @@ pub fn build_digest(
     now_ms: i64,
     window_ms: i64,
 ) -> FleetDigest {
-    build_digest_with(agents, hook_events_dir, base, now_ms, window_ms, &git_facts)
+    build_digest_with(agents, hook_events_dir, base, now_ms, window_ms, &git_facts_with)
 }
 
 /// How many agents this digest reads CONCURRENTLY.
@@ -911,11 +1309,17 @@ fn build_digest_with(
     base: &str,
     now_ms: i64,
     window_ms: i64,
-    git_fn: &(dyn Fn(&str, &str) -> GitFacts + Sync),
+    git_fn: &(dyn Fn(&str, &str, &RefTable) -> GitFacts + Sync),
 ) -> FleetDigest {
+    // ONE table for the whole pass, built before the fan-out and shared by every worker thread.
+    // Construction is free — it only records the population and the base; the single `for-each-ref`
+    // runs on the first agent that actually needs a tip, and not at all when the memo answers
+    // everyone (see [`RefTable`]).
+    let refs = RefTable::new(agents.iter().map(|(_, wt)| wt.clone()).collect(), base);
+
     let one = |(id, worktree): &(String, PathBuf)| {
         let log = hook_events_dir.join(format!("{id}.jsonl"));
-        agent_facts_with(id, worktree, &log, base, now_ms, window_ms, git_fn)
+        agent_facts_with(id, worktree, &log, base, now_ms, window_ms, git_fn, &refs)
     };
 
     let facts: Vec<FleetAgentFacts> = if agents.len() <= 1 {
@@ -973,7 +1377,7 @@ fn now_ms() -> i64 {
 #[tauri::command]
 /// `async` + `spawn_blocking` is REQUIRED here, not stylistic — the rule `hooks.rs` states: a sync
 /// `#[tauri::command]` runs on the MAIN THREAD. This is the heaviest work in the file. Per agent it
-/// is four `git` subprocess spawns plus a filesystem walk of up to [`WALK_MAX_ENTRIES`] stats, so at
+/// is a couple of `git` subprocess spawns plus a filesystem walk of up to [`WALK_MAX_ENTRIES`] stats, so at
 /// the documented target of 64 agents on a ten-second cadence that is ~256 git processes and ~256k
 /// `stat` calls per pass. On the UI thread that is the app frozen for the duration, every ten
 /// seconds, by the very feature meant to make the fleet observable.
@@ -1443,6 +1847,50 @@ fn read_transcript_at(
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // ---- counting the subprocesses this module actually forks ---------------------------------
+    //
+    // The performance contract this file makes is a SPAWN COUNT: five `git` children per agent per
+    // pass became two, plus one fleet-wide prepass. Nothing about the returned `GitFacts` reflects
+    // that — the same struct comes back either way — so a test that inspects the struct proves the
+    // answers are right and says nothing at all about the thing that was changed. These two helpers
+    // are the seam that makes the count observable.
+
+    static GIT_SPAWNS: AtomicUsize = AtomicUsize::new(0);
+
+    /// Called by [`super::git`] on every subprocess this module forks.
+    pub(super) fn note_git_spawn() {
+        GIT_SPAWNS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Serialises every test that spawns real `git` THROUGH THIS MODULE, so the process-wide counter
+    /// above is exclusive for whoever holds it. The counter has to be global (the digest fan-out
+    /// spawns worker threads, so a thread-local would lose most of the count), and libtest runs
+    /// tests concurrently — without this lock a concurrent test's spawns would land in someone
+    /// else's measurement and the assertion would flake.
+    ///
+    /// Fixture setup (`git_repo` / `fleet_repo`) deliberately calls `crate::worktree::git` DIRECTLY,
+    /// bypassing the counter, so building a repo inside a held lock does not pollute the number.
+    ///
+    /// THE INVARIANT, and it is on you when you add a test: EVERY test that can reach `super::git`
+    /// must hold this lock, whether or not it asserts on the count. "Can reach" is wider than it
+    /// looks — `build_digest` and `git_facts` fork git for any worktree argument that is an
+    /// EXISTING DIRECTORY, including one that is not a repository at all (git fails, but the child
+    /// was still forked and still counted).
+    fn git_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Spawns recorded since the last [`reset_git_spawns`]. Call only under [`git_lock`].
+    fn git_spawns() -> usize {
+        GIT_SPAWNS.load(Ordering::SeqCst)
+    }
+
+    fn reset_git_spawns() {
+        GIT_SPAWNS.store(0, Ordering::SeqCst);
+    }
 
     fn line(ts: i64, event: &str, extra: &str) -> String {
         if extra.is_empty() {
@@ -1751,6 +2199,11 @@ mod tests {
 
     #[test]
     fn the_digest_carries_the_unread_diffs_alongside_the_conflicts() {
+        // Holds the counter lock: its `live` agent is an EXISTING directory that is not a git repo,
+        // so `build_digest` really does fork git children through the counted wrapper. Unlocked,
+        // those increments could land inside another test's measurement window — and the two
+        // `assert_eq!(git_spawns(), 0, …)` assertions need only one stray spawn to flake.
+        let _spawns = git_lock();
         // End-to-end through `build_digest`: a caller holding only the digest can tell whether
         // `conflicts` was computed over every agent's diff or over some of them.
         let dir = std::env::temp_dir().join(format!("sparkle-fleet-unread-{}", std::process::id()));
@@ -1817,6 +2270,7 @@ mod tests {
 
     #[test]
     fn digest_carries_the_window_and_the_conflicts_together() {
+        let _spawns = git_lock();
         let dir = std::env::temp_dir().join(format!("sparkle-fleet-digest-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let d = build_digest(&[], &dir, "origin/main", 1_234, 5_678);
@@ -1847,6 +2301,8 @@ mod tests {
 
     #[test]
     fn git_facts_counts_dirty_files_and_reads_the_commit_time() {
+        // Spawns real git THROUGH this module, so it holds the counter lock — see `git_lock`.
+        let _spawns = git_lock();
         // THE regression guard for the argument-order defect: `--no-optional-locks` is a TOP-LEVEL
         // git option, and `git status --porcelain --no-optional-locks` exits 129 with "unknown
         // option". With the flag misplaced every one of these `dirty_files` reads is None, so the
@@ -1886,6 +2342,7 @@ mod tests {
 
     #[test]
     fn an_unresolvable_base_leaves_changed_files_none_rather_than_empty() {
+        let _spawns = git_lock();
         // The real-world trigger: `origin/main` was never fetched into this worktree, so
         // `git diff --name-only origin/main...HEAD` hard-fails. Reported as an empty list it would
         // read as "this agent changed nothing" and silence conflict detection fleet-wide.
@@ -1918,6 +2375,7 @@ mod tests {
 
     #[test]
     fn a_worktree_git_cannot_read_reports_none_not_clean() {
+        let _spawns = git_lock();
         // The module's doctrine: None means WE COULD NOT TELL. A path that is not a git worktree
         // must not be reported as `Some(0)` dirty files, which reads as "this agent is clean".
         let dir = std::env::temp_dir().join(format!("sparkle-fleet-nogit-{}", std::process::id()));
@@ -1927,6 +2385,537 @@ mod tests {
         assert_eq!(facts.dirty_files, None, "a failed git read is None, never Some(0)");
         assert_eq!(facts.last_commit_ms, None);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- the fleet-wide ref prepass ----------------------------------------------------------
+
+    /// The shape this module actually runs against: several LINKED worktrees over ONE shared
+    /// `.git`, each on its own branch one commit past a common `trunk`. The worktrees live OUTSIDE
+    /// the repo's own working tree so they do not show up as its untracked files.
+    fn fleet_repo(tag: &str, branches: &[&str]) -> (PathBuf, String, Vec<PathBuf>) {
+        let root = std::env::temp_dir().join(format!("sparkle-fleet-{tag}-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let main = repo.to_string_lossy().to_string();
+        // Routed through `crate::worktree::git`, NOT this module's counting wrapper: fixture setup
+        // is not part of any measurement, and it also inherits the suite's `core.hooksPath`
+        // isolation so these commits cannot fire a developer's global git hooks.
+        crate::worktree::git(&main, &["init"]).expect("git init");
+        crate::worktree::git(&main, &["config", "user.email", "fleet-test@example.invalid"]).unwrap();
+        crate::worktree::git(&main, &["config", "user.name", "Fleet Test"]).unwrap();
+        std::fs::write(repo.join("base.txt"), "base").unwrap();
+        crate::worktree::git(&main, &["add", "-A"]).unwrap();
+        crate::worktree::git(&main, &["commit", "-m", "base"]).unwrap();
+        // Pin the trunk name: `git init`'s default is a machine setting, and the base ref is an
+        // argument these tests pass by name.
+        crate::worktree::git(&main, &["branch", "-M", "trunk"]).unwrap();
+
+        let mut worktrees = Vec::new();
+        for b in branches {
+            let path = root.join("wt").join(b);
+            let ps = path.to_string_lossy().to_string();
+            crate::worktree::git(&main, &["worktree", "add", "-b", b, &ps, "trunk"]).unwrap();
+            std::fs::write(path.join(format!("{b}.txt")), *b).unwrap();
+            crate::worktree::git(&ps, &["add", "-A"]).unwrap();
+            crate::worktree::git(&ps, &["commit", "-m", b]).unwrap();
+            worktrees.push(path);
+        }
+        (root, "trunk".to_string(), worktrees)
+    }
+
+    fn wt_str(p: &Path) -> String {
+        p.to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn the_batched_pass_forks_two_git_children_per_agent_plus_one_prepass() {
+        // THE assertion this change exists for. The facts are identical either way — only the
+        // number of `git` children differs, and on the reference machine (108 worktrees over one
+        // `.git` with 552 branches) each one costs ~48 ms of pure fork-and-attach. So the spawn
+        // count IS the change; anything asserted about the returned struct would pass just as
+        // happily against the five-spawn version.
+        let _spawns = git_lock();
+        let (root, base, wts) = fleet_repo("spawn-count", &["b1", "b2", "b3"]);
+        let hooks = root.join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let agents: Vec<(String, PathBuf)> =
+            wts.iter().enumerate().map(|(i, p)| (format!("a{i}"), p.clone())).collect();
+
+        // The per-agent path, with no table to hit: `status` + `rev-list` + `log` + `diff`. Before
+        // the `--porcelain=v2 --branch` merge this was FIVE — a separate `rev-parse --abbrev-ref
+        // HEAD` supplied the branch name.
+        reset_git_spawns();
+        for p in &wts {
+            git_facts(&wt_str(p), &base);
+        }
+        assert_eq!(
+            git_spawns(),
+            4 * wts.len(),
+            "unbatched, every agent still pays its own rev-list and log"
+        );
+
+        // The batched pass: `status` + `diff` per agent, and ONE `for-each-ref` for the whole fleet.
+        reset_git_spawns();
+        let digest = build_digest(&agents, &hooks, &base, 1_000_000, 10_000);
+        assert_eq!(
+            git_spawns(),
+            2 * wts.len() + 1,
+            "batched, the fleet pays 2N + 1 — not 4N and not the original 5N"
+        );
+
+        // A spawn count is only worth having if the answers survived it.
+        for row in &digest.agents {
+            assert_eq!(row.git.ahead, Some(1), "each branch is one commit past trunk");
+            assert!(row.git.last_commit_ms.is_some(), "and each has a tip commit time");
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_batched_ref_table_returns_the_same_facts_as_the_per_agent_reads() {
+        // The equivalence that makes the spawn saving safe. `%(ahead-behind:<base>)` must equal
+        // `rev-list --count <base>..HEAD` and `%(committerdate:unix)` must equal `log -1 %ct`, for
+        // every field of `GitFacts`, on a fleet that is not uniform: one clean, one dirty, one
+        // further ahead.
+        let _spawns = git_lock();
+        let (root, base, wts) = fleet_repo("equivalence", &["b1", "b2", "b3"]);
+        // b2 is dirty; b3 is two commits past the base rather than one.
+        std::fs::write(wts[1].join("scratch.txt"), "uncommitted").unwrap();
+        std::fs::write(wts[2].join("second.txt"), "more").unwrap();
+        crate::worktree::git(&wt_str(&wts[2]), &["add", "-A"]).unwrap();
+        crate::worktree::git(&wt_str(&wts[2]), &["commit", "-m", "second"]).unwrap();
+
+        reset_git_spawns();
+        let solo: Vec<GitFacts> = wts.iter().map(|p| git_facts(&wt_str(p), &base)).collect();
+        let solo_spawns = git_spawns();
+
+        let table = RefTable::new(wts.clone(), &base);
+        reset_git_spawns();
+        let batched: Vec<GitFacts> =
+            wts.iter().map(|p| git_facts_with(&wt_str(p), &base, &table)).collect();
+        let batched_spawns = git_spawns();
+
+        assert_eq!(batched, solo, "the batched facts must be identical, field for field");
+
+        // WITHOUT THIS the test is vacuous: if every lookup missed, the two sides would be the same
+        // code path compared with itself and would agree no matter what the prepass parsed.
+        assert!(batched_spawns < solo_spawns, "the fast path must actually have been taken");
+        for p in &wts {
+            let branch = head_branch(p).expect("each fixture worktree is on a named branch");
+            assert!(table.tip(&wt_str(p), &branch).is_some(), "every fixture worktree has a row");
+        }
+
+        // And the facts being compared are not all-defaults, which would also agree trivially.
+        assert_eq!(solo[0].ahead, Some(1));
+        assert_eq!(solo[1].dirty_files, Some(1), "b2's uncommitted file is seen");
+        assert_eq!(solo[2].ahead, Some(2), "b3 is two commits past trunk");
+        assert!(solo.iter().all(|f| f.last_commit_ms.is_some()));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_detached_head_falls_back_and_still_reports_ahead_and_commit_time() {
+        // One of the 101 real worktrees measured was detached, and 58 more had no row. A fast path
+        // that only worked for the 42 that did would be fine; one that reported the other 59 as
+        // `ahead: 0` would be a correctness regression.
+        let _spawns = git_lock();
+        let (root, base, wts) = fleet_repo("detached", &["b1"]);
+        let s = wt_str(&wts[0]);
+        crate::worktree::git(&s, &["checkout", "--detach"]).unwrap();
+
+        let table = RefTable::new(wts.clone(), &base);
+        let got = git_facts_with(&s, &base, &table);
+
+        assert!(table.tip(&s, "b1").is_none(), "a detached HEAD names no branch, so it has no row");
+        assert_eq!(got.branch, None, "and reports no branch, exactly as `rev-parse` used to");
+        assert_eq!(got.ahead, Some(1), "the count still comes back — via the per-agent rev-list");
+        assert!(got.last_commit_ms.is_some(), "and so does the tip time");
+        assert_eq!(got, git_facts(&s, &base), "the fallback is the old answer, unchanged");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_worktree_absent_from_the_table_is_read_the_old_way_not_reported_as_zero() {
+        // The concierge tool passes a SUBSET of the fleet, so a table can legitimately have no row
+        // for a worktree someone then asks about.
+        let _spawns = git_lock();
+        let (root, base, wts) = fleet_repo("absent-row", &["b1", "b2"]);
+        let table = RefTable::new(vec![wts[0].clone()], &base);
+        let missing = wt_str(&wts[1]);
+
+        assert!(table.tip(&missing, "b2").is_none(), "the omitted worktree has no row");
+        let got = git_facts_with(&missing, &base, &table);
+        assert_eq!(got.ahead, Some(1), "the real count, NOT Some(0) standing in for a missing row");
+        assert!(got.last_commit_ms.is_some());
+        assert_eq!(got, git_facts(&missing, &base));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_total_prepass_failure_leaves_ahead_unknown_rather_than_zero() {
+        // `%(ahead-behind:X)` on an unresolvable X fails the WHOLE `for-each-ref` (exit 128), so
+        // every branch in the chunk loses its row at once. The answer must degrade to "we could not
+        // tell", which for this base is `None` — the one substitution this module never makes.
+        //
+        // The base has to EXIST as a shared ref to get this far (`base_names_a_shared_ref` would
+        // otherwise refuse it before any spawn, which is a different path — see
+        // `only_a_base_naming_a_shared_ref_is_batched`). So the fixture writes a DANGLING
+        // `refs/remotes/origin/main`: a real ref file pointing at an object that is not there.
+        let _spawns = git_lock();
+        let (root, _base, wts) = fleet_repo("prepass-fail", &["b1"]);
+        let s = wt_str(&wts[0]);
+        let common = crate::worktree::git_dirs(&wts[0]).1;
+        let origin = common.join("refs").join("remotes").join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::write(origin.join("main"), format!("{}\n", "0".repeat(40))).unwrap();
+        assert!(
+            base_names_a_shared_ref(&common, "origin/main"),
+            "premise: the base passes the shared-ref check, so the prepass really does RUN"
+        );
+        let table = RefTable::new(wts.clone(), "origin/main");
+
+        assert!(table.tip(&s, "b1").is_none(), "an unresolvable base yields no rows at all");
+        let got = git_facts_with(&s, "origin/main", &table);
+        assert_eq!(got.ahead, None, "unknown stays None — never Some(0)");
+        assert_eq!(got.changed_files, None, "and the diff against a missing base is unreadable");
+        // The facts that do NOT depend on the base still answer, which is the per-command-option
+        // contract `git_facts` has always had.
+        assert_eq!(got.branch.as_deref(), Some("b1"));
+        assert_eq!(got.dirty_files, Some(0));
+        assert!(got.last_commit_ms.is_some());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_row_is_refused_for_a_branch_it_was_not_read_for() {
+        // Pins the BRANCH-NAME conjunct of `RefTable::tip`, on its own. The prepass reads `HEAD`
+        // off disk; the per-agent pass reads the branch out of `git status` a moment later. Nothing
+        // makes those atomic, so the row is checked against the branch the agent is actually on
+        // rather than trusted.
+        //
+        // WHY IT ASKS `tip` DIRECTLY rather than checking out another branch: the end-to-end
+        // version of this test is VACUOUS for the branch check. A checkout also rewrites `HEAD`, so
+        // the sibling mtime conjunct catches it too — verified by hand-mutation, the checkout test
+        // stayed green with the branch comparison deleted. Naming a different branch for an
+        // otherwise UNTOUCHED worktree is the one shape only the branch comparison can refuse.
+        let _spawns = git_lock();
+        let (root, base, wts) = fleet_repo("row-branch-guard", &["b1"]);
+        let s = wt_str(&wts[0]);
+        let table = RefTable::new(wts.clone(), &base);
+
+        assert_eq!(table.tip(&s, "b1").map(|r| r.ahead), Some(1), "the table really did read b1");
+        assert!(
+            table.tip(&s, "b1-something-else").is_none(),
+            "the row describes b1 and must not answer for another branch"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_branch_switch_after_the_prepass_is_not_served_the_previous_branch_tip() {
+        // The end-to-end companion to the two `tip` guards: whichever of them fires, an agent that
+        // moved to another branch gets that branch's answer and not the stale one.
+        let _spawns = git_lock();
+        let (root, base, wts) = fleet_repo("stale-row", &["b1"]);
+        let s = wt_str(&wts[0]);
+        let table = RefTable::new(wts.clone(), &base);
+        assert_eq!(table.tip(&s, "b1").map(|r| r.ahead), Some(1), "the table really did read b1");
+
+        // …and now the worktree moves to a branch sitting ON the base, where the stale row's
+        // answer (1) and the true answer (0) differ.
+        tick();
+        crate::worktree::git(&s, &["checkout", "-b", "b1-moved", "trunk"]).unwrap();
+        let got = git_facts_with(&s, &base, &table);
+
+        assert_eq!(got.branch.as_deref(), Some("b1-moved"));
+        assert_eq!(got.ahead, Some(0), "the stale b1 row would have said 1");
+        assert_eq!(got, git_facts(&s, &base));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_commit_landing_after_the_prepass_is_not_served_the_previous_tip() {
+        // The sibling of the branch-switch guard, and the one that would PIN staleness rather than
+        // merely show it. The prepass reads the tip at T; `agent_facts_with` fingerprints the
+        // worktree at some later T'. An agent that commits in between would have its pre-commit
+        // `ahead`/`last_commit_ms` stored in the memo UNDER A POST-COMMIT FINGERPRINT — so the
+        // stale pair would be served until something else about the worktree changed, which for an
+        // agent whose last act was that commit could be a very long time.
+        //
+        // Observed for real: two separate live agents committed inside the measurement window and
+        // came back one commit short. Both were harness artefacts (a table minutes old), but the
+        // same window exists, smaller, in production.
+        let _spawns = git_lock();
+        let (root, base, wts) = fleet_repo("post-prepass-commit", &["b1"]);
+        let s = wt_str(&wts[0]);
+        let table = RefTable::new(wts.clone(), &base);
+        let before = table.tip(&s, "b1").cloned().expect("the prepass read b1");
+        assert_eq!(before.ahead, 1);
+
+        // mtimes compare at millisecond resolution; a commit in the same millisecond as the stat is
+        // not observable, so step past that boundary the way the memo tests do.
+        tick();
+        std::fs::write(wts[0].join("more.txt"), "more").unwrap();
+        crate::worktree::git(&s, &["add", "-A"]).unwrap();
+        crate::worktree::git(&s, &["commit", "-m", "landed after the prepass"]).unwrap();
+
+        assert!(table.tip(&s, "b1").is_none(), "the row's ref moved, so the row is refused");
+        let got = git_facts_with(&s, &base, &table);
+        assert_eq!(got.ahead, Some(2), "the stale row would have said 1");
+        assert_eq!(got, git_facts(&s, &base), "and the fallback is the plain per-agent answer");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn two_projects_with_the_same_branch_name_do_not_answer_for_each_other() {
+        // `fleet_digest` takes a per-agent `project_id`, so one pass can span repositories — and
+        // `trunk`/`shared` in one is not `trunk`/`shared` in another. A table keyed on the branch
+        // NAME would let the second repo's tip answer for the first.
+        let _spawns = git_lock();
+        let (root_a, base, wts_a) = fleet_repo("group-a", &["shared"]);
+        let (root_b, _base_b, wts_b) = fleet_repo("group-b", &["shared"]);
+        // Give repo B's `shared` a second commit, so the two same-named branches disagree.
+        std::fs::write(wts_b[0].join("extra.txt"), "extra").unwrap();
+        crate::worktree::git(&wt_str(&wts_b[0]), &["add", "-A"]).unwrap();
+        crate::worktree::git(&wt_str(&wts_b[0]), &["commit", "-m", "extra"]).unwrap();
+
+        let table = RefTable::new(vec![wts_a[0].clone(), wts_b[0].clone()], &base);
+        assert_eq!(table.tip(&wt_str(&wts_a[0]), "shared").map(|r| r.ahead), Some(1));
+        assert_eq!(table.tip(&wt_str(&wts_b[0]), "shared").map(|r| r.ahead), Some(2));
+        std::fs::remove_dir_all(&root_a).ok();
+        std::fs::remove_dir_all(&root_b).ok();
+    }
+
+    #[test]
+    fn only_a_base_naming_a_shared_ref_is_batched() {
+        // The prepass resolves `base` ONCE, from one member's directory, and applies the answer to
+        // the whole group — so a per-worktree base is silently wrong for everyone else, with no
+        // fallback, because the command succeeds. Excluding `HEAD` and `@` by name is a guard
+        // enumerated by VALUE; every case below sails past `validate_ref` and past that denylist.
+        let _spawns = git_lock();
+        let (root, base, wts) = fleet_repo("shared-ref-base", &["b1"]);
+        let common = crate::worktree::git_dirs(&wts[0]).1;
+
+        for accepted in [base.as_str(), "b1", "refs/heads/trunk"] {
+            assert!(
+                base_names_a_shared_ref(&common, accepted),
+                "{accepted:?} names a ref in the shared store"
+            );
+        }
+        // A full object name is the same commit in every worktree by construction.
+        let sha = crate::worktree::git(&wt_str(&wts[0]), &["rev-parse", "HEAD"]).unwrap();
+        assert!(base_names_a_shared_ref(&common, &sha), "a resolved sha is repo-wide");
+
+        for refused in [
+            "HEAD",             // the case the old denylist covered
+            "@",                //  …and its alias
+            "ORIG_HEAD",        // pseudo-refs: per-worktree, and shaped exactly like a branch name
+            "FETCH_HEAD",
+            "MERGE_HEAD",
+            "REBASE_HEAD",
+            "@{u}",             // reflog / upstream selectors, resolved against the current HEAD
+            "@{-1}",
+            "refs/bisect/bad",  // git's per-worktree ref namespaces
+            "refs/worktree/x",
+            "refs/rewritten/y",
+            "origin/main",      // never fetched into this fixture — nothing shared to read
+            "no-such-branch",
+        ] {
+            assert!(
+                crate::worktree::validate_ref(refused).is_ok() || refused.contains("@{"),
+                "premise: {refused:?} is the kind of base that reaches this guard"
+            );
+            assert!(
+                !base_names_a_shared_ref(&common, refused),
+                "{refused:?} does not name a shared ref and must not be batched"
+            );
+        }
+
+        // …and the refusal happens before any subprocess, not after one.
+        let table = RefTable::new(wts.clone(), "ORIG_HEAD");
+        reset_git_spawns();
+        assert!(table.tip(&wt_str(&wts[0]), "b1").is_none(), "no row for a per-worktree base");
+        assert_eq!(git_spawns(), 0, "and no `for-each-ref` is spawned to discover that");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_row_records_the_ref_mtime_from_BEFORE_the_tip_read() {
+        // The ORDER of the two reads inside `ref_rows` is the whole guard, and it is invisible to
+        // every other test here: a mtime sampled AFTER the `for-each-ref` absorbs anything that
+        // moved during it, so the row pairs a pre-commit `ahead` with a post-commit mtime, the
+        // lookup re-stats, sees a match, and accepts the stale pair. Same bug, smaller window —
+        // and not a sub-millisecond one, since past `REF_CHUNK_MAX_PATTERNS` branches the read is
+        // several spawns and a first-chunk tip would be stat'd only after the last one returned.
+        //
+        // The two orderings are told apart by advancing the ref THROUGHOUT the call: a correct
+        // implementation records a mtime from the start of the window, a sample-last one from the
+        // end, and the window spans a whole `git` spawn. The toucher renames a temp file over the
+        // ref rather than writing in place, so git can never observe a torn read — the bytes are
+        // identical every time and only the mtime moves.
+        let _spawns = git_lock();
+        let (root, base, wts) = fleet_repo("sample-order", &["b1"]);
+        let ref_file =
+            crate::worktree::git_dirs(&wts[0]).1.join("refs").join("heads").join("b1");
+        let sha = std::fs::read_to_string(&ref_file).expect("the branch has a loose ref file");
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let toucher = {
+            let (stop, ref_file, sha) = (stop.clone(), ref_file.clone(), sha.clone());
+            std::thread::spawn(move || {
+                let tmp = ref_file.with_extension("mtime-touch");
+                while !stop.load(Ordering::SeqCst) {
+                    if std::fs::write(&tmp, &sha).is_ok() {
+                        let _ = std::fs::rename(&tmp, &ref_file);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let started = head_ref_ms(&wts[0]).expect("the ref is stat-able before the read");
+        let rows = ref_rows(&wts, &base);
+        stop.store(true, Ordering::SeqCst);
+        toucher.join().unwrap();
+        let ended = head_ref_ms(&wts[0]).expect("and after it");
+
+        let recorded = rows
+            .get(&wt_str(&wts[0]))
+            .expect("the prepass produced a row")
+            .head_ref_ms
+            .expect("and recorded a mtime for it");
+        let window = ended - started;
+        // Prove the premise before leaning on it: at `window == 0` both orderings satisfy the
+        // assertion below and the test would be passing on nothing. The floor only has to exceed
+        // mtime resolution, not the read's duration — the comparison discriminates at any window
+        // wide enough to measure, so a fast machine narrows the margin rather than inverting it.
+        // (Measured here: ~14 ms, sample-last landing at the very end of it.)
+        assert!(window >= 4, "the ref must have advanced across the read (window {window} ms)");
+        assert!(
+            recorded - started <= window / 2,
+            "the row must record the mtime from BEFORE the tip read, but it landed +{} ms into a \
+             {window} ms window — that is the sample-last ordering",
+            recorded - started
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_base_ref_that_has_been_PACKED_is_still_recognised() {
+        // Not a hypothetical: of the 11 repositories on the reference machine, one keeps its
+        // `origin/main` in `packed-refs` rather than as a loose file. Checking only for the loose
+        // file would silently drop that whole project out of the fast path — and since the loose
+        // check runs first, nothing else in the suite would notice.
+        let _spawns = git_lock();
+        let (root, _base, wts) = fleet_repo("packed-base", &["b1"]);
+        let common = crate::worktree::git_dirs(&wts[0]).1;
+        crate::worktree::git(&wt_str(&wts[0]), &["pack-refs", "--all"]).unwrap();
+
+        assert!(
+            !common.join("refs").join("heads").join("trunk").exists(),
+            "premise: packing really did remove the loose ref file"
+        );
+        assert!(base_names_a_shared_ref(&common, "trunk"), "a packed base is still a shared ref");
+        assert!(
+            !base_names_a_shared_ref(&common, "no-such-branch"),
+            "and packing does not make every name resolve"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn one_project_without_the_base_does_not_stop_its_neighbour_batching() {
+        // `base_names_a_shared_ref` is asked PER REPOSITORY. A project that never fetched the base
+        // must take the per-agent path while the project beside it still batches — a single
+        // fleet-wide yes/no would sacrifice one to the other.
+        let _spawns = git_lock();
+        let (root_a, _b, wts_a) = fleet_repo("per-repo-yes", &["b1"]);
+        let (root_b, _b2, wts_b) = fleet_repo("per-repo-no", &["b1"]);
+        // Repo A gets a `refs/remotes/origin/main`; repo B does not.
+        let common_a = crate::worktree::git_dirs(&wts_a[0]).1;
+        let origin = common_a.join("refs").join("remotes").join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        let trunk_sha = crate::worktree::git(&wt_str(&wts_a[0]), &["rev-parse", "trunk"]).unwrap();
+        std::fs::write(origin.join("main"), format!("{trunk_sha}\n")).unwrap();
+
+        let table = RefTable::new(vec![wts_a[0].clone(), wts_b[0].clone()], "origin/main");
+        assert_eq!(
+            table.tip(&wt_str(&wts_a[0]), "b1").map(|r| r.ahead),
+            Some(1),
+            "the project that HAS the base is batched"
+        );
+        assert!(
+            table.tip(&wt_str(&wts_b[0]), "b1").is_none(),
+            "the project that does not have it falls back, on its own"
+        );
+        std::fs::remove_dir_all(&root_a).ok();
+        std::fs::remove_dir_all(&root_b).ok();
+    }
+
+    #[test]
+    fn a_base_shaped_like_a_git_option_never_reaches_the_prepass() {
+        // Same guarantee `fleet_digest` already gives the per-agent reads, extended to the new
+        // command: `base` is interpolated into `--format=…%(ahead-behind:<base>)`, and a branch
+        // name is passed as a positional PATTERN. `validate_ref` rejects both hazards.
+        let _spawns = git_lock();
+        let (root, _base, wts) = fleet_repo("prepass-option", &["b1"]);
+        for hostile in ["--output=/tmp/pwned", "-x", "refs/*", "a..b"] {
+            let table = RefTable::new(wts.clone(), hostile);
+            reset_git_spawns();
+            assert!(table.tip(&wt_str(&wts[0]), "b1").is_none(), "refused base {hostile:?}");
+            assert_eq!(git_spawns(), 0, "and refused it BEFORE spawning git for {hostile:?}");
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn an_unborn_branch_reports_its_name_instead_of_nothing() {
+        // THE one field whose answer this change alters, pinned so it is a decision rather than a
+        // drift. A worktree created but not yet committed into: `rev-parse --abbrev-ref HEAD` exits
+        // 128, so the old reader said `branch: None` — the same answer it gives for a DETACHED head
+        // and for a directory git cannot read at all. `--porcelain=v2 --branch` distinguishes them.
+        // Observed on 1 of 117 real agent worktrees; it was the only mismatch in the whole fleet.
+        let _spawns = git_lock();
+        let (dir, wt) = git_repo("unborn-branch");
+        crate::worktree::git(&wt, &["symbolic-ref", "HEAD", "refs/heads/unborn"]).unwrap();
+        assert!(
+            crate::worktree::git(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]).is_err(),
+            "premise: the command the old reader used really does fail on an unborn branch"
+        );
+
+        let facts = git_facts(&wt, "origin/main");
+        assert_eq!(facts.branch.as_deref(), Some("unborn"), "git status knows the branch name");
+        // …and the facts that genuinely need a commit stay unknown. Learning the branch must not
+        // drag `ahead` down to the `Some(0)` this module never substitutes for "we cannot tell".
+        assert_eq!(facts.ahead, None);
+        assert_eq!(facts.last_commit_ms, None);
+        assert_eq!(facts.dirty_files, Some(0), "an empty tree is clean, and that IS knowable");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ref_chunks_bound_the_argv_by_count_and_by_bytes() {
+        // A fleet is unbounded from this module's point of view; `E2BIG` would drop the table (and
+        // the optimisation) for everyone, silently.
+        let many: Vec<String> = (0..REF_CHUNK_MAX_PATTERNS * 2 + 3).map(|i| format!("b{i}")).collect();
+        let names: Vec<&str> = many.iter().map(String::as_str).collect();
+        let chunks = ref_chunks(&names);
+        assert_eq!(chunks.len(), 3, "two full chunks and a remainder");
+        assert!(chunks.iter().all(|c| c.len() <= REF_CHUNK_MAX_PATTERNS));
+        assert_eq!(chunks.iter().map(Vec::len).sum::<usize>(), names.len(), "nothing is dropped");
+        assert_eq!(chunks.concat(), names, "and nothing is reordered");
+
+        // The byte ceiling binds independently of the count: a handful of very long names.
+        let long: Vec<String> = (0..4).map(|i| format!("{}{i}", "x".repeat(REF_CHUNK_MAX_BYTES / 2))).collect();
+        let long_refs: Vec<&str> = long.iter().map(String::as_str).collect();
+        let by_bytes = ref_chunks(&long_refs);
+        assert!(by_bytes.len() > 1, "four half-budget names cannot share one argv");
+        assert!(by_bytes.iter().all(|c| !c.is_empty()), "a chunk is never empty");
+        assert_eq!(by_bytes.concat(), long_refs);
+
+        assert!(ref_chunks(&[]).is_empty(), "no branches means no spawn at all");
     }
 
     // ---- read_page: the Level 1 paging contract ---------------------------------------------
@@ -2513,12 +3502,13 @@ mod tests {
     }
 
     /// A git reader that records how many times it ran instead of spawning anything.
-    fn counting_git(
-    ) -> (std::sync::Arc<std::sync::atomic::AtomicUsize>, impl Fn(&str, &str) -> GitFacts + Sync)
-    {
+    fn counting_git() -> (
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        impl Fn(&str, &str, &RefTable) -> GitFacts + Sync,
+    ) {
         let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let seen = n.clone();
-        (n, move |_wt: &str, _base: &str| {
+        (n, move |_wt: &str, _base: &str, _refs: &RefTable| {
             seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             GitFacts { ahead: Some(7), ..GitFacts::default() }
         })
@@ -2527,9 +3517,18 @@ mod tests {
     fn memo_pass(
         wt: &Path,
         base: &str,
-        git_fn: &(dyn Fn(&str, &str) -> GitFacts + Sync),
+        git_fn: &(dyn Fn(&str, &str, &RefTable) -> GitFacts + Sync),
     ) -> FleetAgentFacts {
-        agent_facts_with("a1", wt, &wt.join("absent.jsonl"), base, 1_000_000, 10_000, git_fn)
+        agent_facts_with(
+            "a1",
+            wt,
+            &wt.join("absent.jsonl"),
+            base,
+            1_000_000,
+            10_000,
+            git_fn,
+            &RefTable::empty(),
+        )
     }
 
     /// mtimes are compared at millisecond resolution, so a mutation in the same millisecond as the
@@ -2945,7 +3944,7 @@ mod tests {
                 (format!("agent-{i}"), wt)
             })
             .collect();
-        let boom = |_wt: &str, _base: &str| -> GitFacts { panic!("git blew up") };
+        let boom = |_wt: &str, _base: &str, _refs: &RefTable| -> GitFacts { panic!("git blew up") };
 
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             build_digest_with(&agents, &dir, "origin/main", 1_000_000, 10_000, &boom)

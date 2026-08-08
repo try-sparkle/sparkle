@@ -42,6 +42,11 @@ import {
 import { publishedStatusFor } from "../useAttentionNotifications";
 import type { BranchStatus } from "./branchStatus";
 import type { Roster } from "./rosterTypes";
+// Used only by the column-one population selectors at the foot of this file.
+import { accountedNeedsYou } from "./conciergeProactive";
+import { isSparkleAgentId } from "./sparkleAgent";
+import { findKnownAgent } from "./knownAgents";
+import type { AwaySnapshot } from "./conciergeRecap";
 import type { AgentKind, LastObserved, Project } from "../types";
 
 export interface ConciergeAgent {
@@ -391,7 +396,7 @@ export function isAccounted(
 }
 
 /** Every agent in the feed, in rendered order, across all projects. */
-function allAgents(feed: ConciergeFeed): ConciergeAgent[] {
+export function allAgents(feed: ConciergeFeed): ConciergeAgent[] {
   return feed.projects.flatMap((p) => p.agents);
 }
 
@@ -714,4 +719,153 @@ export function buildConciergeFeed(input: ConciergeFeedInput): ConciergeFeed {
   });
 
   return { projects: outProjects, counts, scopedCounts, pinnedProjectId };
+}
+
+// ══ COLUMN-ONE POPULATION SELECTORS ═════════════════════════════════════════════════════════════
+// Moved verbatim out of components/ConciergeHost, which is where they had accumulated. They belong
+// here: this module already owns `isAccounted`, `accountedOwed` and `accountedUnmerged`, and these
+// are the same family — "which agents does column one account for, and which of them get a row".
+// Having them in a React component meant a second agent could not touch the surfacing rule without
+// editing the app's highest-churn file.
+//
+// ONE OF THE NINE DID NOT COME ACROSS: the host carried its own `allAgents`, byte-identical to the
+// one this module already had (`feed.projects.flatMap((p) => p.agents)`), which was private until
+// now. The duplicate is dropped and the existing one exported — same function, one definition.
+
+/** Does THIS window hold a promptable target with this id? Feed membership, OR the app-owned Sparkle
+ *  agent, which is never a feed member (services/knownAgents) but IS a live local PTY whenever its
+ *  pane is mounted — so feed membership ALONE reads the Improve-Sparkle mount as "gone" and strands
+ *  every send at the brain (bead sparkle-0rf5). For any non-sparkle id this is exactly the old
+ *  `allAgents(feed).some(...)` test, so no other target's resolution changes. */
+export function isPromptableTarget(feed: ConciergeFeed, id: string | undefined): boolean {
+  if (!id) return false;
+  if (allAgents(feed).some((a) => a.id === id)) return true;
+  return isSparkleAgentId(id) && findKnownAgent(id)?.source === "sparkle";
+}
+
+/**
+ * The fleet's statuses AS THE CARDS SEE THEM, for the Away recap's two edges.
+ *
+ * Read from the FEED, never from `runtimeStore.status`, and that is the whole point (roborev
+ * 53631-H2). The feed's per-agent status is the DERIVED/published one — the cross-window merged
+ * roster plus the unstarted-worker, red-worker, unmerged and dismissed-alert overlays
+ * (services/conciergeFeed → publishedStatusFor) — and it is what every `statusLabel` and every
+ * nudge card in this thread already speaks. Diffing the raw store against feed-supplied labels made
+ * them two vocabularies, with two visible failures:
+ *
+ *   • `runtimeStore.status` only holds agents THIS window hosts (useConciergeFeed), so a
+ *     roster-fed agent was absent from BOTH sides of the diff and `newlyEntered` skipped it — the
+ *     recap said nothing about an agent in another window that went `waiting` while the same
+ *     thread rendered a nudge card for it. On a concierge column pinned to a project this window
+ *     does not host, the recap could never fire at all.
+ *   • A red the user had DISMISSED reads de-escalated (`idle`/`stopped`) in the feed but still
+ *     `waiting` in the raw store, so the recap filed it under "Wants you" while printing the feed's
+ *     "Done — your turn" beside it — resurfacing an alarm the user had explicitly silenced.
+ *
+ * Building both sides here makes status, label and card one vocabulary by construction, and picks
+ * up cross-window agents for free.
+ */
+export function feedStatuses(feed: ConciergeFeed): Omit<AwaySnapshot, "at"> {
+  const agents = allAgents(feed);
+  return {
+    status: Object.fromEntries(agents.map((a): [string, AgentTabStatus] => [a.id, a.status])),
+    agentIds: agents.map((a) => a.id),
+    // Carried so the recap can tell a head that was genuinely working at the away edge from one
+    // standing in for its subtree — see AwaySnapshot.rolledUpGreen.
+    rolledUpGreen: agents.filter((a) => a.rolledUpGreen).map((a) => a.id),
+  };
+}
+
+/** EVERYTHING column one accounts for right now: in scope, un-muted, needing you, and not already
+ *  spoken for by an ancestor's row.
+ *
+ *  `band === "needs_you"` is the interruption gate. It covers exactly what the old `priority < 2`
+ *  did — waiting, approval, blocked, errored — and, critically, still excludes `unmerged`, which
+ *  bands `done`. On the reported fleet 27 of 51 agents were committed-but-unlanded; surfacing them
+ *  here is 27 nudge cards (see services/conciergeFeed.conciergeBand).
+ *
+ *  These are THE SAME THREE GATES `conciergeFeed` counts `scopedCounts` on, and that is the point:
+ *  the vitals line states `scopedCounts.needs_you` while the thread renders this list, so they are
+ *  one population by construction rather than two computations that have to be kept in step. They
+ *  did drift — `scopedCounts` counted a red worker AND the orchestrator that inherited its red, so
+ *  the line said "2 Need you" over a thread holding one card.
+ *
+ *  Note the remaining asymmetry is the SAFE direction. `muted` can make this set smaller than the
+ *  rows the filter leaves standing, so the sentence can under-state. That is fine — every row it
+ *  promised is there, plus one you asked not to be interrupted about. Over-stating is the bug,
+ *  because the missing rows do not exist to be shown.
+ *
+ *  ONE IMPLEMENTATION, in services/conciergeProactive — this delegates rather than restating the
+ *  filter (roborev 54166-M5). The proactive push channel builds its prompt from the same population
+ *  and the two copies were verbatim duplicates, which is exactly the drift the paragraph above is
+ *  about: the brain would announce, unprompted, a count this column does not show. It lives there
+ *  and not here because that module is pure and React-free, so the rule is testable as data. */
+export function accountedAgents(feed: ConciergeFeed): ConciergeAgent[] {
+  return accountedNeedsYou(feed);
+}
+
+/** The half of {@link accountedAgents} that is OWED A ROW in column two — the digest's pool.
+ *
+ *  `topLevel` is what makes the digest's number honest. Every LINE this feeds is clickable, and the
+ *  click isolates that band in the Build column — which narrows top-level rows and nothing else.
+ *  Folding a worker into a line's count would state a number the click cannot produce: two blocked
+ *  workers rendered "2 Need you in web", and clicking it left an empty column plus an empty-state
+ *  chip. */
+export function surfacedAgents(feed: ConciergeFeed): ConciergeAgent[] {
+  return accountedAgents(feed).filter((a) => a.topLevel);
+}
+
+/** The other half: accounted-for agents with NO row of their own, which therefore have to speak for
+ *  themselves.
+ *
+ *  They are digested by the SAME rule as everything else — one keeps its card, two or more become a
+ *  line — but as the `rowless` variant, because a normal line's count is a promise about rows and
+ *  these have none. This population is NOT bounded by one: gap 3 below fires once per blocked
+ *  worker, so several under an absent or in-motion parent used to be several cards, which is the
+ *  card wall the digest exists to prevent, reintroduced through the one path that skipped it.
+ *
+ *  What survives from the card era is the AFFORDANCE, not the shape: a single one still gets a card
+ *  whose "Show me" reveals it (`openProjectTab` selects it, and the sidebar pops a red worker out
+ *  under its orchestrator), and the collapsed line's click does that same reveal for its lead.
+ *
+ *  Non-empty only when a rowless agent's red reached nobody — a worker with no `parentId`, one whose
+ *  orchestrator is not in the fleet, or a `blocked` one whose bubble `withRedWorkerAttention`
+ *  suppressed while its orchestrator was in motion. Before this existed, the `topLevel` gate turned
+ *  all three into silence: no row, no card, no line, no count. See
+ *  `ConciergeAgent.representedElsewhere` for why the test is band equality and not kind. */
+export function unrepresentedAgents(feed: ConciergeFeed): ConciergeAgent[] {
+  return accountedAgents(feed).filter((a) => !a.topLevel);
+}
+
+/** The part of {@link unrepresentedAgents} a LINE may collapse: those that do get a nested row.
+ *
+ *  A digest line's click reveals exactly one agent, so collapsing is only honest when the click can
+ *  nonetheless put the WHOLE group on screen. That is not a free property of the sidebar — it is
+ *  something the click has to DO. The original version of this comment claimed the former ("reveal
+ *  one and the siblings are on screen beside it") and was wrong twice over: `collapsedOrchestrators`
+ *  reads a missing entry as collapsed, so on a fresh launch the subtree is shut, and a leftover band
+ *  filter can drop the head entirely (roborev 53679, then 53734).
+ *
+ *  So the guarantee is attributed where it actually lives: `revealAgent` and the rowless branch of
+ *  `onDigestClick` call `showAllStatusBands()` + `expandOrchestrators(...)` before opening. What
+ *  makes this population collapsible is having a head at all — one the click can name and open. */
+export function nestedRowlessAgents(feed: ConciergeFeed): ConciergeAgent[] {
+  return unrepresentedAgents(feed).filter((a) => a.parentRowId !== null);
+}
+
+/** The part that may NOT be collapsed: accounted-for agents with no row ANYWHERE.
+ *
+ *  A worker with no `parentId`, or one whose orchestrator is not in this project's fleet, is not
+ *  drawn by column two at all — not as a head, not as a child. Its nudge card's "Show me" is its
+ *  ONLY affordance in the app, so folding several into one line strands all but the lead: the line
+ *  read "2 workers inside web need you" and the click could satisfy one of them, with no way to
+ *  reach the other until the first resolved (roborev 53679).
+ *
+ *  So these stay one card each, on purpose. That is not the card wall coming back — the wall is the
+ *  HIGH-VOLUME case, a blocked worker under a present-but-in-motion orchestrator, which fires once
+ *  per worker and is exactly what {@link nestedRowlessAgents} still collapses. This population is
+ *  the rare ancestor-less remainder, and a card apiece is the cheapest thing that keeps every one of
+ *  them reachable. */
+export function strandedAgents(feed: ConciergeFeed): ConciergeAgent[] {
+  return unrepresentedAgents(feed).filter((a) => a.parentRowId === null);
 }

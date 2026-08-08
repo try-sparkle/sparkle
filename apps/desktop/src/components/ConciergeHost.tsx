@@ -39,7 +39,6 @@ import {
   type ConciergeDigestMessage,
   type ConciergeMessage,
   type ConciergeNudge,
-  type ConciergeNudgeAction,
   type ConciergeReceipt,
   type ConciergeViewModel,
 } from "./Concierge";
@@ -48,22 +47,42 @@ import type { ConciergeMountedAgent, ConciergeReceiptMark } from "./Concierge/ty
 // pure module (no React, no stores) so the inference is unit-testable without mounting this file, and
 // so the stub that draws an anchor reads the same declaration the host writes.
 import { anchorQuote, pendingAnchors, type ReplyAnchor } from "./Concierge/replyAnchors";
-import { quoteFace, quotePrompt, type ComposeQuote } from "./Concierge/composeQuote";
+import { quoteFace, quotePrompt } from "./Concierge/composeQuote";
+import { rememberSentText, SENT_TEXT_LIMIT } from "./Concierge/sentTextLedger";
+// RE-EXPORTED, not just imported: `SENT_TEXT_LIMIT` and `rememberSentText` were exported from this
+// file before they moved, so every existing importer keeps resolving them here.
+export { rememberSentText, SENT_TEXT_LIMIT };
 
-/**
- * One send's quote, carried WITH that send.
- *
- * `restore` is captured at send time because `useConciergeQuote.restore` is bound to `draftKey`;
- * resolving it later would write to whatever conversation is current then. The pair travels as an
- * argument (through `deliver` to `restoreDraft`) rather than living in a ref, because several sends
- * can be outstanding simultaneously — see `restoreDraft`.
- */
-interface SentQuote {
-  quote: ComposeQuote | null;
-  /** Returns whether the quote actually came back — false when a newer one has been staged since
-   *  (see `useConciergeQuote.restore`), which DISCARDS this one. */
-  restore: (quote: ComposeQuote | null) => boolean;
-}
+// The three shapes a send carries — the aim, the out-loud address, the quote to give back — plus the
+// `agentId`→`id` adapter between the first and `conciergeLine.ref`. `ConciergePromptTarget` is
+// RE-EXPORTED below: five suites import the type from this file.
+import {
+  asAgent,
+  type ConciergeMentionAim,
+  type ConciergePromptTarget,
+  type SentQuote,
+} from "./Concierge/hostTypes";
+export type { ConciergePromptTarget };
+// The refusal vocabulary — was this send refused, and what do we tell the founder about it.
+// `TRIAL_SPENT_TEXT` is RE-EXPORTED because ConciergeHost.test.tsx imports it from this file.
+import {
+  refusalCopy,
+  refusedPath,
+  terminalRefusalLine,
+  terminalRefusalText,
+  terminalWriteBlocked,
+  TRIAL_SPENT_TEXT,
+} from "./Concierge/refusalCopy";
+export { TRIAL_SPENT_TEXT };
+// What the thread says about a message it handed on. `relayFollowUp` is RE-EXPORTED because
+// ConciergeHost.mention.test.tsx imports it from this file.
+import { elideQuote, OUTCOME_QUOTE_CHARS, relayFollowUp } from "./Concierge/relayCopy";
+export { relayFollowUp };
+// Two leaf components the host mounts and nothing else does. `prChipScopes` is RE-EXPORTED because
+// ConciergeHost.prChipScope.test.tsx imported it from this file.
+import { LivenessAnnouncer } from "./Concierge/LivenessAnnouncer";
+import { ConciergePrChip, prChipScopes } from "./Concierge/ConciergePrChip";
+export { prChipScopes };
 // The linter's findings, projected to the metadata-only shape a message carries, plus the wording
 // rule the mounted-column notice below reuses so the banner and the inline mark say ONE thing.
 import { lintMarkText, toLintMarks, type MessageLintMark } from "./Concierge/lintMarks";
@@ -74,10 +93,19 @@ import { ConciergeSuggestions } from "./Concierge/ConciergeSuggestions";
 import { NUDGE_DISMISS_ACTION, NUDGE_MUTE_ACTION } from "./Concierge/NudgeCard";
 import { PINNED_CLEAR_ACTION } from "./Concierge/PinnedBlockers";
 import type { ConciergeAgent, ConciergeFeed } from "../useConciergeFeed";
-import { accountedUnmerged } from "../services/conciergeFeed";
-import type { AgentTabStatus } from "../types";
-import { bandCountLabel } from "../engine/statusBandLabels";
-import { rosterLine } from "../engine/conciergeRosterLine";
+// The column-one population selectors now live beside `accountedUnmerged` in the module that already
+// owned that family, rather than in this file where they had accumulated.
+import {
+  accountedUnmerged,
+  allAgents,
+  feedStatuses,
+  isPromptableTarget,
+  nestedRowlessAgents,
+  strandedAgents,
+  surfacedAgents,
+} from "../services/conciergeFeed";
+import { agentToNudge, NUDGE_OPEN_ACTION } from "../engine/conciergeNudges";
+import { buildSnapshot } from "../engine/conciergeSnapshot";
 import { oneLine } from "./promptHistory";
 import { openProjectTab } from "../services/openProjectTab";
 import { revealOutcomeFor, type RevealOutcome } from "../services/agentReveal";
@@ -120,7 +148,6 @@ import {
   noteConciergeProgress,
   noteConciergeSent,
   noteConciergeSettled,
-  useConciergeLiveness,
 } from "../services/conciergeLiveness";
 import {
   buildLintCorrectionPrompt,
@@ -131,14 +158,9 @@ import { DISABLED_POLICY, toLintPolicy } from "../services/conciergeLintPolicy";
 import type { LintPolicy, LintResult, Violation } from "../services/conciergeLint";
 import type { LintAction } from "../stores/conciergeLintMetrics";
 import { getConfig, onConfigChanged, type EffectiveConfig } from "../services/config";
-import {
-  livenessAnnouncement,
-  type ConciergeLiveness,
-} from "../engine/conciergeLiveness";
 import { conciergeFailureNotice } from "../engine/conciergeFailureNotice";
 import { reportClaudeAuthFailed } from "../services/claudeAuthSignal";
 import {
-  accountedNeedsYou,
   createProactiveScheduler,
   markStaleProactive,
   surfacedDigest,
@@ -148,7 +170,6 @@ import {
   agentCanAcceptPrompt,
   dispatchConciergeAnswer,
   onDeferredSendOutcome,
-  type ConciergeDispatchPath,
   type ConciergeDispatchResult,
 } from "../services/conciergeDispatch";
 import type { DispatchAuthority } from "../services/dispatchAuthority";
@@ -164,7 +185,7 @@ import {
 import { ConciergeApprovals } from "./Concierge/ConciergeApprovals";
 import { CountdownBanner } from "./Concierge/CountdownBanner";
 import { flat, line, plain, ref } from "./Concierge/conciergeLine";
-import type { Line, ReferencableAgent } from "./Concierge/conciergeLine";
+import type { Line } from "./Concierge/conciergeLine";
 import { actionReceiptLine, receiptMark } from "./Concierge/actionReceiptLine";
 import {
   noteConciergeTurnForPromises,
@@ -181,16 +202,13 @@ import {
   type ConciergeMention,
 } from "./Concierge/mentions";
 import { classifyComposerRoute } from "./Concierge/composerRoute";
-import type { MountedNoticeModel } from "./Concierge/MountedNotice";
-import { terminalWriteRefusal, type TerminalScreenRefusal } from "../voice/dictationTerminalRoute";
-import { getAgentViewport } from "../services/terminalViewport";
+import { useMountedNotice } from "../hooks/useMountedNotice";
 import { buildDigest } from "../services/conciergeDigest";
 import { isSparkleAgentId, SPARKLE_AGENT_NAME } from "../services/sparkleAgent";
 import {
   agentTranscriptWorktree,
   subscribeAgentTranscriptWorktrees,
 } from "../services/agentTranscriptRegistry";
-import { findKnownAgent } from "../services/knownAgents";
 import { createArrivalOrder, forgetArrival, orderByArrival } from "../engine/conciergeStreamOrder";
 import {
   forgetEpisode,
@@ -203,7 +221,6 @@ import {
 import { useEffectiveWired } from "../hooks/useEffectiveWired";
 import { isAskingIsolated } from "../engine/buildSections";
 import { useUiStore } from "../stores/uiStore";
-import { openProjectsOf } from "../engine/openProjects";
 import { attachedDisplay, attachedPayload } from "../services/conciergeAttach";
 import { useConciergeAttachments } from "../hooks/useConciergeAttachments";
 import { useConciergeQuote, type ConciergeQuoteApi } from "../hooks/useConciergeQuote";
@@ -228,7 +245,6 @@ import { usePendingAttachmentsStore } from "../stores/pendingAttachmentsStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useMountedThread } from "../stores/mountedThreadStore";
 import { useAgentTranscript } from "../hooks/useAgentTranscript";
-import { OpenPrMenu, agentLinkForPr, type PrScope } from "./OpenPrMenu";
 // The SELECTED project id, for the header's "here" segment. A scalar selector, deliberately — it
 // re-renders this host only when the selection actually changes, which is the narrow subscription
 // the note above rules the whole `projects` array out in favour of.
@@ -253,14 +269,12 @@ import {
   type RecapAgentInfo,
 } from "../services/conciergeRecap";
 
+// STAYS HERE, deliberately. Every thread id (`you-N`, `sparkle-N`, `pill-N`, `recap-N`) comes off
+// this counter, and stores/conciergeThreadStore documents a reindex that exists BECAUSE it restarts
+// at 0 on reload. Moving it to a module the host also re-exported would risk two live copies, so it
+// is the one piece of module scope that is not up for extraction.
 let seq = 0;
 const nextId = (p: string) => `${p}-${(seq += 1)}`;
-
-/** How many sent messages keep their original text for a possible redirect. Only the newest bubble
- *  is ever redirectable, so anything older is dead weight — and without a bound a long session with
- *  pasted content grows the map forever. Kept well above 1 so the map still reads as a short
- *  history rather than a single slot. */
-export const SENT_TEXT_LIMIT = 50;
 
 /**
  * Ceiling on a single queued delivery, so a hung one can't wedge the shared chain forever. Well
@@ -277,728 +291,6 @@ export const SENT_TEXT_LIMIT = 50;
  * actually resolve it.
  */
 const QUEUE_TASK_TIMEOUT_MS = 30_000;
-
-/** Remember `text` for `id`, evicting the oldest entries past the cap (Map preserves insertion
- *  order, so the first keys are the oldest). */
-export function rememberSentText(map: Map<string, string>, id: string, text: string): void {
-  map.set(id, text);
-  while (map.size > SENT_TEXT_LIMIT) {
-    const oldest = map.keys().next().value;
-    if (oldest === undefined) break;
-    map.delete(oldest);
-  }
-}
-
-/** What the concierge says when the server has refused the send: the free trial is spent. The
- *  dispatch path gates BEFORE delivery (services/trialMeter.trialSendAllowed), so nothing reached
- *  the agent — say so plainly rather than leaving the user waiting on a reply that isn't coming. */
-export const TRIAL_SPENT_TEXT =
-  "Your free trial is used up, so that didn't send. Upgrade and I'll pass it straight through.";
-
-/** The two voices a non-delivery is reported in: the nudge card's Approve relay, and the compose
- *  box's user-authored prompt. Same facts, different remedy — "hit Retry" vs "then send again". */
-type RefusalVoice = "approval" | "prompt";
-
-/** The paths that mean NOT DELIVERED. `picker-option`/`free-text` are excluded because they DID
- *  land; `queued` because it means HELD — the callers report that themselves, but only when `ok`,
- *  so an `ok:false` queued result DOES reach `refusedPath` and comes back `null` for the generic
- *  line (roborev 53044). Narrowing the parameter this way means handing a delivered path to
- *  `refusalCopy` is a compile error at the call site rather than a misleading generic
- *  "I couldn't send…" — the very dead end it exists to remove (roborev 52972). */
-type RefusedPath = Exclude<ConciergeDispatchPath, "picker-option" | "free-text" | "queued">;
-
-/**
- * The refusal path of a result that did NOT deliver — or `null` when it did.
- *
- * `ok` stays the ONLY test for delivery. An earlier pass got the narrowing by widening the callers'
- * success branch to `r.ok || r.path === "picker-option" || r.path === "free-text"`, which inverted
- * that: an `{ ok: false, path: "free-text" }` would have reported "Sent to X." and, in
- * `promptAgent`, returned true — DISCARDING the user's draft on a failure that used to restore it
- * (roborev 53018). A cosmetic risk is not worth a real one. This predicate gives the same
- * compile-time proof with `ok` still in charge.
- */
-function refusedPath(r: ConciergeDispatchResult): RefusedPath | null {
-  if (r.ok) return null;
-  switch (r.path) {
-    // ok:false on a path that means "delivered" is a contradiction the type system can't yet rule
-    // out (ok and path are independent fields). Treat it as a plain refusal with no bespoke line
-    // rather than as a success — the user keeps their draft either way.
-    case "picker-option":
-    case "free-text":
-      return null;
-    // `queued` means HELD, not delivered — reachable here precisely BECAUSE the callers gate their
-    // held branch on `ok`. An ok:false hold is not a hold, so it takes the generic refusal line.
-    case "queued":
-      return null;
-    default:
-      return r.path;
-  }
-}
-
-/** THE one place a refused dispatch path becomes user-facing copy.
- *
- *  `approve` and `promptAgent` used to carry two near-identical `else if` ladders over the same
- *  paths, and they drifted exactly as you'd expect: the truthful `agent-failed`/`cloud-agent` lines
- *  landed on the prompt side a full commit before the approval side, so approving on a cloud agent
- *  gave the generic "I couldn't send…" dead end for a week. An exhaustive `switch` makes that
- *  impossible — a path added to ConciergeDispatchPath is a TYPE ERROR here (the `never` guard in
- *  `default`) instead of a silent fall-through to the generic line.
- *
- *  Only NON-delivery is handled: the callers report the delivered/held paths themselves, because
- *  what they do there differs (approve returns void; promptAgent returns whether to keep the draft). */
-/** An addressed target — which spells its id `agentId` — as something `ref` can reference.
- *
- *  A shape adapter and nothing more. It exists so the call sites below read as prose rather than as
- *  object literals, and so the `agentId`→`id` rename happens in ONE place: a call site that built
- *  the object inline is a call site that can build it wrong, and `ref` cannot tell a mistyped id
- *  from a real one. */
-function asAgent(t: { agentId: string; name: string }): ReferencableAgent {
-  return { id: t.agentId, name: t.name };
-}
-
-/**
- * MAY THIS COMPOSER SEND BE WRITTEN INTO THAT AGENT'S TERMINAL RIGHT NOW?
- *
- * The guard shipped for dictation (`voice/dictationTerminalRoute.terminalWriteRefusal`), reused
- * verbatim rather than reimplemented — its two prompt lists each grew four entries from real misses
- * found in the field, and a private copy would inherit the misses and not the fixes.
- *
- * ══ WHY THE COMPOSER NEEDS IT AT ALL ════════════════════════════════════════════════════════════
- * `dispatchConciergeAnswer` guards exactly one hazard: a live PICKER, which it refuses via
- * `neverPickerAnswer`. It does not look at the screen otherwise. So a send into an agent sitting in
- * `vim` is pasted AND submitted — and vim normal mode does not insert a sentence, it EXECUTES it (`d`
- * deletes, `2` counts, `p` pastes). A send at `[sudo] password for …:` types a sentence into a field
- * that echoes nothing and presses Enter on it. Both are reachable from this box today.
- *
- * ══ `no-viewport` IS FATAL FOR A MOUNT AND NOT FOR AN ADDRESS ═══════════════════════════════════
- * and the asymmetry is about what the two aims can honestly claim to know.
- *
- * A MOUNT points at the agent the cable is patched to — its pair is on screen, its terminal is
- * mounted, its column is the one the founder is looking at. "I cannot read that screen" there is not
- * a normal state; it is the state where a clean prompt and a `vim` session are indistinguishable, and
- * the thing being routed is the founder's ordinary typing with no address on it. Refuse.
- *
- * An ADDRESS may legitimately name an agent in another project whose pane is not mounted in this
- * window at all, and that send has worked since mentions shipped (it queues on `pendingSends` if the
- * PTY is still coming up). Refusing it would break a shipped feature to protect a screen nobody is
- * looking at, and the user named that destination explicitly. So an address is refused only on what
- * the screen POSITIVELY shows — `alternate-screen`, `awaiting-input` — which is strictly more
- * protection than it had, with nothing taken away.
- */
-function terminalWriteBlocked(
-  agentId: string,
-  via: "address" | "mount",
-  read: (id: string) => ReturnType<typeof getAgentViewport> = getAgentViewport,
-): TerminalScreenRefusal | null {
-  const refusal = terminalWriteRefusal(read(agentId));
-  if (!refusal) return null;
-  if (refusal === "no-viewport" && via === "address") return null;
-  return refusal;
-}
-
-/**
- * The same three refusals as PLAIN TEXT, for the mounted notice row.
- *
- * A SECOND RENDERING, not a second decision — exactly like `payload`/`display`/`text` on a send. The
- * thread's version builds a `Line` so the agent draws as a pill; the notice row is one line of text
- * in a banner, where a pill would be chrome nobody can click through to anything. Both take the same
- * `reason`, so they cannot disagree about WHY; only about how the agent is named.
- *
- * Kept adjacent to {@link terminalRefusalLine} so the pair is obvious and a fourth reason has to be
- * added to both or neither.
- */
-function terminalRefusalText(agentName: string, reason: TerminalScreenRefusal): string {
-  if (reason === "alternate-screen") {
-    return `Not sent — ${agentName} has a full-screen app open, so the keys would have run as commands. Your message is back in the box.`;
-  }
-  if (reason === "awaiting-input") {
-    return `Not sent — ${agentName} is waiting on something on screen. Answer that first; your message is back in the box.`;
-  }
-  return `Not sent — I can't see ${agentName}'s screen, so I'd be guessing what this would land in. Your message is back in the box.`;
-}
-
-/** What the founder is told when a terminal declines the message, per cause.
- *
- *  NAMES THE CAUSE, never a generic "couldn't send". The three causes have three different exits —
- *  leave the full-screen app, answer the prompt on screen, or look at why that pane is not there —
- *  and a message that does not distinguish them leaves the user retyping the same thing into the same
- *  refusal, which is the dead-end this file's copy rules exist against (roborev 54665). The words are
- *  in the composer either way: the caller restores the draft, so nothing is lost while they decide. */
-function terminalRefusalLine(agent: ReferencableAgent, reason: TerminalScreenRefusal): Line {
-  if (reason === "alternate-screen") {
-    return line`${ref(agent)} has a full-screen app open, so I didn't type that into it — the keys would have run as commands rather than landing as text. Your message is back in the box.`;
-  }
-  if (reason === "awaiting-input") {
-    return line`${ref(agent)} is waiting on something on screen, so I didn't type that into it. Open it and answer the prompt first — your message is back in the box.`;
-  }
-  return line`I can't see ${ref(agent)}'s screen right now, so I didn't type that into it — I'd be guessing what it would land in. Your message is back in the box.`;
-}
-
-function refusalCopy(path: RefusedPath | null, agent: ReferencableAgent, voice: RefusalVoice): Line {
-  const approving = voice === "approval";
-  // ONE slot, reused across the ladder — every arm names the same agent, and building the reference
-  // once means no arm can be the one that forgets to.
-  const a = ref(agent);
-  const generic = approving ? line`I couldn't send the approval to ${a}.` : line`I couldn't send that to ${a}.`;
-  if (path === null) return generic; // refused on a delivered-looking path — see refusedPath
-  switch (path) {
-    case "trial-spent":
-      // Names no agent — the trial is the user's, not any one agent's.
-      return flat(TRIAL_SPENT_TEXT);
-    case "agent-failed":
-      return approving
-        ? line`${a} couldn't start, so I couldn't send the approval — open its pane and hit Retry.`
-        : line`${a} couldn't start, so that didn't send — open its pane and hit Retry (or finish installing Claude Code), then send again.`;
-    // NARROWED TO ANSWERS (design 2026-08-01 §Decision 7). Prompting a cloud agent from here IS
-    // wired now — the dispatcher relays it to the sandbox's stdin — so the old prompt line ("isn't
-    // wired up yet — use its own pane for now") became an instruction to work around a working
-    // feature. What still refuses is an ANSWER to a question on the agent's own screen: an approval
-    // gesture, or any send made while a picker is live. Both remedies point at the same place, and
-    // that place is where the question is actually readable.
-    case "cloud-agent":
-      return approving
-        ? line`${a} runs in the cloud — an approval has to be given where the question is, so open its pane and answer it there.`
-        : line`${a} runs in the cloud and it's waiting on something on screen — I can't answer that for it from here. Open its pane and answer it there; your message is back in the box.`;
-    // NOT the same fact as `cloud-agent`, and the difference is what the user should do next: the
-    // agent is fine and the message is sendable, but this Mac has no live relay connection to hand
-    // it over on — so the remedy is to get connected, not to go and type in its pane (which is
-    // streamed over the very connection that is missing, and would be just as empty).
-    case "cloud-offline":
-      return approving
-        ? line`I've lost the connection to the cloud, so the approval for ${a} didn't go anywhere. It'll reconnect on its own — try again in a moment.`
-        : line`I've lost the connection to the cloud, so that didn't reach ${a}. It'll reconnect on its own — your message is back in the box, try again in a moment.`;
-    case "pty-gone":
-      return approving
-        ? line`${a}'s terminal has closed — I couldn't send the approval.`
-        : line`${a}'s terminal has closed — that didn't send. Start it again and I'll pass it along.`;
-    case "ambiguous-picker":
-      return approving
-        ? line`${a} is asking something I can't answer with a plain "approve" — open it to choose.`
-        : line`${a} is waiting on a choice I can't map that to — open it and pick, or answer with just the option.`;
-    // ITS OWN LINE, not a second use of `ambiguous-picker` above (roborev 54665). That copy says
-    // the answer mapped to nothing and offers "answer with just the option", and it is wrong here
-    // WHETHER OR NOT the text matched — which is the point, because this path no longer depends on
-    // the match at all (roborev 55400: the declared disposition is read before the matcher). The
-    // refusal is about what the message IS, not how well it scored:
-    //   • an ADDRESSED send matches perfectly and is still refused, because a message is not a
-    //     keystroke — and "answer with just the option" is exactly what the user already did;
-    //   • an ATTACHMENT-CARRYING redirect matches nothing, because the quoted paths defeat the
-    //     anchored matcher — and the thing in their way is the file, not the wording.
-    // Sharing `ambiguous-picker` sent the first round a loop whose only exit was guessing the `@`
-    // was the problem, and the second one a loop with no exit at all. This line states the real
-    // reason and the real exits.
-    // ONE exit, not two. This line used to offer a second — "drop the @<name> and send just the
-    // option" — and that advice is only safe when the named agent also happens to be the column's
-    // current target. `send` resolves an UNADDRESSED message against `targetRef.current`, so with
-    // the address removed the bare "yes" is aimed at whatever the column is pointed at. The whole
-    // premise of naming an agent is that it is most natural when several are asking at once, which
-    // is exactly when the shown target is a DIFFERENT agent — and a terse "yes" landing on that
-    // agent's live picker gets framed as `y\r` and presses its button. That is the precise outcome
-    // `neverPickerAnswer` exists to prevent, reintroduced by the remedy text. Gating the second
-    // exit on `targetRef.current?.agentId === aim.agentId` would also work; it is not worth a
-    // branch and a threaded ref to keep an affordance that saves one click. (roborev 54673.)
-    case "addressed-at-picker":
-      return approving
-        ? line`${a} is waiting on a choice on screen — open it and pick.`
-        : line`${a} is waiting on a choice on screen, so I didn't send that to it as a message — open ${a} and pick.`;
-    // A full-screen app owns the screen, so the write would have been EXECUTED as editor/pager
-    // commands. Name the app class rather than the buffer ("alternate screen" means nothing to the
-    // person reading), and name the ONE exit — leaving it. Deliberately no "try rephrasing":
-    // rewording changes nothing about a screen that executes whatever arrives.
-    case "alternate-screen":
-      return approving
-        ? line`${a} is in a full-screen app right now, so I didn't send the approval — anything typed there would run as commands. Quit it and approve again.`
-        : line`${a} is in a full-screen app right now (an editor or pager), so I didn't send that — anything typed there would run as commands. Quit it and send again.`;
-    // The agent is at its own prompt (Claude Code, typically) but that prompt is sitting on a
-    // CREDENTIAL field, an ssh host-key question, or a `(yes/no)` — and this send would be pasted
-    // AND SUBMITTED into it. A different refusal from `alternate-screen` because the exit is
-    // different: answer the thing on screen, rather than quit an app. Named without quoting the
-    // prompt, since the whole hazard is that some of these echo nothing.
-    case "blocked-prompt":
-      return approving
-        ? line`${a} is waiting on something on screen — a prompt or a credential field — so I didn't send the approval. Answer that first, then approve again.`
-        : line`${a} is waiting on something on screen — a prompt or a credential field — so I didn't send that. Answer it in ${a}'s pane first, then send again.`;
-    case "unauthorized":
-      // Should be unreachable: `authority` is required and non-defaulted, so a call site that omits
-      // it does not compile. Reachable only if a malformed authority is built dynamically — a bug,
-      // not a user error. Say the honest thing (it did NOT send) without inventing a remedy the
-      // user could act on, and let the log line carry the diagnosis.
-      return approving
-        ? line`Something went wrong on my side, so I didn't send the approval to ${a}.`
-        : line`Something went wrong on my side, so I didn't send that to ${a}. Try again.`;
-    case "queue-full":
-      // A full hold queue is NOT a dead terminal — the agent is starting normally, there are simply
-      // already MAX_PER_AGENT prompts waiting on it. Falling through to the generic line (or worse,
-      // to the "terminal has closed" one) would send the user to restart something that is coming
-      // up fine (roborev 46280). Both voices name the action that was refused, because these
-      // ladders otherwise only say what did NOT happen, leaving the user unsure whether theirs
-      // went through.
-      return approving
-        ? line`${a} already has a few prompts waiting to start — let those land first, then approve again.`
-        : line`${a} already has a few prompts waiting to start — let those land first, then send again.`;
-    // No bespoke line: "empty" is a blank answer the UI already swallows, and "expired"/"abandoned"
-    // are DEFERRED outcomes reported by the onDeferredSendOutcome effect below, never returned to a
-    // caller synchronously. They are listed rather than folded into `default` on purpose — `default`
-    // has to stay unreachable for the exhaustiveness guard to have any teeth.
-    case "empty":
-    case "expired":
-    case "abandoned":
-      return generic;
-    default: {
-      const unhandled: never = path;
-      void unhandled;
-      return generic;
-    }
-  }
-}
-
-/** Flatten every agent across the feed (used to resolve a nudge back to its source agent). */
-function allAgents(feed: ConciergeFeed): ConciergeAgent[] {
-  return feed.projects.flatMap((p) => p.agents);
-}
-
-/** Does THIS window hold a promptable target with this id? Feed membership, OR the app-owned Sparkle
- *  agent, which is never a feed member (services/knownAgents) but IS a live local PTY whenever its
- *  pane is mounted — so feed membership ALONE reads the Improve-Sparkle mount as "gone" and strands
- *  every send at the brain (bead sparkle-0rf5). For any non-sparkle id this is exactly the old
- *  `allAgents(feed).some(...)` test, so no other target's resolution changes. */
-function isPromptableTarget(feed: ConciergeFeed, id: string | undefined): boolean {
-  if (!id) return false;
-  if (allAgents(feed).some((a) => a.id === id)) return true;
-  return isSparkleAgentId(id) && findKnownAgent(id)?.source === "sparkle";
-}
-
-/**
- * The fleet's statuses AS THE CARDS SEE THEM, for the Away recap's two edges.
- *
- * Read from the FEED, never from `runtimeStore.status`, and that is the whole point (roborev
- * 53631-H2). The feed's per-agent status is the DERIVED/published one — the cross-window merged
- * roster plus the unstarted-worker, red-worker, unmerged and dismissed-alert overlays
- * (services/conciergeFeed → publishedStatusFor) — and it is what every `statusLabel` and every
- * nudge card in this thread already speaks. Diffing the raw store against feed-supplied labels made
- * them two vocabularies, with two visible failures:
- *
- *   • `runtimeStore.status` only holds agents THIS window hosts (useConciergeFeed), so a
- *     roster-fed agent was absent from BOTH sides of the diff and `newlyEntered` skipped it — the
- *     recap said nothing about an agent in another window that went `waiting` while the same
- *     thread rendered a nudge card for it. On a concierge column pinned to a project this window
- *     does not host, the recap could never fire at all.
- *   • A red the user had DISMISSED reads de-escalated (`idle`/`stopped`) in the feed but still
- *     `waiting` in the raw store, so the recap filed it under "Wants you" while printing the feed's
- *     "Done — your turn" beside it — resurfacing an alarm the user had explicitly silenced.
- *
- * Building both sides here makes status, label and card one vocabulary by construction, and picks
- * up cross-window agents for free.
- */
-function feedStatuses(feed: ConciergeFeed): Omit<AwaySnapshot, "at"> {
-  const agents = allAgents(feed);
-  return {
-    status: Object.fromEntries(agents.map((a): [string, AgentTabStatus] => [a.id, a.status])),
-    agentIds: agents.map((a) => a.id),
-    // Carried so the recap can tell a head that was genuinely working at the away edge from one
-    // standing in for its subtree — see AwaySnapshot.rolledUpGreen.
-    rolledUpGreen: agents.filter((a) => a.rolledUpGreen).map((a) => a.id),
-  };
-}
-
-/** EVERYTHING column one accounts for right now: in scope, un-muted, needing you, and not already
- *  spoken for by an ancestor's row.
- *
- *  `band === "needs_you"` is the interruption gate. It covers exactly what the old `priority < 2`
- *  did — waiting, approval, blocked, errored — and, critically, still excludes `unmerged`, which
- *  bands `done`. On the reported fleet 27 of 51 agents were committed-but-unlanded; surfacing them
- *  here is 27 nudge cards (see services/conciergeFeed.conciergeBand).
- *
- *  These are THE SAME THREE GATES `conciergeFeed` counts `scopedCounts` on, and that is the point:
- *  the vitals line states `scopedCounts.needs_you` while the thread renders this list, so they are
- *  one population by construction rather than two computations that have to be kept in step. They
- *  did drift — `scopedCounts` counted a red worker AND the orchestrator that inherited its red, so
- *  the line said "2 Need you" over a thread holding one card.
- *
- *  Note the remaining asymmetry is the SAFE direction. `muted` can make this set smaller than the
- *  rows the filter leaves standing, so the sentence can under-state. That is fine — every row it
- *  promised is there, plus one you asked not to be interrupted about. Over-stating is the bug,
- *  because the missing rows do not exist to be shown.
- *
- *  ONE IMPLEMENTATION, in services/conciergeProactive — this delegates rather than restating the
- *  filter (roborev 54166-M5). The proactive push channel builds its prompt from the same population
- *  and the two copies were verbatim duplicates, which is exactly the drift the paragraph above is
- *  about: the brain would announce, unprompted, a count this column does not show. It lives there
- *  and not here because that module is pure and React-free, so the rule is testable as data. */
-function accountedAgents(feed: ConciergeFeed): ConciergeAgent[] {
-  return accountedNeedsYou(feed);
-}
-
-/** The half of {@link accountedAgents} that is OWED A ROW in column two — the digest's pool.
- *
- *  `topLevel` is what makes the digest's number honest. Every LINE this feeds is clickable, and the
- *  click isolates that band in the Build column — which narrows top-level rows and nothing else.
- *  Folding a worker into a line's count would state a number the click cannot produce: two blocked
- *  workers rendered "2 Need you in web", and clicking it left an empty column plus an empty-state
- *  chip. */
-function surfacedAgents(feed: ConciergeFeed): ConciergeAgent[] {
-  return accountedAgents(feed).filter((a) => a.topLevel);
-}
-
-/** The other half: accounted-for agents with NO row of their own, which therefore have to speak for
- *  themselves.
- *
- *  They are digested by the SAME rule as everything else — one keeps its card, two or more become a
- *  line — but as the `rowless` variant, because a normal line's count is a promise about rows and
- *  these have none. This population is NOT bounded by one: gap 3 below fires once per blocked
- *  worker, so several under an absent or in-motion parent used to be several cards, which is the
- *  card wall the digest exists to prevent, reintroduced through the one path that skipped it.
- *
- *  What survives from the card era is the AFFORDANCE, not the shape: a single one still gets a card
- *  whose "Show me" reveals it (`openProjectTab` selects it, and the sidebar pops a red worker out
- *  under its orchestrator), and the collapsed line's click does that same reveal for its lead.
- *
- *  Non-empty only when a rowless agent's red reached nobody — a worker with no `parentId`, one whose
- *  orchestrator is not in the fleet, or a `blocked` one whose bubble `withRedWorkerAttention`
- *  suppressed while its orchestrator was in motion. Before this existed, the `topLevel` gate turned
- *  all three into silence: no row, no card, no line, no count. See
- *  `ConciergeAgent.representedElsewhere` for why the test is band equality and not kind. */
-function unrepresentedAgents(feed: ConciergeFeed): ConciergeAgent[] {
-  return accountedAgents(feed).filter((a) => !a.topLevel);
-}
-
-/** The part of {@link unrepresentedAgents} a LINE may collapse: those that do get a nested row.
- *
- *  A digest line's click reveals exactly one agent, so collapsing is only honest when the click can
- *  nonetheless put the WHOLE group on screen. That is not a free property of the sidebar — it is
- *  something the click has to DO. The original version of this comment claimed the former ("reveal
- *  one and the siblings are on screen beside it") and was wrong twice over: `collapsedOrchestrators`
- *  reads a missing entry as collapsed, so on a fresh launch the subtree is shut, and a leftover band
- *  filter can drop the head entirely (roborev 53679, then 53734).
- *
- *  So the guarantee is attributed where it actually lives: `revealAgent` and the rowless branch of
- *  `onDigestClick` call `showAllStatusBands()` + `expandOrchestrators(...)` before opening. What
- *  makes this population collapsible is having a head at all — one the click can name and open. */
-function nestedRowlessAgents(feed: ConciergeFeed): ConciergeAgent[] {
-  return unrepresentedAgents(feed).filter((a) => a.parentRowId !== null);
-}
-
-/** The part that may NOT be collapsed: accounted-for agents with no row ANYWHERE.
- *
- *  A worker with no `parentId`, or one whose orchestrator is not in this project's fleet, is not
- *  drawn by column two at all — not as a head, not as a child. Its nudge card's "Show me" is its
- *  ONLY affordance in the app, so folding several into one line strands all but the lead: the line
- *  read "2 workers inside web need you" and the click could satisfy one of them, with no way to
- *  reach the other until the first resolved (roborev 53679).
- *
- *  So these stay one card each, on purpose. That is not the card wall coming back — the wall is the
- *  HIGH-VOLUME case, a blocked worker under a present-but-in-motion orchestrator, which fires once
- *  per worker and is exactly what {@link nestedRowlessAgents} still collapses. This population is
- *  the rare ancestor-less remainder, and a card apiece is the cheapest thing that keeps every one of
- *  them reachable. */
-function strandedAgents(feed: ConciergeFeed): ConciergeAgent[] {
-  return unrepresentedAgents(feed).filter((a) => a.parentRowId === null);
-}
-
-/** The LABELLED buttons a card carries — things the AGENT can be told to do, which today is Approve
- *  and only Approve.
- *
- *  "SHOW ME" AND "MUTE" ARE BOTH GONE FROM THIS LIST, for different reasons, and neither is a
- *  deletion (see the header of Concierge/NudgeCard):
- *   • Show me was removed outright. The card now renders the agent as a real `AgentPill` that
- *     navigates, and the whole card remains a click target, so a third copy of the same affordance
- *     was pure width in a column whose scarcest resource is width.
- *   • Mute moved to a CONTROL on the card rather than an action in this list, alongside the new [x].
- *     Both are properties of the ALARM — every card has them regardless of what its agent is doing —
- *     whereas an entry here is a property of the agent's current work. `NudgeCard` fires them
- *     through the same `onNudgeAction` channel under `NUDGE_MUTE_ACTION` / `NUDGE_DISMISS_ACTION`,
- *     so nothing about the wiring changed, only where they are drawn.
- *
- *  Approve stays a labelled button on purpose: it is a one-tap relay into a live terminal, there is
- *  no other place in the app to do it from, and an icon would make an irreversible action ambiguous. */
-/** The action id that reveals the agent's own pane instead of relaying anything into it. */
-const NUDGE_OPEN_ACTION = "open";
-
-function actionsFor(a: ConciergeAgent): ConciergeNudgeAction[] {
-  if (a.status !== "approval") return [];
-  // A CLOUD AGENT GETS "Open", NOT "Approve". Approve relays the word into that agent's terminal,
-  // and `conciergeDispatch.deliverCloudPrompt` refuses every approval gesture aimed at a cloud agent
-  // by design — an approval presses a button on the agent's own screen, which the concierge cannot
-  // see well enough to press correctly. So the old card offered a button whose only possible outcome
-  // was a refusal, discoverable only by pressing it. "Open" is the action the refusal copy already
-  // told the user to take. It is a SWAP, never a removal: a control that vanishes on scope reads as
-  // a deleted feature (sparkle-lcx8y).
-  //
-  // Resolved off `knownAgents` rather than by importing `conciergeDispatch.isCloudAgent`, which
-  // evaluates this identical expression: 19 suites hand-list a partial mock of that module, and
-  // vitest throws on any export a factory omits, so one more import from it turns 143 unrelated
-  // tests red. Same record, same polarity — TRUE only on positive evidence, so `runtime: "unknown"`
-  // keeps the Approve relay and lets the write attempt report honestly.
-  const cloud = findKnownAgent(a.id)?.runtime === "cloud";
-  return [
-    {
-      id: cloud ? NUDGE_OPEN_ACTION : "approve",
-      label: cloud ? "Open" : "Approve",
-      kind: "primary",
-    },
-  ];
-}
-
-function agentToNudge(a: ConciergeAgent): ConciergeNudge {
-  return {
-    id: a.id, // the source agent id — resolved back via the feed on click/action
-    kind: "nudge",
-    band: a.band,
-    projectName: a.projectName,
-    agentName: a.name,
-    text: `${a.statusLabel} — ${a.name} in ${a.projectName}.`,
-    actions: actionsFor(a),
-  };
-}
-
-/** Compact context handed to the headless brain so its reply is grounded in what's actually happening. */
-function buildSnapshot(feed: ConciergeFeed, userText: string): string {
-  // The FULL accounted population, rows and rowless alike — this states `scopedCounts.needs_you`
-  // right below, and listing only the row-owning half would hand the brain a count it can't see the
-  // items behind.
-  const surfaced = accountedAgents(feed);
-  // The line format — including the trailing `id:<agentId>` the persona's pill syntax depends on —
-  // lives in engine/conciergeRosterLine, shared with buildProactivePrompt. See that module's header
-  // for why a second copy of the template string is not an option.
-  const lines = surfaced.map((a) => rosterLine(a));
-  // Keep the project count SCOPED to what's actually surfaced so it can't misstate scope (e.g. say
-  // "5 projects" while only counting in-scope agents).
-  const scopedProjects = new Set(surfaced.map((a) => a.projectId)).size;
-  const state =
-    surfaced.length > 0
-      ? `${bandCountLabel("needs_you", feed.scopedCounts.needs_you)} across ${scopedProjects} project(s):\n${lines.join("\n")}`
-      : `All projects are calm right now.`;
-  return `${state}\n\nThe user says: ${userText}\n\nReply briefly and recommend the next action.`;
-}
-
-/** The agent a compose-box send would reach when the target is "agent": the selected tab's
- *  selected agent. Null when there's no project open or no agent selected. */
-export interface ConciergePromptTarget {
-  projectId: string;
-  agentId: string;
-  name: string;
-}
-
-/**
- * An aim the user stated OUT LOUD, by naming an agent in the message itself (`@Blueprint UI/UX move
- * it 5px`). Everything the send needs to honour that, captured at submit like every other aim.
- *
- * ══ WHY THIS IS ALLOWED TO SKIP THE ROUTER, WHEN `forceSparkle` IS ONLY ALLOWED ONE WAY ═════════
- * `deliver`'s `forceSparkle` carries a warning that a `forceAgent` twin must never be added, because
- * it "would type a paragraph into a live PTY on the strength of a latch". That warning stands, and
- * this is not the thing it forbids. Three differences, and the third is the one that matters:
- *
- *   1. A LATCH is invisible state left over from an earlier action (the capture window's Chat ❯,
- *      set once and consumed later), which is why it has to be retired the moment the words that
- *      set it are gone. A mention is not state at all — it is DERIVED from the text being sent, at
- *      the moment of sending (components/Concierge/mentions). It cannot outlive its own words
- *      because it has no existence apart from them.
- *   2. It is VISIBLE. The user typed the name, the picker offered it, and the pill is in the bubble.
- *   3. **IT DOES NOT SKIP THE GATE.** This changes only WHO decides the destination — the user
- *      instead of the classifier. It still arms an intent, still counts down in the banner, still
- *      offers Cancel, and still posts a receipt. What the warning is really protecting is that no
- *      heuristic verdict reaches a terminal unseen; a mention reaches it by exactly the same
- *      countdown every routed send does. That is why there is still no `router` arm in
- *      DispatchAuthority and must never be one.
- *
- * So: explicitness buys the user a skipped classify, never a skipped gate. If you are ever tempted
- * to dispatch a mention directly, that is the line this comment exists to hold.
- */
-interface ConciergeMentionAim {
-  /**
-   * HOW this terminal was chosen — the user naming it, or the cable being patched to it.
-   *
-   * The `mount` arm is the founder's mounted-composer rule (Concierge/composerRoute): while the
-   * concierge is patched to a build agent, plain text goes to that agent's terminal. It arrives on
-   * THIS type rather than on a parallel one because everything downstream of the choice is identical
-   * — the same stripped wire, the same armed intent, the same countdown, the same receipt — and a
-   * second aim type would be a second delivery path to keep in step with this one.
-   *
-   * Three things read it, and each difference is deliberate: the decision's `reason` string, whether
-   * Sparkle follows up with a turn of its own, and whether an unreadable terminal screen is fatal.
-   */
-  via: "address" | "mount";
-  /** The agent the message named, or — under a mount — the agent the cable is patched to. */
-  target: ConciergePromptTarget;
-  /** What the PTY receives — the address stripped off, attachment paths prefixed. The `@` must not
-   *  reach the terminal: the agent there is a Claude Code CLI, where a leading `@` opens its own
-   *  file-reference autocomplete (see mentions.mentionFreeText). */
-  payload: string;
-  /** The same without attachment paths — what the auto-namer reads. */
-  text: string;
-}
-
-/** How much of a relayed message is quoted back to the brain when it acknowledges the hand-off.
- *  Bounded for the reason the router bounds its context line: a pasted essay would otherwise bill
- *  unbounded metered input tokens on every mention. */
-const RELAY_QUOTE_CHARS = 240;
-
-/** How much of a held message a deferred-send OUTCOME quotes back into the thread before eliding.
- *
- *  Its own number rather than {@link RELAY_QUOTE_CHARS}, because the two are bounded for different
- *  reasons: that one protects a metered token bill, this one protects a narrow column's geometry — the
- *  quote is there so the user can tell WHICH held message an outcome refers to (roborev 53123), and a
- *  recognisable head does that in a line or two. The payload itself is not lost: past
- *  `shouldPasteAsPill` it rides on the message as a collapsed block. Matches the countdown banner's
- *  `MAX_QUOTED_CHARS`, which quotes for the same reason on an equally narrow surface. */
-const OUTCOME_QUOTE_CHARS = 120;
-
-/** Bound a one-lined quote for the transcript. See {@link OUTCOME_QUOTE_CHARS}. */
-function elideQuote(text: string): string {
-  return text.length <= OUTCOME_QUOTE_CHARS ? text : `${text.slice(0, OUTCOME_QUOTE_CHARS - 1)}…`;
-}
-
-/**
- * What Sparkle is asked after it has relayed a message — the founder's headline requirement:
- * *"the concierge sends it over to that builder agent, but ALSO still participates in the
- * conversation… I want the concierge to be a thought partner."*
- *
- * A real brain turn, not a canned line. `postSparkle("Sent to X.")` would satisfy "says something"
- * and miss the ask entirely: the point is that addressing an agent starts a conversation ABOUT that
- * agent rather than ending one. The receipt under the bubble already states the bare fact of
- * delivery, so this prompt asks for the half a receipt cannot give.
- *
- * Phrased in the user's voice because `buildSnapshot` wraps it in "The user says:" — writing it as
- * an instruction to the assistant there would read as the user issuing stage directions.
- */
-export function relayFollowUp(agentName: string, sent: string): string {
-  const quoted = oneLine(sent).slice(0, RELAY_QUOTE_CHARS);
-  return `(I just used the concierge to send "${quoted}" over to my build agent "${agentName}". Confirm briefly that it went, then stay with me on it — what else should I be thinking about, or want to take up with ${agentName}?)`;
-}
-
-/**
- * THE LIVENESS COLOUR, SPOKEN — a component that renders nothing and exists for two reasons.
- *
- * The concierge's no-answer signal is a COLOUR and nothing else: gray, yellow at 30s, red at 60s
- * (engine/conciergeLiveness). The founder asked for exactly that and no words — *"don't have it say
- * no answer yet, just have the color change from gray to yellow to then red."* A colour cannot be
- * read aloud, and the objection was to visual noise, so the step is spoken through `announce`, the
- * column's ONE live region, like every other line the column says. It does not belong to the
- * indicator: two attempts to give that component its own region failed, the second because the
- * thread deliberately owns no announcer (a second region double-announces, asserted by
- * ConciergeThread.roleLabels) and because the indicator's row is `aria-hidden` when it carries no
- * activity line, which would have muted a nested region in the exact case it existed for.
- *
- * WHY IT IS ITS OWN COMPONENT and not an effect in the host (roborev 56177-M2). The liveness hook
- * keeps `now` in component state and re-renders its caller once a second for the WHOLE of every turn
- * — `reduceProgress` pushes `silentSince` forward on every delta and tool call, so the ticker is not
- * confined to the silent stretches. Calling it in the host would reconcile the entire column subtree
- * (neither ConciergeColumn nor ConciergeThread is memo'd) at 1 Hz to derive a string that changes at
- * most twice. Here the 1 Hz re-render lands in a leaf that renders nothing.
- *
- * IT ANNOUNCES ONLY AN OBSERVED CHANGE (roborev 56177-M1). The liveness store is module-level and
- * outlives this component — the host unmounts whenever no project is open (App.tsx), and a turn in
- * flight at that moment loses its terminal listeners and leaves `silentSince` set forever. Speaking
- * on the effect's FIRST run would then have a reopened project greet the user with "nothing has come
- * back" about a turn nobody is waiting for, and clobber the column's one live region on mount. So
- * the first reading is recorded silently, whatever it is, and only a genuine step change speaks.
- */
-function LivenessAnnouncer({ announce }: { announce: (text: string) => void }) {
-  const { liveness } = useConciergeLiveness();
-  // `null` means "nothing observed yet in this mount" — distinct from any real step, so the first
-  // run can be told apart from a transition into the same value.
-  const spoken = useRef<ConciergeLiveness | null>(null);
-
-  useEffect(() => {
-    const previous = spoken.current;
-    spoken.current = liveness;
-    if (previous === null || previous === liveness) return;
-    const line = livenessAnnouncement(liveness);
-    // `announce` bumps a write counter so identical repeats still speak (roborev 53392), which is
-    // exactly why this must fire on the transition rather than per render: a turn that sits red for
-    // ten minutes says it once.
-    if (line) announce(line);
-  }, [liveness, announce]);
-
-  return null;
-}
-
-/**
- * WHICH repos the concierge's PR chip lists: ALL of the open ones, in tab order.
- *
- * THIS USED TO BE A PRECEDENCE RULE (`prChipProject`) that picked exactly one project — the global
- * selection, else the left pair's, else the first open one — and it was the wrong shape twice over.
- *
- * The old note recorded its own known limit: "with two pairs holding DIFFERENT projects this still
- * lists only one of them. Listing both means `OpenPrMenu` fetching per repo and keying its merge
- * state by repo+number instead of number (PR numbers collide across repos)." That is exactly what
- * happened — `OpenPrMenu` is repo-keyed throughout now — so the precedence has nothing left to
- * decide, and the limit is gone rather than documented.
- *
- * The second failure was worse than a limit, because picking one project meant sometimes picking
- * NONE. The founder's concierge was scoped to a project with no pull requests while all ten of his
- * lived in another, and a resolution that came back null unmounted the app's ONLY pull-request
- * affordance (bead sparkle-lcx8y). Selecting a project is not a statement about which PRs you want
- * to see; it is a statement about which agents you are looking at.
- *
- * So there is no selection here at all — the answer is every open tab, and the menu groups by name.
- * `leftProjectId` is deliberately no longer read: with every open project listed, which pair
- * selected what stopped being able to hide anything.
- *
- * ONE THING IS CARRIED BEYOND THE TAB ITSELF: `repoKey`, the canonical `.git` common dir. Two tabs
- * can be one REPOSITORY — `sparkle-desktop` is a linked worktree of `sparkle`, and the founder had
- * both open — and without this the menu counted that repo's pull requests twice and listed all 23 of
- * them under both headings. It is passed straight through, never derived here: a linked worktree's
- * `.git` is a FILE, so nothing about the path or the folder's shape can tell you this. See
- * `services/fleetPrs.repoIdentityOf`.
- *
- * Pure and exported so the mapping is tested without mounting the host.
- */
-export function prChipScopes(
-  openProjects: readonly {
-    id: string;
-    name: string;
-    rootPath?: string | null;
-    repoKey?: string | null;
-  }[],
-): PrScope[] {
-  return openProjects.map((p) => ({
-    projectId: p.id,
-    projectName: p.name,
-    rootPath: p.rootPath ?? null,
-    repoKey: p.repoKey ?? null,
-  }));
-}
-
-/**
- * The concierge header's PR chip — the app's ONE pull-request affordance, listing EVERY open
- * project tab.
- *
- * It used to be a wide bordered "3 PRs waiting" pill over in the project tab strip, and the
- * concierge header carried a second, DEAD one (a `prsReady` number that nothing ever passed). This
- * is the single survivor: the same `OpenPrMenu`, mounted `compact` so it reads as an icon and a
- * count beside the ⋮ rather than a labelled pill competing with the tab row.
- *
- * The wiring it needs is repo state — which is why the presentational `Concierge/` directory takes
- * it as a slot rather than growing a store read (see `ConciergeColumnProps.prSlot`). Scope comes
- * from {@link prChipScopes}; `resolveAgent` searches EVERY project, so a PR belonging to another
- * pair's agent still offers "Open agent" and routes there.
- *
- * THERE IS NO EARLY RETURN HERE ANY MORE, and that is the fix (bead sparkle-lcx8y). This component
- * used to be `if (!project) return null` — so a concierge scoped to a project the resolution could
- * not place removed the app's only way to see, let alone merge, a pull request. `OpenPrMenu` owns
- * the one remaining case where nothing renders (no open project tab at all, i.e. the app's
- * "open a project with +" state), and it can no longer be reached by a scope, a count of zero, or a
- * failed probe.
- */
-function ConciergePrChip() {
-  const projects = useProjectStore((s) => s.projects);
-  const selectedProjectId = useProjectStore((s) => s.selectedProjectId);
-  const openProjectIds = useUiStore((s) => s.openProjectIds);
-  // A fresh array every render, and deliberately not memoized here: `OpenPrMenu` keys its polling
-  // on the scope SET's value (`scopeSetKey`), not on this array's identity, precisely so a caller
-  // reading two stores does not have to get a memo's dependencies exactly right to avoid
-  // re-probing GitHub on every unrelated store write.
-  const scopes = prChipScopes(openProjectsOf(projects, openProjectIds));
-  return (
-    <OpenPrMenu
-      compact
-      scopes={scopes}
-      resolveAgent={(pr) => agentLinkForPr(pr, projects, selectedProjectId)}
-      onOpenAgent={(link) => openProjectTab(link.projectId, link.agentId)}
-    />
-  );
-}
 
 /**
  * ONE REPLY HELD BACK WHILE ITS CORRECTION TURN RUNS — the whole state of the linter's block path.
@@ -1218,19 +510,6 @@ export function ConciergeHost({
    *  rendered node on it so the DOM genuinely changes. */
   const announce = useCallback((text: string) => {
     setAnnouncement((prev) => ({ seq: prev.seq + 1, text }));
-  }, []);
-  // ══ WHAT A MOUNTED COLUMN CAN STILL SHOW (roborev 57360) ════════════════════════════════════════
-  // Mounted, the column renders the AGENT's transcript and does not render `ConciergeThread` at all —
-  // so `postSparkle` writes into a component that is off screen. This is the sibling row that stays
-  // (Concierge/MountedNotice), and it carries the outcomes that would otherwise be invisible in the
-  // exact state the mounted-composer feature exists for.
-  //
-  // `{ seq, text, tone }` and a bump per write, for the same reason `announcement` is not a bare
-  // string: refusing TWICE FOR THE SAME REASON is the common case here — the founder retypes and hits
-  // the same `vim` — and an `Object.is`-equal setState would render the second refusal as no change.
-  const [mountedNotice, setMountedNotice] = useState<MountedNoticeModel | null>(null);
-  const noteMounted = useCallback((text: string, tone: "warn" | "info") => {
-    setMountedNotice((prev) => ({ seq: (prev?.seq ?? 0) + 1, text, tone }));
   }, []);
   // "Copy on selection" (PRD 1 §1) — a PRESENTATION preference, so it lives in uiStore rather than
   // config.toml, and is READ HERE rather than in the column: nothing under components/Concierge
@@ -1791,14 +1070,12 @@ export function ConciergeHost({
   useEffect(() => {
     displayMountedNameRef.current = mountedName;
   }, [mountedName]);
-  // THE NOTICE DIES WITH THE MOUNT IT DESCRIBES. Left standing after an unmount it asserts a state
-  // that is over, which is the same stale signal the unmount hint is gated to avoid. Keyed on the
-  // DISPLAY mount for the same reason the writes are — that is when the row is on screen — and on
-  // the id rather than a boolean, so moving the cable between agents also clears the previous
-  // agent's line rather than attributing it to the new one.
-  useEffect(() => {
-    setMountedNotice(null);
-  }, [mountedAgentId]);
+  // The mounted column's notice row — state, writer and the release effect that retires a notice
+  // with the mount it describes — in one hook (hooks/useMountedNotice). CALLED HERE, where the
+  // release effect used to be declared rather than where the state was: that keeps the effect at its
+  // exact position among this component's effects. Nothing between the old two positions reads
+  // `mountedNotice` or calls `noteMounted`, so nothing moves relative to its producer.
+  const { mountedNotice, noteMounted } = useMountedNotice(mountedAgentId);
 
   // Gated on the NAME rather than on the row, because a name is what this needs and the roster is
   // only one of the two places one can come from (see `mountedName`). Keeping `mountedRow` as the

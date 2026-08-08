@@ -10,7 +10,9 @@
 //
 // Tested as the pure function it is — no host mount, no stores.
 import { describe, expect, it } from "vitest";
-import { prChipScopes } from "./ConciergeHost";
+// Imported from its own module rather than through ConciergeHost's re-export, so this suite does not
+// pull the whole host in to test one pure mapping.
+import { prChipScopes } from "./Concierge/ConciergePrChip";
 
 const P = (id: string, name = id, rootPath: string | null = `/code/${id}`) => ({
   id,
