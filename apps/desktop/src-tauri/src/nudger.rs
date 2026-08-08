@@ -1774,10 +1774,6 @@ mod tests {
         assert_eq!(flags.list()[0].target, "concierge");
     }
 
-    /// An agent that MOVED has resolved its own episode, so the flag is no longer true. Leaving it
-    /// up has the pusher chase an agent that is already working again — and a channel that reports
-    /// resolved problems stops being read.
-    #[test]
     /// A REPAINT IS NOT A NEW EPISODE — the `apply_flags` half of roborev 60369, which shipped with
     /// NO test of its own (roborev 60386): no existing case passed `hash_changed: true` together
     /// with `flagged: Some(..)`, so deleting the guard left this whole suite green while the
@@ -1818,6 +1814,12 @@ mod tests {
         );
     }
 
+    /// An agent that MOVED has resolved its own episode, so the flag is no longer true. Leaving it
+    /// up has the pusher chase an agent that is already working again — and a channel that reports
+    /// resolved problems stops being read.
+    ///
+    /// The paired opposite of the repaint test above: same `hash_changed: true`, but this look
+    /// raises NO flag, which is what makes the clear correct here and wrong there.
     #[test]
     fn output_from_a_flagged_agent_clears_its_flag() {
         let flags = NudgeFlags::default();
