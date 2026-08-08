@@ -596,10 +596,46 @@ describe("cloud agents", () => {
   // CONTROL_OPS check below.
   it("does not import the START floor — the resume bar cannot be dragged by it again", () => {
     const source = readFileSync(new URL("./goalContinuation.ts", import.meta.url), "utf8");
-    const imports = source
-      .split("\n")
-      .filter((l) => /^\s*import\b/.test(l) || /^\s*}\s*from\s+["']/.test(l))
-      .join("\n");
+    // WHOLE STATEMENTS, not lines. The first version of this guard filtered lines matching
+    // /^\s*import\b/ or /^\s*}\s*from/ — which drops the MIDDLE of a multi-line import, exactly
+    // where a re-added symbol would sit:
+    //
+    //   import {                    ← kept
+    //     CLOUD_MIN_START_CENTS,    ← matched NEITHER pattern, silently dropped
+    //   } from "../services/cloudAgents/gating";   ← kept
+    //
+    // so the guard passed while the import it exists to forbid was present. It was verified against
+    // a single-line import only, which is the shape the filter happens to catch. Match the statement
+    // across newlines instead.
+    const extractImports = (src: string) =>
+      src.match(/^\s*import\b[\s\S]*?from\s+["'][^"']+["'];/gm) ?? [];
+
+    // POSITIVE CONTROL — and it has to be a MULTI-LINE fixture, because that is the whole defect.
+    // `goalContinuation.ts` today contains four single-line imports and no multi-line ones, so
+    // "the extractor found ./agentGoal" is satisfied by the OLD line-filter just as well as by this
+    // regex: it proves the extractor found something, not that it can see the middle of a wrapped
+    // `import { … }` block. Revert this to a line filter, or drop the `[\s\S]` that spans newlines,
+    // and every other assertion here still passes while the guard goes back to being vacuous.
+    //
+    // Same helper for the fixture and for the real check, deliberately: asserting a hand-copied
+    // regex against the fixture would test a DUPLICATE of the mechanism and leave the real one
+    // unpinned — the failure mode this whole test exists to avoid, relocated one level up.
+    expect(
+      extractImports(
+        'import {\n  CLOUD_MIN_START_CENTS,\n} from "../services/cloudAgents/gating";',
+      ).join("\n"),
+    ).toContain("CLOUD_MIN_START_CENTS");
+
+    const statements = extractImports(source);
+    const imports = statements.join("\n");
+
+    // …and that it found THIS file's real imports, so a renamed file or a changed import style
+    // cannot make the negative assertion below vacuously true.
+    expect(imports).toContain("./agentGoal");
+    expect(imports).toContain("./quotaBlock");
+    expect(statements.length).toBeGreaterThanOrEqual(4);
+
+    // THE GUARD ITSELF.
     expect(imports).not.toContain("CLOUD_MIN_START_CENTS");
     // And the definition is a literal, not a reference to anything.
     expect(source).toMatch(/export const CLOUD_MIN_CONTINUE_CENTS = \d+;/);
