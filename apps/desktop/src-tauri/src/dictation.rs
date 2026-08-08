@@ -284,6 +284,73 @@ pub(crate) fn should_install_cloud(
     same_generation && still_current && capture_present && !already_active
 }
 
+/// After a build is INVALIDATED — discarded on install, or failed outright — does the session still
+/// want a capture that nobody is going to build?
+///
+/// WHY THIS IS A FUNCTION AND NOT AN INLINE `if`. `plan_capture_for` treats an in-flight build as an
+/// existing capture, which DROPS a reconcile rather than deferring it, and nothing re-runs it if the
+/// build it deferred to never lands. So whoever invalidates a build owns re-issuing the request it
+/// was suppressing — and there are TWO such places (`install_capture`'s discard, and the `Err` arm
+/// of `reconcile_capture`), which is exactly the shape that drifts. Both call it; neither is
+/// driveable in CI (a real `Capture`, `DecodeWorker` and `AppHandle`), which is why the decision is
+/// extracted rather than written twice at the call sites (roborev 60351).
+pub(crate) fn discard_needs_reissue(should_be_live: bool, has_capture: bool) -> bool {
+    should_be_live && !has_capture
+}
+
+/// Everything a FRESH ARM resets, as one named transition rather than six lines inline in
+/// `start_dictation` (roborev 60387).
+///
+/// The cloud Arcs are a new GENERATION, so `start_cloud_stream`'s `ptr_eq`/epoch guards correctly
+/// invalidate any stream that raced a prior stop+start — including `cloud_tx`, which mirrors `cloud`
+/// and must never survive into a new arm. `build_failure_reissued` is refunded for the same reason
+/// in a different currency: a user who mutes and unmutes is making a NEW attempt, and inheriting a
+/// budget the previous one spent would leave this arm's stale-attempt failure recoverable only by
+/// the watchdog, ~3 s later. Written inline that refund was invisible to the suite and silently
+/// deletable; as a function it is one assertion.
+pub(crate) fn note_fresh_arm(sess: &mut DictationSession) {
+    sess.cloud = Arc::new(Mutex::new(None));
+    sess.cloud_active = Arc::new(AtomicBool::new(false));
+    sess.cloud_epoch = Arc::new(AtomicU64::new(0));
+    sess.cloud_tx = Arc::new(Mutex::new(None));
+    sess.armed = true;
+    sess.build_failure_reissued = false;
+}
+
+/// The whole lock-scoped decision `reconcile_capture` takes when a build returns `Err`: clear the
+/// in-flight marker, then answer whether to re-issue the reconcile that build was suppressing.
+///
+/// WHY THIS IS BOUNDED AND THE DISCARD PATH IS NOT (roborev 60384). `install_capture`'s discard
+/// terminates on its own: it re-issues only on a transcriber-generation mismatch, and the re-issued
+/// build installs against the current generation. A FAILED build has no such stopping condition —
+/// the failure is a property of the DEVICE, and the re-issued reconcile plans a fresh `Build`
+/// because the marker that would have suppressed it is cleared on the line above. Left ungated,
+/// a mic that cannot open at all (no input device, revoked TCC grant, device held elsewhere)
+/// recurses `reconcile_capture` → `build_capture` → `Err` → `reconcile_capture` … on the calling
+/// thread, blocking in CoreAudio init and emitting a `dictation://error` per lap until the stack
+/// runs out. So the retry is a ONE-SHOT budget (`build_failure_reissued`), exactly like the
+/// watchdog's `audio_reacquired`: the stale-attempt case gets its retry, and a persistently failing
+/// device falls through to the watchdog's escalation instead of spinning here.
+///
+/// Takes `&mut DictationSession` rather than two bools so the marker clear, the want-a-capture test
+/// and the budget are pinned TOGETHER by a test on a real session — the ordering (clear before
+/// decide) is what makes the recursion reachable, and a truth-table test over bare bools cannot see
+/// it.
+pub(crate) fn note_build_failed(sess: &mut DictationSession) -> bool {
+    // Clear the in-flight marker so the watchdog stops treating this as a build still running and
+    // can escalate/retry.
+    sess.build_started_at = None;
+    let wants_capture = discard_needs_reissue(
+        capture_should_be_live(sess.armed, sess.focused),
+        sess.capture.is_some(),
+    );
+    if !wants_capture || sess.build_failure_reissued {
+        return false;
+    }
+    sess.build_failure_reissued = true;
+    true
+}
+
 /// What to do with a relay socket whose blocking handshake was raced by a stop/restart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RacedStream {
@@ -344,6 +411,75 @@ pub(crate) fn raced_stream_disposition(
         return RacedStream::ParkWarm;
     }
     RacedStream::Discard
+}
+
+/// What the frontend should be told about a raced stream — THREE outcomes, not two.
+///
+/// `Ok(false)` alone cannot carry this: it means only "do not meter", and the frontend's fallback
+/// story needs to tell three different things apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LateReport {
+    /// WE CONNECTED, for the session the user is in right now, and then did not install it. Drives
+    /// the `too-slow` banner: reachability is PROVEN, so any copy about the network would be false.
+    Late,
+    /// An orphan of a generation that has already rotated — a handshake for a session the user
+    /// stopped, landing 1-6 s late (measured) while a successor may already be live and painting
+    /// interims. NO EVIDENCE EITHER WAY, and that is the whole point: it must not light the banner
+    /// (it would describe "that utterance" over a working stream), and it must not reach the
+    /// corroboration counter either. Suppressing only the banner was not enough — the counter is
+    /// global, so the orphan's `Ok(false)` was still attributed to the SUCCESSOR episode, and a
+    /// rapid re-hold pattern (the ordinary push-to-talk one) accumulated two of them and claimed
+    /// unreachability over a relay that had completed two handshakes. A stronger false claim on the
+    /// same trigger (roborev 60365).
+    Orphan,
+    /// Nothing to report: the socket was installed and is routing.
+    Silent,
+}
+
+/// Classify a raced stream for the frontend. Pure so the three-way distinction is pinned without a
+/// relay, an `AppHandle` or a clock.
+pub(crate) fn late_report_for(disposition: RacedStream, same_generation: bool) -> LateReport {
+    match disposition {
+        // Park only ever happens within one generation, so the guard reads as a tautology here —
+        // stated rather than omitted, so a future relaxation of `raced_stream_disposition` cannot
+        // quietly start parking across a rotation and re-open the hazard.
+        RacedStream::ParkWarm | RacedStream::Discard => {
+            if same_generation { LateReport::Late } else { LateReport::Orphan }
+        }
+        RacedStream::InstallLive => LateReport::Silent,
+    }
+}
+
+/// Send the frontend whatever `late_report_for` decided. One place, so the park and discard arms
+/// cannot drift, and so "an orphan says NOTHING" stays a single fact rather than two omissions.
+///
+/// A distinct event rather than silence: silence is indistinguishable from a handshake that never
+/// completed, which is exactly what the corroboration counter counts. The orphan must be silent on
+/// BOTH axes — no banner AND no refusal tally — and only a signal it can recognise lets the
+/// frontend do that.
+fn emit_late_report(app: &AppHandle, report: LateReport) {
+    match report {
+        LateReport::Late => {
+            let _ = app.emit("dictation://cloud-late", ());
+        }
+        LateReport::Orphan => {
+            // THE POINT OF THIS ARM IS THE `cloud-late` IT DOES NOT EMIT. The frontend has no
+            // listener for `cloud-orphan` and must not grow one (roborev 60408/60429): an orphan's
+            // own attempt answers `CloudStreamOutcome::Raced`, which the frontend classifies as
+            // `ignore` — already "record nothing" — so any latch keyed on this event could only ever
+            // suppress a DIFFERENT attempt's outcome, and the event is an `app.emit`, i.e. broadcast
+            // to every window. Two mechanisms were built on it and both were deleted for exactly
+            // that. It stays emitted as a diagnostic companion to this log line; if a consumer is
+            // ever genuinely needed, it must carry the generation id, not a bare fact.
+            tracing::info!(
+                target: "dictation",
+                "the raced stream belongs to a rotated generation; reporting it as an orphan so it \
+                 neither lights the banner nor counts as a refusal"
+            );
+            let _ = app.emit("dictation://cloud-orphan", ());
+        }
+        LateReport::Silent => {}
+    }
 }
 
 /// What `cloud_reuse` was told about the socket sitting in the slot. NAMED fields, not a bool pair:
@@ -733,6 +869,40 @@ pub(crate) fn plan_capture(should_be_live: bool, has_capture: bool) -> CapturePl
         (false, true) => CapturePlan::Teardown,
         _ => CapturePlan::Idle,
     }
+}
+
+/// `plan_capture`, but counting a build that is ALREADY IN FLIGHT as a capture that exists.
+///
+/// ── THE BUG THIS DELETES ────────────────────────────────────────────────────────────────────────
+/// `sess.capture` is not written until `install_capture`, which runs AFTER the off-lock
+/// `build_capture` (CoreAudio init, ~78 ms measured). Two reconciles landing inside that window both
+/// read `has_capture == false`, both plan `Build`, and ONE `start_dictation` produces TWO captures
+/// on the same device. Check-then-act, and it was the normal path, not an edge case:
+/// sparkle.log.2026-08-06 has the pair 0.17 ms apart on every steady-state cycle, 202
+/// `build_capture` against 180 `start_dictation` across the day.
+///
+/// The loser was then discarded by `install_capture`'s `still_current` re-check and logged as
+/// "discarding a capture built during a stop/blur race" — 153 times, overwhelmingly with no stop and
+/// no blur anywhere near it. Two separate investigations chased that phantom focus race.
+///
+/// ── WHY IT IS A SEPARATE FUNCTION AND NOT AN EXTRA `||` AT THE CALL SITE ────────────────────────
+/// The Build arm of `take_reconcile_step` cannot be driven to completion in a test — `Capture::start`
+/// needs a real audio device and `ParakeetTdt::new` a 482 MB model, neither present in CI — and with
+/// no transcriber resident the arm falls through to `Idle` REGARDLESS of the plan. A test written
+/// against `take_reconcile_step` would therefore pass identically with and without this fix: the
+/// textbook vacuous test. Keeping the decision pure is the same reason `plan_capture` exists, and it
+/// is the only shape in which this fix can actually be pinned.
+pub(crate) fn plan_capture_for(
+    should_be_live: bool,
+    has_capture: bool,
+    build_in_flight: bool,
+) -> CapturePlan {
+    // NOTE the asymmetry, which is deliberate: an in-flight build suppresses a second BUILD, and it
+    // must not also suppress a TEARDOWN. `plan_capture(false, true)` is how a blur or a stop releases
+    // the mic, and folding the marker in here is what lets that keep working — the capture about to
+    // be installed is torn down by `install_capture`'s own `still_current` check, which is the one
+    // path that can see it at all.
+    plan_capture(should_be_live, has_capture || build_in_flight)
 }
 
 /// Whether a *deferred* blur should actually commit (release the mic + notify the frontend). We
@@ -1352,6 +1522,19 @@ pub struct DictationSession {
     /// silence re-entered through the fix for the false positive (roborev 55300). Past
     /// `BUILD_STALL_GRACE` we stop believing it.
     build_started_at: Option<std::time::Instant>,
+    /// One-shot budget: this session has already spent its automatic re-issue after a FAILED build.
+    ///
+    /// The re-issue in `reconcile_capture`'s `Err` arm exists for a build that failed because it
+    /// belonged to a SUPERSEDED attempt (the device was held during a stop), where retrying against
+    /// the current session succeeds. But the re-issued reconcile plans a fresh `Build` — the marker
+    /// it would otherwise be gated behind was just cleared by the failure — so a device that fails
+    /// for its OWN reasons (no input device, a revoked TCC grant, another process holding it) would
+    /// fail, re-issue, fail, re-issue, recursing on the calling thread and emitting a
+    /// `dictation://error` per lap until the stack ran out. This latch bounds it at exactly one, in
+    /// the same shape (and for the same reason) as `audio_reacquired` bounds the watchdog's one free
+    /// re-acquire: one silent retry, then escalate. Cleared by every capture that actually installs
+    /// and by every fresh arm, so the budget is per-attempt rather than per-process.
+    build_failure_reissued: bool,
     /// Consecutive watchdog ticks where the mic SHOULD be capturing but no capture exists.
     /// Debounces the ordinary in-flight-rebuild window so only a genuinely stuck state escalates.
     audio_missing_ticks: u8,
@@ -1604,12 +1787,22 @@ impl DictationState {
         // that still tore down under the lock.
         // Same reasoning as `take_reconcile_step`'s: log the DECISION and both of its inputs on
         // every path, so a mic that silently never comes up is visible in the log.
-        let plan = plan_capture(capture_should_be_live(sess.armed, sess.focused), sess.capture.is_some());
+        // Counts an in-flight build as an existing capture, for the same reason and via the same
+        // helper as `take_reconcile_step` — see `plan_capture_for`. This path MUST make the identical
+        // call: the comment above pins that the two cannot drift on when to build, and a focus edge
+        // landing inside the ~78 ms build window is one of the two ways the double-build was reached.
+        let build_in_flight = build_suppresses_watch(sess.build_started_at.map(|t| t.elapsed()));
+        let plan = plan_capture_for(
+            capture_should_be_live(sess.armed, sess.focused),
+            sess.capture.is_some(),
+            build_in_flight,
+        );
         tracing::info!(
             target: "dictation",
             armed = sess.armed,
             focused = sess.focused,
             has_capture = sess.capture.is_some(),
+            build_in_flight = build_in_flight,
             has_transcriber = sess.transcriber.is_some(),
             plan = ?plan,
             "reconcile decision (focus edge)",
@@ -1697,9 +1890,23 @@ impl DictationState {
             // queued decodes — neither may run under the session lock. Order mirrors every teardown:
             // the Capture (sole decode-channel Sender) drops first, then the worker joins.
             ReconcileStep::Teardown { capture, worker } => {
+                // SAY WHICH TEARDOWN THIS IS (roborev 59586). Folding the in-flight marker into the
+                // has-capture term made `Teardown { capture: None }` reachable — a stop/blur landing
+                // inside the ~78 ms build window, where the decision is preserved but nothing is
+                // installed to release. Logging "capture paused" there is a new false statement in
+                // exactly the window whose misleading logging this work exists to delete: nothing
+                // was paused, and the mic is released later by `install_capture`'s discard.
+                let had_capture = capture.is_some();
                 drop(capture);
                 drop(worker);
-                tracing::info!(target: "dictation", "capture paused (window unfocused or muted)");
+                if had_capture {
+                    tracing::info!(target: "dictation", "capture paused (window unfocused or muted)");
+                } else {
+                    tracing::info!(
+                        target: "dictation",
+                        "stop/blur landed during a build; the in-flight capture will be discarded on install"
+                    );
+                }
             }
             // Build OUTSIDE the lock (Capture::start's CoreAudio init blocks on the main thread), then
             // install under the lock only if the arm intent is still current.
@@ -1709,8 +1916,36 @@ impl DictationState {
                     Err(e) => {
                         // The build FAILED — clear the in-flight marker so the watchdog stops
                         // treating this as a build still running and can escalate/retry.
-                        self.0.lock().unwrap_or_else(|p| p.into_inner()).build_started_at = None;
+                        //
+                        // …AND RE-ISSUE, exactly as the discard path does (roborev 60351). This is
+                        // the OTHER way a build gets invalidated, and it was dropping the same
+                        // suppressed reconcile: marker set for T1 → stop → start installs T2 and
+                        // reconciles to Idle because the marker stands → T1's build returns Err (the
+                        // device was held during the stop) → marker cleared, error emitted, nothing
+                        // pending. Same armed && focused && no-capture dead end, recoverable only by
+                        // the watchdog ~3 s later. The retry frequently SUCCEEDS here, because the
+                        // failure belonged to the stale T1 attempt and not to T2's session.
+                        //
+                        // NO RETRY STORM — and the bound is a LATCH, not the in-flight marker. An
+                        // earlier version of this comment claimed the re-issued build would find
+                        // `build_started_at` set by its own plan and stop there; it does not, because
+                        // the line clearing that marker runs first, so the re-issued reconcile plans
+                        // a fresh Build every time. A device failing for its OWN reasons therefore
+                        // recursed until the stack ran out (roborev 60384). `note_build_failed`
+                        // spends a one-shot budget instead: the stale-attempt case gets its retry,
+                        // and a persistently failing device falls through to the watchdog.
+                        let reissue = {
+                            let mut sess = self.0.lock().unwrap_or_else(|p| p.into_inner());
+                            note_build_failed(&mut sess)
+                        };
                         let _ = app.emit("dictation://error", e);
+                        if reissue {
+                            tracing::info!(
+                                target: "dictation",
+                                "re-reconciling after a FAILED build; the session still wants a capture",
+                            );
+                            self.reconcile_capture(app);
+                        }
                     }
                 }
             }
@@ -1740,12 +1975,43 @@ impl DictationState {
         // answered from a log at all; it had to be inferred, and was inferred wrongly.
         //
         // Cheap: this runs on arm and on focus edges, not per audio frame.
-        let plan = plan_capture(capture_should_be_live(sess.armed, sess.focused), sess.capture.is_some());
+        // ── A BUILD IN FLIGHT IS A CAPTURE THAT ALREADY EXISTS, FOR THIS DECISION ────────────────
+        // `sess.capture` is not written until `install_capture`, which runs AFTER the off-lock
+        // `build_capture` (CoreAudio init, ~78 ms measured). So two reconciles that land inside that
+        // window BOTH read `capture.is_some() == false`, both decide `Build`, and one
+        // `start_dictation` produces TWO captures on the same device. Classic check-then-act.
+        //
+        // MEASURED, not hypothetical: sparkle.log.2026-08-06 shows the pair 0.17 ms apart on every
+        // steady-state cycle —
+        //     34.184683  reconcile decision … has_capture=false … plan=Build
+        //     34.184853  reconcile decision … has_capture=false … plan=Build
+        //     34.262372  capture bound to input device
+        //     34.262651  capture bound to input device
+        // — 202 `build_capture` against 180 `start_dictation` across the day, and the loser is then
+        // thrown away by `install_capture`'s `still_current` check, which reports it as
+        // "discarding a capture built during a stop/blur race" (153×) when NO stop or blur was
+        // involved. That misattribution is what sent two investigations hunting a focus race.
+        //
+        // WHY `build_suppresses_watch` AND NOT `build_started_at.is_some()`: the marker is cleared
+        // on every path a build can normally leave by (install, discard, and the error arm in
+        // `reconcile_capture`), so only a HUNG build can leave it standing. Treating it as
+        // permanently true would then refuse to ever rebuild — which is precisely the trap roborev
+        // 55300 documents one bound away from here. Reusing that same bound keeps ONE answer to
+        // "is this build still believable" rather than letting a second one drift away from it.
+        let build_in_flight = build_suppresses_watch(sess.build_started_at.map(|t| t.elapsed()));
+        let plan = plan_capture_for(
+            capture_should_be_live(sess.armed, sess.focused),
+            sess.capture.is_some(),
+            build_in_flight,
+        );
         tracing::info!(
             target: "dictation",
             armed = sess.armed,
             focused = sess.focused,
             has_capture = sess.capture.is_some(),
+            // Logged SEPARATELY from `has_capture` rather than folded into it: the whole reason this
+            // bug survived is that the log could not distinguish "no capture" from "no capture YET".
+            build_in_flight = build_in_flight,
             has_transcriber = sess.transcriber.is_some(),
             plan = ?plan,
             "reconcile decision",
@@ -1849,10 +2115,38 @@ impl DictationState {
                 Some((capture, worker))
             }
         }; // release the lock before dropping the raced-out capture (its cpal-stream drop touches CoreAudio)
+        let mut reissue = false;
         if let Some((capture, worker)) = discard {
             tracing::info!(target: "dictation", "discarding a capture built during a stop/blur race");
             drop(capture);
             drop(worker);
+            // ── RE-ISSUE THE RECONCILE THIS BUILD WAS SUPPRESSING (roborev 59586) ───────────────
+            // `plan_capture_for` treats an in-flight build as an existing capture, which DROPS the
+            // suppressed reconcile rather than deferring it — and nothing re-runs it if the build it
+            // deferred to is then thrown away. Reachable entirely inside the ~78 ms window: a Build
+            // for transcriber T1 is planned and marks in-flight; `stop_dictation` takes the
+            // transcriber; `start_dictation` installs a fresh Arc T2 and reconciles to Idle *because
+            // the marker still stands*; then the T1 build lands, fails `ptr_eq`, and is discarded
+            // here. The session is left armed && focused with no capture and nothing pending.
+            //
+            // Before the dedup that sequence was self-correcting — step 3 simply built a capture and
+            // step 4 threw away the stale one, wasteful but live. Without this re-issue the only
+            // recovery is the watchdog's missing_tick escalation, i.e. the dedup would trade one
+            // redundant capture for up to ~3 s of DEAD MICROPHONE. That is a strictly worse bug than
+            // the one it fixes, so the suppressed request is re-issued by whoever invalidates the
+            // build it was suppressed behind.
+            let sess = self.0.lock().unwrap_or_else(|p| p.into_inner());
+            reissue = discard_needs_reissue(
+                capture_should_be_live(sess.armed, sess.focused),
+                sess.capture.is_some(),
+            );
+        }
+        if reissue {
+            tracing::info!(
+                target: "dictation",
+                "re-reconciling after a discarded build; the session still wants a capture",
+            );
+            self.reconcile_capture(app);
         }
         if retract {
             // The mic is back. Retract the notice we showed, or the frontend's sticky error state
@@ -2598,10 +2892,19 @@ impl DictationSession {
     /// make the NEXT fault on this capture skip straight to complaining — inverting "recover before
     /// you complain" exactly in the flapping-device case (USB unplug/replug, plug-in load/unload)
     /// where a rebind is the thing that fixes it.
+    /// AND THE FAILED-BUILD RETRY BUDGET, for the reason it is in this function rather than at the
+    /// call sites (roborev 60387). `build_failure_reissued` is only per-ATTEMPT because something
+    /// refunds it; written inline at each install site, every one of those lines was silently
+    /// deletable — the suite stayed green while the budget quietly became per-PROCESS, so the first
+    /// failed build in the app's lifetime would cost every later arm its re-issue and leave ~3 s of
+    /// dead mic on every hold, forever, with no log line saying why. Every caller of this function
+    /// is a live capture or a demonstrably voiced device, which is exactly when nothing can be
+    /// spinning — so the refund belongs to the same event, and the existing unit test sees it.
     fn clear_audio_fault(&mut self) {
         self.audio_reported = false;
         self.audio_reacquired = false;
         self.audio_missing_ticks = 0;
+        self.build_failure_reissued = false;
     }
 }
 
@@ -3262,15 +3565,7 @@ pub async fn start_dictation(app: AppHandle, state: State<'_, DictationState>) -
         StartAfterLoad::Arm => {}
     }
     sess.transcriber = Some(transcriber);
-    // Fresh cloud generation for this arm — new Arcs so start_cloud_stream's ptr_eq/epoch guards
-    // correctly invalidate any stream that raced a prior stop+start.
-    sess.cloud = Arc::new(Mutex::new(None));
-    sess.cloud_active = Arc::new(AtomicBool::new(false));
-    sess.cloud_epoch = Arc::new(AtomicU64::new(0));
-    // Fresh sender slot too — it mirrors `cloud`, so it must be reset with the generation (a stale
-    // sender from a prior arm must never survive into a new one).
-    sess.cloud_tx = Arc::new(Mutex::new(None));
-    sess.armed = true;
+    note_fresh_arm(&mut sess);
     // Release the session lock BEFORE reconcile_capture: it samples focus (is_focused) and builds
     // the capture (Capture::start), both of which block on the main thread. Holding the lock across
     // them from this async-runtime worker — while the main thread waits on the SAME lock in the
@@ -3472,6 +3767,9 @@ pub async fn start_cloud_stream(
     // resolved address) onto a blocking worker so a slow or black-holed network can't stall the UI —
     // the whole reason this command is async. `app` is consumed by the handshake and unused after it,
     // so it moves into the closure.
+    // Kept back from the move below so the "we DID connect" signal can still be emitted after the
+    // handshake — see the `dictation://cloud-late` emits in the parked/discard arms.
+    let app_for_events = app.clone();
     let started = match tauri::async_runtime::spawn_blocking(move || {
         DeepgramSession::start(app, base_url, token, project)
     })
@@ -3497,6 +3795,11 @@ pub async fn start_cloud_stream(
             //   - capture present & not already active: belt-and-suspenders for the same intent.
             let mut parked = false;
             let mut displaced: Option<crate::cloud::SilencedSession> = None;
+            // Hoisted out of the lock block because the `cloud-late` emit below needs it: a discard
+            // whose generation has ROTATED is an orphan of a session the user already left, and it
+            // must stay as silent to the banner as `silence_now()` makes it to the transcript.
+            // ONE decision, taken by `late_report_for`, so the two emit arms cannot drift.
+            let mut report = LateReport::Silent;
             let reject = {
                 let sess = state.0.lock().unwrap_or_else(|p| p.into_inner());
                 let same_generation = Arc::ptr_eq(&cloud_active, &sess.cloud_active);
@@ -3509,13 +3812,15 @@ pub async fn start_cloud_stream(
                 );
                 let slot_empty =
                     sess.cloud.lock().unwrap_or_else(|p| p.into_inner()).is_none();
-                match raced_stream_disposition(
+                let disposition = raced_stream_disposition(
                     install,
                     same_generation,
                     sess.armed, // a mute leaves the generation intact — see raced_stream_disposition
                     slot_empty,
                     already_active,
-                ) {
+                );
+                report = late_report_for(disposition, same_generation);
+                match disposition {
                     RacedStream::ParkWarm => {
                         // A stop/blur raced the handshake, but this generation is still live and
                         // its slot is empty. Park rather than burn the connection: the next
@@ -3552,8 +3857,14 @@ pub async fn start_cloud_stream(
                         "a stop raced the handshake; parking the stream in warm standby instead \
                          of discarding it"
                     );
-                    // Benign race, and the socket is BANKED — not a refusal, so it must not count
-                    // toward a fallback notice.
+                    // WE CONNECTED, and `Raced` alone cannot say so. `Raced` means "a benign race,
+                    // the socket is BANKED, do not meter and do not count it as a refusal" — it is
+                    // classified `ignore` on the frontend, which is right about billing and about
+                    // the corroboration counter, but it leaves the user with no account of why the
+                    // live preview did not appear. The handshake COMPLETED on this path by
+                    // construction, so the additive `cloud-late` event is what carries that fact;
+                    // see dictationEngineStore's `too-slow` reason.
+                    emit_late_report(&app_for_events, report);
                     Ok(CloudStreamOutcome::Raced)
                 }
                 // installed a live cloud socket → caller may start metering
@@ -3571,6 +3882,30 @@ pub async fn start_cloud_stream(
                     // (roborev 51712/52980/53024)
                     let s = s.silence_now();
                     tauri::async_runtime::spawn_blocking(move || s.finish());
+                    // Same as the parked arm: the handshake SUCCEEDED and we threw the socket away
+                    // for arriving late. Emitted after the silence/close hand-off so the frontend's
+                    // reason can never outlive the stream it describes.
+                    //
+                    // ── BUT THE GENERATION DECIDES WHICH EVENT (roborev 59692/60374) ────────────
+                    // Discard is also the arm a CROSS-GENERATION orphan lands in — a handshake from
+                    // a session the user already stopped, arriving 1-6 s late while a fresh
+                    // start_dictation has installed new Arcs. That successor may already be live and
+                    // painting interims, and the banner has no expiry short of its TTL, so an
+                    // ungated `cloud-late` lights "connected too late for that utterance" over a
+                    // stream that is working. It is the same speak-into-the-successor hazard
+                    // `silence_now()` exists for, aimed at the banner instead of the transcript.
+                    //
+                    // So `late_report_for` answers THREE ways and `emit_late_report` routes them: a
+                    // same-generation late connect emits `cloud-late`, an orphan emits
+                    // `cloud-orphan`, and neither emits nothing. An earlier version of this comment
+                    // said the orphan was "silenced here too" and that the frontend then "falls
+                    // through to `noteCloudOpenRefused`, whose corroboration is exactly right for a
+                    // signal we cannot attribute" — that is the defect, not the design. An orphan is
+                    // evidence about NEITHER session, so charging it to the successor's counter is
+                    // how two rapid re-holds painted "can't reach the cloud transcription service"
+                    // over a relay that had just completed two handshakes. It must reach neither the
+                    // banner nor the counter, which is what the dedicated event buys.
+                    emit_late_report(&app_for_events, report);
                     // not installed → caller must not bill; a race, not a refusal
                     Ok(CloudStreamOutcome::Raced)
                 }
@@ -3843,12 +4178,12 @@ mod tests {
     use super::{AppHandle, State, AudioHealth, FaultAction, fault_action, no_audio_message,
         fold_silence_evidence, install_retracts, reported_after_install, watchdog_report_message, ZeroSource,
         missing_tick, build_suppresses_watch, BUILD_STALL_GRACE, DictationSession, MISSING_CAPTURE_TICKS, watchdog_emission, WatchdogEmission,
-        begin_start_decision, capture_should_be_live, choose_engine, cloud_reuse, frame_on_device_speech, frame_speaking, dispatch_closed_segments, segment_cloud_latch, park_cloud_for_blur, plan_capture,
+        begin_start_decision, capture_should_be_live, choose_engine, cloud_reuse, frame_on_device_speech, frame_speaking, dispatch_closed_segments, segment_cloud_latch, park_cloud_for_blur, plan_capture, plan_capture_for, discard_needs_reissue, note_build_failed, note_fresh_arm,
         apply_decode_plan, plan_decode_emit, DecodeEmitPlan, DecodeEmitSink, DecodeOutcome,
         segment_fingerprint, should_emit_blur, should_install_cloud, should_keep_warm_on_stop, should_log_interim, INTERIM_LOG_EVERY, next_interim_index, reset_interim_log_sampling,
         should_resume_on_focus, should_standby_on_blur, start_after_load, stop_is_noop, unpark_cloud_for_focus, BeginStart, CapturePlan,
         CloudReuse, DeepgramSession, DictationState, Engine, Installed, ReconcileStep, StartAfterLoad,
-        raced_stream_disposition, RacedStream, park_raced_stream, install_live_stream, CloudAudioSender,
+        raced_stream_disposition, RacedStream, late_report_for, LateReport, park_raced_stream, install_live_stream, CloudAudioSender,
         CloudStreamOutcome,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -5483,12 +5818,22 @@ mod tests {
             audio_reported: true,
             audio_reacquired: true,
             audio_missing_ticks: 9,
+            // …and the failed-build retry budget, which lives here for the same "per-capture latch"
+            // reason (roborev 60387). Both install paths reach this function, so pinning it here is
+            // what stops the refund being a deletable line at each call site — without it the budget
+            // silently becomes per-PROCESS and every later arm loses its re-issue.
+            build_failure_reissued: true,
             ..Default::default()
         };
         sess.clear_audio_fault();
         assert!(!sess.audio_reported, "the user-visible notice must be retractable again");
         assert!(!sess.audio_reacquired, "the next fault must get its own recovery attempt");
         assert_eq!(sess.audio_missing_ticks, 0, "a stale count must not survive a recovery");
+        assert!(
+            !sess.build_failure_reissued,
+            "a capture that installed refunds the one-shot failed-build retry — otherwise one \
+             failure early in the process costs every later arm its re-issue"
+        );
     }
 
     #[test]
@@ -5724,6 +6069,253 @@ mod tests {
         assert_eq!(plan_capture(false, true), CapturePlan::Teardown, "shouldn't be live, still is → tear down");
         assert_eq!(plan_capture(true, true), CapturePlan::Idle, "already live → nothing");
         assert_eq!(plan_capture(false, false), CapturePlan::Idle, "already off → nothing");
+    }
+
+    #[test]
+    fn one_start_dictation_builds_exactly_one_capture() {
+        // ── THE REGRESSION THIS PINS ────────────────────────────────────────────────────────────
+        // `sess.capture` is only written by `install_capture`, which runs AFTER the off-lock
+        // `build_capture` (~78 ms of CoreAudio init). Two reconciles inside that window both saw
+        // `has_capture == false` and both planned Build, so one start produced two captures on the
+        // same device — measured 0.17 ms apart on every steady-state cycle in
+        // sparkle.log.2026-08-06, 202 `build_capture` against 180 `start_dictation` in a day.
+        //
+        // THE LOAD-BEARING ASSERTION is the third argument being `true`. Against main this case
+        // returns Build (main has no third argument at all — it cannot express "not yet, but
+        // coming"), and the second capture it authorises is the one thrown away by
+        // `install_capture` and mislabelled a "stop/blur race" 153 times.
+        assert_eq!(
+            plan_capture_for(true, false, true),
+            CapturePlan::Idle,
+            "a build already in flight must not authorise a SECOND one — this is the double-build"
+        );
+        // …and the same inputs WITHOUT a build in flight must still build, or the fix would have
+        // simply switched the microphone off. This is the pair that makes the assertion above mean
+        // "deduplicated" rather than "disabled".
+        assert_eq!(
+            plan_capture_for(true, false, false),
+            CapturePlan::Build,
+            "no capture and nothing being built → still build, exactly as before"
+        );
+
+        // A TEARDOWN MUST STILL FIRE while a build is in flight. Folding the marker into the
+        // `has_capture` term is what preserves this: a blur or stop landing mid-build has to be able
+        // to release the mic, and `plan_capture(false, true)` is the only edge that does it. Had the
+        // marker instead been used to suppress reconciling altogether, a stop during the build window
+        // would leave a capture nobody ever tore down — a strictly worse bug than the one being fixed.
+        assert_eq!(
+            plan_capture_for(false, false, true),
+            CapturePlan::Teardown,
+            // WORDED PRECISELY (roborev 59586): the teardown DECISION is preserved here; the actual
+            // release happens later, in install_capture's `still_current` discard. Claiming this
+            // line releases the mic would describe something the code does not do.
+            "a stop/blur during the build window must still plan a teardown"
+        );
+        assert_eq!(
+            plan_capture_for(false, true, true),
+            CapturePlan::Teardown,
+            "an installed capture plus one in flight still tears down"
+        );
+
+        // The remaining matrix is unchanged from `plan_capture`, which the test above pins.
+        assert_eq!(plan_capture_for(true, true, false), CapturePlan::Idle, "already live → nothing");
+        assert_eq!(plan_capture_for(false, false, false), CapturePlan::Idle, "already off → nothing");
+    }
+
+    #[test]
+    fn an_invalidated_build_re_issues_the_reconcile_it_was_suppressing() {
+        // ── THE DEAD-MICROPHONE WINDOW THE DEDUP WOULD OTHERWISE OPEN (roborev 59586/60351) ──────
+        // `plan_capture_for` counts an in-flight build as an existing capture, so a reconcile that
+        // arrives while one is running is DROPPED, not queued. Nothing re-runs it if that build is
+        // then invalidated — and there are two ways for that to happen (discarded on install after a
+        // ptr_eq mismatch, or an outright build failure). Left unhandled the session sits
+        // armed && focused with no capture and nothing pending, recovering only via the watchdog's
+        // missing_tick escalation ~3 s later: a strictly worse bug than the redundant capture the
+        // dedup removes.
+        assert!(
+            discard_needs_reissue(true, false),
+            "still wants a capture and has none — re-issue, or the mic stays dead until the watchdog"
+        );
+
+        // The two that must NOT re-issue. Without this pair the assertion above is satisfied by a
+        // call site that re-issues unconditionally — which would rebuild the mic straight after the
+        // stop that asked for it to go away, and would spin against a competing build.
+        assert!(
+            !discard_needs_reissue(false, false),
+            "a stop/blur legitimately wants no capture; re-issuing would fight the user"
+        );
+        assert!(
+            !discard_needs_reissue(true, true),
+            "a competing build already installed one — re-issuing would start the double-build again"
+        );
+        assert!(!discard_needs_reissue(false, true));
+    }
+
+    #[test]
+    fn a_fresh_arm_starts_a_new_generation_and_a_refunded_retry_budget() {
+        // The OTHER refund, and the reason it is a function (roborev 60387). Inline in
+        // `start_dictation` — which needs an AppHandle and a 482 MB model, so it is not driveable
+        // here — the line was invisible to the suite: delete it and the budget becomes per-PROCESS,
+        // so one failed build early in the app's life costs EVERY later arm its re-issue and leaves
+        // ~3 s of dead mic on every hold, with nothing in the log to say why.
+        let mut sess = DictationSession {
+            armed: false,
+            build_failure_reissued: true,
+            ..Default::default()
+        };
+        let old_cloud = sess.cloud.clone();
+        let old_tx = sess.cloud_tx.clone();
+
+        note_fresh_arm(&mut sess);
+
+        assert!(sess.armed, "the arm is what this transition is");
+        assert!(
+            !sess.build_failure_reissued,
+            "a NEW attempt must not inherit a budget the previous one spent"
+        );
+        // The generation really rotated: `start_cloud_stream`'s ptr_eq/epoch guards key off these
+        // identities, so reusing an Arc would let a stream that raced the prior stop install itself
+        // against this arm.
+        assert!(!Arc::ptr_eq(&old_cloud, &sess.cloud), "a fresh arm gets a fresh cloud generation");
+        assert!(!Arc::ptr_eq(&old_tx, &sess.cloud_tx), "the sender slot mirrors it, or a stale sender survives");
+        assert_eq!(sess.cloud_epoch.load(Ordering::SeqCst), 0, "the epoch restarts with the generation");
+        assert!(!sess.cloud_active.load(Ordering::Relaxed), "nothing is routing yet on a fresh arm");
+    }
+
+    #[test]
+    fn a_failed_build_re_issues_once_and_then_leaves_it_to_the_watchdog() {
+        // ── THE BOUND, ON A REAL SESSION (roborev 60384) ────────────────────────────────────────
+        // The truth table above cannot see this: `discard_needs_reissue` is a two-term boolean that
+        // is true for as long as the session wants a capture, and the FAILED-build call site clears
+        // `build_started_at` BEFORE asking it. So the re-issued reconcile plans a fresh Build every
+        // lap, and a device that fails for its own reasons (no input device, revoked TCC grant,
+        // held elsewhere) recursed reconcile → build → Err → reconcile until the stack ran out,
+        // emitting a `dictation://error` per lap. `note_build_failed` owns the whole decision so the
+        // clear, the want-a-capture test and the one-shot budget are pinned together here.
+        let state = DictationState::default();
+        {
+            let mut sess = state.0.lock().unwrap();
+            sess.armed = true;
+            sess.focused = true;
+            sess.build_started_at = Some(std::time::Instant::now());
+            assert!(
+                note_build_failed(&mut sess),
+                "a failure while the session still wants a capture re-issues — this is the stale-T1 \
+                 case, where the retry usually succeeds because the failure belonged to the attempt \
+                 the stop superseded"
+            );
+            assert!(
+                sess.build_started_at.is_none(),
+                "the in-flight marker must be cleared, or the watchdog keeps believing a build is \
+                 running and never escalates"
+            );
+
+            // THE ASSERTION THAT GOES RED IF THE BOUND IS REMOVED. A second consecutive failure —
+            // same session, nothing installed in between — is the persistently-failing device, and
+            // it must fall through to the watchdog rather than recurse.
+            sess.build_started_at = Some(std::time::Instant::now());
+            assert!(
+                !note_build_failed(&mut sess),
+                "the one-shot budget is spent: a second consecutive failure must NOT re-issue"
+            );
+            assert!(sess.build_started_at.is_none(), "the marker is still cleared on the bounded lap");
+        }
+
+        // A capture that installs refunds the budget, so the NEXT stale-attempt failure still gets
+        // its retry — driven through the REAL refunder rather than by writing the field, which is
+        // what makes this an assertion about the wiring (roborev 60387). `install_capture` and
+        // `reconcile_locked` both reach `clear_audio_fault` on their install path; neither is
+        // driveable here (a real Capture / AppHandle / 482 MB model), so this is the closest seam to
+        // the call sites that a test can hold.
+        {
+            let mut sess = state.0.lock().unwrap();
+            sess.clear_audio_fault();
+            sess.build_started_at = Some(std::time::Instant::now());
+            assert!(note_build_failed(&mut sess), "a refunded budget re-issues again");
+        }
+
+        // A stop/blur wants no capture: no re-issue, AND the budget is not consumed by the refusal —
+        // otherwise a blur landing on a failed build would silently eat the next arm's one retry.
+        let stopped = DictationState::default();
+        {
+            let mut sess = stopped.0.lock().unwrap();
+            sess.armed = false;
+            sess.focused = true;
+            sess.build_started_at = Some(std::time::Instant::now());
+            assert!(!note_build_failed(&mut sess), "nothing wants a capture → nothing to re-issue");
+            assert!(
+                !sess.build_failure_reissued,
+                "declining because the session wants no capture must not spend the retry budget"
+            );
+            assert!(sess.build_started_at.is_none(), "the marker is cleared on every failure path");
+        }
+    }
+
+    #[test]
+    fn take_reconcile_step_honours_the_in_flight_build_marker() {
+        // ── PINS THE CALL SITE, NOT JUST THE PREDICATE (roborev 59586) ──────────────────────────
+        // The previous tests exercised `plan_capture_for` in isolation, so reverting BOTH call sites
+        // — i.e. deleting the whole fix — left them green. The justification for that ("the Build arm
+        // cannot be driven in CI") holds only for the BUILD arm; it is not true of the new argument
+        // in general. With `armed = false` and the marker set, `plan_capture_for` returns Teardown
+        // where `plan_capture` returned Idle, and that difference is observable on a real
+        // DictationState with no audio device and no 482 MB model.
+        let state = DictationState::default();
+        {
+            let mut sess = state.0.lock().unwrap();
+            sess.armed = false;
+            sess.build_started_at = Some(std::time::Instant::now());
+        }
+        let g = state.1.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            matches!(state.take_reconcile_step(false, g), ReconcileStep::Teardown { .. }),
+            "an in-flight build must be visible to the reconcile decision at the CALL SITE — this \
+             is the assertion that goes red if plan_capture_for is reverted to plan_capture"
+        );
+
+        // The converse: no marker, same inputs → Idle. Without this pair the assertion above could
+        // be satisfied by a call site that always tears down.
+        let clean = DictationState::default();
+        {
+            let mut sess = clean.0.lock().unwrap();
+            sess.armed = false;
+            sess.build_started_at = None;
+        }
+        let g = clean.1.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            matches!(clean.take_reconcile_step(false, g), ReconcileStep::Idle),
+            "nothing installed and nothing in flight → nothing to do"
+        );
+
+        // `reconcile_locked` (the focus-edge twin) needs an AppHandle, so it cannot be driven here
+        // and stays unpinned by construction. Its call site is kept honest by the shared helper.
+    }
+
+    #[test]
+    fn a_hung_build_stops_suppressing_rebuilds_once_it_is_past_its_grace() {
+        // The dedup above is only safe because the in-flight marker EXPIRES. `build_started_at` is
+        // cleared on every path a build normally leaves by (install, discard, and the error arm in
+        // `reconcile_capture`), so only a HUNG build can leave it standing — and a marker believed
+        // forever would refuse to ever rebuild, which is exactly the nine-minute silent failure
+        // roborev 55300 documents. This asserts the dedup rides that same bound rather than a second
+        // one that could drift away from it.
+        assert!(
+            !build_suppresses_watch(Some(BUILD_STALL_GRACE)),
+            "a build stuck past its grace must stop counting as in-flight, or the mic never rebuilds"
+        );
+        assert_eq!(
+            plan_capture_for(true, false, build_suppresses_watch(Some(BUILD_STALL_GRACE))),
+            CapturePlan::Build,
+            "past the grace the reconcile must be free to build again"
+        );
+        assert!(
+            build_suppresses_watch(Some(std::time::Duration::from_millis(78))),
+            "a normal ~78ms build IS in flight — this is the window the double-build lived in"
+        );
+        assert!(
+            !build_suppresses_watch(None),
+            "no build recorded → nothing in flight"
+        );
     }
 
     #[test]
@@ -6071,6 +6663,48 @@ mod tests {
             RacedStream::Discard,
             "never shadow a session that is actively routing"
         );
+    }
+
+    #[test]
+    fn an_orphan_of_a_rotated_generation_is_reported_as_no_evidence_not_as_nothing() {
+        // ── THE BANNER'S OWN SPEAK-INTO-THE-SUCCESSOR HAZARD (roborev 59692) ────────────────────
+        // Every arm above that reaches Discard emits `dictation://cloud-late`, which paints
+        // "connected too late for THAT utterance". Two of those Discards are the current session's
+        // own (a mute, an occupied slot) and reporting them is the whole point. The third —
+        // `same_generation: false` — is an orphan of a session the user already stopped, landing
+        // 1-6 s late (measured) while a fresh start_dictation may already be live and painting
+        // interims. The banner has no expiry short of its TTL, so reporting that one states a
+        // timing fault about a stream that is working. Same hazard `silence_now()` covers for the
+        // transcript, aimed at the banner.
+        // ORPHAN, NOT SILENT, and the difference is the whole finding (roborev 60365). Saying
+        // nothing is indistinguishable from a handshake that never completed, so the orphan's
+        // Ok(false) still fell through to the corroboration counter — which is GLOBAL, so it was
+        // charged to the SUCCESSOR episode. Two rapid re-holds (the ordinary push-to-talk pattern)
+        // then reached the threshold and claimed Sparkle "can't reach the cloud transcription
+        // service" over a relay that had just completed two handshakes: a STRONGER false claim than
+        // the banner this gate was added to prevent. It has to be silent on both axes, and only a
+        // signal the frontend can recognise makes that possible.
+        assert_eq!(
+            late_report_for(RacedStream::Discard, false),
+            LateReport::Orphan,
+            "a rotated-generation orphan must be reported as no-evidence, never as nothing at all"
+        );
+
+        // The pair that keeps the assertion above meaning "discriminated" rather than "muted": the
+        // cases this event EXISTS for still report, or the too-slow reason is unreachable again.
+        assert_eq!(
+            late_report_for(RacedStream::Discard, true),
+            LateReport::Late,
+            "this generation's own late handshake is exactly what the banner must report"
+        );
+        assert_eq!(
+            late_report_for(RacedStream::ParkWarm, true),
+            LateReport::Late,
+            "parked-for-reuse still means WE CONNECTED and did not install — Ok(false) cannot say so"
+        );
+        // Nothing went wrong on the install path: the caller answers Ok(true) and the frontend
+        // calls noteCloudLive, so a report here would light a banner over a live stream.
+        assert_eq!(late_report_for(RacedStream::InstallLive, true), LateReport::Silent);
     }
 
     #[test]

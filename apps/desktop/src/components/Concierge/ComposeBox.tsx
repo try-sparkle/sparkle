@@ -99,6 +99,7 @@ import { FiAlertTriangle, FiUpload, FiX } from "react-icons/fi";
 // FONT_WEIGHT / ON_GOLD_FILL went with the Send button when it moved into ./SendRail (the gold
 // rect's styling travelled verbatim, so SendRail imports them itself), and COMPOSE_SCRIM went with
 // the scrim when `.cmp` became a box on `--k-input` — see the long note on the root's `background`.
+import { appendDictatedForClipboard } from "../../voice/dictationClipboard";
 import { C } from "../../theme/colors";
 import { BLUEPRINT } from "../../theme/blueprintSpec";
 import { useResolvedTheme } from "../../theme/theme";
@@ -543,12 +544,17 @@ export function AttachControl({
 }
 
 /** Where a committed dictation segment goes in the box: appended, space-separated, never
- *  double-spaced. Pure so the commit rule is testable without a mic. */
+ *  double-spaced. Pure so the commit rule is testable without a mic.
+ *
+ *  ONE IMPLEMENTATION, DELEGATED — not a copy (roborev 59596). The clipboard mirror has to produce
+ *  exactly what this box would have held, and it was re-implementing the rule byte-for-byte with a
+ *  comment claiming a cross-checking test that did not exist. Two identical bodies and no guard is
+ *  the shape that drifts silently: normalize interior whitespace here, or join multi-sentence
+ *  segments with a newline, and the mirror keeps the old rule while every suite stays green.
+ *  Delegating makes the drift unrepresentable, and the direction is deliberate — the React-free
+ *  module owns the rule so nothing has to import a component to reuse it. */
 export function appendDictated(current: string, segment: string): string {
-  const chunk = segment.trim();
-  if (!chunk) return current;
-  if (!current) return chunk;
-  return current.endsWith(" ") ? `${current}${chunk}` : `${current} ${chunk}`;
+  return appendDictatedForClipboard(current, segment);
 }
 
 export function ComposeBox({

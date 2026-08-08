@@ -2,8 +2,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   classifyCloudOutcome,
   FALLBACK_NOTICE_TTL_MS,
+  noteCloudLate,
+  noteCloudLateAttemptStart,
   OPEN_REFUSALS_BEFORE_WARNING,
   outcomeInstalledStream,
+  sawCloudLateThisAttempt,
   shouldWarnLocalEngine,
   useDictationEngineStore,
   type CloudStreamOutcome,
@@ -297,6 +300,207 @@ describe("dictationEngineStore", () => {
     read().noteCloudUnavailable("unavailable");
 
     expect(shouldWarnLocalEngine(read())).toBe(true);
+  });
+});
+
+describe("a relay that CONNECTED is never reported as unreachable", () => {
+  // THE LOAD-BEARING CASE — the founder's, measured on 2026-08-06. The relay opened 171 times and
+  // was discarded 136 of those for landing after the utterance ended (0.96 s after stop_dictation in
+  // one cycle, ~6 s in another) while his network was healthy: ping 1.1.1.1 0% loss / 20 ms,
+  // api.deepgram.com connect 260 ms. Reporting that as "can't reach the cloud transcription service"
+  // is a claim the completed handshake disproves outright.
+  //
+  // These assert `noteCloudConnectedLate`, NOT a pure classifier. There was one — and it took
+  // `{exhausted, streamOpened}` as arguments, so its tests could only ever prove that a hardcoded
+  // fact maps to a reason. Both production call sites passed the same literal, and going through it
+  // is what let them escape the two invariants below (roborev 60355). The decision now lives with
+  // the state it depends on, which is what makes these assertions about behaviour.
+
+  it("calls a late-but-successful connection 'too-slow', not 'unavailable'", () => {
+    read().noteCloudConnectedLate(true);
+    expect(read().fallbackReason).toBe("too-slow");
+    expect(shouldWarnLocalEngine(read())).toBe(true);
+  });
+
+  it("does NOT downgrade a standing out-of-credits — reachability says nothing about credits", () => {
+    // Exhaustion is signalled mid-stream, so a zero-balance user's NEXT attempt still completes its
+    // handshake; if that one lands late, the naive write replaced "You're out of Sparkle credits…
+    // Refill" with copy naming no remedy they can act on — and re-nagged, because the reason
+    // changed. This is the same precedence noteCloudOpenRefused already keeps.
+    read().noteCloudUnavailable("exhausted");
+    read().dismiss();
+    read().noteCloudConnectedLate(true);
+    expect(read().fallbackReason).toBe("exhausted");
+    // …and the wave-away survives, because from the user's side nothing new was said.
+    expect(read().dismissed).toBe(true);
+  });
+
+  it("does not renew the stamp of a reason it merely PRESERVED", () => {
+    // Preserving is not observing: this seam saw a handshake, never a balance. Renewing here would
+    // let a stale `exhausted` be pushed out indefinitely and never expire on its own TTL — the same
+    // rule the refusal path states in the same words.
+    vi.useFakeTimers();
+    read().noteCloudUnavailable("exhausted");
+    const stamped = read().observedAt!;
+    vi.advanceTimersByTime(60_000);
+    read().noteCloudConnectedLate(true);
+    expect(read().observedAt).toBe(stamped);
+    // The pair that stops this passing for a store that never stamps anything: an UNPRESERVED late
+    // connect does take a fresh stamp, which is what keeps a real too-slow episode alive.
+    read().noteCloudLive();
+    read().noteCloudConnectedLate(true);
+    expect(read().observedAt).toBeGreaterThan(stamped);
+  });
+
+  it("ZEROES the corroboration counter — a completed handshake is evidence of a live cloud", () => {
+    // The sequence this exists to stop: refuse (1) → connect late → refuse (would be 2, the
+    // threshold) → the banner claims Sparkle "can't reach the cloud transcription service" over a
+    // relay that provably connected one utterance earlier, silently downgrading the honest reason.
+    // That is the flap the counter exists to remove, straddling a proven-live connection.
+    read().noteCloudOpenRefused();
+    expect(read().openRefusals).toBe(1);
+    read().noteCloudConnectedLate(true);
+    expect(read().openRefusals).toBe(0);
+    read().noteCloudOpenRefused();
+    expect(read().openRefusals).toBe(1);
+    expect(read().fallbackReason).toBe("too-slow"); // NOT downgraded to "unavailable"
+  });
+
+  it("takes the EVIDENCE but not the CLAIM in a window that is not dictating", () => {
+    // `dictation://cloud-late` is an `app.emit`, so every open window runs the listener and every
+    // project window paints its own banner (roborev 60368). "Connected too late for that utterance"
+    // is about ONE window's utterance; painting it in three describes an utterance two of them had
+    // no part in — and they cannot take it down, because every clearing path needs `isCapturable()`,
+    // so it stands for the full notice TTL. What the handshake proves about the RELAY is app-wide.
+    read().noteCloudOpenRefused();
+    read().noteCloudConnectedLate(false);
+    expect(read().fallbackReason).toBeNull(); // the claim stayed in the window that owns it…
+    expect(read().openRefusals).toBe(0); // …and the evidence still landed everywhere
+  });
+
+  it("RETRACTS a standing 'unavailable' in that same non-dictating window", () => {
+    // The half the assertion above cannot reach (roborev 60376): with one refusal charged,
+    // `fallbackReason` is already null, so `toBeNull()` holds vacuously and a branch that zeroes the
+    // counter while leaving the banner up passes it. Raise the banner first. A window that has been
+    // shown the relay IS reachable must not go on claiming it is unreachable — and it is the one
+    // window that can never take that back itself, since `noteCloudLive` and the interim-driven
+    // clear both require it to be the capturable one. It would stand for the full TTL.
+    read().noteCloudOpenRefused();
+    read().noteCloudOpenRefused();
+    expect(read().fallbackReason).toBe("unavailable");
+    expect(shouldWarnLocalEngine(read())).toBe(true);
+
+    read().noteCloudConnectedLate(false);
+    expect(read().fallbackReason).toBeNull();
+    expect(read().observedAt).toBeNull();
+    expect(read().openRefusals).toBe(0);
+    expect(shouldWarnLocalEngine(read())).toBe(false);
+  });
+
+  // EVERY STATED REASON, NOT JUST `exhausted` (roborev 60394). The preservation rule was widened to
+  // match `noteCloudOpenRefused` when 401/403 started arriving stated as `signed_out`/`not_entitled`
+  // — but only `exhausted` was tested, so reverting the predicate to `stated === "exhausted"` left
+  // the suite green while a late handshake overwrote "Sign in again" / "Unlock Sparkle" with copy
+  // naming no remedy that works.
+  it.each(["exhausted", "signed_out", "not_entitled"] as const)(
+    "preserves a stated '%s' on both the CLAIM and the EVIDENCE lap",
+    (reason) => {
+      vi.useFakeTimers();
+      read().noteCloudUnavailable(reason);
+      const stamped = read().observedAt;
+      vi.advanceTimersByTime(60_000);
+
+      // speaks: false — the evidence-only lap must not retract it…
+      read().noteCloudConnectedLate(false);
+      expect(read().fallbackReason).toBe(reason);
+      expect(read().observedAt).toBe(stamped);
+      expect(read().openRefusals).toBe(0);
+
+      // …and speaks: true must not DOWNGRADE it to "too-slow", nor renew a stamp it merely kept.
+      read().noteCloudConnectedLate(true);
+      expect(read().fallbackReason).toBe(reason);
+      expect(read().observedAt).toBe(stamped);
+    },
+  );
+
+  it("retracts ONLY 'unavailable' — a genuine too-slow of its own still stands", () => {
+    // The counter-case that stops the table above from being satisfied by "never write anything":
+    // an UNPRESERVED late connect does take the claim, and a following evidence-only lap leaves it.
+    read().noteCloudLive();
+    read().noteCloudConnectedLate(true); // raise a genuine too-slow…
+    expect(read().fallbackReason).toBe("too-slow");
+    read().noteCloudConnectedLate(false); // …and an evidence-only lap must leave it alone
+    expect(read().fallbackReason).toBe("too-slow");
+  });
+
+  it("re-arms a dismissal when the reason changes from unavailable to too-slow", () => {
+    // The store's existing rule across the NEW boundary: these are different things to tell the
+    // user, so learning it was a timing fault must be able to speak even after the (wrong)
+    // connectivity claim was waved away.
+    read().noteCloudUnavailable("unavailable");
+    read().dismiss();
+    expect(shouldWarnLocalEngine(read())).toBe(false);
+    read().noteCloudConnectedLate(true);
+    expect(read().fallbackReason).toBe("too-slow");
+    expect(shouldWarnLocalEngine(read())).toBe(true);
+  });
+});
+
+describe("the corroboration count keeps climbing while the episode is live", () => {
+  it("does not freeze at the threshold once the banner is up", () => {
+    // The store's own comment says the count keeps climbing and explains why; the returned patch
+    // omitted the key, so it froze at `OPEN_REFUSALS_BEFORE_WARNING - 1` instead. Invisible in the
+    // UI — the banner is decided by `fallbackReason` — but it makes "does the count still support
+    // this banner?" unanswerable — and one guard (the since-deleted orphan withdrawal) was written
+    // against it before that was noticed.
+    for (let i = 0; i < OPEN_REFUSALS_BEFORE_WARNING + 2; i += 1) read().noteCloudOpenRefused();
+    expect(read().openRefusals).toBe(OPEN_REFUSALS_BEFORE_WARNING + 2);
+    expect(read().fallbackReason).toBe("unavailable");
+  });
+
+  it("still zeroes on every documented end of an episode", () => {
+    // The counterpart, so the change above cannot be read as "the count never comes down".
+    for (let i = 0; i < OPEN_REFUSALS_BEFORE_WARNING + 1; i += 1) read().noteCloudOpenRefused();
+    read().noteCloudLive();
+    expect(read().openRefusals).toBe(0);
+
+    for (let i = 0; i < OPEN_REFUSALS_BEFORE_WARNING + 1; i += 1) read().noteCloudOpenRefused();
+    read().noteCloudUnavailable("exhausted");
+    expect(read().openRefusals).toBe(0);
+  });
+});
+
+describe("the cloud-late latch survives either race order", () => {
+  // The event and start_cloud_stream's response race, and Tauri does not order them. A first
+  // version of this wiring set the store from the event only -- so when the invoke resolved SECOND
+  // it overwrote the true reason with the false one it exists to replace. Both orders are pinned
+  // here because only one of them was broken, and the working one hid it.
+
+  // WHAT THESE DO NOT PROVE, stated so nobody reads them as coverage of the wiring: they pin the
+  // latch, which is a carrier. The three-way branch that READS it lives in `startCloudStream` and is
+  // pinned in `useDictation.engine.test.tsx`, driving the real closure in both race orders — an
+  // earlier version of this file composed the latch with a classifier by hand, which stayed green
+  // when the call site was reverted.
+
+  it("holds the fact when the event wins the race", () => {
+    noteCloudLateAttemptStart();
+    noteCloudLate(); // the event landed before the invoke resolved
+    expect(sawCloudLateThisAttempt()).toBe(true);
+  });
+
+  it("reads false when no cloud-late arrived at all", () => {
+    noteCloudLateAttemptStart();
+    // Nothing connected — the genuine-outage path must reach the corroborating counter, not this.
+    expect(sawCloudLateThisAttempt()).toBe(false);
+  });
+
+  it("does not carry a latch across attempts", () => {
+    noteCloudLateAttemptStart();
+    noteCloudLate(); // utterance 1 connected late
+    noteCloudLateAttemptStart(); // utterance 2 begins
+    // A stale latch here would report a REAL outage as a timing fault -- the same false banner
+    // pointing the other way, which is why the clear happens before every invoke.
+    expect(sawCloudLateThisAttempt()).toBe(false);
   });
 });
 

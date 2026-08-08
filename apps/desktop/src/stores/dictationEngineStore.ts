@@ -75,6 +75,24 @@ export type DictationFallbackReason =
   | "unavailable"
   /** The relay signalled out-of-credits — the one reason the user can actually act on. */
   | "exhausted"
+  /**
+   * The relay CONNECTED, but not until after the utterance was already over, so the stream was
+   * discarded and the words were decoded on-device.
+   *
+   * ── WHY THIS IS NOT `unavailable` ───────────────────────────────────────────────────────────
+   * It was being reported as `unavailable`, and that copy says Sparkle "can't reach the cloud
+   * transcription service" — a claim the log disproves. Measured on 2026-08-06: the relay opened
+   * 171 times and closed 170, 136 of them discarded as "opened during a stop/again race"; the
+   * founder's network was healthy at the moment the banner fired (ping 1.1.1.1 0% loss / 20 ms,
+   * api.deepgram.com connect 260 ms). The handshake simply lands after a short utterance ends —
+   * measured 0.96 s after `stop_dictation` in one cycle and ~6 s in another.
+   *
+   * A banner that blames the network for a timing bug is worse than no banner: it sent both the
+   * founder AND an investigating agent hunting a connectivity fault that did not exist. The
+   * founder's own words: *"if that is truly what's happening, then it should be doing something
+   * other than what it's doing so that I'm not confused as a user."*
+   */
+  | "too-slow"
   /** No usable Sparkle session on this machine (no bearer, or the relay rejected it with 401).
    *  Actionable: sign in again. */
   | "signed_out"
@@ -221,7 +239,6 @@ export function outcomeInstalledStream(outcome: CloudStreamOutcome): boolean {
   }
 }
 
-
 export interface DictationEngineState {
   /** Set once a cloud attempt has been REFUSED or a live stream has ended, meaning dictation is now
    *  running on-device. `null` means "no problem known" — the resting state, and deliberately NOT
@@ -245,6 +262,11 @@ export interface DictationEngineState {
    *  claim as `noteCloudUnavailable`. The only remaining ambiguous outcome, so the only one that
    *  needs corroboration before it speaks; see `OPEN_REFUSALS_BEFORE_WARNING`. */
   noteCloudOpenRefused: () => void;
+  /** The relay CONNECTED and was then discarded for landing after the utterance ended — Rust's
+   *  `dictation://cloud-late`. Owns the two invariants both call sites kept getting wrong; see the
+   *  implementation. `speaks` splits the user-facing CLAIM from the relay EVIDENCE: pass
+   *  `isCapturable()` from a broadcast listener, `true` from the window that made the attempt. */
+  noteCloudConnectedLate: (speaks: boolean) => void;
   /** THE ONE ENTRY POINT for a `start_cloud_stream` result. Routes the outcome through
    *  `classifyCloudOutcome` so the open seam no longer has to guess what a bare `false` meant. */
   noteCloudOutcome: (outcome: CloudStreamOutcome) => void;
@@ -431,6 +453,16 @@ export const useDictationEngineStore = create<DictationEngineState>()(
           // for deleting the sink's `openRefusals: 0` and reopening the `cloud-ended` →
           // one-blip-crosses-threshold path. Three resetters; keep this list and the `openRefusals`
           // field doc in step.
+          //
+          // AND IT ONLY CLIMBS IF THIS BRANCH WRITES IT. The paragraph above described the intent;
+          // the returned patch simply omitted the key, so the count froze at
+          // `OPEN_REFUSALS_BEFORE_WARNING - 1` for the whole episode — the one number in this store
+          // whose documented behaviour and actual behaviour disagreed. Nothing user-visible depended
+          // on it (the banner is decided by `fallbackReason`), which is why it survived; but it makes
+          // "is the count still high enough to support this banner?" unanswerable, and any guard
+          // written against the threshold silently dead — and one such guard (the orphan
+          // withdrawal) was written against it before it was noticed.
+          openRefusals,
           fallbackReason: reason,
           // PRESERVING A REASON IS NOT OBSERVING IT (roborev 59968). This seam saw an ambiguous
           // `false` and nothing more — it has no evidence of out-of-credits — so renewing the stamp
@@ -442,6 +474,77 @@ export const useDictationEngineStore = create<DictationEngineState>()(
           // on its own TTL, after which this seam reports `unavailable` honestly.
           observedAt: preserved ? s.observedAt : Date.now(),
           dismissed: s.fallbackReason === reason ? s.dismissed : false,
+        };
+      }),
+    // ── THE UNAMBIGUOUS LATE CONNECT ────────────────────────────────────────────────────────────
+    // Rust proved the relay was reachable (the handshake COMPLETED) and then threw the socket away
+    // for landing after the utterance. Unlike `noteCloudOpenRefused` this needs no corroboration —
+    // it is evidence, not a bare `false`. But writing `noteCloudUnavailable("too-slow")` from the
+    // two call sites, which is what they used to do, escaped BOTH of this store's invariants
+    // (roborev 60355). Hence one action that owns them:
+    //
+    //   1. IT MUST NOT DOWNGRADE A RELAY-STATED REASON. Exhaustion is signalled mid-stream, so a
+    //      zero-balance user's next attempt still completes its handshake — and if that one lands
+    //      late, the naive write replaced "You're out of Sparkle credits… Refill" with "connected
+    //      too late… Longer utterances usually get the live preview", which names no remedy they can
+    //      act on, and re-nagged (the reason CHANGED, so `dismissed` cleared). Reachability says
+    //      nothing about credits. Same precedence `noteCloudOpenRefused` keeps, in the same WIDENED
+    //      form it settled on (roborev 60356): `exhausted` was once the only reason the relay could
+    //      state, and it is not any more — a 401 arrives as `signed_out` and a 403 as `not_entitled`,
+    //      both definitive and both carrying the only remedy that works ("Sign in", "Unlock
+    //      Sparkle"). A test written as `=== "exhausted"` silently overwrites those two the moment
+    //      a handshake lands late, which is the identical misdirection aimed at two new reasons.
+    //      The two NOT preserved are the two this seam outranks or owns: `unavailable`, which a
+    //      completed handshake disproves outright, and `too-slow` itself, whose re-report should
+    //      renew its own stamp.
+    //   2. IT MUST ZERO `openRefusals`. The counter's documented rule is that any EVIDENCE of a live
+    //      cloud clears it, and a completed handshake is exactly that — it is this action's whole
+    //      premise. Leaving it armed let refuse → late → refuse reach the threshold and then claim
+    //      Sparkle "can't reach the cloud transcription service" over a relay that provably
+    //      connected one utterance earlier, silently downgrading the honest reason. That is the flap
+    //      the corroboration counter exists to remove, straddling a proven-live connection.
+    //
+    // PRESERVING A REASON IS NOT OBSERVING IT: when `exhausted` is kept the stamp is NOT renewed, so
+    // a stale out-of-credits still expires on its own TTL rather than being pushed out forever by a
+    // seam that never saw a balance (the same rule, and the same wording, as the refusal path).
+    //
+    // AND `speaks` SPLITS THE CLAIM FROM THE EVIDENCE (roborev 60368). `dictation://cloud-late` is an
+    // `app.emit`, i.e. broadcast to EVERY window, and each project window mounts its own banner. What
+    // the handshake PROVES about the relay is app-wide and is applied unconditionally; the sentence
+    // "connected too late for that utterance" is about a specific window's utterance, and painting it
+    // in three windows describes an utterance two of them had no part in — which they then cannot
+    // take down, since every clearing path needs `isCapturable()`. That is the same over-report the
+    // `cloud-ended` listener already gates for, and the interim handler already splits this exact way.
+    noteCloudConnectedLate: (speaks) =>
+      set((s) => {
+        // Unconditional: a completed handshake is evidence about the RELAY, not about this window.
+        //
+        // AND THE EVIDENCE RETRACTS THE ONE CLAIM IT DISPROVES (roborev 60376). Zeroing the counter
+        // without touching the banner that counter raised left a false "Sparkle can't reach the
+        // cloud transcription service" standing in a window that has just been shown the relay IS
+        // reachable — and standing for the full TTL, because every clearing path (`noteCloudLive`,
+        // the interim-driven clear) needs that window to be the capturable one, which by definition
+        // it is not. That is the invariant this seam exists for ("a relay that CONNECTED is never
+        // reported as unreachable"), and the evidence-only branch was the one path still breaking
+        // it. Retract `unavailable` once the count can no longer support it (0 is the strongest
+        // form of that), and leave `exhausted` and `too-slow` standing, since those came from the relay SAYING something that a
+        // reachability proof does not contradict.
+        if (!speaks)
+          return s.fallbackReason === "unavailable"
+            ? { openRefusals: 0, fallbackReason: null, observedAt: null, dismissed: false }
+            : { openRefusals: 0 };
+        // Bound to a local first so the narrowing survives, for the same TypeScript reason
+        // `noteCloudOpenRefused` states: an aliased condition written against a property of the
+        // callback's argument does not narrow.
+        const stated = s.fallbackReason;
+        const preserved =
+          stated !== null && stated !== "unavailable" && stated !== "too-slow";
+        const reason: DictationFallbackReason = preserved ? stated : "too-slow";
+        return {
+          fallbackReason: reason,
+          observedAt: preserved ? s.observedAt : Date.now(),
+          dismissed: s.fallbackReason === reason ? s.dismissed : false,
+          openRefusals: 0,
         };
       }),
     dismiss: () => set({ dismissed: true }),
@@ -471,3 +574,70 @@ export function shouldWarnLocalEngine(
     state.fallbackReason !== null && !state.dismissed && !isStale(state, now)
   );
 }
+
+// `CloudEndedFacts` / `fallbackReasonForEnded` lived here and are GONE (roborev 60355). The
+// classifier had exactly two production callers and both passed the same literal
+// `{ exhausted: false, streamOpened: true }` — a constant `"too-slow"` dressed as a decision, whose
+// other two branches only ever ran in its own tests. Worse, going through it is what let those call
+// sites write the store directly and escape the `exhausted`-preservation and corroboration-counter
+// invariants above. `noteCloudConnectedLate` replaces it: the decision now lives where the state it
+// depends on lives, so it cannot be taken with a hardcoded fact again.
+
+// ── WHAT DID THIS ATTEMPT'S HANDSHAKE ACTUALLY DO? ──────────────────────────────────────────────
+// `start_cloud_stream` answers with a bool, and `false` covers THREE different things:
+//
+//   1. it never connected                        → an ambiguous refusal; corroborate (openRefusals)
+//   2. it connected, too late to install         → `dictation://cloud-late`  → too-slow, immediately
+//   3. it connected for a generation that has
+//      since rotated (an ORPHAN of a stopped
+//      session, landing 1-6 s late)              → `dictation://cloud-orphan` → NO EVIDENCE AT ALL
+//
+// The Rust side knows which; these latches carry that fact the few milliseconds from the event
+// listener to the invoke's continuation, which is where the store gets written.
+//
+// (3) IS NOT THE SAME AS SILENCE, and treating it as such is what roborev 60365 caught: the orphan's
+// `Ok(false)` fell through to the corroboration counter, which is GLOBAL, so it was charged to the
+// SUCCESSOR episode. Two rapid re-holds — the ordinary push-to-talk pattern, and precisely the one
+// that rotates generations — reached the threshold and claimed Sparkle "can't reach the cloud
+// transcription service" over a relay that had just completed two handshakes.
+//
+// SCOPED TO ONE ATTEMPT, which is the part that matters. A latch left set from a previous utterance
+// would report a genuine outage as a timing fault — the same false banner, aimed the other way — so
+// `noteCloudLateAttemptStart` clears both before every invoke and is the only thing that does.
+let cloudLateThisAttempt = false;
+
+/** Called before each `start_cloud_stream`, so the latches can only describe the attempt in flight. */
+export function noteCloudLateAttemptStart(): void {
+  cloudLateThisAttempt = false;
+}
+
+/** The relay connected but was not installed (raced the stop), for THIS generation. */
+export function noteCloudLate(): void {
+  cloudLateThisAttempt = true;
+}
+
+export function sawCloudLateThisAttempt(): boolean {
+  return cloudLateThisAttempt;
+}
+
+// ── WHY THERE IS NO ORPHAN MACHINERY HERE AT ALL ────────────────────────────────────────────────
+// There used to be two mechanisms: an orphan LATCH (`noteCloudOrphan` / `takeCloudOrphanThisAttempt`)
+// for the ordering where the event arrived before the invoke resolved, and a charged-refusal latch
+// plus a `withdrawOrphanedRefusal` action for the ordering where it arrived after. Both were
+// necessary while `start_cloud_stream` answered a bare bool, whose `Ok(false)` covered an orphan and
+// a genuine refusal alike.
+//
+// BOTH ARE DEAD IN THE OUTCOME WORLD, AND WORSE THAN DEAD (roborev 60408/60429). Both arms that
+// emit an orphan return `CloudStreamOutcome::Raced` (`dictation.rs`, the `None if parked` and
+// `Some(s)` arms), which classifies as `ignore` — a no-op. So for the attempt that PRODUCED the
+// orphan, neither mechanism changes anything: it charges nothing to withdraw, and it records
+// nothing to suppress. The only thing either could still reach was a DIFFERENT attempt's — a
+// withdrawal taking down a second window's genuinely earned banner, or a latch swallowing the one
+// outcome that is real evidence (`unreachable`), in the same window's next attempt or in another
+// window entirely, since the event is an `app.emit`. A mechanism that can only ever fire wrongly is
+// deleted, not gated: focus (`isCapturable()`) was tried as a stand-in for attempt ownership and is
+// not one.
+//
+// THE INVARIANT THIS RESTS ON, stated so a future change cannot quietly break it: an orphan's own
+// attempt resolves `Raced`. If a raced arm is ever made to answer something else, the frontend has
+// to learn about attempt identity — a payload on the event — rather than re-introducing a latch.

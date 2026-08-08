@@ -82,6 +82,15 @@ export const WARNING: Record<DictationFallbackReason, string> = {
     "Sparkle can't reach the cloud transcription service. Live dictation preview is off — dictation is running on the local engine. Your words are still captured; they appear when you finish speaking instead of word by word. It usually reconnects on its own, so try dictating again in a moment",
   exhausted:
     "You're out of Sparkle credits. Live dictation preview is off — dictation is running on the local engine. Your words are still captured; they appear when you finish speaking instead of word by word. Refill your credits to get the live preview back",
+  // DELIBERATELY SAYS NOTHING ABOUT CONNECTIVITY. This reason is only reached once a stream has
+  // actually opened, which proves the service was reachable — so any mention of the network here
+  // would be false, and it is precisely the false claim that sent the founder (and an investigating
+  // agent) hunting a connectivity fault that did not exist. It also does not offer a remedy,
+  // because there is nothing the user can do: the handshake being slower than a short utterance is
+  // ours to fix, not theirs. Saying "try again" would be the remedy-that-is-unsafe-under-its-own-
+  // trigger shape AGENTS.md warns about — the retry hits the same race.
+  "too-slow":
+    "Live dictation preview is off — the cloud transcription service connected too late for that utterance, so it was transcribed on the local engine. Your words are still captured; they appear when you finish speaking instead of word by word. Longer utterances usually get the live preview",
   // The two conditions that were previously invisible — both reported as a generic outage, sending
   // the user to debug a network that was never the problem.
   signed_out:

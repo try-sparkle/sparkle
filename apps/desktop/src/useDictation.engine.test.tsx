@@ -47,7 +47,11 @@ vi.mock("./services/aiGate", () => ({
 }));
 
 import { useDictationStore } from "./stores/dictationStore";
-import { useDictationEngineStore } from "./stores/dictationEngineStore";
+import {
+  noteCloudLate,
+  useDictationEngineStore,
+  type CloudStreamOutcome,
+} from "./stores/dictationEngineStore";
 import { useAmbientVoice } from "./useDictation";
 
 /** Yield a real MACROTASK, not a microtask. `createDictationController` awaits a `Promise.all` over
@@ -237,6 +241,261 @@ describe("the relay's own answer to start_cloud_stream drives the engine signal"
     // The overreach guard: a signal that fired on every open would light the banner permanently
     // while nothing was wrong, which is worse than not having it.
     expect(useDictationEngineStore.getState().fallbackReason).toBeNull();
+  });
+
+  // ── THE LATE-RELAY CASE, DRIVEN THROUGH THE REAL CLOSURE ──────────────────────────────────────
+  // `dictationEngineStore.test.ts` pins the latch and the classifier, but it composes them the way
+  // the production code is SUPPOSED to and never touches `startCloudStream` — so reverting that one
+  // `else if` line left all of it green (stated as a known gap when the wiring landed; roborev
+  // 59692). These two drive the actual closure, and they are the only assertions in the tree that go
+  // red if the call site stops reading the latch.
+  //
+  // BOTH ORDERINGS, because the event and the invoke's response race and Tauri orders neither. The
+  // first version of this wiring worked in exactly one of them and the working order hid the other.
+
+  /** Deliver `dictation://cloud-late` — Rust's "we DID connect, then discarded it for landing after
+   *  the utterance". Emitted only for the CURRENT generation (see `late_report_for`). */
+  const fireCloudLate = () => {
+    for (const cb of listeners["dictation://cloud-late"] ?? []) cb({ payload: undefined });
+  };
+
+  it("reports too-slow when the event lands BEFORE start_cloud_stream resolves", async () => {
+    // The open is held pending so the event provably wins the race, rather than the test hoping it
+    // does. This is the ordering where the store write comes from `startCloudStream` reading the
+    // latch — delete the `else if` and this goes to `null` + one refusal.
+    let release!: (outcome: CloudStreamOutcome) => void;
+    invoke.mockImplementation((cmd: string) =>
+      cmd === "start_cloud_stream"
+        ? new Promise<CloudStreamOutcome>((r) => {
+            release = r;
+          })
+        : Promise.resolve(undefined),
+    );
+    await mountVoice();
+    await act(async () => {
+      useDictationStore.setState({ phase: "active" });
+    });
+    await flush();
+    expect(invoke).toHaveBeenCalledWith("start_cloud_stream", expect.anything());
+
+    fireCloudLate(); // the relay connected — the socket just arrived too late to be installed
+    await act(async () => {
+      // BOTH raced arms answer `raced`, which classifies as `ignore`: right about billing and about
+      // the counter, and silent about why the preview never appeared. The event carries that.
+      release("raced");
+    });
+    await flush();
+
+    expect(useDictationEngineStore.getState().fallbackReason).toBe("too-slow");
+    // AND IT DID NOT SPEND A CORROBORATION ROUND. `noteCloudOpenRefused` exists for the ambiguous
+    // `false` (AlreadyRouting); a proven late handshake is not ambiguous, so routing it through the
+    // counter would delay the honest copy by an utterance and let a stale count speak later.
+    expect(useDictationEngineStore.getState().openRefusals).toBe(0);
+  });
+
+  it("corrects to too-slow when the event lands AFTER the invoke already resolved", async () => {
+    invoke.mockImplementation((cmd: string) =>
+      cmd === "start_cloud_stream" ? Promise.resolve("raced") : Promise.resolve(undefined),
+    );
+    await mountVoice();
+    await goActive();
+    // `raced` is classified `ignore`, so the invoke half said NOTHING — no banner and no charge.
+    // Asserting that here is what makes the correction below meaningful rather than a re-assertion
+    // of something already true.
+    expect(useDictationEngineStore.getState().fallbackReason).toBeNull();
+    expect(useDictationEngineStore.getState().openRefusals).toBe(0);
+
+    fireCloudLate();
+    await flush();
+
+    expect(useDictationEngineStore.getState().fallbackReason).toBe("too-slow");
+  });
+
+  it("a LIVE outcome still retires the banner even when a late latch is set", async () => {
+    // THE ONLY ASSERTION IN THE TREE THAT REDS IF THE CONTINUATION IS REORDERED BACK TO LATCH-FIRST
+    // (roborev 60394, kept by 60441). The successor of a parked stream typically answers `resumed`,
+    // and the late latch can still be set when it resolves. Latch-first reported `too-slow` over a
+    // socket that is live right now and — worse — skipped `noteCloudLive`, leaving a standing banner
+    // up and the corroboration counter armed.
+    //
+    // The LATCH is set directly rather than by firing the event, deliberately: the `cloud-late`
+    // LISTENER writes the store itself (that is the event-lands-second ordering it exists for), so
+    // firing it here would assert the listener's write, not the closure's precedence — which is the
+    // thing this test is about. Its neighbours fire the event for that other path.
+    invoke.mockImplementation((cmd: string) =>
+      cmd === "start_cloud_stream"
+        ? Promise.resolve("unreachable")
+        : Promise.resolve(undefined),
+    );
+    await mountVoice();
+    await goActive();
+    await goPassive();
+    await goActive(); // two unreachables — the banner is up and the count is armed
+    expect(useDictationEngineStore.getState().fallbackReason).toBe("unavailable");
+
+    // Hold the next attempt open so the latch is provably set while it is in flight.
+    let resolveIt!: (o: CloudStreamOutcome) => void;
+    invoke.mockImplementation((cmd: string) =>
+      cmd === "start_cloud_stream"
+        ? new Promise<CloudStreamOutcome>((r) => {
+            resolveIt = r;
+          })
+        : Promise.resolve(undefined),
+    );
+    await goPassive();
+    await act(async () => {
+      useDictationStore.setState({ phase: "active" });
+    });
+    await flush();
+    noteCloudLate(); // the park arm's event, latched but not yet spoken for
+    await act(async () => {
+      resolveIt("resumed"); // …and this attempt resumed that very socket
+    });
+    await flush();
+
+    expect(useDictationEngineStore.getState().fallbackReason).toBeNull();
+    expect(useDictationEngineStore.getState().openRefusals).toBe(0);
+  });
+
+  it("a NAMED refusal still speaks even when a late latch is set", async () => {
+    // THE OTHER HALF OF THE SAME PREDICATE (roborev 60444). Its sibling above pins `live`; this pins
+    // `definitive`, and without it dropping `|| verdict.kind === "definitive"` from the condition
+    // leaves the whole suite green — the three named-refusal tests never set the late latch, so they
+    // fall through to the identical `else engine.noteCloudOutcome(outcome)` on both orderings.
+    //
+    // The user-visible loss is the same one, one verdict class over: under latch-first,
+    // `noteCloudConnectedLate(true)` runs while `fallbackReason` is still null, so nothing is
+    // preserved and a user at zero credits reads "connected too late for that utterance" instead of
+    // "You're out of Sparkle credits… Refill" — copy naming no remedy they can act on.
+    let resolveIt!: (o: CloudStreamOutcome) => void;
+    invoke.mockImplementation((cmd: string) =>
+      cmd === "start_cloud_stream"
+        ? new Promise<CloudStreamOutcome>((r) => {
+            resolveIt = r;
+          })
+        : Promise.resolve(undefined),
+    );
+    await mountVoice();
+    await act(async () => {
+      useDictationStore.setState({ phase: "active" });
+    });
+    await flush();
+    noteCloudLate(); // a park-arm event, latched while this attempt is still in flight
+    await act(async () => {
+      resolveIt("insufficient_credits"); // …and the relay named the cause for THIS attempt
+    });
+    await flush();
+
+    expect(useDictationEngineStore.getState().fallbackReason).toBe("exhausted");
+  });
+
+  /** Deliver `dictation://cloud-orphan` — a handshake for a generation that has since rotated.
+   *  NOTHING LISTENS TO IT ANY MORE, and these cases exist to keep it that way (roborev
+   *  60408/60429): two mechanisms were built on this event (an orphan latch, and a charged-refusal
+   *  withdrawal) and both were deleted, because an orphan's own attempt answers `raced` — already
+   *  "record nothing" — so either could only ever reach a DIFFERENT attempt's state, in this window
+   *  or, since it is an `app.emit`, in another one. */
+  const fireCloudOrphan = () => {
+    for (const cb of listeners["dictation://cloud-orphan"] ?? []) cb({ payload: undefined });
+  };
+
+  it("an ORPHANED handshake records nothing at all — not a banner, and not a refusal", async () => {
+    // The originating attempt answers `raced`, which classifies `ignore`. Three re-holds is one more
+    // than OPEN_REFUSALS_BEFORE_WARNING, so a counted orphan would have spoken by now.
+    invoke.mockImplementation((cmd: string) =>
+      cmd === "start_cloud_stream" ? Promise.resolve("raced") : Promise.resolve(undefined),
+    );
+    await mountVoice();
+
+    for (let hold = 0; hold < 3; hold += 1) {
+      await goPassive();
+      await goActive();
+      fireCloudOrphan();
+      await flush();
+    }
+
+    expect(useDictationEngineStore.getState().fallbackReason).toBeNull();
+    expect(useDictationEngineStore.getState().openRefusals).toBe(0);
+  });
+
+  it("an orphan mid-flight does NOT swallow a genuine unreachable", async () => {
+    // THE LOAD-BEARING ORDERING, and the one every earlier orphan test missed (roborev 60429). The
+    // event is held against an attempt that is genuinely in flight and then answers `unreachable` —
+    // real evidence about the relay, from a different attempt than the orphan's. The deleted latch
+    // swallowed exactly this: the counter never incremented and the user was told nothing. Feeding
+    // `raced`, or firing the orphan after the attempt resolved, cannot see it — which is why those
+    // shapes stayed green while the latch existed.
+    let release!: (o: CloudStreamOutcome) => void;
+    invoke.mockImplementation((cmd: string) =>
+      cmd === "start_cloud_stream"
+        ? new Promise<CloudStreamOutcome>((r) => {
+            release = r;
+          })
+        : Promise.resolve(undefined),
+    );
+    await mountVoice();
+    await act(async () => {
+      useDictationStore.setState({ phase: "active" });
+    });
+    await flush();
+
+    fireCloudOrphan(); // an orphan from a PREVIOUS generation lands mid-flight
+    await act(async () => {
+      release("unreachable");
+    });
+    await flush();
+
+    expect(useDictationEngineStore.getState().openRefusals).toBe(1);
+  });
+
+  it("a broadcast orphan cannot touch another window's standing banner", async () => {
+    // `dictation://cloud-orphan` is an `app.emit`, so every window runs whatever is listening. This
+    // window genuinely earned its banner; an orphan fired by an attempt in a DIFFERENT window must
+    // leave both the banner and the count exactly where they are.
+    invoke.mockImplementation((cmd: string) =>
+      cmd === "start_cloud_stream"
+        ? Promise.resolve("unreachable")
+        : Promise.resolve(undefined),
+    );
+    await mountVoice();
+    await goActive();
+    await goPassive();
+    await goActive();
+    expect(useDictationEngineStore.getState().openRefusals).toBe(2);
+    expect(useDictationEngineStore.getState().fallbackReason).toBe("unavailable");
+
+    fireCloudOrphan();
+    await flush();
+
+    expect(useDictationEngineStore.getState().openRefusals).toBe(2);
+    expect(useDictationEngineStore.getState().fallbackReason).toBe("unavailable");
+  });
+
+  it("a late connect resets the corroboration, so refuse → late → refuse never reaches the threshold", async () => {
+    // THE FLAP THIS WHOLE SEAM EXISTS TO REMOVE, straddling a PROVEN-LIVE connection (roborev
+    // 60355). Without the reset the third attempt is the second consecutive refusal, so the bar
+    // claims Sparkle "can't reach the cloud transcription service" over a relay that connected one
+    // utterance earlier — and silently downgrades the honest `too-slow` while doing it.
+    let outcome: CloudStreamOutcome = "unreachable";
+    invoke.mockImplementation((cmd: string) =>
+      cmd === "start_cloud_stream" ? Promise.resolve(outcome) : Promise.resolve(undefined),
+    );
+    await mountVoice();
+    await goActive(); // refusal #1
+    expect(useDictationEngineStore.getState().openRefusals).toBe(1);
+
+    outcome = "raced"; // …but this one connected, just too late
+    await goPassive();
+    await goActive();
+    fireCloudLate();
+    await flush();
+    expect(useDictationEngineStore.getState().openRefusals).toBe(0);
+
+    outcome = "unreachable";
+    await goPassive();
+    await goActive(); // refusal, and it must be counted as the FIRST of a new run
+    expect(useDictationEngineStore.getState().openRefusals).toBe(1);
+    expect(useDictationEngineStore.getState().fallbackReason).toBe("too-slow");
   });
 
   // THE FOUNDER'S SYMPTOM, PINNED ON THE WIRING PATH. `already_routing` is what the command answers

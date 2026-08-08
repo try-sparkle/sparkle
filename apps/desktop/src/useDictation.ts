@@ -3,6 +3,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useDictationStore } from "./stores/dictationStore";
 import {
+  classifyCloudOutcome,
+  noteCloudLate,
+  noteCloudLateAttemptStart,
+  sawCloudLateThisAttempt,
   useDictationEngineStore,
   type CloudStreamOutcome,
 } from "./stores/dictationEngineStore";
@@ -519,6 +523,34 @@ export async function createDictationController(
       deliverCommittedSegment(e.payload);
     }),
 
+    // ── THE RELAY CONNECTED, JUST TOO LATE ────────────────────────────────────────────────────
+    // Emitted by start_cloud_stream's parked/discard arms, both of which answer
+    // `CloudStreamOutcome::Raced` — "a stop interleaved; don't meter, don't count it". That is
+    // right about billing and about the corroboration counter (it classifies as `ignore`) and says
+    // NOTHING to the user, and before the outcome existed it was a bare `Ok(false)` the frontend
+    // could not tell apart from a handshake that never completed. So a socket that opened fine was
+    // reported as "Sparkle can't reach the cloud transcription service": false on this path by
+    // construction, since it demonstrably reached it. This event is what carries that fact.
+    // Measured 2026-08-06: 171 opened / 170 closed, 136 discarded for landing after the utterance
+    // ended, on a network measured healthy at the moment the banner fired.
+    listen("dictation://cloud-late", () => {
+      // BOTH, deliberately — the event and the invoke's response race, and the order is not
+      // guaranteed by Tauri. Setting the flag fixes the case where this lands FIRST (startCloudStream
+      // then reads it instead of defaulting to "unavailable"); writing the store fixes the case where
+      // it lands SECOND (it corrects the "unavailable" already written). Doing only one of the two
+      // leaves the reason wrong in exactly one of the two orderings — which is the bug a reviewer
+      // caught in the first version of this wiring, where the true reason was written and then
+      // immediately overwritten with the false one it exists to replace.
+      noteCloudLate();
+      // GATED LIKE ITS SIBLINGS, and for the reason 59964 established for `cloud-ended`: this is an
+      // `app.emit`, so every open window runs it, and every project window paints its own banner. The
+      // EVIDENCE (a completed handshake) is app-wide and lands unconditionally; the CLAIM is about
+      // one window's utterance. Ungated, dictating in window A painted "connected too late for that
+      // utterance" in B and C — which cannot take it down, because every clearing path needs
+      // `isCapturable()` — so it stood there for the full notice TTL.
+      useDictationEngineStore.getState().noteCloudConnectedLate(isCapturable());
+    }),
+
     // Cloud-only: Deepgram interim results — the live, word-by-word preview. Volatile; replaced in
     // place and never routed through the segment handler (that only acts on committed segments).
     listen<string>("dictation://interim", (e) => {
@@ -559,15 +591,19 @@ export async function createDictationController(
       //
       // IT ALSO CLEARS PARTIAL CORROBORATION, NOT ONLY A PAINTED NOTICE (roborev 59964/59966).
       // Gating on `fallbackReason !== null` alone left the counter climbing through a HEALTHY
-      // session, because nothing else brings it down: the open path zeroes it only when
-      // `start_cloud_stream` returns TRUE, and a warm socket answers `AlreadyRouting -> Ok(false)`
-      // on EVERY passive→active edge. So consecutive no-ops are the normal case, not the exception
-      // — which makes the design note I first wrote here ("the no-op is followed by a working
-      // stream rather than another refusal") simply false at this seam. Two holds onto one live
-      // socket would reach the threshold and paint "Sparkle can't reach the cloud transcription
-      // service" while relay text was visibly streaming in, with the next interim clearing it: the
-      // reported flap made rarer rather than removed. Evidence of a live cloud has to reset the
-      // count whether or not a notice is up.
+      // session, because when this was written nothing else brought it down: the open path zeroed
+      // it only when `start_cloud_stream` returned TRUE, and a warm socket answered
+      // `AlreadyRouting -> Ok(false)` on EVERY passive→active edge, so consecutive no-ops were the
+      // normal case rather than the exception. Two holds onto one live socket would reach the
+      // threshold and paint "Sparkle can't reach the cloud transcription service" while relay text
+      // was visibly streaming in, with the next interim clearing it: the reported flap made rarer
+      // rather than removed.
+      //
+      // THE PRIMARY FIX FOR THAT NOW LIVES AT THE SEAM — `already_routing` is its own outcome and
+      // classifies as `live`, so the counter is zeroed by the open path itself on exactly the edge
+      // that used to climb it. This stays because the rule it encodes is the durable one: evidence
+      // of a live cloud resets the count whether or not a notice is up, and an interim is the
+      // strongest evidence there is.
       //
       // Still gated, because this fires ~25x/sec while speaking and an unconditional write would
       // churn the store and every subscriber for a no-op. Both terms are false in the steady state.
@@ -1130,20 +1166,41 @@ export function useAmbientVoice(): void {
       // stream that DIED rather than one that was refused — the two paths are complementary, not a
       // fallback for a seam that cannot tell.
       startCloudStream: async () => {
+        // Clear BEFORE the invoke so the flag can only ever describe THIS attempt. A stale `true`
+        // from a previous utterance would report a genuine outage as a timing fault — the same lie
+        // as before, pointing the other way.
+        noteCloudLateAttemptStart();
         const outcome = await invoke<CloudStreamOutcome>("start_cloud_stream", {
           project: selectedProjectName(),
         });
         const engine = useDictationEngineStore.getState();
-        // ONE CALL, because the seam can now TELL — this is the fix for sparkle-omznw rather than
-        // another mitigation of it. The command used to answer a bare bool whose `false` covered
-        // seven cases, including `cloud_reuse`'s `AlreadyRouting`: a socket that is alive, matches
-        // the project and is actively routing. Counting that healthy no-op as a refusal is what made
-        // the banner flap on every repeated hold and focus-regain while the relay was verified
-        // healthy throughout. It now arrives as its own outcome and is read as EVIDENCE THE CLOUD IS
-        // LIVE, so the most common path during normal use can no longer accuse the relay of
-        // anything. `noteCloudOutcome` routes the rest: a named 401/402/403/503 reports at once, and
-        // only a genuine "no answer" still goes through the corroboration counter.
-        engine.noteCloudOutcome(outcome);
+        // ONE FACT THE OUTCOME CANNOT CARRY. `start_cloud_stream` now answers a classified
+        // `CloudStreamOutcome`, and `noteCloudOutcome` routes it: `already_routing` is evidence the
+        // cloud is LIVE, a named 401/402/403/503 reports at once, and only a genuine `unreachable`
+        // still corroborates. That fixes what a bare `false` could not say — but BOTH of the raced
+        // arms answer `Raced`, which is classified `ignore`, and `ignore` is right about billing and
+        // about the counter while saying nothing to the user about why the live preview never
+        // appeared. The `cloud-late` latch carries that one fact: the handshake COMPLETED and the
+        // socket was then thrown away for landing after the utterance ended. Unambiguous, so it
+        // reports immediately rather than spending a corroboration round on something the backend
+        // already proved, and `speaks: true` because this path is not a broadcast — it runs only in
+        // the window whose own `openCloud` made the attempt.
+        //
+        // ITS ORPHAN SIBLING HAS NO ARM HERE, DELIBERATELY (roborev 60408/60429). An orphaned
+        // handshake belongs to a session the user already left, and its own attempt answers `Raced`
+        // — which is already "records nothing". A latch for it could therefore only ever suppress a
+        // DIFFERENT attempt's outcome, and the one outcome worth suppressing (`unreachable`) is the
+        // only one that is real evidence. See dictationEngineStore for the full argument.
+        //
+        // CLASSIFY FIRST — THE RELAY'S OWN ANSWER OUTRANKS THE LATCH (roborev 60394). Reading the
+        // latch first is what the pre-outcome branch did, and carrying that order across the merge
+        // let it DISCARD the outcome: a re-hold that answered `resumed` skipped `noteCloudLive`,
+        // leaving a standing banner up and the counter armed.
+        const verdict = classifyCloudOutcome(outcome);
+        if (verdict.kind === "live" || verdict.kind === "definitive") {
+          engine.noteCloudOutcome(outcome);
+        } else if (sawCloudLateThisAttempt()) engine.noteCloudConnectedLate(true);
+        else engine.noteCloudOutcome(outcome);
         // THE CAUSE, AT THE SOURCE — deliberately in the log and NOT in the banner. The store holds
         // only a coarse reason on purpose (copy rules: no raw errors, no status codes), which is
         // right for the user and useless for diagnosis. This is the transition record that answers
