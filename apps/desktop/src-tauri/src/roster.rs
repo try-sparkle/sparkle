@@ -36,6 +36,16 @@ pub struct RosterAgentSlice {
     /// field still deserializes.
     #[serde(default)]
     pub rollup_dot: Option<String>,
+    /// `engine/agentGoal`'s `GoalState` for this agent — "none" | "unmet" | "met" | "expired" |
+    /// "escalated" — or `None` from a window that predates the field.
+    ///
+    /// Carried for the NUDGER, which has no other way to learn it: goals live in the frontend
+    /// store, and `nudge_ladder` must know that an agent's goal is met so it stops spending a full
+    /// agent turn asking a finished agent to "resume your goal" (the founder's 2026-08-07
+    /// fourteen-ping screenshot). `None` and "unmet" both mean "keep nudging" — the absence of the
+    /// field can never be read as done.
+    #[serde(default)]
+    pub goal_state: Option<String>,
     pub parent_id: Option<String>,
     pub workflow_stage: Option<String>,
     pub last_activity_at: Option<i64>,
@@ -81,7 +91,7 @@ mod tests {
         RosterAgentSlice {
             id: id.into(), name: id.into(), kind: "build".into(),
             status: status.into(), status_color: "#000".into(), status_label: "x".into(),
-            rollup_dot: None,
+            rollup_dot: None, goal_state: None,
             parent_id: None, workflow_stage: None, last_activity_at: None,
             recent_prompts: Vec::new(),
         }

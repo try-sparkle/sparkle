@@ -357,3 +357,50 @@ describe("openProjects — what \"open\" means in the single-window shell", () =
     expect(openProjects([live, dormant], [], none)).toEqual([]);
   });
 });
+
+// The Rust nudger cannot see this store, so `goal_state` is the ONLY channel by which
+// `nudge_ladder` learns that an agent has finished. Without it the sparkle-nudge ladder keeps
+// typing "Resume your goal" at agents that already reported themselves done — the founder's
+// 2026-08-07 screenshot caught fourteen consecutive pings on one such agent, and every ping is a
+// full agent turn (context loaded, model called, reply generated) billed against the same account
+// quota the whole fleet draws on.
+describe("buildRoster publishes goal_state for the nudger", () => {
+  const NOW = 5_000_000;
+  const TTL = 4 * 60 * 60_000;
+
+  const withGoal = (goal: unknown): Project => ({
+    id: "p1", name: "Proj", rootPath: "/p", defaultBranch: "main",
+    createdAt: "", selectedAgentId: null,
+    agents: [
+      { id: "a1", name: "Build", kind: "build", parentId: null, runtime: "local",
+        promptHistory: [], goal } as any,
+    ],
+  });
+
+  const published = (goal: unknown) =>
+    buildRoster([withGoal(goal)], { a1: "idle" }, {}, {}, NOW).projects[0]!.agents[0]!.goal_state;
+
+  it("publishes `met` once the agent has marked its goal met", () => {
+    expect(published({ text: "ship it", setAt: NOW, ttlMs: TTL, metAt: NOW, continues: 0, totalContinues: 0 }))
+      .toBe("met");
+  });
+
+  // The whole point is the CONTRAST: `met` is the only value that silences the ladder, so every
+  // other state has to arrive as something else or a live agent goes unwatched. An assertion on
+  // `met` alone would pass against a publisher that hard-codes it.
+  it("publishes a live goal as something the nudger will keep nudging", () => {
+    expect(published({ text: "ship it", setAt: NOW, ttlMs: TTL, continues: 0, totalContinues: 0 }))
+      .toBe("unmet");
+    expect(published(undefined)).toBe("none");
+  });
+
+  // EXPIRED AND ESCALATED ARE NOT DONE. Reading `goal.metAt` directly would be the obvious
+  // implementation and would be wrong for both: an escalated goal is one a human now owns, and an
+  // expired one outlived its mandate — neither finished, and both must stay nudgeable.
+  it("never publishes an unfinished goal as met", () => {
+    expect(published({ text: "x", setAt: NOW - TTL - 1, ttlMs: TTL, continues: 0, totalContinues: 0 }))
+      .toBe("expired");
+    expect(published({ text: "x", setAt: NOW, ttlMs: TTL, escalatedAt: NOW, continues: 0, totalContinues: 0 }))
+      .toBe("escalated");
+  });
+});

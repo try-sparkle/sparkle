@@ -87,6 +87,16 @@ export interface RosterAgentPayload {
    *  and therefore emits an explicit `null` for a slice published by an older window
    *  (roborev 54742) — see the same note in services/rosterTypes.ts. */
   rollup_dot?: RollupDot | null;
+  /** `engine/agentGoal`'s `GoalState` — "none" | "unmet" | "met" | "expired" | "escalated".
+   *
+   *  Published for the RUST NUDGER, which has no other way to reach it: goals live in this store,
+   *  and `nudge_ladder` needs to know a goal is MET so it stops spending a full agent turn asking a
+   *  finished agent to "resume your goal". Only the exact "met" reads as done on the Rust side, so
+   *  a missing field or a new state is treated as a live goal and keeps the ladder running.
+   *
+   *  `| null` for the same reason as `rollup_dot` above: it mirrors a Rust `Option<String>` with no
+   *  `skip_serializing_if`, so an older window emits an explicit `null`. */
+  goal_state?: string | null;
   parent_id: string | null;
   workflow_stage?: string | null;
   last_activity_at?: number | null; // epoch ms of the user's last touch; drives the elapsed timer

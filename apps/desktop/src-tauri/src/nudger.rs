@@ -280,6 +280,15 @@ pub struct NudgeFlag {
     pub blocked_by: Option<String>,
     /// How long the agent had been silent.
     pub silent_secs: u64,
+    /// The agent's OWN last one-line answer — `blocked-on-human`, `blocked-on-quota`, … — or `None`
+    /// if it never answered.
+    ///
+    /// DISTINCT FROM `blocked_by`, and the distinction is the whole point: `blocked_by` is why WE
+    /// could not type at it (a picker, a parked reader), which is our problem. This is what the
+    /// AGENT said is stopping IT, which is the human's problem. A founder-level row that reads
+    /// `blocked-on-human` tells the reader what is owed; the same row with only `blocked_by: null`
+    /// tells them an agent has been quiet for a while and nothing about why.
+    pub reply: Option<String>,
 }
 
 /// Live flags, keyed by agent id so a stuck agent contributes one row rather than a stream.
@@ -437,7 +446,7 @@ struct Tracked {
 /// Built ONCE per tick, not once per agent. `merge` rebuilds and clones the entire roster on every
 /// call, so asking it per agent is quadratic in fleet size — and this fleet runs to dozens of
 /// agents, on a thread whose whole justification is that it stays cheap and stays alive.
-fn status_map<R: Runtime>(app: &AppHandle<R>) -> HashMap<String, String> {
+fn status_map<R: Runtime>(app: &AppHandle<R>) -> HashMap<String, AgentFacts> {
     let Some(state) = app.try_state::<crate::roster::RosterState>() else {
         return HashMap::new();
     };
@@ -445,8 +454,32 @@ fn status_map<R: Runtime>(app: &AppHandle<R>) -> HashMap<String, String> {
     crate::roster::merge(&guard)
         .into_iter()
         .flat_map(|p| p.agents)
-        .map(|a| (a.id, a.status))
+        .map(|a| {
+            let facts = AgentFacts {
+                goal_met: goal_is_met(a.goal_state.as_deref()),
+                status: a.status,
+            };
+            (a.id, facts)
+        })
         .collect()
+}
+
+/// The two roster facts one tick needs about one agent.
+#[derive(Debug, Clone, Default)]
+struct AgentFacts {
+    status: String,
+    goal_met: bool,
+}
+
+/// Is this agent's goal MET? Only the exact token counts.
+///
+/// Free function so the tri-state is assertable. `None` is a window that predates the field and
+/// "unmet"/"expired"/"escalated"/"none" are all live goals — every one of them must read as NOT met,
+/// because a false "met" is the only reading here that can silence an agent that still needs help.
+/// `engine/agentGoal.ts::GoalState` is the vocabulary; a typo on either side reads as unmet, which
+/// is the safe direction.
+fn goal_is_met(goal_state: Option<&str>) -> bool {
+    goal_state == Some("met")
 }
 
 /// Start the nudger. Idempotent; safe to call more than once.
@@ -524,8 +557,12 @@ fn tick<R: Runtime>(app: &AppHandle<R>, tracked: &mut HashMap<String, Tracked>, 
         // frontend and boots empty, so this is also what a wedged WebView looks like. Reading it as
         // an empty status is deliberate — it removes the roster's veto and leaves the decision to
         // the screen, which is the signal that still works in that case.
-        let status_str = statuses.get(agent_id).map(String::as_str).unwrap_or("");
-        let obs = observe(observer, status_str, now);
+        let facts = statuses.get(agent_id);
+        let status_str = facts.map(|f| f.status.as_str()).unwrap_or("");
+        // An agent missing from the roster has NO goal fact, which reads as unmet — so an unobserved
+        // agent keeps the full ladder rather than being silenced by an absence.
+        let goal_met = facts.is_some_and(|f| f.goal_met);
+        let obs = observe(observer, status_str, goal_met, now);
 
         let decision = nudge_ladder::step(&mut entry.state, &obs);
         entry.due_at_ms = now.saturating_add(decision.next_look_secs * 1000);
@@ -542,6 +579,12 @@ fn tick<R: Runtime>(app: &AppHandle<R>, tracked: &mut HashMap<String, Tracked>, 
             action = action_name(&decision.action),
             status = status_str,
             silent_secs = entry.state.silent_secs(),
+            // The three facts that decide whether we type at all now. Without them "why did it stop
+            // nudging" is unanswerable from the log, and the answer is exactly what a reader of this
+            // module needs — the previous version could not even show that an agent HAD replied.
+            goal_met = goal_met,
+            reply = entry.state.last_reply().map(|r| r.as_str()).unwrap_or("-"),
+            nudges = entry.state.attempts(),
             "nudger tick"
         );
 
@@ -668,7 +711,7 @@ fn sweep_dead_flags(flags: &NudgeFlags, live_ids: &std::collections::HashSet<&st
 /// parked-reader setter and getter, which is a precondition, not a side effect — breaking `tick`'s
 /// use of it left that test green. This is the seam where "the reader is parked" actually becomes
 /// "do not write".
-fn observe(observer: &PtyObserver, status: &str, now: u64) -> Observation {
+fn observe(observer: &PtyObserver, status: &str, goal_met: bool, now: u64) -> Observation {
     let hash = observer.hash_with_status(status);
     let (text, alternate) = observer.render();
     // A parked reader means this screen is NOT being updated, so it may be arbitrarily out of date.
@@ -696,6 +739,17 @@ fn observe(observer: &PtyObserver, status: &str, now: u64) -> Observation {
         screen_readable,
         prompt_has_text: nudge_gate::prompt_line_has_text(&text),
         since_other_write_ms: observer.since_foreign_write_ms(now),
+        foreign_write_ms: observer.last_foreign_write_ms.load(Ordering::Relaxed),
+        goal_met,
+        // THE ANSWER TO THE QUESTION WE ASKED. Read off the same rendered grid the safety gate uses,
+        // so it needs neither the frontend nor a model — the two things this module cannot depend
+        // on. A parked reader makes the grid stale, and a stale screen must never be read as fresh
+        // consent to go quiet, so an unreadable screen yields no reply at all.
+        reply: if screen_readable {
+            nudge_ladder::parse_reply(&text)
+        } else {
+            None
+        },
     }
 }
 
@@ -837,6 +891,7 @@ fn build_flag(
         delivered: state.delivered(),
         blocked_by: state.last_blocked().map(str::to_string),
         silent_secs: state.silent_secs(),
+        reply: state.last_reply().map(|r| r.as_str().to_string()),
         // Live by construction: this is only built while the agent is still being ticked, which
         // requires a live observer. `sweep_dead_flags` is the one place that sets it.
     }
@@ -1170,21 +1225,21 @@ mod tests {
         // A screen that is unambiguously SAFE to write to, so the only thing under test is the park.
         o.ingest("\x1b[2J\x1b[H────────────────────────\r\n❯\u{a0}\r\n────────────────────────");
         assert_eq!(
-            observe(&o, "idle", now_ms()).refusal,
+            observe(&o, "idle", false, now_ms()).refusal,
             None,
             "precondition: screen permits"
         );
 
         o.set_reader_parked(true);
         assert_eq!(
-            observe(&o, "idle", now_ms()).refusal,
+            observe(&o, "idle", false, now_ms()).refusal,
             Some("reader-parked"),
             "a screen that is not being updated must be refused, not trusted"
         );
 
         // ...and it must clear, or one burst of backpressure mutes the nudger for the session.
         o.set_reader_parked(false);
-        assert_eq!(observe(&o, "idle", now_ms()).refusal, None);
+        assert_eq!(observe(&o, "idle", false, now_ms()).refusal, None);
     }
 
     /// END TO END, the wedged-mid-turn case: a spinner frozen on a parked reader's grid must not
@@ -1200,7 +1255,7 @@ mod tests {
         o.ingest("\x1b[2J\x1b[H✻ Churning… (1m 24s · esc to interrupt)");
         o.set_reader_parked(true);
 
-        let obs = observe(&o, "working", now_ms());
+        let obs = observe(&o, "working", false, now_ms());
         assert!(obs.working, "the frozen screen and the stale roster both still say working");
         assert!(!obs.screen_readable, "but nothing read off that grid is current");
 
@@ -1222,13 +1277,13 @@ mod tests {
     fn either_the_roster_or_the_screen_can_veto_as_working() {
         let idle = observer();
         idle.ingest("\x1b[2J\x1b[H────────────────────────\r\n❯\u{a0}\r\n────────────────────────");
-        assert!(!observe(&idle, "idle", now_ms()).working);
-        assert!(observe(&idle, "working", now_ms()).working, "roster veto");
+        assert!(!observe(&idle, "idle", false, now_ms()).working);
+        assert!(observe(&idle, "working", false, now_ms()).working, "roster veto");
 
         let spinning = observer();
         spinning.ingest("\x1b[2J\x1b[H✻ Churning… (1m 24s · esc to interrupt)");
         assert!(
-            observe(&spinning, "", now_ms()).working,
+            observe(&spinning, "", false, now_ms()).working,
             "screen veto, with the roster saying nothing at all — the wedged-WebView case"
         );
     }
@@ -1404,6 +1459,7 @@ mod tests {
             delivered: 3,
             blocked_by: None,
             silent_secs: 900,
+            reply: None,
             };
         flags.raise(mk("concierge", 1));
         flags.raise(mk("founder", 2));
@@ -1649,6 +1705,9 @@ mod tests {
                 screen_readable: true,
                 prompt_has_text: false,
                 since_other_write_ms: u64::MAX,
+                foreign_write_ms: 0,
+                goal_met: false,
+                reply: None,
             };
             for _ in 0..7 {
                 nudge_ladder::step(&mut state, &stalled);
@@ -1739,6 +1798,9 @@ mod tests {
             screen_readable: true,
             prompt_has_text: false,
             since_other_write_ms: u64::MAX,
+            foreign_write_ms: 0,
+            goal_met: false,
+            reply: None,
         };
         for _ in 0..looks {
             nudge_ladder::step(&mut state, &stalled);
@@ -1845,5 +1907,74 @@ mod tests {
             &AgentState::default(),
         );
         assert_eq!(flags.list().len(), 1, "a still-stuck agent keeps its flag");
+    }
+
+    // ══ THE GOAL FACT AND THE AGENT'S ANSWER ════════════════════════════════════════════════════
+
+    /// ONLY `"met"` MEANS DONE, and this is the one reading in the whole change that can silence an
+    /// agent that still needs help — so every other state is asserted explicitly rather than left to
+    /// a default. `expired` and `escalated` are the dangerous pair: both have `metAt` unset and both
+    /// describe UNFINISHED work, so an implementation that tested "not unmet" would silence exactly
+    /// the agents that most need a human.
+    #[test]
+    fn only_an_explicitly_met_goal_reads_as_met() {
+        assert!(goal_is_met(Some("met")));
+        for live in ["unmet", "expired", "escalated", "none", "", "Met", "MET"] {
+            assert!(!goal_is_met(Some(live)), "{live:?} is not a finished goal");
+        }
+        assert!(
+            !goal_is_met(None),
+            "a window that predates the field publishes nothing — absence is never done"
+        );
+    }
+
+    /// AN UNOBSERVED AGENT KEEPS THE FULL LADDER. An agent missing from the roster has no goal fact
+    /// at all, and a wedged WebView is one of the ways an agent goes missing — so if absence read as
+    /// "met", the exact failure this module exists to survive would also switch it off.
+    #[test]
+    fn an_agent_absent_from_the_roster_is_not_treated_as_finished() {
+        let statuses: HashMap<String, AgentFacts> = HashMap::new();
+        let facts = statuses.get("ghost");
+        assert!(!facts.is_some_and(|f: &AgentFacts| f.goal_met));
+    }
+
+    /// The founder-facing row must say WHY, in the agent's own words. `blocked_by` cannot answer
+    /// this — it records why WE could not type, which on an agent that answered us is `None`, so a
+    /// founder row for `blocked-on-human` would otherwise read as "quiet for a while, reason null".
+    #[test]
+    fn the_flag_carries_the_agents_own_answer() {
+        let mut state = AgentState::default();
+        let stalled = nudge_ladder::Observation {
+            hash: 1,
+            working: false,
+            refusal: None,
+            screen_readable: true,
+            prompt_has_text: false,
+            since_other_write_ms: u64::MAX,
+            foreign_write_ms: 0,
+            goal_met: false,
+            reply: None,
+        };
+        for _ in 0..7 {
+            nudge_ladder::step(&mut state, &stalled);
+        }
+        // It answers: a person is needed.
+        let asking = nudge_ladder::Observation {
+            hash: 2,
+            reply: Some(nudge_ladder::Reply::Human),
+            ..stalled
+        };
+        let decision = nudge_ladder::step(&mut state, &asking);
+        assert_eq!(decision.flagged, Some(nudge_ladder::Escalation::Founder));
+
+        let flags = NudgeFlags::default();
+        apply_flags(&flags, "agent-1", &decision, &state);
+        let row = flags.get("agent-1").expect("the ask must reach a human's surface");
+        assert_eq!(row.reply.as_deref(), Some("blocked-on-human"));
+        assert_eq!(row.target, "founder");
+        assert_eq!(
+            row.blocked_by, None,
+            "and `blocked_by` is genuinely empty here — which is exactly why `reply` had to exist"
+        );
     }
 }

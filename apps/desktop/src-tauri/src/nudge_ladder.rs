@@ -26,6 +26,41 @@
 //! words, "a no-op at best and confirms a dialog at worst" — the dialog case being the one that
 //! costs something, because confirming a picker nobody read is exactly the harm the gate exists to
 //! prevent.
+//!
+//! ── THE LADDER LISTENS (2026-08-07) ───────────────────────────────────────────────────────────
+//! Everything above is about WHEN TO TYPE. The other half — added after the founder screenshotted
+//! one agent taking ~14 consecutive pings, every one labelled `#1`, every one answered
+//! `not-blocked — complete; goal marked met, nothing left to resume.` — is about WHEN TO STOP.
+//!
+//! THE COST IS THE POINT. A nudge is not a notification; it is a FULL AGENT TURN, with context
+//! loaded, a model called and a reply generated. Fourteen of those on one agent, across a fleet of
+//! dozens, draws down the same account quota every interactive agent is sharing — and the day
+//! before that screenshot the account hit a usage wall that cost roughly ten hours of fleet time.
+//! Pinging an agent that has already said it is done is not merely untidy; it is a direct
+//! contributor to that wall.
+//!
+//! Three defects produced the loop, and they are separable:
+//!
+//!   1. `goal_met` WAS NOT READ. The agent said the goal was met, the store agreed, and the ladder
+//!      typed "Resume your goal" anyway. There is nothing to resume.
+//!   2. THE ANSWER WAS NOT READ. The nudge has always ended by demanding one line from a fixed
+//!      vocabulary, and nothing on any path parsed it. `parse_reply` closes that, and `Standdown`
+//!      acts on it: `blocked-on-human` flags the founder at the FIRST answer instead of re-typing,
+//!      `blocked-on-quota` backs off to `QUOTA_BACKOFF_SECS`.
+//!   3. THE COUNTER RESET ON ITS OWN FOOTSTEPS. This is the subtle one, and it is why `#1` repeated
+//!      rather than climbing. A nudge is typed into the PTY, so it ECHOES, and the answer it demands
+//!      is more output still — all of which moves the 4KB tail hash that the episode reset keys on.
+//!      The `4m 5s` in every ping is the proof: 5+10+20+30+60+120 = 245s is exactly the climb from
+//!      rung 1. So a hash change caused by the agent ANSWERING us now restarts only the silence
+//!      clock and leaves the nudge history standing (see `conversation` in `step`), while output we
+//!      did NOT provoke is still a full reset — a working agent earns a clean slate.
+//!
+//! ── AND THE RULE THAT BOUNDS ALL OF IT ────────────────────────────────────────────────────────
+//! NONE OF THIS MAY MAKE A STALLED AGENT QUIET. Sparkle's standing rule is that a row the founder
+//! owes is never hidden, so every mechanism above is one-sided: it stops the TYPING and never the
+//! TELLING. `GIVE_UP_AFTER` stops writing but keeps `flagged` at the level reached. `blocked-on-
+//! human` is LOUDER than the behaviour it replaced, not quieter. `parse_reply` fails closed toward
+//! nudging. An agent that is stuck and NOT reporting `not-blocked` is treated exactly as before.
 
 /// How long to wait before LOOKING again, per rung. The last entry repeats forever.
 ///
@@ -48,6 +83,130 @@ const ESCALATE_CONCIERGE_AFTER: u32 = 3;
 /// Nudges with no output change before the founder is flagged. The nudger never addresses a human
 /// itself — it raises a flag that the pusher/concierge loop (sparkle-4cd0x) consumes.
 const ESCALATE_FOUNDER_AFTER: u32 = 6;
+
+/// Nudges after which the ladder STOPS WRITING for the rest of the episode — the terminal rung.
+///
+/// ── WHY A LADDER MUST END ─────────────────────────────────────────────────────────────────────
+/// Without this the top rung repeats forever: an agent nobody can unstick is re-typed at every 600s
+/// for the life of the process, and every one of those is a FULL AGENT TURN — context loaded, model
+/// called, reply generated. Past the founder flag there is nothing left for another identical ping
+/// to achieve that the flag has not already achieved; the row is on a human's surface and the only
+/// thing more nudging adds is token burn against the same account quota the fleet is drawing on.
+///
+/// It does NOT go quiet: `flagged` stays at whatever level was reached, so `apply_flags` keeps
+/// raising the row on every look. Sparkle's standing rule is that a row a human owes is never
+/// hidden — this stops the TYPING, not the TELLING.
+const GIVE_UP_AFTER: u32 = 8;
+
+/// How long to wait between looks once an agent has told us it is out of quota.
+///
+/// Quota is the one blocker where re-asking is actively counterproductive: the reply costs a turn
+/// against the very budget that is exhausted. Half an hour is the shortest interval that is not
+/// simply the top rung again, and a quota window that reopens sooner will be caught by the agent's
+/// own output resetting the episode long before this elapses.
+const QUOTA_BACKOFF_SECS: u64 = 1800;
+
+/// The one-line answers the nudge asks for, and the ONLY vocabulary this module accepts.
+///
+/// ── THE DEFECT THIS TYPE EXISTS TO CLOSE ──────────────────────────────────────────────────────
+/// `nudge_text` has always ENDED with a demand for exactly one of these tokens, and until now
+/// nothing on any path read the answer. The fleet retro named the shape — "the ladder asks a
+/// question it does not listen for the answer to" — and the founder's 2026-08-07 screenshot is what
+/// it costs: one agent answered `not-blocked` FOURTEEN consecutive times and was re-pinged after
+/// every one, each ping a full agent turn.
+///
+/// Keeping the enum in the same file as `nudge_text` is deliberate: the question and the answer are
+/// one contract, and `every_token_the_nudge_offers_parses_back` asserts they cannot drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reply {
+    NotBlocked,
+    Human,
+    Ci,
+    AnotherAgent,
+    Quota,
+}
+
+/// The wire tokens, longest-first so a prefix can never shadow a longer match.
+const REPLY_TOKENS: [(&str, Reply); 5] = [
+    ("blocked-on-another-agent", Reply::AnotherAgent),
+    ("blocked-on-human", Reply::Human),
+    ("blocked-on-quota", Reply::Quota),
+    ("blocked-on-ci", Reply::Ci),
+    ("not-blocked", Reply::NotBlocked),
+];
+
+impl Reply {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Reply::NotBlocked => "not-blocked",
+            Reply::Human => "blocked-on-human",
+            Reply::Ci => "blocked-on-ci",
+            Reply::AnotherAgent => "blocked-on-another-agent",
+            Reply::Quota => "blocked-on-quota",
+        }
+    }
+}
+
+/// What the ladder does with itself once it knows the agent is not merely silent.
+///
+/// A stand-down is NOT silence toward humans — every variant below records the flag level it still
+/// raises. It governs only whether we TYPE at the agent again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Standdown {
+    /// Nothing left to resume: the goal is met, or the agent said `not-blocked`. No writes, no
+    /// flag — an agent that is finished is not a row anybody owes.
+    Done,
+    /// `blocked-on-human`. Re-typing cannot move this; only a person can. Writes stop and the
+    /// FOUNDER is flagged at once rather than after another five ignored pings.
+    AwaitHuman,
+    /// `blocked-on-quota`. Back off hard — the answer to a ping costs a turn against the exhausted
+    /// budget itself. Flagged to the concierge, which is the layer that can act on a quota wall.
+    Quota,
+    /// `blocked-on-ci` / `blocked-on-another-agent`. The agent is waiting on something real and
+    /// external, so keep the ladder running — but at the top rung only, and let the counter climb
+    /// to the terminal rung so this ends.
+    External,
+}
+
+impl Standdown {
+    fn of(reply: Reply) -> Standdown {
+        match reply {
+            Reply::NotBlocked => Standdown::Done,
+            Reply::Human => Standdown::AwaitHuman,
+            Reply::Quota => Standdown::Quota,
+            Reply::Ci | Reply::AnotherAgent => Standdown::External,
+        }
+    }
+
+    /// The flag level this stand-down sits at, for as long as it holds.
+    fn flag(self) -> Option<Escalation> {
+        match self {
+            Standdown::Done => None,
+            Standdown::AwaitHuman => Some(Escalation::Founder),
+            Standdown::Quota => Some(Escalation::Concierge),
+            // External keeps whatever the ordinary escalation counter has reached; it does not
+            // assert a level of its own.
+            Standdown::External => None,
+        }
+    }
+
+    /// Does this stand-down forbid writing entirely?
+    fn silences_writes(self) -> bool {
+        !matches!(self, Standdown::External)
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            Standdown::Done => "nothing-to-resume",
+            Standdown::AwaitHuman => "blocked-on-human",
+            Standdown::Quota => "blocked-on-quota",
+            Standdown::External => "blocked-externally",
+        }
+    }
+}
+
+/// The marker every nudge line starts with, and the anchor `parse_reply` searches from.
+const NUDGE_MARKER: &str = "[sparkle-nudge #";
 
 /// Who a raised flag is for. NOT a write, and never delivered by this module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -104,6 +263,28 @@ pub struct Observation {
     /// (roborev 54369/54375). Standing down for a couple of seconds after any other write closes
     /// that window without needing to re-plumb the JS protocol.
     pub since_other_write_ms: u64,
+    /// Epoch ms of the last write by anybody other than this module — the ABSOLUTE form of the
+    /// field above, and a different question with a different answer.
+    ///
+    /// `since_other_write_ms` asks "did somebody type in the last few seconds", which is a safety
+    /// interlock. This asks "has anybody typed SINCE we stood down", which is how a stand-down
+    /// ends. The delta cannot answer it: the ladder's top rung is 600s, so a founder handing an
+    /// agent new work is invisible to a 5-second window on all but one look in a hundred and twenty.
+    pub foreign_write_ms: u64,
+    /// The agent's goal is MET — it has said, through `set_agent_goal_met`, that the thing it was
+    /// sent to do is done.
+    ///
+    /// ── WHY A FRONTEND-WRITTEN FACT IS TRUSTED HERE ───────────────────────────────────────────
+    /// Every other roster-derived signal in this module is treated as suspect, because the roster
+    /// is written by a WebView that may be wedged. This one is safe in a way `working` is not, and
+    /// the asymmetry is worth stating: a stale `working` suppresses a nudge an agent NEEDS, whereas
+    /// a stale `goal_met` suppresses a nudge for an agent that already reported having nothing left
+    /// to do. "Resume your goal" said to an agent whose goal is met is not a recovery — it is a
+    /// full agent turn spent to be told, again, that there is nothing to resume.
+    pub goal_met: bool,
+    /// The agent's own one-line answer to the most recent nudge, per `parse_reply`. `None` when it
+    /// has not answered, or when the screen cannot be read unambiguously.
+    pub reply: Option<Reply>,
 }
 
 /// The nudger's memory of one agent, between ticks.
@@ -130,6 +311,19 @@ pub struct AgentState {
     escalated: Option<Escalation>,
     /// How long this agent has been unchanged, in seconds — carried for the nudge string.
     silent_secs: u64,
+    /// The stand-down the agent's own last answer put us in, if any. Latched, because the answer is
+    /// a fact about the agent that outlives the look that read it.
+    standdown: Option<Standdown>,
+    /// The answer that produced `standdown`, kept for the log and the flag.
+    last_reply: Option<Reply>,
+    /// `foreign_write_ms` as it stood when `standdown` was latched.
+    ///
+    /// This is the entire "unless new work arrives" clause. A stand-down says the agent has nothing
+    /// to resume; the moment somebody hands it something to resume, that stops being true. Any
+    /// INCREASE here is that moment — a founder typing, an orchestrator delivering a task — and it
+    /// releases the latch. Comparing absolute stamps rather than a recency window means the release
+    /// cannot be missed by looking at the wrong second.
+    standdown_at_foreign_write: u64,
 }
 
 impl AgentState {
@@ -175,6 +369,14 @@ impl AgentState {
     }
     pub fn silent_secs(&self) -> u64 {
         self.silent_secs
+    }
+    /// The stand-down currently in force, if the agent's own answer put us in one.
+    pub fn standdown(&self) -> Option<Standdown> {
+        self.standdown
+    }
+    /// The agent's last parsed answer, for the log and the flag.
+    pub fn last_reply(&self) -> Option<Reply> {
+        self.last_reply
     }
 }
 
@@ -231,25 +433,84 @@ pub fn step(state: &mut AgentState, obs: &Observation) -> Decision {
     let previous = state.hash;
     let changed = previous.is_some_and(|h| h != obs.hash);
 
-    // ANY change resets the whole episode. This is the entire detector.
-    if changed || previous.is_none() {
-        state.hash = Some(obs.hash);
-        state.rung = 0;
+    // ── NEW WORK RELEASES A STAND-DOWN ────────────────────────────────────────────────────────
+    // "It has nothing to resume" stops being true the moment somebody gives it something to
+    // resume. A foreign write is that moment — the founder typing, the orchestrator delivering a
+    // task — and it puts the agent back under the ordinary ladder with a clean history.
+    if state.standdown.is_some() && obs.foreign_write_ms > state.standdown_at_foreign_write {
+        state.standdown = None;
+        state.last_reply = None;
         state.attempts = 0;
         state.delivered = 0;
-        state.last_blocked = None;
         state.escalated = None;
+        state.last_blocked = None;
+    }
+
+    // ── THE AGENT'S OWN ANSWER ────────────────────────────────────────────────────────────────
+    // Absorbed on EVERY look, not only on the one where the hash moved: the reply sits on the
+    // rendered screen from the moment it is typed, so any later look reads the same fact, and a
+    // slow answer is caught rather than missed by one tick.
+    //
+    // Gated on `attempts > 0` — a conversation we actually started. After a full reset the previous
+    // exchange can still be in scrollback, and an answer to a nudge from an hour ago is not consent
+    // to stay quiet now. `parse_reply` reinforces this from the other side by only ever reading the
+    // region after the LATEST nudge.
+    if state.attempts > 0 {
+        if let Some(reply) = obs.reply {
+            if state.last_reply != Some(reply) {
+                state.last_reply = Some(reply);
+                state.standdown = Some(Standdown::of(reply));
+                state.standdown_at_foreign_write = obs.foreign_write_ms;
+            }
+        }
+    }
+
+    // ANY change resets the SILENCE clock. This is still the entire detector.
+    if changed || previous.is_none() {
+        // ── WHOSE OUTPUT WAS THAT? ────────────────────────────────────────────────────────────
+        // THE BUG THE FOUNDER SCREENSHOTTED, in one condition. A nudge is not a passive read: it
+        // is typed into the PTY, it echoes, and the one-line answer it demands is more output
+        // still. So the exchange WE START moves the hash — and treating that as "the agent got
+        // back to work" reset the counter to zero every single cycle. Fourteen consecutive pings
+        // all labelled `#1`, all reporting the same `4m 5s` (which is exactly 5+10+20+30+60+120,
+        // the climb from rung 1), each one a full agent turn, on an agent that had already said it
+        // was done. A ladder whose rung resets on its own footsteps is a loop, not a ladder.
+        //
+        // So an answered nudge advances the conversation instead of erasing it: the silence clock
+        // restarts (the agent did emit), but the nudge history, the escalation high-water mark and
+        // the stand-down all survive. Output we did NOT provoke is still a full reset — that is a
+        // genuinely working agent and it earns a clean slate.
+        let conversation = changed && state.attempts > 0 && obs.reply.is_some();
+        state.hash = Some(obs.hash);
+        state.rung = 0;
         state.silent_secs = 0;
+        if !conversation {
+            state.attempts = 0;
+            state.delivered = 0;
+            state.last_blocked = None;
+            state.escalated = None;
+            state.standdown = None;
+            state.last_reply = None;
+        }
+
+        let stand = effective_standdown(state, obs);
+        let flagged = standdown_level(stand, state.escalated);
+        let escalate = raise(state, flagged);
         return Decision {
             action: Action::Observe,
-            escalate: None,
-            // The episode just reset, so there is no level to be at. The consumer clears its row
-            // on `hash_changed` anyway; this says the same thing from the other side.
-            flagged: None,
+            escalate,
+            // The episode just reset, so there is normally no level to be at — the consumer clears
+            // its row on `hash_changed` anyway. A stand-down is the exception: an agent that just
+            // answered `blocked-on-human` needs its row back on this very look, not in ten minutes.
+            flagged,
             rung: 1,
             hash_changed: changed,
             // A first look has nothing to refuse — it is the baseline, not a declined write.
-            refusal: if changed { None } else { Some("seeding") },
+            refusal: match (stand, changed) {
+                (Some(s), _) => Some(s.reason()),
+                (None, true) => None,
+                (None, false) => Some("seeding"),
+            },
             next_look_secs: LADDER_SECS[0],
         };
     }
@@ -258,8 +519,54 @@ pub fn step(state: &mut AgentState, obs: &Observation) -> Decision {
     state.silent_secs += LADDER_SECS[state.rung.min(LADDER_SECS.len() - 1)];
     state.rung = (state.rung + 1).min(LADDER_SECS.len() - 1);
     let rung = state.rung;
-    let next_look_secs = LADDER_SECS[rung];
     let rung_1based = (rung + 1) as u32;
+    let stand = effective_standdown(state, obs);
+    // An agent waiting on CI or on another agent is not stuck, it is QUEUED — so it stays on the
+    // ladder (something has to notice if the wait never ends) but never at the dense early rungs.
+    let next_look_secs = match stand {
+        Some(Standdown::External) => LADDER_SECS[LADDER_SECS.len() - 1],
+        _ => LADDER_SECS[rung],
+    };
+
+    // ── THE STAND-DOWN GATE ───────────────────────────────────────────────────────────────────
+    // The agent has told us, or the goal state has told us, that another identical ping cannot
+    // help. Stop TYPING — and keep TELLING, at whatever level the situation warrants.
+    if let Some(stand) = stand {
+        if stand.silences_writes() {
+            let flagged = standdown_level(Some(stand), state.escalated);
+            let escalate = raise(state, flagged);
+            return Decision {
+                action: Action::Observe,
+                escalate,
+                flagged,
+                rung: rung_1based,
+                hash_changed: false,
+                refusal: Some(stand.reason()),
+                next_look_secs: match stand {
+                    // Asking an agent that is out of quota to answer a ping spends a turn against
+                    // the exact budget that is exhausted. Back all the way off.
+                    Standdown::Quota => QUOTA_BACKOFF_SECS,
+                    _ => next_look_secs,
+                },
+            };
+        }
+    }
+
+    // ── THE TERMINAL RUNG ─────────────────────────────────────────────────────────────────────
+    // Past here the founder has already been flagged and N identical pings have been ignored. The
+    // row stays up — `flagged` carries the level reached, so `apply_flags` keeps raising it — but
+    // the typing stops, because the only thing ping N+1 reliably produces is another billed turn.
+    if state.attempts >= GIVE_UP_AFTER {
+        return Decision {
+            action: Action::Observe,
+            escalate: None,
+            flagged: state.escalated,
+            rung: rung_1based,
+            hash_changed: false,
+            refusal: Some("gave-up"),
+            next_look_secs,
+        };
+    }
 
     let observe = |refusal: &'static str| Decision {
         action: Action::Observe,
@@ -362,17 +669,7 @@ pub fn step(state: &mut AgentState, obs: &Observation) -> Decision {
     };
     // `>` not `>=`: re-raising the same flag every rung would turn one stuck agent into a stream of
     // identical notices, which is how a signal stops being read.
-    let escalate = match (target, state.escalated) {
-        (Some(t), None) => {
-            state.escalated = Some(t);
-            Some(t)
-        }
-        (Some(t), Some(prev)) if t > prev => {
-            state.escalated = Some(t);
-            Some(t)
-        }
-        _ => None,
-    };
+    let escalate = raise(state, target);
 
     Decision {
         // The attempt counted either way; whether a BYTE goes out is a separate question.
@@ -386,6 +683,58 @@ pub fn step(state: &mut AgentState, obs: &Observation) -> Decision {
         hash_changed: false,
         refusal: blocked,
         next_look_secs,
+    }
+}
+
+/// Advance the escalation high-water mark, returning a target only when it actually ROSE.
+///
+/// Factored out because three call sites now need it — the reset branch, the stand-down gate and
+/// the ordinary nudge path — and three hand-rolled copies of a high-water mark is three chances for
+/// one of them to re-raise the same flag every look, which is how a signal stops being read.
+fn raise(state: &mut AgentState, target: Option<Escalation>) -> Option<Escalation> {
+    match (target, state.escalated) {
+        (Some(t), None) => {
+            state.escalated = Some(t);
+            Some(t)
+        }
+        (Some(t), Some(prev)) if t > prev => {
+            state.escalated = Some(t);
+            Some(t)
+        }
+        _ => None,
+    }
+}
+
+/// Which stand-down actually applies, folding the goal state in with the agent's own answer.
+///
+/// ── AN EXPLICIT ASK FOR A PERSON OUTRANKS A MET GOAL ──────────────────────────────────────────
+/// The ordering is the safety rule, not a preference. `goal_met` silences the row entirely, so if
+/// it won here an agent that answered `blocked-on-human` while its goal happened to read met would
+/// have the row a human owes deleted by a stale frontend fact. The two should not co-occur — but
+/// "should not" is not a guarantee, and the failure is asymmetric: the wrong way round loses a
+/// human's row silently, this way round costs one visible flag that a human can dismiss.
+fn effective_standdown(state: &AgentState, obs: &Observation) -> Option<Standdown> {
+    if state.standdown == Some(Standdown::AwaitHuman) {
+        return Some(Standdown::AwaitHuman);
+    }
+    if obs.goal_met {
+        return Some(Standdown::Done);
+    }
+    state.standdown
+}
+
+/// The flag level a stand-down sits at, never dropping below what the episode already reached.
+///
+/// `Done` is the one that genuinely clears: an agent that is FINISHED is not a row anybody owes,
+/// and leaving a founder flag up on it is exactly the "channel that reports resolved problems"
+/// this module's header warns stops being read. Every other variant takes the higher of its own
+/// level and the high-water mark, because a row must never silently downgrade — telling the
+/// founder that somebody else has it is worse than saying nothing.
+fn standdown_level(stand: Option<Standdown>, escalated: Option<Escalation>) -> Option<Escalation> {
+    match stand {
+        Some(Standdown::Done) => None,
+        Some(s) => s.flag().max(escalated),
+        None => escalated,
     }
 }
 
@@ -406,6 +755,48 @@ pub fn nudge_text(n: u32, silent_secs: u64) -> String {
          blocked-on-another-agent | blocked-on-quota | not-blocked — plus what you need.",
         human_duration(silent_secs)
     )
+}
+
+/// The last clause of `nudge_text`, and the boundary between OUR QUESTION and THEIR ANSWER.
+///
+/// This anchor is not decoration — it is the whole reason a naive parse is wrong. The nudge string
+/// itself LISTS all five reply tokens, so any search over the raw screen matches our own question
+/// and reads it as the agent's answer, every single time, on an agent that has said nothing at all.
+/// That would silence a genuinely stalled agent, which is the one outcome forbidden here.
+const NUDGE_TAIL: &str = "plus what you need.";
+
+/// Read the agent's one-line answer to the MOST RECENT nudge, if it has given one.
+///
+/// ── FAIL CLOSED, AND WHICH DIRECTION THAT IS ──────────────────────────────────────────────────
+/// `None` means "no answer I can be sure of", and every uncertain path returns it: no nudge on
+/// screen, a nudge whose text is cut off by scrollback, no token after the question. `None` leaves
+/// the ordinary ladder running, so an unparseable screen keeps getting nudged. That is deliberately
+/// the noisy direction — a false NEGATIVE costs one more ping, a false POSITIVE goes quiet on an
+/// agent that never spoke, and Sparkle's standing rule is that a stalled agent is never hidden.
+///
+/// ── WHY WHITESPACE IS STRIPPED ────────────────────────────────────────────────────────────────
+/// This reads a RENDERED VT grid, so the terminal has already hard-wrapped both the nudge and the
+/// reply at the pane width — and the wrap lands wherever the column happens to fall, which can be
+/// the middle of `not-blocked`. Comparing whitespace-free forms makes the match independent of the
+/// pane geometry, which is exactly what the module's header says the grid must not be trusted for.
+pub fn parse_reply(screen: &str) -> Option<Reply> {
+    let flat: String = screen.chars().filter(|c| !c.is_whitespace()).collect();
+    let marker: String = NUDGE_MARKER.chars().filter(|c| !c.is_whitespace()).collect();
+    let tail: String = NUDGE_TAIL.chars().filter(|c| !c.is_whitespace()).collect();
+
+    // Where the most recent nudge starts…
+    let marker_at = flat.rfind(&marker)?;
+    // …and where its text ends. Anything before this is OUR question, and must never be read as an
+    // answer. A missing tail means the nudge is truncated, so the boundary is unknown: give up.
+    let answer_from = flat[marker_at..].find(&tail).map(|i| marker_at + i + tail.len())?;
+
+    // The LAST token in the answer region wins: an agent that corrects itself ("not-blocked —
+    // actually blocked-on-ci") means the correction, and a scrolled-back older answer sits earlier.
+    REPLY_TOKENS
+        .iter()
+        .filter_map(|(token, reply)| flat[answer_from..].rfind(token).map(|i| (i, *reply)))
+        .max_by_key(|(i, _)| *i)
+        .map(|(_, reply)| reply)
 }
 
 /// Compact, stable duration rendering: `45s`, `2m 5s`, `1h 3m`. Stable matters — this string goes
@@ -440,7 +831,21 @@ mod tests {
             screen_readable: true,
             prompt_has_text: false,
             since_other_write_ms: u64::MAX,
+            foreign_write_ms: 0,
+            goal_met: false,
+            reply: None,
         }
+    }
+
+    /// A screen holding nudge #N and, optionally, the agent's one-line answer under it. Built from
+    /// `nudge_text` rather than a hand-written string so a test can never assert against a question
+    /// the module does not actually ask — the vacuity this repo's #1 finding is about.
+    fn screen_after_nudge(n: u32, answer: Option<&str>) -> String {
+        let mut s = format!("● doing some work\n{}\n", nudge_text(n, 245));
+        if let Some(a) = answer {
+            s.push_str(&format!("● {a}\n"));
+        }
+        s
     }
 
     /// Run `n` looks and collect what was decided each time.
@@ -910,5 +1315,359 @@ mod tests {
         assert_eq!(decisions[6].action, Action::Nudge { n: 1 });
         assert!(decisions.iter().any(|d| d.escalate == Some(Escalation::Concierge)));
         assert!(decisions.iter().any(|d| d.escalate == Some(Escalation::Founder)));
+    }
+
+    // ══ READING THE ANSWER ══════════════════════════════════════════════════════════════════════
+
+    /// THE TRAP THAT MAKES A NAIVE PARSER WORSE THAN NONE.
+    ///
+    /// `nudge_text` ENDS by listing all five reply tokens, so a parser that searches the raw screen
+    /// finds every one of them on an agent that has answered nothing — and reads our own question
+    /// as consent to stop nudging. That would silence a genuinely stalled agent, the one outcome
+    /// this module forbids. Asserted first because every other parser test would pass without it.
+    #[test]
+    fn the_nudges_own_question_is_never_read_as_an_answer() {
+        let unanswered = screen_after_nudge(1, None);
+        for token in ["blocked-on-human", "blocked-on-quota", "not-blocked"] {
+            assert!(unanswered.contains(token), "precondition: the question really does list {token}");
+        }
+        assert_eq!(
+            parse_reply(&unanswered),
+            None,
+            "the question lists every token; only text AFTER it can be an answer"
+        );
+    }
+
+    /// THE QUESTION AND THE ANSWER ARE ONE CONTRACT. Built from `nudge_text` itself, so a token
+    /// renamed on one side and not the other fails here rather than going quietly unparsed for
+    /// months — which is exactly how "the ladder asks a question it does not listen for the answer
+    /// to" survived as long as it did.
+    #[test]
+    fn every_token_the_nudge_offers_parses_back() {
+        for (token, expected) in REPLY_TOKENS {
+            assert!(
+                nudge_text(1, 60).contains(token),
+                "{token} is parsed but never offered — the vocabulary has drifted"
+            );
+            assert_eq!(
+                parse_reply(&screen_after_nudge(1, Some(token))),
+                Some(expected),
+                "the agent answered {token} and the ladder did not hear it"
+            );
+        }
+    }
+
+    /// The founder's screenshot verbatim — the exact line the agent sent fourteen times.
+    #[test]
+    fn the_answer_from_the_screenshot_parses() {
+        let screen =
+            screen_after_nudge(1, Some("not-blocked — complete; goal marked met, nothing left to resume."));
+        assert_eq!(parse_reply(&screen), Some(Reply::NotBlocked));
+    }
+
+    /// This reads a RENDERED grid, so the terminal has already hard-wrapped at the pane width — and
+    /// the wrap lands wherever the column falls, including the middle of the token.
+    #[test]
+    fn a_reply_wrapped_by_the_terminal_still_parses() {
+        let screen = format!("{}\n● not-bl\nocked — done here.\n", nudge_text(2, 245));
+        assert_eq!(parse_reply(&screen), Some(Reply::NotBlocked));
+    }
+
+    /// An agent that corrects itself means the correction.
+    #[test]
+    fn the_last_answer_wins() {
+        let screen = format!("{}\n● not-blocked — wait, actually blocked-on-ci\n", nudge_text(1, 60));
+        assert_eq!(parse_reply(&screen), Some(Reply::Ci));
+    }
+
+    /// FAIL CLOSED, AND THE CLOSED DIRECTION IS THE NOISY ONE. Every unreadable shape yields `None`,
+    /// which leaves the ordinary ladder running — a false negative costs one more ping, a false
+    /// positive goes quiet on an agent that never spoke.
+    #[test]
+    fn an_unreadable_screen_yields_no_answer() {
+        // No nudge on screen at all: a bare token in ordinary output is not an answer to anything.
+        assert_eq!(parse_reply("● I am not-blocked by the way\n"), None);
+        // A nudge whose text is cut off by scrollback: the question/answer boundary is unknown.
+        let truncated = "[sparkle-nudge #4 · no output for 10m] Automated ping, not a\n● not-blocked\n";
+        assert_eq!(parse_reply(truncated), None);
+        assert_eq!(parse_reply(""), None);
+    }
+
+    // ══ THE FOURTEEN-PING LOOP ══════════════════════════════════════════════════════════════════
+
+    /// THE FOUNDER'S BUG, END TO END (screenshot 2026-08-07 16:28).
+    ///
+    /// An agent whose goal is MET answers `not-blocked`, and was pinged again anyway — fourteen
+    /// consecutive times, every one labelled `#1`, every one reporting the same `4m 5s`, every one a
+    /// FULL AGENT TURN with context loaded and a model called. The `#1` and the `4m 5s` are the
+    /// tell: 5+10+20+30+60+120 = 245s is the climb from rung 1, so the ladder was resetting to the
+    /// bottom every cycle — on the echo of its own nudge and the answer it had itself demanded.
+    ///
+    /// Both halves are asserted, because either alone would let it recur: no further WRITE, and the
+    /// counter not silently restarting underneath.
+    #[test]
+    fn a_met_goal_and_a_not_blocked_reply_end_the_pinging() {
+        let mut s = AgentState::default();
+        let first = run(&mut s, &stalled(), 7);
+        assert_eq!(first[6].action, Action::Nudge { n: 1 }, "precondition: it did get one ping");
+
+        // The nudge lands. The agent answers and marks its goal met — and BOTH the echo of our own
+        // text and the answer itself move the hash, which is what used to reset everything.
+        let answered = Observation {
+            hash: 0x0a11,
+            goal_met: true,
+            reply: parse_reply(&screen_after_nudge(
+                1,
+                Some("not-blocked — complete; goal marked met, nothing left to resume."),
+            )),
+            ..stalled()
+        };
+        assert_eq!(answered.reply, Some(Reply::NotBlocked), "fixture must carry a real answer");
+
+        // Forty more looks — far past the fourteen the founder watched.
+        let after = run(&mut s, &answered, 40);
+        assert!(
+            after.iter().all(|d| d.action == Action::Observe),
+            "a finished agent must never be typed at again: {:?}",
+            after.iter().find(|d| d.action != Action::Observe)
+        );
+        assert_eq!(s.delivered(), 0, "and nothing more went out");
+        assert!(
+            after.iter().all(|d| d.flagged.is_none()),
+            "an agent that is DONE is not a row anybody owes"
+        );
+        assert_eq!(
+            after.last().unwrap().refusal,
+            Some("nothing-to-resume"),
+            "and the log says why, so this is diagnosable without a screenshot"
+        );
+    }
+
+    /// The two suppressors are INDEPENDENT — the founder asked for either to be sufficient, and a
+    /// fix that only worked when both held would still have re-pinged half the fleet.
+    #[test]
+    fn either_a_met_goal_or_a_not_blocked_reply_is_enough_on_its_own() {
+        // (a) Goal met, agent never answered anything.
+        let mut goal_only = AgentState::default();
+        let d = run(&mut goal_only, &Observation { goal_met: true, ..stalled() }, 30);
+        assert!(d.iter().all(|d| d.action == Action::Observe), "a met goal alone must silence writes");
+        assert!(d.iter().all(|d| d.flagged.is_none()));
+
+        // (b) Answered `not-blocked`, goal NOT met — a met goal is not required to believe the agent.
+        let mut reply_only = AgentState::default();
+        run(&mut reply_only, &stalled(), 7);
+        let answered =
+            Observation { hash: 0x0b22, goal_met: false, reply: Some(Reply::NotBlocked), ..stalled() };
+        let d = run(&mut reply_only, &answered, 30);
+        assert!(
+            d.iter().all(|d| d.action == Action::Observe),
+            "`not-blocked` alone must silence writes"
+        );
+    }
+
+    // ══ THE OTHER DIRECTION — NEVER HIDE AN AGENT THAT NEEDS SOMEBODY ═══════════════════════════
+
+    /// SPARKLE'S STANDING RULE, PINNED. An agent that is stuck and NOT reporting `not-blocked` must
+    /// still be nudged and must still reach a human. This is the assertion that stops the fix above
+    /// from being "make the nudger quiet", and it is deliberately the same fixture as the loop test
+    /// with only the answer and the goal removed.
+    #[test]
+    fn a_stalled_agent_that_says_nothing_is_still_nudged_and_still_escalates() {
+        let mut s = AgentState::default();
+        let d = run(&mut s, &stalled(), 20);
+
+        let nudges: Vec<u32> = d
+            .iter()
+            .filter_map(|d| match d.action {
+                Action::Nudge { n } => Some(n),
+                _ => None,
+            })
+            .collect();
+        assert!(!nudges.is_empty(), "silence with no answer must still be nudged");
+        assert_eq!(nudges[0], 1);
+        let raised: Vec<Escalation> = d.iter().filter_map(|d| d.escalate).collect();
+        assert_eq!(
+            raised,
+            vec![Escalation::Concierge, Escalation::Founder],
+            "and a human must still be told"
+        );
+    }
+
+    /// `blocked-on-human` RAISES SOMETHING A HUMAN SEES RATHER THAN RE-PINGING. Re-typing cannot
+    /// move a blocker only a person can clear, so the ping is wasted and the flag is the point —
+    /// and it comes at the FIRST answer rather than after another five ignored turns.
+    #[test]
+    fn blocked_on_human_flags_the_founder_at_once_and_stops_typing() {
+        let mut s = AgentState::default();
+        run(&mut s, &stalled(), 7);
+        let asking = Observation { hash: 0x0c33, reply: Some(Reply::Human), ..stalled() };
+
+        let d = run(&mut s, &asking, 20);
+        assert!(d.iter().all(|x| x.action == Action::Observe), "a human blocker is not typed at");
+        assert_eq!(
+            d[0].escalate,
+            Some(Escalation::Founder),
+            "the founder is flagged on the look that reads the answer, not five nudges later"
+        );
+        assert!(
+            d.iter().all(|x| x.flagged == Some(Escalation::Founder)),
+            "and the row STAYS up for as long as the ask does"
+        );
+        assert_eq!(d.last().unwrap().refusal, Some("blocked-on-human"));
+    }
+
+    /// A MET GOAL MUST NOT DELETE A ROW A HUMAN OWES. The two should not co-occur, but `goal_met` is
+    /// a frontend-written fact that can be stale, and the failure is asymmetric: if it won here, a
+    /// stale "met" would silently swallow an explicit request for a person.
+    #[test]
+    fn an_ask_for_a_human_outranks_a_met_goal() {
+        let mut s = AgentState::default();
+        run(&mut s, &stalled(), 7);
+        let both =
+            Observation { hash: 0x0d44, goal_met: true, reply: Some(Reply::Human), ..stalled() };
+        let d = run(&mut s, &both, 10);
+        assert!(
+            d.iter().all(|x| x.flagged == Some(Escalation::Founder)),
+            "an explicit ask for a person survives a met goal"
+        );
+    }
+
+    /// `blocked-on-quota` BACKS OFF HARD. Answering a ping costs a turn against the exact budget
+    /// that is exhausted, so the interval jumps well past the ladder's own top rung — and the
+    /// concierge, which is the layer that can act on a quota wall, is told.
+    #[test]
+    fn blocked_on_quota_backs_off_hard_and_tells_the_concierge() {
+        let mut s = AgentState::default();
+        run(&mut s, &stalled(), 7);
+        let broke = Observation { hash: 0x0e55, reply: Some(Reply::Quota), ..stalled() };
+
+        let d = run(&mut s, &broke, 10);
+        assert!(d.iter().all(|x| x.action == Action::Observe), "never ping an agent that is out of quota");
+        assert_eq!(d[0].escalate, Some(Escalation::Concierge));
+        let waits: Vec<u64> = d[1..].iter().map(|x| x.next_look_secs).collect();
+        assert!(
+            waits.iter().all(|w| *w == QUOTA_BACKOFF_SECS),
+            "the backoff must exceed the ladder's own top rung, not merely reach it: {waits:?}"
+        );
+        assert!(QUOTA_BACKOFF_SECS > LADDER_SECS[LADDER_SECS.len() - 1]);
+    }
+
+    // ══ THE LADDER ACTUALLY ADVANCES ════════════════════════════════════════════════════════════
+
+    /// `#2` MUST DIFFER FROM `#1`. The founder counted fourteen pings all labelled `#1`: a ladder
+    /// that cannot count cannot escalate, cannot back off and cannot give up — it is a loop wearing
+    /// a ladder's name. An answered nudge now advances the conversation instead of erasing it.
+    #[test]
+    fn the_counter_advances_across_an_answered_nudge() {
+        let mut s = AgentState::default();
+        let first = run(&mut s, &stalled(), 7);
+        assert_eq!(first[6].action, Action::Nudge { n: 1 });
+
+        // An answer that does NOT silence the ladder, so the next ping is observable.
+        let waiting = Observation { hash: 0x0f66, reply: Some(Reply::Ci), ..stalled() };
+        let d = run(&mut s, &waiting, 10);
+
+        let next = d.iter().find_map(|x| match x.action {
+            Action::Nudge { n } => Some(n),
+            _ => None,
+        });
+        assert_eq!(next, Some(2), "the ping after an answered #1 is #2, not #1 again");
+    }
+
+    /// Output the ladder did NOT provoke is still a clean slate — a genuinely working agent must not
+    /// inherit the nudge history of the episode before it. This is the boundary of the rule above,
+    /// and without it "the counter survives" would quietly become "the counter never resets".
+    #[test]
+    fn unprovoked_output_still_resets_the_whole_episode() {
+        let mut s = AgentState::default();
+        run(&mut s, &stalled(), 12);
+        assert!(s.attempts() >= 3, "precondition: a real nudge history");
+
+        // Moving, with no answer to any nudge — the agent simply got back to work.
+        let working_again = Observation { hash: 0x1077, reply: None, ..stalled() };
+        step(&mut s, &working_again);
+        assert_eq!(s.attempts(), 0, "unprovoked output earns a clean slate");
+        assert_eq!(s.escalated(), None);
+        assert_eq!(s.standdown(), None);
+    }
+
+    /// THE TERMINAL RUNG. Past `GIVE_UP_AFTER` identical ignored pings there is nothing another one
+    /// can achieve that the founder flag has not — so the TYPING stops while the TELLING does not.
+    #[test]
+    fn the_ladder_gives_up_typing_but_never_gives_up_telling() {
+        let mut s = AgentState::default();
+        let d = run(&mut s, &stalled(), 40);
+
+        let nudges: Vec<u32> = d
+            .iter()
+            .filter_map(|x| match x.action {
+                Action::Nudge { n } => Some(n),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            nudges,
+            (1..=GIVE_UP_AFTER).collect::<Vec<u32>>(),
+            "exactly {GIVE_UP_AFTER} pings, however long the agent stays wedged"
+        );
+
+        let tail = &d[d.len() - 10..];
+        assert!(tail.iter().all(|x| x.refusal == Some("gave-up")));
+        assert!(
+            tail.iter().all(|x| x.flagged == Some(Escalation::Founder)),
+            "the row a human owes is NEVER hidden — giving up on typing is not giving up on telling"
+        );
+    }
+
+    // ══ "UNLESS NEW WORK ARRIVES" ═══════════════════════════════════════════════════════════════
+
+    /// A stand-down says "there is nothing to resume". Handing the agent something to resume ends
+    /// that, and a foreign write is exactly that event. Without this the fix would be permanent: an
+    /// agent that once said `not-blocked` could never be nudged again for the life of its session.
+    #[test]
+    fn new_work_releases_a_stand_down() {
+        let mut s = AgentState::default();
+        run(&mut s, &stalled(), 7);
+        let answered = Observation { hash: 0x1188, reply: Some(Reply::NotBlocked), ..stalled() };
+        run(&mut s, &answered, 12);
+        assert_eq!(s.standdown(), Some(Standdown::Done), "precondition: stood down");
+
+        // The founder types a new task into the terminal. `foreign_write_ms` is an ABSOLUTE stamp,
+        // so this is caught however long ago in the look cycle it happened.
+        let new_work = Observation { hash: 0x1199, foreign_write_ms: 42, ..answered };
+        step(&mut s, &new_work);
+        assert_eq!(s.standdown(), None, "new work puts the agent back under the ordinary ladder");
+        assert_eq!(s.attempts(), 0, "with a clean history");
+
+        // ...and it really does nudge again if the new work then stalls.
+        let stalled_again = Observation { hash: 0x1199, foreign_write_ms: 42, ..stalled() };
+        let d = run(&mut s, &stalled_again, 8);
+        assert_eq!(
+            d.iter().find_map(|x| match x.action {
+                Action::Nudge { n } => Some(n),
+                _ => None,
+            }),
+            Some(1),
+            "a stand-down must not outlive the work that justified it"
+        );
+    }
+
+    /// A stand-down is NOT released by the passage of time or by the agent's own idle redraws —
+    /// only by somebody actually giving it work. Otherwise the fourteen-ping loop returns with a
+    /// longer period, which is not a fix.
+    #[test]
+    fn a_stand_down_survives_everything_except_new_work() {
+        let mut s = AgentState::default();
+        run(&mut s, &stalled(), 7);
+        let answered = Observation { hash: 0x11aa, reply: Some(Reply::NotBlocked), ..stalled() };
+        step(&mut s, &answered);
+
+        // Idle redraws: the hash keeps moving, nobody typed. A spinner is not a new assignment.
+        for i in 0..12u64 {
+            let redraw = Observation { hash: 0x2000 + i, ..answered };
+            let d = step(&mut s, &redraw);
+            assert_eq!(d.action, Action::Observe, "redraw {i} must not revive the pinging");
+        }
+        assert_eq!(s.standdown(), Some(Standdown::Done));
     }
 }

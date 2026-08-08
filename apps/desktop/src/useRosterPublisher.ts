@@ -27,6 +27,7 @@ import {
 } from "./services/sessionProjects";
 import { agentDisplayName } from "./engine/agentDisplayName";
 import { rollupDotAccessor } from "./engine/workerRollup";
+import { goalStateOf } from "./engine/agentGoal";
 import { calmNewAgent } from "./engine/newAgentAttention";
 import { useNewAgentGraceTick } from "./hooks/useNewAgentCalm";
 import { composerPrompts } from "./components/promptHistory";
@@ -158,6 +159,12 @@ export function buildRoster(
           // A childless row and a worker row roll up to their own tier (an empty worker list), so
           // every row in the payload carries the field and no consumer needs a special case.
           rollup_dot: dotOf(a.id),
+          // For the Rust nudger. It cannot see this store, and without it the sparkle-nudge ladder
+          // re-pings agents that have already reported their goal met — the founder's 2026-08-07
+          // screenshot caught fourteen consecutive pings on one such agent, each a full agent turn.
+          // Derived here rather than read off `a.goal.met` so an EXPIRED or ESCALATED goal (both of
+          // which have `met` unset but are not "done") can never be published as met.
+          goal_state: goalStateOf(a.goal, now),
           parent_id: a.parentId,
           workflow_stage: workflowStage[a.id] ?? null,
           last_activity_at: lastActivityAt(a, interaction),

@@ -200,6 +200,13 @@ export interface NudgeFlag {
   delivered: number;
   blockedBy: string | null;
   silentSecs: number;
+  /** The agent's OWN one-line answer to the nudge — "blocked-on-human" | "blocked-on-ci" |
+   *  "blocked-on-another-agent" | "blocked-on-quota" | "not-blocked" — or null if it never answered.
+   *
+   *  NOT the same question as `blockedBy`, which is why WE could not type at it (a picker, a parked
+   *  reader). This is what the AGENT says is stopping IT. Optional so a flag raised by a Rust build
+   *  that predates the field still parses. */
+  reply?: string | null;
 }
 
 /** What a recovery attempt did, per agent. Emitted on {@link AUTH_RECOVERY_RESULT_EVENT}. */
