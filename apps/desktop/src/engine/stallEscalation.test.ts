@@ -37,6 +37,29 @@ function resting(over: Partial<StallInput> = {}): StallInput {
   };
 }
 
+/**
+ * A resting row that only the FOUNDER can clear — the fixture for every case about the RED tier.
+ *
+ * Both halves of `human-verified-goal` (engine/agentStall): auto-continue has stopped (`escalatedAt`)
+ * AND the goal's stated check is one no agent may ever discharge (`{kind:"human"}`).
+ *
+ * ⚠️ WHY SO MANY CASES BELOW NEEDED IT ON 2026-08-07. They were written against an ordinary unmet
+ * goal or a dirty worktree back when those painted red, and they are not ABOUT the tier at all —
+ * they cover liveness refusal, dismissal, the episode counter and cross-fleet selectivity. Rewriting
+ * their expectation to `lapsed` would have kept them green while quietly deleting the only coverage
+ * the red path has in those mechanisms. Swapping the FIXTURE keeps each test testing what it was
+ * written to test.
+ */
+function founderOnly(over: Partial<StallInput> = {}): StallInput {
+  return resting({
+    goal: {
+      ...newGoal("sign off on the launch copy", T0, undefined, { kind: "human" }),
+      escalatedAt: T0 + 1,
+    },
+    ...over,
+  });
+}
+
 const reportFor = (input: StallInput) => (id: string) =>
   id === "a" ? stallReport(input) : undefined;
 /** Every agent alive unless a test says otherwise — the common case. */
@@ -46,18 +69,38 @@ describe("THE FOUNDER'S ACCEPTANCE TEST — gray is a terminal state", () => {
   // "An agent with an unmet goal, or with uncommitted changes, or with an open unmerged branch, must
   // never render gray. If your state model can produce that combination, it is not finished."
   // The third element is the tier the row must land in. It was implicitly `blocked` for every case
-  // until 2026-08-06; `an escalated goal` now lands AMBER instead, because auto-continue's retry
-  // budget running out is a fact about our machinery rather than about the work (see LIFECYCLE in
-  // stallEscalation.ts). The founder's rule is unchanged and still asserted for all five: NOT GRAY.
+  // until 2026-08-06, when `an escalated goal` moved to AMBER; on 2026-08-07 the remaining four
+  // followed it, because each names work ANOTHER ACTOR clears — the concierge lands a branch, the
+  // agent commits its worktree, CI clears a PR, auto-continue drives an unmet goal (see OUTSTANDING
+  // in stallEscalation.ts).
+  //
+  // ⚠️ THE FOUNDER'S RULE HERE IS UNCHANGED AND STILL FULLY ASSERTED: none of these may render GRAY.
+  // That is what the colour assertion in each `it` checks, and it is the actual content of "gray is a
+  // terminal state" — the rule says a row that owes work must LEAVE CALM, it never said which
+  // non-calm colour. Amber satisfies it. Do not read the tier change below as a weakening of it; the
+  // last case pins the red tier still being reachable, so the matrix is non-trivial in both
+  // directions.
   const cases: Array<[string, StallInput, AgentTabStatus]> = [
-    ["an unmet goal", resting({ goal: newGoal("ship the ladder", T0) }), "blocked"],
-    ["uncommitted changes", resting({ hasUncommittedChanges: true }), "blocked"],
-    ["an open unmerged PR", resting({ hasOpenPr: true }), "blocked"],
-    ["committed work that never landed", resting({ hasUnlandedWork: true }), "blocked"],
+    ["an unmet goal", resting({ goal: newGoal("ship the ladder", T0) }), "lapsed"],
+    ["uncommitted changes", resting({ hasUncommittedChanges: true }), "lapsed"],
+    ["an open unmerged PR", resting({ hasOpenPr: true }), "lapsed"],
+    ["committed work that never landed", resting({ hasUnlandedWork: true }), "lapsed"],
     [
       "an escalated goal",
       resting({ goal: { ...newGoal("hard", T0), escalatedAt: T0 + 1 } }),
       "lapsed",
+    ],
+    // …and the one that IS his. Auto-continue has stopped AND the goal's stated check is one no
+    // agent may ever discharge, so nobody but the founder can clear this row.
+    [
+      "a goal only a person can close, with no retry coming",
+      resting({
+        goal: {
+          ...newGoal("approve the copy", T0, undefined, { kind: "human" }),
+          escalatedAt: T0 + 1,
+        },
+      }),
+      "blocked",
     ],
     // NOTE: "an expired goal" USED TO BE A CASE HERE and was removed on purpose (sparkle-biezi).
     // Expiry is a fact about the clock, not about the work, so it is no longer sufficient on its own
@@ -83,15 +126,45 @@ describe("THE FOUNDER'S ACCEPTANCE TEST — gray is a terminal state", () => {
     expect(AGENT_STATUS[out.a as AgentTabStatus].color).not.toBe(AGENT_STATUS.idle.color);
   });
 
-  it("STUCK IS RED — the founder's second complaint, asserted as colour", () => {
+  it("STUCK IS NOT GRAY — the founder's second complaint, asserted as colour", () => {
     // "the user also asked why an agent that is STUCK is not red. Their expectation is that stuck
     // means red, not gray."
+    //
+    // ⚠️ THIS ASSERTED `waiting.color` (RED) UNTIL 2026-08-07, and the founder himself superseded it:
+    // *"Why are all these agents red? They don't seem to need anything from me."* A row stuck on an
+    // unmet goal is one auto-continue is still driving, so it needs nothing from him — the ANSWER to
+    // "why isn't this gray" was never "because it needs you", it was "because it isn't finished".
+    // Amber says exactly that, and the complaint the case was written for — a stuck row rendering as
+    // calm as a shipped one — is still fully guarded here.
     const out = withStallAttention(
       AGENTS,
       { a: "idle" },
       reportFor(resting({ goal: newGoal("stuck on the merge", T0) })),
       allAlive,
     );
+    const color = AGENT_STATUS[out.a as AgentTabStatus].color;
+    expect(color).not.toBe(AGENT_STATUS.idle.color);
+    expect(color).toBe(AGENT_STATUS.lapsed.color);
+  });
+
+  it("…and RED still reaches the rows that ARE his, so the tier is not dead", () => {
+    // The other direction, and the reason the change above is safe: making rows less red must not
+    // make the red tier unreachable. A goal only a person can close, with no retry coming, still
+    // paints the loudest colour the app has.
+    const out = withStallAttention(
+      AGENTS,
+      { a: "idle" },
+      reportFor(
+        resting({
+          goal: {
+            ...newGoal("sign off on the launch copy", T0, undefined, { kind: "human" }),
+            escalatedAt: T0 + 1,
+          },
+        }),
+      ),
+      allAlive,
+    );
+    expect(out.a).toBe("blocked");
     expect(AGENT_STATUS[out.a as AgentTabStatus].color).toBe(AGENT_STATUS.waiting.color);
   });
 });
@@ -127,30 +200,39 @@ describe("EXPIRY IS NOT AN ALARM — sparkle-biezi", () => {
     expect(mustLeaveCalm(report)).toBe(false);
   });
 
-  it("STILL goes red when the expiry sits on top of UNLANDED work", () => {
-    // The other half of the founder's rule. The work-based causes are untouched, so a row that
-    // genuinely owes something keeps exactly the colour it had — on the strength of the work, not
-    // of the clock. Without this, the fix above would have silenced real stalls too.
+  it("STILL leaves calm when the expiry sits on top of UNLANDED work", () => {
+    // The other half of the founder's rule: a row that genuinely owes something must not go quiet
+    // just because its clock also ran out. Without this, the expiry fix would have silenced real
+    // stalls too.
+    //
+    // ⚠️ THIS ASSERTED `blocked` UNTIL 2026-08-07 ("keeps exactly the colour it had — on the strength
+    // of the work"). `unlanded-work` is amber now: the concierge lands a stranded branch alone, and
+    // did so for 15 of them in one night. The half of the rule this case exists for is untouched —
+    // the row still LEAVES CALM on the strength of the work rather than of the clock, which is what
+    // separates it from the spotless expired row above.
     const out = withStallAttention(
       AGENTS,
       { a: "idle" },
       reportFor({ ...expiredAndDone, hasUnlandedWork: true }),
       allAlive,
     );
-    expect(out.a).toBe("blocked");
+    expect(out.a).toBe("lapsed");
+    expect(mustLeaveCalm(stallReport({ ...expiredAndDone, hasUnlandedWork: true }))).toBe(true);
+    expect(AGENT_STATUS[out.a as AgentTabStatus].color).not.toBe(AGENT_STATUS.idle.color);
     expect(stallReport({ ...expiredAndDone, hasUnlandedWork: true }).causes).toContain(
       "expired-goal",
     );
   });
 
-  it("STILL goes red when the expiry sits on top of uncommitted changes", () => {
+  it("STILL leaves calm when the expiry sits on top of uncommitted changes", () => {
     const out = withStallAttention(
       AGENTS,
       { a: "idle" },
       reportFor({ ...expiredAndDone, hasUncommittedChanges: true }),
       allAlive,
     );
-    expect(out.a).toBe("blocked");
+    expect(out.a).toBe("lapsed");
+    expect(AGENT_STATUS[out.a as AgentTabStatus].color).not.toBe(AGENT_STATUS.idle.color);
   });
 
   it("an ESCALATED goal leaves calm — but AMBER, not the red it used to be", () => {
@@ -174,18 +256,18 @@ describe("EXPIRY IS NOT AN ALARM — sparkle-biezi", () => {
     expect(AGENT_STATUS.lapsed.color).not.toBe(AGENT_STATUS.waiting.color);
   });
 
-  it("…but an escalated goal WITH outstanding work is still RED", () => {
-    // The safety property, and the reason the change above is not a way to silence real stalls:
-    // `OUTSTANDING` is tested before `LIFECYCLE`, so work that exists still outranks the amber tier.
+  it("…but a row that owes the FOUNDER a verdict is still RED, whatever else is true of it", () => {
+    // The safety property, and the reason none of this is a way to silence real stalls: `OUTSTANDING`
+    // is tested before `LIFECYCLE`, so a cause only he can clear still outranks the amber tier.
+    //
+    // ⚠️ THIS DROVE `hasUncommittedChanges` UNTIL 2026-08-07, when uncommitted work moved to amber
+    // (the agent commits or discards its own worktree — the founder never does). Amber-plus-amber
+    // must NOT add up to red, which is pinned in redAttentionTaxonomy; what this case guards is the
+    // ORDERING, so it now carries a genuinely red cause plus a pile of amber ones.
     const out = withStallAttention(
       AGENTS,
       { a: "idle" },
-      reportFor(
-        resting({
-          goal: { ...newGoal("hard", T0), escalatedAt: T0 + 1 },
-          hasUncommittedChanges: true,
-        }),
-      ),
+      reportFor(founderOnly({ hasUncommittedChanges: true, hasUnlandedWork: true })),
       allAlive,
     );
     expect(out.a).toBe("blocked");
@@ -262,10 +344,18 @@ describe("a DEAD process, shaped the way production presents it", () => {
   // status that IS escalatable, and the band is its own evidence of outstanding work. The row went red
   // saying "needs you to unstick it" about an agent with no PTY. The earlier test could not see it
   // because it passed the PRE-overlay status, which the real pipeline never presents here.
+  //
+  // The goal is the FOUNDER-ONLY one so the "while the process is alive" control below still lands
+  // on RED. The liveness refusal itself runs BEFORE the tier split (`withStallAttention` continues
+  // on a dead process without ever calling `escalationFor`), so it covers both tiers either way —
+  // but the loudest colour is the one worth pinning against a dead PTY.
   const deadUnmergedRow: StallInput = {
     status: "unmerged", // what withUnmergedWork wrote over `stopped`
     now: T0,
-    goal: newGoal("never finished", T0),
+    goal: {
+      ...newGoal("never finished", T0, undefined, { kind: "human" }),
+      escalatedAt: T0 + 1,
+    },
     hasOpenPr: false,
     hasUncommittedChanges: true,
   };
@@ -290,18 +380,16 @@ describe("a DEAD process, shaped the way production presents it", () => {
     // `goalContinuation` fails CLOSED on absent liveness because a wrong yes there spends money by
     // typing into a terminal. Here a wrong yes only colours a dot, and failing closed would re-open
     // the gray lie this module exists to close. Same evidence, different cost, different default.
-    const out = withStallAttention(
-      AGENTS,
-      { a: "idle" },
-      reportFor(resting({ goal: newGoal("g", T0) })),
-      () => undefined,
-    );
+    const out = withStallAttention(AGENTS, { a: "idle" }, reportFor(founderOnly()), () => undefined);
     expect(out.a).toBe("blocked");
   });
 });
 
 describe("the red it produces is a red the human can ACKNOWLEDGE", () => {
-  const stalled = resting({ goal: newGoal("land the branch", T0) });
+  // FOUNDER-ONLY since 2026-08-07: this suite is about acknowledging the RED tier, and its old
+  // fixture (a plain unmet goal) is amber now. The amber tier has its own end-to-end suite at the
+  // bottom of this file; keeping both means neither path loses its dismissal coverage.
+  const stalled = founderOnly();
   const CALM: Record<string, AgentTabStatus> = { a: "unmerged" };
 
   /**
@@ -433,7 +521,7 @@ describe("the red it produces is a red the human can ACKNOWLEDGE", () => {
       { stalled: "idle", clean: "idle", busy: "working" },
       (id) =>
         id === "stalled"
-          ? stallReport(resting({ goal: newGoal("g", T0) }))
+          ? stallReport(founderOnly())
           : id === "clean"
             ? stallReport(resting())
             : undefined,

@@ -81,18 +81,67 @@ export const ESCALATED_STATUS: AgentTabStatus = "blocked";
 export const LAPSED_STATUS: AgentTabStatus = "lapsed";
 
 /**
- * The causes that mean "this row is not finished".
+ * The causes that mean "THE FOUNDER IS THE ONLY ACTOR WHO CAN UNBLOCK THIS".
  *
  * Kept as an explicit set rather than "any cause at all" so that adding a new cause to `agentStall`
  * forces a decision here about whether it belongs in the red tier, instead of silently recolouring
- * rows. Each member is work that EXISTS and that nothing is coming to finish — which is what the
- * founder's rule licenses painting red.
+ * rows.
+ *
+ * ══ ONE MEMBER, AND THE TEST IS A QUESTION WITH AN ANSWER (2026-08-07) ═══════════════════════════
+ * This set used to read `unmet-goal` / `open-pr` / `unlanded-work` / `uncommitted-changes`, on the
+ * rule "work that EXISTS and that nothing is coming to finish". That rule turned out to be the wrong
+ * question, and the founder answered it directly after triaging red rows that needed nothing from him
+ * at least six separate times in one day: *"Why are all these agents red? They don't seem to need
+ * anything from me."* — *"Why is Cloud Gate Dead End showing as red?"* — *"When it doesn't need
+ * anything from me."*
+ *
+ * The right question is not *is work outstanding* but **who can clear it**:
+ *
+ *   • `unlanded-work` — THE CONCIERGE DOES THIS ALONE, and did, for 15 branches in one night. 'Cloud
+ *     Gate Dead End' — the row he named — was red for a single stranded commit with no PR; pushing
+ *     the branch, opening #1509 and merging it when green resolved it, and he was required at no
+ *     step of that.
+ *   • `uncommitted-changes` — the AGENT commits or discards its own worktree. He never does.
+ *   • `open-pr` — CI or a reviewer clears it. Not his to press.
+ *   • `unmet-goal` — the agent's own work is unfinished, and finishing it is the AGENT's job. It is
+ *     also the state auto-continue is defined over (`hasUnmetGoal` gates the retry budget and is
+ *     true for exactly it), so the machinery may well be driving it.
+ *
+ *     ⚠️ BUT DO NOT REST THE DEMOTION ON THAT SECOND SENTENCE — an earlier draft did, and it is not
+ *     sound (roborev 60322). Auto-continue only runs where there is turn-end authority; an agent
+ *     that stalls in a window without it is never continued AND never escalated, so it can sit
+ *     `unmet` with nothing actually driving it (the 09:00/09:30 case `agentStall` describes at
+ *     length). The demotion rests on the FIRST sentence, which holds either way: whether or not a
+ *     retry is coming, the founder is not the actor — he cannot finish the agent's work for it, and
+ *     an unmet goal asks him for nothing. If nothing is driving it, the defect is in
+ *     goalContinuation/turn-end authority, and painting the row red neither fixes that nor tells
+ *     him anything he can act on.
+ *
+ * All four are lifecycle bookkeeping, so all four moved to {@link LIFECYCLE}. What is left is the one
+ * cause where the answer is genuinely "nobody but him": `human-verified-goal` — auto-continue has
+ * stopped AND the goal's stated check is one no agent may ever discharge. See its derivation in
+ * `agentStall`.
+ *
+ * THE COST OF GETTING THIS WRONG IS NOT THE CLICKS. It is that a red row stops meaning anything, and
+ * a genuine blocker then hides among the false ones. That is why the bar for membership here is the
+ * strongest claim the app can make, not merely a true one.
+ *
+ * ⚠️ THE OPPOSITE FAILURE IS THE MORE EXPENSIVE ONE, and nothing above weakens it. Sparkle's standing
+ * rule is never to hide a row that needs the founder. Three things hold it:
+ *   • The genuinely-red STATUSES never pass through this module at all — `waiting`, `approval` and
+ *     `errored` are derived by `statusEngine` from the PTY and are not in {@link ESCALATABLE}, so an
+ *     unanswered question or a permission prompt is untouched by every line here.
+ *   • `OUTSTANDING` is still tested FIRST in {@link escalationFor}, so a row that owes him a verdict
+ *     stays red however much amber bookkeeping sits beside it.
+ *   • `redAttentionTaxonomy.test.ts` pins BOTH directions per cause by name, and makes an
+ *     unclassified new cause a type error.
  *
  * ── `expired-goal` AND `escalated-goal` ARE BOTH DELIBERATELY ABSENT — BUT NOT TO THE SAME PLACE. ─
  * `expired-goal` left first (sparkle-biezi, the argument below) and is in NEITHER set: it renders
  * calm gray, which already satisfies "not red". `escalated-goal` left on 2026-08-06 for the same
  * reason one notch further and went to {@link LIFECYCLE}, which paints AMBER. Read LIFECYCLE for why
- * the two were separated; what follows is the original expiry argument, the derivation both rest on.
+ * the two were separated; what follows is the original expiry argument — the derivation that the
+ * four work causes above eventually followed to the same place.
  *
  * ── EXPIRY IS NOT AN ALARM. ──────────────────────────────────────────────────────────────────────
  * It was in this set and it was the single biggest source of false red on the fleet (sparkle-biezi).
@@ -126,20 +175,22 @@ export const LAPSED_STATUS: AgentTabStatus = "lapsed";
  * Do NOT fix a future "expiry is invisible" report by adding it back here — the affordance exists,
  * one layer up, and now also in {@link LIFECYCLE}'s own amber tier.
  */
-const OUTSTANDING: ReadonlySet<StallCause> = new Set<StallCause>([
-  "unmet-goal",
-  "open-pr",
-  "unlanded-work",
-  "uncommitted-changes",
-]);
+const OUTSTANDING: ReadonlySet<StallCause> = new Set<StallCause>(["human-verified-goal"]);
 
 /**
- * The causes that mean "the AUTO-CONTINUE MACHINERY stopped", which is not the same claim at all.
+ * The causes ANOTHER ACTOR CAN CLEAR — the concierge, the agent itself, CI, or auto-continue.
  *
- * ONE MEMBER: `escalated-goal`. Every member of `OUTSTANDING` above is a fact about the WORK — a
- * goal nobody met, a PR nobody merged, commits that never landed, files nobody committed. This is a
- * fact about Sparkle's own retry budget: how much it was willing to SPEND chasing a goal before
- * handing it back. It does not say the human is required, and it does not say the work is unfinished.
+ * Amber. Not calm (the work is real and a reader should see it) and not red (it is not addressed to
+ * the founder). This is where every cause lands that is not the single red one above.
+ *
+ * ── IT WAS ONE MEMBER UNTIL 2026-08-07 ───────────────────────────────────────────────────────────
+ * It held only `escalated-goal`, and the distinction drawn was "a fact about the WORK" (red) versus
+ * "a fact about Sparkle's retry budget" (amber). That line was too narrow: it moved the one cause
+ * the founder had named that week and left four behind, so he kept triaging red rows that needed
+ * nothing. `unmet-goal`, `open-pr`, `unlanded-work` and `uncommitted-changes` joined it — see
+ * {@link OUTSTANDING} for who clears each one, which is the question that decides membership now.
+ *
+ * A cause here still says the row is NOT FINISHED. It says only that finishing it is not his job.
  *
  * ⚠️ `expired-goal` IS DELIBERATELY NOT HERE, and it WAS in the first cut of this change — so if you
  * are reading this because the set looks like it is missing one, it is not. Expiry is already calm
@@ -163,16 +214,24 @@ const OUTSTANDING: ReadonlySet<StallCause> = new Set<StallCause>([
  * retry budget is even more clearly OUR machinery's business than a clock is.
  *
  * ── RED WINS OVER AMBER, AND THAT IS THE SAFETY PROPERTY ─────────────────────────────────────────
- * `withStallAttention` tests `OUTSTANDING` FIRST. So an agent that gave up AND still holds unlanded
- * work stays RED, on the strength of the WORK — `unmet-goal` / `open-pr` / `unlanded-work` /
- * `uncommitted-changes` are untouched and still fire on their own evidence. Only a row that owes
- * NOTHING goes quiet. Without that ordering this change would silence real stalls, which is the
- * opposite failure and the more expensive one.
+ * `withStallAttention` tests `OUTSTANDING` FIRST, so a row that owes the founder a verdict stays RED
+ * however much of this set is also true of it. The ordering is what keeps making rows less red from
+ * silencing a real one — the opposite failure, and the more expensive one.
+ *
+ * (That sentence used to run the other way — "an agent that gave up AND still holds unlanded work
+ * stays RED, on the strength of the WORK" — which stopped being true when the work causes moved
+ * here. Same ordering, same guarantee; what changed is which cause is doing the outranking.)
  *
  * The same ordering is mirrored one component out, in `components/agentNotices.STALL_CAUSE_RANK`,
  * so the row's single glyph leads with a work cause too. Keep the two in step.
  */
-const LIFECYCLE: ReadonlySet<StallCause> = new Set<StallCause>(["escalated-goal"]);
+const LIFECYCLE: ReadonlySet<StallCause> = new Set<StallCause>([
+  "escalated-goal",
+  "unmet-goal",
+  "open-pr",
+  "unlanded-work",
+  "uncommitted-changes",
+]);
 
 /** Does this report describe a row that must not render calm? True for BOTH tiers — red and amber.
  *

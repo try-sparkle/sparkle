@@ -125,7 +125,10 @@ describe("notificationFor", () => {
     const n = notificationFor("lapsed", "Backlog", "sparkle");
     expect(n.title).toBe("🔘 Backlog");
     expect(n.title).not.toBe("Backlog"); // the empty-glyph fallthrough
-    expect(n.body).toBe("Auto-continue stopped — nothing is waiting on you · sparkle");
+    // The body no longer names auto-continue: the tier widened on 2026-08-07 to every stall cause
+    // another actor can clear, so a row here is just as likely to be holding a stranded branch.
+    expect(n.body).toBe("Unfinished — but nothing is waiting on you · sparkle");
+    expect(n.body).not.toMatch(/auto-continue/i);
     // …and it must not borrow the alarm glyph either.
     expect(n.title.startsWith("🔴")).toBe(false);
   });

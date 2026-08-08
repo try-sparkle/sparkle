@@ -156,6 +156,13 @@ export const NOTICE_EXPLAINER: Record<string, string> = {
   // The tier is not knowable from here — `escalationFor` folds ALL causes together, and this table
   // sees one at a time — so the text stays TIER-AGNOSTIC and points at the row's other marks, which
   // are ordered work-first (STALL_CAUSE_RANK) precisely so they can carry that answer.
+  // THE ONE RED STALL CAUSE. Its explainer may say what the tier-agnostic ones below must not: that
+  // this row is addressed to HIM. It is the only cause where that sentence is safe, because both
+  // halves of the condition are checked before it is raised (engine/agentStall).
+  "stall:human-verified-goal":
+    "This agent's goal can only be closed by a person — the check on it is a sign-off or a command, " +
+    "neither of which any agent may mark met itself — and nothing is coming to retry it. That makes " +
+    "you the only one who can clear this row: decide whether the goal is met.",
   "stall:escalated-goal":
     "Auto-continue has given up on this agent's goal and handed it back. Nothing is coming for it " +
     "— no retry is scheduled and no other agent is watching it. The other marks on this row say " +
@@ -234,17 +241,22 @@ export const NOTICE_EXPLAINER: Record<string, string> = {
  *  {@link GLYPH_RANK}, which overrides input order — reordering this map alone does NOT reach them,
  *  and that gap is what roborev 59949 caught. Both are fixed; keep them in step. */
 const STALL_CAUSE_RANK: Record<StallCause, number> = {
-  // RED — `stallEscalation.OUTSTANDING`: the founder has something to do.
-  "unmet-goal": 0,
-  "open-pr": 1,
-  "unlanded-work": 2,
-  "uncommitted-changes": 3,
-  // NEVER RED — and these two are NOT the same tier, which is why this comment does not name one
-  // set. `escalated-goal` is `stallEscalation.LIFECYCLE` → the amber `lapsed` status.
-  // `expired-goal` is in NEITHER engine set → calm gray. Do not "keep them in step" by adding
-  // expiry to LIFECYCLE; that module's own ⚠️ block explains at length why it must stay out.
-  "escalated-goal": 4,
-  "expired-goal": 5,
+  // RED — `stallEscalation.OUTSTANDING`: the founder is the only actor who can clear it.
+  "human-verified-goal": 0,
+  // NEVER RED. The four below are `stallEscalation.LIFECYCLE` → the amber `lapsed` status; they were
+  // in the RED group until 2026-08-07 and moved together (see OUTSTANDING for who clears each). Their
+  // relative order is unchanged — it is a genuine actionability ordering among things somebody else
+  // will do, and `uncommitted-changes` stays last of them for the same reason it always did.
+  "unmet-goal": 1,
+  "open-pr": 2,
+  "unlanded-work": 3,
+  "uncommitted-changes": 4,
+  // `escalated-goal` is LIFECYCLE too, and sorts BELOW the work causes: it says our retry budget ran
+  // out, which is the quietest thing on this list. `expired-goal` is in NEITHER engine set → calm
+  // gray. Do not "keep them in step" by adding expiry to LIFECYCLE; that module's own ⚠️ block
+  // explains at length why it must stay out.
+  "escalated-goal": 5,
+  "expired-goal": 6,
 };
 
 // NO THRASH RANK HERE, deliberately (roborev 58710/58721). A `ThrashReport` carries exactly ONE

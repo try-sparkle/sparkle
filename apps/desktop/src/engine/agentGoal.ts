@@ -101,7 +101,23 @@ export interface AgentGoal {
    *
    *  Kept SEPARATE rather than folded into `verifyStated` because the two gate different things:
    *  `verifyStated` decides whether the check BINDS (and must keep failing closed on absence), while
-   *  this decides only what the refusal TELLS the agent. Nothing about enforcement reads it. */
+   *  this decides RELEVANCE — whether the obligation is about the work in front of you.
+   *
+   *  ⚠️ IT HAS A SECOND READER SINCE 2026-08-07, AND THIS DOCSTRING USED TO DENY IT (roborev 60339).
+   *  It said "this decides only what the refusal TELLS the agent. Nothing about enforcement reads
+   *  it." That is no longer true: `engine/agentStall`'s `chosenHere` reads this flag to decide
+   *  whether the `human-verified-goal` cause fires, and that cause is the ONLY member of
+   *  `stallEscalation.OUTSTANDING` — i.e. the only thing that paints a row RED.
+   *
+   *  The two readers have opposite tolerances, so know which you are affecting: the refusal copy is
+   *  cosmetic, the attention tier is a user-visible alarm. WIDENING THIS FLAG SUPPRESSES THE RED
+   *  CAUSE. Stamping it `true` on a population that does not have it today — legacy/absent
+   *  provenance, say, so the refusal copy can always name the take-back exit — would silently switch
+   *  `human-verified-goal` off for that whole population, and nothing in THIS module's suite would
+   *  catch it. `engine/redAttentionTaxonomy.test.ts` is where that contract is pinned.
+   *
+   *  @see engine/agentStall.ts — `chosenHere`, and its "TERM 3 IS A RELEVANCE JUDGEMENT" block
+   *  @see services/controlListener.ts — the original reader, the refusal's `chosenHere` evidence */
   verifyInherited?: boolean;
 }
 
@@ -290,7 +306,13 @@ export interface GoalDebt {
   verifyStated?: boolean;
   /** Was the owed check carried over from an earlier goal? Rides along so a clear-then-set cannot
    *  launder an INHERITED check into one chosen for the new goal — see
-   *  {@link AgentGoal.verifyInherited}. Read only by the refusal copy, never by the gate. */
+   *  {@link AgentGoal.verifyInherited}.
+   *
+   *  ⚠️ NOT read by the CLOSE gate (`canSelfMarkMet` never sees it) — but this line used to say
+   *  "read only by the refusal copy", and that is no longer true (roborev 60339).
+   *  `engine/agentStall` reads it to decide whether the red `human-verified-goal` cause fires, so
+   *  widening it suppresses the loudest signal in the app. The full warning is on
+   *  {@link AgentGoal.verifyInherited}; read it before changing who gets this flag. */
   verifyInherited?: boolean;
 }
 

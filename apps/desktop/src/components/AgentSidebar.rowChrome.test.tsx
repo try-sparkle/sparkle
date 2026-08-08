@@ -1021,13 +1021,21 @@ describe("Build column — an unmerged head outranks its green rollup, and what 
     expect(dot.style.background).toBe(asRgb(AGENT_STATUS.idle.color));
   });
 
-  it("but a head whose whole subtree is RESTING with unlanded work goes red", () => {
+  it("but a head whose whole subtree is RESTING with unlanded work leaves the calm tier", () => {
     // The other half, so the in-motion refusal above cannot silently disable the escalation wholesale.
     // Nothing here is working: the head owes unlanded commits and nobody is finishing them.
+    //
+    // ⚠️ THIS EXPECTED `blocked.color` (RED) UNTIL 2026-08-07. What the case exists to prove is that
+    // the escalation still FIRES when the subtree is at rest — that is unchanged and still asserted.
+    // Only the tier moved: `unlanded-work` is amber now, because the concierge lands a stranded
+    // branch on its own (it did so for 15 of them in one night) and the founder is required at no
+    // step. See engine/stallEscalation.OUTSTANDING.
     const project = seedUnmerged({ a1: "idle", w1: "idle", w2: "idle" });
     render(<AgentSidebar project={project} />);
     const dot = rowFor("Alpha").querySelector<HTMLElement>("span[title]")!;
-    expect(dot.style.background).toBe(asRgb(AGENT_STATUS.blocked.color));
+    expect(dot.style.background).toBe(asRgb(AGENT_STATUS.lapsed.color));
+    // The property the case is really about: it did NOT stay calm like the in-motion head above.
+    expect(dot.style.background).not.toBe(asRgb(AGENT_STATUS.idle.color));
   });
 
   it("counts it under Done, not Running", () => {

@@ -167,7 +167,12 @@ export function notificationFor(
     // shape of event wearing "needs you", and this state exists precisely because that phrasing was
     // being applied to agents that needed nothing. OFF by default in DEFAULT_NOTIFY_STATUSES, so
     // this copy only ever fires for someone who opted in.
-    lapsed: "Auto-continue stopped — nothing is waiting on you",
+    // ⚠️ THIS READ "Auto-continue stopped — nothing is waiting on you" UNTIL 2026-08-07, and the
+    // first half stopped being true when the tier widened. `lapsed` now covers a stranded branch,
+    // an uncommitted worktree, an unmerged PR and an unmet goal as well as a spent retry budget
+    // (engine/stallEscalation.LIFECYCLE), so naming ONE of its five causes misdescribed the other
+    // four. The second half is the part that generalises, and it is what the tier actually means.
+    lapsed: "Unfinished — but nothing is waiting on you",
     unmerged: "Done — but not merged to main yet",
     // OFF by default, but LIVE user-facing copy — not dead code. `new` is false in
     // DEFAULT_NOTIFY_STATUSES and has no checkbox in NotificationsMenu, which deliberately omits the

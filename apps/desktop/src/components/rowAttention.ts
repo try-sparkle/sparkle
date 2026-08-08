@@ -119,6 +119,9 @@ export function stallInputsFor(
 /** Each outstanding thing in three or four words, for a chip that has to fit in a sidebar column.
  *  The full sentence lives in `StallReport.detail` and rides along as the chip's tooltip. */
 export const STALL_CAUSE_LABEL: Record<StallCause, string> = {
+  // THE ONLY LABEL THAT ADDRESSES THE READER. Every other phrase here names a state; this one names
+  // an action, because it is the one cause where he is the only actor who can clear it.
+  "human-verified-goal": "needs your sign-off",
   "escalated-goal": "auto-continue gave up",
   "unmet-goal": "goal unmet",
   "expired-goal": "goal expired",

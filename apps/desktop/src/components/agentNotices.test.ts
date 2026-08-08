@@ -96,6 +96,7 @@ describe("agentNotices", () => {
     // exercised, and could ship ranked above a red cause with the suite green. `satisfies` makes
     // omitting one a type error at this line instead of a silent gap.
     const ALL = Object.keys({
+      "human-verified-goal": 0,
       "unmet-goal": 0,
       "open-pr": 0,
       "unlanded-work": 0,

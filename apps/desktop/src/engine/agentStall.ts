@@ -23,6 +23,7 @@
 // stall claim that fires on missing data trains the human to ignore the signal, which costs more
 // than the stall did. `unknown` is a real answer here (mirroring `rollupDot`'s null arm).
 import type { AgentTabStatus } from "@sparkle/ui";
+import { agentClosableKind } from "@sparkle/core";
 import { type AgentGoal, goalStateOf } from "./agentGoal";
 import { SESSION_LIMIT_FALLBACK_MS, type QuotaBlock, isQuotaBlocked } from "./quotaBlock";
 
@@ -44,8 +45,14 @@ import { SESSION_LIMIT_FALLBACK_MS, type QuotaBlock, isQuotaBlocked } from "./qu
 export type StallVerdict = "stalled" | "finished" | "unknown" | "active" | "quota-blocked";
 
 /** Why a row is stalled, most-actionable first. Reported so the UI and the concierge can say what
- *  is outstanding rather than only that something is. */
+ *  is outstanding rather than only that something is.
+ *
+ *  ⚠️ ADDING ONE IS A COLOUR DECISION. `engine/stallEscalation` partitions this union into the RED
+ *  tier (`OUTSTANDING`) and the amber one (`LIFECYCLE`), and a cause in neither renders calm gray.
+ *  `redAttentionTaxonomy.test.ts` makes an unclassified cause a TYPE error rather than letting it
+ *  inherit a tier by falling through — answer the question there when you add one. */
 export type StallCause =
+  | "human-verified-goal"
   | "unmet-goal"
   | "escalated-goal"
   | "expired-goal"
@@ -171,6 +178,93 @@ export function stallReport(input: StallInput): StallReport {
 
   const causes: StallCause[] = [];
   const goalState = goalStateOf(goal, now);
+  // FIRST, because it is the only cause in this file that means "a human is required" — see the
+  // corrected paragraph further down, which said no such cause existed until 2026-08-07.
+  //
+  // ── THE ONE CAUSE THAT SURVIVES "RED = THE FOUNDER IS THE ONLY ACTOR" ────────────────────────────
+  // Both halves must hold, and each on its own is a false alarm the founder has already triaged:
+  //
+  //   1. AUTO-CONTINUE EXPLICITLY HANDED IT BACK — `escalated`, and ONLY that.
+  //      • NOT `unmet`: the agent still has work left, so his verdict is not owed yet. Firing there
+  //        would paint every agent carrying a sign-off red the moment it went quiet — the volume
+  //        mistake this whole change is undoing, rebuilt under a better name.
+  //      • NOT `expired` EITHER, and that half WAS here in the first cut (roborev 60322). Expiry is
+  //        the highest-volume goal cause — every agent outliving its TTL earns one — and it is
+  //        deliberately calm gray for exactly that reason (sparkle-biezi, and the founder's own
+  //        2026-08-07 instruction lists it as a cause that must not be red because re-arming the
+  //        clock is a CONCIERGE action). Admitting it through a composite cause would have
+  //        re-reddened that population by the back door, which is the specific thing this file is
+  //        being changed to stop. Escalation is the narrow signal: our machinery ran out of budget
+  //        and SAID SO. A clock lapsing says nothing and asks for nothing.
+  //   2. NO AGENT MAY EVER CLOSE IT — `core.agentClosableKind` is the authority and answers NO for
+  //      `command` and `human`, YES for `landed`. ASKED rather than restated (the same reason that
+  //      predicate itself defers to `canSelfMarkMet`): the day someone wires the command executor,
+  //      `command` becomes agent-closable and this cause stops firing for it with no edit here.
+  //   3. A CALLER STATED THAT CHECK FOR *THIS* GOAL — `verifyStated === true && verifyInherited !==
+  //      true`. This is `controlListener`'s `chosenHere` predicate, deliberately the same expression
+  //      rather than a third reading of the two provenance bits.
+  //
+  //      ⚠️ IT TOOK TWO ROUNDS TO GET RIGHT, and the near-miss is the instructive part. The first cut
+  //      had no provenance term at all (roborev 60322): `chargeGoalDebt` MANUFACTURES
+  //      `{kind:"human"}` as its fallback (`INHERITED_VERIFY`) for goal text it cannot infer a check
+  //      for, so an agent wore the loudest signal in the app for a sign-off nobody asked for. The
+  //      second cut added `verifyStated === true` alone, which is STILL TOO WIDE (roborev 60325):
+  //      that flag answers "was a check of this kind EVER chosen", and it is carried VERBATIM through
+  //      same-kind inheritance. So an owed stated `human` plus any non-landing-shaped new goal text
+  //      inherits `{kind:"human"}` with `verifyStated: true` — and since `send_to_agent_terminal`
+  //      records ordinary work goals with no `verify`, that inheritance is the COMMON path, not an
+  //      edge case. `verifyInherited` is the narrower bit and is what closes it.
+  //
+  //      ⚠️ BOTH TERMS FAIL QUIET, so absent (legacy) does not qualify — the OPPOSITE default from
+  //      `AgentGoal.verifyStated`'s own docstring, deliberately. There absence fails CLOSED (binding)
+  //      because a wrong answer lets an agent LAUNDER away a real sign-off. Here a wrong answer only
+  //      paints a dot, and the installed base is full of persisted `human` checks carrying no flag,
+  //      so treating those as red would light up a population nobody can audit. Same fields,
+  //      opposite question, opposite fail-safe direction — quiet when unsure, this change's rule.
+  //
+  // Together: our own machinery has given up and said so, and the goal carries a check that was
+  // chosen for THIS work and that no agent may discharge. That is the founder's "a decision the
+  // agent has explicitly escalated as his call".
+  //
+  // NOTE WHAT THIS DOES *NOT* CLAIM: not that a named person owes the sign-off. `goalVerify` records
+  // no person, and self-binding is an advertised path, so a stated `human` is often the agent's own
+  // choice. The claim is only that nothing but a human DECISION can close it.
+  //
+  // ══ TERM 3 IS A *RELEVANCE* JUDGEMENT, NOT AN ACTOR ONE — SAID PLAINLY (roborev 60339) ═══════════
+  // The honest statement of the trade-off, because the reviewer is right on the mechanism and the
+  // first draft of this comment papered over it. An INHERITED check still BINDS: `owedBinds` reads
+  // `verifyStated !== false` (agentGoal), so no agent can discharge it and `agentClosableKind` still
+  // answers NO. By the pure actor test, an inherited-and-escalated `human` check IS founder-only, and
+  // this term declines to paint it red anyway. That is a deliberate product call, and it costs
+  // something real: such a row goes amber and nothing re-raises it (an escalated goal cannot lapse).
+  //
+  // WHY THE CALL GOES THIS WAY:
+  //   • The pure actor test cannot be applied literally without emptying the tier. The concierge's
+  //     `verify: null` take-back drops ANY check unconditionally, for both provenances alike — so
+  //     "could someone other than the founder clear this" is trivially YES for every goal check ever
+  //     written, chosen-here included. Something narrower than the literal test has to decide.
+  //   • What separates the two is whether the obligation is about THIS work. An inherited check was
+  //     attached to earlier work and carried here by machinery; `send_to_agent_terminal` records
+  //     ordinary work goals with no `verify`, so this is the COMMON path. Painting that red tells the
+  //     founder "needs your sign-off" about work nobody ever asked him to sign off on — and he cannot
+  //     act on it, because the obligation belongs to a goal that is no longer on the row. That is
+  //     exactly how red stops meaning anything, which is the failure this whole file is undoing.
+  //   • THE MISS IS BOUNDED AND VISIBLE. The row is not silenced: it still reports `escalated-goal`,
+  //     still renders the amber tier, still carries the goal chip and the "auto-continue gave up"
+  //     mark. It is findable — just not alarm-coloured. `redAttentionTaxonomy.test.ts` pins that
+  //     surfacing directly, so this stays a quieter signal rather than decaying into no signal.
+  // If a real inherited-sign-off row is ever missed in practice, the fix is to make INHERITANCE carry
+  // less (stop manufacturing `human` for unrelated work), not to widen this term — widening it
+  // reinstates the false red on the common path.
+  const chosenHere = goal?.verifyStated === true && goal.verifyInherited !== true;
+  if (
+    goalState === "escalated" &&
+    goal?.verify !== undefined &&
+    chosenHere &&
+    !agentClosableKind(goal.verify.kind)
+  ) {
+    causes.push("human-verified-goal");
+  }
   if (goalState === "unmet") causes.push("unmet-goal");
   // An ESCALATED goal is still outstanding work — auto-continue gave up on it, which makes it MORE
   // the human's problem, not less. Folding it into `finished` would hide precisely the agent the
@@ -206,10 +300,17 @@ export function stallReport(input: StallInput): StallReport {
   // reports that auto-continue's RETRY BUDGET ran out, which is a fact about our machinery, not a
   // claim that a human is required — the founder measured two escalated rows that needed nothing and
   // were painted red for it. It now routes to the amber `lapsed` tier (engine/stallEscalation
-  // LIFECYCLE). There is no cause in this file that means "a human is required" on its own; the red
-  // tier is reached by the WORK causes (`unmet-goal` / `open-pr` / `unlanded-work` /
-  // `uncommitted-changes`), and by the statuses `statusEngine` derives from the PTY (waiting /
-  // approval / errored), which never pass through here.
+  // LIFECYCLE).
+  //
+  // ⚠️ AND THE SENTENCE AFTER IT IS NOW WRONG TOO, corrected 2026-08-07 in the same spirit. It read:
+  // "There is no cause in this file that means 'a human is required' on its own; the red tier is
+  // reached by the WORK causes (`unmet-goal` / `open-pr` / `unlanded-work` / `uncommitted-changes`)".
+  // Every one of those WORK causes has since moved to the amber tier — the concierge lands a stranded
+  // branch, the agent commits its own worktree, CI clears a PR, auto-continue drives an unmet goal —
+  // so none of them is red any more. What replaced them is `human-verified-goal` above, which is
+  // exactly the cause that paragraph said did not exist: it means a human is required, on its own,
+  // and it is the only member of `OUTSTANDING`. The statuses `statusEngine` derives from the PTY
+  // (waiting / approval / errored) are still red and still never pass through here.
   if (goalState === "expired") causes.push("expired-goal");
   if (hasOpenPr === true) causes.push("open-pr");
   // FOLDED INTO `open-pr` WHENEVER BOTH HOLD. An agent with an open PR has unlanded commits by
@@ -285,6 +386,13 @@ function quotaBlockedDetail(block: QuotaBlock): string {
 function stalledDetail(causes: StallCause[], goal: AgentGoal | undefined): string {
   const parts = causes.map((c) => {
     switch (c) {
+      case "human-verified-goal":
+        // Names the PERSON explicitly, because this is the one sentence on the surface that is
+        // asking for something. Every other cause here describes work someone else will do.
+        return (
+          `its goal can only be closed by a person and nothing is coming to retry it` +
+          `${goal?.text ? ` ("${goal.text}")` : ""}`
+        );
       case "unmet-goal":
         return `its goal is not met ("${goal?.text ?? ""}")`;
       case "escalated-goal":

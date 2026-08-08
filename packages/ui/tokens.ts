@@ -197,11 +197,24 @@ export const AGENT_STATUS = {
   // the founder's explicit instruction, in these words: "why are they red when they don't require
   // my assistance?"
   //
-  // WHAT IT MEANS. The auto-continue machinery spent its retry budget on this agent's goal and
-  // handed it back — `escalated-goal`, and that ONE cause is the whole tier
-  // (`engine/stallEscalation.LIFECYCLE`). It is a fact about the MACHINERY — how much Sparkle was
-  // willing to spend chasing a goal — not about the work, and not about whether a human is
-  // required. Its `OUTSTANDING` neighbour is the set that still paints red.
+  // WHAT IT MEANS: THIS ROW IS NOT FINISHED, AND FINISHING IT IS NOT YOUR JOB.
+  //
+  // ⚠️ IT MEANT ONE CAUSE UNTIL 2026-08-07 — "the auto-continue machinery spent its retry budget on
+  // this agent's goal and handed it back (`escalated-goal`), and that ONE cause is the whole tier".
+  // That cut moved the single cause the founder had named that week and left four behind, so he went
+  // on triaging red rows that needed nothing from him — six more times in one day: *"Why are all
+  // these agents red? They don't seem to need anything from me."* So the tier now holds every stall
+  // cause ANOTHER ACTOR clears (`engine/stallEscalation.LIFECYCLE`): a stranded branch the concierge
+  // lands, an uncommitted worktree the agent commits, a PR waiting on CI, a goal auto-continue is
+  // still driving, and the spent retry budget it started with.
+  //
+  // Its `OUTSTANDING` neighbour is what still paints red, and it is down to the ONE cause where the
+  // founder is the only actor who can act: a goal whose stated check no agent may ever discharge,
+  // with no retry coming. Red now means exactly "you are the only one who can clear this".
+  //
+  // ⚠️ SO DO NOT NAME A CAUSE IN THIS TIER'S COPY. The label below and the notification body in
+  // `engine/attention.ts` both used to say "Auto-continue stopped", which became false for four of
+  // the five rows landing here. Whatever this tier says has to be true of all of them.
   //
   // ⚠️ `expired-goal` IS NOT IN THIS TIER. It renders calm GRAY and always did (sparkle-biezi); an
   // earlier cut of this change moved it to amber and it was moved back, because expiry is the
@@ -233,12 +246,15 @@ export const AGENT_STATUS = {
   //   • It must NOT be in `engine/attention.needsAttention`. No dock badge, no banner, no
   //     inflation of "N agents need you". Unlike `questions` (blue, and deliberately IN that set
   //     because a question nobody sees is a stalled agent), nothing here is addressed to the human.
-  //   • It must NOT outrank a genuine red. `withStallAttention` checks `OUTSTANDING` FIRST, so an
-  //     agent that gave up AND still holds unlanded work stays RED on the strength of the WORK.
-  //     Only a row that owes nothing goes quiet.
+  //   • It must NOT outrank a genuine red. `withStallAttention` checks `OUTSTANDING` FIRST, so a row
+  //     that owes the founder a verdict stays RED however much of this tier is also true of it.
+  //     (That bullet used to read "an agent that gave up AND still holds unlanded work stays RED on
+  //     the strength of the WORK" — same ordering, same guarantee, different cause doing the
+  //     outranking since unlanded work moved here.)
   // Sparkle's standing rule is never to hide a row that needs the founder; making rows less red is
-  // only safe while those three hold.
-  lapsed: { color: AMBER, label: "Auto-continue stopped" },
+  // only safe while those three hold. `engine/redAttentionTaxonomy.test.ts` pins both directions
+  // per cause by name, and makes an unclassified new cause a type error.
+  lapsed: { color: AMBER, label: "Unfinished, not yours" },
   // Done, but committed work isn't on main yet — open/merge the PR. GRAY, deliberately: this is a
   // LANDING state, not an alarm. It was red until 2026-07-26, and on a real fleet that made red
   // meaningless — 27 of 51 agents sat in the committed-but-unlanded band, so the wall of red said

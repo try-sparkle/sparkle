@@ -253,18 +253,26 @@ describe("GRAY IS A TERMINAL STATE — the founder's rule, end to end through th
     // rule is that status never inks the row's TEXT, so reading the name's colour would prove
     // nothing. Its tooltip is the status label and its background is the tier colour, so one lookup
     // checks both halves of the claim.
-    // The dot's tooltip IS the status label, so finding it by the `blocked` label is the assertion:
-    // a gray row would carry "Done — your turn" here and this lookup would throw. Compared against
-    // the finished row's dot rather than a hex literal, because jsdom normalises colours to rgb().
-    expect(within(row).getByTitle(AGENT_STATUS.blocked.label)).toBeTruthy();
+    //
+    // ⚠️ THIS LOOKED FOR `AGENT_STATUS.blocked.label` UNTIL 2026-08-07. The founder's rule asserted
+    // here is UNCHANGED and still fully checked — this row may not render GRAY — but neither of its
+    // causes is his to clear (the agent commits its own dirty tree; auto-continue is still driving
+    // the unmet goal), so it leaves calm into AMBER rather than red. The rule never named a colour,
+    // only that a row owing work must not look finished.
+    expect(within(row).getByTitle(AGENT_STATUS.lapsed.label)).toBeTruthy();
+    // The half that would break if amber quietly became calm: the row must NOT wear a gray label.
+    expect(within(row).queryByTitle(AGENT_STATUS.idle.label)).toBeNull();
+    expect(within(row).queryByTitle(AGENT_STATUS.done.label)).toBeNull();
   });
 
-  it("still says WHAT is outstanding once it has gone red", () => {
+  it("still says WHAT is outstanding once it has left the calm tier", () => {
     // THE INTEGRATION TRAP. The row derives its stall report from its own status, and `stallReport`
     // answers `active` for the whole red tier — so composing the escalation naively deleted the chip
-    // at exactly the moment the row turned red: colour with no cause. `calmSt` exists for this.
-    // The trap this guards is unchanged — the row must still SAY what is outstanding after it turns
-    // red — but the goal cause moved off the notice mark (roborev 59322): the goal chip already
+    // at exactly the moment the row changed colour: colour with no cause. `calmSt` exists for this.
+    // (Titled "gone red" until 2026-08-07; this fixture lands in the AMBER tier now, and the trap is
+    // identical in both — the row must still say what is outstanding after it is recoloured.)
+    // The trap this guards is unchanged — the row must still SAY what is outstanding after it leaves
+    // calm — but the goal cause moved off the notice mark (roborev 59322): the goal chip already
     // draws that fact and is clickable, so marking it twice put two identical glyphs on one row.
     // Both halves asserted here, because "the cause is named somewhere" is the actual property.
     const row = within(renderStalled());
@@ -288,13 +296,24 @@ describe("GRAY IS A TERMINAL STATE — the founder's rule, end to end through th
     // could not: this test passed against a mutation that deleted the pass entirely until the fixture
     // changed.) With the pass, the row comes back "Needs merge"; without it, `idle` — losing the label,
     // the ordering band, and the evidence that the branch exists.
+    //
+    // ⚠️ THE GOAL GAINED A `{kind:"human"}` CHECK AND AN ESCALATION ON 2026-08-07, so this stays an
+    // end-to-end test of the RED tier. Its old fixture (a plain unmet goal on an unlanded branch)
+    // is amber now, and simply rewriting the expectations to `lapsed` would have kept the test green
+    // while deleting the only end-to-end coverage the red acknowledge path has. The amber tier's own
+    // dismissal cycle is covered in engine/stallEscalation.test.ts, so both survive.
     render(
       <AgentSidebar
         project={seed({
           status: { stalled: "idle" },
           branchStatus: { stalled: { ...CLEAN_BS, ahead: 3 } },
           workflowState: { stalled: BARE_WS },
-          goals: { stalled: newGoal("land the never-idle work", Date.now()) },
+          goals: {
+            stalled: {
+              ...newGoal("sign off on the launch copy", Date.now(), undefined, { kind: "human" }),
+              escalatedAt: Date.now(),
+            },
+          },
         })}
       />,
     );
