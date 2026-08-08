@@ -5,6 +5,7 @@
 // `code` to a recovery bucket the creation UI can act on (deep-link to the right Settings section),
 // degrading to a plain retry when the body is opaque. Pure + unit-tested.
 
+import { isSynthesizedErrorMessage } from "./synthesizedError";
 import type { CategoryId } from "../../stores/uiStore";
 
 /** Recovery buckets for a start failure. Covers the client-side {@link CloudBlockReason} set plus a
@@ -164,7 +165,24 @@ export function classifyStartError(raw: unknown): StartGuidance {
   // transcript at all would read "transcript_too_large" and be told their conversation was too big
   // (roborev 57566). Dropping the override here sends those to the reason's own written sentence,
   // which is what the `code`-shaped body was always classified into anyway.
-  const prose = e.message != null && e.message.toLowerCase() !== code ? e.message : undefined;
+  // A SYNTHESIZED FALLBACK IS NOT PROSE EITHER. `ensureOk` does not leave `message` null when a body
+  // carries none — it synthesizes `Request failed (<status>)` for an empty body, a non-JSON body, a
+  // proxy's HTML error page. That string is not equal to the code, so it sailed through this gate
+  // and was rendered VERBATIM: the user read "Request failed (403)" and never saw the status's own
+  // written sentence. It silently shadowed the 413 line too. Asked of the PRODUCER rather than
+  // re-encoded here, so a reword there cannot silently stop the match.
+  const prose =
+    e.message != null &&
+    e.message.toLowerCase() !== code &&
+    !isSynthesizedErrorMessage(e.message, e.status)
+      ? e.message
+      : undefined;
+  // The status is the only diagnostic a body-less error carries, and suppressing the string above
+  // takes it out of the user's copy — so it goes to the console, where a support report can still
+  // reach it. Every caller discards the raw error after classification.
+  if (prose === undefined && e.status != null && reason === "generic") {
+    console.warn("[cloud] start failed with no server message", { status: e.status, code: e.code });
+  }
   return guidanceFor(reason, prose, e.status);
 }
 
@@ -249,12 +267,20 @@ function guidanceFor(
       // to prefer. If that ever changes, take the override here (roborev 46918).
       return startedUntrackedGuidance();
     case "generic":
-    default:
+    default: {
       // Surface the server's own message when it's short + safe; else a plain retry line. A 413
       // gets its own line first: it is the one status whose bodies are routinely code-only (see the
       // note in classifyStartError), and "try again" is actively wrong advice for a request that
       // will be the same size next time. Kept deliberately neutral about WHAT was too large —
       // `createCloudAgent` sends no transcript, so naming the conversation here would be a guess.
+      // "TRY AGAIN" IS A PROMISE, made only where retrying can work. Suppressing the synthesized
+      // message above makes this line reachable on body-less 4xx, and `/sessions/start` emits
+      // several (404 not_found, 400 claude_auth_required, 409 session_id_taken) that fail
+      // identically every time. `!status` — not `status == null` — because this module treats a
+      // falsy status as "no status"; `status: 0` is a network failure. 408/425 are 4xx that MEAN
+      // retry.
+      const retryable =
+        !status || status >= 500 || status === 429 || status === 408 || status === 425;
       return {
         reason: "generic",
         message:
@@ -262,7 +288,10 @@ function guidanceFor(
             ? serverMessage
             : status === 413
               ? "That request was too large for the cloud service."
-              : "Couldn't start the cloud agent — try again.",
+              : retryable
+                ? "Couldn't start the cloud agent — try again."
+                : "The cloud service refused that request. Contact support if that's unexpected.",
       };
+    }
   }
 }

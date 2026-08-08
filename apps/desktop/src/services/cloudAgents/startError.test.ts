@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { classifyStartError, isTranscriptTooLarge, parseStartError } from "./startError";
-import { CloudApiError } from "./api";
+import { CloudApiError, makeCloudApi } from "./api";
+import { synthesizedErrorMessage } from "./synthesizedError";
 
 describe("parseStartError", () => {
   it("reads a structured object", () => {
@@ -93,6 +94,72 @@ describe("classifyStartError", () => {
     const g = classifyStartError({ status: 403, code: "not_entitled" });
     expect(g.reason).toBe("insufficient_credits");
     expect(g.deepLink).toBe("credits");
+  });
+
+  // ── THE SYNTHESIZED FALLBACK IS NOT THE SERVER'S PROSE ───────────────────────────────────────
+  it("does not render ensureOk's SYNTHESIZED message as if the server had written it", () => {
+    // `ensureOk` does not leave `message` null when a body carries none — it synthesizes
+    // `Request failed (<status>)` for an empty body, a non-JSON body, a proxy's HTML error page.
+    // That is not equal to the code, so it passed the prose gate and rendered VERBATIM: the user
+    // read "Request failed (403)" and never saw the status's own sentence. It shadowed 413 too.
+    const g403 = classifyStartError(new CloudApiError(403, null, synthesizedErrorMessage(403)));
+    expect(g403.message).not.toMatch(/request failed/i);
+    const g413 = classifyStartError(new CloudApiError(413, null, synthesizedErrorMessage(413)));
+    expect(g413.message).toMatch(/too large/i);
+    const g500 = classifyStartError(new CloudApiError(500, null, synthesizedErrorMessage(500)));
+    expect(g500.message).toBe("Couldn't start the cloud agent — try again.");
+  });
+
+  it("survives a REAL non-JSON error through makeCloudApi — the producer, not a hand-typed copy", () => {
+    // The binding test. The suppression used to be a regex re-encoding `ensureOk`'s template
+    // literal with nothing tying them together, so a reword there would silently stop the match
+    // while every test stayed green (they all hand-typed the string they asserted).
+    const api = makeCloudApi({
+      baseUrl: "https://example.invalid",
+      getToken: async () => "tok",
+      fetch: (async () =>
+        new Response("<html><body>Forbidden</body></html>", {
+          status: 403,
+          headers: { "content-type": "text/html" },
+        })) as typeof fetch,
+    });
+    return api.startSession({ projectId: "p", goal: "g", repoUrl: "r" } as never).then(
+      () => {
+        throw new Error("expected startSession to reject");
+      },
+      (err: unknown) => {
+        expect((err as CloudApiError).message).toBe(synthesizedErrorMessage(403));
+        expect(classifyStartError(err).message).not.toMatch(/request failed/i);
+      },
+    );
+  });
+
+  // ── "TRY AGAIN" IS A PROMISE ─────────────────────────────────────────────────────────────────
+  it("never promises 'try again' for a body-less NON-RETRYABLE status", () => {
+    // Suppressing the synthesized message makes the retry line reachable on body-less 4xx, and
+    // `/sessions/start` emits several (404 not_found, 400 claude_auth_required, 409
+    // session_id_taken) that fail identically every time.
+    for (const status of [400, 404, 405, 409, 410, 451]) {
+      const m = classifyStartError(new CloudApiError(status, null, synthesizedErrorMessage(status))).message;
+      expect(m).not.toMatch(/try again/i);
+      expect(m).toMatch(/refused that request/i);
+      // …and it claims neither account scope nor permanence, neither of which a bare status proves.
+      expect(m).not.toMatch(/your account|this account/i);
+      expect(m).not.toMatch(/won't change|permanent/i);
+    }
+  });
+
+  it("DOES still promise 'try again' where retrying can actually work", () => {
+    // The positive half, so the rule above cannot pass by never offering retry at all. `status: 0`
+    // is a network failure — this module treats a falsy status as "no status" everywhere else.
+    for (const status of [500, 502, 503, 429, 408, 425]) {
+      expect(
+        classifyStartError(new CloudApiError(status, null, synthesizedErrorMessage(status))).message,
+      ).toBe("Couldn't start the cloud agent — try again.");
+    }
+    expect(
+      classifyStartError(new CloudApiError(0, null, synthesizedErrorMessage(0))).message,
+    ).toBe("Couldn't start the cloud agent — try again.");
   });
 
   it("prefers the stable code over the status when both are present", () => {

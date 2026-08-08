@@ -12,7 +12,12 @@
 // The plan is handed in as a value rather than derived, so every case here is a pure statement
 // about the dialog: given this plan, the user sees this. `planPromotion` has its own tests.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+
+vi.mock("../services/sparkleApi", async (orig) => {
+  const real = (await orig()) as Record<string, unknown>;
+  return { ...real, openSignIn: vi.fn(async () => true), lastSignInUrl: vi.fn(() => null) };
+});
 
 vi.mock("../stores/uiStore", () => ({
   useUiStore: (sel: (s: { openSettings: (c?: string) => void }) => unknown) =>
@@ -20,6 +25,7 @@ vi.mock("../stores/uiStore", () => ({
 }));
 
 import { PromoteToCloudDialog, type PromoteToCloudDeps } from "./PromoteToCloudDialog";
+import { lastSignInUrl, openSignIn } from "../services/sparkleApi";
 import { useAuthStore } from "../stores/authStore";
 import { WIP_COMMIT_MESSAGE } from "../services/agentPromotion/plan";
 import type { PromotionPlan } from "../services/agentPromotion/plan";
@@ -72,6 +78,11 @@ const me = (over: { balanceCents?: number; centsPerMinute?: number | null } = {}
 beforeEach(() => {
   // The dialog re-reads /me on open; the real refresh would clear what a test seeded.
   useAuthStore.setState({ refresh: vi.fn(async () => {}) } as never);
+  // The dialog also SUBSCRIBES to `tokenPresent`, so a token leaked from a previous test would seed
+  // the next one already signed in and silently skip the refusal it means to assert.
+  vi.mocked(openSignIn).mockClear();
+  vi.mocked(lastSignInUrl).mockClear();
+  useAuthStore.setState({ tokenPresent: false } as never);
 });
 
 afterEach(() => {
@@ -291,6 +302,237 @@ describe("refusals and failures", () => {
     }));
     fireEvent.click(await screen.findByTestId("promote-confirm"));
     expect((await screen.findByTestId("promote-orphan")).textContent).toContain("sess-abc");
+  });
+});
+
+describe("the sign-in refusal has to be able to END", () => {
+  // `openSignIn()` resolving true means the BROWSER opened — not that anyone signed in. That
+  // completes seconds-to-minutes later when the sparkle:// deep link updates the auth store. The
+  // plan loads once and the dialog stays mounted across the hand-off, so without a re-read the user
+  // returns to the identical refusal with no confirm button and close-and-reopen as the only exit.
+  const REFUSAL: PromotionPlan = {
+    ok: false,
+    refusal: "cloud_gate",
+    message: "Sign in to run agents in the cloud.",
+    needsSignIn: true,
+  };
+  // Reads the LIVE auth signal rather than returning a scripted sequence: a re-read at the wrong
+  // moment then returns the same refusal, exactly as it would in the app. A hand-scripted
+  // "second call succeeds" encodes the assumption under test instead of exercising it.
+  const gateBacked = (): PromoteToCloudDeps => ({
+    loadPlan: async () => (useAuthStore.getState().tokenPresent ? okPlan() : REFUSAL),
+    promote: async () =>
+      ({ ok: true, sessionId: "s-1", transcriptMoved: true, transcriptTruncated: false, committed: 0 }) as PromoteResult,
+  });
+
+  it("does NOT resolve the refusal merely because the browser opened", async () => {
+    render(<PromoteToCloudDialog agent={AGENT} deps={gateBacked()} onClose={vi.fn()} />);
+    fireEvent.click(await screen.findByTestId("promote-sign-in"));
+    await waitFor(() => expect(openSignIn).toHaveBeenCalled());
+    expect(await screen.findByTestId("promote-refusal")).toBeTruthy();
+    expect(screen.queryByTestId("promote-confirm")).toBeNull();
+  });
+
+  it("re-reads when SIGN-IN COMPLETES, so the refusal becomes the confirm screen", async () => {
+    render(<PromoteToCloudDialog agent={AGENT} deps={gateBacked()} onClose={vi.fn()} />);
+    expect(await screen.findByTestId("promote-refusal")).toBeTruthy();
+    await act(async () => {
+      useAuthStore.setState({ tokenPresent: true } as never); // the real signal, from elsewhere
+    });
+    expect(await screen.findByTestId("promote-confirm")).toBeTruthy();
+  });
+
+  it("also re-reads on window FOCUS — driven by a signal the component cannot observe", async () => {
+    // `tokenPresent` stays FALSE throughout, so the auth effect cannot be what answers; only focus
+    // can. (Flipping the token and THEN firing focus passes with the listener deleted.)
+    let account: "out" | "in" = "out";
+    const deps: PromoteToCloudDeps = {
+      loadPlan: async () => (account === "in" ? okPlan() : REFUSAL),
+      promote: async () => ({ ok: true }) as PromoteResult,
+    };
+    render(<PromoteToCloudDialog agent={AGENT} deps={deps} onClose={vi.fn()} />);
+    expect(await screen.findByTestId("promote-refusal")).toBeTruthy();
+    account = "in";
+    await act(async () => {
+      fireEvent.focus(window);
+    });
+    expect(await screen.findByTestId("promote-confirm")).toBeTruthy();
+    expect(useAuthStore.getState().tokenPresent).toBe(false);
+  });
+
+  it("surfaces the copy/paste URL when the browser could not be launched", async () => {
+    // `openSignIn()` RESOLVES false (never rejects) on a launch failure; discarding it leaves a
+    // button that visibly does nothing.
+    vi.mocked(openSignIn).mockResolvedValueOnce(false);
+    vi.mocked(lastSignInUrl).mockReturnValueOnce("https://sparkle.ai/sign-in?state=abc");
+    render(<PromoteToCloudDialog agent={AGENT} deps={gateBacked()} onClose={vi.fn()} />);
+    fireEvent.click(await screen.findByTestId("promote-sign-in"));
+    const fb = await screen.findByTestId("promote-sign-in-fallback");
+    expect(fb.textContent).toContain("https://sparkle.ai/sign-in?state=abc");
+  });
+
+  it("still says so when the launch failed before a URL even existed", async () => {
+    // `lastSignInUrl()` is null when the URL was never built; a bare `string | null` state cannot
+    // tell that from "no failure", so the fallback would render nothing — the dead button again.
+    vi.mocked(openSignIn).mockResolvedValueOnce(false);
+    vi.mocked(lastSignInUrl).mockReturnValueOnce(null);
+    render(<PromoteToCloudDialog agent={AGENT} deps={gateBacked()} onClose={vi.fn()} />);
+    fireEvent.click(await screen.findByTestId("promote-sign-in"));
+    expect((await screen.findByTestId("promote-sign-in-fallback")).textContent).toMatch(
+      /Couldn't start sign-in/i,
+    );
+  });
+});
+
+describe("a reload must never erase what the user needs", () => {
+  // `promote-progress`, the failure panel and `failure.orphanedSessionId` ALL render inside the
+  // `plan.ok` branch, so any reload landing a not-ok plan erases the id needed to stop a sandbox
+  // that is still billing — and nothing re-derives it.
+  const REFUSED: PromotionPlan = {
+    ok: false,
+    refusal: "cloud_gate",
+    message: "Sign in to run agents in the cloud.",
+    needsSignIn: true,
+  };
+
+  it("a token flip MID-PROMOTION does not swap the progress screen, and the orphan id still lands", async () => {
+    let account: "ok" | "refused" = "ok";
+    let finish: ((r: PromoteResult) => void) | null = null;
+    const deps: PromoteToCloudDeps = {
+      loadPlan: async () => (account === "ok" ? okPlan() : REFUSED),
+      promote: ({ onStep }) => {
+        onStep("await_live");
+        return new Promise<PromoteResult>((r) => {
+          finish = r;
+        });
+      },
+    };
+    render(<PromoteToCloudDialog agent={AGENT} deps={deps} onClose={vi.fn()} />);
+    fireEvent.click(await screen.findByTestId("promote-confirm"));
+    expect(await screen.findByTestId("promote-progress")).toBeTruthy();
+    account = "refused";
+    await act(async () => {
+      useAuthStore.setState({ tokenPresent: true } as never);
+    });
+    expect(screen.getByTestId("promote-progress")).toBeTruthy();
+    await act(async () => {
+      finish?.({ ok: false, step: "await_live", message: "never streamed", orphanedSessionId: "sess-abc" } as PromoteResult);
+      await Promise.resolve();
+    });
+    expect((await screen.findByTestId("promote-orphan")).textContent).toContain("sess-abc");
+  });
+
+  it("a RESOLVED refusal cannot replace a good plan the user is reading", async () => {
+    // roborev 59544, and the symmetric twin of the rejection case below. `loadPlan` swallows a
+    // failed `promotion_preflight` with `.catch(() => null)` and `planPromotion` turns a null
+    // preflight into a `no_worktree` REFUSAL — so a transient failure arrives as a RESOLVED not-ok
+    // plan, not a rejection. Unguarded, one flaky Tauri invoke while the user alt-tabs replaced the
+    // confirm screen (branch, dirty-file list, policy radios) with "there is no worktree to
+    // promote". Guarding only the reject path left exactly this hole, which is why the pair was
+    // asymmetric.
+    let degraded = false;
+    const deps: PromoteToCloudDeps = {
+      loadPlan: async () =>
+        degraded
+          ? ({ ok: false, refusal: "no_worktree", message: "This agent has no worktree." } as PromotionPlan)
+          : okPlan(),
+      promote: async () => ({ ok: true }) as PromoteResult,
+    };
+    render(<PromoteToCloudDialog agent={AGENT} deps={deps} onClose={vi.fn()} />);
+    expect(await screen.findByTestId("promote-confirm")).toBeTruthy();
+
+    degraded = true;
+    await act(async () => {
+      fireEvent.focus(window);
+    });
+
+    expect(screen.getByTestId("promote-confirm")).toBeTruthy();
+    expect(screen.queryByTestId("promote-refusal")).toBeNull();
+  });
+
+  it("two concurrent reloads settle last-CALLED-wins, not last-to-resolve", async () => {
+    // Reachable while the plan is NOT ok: focus and the token flip can both fire, and `loadPlan`
+    // shells out to Tauri and `gh`, so the first can resolve after the second. Unordered,
+    // last-write-wins would put the stale refusal back over the good plan with nothing left to
+    // correct it. (This replaces an in-flight-during-promotion test that the `plan.ok` guard above
+    // made unreachable — with that guard, a reload is never issued while a promotion can start, so
+    // the old test passed with the ordering removed.)
+    const REFUSAL: PromotionPlan = {
+      ok: false,
+      refusal: "cloud_gate",
+      message: "Sign in to run agents in the cloud.",
+      needsSignIn: true,
+    };
+    let releaseStale: (() => void) | null = null;
+    let call = 0;
+    const deps: PromoteToCloudDeps = {
+      loadPlan: () => {
+        call += 1;
+        if (call === 1) return Promise.resolve(REFUSAL); // mount: not ok, so reloads stay enabled
+        if (call === 2) {
+          return new Promise<PromotionPlan>((resolve) => {
+            releaseStale = () => resolve(REFUSAL); // the focus reload, held open
+          });
+        }
+        return Promise.resolve(okPlan()); // the auth reload, resolves immediately
+      },
+      promote: async () => ({ ok: true }) as PromoteResult,
+    };
+    render(<PromoteToCloudDialog agent={AGENT} deps={deps} onClose={vi.fn()} />);
+    expect(await screen.findByTestId("promote-refusal")).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.focus(window); // reload A — in flight
+    });
+    await act(async () => {
+      useAuthStore.setState({ tokenPresent: true } as never); // reload B — wins by being newer
+    });
+    expect(await screen.findByTestId("promote-confirm")).toBeTruthy();
+
+    await act(async () => {
+      releaseStale?.(); // A finally answers, with the stale refusal
+      await Promise.resolve();
+    });
+
+    expect(screen.getByTestId("promote-confirm")).toBeTruthy();
+    expect(screen.queryByTestId("promote-refusal")).toBeNull();
+  });
+
+  it("a TRANSIENT load failure is not permanent — a later good load clears it", async () => {
+    // `loadError` pre-empts the plan branch and had one writer and no clearer, so one throw wedged
+    // the dialog forever: every recovery trigger fired, passed its guards, set a good plan, and the
+    // user saw none of it.
+    let ok = false;
+    const deps: PromoteToCloudDeps = {
+      loadPlan: () => (ok ? Promise.resolve(okPlan()) : Promise.reject(new Error("preflight blew up"))),
+      promote: async () => ({ ok: true }) as PromoteResult,
+    };
+    render(<PromoteToCloudDialog agent={AGENT} deps={deps} onClose={vi.fn()} />);
+    expect((await screen.findByTestId("promote-load-error")).textContent).toContain("preflight blew up");
+    ok = true;
+    await act(async () => {
+      fireEvent.focus(window);
+    });
+    expect(await screen.findByTestId("promote-confirm")).toBeTruthy();
+    expect(screen.queryByTestId("promote-load-error")).toBeNull();
+  });
+
+  it("a FAILED background reload does not tear down an already-good plan", async () => {
+    // The symmetric case: a rejection is the ABSENCE of an answer, not a verdict, so it must not
+    // replace a confirm screen the user has already read. The error panel carries no button.
+    let fail = false;
+    const deps: PromoteToCloudDeps = {
+      loadPlan: () => (fail ? Promise.reject(new Error("gh resolve blew up")) : Promise.resolve(okPlan())),
+      promote: async () => ({ ok: true }) as PromoteResult,
+    };
+    render(<PromoteToCloudDialog agent={AGENT} deps={deps} onClose={vi.fn()} />);
+    expect(await screen.findByTestId("promote-confirm")).toBeTruthy();
+    fail = true;
+    await act(async () => {
+      fireEvent.focus(window);
+    });
+    expect(screen.getByTestId("promote-confirm")).toBeTruthy();
+    expect(screen.queryByTestId("promote-load-error")).toBeNull();
   });
 });
 

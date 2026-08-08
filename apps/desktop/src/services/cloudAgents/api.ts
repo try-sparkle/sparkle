@@ -19,6 +19,7 @@
 //   PUT    /claude-auth     { method, secret }                                   → 200
 //   DELETE /claude-auth                                                          → 200
 
+import { synthesizedErrorMessage } from "./synthesizedError";
 import { invoke } from "@tauri-apps/api/core";
 import type { CloudSessionSummary } from "./reconcile";
 
@@ -122,7 +123,7 @@ async function authHeaders(deps: CloudApiDeps): Promise<Record<string, string>> 
 async function ensureOk(res: Response): Promise<Response> {
   if (res.ok) return res;
   let code: string | null = null;
-  let message = `Request failed (${res.status})`;
+  let message = synthesizedErrorMessage(res.status);
   try {
     const body = (await res.clone().json()) as { code?: unknown; error?: unknown; message?: unknown };
     if (typeof body.code === "string") code = body.code;

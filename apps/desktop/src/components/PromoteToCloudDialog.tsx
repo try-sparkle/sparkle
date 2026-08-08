@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import {
   FiAlertTriangle,
   FiCheckCircle,
@@ -16,7 +16,7 @@ import { cloudApi } from "../services/cloudAgents/api";
 import { deepLinkActionLabel } from "../services/cloudAgents/gating";
 import { cloudCostLine } from "../services/cloudAgents/cloudCostEstimate";
 import { useAuthStore } from "../stores/authStore";
-import { openSignIn } from "../services/sparkleApi";
+import { lastSignInUrl, openSignIn } from "../services/sparkleApi";
 import { projectRepoUrl } from "../services/cloudAgents/repoUrl";
 import { ensureCloudProjectId } from "../services/cloudAgents/projectLink";
 import { projectBindingSets } from "../services/cloudAgents/projectBinding";
@@ -241,20 +241,108 @@ export function PromoteToCloudDialog({
   // is.
   const depsRef = useRef(deps);
   depsRef.current = deps;
-  useEffect(() => {
-    let alive = true;
+  // ── THE REFUSAL HAS TO BE ABLE TO END ────────────────────────────────────────────────────────
+  //
+  // `openSignIn()` resolving true means the OS BROWSER opened — it says nothing about whether
+  // anyone signed in. That completes seconds-to-minutes later, out of process, when the
+  // `sparkle://` deep link runs `exchangeCode` and updates the auth store. So the recovery is keyed
+  // on `tokenPresent` flipping (that IS sign-in completing, and it is what `useCloudGate` reads),
+  // plus the `focus` listener `CreditsPanel` uses for the same return path. Without this the
+  // []-deps mount load is the only load that ever runs and the refusal can never end: the dialog
+  // stays mounted across the hand-off, so the user comes back to the identical sentence.
+  const signedIn = useAuthStore((s) => s.tokenPresent);
+  const aliveRef = useRef(true);
+  useEffect(() => () => {
+    aliveRef.current = false;
+  }, []);
+  const genRef = useRef(0);
+  // Mirrored into refs because `reloadPlan` is ref-stable and would otherwise close over first-render
+  // values.
+  const failureRef = useRef(failure);
+  failureRef.current = failure;
+  const stepRef = useRef(step);
+  stepRef.current = step;
+  const movedRef = useRef(moved);
+  movedRef.current = moved;
+  const planRef = useRef(plan);
+  planRef.current = plan;
+  const reloadPlan = useCallback(() => {
+    // ONE FUNNEL, checked at BOTH ENDS. Every precondition lives here rather than on the triggers,
+    // so a future trigger cannot reintroduce the hole — and it is re-checked at resolution because
+    // `loadPlan` takes seconds (a Tauri preflight plus a `gh` resolve) and the state can change
+    // while it is in flight. The stakes: `promote-progress`, the failure panel and
+    // `failure.orphanedSessionId` all render INSIDE the `plan.ok` branch, so any reload landing a
+    // not-ok plan erases the id a user needs to stop a sandbox that is still billing, and nothing
+    // re-derives it. A refusal only needs to become resolvable BEFORE a promotion is attempted.
+    if (failureRef.current !== null || stepRef.current !== null || movedRef.current) return;
+    // AND NOTHING RELOADS OVER A GOOD PLAN THE USER IS READING. The guards above only protect a
+    // promotion that has STARTED; an ok plan on screen was unprotected, and the resolve path could
+    // downgrade it. That is not hypothetical: `promoteDialogDeps.loadPlan` swallows a failed
+    // `promotion_preflight` with `.catch(() => null)`, and `planPromotion` turns a null preflight
+    // into a `no_worktree` REFUSAL — so one flaky Tauri invoke while the user alt-tabs replaced the
+    // confirm screen (branch, dirty-file list, policy radios) with "there is no worktree to
+    // promote", recoverable only by happening to fire another focus event. It is the same harm the
+    // `.catch` below guards against for a throw, arriving through the resolve path instead — and it
+    // contradicts this file's own rule that a churning plan is the hazard. The recovery this whole
+    // feature exists for only ever needs a reload while the plan is NOT ok (roborev 59544).
+    if (planRef.current?.ok) return;
+    const gen = ++genRef.current;
+    const current = () =>
+      aliveRef.current &&
+      gen === genRef.current &&
+      failureRef.current === null &&
+      stepRef.current === null &&
+      !movedRef.current;
     depsRef.current
       .loadPlan()
       .then((p) => {
-        if (alive) setPlan(p);
+        if (!current()) return;
+        // Clear the error this supersedes: `loadError` pre-empts the `plan` branch and nothing else
+        // resets it, so one transient rejection otherwise wedged the dialog past every recovery.
+        setLoadError(null);
+        setPlan(p);
       })
       .catch((err: unknown) => {
-        if (alive) setLoadError(String(err instanceof Error ? err.message : err));
+        // A REJECTION IS NOT AN ANSWER, so it must not erase one already on screen. A not-ok plan is
+        // a verdict about promotability; a throw is the absence of one. The error panel carries no
+        // button, so landing on it mid-flow leaves close-and-reopen as the only exit.
+        if (current() && planRef.current === null) {
+          setLoadError(String(err instanceof Error ? err.message : err));
+        }
       });
-    return () => {
-      alive = false;
-    };
   }, []);
+
+  // ONE preflight on open. `reloadPlan` is ref-stable, and routing the mount through it puts the
+  // STALEST load (built from the gate captured at open) under the same last-called-wins rule.
+  useEffect(() => {
+    reloadPlan();
+  }, [reloadPlan]);
+
+  // Skips the first run — the mount effect already loaded. Only a genuine transition re-asks.
+  const wasSignedIn = useRef(signedIn);
+  useEffect(() => {
+    if (signedIn && !wasSignedIn.current) reloadPlan();
+    wasSignedIn.current = signedIn;
+  }, [signedIn, reloadPlan]);
+  useEffect(() => {
+    const onFocus = () => reloadPlan();
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [reloadPlan]);
+
+  // `{ url }` not a bare string: "the launch failed" and "we have a URL to offer" are different
+  // facts. `lastSignInUrl()` is null when the failure happened before the URL was built, and a
+  // `string | null` state cannot tell that from "no failure" — so the fallback would render nothing
+  // and we would be back to a button that visibly does nothing.
+  const [signInFailed, setSignInFailed] = useState<{ url: string | null } | null>(null);
+  const signIn = async () => {
+    setSignInFailed(null);
+    // `openSignIn()` RESOLVES false (never rejects) when the browser cannot be launched; discarding
+    // that leaves a dead button. Nothing else happens on success — see the note above.
+    const ok = await openSignIn();
+    if (!ok) setSignInFailed({ url: lastSignInUrl() });
+  };
+
 
   const agentLabel = agent.name || "this agent";
   const running = step !== null;
@@ -354,9 +442,32 @@ export function PromoteToCloudDialog({
                   so a signed-out user read "Sign in to run agents in the cloud" beside no control at
                   all. NewAgentButtons had handled this for the identical gate all along. */}
               {plan.needsSignIn && (
-                <button type="button" style={actionBtn} onClick={() => void openSignIn()}>
+                <button
+                  type="button"
+                  style={actionBtn}
+                  onClick={() => void signIn()}
+                  data-testid="promote-sign-in"
+                >
                   Sign in
                 </button>
+              )}
+              {signInFailed && (
+                <p
+                  role="alert"
+                  data-testid="promote-sign-in-fallback"
+                  style={{ color: DANGER, fontSize: 13, margin: 0, maxWidth: 420 }}
+                >
+                  {signInFailed.url ? (
+                    <>
+                      Couldn&apos;t open your browser. Open this link manually:{" "}
+                      <span style={{ color: C.cream, userSelect: "text", wordBreak: "break-all" }}>
+                        {signInFailed.url}
+                      </span>
+                    </>
+                  ) : (
+                    "Couldn't start sign-in. Check your connection and try again."
+                  )}
+                </p>
               )}
               {plan.deepLink && deepLinkActionLabel(plan.deepLink) && (
                 <button
