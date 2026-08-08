@@ -4771,13 +4771,20 @@ export function ConciergeHost({
         // submit-time check and the one inside `dispatchToTerminal` still observe different
         // instants on this path, so both are load-bearing and neither may be "tidied" away.
         // ══ SUBMITTING IS INPUT, EVEN WHEN NOBODY TOUCHED THE KEYBOARD ═══════════════════════════
-        // `noteInput` is fed from exactly two places — the composer's own `onChange` and the
-        // terminal's `onData` — and BOTH only ever see keystrokes. ComposeBox pokes it on the user's
-        // edits only, deliberately (a dictated segment landing in the box must not report Here on
-        // its own; see its `onChange`). So a hands-free session looks IDLE: read terminal output for
-        // five minutes without typing, dictate a line, and auto-send fires with presence already
-        // resolved to Away — this gate falls through and the countdown banner is back, in precisely
-        // the mode where he is not typing.
+        // `noteInput` has THREE production feeders, and the count matters because an earlier version
+        // of this comment said "exactly two" and reasoned from it (roborev 60344):
+        //   • `Concierge/ComposeBox`'s `onChange`   — keystrokes, and only the USER's own edits: a
+        //     dictated segment landing in the box must not report Here on its own (see it);
+        //   • `Terminal`'s xterm `onData`           — keystrokes;
+        //   • `services/dictationTerminalSink`      — a post-write poke, and the one that is NOT a
+        //     keystroke. It fires only for a dictated delivery straight into a TERMINAL, so it does
+        //     not see a concierge send at all.
+        //
+        // So the hands-free gap is real but narrower than "voice never counts": drive the concierge
+        // by voice — read terminal output for five minutes without typing, dictate a line, let
+        // auto-send fire — and none of the three has fired, so presence has already resolved to Away,
+        // this gate falls through, and the countdown banner is back in precisely the mode where he is
+        // not typing. (Dictating into a terminal, by contrast, does keep him Here.)
         //
         // ══ COMPUTED LOCALLY, NOT POKED INTO THE STORE — THAT DISTINCTION IS THE WHOLE POINT ══════
         // The obvious fix is `usePresenceStore.getState().noteInput()` at the submit seam. It was
@@ -5009,25 +5016,27 @@ export function ConciergeHost({
       // `deliver`'s `submittedAt` param for why reading the clock down there instead is inert.
       const submittedAt = Date.now();
       // ══ AND THE STORE IS STILL NOT POKED HERE — INCLUDING FOR A REAL CLICK ══════════════════════
-      // Recorded because the obvious follow-up was tried and REVERTED, and the next reader will
-      // otherwise try it again. The gap is real: queued intents drain on exactly ONE trigger — the
-      // store's away → here EDGE (`resumeQueuedIntents`) — and `presentNextQueued` re-checks presence
-      // per intent, so a held send cannot be released while the store still reads Away. `noteInput`
-      // is fed only by ComposeBox's `onChange` and xterm's `onData`, both keystroke-only, so neither
-      // a Send CLICK nor a dictated submit reaches it. A held message can therefore only age into
-      // needs-confirmation.
+      // WHY the store is left alone is stated once, at the mount gate in `deliver` — do not restate
+      // it here. This block records only what that one cannot: the follow-up that was TRIED, the
+      // measurement that killed it, and where the attempt lives.
       //
-      // WHY `if (!autoFiringRef.current) usePresenceStore.getState().noteInput()` IS NOT THE FIX,
-      // even though it looks like the same gesture gate `notifyManualSend` uses further down: it reds
-      // "leaves the idle clock alone, so an addressed destructive send still QUEUES while idle-away".
-      // A countdown reads presence AT EXPIRY, on purpose, so that walking away DURING it still
-      // queues. `noteInput` clears the idle clock for IDLE_AWAY_MS — orders of magnitude longer than
-      // the countdown — so a click, then a walk-away, then expiry would DISPATCH the destructive
-      // send. That is precisely the hole the scoped inference above was written to close; the gesture
-      // gate only narrows who reopens it.
+      // `if (!autoFiringRef.current) usePresenceStore.getState().noteInput()` — the same gesture gate
+      // `notifyManualSend` uses further down — reds "leaves the idle clock alone, so an addressed
+      // destructive send still QUEUES while idle-away" (2 failed / 60 passed; without it, 61 passed).
+      // `noteInput` clears the idle clock for IDLE_AWAY_MS, far longer than any countdown, so click →
+      // walk away → expiry would DISPATCH the destructive send. The gesture gate only narrows WHO
+      // reopens that hole. The attempt is snapshotted at `refs/rescue/presence-queue-drain`.
       //
-      // The drain needs its own trigger rather than a presence lie. Whether a manual submit should
-      // release a previously-held destructive send is a product question — filed, not inferred here.
+      // WHAT IS ACTUALLY UNRESOLVED, stated precisely because an earlier cut of this comment
+      // overclaimed it (roborev 60344): THIS submit cannot release a held send. A held send is
+      // otherwise drained by any away → here transition — refocusing the window (`setFocused`), the
+      // Here/pin slider (`setHere`/`setPinnedHere`), or a keystroke — and only ages into
+      // needs-confirmation in the narrow case where none of those happens: idle-Away, window still
+      // focused, never typing, never touching the slider. The queue is not a dead end.
+      //
+      // The drain needs its own trigger rather than a presence lie, and whether a manual submit
+      // SHOULD release a previously-held destructive send is a product question — filed, not
+      // inferred here.
       const forceSparkle = forceSparkleRef.current;
       forceSparkleRef.current = false;
       // ══ WHERE THIS MESSAGE GOES ═════════════════════════════════════════════════════════════════
