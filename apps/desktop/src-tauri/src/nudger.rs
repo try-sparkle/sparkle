@@ -876,9 +876,14 @@ fn apply_flags(
     let target = decision.flagged?;
     // Carry the ORIGINAL raise time across the refresh, the same correction `conflict_watch` took
     // (roborev 57873): a row whose age restarted every look would tell a reader the agent has been
-    // stuck for ten minutes when it has been stuck for six hours. `hash_changed` already cleared
-    // any previous row above, so a NEW episode correctly gets a new timestamp — and so does a row
-    // a consumer cleared, because there is then nothing left to carry.
+    // stuck for ten minutes when it has been stuck for six hours.
+    //
+    // WHICH LOOKS END AN EPISODE, restated because the rule above changed under it (roborev 60386):
+    // a FLAGGING look never clears, `hash_changed` or not, so an agent still asking for a person
+    // keeps its original timestamp through any number of repaints. Only a NON-flagging
+    // `hash_changed` look ends the episode — and that one returns before reaching here — so the
+    // next flagging look after it finds nothing to carry and correctly stamps fresh. A row a
+    // consumer cleared behaves the same way, for the same reason: nothing left to carry.
     let flag = build_flag(agent_id, target, state, flags.get(agent_id));
     flags.raise(flag.clone());
     decision.escalate.map(|_| flag)
@@ -1772,6 +1777,47 @@ mod tests {
     /// An agent that MOVED has resolved its own episode, so the flag is no longer true. Leaving it
     /// up has the pusher chase an agent that is already working again — and a channel that reports
     /// resolved problems stops being read.
+    #[test]
+    /// A REPAINT IS NOT A NEW EPISODE — the `apply_flags` half of roborev 60369, which shipped with
+    /// NO test of its own (roborev 60386): no existing case passed `hash_changed: true` together
+    /// with `flagged: Some(..)`, so deleting the guard left this whole suite green while the
+    /// founder-visible symptom — a still-flagging row's age restarting at "now" on every repaint —
+    /// was protected by nothing.
+    ///
+    /// Paired with the recovery case below it, so the two together pin the CAUSE (the look is still
+    /// flagging) rather than merely asserting an absence.
+    #[test]
+    fn a_repaint_of_a_still_flagging_agent_keeps_its_row_and_its_age() {
+        let flags = NudgeFlags::default();
+        let state = wedged_state(20);
+        apply_flags(
+            &flags,
+            "agent-1",
+            &decision(Some(nudge_ladder::Escalation::Founder), false),
+            &state,
+        );
+        let first_raised = flags.list()[0].raised_at_ms;
+
+        // Same reason as `a_refreshed_row_keeps_the_age_it_was_first_raised_with`: without waiting
+        // past the clock's resolution a restamping implementation produces an IDENTICAL number and
+        // the assertion passes while proving nothing.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        // The agent repaints — hash moved — but it is STILL asking for a person.
+        apply_flags(
+            &flags,
+            "agent-1",
+            &look(Some(nudge_ladder::Escalation::Founder), None, true),
+            &state,
+        );
+        let rows = flags.list();
+        assert_eq!(rows.len(), 1, "a flagging look must never drop the row it is raising");
+        assert_eq!(
+            rows[0].raised_at_ms, first_raised,
+            "and the row must keep the age it was first raised with, or a six-hour wait reads as new"
+        );
+    }
+
     #[test]
     fn output_from_a_flagged_agent_clears_its_flag() {
         let flags = NudgeFlags::default();
