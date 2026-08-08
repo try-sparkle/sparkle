@@ -549,12 +549,7 @@ pub fn step(state: &mut AgentState, obs: &Observation) -> Decision {
         let conversation = changed && state.attempts > 0 && we_wrote_last_look;
         state.hash = Some(obs.hash);
         state.rung = 0;
-        state.silent_secs = 0;
         if !conversation {
-            state.attempts = 0;
-            state.delivered = 0;
-            state.last_blocked = None;
-            state.escalated = None;
             // ── AND THE REPLY LATCH GOES TOO (roborev 60338, High) ────────────────────────────
             // A previous revision kept the stand-down here, reasoning that clearing it would let an
             // idle redraw revive the pinging on an agent that had said it was done. That reasoning
@@ -585,13 +580,47 @@ pub fn step(state: &mut AgentState, obs: &Observation) -> Decision {
             // re-absorbed because absorption is gated on `attempts > 0`, which this block zeroes.
             // The founder row for an agent explicitly asking for a person lasted one look.
             //
-            // `Done` alone is flag-less, and `Done` alone is the `not-blocked` hole 60338 named.
-            // Everything else keeps the foreign-write release above, which is the right one for a
-            // condition a human or another system still has to clear.
-            if state.standdown == Some(Standdown::Done) {
+            // ── KEYED ON "RAISES NO FLAG", NOT ON ONE VARIANT (roborev 60369, Medium) ────────
+            // The narrowing above was first written as `== Some(Done)`, which quietly swept
+            // `External` (`blocked-on-ci` / `blocked-on-another-agent`) into an exemption the
+            // justification never covered: `External::flag()` is `None`, so it is invisible too, and
+            // its only remaining release was a foreign write — which the thing that actually ends a
+            // CI wait does not produce. An agent that answered `blocked-on-ci`, saw CI finish,
+            // worked for an hour and then wedged stayed pinned to the 600s cadence, so its first
+            // ping arrived about an hour into the silence while the flag reported "4m".
+            //
+            // So the real predicate is VISIBILITY, not identity: a stand-down that raises a flag is
+            // seen by a human whatever we do, and keeps the foreign-write release; one that raises
+            // none must not be able to hide an agent, so it expires the moment the agent speaks.
+            // Written this way a variant added later gets the right behaviour by construction.
+            let invisible = state.standdown.is_some_and(|s| s.flag().is_none());
+            if invisible {
                 state.standdown = None;
                 state.last_reply = None;
             }
+
+            // ── AND THE EPISODE HISTORY SURVIVES A SURVIVING STAND-DOWN (roborev 60369, Medium) ─
+            // Zeroing these unconditionally made `apply_flags` rewrite the founder's row on every
+            // unprovoked repaint: it clears the row on `hash_changed`, then rebuilds it from a now
+            // absent previous row, so `raised_at_ms` restarted at "now" and the counters read
+            // `nudges: 0, silent_secs: 0`. A founder could not tell an agent waiting one minute
+            // from one waiting six hours — the very defect roborev 57873 fixed for `conflict_watch`
+            // — and clearing `escalated` also re-armed `raise`, re-emitting `nudger://escalation`
+            // every repaint. An agent still standing down has not started a new episode.
+            if state.standdown.is_none() {
+                state.attempts = 0;
+                state.delivered = 0;
+                state.last_blocked = None;
+                state.escalated = None;
+            }
+        }
+
+        // The silence clock restarts only when no stand-down survived. While one holds, this is what
+        // the founder's row reports, and there the useful number is how long the agent has been
+        // waiting on the thing it named — not how long since its last repaint. Restarting it every
+        // repaint is what made a six-hour block read as brand new.
+        if state.standdown.is_none() {
+            state.silent_secs = 0;
         }
 
         let stand = effective_standdown(state, obs);
@@ -2014,6 +2043,88 @@ mod tests {
                 "{reply:?}: and the row stays up the whole time"
             );
         }
+    }
+
+    /// AN INVISIBLE STAND-DOWN EXPIRES TOO, EVEN THOUGH IT IS NOT `Done` (roborev 60369, Medium).
+    ///
+    /// `External` (`blocked-on-ci` / `blocked-on-another-agent`) raises NO flag, so it hides an
+    /// agent exactly the way `Done` does — but the first narrowing keyed on the `Done` variant by
+    /// name and swept it into the exemption. Its only release was a foreign write, and the thing
+    /// that ends a CI wait does not type into a PTY. So an agent that answered `blocked-on-ci`, saw
+    /// CI finish, worked for an hour and then wedged stayed pinned to the 600s cadence: its first
+    /// ping arrived about an hour into the silence, with the flag reporting minutes.
+    #[test]
+    fn an_unflagged_stand_down_expires_on_unprovoked_output_whatever_its_variant() {
+        for reply in [Reply::Ci, Reply::AnotherAgent, Reply::NotBlocked] {
+            assert_eq!(Standdown::of(reply).flag(), None, "{reply:?}: precondition — invisible");
+
+            let mut s = AgentState::default();
+            run(&mut s, &stalled(), 7);
+            step(&mut s, &Observation { hash: 0x8001, reply: Some(reply), ..stalled() });
+            assert_eq!(s.standdown(), Some(Standdown::of(reply)), "{reply:?}: stood down");
+
+            // It gets back to work on its own — the CI wait ended, nobody typed.
+            step(&mut s, &Observation { hash: 0x8002, reply: None, ..stalled() });
+            assert_eq!(s.standdown(), None, "{reply:?}: an invisible stand-down cannot outlive this");
+
+            // …and it is back on the ORDINARY cadence, not pinned to the top rung.
+            let d = run(&mut s, &Observation { hash: 0x8002, reply: None, ..stalled() }, 8);
+            let first = d.iter().position(|x| matches!(x.action, Action::Nudge { .. }));
+            assert_eq!(first, Some(5), "{reply:?}: first ping on the normal rungs, not an hour late");
+            // THE DISCRIMINATOR: a latched `External` pins every look to the 600s top rung, so this
+            // sequence is what separates "back on the ladder" from "waiting an hour to say anything".
+            assert_eq!(
+                d[..=5].iter().map(|x| x.next_look_secs).collect::<Vec<u64>>(),
+                vec![10, 20, 30, 60, 120, 300],
+                "{reply:?}: the dense early rungs are back"
+            );
+        }
+    }
+
+    /// A SURVIVING STAND-DOWN IS NOT A NEW EPISODE (roborev 60369, Medium).
+    ///
+    /// The reset zeroed the counters and the escalation high-water mark unconditionally, so every
+    /// unprovoked repaint of an agent stood down on `blocked-on-human` rewrote the founder's row as
+    /// `nudges: 0, silent_secs: 0` and re-armed `raise`, re-emitting an escalation event each time.
+    /// A row that resets its own age cannot tell a one-minute wait from a six-hour one.
+    #[test]
+    fn a_repaint_does_not_restart_a_surviving_stand_downs_history() {
+        let mut s = AgentState::default();
+        run(&mut s, &stalled(), 9);
+        let before_attempts = s.attempts();
+        assert!(before_attempts >= 3, "precondition: a real nudge history");
+
+        let d = step(&mut s, &Observation { hash: 0x9001, reply: Some(Reply::Human), ..stalled() });
+        assert_eq!(d.flagged, Some(Escalation::Founder), "precondition: the row went up");
+        let secs_at_answer = s.silent_secs();
+
+        // Repaint after repaint, unprovoked. None of them is a new episode.
+        for i in 0..6u64 {
+            let d = step(&mut s, &Observation { hash: 0x9100 + i, reply: None, ..stalled() });
+            assert_eq!(d.escalate, None, "repaint {i} must not re-emit an escalation event");
+            assert_eq!(d.flagged, Some(Escalation::Founder), "repaint {i}: row still up");
+        }
+        assert_eq!(s.attempts(), before_attempts, "the nudge count must not regress to zero");
+        assert_eq!(s.escalated(), Some(Escalation::Founder), "nor the high-water mark");
+        assert!(
+            s.silent_secs() >= secs_at_answer,
+            "and the age must not restart: {} < {secs_at_answer}",
+            s.silent_secs()
+        );
+    }
+
+    /// …but a genuinely recovered agent — no stand-down — still gets the clean slate.
+    #[test]
+    fn a_recovered_agent_still_starts_a_fresh_episode() {
+        let mut s = AgentState::default();
+        run(&mut s, &stalled(), 9);
+        assert!(s.attempts() >= 3);
+
+        step(&mut s, &Observation { hash: 0x9201, reply: None, ..stalled() });
+        step(&mut s, &Observation { hash: 0x9202, reply: None, ..stalled() });
+        assert_eq!(s.attempts(), 0, "no stand-down means the episode really did end");
+        assert_eq!(s.escalated(), None);
+        assert_eq!(s.silent_secs(), 0, "and the silence clock restarts");
     }
 
     /// …but a FINISHED agent stays quiet through the same sequence, which is what makes the rule

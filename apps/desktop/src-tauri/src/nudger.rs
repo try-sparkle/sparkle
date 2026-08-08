@@ -861,7 +861,16 @@ fn apply_flags(
     // An agent that MOVED has resolved its own episode, so any flag raised for it is no longer
     // true. Leaving it up would have the pusher chase an agent that is already working again — and
     // a channel that reports resolved problems stops being read.
-    if decision.hash_changed {
+    //
+    // …UNLESS THE LOOK IS STILL A FLAGGING ONE (roborev 60369, Medium). `hash_changed` stopped
+    // meaning "new episode" once a stand-down could survive a reset: an agent that answered
+    // `blocked-on-human` and then repainted still carries `flagged`, but the unconditional clear
+    // dropped its row and the rebuild below then found no previous row to carry `raised_at_ms` from,
+    // so the age restarted at "now" on every repaint. A founder could not tell an agent waiting one
+    // minute from one waiting six hours — exactly what roborev 57873 fixed for `conflict_watch`.
+    // Clearing only when the look raises NO flag keeps the recovery case (a moving, unflagged agent
+    // loses its row) while an ongoing ask keeps its age.
+    if decision.hash_changed && decision.flagged.is_none() {
         flags.clear(agent_id);
     }
     let target = decision.flagged?;
