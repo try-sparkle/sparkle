@@ -410,13 +410,44 @@ export function AgentSidebar({
   // out on AgentRowProps.calmSt: `stallReport` answers `active` for the red tier, so feeding it the
   // escalated map would collapse every report to "nothing outstanding" and the escalation would erase
   // its own justification.
+  //
+  // AND IT IS ASKED ONCE PER AGENT, WHICH IS WHY THE LOOKUP IS INDEXED (sparkle perf, 2026-08-08).
+  // `withStallAttention` walks every agent and hands the callback below an `id`; the callback needs
+  // that agent's `goal`, and it used to get it with `project.agents.find((x) => x.id === id)` — a
+  // linear scan nested inside a linear walk, i.e. O(agents²) element visits *per memo evaluation*.
+  // This memo's deps include `branchStatus`, `workflowState` and `workflowStage`, every one of which
+  // is rewritten by ANY agent's probe, so on a 60-agent fleet it re-ran constantly and each run cost
+  // ~1,830 comparisons (Σ i for i≤60 — `find` stops at the match) to answer 60 questions. Indexed by
+  // id it is 60 map lookups. Hoisted into its OWN memo keyed on the agents array rather than rebuilt
+  // inside the one below, because the agents array changes far less often than the probe maps do.
+  //
+  // ⚠️ THIS DOES NOT MAKE THE MEMO LINEAR, and the difference matters to whoever profiles it next
+  // (roborev 60536). `withStallAttention` also asks `engine/inMotion.isInMotion` once per
+  // escalatable agent, and that runs its own full `agents.some(...)` scan for any agent not itself
+  // `working` — i.e. for the entire escalatable set. At 60 agents that is ~3,600 element visits,
+  // LARGER than the term removed here. Closing it means handing `withStallAttention` a precomputed
+  // parent → working-worker index instead of the raw array, which is a change to `engine/inMotion`
+  // and `engine/stallEscalation`, not to this file. Tracked as bead sparkle-z5gq8.
+  //
+  // Nor is that the largest survivor. Measured at 60 agents, the render path's scans over the
+  // agents array are ~360 element visits from `find` (this fix), ~3,600 from `some`
+  // (sparkle-z5gq8), and ~4,080 from the per-id `agents.filter((a) => a.parentId === id)`
+  // callbacks (sparkle-k3wab). So this removed 1,830 visits from a path that still does ~8,000.
+  // `AgentSidebar.escalationCost.test` counts all three separately and ASSERTS the two unfixed
+  // ones are still present, so neither can go quietly dead and neither can be fixed without
+  // forcing this comment to be corrected.
+  const agentsById = useMemo(() => {
+    const index = new Map<string, AgentTab>();
+    for (const a of project?.agents ?? NO_AGENTS) index.set(a.id, a);
+    return index;
+  }, [project?.agents]);
   const escalatedStatus = useMemo(() => {
     if (!project) return status;
     const escalated = withStallAttention(
       project.agents,
       calmStatus,
       (id) => {
-        const agent = project.agents.find((x) => x.id === id);
+        const agent = agentsById.get(id);
         if (agent === undefined) return undefined;
         return stallReport(
           stallInputsFor(
@@ -438,7 +469,7 @@ export function AgentSidebar({
       (id) => processAliveFor(id, status, openIds),
     );
     return escalated;
-  }, [project, calmStatus, status, branchStatus, workflowStage, workflowState, openIds]);
+  }, [project, agentsById, calmStatus, status, branchStatus, workflowStage, workflowState, openIds]);
   // The map the ROW PRESENTS: acknowledged escalations handed back to the band they came from.
   //
   // TWO MAPS, AND WHICH ONE EACH CONSUMER GETS IS THE WHOLE FIX (roborev 55423/55434). The episode
@@ -3456,45 +3487,158 @@ export { formatElapsed };
  * out-of-phase clock, which previously made the count visibly jump backward (read as a spurious
  * "reset"). `since` is the user's last interaction; null means no timer, so the interval is skipped.
  */
+/** The row clock's two cadences. Fast for the first 100s after an interaction, where every second
+ *  is visible in the counter; relaxed afterwards, where the display is minutes to one decimal. */
+const ROW_CLOCK_FAST_MS = 1000;
+const ROW_CLOCK_SLOW_MS = 5000;
+
+interface RowClockSub {
+  /** How often THIS row wants waking — {@link ROW_CLOCK_FAST_MS} or {@link ROW_CLOCK_SLOW_MS}. */
+  cadence: number;
+  /** Epoch ms this row was last notified; the ticker uses it to decide whether the row is due. */
+  last: number;
+  notify: (now: number) => void;
+}
+
+// ── ONE TICKER FOR THE WHOLE COLUMN ─────────────────────────────────────────────────────────────
+// `useRowClock` used to own a `setInterval` PER ROW. At the founder's 60 agents that is 60
+// independent timers, 60 independent wakeups and 60 independent `visibilitychange` listeners, each
+// firing a `setNow` that re-renders that row's whole (unmemoized, ~2,200-line) body. The timers are
+// the part that is pure waste: the renders are the feature, sixty scheduler entries to produce them
+// are not.
+//
+// So the rows subscribe to a module-level clock instead, and it runs exactly one interval.
+//
+// ⚠️ THE TRAP THIS SHAPE AVOIDS. A single 1s ticker that woke every subscriber each second would be
+// WORSE than sixty timers, not better: it would quintuple the re-renders of every relaxed row. The
+// two rates are therefore preserved PER SUBSCRIBER — the interval runs at the fastest cadence
+// anyone currently wants, and each tick notifies only the subscribers whose own cadence is due.
+// With no fast row mounted the interval itself relaxes to 5s, so an all-relaxed column wakes at the
+// same rate it did before.
+const rowClockSubs = new Set<RowClockSub>();
+let rowClockInterval: ReturnType<typeof setInterval> | undefined;
+/** The cadence `rowClockInterval` was started at, so a re-evaluation can tell "already right". */
+let rowClockCadence = 0;
+let rowClockListening = false;
+
+const rowClockVisible = (): boolean =>
+  typeof document === "undefined" || document.visibilityState === "visible";
+
+function rowClockTick(): void {
+  const now = Date.now();
+  for (const sub of rowClockSubs) {
+    // HALF THE TICK OF SLACK, because a real `setInterval` does not fire on the exact millisecond.
+    // Without it a 1s subscriber on a 1s ticker that fires at 999ms elapsed is judged not-due and
+    // skips to the NEXT tick — a visible stutter in a counter whose whole job is to show seconds.
+    // With it, a 5s subscriber still cannot fire at 4s (4000 < 4500).
+    if (now - sub.last >= sub.cadence - rowClockCadence / 2) {
+      sub.last = now;
+      sub.notify(now);
+    }
+  }
+  // RELAX HERE, NOT ON UNSUBSCRIBE — see rowClockStart's warning. A tick has just fired, so
+  // replacing the interval now cannot starve anyone; doing it during subscription churn can.
+  if (rowClockSubs.size > 0 && rowClockDesiredCadence() > rowClockCadence) {
+    rowClockRestart(rowClockDesiredCadence());
+  }
+}
+
+function rowClockStop(): void {
+  if (rowClockInterval !== undefined) {
+    clearInterval(rowClockInterval);
+    rowClockInterval = undefined;
+  }
+  rowClockCadence = 0;
+}
+
+/** The fastest cadence any currently-mounted row wants. */
+function rowClockDesiredCadence(): number {
+  let cadence = ROW_CLOCK_SLOW_MS;
+  for (const sub of rowClockSubs) if (sub.cadence < cadence) cadence = sub.cadence;
+  return cadence;
+}
+
+function rowClockRestart(cadence: number): void {
+  rowClockStop();
+  rowClockCadence = cadence;
+  rowClockInterval = setInterval(rowClockTick, cadence);
+}
+
+/**
+ * Start the shared interval, or TIGHTEN it if someone now wants a faster beat than it is running
+ * at. No-op when nobody is subscribed or the window is hidden — both mean there is nothing to tick
+ * for — and, critically, a no-op when the running cadence is already fast enough.
+ *
+ * ⚠️ TIGHTEN-ONLY, AND WHY IT MUST NOT ALSO RELAX HERE (roborev 60545). Replacing the interval
+ * discards a PENDING fire, and with one shared timer that starves EVERY row rather than one. The
+ * hook resubscribes on every change to `since`, and `since` is `interactionStore.lastAt`, which is
+ * rewritten every `TOUCH_THROTTLE_MS` (900ms) for as long as the user types into a terminal. So on
+ * a realistic column — one fast row, the rest relaxed — an earlier version restarted twice per
+ * keystroke window: unsubscribing the only fast row relaxed the timer to 5s, and the immediate
+ * resubscribe tightened it back to 1s. The 1s interval was destroyed every ~900ms and never
+ * reached its first fire, so the whole column's clock froze for as long as typing continued.
+ *
+ * With tighten-only, a fast→fast resubscribe finds 1000 already running and leaves it completely
+ * alone, so the churn costs nothing. Relaxation is genuinely wanted, just not urgently, and it
+ * happens in {@link rowClockTick} — after a fire, where it can starve nobody. The cost is at most
+ * one extra wakeup at the old rate before it settles.
+ */
+function rowClockStart(): void {
+  if (rowClockSubs.size === 0 || !rowClockVisible()) return;
+  const desired = rowClockDesiredCadence();
+  if (rowClockInterval !== undefined && desired >= rowClockCadence) return;
+  rowClockRestart(desired);
+}
+
+function onRowClockVisibility(): void {
+  if (rowClockVisible()) {
+    // Catch every subscriber up to real elapsed time the instant we are shown, then resume. Same
+    // contract the per-row version had — the clock froze while hidden, so it must not come back
+    // holding a stale reading and then advance from it.
+    const now = Date.now();
+    for (const sub of rowClockSubs) {
+      sub.last = now;
+      sub.notify(now);
+    }
+    rowClockStart();
+  } else {
+    // Nobody is watching a backgrounded window's elapsed counter, so the wakeups are pure waste.
+    rowClockStop();
+  }
+}
+
+function rowClockSubscribe(cadence: number, notify: (now: number) => void): () => void {
+  const sub: RowClockSub = { cadence, last: Date.now(), notify };
+  rowClockSubs.add(sub);
+  if (!rowClockListening && typeof document !== "undefined") {
+    document.addEventListener("visibilitychange", onRowClockVisibility);
+    rowClockListening = true;
+  }
+  rowClockStart();
+  return () => {
+    rowClockSubs.delete(sub);
+    if (rowClockSubs.size === 0) {
+      rowClockStop();
+      if (rowClockListening && typeof document !== "undefined") {
+        document.removeEventListener("visibilitychange", onRowClockVisibility);
+        rowClockListening = false;
+      }
+    } else {
+      // DELIBERATELY NOTHING. The departing row may have been the only fast one, but relaxing the
+      // ticker here is exactly the restart that starves the column during `since` churn — see
+      // rowClockStart. `rowClockTick` relaxes it after the next fire instead.
+    }
+  };
+}
+
 export function useRowClock(since: number | undefined): number {
   const [now, setNow] = useState(() => Date.now());
   const fast = since != null && now - since < 100_000;
   useEffect(() => {
+    // `since == null` means the agent has never been touched, so there is no duration to count and
+    // this row registers NOTHING — not a slow subscription, not a timer.
     if (since == null) return;
-    // Only tick while the window is actually visible. A hidden/backgrounded window has no one
-    // watching the elapsed counter, so a per-second (or 5s) re-render there is pure wasted work and
-    // wakeups — with many rows it adds up. The interval pauses when the document is hidden and
-    // resumes (catching the clock up immediately) on the visibilitychange back to visible.
-    const visible = () =>
-      typeof document === "undefined" || document.visibilityState === "visible";
-    let id: ReturnType<typeof setInterval> | undefined;
-    const startTicking = () => {
-      if (id == null) id = setInterval(() => setNow(Date.now()), fast ? 1000 : 5000);
-    };
-    const stopTicking = () => {
-      if (id != null) {
-        clearInterval(id);
-        id = undefined;
-      }
-    };
-    const onVisibility = () => {
-      if (visible()) {
-        setNow(Date.now()); // catch up the (frozen-while-hidden) clock the instant we're shown
-        startTicking();
-      } else {
-        stopTicking();
-      }
-    };
-    if (visible()) startTicking();
-    if (typeof document !== "undefined") {
-      document.addEventListener("visibilitychange", onVisibility);
-    }
-    return () => {
-      stopTicking();
-      if (typeof document !== "undefined") {
-        document.removeEventListener("visibilitychange", onVisibility);
-      }
-    };
+    return rowClockSubscribe(fast ? ROW_CLOCK_FAST_MS : ROW_CLOCK_SLOW_MS, setNow);
   }, [fast, since]);
   return now;
 }
@@ -4294,10 +4438,24 @@ const AgentRow = memo(function AgentRow({
   // Falls back to `scrollIntoView` whenever there is no anchor (a spawn, a concierge tool call, a
   // keyboard activation) — those have no cursor behind them, and inventing one would scroll the
   // column to a place nobody was looking.
-  const revealAgentId = useUiStore((s) => s.revealAgentId);
-  const revealAnchorY = useUiStore((s) => s.revealAnchorY);
+  //
+  // ── SUBSCRIBED AS A BOOLEAN, FOR THE REASON `unjudgedAsk` ABOVE IS ──────────────────────────────
+  // These were `useUiStore((s) => s.revealAgentId)` and `…revealAnchorY` — two SCALARS, read by
+  // every row. A scalar selector changes value for EVERY subscriber whenever it is written, so one
+  // reveal re-rendered all sixty rows, and then re-rendered all sixty AGAIN when `clearRevealAgent`
+  // below wrote it back to null: 120 row renders to scroll one row. The comment forty lines up
+  // already claims row subscriptions are narrowed to booleans precisely so an unrelated write
+  // cannot invalidate every row; this is that claim made true here too.
+  //
+  // The ANCHOR is read from the store at effect time rather than subscribed. It only has meaning
+  // for the row being revealed, it is written in the SAME `set` as `revealAgentId` (see uiStore's
+  // `requestRevealAgent`), and it is cleared in the same one — so `revealMe` flipping is the only
+  // edge that can bring a new anchor with it, and `getState()` inside the effect reads the freshest
+  // value there is. Subscribing to it bought nothing and cost fifty-nine renders.
+  const revealMe = useUiStore((s) => s.revealAgentId === a.id);
   useEffect(() => {
-    if (revealAgentId !== a.id) return;
+    if (!revealMe) return;
+    const revealAnchorY = useUiStore.getState().revealAnchorY;
     sidebarScroll?.abandonReveal(true);
     const row = rowRef.current;
     const sc = sidebarScroll?.containerRef.current;
@@ -4333,7 +4491,7 @@ const AgentRow = memo(function AgentRow({
       rowRef.current?.scrollIntoView?.({ block: "nearest" });
     }
     useUiStore.getState().clearRevealAgent(a.id);
-  }, [revealAgentId, revealAnchorY, a.id, sidebarScroll]);
+  }, [revealMe, a.id, sidebarScroll]);
 
   // Hover open/close with a short close delay, so moving the cursor from the in-flow row onto the
   // overlay sitting on top of it (which fires the row's mouseleave) doesn't flicker it shut.
