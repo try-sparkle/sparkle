@@ -58,9 +58,28 @@ let generation = 0;
 
 /** Load accounts + usage, served from a short TTL cache and de-duped across concurrent callers.
  *  Best-effort: on IPC failure it resolves to empty arrays (→ no accounts → default spawn behavior,
- *  so a backend hiccup never blocks an agent from starting). `force` bypasses the cache. */
-export async function loadAccountState(opts: { force?: boolean; now?: number } = {}): Promise<AccountState> {
+ *  so a backend hiccup never blocks an agent from starting). `force` bypasses the cache.
+ *
+ *  `withIdentities: false` SKIPS the `getIdentities()` leg, and exists because that leg is by far
+ *  the most expensive one: `accounts_identities` reads and JSON-parses EVERY registered account's
+ *  whole `.claude.json` — hundreds of KB for the imported `~/.claude`, which grows with project
+ *  history — to pull three fields out of `oauthAccount`, and folds the result into the
+ *  identity-epoch ledger. That is the right price for the spawn path, which gates auto-pick on
+ *  identities. It is the wrong price for a POLLER that never reads the field: the usage-limit
+ *  banner re-reads on `USAGE_LIMIT_RECHECK_MS` (10s) while the cache TTL above is 5s, so no tick
+ *  can ever be served from cache and the full parse was being paid six times a minute, per mounted
+ *  banner, for as long as a limit was showing — hours, by that feature's own premise (`sparkle-608gg`).
+ *
+ *  An identity-less load is PRIVATE to its caller: it neither writes the shared cache nor publishes
+ *  itself as the in-flight load, because `identities: []` is indistinguishable from "nobody is
+ *  signed in" and auto-pick would read it that way. */
+export async function loadAccountState(
+  opts: { force?: boolean; now?: number; withIdentities?: boolean } = {},
+): Promise<AccountState> {
   const now = opts.now ?? Date.now();
+  // `withIdentities: false` drops the getIdentities() leg — see the doc-comment above for why the
+  // banner needs it. Default true so every existing caller is untouched.
+  const withIdentities = opts.withIdentities !== false;
   if (!opts.force) {
     if (cache && now - cache.at < ACCOUNT_CACHE_TTL_MS) return cache.state;
     if (inflight) return inflight;
@@ -71,7 +90,7 @@ export async function loadAccountState(opts: { force?: boolean; now?: number } =
       const [accounts, usage, identities, ceilings] = await Promise.all([
         listAccounts(),
         getUsage(),
-        getIdentities(),
+        withIdentities ? getIdentities() : Promise.resolve([] as Identity[]),
         // SWALLOWED SEPARATELY, and that asymmetry is deliberate. The other three are load-bearing:
         // if they fail, the load genuinely failed. Ceilings only ever REFINE the pick — with none,
         // selection is exactly the lowest-usage rule that shipped before. So a backend that predates
@@ -100,16 +119,24 @@ export async function loadAccountState(opts: { force?: boolean; now?: number } =
         // have no accounts", which is precisely the confusion `failed` exists to end.
         failed: !shapeOk,
       };
-      if (gen === generation) cache = { at: now, state }; // skip if invalidated mid-load
+      // NEVER publish an identity-less snapshot. `identities: []` is indistinguishable from "nobody
+      // is signed in", and auto-pick GATES on it (see chooseAccountForAgent) — caching this would
+      // strand every spawn at a login prompt. A `withIdentities: false` reader is opting out for
+      // itself, not for the app.
+      if (withIdentities && gen === generation) cache = { at: now, state }; // skip if invalidated mid-load
       return state;
     } catch {
       if (gen === generation) cache = null; // don't pin a failure; the next call retries
       return EMPTY;
     } finally {
-      if (gen === generation) inflight = null; // don't clear a newer load's inflight
+      // `withIdentities` guard as well as the generation one: an identity-less load never PUBLISHED
+      // itself as `inflight`, so clearing it here would cancel a full load someone else is awaiting.
+      if (withIdentities && gen === generation) inflight = null; // don't clear a newer load's inflight
     }
   })();
-  inflight = p;
+  // Same reason as the cache write: an identity-less load must not be handed to a concurrent caller
+  // that asked for the full state. It stays private to its requester.
+  if (withIdentities) inflight = p;
   return p;
 }
 

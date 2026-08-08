@@ -115,6 +115,24 @@ describe("ProviderUnavailableBanner", () => {
  * BannerStack.layout.test.ts; this block is the cheap always-runs guard that the two properties
  * that shape survive are still on the element.
  */
+describe("what the banner asks the accounts seam for", () => {
+  it("opts out of identities — it never reads them, and the leg is the expensive one", async () => {
+    // sparkle-608gg: `accounts_identities` reads and JSON-parses every account's whole
+    // `.claude.json`, and the seam's 5s cache TTL cannot absorb this 10s poll, so every tick paid
+    // that parse in full for as long as a limit was showing. The banner uses only `usage` and
+    // `accounts`, so it must ask for exactly those.
+    useAiProviderStore.setState({ outage: { reason: "usage_limit", at: Date.now() } });
+    render(<ProviderUnavailableBanner />);
+    await act(async () => {
+      await loadStateMock.mock.results[0]?.value;
+    });
+    expect(loadStateMock).toHaveBeenCalled();
+    for (const [opts] of loadStateMock.mock.calls) {
+      expect(opts).toMatchObject({ withIdentities: false });
+    }
+  });
+});
+
 describe("the bar's layout shape at a narrow window", () => {
   it("top-anchors its content rather than centring it", () => {
     useAiProviderStore.setState({ outage: { reason: "usage_limit", at: Date.now() } });

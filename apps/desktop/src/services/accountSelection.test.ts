@@ -76,6 +76,44 @@ describe("accountSelection cache", () => {
     expect(invoke).toHaveBeenCalledTimes(CALLS_PER_LOAD);
   });
 
+  // ── withIdentities: false — the poller's opt-out (sparkle-608gg) ──────────────────────────────
+  // `accounts_identities` reads and JSON-parses every account's whole `.claude.json`. The
+  // usage-limit banner polls every 10s against a 5s TTL, so no tick is ever cache-served and that
+  // parse was being paid six times a minute for a field the banner never reads.
+
+  it("skips the identities IPC entirely when the caller opts out", async () => {
+    await loadAccountState({ now: 6_100_000, withIdentities: false });
+    const commands = invoke.mock.calls.map((c) => c[0]);
+    expect(commands).toContain("accounts_list");
+    expect(commands).toContain("accounts_usage");
+    // The whole point: the expensive leg is not merely ignored, it is never issued.
+    expect(commands).not.toContain("accounts_identities");
+  });
+
+  it("does not let an identity-less load poison the shared cache", async () => {
+    const t0 = 6_200_000;
+    await loadAccountState({ now: t0, withIdentities: false });
+    invoke.mockClear();
+    // A full reader arriving inside the TTL must still get a real load, not the identity-less
+    // snapshot — `identities: []` is indistinguishable from "nobody is signed in", and auto-pick
+    // gates on it, so a poisoned cache would strand every spawn at a login prompt.
+    const full = await loadAccountState({ now: t0 + 1 });
+    expect(invoke.mock.calls.map((c) => c[0])).toContain("accounts_identities");
+    expect(full.failed).toBe(false);
+  });
+
+  it("does not let an identity-less load satisfy a concurrent full reader", async () => {
+    const t0 = 6_300_000;
+    const [lean, full] = await Promise.all([
+      loadAccountState({ now: t0, withIdentities: false }),
+      loadAccountState({ now: t0 }),
+    ]);
+    // Two separate loads: the lean one never publishes itself as the in-flight load.
+    expect(invoke.mock.calls.map((c) => c[0]).filter((c) => c === "accounts_identities")).toHaveLength(1);
+    expect(lean.accounts).toHaveLength(ACCOUNTS.length);
+    expect(full.accounts).toHaveLength(ACCOUNTS.length);
+  });
+
   it("chooseAccountForAgent auto-picks lowest-usage, and honors a manual pin", async () => {
     const t0 = 5_000_000;
     // No usage rows → tie at zero → first account (default) wins the stable reduce.

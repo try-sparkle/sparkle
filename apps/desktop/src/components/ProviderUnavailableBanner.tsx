@@ -186,8 +186,13 @@ export function ProviderUnavailableBanner({ inline = false }: { inline?: boolean
     // The established seam (services/accountSelection), not a second loader: it already owns the
     // short TTL cache, in-flight de-duplication and the degrade-to-empty failure contract
     // (knightwatch 5198911473#3).
+    //
+    // WITHOUT IDENTITIES, and that is load-bearing rather than an optimisation (`sparkle-608gg`).
+    // The identities leg reads and JSON-parses every account's whole `.claude.json`, and the seam's
+    // 5s cache TTL cannot absorb this 10s poll, so every tick paid that parse in full — for hours,
+    // on every mounted banner, for a field this component never reads.
     const check = () => {
-      loadAccountState().then((state) => {
+      loadAccountState({ withIdentities: false }).then((state) => {
         if (alive) setLive(state);
       });
     };
