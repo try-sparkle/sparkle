@@ -5,6 +5,20 @@ declare module "*/worktree-guard.mjs" {
   // Keychain guard predicate (sparkle-0ezz): true iff a Bash command shells out to the macOS
   // `security` CLI against the ai.sparkle.desktop generic-password keychain item.
   export function blocksKeychainCommand(command: unknown): boolean;
+  // Secret-staging guard predicate: non-null iff a Bash command would put credential material into
+  // git. `kind: "named"` = the command line explicitly names a secret-shaped path (pure string
+  // matching, fails CLOSED); `kind: "sweep"` = the command stages whatever is lying around and the
+  // repo holds untracked, un-ignored secret-shaped files; `kind: "staged"` = a `git commit` whose
+  // INDEX already carries one (staged by something this hook never saw). The two repo-consulting
+  // kinds need `git status` and fail OPEN when repo state cannot be determined. Returns null to allow.
+  export function blocksSecretStaging(
+    command: unknown,
+    cwd: unknown,
+  ): { kind: "named" | "sweep" | "staged"; files: string[] } | null;
+  // True iff a path looks like credential material (.env/.env.*/*.env, *.pem/*.key/*.p12/…, id_rsa…,
+  // .netrc/.npmrc/.pgpass, credentials.json/service-account*.json/…, .aws/credentials). Template
+  // files (.env.example/.sample/.template/.dist) and the .pub half of a keypair are exempt.
+  export function isSecretPath(p: unknown): boolean;
   // Narrow allow-list predicate (item 1j): true iff target resolves into $HOME/.claude/plans/ or a
   // $HOME/.claude/projects/<any>/memory/ dir, canonicalized through symlinks (both are append-only
   // per-agent note dirs the guard permits even though they live outside the worktree).
