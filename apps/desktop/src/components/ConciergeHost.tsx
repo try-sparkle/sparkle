@@ -5025,7 +5025,14 @@ export function ConciergeHost({
       // destructive send still QUEUES while idle-away" (2 failed / 60 passed; without it, 61 passed).
       // `noteInput` clears the idle clock for IDLE_AWAY_MS, far longer than any countdown, so click →
       // walk away → expiry would DISPATCH the destructive send. The gesture gate only narrows WHO
-      // reopens that hole. The attempt is snapshotted at `refs/rescue/presence-queue-drain`.
+      // reopens that hole.
+      //
+      // THE ATTEMPT ITSELF IS NOT RECOVERABLE FROM HERE, and this comment used to imply otherwise by
+      // naming `refs/rescue/presence-queue-drain`. That ref is CLONE-LOCAL: `refs/rescue/*` is
+      // outside the default fetch refspec, so it is never pushed and never fetched, and its object
+      // is reachable from no remote branch (checked). For anyone but its author it resolves to
+      // nothing. The durable record is this comment plus roborev 60321/60239 — and the change is two
+      // lines, so re-deriving it from the description above is cheaper than hunting a dangling ref.
       //
       // WHAT IS ACTUALLY UNRESOLVED, stated precisely because an earlier cut of this comment
       // overclaimed it (roborev 60344): THIS submit cannot release a held send. A held send is

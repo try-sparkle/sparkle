@@ -83,11 +83,20 @@ export async function routeDictationToTerminal(
     return { kind: "failed", agentId, error: e };
   }
 
-  // THE USER IS PRESENT. `noteInput` is fed by xterm's `onData`, which only ever sees keystrokes —
-  // so someone who drives an agent purely by voice looks idle to the presence timer and trips
-  // IDLE_AWAY_MS mid-conversation, after which the concierge starts behaving as if nobody is
-  // watching. Dictating is input; say so. Poked AFTER the write so a refused or failed phrase does
-  // not count as activity the user never actually produced.
+  // THE USER IS PRESENT. Every OTHER `noteInput` feeder is keystroke-only — xterm's `onData` and
+  // Concierge/ComposeBox's `onChange` — so someone who drives an agent purely by voice would look
+  // idle to the presence timer and trip IDLE_AWAY_MS mid-conversation, after which the concierge
+  // starts behaving as if nobody is watching. Dictating is input; say so.
+  //
+  // THIS LINE IS THEREFORE THE THIRD FEEDER, and the only one that is not a keystroke. Say it that
+  // way rather than "fed by onData", which was true before this call existed and is now the
+  // retracted claim — ConciergeHost's mount-gate block owns the authoritative enumeration, and
+  // reasoning built on the two-feeder version has already had to be corrected once (roborev 60344).
+  // Note the scope: this fires for a dictated delivery into a TERMINAL, so it does not cover a
+  // dictated CONCIERGE send, which is why that path still needs its own inference.
+  //
+  // Poked AFTER the write so a refused or failed phrase does not count as activity the user never
+  // actually produced.
   usePresenceStore.getState().noteInput();
   useInteractionStore.getState().touch(agentId);
 

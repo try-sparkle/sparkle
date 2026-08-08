@@ -1013,11 +1013,12 @@ describe("ConciergeHost — a terminal that must not receive free text refuses",
 
   // ══ A VOICE-ONLY SESSION MUST NOT LOOK IDLE ═══════════════════════════════════════════════════
   // THE REGRESSION THIS GUARDS, and it is the founder's own complaint coming back in the mode he
-  // uses most. `noteInput` is fed only by the composer's `onChange` and the terminal's `onData` —
-  // both keystroke-only, deliberately, so a dictated segment landing in the box does not report Here
-  // on its own. So: read terminal output for five minutes without typing, dictate a line, and the
-  // idle clock has already resolved presence to Away — the presence gate falls through and the
-  // countdown banner is back.
+  // uses most. `noteInput`'s feeders are enumerated ONCE, in ConciergeHost's mount-gate block — do
+  // not restate the list here; an earlier version of this header did, with the retracted "exactly
+  // two" count, which is the drift that correction existed to close (roborev 60364). What matters
+  // for this row: none of them fires for a dictated CONCIERGE send. So read terminal output for five
+  // minutes without typing, dictate a line, and the idle clock has already resolved presence to
+  // Away — the presence gate falls through and the countdown banner is back.
   //
   // IDLE Away, not MANUAL away, which is the distinction that makes this row mean something. The
   // rows above use `setAway()` (an explicit "I'm stepping out", which `resolveMode` honours first
