@@ -279,6 +279,18 @@ export function ConciergeThread({
   // `onJump` at a message id that is not currently rendered, so `jumpTo`'s scan finds nothing and the
   // click does nothing. Indexed off what is on screen, the affordance and its target appear together.
   const answeredBy = useMemo(() => answeredByIndex(visible), [visible]);
+  // ── THE FOLD, COMPUTED ONCE PER THREAD RATHER THAN ONCE PER RENDER ───────────────────────────
+  // `foldReceiptRuns` walks the WHOLE transcript and allocates a fresh `ThreadRow[]`, and it used to
+  // do it inline in the JSX below — so it ran on every render of this component, including the ones
+  // that have nothing to do with the transcript. Typing is the case that matters: the draft is
+  // lifted into the host's state on every character, which re-renders this container, and the fold
+  // was redoing a full pass over every message in the conversation for each one.
+  //
+  // The message ROWS were already memoized and bail out, so this was never row cost — it is this
+  // container's own, and it grows with the length of the conversation rather than with anything the
+  // keystroke changed. `visible` is the only thing the fold reads, and it is itself memoized
+  // upstream (`useSelectionStableThread`), so it is the whole dependency.
+  const rows = useMemo(() => foldReceiptRuns(visible), [visible]);
 
   /**
    * IS A BUBBLE ALREADY SAYING WHAT THE RAIL WOULD SAY? (sparkle-9ciay)
@@ -454,7 +466,7 @@ export function ConciergeThread({
             SAME rows rendered inside a disclosure rather than different ones. A refused or partly
             refused send is never foldable, so it keeps its own row here by construction rather than
             by anything this JSX has to remember. */}
-        {foldReceiptRuns(visible).map((row) =>
+        {rows.map((row) =>
           row.type === "message" ? (
             renderRow(row.message)
           ) : (

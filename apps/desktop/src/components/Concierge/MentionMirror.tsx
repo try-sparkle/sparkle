@@ -56,7 +56,7 @@
 // This is the same technique Composer.tsx (the build-agent composer) uses for its own ghost layer,
 // down to the space-joining rule; the two were deliberately brought back into line.
 import { useEffect, useRef, type CSSProperties, type RefObject } from "react";
-import { mentionsIn, splitMentionText, type MentionAgent } from "./mentions";
+import { splitAtMentionSpans, type MentionSpan } from "./mentions";
 import { MentionPill, MENTION_PILL_FILL } from "./MentionPill";
 import { C } from "../../theme/colors";
 
@@ -138,7 +138,7 @@ const MIRRORED_PILL: CSSProperties = {
 
 export function MentionMirror({
   text,
-  agents,
+  spans,
   /** The typography and box metrics of the textarea this sits behind. Passed in rather than
    *  re-declared, because they must MATCH EXACTLY: a pixel of difference in padding, font size or
    *  line height and the fills slide off the words they are supposed to be behind. Sharing the
@@ -151,10 +151,26 @@ export function MentionMirror({
   interim = "",
 }: {
   text: string;
-  /** The LIVE roster — the same one the picker offers from and a send resolves against, so a pill
-   *  appears exactly when the text would actually address someone. An agent that leaves the fleet
-   *  takes its pill with it, which is the whole point of deriving mentions from the text. */
-  agents: readonly MentionAgent[];
+  /**
+   * WHERE THE PILLS GO — the spans the composer resolved for THIS draft against the LIVE roster.
+   *
+   * This used to be the roster itself, and the mirror ran the match: `splitMentionText(text,
+   * mentionsIn(text, agents))`, which is two walks of the draft (`mentionsIn` finds the spans,
+   * `splitMentionText` throws away their positions and re-finds them). The composer had already
+   * done the first of those in its own render body, one component up, for the route indicator — so
+   * with the two other consumers doing likewise the same match ran fourteen times per keystroke over
+   * a 60-agent fleet (see mentions.scanMentions).
+   *
+   * Taking the spans rather than the roster is not merely fewer calls: it makes it STRUCTURALLY
+   * impossible for the pills to disagree with the aim. A mirror that re-derived its own spans could
+   * drift from the ones the send resolves; one that is handed them cannot. The pill is the surface
+   * that exists to make the aim reviewable before Enter, so "cannot disagree" is the property that
+   * matters here.
+   *
+   * The liveness the old prop doc described is unchanged — the spans come from the live roster, so
+   * an agent that leaves the fleet still takes its pill with it on the next render.
+   */
+  spans: readonly MentionSpan[];
   metrics: CSSProperties;
   textareaRef: RefObject<HTMLTextAreaElement | null>;
   interim?: string;
@@ -179,11 +195,12 @@ export function MentionMirror({
     return () => ta.removeEventListener("scroll", sync);
   });
 
-  // The SAME splitter the sent bubble uses, fed the mentions this text currently resolves to. Going
-  // through `mentionsIn` → `splitMentionText` rather than calling `findMentionSpans` directly keeps
-  // one notion of where a mention starts and ends: the composer's pills and the bubble's pills are
-  // produced by the same code, so they cannot come to disagree about what counts as a mention.
-  const parts = splitMentionText(text, mentionsIn(text, agents));
+  // The SAME splitter the sent bubble uses (`splitMentionText` is a thin wrapper over this one),
+  // so the composer's pills and the bubble's pills are produced by identical code and cannot come
+  // to disagree about what counts as a mention. The difference is only where the spans come from:
+  // the bubble re-matches a finished message's recorded mentions, this one is handed the live
+  // composer's own reading of the draft — see the `spans` prop.
+  const parts = splitAtMentionSpans(text, spans);
 
   return (
     <div

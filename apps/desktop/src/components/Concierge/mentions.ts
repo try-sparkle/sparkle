@@ -224,6 +224,27 @@ export function isAddressingPosition(text: string, start: number): boolean {
   return text.slice(0, start).trim() === "";
 }
 
+// ══ THE COST OF ONE KEYSTROKE, MADE ASSERTABLE ═══════════════════════════════════════════════════
+
+/**
+ * How much scanning this module has done. PRODUCTION CODE, deliberately, and two integer increments
+ * is the whole of it.
+ *
+ * Typing is the founder's most frequent action, and the thing that made this box slow was not any
+ * single scan being expensive — it was the SAME scan running once per consumer, per character, over
+ * a ~60-agent roster. That is a property no ordinary assertion can see: every consumer rendered the
+ * right pills and routed to the right agent whether the work happened once or four times, so the
+ * suite was green throughout. A counter is the only thing a test can hold that distinguishes "the
+ * composer is correct" from "the composer is correct AND does it once".
+ *
+ * A test seam living in `if (import.meta.env.DEV)` would not do: the assertion has to be about the
+ * code that ships. So this counts always.
+ *
+ * `spans` — calls to {@link findMentionSpans}, the O(agents × textLength) matcher.
+ * `rosterSorts` — length-orderings of the roster, the per-scan `[...agents].sort(…)` that was.
+ */
+export const mentionScanStats = { spans: 0, rosterSorts: 0 };
+
 /** Where a mention's literal sits in the text. Half-open `[start, end)`, like every other range in
  *  this codebase's string handling. */
 export interface MentionSpan {
@@ -257,20 +278,33 @@ export interface MentionSpan {
  * why it is correct.
  */
 export function findMentionSpans(text: string, agents: readonly MentionAgent[]): MentionSpan[] {
-  // Sort a COPY: `agents` is the caller's list and is also what the picker renders in its own
-  // order. Mutating it here would silently reorder the visible list from a parse.
-  const byLength = [...agents].sort((a, b) => labelOf(b).length - labelOf(a).length);
+  mentionScanStats.spans += 1;
+  const byLength = longestLabelFirst(agents);
   const spans: MentionSpan[] = [];
-  const taken: boolean[] = new Array(text.length).fill(false);
+  // WHERE THE SIGILS ARE, found once. Every needle begins with `@`, so a match can only start at one
+  // of these — which turns the search from "walk the whole draft once PER AGENT" into "walk it once,
+  // then test each agent at the two or three places a mention could possibly be". With a 60-agent
+  // fleet and a 200-character paragraph that is ~200 character reads instead of ~12,000.
+  //
+  // It finds exactly the same set the `text.indexOf(needle, …)` loop this replaces did, in the same
+  // ascending order: `indexOf` restarted at `at + 1` after each hit, so it enumerated every
+  // occurrence including overlapping ones, and every occurrence starts at a sigil.
+  const sigils: number[] = [];
+  for (let i = text.indexOf(MENTION_SIGIL); i >= 0; i = text.indexOf(MENTION_SIGIL, i + 1)) {
+    sigils.push(i);
+  }
+  if (sigils.length === 0) return spans;
+  // The ranges already claimed by a longer name. A LIST, not a `new Array(text.length).fill(false)`
+  // bitmap: the bitmap cost an O(draftLength) allocation on every scan — per keystroke, per consumer
+  // — to answer a question about at most a handful of spans. Overlap against a few ranges is cheaper
+  // than allocating two hundred booleans to look one up.
+  const claimed: { start: number; end: number }[] = [];
   for (const agent of byLength) {
     const label = labelOf(agent);
     if (!label) continue; // an unnamed agent has no literal to match — skip, never match "@"
     const needle = MENTION_SIGIL + label;
-    let from = 0;
-    for (;;) {
-      const at = text.indexOf(needle, from);
-      if (at < 0) break;
-      from = at + 1;
+    for (const at of sigils) {
+      if (!text.startsWith(needle, at)) continue;
       const end = at + needle.length;
       // The sigil must START a token — `a@Blue` and `foo@bar.com` are not mentions. And the match
       // must not be a PREFIX of a longer word: `@Blue` inside `@Blueprint` is the wrong agent.
@@ -278,10 +312,8 @@ export function findMentionSpans(text: string, agents: readonly MentionAgent[]):
       if (blocksBoundary(text, at - 1, -1) || text[at - 1] === MENTION_SIGIL) continue;
       if (blocksBoundary(text, end, 1)) continue;
       // Already claimed by a longer name that overlaps this range.
-      let overlaps = false;
-      for (let i = at; i < end; i += 1) if (taken[i]) overlaps = true;
-      if (overlaps) continue;
-      for (let i = at; i < end; i += 1) taken[i] = true;
+      if (claimed.some((c) => at < c.end && end > c.start)) continue;
+      claimed.push({ start: at, end });
       // `label`, not `name`: the span's text IS what was matched, and a mention record carrying the
       // bare name would no longer locate itself in the message (rosterFromMentions feeds it back
       // into this same matcher).
@@ -291,17 +323,108 @@ export function findMentionSpans(text: string, agents: readonly MentionAgent[]):
   return spans.sort((a, b) => a.start - b.start);
 }
 
-/** The mentions in `text`, de-duplicated by agent and in first-appearance order — what a send
- *  carries. Two `@Kraken Auth`s in one message are one aim, not two. */
-export function mentionsIn(text: string, agents: readonly MentionAgent[]): ConciergeMention[] {
+// ── THE LENGTH ORDERING, KEPT RATHER THAN REBUILT ────────────────────────────────────────────────
+// `findMentionSpans` needs the roster longest-label-first, and used to sort a fresh copy on every
+// call. The roster changes when the FLEET changes — a few times a minute at most — while the scan
+// used to run on every character of every draft, so the sort was being redone thousands of times for
+// an answer that had not moved.
+//
+// Keyed on the roster's IDENTITY, and one entry deep. Both are deliberate:
+//   • identity, because these lists come out of `useMemo`s and `mentionRoster` below, so a stable
+//     fleet really does hand over the same object every time — and a CONTENT key would mean walking
+//     all 60 agents to decide whether we may skip walking all 60 agents;
+//   • one entry, because there is exactly one roster in play at a time (see `mentionRoster`), and a
+//     cache that cannot grow cannot leak. A roster that changes evicts the old one on the next call.
+let sortedFor: readonly MentionAgent[] | null = null;
+let sortedList: readonly MentionAgent[] | null = null;
+function longestLabelFirst(agents: readonly MentionAgent[]): readonly MentionAgent[] {
+  if (sortedFor === agents && sortedList) return sortedList;
+  mentionScanStats.rosterSorts += 1;
+  // Sort a COPY: `agents` is the caller's list and is also what the picker renders in its own
+  // order. Mutating it here would silently reorder the visible list from a parse.
+  sortedList = Object.freeze([...agents].sort((a, b) => labelOf(b).length - labelOf(a).length));
+  sortedFor = agents;
+  return sortedList;
+}
+
+/**
+ * ONE READING OF ONE DRAFT: where the mentions are, and which agents they name.
+ *
+ * ══ WHY THIS EXISTS: THE SAME SCAN WAS RUNNING FOURTEEN TIMES PER KEYSTROKE ═════════════════════
+ * Four consumers each asked this module the same question about the same string, independently, in
+ * the same render — the compose box (to pick the route indicator's face), the mention mirror (to
+ * paint the pills), the host's auto-send rail (to name the destination), and `classifyComposerRoute`
+ * (which re-derived the addressing span from the mentions it had just been handed). ComposeBox
+ * re-renders three times per character and the host once, so a measured 60-agent fleet with a
+ * 194-character draft cost **14 full scans per keystroke**, each one sorting the roster and walking
+ * the draft once per agent.
+ *
+ * Every one of those consumers was correct, which is exactly why it survived: nothing they rendered
+ * differed between doing the work once and doing it fourteen times. The fix is not to make any of
+ * them stop asking — each genuinely needs the answer — but to make asking cheap, so the shape of the
+ * data flow can stay as legible as it is.
+ *
+ * ══ THE CACHE, AND WHY ONE ENTRY IS ENOUGH ══════════════════════════════════════════════════════
+ * Keyed on the text and the roster's IDENTITY, one entry deep. Within a keystroke every consumer
+ * asks about the SAME draft against the SAME roster object — `mentionRoster` hands out one shared
+ * list (see its own note) and the draft is one string — so a single entry converts all fourteen
+ * asks into one computation plus thirteen pointer comparisons. A one-entry cache also cannot grow,
+ * which is the property that matters for a module-level cache in a long-lived window: there is no
+ * eviction policy to get wrong and nothing accumulates across a session.
+ *
+ * IT MUST STILL RECOMPUTE, and that is the half a call-count assertion cannot see. A new character
+ * is a new string and a fleet change is a new roster object, so both miss and both re-scan —
+ * `mentions.test.ts` pins that directly, because a cache that always returned its first answer would
+ * satisfy every performance assertion in this repo and silently freeze the pills, the route
+ * indicator and the rail's destination at whatever the first draft said.
+ */
+export interface MentionScan {
+  /** Every `@<name>` literal in the text, in the order they appear. */
+  spans: readonly MentionSpan[];
+  /** The same thing de-duplicated by agent — what a send carries. */
+  mentions: readonly ConciergeMention[];
+}
+
+let scanText: string | null = null;
+let scanAgents: readonly MentionAgent[] | null = null;
+let scanResult: MentionScan | null = null;
+
+export function scanMentions(text: string, agents: readonly MentionAgent[]): MentionScan {
+  if (scanResult && scanText === text && scanAgents === agents) return scanResult;
+  const spans = findMentionSpans(text, agents);
   const seen = new Set<string>();
-  const out: ConciergeMention[] = [];
-  for (const s of findMentionSpans(text, agents)) {
+  const mentions: ConciergeMention[] = [];
+  for (const s of spans) {
     if (seen.has(s.agentId)) continue;
     seen.add(s.agentId);
-    out.push({ agentId: s.agentId, name: s.name });
+    mentions.push({ agentId: s.agentId, name: s.name });
   }
-  return out;
+  // FROZEN, and that is the enforcement behind "safe to share".
+  //
+  // These arrays are held by the cache AND handed to every consumer, so an in-place `.sort()` or
+  // `.push()` in any one of them would rewrite what the others read — and, through the mentions a
+  // send carries, what an ALREADY-SENT message says it was addressed to. A comment asserting nobody
+  // mutates them is not enforcement; a freeze is. Modules are strict-mode, so a mutation throws
+  // where it is written rather than corrupting a cache silently several surfaces away.
+  scanResult = { spans: Object.freeze(spans), mentions: Object.freeze(mentions) };
+  scanText = text;
+  scanAgents = agents;
+  return scanResult;
+}
+
+/** The mentions in `text`, de-duplicated by agent and in first-appearance order — what a send
+ *  carries. Two `@Kraken Auth`s in one message are one aim, not two.
+ *
+ *  A projection of {@link scanMentions}, so a caller that wants only the agents shares the one scan
+ *  with the callers that want the spans. */
+export function mentionsIn(text: string, agents: readonly MentionAgent[]): ConciergeMention[] {
+  // A COPY, not the cached array. This is the value that ESCAPES the render: `ComposeBox` hands it
+  // to `onSend`, which stores it on the sent message, which `ConciergeMessageRow` re-reads for as
+  // long as that message is in the thread. Handing out the cache entry there would mean one array
+  // owned by the cache and by a piece of history at once — and history must not change when the
+  // next keystroke evicts a cache. Callers wanting the shared, frozen reading ask `scanMentions`
+  // directly; this one keeps its long-standing contract of returning an array the caller owns.
+  return [...scanMentions(text, agents).mentions];
 }
 
 /** What the AGENT receives: the same message with a LEADING address removed and every other
@@ -654,13 +777,45 @@ export function isSparkleMention(mention: { agentId: string }): boolean {
  * to the patched terminal and `@Sparkle` is how you reach the concierge, so the concierge must be
  * the one thing that is always addressable.
  */
+/**
+ * ONE LIST OBJECT, NOT MERELY ONE LIST — and the identity is what makes the shared scan work.
+ *
+ * Two callers build this roster from the same pair of inputs: `ComposeBox` (for its picker, its
+ * resolve and its Backspace) and `ConciergeHost`'s auto-send rail (for the destination it names).
+ * Both are already `useMemo`'d on `[mentionAgents, preferredAgentId]`, so neither rebuilt it per
+ * keystroke — but they produced two DIFFERENT arrays holding equal contents, and
+ * {@link scanMentions} keys on identity. Two rosters meant two cache entries' worth of misses per
+ * keystroke, and a one-entry cache thrashing between them.
+ *
+ * Memoizing here makes the two calls return the same object, so the host's reading of a draft and
+ * the composer's reading of that same draft are one computation. It is one entry deep for the same
+ * reason the scan cache is: there is one live roster at a time, and a cache that cannot grow cannot
+ * leak.
+ *
+ * SAFE TO SHARE because nothing mutates it — `findMentionSpans` sorts a copy, `orderMentionAgents`
+ * and `withMentionLabels` both map into fresh arrays, and the picker only reads. That was already
+ * required of every caller (the sort-a-copy comment in `findMentionSpans` says why); handing out one
+ * object makes the requirement load-bearing rather than incidental, which is worth stating before
+ * someone reaches for `.sort()` on what they think is their own list.
+ */
+let rosterAgents: readonly MentionAgent[] | null = null;
+let rosterPreferred: string | null | undefined;
+let rosterResult: MentionAgent[] | null = null;
+
 export function mentionRoster(
   agents: readonly MentionAgent[],
   preferredId?: string | null,
 ): MentionAgent[] {
-  return withMentionLabels(
-    orderMentionAgents([...agents, SPARKLE_MENTION_AGENT], "", preferredId),
-  );
+  if (rosterResult && rosterAgents === agents && rosterPreferred === preferredId) return rosterResult;
+  // Frozen for the reason the scan's arrays are (see `scanMentions`): this ONE object is handed to
+  // both `ComposeBox` and the host's rail, so an in-place sort in either would reorder the other's
+  // roster — and roster order is what used to decide which terminal a duplicate name resolved to.
+  rosterResult = Object.freeze(
+    withMentionLabels(orderMentionAgents([...agents, SPARKLE_MENTION_AGENT], "", preferredId)),
+  ) as MentionAgent[];
+  rosterAgents = agents;
+  rosterPreferred = preferredId;
+  return rosterResult;
 }
 
 // ══ EDITING ══════════════════════════════════════════════════════════════════════════════════════
@@ -795,7 +950,10 @@ export function backspaceMention(
 ): MentionEdit | null {
   // Allow the caret to sit one space past the mention's end — that is where it lands after a pick.
   const spanEnd = text[caret - 1] === " " ? caret - 1 : caret;
-  const span = findMentionSpans(text, agents).find((s) => s.end === spanEnd);
+  // Through the shared scan: a Backspace lands in the same render as the composer's own reading of
+  // this exact draft against this exact roster, so it costs a pointer comparison rather than a
+  // fifteenth walk of the text.
+  const span = scanMentions(text, agents).spans.find((s) => s.end === spanEnd);
   if (!span) return null;
   return { text: text.slice(0, span.start) + text.slice(caret), caret: span.start };
 }
@@ -834,7 +992,32 @@ export function splitMentionText(
   mentions: readonly ConciergeMention[],
 ): ({ kind: "text"; text: string } | { kind: "mention"; text: string; agentId: string })[] {
   if (mentions.length === 0) return text ? [{ kind: "text", text }] : [];
-  const spans = findMentionSpans(text, rosterFromMentions(mentions));
+  return splitAtMentionSpans(text, findMentionSpans(text, rosterFromMentions(mentions)));
+}
+
+/**
+ * The same split, for a caller that ALREADY HAS THE SPANS.
+ *
+ * {@link splitMentionText} re-derives them, and has to: a sent bubble holds a snapshot of the agents
+ * a message named and no live roster, so re-matching through `rosterFromMentions` is the only way it
+ * can locate them (and reusing the one matcher is why it does that rather than grepping). The
+ * COMPOSER is the other case — it scanned the live roster a moment ago and is holding the answer, so
+ * making it hand the mentions back only for them to be turned into a roster and re-matched was a
+ * whole second scan of the draft on every keystroke, for spans it already had.
+ *
+ * The two agree by construction, which is the property that lets this exist: the spans a composer
+ * gets from the live roster and the spans a re-match gets from `rosterFromMentions(mentionsIn(…))`
+ * are the same spans — the second roster contains exactly the labels that won the first match, so
+ * longest-first ordering and the boundary checks land identically. `mentions.test.ts` pins that on
+ * the cases where it could plausibly diverge (a name that is a prefix of a sibling, one agent named
+ * twice, a disambiguated `@Docs (web)`), because "obviously equivalent" is how a wrong-agent bug
+ * gets in.
+ */
+export function splitAtMentionSpans(
+  text: string,
+  spans: readonly MentionSpan[],
+): ({ kind: "text"; text: string } | { kind: "mention"; text: string; agentId: string })[] {
+  if (spans.length === 0) return text ? [{ kind: "text", text }] : [];
   const out: ReturnType<typeof splitMentionText> = [];
   let at = 0;
   for (const s of spans) {

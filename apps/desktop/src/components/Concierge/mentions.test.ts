@@ -13,7 +13,13 @@ import {
   mentionFreeText,
   mentionQuery,
   mentionsIn,
+  mentionScanStats,
   orderMentionAgents,
+  rosterFromMentions,
+  scanMentions,
+  splitAtMentionSpans,
+  type ConciergeMention,
+  type MentionSpan,
   mentionRoster,
   withMentionLabels,
   splitMentionText,
@@ -26,6 +32,7 @@ import {
 // that hardcoded the string would keep passing if the constant were ever renamed — and the bug would
 // come back silently (bead sparkle-k5kit).
 import { SPARKLE_AGENT_ID, SPARKLE_AGENT_NAME } from "../../services/sparkleAgent";
+import { classifyComposerRoute } from "./composerRoute";
 
 function agent(over: Partial<MentionAgent> & { id: string; name: string }): MentionAgent {
   return {
@@ -716,5 +723,292 @@ describe("splitMentionText — how a sent bubble draws its pills", () => {
   it("draws a pill for an agent that no longer exists anywhere", () => {
     const parts = splitMentionText("@Ghost Agent hi", [{ agentId: "gone", name: "Ghost Agent" }]);
     expect(parts[0]).toEqual({ kind: "mention", text: "@Ghost Agent", agentId: "gone" });
+  });
+});
+
+// ══ THE SHARED SCAN ═════════════════════════════════════════════════════════════════════════════
+// `scanMentions` is what stopped every consumer of a draft from re-walking it independently — the
+// composer, the pill mirror, the auto-send rail and the route classifier were doing the same match
+// fourteen times per keystroke over a 60-agent fleet (ConciergeHost.typingCost.test.tsx measures the
+// end-to-end number; these rows pin the rules the cache must not break).
+//
+// EVERY OPTIMISATION HERE IS TESTED AS A PAIR. A cache that never recomputed would satisfy any
+// call-count ceiling perfectly while freezing the pills and the destination at whatever the first
+// draft said — so for each "it reuses" row below there is an "it recomputes when X really changed"
+// row, and the second is the one that would catch a stale answer.
+describe("scanMentions — one reading, shared", () => {
+  const roster = mentionRoster([BLUEPRINT, KRAKEN]);
+
+  it("agrees with findMentionSpans and mentionsIn", () => {
+    const text = "@Kraken Auth ship it, and tell @Blueprint UI/UX too";
+    const scan = scanMentions(text, roster);
+    expect(scan.spans).toEqual(findMentionSpans(text, roster));
+    expect(scan.mentions).toEqual(mentionsIn(text, roster));
+  });
+
+  // ── THE REUSE ────────────────────────────────────────────────────────────────────────────────
+  // Asserted on the COUNTER, not on object identity: identity would also pass if the function
+  // recomputed and happened to return a cached-looking value, and the counter is the thing the
+  // typing cost is actually made of.
+  it("does not re-scan when the same draft is read again against the same roster", () => {
+    const text = "@Kraken Auth ship it";
+    scanMentions(text, roster);
+    const before = mentionScanStats.spans;
+    scanMentions(text, roster);
+    scanMentions(text, roster);
+    scanMentions(text, roster);
+    expect(mentionScanStats.spans).toBe(before);
+  });
+
+  // ── AND THE PAIRED HALF: IT MUST STILL RECOMPUTE ─────────────────────────────────────────────
+  // A NEW CHARACTER. This is the case that runs on literally every keystroke, and a cache keyed
+  // too loosely would leave the pills painting the previous draft.
+  it("re-scans, and gives the NEW answer, when one character changes the text", () => {
+    scanMentions("@Kraken Auth ship it", roster);
+    const before = mentionScanStats.spans;
+    // Deleting one character of the name un-resolves the mention — derive-from-text's fail-CLOSED
+    // direction. A stale cache would keep drawing a pill over an address that no longer exists.
+    const next = scanMentions("@Kraken Aut ship it", roster);
+    expect(mentionScanStats.spans).toBe(before + 1);
+    expect(next.mentions).toEqual([]);
+    expect(next.spans).toEqual([]);
+  });
+
+  // A CHANGED FLEET. The agent left, so the aim must leave with it — the roster is a different
+  // object and the answer for the SAME text is different.
+  it("re-scans, and drops the mention, when the roster no longer holds that agent", () => {
+    const text = "@Kraken Auth ship it";
+    expect(scanMentions(text, roster).mentions).toEqual([{ agentId: "a2", name: "Kraken Auth" }]);
+    const shrunk = mentionRoster([BLUEPRINT]);
+    const after = scanMentions(text, shrunk);
+    expect(after.mentions).toEqual([]);
+  });
+
+  // …and the other direction, which is the one a "roster changes are ignored" bug would show up in
+  // first: an agent JOINS, and the text that named nobody a moment ago now addresses them.
+  it("re-scans, and FINDS a new mention, when the roster grows", () => {
+    const text = "@Kraken Auth ship it";
+    expect(scanMentions(text, mentionRoster([BLUEPRINT])).mentions).toEqual([]);
+    expect(scanMentions(text, mentionRoster([BLUEPRINT, KRAKEN])).mentions).toEqual([
+      { agentId: "a2", name: "Kraken Auth" },
+    ]);
+  });
+
+  // A RELABEL is a roster change that leaves the id list identical — two agents called "Docs" make
+  // the address `@Docs (web)`, and a cache keyed on anything coarser than the roster object would
+  // keep resolving a bare `@Docs` that must now match NOTHING.
+  it("re-scans when a name collision changes what the address IS", () => {
+    const web = agent({ id: "d1", name: "Docs", projectName: "web" });
+    const mobile = agent({ id: "d2", name: "Docs", projectName: "mobile" });
+    expect(scanMentions("@Docs ship it", mentionRoster([web])).mentions).toEqual([
+      { agentId: "d1", name: "Docs" },
+    ]);
+    // Now ambiguous: the bare name addresses neither, and the qualified one addresses exactly one.
+    expect(scanMentions("@Docs ship it", mentionRoster([web, mobile])).mentions).toEqual([]);
+    expect(scanMentions("@Docs (web) ship it", mentionRoster([web, mobile])).mentions).toEqual([
+      { agentId: "d1", name: "Docs (web)" },
+    ]);
+  });
+});
+
+// ══ ONE ROSTER OBJECT ═══════════════════════════════════════════════════════════════════════════
+// The scan cache keys on the roster's IDENTITY, so two callers building "the same" roster from the
+// same inputs had to stop producing two different arrays or the cache thrashes between them and
+// nothing is shared. This is the property that makes the composer's reading and the host's reading
+// of one draft a single computation.
+describe("mentionRoster — the same inputs give back the same object", () => {
+  it("returns the identical array for the same agents and preferred id", () => {
+    const agents = [BLUEPRINT, KRAKEN];
+    expect(mentionRoster(agents, "a1")).toBe(mentionRoster(agents, "a1"));
+  });
+
+  // PAIRED: it must not hand back a stale roster when the inputs genuinely differ, or the picker
+  // orders by the wrong preference and — worse — a departed agent stays addressable.
+  it("rebuilds when the preferred id changes", () => {
+    const agents = [BLUEPRINT, KRAKEN];
+    const first = mentionRoster(agents, "a1");
+    const second = mentionRoster(agents, "a2");
+    expect(second).not.toBe(first);
+    // The preference is what it orders by, so the answer really did change.
+    expect(second[0]!.id).toBe("a2");
+    expect(first[0]!.id).toBe("a1");
+  });
+
+  it("rebuilds when the fleet changes", () => {
+    const first = mentionRoster([BLUEPRINT, KRAKEN], null);
+    const second = mentionRoster([BLUEPRINT], null);
+    expect(second).not.toBe(first);
+    expect(second.map((a) => a.id)).not.toContain("a2");
+  });
+});
+
+// ══ THE SPANS THE COMPOSER HOLDS ARE THE SPANS A RE-MATCH WOULD FIND ════════════════════════════
+// Two call sites stopped re-deriving positions they already had — `classifyComposerRoute` (which
+// re-matched through `rosterFromMentions` to find the addressing span) and the composer's pill
+// mirror (which round-tripped mentions back through `splitMentionText`). Both are only safe because
+// scanning the LIVE roster and re-scanning the resolved mentions produce identical spans.
+//
+// "Obviously equivalent" is how a wrong-agent bug gets in, so these are the cases where it could
+// plausibly diverge: a name that is a PREFIX of a sibling's, one agent named twice, and a
+// disambiguated collision label.
+describe("live-roster spans === re-matched spans", () => {
+  const cases: [string, MentionAgent[], string][] = [
+    ["a name that is a prefix of a sibling", [BLUEPRINT, agent({ id: "a3", name: "Blueprint UI" })], "@Blueprint UI/UX move it"],
+    ["the shorter sibling on its own", [BLUEPRINT, agent({ id: "a3", name: "Blueprint UI" })], "@Blueprint UI move it"],
+    ["one agent named twice", [KRAKEN], "@Kraken Auth ping @Kraken Auth again"],
+    ["a mid-sentence name", [KRAKEN], "why is @Kraken Auth just sitting there?"],
+    ["a sentence-final full stop", [KRAKEN], "please look at @Kraken Auth."],
+    [
+      "a disambiguated collision",
+      [agent({ id: "d1", name: "Docs", projectName: "web" }), agent({ id: "d2", name: "Docs", projectName: "mobile" })],
+      "@Docs (web) and @Docs (mobile) both",
+    ],
+    ["no mention at all", [KRAKEN], "just some words"],
+  ];
+  for (const [label, fleet, text] of cases) {
+    it(`agrees for ${label}`, () => {
+      const roster = mentionRoster(fleet);
+      const live = scanMentions(text, roster);
+      const rematched = findMentionSpans(text, rosterFromMentions(live.mentions));
+      expect(rematched).toEqual(live.spans);
+      // …and therefore the two splits agree, which is what the composer's mirror relies on.
+      expect(splitAtMentionSpans(text, live.spans)).toEqual(splitMentionText(text, live.mentions));
+      // …and so does the route, which is what `classifyComposerRoute`'s optional `spans` relies on.
+      expect(
+        classifyComposerRoute({ text, mentions: live.mentions, mountedAgentId: "m1", spans: live.spans }),
+      ).toEqual(classifyComposerRoute({ text, mentions: live.mentions, mountedAgentId: "m1" }));
+    });
+  }
+});
+
+// ══ THE LENGTH ORDERING IS KEPT, NOT REBUILT ════════════════════════════════════════════════════
+// `findMentionSpans` needs the roster longest-label-first and used to sort a fresh copy per call.
+// The ordering depends on the ROSTER, which changes a few times a minute; the scan it feeds used to
+// run on every character. `mentionScanStats.rosterSorts` is what makes the difference assertable,
+// and these are its assertions — without them the memo could be deleted and every other row here
+// would stay green, because `scanMentions`'s own cache absorbs the repeat calls.
+describe("longestLabelFirst — the roster is ordered once per roster", () => {
+  it("does not re-sort when the same roster object is scanned again", () => {
+    const roster = mentionRoster([BLUEPRINT, KRAKEN]);
+    // Distinct texts, so the SCAN cache cannot be what absorbs these — each call really does run
+    // the matcher, and the question is only whether it re-orders the roster to do it.
+    findMentionSpans("@Kraken Auth a", roster);
+    const before = mentionScanStats.rosterSorts;
+    findMentionSpans("@Kraken Auth b", roster);
+    findMentionSpans("@Kraken Auth c", roster);
+    findMentionSpans("@Kraken Auth d", roster);
+    expect(mentionScanStats.rosterSorts).toBe(before);
+  });
+
+  // ── THE PAIRED HALF, AND IT ASSERTS THE ORDER ACTUALLY MOVED ─────────────────────────────────
+  // A memo keyed on anything that survives a roster swap — a length, a count, a stale flag — would
+  // pass the row above and then match against the OLD fleet forever. So this asserts both that the
+  // sort re-ran and that its RESULT is the new fleet's ordering: "Blueprint UI" alone claims
+  // `@Blueprint UI`, and once the longer "Blueprint UI/UX" joins, the longer label must win the
+  // same text. That is exactly what longest-first buys, so a stale ordering shows up as a
+  // wrong-agent aim rather than as a timing difference.
+  it("re-sorts for a new roster, and the LONGER label then wins", () => {
+    const short = agent({ id: "b1", name: "Blueprint UI" });
+    const long = agent({ id: "b2", name: "Blueprint UI/UX" });
+    const onlyShort = mentionRoster([short]);
+    const before = mentionScanStats.rosterSorts;
+    expect(findMentionSpans("@Blueprint UI move it", onlyShort)[0]?.agentId).toBe("b1");
+    expect(mentionScanStats.rosterSorts).toBe(before + 1);
+
+    const both = mentionRoster([short, long]);
+    const spans = findMentionSpans("@Blueprint UI/UX move it", both);
+    expect(mentionScanStats.rosterSorts).toBe(before + 2);
+    // The new fleet's ordering, not the old one's: the longer name claims the span.
+    expect(spans[0]?.agentId).toBe("b2");
+    expect(spans[0]?.name).toBe("Blueprint UI/UX");
+  });
+});
+
+// ══ THE SHARED ARRAYS CANNOT BE MUTATED BY A CONSUMER ═══════════════════════════════════════════
+// One roster object and one scan result are handed to several consumers at once, so "nothing
+// mutates them" had to stop being a comment. A `.sort()` in any consumer would reorder what the
+// others read — and roster order is what used to decide which terminal a duplicate name resolved
+// to — while a push into the cached mentions would rewrite what an ALREADY-SENT message says it
+// was addressed to. Frozen, that throws where it is written instead.
+describe("the shared readings are frozen", () => {
+  it("refuses an in-place sort of the shared roster", () => {
+    const roster = mentionRoster([BLUEPRINT, KRAKEN]);
+    expect(() => roster.sort()).toThrow();
+  });
+
+  it("refuses a push into the cached scan", () => {
+    const scan = scanMentions("@Kraken Auth ship it", mentionRoster([BLUEPRINT, KRAKEN]));
+    expect(() => (scan.mentions as ConciergeMention[]).push({ agentId: "x", name: "X" })).toThrow();
+    expect(() => (scan.spans as MentionSpan[]).pop()).toThrow();
+  });
+
+  // …but `mentionsIn` hands out an array the CALLER owns, because that one escapes into a sent
+  // message's stored state and history must not change when the next keystroke evicts a cache.
+  it("gives mentionsIn's caller its own array", () => {
+    const roster = mentionRoster([BLUEPRINT, KRAKEN]);
+    const text = "@Kraken Auth ship it";
+    const mine = mentionsIn(text, roster);
+    expect(mine).not.toBe(scanMentions(text, roster).mentions);
+    expect(() => mine.push({ agentId: "x", name: "X" })).not.toThrow();
+    // …and mutating it did not reach the cache.
+    expect(scanMentions(text, roster).mentions).toEqual([{ agentId: "a2", name: "Kraken Auth" }]);
+  });
+});
+
+// ══ A HANDED-IN `spans` THAT DOES NOT FIT THE TEXT IS IGNORED ═══════════════════════════════════
+// `classifyComposerRoute`'s optional `spans` is a second representation of what `mentions` already
+// implies, and a redundant input that is TRUSTED is how two facts come to disagree. The
+// disagreement has one shape and it is the unrecoverable one: a span captured a render earlier is
+// an offset into the OLD text, so the route resolves to an agent the CURRENT draft does not
+// address and the words are written into that agent's PTY.
+//
+// The guard falls back to the authoritative re-match, so a caller handing over something wrong can
+// only make the answer slower, never different.
+describe("classifyComposerRoute ignores spans that do not describe the text", () => {
+  const roster = mentionRoster([BLUEPRINT, KRAKEN]);
+
+  it("REGRESSION: a stale span does not aim the message at the agent it used to name", () => {
+    const oldText = "@Kraken Auth ship the DMG";
+    const stale = scanMentions(oldText, roster).spans;
+    // The user deleted the address and typed something else. Under a mount, the correct verdict is
+    // the MOUNT — and trusting `stale` would instead hand the words to Kraken Auth.
+    const now = "actually never mind, let us wait";
+    const route = classifyComposerRoute({
+      text: now,
+      mentions: mentionsIn(now, roster),
+      spans: stale,
+      mountedAgentId: "mounted-1",
+    });
+    expect(route).toEqual({ kind: "agent", agentId: "mounted-1", via: "mount" });
+  });
+
+  // The other direction, and the one a "spans[0] exists?" guard would wave straight through: a
+  // stale EMPTY array over a draft that DOES open with `@Sparkle`. Trusting it finds no address, so
+  // the message follows the mount — swallowing the one send whose entire purpose is escaping a
+  // mount.
+  it("REGRESSION: a stale EMPTY spans array does not swallow the @Sparkle escape hatch", () => {
+    const plain = "move the button 5px left";
+    const staleEmpty = scanMentions(plain, roster).spans;
+    expect(staleEmpty).toEqual([]);
+    const now = "@Sparkle what is the status of the build?";
+    const route = classifyComposerRoute({
+      text: now,
+      mentions: mentionsIn(now, roster),
+      spans: staleEmpty,
+      mountedAgentId: "mounted-1",
+    });
+    expect(route).toEqual({ kind: "sparkle", via: "address" });
+  });
+
+  // PAIRED: the fast path is still a fast path. Spans that DO describe the text are used, and give
+  // the same verdict the re-match would — otherwise the guard would have quietly disabled the
+  // optimisation it exists to make safe.
+  it("uses spans that do fit, and agrees with the re-match", () => {
+    const text = "@Kraken Auth ship the DMG";
+    const { spans, mentions } = scanMentions(text, roster);
+    const withSpans = classifyComposerRoute({ text, mentions, spans, mountedAgentId: "mounted-1" });
+    const without = classifyComposerRoute({ text, mentions, mountedAgentId: "mounted-1" });
+    expect(withSpans).toEqual({ kind: "agent", agentId: "a2", via: "address" });
+    expect(withSpans).toEqual(without);
   });
 });

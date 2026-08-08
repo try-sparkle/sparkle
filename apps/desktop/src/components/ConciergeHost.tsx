@@ -176,7 +176,7 @@ import { routeMessage } from "../services/conciergeRouter";
 import {
   mentionFreeText,
   mentionRoster,
-  mentionsIn,
+  scanMentions,
   rosterFromMentions,
   type ConciergeMention,
 } from "./Concierge/mentions";
@@ -1944,9 +1944,15 @@ export function ConciergeHost({
    * does not restate the rule, it CALLS it: `classifyComposerRoute`, the same pure function `send`
    * routes by, over the same inputs. Mentions resolve exactly as the send resolves them —
    * `mentionRoster(mentionAgents, preferredAgentId)` over the SAME two inputs `ComposeBox` is handed
-   * below (its `mentionAgents` / `preferredAgentId` props), then `mentionsIn` over the live text —
+   * below (its `mentionAgents` / `preferredAgentId` props), then `scanMentions` over the live text —
    * and the mount handed in is the one `send` reads through `mountedAgentIdRef`. If you change
    * either input here, change it in the JSX below too.
+   *
+   * `scanMentions` rather than `mentionsIn` is not a detail: `mentionRoster` returns the SAME object
+   * to both this memo and `ComposeBox`, and the scan is cached on that object plus the text, so the
+   * rail's reading of a draft and the composer's are one computation. Sharing the reading is also
+   * what makes "the label and the destination are computed the same way" structural rather than a
+   * pair of calls that happen to agree.
    *
    * THE BUG THAT MADE THIS A SHARED CALL RATHER THAN A SECOND COPY OF THE RULE: while mounted, a
    * plain message goes to the mounted agent's terminal, and this said "Concierge" — so the founder
@@ -1961,17 +1967,36 @@ export function ConciergeHost({
    * `withMentionLabels`). Naming the destination ambiguously is exactly the failure this rail exists
    * to catch, so it shows the address.
    */
+  //
+  // ══ THE ROSTER IS NOT A FUNCTION OF THE DRAFT, SO IT IS NOT REBUILT PER CHARACTER ══════════════
+  // This used to sit INSIDE the memo below, whose deps necessarily include `composedText`. So every
+  // keystroke re-ran `orderMentionAgents` — a full sort of the fleet with a `matchScore` per agent —
+  // and `withMentionLabels` — another full pass plus a Map — to produce a list that had not changed,
+  // because none of its inputs had. Split out, it rebuilds when the FLEET changes, which is what it
+  // actually depends on.
+  //
+  // Its identity matters as much as its cost: `mentionRoster` hands the same object to `ComposeBox`
+  // for the same inputs (see that function's note), which is what lets the composer's reading of a
+  // draft and this one be a single scan rather than two.
+  const railRoster = useMemo(
+    () => mentionRoster(mentionAgents, routingTarget?.agentId ?? null),
+    [mentionAgents, routingTarget?.agentId],
+  );
   const railTargetName = useMemo(() => {
-    const roster = mentionRoster(mentionAgents, routingTarget?.agentId ?? null);
-    const mentions = mentionsIn(composedText, roster);
+    // The SHARED scan: `ComposeBox` read this exact draft against this exact roster in the same
+    // commit, so this costs a pointer comparison. Its spans go to `classifyComposerRoute` so the
+    // classifier does not re-derive the addressing position from the mentions it was just handed.
+    const { spans, mentions } = scanMentions(composedText, railRoster);
     const route = classifyComposerRoute({
       text: composedText,
       mentions,
+      spans,
       mountedAgentId: routableMountedAgentId,
     });
     if (route.kind === "sparkle") return "Concierge";
     // `mentions[0]` IS the addressing mention: `addressingSpan` can only ever qualify the FIRST
-    // span (every later one has an earlier literal to its left), and `mentionsIn` keeps that order.
+    // span (every later one has an earlier literal to its left), and the scan's `mentions` — the
+    // spans de-duplicated in place — keep that order.
     if (route.via === "address") return mentions[0]?.name ?? "Concierge";
     // ══ AN AGENT-BOUND VERDICT MUST NEVER RENDER AS "Concierge" (roborev 59212 / 59232) ═══════════
     // The `?? "Concierge"` that used to close this expression restored the exact defect the commit
@@ -1984,7 +2009,7 @@ export function ConciergeHost({
     // truthful non-destination rather than a fallback: `mountedName` resolves whenever the mount
     // routes, so reaching it would mean a routable mount with no target at all.
     return mountedName ?? "the mounted agent";
-  }, [composedText, mentionAgents, routingTarget?.agentId, routableMountedAgentId, mountedName]);
+  }, [composedText, railRoster, routableMountedAgentId, mountedName]);
 
   const autoSendRail = useAutoSend({
     // ARMED IS NOW A TRAY POSITION, not a switch: only `speak` counts down, and only while the

@@ -158,6 +158,7 @@ import {
   mentionRoster,
   mentionsIn,
   orderMentionAgents,
+  scanMentions,
   SPARKLE_MENTION_AGENT,
   SPARKLE_MENTION_ID,
   type ConciergeMention,
@@ -1016,9 +1017,20 @@ export function ComposeBox({
   //
   // Resolved against `roster`, so what the box RESOLVED as a mention (and drew as a pill) is what the
   // font reflects — one matcher, one answer, no third notion of what an address looks like.
+  //
+  // ONE SCAN, READ THREE WAYS. `scanMentions` is the module's shared reading of (this draft, this
+  // roster) — see its own doc for the fourteen-scans-per-keystroke measurement that produced it.
+  // The route indicator below, the pill mirror in the JSX, and the send path all take their answer
+  // from this one call, and the spans go to `classifyComposerRoute` so it does not re-derive the
+  // addressing position from a projection that had just been built out of them.
+  const scan = scanMentions(text, roster);
   const aimedAtTerminal =
-    classifyComposerRoute({ text, mentions: mentionsIn(text, roster), mountedAgentId }).kind ===
-    "agent";
+    classifyComposerRoute({
+      text,
+      mentions: scan.mentions,
+      spans: scan.spans,
+      mountedAgentId,
+    }).kind === "agent";
   const textMetrics = aimedAtTerminal ? COMPOSE_TEXT_METRICS_TERMINAL : COMPOSE_TEXT_METRICS;
   const pending = mentionQuery(text, caret);
   const matches =
@@ -2131,7 +2143,7 @@ export function ComposeBox({
               input to the height instead — see the layout effect and `composeInterimExtraH`. */}
           <MentionMirror
             text={text}
-            agents={roster}
+            spans={scan.spans}
             metrics={textMetrics}
             textareaRef={textareaRef}
             interim={interim}

@@ -107,6 +107,20 @@ export interface ComposerRouteInput {
    *  here through `rosterFromMentions` so there is no second, laxer notion of where a mention sits
    *  in the string (the same round-trip `mentionFreeText` makes, for the same reason). */
   mentions: readonly ConciergeMention[];
+  /**
+   * The spans those mentions came from, when the caller has them.
+   *
+   * OPTIONAL, AND NOT A SHORTCUT PAST THE RULE. `mentions` alone carries no positions, so the
+   * re-match above is the only way to recover them — but the LIVE composer already ran that match a
+   * moment ago against the live roster, and handing the result back is strictly more information
+   * than re-deriving it from a lossy projection. Making it optional keeps the send path, the thread
+   * and every existing test on the two-argument form unchanged; what it removes is the second walk
+   * of the draft that ran on every keystroke purely to recover a number the caller was holding.
+   *
+   * The two derivations agree by construction — see `mentions.splitAtMentionSpans` for why, and
+   * `mentions.test.ts` for the cases that pin it.
+   */
+  spans?: readonly MentionSpan[];
   /** The agent the concierge is patched to, or null when it floats free. NOT "the selected agent":
    *  something is selected almost always, and routing on that would type into whichever row the
    *  founder last clicked in the sidebar. The cable is the gesture. */
@@ -128,10 +142,59 @@ export interface ComposerRouteInput {
 export function addressingSpan(
   text: string,
   mentions: readonly ConciergeMention[],
+  /** Skip the re-match when the caller already holds the spans — see `ComposerRouteInput.spans`. */
+  spans?: readonly MentionSpan[],
 ): MentionSpan | null {
-  const first = findMentionSpans(text, rosterFromMentions(mentions))[0];
+  const trusted = fitsText(text, mentions, spans)
+    ? spans
+    : findMentionSpans(text, rosterFromMentions(mentions));
+  const first = trusted[0];
   if (!first) return null;
   return isAddressingPosition(text, first.start) ? first : null;
+}
+
+/**
+ * Do these spans actually describe THIS text?
+ *
+ * ══ WHY THE OPTIONAL `spans` IS CHECKED RATHER THAN TRUSTED ═════════════════════════════════════
+ * `spans` is a second representation of something `mentions` already implies, and a redundant input
+ * that is trusted is a way for two facts to disagree. The disagreement here has a specific and
+ * unrecoverable shape: a span captured one render earlier — through a ref, a memo with incomplete
+ * deps, a debounced draft — would have `isAddressingPosition` read the prefix of the NEW text at an
+ * offset from the OLD one, and hand back an `agentId` the current draft no longer addresses. The
+ * route resolves to `{kind: "agent"}` and the founder's words are written into that agent's PTY.
+ * That is the exact failure this module's header is written around, and the whole point of
+ * derive-from-text is that it cannot happen.
+ *
+ * Both callers today build the text and the spans in one expression, so no stale span is reachable —
+ * this is a guard against the shape, not a live bug. It earns its place because it costs one slice
+ * comparison on ONE span and because it fails to the SAFE side: spans that do not fit are ignored
+ * and the authoritative re-match runs, which is exactly what happens when no spans are passed at
+ * all. A caller cannot make the answer worse by handing over something wrong, only slower.
+ *
+ * Checking the FIRST span is sufficient for what this function decides: it only ever reads
+ * `spans[0]` (see the note above — no later span can be an address), so a mismatch anywhere that
+ * could change the verdict shows up there.
+ *
+ * AN EMPTY `spans` IS CHECKED TOO, and it is the case a laxer guard would wave through. "No spans"
+ * is not self-evidently about this text — a stale empty array over a draft that DOES open with an
+ * address means no address is found, the message follows the mount, and the leading `@Sparkle` that
+ * exists precisely to escape a mount is the send that gets swallowed. So emptiness is cross-checked
+ * against `mentions`, which is derived from the same scan: the two must agree there is nothing to
+ * find.
+ */
+function fitsText(
+  text: string,
+  mentions: readonly ConciergeMention[],
+  spans?: readonly MentionSpan[],
+): spans is readonly MentionSpan[] {
+  if (!spans) return false;
+  const first = spans[0];
+  // `mentions` is `spans` de-duplicated in place, so the two are empty together and their first
+  // entries name the same agent. Either disagreement means these did not come from one reading.
+  if (!first) return mentions.length === 0;
+  if (first.agentId !== mentions[0]?.agentId) return false;
+  return text.slice(first.start, first.end) === MENTION_SIGIL + first.name;
 }
 
 /**
@@ -147,7 +210,7 @@ export function addressingSpan(
  *   4. otherwise                → the concierge.
  */
 export function classifyComposerRoute(i: ComposerRouteInput): ComposerRoute {
-  const address = addressingSpan(i.text, i.mentions);
+  const address = addressingSpan(i.text, i.mentions, i.spans);
   if (address) {
     return address.agentId === SPARKLE_MENTION_ID
       ? { kind: "sparkle", via: "address" }
