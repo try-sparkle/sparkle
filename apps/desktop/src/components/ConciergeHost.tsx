@@ -240,7 +240,7 @@ import { useAutoSend, notifyManualSend } from "../voice/useAutoSend";
 import { useSendMode } from "../voice/useSendMode";
 import { useSparklePrefsStore } from "../stores/sparklePrefsStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
-import { usePresenceStore, type PresenceMode } from "../stores/presenceStore";
+import { resolveMode, usePresenceStore, type PresenceMode } from "../stores/presenceStore";
 // `setConciergeChat` is aliased to `setChat` AT THE IMPORT so it stays module-scoped: that is what
 // keeps `react-hooks/exhaustive-deps` from demanding it in five dependency arrays below (a store
 // setter isn't on the rule's known-stable list the way `useState`'s is, even though this one never
@@ -4731,10 +4731,38 @@ export function ConciergeHost({
         // THE SCREEN RE-CHECK IS *NOT* REDUNDANT HERE EITHER, for that same `enqueue` reason: the
         // submit-time check and the one inside `dispatchToTerminal` still observe different
         // instants on this path, so both are load-bearing and neither may be "tidied" away.
+        // ══ SUBMITTING IS INPUT, EVEN WHEN NOBODY TOUCHED THE KEYBOARD ═══════════════════════════
+        // `noteInput` is fed from exactly two places — the composer's own `onChange` and the
+        // terminal's `onData` — and BOTH only ever see keystrokes. ComposeBox pokes it on the user's
+        // edits only, deliberately (a dictated segment landing in the box must not report Here on
+        // its own; see its `onChange`). So a hands-free session looks IDLE: read terminal output for
+        // five minutes without typing, dictate a line, and auto-send fires with presence already
+        // resolved to Away — this gate falls through and the countdown banner is back, in precisely
+        // the mode where he is not typing.
+        //
+        // ══ COMPUTED LOCALLY, NOT POKED INTO THE STORE — THAT DISTINCTION IS THE WHOLE POINT ══════
+        // The obvious fix is `usePresenceStore.getState().noteInput()` at the submit seam. It was
+        // written that way first and it is WRONG, because the blast radius is not this gate: it
+        // resets the store's idle clock for `IDLE_AWAY_MS`, and the ARMED path reads presence AT
+        // EXPIRY (see `presence:` below) precisely so that walking away DURING a countdown still
+        // queues a destructive send. A global poke therefore silently converts "idle-Away +
+        // destructive → queued" into "→ dispatched", deleting the one path by which the idle
+        // heuristic could still reach the queue arm. And the submit need not be a gesture at all —
+        // `send` is reachable from the auto-send RAIL, i.e. a timer firing after dictation silence.
+        //
+        // So the inference is scoped to the ONE decision that needs it: `resolveMode` re-run over a
+        // COPY of the facts with `lastInputAt` moved to now, answering "would presence read Here if
+        // this submit counted as input?" while mutating nothing. `manualAway` and an unfocused
+        // window still win, because both sit ahead of the idle rule inside `resolveMode` — an
+        // explicit "I'm stepping out" is not overridden by a timer firing.
+        const presenceCountingThisSubmit = resolveMode(
+          { ...usePresenceStore.getState(), lastInputAt: Date.now() },
+          Date.now(),
+        );
         if (
           mentionAim?.via === "mount" &&
           addressable &&
-          usePresenceStore.getState().mode === "here"
+          presenceCountingThisSubmit === "here"
         ) {
           dispatchToTerminal({ kind: "mount", agentId: aim.agentId });
           // TRUE — the text is in hand and on its way. There is no banner to announce and no cancel
@@ -4926,23 +4954,6 @@ export function ConciergeHost({
       // queued cannot retroactively redirect it.
       const forceSparkle = forceSparkleRef.current;
       forceSparkleRef.current = false;
-      // ══ SUBMITTING IS INPUT, EVEN WHEN NOBODY TOUCHED THE KEYBOARD ══════════════════════════════
-      // `noteInput` is fed from exactly two places — the composer's own `onChange` and the
-      // terminal's `onData` — and BOTH only ever see keystrokes. ComposeBox pokes it on the user's
-      // edits only, deliberately (a dictated segment landing in the box must not report Here on its
-      // own; see its `onChange`). The consequence is that a hands-free session looks IDLE: read
-      // terminal output for five minutes without typing, dictate a line, and auto-send fires with
-      // presence already resolved to Away.
-      //
-      // That matters here specifically, because the immediate mounted path is gated on presence. Left
-      // alone, a voice-only founder gets the countdown banner back — the exact complaint this whole
-      // change removes, resurrected in precisely the mode where he is not typing.
-      //
-      // A SUBMIT IS NOT A SEGMENT. `services/dictationTerminalSink` already made this call for the
-      // terminal sink and its reasoning transfers verbatim: dictating is input, say so. This is the
-      // narrower version of that — poked once per SUBMIT, not per dictated segment, so an utterance
-      // still accumulating in the box does not keep the app reporting Here on its own.
-      usePresenceStore.getState().noteInput();
       // ══ WHERE THIS MESSAGE GOES ═════════════════════════════════════════════════════════════════
       // The founder's rule, whole, in one pure function (Concierge/composerRoute):
       //

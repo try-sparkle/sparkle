@@ -1045,8 +1045,8 @@ describe("ConciergeHost — a terminal that must not receive free text refuses",
     expect(h.dispatchConciergeAnswer).toHaveBeenCalledTimes(1);
   });
 
-  // ...and the poke does NOT trample an explicit Away. `resolveMode` puts `manualAway` first, so
-  // "I'm stepping out" survives a submit — otherwise the fix above would quietly delete the one
+  // ...and the inference does NOT trample an explicit Away. `resolveMode` puts `manualAway` first,
+  // so "I'm stepping out" survives a submit — otherwise the fix above would quietly delete the one
   // presence signal the user set on purpose.
   it("does not let a submit override an EXPLICIT away", async () => {
     usePresenceStore.getState().setAway();
@@ -1055,6 +1055,71 @@ describe("ConciergeHost — a terminal that must not receive free text refuses",
     expect(usePresenceStore.getState().mode).toBe("away");
     expect(armedIntents()).toHaveLength(1);
     expect(h.dispatchConciergeAnswer).not.toHaveBeenCalled();
+  });
+
+  // ══ THE SUBMIT INFERENCE IS SCOPED, AND THIS IS THE ROW THAT SAYS SO ══════════════════════════
+  // THE BUG THIS PINS, which an earlier version of this branch shipped: "a submit is input" was
+  // written as a global `noteInput()` poke. That resets the STORE's idle clock for IDLE_AWAY_MS —
+  // and the ARMED path reads presence AT EXPIRY, precisely so that walking away DURING a countdown
+  // still queues a destructive send. So the poke silently converted "idle-Away + destructive →
+  // queued" into "→ dispatched", deleting the last way the idle heuristic could reach the queue arm.
+  //
+  // IDLE-Away, not manual. Every other away row here uses `setAway()` (`manualAway`), which
+  // `noteInput` can never clear — so those rows are structurally blind to this bug in both
+  // directions. Only an aged `lastInputAt` can see it.
+  it("leaves the idle clock alone, so an addressed destructive send still QUEUES while idle-away", async () => {
+    mount();
+    const text = "@Kraken Auth run the deploy command";
+    fireEvent.change(box(), {
+      target: { value: text, selectionStart: text.length, selectionEnd: text.length },
+    });
+    // Nobody touches the keyboard for longer than the idle threshold, then the rail auto-fires.
+    usePresenceStore.setState({
+      pinnedHere: false,
+      manualAway: false,
+      focused: true,
+      lastInputAt: Date.now() - (IDLE_AWAY_MS + 60_000),
+    });
+    usePresenceStore.getState().evaluate();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Send" }));
+      for (let i = 0; i < 6; i++) await Promise.resolve();
+    });
+    expect(armedIntents()).toHaveLength(1);
+    await elapse();
+    // HELD, not sent: the submit did not clear the idle clock the expiry reads.
+    expect(h.dispatchConciergeAnswer).not.toHaveBeenCalled();
+    expect(queuedIntents()).toHaveLength(1);
+    expect(queuedIntents()[0]!.class).toBe("destructive");
+  });
+
+  // THE OTHER HALF, so the scoping is pinned in both directions rather than only the safe one. The
+  // MOUNT gate does count the submit, deliberately, including for destructive text — the founder
+  // just spoke or pressed Send, and immediate dispatch happens at that same instant, so there is no
+  // walk-away window for the queue to protect. A build that scoped the inference to nothing (or
+  // reverted to reading the raw store mode) reds here.
+  it("still dispatches a destructive MOUNTED send immediately while idle-away", async () => {
+    mount();
+    const text = "run the deploy command";
+    fireEvent.change(box(), {
+      target: { value: text, selectionStart: text.length, selectionEnd: text.length },
+    });
+    usePresenceStore.setState({
+      pinnedHere: false,
+      manualAway: false,
+      focused: true,
+      lastInputAt: Date.now() - (IDLE_AWAY_MS + 60_000),
+    });
+    usePresenceStore.getState().evaluate();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Send" }));
+      for (let i = 0; i < 6; i++) await Promise.resolve();
+    });
+    expect(armedIntents()).toHaveLength(0);
+    expect(h.dispatchConciergeAnswer).toHaveBeenCalledTimes(1);
+    expect(h.dispatchConciergeAnswer.mock.calls[0]![2]).toMatchObject({
+      authority: { kind: "mount" },
+    });
   });
 
   // ══ AND THE POST-COUNTDOWN REFUSAL RETRACTS ITS BUBBLE TOO (roborev 57776) ═══════════════════
