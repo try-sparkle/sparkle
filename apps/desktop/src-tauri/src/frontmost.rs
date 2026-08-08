@@ -36,7 +36,9 @@ pub const HELPER_LABEL: &str = "helper";
 pub use crate::capture_window::CAPTURE_LABEL;
 
 /// How long to wait before committing a blur, letting a paired `becomeKey` land first.
-/// Matches dictation.rs' constant — one runloop turn plus slack.
+/// Matches `dictation::frame_policy::FOCUS_BLUR_COALESCE_MS` — one runloop turn plus slack.
+/// DELIBERATELY the same value, from the same OS behaviour, but a SEPARATE definition: re-measuring
+/// that window means changing both, or the two deferred blurs commit at different times.
 const FOCUS_BLUR_COALESCE_MS: u64 = 120;
 
 /// Whether a window label counts as a REAL Sparkle window for "is the app frontmost".

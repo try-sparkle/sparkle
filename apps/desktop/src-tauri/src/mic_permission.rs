@@ -153,7 +153,7 @@ mod platform {
     /// itself is presented by the OS on the main run loop. So this function must never run on the
     /// main thread: blocking there would stall the very run loop that has to draw the prompt the
     /// block is waiting on — a self-deadlock where the app hangs with no dialog ever appearing.
-    /// The only caller is `dictation.rs`'s arm path, from inside `tauri::async_runtime::
+    /// The only caller is `dictation::commands`'s arm path, from inside `tauri::async_runtime::
     /// spawn_blocking` (the same convention its model load already uses), so the main thread stays
     /// free to present the dialog and the event loop keeps running while the user reads it.
     ///
@@ -211,7 +211,7 @@ pub fn status() -> MicAuth {
 /// The full gate: read the status, act on it, and answer whether the mic may be armed.
 ///
 /// BLOCKING — it can sit on the OS permission prompt for as long as the user takes to read it.
-/// Callers MUST be off the main thread (`dictation.rs` calls it inside `spawn_blocking`); see
+/// Callers MUST be off the main thread (`dictation::commands` calls it inside `spawn_blocking`); see
 /// `platform::request_access_blocking` for why blocking the main thread here self-deadlocks.
 ///
 /// `Ok(())` means armed-as-before. `Err` is a string `classifyVoiceError` routes to `permission`.

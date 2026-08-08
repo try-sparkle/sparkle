@@ -505,7 +505,7 @@ pub struct ArmOrigin {
     /// `load_model`. On the FIRST arm of a process this holds the multi-second ONNX transducer init;
     /// on every later arm the recognizer is served from `transcribe::DECODER_CACHE`, so what is left
     /// is the per-arm Silero VAD session plus three rounds of file verification. The two are not
-    /// separated here — see the note in `dictation::start_dictation` — but they are trivially told
+    /// separated here — see the note in `dictation::commands::start_dictation` — but they are trivially told
     /// apart by ARM ORDINAL, because the cache makes the first arm the only expensive one.
     pub model_ms: u64,
 }

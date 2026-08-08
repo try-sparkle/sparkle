@@ -40,7 +40,7 @@ use tungstenite::client::IntoClientRequest;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 
-use crate::dictation::{
+use crate::dictation::events::{
     emit_cloud_balance, emit_cloud_ended, emit_interim, emit_partial, emit_speech_end,
 };
 

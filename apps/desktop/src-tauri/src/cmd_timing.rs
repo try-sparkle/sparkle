@@ -310,7 +310,15 @@ mod main_thread_guard {
             "history.rs",
             &["history_record", "history_search", "history_prune"],
         ),
-        (include_str!("dictation.rs"), "dictation.rs", &["list_audio_inputs"]),
+        // The dictation `#[tauri::command]`s live in `dictation/commands.rs`, not `dictation.rs` —
+        // they were split out of it when that file was decomposed. This entry is keyed by FILE, so
+        // it has to follow them; leaving it on `dictation.rs` makes the guard fail loudly (which is
+        // how the move was caught) rather than silently stop guarding.
+        (
+            include_str!("dictation/commands.rs"),
+            "dictation/commands.rs",
+            &["list_audio_inputs"],
+        ),
         (include_str!("stale_build.rs"), "stale_build.rs", &["stale_build_probe"]),
     ];
 
