@@ -240,6 +240,29 @@ impl PtyManager {
             .filter_map(|(id, s)| s.pid.map(|pid| (id.clone(), pid)))
             .collect()
     }
+
+    /// EVERY live session id — the process-global answer to "is this agent already running".
+    ///
+    /// The session id IS the agent id, so this needs no mapping table that could drift. It is the
+    /// sibling of [`session_pids`] and it differs in the one way that matters here: a session with
+    /// NO pid yet is REPORTED, not skipped.
+    ///
+    /// That asymmetry is the whole reason this is a separate method rather than a `.map` over the
+    /// other. `session_pids` feeds the memory watchdog, which cannot measure a footprint it has no
+    /// pid for, so skipping is right there. This one feeds the resurrection guard, where a pid-less
+    /// session is the MOST dangerous entry in the map: it is a spawn in flight. `pty_spawn` inserts
+    /// by `sessions.insert`, which REPLACES silently, so a second spawn for the same id drops the
+    /// first `PtySession` on the floor — its child keeps running, keeps holding its worktree, keeps
+    /// burning tokens, and is invisible to every surface in the app because nothing holds a handle
+    /// to it any more. Filtering on `pid.is_some()` here would open exactly that window.
+    pub fn session_ids(&self) -> Vec<String> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect()
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -955,6 +978,22 @@ pub fn pty_kill(manager: State<PtyManager>, id: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Every agent id with a live PTY session in THIS process.
+///
+/// The process-global backstop for the resurrection path. `decideResurrection` already requires
+/// `processAlive === false`, and `services/goalContinuationRunner`'s ownership election already stops
+/// two WINDOWS acting on one agent — but both of those are window-local evidence, and the PTY host
+/// is app-global: `pty_spawn` from any webview reaches any agent id. This is the one reading that
+/// cannot be wrong about it.
+///
+/// Sync deliberately, like its `pty_ack`/`pty_resize` siblings: the body is a mutex lock and a clone
+/// of a short `Vec<String>`, with no I/O of any kind, so there is nothing to move off the main
+/// thread. The commands that must be `async` are the ones that touch the disk.
+#[tauri::command]
+pub fn pty_live_sessions(manager: State<PtyManager>) -> Vec<String> {
+    manager.session_ids()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1365,6 +1404,62 @@ mod tests {
         );
 
         let removed = mgr.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove("agent-no-pid");
+        if let Some(mut s) = removed {
+            let _ = s.killer.kill();
+            let _ = child.wait();
+        }
+    }
+
+    /// `session_ids` must report a session that has NO pid — the exact entry `session_pids` skips.
+    ///
+    /// This is the whole point of the second method, and it is asserted here rather than left to
+    /// read as a duplicate: a pid-less session is a spawn IN FLIGHT, which is the most dangerous
+    /// state the resurrection guard can be blind to. `sessions.insert` REPLACES silently, so if this
+    /// reported empty the runner would admit an agent that is already booting, the second spawn
+    /// would drop the first `PtySession`, and its child would keep running with nothing holding a
+    /// handle to it — still burning tokens, still holding its worktree, invisible everywhere.
+    ///
+    /// Written as an inverted pair against `session_pids` on the SAME manager, so it cannot pass by
+    /// the fixture being empty: one method must answer 0 while the other answers 1.
+    #[test]
+    fn session_ids_reports_a_pid_less_session_that_session_pids_skips() {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        let sys = native_pty_system();
+        let Ok(pair) =
+            sys.openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+        else {
+            return; // no PTY in this environment — skip
+        };
+        let Ok(mut child) = pair.slave.spawn_command(CommandBuilder::new("/bin/cat")) else {
+            return;
+        };
+        let killer = child.clone_killer();
+        let writer = pair.master.take_writer().expect("take_writer");
+        let mgr = PtyManager::default();
+        mgr.sessions.lock().unwrap().insert(
+            "agent-mid-spawn".to_string(),
+            PtySession {
+                writer: Arc::new(Mutex::new(writer)),
+                master: pair.master,
+                killer,
+                pause: Arc::new(PauseState::new()),
+                inflight: Arc::new(InflightState::new()),
+                // No pid yet — a spawn that has not finished reporting one.
+                pid: None,
+            },
+        );
+
+        assert!(
+            mgr.session_pids().is_empty(),
+            "control: session_pids skips a pid-less session, so a 1 below is this method's doing"
+        );
+        assert_eq!(
+            mgr.session_ids(),
+            vec!["agent-mid-spawn".to_string()],
+            "a live session with no pid is still a live session"
+        );
+
+        let removed = mgr.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove("agent-mid-spawn");
         if let Some(mut s) = removed {
             let _ = s.killer.kill();
             let _ = child.wait();

@@ -678,7 +678,7 @@ pub fn seal_stale_at(
 /// fleet reporting as dead and immediately respawnable, which is precisely the catastrophic
 /// direction this module's flock is supposed to rule out. `seal_stale_at` already had the guard;
 /// `derive` did not, and only `derive` feeds the resurrection path.
-fn epoch_still_running(app_data: &Path, epoch: &str) -> bool {
+pub(crate) fn epoch_still_running(app_data: &Path, epoch: &str) -> bool {
     epoch == crate::babysit_lease::process_epoch() || epoch_is_alive(app_data, epoch)
 }
 
@@ -815,6 +815,171 @@ pub fn list_at(
         }
     }
     Ok(out)
+}
+
+// ── the command layer ────────────────────────────────────────────────────────────────────────
+//
+// THIN WRAPPERS ONLY. Every rule above stays in the pure `*_at` cores, which is what lets the 37
+// tests in this file exercise the whole policy against a `tempdir` with no Tauri runtime in sight.
+// A command here may resolve a directory, stamp the clock and hop off the main thread — nothing
+// else. If you find yourself writing an `if` in one of these, it belongs upstairs.
+//
+// EVERY ONE IS `pub async fn` + `spawn_blocking`, and `every_tauri_command_here_runs_off_the_main_thread`
+// below fails the build if one is not. That is not ceremony: a sync `#[tauri::command]` body runs on
+// the MAIN thread, and these do file I/O over the whole ledger — `list_at` reads and derives every
+// record, once per sweep. Put that in front of the AppKit event loop and the symptom is the
+// concierge control bridge timing out (`bridge request timeout: concierge_tool`), which is the exact
+// failure `inbox.rs` documents and guards the same way.
+
+/// `<app_data>/agent-life`. Beside `hook-events/`, deliberately NOT inside the agent's worktree —
+/// see this module's header for why a write there would make a dead agent look like it was writing.
+pub fn life_dir(base: &Path) -> PathBuf {
+    base.join("agent-life")
+}
+
+/// `(ledger dir, app_data)`. Both, because every reading predicate needs `app_data` to answer
+/// "is that epoch still alive" from its `flock`.
+fn dirs_of(app: &tauri::AppHandle) -> Result<(PathBuf, PathBuf), String> {
+    let base = crate::dev_identity::app_data_dir(app)?;
+    Ok((life_dir(&base), base))
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Open (or reopen) a record. Called at PTY spawn, always, and safe to call more than once.
+#[tauri::command]
+pub async fn agent_life_open(
+    app: tauri::AppHandle,
+    agent_id: String,
+    project_id: String,
+    worktree: String,
+) -> Result<(), String> {
+    let (dir, _) = dirs_of(&app)?;
+    let epoch = crate::babysit_lease::process_epoch();
+    let now = now_ms();
+    tauri::async_runtime::spawn_blocking(move || {
+        open_at(&dir, &agent_id, &project_id, &worktree, epoch, now).map(|_| ())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
+}
+
+/// Record an OBSERVED death. The caller supplies the whole verdict; the classification rules live in
+/// `engine/deathRecord.ts` and the honesty rule is re-checked by `validate` on this side.
+#[tauri::command]
+pub async fn agent_life_close(
+    app: tauri::AppHandle,
+    agent_id: String,
+    death: Death,
+    wall: Option<Wall>,
+) -> Result<(), String> {
+    let (dir, _) = dirs_of(&app)?;
+    tauri::async_runtime::spawn_blocking(move || close_at(&dir, &agent_id, death, wall).map(|_| ()))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+/// Record a wall on a record that is still open. A walled agent is not yet a dead one.
+#[tauri::command]
+pub async fn agent_life_note_wall(
+    app: tauri::AppHandle,
+    agent_id: String,
+    wall: Wall,
+) -> Result<(), String> {
+    let (dir, _) = dirs_of(&app)?;
+    tauri::async_runtime::spawn_blocking(move || note_wall_at(&dir, &agent_id, wall))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn agent_life_read(
+    app: tauri::AppHandle,
+    agent_id: String,
+) -> Result<Option<AgentLifeReading>, String> {
+    let (dir, app_data) = dirs_of(&app)?;
+    let now = now_ms();
+    tauri::async_runtime::spawn_blocking(move || read_at(&dir, &app_data, &agent_id, now))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn agent_life_list(
+    app: tauri::AppHandle,
+) -> Result<BTreeMap<String, AgentLifeReading>, String> {
+    let (dir, app_data) = dirs_of(&app)?;
+    let now = now_ms();
+    tauri::async_runtime::spawn_blocking(move || list_at(&dir, &app_data, now))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+/// Take the resurrection claim. `Ok(false)` means a LIVE epoch already holds it — a refusal, not an
+/// error, because that is the ordinary outcome of two windows racing and the caller's correct
+/// response is to skip this agent rather than to log a failure.
+#[tauri::command]
+pub async fn agent_life_claim(
+    app: tauri::AppHandle,
+    agent_id: String,
+    by: String,
+) -> Result<bool, String> {
+    let (dir, app_data) = dirs_of(&app)?;
+    let epoch = crate::babysit_lease::process_epoch();
+    let now = now_ms();
+    tauri::async_runtime::spawn_blocking(move || {
+        match claim_at(&dir, &app_data, &agent_id, &by, epoch, now) {
+            Ok(_) => Ok(true),
+            Err(LifeError::HeldLive) => Ok(false),
+            Err(e) => Err(e.to_string()),
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Give the claim back. `spawned` is what records the attempt DURABLY, which is the number the
+/// rolling per-agent daily cap counts — so it must be true exactly when a respawn was performed.
+#[tauri::command]
+pub async fn agent_life_release(
+    app: tauri::AppHandle,
+    agent_id: String,
+    spawned: bool,
+) -> Result<(), String> {
+    let (dir, app_data) = dirs_of(&app)?;
+    let epoch = crate::babysit_lease::process_epoch();
+    let now = now_ms();
+    tauri::async_runtime::spawn_blocking(move || {
+        release_at(&dir, &app_data, &agent_id, epoch, spawned, now).map(|_| ())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
+}
+
+/// Retire a record: this agent is finished with, and its worktree may be reaped.
+#[tauri::command]
+pub async fn agent_life_retire(
+    app: tauri::AppHandle,
+    agent_id: String,
+    reason: String,
+) -> Result<(), String> {
+    let (dir, _) = dirs_of(&app)?;
+    let now = now_ms();
+    tauri::async_runtime::spawn_blocking(move || retire_at(&dir, &agent_id, &reason, now))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -1531,5 +1696,93 @@ mod tests {
             open_at(&dir, "../escape", "p", "/wt", "e", NOW),
             Err(LifeError::BadAgentId)
         ));
+    }
+
+    // ── the command layer's one structural guard ──────────────────────────────────────────────
+
+    /// Scan Rust source for `#[tauri::command]` fns, returning `(total_commands, sync_signatures)`.
+    ///
+    /// Deliberately the SAME shape as `inbox.rs`'s scanner, including the anti-vacuity test below —
+    /// the two files must not grow different definitions of "is this command async".
+    fn tauri_commands_in(src: &str) -> (usize, Vec<String>) {
+        let lines: Vec<&str> = src.lines().collect();
+        let mut total = 0usize;
+        let mut sync = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            // `starts_with`, not equality: `#[tauri::command(async)]` and
+            // `#[tauri::command(rename_all = "snake_case")]` are commands too, and an exact-match
+            // matcher would skip them and pass having matched nothing.
+            if !line.trim().starts_with("#[tauri::command") {
+                continue;
+            }
+            let Some(sig) = lines[i..].iter().find(|l| l.contains("fn ")) else {
+                continue;
+            };
+            total += 1;
+            if !sig.contains("async fn") {
+                sync.push(sig.trim().to_string());
+            }
+        }
+        (total, sync)
+    }
+
+    /// EVERY `#[tauri::command]` in this module must be `pub async fn`, because a sync Tauri command
+    /// body runs on the MAIN thread and these commands do file I/O over the whole ledger.
+    /// `agent_life_list` reads and derives EVERY record — once per resurrection sweep, forever — and
+    /// `services/fleetWatch` already showed what recurring blocking disk I/O in front of the AppKit
+    /// event loop costs: the concierge control bridge times out (`bridge request timeout:
+    /// concierge_tool`) and the app cannot see or talk to any agent.
+    ///
+    /// Asserted against this file's own SOURCE because there is no runtime handle to check: the
+    /// defect is a missing `async` keyword, invisible to every behavioural test.
+    #[test]
+    fn every_tauri_command_here_runs_off_the_main_thread() {
+        let (total, sync_cmds) = tauri_commands_in(include_str!("agent_life.rs"));
+        // POSITIVE assertion first, so "the matcher found nothing" FAILS instead of passing
+        // silently — the "assertion already true before the change" shape this repo calls its #1
+        // finding. Renaming the attribute or moving the commands to a submodule must break this.
+        assert!(
+            total >= 8,
+            "expected at least the 8 agent-life commands (open/close/note_wall/read/list/claim/\
+             release/retire), found {total} — the scanner matched nothing, so this guard is not \
+             guarding anything"
+        );
+        assert!(
+            sync_cmds.is_empty(),
+            "these agent-life commands are synchronous, so they run on the main thread and can \
+             starve the concierge control bridge. Make them `pub async fn` + \
+             `tauri::async_runtime::spawn_blocking`: {sync_cmds:#?}"
+        );
+    }
+
+    /// The guard is only meaningful if its scanner can actually SEE a sync command. Feeds the REAL
+    /// scanner the shape it must reject, so a green guard means "all async" rather than "matched
+    /// nothing".
+    #[test]
+    fn the_async_guard_would_notice_a_sync_command() {
+        let sample =
+            "#[tauri::command]\npub fn agent_life_regressed(app: AppHandle) -> Result<(), String> {\n";
+        let (total, sync) = tauri_commands_in(sample);
+        assert_eq!(total, 1, "scanner must see the command");
+        assert_eq!(sync.len(), 1, "scanner must flag it as sync: {sync:?}");
+
+        let ok = "#[tauri::command(rename_all = \"snake_case\")]\npub async fn fine(app: AppHandle) {\n";
+        let (total_ok, sync_ok) = tauri_commands_in(ok);
+        assert_eq!(total_ok, 1, "attribute with args must still be counted");
+        assert!(sync_ok.is_empty(), "async command must not be flagged: {sync_ok:?}");
+    }
+
+    /// The ledger lives BESIDE `hook-events/`, never inside a worktree — the header's reason is that
+    /// a write under `.sparkle/` would bump `fleet`'s `newest_write_ms` and make a dead agent look
+    /// like it was writing forever. Pinned so a later "tidy up" cannot relocate it silently.
+    #[test]
+    fn the_ledger_sits_in_app_data_beside_hook_events() {
+        let base = Path::new("/tmp/-data");
+        assert_eq!(life_dir(base), base.join("agent-life"));
+        assert_eq!(
+            life_dir(base).parent(),
+            base.join("hook-events").parent(),
+            "the ledger must be a sibling of hook-events, not a child of any worktree"
+        );
     }
 }

@@ -44,6 +44,7 @@ import { AccountLimitModal } from "./components/AccountLimitModal";
 import { startUpdater } from "./services/updaterService";
 import { startStaleBuildWatch } from "./services/staleBuildService";
 import { startGoalContinuationRunner } from "./services/goalContinuationRunner";
+import { startResurrectionRunner } from "./services/resurrectionRunner";
 import { startFleetWatch } from "./services/fleetWatch";
 import { startInboxWatch } from "./stores/inboxStore";
 import { startPusher } from "./services/pusherMount";
@@ -179,6 +180,24 @@ function LimitSync() {
 // UI.
 function GoalContinuation() {
   useEffect(() => startGoalContinuationRunner(), []);
+  return null;
+}
+
+// THE FLEET RESURRECTOR — the sweep that brings back agents that are DEAD, as opposed to stalled
+// (services/resurrectionRunner).
+//
+// The mirror of `apiRecoveryRunner`, and the pair is disjoint by construction: that one recovers
+// `errored + alive` by typing a retry into a living PTY, this one recovers `errored + dead`, which
+// no keystroke can reach. App restart is the largest single killer of agents in this app — 54
+// SessionEnd in one minute on 2026-08-06, 49 more twenty-six minutes later, of which exactly one
+// came back.
+//
+// Mounted app-level for the same reason GoalContinuation is: a death belongs to an AGENT and one
+// sweep serves the whole fleet, so a per-pane timer would multiply the RESPAWNS. Its own
+// single-owner election and the process-global `pty_live_sessions` check keep a torn-off satellite
+// window from respawning an agent this window is already respawning. Paints no UI.
+function FleetResurrection() {
+  useEffect(() => startResurrectionRunner(), []);
   return null;
 }
 
@@ -494,6 +513,7 @@ export function App() {
       <InboxWatch />
       <LimitSync />
       <GoalContinuation />
+      <FleetResurrection />
       <Pusher />
       <AuthRecovery />
       <ApiRecovery />

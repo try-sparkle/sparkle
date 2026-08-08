@@ -329,12 +329,52 @@ const inFlight = new Set<string>();
 /** agentId → how many auto-continues IN A ROW never reached the terminal, and the path the last one
  *  refused on. See {@link MAX_UNDELIVERED_CONTINUES}. Cleared by a delivery and by an escalation. */
 const undelivered = new Map<string, { count: number; path: string }>();
+/** agentId → epoch ms until which this sweep must not type anything into it. See
+ *  {@link suppressContinuation}. */
+const suppressedUntil = new Map<string, number>();
 
-/** Test seam: forget the idle clock, any in-flight sends, and the undelivered streaks. */
+/** Test seam: forget the idle clock, any in-flight sends, the undelivered streaks, and any
+ *  suppressions. */
 export function _resetGoalContinuationRunnerForTests(): void {
   idleClock = new Map();
   inFlight.clear();
   undelivered.clear();
+  suppressedUntil.clear();
+}
+
+/**
+ * Hold off auto-continuing one agent until `untilMs`.
+ *
+ * ── THE COLLISION THIS EXISTS TO STOP ─────────────────────────────────────────────────────────
+ * The instant the resurrector admits a dead agent, its pane mounts and then SITS IDLE while
+ * `claude --resume` boots — a worktree prep, a transcript scan, an account pick and the model
+ * re-reading its whole context. At `IDLE_SETTLE_MS` (45s) this sweep sees a goal-carrying agent that
+ * has been continuously at rest and does exactly what it is built to do: types a continue into it.
+ *
+ * That is wrong twice over, and the second one is the expensive one. It spends one of the agent's 20
+ * continues on a turn it never needed — but worse, if that agent is a cohort's CANARY it pollutes
+ * the survival evidence the whole cohort is waiting on. `advanceProbation` judges `hasTurnAuthority`
+ * and `didWork` at the deadline; a continue typed in at t+45s manufactures both, so a canary that
+ * booted into a still-closed door would report a clean probation and release 48 agents behind it.
+ *
+ * REUSES THE `inFlight` SKIP rather than adding a gate of its own — the sweep already has exactly
+ * one place where an agent is passed over without spending anything from any budget, and this is the
+ * same shape: no send, no retry recorded, no idle-clock re-arm, so the agent is continued normally
+ * the moment the suppression lapses.
+ *
+ * Idempotent and monotonic: a second call may only ever push the deadline LATER. A respawn that
+ * happens mid-probation must not be able to shorten a hold that is already running.
+ */
+export function suppressContinuation(agentId: string, untilMs: number): void {
+  const existing = suppressedUntil.get(agentId);
+  if (existing !== undefined && existing >= untilMs) return;
+  suppressedUntil.set(agentId, untilMs);
+}
+
+/** Is this agent currently held off? Exported so a test can assert the rule directly rather than
+ *  only through the absence of a send. */
+export function continuationSuppressedUntil(agentId: string): number | undefined {
+  return suppressedUntil.get(agentId);
 }
 
 /**
@@ -563,6 +603,23 @@ export async function sweepGoalContinuations(opts: SweepOptions = {}): Promise<S
       if (inFlight.has(agent.id)) {
         outcomes.push({ agentId: agent.id, action: "none", detail: "send-in-flight" });
         continue;
+      }
+      // The same skip, for an agent the resurrector has just respawned — see suppressContinuation.
+      // Named distinctly so a human reading a sweep's outcomes can tell "a write is in progress"
+      // from "this one is on probation", but it takes the identical no-cost path: nothing sent,
+      // nothing recorded, the idle clock left alone.
+      const heldUntil = suppressedUntil.get(agent.id);
+      if (heldUntil !== undefined) {
+        if (now < heldUntil) {
+          outcomes.push({ agentId: agent.id, action: "none", detail: "respawn-probation" });
+          continue;
+        }
+        // Lapsed. Dropped on READ rather than on a timer: a `setTimeout` here would be a second
+        // clock to keep in step with the injected `now` every other decision in this sweep uses,
+        // and it would fire against a window that may be gone. An agent closed before its hold
+        // lapses leaves one stale entry, bounded by the number of agents this window resurrected —
+        // the same bound `sessionProjects`' visited set carries, and for the same reason.
+        suppressedUntil.delete(agent.id);
       }
 
       // The mark is computed ONCE, here, and the same value is both decided on and recorded. Two

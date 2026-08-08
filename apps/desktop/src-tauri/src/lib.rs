@@ -84,6 +84,7 @@ mod pty;
 mod redacting_writer;
 mod repo_freshness;
 mod retention;
+mod revival;
 mod review_cmd;
 mod roborev_probe;
 mod transcribe;
@@ -178,6 +179,11 @@ pub fn run() {
         // nudger's are: the watcher thread reaches them from an `AppHandle`, the frontend PULLS
         // them with `conflict_flags`, and a test can stand one up in isolation.
         .manage(conflict_watch::ConflictFlags::default())
+        // The due-for-resurrection list, republished once a second by `revival::start`. Managed for
+        // the same reason the nudger's state is: the timer thread reaches it from an `AppHandle`,
+        // and `services/resurrectionRunner` PULLS it with `revival_due` rather than the sweep
+        // re-deriving the ledger itself on the main thread.
+        .manage(revival::RevivalState::default())
         .manage(frontmost::FrontmostState::default())
         .manage(helper::HelperVitals::default())
         // PR claims live in the Rust process, not a window store, so an agent's "I am landing this
@@ -313,6 +319,60 @@ pub fn run() {
             // on any path, so a provider-wide 529 can never blind us to a PR that has gone DIRTY —
             // and therefore, since GitHub never fires `pull_request` for one, UNTESTED.
             conflict_watch::start(app.handle());
+            // SEAL THE PREVIOUS LAUNCH'S UNCLOSED RECORDS, SYNCHRONOUSLY, BEFORE ANYTHING ELSE CAN
+            // READ THEM.
+            //
+            // App restart is the largest single killer of agents in this app — 54 SessionEnd in one
+            // minute on 2026-08-06 at 18:20, 49 more at 18:47 — and it is precisely the case in
+            // which the WebView gets no chance to write anything down. So the death is not observed,
+            // it is INFERRED here: a record still `Live` whose owning epoch is provably dead (a
+            // kernel-released `flock`, not a heartbeat) becomes an `AppRestart` death.
+            //
+            // ON THE MAIN THREAD ON PURPOSE, which is the one place in this file that is the right
+            // trade. `seal_stale_at` is documented as needing to run "BEFORE any pane mounts, so a
+            // reader sees a settled record instead of racing the sealer", and a background thread
+            // cannot promise that — the webview's first `agent_life_open` could land first. The cost
+            // is a `read_dir` plus one small JSON parse per agent, against a directory holding one
+            // file per agent this machine has ever run; the measured worst case is ~50 files.
+            //
+            // A record whose epoch is still ALIVE is left completely alone. That is the sleep case
+            // (an `flock` is not released by suspend), and getting it wrong would seal a running
+            // fleet and hand every live agent to the resurrector at once.
+            match dev_identity::app_data_dir(app.handle()) {
+                Ok(base) => {
+                    let dir = agent_life::life_dir(&base);
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
+                    match agent_life::seal_stale_at(
+                        &dir,
+                        &base,
+                        babysit_lease::process_epoch(),
+                        now,
+                    ) {
+                        Ok(stats) if stats.sealed > 0 => tracing::info!(
+                            scanned = stats.scanned,
+                            sealed = stats.sealed,
+                            still_live = stats.still_live,
+                            "agent-life: sealed records orphaned by a previous launch"
+                        ),
+                        Ok(stats) => tracing::debug!(
+                            scanned = stats.scanned,
+                            still_live = stats.still_live,
+                            "agent-life: nothing to seal"
+                        ),
+                        Err(e) => tracing::warn!("agent-life seal failed: {e}"),
+                    }
+                }
+                Err(e) => tracing::warn!("agent-life seal skipped (app_data_dir): {e}"),
+            }
+            // …and only THEN start the thread that reads what the seal just wrote. Same category as
+            // the nudger and the conflict watcher above, and started beside them for the same
+            // reason: a plain OS thread that makes NO model call on any path. When the wall is
+            // fleet-wide every LLM in the app is behind the same account limit, so anything that
+            // consults one is dead exactly when recovery is needed.
+            revival::start(app.handle());
             // Stand up the local history store (prompts + responses, FTS5) in the app-data dir.
             // A failure here must not stop the app from booting — capture/search just won't work.
             match dev_identity::app_data_dir(app.handle()) {
@@ -587,6 +647,19 @@ pub fn run() {
             pty::pty_write,
             pty::pty_resize,
             pty::pty_kill,
+            pty::pty_live_sessions,
+            // The fleet-resurrection mount. The ledger's commands are thin wrappers over the pure
+            // `*_at` cores in agent_life.rs; `revival_due` is a read of a list the revival thread
+            // has already computed.
+            agent_life::agent_life_open,
+            agent_life::agent_life_close,
+            agent_life::agent_life_note_wall,
+            agent_life::agent_life_read,
+            agent_life::agent_life_list,
+            agent_life::agent_life_claim,
+            agent_life::agent_life_release,
+            agent_life::agent_life_retire,
+            revival::revival_due,
             pty::pty_set_paused,
             pty::pty_ack,
             nudger::nudger_flags,

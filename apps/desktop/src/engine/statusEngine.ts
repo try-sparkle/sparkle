@@ -38,6 +38,7 @@ import { screenOffersAnswer, streamOffersAnswer } from "./screenAnswerable";
 import { withScreenReason, type StatusReason } from "./statusRouter";
 import { forgetAgent, noteProcessExit, noteSpinnerSeen, trackAgent } from "./turnEndAuthority";
 import { StreamFailureDetector, apiErrorFramesIn, countApiErrorFrames } from "./streamFailure";
+import type { Terminator } from "./deathRecord";
 import { type QuotaBlock, isQuotaBlocked, quotaBlockIn, quotaBlocksIn } from "./quotaBlock";
 import {
   logStatusTransition,
@@ -278,6 +279,22 @@ export interface StatusEngineOpts {
   // grid). Read on settle to decide red (a question is on screen) vs gray (a finished
   // turn). Optional: without it, settle falls back to gray/idle.
   getScreen?: () => string;
+  /**
+   * Something happened that ENDS this agent's session, as far as the transport can tell.
+   *
+   * THE ENGINE REPORTS THE TERMINATOR AND NOTHING ELSE. It does not classify the death, and it
+   * emphatically does not reach into a store to find out — `services/deathRecordWriter` gathers the
+   * observation and `engine/deathRecord.classifyDeath` decides. That split is not tidiness: this
+   * engine is constructed per pane with a live `xterm` in its closure and is unit-tested by feeding
+   * it bytes, so a store read here would make every one of those tests depend on app state, and
+   * `classifyDeath`'s Gate 0 (the one that stops "no pane in this window" being written down as
+   * "healthy") only works because the caller is forced to state the liveness it observed.
+   *
+   * EDGE-TRIGGERED for `quota-trip`, level-triggered for `pty-exit`. A wall matches on every line
+   * the agent reprints it on, and firing per line would rewrite the durable record dozens of times
+   * for one incident; a PTY exits once.
+   */
+  onDeath?: (o: { terminator: Terminator }) => void;
 }
 
 // `approval` PROMISES A BUTTON — so it may only be claimed when one is actually on screen.
@@ -506,11 +523,38 @@ export class StatusEngine {
   // The ONE way into the sticky mid-stream failure, so the flag and the kind that governs its
   // recovery can never drift apart. "churn" outranks "api" (see failureKind).
   private tripStreamFailure(kind: "api" | "churn" | "quota"): void {
+    // Read BEFORE the assignment below, because that assignment is what destroys the edge.
+    const alreadyWalled = this.failureKind === "quota";
     this.sawStreamFailure = true;
     // Precedence, strongest first: quota beats everything (it is the most specific reading and the
     // only one that names a time), then churn, then api.
     if (kind === "quota" || this.failureKind === null) this.failureKind = kind;
     else if (kind === "churn" && this.failureKind !== "quota") this.failureKind = kind;
+    // ONLY the quota arm reports a death, and only on the EDGE into it.
+    //
+    // Why quota and not "api": an API banner is the transport failing, and `apiRecoveryRunner`
+    // already owns that case by typing a retry into the still-LIVING PTY. A wall is different in
+    // kind — the account is shut, no keystroke opens it, and the agent will sit there until either
+    // the window resets or a human pays. That is a death this app has to write down while it can
+    // still see it, because the app quitting is what usually happens next.
+    //
+    // EDGE-TRIGGERED. `quotaBlocksIn` matches every time the agent reprints the banner (and Claude
+    // reprints it on each retry), so a level trigger would rewrite the durable record dozens of
+    // times for ONE incident. `clearStreamFailure` nulls `failureKind`, so a wall that returns after
+    // a genuine recovery does fire again — which is right: that is a second incident.
+    if (kind === "quota" && !alreadyWalled) this.reportDeath("quota-trip");
+  }
+
+  /** Hand the terminator to whoever is recording deaths. NEVER lets a listener's failure escape:
+   *  this is called from `exit()` and from the middle of stream classification, and a throw there
+   *  would strand the agent's status mid-transition — a recovery mechanism must not be able to break
+   *  the thing it is trying to recover. */
+  private reportDeath(terminator: Terminator): void {
+    try {
+      this.opts.onDeath?.({ terminator });
+    } catch {
+      // Swallowed by design; see above.
+    }
   }
 
   /** The account-limit wall this agent last reported, if any. Read by the surfaces that must explain
@@ -1167,6 +1211,12 @@ export class StatusEngine {
     // must read `errored`, not gray `done`: sawStreamFailure counts the same as a pre-exit error
     // marker here, so a wedged-then-killed agent doesn't settle green-gray (roborev 16152).
     this.set(this.sawRecentError || this.sawStreamFailure ? "errored" : "done", "process-exit");
+    // AFTER the status is set, so a listener that reads the row sees the terminal value rather than
+    // the pre-exit one. The PTY closing is the strongest death signal there is, and it carries NO
+    // exit code — `pty.rs` emits none — so it names the terminator and lets `classifyDeath` decide
+    // what, if anything, it means. Most of the time the answer is `unknown`, which is deliberately
+    // NOT resurrectable: a human clicking stop produces exactly this observation.
+    this.reportDeath("pty-exit");
   }
 
   dispose(): void {

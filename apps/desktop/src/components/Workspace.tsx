@@ -99,6 +99,11 @@ import {
   visitedProjectsVersion,
   wasProjectVisited,
 } from "../services/sessionProjects";
+import {
+  admittedAgents,
+  admittedAgentsVersion,
+  onAdmittedAgentsChange,
+} from "../services/resurrectionAdmission";
 import { subscribeToCrossWindowSync } from "../services/crossWindowSync";
 import { useTornOutProjects } from "../hooks/useTornOutProjects";
 import { focusSatellite, reclaimProject, reconcileSatellites } from "../services/satelliteWindows";
@@ -1419,8 +1424,14 @@ export function Workspace() {
   // not.
   const tornOut = useTornOutProjects();
 
+  // Agents the fleet resurrector has admitted back (services/resurrectionAdmission). Same
+  // useSyncExternalStore shape as `visitedVersion` above and for the same reason: it is a
+  // module-level set, not React state, so the memo below needs a subscription token.
+  const admittedVersion = useSyncExternalStore(onAdmittedAgentsChange, admittedAgentsVersion);
+
   const live: Array<{ project: Project; agent: AgentTab }> = useMemo(() => {
     const out: Array<{ project: Project; agent: AgentTab }> = [];
+    const admitted = admittedAgents();
     // One Set for the whole nested loop: this memo re-runs on EVERY projectStore write (the file's
     // perf comment calls that the top render driver), so an O(projects × agents) scan with an
     // inner `includes` was a linear search per agent.
@@ -1439,15 +1450,48 @@ export function Workspace() {
       // rows cannot repair it: this gate is per PROJECT, so `openAgentIds` never gets a say. That is
       // the "zero mounted → dead terminals under a live tab" half of the invariant engine/pairs
       // claims to make unrepresentable (roborev 55149).
-      if (!wasProjectVisited(p.id) && p.id !== currentProjectId && p.id !== leftProjectId) continue;
+      // …AND a project holding an agent the resurrector admitted counts as visited.
+      //
+      // This union sits HERE, replacing only the visited check, and it must not move up past the
+      // `tornOut` continue above. Torn-out is a pane-OWNERSHIP gate: a satellite window owns those
+      // panes, and if main mounted one too, both webviews would spawn an xterm against the same
+      // agent id and `pty_spawn`'s `sessions.insert` would orphan one of the two child processes.
+      // Admission is a VISIBILITY question and can never answer an ownership one.
+      //
+      // The visited gate is what it has to clear, because a resurrected agent very often lives in a
+      // project nobody has opened this session — that is the normal case after an app restart, not
+      // an edge one. `markProjectVisited` is deliberately NOT used to force it: that set feeds the
+      // tray and the phone roster publisher, so it would publish a project the user never opened.
+      //
+      // Note the AGENT-level test below is untouched (`open.has`). Admission gates the project only;
+      // the runner calls `runtimeStore.open()` for the agent itself, which is what keeps an ordinary
+      // close working — if admission gated the agent too, closing a resurrected pane would put it
+      // straight back.
+      if (
+        !wasProjectVisited(p.id) &&
+        p.id !== currentProjectId &&
+        p.id !== leftProjectId &&
+        !p.agents.some((a) => admitted.has(a.id))
+      )
+        continue;
       for (const a of p.agents) {
         if (open.has(a.id)) out.push({ project: p, agent: a });
       }
     }
     return out;
-    // visitedVersion is the subscription token for the module set read via wasProjectVisited.
+    // visitedVersion is the subscription token for the module set read via wasProjectVisited, and
+    // admittedVersion the same for `admitted` — neither set is React state, so without its token the
+    // memo would keep returning the pre-admission list until some unrelated render corrected it.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projects, openAgentIds, visitedVersion, currentProjectId, leftProjectId, tornOut]);
+  }, [
+    projects,
+    openAgentIds,
+    visitedVersion,
+    admittedVersion,
+    currentProjectId,
+    leftProjectId,
+    tornOut,
+  ]);
 
   // WHERE EACH PAIR'S PANES ARE DISPLAYED — the DOM node, not a slice of the list.
   //

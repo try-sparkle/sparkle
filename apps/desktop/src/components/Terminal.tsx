@@ -22,6 +22,7 @@ import type { AgentTabStatus, Runtime } from "../types";
 import { getTransport, type AgentTransport } from "../services/agentTransport";
 import { StatusEngine } from "../engine/statusEngine";
 import { registerStatusEngine, unregisterStatusEngine } from "../engine/engineRegistry";
+import { openDeathRecord, recordDeath } from "../services/deathRecordWriter";
 import { snapshotScreen } from "../engine/screenSnapshot";
 import { bottomRowIndices } from "../engine/composerOcclusion";
 import { registerScrollback, serializeScrollback } from "../services/terminalScrollback";
@@ -816,11 +817,30 @@ export function Terminal({
       agentId,
       onStatus: onStatusWithCapture,
       getScreen: () => snapshotScreen(term.buffer.active, term.rows),
+      // Record WHY this session ended, durably, while the app is still alive to see it. The engine
+      // reports only the terminator; `services/deathRecordWriter` gathers the observation and
+      // `engine/deathRecord` classifies it.
+      onDeath: ({ terminator }) => void recordDeath(agentId, terminator),
     });
     // Publish this engine so the user-input submit paths (Composer / requery → submitPrompt) can
     // signal noteUserInput on it — the recovery signal for a stuck-red row (Bug B). Unregistered in
     // the cleanup below.
     registerStatusEngine(agentId, engine);
+    // OPEN THE DEATH RECORD HERE, BESIDE THE ENGINE — and note what the cleanup below deliberately
+    // does NOT do.
+    //
+    // The ledger is opened at SPAWN rather than written at death, because the biggest killer of
+    // agents in this app is the app itself quitting, which is exactly when nothing here gets to run
+    // (54 SessionEnd in one minute on 2026-08-06). What is left open is sealed as `app-restart` at
+    // the next launch.
+    //
+    // THERE IS NO MATCHING CLOSE IN THE CLEANUP, ON PURPOSE. **Unmounting is not a death.** A pane
+    // unmounts on tab close, on a StrictMode double-mount, and on "Start again", and the PTY may
+    // still be running — `unregisterStatusEngine` is identity-guarded against precisely that race.
+    // A close here would write a false `unknown` over a healthy agent's record and hand it to the
+    // resurrector. The close comes from `engine.exit()` alone, which the `disposed` latch already
+    // stops from firing for a PTY this engine no longer owns.
+    void openDeathRecord(agentId, projectId, cwd ?? "");
 
     // Forward keystrokes typed directly in the terminal to the PTY. onData fires for USER input
     // only (never programmatic agent output), so it's our signal that the user just interacted —
