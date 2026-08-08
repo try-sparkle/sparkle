@@ -340,6 +340,31 @@ describe("a live blocker is pinned above the composer, not threaded", () => {
     ).toEqual(["solo"]);
   });
 
+  it("keeps a nested WORKER's chip while its parent publishes its own working", () => {
+    // RESTORED (roborev 60332-M1). I deleted this as part of a duplicate-title cleanup, but its
+    // title was unique and its SHAPE is distinct from both surviving cases: here the acknowledged
+    // record is a ROWLESS WORKER WITH A PRESENT PARENT (`orch` working, so the card names `w1`),
+    // whereas the sibling covers an inherited-red HEAD and the H1 case covers a STRANDED worker with
+    // no parent at all. Those are the two rowless shapes, and this commit's fix is precisely about
+    // the worker population — so dropping this left the half of it with a parent uncovered.
+    //
+    // What it pins: the PARENT being visibly at work says nothing about the acknowledged worker, so
+    // the chip stays. A release rule that looked at the wrong agent's status would fail here.
+    const p = projectOf("p1", "sparkle-desktop", [tab("orch"), worker("w1", "orch")]);
+    const { rerender } = render(
+      <ConciergeHost feed={feedFrom([p], { orch: "working", w1: "waiting" })} />,
+    );
+    expect(cardAgentIds()).toEqual(["w1"]);
+    fireEvent.click(screen.getByTestId("concierge-nudge-dismiss"));
+
+    rerender(<ConciergeHost feed={feedFrom([p], { orch: "working", w1: "idle" })} />);
+    expect(
+      screen
+        .queryAllByTestId(PINNED_BLOCKER_CHIP_TESTID)
+        .map((el) => el.getAttribute("data-agent-id")),
+    ).toEqual(["w1"]);
+  });
+
   it("keeps the chip on the tick right after [x], when the calm is the dismissal's own doing", () => {
     // ROBOREV 60221-M2. Acknowledging a ROLLUP card writes the transitive dismissal over the whole
     // subtree, so the head's inherited red disappears and it republishes its OWN status one tick

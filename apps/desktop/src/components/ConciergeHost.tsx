@@ -6062,27 +6062,26 @@ export function ConciergeHost({
     // NOT ALSO IN THE STREAM. Rendering both would put one agent's blocker on screen twice, and the
     // scrolling copy is the one that goes stale — the precise bug this move exists to end.
     const pinnedBlockers = nudges;
-    // ACKNOWLEDGED CHIPS — MUTE AND SCOPE ONLY, because those are the two CURRENT-VIEW facts and a
-    // current-view fact may only ever HIDE (roborev 59945-M2 established this for the receipts; the
-    // same rule holds here). Unmute or unpin and the chip is back.
+    // ACKNOWLEDGED CHIPS. This filter DISPLAYS; it never ends an acknowledgement — and that split is
+    // the whole design, so it is stated once, here (roborev 60332-M2 caught an older version of this
+    // block still asserting the opposite twenty lines above the code):
     //
-    // "THE AGENT MOVED ON" IS NOT FILTERED HERE — it prunes the STATE, in the effect below, and the
-    // difference is the whole of roborev 60209. Filtering it at render made the chip disappear while
-    // `acknowledgedIds` (derived from the raw state) went on suppressing `noteCardsShown` forever:
-    // the agent could never open a resolved episode again, and the escape hatch — clearing the chip
-    // — was gone with the chip. A display filter cannot express "this is over"; only removing the
-    // record can.
+    //   • RENDER (this filter) hides a chip — for mute/scope, and for `working`. Every one of those
+    //     is reversible or momentary, and hiding is all a render may do.
+    //   • THE EFFECT (see `setAcknowledged` above) RELEASES the record, and only on "surfaced
+    //     again". That is what ends the `acknowledgedIds` suppression, which a display filter cannot
+    //     express at all — the lesson of roborev 60209, where a chip filtered away at render left
+    //     the suppression standing with nothing left to clear it.
+    //
+    // Neither half can do the other's job: release alone leaves a chip up while the agent is visibly
+    // working (roborev 60158-H1), and display alone suppresses receipts forever (60209).
     const liveAcknowledged = acknowledged
       .filter((a) => {
         // MUTE AND SCOPE are current-view facts, so they HIDE (roborev 59945-M2 established this
         // for the receipts) — unmute or unpin and the chip is back.
         if (eligible.get(a.id) !== true) return false;
         // AND THE CHIP STANDS DOWN once the agent is visibly getting on with something (roborev
-        // 60158-H1). THIS IS THE DISPLAY HALF OF A TWO-PART RULE, and the split is the whole design:
-        // the chip hides on `working`, while the RECORD is released only when the agent is surfaced
-        // again (the effect above). Display alone cannot end the receipt-suppression the record
-        // carries — that was roborev 60209 — and release alone would leave a chip up while the agent
-        // is visibly working, which was 60158-H1. Each half fixes what the other cannot.
+        // 60158-H1). Display only — see the split above.
         // A DENYLIST ON `working`, not an allowlist of the two de-escalated statuses (roborev
         // 60249-M2). `withDismissedAlerts` only guarantees `idle`/`stopped` while the acknowledged
         // red still STANDS; every other status the agent can go on to publish — `done`, `unmerged`,
