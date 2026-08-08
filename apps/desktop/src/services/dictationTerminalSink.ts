@@ -83,10 +83,12 @@ export async function routeDictationToTerminal(
     return { kind: "failed", agentId, error: e };
   }
 
-  // THE USER IS PRESENT. Every OTHER `noteInput` feeder is keystroke-only — xterm's `onData` and
-  // Concierge/ComposeBox's `onChange` — so someone who drives an agent purely by voice would look
-  // idle to the presence timer and trip IDLE_AWAY_MS mid-conversation, after which the concierge
-  // starts behaving as if nobody is watching. Dictating is input; say so.
+  // THE USER IS PRESENT. Every OTHER `noteInput` feeder is keystroke-only — do not restate which
+  // ones here; ConciergeHost's mount-gate block owns the list, and a named copy in this file is the
+  // very thing that has already drifted twice. What matters at this call site is the PROPERTY, not
+  // the roster: someone who drives an agent purely by voice would otherwise look idle to the
+  // presence timer and trip IDLE_AWAY_MS mid-conversation, after which the concierge starts
+  // behaving as if nobody is watching. Dictating is input; say so.
   //
   // THIS LINE IS THEREFORE THE THIRD FEEDER, and the only one that is not a keystroke. Say it that
   // way rather than "fed by onData" — which was never true, not even before this call existed:
