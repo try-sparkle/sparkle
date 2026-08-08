@@ -468,15 +468,26 @@ pub fn step(state: &mut AgentState, obs: &Observation) -> Decision {
     // and `goalStateOf` keeps answering "met" forever once `metAt` is set. Stamp the write clock at
     // the first met look; any LATER foreign write means the agent has been handed something the met
     // claim knows nothing about, and the claim stops being a reason to stay quiet.
+    //
+    // ── AND THE SUPERSESSION IS STICKY (roborev 60338, Medium) ────────────────────────────────
+    // An earlier revision cleared both fields on any look where `goal_met` read false. That is not
+    // the rare event it sounds like: `nudger.rs` computes `goal_met` from the roster, and an agent
+    // ABSENT from the roster reads as unmet — which is exactly what a frontend reload, a republish
+    // gap or a wedged WebView produces. One such look reset the stamp, the next met look re-stamped
+    // it against the NEW write clock, and the lifetime exemption was back, permanently, with `Done`
+    // raising no flag. A transient roster blink must not be able to do that.
+    //
+    // The cost of stickiness is the honest one: an agent that is superseded and then legitimately
+    // finishes NEW work will keep being watched, because nothing on this observation distinguishes
+    // "a new goal was met" from "the old met claim is still being reported". That errs toward
+    // nudging, which is the only direction this module is allowed to err in — and the agent can
+    // still quiet itself for free by answering `not-blocked`.
     if obs.goal_met {
         match state.goal_met_at_write {
             None => state.goal_met_at_write = Some(obs.foreign_write_ms),
             Some(at) if obs.foreign_write_ms > at => state.goal_met_superseded = true,
             _ => {}
         }
-    } else {
-        state.goal_met_at_write = None;
-        state.goal_met_superseded = false;
     }
 
     // ── NEW WORK RELEASES A STAND-DOWN ────────────────────────────────────────────────────────
@@ -544,14 +555,43 @@ pub fn step(state: &mut AgentState, obs: &Observation) -> Decision {
             state.delivered = 0;
             state.last_blocked = None;
             state.escalated = None;
-            // NOTE what is NOT cleared: the stand-down. Output is the agent TALKING; a stand-down
-            // ends when somebody gives it something new to DO, which is the foreign-write release
-            // at the top of this function and nothing else. Clearing it here would mean any idle
-            // redraw — a spinner, a clock, a repaint — revived the pinging on an agent that had
-            // already said it was done, which is the founder's loop returning with a longer period
-            // rather than being fixed. The nudge only ever says "resume your goal", so for an agent
-            // that reported nothing to resume and has been handed nothing since, there is no
-            // content in asking again.
+            // ── AND THE REPLY LATCH GOES TOO (roborev 60338, High) ────────────────────────────
+            // A previous revision kept the stand-down here, reasoning that clearing it would let an
+            // idle redraw revive the pinging on an agent that had said it was done. That reasoning
+            // was WRONG, and the mistake is worth recording because it is seductive: a FINISHED
+            // agent is held quiet by `obs.goal_met` inside `effective_standdown`, which is re-read
+            // every look and owes nothing to this latch. So clearing here cannot revive pinging of
+            // a finished agent — it was never what kept one quiet.
+            //
+            // What keeping it DID do was hand `not-blocked` — the commonest token, and the one in
+            // the founder's screenshot — the power to silence an agent for the rest of its session:
+            // `Done` both refuses to write AND reports no flag, so an agent that answered at minute
+            // 5, worked on, and wedged at minute 40 was invisible in both directions with no way
+            // back except a human typing at it. That is precisely the forbidden outcome the
+            // goal-met supersession above exists to close, re-entered through the reply door.
+            //
+            // An unprovoked reset is by definition output we did not ask for. The agent is alive
+            // and doing something; whatever it told us minutes ago about being idle has expired.
+            //
+            // ── ONLY `Done`, AND THE NARROWNESS IS THE POINT (roborev 60353, High) ────────────
+            // A first attempt wiped EVERY stand-down here, which was far too broad. `AwaitHuman`
+            // and `Quota` raise FLAGS — they are visible by construction, so they never had the
+            // silent-in-both-directions problem that justified this expiry. Clearing them destroyed
+            // the very row they exist to put up: an agent answers `blocked-on-human`, the founder
+            // is flagged, the rung resets to 0 so the NEXT look is five seconds later, and any
+            // further output — the "plus what you need" explanation we just asked it for, a footer
+            // repaint, the tail of the same turn — deleted the answer. `apply_flags` then cleared
+            // the row and had no `flagged` to re-raise it from, and the reply could not even be
+            // re-absorbed because absorption is gated on `attempts > 0`, which this block zeroes.
+            // The founder row for an agent explicitly asking for a person lasted one look.
+            //
+            // `Done` alone is flag-less, and `Done` alone is the `not-blocked` hole 60338 named.
+            // Everything else keeps the foreign-write release above, which is the right one for a
+            // condition a human or another system still has to clear.
+            if state.standdown == Some(Standdown::Done) {
+                state.standdown = None;
+                state.last_reply = None;
+            }
         }
 
         let stand = effective_standdown(state, obs);
@@ -1882,22 +1922,138 @@ mod tests {
         assert_eq!(parse_reply(&answered), Some(Reply::NotBlocked));
     }
 
-    /// A stand-down is NOT released by the passage of time or by the agent's own idle redraws —
-    /// only by somebody actually giving it work. Otherwise the fourteen-ping loop returns with a
-    /// longer period, which is not a fix.
+    /// A stand-down holds while the agent stays SILENT — the situation it exists for.
+    ///
+    /// THE HASH IS HELD STEADY, and that is the whole point of the rewrite (roborev 60338, Medium).
+    /// The previous version fed a DIFFERENT hash on every iteration and asserted `Observe`, which
+    /// cannot fail: a changed look returns `Observe` with the rung reset to 0 whatever the
+    /// stand-down says, so the ladder never reached a nudge rung and the claim in the test's own
+    /// name went untested.
     #[test]
-    fn a_stand_down_survives_everything_except_new_work() {
+    fn a_stand_down_holds_while_the_agent_stays_silent() {
         let mut s = AgentState::default();
         run(&mut s, &stalled(), 7);
         let answered = Observation { hash: 0x11aa, reply: Some(Reply::NotBlocked), ..stalled() };
         step(&mut s, &answered);
+        assert_eq!(s.standdown(), Some(Standdown::Done), "precondition: stood down");
 
-        // Idle redraws: the hash keeps moving, nobody typed. A spinner is not a new assignment.
-        for i in 0..12u64 {
-            let redraw = Observation { hash: 0x2000 + i, ..answered };
-            let d = step(&mut s, &redraw);
-            assert_eq!(d.action, Action::Observe, "redraw {i} must not revive the pinging");
+        let d = run(&mut s, &answered, 20);
+        assert!(
+            d.iter().any(|x| x.rung as usize > FIRST_NUDGE_RUNG),
+            "precondition: the ladder must actually reach a nudge rung, or this proves nothing"
+        );
+        assert!(d.iter().all(|x| x.action == Action::Observe), "and still never types");
+    }
+
+    /// …AND IT EXPIRES ON UNPROVOKED OUTPUT (roborev 60338, High).
+    ///
+    /// Latching it until a human typed gave `not-blocked` — the commonest token, and the one in the
+    /// founder's screenshot — the power to silence an agent for the rest of its session. `Done`
+    /// both refuses to write and reports NO flag, so an agent that answered at minute 5, worked on,
+    /// and wedged at minute 40 was invisible in both directions. An answer minutes old does not
+    /// describe an agent that is currently producing output.
+    ///
+    /// This does NOT revive pinging of a finished agent: that one is held quiet by `obs.goal_met`,
+    /// which is re-read every look and owes nothing to this latch.
+    #[test]
+    fn unprovoked_output_expires_a_reply_stand_down() {
+        let mut s = AgentState::default();
+        run(&mut s, &stalled(), 7);
+        step(&mut s, &Observation { hash: 0x11aa, reply: Some(Reply::NotBlocked), ..stalled() });
+        assert_eq!(s.standdown(), Some(Standdown::Done), "precondition: stood down");
+
+        // It gets back to work on its own: no reply, and nobody typed at it.
+        step(&mut s, &Observation { hash: 0x11ab, reply: None, ..stalled() });
+        assert_eq!(s.standdown(), None, "a stale answer must not outlive the idleness it described");
+
+        // …and it is genuinely watched again — hold the hash steady and it reaches a nudge.
+        let d = run(&mut s, &Observation { hash: 0x11ab, reply: None, ..stalled() }, 10);
+        assert!(
+            d.iter().any(|x| matches!(x.action, Action::Nudge { .. })),
+            "an agent that answered once must not be exempt for the rest of its session"
+        );
+    }
+
+    /// …AND THE EXPIRY IS NARROW (roborev 60353, High). A stand-down that RAISES A FLAG is visible
+    /// by construction, so it never had the silent-in-both-directions problem the expiry exists to
+    /// close — and expiring it deletes the row it was put up for. The rung resets to 0 on the look
+    /// that reads the answer, so the next look is five seconds later: the "plus what you need"
+    /// explanation the nudge itself asked for was enough to destroy a founder row.
+    ///
+    /// Every other test of these two answers holds the hash CONSTANT after the reply, which is why
+    /// none of them could see it.
+    #[test]
+    fn unprovoked_output_does_not_expire_a_stand_down_that_holds_a_flag() {
+        for (reply, level) in
+            [(Reply::Human, Escalation::Founder), (Reply::Quota, Escalation::Concierge)]
+        {
+            let mut s = AgentState::default();
+            run(&mut s, &stalled(), 7);
+            let answered = Observation { hash: 0x7001, reply: Some(reply), ..stalled() };
+            let d = step(&mut s, &answered);
+            assert_eq!(d.flagged, Some(level), "{reply:?}: precondition — the row went up");
+
+            // The agent keeps talking: the explanation we asked it for, a repaint, the same turn's
+            // tail. Unprovoked, so this is the path that used to wipe everything.
+            let d = step(&mut s, &Observation { hash: 0x7002, reply: None, ..stalled() });
+            assert_eq!(
+                d.flagged,
+                Some(level),
+                "{reply:?}: the row must not vanish because the agent said more"
+            );
+            assert_eq!(s.standdown(), Some(Standdown::of(reply)), "{reply:?}: still stood down");
+
+            // …and it is still not typed at, over a full climb past the nudge rung.
+            let later = run(&mut s, &Observation { hash: 0x7002, reply: None, ..stalled() }, 14);
+            assert!(
+                later.iter().all(|x| x.action == Action::Observe),
+                "{reply:?}: re-pinging is exactly what this stand-down forbids"
+            );
+            assert!(
+                later.iter().all(|x| x.flagged == Some(level)),
+                "{reply:?}: and the row stays up the whole time"
+            );
         }
-        assert_eq!(s.standdown(), Some(Standdown::Done));
+    }
+
+    /// …but a FINISHED agent stays quiet through the same sequence, which is what makes the rule
+    /// above safe rather than merely noisy. Same steps, `goal_met: true`.
+    #[test]
+    fn expiring_the_reply_latch_does_not_revive_pinging_of_a_finished_agent() {
+        let mut s = AgentState::default();
+        let done = Observation { goal_met: true, ..stalled() };
+        run(&mut s, &done, 7);
+        step(&mut s, &Observation { hash: 0x12aa, reply: Some(Reply::NotBlocked), ..done });
+        step(&mut s, &Observation { hash: 0x12ab, reply: None, ..done });
+
+        let d = run(&mut s, &Observation { hash: 0x12ab, reply: None, ..done }, 20);
+        assert!(
+            d.iter().all(|x| x.action == Action::Observe),
+            "a met goal holds the agent quiet on its own, latch or no latch"
+        );
+    }
+
+    /// A TRANSIENT ROSTER BLINK MUST NOT RE-EXEMPT A SUPERSEDED AGENT (roborev 60338, Medium).
+    ///
+    /// `goal_met` is computed from the roster, and an agent ABSENT from the roster reads as unmet —
+    /// which is exactly what a frontend reload, a republish gap or a wedged WebView produces. One
+    /// such look used to clear the supersession, and the next met look re-stamped it against the
+    /// new write clock, restoring the lifetime exemption permanently and silently.
+    #[test]
+    fn a_roster_blink_does_not_re_exempt_a_superseded_goal() {
+        let mut s = AgentState::default();
+        run(&mut s, &Observation { goal_met: true, foreign_write_ms: 100, ..stalled() }, 10);
+        // New work arrives — superseded.
+        step(&mut s, &Observation { hash: 0x6001, goal_met: true, foreign_write_ms: 200, ..stalled() });
+        // ONE look where the agent is missing from the roster, so `goal_met` reads false.
+        step(&mut s, &Observation { hash: 0x6002, goal_met: false, foreign_write_ms: 200, ..stalled() });
+
+        // Back on the roster, still met, same write clock — the exemption must NOT return.
+        let back = Observation { hash: 0x6002, goal_met: true, foreign_write_ms: 200, ..stalled() };
+        let d = run(&mut s, &back, 12);
+        assert!(
+            d.iter().any(|x| matches!(x.action, Action::Nudge { .. })),
+            "a one-look roster blink must not hand back a lifetime exemption"
+        );
     }
 }

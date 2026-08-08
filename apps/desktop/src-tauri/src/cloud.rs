@@ -168,7 +168,7 @@ impl DeepgramSession {
         token: String,
         // Project this dictation belongs to, for credit-history attribution. None when unknown.
         project: Option<String>,
-    ) -> Result<DeepgramSession, String> {
+    ) -> Result<DeepgramSession, RelayError> {
         // ── THE HANDSHAKE, MEASURED (sparkle-oyapv) ──────────────────────────────────────────────
         // DNS + TCP + TLS + the WS upgrade, and the dominant cost of the second window in which
         // push-to-talk loses speech: while this is in flight `cloud_active` is still false, and when
@@ -192,7 +192,7 @@ impl DeepgramSession {
         let worker = std::thread::Builder::new()
             .name("deepgram-relay".into())
             .spawn(move || run_session(app, socket, rx, suppress_cb, alive_cb, muted_cb))
-            .map_err(|e| format!("spawn relay worker: {e}"))?;
+            .map_err(|e| RelayError::local(format!("spawn relay worker: {e}")))?;
         tracing::info!(target: "dictation", handshake_ms, "cloud relay stream opened");
         Ok(DeepgramSession {
             audio_tx: tx,
@@ -612,30 +612,134 @@ pub(crate) fn classify_relay_frame(json: &str) -> RelayFrame {
 /// seconds.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// WHY a handshake failed, kept as a TYPE rather than flattened into a message string.
+///
+/// The relay answers every refusal with a DISTINCT status (see `deepgramRelay.ts`: 503 when its own
+/// Deepgram key is unset, then 401 → 403 → 402 as it walks auth → entitlement → affordability), and
+/// this end used to `format!` all of them into one `String` that only ever reached a log line. So the
+/// desktop could not tell a stale token from a lapsed subscription from an empty balance from the
+/// relay actually being down — and neither could anyone debugging it. That discard is why a
+/// non-existent production outage was reported four times over two days: the server had computed the
+/// exact answer on every attempt and the client threw it away at this boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RelayRefusal {
+    /// 401 — no/expired Sparkle bearer. The user can fix this by signing in again.
+    Unauthorized,
+    /// 402 — entitled, but can't afford the first minute. Actionable: refill.
+    InsufficientCredits,
+    /// 403 — signed in, but this account isn't entitled to cloud dictation.
+    NotEntitled,
+    /// 503 — the RELAY is misconfigured (its own Deepgram key is unset). Nothing the user can do.
+    Unconfigured,
+    /// Any other non-101 status. Carried numerically rather than collapsed, so an unexpected gate
+    /// added server-side shows up in the log as itself instead of as a generic failure.
+    Http(u16),
+    /// We never got an HTTP answer at all — DNS, TCP, TLS, or the CONNECT_TIMEOUT. Distinct from
+    /// every variant above because those PROVE the relay is reachable and serving.
+    Unreachable,
+    /// Our own side failed (thread spawn, a panicked blocking task). Not the relay's fault, and
+    /// separated so a local defect can never be reported to the user as a service outage.
+    Local,
+}
+
+impl RelayRefusal {
+    /// The stable snake_case token handed to the frontend. Kept beside the enum so a new variant
+    /// cannot be added without deciding what the UI is told about it.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            RelayRefusal::Unauthorized => "unauthorized",
+            RelayRefusal::InsufficientCredits => "insufficient_credits",
+            RelayRefusal::NotEntitled => "not_entitled",
+            RelayRefusal::Unconfigured => "relay_unconfigured",
+            RelayRefusal::Http(_) => "unreachable",
+            RelayRefusal::Unreachable => "unreachable",
+            RelayRefusal::Local => "unreachable",
+        }
+    }
+}
+
+/// A handshake failure: the classified reason PLUS the original message, so the log keeps every
+/// detail it had before while the caller gets something it can branch on.
+#[derive(Debug, Clone)]
+pub(crate) struct RelayError {
+    pub refusal: RelayRefusal,
+    pub detail: String,
+}
+
+impl std::fmt::Display for RelayError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.detail)
+    }
+}
+
+impl RelayError {
+    fn unreachable(detail: String) -> Self {
+        RelayError { refusal: RelayRefusal::Unreachable, detail }
+    }
+    fn local(detail: String) -> Self {
+        RelayError { refusal: RelayRefusal::Local, detail }
+    }
+}
+
+/// Map a tungstenite handshake error onto a refusal. PURE, so the status→meaning table is unit
+/// testable without a relay, a socket, or a network.
+///
+/// Only `Error::Http` carries a response, and its presence is exactly what proves we reached the
+/// relay and it answered. Everything else (Io, Tls, Protocol, …) means no answer arrived, which is
+/// a materially different claim and must not be reported as a refusal.
+pub(crate) fn classify_handshake_error(err: &tungstenite::Error) -> RelayRefusal {
+    match err {
+        tungstenite::Error::Http(resp) => match resp.status().as_u16() {
+            401 => RelayRefusal::Unauthorized,
+            402 => RelayRefusal::InsufficientCredits,
+            403 => RelayRefusal::NotEntitled,
+            503 => RelayRefusal::Unconfigured,
+            other => RelayRefusal::Http(other),
+        },
+        _ => RelayRefusal::Unreachable,
+    }
+}
+
+/// Adapter from what `tungstenite::client{,_tls}` actually returns. Thin on purpose: the status→
+/// meaning table stays in `classify_handshake_error`, which takes a plain `Error` and so can be
+/// tested without constructing a handshake role.
+///
+/// `Interrupted` means the handshake is mid-flight on a would-block socket — no response yet, so it
+/// is Unreachable rather than a refusal. Our sockets are blocking with a read timeout, so this arm
+/// is effectively a timeout.
+fn classify_handshake<R: tungstenite::handshake::HandshakeRole>(
+    err: &tungstenite::HandshakeError<R>,
+) -> RelayRefusal {
+    match err {
+        tungstenite::HandshakeError::Failure(e) => classify_handshake_error(e),
+        tungstenite::HandshakeError::Interrupted(_) => RelayRefusal::Unreachable,
+    }
+}
+
 /// Open the WebSocket to the orchestration relay with the Sparkle bearer as the `Authorization`
 /// header. Blocking but bounded by CONNECT_TIMEOUT — callers run it on a blocking worker (never the
 /// main/event-loop thread) and treat Err as "fall back to on-device". A non-101 handshake response
-/// (the relay's 401/402/403/503
-/// gates) surfaces as Err too. run_session resets the socket timeouts to its own values after this
-/// returns.
+/// (the relay's 401/402/403/503 gates) surfaces as Err too, CLASSIFIED — see `RelayRefusal`.
+/// run_session resets the socket timeouts to its own values after this returns.
 fn connect(
     base_url: &str,
     token: &str,
     sample_rate: u32,
     project: Option<&str>,
-) -> Result<WebSocket<MaybeTlsStream<TcpStream>>, String> {
-    let (ws_url, host_port, tls) = relay_target(base_url, sample_rate)?;
+) -> Result<WebSocket<MaybeTlsStream<TcpStream>>, RelayError> {
+    let (ws_url, host_port, tls) =
+        relay_target(base_url, sample_rate).map_err(RelayError::local)?;
     // into_client_request() fills in the required handshake headers (Host, Upgrade, Sec-*); we
     // only add Authorization (and the metering-only project) on top.
     let mut req = ws_url
         .as_str()
         .into_client_request()
-        .map_err(|e| format!("bad relay request: {e}"))?;
+        .map_err(|e| RelayError::local(format!("bad relay request: {e}")))?;
     req.headers_mut().insert(
         "Authorization",
         format!("Bearer {token}")
             .parse()
-            .map_err(|_| "invalid Sparkle auth header".to_string())?,
+            .map_err(|_| RelayError::local("invalid Sparkle auth header".to_string()))?,
     );
     // Metering-only, and NON-FATAL by construction: an unparseable header value is skipped (losing
     // the attribution) rather than failing the connection — the annotation must never be able to
@@ -656,10 +760,10 @@ fn connect(
     // force a fallback when a later address would connect.
     let addrs: Vec<_> = host_port
         .to_socket_addrs()
-        .map_err(|e| format!("relay dns: {e}"))?
+        .map_err(|e| RelayError::unreachable(format!("relay dns: {e}")))?
         .collect();
     if addrs.is_empty() {
-        return Err("relay dns: no address".to_string());
+        return Err(RelayError::unreachable("relay dns: no address".to_string()));
     }
     let mut tcp = None;
     let mut last_err = String::new();
@@ -672,18 +776,27 @@ fn connect(
             Err(e) => last_err = e.to_string(),
         }
     }
-    let tcp = tcp.ok_or_else(|| format!("relay connect failed: {last_err}"))?;
+    let tcp = tcp
+        .ok_or_else(|| RelayError::unreachable(format!("relay connect failed: {last_err}")))?;
     let _ = tcp.set_read_timeout(Some(CONNECT_TIMEOUT));
     let _ = tcp.set_write_timeout(Some(CONNECT_TIMEOUT));
     if tls {
-        let (socket, _resp) = tungstenite::client_tls(req, tcp)
-            .map_err(|e| format!("relay handshake failed: {e}"))?;
+        // THE STATUS IS READ HERE, NOT DISCARDED. `classify_handshake_error` keeps the relay's own
+        // answer (401/402/403/503) as a value the caller can branch on; the message still goes into
+        // `detail` for the log, so nothing that was available before is lost.
+        let (socket, _resp) = tungstenite::client_tls(req, tcp).map_err(|e| RelayError {
+            refusal: classify_handshake(&e),
+            detail: format!("relay handshake failed: {e}"),
+        })?;
         Ok(socket)
     } else {
         // Plaintext (local dev, e.g. ws://localhost:3001): wrap the TcpStream as MaybeTlsStream::Plain
         // so the returned socket has the same type as the TLS path (set_socket_timeouts handles both).
-        let (socket, _resp) = tungstenite::client(req, MaybeTlsStream::Plain(tcp))
-            .map_err(|e| format!("relay handshake failed: {e}"))?;
+        let (socket, _resp) =
+            tungstenite::client(req, MaybeTlsStream::Plain(tcp)).map_err(|e| RelayError {
+                refusal: classify_handshake(&e),
+                detail: format!("relay handshake failed: {e}"),
+            })?;
         Ok(socket)
     }
 }
@@ -1123,6 +1236,77 @@ pub(crate) fn parkable_session() -> (DeepgramSession, ParkedChannel) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build the shape tungstenite hands us when the relay ANSWERED with a non-101 status.
+    fn http_err(status: u16) -> tungstenite::Error {
+        let resp = tungstenite::http::Response::builder()
+            .status(status)
+            .body(None)
+            .expect("valid test response");
+        tungstenite::Error::Http(resp)
+    }
+
+    /// THE POINT OF THE WHOLE CHANGE: each of the relay's gates must come back as its OWN value.
+    /// Asserted as a set of DISTINCT results rather than one-by-one, because the defect being fixed
+    /// was precisely that they all collapsed together — a test that checked them individually
+    /// against a single expected value would still pass if two of them merged.
+    #[test]
+    fn each_relay_gate_classifies_to_its_own_refusal() {
+        assert_eq!(classify_handshake_error(&http_err(401)), RelayRefusal::Unauthorized);
+        assert_eq!(classify_handshake_error(&http_err(402)), RelayRefusal::InsufficientCredits);
+        assert_eq!(classify_handshake_error(&http_err(403)), RelayRefusal::NotEntitled);
+        assert_eq!(classify_handshake_error(&http_err(503)), RelayRefusal::Unconfigured);
+
+        // …and they are mutually distinct. This is the assertion the old `String` could never
+        // satisfy: four causes, four different answers.
+        let all = [
+            classify_handshake_error(&http_err(401)),
+            classify_handshake_error(&http_err(402)),
+            classify_handshake_error(&http_err(403)),
+            classify_handshake_error(&http_err(503)),
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "gates {i} and {j} must not collapse onto one refusal");
+                }
+            }
+        }
+    }
+
+    /// An unexpected status still proves the relay ANSWERED, so it keeps its number rather than
+    /// being flattened into the no-answer case.
+    #[test]
+    fn an_unmapped_status_keeps_its_number() {
+        assert_eq!(classify_handshake_error(&http_err(500)), RelayRefusal::Http(500));
+        assert_eq!(classify_handshake_error(&http_err(429)), RelayRefusal::Http(429));
+    }
+
+    /// A transport failure is NOT a refusal — nothing was answered. Conflating the two is what let a
+    /// healthy relay be reported as refusing (and a genuinely down one as merely unauthorized).
+    #[test]
+    fn a_transport_failure_is_unreachable_not_a_refusal() {
+        let io = tungstenite::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "refused",
+        ));
+        assert_eq!(classify_handshake_error(&io), RelayRefusal::Unreachable);
+
+        let proto =
+            tungstenite::Error::Protocol(tungstenite::error::ProtocolError::WrongHttpMethod);
+        assert_eq!(classify_handshake_error(&proto), RelayRefusal::Unreachable);
+    }
+
+    /// The wire tokens are a CONTRACT with the frontend's `CloudStreamOutcome` union — pin them, so
+    /// a rename here fails here instead of silently falling through to the banner's default copy.
+    #[test]
+    fn refusal_tokens_are_pinned() {
+        assert_eq!(RelayRefusal::Unauthorized.as_str(), "unauthorized");
+        assert_eq!(RelayRefusal::InsufficientCredits.as_str(), "insufficient_credits");
+        assert_eq!(RelayRefusal::NotEntitled.as_str(), "not_entitled");
+        assert_eq!(RelayRefusal::Unconfigured.as_str(), "relay_unconfigured");
+        assert_eq!(RelayRefusal::Unreachable.as_str(), "unreachable");
+    }
 
     #[test]
     fn warm_expires_only_at_or_past_the_window() {

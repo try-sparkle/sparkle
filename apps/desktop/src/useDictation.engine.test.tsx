@@ -2,9 +2,10 @@
 /**
  * THE ENGINE-FALLBACK SIGNAL, ON THE PATH THAT ACTUALLY OPENS THE RELAY.
  *
- * `start_cloud_stream` returns a boolean the relay itself decided: `true` = the socket opened,
- * `false` = it REFUSED (signed out, not entitled, can't afford the first minute) and dictation
- * silently continues on-device. On-device is an OFFLINE transducer with no interim results at all,
+ * `start_cloud_stream` returns a `CloudStreamOutcome` naming what the relay decided:
+ * `opened`/`resumed`/`already_routing` = the cloud is live; `raced` = a stop interleaved and says
+ * nothing; the rest name a specific refusal (signed out, 401, 403, 402, 503, unreachable) and
+ * dictation silently continues on-device. On-device is an OFFLINE transducer with no interim results at all,
  * so the live word-by-word preview structurally stops existing — a swap the user reads as a broken
  * feature unless something says so (see stores/dictationEngineStore).
  *
@@ -147,7 +148,7 @@ describe("the window-blur guard — a broadcast stand-down must not close the gl
   const mountFocusedAndGoActive = async () => {
     hasFocus = vi.spyOn(document, "hasFocus").mockReturnValue(true);
     invoke.mockImplementation((cmd: string) =>
-      cmd === "start_cloud_stream" ? Promise.resolve(true) : Promise.resolve(undefined),
+      cmd === "start_cloud_stream" ? Promise.resolve("opened") : Promise.resolve(undefined),
     );
     await mountVoice();
     await goActive();
@@ -189,12 +190,15 @@ describe("the relay's own answer to start_cloud_stream drives the engine signal"
   // wiring path — the node-env suites drive the store directly and would stay green if the closure
   // called the wrong action entirely.
 
-  it("ONE refusal stays silent — the open seam cannot tell a refusal from an already-live stream", async () => {
-    // The actual new contract. `cloud_reuse` answers `AlreadyRouting -> Ok(false)` for a socket that
-    // is alive and actively routing, so a lone `false` is not evidence of an outage; treating it as
-    // one is what made the banner flap on every repeated hold.
+  it("ONE unreachable relay stays silent — a blip is not yet an outage", async () => {
+    // The remaining ambiguous case, and the only one that still needs corroboration: `unreachable`
+    // means no answer arrived at all, which a transient network blip produces just as readily as a
+    // real outage. (The case this test used to cover — a healthy already-routing socket counted as
+    // a refusal — is gone: that now arrives as its own outcome and counts for nothing.)
     invoke.mockImplementation((cmd: string) =>
-      cmd === "start_cloud_stream" ? Promise.resolve(false) : Promise.resolve(undefined),
+      cmd === "start_cloud_stream"
+        ? Promise.resolve("unreachable")
+        : Promise.resolve(undefined),
     );
     await mountVoice();
     await goActive();
@@ -204,9 +208,11 @@ describe("the relay's own answer to start_cloud_stream drives the engine signal"
     expect(useDictationEngineStore.getState().openRefusals).toBe(1);
   });
 
-  it("a SECOND consecutive refusal records the fallback — dictation is on-device now", async () => {
+  it("a SECOND consecutive unreachable records the fallback — dictation is on-device now", async () => {
     invoke.mockImplementation((cmd: string) =>
-      cmd === "start_cloud_stream" ? Promise.resolve(false) : Promise.resolve(undefined),
+      cmd === "start_cloud_stream"
+        ? Promise.resolve("unreachable")
+        : Promise.resolve(undefined),
     );
     await mountVoice();
     await goActive();
@@ -223,7 +229,7 @@ describe("the relay's own answer to start_cloud_stream drives the engine signal"
 
   it("a SUCCESS (true) records nothing — the resting state is 'no problem known'", async () => {
     invoke.mockImplementation((cmd: string) =>
-      cmd === "start_cloud_stream" ? Promise.resolve(true) : Promise.resolve(undefined),
+      cmd === "start_cloud_stream" ? Promise.resolve("opened") : Promise.resolve(undefined),
     );
     await mountVoice();
     await goActive();
@@ -233,12 +239,56 @@ describe("the relay's own answer to start_cloud_stream drives the engine signal"
     expect(useDictationEngineStore.getState().fallbackReason).toBeNull();
   });
 
+  // THE FOUNDER'S SYMPTOM, PINNED ON THE WIRING PATH. `already_routing` is what the command answers
+  // on a repeated passive→active edge onto a healthy socket — the most common outcome in ordinary
+  // use. It used to arrive as the same `false` as a refusal and was COUNTED as one, which is what
+  // made the banner pop up and go away while the relay was fine. It must now count for nothing.
+  it("an ALREADY-ROUTING socket is not a refusal — it does not even accumulate", async () => {
+    invoke.mockImplementation((cmd: string) =>
+      cmd === "start_cloud_stream"
+        ? Promise.resolve("already_routing")
+        : Promise.resolve(undefined),
+    );
+    await mountVoice();
+    await goActive();
+    await goPassive();
+    await goActive();
+    expect(invoke).toHaveBeenCalledWith("start_cloud_stream", expect.anything());
+    expect(useDictationEngineStore.getState().openRefusals).toBe(0);
+    expect(useDictationEngineStore.getState().fallbackReason).toBeNull();
+  });
+
+  // The other half of the fix: when the relay DOES name a cause, the wiring reports it at once and
+  // by name. One attempt, no corroboration — and not the generic "unavailable".
+  it("a NAMED refusal reports immediately, with the specific reason", async () => {
+    invoke.mockImplementation((cmd: string) =>
+      cmd === "start_cloud_stream"
+        ? Promise.resolve("insufficient_credits")
+        : Promise.resolve(undefined),
+    );
+    await mountVoice();
+    await goActive();
+    expect(invoke).toHaveBeenCalledWith("start_cloud_stream", expect.anything());
+    expect(useDictationEngineStore.getState().fallbackReason).toBe("exhausted");
+  });
+
+  it("a rejected session is named as a sign-in problem, not a network one", async () => {
+    invoke.mockImplementation((cmd: string) =>
+      cmd === "start_cloud_stream"
+        ? Promise.resolve("unauthorized")
+        : Promise.resolve(undefined),
+    );
+    await mountVoice();
+    await goActive();
+    expect(useDictationEngineStore.getState().fallbackReason).toBe("signed_out");
+  });
+
   it("a cloud stream coming back RETIRES a standing fallback and re-arms the dismissal", async () => {
     // The recovery half. Without it the banner outlives the outage it describes — the user fixes
     // their connection, dictation goes back to streaming interims, and the app still says it isn't.
     useDictationEngineStore.setState({ fallbackReason: "exhausted", dismissed: true });
     invoke.mockImplementation((cmd: string) =>
-      cmd === "start_cloud_stream" ? Promise.resolve(true) : Promise.resolve(undefined),
+      cmd === "start_cloud_stream" ? Promise.resolve("opened") : Promise.resolve(undefined),
     );
     await mountVoice();
     await goActive();

@@ -1,8 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  classifyCloudOutcome,
   FALLBACK_NOTICE_TTL_MS,
+  OPEN_REFUSALS_BEFORE_WARNING,
+  outcomeInstalledStream,
   shouldWarnLocalEngine,
   useDictationEngineStore,
+  type CloudStreamOutcome,
   type DictationEngineState,
 } from "./dictationEngineStore";
 
@@ -181,8 +185,16 @@ describe("dictationEngineStore", () => {
   it("retiring a stale notice resets the counter — the expiry closes its episode too", () => {
     vi.useFakeTimers();
     read().noteCloudOpenRefused(); // counter 1, below the threshold, nothing raised
-    read().noteCloudUnavailable("unavailable"); // an unambiguous report lights it without resetting
-    expect(read().openRefusals).toBe(1);
+    // A DEFINITIVE REPORT NOW ZEROES THE COUNTER, and this line used to assert the opposite ("an
+    // unambiguous report lights it without resetting", expecting 1). That was the state of the world
+    // when only the ambiguous seam could raise a reason; it contradicted the newer rule the moment
+    // `noteCloudOutcome` started ending the episode on a named answer, and the two were pinned in
+    // opposite directions in the same file (roborev 60366). One rule now, asserted here and there.
+    read().noteCloudUnavailable("unavailable");
+    expect(read().openRefusals).toBe(0);
+    // Re-arm so the rest of this case still exercises what it was written for: a counter that is
+    // live when the notice goes stale.
+    read().noteCloudOpenRefused();
 
     vi.advanceTimersByTime(FALLBACK_NOTICE_TTL_MS + 1);
     read().retireStaleNotice();
@@ -285,5 +297,192 @@ describe("dictationEngineStore", () => {
     read().noteCloudUnavailable("unavailable");
 
     expect(shouldWarnLocalEngine(read())).toBe(true);
+  });
+});
+
+describe("classifyCloudOutcome — one policy table, enumerated", () => {
+  // THE FLAP, ASSERTED DIRECTLY. `already_routing` is the idempotent no-op on a repeated
+  // passive→active edge onto a healthy socket and is the most common outcome in ordinary use. It
+  // used to arrive as the same `false` as a refusal, which is what lit the banner while the relay
+  // was fine. Reading it as anything other than `live` re-creates that bug.
+  it("treats an already-routing socket as LIVE, not as a refusal", () => {
+    expect(classifyCloudOutcome("already_routing")).toEqual({ kind: "live" });
+  });
+
+  it("treats a fresh open and a warm resume as live", () => {
+    expect(classifyCloudOutcome("opened")).toEqual({ kind: "live" });
+    expect(classifyCloudOutcome("resumed")).toEqual({ kind: "live" });
+  });
+
+  // A race is not evidence of anything. Counting it would be the flap in a narrower form.
+  it("ignores a race entirely", () => {
+    expect(classifyCloudOutcome("raced")).toEqual({ kind: "ignore" });
+  });
+
+  // Each named refusal must reach its OWN reason. Asserted as a table so a future variant that
+  // silently falls through to `unavailable` fails here.
+  it.each([
+    ["signed_out", "signed_out"],
+    ["unauthorized", "signed_out"],
+    ["not_entitled", "not_entitled"],
+    ["insufficient_credits", "exhausted"],
+    ["relay_unconfigured", "unavailable"],
+  ] as const)("reports %s definitively as %s", (outcome, reason) => {
+    expect(classifyCloudOutcome(outcome)).toEqual({
+      kind: "definitive",
+      reason,
+    });
+  });
+
+  // The ONE remaining ambiguous case — and it must stay ambiguous, because a transient network blip
+  // is exactly what the corroboration counter exists for.
+  it("keeps an unreachable relay ambiguous, so it still needs corroboration", () => {
+    expect(classifyCloudOutcome("unreachable")).toEqual({ kind: "ambiguous" });
+  });
+
+  // `live` and `installed by this call` differ on exactly one outcome; if they ever collapse, a
+  // raced stop would tear down a stream owned by an earlier call.
+  it("separates 'the cloud is live' from 'this call installed it'", () => {
+    expect(outcomeInstalledStream("already_routing")).toBe(false);
+    expect(classifyCloudOutcome("already_routing")).toEqual({ kind: "live" });
+    expect(outcomeInstalledStream("opened")).toBe(true);
+    expect(outcomeInstalledStream("resumed")).toBe(true);
+    expect(outcomeInstalledStream("raced")).toBe(false);
+  });
+});
+
+describe("noteCloudOutcome — what the seam actually does with an outcome", () => {
+  it("a known refusal speaks IMMEDIATELY, without waiting for corroboration", () => {
+    // The whole point of naming the cause: one attempt is enough when the relay told us why.
+    // Guarded against the threshold so this cannot pass by the counter happening to be 1.
+    expect(OPEN_REFUSALS_BEFORE_WARNING).toBeGreaterThan(1);
+
+    read().noteCloudOutcome("insufficient_credits");
+
+    expect(read().fallbackReason).toBe("exhausted");
+    expect(shouldWarnLocalEngine(read())).toBe(true);
+  });
+
+  it("names a stale session rather than blaming the network", () => {
+    read().noteCloudOutcome("unauthorized");
+    expect(read().fallbackReason).toBe("signed_out");
+    expect(shouldWarnLocalEngine(read())).toBe(true);
+  });
+
+  // THE REGRESSION TEST FOR THE FOUNDER'S SYMPTOM. Repeated holds and focus-regains onto a healthy
+  // socket produce a run of `already_routing`. Any number of them must leave the banner down.
+  it("never warns across a long run of already-routing no-ops", () => {
+    for (let i = 0; i < 10; i += 1) read().noteCloudOutcome("already_routing");
+
+    expect(read().fallbackReason).toBeNull();
+    expect(read().openRefusals).toBe(0);
+    expect(shouldWarnLocalEngine(read())).toBe(false);
+  });
+
+  it("a race moves nothing at all", () => {
+    read().noteCloudOutcome("unreachable"); // one ambiguous refusal, below the threshold
+    const before = read().openRefusals;
+
+    read().noteCloudOutcome("raced");
+    read().noteCloudOutcome("raced");
+
+    expect(read().openRefusals).toBe(before);
+    expect(read().fallbackReason).toBeNull();
+  });
+
+  it("still corroborates an unreachable relay before speaking", () => {
+    read().noteCloudOutcome("unreachable");
+    expect(shouldWarnLocalEngine(read())).toBe(false); // one is not enough
+
+    read().noteCloudOutcome("unreachable");
+    expect(read().fallbackReason).toBe("unavailable");
+    expect(shouldWarnLocalEngine(read())).toBe(true);
+  });
+
+  // A healthy no-op between two blips must clear the count — consecutive means consecutive.
+  it("a live outcome resets the corroboration counter", () => {
+    read().noteCloudOutcome("unreachable");
+    read().noteCloudOutcome("already_routing");
+    read().noteCloudOutcome("unreachable");
+
+    expect(shouldWarnLocalEngine(read())).toBe(false);
+  });
+
+  // The relay's CURRENT verdict wins: a user who refills and then hits a genuine sign-out must be
+  // told about the sign-out, not left reading a stale "you're out of credits".
+  it("lets a newer definitive answer replace an older one", () => {
+    read().noteCloudOutcome("insufficient_credits");
+    expect(read().fallbackReason).toBe("exhausted");
+
+    read().noteCloudOutcome("not_entitled");
+    expect(read().fallbackReason).toBe("not_entitled");
+  });
+
+  // TOTALITY, ASSERTED AS A SIDE EFFECT RATHER THAN A SHAPE. Without the `default` arm this call
+  // returns `undefined`, `noteCloudOutcome` reads `.kind` off it and THROWS — inside
+  // `startCloudStream`, i.e. before `openCloudDictationWindow` reaches its teardown, so a socket the
+  // backend really did install would never be closed on a raced stop and would keep billing. The
+  // bool this replaced was total for anything the backend could send; this has to be too.
+  it("does not throw on an outcome it does not recognise, and treats it as ambiguous", () => {
+    const bogus = "AlreadyRouting" as CloudStreamOutcome; // e.g. a lost `rename_all` on the Rust side
+    expect(() => classifyCloudOutcome(bogus)).not.toThrow();
+    expect(classifyCloudOutcome(bogus)).toEqual({ kind: "ambiguous" });
+
+    // …and the store dispatch survives it, corroborating rather than naming a cause we cannot read.
+    expect(() => read().noteCloudOutcome(bogus)).not.toThrow();
+    expect(read().openRefusals).toBe(1);
+    expect(read().fallbackReason).toBeNull();
+  });
+
+  // A RELAY-STATED REASON MUST SURVIVE THE AMBIGUOUS SEAM — for EVERY stated reason, not just
+  // `exhausted` (roborev 60356). The guard was written when `exhausted` was the only reason the
+  // relay could state; 401 and 403 now arrive stated too, and both were being overwritten with the
+  // generic "Sparkle can't reach the cloud transcription service" the moment corroboration landed.
+  // That tells an unentitled user to retry forever while "Unlock Sparkle" — the only thing that
+  // works — vanishes from the banner.
+  it.each([
+    ["unauthorized", "signed_out"],
+    ["not_entitled", "not_entitled"],
+    ["insufficient_credits", "exhausted"],
+  ] as const)(
+    "a stated %s survives corroborating unreachables instead of decaying to unavailable",
+    (outcome, expected) => {
+      read().noteCloudOutcome(outcome);
+      expect(read().fallbackReason).toBe(expected);
+
+      for (let i = 0; i < OPEN_REFUSALS_BEFORE_WARNING + 1; i++) {
+        read().noteCloudOutcome("unreachable");
+      }
+      expect(read().fallbackReason).toBe(expected);
+    },
+  );
+
+  // A NAMED ANSWER ENDS THE AMBIGUOUS EPISODE. Without zeroing the counter, a pre-existing count of
+  // 1 survives the definitive report, so ONE later unreachable crosses the threshold — reaching the
+  // downgrade path in a single blip rather than two.
+  it("a definitive answer zeroes the corroboration counter", () => {
+    read().noteCloudOutcome("unreachable");
+    expect(read().openRefusals).toBe(1);
+
+    read().noteCloudOutcome("not_entitled");
+    expect(read().openRefusals).toBe(0);
+  });
+
+  it("every outcome is handled — no silent fall-through", () => {
+    const all: CloudStreamOutcome[] = [
+      "opened",
+      "resumed",
+      "already_routing",
+      "raced",
+      "signed_out",
+      "unauthorized",
+      "not_entitled",
+      "insufficient_credits",
+      "relay_unconfigured",
+      "unreachable",
+    ];
+    for (const o of all) {
+      expect(classifyCloudOutcome(o)).toBeDefined();
+    }
   });
 });

@@ -2,7 +2,10 @@ import { useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useDictationStore } from "./stores/dictationStore";
-import { useDictationEngineStore } from "./stores/dictationEngineStore";
+import {
+  useDictationEngineStore,
+  type CloudStreamOutcome,
+} from "./stores/dictationEngineStore";
 import { useAiFeature, aiFeatureNow } from "./services/aiGate";
 import { useAuthStore } from "./stores/authStore";
 import { openCloudDictationWindow, nextBalanceCents } from "./services/cloudDictation";
@@ -546,11 +549,13 @@ export async function createDictationController(
       }
       // ══ AN INTERIM IS PROOF THE CLOUD ENGINE IS LIVE — SO IT RETIRES ANY STANDING NOTICE ═══════
       // The on-device engine is an OFFLINE transducer with no interim results at all, so this event
-      // can only have come from the relay. That is stronger evidence of cloud health than the
-      // boolean the notice is raised on, and a banner claiming "Sparkle can't reach the cloud
-      // transcription service" while relay text is arriving is simply false. Reachable because
-      // `cloud_reuse` answers `AlreadyRouting -> Ok(false)` for a socket that is alive and actively
-      // routing (see the open seam below, and bead sparkle-omznw).
+      // can only have come from the relay. That is stronger evidence of cloud health than anything
+      // the open seam reports, and a banner claiming "Sparkle can't reach the cloud transcription
+      // service" while relay text is arriving is simply false. It used to be reachable because
+      // `cloud_reuse` answered `AlreadyRouting -> Ok(false)` for a socket that was alive and
+      // actively routing; that outcome now classifies as `live` at the seam itself, so this is a
+      // backstop for the one remaining ambiguous outcome (`unreachable`) rather than the primary
+      // fix it once was (see the open seam below, and bead sparkle-omznw).
       //
       // IT ALSO CLEARS PARTIAL CORROBORATION, NOT ONLY A PAINTED NOTICE (roborev 59964/59966).
       // Gating on `fallbackReason !== null` alone left the counter climbing through a HEALTHY
@@ -1098,53 +1103,62 @@ export function useAmbientVoice(): void {
   // focus-regain resume, so a Speak session stays active across tabbing away and back without the
   // user touching the tray. Gated on the live cloud-dictation prefs — a no-op when off, so
   // a signed-out / composer-off user never opens a stream. Metering + entitlement/affordability are
-  // enforced SERVER-side by the relay: start_cloud_stream returns false when it refuses (stay
-  // on-device), and mid-stream out-of-credits arrives via the cloud-ended event. Balance updates
+  // enforced SERVER-side by the relay: start_cloud_stream reports a NAMED `CloudStreamOutcome` when
+  // it refuses (401/403/402/503, or unreachable) and dictation stays on-device; mid-stream
+  // out-of-credits still arrives via the cloud-ended event. Balance updates
   // arrive via the cloud-balance event (both wired in createDictationController above).
   const openCloud = useRef(() => {
     if (!(aiFeatureNow("composer") && aiFeatureNow("voiceDictation"))) return;
     void openCloudDictationWindow({
       // Metering-only: attributes the per-minute dictation debits to the project the user is
       // dictating into. Resolved at open time; undefined when no project is selected.
-      // THE RELAY'S OWN ANSWER, RECORDED. `true` = the socket opened, so the cloud engine is live and
-      // any standing fallback notice retires; `false` = the relay REFUSED (signed out, not entitled,
-      // can't afford the first minute) and dictation silently continues on-device without interim
-      // results. That refusal is NOT definitive and must be corroborated before it is reported —
-      // `cloud_reuse` returns the same `false` for an already-routing socket. See
-      // dictationEngineStore's OPEN_REFUSALS_BEFORE_WARNING, and the call below.
+      // THE RELAY'S OWN ANSWER, RECORDED — and now it is an ANSWER, not a bit. The command returns a
+      // `CloudStreamOutcome` naming what happened: `opened`/`resumed`/`already_routing` mean the
+      // cloud engine is live and any standing notice retires; `raced` means a stop interleaved and
+      // says nothing; the rest name a specific cause (signed out, 401, 403, 402, 503, unreachable)
+      // and dictation silently continues on-device without interim results. Only `unreachable` is
+      // ambiguous enough to still need corroboration — see dictationEngineStore's
+      // `classifyCloudOutcome` and OPEN_REFUSALS_BEFORE_WARNING, and the call below.
       //
       // THE ONE PLACE THIS INVOKE LIVES, which is why wiring it here covers every opener: both the
       // passive→active phase edge and the focus-regain resume reach the relay through
       // `onResumeActive` → this closure, so neither can open a stream without reporting what happened.
-      // Refusals are deliberately indistinguishable at this seam (see openCloudDictationWindow), so
-      // "unavailable" is the only honest reason available here; out-of-credits is reported by name
-      // from the mid-stream `cloud-ended` teardown, which does know.
+      // REFUSALS ARE NO LONGER INDISTINGUISHABLE HERE, and an earlier version of this note said they
+      // were ("'unavailable' is the only honest reason available here"). That was true of the bool
+      // and is the very thing this seam stopped doing: a 401/403/402/503 now arrives by name and is
+      // reported by name. The mid-stream `cloud-ended` teardown still reports out-of-credits for a
+      // stream that DIED rather than one that was refused — the two paths are complementary, not a
+      // fallback for a seam that cannot tell.
       startCloudStream: async () => {
-        const opened = await invoke<boolean>("start_cloud_stream", {
+        const outcome = await invoke<CloudStreamOutcome>("start_cloud_stream", {
           project: selectedProjectName(),
         });
         const engine = useDictationEngineStore.getState();
-        // `noteCloudOpenRefused`, NOT `noteCloudUnavailable`: this seam cannot tell a refusal from
-        // a success. `cloud_reuse` answers `AlreadyRouting -> Ok(false)` for a socket that is alive,
-        // matches the project and is actively routing, so one `false` means both "the relay said
-        // no" and "one is already running, nothing to do". Reporting that as an outage is what made
-        // the banner flap on every repeated hold and focus-regain, with the relay verified healthy
-        // throughout. The store corroborates before speaking; the unambiguous mid-stream
-        // `cloud-ended` path still reports immediately. Root cause tracked as sparkle-omznw.
-        if (opened) engine.noteCloudLive();
-        else engine.noteCloudOpenRefused();
+        // ONE CALL, because the seam can now TELL — this is the fix for sparkle-omznw rather than
+        // another mitigation of it. The command used to answer a bare bool whose `false` covered
+        // seven cases, including `cloud_reuse`'s `AlreadyRouting`: a socket that is alive, matches
+        // the project and is actively routing. Counting that healthy no-op as a refusal is what made
+        // the banner flap on every repeated hold and focus-regain while the relay was verified
+        // healthy throughout. It now arrives as its own outcome and is read as EVIDENCE THE CLOUD IS
+        // LIVE, so the most common path during normal use can no longer accuse the relay of
+        // anything. `noteCloudOutcome` routes the rest: a named 401/402/403/503 reports at once, and
+        // only a genuine "no answer" still goes through the corroboration counter.
+        engine.noteCloudOutcome(outcome);
         // THE CAUSE, AT THE SOURCE — deliberately in the log and NOT in the banner. The store holds
         // only a coarse reason on purpose (copy rules: no raw errors, no status codes), which is
         // right for the user and useless for diagnosis. This is the transition record that answers
         // "is it flapping, and how often": one line per open attempt with the running count of
         // consecutive refusals and whether this one crossed into a warning. No transcript, no PII.
         console.info("[dictation] cloud open attempt", {
-          opened,
+          // THE CAUSE, BY NAME. This line used to carry a bare `opened: false`, which is precisely
+          // the log you cannot debug from — it is the same string whether the relay was down, the
+          // token was stale, or nothing was wrong at all.
+          outcome,
           consecutiveRefusals: useDictationEngineStore.getState().openRefusals,
           warning: useDictationEngineStore.getState().fallbackReason,
           at: new Date().toISOString(),
         });
-        return opened;
+        return outcome;
       },
       stopCloudStream: () => void invoke("stop_cloud_stream").catch(() => {}),
       isStillActive: () =>

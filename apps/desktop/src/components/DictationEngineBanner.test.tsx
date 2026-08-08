@@ -8,8 +8,12 @@
 // other banners' jobs.
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { DictationEngineBanner } from "./DictationEngineBanner";
-import { FALLBACK_NOTICE_TTL_MS, useDictationEngineStore } from "../stores/dictationEngineStore";
+import { DictationEngineBanner, WARNING } from "./DictationEngineBanner";
+import {
+  FALLBACK_NOTICE_TTL_MS,
+  useDictationEngineStore,
+  type DictationFallbackReason,
+} from "../stores/dictationEngineStore";
 
 beforeEach(() =>
   useDictationEngineStore.setState({
@@ -61,15 +65,82 @@ describe("DictationEngineBanner", () => {
     expect(unavailable).not.toMatch(/refill/i);
   });
 
-  it("carries no raw error or status code, and blames neither the network nor Claude", () => {
-    for (const reason of ["unavailable", "exhausted"] as const) {
+  // SWEPT OFF `WARNING`'S OWN KEYS, NOT A HAND-WRITTEN LIST. It used to iterate
+  // `["unavailable", "exhausted"] as const`, which could not grow with the union: two new reasons
+  // (`signed_out`, `not_entitled`) were added and neither was covered by the invariants this file
+  // calls load-bearing. `Record<DictationFallbackReason, string>` only forces a string to EXIST — it
+  // says nothing about what is in it, so the type could not stand in for this.
+  it("carries no raw error or status code, and blames neither the network nor Claude — EVERY reason", () => {
+    const reasons = Object.keys(WARNING) as DictationFallbackReason[];
+    // Guard the sweep itself: an empty or shrunken map would satisfy every assertion below
+    // vacuously, which is the one way this test could go quiet without anyone noticing.
+    expect(reasons).toEqual(
+      expect.arrayContaining(["unavailable", "exhausted", "signed_out", "not_entitled"]),
+    );
+
+    for (const reason of reasons) {
       cleanup();
       useDictationEngineStore.setState({ fallbackReason: reason, dismissed: false });
       render(<DictationEngineBanner />);
       const text = screen.getByRole("status").textContent ?? "";
       expect(text).not.toMatch(/HTTP \d|\b4\d\d\b|\b5\d\d\b|websocket|deepgram|sherpa|@/i);
       expect(text).not.toMatch(/your network|you're offline|you are offline|Claude|rate.?limit/i);
+      // What was LOST and that the words still land — the reason the banner exists at all — must be
+      // said by every reason, not just the two that were written first.
+      expect(text).toMatch(/live dictation preview is off/i);
+      expect(text).toMatch(/local engine/i);
+      expect(text).toMatch(/still captured/i);
     }
+  });
+
+  // EACH REASON MUST SAY SOMETHING DIFFERENT, or naming the cause bought nothing: the whole point of
+  // carrying the relay's status through is that a user can tell a stale session from an empty
+  // balance from an outage. Distinctness across the WHOLE map, so a new reason pasted from an
+  // existing one fails here.
+  it("gives every reason its own distinct sentence", () => {
+    const seen = new Map<string, DictationFallbackReason>();
+    for (const reason of Object.keys(WARNING) as DictationFallbackReason[]) {
+      cleanup();
+      useDictationEngineStore.setState({ fallbackReason: reason, dismissed: false });
+      render(<DictationEngineBanner />);
+      const text = screen.getByRole("status").textContent ?? "";
+      expect(seen.has(text)).toBe(false);
+      seen.set(text, reason);
+    }
+    expect(seen.size).toBe(Object.keys(WARNING).length);
+  });
+
+  // THE REMEDY EACH ONE NAMES IS THE APP'S OWN VERB. A remedy string is an instruction the user will
+  // follow, so it has to point at a control that exists: "Refill" is ZeroCreditBanner's,
+  // "Unlock Sparkle" is AiLockedNotice's $99 paywall. `not_entitled` first said "Upgrade" against a
+  // "plan" — neither of which the product has.
+  it("names remedies the product actually offers", () => {
+    useDictationEngineStore.setState({ fallbackReason: "not_entitled", dismissed: false });
+    render(<DictationEngineBanner />);
+    const notEntitled = screen.getByRole("status").textContent ?? "";
+    expect(notEntitled).toMatch(/unlock sparkle/i);
+    expect(notEntitled).not.toMatch(/upgrade|plan|subscription/i);
+
+    cleanup();
+    useDictationEngineStore.setState({ fallbackReason: "signed_out", dismissed: false });
+    render(<DictationEngineBanner />);
+    const signedOut = screen.getByRole("status").textContent ?? "";
+    expect(signedOut).toMatch(/sign in/i);
+    // It must not send a signed-out user to the credits screen — that was the hedge this change
+    // removed from `unavailable`, and re-introducing it here would be the same misdirection.
+    expect(signedOut).not.toMatch(/refill|credits/i);
+  });
+
+  // THE HEDGE IS GONE FROM `unavailable`, AND ITS ABSENCE IS THE ASSERTION. It said "if it keeps
+  // happening, check your Sparkle credits" only because this seam could not tell why the relay
+  // refused. It can now — an empty balance arrives as `exhausted` — so the hedge would send a user
+  // whose network blipped to inspect a balance that is fine.
+  it("no longer sends an unreachable-relay user to check their credits", () => {
+    useDictationEngineStore.setState({ fallbackReason: "unavailable", dismissed: false });
+    render(<DictationEngineBanner />);
+    const text = screen.getByRole("status").textContent ?? "";
+    expect(text).not.toMatch(/credits/i);
+    expect(text).toMatch(/try dictating again in a moment/i);
   });
 
   it("uses a react-icons glyph, never an emoji, for the caution mark", () => {

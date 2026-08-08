@@ -355,6 +355,63 @@ pub(crate) struct Installed {
     pub project_matches: bool,
 }
 
+/// WHAT ACTUALLY HAPPENED on a `start_cloud_stream` attempt — the command's return value.
+///
+/// THIS REPLACES A `bool`, AND THE BOOL WAS THE BUG. `Ok(false)` had SEVEN distinct meanings at this
+/// command's return sites, of which only ONE was a relay refusal: a healthy already-routing socket, a
+/// warm-parked race, a discarded race, a signed-out user, a panicked handshake task, an
+/// unreachable-by-construction guard — and the actual refusal. The frontend therefore could not tell
+/// "everything is fine, a stream is already running" from "the relay said no", which is why the
+/// fallback banner FLAPPED on every repeated hold and focus-regain while the relay was verified
+/// healthy throughout (the founder's "it's popping up and going away… very sensitive"), and why
+/// `OPEN_REFUSALS_BEFORE_WARNING` had to exist to paper over it.
+///
+/// Splitting the outcomes is what lets the frontend do two things it could not do before: treat the
+/// benign no-ops as evidence the cloud is LIVE rather than as refusals, and name the specific,
+/// actionable conditions (signed out / not entitled / out of credits) instead of one flat
+/// "unavailable".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudStreamOutcome {
+    /// A fresh socket was installed and is routing. Caller may start metering.
+    Opened,
+    /// A warm standby socket was resumed — no handshake. Also live; caller may start metering.
+    Resumed,
+    /// A live socket for this project was ALREADY routing: the idempotent no-op on a repeated
+    /// passive→active edge. NOT A REFUSAL — this is positive evidence the cloud is working.
+    AlreadyRouting,
+    /// A stop/mute/toggle raced the open, so nothing is routing now. Benign and self-correcting;
+    /// says nothing about the relay's health, so it must never raise a fallback notice.
+    Raced,
+    /// No Sparkle bearer on this machine — we never contacted the relay.
+    SignedOut,
+    /// Relay answered 401: the bearer was rejected. Actionable — sign in again.
+    Unauthorized,
+    /// Relay answered 403: this account is not entitled to cloud dictation.
+    NotEntitled,
+    /// Relay answered 402: entitled but can't afford the first minute. Actionable — refill.
+    InsufficientCredits,
+    /// Relay answered 503: ITS Deepgram key is unset. A real service fault, nothing user-fixable.
+    RelayUnconfigured,
+    /// No answer from the relay (DNS/TCP/TLS/timeout), an unexpected status, or a local failure.
+    Unreachable,
+}
+
+impl From<crate::cloud::RelayRefusal> for CloudStreamOutcome {
+    fn from(r: crate::cloud::RelayRefusal) -> Self {
+        use crate::cloud::RelayRefusal as R;
+        match r {
+            R::Unauthorized => CloudStreamOutcome::Unauthorized,
+            R::NotEntitled => CloudStreamOutcome::NotEntitled,
+            R::InsufficientCredits => CloudStreamOutcome::InsufficientCredits,
+            R::Unconfigured => CloudStreamOutcome::RelayUnconfigured,
+            // An unexpected status proves the relay ANSWERED, but we have no copy for it and must
+            // not invent one — report it as unavailable and let the log carry the number.
+            R::Http(_) | R::Unreachable | R::Local => CloudStreamOutcome::Unreachable,
+        }
+    }
+}
+
 /// The decision `cloud_reuse` returns: what `start_cloud_stream` should do with whatever socket is
 /// currently installed.
 #[derive(Debug, PartialEq, Eq)]
@@ -3251,10 +3308,12 @@ pub async fn start_dictation(app: AppHandle, state: State<'_, DictationState>) -
 /// (The
 /// voice-setting gate lives entirely in the frontend, the single source of truth; no `cloud` arg.)
 ///
-/// Returns TRUE only when a live relay socket was actually installed. Returns FALSE on every
-/// stay-on-device path (signed out, handshake failure — which includes the relay refusing an
-/// unentitled / can't-afford-a-minute user — or a stop/restart race discard) so the frontend knows to
-/// stay on the on-device model. Metering is server-side now, so a FALSE simply means "no cloud".
+/// Returns a `CloudStreamOutcome` naming WHAT HAPPENED — see that enum for why this is not a bool.
+/// `Opened`/`Resumed` mean a live relay socket is routing and the caller may start metering.
+/// `AlreadyRouting` also means the cloud is live (a repeated passive→active edge onto a working
+/// socket) and is NOT a refusal. `Raced` means a stop/restart interleaved and says nothing about the
+/// relay. Everything else names a specific reason the cloud is unavailable, so the frontend can tell
+/// the user something true and actionable instead of one flat "unavailable".
 /// MUST stay `async fn` (see the `spawn_blocking` on the handshake below). A plain sync
 /// `#[tauri::command]` is `ExecutionContext::Blocking`, which runs the body INLINE on the
 /// IPC/event-loop (macOS main) thread — where the ~hundreds-of-ms-to-8s TLS+WS handshake froze the
@@ -3268,7 +3327,7 @@ pub async fn start_cloud_stream(
     // Display name of the project the user is dictating into, so the per-minute deepgram debits are
     // attributable in the Credits history. Metering-only; None when the caller doesn't know.
     project: Option<String>,
-) -> Result<bool, ()> {
+) -> Result<CloudStreamOutcome, ()> {
     // A NEW DICTATION ATTEMPT — restart the interim log sampling, so THIS attempt logs its own
     // first interim. Here rather than at socket open because this command runs on every
     // passive→active edge INCLUDING warm reuse, and warm reuse is the common case: without it a
@@ -3323,19 +3382,25 @@ pub async fn start_cloud_stream(
                 project_matches: s.is_for_project(project.as_deref()),
             });
             match cloud_reuse(sess.cloud_active.load(Ordering::Relaxed), installed) {
-                CloudReuse::AlreadyRouting => return Ok(false),
+                // POSITIVE EVIDENCE, not a refusal: a live socket for this project is already
+                // routing. Reported as its own outcome so the frontend stops counting the most
+                // common healthy path as an outage.
+                CloudReuse::AlreadyRouting => return Ok(CloudStreamOutcome::AlreadyRouting),
                 CloudReuse::Resume => match cloud.as_ref() {
                     Some(s) => {
                         s.resume();
                         sess.cloud_active.store(true, Ordering::Relaxed);
                         tracing::info!(target: "dictation", "reusing warm deepgram socket");
-                        return Ok(true); // caller starts metering, exactly as for a fresh open
+                        // caller starts metering, exactly as for a fresh open
+                        return Ok(CloudStreamOutcome::Resumed);
                     }
                     // Unreachable by construction (Resume implies an installed session), but stated
                     // rather than assumed: flipping cloud_active with an EMPTY slot would tell the
                     // frontend cloud is live while the callback finds no sender — audio dropped
                     // instead of transcribed, with no cloud-ended to recover it. (roborev 52647)
-                    None => return Ok(false),
+                    // Reported as `Raced` rather than a refusal: nothing about the relay is known
+                    // here, and accusing it of an outage on an internal invariant would be a lie.
+                    None => return Ok(CloudStreamOutcome::Raced),
                 },
                 CloudReuse::Reopen => {
                     tracing::info!(
@@ -3394,7 +3459,8 @@ pub async fn start_cloud_stream(
     // below already guards (it re-reads both under the lock after the handshake returns).
     let token = crate::auth::bearer_token();
     if choose_engine(true, token.is_some(), true) != Engine::Cloud {
-        return Ok(false); // signed out → stay on the on-device model; don't consume an epoch on this path
+        // signed out → stay on the on-device model; don't consume an epoch on this path
+        return Ok(CloudStreamOutcome::SignedOut);
     }
     let token = token.expect("choose_engine returned Cloud only when a bearer is present");
     let base_url = crate::auth::base_url();
@@ -3416,7 +3482,7 @@ pub async fn start_cloud_stream(
             // The blocking task panicked (its panic was already logged by the hook). Treat it like a
             // handshake failure and stay on-device rather than surfacing an error to the mic UI.
             tracing::info!(target: "dictation", error = %join_err, "cloud handshake task failed; using on-device");
-            return Ok(false);
+            return Ok(CloudStreamOutcome::Unreachable);
         }
     };
     match started {
@@ -3486,9 +3552,12 @@ pub async fn start_cloud_stream(
                         "a stop raced the handshake; parking the stream in warm standby instead \
                          of discarding it"
                     );
-                    Ok(false)
+                    // Benign race, and the socket is BANKED — not a refusal, so it must not count
+                    // toward a fallback notice.
+                    Ok(CloudStreamOutcome::Raced)
                 }
-                None => Ok(true), // installed a live cloud socket → caller may start metering
+                // installed a live cloud socket → caller may start metering
+                None => Ok(CloudStreamOutcome::Opened),
                 Some(s) => {
                     tracing::info!(target: "dictation", "discarding cloud stream opened during a stop/again race");
                     // Silence HERE on this thread, then hand ONLY the blocking close+join off-thread
@@ -3502,14 +3571,23 @@ pub async fn start_cloud_stream(
                     // (roborev 51712/52980/53024)
                     let s = s.silence_now();
                     tauri::async_runtime::spawn_blocking(move || s.finish());
-                    Ok(false) // not installed → caller must not bill
+                    // not installed → caller must not bill; a race, not a refusal
+                    Ok(CloudStreamOutcome::Raced)
                 }
             }
         }
         Err(e) => {
-            // Offline / bad key / handshake failure → transparently keep using the on-device model.
-            tracing::info!(target: "dictation", error = %e, "cloud stream unavailable; using on-device");
-            Ok(false)
+            // THE RELAY'S OWN ANSWER, CARRIED THROUGH instead of flattened. The log keeps the full
+            // detail; the return value keeps the CLASSIFICATION, so the frontend can name a stale
+            // token or an empty balance rather than reporting every cause as one outage.
+            let outcome = CloudStreamOutcome::from(e.refusal);
+            tracing::info!(
+                target: "dictation",
+                error = %e,
+                refusal = e.refusal.as_str(),
+                "cloud stream unavailable; using on-device"
+            );
+            Ok(outcome)
         }
     }
 }
@@ -3771,6 +3849,7 @@ mod tests {
         should_resume_on_focus, should_standby_on_blur, start_after_load, stop_is_noop, unpark_cloud_for_focus, BeginStart, CapturePlan,
         CloudReuse, DeepgramSession, DictationState, Engine, Installed, ReconcileStep, StartAfterLoad,
         raced_stream_disposition, RacedStream, park_raced_stream, install_live_stream, CloudAudioSender,
+        CloudStreamOutcome,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
@@ -3780,6 +3859,164 @@ mod tests {
     };
     use std::sync::mpsc::{channel, sync_channel};
     use std::time::{Duration, Instant};
+
+    /// THE IPC CONTRACT, PINNED WHERE IT ACTUALLY LIVES.
+    ///
+    /// `CloudStreamOutcome` crosses into TypeScript as a serde-serialized string, and the frontend's
+    /// `CloudStreamOutcome` union (dictationEngineStore.ts) lists those exact ten tokens. Nothing
+    /// asserted them: the natural candidate, `cloud::refusal_tokens_are_pinned`, covers
+    /// `RelayRefusal::as_str()` — a value that only ever reaches a `tracing` field and NEVER the
+    /// wire. So renaming a variant here, or dropping `#[serde(rename_all = "snake_case")]`, would
+    /// ship a token the union does not contain while every Rust test stayed green.
+    ///
+    /// This asserts the SERIALIZED form, not the variant names, because serde's output is the thing
+    /// the frontend parses. A test that compared `format!("{:?}")` would pass through exactly the
+    /// change it exists to catch.
+    ///
+    /// WHAT THIS DOES AND DOES NOT GUARANTEE — stated precisely, because two earlier versions of
+    /// this comment overstated it and roborev caught both (60337, 60349).
+    ///
+    /// GUARANTEED by the compiler: a new `CloudStreamOutcome` variant cannot be added without
+    /// NAMING its expected wire token, because `expected_token`'s match has no `_` arm. That is the
+    /// property worth having — the token is the thing dictationEngineStore.ts parses, and the
+    /// prompt to write it here is also the prompt to add it to the TS union.
+    ///
+    /// NOT guaranteed: that the new variant is EXERCISED. `all` is hand-maintained, and Rust has no
+    /// way to enumerate an enum's variants without a derive (`strum::EnumIter`), which is not a
+    /// dependency here. Two previous attempts to fake that tie were both vacuous — `all.len() == 10`
+    /// compares a compile-time constant to itself, and a `covered: [bool; VARIANT_COUNT]` array is
+    /// only ever written for variants already in `all`, so the omission it advertised catching
+    /// passed green. An accurate comment beats a guard that reports the opposite of its coverage.
+    #[test]
+    fn outcome_wire_tokens_are_pinned() {
+        // No `_` arm: adding a variant fails to COMPILE until its token is written here.
+        fn expected_token(o: CloudStreamOutcome) -> &'static str {
+            match o {
+                CloudStreamOutcome::Opened => "opened",
+                CloudStreamOutcome::Resumed => "resumed",
+                CloudStreamOutcome::AlreadyRouting => "already_routing",
+                CloudStreamOutcome::Raced => "raced",
+                CloudStreamOutcome::SignedOut => "signed_out",
+                CloudStreamOutcome::Unauthorized => "unauthorized",
+                CloudStreamOutcome::NotEntitled => "not_entitled",
+                CloudStreamOutcome::InsufficientCredits => "insufficient_credits",
+                CloudStreamOutcome::RelayUnconfigured => "relay_unconfigured",
+                CloudStreamOutcome::Unreachable => "unreachable",
+            }
+        }
+
+        // HAND-MAINTAINED, and the doc comment above says so rather than pretending otherwise.
+        let all = [
+            CloudStreamOutcome::Opened,
+            CloudStreamOutcome::Resumed,
+            CloudStreamOutcome::AlreadyRouting,
+            CloudStreamOutcome::Raced,
+            CloudStreamOutcome::SignedOut,
+            CloudStreamOutcome::Unauthorized,
+            CloudStreamOutcome::NotEntitled,
+            CloudStreamOutcome::InsufficientCredits,
+            CloudStreamOutcome::RelayUnconfigured,
+            CloudStreamOutcome::Unreachable,
+        ];
+
+        let mut seen = std::collections::HashSet::new();
+        for outcome in all {
+            let wire = serde_json::to_string(&outcome).expect("outcome serializes");
+            assert_eq!(
+                wire,
+                format!("\"{}\"", expected_token(outcome)),
+                "wire token for {outcome:?} must match the frontend's CloudStreamOutcome union",
+            );
+            // Two variants sharing a token would make the frontend unable to tell them apart, which
+            // is the whole thing this enum replaced a bool to avoid.
+            assert!(seen.insert(wire.clone()), "duplicate wire token {wire} for {outcome:?}");
+        }
+    }
+
+    /// Every relay refusal must reach a DISTINCT outcome, or naming the cause buys nothing. The
+    /// three no-answer variants deliberately converge on `Unreachable` — that is the one collapse
+    /// the design asks for, so it is asserted rather than left to inspection.
+    ///
+    /// Also exhaustive by compiler, for the same reason as the token test above: the `match` has no
+    /// `_` arm, so a new `RelayRefusal` cannot be added without a deliberate decision about whether
+    /// it gets its own outcome or joins the no-answer collapse.
+    #[test]
+    fn each_refusal_maps_to_its_own_outcome() {
+        use crate::cloud::RelayRefusal as R;
+
+        // NAMED vs COLLAPSED, decided here rather than inferred from the mapping under test — a
+        // classification written by reading `From` would agree with any mapping, including a wrong
+        // one. `true` = the user is told something specific; `false` = we could not tell.
+        //
+        // EVERY USE OF IT CROSSES TO `From`. An earlier version also asserted `is_named(x)` against
+        // its own literal definition, which cannot fail whatever the mapping does (roborev 60337);
+        // those self-assertions are gone. The exhaustive match (no `_` arm) still forces a new
+        // `RelayRefusal` to be classified deliberately, and every case below tests the CODE.
+        fn is_named(r: R) -> bool {
+            match r {
+                R::Unauthorized | R::NotEntitled | R::InsufficientCredits | R::Unconfigured => true,
+                R::Http(_) | R::Unreachable | R::Local => false,
+            }
+        }
+        // `Http(418)` is here and not only in the collapse loop below, so "an arbitrary unexpected
+        // status collapses onto Unreachable" is actually asserted rather than merely listed.
+        for r in [
+            R::Unauthorized,
+            R::NotEntitled,
+            R::InsufficientCredits,
+            R::Unconfigured,
+            R::Http(500),
+            R::Http(418),
+            R::Unreachable,
+            R::Local,
+        ] {
+            let outcome = CloudStreamOutcome::from(r);
+            if is_named(r) {
+                assert_ne!(
+                    outcome,
+                    CloudStreamOutcome::Unreachable,
+                    "{r:?} is a named refusal and must not collapse onto Unreachable",
+                );
+            } else {
+                assert_eq!(
+                    outcome,
+                    CloudStreamOutcome::Unreachable,
+                    "{r:?} carries no answer to name, so it must collapse onto Unreachable",
+                );
+            }
+        }
+
+        assert_eq!(CloudStreamOutcome::from(R::Unauthorized), CloudStreamOutcome::Unauthorized);
+        assert_eq!(CloudStreamOutcome::from(R::NotEntitled), CloudStreamOutcome::NotEntitled);
+        assert_eq!(
+            CloudStreamOutcome::from(R::InsufficientCredits),
+            CloudStreamOutcome::InsufficientCredits,
+        );
+        assert_eq!(
+            CloudStreamOutcome::from(R::Unconfigured),
+            CloudStreamOutcome::RelayUnconfigured,
+        );
+
+        let named = [
+            CloudStreamOutcome::from(R::Unauthorized),
+            CloudStreamOutcome::from(R::NotEntitled),
+            CloudStreamOutcome::from(R::InsufficientCredits),
+            CloudStreamOutcome::from(R::Unconfigured),
+        ];
+        for (i, a) in named.iter().enumerate() {
+            for (j, b) in named.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "refusals {i} and {j} must not collapse onto one outcome");
+                }
+            }
+        }
+
+        // No HTTP answer reached us — there is nothing to name, so all three are `Unreachable` and
+        // the frontend keeps corroborating rather than accusing the relay of something specific.
+        for r in [R::Http(500), R::Unreachable, R::Local] {
+            assert_eq!(CloudStreamOutcome::from(r), CloudStreamOutcome::Unreachable);
+        }
+    }
 
     /// THE REGRESSION TEST for "auto-send never arms on the on-device path".
     ///

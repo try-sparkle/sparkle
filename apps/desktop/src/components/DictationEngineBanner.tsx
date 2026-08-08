@@ -45,7 +45,10 @@ import {
   type DictationFallbackReason,
 } from "../stores/dictationEngineStore";
 
-/** One sentence per coarse reason.
+/** One sentence per coarse reason — FOUR of them now that the relay's answer is carried through
+ *  (`unavailable`, `exhausted`, `signed_out`, `not_entitled`). The two paragraphs below were written
+ *  when there were two; the rules they state apply to every reason added since, and the test sweeps
+ *  `WARNING`'s own keys so a new reason cannot ship without meeting them.
  *
  *  THE CAUSE LEADS, and that is a correction. Both strings used to open with the identical clause
  *  "Live dictation preview is off — ", so the only words that DISCRIMINATE — unreachable relay vs.
@@ -66,16 +69,31 @@ import {
  *  rather than a placeholder.
  *
  *  Neither carries a raw error, a status code, or any PII. */
-const WARNING: Record<DictationFallbackReason, string> = {
+export const WARNING: Record<DictationFallbackReason, string> = {
   unavailable:
-    // The tail hedges DELIBERATELY (roborev 59930). The open seam cannot tell WHY the relay refused
-    // — it always reports "unavailable" — so this sentence has to stay true even when the real cause
-    // was an empty balance. "Try again in a moment" alone is futile advice for that user; naming
-    // credits as the thing to check keeps the copy honest without claiming a cause we do not have,
-    // and without duplicating ZeroCreditBanner's "Refill" affordance.
-    "Sparkle can't reach the cloud transcription service. Live dictation preview is off — dictation is running on the local engine. Your words are still captured; they appear when you finish speaking instead of word by word. It usually reconnects on its own, so try dictating again in a moment — and if it keeps happening, check your Sparkle credits",
+    // THE CREDITS HEDGE IS GONE, AND ITS REMOVAL IS THE POINT (it was added under roborev 59930).
+    // That tail — "if it keeps happening, check your Sparkle credits" — existed only because this
+    // seam could not tell WHY the relay refused, so the sentence had to stay true even when the real
+    // cause was an empty balance. It can tell now: an empty balance arrives as `exhausted` and gets
+    // its own copy below. Keeping the hedge would send a user whose network blipped off to inspect a
+    // balance that is fine, which is the same class of misdirection the hedge was written to avoid.
+    // `unavailable` now means only "we could not reach the relay, or the relay itself is
+    // misconfigured" — neither of which the user can fix by refilling.
+    "Sparkle can't reach the cloud transcription service. Live dictation preview is off — dictation is running on the local engine. Your words are still captured; they appear when you finish speaking instead of word by word. It usually reconnects on its own, so try dictating again in a moment",
   exhausted:
     "You're out of Sparkle credits. Live dictation preview is off — dictation is running on the local engine. Your words are still captured; they appear when you finish speaking instead of word by word. Refill your credits to get the live preview back",
+  // The two conditions that were previously invisible — both reported as a generic outage, sending
+  // the user to debug a network that was never the problem.
+  signed_out:
+    "Sparkle can't verify your account, so live dictation preview is off — dictation is running on the local engine. Your words are still captured; they appear when you finish speaking instead of word by word. Sign in again to get the live preview back",
+  // THE APP'S OWN VERB, NOT AN INVENTED ONE. This copy first said "Your Sparkle plan doesn't
+  // include cloud dictation… Upgrade" — but there is no plan and no Upgrade. The relay's 403 comes
+  // from `user.paidAt == null`, i.e. the ONE-TIME $99 purchase, and every other surface for that
+  // exact condition says "Buy Sparkle" / "Unlock Sparkle — $99" (AiLockedNotice). Naming a remedy
+  // the product does not offer sends the user hunting for a control that does not exist — the same
+  // rule that made `exhausted` say "Refill" rather than inventing a synonym.
+  not_entitled:
+    "Cloud dictation needs the full Sparkle app, so live dictation preview is off — dictation is running on the local engine. Your words are still captured; they appear when you finish speaking instead of word by word. Unlock Sparkle to get the live preview back",
 };
 
 // Brand amber is the theme-CONSTANT caution fill, so its ink is the constant brand navy (matching
