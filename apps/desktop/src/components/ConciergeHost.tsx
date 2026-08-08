@@ -4369,6 +4369,19 @@ export function ConciergeHost({
        *  happened to be staged most recently. Per-send like `staged` above, and for the same reason:
        *  several intents can be armed at once (roborev 59804). */
       sentQuote: SentQuote | null,
+      /**
+       * `Date.now()` AT SUBMIT — captured in `send`, like `submitted` and `staged` above, and for
+       * the same reason: this body is the ENQUEUED half and can run long after the gesture.
+       *
+       * It exists because computing it here is not merely imprecise, it is INERT. The mounted gate
+       * asks "would presence read Here if this submit counted as input?", and a `resolveMode` given
+       * `lastInputAt: Date.now()` alongside `now: Date.now()` makes `now - lastInputAt` identically
+       * zero — so the idle clause can never fire and the credit is granted at DEQUEUE time,
+       * unconditioned on how old the submit actually is. Chain a few slow deliveries (each bounded
+       * at `QUEUE_TASK_TIMEOUT_MS`) and a send from minutes ago still reads Here, dispatching to a
+       * live terminal on the strength of a gesture that is no longer true of where the user is.
+       */
+      submittedAt: number,
     ): Promise<boolean> => {
       // Has this send already claimed the mounted notice row with something SPECIFIC? The row holds
       // one line, so a later, vaguer notice would silently replace the explanation the founder needs.
@@ -4762,14 +4775,25 @@ export function ConciergeHost({
         // `send` is reachable from the auto-send RAIL, i.e. a timer firing after dictation silence.
         //
         // So the inference is scoped to the ONE decision that needs it: `resolveMode` re-run over a
-        // COPY of the facts with `lastInputAt` moved to now, answering "would presence read Here if
-        // this submit counted as input?" while mutating nothing. `manualAway` and an unfocused
-        // window still win, because both sit ahead of the idle rule inside `resolveMode` — an
-        // explicit "I'm stepping out" is not overridden by a timer firing.
-        const presenceCountingThisSubmit = resolveMode(
-          { ...usePresenceStore.getState(), lastInputAt: Date.now() },
-          Date.now(),
-        );
+        // COPY of the facts, answering "would presence read Here if this submit counted as input?"
+        // while mutating nothing. `manualAway` and an unfocused window still win, because both sit
+        // ahead of the idle rule inside `resolveMode` — an explicit "I'm stepping out" is not
+        // overridden by a timer firing.
+        //
+        // ══ ANCHORED TO `submittedAt`, NOT TO NOW — AND THAT IS NOT A REFINEMENT ═════════════════
+        // Writing `lastInputAt: Date.now()` here (as the first cut did) makes the idle clause
+        // STRUCTURALLY UNREACHABLE: `now - lastInputAt` is then identically zero, so the gate always
+        // reads Here and the credit is granted at DEQUEUE time. This body is the enqueued half — the
+        // same one whose neighbours insist it "can run well after the submit" — so that turns a
+        // minutes-old send into an immediate write to a live terminal. `MAX` rather than a bare
+        // `submittedAt`, so a real keystroke that landed AFTER the submit still counts.
+        const presenceCountingThisSubmit = (() => {
+          const facts = usePresenceStore.getState();
+          return resolveMode(
+            { ...facts, lastInputAt: Math.max(facts.lastInputAt, submittedAt) },
+            Date.now(),
+          );
+        })();
         if (
           mentionAim?.via === "mount" &&
           addressable &&
@@ -4963,6 +4987,12 @@ export function ConciergeHost({
       // The capture-Chat aim, consumed HERE for the same reason the aim itself is: everything that
       // must reflect SUBMIT happens synchronously, so a handoff landing while this send is still
       // queued cannot retroactively redirect it.
+      // WHEN this submit happened, captured HERE for the same reason `submitted` and `staged` are:
+      // everything that must reflect SUBMIT is read synchronously, because `deliver` runs off a
+      // global queue and can execute long afterwards. The mounted immediate-dispatch gate uses it to
+      // decide whether the submit still counts as evidence the user is at the machine — see
+      // `deliver`'s `submittedAt` param for why reading the clock down there instead is inert.
+      const submittedAt = Date.now();
       const forceSparkle = forceSparkleRef.current;
       forceSparkleRef.current = false;
       // ══ WHERE THIS MESSAGE GOES ═════════════════════════════════════════════════════════════════
@@ -5324,6 +5354,7 @@ export function ConciergeHost({
             mentionAim,
             redirectable,
             sentQuote,
+            submittedAt,
           ),
         false,
       );

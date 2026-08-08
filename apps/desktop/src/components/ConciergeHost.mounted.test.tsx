@@ -292,6 +292,17 @@ afterEach(() => {
   //
   // `clearAllIntents` is the API that exists for exactly this ("test teardown and app shutdown
   // only") and drops armed and queued alike, without delivering or reporting.
+  // ══ UNFREEZE THE CLOCK, UNCONDITIONALLY ═══════════════════════════════════════════════════════
+  // One row calls `vi.setSystemTime` to separate submit time from queue-drain time. No fake timers
+  // are installed in this file or in test-setup, so vitest takes the `!_fakingTime` branch and swaps
+  // `globalThis.Date` for a FROZEN MockDate while `setTimeout`/`setInterval` keep running in real
+  // time. Restoring at the end of that test body would only run when all of its assertions passed —
+  // exactly the case where it does not matter. If one fails, `Date` stays frozen for every later row
+  // (and for `retry` re-runs), so presence, countdown deadlines and `STALE_INTENT_MS` are all
+  // computed against a clock that never advances while their timers do fire: one genuine regression
+  // would surface as a cascade of unrelated timeouts and destroy the diagnostic. Teardown is where
+  // this file already puts its other global resets, for the same reason.
+  vi.useRealTimers();
   clearAllIntents();
   cleanup();
   vi.clearAllMocks();
@@ -1091,6 +1102,56 @@ describe("ConciergeHost — a terminal that must not receive free text refuses",
     expect(h.dispatchConciergeAnswer).not.toHaveBeenCalled();
     expect(queuedIntents()).toHaveLength(1);
     expect(queuedIntents()[0]!.class).toBe("destructive");
+  });
+
+  // ══ THE CREDIT IS ANCHORED TO SUBMIT TIME, NOT DEQUEUE TIME ═══════════════════════════════════
+  // THE BUG THIS PINS, which the first cut of the scoping fix shipped: the gate computed
+  // `resolveMode({...facts, lastInputAt: Date.now()}, Date.now())`. With both arguments read at the
+  // same instant, `now - lastInputAt` is identically ZERO, so `resolveMode`'s idle clause is
+  // structurally unreachable and the gate ALWAYS reads Here. Since this runs in the ENQUEUED half,
+  // that grants presence at dequeue time — a send from minutes ago writes straight into a live
+  // terminal on the strength of a gesture that is no longer true of where the founder is.
+  //
+  // ALL FOUR OTHER PRESENCE ROWS SUBMIT AND DELIVER IN THE SAME TICK, so the distinction between
+  // "submit time" and "dequeue time" is invisible to them. This row is the only one that separates
+  // the two: one slow delivery is chained ahead of the mounted send, and the clock is aged past the
+  // idle threshold before the chain is allowed to drain.
+  it("arms rather than dispatching when the queue drains long after the submit", async () => {
+    mount();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    h.dispatchConciergeAnswer.mockImplementationOnce(async () => {
+      await gate;
+      return { ok: true, path: "free-text" };
+    });
+    await send("first message holding the queue");
+    // Submitted while genuinely Here, and queued behind the in-flight delivery above.
+    await send("move the button 5px left");
+    // Time passes — more than the idle window — before the chain reaches our send. `lastInputAt` is
+    // aged to match, which is what the real clock would have done.
+    const aged = Date.now() - (IDLE_AWAY_MS + 60_000);
+    usePresenceStore.setState({
+      pinnedHere: false,
+      manualAway: false,
+      focused: true,
+      lastInputAt: aged,
+    });
+    usePresenceStore.getState().evaluate();
+    vi.setSystemTime(Date.now() + IDLE_AWAY_MS + 60_000);
+    await act(async () => {
+      release();
+      for (let i = 0; i < 12; i++) await Promise.resolve();
+    });
+    // The first message went out; ours did NOT take the immediate path — the submit is too old to
+    // still count as evidence anyone is watching, so it fell through to the countdown.
+    expect(h.dispatchConciergeAnswer).toHaveBeenCalledTimes(1);
+    expect(h.dispatchConciergeAnswer.mock.calls[0]![1]).toBe("first message holding the queue");
+    expect(armedIntents()).toHaveLength(1);
+    // NO `vi.useRealTimers()` HERE — it lives in `afterEach`. See the note there: undoing a frozen
+    // clock in the test body only runs when every assertion above it passed, which is precisely the
+    // case where it does not matter.
   });
 
   // THE OTHER HALF, so the scoping is pinned in both directions rather than only the safe one. The
