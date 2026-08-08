@@ -215,7 +215,8 @@ fn flatten(s: &str) -> String {
 /// that list naturally, and "always the end" is the only insertion rule that keeps every append a
 /// clean one-line diff regardless of how the user has since restructured the file.
 ///
-/// Returns the file's new full text so a caller can echo it back without a second read.
+/// Returns the file's new full text, RE-READ FROM DISK — see the read-back at the end of the body
+/// for why the composed string is not an acceptable answer.
 pub fn append_rule(
     app_data: &Path,
     rule: &str,
@@ -240,12 +241,51 @@ pub fn append_rule(
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
     }
-    text.push_str(&format_rule(flat_rule, attribution, date));
+    let line = format_rule(flat_rule, attribution, date);
+    text.push_str(&line);
     // The cap is enforced HERE too, not only on the editor path: the concierge appends on its own
     // initiative, so an unbounded append loop is exactly the way this file would grow without a
     // human ever seeing it.
     write_text(app_data, &text)?;
-    Ok(text)
+
+    // READ BACK BEFORE ACKNOWLEDGING (sparkle-3kr3t). Returning the string we just composed is
+    // returning our own INTENT, not the file's state, and the caller does not use it that way: the
+    // control op hands it straight back as `{ ok: true, guidelines }` and the concierge then tells
+    // the user, in words, that their rule is saved.
+    //
+    // WHY `write_text` RETURNING Ok IS NOT ENOUGH EVIDENCE. This function is a read-modify-write
+    // with NO lock, and `write_text` publishes by `rename`, which is last-writer-wins. Two appends
+    // that overlap — the concierge acting on its own initiative while the user saves the file in the
+    // editor, or two turns landing in the same instant — both read text T, both compose T+their own
+    // rule, and both rename successfully. One of the two rules is then simply gone, and BOTH callers
+    // were handed an Ok plus a text containing their line. That is the failure this class is named
+    // for: a silent drop that is indistinguishable from a save.
+    //
+    // Re-read through `read_text_strict`, the same reader the next append and the prompt injection
+    // use, rather than trusting the writer's view. A check that agreed with the writer would re-open
+    // the hole one layer down.
+    //
+    // COST: one extra read of a file bounded by `MAX_BYTES`, on an op that fires at most a few times
+    // a conversation. Cheap against a user re-explaining a preference they were told was recorded.
+    let on_disk = read_text_strict(app_data)?;
+    verify_appended(&on_disk, &line)?;
+    Ok(on_disk)
+}
+
+/// Is the rule we just wrote actually present in the text a READER sees? Pure, so the decision is
+/// pinned by a test that can drive both answers without racing a real filesystem.
+///
+/// Compares against the rendered line rather than the raw rule so it asserts the thing the file is
+/// supposed to contain, trailing newline excluded — the reader's copy may end with or without one.
+fn verify_appended(on_disk: &str, line: &str) -> Result<(), String> {
+    if on_disk.contains(line.trim_end()) {
+        return Ok(());
+    }
+    Err("concierge guideline: wrote the rule but could not read it back from the guidelines \
+         file — treating this as a FAILED save rather than telling you it was saved. A \
+         concurrent edit (the editor, or another append) most likely replaced the file; \
+         re-state the rule."
+        .into())
 }
 
 /// The block appended to `--append-system-prompt` after the persona, or "" when there is nothing to
@@ -357,6 +397,44 @@ mod tests {
 
     fn dir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    /// A LOST UPDATE MUST NOT REPORT AS A SAVE (sparkle-3kr3t).
+    ///
+    /// `append_rule` is an unlocked read-modify-write published by `rename`, so an overlapping
+    /// append (the editor saving, or a second turn) can land its own full-file rename between our
+    /// read and ours. Both writers succeed; one rule is gone. The text we composed still contains
+    /// our line, which is exactly why returning it was the bug — the reader's copy is the only copy
+    /// that counts, and this asserts we refuse rather than acknowledge when the two disagree.
+    #[test]
+    fn a_rule_missing_from_the_readers_copy_is_a_failed_save_not_a_save() {
+        let line = format_rule("stop pasting file:line at me", "Sparkle", "2026-08-08");
+        // The winner of the race: a well-formed file that simply does not carry our rule.
+        let clobbered = format!("# Rules\n\n{}", format_rule("something else", "You", "2026-08-08"));
+        let err = verify_appended(&clobbered, &line).unwrap_err();
+        // It must say the save FAILED — the concierge is about to speak this to the user, and
+        // "wrote it" is the claim that must not survive.
+        assert!(err.contains("FAILED save"), "unhelpful error: {err}");
+    }
+
+    /// The paired positive: the same setup DOES pass once the reader's copy carries the line, so the
+    /// refusal above is caused by absence and not by the check rejecting everything.
+    #[test]
+    fn a_rule_present_in_the_readers_copy_verifies() {
+        let line = format_rule("lead with the answer", "Sparkle", "2026-08-08");
+        // Trailing newline deliberately dropped — a reader's copy may or may not end with one.
+        let on_disk = format!("# Rules\n\n{}", line.trim_end());
+        assert!(verify_appended(&on_disk, &line).is_ok());
+    }
+
+    /// End to end: what `append_rule` RETURNS is the bytes a reader gets, not the string it built.
+    #[test]
+    fn append_rule_returns_the_text_read_back_from_disk() {
+        let d = dir();
+        let returned = append_rule(d.path(), "keep replies short", "Sparkle", "2026-08-08").unwrap();
+        let from_disk = std::fs::read_to_string(guidelines_path(d.path())).unwrap();
+        assert_eq!(returned, from_disk);
+        assert!(returned.contains("keep replies short"));
     }
 
     #[test]
