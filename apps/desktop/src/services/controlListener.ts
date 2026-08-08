@@ -208,7 +208,7 @@ const CONTROL_OP_TIERS: Record<ControlOp, "free" | "privileged"> = {
   //
   // ⚠️ UNLIKE `claim_pr`/`release_pr` BELOW, THIS ONE IS TARGETABLE. It is in `PER_AGENT_OPS`, it is
   // not caller-stamped, and it deliberately CAN reach another agent — a worker in the caller's own
-  // subtree. The closure that makes that safe is `mayWriteGoalFor`, not the tier: `free` here is a
+  // subtree. The closure that makes that safe is `mayWriteAgentFieldFor`, not the tier: `free` here is a
   // statement about WHO MAY CALL IT, and says nothing about whose goal they may write. Do not read
   // the "neither op can touch another agent" note below as covering this entry; it does not, and a
   // previous edit left it looking as though it did (roborev 55599).
@@ -333,17 +333,34 @@ function resolveTargetId(req: ControlRequest): string | undefined {
 }
 
 /**
- * May this caller write `targetId`'s GOAL? Yourself, your own worker subtree, or the concierge.
+ * May this caller write `targetId`'s AGENT-OWNED FIELDS? Yourself, your own worker subtree, or the
+ * concierge. (Formerly `mayWriteGoalFor` — the rule was never goal-specific, only its name was.)
  *
- * See `handleSetGoal` for why the write half needs a closure at all: the goal text is replayed
- * verbatim into the target's PTY by `continuePrompt`, and clearing a goal is the documented opt-out
- * from auto-continue — so an unrestricted target is both an injection channel and a way to silence
- * another agent's resume loop (roborev 55549).
+ * ONE PREDICATE FOR EVERY SUCH FIELD, deliberately. It was written for `set_agent_goal`, whose
+ * threat `handleSetGoal` spells out: the goal text is replayed verbatim into the target's PTY by
+ * `continuePrompt`, and clearing a goal is the documented opt-out from auto-continue, so an
+ * unrestricted target is both an injection channel and a way to silence another agent's resume loop
+ * (roborev 55549). `rename_agent` and `set_agent_activity` were simply MISSED when that closure went
+ * in — they kept resolving a caller-supplied `targetAgentId` with no ownership test at all, so any
+ * agent on the shared control socket could rewrite any other agent's two most human-facing fields
+ * after one free-tier `get_state` to enumerate the roster.
+ *
+ * Their blast radius is not code execution, it is DECEPTION OF THE OPERATOR: the human reads `name`
+ * and `activity` as an agent's own first-person report of what it is and what it is doing, so a
+ * prompt-injected worker that renames a stalled agent to look healthy, or writes a reassuring
+ * activity line onto an agent doing something else, makes the roster lie exactly where it is
+ * trusted. Same reasoning, same closure.
+ *
+ * KEEP IT ONE FUNCTION. Two near-identical authorisation predicates is how one of them gets fixed
+ * and the other does not — which is the bug this generalisation closes. A field whose rule is
+ * genuinely stricter belongs in its own handler and says so: `set_agent_goal_met` is caller-stamped
+ * (self only, concierge excepted) because marking another agent met latches its `metAt`, and that is
+ * a narrower rule than ownership, not a second copy of it.
  *
  * FAILS CLOSED on an unresolvable caller: no id means we cannot establish ownership, and the only
  * safe answer to "does this anonymous caller own that agent" is no.
  */
-function mayWriteGoalFor(req: ControlRequest, targetId: string): boolean {
+function mayWriteAgentFieldFor(req: ControlRequest, targetId: string): boolean {
   if (req.callerAgentId === CONCIERGE_CALLER_AGENT_ID) return true;
   const caller = (req.callerAgentId || "").trim();
   if (!caller) return false;
@@ -480,6 +497,29 @@ function targetRequired(op: string, req: ControlRequest): Record<string, unknown
         "is nothing to default the target to"
       : "this caller has no own agent to default the target to";
   return { ok: false, code: "target_required", error: `${op} requires an explicit targetAgentId: ${why}` };
+}
+
+/** The typed refusal for a per-agent WRITE aimed at an agent the caller does not own — the reply
+ *  half of `mayWriteAgentFieldFor`, shared by every op behind it so the three cannot drift into
+ *  three failure shapes a caller has to decode separately.
+ *
+ *  `code: "not_yours"` is the stable machine-readable half (the concierge brain is an LLM reading a
+ *  tool result, and the UI decodes one code, not prose). NOT a silent `{ ok: true }` no-op: a caller
+ *  that believes it renamed an agent and did not is the failure every other handler here refuses
+ *  for, and a silent success is strictly worse than a refusal — neither the caller nor anyone
+ *  reading a log can tell it was denied.
+ *
+ *  `what` completes "is not yours to …" and `why` states the harm, so the message names the specific
+ *  field rather than a generic denial. The remedy clause is shared: it lists exactly the three
+ *  callers the predicate admits, so an agent that reads it learns the rule instead of retrying. */
+function notYours(targetId: string, what: string, why: string): Record<string, unknown> {
+  return {
+    ok: false,
+    code: "not_yours",
+    error:
+      `agent ${targetId} is not yours to ${what} — ${why}, so only the agent itself, an ` +
+      `orchestrator above it, or the concierge may write it.`,
+  };
 }
 
 /** How much of the roster get_state returns. The roster is the single largest thing this API can
@@ -974,6 +1014,18 @@ function handleGetState(req: ControlRequest): {
 function handleRename(req: ControlRequest): Record<string, unknown> {
   const targetId = resolveTargetId(req);
   if (!targetId) return targetRequired("rename_agent", req);
+  // SAME CLOSURE AS THE GOAL WRITE — this op was missed when that one was added. Until then any
+  // agent on the shared socket could rename any other: `get_state` is free-tier, so enumerating the
+  // roster is one call away, and the name is what the human reads as an agent's own account of
+  // itself. Renaming a stalled agent to something reassuring is a lie told in the operator's own
+  // trusted surface, which is the whole point of the roster.
+  if (!mayWriteAgentFieldFor(req, targetId)) {
+    return notYours(
+      targetId,
+      "rename",
+      "its name is that agent's own first-person report of what it is, and the human reads the roster as such",
+    );
+  }
   const name = req.payload.name;
   if (typeof name !== "string" || !name.trim()) return { ok: false, error: "name is required" };
   const found = findAgent(targetId);
@@ -989,6 +1041,17 @@ function handleRename(req: ControlRequest): Record<string, unknown> {
 function handleSetActivity(req: ControlRequest): Record<string, unknown> {
   const targetId = resolveTargetId(req);
   if (!targetId) return targetRequired("set_agent_activity", req);
+  // See `handleRename`: the same hole, and the more dangerous half of it. The activity line is the
+  // live "what I'm building now" the human scans to tell a working agent from a stuck one, and it is
+  // also what the app reuses as a notification body — so an unowned write both misdescribes the
+  // agent on the roster and can put attacker-chosen prose in front of the human out of band.
+  if (!mayWriteAgentFieldFor(req, targetId)) {
+    return notYours(
+      targetId,
+      "narrate",
+      "its activity line is that agent's own first-person report of what it is doing, and the human reads the roster as such",
+    );
+  }
   const activity = req.payload.activity;
   if (typeof activity !== "string") return { ok: false, error: "activity must be a string" };
   const found = findAgent(targetId);
@@ -1038,12 +1101,8 @@ function handleSetGoal(req: ControlRequest): Record<string, unknown> {
   // writes to their terminals by design. What is NOT legitimate is reaching a sibling or an unrelated
   // agent's fleet. So: yourself, your own worker subtree, or the concierge (whose reserved id the
   // bridge stamps server-side, and which is the human-driven surface).
-  if (!mayWriteGoalFor(req, targetId)) {
-    return {
-      ok: false,
-      code: "not_yours",
-      error: `agent ${targetId} is not yours to set a goal on — its text is replayed into that agent's terminal, so only the agent itself, an orchestrator above it, or the concierge may write it.`,
-    };
+  if (!mayWriteAgentFieldFor(req, targetId)) {
+    return notYours(targetId, "set a goal on", "its text is replayed into that agent's terminal");
   }
   const goal = req.payload.goal;
   if (typeof goal !== "string") return { ok: false, error: "goal must be a string" };

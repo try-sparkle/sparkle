@@ -1029,6 +1029,190 @@ describe("controlListener", () => {
     expect(lastReply()).toMatchObject({ ok: false });
   });
 
+  // ── WHO MAY WRITE ANOTHER AGENT'S NAME / ACTIVITY ───────────────────────────────────────────────
+  //
+  // `rename_agent` and `set_agent_activity` were freely targetable long after the identical hole was
+  // closed for the goal ops: `resolveTargetId` honours whatever `targetAgentId` the payload carries,
+  // so ANY agent on the shared control socket could rewrite ANY other agent's two most human-facing
+  // fields. `get_state` is free-tier, so enumerating the roster to get the ids costs one call.
+  //
+  // The blast radius is DECEPTION OF THE HUMAN, which is why these belong under the same closure as
+  // the goal write rather than being waved off as cosmetic: the human reads `name` and `activity` as
+  // an agent's own first-person report of what it is and what it is doing. A prompt-injected worker
+  // that renames a stalled agent to something reassuring, or writes a plausible activity line onto an
+  // agent doing something else, makes the roster lie in exactly the place the operator trusts it.
+  //
+  // Every case reads the target back out of `useProjectStore` and asserts the SIDE EFFECT. A handler
+  // that refused the caller and mutated the row anyway satisfies a reply-only assertion, and that is
+  // the defect shape this repo keeps shipping.
+  describe("target ownership on rename_agent / set_agent_activity", () => {
+    const agentOf = (id: string) => useProjectStore.getState().projects.flatMap((p) => p.agents).find((a) => a.id === id);
+
+    // An UNRELATED caller: a sibling build agent with no parent relationship to `callerId` in either
+    // direction, which is the ordinary shape of two agents sharing one control socket.
+    const strangerCaller = () => useProjectStore.getState().addAgent(projectId, { kind: "build" })!;
+
+    it("REFUSES an unrelated agent's rename_agent — the name is unchanged", async () => {
+      const stranger = strangerCaller();
+      // Seed a REAL name first, so "unchanged" below compares a string rather than
+      // `undefined === undefined` — which would hold against a handler that wrote nothing at all.
+      useProjectStore.getState().selfNameAgent(projectId, callerId, "Parser Builder");
+      expect(agentOf(callerId)!.name).toBe("Parser Builder");
+
+      fire({
+        reqId: "own1",
+        op: "rename_agent",
+        callerAgentId: stranger,
+        payload: { targetAgentId: callerId, name: "Definitely Healthy" },
+      });
+      await flush();
+      // The SAME typed refusal the goal ops return, so a caller and the UI decode one failure shape.
+      expect(lastReply()).toMatchObject({ ok: false, code: "not_yours" });
+      expect(agentOf(callerId)!.name).toBe("Parser Builder");
+    });
+
+    it("REFUSES an unrelated agent's set_agent_activity — the activity line is unchanged", async () => {
+      const stranger = strangerCaller();
+      useProjectStore.getState().setAgentActivity(projectId, callerId, "Chasing a flaky test");
+      expect(agentOf(callerId)!.activity).toBe("Chasing a flaky test");
+
+      fire({
+        reqId: "own2",
+        op: "set_agent_activity",
+        callerAgentId: stranger,
+        payload: { targetAgentId: callerId, activity: "All green, nearly done" },
+      });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false, code: "not_yours" });
+      expect(agentOf(callerId)!.activity).toBe("Chasing a flaky test");
+    });
+
+    // ── THE REGRESSION GUARDS ────────────────────────────────────────────────────────────────────
+    // Self-naming with the target OMITTED is the overwhelmingly common call — essentially every
+    // agent makes it in its first turn. Breaking it would be an immediate fleet-wide regression, so
+    // it is pinned explicitly rather than left to be inferred from the refusals above.
+    it("still lets an agent rename ITSELF with targetAgentId omitted", async () => {
+      fire({ reqId: "own3", op: "rename_agent", callerAgentId: callerId, payload: { name: "Control Target Ownership" } });
+      await flush();
+      expect(lastReply()).toEqual({ ok: true });
+      expect(agentOf(callerId)!.name).toBe("Control Target Ownership");
+    });
+
+    it("still lets an agent rename ITSELF when it names its OWN id explicitly", async () => {
+      // The other spelling of the same call. `caller === target` must be admitted, not caught by the
+      // "an explicit target is suspicious" reading of the closure.
+      fire({
+        reqId: "own4",
+        op: "rename_agent",
+        callerAgentId: callerId,
+        payload: { targetAgentId: callerId, name: "Self Named Explicitly" },
+      });
+      await flush();
+      expect(lastReply()).toEqual({ ok: true });
+      expect(agentOf(callerId)!.name).toBe("Self Named Explicitly");
+    });
+
+    it("still lets an agent narrate ITSELF with targetAgentId omitted", async () => {
+      fire({ reqId: "own5", op: "set_agent_activity", callerAgentId: callerId, payload: { activity: "Wiring the closure" } });
+      await flush();
+      expect(lastReply()).toEqual({ ok: true });
+      expect(agentOf(callerId)!.activity).toBe("Wiring the closure");
+    });
+
+    it("still lets an ORCHESTRATOR write its OWN worker's name and activity, at any depth", async () => {
+      // Inside the trust boundary and an advertised use: a head spawns its workers and writes to
+      // their terminals by design. The walk goes UP from the target, so depth must not matter —
+      // `grandchild` sits two hops below the caller.
+      const grandchild = useProjectStore.getState().addAgent(projectId, { kind: "worker", parentId: otherId })!;
+      expect(agentOf(grandchild)!.parentId).toBe(otherId); // the walk has something to walk
+      expect(agentOf(otherId)!.parentId).toBe(callerId);
+
+      fire({
+        reqId: "own6",
+        op: "rename_agent",
+        callerAgentId: callerId,
+        payload: { targetAgentId: grandchild, name: "Deep Worker" },
+      });
+      await flush();
+      expect(lastReply()).toEqual({ ok: true });
+      expect(agentOf(grandchild)!.name).toBe("Deep Worker");
+
+      fire({
+        reqId: "own7",
+        op: "set_agent_activity",
+        callerAgentId: callerId,
+        payload: { targetAgentId: grandchild, activity: "Running the shard" },
+      });
+      await flush();
+      expect(lastReply()).toEqual({ ok: true });
+      expect(agentOf(grandchild)!.activity).toBe("Running the shard");
+    });
+
+    it("still lets the CONCIERGE write any agent's name and activity", async () => {
+      // The third branch, and the one a subtree walk can never reach: the concierge has no roster
+      // row, so `caller === target` is false and its `parentId` chain contains nothing. It is the
+      // human-driven surface and its reserved id is stamped server-side by the bridge.
+      const stranger = strangerCaller();
+      fire({
+        reqId: "own8",
+        op: "rename_agent",
+        callerAgentId: CONCIERGE_CALLER_AGENT_ID,
+        payload: { targetAgentId: stranger, name: "Named By The Human" },
+      });
+      await flush();
+      expect(lastReply()).toEqual({ ok: true });
+      expect(agentOf(stranger)!.name).toBe("Named By The Human");
+
+      fire({
+        reqId: "own9",
+        op: "set_agent_activity",
+        callerAgentId: CONCIERGE_CALLER_AGENT_ID,
+        payload: { targetAgentId: stranger, activity: "told by the concierge" },
+      });
+      await flush();
+      expect(lastReply()).toEqual({ ok: true });
+      expect(agentOf(stranger)!.activity).toBe("told by the concierge");
+    });
+
+    // A `pusher:` caller is the concrete untrusted-prose case, mirroring the goal-op block below:
+    // a Pusher's own text is derived from its partner's terminal output, so it is exactly the caller
+    // class that must never reach a field the human reads as first-person.
+    it("REFUSES a pusher: caller writing its PARTNER's name and activity", async () => {
+      useProjectStore.getState().selfNameAgent(projectId, callerId, "Retry PR Lander");
+      useProjectStore.getState().setAgentActivity(projectId, callerId, "Draining roborev");
+
+      fire({
+        reqId: "own10",
+        op: "rename_agent",
+        callerAgentId: `pusher:${callerId}`,
+        payload: { targetAgentId: callerId, name: "Idle" },
+      });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false, code: "not_yours" });
+      expect(agentOf(callerId)!.name).toBe("Retry PR Lander");
+
+      fire({
+        reqId: "own11",
+        op: "set_agent_activity",
+        callerAgentId: `pusher:${callerId}`,
+        payload: { targetAgentId: callerId, activity: "Doing nothing" },
+      });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false, code: "not_yours" });
+      expect(agentOf(callerId)!.activity).toBe("Draining roborev");
+    });
+
+    // FAILS CLOSED on an unresolvable caller. An empty stamped id cannot establish ownership of
+    // anything, and the only safe answer to "does this anonymous caller own that agent" is no.
+    it("REFUSES a caller with no stamped id naming someone else", async () => {
+      useProjectStore.getState().selfNameAgent(projectId, otherId, "Sub Task");
+      fire({ reqId: "own12", op: "rename_agent", callerAgentId: "", payload: { targetAgentId: otherId, name: "Hijacked" } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false, code: "not_yours" });
+      expect(agentOf(otherId)!.name).toBe("Sub Task");
+    });
+  });
+
   // ── set_agent_goal — the EXIT from auto-continue ────────────────────────────────────────────
   //
   // `engine/goalContinuation.continuePrompt` types "mark it met (sparkle-control: set_agent_goal
