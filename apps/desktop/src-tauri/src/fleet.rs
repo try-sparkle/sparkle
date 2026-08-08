@@ -787,6 +787,27 @@ fn head_branch(worktree: &Path) -> Option<String> {
 /// project is not `main` in another. Keying a flat map on the branch name alone would let one
 /// project's tip answer for another's.
 fn ref_rows(worktrees: &[PathBuf], base: &str) -> HashMap<String, RefRow> {
+    ref_rows_with(worktrees, base, &|| {})
+}
+
+/// [`ref_rows`] with a hook that runs between the mtime sample and the tip read.
+///
+/// The seam exists because the ordering of those two reads IS the guard, and ordering is invisible
+/// to any test that can only observe the result: with nothing moving in between, sample-first and
+/// sample-last record the same number. The alternative — racing a thread that keeps advancing the
+/// ref and comparing elapsed times — decides a logical question by a scheduling ratio, so it can go
+/// red on correct code (one deschedule in the prelude) and green on the bug (a fast spawn on a
+/// warm, small repo). This makes the question exact instead: the hook jumps the ref's mtime by an
+/// unmistakable amount, and the recorded value either predates that jump or it does not.
+///
+/// Production passes a no-op, and that call site is not a hole: every other prepass test drives
+/// `ref_rows` through [`RefTable::tip`], so the real path is exercised throughout the suite. Only
+/// the hook itself is test-only.
+fn ref_rows_with(
+    worktrees: &[PathBuf],
+    base: &str,
+    between: &dyn Fn(),
+) -> HashMap<String, RefRow> {
     let mut rows = HashMap::new();
     // SECURITY. `base` is interpolated into the `--format` argument, and each branch name is passed
     // as a positional pattern. `validate_ref` is the existing, tested guard for both hazards: it
@@ -834,6 +855,7 @@ fn ref_rows(worktrees: &[PathBuf], base: &str) -> HashMap<String, RefRow> {
             .iter()
             .map(|(worktree, _)| (worktree.as_str(), head_ref_ms(Path::new(worktree))))
             .collect();
+        between();
 
         // Any member works as the cwd — they share one ref store, which is the premise of batching.
         let cwd = members[0].0.clone();
@@ -2749,56 +2771,51 @@ mod tests {
         // and not a sub-millisecond one, since past `REF_CHUNK_MAX_PATTERNS` branches the read is
         // several spawns and a first-chunk tip would be stat'd only after the last one returned.
         //
-        // The two orderings are told apart by advancing the ref THROUGHOUT the call: a correct
-        // implementation records a mtime from the start of the window, a sample-last one from the
-        // end, and the window spans a whole `git` spawn. The toucher renames a temp file over the
-        // ref rather than writing in place, so git can never observe a torn read — the bytes are
-        // identical every time and only the mtime moves.
+        // Asked EXACTLY rather than statistically. With nothing moving between the two reads the
+        // orderings are indistinguishable, so the hook moves the ref's mtime by an hour — far
+        // outside any filesystem's granularity — and the recorded value either predates that jump
+        // or it is the jump. No thread, no sleep, no elapsed-time ratio to be descheduled out of.
+        //
+        // WHERE `between()` FIRES IS PART OF THIS TEST. It must sit between the `sampled_ms`
+        // collect and the tip read; moved after both, every ordering records the same value and
+        // this test passes on nothing. Verified by mutation — that is the one edit that makes it
+        // vacuous rather than red, so it will not announce itself.
         let _spawns = git_lock();
         let (root, base, wts) = fleet_repo("sample-order", &["b1"]);
         let ref_file =
             crate::worktree::git_dirs(&wts[0]).1.join("refs").join("heads").join("b1");
-        let sha = std::fs::read_to_string(&ref_file).expect("the branch has a loose ref file");
+        let before = head_ref_ms(&wts[0]).expect("the branch has a loose ref file to stat");
 
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let toucher = {
-            let (stop, ref_file, sha) = (stop.clone(), ref_file.clone(), sha.clone());
-            std::thread::spawn(move || {
-                let tmp = ref_file.with_extension("mtime-touch");
-                while !stop.load(Ordering::SeqCst) {
-                    if std::fs::write(&tmp, &sha).is_ok() {
-                        let _ = std::fs::rename(&tmp, &ref_file);
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                }
-            })
-        };
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        let jumped = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        let rows = ref_rows_with(&wts, &base, &|| {
+            std::fs::File::options()
+                .write(true)
+                .open(&ref_file)
+                .and_then(|f| f.set_modified(jumped))
+                .expect("the hook must be able to move the ref's mtime");
+        });
 
-        let started = head_ref_ms(&wts[0]).expect("the ref is stat-able before the read");
-        let rows = ref_rows(&wts, &base);
-        stop.store(true, Ordering::SeqCst);
-        toucher.join().unwrap();
-        let ended = head_ref_ms(&wts[0]).expect("and after it");
+        let after = head_ref_ms(&wts[0]).expect("the ref is still stat-able");
+        // Prove the premise before leaning on it: if the hook did nothing, both orderings record
+        // the same value and the assertion below would be passing on nothing.
+        assert!(
+            after - before > 1_000_000,
+            "the hook must have moved the ref's mtime (before {before}, after {after})"
+        );
 
         let recorded = rows
             .get(&wt_str(&wts[0]))
             .expect("the prepass produced a row")
             .head_ref_ms
             .expect("and recorded a mtime for it");
-        let window = ended - started;
-        // Prove the premise before leaning on it: at `window == 0` both orderings satisfy the
-        // assertion below and the test would be passing on nothing. The floor only has to exceed
-        // mtime resolution, not the read's duration — the comparison discriminates at any window
-        // wide enough to measure, so a fast machine narrows the margin rather than inverting it.
-        // (Measured here: ~14 ms, sample-last landing at the very end of it.)
-        assert!(window >= 4, "the ref must have advanced across the read (window {window} ms)");
-        assert!(
-            recorded - started <= window / 2,
-            "the row must record the mtime from BEFORE the tip read, but it landed +{} ms into a \
-             {window} ms window — that is the sample-last ordering",
-            recorded - started
+        assert_eq!(
+            recorded, before,
+            "the row must record the mtime from BEFORE the tip read; {after} is the sample-last \
+             ordering, which would then MATCH at lookup and serve the row it should refuse"
         );
+        // …and that is precisely what makes the row refusable: what it recorded no longer matches
+        // what the ref says now, so `tip` drops it and the agent takes the per-agent path.
+        assert_ne!(recorded, after, "so the row is refused rather than trusted");
         std::fs::remove_dir_all(&root).ok();
     }
 
