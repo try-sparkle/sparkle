@@ -4,7 +4,11 @@ import {
   authorizeDecision,
   resolveSuggestionClick,
   frameSubmit,
+  frameRelaySubmit,
 } from "./relayGate";
+import { PASTE_START, PASTE_END } from "../pasteMarkers";
+
+const ESC = String.fromCharCode(27);
 
 describe("resolveSuggestionClick (the single click gate, raw value)", () => {
   const lookup = (a: string, b: string) => (a === "a1" && b === "btn1" ? "control:closeAgent" : null);
@@ -25,12 +29,38 @@ describe("resolveSuggestionClick (the single click gate, raw value)", () => {
       resolveSuggestionClick(new Set(["a1"]), { agent_id: "a1", button_id: "x" }, bigLookup),
     ).toBeNull();
   });
+
+  // The resolved value reaches the PTY (via frameRelaySubmit) OR `parseControlAction` — so it is
+  // stripped HERE, before either branch, rather than only in the framing one path takes.
+  it("strips an embedded PASTE_END from the resolved value (cannot close paste mode early)", () => {
+    const evil = () => `deploy${PASTE_END}; rm -rf ~`;
+    expect(
+      resolveSuggestionClick(new Set(["a1"]), { agent_id: "a1", button_id: "x" }, evil)?.value,
+    ).toBe("deploy; rm -rf ~");
+  });
+  it("strips an embedded PASTE_START from the resolved value", () => {
+    const evil = () => `deploy${PASTE_START}tail`;
+    expect(
+      resolveSuggestionClick(new Set(["a1"]), { agent_id: "a1", button_id: "x" }, evil)?.value,
+    ).toBe("deploytail");
+  });
+  it("strips markers reconstituted by a single removal pass (interleaved)", () => {
+    // "\x1b[20" + PASTE_END + "1~" collapses to a fresh PASTE_END after one naive pass.
+    const evil = () => `${ESC}[20${PASTE_END}1~x`;
+    const out = resolveSuggestionClick(
+      new Set(["a1"]),
+      { agent_id: "a1", button_id: "x" },
+      evil,
+    )?.value;
+    expect(out).not.toContain(PASTE_END);
+    expect(out).not.toContain(PASTE_START);
+  });
 });
 
 // Submissions terminate with CR (`\r`) — what a physical Enter sends. Raw-mode TUIs (Claude
 // Code's Ink pickers) don't treat LF as Enter, so LF-framed answers to a numbered picker vanish;
 // canonical-mode prompts still accept CR via ICRNL.
-describe("frameSubmit (PTY submission framing)", () => {
+describe("frameSubmit (LOCAL keystroke framing — CR only, no paste wrapper)", () => {
   it("adds a trailing CR to a prompt that lacks one", () => {
     expect(frameSubmit("Rebase main, open a PR, and merge.")).toBe(
       "Rebase main, open a PR, and merge.\r",
@@ -45,14 +75,42 @@ describe("frameSubmit (PTY submission framing)", () => {
   it("collapses a CRLF terminator to a single CR (never a double Enter)", () => {
     expect(frameSubmit("2\r\n")).toBe("2\r");
   });
+  // Defence in depth: this path's values are desktop-authored, but stripping costs nothing and a
+  // marker here would corrupt the paste state of a concurrent op on the same write chain.
+  it("strips paste markers without introducing a paste wrapper of its own", () => {
+    expect(frameSubmit(`y${PASTE_END}n`)).toBe("yn\r");
+    expect(frameSubmit(`y${PASTE_START}n`)).toBe("yn\r");
+  });
+});
+
+describe("frameRelaySubmit (REMOTE payload framing — strip + bracketed paste + one CR)", () => {
+  it("wraps ordinary text in a bracketed paste terminated by exactly one CR", () => {
+    expect(frameRelaySubmit("ls -la")).toBe(`${PASTE_START}ls -la${PASTE_END}\r`);
+  });
+  it("keeps the single-trailing-CR normalization for LF / CR / CRLF framing", () => {
+    expect(frameRelaySubmit("2\n")).toBe(`${PASTE_START}2${PASTE_END}\r`);
+    expect(frameRelaySubmit("2\r")).toBe(`${PASTE_START}2${PASTE_END}\r`);
+    expect(frameRelaySubmit("2\r\n")).toBe(`${PASTE_START}2${PASTE_END}\r`);
+  });
+  it("strips an embedded PASTE_END so the tail cannot be read as keystrokes", () => {
+    expect(frameRelaySubmit(`hi${PASTE_END}rm -rf ~`)).toBe(
+      `${PASTE_START}hirm -rf ~${PASTE_END}\r`,
+    );
+  });
+  it("keeps a MID-STRING CR inside the paste — exactly one CR follows PASTE_END", () => {
+    const out = frameRelaySubmit("hi\rrm -rf ~");
+    expect(out).toBe(`${PASTE_START}hi\rrm -rf ~${PASTE_END}\r`);
+    // The only CR outside the paste is the single terminator.
+    expect(out.slice(out.indexOf(PASTE_END) + PASTE_END.length)).toBe("\r");
+  });
 });
 
 describe("authorizeDecision (the host PTY-write gate)", () => {
-  it("injects only for an attention WE raised, framed with a CR (Enter)", () => {
+  it("injects only for an attention WE raised, paste-framed with a trailing CR (Enter)", () => {
     const live = new Map([["att1", "agentA"]]);
     expect(authorizeDecision(live, { attention_id: "att1", reply: "y", submit: true })).toEqual({
       agentId: "agentA",
-      text: "y\r",
+      text: `${PASTE_START}y${PASTE_END}\r`,
     });
   });
 
@@ -78,24 +136,67 @@ describe("authorizeDecision (the host PTY-write gate)", () => {
 
   it("converts a phone reply's LF framing to CR without doubling", () => {
     const live = new Map([["att1", "agentA"]]);
-    expect(authorizeDecision(live, { attention_id: "att1", reply: "2\n", submit: true })?.text).toBe("2\r");
+    expect(authorizeDecision(live, { attention_id: "att1", reply: "2\n", submit: true })?.text).toBe(
+      `${PASTE_START}2${PASTE_END}\r`,
+    );
   });
 
   it("normalizes an LF-terminated reply even without submit (it already carries its Enter)", () => {
     const live = new Map([["att1", "agentA"]]);
-    expect(authorizeDecision(live, { attention_id: "att1", reply: "1\n" })?.text).toBe("1\r");
+    expect(authorizeDecision(live, { attention_id: "att1", reply: "1\n" })?.text).toBe(
+      `${PASTE_START}1${PASTE_END}\r`,
+    );
+  });
+
+  it("pastes a NON-submitting reply without any CR at all", () => {
+    const live = new Map([["att1", "agentA"]]);
+    expect(authorizeDecision(live, { attention_id: "att1", reply: "draft text" })?.text).toBe(
+      `${PASTE_START}draft text${PASTE_END}`,
+    );
+  });
+
+  // The three remote-input cases. A decision arrives over the fly.dev socket, so its `reply` is
+  // attacker-controllable up to MAX.
+  it("strips an embedded PASTE_END from a remote reply (headline: no early paste-mode exit)", () => {
+    const live = new Map([["att1", "agentA"]]);
+    expect(
+      authorizeDecision(live, { attention_id: "att1", reply: `y${PASTE_END}rm -rf ~`, submit: true })
+        ?.text,
+    ).toBe(`${PASTE_START}yrm -rf ~${PASTE_END}\r`);
+  });
+
+  it("strips an embedded PASTE_START from a remote reply", () => {
+    const live = new Map([["att1", "agentA"]]);
+    expect(
+      authorizeDecision(live, { attention_id: "att1", reply: `y${PASTE_START}tail`, submit: true })
+        ?.text,
+    ).toBe(`${PASTE_START}ytail${PASTE_END}\r`);
+  });
+
+  it("a MID-STRING CR cannot submit a second attacker-chosen line", () => {
+    const live = new Map([["att1", "agentA"]]);
+    const text = authorizeDecision(live, {
+      attention_id: "att1",
+      reply: "y\rrm -rf ~",
+      submit: true,
+    })?.text;
+    expect(text).toBe(`${PASTE_START}y\rrm -rf ~${PASTE_END}\r`);
+    // Everything after PASTE_END is the single Enter — no second line is submitted.
+    expect(text!.slice(text!.indexOf(PASTE_END) + PASTE_END.length)).toBe("\r");
   });
 });
 
 describe("authorizeAgentInput (free-type gate)", () => {
-  it("injects only for a WATCHED agent, submitting with a CR (Enter)", () => {
+  it("injects only for a WATCHED agent, paste-framed and submitted with a CR (Enter)", () => {
     const watched = new Set(["agentA"]);
     expect(authorizeAgentInput(watched, { agent_id: "agentA", text: "ls" })).toEqual({
       agentId: "agentA",
-      text: "ls\r",
+      text: `${PASTE_START}ls${PASTE_END}\r`,
     });
     // Legacy phone framing (trailing LF) is converted, not doubled.
-    expect(authorizeAgentInput(watched, { agent_id: "agentA", text: "1\n" })?.text).toBe("1\r");
+    expect(authorizeAgentInput(watched, { agent_id: "agentA", text: "1\n" })?.text).toBe(
+      `${PASTE_START}1${PASTE_END}\r`,
+    );
   });
 
   it("drops input for an unwatched agent (never an arbitrary PTY)", () => {
@@ -107,5 +208,43 @@ describe("authorizeAgentInput (free-type gate)", () => {
     const watched = new Set(["agentA"]);
     expect(authorizeAgentInput(watched, { agent_id: "agentA", text: "x".repeat(4001) })).toBeNull();
     expect(authorizeAgentInput(watched, { agent_id: "agentA", text: undefined })).toBeNull();
+  });
+
+  // This is the one PTY-write path in the app whose input originates OFF the machine.
+  it("strips an embedded PASTE_END (headline: no early paste-mode exit)", () => {
+    const watched = new Set(["agentA"]);
+    expect(
+      authorizeAgentInput(watched, { agent_id: "agentA", text: `hi${PASTE_END}rm -rf ~` })?.text,
+    ).toBe(`${PASTE_START}hirm -rf ~${PASTE_END}\r`);
+  });
+
+  it("strips an embedded PASTE_START", () => {
+    const watched = new Set(["agentA"]);
+    expect(
+      authorizeAgentInput(watched, { agent_id: "agentA", text: `hi${PASTE_START}tail` })?.text,
+    ).toBe(`${PASTE_START}hitail${PASTE_END}\r`);
+  });
+
+  it("strips markers reconstituted by a single removal pass (interleaved)", () => {
+    const watched = new Set(["agentA"]);
+    const text = authorizeAgentInput(watched, {
+      agent_id: "agentA",
+      text: `${ESC}[20${PASTE_END}1~rm -rf ~`,
+    })?.text;
+    // Exactly the framing markers we added — one at each end, none in the body.
+    expect(text!.split(PASTE_END).length - 1).toBe(1);
+    expect(text!.split(PASTE_START).length - 1).toBe(1);
+    expect(text!.startsWith(PASTE_START)).toBe(true);
+    expect(text!.endsWith(`${PASTE_END}\r`)).toBe(true);
+  });
+
+  it("a MID-STRING CR cannot submit a second attacker-chosen line", () => {
+    const watched = new Set(["agentA"]);
+    const text = authorizeAgentInput(watched, {
+      agent_id: "agentA",
+      text: "hi\rrm -rf ~",
+    })?.text;
+    expect(text).toBe(`${PASTE_START}hi\rrm -rf ~${PASTE_END}\r`);
+    expect(text!.slice(text!.indexOf(PASTE_END) + PASTE_END.length)).toBe("\r");
   });
 });

@@ -27,7 +27,8 @@ import {
   authorizeAgentInput,
   authorizeDecision,
   resolveSuggestionClick,
-  frameSubmit,
+  frameRelaySubmit,
+  type FramedPtyText,
   type AgentInputPayload,
   type DecisionPayload,
   type SuggestionClickPayload,
@@ -165,6 +166,23 @@ export function lookupSuggestionValue(agentId: string, buttonId: string): string
   return suggestionsByAgent.get(agentId)?.get(buttonId) ?? null;
 }
 
+/**
+ * THE ONE PTY WRITE IN THIS FILE. Every remote path funnels through it, and it accepts only
+ * {@link FramedPtyText} — a type a plain `string` cannot satisfy — so a handler added later cannot
+ * hand a raw socket payload to a PTY without `tsc` rejecting it. That is the whole point: the
+ * stripping and bracketed-paste framing in `relayGate` were a convention until this signature made
+ * skipping them a compile error (see relayGate's `FramedPtyText`).
+ *
+ * Chained, not raw: a relayed payload carries its own CR and must not land inside another
+ * operation's paste→CR window (pty.writePtyChained, roborev 54375). Fire-and-forget with a debug
+ * log — nothing here is claiming delivery to the phone, and PTY teardown is an expected race.
+ */
+function writeFramedToPty(agentId: string, text: FramedPtyText, what: string): void {
+  void writePtyChained(agentId, text).catch((e) =>
+    console.debug(`relay ${what} writePty failed`, e),
+  );
+}
+
 /** Start (idempotent) the relay host connection. No-op if not signed in. */
 export async function startRelayHost(): Promise<void> {
   if (socket || connecting) return; // serialize across the async gap (StrictMode double-mount)
@@ -263,11 +281,7 @@ export async function startRelayHost(): Promise<void> {
   // The phone typed free text into a watched agent — authorize + inject (gate: relayGate).
   socket.on("agent_input", (i: AgentInputPayload) => {
     const w = authorizeAgentInput(watched, i);
-    if (w) {
-      void writePtyChained(w.agentId, w.text).catch((e) =>
-        console.debug("relay agent_input writePty failed", e),
-      );
-    }
+    if (w) writeFramedToPty(w.agentId, w.text, "agent_input");
   });
 
   // The phone tapped a suggestion button — resolve it back to the exact value WE pushed for that
@@ -308,19 +322,17 @@ export async function startRelayHost(): Promise<void> {
         .catch((e) => console.debug("relay suggestion_click closeAgent failed", e));
       return;
     }
-    void writePtyChained(r.agentId, frameSubmit(r.value)).catch((e) =>
-      console.debug("relay suggestion_click writePty failed", e),
-    );
+    // `frameRelaySubmit`, not `frameSubmit`: everything this file writes to a PTY came in over the
+    // remote socket, so it takes the bracketed-paste framing (see relayGate's header). The value
+    // itself was resolved from what the desktop pushed rather than sent by the phone, but it is
+    // derived from the agent's own screen, so it is framed like the other two relay paths.
+    writeFramedToPty(r.agentId, frameRelaySubmit(r.value), "suggestion_click");
   });
 
   // The phone answered an attention — authorize + inject into that agent's PTY (gate: relayGate).
   socket.on("decision", (d: DecisionPayload) => {
     const w = authorizeDecision(liveAttentions, d);
-    if (w) {
-      void writePtyChained(w.agentId, w.text).catch((e) =>
-        console.debug("relay decision writePty failed", e),
-      );
-    }
+    if (w) writeFramedToPty(w.agentId, w.text, "decision");
   });
 }
 

@@ -1,6 +1,34 @@
-// Pure authorization for what a phone may inject into a local agent's PTY. Kept separate from
-// the socket plumbing so the security-critical gates are unit-testable. A phone (the user's
-// remote) can drive a PTY only via these two paths; everything else is dropped.
+// Authorization AND framing for what a phone may inject into a local agent's PTY. Kept separate
+// from the socket plumbing so the security-critical gates are unit-testable. A phone (the user's
+// remote) can drive a PTY only via these three paths; everything else is dropped.
+//
+// THIS IS THE ONE PTY-WRITE SURFACE IN THE APP WHOSE INPUT ORIGINATES OFF THE MACHINE. The
+// payloads arrive as `agent_input` / `decision` / `suggestion_click` frames over the remote
+// sparkle-orchestration socket, and the Rust side writes them to the pty verbatim
+// (`writer.write_all(data.as_bytes())` — a pty write legitimately carries arbitrary bytes, so
+// there is no filtering there by design). Everything downstream of this file therefore trusts
+// that what leaves here is already safe to hand to a running CLI.
+//
+// Two things a raw remote string could do, both of which these framers close:
+//   1. An embedded `ESC[201~` CLOSES bracketed-paste mode mid-payload, so the remainder is read as
+//      live KEYSTROKES by whatever is running — an Ink picker, or a bare shell before `claude`
+//      execs. `ESC[200~`/`ESC[201~` can also corrupt the paste state of a concurrent operation
+//      chained on the same agent's `ptyWriteChains`. (pty.ts's note on roborev 2197 / 54397 —
+//      this guard has been written, lost to a second call site, and re-written before.)
+//   2. An embedded mid-string `\r` submits a SECOND, attacker-chosen line, which the "one
+//      authorized input" model these gates implement never intended to permit.
+//
+// The defence is the same one every other non-live-keystroke write path already runs
+// (`pty.deliverSubmit`, `pty.pasteIntoPty`, `conciergeDispatch.frameCloudSubmit`): strip embedded
+// paste markers, then wrap the body in one bracketed paste. `stripPasteMarkers` is IMPORTED, never
+// re-implemented — a near-duplicate of a security filter is exactly how one copy gets fixed and
+// the other does not, which is the bug class this file is closing.
+//
+// Imported from the LEAF `../pasteMarkers`, not from `../pty` which re-exports it: `pty` is the
+// module 45 suites replace wholesale with `vi.mock`, and reaching the filter through it would hand
+// this file `undefined` inside any of them — a guard that disappears exactly where the PTY is
+// faked. A leaf with no imports cannot be collaterally stubbed.
+import { PASTE_START, PASTE_END, stripPasteMarkers } from "../pasteMarkers";
 
 export interface DecisionPayload {
   attention_id?: string;
@@ -16,9 +44,26 @@ export interface SuggestionClickPayload {
   agent_id?: string;
   button_id?: string;
 }
+declare const RELAY_FRAMED: unique symbol;
+/**
+ * A string that has been through this module's framing and is therefore safe to hand to a PTY.
+ *
+ * THE STRUCTURAL BACKSTOP for everything the header describes. Without it, the safety of this path
+ * is a TypeScript-side CONVENTION: a `socket.on(...)` handler added next quarter can call
+ * `writePtyChained(id, payload.text)` with the raw remote string and silently reintroduce the bug,
+ * exactly as roborev 54397 reintroduced 2197's by adding a caller that did not know about the
+ * guard. A plain `string` cannot be assigned to this type, so `relayClient`'s write helper — which
+ * accepts only `FramedPtyText` — turns "I forgot to frame it" into a COMPILE ERROR instead of a
+ * silent remote-code-execution hole.
+ *
+ * The brand exists only in the type system; at runtime these are ordinary strings.
+ */
+export type FramedPtyText = string & { readonly [RELAY_FRAMED]: true };
+
 export interface PtyWrite {
   agentId: string;
-  text: string;
+  /** Already stripped and bracketed-paste framed — see {@link FramedPtyText}. */
+  text: FramedPtyText;
 }
 
 const MAX = 4000;
@@ -34,7 +79,43 @@ function terminateSubmit(value: string): string {
   // Strip the ENTIRE existing terminator (LF, CR, or CRLF) before appending exactly one CR — a
   // CRLF-framed value must not become "\r\r" (two Enters: answer the picker, then blindly
   // confirm whatever renders next).
-  return `${value.replace(/\r?\n$|\r$/, "")}\r`;
+  return `${stripTerminator(value)}\r`;
+}
+
+/** The trailing-terminator normalization on its own, so the paste-framed form below can reuse it
+ *  and the "exactly one CR, never two Enters" rule stays stated in ONE place. */
+function stripTerminator(value: string): string {
+  return value.replace(/\r?\n$|\r$/, "");
+}
+
+/**
+ * Wrap a body in one bracketed paste, with any embedded markers stripped first.
+ *
+ * The strip must happen INSIDE the wrapper's construction, not at the call sites: a body that
+ * still carried `ESC[201~` would terminate the very paste we are opening here and have its tail
+ * read as keystrokes (see the header).
+ */
+function framePaste(body: string): FramedPtyText {
+  // The ONE place the brand is minted, and it sits directly on top of the strip — so a value can
+  // only acquire the type by actually having been stripped and wrapped.
+  return `${PASTE_START}${stripPasteMarkers(body)}${PASTE_END}` as FramedPtyText;
+}
+
+/**
+ * The wire form of a REMOTE (phone-relay) submission: strip, bracket-paste, then exactly one CR.
+ *
+ * ONE STRING, NOT TWO WRITES, which is the difference from the local `pty.deliverSubmit` rather
+ * than an omission — the same reasoning `conciergeDispatch.frameCloudSubmit` records. These gates
+ * hand a single value to a single `writePtyChained` call, so the paste and its Enter cannot be
+ * reordered against each other or have an unrelated chained write land between them; splitting
+ * them into two writes would open exactly the paste→CR window `ptyWriteChains` exists to close.
+ *
+ * `terminateSubmit`'s single-trailing-CR semantics are preserved exactly: the existing terminator
+ * (LF, CR or CRLF) is stripped from the BODY, and one CR is appended AFTER `PASTE_END` so it is
+ * still the Enter a raw-mode Ink picker requires. Only the framing is new.
+ */
+export function frameRelaySubmit(value: string): FramedPtyText {
+  return `${framePaste(stripTerminator(value))}\r` as FramedPtyText;
 }
 
 /**
@@ -53,8 +134,15 @@ export function authorizeDecision(
   if (typeof d.reply !== "string" || d.reply.length > MAX) return null;
   liveAttentions.delete(d.attention_id); // one decision per raised attention
   // The phone frames replies with a trailing LF; submit means "press Enter", so normalize to CR
-  // either way (see terminateSubmit) — a reply that already carries its newline still gets fixed.
-  const text = d.submit || d.reply.endsWith("\n") ? terminateSubmit(d.reply) : d.reply;
+  // either way (see frameRelaySubmit) — a reply that already carries its newline still gets fixed.
+  //
+  // BOTH branches are paste-framed, because both write `d.reply` — a remote, attacker-shaped
+  // string of up to MAX chars — into the PTY. The no-submit branch mirrors `pty.pasteIntoPty`
+  // (paste, no CR: the text sits in the prompt for the human to send); the submit branch mirrors
+  // `pty.deliverSubmit`. Framing the no-submit branch matters just as much: without it an embedded
+  // `ESC[200~` left the NEXT chained operation's paste state corrupted.
+  const text =
+    d.submit || d.reply.endsWith("\n") ? frameRelaySubmit(d.reply) : framePaste(d.reply);
   return { agentId, text };
 }
 
@@ -69,14 +157,17 @@ export function authorizeAgentInput(
 ): PtyWrite | null {
   if (!i || typeof i.agent_id !== "string" || !watched.has(i.agent_id)) return null;
   if (typeof i.text !== "string" || i.text.length > MAX) return null;
-  return { agentId: i.agent_id, text: terminateSubmit(i.text) };
+  // The widest of the three: free text, straight off the socket, up to MAX chars. Paste-framed for
+  // the reasons in the header — this is the payload an attacker actually gets to author.
+  return { agentId: i.agent_id, text: frameRelaySubmit(i.text) };
 }
 
 /**
  * The single authorization gate for a phone suggestion click: allowed ONLY for a watched agent and
  * a button id the desktop actually pushed (resolved via `lookup`). Returns the target agent + the
- * RAW pushed value (un-framed), or null. Both the PTY-write path and the control-action path branch
- * off this one result, so the gate can never diverge.
+ * pushed value, marker-stripped but UNWRAPPED (no bracketed paste, no CR), or null. Both the
+ * PTY-write path and the control-action path branch off this one result, so the gate can never
+ * diverge — which is also why the value stays unwrapped here and is framed by the write branch.
  */
 export function resolveSuggestionClick(
   watched: Set<string>,
@@ -87,12 +178,35 @@ export function resolveSuggestionClick(
   if (typeof c.button_id !== "string") return null;
   const value = lookup(c.agent_id, c.button_id);
   if (value == null || value.length > MAX) return null;
-  return { agentId: c.agent_id, value };
+  // Stripped HERE rather than in the framing, because this is the one gate whose result FORKS: the
+  // caller reads the raw value with `parseControlAction` before deciding between an app action and
+  // a PTY write, so a wrapper applied here would break that parse and a strip applied only in the
+  // write branch would leave the other one unguarded.
+  //
+  // Constrained, but NOT to a fixed set — which is why it is filtered like the other two rather
+  // than exempted. The phone sends only a button id, and the value is whatever the DESKTOP pushed
+  // for it, so no remote text reaches this line. But those values are derived from the agent's own
+  // terminal output (`suggestions/useSuggestions` parses live picker options off the screen), so
+  // they are CLI/model-authored strings, not an enum this file could enumerate.
+  return { agentId: c.agent_id, value: stripPasteMarkers(value) };
 }
 
-/** Frame a value for SUBMISSION into the PTY: ensure exactly one trailing CR (Enter) so the
- *  prompt is actually entered. Values authored with `\n` (e.g. heuristic buttons' "2\n") are
- *  normalized, not doubled. */
+/**
+ * Frame a value for SUBMISSION into the PTY as a KEYSTROKE: exactly one trailing CR (Enter) so the
+ * prompt is actually entered, and no paste wrapper. Values authored with `\n` (e.g. heuristic
+ * buttons' "2\n") are normalized, not doubled.
+ *
+ * DELIBERATELY NOT PASTE-FRAMED, unlike {@link frameRelaySubmit}. This is the LOCAL picker-answer
+ * form — `conciergeDispatch` sends `frameSubmit(match.value)` for a desktop click, and pty.ts's
+ * `writePtyChained` note describes exactly this shape ("these payloads carry their OWN carriage
+ * return"). Wrapping a one-key picker answer in a bracketed paste would change what the desktop
+ * has always sent for a click, which is a behaviour change in a path this security fix has no
+ * finding against; the remote path gets the stronger framing because it is the remote path.
+ *
+ * It DOES strip paste markers, which is free and cannot change how a picker reads a legitimate
+ * answer: no real "2" / "y" / option label contains an ESC. Worth having anyway — such a marker
+ * would corrupt the paste state of whatever else is queued on the same agent's `ptyWriteChains`.
+ */
 export function frameSubmit(value: string): string {
-  return terminateSubmit(value);
+  return terminateSubmit(stripPasteMarkers(value));
 }

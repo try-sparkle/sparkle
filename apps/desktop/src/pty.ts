@@ -89,33 +89,15 @@ async function writePtyStrict(id: string, data: string): Promise<void> {
   }
 }
 
-// Bracketed-paste wrappers: ESC[200~ … ESC[201~. ESC is char code 27 — constructed here so
-// the source contains no literal ESC byte. Pasting (vs. raw typing) lets the CLI treat a
-// multi-line prompt as one atomic block.
-const ESC = String.fromCharCode(27);
-export const PASTE_START = `${ESC}[200~`;
-export const PASTE_END = `${ESC}[201~`;
-
-/**
- * Neutralize bracketed-paste markers embedded in text we are about to wrap in a paste, so the
- * content can't terminate paste mode early and have its tail interpreted as KEYSTROKES by the
- * running CLI (roborev 2197). Applies to anything the user didn't type at the terminal themselves —
- * a terminal selection, a dropped file's path.
- *
- * A single split/join pass is insufficient: removing a marker can reconstitute a new one from its
- * neighbors (e.g. "\x1b[20\x1b[201~1~" → "\x1b[201~" after one pass). Loop until stable so no marker
- * survives regardless of how deeply it is interleaved (roborev 2210).
- *
- * Lives here, beside the markers it strips, rather than beside any one caller: it is a property of
- * the paste framing, and a second private copy is how one call site quietly loses the guard.
- */
-export function stripPasteMarkers(s: string): string {
-  let t = s;
-  while (t.includes(PASTE_START) || t.includes(PASTE_END)) {
-    t = t.split(PASTE_START).join("").split(PASTE_END).join("");
-  }
-  return t;
-}
+// Bracketed-paste wrappers and their filter now live in the LEAF module `./pasteMarkers`, and are
+// re-exported here so every existing `from "../pty"` importer is unchanged.
+//
+// They moved because this module is the one 45 suites stub with a wholesale
+// `vi.mock("../pty", () => ({ … }))`. Anything reaching `stripPasteMarkers` THROUGH here became
+// `undefined` in those suites — a security filter that silently vanishes wherever the PTY is faked.
+// A leaf with no imports of its own cannot be collaterally stubbed. See `pasteMarkers.ts`.
+import { PASTE_START, PASTE_END, stripPasteMarkers } from "./pasteMarkers";
+export { PASTE_START, PASTE_END, stripPasteMarkers } from "./pasteMarkers";
 
 /** Gap between the bracketed paste and the carriage return, so the CLI has finished ingesting
  *  the paste before the Enter arrives. */
