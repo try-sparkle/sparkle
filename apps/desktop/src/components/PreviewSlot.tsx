@@ -33,7 +33,7 @@ import { PLAN_COLUMN_Z } from "./layers";
 import { PlanBuildToggle } from "./PlanBuildToggle";
 import { useUiStore } from "../stores/uiStore";
 import { useSettingsStore } from "../stores/settingsStore";
-import { usePreviewStore } from "../stores/previewStore";
+import { usePreviewStore, type PreviewState } from "../stores/previewStore";
 import { isLoopbackPreviewUrl } from "../services/preview";
 import type { PairSide } from "../engine/pairs";
 import type { Project } from "../types";
@@ -60,9 +60,47 @@ export const PREVIEW_SANDBOX_TOKENS = [
   "allow-same-origin",
 ] as const;
 
-/** The `state`s that mean "there is nothing to render and something to say". */
-function isFailedState(status: string | undefined): boolean {
-  return status === "failed" || status === "crashed";
+/**
+ * WHICH PANE A STATE GETS — the ONE mapping, and the thing that actually decides what renders.
+ *
+ * Previously this was a conditional chain plus a separate exhaustive `switch` that shadowed it. The
+ * shadow was worse than nothing: the pairing lived in trailing comments, so DELETING a JSX branch
+ * still typechecked (the `case` remained), and when the union grew, the one-keystroke way to clear
+ * the compile error was to add the new member to the fall-through group — satisfying `tsc` while the
+ * pane rendered "Sparkle does not recognise this state" for a state this build names. A second copy
+ * of a list is not a pin on the first.
+ *
+ * `Record<PreviewState, …>` is total, so a new union member fails to compile HERE, at the thing that
+ * decides what renders — not in a shadow list beside it. What this does NOT do, said plainly rather
+ * than claimed away: deleting one of the JSX branches below still typechecks, because the map only
+ * says which pane a state wants, not that the pane exists. That half is covered by tests instead —
+ * `Workspace.previewSlot.test.tsx` asserts `stopped`, `starting`, the three framable states, an
+ * unrecognised state and no-entry each render their own testid, so a deleted branch reds there.
+ *
+ * `"framable"` is a REQUEST, not a verdict: the url still has to pass `isLoopbackPreviewUrl`, and a
+ * listening server whose url is refused renders the refusal instead. That is why this maps to a pane
+ * KIND rather than to a testid.
+ */
+type PreviewPane = "framable" | "starting" | "stopped" | "failed";
+
+const PANE_FOR: Record<PreviewState, PreviewPane> = {
+  starting: "starting",
+  listening: "framable",
+  ready: "framable",
+  serving: "framable",
+  failed: "failed",
+  crashed: "failed",
+  stopped: "stopped",
+};
+
+/**
+ * The pane for a status the wire actually sent. `undefined` means THIS BUILD HAS NO NAME FOR IT —
+ * `applyPreviewStatus` writes `state` into the store unvalidated, so a desktop older than the agent
+ * that started the server lands here, and no compile-time check can see a value from another
+ * process.
+ */
+function paneFor(status: string | undefined): PreviewPane | undefined {
+  return status === undefined ? undefined : PANE_FOR[status as PreviewState];
 }
 
 export function PreviewSlot({ project, side }: { project: Project; side: PairSide }) {
@@ -80,10 +118,20 @@ export function PreviewSlot({ project, side }: { project: Project; side: PairSid
   // url reached us over a bridge from another process; that process's gate is a claim about a
   // different binary's build, and this side is what actually renders. See `isLoopbackPreviewUrl`.
   const url = entry?.url ?? null;
-  const framable = useMemo(() => isLoopbackPreviewUrl(url), [url]);
+  const loopbackOk = useMemo(() => isLoopbackPreviewUrl(url), [url]);
 
-  const failed = isFailedState(entry?.status);
-  const refused = !!url && !framable;
+  const pane = paneFor(entry?.status);
+  const failed = pane === "failed";
+  // A refusal is about the ADDRESS, so it is judged on the url alone — a server that is merely not
+  // up yet has not been refused anything.
+  const refused = !!url && !loopbackOk;
+  // WE ONLY FRAME A SERVER THAT IS ACTUALLY LISTENING, which is a separate question from whether
+  // the address is allowed. Rust knows the url before the server is up ("the URL is knowable
+  // because the port was FORCED"), so gating the iframe on the url's presence mounted it against a
+  // dead port: the user got the webview's connection-refused page, and since `src` and `key` never
+  // change afterwards it STAYED there — a preview that looks broken for the entire cold start,
+  // recoverable only by pressing Reload by hand. `preview-starting` was unreachable on that path.
+  const framable = loopbackOk && pane === "framable";
 
   return (
     <div
@@ -167,16 +215,51 @@ export function PreviewSlot({ project, side }: { project: Project; side: PairSid
               background: "#fff",
             }}
           />
-        ) : entry ? (
+        ) : pane === "stopped" ? (
+          // STOPPED IS ITS OWN ANSWER, and it must not fall into the branch below. `stopped` is a
+          // RETAINED entry — `clearPreview` runs only from `stopPreviewForAgent`, and the stopped
+          // event still carries the loopback url — so once framing became conditional on a live
+          // state, a stopped server matched "entry exists, not framable" and the pane claimed to be
+          // starting a server nobody had asked for, permanently. The cost of getting this wrong is
+          // not cosmetic: it is the pane asserting work that is not happening.
+          <PreviewMessage
+            testId="preview-stopped"
+            icon={null}
+            title="The dev server was stopped"
+            detail="Open the preview again from that agent's card in the Build column to start a fresh one."
+          />
+        ) : pane === "starting" ? (
           <PreviewMessage
             testId="preview-starting"
             icon={null}
             title="Starting the dev server…"
-            detail={
-              entry.status === "listening" || entry.status === "ready"
-                ? "It is up and compiling the first page."
-                : "This takes a few seconds on a cold start, and longer if dependencies are still installing."
-            }
+            // GATED ON `starting` BY NAME, not on "an entry exists". This used to branch on
+            // `listening`/`ready` for "It is up and compiling the first page" — copy that became
+            // unreachable when those states started framing — and the fall-through it left behind
+            // then swallowed `stopped` (above). Naming the state is what keeps the title honest.
+            detail="This takes a few seconds on a cold start, and longer if dependencies are still installing."
+          />
+        ) : entry ? (
+          // AN ENTRY WE DO NOT RECOGNISE IS NOT "no preview running", and telling the user there is
+          // none — with no Reload button, since that is gated on `framable` — is the worse half of
+          // the bug the `stopped` branch just fixed: a live server reported as absent. This is
+          // reachable rather than theoretical: `applyPreviewStatus` passes the wire's `state`
+          // straight into the store with no validation, so a state this build's union does not name
+          // lands HERE. Two other mechanisms cover the neighbouring halves, and this comment named
+          // neither correctly until now — it cited `PREVIEW_STATE_IS_HANDLED`, a symbol that no
+          // longer exists, and claimed nothing ties the Rust enum to this union, which stopped
+          // being true in the same commit that deleted it:
+          //   * `PANE_FOR` (ABOVE) is a total `Record<PreviewState, …>`, so adding a union member
+          //     without deciding what it renders is a COMPILE error.
+          //   * `previewSeam.test.ts` reads `pub enum PreviewState` out of preview.rs and compares
+          //     it to the union, so a Rust variant added without updating the union REDS.
+          // What neither can cover is the wire arriving ahead of the types — an older desktop build
+          // talking to a newer agent — which is this branch.
+          <PreviewMessage
+            testId="preview-unknown"
+            icon={null}
+            title="This preview is in a state Sparkle does not recognise"
+            detail={`The server reported "${String(entry.status)}". It may still be running — reopen the preview from that agent's card, and if this persists the desktop app is older than the agent that started it.`}
           />
         ) : (
           // No entry at all is a DIFFERENT fact from `stopped`, and the copy says so rather than

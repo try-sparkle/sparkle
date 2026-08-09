@@ -447,6 +447,104 @@ describe("the preview slot covers its pair", () => {
     expect(screen.getByTestId("preview-failed-detail").textContent).toContain("Cannot find module");
   });
 
+  // THE COLD START, and the bug it replaces was invisible in every other test because they all
+  // seed `serving`. Rust knows the url BEFORE the server is up — it forced the port — so a
+  // `starting` entry carries a perfectly good loopback url. Framing on the url's presence therefore
+  // mounted the iframe against a port nothing was listening on: the user got the webview's
+  // connection-refused page for the whole cold start, and since `src` and `key` never change
+  // afterwards it stayed there until they pressed Reload by hand. `preview-starting` was
+  // unreachable on the forced-port path, which is every path.
+  it("shows STARTING, not a dead frame, while the server is still coming up", () => {
+    usePreviewStore.setState({
+      byAgent: {
+        a2: {
+          id: "srv-1", status: "starting", url: "http://127.0.0.1:5199/", port: 5199,
+          error: null, startedAt: 0, reloadNonce: 0,
+        },
+      },
+    });
+    render(<Workspace />);
+    previewOn("left");
+
+    expect(previewColumn("left").querySelector("[data-testid='preview-frame']")).toBe(null);
+    expect(screen.getByTestId("preview-starting")).toBeTruthy();
+    // And NOT the refusal: the address is fine, the server merely is not up yet. Those are
+    // different facts and the pane must not blame the url for a cold start.
+    expect(previewColumn("left").querySelector("[data-testid='preview-refused']")).toBe(null);
+  });
+
+  // THE PAIR TO IT. Without this the test above could pass against a slot that never frames
+  // anything — the assertion is an absence, and an absence is satisfied by a broken component.
+  it.each(["listening", "ready", "serving"] as const)(
+    "frames the server once it reports %s",
+    (status) => {
+      usePreviewStore.setState({
+        byAgent: {
+          a2: {
+            id: "srv-1", status, url: "http://127.0.0.1:5199/", port: 5199,
+            error: null, startedAt: 0, reloadNonce: 0,
+          },
+        },
+      });
+      render(<Workspace />);
+      previewOn("left");
+
+      const frame = previewColumn("left").querySelector("[data-testid='preview-frame']");
+      expect(frame).toBeTruthy();
+      expect(frame?.getAttribute("src")).toBe("http://127.0.0.1:5199/");
+    },
+  );
+
+  // THE STATE THE ALLOWLIST NEARLY SWALLOWED. `stopped` is a RETAINED entry — `clearPreview` runs
+  // only from `stopPreviewForAgent`, and the stopped event still carries the loopback url — so once
+  // framing required a live state, "entry exists and is not framable" caught it and the pane
+  // announced a cold start for a server the user had deliberately stopped, permanently. A pane
+  // asserting work that is not happening is worse than one saying nothing.
+  it("says the server was STOPPED rather than claiming it is starting", () => {
+    usePreviewStore.setState({
+      byAgent: {
+        a2: {
+          id: "srv-1", status: "stopped", url: "http://127.0.0.1:5199/", port: 5199,
+          error: null, startedAt: 0, reloadNonce: 0,
+        },
+      },
+    });
+    render(<Workspace />);
+    previewOn("left");
+
+    expect(screen.getByTestId("preview-stopped")).toBeTruthy();
+    const col = previewColumn("left");
+    expect(col.querySelector("[data-testid='preview-starting']")).toBe(null);
+    expect(col.querySelector("[data-testid='preview-frame']")).toBe(null);
+    // Nor is it the no-entry copy: "we stopped it" and "there was never one" are different facts,
+    // and the store's own comment is what says they must stay distinguishable.
+    expect(col.querySelector("[data-testid='preview-empty']")).toBe(null);
+  });
+
+  // A STATE THIS BUILD DOES NOT KNOW IS NOT "no preview running". `applyPreviewStatus` passes the
+  // wire's `state` into the store unvalidated, so a desktop build older than the agent that started
+  // the server sees exactly this — and the previous fall-through told the user there was no preview
+  // for a server that was live, with no Reload button (gated on framable) and no way to tell.
+  // Cast because the whole point is a value outside the union.
+  it("names an unrecognised state instead of claiming there is no preview", () => {
+    usePreviewStore.setState({
+      byAgent: {
+        a2: {
+          id: "srv-1", status: "installing" as never, url: "http://127.0.0.1:5199/", port: 5199,
+          error: null, startedAt: 0, reloadNonce: 0,
+        },
+      },
+    });
+    render(<Workspace />);
+    previewOn("left");
+
+    const col = previewColumn("left");
+    expect(screen.getByTestId("preview-unknown")).toBeTruthy();
+    expect(screen.getByTestId("preview-unknown-detail").textContent).toContain("installing");
+    expect(col.querySelector("[data-testid='preview-empty']")).toBe(null);
+    expect(col.querySelector("[data-testid='preview-starting']")).toBe(null);
+  });
+
   it("says so plainly when the agent has no preview at all", () => {
     usePreviewStore.setState({ byAgent: {} });
     render(<Workspace />);

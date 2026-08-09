@@ -92,15 +92,17 @@ export async function refreshPreviewCapability(
     usePreviewStore.getState().setCapability(projectId, cap);
     return cap;
   } catch (e) {
-    // FAIL CLOSED, AND SAY SO. An unreadable probe is not "previewable"; recording false here is
-    // what keeps a broken bridge from offering a button that cannot work. It is re-askable — the
-    // next selection re-runs it — so this is not a sticky verdict.
+    // FAIL CLOSED, BUT RECORD NOTHING — and the distinction is the whole point. This used to write
+    // `{previewable: false}`, which reads identically to a project that genuinely has no dev
+    // server; the caller's gate is `capability[id] !== undefined`, so a recorded failure satisfied
+    // it and the probe was never asked again. One transient miss (bridge not up yet, a momentarily
+    // unreadable directory, a spawn_blocking task error) therefore disabled the preview for the
+    // whole session, while this function's own comment claimed the verdict was re-askable.
+    //
+    // Leaving the entry UNSET fails closed just as hard — an absent capability reads as false
+    // everywhere, so no affordance appears — and it is the only value the gate will ask about
+    // again. "We could not look" and "we looked and the answer is no" are different facts.
     console.debug("preview_capability failed", e);
-    usePreviewStore.getState().setCapability(projectId, {
-      previewable: false,
-      target: null,
-      declineReason: String(e),
-    });
     return null;
   }
 }
@@ -121,10 +123,14 @@ export interface PreviewOpened {
 }
 
 /** The Rust refusal a caller must NOT paint as a failed start — `preview.rs`'s
- *  `PreviewManager::reserve_or_reattach`. Matched as a substring because the message carries a
- *  `preview:` prefix and crosses the IPC boundary as a bare string; the Rust text and this constant
- *  are pinned to each other by `preview.rs`'s reservation test and `AgentSidebar.openPreview.test`. */
-export const PREVIEW_ALREADY_STARTING = "already starting";
+ *  `PreviewManager::reserve_or_reattach`, whose `ALREADY_STARTING` const holds this same literal.
+ *
+ *  A HYPHENATED TOKEN, NOT PROSE, and that is the point: the message crosses the IPC boundary as a
+ *  bare string, so this seam is two languages hand-copying English. Reword either side and both
+ *  suites stay green while the pane paints its TERMINAL `failed` state over a start that is healthy
+ *  and still running. `previewSeam.test.ts` reads `preview.rs` and asserts the two literals agree,
+ *  which is the only mechanical pin available short of generating one side from the other. */
+export const PREVIEW_ALREADY_STARTING = "already-starting";
 
 /** Start a preview for an agent, or RE-ATTACH to the one already running for it.
  *
@@ -135,10 +141,15 @@ export const PREVIEW_ALREADY_STARTING = "already starting";
  *  rather than handing back the corpse.
  *
  *  A call made while a start for the same agent is STILL IN FLIGHT — the seconds before the new
- *  server exists to re-attach to — REJECTS with "a server for this agent is already starting"
- *  rather than spawning a rival. Callers that surface errors to the user (AgentSidebar writes the
- *  pane's `failed` state) should expect that string on a double click; it is a refusal, not a
- *  failed start, and the in-flight start goes on to populate the pane by event.
+ *  server exists to re-attach to — REJECTS rather than spawning a rival. **Match that rejection
+ *  with `PREVIEW_ALREADY_STARTING`, never by retyping the sentence.** This doc used to quote the
+ *  prose ("…is already starting", with a space) twelve lines below the constant, which is the
+ *  hyphenated token the Rust side actually interpolates — so a caller who followed the doc instead
+ *  of importing the constant would write a substring match that can NEVER fire, and paint the
+ *  pane's terminal `failed` state over a healthy in-flight start. That is the precise failure the
+ *  token exists to prevent, reintroduced by its own documentation.
+ *
+ *  It is a refusal, not a failed start: the in-flight start goes on to populate the pane by event.
  *
  *  The same state arrives on the event channel, so the store write here is only about not waiting a
  *  round trip — synthesized from the args the caller already holds, because the reply does not name

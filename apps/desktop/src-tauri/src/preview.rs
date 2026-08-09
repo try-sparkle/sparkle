@@ -335,11 +335,38 @@ fn v6_refusal(addr: &str) -> String {
 /// Three outcomes, and they are three because collapsing any two loses information the pane has to
 /// render:
 ///   * `Ok(None)` — nothing is listening yet. Keep waiting.
-///   * `Ok(Some(port))` — a loopback listener. The `requested` port wins when present, so the common
-///     forced-port case is deterministic even while a framework opens a second socket (HMR).
+///   * `Ok(Some(port))` — a loopback listener. The `requested` port wins when it is ONE OF THEM, so
+///     a framework's second socket (HMR) cannot displace it. It does NOT win merely by being
+///     passed: a forced port that has not bound yet loses to the lowest v4 loopback port in the
+///     tree. See the caveat below — this bullet claimed the forced case was "deterministic" for one
+///     commit after the fall-through stopped being conditional, which is the overclaim the caveat
+///     exists to correct.
 ///   * `Err(msg)` — the tree IS listening, but not on loopback. **Refused, not depreferred**, and
 ///     the message NAMES the offending address so the pane can say what it refused rather than
 ///     showing a generic failure.
+///
+/// **A PORT THAT MATCHES NEITHER LIST FALLS THROUGH TO THE FIRST v4 LOOPBACK SOCKET, WHATEVER IT
+/// IS — and passing a `requested` port does not change that.** The rule is uniform: `requested` wins
+/// when it appears in one of the lists, and otherwise the v4 list is consulted first, so any
+/// unrelated socket in the tree (Node's inspector on 9229 is the one you will actually meet) is
+/// handed back as the preview's port. Nothing about that is an error, and the pane frames the
+/// debugger.
+///
+/// This bites the DRIVEN frameworks too, not only `Framework::Unknown`: if the forced port has not
+/// appeared by the discovery tick on which some other v4 socket already has, that socket is what
+/// comes back — and `supervise` latches the first answer (`if bound.is_none()`), so discovery never
+/// revisits it. Refusing instead is not the fix: it kills servers that are merely slow, which is the
+/// regression bead `sparkle-dnvaq` records. Identifying the app's socket is.
+///
+/// **AND THE NON-DESTRUCTIVE ANSWER IS ONLY AVAILABLE WHILE SOMETHING IS ON v4 LOOPBACK.** With an
+/// empty v4 list the fall-through has nothing to hand back, so the v6-only refusal below fires and
+/// `supervise` treats an `Err` as terminal — it KILLS the child. That is the destructive outcome
+/// this function otherwise avoids, and a forced port reaches it: a driven framework whose port has
+/// not bound yet, in a tree whose only socket so far is a helper on a bare `localhost` (Node >= 17
+/// resolves that to `::1`), is refused and killed for being slow. The refusal is right when the v6
+/// socket IS the app and wrong when it is a helper, and — the whole of `sparkle-dnvaq` — nothing
+/// here can tell those apart. It is kept because with no v4 candidate at all the app is more likely
+/// than not the thing we can see, not because the case is unambiguous.
 pub fn choose_listener(listeners: &[Listener], requested: Option<u16>) -> Result<Option<u16>, String> {
     let mut loopback: Vec<u16> = Vec::new();
     let mut foreign: Vec<String> = Vec::new();
@@ -388,6 +415,23 @@ pub fn choose_listener(listeners: &[Listener], requested: Option<u16>) -> Result
         if let Some(addr) = v6_only.get(&want) {
             return Err(v6_refusal(addr));
         }
+        // A REQUESTED PORT THAT MATCHED NEITHER LIST FALLS THROUGH ON PURPOSE — see the caveat in
+        // the docblock. A previous version of this function refused here whenever any v6-only socket
+        // was in the tree, on the theory that it must be the app (`Framework::Unknown` injects no
+        // port flag, so the child binds where the runtime chose). That was REVERTED, because the
+        // theory is a coin flip and the two outcomes are not equally bad:
+        //
+        //   * guess wrong toward refusing — an app on `127.0.0.1:3000` with any helper on a bare
+        //     `localhost` (Node >= 17 resolves that to `::1`) is refused, and `supervise` treats a
+        //     refusal as terminal: it KILLS the working dev server. The refusal text then tells the
+        //     user to bind 127.0.0.1, which that server already did, so following it cannot help.
+        //   * guess wrong toward accepting — the pane frames some other socket in the tree (the
+        //     inspector on 9229 is the one you will meet). Wrong page, nothing destroyed, Reload
+        //     and Stop both still work.
+        //
+        // Nothing here can tell the two shapes apart: same lists, same emptiness, different truth.
+        // Until the app's socket can be IDENTIFIED rather than guessed (bead sparkle-dnvaq), the
+        // non-destructive wrong answer is the right default.
     }
     loopback.sort_unstable();
     if let Some(&port) = loopback.first() {
@@ -409,17 +453,30 @@ pub fn choose_listener(listeners: &[Listener], requested: Option<u16>) -> Result
 
 /// The whole discovery step: process tree → listening sockets → a verdict. Split out from the
 /// supervisor loop so it can be driven from a test with both seams fixed.
+/// TAKES A `u16`, NOT AN `Option<u16>`, AND THAT IS THE GUARD. Passing `None` from here would be
+/// silently catastrophic: see [`choose_listener`]'s caveat, where an unrelated v4 socket (Node's
+/// inspector on 9229) wins and the pane frames the debugger's JSON blob instead of the app. That
+/// constraint used to live in a test comment claiming to pin a call site no test can reach; making
+/// the parameter non-optional moves it to the compiler, which is the only thing that can hold it.
+///
+/// **PASSING IT DOES NOT GUARANTEE THE ANSWER IS THE APP.** `Framework::Unknown` gets no port flag
+/// at all (`port_args`'s `_ => Vec::new()` arm), so for a plain `node server.js` this is a port
+/// Sparkle allocated and never told the child about — but even a DRIVEN framework loses the
+/// guarantee whenever its port has not bound yet and another v4 socket has. `choose_listener` falls
+/// through to the first v4 loopback socket in either case; see its caveat. The `u16` here removes
+/// one way to get it wrong (asking with no port at all), not the ambiguity itself, which is bead
+/// `sparkle-dnvaq` — the alternative, refusing on a guess, kills working servers.
 pub fn discover_port(
     procs: &dyn ProcessTable,
     listen: &dyn ListenTable,
     root_pid: u32,
-    requested: Option<u16>,
+    requested: u16,
 ) -> Result<Option<u16>, String> {
     // `None` from either seam means we could not look — NOT that nothing is listening.
     let Some(rows) = procs.rows() else { return Ok(None) };
     let tree = descendant_pids(&rows, root_pid);
     let Some(listeners) = listen.listeners(&tree) else { return Ok(None) };
-    choose_listener(&listeners, requested)
+    choose_listener(&listeners, Some(requested))
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -1294,6 +1351,48 @@ fn live_for_reattach(state: PreviewState) -> bool {
     }
 }
 
+/// THE MACHINE-READABLE HALF OF THE IN-FLIGHT REFUSAL, and the only part the frontend may match on.
+///
+/// The message crosses the IPC boundary as a bare string, so the seam is an English substring that
+/// two languages hand-copy — reword either side and both suites stay green while the pane paints its
+/// TERMINAL `failed` state over a start that is healthy and still running. `services/preview.ts`
+/// exports the same literal as `PREVIEW_ALREADY_STARTING`, and `previewSeam.test.ts` reads THIS FILE
+/// and asserts the two agree, so a reword on either side is a red test rather than a silent
+/// regression. Keep it a hyphenated token: prose gets edited, tokens get left alone.
+const ALREADY_STARTING: &str = "already-starting";
+
+/// Holds one agent's start reservation for as long as it is alive, and gives it back on Drop.
+///
+/// RAII RATHER THAN A TRAILING STATEMENT, and the difference is not style. `open_reserved` runs an
+/// unbounded login-shell lookup and a process spawn; an unwind anywhere in there skips a trailing
+/// release, tokio turns the panic into a `JoinError` and the process survives — so the reservation
+/// survives too, and that agent's preview button is dead for the rest of the session with NO
+/// feedback, because the frontend deliberately swallows this refusal. A guard cannot be forgotten by
+/// a future early return and cannot be skipped by an unwind.
+///
+/// STILL NOT COVERED: a start that HANGS. `spawn_blocking` tasks are never cancelled, so a
+/// `resolve_program` parked forever in a user's `.zshrc` holds this guard for the life of the
+/// process. The fix for that is bounding `preflight::run_in_login_shell`, not anything here —
+/// tracked separately, since it is an unbounded call this code merely inherits.
+struct StartReservation<'a> {
+    mgr: &'a PreviewManager,
+    agent_id: String,
+}
+
+impl Drop for StartReservation<'_> {
+    fn drop(&mut self) {
+        self.mgr.release_starting(&self.agent_id);
+    }
+}
+
+/// What [`PreviewManager::reserve_or_reattach`] decided.
+enum ReserveOutcome<'a> {
+    /// This agent already has a usable server; hand it back rather than spawning.
+    Reattached(PreviewOpened),
+    /// The caller owns the start. The reservation lasts exactly as long as this guard.
+    Reserved(StartReservation<'a>),
+}
+
 /// Managed state: every preview this launch owns.
 #[derive(Default)]
 pub struct PreviewManager {
@@ -1328,9 +1427,9 @@ impl PreviewManager {
         self.lock().values().find(|s| s.status.agent_id == agent_id).map(|s| s.status.clone())
     }
 
-    /// The one place that decides whether a `preview_open` SPAWNS. `Ok(Some(_))` = re-attach to what
-    /// this agent already has; `Ok(None)` = the caller holds the reservation and must spawn, then
-    /// call [`PreviewManager::release_starting`]; `Err` = another start is already in flight.
+    /// The one place that decides whether a `preview_open` SPAWNS. `Reattached` = this agent already
+    /// has a usable server; `Reserved(guard)` = the caller must spawn, and the RESERVATION LIVES AS
+    /// LONG AS THAT GUARD; `Err` = another start is already in flight.
     ///
     /// A RESERVATION, not a check, and that is the whole point. `open_blocking` does seconds of work
     /// before the new server lands in `servers` — target detection, a login-shell PATH lookup, the
@@ -1343,12 +1442,12 @@ impl PreviewManager {
     /// `servers` is consulted BEFORE the reservation deliberately: in the brief window after a
     /// spawn lands and before its reservation is released, re-attaching is the better answer than
     /// refusing. Lock order is `starting` then `servers`, and this is the only place that takes both.
-    fn reserve_or_reattach(&self, agent_id: &str) -> Result<Option<PreviewOpened>, String> {
+    fn reserve_or_reattach(&self, agent_id: &str) -> Result<ReserveOutcome<'_>, String> {
         let mut starting = self.starting.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(existing) =
             self.lock().values().find(|s| s.status.agent_id == agent_id && live_for_reattach(s.status.state))
         {
-            return Ok(Some(PreviewOpened {
+            return Ok(ReserveOutcome::Reattached(PreviewOpened {
                 id: existing.status.id.clone(),
                 url: existing
                     .status
@@ -1360,13 +1459,11 @@ impl PreviewManager {
             }));
         }
         if !starting.insert(agent_id.to_string()) {
-            return Err("preview: a server for this agent is already starting".into());
+            return Err(format!("preview: a server for this agent is {ALREADY_STARTING}"));
         }
-        Ok(None)
+        Ok(ReserveOutcome::Reserved(StartReservation { mgr: self, agent_id: agent_id.to_string() }))
     }
 
-    /// Drop the reservation taken by [`PreviewManager::reserve_or_reattach`]. Called on BOTH the
-    /// success and the failure path — a start that errored must leave the button retryable.
     fn release_starting(&self, agent_id: &str) {
         self.starting.lock().unwrap_or_else(|e| e.into_inner()).remove(agent_id);
     }
@@ -1524,6 +1621,28 @@ pub fn validate_worktree(worktrees_base: &Path, worktree: &str) -> Result<PathBu
     Ok(real)
 }
 
+/// Canonicalize a path the frontend named as a PROJECT ROOT, for READ-ONLY inspection.
+///
+/// DELIBERATELY NOT `validate_worktree`, and the difference is what made the feature work at all. A
+/// project root is the user's own chosen repo folder (`types.ts`'s `rootPath`); agent worktrees live
+/// under `<app_data>/worktrees/<projectId>/<agentId>`. So a project root is NEVER inside the managed
+/// worktrees directory, and running the containment check against one rejected EVERY real project —
+/// `preview_capability` errored, the frontend's catch recorded `previewable: false`, and every
+/// preview affordance was permanently absent in every session with only a `console.debug`. Both
+/// halves passed their own tests; the seam was dead (the `sparkle-16y6h` shape).
+///
+/// The containment check belongs to `preview_open`, which SPAWNS A PROCESS in the directory. This
+/// path only reads manifests, so it asks the two things a read actually needs: the path resolves,
+/// and it is a directory.
+pub fn validate_project_dir(path: &str) -> Result<PathBuf, String> {
+    let real =
+        std::fs::canonicalize(path).map_err(|e| format!("preview: invalid project path: {e}"))?;
+    if !real.is_dir() {
+        return Err("preview: the project path is not a directory".into());
+    }
+    Ok(real)
+}
+
 /// Resolve the program to run. A bare name is looked up the same way every other user-scope binary
 /// in this app is, because a Finder/Dock-launched Sparkle inherits a PATH with no nvm or corepack.
 fn resolve_program(program: &str) -> Result<String, String> {
@@ -1545,13 +1664,30 @@ fn resolve_program(program: &str) -> Result<String, String> {
     Err(format!("preview: could not find `{program}` on this machine's PATH"))
 }
 
-/// RE-ATTACH, OR RESERVE AND SPAWN. Blocking — callers wrap it in `spawn_blocking`.
+/// Re-attach, or reserve and run `spawn`. THE WHOLE WIRING, with the `AppHandle` factored out.
 ///
-/// The decision and the reservation both happen inside
-/// [`PreviewManager::reserve_or_reattach`]; everything after it is the spawn, in `open_reserved`.
-/// Splitting them is what makes the reservation releasable on EVERY exit — `open_reserved` has a
-/// dozen `?` early returns, and a reservation leaked by any one of them would wedge that agent's
-/// preview button for the rest of the session.
+/// `open_blocking` is untestable by construction — it needs a live `AppHandle` — so keeping the
+/// orchestration here is what lets a test drive reserve→spawn→release for real, including the paths
+/// that matter: a spawn that ERRORS and a spawn that PANICS must both leave the agent startable
+/// again. The release is the guard's `Drop`, so there is no statement left for a future edit to skip.
+fn open_with_reservation<F>(
+    mgr: &PreviewManager,
+    agent_id: &str,
+    spawn: F,
+) -> Result<PreviewOpened, String>
+where
+    F: FnOnce(&StartReservation<'_>) -> Result<PreviewOpened, String>,
+{
+    match mgr.reserve_or_reattach(agent_id)? {
+        ReserveOutcome::Reattached(existing) => Ok(existing),
+        // The guard is BOUND and then HANDED to the spawn — `let _ = guard` would drop it
+        // immediately and release the reservation before the spawn it is meant to cover, and
+        // passing it on is what lets `open_reserved` demand proof rather than trust a comment.
+        ReserveOutcome::Reserved(guard) => spawn(&guard),
+    }
+}
+
+/// RE-ATTACH, OR RESERVE AND SPAWN. Blocking — callers wrap it in `spawn_blocking`.
 fn open_blocking(
     app: AppHandle,
     agent_id: String,
@@ -1559,16 +1695,21 @@ fn open_blocking(
     worktree: String,
     path_override: Option<String>,
 ) -> Result<PreviewOpened, String> {
-    if let Some(existing) = app.state::<PreviewManager>().reserve_or_reattach(&agent_id)? {
-        return Ok(existing);
-    }
-    let out = open_reserved(app.clone(), agent_id.clone(), project_id, worktree, path_override);
-    app.state::<PreviewManager>().release_starting(&agent_id);
-    out
+    let state = app.state::<PreviewManager>();
+    open_with_reservation(&state, &agent_id, |reservation| {
+        open_reserved(reservation, app.clone(), agent_id.clone(), project_id, worktree, path_override)
+    })
 }
 
-/// Spawn the dev server and start supervising it. Call ONLY while holding this agent's reservation.
+/// Spawn the dev server and start supervising it.
+///
+/// TAKES THE RESERVATION AS A PARAMETER even though it does not read it: the guard is the proof that
+/// this agent's start is reserved, so a caller cannot reach the spawn without holding one. The rule
+/// used to be a sentence ("call ONLY while holding…"), which is exactly the kind of enforcement that
+/// let the original leak in — and `open_blocking` is untestable by construction, so no test could
+/// have pinned the wiring either. The type can.
 fn open_reserved(
+    _reservation: &StartReservation<'_>,
     app: AppHandle,
     agent_id: String,
     project_id: String,
@@ -1749,7 +1890,7 @@ fn supervise(
         }
 
         if bound.is_none() {
-            match discover_port(&PsProcessTable, &LsofListenTable, pid, Some(requested)) {
+            match discover_port(&PsProcessTable, &LsofListenTable, pid, requested) {
                 Ok(Some(port)) => {
                     bound = Some(port);
                     app.state::<PreviewManager>().transition(&app, &id, PreviewState::Listening, Some(port), None);
@@ -1848,10 +1989,12 @@ fn mark_bound(app_data: &Path, id: &str, port: u16) {
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
 #[tauri::command]
-pub async fn preview_capability(app: AppHandle, worktree: String) -> Result<PreviewCapability, String> {
+pub async fn preview_capability(worktree: String) -> Result<PreviewCapability, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let app_data = crate::dev_identity::app_data_dir(&app)?;
-        let real = validate_worktree(&app_data.join("worktrees"), &worktree)?;
+        // A PROJECT ROOT, not a managed worktree — see `validate_project_dir`. Detection is a
+        // property of the project's own manifests, so the frontend asks with `rootPath`, which is
+        // never inside `<app_data>/worktrees`.
+        let real = validate_project_dir(&worktree)?;
         let enabled = crate::config::for_project(&real.to_string_lossy()).config.preview.enabled;
         Ok(match detect_preview_target(&real, enabled) {
             Ok(target) => PreviewCapability { previewable: true, target: Some(target), decline_reason: None },
@@ -2106,7 +2249,7 @@ mod tests {
         // ONLY the great-grandchild listens. If the walk stopped at the direct child, `lsof` would
         // be asked about pid 100 alone and this would be `Ok(None)` forever.
         let listen = FixedListenTable(Some(vec![listener(103, "127.0.0.1:5200")]));
-        assert_eq!(discover_port(&procs, &listen, 100, Some(5200)), Ok(Some(5200)));
+        assert_eq!(discover_port(&procs, &listen, 100, 5200), Ok(Some(5200)));
 
         // Pin the mechanism, not just the outcome: the pid set handed to lsof must contain the
         // great-grandchild. Without this, a walk that returned every pid on the machine would also
@@ -2167,21 +2310,62 @@ mod tests {
             .expect_err("the REQUESTED port is v6-only; the debugger's port is not a substitute");
         assert!(err.contains("[::1]:5173"), "must name the app's address; got: {err}");
 
-        // THE OTHER HALF, and the load-bearing one: WITHOUT the requested port there is nothing
-        // that says which socket is the app, and the debugger IS handed back. That is not a defect
-        // to fix here — it is the constraint on the caller, and `supervise` satisfies it by always
-        // passing the port it forced (`discover_port(.., Some(requested))`). Pinned so that
-        // rewriting the call site to pass `None` shows up as this test going red with the port
-        // number in the message, rather than as a preview quietly framing a JSON blob.
+        // THE OTHER HALF: without a requested port nothing says which socket is the app, and the
+        // debugger IS handed back. This pins `choose_listener`'s `None` semantics — nothing more.
+        // An earlier version of this comment claimed it also guarded the CALL SITE ("rewriting it
+        // to pass None shows up as this test going red"), which was false: changing `supervise`
+        // cannot change what this function returns, so the test would have stayed green while the
+        // pane framed a JSON blob. The call site is now guarded by the only thing that can hold it,
+        // the type — `discover_port` takes a `u16`, so `None` is unexpressible there.
         //
-        // (The previous assertion here — `!err.contains("9229")` — could not fail: it ran only
-        // after `expect_err` had already established the value was the v6 refusal, whose only
-        // interpolation is the app's own address.)
+        // (The assertion before that — `!err.contains("9229")` — could not fail at all: it ran only
+        // after `expect_err` had established the value was the v6 refusal, whose only interpolation
+        // is the app's own address.)
         assert_eq!(
             choose_listener(&ls, None),
             Ok(Some(9229)),
             "with no requested port the first v4 loopback socket wins, debugger included"
         );
+    }
+
+    /// THE UNFORCED FRAMEWORK, AND WHY WE ACCEPT RATHER THAN REFUSE. `Framework::Unknown` gets no
+    /// port flag, so the requested port is one the child was never told about; it matches neither
+    /// list, and the two trees below are INDISTINGUISHABLE from the socket list alone.
+    ///
+    /// A version of this refused whenever any v6-only socket was present, reading it as "the app is
+    /// on v6 and unreachable". The second case is why that was reverted: refusing there kills a
+    /// working dev server (`supervise` treats a refusal as terminal) and tells its owner to bind an
+    /// address it is already bound to. Framing the wrong socket is recoverable; killing the server
+    /// is not. Both rows are asserted so the trade-off is a decision on the record, not a default
+    /// nobody chose — bead `sparkle-dnvaq` tracks identifying the app's socket properly.
+    #[test]
+    fn a_requested_port_that_nothing_took_falls_through_rather_than_guessing() {
+        // App v6-only, an unrelated v4 socket (Node's inspector). We hand back 9229 and the pane
+        // frames a JSON blob: the WRONG page, and the known cost of not guessing.
+        assert_eq!(
+            choose_listener(&[listener(7, "[::1]:4000"), listener(7, "127.0.0.1:9229")], Some(5173)),
+            Ok(Some(9229)),
+            "wrong socket, but nothing is destroyed and Reload/Stop still work"
+        );
+
+        // The mirror image, and the expensive one: app on v4, a helper on a bare `localhost` that
+        // Node >= 17 resolved to `[::1]`. This MUST resolve — refusing would kill it.
+        assert_eq!(
+            choose_listener(&[listener(7, "127.0.0.1:3000"), listener(7, "[::1]:9230")], Some(5173)),
+            Ok(Some(3000)),
+            "a working v4 app must never be vetoed by an unidentified v6 socket"
+        );
+
+        // And with NO v4 candidate at all, the existing refusal still fires — AND THIS ONE IS
+        // DESTRUCTIVE, which the two cases above are not. `supervise` treats an `Err` as terminal
+        // and kills the child, so a driven framework whose forced port (5173) has simply not bound
+        // yet, in a tree whose only socket so far is a helper on a bare `localhost`, is killed for
+        // being slow. It is NOT the unambiguous case an earlier version of this comment claimed:
+        // the v6 socket may be the app or may be a helper, and nothing here can tell (sparkle-dnvaq).
+        // Pinned as the known cost of keeping the refusal, not as evidence it is right.
+        let err = choose_listener(&[listener(7, "[::1]:4000")], Some(5173))
+            .expect_err("nothing on v4 loopback: the v6 socket is the only candidate");
+        assert!(err.contains("[::1]:4000"), "must name it; got: {err}");
     }
 
     /// The other direction, or the refusal above would break every ordinary dual-stack server.
@@ -2236,9 +2420,9 @@ mod tests {
     #[test]
     fn an_unavailable_seam_reports_pending_not_a_refusal() {
         let procs = FixedProcessTable(None);
-        assert_eq!(discover_port(&procs, &FixedListenTable(None), 100, None), Ok(None));
+        assert_eq!(discover_port(&procs, &FixedListenTable(None), 100, 5200), Ok(None));
         let procs = FixedProcessTable(Some(vec![ProcRow { pid: 100, ppid: 1, rss_bytes: 0 }]));
-        assert_eq!(discover_port(&procs, &FixedListenTable(None), 100, None), Ok(None));
+        assert_eq!(discover_port(&procs, &FixedListenTable(None), 100, 5200), Ok(None));
     }
 
     // ---------------------------------------------------------------- §3 detection
@@ -2618,13 +2802,31 @@ mod tests {
     /// Paired with the reservation test below, and the pair is the point: this one shows a live
     /// server IS handed back (so the assertion cannot pass by nothing ever happening), the next
     /// shows an in-flight start is REFUSED rather than duplicated.
+    /// `reserve_or_reattach` returns a borrow of the manager, so unwrapping it in a test needs the
+    /// outcome flattened to the two things a caller cares about.
+    fn reattached(out: ReserveOutcome<'_>) -> Option<PreviewOpened> {
+        match out {
+            ReserveOutcome::Reattached(o) => Some(o),
+            ReserveOutcome::Reserved(_) => None,
+        }
+    }
+
+    fn opened(port: u16) -> PreviewOpened {
+        PreviewOpened {
+            id: "spawned".into(),
+            url: preview_url_for(port),
+            port,
+            state: PreviewState::Starting,
+        }
+    }
+
     #[test]
     fn a_second_open_re_attaches_to_the_agents_live_server_instead_of_spawning() {
         let mgr = PreviewManager::default();
         mgr.lock().insert("srv-1".into(), seeded("agent-1", "srv-1", 5173, PreviewState::Ready));
 
         let out = mgr.reserve_or_reattach("agent-1").expect("a live server is not an error");
-        let out = out.expect("the caller must be handed the RUNNING server, not a reservation");
+        let out = reattached(out).expect("the caller must be handed the RUNNING server, not a reservation");
         assert_eq!(out.id, "srv-1", "…and it is that server's id, so the stop paths can reach it");
         assert_eq!(out.port, 5173);
         assert_eq!(out.url, preview_url_for(5173));
@@ -2639,21 +2841,67 @@ mod tests {
     /// PATH lookup and the spawn before its server lands in `servers`, so a check that only reads
     /// the map leaves that whole window open and two clicks each start a dev server.
     #[test]
-    fn a_start_already_in_flight_refuses_a_second_spawn_and_frees_up_after_it_finishes() {
+    fn a_start_already_in_flight_refuses_a_second_spawn() {
         let mgr = PreviewManager::default();
 
-        assert!(mgr.reserve_or_reattach("agent-1").unwrap().is_none(), "first caller spawns");
+        let Ok(held) = mgr.reserve_or_reattach("agent-1") else { panic!("first caller spawns") };
+        assert!(matches!(held, ReserveOutcome::Reserved(_)), "…with a reservation, not a re-attach");
         // The map is still EMPTY here — this is precisely the window the old check could not see.
         assert!(mgr.lock().is_empty());
-        let err = mgr.reserve_or_reattach("agent-1").expect_err("the second caller must not spawn too");
-        assert!(err.contains("already starting"), "and it must say why: {err}");
+        let err = match mgr.reserve_or_reattach("agent-1") {
+            Err(e) => e,
+            Ok(_) => panic!("the second caller must not spawn too"),
+        };
+        assert!(err.contains(ALREADY_STARTING), "and it must say why, in the token the frontend matches: {err}");
 
         // A different agent is unaffected — the reservation is per agent, not a global lock.
-        assert!(mgr.reserve_or_reattach("agent-2").unwrap().is_none());
+        assert!(matches!(mgr.reserve_or_reattach("agent-2"), Ok(ReserveOutcome::Reserved(_))));
 
-        // Released on BOTH paths, so a start that failed leaves the button retryable.
-        mgr.release_starting("agent-1");
-        assert!(mgr.reserve_or_reattach("agent-1").unwrap().is_none(), "a retry must be allowed");
+        // Dropping the guard is what frees it — there is no release statement to call.
+        drop(held);
+        assert!(
+            matches!(mgr.reserve_or_reattach("agent-1"), Ok(ReserveOutcome::Reserved(_))),
+            "a retry must be allowed once the first start's guard is gone"
+        );
+    }
+
+    /// THE HALF THAT WAS UNPINNED. The release used to be a trailing statement in `open_blocking`,
+    /// which no test reached (it needs an `AppHandle`), so deleting it left every test green while
+    /// wedging that agent's preview button for the session — silently, because the frontend
+    /// deliberately swallows this refusal. These drive the real wiring through the same seam
+    /// `open_blocking` uses.
+    #[test]
+    fn a_spawn_that_fails_or_panics_still_gives_the_reservation_back() {
+        let mgr = PreviewManager::default();
+
+        let err = open_with_reservation(&mgr, "agent-1", |_| Err("boom".into())).expect_err("propagates");
+        assert_eq!(err, "boom", "the spawn's own error reaches the caller unchanged");
+        assert!(!mgr.starting.lock().unwrap().contains("agent-1"), "an errored start must be retryable");
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            open_with_reservation(&mgr, "agent-1", |_| panic!("the dev server spawn blew up"))
+        }));
+        assert!(panicked.is_err(), "the panic is not swallowed");
+        assert!(
+            !mgr.starting.lock().unwrap().contains("agent-1"),
+            "…and unwinding released the reservation, which a trailing statement could not do"
+        );
+
+        // Still functional afterwards: the next start really does get through.
+        let out = open_with_reservation(&mgr, "agent-1", |_| Ok(opened(5173))).expect("a retry runs");
+        assert_eq!(out.port, 5173);
+        assert!(!mgr.starting.lock().unwrap().contains("agent-1"));
+    }
+
+    /// A re-attach must NOT take a reservation — nothing would ever release it.
+    #[test]
+    fn re_attaching_runs_no_spawn_and_holds_no_reservation() {
+        let mgr = PreviewManager::default();
+        mgr.lock().insert("srv-1".into(), seeded("agent-1", "srv-1", 5173, PreviewState::Ready));
+
+        let out = open_with_reservation(&mgr, "agent-1", |_| panic!("must not spawn")).expect("re-attaches");
+        assert_eq!(out.id, "srv-1");
+        assert!(!mgr.starting.lock().unwrap().contains("agent-1"));
     }
 
     /// A corpse is not re-attachable: answering a second click with the dead server would make the
@@ -2664,7 +2912,7 @@ mod tests {
             let mgr = PreviewManager::default();
             mgr.lock().insert("srv-1".into(), seeded("agent-1", "srv-1", 5173, state));
             assert!(
-                mgr.reserve_or_reattach("agent-1").unwrap().is_none(),
+                matches!(mgr.reserve_or_reattach("agent-1"), Ok(ReserveOutcome::Reserved(_))),
                 "{state:?} must fall through to a fresh spawn"
             );
         }
@@ -2674,7 +2922,7 @@ mod tests {
             let mgr = PreviewManager::default();
             mgr.lock().insert("srv-1".into(), seeded("agent-1", "srv-1", 5173, state));
             assert!(
-                mgr.reserve_or_reattach("agent-1").unwrap().is_some(),
+                matches!(mgr.reserve_or_reattach("agent-1"), Ok(ReserveOutcome::Reattached(_))),
                 "{state:?} must re-attach"
             );
         }
@@ -2700,6 +2948,23 @@ mod tests {
         assert_eq!(live.len() + dead.len(), 7, "every PreviewState variant is classified above");
     }
 
+    /// The wire name of a state, as an EXHAUSTIVE match. Rust cannot enumerate variants, so a
+    /// hand-written array of pairs is satisfied by any 7 rows and a new variant leaves it green
+    /// while the TypeScript union goes stale — and the frontend's fall-through then renders a live
+    /// server as "No preview running". This match is the tie: adding a variant fails to compile
+    /// here, which is the prompt to add it to `previewStore.ts`'s union too.
+    fn wire_name(state: PreviewState) -> &'static str {
+        match state {
+            PreviewState::Starting => "starting",
+            PreviewState::Listening => "listening",
+            PreviewState::Ready => "ready",
+            PreviewState::Serving => "serving",
+            PreviewState::Failed => "failed",
+            PreviewState::Crashed => "crashed",
+            PreviewState::Stopped => "stopped",
+        }
+    }
+
     #[test]
     fn every_state_serializes_to_the_string_the_frontend_is_typed_against() {
         let pairs = [
@@ -2713,7 +2978,77 @@ mod tests {
         ];
         for (state, wire) in pairs {
             assert_eq!(serde_json::to_value(state).unwrap(), wire);
+            // …and the same value through the exhaustive match, so the hand-written table above
+            // cannot drift from the classification a new variant is forced to join.
+            assert_eq!(wire_name(state), wire);
         }
+    }
+
+    /// THE SEAM THAT WAS DEAD. `preview_capability` is asked with the project's `rootPath` — the
+    /// user's own repo folder — because detection is a property of the project's manifests. That
+    /// path is NEVER inside `<app_data>/worktrees`, so running the spawn path's containment check
+    /// against it refused every real project: the invoke errored, the frontend recorded
+    /// `previewable: false`, and every preview affordance was permanently absent, in every session,
+    /// with only a `console.debug`. Both halves were green; only the seam was broken.
+    ///
+    /// The two validators are asserted TOGETHER on one path, which is the only way to state the
+    /// distinction: the read-only probe accepts a plain project directory that the spawn path
+    /// refuses, and the spawn path's refusal is still intact.
+    #[test]
+    fn a_project_root_passes_the_read_only_probe_and_is_still_refused_by_the_spawn_path() {
+        let dir = std::env::temp_dir().join(format!("sparkle-preview-root-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.to_string_lossy().to_string();
+
+        let probed = validate_project_dir(&path).expect("a project root is a legitimate thing to READ");
+        assert_eq!(probed, std::fs::canonicalize(&dir).unwrap(), "…canonicalized");
+
+        // The same path through the spawn path's check, whose base it is not under.
+        let managed = std::env::temp_dir().join(format!("sparkle-preview-wts-{}", new_id()));
+        std::fs::create_dir_all(&managed).unwrap();
+        let err = validate_worktree(&managed, &path)
+            .expect_err("spawning a process in an arbitrary directory is still refused");
+        assert!(err.contains("outside the managed worktrees directory"), "got: {err}");
+
+        // And a non-directory is not a project root either.
+        let file = dir.join("package.json");
+        std::fs::write(&file, "{}").unwrap();
+        assert!(validate_project_dir(&file.to_string_lossy()).is_err(), "a file is not a project");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&managed);
+    }
+
+    /// DRIVES THE COMMAND, which is the only thing that pins WHICH validator it uses. The test
+    /// above asserts the two validators disagree; it does not assert `preview_capability` picked
+    /// the read-only one, so reverting that single line restored the bug verbatim with all 42 tests
+    /// green — the "production call site untested by construction" shape (`sparkle-lgbwf`). Removing
+    /// the `AppHandle` parameter is what made this reachable: it is now a plain `async fn(String)`.
+    #[test]
+    fn preview_capability_answers_for_a_real_project_root() {
+        let dir = std::env::temp_dir().join(format!("sparkle-preview-cap-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A single-package Vite app: the shape §7 says is the common case.
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"name":"probe-fixture","scripts":{"dev":"vite"}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("vite.config.ts"), "export default {}\n").unwrap();
+        // A LOCKFILE IS PART OF THE CONTRACT, not fixture noise: detection declines a repo it cannot
+        // pick a package manager for, and this test found that out by failing with that exact
+        // decline. Naming pnpm here is also what makes the argument-separator path deterministic.
+        std::fs::write(dir.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+
+        let cap = tauri::async_runtime::block_on(preview_capability(dir.to_string_lossy().to_string()))
+            .expect("a project root is a legitimate thing to probe");
+        assert!(
+            cap.previewable,
+            "the probe must ANSWER for a path shaped like a real rootPath; decline was {:?}",
+            cap.decline_reason
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The path arrives from the frontend, so it is untrusted until this has run.

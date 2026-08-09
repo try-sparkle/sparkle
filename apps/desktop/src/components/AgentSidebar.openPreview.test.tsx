@@ -39,6 +39,7 @@ vi.mock("../services/preview", async (orig) => ({
 }));
 
 import { AgentSidebar } from "./AgentSidebar";
+import { PREVIEW_ALREADY_STARTING } from "../services/preview";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import { usePreviewStore } from "../stores/previewStore";
@@ -179,8 +180,11 @@ describe("AgentSidebar — Preview", () => {
       port: null,
       error: null,
     });
+    // Built from the constant, not restated: `previewSeam.test.ts` is what pins that constant to
+    // `preview.rs`'s `ALREADY_STARTING`, so this file does not need a second copy of the token —
+    // and a copy here would drift silently the moment the seam moved.
     openPreviewServer.mockRejectedValueOnce(
-      new Error("preview: a server for this agent is already starting"),
+      new Error(`preview: a server for this agent is ${PREVIEW_ALREADY_STARTING}`),
     );
     render(<AgentSidebar project={mkProject([mkAgent({ id: "a7" })])} />);
     openCard("Parser Agent");

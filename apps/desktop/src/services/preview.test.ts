@@ -7,7 +7,12 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(() => Promise.resolve(nul
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(() => Promise.resolve(() => {})) }));
 
 import { invoke } from "@tauri-apps/api/core";
-import { applyPreviewStatus, isLoopbackPreviewUrl, openPreviewServer } from "./preview";
+import {
+  applyPreviewStatus,
+  isLoopbackPreviewUrl,
+  openPreviewServer,
+  refreshPreviewCapability,
+} from "./preview";
 import { usePreviewStore } from "../stores/previewStore";
 
 describe("isLoopbackPreviewUrl", () => {
@@ -152,5 +157,47 @@ describe("openPreviewServer — the wire shape preview_open ACTUALLY returns", (
     });
     expect(out).toBeNull();
     expect(Object.keys(usePreviewStore.getState().byAgent)).toHaveLength(0);
+  });
+});
+
+// "WE COULD NOT LOOK" IS NOT "WE LOOKED AND THE ANSWER IS NO", and conflating them cost the whole
+// feature for a session. The only caller gates on `capability[id] !== undefined`, so a recorded
+// failure satisfies the gate and the probe is never asked again — one transient miss (bridge not up
+// yet, a momentarily unreadable directory, a spawn_blocking task error) disabled every preview
+// affordance until relaunch, while the function's own comment claimed the verdict was re-askable.
+describe("refreshPreviewCapability — a failed probe must stay re-askable", () => {
+  beforeEach(() => usePreviewStore.setState({ byAgent: {}, capability: {} }));
+
+  it("records NOTHING when the probe throws, so the gate asks again", async () => {
+    vi.mocked(invoke).mockRejectedValueOnce(new Error("preview: invalid project path"));
+    const out = await refreshPreviewCapability("p1", "/some/project");
+
+    expect(out).toBeNull();
+    // The assertion is `undefined`, not `previewable === false`: both hide the affordance, but only
+    // one of them is a value the caller's `!== undefined` gate will ask about again.
+    expect(usePreviewStore.getState().capability.p1).toBeUndefined();
+  });
+
+  // THE PAIR, so the test above cannot be satisfied by a function that never records anything.
+  it("records the answer when the probe succeeds", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce({ previewable: true, target: null, declineReason: null });
+    const out = await refreshPreviewCapability("p1", "/some/project");
+
+    expect(out?.previewable).toBe(true);
+    expect(usePreviewStore.getState().capability.p1?.previewable).toBe(true);
+  });
+
+  // A genuine "no" IS recorded — that is the sticky verdict we want, and it is what makes the
+  // distinction above meaningful rather than a blanket refusal to write.
+  it("records a decline, which is an answer", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce({
+      previewable: false,
+      target: null,
+      declineReason: "no dev script",
+    });
+    await refreshPreviewCapability("p1", "/some/project");
+
+    expect(usePreviewStore.getState().capability.p1?.previewable).toBe(false);
+    expect(usePreviewStore.getState().capability.p1?.declineReason).toBe("no dev script");
   });
 });

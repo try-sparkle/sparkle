@@ -1831,9 +1831,12 @@ export function AgentSidebar({
   useEffect(() => {
     if (!project) return;
     if (usePreviewStore.getState().capability[project.id] !== undefined) return;
-    // Fire and forget — the service records both the answer and a failure, so there is nothing to
-    // await and nothing here to handle. Awaiting would only delay a render that already has its
-    // honest default ("we do not know" → no affordance).
+    // Fire and forget: the service records an ANSWER (previewable or a decline) and records NOTHING
+    // when the probe fails, which is what keeps a transient failure re-askable — so there is
+    // nothing to await and nothing here to handle. The gate above is therefore self-limiting only
+    // once an answer lands; until then this re-probes on each new `project` identity, which is the
+    // intended behaviour. Awaiting would only delay a render that already has its honest default
+    // ("we do not know" → no affordance).
     void refreshPreviewCapability(project.id, project.rootPath);
   }, [project]);
   // If Beads is turned off while the user is parked on the (now-hidden) Plan board, leave it — the
