@@ -144,15 +144,36 @@ describe("ColumnPullTab — the seam is draggable along its whole height", () =>
 });
 
 describe("ColumnPullTab — one tab, two zones", () => {
-  it("is hidden at rest and revealed on hover", () => {
-    // The founder's note verbatim: "It should also only show on hover. It's showing all the time
-    // now." The control it replaces painted two grey marks on the seam permanently.
+  it("PAINTS AT REST, quietly, and strengthens on hover", () => {
+    // THE FOUNDER REVERSED THE HOVER-ONLY RULE, 2026-08-08: "I don't see the vertical slider so yes,
+    // make it always show." This case used to assert the opposite (`opacity` 0 at rest), which is
+    // why it is rewritten rather than added to — a suite cannot hold both rules.
+    //
+    // The assertion is the PROPERTY, not the number, because the number is a knob he will want
+    // turned: strictly visible (≠ 0, which is the old behaviour and the bug) and strictly quieter
+    // than the hovered state (≠ 1, which is the permanent-chrome weight he called janky). Pinning
+    // 0.6 would make every tuning request a test edit; pinning the property fails against both of
+    // the states he has actually rejected.
     setup();
-    expect(tab().style.opacity).toBe("0");
+    const rest = Number(tab().style.opacity);
+    expect(rest).toBeGreaterThan(0);
+    expect(rest).toBeLessThan(1);
     fireEvent.mouseEnter(root());
     expect(tab().style.opacity).toBe("1");
     fireEvent.mouseLeave(root());
-    expect(tab().style.opacity).toBe("0");
+    expect(Number(tab().style.opacity)).toBe(rest);
+  });
+
+  it("is REACHABLE at rest — the pointer must not fall through the visible tab", () => {
+    // The half of the invisibility that was not about paint. While the tab was `pointerEvents:none`
+    // it was not hit-test eligible, so moving onto it from a column fired no enter on the rail: the
+    // ONLY way to summon the control was to land inside the literal 6px rail, a target you have to
+    // already know is there. Painting it without this would give him something he can see and still
+    // cannot press.
+    setup();
+    expect(tab().style.pointerEvents).toBe("auto");
+    fireEvent.mouseEnter(root());
+    expect(tab().style.pointerEvents).toBe("auto");
   });
 
   it("takes no clicks while hidden OR shown — the ZONE never swallows a press", () => {
@@ -169,9 +190,9 @@ describe("ColumnPullTab — one tab, two zones", () => {
   });
 
   it("detects hover on the in-flow RAIL, which overhangs nothing", () => {
-    // The corollary of the above: if the zone is inert at rest, something else has to notice the
-    // pointer. That is the 6px rail — the real gap between the two columns — and it is why the
-    // control can be revealed at all without stealing a single click from either neighbour.
+    // The corollary of the zone case above: the zone is inert forever, so something else has to
+    // notice the pointer. That is the 6px rail — the real gap between the two columns — and it is
+    // why the tab can be emphasised without stealing a single click from either neighbour.
     setup();
     expect(root().style.width).toBe("6px");
     expect(root().style.position).toBe("relative");
@@ -179,17 +200,17 @@ describe("ColumnPullTab — one tab, two zones", () => {
     expect(tab().style.opacity).toBe("1");
   });
 
-  it("is revealed by KEYBOARD FOCUS too, and rings itself", () => {
-    // Hover-only is a mouse rule. Without this, tabbing onto the dots drives a control that paints
-    // nothing at all — there is not even anything for a focus ring to sit on.
+  it("is EMPHASISED by keyboard focus too, and rings itself", () => {
+    // Hover is a mouse rule, so the keyboard gets the same strengthening — and the ring has a
+    // full-strength object to sit on rather than a faint one.
     setup();
-    expect(tab().style.opacity).toBe("0");
+    const rest = tab().style.opacity;
     dots().focus();
     fireEvent.focus(dots());
     expect(tab().style.opacity).toBe("1");
     expect(tab().style.outline).toMatch(/2px solid/);
     fireEvent.blur(dots());
-    expect(tab().style.opacity).toBe("0");
+    expect(tab().style.opacity).toBe(rest);
     expect(tab().style.outline).toBe("none");
   });
 
@@ -387,10 +408,13 @@ describe("ColumnPullTab — two boundaries, two independent tabs", () => {
   }
 
   it("each owns its own hover state", () => {
+    // Both are painted now, so the discriminator is the EMPHASIS: hovering one takes that one to
+    // full and leaves its sibling at the resting weight. The failure this guards (one module-level
+    // ref, one shared listener) would light both.
     pair();
     fireEvent.mouseEnter(screen.getByTestId("left-tab"));
     expect(screen.getByTestId("left-tab-tab").style.opacity).toBe("1");
-    expect(screen.getByTestId("right-tab-tab").style.opacity).toBe("0");
+    expect(Number(screen.getByTestId("right-tab-tab").style.opacity)).toBeLessThan(1);
   });
 
   it("each drags its OWN column, from its own width and against its own clamps", () => {
@@ -552,12 +576,17 @@ describe("ConciergeDragGrip — 4×2, drags the concierge between sides", () => 
 });
 
 describe("the seam never swallows a click meant for a column — roborev 54691 / 54730", () => {
-  it("only the VISIBLE tab takes pointer events", () => {
+  it("the ZONE never takes pointer events, painted tab or not", () => {
+    // THE RULE THIS DESCRIBES SURVIVED THE 2026-08-08 REVERSAL; only its subject moved. The hazard
+    // was never the tab — it is the 30×52 ZONE, which overhangs ~15px into both columns straight
+    // over the agent rows, and it is inert unconditionally. The tab is a ~24×43 object centred on
+    // the rail that the user can now always see under the cursor, which is what earns it the right
+    // to take a press (that half is asserted in "is REACHABLE at rest" above).
     render(<ColumnPullTab width={360} onWidth={() => {}} min={240} max={640} label="Build column" testId="t" />);
-    const tab = screen.getByTestId("t-tab");
-    expect(tab.style.pointerEvents).toBe("none");
+    const zone = screen.getByTestId("t-zone");
+    expect(zone.style.pointerEvents).toBe("none");
     fireEvent.mouseEnter(screen.getByTestId("t"));
-    expect(tab.style.pointerEvents).toBe("auto");
+    expect(zone.style.pointerEvents).toBe("none");
   });
 
   it("abandons a drag whose release went missing, keeping the width the user last saw", () => {
@@ -594,9 +623,11 @@ describe("the reveal cannot be killed from inside the seam — roborev 54850", (
     // The tab is a DOM DESCENDANT of the rail (rail > zone > tab), so React dispatches
     // enter/leave along the DOM path to the common ancestor, not by visual geometry. A leave
     // handler ON THE TAB therefore fires with no matching enter when you move tab → rail, which
-    // cleared `hovered` while the pointer was still on the rail. The tab vanished and could not
-    // come back: hidden it is `pointerEvents:"none"`, and the pointer had never left the rail, so
-    // nothing would fire again until the user exited the seam entirely.
+    // cleared `hovered` while the pointer was still on the rail. Under the hover-only rule the tab
+    // then vanished and could not come back — hidden it was `pointerEvents:"none"`, and the pointer
+    // had never left the rail, so nothing would fire again until the user exited the seam entirely.
+    // The tab is painted and pressable at rest now, so the dead-reveal consequence is gone; the
+    // hover bookkeeping this pins is not, and a leave with no enter still strands the emphasis.
     render(
       <ColumnPullTab width={360} onWidth={() => {}} min={240} max={640} label="Build column" testId="t" />,
     );

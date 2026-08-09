@@ -111,28 +111,41 @@ describe("AgentSidebar — the two pull tabs", () => {
     expect(resizeTab()).not.toBe(overlayTab());
   });
 
-  it("is HIDDEN at rest and revealed by hovering the boundary", () => {
-    // The whole point of the replacement: the shell's most prominent seam carries no permanent
-    // grey furniture. The controls this replaced were painted at rest, which is what the founder
-    // called janky.
+  it("PAINTS at rest on THIS seam too, and strengthens on hover", () => {
+    // THE FOUNDER REVERSED THE HOVER-ONLY RULE, 2026-08-08 ("I don't see the vertical slider so
+    // yes, make it always show"), and this case asserted the old one. The reversal is scoped to
+    // `ColumnPullTab`, which all three seams share — so it lands here whether or not anyone
+    // remembers this file exists, and this case is what makes that consistency a stated contract
+    // rather than an accident. Some seams resting and others not would be worse than either rule.
+    //
+    // What he rejected remains rejected: that was TWO stacked controls on the edge. This is one
+    // tab, quiet at rest.
     render(<AgentSidebar project={mkProject()} />);
     const tab = screen.getByTestId("sidebar-pull-tab-tab");
-    expect(tab.style.opacity).toBe("0");
+    const rest = Number(tab.style.opacity);
+    expect(rest).toBeGreaterThan(0);
+    expect(rest).toBeLessThan(1);
     fireEvent.mouseEnter(rail());
     expect(tab.style.opacity).toBe("1");
     fireEvent.mouseLeave(rail());
-    expect(tab.style.opacity).toBe("0");
+    expect(Number(tab.style.opacity)).toBe(rest);
   });
 
-  it("never lets a hidden tab swallow a click aimed at a row", () => {
+  it("never lets the ZONE swallow a click aimed at a row", () => {
     // The zone straddles the seam and overhangs ~15px INTO this column, right over the agent rows.
     // An always-live rectangle there eats presses on a row's edge — so the zone is never
-    // pointer-active, and the tab takes events only while it is actually visible under the cursor.
+    // pointer-active, at rest or hovered.
+    //
+    // THE TAB IS A DIFFERENT QUESTION and it is now always pointer-active. That is not a weakening
+    // of this rule: the test it has to pass is whether there is a control the user can SEE under
+    // the cursor, and since the reversal above there always is. It is also required — inert, the
+    // pointer falls through the painted tab to the column beneath and the control cannot be
+    // pressed at all without first finding the 6px rail.
     render(<AgentSidebar project={mkProject()} />);
     const zone = screen.getByTestId("sidebar-pull-tab-zone");
     const tab = screen.getByTestId("sidebar-pull-tab-tab");
     expect(zone.style.pointerEvents).toBe("none");
-    expect(tab.style.pointerEvents).toBe("none");
+    expect(tab.style.pointerEvents).toBe("auto");
     fireEvent.mouseEnter(rail());
     expect(zone.style.pointerEvents).toBe("none");
     expect(tab.style.pointerEvents).toBe("auto");

@@ -8,10 +8,32 @@
 // was exactly that — "very janky, there's that secondary arrow pull tab below it… it should also
 // only show on hover."
 //
-// So: one tab, two ZONES, revealed on hover.
+// So: one tab, two ZONES.
 //
 //   ›    the chevron zone  — OVERLAY. Pull this column out over the column to its right.
 //   ⣿    the dot zone      — RESIZE. Drag to move the boundary; arrow keys nudge it.
+//
+// ── AND IT PAINTS AT REST NOW — the founder REVERSED the hover-only rule, 2026-08-08 ───────────
+// "I don't see the vertical slider so yes, make it always show." He had asked where the concierge's
+// resize control had gone and could not find it; it had shipped, and it was invisible.
+//
+// THAT IS NOT A CONTRADICTION OF THE NOTE ABOVE, and the difference is what this file has to keep
+// straight. What he rejected was TWO PERMANENT MARKS on the seam — a resize bar with a separate
+// arrow button stacked under it, two objects to read. This is ONE tab. Making one quiet tab visible
+// does not restore two loud ones, and the container chrome (surface + hairline) is load-bearing for
+// exactly that: it is what makes the chevron and the dots read as two ZONES OF ONE OBJECT rather
+// than as two marks. Do not strip it to make the resting state lighter — lower `REST_OPACITY`.
+//
+// The hover/focus/drag treatment is kept as the LOUD state rather than deleted, so the control still
+// answers the pointer; `shown` below is now "emphasised", not "rendered at all".
+//
+// THE PAINT WAS ONLY HALF OF WHY HE COULD NOT FIND IT. The other half was `pointerEvents`: the tab
+// was inert at rest, so the pointer fell THROUGH it to the column beneath and the rail never saw an
+// enter. The only thing that could reveal the control was landing inside the literal 6px rail —
+// a target you have to already know about. The tab takes pointer events unconditionally now, which
+// the roborev 54691/54730 rule permits on its own terms: the test there is whether there is a
+// control the user can SEE under the cursor, and now there always is. The ZONE stays inert forever
+// — that is the 15px overhang, and none of this touches it.
 //
 // And the round trip the founder specified: once the column is overlaid, clicking the DOTS snaps it
 // back into flow and hands the gesture back to resizing. That is why the dot zone is a button as
@@ -97,6 +119,16 @@ const DOT_GAP = 2;
 /** The chevron's box. Drawn at a heavier stroke than Feather's default — the "bolder" of the ask. */
 const ARROW = 12;
 const ARROW_STROKE = 3;
+/**
+ * THE RESTING WEIGHT — the one knob for "present but quiet", and the only one that should be turned.
+ *
+ * The seam repeats at every column edge, so whatever this number paints, the shell paints three of.
+ * Too heavy and it reads as the janky permanent chrome the header describes; too light and it is the
+ * invisible control that caused this reversal. If the founder wants it louder or quieter, change
+ * THIS — not the tab's background, border or dot colour, which are what hold the two zones together
+ * as one object.
+ */
+const REST_OPACITY = 0.6;
 
 export interface ColumnPullTabProps {
   /** Current width of the column this tab owns, in px. */
@@ -731,12 +763,13 @@ export function ColumnPullTab({
     gestureMax.current = null;
   };
 
-  // Visible while hovered, FOCUSED, or mid-drag.
-  //  • drag: the pointer leaves the tab on the first pixel of a drag, so a hover-only rule would
-  //    hide the control exactly while it is being used.
-  //  • focus: hover-only is a mouse rule. A keyboard user tabbing onto the dots would otherwise be
-  //    driving a control that paints nothing — the reason this is `shown`, and not merely an
-  //    outline, is that there would be nothing on screen for the outline to sit on.
+  // THE LOUD STATE — not "rendered at all", which is now unconditional (see the header's reversal
+  // note). The tab sits at `REST_OPACITY` the rest of the time; this is what takes it to full.
+  //  • hover: the ordinary "you are on the control I am about to obey".
+  //  • drag: the pointer leaves the tab on the first pixel of a drag, so keying only on hover would
+  //    dim the control exactly while it is being used.
+  //  • focus: hover is a mouse rule. A keyboard user tabbing onto the dots gets the same emphasis a
+  //    mouse user gets, and the ring below has a full-strength object to sit on.
   const shown = hovered || dragging || focused;
 
   return (
@@ -785,9 +818,10 @@ export function ColumnPullTab({
           rectangle went live the pointer was already over an agent row, and a press there was
           still swallowed. The zone is also 30×52 around a ~22×41 tab, so most of what it was
           claiming is dead space with no click of its own to receive.
-          Only the VISIBLE TAB takes pointer events now, and only while it is shown. That is a
-          control the user can actually see under the cursor, which is the whole test for whether
-          something has the right to swallow a press.
+          Only the TAB takes pointer events, and since 2026-08-08 it does so unconditionally —
+          because it is now unconditionally painted. That is a control the user can actually see
+          under the cursor, which is the whole test for whether something has the right to swallow
+          a press; the zone, which is mostly dead space around a ~24×43 tab, never passes it.
 
           HOVER IS OWNED SOLELY BY THE RAIL, and the tab must NOT carry its own enter/leave.
           I added a pair here on the premise that the tab overhangs the rail geometrically, so
@@ -805,10 +839,18 @@ export function ColumnPullTab({
           style={{
             ...tab,
             borderRadius: RADIUS.sm,
-            opacity: shown ? 1 : 0,
-            // At rest the tab must not take clicks: the zone above it overhangs 15px into each
-            // column, and an invisible control that swallows a click is worse than a visible one.
-            pointerEvents: shown ? "auto" : "none",
+            // ALWAYS PAINTED. `REST_OPACITY` at rest, full while hovered/focused/dragging — the
+            // founder's 2026-08-08 reversal, and the header explains why this is not the two-mark
+            // layout he rejected.
+            opacity: shown ? 1 : REST_OPACITY,
+            // AND ALWAYS PRESSABLE, which is the half of the fix that is not about paint. Inert, the
+            // pointer fell straight through the tab to the column under it, so the only way to reach
+            // this control was to land inside the 6px rail — and moving onto the visible tab from
+            // outside fired no enter at all, because a `pointerEvents:none` element is not hit-test
+            // eligible. The 54691/54730 rule is satisfied rather than waived: what may swallow a
+            // press is a control the user can see under the cursor, and the tab now always is one.
+            // The ZONE — the 30×52 rectangle overhanging 15px into both columns — stays inert.
+            pointerEvents: "auto",
             // THE FOCUS RING. Drawn on the tab rather than on whichever zone holds focus: the two
             // zones are 12px and 8px wide, and a ring that tight around a chevron reads as part of
             // the glyph. Ringing the whole object is also the honest picture — what the keyboard
