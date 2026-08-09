@@ -15,14 +15,14 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import type { Bead } from "../services/beads";
 
 const listBeads = vi.fn();
-const blockedBeadIds = vi.fn();
+const blockedBeadIdsOrNull = vi.fn();
 const ensureBeadsDb = vi.fn();
 vi.mock("../services/beads", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../services/beads")>();
   return {
     ...actual, // real bucketBeads / isBeadsUnavailable — the bucketing under test must be the real one
     listBeads: (...a: unknown[]) => listBeads(...a),
-    blockedBeadIds: (...a: unknown[]) => blockedBeadIds(...a),
+    blockedBeadIdsOrNull: (...a: unknown[]) => blockedBeadIdsOrNull(...a),
     ensureBeadsDb: (...a: unknown[]) => ensureBeadsDb(...a),
   };
 });
@@ -35,6 +35,7 @@ import {
   beadsPolledAt,
   snapshotUnchanged,
   COMPARED_BEAD_FIELDS,
+  BEADS_BLOCKED_REFRESH_MS,
   __resetBeadsRefreshInFlightForTest,
 } from "./beadsStore";
 import { useSettingsStore } from "./settingsStore";
@@ -75,15 +76,15 @@ async function poll(projectId: string, beads: Bead[], blocked: string[] = []): P
   // is that equal CONTENT arriving in new objects must not churn the store. Handing back the same
   // array would make every assertion below vacuous.
   listBeads.mockResolvedValueOnce(beads.map((b) => ({ ...b, labels: [...b.labels] })));
-  blockedBeadIds.mockResolvedValueOnce(new Set(blocked));
+  blockedBeadIdsOrNull.mockResolvedValueOnce(new Set(blocked));
   await useBeadsStore.getState().refresh(projectId, "/proj");
 }
 
 beforeEach(() => {
   listBeads.mockReset();
-  blockedBeadIds.mockReset();
+  blockedBeadIdsOrNull.mockReset();
   ensureBeadsDb.mockReset();
-  blockedBeadIds.mockResolvedValue(new Set<string>());
+  blockedBeadIdsOrNull.mockResolvedValue(new Set<string>());
   useBeadsStore.setState({ byProject: {}, loading: {}, error: {} });
   __resetBeadsRefreshInFlightForTest();
 });
@@ -156,11 +157,19 @@ describe("an unchanged poll preserves snapshot identity", () => {
   it("a bead moving between board columns is a change even though `beads` is identical", async () => {
     // `board = bucketBeads(beads, blocked)` and `blocked` is NOT stored, so beads alone cannot
     // decide this. Comparing only `beads` would freeze the board with `a` in the wrong column.
+    //
+    // The blocked set is read on its own SLOW cadence now (BEADS_BLOCKED_REFRESH_MS) and cached in
+    // between, so the two polls below have to straddle that window for the second `bd blocked` to
+    // run at all — which is the production mechanism, not a test backdoor. Fake timers move
+    // `Date.now()`, which is what the cache is keyed on; the mocked reads settle as microtasks and
+    // never touch a timer.
+    vi.useFakeTimers();
     const content = [bead({ id: "a", status: "open" })];
     await poll("p1", content, []);
     expect(selectBoard("p1")?.backlog.map((b) => b.id)).toEqual(["a"]);
     const board1 = selectBoard("p1");
 
+    vi.advanceTimersByTime(BEADS_BLOCKED_REFRESH_MS);
     await poll("p1", content, ["a"]); // same beads, now blocked
 
     expect(selectBoard("p1")).not.toBe(board1);

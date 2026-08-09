@@ -21,13 +21,13 @@ import React from "react";
 import type { Bead } from "../services/beads";
 
 const listBeads = vi.fn();
-const blockedBeadIds = vi.fn();
+const blockedBeadIdsOrNull = vi.fn();
 vi.mock("../services/beads", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../services/beads")>();
   return {
     ...actual,
     listBeads: (...a: unknown[]) => listBeads(...a),
-    blockedBeadIds: (...a: unknown[]) => blockedBeadIds(...a),
+    blockedBeadIdsOrNull: (...a: unknown[]) => blockedBeadIdsOrNull(...a),
     ensureBeadsDb: vi.fn(),
   };
 });
@@ -87,7 +87,7 @@ function Fleet({ projectId }: { projectId: string }) {
 async function poll(projectId: string, beads: Bead[]): Promise<void> {
   // Fresh objects each time — a real `bd` read never hands back the same array.
   listBeads.mockResolvedValueOnce(beads.map((b) => ({ ...b, labels: [...b.labels] })));
-  blockedBeadIds.mockResolvedValueOnce(new Set<string>());
+  blockedBeadIdsOrNull.mockResolvedValueOnce(new Set<string>());
   await act(async () => {
     await useBeadsStore.getState().refresh(projectId, "/proj");
   });
@@ -96,8 +96,8 @@ async function poll(projectId: string, beads: Bead[]): Promise<void> {
 beforeEach(() => {
   renders = 0;
   listBeads.mockReset();
-  blockedBeadIds.mockReset();
-  blockedBeadIds.mockResolvedValue(new Set<string>());
+  blockedBeadIdsOrNull.mockReset();
+  blockedBeadIdsOrNull.mockResolvedValue(new Set<string>());
   useBeadsStore.setState({ byProject: {}, loading: {}, error: {} });
   __resetBeadsRefreshInFlightForTest();
 });

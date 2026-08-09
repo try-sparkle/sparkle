@@ -22,14 +22,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // Tauri bridge. Everything else in this file switches `[tools].beads` OFF instead, so these mocks
 // are never reached by those rows — `refresh` returns before touching the service.
 const listBeads = vi.fn();
-const blockedBeadIds = vi.fn();
+const blockedBeadIdsOrNull = vi.fn();
 const ensureBeadsDb = vi.fn();
 vi.mock("../../services/beads", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../services/beads")>();
   return {
     ...actual,
     listBeads: (...a: unknown[]) => listBeads(...a),
-    blockedBeadIds: (...a: unknown[]) => blockedBeadIds(...a),
+    blockedBeadIdsOrNull: (...a: unknown[]) => blockedBeadIdsOrNull(...a),
     ensureBeadsDb: (...a: unknown[]) => ensureBeadsDb(...a),
   };
 });
@@ -411,9 +411,9 @@ describe("BeadPill — a bead in a project the founder is not looking at", () =>
 
   beforeEach(() => {
     listBeads.mockReset();
-    blockedBeadIds.mockReset();
+    blockedBeadIdsOrNull.mockReset();
     ensureBeadsDb.mockReset();
-    blockedBeadIds.mockResolvedValue(new Set());
+    blockedBeadIdsOrNull.mockResolvedValue(new Set());
     listBeads.mockResolvedValue([]);
     startPolling = vi
       .spyOn(useBeadsStore.getState(), "startPolling")

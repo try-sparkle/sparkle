@@ -18,13 +18,13 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 const listBeads = vi.fn();
-const blockedBeadIds = vi.fn();
+const blockedBeadIdsOrNull = vi.fn();
 vi.mock("../services/beads", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../services/beads")>();
   return {
     ...actual,
     listBeads: (...a: unknown[]) => listBeads(...a),
-    blockedBeadIds: (...a: unknown[]) => blockedBeadIds(...a),
+    blockedBeadIdsOrNull: (...a: unknown[]) => blockedBeadIdsOrNull(...a),
   };
 });
 
@@ -61,10 +61,10 @@ async function tick() {
 
 beforeEach(() => {
   listBeads.mockReset();
-  blockedBeadIds.mockReset();
+  blockedBeadIdsOrNull.mockReset();
   runDecomposeWatcherForPoll.mockReset();
   listBeads.mockResolvedValue([]);
-  blockedBeadIds.mockResolvedValue(new Set());
+  blockedBeadIdsOrNull.mockResolvedValue(new Set());
   useBeadsStore.setState({ byProject: {}, loading: {}, error: {} });
   useSettingsStore.setState({ beadsEnabled: true });
   __resetBeadsRefreshInFlightForTest(); // teardown no longer clears the guard; reset it explicitly

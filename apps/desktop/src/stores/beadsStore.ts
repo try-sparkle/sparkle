@@ -5,7 +5,7 @@
 import { create } from "zustand";
 import {
   listBeads,
-  blockedBeadIds,
+  blockedBeadIdsOrNull,
   bucketBeads,
   ensureBeadsDb,
   isBeadsUnavailable,
@@ -25,27 +25,144 @@ function beadsEnabled(): boolean {
   }
 }
 
-/** Default poll interval. bd is local + cheap, but 5s keeps the board feeling live without
- *  hammering the CLI. */
+/**
+ * The FLOOR on the poll cadence, and the fixed interval a caller gets by passing `intervalMs`
+ * explicitly. NOT what schedules an ordinary board poll any more — see `nextPollDelayMs`.
+ *
+ * ══ WHY A FIXED 5s INTERVAL WAS THE BUG, NOT THE BASELINE ══════════════════════════════════════
+ * `bd` is neither local-and-cheap nor a constant cost, which is what the old comment here assumed.
+ * Measured against this repo's real ~4,000-bead embedded-Dolt store:
+ *
+ *     bd version (opens no DB) :  ~230 ms
+ *     bd list --all -n 0 --json: 2740 / 4611 / 4463 ms   (4002 rows, 5.7 MB)
+ *     bd list --all -n 1 --json: 1681 / 2217 / 5177 ms   ← reading ONE row costs the same
+ *     bd blocked --json        : 1860 / 1466 / 1285 ms
+ *     bd update <id> (a WRITE) : 3438 / 3710 / 3866 / 29975 ms   ← the app's 30s ceiling
+ *
+ * Two facts follow. First, the cost is PER-INVOCATION, not per-row — a `-n 1` read costs what a
+ * full scan costs — so shrinking or paging the query buys nothing and only the NUMBER of `bd`
+ * processes matters. Second, one tick's work (a list + a blocked query, ~4.5–6.5 s together)
+ * takes LONGER than the 5s interval that scheduled it. An interval shorter than the work it
+ * launches saturates by construction: the store's lock is never free, and a user-initiated write
+ * queues behind a read backlog that refills faster than it drains — which is how a `bd update`
+ * reached the 30s ceiling and reported "whether the change landed is UNKNOWN". 44 distinct `bd`
+ * processes were observed in one 30s window (18 `list`, 12 `blocked`).
+ *
+ * The in-flight claim below stops those ticks from STACKING, but coalescing a convoy is not the
+ * same as leaving the store idle: it still ran back-to-back reads ~100% of the time.
+ *
+ * Kept exported and still honoured as an explicit `intervalMs` (several suites pin their cadence
+ * with it, and a caller that names an interval means it), but the poll now DERIVES its own.
+ */
 export const BEADS_POLL_INTERVAL_MS = 5000;
+
+/**
+ * Fraction of wall-clock time the board poll is allowed to keep the shared `bd` store busy.
+ *
+ * ══ THE CONSTANT TO JUSTIFY IS THE DUTY CYCLE, NOT AN INTERVAL ═════════════════════════════════
+ * An interval is a guess that goes wrong the moment the store's size changes; a duty cycle is a
+ * budget that holds at any speed. Waiting `factor × T` after a refresh that itself took `T` gives
+ * a cycle of `T × (1 + factor)`, of which `T` is busy — so the duty cycle is `1 / (1 + factor)`
+ * and is INDEPENDENT of T. Solving for a 20% budget gives factor 4.
+ *
+ * Against the measurements above (list only — the blocked query moved to its own cadence, see
+ * `BEADS_BLOCKED_REFRESH_MS`):
+ *
+ *     typical list ~4.0 s  → wait 16.0 s → 20.0 s cycle → 20% duty →  3 bd/min
+ *     worst   list  5.2 s  → wait 20.8 s → 26.0 s cycle → 20% duty → ~2 bd/min
+ *     a fast store, 0.3 s  → wait  1.2 s → clamped to the 5s floor →  12 bd/min
+ *
+ * versus the old fixed schedule: a 4.5–6.5 s refresh every 5 s ≈ 100% duty and 24 bd/min (a list
+ * AND a blocked query per tick). 20% is chosen because the thing being protected is a user write:
+ * at 20% duty a write arriving at a random moment has a 4-in-5 chance of finding the store idle,
+ * and in the remaining case waits out at most one read (~4 s) rather than an unbounded backlog.
+ * Pushing the budget lower would buy little — the write already gets in — and costs board
+ * liveness linearly.
+ */
+export const BEADS_POLL_DUTY_FACTOR = 4;
+
+/**
+ * Floor on the derived cadence — what a FAST store gets.
+ *
+ * Deliberately the old fixed interval: 5s is the cadence the board has always felt like, nobody
+ * has asked for faster, and this change must never be able to INCREASE the load it exists to cut.
+ * It binds whenever a refresh completes in under 1.25 s (= 5000 / the factor above), i.e. on a
+ * small backlog where the duty budget would allow a sub-second cadence that no human can read.
+ */
+export const BEADS_POLL_MIN_INTERVAL_MS = BEADS_POLL_INTERVAL_MS;
+
+/**
+ * Ceiling on the derived cadence — what a SLOW store gets, so it never goes silent.
+ *
+ * Binds only once a single refresh exceeds 15 s (= 60000 / the factor), which the measurements
+ * above put well outside normal: the store is already pathological by then. The cap trades the
+ * duty budget for a liveness floor at that point, because a board that has not moved in over a
+ * minute reads as broken to the person watching it, and a poll that never comes back can never
+ * observe the store recovering either. One minute also matches `BEADS_BLOCKED_REFRESH_MS`, so a
+ * fully-degraded project settles at ~2 `bd` processes a minute in total.
+ */
+export const BEADS_POLL_MAX_INTERVAL_MS = 60_000;
+
+/**
+ * How long the cached blocked-id set is reused before `bd blocked` is asked again.
+ *
+ * ══ WHY THE BLOCKED QUERY IS NOT PART OF A POLL TICK ANY MORE ══════════════════════════════════
+ * It is a WHOLE SEPARATE `bd` process with its own DB open (measured 1285–1860 ms), and it was
+ * firing on every tick — 12 of the 44 processes in the observed 30s window — to answer a question
+ * about a lane that holds THREE rows and changes only when someone adds or closes a dependency
+ * edge. That is a human action, not a background one, so a second-by-second answer is worth
+ * nothing. Decoupling it roughly HALVES the poll's process count on its own: a project polling at
+ * the derived ~20 s cadence drops from ~6 `bd` processes a minute to ~3 + 1.
+ *
+ * The lane is allowed to be stale by up to this window. It is NOT allowed to be spuriously EMPTY:
+ * a tick that skips the query reuses the last known set, and a FAILED query keeps it too (which is
+ * why the store reads `blockedBeadIdsOrNull` rather than the collapsing `blockedBeadIds`). An
+ * empty blocked lane is indistinguishable from a healthy one, so degrading to empty would be a
+ * silent wrong answer — the failure mode the `columnFor` docstring rejects derived lanes for.
+ *
+ * NOT derived from the list payload, which would cost zero processes and is the obvious idea:
+ * `dependency_count` counts CLOSED blockers too (a bead with all-closed deps is ready, not
+ * blocked), and `dependencies` mixes parent-child edges in with real blockers. A lane that lies is
+ * worse than a lane that lags.
+ */
+export const BEADS_BLOCKED_REFRESH_MS = 60_000;
+
+/**
+ * The delay before the next poll, derived from how long the last one actually took.
+ *
+ * Exported for direct unit tests of the clamps; the scheduler in `startPolling` is the only
+ * production caller. A non-finite or negative measurement (a clock that jumped backwards) falls
+ * back to the floor rather than propagating into the clamp.
+ */
+export function nextPollDelayMs(lastRefreshMs: number): number {
+  if (!Number.isFinite(lastRefreshMs) || lastRefreshMs < 0) return BEADS_POLL_MIN_INTERVAL_MS;
+  const derived = Math.round(BEADS_POLL_DUTY_FACTOR * lastRefreshMs);
+  return Math.min(BEADS_POLL_MAX_INTERVAL_MS, Math.max(BEADS_POLL_MIN_INTERVAL_MS, derived));
+}
 
 /** How long a single in-flight refresh may run before a later tick is allowed to STEAL its claim
  *  and retry. `bd` reads are unbounded (`run_bd` is a bare `Command::output()` with no timeout), so
  *  a scan blocked on the wedged store's lock can hang indefinitely; without a steal it would latch
  *  the concurrency guard for the rest of the session. Set well above a merely-slow-but-progressing
  *  scan (which the guard is meant to coalesce, not steal) so recovery only triggers for a genuinely
- *  stuck one: at 6× the interval a claim older than this is presumed hung. The steal fires at most
- *  once per window, so a wedged store retries on a slow trickle, never a convoy. */
+ *  stuck one: at 30s — 6× the old fixed interval, and far above every measured read — a claim older
+ *  than this is presumed hung. The steal fires at most once per window, so a wedged store retries on
+ *  a slow trickle, never a convoy.
+ *
+ *  DOUBLES AS THE ADAPTIVE POLLER'S WATCHDOG: the self-scheduling chain gives up waiting on a
+ *  refresh after exactly this long, so a tick still arrives while the claim is stealable and
+ *  recovery does not depend on a scan that may never return. See `startAdaptivePoller`. */
 export const BEADS_STALE_REFRESH_MS = 6 * BEADS_POLL_INTERVAL_MS;
 
 /**
  * How often the concierge re-reads the projects it is NOT looking at, so a bead id belonging to one
  * of them still resolves. `BeadPillHost` owns the sweep and the reasoning behind it.
  *
- * SIX TIMES SLOWER than the poll interval, deliberately. Every refresh is a `bd list --all` +
- * `bd blocked` pair against the shared embedded store, so sweeping N projects at the board's
- * cadence would multiply the exact subprocess load the in-flight guard above exists to contain —
- * for projects nobody is looking at. A cross-project pill needs EXISTENCE, which does not change
+ * SIX TIMES SLOWER than the poll FLOOR, deliberately. Every refresh is a `bd list --all` against
+ * the shared embedded store (plus a `bd blocked` on the slow cadence — see
+ * `BEADS_BLOCKED_REFRESH_MS`), so sweeping N projects at the board's cadence would multiply the
+ * exact subprocess load the in-flight guard above exists to contain — for projects nobody is
+ * looking at. A cross-project pill needs EXISTENCE, which does not change
  * second to second; the status dot lagging by up to this interval is the cheap half of the trade,
  * and the project the reader IS looking at keeps the fast cadence.
  */
@@ -227,9 +344,14 @@ interface BeadsState {
     runWatchers?: boolean,
     allowAutoInit?: boolean,
   ) => Promise<void>;
-  /** Start polling a project: refresh immediately, then every intervalMs. Idempotent in the sense
-   *  that matters — one timer per project — but REFERENCE-COUNTED, so N viewers of the same project
-   *  each hold the poller up and the timer stops when the last one lets go. See `viewers` below.
+  /** Start polling a project: refresh immediately, then on a cadence. Idempotent in the sense that
+   *  matters — one poller per project — but REFERENCE-COUNTED, so N viewers of the same project
+   *  each hold the poller up and it stops when the last one lets go. See `viewers` below.
+   *
+   *  `intervalMs` OMITTED (the normal case) means the cadence is DERIVED from how long each refresh
+   *  actually takes, so the shared `bd` store stays inside a duty-cycle budget however big the
+   *  backlog grows — see `BEADS_POLL_DUTY_FACTOR`. Passing one pins a fixed grid instead; a caller
+   *  that names an interval means it.
    *
    *  `kind` defaults to `"board"`, which is the historical behaviour — so a call site that predates
    *  this parameter cannot have been silently downgraded. A viewer must RELEASE with the same kind
@@ -244,8 +366,51 @@ interface BeadsState {
   stopPolling: (projectId: string, kind?: PollKind) => void;
 }
 
-// One interval per project, kept out of store state so timers never serialize / re-render.
-const timers = new Map<string, ReturnType<typeof setInterval>>();
+/**
+ * One poller per project, kept out of store state so timers never serialize / re-render.
+ *
+ * A poller owns its own teardown rather than exposing a raw handle, because there are now two
+ * shapes behind it — a fixed `setInterval` for a caller that named an interval, and a
+ * SELF-SCHEDULING `setTimeout` chain for the derived cadence — and only the poller knows which
+ * handles it has armed. `stopPolling` calls `stop()`; a chain that is mid-refresh when that
+ * happens must not re-arm, which a caller holding a handle could not enforce.
+ */
+interface Poller {
+  stop: () => void;
+}
+const timers = new Map<string, Poller>();
+
+/**
+ * The last blocked-id set read for each project, and when it was read.
+ *
+ * `at` is stamped on every ATTEMPT, not only on success, so a project whose `bd blocked` keeps
+ * failing is retried on the slow cadence rather than on every list poll — a failing query is still
+ * a `bd` process, and retrying it every tick would put back the load this cache removes. `ids`
+ * is only ever replaced by a successful read, so a failure leaves the previous (possibly
+ * populated) lane standing. See `BEADS_BLOCKED_REFRESH_MS`.
+ */
+interface BlockedCache {
+  ids: ReadonlySet<string>;
+  at: number;
+}
+const blockedCache = new Map<string, BlockedCache>();
+
+/**
+ * Read the blocked-id set for a project, asking `bd` only when the cache is cold or past its
+ * window. Never throws and never returns a spuriously empty set for a project whose lane was
+ * populated — see `BEADS_BLOCKED_REFRESH_MS` for why that distinction is the whole point.
+ */
+async function blockedIdsFor(projectPath: string, projectId: string): Promise<ReadonlySet<string>> {
+  const cached = blockedCache.get(projectId);
+  if (cached !== undefined && Date.now() - cached.at < BEADS_BLOCKED_REFRESH_MS) return cached.ids;
+  const fresh = await blockedBeadIdsOrNull(projectPath);
+  // Stamp the attempt either way; keep the previous ids when the query could not answer. A cold
+  // cache that fails settles on an empty lane — the same outcome the collapsing `blockedBeadIds`
+  // always gave — but a WARM one is never degraded by a transient failure.
+  const ids = fresh ?? cached?.ids ?? new Set<string>();
+  blockedCache.set(projectId, { ids, at: Date.now() });
+  return ids;
+}
 /**
  * The `refresh` currently in flight for each project — the per-project CONCURRENCY-1 guard.
  *
@@ -335,6 +500,10 @@ export function __resetBeadsRefreshInFlightForTest(): void {
   // Freshness is module-scope too, so a case that polled project "p1" would otherwise leave the
   // next case's "p1" looking already-fresh.
   polledAt.clear();
+  // Likewise the blocked-id cache: a case that read a populated blocked set for "p1" would
+  // otherwise hand it to the next case, whose `bd blocked` mock is then never consulted — turning
+  // an assertion about the lane into an assertion about the previous test.
+  blockedCache.clear();
 }
 /**
  * How many mounted viewers currently want each project polled.
@@ -388,6 +557,118 @@ function armVisibilityRefresh(projectId: string, projectPath: string): void {
   document.addEventListener("visibilitychange", onVisible);
 }
 
+/** One poll: the visibility gate, then a refresh whose watcher flag is asked FOR THIS TICK.
+ *
+ *  `wantsWatchers` is asked every time rather than captured when the poller was armed: the last
+ *  board can close while a passive viewer keeps the poller alive, and from that moment the
+ *  decompose watcher must stop running. Returns the refresh promise, or `undefined` when the tick
+ *  was skipped because nobody is looking. */
+function pollOnce(
+  projectId: string,
+  projectPath: string,
+  checkVisibility: boolean,
+): Promise<void> | undefined {
+  // Don't shell out to `bd` for a window nobody's looking at — a backgrounded Tasks tab would
+  // otherwise spawn a subprocess every interval for hours doing work no one sees. Skip the spawn
+  // and arm a one-shot listener that re-syncs the board the moment it's visible again.
+  if (checkVisibility && typeof document !== "undefined" && document.visibilityState === "hidden") {
+    armVisibilityRefresh(projectId, projectPath);
+    return undefined;
+  }
+  return useBeadsStore.getState().refresh(projectId, projectPath, wantsWatchers(projectId));
+}
+
+/** The poller a caller gets by naming an `intervalMs`: a plain fixed-grid `setInterval`, exactly as
+ *  before. Ticks fire on wall-clock regardless of whether the previous refresh has settled — the
+ *  in-flight claim is what keeps that from stacking, and the steal path depends on a tick arriving
+ *  while a hung scan is still latched. A caller that names an interval means it. */
+function startFixedPoller(projectId: string, projectPath: string, intervalMs: number): Poller {
+  // Fire immediately so the board isn't empty for a full interval, then on the caller's cadence.
+  void pollOnce(projectId, projectPath, false);
+  const timer = setInterval(() => void pollOnce(projectId, projectPath, true), intervalMs);
+  return { stop: () => clearInterval(timer) };
+}
+
+/**
+ * The default poller: a self-scheduling chain that waits `nextPollDelayMs(<how long that refresh
+ * took>)` after each completed refresh, so the store's duty cycle stays inside the budget however
+ * big the backlog grows. See `BEADS_POLL_DUTY_FACTOR` for the arithmetic.
+ *
+ * ══ WHY IT DOES NOT SIMPLY `await` THE REFRESH ═════════════════════════════════════════════════
+ * A `bd` read is unbounded (`run_bd` has no timeout), so a scan against a wedged store can hang
+ * forever. A chain that waits for its own refresh before re-arming would then stop for good — and
+ * with it the ONLY thing that fires the stale-claim steal in `refresh`, which is what recovers a
+ * wedged project. The fixed interval got that for free by ignoring in-flight state; the chain has
+ * to buy it back, so it gives up waiting after `BEADS_STALE_REFRESH_MS`.
+ *
+ * That bound is the steal window and not a new constant on purpose: waiting LONGER would push
+ * recovery past the moment the claim became stealable, and waiting less would only produce ticks
+ * the in-flight claim drops. A tick with no measurement behind it re-arms at the floor, because a
+ * dropped tick costs nothing — it spawns no process — and the point of it is to let the steal path
+ * run, not to read anything.
+ */
+function startAdaptivePoller(projectId: string, projectPath: string): Poller {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let watchdog: ReturnType<typeof setTimeout> | undefined;
+  let stopped = false;
+  /** The delay to use when this tick produced no measurement (skipped or unsettled). */
+  let lastDelay = BEADS_POLL_MIN_INTERVAL_MS;
+
+  const arm = (delay: number) => {
+    if (stopped) return; // torn down mid-refresh: never re-arm, or stopPolling would not stop it
+    timer = setTimeout(() => void tick(), delay);
+  };
+
+  /** Resolve true if the refresh settled within the steal window, false if we gave up waiting. */
+  const settleWithin = (p: Promise<void>): Promise<boolean> =>
+    new Promise<boolean>((resolve) => {
+      let done = false;
+      const finish = (settled: boolean) => {
+        if (done) return;
+        done = true;
+        if (watchdog !== undefined) clearTimeout(watchdog);
+        watchdog = undefined;
+        resolve(settled);
+      };
+      watchdog = setTimeout(() => finish(false), BEADS_STALE_REFRESH_MS);
+      // `refresh` never rejects, but treat a rejection as settled rather than hanging the chain.
+      void p.then(
+        () => finish(true),
+        () => finish(true),
+      );
+    });
+
+  const tick = async (first = false) => {
+    timer = undefined;
+    if (stopped) return;
+    const startedAt = Date.now();
+    const running = pollOnce(projectId, projectPath, !first);
+    if (running === undefined) {
+      arm(lastDelay); // hidden window: nothing measured, keep the chain alive at the last cadence
+      return;
+    }
+    const settled = await settleWithin(running);
+    lastDelay = settled ? nextPollDelayMs(Date.now() - startedAt) : BEADS_POLL_MIN_INTERVAL_MS;
+    arm(lastDelay);
+  };
+
+  // Fire immediately so the board isn't empty for a full cadence. The first refresh is also the
+  // first MEASUREMENT, which is why it goes through the chain rather than beside it.
+  void tick(true);
+
+  return {
+    stop: () => {
+      stopped = true;
+      if (timer !== undefined) clearTimeout(timer);
+      timer = undefined;
+      // A chain torn down while waiting on a refresh leaves this armed; clear it so teardown
+      // leaves NOTHING pending. (`arm` would no-op anyway — this is about not holding a timer.)
+      if (watchdog !== undefined) clearTimeout(watchdog);
+      watchdog = undefined;
+    },
+  };
+}
+
 export const useBeadsStore = create<BeadsState>()((set) => ({
   byProject: {},
   loading: {},
@@ -401,8 +682,11 @@ export const useBeadsStore = create<BeadsState>()((set) => ({
     if (!beadsEnabled()) {
       // Drop the freshness stamp with the snapshot. Leaving it would make the cross-project sweep
       // treat a project whose snapshot we just discarded as recently read, so re-enabling beads
-      // would show dead ids for up to a full sweep interval.
+      // would show dead ids for up to a full sweep interval. The cached blocked set goes with it
+      // for the same reason: it would otherwise outlive the snapshot it belongs to and bucket the
+      // first post-re-enable read against a set up to BEADS_BLOCKED_REFRESH_MS old.
       polledAt.delete(projectId);
+      blockedCache.delete(projectId);
       set((s) => ({
         byProject: { ...s.byProject, [projectId]: undefined },
         loading: { ...s.loading, [projectId]: false },
@@ -474,11 +758,15 @@ export const useBeadsStore = create<BeadsState>()((set) => ({
     };
     commit((s) => ({ loading: { ...s.loading, [projectId]: true } }));
     try {
-      // CONCURRENTLY, not in sequence. `list_beads` is the 5s-poll hot path the perf work in
-      // notes.rs targets, and the blocked query is independent of it — running them together costs
-      // one wall-clock round trip instead of two. `blockedBeadIds` never rejects (it degrades to an
-      // empty set), so this cannot turn a working board into a failed one.
-      const [beads, blocked] = await Promise.all([listBeads(projectPath), blockedBeadIds(projectPath)]);
+      // CONCURRENTLY, not in sequence — on the ticks where the blocked query runs at all. It is
+      // independent of the list, so when both are due they cost one wall-clock round trip instead
+      // of two; most ticks now answer `blockedIdsFor` from cache and spawn no second process (see
+      // BEADS_BLOCKED_REFRESH_MS). Neither call rejects, so this cannot turn a working board into
+      // a failed one.
+      const [beads, blocked] = await Promise.all([
+        listBeads(projectPath),
+        blockedIdsFor(projectPath, projectId),
+      ]);
       const board = bucketBeads(beads, blocked);
       commitSnapshot(beads, board);
       // Post-poll auto-decompose watcher (spec §7). Every guard (main-window election, AI gate,
@@ -515,7 +803,7 @@ export const useBeadsStore = create<BeadsState>()((set) => ({
           await ensureBeadsDb(projectPath);
           const [beads, blocked] = await Promise.all([
             listBeads(projectPath),
-            blockedBeadIds(projectPath),
+            blockedIdsFor(projectPath, projectId),
           ]);
           const board = bucketBeads(beads, blocked);
           commitSnapshot(beads, board);
@@ -572,7 +860,7 @@ export const useBeadsStore = create<BeadsState>()((set) => ({
     }
   },
 
-  startPolling: (projectId, projectPath, intervalMs = BEADS_POLL_INTERVAL_MS, kind = "board") => {
+  startPolling: (projectId, projectPath, intervalMs, kind = "board") => {
     // ══ THE CLAIM IS TAKEN FIRST, BEFORE EVERY GATE ═════════════════════════════════════════════
     // A claim tracks a MOUNTED VIEWER, and `stopPolling` releases unconditionally, so anything that
     // makes the claim conditional makes the two asymmetric — and an unmatched release then tears the
@@ -587,22 +875,13 @@ export const useBeadsStore = create<BeadsState>()((set) => ({
     viewers.set(projectId, (viewers.get(projectId) ?? 0) + 1);
     if (kind === "board") boardViewers.set(projectId, (boardViewers.get(projectId) ?? 0) + 1);
     if (!beadsEnabled()) return; // Beads off: don't arm a timer (refresh would no-op anyway)
-    if (timers.has(projectId)) return; // already polling — one timer per project
-    // Fire immediately so the board isn't empty for a full interval, then on a cadence.
-    void useBeadsStore.getState().refresh(projectId, projectPath, wantsWatchers(projectId));
-    const timer = setInterval(() => {
-      // Don't shell out to `bd` for a window nobody's looking at — a backgrounded Tasks tab would
-      // otherwise spawn a subprocess every interval for hours doing work no one sees. Skip the
-      // spawn and arm a one-shot listener that re-syncs the board the moment it's visible again.
-      if (typeof document !== "undefined" && document.visibilityState === "hidden") {
-        armVisibilityRefresh(projectId, projectPath);
-        return;
-      }
-      // ASKED EVERY TICK, not captured when the timer was armed: the last board can close while a
-      // passive viewer keeps the timer alive, and from that moment the watcher must stop running.
-      void useBeadsStore.getState().refresh(projectId, projectPath, wantsWatchers(projectId));
-    }, intervalMs);
-    timers.set(projectId, timer);
+    if (timers.has(projectId)) return; // already polling — one poller per project
+    timers.set(
+      projectId,
+      intervalMs === undefined
+        ? startAdaptivePoller(projectId, projectPath)
+        : startFixedPoller(projectId, projectPath, intervalMs),
+    );
   },
 
   stopPolling: (projectId, kind = "board") => {
@@ -629,9 +908,11 @@ export const useBeadsStore = create<BeadsState>()((set) => ({
     // teardown would therefore miss exactly that project, and (being untokenized) could free a claim
     // a remount had already replaced. Recovery is instead time-based: a claim older than
     // BEADS_STALE_REFRESH_MS is stolen by a later tick in `refresh`, which covers every project.
-    const timer = timers.get(projectId);
-    if (timer !== undefined) {
-      clearInterval(timer);
+    // The poller owns its own teardown — a fixed interval clears one handle, the adaptive chain
+    // also has to refuse to re-arm if it is mid-refresh right now. See `Poller`.
+    const poller = timers.get(projectId);
+    if (poller !== undefined) {
+      poller.stop();
       timers.delete(projectId);
     }
     // Tear down any armed visibility listener so it can't fire a refresh after the board unmounts.

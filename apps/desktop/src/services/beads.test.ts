@@ -6,6 +6,8 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invokeMock
 
 import {
   listBeads,
+  blockedBeadIds,
+  blockedBeadIdsOrNull,
   ensureBeadsDb,
   beadShow,
   columnFor,
@@ -152,6 +154,39 @@ describe("beadShow", () => {
   it("returns null when the array is empty", async () => {
     invokeMock.mockResolvedValue("[]");
     expect(await beadShow("/proj", "missing")).toBeNull();
+  });
+});
+
+// ── The blocked query has TWO failure contracts, and the difference is the whole point ──────────
+//
+// `beadsStore` caches this answer and reuses it between slow-cadence reads, so it must be able to
+// tell "bd says nothing is blocked" from "we could not reach bd" — collapsing the second to an
+// empty set would silently wipe a populated Blocked lane on one transient failure. The store's own
+// suite mocks `blockedBeadIdsOrNull`, so without these cases the null-on-failure contract it
+// depends on would be asserted nowhere and could be quietly removed.
+describe("blockedBeadIdsOrNull vs blockedBeadIds", () => {
+  it("returns the ids on success, for both", async () => {
+    invokeMock.mockResolvedValue(JSON.stringify([{ id: "a" }, { id: "b" }]));
+    expect([...((await blockedBeadIdsOrNull("/p")) ?? [])]).toEqual(["a", "b"]);
+    expect([...(await blockedBeadIds("/p"))]).toEqual(["a", "b"]);
+  });
+
+  it("reports a REJECTED call as null, and never as an empty set", async () => {
+    invokeMock.mockRejectedValue(new Error("bd exploded"));
+    expect(await blockedBeadIdsOrNull("/p")).toBeNull();
+  });
+
+  it("reports UNPARSEABLE output as null too", async () => {
+    invokeMock.mockResolvedValue("not json at all");
+    expect(await blockedBeadIdsOrNull("/p")).toBeNull();
+  });
+
+  it("the collapsing wrapper still degrades a failure to an empty set for its own callers", async () => {
+    // The concierge board/plans tools read this one and want a lane, not an error.
+    invokeMock.mockRejectedValue(new Error("bd exploded"));
+    const ids = await blockedBeadIds("/p");
+    expect(ids).toBeInstanceOf(Set);
+    expect(ids.size).toBe(0);
   });
 });
 

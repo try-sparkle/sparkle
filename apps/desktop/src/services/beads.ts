@@ -95,7 +95,7 @@ export async function listBeads(projectPath: string): Promise<Bead[]> {
 }
 
 /**
- * The ids of beads bd considers BLOCKED — open, with at least one unmet blocker.
+ * The ids of beads bd considers BLOCKED, or `null` when we could not ask.
  *
  * Blocked is DERIVED from dependency edges, not stored: `BeadStatus` is only
  * open | in_progress | closed, and this repo never writes a "blocked" status. The temptation is to
@@ -103,16 +103,37 @@ export async function listBeads(projectPath: string): Promise<Bead[]> {
  * direction that matters, because a bead whose dependencies are all CLOSED has a non-zero count and
  * is perfectly ready. So the board asks bd the question bd can answer.
  *
- * Never throws: the Rust side degrades a missing/failing `bd blocked` to an empty list, and a parse
- * failure here does the same. A quiet Blocked lane beats a board that will not load.
+ * ══ WHY A NULLABLE VARIANT EXISTS AT ALL ═══════════════════════════════════════════════════════
+ * `blockedBeadIds` below collapses a failure to an empty set, which is the right default for a
+ * one-shot read: a quiet Blocked lane beats a board that will not load. It is the WRONG default for
+ * a CACHED reader — `beadsStore` now re-asks this question on a much slower cadence than the list
+ * poll and reuses the previous answer in between, so it must be able to tell "bd says nothing is
+ * blocked" from "we could not reach bd", or one transient failure would wipe a populated lane and
+ * the board would keep showing it empty until the next slow-cadence window.
+ *
+ * NOTE the limit of this signal: the Rust side already degrades a missing/failing `bd blocked` to
+ * an EMPTY LIST rather than an error, so `null` reports only the failures that reach us — the IPC
+ * call rejecting, or output we cannot parse. It is a floor on detectable failure, not a complete
+ * one. That is still strictly better than the collapse, and it is the only honest signal available
+ * without changing the Rust command's contract.
  */
-export async function blockedBeadIds(projectPath: string): Promise<Set<string>> {
+export async function blockedBeadIdsOrNull(projectPath: string): Promise<Set<string> | null> {
   try {
     const raw = await invoke<string>("blocked_beads", { projectPath });
     return new Set(parseBeadArray(raw, "blocked_beads").map((b) => b.id));
   } catch {
-    return new Set();
+    return null;
   }
+}
+
+/**
+ * The ids of beads bd considers BLOCKED — open, with at least one unmet blocker.
+ *
+ * Never throws: a failure degrades to an empty set (see `blockedBeadIdsOrNull` for the variant that
+ * reports the failure, and for why the board needs it).
+ */
+export async function blockedBeadIds(projectPath: string): Promise<Set<string>> {
+  return (await blockedBeadIdsOrNull(projectPath)) ?? new Set();
 }
 
 /** Ensure the project has a beads database, creating one (`bd init`) if none resolves yet.
