@@ -290,54 +290,74 @@ describe("escalatedStatus resolves agents by index, not by scanning", () => {
     //   · When the scans ARE fixed, the numbers in this file's header and in AgentSidebar's
     //     `agentsById` comment become false, and nothing else would force those to be updated.
     //
-    // ⚠️ WHAT A RED MEANS IS ATTACHED TO EACH ASSERTION, NOT WRITTEN OUT HERE (roborev 60721).
+    // ⚠️ WHAT A RED MEANS IS ATTACHED TO EACH ASSERTION, NOT WRITTEN OUT HERE.
     // This block used to carry a prose decision tree enumerating the failing conditions, and it
-    // drifted from the assertions THREE TIMES in a row — each fix to an assertion left the tree
-    // describing the old one, and twice the stale tree would have routed a maintainer into exactly
-    // the wrong action (deleting a live pin; re-wiring a working instrument). A condition restated
-    // in prose beside the code that computes it is a second source of truth with no test. So the
-    // guidance now lives in each assertion's own failure message, where it is impossible to read
-    // without also seeing the value that produced it, and cannot describe a threshold other than
-    // the one being applied.
+    // drifted from the assertions on every single round of review that touched them (roborev
+    // 60615, 60648, 60697, 60721, 60736, 61308) — each fix to an assertion left the tree
+    // describing the old one, and more than once the stale tree would have routed a maintainer
+    // into exactly the wrong action: deleting a live pin, or re-wiring a working instrument. A
+    // condition restated in prose beside the code that computes it is a second source of truth
+    // with no test. So the guidance lives in each assertion's own failure message, where it cannot
+    // be read without the value that produced it and cannot name a threshold other than the one
+    // being applied.
+    //
+    // (That count is deliberately a LIST OF JOBS rather than a number. The number was itself a
+    // restated fact that went stale — it still said "three times" on the fourth round.)
     const AGENT_STEP = 30; // 60 - 30, the fleet-size increment measured above
 
-    /** What a maintainer must do when a per-agent liveness assertion goes red. */
-    const liveness = (scan: string, n: number, bead: string) =>
-      `LIVENESS: '${scan}' ran fewer than one scan per agent at n=${n}. This does NOT by itself ` +
-      `mean ${bead} landed — do not delete this block yet. ZERO means the counting override is ` +
-      `no longer reached at all (a derived/copied array now arrives at the call site): re-wire ` +
-      `the instrument, the scan is untouched. NON-ZERO BUT UNDER ${n} means either a per-agent ` +
-      `call site went dead OR fewer rows now reach the escalatable path (a partial fix) — find ` +
-      `the call site before concluding anything. Note that liveness and the delta below can go ` +
-      `red together for one underlying cause, so read both, not just the first.`;
+    // ── ONE LIVENESS PROBE, AND IT IS `find` (roborev 61308) ────────────────────────────────────
+    // This used to be a per-scan `calls >= n` check on `some` and `filter`, with a three-case prose
+    // taxonomy attached. Both were wrong, in the same way and for the third time:
+    //
+    //   · The taxonomy was written for `some`, whose success value IS zero, and then handed to
+    //     `filter`, whose success value is NOT — the header table records ~8 constant-count
+    //     `filter` calls at n=30. So the day sparkle-k3wab lands, `filter30.calls ≈ 8` fell into
+    //     the case whose text says "neither of those", actively excluding the bead-landed reading
+    //     for the very bead the message names.
+    //   · `some`'s success value being zero meant its liveness red and its delta red fired
+    //     together, printing "re-wire, the scan is untouched" beside "DELETE this block" — two
+    //     contradictory instructions in one output, one of which deletes a live pin.
+    //
+    // The mistake both times was ENUMERATING cases in prose keyed to values the prose then got
+    // wrong. So the absolute per-scan checks are gone. Two facts are measured directly instead, and
+    // each assertion says only what its own number can support:
+    //
+    //   `find`  — a CONSTANT scan (6 calls at both sizes) over this same instrumented array, so it
+    //             answers "are the overrides reached at all", and nothing else.
+    //   delta   — (calls at 60) − (calls at 30). Subtracting cancels every constant-count scan, so
+    //             it isolates the PER-AGENT term whatever that scan's absolute baseline happens to
+    //             be. That is what makes it correct for `filter` and `some` alike.
+    const instrumentAlive =
+      `INSTRUMENT: no 'find' scan was counted, so the counting overrides are not being reached at ` +
+      `all — something now hands this call site a DERIVED or COPIED array ([...project.agents], a ` +
+      `memoised copy, topLevelAgents(...)). Every other counter reads zero for THAT reason, not ` +
+      `because a scan was optimised away. RE-WIRE the instrument: do not delete anything, and do ` +
+      `not write "the scan is gone" into the header.`;
+    expect.soft(find30.calls, instrumentAlive).toBeGreaterThan(0);
+    expect.soft(find60.calls, instrumentAlive).toBeGreaterThan(0);
 
-    /** What a maintainer must do when a per-agent DELTA assertion goes red. */
+    /** What a maintainer must do when a per-agent term assertion goes red. */
     const delta = (scan: string, bead: string) =>
-      `PER-AGENT DELTA: 30 more agents no longer cost 30 more '${scan}' scans. ZERO (with ` +
-      `liveness above holding) means ${bead} landed: DELETE this block and correct the prose it ` +
-      `names — the header table and AgentSidebar's agentsById comment. Any other value means the ` +
-      `per-agent shape changed: LARGER is a new scan, SMALLER is a partial fix. Do not assume ` +
-      `growth, and do not delete.`;
+      `PER-AGENT TERM ('${scan}'): 30 more agents no longer cost 30 more '${scan}' scans of the ` +
+      `agents array. ZERO means the per-agent scan no longer runs over THIS array — and the ` +
+      `counters cannot tell you which of two causes that is: ${bead} landed (the scan was replaced ` +
+      `by an index), or this one call site is now handed a derived/copied array while the ` +
+      `constant-count scans still see the instrumented one. They are genuinely indistinguishable ` +
+      `from here, so READ THE CALL SITE: scan gone → DELETE this block and correct the prose it ` +
+      `names (the header table, and AgentSidebar's agentsById comment); still scanning a copy → ` +
+      `re-wire the instrument and delete nothing. Any value other than 0 or ${AGENT_STEP} means ` +
+      `the per-agent shape changed — LARGER is a new scan, SMALLER a partial fix. Note this is a ` +
+      `DELTA on purpose: '${scan}' has constant-count callers too, so its absolute count at ` +
+      `success is not necessarily zero, and only the delta isolates the per-agent term.`;
 
-    // Asserted as a per-agent DELTA rather than an absolute count so a constant-count scan added
-    // later cannot masquerade as a change in the per-agent term (roborev 60615), and liveness is
-    // asserted PER AGENT rather than merely non-zero because both counters also tally the handful
-    // of constant-count scans the header documents — ~8 of `filter`'s 38 calls at n=30 — which is
-    // enough to fake a `> 0` check on a dead per-agent call site (roborev 60697).
-    expect(some30.calls, liveness("some", 30, "sparkle-z5gq8")).toBeGreaterThanOrEqual(30);
-    expect(some60.calls, liveness("some", 60, "sparkle-z5gq8")).toBeGreaterThanOrEqual(60);
-    expect(filter30.calls, liveness("filter", 30, "sparkle-k3wab")).toBeGreaterThanOrEqual(30);
-    expect(filter60.calls, liveness("filter", 60, "sparkle-k3wab")).toBeGreaterThanOrEqual(60);
-
-    // `some`, via engine/inMotion.isInMotion — one full scan per escalatable agent.
-    expect(some60.calls - some30.calls, delta("some", "sparkle-z5gq8")).toBe(AGENT_STEP);
-    expect(some60.visits).toBeGreaterThan(some30.visits * 2);
+    expect.soft(some60.calls - some30.calls, delta("some", "sparkle-z5gq8")).toBe(AGENT_STEP);
+    expect.soft(some60.visits).toBeGreaterThan(some30.visits * 2);
     // `filter`, via the per-id `agents.filter((a) => a.parentId === id)` callbacks on the render
     // path — the largest of the three, and roughly 2.2× the 1,830 visits this change removed
     // (4,080 vs 1,830 at n=60; NOT an order of magnitude, which an earlier version of this comment
     // claimed while sitting 270 lines under the table that disproves it — roborev 60615).
-    expect(filter60.calls - filter30.calls, delta("filter", "sparkle-k3wab")).toBe(AGENT_STEP);
-    expect(filter60.visits).toBeGreaterThan(filter30.visits * 2);
+    expect.soft(filter60.calls - filter30.calls, delta("filter", "sparkle-k3wab")).toBe(AGENT_STEP);
+    expect.soft(filter60.visits).toBeGreaterThan(filter30.visits * 2);
   });
 
   it("STILL ASKS ABOUT EVERY AGENT — the lookups are indexed, not skipped", () => {
