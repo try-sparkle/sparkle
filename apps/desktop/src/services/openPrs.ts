@@ -696,15 +696,34 @@ export function prReadyCount(prs: readonly PrJudgeable[]): number {
 export type JudgedPrRow = PrRow & { probes?: PrProbeState };
 
 /**
+ * How many of `prs` report `blocker` as the ONE fact their row states.
+ *
+ * DELIBERATELY NOT "not ready minus ready", and never a second predicate of its own. Every PR that
+ * is not green is blocked on SOMETHING, and the whole point of {@link PrBlocker} is that the ranking
+ * picks exactly one. Counting "PRs that have a conflict" by re-testing `mergeable` would put a PR
+ * whose visible row reads "No merge rights" into a conflict tally, and send the reader to rebase a
+ * branch whose actual problem is an access token.
+ *
+ * WHY THE CALLERS NEED THIS SPLIT AT ALL (the founder's 2026-08-09 report). His summary said four
+ * PRs needed merging; three were red because CI had failed and one because it conflicts. Those are
+ * two different asks — the first three needed a re-run he had already triggered, the fourth needs a
+ * human to decide how to rebase — and one undifferentiated "4" told him neither.
+ */
+export function prBlockerCount(
+  prs: readonly PrJudgeable[],
+  blocker: Exclude<PrBlocker, null>,
+): number {
+  return prs.filter((p) => prMergeReadiness(p).blocker === blocker).length;
+}
+
+/**
  * How many of `prs` are blocked on unanswered knightwatch probes — the "8 blocked" in the header.
  *
- * DELIBERATELY NOT "not ready minus ready". A PR blocked on a conflict is also not ready, and
- * counting it here would put it behind a word that tells the reader to go and answer a probe that
- * does not exist. This counts the PRs whose SPECIFIC blocker is a probe, which is what the header
- * claims and what the reader will act on.
+ * Kept as its own name because the header's sentence is about probes specifically; it delegates so
+ * there is one implementation of "count the rows whose stated blocker is X".
  */
 export function prProbeBlockedCount(prs: readonly PrJudgeable[]): number {
-  return prs.filter((p) => prMergeReadiness(p).blocker === "probes").length;
+  return prBlockerCount(prs, "probes");
 }
 
 /**

@@ -203,7 +203,8 @@ import {
 } from "./Concierge/mentions";
 import { classifyComposerRoute } from "./Concierge/composerRoute";
 import { useMountedNotice } from "../hooks/useMountedNotice";
-import { buildDigest } from "../services/conciergeDigest";
+import { buildDigest, type DigestReadiness } from "../services/conciergeDigest";
+import { usePrReadinessStore } from "../stores/prReadinessStore";
 import { isSparkleAgentId, SPARKLE_AGENT_NAME } from "../services/sparkleAgent";
 import {
   agentTranscriptWorktree,
@@ -5245,6 +5246,24 @@ export function ConciergeHost({
   // reflected in both places, rather than a header control that can disagree with the column.
   const needsYouIsolated = useUiStore((s) => isAskingIsolated(s.statusFilter));
 
+  // ── WHAT GITHUB SAID, so "N need merge" can say how many of those N actually can ────────────────
+  //
+  // Written by `OpenPrMenu` (the app's one pull-request probe, mounted in this column's own header
+  // via `ConciergePrChip`); see `stores/prReadinessStore` for why it travels as a store.
+  //
+  // TWO SUBSCRIPTIONS, NOT ONE OBJECT SELECTOR. zustand compares a selector's result by identity, so
+  // `(s) => ({ probed: …, ready: … })` mints a new object every call and re-renders this host on
+  // every unrelated store write. Each field is a stable array reference between publishes, and the
+  // publish itself is dropped when nothing changed (`sameSnapshot`), so this host repaints only when
+  // the readiness answer really moved.
+  const probedProjectIds = usePrReadinessStore((s) => s.probedProjectIds);
+  const readyAgentIds = usePrReadinessStore((s) => s.readyAgentIds);
+  const prReadiness: DigestReadiness = useMemo(() => {
+    const probed = new Set(probedProjectIds);
+    const ready = new Set(readyAgentIds);
+    return { probed: (id) => probed.has(id), agentReady: (id) => ready.has(id) };
+  }, [probedProjectIds, readyAgentIds]);
+
   const model: ConciergeViewModel = useMemo(() => {
     // DIGEST, don't enumerate (bead sparkle-4562.4). One item of a priority keeps its card; two or
     // more become a single line. Without this, eight P0s and nineteen P1s meant twenty-seven cards
@@ -5262,7 +5281,11 @@ export function ConciergeHost({
     // grouped line carrying a TRUE count, never 27 cards. Asked directly, he chose exactly that:
     // "one honest group — one row reading '27 need merge' that expands in place". Excluding it is
     // what let the column report "0 Need you" over 27 un-landed PRs.
-    const unmerged = buildDigest(accountedUnmerged(feed), "unmerged");
+    // AND IT CARRIES THE READINESS SPLIT (bead `sparkle-mf501`). The count above is a git fact —
+    // agents whose commits are not on `main` — and on its own it promised four merges where GitHub
+    // would allow none. `prReadiness` is what lets the line state the actionable half beside the
+    // outstanding one instead of hiding the red work, which the ruling above forbids.
+    const unmerged = buildDigest(accountedUnmerged(feed), "unmerged", prReadiness);
     // Never digested — every one of these keeps its own card, because its card is the only way to
     // reach it. See `strandedAgents`.
     // `unmerged.cards` IS DELIBERATELY NOT SPREAD HERE. buildDigest never emits one for this variant
@@ -5453,6 +5476,10 @@ export function ConciergeHost({
     // Read in the body (it ships in the view model), so acknowledging repaints the strip on the
     // same tick the reader clicks rather than at the next feed tick.
     acknowledged,
+    // The "N need merge · M ready" split. Its own dependency because the PR probe answers on a
+    // three-minute poll of its own: without this, a line built before the probe landed would keep
+    // saying nothing about readiness until some unrelated input happened to invalidate this memo.
+    prReadiness,
   ]);
 
   /**

@@ -120,7 +120,45 @@ export interface ConciergeDigestGroup {
    *  makes column one a conversation; "and you can see which N" is what keeps that line honest, and
    *  there is no variant for which that is untrue. */
   memberIds: string[];
+  /**
+   * How many of {@link memberIds} own a pull request that could be merged RIGHT NOW — or `null` for
+   * "we have not been told", which is NOT zero.
+   *
+   * ONLY EVER SET ON THE `unmerged` VARIANT, because it is the only line whose verb promises an
+   * action GitHub gets a say in. A `rows` line says "3 Need you", and whether those three are
+   * answerable is not a question anyone else holds the answer to.
+   *
+   * THE FIELD EXISTS SO THE SPLIT IS MACHINE-READABLE. `text` states it too, but a test that has to
+   * grep an English sentence for "0 ready" is a test that goes green the day someone rewords the
+   * sentence — and the whole defect here was a number that read as a promise. See {@link digestText}.
+   */
+  readyCount: number | null;
   text: string;
+}
+
+/**
+ * WHAT THE APP HAS BEEN TOLD ABOUT PULL-REQUEST READINESS, as the digest needs to ask it.
+ *
+ * A FUNCTION RATHER THAN A MAP because the two halves are asked at different granularities: "did we
+ * look at this project" is per project, "can this agent's PR be merged" is per agent. Collapsing
+ * them into one per-project map was tried and is wrong — an agent in one project routinely owns a PR
+ * in another repository, so a per-project ready count cannot be attributed back to the agents the
+ * line actually counts. See `services/fleetPrs.prReadinessSnapshot`, which produces this.
+ */
+export interface DigestReadiness {
+  /**
+   * Has a pull-request probe ANSWERED for this project? A `false` here silences the readiness half
+   * of the sentence entirely.
+   *
+   * This is the load-bearing half. `gh` can be absent, unauthed, offline or rate-limited, and the
+   * probe runs on a three-minute poll — so "no agent in this line has a green PR" and "we have not
+   * heard back yet" are both, naively, a ready count of zero. Rendering the second as "none ready to
+   * merge" would replace one false promise with a false denial, which is the same defect wearing the
+   * opposite sign.
+   */
+  probed: (projectId: string) => boolean;
+  /** Does this agent own an open PR whose {@link prMergeReadiness} tone is `ready`? */
+  agentReady: (agentId: string) => boolean;
 }
 
 export interface ConciergeDigest {
@@ -148,6 +186,7 @@ function digestText(
   count: number,
   projectName: string,
   status: ConciergeAgent["status"],
+  readyCount: number | null,
 ): string {
   // THE FOUNDER'S OWN WORDS: "one row reading '27 need merge'". Lower-case "need merge" rather than
   // the status token's "Needs merge", because this is a sentence about many agents and it has to
@@ -161,9 +200,29 @@ function digestText(
   // a caller's mistake laundered into a confident false statement, which is the failure mode this
   // whole change exists to remove. They fall back to the shared band vocabulary instead.
   if (variant === "unmerged") {
-    return status === "unmerged"
-      ? `${count} need merge in ${projectName}`
-      : `${bandCountLabel(band, count)} in ${projectName}`;
+    if (status !== "unmerged") return `${bandCountLabel(band, count)} in ${projectName}`;
+    const base = `${count} need merge in ${projectName}`;
+    // ── THE SPLIT (bead `sparkle-mf501`, the founder's 2026-08-09 report) ────────────────────────
+    //
+    // He read "4 need merge in sparkle", clicked through, and NOT ONE of the four could be merged:
+    // three were red on CI and the fourth conflicts. The count was arithmetically honest — four
+    // agents really did have work that had not reached `main` — and it was still a false promise,
+    // because the word it wears is "merge" and none of them could be. Two different predicates were
+    // wearing one number.
+    //
+    // HIS OWN ASK WAS TO HIDE THE ROW UNTIL EVERYTHING IS GREEN, and that is the one thing this
+    // must not do. `engine/agentStall` records the standing position from the same fleet: un-landed
+    // work is a LANDING STATE, not an alarm, and 27 of 51 agents sat in it — three red pull requests
+    // do not stop existing because they are red, and the ruling in this file's own header (bead
+    // `sparkle-qogah`) is that a row he owes action on may never be hidden. So the number SPLITS
+    // rather than filters: the outstanding count and the actionable count stop being the same word,
+    // and a number that invites a click promises only what the click can do.
+    //
+    // SILENT WHEN WE DID NOT LOOK. `readyCount === null` means no probe has answered — see
+    // {@link DigestReadiness.probed} — and it renders the bare sentence rather than "none ready",
+    // because a denial we cannot support is the same defect as a promise we cannot keep.
+    if (readyCount === null) return base;
+    return readyCount > 0 ? `${base} · ${readyCount} ready` : `${base} · none ready yet`;
   }
   if (variant === "rows") {
     // `bandCountLabel`, not a local template: the label has to AGREE IN NUMBER ("1 Needs you" but
@@ -192,6 +251,7 @@ function digestText(
 export function buildDigest(
   agents: ConciergeAgent[],
   variant: DigestVariant = "rows",
+  readiness?: DigestReadiness,
 ): ConciergeDigest {
   const buckets = new Map<string, ConciergeAgent[]>();
   for (const a of agents) {
@@ -210,6 +270,18 @@ export function buildDigest(
   const groups: ConciergeDigestGroup[] = [];
   for (const [key, bucket] of buckets) {
     const first = bucket[0]!;
+    // COUNTED OVER THIS BUCKET'S OWN MEMBERS, never over the project's pull requests. The two are
+    // different populations and only one of them is what the line's number stands for: an agent may
+    // have committed work with no PR at all, and a project's PR list holds PRs belonging to agents
+    // this line does not count. Asking per member keeps the numerator inside the denominator, so
+    // "4 need merge · 2 ready" can only ever mean "two of THESE four".
+    //
+    // GATED ON THE PROJECT'S PROBE, taken from the bucket's own project (every member shares it —
+    // the key is `projectId::status`). Un-probed → null → the sentence says nothing about readiness.
+    const readyCount =
+      variant === "unmerged" && readiness?.probed(first.projectId)
+        ? bucket.filter((a) => readiness.agentReady(a.id)).length
+        : null;
     // A LONE `unmerged` AGENT STILL GETS A LINE, NEVER A CARD — the one variant where the singleton
     // shortcut is wrong, for two independent reasons.
     //
@@ -247,7 +319,15 @@ export function buildDigest(
       // Every member, in feed order. `count` is `memberIds.length` by construction — the line cannot
       // state a number it cannot then show you, which is the whole of "expands in place".
       memberIds: bucket.map((a) => a.id),
-      text: digestText(variant, first.band, bucket.length, first.projectName, first.status),
+      readyCount,
+      text: digestText(
+        variant,
+        first.band,
+        bucket.length,
+        first.projectName,
+        first.status,
+        readyCount,
+      ),
     });
   }
 

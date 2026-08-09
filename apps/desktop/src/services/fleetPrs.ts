@@ -17,6 +17,8 @@
 // grouped by the tab's own name.
 import { pathKey } from "../engine/projectIdentity";
 import {
+  prBlockerCount,
+  prMergeReadiness,
   prProbeBlockedCount,
   prReadyCount,
   type JudgedPrRow,
@@ -220,6 +222,19 @@ export interface PrGroup {
    * after the list, and an unknown reading is never counted as blocked (see `prProbeBlockedCount`).
    */
   blockedCount: number;
+  /**
+   * How many of `prs` are red because they CONFLICT with the base branch.
+   *
+   * SEPARATE FROM {@link checkBlockedCount} because the two need different things from the reader,
+   * and that difference is the founder's 2026-08-09 ask. A conflict needs a HUMAN to decide how to
+   * rebase; a failing check needs a re-run, and often nothing at all. Reported as one red count they
+   * are indistinguishable, so a reader with three of one and one of the other cannot tell whether
+   * the list is waiting on them or on CI.
+   */
+  conflictCount: number;
+  /** How many of `prs` are held by their CHECKS — failing, still running, or a rollup GitHub calls
+   *  unstable. Resolves itself, unlike {@link conflictCount}. */
+  checkBlockedCount: number;
 }
 
 /**
@@ -424,8 +439,67 @@ export function buildPrGroups(
       // Same discipline as `readyCount` directly above: through the exported helper, never a
       // re-implemented filter, so the header and the rows cannot disagree about what "blocked" is.
       blockedCount: prProbeBlockedCount(prs),
+      // The two shapes of RED the founder asked to be able to tell apart — same helper, same one
+      // ranking, so a row that says "Conflicts" is counted as a conflict and nothing else.
+      conflictCount: prBlockerCount(prs, "conflicts"),
+      checkBlockedCount: prBlockerCount(prs, "checks"),
     };
   });
+}
+
+/**
+ * WHICH AGENTS HAVE A PULL REQUEST THAT IS MERGE-READY RIGHT NOW, keyed by the project whose tab
+ * the reader is looking at.
+ *
+ * This is the join the concierge's "N need merge in <project>" line was missing, and its absence is
+ * the whole of bead `sparkle-mf501`. That line counts AGENTS with committed work that has not
+ * reached `main` — a git fact, computed with no reference to GitHub at all — so it could state "4
+ * need merge" over four pull requests of which none could be merged. `prMergeReadiness` already knew
+ * the truth; nothing carried it across to the sentence.
+ *
+ * TWO OUTPUTS, AND KEEPING THEM SEPARATE IS THE POINT:
+ *
+ *  • `knownProjectIds` — projects whose probe has ANSWERED. A readiness claim may only be made about
+ *    these. Absent from the set means "we did not look", which must never render as "none are
+ *    ready": that is the confident-zero-from-a-machine-that-failed-to-look failure the null-vs-zero
+ *    contract in `services/openPrs` spends its doc-comment on, restated one surface further out.
+ *    Every MEMBER of a folded group is listed, not just the primary — two tabs on one repository
+ *    share its answer, and the agents in the second tab are as answered-for as the first's.
+ *
+ *  • `readyAgentIds` — the agents owning a green PR. Flat rather than per-project, because
+ *    `resolveAgent` answers with the AGENT's own project, which need not be the project whose repo
+ *    holds the PR (an agent in `sparkle-desktop` opens PRs in `sparkle`). Keying by the PR's repo
+ *    would strand exactly those agents on the wrong side of the lookup.
+ *
+ * `resolveAgent` returning null — a PR whose owner was never recorded, or whose owner has left the
+ * roster — contributes NOTHING. That is fail-closed in the safe direction: an unattributable green
+ * PR makes the line say fewer are ready than really are, which understates work available. The
+ * opposite error would be the bug this function exists to remove.
+ */
+export interface PrReadinessSnapshot {
+  knownProjectIds: string[];
+  readyAgentIds: string[];
+}
+
+export function prReadinessSnapshot(
+  groups: readonly PrGroup[],
+  resolveAgent: (pr: JudgedPrRow) => { agentId: string } | null,
+): PrReadinessSnapshot {
+  const known = new Set<string>();
+  const ready = new Set<string>();
+  for (const g of groups) {
+    if (!g.known) continue;
+    for (const m of g.members) known.add(m.projectId);
+    for (const pr of g.prs) {
+      // THE ONE RULE, ASKED — never `pr.mergeable === "mergeable"`, which is the exact trap this
+      // change is about: it means "git would not conflict", not "safe to merge", and it reads
+      // MERGEABLE beside a `mergeStateStatus: UNSTABLE` whose checks are red.
+      if (prMergeReadiness(pr).tone !== "ready") continue;
+      const link = resolveAgent(pr);
+      if (link) ready.add(link.agentId);
+    }
+  }
+  return { knownProjectIds: [...known], readyAgentIds: [...ready] };
 }
 
 /** The fleet-wide numbers behind the chiclet and the panel's header line. */
@@ -481,6 +555,10 @@ export interface FleetTotals {
    * will be. That is the same wrong-tense defect as announcing a failure early, at the other end.
    */
   askable: number;
+  /** Open PRs that CONFLICT with their base, fleet-wide — the ones that need a human to rebase. */
+  conflicting: number;
+  /** Open PRs held by their CHECKS, fleet-wide — failing, running, or an unstable rollup. */
+  checkBlocked: number;
 }
 
 /**
@@ -500,17 +578,32 @@ export function fleetTotals(groups: readonly PrGroup[]): FleetTotals {
   let unreadable = 0;
   let pending = 0;
   let askable = 0;
+  let conflicting = 0;
+  let checkBlocked = 0;
   for (const g of groups) {
     total += g.prs.length;
     ready += g.readyCount;
     dismissed += g.dismissed.length;
+    conflicting += g.conflictCount;
+    checkBlocked += g.checkBlockedCount;
     if (g.known) known = true;
     if (g.prs.length > 0) groupsWithPrs += 1;
     if (g.unreadable) unreadable += 1;
     if (g.scope.rootPath) askable += 1;
     if (g.scope.rootPath && !g.known && !g.failed) pending += 1;
   }
-  return { total, ready, dismissed, known, groupsWithPrs, unreadable, pending, askable };
+  return {
+    total,
+    ready,
+    dismissed,
+    known,
+    groupsWithPrs,
+    unreadable,
+    pending,
+    askable,
+    conflicting,
+    checkBlocked,
+  };
 }
 
 /**
@@ -600,9 +693,43 @@ export function fleetHeadline(totals: FleetTotals): string {
         : "No open pull requests";
     case "counted": {
       const noun = totals.total === 1 ? "open pull request" : "open pull requests";
-      return asked <= 1 ? `${totals.total} ${noun}` : `${totals.total} ${noun} across ${asked} projects`;
+      const scoped =
+        asked <= 1 ? `${totals.total} ${noun}` : `${totals.total} ${noun} across ${asked} projects`;
+      return `${scoped} · ${readyClause(totals)}`;
     }
   }
+}
+
+/**
+ * THE HALF OF THE HEADLINE THAT SAYS WHAT YOU CAN ACTUALLY DO — "2 ready to merge", or, when none
+ * are, what is holding them.
+ *
+ * THE BUG THIS FIXES (bead `sparkle-mf501`, the founder's 2026-08-09 report). The panel said "4 open
+ * pull requests" and not one of them could be merged: three were red on checks and the fourth
+ * conflicts. Every one of those facts was already computed — `prMergeReadiness` had ranked all four,
+ * the per-group "Merge all ready" correctly offered zero — and the one sentence at the top of the
+ * panel reported none of it. An OPEN count and a READY count are two different predicates, and for
+ * as long as they wore the same number the reader had to open four rows to learn what the header
+ * could have told them in four words.
+ *
+ * IT NAMES THE BLOCKER ONLY WHEN THERE IS EXACTLY ONE KIND, and that restraint is deliberate. "none
+ * ready — 4 waiting on checks" is actionable; "none ready — 3 waiting on checks, 1 conflicting, 2
+ * blocked on probes" is a paragraph in a line that already ellipsizes, and the rows below say it
+ * better. A mixed list gets the honest bare "none ready to merge" and the reader scans the rows.
+ *
+ * NEVER STATES A ZERO IT DID NOT EARN. This is only ever reached from the `counted` branch, i.e.
+ * after a probe answered with at least one PR — the `!known` and `pending` states are handled above
+ * and say "Checking GitHub…" instead, because "none ready" over a list we could not read is the same
+ * confident-zero-from-a-machine-that-failed-to-look this file's whole state machine exists to refuse.
+ */
+function readyClause(totals: FleetTotals): string {
+  if (totals.ready > 0) return `${totals.ready} ready to merge`;
+  const blocked = totals.total;
+  if (totals.conflicting === blocked)
+    return blocked === 1 ? "none ready — it conflicts" : `none ready — all ${blocked} conflict`;
+  if (totals.checkBlocked === blocked)
+    return blocked === 1 ? "none ready — waiting on checks" : `none ready — all waiting on checks`;
+  return "none ready to merge";
 }
 
 /**

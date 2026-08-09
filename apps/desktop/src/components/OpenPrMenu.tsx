@@ -89,6 +89,7 @@ import {
   fleetTotals,
   keyOfScope,
   prKeyOf,
+  prReadinessSnapshot,
   probeStrength,
   scopeIdentitySetKey,
   scopeSetKey,
@@ -113,6 +114,7 @@ import {
   restorePr,
   type PrDismissal,
 } from "../services/prDismissals";
+import { usePrReadinessStore } from "../stores/prReadinessStore";
 import { log } from "../logger";
 import type { Project } from "../types";
 
@@ -1160,6 +1162,34 @@ export function OpenPrMenu({
   }, [groups]);
 
   const totals = fleetTotals(groups);
+
+  /**
+   * PUBLISH WHAT GITHUB SAID, so the concierge's "N need merge" line can stop promising merges that
+   * are not available (bead `sparkle-mf501`).
+   *
+   * This component is the app's only pull-request probe and it is mounted exactly once, in the
+   * concierge header — so it is the one place that can answer "can this actually be merged", and the
+   * concierge is one component away with no path to ask. See `stores/prReadinessStore` for why a
+   * store rather than a prop threaded back up through `ConciergeColumnProps.prSlot`.
+   *
+   * AN EFFECT, NEVER A RENDER-TIME WRITE. Writing a zustand store during render makes any subscriber
+   * re-render inside this one's render phase, which React treats as an update loop.
+   *
+   * `resolveAgent` IS A REAL DEPENDENCY, not noise to be silenced with a ref. It closes over the
+   * project roster, so a green PR whose owning agent joins the roster after the probe landed is only
+   * attributable once this re-runs — pinning it to `groups` alone would leave that agent uncounted
+   * until the next three-minute poll. The identity churns every parent render, which is affordable
+   * precisely because the store DROPS A NO-OP PUBLISH (`sameSnapshot`): a re-run that computes the
+   * same answer costs one small scan and notifies nobody.
+   */
+  useEffect(() => {
+    const snap = prReadinessSnapshot(groups, resolveAgent);
+    usePrReadinessStore.getState().publishPrReadiness({
+      probedProjectIds: snap.knownProjectIds,
+      readyAgentIds: snap.readyAgentIds,
+    });
+  }, [groups, resolveAgent]);
+
   /**
    * DID ANY SCOPE'S PROBE COME BACK TRUNCATED — i.e. is the number below a FLOOR rather than a total?
    *

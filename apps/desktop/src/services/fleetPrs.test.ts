@@ -174,7 +174,7 @@ describe("fleetHeadline", () => {
 
   it("omits the scope count when only one project is open", () => {
     const t = totals([sparkle], new Map([[keyOfScope(sparkle), [green(1), green(2)]]]));
-    expect(fleetHeadline(t)).toBe("2 open pull requests");
+    expect(fleetHeadline(t)).toBe("2 open pull requests · 2 ready to merge");
   });
 
   it("NAMES the scope count once the list spans projects", () => {
@@ -183,12 +183,12 @@ describe("fleetHeadline", () => {
       [sparkle, site],
       new Map([[keyOfScope(sparkle), [green(1)]], [keyOfScope(site), [green(2)]]]),
     );
-    expect(fleetHeadline(t)).toBe("2 open pull requests across 2 projects");
+    expect(fleetHeadline(t)).toBe("2 open pull requests across 2 projects · 2 ready to merge");
   });
 
   it("singularises one PR", () => {
     const t = totals([sparkle], new Map([[keyOfScope(sparkle), [green(1)]]]));
-    expect(fleetHeadline(t)).toBe("1 open pull request");
+    expect(fleetHeadline(t)).toBe("1 open pull request · 1 ready to merge");
   });
 });
 
@@ -315,7 +315,7 @@ describe("the zero claim waits for every project", () => {
     const t = fleetTotals(buildPrGroups([sparkle, site], byKey, new Set()));
     expect(t.pending).toBe(1);
     expect(fleetState(t)).toBe("counted");
-    expect(fleetHeadline(t)).toBe("1 open pull request across 2 projects");
+    expect(fleetHeadline(t)).toBe("1 open pull request across 2 projects · 1 ready to merge");
   });
 });
 
@@ -340,14 +340,14 @@ describe("sentences count what was ASKED, not what has a tab", () => {
     const t = fleetTotals(buildPrGroups([unaskable, sparkle], byKey, new Set()));
     expect(t.askable).toBe(1);
     // "across 2 projects" would imply the unaskable tab contributed a zero to the total.
-    expect(fleetHeadline(t)).toBe("1 open pull request");
+    expect(fleetHeadline(t)).toBe("1 open pull request · 1 ready to merge");
   });
 
   it("still names the count once TWO projects were actually asked", () => {
     const byKey = new Map([[keyOfScope(sparkle), [green(1)]], [keyOfScope(site), [green(2)]]]);
     const t = fleetTotals(buildPrGroups([unaskable, sparkle, site], byKey, new Set()));
     expect(t.askable).toBe(2);
-    expect(fleetHeadline(t)).toBe("2 open pull requests across 2 projects");
+    expect(fleetHeadline(t)).toBe("2 open pull requests across 2 projects · 2 ready to merge");
   });
 });
 
@@ -510,7 +510,7 @@ describe("one repository open under two project entries", () => {
     // were the same miscount seen twice.
     expect(t.total).toBe(4);
     expect(t.askable).toBe(2);
-    expect(fleetHeadline(t)).toBe("4 open pull requests across 2 projects");
+    expect(fleetHeadline(t)).toBe("4 open pull requests across 2 projects · 3 ready to merge");
   });
 
   it("names the folded checkout in the heading instead of making it disappear", () => {

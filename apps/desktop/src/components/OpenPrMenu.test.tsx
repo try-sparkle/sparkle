@@ -107,6 +107,8 @@ const totals = (t: Partial<FleetTotals> = {}): FleetTotals => ({
   unreadable: 0,
   pending: 0,
   askable: 1,
+  conflicting: 0,
+  checkBlocked: 0,
   ...t,
 });
 
@@ -1984,7 +1986,7 @@ describe("OpenPrMenu — fleet-wide, grouped by project tab", () => {
     await openMenu();
     await waitFor(() =>
       expect(screen.getByTestId("pr-count-label").textContent).toBe(
-        "2 open pull requests across 2 projects",
+        "2 open pull requests across 2 projects · 2 ready to merge",
       ),
     );
   });
