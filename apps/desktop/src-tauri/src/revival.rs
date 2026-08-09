@@ -346,24 +346,79 @@ fn tick(dir: &Path, app_data: &Path, state: &RevivalState, now_ms: i64) -> Optio
     }
 
     let due = due_at(&readings, now_ms, &live_epochs);
+    publish_due(state, &due);
+    Some(due)
+}
+
+/// WHICH DEATH THIS IS, as opposed to WHEN THE ANSWER WAS COMPUTED.
+///
+/// `not_before_ms` is deliberately absent, and it is the entire reason this function exists.
+/// `agent_life::derive` recomputes it as `Some(now_ms)` for every cause that is not clock-armed —
+/// which is load-bearing and must NOT change ("due immediately" has to mean *now*, not an instant
+/// frozen when the record was written). So a freshly computed `DueAgent` differs from the one
+/// published five seconds ago on EVERY scan, `*guard != due` was therefore always true, and
+/// `due-for-resurrection set changed` was logged once per scan with a byte-identical id list:
+/// 3,138 lines in one day on the founder's install, burying every other `revival` line — including
+/// the ones that say why an agent did or did not come back, which is what someone reading this log
+/// came for. The same shape as the two edge-triggered logs above (`LEDGER_UNREADABLE`,
+/// `LAST_SKIPPED`), which this one was supposed to be and was not.
+///
+/// The five fields are what identify a death: which agent, of what, when, under which app epoch,
+/// and how many respawns it has already spent. `project_id` and `worktree` cannot change without
+/// the record being reopened (which changes `died_at`). `message` CAN — a wall arriving after a
+/// transport death rewrites it — so a message-only change goes unlogged; that is accepted, because
+/// the due SET is what this line reports and it has not moved. The full struct is still published
+/// (see `publish_due`), so nothing downstream loses the newer message.
+fn due_identity(d: &DueAgent) -> (&str, DeathCause, i64, &str, usize) {
+    (
+        d.agent_id.as_str(),
+        d.cause,
+        d.died_at,
+        d.epoch.as_str(),
+        d.attempts_at.len(),
+    )
+}
+
+/// Publish `due`, logging only when the SET genuinely changed. Returns whether a line was written.
+///
+/// The return value is what makes the change detection testable: it is the exact boolean the log is
+/// gated on, in the same `if`, so a test asserting `[true, false]` across two identical-but-
+/// recomputed scans goes red the moment the comparison goes back to whole structs.
+///
+/// Element-wise comparison is sound because `due_at` walks a `BTreeMap`, so both lists are ordered
+/// by `agent_id`; a set that gained or lost a member changes the length or the ids at some index.
+fn publish_due(state: &RevivalState, due: &[DueAgent]) -> bool {
     let mut guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
-    if *guard != due {
-        // Logged on CHANGE only. A per-second line for a steady state would bury the transition
-        // that matters, and this is the record a human reads when they ask why an agent came back.
+    let changed = guard.len() != due.len()
+        || guard
+            .iter()
+            .zip(due.iter())
+            .any(|(was, now)| due_identity(was) != due_identity(now));
+    if changed {
+        // Logged on CHANGE only. A per-scan line for a steady state would bury the transition that
+        // matters, and this is the record a human reads when they ask why an agent came back.
         tracing::info!(
             target: "revival",
             due = due.len(),
             ids = ?due.iter().map(|d| d.agent_id.as_str()).collect::<Vec<_>>(),
             "due-for-resurrection set changed"
         );
-        *guard = due.clone();
     }
-    Some(due)
+    // REPUBLISHED EVERY SCAN, changed or not. `revival_due` serves this list to the TS runner, whose
+    // ladder compares `not_before_ms` against a live clock — so freezing the published struct to
+    // keep the log quiet would trade a logging bug for a scheduling one. Only the log's change test
+    // changed here; the payload is exactly what it always was.
+    guard.clear();
+    guard.extend_from_slice(due);
+    changed
 }
 
 static STARTED: AtomicBool = AtomicBool::new(false);
 /// Is the ledger currently unreadable? Edge state for the log line only — see `tick`.
 static LEDGER_UNREADABLE: AtomicBool = AtomicBool::new(false);
+/// Has the session reaper failed? Edge state for the log line only — a reaper that cannot read the
+/// ledger fails on EVERY scan, and a per-scan warning would bury the rest of this target's output.
+static REAP_FAILED: AtomicBool = AtomicBool::new(false);
 /// The agent ids skipped on the LAST scan. Edge state for the log line only — see `read_ledger`.
 static LAST_SKIPPED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
@@ -402,6 +457,48 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
             let Some(state) = app.try_state::<RevivalState>() else {
                 continue;
             };
+            // SEAL BEFORE PUBLISHING, on the same scan, so a newly-reaped agent is due immediately
+            // rather than a scan later.
+            //
+            // This is the input side of the whole feature. `agent_life::seal_stale_at` runs only at
+            // app LAUNCH and only for a DEAD epoch, so the far more common death — one agent's
+            // `claude` exiting while the app keeps running — was never written down at all: the
+            // record stayed `Live`, `derive` reported `alive: true`, and `due_at`'s first gate
+            // skipped it forever. Measured on a live install: seven agents with no process, a
+            // `Live` record and a `working` status 47 minutes after their last hook event.
+            //
+            // The PTY session map is the artifact that settles it, and it is the RIGHT one: it is
+            // app-global (`pty_spawn` from any webview reaches any agent id), it needs no mounted
+            // pane, and it costs a mutex lock and a `Vec<String>` clone. No model call, in keeping
+            // with this module's header.
+            if let Some(pty) = app.try_state::<crate::pty::PtyManager>() {
+                let live: HashSet<String> = pty.session_ids().into_iter().collect();
+                match agent_life::reap_dead_sessions_at(
+                    &dir,
+                    crate::babysit_lease::process_epoch(),
+                    &live,
+                    now,
+                ) {
+                    Ok(stats) if stats.reaped > 0 => {
+                        // Logged unconditionally when it fires: a death being inferred is exactly
+                        // the line a human wants when they ask why an agent came back.
+                        tracing::info!(
+                            target: "revival",
+                            reaped = stats.reaped,
+                            still_live = stats.still_live,
+                            too_young = stats.too_young,
+                            "sealed agents whose PTY session is gone"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        // ONCE PER TRANSITION, same discipline as the ledger-unreadable log below.
+                        if !REAP_FAILED.swap(true, Ordering::Relaxed) {
+                            tracing::warn!(target: "revival", error = %e, "could not reap dead sessions");
+                        }
+                    }
+                }
+            }
             tick(&dir, &base, &state, now);
         }
     });
@@ -920,6 +1017,184 @@ mod tests {
             due.iter().map(|d| d.agent_id.as_str()).collect::<Vec<_>>(),
             vec!["healthy"],
             "the readable agent must still be published"
+        );
+    }
+
+    // ── THE LOG THAT BURIED EVERYTHING ELSE ─────────────────────────────────────────────────────
+    //
+    // These assert the LINE, not a helper's return value, because the defect was a log: `tick`
+    // wrote `due-for-resurrection set changed` on every 5s scan with an identical id list — 3,138
+    // lines in one day. A test that only checked `publish_due`'s boolean would still pass against a
+    // `tick` that logged unconditionally beside it.
+
+    /// Run `f` with `tracing` output captured into a string, so the number of emitted lines can be
+    /// counted. Thread-local (`with_default`), so a parallel test run cannot cross-contaminate.
+    fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl Write for Buf {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+            type Writer = Buf;
+            fn make_writer(&'a self) -> Buf {
+                self.clone()
+            }
+        }
+
+        let buf = Buf(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let out = tracing::subscriber::with_default(subscriber, f);
+        let text = {
+            let bytes = buf.0.lock().unwrap_or_else(|e| e.into_inner());
+            String::from_utf8_lossy(&bytes).into_owned()
+        };
+        (out, text)
+    }
+
+    const CHANGE_LINE: &str = "due-for-resurrection set changed";
+
+    /// A ledger holding one dead, resurrectable, due agent. Returns the tempdir (which must be held
+    /// alive) plus the two paths `tick` takes.
+    fn one_dead_agent_ledger(id: &str) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let td = tempfile::tempdir().expect("tempdir");
+        let dir = td.path().join("agent-life");
+        let app_data = td.path().join("app-data");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&app_data).unwrap();
+        add_dead_agent(&dir, id);
+        (td, dir, app_data)
+    }
+
+    fn add_dead_agent(dir: &Path, id: &str) {
+        // "dead-epoch" never took a lease, so `epoch_still_running` reads it as dead.
+        agent_life::open_at(dir, id, "proj", "/wt", "dead-epoch", NOW).unwrap();
+        agent_life::close_at(
+            dir,
+            id,
+            Death {
+                cause: DeathCause::TransportTransient,
+                evidence: DeathEvidence::ApiBanner,
+                at: NOW,
+                message: Some("API Error: Unable to connect to API (ENOTFOUND)".into()),
+                goal_met_at: None,
+            },
+            None,
+        )
+        .unwrap();
+    }
+
+    /// THE 3,138-LINES-A-DAY BUG.
+    ///
+    /// `transport-transient` is not clock-armed, so `derive` computes `not_before_ms = Some(now_ms)`
+    /// — a DIFFERENT value on every scan, by design. Comparing whole `DueAgent`s therefore made
+    /// `*guard != due` unconditionally true. Two scans over an unchanged ledger must produce ONE
+    /// line, not two.
+    #[test]
+    fn an_unchanged_due_set_logs_once_even_though_not_before_is_recomputed_each_scan() {
+        let (_td, dir, app_data) = one_dead_agent_ledger("a1");
+        let state = RevivalState::default();
+
+        let ((first, second), logs) = capture_logs(|| {
+            let first = tick(&dir, &app_data, &state, NOW + 1).expect("ledger readable");
+            let second = tick(&dir, &app_data, &state, NOW + 5_000).expect("ledger readable");
+            (first, second)
+        });
+
+        // POSITIVE CONTROL — without it a green test could mean the fixture never recomputed
+        // anything, which is the vacuous version of this assertion.
+        assert_ne!(
+            first, second,
+            "the fixture must actually produce two different structs, or this test proves nothing"
+        );
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_ne!(
+            first[0].not_before_ms, second[0].not_before_ms,
+            "`not_before_ms` must be the recomputed field — that is the whole premise here"
+        );
+        assert_eq!(
+            first[0].agent_id, second[0].agent_id,
+            "the due SET is unchanged; only the recomputed instant moved"
+        );
+
+        assert_eq!(
+            logs.matches(CHANGE_LINE).count(),
+            1,
+            "a steady due set must log once, not once per scan — got:\n{logs}"
+        );
+    }
+
+    /// THE PAIRED POSITIVE. Without it, a `publish_due` that never logged at all would satisfy the
+    /// test above — and a change nobody is told about is the failure this module exists to end.
+    #[test]
+    fn a_genuinely_changed_due_set_still_logs() {
+        let (_td, dir, app_data) = one_dead_agent_ledger("a1");
+        let state = RevivalState::default();
+
+        let (sets, logs) = capture_logs(|| {
+            let first = tick(&dir, &app_data, &state, NOW + 1).expect("ledger readable");
+            // A SECOND agent dies. Same cause, same epoch — so nothing but MEMBERSHIP changed.
+            add_dead_agent(&dir, "a2");
+            let second = tick(&dir, &app_data, &state, NOW + 5_000).expect("ledger readable");
+            (first, second)
+        });
+
+        assert_eq!(sets.0.len(), 1);
+        assert_eq!(sets.1.len(), 2, "the second scan must genuinely see two agents");
+        assert_eq!(
+            logs.matches(CHANGE_LINE).count(),
+            2,
+            "an agent joining the due set is news and must be logged — got:\n{logs}"
+        );
+    }
+
+    /// A RESPAWN IS A CHANGE TOO. `attempts_at.len()` is in the identity precisely so that an agent
+    /// that stayed due while spending one of its 24 daily attempts re-logs — that is the transition
+    /// a human is reading this log to find. Driven through `publish_due` because the attempt count
+    /// is the one identity axis that moves without the membership moving.
+    #[test]
+    fn a_new_respawn_attempt_on_the_same_agent_counts_as_a_change() {
+        fn due(attempts: Vec<i64>, not_before: i64) -> Vec<DueAgent> {
+            vec![DueAgent {
+                agent_id: "a1".into(),
+                project_id: "proj".into(),
+                worktree: "/wt".into(),
+                cause: DeathCause::TransportTransient,
+                epoch: "e".into(),
+                died_at: NOW,
+                not_before_ms: not_before,
+                message: None,
+                attempts_at: attempts,
+            }]
+        }
+
+        let state = RevivalState::default();
+        assert!(publish_due(&state, &due(vec![], NOW)), "the first publish is always a change");
+        assert!(
+            !publish_due(&state, &due(vec![], NOW + 5_000)),
+            "a recomputed instant alone is not a change"
+        );
+        assert!(
+            publish_due(&state, &due(vec![NOW + 6_000], NOW + 10_000)),
+            "a respawn attempt recorded against the same agent IS a change"
+        );
+        assert_eq!(
+            state.0.lock().unwrap().first().map(|d| d.not_before_ms),
+            Some(NOW + 10_000),
+            "the FULL struct is still published every scan, including the unchanged-set one"
         );
     }
 }

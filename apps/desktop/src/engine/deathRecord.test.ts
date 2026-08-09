@@ -212,6 +212,107 @@ describe("unknown is first-class and honest", () => {
   });
 });
 
+// The RETAINED banner (`recentFailure`) as a pure input. The test that reproduces the RACE which
+// makes this field necessary lives in `services/deathRecordWriter.test.ts` and drives a real
+// `StatusEngine` — a hand-built observation cannot reproduce a sequence of calls inside the engine,
+// so it would prove nothing about the bug. What belongs HERE is the gate arithmetic: given the field,
+// which gate claims it, and — the part that is easy to get wrong — which gates must ignore it.
+describe("the retained banner is a strict FALLBACK, admitted only where the live signals said nothing", () => {
+  it("classifies transport-transient when only the retained banner is left", () => {
+    const v = classifyDeath(obs({ recentFailure: { message: ENOTFOUND, at: NOW - 1_000 } }));
+    expect(v).toEqual({
+      cause: "transport-transient",
+      evidence: "api-banner",
+      message: ENOTFOUND,
+    });
+  });
+
+  it("prefers the LIVE banner when both are present — it is the stronger evidence", () => {
+    // The live reading means the agent was still sitting in the failure when it died. The retained
+    // one only means it printed that at some point inside the window, so a stale retained copy must
+    // never speak over a current one.
+    const v = classifyDeath(
+      obs({
+        lastFailure: { message: OVERLOADED, at: NOW },
+        recentFailure: { message: ENOTFOUND, at: NOW - 200_000 },
+      }),
+    );
+    expect(v).toMatchObject({ cause: "transport-transient", message: OVERLOADED });
+  });
+
+  it("NEVER demotes a clean-goal-met — a finished agent must not be resurrected", () => {
+    // THE REGRESSION THIS FIELD COULD HAVE CAUSED, and the reason Gate 1 reads only the live
+    // signals. An agent that blipped, recovered, did its work, marked its goal met and exited
+    // cleanly still carries a retained banner for up to TRANSPORT_FAILURE_WINDOW_MS. If that reached
+    // Gate 1 the agent would be recorded under a RESURRECTABLE cause and the fleet would restart
+    // work that was already finished — the "undoes a completed decision" failure Gate 1 is first to
+    // prevent. The paired positive is the test above: the same banner DOES decide when no goal was
+    // met, so this is a statement about gate order rather than about the field being ignored.
+    const metAt = NOW - 1_000;
+    const v = classifyDeath(
+      obs({
+        goal: goal({ metAt }),
+        recentFailure: { message: ENOTFOUND, at: NOW - 1_000 },
+        terminator: "pty-exit",
+      }),
+    );
+    expect(v).toEqual({ cause: "clean-goal-met", evidence: "goal-met-marked", goalMetAt: metAt });
+  });
+
+  it("routes a retained ACCOUNT WALL to wall-session, never to transport-transient", () => {
+    // Defence in depth rather than a path the line-scanner can produce today: `apiErrorFramesIn` is
+    // anchored to `^api error:` and `ACCOUNT_LIMIT_OPENER` to `^you've hit your`, so no single
+    // captured line can satisfy both and the engine's own capture cannot currently retain a terminal
+    // message. The gate exists anyway, for the same reason `effectiveWall` re-parses `lastFailure`:
+    // the field is typed as "a banner", any future capture site could put a wall in it, and the cost
+    // of being wrong here is retrying against a door no keystroke opens — the measured 45-retry
+    // failure. Re-parsed through `quotaBlocksIn`, the SAME function, never a second matcher.
+    const v = classifyDeath(obs({ recentFailure: { message: SESSION_WALL, at: NOW - 1_000 } }));
+    expect(v).toMatchObject({ cause: "wall-session", evidence: "quota-block" });
+    expect(v.wall).toMatchObject({ message: SESSION_WALL, resetParsed: true });
+  });
+
+  it("routes a retained SPEND cap to wall-spend, with no invented reset instant", () => {
+    const v = classifyDeath(obs({ recentFailure: { message: SPEND_WALL, at: NOW - 1_000 } }));
+    expect(v).toMatchObject({ cause: "wall-spend" });
+    expect(v.wall?.resetAt, "a spend cap has no reset and one must never be persisted").toBeUndefined();
+  });
+
+  it("still refuses to claim anything when this window did not watch the agent", () => {
+    // Gate 0 is unconditional and FIRST, so the new field cannot become a way around it.
+    const v = classifyDeath(
+      obs({ liveness: "other-window", recentFailure: { message: ENOTFOUND, at: NOW } }),
+    );
+    expect(v).toEqual({ cause: "unknown", evidence: "none" });
+  });
+
+  it("is outranked by a person waiting — a respawn re-asks nothing", () => {
+    const v = classifyDeath(
+      obs({ blockingTool: "AskUserQuestion", recentFailure: { message: ENOTFOUND, at: NOW } }),
+    );
+    expect(v).toEqual({ cause: "blocked-on-human", evidence: "blocking-tool" });
+  });
+
+  it("PAIRED NEGATIVE — no retained banner still yields unknown", () => {
+    // Without this, every assertion above is compatible with a bug that returned a cause for any
+    // pty-exit at all.
+    expect(classifyDeath(obs({ recentFailure: undefined }))).toEqual({
+      cause: "unknown",
+      evidence: "pty-exit",
+    });
+  });
+
+  it.each([ENOTFOUND, OVERLOADED, STALLED])(
+    "accepts every retryable banner shape the fleet actually prints: %s",
+    (message) => {
+      expect(classifyDeath(obs({ recentFailure: { message, at: NOW } }))).toMatchObject({
+        cause: "transport-transient",
+        message,
+      });
+    },
+  );
+});
+
 describe("every verdict this module can produce satisfies the honesty rule", () => {
   it("holds across the whole observation space", () => {
     const quotas = [undefined, quotaBlocksIn(SESSION_WALL, NOW)[0], quotaBlocksIn(SPEND_WALL, NOW)[0]];

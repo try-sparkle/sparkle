@@ -8,6 +8,7 @@ import {
   SESSION_LIMIT_PICKER_EVENT,
   type SessionLimitPickerDetail,
 } from "./statusEngine";
+import { TRANSPORT_FAILURE_WINDOW_MS } from "./deathTypes";
 import { createStatusRouter, type StatusTransition } from "./statusRouter";
 import { SESSION_LIMIT_PICKER, APPROVAL_2_1_220 } from "./capturedScreens.fixture";
 // The SAME predicate the concierge tool surface derives `needsYou` from, so the no-false-alarm
@@ -1692,5 +1693,76 @@ describe("StatusEngine — a tool-approval prompt never reads green", () => {
     engine.ingest(SPINNER);
     vi.advanceTimersByTime(60_000);
     expect(emitted.at(-1)).toBe("working");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// THE RETAINED API BANNER — `recentFailureNow`, the read side of `lastFailureEver`.
+//
+// `lastFailure` is nulled by `clearStreamFailure()`, which fires on any recovery signal. That is
+// correct for the LIVE reading and stays. The problem it caused is that Claude Code retries a
+// transport fault for ~3 minutes before exiting 1 (measured 2m56s against a non-resolving base URL,
+// final line `API Error: Unable to connect to API (ENOTFOUND)`), and its retries emit exactly those
+// recovery signals — so the banner was destroyed by the failure it was meant to describe, and the
+// death classified `unknown`, which is not resurrectable. 0 of 76 records on the founder's install
+// classified `transport-transient`.
+//
+// These pin the ENGINE half in isolation: the classification half lives in
+// `services/deathRecordWriter.test.ts`, which drives this engine through the real registry.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+describe("recentFailureNow — the banner outlives the recovery that clears the live one", () => {
+  const ENOTFOUND = "API Error: Unable to connect to API (ENOTFOUND)";
+  const RECOVERY = "$ pnpm test\n"; // a classified line; `if (ev)` calls clearStreamFailure()
+
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it("survives a recovery signal that nulls the live reading", () => {
+    const { engine } = makeEngine();
+    engine.ingest(`${ENOTFOUND}\n`);
+    expect(engine.lastFailureNow()).toMatchObject({ message: ENOTFOUND });
+
+    engine.ingest(RECOVERY);
+
+    // The PRECONDITION, asserted rather than assumed — if this chunk stopped counting as recovery
+    // the test below would pass without the retention doing any work at all.
+    expect(engine.lastFailureNow(), "the recovery must really clear the live reading").toBeUndefined();
+    expect(engine.recentFailureNow(Date.now())).toMatchObject({ message: ENOTFOUND });
+  });
+
+  it("captures from the UNTERMINATED tail too, not just a completed line", () => {
+    // The measured death prints its banner as the final line before the PTY closes, i.e. with no
+    // trailing newline. Both capture sites funnel through one writer so neither can be missed.
+    const { engine } = makeEngine();
+    engine.ingest(ENOTFOUND); // no "\n"
+    engine.ingest(RECOVERY);
+    expect(engine.lastFailureNow()).toBeUndefined();
+    expect(engine.recentFailureNow(Date.now())).toMatchObject({ message: ENOTFOUND });
+  });
+
+  it("expires on the clock, so it never becomes a permanent stamp of the last bad turn", () => {
+    const { engine } = makeEngine();
+    engine.ingest(`${ENOTFOUND}\n`);
+    const at = Date.now();
+
+    expect(engine.recentFailureNow(at + TRANSPORT_FAILURE_WINDOW_MS)).toMatchObject({
+      message: ENOTFOUND,
+    });
+    expect(engine.recentFailureNow(at + TRANSPORT_FAILURE_WINDOW_MS + 1)).toBeUndefined();
+  });
+
+  it("PAIRED NEGATIVE — an engine that saw no banner reports nothing", () => {
+    const { engine } = makeEngine();
+    engine.ingest(RECOVERY);
+    expect(engine.recentFailureNow(Date.now())).toBeUndefined();
+  });
+
+  it("keeps the LATEST banner when several arrive", () => {
+    // A retry loop reprints, and often escalates from one shape to another. The record should name
+    // what the agent was actually sitting in when it died, not the first thing that went wrong.
+    const { engine } = makeEngine();
+    engine.ingest("API Error: 529 Overloaded\n");
+    engine.ingest(`${ENOTFOUND}\n`);
+    expect(engine.recentFailureNow(Date.now())).toMatchObject({ message: ENOTFOUND });
   });
 });

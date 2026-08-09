@@ -84,10 +84,21 @@ fn prune_attempts(attempts_at: &mut Vec<i64>, now_ms: i64) {
 
 /// Why an agent session ended. Mirrors `apps/desktop/src/engine/deathTypes.ts`.
 ///
-/// `the_serde_strings_match_deathtypes_ts` pins these strings against literals in THIS file, which
-/// catches a rename on the Rust side only. It does not read the TS union, so it cannot catch a
-/// rename over there (roborev 60090 — an earlier comment claimed "both sides"). The stronger test,
-/// parsing the union out of `deathTypes.ts` with `include_str!`, is worth adding.
+/// `the_serde_strings_match_deathtypes_ts` guards this vocabulary in BOTH directions, and it is
+/// worth knowing exactly how far that goes before trusting it (roborev 60090, 61725, 61785 — two
+/// earlier versions of this comment overstated it, then understated it):
+///
+///   - It parses the `DeathCause` / `DeathEvidence` unions out of `deathTypes.ts` with
+///     `include_str!` and compares them against the serde vocabulary as SETS, so a rename on either
+///     side fails the test rather than producing records the other end reads as an unknown variant.
+///   - `serde_name_cause` / `serde_name_evidence` are exhaustive `match`es, so a new variant cannot
+///     compile until someone names its wire string.
+///
+/// RESIDUAL, and the reason this is a paragraph rather than a sentence: the variant LIST inside the
+/// test is still hand-written, because Rust cannot enumerate an enum's variants without `strum`. An
+/// author who adds a variant, satisfies the compiler in `serde_name_*`, and never adds it to that
+/// list still slips past. The compile error is what brings them to the file; nothing yet forces the
+/// last step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DeathCause {
@@ -97,6 +108,21 @@ pub enum DeathCause {
     CleanGoalMet,
     BlockedOnHuman,
     AppRestart,
+    /// THE AGENT'S PROCESS IS GONE AND NO WINDOW SAW IT GO (bead: transport-death-revival).
+    ///
+    /// Distinct from `AppRestart`, which means the whole app died and is keyed on a dead EPOCH, and
+    /// distinct from `Unknown`, which means a window WATCHED the exit and had nothing to say about
+    /// it. This one is written by `reap_dead_sessions_at` on the running app's own tick, for a
+    /// record still `Live` under THIS epoch whose PTY session has vanished.
+    ///
+    /// IT IS RESURRECTABLE, AND THE ASYMMETRY WITH `Unknown` IS THE WHOLE POINT. `Unknown` refuses
+    /// resurrection because a human clicking "stop" produces exactly a quiet observed exit — but a
+    /// human clicking stop is BY CONSTRUCTION observed, because a mounted pane is what renders the
+    /// button. This cause is reached only when NOTHING observed the exit, which is the one case a
+    /// deliberate stop cannot produce. Measured on the founder's install: 7 agents sat with a dead
+    /// process, a `Live` record and a `working` status for 47 minutes, invisible to recovery,
+    /// because the only sealer (`seal_stale_at`) runs at app LAUNCH and keys on a dead epoch.
+    ProcessGone,
     Unknown,
 }
 
@@ -111,6 +137,11 @@ pub enum DeathEvidence {
     BlockingTool,
     GoalMetMarked,
     EpochDead,
+    /// The PTY session was ABSENT from the app's own session map while the epoch was still
+    /// alive — the reaper's inference, made with no observer. Distinct from `PtyExit`, which means
+    /// a window WATCHED the close. Sharing `PtyExit` made `validate` reject every record the
+    /// reaper writes (roborev 61705).
+    SessionVanished,
     PtyExit,
     SessionEndHook,
     None,
@@ -125,6 +156,7 @@ pub fn cause_of(evidence: DeathEvidence) -> Option<DeathCause> {
         DeathEvidence::BlockingTool => Some(DeathCause::BlockedOnHuman),
         DeathEvidence::GoalMetMarked => Some(DeathCause::CleanGoalMet),
         DeathEvidence::EpochDead => Some(DeathCause::AppRestart),
+        DeathEvidence::SessionVanished => Some(DeathCause::ProcessGone),
         DeathEvidence::PtyExit | DeathEvidence::SessionEndHook | DeathEvidence::None => {
             Some(DeathCause::Unknown)
         }
@@ -137,20 +169,76 @@ pub fn cause_of(evidence: DeathEvidence) -> Option<DeathCause> {
 /// (there is no reset instant), but it is recovered by PROBING — the fleet keeps testing the door on
 /// a bounded backoff and returns the moment a probe succeeds. Telling the founder is a byproduct so
 /// he can shorten the outage; it is never what the system waits on.
+///
+/// EXHAUSTIVE `match`, NOT `matches!` (roborev 61725). `matches!` compiles fine against a variant
+/// added later and silently answers `false` — so a new cause would default to "never recover", the
+/// one direction that costs the user work, with no compile error and no test failure to say so. The
+/// `match` forces whoever adds a variant to state the policy.
 pub fn is_resurrectable(cause: DeathCause) -> bool {
-    matches!(
-        cause,
+    match cause {
         DeathCause::TransportTransient
-            | DeathCause::WallSession
-            | DeathCause::WallSpend
-            | DeathCause::AppRestart
-    )
+        | DeathCause::WallSession
+        | DeathCause::WallSpend
+        | DeathCause::AppRestart
+        | DeathCause::ProcessGone => true,
+        DeathCause::CleanGoalMet | DeathCause::BlockedOnHuman | DeathCause::Unknown => false,
+    }
 }
 
 /// Only `WallSession` names an instant. Everything else retries or probes, which is what lets this
 /// crate compare integers instead of carrying a date/time crate it deliberately does not have.
+///
+/// Exhaustive for the same reason as `is_resurrectable` above.
 pub fn arms_on_clock(cause: DeathCause) -> bool {
-    matches!(cause, DeathCause::WallSession)
+    match cause {
+        DeathCause::WallSession => true,
+        DeathCause::TransportTransient
+        | DeathCause::WallSpend
+        | DeathCause::CleanGoalMet
+        | DeathCause::BlockedOnHuman
+        | DeathCause::AppRestart
+        | DeathCause::ProcessGone
+        | DeathCause::Unknown => false,
+    }
+}
+
+/// The EXACT wire string serde emits for a cause, written as an exhaustive `match` so a new variant
+/// cannot be added without naming its string (roborev 61725).
+///
+/// This exists because the pin test it feeds was a hand-written `[(variant, "string")]` array, which
+/// catches a RENAME but not an ADDITION — a new variant simply is not in the array, so the test
+/// passes while the TS union never learns about it. That is precisely how the `SessionVanished`
+/// drift got in. The TS side got a `CoversUnion` compile-time guard; this is its Rust mirror.
+#[cfg(test)]
+fn serde_name_cause(cause: DeathCause) -> &'static str {
+    match cause {
+        DeathCause::TransportTransient => "transport-transient",
+        DeathCause::WallSession => "wall-session",
+        DeathCause::WallSpend => "wall-spend",
+        DeathCause::CleanGoalMet => "clean-goal-met",
+        DeathCause::BlockedOnHuman => "blocked-on-human",
+        DeathCause::AppRestart => "app-restart",
+        DeathCause::ProcessGone => "process-gone",
+        DeathCause::Unknown => "unknown",
+    }
+}
+
+/// The EXACT wire string serde emits for an evidence. Exhaustive for the same reason as
+/// `serde_name_cause` above.
+#[cfg(test)]
+fn serde_name_evidence(evidence: DeathEvidence) -> &'static str {
+    match evidence {
+        DeathEvidence::QuotaBlock => "quota-block",
+        DeathEvidence::Transcript429 => "transcript-429",
+        DeathEvidence::ApiBanner => "api-banner",
+        DeathEvidence::BlockingTool => "blocking-tool",
+        DeathEvidence::GoalMetMarked => "goal-met-marked",
+        DeathEvidence::EpochDead => "epoch-dead",
+        DeathEvidence::SessionVanished => "session-vanished",
+        DeathEvidence::PtyExit => "pty-exit",
+        DeathEvidence::SessionEndHook => "session-end-hook",
+        DeathEvidence::None => "none",
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -455,6 +543,46 @@ fn validate(death: &Death, wall: Option<&Wall>) -> Result<(), LifeError> {
     Ok(())
 }
 
+/// RECORD A DELIBERATE STOP — the whole mechanism `pty_kill` performs, as one testable call.
+///
+/// This is the ledger half of "the user stopped this agent", and it lives here rather than in
+/// `pty.rs` so a test can drive the REAL thing (roborev 61770). It used to be a private fn taking
+/// an `&AppHandle`, which nothing could call: the Rust test that asserted what the write buys
+/// hand-built the same `Death` and called `close_at` itself — a COPY of the mechanism. Deleting the
+/// call from `pty_kill`, or changing its cause to something resurrectable, left the entire suite
+/// green while every ordinary stop path became resurrectable again.
+///
+/// ── WHY `Dead`/`unknown` AND NOT `Retired` (roborev 61714) ────────────────────────────────────
+/// `Retired` carries more meaning than "do not resurrect": `derive` maps it to
+/// `ReaperVerdict::Reapable` UNCONDITIONALLY, with none of the `PROTECTION_MAX` grace `Dead` gets.
+/// But "stop the agents when I close this window" is explicitly not "delete them" — the records and
+/// tabs are meant to survive — and the promotion cutover kills the LOCAL pty for an agent that is
+/// still alive in the cloud on that same worktree. Marking either `Reapable` would hand a worktree
+/// holding uncommitted work to any future reaper.
+///
+/// `unknown` needs no new vocabulary: `deathTypes` documents it as "a human clicking stop produces
+/// exactly this observation", and `is_resurrectable` refuses it. `PtyExit` is the honest evidence —
+/// a window watched this close, which is what makes it distinct from the reaper's `SessionVanished`.
+///
+/// ONLY a `Live` record is touched, so this can never downgrade a richer verdict a window already
+/// observed (a met goal, a wall, a transport banner). `Ok(false)` means "there was nothing to mark",
+/// which is a normal outcome and not a failure.
+pub fn mark_stopped_at(dir: &Path, agent_id: &str, now_ms: i64) -> Result<bool, LifeError> {
+    match read_record_at(dir, agent_id)? {
+        Some(rec) if rec.state == LifeState::Live => {}
+        _ => return Ok(false),
+    }
+    let death = Death {
+        cause: DeathCause::Unknown,
+        evidence: DeathEvidence::PtyExit,
+        at: now_ms,
+        message: None,
+        goal_met_at: None,
+    };
+    close_at(dir, agent_id, death, None)?;
+    Ok(true)
+}
+
 /// Record an OBSERVED death. Refuses to downgrade a finished agent.
 pub fn close_at(
     dir: &Path,
@@ -665,6 +793,131 @@ pub fn seal_stale_at(
     Ok(stats)
 }
 
+/// How long a freshly-opened record is immune from the session reaper.
+///
+/// NOT a tuning knob — it closes a REAL race with a definite direction. `openDeathRecord` runs at
+/// SPAWN, deliberately before anything else (its own doc: "the open is the load-bearing write"),
+/// and `pty_spawn` inserts the session only afterwards. So between those two writes a perfectly
+/// healthy agent has a `Live` record and NO live session, which is byte-for-byte the state this
+/// reaper kills on. Without the grace window the reaper would seal every agent the instant it was
+/// created, and the resurrector would then respawn it — an infinite spawn/kill loop across the
+/// whole fleet, which is the single worst outcome available in this module.
+///
+/// 60s is orders of magnitude more than the observed open→spawn gap (milliseconds) while still
+/// being far below the 15s×N it takes the TS sweep to act on anything.
+pub const REAP_GRACE_MS: i64 = 60_000;
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ReapStats {
+    pub scanned: u32,
+    pub reaped: u32,
+    /// Left alone because a live PTY session still answers for them.
+    pub still_live: u32,
+    /// Left alone because they are younger than {@link REAP_GRACE_MS}.
+    pub too_young: u32,
+    /// Left alone because they belong to a DIFFERENT epoch — not ours to judge.
+    pub not_ours: u32,
+}
+
+/// SEAL EVERY RECORD WHOSE AGENT PROCESS IS GONE, ON THE RUNNING APP'S OWN CLOCK.
+///
+/// ── THE HOLE THIS FILLS ───────────────────────────────────────────────────────────────────────
+/// `seal_stale_at` is the only other sealer and it runs at APP LAUNCH, keyed on a dead EPOCH. So it
+/// covers exactly one death: the app quitting. It cannot see the far more common one — a single
+/// agent's `claude` exiting while the app keeps running — because that record's epoch is this very
+/// process, which is alive by definition.
+///
+/// The consequence was measured on the founder's install and it is total: `derive` computes
+/// `alive = state == Live && epoch_alive`, so an agent whose process died hours ago still reads
+/// ALIVE, `due_at`'s first gate skips it, and it can never be published as due. Seven agents sat in
+/// exactly that state for 47 minutes — dead process, `Live` record, and a `working` status the
+/// screen scraper kept re-asserting off a frozen spinner frame. Every death record on that machine
+/// arrived in an app-quit burst; individual deaths produced four records in two days against ~40
+/// agents a day restarted by hand.
+///
+/// ── WHY THE WEBVIEW CANNOT BE THE ANSWER ──────────────────────────────────────────────────────
+/// `StatusEngine.exit()` → `recordDeath` is the observed path, and it requires a MOUNTED pane —
+/// `classifyDeath`'s Gate 0 refuses to write anything when `liveness !== "local"`. Panes mount
+/// lazily per project, so most of the fleet has no observer at any given moment. A death nobody is
+/// watching has to be inferred from an artifact, and the PTY session map is that artifact.
+///
+/// ── THE THREE GATES, AND WHY EACH ONE IS LOAD-BEARING ─────────────────────────────────────────
+///  1. `rec.epoch == current_epoch`. `live_sessions` is THIS process's PTY map, so it is evidence
+///     about OUR agents only. Judging another live instance's records against it would report its
+///     entire healthy fleet as dead — the same catastrophic direction `epoch_still_running`'s
+///     short-circuit exists to prevent. A record under a DEAD epoch is `seal_stale_at`'s job and is
+///     deliberately left alone here.
+///  2. The session is absent. Present ⇒ the agent is running; nothing to do.
+///  3. Older than {@link REAP_GRACE_MS} — see that constant for the open-before-spawn race.
+///
+/// Idempotent: a record already `Dead`, `Claimed` or `Retired` is skipped, so re-running never
+/// rewrites a verdict a window recorded with real evidence.
+pub fn reap_dead_sessions_at(
+    dir: &Path,
+    current_epoch: &str,
+    live_sessions: &std::collections::HashSet<String>,
+    now_ms: i64,
+) -> Result<ReapStats, LifeError> {
+    let mut stats = ReapStats::default();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(stats),
+        Err(e) => return Err(LifeError::Io(e.to_string())),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(agent_id) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+        // A record we cannot parse is SKIPPED, never sealed. Same asymmetry `revival::read_ledger`
+        // argues for: one torn file must not take the rest of the ledger with it, and inventing a
+        // death for bytes we could not read would be the worst possible way to fail.
+        let Ok(Some(mut rec)) = read_record_at(dir, agent_id) else { continue };
+        stats.scanned += 1;
+        if rec.state != LifeState::Live {
+            continue;
+        }
+        if rec.epoch != current_epoch {
+            stats.not_ours += 1;
+            continue;
+        }
+        if live_sessions.contains(agent_id) {
+            stats.still_live += 1;
+            continue;
+        }
+        if now_ms.saturating_sub(rec.opened_at) < REAP_GRACE_MS {
+            stats.too_young += 1;
+            continue;
+        }
+        let death = Death {
+            cause: DeathCause::ProcessGone,
+            evidence: DeathEvidence::SessionVanished,
+            at: now_ms,
+            message: None,
+            goal_met_at: None,
+        };
+        // THROUGH `validate`, not around it (roborev 61705). Writing straight to
+        // `write_record_at` is what let the first version persist a `{ProcessGone, PtyExit}` pair
+        // that `validate` would have rejected — an invariant the module states and enforces "at the
+        // persistence boundary" quietly becoming untrue for the only records this path writes.
+        // A record that fails the check is SKIPPED, never forced: this is an inference, and an
+        // inference that cannot satisfy the module's own honesty rule has no business being stored.
+        if let Err(e) = validate(&death, rec.wall.as_ref()) {
+            tracing::warn!(target: "revival", agent_id, error = %e, "refusing to write an unsupported reaper verdict");
+            continue;
+        }
+        rec.state = LifeState::Dead;
+        rec.death = Some(death);
+        // `rec.wall` survives untouched, exactly as in `seal_stale_at`: an agent walled at 18:19
+        // whose process then vanished has both facts true, and recovery needs both — resurrect
+        // because it died, but not before the reset.
+        write_record_at(dir, &rec)?;
+        stats.reaped += 1;
+    }
+    Ok(stats)
+}
+
 // ── reading ──────────────────────────────────────────────────────────────────────────────────
 
 /// Is the epoch that stamped this record still running?
@@ -701,9 +954,13 @@ fn derive(rec: AgentLifeRecord, app_data: &Path, now_ms: i64) -> AgentLifeReadin
         } else if arms_on_clock(c) {
             rec.wall.as_ref().and_then(|w| w.reset_at)
         } else {
-            // An app restart still honours a wall that rode along with it.
+            // An app restart still honours a wall that rode along with it — and so does a process
+            // that simply vanished. Neither death OBSERVED the wall, but the record carries it, and
+            // respawning into a window that has not reopened is the measured 45-retry failure.
             match c {
-                DeathCause::AppRestart => rec.wall.as_ref().and_then(|w| w.reset_at).or(Some(now_ms)),
+                DeathCause::AppRestart | DeathCause::ProcessGone => {
+                    rec.wall.as_ref().and_then(|w| w.reset_at).or(Some(now_ms))
+                }
                 _ => Some(now_ms),
             }
         }
@@ -1025,36 +1282,368 @@ mod tests {
         Death { cause, evidence, at: NOW, message: None, goal_met_at: None }
     }
 
+    /// The TS union's own members, read out of `deathTypes.ts` at compile time.
+    ///
+    /// Only lines whose trimmed form starts with `| "` are taken: the doc comments BETWEEN the
+    /// members quote other members by name (`Distinct from "pty-exit"`), so a naive scan for quoted
+    /// strings would silently accept a union that lost a member as long as some comment still
+    /// mentioned it.
+    fn ts_union_members(src: &str, type_name: &str) -> Vec<String> {
+        let head = format!("export type {type_name} =");
+        let body = src.split(&head).nth(1).unwrap_or_else(|| panic!("{type_name} not found in deathTypes.ts"));
+        let mut out = Vec::new();
+        for line in body.lines() {
+            let t = line.trim();
+            if let Some(rest) = t.strip_prefix("| \"") {
+                let Some(end) = rest.find('"') else { continue };
+                out.push(rest[..end].to_string());
+            }
+            // The union ends at the first `;` that terminates a member line.
+            if t.ends_with("\";") {
+                break;
+            }
+        }
+        assert!(!out.is_empty(), "parsed no members for {type_name} — the parser, not the union, is probably wrong");
+        out
+    }
+
+    /// THE RUST↔TS WIRE VOCABULARY IS ONE SET, AND BOTH ENDS MUST HOLD ALL OF IT.
+    ///
+    /// This used to be a hand-written `[(variant, "string")]` array, which catches a RENAME and not
+    /// an ADDITION (roborev 61725): a new variant simply is not in the array, so the array agrees
+    /// with itself and the test passes while the other end never learns the value exists. That is
+    /// how the `session-vanished` drift got in, and it is the exact hole the TS side closed with its
+    /// `CoversUnion` guard. Two changes close it here:
+    ///
+    ///   1. The expected string comes from `serde_name_cause` / `serde_name_evidence`, which are
+    ///      EXHAUSTIVE matches — a new variant fails to COMPILE until someone names its string.
+    ///   2. The resulting set is compared against the TS union parsed out of `deathTypes.ts`, so a
+    ///      value that exists on one side and not the other is a test failure rather than a record
+    ///      the other end reads as an unknown variant.
+    ///
+    /// Residual, stated rather than papered over: the variant LIST below is still hand-written
+    /// (Rust cannot enumerate an enum's variants without `strum`), so an author who adds a variant,
+    /// satisfies the compiler in `serde_name_*`, and does not add it here still slips past. The
+    /// compile error is the moment they are told to come to this file; the doc comment on
+    /// `serde_name_cause` is what tells them the rest.
     #[test]
     fn the_serde_strings_match_deathtypes_ts() {
-        // Pinned against the TS union. A rename on either side must break here rather than silently
-        // produce records the other end reads as an unknown variant.
-        let pairs = [
-            (DeathCause::TransportTransient, "\"transport-transient\""),
-            (DeathCause::WallSession, "\"wall-session\""),
-            (DeathCause::WallSpend, "\"wall-spend\""),
-            (DeathCause::CleanGoalMet, "\"clean-goal-met\""),
-            (DeathCause::BlockedOnHuman, "\"blocked-on-human\""),
-            (DeathCause::AppRestart, "\"app-restart\""),
-            (DeathCause::Unknown, "\"unknown\""),
+        let src = include_str!("../../src/engine/deathTypes.ts");
+
+        let causes = [
+            DeathCause::TransportTransient,
+            DeathCause::WallSession,
+            DeathCause::WallSpend,
+            DeathCause::CleanGoalMet,
+            DeathCause::BlockedOnHuman,
+            DeathCause::AppRestart,
+            DeathCause::ProcessGone,
+            DeathCause::Unknown,
         ];
-        for (c, s) in pairs {
-            assert_eq!(serde_json::to_string(&c).unwrap(), s);
+        for c in causes {
+            // serde really emits what the exhaustive helper claims…
+            assert_eq!(
+                serde_json::to_string(&c).unwrap(),
+                format!("\"{}\"", serde_name_cause(c)),
+                "serde's wire string for {c:?} is not what serde_name_cause says it is"
+            );
         }
-        let ev = [
-            (DeathEvidence::QuotaBlock, "\"quota-block\""),
-            (DeathEvidence::Transcript429, "\"transcript-429\""),
-            (DeathEvidence::ApiBanner, "\"api-banner\""),
-            (DeathEvidence::BlockingTool, "\"blocking-tool\""),
-            (DeathEvidence::GoalMetMarked, "\"goal-met-marked\""),
-            (DeathEvidence::EpochDead, "\"epoch-dead\""),
-            (DeathEvidence::PtyExit, "\"pty-exit\""),
-            (DeathEvidence::SessionEndHook, "\"session-end-hook\""),
-            (DeathEvidence::None, "\"none\""),
+        // …and that vocabulary is exactly the TS union's, in both directions.
+        let mut rust: Vec<String> = causes.iter().map(|c| serde_name_cause(*c).to_string()).collect();
+        let mut ts = ts_union_members(src, "DeathCause");
+        rust.sort();
+        ts.sort();
+        assert_eq!(
+            rust, ts,
+            "DeathCause has drifted from deathTypes.ts — a value one end emits the other reads as \
+             an unknown variant"
+        );
+
+        let evidence = [
+            DeathEvidence::QuotaBlock,
+            DeathEvidence::Transcript429,
+            DeathEvidence::ApiBanner,
+            DeathEvidence::BlockingTool,
+            DeathEvidence::GoalMetMarked,
+            DeathEvidence::EpochDead,
+            DeathEvidence::SessionVanished,
+            DeathEvidence::PtyExit,
+            DeathEvidence::SessionEndHook,
+            DeathEvidence::None,
         ];
-        for (e, s) in ev {
-            assert_eq!(serde_json::to_string(&e).unwrap(), s);
+        for e in evidence {
+            assert_eq!(
+                serde_json::to_string(&e).unwrap(),
+                format!("\"{}\"", serde_name_evidence(e)),
+                "serde's wire string for {e:?} is not what serde_name_evidence says it is"
+            );
         }
+        let mut rust: Vec<String> =
+            evidence.iter().map(|e| serde_name_evidence(*e).to_string()).collect();
+        let mut ts = ts_union_members(src, "DeathEvidence");
+        rust.sort();
+        ts.sort();
+        assert_eq!(
+            rust, ts,
+            "DeathEvidence has drifted from deathTypes.ts — a value one end emits the other reads \
+             as an unknown variant"
+        );
+    }
+
+    // ── the session reaper ───────────────────────────────────────────────────────────────────
+    //
+    // Written as INVERTED PAIRS over one record wherever possible: each test changes exactly one
+    // input, so it cannot pass by the record being dropped for one of the other three reasons.
+
+    fn sessions(ids: &[&str]) -> std::collections::HashSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// THE ONE THAT MATTERS, asserted on the END-TO-END side effect rather than on the write.
+    ///
+    /// `reaped == 1` would be satisfied by a reaper that wrote any death at all. What the founder
+    /// actually needs is for the agent to become DUE, and that runs through `derive`'s `alive` gate
+    /// and `is_resurrectable` — so this asserts the reading, which is what `revival::due_at`
+    /// consumes. Against today's code (no reaper) the record stays `Live`, `derive` reports
+    /// `alive: true`, and the agent is invisible to recovery forever.
+    #[test]
+    #[cfg(unix)]
+    fn a_live_record_whose_session_vanished_is_reaped_and_becomes_resurrectable() {
+        let (_td, dir, app_data) = dirs();
+        open(&dir, "a1", "epoch-mine");
+        // THE EPOCH MUST BE GENUINELY ALIVE or this test proves nothing. `derive` computes
+        // `alive = Live && epoch_alive`, so against a fake epoch the `!alive` assertion below would
+        // hold whether or not the reaper ever ran — and `effective_cause` would read `AppRestart`
+        // from the dead-epoch path rather than from our write. Holding a real `flock` puts the
+        // record in the exact state the bug lives in: alive epoch, vanished session.
+        let _lock = hold_test_lock(&app_data, "epoch-mine");
+        let at = NOW + REAP_GRACE_MS;
+
+        // BEFORE: this is the founder's stuck state — dead process, and the ledger says alive.
+        let before = read_at(&dir, &app_data, "a1", at).unwrap().unwrap();
+        assert!(before.alive, "precondition: an unreaped record reads ALIVE — the bug");
+        assert!(!before.resurrectable, "and is therefore invisible to recovery");
+
+        let stats = reap_dead_sessions_at(&dir, "epoch-mine", &sessions(&[]), at).unwrap();
+        assert_eq!(stats.reaped, 1, "a dead session under our own epoch must be sealed");
+
+        let r = read_at(&dir, &app_data, "a1", at).unwrap().unwrap();
+        assert!(!r.alive, "the whole point: it must stop reading ALIVE");
+        assert_eq!(r.effective_cause, Some(DeathCause::ProcessGone));
+        assert!(r.resurrectable, "a process that vanished unobserved must be recoverable");
+        assert_eq!(r.not_before_ms, Some(at), "due immediately; the TS ladder paces it");
+    }
+
+    /// The paired positive. Same record, same clock, ONLY the session set differs — so the test
+    /// above cannot be passing because of the grace window or the epoch gate.
+    #[test]
+    #[cfg(unix)]
+    fn a_live_record_with_a_live_session_is_left_completely_alone() {
+        let (_td, dir, app_data) = dirs();
+        open(&dir, "a1", "epoch-mine");
+        let _lock = hold_test_lock(&app_data, "epoch-mine");
+        let at = NOW + REAP_GRACE_MS;
+
+        // IDENTICAL to the test above in every input except the session set.
+        let stats = reap_dead_sessions_at(&dir, "epoch-mine", &sessions(&["a1"]), at).unwrap();
+        assert_eq!(stats.reaped, 0);
+        assert_eq!(stats.still_live, 1);
+        assert_eq!(read_record_at(&dir, "a1").unwrap().unwrap().state, LifeState::Live);
+        assert!(
+            read_at(&dir, &app_data, "a1", at).unwrap().unwrap().alive,
+            "a running agent must keep reading ALIVE — reaping one would be catastrophic"
+        );
+    }
+
+    /// THE SPAWN RACE, which is the one that would have been catastrophic. `openDeathRecord` writes
+    /// the record BEFORE `pty_spawn` registers the session, so a healthy just-created agent looks
+    /// exactly like a dead one. Reaping it would seal every agent at birth and the resurrector
+    /// would respawn it — an unbounded spawn/kill loop across the fleet.
+    ///
+    /// Inverted pair on the CLOCK alone: one millisecond under the window is immune, the window
+    /// itself is fair game.
+    #[test]
+    fn a_freshly_opened_record_is_immune_until_the_grace_window_passes() {
+        let (_td, dir, _app_data) = dirs();
+        open(&dir, "a1", "epoch-mine");
+
+        let early = reap_dead_sessions_at(&dir, "epoch-mine", &sessions(&[]), NOW + REAP_GRACE_MS - 1).unwrap();
+        assert_eq!(early.reaped, 0, "the open→spawn gap must never be read as death");
+        assert_eq!(early.too_young, 1);
+        assert_eq!(read_record_at(&dir, "a1").unwrap().unwrap().state, LifeState::Live);
+
+        let late = reap_dead_sessions_at(&dir, "epoch-mine", &sessions(&[]), NOW + REAP_GRACE_MS).unwrap();
+        assert_eq!(late.reaped, 1, "and once it is past, the reaper must still fire");
+    }
+
+    /// THE CATASTROPHIC DIRECTION. `live_sessions` is THIS process's PTY map, so it is evidence
+    /// about our agents only. A second running instance's records must be untouchable — judging
+    /// them against our session map would report its entire healthy fleet as dead and hand all of
+    /// it to the resurrector at once.
+    #[test]
+    fn a_record_belonging_to_another_epoch_is_never_reaped() {
+        let (_td, dir, _app_data) = dirs();
+        open(&dir, "theirs", "some-other-epoch");
+        let stats =
+            reap_dead_sessions_at(&dir, "epoch-mine", &sessions(&[]), NOW + 86_400_000).unwrap();
+        assert_eq!(stats.reaped, 0, "another instance's agents are not ours to judge");
+        assert_eq!(stats.not_ours, 1);
+        assert_eq!(read_record_at(&dir, "theirs").unwrap().unwrap().state, LifeState::Live);
+    }
+
+    /// A verdict a WINDOW recorded with real evidence must survive. The reaper infers from an
+    /// absence; an observed classification is strictly better information and must not be
+    /// overwritten by a later tick.
+    #[test]
+    fn an_already_classified_death_is_never_rewritten() {
+        let (_td, dir, _app_data) = dirs();
+        open(&dir, "a1", "epoch-mine");
+        close_at(
+            &dir,
+            "a1",
+            death(DeathCause::BlockedOnHuman, DeathEvidence::BlockingTool),
+            None,
+        )
+        .unwrap();
+
+        let stats =
+            reap_dead_sessions_at(&dir, "epoch-mine", &sessions(&[]), NOW + 86_400_000).unwrap();
+        assert_eq!(stats.reaped, 0);
+        let rec = read_record_at(&dir, "a1").unwrap().unwrap();
+        assert_eq!(
+            rec.death.unwrap().cause,
+            DeathCause::BlockedOnHuman,
+            "the reaper must never clobber a verdict a window observed — this agent is waiting on \
+             a PERSON, and re-labelling it `process-gone` would make it resurrectable and respawn \
+             an agent that asked someone a question"
+        );
+    }
+
+    /// A DELIBERATELY STOPPED AGENT MUST NEVER BE REAPED OR RESURRECTED (roborev 61700/61714).
+    ///
+    /// The reaper infers death from "open record, absent session" — and a deliberate stop produces
+    /// exactly that whenever no pane was mounted to observe it. The ordinary stop paths are all
+    /// like that: `spinDownWorker`, `ProjectModal` killing a whole project's agents,
+    /// `AgentSidebar` closing a row, `killAllOpenAgents` on window close.
+    ///
+    /// `pty_kill` marks the record `Dead`/`unknown` before killing (see
+    /// `pty.rs::mark_stopped_before_kill`), and this asserts what that buys. `unknown` rather than
+    /// `Retired` is load-bearing in BOTH directions, so both are asserted:
+    ///   - not resurrectable, so the fleet cannot restart what the user stopped
+    ///   - still PROTECTED from the worktree reaper, because "stop" is not "delete" and the
+    ///     promotion cutover kills a local pty for an agent still alive in the cloud. `Retired`
+    ///     maps to `Reapable` unconditionally, with none of `Dead`'s `PROTECTION_MAX` grace.
+    ///
+    /// Inverted pair against `a_live_record_whose_session_vanished_is_reaped_and_becomes_
+    /// resurrectable`: identical inputs, and ONLY the recorded stop differs.
+    #[test]
+    #[cfg(unix)]
+    fn a_deliberately_stopped_agent_is_neither_reaped_nor_reapable() {
+        let (_td, dir, app_data) = dirs();
+        open(&dir, "a1", "epoch-mine");
+        let _lock = hold_test_lock(&app_data, "epoch-mine");
+        // THE MECHANISM ITSELF, not a copy of it (roborev 61770). This used to hand-build the same
+        // `Death` and call `close_at` — so deleting the call from `pty_kill`, or changing its cause
+        // to something resurrectable, left this green while every stop path became resurrectable.
+        assert!(
+            mark_stopped_at(&dir, "a1", NOW).unwrap(),
+            "a Live record must actually be marked — an Ok(false) here would make everything below \
+             assert about a record nothing touched"
+        );
+
+        let at = NOW + REAP_GRACE_MS;
+        let stats = reap_dead_sessions_at(&dir, "epoch-mine", &sessions(&[]), at).unwrap();
+        assert_eq!(stats.reaped, 0, "a stop the user asked for is not a death to recover from");
+
+        let r = read_at(&dir, &app_data, "a1", at).unwrap().unwrap();
+        assert!(
+            !r.resurrectable,
+            "must stay unresurrectable — respawning it would fight the user"
+        );
+        assert_eq!(
+            r.reaper_verdict,
+            ReaperVerdict::Protected,
+            "and must stay PROTECTED: stop is not delete, and the promotion cutover kills a local \
+             pty for an agent still alive in the cloud on that worktree"
+        );
+    }
+
+    /// THE OTHER HALF: A STOP MUST NOT OVERWRITE A RICHER VERDICT SOMEONE ALREADY OBSERVED.
+    ///
+    /// This is the one behaviour that distinguishes `mark_stopped_at` from a bare `close_at`, and it
+    /// had no test (roborev 61789) — so deleting the `Live`-only pre-check left the suite green
+    /// while changing real behaviour. `close_at` refuses a downgrade ONLY for `CleanGoalMet`; every
+    /// other recorded death is overwritten. So an agent already sealed on a session wall — whose
+    /// `reset_at` is exactly what `arms_on_clock` uses to bring it back — that is then swept by
+    /// `killAllOpenAgents` or `ProjectModal` would have its cause rewritten to `unknown`, which
+    /// `is_resurrectable` refuses. It would silently never come back at reset.
+    ///
+    /// Paired with the test above: same call, and the ONLY difference is the record's prior state.
+    #[test]
+    #[cfg(unix)]
+    fn a_stop_never_overwrites_a_death_a_window_already_observed() {
+        let (_td, dir, app_data) = dirs();
+        open(&dir, "a1", "epoch-mine");
+        let _lock = hold_test_lock(&app_data, "epoch-mine");
+        let wall = Wall {
+            message: "session limit reached, resets 4pm".into(),
+            reset_at: Some(NOW + 60_000),
+            reset_parsed: true,
+            observed_at: NOW,
+        };
+        close_at(&dir, "a1", death(DeathCause::WallSession, DeathEvidence::QuotaBlock), Some(wall))
+            .unwrap();
+
+        assert!(
+            !mark_stopped_at(&dir, "a1", NOW + 1).unwrap(),
+            "the record is no longer Live, so there is nothing to mark — reporting true would mean \
+             the stop had claimed a record it must not touch"
+        );
+
+        let rec = read_record_at(&dir, "a1").unwrap().unwrap();
+        assert_eq!(
+            rec.death.as_ref().unwrap().cause,
+            DeathCause::WallSession,
+            "the wall death must survive the stop — rewriting it to `unknown` makes an agent that \
+             would have returned at reset never return at all"
+        );
+        assert_eq!(
+            rec.wall.as_ref().unwrap().reset_at,
+            Some(NOW + 60_000),
+            "and its reset instant with it, since that is what arms the recovery"
+        );
+        let r = read_at(&dir, &app_data, "a1", NOW + 2).unwrap().unwrap();
+        assert!(r.resurrectable, "a session wall is recoverable, and a stop must not have taken that away");
+    }
+
+    /// A wall observed before the process vanished rides along, exactly as `seal_stale_at` keeps
+    /// one. Recovery needs BOTH facts: resurrect because it died, but not before the reset.
+    #[test]
+    fn reaping_preserves_a_wall_it_did_not_observe() {
+        let (_td, dir, app_data) = dirs();
+        open(&dir, "a1", "epoch-mine");
+        note_wall_at(
+            &dir,
+            "a1",
+            Wall {
+                message: SESSION_WALL.into(),
+                reset_at: Some(NOW + 3_600_000),
+                reset_parsed: true,
+                observed_at: NOW,
+            },
+        )
+        .unwrap();
+
+        let at = NOW + REAP_GRACE_MS;
+        assert_eq!(reap_dead_sessions_at(&dir, "epoch-mine", &sessions(&[]), at).unwrap().reaped, 1);
+
+        let r = read_at(&dir, &app_data, "a1", at).unwrap().unwrap();
+        assert_eq!(r.effective_cause, Some(DeathCause::ProcessGone));
+        assert_eq!(
+            r.not_before_ms,
+            Some(NOW + 3_600_000),
+            "the wall it rode in with must still gate the respawn"
+        );
     }
 
     #[test]
@@ -1700,6 +2289,34 @@ mod tests {
 
     // ── the command layer's one structural guard ──────────────────────────────────────────────
 
+    /// The source text of one fn's body, bounded by its OWN braces.
+    ///
+    /// Bounding a "scoped" source scan by the next attribute is not a scope (roborev 61789): the
+    /// slice then runs to whatever happens to follow, so it is non-vacuous by luck rather than by
+    /// construction. Callers should still assert something the slice must NOT contain — brace
+    /// counting is blind to braces inside string literals, and this is a test helper, not a parser.
+    fn fn_body(src: &str, signature: &str) -> String {
+        let after = src
+            .split(signature)
+            .nth(1)
+            .unwrap_or_else(|| panic!("`{signature}` not found — renamed, or no longer async"));
+        let start = after.find('{').expect("that fn has no body");
+        let mut depth = 0usize;
+        for (i, ch) in after[start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return after[start..=start + i].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces after `{signature}`");
+    }
+
     /// Scan Rust source for `#[tauri::command]` fns, returning `(total_commands, sync_signatures)`.
     ///
     /// Deliberately the SAME shape as `inbox.rs`'s scanner, including the anti-vacuity test below —
@@ -1752,6 +2369,69 @@ mod tests {
             "these agent-life commands are synchronous, so they run on the main thread and can \
              starve the concierge control bridge. Make them `pub async fn` + \
              `tauri::async_runtime::spawn_blocking`: {sync_cmds:#?}"
+        );
+    }
+
+    /// THE RULE FOLLOWS THE LEDGER, NOT THE FILE (roborev 61770).
+    ///
+    /// The guard above scans `agent_life.rs`, so it could not see a command in ANOTHER module that
+    /// writes this ledger — and one arrived: `pty_kill` calls `mark_stopped_at`, whose `close_at`
+    /// writes a temp file, `fsync`s it and renames. Sync, that is a read + an fsync on the main
+    /// thread PER AGENT for `windowClose.stopOpenProjectAgents` and `ProjectModal`'s
+    /// `Promise.all(agents.map(killPty))`, in front of the AppKit event loop the concierge bridge
+    /// needs. A guard that stops at its own file would have watched that land.
+    ///
+    /// Scoped to the commands that touch the ledger rather than every command in `pty.rs`: the sync
+    /// ones next door (`pty_ack`, `pty_resize`, `pty_live_sessions`) are a mutex and a `Vec` clone
+    /// with no I/O, and deliberately stay sync.
+    #[test]
+    fn pty_commands_that_write_the_agent_life_ledger_run_off_the_main_thread() {
+        let src = include_str!("pty.rs");
+        // SCOPED TO `pty_kill`'S OWN BODY, not to the file. A file-wide `contains` passes on the
+        // mutation that matters: deleting the call from `pty_kill` leaves the helper defined and
+        // still mentioning `mark_stopped_at`, so the whole-file scan stays green while every stop
+        // path silently becomes resurrectable again. Measured — the first version of this guard did
+        // exactly that.
+        let body = fn_body(src, "pub async fn pty_kill");
+        // The slice is bounded by pty_kill's own BRACES, not by the next `#[tauri::command]`
+        // attribute (roborev 61789). An attribute terminator is not a scope: moving the helper's
+        // definition below its caller — an ordinary "helper after caller" refactor — would pull
+        // `fn mark_stopped_before_kill`'s own body into the slice and make the assertion below
+        // satisfiable without `pty_kill` calling anything. This is the self-check for that.
+        assert!(
+            !body.contains("fn mark_stopped_before_kill"),
+            "the slice swallowed the helper's own DEFINITION, so the call-site assertion below \
+             cannot fail — re-scope it before trusting this guard"
+        );
+        let call = body.find("mark_stopped_before_kill(").unwrap_or_else(|| {
+            panic!(
+                "`pty_kill` no longer records the deliberate stop, so the session reaper will seal \
+                 these agents `process-gone` and resurrect what the user just stopped (roborev 61700)"
+            )
+        });
+        // PRESENCE IS NOT THE PROPERTY — POSITION IS (roborev 61789). Dropping the `.await`, or
+        // moving the mark below the session removal, leaves every test green while the record is
+        // still read `Live` after the session has vanished: exactly the state
+        // `reap_dead_sessions_at` seals as `process-gone`.
+        let kill = body.find("sessions.lock()").expect("pty_kill no longer removes the session");
+        assert!(
+            call < kill,
+            "the deliberate-stop mark must run BEFORE the session is removed, or the reaper can \
+             land in the window where the session is gone and the record still reads Live"
+        );
+        assert!(
+            body[call..kill].contains(".await"),
+            "the mark is dispatched but not awaited before the kill, so the ordering above is not \
+             actually enforced at runtime"
+        );
+        let (total, sync_cmds) = tauri_commands_in(src);
+        assert!(total >= 5, "the scanner matched {total} pty commands, so it is not guarding anything");
+        let offenders: Vec<&String> = sync_cmds.iter().filter(|s| s.contains("pty_kill")).collect();
+        assert!(
+            offenders.is_empty(),
+            "`pty_kill` writes the agent-life ledger (fsync + rename), so a synchronous body runs \
+             that on the main thread — once per agent on window close. Make it `pub async fn` + \
+             `tauri::async_runtime::spawn_blocking`: {offenders:#?}"
         );
     }
 

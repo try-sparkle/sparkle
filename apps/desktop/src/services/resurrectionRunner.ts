@@ -54,6 +54,7 @@ import type { DeathCause } from "../engine/deathTypes";
 import type { QuotaBlock } from "../engine/quotaBlock";
 import { hasTurnEndAuthority, processAliveOf } from "../engine/turnEndAuthority";
 import { log } from "../logger";
+import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { notifyAttention } from "./attention";
 import { restartPane } from "./paneControl";
@@ -98,6 +99,30 @@ export interface ResurrectionOutcome {
   detail: string;
 }
 
+/**
+ * WHAT THE MOUNT ACTUALLY DID — and the reason this is no longer `void`.
+ *
+ * `mount` used to return nothing, so `admit` could not tell a real mount from a no-op and reported
+ * `respawn` either way. On the founder's live v0.95.0 install that produced nine `respawned a dead
+ * agent` lines in one day for nine agents whose `pty_spawn` count was ZERO and whose `agent-status`
+ * event count was ZERO. Each of those fictions spent one of the 24 durable daily attempts, moved the
+ * cohort into `probation`, failed 180s later on `no-turn-authority` (correctly — nothing had
+ * started), rotated the canary, and after three rotations abandoned the whole cohort. Two full
+ * cohort abandonments in one day, every one of them caused by the mount lying about itself.
+ *
+ * So the seam answers a QUESTION now, and `admit` believes the answer rather than the call
+ * returning:
+ *
+ *   • `restarted`    — route 1: a mounted pane's own re-spawn lever was pulled. Real.
+ *   • `opened`       — route 2: the agent has a projectStore row, so `Workspace` can and will mount
+ *                      a fresh pane for it. Real.
+ *   • `no-agent-row` — route 2 is STRUCTURALLY INERT: no `Project.agents` row names this id, so
+ *                      `Workspace`'s project gate (`p.agents.some(a => admitted.has(a.id))`) matches
+ *                      nothing and its mount loop (`for (const a of p.agents)`) iterates past it. The
+ *                      admission set grows, `openAgentIds` grows, and nothing whatsoever mounts.
+ */
+export type MountResult = "restarted" | "opened" | "no-agent-row";
+
 export interface ResurrectionSweepOptions {
   /** Injected clock, house style — so the ladder arithmetic needs no fake timers. */
   now?: number;
@@ -113,8 +138,11 @@ export interface ResurrectionSweepOptions {
   claim?: (agentId: string) => Promise<boolean>;
   /** Give the claim back, recording the attempt durably when `spawned`. */
   release?: (agentId: string, spawned: boolean) => Promise<void>;
-  /** Let the pane mount. Defaults to the admission set + the runtime store's open. */
-  mount?: (agentId: string) => void;
+  /** Let the pane mount, and SAY WHETHER IT LANDED. See {@link MountResult}. */
+  mount?: (agentId: string) => MountResult;
+  /** Does the projectStore still hold an agent row for this id? See {@link agentRowPresent} — the
+   *  one question that separates a revivable dead agent from an orphaned ledger record. */
+  hasAgentRow?: (agentId: string) => boolean;
   /** Hold the goal sweep off this agent until `untilMs`. */
   suppress?: (agentId: string, untilMs: number) => void;
   /** What was observed about a canary during its probation window. */
@@ -159,6 +187,7 @@ export function _resetResurrectionRunnerForTests(): void {
   burnedCanaries = new Map();
   cohortAttempts = new Map();
   inFlight.clear();
+  _resetResurrectionDecisionLogForTests();
 }
 
 /** Introspection seam: the phase this window currently holds for a cohort key. Lets a test assert
@@ -283,15 +312,51 @@ function defaultProbationEvidence(
  * this window has never mounted anything for that agent. `restartPane` returns false (no pane
  * registered its lever), and the admission set plus `open` are exactly right — they are what makes
  * `Workspace` mount a fresh pane, which prepares the worktree and resumes.
+ *
+ * ── ROUTE 2 HAS A PRECONDITION, AND SKIPPING THE CHECK IS WHY THIS SHIPPED AS A NO-OP ─────────
+ * Route 2 only works when a `Project.agents` row names the id. `Workspace.tsx` gates the PROJECT on
+ * `p.agents.some(a => admitted.has(a.id))` and then mounts with `for (const a of p.agents)` — an id
+ * naming no row satisfies neither. So for an agent whose ledger record outlived its UI row, both
+ * calls below "succeed" and nothing mounts. That is the exact state on the founder's install: 15
+ * projects, 75 agent rows, and nine due agents present in none of them.
+ *
+ * The roborev-60241 fix closed route 1 (`restartPane` already returned a boolean) and left route 2
+ * claiming success unconditionally. This is route 2's boolean.
  */
-function defaultMount(agentId: string): void {
+function defaultMount(agentId: string, hasRow: (id: string) => boolean): MountResult {
   // Route 1 first: a mounted pane is authoritative evidence that route 2's work is already done.
-  if (restartPane(agentId)) return;
+  if (restartPane(agentId)) return "restarted";
+  // Route 2's precondition, checked BEFORE anything is written. Both writes below are effectively
+  // permanent for the session — the admission set is add-only by design, and nothing removes an id
+  // from `openAgentIds` on a PTY exit — so growing them for an id that can never mount is pure
+  // garbage, which the sweep would then report as a respawn.
+  if (!hasRow(agentId)) return "no-agent-row";
   // Route 2. BOTH calls, doing different jobs: `admitAgent` unlocks the PROJECT's visited gate in
   // Workspace's `live` memo, `open` is the app's ordinary, persisted, multi-window mount signal for
   // the AGENT — and the one `runtimeStore.close()` undoes, which is what keeps the pane closable.
   admitAgent(agentId);
   useRuntimeStore.getState().open(agentId);
+  return "opened";
+}
+
+/**
+ * Does the projectStore hold a `Project.agents` row for this id?
+ *
+ * ── IT FAILS *OPEN*, AND THAT DIRECTION IS DELIBERATE ────────────────────────────────────────
+ * An empty `projects` array cannot be told apart from "zustand's persist middleware has not
+ * rehydrated `sparkle-projects` yet", and this sweep runs on a 15s interval that starts at app boot.
+ * Answering `false` there would mark the entire fleet orphaned for one tick — and an orphan is a
+ * PERMANENT refusal that also feeds `permanentlyUnfit`, so a single unlucky tick during rehydration
+ * would write off every dead agent on the machine. `true` merely means the sweep tries a mount and,
+ * at worst, `admit` catches the miss one layer down; that is the recoverable direction.
+ *
+ * Read-only on purpose: `getState()` rather than a hook, because the sweep is not a component and
+ * must not subscribe to anything.
+ */
+export function agentRowPresent(agentId: string): boolean {
+  const { projects } = useProjectStore.getState();
+  if (projects.length === 0) return true;
+  return projects.some((p) => p.agents.some((a) => a.id === agentId));
 }
 
 /** Test seam: the REAL probation evidence, so it can be driven directly. It is the default nobody
@@ -299,7 +364,13 @@ function defaultMount(agentId: string): void {
 export const defaultProbationEvidenceForTests = defaultProbationEvidence;
 
 function liveOptions(opts: ResurrectionSweepOptions): Required<ResurrectionSweepOptions> {
+  // ONE predicate, shared by the sweep's pre-gate and by `defaultMount`. Resolved here rather than
+  // letting `defaultMount` reach for the real one itself, so a test that injects `hasAgentRow`
+  // drives BOTH — otherwise the two could answer differently and the pairing that matters in
+  // production would be untested by construction.
+  const hasAgentRow = opts.hasAgentRow ?? agentRowPresent;
   return {
+    hasAgentRow,
     now: opts.now ?? Date.now(),
     ownsProject: opts.ownsProject ?? ownsProjectInThisWindow,
     projectTornOut: opts.projectTornOut ?? ((projectId) => isTornOut(projectId)),
@@ -313,7 +384,7 @@ function liveOptions(opts: ResurrectionSweepOptions): Required<ResurrectionSweep
       (async (agentId, spawned) => {
         await tauriInvoke("agent_life_release", { agentId, spawned });
       }),
-    mount: opts.mount ?? defaultMount,
+    mount: opts.mount ?? ((agentId) => defaultMount(agentId, hasAgentRow)),
     suppress: opts.suppress ?? suppressContinuation,
     probationEvidence: opts.probationEvidence ?? defaultProbationEvidence,
   };
@@ -449,6 +520,34 @@ export async function sweepResurrections(
     mine.push(d);
   }
 
+  // ── AN ORPHANED LEDGER RECORD IS A NAMED, PERMANENT REFUSAL — NOT A CANARY ──────────────────
+  //
+  // An `agent-life` record whose projectStore row is gone can NEVER be brought back by this
+  // mechanism: route 1 has no pane to restart and route 2 cannot mount an id that no `Project.agents`
+  // array names. Treating it as an ordinary victim is what burned the founder's fleet — `electCanary`
+  // prefers the OLDEST death, and an orphaned record is exactly that, so an orphan is the MOST
+  // likely canary. It "spawns" instantly, proves nothing for 180 seconds, fails on
+  // `no-turn-authority`, and rotates. Three of those and the whole cohort is `abandoned`.
+  //
+  // So it is handled the way `PERMANENT_NO_RESURRECT` reasons are: excluded from election, counted
+  // as permanently unfit, and reported BY NAME so a human reading the log sees `no-agent-row` rather
+  // than a cohort phase. Computed ONCE per sweep, before grouping, because the answer is the same for
+  // the cohort pre-pass and the lone-death loop and asking twice invites the two to disagree.
+  //
+  // MEMBERSHIP IS NOT TOUCHED. An orphan stays in `mine`, so `groupCohorts` still sees it and the
+  // cohort keeps its identity and its 2-victim floor — the same reason a LIVE agent stays in the list
+  // (see the note by `mine.push`). Only eligibility changes.
+  //
+  // THE LEDGER RECORD IS DELIBERATELY LEFT ALONE. `agent_life`'s retire path would stop it being
+  // republished on every 5s scan forever, which is the tidy answer, and it is the wrong risk to take
+  // from here: `agentRowPresent` can only fail OPEN (see its docstring), a retire is DURABLE and
+  // irreversible, and this sweep would be writing the record off on the strength of one webview's
+  // view of a store another window may hold differently. A record that is merely re-listed costs one
+  // comparison per scan; a wrongly retired one is unrecoverable. Left to the Rust side, which can see
+  // the whole machine rather than one window.
+  const orphaned = new Set<string>();
+  for (const d of mine) if (!o.hasAgentRow(d.agentId)) orphaned.add(d.agentId);
+
   const byId = new Map(mine.map((d) => [d.agentId, d]));
   const groups0 = groupCohorts(mine.map(memberOf));
   const { groups, binding, supersedes } = stabilizeCohortKeys(cohortBinding, groups0);
@@ -519,7 +618,7 @@ export async function sweepResurrections(
     /** Why a member was passed over, for its outcome line. Both permanent and transient refusals
      *  land here — a human asking "why was this row left alone" wants `daily-cap-spent`, not
      *  `cohort-canary-elected`. Only {@link permanentlyUnfit} feeds the abandonment decision. */
-    const refusedReason = new Map<string, NoResurrectReason>();
+    const refusedReason = new Map<string, NoResurrectReason | "no-agent-row">();
     /** Members that will never be victims again. The ONLY refusals allowed to influence whether a
      *  cohort is given up on. */
     const permanentlyUnfit = new Set<string>();
@@ -528,6 +627,15 @@ export async function sweepResurrections(
       if (member === undefined) {
         unelectable.add(m.agentId);
         permanentlyUnfit.add(m.agentId);
+        continue;
+      }
+      // Checked BEFORE `decideResurrection`, because the per-agent gate would happily approve an
+      // orphan — it reasons about causes, clocks and attempt counts, none of which know anything
+      // about whether a pane can exist at all. The structural fact wins.
+      if (orphaned.has(m.agentId)) {
+        unelectable.add(m.agentId);
+        permanentlyUnfit.add(m.agentId);
+        refusedReason.set(m.agentId, "no-agent-row");
         continue;
       }
       const probe = decideResurrection(
@@ -659,6 +767,25 @@ export async function sweepResurrections(
         phase = { phase: "observed", victims: cohort.map((m) => m.agentId), since: o.now };
       }
     }
+    // ── AN ORPHANED COHORT IS NOT AN ABANDONED ONE ──────────────────────────────────────────────
+    //
+    // `permanentlyUnfit` feeds `everyoneFinished` above, so without this an all-orphan cohort walks
+    // straight to `abandoned` — a sticky phase that fires a "N agents could not be brought back"
+    // notification and gives up on the key for good. That is precisely the failure this change
+    // exists to end, reached by the guard against it: two full cohort abandonments in one day on the
+    // founder's install, both from cohorts that were never revivable in the first place.
+    //
+    // `abandoned` means "canaries were sent and the door stayed shut — a human is needed". Nothing
+    // was sent here, and there is nothing for a human to click: the ledger record simply outlived its
+    // UI row. So the cohort goes back to waiting, which is what it did before any of this existed,
+    // and the per-agent `no-agent-row` outcomes below are what actually tell the story.
+    //
+    // NARROW ON PURPOSE — `every`, not `some`. A mixed cohort whose real victims burned their
+    // probations IS honestly abandoned, and suppressing that would hide a genuinely shut door behind
+    // one stale record.
+    if (phase.phase === "abandoned" && cohort.every((m) => orphaned.has(m.agentId))) {
+      phase = { phase: "observed", victims: cohort.map((m) => m.agentId), since: o.now };
+    }
     // GIVING UP HAS TO BE SAID OUT LOUD (roborev 60241). `abandoned` is the state the engine
     // documents as "give up and ask a human", and the phase is sticky for as long as the key
     // lives — so a whole cohort stops being recoverable. Reporting it only through the returned
@@ -753,6 +880,12 @@ export async function sweepResurrections(
   // it: its 54 agents share one epoch, so it only ever exercises a single cohort's own drain.
   for (const d of mine) {
     if (inCohort.has(d.agentId)) continue;
+    // Refused BEFORE the cap is consulted, and it does not touch `planned`: an admission that cannot
+    // possibly land must not push a revivable agent out of this sweep's budget.
+    if (orphaned.has(d.agentId)) {
+      outcomes.push({ agentId: d.agentId, action: "none", detail: "no-agent-row" });
+      continue;
+    }
     if (planned >= MAX_RESPAWNS_PER_SWEEP) {
       outcomes.push({ agentId: d.agentId, action: "none", detail: "sweep-cap" });
       continue;
@@ -847,7 +980,39 @@ async function admit(
       return;
     }
 
-    o.mount(d.agentId);
+    // ── EVERYTHING BELOW IS CONDITIONAL ON THE MOUNT HAVING LANDED ─────────────────────────────
+    //
+    // A mount that did not land must leave NO trace: no `respawn` outcome, no durable attempt (the
+    // `finally` reads `outcome.action`, so returning here releases with `spawned: false`), no
+    // `probation` transition, and no append to a released cohort's `drained`. Each of those is a
+    // cost the founder's fleet paid nine times for respawns that never happened — the durable attempt
+    // is one of 24 per agent per day, and the probation is what rotated the canary into abandonment.
+    //
+    // This is the LAST line of defence, not the first: the sweep already refused every orphan by name
+    // above. It still has to be here, because `hasAgentRow` fails open on an unrehydrated store and
+    // because a row can be deleted between the pre-gate and this call.
+    // FAILS CLOSED: anything that is not a POSITIVE report of a landed mount counts as "did not
+    // land" (roborev 61711). Testing `=== "no-agent-row"` was an allow-list of one — an injected
+    // stub returning nothing, a partial mock, or a `MountResult` variant added later all read as
+    // `undefined` and sailed through, booking a durable attempt and a probation for a mount that
+    // never happened. That is the exact failure this block exists to stop, reachable through the
+    // block itself. On the last line of defence the safe default is refusal.
+    const mounted = o.mount(d.agentId);
+    if (mounted !== "restarted" && mounted !== "opened") {
+      outcome.action = "none";
+      outcome.detail = mounted === "no-agent-row" ? "no-agent-row" : "mount-did-not-land";
+      log.warn("resurrection", "nothing to mount — the agent's row is gone", {
+        agentId: d.agentId,
+        cause: d.cause,
+        projectId: d.projectId,
+        cohort: cohortKey,
+      });
+      return;
+    }
+    // WHICH ROUTE RAN, in the line a human reads. `restarted` means a real pane lever was pulled;
+    // `opened` means a row exists and Workspace will mount one. Neither can be reported by a mount
+    // that did nothing, which is the whole point of the seam returning a value.
+    outcome.detail = `attempt ${attempt} (${mounted})`;
 
     // THE COLLISION WITH THE GOAL SWEEP, CLOSED HERE (see suppressContinuation).
     //
@@ -876,6 +1041,9 @@ async function admit(
     log.info("resurrection", "respawned a dead agent", {
       agentId: d.agentId,
       cause: d.cause,
+      // The route, so this line stops being unfalsifiable. Nine of these were written on the
+      // founder's install for agents whose `pty_spawn` count was zero.
+      via: mounted,
       attempt,
       cap: MAX_RESURRECTS_PER_AGENT_PER_DAY,
       cohort: cohortKey,
@@ -901,6 +1069,80 @@ async function admit(
   }
 }
 
+// ── SAY WHY, EVERY TIME ──────────────────────────────────────────────────────────────────────
+//
+// `sweepResurrections` has always returned a per-agent reason and `tick` has always thrown it away,
+// so `already-live`, `daily-cap-spent`, `not-this-window`, `waiting-for-next-rung`,
+// `cohort-probation` and `blocked-on-human` were invisible to everyone. The only lines this module
+// ever wrote were about things it DID — which is the wrong half: "an agent sits dead and nobody is
+// told" is the exact failure the whole feature exists to end, and the sweep was reproducing it one
+// layer up. The founder asked for precisely this: when resurrection declines to revive something,
+// it should say so and why.
+//
+// ON CHANGE, NOT ON EVERY TICK. The sweep runs every 15s, so a steady state — twelve agents parked
+// on `blocked-on-human`, which can last days — would be 5,760 identical lines a day. That is not
+// visibility; it is the same burial `revival.rs` inflicted on itself with its own change detection,
+// and it would drown this module's `respawned a dead agent` and `gave up on a cohort` lines.
+
+/**
+ * The last summary this window emitted, as a stable signature.
+ *
+ * Seeded with the EMPTY sweep's signature deliberately: a machine with nothing due — the ordinary
+ * case, and the one that runs for hours — must never write a line at all. A transition INTO empty
+ * still logs once, because "everything that was stuck has cleared" is news.
+ */
+const NO_DECISIONS = "[]";
+let lastDecisionSignature = NO_DECISIONS;
+
+/** Test seam: forget what was last logged, so a test can drive the change detection from scratch. */
+export function _resetResurrectionDecisionLogForTests(): void {
+  lastDecisionSignature = NO_DECISIONS;
+}
+
+/**
+ * Group one sweep's outcomes by reason and log them IF they differ from the last summary. Returns
+ * whether a line was written, so the change detection can be asserted directly rather than only
+ * through a spy on the logger.
+ *
+ * Every respawn collapses into one `respawn` bucket rather than keeping its `attempt N (route)`
+ * detail: the attempt number changes on every retry, so keying the signature on it would defeat the
+ * change detection for the one shape that retries — and each respawn already writes its own line
+ * carrying both the attempt and the route.
+ */
+export function reportSweepDecisions(outcomes: readonly ResurrectionOutcome[]): boolean {
+  const byReason = new Map<string, string[]>();
+  for (const oc of outcomes) {
+    const reason = oc.action === "respawn" ? "respawn" : oc.detail;
+    const ids = byReason.get(reason);
+    if (ids === undefined) byReason.set(reason, [oc.agentId]);
+    else ids.push(oc.agentId);
+  }
+  // Sorted on BOTH axes, so a sweep that reaches the same conclusion about the same agents in a
+  // different order is recognised as unchanged. Without it the due list's ordering — a BTreeMap walk
+  // on the Rust side, re-grouped here — would re-log a steady state.
+  const grouped = [...byReason]
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([reason, ids]) => [reason, [...ids].sort()] as const);
+  const signature = JSON.stringify(grouped);
+  if (signature === lastDecisionSignature) return false;
+  lastDecisionSignature = signature;
+
+  if (grouped.length === 0) {
+    log.info("resurrection", "nothing is due for resurrection any more");
+    return true;
+  }
+  log.info("resurrection", "resurrection sweep decisions", {
+    total: outcomes.length,
+    // reason → { count, agentIds }, which is what a human actually asks for: not "six agents were
+    // skipped" but "these two are waiting on a person, these three have spent today's cap, and this
+    // one has no row left".
+    reasons: Object.fromEntries(
+      grouped.map(([reason, ids]) => [reason, { count: ids.length, agentIds: ids }]),
+    ),
+  });
+  return true;
+}
+
 // ── The mount ────────────────────────────────────────────────────────────────────────────────
 
 let timer: ReturnType<typeof setInterval> | null = null;
@@ -917,6 +1159,10 @@ let sweeping = false;
  */
 export function startResurrectionRunner(
   intervalMs: number = RESURRECT_SWEEP_INTERVAL_MS,
+  /** Passed straight through to every sweep. Exists so a test can drive the REAL tick — including
+   *  the real `reportSweepDecisions` call below — rather than a re-implementation of it. The app
+   *  passes nothing, so production takes every default. */
+  options: ResurrectionSweepOptions = {},
 ): () => void {
   stopResurrectionRunner();
   const tick = async () => {
@@ -925,7 +1171,8 @@ export function startResurrectionRunner(
     if (sweeping) return;
     sweeping = true;
     try {
-      await sweepResurrections();
+      // THE RETURN VALUE IS THE POINT. Discarding it is what made every refusal invisible.
+      reportSweepDecisions(await sweepResurrections(options));
     } catch (e) {
       log.warn("resurrection", "resurrection sweep failed", { error: String(e) });
     } finally {

@@ -29,7 +29,11 @@ import {
   classifyDeath,
 } from "../engine/deathRecord";
 import type { DeathVerdict } from "../engine/deathTypes";
-import { lastFailureForAgent, quotaBlockForAgent } from "../engine/engineRegistry";
+import {
+  lastFailureForAgent,
+  quotaBlockForAgent,
+  recentFailureForAgent,
+} from "../engine/engineRegistry";
 import type { QuotaBlock } from "../engine/quotaBlock";
 import { log } from "../logger";
 import { useProjectStore } from "../stores/projectStore";
@@ -46,6 +50,13 @@ import { type AgentLiveness, livenessOf } from "./agentLiveness";
 export interface DeathRecordDeps {
   quota: (agentId: string, now: number) => QuotaBlock | undefined;
   lastFailure: (agentId: string) => { message: string; at: number } | undefined;
+  /**
+   * The RETAINED API-error banner, bounded by recency — `engineRegistry.recentFailureForAgent`.
+   *
+   * Takes `now` for the same reason `quota` does: the window is applied against the clock this call
+   * already read, so the classification cannot straddle two different readings of "now".
+   */
+  recentFailure: (agentId: string, now: number) => { message: string; at: number } | undefined;
   liveness: (agentId: string) => AgentLiveness;
   goal: (agentId: string) => AgentGoal | undefined;
   /**
@@ -73,6 +84,7 @@ export function liveDeps(): DeathRecordDeps {
   return {
     quota: quotaBlockForAgent,
     lastFailure: lastFailureForAgent,
+    recentFailure: recentFailureForAgent,
     liveness: (agentId) => {
       const rt = useRuntimeStore.getState();
       // Built EXACTLY as `goalContinuationRunner` and `conciergeTools` build it: the in-memory set
@@ -147,6 +159,7 @@ export async function recordDeath(
     const observation: DeathObservation = {
       quota: deps.quota(agentId, now),
       lastFailure: deps.lastFailure(agentId),
+      recentFailure: deps.recentFailure(agentId, now),
       liveness: deps.liveness(agentId),
       goal: deps.goal(agentId),
       blockingTool: deps.blockingTool(agentId),

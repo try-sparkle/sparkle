@@ -105,6 +105,7 @@ async function replay(durationMs: number): Promise<Replay> {
       release: () => Promise.resolve(),
       mount: (agentId) => {
         revived.add(agentId);
+              return "opened" as const;
       },
       suppress: () => {},
       probationEvidence: () => HEALTHY_CANARY,

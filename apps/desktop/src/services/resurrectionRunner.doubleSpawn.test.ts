@@ -118,6 +118,7 @@ describe("an agent whose PTY is already live is refused", () => {
         liveSessions: () => Promise.resolve(["a1"]),
         mount: (agentId) => {
           mounted.push(agentId);
+                  return "opened" as const;
         },
       }),
     );
@@ -180,6 +181,7 @@ describe("a canary that can no longer serve is re-elected, not waited on forever
         liveSessions: () => Promise.resolve(["older"]),
         mount: (agentId) => {
           mounted.push(agentId);
+                  return "opened" as const;
         },
       }),
     );
@@ -201,6 +203,7 @@ describe("a canary that can no longer serve is re-elected, not waited on forever
         due: () => Promise.resolve([dead({ agentId: "younger", diedAt: NOW })]),
         mount: (agentId) => {
           mounted.push(agentId);
+                  return "opened" as const;
         },
       }),
     );
@@ -224,6 +227,7 @@ describe("liveness is a per-sweep fact and must not pollute the DURABLE burned s
     const mounted: string[] = [];
     const mount = (agentId: string) => {
       mounted.push(agentId);
+      return "opened" as const;
     };
 
     // 1. `older` is elected and the claim is refused, so the phase sticks at `canary-elected`.
@@ -287,6 +291,7 @@ describe("liveness is a per-sweep fact and must not pollute the DURABLE burned s
           ]),
         mount: (agentId) => {
           mounted.push(agentId);
+                  return "opened" as const;
         },
       }),
     );
@@ -324,6 +329,7 @@ describe("liveness is a per-sweep fact and must not pollute the DURABLE burned s
         due: () => Promise.resolve(bothCapped),
         mount: (agentId) => {
           mounted.push(agentId);
+                  return "opened" as const;
         },
       }),
     );
@@ -376,7 +382,7 @@ describe("a cohort IS eventually given up on, and the human is told the truth ab
         opts({
           now,
           due: () => Promise.resolve(pair),
-          mount: () => {},
+          mount: () => "opened" as const,
           probationEvidence: ALWAYS_FAILS,
         }),
       );
@@ -429,6 +435,7 @@ describe("a cohort IS eventually given up on, and the human is told the truth ab
           liveSessions: () => Promise.resolve(live),
           mount: (agentId) => {
             mounted.push(agentId);
+                      return "opened" as const;
           },
           probationEvidence: ALWAYS_FAILS,
         }),
@@ -491,6 +498,12 @@ describe("a cohort IS eventually given up on, and the human is told the truth ab
           due: () => Promise.resolve(due),
           mount: (agentId) => {
             mounted.push(agentId);
+            // `mount` reports whether the pane actually came up (`MountResult`), so a stub that
+            // returns nothing is a type error under the new seam — and, since the runner now fails
+            // closed, would also be REFUSED at runtime as "did not land", short-circuiting before
+            // any probation and making the budget assertions below vacuous. Report a real mount so
+            // this test keeps exercising the canary budget it is about.
+            return "opened";
           },
           probationEvidence: ALWAYS_FAILS,
         }),
@@ -557,6 +570,7 @@ describe("a 2-victim cohort is NOT dissolved when its canary is mounted", () => 
     const mounted: string[] = [];
     const mount = (agentId: string) => {
       mounted.push(agentId);
+      return "opened" as const;
     };
 
     // Sweep 1 admits the canary.
@@ -607,6 +621,7 @@ describe("a project a satellite window owns is refused", () => {
         projectTornOut: (projectId) => projectId === "satellite-proj",
         mount: (agentId) => {
           mounted.push(agentId);
+                  return "opened" as const;
         },
       }),
     );

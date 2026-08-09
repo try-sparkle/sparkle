@@ -12,11 +12,20 @@
 // Driven through the REAL `StatusEngine`, not a stand-in, because the guarantee lives in the
 // engine's `disposed` latch and in which method `Terminal`'s cleanup happens to call. A test against
 // a fake would assert my own understanding of that wiring rather than the wiring.
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { TRANSPORT_FAILURE_WINDOW_MS } from "../engine/deathTypes";
+import {
+  lastFailureForAgent,
+  quotaBlockForAgent,
+  recentFailureForAgent,
+  registerStatusEngine,
+  unregisterStatusEngine,
+} from "../engine/engineRegistry";
 import { StatusEngine } from "../engine/statusEngine";
 import {
   type DeathRecordDeps,
+  liveDeps,
   openDeathRecord,
   recordDeath,
 } from "./deathRecordWriter";
@@ -38,6 +47,7 @@ function deps(over: Partial<DeathRecordDeps> = {}): Calls {
   const d: DeathRecordDeps = {
     quota: () => undefined,
     lastFailure: () => undefined,
+    recentFailure: () => undefined,
     // "local" means THIS window watched the agent. Anything else and `classifyDeath`'s Gate 0
     // refuses to claim anything, which is asserted on its own below.
     liveness: () => "local",
@@ -249,5 +259,224 @@ describe("a wall trips a close while the agent is still alive to see it", () => 
     expect(closes, "the PTY exiting IS a death, and still closes").toHaveLength(1);
     expect(closes[0]?.death).toMatchObject({ cause: "wall-session" });
     expect(closes[0]?.wall).toMatchObject({ message: SESSION_WALL });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// THE TRANSPORT DEATH, AND THE RACE THAT MADE IT INVISIBLE
+//
+// Census on the founder's live v0.95.0 install: 76 agent-life records, of which ZERO classified
+// `transport-transient` and 25 landed on `unknown` with evidence `pty-exit`. `isResurrectable`
+// refuses `unknown`, so those 25 were structurally outside recovery — the feature had never once
+// fired in production.
+//
+// The cause is a race, not a missing matcher. Claude Code does NOT print an API banner and exit; it
+// RETRIES. Measured 2026-08-08 against a non-resolving `ANTHROPIC_BASE_URL`: a real `claude` retried
+// for 2m56s, then exited 1, with `API Error: Unable to connect to API (ENOTFOUND)` as its FINAL line
+// of output. Every one of those retries emits a signal `StatusEngine.clearStreamFailure()` treats as
+// recovery — a classified tool event, a redrawn prompt, a token advance — and that method nulls
+// `lastFailure`, which is the only thing Gate 4 used to read. So the banner was reliably destroyed
+// by the very retry loop it was supposed to describe.
+//
+// ── WHY THESE DRIVE THE REAL ENGINE THROUGH THE REAL REGISTRY ────────────────────────────────
+// A test that hand-builds a `DeathObservation` with `recentFailure` already populated asserts my own
+// understanding of the wiring rather than the wiring, and — the part that matters — it CANNOT
+// reproduce the race at all, because the race is a sequence of calls inside `StatusEngine`. So these
+// register a real engine in the real `engineRegistry`, feed it real bytes, and let the writer read
+// it back exactly as production does. The precondition is ASSERTED rather than assumed: each test
+// below checks that `lastFailureForAgent` really has been cleared before `exit()`, so if a future
+// change stopped that chunk counting as recovery the test would fail loudly instead of passing for
+// a reason it never intended.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+describe("a transport-killed agent is classified as such, even though its retries cleared the banner", () => {
+  /** Whatever `Date.now()` reads. The engine stamps banners with it and the writer's `now` reads it,
+   *  so both halves of the recency comparison move together — a real clock would let them drift. */
+  let clock = NOW;
+  const registered: Array<[string, StatusEngine]> = [];
+
+  beforeEach(() => {
+    clock = NOW;
+    // NOT fake timers: `settle()` below needs a real `setTimeout` to flush the writer's microtask.
+    // Only the wall-clock reading is controlled.
+    vi.spyOn(Date, "now").mockImplementation(() => clock);
+  });
+
+  afterEach(() => {
+    for (const [id, engine] of registered.splice(0)) unregisterStatusEngine(id, engine);
+  });
+
+  /**
+   * A real engine wired the way PRODUCTION wires it: registered in `engineRegistry`, with the
+   * writer's failure/quota deps being the REAL registry readers rather than stubs.
+   *
+   * That is what makes these tests assert the chain instead of a hand-built object — the banner has
+   * to survive `StatusEngine`'s own recovery handling, cross the registry, and reach `classifyDeath`
+   * under the recency window. Every link is live except the Tauri `invoke`.
+   */
+  function engineOn(agentId: string): { engine: StatusEngine; calls: Calls } {
+    const calls = deps({
+      quota: quotaBlockForAgent,
+      lastFailure: lastFailureForAgent,
+      recentFailure: recentFailureForAgent,
+      now: () => Date.now(),
+    });
+    const engine = new StatusEngine({
+      agentId,
+      onStatus: () => {},
+      onDeath: ({ terminator }) => void recordDeath(agentId, terminator, calls.deps),
+    });
+    registerStatusEngine(agentId, engine);
+    registered.push([agentId, engine]);
+    return { engine, calls };
+  }
+
+  /**
+   * The recovery signal a retry emits. A classified command line is the shape `StatusEngine` treats
+   * as unambiguous forward progress, and the `if (ev)` arm calls `clearStreamFailure()`.
+   *
+   * VERIFIED TO ACTUALLY CLEAR, not assumed: several plausible-looking shapes (`⏺ Read(...)`,
+   * `Bash(ls)`, `│ > `) do NOT classify, and a test built on one of those would never reproduce the
+   * race — it would leave `lastFailure` set, so the OLD code would pass it too. Each test below
+   * re-asserts the clearing rather than trusting this constant.
+   */
+  const RETRY_PROGRESS = "$ pnpm test\n";
+
+  /** The OTHER doors into `clearStreamFailure()`, so the retention is not specific to one of them.
+   *  The field's own doc names these: a classified tool event, a real prompt, user input. */
+  const RECOVERY_SHAPES: ReadonlyArray<readonly [string, string]> = [
+    ["a classified tool event", RETRY_PROGRESS],
+    ["a redrawn prompt", "Do you want to proceed? (y/n)\n"],
+    ["an option row", "❯ 1. Yes\n"],
+  ];
+
+  it.each(RECOVERY_SHAPES)(
+    "classifies transport-transient after %s destroyed the live banner",
+    async (label, recovery) => {
+      // THE TEST THIS WHOLE CHANGE EXISTS FOR. It fails against the previous code — not
+      // incidentally, but because Gate 4 read only `lastFailure`, which the recovery chunk erases.
+      const id = `t-race-${label.replace(/\s+/g, "-")}`;
+      const { engine, calls } = engineOn(id);
+      engine.ingest(`${ENOTFOUND}\n`);
+      engine.ingest(recovery); // ← the race: a retry's own output reads as recovery
+      clock += 1_000;
+
+      // THE PRECONDITION, ASSERTED. Without this the test could pass while never reproducing the
+      // race — if the chunk stopped counting as recovery, `lastFailure` would still be set and the
+      // OLD code would classify correctly too. The assertion is what keeps it honest, and it has
+      // already earned its place: the first shape tried here silently did not clear.
+      expect(lastFailureForAgent(id), "the recovery signal must really have cleared the live banner")
+        .toBeUndefined();
+
+      engine.exit();
+      await settle();
+
+      expect(calls.closes()[0]?.death).toMatchObject({
+        cause: "transport-transient",
+        evidence: "api-banner",
+        message: ENOTFOUND,
+      });
+    },
+  );
+
+  it("retains the banner from the UNTERMINATED tail too — the shape the founder actually saw", async () => {
+    // The measured death prints its banner as the FINAL line before the PTY closes, i.e. with no
+    // trailing newline, so it lands entirely in the partial-tail capture path rather than the
+    // completed-line one. Both sites must retain, which is why they funnel through one writer
+    // (`noteApiFailure`); this is the test that would catch a future edit retaining on only one.
+    const { engine, calls } = engineOn("t-tail");
+    engine.ingest(ENOTFOUND); // no "\n"
+    engine.ingest(RETRY_PROGRESS);
+    clock += 1_000;
+    expect(lastFailureForAgent("t-tail")).toBeUndefined();
+
+    engine.exit();
+    await settle();
+
+    expect(calls.closes()[0]?.death).toMatchObject({
+      cause: "transport-transient",
+      message: ENOTFOUND,
+    });
+  });
+
+  it("PAIRED NEGATIVE — an agent that never printed a banner is still unknown", async () => {
+    // Required, and not a formality: without it "the banner produced the verdict" is unfalsifiable,
+    // because a bug that returned `transport-transient` for EVERY pty-exit would pass the test
+    // above. This is also the human-clicked-stop case, which must stay unresurrectable.
+    const { engine, calls } = engineOn("t-quiet");
+    engine.ingest(RETRY_PROGRESS);
+    clock += 1_000;
+
+    engine.exit();
+    await settle();
+
+    expect(calls.closes()[0]?.death).toMatchObject({ cause: "unknown", evidence: "pty-exit" });
+  });
+
+  it("AGED OUT — a banner older than the window no longer explains the death", async () => {
+    // The retained copy is bounded on READ rather than cleared on recovery, so this is the only
+    // thing standing between it and the permanent stamp `lastFailure` correctly refuses to be. An
+    // agent that blipped an hour ago and was later stopped by a human is NOT a transport death.
+    const { engine, calls } = engineOn("t-old");
+    engine.ingest(`${ENOTFOUND}\n`);
+    engine.ingest(RETRY_PROGRESS);
+    clock += TRANSPORT_FAILURE_WINDOW_MS + 1;
+
+    engine.exit();
+    await settle();
+
+    expect(calls.closes()[0]?.death).toMatchObject({ cause: "unknown", evidence: "pty-exit" });
+  });
+
+  it("still counts at exactly the window boundary — the measured retry run must fit inside it", async () => {
+    // Pins the comparison's DIRECTION, which the aged-out test alone cannot: `<=` vs `<` differ only
+    // here. It also states the sizing constraint — the measured sequence is 176s and the window is
+    // 300s, so a death at the far edge of a retry run is still inside it.
+    const { engine, calls } = engineOn("t-edge");
+    engine.ingest(`${ENOTFOUND}\n`);
+    engine.ingest(RETRY_PROGRESS);
+    clock += TRANSPORT_FAILURE_WINDOW_MS;
+
+    engine.exit();
+    await settle();
+
+    expect(calls.closes()[0]?.death).toMatchObject({ cause: "transport-transient" });
+  });
+
+  it("A LIVE WALL STILL OUTRANKS A RETAINED BANNER — never retry into a closed door", async () => {
+    // THE REGRESSION THIS CHANGE COULD HAVE INTRODUCED. Before it, a retained banner did not exist,
+    // so nothing competed with the wall at Gate 2. Now both survive `clearStreamFailure()` — the
+    // wall in `quotaBlock`, the banner in `lastFailureEver` — and if Gate 4 ran first, an agent
+    // barred by its account limit would be recorded `transport-transient` and retried against a door
+    // no keystroke opens. That is the measured 45-retry failure this area exists to prevent.
+    const { engine, calls } = engineOn("t-wall");
+    engine.ingest(`${SESSION_WALL}\n`); // sets the quota block AND fires the quota-trip note
+    engine.ingest(`${ENOTFOUND}\n`); // …and then the transport fails too
+    engine.ingest(RETRY_PROGRESS); // …and the retry clears the live banner, retaining it
+    clock += 1_000;
+    expect(lastFailureForAgent("t-wall")).toBeUndefined();
+    expect(
+      recentFailureForAgent("t-wall", Date.now()),
+      "the banner really is retained — otherwise the wall wins for the wrong reason",
+    ).toMatchObject({ message: ENOTFOUND });
+
+    engine.exit();
+    await settle();
+
+    const close = calls.closes()[0];
+    expect(close?.death).toMatchObject({ cause: "wall-session", evidence: "quota-block" });
+    expect(close?.wall).toMatchObject({ message: SESSION_WALL, resetParsed: true });
+  });
+
+  it("wires the retained reader into the REAL deps, not just the test's", () => {
+    // The defaulted-seam trap (AGENTS.md): every test above injects its own deps, so the one line in
+    // `liveDeps()` that supplies the production reader would be covered by nothing — delete it and
+    // the whole suite stays green while the fix is inert for every real agent.
+    const { engine } = engineOn("t-live");
+    engine.ingest(`${ENOTFOUND}\n`);
+    engine.ingest(RETRY_PROGRESS);
+    clock += 1_000;
+
+    expect(liveDeps().lastFailure("t-live")).toBeUndefined();
+    expect(liveDeps().recentFailure("t-live", Date.now())).toMatchObject({ message: ENOTFOUND });
   });
 });

@@ -128,7 +128,7 @@ describe("the goal sweep is held off a freshly respawned agent", () => {
       liveSessions: () => Promise.resolve([]),
       claim: () => Promise.resolve(true),
       release: () => Promise.resolve(),
-      mount: () => {},
+      mount: () => "opened" as const,
       // NOT injected — the REAL `suppressContinuation`, so this asserts the two modules are actually
       // wired together rather than that the runner called a stub.
     });
@@ -147,7 +147,7 @@ describe("the goal sweep is held off a freshly respawned agent", () => {
       liveSessions: () => Promise.resolve([]),
       claim: () => Promise.resolve(true),
       release: () => Promise.resolve(),
-      mount: () => {},
+      mount: () => "opened" as const,
     });
 
     expect(continuationSuppressedUntil("a1")).toBeUndefined();

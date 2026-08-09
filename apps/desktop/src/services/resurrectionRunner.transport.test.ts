@@ -79,6 +79,7 @@ function harness(due: DueAgent[], over: Partial<ResurrectionSweepOptions> = {}):
       },
       mount: (agentId) => {
         mounted.push(agentId);
+              return "opened" as const;
       },
       suppress: (agentId, untilMs) => {
         suppressed.push([agentId, untilMs]);
@@ -98,7 +99,9 @@ describe("an ENOTFOUND death is respawned automatically", () => {
     const h = harness([dead()]);
     const outcomes = await sweepResurrections({ ...h.opts, now: NOW + FIRST_RUNG });
 
-    expect(outcomes).toEqual([{ agentId: "a1", action: "respawn", detail: "attempt 1" }]);
+    expect(outcomes).toEqual([
+      { agentId: "a1", action: "respawn", detail: "attempt 1 (opened)" },
+    ]);
     // The SIDE EFFECT, not the decision restated: the pane was let mount.
     expect(h.mounted).toEqual(["a1"]);
     // …and the attempt was recorded DURABLY, which is the number the rolling daily cap counts.
@@ -123,7 +126,12 @@ describe("an ENOTFOUND death is respawned automatically", () => {
     // `Workspace`'s `live` memo reads exactly this and nothing else. The runtime-store half of the
     // default `mount` is left out deliberately — this file has no business standing up a store to
     // prove that a Set was written.
-    const h = harness([dead()], { mount: (agentId) => admitAgent(agentId) });
+    const h = harness([dead()], {
+      mount: (agentId) => {
+        admitAgent(agentId);
+        return "opened" as const;
+      },
+    });
 
     expect(isAgentAdmitted("a1")).toBe(false);
     await sweepResurrections({ ...h.opts, now: NOW + FIRST_RUNG });

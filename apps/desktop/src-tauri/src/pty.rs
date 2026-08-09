@@ -1035,9 +1035,79 @@ pub fn pty_resize(
     Ok(())
 }
 
+/// Mark a deliberately-killed agent so the session reaper cannot resurrect it.
+///
+/// ── WHY THIS IS IN RUST, INSIDE `pty_kill` (roborev 61714) ────────────────────────────────────
+/// It was briefly done in `pty.ts`, as an `await` before the `pty_kill` invoke. That is a real
+/// regression and the reason is timing, not correctness: `SatelliteApp`'s teardown depends on
+/// `pty_kill` being DISPATCHED SYNCHRONOUSLY from the unmount — its `CLOSE_SETTLE_MS` (250ms) is a
+/// budget for ONE round-trip before the webview is `destroy()`ed, and `Terminal`'s cleanup is
+/// `void`-ed so nothing awaits it. Putting an invoke in front means the continuation carrying
+/// `pty_kill` is torn down with the JS context if the first call has not resolved — and the PTY is
+/// then never killed at all, which is precisely the orphaned-child case that budget exists to
+/// prevent. One command, dispatched once, with the order guaranteed on this side instead.
+///
+/// ── WHY `Dead`/`unknown` AND NOT `Retired` (roborev 61714) ────────────────────────────────────
+/// `Retired` carries more meaning than "do not resurrect": `derive` maps it to
+/// `ReaperVerdict::Reapable` UNCONDITIONALLY, with none of the `PROTECTION_MAX` grace `Dead` gets.
+/// But "stop the agents when I close this window" is explicitly not "delete them" — the records and
+/// tabs are meant to survive — and the promotion cutover kills the LOCAL pty for an agent that is
+/// still alive in the cloud on that same worktree. Marking either `Reapable` would hand a worktree
+/// holding uncommitted work to any future reaper.
+///
+/// `unknown` is the exactly-right cause here and needs no new vocabulary: `deathTypes` already
+/// documents it as "a human clicking stop produces exactly this observation", and
+/// `is_resurrectable` refuses it. So a deliberate stop is recorded as what it is, stays
+/// unresurrectable, and keeps the ordinary protection window.
+///
+/// ONLY a `Live` record is touched, so this can never downgrade a richer verdict a window already
+/// observed (a met goal, a wall, a transport banner). Failure is swallowed: a ledger write is an
+/// affordance, and it must never keep alive a process the user asked to be gone.
+///
+/// ── OFF THE MAIN THREAD (roborev 61770) ───────────────────────────────────────────────────────
+/// The mechanism itself is `agent_life::mark_stopped_at`, so a test can drive it; this only resolves
+/// the directory. It must NOT run on the main thread: `close_at` writes a temp file, `fsync`s it and
+/// renames, and `windowClose.stopOpenProjectAgents` / `ProjectModal` fire one `pty_kill` PER AGENT.
+/// Serialized in front of the AppKit event loop that is a read + an fsync each, inside the very
+/// 250ms `CLOSE_SETTLE_MS` budget this design exists to protect, on the same thread the concierge
+/// bridge needs — the round-trip regression coming back through another channel.
+fn mark_stopped_before_kill(app: &AppHandle, id: &str) {
+    let Ok(base) = crate::dev_identity::app_data_dir(app) else { return };
+    let dir = crate::agent_life::life_dir(&base);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    if let Err(e) = crate::agent_life::mark_stopped_at(&dir, id, now) {
+        // WARN, not debug: a stop that failed to record is a stop the resurrector may undo.
+        tracing::warn!(target: "pty", %id, error = %e, "could not mark a deliberate stop");
+    }
+}
+
+/// Kill a PTY the user deliberately stopped.
+///
+/// `async` + `spawn_blocking` because the body does ledger I/O — see `mark_stopped_before_kill`.
+/// That does NOT weaken the guarantee the frontend depends on: `killPty` still issues exactly ONE
+/// invoke, dispatched synchronously from the unmount, and both halves stay inside this one command,
+/// so the mark-then-kill order holds without a second round-trip. It is strictly better than doing
+/// the work in JS, because once dispatched this runs in the Rust process and a webview torn down
+/// mid-flight cannot cancel it.
 #[tauri::command]
-pub fn pty_kill(manager: State<PtyManager>, id: String) -> Result<(), String> {
+pub async fn pty_kill(app: AppHandle, manager: State<'_, PtyManager>, id: String) -> Result<(), String> {
     tracing::info!(%id, "pty_kill");
+    // BEFORE the kill, so there is no window in which the session is gone and the record still
+    // reads `Live` — the exact state `reap_dead_sessions_at` seals as `process-gone`.
+    //
+    // Only the LEDGER write goes off-thread — it is the only part that touches the disk. The kill
+    // itself is a mutex plus a signal, so it finishes back here (mirrors `pty_spawn`, which does its
+    // blocking openpty/spawn off-thread and the cheap map wiring on the async side). Awaiting the
+    // hop before the kill is what keeps the order.
+    let mark_app = app.clone();
+    let mark_id = id.clone();
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        mark_stopped_before_kill(&mark_app, &mark_id);
+    })
+    .await;
     if let Some(mut session) = manager.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(&id) {
         // If the reader is parked (paused) it won't observe the kill's EOF and would never run its
         // teardown (remove + pty:exit). Resume it first so it wakes, reads EOF, and cleans up.

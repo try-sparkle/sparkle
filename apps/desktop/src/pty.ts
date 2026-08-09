@@ -296,6 +296,20 @@ export function setPtyPaused(id: string, paused: boolean): Promise<void> {
   return invoke<void>("pty_set_paused", { id, paused }).catch(ignoreExitedPty);
 }
 
+/**
+ * Kill a PTY DELIBERATELY.
+ *
+ * ONE INVOKE, DISPATCHED SYNCHRONOUSLY, AND THAT IS LOAD-BEARING (roborev 61714). `SatelliteApp`'s
+ * teardown budgets `CLOSE_SETTLE_MS` (250ms) for exactly one round-trip before the webview is
+ * `destroy()`ed, and `Terminal`'s cleanup is `void`-ed so nothing awaits it. Any `await` in front
+ * of this call puts `pty_kill` in a `.then` continuation that dies with the JS context — leaving
+ * the child alive with nothing holding a handle to it, which is the orphaned-PTY case that budget
+ * exists to prevent. A version of this function briefly did that.
+ *
+ * The agent-life bookkeeping a deliberate stop needs — recording it so the session reaper cannot
+ * resurrect what the user just stopped — happens INSIDE `pty_kill`, on the Rust side, where the
+ * ordering is guaranteed without a second round-trip. See `pty.rs::mark_stopped_before_kill`.
+ */
 export function killPty(id: string): Promise<void> {
   return invoke("pty_kill", { id });
 }

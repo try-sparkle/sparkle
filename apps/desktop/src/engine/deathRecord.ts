@@ -58,6 +58,25 @@ export interface DeathObservation {
   quota: QuotaBlock | undefined;
   /** `engineRegistry.lastFailureForAgent(agentId)` — VERBATIM, never normalized. */
   lastFailure: { message: string; at: number } | undefined;
+  /**
+   * `engineRegistry.recentFailureForAgent(agentId, now)` — the most recent API-error banner the
+   * agent printed, VERBATIM, retained past the recovery signal that cleared {@link lastFailure} and
+   * already bounded by {@link TRANSPORT_FAILURE_WINDOW_MS} on the way in.
+   *
+   * ── WHY THIS EXISTS AS A SECOND, WEAKER FIELD ─────────────────────────────────────────────────
+   * `lastFailure` is the LIVE reading and is the stronger evidence: it means the agent was still
+   * sitting in the failure when it died. It is also, in practice, almost never there — Claude Code
+   * retries a transport fault for ~3 minutes before exiting 1, and every retry emits a signal
+   * `StatusEngine.clearStreamFailure()` treats as recovery. The census: 0 of 76 agent-life records
+   * classified `transport-transient`; 25 landed on `unknown`/`pty-exit`, which is not resurrectable.
+   *
+   * ── IT IS STRICTLY A FALLBACK, AND THE GATES BELOW SAY SO ─────────────────────────────────────
+   * Every observation that classified as some cause without this field still classifies as that same
+   * cause with it. It is consulted ONLY where the live signals were about to yield `unknown`, so it
+   * can never demote a `clean-goal-met` — a retained banner from a blip the agent recovered from and
+   * then finished past must not un-finish it. See Gate 1's own note.
+   */
+  recentFailure?: { message: string; at: number } | undefined;
   /** `agentLiveness.livenessOf(...)`. Anything but `"local"` means this window did not watch it. */
   liveness: AgentLiveness;
   goal: AgentGoal | undefined;
@@ -94,10 +113,17 @@ function wallFrom(q: QuotaBlock): DeathWall {
  */
 function effectiveWall(o: DeathObservation): QuotaBlock | undefined {
   if (o.quota) return o.quota;
-  const lf = o.lastFailure;
-  if (!lf) return undefined;
-  if (classifyApiFailure(lf.message) !== "terminal") return undefined;
-  return quotaBlocksIn(lf.message, lf.at)[0];
+  return wallInBanner(o.lastFailure);
+}
+
+/** The wall a single banner implies, or `undefined` when it is not an account-limit shape.
+ *
+ *  Factored out of {@link effectiveWall} so the RETAINED banner can be re-parsed by the SAME
+ *  function at Gate 2 without also feeding Gate 1 — see that gate for why the two must differ. */
+function wallInBanner(f: { message: string; at: number } | undefined): QuotaBlock | undefined {
+  if (!f) return undefined;
+  if (classifyApiFailure(f.message) !== "terminal") return undefined;
+  return quotaBlocksIn(f.message, f.at)[0];
 }
 
 /**
@@ -114,6 +140,13 @@ function effectiveWall(o: DeathObservation): QuotaBlock | undefined {
  *  3. `blocked-on-human` → a person is the blocker; a respawn re-asks nothing.
  *  4. `transport-transient` → the ordinary retryable case.
  *  5. `unknown` → observed, but nothing said why. First-class and honest.
+ *
+ * WHERE THE RETAINED BANNER (`o.recentFailure`) IS ADMITTED, stated once because getting it wrong
+ * is what the order protects against: Gate 2 and Gate 4 only. NOT Gate 1 — a retained banner must
+ * never demote a finished agent — and Gate 2 before Gate 4 so a retained ACCOUNT WALL routes to
+ * `wall-*` rather than being retried as a transport fault. Consulted only where the live signals
+ * were already about to yield `unknown`, so the change is strictly additive: no observation that
+ * classified as some cause before classifies as a different one now.
  */
 export function classifyDeath(o: DeathObservation): DeathVerdict {
   // ── Gate 0 ──────────────────────────────────────────────────────────────────────────────────
@@ -129,6 +162,14 @@ export function classifyDeath(o: DeathObservation): DeathVerdict {
   // ENDING never sets it. The extra conditions matter: an agent whose goal was met and which then
   // hit a wall or an API error did not exit cleanly, and calling it clean would make it permanently
   // unresurrectable on the strength of a stale mark.
+  //
+  // READS THE LIVE SIGNALS ONLY — `wall` and `o.lastFailure`, never `o.recentFailure`. That is the
+  // one place the retained banner is deliberately withheld, and withholding it is what keeps
+  // `clean-goal-met` outranking everything: an agent that blipped, RECOVERED, did its work, marked
+  // its goal met and exited cleanly still holds a retained banner for up to
+  // TRANSPORT_FAILURE_WINDOW_MS afterwards. Letting that reach this gate would demote a finished
+  // agent to a resurrectable cause and have the fleet restart work that was already done — the exact
+  // "undoes a completed decision" failure this gate is first in order to prevent.
   if (
     goalStateOf(o.goal, o.now) === "met" &&
     wall === undefined &&
@@ -142,12 +183,20 @@ export function classifyDeath(o: DeathObservation): DeathVerdict {
   // ── 2. Walls ────────────────────────────────────────────────────────────────────────────────
   // `resetParsed` is the whole discriminator, and it is not a heuristic — `quotaBlock.blockFrom`
   // computes it by comparing against `parseResetInstant`'s documented fallback expression exactly.
-  if (wall) {
+  //
+  // THE RETAINED BANNER IS RE-PARSED HERE, ABOVE GATE 4, AND THE ORDER IS THE POINT. A wall is
+  // retained by exactly the same mechanism as a transport fault, so without this line an
+  // account-limit message that survived to death would fall through to Gate 4, fail its `retryable`
+  // test, and land on `unknown` — or, if that test were ever loosened, be RETRIED INTO THE WALL,
+  // which is the measured 45-retry failure this whole area exists to avoid. Same function,
+  // `quotaBlocksIn`, never a second matcher.
+  const deathWall = wall ?? wallInBanner(o.recentFailure);
+  if (deathWall) {
     return {
-      cause: wall.resetParsed ? "wall-session" : "wall-spend",
+      cause: deathWall.resetParsed ? "wall-session" : "wall-spend",
       evidence: "quota-block",
-      message: wall.message,
-      wall: wallFrom(wall),
+      message: deathWall.message,
+      wall: wallFrom(deathWall),
     };
   }
 
@@ -162,11 +211,24 @@ export function classifyDeath(o: DeathObservation): DeathVerdict {
   // ── 4. Retryable vendor fault ───────────────────────────────────────────────────────────────
   // Re-classified here rather than trusted from upstream, so a record can never inherit a stale
   // "terminal" and be retried against a wall.
-  if (o.lastFailure && classifyApiFailure(o.lastFailure.message) === "retryable") {
+  //
+  // FALLS BACK TO THE RETAINED BANNER, and that fallback is the entire reason this gate ever fires.
+  // The live reading is the stronger evidence so it is preferred — but Claude Code retries a
+  // transport fault for ~3 minutes, emitting recovery signals the whole time, so by the time the PTY
+  // closes `lastFailure` has usually been nulled BY the failure it was supposed to report. Measured:
+  // a real `claude` against a non-resolving base URL retried 2m56s and exited 1 with
+  // `API Error: Unable to connect to API (ENOTFOUND)` as its final line — the banner IS the last
+  // thing printed, and it was being thrown away. 0 of 76 records reached this gate before this line.
+  //
+  // Everything terminal has already been claimed by Gate 2, so a message arriving here can only be
+  // retryable — but the check stays explicit rather than relying on that, because a gate that is
+  // correct only because of a distant neighbour is one edit away from retrying into a wall.
+  const failure = o.lastFailure ?? o.recentFailure;
+  if (failure && classifyApiFailure(failure.message) === "retryable") {
     return {
       cause: "transport-transient",
       evidence: "api-banner",
-      message: o.lastFailure.message,
+      message: failure.message,
     };
   }
 

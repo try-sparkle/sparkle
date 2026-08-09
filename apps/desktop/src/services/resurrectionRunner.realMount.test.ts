@@ -88,7 +88,12 @@ describe("the mount path actually restarts a pane that is still mounted", () => 
 
     const outcomes = await sweepResurrections(realMountOpts([dead()]));
 
-    expect(outcomes).toEqual([{ agentId: "a1", action: "respawn", detail: "attempt 1" }]);
+    // The detail NAMES THE ROUTE. `restarted` can only be reported by `restartPane` having returned
+    // true, so this assertion cannot be satisfied by a mount that did nothing — which is exactly
+    // what the old `void` seam let happen, on nine agents in one day.
+    expect(outcomes).toEqual([
+      { agentId: "a1", action: "respawn", detail: "attempt 1 (restarted)" },
+    ]);
     expect(restarts, "the pane's re-spawn lever must actually be pulled").toEqual(["a1"]);
     unregisterPaneRestart("a1");
   });
@@ -135,7 +140,7 @@ describe("the per-sweep cap binds on LONE deaths, which is what it was written f
     const n = MAX_RESPAWNS_PER_SWEEP + 6;
     const outcomes = await sweepResurrections({
       ...realMountOpts(loneSwarm(n)),
-      mount: () => {},
+      mount: () => "opened" as const,
     });
 
     const admitted = outcomes.filter((o) => o.action === "respawn");
@@ -154,6 +159,7 @@ describe("the per-sweep cap binds on LONE deaths, which is what it was written f
       due: () => Promise.resolve(swarm.filter((d) => !revived.has(d.agentId))),
       mount: (agentId: string) => {
         revived.add(agentId);
+              return "opened" as const;
       },
     };
 

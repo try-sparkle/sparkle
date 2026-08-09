@@ -58,3 +58,25 @@ export function quotaBlockForAgent(agentId: string, now: number): QuotaBlock | u
 export function lastFailureForAgent(agentId: string): { message: string; at: number } | undefined {
   return engines.get(agentId)?.lastFailureNow();
 }
+
+/**
+ * The most recent API-error banner this agent printed, if it is recent enough to still explain a
+ * death — even when the agent has since shown a recovery signal.
+ *
+ * The difference from {@link lastFailureForAgent} is the whole point, and it is one word: EVER.
+ * That reader answers "is this agent in a failure now" and is nulled by `clearStreamFailure()`,
+ * which fires on any recovery signal — including the ones Claude Code's own retry loop emits while
+ * it spends ~3 minutes failing to reach the API before exiting. So at the moment a transport death
+ * is classified, that reader has usually already been cleared BY the failure it is meant to report.
+ * This one survives that and expires on a clock instead.
+ *
+ * `undefined` still covers the same two cases as its siblings — no failure, and no engine registered
+ * in this window — and `classifyDeath`'s Gate 0 is still what tells those apart, via the `liveness`
+ * the caller must state.
+ */
+export function recentFailureForAgent(
+  agentId: string,
+  now: number,
+): { message: string; at: number } | undefined {
+  return engines.get(agentId)?.recentFailureNow(now);
+}

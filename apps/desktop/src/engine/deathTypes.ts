@@ -31,6 +31,39 @@
 // PURE. Types and one total function. No I/O, no clock, no state.
 
 /**
+ * How long an API-error banner stays admissible as evidence for a death that follows it.
+ *
+ * ── THE MEASUREMENT THIS NUMBER IS SIZED AGAINST ──────────────────────────────────────────────
+ * Claude Code does not print a banner and exit. It RETRIES, for minutes, and only then gives up.
+ * Measured directly (2026-08-08) by running a real `claude` against a non-resolving
+ * `ANTHROPIC_BASE_URL`: it retried for **2m56s (176s)** and then exited 1, with this as its final
+ * line of output — the banner IS the last thing printed before the PTY closes:
+ *
+ *     API Error: Unable to connect to API (ENOTFOUND)
+ *
+ * Against a local endpoint returning HTTP 529 it backs off ~38s per rung and stays up longer still.
+ *
+ * ── WHY A WINDOW IS NEEDED AT ALL ─────────────────────────────────────────────────────────────
+ * Those retries emit exactly the signals `StatusEngine.clearStreamFailure()` treats as recovery — a
+ * classified tool event, a re-drawn prompt, a token advance — so `lastFailure` is nulled by the
+ * retry loop and is very often GONE by the time the PTY closes. Whether the banner survives to
+ * `exit()` is a race against the last retry, and the census says it loses: of 76 agent-life records
+ * on the founder's v0.95.0 install, **zero** are `transport-transient` while 25 are `unknown` with
+ * evidence `pty-exit` — and `isResurrectable` refuses `unknown`, so all 25 were structurally outside
+ * recovery. The banner has to be RETAINED past the recovery signal, and a retained banner has to
+ * expire or it becomes a permanent stamp of the last bad turn.
+ *
+ * ── WHY 5 MINUTES ────────────────────────────────────────────────────────────────────────────
+ * It must comfortably exceed the retry sequence, or the fix does not fire at all: anything at or
+ * below the measured 176s can be outlived by the very loop it exists to see past. 300s is ~1.7× that
+ * with headroom for the slower 529 ladder, and is still far short of any interval over which an
+ * agent could plausibly print a banner, fully recover, work, and then die of something unrelated —
+ * and even that case is already outranked by the gates above `transport-transient` (a met goal, a
+ * wall, a blocking tool), which is what makes erring long the cheap direction here.
+ */
+export const TRANSPORT_FAILURE_WINDOW_MS = 300_000;
+
+/**
  * Why an agent session ended.
  *
  * Kept deliberately small: each variant exists because it demands a DIFFERENT action, not because it
@@ -49,6 +82,21 @@ export type DeathCause =
   | "blocked-on-human"
   /** The app process that owned this agent is gone and wrote no close. Inferred, never observed. */
   | "app-restart"
+  /**
+   * THIS agent's process vanished while the app kept running, and no window saw it go.
+   *
+   * Written only by `agent_life::reap_dead_sessions_at`, from the absence of a PTY session under a
+   * still-live epoch. Distinct from `app-restart` (the whole app died; keyed on a dead epoch) and
+   * from `unknown` (a window WATCHED the exit and had nothing to say).
+   *
+   * Resurrectable, and the asymmetry with `unknown` is deliberate rather than inconsistent. The
+   * comment on {@link isResurrectable} explains that `unknown` refuses because a human clicking
+   * stop produces exactly that observation — but a deliberate stop is BY CONSTRUCTION observed,
+   * since a mounted pane is what renders the button. This cause is reached only when nothing
+   * observed the exit, which is the one case a human stop cannot produce. It is the "distinct
+   * cause sourced from the app's own liveness" that comment asks for, from the other side.
+   */
+  | "process-gone"
   /** Nothing was observed. A first-class, honest value — NOT a synonym for "healthy" or "fine". */
   | "unknown";
 
@@ -77,6 +125,16 @@ export type DeathEvidence =
   | "goal-met-marked"
   /** The owning app instance's epoch is provably dead (a kernel-released lock, not a timeout). */
   | "epoch-dead"
+  /**
+   * The agent's PTY session was absent from the app's own session map while its epoch was still
+   * alive — read by `agent_life::reap_dead_sessions_at` on the revival tick.
+   *
+   * Distinct from `"pty-exit"`, which means a WINDOW watched the PTY close. This is an inference
+   * from an ABSENCE, made with no observer, and it is the only evidence that supports
+   * `"process-gone"`. Sharing `"pty-exit"` would have made `verdictIsSupported` false for every
+   * record the reaper writes — the invariant stated but untrue (roborev 61705).
+   */
+  | "session-vanished"
   /** The PTY ended, or a SessionEnd hook landed, with nothing else to say about why. */
   | "pty-exit"
   | "session-end-hook"
@@ -136,6 +194,8 @@ export function causeOf(evidence: DeathEvidence): DeathCause | null {
       return "clean-goal-met";
     case "epoch-dead":
       return "app-restart";
+    case "session-vanished":
+      return "process-gone";
     case "pty-exit":
     case "session-end-hook":
       return "unknown";
@@ -189,6 +249,7 @@ export function isResurrectable(cause: DeathCause): boolean {
     case "wall-session":
     case "wall-spend":
     case "app-restart":
+    case "process-gone":
       return true;
     case "clean-goal-met":
     case "blocked-on-human":

@@ -39,6 +39,7 @@ import { withScreenReason, type StatusReason } from "./statusRouter";
 import { forgetAgent, noteProcessExit, noteSpinnerSeen, trackAgent } from "./turnEndAuthority";
 import { StreamFailureDetector, apiErrorFramesIn, countApiErrorFrames } from "./streamFailure";
 import type { Terminator } from "./deathRecord";
+import { TRANSPORT_FAILURE_WINDOW_MS } from "./deathTypes";
 import { type QuotaBlock, isQuotaBlocked, quotaBlockIn, quotaBlocksIn } from "./quotaBlock";
 import {
   logStatusTransition,
@@ -402,6 +403,29 @@ export class StatusEngine {
    * and every consumer would keep reporting a dead agent that had been working for hours.
    */
   private lastFailure: { message: string; at: number } | null = null;
+  /**
+   * The most recent API-error banner this agent EVER printed — the same bytes as {@link lastFailure},
+   * retained past the recovery that clears it, and read only through {@link recentFailureNow}.
+   *
+   * ── WHY A SECOND FIELD RATHER THAN "STOP CLEARING THE FIRST" ──────────────────────────────────
+   * {@link lastFailure} answers "is this agent sitting in a failure RIGHT NOW", and every live
+   * consumer (the red band, the cohort report, the resume ladder) depends on it clearing — its own
+   * doc says a permanent stamp would have them "keep reporting a dead agent that had been working
+   * for hours". That is correct and is not what changes here. This field answers a different
+   * question, asked exactly once, at death: "was a transport fault the LAST thing this agent said?"
+   *
+   * ── THE RACE IT CLOSES ────────────────────────────────────────────────────────────────────────
+   * Claude Code does not print a banner and exit — it retries for ~3 minutes and then exits 1
+   * (measured; see {@link TRANSPORT_FAILURE_WINDOW_MS}). Those retries emit precisely the signals
+   * `clearStreamFailure()` treats as recovery, so `lastFailure` is routinely nulled by the retry loop
+   * before the PTY ever closes. Whether the banner survived to `exit()` was therefore a race against
+   * the last retry, and the ledger census says it lost every time: 0 of 76 records classified
+   * `transport-transient`, while 25 landed on `unknown`/`pty-exit` — which `isResurrectable` refuses.
+   *
+   * NOT cleared by `clearStreamFailure()`. It is bounded by the recency window on READ instead, which
+   * is what keeps it from becoming the permanent stamp `lastFailure` correctly refuses to be.
+   */
+  private lastFailureEver: { message: string; at: number } | null = null;
   // Fires at the wall's stated reset. See armQuotaRelease for why a timer and not a check-on-ingest.
   private quotaTimer: ReturnType<typeof setTimeout> | null = null;
   // The token count from the most recent spinner frame that carried one, so a strictly-higher count
@@ -569,6 +593,41 @@ export class StatusEngine {
     return this.lastFailure ?? undefined;
   }
 
+  /**
+   * The most recent API-error banner, verbatim, IF it is recent enough to still explain a death.
+   *
+   * The read side of {@link lastFailureEver}. Unlike {@link lastFailureNow} this survives
+   * `clearStreamFailure()`, so it can answer for an agent whose retry loop cleared the live failure
+   * moments before the PTY closed — the race that put 0 of 76 deaths in the `transport-transient`
+   * bucket.
+   *
+   * THE WINDOW IS APPLIED HERE, ON READ, and that placement is deliberate: it means no consumer can
+   * accidentally treat a banner from an hour ago as evidence, and the caller supplies `now` rather
+   * than this reading a clock — the same purity rule `quotaBlockNow` follows.
+   */
+  recentFailureNow(
+    now: number,
+    windowMs: number = TRANSPORT_FAILURE_WINDOW_MS,
+  ): { message: string; at: number } | undefined {
+    const f = this.lastFailureEver;
+    if (f === null) return undefined;
+    return now - f.at <= windowMs ? f : undefined;
+  }
+
+  /**
+   * The ONE way an API-error banner is recorded, so the live field and the retained one cannot drift.
+   *
+   * Both capture sites (a completed line, and the unterminated tail) funnel through here. Writing
+   * `this.lastFailure` directly at a call site would leave the retained copy behind on that path
+   * only — and the retained copy is read exactly once, at death, so the omission would be invisible
+   * until a real transport death classified `unknown` in production.
+   */
+  private noteApiFailure(message: string): void {
+    const f = { message, at: Date.now() };
+    this.lastFailure = f;
+    this.lastFailureEver = f;
+  }
+
   // The ONE way out of it: every recovery path (a classified tool event, a real prompt, user input, a
   // token advance) must drop the flag, the kind AND the churn counters together — a leftover kind or
   // a half-counted repeat re-arms red on the next line.
@@ -578,6 +637,11 @@ export class StatusEngine {
     this.failure.reset();
     // Dropped WITH the red, unlike `quotaBlock` — see the field's own note for why the two differ.
     this.lastFailure = null;
+    // `lastFailureEver` is DELIBERATELY NOT DROPPED HERE, and this line is the whole fix: the
+    // signals that reach this method are exactly the ones Claude Code's retry loop emits while it
+    // spends ~3 minutes failing to connect, so clearing the retained copy here would restore the
+    // race that classified every transport death `unknown`. It is bounded on READ instead
+    // (`recentFailureNow`), which expires it without letting the retry loop erase it.
   }
 
   /**
@@ -948,7 +1012,7 @@ export class StatusEngine {
         // exactly that plus the same `stripMarkers`. The RED behaviour is unchanged.
         const apiFrames = apiErrorFramesIn(line);
         if (apiFrames.length > 0) {
-          this.lastFailure = { message: apiFrames[apiFrames.length - 1]!, at: Date.now() };
+          this.noteApiFailure(apiFrames[apiFrames.length - 1]!);
         }
         this.tripStreamFailure(apiFrames.length > 0 ? "api" : "churn");
         trippedThisChunk = true;
@@ -1004,7 +1068,7 @@ export class StatusEngine {
     if (arrived.length > 0) {
       // The LAST arrival, matching how `wallInTail` takes the last wall: within one chunk the most
       // recent banner is the current state of the turn.
-      this.lastFailure = { message: arrived[arrived.length - 1]!, at: Date.now() };
+      this.noteApiFailure(arrived[arrived.length - 1]!);
       this.tripStreamFailure("api");
       trippedThisChunk = true;
     }

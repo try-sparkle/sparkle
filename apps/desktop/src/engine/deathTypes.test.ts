@@ -20,6 +20,7 @@ const ALL_EVIDENCE = [
   "blocking-tool",
   "goal-met-marked",
   "epoch-dead",
+  "session-vanished",
   "pty-exit",
   "session-end-hook",
   "none",
@@ -32,8 +33,28 @@ const ALL_CAUSES = [
   "clean-goal-met",
   "blocked-on-human",
   "app-restart",
+  "process-gone",
   "unknown",
 ] as const satisfies readonly DeathCause[];
+
+/**
+ * THE LISTS ABOVE MUST COVER THE UNIONS, AND `satisfies` DOES NOT CHECK THAT (roborev 61705).
+ *
+ * The comment above claims a new union member "makes these arrays incomplete and TypeScript says
+ * so". It does not. `as const satisfies readonly DeathCause[]` asserts every ENTRY is a valid
+ * cause; it is silent about a MISSING one. So when `process-gone` was added to the union,
+ * `ALL_CAUSES` quietly stopped being exhaustive and every list-driven assertion below began proving
+ * its policy over a strict subset — "rejects any cause claimed on no evidence" never evaluated the
+ * new cause, and "armsOnClock is true for exactly one cause" became a claim about 7 of 8 members.
+ * Nothing failed, which is the whole problem: a guard enumerated by VALUE goes stale in silence.
+ *
+ * This asks the other direction — is the UNION assignable to the listed members? A missing member
+ * makes `[Union] extends [Listed]` false, the type resolves to `never`, and `= true` stops
+ * compiling. Compile-time, so `tsc --noEmit` catches it even if nobody runs this suite.
+ */
+type CoversUnion<Union, Listed extends Union> = [Union] extends [Listed] ? true : never;
+const _allCausesAreExhaustive: CoversUnion<DeathCause, (typeof ALL_CAUSES)[number]> = true;
+const _allEvidenceIsExhaustive: CoversUnion<DeathEvidence, (typeof ALL_EVIDENCE)[number]> = true;
 
 describe("causeOf", () => {
   it("is total over every evidence value", () => {
@@ -148,6 +169,38 @@ describe("isResurrectable", () => {
     expect(isResurrectable("transport-transient")).toBe(true);
     expect(isResurrectable("wall-session")).toBe(true);
     expect(isResurrectable("app-restart")).toBe(true);
+  });
+
+  it("DOES resurrect a vanished process, and that is not in tension with refusing `unknown`", () => {
+    // Stated as the PAIR, because read apart the two look contradictory: both are "the agent is
+    // gone and nothing explained why", yet one is recovered and the other refused.
+    //
+    // The discriminator is WHO WAS WATCHING. `unknown` is written by a mounted pane that observed
+    // the exit and had nothing to say — and a human clicking stop produces exactly that, which is
+    // why it must refuse. `process-gone` is written only by `agent_life::reap_dead_sessions_at`,
+    // from an ABSENCE, with no observer at all — the one case a deliberate stop cannot produce,
+    // since the button that stops an agent is rendered by the very pane whose presence would have
+    // made the death `unknown` instead. (`pty.killPty` retires the record on every deliberate stop
+    // precisely so that rule holds for the programmatic stop paths too.)
+    expect(isResurrectable("process-gone")).toBe(true);
+    expect(isResurrectable("unknown")).toBe(false);
+  });
+
+  it("pairs `process-gone` with the evidence that is its ONLY support", () => {
+    // The invariant `verdictIsSupported` enforces, asserted from both ends so the cause and its
+    // evidence cannot drift apart (roborev 61705): the reaper's evidence supports this cause and
+    // nothing else, and the cause is supported by that evidence and nothing else. The first
+    // version shared `pty-exit`, which made this predicate FALSE for every record the reaper
+    // writes — the module's honesty rule stated but untrue.
+    expect(causeOf("session-vanished")).toBe("process-gone");
+    expect(verdictIsSupported({ cause: "process-gone", evidence: "session-vanished" })).toBe(true);
+    // `pty-exit` means a window WATCHED the close, so it can never support an unobserved inference.
+    expect(verdictIsSupported({ cause: "process-gone", evidence: "pty-exit" })).toBe(false);
+    expect(verdictIsSupported({ cause: "unknown", evidence: "session-vanished" })).toBe(false);
+  });
+
+  it("never arms `process-gone` on a clock — it falls to the ladder", () => {
+    expect(armsOnClock("process-gone")).toBe(false);
   });
 });
 
