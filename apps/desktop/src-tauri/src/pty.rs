@@ -52,9 +52,17 @@ struct PtySession {
     epoch: u64,
 }
 
+/// "No PTY has spawned." Never minted by [`next_pty_epoch`] (which starts at 1), so it can never
+/// collide with a real life — which is what makes it safe as a placeholder and as the answer
+/// `live_epoch` gives for an id with no session.
+const NO_EPOCH: u64 = 0;
+
 /// Mint the next PTY epoch. Process-global and strictly increasing, so no two PTYs — for the same
-/// agent or different ones, in this app run — ever share one. Starts at 1: `0` is left free as a
-/// "no PTY has spawned yet" sentinel for callers that need one.
+/// agent or different ones, in this app run — ever share one. Starts at 1: [`NO_EPOCH`] is left free
+/// as a "no PTY has spawned yet" sentinel for callers that need one.
+///
+/// CALL IT FROM [`PtyManager::insert_session`], not from the top of a spawn: the ORDER in which
+/// epochs are minted only means something if it matches the order sessions land in the map.
 fn next_pty_epoch() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -248,6 +256,57 @@ impl PtyManager {
         self.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
     }
 
+    /// Insert a session under `id`, MINTING ITS EPOCH WHILE THE MAP IS LOCKED, and return that epoch.
+    ///
+    /// The mint and the insert are one critical section on purpose, and the reason is subtle enough
+    /// to be worth stating: `pty_spawn` cannot mint at its top and still claim anything about which
+    /// session survived. Mint order there is INVOKE order, while insert order is
+    /// blocking-completion order — `validate_spawn` + `openpty` + `spawn_command` run on a thread
+    /// pool, and two concurrent spawns of one id can finish in either order. The lower epoch could
+    /// therefore be the one left in the map.
+    ///
+    /// That is not a cosmetic skew. `sessions.insert` REPLACES silently, so the loser's reader thread
+    /// stays alive and still owes a `pty:exit`, while every other verb (`write`/`resize`/`kill`) is
+    /// keyed by id alone and acts on whatever is in the map. A frontend that bound to the highest
+    /// epoch would then accept the ORPHAN's death and ignore the death of the PTY the user is
+    /// actually typing into — the same misattribution the epoch exists to close, inverted.
+    ///
+    /// Minting here makes "the highest epoch minted for an id IS the session in the map" an
+    /// invariant rather than an assumption, because nothing can interleave between the two.
+    /// The other half of that invariant is [`PtyManager::remove_if_epoch`]: an id-keyed REMOVAL
+    /// would let a loser's reader thread delete the winner it never knew replaced it.
+    fn insert_session(&self, id: String, mut session: PtySession) -> u64 {
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let epoch = next_pty_epoch();
+        session.epoch = epoch;
+        sessions.insert(id, session);
+        epoch
+    }
+
+    /// Remove the session under `id` ONLY IF it is the life identified by `epoch`. Returns whether
+    /// it removed anything, so a caller can gate its other per-id teardown on the same answer.
+    ///
+    /// THE TEARDOWN TWIN OF [`PtyManager::insert_session`], and needed for the same reason. A reader
+    /// thread outlives the insert that replaced its session: after an overlapping spawn the loser is
+    /// gone from the map but its thread is alive and will reach its own teardown, typically SOONER
+    /// than the winner (a command that fails fast exits immediately). An id-keyed `remove` there
+    /// deletes the WINNER — a live PTY — so `pty_write`/`pty_resize`/`pty_kill` start answering
+    /// "no such pty" for a terminal the user is typing into, with no `pty:exit` to explain it, since
+    /// the loser's exit carries the lower epoch and the frontend filters it out by design.
+    ///
+    /// A `false` return is therefore not a failure: it is "someone else owns this id now, leave
+    /// their session alone".
+    fn remove_if_epoch(&self, id: &str, epoch: u64) -> bool {
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        match sessions.get(id) {
+            Some(s) if s.epoch == epoch => {
+                sessions.remove(id);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// The epoch of the session live under `id`, or `0` (the never-minted sentinel) when there is
     /// none. This is the ONE read of `PtySession::epoch`: the reader thread stamps its own copy on
     /// `pty:exit` rather than looking the session up, precisely because by then the map may already
@@ -259,7 +318,7 @@ impl PtyManager {
             .unwrap_or_else(|e| e.into_inner())
             .get(id)
             .map(|s| s.epoch)
-            .unwrap_or(0)
+            .unwrap_or(NO_EPOCH)
     }
 
     /// `(session id, root pid)` for every live session that reported a pid.
@@ -632,12 +691,13 @@ pub async fn pty_spawn(
     cols: u16,
     rows: u16,
 ) -> Result<u64, String> {
-    // WHICH LIFE OF THIS AGENT THIS IS. Minted before anything can fail so the value returned to the
-    // caller and the value the reader thread stamps on `pty:exit` are provably the same number, and
-    // handed back so the frontend's transport can bind to it — see `PtySession::epoch` for what goes
-    // wrong without it. Cheap enough to mint on a spawn that later fails: the counter is only ever
-    // compared for equality, never for density.
-    let epoch = next_pty_epoch();
+    // WHICH LIFE OF THIS AGENT THIS IS is minted LATER, by `insert_session`, under the same lock as
+    // the insert — NOT here. Minting at the top reads naturally and is wrong: the setup below runs
+    // on a thread pool, so mint order would be INVOKE order while insert order is completion order,
+    // and two concurrent spawns of one id can finish in either. The map could then hold the LOWER
+    // epoch, and the frontend's "highest epoch is the surviving session" rule would bind to a
+    // session that was silently replaced. See `PtyManager::insert_session`.
+    //
     // Log the command and arg COUNT at info. The full args carry the built `zsh -c '…'` script,
     // which embeds the user's prompt/persona (and could in principle carry a secret passed as a
     // flag), so they're NEVER written to the shared daily log by default — even though our default
@@ -738,7 +798,11 @@ pub async fn pty_spawn(
                     pause: Arc::new(PauseState::new()),
                     inflight: Arc::new(InflightState::new()),
                     pid,
-                    epoch,
+                    // Placeholder — the real epoch is stamped by `insert_session`, under the lock
+                    // that inserts this session. `0` is the never-minted sentinel, so a session that
+                    // somehow reached the map without going through that path would read as "no PTY
+                    // has spawned" rather than impersonating a real life.
+                    epoch: NO_EPOCH,
                 },
                 reader,
                 child,
@@ -763,11 +827,10 @@ pub async fn pty_spawn(
     // screen before this.
     let observer = app.state::<crate::nudger::Observers>().attach(&id, cols, rows);
     let read_observer = observer.clone();
-    app.state::<PtyManager>()
-        .sessions
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(id.clone(), session);
+    // MINT UNDER THE SAME LOCK AS THE INSERT — see `insert_session`. This is the only ordering that
+    // makes "the highest epoch minted for an id is the session that survived" TRUE rather than
+    // merely likely, and the frontend's overlap rule depends on it.
+    let epoch = app.state::<PtyManager>().insert_session(id.clone(), session);
 
     // Reap the child so it doesn't zombie.
     std::thread::spawn(move || {
@@ -905,13 +968,23 @@ pub async fn pty_spawn(
         // lost on EOF.
         read_inflight.close();
         let _ = flusher.join();
-        // Reap the session on natural exit (pty_kill also removes it).
-        read_app.state::<PtyManager>().remove(&read_id);
+        // Reap the session on natural exit (pty_kill also removes it) — but ONLY IF THE MAP STILL
+        // HOLDS THIS LIFE. An id-keyed remove here is the teardown twin of an id-keyed insert: after
+        // an overlapping spawn, the loser's session was silently replaced while its reader thread
+        // stayed alive, so this line would delete the WINNER — a session whose PTY is running and
+        // whose terminal the user is typing into. `pty_write`/`resize`/`kill` would then answer
+        // "no such pty" for a live PTY, with no `pty:exit` to explain it (the loser's exit carries
+        // the lower epoch and is filtered out by design), and `live_epoch` would drop to NO_EPOCH
+        // while a higher-epoch session runs, so an observer's floor would admit a stale exit.
+        let was_ours = read_app.state::<PtyManager>().remove_if_epoch(&read_id, epoch);
         // Stop observing too, or a long-lived app accumulates one 4KB tail and one VT grid per
         // agent that has ever run. The nudger also keys its ladder state off the live observer set,
         // so a dead session left here would climb rungs forever and eventually escalate a terminal
-        // that no longer exists.
-        read_app.state::<crate::nudger::Observers>().detach(&read_id);
+        // that no longer exists. Gated on the same answer: detaching is per-id, so a loser doing it
+        // would blind the nudger to a live terminal.
+        if was_ours {
+            read_app.state::<crate::nudger::Observers>().detach(&read_id);
+        }
         // Stamped with THIS session's epoch, not with whatever is currently in the map under this
         // id. By the time a replaced reader gets here the map may already hold its SUCCESSOR, and
         // reporting the successor's epoch would be worse than reporting none: the new terminal would
@@ -1214,7 +1287,7 @@ mod tests {
     use super::{
         acquire_writer, apply_heap_cap, guard_resize_size, guard_spawn_size, next_pty_epoch,
         node_options_with_cap, run_flusher, validate_spawn_inner, Credit, FlushBuf, InflightState,
-        PauseState, PtyManager, PtyEnd, PtySession, MIN_PTY_COLS, MIN_PTY_ROWS,
+        PauseState, PtyManager, PtyEnd, PtySession, MIN_PTY_COLS, MIN_PTY_ROWS, NO_EPOCH,
         PTY_INFLIGHT_HIGH_WATER_BYTES, SPAWN_FALLBACK_COLS, SPAWN_FALLBACK_ROWS,
     };
     use portable_pty::CommandBuilder;
@@ -1626,6 +1699,85 @@ mod tests {
         }
     }
 
+    /// A LOSER'S REAPER MUST NOT DELETE THE WINNER.
+    ///
+    /// The overlapping-spawn case, end to end on the manager alone, which is where it can be pinned
+    /// deterministically. Two spawns land under one id; `sessions.insert` replaces silently, so the
+    /// loser is gone from the map while its reader thread is still alive and still owes a teardown —
+    /// and that teardown typically runs FIRST, because a command that fails fast exits immediately.
+    ///
+    /// With an id-keyed `remove` there, the live session disappears from the map: `pty_write` /
+    /// `pty_resize` / `pty_kill` answer "no such pty" for a PTY the user is typing into, no
+    /// `pty:exit` explains it (the loser's exit carries the lower epoch and is filtered out by
+    /// design), and `live_epoch` reads NO_EPOCH while a higher-epoch session runs — so an observer
+    /// floor sampled after that admits a stale exit. Every consequence the epoch exists to prevent,
+    /// relocated past the insert.
+    #[test]
+    fn a_replaced_session_reaping_leaves_the_live_one_alone() {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        let sys = native_pty_system();
+        let size = PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
+        // Two real sessions under ONE id — the shape an overlapping spawn leaves behind.
+        let mut made = Vec::new();
+        for _ in 0..2 {
+            let Ok(pair) = sys.openpty(size) else { return };
+            let Ok(child) = pair.slave.spawn_command(CommandBuilder::new("/bin/cat")) else {
+                return;
+            };
+            let killer = child.clone_killer();
+            let Ok(writer) = pair.master.take_writer() else { return };
+            made.push((
+                PtySession {
+                    writer: Arc::new(Mutex::new(writer)),
+                    master: pair.master,
+                    killer,
+                    pause: Arc::new(PauseState::new()),
+                    inflight: Arc::new(InflightState::new()),
+                    pid: None,
+                    epoch: NO_EPOCH,
+                },
+                child,
+            ));
+        }
+        let mgr = PtyManager::default();
+        let mut children = Vec::new();
+        let mut epochs = Vec::new();
+        for (session, child) in made {
+            epochs.push(mgr.insert_session("agent-overlap".to_string(), session));
+            children.push(child);
+        }
+        let (loser, winner) = (epochs[0], epochs[1]);
+        assert!(winner > loser, "the later insert must carry the higher epoch");
+
+        // The LOSER's reader thread reaches its teardown first and asks to reap.
+        assert!(
+            !mgr.remove_if_epoch("agent-overlap", loser),
+            "a replaced session must not be able to remove the id it no longer owns"
+        );
+        assert_eq!(
+            mgr.live_epoch("agent-overlap"),
+            winner,
+            "the live session must survive its predecessor's reaper"
+        );
+        assert_eq!(
+            mgr.session_ids(),
+            vec!["agent-overlap".to_string()],
+            "and must still be visible to the resurrection guard"
+        );
+
+        // …and the winner's own reaper still works, or sessions would leak forever.
+        assert!(
+            mgr.remove_if_epoch("agent-overlap", winner),
+            "the session that owns the id must still be removable by its own reader"
+        );
+        assert_eq!(mgr.live_epoch("agent-overlap"), NO_EPOCH, "and the id is then free");
+
+        for mut child in children {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
     /// `session_ids` must report a session that has NO pid — the exact entry `session_pids` skips.
     ///
     /// This is the whole point of the second method, and it is asserted here rather than left to
@@ -1652,7 +1804,10 @@ mod tests {
         let killer = child.clone_killer();
         let writer = pair.master.take_writer().expect("take_writer");
         let mgr = PtyManager::default();
-        mgr.sessions.lock().unwrap().insert(
+        // Through `insert_session`, the way production does — the epoch is stamped by the insert, so
+        // a session constructed with the `NO_EPOCH` placeholder comes out of the map carrying a real
+        // life. Inserting by hand here would let the placeholder survive and hide that.
+        let inserted = mgr.insert_session(
             "agent-mid-spawn".to_string(),
             PtySession {
                 writer: Arc::new(Mutex::new(writer)),
@@ -1662,9 +1817,10 @@ mod tests {
                 inflight: Arc::new(InflightState::new()),
                 // No pid yet — a spawn that has not finished reporting one.
                 pid: None,
-                epoch: next_pty_epoch(),
+                epoch: NO_EPOCH,
             },
         );
+        assert!(inserted > NO_EPOCH, "insert_session must stamp a real epoch, not the sentinel");
 
         assert!(
             mgr.session_pids().is_empty(),
@@ -1684,6 +1840,13 @@ mod tests {
             mgr.live_epoch("agent-mid-spawn"),
             live,
             "live_epoch must report the epoch of the session actually in the map"
+        );
+        // THE EPOCH THE INSERT RETURNED IS THE EPOCH THE MAP HOLDS. `pty_spawn` returns this value to
+        // the frontend, which binds its exit filter to it, so a stamp that did not reach the session
+        // would bind the terminal to a life the PTY host never recorded.
+        assert_eq!(
+            inserted, live,
+            "the epoch insert_session returns must be the one it stored under that id"
         );
         assert_eq!(
             mgr.live_epoch("no-such-agent"),

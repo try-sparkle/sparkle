@@ -299,10 +299,12 @@ export class LocalTransport implements AgentTransport {
       // Highest wins, rather than last-caller wins, and the difference is not cosmetic: which of two
       // in-flight `spawnPty` calls reaches Rust first is not knowable from here (each awaits a
       // different number of microtasks before it even invokes), so JS call order cannot say which
-      // PTY is live. Rust's counter can: it mints in the order it actually creates PTYs, and
-      // `sessions.insert` replaces, so the HIGHEST epoch minted for this id IS the session that
-      // survived. A loser still settles its own waiters — against the winner, so they judge exits by
-      // the life that is actually live.
+      // PTY is live. Rust's counter can — but ONLY because it mints inside the same lock as the
+      // insert (`PtyManager::insert_session`). That is what makes "the HIGHEST epoch minted for this
+      // id IS the session in the map" an invariant: mint at the top of `pty_spawn` instead and mint
+      // order is invoke order while insert order is completion order, so the map can hold the LOWER
+      // epoch and this rule binds to a session that was silently replaced. A loser still settles its
+      // own waiters — against the winner, so they judge exits by the life that is actually live.
       if (epoch > (this.epoch ?? NO_EPOCH)) this.epoch = epoch;
       // Settled after the assignment so a subscriber woken by `epochKnown` reads the same value the
       // synchronous path reads.
