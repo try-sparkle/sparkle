@@ -320,7 +320,7 @@ export function DemoteToLocalDialog({
           </button>
         </div>
 
-        <div style={body}>
+        <div data-testid="demote-dialog-body" style={body}>
           {done ? (
             <div style={panel} data-testid="demote-success">
               <div style={{ ...successText, display: "flex", gap: 7, alignItems: "flex-start" }}>

@@ -25,6 +25,7 @@ vi.mock("../stores/uiStore", () => ({
 }));
 
 import { PromoteToCloudDialog, type PromoteToCloudDeps } from "./PromoteToCloudDialog";
+import { expectBoundedCard } from "./dialogCardGeometryTestUtils";
 import { lastSignInUrl, openSignIn } from "../services/sparkleApi";
 import { useAuthStore } from "../stores/authStore";
 import { WIP_COMMIT_MESSAGE } from "../services/agentPromotion/plan";
@@ -98,6 +99,19 @@ afterEach(() => {
 // whole estimate block was inert: a wrong selector path, a `costLine` accidentally placed inside the
 // refusal branch, or a dropped `data-testid` would all have shipped with the suite green. That is
 // the same vacuity the Rust round-trip test exists to prevent, one layer up.
+describe("the card cannot outgrow the window", () => {
+  // Restores a guarantee the old source sweep used to assert for this file. The card is bounded and
+  // its scroll is on the body — the title bar carries the close control, so a card-level scrollport
+  // would take it off the screen on exactly the short window the ceiling exists for.
+  it("is bounded to the viewport and scrolls its body, not the card", () => {
+    mount(okPlan());
+    expectBoundedCard({
+      card: screen.getByRole("dialog"),
+      scrollport: screen.getByTestId("promote-dialog-body"),
+    });
+  });
+});
+
 describe("the cost estimate", () => {
   it("states the server's rate and what the balance funds", async () => {
     useAuthStore.setState({ me: me({ balanceCents: 1240 }), tokenPresent: true } as never);

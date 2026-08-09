@@ -14,7 +14,7 @@
 // It is deliberately narrow: it bans a hard-coded black used as a full-bleed OVERLAY background, not
 // every rgba in the app. Translucent blacks are legitimate in plenty of places — a gradient stop, a
 // text shadow, a tinted hover — and a guard that flagged those would be turned off within a week.
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -28,6 +28,40 @@ function sourceFiles(dir: string, out: string[] = []): string[] {
     else if (/\.tsx?$/.test(name) && !name.includes(".test.")) out.push(p);
   }
   return out;
+}
+
+
+/** Source with COMMENT LINES removed — a leading-prefix filter, deliberately, and deliberately
+ *  weak.
+ *
+ *  The version this replaces was a character scanner that also handled block and JSX comments. It
+ *  was wrong in a way that matters more than what it bought: with no string/template/regex
+ *  awareness, a `"/*"` inside a STRING LITERAL flipped it into comment mode and deleted the rest of
+ *  the file. Several guard files in this repo contain exactly that idiom — including this one — so
+ *  a component carrying such a literal would silently vanish from `cardFiles()`, and since it would
+ *  then be absent from BOTH sides of the set comparison, the membership check would pass while
+ *  quietly no longer covering it. That is a false green in the one check here with real value,
+ *  bought to close a hole in a check that had none.
+ *
+ *  A leading-`//` / `/*` / `*` prefix test cannot make that mistake: a comment marker inside a
+ *  string is never the first thing on its line. It misses a block-commented call, which is the
+ *  honest cost — see the note on the usage check below for why that no longer matters. */
+function stripComments(src: string): string {
+  return src
+    .split("\n")
+    .filter((l) => !/^\s*(\/\/|\/\*|\*)/.test(l))
+    .join("\n");
+}
+
+/** Files that paint their own dialog card: a dialog surface AND a modal shadow. Deliberately a
+ *  FILE-level fact — it decides membership, never geometry. */
+function cardFiles(): string[] {
+  return sourceFiles(SRC)
+    .filter((f) => {
+      const src = stripComments(readFileSync(f, "utf8"));
+      return /background:\s*C\.dialogSurface\b/.test(src) && /MODAL_SHADOW/.test(src);
+    })
+    .map((f) => f.slice(SRC.length));
 }
 
 /** `background: "rgba(0,0,0,…)"` — a hard-coded black fill, however it is spaced. */
@@ -46,6 +80,35 @@ function looksLikeOverlay(lines: string[], i: number): boolean {
   const near = lines.slice(Math.max(0, i - WINDOW), i + WINDOW).join("\n");
   return /inset:\s*0\b/.test(near) && /position:\s*"(fixed|absolute)"/.test(near);
 }
+
+/**
+ * Every file that paints its OWN dialog card, mapped to the test file asserting its geometry.
+ *
+ * `null` means NO render assertion exists, with the reason stated. That distinction is the whole
+ * point of the map: the first version of this was an array plus a prose comment, and the prose
+ * claimed coverage for six cards that had none — deleting `maxHeight` from `SettingsDialog` left the
+ * suite green. A comment cannot fail; a map entry can.
+ */
+const KNOWN_CARDS: Record<string, string | null> = {
+  "AccountLimitModal.tsx": "AccountLimitModal.test.tsx",
+  "AccountLoginModal.tsx": "AccountLoginModal.remount.test.tsx",
+  "DemoteToLocalDialog.tsx": "DemoteToLocalDialog.test.tsx",
+  // Also asserted in the real production composition (ModalShell > AccountsScreen), which is the
+  // shape the founder actually hit — see AccountsScreen.reachability.test.tsx.
+  "ModalShell.tsx": "ModalShell.test.tsx",
+  "NewCloudAgentDialog.tsx": "NewCloudAgentDialog.test.tsx",
+  "PromoteToCloudDialog.tsx": "PromoteToCloudDialog.test.tsx",
+  "SettingsDialog.tsx": "SettingsDialog.test.tsx",
+  // DELIBERATE card-level scrollports, so `expectBoundedCard` would (correctly) refuse them: each
+  // wraps a single child with no chrome of its own — no header, no footer, no dismiss control inside
+  // the card — so there is nothing that CAN scroll away. The smoke check below still holds their
+  // ceiling.
+  "BoardView.tsx": null,
+  "composer/ModalOverlay.tsx": null,
+  // No test file exists for this component at all. Its card is bounded and its scroll is on
+  // `project-modal-body`, but nothing asserts either. Worth a minimal render test.
+  "ProjectModal.tsx": null,
+};
 
 describe("modal chrome is not hand-rolled", () => {
   it("no component paints a full-bleed overlay in a hard-coded black — use SCRIM", () => {
@@ -95,110 +158,90 @@ describe("modal chrome is not hand-rolled", () => {
     ).toEqual([]);
   });
 
-  // ── A DIALOG CARD IS BOUNDED TO THE VIEWPORT, OR IT IS A TRAP ────────────────────────────────
+  // ── EVERY SELF-PAINTED DIALOG CARD IS ACCOUNTED FOR ─────────────────────────────────────────
   //
   // A card with no height ceiling takes whatever height its content wants. Harmless for a confirm
-  // prompt; a trap the moment the dialog contains a list — and both ways it centres are worse than
+  // prompt; a trap the moment the dialog holds a list — and both ways a card centres are worse than
   // they sound. `ModalShell` centres with flexbox and `NewCloudAgentDialog` with a transform, so an
-  // over-tall card overflows the window at the TOP as well as the bottom, and there is no scroll
-  // position that recovers what went off the top. The controls are simply gone.
+  // over-tall card overflows the window at the TOP as well as the bottom, and no scroll position
+  // recovers what went off the top. That shipped: the accounts dialog grew past the window under its
+  // spawn ledger and took "+ Add account" with it — the exact remedy its own banner recommends.
   //
-  // That shipped. The accounts dialog grew past the window under its spawn ledger and took
-  // "+ Add account" with it, which is the exact remedy the panel's own banner recommends — the
-  // founder could not sign in a second Claude account because the button that does it was
-  // unreachable. When that was fixed, a source survey found TWO more self-painted cards with the
-  // same hole (`NewCloudAgentDialog`, `ProjectModal`), neither of which anyone had thought about.
+  // ── WHY THIS IS A MEMBERSHIP CHECK AND NOT A STYLE SWEEP ────────────────────────────────────
+  // The first version of this guard tried to answer "does THIS element carry that declaration?" by
+  // reading source text. Seven rounds of review, seven real holes, each one level down: file-scoped
+  // → ±8-line window → opener-pattern → line-granular balance → column-aware-in-but-not-out. Every
+  // fix to the scoping introduced a new FALSE GREEN, and twice the fixture written to prove a fix
+  // used a shape that could not reproduce the bug. Hand-rolled brace counting is the wrong tool for
+  // "which element carries this style"; the DOM knows exactly, with no parsing.
   //
-  // Hence a sweep rather than three render tests. The next hand-rolled dialog is written by copying
-  // one of these files, and a per-component test cannot cover a component that does not exist yet —
-  // the same argument the scrim guard above already won.
-  it("every self-painted dialog card is height-bounded and has somewhere to scroll", () => {
-    /** A file that paints its OWN modal card: the dialog surface, in a style object that also
-     *  carries the modal shadow or sits beside a scrim. Files that mount `<ModalShell>` inherit its
-     *  bound and are correctly out of scope; so is `AccountsScreen`, which reaches for
-     *  `dialogSurface` to paint a sticky header INSIDE a shell it does not own. */
-    /** Every card style object in the file, as the `WINDOW` slice around its identifying line. A
-     *  file-wide regex cannot serve this guard: it cannot tell WHICH element carries the bound, so
-     *  an unrelated `maxHeight` on a dropdown or a preview pane elsewhere in the file would satisfy
-     *  it for a card that has none — and, worse, it cannot tell the correct body-scoped scroll from
-     *  the card-level scroll this guard exists to reject. */
-    function cardWindows(file: string): string[] {
-      // COMMENTS ARE STRIPPED BEFORE WINDOWING, not after. Slicing raw lines lets a comment eat the
-      // window: documenting *why* a card is bounded pushed its own `maxHeight` out of range and the
-      // guard then reported the documented card as unbounded. A window measured in DECLARATIONS is
-      // what this is trying to express, so an explanatory paragraph must not shrink it.
-      const lines = readFileSync(file, "utf8")
-        .split("\n")
-        .filter((l) => !/^\s*(\/\/|\/\*|\*)/.test(l));
-      const out: string[] = [];
-      lines.forEach((line, i) => {
-        if (!/background:\s*C\.dialogSurface\b/.test(line)) return;
-        const text = lines.slice(Math.max(0, i - WINDOW), i + WINDOW).join("\n");
-        if (!/MODAL_SHADOW/.test(text)) return;
-        out.push(text);
-      });
-      return out;
-    }
-
-    const owners = sourceFiles(SRC).filter((f) => cardWindows(f).length > 0);
-    // A drift canary with a floor near the REAL population. `> 2` was the first cut and it was far
-    // too loose: the heuristic matches ten files, so the scope could have stopped covering seven of
-    // them and this guard would still have read green — a guard whose whole value is covering files
-    // nobody has written yet must notice when it stops covering the ones that exist.
+  // So the behaviour is asserted where it is observable — `expectBoundedCard` against the rendered
+  // dialog, in each component's own test file — and this keeps only the half a render test cannot
+  // do: noticing a NEW file that paints a dialog card. That question needs no parsing and cannot
+  // false-positive, because it is answered per FILE, not per element.
+  it("every file painting its own dialog card is in KNOWN_CARDS", () => {
+    const found = cardFiles().sort();
     expect(
-      owners.length,
-      `the self-painted-card scope matched ${owners.length} files — the heuristic has drifted`,
-    ).toBeGreaterThanOrEqual(9);
+      found,
+      "a file here paints its own dialog card, so it owes a geometry assertion. Add an " +
+        "`expectBoundedCard` case to that component's test file (see AccountLimitModal.test.tsx) " +
+        "and map it in KNOWN_CARDS — or map it to null WITH the reason:\n" +
+        `  expected: ${JSON.stringify(Object.keys(KNOWN_CARDS).sort())}\n` +
+        `  found:    ${JSON.stringify(found)}`,
+    ).toEqual(Object.keys(KNOWN_CARDS).sort());
+  });
 
-    const offenders: string[] = [];
-    for (const file of owners) {
-      const wholeFile = readFileSync(file, "utf8")
-        .split("\n")
-        .filter((l) => !/^\s*(\/\/|\/\*|\*)/.test(l))
-        .join("\n");
-      for (const card of cardWindows(file)) {
-        // RELATIVE specifically — `vh` against the viewport, or `%` against a parent that is itself
-        // bounded (the composer's overlay and the board's panel fill a fixed ancestor, so `100%` IS
-        // a viewport bound, transitively). A ceiling in PIXELS is not a bound against the window,
-        // which is the thing the card overflows. Read off the CARD, not the file.
-        if (!/maxHeight:\s*(MODAL_MAX_HEIGHT|["'`]\d+(\.\d+)?(vh|%))/.test(card)) {
-          offenders.push(`${file.slice(SRC.length)}: card has no viewport-relative maxHeight`);
-        }
-        // THE SCROLL BELONGS TO A DESCENDANT, NOT TO THE CARD — and this is the check that has to be
-        // card-scoped or it is worse than nothing. Making the card itself the scrollport scrolls its
-        // OWN top chrome out of view: `AccountLoginModal`'s only dismiss control is the `Done` button
-        // in its header, so on exactly the short window this bound exists for, the user scrolls to
-        // reach the content and the way out leaves the screen. A file-wide match blessed that.
-        //
-        // `BoardView` is exempt BY NAME: its card wraps a single `<BeadCard>` with no chrome of its
-        // own — no header, no footer, no dismiss control inside it (the scrim and Escape close it) —
-        // so there is nothing that CAN scroll away, and card-level scroll is the correct shape.
-        // Named rather than pattern-matched, so a third exemption is a deliberate act.
-        if (/overflowY:\s*["']auto["']/.test(card) && !file.endsWith("BoardView.tsx")) {
-          offenders.push(
-            `${file.slice(SRC.length)}: the CARD is the scrollport — its own header will scroll away`,
-          );
-        }
+  // THE MAP MUST NOT LIE. Naming a test file that does not assert the geometry is exactly the
+  // failure the prose version had — coverage claimed, none delivered.
+  it("each card mapped to a test file really is asserted there", () => {
+    const broken: string[] = [];
+    for (const [card, test] of Object.entries(KNOWN_CARDS)) {
+      if (test == null) continue;
+      const path = join(SRC, test);
+      if (!existsSync(path)) {
+        broken.push(`${card} → ${test} (no such test file)`);
+        continue;
       }
-      // `composer/ModalOverlay` is the one legitimate exception and is named rather than pattern-
-      // matched, so adding a second one is a deliberate act someone has to justify in review. It is
-      // a bare frame — bounded, `overflow: hidden`, and `{children}` passed straight through with no
-      // body of its own — so the scrollport is the CONSUMER's to provide, and giving it one here
-      // would put a second scrollbar around every child that already has one.
-      if (file.endsWith("composer/ModalOverlay.tsx")) continue;
-      // A ceiling with no scrollport anywhere CLIPS the overflow instead of hiding it, which is not
-      // an improvement — the controls are still unreachable, just invisible rather than off-screen.
-      if (!/overflowY:\s*["']auto["']/.test(wholeFile)) {
-        offenders.push(`${file.slice(SRC.length)}: card is bounded but nothing scrolls`);
+      // WHAT THIS CAN AND CANNOT PROVE, stated rather than implied.
+      //
+      // It proves the mapped file exists and mentions the helper. It does NOT prove the assertion
+      // runs: a commented-out or `.skip`-ped call still satisfies it. Earlier versions tried to
+      // close that, and every attempt needed to parse TypeScript with regexes — which is the exact
+      // tool this whole PR concluded was wrong for "which construct is this text inside". Those
+      // attempts produced, in order: a file-wide `.skip` match that red on an unrelated quarantined
+      // test; a block-scoped rescan that stopped at the innermost `it(` and so missed a
+      // `describe.skip` wrapping it; and a comment stripper that deleted whole files on a string
+      // literal. Each fix to the checker introduced a worse defect than the one it closed.
+      //
+      // So the claim is narrowed to what a substring test genuinely supports. The realistic error
+      // — a map entry pointing at a file that never heard of the helper — is caught. Deliberately
+      // disabling an assertion while leaving its map entry is left to code review, which is a
+      // cheaper and more reliable reader of intent than a regex.
+      if (!/expectBoundedCard\(/.test(readFileSync(path, "utf8"))) {
+        broken.push(`${card} → ${test} (never mentions expectBoundedCard)`);
       }
     }
     expect(
-      offenders,
-      "a dialog card that can outgrow the window hides its own controls, and a centred one hides " +
-        "them off the TOP where no scroll reaches. Bound it with MODAL_MAX_HEIGHT from ModalShell " +
-        "and give it a scrollport (see ModalShell's body, or PromoteToCloudDialog):\n" +
-        offenders.join("\n"),
+      broken,
+      "KNOWN_CARDS claims a geometry assertion that is not there:\n" + broken.join("\n"),
     ).toEqual([]);
+  });
+
+  // The weak backstop for the three cards with no render assertion. FILE-level and coarse on
+  // purpose: it only asks whether a viewport-relative ceiling is declared anywhere in the file, so
+  // it can UNDER-report (an unrelated `maxHeight` would satisfy it) but never reds correct code.
+  // It is not a substitute for a render test — it exists so those three are not guarded by nothing
+  // at all, which is what the first version of this rewrite left them as.
+  it("cards with no render assertion still declare a viewport-relative ceiling", () => {
+    const offenders: string[] = [];
+    for (const [card, test] of Object.entries(KNOWN_CARDS)) {
+      if (test != null) continue;
+      const src = stripComments(readFileSync(join(SRC, card), "utf8"));
+      if (!/maxHeight:\s*(MODAL_MAX_HEIGHT|["'`]\d+(\.\d+)?(vh|%))/.test(src)) {
+        offenders.push(`${card}: no viewport-relative maxHeight anywhere in the file`);
+      }
+    }
+    expect(offenders, offenders.join("\n")).toEqual([]);
   });
 });
 

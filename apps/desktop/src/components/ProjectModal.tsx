@@ -132,7 +132,7 @@ export function ProjectModal({ project, onClose }: { project: Project; onClose: 
               here, so a short window shrinks the form rather than pushing Cancel/Save off-screen.
               `minHeight: 0` is what lets it shrink at all — a flex child's default `min-height:
               auto` refuses to go below its content, and the card's ceiling would never bind. */}
-          <div style={{ flex: "1 1 auto", minHeight: 0, overflowY: "auto" }}>
+          <div data-testid="project-modal-body" style={{ flex: "1 1 auto", minHeight: 0, overflowY: "auto" }}>
           <label style={{ display: "block", color: C.muted, fontSize: 12, marginBottom: 6 }}>
             Project name
           </label>

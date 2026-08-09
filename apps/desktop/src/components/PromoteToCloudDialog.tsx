@@ -409,7 +409,7 @@ export function PromoteToCloudDialog({
           </button>
         </div>
 
-        <div style={body}>
+        <div data-testid="promote-dialog-body" style={body}>
           {moved ? (
             <div style={panel} data-testid="promote-success">
               <div style={{ ...successText, display: "flex", gap: 7, alignItems: "flex-start" }}>

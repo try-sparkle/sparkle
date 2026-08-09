@@ -14,6 +14,7 @@
 // dialog: given this plan, the user sees this. `planDemotion` has its own tests (§W3).
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { expectBoundedCard } from "./dialogCardGeometryTestUtils";
 
 import {
   DemoteToLocalDialog,
@@ -63,6 +64,16 @@ function mount(plan: DemotionPlan, demote?: DemoteToLocalDeps["demote"], repairO
 }
 
 afterEach(cleanup);
+
+describe("the card cannot outgrow the window", () => {
+  it("is bounded to the viewport and scrolls its body, not the card", () => {
+    mount(okPlan());
+    expectBoundedCard({
+      card: screen.getByRole("dialog"),
+      scrollport: screen.getByTestId("demote-dialog-body"),
+    });
+  });
+});
 
 describe("what the user is told before they can confirm", () => {
   it("names the branch the work comes back on", async () => {

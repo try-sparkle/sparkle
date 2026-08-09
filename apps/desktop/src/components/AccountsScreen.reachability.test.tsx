@@ -27,6 +27,7 @@ import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AccountsScreen, type AccountsDeps } from "./AccountsScreen";
 import { ModalShell } from "./ModalShell";
+import { expectBoundedCard } from "./dialogCardGeometryTestUtils";
 import type { Account, Identity } from "../services/accountStore";
 import type { SpawnLogEntry } from "../services/accountLedger";
 
@@ -103,18 +104,12 @@ describe("the accounts dialog cannot grow off the screen", () => {
     await waitFor(() => expect(screen.getByText("60 shown")).toBeTruthy());
 
     const body = screen.getByTestId("modal-shell-body");
-    const card = body.parentElement as HTMLElement;
 
-    // The regression, named: an unbounded card is what let content decide the dialog's height.
-    expect(card.style.maxHeight).toMatch(/vh$/);
-    // …and a bound with no scroll would merely CLIP the button instead of hiding it, which is not
-    // an improvement. The body has to be the scrollport.
-    expect(body.style.overflowY).toBe("auto");
-    // A flex column whose child cannot shrink below its content ignores the bound entirely — the
-    // default `min-height: auto` would let the body push the card straight back past `maxHeight`.
-    // (CSSOM serialises a unitless zero here, so compare numerically rather than to "0px".)
-    expect(body.style.minHeight).not.toBe("");
-    expect(parseFloat(body.style.minHeight)).toBe(0);
+    // THE SHARED ASSERTION, not a local copy of it. This used to hand-roll the three checks, and the
+    // copy had already drifted twice: it rejected a `%` ceiling, and it omitted the card-level-
+    // scrollport ban entirely — the one check that corresponds to a bug that actually shipped. A
+    // rule written out five times is a rule with five versions.
+    expectBoundedCard({ card: body.parentElement as HTMLElement, scrollport: body });
   });
 
   it("pins the add-account control so no ledger length can scroll it away", async () => {

@@ -30,6 +30,7 @@ vi.mock("../services/sparkleApi", async (importOriginal) => ({
 }));
 
 import { NewCloudAgentDialog } from "./NewCloudAgentDialog";
+import { expectBoundedCard } from "./dialogCardGeometryTestUtils";
 import { useAuthStore } from "../stores/authStore";
 import { useUiStore } from "../stores/uiStore";
 import { useCloudAuthStore } from "../stores/cloudAuthStore";
@@ -86,6 +87,20 @@ const clickStart = () => fireEvent.click(screen.getByRole("button", { name: /Sta
 // THE PRICE, BEFORE THE BUTTON. The founder's ask was "I need to know what the cost of it is" — and
 // the honest form of that, for a per-minute meter with an unknown run length, is a rate plus a
 // runway rather than a total nobody can compute.
+
+describe("the cloud dialog cannot outgrow the window", () => {
+  // A transform-centred card with no ceiling overflows the TOP as well as the bottom, where no
+  // scroll reaches — and the founder reported not being able to see all of a cloud surface. The
+  // scroll must be on the body: the title bar carries the only close button.
+  it("is bounded to the viewport and scrolls its body, not the card", () => {
+    render(<NewCloudAgentDialog project={seedProject()} onClose={vi.fn()} />);
+    expectBoundedCard({
+      card: screen.getByRole("dialog"),
+      scrollport: screen.getByTestId("cloud-dialog-body"),
+    });
+  });
+});
+
 describe("NewCloudAgentDialog — the cost estimate", () => {
   it("states the hourly rate and what the balance funds, from the SERVER's price", () => {
     useAuthStore.setState({ me: me({ balanceCents: 1240 }), tokenPresent: true });

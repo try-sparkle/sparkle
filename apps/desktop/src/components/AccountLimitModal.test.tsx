@@ -45,6 +45,7 @@ vi.mock("./ClaudeSignIn", () => ({
 }));
 
 import { AccountLimitModal, PENDING_NICKNAME } from "./AccountLimitModal";
+import { expectBoundedCard } from "./dialogCardGeometryTestUtils";
 import { useAccountLimitStore } from "../stores/accountLimitStore";
 
 const LIMITED = { id: "old", nickname: "DROdio Personal", configDir: "/Users/x/.claude", isDefault: true, createdAt: 0 };
@@ -73,6 +74,16 @@ async function openWithLimit() {
 }
 
 describe("AccountLimitModal", () => {
+  // The card must not be able to outgrow the window, and its scroll must live on a DESCENDANT — the
+  // dismiss and sign-in buttons sit in pinned chrome, so a card-level scrollport would carry them
+  // off the screen on exactly the short window the ceiling exists for. Asserted on the rendered DOM
+  // rather than by reading the source: see dialogCardGeometry.ts for why.
+  it("is bounded to the viewport and scrolls a descendant, not itself", async () => {
+    await openWithLimit();
+    const body = screen.getByTestId("account-limit-body");
+    expectBoundedCard({ card: body.parentElement as HTMLElement, scrollport: body });
+  });
+
   it("renders nothing until an account is actually limited", () => {
     render(<AccountLimitModal />);
     expect(screen.queryByTestId("account-limit-backdrop")).toBeNull();

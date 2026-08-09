@@ -5,6 +5,7 @@
 // the close affordance fires onClose. The individual controls have their own tests; here we
 // only care about the rail/pane shell.
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { expectBoundedCard } from "./dialogCardGeometryTestUtils";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { FONT_MONO, TYPE, WEIGHT } from "../theme/scale";
 import {
@@ -84,6 +85,18 @@ afterEach(() => {
 });
 
 const heading = (name: string) => screen.queryByRole("heading", { name });
+
+describe("the settings card cannot outgrow the window", () => {
+  // The chain here is card(column) > bodyRow(row) > pane. What makes the ceiling bind is bodyRow's
+  // `minHeight: 0`, NOT anything on the pane — the helper walks the chain and finds that itself.
+  it("is bounded to the viewport and scrolls its pane, not the card", () => {
+    render(<SettingsDialog onClose={vi.fn()} onManageAccounts={vi.fn()} />);
+    expectBoundedCard({
+      card: screen.getByRole("dialog"),
+      scrollport: screen.getByTestId("settings-pane"),
+    });
+  });
+});
 
 describe("SettingsDialog", () => {
   it("opens on the AI features pane by default", () => {

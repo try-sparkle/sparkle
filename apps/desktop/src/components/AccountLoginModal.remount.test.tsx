@@ -9,7 +9,7 @@
 // The guard is `key={account.configDir}` at the mount site. This asserts the REMOUNT (a fresh
 // ClaudeSignIn instance for a different account), which is the side effect — not that the key
 // attribute exists, which would pass against any implementation that merely spelled it.
-import { cleanup, render } from "@testing-library/react";
+import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 // Count MOUNTS per configDir — recorded from a `[]`-dep effect, not the render body. A component
@@ -34,6 +34,7 @@ vi.mock("./ClaudeSignIn", async () => {
   };
 });
 
+import { expectBoundedCard } from "./dialogCardGeometryTestUtils";
 import { AccountLoginModal } from "./AccountLoginModal";
 import type { Account } from "../services/accountStore";
 
@@ -51,6 +52,14 @@ afterEach(() => {
 });
 
 describe("AccountLoginModal — swapping the account underneath it", () => {
+  // This card's ONLY dismiss control is the "Done" button in its header row, which makes it the
+  // sharpest case for the rule: a card-level scrollport scrolls the way out off the screen.
+  it("is bounded to the viewport and scrolls a descendant, not itself", () => {
+    render(<AccountLoginModal account={acct("a", "/dirs/a")} onClose={vi.fn()} />);
+    const body = screen.getByTestId("account-login-body");
+    expectBoundedCard({ card: body.parentElement as HTMLElement, scrollport: body });
+  });
+
   it("remounts the sign-in surface, so account B cannot inherit account A's verdict", () => {
     const { rerender } = render(
       <AccountLoginModal account={acct("a", "/dirs/a")} onClose={vi.fn()} />,

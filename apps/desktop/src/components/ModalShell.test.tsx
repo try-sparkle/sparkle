@@ -13,6 +13,7 @@ import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import { ModalShell } from "./ModalShell";
 import { RADIUS } from "../theme/scale";
+import { expectBoundedCard } from "./dialogCardGeometryTestUtils";
 
 afterEach(cleanup);
 
@@ -38,6 +39,14 @@ function renderShell() {
 }
 
 describe("ModalShell paints the spec's modal plane", () => {
+  // Fifteen dialogs inherit this card, so this is the highest-leverage place the geometry rule is
+  // pinned: bounded to the viewport, and the scroll on the BODY rather than the card — a card that
+  // is its own scrollport carries whatever pinned chrome a consumer put at the top off the screen.
+  it("is bounded to the viewport and scrolls its body, not the card", () => {
+    const { body, card } = renderShell();
+    expectBoundedCard({ card, scrollport: body });
+  });
+
   it("the card takes the DIALOG surface, not the builder column's plane", () => {
     const { card } = renderShell();
     expect(card.style.background).toBe("var(--c-dialog-surface)");

@@ -87,7 +87,7 @@ export function AccountLoginModal({ account, onClose }: { account: Account; onCl
           {/* THE SCROLLPORT: the explanatory prose, which is what a short window has to give up.
               It scrolls here rather than on the card, so "Done" above and the terminal below both
               stay put. */}
-          <div style={{ flex: "0 1 auto", minHeight: 0, overflowY: "auto" }}>
+          <div data-testid="account-login-body" style={{ flex: "0 1 auto", minHeight: 0, overflowY: "auto" }}>
           <p style={{ fontSize: 12, color: C.muted, marginTop: 0, lineHeight: 1.4 }}>
             Complete the normal Claude login below (it opens your browser). Sparkle never sees your
             credentials. Close when you’re done.

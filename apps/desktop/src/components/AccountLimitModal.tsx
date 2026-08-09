@@ -161,7 +161,7 @@ export function AccountLimitModal() {
           </div>
 
           {/* THE SCROLLPORT — everything between the pinned title and the pinned buttons. */}
-          <div style={{ flex: "1 1 auto", minHeight: 0, overflowY: "auto", display: "flex", flexDirection: "column" }}>
+          <div data-testid="account-limit-body" style={{ flex: "1 1 auto", minHeight: 0, overflowY: "auto", display: "flex", flexDirection: "column" }}>
           <p style={{ fontSize: 12, color: C.muted, marginTop: 0, lineHeight: 1.5 }}>
             {resetsAt
               ? `It resets at ${resetsAt}. Retrying can’t clear it — this is an account limit, not a network error.`

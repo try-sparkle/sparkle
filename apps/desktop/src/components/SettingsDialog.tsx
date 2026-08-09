@@ -285,7 +285,7 @@ export function SettingsDialog({ onClose, onManageAccounts, initialCategory }: S
           </nav>
 
           {/* Active pane */}
-          <section style={pane} aria-label={current.label}>
+          <section data-testid="settings-pane" style={pane} aria-label={current.label}>
             <h2 style={paneHeading}>{current.label}</h2>
             <p style={paneBlurb}>{current.blurb}</p>
             {/* `current`, not `active`: when a deep-link names a category this account doesn't

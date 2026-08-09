@@ -147,7 +147,7 @@ export function NewCloudAgentDialog({ project, onClose }: { project: Project; on
           </button>
         </div>
 
-        <div style={body}>
+        <div data-testid="cloud-dialog-body" style={body}>
           {blocked ? (
             <div style={panel} data-testid="cloud-gate-block">
               <div style={{ fontSize: 13, color: C.cream }}>{blocked.message}</div>
