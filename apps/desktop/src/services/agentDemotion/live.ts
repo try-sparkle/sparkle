@@ -17,6 +17,7 @@ import {
   LocalTransport,
   type AgentTransport,
 } from "../agentTransport";
+import { ptyLiveEpoch } from "../../pty";
 import { cloudApi, type CloudApi } from "../cloudAgents/api";
 import { useProjectStore } from "../../stores/projectStore";
 import { demotionLandBranch, demotionWriteTranscript } from "./rust";
@@ -42,14 +43,21 @@ export interface AwaitLocalFirstFrameOpts {
  * just proved was alive.
  */
 export function awaitLocalFirstFrameLive(opts: AwaitLocalFirstFrameOpts): Promise<void> {
-  // An OBSERVER, explicitly (`observeAnyEpoch`) — not `getTransport`, which hands back a transport
-  // that reports only the exit of a PTY IT spawned. This one spawns nothing, so under the default
-  // epoch filter its exit path would be permanently inert: the early-exit rejection below would
-  // never fire and the commonest demotion failure would present as a first-frame TIMEOUT blaming the
-  // deadline, holding the cloud sandbox open for the whole wait. Any life of this agent exiting
-  // before we saw a frame is the fact this wants, and it is exactly what an observer reports.
+  // An OBSERVER, explicitly — not `getTransport`, which hands back a transport that reports only the
+  // exit of a PTY IT spawned. This one spawns nothing, so under that filter its exit path would be
+  // permanently inert: the early-exit rejection below would never fire, and the commonest demotion
+  // failure would present as a first-frame TIMEOUT blaming the deadline, holding the cloud sandbox
+  // open for the whole wait.
+  //
+  // The FLOOR is what makes it safe. This gate subscribes BEFORE `spawnLocalAgent`, and that spawn
+  // is a restart whose first act is to tear down the existing PTY — whose exit then arrives, late,
+  // with us listening. Accepting it would reject the wait, stand down a HEALTHY newly-spawned agent
+  // and report demotion as failed: the very misattribution the epoch closes, relocated here. So we
+  // sample the epoch live RIGHT NOW (before any spawn) and accept only exits above it — epochs
+  // strictly increase, so that is exactly "the life we are waiting for died".
   const transport =
-    opts.transport ?? new LocalTransport(opts.agentId, { observeAnyEpoch: true });
+    opts.transport ??
+    new LocalTransport(opts.agentId, { observeExitsAfter: () => ptyLiveEpoch(opts.agentId) });
   const setTimer = opts.setTimer ?? ((fn, ms) => setTimeout(fn, ms));
   const clearTimer = opts.clearTimer ?? ((h) => clearTimeout(h as ReturnType<typeof setTimeout>));
 

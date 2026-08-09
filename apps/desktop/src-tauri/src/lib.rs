@@ -678,6 +678,7 @@ pub fn run() {
             pty::pty_resize,
             pty::pty_kill,
             pty::pty_live_sessions,
+            pty::pty_live_epoch,
             // The fleet-resurrection mount. The ledger's commands are thin wrappers over the pure
             // `*_at` cores in agent_life.rs; `revival_due` is a read of a list the revival thread
             // has already computed.

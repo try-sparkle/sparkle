@@ -248,6 +248,20 @@ impl PtyManager {
         self.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
     }
 
+    /// The epoch of the session live under `id`, or `0` (the never-minted sentinel) when there is
+    /// none. This is the ONE read of `PtySession::epoch`: the reader thread stamps its own copy on
+    /// `pty:exit` rather than looking the session up, precisely because by then the map may already
+    /// hold the successor — so the stored field exists to answer this question, from outside, about
+    /// the life that is live RIGHT NOW.
+    pub fn live_epoch(&self, id: &str) -> u64 {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .map(|s| s.epoch)
+            .unwrap_or(0)
+    }
+
     /// `(session id, root pid)` for every live session that reported a pid.
     ///
     /// The session id IS the agent id (`pty:output:<agentId>`), so the memory watchdog needs no
@@ -1052,6 +1066,26 @@ pub fn pty_live_sessions(manager: State<PtyManager>) -> Vec<String> {
     manager.session_ids()
 }
 
+/// The epoch of the PTY currently live under `id`, or `0` when none is — the sentinel
+/// [`next_pty_epoch`] reserves and never mints.
+///
+/// A LOWER BOUND for an OBSERVER, and that is the only thing it is for. A caller that is about to
+/// cause a re-spawn and then wait for the new PTY cannot identify the life it is waiting for (the
+/// epoch does not exist yet), but it CAN identify every life that already exists — and since epochs
+/// strictly increase, "exited with an epoch greater than the one live when I started watching" is
+/// exactly "the life I am waiting for died". Without that floor the observer accepts the death of
+/// the PREDECESSOR its own spawn is tearing down, which is the misreading the epoch exists to close,
+/// merely relocated into the waiter (`agentDemotion/live.ts`).
+///
+/// `0` on an unknown id is deliberately not an error: "nothing is live" is a real, useful answer —
+/// it means every exit that follows belongs to a life spawned after the caller started watching.
+///
+/// Sync for the same reason as `pty_live_sessions`: a mutex lock and a `u64` copy, no I/O.
+#[tauri::command]
+pub fn pty_live_epoch(id: String, manager: State<PtyManager>) -> u64 {
+    manager.live_epoch(&id)
+}
+
 #[cfg(test)]
 mod epoch_tests {
     use super::{next_pty_epoch, PtyEnd};
@@ -1570,6 +1604,21 @@ mod tests {
             mgr.session_ids(),
             vec!["agent-mid-spawn".to_string()],
             "a live session with no pid is still a live session"
+        );
+
+        // The observer's FLOOR. It must report the epoch of the session that is live RIGHT NOW, and
+        // must answer 0 — never a live session's epoch — for an id with nothing under it: a waiter
+        // told the wrong floor either ignores the death it is waiting for or accepts a predecessor's.
+        let live = mgr.sessions.lock().unwrap().get("agent-mid-spawn").map(|s| s.epoch).unwrap();
+        assert_eq!(
+            mgr.live_epoch("agent-mid-spawn"),
+            live,
+            "live_epoch must report the epoch of the session actually in the map"
+        );
+        assert_eq!(
+            mgr.live_epoch("no-such-agent"),
+            0,
+            "an id with no session reads as the never-minted sentinel, not as some other session"
         );
 
         let removed = mgr.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove("agent-mid-spawn");

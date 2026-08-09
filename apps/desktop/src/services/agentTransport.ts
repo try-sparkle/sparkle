@@ -103,6 +103,11 @@ export interface AgentTransport {
  * stash a readiness promise, and have `spawn` await it — preserving the pre-refactor guarantee that
  * the output listener is registered BEFORE the PTY spawns (so no early output is dropped).
  */
+/** "No PTY was ever bound." The epoch pty.rs reserves and never mints (`next_pty_epoch` starts at 1),
+ *  so it is safe to settle a spawn's waiters with it: they wake, compare, and match nothing. That
+ *  matters because leaving them unsettled is not neutral — it is an exit path that hangs forever. */
+const NO_EPOCH = 0;
+
 export class LocalTransport implements AgentTransport {
   /** The agent id this transport is bound to — the id every pty.ts verb and both global event
    *  channels are keyed by. */
@@ -138,31 +143,50 @@ export class LocalTransport implements AgentTransport {
   private epochKnown!: Promise<number>;
   private markSpawned!: (epoch: number) => void;
 
-  /**
-   * OBSERVER MODE — this transport watches an agent whose PTY someone ELSE spawned.
-   *
-   * The epoch filter above answers "is this MY PTY's death", and it can only answer it for a
-   * transport that spawned. A pure observer never calls `spawn`, so its epoch would stay `null`
-   * forever and EVERY exit would sit deferred on a promise that never resolves — the exit silently
-   * unreportable rather than merely unattributable. That is not hypothetical: `awaitLocalFirstFrame`
-   * (agentDemotion/live.ts) exists to fail demotion in milliseconds when the local PTY dies before
-   * its first frame, and an inert exit path turns that into a full first-frame timeout blaming the
-   * deadline, holding a billing sandbox open for the wait.
-   *
-   * So an observer keeps the pre-epoch, id-only semantics DELIBERATELY: it has no life of its own to
-   * be confused about, and "some life of this agent exited" is exactly the fact it wants.
-   */
-  private readonly observeAnyEpoch: boolean;
+  /** Has ANY spawn attempt begun on this instance? Distinct from `epoch !== null`, which only says a
+   *  spawn SUCCEEDED — a failed attempt has still consumed its `epochKnown`, so the next one must
+   *  re-arm or it would publish into an already-settled promise and never reach its waiters. */
+  private spawnStarted = false;
 
-  constructor(id: string, opts: { observeAnyEpoch?: boolean } = {}) {
+  /**
+   * OBSERVER MODE — this transport watches an agent whose PTY someone ELSE spawns, and this is the
+   * FLOOR that separates the life it is waiting for from the life being replaced.
+   *
+   * The epoch filter above answers "is this MY PTY's death", and can only answer it for a transport
+   * that spawned. A pure observer never calls `spawn`, so its epoch stays `null` forever and every
+   * exit sits deferred on a promise nothing resolves — its exit path not merely unattributable but
+   * permanently INERT. `awaitLocalFirstFrame` (agentDemotion/live.ts) is that consumer, and failing
+   * fast on the PTY's death is its whole reason to watch: inert, it runs out a 60s deadline and
+   * blames the timeout while a billing sandbox stays open.
+   *
+   * But plain id-only semantics are wrong in the other direction, and dangerously so. The waiter
+   * subscribes BEFORE the spawn it is waiting on, and that spawn is a restart — its first act is to
+   * tear the existing PTY down. The predecessor's exit "arrives whenever the child actually finishes
+   * dying", routinely after we subscribed, so an unfiltered observer rejects on the death of the PTY
+   * its own spawn just killed, kills the healthy replacement, and reports demotion as failed. That is
+   * the original misreading relocated into the waiter.
+   *
+   * The floor closes both: sample the epoch that is live BEFORE triggering the spawn, then accept
+   * only exits ABOVE it. Epochs strictly increase, so "above the floor" is exactly "a life that
+   * began after I started watching" — the one we are waiting for. Sampling happens in the
+   * constructor, which is the earliest moment available and, for the demotion gate, before the
+   * spawn step runs.
+   */
+  private readonly exitFloor: Promise<number> | null;
+
+  constructor(id: string, opts: { observeExitsAfter?: () => Promise<number> } = {}) {
     this.id = id;
-    this.observeAnyEpoch = opts.observeAnyEpoch === true;
+    // Fail OPEN, to the pre-floor id-only behavior. The query is an in-memory map read that can
+    // realistically only fail during teardown, and the two failure directions are not symmetric: a
+    // floor of `Infinity` would resurrect the inert exit path this mode exists to remove, whereas a
+    // floor of 0 degrades to the semantics this consumer had before the epoch existed at all.
+    this.exitFloor = opts.observeExitsAfter ? opts.observeExitsAfter().catch(() => 0) : null;
     this.armEpoch();
   }
 
-  /** Fresh, unresolved `epochKnown` for the NEXT life. Called once at construction and again at the
-   *  head of every re-spawn, so a second `spawn` on one instance cannot be judged against the first
-   *  life's epoch (which would accept the predecessor's late exit — the very bug the epoch closes). */
+  /** Fresh, unresolved `epochKnown` for the NEXT life, and the resolver that settles it. Called once
+   *  at construction and again at the head of every spawn after the first, so a spawn can never
+   *  publish into the promise a PREVIOUS life's waiters are holding. */
   private armEpoch(): void {
     this.epochKnown = new Promise<number>((resolve) => {
       this.markSpawned = resolve;
@@ -200,10 +224,14 @@ export class LocalTransport implements AgentTransport {
     // our death and is dropped silently: some other binding owns it, or owned it.
     const p = onPtyExit((e) => {
       if (e.id !== this.id) return;
-      // An OBSERVER owns no PTY, so it has no epoch to compare and nothing to be confused about —
-      // see `observeAnyEpoch`. Judging it by the epoch would make its exit path permanently inert.
-      if (this.observeAnyEpoch) {
-        cb({});
+      // An OBSERVER owns no PTY of its own, so it is judged against the FLOOR it sampled before the
+      // spawn it is waiting on — see `exitFloor`. Judging it by `epoch` instead would make its exit
+      // path permanently inert; judging it by the id alone would let it accept the death of the PTY
+      // that spawn is replacing.
+      if (this.exitFloor) {
+        void this.exitFloor.then((floor) => {
+          if (!cancelled && e.epoch > floor) cb({});
+        });
         return;
       }
       if (this.epoch !== null) {
@@ -241,28 +269,57 @@ export class LocalTransport implements AgentTransport {
     // reintroduced one instance down. (Pinned by "a re-spawn on the SAME transport…"; moving this
     // below the await turns that test red.)
     //
-    // Only on a re-spawn: on the FIRST spawn `epochKnown` may already carry deferred waiters (an
-    // exit that beat the spawn back to us), and re-arming would strand them on a promise that
-    // nothing ever resolves.
-    if (this.epoch !== null) {
-      this.epoch = null;
-      this.armEpoch();
+    // Only after the FIRST attempt: on the first spawn `epochKnown` may already carry deferred
+    // waiters (an exit that beat the spawn back to us), and re-arming would strand them on a promise
+    // nothing ever resolves. Keyed on "an attempt has STARTED", not on "a spawn succeeded" — a
+    // failed attempt has still consumed its resolver, so the next one needs a fresh promise.
+    if (this.spawnStarted) this.armEpoch();
+    this.spawnStarted = true;
+    // The life we owned going in. A spawn that FAILS must put it back (see the catch): the PTY we
+    // were replacing is only replaced if the replacement actually happened, and until then its exit
+    // is still ours to report.
+    const previous = this.epoch;
+    this.epoch = null;
+    // The resolver for THIS attempt's promise, captured before any await — so an attempt that is
+    // superseded mid-flight settles the waiters IT collected rather than a later attempt's.
+    const settle = this.markSpawned;
+    try {
+      // Drain (splice) rather than re-read so a later re-spawn doesn't re-await already-settled ones.
+      await Promise.all(this.ready.splice(0));
+      const epoch = await spawnPty({
+        id: this.id,
+        command: cmd.command,
+        args: cmd.args,
+        cwd: cmd.cwd,
+        cols: cmd.cols,
+        rows: cmd.rows,
+      });
+      // BIND TO THE PTY WE JUST GOT — or to the HIGHEST epoch seen, if two spawns overlapped.
+      //
+      // Highest wins, rather than last-caller wins, and the difference is not cosmetic: which of two
+      // in-flight `spawnPty` calls reaches Rust first is not knowable from here (each awaits a
+      // different number of microtasks before it even invokes), so JS call order cannot say which
+      // PTY is live. Rust's counter can: it mints in the order it actually creates PTYs, and
+      // `sessions.insert` replaces, so the HIGHEST epoch minted for this id IS the session that
+      // survived. A loser still settles its own waiters — against the winner, so they judge exits by
+      // the life that is actually live.
+      if (epoch > (this.epoch ?? NO_EPOCH)) this.epoch = epoch;
+      // Settled after the assignment so a subscriber woken by `epochKnown` reads the same value the
+      // synchronous path reads.
+      settle(this.epoch ?? NO_EPOCH);
+    } catch (err) {
+      // A SPAWN THAT FAILED IS A NO-OP, NOT A TEARDOWN. Two things go wrong if this is skipped.
+      //
+      // Left unsettled, `epochKnown` never resolves and every later exit for this agent hangs on it
+      // forever — the permanently inert exit path, reintroduced for a spawner that reported exits
+      // fine before. And left cleared, `epoch` says we own nothing while the PREVIOUS PTY is very
+      // possibly still alive: `spawnPty` can reject before Rust ever replaces the session, so its
+      // exit is still ours to report. So restore what we had and settle the waiters with it —
+      // unless an overlapping spawn bound a newer life in the meantime, which wins on epoch order.
+      if ((previous ?? NO_EPOCH) > (this.epoch ?? NO_EPOCH)) this.epoch = previous;
+      settle(this.epoch ?? NO_EPOCH);
+      throw err;
     }
-    // Drain (splice) rather than re-read so a later re-spawn doesn't re-await already-settled ones.
-    await Promise.all(this.ready.splice(0));
-    const epoch = await spawnPty({
-      id: this.id,
-      command: cmd.command,
-      args: cmd.args,
-      cwd: cmd.cwd,
-      cols: cmd.cols,
-      rows: cmd.rows,
-    });
-    // BIND TO THE PTY WE JUST GOT. Everything after this point can tell our own exit from the exit
-    // of whatever session we replaced. Set before the promise is resolved so a subscriber woken by
-    // `epochKnown` reads the same value the synchronous path reads.
-    this.epoch = epoch;
-    this.markSpawned(epoch);
   }
 
   write(data: string): void {

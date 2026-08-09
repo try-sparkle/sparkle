@@ -10,8 +10,10 @@ import { awaitLocalFirstFrameLive } from "./live";
 // that omits `transport` exercises the real `new LocalTransport(id, { observeAnyEpoch: true })`.
 // Every other test here injects a fake transport, which is what let a change to the DEFAULT go
 // unnoticed: the line that supplies it was covered by nothing.
-const { exitRef } = vi.hoisted(() => ({
+const { exitRef, liveEpochRef } = vi.hoisted(() => ({
   exitRef: { cb: null as null | ((e: { id: string; epoch: number }) => void) },
+  // The epoch live when the gate starts watching — the PTY its own spawn is about to replace.
+  liveEpochRef: { value: 7 },
 }));
 vi.mock("../../pty", () => ({
   spawnPty: vi.fn(() => Promise.resolve(1)),
@@ -26,6 +28,7 @@ vi.mock("../../pty", () => ({
     return Promise.resolve(() => {});
   }),
   ignorePtyGone: vi.fn(),
+  ptyLiveEpoch: vi.fn(() => Promise.resolve(liveEpochRef.value)),
 }));
 
 /** A transport whose output/exit can be driven, recording every unlisten. */
@@ -176,9 +179,38 @@ describe("awaitLocalFirstFrameLive", () => {
     });
     // The listener registers over an async `listen()`; let it land before driving the channel.
     await vi.waitFor(() => expect(exitRef.cb).not.toBeNull());
-    // An epoch this observer could not possibly have spawned — someone else's PTY, same agent.
-    exitRef.cb?.({ id: "agent-1", epoch: 4242 });
+    // A life spawned AFTER we started watching (the floor is 7) — the one we are waiting for.
+    exitRef.cb?.({ id: "agent-1", epoch: 8 });
     await expect(p).rejects.toThrow(/exited before it produced any output/);
+  });
+
+  // The other direction, through the same default transport. This gate subscribes BEFORE the spawn
+  // it waits on, and that spawn is a restart that tears the existing PTY down — so the predecessor's
+  // late exit lands with us listening. Accepting it would reject the wait, stand down a HEALTHY
+  // newly-spawned local agent, and tell the user demotion failed.
+  it("does not reject on the exit of the PTY its own spawn is replacing", async () => {
+    const timers = fakeTimers();
+    const settled: string[] = [];
+    const p = awaitLocalFirstFrameLive({
+      agentId: "agent-1",
+      timeoutMs: 60_000,
+      setTimer: timers.setTimer,
+      clearTimer: timers.clearTimer,
+    });
+    p.then(
+      () => settled.push("resolved"),
+      () => settled.push("rejected"),
+    );
+    await vi.waitFor(() => expect(exitRef.cb).not.toBeNull());
+    exitRef.cb?.({ id: "agent-1", epoch: liveEpochRef.value }); // the doomed predecessor
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(settled).toEqual([]);
+    // …and the deadline is still armed, so the wait is genuinely still waiting.
+    expect(timers.pendingCount).toBe(1);
+    timers.fireAll();
+    await expect(p).rejects.toThrow(/within 60000ms/);
   });
 
   it("never kills or detaches the transport it is watching", async () => {

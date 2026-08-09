@@ -59,6 +59,18 @@ export function spawnPty(opts: SpawnPtyOptions): Promise<number> {
   });
 }
 
+/** The epoch of the PTY live under `id` right now, or `0` when none is (the sentinel Rust reserves
+ *  and never mints).
+ *
+ *  A LOWER BOUND for an OBSERVER — the one thing it is for. A caller about to cause a re-spawn and
+ *  then wait for the NEW PTY cannot name the life it is waiting for (that epoch does not exist yet),
+ *  but it can name every life that already exists; epochs strictly increase, so "exited with an
+ *  epoch above the floor" is exactly "the life I was waiting for died". Sample it BEFORE triggering
+ *  the spawn, or the floor is the very life you are about to wait on. */
+export function ptyLiveEpoch(id: string): Promise<number> {
+  return invoke("pty_live_epoch", { id });
+}
+
 // A PTY can exit (and have its session reaped on the Rust side) a beat before a stray
 // keystroke or a ResizeObserver-driven resize reaches it — pty_write / pty_resize then
 // return Err("no such pty"). Callers fire these and forget, so an un-caught rejection would

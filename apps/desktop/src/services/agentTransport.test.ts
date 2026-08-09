@@ -260,23 +260,116 @@ describe("LocalTransport delegation to pty.ts", () => {
     expect(exits).toEqual([{}]);
   });
 
+  // A SPAWN THAT FAILS IS A NO-OP, NOT A TEARDOWN. `spawnPty` can reject before Rust ever replaces
+  // the session, so the PREVIOUS PTY is very possibly still alive — and it is still this transport's
+  // to report. Dropping the binding on a failed attempt makes that life's death unreportable
+  // forever: `epoch` is null and `epochKnown` is a fresh promise nothing will ever settle, so every
+  // later exit parks on it. That is the inert exit path, reintroduced for a spawner.
+  it("a failed re-spawn keeps the life it failed to replace", async () => {
+    const t = new LocalTransport("agent-1");
+    const exits: unknown[] = [];
+    t.onExit((e) => exits.push(e));
+    await t.spawn({ command: "claude", args: [], cols: 80, rows: 24 });
+    const firstLife = epochRef.last;
+
+    spawnPty.mockRejectedValueOnce(new Error("no such command"));
+    await expect(t.spawn({ command: "claude", args: [], cols: 80, rows: 24 })).rejects.toThrow(
+      /no such command/,
+    );
+
+    // The PTY we failed to replace is still ours, and its death still reports.
+    exitRef.cb?.({ id: "agent-1", epoch: firstLife });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(exits).toEqual([{}]);
+
+    // …and a life that is not ours still does not, so this is not "report everything".
+    exitRef.cb?.({ id: "agent-1", epoch: firstLife + 99 });
+    await Promise.resolve();
+    expect(exits).toEqual([{}]);
+
+    // …and the transport is still usable: a later successful spawn binds and reports its own exit.
+    await t.spawn({ command: "claude", args: [], cols: 80, rows: 24 });
+    exitRef.cb?.({ id: "agent-1", epoch: epochRef.last });
+    expect(exits).toEqual([{}, {}]);
+  });
+
+  // Two spawns in flight at once. The transport must end up owning the life Rust actually kept —
+  // the HIGHEST epoch, since Rust mints in the order it creates PTYs and `sessions.insert` replaces.
+  // Which of the two `spawnPty` calls reaches Rust first is not knowable from JS (they await
+  // different numbers of microtasks), so a rule based on caller order would bind to a dead PTY half
+  // the time and then accept the live one's exit as a stranger's — or its own predecessor's as its.
+  it("overlapping spawns leave the transport owning the life Rust kept", async () => {
+    const t = new LocalTransport("agent-1");
+    const exits: unknown[] = [];
+    t.onExit((e) => exits.push(e));
+    await Promise.all([
+      t.spawn({ command: "claude", args: [], cols: 80, rows: 24 }),
+      t.spawn({ command: "claude", args: [], cols: 80, rows: 24 }),
+    ]);
+    const survivor = epochRef.last; // the last epoch Rust minted for this id
+    expect(survivor).toBeGreaterThan(1);
+
+    // The life that lost the insert race is not ours, whichever call produced it.
+    exitRef.cb?.({ id: "agent-1", epoch: survivor - 1 });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(exits).toEqual([]);
+
+    exitRef.cb?.({ id: "agent-1", epoch: survivor });
+    expect(exits).toEqual([{}]);
+  });
+
   // An OBSERVER (agentDemotion's first-frame gate) watches a PTY it did not spawn, so it has no
   // epoch of its own. Under the spawner's filter its exit path is not merely unattributable but
   // permanently INERT — every exit defers on a promise nothing resolves — which turns "the local
   // agent died before its first frame" into a full first-frame timeout blaming the deadline.
-  it("an observer transport reports an exit for a PTY it never spawned", () => {
-    const t = new LocalTransport("agent-1", { observeAnyEpoch: true });
+  it("an observer reports the exit of a life spawned after it started watching", async () => {
+    const t = new LocalTransport("agent-1", { observeExitsAfter: () => Promise.resolve(7) });
     const exits: unknown[] = [];
     t.onExit((e) => exits.push(e));
-    exitRef.cb?.({ id: "agent-1", epoch: 4242 });
+    exitRef.cb?.({ id: "agent-1", epoch: 8 });
+    await Promise.resolve();
+    await Promise.resolve();
     expect(exits).toEqual([{}]);
   });
 
-  it("an observer transport still filters by agent id", () => {
-    const t = new LocalTransport("agent-1", { observeAnyEpoch: true });
+  // THE OTHER DIRECTION, and the dangerous one. The gate subscribes BEFORE the spawn it waits on,
+  // and that spawn is a restart that tears the existing PTY down — so the predecessor's late exit
+  // arrives with the gate listening. Accepting it stands down a HEALTHY replacement and reports the
+  // demotion as failed: the original misattribution, relocated into the waiter.
+  it("an observer ignores the exit of the life its own spawn is replacing", async () => {
+    const t = new LocalTransport("agent-1", { observeExitsAfter: () => Promise.resolve(7) });
+    const exits: unknown[] = [];
+    t.onExit((e) => exits.push(e));
+    exitRef.cb?.({ id: "agent-1", epoch: 7 }); // the floor itself — the doomed predecessor
+    exitRef.cb?.({ id: "agent-1", epoch: 6 }); // and anything older
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(exits).toEqual([]);
+  });
+
+  // Fail OPEN, to the pre-floor id-only behavior: a floor of Infinity would resurrect the inert exit
+  // path this mode exists to remove, which is the worse of the two failure directions.
+  it("an observer whose floor query fails degrades to id-only rather than going inert", async () => {
+    const t = new LocalTransport("agent-1", {
+      observeExitsAfter: () => Promise.reject(new Error("no such pty host")),
+    });
+    const exits: unknown[] = [];
+    t.onExit((e) => exits.push(e));
+    exitRef.cb?.({ id: "agent-1", epoch: 3 });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(exits).toEqual([{}]);
+  });
+
+  it("an observer still filters by agent id", async () => {
+    const t = new LocalTransport("agent-1", { observeExitsAfter: () => Promise.resolve(0) });
     const exits: unknown[] = [];
     t.onExit((e) => exits.push(e));
     exitRef.cb?.({ id: "other-agent", epoch: 4242 });
+    await Promise.resolve();
+    await Promise.resolve();
     expect(exits).toEqual([]);
   });
 
