@@ -371,29 +371,11 @@ function RotationBanner({
   );
 }
 
-/** What a new Max account actually needs, in the order it happens. Four steps because the third one
- *  — the browser `claude login` under the NEW config dir — is the one that gets skipped, and skipping
- *  it leaves a registered row that looks exactly like a working account. */
-function AddAccountSteps() {
-  const steps = [
-    "Click “+ Add account” and give it a nickname (this is just a label for you).",
-    "Sparkle creates a separate Claude config folder for it. Your existing logins are untouched.",
-    "The sign-in window opens straight away — complete the normal Claude login in your browser. It signs in under the new folder, so it does not replace your other accounts.",
-    "The row then shows the email you signed in as. If it still reads “Not signed in”, the login never finished — click “Finish sign-in” on that row.",
-  ];
-  return (
-    <div style={{ ...card, fontSize: 12, color: C.muted, lineHeight: 1.5 }}>
-      <div style={{ fontWeight: 600, color: C.cream }}>Adding a Claude account takes two minutes</div>
-      <ol data-testid="add-account-steps" style={{ margin: "6px 0 0", paddingLeft: 18 }}>
-        {steps.map((s) => (
-          <li key={s} style={{ marginTop: 2 }}>
-            {s}
-          </li>
-        ))}
-      </ol>
-    </div>
-  );
-}
+// The "Adding a Claude account takes two minutes" step list and the "Each account is a separate
+// Claude login…" paragraph both lived here. Both are DELETED at the founder's instruction
+// (sparkle-cjpte): the controls carry the meaning now. "+ Add account", the account rows, the
+// per-row "Finish sign-in" and the usage bars are all unchanged — only the prose that described
+// them is gone.
 
 /** Whether this account has a real Claude login. Derived from accountUuid OR email: the Rust
  *  `AccountIdentity` allows those independently, and `duplicateAccountGroups` matches on the
@@ -638,8 +620,15 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
       />
 
       {/* AC8 — every usable account is out of room. Deliberately does NOT claim spawns are blocked:
-          `pickAccount` still returns a least-bad account rather than refusing, so promising a block
-          would be false, and so would implying everything is fine. */}
+          `pickAccount` still returns an account rather than refusing, so promising a block would be
+          false, and so would implying everything is fine.
+
+          ON THE WORDING: the sentence below is the founder's, chosen to settle a contradiction
+          between two older strings (sparkle-cjpte). `pickAccount` IS lowest-usage in the general
+          case — see accountSelection.ts — but in THIS branch, where every account is already at its
+          limit, the pick is the least-bad fallback rather than a genuinely least-used one. The copy
+          is deliberate and is not to be re-voiced here; this note exists so the next reader knows
+          the nuance is known rather than overlooked. */}
       {outlook.allAtLimit && (
         <div data-testid="all-at-limit-banner" role="alert" style={noticeCard(C.dangerInk)}>
           <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, fontWeight: 600 }}>
@@ -653,10 +642,7 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
                 : ` The first frees up at ${clockTime(outlook.earliestReset)}.`
               : " No reset time has been reported yet."}
           </div>
-          <div style={{ marginTop: 4 }}>
-            Sparkle keeps spawning — new agents go to the least-bad account — so work carries on, but
-            it may hit the wall straight away.
-          </div>
+          <div style={{ marginTop: 4 }}>Sparkle spawns new agents in the least-used account.</div>
         </div>
       )}
 
@@ -685,14 +671,6 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
           </div>
         </div>
       ))}
-
-      <p style={{ fontSize: 12, color: C.muted, marginTop: 0, lineHeight: 1.4 }}>
-        Each account is a separate Claude login. New jobs run under the least-used account. Bars
-        show each account&apos;s usage relative to your busiest one. Sparkle never sees your Claude
-        credentials.
-      </p>
-
-      <AddAccountSteps />
 
       {adding && (
         <div style={{ ...card, display: "flex", gap: 8, alignItems: "center" }}>

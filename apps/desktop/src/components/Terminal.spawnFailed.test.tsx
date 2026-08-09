@@ -14,7 +14,7 @@
 // names, asserting the caller's input instead of the side effect. Verified: with the invocation
 // deleted, 613 tests passed. These two assert the CALL, and its `disposed` guard.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render } from "@testing-library/react";
+import { act, cleanup, render } from "@testing-library/react";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
@@ -262,6 +262,52 @@ describe("Terminal — a rejected spawn reports OUT, not just to its own overlay
     // …and still declined to call it a launch failure, because the spawn had already returned.
     expect(onSpawnFailed).not.toHaveBeenCalled();
     debugSpy.mockRestore();
+  });
+
+  // THE REASON HAS TO REACH THE PANE — asserted at RUNTIME, on the rendered DOM (sparkle-mahbf).
+  //
+  // Why here and not in `terminalOverlay.test.ts`: that file tests the pure resolver, so deleting
+  // `setSpawnError(errText(e))` from the catch — or deleting the `overlay.detail` JSX entirely —
+  // leaves the whole desktop suite green while fully restoring the swallowed-reason bug. That is the
+  // same vacuity this file's header was written about, one layer up. These arms assert the wiring.
+  it("renders the REAL spawn error under the failure message, not just 'Couldn't start the agent.'", async () => {
+    const reason = "pty_spawn: cwd is outside the managed worktrees directory";
+    spawnFail.promise = Promise.reject(new Error(reason));
+    spawnFail.promise.catch(() => {});
+    const { container } = render(<Terminal {...baseProps} />);
+    // act(): these arms assert the rendered DOM, so React must commit the catch's setState. The
+    // pre-existing arms only read mock calls, which is why the bare `flush()` sufficed for them.
+    await act(async () => {
+      await flush();
+    });
+
+    const detail = container.querySelector('[data-testid="terminal-spawn-detail"]');
+    expect(detail).not.toBeNull();
+    expect(detail!.textContent).toContain(reason);
+    // The retry stays reachable alongside it — the detail must ADD to the affordance, not replace it.
+    expect(container.textContent).toContain("Couldn't start the agent.");
+    expect(container.textContent).toContain("Start again");
+
+    // …and the detail is BOUNDED, so a long error cannot push the button out of the pane. jsdom has
+    // no layout engine, so this pins the declaration (which it can see) rather than a measured
+    // height (which it always reports as 0) — see docs/jsdom-test-caveats.md.
+    const style = (detail as HTMLElement).style;
+    expect(style.maxHeight).not.toBe("");
+    expect(style.overflowY).toBe("auto");
+  });
+
+  it("renders no detail element at all when the rejection carries no message", async () => {
+    // `new Error("")` → errText returns "" → the overlay must omit `detail` rather than paint an
+    // empty line under the message. The positive arm above is what stops this passing vacuously.
+    spawnFail.promise = Promise.reject(new Error(""));
+    spawnFail.promise.catch(() => {});
+    const { container } = render(<Terminal {...baseProps} />);
+    await act(async () => {
+      await flush();
+    });
+
+    expect(container.textContent).toContain("Couldn't start the agent.");
+    expect(container.querySelector('[data-testid="terminal-spawn-detail"]')).toBeNull();
   });
 
   // THE SUCCESS SIGNAL MUST NOT SIT BEHIND THE TAIL THAT CAN THROW. Once `transport.spawn` returns,

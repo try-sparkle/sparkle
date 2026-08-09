@@ -214,7 +214,14 @@ export function ClaudeSignIn({
           projectRootPath=""
           command={SHELL}
           args={["-l", "-c", exec]}
-          cwd={configDir}
+          // NO cwd, DELIBERATELY — passing one here made every named-account login impossible.
+          // `pty_spawn` requires a supplied cwd to resolve inside `<app_data>/worktrees`, and an
+          // account's config dir is `<app_data>/accounts/<id>` — a SIBLING of it. So `cwd={configDir}`
+          // was rejected on every attempt ("cwd is outside the managed worktrees directory"), the pane
+          // painted "Couldn't start the agent.", and its "Start again" re-ran the same doomed spawn.
+          // The account is targeted by CLAUDE_CONFIG_DIR inside `exec`; the cwd never carried that and
+          // was pure liability. A null cwd is the contract pty.rs documents for the login flows — it
+          // falls back to the managed app-data dir. See sparkle-mahbf.
           active
           onStatus={() => {}}
           onExit={handleExit}

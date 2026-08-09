@@ -524,15 +524,33 @@ describe("rotation-readiness banner", () => {
     expect(screen.getByLabelText("New account nickname")).toBeTruthy();
   });
 
-  it("shows the numbered steps for adding an account", async () => {
+  // THE PROSE IS GONE, THE CONTROLS ARE NOT (sparkle-cjpte). The founder cut the "Adding a Claude
+  // account takes two minutes" step list and the "Each account is a separate Claude login…"
+  // paragraph: the controls carry the meaning now. That makes this a PAIRED test on purpose —
+  // asserting only the absence would stay green if the controls the copy used to name disappeared
+  // with it, which is the actual risk when you delete the text that explains a screen.
+  it("drops the explanatory prose but keeps the controls it used to describe", async () => {
     const deps = makeDeps([acct("a")], [], [signedInAs("a", "one@example.com")]);
+    const { container } = render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    // Wait for a real control rather than the deleted block, so this cannot pass by rendering nothing.
+    expect(await screen.findByRole("button", { name: /\+ Add account/ })).toBeTruthy();
+
+    // Gone: the step list and the paragraph, asserted on the RENDERED document.
+    expect(screen.queryByTestId("add-account-steps")).toBeNull();
+    const text = container.textContent ?? "";
+    expect(text).not.toContain("Adding a Claude account takes two minutes");
+    expect(text).not.toContain("Each account is a separate Claude login");
+    expect(text).not.toContain("Bars show each account");
+    expect(text).not.toContain("never sees your Claude credentials");
+  });
+
+  it("still reaches the per-row Finish sign-in control the deleted copy pointed at", async () => {
+    // An account with a config dir but no identity = registered, never logged in. That is the exact
+    // row the removed step 4 told the user to click "Finish sign-in" on.
+    const deps = makeDeps([acct("a"), acct("dead")], [], [signedInAs("a", "one@example.com"), neverLoggedIn("dead")]);
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
-    const steps = await screen.findByTestId("add-account-steps");
-    expect(steps.querySelectorAll("li")).toHaveLength(4);
-    // The third step — the browser login under the NEW config dir — is the one that gets skipped,
-    // and the fourth is how you tell that it was.
-    expect(steps.textContent).toContain("browser");
-    expect(steps.textContent).toContain("Finish sign-in");
+    const finish = await screen.findAllByRole("button", { name: /Finish sign-in/ });
+    expect(finish.length).toBeGreaterThan(0);
   });
 });
 
@@ -634,8 +652,11 @@ describe("AC8 — every account at its limit", () => {
     // The EARLIER instant, not merely "a" instant — that ordering is the whole content of AC8.
     expect(banner.textContent).toContain(`The first frees up at ${clock(soon)}`);
     expect(banner.textContent).not.toContain(clock(later));
-    // MUST NOT promise spawns are blocked: `pickAccount` still returns a least-bad account.
-    expect(banner.textContent).toContain("work carries on");
+    // MUST NOT promise spawns are blocked: `pickAccount` still returns an account rather than
+    // refusing. The wording is the founder's (sparkle-cjpte) — it replaced "new agents go to the
+    // least-bad account — so work carries on" — but the CONSTRAINT it has to satisfy is unchanged,
+    // which is why the negative assertion below outlived the sentence above it.
+    expect(banner.textContent).toContain("Sparkle spawns new agents in the least-used account.");
     expect(banner.textContent).not.toMatch(/blocked|will not spawn|stops spawning/i);
   });
 

@@ -18,11 +18,11 @@ vi.mock("../preflight", () => ({
 
 // The PTY is the one thing we cannot run here. Expose its onExit so a test can fire the exact edge
 // the confirm window hangs off, and record the argv so the `auth login` fix is pinned end to end.
-let lastSpawn: { args: string[] } | null = null;
+let lastSpawn: { args: string[]; cwd?: string } | null = null;
 let fireExit: (() => void) | null = null;
 vi.mock("./Terminal", () => ({
-  Terminal: ({ args, onExit }: { args: string[]; onExit?: () => void }) => {
-    lastSpawn = { args };
+  Terminal: ({ args, cwd, onExit }: { args: string[]; cwd?: string; onExit?: () => void }) => {
+    lastSpawn = { args, cwd };
     fireExit = onExit ?? null;
     return <div data-testid="pty" />;
   },
@@ -167,5 +167,27 @@ describe("ClaudeSignIn", () => {
       fireExit?.();
     });
     await waitFor(() => expect(checkClaudeAuthStatus).toHaveBeenCalledWith("/acc/dir"));
+  });
+
+  // THE ADD-AN-ACCOUNT LOGIN COULD NEVER SPAWN (sparkle-mahbf).
+  //
+  // `pty_spawn` refuses any supplied `cwd` that does not resolve INSIDE `<app_data>/worktrees`
+  // ("pty_spawn: cwd is outside the managed worktrees directory" — see validate_spawn_inner in
+  // pty.rs). An account's config dir is `<app_data>/accounts/<id>`, a SIBLING of `worktrees`, so
+  // handing it over as the cwd made every named-account login a guaranteed rejection: the pane
+  // painted "Couldn't start the agent." and "Start again" re-ran the identical doomed spawn, which
+  // is exactly the "sign-in page does nothing" the founder hit. The machine's own `~/.claude` login
+  // passes no configDir, so it kept working — which is why only ADDING an account was broken.
+  //
+  // The config dir is targeted by `CLAUDE_CONFIG_DIR` in the exec string (asserted above), never by
+  // the cwd, so there is nothing to replace it with: a null cwd is the contract pty.rs documents for
+  // "the pre-worktree `claude login` flows", and it falls back to the managed app-data dir.
+  it("never hands the account config dir to the PTY as its cwd", async () => {
+    render(<ClaudeSignIn configDir="/acc/dir" onSignedIn={vi.fn()} />);
+    await screen.findByTestId("pty");
+    // The account is still targeted — by env, which is the mechanism that actually works.
+    expect(lastSpawn?.args.at(-1)).toContain("CLAUDE_CONFIG_DIR='/acc/dir'");
+    // …and NOT by a cwd the spawn guard will reject.
+    expect(lastSpawn?.cwd).toBeUndefined();
   });
 });

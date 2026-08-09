@@ -1571,6 +1571,33 @@ mod tests {
         );
     }
 
+    /// AN ACCOUNT CONFIG DIR IS NOT A LEGAL cwd — this is the mechanism behind sparkle-mahbf.
+    ///
+    /// `<app_data>/accounts/<id>` is a SIBLING of `<app_data>/worktrees`, not a child, so handing it
+    /// to `pty_spawn` as the cwd is refused every single time. The embedded `claude auth login` did
+    /// exactly that, which is why "Add account" could never open a login pane and its "Start again"
+    /// re-ran an identically doomed spawn. The frontend fix is to pass NO cwd (the account is
+    /// targeted by `CLAUDE_CONFIG_DIR`); this test pins the constraint that makes that the only
+    /// correct answer, so nobody "helpfully" restores the cwd later.
+    #[test]
+    fn rejects_an_account_config_dir_as_cwd() {
+        let base = worktrees_base();
+        let managed = managed_of(&base);
+        let account_dir = managed.join("accounts").join("602064ad688be368");
+        std::fs::create_dir_all(&account_dir).unwrap();
+        let err = validate_spawn_inner(&base, &managed, "/bin/zsh", account_dir.to_str())
+            .expect_err("an account config dir must not be accepted as a spawn cwd");
+        assert!(
+            err.contains("outside the managed worktrees directory"),
+            "expected the containment refusal, got: {err}"
+        );
+        // …and the sanctioned alternative — no cwd at all — is accepted, landing in the managed dir.
+        assert_eq!(
+            validate_spawn_inner(&base, &managed, "/bin/zsh", None).unwrap(),
+            managed.canonicalize().unwrap()
+        );
+    }
+
     #[test]
     fn rejects_dotdot_escape_cwd() {
         let base = worktrees_base();

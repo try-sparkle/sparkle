@@ -36,7 +36,7 @@ import { shouldReclaimPlainDrag } from "./terminalSelectionReclaim";
 import { isCopySelectionKey } from "./copySelectionKey";
 import { arrowKeySequence } from "./composerArrowOverflow";
 import { wheelToScrollLines } from "./terminalScroll";
-import { resolveTerminalOverlay } from "./terminalOverlay";
+import { resolveTerminalOverlay, errText } from "./terminalOverlay";
 import { TERMINAL_AGENT_ATTR, TERMINAL_SURFACE_ATTR } from "../voice/dictationFocus";
 // No `ZOOM_COLUMN_ATTR` here on purpose: the marker goes on the STAGE (components/Workspace), and
 // `PaneHost` appends this pane's host node into that stage, so the terminal surface is already a DOM
@@ -402,11 +402,16 @@ export function Terminal({
   // silent blank pane: "failed" = the spawn chain threw (e.g. claude/shell not found, worktree
   // guard); "exited" = the PTY exited before emitting any output. Both offer "Start again".
   const [spawnFail, setSpawnFail] = useState<null | "failed" | "exited">(null);
+  // The ACTUAL error behind a "failed" spawn. It used to live only in a `console.debug`, which made
+  // a permanent refusal (pty_spawn's worktree-scope guard) look exactly like a slow start — and made
+  // "Start again" look like a dead button instead of a doomed retry. See sparkle-mahbf.
+  const [spawnError, setSpawnError] = useState<string | null>(null);
   // Bumped by "Start again"; in the mount effect's deps so a retry tears down and re-spawns cleanly.
   const [attempt, setAttempt] = useState(0);
   const retry = useCallback(() => {
     gotOutputRef.current = false;
     setSpawnFail(null);
+    setSpawnError(null);
     setFirstOutput(false);
     setAttempt((a) => a + 1);
   }, []);
@@ -656,6 +661,7 @@ export function Terminal({
     gotOutputRef.current = false;
     setFirstOutput(false);
     setSpawnFail(null);
+    setSpawnError(null);
     // A fresh PTY has been told nothing yet. Clearing the memo here (rather than trusting the size
     // handed to spawn) keeps the post-spawn re-sync below unconditional, which is what preserves the
     // spawn-time width invariant: the child is always told its real size once the box is measured.
@@ -1109,6 +1115,7 @@ export function Terminal({
           // Same lever as the overlay's "Start again": bumping `attempt` is in the mount effect's
           // deps, so it tears down and re-spawns cleanly (resuming the Claude session).
           setSpawnFail(null);
+    setSpawnError(null);
           setAttempt((a) => a + 1);
         },
       };
@@ -1237,7 +1244,8 @@ export function Terminal({
       // "exited after output" (normal end) from "exited with no output" (show the retry state).
       gotOutputRef.current = true;
       setFirstOutput(true);
-      setSpawnFail(null); // output means it's alive — clear any prior failed/exited state
+      setSpawnFail(null);
+    setSpawnError(null); // output means it's alive — clear any prior failed/exited state
       // Flow control: register the chunk BEFORE writing, then release it when xterm finishes
       // parsing (the write callback). string length is a fine byte proxy for the watermarks.
       const chunkLen = e.chunk.length;
@@ -1366,6 +1374,9 @@ export function Terminal({
       // would restart-and-double-brief it (see `spawned` above).
       if (!disposed && !spawned) {
         setSpawnFail("failed");
+        // SURFACE IT, don't only log it. This string is the difference between "the button is
+        // broken" and "the spawn was refused, and here is what refused it" (sparkle-mahbf).
+        setSpawnError(errText(e));
         // TELL THE OWNER, not just the overlay. Same guards and same call site as the overlay, so the
         // two can never disagree about whether this launch failed — which is exactly what went wrong
         // when only the overlay knew (see `onSpawnFailed`).
@@ -1738,7 +1749,7 @@ export function Terminal({
 
   // What to paint over the blank xterm: a fail/exited affordance, a loading hint, or nothing once
   // output streams. Pure (see terminalOverlay.ts) so the "never a silent blank pane" rule is tested.
-  const overlay = resolveTerminalOverlay(spawnFail, firstOutput, resuming);
+  const overlay = resolveTerminalOverlay(spawnFail, firstOutput, resuming, spawnError ?? undefined);
   // The pane's own inks. `--c-forest` follows a `data-theme` flip through CSS, but the terminal's
   // ink register has no CSS variable (see terminalChrome), so these resolve in JS. That is a
   // re-render on a theme flip and MUST NOT become a remount — an unmount kills this PTY. Nothing
@@ -1808,6 +1819,33 @@ export function Terminal({
               plane happens to be and is measured against nothing; `termMuted` is the register's
               own quiet tier. */}
           <span style={{ color: quietInk }}>{overlay.message}</span>
+          {/* THE REAL REASON. Without it a permanent refusal (the worktree-scope guard rejecting an
+              account config dir) is pixel-identical to a transient hiccup, so "Start again" reads as
+              a dead button rather than a retry that cannot succeed — sparkle-mahbf. Wrapped and
+              width-capped: these are raw backend strings, not composed copy. */}
+          {overlay.detail ? (
+            <span
+              data-testid="terminal-spawn-detail"
+              style={{
+                color: quietInk,
+                fontSize: TERM_TYPE.small,
+                maxWidth: "80%",
+                textAlign: "center",
+                whiteSpace: "pre-wrap",
+                overflowWrap: "anywhere",
+                // BOUNDED, so the button's position never depends on the error's length. `errText`
+                // can return an arbitrarily long backend chain or a JSON.stringify of anything; left
+                // unbounded it wraps into many lines inside this centred, `inset: 0` column and
+                // pushes "Start again" past the bottom of the pane with no way to scroll to it —
+                // i.e. it would recreate the unreachable-retry bug this change exists to fix.
+                // Scrolls within its own box instead (roborev 61829).
+                maxHeight: "6em",
+                overflowY: "auto",
+              }}
+            >
+              {overlay.detail}
+            </span>
+          ) : null}
           <button
             onClick={retry}
             style={{
