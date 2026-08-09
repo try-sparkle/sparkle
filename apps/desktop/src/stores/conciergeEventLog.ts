@@ -88,6 +88,7 @@ export const CONCIERGE_EVENT_KINDS = [
   "agent_exited",
   "approval_requested",
   "approval_resolved",
+  "research_completed",
   "pr_checks_concluded",
   "build_failed",
 ] as const;
@@ -114,6 +115,16 @@ export const CONCIERGE_EVENT_WIRING: Record<ConciergeEventKind, "wired" | "named
   // ends: the human's yes, their no, and the TTL lapsing it unanswered (`outcome: "expired"`).
   approval_requested: "wired",
   approval_resolved: "wired",
+  // services/research/drain.ts — the turn-start drain observes the research task list and records
+  // one event per task the FIRST time it is seen in a terminal state. It is the emitter because it
+  // is the one thing that reads the whole list on a schedule tied to turns; the sidebar row renders
+  // the same list but is a view, and a view that emitted would emit again on every re-render.
+  //
+  // IT CARRIES WHAT THE PREAMBLE CANNOT. `isUnread` is `done`-only, so a `failed` or `cancelled`
+  // task never reaches a prompt — and a concierge waiting on findings that are never coming has no
+  // other way to learn that. `done` is recorded too, so the stream is a complete account of how
+  // each task ended rather than a failure-only channel a reader would misread as "nothing finished".
+  research_completed: "wired",
   // NAMED, NOT WIRED. `pr_checks_status` (services/conciergeTools/workflow.ts) is an ON-DEMAND read
   // the concierge performs itself; there is no background poller watching PR checks, so there is no
   // moment at which the app learns a conclusion the concierge did not already ask for. Emitting from
@@ -190,6 +201,30 @@ export interface ApprovalResolvedEvent {
   outcome: "approved" | "denied" | "expired";
 }
 
+/**
+ * A RESEARCH TASK REACHED A TERMINAL STATE — `done`, `failed` or `cancelled` (bead `sparkle-s7rfc`).
+ *
+ * `status` rather than a boolean, and all three terminal states rather than just failure, because
+ * `services/research/types` made them three deliberately: "the shell came back non-zero", "the human
+ * killed it" and "it ran out of wall clock" are different facts to a concierge deciding whether to
+ * re-ask, and a reader that had to infer cancellation from silence would re-dispatch work the
+ * founder just stopped.
+ *
+ * NO QUESTION TEXT AND NO FINDINGS — property 4. The findings travel in the turn-start prompt
+ * preamble (`services/research/drain`), which is the surface meant to carry them; this stream is
+ * ids, statuses and outcomes, like every other kind here.
+ */
+export interface ResearchCompletedEvent {
+  kind: "research_completed";
+  taskId: string;
+  /** The project the task was asked about; `null` when the dispatch resolved none — a real state,
+   *  see `ResearchTask.projectId`. */
+  projectId: string | null;
+  /** One of the terminal `ResearchStatus` values. Typed as a string here so this store keeps no
+   *  import edge into the research contract — the emitter is what holds both. */
+  status: string;
+}
+
 /** NAMED, NOT WIRED — see {@link CONCIERGE_EVENT_WIRING}. The shape is declared so a future source
  *  has one to fill rather than inventing a second one. */
 export interface PrChecksConcludedEvent {
@@ -214,6 +249,7 @@ export type ConciergeEventPayload =
   | AgentExitedEvent
   | ApprovalRequestedEvent
   | ApprovalResolvedEvent
+  | ResearchCompletedEvent
   | PrChecksConcludedEvent
   | BuildFailedEvent;
 

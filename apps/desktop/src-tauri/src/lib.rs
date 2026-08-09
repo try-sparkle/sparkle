@@ -89,6 +89,9 @@ mod project_window;
 mod pty;
 mod redacting_writer;
 mod repo_freshness;
+/// The background research runner behind "Concierge Agents" (bead `sparkle-s7rfc`) — dispatches a
+/// read-only `claude` child and returns before it finishes.
+mod research;
 mod retention;
 mod revival;
 mod review_cmd;
@@ -659,6 +662,15 @@ pub fn run() {
             inbox::inbox_status,
             inbox::inbox_peek,
             inbox::inbox_claim_for_idle,
+            // "Concierge Agents" (bead sparkle-s7rfc). `research_dispatch` RETURNS BEFORE THE CHILD
+            // FINISHES — that non-blocking property is the feature, and research.rs has a test
+            // pinning it. The five names are the contract with `RESEARCH_COMMANDS` in
+            // src/services/research/store.ts.
+            research::research_dispatch,
+            research::research_list,
+            research::research_get,
+            research::research_cancel,
+            research::research_mark_read,
             folder_picker::pick_folder,
             folder_picker::pick_files,
             pty::pty_spawn,

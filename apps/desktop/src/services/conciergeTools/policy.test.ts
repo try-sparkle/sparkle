@@ -52,6 +52,7 @@ import { APPROVALS_OPS } from "./approvals";
 import { PLANS_OPS } from "./plans";
 import { DIFF_OPS } from "./diff";
 import { FLEET_OPS } from "./fleet";
+import { RESEARCH_OPS } from "./research";
 import { toConciergeToolPolicy } from "../../stores/settingsStore";
 
 const NONE = { overrides: NO_TOOL_POLICY_OVERRIDES };
@@ -226,6 +227,7 @@ describe("the tool set is derived from the domains", () => {
       "plans",
       "diff",
       "fleet",
+      "research",
       "app",
     ]);
     expect(CONCIERGE_TOOL_DOMAINS.map((d) => d.id)).toEqual(
@@ -279,6 +281,7 @@ describe("the tool set is derived from the domains", () => {
         PLANS_OPS.length +
         DIFF_OPS.length +
         FLEET_OPS.length +
+        RESEARCH_OPS.length +
         APP_TOOL_NAMES.length,
     );
   });

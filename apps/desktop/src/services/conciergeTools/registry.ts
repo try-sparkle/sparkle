@@ -227,6 +227,16 @@ import {
   type ScreenshotOp,
   type ScreenshotResult,
 } from "./screenshot";
+import {
+  RESEARCH_OPS,
+  cancelResearchTask,
+  dispatchResearchTask,
+  getResearchTask,
+  listResearchTasks,
+  type ResearchOp,
+  type ResearchResult,
+} from "./research";
+import { RESEARCH_DEPTHS } from "../research/types";
 import { conciergeToolConfigPath } from "./policy";
 import { conciergeToolAuthority, type ToolPolicyDecision } from "../dispatchAuthority";
 import { useProjectStore } from "../../stores/projectStore";
@@ -268,6 +278,7 @@ export const CONCIERGE_TOOL_DOMAINS = [
   "plans",
   "diff",
   "fleet",
+  "research",
 ] as const;
 
 export type ConciergeToolDomain = (typeof CONCIERGE_TOOL_DOMAINS)[number];
@@ -542,6 +553,14 @@ function fromDiff<T>(ctx: OpContext, r: DiffResult<T>): ConciergeToolReply {
 /** approvals: same convention as board. Read-only throughout — see approvals.ts's header for why
  *  there is deliberately no `approve` op for this to normalize. */
 function fromApprovals<T>(ctx: OpContext, r: ApprovalsResult<T>): ConciergeToolReply {
+  return r.ok ? ok(ctx, r.data) : err(ctx, r.reason, r.message);
+}
+
+/** research: same convention as board. `not-acknowledged` and `unknown-task` pass through as the
+ *  code because they demand opposite responses — the first says "do NOT re-dispatch, read the list",
+ *  the second says "that id was never real" — and a caller that cannot tell them apart will retry
+ *  exactly the one that starts a second metered child. */
+function fromResearch<T>(ctx: OpContext, r: ResearchResult<T>): ConciergeToolReply {
   return r.ok ? ok(ctx, r.data) : err(ctx, r.reason, r.message);
 }
 
@@ -1616,6 +1635,89 @@ const APPROVALS_ROUTES: Record<ApprovalsOp, Handler> = {
 };
 
 // ---------------------------------------------------------------------------------------------
+// RESEARCH — "Concierge Agents": ask a question, keep talking, read the answer later.
+// ---------------------------------------------------------------------------------------------
+
+/** 2000 chars is a QUESTION; past that it is a payload, and a research child briefed with a wall of
+ *  text answers a different question than the one the human asked. The cap refuses rather than
+ *  truncating — a silently clipped brief is the confidently-wrong answer research/types.ts warns
+ *  about, one layer up. */
+const researchDispatchArgs = z
+  .object({
+    question: z
+      .string()
+      .min(1, "say what to find out")
+      .max(2000, "keep the question under 2000 characters"),
+    /** OPTIONAL, and an omitted one is not an error: a task with no project is a supported state
+     *  (research/types.ts), so this falls back to the selected project and then to `null` rather
+     *  than refusing. A project NAMED and not found is still a refusal — that is a mistake, not a
+     *  choice. */
+    projectId: z.string().min(1).optional(),
+    depth: z.enum(RESEARCH_DEPTHS).optional(),
+  })
+  .strict();
+
+const researchTaskIdArgs = z
+  .object({ taskId: z.string().min(1, "a research task id is required") })
+  .strict();
+
+const RESEARCH_ROUTES: Record<ResearchOp, Handler> = {
+  dispatch: route(researchDispatchArgs, async (a, ctx) => {
+    // The project is resolved HERE, from the store, for the reason the store-lookup section above
+    // states: a model supplies an id at most, never a root, and the runner is handed something this
+    // window has confirmed exists.
+    const projectId = a.projectId ?? useProjectStore.getState().selectedProjectId ?? null;
+    // RESOLVE THE ROOT, not just the id. This used to validate the project and then throw its
+    // `rootPath` away, which left the runner with no directory to work in — and the runner's own
+    // fallback was the process cwd, so every dispatch would have researched an arbitrary tree and
+    // answered confidently about it. Both halves were green and the merge was clean; the defect
+    // lived entirely in the gap between them.
+    const project = projectId === null ? undefined : findProject(projectId);
+    if (!project) {
+      return err(
+        ctx,
+        REGISTRY_CODES.unknownProject,
+        a.projectId !== undefined
+          ? `No project with id ${a.projectId}.`
+          : "I don't have a project selected to research in — name one with `projectId`.",
+      );
+    }
+    return fromResearch(
+      ctx,
+      await dispatchResearchTask({
+        question: a.question,
+        projectId: project.id,
+        projectRoot: project.rootPath,
+        // `quick` is the default the contract names: cheap by default, escalate on demand.
+        depth: a.depth ?? "quick",
+      }),
+    );
+  }),
+  list: route(noArgs, async (_a, ctx) => fromResearch(ctx, await listResearchTasks())),
+  get: route(researchTaskIdArgs, async (a, ctx) =>
+    fromResearch(ctx, await getResearchTask(a.taskId)),
+  ),
+  cancel: route(researchTaskIdArgs, async (a, ctx) =>
+    fromResearch(ctx, await cancelResearchTask(a.taskId)),
+  ),
+};
+
+/**
+ * Does this op change the world? Written as an exhaustive `Record` rather than derived from
+ * `RESEARCH_RISK`, so a fifth op is a TYPECHECK FAILURE here until someone decides — which is the
+ * completeness a `!== "read-only"` lookup cannot give.
+ *
+ * `dispatch` is a write even though it is auto-allowed: `write` describes the ACT, `risk` describes
+ * how much the human cares, and conflating them is how an approval layer ends up asking about reads.
+ */
+const RESEARCH_WRITE: Record<ResearchOp, boolean> = {
+  dispatch: true,
+  list: false,
+  get: false,
+  cancel: true,
+};
+
+// ---------------------------------------------------------------------------------------------
 // PLANS — epics and their children, plus the handoff into a build agent.
 // ---------------------------------------------------------------------------------------------
 
@@ -1843,6 +1945,13 @@ const DOMAINS: Record<ConciergeToolDomain, DomainEntry> = {
     write: (op) => APPROVALS_RISK[op as ApprovalsOp] !== "read-only",
     ops: APPROVALS_OPS,
   },
+  research: {
+    routes: RESEARCH_ROUTES,
+    // The domain's OWN write map, not its risk map. `dispatch` is `routine` (auto-allowed) and is
+    // still a write; reading the risk word here would report it as one only by accident.
+    write: (op) => RESEARCH_WRITE[op as ResearchOp] ?? true,
+    ops: RESEARCH_OPS,
+  },
 };
 
 /**
@@ -1877,6 +1986,7 @@ export const CONCIERGE_TOOL_OPS: Record<ConciergeToolDomain, readonly string[]> 
   plans: DOMAINS.plans.ops,
   diff: DOMAINS.diff.ops,
   fleet: DOMAINS.fleet.ops,
+  research: DOMAINS.research.ops,
 };
 
 function isDomain(v: string): v is ConciergeToolDomain {

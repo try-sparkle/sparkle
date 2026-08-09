@@ -60,7 +60,7 @@ function harness(over: Partial<ProactiveDeps> = {}) {
   let now = 1_000_000;
   let nextHandle = 0;
   const timers = new Map<number, { at: number; fn: () => void }>();
-  const fired: { prompt: string; digest: string }[] = [];
+  const fired: { prompt: string; digest: string; researchTaskIds: readonly string[] }[] = [];
   /** What the transport reports back. `false` = the push never ran (declined because the user owns
    *  the conversation, a dead bridge, a claude error) — the outcome the scheduler must not treat
    *  as delivery. Flipped mid-test by the decline cases below. */
@@ -75,8 +75,8 @@ function harness(over: Partial<ProactiveDeps> = {}) {
     clearTimer: (h) => {
       timers.delete(h);
     },
-    startTurn: (prompt, digest) => {
-      fired.push({ prompt, digest });
+    startTurn: (prompt, digest, researchTaskIds) => {
+      fired.push({ prompt, digest, researchTaskIds });
       return accept;
     },
     ...over,
@@ -915,5 +915,98 @@ describe("a delivered notice lowers the owed flag (roborev 57705)", () => {
     h.advance(PROACTIVE_MIN_INTERVAL_MS);
     expect(h.fired).toHaveLength(2);
     expect(h.fired[1]!.prompt).toContain("second");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// THE RESEARCH DRAIN'S SECOND SEAM (bead sparkle-s7rfc, reporting-channel PRD §3.3)
+//
+// §3.3's free improvement: a turn that is happening anyway carries the unread findings. The two
+// properties worth pinning are opposite in direction — it must ride EVERY proactive turn, and it
+// must never CAUSE one. The second is the expensive half: a finding that bought a push would spend
+// the six-an-hour ceiling on routine results and rate-limit out a genuine blocker.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+describe("research findings ride a proactive turn", () => {
+  const staging = (preamble: string, ...taskIds: string[]) => () => ({ preamble, taskIds });
+
+  it("puts the preamble AHEAD of the roster section, and names the ids for the caller to stage", () => {
+    const h = harness({ peekResearch: staging("RESEARCH BACK — 1 finding(s):\nrelay p90 is 7.4s", "r-1") });
+    const s = createProactiveScheduler(h.deps);
+    s.observe(feed([agent({ id: "a", status: "working", band: "running" })]));
+    s.observe(feed([agent({ id: "a", status: "approval", band: "needs_you" })]));
+    h.advance(PROACTIVE_COALESCE_MS);
+    expect(h.fired).toHaveLength(1);
+    const { prompt, researchTaskIds } = h.fired[0]!;
+    expect(prompt).toContain("relay p90 is 7.4s");
+    // "Approve?" is the roster line's status label — the first thing the old prompt began with.
+    expect(prompt).toContain("Approve?");
+    expect(prompt.indexOf("relay p90 is 7.4s")).toBeLessThan(prompt.indexOf("Approve?"));
+    expect(researchTaskIds).toEqual(["r-1"]);
+  });
+
+  it("rides a NOTICE-ONLY turn too — the one that never calls buildProactivePrompt", () => {
+    const h = harness({ peekResearch: staging("RESEARCH BACK — 1 finding(s):\nthe answer", "r-1") });
+    const s = createProactiveScheduler(h.deps);
+    s.notify("Agent A has been quota-walled for 3h");
+    h.advance(PROACTIVE_COALESCE_MS);
+    expect(h.fired).toHaveLength(1);
+    expect(h.fired[0]!.prompt).toContain("the answer");
+    expect(h.fired[0]!.prompt).toContain("quota-walled");
+  });
+
+  it("NEVER buys a turn of its own — a finding with nothing else to say spends nothing", () => {
+    // The rejected alternative, pinned. If this ever fires, routine research is eating the hourly
+    // ceiling and the blocker at minute 40 is the thing that gets dropped.
+    let peeks = 0;
+    const h = harness({
+      peekResearch: () => {
+        peeks++;
+        return { preamble: "RESEARCH BACK — 1 finding(s):\nnobody asked", taskIds: ["r-1"] };
+      },
+    });
+    const s = createProactiveScheduler(h.deps);
+    // A quiet fleet, seeded and unchanged: nothing needs the user, nothing was notified.
+    s.observe(feed([agent({ id: "a", status: "working", band: "running" })]));
+    s.observe(feed([agent({ id: "a", status: "working", band: "running" })]));
+    h.advance(60 * 60_000);
+    expect(h.fired).toEqual([]);
+    // And it was not even CONSULTED — peeking is free, but a peek here would mean the decision to
+    // speak had already been taken.
+    expect(peeks).toBe(0);
+  });
+
+  it("stages nothing when the push is DECLINED — the finding stays owed", () => {
+    // The caller stages against the turn id the transport returns; a decline returns none. This
+    // pins the scheduler half: it must still hand over the ids rather than pre-emptively clearing
+    // them, so the next turn carries the same finding.
+    const h = harness({ peekResearch: staging("RESEARCH BACK — 1 finding(s):\nheld", "r-1") });
+    h.decline();
+    const s = createProactiveScheduler(h.deps);
+    s.observe(feed([agent({ id: "a", status: "working", band: "running" })]));
+    s.observe(feed([agent({ id: "a", status: "approval", band: "needs_you" })]));
+    h.advance(PROACTIVE_COALESCE_MS);
+    expect(s.stats().skipped.declined).toBe(1);
+    h.acceptAgain();
+    h.advance(PROACTIVE_MIN_INTERVAL_MS);
+    expect(h.fired).toHaveLength(2);
+    expect(h.fired[1]!.prompt).toContain("held");
+    expect(h.fired[1]!.researchTaskIds).toEqual(["r-1"]);
+  });
+
+  it("adds NOTHING to the prompt when nothing is unread", () => {
+    const withDrain = harness({ peekResearch: () => ({ preamble: "", taskIds: [] }) });
+    const without = harness();
+    for (const h of [withDrain, without]) {
+      const s = createProactiveScheduler(h.deps);
+      s.observe(feed([agent({ id: "a", status: "working", band: "running" })]));
+      s.observe(feed([agent({ id: "a", status: "approval", band: "needs_you" })]));
+      h.advance(PROACTIVE_COALESCE_MS);
+      s.dispose();
+    }
+    // Byte-identical to a scheduler with no drain wired at all — no empty header, no stray blank
+    // line, on the overwhelmingly common turn.
+    expect(withDrain.fired[0]!.prompt).toBe(without.fired[0]!.prompt);
+    expect(withDrain.fired[0]!.researchTaskIds).toEqual([]);
   });
 });

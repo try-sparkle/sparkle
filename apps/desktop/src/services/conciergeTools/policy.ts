@@ -79,6 +79,7 @@ import { PLANS_OPS, PLANS_RISK, type PlansOp } from "./plans";
 import { DIFF_OPS, DIFF_RISK, type DiffOp } from "./diff";
 import { FLEET_OPS, FLEET_RISK, type FleetOp } from "./fleet";
 import { SCREENSHOT_OPS, SCREENSHOT_RISK, type ScreenshotOp, type ScreenshotRisk } from "./screenshot";
+import { RESEARCH_OPS, RESEARCH_RISK, type ResearchOp } from "./research";
 
 // ---------------------------------------------------------------------------------------------
 // The three values
@@ -172,6 +173,7 @@ export type ConciergeToolDomain =
   | "plans"
   | "diff"
   | "fleet"
+  | "research"
   | "app";
 
 /** The domains in the order the pane lists them, with the heading each renders under. */
@@ -189,6 +191,7 @@ export const CONCIERGE_TOOL_DOMAINS = [
   { id: "plans", label: "Plans" },
   { id: "diff", label: "Diff" },
   { id: "fleet", label: "Fleet awareness" },
+  { id: "research", label: "Background research" },
   { id: "app", label: "App & settings" },
 ] as const satisfies readonly { id: ConciergeToolDomain; label: string }[];
 
@@ -355,6 +358,25 @@ const TERMINAL_TOOL_SUMMARY: Record<TerminalToolName, string> = {
     "completion criterion) or `notWork: { reason }`.",
 };
 
+/**
+ * The research domain's rows — and here a summary is REQUIRED rather than nice to have.
+ *
+ * These four op names (`dispatch`, `list`, `get`, `cancel`) are the wire contract, and they are the
+ * most generic in the whole catalog. A settings row that fell back to the risk note would read
+ * "dispatch — Local and reversible", which tells the human nothing about what they are being asked
+ * to allow. Every row here says what it does AND that a research task is a background `claude` run,
+ * because "this spends money in the background" is the fact someone deciding to gate `dispatch`
+ * actually needs.
+ */
+const RESEARCH_TOOL_SUMMARY: Record<ResearchOp, string> = {
+  dispatch:
+    "Send a question off to a background research agent and keep talking — it answers later, and " +
+    "it is a metered Claude run.",
+  list: "See which background research is still running and what has come back.",
+  get: "Read one research task in full, including its findings.",
+  cancel: "Stop a background research task that is still running.",
+};
+
 /** The attachment domain's rows. Keyed on that domain's own op union, so an op added there is a
  *  typecheck failure here rather than a settings row that silently falls back to a risk note. */
 const ATTACHMENTS_TOOL_SUMMARY: Record<AttachmentsOp, string> = {
@@ -454,6 +476,7 @@ export type ConciergeToolName =
   | DiffOp
   | PlansOp
   | FleetOp
+  | ResearchOp
   | AppToolName;
 
 /**
@@ -523,6 +546,12 @@ const RISK_BY_TOOL: Record<ConciergeToolName, ConciergeRiskClass> = {
   // while `send_to_agent_terminal` stays `disruptive` and asks. That asymmetry is what makes the
   // non-interrupting channel the path of least resistance — and Level 3 correspondingly rare.
   ...translateRisk(FLEET_RISK, WORKSPACE_RISK_TO_CLASS),
+  // Research publishes two of workspace's four risk words, so it reuses that translation. Both
+  // `dispatch` and `cancel` are `routine` and therefore auto-allowed, which is the FOUNDER'S
+  // EXPLICIT CALL ("no cap, trust the concierge") rather than a default nobody looked at —
+  // research.ts's header records the reasoning, including why `dispatch` is not `costs-money` and
+  // why `cancel` is not the `disruptive` that RISK_OVERRIDES gives close_agent/stop_agent.
+  ...translateRisk(RESEARCH_RISK, WORKSPACE_RISK_TO_CLASS),
   ...TERMINAL_TOOL_RISK,
   // The attachments domain publishes the same four risk words as workspace, so it reuses that
   // translation rather than declaring a fifth identical one.
@@ -547,6 +576,7 @@ const DOMAIN_BY_TOOL: Record<ConciergeToolName, ConciergeToolDomain> = {
   ...constantOver(PLANS_RISK, "plans" as const),
   ...constantOver(DIFF_RISK, "diff" as const),
   ...constantOver(FLEET_RISK, "fleet" as const),
+  ...constantOver(RESEARCH_RISK, "research" as const),
   ...constantOver(APP_TOOL_RISK, "app" as const),
 };
 
@@ -555,6 +585,7 @@ const DOMAIN_BY_TOOL: Record<ConciergeToolName, ConciergeToolDomain> = {
  *  here would be a second description that drifts from the code it describes. Those rows fall back
  *  to the risk note, which is a fact the domain DID publish. */
 const SUMMARY_BY_TOOL: Partial<Record<ConciergeToolName, string>> = {
+  ...RESEARCH_TOOL_SUMMARY,
   ...SCREENSHOT_TOOL_SUMMARY,
   ...TERMINAL_TOOL_SUMMARY,
   ...ATTACHMENTS_TOOL_SUMMARY,
@@ -577,6 +608,7 @@ const NAMES_BY_DOMAIN: Record<ConciergeToolDomain, readonly ConciergeToolName[]>
   plans: PLANS_OPS,
   diff: DIFF_OPS,
   fleet: FLEET_OPS,
+  research: RESEARCH_OPS,
   app: APP_TOOL_NAMES,
 };
 

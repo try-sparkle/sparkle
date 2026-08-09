@@ -30,6 +30,7 @@ import type { ApprovalsOp } from "../services/conciergeTools/approvals";
 import type { DiffOp } from "../services/conciergeTools/diff";
 import type { FleetOp } from "../services/conciergeTools/fleet";
 import type { PlansOp } from "../services/conciergeTools/plans";
+import type { ResearchOp } from "../services/conciergeTools/research";
 import { conciergeNativeToolLine } from "./conciergeNativeToolLine";
 
 /** Which glyph family a line wears. A KIND, not a component: this module stays React-free, and the
@@ -408,6 +409,19 @@ const FLEET_PHRASES: Record<FleetOp, OpPhrase> = {
   inbox_status: phrase("Checking who has read their messages", "Checked who has read their messages"),
 };
 
+/**
+ * Background research. The dispatch phrase says SENT, not "researching": the whole property of that
+ * op is that it returns before the work is done, so a column line reading "Researching…" would
+ * describe the concierge as busy on something it has already handed off — and would go stale the
+ * moment the turn ends while the child runs on.
+ */
+const RESEARCH_PHRASES: Record<ResearchOp, OpPhrase> = {
+  dispatch: phrase("Sending off a research question", "Sent off a research question"),
+  list: phrase("Checking on your research", "Checked on your research"),
+  get: phrase("Reading a research finding", "Read a research finding"),
+  cancel: phrase("Calling off a research task", "Called off a research task"),
+};
+
 /** Domain → its phrase table and its glyph. Keyed on the registry's own domain union, so a new
  *  domain cannot be added without deciding how the column describes it.
  *
@@ -442,6 +456,9 @@ const DOMAINS: Record<
   // same question the workflow ops answer from the other side.
   diff: { icon: "workflow", phrases: DIFF_PHRASES },
   fleet: { icon: "agents", phrases: FLEET_PHRASES },
+  // Reuses the agents glyph: a research task IS an agent — a background `claude` child the
+  // concierge started — so it belongs with the other lines about agents doing work.
+  research: { icon: "agents", phrases: RESEARCH_PHRASES },
 };
 
 /** What an op's `%s` refers to, so the recorder knows which id to resolve into a name.

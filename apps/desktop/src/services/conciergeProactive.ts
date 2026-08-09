@@ -26,6 +26,7 @@
 // actually matters, never on a tick, and never on movement that is only a timestamp.
 import { bandCountLabel } from "../engine/statusBandLabels";
 import { rosterLine } from "../engine/conciergeRosterLine";
+import { withResearchPreamble, type ResearchStaging } from "./research/drain";
 import type { ConciergeMessage } from "../components/Concierge/types";
 import type { ConciergeAgent, ConciergeFeed } from "./conciergeFeed";
 
@@ -78,8 +79,28 @@ export interface ProactiveDeps {
   setTimer(fn: () => void, ms: number): number;
   clearTimer(handle: number): void;
   /**
+   * THE RESEARCH DRAIN'S SECOND SEAM (bead `sparkle-s7rfc`, §3.3 of the reporting-channel PRD).
+   *
+   * Returns the unread research findings to fold into this turn's prompt, and the ids they came
+   * from. Optional: a scheduler wired without it behaves exactly as before.
+   *
+   * IT IS ONLY EVER CALLED FOR A TURN THAT IS ALREADY HAPPENING. §3.3 is explicit that findings buy
+   * no interruption of their own — a push per finding would spend the shared six-an-hour ceiling on
+   * routine results and rate-limit out a genuine blocker at minute 40, which is the exact failure
+   * the channel exists to prevent. So this is consulted AFTER `fire` has decided there is something
+   * to say; a pending finding never makes that decision `true`.
+   *
+   * PEEKING CLAIMS NOTHING. The ids travel to {@link startTurn}, which stages them against the turn
+   * id it gets back; the claim happens only once that turn delivers. See services/research/drain.
+   */
+  peekResearch?(): ResearchStaging;
+  /**
    * Start one proactive turn. `digest` is the state it is being authored against — the caller
    * records it against the turn id so the resulting message can be marked stale later.
+   *
+   * `researchTaskIds` names the findings this prompt is carrying (empty when none). The caller
+   * stages them against the turn id the transport returns — a decline stages nothing, so an
+   * undelivered finding stays unread and rides the next turn instead.
    *
    * RETURNS WHETHER A TURN ACTUALLY STARTED, and that answer is load-bearing (roborev 54166-M2).
    * `concierge_proactive_turn` stands down for any user turn — in flight or merely preparing — and
@@ -92,7 +113,11 @@ export interface ProactiveDeps {
    * synchronously — the scheduler is otherwise perfectly deterministic, and a mandatory microtask
    * would make every caller's ordering depend on the event loop.
    */
-  startTurn(prompt: string, digest: string): boolean | Promise<boolean>;
+  startTurn(
+    prompt: string,
+    digest: string,
+    researchTaskIds: readonly string[],
+  ): boolean | Promise<boolean>;
 }
 
 export interface ProactiveScheduler {
@@ -212,6 +237,10 @@ export function buildNoticeSection(notices: readonly string[]): string {
   );
 }
 
+/** What a scheduler with no research drain wired sees: nothing unread, nothing to claim. Frozen
+ *  because it is shared by every such turn. */
+const EMPTY_RESEARCH: ResearchStaging = Object.freeze({ preamble: "", taskIds: Object.freeze([]) });
+
 /** Every agent in the feed, across projects. */
 function allAgents(feed: ConciergeFeed): ConciergeAgent[] {
   return feed.projects.flatMap((p) => p.agents);
@@ -300,6 +329,12 @@ export function surfacedDigest(feed: ConciergeFeed): string {
  * vocabulary — with one critical difference: it says outright that there is no question to answer.
  * Handed the send-shaped prompt, the brain reliably answers the last thing the user said, because
  * `--resume` means it can still see it.
+ *
+ * THE RESEARCH PREAMBLE IS NOT BUILT HERE. It is composed in `fire`, ahead of this section and
+ * ahead of the notices, by `withResearchPreamble` — because a notice-only turn calls this function
+ * not at all and must still carry the findings. Same reason `buildSnapshot` does not build it
+ * either: the seam belongs where the whole prompt is assembled, so there is one place per turn
+ * kind rather than one per section.
  */
 export function buildProactivePrompt(feed: ConciergeFeed): string {
   const surfaced = accountedNeedsYou(feed);
@@ -523,7 +558,15 @@ export function createProactiveScheduler(deps: ProactiveDeps): ProactiveSchedule
     // findings move no digest, so requiring a feed change here would mean they could only ever ride
     // along with an unrelated one — i.e. exactly the silence being fixed.
     if (!hasFeedChange && notices.length === 0) return;
-    const prompt = [
+    // ══ THE RESEARCH DRAIN RIDES A TURN; IT NEVER BUYS ONE ═══════════════════════════════════════
+    // BELOW the guard above, deliberately. §3.3 of the reporting-channel PRD rejected a push per
+    // finding, so an unread finding must never be the reason a proactive turn happens — it is
+    // folded into a turn that was already going to run, at the front of the prompt, exactly as the
+    // user-turn seam folds it ahead of the founder's message. Moving this line above the return
+    // would not merely widen the trigger: it would spend the six-an-hour ceiling on routine
+    // results and rate-limit out the blocker this channel exists to deliver.
+    const research = deps.peekResearch?.() ?? EMPTY_RESEARCH;
+    const body = [
       hasFeedChange ? buildProactivePrompt(feed) : null,
       // EVERY OWED FINDING GOES IN — `buildNoticeSection` names all of them however many there are,
       // and changes shape rather than length past the readability threshold.
@@ -531,6 +574,8 @@ export function createProactiveScheduler(deps: ProactiveDeps): ProactiveSchedule
     ]
       .filter((part): part is string => part !== null)
       .join("\n\n");
+    // Identity when there is nothing unread — no empty header, on any turn.
+    const prompt = withResearchPreamble(research.preamble, body);
     lastAttemptAt = now;
     dropPending();
 
@@ -611,7 +656,7 @@ export function createProactiveScheduler(deps: ProactiveDeps): ProactiveSchedule
     // struck early, rather than a finding that has stopped being true being left standing. This
     // file's own rule is that the app volunteering something false is worse than having said
     // nothing.
-    const outcome = deps.startTurn(prompt, surfaced ?? baselineSurfaced ?? "");
+    const outcome = deps.startTurn(prompt, surfaced ?? baselineSurfaced ?? "", research.taskIds);
     if (typeof outcome === "boolean") {
       settle(outcome);
       return;

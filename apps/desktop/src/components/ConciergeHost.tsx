@@ -106,6 +106,14 @@ import {
 } from "../services/conciergeFeed";
 import { agentToNudge, NUDGE_OPEN_ACTION } from "../engine/conciergeNudges";
 import { buildSnapshot } from "../engine/conciergeSnapshot";
+import { createResearchDrain, withResearchPreamble } from "../services/research/drain";
+import {
+  allTasksNow as allResearchTasks,
+  markResearchRead,
+  refreshResearch,
+  useResearchStore,
+} from "../services/research/store";
+import { recordConciergeEvent } from "../stores/conciergeEventLog";
 import { oneLine } from "./promptHistory";
 import { openProjectTab } from "../services/openProjectTab";
 import { revealOutcomeFor, type RevealOutcome } from "../services/agentReveal";
@@ -350,6 +358,38 @@ interface LintHold {
  * would render the original while a good correction was still being written.
  */
 const LINT_CORRECTION_TIMEOUT_MS = 90_000;
+
+/**
+ * THE RESEARCH TURN-START DRAIN (bead `sparkle-s7rfc`; reporting-channel PRD §3.3).
+ *
+ * Findings from research the concierge dispatched are folded into the prompt of a turn that is
+ * happening anyway — ahead of the founder's message on a user turn, ahead of the roster section on
+ * a push. Deliberately NOT a proactive interrupt: a push per finding would spend the shared
+ * six-an-hour ceiling on routine results and rate-limit out a genuine blocker.
+ *
+ * MODULE SCOPE, NOT A REF, and that is load-bearing. The drain remembers which turn ids are
+ * carrying which findings; a remount mid-turn (a key change, a project close) would otherwise
+ * forget the staging and the finding would be told a second time. One window, one drain.
+ *
+ * Every edge is here and nowhere else: the clock, the store's cache, the claim, and the event
+ * recorder. The rules themselves are pure and live in services/research/drain.
+ */
+const researchDrain = createResearchDrain({
+  now: () => Date.now(),
+  tasks: () => allResearchTasks(),
+  markRead: (ids, at) => {
+    // Fire-and-forget, and a failure is SAFE: an unstamped finding is told again next turn, which
+    // is the recoverable direction this whole design is built around. The refresh pulls the disk's
+    // answer back into the cache; until it lands, the drain's own claim set stops a repeat.
+    void markResearchRead(ids, at).then(
+      () => refreshResearch(),
+      (e) => console.warn("research: could not mark findings read:", e),
+    );
+  },
+  recordEvent: (payload, at) => {
+    recordConciergeEvent(payload, at);
+  },
+});
 
 export function ConciergeHost({
   feed,
@@ -2246,6 +2286,10 @@ export function ConciergeHost({
       // A correction its hold already gave up on. Dropped whole — rendering it now would append a
       // SECOND answer, to a prompt the user never sent, under the reply that replaced it.
       if (isSilencedTurn(e.id)) {
+        // NOTHING REACHED THE FOUNDER, so nothing is claimed: this reply is discarded whole, and
+        // any research finding it carried is still owed. `abandon` releases the staging and the
+        // next turn names the finding again.
+        researchDrain.abandon(e.id);
         delete brainTextRef.current[e.id];
         return;
       }
@@ -2256,13 +2300,24 @@ export function ConciergeHost({
       // user is waiting on now comes through its own turn regardless; this only settles the one
       // that was already answered.
       if (isCorrectionTurn(e.id)) {
+        // A correction DELIVERS — `finishCorrection` renders the held reply — so a finding this
+        // turn carried has reached the founder and is claimed like any other.
+        researchDrain.settle(e.id);
         finishCorrection(e);
         return;
       }
       if (supersededTurn(e.id)) {
+        // THE CASE THE WHOLE SPLIT EXISTS FOR. The user sent again, `concierge.rs` killed this
+        // child, and its text is dropped here without ever being rendered — so this turn told the
+        // founder nothing, and its findings must survive it. Claiming at prompt-build time would
+        // have destroyed them at exactly this moment, which is the ordinary outcome of two fast
+        // sends rather than an edge case.
+        researchDrain.abandon(e.id);
         delete brainTextRef.current[e.id];
         return;
       }
+      // The turn spoke. THIS is the only place a user turn's findings are claimed.
+      researchDrain.settle(e.id);
       // A push owns no typing indicator — nobody is waiting on it. The Rust command stands down
       // for any user turn so the two should never overlap, but if that ever changes, clearing here
       // would take the indicator away from the reply the user IS waiting on.
@@ -2443,6 +2498,12 @@ export function ConciergeHost({
       if (full) announce(full);
     });
     const offError = onConciergeError((e) => {
+      // ══ AN ERRORED TURN CLAIMS NOTHING ═════════════════════════════════════════════════════════
+      // Every branch below ends the turn without a reply — a real failure, a superseded sentinel, a
+      // declined push, an abandoned correction. None of them told the founder what came back, so
+      // the findings stay unread and ride the next turn. One call above every gate, because there
+      // is no error path on which claiming would be correct.
+      researchDrain.abandon(e.id);
       // Likewise for an abandoned correction's failure: there is no hold left to settle, and it must
       // not raise the user-facing failure bubble below.
       if (isSilencedTurn(e.id)) {
@@ -2650,11 +2711,20 @@ export function ConciergeHost({
       now: () => Date.now(),
       setTimer: (fn, ms) => window.setTimeout(fn, ms),
       clearTimer: (h) => window.clearTimeout(h),
-      startTurn: async (prompt, digest) => {
+      // The research drain's second seam (§3.3's free improvement). Consulted by `fire` only once
+      // it has already decided to speak, so a finding never buys a push of its own.
+      peekResearch: () => researchDrain.peek(),
+      startTurn: async (prompt, digest, researchTaskIds) => {
         const id = await startProactiveConciergeTurn(prompt);
         // Null means no turn ran — the user owns the conversation, or the bridge failed. Reporting
         // that honestly is what keeps the change pending instead of silently swallowed.
+        //
+        // The findings go with it: nothing is staged, so nothing can be claimed, and the next turn
+        // (push or send) carries them again.
         if (id === null) return false;
+        // Staged, not claimed — this push can still be superseded before it renders, and `offDone`
+        // / `offError` above are what decide which of those two happened.
+        researchDrain.stage(id, researchTaskIds);
         pushDigestRef.current.set(id, digest);
         const oldest = pushDigestRef.current.keys().next();
         if (pushDigestRef.current.size > 16 && !oldest.done) pushDigestRef.current.delete(oldest.value);
@@ -2674,6 +2744,22 @@ export function ConciergeHost({
       s.dispose();
       schedulerRef.current = null;
     };
+  }, []);
+
+  // ══ WATCH THE RESEARCH TASKS ═════════════════════════════════════════════════════════════════
+  //
+  // Two jobs, both cheap. One refresh at mount so a window opened after a task finished still knows
+  // about it — the store is a cache and the disk is the truth, so an empty store means "we have not
+  // looked", never "there is nothing". And a subscription so `research_completed` is recorded when
+  // a task actually reaches its terminal state rather than whenever a turn happens to start.
+  //
+  // The event log is what carries a FAILED or CANCELLED task to the concierge at all: the prompt
+  // preamble is `done`-only by design (`isUnread`), so without this a concierge that dispatched a
+  // task would wait forever on an answer that was never coming. `observe` is idempotent per task —
+  // it reports each id once — so a subscription that fires on every store write is safe.
+  useEffect(() => {
+    void refreshResearch();
+    return useResearchStore.subscribe((s) => researchDrain.observe(Object.values(s.byId)));
   }, []);
 
   // Feed the trigger, and retract any push the state has moved past.
@@ -3486,10 +3572,22 @@ export function ConciergeHost({
     // BUILT NOW, NOT AT ENQUEUE. A queued entry deliberately carries no snapshot: the fleet picture
     // is read at dispatch so a turn that waited behind three others still describes the app as it
     // is when it actually runs, rather than as it looked when the user typed.
-    void startConciergeTurn(buildSnapshot(feedRef.current, entry.text)).then(
+    // ══ THE RESEARCH DRAIN — PEEK NOW, CLAIM ONLY IF THIS TURN SPEAKS ═════════════════════════════
+    // Unread findings go in FRONT of the snapshot, so the brain reads what came back before it
+    // reads what the founder just said. `peek` stamps nothing: `readAt` is written in the `done`
+    // handler below, because this turn can still be superseded and killed before it says a word —
+    // and a finding claimed here would be gone with no residue and no retry.
+    const research = researchDrain.peek();
+    void startConciergeTurn(
+      withResearchPreamble(research.preamble, buildSnapshot(feedRef.current, entry.text)),
+    ).then(
       (id) => {
         const n = id !== null && /^\d+$/.test(id) ? Number(id) : null;
         if (n !== null) retireThroughRef.current = Math.max(retireThroughRef.current, n - 1);
+        // `null` is a turn that never installed — superseded before install, cancelled, or a local
+        // error (services/concierge). There is no turn to claim against, so the findings stay
+        // unread and the next send carries them.
+        if (id !== null) researchDrain.stage(id, research.taskIds);
       },
       // ══ A REJECTED DISPATCH MUST STILL RELEASE THE SLOT (probe 4 on PR #1235) ═══════════════════
       // `startConciergeTurn` throws BEFORE its own try block when AI enhancements are off

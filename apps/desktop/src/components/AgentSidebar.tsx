@@ -13,6 +13,8 @@ import { FONT_UI, TYPE } from "../theme/scale";
 import { SupportTicketRow } from "./SupportTicketRow";
 import { subtreeDomId } from "./subtreeDomId";
 import { SparkleAgentRow } from "./SparkleAgentRow";
+import { ConciergeAgentsRow, researchRollupStatuses } from "./ConciergeAgentsRow";
+import { liveTasks, useResearchStore } from "../services/research/store";
 import { AgentRow } from "./AgentRow";
 import { SidebarScrollContext, type SidebarScrollApi } from "./sidebarScrollContext";
 import { WorkerPeek } from "./WorkerPeek";
@@ -40,7 +42,7 @@ import {
   buildWidthVar,
   readStoredBuildWidth,
 } from "../engine/columnResize";
-import type { Project, AgentTab } from "../types";
+import type { Project, AgentTab, AgentTabStatus } from "../types";
 import { useProjectStore } from "../stores/projectStore";
 import { usePreviewStore } from "../stores/previewStore";
 import { refreshPreviewCapability } from "../services/preview";
@@ -2140,6 +2142,41 @@ export function AgentSidebar({
   const sparkleRollupOverrides =
     sparkleBand !== bandOfStatus(ownStatus[sparkleAgentId] ?? "stopped");
 
+  // ── THE PINNED CONCIERGE AGENTS ROW'S VIEW MODEL (bead sparkle-s7rfc) ──────────────────────────
+  //
+  // THE SAME FOUR LINES THE SPARKLE ROW ABOVE TAKES, and for the same reason: the row must not hold
+  // a private copy of this derivation, because a private derivation does not inherit fixes. That is
+  // the failure recorded at length above — the Improve Sparkle row rendering GREEN while its agent
+  // sat on an unanswered picker — and it is the one thing `ConciergeAgentsRow`'s header forbids.
+  //
+  // WHAT IS DIFFERENT, and why it is not a second pipeline:
+  //
+  //   • The row's OWN status is `stopped`, always. A research task is not an agent (no worktree, no
+  //     branch, no pane, no PTY — see the row's header for why widening `AgentKind` was refused), so
+  //     there is no id to look up in `effectiveStatus` and nothing of its own for the row to report.
+  //     `"stopped"` is the identical fallback every build row takes before it has ever spawned.
+  //   • Its "workers" are the LIVE research tasks, translated into the column's status vocabulary by
+  //     `agentStatusForResearch`. `rollupDot` / `bandOfRollup` / `ROLLUP_DOT_COLOR` / `rollupLabel`
+  //     are then the SAME four functions, unchanged, so this row lands in the same taxonomy as every
+  //     other disc in the column.
+  //
+  // `researchRollupStatuses` deliberately feeds only the LIVE tasks — see its docstring: a failed
+  // research task has no "read" gesture, so escalating it here would paint the row red forever after
+  // the first failure. The failure is not hidden; it is one click away in the expanded list.
+  //
+  // NOT counted into `bandCounts`. The chips summarize the BUILD roster, and these are not build
+  // rows; adding them would make "3 running" mean two different populations at once, which is the
+  // one-signal-many-meanings failure recorded as sparkle-345q5.
+  const researchById = useResearchStore((s) => s.byId);
+  const researchHydrated = useResearchStore((s) => s.hydrated);
+  // `liveTasks` from the store, NOT a local filter — the badge and the disc read the same selector,
+  // so they cannot come to disagree about what "running" means.
+  const conciergeLive = useMemo(() => liveTasks(Object.values(researchById)), [researchById]);
+  const conciergeStatus: AgentTabStatus = "stopped";
+  const conciergeRollup = rollupDot(conciergeStatus, researchRollupStatuses(conciergeLive));
+  const conciergeRollupOverrides =
+    bandOfRollup(conciergeRollup) !== bandOfStatus(conciergeStatus);
+
   // Per-band counts for the filter chips. Counted over the UNFILTERED top-level rows on purpose: a
   // chip must keep showing how many rows it would reveal while it is toggled OFF, otherwise a
   // hidden band reads "0" and the user has no idea anything is behind it.
@@ -2885,6 +2922,26 @@ export function AgentSidebar({
           That position is the ENTIRE expression of "this one is different" — it works on Sparkle
           itself, not the user's project, and it can't be closed. Everything else about it is a
           build row (see SparkleAgentRow), including the status derivation feeding it here. */}
+      {/* CONCIERGE AGENTS — one pinned row DIRECTLY ABOVE Improve Sparkle, holding the research
+          tasks the concierge has dispatched (bead sparkle-s7rfc). Founder: "a row right above
+          improved sparkle called 'Concierge Agents'. it's just one row, like a build orchestrator
+          with '+[n]' showing how many agents are running."
+
+          UNCONDITIONAL, where the row below it is behind `showSparkleRow`: "it's just one row" and
+          it is always present. A row that appeared only once work existed would leave the founder
+          with nowhere to look for work he had just asked for and no way to learn the surface exists
+          — and the `+0` it renders instead is a real answer, which is the whole reason `hydrated`
+          is passed separately from the count. */}
+      <ConciergeAgentsRow
+        status={conciergeStatus}
+        dotColor={conciergeRollupOverrides ? ROLLUP_DOT_COLOR[conciergeRollup] : undefined}
+        dotLabel={conciergeRollupOverrides ? rollupLabel(conciergeRollup) : undefined}
+        liveCount={conciergeLive.length}
+        hydrated={researchHydrated}
+        paneSide={pairSide}
+        jointOpen={jointOpen}
+      />
+
       {showSparkleRow && (
         <SparkleAgentRow
           // Scoped, like every other read of this flag in the column: the row may only claim to be

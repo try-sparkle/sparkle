@@ -419,14 +419,30 @@ describe("the wiring table is the truth, not decoration", () => {
     expect(Object.keys(CONCIERGE_EVENT_WIRING).sort()).toEqual([...CONCIERGE_EVENT_KINDS].sort());
   });
 
-  it("names exactly the five kinds something emits today", () => {
+  it("names exactly the six kinds something emits today", () => {
     expect([...WIRED_EVENT_KINDS]).toEqual([
       "agent_status",
       "agent_spawned",
       "agent_exited",
       "approval_requested",
       "approval_resolved",
+      // services/research/drain.ts observes the research task list and records one of these the
+      // first time a task is seen terminal — the channel by which a FAILED or CANCELLED task
+      // reaches the concierge at all, since the turn-start preamble is `done`-only.
+      "research_completed",
     ]);
+  });
+
+  it("carries a research task's ENDING, and no user content with it", () => {
+    // Property 4, at the newest kind: these records are handed to a model and may be quoted back,
+    // so the question and the findings must not be in them. The findings travel in the prompt
+    // preamble instead (services/research/drain).
+    const e = recordConciergeEvent(
+      { kind: "research_completed", taskId: "r-1", projectId: "p1", status: "failed" },
+      NOW,
+    );
+    expect(e).toMatchObject({ kind: "research_completed", taskId: "r-1", status: "failed", seq: 1 });
+    expect(Object.keys(e).sort()).toEqual(["at", "kind", "projectId", "seq", "status", "taskId"]);
   });
 
   it("marks pr_checks_concluded and build_failed as named-but-unwired", () => {
