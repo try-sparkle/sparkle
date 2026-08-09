@@ -5,6 +5,8 @@ import {
   resolveSuggestionClick,
   frameSubmit,
   frameRelaySubmit,
+  frameRelayKeystroke,
+  frameRemoteSubmission,
 } from "./relayGate";
 import { PASTE_START, PASTE_END } from "../pasteMarkers";
 
@@ -324,5 +326,66 @@ describe("picker answers are keystrokes, never bracketed pastes (roborev 60573)"
       submit: true,
     })?.text;
     expect(text).toBe(`${PASTE_START}first\nsecond${PASTE_END}\r`);
+  });
+});
+
+// DIRECT tests for the keystroke framer (roborev 60642). It is a SECOND place that mints
+// FramedPtyText, and it was reachable only indirectly through authorizeDecision — so the properties
+// unique to it were asserted nowhere, and deleting its `scrubControls(...)` call left the suite
+// green. That is the same untested-seam shape this file keeps closing on other people's code.
+describe("frameRelayKeystroke — the picker-answer framing", () => {
+  it("appends exactly one CR and NO bracketed-paste wrapper", () => {
+    expect(frameRelayKeystroke("y")).toBe("y\r");
+    expect(frameRelayKeystroke("y\n")).toBe("y\r");
+    expect(frameRelayKeystroke("y\r\n")).toBe("y\r");
+    expect(frameRelayKeystroke("y\r")).toBe("y\r");
+  });
+
+  it("never emits two Enters for a CRLF-framed answer", () => {
+    expect(frameRelayKeystroke("2\r\n").split("\r").length - 1).toBe(1);
+  });
+
+  it("scrubs control bytes — deleting scrubControls here must turn this red", () => {
+    expect(frameRelayKeystroke("y\u0003\u0004")).toBe("y\r");
+    expect(frameRelayKeystroke("y\u001bx")).toBe("yx\r");
+  });
+
+  it("strips embedded paste markers so a smuggled marker cannot survive unwrapped", () => {
+    expect(frameRelayKeystroke(`${PASTE_START}y${PASTE_END}`)).toBe("y\r");
+  });
+});
+
+describe("frameRemoteSubmission — the shape discriminator", () => {
+  it("keystroke-frames a single line", () => {
+    expect(frameRemoteSubmission("y\n")).toBe("y\r");
+  });
+
+  it("paste-frames genuine multi-line text — a prompt-kind suggestion must not be mangled", () => {
+    // `pushSuggestions` stores `kind: "prompt"` free text too, not only picker keystrokes. Framing
+    // those as keystrokes DELETED interior newlines with no separator, so a two-line prompt arrived
+    // as one run-on line (roborev 60642).
+    expect(frameRemoteSubmission("line one\nline two")).toBe(
+      `${PASTE_START}line one\nline two${PASTE_END}\r`,
+    );
+  });
+
+  it("an interior CR keeps the keystroke path and is scrubbed, not turned into a second line", () => {
+    // Named for what is TRUE. An earlier version of this test claimed a `.replace(/\r/g,"")` in
+    // frameRemoteSubmission prevented a CR from flipping the branch; that replace was a no-op with
+    // respect to the branch (deleting CRs cannot change whether a string contains LF) and the test
+    // passed with or without it (roborev 60689). What holds is: CR does not select paste, and it is
+    // removed downstream by scrubControls rather than reaching the PTY as a second Enter.
+    expect(frameRemoteSubmission("y\rx")).toBe("yx\r");
+    expect(frameRemoteSubmission("y\rx").split("\r").length - 1).toBe(1);
+  });
+
+  it("DOCUMENTS THE ACCEPTED RESIDUAL: an interior LF does select the paste path", () => {
+    // Honest pin, not an endorsement. Interior LF is phone-supplied, so a caller CAN choose paste
+    // framing for what a dialog wanted as a keystroke. Accepted because an authenticated phone
+    // already has an unconditional paste-framed path via `agent_input`, so this grants no capability
+    // it lacks; the exposure is a mis-framed picker answer, not privilege escalation. If picker
+    // cancellation ever matters, gate on the kind of the attention WE raised — that is not
+    // phone-authored. This test exists so the residual is visible rather than implied.
+    expect(frameRemoteSubmission("y\nx")).toBe(`${PASTE_START}y\nx${PASTE_END}\r`);
   });
 });

@@ -892,6 +892,20 @@ fn build_turn_command(script: &str, cwd: &std::path::Path, config_dir: Option<&s
     // (usually absent) `CLAUDE_CONFIG_DIR` and so always ran as `$HOME/.claude`, which is why
     // authenticating a different account elsewhere never moved it off an exhausted login.
     crate::claude::apply_spawn_config_dir(&mut cmd, config_dir);
+    // SCRUB THE INHERITED SECRETS — including the ANTHROPIC_* family (security audit M1/H2).
+    //
+    // A comment ~260 lines above this function asserted "the concierge's own `claude -p` child runs
+    // with these stripped." It did not. `scrub_anthropic_env_for`'s only call sites were the
+    // diagnostic `claude auth status` probe and two internal `claude_oneshot` builders — so the path
+    // that merely REPORTS whether you are signed in was scrubbed, and the path that actually ACTS
+    // was not. If Sparkle's process carries `ANTHROPIC_API_KEY` or `ANTHROPIC_BASE_URL`, a
+    // dispatched turn silently authenticated against the wrong credential: precisely the false
+    // "you're signed in" bug the scrub was written to prevent (see accounts.rs's account of the
+    // prior incident), except on the path with real consequences.
+    crate::claude_oneshot::scrub_anthropic_env_for(&mut cmd);
+    for name in crate::claude_oneshot::secret_env_names_now() {
+        cmd.env_remove(&name);
+    }
     cmd.current_dir(cwd);
     // No stdin: `-p` is one-shot, and a null stdin guarantees nothing can block on input.
     cmd.stdin(Stdio::null());

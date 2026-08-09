@@ -293,18 +293,53 @@ pub(crate) fn read_accounts_at(path: &Path) -> Result<Vec<Account>, String> {
 /// mid-write thus leaves the previous valid file intact rather than a truncated one
 /// — important because `read_accounts_at` treats a present-but-unparseable file as a
 /// hard error that would lock the user out of all account management.
+/// Tighten `path` to `mode` if it is currently WIDER, leaving an already-stricter mode alone.
+///
+/// Self-healing, not just correct-going-forward: every existing install already has a 0644
+/// `accounts.json` and a 0755 `accounts/` on disk, and those users get nothing from a fix that only
+/// applies at creation time. Never widens — a deployment that keeps things at 0400 must not be
+/// loosened by its own hardening. No-op off Unix so the Windows build still compiles
+/// (security audit 2026-08-08, M2).
+#[cfg(unix)]
+fn tighten_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = std::fs::metadata(path) else { return };
+    let current = meta.permissions().mode() & 0o777;
+    if current & !mode != 0 {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(current & mode));
+    }
+}
+#[cfg(not(unix))]
+fn tighten_mode(_path: &Path, _mode: u32) {}
+
 fn write_accounts_at(path: &Path, accounts: &[Account]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir app data dir: {e}"))?;
+        // The DIRECTORY too, not just the file. `create_dir_all` leaves the OS default (0755), so
+        // any other local user could list every registered account — an agent did not even have to
+        // guess an id. Matches what each per-account config dir already does two functions away.
+        tighten_mode(parent, 0o700);
     }
     let json = serde_json::to_vec_pretty(accounts).map_err(|e| format!("serialize accounts: {e}"))?;
     // Temp file in the same dir so the final rename stays on one filesystem (atomic).
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, &json).map_err(|e| format!("write accounts.json tmp: {e}"))?;
+    // MODE SET ON THE TEMP FILE, BEFORE THE RENAME. `fs::write` creates at the umask default
+    // (usually 0644), and a rename carries the source's mode across — so chmod'ing after the rename
+    // leaves a window in which the real `accounts.json` exists world-readable. Ordering is the whole
+    // point: same file, same bits, different exposure.
+    //
+    // The file holds no tokens, but it does carry account nicknames, the absolute path of every
+    // account's config dir (a map of where the credentials live), and via `exhausted_identity` the
+    // user's plaintext email.
+    tighten_mode(&tmp, 0o600);
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp); // best-effort cleanup of the orphan temp
         format!("rename accounts.json into place: {e}")
-    })
+    })?;
+    // Self-heal an install that already has a 0644 file from before this fix.
+    tighten_mode(path, 0o600);
+    Ok(())
 }
 
 // ---- mutations (pure) ---------------------------------------------------------
@@ -2794,6 +2829,43 @@ pub async fn claude_auth_status(config_dir: Option<String>) -> ClaudeAuthStatus 
 
 #[cfg(test)]
 mod tests {
+
+    /// accounts.json must be owner-only, and so must the directory holding it (audit M2).
+    #[test]
+    #[cfg(unix)]
+    fn accounts_json_and_its_dir_are_owner_only_and_self_heal() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("accounts-store");
+        let path = dir.join("accounts.json");
+
+        write_accounts_at(&path, &[]).unwrap();
+
+        let fmode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let dmode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(fmode, 0o600, "accounts.json must not be world-readable");
+        assert_eq!(dmode & 0o077, 0, "the accounts dir must not be listable by others");
+
+        // SELF-HEALING: an install created before this fix already has a 0644 file on disk, and a
+        // creation-time-only fix would never reach it.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_accounts_at(&path, &[]).unwrap();
+        let healed = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(healed, 0o600, "a pre-existing 0644 file must be tightened");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn tighten_mode_never_widens_an_already_stricter_file() {
+        // A deployment that keeps its files at 0400 must not be LOOSENED by our own hardening.
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("x");
+        std::fs::write(&f, b"x").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o400)).unwrap();
+        tighten_mode(&f, 0o600);
+        assert_eq!(std::fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o400);
+    }
     /// Build an `OauthIdentity` for the exhaustion tests. `uuid`/`email` are independent so both
     /// rungs of the identity ladder can be exercised.
     fn oauth(uuid: Option<&str>, email: &str) -> OauthIdentity {

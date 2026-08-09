@@ -27,7 +27,7 @@ import {
   authorizeAgentInput,
   authorizeDecision,
   resolveSuggestionClick,
-  frameRelayKeystroke,
+  frameRemoteSubmission,
   type FramedPtyText,
   type AgentInputPayload,
   type DecisionPayload,
@@ -322,18 +322,20 @@ export async function startRelayHost(): Promise<void> {
         .catch((e) => console.debug("relay suggestion_click closeAgent failed", e));
       return;
     }
-    // `frameRelayKeystroke`, NOT `frameRelaySubmit` (roborev 60573, High). A suggestion click is a
-    // picker KEYSTROKE — `"y\n"`, `"n\n"`, `"2\n"` answering a live raw-mode Ink dialog — and this
-    // path briefly wrapped it in a bracketed paste, which the rest of the codebase forbids in
-    // several places at once (conciergeDispatch's header rules, frameCloudSubmit refusing while a
-    // picker is live, dictationTerminalRoute.WRITE_BLOCKING_PROMPTS).
+    // Framed BY SHAPE (roborev 60573 High, then 60642). Most suggestion values are picker
+    // keystrokes — `"y\n"`, `"n\n"`, `"2\n"` answering a live raw-mode Ink dialog — and wrapping one
+    // in a bracketed paste is forbidden in three other places at once (conciergeDispatch's header
+    // rules, frameCloudSubmit refusing while a picker is live,
+    // dictationTerminalRoute.WRITE_BLOCKING_PROMPTS). But NOT all of them are: `pushSuggestions`
+    // also stores `kind: "prompt"` free text, so unconditional keystroke framing deleted interior
+    // newlines and mangled a multi-line prompt into one run-on line.
     //
     // The bug it caused: a phone tap on "Approve" sent `ESC[200~y ESC[201~\r` while the SAME button
     // clicked on the desktop sent `y\r`. Against a permission dialog whose select component does
     // not consume paste markers, that leading ESC reads as Escape and cancels the prompt. The
     // keystroke framer still strips markers and scrubs control bytes — it just does not paste-wrap,
     // so the phone and the desktop send identical bytes for the same button.
-    writeFramedToPty(r.agentId, frameRelayKeystroke(r.value), "suggestion_click");
+    writeFramedToPty(r.agentId, frameRemoteSubmission(r.value), "suggestion_click");
   });
 
   // The phone answered an attention — authorize + inject into that agent's PTY (gate: relayGate).

@@ -1411,12 +1411,29 @@ fn restore_one(op: &str, args: &OpRestoreArgs) -> Result<(), String> {
     //
     // `ensure_seeded_path_ignored` wants (repo-ish root, relative path); the parent directory and
     // the file name give it both, and it resolves the real toplevel itself.
+    // BEFORE the download, restoring the ordering the sibling seed path states as load-bearing
+    // ("never a window in which an unignored secret exists on disk"). Moving it after was wrong
+    // (roborev 60691): it put the plaintext in the repo first and appended the rule across a
+    // 1Password CLI fetch — seconds of network — during which an agent with bypass-permissions
+    // running `git add -A` in that project can stage it. That IS the H1 condition.
+    //
+    // The two defects that reorder was meant to fix are handled without it: the message below is
+    // now conditional rather than past-tense, and a rule left behind by a download that then fails
+    // is INERT — an ignore entry for a path that does not exist matches nothing and is idempotent
+    // on the next attempt. Inert litter is a much better trade than a window of unprotected
+    // plaintext.
     if let (Some(parent), Some(name)) = (target.parent(), target.file_name()) {
         if !ensure_seeded_path_ignored(parent, Path::new(name)) {
-            // Count-only, no path — the module's standing privacy rule (a path names a user's
-            // project and file).
+            // Count-only, no path — the module's standing privacy rule.
+            //
+            // A LOG IS A WEAK CHANNEL and this is knowingly the weak half of "make it safe where we
+            // can, warn otherwise": `op_restore` returns `Result<(), String>` and the frontend
+            // invokes it as `invoke<void>`, so an unprotected restore is indistinguishable in the UI
+            // from a protected one. Surfacing it means adding a non-fatal outcome field to the
+            // FROZEN IPC contract at the top of this file — a deliberate contract change, not
+            // something to slip in beside a security fix. Named so the gap is known, not overlooked.
             tracing::warn!(
-                "restored an env file this project's git may not ignore — add it to .gitignore"
+                "restoring an env file this project's git will not ignore — add it to .gitignore"
             );
         }
     }
@@ -1566,6 +1583,14 @@ pub(crate) struct SeedOutcome {
     pub written: Vec<String>,
     pub rejected: usize,
     pub failed: usize,
+    /// A SAFETY REFUSAL — we could not prove this repo would ignore the file, so we did not write
+    /// it. Distinct from `failed` (an I/O or download error) and from `rejected` (a vault title
+    /// trying to escape the worktree). Returned rather than only logged: this struct's own doc says
+    /// keeping counters in the return type is what lets a test tell the cases apart, and a counter
+    /// that lives only in a tracing line made the distinction unobservable to every caller AND was
+    /// a net loss — refusals used to land in `failed`, which tests could at least read
+    /// (roborev 60653).
+    pub refused: usize,
     /// The worktree vanished mid-run and the loop stopped. Distinct from `rejected`.
     pub torn_down: bool,
 }
@@ -1607,9 +1632,13 @@ fn repo_toplevel(root: &Path) -> Option<PathBuf> {
 /// `check-ignore` exit 1 is a legitimate ANSWER ("not ignored"), not a failure. Conflating the two
 /// is precisely the mistake this whole guard exists to avoid.
 ///
-/// Note the absence of `--no-index`: here we WANT the index-aware answer. A path already tracked in
-/// this repo is not something we are about to leak by seeding — it is already committed — and the
-/// question that matters is whether an untracked write would be staged by `git add -A`.
+/// INDEX-AWARE ON PURPOSE, and the caller handles the consequence rather than this function.
+/// For a TRACKED path `check-ignore` exits 1 — "not ignored" — whatever the rules say. That is not
+/// a wrong answer to work around here; it is why `ensure_seeded_path_ignored` short-circuits on
+/// `ls-files --error-unmatch` BEFORE reaching its append branch. Without that short-circuit the
+/// caller would append a rule git can never honour for that path and then refuse forever.
+/// (An earlier version of this comment argued for `--no-index` while the code did the opposite —
+/// in a guard whose entire history is a true-sounding sentence nobody verified, roborev 60653.)
 fn path_is_git_ignored(top: &Path, rel: &Path) -> Option<bool> {
     let out = Command::new(crate::preflight::git_program())
         .arg("-C")
@@ -1625,7 +1654,16 @@ fn path_is_git_ignored(top: &Path, rel: &Path) -> Option<bool> {
     }
 }
 
-/// Serializes the read-verify-append-reverify sequence below.
+/// Serializes the READ+APPEND pair below — not the verify probes around it (roborev 60703).
+///
+/// WHY THAT NARROWER SCOPE IS SAFE — and it takes BOTH halves, because git resolves ignore rules
+/// LAST-MATCH-WINS. (1) Every writer here is APPEND-ONLY, and (2) none of them can emit a
+/// NEGATION. Half (2) is not decoration: an appended `!/.env.local` would un-ignore the exact path
+/// we just proved ignored, and the post-write `check-ignore` runs OUTSIDE this lock, so that is a
+/// live window rather than a hypothetical. What guarantees it is the `!` escaping in
+/// `ensure_seeded_path_ignored`'s pattern construction — the two are coupled, so changing either
+/// breaks the other. Reintroduce a read-modify-write, OR emit an unescaped pattern, and this
+/// silently stops being true (roborev 60731).
 ///
 /// `info/exclude` is in git's `common_list`, so EVERY worktree of a project shares one file. Both
 /// seed entry points are `#[tauri::command]`s dispatched through `spawn_blocking`, and Sparkle
@@ -1641,6 +1679,22 @@ fn path_is_git_ignored(top: &Path, rel: &Path) -> Option<bool> {
 /// process — two Sparkle instances on one machine would still race — which is not a configuration
 /// that exists, and the append-only write below bounds the damage if it ever does.
 static EXCLUDE_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Append one ignore rule to `exclude`, idempotently. Returns false only on an I/O failure.
+///
+/// APPEND, never rewrite. Even holding the lock, an append cannot destroy a rule another writer
+/// (a future caller, a human, another process) is relying on, whereas a read-modify-write can.
+fn append_exclude_rule(exclude: &Path, existing: &str, escaped: &str) -> bool {
+    if existing.lines().any(|l| l.trim() == escaped) {
+        return true; // already present — a re-seed must not stack duplicates
+    }
+    use std::io::Write;
+    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(exclude) else {
+        return false;
+    };
+    let lead = if existing.is_empty() || existing.ends_with('\n') { "" } else { "\n" };
+    write!(f, "{lead}{EXCLUDE_MARKER}\n{escaped}\n").is_ok()
+}
 
 /// Guarantee that a file we are about to seed cannot be committed out of the destination repo,
 /// returning whether the caller may proceed with the write.
@@ -1687,6 +1741,32 @@ fn ensure_seeded_path_ignored(root: &Path, rel: &Path) -> bool {
         Some(false) => {}
     }
 
+    // ALREADY TRACKED ⇒ REFUSE, and do not write a rule (roborev 60658 + 60691).
+    //
+    // The first version of this short-circuit returned TRUE, which is catastrophically wrong in a
+    // function whose `true` IS permission to write a secret here: both seed call sites proceed on
+    // `true`, so a tracked path became fail-OPEN on exactly the H1 condition. Tracked is not
+    // "nothing to guard" — it is the worst destination there is. The reasoning that misled me was
+    // about the file's OLD bytes ("already committed, nothing left to leak"); what is about to be
+    // written is a LIVE vault secret, and a tracked path needs no `git add -A` at all — `git commit
+    // -a` publishes it, and `git status` shows an ordinary modification rather than the untracked
+    // file a human might notice.
+    //
+    // Returning FALSE without appending also keeps 60658's point intact: `check-ignore` is
+    // index-aware, so a rule here could never take effect for a tracked path, and writing one would
+    // be permanent litter in the shared common gitdir. Refuse, write nothing.
+    if Command::new(crate::preflight::git_program())
+        .arg("-C")
+        .arg(&top)
+        .args(["ls-files", "--error-unmatch", "--"])
+        .arg(rel_from_top)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        return false;
+    }
+
     // Anchored to the repo root, with git's pattern metacharacters escaped so a path containing
     // `*`, `?`, `[` or a leading `!`/`#` cannot widen into a broader pattern — or, worse, become a
     // NEGATION that un-ignores something else already in the file.
@@ -1707,28 +1787,23 @@ fn ensure_seeded_path_ignored(root: &Path, rel: &Path) -> bool {
     }
     let info = common.join("info");
 
-    let _guard = EXCLUDE_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    // Re-ask under the lock: a concurrent seed of the same project may have added this very rule
-    // between our check above and acquiring the lock.
-    if path_is_git_ignored(&top, rel_from_top) == Some(true) {
-        return true;
-    }
-    if std::fs::create_dir_all(&info).is_err() {
-        return false;
-    }
-    let exclude = info.join("exclude");
-    let existing = std::fs::read_to_string(&exclude).unwrap_or_default();
-    if !existing.lines().any(|l| l.trim() == escaped) {
-        // APPEND, never rewrite. Even holding the lock, an append cannot destroy a rule another
-        // writer (a future caller, a human, another process) is relying on, whereas a
-        // read-modify-write can.
-        use std::io::Write;
-        let opened = std::fs::OpenOptions::new().create(true).append(true).open(&exclude);
-        let Ok(mut f) = opened else { return false };
-        let lead = if existing.is_empty() || existing.ends_with('\n') { "" } else { "\n" };
-        if write!(f, "{lead}{EXCLUDE_MARKER}\n{escaped}\n").is_err() {
+    // SCOPED TO THE READ+APPEND ONLY (roborev 60653). Holding it across the git probes would put
+    // two unbounded subprocess spawns inside the critical section — and `check-ignore` reads the
+    // index and can invoke `core.fsmonitor`, so one stall on a dead network mount or a wedged
+    // fsmonitor daemon would block EVERY seed in the process and pile up `spawn_blocking` threads
+    // across all concurrent agent spawns. Only the read→append pair needs mutual exclusion; the
+    // "microseconds" claim in the lock's own doc describes the file write, not a `git` fork.
+    let appended = {
+        let _guard = EXCLUDE_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if std::fs::create_dir_all(&info).is_err() {
             return false;
         }
+        let exclude = info.join("exclude");
+        let existing = std::fs::read_to_string(&exclude).unwrap_or_default();
+        append_exclude_rule(&exclude, &existing, &escaped)
+    };
+    if !appended {
+        return false;
     }
 
     // The load-bearing line: git's own verdict, after our write, is the only thing we trust.
@@ -1850,7 +1925,7 @@ fn seed_worktree_outcome(
             "withheld env file(s) this project's git would not ignore"
         );
     }
-    Ok(SeedOutcome { written, rejected: skipped_unsafe, failed, torn_down })
+    Ok(SeedOutcome { written, rejected: skipped_unsafe, failed, refused: refused_unignorable, torn_down })
 }
 
 /// Copy every backup-worthy `.env*` file from `source_root` into `dest_root` at the same relative
@@ -1869,7 +1944,18 @@ fn seed_worktree_outcome(
 /// A worktree's `.env.local` was always a copy of the one already in the project checkout, so the
 /// vault was never the nearest source. Copying locally is also strictly fresher — it picks up edits
 /// made since the last backup.
+/// [`seed_from_checkout_outcome`] with the counters dropped — the shape the spawn path wants.
+/// Mirrors the `seed_worktree` / `seed_worktree_outcome` split already in this module.
 fn seed_from_checkout(source_root: &str, dest_root: &str) -> Result<Vec<String>, String> {
+    seed_from_checkout_outcome(source_root, dest_root).map(|o| o.written)
+}
+
+/// As [`seed_from_checkout`], but RETURNING THE COUNTERS.
+///
+/// `refused` (we could not prove the repo would ignore it) has to be distinguishable from `failed`
+/// (the copy errored) by something other than a log line, or a regression that turns one into the
+/// other is undetectable — see `SeedOutcome::refused` (roborev 60653).
+fn seed_from_checkout_outcome(source_root: &str, dest_root: &str) -> Result<SeedOutcome, String> {
     let source = PathBuf::from(source_root);
     if !source.is_dir() {
         return Err("the project folder couldn't be read".to_string());
@@ -1955,7 +2041,7 @@ fn seed_from_checkout(source_root: &str, dest_root: &str) -> Result<Vec<String>,
             "withheld env file(s) this project's git would not ignore — add them to .gitignore,              or check that git is runnable and the repo's gitdir is writable"
         );
     }
-    Ok(written)
+    Ok(SeedOutcome { written, rejected: 0, failed, refused, torn_down: false })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -4270,6 +4356,121 @@ fi
             !dst.path().join(".env.local").exists(),
             "an unprotectable secret must not be on disk"
         );
+    }
+
+    #[test]
+    fn checkout_seed_into_a_SUBDIRECTORY_uses_the_repo_toplevel_and_creates_no_fake_gitdir() {
+        // THE MOTIVATING CASE FOR repo_toplevel (roborev 60608/60653), previously untested — every
+        // other fixture passes the toplevel itself, so restoring the old `is_git_worktree` +
+        // `git_dirs(root)` left the whole suite green.
+        let src = tmp();
+        let repo = tmp();
+        init_repo(repo.path(), ".env\n");
+        let sub = repo.path().join("sub/dir");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(src.path().join(".env.local"), "ROOT=1\n").unwrap();
+
+        let written =
+            seed_from_checkout(&src.path().to_string_lossy(), &sub.to_string_lossy()).unwrap();
+
+        assert_eq!(written, vec![".env.local".to_string()]);
+        // Ignored via a rule ANCHORED AT THE REPO ROOT, not at the subdirectory.
+        assert!(is_ignored(repo.path(), "sub/dir/.env.local"));
+        let body = std::fs::read_to_string(repo.path().join(".git/info/exclude")).unwrap();
+        assert!(body.contains("/sub/dir/.env.local"), "rule must be repo-anchored, got: {body:?}");
+        // …and NO fabricated gitdir inside the user's project. That was the visible symptom: an
+        // untracked `.git/info/` git never reads, left behind while the seed was refused.
+        assert!(!sub.join(".git").exists(), "must not fabricate a .git inside the repo");
+    }
+
+    #[test]
+    fn checkout_seed_appends_to_info_exclude_without_destroying_existing_rules() {
+        // Pins APPEND-not-rewrite (roborev 60653). `git init` writes a default info/exclude and the
+        // old read-modify-write preserved that too, so the duplicate-rule test passed under either
+        // implementation. A sentinel nobody else writes is what actually distinguishes them.
+        let src = tmp();
+        let dst = tmp();
+        init_repo(dst.path(), ".env\n");
+        std::fs::write(src.path().join(".env.local"), "ROOT=1\n").unwrap();
+        let exclude = dst.path().join(".git/info/exclude");
+        std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        std::fs::write(&exclude, "# sentinel-from-someone-else\n/keep-me.txt\n").unwrap();
+
+        seed_from_checkout(&src.path().to_string_lossy(), &dst.path().to_string_lossy()).unwrap();
+
+        let body = std::fs::read_to_string(&exclude).unwrap();
+        assert!(body.contains("/keep-me.txt"), "an existing rule must survive: {body:?}");
+        assert!(body.contains("/.env.local"), "our rule must be added: {body:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_safety_refusal_is_counted_separately_from_an_io_failure() {
+        // The counter has to be OBSERVABLE, not just logged (roborev 60653). Without this, a
+        // regression that turns a safety refusal into an I/O failure — or the reverse — is
+        // undetectable, which is the exact conflation the separate counter exists to prevent.
+        use std::os::unix::fs::PermissionsExt;
+        let src = tmp();
+        let dst = tmp();
+        std::fs::write(src.path().join(".env.local"), "ROOT=1\n").unwrap();
+        init_repo(dst.path(), ".env\n");
+        let exclude = dst.path().join(".git/info/exclude");
+        std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        if !exclude.exists() {
+            std::fs::write(&exclude, "").unwrap();
+        }
+        let orig = std::fs::metadata(&exclude).unwrap().permissions();
+        let mut ro = orig.clone();
+        ro.set_mode(0o400);
+        std::fs::set_permissions(&exclude, ro).unwrap();
+
+        let out = seed_from_checkout_outcome(
+            &src.path().to_string_lossy(),
+            &dst.path().to_string_lossy(),
+        );
+        std::fs::set_permissions(&exclude, orig).unwrap();
+
+        let out = out.unwrap();
+        assert_eq!(out.refused, 1, "an unprovable-ignore is a REFUSAL");
+        assert_eq!(out.failed, 0, "…and must not be reported as an I/O failure");
+        assert!(out.written.is_empty());
+    }
+
+    #[test]
+    fn checkout_seed_REFUSES_a_tracked_destination_rather_than_granting_permission() {
+        // THE FAIL-OPEN I INTRODUCED AND ROBOREV 60691 CAUGHT. The tracked short-circuit first
+        // returned `true` — and `true` is this guard's permission to write a secret. A path tracked
+        // in the index but ABSENT from the working tree slips past the `dest.exists()` skip, so it
+        // would have been seeded with a live vault secret where the code previously refused.
+        // Tracked is the worst destination, not an exempt one: `git commit -a` publishes it with no
+        // `git add -A` at all, and it shows as an ordinary modification rather than an untracked
+        // file someone might notice.
+        let src = tmp();
+        let dst = tmp();
+        init_repo(dst.path(), ".env\n");
+        // Track `.env.local`, then REMOVE it from the working tree — index-present, disk-absent.
+        std::fs::write(dst.path().join(".env.local"), "OLD=1\n").unwrap();
+        std::process::Command::new("git")
+            .arg("-C").arg(dst.path()).args(["add", "-f", ".env.local"]).output().unwrap();
+        std::process::Command::new("git")
+            .arg("-C").arg(dst.path()).args(["commit", "-qm", "track it"]).output().unwrap();
+        std::fs::remove_file(dst.path().join(".env.local")).unwrap();
+        std::fs::write(src.path().join(".env.local"), "SECRET=live\n").unwrap();
+
+        let written =
+            seed_from_checkout(&src.path().to_string_lossy(), &dst.path().to_string_lossy())
+                .unwrap();
+
+        assert!(written.is_empty(), "a tracked destination must NOT be seeded");
+        assert!(
+            !dst.path().join(".env.local").exists(),
+            "the live secret must not be written where a commit -a would publish it"
+        );
+        // …and no useless rule left behind: check-ignore is index-aware, so a rule for a tracked
+        // path could never take effect, and writing one would be permanent litter in the SHARED
+        // common gitdir (roborev 60658).
+        let body = std::fs::read_to_string(dst.path().join(".git/info/exclude")).unwrap_or_default();
+        assert!(!body.contains(EXCLUDE_MARKER), "no rule should be written for a tracked path");
     }
 
     #[test]

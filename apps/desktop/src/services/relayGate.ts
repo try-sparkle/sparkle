@@ -18,9 +18,15 @@
 //   2. An embedded mid-string `\r` submits a SECOND, attacker-chosen line, which the "one
 //      authorized input" model these gates implement never intended to permit.
 //
-// The defence is the same one every other non-live-keystroke write path already runs
-// (`pty.deliverSubmit`, `pty.pasteIntoPty`, `conciergeDispatch.frameCloudSubmit`): strip embedded
-// paste markers, then wrap the body in one bracketed paste. `stripPasteMarkers` is IMPORTED, never
+// TWO FRAMINGS, ONE FILTER. What is common to every path is the FILTER: strip embedded paste
+// markers, then scrub C0 control bytes (`scrubControls`). That is the primary defence, and it holds
+// whatever the foreground program is doing. The WRAPPER is not universal and must not be assumed:
+//   * TEXT (free-typed `agent_input`, a multi-line reply) is bracketed-pasted, matching every other
+//     non-live-keystroke write path (`pty.deliverSubmit`, `pty.pasteIntoPty`, `frameCloudSubmit`).
+//   * A PICKER ANSWER (`y`, `n`, `2` answering a live raw-mode Ink dialog) is NOT. Wrapping one is
+//     forbidden elsewhere in this codebase for good reason: the leading ESC reads as Escape and
+//     cancels the dialog. See `frameRelayKeystroke` (roborev 60573).
+// `frameRemoteSubmission` picks between them by shape. `stripPasteMarkers` is IMPORTED, never
 // re-implemented — a near-duplicate of a security filter is exactly how one copy gets fixed and
 // the other does not, which is the bug class this file is closing.
 //
@@ -62,7 +68,11 @@ export type FramedPtyText = string & { readonly [RELAY_FRAMED]: true };
 
 export interface PtyWrite {
   agentId: string;
-  /** Already stripped and bracketed-paste framed — see {@link FramedPtyText}. */
+  /** Already scrubbed and framed — see {@link FramedPtyText}. TWO framings mint this brand:
+   *  {@link frameRelayKeystroke} (picker answers: scrub + one CR, NO wrapper) and
+   *  {@link frameRelaySubmit} / {@link framePaste} (text: scrub + bracketed paste). Control-byte
+   *  scrubbing is common to both; the wrapper is not, so do not assume a `FramedPtyText` is
+   *  bracketed. */
   text: FramedPtyText;
 }
 
@@ -154,6 +164,41 @@ function scrubControls(s: string): string {
 }
 
 /**
+ * Frame a remote submission by SHAPE: a single line is a keystroke, multiple lines are text.
+ *
+ * Shared by `authorizeDecision` and the `suggestion_click` write path because BOTH carry a mix.
+ * Decision replies are usually picker answers but can be typed text; and a suggestion value is only
+ * a keystroke when the pushed button was `kind: "terminal"` — `pushSuggestions` also stores
+ * `kind: "prompt"` free text (`catalog.ts` ships "Go ahead and rebase main, issue a PR, and merge
+ * to main.", and `engine.ts` accepts model-authored values). Keystroke-framing those unconditionally
+ * DELETED their interior newlines with no separator, so a two-line prompt arrived as
+ * `line onelinetwo` and went in unwrapped (roborev 60642).
+ *
+ * A CHOSEN RESIDUAL, stated plainly rather than claimed away. An earlier comment here said the
+ * discriminator was not attacker-controlled because interior CR is dropped before the test. That was
+ * only half true: interior LF is equally phone-supplied, so `reply: "y\nx"` still selects the paste
+ * path and can paste-wrap what a dialog wanted as a keystroke. It is accepted, not closed, because
+ * an authenticated phone ALREADY has an unconditional paste-framed path via `agent_input`, so
+ * gating this one adds no capability it does not already have; the exposure is a mis-framed picker
+ * answer (an annoying dialog cancel), not privilege escalation. Closing it properly means gating on
+ * the kind of the attention WE raised at `emitAttention` time, which is not phone-authored — worth
+ * doing if picker cancellation ever turns out to matter.
+ */
+export function frameRemoteSubmission(value: string): FramedPtyText {
+  // WHAT ACTUALLY KEEPS THE BRANCH OUT OF ATTACKER HANDS is that only LF is tested, plus
+  // `stripTerminator`. An earlier version stripped `\r` here and claimed that was the guard; it was
+  // a no-op with respect to this branch — deleting CRs cannot change whether a string contains LF —
+  // so the comment described a protection that did not exist as code (roborev 60689). Removing a
+  // false rationale matters more than the line it justified: the next reader would have trusted it.
+  //
+  // `stripTerminator` IS load-bearing: without it `"y\n"` — the ordinary shape of a picker answer —
+  // would test as multi-line, take the paste path, and re-create the cancelled-dialog bug of 60573.
+  return stripTerminator(value).includes("\n")
+    ? frameRelaySubmit(value)
+    : frameRelayKeystroke(value);
+}
+
+/**
  * The wire form of a remote PICKER ANSWER: strip, scrub every control byte, exactly one CR — and
  * NO bracketed-paste wrapper.
  *
@@ -178,6 +223,7 @@ export function frameRelayKeystroke(value: string): FramedPtyText {
   const body = scrubControls(stripPasteMarkers(stripTerminator(value))).replace(/\n/g, "");
   return `${body}\r` as FramedPtyText;
 }
+
 
 /**
  * Authorize a phone DECISION. A decision may ONLY drive an agent we actually raised an attention
@@ -217,13 +263,8 @@ export function authorizeDecision(
   // text. Otherwise the DISCRIMINATOR ITSELF is attacker-controlled: appending a `\r` to a one-key
   // answer would flip a picker reply onto the paste path and re-create the cancelled-dialog bug on
   // demand. A CR is never legitimate inside a reply, so removing it here loses nothing.
-  const body = stripTerminator(d.reply).replace(/\r/g, "");
-  const multiline = body.includes("\n");
-  const text = d.submit || d.reply.endsWith("\n")
-    ? multiline
-      ? frameRelaySubmit(d.reply)
-      : frameRelayKeystroke(d.reply)
-    : framePaste(d.reply);
+  const text =
+    d.submit || d.reply.endsWith("\n") ? frameRemoteSubmission(d.reply) : framePaste(d.reply);
   return { agentId, text };
 }
 

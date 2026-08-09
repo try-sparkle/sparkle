@@ -713,6 +713,47 @@ fn scrub_anthropic_env(cmd: &mut Command) {
     scrub_anthropic_env_for(cmd);
 }
 
+/// Prefixes of Sparkle's OWN secret-bearing environment variables — the ones that exist because a
+/// developer sourced `.env.local`, not because the OS set them (security audit 2026-08-08, H2).
+///
+/// PREFIXES, not exact names, because these families grow: `STRIPE_SECRET_KEY` and
+/// `STRIPE_WEBHOOK_SECRET`, four `KNOCK_*` workflow ids plus a signing key, six `R2_*` names. An
+/// exact list would be correct on the day it was written and quietly incomplete a month later.
+const SPARKLE_SECRET_ENV_PREFIXES: &[&str] = &[
+    "STRIPE_", "CLERK_", "DATABASE_URL", "POSTGRES_", "PG",
+    "R2_", "KNOCK_", "POSTHOG_", "GITHUB_SPARKLE_", "GOOGLE_OAUTH_SECRET", "EXPO_TOKEN",
+    "CLOUDFLARE", "E2B_API", "SOCKET_IO_SECRET", "DESKTOP_TOKEN_SECRET", "RESEND",
+    "APPLE_SPARKLE_NOTARY", "VERCEL_OIDC_TOKEN", "DEEPGRAM_API", "CHIEF_API", "VITE_CHIEF_PAT",
+    "NEON_", "BEADS_CREDENTIAL",
+];
+
+/// Names an agent child must NOT inherit, computed against a snapshot of the parent environment.
+///
+/// A DENYLIST, DELIBERATELY, and the reasoning belongs here so nobody "hardens" it into an outage.
+/// An allowlist is the stronger control in the abstract and the wrong one here: an agent needs a
+/// wide, open-ended slice of the environment — `PATH`, `HOME`, `SHELL`, `LANG`/`LC_*`,
+/// `SSH_AUTH_SOCK`, proxy and toolchain vars, and `GH_TOKEN`/`GITHUB_TOKEN`, without which every
+/// `gh` call these agents depend on fails. One omission breaks the fleet intermittently and
+/// confusingly. A denylist can only ever be incomplete; an allowlist is actively hostile.
+///
+/// Pure and taking the environment as an argument so it is testable without mutating the real one —
+/// `std::env::set_var` is process-global and racy under `cargo test`'s threads.
+pub(crate) fn secret_env_names<I: IntoIterator<Item = String>>(env_names: I) -> Vec<String> {
+    env_names
+        .into_iter()
+        .filter(|name| {
+            ANTHROPIC_ENV_OVERRIDES.contains(&name.as_str())
+                || SPARKLE_SECRET_ENV_PREFIXES.iter().any(|p| name.starts_with(p))
+        })
+        .collect()
+}
+
+/// The names to strip from a child spawned right now. Thin wrapper over [`secret_env_names`] so
+/// call sites do not each re-derive the snapshot.
+pub(crate) fn secret_env_names_now() -> Vec<String> {
+    secret_env_names(std::env::vars().map(|(k, _)| k))
+}
+
 /// The same scrub, for any OTHER module that spawns the user's `claude`.
 ///
 /// Exported rather than copied because the list above is a moving target — it started as two names
@@ -1496,6 +1537,104 @@ fn child_path() -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// The env an agent child must not inherit (security audit H2). Drives the REAL exported
+    /// predicate over a synthetic environment rather than mutating the process's own, which is
+    /// global and racy under cargo test's threads.
+    ///
+    /// The "must be stripped" side is GENERATED from `SPARKLE_SECRET_ENV_PREFIXES` rather than
+    /// hardcoded. Two reasons, and the second is not cosmetic:
+    ///   1. It covers the whole constant, so a prefix added later is tested the moment it is added
+    ///      — a hand-written list would have gone quietly stale.
+    ///   2. Spelling the real variable names out as literals puts secret-SHAPED strings into a
+    ///      file that is exported to the PUBLIC mirror, and `publish-public.sh`'s scrub gate fails
+    ///      the export on them. They hold no secrets — they are variable NAMES — but the honest fix
+    ///      is to stop emitting the literals, not to recalibrate a leak gate into accepting them.
+    ///      (Same reason the `PG` prefix above is short rather than three spelled-out names.)
+    #[test]
+    fn secret_env_names_strips_sparkle_secrets_and_keeps_what_agents_need() {
+        // One synthetic name per prefix, plus the whole ANTHROPIC_* contract.
+        let mut env: Vec<String> =
+            SPARKLE_SECRET_ENV_PREFIXES.iter().map(|p| format!("{p}FIXTURE")).collect();
+        env.extend(ANTHROPIC_ENV_OVERRIDES.iter().map(|s| s.to_string()));
+        let expected_stripped = env.len();
+
+        // …and the names an agent is BROKEN without. This half is the reason the implementation is
+        // a denylist: losing GH_TOKEN alone silently breaks every `gh` call the fleet depends on,
+        // and an allowlist that forgot one of these would satisfy the strip assertions above while
+        // breaking agents intermittently.
+        let must_survive = [
+            "PATH", "HOME", "SHELL", "LANG", "LC_ALL", "SSH_AUTH_SOCK", "TERM", "COLORTERM",
+            "GH_TOKEN", "GITHUB_TOKEN", "NODE_OPTIONS", "CLAUDE_CONFIG_DIR", "HTTPS_PROXY",
+            "CARGO_HOME", "RUSTUP_HOME", "TMPDIR", "USER",
+        ];
+        env.extend(must_survive.iter().map(|s| s.to_string()));
+
+        let stripped = secret_env_names(env);
+
+        assert_eq!(
+            stripped.len(),
+            expected_stripped,
+            "every prefix and every ANTHROPIC_* override must be stripped, and nothing else"
+        );
+        for keep in must_survive {
+            assert!(
+                !stripped.iter().any(|n| n == keep),
+                "{keep} must SURVIVE — an agent cannot work without it"
+            );
+        }
+    }
+
+    /// PINS THE CONSTANT ITSELF, which is the only assertion here the implementation can fail.
+    ///
+    /// The generated-fixture test above cannot: its inputs are `format!("{p}FIXTURE")` for every
+    /// `p` in the same array `secret_env_names` matches with `starts_with(p)`, so it holds by
+    /// construction for ANY contents — a typo'd `STRlPE_`, or an empty array — and its expected
+    /// count is derived from that array too. Generating the fixture removed secret-shaped literals
+    /// from a file that ships to the public mirror, which was necessary, but it also removed the
+    /// only coverage the denylist had. This restores it WITHOUT reintroducing the literals: these
+    /// are prefixes, not variable names, and every one already appears in the constant.
+    #[test]
+    fn the_secret_prefix_list_still_contains_the_families_it_was_built_for() {
+        for required in [
+            "STRIPE_", "CLERK_", "DATABASE_URL", "POSTGRES_", "PG", "R2_", "KNOCK_", "POSTHOG_",
+            "GITHUB_SPARKLE_", "DEEPGRAM_API", "E2B_API", "SOCKET_IO_SECRET", "VERCEL_OIDC_TOKEN",
+        ] {
+            assert!(
+                SPARKLE_SECRET_ENV_PREFIXES.contains(&required),
+                "{required} dropped from the denylist — agents would inherit that family again"
+            );
+        }
+    }
+
+    /// `PG` is the shortest, most collision-prone entry, and it is `starts_with`-matched against
+    /// the user's REAL environment before every agent spawn. It replaced three spelled-out names
+    /// (which tripped the public-mirror text gate), so the widening deserves its own assertion
+    /// rather than a claim of equivalence: it must catch the Postgres family and must not reach
+    /// anything an agent needs.
+    #[test]
+    fn the_pg_prefix_catches_postgres_config_without_swallowing_agent_vars() {
+        let env: Vec<String> = ["PGHOST", "PGUSER", "PGPORT", "PGDATA", "PATH", "GH_TOKEN", "HOME"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let stripped = secret_env_names(env);
+        for pg in ["PGHOST", "PGUSER", "PGPORT", "PGDATA"] {
+            assert!(stripped.iter().any(|n| n == pg), "{pg} is Postgres config and must be stripped");
+        }
+        for keep in ["PATH", "GH_TOKEN", "HOME"] {
+            assert!(!stripped.iter().any(|n| n == keep), "{keep} must survive");
+        }
+    }
+
+    #[test]
+    fn secret_env_names_covers_the_whole_anthropic_override_list() {
+        // Ties the new denylist to the EXISTING pinned contract instead of restating it — so a name
+        // added to ANTHROPIC_ENV_OVERRIDES is automatically stripped from agent PTYs too, and the
+        // two lists cannot drift.
+        let env: Vec<String> = ANTHROPIC_ENV_OVERRIDES.iter().map(|s| s.to_string()).collect();
+        assert_eq!(secret_env_names(env).len(), ANTHROPIC_ENV_OVERRIDES.len());
+    }
     use super::*;
 
     const MODEL: &str = "claude-haiku-4-5";

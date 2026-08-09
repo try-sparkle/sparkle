@@ -626,6 +626,23 @@ pub async fn pty_spawn(
             // TUIs emit their normal palette. (env() overrides on top of the inherited env.)
             cmd.env("TERM", "xterm-256color");
             cmd.env("COLORTERM", "truecolor");
+            // DO NOT HAND THE AGENT SPARKLE'S SECRETS (security audit 2026-08-08, H2).
+            //
+            // `CommandBuilder` inherits the FULL parent environment by default, and this child is an
+            // autonomous agent running with `--dangerously-skip-permissions` that auto-approves its
+            // own tool calls. So every secret in Sparkle.app's process environment was flowing
+            // straight into it. That is not hypothetical: this repo's working tree carries
+            // `.env.local`, `apps/orchestration/.env` and `apps/web/.env.local` holding GitHub PATs
+            // with repo write, Stripe and Clerk secret keys, production Postgres credentials and R2
+            // tokens — and if Sparkle is launched from a shell that sourced any of them, they were
+            // inherited here.
+            //
+            // The list is shared with `claude_oneshot`'s existing ANTHROPIC_* scrub rather than
+            // copied, so the two cannot drift — that scrub already existed on a NEIGHBOURING path,
+            // which is what made the omission here a gap rather than an oversight.
+            for name in crate::claude_oneshot::secret_env_names_now() {
+                cmd.env_remove(&name);
+            }
             // Bound the child's V8 heap so a runaway agent can't run itself up to Node's ~4 GiB
             // default ceiling (sparkle-01xv). Merges with — never clobbers — a NODE_OPTIONS the
             // user already set; see node_options_with_cap.
