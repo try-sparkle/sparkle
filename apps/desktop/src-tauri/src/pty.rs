@@ -248,14 +248,26 @@ pub struct PtyManager {
     sessions: Mutex<HashMap<String, PtySession>>,
 }
 
-impl PtyManager {
-    fn remove(&self, id: &str) {
-        // Poison-tolerant: a panic while another thread held this lock must not wedge every
-        // later pty_spawn/write/resize/kill app-wide. The recovered guard still points at a
-        // valid HashMap (mirrors accounts.rs / trial.rs).
-        self.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
-    }
+/// What a reader thread's reap found under its id — see [`PtyManager::reap`].
+///
+/// Only ONE of these means "leave everything else alone". The other two are both "this teardown is
+/// mine to finish", and collapsing them into a bool is what breaks the ordinary kill path: gate a
+/// per-id cleanup on "did I remove a row" and it stops running whenever `pty_kill` got there first,
+/// which is every deliberate stop.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Reap {
+    /// Our session was in the map and we took it out — the natural-exit path.
+    RemovedOurs,
+    /// Nothing under this id. `pty_kill` removes the session itself before the reader wakes on EOF,
+    /// so this is the ordinary deliberate-stop teardown, NOT an anomaly: the id is unowned and the
+    /// rest of this reader's cleanup must still run.
+    AlreadyGone,
+    /// A DIFFERENT life owns this id now — an overlapping spawn replaced us while we were reading.
+    /// Touch nothing: the session, its observer and its terminal all belong to a live PTY.
+    OwnedByOther,
+}
 
+impl PtyManager {
     /// Insert a session under `id`, MINTING ITS EPOCH WHILE THE MAP IS LOCKED, and return that epoch.
     ///
     /// The mint and the insert are one critical section on purpose, and the reason is subtle enough
@@ -283,8 +295,7 @@ impl PtyManager {
         epoch
     }
 
-    /// Remove the session under `id` ONLY IF it is the life identified by `epoch`. Returns whether
-    /// it removed anything, so a caller can gate its other per-id teardown on the same answer.
+    /// A reader thread's reap: drop this id's session IF this reader still owns it.
     ///
     /// THE TEARDOWN TWIN OF [`PtyManager::insert_session`], and needed for the same reason. A reader
     /// thread outlives the insert that replaced its session: after an overlapping spawn the loser is
@@ -294,16 +305,23 @@ impl PtyManager {
     /// "no such pty" for a terminal the user is typing into, with no `pty:exit` to explain it, since
     /// the loser's exit carries the lower epoch and the frontend filters it out by design.
     ///
-    /// A `false` return is therefore not a failure: it is "someone else owns this id now, leave
-    /// their session alone".
-    fn remove_if_epoch(&self, id: &str, epoch: u64) -> bool {
+    /// THREE ANSWERS, NOT TWO, and the third is why: "nothing is here" and "someone else is here"
+    /// are opposite instructions to the caller, and a bool that merges them gets the common path
+    /// wrong. `pty_kill` removes the session by id BEFORE the reader wakes on EOF, so the ordinary
+    /// deliberate-kill teardown finds an empty slot — and it is still that reader's job to finish
+    /// tearing down (see [`Reap::AlreadyGone`]).
+    ///
+    /// Poison-tolerant, like every other lock here: a panic while another thread held it must not
+    /// wedge spawn/write/resize/kill app-wide, and the recovered guard still points at a valid map.
+    fn reap(&self, id: &str, epoch: u64) -> Reap {
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         match sessions.get(id) {
             Some(s) if s.epoch == epoch => {
                 sessions.remove(id);
-                true
+                Reap::RemovedOurs
             }
-            _ => false,
+            Some(_) => Reap::OwnedByOther,
+            None => Reap::AlreadyGone,
         }
     }
 
@@ -976,13 +994,17 @@ pub async fn pty_spawn(
         // "no such pty" for a live PTY, with no `pty:exit` to explain it (the loser's exit carries
         // the lower epoch and is filtered out by design), and `live_epoch` would drop to NO_EPOCH
         // while a higher-epoch session runs, so an observer's floor would admit a stale exit.
-        let was_ours = read_app.state::<PtyManager>().remove_if_epoch(&read_id, epoch);
+        let reap = read_app.state::<PtyManager>().reap(&read_id, epoch);
         // Stop observing too, or a long-lived app accumulates one 4KB tail and one VT grid per
-        // agent that has ever run. The nudger also keys its ladder state off the live observer set,
-        // so a dead session left here would climb rungs forever and eventually escalate a terminal
-        // that no longer exists. Gated on the same answer: detaching is per-id, so a loser doing it
-        // would blind the nudger to a live terminal.
-        if was_ours {
+        // agent that has ever run. The nudger also keys its ladder state off the live observer set
+        // (`nudger::tick` reads `observers.all()`), so an observer left attached to a dead PTY keeps
+        // its ladder climbing and eventually escalates a terminal that no longer exists.
+        //
+        // Gated on NOT BEING SOMEONE ELSE'S, not on "did I remove a row". `pty_kill` removes the
+        // session by id before the reader wakes on EOF, so on every deliberate stop the reap finds
+        // an empty slot — and gating on the removal would skip the detach exactly there, on the
+        // commonest teardown path there is.
+        if reap != Reap::OwnedByOther {
             read_app.state::<crate::nudger::Observers>().detach(&read_id);
         }
         // Stamped with THIS session's epoch, not with whatever is currently in the map under this
@@ -1287,7 +1309,7 @@ mod tests {
     use super::{
         acquire_writer, apply_heap_cap, guard_resize_size, guard_spawn_size, next_pty_epoch,
         node_options_with_cap, run_flusher, validate_spawn_inner, Credit, FlushBuf, InflightState,
-        PauseState, PtyManager, PtyEnd, PtySession, MIN_PTY_COLS, MIN_PTY_ROWS, NO_EPOCH,
+        PauseState, PtyManager, PtyEnd, PtySession, Reap, MIN_PTY_COLS, MIN_PTY_ROWS, NO_EPOCH,
         PTY_INFLIGHT_HIGH_WATER_BYTES, SPAWN_FALLBACK_COLS, SPAWN_FALLBACK_ROWS,
     };
     use portable_pty::CommandBuilder;
@@ -1314,8 +1336,10 @@ mod tests {
         })
         .join();
         assert!(manager.sessions.is_poisoned(), "mutex should be poisoned by the panic");
-        // remove() goes through the poison-tolerant lock and must not panic.
-        manager.remove("nonexistent");
+        // reap() goes through the poison-tolerant lock and must not panic. Asserted on the ACTUAL
+        // production reap path (every reader thread ends here), not on a helper only tests call —
+        // a poison-tolerance test aimed at an unused function guards nothing.
+        assert_eq!(manager.reap("nonexistent", 1), Reap::AlreadyGone);
         // And the recovered guard still points at a usable HashMap.
         let len = manager.sessions.lock().unwrap_or_else(|e| e.into_inner()).len();
         assert_eq!(len, 0);
@@ -1750,8 +1774,9 @@ mod tests {
         assert!(winner > loser, "the later insert must carry the higher epoch");
 
         // The LOSER's reader thread reaches its teardown first and asks to reap.
-        assert!(
-            !mgr.remove_if_epoch("agent-overlap", loser),
+        assert_eq!(
+            mgr.reap("agent-overlap", loser),
+            Reap::OwnedByOther,
             "a replaced session must not be able to remove the id it no longer owns"
         );
         assert_eq!(
@@ -1766,11 +1791,23 @@ mod tests {
         );
 
         // …and the winner's own reaper still works, or sessions would leak forever.
-        assert!(
-            mgr.remove_if_epoch("agent-overlap", winner),
+        assert_eq!(
+            mgr.reap("agent-overlap", winner),
+            Reap::RemovedOurs,
             "the session that owns the id must still be removable by its own reader"
         );
         assert_eq!(mgr.live_epoch("agent-overlap"), NO_EPOCH, "and the id is then free");
+
+        // THE KILL ORDERING, which is the common path and the one a two-answer reap gets wrong.
+        // `pty_kill` removes the session itself before the reader wakes on EOF, so the reader's reap
+        // finds an empty slot. That is "mine to finish tearing down", NOT "someone else's" — read it
+        // as the latter and `Observers::detach` is skipped on every deliberate stop, leaking the
+        // observer and leaving the nudger's ladder climbing against a PTY that no longer exists.
+        assert_eq!(
+            mgr.reap("agent-overlap", winner),
+            Reap::AlreadyGone,
+            "an id already emptied by pty_kill is unowned, not owned by someone else"
+        );
 
         for mut child in children {
             let _ = child.kill();
