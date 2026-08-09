@@ -98,6 +98,11 @@ pub enum BeadsErrorKind {
     BdFailed,
     /// bd exceeded BD_TIMEOUT and was killed.
     Timeout,
+    /// bd reached the store but could not complete against it — its own context was canceled, or
+    /// the embedded database refused the write because another writer holds it. Distinct from
+    /// `BdFailed` because the remedy is the opposite one: retry unchanged in a moment. Nothing
+    /// about the request was wrong, so re-issuing it is not "hoping a broken call works".
+    StoreBusy,
     /// bd exited cleanly but its output was not the JSON we expect (version skew, partial write).
     BadOutput,
 }
@@ -452,6 +457,32 @@ fn error_payload(v: &Value) -> Option<String> {
     Some(e.as_str().map(str::to_string).unwrap_or_else(|| e.to_string()))
 }
 
+/// The wordings that mean "the store was busy", not "the request was bad".
+///
+/// The store is ONE embedded database shared by every worktree in the repo, written by dozens of
+/// agents and polled by this app every five seconds, so a write losing the race for it is an
+/// ordinary event rather than an exceptional one. When that happens bd does not say "locked" — the
+/// Go client's context is canceled first, and the caller is handed the bare runtime phrase
+/// `context canceled`, which names the mechanism and not the cause. Read literally it describes a
+/// call that someone aborted, which is why it reads as a fault in the caller's own request and gets
+/// investigated as one.
+///
+/// Kept as a table rather than inlined so the wordings are auditable in one place. Deliberately
+/// narrow: every entry here is a phrase that can ONLY be produced by the store being unavailable
+/// for the length of the call. Generic exhaustion wordings ("resource temporarily unavailable") are
+/// excluded — a spawn failure is not a busy store, and mistaking one for the other would tell a
+/// caller to retry something that will never succeed.
+const STORE_BUSY_WORDINGS: &[&str] = &[
+    "context canceled",
+    "context cancelled",
+    "context deadline exceeded",
+    "database is locked",
+    "could not acquire lock",
+    "failed to acquire lock",
+    "lock is held",
+    "database is in use",
+];
+
 /// Map a bd failure message onto a typed kind. The substrings are bd's stable wording — the same
 /// contract `services/beads.ts::isBeadsUnavailable` already depends on — and anything unrecognized
 /// stays `BdFailed` rather than being forced into a bucket it may not belong in.
@@ -459,6 +490,8 @@ fn classify_bd_message(msg: &str, code: Option<i32>) -> BeadsError {
     let lower = msg.to_lowercase();
     let kind = if lower.contains("no beads database found") || lower.contains("no beads workspace") {
         BeadsErrorKind::NoWorkspace
+    } else if STORE_BUSY_WORDINGS.iter().any(|w| lower.contains(w)) {
+        BeadsErrorKind::StoreBusy
     } else {
         BeadsErrorKind::BdFailed
     };
@@ -1327,6 +1360,46 @@ mod tests {
     }
 
     #[test]
+    fn a_write_that_lost_the_store_is_store_busy_not_a_failed_request() {
+        // The observed shape: `bd create` blocks on the shared embedded store until bd's own
+        // context expires, then exits non-zero with the bare Go phrase. Driven through
+        // `ack_outcome` because the mutation path is the one that hits it.
+        let out = BdOutput {
+            status: Some(1),
+            success: false,
+            stdout: String::new(),
+            stderr: "Error: context canceled".into(),
+        };
+        let e = ack_outcome(&out).expect_err("a non-zero exit is not an acknowledgement");
+        assert_eq!(e.kind, BeadsErrorKind::StoreBusy);
+        assert_eq!(e.exit_code, Some(1));
+        assert!(e.message.contains("context canceled"), "bd's own wording survives: {}", e.message);
+    }
+
+    #[test]
+    fn a_locked_store_reported_as_a_json_error_payload_is_store_busy_on_the_read_path_too() {
+        // The paired half: same classification, other transport (JSON body rather than stderr) and
+        // other direction (read rather than write). Both call `classify_bd_message`, and this is
+        // what proves it — a fix applied to only one of them passes the test above and fails here.
+        let e = parse_bead_rows(r#"{"error":"database is locked","schema_version":1}"#).unwrap_err();
+        assert_eq!(e.kind, BeadsErrorKind::StoreBusy);
+    }
+
+    #[test]
+    fn an_ordinary_bd_failure_is_still_bd_failed() {
+        // The guard on the table above. Without it, classifying everything as `StoreBusy` would
+        // satisfy both cases above — and would tell a caller to retry a request that is simply
+        // wrong, forever.
+        for msg in ["Error: unknown flag: --nope", "Error: no issue found with id x", "canceled"] {
+            assert_eq!(
+                classify_bd_message(msg, Some(1)).kind,
+                BeadsErrorKind::BdFailed,
+                "over-matched: {msg}"
+            );
+        }
+    }
+
+    #[test]
     fn a_mutation_that_bd_acknowledged_succeeds() {
         // bd's mutations print human text, not JSON — that must stay a success.
         let ok = BdOutput {
@@ -1829,6 +1902,7 @@ mod tests {
             (BeadsErrorKind::InvalidInput, "invalidInput"),
             (BeadsErrorKind::BdFailed, "bdFailed"),
             (BeadsErrorKind::Timeout, "timeout"),
+            (BeadsErrorKind::StoreBusy, "storeBusy"),
             (BeadsErrorKind::BadOutput, "badOutput"),
         ] {
             assert_eq!(serde_json::to_value(kind).unwrap(), tag);

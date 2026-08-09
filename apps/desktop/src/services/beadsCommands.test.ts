@@ -15,6 +15,7 @@ import {
   isBeadsError,
   isNoWorkspace,
   isBdMissing,
+  isStoreBusy,
   describeOmissions,
   type BeadPage,
   type BeadSummary,
@@ -229,6 +230,7 @@ describe("typed errors", () => {
       "invalidInput",
       "bdFailed",
       "timeout",
+      "storeBusy",
       "badOutput",
     ]) {
       expect(isBeadsError({ kind, message: "", exitCode: null })).toBe(true);
@@ -251,6 +253,20 @@ describe("typed errors", () => {
     // An unrelated failure is neither, so a caller does not run `bd init` over a real error.
     expect(isNoWorkspace(new Error("disk full"))).toBe(false);
     expect(isBdMissing(new Error("disk full"))).toBe(false);
+  });
+
+  it("treats both halves of a lost race for the store as retryable", () => {
+    // Same event, two reporters: we gave up on bd (`timeout`), or bd gave up first (`storeBusy`).
+    expect(isStoreBusy({ kind: "timeout", message: "", exitCode: null })).toBe(true);
+    expect(isStoreBusy({ kind: "storeBusy", message: "context canceled", exitCode: 1 })).toBe(true);
+  });
+
+  it("does not invite a retry of a request that is simply wrong", () => {
+    // The guard on the case above: if this passed too, a caller would retry forever.
+    for (const kind of ["bdFailed", "invalidInput", "binaryNotFound", "noWorkspace", "badOutput"]) {
+      expect(isStoreBusy({ kind, message: "", exitCode: 1 })).toBe(false);
+    }
+    expect(isStoreBusy(new Error("disk full"))).toBe(false);
   });
 });
 

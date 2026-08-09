@@ -8,6 +8,7 @@ import {
   beadsUpdate,
   isBdMissing,
   isNoWorkspace,
+  isStoreBusy,
   toBeadsError,
 } from "../../services/beadsCommands";
 import { EDITABLE_PRIORITIES, PRIORITY_LABEL } from "../../services/boardFilters";
@@ -96,18 +97,22 @@ export async function setBeadPriority(
 /**
  * What the reader is told when the write fails.
  *
- * ══ TIMEOUT IS ITS OWN SENTENCE, AND THAT IS THE POINT OF THE TYPED ERROR ═══════════════════════
+ * ══ A BUSY STORE IS ITS OWN SENTENCE, AND THAT IS THE POINT OF THE TYPED ERROR ══════════════════
  * `bd` is a single embedded database that every worktree in the repo shares, and this app polls it
- * every five seconds while dozens of agents write to it. A timed-out write is therefore the MOST
- * LIKELY failure here, and it is the one where "try again in a moment" is the whole remedy — which
- * a generic "couldn't save" actively hides. `BeadsErrorKind` distinguishes it, so this does too.
+ * every five seconds while dozens of agents write to it. A write that loses that race is therefore
+ * the MOST LIKELY failure here, and it is the one where "try again in a moment" is the whole
+ * remedy — which a generic "couldn't save" actively hides. `BeadsErrorKind` distinguishes it, so
+ * this does too, via `isStoreBusy`: it covers both halves of that one event — us timing out on a bd
+ * that was still waiting, and bd giving up first and saying `context canceled`. The second used to
+ * fall through to the last line, which put that bare Go phrase in front of the reader as though the
+ * request itself had been wrong.
  *
  * The other two are the errors with a DIFFERENT remedy: install `bd`, or run `bd init`. Everything
  * else falls through to `bd`'s own message, which is the most specific thing available.
  */
 export function priorityFailureSentence(e: unknown): string {
   const err = toBeadsError(e);
-  if (err.kind === "timeout") return "bd is busy — priority not saved";
+  if (isStoreBusy(e)) return "bd is busy — priority not saved";
   if (isBdMissing(e)) return "bd is not installed — priority not saved";
   if (isNoWorkspace(e)) return "this project has no beads workspace — priority not saved";
   return err.message === "" ? "priority not saved" : `priority not saved — ${err.message}`;

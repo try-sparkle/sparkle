@@ -31,6 +31,7 @@ export type BeadsErrorKind =
   | "invalidInput"
   | "bdFailed"
   | "timeout"
+  | "storeBusy"
   | "badOutput";
 
 /** The rejection value every command in this module produces. */
@@ -46,6 +47,7 @@ const KINDS: readonly BeadsErrorKind[] = [
   "invalidInput",
   "bdFailed",
   "timeout",
+  "storeBusy",
   "badOutput",
 ];
 
@@ -83,6 +85,19 @@ export function isNoWorkspace(e: unknown): boolean {
  *  and no amount of retrying or `bd init` will help. */
 export function isBdMissing(e: unknown): boolean {
   return toBeadsError(e).kind === "binaryNotFound";
+}
+
+/** True when the call lost a race for the store rather than being wrong — the failure whose remedy
+ *  is to re-issue the SAME request in a moment.
+ *
+ *  Two kinds land here because they are one event seen from two sides: `timeout` is us giving up on
+ *  a bd that was still waiting, `storeBusy` is bd giving up first and telling us so. The store is a
+ *  single embedded database shared by every worktree, written by many agents at once and polled by
+ *  this app every five seconds, so losing that race is the ORDINARY failure here — and it is the
+ *  one that reads as a fault in the request when it is reported without a name. */
+export function isStoreBusy(e: unknown): boolean {
+  const { kind } = toBeadsError(e);
+  return kind === "timeout" || kind === "storeBusy";
 }
 
 // ── Data ──────────────────────────────────────────────────────────────────────────────────────

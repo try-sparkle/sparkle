@@ -73,6 +73,18 @@ describe("priorityFailureSentence", () => {
     );
   });
 
+  it("says the same thing when bd is the one that gave up on the store", () => {
+    // `storeBusy` carries bd's own `context canceled`, which used to reach the reader verbatim —
+    // a Go runtime phrase describing the mechanism, in the slot reserved for the remedy.
+    const sentence = priorityFailureSentence({
+      kind: "storeBusy",
+      message: "context canceled",
+      exitCode: 1,
+    });
+    expect(sentence).toBe("bd is busy — priority not saved");
+    expect(sentence).not.toContain("context canceled");
+  });
+
   it("distinguishes a missing bd from a missing workspace", () => {
     expect(priorityFailureSentence({ kind: "binaryNotFound", message: "", exitCode: null })).toContain(
       "not installed",
