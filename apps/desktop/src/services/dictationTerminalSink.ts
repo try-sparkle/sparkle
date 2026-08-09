@@ -90,7 +90,10 @@ export async function routeDictationToTerminal(
   // presence timer and trip IDLE_AWAY_MS mid-conversation, after which the concierge starts
   // behaving as if nobody is watching. Dictating is input; say so.
   //
-  // THIS LINE IS THEREFORE THE THIRD FEEDER, and the only one that is not a keystroke. Say it that
+  // THIS CALL IS ITSELF A FEEDER — the non-keystroke one, which is the whole reason the sentence
+  // above says "every OTHER". Stated as a PROPERTY and not as an ordinal on purpose: an earlier cut
+  // of this comment called it "the THIRD feeder", which is the same drifting count in another form
+  // — it goes stale the moment a fourth is added, exactly as the roster it replaced did. Say it this
   // way rather than "fed by onData" — which was never true, not even before this call existed:
   // ComposeBox's `onChange` feeder landed in f03d9f66b (2026-07-27), three days ahead of this one in
   // e41eed4a1 (2026-07-30), so the single-feeder claim was already wrong the day it was written and
