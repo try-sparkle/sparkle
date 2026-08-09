@@ -18,9 +18,10 @@
 // branch rebase, path reveal, the alert toggle and per-worker detail. It moved to right-click, so
 // several assertions below check that the card is absent from a LEFT click and present on a right
 // one, rather than that it is gone entirely.
-import { cleanup, createEvent, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, createEvent, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AGENT_STATUS } from "@sparkle/ui";
+import { FOUNDER_ASK_LABEL } from "../engine/founderAsk";
 import { C } from "../theme/colors";
 import { asRgb } from "./statusDotTestUtils";
 
@@ -505,7 +506,12 @@ describe("Build column — the head's disc rolls up its workers", () => {
     render(<AgentSidebar project={project} />);
     const title = dotFor("Alpha").getAttribute("title");
     expect(title).not.toBe("Workers need you");
-    expect([AGENT_STATUS.blocked.label, AGENT_STATUS.waiting.label]).toContain(title);
+    // ⚠️ THE ROW'S OWN LABEL IS NOW THE FOUNDER'S ASK, not the raw status word (engine/founderAsk),
+    // so this lists the ask labels rather than `AGENT_STATUS[…].label`. The property under test is
+    // unchanged and is the first assertion: a head that is red on its own account keeps ITS OWN
+    // reading instead of borrowing the subtree's. Which of the two it lands on still depends on
+    // `withRedWorkerAttention`, which is why both remain acceptable.
+    expect([FOUNDER_ASK_LABEL.unstick, FOUNDER_ASK_LABEL.answer]).toContain(title);
   });
 });
 
@@ -881,7 +887,12 @@ describe("Build column — the rollup label belongs to HEADS only", () => {
     const project = seedExpanded({ a1: "idle", w1: "approval", w2: "idle" });
     render(<AgentSidebar project={project} />);
     const dot = rowFor("Parser Worker").querySelector<HTMLElement>("span[title]")!;
-    expect(dot.getAttribute("title")).toBe(AGENT_STATUS.approval.label);
+    // ⚠️ Reads the ASK now rather than `AGENT_STATUS.approval.label` (engine/founderAsk). The
+    // property is unchanged — the worker keeps a reading about ITSELF instead of the head's
+    // "Workers need you" — and the ask is a strictly better one: "Approve an action ›" names what
+    // to do, which is the same thing "Approve?" was here to preserve.
+    expect(dot.getAttribute("title")).toBe(FOUNDER_ASK_LABEL.approve);
+    expect(dot.getAttribute("title")).not.toBe("Workers need you");
   });
 });
 
@@ -1057,5 +1068,81 @@ describe("Build column — an unmerged head outranks its green rollup, and what 
     render(<AgentSidebar project={project} />);
     expect(screen.queryByText("Alpha")).toBeNull();
     expect(screen.queryByText("Parser Worker")).toBeNull();
+  });
+});
+
+// ── THE ROW SAYS WHAT IT WANTS (engine/founderAsk) ───────────────────────────────────────────────
+//
+// The founder, on a finished agent — goal met, six PRs merged, worktree clean: *"why it is showing
+// as blocked"*. He opened it expecting a problem and found a completed job. "Needs you" reads
+// identically on a row awaiting a one-press confirm and on one wedged mid-task.
+//
+// Asserted through the REAL sidebar rather than on `askFor` alone, because the engine suite proves
+// only that the string exists — this proves it reaches the surface, which is the half that matters.
+//
+// THE WORDED PILL LIVES ON THE DETAIL CARD, not on the collapsed row, and that is deliberate: bead
+// sparkle-tyter stripped 18ch text pills off the scannable row for width, and re-adding one here
+// would re-open that. The collapsed row carries the ask in its status mark's tooltip and accessible
+// name instead (asserted last), so nothing is hidden — it is worded where there is room to word it.
+describe("a red row names the founder's next action, not the agent's condition", () => {
+  const askPill = () => within(card()!).queryByTestId("row-founder-ask");
+
+  it("a waiting row says ANSWER, and does not say the generic status word", () => {
+    render(<AgentSidebar project={seedExpanded({ a1: "waiting" })} />);
+    fireEvent.contextMenu(rowFor("Alpha"));
+    const pill = askPill()!;
+    expect(pill.getAttribute("data-ask")).toBe("answer");
+    expect(pill.textContent).toMatch(/^Answer a question/);
+    // The words he could not act on. If this ever comes back, the feature has regressed.
+    expect(pill.textContent).not.toMatch(/needs you/i);
+  });
+
+  it("an errored row is marked a PROBLEM, not a confirmation", () => {
+    render(<AgentSidebar project={seedExpanded({ a1: "errored" })} />);
+    fireEvent.contextMenu(rowFor("Alpha"));
+    const pill = askPill()!;
+    expect(pill.getAttribute("data-ask")).toBe("unstick");
+    // A PROBLEM keeps the row's own status ink, so "something is wrong" still looks wrong — and
+    // specifically NOT the calm accent the retirement pill uses. Asserted as "is the alarm ink and
+    // is not the calm ink" rather than against a hex, because the row paints from the theme's CSS
+    // vars and jsdom reports those verbatim. There is no confirmation arm today; when one lands it
+    // must not take this colour (engine/founderAsk).
+    expect(pill.style.color).toBe(C.dangerInk);
+    expect(pill.style.color).not.toBe(C.accentInk);
+  });
+
+  it("a CALM row carries no ask at all — this is not chrome on every row", () => {
+    // THE LOAD-BEARING CASE. Its first version seeded a `merged` stage and no retro receipt, so the
+    // row was never retirement-ready and the assertion held with the guard deleted — vacuous in
+    // exactly the way its own comment warned against (roborev on 8148084b6). `askFor` now reads
+    // ONLY the status, so an idle row is the honest statement of the property.
+    render(<AgentSidebar project={seedExpanded({ a1: "idle" })} />);
+    fireEvent.contextMenu(rowFor("Alpha"));
+    expect(askPill()).toBeNull();
+  });
+
+  it("the ask is OPERABLE by keyboard, not merely announced", () => {
+    // roborev 59545's defect, reintroduced on a new element and caught again: an aria-label on a
+    // role-less span is not reliably exposed, and a click-only handler cannot be reached at all.
+    render(<AgentSidebar project={seedExpanded({ a1: "waiting" })} />);
+    fireEvent.contextMenu(rowFor("Alpha"));
+    const pill = askPill()!;
+    expect(pill.getAttribute("role")).toBe("button");
+    expect(pill.getAttribute("tabindex")).toBe("0");
+    // Enter runs the same branch as the click. Asserted as a SIDE EFFECT (the row gets selected),
+    // not merely that a handler is attached — the latter would pass on a no-op handler.
+    open.mockClear();
+    fireEvent.keyDown(pill, { key: "Enter" });
+    expect(open).toHaveBeenCalled();
+  });
+
+  it("the COLLAPSED row still carries the ask, in the mark's tooltip", () => {
+    // The scannable list keeps its icon-only treatment, so the words ride the title — which is what
+    // stops "worded on the card" from meaning "invisible where he actually looks".
+    render(<AgentSidebar project={seedExpanded({ a1: "waiting" })} />);
+    const titled = within(rowFor("Alpha"))
+      .getAllByTitle(/Answer a question/)
+      .filter(Boolean);
+    expect(titled.length).toBeGreaterThan(0);
   });
 });

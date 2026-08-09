@@ -36,6 +36,7 @@ import { useCloudAgentsEnabled } from "../hooks/useCloudAgents";
 import { refreshAgentBranch } from "../services/branchStatus";
 import { cachedReceipt } from "../services/retroReceipts";
 import { retirementPill } from "../engine/retirementReadiness";
+import { askFor, FOUNDER_ASK_LABEL, FOUNDER_ASK_DETAIL } from "../engine/founderAsk";
 import { beadLabel, epicForBuild, epicPillFor } from "../services/planView";
 import { type Bead } from "../services/beads";
 import { applyModelToRunningAgent } from "../services/agentModel";
@@ -1255,6 +1256,63 @@ export const AgentRow = memo(function AgentRow({
     stage: trackerStage ?? "thought",
     receipt: cachedReceipt(project.id, a.id),
   });
+  // WHAT THIS ROW WANTS FROM THE FOUNDER, IN WORDS (engine/founderAsk). His complaint about a
+  // finished agent: *"why it is showing as blocked"* — he opened it expecting a problem and found a
+  // completed job. "Needs you" reads identically on a row awaiting a one-press confirm and on one
+  // wedged mid-task, so every red cost him a pane-open to classify.
+  //
+  // The engine decides; this only renders. In particular it CANNOT redden a row — `askFor` reads the
+  // status the taxonomy already settled, and returns `null` for every calm row (including a calm
+  // retirement-ready one, which keeps its informational pill and stays gray).
+  const founderAsk = askFor({ status: st });
+  // ONE handler for both the click and the key, so the two can never drift. Every ask this module
+  // can raise is answered IN THE PANE, so the action is always "select this row and let him read
+  // it". It deliberately does NOT branch on a confirmation: there is no confirmation arm today, and
+  // a dormant `onClose()` branch here would mean a future arm silently inherited the retirement
+  // confirm as its action (roborev on 6b68205d3). Give that arm its own action when it lands.
+  const askAction = () => onSelect?.();
+  const askPill = founderAsk ? (
+    <span
+      data-testid="row-founder-ask"
+      data-ask={founderAsk}
+      // OPERABLE, not merely announced as operable — the same defect `retireMark` below already had
+      // fixed once (roborev 59545), and this element reintroduced it: an `aria-label` on a role-less
+      // <span> is not reliably exposed, and a click-only handler is unreachable from a keyboard
+      // entirely. Mirrors that element exactly rather than inventing a second pattern.
+      role="button"
+      tabIndex={0}
+      onClick={(e) => {
+        e.stopPropagation();
+        askAction();
+      }}
+      onKeyDown={(e) => {
+        if (e.key !== "Enter" && e.key !== " ") return;
+        e.stopPropagation();
+        // Space would scroll the list out from under whatever the action opens.
+        e.preventDefault();
+        askAction();
+      }}
+      title={FOUNDER_ASK_DETAIL[founderAsk]}
+      aria-label={`${FOUNDER_ASK_LABEL[founderAsk]} — ${FOUNDER_ASK_DETAIL[founderAsk]}`}
+      style={{
+        flex: "0 0 auto",
+        fontFamily: FONT_MONO,
+        fontSize: TYPE.micro,
+        lineHeight: 1,
+        // The row's own status colour, so "something is wrong" still looks wrong. When a
+        // CONFIRMATION arm lands it must NOT take this ink — see the note in engine/founderAsk.
+        color: statusColor,
+        border: `1px solid ${statusColor}`,
+        borderRadius: RADIUS.sm,
+        padding: "1px 5px",
+        whiteSpace: "nowrap",
+        cursor: "pointer",
+      }}
+    >
+      {FOUNDER_ASK_LABEL[founderAsk]}
+    </span>
+  ) : null;
+
   const retirePill = retirePillState ? (
     <span
       data-testid="row-retire-pill"
@@ -1380,7 +1438,15 @@ export const AgentRow = memo(function AgentRow({
               53837). The × moved to a trailing slot instead; see below. */}
           {kindGlyph ? (
             <span
-              title={`${a.kind} — ${AGENT_STATUS[st].label}`}
+              // NAMES THE ASK WHEN THERE IS ONE. `AGENT_STATUS[st].label` describes the AGENT's
+              // condition ("Blocked", "Needs you"); the ask describes the FOUNDER's next action,
+              // which is what he was missing. Falls back to the status label for every calm row,
+              // where there is no ask and the condition is the only thing to say.
+              title={
+                founderAsk
+                  ? `${a.kind} — ${FOUNDER_ASK_LABEL[founderAsk]}`
+                  : `${a.kind} — ${AGENT_STATUS[st].label}`
+              }
               style={{
                 fontSize: 12,
                 // STATUS-inked, and it has to be. A shell row renders this glyph INSTEAD of a disc
@@ -1400,7 +1466,15 @@ export const AgentRow = memo(function AgentRow({
             // this slot. It no longer PULSES: with the row stripped to a disc and a title, a column
             // of running agents was a column of blinking dots, and motion that is always on stops
             // reading as "look here". The color already separates running from done.
-            <StatusDot status={st} size={DOT_SIZE} color={dotColor} label={dotLabel} />
+            // The disc hovers as the ASK when there is one, so the scannable row is not the one
+            // surface that still says only "Blocked". `dotLabel` (the orchestrator rollup override)
+            // still wins where it is set — it describes a SUBTREE, which the row's own ask does not.
+            <StatusDot
+              status={st}
+              size={DOT_SIZE}
+              color={dotColor}
+              label={dotLabel ?? (founderAsk ? FOUNDER_ASK_LABEL[founderAsk] : undefined)}
+            />
           )}
         </div>
         <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 2 }}>
@@ -1502,6 +1576,10 @@ export const AgentRow = memo(function AgentRow({
                 {stallChipEl}
                 {thrashChipEl}
                 {epicPill}
+                {/* FIRST of the pills, ahead of the retirement one: it is the only chip that names
+                    an action the founder takes, and a row carrying both would otherwise lead with
+                    the statement rather than the request. */}
+                {askPill}
                 {retirePill}
                 {cloudChip}
               </div>
