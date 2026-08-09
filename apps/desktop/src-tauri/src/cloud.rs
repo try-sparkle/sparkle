@@ -80,12 +80,51 @@ const FINALIZE_MSG: &str = "{\"type\":\"Finalize\"}";
 /// How long an idle (paused) relay socket is kept open for instant reuse by the next utterance,
 /// instead of being torn down. The per-utterance TLS+WS handshake (plus the relay opening its own
 /// Deepgram upstream) is the dominant cold-start latency the user feels; reusing a warm socket
-/// eliminates it for back-to-back dictation. Deliberately kept UNDER Deepgram's ~10 s server-side
-/// idle-close window so the relay never has to send KeepAlive frames. NOTE: unlike the old
-/// client-metered path, the relay meters by socket LIFETIME, so a warm socket held across a pause is
-/// billed for that elapsed time (bounded to well under one minute per idle window) — an accepted
-/// tradeoff for instant reuse and an honest reflection of a held-open server resource.
-const WARM_STANDBY: Duration = Duration::from_secs(8);
+/// eliminates it for back-to-back dictation.
+///
+/// ── WHY 55s AND NOT 8s, AND WHY THAT IS *FREE* (sparkle dictation latency measurement) ───────────
+/// This was 8s, chosen to sit under Deepgram's ~10 s server-side idle close so the worker never had
+/// to send KeepAlive frames. Measured against the founder's actual push-to-talk rhythm (281 holds
+/// over 8 days), that window covered only **33.5%** of re-holds — his median gap between holds is
+/// **18 s**, so two thirds of them fell outside it and paid a fresh ~490 ms handshake.
+///
+/// The window is now bounded by BILLING rather than by Deepgram's idle timer, because that is the
+/// constraint that actually costs the user money. The relay debits one minute UP FRONT on upstream
+/// open (`firstMinuteCents`, 6¢) and one more every 60 s the socket stays open. So every distinct
+/// handshake costs a whole minute no matter how briefly you speak — and holding ONE socket open for
+/// the remainder of a minute already paid for costs exactly nothing extra. Reuse inside the paid
+/// minute is therefore strictly CHEAPER than reconnecting: it replaces a second 6¢ debit with zero.
+/// See `warm_deadline_passed` for the paid-minute half of the rule, which is what keeps this
+/// cost-neutral instead of merely cheap.
+///
+/// At 55 s this covers **74.1%** of the founder's re-holds (vs 33.5% at 8 s) for the same money.
+const WARM_STANDBY: Duration = Duration::from_secs(55);
+
+/// The relay's billing quantum: it debits one minute on upstream open and one per 60 s thereafter
+/// (`deepgramMeter.ts` `MINUTE_MS`). A warm socket closed before this elapses costs the user exactly
+/// the one minute that opening it already charged.
+const PAID_MINUTE: Duration = Duration::from_secs(60);
+
+/// How far before the next per-minute debit a warm socket must be closed. Covers the close+drain
+/// (~2 s, see `finish`) plus clock/scheduling slop, so warm standby can never be the thing that
+/// tips a session into a SECOND billed minute. Without it "hold until 60 s" would race the debit it
+/// is trying to avoid.
+const PAID_MINUTE_SAFETY: Duration = Duration::from_secs(6);
+
+/// Deepgram control message: "I have nothing to send right now, keep the connection open." Required
+/// now that `WARM_STANDBY` (55 s) exceeds Deepgram's ~10 s server-side idle close — the reason the
+/// old 8 s window existed. The relay forwards client text frames to Deepgram verbatim
+/// (`deepgramRelay.ts` client→upstream `on("message")`), so this needs NO server-side change.
+///
+/// Unlike `FINALIZE_MSG` this produces no transcript and does not close the current utterance; it is
+/// purely an idle heartbeat. If it were ever rejected the socket simply dies, the worker exits,
+/// `alive` goes false, and `cloud_reuse` opens a fresh one — i.e. it degrades to the pre-warm
+/// behaviour rather than breaking dictation.
+const KEEPALIVE_MSG: &str = "{\"type\":\"KeepAlive\"}";
+
+/// How often to send `KEEPALIVE_MSG` while parked. Comfortably under Deepgram's ~10 s idle close so
+/// a single dropped/delayed heartbeat cannot expire the socket.
+const KEEPALIVE_EVERY: Duration = Duration::from_secs(4);
 
 /// Cap on how many audio frames we buffer locally while waiting for the relay's `ready` signal (see
 /// the send loop). The relay DROPS any client audio it receives before its first-minute debit clears
@@ -247,6 +286,14 @@ impl DeepgramSession {
     /// session; see the `alive` field for why a lost race is safe.
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
+    }
+
+    /// Mark the worker as exited, the way warm expiry or a socket error does. Test-only seam: the
+    /// `alive` flag is worker-owned and there is no real worker behind `parkable_session`, so the
+    /// dead-socket branches (which several callers gate on) are otherwise undriveable.
+    #[cfg(test)]
+    pub(crate) fn kill_for_test(&self) {
+        self.alive.store(false, Ordering::Relaxed);
     }
 
     /// End the stream: tell the relay to finalize, then join the worker. The shutdown path itself is
@@ -859,6 +906,149 @@ fn warm_expired(elapsed: Duration, window: Duration) -> bool {
     elapsed >= window
 }
 
+/// Whether a warm socket is close enough to its next per-minute debit that it must be closed NOW,
+/// regardless of how much of `WARM_STANDBY` is left.
+///
+/// THIS IS THE HALF THAT MAKES THE LONG WARM WINDOW FREE. `WARM_STANDBY` is measured from the PAUSE;
+/// billing is measured from the socket OPEN. Without this, a socket opened at t=0 and paused at
+/// t=30 would be held until t=85 and cross the 60 s boundary — silently charging a SECOND minute to
+/// save one handshake, which is the opposite of the trade this window exists to make. With it the
+/// socket is closed at `PAID_MINUTE - PAID_MINUTE_SAFETY` from open, so warm standby can never add
+/// a debit: it only ever spends minutes the user has already been charged for.
+///
+/// Pure, and takes both durations, so the interaction of the two deadlines is unit-testable without
+/// a clock or a relay — a test on the idle window alone cannot see this one at all.
+/// MEASURED WITHIN THE CURRENT BILLING QUANTUM, NOT FROM OPEN (roborev 61450, Medium). The relay
+/// debits a minute on open AND one every 60 s after, so a 70-second-old socket is already paid
+/// through t=120 and is just as free to hold as a 10-second-old one. Comparing absolute age against
+/// 60 s made this permanently true past t=54, which silently switched warm standby OFF for every
+/// session that dictated for more than ~54 s — the exact opposite of the rationale above, since
+/// those holds then paid a fresh handshake AND a fresh debit while the minute they had already been
+/// charged for went unused.
+fn paid_minute_nearly_spent(since_open: Duration, paid: Duration, safety: Duration) -> bool {
+    if paid.is_zero() {
+        return true; // no billing quantum to reason about — never hold speculatively
+    }
+    let into_minute = Duration::from_secs(since_open.as_secs() % paid.as_secs());
+    into_minute.saturating_add(safety) >= paid
+}
+
+/// The whole warm-standby close decision: idle window OR paid-minute guard, whichever comes first.
+/// One function so the two deadlines cannot drift apart at the call site.
+fn warm_deadline_passed(idle: Duration, since_open: Duration) -> bool {
+    warm_expired(idle, WARM_STANDBY)
+        || paid_minute_nearly_spent(since_open, PAID_MINUTE, PAID_MINUTE_SAFETY)
+}
+
+/// What a worker tick should do with a socket that is parked in warm standby.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum WarmTick {
+    /// A deadline passed — CloseStream and wind the session down.
+    Close,
+    /// Still warm and the heartbeat is due — write `KEEPALIVE_MSG`.
+    Heartbeat,
+    /// Still warm, heartbeat not due yet — do nothing this tick.
+    Wait,
+}
+
+/// The whole paused-tick decision, extracted so the heartbeat is guarded by something other than
+/// relationships between constants (roborev 61450, Medium).
+///
+/// The previous test asserted only that `KEEPALIVE_EVERY < DEEPGRAM_IDLE_CLOSE` and what
+/// `KEEPALIVE_MSG` contains — both true before the heartbeat existed. Deleting the entire send block
+/// from `run_session` left it green while every "warm" socket silently died at ~10 s and reuse past
+/// that reverted to a full handshake: the defect this change exists to fix, reintroduced invisibly.
+/// That is the vacuous-test shape AGENTS.md calls out, so the DECISION now lives here where a test
+/// can drive it. (The `socket.write` itself remains inside the loop, which is not hermetically
+/// testable without a transport trait — the same acknowledged gap `run_session` already documents
+/// for every other write it makes.)
+///
+/// `since_keepalive` is `None` when no heartbeat has been sent since the park, which is due
+/// immediately — the caller seeds it at the pause so the first one falls a full interval later.
+pub(crate) fn warm_tick(
+    idle: Duration,
+    since_open: Duration,
+    since_keepalive: Option<Duration>,
+) -> WarmTick {
+    if warm_deadline_passed(idle, since_open) {
+        return WarmTick::Close;
+    }
+    match since_keepalive {
+        Some(elapsed) if elapsed < KEEPALIVE_EVERY => WarmTick::Wait,
+        _ => WarmTick::Heartbeat,
+    }
+}
+
+/// PERFORM the tick — i.e. write the frame it calls for — through an injectable text sink.
+///
+/// THE DECISION WAS TESTED; THE ACTION WAS NOT, and the action is the half whose absence silently
+/// reverts the feature (roborev 61465, Medium). With the write inline in `run_session`, deleting the
+/// single `socket.write(Message::text(KEEPALIVE_MSG))` line left `warm_tick`'s test, the constants
+/// test and the whole suite green — while every parked socket died at Deepgram's ~10 s idle close
+/// and the 55 s window became a lie, with nothing logged. That is the "assert the SIDE EFFECT, not
+/// the precondition" rule in AGENTS.md, and the heartbeat is exactly the case it is written for.
+///
+/// A `&mut dyn FnMut(&str)` rather than a full transport trait: this keeps the seam to the frames
+/// this tick emits, without abstracting the loop's reads — the indirection `run_session` weighed and
+/// declined for the whole socket. Errors are deliberately swallowed by the caller's sink, matching
+/// the surrounding policy (a write timeout is transient; a genuinely dead socket is caught by the
+/// read path, which owns the exit).
+pub(crate) fn apply_warm_tick(tick: WarmTick, send_text: &mut dyn FnMut(&str)) -> WarmOutcome {
+    match tick {
+        // Ends the session — the caller then shrinks its timeouts and enters the drain.
+        WarmTick::Close => {
+            send_text(CLOSE_STREAM_MSG);
+            WarmOutcome::Closing
+        }
+        // Keeps Deepgram's idle close from taking the socket out from under a parked session.
+        WarmTick::Heartbeat => {
+            send_text(KEEPALIVE_MSG);
+            WarmOutcome::Parked { beat: true }
+        }
+        // Still warm, nothing due: the socket must stay silent, NOT be poked every poll interval.
+        WarmTick::Wait => WarmOutcome::Parked { beat: false },
+    }
+}
+
+/// What `run_session`'s loop must do to its own state after a warm tick.
+///
+/// RETURNED rather than re-derived, so the write and the state transition cannot disagree about
+/// which tick happened. The previous shape matched on `tick` TWICE — once to write the frame, once
+/// to move `closing`/`warm_since`/`last_keepalive` — which is a drift hazard of its own: an edit to
+/// one match compiles perfectly well against a stale other.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum WarmOutcome {
+    /// Still parked. `beat` is true when a heartbeat was just written, so the caller restamps its
+    /// keepalive clock — the one piece of state only the caller can hold (it owns the `Instant`).
+    Parked { beat: bool },
+    /// CloseStream was written: the caller shrinks its timeouts and enters the drain.
+    Closing,
+}
+
+/// ONE warm-standby tick, end to end: decide, WRITE the frame, and say what the loop must do next.
+///
+/// THE POINT IS THAT THE WRITE IS NOT OPTIONAL HERE (roborev 61471, Medium). Extracting only the
+/// frame mapping relocated the regression rather than removing it: deleting the call to it left the
+/// state transitions still flipping while nothing reached the wire — no KeepAlive (so every parked
+/// socket dies at Deepgram's ~10 s idle close and the 55 s window is a lie) and no CloseStream (so
+/// the warm deadline stops flushing the trailing final and the drain reads nothing). Folding the
+/// decision, the write and the state instruction into one call makes the tick a single testable
+/// unit, driveable over a simulated park with a recording sink.
+///
+/// Durations rather than `Instant`s so the whole thing is clock-free and a test can simulate a park
+/// of any length; the caller converts. The residual — that this one call could itself be deleted —
+/// is irreducible without threading a sink through `run_session`'s reads too, i.e. the transport
+/// trait this module weighed and declined for a single call site. It is now one call whose removal
+/// deletes the ENTIRE paused branch rather than silently keeping its bookkeeping.
+pub(crate) fn run_warm_standby_tick(
+    idle: Duration,
+    since_open: Duration,
+    since_keepalive: Option<Duration>,
+    send_text: &mut dyn FnMut(&str),
+) -> WarmOutcome {
+    apply_warm_tick(warm_tick(idle, since_open, since_keepalive), send_text)
+}
+
 /// The worker loop: interleave sending queued audio with reading relay messages, emitting
 /// interim/final transcript events + balance updates, until the stream is closed or the socket
 /// errors / the relay signals exhaustion.
@@ -921,6 +1111,13 @@ fn run_session(
     // keeps the socket open until the user resumes (instant reuse) or `WARM_STANDBY` elapses.
     let mut paused = false;
     let mut warm_since: Option<Instant> = None;
+    // When this socket opened, i.e. when the relay debited its first minute. The warm-standby close
+    // is bounded by BOTH the idle window and this, so holding a socket warm can never tip the
+    // session into a second billed minute — see `paid_minute_nearly_spent`.
+    let opened_at = Instant::now();
+    // Last idle heartbeat. `None` while routing; set on the first keepalive of a park so the first
+    // one is sent a full interval after the pause rather than immediately.
+    let mut last_keepalive: Option<Instant> = None;
     // The relay drops any client audio it receives before it sends `ready` (the first-minute debit
     // clearing + its Deepgram upstream opening). Buffer frames until then so we don't clip the first
     // words. `ready` persists across pause/resume — the relay's metering is per-connection.
@@ -953,12 +1150,40 @@ fn run_session(
         // before Deepgram's own idle timeout). Falls into the normal `closing` drain/exit below.
         if paused {
             if let Some(since) = warm_since {
-                if warm_expired(since.elapsed(), WARM_STANDBY) {
-                    let _ = socket.write(Message::text(CLOSE_STREAM_MSG));
-                    set_socket_timeouts(&mut socket, READ_TIMEOUT, READ_TIMEOUT);
-                    closing = true;
-                    paused = false;
-                    warm_since = None;
+                // The decision AND the write both live in `run_warm_standby_tick`, so they are
+                // covered by a test rather than by this loop, which is not hermetically driveable.
+                // Scoped so the mutable borrow of `socket` ends before the transitions below
+                // re-borrow it.
+                //
+                // A write timeout inside the sink is transient (a full send buffer) and is NOT
+                // fatal: the frame stays buffered and the next tick retries. A genuinely dead socket
+                // is caught by the read path below, which owns the exit — killing the session here
+                // would tear down a warm socket on ordinary WiFi jitter.
+                let outcome = {
+                    let mut send_text = |s: &str| {
+                        let _ = socket.write(Message::text(s));
+                    };
+                    run_warm_standby_tick(
+                        since.elapsed(),
+                        opened_at.elapsed(),
+                        last_keepalive.map(|t| t.elapsed()),
+                        &mut send_text,
+                    )
+                };
+                match outcome {
+                    WarmOutcome::Closing => {
+                        set_socket_timeouts(&mut socket, READ_TIMEOUT, READ_TIMEOUT);
+                        closing = true;
+                        paused = false;
+                        warm_since = None;
+                        last_keepalive = None;
+                    }
+                    // Only the caller can hold the `Instant`. Restamped only when a heartbeat was
+                    // actually written — the returned flag, not a second guess at the tick.
+                    // Cleared on Resume, since a routing session's audio frames are its own
+                    // keepalive.
+                    WarmOutcome::Parked { beat: true } => last_keepalive = Some(Instant::now()),
+                    WarmOutcome::Parked { beat: false } => {}
                 }
             }
         }
@@ -1000,6 +1225,9 @@ fn run_session(
                         let _ = socket.write(Message::text(FINALIZE_MSG));
                         paused = true;
                         warm_since = Some(Instant::now());
+                        // First heartbeat falls a full KEEPALIVE_EVERY after the pause, not now:
+                        // Finalize has just been written, so the link is demonstrably alive.
+                        last_keepalive = Some(Instant::now());
                     }
                     break; // go read the trailing final(s) Finalize will produce
                 }
@@ -1008,6 +1236,7 @@ fn run_session(
                 Ok(AudioMsg::Resume) => {
                     paused = false;
                     warm_since = None;
+                    last_keepalive = None; // audio frames are their own keepalive while routing
                 }
                 Ok(AudioMsg::Close) | Err(TryRecvError::Disconnected) => {
                     // Begin shutdown — but exactly once. A dropped sender (Drop-without-finish())
@@ -1375,11 +1604,292 @@ mod tests {
     }
 
     #[test]
-    fn warm_standby_is_under_deepgrams_idle_close_so_no_keepalive_is_needed() {
-        // The whole no-KeepAlive design hinges on closing the warm socket ourselves BEFORE Deepgram's
-        // ~10 s server-side idle timeout would. Guard that margin so a future bump can't silently
-        // cross it (which would let Deepgram drop the socket mid-standby).
-        assert!(WARM_STANDBY < Duration::from_secs(10), "warm window must stay under Deepgram's idle close");
+    fn the_warm_window_can_never_add_a_billed_minute() {
+        // THE GUARD THAT MAKES A 55s WINDOW FREE. Billing runs from OPEN, the idle window from
+        // PAUSE, and holding a socket across that difference is the one way warm standby could cost
+        // the user money instead of saving it. A socket opened at t=0 and paused at t=30 must NOT be
+        // held for a further 55s — it must close before the 60s debit.
+        assert!(
+            !paid_minute_nearly_spent(Duration::from_secs(0), PAID_MINUTE, PAID_MINUTE_SAFETY),
+            "a socket that just opened has its whole paid minute ahead of it"
+        );
+        assert!(
+            !paid_minute_nearly_spent(Duration::from_secs(53), PAID_MINUTE, PAID_MINUTE_SAFETY),
+            "still comfortably inside the minute already charged"
+        );
+        assert!(
+            paid_minute_nearly_spent(Duration::from_secs(54), PAID_MINUTE, PAID_MINUTE_SAFETY),
+            "within the safety margin of the next debit → close now, don't buy a second minute"
+        );
+        // NOT 90s — that is 30s into the SECOND paid minute and is holdable. This assertion used to
+        // read `90 → true` under the absolute-age comparison, which is precisely the bug: it made
+        // the guard permanently true past t=54 and switched warm standby off for long sessions.
+        // `a_long_session_is_still_allowed_to_hold_a_warm_socket` covers that side.
+        assert!(
+            paid_minute_nearly_spent(Duration::from_secs(59), PAID_MINUTE, PAID_MINUTE_SAFETY),
+            "one second before the debit"
+        );
+        // And the combined decision really consults BOTH deadlines — a test on the idle window alone
+        // is blind to the one that costs money. Idle for 1s, but 58s since open: must close.
+        assert!(
+            warm_deadline_passed(Duration::from_secs(1), Duration::from_secs(58)),
+            "barely idle, but the paid minute is nearly spent → close"
+        );
+        assert!(
+            warm_deadline_passed(Duration::from_secs(55), Duration::from_secs(55)),
+            "idle window reached → close"
+        );
+        assert!(
+            !warm_deadline_passed(Duration::from_secs(30), Duration::from_secs(31)),
+            "inside both deadlines → stay warm, this is the reuse the window exists for"
+        );
+        // The safety margin must cover the ~2s close+drain, or the close races the debit it avoids.
+        assert!(
+            PAID_MINUTE_SAFETY >= Duration::from_secs(3),
+            "the margin must outlast the close+drain it protects"
+        );
+        assert!(PAID_MINUTE_SAFETY < PAID_MINUTE, "a margin larger than the minute closes instantly");
+    }
+
+    #[test]
+    fn a_long_session_is_still_allowed_to_hold_a_warm_socket() {
+        // THE GUARD MUST NOT SWITCH THE FEATURE OFF (roborev 61450, Medium). Comparing ABSOLUTE age
+        // against 60s made `since_open + 6 >= 60` permanently true past t=54, so warm standby was
+        // silently disabled for every session that had dictated for more than ~54s — those holds
+        // paid a fresh handshake AND a fresh 6¢ debit while the minute they had already been charged
+        // for went unused. The relay debits one minute on open and one every 60s after, so a
+        // 70-second-old socket is paid through t=120 and is exactly as free to hold as a new one.
+        assert!(
+            !paid_minute_nearly_spent(Duration::from_secs(70), PAID_MINUTE, PAID_MINUTE_SAFETY),
+            "10s into the SECOND paid minute — still free to hold"
+        );
+        assert!(
+            !paid_minute_nearly_spent(Duration::from_secs(300), PAID_MINUTE, PAID_MINUTE_SAFETY),
+            "a five-minute session is no different: it is 0s into its sixth paid minute"
+        );
+        assert!(
+            paid_minute_nearly_spent(Duration::from_secs(114), PAID_MINUTE, PAID_MINUTE_SAFETY),
+            "but the guard still fires near the END of a later minute"
+        );
+        // The property, rather than three sampled points: every minute behaves like the first.
+        for minute in 0..6u64 {
+            let base = minute * PAID_MINUTE.as_secs();
+            assert!(
+                !paid_minute_nearly_spent(Duration::from_secs(base + 30), PAID_MINUTE, PAID_MINUTE_SAFETY),
+                "mid-minute {minute} must be holdable"
+            );
+            assert!(
+                paid_minute_nearly_spent(Duration::from_secs(base + 56), PAID_MINUTE, PAID_MINUTE_SAFETY),
+                "the end of minute {minute} must close"
+            );
+        }
+        // A long session that is mid-minute really does get to stay warm end-to-end.
+        assert!(
+            !warm_deadline_passed(Duration::from_secs(2), Duration::from_secs(305)),
+            "a five-minute dictation must still get warm reuse on its next hold"
+        );
+    }
+
+    #[test]
+    fn a_simulated_park_really_heartbeats_then_closes_on_the_wire() {
+        // THE WHOLE PARK, DRIVEN (roborev 61471, Medium). The per-tick mapping test below was never
+        // the at-risk half — the at-risk half is that anything CALLS it on the paused tick, and the
+        // earlier shape let that call be deleted with the suite green and nothing reaching the wire.
+        //
+        // This runs a real park on a simulated clock and asserts the FRAME SEQUENCE, so a heartbeat
+        // that never fires, fires at the wrong cadence, or a deadline that never sends CloseStream,
+        // all fail here.
+        const TICK: Duration = Duration::from_millis(100); // the loop's read-timeout poll interval
+        let mut sent: Vec<String> = Vec::new();
+        let mut last_keepalive: Option<Duration> = Some(Duration::ZERO); // seeded at the pause
+        let mut elapsed = Duration::ZERO;
+        let opened_before_park = Duration::from_secs(2); // a short utterance, then release
+        let mut closed_at: Option<Duration> = None;
+        let mut beat_times: Vec<Duration> = Vec::new();
+
+        while closed_at.is_none() && elapsed < Duration::from_secs(120) {
+            elapsed += TICK;
+            let outcome = {
+                let mut sink = |s: &str| sent.push(s.to_string());
+                run_warm_standby_tick(
+                    elapsed,
+                    opened_before_park + elapsed,
+                    last_keepalive.map(|k| elapsed - k),
+                    &mut sink,
+                )
+            };
+            match outcome {
+                WarmOutcome::Closing => closed_at = Some(elapsed),
+                WarmOutcome::Parked { beat: true } => {
+                    last_keepalive = Some(elapsed);
+                    beat_times.push(elapsed);
+                }
+                WarmOutcome::Parked { beat: false } => {}
+            }
+        }
+
+        let closed_at = closed_at.expect("a parked socket must eventually close, never idle forever");
+        let beats = sent.iter().filter(|s| *s == KEEPALIVE_MSG).count();
+        let closes = sent.iter().filter(|s| *s == CLOSE_STREAM_MSG).count();
+
+        assert!(
+            beats > 0,
+            "a parked socket sent NOTHING — it would die at Deepgram's ~10s idle close and the \
+             {WARM_STANDBY:?} window would be a lie"
+        );
+        assert_eq!(closes, 1, "exactly one CloseStream, or the trailing final never drains");
+        assert_eq!(sent.last().map(String::as_str), Some(CLOSE_STREAM_MSG), "and it comes last");
+        // Cadence: enough beats to cover the whole park at ≤ KEEPALIVE_EVERY, with none wasted.
+        // ±1 because the tick that closes the socket spends a slot that would otherwise have beaten.
+        let expected = (closed_at.as_secs_f64() / KEEPALIVE_EVERY.as_secs_f64()).floor() as usize;
+        assert!(
+            beats + 1 >= expected && beats <= expected + 1,
+            "expected ~{expected} heartbeats over a {closed_at:?} park, got {beats} — a cadence \
+             that drifts either lets the socket die or spams the relay"
+        );
+        // THE PAID-MINUTE GUARD IS WHAT ENDED THIS PARK, not the idle window, and that is the
+        // interaction worth pinning: the socket opened 2s before the park, so it must close at
+        // PAID_MINUTE - PAID_MINUTE_SAFETY since OPEN (54s) rather than running the full 55s window.
+        assert_eq!(
+            opened_before_park + closed_at,
+            PAID_MINUTE - PAID_MINUTE_SAFETY,
+            "a park must end on whichever deadline comes first, measured from the right origin"
+        );
+        // THE GAP THAT MATTERS: no two CONSECUTIVE beats may straddle Deepgram's idle close.
+        //
+        // Asserted on the MAXIMUM gap, not the average (roborev 61498). An average is not the
+        // property this comment claims and cannot detect the failure it names: a regression that
+        // beats normally for half the park and then stops — say `warm_tick` returning `Wait` past
+        // t=30 — leaves a 24s silent gap before the close while the average stays around 7s, so the
+        // socket is dead at the idle close and the assertion is green. The whole-park beat COUNT
+        // above is blind to distribution for the same reason.
+        //
+        // The sequence is bookended by the park start and the close, so the two intervals an
+        // average most easily hides — park→first beat and last beat→close — are covered too.
+        const DEEPGRAM_IDLE_CLOSE: Duration = Duration::from_secs(10);
+        let mut marks = vec![Duration::ZERO];
+        marks.extend(beat_times.iter().copied());
+        marks.push(closed_at);
+        let worst = marks
+            .windows(2)
+            .map(|w| w[1] - w[0])
+            .max()
+            .expect("the sequence is bookended, so it always has at least one interval");
+        assert!(
+            worst < DEEPGRAM_IDLE_CLOSE,
+            "the longest silence during the park was {worst:?}, which straddles Deepgram's ~10s \
+             idle close — the socket would be gone and the {WARM_STANDBY:?} window a lie \
+             (beats at {beat_times:?}, closed at {closed_at:?})"
+        );
+        // The park really did last (roughly) the window, rather than closing early.
+        assert!(
+            closed_at >= WARM_STANDBY.min(Duration::from_secs(50)),
+            "the park ended at {closed_at:?}, far short of the window it promises"
+        );
+    }
+
+    #[test]
+    fn a_warm_tick_actually_writes_the_frame_it_decided_on() {
+        // THE ACTION, NOT THE DECISION (roborev 61465, Medium). `warm_tick`'s own test proves which
+        // tick is chosen; nothing proved a frame was ever WRITTEN. With the write inline in
+        // `run_session`, deleting one `socket.write(KEEPALIVE_MSG)` line kept every test green while
+        // every parked socket died at Deepgram's ~10s idle close and the 55s window became a lie.
+        let record = |tick| {
+            let mut sent: Vec<String> = Vec::new();
+            {
+                let mut sink = |s: &str| sent.push(s.to_string());
+                apply_warm_tick(tick, &mut sink);
+            }
+            sent
+        };
+        assert_eq!(
+            record(WarmTick::Heartbeat),
+            vec![KEEPALIVE_MSG.to_string()],
+            "a due heartbeat must put a KeepAlive on the wire — this is the whole 55s window"
+        );
+        assert_eq!(
+            record(WarmTick::Close),
+            vec![CLOSE_STREAM_MSG.to_string()],
+            "a deadline must send CloseStream so the trailing final still drains"
+        );
+        assert!(
+            record(WarmTick::Wait).is_empty(),
+            "a socket that is merely warm must stay SILENT, not be poked every poll interval"
+        );
+        // The frames must not be interchangeable: Finalize would flush a transcript and CloseStream
+        // would end the session, so sending either as the heartbeat breaks warm standby differently.
+        assert_ne!(record(WarmTick::Heartbeat), record(WarmTick::Close));
+        assert_ne!(KEEPALIVE_MSG, FINALIZE_MSG);
+    }
+
+    #[test]
+    fn a_parked_socket_heartbeats_until_a_deadline_closes_it() {
+        // THE HEARTBEAT'S ONLY REAL GUARD (roborev 61450, Medium). The constants test below asserts
+        // relationships that were all true BEFORE the heartbeat existed — delete the send block from
+        // `run_session` and it stays green while every warm socket dies at Deepgram's ~10s idle
+        // close, reverting reuse to a full handshake. This drives the DECISION instead.
+        //
+        // Nothing sent since the park → due immediately.
+        assert_eq!(
+            warm_tick(Duration::from_secs(1), Duration::from_secs(1), None),
+            WarmTick::Heartbeat
+        );
+        // Sent recently → wait.
+        assert_eq!(
+            warm_tick(Duration::from_secs(5), Duration::from_secs(5), Some(Duration::from_secs(1))),
+            WarmTick::Wait
+        );
+        // A full interval later → due again. This is the cadence that defeats the idle close, and a
+        // socket parked for the whole window must keep beating the entire time.
+        assert_eq!(
+            warm_tick(Duration::from_secs(5), Duration::from_secs(5), Some(KEEPALIVE_EVERY)),
+            WarmTick::Heartbeat
+        );
+        assert_eq!(
+            warm_tick(Duration::from_secs(50), Duration::from_secs(50), Some(KEEPALIVE_EVERY)),
+            WarmTick::Heartbeat,
+            "still beating deep into the window — otherwise the socket dies before the window ends"
+        );
+        // A DEADLINE OUTRANKS THE HEARTBEAT: never keep a socket alive past the point it must close,
+        // or the guards above become advisory.
+        assert_eq!(
+            warm_tick(WARM_STANDBY, Duration::from_secs(1), None),
+            WarmTick::Close,
+            "idle window reached → close, do not heartbeat"
+        );
+        assert_eq!(
+            warm_tick(Duration::from_secs(1), Duration::from_secs(58), None),
+            WarmTick::Close,
+            "paid minute nearly spent → close, do not heartbeat"
+        );
+    }
+
+    #[test]
+    fn a_warm_window_past_deepgrams_idle_close_must_heartbeat() {
+        // The 8s window used to sit under Deepgram's ~10s idle close SO THAT no KeepAlive was
+        // needed. Raising it to 55s (to cover the founder's 18s median re-hold gap) makes the
+        // heartbeat load-bearing rather than optional: without it Deepgram closes the socket at ~10s
+        // and every "warm" reuse past that silently pays a fresh handshake again — the exact defect
+        // the longer window exists to fix, reintroduced invisibly.
+        const DEEPGRAM_IDLE_CLOSE: Duration = Duration::from_secs(10);
+        assert!(
+            WARM_STANDBY > DEEPGRAM_IDLE_CLOSE,
+            "this test only means anything while the window outlasts the idle close"
+        );
+        assert!(
+            KEEPALIVE_EVERY < DEEPGRAM_IDLE_CLOSE,
+            "the heartbeat must be more frequent than the idle close it defeats"
+        );
+        // With margin for one dropped/delayed heartbeat, not merely under it by a hair.
+        assert!(
+            KEEPALIVE_EVERY.saturating_mul(2) < DEEPGRAM_IDLE_CLOSE,
+            "one missed heartbeat must not expire the socket"
+        );
+        // The frame Deepgram actually documents for this. A Finalize would flush a transcript and a
+        // CloseStream would end the session, so neither is a substitute.
+        assert_eq!(KEEPALIVE_MSG, "{\"type\":\"KeepAlive\"}");
+        assert_ne!(KEEPALIVE_MSG, FINALIZE_MSG);
+        assert_ne!(KEEPALIVE_MSG, CLOSE_STREAM_MSG);
     }
 
     #[test]

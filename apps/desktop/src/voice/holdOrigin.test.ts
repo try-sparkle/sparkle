@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from "vitest";
 import {
   markHoldOrigin,
   takeHoldOriginAge,
+  peekHoldOriginAge,
   holdOriginPending,
   clearHoldOrigin,
   HOLD_ORIGIN_MAX_AGE_MS,
@@ -83,5 +84,33 @@ describe("holdOrigin", () => {
     markHoldOrigin(1_000);
     markHoldOrigin(1_500);
     expect(takeHoldOriginAge(1_520)).toBe(20);
+  });
+
+  it("lets the cloud path read the origin WITHOUT stealing it from the arm", () => {
+    // ONE KEYDOWN, TWO RACING COMMANDS. Push to talk fans out into `start_dictation` (keydown →
+    // first captured sample) and `start_cloud_stream` (keydown → relay socket live), and the two
+    // race. If the cloud path used the one-shot `take`, whichever invoke happened to run first would
+    // consume the slot and the OTHER would report null — silently losing one of the two headline
+    // latency numbers, on a coin flip, with nothing to say which.
+    markHoldOrigin(1_000);
+    expect(peekHoldOriginAge(1_040)).toBe(40);
+    expect(holdOriginPending()).toBe(true);
+    // Peeking twice is still non-destructive, and the arm still gets its origin afterwards.
+    expect(peekHoldOriginAge(1_050)).toBe(50);
+    expect(takeHoldOriginAge(1_060)).toBe(60);
+    expect(holdOriginPending()).toBe(false);
+  });
+
+  it("refuses the same untrustworthy origins the arm path refuses", () => {
+    // A peek that outlived its gesture must not publish an absurd number just because it is only a
+    // diagnostic — the two readers have to agree about what is reportable, or an aggregate over the
+    // cloud line would include spans the arm line rejected.
+    expect(peekHoldOriginAge(0)).toBeNull(); // nothing pending
+    markHoldOrigin(0);
+    expect(peekHoldOriginAge(HOLD_ORIGIN_MAX_AGE_MS + 1)).toBeNull();
+    expect(peekHoldOriginAge(-5)).toBeNull(); // non-monotonic clock
+    // ...and rejecting a value must NOT clear the slot, unlike `takeHoldOriginAge`.
+    expect(holdOriginPending()).toBe(true);
+    expect(peekHoldOriginAge(25)).toBe(25);
   });
 });

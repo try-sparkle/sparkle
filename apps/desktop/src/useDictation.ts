@@ -16,7 +16,7 @@ import { openCloudDictationWindow, nextBalanceCents } from "./services/cloudDict
 import { safeUnlisten } from "./services/safeUnlisten";
 import { selectedProjectName } from "./services/creditProject";
 import { classifyVoiceError, isWatchdogFault } from "./voice/dictationCopy";
-import { takeHoldOriginAge } from "./voice/holdOrigin";
+import { peekHoldOriginAge, takeHoldOriginAge } from "./voice/holdOrigin";
 import type { Phase } from "./voice/dictationPhase";
 import { routeDictationToTerminal } from "./services/dictationTerminalSink";
 import {
@@ -1179,6 +1179,12 @@ export function useAmbientVoice(): void {
         noteCloudLateAttemptStart();
         const outcome = await invoke<CloudStreamOutcome>("start_cloud_stream", {
           project: selectedProjectName(),
+          // THE NUMBER THE FOUNDER ASKED FOR, and the one nothing measured: keydown → relay socket
+          // live. `handshake_ms` only ever covered the connect itself, which starts well after the
+          // gesture; the span that decides whether a 1-3s utterance gets the live preview is this
+          // one. PEEK, never take — `start_dictation` owns the one-shot slot and races us for it
+          // (see voice/holdOrigin `peekHoldOriginAge`).
+          keydownAgeMs: peekHoldOriginAge(),
         });
         const engine = useDictationEngineStore.getState();
         // ONE FACT THE OUTCOME CANNOT CARRY. `start_cloud_stream` now answers a classified

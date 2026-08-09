@@ -78,6 +78,29 @@ export function takeHoldOriginAge(now: number = performance.now()): number | nul
   return Math.round(age);
 }
 
+/**
+ * Read the pending origin's age WITHOUT consuming it, under the same validity rules as
+ * `takeHoldOriginAge`.
+ *
+ * ONE GESTURE, TWO MEASURED CHAINS. Push to talk fans out from a single keydown into two racing
+ * commands — `start_dictation` (which measures keydown → first captured sample) and
+ * `start_cloud_stream` (which measures keydown → relay socket live). Both need the same origin, and
+ * `takeHoldOriginAge` is one-shot: whichever invoke ran first would consume it and the other would
+ * report `null`, silently losing exactly one of the two numbers depending on a race.
+ *
+ * So the CLOUD path peeks and the ARM path takes. The arm keeps ownership of the one-shot slot (its
+ * mis-attribution guard is the reason the slot is one-shot at all — see `HOLD_ORIGIN_MAX_AGE_MS`),
+ * and the cloud path, which is purely diagnostic, reads without disturbing it. A peek that outlives
+ * its gesture is bounded by the same `HOLD_ORIGIN_MAX_AGE_MS` cap, so it cannot publish an absurd
+ * number either.
+ */
+export function peekHoldOriginAge(now: number = performance.now()): number | null {
+  if (pending === null) return null;
+  const age = now - pending;
+  if (!Number.isFinite(age) || age < 0 || age > HOLD_ORIGIN_MAX_AGE_MS) return null;
+  return Math.round(age);
+}
+
 /** Is an origin waiting to be billed? For tests and for nothing else — reading it is not consuming it. */
 export function holdOriginPending(): boolean {
   return pending !== null;

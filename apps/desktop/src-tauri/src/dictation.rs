@@ -117,12 +117,154 @@ pub(crate) fn discard_needs_reissue(should_be_live: bool, has_capture: bool) -> 
 /// the watchdog, ~3 s later. Written inline that refund was invisible to the suite and silently
 /// deletable; as a function it is one assertion.
 pub(crate) fn note_fresh_arm(sess: &mut DictationSession) {
-    sess.cloud = Arc::new(Mutex::new(None));
-    sess.cloud_active = Arc::new(AtomicBool::new(false));
+    // CARRY A WARM SOCKET ACROSS THE ROTATION — without this the whole warm-standby design is
+    // unreachable for push to talk, which is how it is armed.
+    //
+    // Push-to-talk RELEASE goes all the way to `setEnabled(false)` (`useMicActions::setOff` — the
+    // hold's resting state), so every hold ends in `stop_dictation` and every next hold starts in
+    // `start_dictation`, i.e. HERE. Replacing the slot with an empty Arc drops whatever was parked
+    // in it, so a socket banked by the previous hold was destroyed by the next hold's arm before
+    // `start_cloud_stream` could ever reach `cloud_reuse`'s `Resume` path. Warm standby only ever
+    // worked for the Speak-tray path, where `enabled` stays true and no rotation happens.
+    //
+    // The generation guards are UNCHANGED and still do their job: all four Arcs are new, so
+    // `start_cloud_stream`'s `ptr_eq`/epoch checks still invalidate any stream that raced a prior
+    // stop. What moves is the parked SESSION, not the Arc identity — into the new slot, where the
+    // next `cloud_reuse` finds it and resumes with no handshake.
+    //
+    // THE GATE IS `is_alive()` ALONE — NOT `is_parked() && is_alive()`, and that distinction is the
+    // whole correctness of the reuse hold (roborev 61450, High).
+    //
+    // On the REUSE hold the two commands run in the opposite order to the intuition: nothing has to
+    // handshake, so `start_cloud_stream` reaches `cloud_reuse`'s `Resume` arm IMMEDIATELY — it calls
+    // `resume()` (clearing `parked`), flips `cloud_active` true and returns `Resumed` — and only
+    // ~40 ms later does `start_dictation` arrive here. A `is_parked()` gate therefore sees a session
+    // that was un-parked microseconds ago, declines to carry it, and `sess.cloud = Arc::new(None)`
+    // drops the LAST handle to a socket that is live and already being metered. `Drop` only signals
+    // Close (it does not `silence_now()`), so the just-resumed socket is torn down mid-hold, audio
+    // silently falls back on-device, and a `cloud-ended` fires into the generation that just armed —
+    // the exact speak-into-the-successor hazard every other path guards. The frontend, meanwhile,
+    // was told `Resumed` and started billing. Strictly worse than the bug this change fixes.
+    //
+    // So the carry is ordering-independent: any ALIVE session crosses, parked or routing, and its
+    // routing flag crosses WITH it. A dead worker is a corpse `cloud_reuse` would reject anyway and
+    // is left in the old Arc to drop exactly as before.
+    //
+    // Carrying a ROUTING session is not a hazard, because carrying is the opposite of the
+    // speak-into-the-successor shape: that hazard is a session torn down ALONGSIDE a live
+    // replacement, whereas here the session simply continues — it IS the successor. Project
+    // attribution is unaffected: the next `start_cloud_stream` re-checks `is_for_project` and
+    // reopens on a mismatch.
+    //
+    // `cloud_tx` is rebuilt from the carried session rather than reused, so the slot and the sender
+    // stay faithful mirrors (the invariant `park_raced_stream` and `install_live_stream` both keep).
+    let was_active = sess.cloud_active.load(Ordering::Relaxed);
+    let carried = carry_alive_across_arm(&sess.cloud);
+    let carried_tx = carried.as_ref().map(DeepgramSession::audio_sender);
+    // Only a carried session may bring a `true` routing flag with it: an empty slot with
+    // `cloud_active` true would tell the callback to route at a sender that isn't there.
+    let still_routing = carried.is_some() && was_active;
+    sess.cloud = Arc::new(Mutex::new(carried));
+    sess.cloud_active = Arc::new(AtomicBool::new(still_routing));
     sess.cloud_epoch = Arc::new(AtomicU64::new(0));
-    sess.cloud_tx = Arc::new(Mutex::new(None));
+    sess.cloud_tx = Arc::new(Mutex::new(carried_tx));
     sess.armed = true;
     sess.build_failure_reissued = false;
+}
+
+/// What `stop_dictation` does with the cloud socket: PARK it in warm standby for the next hold, or
+/// hand it back for teardown.
+///
+/// Extracted from the command for the reason AGENTS.md names as the recurring vacuity trap: a
+/// decision written inline in a `#[tauri::command]` needs an `AppHandle` and a `State`, so it is not
+/// driveable by any test — delete it and the suite stays green while the bug comes straight back.
+/// The predicate itself (`should_keep_warm_on_stop`) already had a table test; what had NO test was
+/// the call site, which is the half that actually decides whether a socket survives a hold.
+///
+/// Returns `Some(session)` when the caller must tear it down (already taken out of the slot), and
+/// `None` when it has been parked and deliberately LEFT in the slot alongside its sender — the pair
+/// `note_fresh_arm` then carries into the next hold's generation.
+///
+/// `was_active` is the pre-stop value of `cloud_active`, sampled by the caller before it clears it.
+pub(crate) fn park_or_take_on_stop(
+    sess: &DictationSession,
+    was_active: bool,
+) -> Option<DeepgramSession> {
+    let mut cloud = sess.cloud.lock().unwrap_or_else(|p| p.into_inner());
+    let keep_warm = cloud
+        .as_ref()
+        .map(|s| should_keep_warm_on_stop(was_active, s.is_alive(), s.is_parked()))
+        .unwrap_or(false);
+    if keep_warm {
+        // pause() Finalizes, so the released utterance's trailing text still commits exactly as
+        // finish()'s flush did — the only difference is that the connection survives.
+        cloud.as_ref().unwrap().pause();
+        None
+    } else {
+        // Nothing worth keeping (never routed, already dead, or no socket at all): tear it down
+        // exactly as before, and drop the callback's sender handle with it so `cloud_tx` stays a
+        // faithful mirror of `cloud`.
+        *sess.cloud_tx.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        cloud.take()
+    }
+}
+
+/// Which generation's `cloud_active` flag guards the park decision.
+///
+/// `raced_stream_disposition`'s `already_active` term means "never shadow a session that is actively
+/// routing" — so it must describe the generation the socket would be parked INTO. `ParkWarm` parks
+/// into the captured generation and `ParkCurrent` into the current one, so the source has to follow.
+///
+/// TAKES THE FLAGS THEMSELVES, NOT TWO BOOLS — so the choice cannot be made (or reverted) at the
+/// call site at all (roborev 61465, Medium).
+///
+/// The first version of this helper took `(same_generation, captured: bool, current: bool)`, which
+/// moved the NAME of the decision into a tested unit while leaving the decision itself — which
+/// `AtomicBool` gets read — back at the undriveable call site. Reverting that line to
+/// `already_active`, or simply swapping the two adjacent `bool` arguments, compiled cleanly and kept
+/// every test green. That is the exact hazard this module's own `Installed` struct is documented
+/// against ("NAMED fields, not a bool pair: a caller that swapped `is_alive()` for
+/// `is_for_project()` in a tuple would compile and mis-bill silently").
+///
+/// With both sources passed in, the call site has exactly one way to spell it and the sourcing rule
+/// lives where a test can drive it against a real `DictationSession`.
+///
+/// `raced_stream_disposition`'s `already_active` term means "never shadow a session that is actively
+/// routing", so it must describe the generation the socket would be parked INTO: `ParkWarm` parks
+/// into the captured generation, `ParkCurrent` into the current one. Reading the captured flag on
+/// both paths left the guard inert precisely in the rotated case `ParkCurrent` enables (roborev
+/// 61450, Medium).
+pub(crate) fn park_target_active(
+    same_generation: bool,
+    captured: &AtomicBool,
+    sess: &DictationSession,
+) -> bool {
+    if same_generation {
+        captured.load(Ordering::Relaxed)
+    } else {
+        sess.cloud_active.load(Ordering::Relaxed)
+    }
+}
+
+/// Take an ALIVE session out of the outgoing generation's slot so a fresh arm can inherit it.
+///
+/// Extracted so the predicate is testable on a real session slot without an `AppHandle` or a relay,
+/// and so "which sessions may cross a generation boundary" is one statement rather than a condition
+/// buried in `note_fresh_arm`'s Arc swaps.
+///
+/// DELIBERATELY NOT gated on `is_parked()` — see `note_fresh_arm` for why that gate dropped a live,
+/// already-metered socket on exactly the reuse hold this whole change exists to make fast.
+///
+/// Returns `None` — leaving the slot untouched — for a dead worker or an empty slot, so the caller's
+/// old Arc drops it exactly as it always did.
+fn carry_alive_across_arm(cloud: &Mutex<Option<DeepgramSession>>) -> Option<DeepgramSession> {
+    let mut slot = cloud.lock().unwrap_or_else(|p| p.into_inner());
+    let carryable = slot.as_ref().map(|s| s.is_alive()).unwrap_or(false);
+    if carryable {
+        slot.take()
+    } else {
+        None
+    }
 }
 
 /// The whole lock-scoped decision `reconcile_capture` takes when a build returns `Err`: clear the
@@ -167,8 +309,35 @@ pub(crate) enum RacedStream {
     /// A stop landed while we were connecting, but this session generation is still the live one
     /// and its slot is empty. PARK it in warm standby instead of throwing it away.
     ParkWarm,
-    /// The session generation moved on (a stop_dictation + start_dictation swapped fresh Arcs), so
-    /// this socket is an orphan against state nobody holds. It must be silenced and closed.
+    /// The generation ROTATED while we were connecting, but the mic is armed right now and the
+    /// CURRENT generation's slot is empty — so this pristine socket is exactly what the live session
+    /// needs. Park it into the CURRENT Arcs (not the captured, now-stale ones).
+    ///
+    /// ── THE MEASURED DEFECT THIS EXISTS FOR (74.3% of all sockets) ──────────────────────────────
+    /// Push-to-talk fires `start_cloud_stream` and `start_dictation` from ONE gesture
+    /// (`setEnabled(true); setPhase("active")`), and they race. The handshake begins ~40 ms BEFORE
+    /// `start_dictation` reaches `note_fresh_arm`, so it captures generation G and lands into G+1 —
+    /// rotated by its own arm. Under the old rule that read as an unsalvageable orphan and was
+    /// silenced and closed. Every time: 735 of 989 sockets over Aug 1-9 (87% on one day, 94% on
+    /// another), each costing a full TLS+WS handshake and an up-front `firstMinuteCents` debit for a
+    /// connection that carried no audio at all. It is why a short hold never gets the live preview —
+    /// there was never a warm socket to reuse, because every one of them was destroyed on arrival.
+    ///
+    /// WHY THIS IS SAFE, and it is the same property the Discard arm already relies on: a socket
+    /// reaching this decision has NEVER ROUTED AUDIO. It was just handshaked and was never installed,
+    /// so Deepgram has received nothing from it and has nothing to transcribe. The
+    /// speak-into-the-successor hazard that `Discard` and `silence_now()` exist for — a torn-down
+    /// session draining ITS trailing transcripts into a live successor — is vacuous here, because
+    /// there are no trailing transcripts to drain. `start_cloud_stream`'s own discard arm says so in
+    /// as many words: "This orphan never routed audio, so muting loses nothing."
+    ///
+    /// The guards that remain are the ones that are NOT vacuous: `armed` (never bank a socket
+    /// against a mic the user turned off), `slot_empty` (never clobber an occupant), and
+    /// `!already_active` (never shadow a routing session).
+    ParkCurrent,
+    /// The session generation moved on and nothing wants this socket (the mic is muted, or the
+    /// current slot is already claimed), so it is an orphan against state nobody holds. It must be
+    /// silenced and closed.
     Discard,
 }
 
@@ -215,8 +384,12 @@ pub(crate) fn raced_stream_disposition(
     //
     // A blur — the race this whole path exists for — keeps `armed` true (it drops the capture, not
     // the session), so parking still happens where it pays.
-    if same_generation && armed && slot_empty && !already_active {
-        return RacedStream::ParkWarm;
+    if armed && slot_empty && !already_active {
+        // Same three guards either way; only WHICH Arcs receive the socket differs. Splitting the
+        // two dispositions rather than widening `ParkWarm` is what stops the caller parking a
+        // rotated socket into the captured (stale) `cloud_tx` — a slot and a sender that no longer
+        // mirror each other, which is the bug a single variant would have invited.
+        return if same_generation { RacedStream::ParkWarm } else { RacedStream::ParkCurrent };
     }
     RacedStream::Discard
 }
@@ -248,12 +421,21 @@ pub(crate) enum LateReport {
 /// relay, an `AppHandle` or a clock.
 pub(crate) fn late_report_for(disposition: RacedStream, same_generation: bool) -> LateReport {
     match disposition {
-        // Park only ever happens within one generation, so the guard reads as a tautology here —
-        // stated rather than omitted, so a future relaxation of `raced_stream_disposition` cannot
-        // quietly start parking across a rotation and re-open the hazard.
         RacedStream::ParkWarm | RacedStream::Discard => {
             if same_generation { LateReport::Late } else { LateReport::Orphan }
         }
+        // ROTATED, BUT NOT AN ORPHAN — and this is the one place the two must be told apart.
+        // `Orphan` means "no evidence either way": a handshake for a session the user already left,
+        // possibly landing while a SUCCESSOR is live and painting interims, so reporting it would
+        // describe a timing fault over a working stream. `ParkCurrent` is reached only with the mic
+        // ARMED and the current slot EMPTY — i.e. there is provably no successor stream to lie
+        // about, and this socket has just been banked for the session the user is in right now.
+        //
+        // So `Late` is the honest report: we connected, for the live session, too late to install
+        // for the utterance that just ended. That is exactly what the banner says, and (unlike the
+        // orphan case) it is now also actionable — the next hold reuses this socket with no
+        // handshake, which is the whole point of banking it.
+        RacedStream::ParkCurrent => LateReport::Late,
         RacedStream::InstallLive => LateReport::Silent,
     }
 }

@@ -45,8 +45,9 @@ use crate::transcribe::Transcriber;
 use super::events::{emit_partial, reset_interim_log_sampling};
 use super::{
     begin_start_decision, choose_engine, cloud_reuse, emit_late_report, install_live_stream,
-    late_report_for, load_model, note_fresh_arm, park_raced_stream, raced_stream_disposition,
-    set_arm_origin, should_install_cloud, should_keep_warm_on_stop, start_after_load, stop_is_noop,
+    late_report_for, load_model, note_fresh_arm, park_or_take_on_stop, park_raced_stream,
+    park_target_active, raced_stream_disposition, set_arm_origin, should_install_cloud,
+    start_after_load, stop_is_noop,
 };
 use super::{
     BeginStart, CloudReuse, CloudStreamOutcome, DictationState, Engine, Installed, LateReport,
@@ -385,6 +386,46 @@ pub async fn start_dictation(
     Ok(())
 }
 
+/// PUSH-TO-TALK KEYDOWN → RELAY SOCKET LIVE, the span that decides whether a short utterance gets
+/// the live word-by-word preview. Emitted once per `start_cloud_stream` that ends with a usable
+/// socket.
+///
+/// WHY THIS LINE HAD TO EXIST. `handshake_ms` (cloud.rs) measures the TLS+WS connect only, and it
+/// starts well after the gesture — so the number everyone argued from began too late, exactly as it
+/// did for the audio path before `push-to-talk keydown to first audio sample` was added. Neither
+/// number could answer the actual question: was the relay connected BEFORE the user started
+/// speaking? Only a span anchored at the keydown can.
+///
+/// `path` is what makes the before/after readable at a glance:
+///   * `resumed`  — a warm socket was reused; NO handshake. This is the fast path, and its
+///                  `total_ms` is the whole point of the change.
+///   * `opened`   — a fresh TLS+WS handshake was paid for and installed.
+///   * `routing`  — a socket was already live (a repeated passive→active edge).
+///   * `banked`   — the handshake landed after the utterance ended and was PARKED for the next hold
+///                  instead of being destroyed. Not live for this utterance; live for the next one.
+///
+/// `keydown_age_ms` is `None` for opens with no gesture origin (the tray, the voice menu, a
+/// focus-regain resume); `total_ms` is then omitted rather than guessed, so an aggregate over these
+/// lines can never mix a measured span with an invented one.
+fn log_socket_live(path: &str, keydown_age_ms: Option<u64>, in_cmd_ms: u64) {
+    match keydown_age_ms {
+        Some(age) => tracing::info!(
+            target: "dictation",
+            path,
+            keydown_age_ms = age,
+            in_cmd_ms,
+            total_ms = age + in_cmd_ms,
+            "push-to-talk keydown to relay socket live"
+        ),
+        None => tracing::info!(
+            target: "dictation",
+            path,
+            in_cmd_ms,
+            "relay socket live (no gesture origin; not a push-to-talk hold)"
+        ),
+    }
+}
+
 /// Open the cloud (relay) stream for the active-dictation window. The frontend calls this only when
 /// the dictation phase transitions to ACTIVE — the send tray moving to Speak, or a push-to-talk
 /// hold beginning (`voice/dictationPhase`, `voice/sendMode`) — *and* it has already gated on the
@@ -411,7 +452,16 @@ pub async fn start_cloud_stream(
     // Display name of the project the user is dictating into, so the per-minute deepgram debits are
     // attributable in the Credits history. Metering-only; None when the caller doesn't know.
     project: Option<String>,
+    // Age of the push-to-talk keydown at the moment the frontend invoked us, in ms — the missing
+    // half of the latency chain. `None` when this open has no trustworthy gesture origin (the tray,
+    // the voice menu, a focus-regain resume), in which case the line below reports the stages it can
+    // measure without claiming a keydown span it cannot. Diagnostic only; never affects behaviour.
+    keydown_age_ms: Option<u64>,
 ) -> Result<CloudStreamOutcome, ()> {
+    // Reconstruct the gesture origin: everything from the keydown up to this line already happened
+    // (two zustand writes, React scheduling, the phase-edge subscriber, the JS→Tauri hop), and the
+    // elapsed time from here is what we add to it.
+    let t_cmd = std::time::Instant::now();
     // A NEW DICTATION ATTEMPT — restart the interim log sampling, so THIS attempt logs its own
     // first interim. Here rather than at socket open because this command runs on every
     // passive→active edge INCLUDING warm reuse, and warm reuse is the common case: without it a
@@ -475,6 +525,9 @@ pub async fn start_cloud_stream(
                         s.resume();
                         sess.cloud_active.store(true, Ordering::Relaxed);
                         tracing::info!(target: "dictation", "reusing warm deepgram socket");
+                        // THE FAST PATH, MEASURED. No handshake ran, so this is keydown → live with
+                        // the ~490 ms connect removed — the number this whole change exists to move.
+                        log_socket_live("resumed", keydown_age_ms, t_cmd.elapsed().as_millis() as u64);
                         // caller starts metering, exactly as for a fresh open
                         return Ok(CloudStreamOutcome::Resumed);
                     }
@@ -601,12 +654,20 @@ pub async fn start_cloud_stream(
                 );
                 let slot_empty =
                     sess.cloud.lock().unwrap_or_else(|p| p.into_inner()).is_none();
+                // READ THE FLAG OF THE GENERATION WE WOULD PARK INTO (roborev 61450, Medium).
+                // `already_active` above is the CAPTURED generation's flag, which is right for
+                // `should_install_cloud` (that decision is about our own attempt) but wrong here on
+                // the rotated path: `ParkCurrent` banks into `sess.*`, and `armed`/`slot_empty` are
+                // already read from `sess`, so sourcing this one from a retired generation left the
+                // "never shadow a routing session" guard inert in exactly the case the new variant
+                // enables. Identical to `already_active` whenever the generation is unchanged.
+                let target_active = park_target_active(same_generation, &cloud_active, &sess);
                 let disposition = raced_stream_disposition(
                     install,
                     same_generation,
                     sess.armed, // a mute leaves the generation intact — see raced_stream_disposition
                     slot_empty,
-                    already_active,
+                    target_active,
                 );
                 report = late_report_for(disposition, same_generation);
                 match disposition {
@@ -617,6 +678,21 @@ pub async fn start_cloud_stream(
                         // second handshake, and the first minute already debited gets used.
                         park_raced_stream(&sess.cloud, &cloud_tx, session);
                         // cloud_active deliberately left FALSE: parked, not routing.
+                        parked = true;
+                        None
+                    }
+                    RacedStream::ParkCurrent => {
+                        // The push-to-talk case, and the one that was throwing away 74% of all
+                        // sockets: this gesture's OWN arm rotated the generation while we were
+                        // handshaking, so the captured Arcs are stale but the live session is armed
+                        // and wants exactly this socket.
+                        //
+                        // PARK INTO `sess.*`, NOT THE CAPTURED ARCS — that is the entire difference
+                        // from the arm above, and getting it wrong would install the sender into an
+                        // Arc nobody reads while the slot holds a session the callback can't feed.
+                        // The captured `cloud_tx` is deliberately NOT touched: it belongs to a
+                        // generation that is already gone.
+                        park_raced_stream(&sess.cloud, &sess.cloud_tx, session);
                         parked = true;
                         None
                     }
@@ -654,10 +730,18 @@ pub async fn start_cloud_stream(
                     // construction, so the additive `cloud-late` event is what carries that fact;
                     // see dictationEngineStore's `too-slow` reason.
                     emit_late_report(&app_for_events, report);
+                    // Not live for THIS utterance — but banked, which is the difference between
+                    // this and the discard it replaces. The next hold's line should read `resumed`.
+                    log_socket_live("banked", keydown_age_ms, t_cmd.elapsed().as_millis() as u64);
                     Ok(CloudStreamOutcome::Raced)
                 }
                 // installed a live cloud socket → caller may start metering
-                None => Ok(CloudStreamOutcome::Opened),
+                None => {
+                    // The slow path: a full TLS+WS handshake inside this span. Its `total_ms` is the
+                    // BEFORE number in the comparison — every hold used to look like this.
+                    log_socket_live("opened", keydown_age_ms, t_cmd.elapsed().as_millis() as u64);
+                    Ok(CloudStreamOutcome::Opened)
+                }
                 Some(s) => {
                     tracing::info!(target: "dictation", "discarding cloud stream opened during a stop/again race");
                     // Silence HERE on this thread, then hand ONLY the blocking close+join off-thread
@@ -736,33 +820,19 @@ pub async fn stop_cloud_stream(state: State<'_, DictationState>) -> Result<(), (
         let sess = state.0.lock().unwrap_or_else(|p| p.into_inner());
         let was_active = sess.cloud_active.swap(false, Ordering::Relaxed); // callback routes on-device again
         sess.cloud_epoch.fetch_add(1, Ordering::Relaxed); // invalidate any in-flight start_cloud_stream
-        let mut cloud = sess.cloud.lock().unwrap_or_else(|p| p.into_inner());
         // Warm standby: a genuine stop of a LIVE stream pauses the socket and KEEPS it for
         // ~WARM_STANDBY so the next utterance reuses it (no handshake). The session stays in the slot;
         // start_cloud_stream resumes it. Any other case (already inactive — e.g. a cloud-ended cleanup
         // after warm expiry — or a worker that already died) takes + finishes the leftover instead.
-        // Shares the predicate with the blur path rather than restating it: parking on a deliberate
-        // stop and parking on a window blur are ONE rule, and an inline copy here is exactly how the
-        // two would drift. `is_parked` is what makes the blur ordering work — see
-        // `should_keep_warm_on_stop`.
-        let keep_warm = cloud
-            .as_ref()
-            .map(|s| should_keep_warm_on_stop(was_active, s.is_alive(), s.is_parked()))
-            .unwrap_or(false);
-        if keep_warm {
-            // Warm standby: the session (and thus its sender in cloud_tx) is kept for reuse — leave
-            // the slot as-is. cloud_active is already false, so the callback routes on-device and
-            // won't touch the slot until a resume flips it back. Re-pausing an already-parked
-            // session is a no-op in the worker (its Pause arm is guarded on `!paused`), so this
-            // never extends the warm timer past the original park.
-            cloud.as_ref().unwrap().pause();
-            None
-        } else {
-            // Taking the session down: drop the callback's sender handle too, keeping cloud_tx a
-            // faithful mirror of `cloud` (Some iff a session is installed).
-            *sess.cloud_tx.lock().unwrap_or_else(|p| p.into_inner()) = None;
-            cloud.take()
-        }
+        //
+        // ONE IMPLEMENTATION, shared with `stop_dictation` (the push-to-talk release) and sharing its
+        // predicate with the blur path: parking on a tray stop, on a released hold, and on a window
+        // blur are ONE rule. This was an inline copy of exactly the body `park_or_take_on_stop` now
+        // holds, and `stop_dictation` had a THIRD, divergent version that simply destroyed the socket
+        // — which is the drift that cost every push-to-talk hold its warm socket. Re-pausing an
+        // already-parked session is a no-op in the worker (its Pause arm is guarded on `!paused`), so
+        // this never extends the warm timer past the original park.
+        park_or_take_on_stop(&sess, was_active)
     }; // release locks before the (slower) finish()/join
     // Move the blocking Deepgram flush off the calling (IPC/event-loop) thread — see the fn doc.
     // The session was already taken OUT of the slot under the lock above, so finishing it here can
@@ -915,10 +985,25 @@ pub async fn stop_dictation(app: AppHandle, state: State<'_, DictationState>) ->
         sess.stop_epoch = sess.stop_epoch.wrapping_add(1);
         sess.capture = None;            // drop Capture -> stops the cpal stream (no more frames) AND closes the decode channel
         let worker = sess.decode_worker.take(); // join below, AFTER releasing the lock (drains queued decodes)
-        sess.cloud_active.store(false, Ordering::Relaxed);
+        let cloud_was_active = sess.cloud_active.swap(false, Ordering::Relaxed);
         sess.cloud_epoch.fetch_add(1, Ordering::Relaxed); // invalidate any in-flight start_cloud_stream
-        *sess.cloud_tx.lock().unwrap_or_else(|p| p.into_inner()) = None; // drop the callback's cloud sender handle
-        let cloud_session = sess.cloud.lock().unwrap_or_else(|p| p.into_inner()).take(); // tear down any live cloud stream
+        // PARK THE RELAY SOCKET INSTEAD OF BURNING IT — the push-to-talk half of warm standby.
+        //
+        // `stop_dictation` is where every push-to-talk RELEASE lands: the hold's resting state is
+        // `setOff()` (`setEnabled(false)`), not a phase drop, so the release never reaches
+        // `stop_cloud_stream`'s keep-warm branch — it comes here, where the socket was taken and
+        // `finish()`ed unconditionally. That is why warm standby only ever worked for the Speak
+        // tray, and why every hold paid a fresh ~490 ms handshake and a fresh 6¢ first-minute debit.
+        //
+        // Same predicate as the tray stop and the blur park, deliberately (`should_keep_warm_on_stop`)
+        // — three ways of saying "the user stopped this utterance, not this session", and an inline
+        // copy here is exactly how the three would drift.
+        //
+        // `pause()` still Finalizes, so the trailing text of the utterance being released commits
+        // exactly as `finish()`'s flush did; the difference is only that the connection survives.
+        // The worker closes it on its own schedule (warm expiry, or the paid-minute guard), and a
+        // socket left parked here is what the NEXT hold's `note_fresh_arm` carries forward.
+        let cloud_session = park_or_take_on_stop(&sess, cloud_was_active);
         (sess.transcriber.take(), cloud_session, worker)
     };                                  // release the session lock before the (slower) join/finalize
     tracing::info!(target: "dictation", "stop_dictation: capture dropped, finalizing");

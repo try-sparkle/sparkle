@@ -18,7 +18,7 @@
     use super::{AppHandle, AudioHealth, ZeroSource, DictationSession,
         begin_start_decision, choose_engine, cloud_reuse, park_cloud_for_blur, discard_needs_reissue, note_build_failed, note_fresh_arm,
         apply_decode_plan, plan_decode_emit, DecodeEmitPlan, DecodeEmitSink, DecodeOutcome,
-        should_install_cloud, should_keep_warm_on_stop,
+        should_install_cloud, should_keep_warm_on_stop, park_or_take_on_stop, park_target_active,
         should_resume_on_focus, should_standby_on_blur, start_after_load, stop_is_noop, unpark_cloud_for_focus, BeginStart,
         CloudReuse, DeepgramSession, DictationState, Engine, Installed, ReconcileStep, StartAfterLoad,
         raced_stream_disposition, RacedStream, late_report_for, LateReport, park_raced_stream, install_live_stream, CloudAudioSender,
@@ -2498,11 +2498,35 @@
     }
 
     #[test]
-    fn a_stream_orphaned_by_a_new_session_generation_is_still_discarded() {
-        // The case that genuinely cannot be salvaged: stop_dictation + start_dictation installed
-        // FRESH Arcs, so this socket is attached to state nobody holds. Parking it would strand a
-        // live connection against a dead generation — worse than discarding it.
-        assert_eq!(disposition(Race { same_generation: false, ..SALVAGEABLE }), RacedStream::Discard);
+    fn a_stream_orphaned_by_its_own_arm_is_banked_for_the_next_hold() {
+        // ── THE PUSH-TO-TALK DEFECT, PINNED (74.3% of all sockets: 735 of 989, Aug 1-9) ──────────
+        // This asserted `Discard`, and that is what made short holds permanently preview-less.
+        //
+        // ONE gesture fires BOTH `start_cloud_stream` and `start_dictation`
+        // (`setEnabled(true); setPhase("active")`), and they race: the handshake begins ~40ms before
+        // `start_dictation` reaches `note_fresh_arm`, so it captures generation G and lands into
+        // G+1 — rotated by ITS OWN ARM, with the user still holding the key. The old rule read that
+        // as an unsalvageable orphan and silenced+closed it. Every hold therefore paid a fresh
+        // ~490ms handshake and a fresh 6¢ first-minute debit for a socket that was destroyed on
+        // arrival, and warm standby — the machinery built to prevent exactly this — was never once
+        // reached on the push-to-talk path.
+        //
+        // Safe to bank precisely because such a socket has NEVER ROUTED AUDIO (see the Discard arm
+        // in start_cloud_stream: "This orphan never routed audio, so muting loses nothing"), so
+        // there are no trailing transcripts to leak into a successor.
+        assert_eq!(
+            disposition(Race { same_generation: false, ..SALVAGEABLE }),
+            RacedStream::ParkCurrent,
+            "rotated by its own arm, mic still armed, slot empty: bank it for the next hold"
+        );
+        // And it must be banked into the CURRENT Arcs, which is why this is a distinct variant
+        // rather than a widened ParkWarm — the captured cloud_tx belongs to a generation that is
+        // gone, and parking into it would leave the slot and the sender out of sync.
+        assert_ne!(
+            disposition(Race { same_generation: false, ..SALVAGEABLE }),
+            RacedStream::ParkWarm,
+            "a rotated socket must not be parked into the stale captured sender"
+        );
         // Nor may we park on top of a socket someone else already owns, or while audio is routing.
         assert_eq!(
             disposition(Race { slot_empty: false, ..SALVAGEABLE }),
@@ -2514,6 +2538,298 @@
             RacedStream::Discard,
             "never shadow a session that is actively routing"
         );
+    }
+
+    #[test]
+    fn banking_across_a_rotation_keeps_every_guard_that_is_not_vacuous() {
+        // Relaxing `same_generation` must not relax anything else. Each of these is a case where
+        // banking would be actively wrong, and all three survive the rotation unchanged — so the
+        // change is "a rotated socket is no longer AUTOMATICALLY doomed", not "parking is now
+        // unguarded". Without this, the widened rule would be pinned only by the case it enables.
+        assert_eq!(
+            disposition(Race { same_generation: false, armed: false, ..SALVAGEABLE }),
+            RacedStream::Discard,
+            "muted: never bank a live socket against a mic the user turned off"
+        );
+        assert_eq!(
+            disposition(Race { same_generation: false, slot_empty: false, ..SALVAGEABLE }),
+            RacedStream::Discard,
+            "the current generation already has a socket — clobbering it is the successor hazard"
+        );
+        assert_eq!(
+            disposition(Race { same_generation: false, already_active: true, ..SALVAGEABLE }),
+            RacedStream::Discard,
+            "audio is already routing somewhere — never shadow it"
+        );
+        // The same three guards decide both park flavours, so neither can drift into being laxer
+        // than the other.
+        for armed in [true, false] {
+            for slot_empty in [true, false] {
+                for already_active in [true, false] {
+                    let r = Race { install: false, same_generation: true, armed, slot_empty, already_active };
+                    let rotated = Race { same_generation: false, ..r };
+                    let parked_same = disposition(r) == RacedStream::ParkWarm;
+                    let parked_rotated = disposition(rotated) == RacedStream::ParkCurrent;
+                    assert_eq!(
+                        parked_same, parked_rotated,
+                        "the park decision must not depend on the generation, only WHERE it parks \
+                         (armed={armed} slot_empty={slot_empty} already_active={already_active})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_park_guard_reads_the_flag_of_the_generation_it_parks_into() {
+        // The guard `raced_stream_disposition` calls `already_active` means "never shadow a session
+        // that is actively routing" — so it has to describe the generation the socket lands in.
+        // ParkWarm lands in the captured one, ParkCurrent in the CURRENT one, and reading the
+        // captured flag on both paths left the guard inert in exactly the rotated case the new
+        // variant enables. The pure table test above cannot see this: it never exercises where the
+        // arguments come from (roborev 61450, Medium).
+        //
+        // Driven against a REAL session plus a distinct captured Arc, set to OPPOSITE values, so the
+        // assertion is about which AtomicBool is actually read — not about two bools someone handed
+        // in. The first version took `(same_generation, captured: bool, current: bool)`, and
+        // reverting the call site (or swapping those two adjacent args) compiled and stayed green:
+        // the helper was proven while the line that chose its inputs remained untested (roborev
+        // 61465, Medium).
+        let sess = DictationSession::default();
+        let captured = Arc::new(AtomicBool::new(false));
+
+        // Retired generation idle, CURRENT generation routing.
+        captured.store(false, Ordering::Relaxed);
+        sess.cloud_active.store(true, Ordering::Relaxed);
+        assert!(
+            park_target_active(false, &captured, &sess),
+            "rotated: a CURRENT generation that is routing must block the park, even though the \
+             retired generation's flag says otherwise"
+        );
+        assert!(
+            !park_target_active(true, &captured, &sess),
+            "same generation: the captured flag decides — reading `sess` here would be the bug \
+             pointing the other way"
+        );
+
+        // And the mirror, so neither branch can be a constant.
+        captured.store(true, Ordering::Relaxed);
+        sess.cloud_active.store(false, Ordering::Relaxed);
+        assert!(
+            !park_target_active(false, &captured, &sess),
+            "a retired generation that was routing must not block a park into an idle current one"
+        );
+        assert!(park_target_active(true, &captured, &sess), "same generation → the captured flag");
+    }
+
+    #[test]
+    fn a_socket_banked_by_its_own_arm_reports_late_not_orphan() {
+        // `Orphan` means "NO EVIDENCE EITHER WAY" — a handshake for a session the user already left,
+        // which may be landing while a SUCCESSOR is live and painting interims, so reporting it
+        // would describe a timing fault over a working stream (roborev 59692/60365).
+        //
+        // ParkCurrent is a different fact and must not inherit that silence: it is reached only with
+        // the mic ARMED and the current slot EMPTY, so there is provably no successor stream to lie
+        // about, and the socket has just been banked for the session the user is in right now.
+        // Reporting `Late` is both honest and, unlike the orphan case, actionable — the next hold
+        // reuses this socket with no handshake.
+        assert_eq!(
+            late_report_for(RacedStream::ParkCurrent, false),
+            LateReport::Late,
+            "banked for the live session: say we connected late, don't stay silent"
+        );
+        // The genuine orphan — nothing wanted the socket — keeps its silence.
+        assert_eq!(late_report_for(RacedStream::Discard, false), LateReport::Orphan);
+        assert_eq!(late_report_for(RacedStream::ParkWarm, true), LateReport::Late);
+        assert_eq!(late_report_for(RacedStream::InstallLive, true), LateReport::Silent);
+    }
+
+    #[test]
+    fn a_push_to_talk_release_parks_the_relay_socket_instead_of_burning_it() {
+        // WHERE EVERY HOLD USED TO DIE. Push to talk RESTS at `setOff()` (`setEnabled(false)`), not
+        // at a phase drop, so a release never reaches `stop_cloud_stream`'s keep-warm branch — it
+        // lands in `stop_dictation`, which took the socket and `finish()`ed it unconditionally.
+        // That is why warm standby only ever worked for the Speak tray, and why every hold paid a
+        // fresh ~490ms handshake and a fresh 6¢ first-minute debit.
+        let sess = DictationSession::default();
+        let (session, rx) = crate::cloud::parkable_session();
+        *sess.cloud.lock().unwrap() = Some(session);
+        *sess.cloud_tx.lock().unwrap() =
+            Some(sess.cloud.lock().unwrap().as_ref().unwrap().audio_sender());
+
+        // A release of a LIVE cloud stream (cloud_active was true).
+        let taken = park_or_take_on_stop(&sess, true);
+
+        assert!(taken.is_none(), "a released hold must not hand the socket back for teardown");
+        assert!(
+            sess.cloud.lock().unwrap().is_some(),
+            "the socket must stay in the slot — this is what the next arm carries forward"
+        );
+        assert!(
+            sess.cloud.lock().unwrap().as_ref().unwrap().is_parked(),
+            "and it must actually be PARKED, not merely left sitting there unpaused: an unparked \
+             socket runs no warm timer and is not carryable by note_fresh_arm"
+        );
+        assert!(
+            sess.cloud_tx.lock().unwrap().is_some(),
+            "the sender stays installed alongside it, exactly as warm standby leaves the pair"
+        );
+        // The WORKER-VISIBLE effect, not just the flag: `pause()` is what Finalizes the released
+        // utterance (so its trailing text still commits) and starts the warm timer. Asserting only
+        // `is_parked()` would pass against a version that set the flag and sent nothing.
+        assert!(
+            rx.took_pause(),
+            "the release must send Pause to the worker, or nothing finalizes and nothing warms"
+        );
+    }
+
+    #[test]
+    fn a_stop_with_nothing_worth_keeping_still_tears_the_socket_down() {
+        // The other side, so the park cannot quietly become unconditional. A socket that never
+        // routed and was never parked has NO warm timer behind it — leaving it in the slot would
+        // strand a connection that nothing will ever close on schedule.
+        let sess = DictationSession::default();
+        let (session, _rx) = crate::cloud::parkable_session();
+        *sess.cloud.lock().unwrap() = Some(session);
+        *sess.cloud_tx.lock().unwrap() =
+            Some(sess.cloud.lock().unwrap().as_ref().unwrap().audio_sender());
+
+        // cloud_active false, never parked → nothing is holding it warm.
+        let taken = park_or_take_on_stop(&sess, false);
+
+        assert!(taken.is_some(), "an unparked, never-routing socket is handed back for teardown");
+        assert!(sess.cloud.lock().unwrap().is_none(), "and it leaves the slot");
+        assert!(
+            sess.cloud_tx.lock().unwrap().is_none(),
+            "the sender goes with it, or cloud_tx outlives the session it points at"
+        );
+        // An empty slot is simply nothing to do.
+        let empty = DictationSession::default();
+        assert!(park_or_take_on_stop(&empty, true).is_none());
+    }
+
+    #[test]
+    fn a_fresh_arm_carries_a_warm_socket_instead_of_orphaning_it() {
+        // THE OTHER HALF OF THE PUSH-TO-TALK FIX, and without it the first half is inert.
+        //
+        // A push-to-talk RELEASE goes all the way to `setEnabled(false)` (`useMicActions::setOff` —
+        // the hold's resting state), so every hold ends in `stop_dictation` and every NEXT hold
+        // starts here. Replacing the slot with an empty Arc dropped whatever was parked in it, so a
+        // socket banked by hold N was destroyed by hold N+1's arm before `start_cloud_stream` could
+        // ever reach `cloud_reuse`'s Resume path. Warm standby only ever worked for the Speak tray,
+        // where `enabled` stays true and no rotation happens.
+        let mut sess = DictationSession { armed: false, ..Default::default() };
+        let (session, _rx) = crate::cloud::parkable_session();
+        session.pause(); // what stop_dictation's keep-warm branch does on release
+        assert!(session.is_parked() && session.is_alive(), "precondition: a warm, live socket");
+        *sess.cloud.lock().unwrap() = Some(session);
+        let old_cloud = sess.cloud.clone();
+
+        note_fresh_arm(&mut sess);
+
+        // The generation guards are UNCHANGED — this is what makes the carry safe rather than a
+        // hole in the ptr_eq/epoch protocol.
+        assert!(!Arc::ptr_eq(&old_cloud, &sess.cloud), "still a fresh generation");
+        assert_eq!(sess.cloud_epoch.load(Ordering::SeqCst), 0, "epoch restarts");
+        assert!(!sess.cloud_active.load(Ordering::Relaxed), "carried = parked, never routing");
+        // What actually moved: the SESSION, into the new slot, where cloud_reuse finds it.
+        assert!(
+            sess.cloud.lock().unwrap().is_some(),
+            "the warm socket must survive the arm — otherwise the next hold pays a full handshake"
+        );
+        assert!(
+            sess.cloud_tx.lock().unwrap().is_some(),
+            "the sender must be rebuilt alongside it, or the slot and the sender stop mirroring"
+        );
+        assert!(old_cloud.lock().unwrap().is_none(), "and it must not be left in the retired Arc too");
+        // The payoff, stated as the decision the next start_cloud_stream actually takes.
+        assert_eq!(
+            cloud_reuse(false, Some(Installed { alive: true, project_matches: true })),
+            CloudReuse::Resume,
+            "the carried socket is what turns the next hold into a resume with no handshake"
+        );
+    }
+
+    #[test]
+    fn the_reuse_hold_resumes_BEFORE_the_arm_and_the_arm_must_not_drop_it() {
+        // ── THE ORDERING THE FIRST VERSION OF THIS FIX GOT WRONG (roborev 61450, High) ───────────
+        // The sibling test above calls `note_fresh_arm` on a STILL-PARKED session, which is not the
+        // order the reuse hold actually runs in — so it could not see this, and the whole change was
+        // inert (worse than inert) on the one path it exists for.
+        //
+        // On the reuse hold nothing has to handshake, so `start_cloud_stream` reaches `cloud_reuse`'s
+        // Resume arm IMMEDIATELY: it calls `resume()` (clearing `parked`), flips `cloud_active` true
+        // and returns `Resumed` — and only ~40ms later does `start_dictation` reach the arm. A carry
+        // gated on `is_parked()` then declines, and replacing the slot drops the LAST handle to a
+        // socket that is live and already being metered: `Drop` only signals Close (no
+        // `silence_now()`), so it is torn down mid-hold, audio falls back on-device, and a
+        // `cloud-ended` fires into the generation that just armed.
+        let mut sess = DictationSession { armed: false, ..Default::default() };
+        let (session, _rx) = crate::cloud::parkable_session();
+        session.pause();
+        *sess.cloud.lock().unwrap() = Some(session);
+
+        // What start_cloud_stream's Resume arm does, in the order it really does it.
+        sess.cloud.lock().unwrap().as_ref().unwrap().resume();
+        sess.cloud_active.store(true, Ordering::Relaxed);
+        assert!(
+            !sess.cloud.lock().unwrap().as_ref().unwrap().is_parked(),
+            "precondition: the resume already un-parked it — this is the state the arm meets"
+        );
+
+        note_fresh_arm(&mut sess);
+
+        assert!(
+            sess.cloud.lock().unwrap().is_some(),
+            "the arm must NOT drop a live, already-metered socket it finds un-parked"
+        );
+        assert!(
+            sess.cloud_active.load(Ordering::Relaxed),
+            "and its routing flag must cross with it — otherwise the frontend was told `Resumed` \
+             and started billing while the callback quietly routes on-device"
+        );
+        assert!(sess.cloud_tx.lock().unwrap().is_some(), "the sender crosses too, or nothing routes");
+    }
+
+    #[test]
+    fn an_empty_slot_never_carries_a_routing_flag() {
+        // The other half of preserving `cloud_active`: a `true` flag over an EMPTY slot tells the
+        // capture callback to route at a sender that isn't there — frames dropped rather than
+        // transcribed, with no cloud-ended to recover it (the invariant roborev 52647 pinned).
+        let mut sess = DictationSession { armed: false, ..Default::default() };
+        sess.cloud_active.store(true, Ordering::Relaxed);
+        assert!(sess.cloud.lock().unwrap().is_none(), "precondition: nothing installed");
+
+        note_fresh_arm(&mut sess);
+
+        assert!(
+            !sess.cloud_active.load(Ordering::Relaxed),
+            "no session carried → the routing flag must not be carried either"
+        );
+    }
+
+    #[test]
+    fn a_fresh_arm_never_carries_a_dead_worker() {
+        // The one thing the carry still refuses. A dead worker is a corpse — `cloud_reuse` gates on
+        // `is_alive` and would reject it anyway, and carrying it would put a session in the slot
+        // that can never route, hiding the empty-slot `Open` path behind a socket that is gone.
+        // Left in the old Arc and dropped exactly as before, so this change cannot resurrect a
+        // session that should have died.
+        let mut sess = DictationSession { armed: false, ..Default::default() };
+        let (session, _rx) = crate::cloud::parkable_session();
+        session.pause();
+        session.kill_for_test(); // warm expiry / socket death
+        assert!(!session.is_alive(), "precondition: the worker has exited");
+        *sess.cloud.lock().unwrap() = Some(session);
+
+        note_fresh_arm(&mut sess);
+
+        assert!(
+            sess.cloud.lock().unwrap().is_none(),
+            "a dead session must not cross a generation boundary"
+        );
+        assert!(sess.cloud_tx.lock().unwrap().is_none(), "and no sender may be invented for it");
+        assert!(!sess.cloud_active.load(Ordering::Relaxed), "nor a routing flag");
     }
 
     #[test]
