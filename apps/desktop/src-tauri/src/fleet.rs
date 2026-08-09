@@ -2776,10 +2776,12 @@ mod tests {
         // outside any filesystem's granularity — and the recorded value either predates that jump
         // or it is the jump. No thread, no sleep, no elapsed-time ratio to be descheduled out of.
         //
-        // WHERE `between()` FIRES IS PART OF THIS TEST. It must sit between the `sampled_ms`
-        // collect and the tip read; moved after both, every ordering records the same value and
-        // this test passes on nothing. Verified by mutation — that is the one edit that makes it
-        // vacuous rather than red, so it will not announce itself.
+        // WHERE `between()` FIRES IS PART OF THIS TEST, so the hook asserts its own placement (see
+        // below). It must sit between the `sampled_ms` collect and the tip read; moved after both —
+        // or into the chunk loop — every ordering records the same value and this test would pass
+        // on nothing. That edit happens in production code 1,900 lines from here and reds nothing
+        // on its own, which is why the check is a `assert_eq!` inside the closure rather than a
+        // sentence in this comment.
         let _spawns = git_lock();
         let (root, base, wts) = fleet_repo("sample-order", &["b1"]);
         let ref_file =
@@ -2787,7 +2789,21 @@ mod tests {
         let before = head_ref_ms(&wts[0]).expect("the branch has a loose ref file to stat");
 
         let jumped = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        reset_git_spawns();
         let rows = ref_rows_with(&wts, &base, &|| {
+            // THE HOOK CHECKS ITS OWN PLACEMENT. Everything `ref_rows_with` does before the sample
+            // is pure filesystem work, so the spawn count here is deterministically 0 — and the
+            // very next thing after the sample is the `for-each-ref`. Without this line the guard
+            // could be disarmed from 1,900 lines away, silently: sink `between()` below the chunk
+            // loop (or into it) and sample-first and sample-last both record the same pre-jump
+            // value, so this test goes GREEN on the bug it exists to catch. A comment cannot
+            // defend against that, because the edit that breaks it happens in production code and
+            // reds nothing. This turns that edit into a failure.
+            assert_eq!(
+                git_spawns(),
+                0,
+                "the hook must fire BEFORE the tip read, or this test proves nothing"
+            );
             std::fs::File::options()
                 .write(true)
                 .open(&ref_file)
