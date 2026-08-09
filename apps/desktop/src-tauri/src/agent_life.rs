@@ -2403,6 +2403,15 @@ mod tests {
             "the slice swallowed the helper's own DEFINITION, so the call-site assertion below \
              cannot fail — re-scope it before trusting this guard"
         );
+        // Same self-check for the OTHER helper this guard now locates by name. `kill_session` holds
+        // the session removal that used to be inline here; if the slice ever swallowed its
+        // definition, `find("kill_session(")` would match the definition instead of the call and the
+        // ordering assertion below would be measuring nothing.
+        assert!(
+            !body.contains("fn kill_session"),
+            "the slice swallowed `kill_session`'s DEFINITION, so the ordering assertion below \
+             would match the definition rather than pty_kill's call — re-scope it"
+        );
         let call = body.find("mark_stopped_before_kill(").unwrap_or_else(|| {
             panic!(
                 "`pty_kill` no longer records the deliberate stop, so the session reaper will seal \
@@ -2413,7 +2422,14 @@ mod tests {
         // moving the mark below the session removal, leaves every test green while the record is
         // still read `Live` after the session has vanished: exactly the state
         // `reap_dead_sessions_at` seals as `process-gone`.
-        let kill = body.find("sessions.lock()").expect("pty_kill no longer removes the session");
+        // The removal used to be inline here as `sessions.lock()…remove(&id)`; it now lives in
+        // `kill_session`, which `pty_kill` calls. The PROPERTY is unchanged — the mark must precede
+        // the kill — so this locates the kill by the call rather than by the lock it used to
+        // contain. Keyed on the call, not on the lock, precisely because the lock moving is an
+        // ordinary refactor and must not silently blind this guard (which is what it just did).
+        let kill = body
+            .find("kill_session(")
+            .expect("pty_kill no longer kills the session — this guard's ordering has no subject");
         assert!(
             call < kill,
             "the deliberate-stop mark must run BEFORE the session is removed, or the reaper can \

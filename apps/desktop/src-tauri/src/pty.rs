@@ -689,6 +689,28 @@ fn apply_heap_cap(cmd: &mut CommandBuilder, inherited: Option<String>, heap_mb: 
     }
 }
 
+/// What a reader thread does about its observer once it knows [`Reap`]'s verdict.
+///
+/// TWO LINES, EXTRACTED SO THEY CAN BE TESTED — and that is the whole point, not tidiness. The bug
+/// this closes lived HERE, in the mapping from verdict to action, while every test targeted `reap`'s
+/// return value; the suite stayed green through a gate that skipped the detach on the commonest
+/// path. Inline, this decision is reachable only from a thread inside a real `pty_spawn`, so nothing
+/// could assert it. Behind this function, three unit tests pin all three verdicts.
+///
+/// Stop observing, or a long-lived app accumulates one 4KB tail and one VT grid per agent that has
+/// ever run. The nudger also keys its ladder state off the live observer set (`nudger::tick` reads
+/// `observers.all()`), so an observer left attached to a dead PTY keeps its ladder climbing and
+/// eventually escalates a terminal that no longer exists.
+///
+/// Gated on NOT BEING SOMEONE ELSE'S, not on "did I remove a row". `pty_kill` removes the session by
+/// id before the reader wakes on EOF, so on every deliberate stop the reap finds an empty slot — and
+/// gating on the removal skips the detach exactly there, on the commonest teardown path there is.
+fn finish_teardown(observers: &crate::nudger::Observers, id: &str, reap: Reap) {
+    if reap != Reap::OwnedByOther {
+        observers.detach(id);
+    }
+}
+
 /// The `Send` pieces `pty_spawn`'s blocking setup hands back to the async side: the session to
 /// insert into the manager, plus the child's output reader and the child itself (each reaped on
 /// its own thread).
@@ -995,18 +1017,7 @@ pub async fn pty_spawn(
         // the lower epoch and is filtered out by design), and `live_epoch` would drop to NO_EPOCH
         // while a higher-epoch session runs, so an observer's floor would admit a stale exit.
         let reap = read_app.state::<PtyManager>().reap(&read_id, epoch);
-        // Stop observing too, or a long-lived app accumulates one 4KB tail and one VT grid per
-        // agent that has ever run. The nudger also keys its ladder state off the live observer set
-        // (`nudger::tick` reads `observers.all()`), so an observer left attached to a dead PTY keeps
-        // its ladder climbing and eventually escalates a terminal that no longer exists.
-        //
-        // Gated on NOT BEING SOMEONE ELSE'S, not on "did I remove a row". `pty_kill` removes the
-        // session by id before the reader wakes on EOF, so on every deliberate stop the reap finds
-        // an empty slot — and gating on the removal would skip the detach exactly there, on the
-        // commonest teardown path there is.
-        if reap != Reap::OwnedByOther {
-            read_app.state::<crate::nudger::Observers>().detach(&read_id);
-        }
+        finish_teardown(&read_app.state::<crate::nudger::Observers>(), &read_id, reap);
         // Stamped with THIS session's epoch, not with whatever is currently in the map under this
         // id. By the time a replaced reader gets here the map may already hold its SUCCESSOR, and
         // reporting the successor's epoch would be worse than reporting none: the new terminal would
@@ -1203,16 +1214,38 @@ pub async fn pty_kill(app: AppHandle, manager: State<'_, PtyManager>, id: String
         mark_stopped_before_kill(&mark_app, &mark_id);
     })
     .await;
-    if let Some(mut session) = manager.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(&id) {
-        // If the reader is parked (paused) it won't observe the kill's EOF and would never run its
-        // teardown (remove + pty:exit). Resume it first so it wakes, reads EOF, and cleans up.
-        session.pause.set(false);
-        // Same hazard, second gate: a reader or flusher parked waiting for acks will get none once
-        // the terminal is gone. Close the credit gate so both proceed, drain, and tear down.
-        session.inflight.close();
-        let _ = session.killer.kill();
-    }
+    kill_session(&manager, &id);
     Ok(())
+}
+
+/// Take the session out of the map and end its child — the whole of `pty_kill`'s effect on a live
+/// PTY, extracted so it can be DRIVEN by a test rather than hand-simulated in one.
+///
+/// The REMOVAL BY ID is what makes `Reap::AlreadyGone` the ordinary case: the session leaves the
+/// map HERE, and the reader thread that later wakes on its child's EOF finds nothing under its id.
+/// A test that reproduces that by reaching into the map itself asserts a precondition it created —
+/// it stays green if this function stops removing by id at all. Driving this reds that.
+///
+/// What no synchronous caller can observe is the order of the three statements BELOW against each
+/// other — by the time this returns, all of them have run. `kill_resumes_a_reader_parked_on_the_
+/// pause_gate_and_closes_the_credit_gate` pins that the resume and the close HAPPEN (deleting
+/// either reds it); the interleaving against `killer.kill()` is pinned by nothing, and claiming
+/// otherwise in a comment is how the last vacuous test here got written.
+///
+/// Returns whether a session was there to kill.
+fn kill_session(manager: &PtyManager, id: &str) -> bool {
+    let Some(mut session) = manager.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(id)
+    else {
+        return false;
+    };
+    // If the reader is parked (paused) it won't observe the kill's EOF and would never run its
+    // teardown (reap + pty:exit). Resume it first so it wakes, reads EOF, and cleans up.
+    session.pause.set(false);
+    // Same hazard, second gate: a reader or flusher parked waiting for acks will get none once
+    // the terminal is gone. Close the credit gate so both proceed, drain, and tear down.
+    session.inflight.close();
+    let _ = session.killer.kill();
+    true
 }
 
 /// Every agent id with a live PTY session in THIS process.
@@ -1309,7 +1342,9 @@ mod tests {
     use super::{
         acquire_writer, apply_heap_cap, guard_resize_size, guard_spawn_size, next_pty_epoch,
         node_options_with_cap, run_flusher, validate_spawn_inner, Credit, FlushBuf, InflightState,
-        PauseState, PtyManager, PtyEnd, PtySession, Reap, MIN_PTY_COLS, MIN_PTY_ROWS, NO_EPOCH,
+        finish_teardown, kill_session, PauseState, PtyManager, PtyEnd, PtySession, Reap,
+        MIN_PTY_COLS,
+        MIN_PTY_ROWS, NO_EPOCH,
         PTY_INFLIGHT_HIGH_WATER_BYTES, SPAWN_FALLBACK_COLS, SPAWN_FALLBACK_ROWS,
     };
     use portable_pty::CommandBuilder;
@@ -1825,21 +1860,103 @@ mod tests {
         );
         assert_eq!(mgr.live_epoch("agent-overlap"), NO_EPOCH, "and the id is then free");
 
-        // THE KILL ORDERING, which is the common path and the one a two-answer reap gets wrong.
-        // `pty_kill` removes the session itself before the reader wakes on EOF, so the reader's reap
-        // finds an empty slot. That is "mine to finish tearing down", NOT "someone else's" — read it
-        // as the latter and `Observers::detach` is skipped on every deliberate stop, leaking the
-        // observer and leaving the nudger's ladder climbing against a PTY that no longer exists.
-        assert_eq!(
-            mgr.reap("agent-overlap", winner),
-            Reap::AlreadyGone,
-            "an id already emptied by pty_kill is unowned, not owned by someone else"
-        );
-
         for mut child in children {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+
+    /// THE KILL ORDERING, simulated the way it actually happens: a session is live, `pty_kill`
+    /// removes it BY ID, and only then does its own reader thread wake on EOF and reap.
+    ///
+    /// Written as its own test against a freshly inserted session rather than reusing an id an
+    /// earlier assertion already emptied — an empty map answers `AlreadyGone` for reasons that have
+    /// nothing to do with a kill, so reusing it would re-test the trivial case while claiming to
+    /// cover this one.
+    #[test]
+    fn a_session_killed_by_id_still_reads_as_unowned_to_its_own_reader() {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        let sys = native_pty_system();
+        let size = PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
+        let Ok(pair) = sys.openpty(size) else { return };
+        let Ok(mut child) = pair.slave.spawn_command(CommandBuilder::new("/bin/cat")) else {
+            return;
+        };
+        let killer = child.clone_killer();
+        let Ok(writer) = pair.master.take_writer() else { return };
+        let mgr = PtyManager::default();
+        let epoch = mgr.insert_session(
+            "agent-killed".to_string(),
+            PtySession {
+                writer: Arc::new(Mutex::new(writer)),
+                master: pair.master,
+                killer,
+                pause: Arc::new(PauseState::new()),
+                inflight: Arc::new(InflightState::new()),
+                pid: None,
+                epoch: NO_EPOCH,
+            },
+        );
+
+        // THE REAL KILL, not a hand-rolled stand-in for it. Reaching into the map here would assert
+        // a precondition this test created: `reap` reads nothing but `sessions.get(id)`, so a
+        // manually emptied map is byte-for-byte a map that never held the id, and the assertion
+        // below would collapse into the `nonexistent` case another test already owns. Driving
+        // `kill_session` is what makes ONE regression red: the kill ceasing to remove by id (a
+        // `get_mut` in place of the `remove`) leaves the session under its own epoch, so the reap
+        // below answers `RemovedOurs`. It does NOT pin the removal against `killer.kill()` — this
+        // caller is synchronous, so both have run by the time `reap` is asked, and swapping the two
+        // statements inside `kill_session` stays green here. Only a reader racing a live kill could
+        // see that, and nothing in this suite does.
+        assert!(kill_session(&mgr, "agent-killed"), "control: the session was live before the kill");
+
+        // The reader wakes on EOF and reaps with ITS OWN epoch. Nothing owns the id, so this is
+        // still its teardown to finish — not someone else's session to leave alone.
+        assert_eq!(
+            mgr.reap("agent-killed", epoch),
+            Reap::AlreadyGone,
+            "a session removed by pty_kill leaves its id UNOWNED; reading that as OwnedByOther \
+             skips the reader's remaining teardown on every deliberate stop"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// THE GATE ITSELF — the two lines the previous fix actually changed, and the ones nothing
+    /// covered. Reverting `finish_teardown` to `reap == RemovedOurs` (literally the pre-fix
+    /// behavior) left the whole `pty::` suite green, because every assertion targeted `reap`'s
+    /// return value rather than what the caller DOES with it. These three cases red under that
+    /// exact mutation.
+    #[test]
+    fn finish_teardown_detaches_unless_the_id_belongs_to_someone_else() {
+        use crate::nudger::Observers;
+
+        // RemovedOurs — the natural-exit path: our session was in the map and we took it out.
+        let observers = Observers::default();
+        observers.attach("agent-a", 80, 24);
+        finish_teardown(&observers, "agent-a", Reap::RemovedOurs);
+        assert!(observers.get("agent-a").is_none(), "a natural exit must stop observing");
+
+        // AlreadyGone — pty_kill got there first. STILL OURS to finish tearing down: this is the
+        // case the boolean gate got wrong, and it is the commonest teardown there is.
+        let observers = Observers::default();
+        observers.attach("agent-b", 80, 24);
+        finish_teardown(&observers, "agent-b", Reap::AlreadyGone);
+        assert!(
+            observers.get("agent-b").is_none(),
+            "a killed agent must stop being observed, or nudger::tick keeps it in `live` forever \
+             and escalates a terminal that no longer exists"
+        );
+
+        // OwnedByOther — an overlapping spawn replaced us. The observer belongs to a LIVE PTY.
+        let observers = Observers::default();
+        observers.attach("agent-c", 80, 24);
+        finish_teardown(&observers, "agent-c", Reap::OwnedByOther);
+        assert!(
+            observers.get("agent-c").is_some(),
+            "a replaced reader must not detach the observer of the live session that replaced it"
+        );
     }
 
     /// `session_ids` must report a session that has NO pid — the exact entry `session_pids` skips.
@@ -2080,26 +2197,77 @@ mod tests {
         assert!(status.success(), "/bin/echo must exit 0; got {status:?}");
     }
 
-    /// `pty_kill` on a paused session sets `pause.set(false)` BEFORE `killer.kill()` so a reader
-    /// parked on the pause gate wakes, then reads the child's EOF and runs teardown. This pins that
-    /// kill-while-paused ordering contract ().
+    /// `pty_kill` on a PAUSED session must resume it, or the reader stays parked on the pause gate,
+    /// never observes the child's EOF, and never runs its teardown (reap + `pty:exit`) — the agent
+    /// is dead and the app still shows it live (). Same hazard on the credit gate: a
+    /// producer parked waiting for acks gets none once the terminal is gone.
+    ///
+    /// DRIVEN, not restaged. This used to build its own `PauseState`, park a thread on it and call
+    /// `pause.set(false)` itself under the comment "exactly what pty_kill does" — which made it a
+    /// test of `PauseState`, green even with `session.pause.set(false)` deleted from the kill
+    /// outright. `kill_session` is callable now, so the real path is what runs and that deletion
+    /// reds it. Both gates are asserted, since nothing else covers the `inflight.close()`.
     #[test]
-    fn kill_order_wakes_a_reader_parked_on_the_pause_gate() {
+    fn kill_resumes_a_reader_parked_on_the_pause_gate_and_closes_the_credit_gate() {
+        use portable_pty::{native_pty_system, PtySize};
+        let sys = native_pty_system();
+        let size = PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
+        let Ok(pair) = sys.openpty(size) else { return };
+        let Ok(mut child) = pair.slave.spawn_command(CommandBuilder::new("/bin/cat")) else {
+            return;
+        };
+        let killer = child.clone_killer();
+        let Ok(writer) = pair.master.take_writer() else { return };
+
         let pause = Arc::new(PauseState::new());
-        pause.set(true);
+        let inflight = Arc::new(InflightState::new());
+        pause.set(true); // the state a kill has to rescue: paused, with a reader about to park
+        let mgr = PtyManager::default();
+        mgr.insert_session(
+            "agent-paused".to_string(),
+            PtySession {
+                writer: Arc::new(Mutex::new(writer)),
+                master: pair.master,
+                killer,
+                pause: pause.clone(),
+                inflight: inflight.clone(),
+                pid: None,
+                epoch: NO_EPOCH,
+            },
+        );
+
         let woke = Arc::new(AtomicBool::new(false));
-        let p2 = pause.clone();
-        let w2 = woke.clone();
+        let (p2, w2) = (pause.clone(), woke.clone());
         let reader = std::thread::spawn(move || {
             p2.wait_while_paused(); // the real reader parks here before each read()
             w2.store(true, Ordering::SeqCst);
         });
         std::thread::sleep(Duration::from_millis(30));
-        assert!(!woke.load(Ordering::SeqCst), "a paused reader must stay parked");
-        // Exactly what pty_kill does to the removed session before killing the child:
-        pause.set(false);
-        reader.join().unwrap();
-        assert!(woke.load(Ordering::SeqCst), "kill's resume must wake the parked reader");
+        assert!(!woke.load(Ordering::SeqCst), "control: a paused reader stays parked until the kill");
+        assert!(!inflight.is_closed(), "control: the credit gate is open until the kill closes it");
+
+        assert!(kill_session(&mgr, "agent-paused"), "control: the session was live before the kill");
+
+        // Bounded wait, not a `join`: the regression this guards against is a thread that NEVER
+        // wakes, and joining it would HANG the suite instead of failing it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !woke.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            woke.load(Ordering::SeqCst),
+            "the kill must resume the pause gate; a reader left parked never reads the child's EOF, \
+             so its teardown — reap and pty:exit — never runs and the agent reads live forever"
+        );
+        assert!(
+            inflight.is_closed(),
+            "the kill must close the credit gate; a producer parked on it is waiting for acks a \
+             dead terminal can no longer send"
+        );
+
+        let _ = reader.join();
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     // ── IPC emit credit gate (inflight backpressure) ──────────────────────────────────────────
