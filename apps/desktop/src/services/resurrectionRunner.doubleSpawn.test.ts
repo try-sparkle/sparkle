@@ -460,6 +460,62 @@ describe("a cohort IS eventually given up on, and the human is told the truth ab
     ).toMatch(/3 canaries failed/);
   });
 
+  it("stays abandoned when a newcomer re-keys a cohort whose budget is already spent", async () => {
+    // THE RUNNER'S OWN BUDGET GATE, which nothing reached (roborev 60378).
+    //
+    // The test above pins how `nextAttempt` is DERIVED, but it abandons through `afterFailure` in
+    // the engine — which carries its own `${MAX_CANARY_ATTEMPTS} canaries failed` copy. So the
+    // string it matches comes from the engine, and deleting the runner's
+    // `if (nextAttempt > MAX_CANARY_ATTEMPTS)` branch outright left the whole suite green.
+    //
+    // That branch has exactly one route in production: `stabilizeCohortKeys` mints a fresh key when
+    // a cohort GAINS a member, and the carry moves `cohortAttempts` across but NOT an `abandoned`
+    // phase (only `released` is carried, deliberately). So the fresh key defaults to `observed`
+    // holding a spent budget, and only the runner can stop it electing again.
+    //
+    // The discriminator is the MOUNT, not the copy: with the branch removed, c4 is untried and
+    // unburned, so `electCanary` hands it back and a fourth probation is sent against a door the
+    // cohort has already established is shut.
+    notified.mockClear();
+    const three = [
+      dead({ agentId: "c1", diedAt: NOW - 1_000 }),
+      dead({ agentId: "c2", diedAt: NOW - 500 }),
+      dead({ agentId: "c3", diedAt: NOW }),
+    ];
+    const mounted: string[] = [];
+    let due = three;
+    const run = (t: number) =>
+      sweepResurrections(
+        opts({
+          now: NOW + FIRST_RUNG + t,
+          due: () => Promise.resolve(due),
+          mount: (agentId) => {
+            mounted.push(agentId);
+          },
+          probationEvidence: ALWAYS_FAILS,
+        }),
+      );
+
+    await run(0); // c1 elected, attempt 1
+    await run(1_000); // c1 fails -> c2, attempt 2
+    await run(2_000); // c2 fails -> c3, attempt 3
+    const spent = await run(3_000); // c3 fails -> budget exhausted
+    expect(spent.some((o) => o.detail === "cohort-abandoned")).toBe(true);
+    expect(mounted).toEqual(["c1", "c2", "c3"]);
+
+    // A fourth agent dies of the SAME cause inside the window, so the cohort is re-keyed and the
+    // spent budget is carried onto a key that has no phase.
+    due = [...three, dead({ agentId: "c4", diedAt: NOW + 60_000 })];
+    const after = await run(4_000);
+
+    expect(
+      mounted,
+      "a spent budget must survive the re-key: electing c4 here is a fourth probation against a door already known shut",
+    ).toEqual(["c1", "c2", "c3"]);
+    expect(after.some((o) => o.action === "respawn")).toBe(false);
+    expect(after.some((o) => o.detail === "cohort-abandoned")).toBe(true);
+  });
+
   it("says nobody was sent when nobody COULD be — the other branch of the same sentence", async () => {
     // The inverted control. A cohort whose members are all permanently unfit is abandoned on its
     // FIRST sweep with zero probations run, and there the original copy would have been the lie.
