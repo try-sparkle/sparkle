@@ -20,6 +20,21 @@ vi.mock("../services/configActions", async (importOriginal) => ({
   refreshPluginInstallState: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn(() => Promise.resolve()) }));
+// The Chat pane reads the signed-in user's OWN profile once on mount, to tell "you have no
+// username" apart from "we haven't looked" for its availability gate. Unmocked, that reaches for a
+// Tauri bearer and then the real orchestration host from inside jsdom. PARTIAL, for the reason
+// stated above: an exhaustive factory would undefine the error classes the pane branches on with
+// `instanceof`. The 404 is the pane's normal "no social identity" answer.
+vi.mock("../services/socialApi", async (importOriginal) => {
+  const real = await importOriginal<typeof import("../services/socialApi")>();
+  return {
+    ...real,
+    getMyProfile: vi.fn(() => Promise.reject(new real.SocialApiError(404, null))),
+    getUser: vi.fn(() => Promise.reject(new real.SocialApiError(404, null))),
+    putUsername: vi.fn(),
+    putVisibility: vi.fn(),
+  };
+});
 vi.mock("../services/trialApi", () => ({ fetchTrial: vi.fn().mockResolvedValue(null) }));
 vi.mock("./CreditsPanel", () => ({ CreditsPanel: () => null }));
 

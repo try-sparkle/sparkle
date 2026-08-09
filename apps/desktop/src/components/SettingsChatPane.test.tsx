@@ -21,6 +21,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("../services/socialApi", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../services/socialApi")>()),
   getUser: vi.fn(),
+  getMyProfile: vi.fn(),
   putUsername: vi.fn(),
   putVisibility: vi.fn(),
 }));
@@ -33,16 +34,24 @@ vi.mock("../services/socialSync", () => ({ resumeSocialSync: vi.fn() }));
 
 import { resumeSocialSync } from "../services/socialSync";
 import {
+  getMyProfile,
   getUser,
   putUsername,
   putVisibility,
   SocialApiError,
   SocialNetworkError,
+  type MyProfileResponse,
   type PublicProfile,
 } from "../services/socialApi";
 import { useSocialStore, EMPTY_PROFILE } from "../stores/socialStore";
 import { useAuthStore } from "../stores/authStore";
-import { SettingsChatPane, USERNAME_CHECK_DEBOUNCE_MS } from "./SettingsChatPane";
+import type { Visibility } from "../engine/social";
+import {
+  claimRemedy,
+  SettingsChatPane,
+  USERNAME_CHECK_DEBOUNCE_MS,
+  visibilityRemedy,
+} from "./SettingsChatPane";
 
 /** A promise a test resolves by hand — the only way to control REPLY order independently of
  *  REQUEST order, which is the whole subject of the stale-response test. */
@@ -70,14 +79,42 @@ const clickSave = () => fireEvent.click(screen.getByTestId("chat-username-save")
 
 const checkState = () => screen.getByTestId("chat-username-check").getAttribute("data-check");
 
+const radio = (value: string) => screen.getByTestId(`chat-visibility-${value}`) as HTMLInputElement;
+
+const gateLine = () => screen.queryByTestId("chat-availability-gate")?.textContent ?? null;
+
+/** The state a user who HOLDS a handle is in: the availability group's precondition is satisfied,
+ *  so the radios are live. Every pre-existing availability test needs this now — before the gate
+ *  landed, `EMPTY_PROFILE` was enough, and that is exactly the state the founder said must not
+ *  offer these controls. */
+const seedClaimed = (visibility: "public" | "connections" | "unavailable" = "unavailable") =>
+  useSocialStore.setState({
+    me: { ...EMPTY_PROFILE, username: "ada_l", socialId: "social-1", visibility },
+    profileLoaded: true,
+    visibilityConfirmed: false,
+  });
+
+/** A bare HTTP status anywhere in user-visible copy. Bounded to 1xx–5xx and fenced by digit
+ *  boundaries so ordinary numbers in the copy ("At most 30", "At least 3") are not false hits. */
+const BARE_HTTP_STATUS = /(?<!\d)[1-5]\d{2}(?!\d)/;
+
 beforeEach(() => {
   // `visibilityConfirmed` too: it is store state that outlives a test. It has no production reader
   // today (see its docstring — it is parked for U1's /me hydration), so the assertions on it below
   // pin the STORE's contract rather than anything a user can see; `me.visibility`, reset on the
   // same line, is the observable half and is what the radio renders from.
-  useSocialStore.setState({ me: EMPTY_PROFILE, visibilityConfirmed: false });
+  //
+  // `profileLoaded: true` is the DEFAULT here so the pane's one hydration call does not fire in
+  // every unrelated test — the tests that are about hydration set it false themselves. It also
+  // resets the flag between tests: it is store state, `setMyProfile` raises it, and a test that
+  // claimed a username would otherwise leave the next one starting from "already looked".
+  useSocialStore.setState({ me: EMPTY_PROFILE, visibilityConfirmed: false, profileLoaded: true });
   useAuthStore.setState({ me: null, tokenPresent: true, loading: false });
   vi.mocked(getUser).mockRejectedValue(new SocialApiError(404, null));
+  // 404 = "no social identity", the normal answer for a user who has not claimed one (see
+  // `getMyProfile`'s docstring). Never an unmocked call: this pane asks on mount, and the real one
+  // would reach for a Tauri bearer and then the network from inside jsdom.
+  vi.mocked(getMyProfile).mockRejectedValue(new SocialApiError(404, null));
   vi.mocked(putUsername).mockResolvedValue(profile("ada_l"));
   vi.mocked(putVisibility).mockResolvedValue({ visibility: "public" });
 });
@@ -346,7 +383,7 @@ describe("SettingsChatPane — the server half may not be live yet", () => {
   });
 
   it("a 404 from the visibility write paints the same calm line, and does not claim the change", async () => {
-    useSocialStore.setState({ me: { ...EMPTY_PROFILE, visibility: "public" } });
+    seedClaimed("public"); // the group is gated on a handle now — see the availability-gate suite
     vi.mocked(putVisibility).mockRejectedValue(new SocialApiError(404, null));
     render(<SettingsChatPane />);
 
@@ -368,7 +405,15 @@ describe("SettingsChatPane — the server half may not be live yet", () => {
   it("a 404 from the visibility write names the failure AT the control, not only in the pane banner", async () => {
     // Seeded to the DEFAULT and clicking away from it, so the click is a real change that fires
     // `onChange` — and so a pane that merely failed to repaint could not pass by accident.
-    useSocialStore.setState({ me: { ...EMPTY_PROFILE, visibility: "unavailable" } });
+    //
+    // `seedClaimed`, not a bare `me` write: this test arrived from `main` while the availability
+    // GATE was being built on this branch, and the two meet here. The gate disables the group until
+    // a username exists, so without a claimed handle the click sends nothing, there is no 404, and
+    // no note to find — the failure this test reported at the merge. A user reaching a 404 from the
+    // visibility write is BY CONSTRUCTION one who holds a handle (that is the only way the control
+    // is live), so seeding one is what makes the scenario reachable rather than a way to dodge the
+    // gate. Same adaptation every other pre-existing availability test needed — see `seedClaimed`.
+    seedClaimed("unavailable");
     vi.mocked(putVisibility).mockRejectedValue(new SocialApiError(404, null));
     render(<SettingsChatPane />);
 
@@ -390,7 +435,7 @@ describe("SettingsChatPane — availability", () => {
   // SEEDED TO `public` FIRST, on purpose: `unavailable` is the store's default, so the obvious
   // version of this test passes against a pane that renders three inert radios.
   it("choosing Unavailable calls putVisibility('unavailable') and the store reflects it", async () => {
-    useSocialStore.setState({ me: { ...EMPTY_PROFILE, visibility: "public" } });
+    seedClaimed("public");
     vi.mocked(putVisibility).mockResolvedValue({ visibility: "unavailable" });
     render(<SettingsChatPane />);
     expect(useSocialStore.getState().me.visibility).toBe("public");
@@ -423,17 +468,19 @@ describe("SettingsChatPane — availability", () => {
   // already-checked radio, so without the onClick handler that click is no request, no spinner and
   // no confirmation, indistinguishable from a successful save.
   it("re-asserting the ALREADY-SELECTED option still calls putVisibility", async () => {
+    seedClaimed("unavailable");
     vi.mocked(putVisibility).mockResolvedValue({ visibility: "unavailable" });
     render(<SettingsChatPane />);
-    const radio = screen.getByTestId("chat-visibility-unavailable") as HTMLInputElement;
-    expect(radio.checked).toBe(true); // the un-hydrated default, and the whole problem
+    const unavailable = radio("unavailable");
+    expect(unavailable.checked).toBe(true); // the un-hydrated default, and the whole problem
 
-    fireEvent.click(radio);
+    fireEvent.click(unavailable);
 
     await waitFor(() => expect(putVisibility).toHaveBeenCalledWith("unavailable"));
   });
 
   it("does NOT double-send when the click actually changes the selection", async () => {
+    seedClaimed();
     vi.mocked(putVisibility).mockResolvedValue({ visibility: "public" });
     render(<SettingsChatPane />);
     fireEvent.click(screen.getByTestId("chat-visibility-public"));
@@ -448,6 +495,7 @@ describe("SettingsChatPane — availability", () => {
   // — otherwise navigating away and back would show a returning user a different answer than the
   // one the server just accepted.
   it("keeps the confirmed choice across a REMOUNT", async () => {
+    seedClaimed();
     vi.mocked(putVisibility).mockResolvedValue({ visibility: "public" });
     render(<SettingsChatPane />);
     fireEvent.click(screen.getByTestId("chat-visibility-public"));
@@ -464,6 +512,7 @@ describe("SettingsChatPane — availability", () => {
   // this app; here `reset()` is what prevents it, so the next account starts at the Unavailable
   // default rather than inheriting the previous one's exposure.
   it("drops the confirmed choice on reset(), so the next account starts Unavailable", async () => {
+    seedClaimed();
     vi.mocked(putVisibility).mockResolvedValue({ visibility: "public" });
     render(<SettingsChatPane />);
     fireEvent.click(screen.getByTestId("chat-visibility-public"));
@@ -485,6 +534,7 @@ describe("SettingsChatPane — availability", () => {
   // negative to "choosing Public reaches the store", without which that test is satisfied by a pane
   // that writes the store unconditionally.
   it("a FAILED save moves neither the value nor the confirmation", async () => {
+    seedClaimed();
     vi.mocked(putVisibility).mockRejectedValue(new SocialNetworkError());
     render(<SettingsChatPane />);
     fireEvent.click(screen.getByTestId("chat-visibility-public"));
@@ -494,6 +544,7 @@ describe("SettingsChatPane — availability", () => {
   });
 
   it("choosing Public reaches the server and the store too (the opposite direction)", async () => {
+    seedClaimed();
     vi.mocked(putVisibility).mockResolvedValue({ visibility: "public" });
     render(<SettingsChatPane />);
     fireEvent.click(screen.getByTestId("chat-visibility-public"));
@@ -644,5 +695,450 @@ describe("claiming a username kicks the roster loop", () => {
 
     await waitFor(() => expect(putUsername).toHaveBeenCalled());
     expect(vi.mocked(resumeSocialSync)).not.toHaveBeenCalled();
+  });
+});
+
+// ── THE AVAILABILITY GATE ───────────────────────────────────────────────────────────────────────
+//
+// Bead sparkle-3g97m, the founder's own words: "if I'm not able to set that before I've chosen my
+// username then that should be grayed out until the username is set. I shouldn't be able to try
+// selecting it if the username is a requirement for that to work."
+//
+// `PUT /account/visibility` answers `409 no_username` with no profile row, so before a handle exists
+// every option here is a guaranteed refusal. Each test asserts the SIDE EFFECT — that no request
+// went out — and not merely that a `disabled` attribute is present: an attribute is a precondition,
+// and a pane that set it while still wiring a click handler to a `<label>` would satisfy it while
+// firing the write anyway.
+//
+// jsdom caveat honoured (docs/jsdom-test-caveats.md): nothing here reads a COLOUR. The stylesheet
+// is never loaded under jsdom, so `getComputedStyle` on a class-derived "greyed out" reads empty and
+// an assertion on it would pass or fail for reasons unrelated to the gate.
+describe("SettingsChatPane — availability is gated on having a username", () => {
+  const VALUES = ["public", "connections", "unavailable"] as const;
+
+  it("is DISABLED with a stated reason when we KNOW there is no username", () => {
+    useSocialStore.setState({ me: EMPTY_PROFILE, profileLoaded: true });
+    render(<SettingsChatPane />);
+
+    for (const value of VALUES) expect(radio(value).disabled).toBe(true);
+    expect(gateLine()).toContain("Claim a username first");
+    // The group announces its state to a screen reader too — the gate must not be carried by the
+    // dimming alone (§10 / WCAG 1.4.1).
+    expect(
+      screen.getByRole("radiogroup", { name: "Availability" }).getAttribute("aria-disabled"),
+    ).toBe("true");
+  });
+
+  // THE ASSERTION THAT MATTERS, and it is a genuinely different assertion from the `disabled`
+  // property above — not a restatement of it. `disabled` is the affordance; the HANDLER's own guard
+  // is what stops the write, and this is the test that found out they are not the same thing:
+  // React declines to dispatch `onClick` for a disabled input but has no such rule for `onChange`,
+  // which for a radio is driven by the click, so 2 of these 4 clicks sent a `putVisibility` through
+  // a greyed-out control. Mutate either one and exactly one of the two tests goes red.
+  it("clicking a disabled radio fires NO request, on any of the three options", async () => {
+    useSocialStore.setState({ me: EMPTY_PROFILE, profileLoaded: true });
+    render(<SettingsChatPane />);
+
+    for (const value of VALUES) fireEvent.click(radio(value));
+    // The already-checked one twice: `Unavailable` is checked in this state, and the re-assert
+    // `onClick` path (roborev 60425) exists precisely to write WITHOUT a change event — so it is the
+    // one handler a `disabled` that only suppressed `onChange` would leave alive.
+    fireEvent.click(radio("unavailable"));
+
+    await Promise.resolve();
+    expect(putVisibility).not.toHaveBeenCalled();
+    expect(useSocialStore.getState().me.visibility).toBe("unavailable");
+    expect(useSocialStore.getState().visibilityConfirmed).toBe(false);
+  });
+
+  it("a second choice made WHILE a write is in flight sends only one request", async () => {
+    // The in-flight half of the same hole. `disabled={visSaving !== null || …}` held this off with
+    // the attribute ALONE, and the attribute is exactly what does not hold for `onChange` — so two
+    // writes raced, the first's `finally` cleared the spinner while the second was outstanding, and
+    // the LAST reply to land won `confirmVisibility`, which could be the older value. (roborev
+    // 61751.) The refusal is a ref, not `visSaving`: both dispatches read the same pre-update
+    // render's state, so a state test would be `null` for both and refuse neither.
+    seedClaimed("unavailable");
+    const inFlight = deferred<{ visibility: Visibility }>();
+    vi.mocked(putVisibility).mockReturnValue(inFlight.promise);
+    render(<SettingsChatPane />);
+
+    fireEvent.click(radio("public"));
+    await waitFor(() => expect(putVisibility).toHaveBeenCalledTimes(1));
+    // …and now, before the first reply, ask for a different value.
+    fireEvent.click(radio("connections"));
+    await Promise.resolve();
+
+    expect(putVisibility).toHaveBeenCalledTimes(1);
+    expect(putVisibility).toHaveBeenCalledWith("public");
+
+    // The first write settles, and the value the SERVER accepted is the one that sticks.
+    await act(async () => {
+      inFlight.resolve({ visibility: "public" });
+      await inFlight.promise;
+    });
+    expect(useSocialStore.getState().me.visibility).toBe("public");
+  });
+
+  it("the in-flight refusal LIFTS once the write settles — it does not wedge the group shut", async () => {
+    // The paired positive for the ref: a guard that never cleared would also pass the test above,
+    // and would leave the group permanently dead after one save.
+    seedClaimed("unavailable");
+    render(<SettingsChatPane />);
+
+    fireEvent.click(radio("public"));
+    await waitFor(() => expect(putVisibility).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(radio("connections"));
+    await waitFor(() => expect(putVisibility).toHaveBeenCalledTimes(2));
+    expect(putVisibility).toHaveBeenLastCalledWith("connections");
+  });
+
+  // THE PAIRED POSITIVE. Without it, "no request went out" is satisfied by a pane whose radios never
+  // work at all — the assertion would hold against a feature that is 100% broken.
+  it("is ENABLED, with no gate line, once a username is known — and the click DOES write", async () => {
+    seedClaimed("unavailable");
+    vi.mocked(putVisibility).mockResolvedValue({ visibility: "public" });
+    render(<SettingsChatPane />);
+
+    for (const value of VALUES) expect(radio(value).disabled).toBe(false);
+    expect(screen.queryByTestId("chat-availability-gate")).toBeNull();
+    expect(
+      screen.getByRole("radiogroup", { name: "Availability" }).getAttribute("aria-disabled"),
+    ).toBeNull();
+
+    fireEvent.click(radio("public"));
+    await waitFor(() => expect(putVisibility).toHaveBeenCalledWith("public"));
+  });
+
+  // THE TRANSITION, IN ONE SESSION. The founder claims a name and the group has to come alive
+  // without a restart — `setMyProfile` raises `profileLoaded` and writes the handle, and the gate
+  // reads both.
+  it("goes from disabled to ENABLED after a successful save(), with no remount", async () => {
+    useSocialStore.setState({ me: EMPTY_PROFILE, profileLoaded: true });
+    vi.mocked(putUsername).mockResolvedValue(profile("ada_l"));
+    vi.mocked(putVisibility).mockResolvedValue({ visibility: "public" });
+    render(<SettingsChatPane />);
+
+    expect(radio("unavailable").disabled).toBe(true);
+
+    typeUsername("ada_l");
+    clickSave();
+    await waitFor(() => expect(useSocialStore.getState().me.username).toBe("ada_l"));
+
+    await waitFor(() => expect(radio("public").disabled).toBe(false));
+    expect(screen.queryByTestId("chat-availability-gate")).toBeNull();
+    // Live, not merely un-greyed.
+    fireEvent.click(radio("public"));
+    await waitFor(() => expect(putVisibility).toHaveBeenCalledWith("public"));
+  });
+
+  // A FAILED CLAIM MUST NOT OPEN THE GATE — the paired negative. `me.username` is only written on a
+  // 2xx, so a pane that enabled the group on "the user pressed Save" would offer the control again
+  // in exactly the state that cannot use it.
+  it("a REFUSED claim leaves the group closed", async () => {
+    useSocialStore.setState({ me: EMPTY_PROFILE, profileLoaded: true });
+    vi.mocked(putUsername).mockRejectedValue(new SocialApiError(409, "taken"));
+    render(<SettingsChatPane />);
+
+    typeUsername("ada_l");
+    clickSave();
+    await waitFor(() => expect(screen.getByTestId("chat-claim-note")).toBeTruthy());
+
+    expect(radio("public").disabled).toBe(true);
+    expect(gateLine()).toContain("Claim a username first");
+  });
+});
+
+// ── THE THIRD STATE: WE HAVE NOT LOOKED YET ─────────────────────────────────────────────────────
+//
+// `me.username == null` is ALSO what a returning user who holds a handle looks like before their
+// profile is read (`socialStore.profileLoaded` exists to tell those apart). Gating on the username
+// alone would grey out a working control and tell that user to claim a name they already own — so
+// the unknown state is disabled but says something different, and the pane's one `getMyProfile()`
+// keeps it brief.
+describe("SettingsChatPane — hydrating the profile so the gate is not stuck at 'unknown'", () => {
+  const unknownStart = () => useSocialStore.setState({ me: EMPTY_PROFILE, profileLoaded: false });
+
+  it("paints its OWN, non-accusatory line while the answer is unknown", () => {
+    unknownStart();
+    vi.mocked(getMyProfile).mockReturnValue(new Promise(() => {})); // never settles
+    render(<SettingsChatPane />);
+
+    expect(radio("public").disabled).toBe(true);
+    const line = gateLine() ?? "";
+    expect(line).toContain("Checking your profile");
+    // It must NOT accuse: we do not know that there is no username, and saying so to someone who
+    // has one is the failure `profileLoaded` exists to prevent.
+    expect(line).not.toContain("Claim a username first");
+  });
+
+  it("asks ONCE on mount, and a 404 settles it to 'no username' with no error and no second ask", async () => {
+    unknownStart();
+    vi.mocked(getMyProfile).mockRejectedValue(new SocialApiError(404, null));
+    render(<SettingsChatPane />);
+
+    await waitFor(() => expect(gateLine()).toContain("Claim a username first"));
+    expect(getMyProfile).toHaveBeenCalledTimes(1);
+    // A 404 is the NORMAL answer for someone with no social identity — never an error banner, and
+    // never the sticky "chat isn't switched on" line.
+    expect(screen.queryByTestId("chat-claim-note")).toBeNull();
+    expect(screen.queryByTestId("chat-visibility-note")).toBeNull();
+    expect(screen.queryByTestId("chat-not-live")).toBeNull();
+
+    // …and nothing retries. A keystroke re-renders the pane; the request must not go out again.
+    typeUsername("ada_l");
+    await waitFor(() => expect(getUser).toHaveBeenCalled());
+    expect(getMyProfile).toHaveBeenCalledTimes(1);
+  });
+
+  it("a RETURNING user's handle arrives from the hydration and the group comes alive", async () => {
+    unknownStart();
+    vi.mocked(getMyProfile).mockResolvedValue({
+      socialId: "social-9",
+      username: "ada_l",
+      displayName: null,
+      visibility: "public",
+    } satisfies MyProfileResponse);
+    vi.mocked(putVisibility).mockResolvedValue({ visibility: "connections" });
+    render(<SettingsChatPane />);
+
+    // The handle reaches the STORE, which is what the rest of the app reads.
+    await waitFor(() => expect(useSocialStore.getState().me.username).toBe("ada_l"));
+    await waitFor(() => expect(radio("connections").disabled).toBe(false));
+    expect(screen.queryByTestId("chat-availability-gate")).toBeNull();
+    fireEvent.click(radio("connections"));
+    await waitFor(() => expect(putVisibility).toHaveBeenCalledWith("connections"));
+  });
+
+  it("a hydration failure that is NOT a 404 leaves the honest 'unknown' line, and does not retry", async () => {
+    unknownStart();
+    vi.mocked(getMyProfile).mockRejectedValue(new SocialNetworkError());
+    render(<SettingsChatPane />);
+
+    await waitFor(() => expect(getMyProfile).toHaveBeenCalledTimes(1));
+    // Still unknown: a failed request is not evidence about the user, so telling them to claim a
+    // username would be an accusation manufactured out of our own outage.
+    expect(gateLine()).toContain("Checking your profile");
+    expect(useSocialStore.getState().profileLoaded).toBe(false);
+    typeUsername("ada_l");
+    await waitFor(() => expect(getUser).toHaveBeenCalled());
+    expect(getMyProfile).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not ask at all when the profile is already known", async () => {
+    // KNOWN, and known to be EMPTY — the state a 404 leaves behind. `profileLoaded` is the whole
+    // question, so the pane must not re-ask merely because there is no username; that would be a
+    // request per mount for every user who has not claimed one.
+    useSocialStore.setState({ me: EMPTY_PROFILE, profileLoaded: true });
+    render(<SettingsChatPane />);
+    typeUsername("ada_l"); // a re-render, the trigger a naive effect would fire on
+    await waitFor(() => expect(checkState()).toBe("checking"));
+    expect(getMyProfile).not.toHaveBeenCalled();
+  });
+});
+
+// ── NO RAW HTTP STATUS CODES REACH THE USER ─────────────────────────────────────────────────────
+//
+// "The server refused that change (409)." is not a sentence anyone can act on: the number is our
+// diagnostic and the remedy is the user's. The server already sends a typed reason; render THAT.
+describe("SettingsChatPane — typed reasons, never HTTP status codes", () => {
+  it("409 no_username renders the typed sentence — and the copy contains no '409'", async () => {
+    // Reached through the real UI, in the race the gate cannot close: this Mac holds a handle
+    // (so the group is live) and the server no longer has the row.
+    seedClaimed("unavailable");
+    vi.mocked(putVisibility).mockRejectedValue(new SocialApiError(409, "no_username"));
+    render(<SettingsChatPane />);
+
+    fireEvent.click(radio("public"));
+
+    await waitFor(() => expect(screen.getByTestId("chat-visibility-note")).toBeTruthy());
+    const note = screen.getByTestId("chat-visibility-note").textContent ?? "";
+    expect(note).toContain("Claim a username first");
+    expect(note).not.toContain("409");
+    expect(note).not.toMatch(BARE_HTTP_STATUS);
+    // The refusal is not laundered into a success.
+    expect(useSocialStore.getState().me.visibility).toBe("unavailable");
+  });
+
+  it("an UNRECOGNISED status gets a plain human sentence with no number in it", async () => {
+    seedClaimed("unavailable");
+    vi.mocked(putVisibility).mockRejectedValue(new SocialApiError(503, null));
+    render(<SettingsChatPane />);
+
+    fireEvent.click(radio("public"));
+
+    await waitFor(() => expect(screen.getByTestId("chat-visibility-note")).toBeTruthy());
+    const note = screen.getByTestId("chat-visibility-note").textContent ?? "";
+    expect(note).not.toMatch(BARE_HTTP_STATUS);
+    expect(note.length).toBeGreaterThan(10); // a sentence, not an empty div
+  });
+
+  // The remedy tables, driven directly over every status a route can produce. A UI test can only
+  // reach the codes it thinks to mock; this is the exhaustive half.
+  it.each([400, 401, 403, 409, 418, 429, 500, 502, 503])(
+    "visibilityRemedy(%i) never puts the number in the copy",
+    (status) => {
+      for (const code of [null, "taken", "no_username", "nonsense"]) {
+        const { text } = visibilityRemedy(new SocialApiError(status, code));
+        expect(text, `status ${status} / code ${code}`).not.toMatch(BARE_HTTP_STATUS);
+        expect(text.length).toBeGreaterThan(10);
+      }
+    },
+  );
+
+  it.each([400, 401, 403, 409, 418, 429, 500, 502, 503])(
+    "claimRemedy(%i) never puts the number in the copy",
+    (status) => {
+      for (const code of [null, "reserved", "impersonation", "invalid_format", "nonsense"]) {
+        const { text } = claimRemedy(new SocialApiError(status, code));
+        expect(text, `status ${status} / code ${code}`).not.toMatch(BARE_HTTP_STATUS);
+        expect(text.length).toBeGreaterThan(10);
+      }
+    },
+  );
+
+  // THE WHOLE-PANE SWEEP. Asserted on the RENDERED DOCUMENT rather than on the two functions above,
+  // so a THIRD place that interpolates a status — a new branch, a new note, a caught error rendered
+  // verbatim — is caught by the same test rather than needing to be remembered.
+  it("no Chat-pane copy contains a bare HTTP status, in any error state", async () => {
+    const states: { name: string; run: () => Promise<void> }[] = [
+      {
+        name: "a refused claim",
+        run: async () => {
+          vi.mocked(putUsername).mockRejectedValue(new SocialApiError(422, "whatever"));
+          render(<SettingsChatPane />);
+          typeUsername("ada_l");
+          clickSave();
+          await waitFor(() => expect(screen.getByTestId("chat-claim-note")).toBeTruthy());
+        },
+      },
+      {
+        name: "a refused visibility write",
+        run: async () => {
+          seedClaimed("unavailable");
+          vi.mocked(putVisibility).mockRejectedValue(new SocialApiError(500, "boom"));
+          render(<SettingsChatPane />);
+          fireEvent.click(radio("public"));
+          await waitFor(() => expect(screen.getByTestId("chat-visibility-note")).toBeTruthy());
+        },
+      },
+      {
+        name: "the not-live-yet banner",
+        run: async () => {
+          vi.mocked(putUsername).mockRejectedValue(new SocialApiError(404, null));
+          render(<SettingsChatPane />);
+          typeUsername("ada_l");
+          clickSave();
+          await waitFor(() => expect(screen.getByTestId("chat-not-live")).toBeTruthy());
+        },
+      },
+      {
+        name: "a failed availability probe",
+        run: async () => {
+          vi.mocked(getUser).mockRejectedValue(new SocialApiError(429, null));
+          render(<SettingsChatPane />);
+          typeUsername("ada_l");
+          await waitFor(() => expect(checkState()).toBe("unknown"), { timeout: 2000 });
+        },
+      },
+      {
+        name: "the gate, unknown",
+        run: async () => {
+          useSocialStore.setState({ me: EMPTY_PROFILE, profileLoaded: false });
+          vi.mocked(getMyProfile).mockReturnValue(new Promise(() => {}));
+          render(<SettingsChatPane />);
+          await waitFor(() => expect(screen.getByTestId("chat-availability-gate")).toBeTruthy());
+        },
+      },
+    ];
+
+    for (const state of states) {
+      await state.run();
+      const shown = document.body.textContent ?? "";
+      const hit = shown.match(BARE_HTTP_STATUS);
+      expect(hit, `"${state.name}" leaked "${hit?.[0]}" into the copy: ${shown}`).toBeNull();
+      cleanup();
+      useSocialStore.setState({
+        me: EMPTY_PROFILE,
+        profileLoaded: true,
+        visibilityConfirmed: false,
+      });
+    }
+  });
+});
+
+// ── THE RESERVED CHECK, BEFORE SAVE ─────────────────────────────────────────────────────────────
+//
+// The probe painted "Looks free — the server decides when you save." for `admin`. The server's
+// RESERVED_USERNAMES is hardcoded and frozen, so the client can say better than that — while staying
+// ADVISORY: it changes the words, never the gate.
+describe("SettingsChatPane — names the client can already tell are reserved", () => {
+  it.each(["admin", "support", "sparkle"])(
+    "%s paints RESERVED before Save, and costs no round trip",
+    async (name) => {
+      render(<SettingsChatPane />);
+      typeUsername(name);
+
+      await waitFor(() => expect(checkState()).toBe("invalid"));
+      expect(screen.getByTestId("chat-username-check").textContent).toContain("reserved");
+      // The old lie, gone.
+      expect(screen.getByTestId("chat-username-check").textContent).not.toContain("Looks free");
+      // A name we already know the answer to is not worth asking about.
+      expect(getUser).not.toHaveBeenCalled();
+    },
+  );
+
+  // ⚠️ THE ONE THAT WOULD SILENTLY RE-BREAK THE HEADLINE FIX. The orchestration half exempts the
+  // OWNER of `drodio` so the founder can claim his own handle. If this client list carried it, the
+  // pane would tell the very person being unblocked "That username is reserved." — before Save,
+  // with no server round trip to correct it. Both casings, because the check runs on the key.
+  it.each(["drodio", "DROdio"])(
+    "%s does NOT paint reserved — it has an owner, and the server decides",
+    async (name) => {
+      render(<SettingsChatPane />);
+      typeUsername(name);
+
+      await waitFor(() => expect(checkState()).toBe("available"), { timeout: 2000 });
+      expect(screen.getByTestId("chat-username-check").textContent).toContain("Looks free");
+      expect(screen.getByTestId("chat-username-check").textContent).not.toContain("reserved");
+      // It reached the network like any other name — the advisory list did not intercept it.
+      expect(getUser).toHaveBeenCalledWith("drodio");
+    },
+  );
+
+  // ADVISORY MEANS ADVISORY. The header is emphatic that the Save button is gated on nothing, and a
+  // client list that silently stopped a claim would be the local check becoming the authority — the
+  // one thing this module forbids.
+  it("does NOT disable Save, and the claim still reaches the server", async () => {
+    vi.mocked(putUsername).mockRejectedValue(new SocialApiError(400, "reserved"));
+    render(<SettingsChatPane />);
+    typeUsername("admin");
+    await waitFor(() => expect(checkState()).toBe("invalid"));
+
+    expect((screen.getByTestId("chat-username-save") as HTMLButtonElement).disabled).toBe(false);
+    clickSave();
+
+    await waitFor(() => expect(putUsername).toHaveBeenCalledWith("admin"));
+  });
+
+  it("does NOT suppress or reinterpret the server's own refusal", async () => {
+    vi.mocked(putUsername).mockRejectedValue(new SocialApiError(400, "reserved"));
+    render(<SettingsChatPane />);
+    typeUsername("admin");
+    clickSave();
+
+    // The server's answer is what the user is told, arriving through `claimRemedy` exactly as it
+    // would for a name the client had no opinion about.
+    await waitFor(() => expect(screen.getByTestId("chat-claim-note")).toBeTruthy());
+    expect(screen.getByTestId("chat-claim-note").textContent).toContain("reserved");
+    expect(useSocialStore.getState().me.username).toBeNull();
+  });
+
+  it("an ordinary name is unaffected — the check is a list, not a mood", async () => {
+    render(<SettingsChatPane />);
+    typeUsername("admin1");
+    await waitFor(() => expect(checkState()).toBe("available"), { timeout: 2000 });
+    expect(getUser).toHaveBeenCalledWith("admin1");
   });
 });

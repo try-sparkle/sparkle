@@ -11,6 +11,7 @@ import { C } from "../theme/colors";
 import { FONT_UI, LABEL, RADIUS, TYPE, WEIGHT } from "../theme/scale";
 import {
   availabilityFromWire,
+  isReservedUsername,
   validateUsernameFormat,
   USERNAME_MAX_LENGTH,
   USERNAME_MIN_LENGTH,
@@ -18,6 +19,7 @@ import {
   type Visibility,
 } from "../engine/social";
 import {
+  getMyProfile,
   getUser,
   putUsername,
   putVisibility,
@@ -71,6 +73,23 @@ import { PersonAvatar } from "./PersonAvatar";
  * a fault: it renders as one calm line and nothing retries in the background. A scary error, or a
  * retry loop against a route that does not exist, would both be wrong.
  *
+ * ══ A CONTROL THAT CAN ONLY FAIL IS NOT OFFERED ════════════════════════════════════════════════
+ * `PUT /account/visibility` answers `409 no_username` with no profile row, so before a handle is
+ * claimed every option in the Availability group is a guaranteed refusal. The group is therefore
+ * disabled until a username exists, with the reason stated (founder, bead `sparkle-3g97m`).
+ *
+ * That gate needs THREE states, not two, and this is the part worth reading twice: `me.username ==
+ * null` is equally the state of a returning user whose profile has not been read, so disabling on
+ * it alone locks a legitimate user out of a control that would have worked. `socialStore`'s
+ * `profileLoaded` is what separates them, and this pane makes ONE `getMyProfile()` call on mount to
+ * settle it quickly — a `404` there is the normal "no social identity" answer, not an error, and
+ * nothing retries.
+ *
+ * Note the ASYMMETRY with the advisory rules above, which is deliberate rather than inconsistent:
+ * the availability gate is a HARD gate on a write we know cannot succeed, while the username checks
+ * stay advisory because their outcome is genuinely the server's to decide. Nothing here suppresses
+ * a server answer; it declines to send a request whose only possible answer is a refusal.
+ *
  * ══ ICON + TEXT, NEVER COLOUR ALONE ════════════════════════════════════════════════════════════
  * Each of the five username states carries a Feather icon AND words (§10; WCAG 1.4.1). Icons are
  * `react-icons/fi` — no emoji, house rule.
@@ -113,6 +132,12 @@ export function rejectionText(reason: UsernameRejection): string {
       return `At most ${USERNAME_MAX_LENGTH} characters.`;
     case "invalid_format":
       return "Start and end with a letter or digit; single underscores in between.";
+    case "reserved":
+      // ADVISORY, like every other line here: it tells the user what the server will almost
+      // certainly say, and Save still asks. The wording is deliberately the same as `claimRemedy`'s
+      // `400 reserved` remedy so a name that gets refused after all reads as the same answer
+      // arriving later, not as a second, different problem.
+      return "That username is reserved. Pick a different one.";
   }
 }
 
@@ -166,7 +191,40 @@ export function claimRemedy(err: unknown): { text: string; calm: boolean } {
   if (err.status === 429) {
     return { text: "Too many attempts. Wait a minute, then try again.", calm: true };
   }
-  return { text: `The server refused that username (${err.status}).`, calm: false };
+  // NO STATUS NUMBER. "The server refused that username (503)." is not a sentence anyone can act
+  // on: the number is our diagnostic, not the user's remedy, and pasting it into the copy makes the
+  // one case we did NOT anticipate the ugliest thing on the pane. Say the honest thing instead —
+  // we do not know why, and trying again is the only move the user has.
+  return { text: "Sparkle couldn’t claim that username. Try again in a moment.", calm: false };
+}
+
+/**
+ * The same treatment for a failed `PUT /account/visibility`, branching on **both** status and code
+ * for the reason {@link claimRemedy} does.
+ *
+ * `409 no_username` is the one the server actually sends when there is no profile row, and with the
+ * availability gate below in place it should be UNREACHABLE from the UI — which is the point of the
+ * gate, not a reason to drop the branch. It stays as the honest answer to the race the gate cannot
+ * close (the row removed server-side, an account switched underneath us, a stale `me.username`), and
+ * it is tested directly rather than assumed dead.
+ */
+export function visibilityRemedy(err: unknown): { text: string; calm: boolean } {
+  if (err instanceof SocialNetworkError) {
+    return { text: "Sparkle couldn’t reach the server. Try again.", calm: true };
+  }
+  if (!(err instanceof SocialApiError)) {
+    return { text: "Something went wrong saving that. Try again.", calm: false };
+  }
+  // On STATUS alone, and first, for the reason `claimRemedy` states: the route may simply not exist
+  // yet, and a framework's HTML 404 has no code to read.
+  if (err.status === 404) return { text: CHAT_NOT_LIVE_TEXT, calm: true };
+  if (err.status === 409 && err.code === "no_username") {
+    return {
+      text: "Claim a username first — you need one before you can set this.",
+      calm: false,
+    };
+  }
+  return { text: "Sparkle couldn’t save that change. Try again in a moment.", calm: false };
 }
 
 /**
@@ -210,6 +268,7 @@ const VISIBILITY_CHOICES: readonly { value: Visibility; label: string; hint: str
 
 export function SettingsChatPane() {
   const me = useSocialStore((s) => s.me);
+  const profileLoaded = useSocialStore((s) => s.profileLoaded);
   const setMyProfile = useSocialStore((s) => s.setMyProfile);
   const confirmVisibility = useSocialStore((s) => s.confirmVisibility);
   const authMe = useAuthStore((s) => s.me);
@@ -219,6 +278,10 @@ export function SettingsChatPane() {
   const [saving, setSaving] = useState(false);
   const [claimNote, setClaimNote] = useState<{ text: string; calm: boolean } | null>(null);
   const [visSaving, setVisSaving] = useState<Visibility | null>(null);
+  /** The same fact as {@link visSaving}, written SYNCHRONOUSLY so `chooseVisibility` can refuse a
+   *  second dispatch that lands before React has re-rendered the first — state would still read
+   *  `null` for both. `visSaving` stays the value the SPINNER renders from; this one only gates. */
+  const visSavingRef = useRef<Visibility | null>(null);
   const [visNote, setVisNote] = useState<{ text: string; calm: boolean } | null>(null);
   /** Set by a 404 from EITHER write. Sticky for the session: nothing here polls, so re-checking
    *  would mean a retry loop against a route we have been told does not exist. */
@@ -252,6 +315,80 @@ export function SettingsChatPane() {
    */
   const settled = me.username != null;
 
+  // ── ONE profile read on mount, so the gate below is not stuck at "we don't know" ───────────────
+  //
+  // The comment above says nothing hydrates `me` when you visit this pane, and until the availability
+  // gate existed that only cost the user a claim form they did not need. It costs more now: the gate
+  // has to tell "you have no username" apart from "we have not looked", and without a read the second
+  // state is where every session starts and stays. So this pane asks once — for ITSELF, not as a
+  // second copy of U1's roster hydration, which owns `visibility`, the roster and the retry policy.
+  //
+  // ONE CALL, GUARDED BY A REF AND NOT ONLY BY THE FLAG. `profileLoaded` is raised by the reply, so
+  // between the request going out and landing the flag is still false — a re-render in that window
+  // (a keystroke in the username field is enough) would fire a second request, and a failure that
+  // never raises the flag would fire one on every render forever. The ref is what makes "once"
+  // true; the flag only decides whether to ask at all. Nothing retries: a 404 is the NORMAL answer
+  // for someone with no social identity (see `getMyProfile`'s docstring) and a retry loop against a
+  // route that may not exist yet is the thing the module header forbids.
+  const askedForProfile = useRef(false);
+  useEffect(() => {
+    if (profileLoaded || askedForProfile.current) return;
+    askedForProfile.current = true;
+    void getMyProfile()
+      .then((mine) => {
+        // Widened for the same reason `save()` widens `putUsername`: `socialApi.request` casts an
+        // absent or unparseable body to `T`, so a 2xx with no JSON arrives here as null.
+        const profile = mine as Awaited<ReturnType<typeof getMyProfile>> | null;
+        // `visibility` is deliberately NOT written from this read. It is not ours to hydrate: a
+        // reply issued before the user clicked a radio can land after `confirmVisibility` accepted
+        // it and would silently roll their choice back — the same read-vs-write race `socialSync`
+        // documents at length. U1's hydration owns that field.
+        setMyProfile({
+          username: profile?.username ?? null,
+          displayName: profile?.displayName ?? null,
+          socialId: profile?.socialId ?? null,
+        });
+      })
+      .catch((e: unknown) => {
+        // 404 SETTLES IT, it does not fail. Per `getMyProfile`: 404 is what a caller with no social
+        // identity gets, and what every path answers while the feature is dark. Both mean "no
+        // username", which is exactly what the gate needs to hear — so it is recorded, calmly, with
+        // no error banner. Only when nothing better is already known: a claim can complete while
+        // this request is in flight, and writing null over a handle the user just claimed would put
+        // the claim form back for a name that can only answer `409 username_immutable`.
+        if (e instanceof SocialApiError && e.status === 404) {
+          if (useSocialStore.getState().me.username == null) setMyProfile({ username: null });
+          return;
+        }
+        // Anything else — offline, a 5xx, a 401 — leaves the gate in its UNKNOWN state, which is
+        // the honest answer and is disabled with a non-accusatory line. Telling someone to claim a
+        // username because a request failed is the accusation this whole flag exists to avoid.
+      });
+  }, [profileLoaded, setMyProfile]);
+
+  /**
+   * MAY THE AVAILABILITY RADIOS BE OFFERED AT ALL?
+   *
+   * `PUT /account/visibility` answers `409 no_username` when there is no profile row, so before a
+   * username is claimed EVERY choice in that group fails. The founder's instruction is direct: "if
+   * I'm not able to set that before I've chosen my username then that should be grayed out until the
+   * username is set. I shouldn't be able to try selecting it if the username is a requirement for
+   * that to work." A control whose every outcome is a refusal must not be offerable.
+   *
+   * THREE STATES, NOT TWO, and the third is the one that matters. `me.username == null` is ALSO
+   * what a returning user who holds a handle looks like before their profile is read — see
+   * `socialStore.profileLoaded`, which exists precisely to tell those apart — so gating on the
+   * username alone would grey out a control that would have worked, for a user who did nothing
+   * wrong, and tell them to claim a name they already own. Unknown is therefore disabled but says
+   * something different and blames nobody, and the read above keeps it brief.
+   */
+  const availability: { enabled: boolean; reason: string | null } = settled
+    ? { enabled: true, reason: null }
+    : profileLoaded
+      ? { enabled: false, reason: "Claim a username first." }
+      : { enabled: false, reason: "Checking your profile…" };
+  const availabilityEnabled = availability.enabled;
+
   // ── The advisory availability probe ───────────────────────────────────────────────────────────
   //
   // SEQUENCE-NUMBERED, and the guard is on the RESPONSE, not just the timer. Clearing the debounce
@@ -280,6 +417,17 @@ export function SettingsChatPane() {
     const local = validateUsernameFormat(raw);
     if (!local.ok) {
       setCheck({ kind: "invalid", reason: local.reason });
+      return;
+    }
+    // RESERVED, LOCALLY, and only as far as the client can honestly go. The server's list is
+    // hardcoded and frozen, so painting "Looks free — the server decides when you save." over
+    // `admin` was the client asserting the one thing it does know to be wrong. Like the format
+    // check this only decides what is SAID and whether a round trip is worth it: `save()` does not
+    // consult it, the Save button stays enabled, and a name with a designated owner (`drodio`) is
+    // absent from the list on purpose so it probes and commits normally. See
+    // `engine/social.ADVISORY_RESERVED_USERNAMES`.
+    if (isReservedUsername(local.key)) {
+      setCheck({ kind: "invalid", reason: "reserved" });
       return;
     }
     setCheck({ kind: "checking" });
@@ -348,6 +496,28 @@ export function SettingsChatPane() {
 
   const chooseVisibility = useCallback(
     async (value: Visibility) => {
+      // THE HANDLER'S OWN GATE, and it is the real one — `disabled` on the input is the affordance.
+      // The same argument the Save button makes in reverse: a disabled attribute proves nothing
+      // about the code path, and here it demonstrably does not hold on its own. React declines to
+      // dispatch `onClick` for a disabled input but has no such rule for `onChange`, which for a
+      // radio is driven by the click through the change plugin — so a click on a greyed-out option
+      // that is not the checked one still reaches this function and still sends the write. (Caught
+      // by "clicking a disabled radio fires NO request"; it failed at 2 of 4 clicks.)
+      if (!availabilityEnabled) return;
+      // THE SECOND REASON THE INPUT IS DEAD, refused here for the same reason as the first: a write
+      // already in flight was held off by the `disabled` attribute ALONE, and the paragraph above is
+      // exactly the argument that the attribute does not hold. A change event arriving mid-write
+      // started a second `putVisibility`; the two raced, the first one's `finally` cleared the
+      // spinner and re-enabled the group while the second was still outstanding, and whichever reply
+      // landed LAST won `confirmVisibility` — which can be the older value, so the pane settles
+      // showing a visibility the server does not hold. (roborev 61751.)
+      //
+      // A REF, NOT `visSaving`, and that is the whole subtlety: `setVisSaving` does not change what
+      // THIS render's closure sees, so a second dispatch arriving before React re-renders reads
+      // `visSaving === null` and is waved through. The ref is written synchronously, so it is the
+      // only thing the second dispatch can observe.
+      if (visSavingRef.current !== null) return;
+      visSavingRef.current = value;
       setVisSaving(value);
       setVisNote(null);
       try {
@@ -357,23 +527,30 @@ export function SettingsChatPane() {
         // action for both halves so the value can never be stored while still marked unconfirmed.
         confirmVisibility(value);
       } catch (e) {
+        // BOTH SIDES OF THIS MERGE WERE RIGHT ABOUT DIFFERENT THINGS, so neither was taken whole.
+        //
+        // From `main`: a 404 must say something AT THE CONTROL too. A failed write never moves
+        // `me`, the radios read `checked` from `me`, so the clicked option snaps back — and
+        // CHAT_NOT_LIVE_TEXT paints ~90 lines of JSX above the group, off-screen for anyone who
+        // scrolled down to Availability. That fix is kept exactly.
+        //
+        // From this branch: every OTHER failure is words, and words live in `visibilityRemedy`,
+        // which renders the server's TYPED reason. `main`'s else-chain still ended in
+        // "The server refused that change (409)." — the raw-status leak this branch exists to
+        // delete, and the one a user cannot act on. Keeping main's 404 arm while routing the rest
+        // through the remedy table is what preserves both.
         if (e instanceof SocialApiError && e.status === 404) {
           setNotLiveYet(true);
-          // AND at the control — see {@link VIS_NOT_SAVED_TEXT}. Setting only the pane-level flag
-          // left the clicked radio reverting with its explanation off-screen above.
           setVisNote({ text: VIS_NOT_SAVED_TEXT, calm: true });
-        } else if (e instanceof SocialNetworkError) {
-          setVisNote({ text: "Sparkle couldn’t reach the server. Try again.", calm: true });
-        } else if (e instanceof SocialApiError) {
-          setVisNote({ text: `The server refused that change (${e.status}).`, calm: false });
-        } else {
-          setVisNote({ text: "Something went wrong saving that. Try again.", calm: false });
-        }
+        } else setVisNote(visibilityRemedy(e));
       } finally {
+        // Cleared in the SAME `finally` as the state, so a rejected write cannot leave the ref set
+        // and wedge the group permanently shut.
+        visSavingRef.current = null;
         setVisSaving(null);
       }
     },
-    [confirmVisibility],
+    [availabilityEnabled, confirmVisibility],
   );
 
   // WHAT OTHERS WILL SEE. `online: true` is not a guess about a socket — this is the SELF view and
@@ -496,18 +673,34 @@ export function SettingsChatPane() {
             the BEHAVIOUR it directed people to is deliberately kept: re-asserting the option that
             is already selected still writes (see the radio's `onClick` below), so a user who wants
             to be sure can click Unavailable and get a real save rather than a silent no-op. */}
-        <div role="radiogroup" aria-label="Availability" style={choiceStack}>
+        <div
+          role="radiogroup"
+          aria-label="Availability"
+          // The a11y half of the gate. `disabled` on each input is what actually stops the write;
+          // this is what a screen reader announces about the GROUP, so the state is not carried by
+          // a visual dimming nobody hears (§10 / WCAG 1.4.1 — the same reason every state on this
+          // pane is icon + text). `undefined` rather than `false` so the attribute is simply absent
+          // in the ordinary case.
+          aria-disabled={availability.enabled ? undefined : true}
+          style={choiceStack}
+        >
           {VISIBILITY_CHOICES.map((choice) => {
             const selected = me.visibility === choice.value;
             return (
-              <label key={choice.value} style={choiceRow(selected)}>
+              <label key={choice.value} style={choiceRow(selected, availability.enabled)}>
                 <input
                   type="radio"
                   name="sparkle-chat-visibility"
                   data-testid={`chat-visibility-${choice.value}`}
                   value={choice.value}
                   checked={selected}
-                  disabled={visSaving !== null}
+                  // TWO REASONS TO BE DEAD, and the second is a gate rather than a spinner: no
+                  // username means no profile row means `409 no_username` for every value here, so
+                  // the group is not offered at all until one exists. `disabled` also kills the
+                  // `onClick` re-assert below — a disabled input dispatches neither handler — which
+                  // is required: that path exists to write WITHOUT a change event, so it is the one
+                  // that would otherwise still fire from a greyed-out control.
+                  disabled={visSaving !== null || !availability.enabled}
                   onChange={() => void chooseVisibility(choice.value)}
                   // RE-ASSERTING THE ALREADY-SELECTED OPTION HAS TO WORK. A browser fires no
                   // `change` for a click on a radio that is already checked, and `Unavailable` is
@@ -538,6 +731,16 @@ export function SettingsChatPane() {
             );
           })}
         </div>
+        {/* WHY IT IS GREYED OUT. A disabled control with no explanation reads as a bug, and the
+            founder asked for the reason as well as the gating. ICON + TEXT, never the dimming
+            alone: colour is not a state anyone can be relied on to perceive, and here it would be
+            the only thing distinguishing "not yet" from "broken". */}
+        {availability.reason && (
+          <div data-testid="chat-availability-gate" style={calmLine}>
+            <FiInfo size={14} aria-hidden style={noteIcon} />
+            <span>{availability.reason}</span>
+          </div>
+        )}
         {visNote && (
           <div data-testid="chat-visibility-note" style={visNote.calm ? calmLine : errorLine}>
             {visNote.calm ? (
@@ -645,13 +848,16 @@ const choiceStack: CSSProperties = {
   gap: 10,
 };
 
-const choiceRow = (selected: boolean): CSSProperties => ({
+// `enabled` changes only the AFFORDANCE (the pointer, the dimming). It is never the gate — the
+// input's own `disabled` is — so a stylesheet that failed to load could not re-open the control.
+const choiceRow = (selected: boolean, enabled: boolean): CSSProperties => ({
   display: "flex",
   alignItems: "flex-start",
   gap: 9,
   fontSize: TYPE.small,
   fontFamily: FONT_UI,
   lineHeight: 1.5,
-  cursor: "pointer",
+  cursor: enabled ? "pointer" : "default",
+  opacity: enabled ? undefined : 0.55,
   fontWeight: selected ? WEIGHT.med : undefined,
 });

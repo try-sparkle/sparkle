@@ -109,9 +109,26 @@ export const USERNAME_MAX_LENGTH = 30;
  */
 export const USERNAME_FORMAT_RE = /^[a-z0-9](?:_?[a-z0-9])+$/;
 
-/** Why a username was refused. One token per rule so a caller can render the specific remedy
- *  instead of a generic "invalid" — §10 requires five states each carried by icon + text. */
-export type UsernameRejection = "empty" | "non_ascii" | "too_short" | "too_long" | "invalid_format";
+/**
+ * Why a username was refused, IN THE CLIENT'S VOCABULARY.
+ *
+ * ⚠️ This union is NOT the server's. `apps/orchestration/src/lib/usernamePolicy.ts` has its own
+ * `UsernameRejection` (`too_short` | `too_long` | `bad_chars` | `reserved` | `impersonation`) whose
+ * values are WIRE values the route sends verbatim; these are local tokens that only ever reach
+ * `rejectionText`. The two overlap by coincidence, not by contract — `bad_chars` is split three
+ * ways here (`non_ascii` / `invalid_format` / `empty`) precisely so §10's five states each get their
+ * own remedy — so never map one onto the other, and never send one of these to the server.
+ *
+ * One token per rule so a caller can render the specific remedy instead of a generic "invalid".
+ */
+export type UsernameRejection =
+  | "empty"
+  | "non_ascii"
+  | "too_short"
+  | "too_long"
+  | "invalid_format"
+  /** Produced by {@link isReservedUsername}, NEVER by {@link validateUsernameFormat} — see both. */
+  | "reserved";
 
 /** The normalized key a username is stored and uniquely indexed under (§6.1: NFKC + lowercase). */
 export function usernameKey(raw: string): string {
@@ -150,4 +167,105 @@ export function validateUsernameFormat(raw: string): UsernameCheck {
   if (key.length > USERNAME_MAX_LENGTH) return { ok: false, reason: "too_long" };
   if (!USERNAME_FORMAT_RE.test(key)) return { ok: false, reason: "invalid_format" };
   return { ok: true, key };
+}
+
+// ── Reserved names (ADVISORY, and DELIBERATELY NOT the server's whole list) ──────────────────────
+
+/**
+ * Reserved handles that nonetheless have a **designated owner**, so the SERVER may accept a claim
+ * on them from the right account and this client must never say otherwise.
+ *
+ * `drodio` is the worked example and today the only entry: it is in the server's
+ * `RESERVED_USERNAMES` (it is a `PROTECTED_HANDLES` spelling, so an exact claim reports `reserved`
+ * rather than the misleading `impersonation`), and the orchestration half exempts its owner so the
+ * real person can claim it. A client list that included it would paint "That name is reserved."
+ * for the one human the exemption exists for — telling him he is locked out of a fix built to
+ * unlock him. So the exemption is subtracted here, the pane stays advisory for these names, and the
+ * SERVER decides.
+ *
+ * This is the ONE direction the split is safe in: subtracting from an advisory list can only ever
+ * make the client say LESS than the server will. Adding to it is what would make the client lie.
+ */
+export const OWNER_EXEMPT_HANDLES: readonly string[] = Object.freeze(["drodio"]);
+
+/**
+ * The server's `RESERVED_USERNAMES` **minus {@link OWNER_EXEMPT_HANDLES}**, duplicated here so the
+ * pane can say "That name is reserved." before Save is pressed rather than painting "Looks free"
+ * for `admin`.
+ *
+ * ⚠️ **ADVISORY, exactly like {@link validateUsernameFormat}, and for the same reason.** It changes
+ * what the user is TOLD and nothing else: it must never gate the Save button, never suppress or
+ * reinterpret a server `400`/`409`, and never keep a claim off the network. The server's list is
+ * the authority, plus a confusable-skeleton check and an owner exemption that are not knowable
+ * here. A client that disagrees with the server always loses.
+ *
+ * Duplicating a security list across two apps is a drift hazard, and it is only acceptable because
+ * the server's copy is HARDCODED AND FROZEN (its own header says so: "changing the set is a code
+ * change + PR") and because a drift test in `social.test.ts` reads that file from disk and pins
+ * this one against it. Do not edit this list by hand without editing the server's; the test fails
+ * loudly with the diff either way.
+ */
+export const ADVISORY_RESERVED_USERNAMES: readonly string[] = Object.freeze([
+  // Sparkle's own identities.
+  "sparkle",
+  "sparkleai",
+  "sparklebot",
+  "sparkleteam",
+  "sparklesupport",
+  "support",
+  "help",
+  "helpdesk",
+  // Authority / system handles.
+  "admin",
+  "admins",
+  "administrator",
+  "root",
+  "system",
+  "staff",
+  "official",
+  "moderator",
+  "mod",
+  "security",
+  "abuse",
+  "billing",
+  "payments",
+  "api",
+  "www",
+  "mail",
+  "postmaster",
+  "webmaster",
+  "noreply",
+  // Broadcast tokens.
+  "everyone",
+  "here",
+  "channel",
+  "all",
+  // Values that read as "no value" downstream.
+  "null",
+  "undefined",
+  "none",
+  "anonymous",
+  "guest",
+  "you",
+  // NOTE: "drodio" is in the server's list and is deliberately ABSENT here — see
+  // {@link OWNER_EXEMPT_HANDLES}.
+]);
+
+const ADVISORY_RESERVED_SET = new Set(ADVISORY_RESERVED_USERNAMES);
+
+/**
+ * Is this name one the client can already tell is reserved?
+ *
+ * Normalizes internally, so `Admin`, `ADMIN` and `admin` all answer true — the server's list is
+ * matched against the key (§6.1) and a check that only fired for the lowercase spelling would be a
+ * check that misses the way people type.
+ *
+ * **Kept OUT of {@link validateUsernameFormat} on purpose.** That function's `ok: false` is what
+ * `SettingsChatPane.save()` refuses on, so folding this in would make an advisory list the commit
+ * gate — the one thing the header forbids — and would mean an owner-exempt handle could never be
+ * sent to the server that is willing to accept it. This is a separate question with a separate
+ * answer: it decides what the user is TOLD while typing, never whether the claim is sent.
+ */
+export function isReservedUsername(raw: string): boolean {
+  return ADVISORY_RESERVED_SET.has(usernameKey(raw));
 }
