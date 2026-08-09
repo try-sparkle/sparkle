@@ -29,7 +29,34 @@ import { ModalLayer } from "./ModalLayer";
  *
  *  The two constants mattered more than they look. `rgba(0,0,0,0.5)` is dark mode's scrim applied to
  *  light mode as well, so a near-white shell got a half-black wash over it; the spec's light scrim is
- *  a 28% navy. Same for the shadow. Nine other dialogs carried their own copies of both. */
+ *  a 28% navy. Same for the shadow. Nine other dialogs carried their own copies of both.
+ *
+ *  ── THE CARD IS BOUNDED TO THE VIEWPORT, AND THAT IS NOT A DETAIL ────────────────────────────
+ *  The card used to take whatever height its children wanted. That is fine for a confirm prompt and
+ *  catastrophic for a dialog with a list in it: the accounts screen grew past the bottom of the
+ *  window, and because the card is CENTRED in the scrim it grew past the top as well — so there was
+ *  no scroll position from which the overflowing controls could be reached, in either direction. The
+ *  founder could not sign in a second Claude account because the "+ Add account" button had been
+ *  carried off the screen by the spawn ledger underneath it.
+ *
+ *  `maxHeight` alone would only trade hiding for CLIPPING, so the body is the scrollport: the card
+ *  is a flex column that clips to its own rounded corners, and the padding moved off the card onto
+ *  the body so that a consumer's sticky header can pin flush against the card's top edge rather
+ *  than leaving a 22px strip of content sliding past above it. `MODAL_PADDING` is exported for
+ *  exactly that: a full-bleed sticky header has to know the inset it is cancelling, and hand-typing
+ *  22 in the consumer is how the two drift apart. */
+
+/** The body's inset. Exported so a consumer pinning a full-bleed sticky header can cancel it with
+ *  negative margins instead of guessing the number. */
+export const MODAL_PADDING = 22;
+
+/** Ceiling on a dialog card's height, as a share of the viewport. Leaves the scrim visible on both
+ *  edges so the dialog still reads as floating rather than as a page.
+ *
+ *  Exported because the dialogs that paint their OWN card (the cloud pair, the project modal) need
+ *  the same ceiling, and three hand-typed copies had already drifted 2vh apart before anyone looked. */
+export const MODAL_MAX_HEIGHT = "88vh";
+
 export function ModalShell({
   width = 420,
   zIndex = 100,
@@ -70,16 +97,33 @@ export function ModalShell({
           style={{
             width,
             maxWidth: "90vw",
+            maxHeight: MODAL_MAX_HEIGHT,
+            display: "flex",
+            flexDirection: "column",
+            // Clip the scrolling body to the card's radius; without it a long list paints square
+            // corners over the rounded ones.
+            overflow: "hidden",
             background: C.dialogSurface,
             border: `1px solid ${C.dialogEdge}`,
             borderRadius: RADIUS.modal,
-            padding: 22,
             color: C.cream,
             fontFamily: FONT_UI,
             boxShadow: MODAL_SHADOW,
           }}
         >
-          {children}
+          <div
+            data-testid="modal-shell-body"
+            style={{
+              padding: MODAL_PADDING,
+              overflowY: "auto",
+              // A flex child's default `min-height: auto` refuses to shrink below its content, which
+              // would let the body push the card straight back past `maxHeight` and restore the bug
+              // this file exists to fix. It has to be allowed to shrink for the bound to bind.
+              minHeight: 0,
+            }}
+          >
+            {children}
+          </div>
         </div>
       </div>
     </ModalLayer>

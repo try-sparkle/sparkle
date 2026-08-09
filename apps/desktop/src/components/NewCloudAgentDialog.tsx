@@ -1,6 +1,7 @@
 import { useEffect, useState, type CSSProperties } from "react";
 import { FiCloud, FiX } from "react-icons/fi";
 import { C, DANGER, MODAL_SHADOW, ON_BRAND_FILL, SCRIM } from "../theme/colors";
+import { MODAL_MAX_HEIGHT } from "./ModalShell";
 import { FONT_UI, RADIUS } from "../theme/scale";
 import { FONT_WEIGHT } from "@sparkle/ui";
 import type { Project } from "../types";
@@ -258,6 +259,17 @@ const dialog: CSSProperties = {
   transform: "translate(-50%, -50%)",
   width: 460,
   maxWidth: "90vw",
+  // BOUNDED, for the same reason `ModalShell` is. A transform-centred card with no height ceiling
+  // overflows the window in BOTH directions once its content is tall enough, and there is no scroll
+  // position that recovers the part off the top — the controls are simply gone. `PromoteToCloudDialog`
+  // already bounds itself this way; this one did not, and it is a cloud-agent surface the founder
+  // reported he could not see all of.
+  //
+  // THE SCROLL BELONGS TO THE BODY, NOT TO THE CARD. Putting `overflowY` here would make the flex
+  // column itself the scrollport — and the title bar, with the only close button, is the first child
+  // of that column, so it scrolls away with everything else. That is the same "the control went off
+  // the top" defect this change exists to fix, reintroduced one element up.
+  maxHeight: MODAL_MAX_HEIGHT,
   background: C.dialogSurface,
   border: `1px solid ${C.dialogEdge}`,
   boxShadow: MODAL_SHADOW,
@@ -275,6 +287,9 @@ const titleBar: CSSProperties = {
   justifyContent: "space-between",
   padding: "14px 16px",
   borderBottom: `1px solid ${C.hairline}`,
+  // Never shrink and never scroll: it carries the only close button, so it has to survive a body
+  // long enough to hit the card's ceiling.
+  flex: "0 0 auto",
 };
 
 const closeBtn: CSSProperties = {
@@ -291,6 +306,11 @@ const body: CSSProperties = {
   flexDirection: "column",
   gap: 10,
   padding: 16,
+  // THE SCROLLPORT. `minHeight: 0` is what makes the card's ceiling bind at all — a flex child's
+  // default `min-height: auto` refuses to shrink below its content, so without it the body simply
+  // pushes the card back past `maxHeight` and nothing scrolls.
+  overflowY: "auto",
+  minHeight: 0,
 };
 
 const panel: CSSProperties = {

@@ -16,8 +16,21 @@ import { readSpawnLog, type SpawnLogEntry, type SelectionReason } from "../servi
 // choose — and on this machine it is the second. Without that number a reader draws exactly the
 // wrong conclusion from a correct log, which is the failure this panel exists to end.
 
-/** How many past selections to show. The ledger keeps 2000; this is a glance, not an audit. */
-const SHOW = 25;
+/** How many past selections to show. The ledger keeps 2000; this is a glance, not an audit.
+ *
+ *  EXPORTED BECAUSE THE COPY HAS TO NAME IT. Collapsing to one row per account replaced a visibly
+ *  bounded list of dated rows with a bare cardinal number, and a bare number reads as a TOTAL. It
+ *  is not one, in two independent ways: `load()` asks for at most this many, and the Rust side
+ *  truncates to it — so on a machine with one account and hundreds of agents the row would read the
+ *  same figure forever — and the ledger records SELECTION DECISIONS rather than starts, skipping a
+ *  sticky key whose answer did not change (`shouldLogSelection`). A panel whose entire value is
+ *  being trusted as evidence must not quote a number it cannot stand behind. */
+export const SHOW = 25;
+
+/** Ceiling on the per-spawn disclosure, in px. The disclosure is the only unbounded list left on
+ *  this panel, and the whole reason this file changed is that an unbounded list pushed the accounts
+ *  screen's controls off the window. It scrolls inside itself instead of growing the page. */
+const DETAIL_MAX_HEIGHT = 220;
 
 /** Human phrasing for why an account was chosen. The distinction that matters is between a rule
  *  that CHOSE and a rule that had no alternative — so "only signed-in account" is surfaced by the
@@ -62,6 +75,19 @@ const headerBtn: CSSProperties = {
   padding: "3px 7px",
 };
 
+/** The per-spawn disclosure's toggle. Deliberately a button rather than `<summary>`: the rows are
+ *  mounted and unmounted by React state, so the open/closed truth has to live there. */
+const disclosureBtn: CSSProperties = {
+  background: "transparent",
+  border: "none",
+  color: C.muted,
+  cursor: "pointer",
+  fontFamily: FONT_UI,
+  fontSize: TYPE.micro,
+  padding: "6px 0 0",
+  textDecoration: "underline",
+};
+
 function fmtTime(at: number): string {
   return new Date(at).toLocaleString(undefined, {
     month: "short",
@@ -79,6 +105,61 @@ function describeKey(key: string): string {
   return `Agent ${key.slice(0, 8)}`;
 }
 
+/** One account, and every spawn that ran on it.
+ *
+ *  THE PANEL USED TO RENDER ONE ROW PER SPAWN, and on the machine this feature was built for that
+ *  is 25 identical lines reading `founder@storytell.ai / picked automatically / limit not learned
+ *  yet` — because only one account is signed in, which is precisely the situation the panel exists
+ *  to explain. The founder's words: "No Need to show the same account multiple times. You can just
+ *  show it once in terms of what's currently signed in." The data was never wrong; the presentation
+ *  repeated it until the page outgrew the window. */
+interface AccountGroup {
+  /** Grouping identity. `null` is its own group — spawns that got no account at all. */
+  accountId: string | null;
+  /** The authenticated email where there is one; never the nickname over an email, since the
+   *  nickname is user-typed and is evidence of nothing. */
+  label: string;
+  count: number;
+  /** The NEWEST spawn on this account. Every "as of now" figure on the summary row — the limit
+   *  fraction, the last-used time — is read from here, because an older spawn's numbers describe a
+   *  machine state that has since moved on. */
+  newest: SpawnLogEntry;
+  /** How many distinct reasons appear across this account's spawns. More than one means the
+   *  summary's single reason label is the newest of several, and it has to say so rather than
+   *  presenting one spawn's reason as if it covered all of them. */
+  reasonCount: number;
+}
+
+/** Collapse the ledger to one entry per account, newest account first.
+ *
+ *  Entries arrive newest-first, so the first sighting of an account is its newest spawn and insertion
+ *  order is already "most recently used first" — no sort, and no clock read that would have to be
+ *  injected to be testable. */
+export function groupByAccount(entries: SpawnLogEntry[]): AccountGroup[] {
+  const byId = new Map<string, AccountGroup>();
+  const reasons = new Map<string, Set<SelectionReason>>();
+  for (const e of entries) {
+    // `null` is a real, distinct group (no account was chosen), not a missing key to be dropped.
+    const id = e.accountId ?? " none";
+    const existing = byId.get(id);
+    if (existing) {
+      existing.count += 1;
+      reasons.get(id)!.add(e.reason);
+      continue;
+    }
+    byId.set(id, {
+      accountId: e.accountId,
+      label: e.email ?? e.nickname ?? "no account (used your terminal's login)",
+      count: 1,
+      newest: e,
+      reasonCount: 1,
+    });
+    reasons.set(id, new Set([e.reason]));
+  }
+  for (const [id, g] of byId) g.reasonCount = reasons.get(id)!.size;
+  return [...byId.values()];
+}
+
 export interface AccountSpawnLogProps {
   /** IO seam so the panel can be tested without a backend. Defaults to the real ledger read. */
   read?: (limit: number) => Promise<SpawnLogEntry[]>;
@@ -86,6 +167,9 @@ export interface AccountSpawnLogProps {
 
 export function AccountSpawnLog({ read = readSpawnLog }: AccountSpawnLogProps) {
   const [entries, setEntries] = useState<SpawnLogEntry[] | null>(null);
+  // Collapsed by default. The per-spawn list is the thing that grew the accounts dialog past the
+  // window, so it opens only when someone asks for it.
+  const [detailOpen, setDetailOpen] = useState(false);
   // Monotonic request id. Two reads can be outstanding at once — Refresh clicked twice, or the
   // effect re-firing on a new `read` identity — and without this the SLOWER one wins whenever it
   // lands second, leaving the panel showing an older snapshot than one it already received. In a
@@ -148,9 +232,10 @@ export function AccountSpawnLog({ read = readSpawnLog }: AccountSpawnLogProps) {
   // the spawn still exports its config dir. Only a genuinely empty registry yields `accountId:
   // null`. That is the sole state in which "Sparkle is not choosing an account at all" is true.
   const choseNothing = latest?.accountId == null;
+  const groups = groupByAccount(entries ?? []);
 
   return (
-    <div style={wrap}>
+    <div data-testid="account-spawn-log" style={wrap}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
         <strong style={{ fontSize: TYPE.body }}>Which account recent agents ran on</strong>
         <button type="button" style={headerBtn} onClick={() => void load()}>
@@ -213,28 +298,95 @@ export function AccountSpawnLog({ read = readSpawnLog }: AccountSpawnLogProps) {
 
       {entries != null && entries.length > 0 && (
         <div style={{ marginTop: 8 }}>
-          {entries.map((e, i) => (
-            <div key={`${e.at}-${e.key}-${i}`} style={row}>
-              <span style={{ color: C.muted, minWidth: 96 }}>{fmtTime(e.at)}</span>
-              <span style={{ minWidth: 110, color: C.muted }}>{describeKey(e.key)}</span>
-              <strong style={{ color: e.accountId ? C.cream : C.amberInk }}>
-                {/* The authenticated email is the trustworthy label; the nickname is user-typed and
-                    has no bearing on which login a config dir actually holds. Fall back only when
-                    no identity resolved. */}
-                {e.email ?? e.nickname ?? "no account (used your terminal's login)"}
-              </strong>
-              <span style={{ color: C.muted }}>{REASON_LABEL[e.reason] ?? e.reason}</span>
-              {e.fraction != null && (
-                <span style={{ color: e.fraction >= 0.8 ? C.amberInk : C.muted }}>
-                  {Math.round(e.fraction * 100)}% of its limit
+          {/* ONE ROW PER ACCOUNT. See `groupByAccount` for why. */}
+          {groups.map((g) => (
+            <div key={g.accountId ?? "none"} style={row}>
+              <strong style={{ color: g.accountId ? C.cream : C.amberInk }}>{g.label}</strong>
+              {/* "N shown", never a bare total — see SHOW. Deliberately NOT "N of M": this span sits
+                  inside a row labelled with ONE account, so a ratio reads as "this account has M
+                  selections and we are showing N", which is false — M is the whole list. The
+                  caption under the list already names the population and both its caveats. */}
+              <span style={{ color: C.muted }}>{g.count} shown</span>
+              <span style={{ color: C.muted }}>
+                {REASON_LABEL[g.newest.reason] ?? g.newest.reason}
+                {/* An account whose spawns were chosen for DIFFERENT reasons must not be summarised
+                    as if one reason covered all of them. The count is the honest qualifier: the
+                    label is the newest, and the row says how many it is standing in for. */}
+                {g.reasonCount > 1 && ` (newest of ${g.reasonCount} reasons)`}
+              </span>
+              {g.newest.fraction != null && (
+                <span style={{ color: g.newest.fraction >= 0.8 ? C.amberInk : C.muted }}>
+                  {Math.round(g.newest.fraction * 100)}% of its limit
                 </span>
               )}
               {/* An unmeasured account is NOT an empty one — say so rather than rendering 0%. */}
-              {e.fraction == null && e.accountId != null && (
+              {g.newest.fraction == null && g.newest.accountId != null && (
                 <span style={{ color: C.muted }}>limit not learned yet</span>
               )}
+              <span style={{ color: C.muted, marginLeft: "auto" }}>last {fmtTime(g.newest.at)}</span>
             </div>
           ))}
+
+          {/* THE PER-SPAWN DETAIL, for anyone debugging a specific agent. Collapsed by default — it
+              is the list that pushed this screen's controls off the window — and bounded when open,
+              so expanding it scrolls inside the disclosure rather than growing the page again.
+
+              The rows are UNMOUNTED while collapsed rather than merely hidden. A `<details>` keeps
+              its children in the document, so the ledger would still be paying for 25 rows nobody
+              asked for, and every one of the account labels above would appear a second time in the
+              tree — which is the same duplication the collapse exists to remove, just invisible. */}
+          <button
+            type="button"
+            aria-expanded={detailOpen}
+            onClick={() => setDetailOpen((v) => !v)}
+            style={disclosureBtn}
+          >
+            {detailOpen
+              ? "Hide the individual selections"
+              : entries.length === 1
+                ? "Show the single selection"
+                : `Show each of the ${entries.length} selections`}
+          </button>
+
+          {/* WHAT THE NUMBERS ABOVE ACTUALLY COUNT. Both qualifications are load-bearing: the list
+              is truncated to the newest SHOW, and an agent that keeps the account it already had is
+              never re-recorded — so neither figure is a spawn total, and the panel says so instead
+              of letting a reader assume one. */}
+          <div style={{ color: C.muted, fontSize: TYPE.micro, marginTop: 6, lineHeight: 1.45 }}>
+            {entries.length >= SHOW
+              ? `Newest ${SHOW} recorded selections; older ones are not shown.`
+              : `All ${entries.length} recorded selections.`}{" "}
+            An agent that keeps the account it already had is not re-recorded, so these are not
+            spawn totals.
+          </div>
+          {detailOpen && (
+            <div
+              data-testid="spawn-detail-list"
+              style={{ maxHeight: DETAIL_MAX_HEIGHT, overflowY: "auto", marginTop: 4 }}
+            >
+              {entries.map((e, i) => (
+                <div key={`${e.at}-${e.key}-${i}`} style={row}>
+                  <span style={{ color: C.muted, minWidth: 96 }}>{fmtTime(e.at)}</span>
+                  <span style={{ minWidth: 110, color: C.muted }}>{describeKey(e.key)}</span>
+                  <strong style={{ color: e.accountId ? C.cream : C.amberInk }}>
+                    {/* The authenticated email is the trustworthy label; the nickname is user-typed
+                        and has no bearing on which login a config dir actually holds. Fall back only
+                        when no identity resolved. */}
+                    {e.email ?? e.nickname ?? "no account (used your terminal's login)"}
+                  </strong>
+                  <span style={{ color: C.muted }}>{REASON_LABEL[e.reason] ?? e.reason}</span>
+                  {e.fraction != null && (
+                    <span style={{ color: e.fraction >= 0.8 ? C.amberInk : C.muted }}>
+                      {Math.round(e.fraction * 100)}% of its limit
+                    </span>
+                  )}
+                  {e.fraction == null && e.accountId != null && (
+                    <span style={{ color: C.muted }}>limit not learned yet</span>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
     </div>

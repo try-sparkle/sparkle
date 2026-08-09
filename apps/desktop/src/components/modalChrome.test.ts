@@ -94,6 +94,112 @@ describe("modal chrome is not hand-rolled", () => {
         "whichever column it happens to open over:\n" + offenders.join("\n"),
     ).toEqual([]);
   });
+
+  // ── A DIALOG CARD IS BOUNDED TO THE VIEWPORT, OR IT IS A TRAP ────────────────────────────────
+  //
+  // A card with no height ceiling takes whatever height its content wants. Harmless for a confirm
+  // prompt; a trap the moment the dialog contains a list — and both ways it centres are worse than
+  // they sound. `ModalShell` centres with flexbox and `NewCloudAgentDialog` with a transform, so an
+  // over-tall card overflows the window at the TOP as well as the bottom, and there is no scroll
+  // position that recovers what went off the top. The controls are simply gone.
+  //
+  // That shipped. The accounts dialog grew past the window under its spawn ledger and took
+  // "+ Add account" with it, which is the exact remedy the panel's own banner recommends — the
+  // founder could not sign in a second Claude account because the button that does it was
+  // unreachable. When that was fixed, a source survey found TWO more self-painted cards with the
+  // same hole (`NewCloudAgentDialog`, `ProjectModal`), neither of which anyone had thought about.
+  //
+  // Hence a sweep rather than three render tests. The next hand-rolled dialog is written by copying
+  // one of these files, and a per-component test cannot cover a component that does not exist yet —
+  // the same argument the scrim guard above already won.
+  it("every self-painted dialog card is height-bounded and has somewhere to scroll", () => {
+    /** A file that paints its OWN modal card: the dialog surface, in a style object that also
+     *  carries the modal shadow or sits beside a scrim. Files that mount `<ModalShell>` inherit its
+     *  bound and are correctly out of scope; so is `AccountsScreen`, which reaches for
+     *  `dialogSurface` to paint a sticky header INSIDE a shell it does not own. */
+    /** Every card style object in the file, as the `WINDOW` slice around its identifying line. A
+     *  file-wide regex cannot serve this guard: it cannot tell WHICH element carries the bound, so
+     *  an unrelated `maxHeight` on a dropdown or a preview pane elsewhere in the file would satisfy
+     *  it for a card that has none — and, worse, it cannot tell the correct body-scoped scroll from
+     *  the card-level scroll this guard exists to reject. */
+    function cardWindows(file: string): string[] {
+      // COMMENTS ARE STRIPPED BEFORE WINDOWING, not after. Slicing raw lines lets a comment eat the
+      // window: documenting *why* a card is bounded pushed its own `maxHeight` out of range and the
+      // guard then reported the documented card as unbounded. A window measured in DECLARATIONS is
+      // what this is trying to express, so an explanatory paragraph must not shrink it.
+      const lines = readFileSync(file, "utf8")
+        .split("\n")
+        .filter((l) => !/^\s*(\/\/|\/\*|\*)/.test(l));
+      const out: string[] = [];
+      lines.forEach((line, i) => {
+        if (!/background:\s*C\.dialogSurface\b/.test(line)) return;
+        const text = lines.slice(Math.max(0, i - WINDOW), i + WINDOW).join("\n");
+        if (!/MODAL_SHADOW/.test(text)) return;
+        out.push(text);
+      });
+      return out;
+    }
+
+    const owners = sourceFiles(SRC).filter((f) => cardWindows(f).length > 0);
+    // A drift canary with a floor near the REAL population. `> 2` was the first cut and it was far
+    // too loose: the heuristic matches ten files, so the scope could have stopped covering seven of
+    // them and this guard would still have read green — a guard whose whole value is covering files
+    // nobody has written yet must notice when it stops covering the ones that exist.
+    expect(
+      owners.length,
+      `the self-painted-card scope matched ${owners.length} files — the heuristic has drifted`,
+    ).toBeGreaterThanOrEqual(9);
+
+    const offenders: string[] = [];
+    for (const file of owners) {
+      const wholeFile = readFileSync(file, "utf8")
+        .split("\n")
+        .filter((l) => !/^\s*(\/\/|\/\*|\*)/.test(l))
+        .join("\n");
+      for (const card of cardWindows(file)) {
+        // RELATIVE specifically — `vh` against the viewport, or `%` against a parent that is itself
+        // bounded (the composer's overlay and the board's panel fill a fixed ancestor, so `100%` IS
+        // a viewport bound, transitively). A ceiling in PIXELS is not a bound against the window,
+        // which is the thing the card overflows. Read off the CARD, not the file.
+        if (!/maxHeight:\s*(MODAL_MAX_HEIGHT|["'`]\d+(\.\d+)?(vh|%))/.test(card)) {
+          offenders.push(`${file.slice(SRC.length)}: card has no viewport-relative maxHeight`);
+        }
+        // THE SCROLL BELONGS TO A DESCENDANT, NOT TO THE CARD — and this is the check that has to be
+        // card-scoped or it is worse than nothing. Making the card itself the scrollport scrolls its
+        // OWN top chrome out of view: `AccountLoginModal`'s only dismiss control is the `Done` button
+        // in its header, so on exactly the short window this bound exists for, the user scrolls to
+        // reach the content and the way out leaves the screen. A file-wide match blessed that.
+        //
+        // `BoardView` is exempt BY NAME: its card wraps a single `<BeadCard>` with no chrome of its
+        // own — no header, no footer, no dismiss control inside it (the scrim and Escape close it) —
+        // so there is nothing that CAN scroll away, and card-level scroll is the correct shape.
+        // Named rather than pattern-matched, so a third exemption is a deliberate act.
+        if (/overflowY:\s*["']auto["']/.test(card) && !file.endsWith("BoardView.tsx")) {
+          offenders.push(
+            `${file.slice(SRC.length)}: the CARD is the scrollport — its own header will scroll away`,
+          );
+        }
+      }
+      // `composer/ModalOverlay` is the one legitimate exception and is named rather than pattern-
+      // matched, so adding a second one is a deliberate act someone has to justify in review. It is
+      // a bare frame — bounded, `overflow: hidden`, and `{children}` passed straight through with no
+      // body of its own — so the scrollport is the CONSUMER's to provide, and giving it one here
+      // would put a second scrollbar around every child that already has one.
+      if (file.endsWith("composer/ModalOverlay.tsx")) continue;
+      // A ceiling with no scrollport anywhere CLIPS the overflow instead of hiding it, which is not
+      // an improvement — the controls are still unreachable, just invisible rather than off-screen.
+      if (!/overflowY:\s*["']auto["']/.test(wholeFile)) {
+        offenders.push(`${file.slice(SRC.length)}: card is bounded but nothing scrolls`);
+      }
+    }
+    expect(
+      offenders,
+      "a dialog card that can outgrow the window hides its own controls, and a centred one hides " +
+        "them off the TOP where no scroll reaches. Bound it with MODAL_MAX_HEIGHT from ModalShell " +
+        "and give it a scrollport (see ModalShell's body, or PromoteToCloudDialog):\n" +
+        offenders.join("\n"),
+    ).toEqual([]);
+  });
 });
 
 // ── THE MODAL RADIUS BELONGS TO THE CARD, NOT TO ITS BUTTONS ───────────────────────────────────

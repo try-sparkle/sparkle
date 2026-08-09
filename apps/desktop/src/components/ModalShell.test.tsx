@@ -18,11 +18,14 @@ afterEach(cleanup);
 
 const noop = () => {};
 
-/** The card is the scrim's only element child; the scrim is the outermost node rendered. */
+/** scrim > card > body > children. The body is the SCROLLPORT and the card is the painted plane —
+ *  they are separate elements because the card must be bounded to the viewport while something
+ *  inside it scrolls, so every assertion below has to name which of the two it means. */
 function parts() {
-  const card = screen.getByTestId("shell-body").parentElement as HTMLElement;
+  const body = screen.getByTestId("modal-shell-body");
+  const card = body.parentElement as HTMLElement;
   const scrim = card.parentElement as HTMLElement;
-  return { card, scrim };
+  return { body, card, scrim };
 }
 
 function renderShell() {

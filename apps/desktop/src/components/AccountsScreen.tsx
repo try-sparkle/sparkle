@@ -4,6 +4,7 @@ import { C, ON_BRAND_FILL } from "../theme/colors";
 import { FONT_UI } from "../theme/scale";
 import { tag } from "./labelTreatment";
 import { AccountSpawnLog } from "./AccountSpawnLog";
+import { MODAL_PADDING } from "./ModalShell";
 import { readSpawnLog } from "../services/accountLedger";
 import {
   listAccounts,
@@ -111,6 +112,36 @@ const primaryBtn: CSSProperties = {
 };
 
 const tagStyle: CSSProperties = { ...tag(C.accentInk), borderColor: C.teal };
+
+/** The screen's title bar, PINNED. "+ Add account" is the remedy every banner on this screen
+ *  recommends, and it used to scroll with the page: the spawn ledger at the bottom grew unbounded,
+ *  the dialog outgrew the window, and the one control the founder needed went off the top edge —
+ *  in a panel whose own copy was telling him to sign in another account.
+ *
+ *  Two details are load-bearing, and each is a way this has already failed:
+ *
+ *  • FULL BLEED. The scrollport is `ModalShell`'s body, which carries the dialog's inset. A sticky
+ *    header that respects that inset leaves a `MODAL_PADDING`-wide gutter down each side with live
+ *    content sliding up through it. Cancelling the inset with negative margins and re-adding it as
+ *    padding makes the header span the card edge-to-edge while looking identical at rest.
+ *  • OPAQUE. `sticky` does not imply a background. Without one the ledger rows scroll straight
+ *    THROUGH the title and the button, which is worse than the overflow it replaced.
+ *
+ *  The negative top margin means it is already at its sticky offset before any scrolling happens,
+ *  so it is pinned from the first paint rather than snapping into place partway down. */
+const stickyHeader: CSSProperties = {
+  position: "sticky",
+  top: 0,
+  zIndex: 2,
+  background: C.dialogSurface,
+  margin: `-${MODAL_PADDING}px -${MODAL_PADDING}px 10px`,
+  padding: `${MODAL_PADDING}px ${MODAL_PADDING}px 8px`,
+  borderBottom: `1px solid ${C.muted}`,
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "space-between",
+  gap: 8,
+};
 
 const inputStyle: CSSProperties = {
   background: "transparent",
@@ -589,7 +620,7 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
 
   return (
     <div style={{ fontFamily: fontStack, color: C.cream }}>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+      <div data-testid="accounts-header" style={stickyHeader}>
         <div style={{ fontSize: 13, fontWeight: 600 }}>Claude accounts</div>
         {!adding && (
           <button type="button" style={primaryBtn} onClick={() => setAdding(true)}>

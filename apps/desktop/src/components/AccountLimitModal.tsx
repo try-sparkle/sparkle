@@ -138,6 +138,12 @@ export function AccountLimitModal() {
             width: pending ? 760 : 520,
             maxWidth: "92vw",
             maxHeight: "85vh",
+            // THE SCROLL IS ON THE BODY BELOW, NOT HERE. Making the card the scrollport scrolls its
+            // own title and its dismiss/sign-in footer out of view — on exactly the short window
+            // this ceiling exists for, the controls leave the screen instead of merely being cut
+            // off, which is not an improvement. `minHeight: 0` lets the column shrink so the
+            // ceiling binds at all. See ModalShell.
+            minHeight: 0,
             display: "flex",
             flexDirection: "column",
             background: C.dialogSurface,
@@ -149,10 +155,13 @@ export function AccountLimitModal() {
             boxShadow: MODAL_SHADOW,
           }}
         >
-          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>
+          {/* PINNED — the title states which account, and must stay visible while reading. */}
+          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8, flex: "0 0 auto" }}>
             {limited?.nickname ? `“${limited.nickname}” hit its Claude limit` : "A Claude account hit its limit"}
           </div>
 
+          {/* THE SCROLLPORT — everything between the pinned title and the pinned buttons. */}
+          <div style={{ flex: "1 1 auto", minHeight: 0, overflowY: "auto", display: "flex", flexDirection: "column" }}>
           <p style={{ fontSize: 12, color: C.muted, marginTop: 0, lineHeight: 1.5 }}>
             {resetsAt
               ? `It resets at ${resetsAt}. Retrying can’t clear it — this is an account limit, not a network error.`
@@ -183,7 +192,10 @@ export function AccountLimitModal() {
             </p>
           ) : null}
 
-          <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 12 }}>
+          </div>
+
+          {/* PINNED — the way out, and the sign-in that fixes the problem. Never scrolls away. */}
+          <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 12, flex: "0 0 auto" }}>
             <button
               type="button"
               onClick={dismiss}

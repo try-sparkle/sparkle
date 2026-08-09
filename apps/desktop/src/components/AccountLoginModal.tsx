@@ -48,6 +48,12 @@ export function AccountLoginModal({ account, onClose }: { account: Account; onCl
             maxWidth: "92vw",
             height: 520,
             maxHeight: "85vh",
+            // THE SCROLL IS ON THE PROSE BELOW, NOT HERE. This card's ONLY dismiss control is the
+            // "Done" button in the header row, so making the card the scrollport would scroll the
+            // way out off the screen on exactly the short window this ceiling exists for. The PTY
+            // region keeps its own `flex: 1` sizing untouched — wrapping it in a scroll container
+            // would resize the terminal.
+            minHeight: 0,
             display: "flex",
             flexDirection: "column",
             background: C.dialogSurface,
@@ -59,7 +65,8 @@ export function AccountLoginModal({ account, onClose }: { account: Account; onCl
             boxShadow: MODAL_SHADOW,
           }}
         >
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+          {/* PINNED — this row holds the only way out of the modal. */}
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10, flex: "0 0 auto" }}>
             <div style={{ fontSize: 13, fontWeight: 600 }}>Log in to “{account.nickname}”</div>
             <button
               type="button"
@@ -77,6 +84,10 @@ export function AccountLoginModal({ account, onClose }: { account: Account; onCl
               Done
             </button>
           </div>
+          {/* THE SCROLLPORT: the explanatory prose, which is what a short window has to give up.
+              It scrolls here rather than on the card, so "Done" above and the terminal below both
+              stay put. */}
+          <div style={{ flex: "0 1 auto", minHeight: 0, overflowY: "auto" }}>
           <p style={{ fontSize: 12, color: C.muted, marginTop: 0, lineHeight: 1.4 }}>
             Complete the normal Claude login below (it opens your browser). Sparkle never sees your
             credentials. Close when you’re done.
@@ -103,6 +114,7 @@ export function AccountLoginModal({ account, onClose }: { account: Account; onCl
               ? `Signing in here changes the Claude login Sparkle uses for this account, stored in ${account.configDir || "~/.claude.json"}. If that is also the config your terminal uses, it changes there too.`
               : "Credentials are stored in this account’s own config folder, separate from your other accounts."}
           </p>
+          </div>
           <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
             {/* Closes on a CONFIRMED sign-in rather than on the PTY exiting. The old wiring closed
                 on exit, which dismissed the modal while the user was still on the OAuth page in

@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { C, FONT_WEIGHT, MODAL_SHADOW, ON_BRAND_FILL, SCRIM } from "../theme/colors";
 import { FONT_UI, RADIUS } from "../theme/scale";
+import { MODAL_MAX_HEIGHT } from "./ModalShell";
 import type { Project } from "../types";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
@@ -97,6 +98,16 @@ export function ProjectModal({ project, onClose }: { project: Project; onClose: 
           style={{
             width: 520,
             maxWidth: "90vw",
+            // BOUNDED. This card is a hand-rolled copy of `ModalShell`'s and inherited its missing
+            // height ceiling: centred in the scrim, it overflows the window in both directions once
+            // its content is tall enough, and nothing recovers the part off the top. Same defect the
+            // accounts dialog shipped with — see ModalShell for the argument.
+            maxHeight: MODAL_MAX_HEIGHT,
+            // THE SCROLL IS ON THE BODY BELOW, NOT HERE. Making the card itself the scrollport
+            // scrolls its own "Project settings" heading and its Cancel/Save footer out of view —
+            // on exactly the short window this ceiling exists for, the way out leaves the screen.
+            display: "flex",
+            flexDirection: "column",
             background: C.dialogSurface,
             border: `1px solid ${C.dialogEdge}`,
             borderRadius: RADIUS.modal,
@@ -106,10 +117,22 @@ export function ProjectModal({ project, onClose }: { project: Project; onClose: 
             boxShadow: MODAL_SHADOW,
           }}
         >
-          <div style={{ fontSize: 17, fontWeight: FONT_WEIGHT.semibold, marginBottom: 16 }}>
+          <div
+            style={{
+              fontSize: 17,
+              fontWeight: FONT_WEIGHT.semibold,
+              marginBottom: 16,
+              flex: "0 0 auto",
+            }}
+          >
             Project settings
           </div>
 
+          {/* THE SCROLLPORT. Everything between the pinned heading and the pinned footer scrolls
+              here, so a short window shrinks the form rather than pushing Cancel/Save off-screen.
+              `minHeight: 0` is what lets it shrink at all — a flex child's default `min-height:
+              auto` refuses to go below its content, and the card's ceiling would never bind. */}
+          <div style={{ flex: "1 1 auto", minHeight: 0, overflowY: "auto" }}>
           <label style={{ display: "block", color: C.muted, fontSize: 12, marginBottom: 6 }}>
             Project name
           </label>
@@ -207,7 +230,10 @@ export function ProjectModal({ project, onClose }: { project: Project; onClose: 
             <div style={{ color: C.sienna, fontSize: 13, marginBottom: 14 }}>{error}</div>
           )}
 
-          <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+          </div>
+
+          {/* PINNED. The way out of this dialog must never be the thing that scrolls away. */}
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, flex: "0 0 auto", paddingTop: 4 }}>
             <button
               onClick={onClose}
               disabled={busy}
