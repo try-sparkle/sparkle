@@ -271,6 +271,10 @@ describe("surface registry", () => {
       "settings-dialog",
       "open-pr-menu-narrow",
       "open-pr-menu-grouped-narrow",
+      // The PR-OWNER surface (bead sparkle-obggv): the "Open agent" pill, which no capture could
+      // reach because no fixture PR resolved to an agent. It lands with the `agentId` on fixture
+      // row #1095 and is meaningless without it — see `visualFixtures.ts`.
+      "open-pr-menu-agent-owner",
       "open-pr-menu-grouped-wide",
       // The merge-rights + dismissal surfaces (bead sparkle-j881r). Two states no other surface
       // reaches: a green PR with a DISABLED Merge because the user has no write access in that

@@ -302,12 +302,38 @@ export function visualProjectCount(search: string): 1 | 2 {
  */
 export const FIXTURE_PRS = [
   {
+    // ── THE ROW WITH A KNOWN OWNER (bead sparkle-obggv) ──────────────────────────────────────
+    //
+    // The ONLY fixture PR that resolves to an agent, and that is deliberate on both counts.
+    //
+    // WHY ANY ROW NEEDS ONE. `agentLinkForPr` renders the "Open agent" pill from the DURABLE
+    // `agentId` the Rust `pr_owner` records, falling back to a branch join only when nothing was
+    // recorded. Every fixture row used to omit `agentId` AND carry a descriptive branch that
+    // matches no fixture agent's `sparkle/<id>` — so both paths returned null and the pill was
+    // unphotographable, on every surface, no matter which one you added. A capture cannot be a
+    // regression baseline for an affordance the fixture makes impossible to render.
+    //
+    // WHY THIS ID. `vfx-agent-2` is a REAL agent in the fixture roster, so the link resolves to a
+    // named agent ("Wire the connection badge") and the pill's tooltip reads as it does in the
+    // app. An id naming no agent is the one case `agentLinkForPr` is explicit about — a KNOWN
+    // owner absent from the roster yields null rather than falling through to the branch join —
+    // so a typo here does not fail loudly, it silently restores the empty state this row exists
+    // to escape. `visualFixtures.test.ts` pins the id against the roster for exactly that reason.
+    //
+    // WHY ONLY ONE. The pill is per-row, so one owned row among six photographs BOTH states in a
+    // single frame: the row that offers "Open agent" and the five that correctly do not. Owning
+    // every row would make an always-render bug and correct behaviour look identical.
+    //
+    // `agentIdSource: "created"` mirrors what Rust records for a PR the app itself opened — the
+    // provenance the menu may display alongside the owner, and the honest one for this row.
     number: 1095,
     title: "feat(concierge): give the header its own quiet state and keep goals visible",
     headRefName: "sparkle/header-quiet-and-goals-visible",
     url: "https://github.com/o/r/pull/1095",
     checks: "passing",
     mergeable: "mergeable",
+    agentId: "vfx-agent-2",
+    agentIdSource: "created",
   },
   {
     number: 1088,

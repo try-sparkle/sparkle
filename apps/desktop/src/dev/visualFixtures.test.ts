@@ -25,6 +25,7 @@ import {
   visualCaptureRun,
   visualPrsRequested,
 } from "./visualFixtures";
+import { agentLinkForPr } from "../components/OpenPrMenu";
 import { stallReport } from "../engine/agentStall";
 import { stallChipFor, stallInputsFor } from "../components/rowAttention";
 import { bandOfStatus, sectionOfRow } from "../engine/buildSections";
@@ -756,6 +757,32 @@ describe("the open-PR parameter", () => {
     // A subject and a branch long enough to have somewhere to truncate TO.
     expect(Math.max(...FIXTURE_PRS.map((p) => p.title.length))).toBeGreaterThan(50);
     expect(Math.max(...FIXTURE_PRS.map((p) => p.headRefName.length))).toBeGreaterThan(25);
+  });
+
+  // ── THE OWNED ROW (bead sparkle-obggv) ──────────────────────────────────────────────────────
+  //
+  // Driven through `agentLinkForPr`, the REAL function the menu renders the "Open agent" pill
+  // from, rather than by reading `agentId` back off the fixture. Reading the field would assert a
+  // precondition that was true the moment it was typed; the pill's existence depends on the id
+  // ALSO naming an agent in the roster, and that join is the half a typo breaks. `agentLinkForPr`
+  // is explicit that a known owner missing from the roster yields null rather than falling through
+  // to the branch join — so the failure this guards is silent by construction: the surface would
+  // capture a menu with no pill and pass.
+  it("gives exactly one row an owner that RESOLVES to a fixture agent", () => {
+    const { project } = buildVisualFixture();
+    const resolved = FIXTURE_PRS.map((p) => agentLinkForPr(p, [project], project.id));
+
+    const owned = resolved.filter((link) => link !== null);
+    expect(owned, "no fixture PR resolves to an agent — the pill cannot be photographed").toHaveLength(1);
+    // A NAMED agent: the pill's tooltip reads "Open <name>", so an id resolving to a nameless row
+    // would photograph as a broken tooltip while this test still saw a non-null link.
+    expect(owned[0]!.agentName).toBeTruthy();
+    expect(project.agents.some((a) => a.id === owned[0]!.agentId)).toBe(true);
+
+    // …AND THE OTHERS RESOLVE TO NOTHING. One owned row among six is what puts both states in one
+    // frame; without this half, a menu that rendered the pill on EVERY row would look identical in
+    // the capture and pass the assertion above.
+    expect(resolved.filter((link) => link === null).length).toBe(FIXTURE_PRS.length - 1);
   });
 });
 

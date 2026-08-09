@@ -421,6 +421,51 @@ export const SURFACES = [
     mock: null,
   },
   {
+    // ── THE PR-OWNER PILL, OPENED FROM THE CONCIERGE COLUMN (bead sparkle-obggv) ────────────────
+    //
+    // The concierge column's PR chip is the app's only way to see a pull request, and one piece of
+    // its panel is owner-dependent: the "Open agent" pill that jumps from a PR back to the agent
+    // that opened it. No surface could photograph it, because no fixture PR resolved to an agent —
+    // so this surface and the `agentId` on fixture row #1095 land together and neither works alone.
+    //
+    // A SEPARATE SURFACE, not a step bolted onto `open-pr-menu-grouped`. That one is evidence about
+    // GROUPING — two repos' rows reading as two sections — and its clip is the whole viewport for
+    // that reason. This one is evidence about ONE ROW'S CONTENT, so it clips to the panel where the
+    // pill is legible at a glance. Folding them together would mean a grouping regression and an
+    // owner regression failing the same capture, with no way to tell which from the picture.
+    //
+    // `prs=1` populates the chip at all (the transport shim answers `project_open_prs` with null
+    // otherwise, so there is no badge to click). `concierge=360` is the app's default width STATED
+    // rather than implied — the harness drives every surface through one browser context and
+    // `sparkle-concierge-width` survives between them, so a surface that names no width photographs
+    // whatever the previously-captured one left behind. See `open-pr-menu-grouped`'s note.
+    //
+    // ONE PROJECT, deliberately: an owner is a property of a row, and grouping only adds section
+    // chrome between the reader and the thing under test.
+    name: "open-pr-menu-agent-owner",
+    query: "prs=1&concierge=360",
+    description: "The open-PR menu with the row whose owning agent is known — the 'Open agent' pill.",
+    app: {
+      steps: [
+        { waitFor: "[data-testid=workspace-shell]" },
+        { cable: "off" },
+        { waitFor: "[data-testid=open-pr-badge]" },
+        { click: "[data-testid=open-pr-badge]" },
+        { waitFor: "[data-testid=open-pr-panel]" },
+        // THE PILL ITSELF, not merely the panel — assert the side effect, never the precondition.
+        // The panel opens whether or not any row resolves to an agent, so waiting on it alone would
+        // photograph the exact empty state this surface exists to escape and still pass. Keyed to
+        // #1095 because that is the one row the fixture gives an owner; if that moves, this fails
+        // loudly rather than quietly capturing a menu with nothing to show.
+        { waitFor: "[data-testid=open-agent-1095]" },
+      ],
+      clip: "[data-testid=open-pr-panel]",
+    },
+    // rev4 predates the menu entirely, let alone PR ownership. Explicitly null so compare.mjs
+    // reports "no reference" rather than scoring it against something unrelated.
+    mock: null,
+  },
+  {
     // ── THE GROUPED MENU AT A COMFORTABLE WIDTH ─────────────────────────────────────────────────
     //
     // The narrow shot is evidence about CONTAINMENT (the panel escapes its column); this one is
