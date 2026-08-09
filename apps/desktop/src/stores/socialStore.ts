@@ -130,15 +130,26 @@ interface SocialState {
    * True once the SERVER has accepted a visibility in this session — i.e. once `me.visibility`
    * stopped being the fail-closed default and became a fact.
    *
-   * IT LIVES HERE, BESIDE THE VALUE IT QUALIFIES, AND NOT IN THE PANE THAT SETS IT. Two reasons,
-   * and the second is the one that made a component-local flag actually wrong rather than merely
-   * untidy:
+   * ⚠️ PARKED — THIS FLAG CURRENTLY HAS NO PRODUCTION READER. It is written (by
+   * {@link SocialState.confirmVisibility}), cleared (by {@link SocialState.reset}) and asserted in
+   * `SettingsChatPane.test.tsx`, but nothing rendering reads it. Its one consumer was the Chat
+   * pane's "this Mac may not know your setting" caveat, and the founder cut that copy on
+   * 2026-08-08 along with three other explanatory blocks (PR #1599). Do not read this as live
+   * state and do not extend it on the assumption that something depends on it.
+   *
+   * IT IS KEPT, NOT DELETED, for one named consumer: U1's `/me` hydration
+   * (`services/socialSync`). Hydration is precisely the thing that makes "did the SERVER say this,
+   * or is it just our default?" answerable, and it is the question this flag exists to answer —
+   * so deleting it now means re-deriving it there. **If U1 lands and still does not read this,
+   * delete it** along with the second half of `confirmVisibility` (which then collapses to a plain
+   * `setVisibility`) and the tests that assert it.
+   *
+   * Why it lives in the store rather than in the pane that sets it — still true, and the reason it
+   * should stay here if it comes back into use:
    *
    *   • LIFETIME. `SettingsDialog` mounts only the ACTIVE pane and is itself conditionally
    *     rendered, so the Chat pane remounts on every rail click. A `useState` flag resets there
-   *     while `me.visibility` — which outlives the pane — does not, so the pane would re-paint its
-   *     "this Mac may not know your setting" caveat over a value the server confirmed a moment ago
-   *     (roborev 60432).
+   *     while `me.visibility` — which outlives the pane — does not (roborev 60432).
    *   • IDENTITY. This is a fact about a PERSON, and per-human state surviving a sign-out is a
    *     recurring leak in this app. Here it cannot: {@link SocialState.reset} restores `INITIAL`,
    *     which clears this with everything else. A module-level flag in a component file would have

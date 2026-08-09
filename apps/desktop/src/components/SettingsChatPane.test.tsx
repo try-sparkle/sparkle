@@ -71,8 +71,10 @@ const clickSave = () => fireEvent.click(screen.getByTestId("chat-username-save")
 const checkState = () => screen.getByTestId("chat-username-check").getAttribute("data-check");
 
 beforeEach(() => {
-  // `visibilityConfirmed` too: it is store state that outlives a test, and leaking a `true` into
-  // the next one would make "a failed save confirms nothing" pass without the pane doing anything.
+  // `visibilityConfirmed` too: it is store state that outlives a test. It has no production reader
+  // today (see its docstring — it is parked for U1's /me hydration), so the assertions on it below
+  // pin the STORE's contract rather than anything a user can see; `me.visibility`, reset on the
+  // same line, is the observable half and is what the radio renders from.
   useSocialStore.setState({ me: EMPTY_PROFILE, visibilityConfirmed: false });
   useAuthStore.setState({ me: null, tokenPresent: true, loading: false });
   vi.mocked(getUser).mockRejectedValue(new SocialApiError(404, null));
@@ -526,8 +528,15 @@ describe("SettingsChatPane — what the user is shown", () => {
       "Sparkle may not know it yet", // 2 — other-machine caveat
       "Sparkle starts everyone at", // 3a — availability preamble
       "choose again here to be sure", // 3b — un-hydrated availability caveat
-      "not end-to-end encrypted", // 4 — the BEFORE YOU START block
+      // 4 — the BEFORE YOU START block, pinned by its HEADING and its closing line rather than by
+      // the privacy claim itself. What the founder cut was a four-paragraph wall, not the right to
+      // ever disclose this: banning the bare phrase "not end-to-end encrypted" would also reject a
+      // one-line link, a shorter sentence or a first-run notice — and the failure would read as
+      // "the founder forbade this", which is not what this guard protects. If a compliant
+      // disclosure is added back in some other form, that is a product decision to make on its
+      // merits, not something this test should pre-empt. (roborev 61542.)
       "Before you start",
+      "wouldn’t put in a support ticket",
     ]) {
       expect(shown).not.toContain(phrase);
     }
