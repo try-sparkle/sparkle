@@ -101,7 +101,29 @@ export type DictationFallbackReason =
   /** The relay refused with 429: this account already holds its limit of concurrent streams.
    *  Actionable (close another dictating window) AND self-correcting (the previous socket's
    *  warm-standby window lapses), and — the part that matters — NOT an outage. */
-  | "too_many_streams";
+  | "too_many_streams"
+  /**
+   * THE MICROPHONE NEVER STARTED — this hold captured NO AUDIO AT ALL.
+   *
+   * ── WHY THIS CANNOT BE ANY OF THE REASONS ABOVE ─────────────────────────────────────────────
+   * Every other reason here is about the RELAY, and every one of their banners ends with some form
+   * of *"Your words are still captured; they appear when you finish speaking instead of word by
+   * word."* That sentence is TRUE for a relay failure — the on-device engine caught the audio — and
+   * FALSE here, because there was no audio to catch. The capture finished building after the user
+   * had already let go and was discarded empty.
+   *
+   * The founder hit exactly this and reported it as *"it doesn't seem to be recognizing the mic
+   * right now"* — while the UI showed him the relay's `too-slow` banner, which was speaking for a
+   * condition it does not cover and promising him words that were never recorded.
+   *
+   * ── WHAT IT IS NOT ──────────────────────────────────────────────────────────────────────────
+   * Not a missing device, not a permission problem, and not another app holding the microphone: on
+   * the machine where this was diagnosed the device bound successfully 41/41 times with zero
+   * failures while this fired. It is capture-start latency losing a race against a short hold —
+   * `capture_ms` measured 232 ms on an idle machine and 2083 ms at load average 291, against
+   * push-to-talk holds of ~345 ms.
+   */
+  | "mic_missed_hold";
 
 /** What `start_cloud_stream` reports — the wire form of Rust's `CloudStreamOutcome`.
  *
@@ -273,6 +295,10 @@ export interface DictationEngineState {
   noteCloudLive: () => void;
   /** A cloud stream was refused or ended; dictation continues on-device without interim results. */
   noteCloudUnavailable: (reason: DictationFallbackReason) => void;
+  /** The microphone never started for a hold, so it recorded nothing. Its OWN seam, not the relay
+   *  one: see the implementation for why routing this through `noteCloudUnavailable` was the same
+   *  conflation this reason exists to delete. */
+  noteMicMissedHold: () => void;
   /** Drop an observation that has gone stale, so the store SETTLES rather than merely going
    *  unpainted. A no-op on a fresh notice and on an empty one. */
   retireStaleNotice: (now?: number) => void;
@@ -372,6 +398,28 @@ export const useDictationEngineStore = create<DictationEngineState>()(
         observedAt: Date.now(),
         dismissed: s.fallbackReason === reason ? s.dismissed : false,
         openRefusals: 0,
+      })),
+    // ── A MIC FAILURE IS NOT A RELAY VERDICT, SO IT DOES NOT USE THE RELAY SEAM ──────────────────
+    // This went through `noteCloudUnavailable` first, which was the same conflation this whole
+    // change exists to delete — just pointing the other way (roborev 61695). That seam does two
+    // things beyond setting the reason, and BOTH are wrong here:
+    //
+    //   * `openRefusals: 0` resets the RELAY corroboration counter. A microphone that never started
+    //     is no evidence at all about the relay, so zeroing it discards genuine relay evidence and
+    //     makes the next real outage take an extra refusal to report.
+    //   * it is the channel for a verdict the relay HANDED US. Routing a local capture failure
+    //     through it means a mic condition and a relay condition are indistinguishable to every
+    //     reader downstream — the exact defect the `mic_missed_hold` reason was added to fix.
+    //
+    // It still WINS the banner, deliberately: losing the whole utterance is strictly worse than
+    // losing the live preview of an utterance that was captured, so it outranks a standing relay
+    // reason. It just does not pretend to be one.
+    noteMicMissedHold: () =>
+      set((s) => ({
+        fallbackReason: "mic_missed_hold",
+        observedAt: Date.now(),
+        dismissed: s.fallbackReason === "mic_missed_hold" ? s.dismissed : false,
+        // openRefusals deliberately UNTOUCHED — see above.
       })),
     // ONE SEAM, FOUR BEHAVIOURS, decided by `classifyCloudOutcome` rather than here — so the policy
     // is a pure function a test can enumerate, and this stays a dispatch.

@@ -19,6 +19,7 @@
         begin_start_decision, choose_engine, cloud_reuse, park_cloud_for_blur, discard_needs_reissue, note_build_failed, note_fresh_arm,
         apply_decode_plan, plan_decode_emit, DecodeEmitPlan, DecodeEmitSink, DecodeOutcome,
         should_install_cloud, should_keep_warm_on_stop, park_or_take_on_stop, park_target_active,
+        classify_capture_fate, CaptureFate,
         should_resume_on_focus, should_standby_on_blur, start_after_load, stop_is_noop, unpark_cloud_for_focus, BeginStart,
         CloudReuse, DeepgramSession, DictationState, Engine, Installed, ReconcileStep, StartAfterLoad,
         raced_stream_disposition, RacedStream, late_report_for, LateReport, park_raced_stream, install_live_stream, CloudAudioSender,
@@ -2622,6 +2623,89 @@
         assert!(park_target_active(true, &captured, &sess), "same generation → the captured flag");
     }
 
+    // ── WHERE THE "WHAT DOES THE PRELOAD SAVE?" MEASUREMENT LIVES ────────────────────────────────
+    // A second on-machine timing test (`measure_real_model_load`) stood here and was DELETED rather
+    // than kept (roborev 61716). `measure_model_load_split`, at the bottom of this file, already
+    // resolves the same app-data path and already calls `load_model` three times, printing round 1
+    // (cold: ONNX transducer init + VAD + verification) against rounds 2-3 (warm: served from
+    // `DECODER_CACHE`) — the cold/warm delta this one re-measured was already on screen, and it now
+    // prints that delta explicitly. Two copies were actively worse than one: `load_model` takes the
+    // process-global `MODEL_LOAD` mutex and shares `DECODER_CACHE`, so the obvious invocation
+    // `cargo test --lib -- --ignored --nocapture` ran both concurrently — whichever went second
+    // timed a "cold" load that was already cache-warm, or timed its own wait on the other test's
+    // mutex, and only the deleted one asserted on the ordering, so the contention could panic.
+
+    #[test]
+    fn only_a_hold_that_recorded_nothing_is_reported_to_the_user() {
+        // The founder's "it doesn't seem to be recognizing the mic". `install_capture` decided this
+        // with ONE `still_current` bool and logged all three rejections as "discarding a capture
+        // built during a stop/blur race" — a line this file already records as having "sent two
+        // investigations hunting a focus race". Only one of the three costs the user their words,
+        // and only that one may raise a banner.
+        assert_eq!(
+            classify_capture_fate(true, true, true),
+            CaptureFate::Install,
+            "wanted, slot free, same generation: install it"
+        );
+        // THE USER-VISIBLE FAILURE: the hold ended before the mic finished starting, and no sibling
+        // capture caught the words. Measured 12+ times on 2026-08-09 with capture_ms up to 2083ms
+        // against ~345ms holds.
+        assert_eq!(
+            classify_capture_fate(false, true, true),
+            CaptureFate::MissedTheHold,
+            "nobody wants it and nothing else is live: this hold recorded NOTHING"
+        );
+        // NOT user-visible: a sibling is already installed and routing, so the audio was captured.
+        // Reporting this one would fire a "nothing was recorded" banner over a working dictation.
+        assert_eq!(
+            classify_capture_fate(false, false, true),
+            CaptureFate::LostToASibling,
+            "a sibling holds the slot — the words were captured by it, nothing is owed"
+        );
+        assert_eq!(
+            classify_capture_fate(true, false, true),
+            CaptureFate::LostToASibling,
+            "still a sibling even when the session wants a capture"
+        );
+        // NOT user-visible either: these words belong to a session the user already left.
+        assert_eq!(
+            classify_capture_fate(false, true, false),
+            CaptureFate::Stale,
+            "a rotated generation outranks everything — not this session's loss to report"
+        );
+        assert_eq!(
+            classify_capture_fate(true, true, false),
+            CaptureFate::Stale,
+            "wanting a capture does not make a stale one this session's"
+        );
+    }
+
+    #[test]
+    fn exactly_one_capture_fate_is_ever_reported_to_the_user() {
+        // The property, rather than the six sampled rows above: across the WHOLE input space there
+        // must be exactly one combination that tells the user they lost their words. A widened rule
+        // that started reporting a sibling loss or a rotated generation would fire a "nothing was
+        // recorded" banner over dictation that worked — which is the same false-claim defect, just
+        // pointing the other way.
+        let mut reported = Vec::new();
+        for wants in [true, false] {
+            for slot_empty in [true, false] {
+                for same_gen in [true, false] {
+                    if classify_capture_fate(wants, slot_empty, same_gen)
+                        == CaptureFate::MissedTheHold
+                    {
+                        reported.push((wants, slot_empty, same_gen));
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            reported,
+            vec![(false, true, true)],
+            "exactly one input may report a lost hold: not wanted, slot empty, same generation"
+        );
+    }
+
     #[test]
     fn a_socket_banked_by_its_own_arm_reports_late_not_orphan() {
         // `Orphan` means "NO EVIDENCE EITHER WAY" — a handshake for a session the user already left,
@@ -3276,8 +3360,18 @@
     #[test]
     #[ignore = "loads ~661MB of real ONNX models; run with --ignored --nocapture"]
     fn measure_model_load_split() {
-        // The real install location `start_dictation` reads (`app_data_dir(&app).join("models")`),
-        // resolved without an AppHandle — there is no Tauri app in a unit test.
+        // The RELEASE install location — the one a shipped build reads, which is the number that
+        // matters for what the founder actually runs. Resolved by hand because there is no Tauri app
+        // in a unit test.
+        //
+        // NOT identical to what THIS build's preload would read (roborev 61716). `app_data_dir` runs
+        // the path through `dev_identity::apply_dev_suffix_path`, which appends `-dev` to the final
+        // component whenever `is_dev()`, and `cargo test` is a debug build — so a debug-build
+        // `preload_model_in_background` loads `ai.sparkle.desktop-dev/models`, which exists on this
+        // machine as a separate install. Deliberately left pointing at the release copy: this is a
+        // measurement of the cost the SHIPPED app pays, not a proof about the current binary, and
+        // the two model directories hold the same files anyway. Do not read a pass here as evidence
+        // that the preload wired up correctly — it measures `load_model`, not the boot path.
         let Some(home) = std::env::var_os("HOME") else {
             eprintln!("SKIPPED measure_model_load_split: no HOME");
             return;
@@ -3293,22 +3387,46 @@
             return;
         }
 
+        let mut ms: Vec<Option<f64>> = Vec::new();
         for round in 1..=3 {
             let t = std::time::Instant::now();
             match super::load_model(&root, |_, _| {}) {
-                Ok(_session) => eprintln!(
-                    "round {round}: load_model {:7.1} ms  ({})",
-                    t.elapsed().as_secs_f64() * 1000.0,
-                    if round == 1 {
-                        "ONNX transducer init + Silero VAD + file verification"
-                    } else {
-                        "Silero VAD + file verification ONLY — the transducer came from DECODER_CACHE"
-                    }
-                ),
+                Ok(_session) => {
+                    let elapsed = t.elapsed().as_secs_f64() * 1000.0;
+                    ms.push(Some(elapsed));
+                    eprintln!(
+                        "round {round}: load_model {elapsed:7.1} ms  ({})",
+                        if round == 1 {
+                            "ONNX transducer init + Silero VAD + file verification"
+                        } else {
+                            "Silero VAD + file verification ONLY — the transducer came from DECODER_CACHE"
+                        }
+                    );
+                }
                 // Not a panic: a busy or half-installed model directory is a property of the
                 // machine. Later rounds are the interesting ones, so keep going.
-                Err(e) => eprintln!("round {round}: SKIPPED — load_model failed ({e})"),
+                Err(e) => {
+                    ms.push(None);
+                    eprintln!("round {round}: SKIPPED — load_model failed ({e})");
+                }
             }
+        }
+
+        // THE DELTA IS THE ANSWER TO "WHAT DOES THE BOOT PRELOAD BUY?", and it is printed here
+        // rather than in a second test (see the note where that test used to live). Round 1 is what
+        // the FIRST hold pays if nothing preloaded; round 2 is what every hold pays afterwards, so
+        // the difference is the wait the preload moves off the hold path.
+        //
+        // Still no assertion, for this test's stated reason: which rounds succeeded is a property
+        // of the machine. An absent round is reported as absent, never silently treated as zero.
+        match (ms.first().copied().flatten(), ms.get(1).copied().flatten()) {
+            (Some(cold), Some(warm)) => eprintln!(
+                "PRELOAD SAVES: {:7.1} ms  (cold {cold:.1} ms → warm {warm:.1} ms)",
+                cold - warm
+            ),
+            _ => eprintln!(
+                "PRELOAD SAVES: unknown — a round failed above, so there is no cold/warm pair"
+            ),
         }
     }
 

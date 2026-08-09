@@ -209,6 +209,64 @@ pub(crate) fn park_or_take_on_stop(
     }
 }
 
+/// What happens to a capture that has just finished building.
+///
+/// ── WHY THIS IS A CLASSIFIER AND NOT A BOOL (the founder's "it doesn't recognize the mic") ───────
+/// `install_capture` decided this with one `still_current` bool and logged EVERY rejection as
+/// "discarding a capture built during a stop/blur race". That single line covers three unrelated
+/// situations, only ONE of which costs the user their words — and the file's own comment records
+/// that the misattribution "sent two investigations hunting a focus race".
+///
+/// Measured on 2026-08-09, load average 291: the device bound successfully 41/41 times and never
+/// once failed, yet 27 captures were discarded and **at least 12 holds had their first audio sample
+/// arrive AFTER the user had already let go**. `capture_ms` climbed from 232 ms early in the day to
+/// 2083 ms under load, against push-to-talk holds of ~345 ms. So the microphone is neither missing
+/// nor held by another app — it simply cannot come up inside a short hold on a loaded machine, and
+/// the audio is then thrown away. From the user's seat that is indistinguishable from "the mic is
+/// not being recognised", which is exactly how it was reported.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum CaptureFate {
+    /// Intent is still current — install it and start routing.
+    Install,
+    /// THE HOLD PRODUCED NOTHING. The user released (or the window blurred) before this capture
+    /// finished building, and no other capture is live to have caught the words. This is the one
+    /// case that owes the user an explanation, and the one the relay banner must never speak for.
+    MissedTheHold,
+    /// Another capture is already installed and routing, so this one merely lost a build race. The
+    /// user's audio was captured by its sibling — nothing is owed and nothing is lost.
+    LostToASibling,
+    /// The session generation rotated (a stop+start swapped in fresh Arcs), so this capture is stale
+    /// against state nobody holds.
+    Stale,
+}
+
+/// Decide a freshly-built capture's fate. Pure, so the distinction that decides whether the user is
+/// TOLD they lost their words is unit-testable without CoreAudio, an `AppHandle` or a real device.
+///
+/// Argument order mirrors the `still_current` expression it replaces, so the three terms stay
+/// readable against the original: does the session still want a capture, is the slot free, and is
+/// this capture's transcriber still the live generation.
+pub(crate) fn classify_capture_fate(
+    wants_capture: bool,
+    slot_empty: bool,
+    same_generation: bool,
+) -> CaptureFate {
+    if wants_capture && slot_empty && same_generation {
+        return CaptureFate::Install;
+    }
+    // ORDER MATTERS, and it is about who is owed an explanation rather than about precedence in the
+    // boolean sense. A rotated generation is stale whatever else is true — its words belong to a
+    // session the user already left. An occupied slot means a sibling capture caught the audio. Only
+    // once both of those are excluded does a capture that nobody wants mean the user lost anything.
+    if !same_generation {
+        return CaptureFate::Stale;
+    }
+    if !slot_empty {
+        return CaptureFate::LostToASibling;
+    }
+    CaptureFate::MissedTheHold
+}
+
 /// Which generation's `cloud_active` flag guards the park decision.
 ///
 /// `raced_stream_disposition`'s `already_active` term means "never shadow a session that is actively
@@ -1850,13 +1908,24 @@ impl DictationState {
         // fire for the missing-capture path — leaving the (sticky) frontend error latched on a
         // microphone that is working again (roborev 55286).
         let mut retract = false;
+        // How long this capture took to build, read BEFORE the marker is cleared. It is the number
+        // that explains a missed hold — 232 ms idle vs 2083 ms under load — and without it the
+        // report says only "you got nothing" with no account of why.
+        let mut fate = CaptureFate::Install;
+        let mut build_ms: u64 = 0;
         let discard = {
             let mut sess = self.0.lock().unwrap_or_else(|p| p.into_inner());
+            build_ms = sess
+                .build_started_at
+                .map(|t| t.elapsed().as_millis() as u64)
+                .unwrap_or(0);
             sess.build_started_at = None;
-            let still_current = capture_should_be_live(sess.armed, sess.focused)
-                && sess.capture.is_none()
-                && sess.transcriber.as_ref().map(|t| Arc::ptr_eq(t, built_for)).unwrap_or(false);
-            if still_current {
+            fate = classify_capture_fate(
+                capture_should_be_live(sess.armed, sess.focused),
+                sess.capture.is_none(),
+                sess.transcriber.as_ref().map(|t| Arc::ptr_eq(t, built_for)).unwrap_or(false),
+            );
+            if fate == CaptureFate::Install {
                 sess.capture = Some(capture);
                 sess.decode_worker = Some(worker);
                 // Fresh capture → fresh liveness verdict. Carrying the latches over would let a
@@ -1896,7 +1965,44 @@ impl DictationState {
         }; // release the lock before dropping the raced-out capture (its cpal-stream drop touches CoreAudio)
         let mut reissue = false;
         if let Some((capture, worker)) = discard {
-            tracing::info!(target: "dictation", "discarding a capture built during a stop/blur race");
+            // NAME THE ACTUAL CAUSE. This line used to say "discarding a capture built during a
+            // stop/blur race" for all three fates, including the ones where no stop and no blur were
+            // involved — the misattribution this file already records as having sent two
+            // investigations after a focus race that never happened.
+            match fate {
+                CaptureFate::MissedTheHold => {
+                    // THE ONE THAT COSTS THE USER THEIR WORDS, at WARN because it is a user-visible
+                    // failure and these reports arrive hours later from a release build where a
+                    // DEBUG line would not have been recorded.
+                    tracing::warn!(
+                        target: "dictation",
+                        build_ms,
+                        "the microphone finished starting AFTER the hold ended, so this utterance \
+                         captured no audio at all — the capture is being discarded with nothing in it"
+                    );
+                    // Tell the frontend, so it can say THIS rather than let the relay's
+                    // "connected too late" banner speak for a condition it does not cover. That
+                    // banner promises "your words are still captured", which is false here.
+                    let _ = app.emit("dictation://capture-missed", serde_json::json!({ "stage": "capture", "ms": build_ms }));
+                }
+                CaptureFate::LostToASibling => tracing::info!(
+                    target: "dictation",
+                    build_ms,
+                    "a second capture finished after one was already installed; discarding the \
+                     loser — the audio was captured by its sibling, nothing is lost"
+                ),
+                CaptureFate::Stale => tracing::info!(
+                    target: "dictation",
+                    build_ms,
+                    "discarding a capture whose session generation has already rotated"
+                ),
+                // Unreachable: `Install` never produces a discard. Stated rather than omitted so a
+                // future relaxation cannot silently fall into the missed-hold report.
+                CaptureFate::Install => tracing::info!(
+                    target: "dictation",
+                    "discarding a capture that was classified as installable"
+                ),
+            }
             drop(capture);
             drop(worker);
             // ── RE-ISSUE THE RECONCILE THIS BUILD WAS SUPPRESSING (roborev 59586) ───────────────
@@ -2661,6 +2767,70 @@ fn retire_cached_decoder() {
     crate::transcribe::retire_cached_decoder();
     #[cfg(test)]
     DECODERS_RETIRED.fetch_add(1, Ordering::Release);
+}
+
+/// Load the on-device model at STARTUP, in the background, so the first push-to-talk hold does not
+/// have to pay for it.
+///
+/// ── THE MEASURED FAILURE THIS DELETES (the founder's "sometimes it doesn't send anything") ───────
+/// The ONNX recognizer is loaded at most once per process, but it was loaded LAZILY — on the first
+/// arm. So the first hold after every launch raced a model load, and on this machine that load is
+/// not small: measured 2418 ms and 3536 ms on ordinary launches, and **46 258 ms at peak load**
+/// (2026-08-09, load average 291). A push-to-talk hold is a few hundred ms. The hold therefore ends
+/// long before the model exists, `start_after_load` correctly aborts the arm — logged as
+/// `outcome="aborted-post-load"` — and the user gets NOTHING: no capture is ever built, so not one
+/// sample of that utterance is recorded anywhere. It happened **20 times on 2026-08-09 alone**.
+///
+/// It is also why the relay banner was the only thing he saw: the socket opened in ~475 ms, found no
+/// session to install against, and reported "connected too late… your words are still captured" —
+/// while the words had in fact never been captured at all.
+///
+/// Starting the load at boot converts that into a load the user is never waiting on. It cannot make
+/// dictation worse: `MODEL_LOAD` already serializes loads, so a hold that arrives mid-preload blocks
+/// on the same mutex it would have taken anyway and then finds the model ready, and `model::ensure`
+/// short-circuits on files already present. Failures are swallowed on purpose — this is a warm-up,
+/// not a gate, and a first-run machine with no model yet must still reach the download path through
+/// `start_dictation` where the progress events are wired to the UI.
+///
+/// Deliberately NOT gated on the mic being enabled: the cost is one background thread on a file that
+/// is about to be needed, and gating it on `enabled` would leave exactly the cold-start case — the
+/// one that fails — unwarmed.
+pub fn preload_model_in_background(app: AppHandle) {
+    std::thread::Builder::new()
+        .name("dictation-model-preload".into())
+        .spawn(move || {
+            let Ok(root) = crate::dev_identity::app_data_dir(&app).map(|d| d.join("models")) else {
+                return;
+            };
+            // Nothing to warm if the model has never been downloaded: `model::ensure` would fetch
+            // 631 MB here, off the path that reports progress to the UI, so a first-run user would
+            // see an idle app quietly saturating their network. That download belongs to the first
+            // deliberate arm.
+            if !root.exists() {
+                tracing::info!(
+                    target: "dictation",
+                    "skipping model preload: no model on disk yet, so the first arm owns the download"
+                );
+                return;
+            }
+            let t = std::time::Instant::now();
+            match load_model(&root, |_, _| {}) {
+                Ok(_) => tracing::info!(
+                    target: "dictation",
+                    preload_ms = t.elapsed().as_millis() as u64,
+                    "on-device model preloaded at startup; the first hold will not pay for it"
+                ),
+                // Best-effort by design — see the doc comment. `start_dictation` still owns the
+                // real error path, with its progress + `dictation://error` wiring intact.
+                Err(e) => tracing::info!(
+                    target: "dictation",
+                    error = %e,
+                    preload_ms = t.elapsed().as_millis() as u64,
+                    "model preload did not complete; the first arm will load it as before"
+                ),
+            }
+        })
+        .ok();
 }
 
 /// Serializes every test that can DETACH a decode worker.

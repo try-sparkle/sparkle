@@ -91,6 +91,25 @@ export const WARNING: Record<DictationFallbackReason, string> = {
   // trigger shape AGENTS.md warns about — the retry hits the same race.
   "too-slow":
     "Live dictation preview is off — the cloud transcription service connected too late for that utterance, so it was transcribed on the local engine. Your words are still captured; they appear when you finish speaking instead of word by word. Longer utterances usually get the live preview",
+  // ── THE ONE BANNER THAT MUST NOT SAY "YOUR WORDS ARE STILL CAPTURED" ────────────────────────────
+  // Every other string here ends with some form of that sentence, and every one of them is telling
+  // the truth: a relay failure still leaves the on-device engine holding the audio. This condition
+  // is the exception — the microphone had not finished starting when the key came up, so there is no
+  // recording anywhere. Reusing the reassurance here is what made the founder report the mic as
+  // broken while the UI insisted his words were safe.
+  //
+  // SAYS NOTHING ABOUT THE DEVICE, because the device is fine: it bound successfully 41/41 times on
+  // the machine where this was diagnosed while this very condition was firing. Blaming the mic, the
+  // permission, or another app would send the user to check three things that are all working — the
+  // same false-lead shape that made `too-slow` stop mentioning the network.
+  //
+  // THE REMEDY IS REAL AND SAFE UNDER ITS OWN TRIGGER, which `too-slow` deliberately has none of.
+  // There, retrying hits the identical race, so offering one would be the unsafe-remedy shape
+  // AGENTS.md warns about. Here it genuinely works: the capture takes a few hundred ms on an idle
+  // machine and a couple of seconds on a loaded one, so a longer hold clears it every time. It is
+  // still ours to fix properly, which is why the copy owns the failure rather than blaming the user.
+  mic_missed_hold:
+    "That was too quick for the microphone — it was still starting when you let go, so nothing was recorded. Try holding the key a moment longer before you speak. Sparkle is slower to open the mic while your machine is busy",
   // The two conditions that were previously invisible — both reported as a generic outage, sending
   // the user to debug a network that was never the problem.
   signed_out:

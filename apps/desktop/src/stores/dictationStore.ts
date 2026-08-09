@@ -207,6 +207,24 @@ interface DictationState {
   setOnDeviceSpeech: (v: boolean) => void;
   /** Replace the live interim preview (cloud path). Pass "" to clear it. */
   setInterim: (text: string) => void;
+  /**
+   * Everything committed during the CURRENT push-to-talk hold, in order.
+   *
+   * THE FOUNDER'S RECOVERY HATCH, and the reason it lives in the store rather than in a local: the
+   * segments arrive on the controller's event listeners while the flush happens on the phase edge,
+   * two places connected only by this store. He asked for "anything I say with the mic pressed to be
+   * captured in the clipboard" precisely because dictation sometimes delivers nothing — so this must
+   * survive the paths where insertion fails, not ride along with them.
+   *
+   * Runtime only (never in `partialize`): a relaunch must not put last session's speech on the
+   * clipboard.
+   */
+  heldSegments: string[];
+  /** Append a committed segment to the current hold. */
+  appendHeldSegment: (text: string) => void;
+  /** Take everything spoken during this hold, clearing it. Returns "" when nothing was captured —
+   *  which is itself the signal that the hold produced nothing and there is nothing to copy. */
+  takeHeldTranscript: () => string;
   /** Setting a non-null value also transitions status to "error". Clearing with
    *  null only returns to "idle" if we were in the "error" state — an active
    *  "listening" session is left untouched. */
@@ -268,6 +286,18 @@ export const useDictationStore = create<DictationState>()(
       setOnDeviceSpeech: (onDeviceSpeech) =>
         set((s) => (s.onDeviceSpeech === onDeviceSpeech ? s : { onDeviceSpeech })),
       setInterim: (interim) => set({ interim }),
+      heldSegments: [],
+      // Appended even while the mic is routing into a composer, so the clipboard copy is a faithful
+      // record of the whole hold rather than only the parts that failed to land somewhere.
+      appendHeldSegment: (text) =>
+        set((s) => ({ heldSegments: [...s.heldSegments, text] })),
+      takeHeldTranscript: () => {
+        const joined = get().heldSegments.join(" ").replace(/\s+/g, " ").trim();
+        // Clear unconditionally, including when empty: the accumulator belongs to ONE hold, and a
+        // leftover would attach this hold's words to the next one.
+        set({ heldSegments: [] });
+        return joined;
+      },
       setError: (error) =>
         set((s) => ({
           error,

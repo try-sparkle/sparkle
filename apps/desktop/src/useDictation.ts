@@ -17,6 +17,7 @@ import { safeUnlisten } from "./services/safeUnlisten";
 import { selectedProjectName } from "./services/creditProject";
 import { classifyVoiceError, isWatchdogFault } from "./voice/dictationCopy";
 import { peekHoldOriginAge, takeHoldOriginAge } from "./voice/holdOrigin";
+import { copyToClipboard } from "./clipboard";
 import type { Phase } from "./voice/dictationPhase";
 import { routeDictationToTerminal } from "./services/dictationTerminalSink";
 import {
@@ -552,6 +553,40 @@ export async function createDictationController(
       useDictationEngineStore.getState().noteCloudConnectedLate(isCapturable());
     }),
 
+    // ── THE MICROPHONE NEVER STARTED — this hold recorded NOTHING ──────────────────────────────
+    // A DIFFERENT FAILURE FROM THE ONE ABOVE, and conflating the two is what made the founder
+    // report the mic as broken while the UI told him his words were safe. `cloud-late` means the
+    // capture worked and the RELAY lost the race, so the on-device engine still holds the audio.
+    // This means the CAPTURE lost the race: it finished building after the key came up and was
+    // discarded empty, so there is no recording anywhere and no engine to fall back to.
+    //
+    // TWO EMITTERS, AND THE PAYLOAD SAYS WHICH (roborev 61704). Both mean "this hold recorded
+    // nothing", but they fail at different stages and the number means a different thing in each:
+    //
+    //   * `stage: "capture"` — `install_capture`'s `MissedTheHold` arm. The model was ready and the
+    //     CoreAudio stream was still building when the key came up. `ms` is the capture build time.
+    //   * `stage: "model"` — `start_dictation`'s abort-during-load arm. The on-device model itself
+    //     was still loading, so no capture was ever even attempted. `ms` is the model load time.
+    //
+    // A bare number was ambiguous between the two and logged under a `buildMs` key that was simply
+    // wrong for half its senders — which is how a diagnostic quietly starts lying. Never emitted for
+    // a capture that lost to a live sibling or one whose generation had rotated: in neither of those
+    // did the user lose anything.
+    listen<{ stage: "capture" | "model"; ms: number }>("dictation://capture-missed", (e) => {
+      console.info("[dictation] hold recorded nothing", {
+        stage: e.payload?.stage,
+        ms: e.payload?.ms,
+        at: new Date().toISOString(),
+      });
+      // GATED LIKE ITS SIBLINGS (roborev 59964): this is an `app.emit`, so every open window runs
+      // it, and every project window paints its own banner. The claim is about ONE window's hold —
+      // ungated, a hold in window A would paint "nothing was recorded" in B and C, which cannot
+      // take it down because every clearing path needs `isCapturable()`.
+      if (isCapturable()) {
+        useDictationEngineStore.getState().noteMicMissedHold();
+      }
+    }),
+
     // Cloud-only: Deepgram interim results — the live, word-by-word preview. Volatile; replaced in
     // place and never routed through the segment handler (that only acts on committed segments).
     listen<string>("dictation://interim", (e) => {
@@ -1045,6 +1080,34 @@ export async function createDictationController(
           armIdlePark();
         }
       } else if (cmd === "stop_cloud_stream") {
+        // ── THE HOLD IS OVER: PUT WHAT HE SAID ON THE CLIPBOARD ────────────────────────────────
+        // Explicitly asked for, and asked for because dictation sometimes delivers nothing: "I
+        // thought I had asked for anything that I say with the mic pressed to be captured in the
+        // clipboard". So it runs on the RELEASE EDGE itself, not on a successful insert — it has to
+        // work on the paths where insertion never happened.
+        //
+        // GATED ON `isWindowActive()`, matching the `stop_cloud_stream` call below rather than
+        // `isCapturable()`: dropping to passive is itself one of the things that makes a window
+        // uncapturable, so gating on capturability would mean the clipboard is written on no path at
+        // all. Ungated it would be worse than useless — `phase` is a cross-window synced slice, so
+        // every open window would race to write its own copy of the same hold.
+        //
+        // An EMPTY transcript writes nothing and clears nothing. That is the (a) case — the hold
+        // recorded no audio — and silently blanking his clipboard at the exact moment dictation
+        // failed him would destroy whatever he had copied earlier, turning a lost sentence into lost
+        // work. The taking is unconditional (it belongs to one hold); only the write is guarded.
+        if (isWindowActive()) {
+          const spoken = useDictationStore.getState().takeHeldTranscript();
+          if (spoken) {
+            void copyToClipboard(spoken).then((ok) => {
+              console.info("[dictation] hold copied to clipboard", {
+                chars: spoken.length,
+                ok,
+                at: new Date().toISOString(),
+              });
+            });
+          }
+        }
         // Leaving the routing phase closes the socket outright, so there is nothing left to park.
         clearIdlePark();
         // Closing is gated on window ownership only, NOT on `isCapturable()`: dropping to passive
@@ -1268,6 +1331,11 @@ export function useAmbientVoice(): void {
     if (store.phase !== "active") return ctx.terminal ? null : undefined;
     const text = seg.trim();
     if (!text) return ctx.terminal ? null : undefined;
+    // RECORD IT BEFORE ROUTING IT ANYWHERE. The clipboard copy is the founder's recovery hatch for
+    // the holds that deliver nothing, so it must not depend on the delivery succeeding — capturing
+    // after `insert()` would lose exactly the cases it exists for. It also spans BOTH destinations
+    // (composer and terminal), so a hold typed into a PTY is still recoverable.
+    store.appendHeldSegment(text);
     if (ctx.terminal) return text;
     store.insert(text);
     return null;

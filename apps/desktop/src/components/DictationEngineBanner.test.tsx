@@ -85,12 +85,45 @@ describe("DictationEngineBanner", () => {
       const text = screen.getByRole("status").textContent ?? "";
       expect(text).not.toMatch(/HTTP \d|\b4\d\d\b|\b5\d\d\b|websocket|deepgram|sherpa|@/i);
       expect(text).not.toMatch(/your network|you're offline|you are offline|Claude|rate.?limit/i);
+      // ── NARROWED FROM "EVERY REASON" TO "EVERY RELAY REASON" (roborev 61695) ──────────────────
+      // These three sentences are the RELAY fallback's contract: the preview is gone, the local
+      // engine took over, and the words still land. They were asserted over every reason because
+      // until now every reason WAS a relay reason. `mic_missed_hold` is not — the microphone never
+      // started, so there is no preview to lose, no engine that ran, and nothing captured. Asserting
+      // them there would force the banner to state three things that are all false, which is the
+      // exact defect that reason was added to fix.
+      //
+      // The sweep still covers it for the no-raw-errors and no-false-blame rules above; only this
+      // relay-shaped promise is scoped. See the paired test below, which pins the OPPOSITE for the
+      // mic reason so neither can drift into the other's copy.
+      if (reason === "mic_missed_hold") continue;
       // What was LOST and that the words still land — the reason the banner exists at all — must be
-      // said by every reason, not just the two that were written first.
+      // said by every relay reason, not just the two that were written first.
       expect(text).toMatch(/live dictation preview is off/i);
       expect(text).toMatch(/local engine/i);
       expect(text).toMatch(/still captured/i);
     }
+  });
+
+  it("NEVER tells a user their words were captured when the mic never started", () => {
+    // THE PAIRED OPPOSITE of the sweep above, and the whole point of the reason existing. The
+    // founder reported "it doesn't seem to be recognizing the mic" while the UI showed him a banner
+    // promising his words were safe — they were not, because no capture was ever built. A copy that
+    // reassures here is worse than no banner: it tells him to go looking for a transcript that does
+    // not exist.
+    //
+    // Asserted as an ABSENCE plus a positive claim, because absence alone would pass against an
+    // empty string.
+    useDictationEngineStore.setState({ fallbackReason: "mic_missed_hold", dismissed: false });
+    render(<DictationEngineBanner />);
+    const text = screen.getByRole("status").textContent ?? "";
+    expect(text).not.toMatch(/still captured/i);
+    expect(text).not.toMatch(/local engine/i);
+    // It must say what actually happened...
+    expect(text).toMatch(/nothing was recorded/i);
+    // ...and must not blame the device, the permission, or another app: all three were verified
+    // working while this fired (the input device bound 41/41 times with zero failures).
+    expect(text).not.toMatch(/permission|another app|no microphone|not found|unavailable/i);
   });
 
   // EACH REASON MUST SAY SOMETHING DIFFERENT, or naming the cause bought nothing: the whole point of

@@ -304,7 +304,19 @@ pub async fn start_dictation(
         StartAfterLoad::AbortMutedDuringLoad => {
             // The user muted mid-download: a stop advanced the epoch after we sampled it. Do NOT
             // re-arm (that's the resurrect race) — our freshly loaded transcriber drops here.
-            tracing::info!(target: "dictation", "start_dictation aborted: a stop landed during model load (mic stays muted)");
+            // WARN, NOT INFO, AND NAMED FOR WHAT THE USER LOST. The abort itself is correct — this
+            // is the resurrect-race guard doing its job — but its CONSEQUENCE is a hold that
+            // recorded nothing at all: the model was still loading when the key came up, so no
+            // capture was ever built and not one sample of that utterance exists anywhere.
+            // Measured 20 times on 2026-08-09, with model loads of 2.4 s to 46 s against holds of a
+            // few hundred ms. `preload_model_in_background` is what removes the cause; this is what
+            // makes the occurrence legible when it still happens.
+            tracing::warn!(
+                target: "dictation",
+                model_ms,
+                "the on-device model was still loading when the hold ended, so this utterance \
+                 recorded no audio at all (mic stays muted; the arm is correctly abandoned)"
+            );
             // Same two caveats as the pre-load abort above: `sess` is still held (drop it before any
             // webview emit — sparkle-sfxu), and this leaves the ring optimistically claiming to
             // listen until the `[enabled]` effect settles it.
@@ -317,6 +329,20 @@ pub async fn start_dictation(
                 total_ms = t_cmd.elapsed().as_millis() as u64,
                 "start_dictation timing"
             );
+            // RELEASE THE SESSION LOCK BEFORE THE EMIT — the rule stated three lines above, which
+            // the first version of this arm broke by emitting inside the critical section (roborev
+            // 61704). `app.emit` hops to the webview/main thread, so holding the session mutex
+            // across it lets a main-thread path that wants the same lock deadlock against us — the
+            // sparkle-sfxu hazard every other emit in this file is careful to stay outside of.
+            // Explicit `drop` rather than a scope, so the ordering is visible at the call site
+            // instead of implied by brace placement.
+            drop(sess);
+            // Tell the frontend it lost this hold, on the SAME channel `install_capture` uses for a
+            // capture that finished too late. Without it the only thing the user sees is the relay's
+            // "connected too late — your words are still captured" banner, which on this path is
+            // false twice over: the words were never captured, and the relay was never the problem.
+            // `model_ms` rather than a build duration: it is the number that explains this failure.
+            let _ = app.emit("dictation://capture-missed", serde_json::json!({ "stage": "model", "ms": model_ms }));
             return Ok(());
         }
         StartAfterLoad::AlreadyArmed => {

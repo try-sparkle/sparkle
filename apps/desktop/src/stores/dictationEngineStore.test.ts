@@ -731,4 +731,51 @@ describe("noteCloudOutcome — what the seam actually does with an outcome", () 
       expect(classifyCloudOutcome(o)).toBeDefined();
     }
   });
+
+});
+
+describe("a mic failure is not a relay verdict (roborev 61695)", () => {
+  beforeEach(() => {
+    useDictationEngineStore.setState({
+      fallbackReason: null,
+      observedAt: null,
+      dismissed: false,
+      openRefusals: 0,
+    });
+  });
+
+  it("does NOT reset the relay corroboration counter", () => {
+    // The counter exists to corroborate an ambiguous `unreachable` from the RELAY. A microphone
+    // that never started is no evidence at all about the relay, so zeroing it here discards genuine
+    // relay evidence and makes the next real outage take an extra refusal to report. This is the
+    // conflation the `mic_missed_hold` reason was added to delete, pointing the other way.
+    useDictationEngineStore.setState({ openRefusals: 1 });
+    useDictationEngineStore.getState().noteMicMissedHold();
+    expect(useDictationEngineStore.getState().openRefusals).toBe(1);
+    expect(useDictationEngineStore.getState().fallbackReason).toBe("mic_missed_hold");
+  });
+
+  it("still OUTRANKS a standing relay reason, because losing the whole utterance is worse", () => {
+    // Losing every word beats losing the live preview of words that were captured, so the mic
+    // condition wins the banner — it just does not pretend to be a relay verdict to do it.
+    useDictationEngineStore.getState().noteCloudUnavailable("too-slow");
+    useDictationEngineStore.getState().noteMicMissedHold();
+    expect(useDictationEngineStore.getState().fallbackReason).toBe("mic_missed_hold");
+  });
+
+  it("stamps itself so it can go stale like any other observation", () => {
+    // An unstamped notice can never be taken down by `isStale` (observedAt === null is never
+    // stale), so it would stand for the rest of the run over a microphone that started working.
+    useDictationEngineStore.getState().noteMicMissedHold();
+    expect(useDictationEngineStore.getState().observedAt).toEqual(expect.any(Number));
+  });
+
+  it("does not inherit a dismissal from a DIFFERENT reason", () => {
+    // Dismissing the relay banner must not pre-dismiss the first "nothing was recorded" notice —
+    // that would silence the more severe condition the user has never seen.
+    useDictationEngineStore.getState().noteCloudUnavailable("too-slow");
+    useDictationEngineStore.setState({ dismissed: true });
+    useDictationEngineStore.getState().noteMicMissedHold();
+    expect(useDictationEngineStore.getState().dismissed).toBe(false);
+  });
 });

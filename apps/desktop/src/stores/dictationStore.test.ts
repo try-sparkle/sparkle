@@ -150,4 +150,50 @@ describe("dictationStore — mic master-mute transitions are logged", () => {
     vi.advanceTimersByTime(OUT_OF_CREDITS_NOTICE_MS);
     expect(log.info).not.toHaveBeenCalled();
   });
+
+  describe("the held-hold transcript (the founder's clipboard recovery hatch)", () => {
+    beforeEach(() => {
+      useDictationStore.setState({ heldSegments: [] });
+    });
+
+    it("accumulates everything spoken during one hold, in order", () => {
+      const s = useDictationStore.getState();
+      s.appendHeldSegment("open the");
+      s.appendHeldSegment("pod bay doors");
+      expect(useDictationStore.getState().takeHeldTranscript()).toBe("open the pod bay doors");
+    });
+
+    it("belongs to ONE hold — taking clears it, so the next hold cannot inherit these words", () => {
+      // The failure this prevents is the worst kind for a clipboard feature: a hold that recorded
+      // nothing would otherwise copy the PREVIOUS hold's sentence, and the user would paste words
+      // they did not just say without any signal that it was stale.
+      const s = useDictationStore.getState();
+      s.appendHeldSegment("first hold");
+      expect(useDictationStore.getState().takeHeldTranscript()).toBe("first hold");
+      expect(useDictationStore.getState().takeHeldTranscript()).toBe("");
+      expect(useDictationStore.getState().heldSegments).toEqual([]);
+    });
+
+    it("reports an empty string for a hold that recorded nothing", () => {
+      // This is the (a) case — the mic never started. The empty result is what the release edge
+      // keys on to leave the clipboard ALONE, rather than blanking whatever he had copied earlier
+      // at the exact moment dictation failed him.
+      expect(useDictationStore.getState().takeHeldTranscript()).toBe("");
+    });
+
+    it("normalises whitespace so a paste is not littered with the segment boundaries", () => {
+      const s = useDictationStore.getState();
+      s.appendHeldSegment("  ragged   spacing ");
+      s.appendHeldSegment("\nand a newline");
+      expect(useDictationStore.getState().takeHeldTranscript()).toBe("ragged spacing and a newline");
+    });
+
+    it("is NOT persisted — a relaunch must not put last session's speech on the clipboard", () => {
+      // partialize keeps only `enabled` and `phase`; anything else surviving a relaunch would mean
+      // the first release after launch copies words spoken before the app was quit.
+      useDictationStore.getState().appendHeldSegment("secret");
+      const persisted = JSON.parse(localStorage.getItem(DICTATION_PERSIST_KEY) ?? "{}");
+      expect(persisted.state?.heldSegments).toBeUndefined();
+    });
+  });
 });

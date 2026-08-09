@@ -495,6 +495,10 @@ pub fn run() {
             // the stream had been created. Started unconditionally: it is one sleeping thread, and
             // it no-ops whenever there is no capture to watch.
             dictation::start_audio_watchdog(app.handle().clone());
+            // Warm the on-device model NOW rather than on the first hold. Lazily loaded, it cost
+            // 2.4-46 s (measured) at exactly the moment a push-to-talk hold needs it, so the hold
+            // ended first and the utterance was never recorded — 20 times on 2026-08-09 alone.
+            dictation::preload_model_in_background(app.handle().clone());
             // Hidden transparent capture window (menu-bar capture flow). Best-effort:
             // a failure only loses the capture feature, never blocks boot.
             if let Err(e) = capture_window::init_capture_window(app.handle()) {
