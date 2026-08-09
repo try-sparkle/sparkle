@@ -37,6 +37,10 @@ import type { StatusBand } from "../engine/buildSections";
 // for `MicIntent`, which reaches theme/colors — and theme/theme.ts imports this store.
 import type { SendMode } from "../voice/sendMode";
 import { assignToSide, pruneAssignment, type PairSide } from "../engine/pairs";
+// THE work-mode union, declared once in `engine/workMode` and re-exported below for the callers
+// that import it from here. Type-only, so it is erased and cannot participate in a cycle (that
+// module imports nothing at all, so there is no cycle to participate in either).
+import type { WorkMode } from "../engine/workMode";
 
 // Settings-dialog category ids. Defined HERE (not SettingsDialog.tsx) so the store never depends
 // on a component file — SettingsDialog imports and re-exports it for its own consumers.
@@ -68,6 +72,11 @@ export type CategoryId =
  *  uses this shape on the write side and `merge` deletes them on the read side; a key present in one
  *  place and missing from the other is how a transient flag comes back to life on the next launch. */
 const TRANSIENT_UI_KEYS = [
+  // AND IT MUST STAY HERE NOW THAT "preview" IS A MODE. A restored Plan mode was merely a surprise;
+  // a restored Preview mode is a pane pointing at a dev server that DIED with the last process —
+  // the preview registry is swept at startup, so there is nothing behind the frame and the column
+  // opens on a blank error with no memory of anyone asking for it. Transient is the only correct
+  // answer for a mode whose content is owned by a child process.
   "workModeBySide",
   "buildAgentHover",
   "boardFocusBeadId",
@@ -214,11 +223,17 @@ export type ThemePref = "auto" | "light" | "dark";
 // chiclets now call `isolateStatusBand`, so their effect lands in the SAME `statusFilter` the chips
 // render: clicking one is visibly a filter, and clearing it is the ordinary "Show all".
 
-// Sidebar workflow mode — which of the Plan / Build chevrons is active. Lifted out of
+// Sidebar workflow mode — which of the Plan / Build / Preview surfaces is active. Lifted out of
 // AgentSidebar's local state into the store so other components can switch tabs by calling
 // setWorkMode. Deliberately NOT persisted (see partialize) so it defaults to "build" on every
 // launch, exactly as the old local useState default did.
-export type WorkMode = "plan" | "build";
+//
+// RE-EXPORTED, NOT RE-DECLARED. This used to be a second `export type WorkMode = "plan" | "build"`
+// sitting beside `engine/workMode`'s copy, with different files importing different ones — so the
+// two could be widened apart and the mismatch would only surface wherever a value crossed between
+// them. `engine/workMode` is the source (it has no imports, so it can never close a cycle); this
+// line keeps every existing `import type { WorkMode } from "../stores/uiStore"` working.
+export type { WorkMode } from "../engine/workMode";
 
 // PER COLUMN, NOT PER WINDOW. This was a single `workMode: WorkMode` for both pairs, and paired
 // with a global `activeSpecial === "board"` it made the Plan board a SINGLETON: the left column's
@@ -335,6 +350,10 @@ interface UiState {
   /** The mirror: put a column into Build **and** make its stage actually visible. Same rule —
    *  anything meaning "show me the terminal/rows" uses this, not a bare `setWorkMode`. */
   showBuildStage: (side: PairSide) => void;
+  /** The THIRD member of that family: put a column into Preview **and** make its slot actually
+   *  visible. Same rule and the same reason — see `openPlanBoard`. Entering a mode is two writes
+   *  and exactly one place may know that. */
+  openPreview: (side: PairSide) => void;
   // One-shot "open this bead's detail when the board shows it" handoff (spec §8: clicking an
   // orchestrator's epic pill jumps to the Plan board with that epic's DetailOverlay open). Set by
   // the pill, consumed-then-cleared by BoardView once the bead is present. Transient — NOT persisted.
@@ -709,6 +728,20 @@ export const useUiStore = create<UiState>()(
       // Improve Sparkle never touches the mode.
       showBuildStage: (side) => {
         get().setWorkMode(side, "build");
+        if (side === SPARKLE_PANE_SIDE) set({ activeSpecial: null });
+      },
+      // THE SAME PAIRING FOR PREVIEW, for the same reason and with the same scope. The preview slot
+      // covers the pair exactly as the board does, and the Improve-Sparkle pane renders into that
+      // pair's stage — so a caller that set the mode alone would get the half state this family
+      // exists to prevent: the chevron on Preview while the Sparkle terminal keeps the stage, with
+      // `reconcileWorkMode` answering null (a special is up) so nothing recovers it.
+      //
+      // NOTE what this does NOT do: it does not start a server. Opening the pane and opening a
+      // preview process are different acts with different owners — `services/preview.openPreview`
+      // is the one that talks to Rust — and conflating them here would make a mode flip spawn a
+      // node process. The slot renders the CURRENT state of that agent's preview, whatever it is.
+      openPreview: (side) => {
+        get().setWorkMode(side, "preview");
         if (side === SPARKLE_PANE_SIDE) set({ activeSpecial: null });
       },
       setWorkMode: (side, m) =>

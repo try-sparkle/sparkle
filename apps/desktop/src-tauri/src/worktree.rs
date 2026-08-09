@@ -233,7 +233,12 @@ const DRAIN_BUF_CAP: usize = RELEASE_DRAIN_BUF_CAP;
 const DRAIN_BUF_CAP: usize = 512 << 10;
 
 /// One pipe's drain: the shared buffer and the two ways its contents can be INCOMPLETE.
-struct Drain {
+///
+/// `Clone` because a long-lived supervised child (`preview.rs`) hands one handle to the thread that
+/// watches it and keeps another to read a stderr tail from — every field is an `Arc`, so both handles
+/// name the same buffer rather than a copy that would silently stop updating.
+#[derive(Clone)]
+pub(crate) struct Drain {
     buf: Arc<Mutex<Vec<u8>>>,
     /// Set once the cap forced bytes out of the buffer. The thread keeps reading (so the child
     /// never blocks on a full pipe) and keeps the tail; this flag is what stops the loss from
@@ -256,7 +261,7 @@ struct Drain {
 /// The buffer is shared (rather than returned via `join`) precisely so the caller never has to join
 /// to get the bytes: on a wedged pipe we abandon the thread and still report everything read so far.
 /// Chunked reads (not `read_to_end`) are what make that snapshot non-empty.
-fn spawn_drain<R: std::io::Read + Send + 'static>(
+pub(crate) fn spawn_drain<R: std::io::Read + Send + 'static>(
     pipe: Option<R>,
 ) -> (Drain, std::thread::JoinHandle<()>) {
     let buf = Arc::new(Mutex::new(Vec::new()));
@@ -310,6 +315,16 @@ fn spawn_drain<R: std::io::Read + Send + 'static>(
     (Drain { buf, truncated, read_error, abandoned }, handle)
 }
 
+impl Drain {
+    /// Read what has accumulated so far WITHOUT abandoning the drain, so the thread keeps retaining
+    /// the tail. [`take_drained`] is the one-shot form for a command that has finished; a supervised
+    /// server is still running and may be asked for its stderr tail more than once (a failed start,
+    /// then a crash), so it needs the non-destructive read.
+    pub(crate) fn snapshot(&self) -> Vec<u8> {
+        self.buf.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
 /// Take whatever a drain thread has read so far, and tell it to stop retaining: this is the last
 /// read of that buffer, so anything it kept afterwards would be unreachable bytes held for as long
 /// as whatever is holding the pipe open lives.
@@ -343,7 +358,7 @@ fn take_drained(drain: &Drain) -> Vec<u8> {
 /// Non-unix falls back to `try_wait` (which does reap): there is no group kill on that path, so
 /// nothing depends on the pid staying reserved, and a later `Child::wait` still returns the status
 /// std cached at the reap.
-fn exited_without_reaping(child: &mut std::process::Child) -> Result<bool, String> {
+pub(crate) fn exited_without_reaping(child: &mut std::process::Child) -> Result<bool, String> {
     #[cfg(unix)]
     {
         let pid = child.id() as libc::id_t;

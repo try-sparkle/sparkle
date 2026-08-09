@@ -922,12 +922,45 @@ const MAX_SCAN_DIRS: usize = 750;
 /// beats no detection. Pure w.r.t. the filesystem it's handed, so it's tested against fixture dirs.
 pub fn detect_project_languages(root: &Path) -> BTreeSet<ProjectLanguage> {
     let mut found: BTreeSet<ProjectLanguage> = BTreeSet::new();
+    bounded_scan(root, &mut |_dir: &Path, name: &str, _is_dir: bool| {
+        if let Some(lang) = language_for_manifest(name) {
+            found.insert(lang);
+        }
+        // Nothing more to learn once every language is accounted for.
+        if found.len() == ProjectLanguage::ALL.len() {
+            ScanFlow::Stop
+        } else {
+            ScanFlow::Continue
+        }
+    });
+    found
+}
+
+/// Whether [`bounded_scan`] should keep walking after this entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanFlow {
+    Continue,
+    Stop,
+}
+
+/// The bounded breadth-first manifest walk, with the visitor supplied by the caller.
+///
+/// Extracted from [`detect_project_languages`] so `preview.rs` can enumerate a monorepo's
+/// `package.json` files under the SAME bounds rather than writing a second walk with its own depth,
+/// count and skip-list to get subtly different. The bounds are the point: `MAX_SCAN_DEPTH` reaches
+/// `apps/<app>/package.json` (the shape this very repo uses) and `MAX_SCAN_DIRS` stops a
+/// pathological repo turning detection into a long filesystem walk.
+///
+/// The visitor is called once per directory entry with `(containing dir, entry name, is_dir)`, and
+/// returning [`ScanFlow::Stop`] ends the whole walk. An unreadable directory is skipped rather than
+/// failing the scan — partial detection beats no detection.
+pub fn bounded_scan(root: &Path, visit: &mut dyn FnMut(&Path, &str, bool) -> ScanFlow) {
     let mut queue: VecDeque<(PathBuf, usize)> = VecDeque::new();
     queue.push_back((root.to_path_buf(), 0));
     let mut visited = 0usize;
 
-    while let Some((dir, depth)) = queue.pop_front() {
-        if visited >= MAX_SCAN_DIRS || found.len() == ProjectLanguage::ALL.len() {
+    'walk: while let Some((dir, depth)) = queue.pop_front() {
+        if visited >= MAX_SCAN_DIRS {
             break;
         }
         visited += 1;
@@ -937,16 +970,15 @@ pub fn detect_project_languages(root: &Path) -> BTreeSet<ProjectLanguage> {
         for entry in entries.flatten() {
             let raw_name = entry.file_name();
             let name = raw_name.to_string_lossy();
-            if let Some(lang) = language_for_manifest(&name) {
-                found.insert(lang);
-            }
             let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            if visit(&dir, &name, is_dir) == ScanFlow::Stop {
+                break 'walk;
+            }
             if is_dir && depth < MAX_SCAN_DEPTH && !should_skip_scan_dir(&name) {
                 queue.push_back((entry.path(), depth + 1));
             }
         }
     }
-    found
 }
 
 // ---------------------------------------------------------------------------

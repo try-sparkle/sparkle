@@ -3,6 +3,7 @@
 // modal + lifecycle shell-outs live in components/AgentSidebar.tsx + CloseAgentPrompt.tsx.
 import { stageIndex, type WorkflowStageId } from "./workflowStage";
 import { firstVisibleAgentId } from "./agentOrdering";
+import type { WorkMode } from "./workMode";
 import type { BranchStatus } from "../services/branchStatus";
 import type { AgentKind } from "../types";
 
@@ -155,7 +156,7 @@ export function selectionAfterClose<T extends CloseSelectionAgent>(
   selectedId: string | null,
   agentsBefore: readonly T[],
   agentsAfter: readonly T[],
-  mode: "plan" | "build",
+  mode: WorkMode,
   // The genuinely-first VISIBLE row, supplied by the caller when it knows the rendered ladder order
   // and the active status filter (the sidebar does; other callers don't). Falls back to the first
   // top-level agent in array order. Threading it as a value — rather than re-deriving an ordering

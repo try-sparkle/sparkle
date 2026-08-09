@@ -31,6 +31,10 @@ import { useNewBuildAgentDrop } from "../hooks/useNewBuildAgentDrop";
 import { AgentSidebar } from "./AgentSidebar";
 import { PLAN_COLUMN_Z } from "./layers";
 import { PlanBuildToggle } from "./PlanBuildToggle";
+// IN ITS OWN FILE, unlike `PlanBoardSlot` directly below — this file is already 2300+ lines, and
+// the preview slot brings an iframe whose attributes carry a security argument that deserves to be
+// read on its own. The two are otherwise the same component shape; see PreviewSlot's header.
+import { PreviewSlot } from "./PreviewSlot";
 import { BoardFilterBar } from "./BoardFilterBar";
 import { ProjectTabsBar } from "./ProjectTabsBar";
 import { OfflineBanner } from "./OfflineBanner";
@@ -92,6 +96,7 @@ import {
   type PairAssignment,
 } from "../engine/pairs";
 import { planBoardUp } from "../engine/planBoard";
+import { previewSlotUp } from "../engine/previewSlot";
 import { decidePromptTarget, resolvePinnedProjectId } from "../engine/shellResolve";
 import {
   markProjectVisited,
@@ -111,6 +116,7 @@ import { startPresenceTracking } from "../stores/presenceStore";
 import { startOrchestrationListener } from "../services/orchestrationListener";
 import { startControlListener } from "../services/controlListener";
 import { startAiServiceHealthListener } from "../services/aiServiceHealthListener";
+import { listPreviews, startPreviewListener } from "../services/preview";
 import { closeScopeProjectNames, killAllOpenAgents, planWindowClose } from "../services/windowClose";
 import { clearWindowProject } from "../services/windowRegistry";
 import { clearWindowRoster } from "../services/attention";
@@ -862,6 +868,33 @@ export function Workspace() {
     };
   }, [isMainWindow]);
 
+  // SUBSCRIBE TO PREVIEW STATE, NEVER POLL. Rust emits `preview:state` on every transition, and the
+  // interesting moments of a dev server's life — bound a port, finished the first compile, crashed —
+  // are exactly the ones a poll interval smears into "something changed at some point". Same shape
+  // as the three listeners above: own singleton guard, `unmounted` flag for the start race, and
+  // main-window only because Tauri emits app-globally.
+  //
+  // The `listPreviews()` after it is the RECONCILIATION read, and it is not redundant: events tell
+  // you about transitions from now on, so a window that mounts after the servers did would show
+  // nothing for previews that are already serving. Ordered after the subscribe on purpose — the
+  // other order has a gap in which a transition can land between the list and the listen.
+  useEffect(() => {
+    if (!isMainWindow) return;
+    let cleanup: (() => void) | undefined;
+    let unmounted = false;
+    void startPreviewListener()
+      .then((c) => {
+        if (unmounted) c();
+        else cleanup = c;
+        return listPreviews();
+      })
+      .catch((e: unknown) => console.debug("[preview] listener failed to start:", e));
+    return () => {
+      unmounted = true;
+      cleanup?.();
+    };
+  }, [isMainWindow]);
+
   // Reap orphaned per-window Sparkle worktrees left behind by the old multi-window shell: each
   // secondary window (`win-<uuid>`) cut its own Sparkle worktree, and those windows no longer exist,
   // so their worktrees would sit there forever. Sweep them on boot — once, from the app window,
@@ -1565,6 +1598,17 @@ export function Workspace() {
   // user's Plan choice: leaving Sparkle brings their board back.
   const boardActive = planBoardUp(workModeBySide.right, !!project, beadsEnabled) && !sparkleActive;
   const leftBoardActive = planBoardUp(workModeBySide.left, !!leftProject, beadsEnabled);
+  // THE SAME QUESTION FOR THE PREVIEW SLOT, per column, and it carries the same `!sparkleActive`
+  // term as the board for the same reason: the slot and the Improve-Sparkle pane render into the
+  // same pair, and without it the pane would mount INVISIBLY behind the slot (it paints at
+  // TERMINAL_PANE_Z, the slot at PLAN_COLUMN_Z), so clicking Improve Sparkle would look like it did
+  // nothing. Gating the RENDER rather than forcing the column out of Preview keeps the user's
+  // choice — leaving Sparkle brings their preview back.
+  //
+  // These can never be true at the same time as their board twin: one `workMode` per side, and
+  // "plan" and "preview" are two of its values. That is what lets both slots share PLAN_COLUMN_Z.
+  const previewActive = previewSlotUp(workModeBySide.right, !!project) && !sparkleActive;
+  const leftPreviewActive = previewSlotUp(workModeBySide.left, !!leftProject);
 
   // Is the selected agent actually ON SCREEN? `project.selectedAgentId` stays non-null while the
   // Plan board or the Improve Sparkle pane is showing, and while the agent's tab isn't open at all.
@@ -1580,7 +1624,13 @@ export function Workspace() {
   // typed at the Plan board from landing in an unseen terminal — it now admits the sparkle pane
   // BECAUSE it is on screen, gated on `sparkleOpen` so a mount whose PTY has not come up yet still
   // routes to the brain (recoverable) rather than a terminal that isn't there.
-  const promptTargetShown = sparkleActive ? sparkleOpen : !boardActive && activeIsOpen;
+  // `!previewActive` alongside `!boardActive`, and for the identical reason spelled out above: the
+  // preview slot COVERS the pair, so the selected agent's terminal is off screen exactly as it is
+  // under the board. Without this term an imperative typed while watching the preview would be
+  // written into a terminal the user cannot see.
+  const promptTargetShown = sparkleActive
+    ? sparkleOpen
+    : !boardActive && !previewActive && activeIsOpen;
 
   // Calm terminal (PRD §3 / prototype `.terminal.calm`): when the agent you're looking at has
   // nothing for you, its terminal TEXT desaturates, so only a screen that wants something from you
@@ -1627,10 +1677,20 @@ export function Workspace() {
   const paneStages = useMemo(() => ({ left: leftStage, right: rightStage }), [leftStage, rightStage]);
   const paneVisibleAgentId = useMemo(
     () => ({
-      left: leftBoardActive ? null : leftActiveAgentId,
-      right: sparkleActive || boardActive ? null : activeAgentId,
+      // Both covering surfaces, not just the board — a pair showing its preview has no visible
+      // agent pane either, and a stale id here is what routes a message into an unseen terminal.
+      left: leftBoardActive || leftPreviewActive ? null : leftActiveAgentId,
+      right: sparkleActive || boardActive || previewActive ? null : activeAgentId,
     }),
-    [leftBoardActive, leftActiveAgentId, sparkleActive, boardActive, activeAgentId],
+    [
+      leftBoardActive,
+      leftPreviewActive,
+      leftActiveAgentId,
+      sparkleActive,
+      boardActive,
+      previewActive,
+      activeAgentId,
+    ],
   );
   const paneCalm = useMemo(() => ({ left: false, right: terminalCalm }), [terminalCalm]);
 
@@ -1774,7 +1834,13 @@ export function Workspace() {
             <MemoAgentSidebar
               project={leftProject}
               slotSide="left"
-              covered={leftBoardActive}
+              // COVERED BY EITHER SLOT. `covered` is what makes the hidden column UNREACHABLE
+              // rather than merely unpainted — without it Tab walks controls nobody can see, AT
+              // announces two identical mode toggles, and the ⌃-hint overlay draws a chiclet whose
+              // key fires the HIDDEN button (its handler takes the first match in DOM order). That
+              // was roborev 57292 for the board; the preview slot carries its own toggle for the
+              // same reason and so reproduces it exactly.
+              covered={leftBoardActive || leftPreviewActive}
               showSparkleRow={false}
             />
             {/* NO `AgentPaneList` HERE. The panes are mounted once, elsewhere, and portalled in —
@@ -1806,6 +1872,12 @@ export function Workspace() {
                 item and the two columns underneath keep their widths. Its project is its own;
                 nothing about it is shared with the right pair's board. */}
             {leftBoardActive && leftProject && <PlanBoardSlot project={leftProject} side="left" />}
+            {/* THE LEFT PAIR'S PREVIEW — a sibling of the board above and of both columns, never a
+                child of the stage. Same geometry, same z, and mutually exclusive with the board by
+                construction (one mode per side), so the two conditions can never both hold. */}
+            {leftPreviewActive && leftProject && (
+              <PreviewSlot project={leftProject} side="left" />
+            )}
           </Pair>
         )}
         {/* ① The persistent cross-project concierge column. Unconditional — the concierge IS the
@@ -1965,7 +2037,7 @@ export function Workspace() {
           {/* ② Builder agents. The sidebar owns the Plan/Build toggle as its header in BUILD mode;
               in Plan the board is painted over this whole column and carries its own, so this one
               goes unreachable rather than merely invisible — see AgentSidebar's `covered`. */}
-          <MemoAgentSidebar project={sidebarProject} covered={boardActive} />
+          <MemoAgentSidebar project={sidebarProject} covered={boardActive || previewActive} />
           {/* ③ The terminal stage. Darkest layer; the selected agent row docks into it (the row
               paints in C.forest too, so the join is seamless).
 
@@ -2122,6 +2194,8 @@ export function Workspace() {
               over the terminal alone. Last child, so it paints over the stage's empty-state hints
               and the portalled panes as well as the Build column. */}
           {boardActive && project && <PlanBoardSlot project={project} side="right" />}
+          {/* ...and the right pair's preview, on the same terms as its board. */}
+          {previewActive && project && <PreviewSlot project={project} side="right" />}
         </Pair>
       </div>
 

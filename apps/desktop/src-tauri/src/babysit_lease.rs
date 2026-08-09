@@ -473,7 +473,7 @@ fn is_same_file(file: &std::fs::File, path: &Path) -> bool {
 /// Idempotent and cheap after the first call. A failure is not fatal: it costs us the veto (other
 /// instances may declare our leases dead by epoch), which is the same exposure as before this
 /// mechanism existed — so it must not block the operation the caller actually asked for.
-fn hold_instance_lock(app_data: &Path, epoch: &str) {
+pub(crate) fn hold_instance_lock(app_data: &Path, epoch: &str) {
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;

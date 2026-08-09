@@ -366,11 +366,33 @@ function isApprovalKey(path: string): boolean {
  * before it is drivable; a stale refusal that names the honored set is a far better failure than a
  * silent one.
  */
+/** `[preview]` keys that ARE mirrored into the merged config, so this tool can read them back. */
+const PREVIEW_MERGED_KEYS: readonly string[] = [
+  "preview.enabled",
+  "preview.idle_grace_min",
+  "preview.auto_open",
+];
+
+/** `[preview]` detection overrides — read off the project file directly by `preview.rs`, never
+ *  merged into `SparkleConfig`, so this tool must not pretend to own them. See the refusal in
+ *  `projectSectionProblem`. */
+const PREVIEW_HAND_WRITTEN_KEYS: readonly string[] = [
+  "preview.command",
+  "preview.args",
+  "preview.path",
+  "preview.port",
+];
+
 const PROJECT_HONORED_SECTIONS: readonly string[] = [
   "workflow",
   "plugins",
   "freshness",
   "worktree_pool",
+  // Whether a project is worth previewing — and how eagerly — is a property of the project, so
+  // `apply_preview` runs in BOTH arms of build_effective (config.rs). Without this entry the
+  // concierge refuses a write that Rust would honor: exactly the stale refusal the note above
+  // predicts, and the failure it exists to prevent.
+  "preview",
   "approvals",
   "done",
   "delivered",
@@ -414,11 +436,43 @@ const PROJECT_IGNORED_SECTIONS: Record<string, string> = {
  * misspelled key can already be sitting in a project file (hand-written, left by an older build,
  * or written by this tool before this check existed). Refusing to delete it would strand it there.
  */
-function projectSectionProblem(path: string): string | null {
+function projectSectionProblem(path: string, value?: unknown): string | null {
   const key = path.trim();
+  // `[preview].enabled` may only NARROW at project scope: config.rs's `apply_preview` ignores a
+  // project `true` so a cloned repo cannot re-enable a preview the user turned off globally. A
+  // write of `true` here would therefore land in the file and change nothing — the silent no-op
+  // this module exists to prevent, and the same shape as the `[approvals]` carve-out above, where
+  // the caller's belief is about safety rather than preference.
+  //
+  // THE COPY STATES ONLY WHAT IS INVARIANT. It used to add "cannot turn it back on for a user who
+  // disabled it globally. Set it in the global config instead." — which asserts a global state this
+  // function never reads, and the preview is ON by default. A user whose preview is already on,
+  // asking to pin it for one project, was told a fact about their config that was false and sent to
+  // change a setting that already had the value they wanted. `config.rs`'s sibling warning was
+  // narrowed to fire only when the preview really is globally off; this path cannot make that
+  // distinction (it has no effective value in hand), so it says the thing that is true either way:
+  // a project file cannot RAISE `preview.enabled`, so writing `true` there is a no-op at any global
+  // setting.
+  if (key === "preview.enabled" && value === true) {
+    return "preview.enabled = true is a no-op in a project's .sparkle/config.toml — a project file can only turn the preview OFF for itself, never on, so writing true there would land in the file and change nothing. If the preview is already enabled globally (the default), this project already has it.";
+  }
   const section = key.split(".")[0] ?? "";
   if (section === "approvals" && !isApprovalKey(key)) {
     return `${key} is not an auto-approve rule. The rules are: ${APPROVAL_KEYS.join(", ")}.`;
+  }
+  // `[preview]` is the first honored section whose keys are NOT all mirrored into the merged
+  // SparkleConfig, so the section-level allowlist above cannot see the difference. The detection
+  // overrides are read straight off the project's own file by preview.rs and never reach
+  // `PreviewConfig`, so a write here would pass every check, land in the file, and then be
+  // reported back as UNSET by readProjectConfig — which walks the effective config and would
+  // truthfully find nothing. Writing the founder's primary escape hatch and then telling him it
+  // is not set is worse than declining.
+  //
+  // `args` could not be written at all regardless: valueProblem rejects arrays, and the documented
+  // form is `args = ["run", "dev:web"]`. Refusing all four together keeps the story consistent
+  // rather than half-supporting the section.
+  if (section === "preview" && PREVIEW_HAND_WRITTEN_KEYS.includes(key)) {
+    return `${key} is a detection override that Sparkle reads straight from the project's .sparkle/config.toml — it is not part of the merged config, so writing it here would report back as unset. Edit that file by hand. The keys this tool can set are: ${PREVIEW_MERGED_KEYS.join(", ")}.`;
   }
   if (PROJECT_HONORED_SECTIONS.includes(section)) return null;
   // `hasOwnProperty`, not a bare index: `"constructor.foo"` and `"__proto__.foo"` pass keyProblem's
@@ -516,6 +570,21 @@ export async function readProjectConfig(
   if (key) {
     const keyIssue = keyProblem(key);
     if (keyIssue) return refuse("read_project_config", "invalid-key", keyIssue);
+    // The MIRROR of the write-side carve-out, and it fixes a false statement rather than a
+    // missing feature. These four keys are read straight off the project's .sparkle/config.toml
+    // by the detector and are deliberately absent from the merged SparkleConfig, so the generic
+    // path below walks the effective config, finds nothing, and reports "…is not set for <root>
+    // — neither the project file nor the global one has it." That is flatly FALSE for a project
+    // file that carries the override — and since the write path now refuses these keys, hand
+    // editing is the ONLY supported way to set them, so the false report is on the supported
+    // path rather than an edge case.
+    if (PREVIEW_HAND_WRITTEN_KEYS.includes(key)) {
+      return refuse(
+        "read_project_config",
+        "invalid-key",
+        `${key} is a detection override read straight from the project's .sparkle/config.toml by Sparkle's previewability detector — it is not part of the merged config this tool can see, so it cannot report whether it is set. Open that file to check. The [preview] keys this tool can read are: ${PREVIEW_MERGED_KEYS.join(", ")}.`,
+      );
+    }
   }
 
   let effective: { config: SparkleConfig; warnings: string[] };
@@ -586,7 +655,7 @@ export async function setProjectConfig(
   if (problem) return refuse(op, "invalid-path", problem);
   const root = normalizeRoot(projectRoot);
 
-  const keyIssue = keyProblem(path) ?? projectSectionProblem(path);
+  const keyIssue = keyProblem(path) ?? projectSectionProblem(path, value);
   if (keyIssue) return refuse(op, "invalid-key", keyIssue);
   const key = path.trim();
 

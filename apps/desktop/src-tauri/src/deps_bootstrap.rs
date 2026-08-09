@@ -61,6 +61,26 @@ impl PackageManager {
         matches!(self, PackageManager::Pnpm | PackageManager::Npm)
     }
 
+    /// Whether we have VERIFIED that this manager forwards extra arguments through to the script
+    /// it runs — i.e. that `<mgr> run dev --port N --host 127.0.0.1` reaches the dev server rather
+    /// than being swallowed by the manager itself.
+    ///
+    /// A SEPARATE question from `is_supported`, which is about unattended-INSTALL safety (whether
+    /// the manager accepts `--ignore-scripts`). They happen to have the same answer today, and
+    /// writing that coincidence down as one predicate is how a reader concludes preview refuses
+    /// yarn "because of --ignore-scripts", which is not the reason.
+    ///
+    /// The reason is a SECURITY property. `preview.rs` passes the loopback host flag
+    /// unconditionally, because a dev server left on its default may bind `0.0.0.0` and expose the
+    /// project to the LAN. If the manager silently drops that flag, the guarantee is gone with no
+    /// symptom — the preview still renders, from a server anyone on the network can reach. yarn v1
+    /// famously needs `yarn dev -- --flag` while berry forwards directly, so the answer genuinely
+    /// differs by version and cannot be read off documentation. Same discipline as `is_supported`:
+    /// verified by running it, or not driven.
+    pub fn forwards_run_args_verified(self) -> bool {
+        matches!(self, PackageManager::Pnpm | PackageManager::Npm)
+    }
+
     /// Whether the install leaves the project's OWN lifecycle scripts unrun.
     ///
     /// True for every supported manager, because `--ignore-scripts` is unconditional and neither
@@ -177,19 +197,25 @@ pub fn plan_for(worktree: &Path) -> BootstrapPlan {
     if !worktree.join("package.json").is_file() {
         return BootstrapPlan::Skip(SkipReason::NotAJsProject);
     }
-    for (name, pm) in LOCKFILES {
-        if worktree.join(name).is_file() {
-            return if pm.is_supported() {
-                BootstrapPlan::Install(*pm)
-            } else {
-                // Recognised but not driven. Reported as its own reason rather than as NoLockfile,
-                // because "we don't drive yarn" and "this repo has no lockfile" call for completely
-                // different follow-ups.
-                BootstrapPlan::Skip(SkipReason::UnsupportedManager(*pm))
-            };
-        }
+    match manager_for(worktree) {
+        Some(pm) if pm.is_supported() => BootstrapPlan::Install(pm),
+        // Recognised but not driven. Reported as its own reason rather than as NoLockfile,
+        // because "we don't drive yarn" and "this repo has no lockfile" call for completely
+        // different follow-ups.
+        Some(pm) => BootstrapPlan::Skip(SkipReason::UnsupportedManager(pm)),
+        None => BootstrapPlan::Skip(SkipReason::NoLockfile),
     }
-    BootstrapPlan::Skip(SkipReason::NoLockfile)
+}
+
+/// Which package manager does this worktree's lockfile name, if any?
+///
+/// Split out of [`plan_for`] so `preview.rs` can ask the same question without inheriting that
+/// function's other rules — a preview runs against a worktree whose `node_modules` is ALREADY there,
+/// which is `plan_for`'s first short-circuit and would answer `AlreadyInstalled` rather than naming
+/// the manager. Returns unsupported managers too: the caller decides what to do about one, and
+/// "we don't drive yarn" must stay distinguishable from "there is no lockfile".
+pub fn manager_for(worktree: &Path) -> Option<PackageManager> {
+    LOCKFILES.iter().find(|(name, _)| worktree.join(name).is_file()).map(|(_, pm)| *pm)
 }
 
 /// What a bootstrap pass concluded, as it crosses into the frontend.
@@ -343,7 +369,7 @@ pub fn known_manager_paths_for(pm: PackageManager, home: Option<PathBuf>) -> Vec
 /// module exists to prevent. `roborev`, `op` and `claude` all already pair the probe with this
 /// fallback; the package manager was the one user-scope binary left without it.
 #[cfg(unix)]
-fn resolve_manager(pm: PackageManager) -> Option<String> {
+pub(crate) fn resolve_manager(pm: PackageManager) -> Option<String> {
     crate::preflight::run_in_login_shell(&format!("command -v {}", pm.program())).or_else(|| {
         crate::preflight::first_executable(&known_manager_paths_for(
             pm,
@@ -359,7 +385,7 @@ fn resolve_manager(pm: PackageManager) -> Option<String> {
 /// find function run_in_login_shell". `where` is also the only thing that returns the `.cmd` shim
 /// that `Command::new` needs to launch pnpm/npm/yarn on Windows at all.
 #[cfg(not(unix))]
-fn resolve_manager(pm: PackageManager) -> Option<String> {
+pub(crate) fn resolve_manager(pm: PackageManager) -> Option<String> {
     crate::preflight::resolve_on_path(pm.program()).or_else(|| {
         crate::preflight::first_executable(&known_manager_paths_for(
             pm,
@@ -720,6 +746,87 @@ mod tests {
                 args
             );
         }
+    }
+
+    /// The seam the live browser preview needs, and the reason it cannot use `plan_for`.
+    ///
+    /// A preview always runs against an already-bootstrapped worktree, so `node_modules` exists and
+    /// `plan_for` short-circuits to `Skip(AlreadyInstalled)` — a variant carrying NO manager. A
+    /// caller that reached for it would get nothing back exactly when it needs the answer and fall
+    /// back to a hardcoded manager, which is how `pnpm exec` ends up relocating an npm project's
+    /// node_modules. `manager_for` must keep answering with node_modules present.
+    #[test]
+    fn manager_for_answers_even_when_plan_for_has_nothing_to_say() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join("package.json"), "{}").unwrap();
+        std::fs::write(root.join("package-lock.json"), "{}").unwrap();
+        // The preview's actual operating condition.
+        std::fs::create_dir(root.join("node_modules")).unwrap();
+
+        assert_eq!(
+            plan_for(root),
+            BootstrapPlan::Skip(SkipReason::AlreadyInstalled),
+            "precondition: plan_for gives up here, carrying no manager"
+        );
+        assert_eq!(
+            manager_for(root),
+            Some(PackageManager::Npm),
+            "manager_for must still name npm — otherwise preview spawns the wrong manager and \
+             mutates the user's node_modules"
+        );
+    }
+
+    /// LITERAL PAIRS, not a loop over `LOCKFILES`.
+    ///
+    /// `manager_for` IS `LOCKFILES.iter().find(..).map(..)`, so a test that iterates the same table
+    /// and asserts the function returns the same tuple element cannot fail: point `yarn.lock` at
+    /// `Npm`, misspell `bun.lockb`, or drop `pnpm-lock.yaml` and it stays green. Writing the pairs
+    /// out means a table edit has to be mirrored here deliberately.
+    #[test]
+    fn manager_for_maps_each_lockfile_name_to_its_manager() {
+        let cases: &[(&str, PackageManager)] = &[
+            ("pnpm-lock.yaml", PackageManager::Pnpm),
+            ("bun.lock", PackageManager::Bun),
+            ("bun.lockb", PackageManager::Bun),
+            ("yarn.lock", PackageManager::Yarn),
+            ("package-lock.json", PackageManager::Npm),
+        ];
+        for (name, want) in cases {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::fs::write(dir.path().join(name), "").unwrap();
+            assert_eq!(manager_for(dir.path()), Some(*want), "for {name}");
+        }
+        // yarn and bun are returned, NOT filtered — `is_supported`/`forwards_run_args_verified`
+        // are the caller's decision, and "we don't drive yarn" must stay distinguishable from
+        // "there is no lockfile".
+        let empty = tempfile::tempdir().expect("tempdir");
+        std::fs::write(empty.path().join("package.json"), "{}").unwrap();
+        assert_eq!(
+            manager_for(empty.path()),
+            None,
+            "no lockfile must be None, never a default — a guess here mutates the project"
+        );
+    }
+
+    /// The ONLY assertion that pins the ordering `LOCKFILES`' own comment calls load-bearing.
+    ///
+    /// A repo carrying two lockfiles is the normal aftermath of a migration, and the preview
+    /// caller turns that into damage: spawn the manager the leftover lockfile names and you get
+    /// the `node_modules/.ignored` relocation this seam was extracted to prevent. Migrations run
+    /// npm/yarn -> pnpm, so the newest lockfile is earliest in the table and pnpm must win.
+    #[test]
+    fn a_leftover_lockfile_does_not_win_over_the_current_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("package-lock.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("pnpm-lock.yaml"), "").unwrap();
+        assert_eq!(
+            manager_for(dir.path()),
+            Some(PackageManager::Pnpm),
+            "a migrated repo with a stale package-lock.json beside its pnpm-lock.yaml must resolve \
+             to pnpm — picking npm here spawns the wrong manager and rearranges node_modules"
+        );
     }
 
     #[test]

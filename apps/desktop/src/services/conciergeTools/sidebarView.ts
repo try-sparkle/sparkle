@@ -56,6 +56,9 @@ import { useProjectStore } from "../../stores/projectStore";
 import { useRuntimeStore } from "../../stores/runtimeStore";
 import { REVEAL_REQUEST_TTL_MS, SPARKLE_PANE_SIDE, useUiStore, type WorkMode } from "../../stores/uiStore";
 import { sideOf } from "../../engine/pairs";
+// The MODE LIST as a value, so the guard below is derived from the same source as the type rather
+// than re-listing it (roborev 60625).
+import { WORK_MODES, isWorkMode } from "../../engine/workMode";
 import type { PairSide } from "../../engine/cable";
 import {
   BUILD_SECTIONS,
@@ -823,7 +826,12 @@ export interface WorkModeChange {
  * success while the stage was unchanged and the caller had no signal the view never appeared.
  */
 export function setWorkMode(mode: string): SidebarViewResult<WorkModeChange> {
-  if (mode !== "plan" && mode !== "build") {
+  // VALIDATED AGAINST THE UNION'S OWN LIST, never against a hand-written pair (roborev 60625). This
+  // read `mode !== "plan" && mode !== "build"` with a refusal message naming those two — so for one
+  // commit after `"preview"` joined the union, the concierge told the user that a mode the app
+  // actually has "is not a work mode". An enumeration copied beside a type is the trap the type
+  // exists to close; `WORK_MODES` is what both are built from, so this cannot go stale again.
+  if (!isWorkMode(mode)) {
     // `unknown-mode`, NOT `no-op`. Both refuse and both change nothing, but a caller has to tell
     // them apart: "kanban is not a mode" is a caller bug that retrying cannot fix, while "already
     // in build mode" below is an idempotent request that is safe to shrug off. One reason covering
@@ -831,7 +839,10 @@ export function setWorkMode(mode: string): SidebarViewResult<WorkModeChange> {
     return refuse(
       "set_work_mode",
       "unknown-mode",
-      `"${mode}" is not a work mode — the chevrons are "plan" and "build".`,
+      // The message is BUILT FROM THE LIST too. A hard-coded sentence is the half of this defect a
+      // widened guard alone would leave standing: the mode would be accepted and the help text
+      // would still name two of three.
+      `"${mode}" is not a work mode — the modes are ${WORK_MODES.map((m) => `"${m}"`).join(", ")}.`,
     );
   }
   const side = scopedSide();
@@ -853,9 +864,16 @@ export function setWorkMode(mode: string): SidebarViewResult<WorkModeChange> {
   if (priorWorkMode === mode && !surfaceHidden) {
     return refuse("set_work_mode", "no-op", `The column is already in ${mode} mode.`);
   }
-  // Both branches go through the store action that owns the mode-plus-yield pairing, so neither
-  // can drift from the chevron the way this call site twice did.
+  // EVERY branch goes through the store action that owns the mode-plus-yield pairing, so none can
+  // drift from the chevron the way this call site twice did. That is also why "preview" gets a
+  // branch here rather than a refusal: `openPreview` is the third member of that family, and a
+  // mode the type accepts but the dispatch cannot reach would refuse at the LAST step, after the
+  // no-op check has already reported the request as actionable.
+  //
+  // It opens the PANE and starts no server, exactly as the toggle segment does — the preview slot
+  // renders whatever state that agent's preview is in, including "none".
   if (mode === "plan") useUiStore.getState().openPlanBoard(side);
+  else if (mode === "preview") useUiStore.getState().openPreview(side);
   else useUiStore.getState().showBuildStage(side);
   return ok("set_work_mode", { priorWorkMode, workMode: mode });
 }

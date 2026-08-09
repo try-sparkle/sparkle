@@ -80,6 +80,14 @@
 export const SIDEBAR_OVERLAY_Z = 25;
 // Above the floated Build column (see above) — the board covers that column, so it must also cover
 // it when floated — and clear of the stage's own overlays at 19-21. Well under the 38–45 band.
+//
+// `PreviewSlot` SHARES THIS NUMBER RATHER THAN DECLARING AN EQUAL ONE. It is the same geometry —
+// an inset-0 overlay over a pair's `paircols`, covering the Build column and carrying its own way
+// back out — so every word above applies to it unchanged. And the two can never be on screen
+// together: a pair has ONE `workMode`, and the board and the preview are two of its three values,
+// so they are mutually exclusive by construction and there is no ordering between them to express.
+// A second constant with the same value would be pure drift surface — kept equal by hand forever,
+// and the first time it drifted nothing could say which of the two was right.
 export const PLAN_COLUMN_Z = 26;
 
 // ── THE TWO COLUMNS OF A PAIR, AT REST ─────────────────────────────────────────────────────────

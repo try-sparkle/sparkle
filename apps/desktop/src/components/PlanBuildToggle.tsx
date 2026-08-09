@@ -130,6 +130,21 @@ export interface PlanBuildToggleProps {
   beadsEnabled: boolean;
   onPickPlan: () => void;
   onPickBuild: () => void;
+  /**
+   * Does this project have something to preview? The Preview segment is rendered ONLY when true —
+   * **absent, never greyed**. That is §7 rule 5 of the design and `ColumnPullTab.tsx:130`'s rule
+   * verbatim: "an affordance that does nothing is worse than an absent one." A disabled segment on
+   * a project with no dev script is a control the user presses, gets nothing from, and cannot learn
+   * anything from; a missing one at least does not promise.
+   *
+   * Undefined (the default) reads as "no", which is also the honest answer while the capability
+   * probe has not come back — offering the mode before we know would put the user in a pane whose
+   * only possible content is an apology.
+   */
+  previewEnabled?: boolean;
+  /** Required for the segment to do anything; the segment is not rendered without `previewEnabled`
+   *  anyway, so this being optional cannot produce a dead button. */
+  onPickPreview?: () => void;
   /** Extra margin for the placement (the sidebar insets it; the plan column doesn't). */
   style?: React.CSSProperties;
   /**
@@ -169,6 +184,8 @@ export function PlanBuildToggle({
   beadsEnabled,
   onPickPlan,
   onPickBuild,
+  previewEnabled = false,
+  onPickPreview,
   style,
   variant = "chevron",
 }: PlanBuildToggleProps) {
@@ -210,9 +227,32 @@ export function PlanBuildToggle({
             Plan
           </button>
         )}
+        {/* PREVIEW — third and last, and CONDITIONAL ON THE PROJECT rather than on a setting.
+            Plan's gate above is a tool toggle the user set; this one is a fact about the code in
+            front of them (is there a dev server to run?), which is why it can appear and disappear
+            as they switch projects. Last in the strip because it is the newest and the least
+            frequently used of the three — the two the user navigates by memory keep their
+            positions. */}
+        {previewEnabled && (
+          <button
+            data-hint="preview"
+            onClick={onPickPreview}
+            aria-pressed={mode === "preview"}
+            title="Preview — this project's dev server, live in the pane"
+            style={miniSegStyle(mode === "preview")}
+          >
+            Preview
+          </button>
+        )}
       </span>
     );
   }
+  // THE CHEVRON VARIANT IS UNTOUCHED, deliberately. It is the Plan column's own header and the
+  // satellite window's, and both are surfaces the preview slot never covers — the slot carries the
+  // `mini` control, exactly as the plan board does. Adding a third chevron would also re-cut the
+  // tessellation (`chevronClip`'s notch/point pairing is written for a two-button strip) for a
+  // placement that has no use for it. Note `mode === "preview"` simply lights neither chevron
+  // there, which is correct: in that window it is not a mode you can be in.
   return (
     <div
       style={{

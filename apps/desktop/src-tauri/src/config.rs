@@ -1081,6 +1081,43 @@ pub struct WorktreePoolConfig {
     pub size: u32,
 }
 
+/// Live in-app browser preview (`preview.rs`). Repo-scoped + per-project overridable (like
+/// [freshness]/[worktree_pool]), because whether a project is worth previewing — and how eagerly —
+/// is a property of the project.
+///
+/// **There is deliberately no `max_servers`.** A `PreviewSlot` covers one pair and there are two
+/// pairs, so at most two previews can be visible at once: the ceiling is a property of the layout,
+/// not of a counter. An earlier draft specified one with LRU eviction; that is machinery whose
+/// eviction path could never fire. See `docs/live-browser-preview.md` §4.
+///
+/// A project's `.sparkle/config.toml` may ALSO carry `command`/`args`/`path` under `[preview]` as
+/// the highest-priority detection override. Those keys are read straight off the worktree's own
+/// file by `preview::detect_preview_target` — detection runs against an arbitrary worktree path,
+/// not against this merged app config — so they deliberately do not appear here. Serde ignores
+/// unknown keys, so their presence in a project file is inert rather than a load error.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PreviewConfig {
+    /// Master switch. false = never detect, never spawn a preview server.
+    pub enabled: bool,
+    /// How long a preview keeps serving after its pane is covered, before it is stopped. A grace
+    /// period, not a cap: stopping the instant a pane is covered would make flipping to Plan and
+    /// back pay a full cold compile (10–30s for Next).
+    pub idle_grace_min: u32,
+    /// When a preview pane may open WITHOUT being asked for: `"returning"` (the five-condition
+    /// conjunction in §10 — the default), `"never"`, or `"always"`. Anything else is rejected in
+    /// `validate` and falls back to `"returning"`.
+    pub auto_open: String,
+}
+
+/// The accepted values of `[preview].auto_open`.
+const PREVIEW_AUTO_OPEN_MODES: &[&str] = &["returning", "never", "always"];
+
+/// Ceiling for `[preview].idle_grace_min`. Two hours is far past any "flip to Plan and back"
+/// round trip the grace exists to absorb, and short enough that a forgotten preview cannot
+/// outlive a working session. See the note at its check in `validate`.
+const PREVIEW_IDLE_GRACE_MAX_MIN: u32 = 120;
+
 /// Menu-bar capture flow. Machine-wide (like [workers]/[ai]): the OS registers ONE global
 /// hotkey per machine, so a per-project value is meaningless and ignored with a warning.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1175,6 +1212,8 @@ pub struct SparkleConfig {
     pub onepassword: OnePasswordConfig,
     pub freshness: FreshnessConfig,
     pub worktree_pool: WorktreePoolConfig,
+    /// Live in-app browser preview (repo-scoped + per-project overridable).
+    pub preview: PreviewConfig,
     pub capture: CaptureConfig,
     pub voice: VoiceConfig,
     /// Per-category Sparkle Auto-Approve rules (repo-scoped overridable, like [workflow]/[freshness]).
@@ -1292,6 +1331,13 @@ impl Default for SparkleConfig {
             },
             // Pre-warm a small pool by default so the common fan-out spawn skips `git worktree add`.
             worktree_pool: WorktreePoolConfig { enabled: true, size: 2 },
+            // On by default: previewability detection DECLINES cleanly (returns None) for a project
+            // it can't read, so the cost of it being on for a non-web repo is one bounded scan.
+            preview: PreviewConfig {
+                enabled: true,
+                idle_grace_min: 10,
+                auto_open: "returning".into(),
+            },
             capture: CaptureConfig { popover_shortcut: "ctrl+shift+r".into() },
             voice: VoiceConfig { input_device_uid: None, allow_virtual_input: false },
             // Undefined by default: every project starts with no Done/Delivered definition until
@@ -1575,6 +1621,15 @@ struct PartialWorktreePool {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct PartialPreview {
+    enabled: Option<bool>,
+    idle_grace_min: Option<u32>,
+    auto_open: Option<String>,
+    // NOTE: `command`/`args`/`path` are NOT declared here on purpose — see `PreviewConfig`. Serde
+    // ignores unknown keys, so a project file carrying them still parses.
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct PartialCapture {
     popover_shortcut: Option<String>,
 }
@@ -1626,6 +1681,7 @@ struct PartialConfig {
     onepassword: Option<PartialOnePassword>,
     freshness: Option<PartialFreshness>,
     worktree_pool: Option<PartialWorktreePool>,
+    preview: Option<PartialPreview>,
     capture: Option<PartialCapture>,
     voice: Option<PartialVoice>,
     approvals: Option<PartialApprovals>,
@@ -1727,6 +1783,80 @@ fn apply_worktree_pool(into: &mut WorktreePoolConfig, p: Option<PartialWorktreeP
     }
     if let Some(v) = p.size {
         into.size = v;
+    }
+}
+
+/// Which config file a partial came from. Only `[preview]` needs to know so far — most sections are
+/// either fully project-overridable or refused outright, and this is the first one whose authority
+/// is asymmetric (a project may narrow it, never widen it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Layer {
+    Global,
+    Project,
+}
+
+/// `layer` says which file this partial came from. It exists for ONE field — see below.
+fn apply_preview(
+    into: &mut PreviewConfig,
+    p: Option<PartialPreview>,
+    layer: Layer,
+    warnings: &mut Vec<String>,
+) {
+    let Some(p) = p else { return };
+    if let Some(v) = p.enabled {
+        // THE MASTER SWITCH ONLY EVER NARROWS AT PROJECT SCOPE. A project may turn preview OFF for
+        // itself; it may NOT turn it back on for a user who disabled it globally.
+        //
+        // This is a security boundary of the same shape [concierge] and [pushers] draw a few
+        // hundred lines below, and for the same reason: `enabled` gates SPAWNING A LONG-LIVED
+        // PROCESS whose command line comes from repo-controlled data — the `[preview]`
+        // command/args/path override in the project's own file, and failing that the `dev` script
+        // out of its package.json. A repo that could flip this back on would hand itself the
+        // ability to run a process on the user's machine merely by being cloned.
+        //
+        // SCOPE, stated because this is easy to over-read as more than it is: this closes the
+        // RE-ENABLE path only. `enabled` defaults to TRUE, so in a default configuration a cloned
+        // repo shipping `[preview] command`/`args` still supplies the command line of a long-lived
+        // process and this narrowing never engages. It does NOT make a project-supplied command
+        // safe by itself. That residual requirement belongs where the detector reads those keys:
+        // a command/args from a repo the user has not vouched for should require confirmation, or
+        // be restricted to naming a script already in the repo's package.json, rather than being
+        // spawned on the first preview open. Tracked so it is not mistaken for handled.
+        //
+        // The other two fields are genuinely project properties and stay fully overridable: how
+        // long a preview lingers, and how eagerly a pane opens, are not authority over the machine.
+        if layer == Layer::Global || !v {
+            into.enabled = v;
+        } else if !into.enabled {
+            // WARN ONLY WHEN THE VALUE IS ACTUALLY BEING REFUSED — i.e. the effective setting is
+            // OFF and this project asked to turn it back on. That is the case the user needs told
+            // about, and it is rare.
+            //
+            // The guard matters because `enabled` DEFAULTS TO TRUE. Warning unconditionally on
+            // `layer == Project && v == true` fires on the overwhelmingly common shape — a project
+            // file that writes `enabled = true` while the global layer is at its default — and
+            // says "is ignored … set it in the global config.toml" about a preview that is already
+            // ON. A permanent, incorrect instruction on every `build_effective` call, telling the
+            // user to fix something that is not broken. (An earlier version of this arm did
+            // exactly that; the test below now pins both halves.)
+            //
+            // The reason to warn at all is the sibling sections' ([capture], [voice], [concierge],
+            // [pushers]): a hand-edited project file is the ONE path that still reaches here, and
+            // silence would leave it with no feedback. The concierge refusal covers only the tool
+            // path, which no longer reaches the config layer.
+            warnings.push(
+                "[preview].enabled = true in a project's .sparkle/config.toml is ignored because \
+                 the preview is disabled globally; a project may turn it off for itself but not \
+                 back on — set it in the global config.toml"
+                    .to_string(),
+            );
+        }
+    }
+    if let Some(v) = p.idle_grace_min {
+        into.idle_grace_min = v;
+    }
+    if let Some(v) = p.auto_open {
+        into.auto_open = v;
     }
 }
 
@@ -2742,6 +2872,30 @@ fn validate(cfg: &mut SparkleConfig, warnings: &mut Vec<String>) {
         ));
         cfg.worktree_pool.size = 16;
     }
+    // The idle grace is CAPPED, for the same reason its neighbour caps worktree_pool.size — but
+    // with more at stake. With no max_servers (deliberate: the two-pane layout is the ceiling) and
+    // `agent_memory_watchdog` still unwired, the grace timeout is one of only three things that
+    // ever stops a preview server. An unbounded value is a dev server — 400 MB to 1 GB resident for
+    // Next — that never exits, configured by a typo rather than a decision.
+    if cfg.preview.idle_grace_min > PREVIEW_IDLE_GRACE_MAX_MIN {
+        warnings.push(format!(
+            "[preview].idle_grace_min ({}) is very high; capping at {}",
+            cfg.preview.idle_grace_min, PREVIEW_IDLE_GRACE_MAX_MIN
+        ));
+        cfg.preview.idle_grace_min = PREVIEW_IDLE_GRACE_MAX_MIN;
+    }
+    // An unrecognized auto_open mode is REPLACED with the default, not left in place: unlike a
+    // [concierge.tools] value (which the frontend reads as the stricter "ask"), nothing downstream
+    // has a safe reading for an unknown preview mode — an unmatched string would silently behave
+    // like "never" and look like the feature is broken rather than misconfigured.
+    if !PREVIEW_AUTO_OPEN_MODES.contains(&cfg.preview.auto_open.as_str()) {
+        warnings.push(format!(
+            "[preview].auto_open is \"{}\", which is not returning, never, or always; using \
+             \"returning\"",
+            cfg.preview.auto_open
+        ));
+        cfg.preview.auto_open = "returning".to_string();
+    }
     // A [concierge.tools] value that isn't allow/ask/deny is surfaced but NOT dropped. The frontend
     // policy layer reads an unrecognized rule as "ask" — deliberately stricter than the derived
     // default — so deleting it here would silently restore the permissive default on exactly the
@@ -2893,6 +3047,7 @@ fn build_effective(
                 apply_onepassword(&mut cfg.onepassword, p.onepassword);
                 apply_freshness(&mut cfg.freshness, p.freshness);
                 apply_worktree_pool(&mut cfg.worktree_pool, p.worktree_pool);
+                apply_preview(&mut cfg.preview, p.preview, Layer::Global, &mut warnings);
                 apply_capture(&mut cfg.capture, p.capture);
                 apply_voice(&mut cfg.voice, p.voice);
                 apply_approvals(&mut cfg.approvals, p.approvals);
@@ -3037,6 +3192,7 @@ fn build_effective(
                 rejected_plugins.extend(apply_plugins(&mut cfg.plugins, p.plugins));
                 apply_freshness(&mut cfg.freshness, p.freshness);
                 apply_worktree_pool(&mut cfg.worktree_pool, p.worktree_pool);
+                apply_preview(&mut cfg.preview, p.preview, Layer::Project, &mut warnings);
                 apply_approvals(&mut cfg.approvals, p.approvals);
                 apply_done(&mut cfg.done, p.done);
                 apply_delivered(&mut cfg.delivered, p.delivered);
@@ -3808,6 +3964,45 @@ enabled = true
 # How many ready worktrees to keep parked per project. Higher = more spawns skip the wait, at the
 # cost of that many extra checkouts on disk. 0 disables warming. Capped at 16 defensively.
 size    = 2
+
+# --- Live in-app browser preview (repo-scoped; overridable in a project file) -----------
+# Sparkle can run a project's dev server for an agent's worktree and show the live site in a
+# pane, hot-reloading as the agent edits. There is deliberately NO max_servers: a preview pane
+# covers one column pair and there are two pairs, so the layout is the ceiling.
+[preview]
+# false = never detect a preview target and never spawn a dev server.
+# A PROJECT file may only NARROW this: it can set false to opt itself out, but a project
+# `enabled = true` is IGNORED. Otherwise a repo could re-enable previews for a user who turned
+# them off, merely by being cloned — and this switch gates spawning a long-lived process whose
+# command line comes from that same repo's config and package.json.
+enabled        = true
+# How many minutes a preview keeps serving after its pane is covered, before Sparkle stops it.
+# A grace period, not a cap — flipping to Plan and back shouldn't pay a full cold compile.
+# Capped at 120: with no max_servers and no runaway-kill path, this is one of only three things
+# that ever stops a server, so an unbounded value is a dev server that never exits.
+idle_grace_min = 10
+# When a preview pane may open WITHOUT you asking:
+#   "returning" = only if you've opened a preview for this project before, that agent is already
+#                 selected in its pair, that pair is in Build mode, and nothing is already shown
+#   "never"     = only ever open a preview by hand
+#   "always"    = open one as soon as a server is up
+auto_open      = "returning"
+# A PROJECT's .sparkle/config.toml may also set command / args / path / port here to override
+# previewability detection outright, e.g.:
+#   command = "pnpm"
+#   args    = ["run", "dev:web"]
+#   path    = "apps/web"
+#   port    = 4321            # optional; skips port allocation and uses this one verbatim
+# Those are read straight off the project's own file by the detector, so they are only
+# meaningful in a project config, never in this global one. This is the escape hatch for a
+# project detection declines to guess at — Sparkle itself is one, with four dev:* scripts and
+# no plain `dev`.
+#
+# HAND-WRITTEN ONLY. Sparkle's own settings tool refuses to set command/args/path/port and will
+# tell you to edit the file directly. They are not merged into the effective config — the
+# detector reads them from the project file — so a tool that wrote one would have to report it
+# back as unset. The three keys above (enabled / idle_grace_min / auto_open) ARE merged and can
+# be set through the app.
 
 # --- What "Done" and "Delivered" mean for THIS project (repo-scoped) --------------------
 # These two sections let each project define its own Plan/Tasks board semantics. They are
@@ -6230,6 +6425,154 @@ quit_app = 42
         let (cfg, warns, _) = effective(Some(g), None);
         assert_eq!(cfg.worktree_pool.size, 0);
         assert!(!warns.iter().any(|w| w.contains("worktree_pool")));
+    }
+
+    /// A cloned repo must not be able to switch the preview back ON for a user who turned it off.
+    ///
+    /// `enabled` gates spawning a LONG-LIVED PROCESS whose command line comes from repo-controlled
+    /// data (the project's own `[preview] command/args/path`, else its `package.json` `dev`
+    /// script), so it belongs in the same class as `[concierge]` and `[pushers]` — which this file
+    /// refuses at project scope precisely so a repo cannot hand itself authority over the user's
+    /// machine merely by being cloned.
+    ///
+    /// Asserts BOTH directions. Only checking that a project `true` is ignored would also pass if
+    /// the project layer had been refused outright, which would break the legitimate
+    /// "this repo is not worth previewing" case.
+    #[test]
+    fn a_project_may_turn_the_preview_off_but_never_back_on() {
+        // The attack: user disabled it globally; a cloned repo ships `enabled = true`.
+        let (cfg, warns, _) = effective(
+            Some("[preview]\nenabled = false\n"),
+            Some("[preview]\nenabled = true\n"),
+        );
+        assert!(
+            !cfg.preview.enabled,
+            "a project file re-enabled a globally-disabled preview — a cloned repo can now spawn \
+             a process on this machine"
+        );
+        // AND IT SAYS SO. Dropping the key in silence leaves a hand-edited project file — the one
+        // path that still reaches this code — with no feedback that it is inert.
+        assert!(
+            warns.iter().any(|w| w.contains("[preview].enabled")),
+            "the ignored project value must be warned about by name; warnings were {warns:?}"
+        );
+
+        // The legitimate narrowing still works: default-on globally, this repo opts out — and it
+        // must NOT warn, or the warning becomes noise on the supported path.
+        let (cfg, warns, _) = effective(None, Some("[preview]\nenabled = false\n"));
+        assert!(!cfg.preview.enabled, "a project must still be able to opt OUT");
+        assert!(
+            !warns.iter().any(|w| w.contains("[preview].enabled")),
+            "opting out is legitimate and must be silent; warnings were {warns:?}"
+        );
+
+        // AND THE COMMON CASE MUST BE SILENT. `enabled` defaults to TRUE, so a project file that
+        // writes `enabled = true` while the global layer is at its default is AGREEING with the
+        // effective value, not being refused. Warning here would fire on nearly every project that
+        // touches the section and tell the user to "set it in the global config.toml" about a
+        // preview that is already on — a permanent, incorrect instruction. This assertion is the
+        // whole reason the warning is guarded on `!into.enabled` rather than on the layer alone.
+        let (cfg, warns, _) = effective(None, Some("[preview]\nenabled = true\n"));
+        assert!(cfg.preview.enabled, "the effective value is on, as it already was");
+        assert!(
+            !warns.iter().any(|w| w.contains("[preview].enabled")),
+            "a project agreeing with the default must be SILENT; warnings were {warns:?}"
+        );
+
+        // And the two knobs that ARE project properties are untouched by the asymmetry.
+        let (cfg, _, _) = effective(
+            Some("[preview]\nidle_grace_min = 30\nauto_open = \"never\"\n"),
+            Some("[preview]\nidle_grace_min = 2\nauto_open = \"always\"\n"),
+        );
+        assert_eq!(cfg.preview.idle_grace_min, 2);
+        assert_eq!(cfg.preview.auto_open, "always");
+    }
+
+    /// The grace period is one of only three things that ever stops a preview server (there is no
+    /// max_servers by design, and `agent_memory_watchdog` is unwired), so an unbounded value is a
+    /// 400 MB – 1 GB dev server that never exits — configured by a typo rather than a decision.
+    ///
+    /// Asserts the SIDE EFFECT — the value in the struct changed — not merely that a warning was
+    /// pushed. A warning nobody acts on would leave the server running just the same.
+    #[test]
+    fn an_absurd_idle_grace_is_capped_rather_than_honored() {
+        let g = "[preview]\nidle_grace_min = 100000\n";
+        let (cfg, warns, _) = effective(Some(g), None);
+        assert_eq!(
+            cfg.preview.idle_grace_min, PREVIEW_IDLE_GRACE_MAX_MIN,
+            "an out-of-range idle_grace_min must be REPLACED with the ceiling"
+        );
+        assert!(
+            warns.iter().any(|w| w.contains("[preview].idle_grace_min")),
+            "the cap must say so by name; warnings were {warns:?}"
+        );
+
+        // The boundary is honored, not capped — a cap that also clamps legal values would quietly
+        // shorten every configured grace.
+        let g = format!("[preview]\nidle_grace_min = {PREVIEW_IDLE_GRACE_MAX_MIN}\n");
+        let (cfg, warns, _) = effective(Some(&g), None);
+        assert_eq!(cfg.preview.idle_grace_min, PREVIEW_IDLE_GRACE_MAX_MIN);
+        assert!(!warns.iter().any(|w| w.contains("idle_grace_min")));
+
+        // 0 is a legitimate "stop as soon as the pane is covered", not an error.
+        let (cfg, warns, _) = effective(Some("[preview]\nidle_grace_min = 0\n"), None);
+        assert_eq!(cfg.preview.idle_grace_min, 0);
+        assert!(!warns.iter().any(|w| w.contains("idle_grace_min")));
+    }
+
+    #[test]
+    fn preview_defaults_overrides_and_auto_open_validation() {
+        // Absent [preview] → the built-in defaults.
+        let (cfg, _, _) = effective(None, None);
+        assert!(cfg.preview.enabled);
+        assert_eq!(cfg.preview.idle_grace_min, 10);
+        assert_eq!(cfg.preview.auto_open, "returning");
+
+        // Global override, field by field.
+        let g = "[preview]\nenabled = false\nidle_grace_min = 30\nauto_open = \"always\"\n";
+        let (cfg, warns, _) = effective(Some(g), None);
+        assert!(!cfg.preview.enabled);
+        assert_eq!(cfg.preview.idle_grace_min, 30);
+        assert_eq!(cfg.preview.auto_open, "always");
+        assert!(warns.is_empty());
+
+        // Per-project overridable (like [freshness]/[worktree_pool]); no "ignored" warning.
+        let p = "[preview]\nidle_grace_min = 2\n";
+        let (cfg, warns, _) = effective(None, Some(p));
+        assert_eq!(cfg.preview.idle_grace_min, 2);
+        assert!(cfg.preview.enabled, "untouched field keeps its default");
+        assert_eq!(cfg.preview.auto_open, "returning");
+        assert!(warns.is_empty());
+
+        // "never" is a real mode, not a typo — it must survive validation untouched.
+        let g = "[preview]\nauto_open = \"never\"\n";
+        let (cfg, warns, _) = effective(Some(g), None);
+        assert_eq!(cfg.preview.auto_open, "never");
+        assert!(!warns.iter().any(|w| w.contains("auto_open")));
+
+        // An unrecognized mode is REPLACED (not merely warned about), because nothing downstream
+        // has a safe reading for it. Assert the replacement, which is the side effect.
+        for bogus in ["Always", "sometimes", "", "returning "] {
+            let g = format!("[preview]\nauto_open = \"{bogus}\"\n");
+            let (cfg, warns, _) = effective(Some(&g), None);
+            assert_eq!(
+                cfg.preview.auto_open, "returning",
+                "auto_open = {bogus:?} must fall back to the default, not be left in place"
+            );
+            assert!(
+                warns.iter().any(|w| w.contains("[preview].auto_open")),
+                "auto_open = {bogus:?} must say so out loud"
+            );
+        }
+
+        // A project file may carry the detection-override keys (command/args/path). They are not
+        // declared in PartialPreview, so this asserts they are INERT — the file still loads and the
+        // sibling keys in the same section still apply — rather than failing the whole layer.
+        let p = "[preview]\nidle_grace_min = 7\ncommand = \"pnpm\"\nargs = [\"run\", \"dev:web\"]\npath = \"apps/web\"\n";
+        let (cfg, warns, hard_error) = effective(None, Some(p));
+        assert!(!hard_error, "unknown [preview] keys must not fail the layer");
+        assert_eq!(cfg.preview.idle_grace_min, 7, "the sibling key must still apply");
+        assert!(warns.is_empty());
     }
 
     #[test]

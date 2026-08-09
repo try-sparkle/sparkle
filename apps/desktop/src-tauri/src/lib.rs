@@ -78,6 +78,11 @@ mod pr_dismissal;
 mod pr_owner;
 mod retro_receipt;
 mod preflight;
+/// The live in-app browser preview's dev-server supervisor.
+mod preview;
+/// Guard pinning the loopback `frame-src` the live browser preview depends on, plus the reserved
+/// port set that keeps a preview frame from being same-origin with the app document.
+mod preview_csp;
 mod proc;
 mod promotion;
 mod project_window;
@@ -190,6 +195,9 @@ pub fn run() {
         // PR claims live in the Rust process, not a window store, so an agent's "I am landing this
         // myself" is visible from EVERY window — including whichever one answers the concierge.
         .manage(pr_claims::PrClaims::default())
+        // Live browser previews this launch owns. Managed state rather than a module static so the
+        // supervisor threads reach it from an `AppHandle` and a stop can find the child to signal.
+        .manage(preview::PreviewManager::default())
         // Every Focused event feeds TWO consumers, both of which need the same blur coalescing
         // because macOS emits the outgoing window's resignKey BEFORE the incoming window's
         // becomeKey:
@@ -284,6 +292,11 @@ pub fn run() {
             // Watch for monitors being plugged/unplugged so a window spanned across displays can be
             // re-fitted instead of stranded at a geometry no remaining display can show.
             display_span::start_display_watch(app.handle().clone());
+            // Reclaim preview dev servers a previous launch left behind. This is the PRIMARY orphan
+            // path, not a backstop: managed state leaks on the ordinary Cmd+Q path, so a hard kill
+            // leaves the child running with nothing else that would ever stop it. It verifies the
+            // full (pid, pgid, start-time) triple before signalling anything — see preview.rs.
+            preview::init(app.handle());
             // Auth hand-off: forward an incoming sparkle://auth?code=… deep link to the webview
             // as a "deep-link" event; AuthGate redeems the one-time code (spec §3.1, §8).
             {
@@ -671,6 +684,14 @@ pub fn run() {
             conflict_watch::conflict_probe_status,
             memwatch::memory_admission,
             memwatch::agent_memory_watchdog,
+            // Live browser preview. Every one is `async fn` + spawn_blocking: a plain `fn` runs
+            // INLINE on the AppKit main thread and all of these touch the filesystem or a process.
+            preview::preview_capability,
+            preview::preview_open,
+            preview::preview_stop,
+            preview::preview_stop_for_agent,
+            preview::preview_status,
+            preview::preview_list,
             preflight::claude_preflight,
             preflight::claude_version,
             preflight::claude_session_info,
@@ -1023,6 +1044,10 @@ pub fn run() {
                 // group kill that stops a detached pass from outliving the app — only actually
                 // happen when driven from here. `Drop` remains an idempotent backstop.
                 app.state::<sparkle_improve::SparkleImproveManager>().end_in_flight_pass();
+                // Same reasoning, same path: a preview's dev server is a supervised child spawned
+                // OUTSIDE a PTY, so nothing else would ever stop it. `Drop` on the manager is the
+                // idempotent backstop for the paths that actually drop.
+                app.state::<preview::PreviewManager>().stop_all();
                 // Leave the per-command main-thread table behind when the probe was armed, so a
                 // measurement run does not depend on someone calling `cmd_timing_report` before
                 // quitting. No-op when disarmed (the default).

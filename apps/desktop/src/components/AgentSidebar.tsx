@@ -42,6 +42,8 @@ import {
 } from "../engine/columnResize";
 import type { Project, AgentTab } from "../types";
 import { useProjectStore } from "../stores/projectStore";
+import { usePreviewStore } from "../stores/previewStore";
+import { refreshPreviewCapability } from "../services/preview";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { SPARKLE_PANE_SIDE, useUiStore } from "../stores/uiStore";
 import { APP_WINDOW_LABEL } from "../windowContext";
@@ -487,6 +489,11 @@ export function AgentSidebar({
   const setWorkMode = useUiStore((s) => s.setWorkMode);
   const openPlanBoard = useUiStore((s) => s.openPlanBoard);
   const showBuildStage = useUiStore((s) => s.showBuildStage);
+  const openPreview = useUiStore((s) => s.openPreview);
+  // MAY THIS PROJECT BE PREVIEWED AT ALL? Narrowed to a boolean through the selector so a
+  // capability write for the OTHER project cannot re-render this column. `undefined` (not probed
+  // yet) reads as false, which is the honest answer — see the probe effect below.
+  const previewable = usePreviewStore((s) => s.capability[project?.id ?? ""]?.previewable === true);
   const setMode = useCallback((m: WorkMode) => setWorkMode(pairSide, m), [setWorkMode, pairSide]);
   // Which status bands the column currently shows (the filter chips above the ladder).
   const statusFilter = useUiStore((s) => s.statusFilter);
@@ -1005,6 +1012,13 @@ export function AgentSidebar({
   // the section; clicking the SAME chevron AGAIN while already in Build spawns a fresh build agent
   // (same as the "+ New Build Agent" button). Plan stays a pure mode switch: it has no agent concept
   // and only opens the read-only Tasks board in the main pane.
+  // ENTER PREVIEW. A pure mode switch, exactly like `onPickPlan` and deliberately unlike
+  // `onPickBuild` (whose second press spawns an agent): pressing it twice must not start a second
+  // dev server, and starting one at all is the hover-card action's job, not a mode toggle's. The
+  // slot renders whatever state that agent's preview is in, including "none".
+  const onPickPreview = () => {
+    openPreview(pairSide);
+  };
   const onPickPlan = () => {
     // ONE WRITE FOR THE BOARD, to THIS column. It used to also set the window-global
     // `activeSpecial = "board"`, which is what made the board a singleton — that global was the
@@ -1132,7 +1146,7 @@ export function AgentSidebar({
   // worker-roll-up stage. Every selection path goes through this, so none of them can drift from
   // the column again (roborev 53411/53428/53439/53440 all found the same class of bug here).
   const firstRenderedRowId = useCallback(
-    (agents: readonly AgentTab[], forMode: "plan" | "build"): string | null => {
+    (agents: readonly AgentTab[], forMode: WorkMode): string | null => {
       const rt = useRuntimeStore.getState();
       const stageFor = (id: string) => resolveStage(rt.branchStatus[id], rt.workflowStage[id]);
       // Same roll-up the ladder buckets by: an orchestrator tracks its LEAST-advanced worker.
@@ -1788,13 +1802,38 @@ export function AgentSidebar({
   useEffect(() => {
     const hasSelection = !!project?.agents.find((a) => a.id === project.selectedAgentId);
     // Scoped for the same reason as the reads above, though note this one carries no behavior
-    // today and no test asserts it: `reconcileWorkMode` short-circuits on `mode === "plan"` and
+    // today and no test asserts it: `reconcileWorkMode` short-circuits on any non-Build mode and
     // otherwise `mode` is already "build", so it answers `null` in every state where `hasSpecial`
     // could matter. It is passed scoped so the column has ONE answer to "is my stage covered"
-    // rather than two that could drift if that helper ever grows a third mode.
+    // rather than two that could drift.
+    //
+    // THE THIRD MODE ARRIVED, and this comment used to end "if that helper ever grows a third
+    // mode" — it did, and the prediction was right: under the old `mode === "plan"` guard this
+    // effect wrote "build" over `"preview"` on the frame it was entered, because a row is always
+    // selected here. The guard asks the property now (`mode !== "build"`), which is why the
+    // sentence above says "any non-Build mode" rather than naming them.
     const next = reconcileWorkMode(hasSelection, mode, paneCoversMe);
     if (next) setMode(next);
   }, [project, mode, paneCoversMe, setMode]);
+  // ASK ONCE PER PROJECT WHETHER IT CAN BE PREVIEWED. Nothing else fills `previewStore.capability`,
+  // so without this every preview affordance is permanently absent — the feature would be inert with
+  // nothing logged, which is the exact failure shape this repo keeps re-finding.
+  //
+  // GATED ON "not asked yet" rather than re-run on mount: the probe is an `invoke` that walks the
+  // worktree's manifests, and both columns plus every remount would repeat it. The cost of the gate
+  // is that a project which GAINS a dev script mid-session keeps its old answer until the next
+  // launch; that is a Phase 2 refresh, not a reason to spend a bounded filesystem walk per mount.
+  //
+  // `rootPath`, not an agent worktree: detection is a property of the project's own manifests
+  // (design §7), and every worktree of it answers the same.
+  useEffect(() => {
+    if (!project) return;
+    if (usePreviewStore.getState().capability[project.id] !== undefined) return;
+    // Fire and forget — the service records both the answer and a failure, so there is nothing to
+    // await and nothing here to handle. Awaiting would only delay a render that already has its
+    // honest default ("we do not know" → no affordance).
+    void refreshPreviewCapability(project.id, project.rootPath);
+  }, [project]);
   // If Beads is turned off while the user is parked on the (now-hidden) Plan board, leave it — the
   // board won't render and the Plan chevron is gone, so a stuck empty state would result otherwise.
   // Also covers Plan mode without the board special, so no code path can strand the user in a Plan
@@ -2432,6 +2471,10 @@ export function AgentSidebar({
             beadsEnabled={beadsEnabled}
             onPickPlan={onPickPlan}
             onPickBuild={onPickBuild}
+            // ABSENT, NEVER GREYED (design §7 rule 5 / ColumnPullTab.tsx:130). A project with no
+            // dev server shows two segments, not three greyed ones.
+            previewEnabled={previewable}
+            onPickPreview={onPickPreview}
           />
           {/* Expand-all / collapse-all, where the `«` chevron used to sit. Hidden in Plan (no rows)
               and when NO head has workers — a control that would act on nothing is worse than none.

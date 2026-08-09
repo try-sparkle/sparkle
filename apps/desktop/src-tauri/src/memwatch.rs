@@ -29,7 +29,7 @@
 //! Everything that makes a decision here is a pure function over a [`MemorySample`] / a process
 //! table, so tests drive it deterministically. Nothing in a unit test shells out to `vm_stat`.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -499,6 +499,47 @@ pub fn agent_footprints(rows: &[ProcRow], roots: &[(String, u32)]) -> Vec<AgentF
             proc_count: count,
             rss_bytes: rss,
         });
+    }
+    out
+}
+
+/// Every pid in `root`'s process TREE, including `root` itself. Deterministic (a `BTreeSet`), so a
+/// caller can render it into an argument list and get a stable command line.
+///
+/// **Why this exists separately from [`agent_footprints`].** `preview.rs` has to find the TCP port a
+/// dev server bound, and the process that binds it is never the child Sparkle spawned: `pnpm` execs
+/// `node`, which forks the framework's CLI, which forks the server — measured four levels deep for
+/// `next dev`. A discovery that only inspects the direct child finds no listener and times out on
+/// every preview, silently. So the tree walk is the load-bearing part, and it is shared code rather
+/// than a second copy of the BFS.
+///
+/// It is deliberately NOT a refactor of `agent_footprints` to call this. That function's boundary
+/// rule — a subtree belongs to its NEAREST enclosing root, and a pid is claimed at most once — is
+/// what keeps per-AGENT RSS attribution honest, and it has no analogue here: a preview tree has one
+/// root and nothing to be attributed away to. Folding the two would either drag that rule into a
+/// place it means nothing, or dilute it where it is load-bearing.
+///
+/// A ppid cycle (a racy `ps` snapshot can produce one) cannot hang it: the output set doubles as the
+/// visited set, so each pid is expanded once.
+pub fn descendant_pids(rows: &[ProcRow], root: u32) -> BTreeSet<u32> {
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for r in rows {
+        // Self-parenting is an immediate cycle; not recording the edge keeps the common walk cheap
+        // (the visited set would catch it anyway).
+        if r.ppid != r.pid {
+            children.entry(r.ppid).or_default().push(r.pid);
+        }
+    }
+    let mut out: BTreeSet<u32> = BTreeSet::new();
+    let mut queue: VecDeque<u32> = VecDeque::new();
+    queue.push_back(root);
+    while let Some(pid) = queue.pop_front() {
+        if !out.insert(pid) {
+            continue;
+        }
+        if let Some(kids) = children.get(&pid) {
+            queue.extend(kids.iter().copied());
+        }
     }
     out
 }
@@ -1336,6 +1377,35 @@ mod tests {
         assert_eq!(f[0].proc_count, 3);
         assert_eq!(f[1].rss_bytes, 500 * MIB);
         assert_eq!(f[1].proc_count, 1);
+    }
+
+    /// `descendant_pids` must reach the WHOLE tree, not one generation. `preview.rs` asks a dev
+    /// server's tree which TCP port it bound, and the listener belongs to a great-grandchild
+    /// (`pnpm` → `node` → `next` → `next-server`); a walk that stopped at the direct child would
+    /// return a set that contains no listener at all, and every preview would time out.
+    #[test]
+    fn descendant_pids_reaches_the_whole_tree_and_only_that_tree() {
+        let rows = vec![
+            row(100, 1, 0),   // pnpm — the child Sparkle spawned
+            row(101, 100, 0), // node
+            row(102, 101, 0), // next
+            row(103, 102, 0), // next-server: the process that actually listens
+            row(900, 1, 0),   // an unrelated process, at the same depth as the root
+        ];
+        let tree = descendant_pids(&rows, 100);
+        assert_eq!(tree, BTreeSet::from([100, 101, 102, 103]), "four levels, root included");
+        assert!(!tree.contains(&900), "a sibling subtree is not ours to signal or probe");
+        // A pid with no rows at all is still returned as itself: `ps` races process exit, and a
+        // root that has just been spawned may not be in the snapshot yet.
+        assert_eq!(descendant_pids(&rows, 555), BTreeSet::from([555]));
+    }
+
+    /// A racy `ps` snapshot can contain a parent cycle. The walk must terminate — a hang here would
+    /// wedge the preview supervisor thread rather than fail it.
+    #[test]
+    fn descendant_pids_terminates_on_a_ppid_cycle() {
+        let rows = vec![row(10, 12, 0), row(11, 10, 0), row(12, 11, 0)];
+        assert_eq!(descendant_pids(&rows, 10), BTreeSet::from([10, 11, 12]));
     }
 
     #[test]

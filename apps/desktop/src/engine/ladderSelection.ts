@@ -19,6 +19,7 @@ import type { AgentKind, AgentTabStatus } from "../types";
 import type { WorkflowStageId } from "./workflowStage";
 import { flattenSections, groupAgentsByStage, type StatusBand } from "./buildSections";
 import { topLevelAgents } from "./agentOrdering";
+import type { WorkMode } from "./workMode";
 
 /**
  * The id of the first row the Build column actually renders, or `null` when the ladder is empty
@@ -33,7 +34,10 @@ export function firstLadderRowId<
   T extends { id: string; kind: AgentKind; parentId: string | null },
 >(
   agents: readonly T[],
-  mode: "plan" | "build",
+  // The full union, not a re-listed pair: this only forwards the mode to `topLevelAgents`, whose
+  // answer is the same for every mode, so narrowing it here buys nothing and costs a type error at
+  // the call site every time a mode is added.
+  mode: WorkMode,
   stageOf: (id: string) => WorkflowStageId,
   statusOf: (id: string) => AgentTabStatus,
   visibleBands: Record<StatusBand, boolean>,

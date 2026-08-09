@@ -16,7 +16,7 @@ import { RADIUS } from "../theme/scale";
 afterEach(cleanup);
 
 const props = { beadsEnabled: true, onPickPlan: vi.fn(), onPickBuild: vi.fn() };
-const chevron = (hint: "plan" | "build") =>
+const chevron = (hint: "plan" | "build" | "preview") =>
   document.querySelector<HTMLElement>(`[data-hint="${hint}"]`)!;
 
 describe("PlanBuildToggle — the inactive chevron desaturates and NOTHING else", () => {
@@ -109,5 +109,57 @@ describe("PlanBuildToggle — the `.bhd` mini segment", () => {
     render(<PlanBuildToggle mode="build" {...props} />);
     expect(screen.queryByTestId("plan-build-mini")).toBeNull();
     expect(chevron("build").style.clipPath).toContain("polygon");
+  });
+
+  // ── THE PREVIEW SEGMENT — ABSENT, NEVER GREYED ────────────────────────────────────────────────
+  // Design §7 rule 5, which is `ColumnPullTab.tsx:130`'s rule verbatim: "an affordance that does
+  // nothing is worse than an absent one." A project with no dev server must not grow a third
+  // segment at all — a disabled one is a control the user presses, gets nothing from, and learns
+  // nothing from.
+  //
+  // The two assertions in the first test are deliberately BOTH negatives of different kinds:
+  // "there is no element" and "there is no element that merely looks disabled". Only the second one
+  // fails if someone implements the gate as `disabled={!previewEnabled}`, which is the obvious
+  // wrong answer and renders almost identically.
+  it("renders NO Preview segment when the project cannot be previewed", () => {
+    render(<PlanBuildToggle mode="build" variant="mini" {...props} />);
+    expect(document.querySelector('[data-hint="preview"]')).toBeNull();
+    expect(document.querySelector("button[disabled]")).toBeNull();
+  });
+
+  it("renders Preview when the project can be previewed, and calls its handler", () => {
+    const onPickPreview = vi.fn();
+    render(
+      <PlanBuildToggle
+        mode="build"
+        variant="mini"
+        {...props}
+        previewEnabled
+        onPickPreview={onPickPreview}
+      />,
+    );
+    expect(chevron("preview")).toBeTruthy();
+    fireEvent.click(chevron("preview"));
+    expect(onPickPreview).toHaveBeenCalledTimes(1);
+    // The other two segments are untouched by its arrival.
+    expect(chevron("build")).toBeTruthy();
+    expect(chevron("plan")).toBeTruthy();
+  });
+
+  it("fills Preview and empties the others when Preview is the active mode", () => {
+    render(<PlanBuildToggle mode="preview" variant="mini" {...props} previewEnabled />);
+    expect(chevron("preview").style.background).toBe(C.goldFill);
+    expect(chevron("preview").getAttribute("aria-pressed")).toBe("true");
+    expect(chevron("build").style.background).toBe("transparent");
+    expect(chevron("build").getAttribute("aria-pressed")).toBe("false");
+    expect(chevron("plan").getAttribute("aria-pressed")).toBe("false");
+  });
+
+  // THE CHEVRON VARIANT IS UNCHANGED. It is the Plan column's and the satellite's header, neither
+  // of which the preview slot ever covers — and a third chevron would have to re-cut the
+  // notch/point tessellation, which is written for a two-button strip.
+  it("leaves the chevron strip at two buttons even when previewing is possible", () => {
+    render(<PlanBuildToggle mode="build" {...props} previewEnabled onPickPreview={vi.fn()} />);
+    expect(document.querySelector('[data-hint="preview"]')).toBeNull();
   });
 });

@@ -701,6 +701,38 @@ describe("setWorkMode", () => {
     }
     expect(useUiStore.getState().workModeBySide.right).toBe("build");
   });
+
+  // ── EVERY MODE THE UNION HAS IS REACHABLE FROM HERE ──────────────────────────────────────────
+  // The guard used to be a hand-written `mode !== "plan" && mode !== "build"` beside a type that
+  // already had three members, so the concierge refused `"preview"` with the message `the chevrons
+  // are "plan" and "build"` — telling the user a real mode does not exist (roborev 60625). Both
+  // halves are asserted: the mode is ACCEPTED, and it lands through the store's paired write.
+  it("switches the column to Preview", () => {
+    const v = value(setWorkMode("preview"));
+    expect(v.priorWorkMode).toBe("build");
+    expect(v.workMode).toBe("preview");
+    expect(useUiStore.getState().workModeBySide.right).toBe("preview");
+  });
+
+  // `openPreview`, not a bare `setWorkMode` — the third member of the mode-plus-yield family. The
+  // Improve-Sparkle pane covers whichever surface the column is showing, so entering Preview while
+  // it is up has to make it yield or the op reports success over an unchanged stage.
+  it("drops a covering Improve-Sparkle pane when it enters Preview", () => {
+    useUiStore.setState({ activeSpecial: "sparkle" } as never);
+    value(setWorkMode("preview"));
+    expect(useUiStore.getState().workModeBySide.right).toBe("preview");
+    expect(useUiStore.getState().activeSpecial).toBeNull();
+  });
+
+  // THE REFUSAL MESSAGE IS BUILT FROM THE LIST, which is the half a widened guard alone would leave
+  // standing: the mode would be accepted while the help text still named two of three.
+  it("names every mode when it refuses an unknown one", () => {
+    const bad = setWorkMode("kanban");
+    expect(bad.ok).toBe(false);
+    if (!bad.ok) {
+      for (const m of ["plan", "build", "preview"]) expect(bad.message).toContain(m);
+    }
+  });
 });
 
 // ── reveal (scroll, don't steal) ─────────────────────────────────────────────────────────────

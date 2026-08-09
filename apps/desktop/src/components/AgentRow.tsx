@@ -22,6 +22,7 @@ import {
   FiUploadCloud,
   FiMoreHorizontal,
   FiMessageSquare,
+  FiMonitor,
 } from "react-icons/fi";
 import { C, AGENT_STATUS, FONT_WEIGHT } from "../theme/colors";
 import { FONT_MONO, FONT_UI, RADIUS, TYPE } from "../theme/scale";
@@ -33,6 +34,8 @@ import { useInteractionStore } from "../stores/interactionStore";
 import { useCableStore } from "../stores/cableStore";
 import { useBeadsStore } from "../stores/beadsStore";
 import { useCloudAgentsEnabled } from "../hooks/useCloudAgents";
+import { usePreviewStore } from "../stores/previewStore";
+import { openPreviewServer, PREVIEW_ALREADY_STARTING } from "../services/preview";
 import { refreshAgentBranch } from "../services/branchStatus";
 import { cachedReceipt } from "../services/retroReceipts";
 import { retirementPill } from "../engine/retirementReadiness";
@@ -180,6 +183,11 @@ export const AgentRow = memo(function AgentRow({
   // re-renders the rows rather than the column. This is `cloudOptionVisible` — SIGNED IN, and
   // nothing else — exactly what the creation flow gates its Cloud option on.
   const cloudOfferable = useCloudAgentsEnabled();
+  // The preview affordances, read HERE for the same reason as `cloudOfferable` above: booleans
+  // through a selector re-render the rows that changed, not the column.
+  const previewOfferable = usePreviewStore((s) => s.capability[project.id]?.previewable === true);
+  const openPreviewPane = useUiStore((s) => s.openPreview);
+  const setPreviewEntry = usePreviewStore((s) => s.setPreview);
   const openPromoteToCloud = useUiStore((s) => s.openPromoteToCloud);
   // The OTHER direction. Deliberately NOT gated on `cloudOfferable` (see the button below).
   const openDemoteToLocal = useUiStore((s) => s.openDemoteToLocal);
@@ -1945,6 +1953,74 @@ export const AgentRow = memo(function AgentRow({
           >
             <FiDownloadCloud size={12} />
             Bring down to local…
+          </button>
+        </div>
+      )}
+      {/* "PREVIEW" — open this agent's dev server in the pane (design §8: "the card is where a row's
+          actions live"), sibling of the two cloud items above and gated the same way.
+
+          TWO CONDITIONS, AND BOTH ARE "COULD THIS POSSIBLY WORK":
+            • `previewOfferable` — `preview_capability` said yes for this project. ABSENT when it
+              said no, and absent while it has not answered. §7 rule 5, and ColumnPullTab.tsx:130
+              verbatim: "an affordance that does nothing is worse than an absent one." Never greyed;
+              a disabled control here would be a promise with no way to learn why it is broken.
+            • `a.worktreePath` — a preview server runs IN a worktree. An agent that has not been
+              given one yet has nowhere to run it, and offering the button anyway would spend a
+              round trip to produce an error about a state the row can already see. It is not a
+              permanent no: the item appears when the worktree does. */}
+      {previewOfferable && a.worktreePath && (
+        <div style={{ marginTop: 8 }}>
+          <button
+            type="button"
+            data-testid="open-preview"
+            onClick={(e) => {
+              e.stopPropagation(); // the card's own onClick re-selects the agent
+              // OPEN THE PANE FIRST, and unconditionally. Starting a server takes seconds and the
+              // pane has honest states for every one of them ("starting…", then the failure with
+              // its stderr) — whereas waiting for the invoke before showing anything makes a click
+              // that appears to do nothing, which is the one outcome that reads as broken.
+              openPreviewPane(paneSide);
+              void openPreviewServer({
+                agentId: a.id,
+                projectId: project.id,
+                worktree: a.worktreePath!,
+              }).catch((err: unknown) => {
+                // ONE REJECTION IS NOT A FAILURE: a click landing while this agent's own start is
+                // still in flight is REFUSED by the Rust reservation (which is what stops a second
+                // dev server), and that start is still running and will populate this pane by
+                // event. Painting `failed` over it would report a broken preview for the one case
+                // where nothing is wrong — and the pane's failed state is terminal, so the honest
+                // "starting…" would never come back.
+                if (String(err).includes(PREVIEW_ALREADY_STARTING)) return;
+                // A REJECTED INVOKE PRODUCES NO EVENT, so nothing else would ever write this
+                // agent's entry and the pane would sit on "starting…" for good. Record the failure
+                // ourselves — the pane's failed state exists precisely so a server that dies before
+                // it listens says so instead of showing a blank white frame.
+                setPreviewEntry(a.id, {
+                  id: null,
+                  status: "failed",
+                  url: null,
+                  port: null,
+                  error: String(err),
+                });
+              });
+            }}
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 6,
+              background: "transparent",
+              color: C.cream,
+              border: `1px solid ${C.muted}`,
+              borderRadius: RADIUS.sm,
+              padding: "4px 9px",
+              cursor: "pointer",
+              fontSize: 12,
+              fontFamily: FONT_UI,
+            }}
+          >
+            <FiMonitor size={12} />
+            Preview
           </button>
         </div>
       )}

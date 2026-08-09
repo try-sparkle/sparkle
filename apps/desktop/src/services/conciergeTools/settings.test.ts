@@ -292,6 +292,93 @@ describe("setProjectConfig", () => {
     },
   );
 
+  // The mirror image of the refusal tests above, and the reason this file's allowlist has to move
+  // whenever the Rust merge does. `[preview]` is project-overridable in BOTH arms of
+  // build_effective (config.rs `apply_preview`), so refusing it here would be a STALE refusal:
+  // the concierge declining a write that Rust would honor, which is the failure the module's own
+  // doc predicts for any section added on the Rust side without an edit here.
+  //
+  // Asserts the SIDE EFFECT — that the write actually reached `setProject` — rather than merely
+  // that `ok` is true. An allowlist edit that let the call through but dropped the write would
+  // satisfy a truthiness check and still leave the setting unmoved.
+  it.each(["preview.idle_grace_min", "preview.auto_open"])(
+    "ALLOWS %s at project scope — whether a project is worth previewing is a property of the project",
+    async (key) => {
+      setProject.mockClear();
+      const res = await setProjectConfig(ROOT, key, "never", { confirm: true }, deps);
+      expect(res.ok).toBe(true);
+      expect(setProject).toHaveBeenCalledWith(ROOT, key, "never");
+    },
+  );
+
+  it("ALLOWS preview.enabled = false — a project may opt itself out", async () => {
+    setProject.mockClear();
+    const res = await setProjectConfig(ROOT, "preview.enabled", false, { confirm: true }, deps);
+    expect(res.ok).toBe(true);
+    expect(setProject).toHaveBeenCalledWith(ROOT, "preview.enabled", false);
+  });
+
+  it("REFUSES preview.enabled = true at project scope, WITHOUT claiming the preview is globally off", async () => {
+    // config.rs's apply_preview ignores a project `true`, so this would write cleanly into the
+    // file and change nothing. The dangerous half is that `enabled` gates spawning a long-lived
+    // process whose command line comes from repo-controlled data.
+    //
+    // THE SECOND ASSERTION IS THE LOAD-BEARING ONE, and it is why this case no longer shares the
+    // `toContain("global config")` check with the machine-wide-section tests above. This refusal
+    // used to end "cannot turn it back on for a user who disabled it globally. Set it in the global
+    // config instead" — but the preview is ON by default and this function never reads the global
+    // value, so a user whose preview was already on got a false statement about their config and
+    // was sent to change a setting that already held the value they wanted. A remedy string is an
+    // instruction someone will follow; the copy now states only what is true at any global setting.
+    setProject.mockClear();
+    const res = await setProjectConfig(ROOT, "preview.enabled", true, { confirm: true }, deps);
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.reason).toBe("invalid-key");
+      expect(res.message).toContain("no-op");
+      expect(res.message).not.toMatch(/Set .* in the global config instead/);
+    }
+    expect(setProject).not.toHaveBeenCalled();
+  });
+
+  it.each(["preview.command", "preview.args", "preview.path", "preview.port"])(
+    "READING %s says it cannot see the key, never that it is unset",
+    async (key) => {
+      // The lie, not just the write that preceded it. These keys are absent from the merged
+      // config BY DESIGN, so the generic read path finds nothing and reports "neither the project
+      // file nor the global one has it" — false for a project file that carries the override. And
+      // since the write path now refuses them, hand-editing is the ONLY supported way to set
+      // them, so this false report sits on the supported path.
+      const res = await readProjectConfig(ROOT, key, deps);
+      expect(res.ok).toBe(false);
+      if (!res.ok) {
+        expect(res.reason).toBe("invalid-key");
+        expect(res.message).toContain("detection override");
+        // The specific words that would be a lie.
+        expect(res.message).not.toContain("is not set");
+        expect(res.message).not.toContain("neither the project file");
+      }
+    },
+  );
+
+  it.each(["preview.command", "preview.args", "preview.path", "preview.port"])(
+    "REFUSES %s — a detection override this tool would write and then report back as unset",
+    async (key) => {
+      // These four are read straight off the project file by preview.rs and never reach the merged
+      // SparkleConfig, so readProjectConfig would walk the effective config, find nothing, and say
+      // "not set" about a key it had just written. `args` could not be written at all regardless —
+      // valueProblem rejects arrays and the documented form is ["run", "dev:web"].
+      setProject.mockClear();
+      const res = await setProjectConfig(ROOT, key, "pnpm", { confirm: true }, deps);
+      expect(res.ok).toBe(false);
+      if (!res.ok) {
+        expect(res.reason).toBe("invalid-key");
+        expect(res.message).toContain("by hand");
+      }
+      expect(setProject).not.toHaveBeenCalled();
+    },
+  );
+
   it("refuses a section the project layer has never honored, naming the ones it does", async () => {
     // Nothing comes back from Rust for this — it parses fine and is skipped in silence.
     const res = await setProjectConfig(ROOT, "brandnew.knob", 1, {}, deps);

@@ -872,7 +872,12 @@ fn resolve_server_url(raw: Option<&str>, is_dev: bool) -> String {
 
 /// An override is acceptable if it's HTTPS, or plain HTTP pointed at the loopback interface (the
 /// only case where a cleartext bearer never leaves the machine).
-fn is_safe_override(raw: &str) -> bool {
+/// `pub(crate)` ONLY so `preview.rs` can assert, in one test, that this function and
+/// `preview::preview_url_is_loopback` disagree on `https://evil.example`. That disagreement is the
+/// whole point: this gate is right for an API base carrying a bearer token and catastrophically
+/// wrong for a preview pane, and a shared test is what makes a future "just reuse it" refactor go
+/// red instead of silently widening the preview gate.
+pub(crate) fn is_safe_override(raw: &str) -> bool {
     if let Some(rest) = raw.strip_prefix("https://") {
         return !rest.is_empty();
     }

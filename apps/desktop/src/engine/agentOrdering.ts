@@ -16,6 +16,7 @@
 // that one is untouched and still sorts, which is fine: the tray is a glanceable digest, not a
 // spatial map the user navigates by memory.)
 import type { AgentKind } from "../types";
+import type { WorkMode } from "./workMode";
 
 /**
  * The top-level agent stack the sidebar renders, in `project.agents` order.
@@ -38,12 +39,15 @@ import type { AgentKind } from "../types";
  *
  * Pure and id-preserving: a filtered view of the input in input order. The caller then groups these
  * into the stage ladder (buildSections.groupAgentsByStage), which is what decides vertical position.
- * `workMode` is accepted for signature stability with its callers; the rows are the same for Plan
- * and Build (Plan renders a board in the main pane, not a different agent list).
+ * `workMode` is accepted for signature stability with its callers; the rows are the same for every
+ * mode (Plan renders a board and Preview renders a framed dev server — both are surfaces in the
+ * main pane, neither is a different agent list). It takes the full `WorkMode` union rather than
+ * re-listing its members, so a mode added later cannot be rejected here by an enumeration nobody
+ * remembered to widen.
  */
 export function topLevelAgents<
   T extends { id: string; kind: AgentKind; parentId: string | null },
->(agents: readonly T[], _workMode: "plan" | "build" = "build"): T[] {
+>(agents: readonly T[], _workMode: WorkMode = "build"): T[] {
   return agents.filter(isTopLevelAgent(agents));
 }
 
@@ -70,9 +74,10 @@ export function isTopLevelAgent<
  * The agent to land selection on for a given work mode: the first top-level row, or `null` when
  * that mode has no such row.
  *
- * `"plan"` is treated like `"build"` here ON PURPOSE: the plan-mode sidebar renders no rows (it
- * shows a board in the main pane), but selection still persists for when the user switches back to
- * Build, so we pick the first build-side row rather than clearing it.
+ * `"plan"` (and `"preview"`) is treated like `"build"` here ON PURPOSE: neither mode's sidebar
+ * renders a different row set (both show a surface in the main pane), but selection still persists
+ * for when the user switches back to Build, so we pick the first build-side row rather than
+ * clearing it.
  *
  * NOTE this is `project.agents` order, NOT the rendered ladder order — the ladder needs each
  * agent's workflow stage, which this pure helper has no access to. The two can disagree when the
@@ -84,6 +89,6 @@ export function isTopLevelAgent<
  */
 export function firstVisibleAgentId<
   T extends { id: string; kind: AgentKind; parentId: string | null },
->(agents: readonly T[], mode: "plan" | "build"): string | null {
+>(agents: readonly T[], mode: WorkMode): string | null {
   return topLevelAgents(agents, mode)[0]?.id ?? null;
 }

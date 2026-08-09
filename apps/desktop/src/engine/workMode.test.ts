@@ -29,4 +29,18 @@ describe("reconcileWorkMode", () => {
   it("keeps the user's chosen mode when the pane is empty (no selection)", () => {
     expect(reconcileWorkMode(false, "build", false)).toBeNull();
   });
+
+  // ── THE THIRD MODE, AND THE ONE ASSERTION THAT PAYS FOR THE GUARD ──────────────────────────────
+  // This is the case the old `mode === "plan"` guard got wrong, and getting it wrong made Preview
+  // unreachable rather than merely quirky: with a row selected — which is the normal state of a
+  // build column, and the only way anyone opens a preview — the helper answered "build", and
+  // AgentSidebar's effect wrote it, so the column left Preview on the frame it entered.
+  //
+  // MUTATION TARGET, and it is exact: restore `mode === "plan"` in workMode.ts and this line goes
+  // red with "build". Nothing else in the suite notices, which is why it is spelled out here.
+  it("never auto-changes Preview mode, even with an agent selected", () => {
+    expect(reconcileWorkMode(true, "preview", false)).toBeNull();
+    expect(reconcileWorkMode(false, "preview", false)).toBeNull();
+    expect(reconcileWorkMode(true, "preview", true)).toBeNull();
+  });
 });
