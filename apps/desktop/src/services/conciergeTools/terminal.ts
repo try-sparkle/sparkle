@@ -19,7 +19,12 @@
 //   (a) scrollback       — the live xterm buffer. What the terminal shows RIGHT NOW. Mounted panes only.
 //   (b) attention-screen — runtimeStore.attentionScreen[agentId], the screen captured the moment the
 //                          agent crossed into waiting/approval. Survives an unmounted pane and is
-//                          usually the exact text of the ask; it is a SNAPSHOT, not the present.
+//                          usually the exact text of the ask; it is a SNAPSHOT, not the present. It
+//                          is EXPIRED rather than immortal (sparkle-99o9a) — twice over, and neither
+//                          expiry alone covers the tier: the store drops it when the agent leaves
+//                          red, which never fires for an agent whose pane is unmounted, and
+//                          `captureFor` additionally discards it once the movement ledger has seen
+//                          that agent act since. Read that as "bounded", not as "live".
 //   (c) history-search   — the SQLite FTS store (src-tauri/src/history.rs) of every prompt/response.
 //                          Snippets, not screens, and query-driven (see the note on the tier below).
 //   (d) transcript       — read_transcript_last_assistant (src-tauri/src/transcript.rs): the last
@@ -69,9 +74,13 @@ import {
 import { isDispatchAuthority, type ConciergeToolAuthority } from "../dispatchAuthority";
 import { PtyGoneError, writePtyChainedStrict } from "../../pty";
 import { searchHistory } from "../history";
+import { pickerParseDiagnosis, type PickerBlindness } from "../suggestions/heuristics";
 import { SNAPSHOT_MAX_LINES, getAgentScrollback } from "../terminalScrollback";
 import { agentTranscriptPath, agentTranscriptWorktree } from "../agentTranscriptRegistry";
 import { isRedStatus } from "../windowStatus";
+// The "has this agent acted since its red was raised" ledger, shared with the concierge feed's
+// stale-red retraction — see `captureFor` for why the ask-screen needs the same answer.
+import { movedSince, windowRetractionLedger } from "../../engine/movementRetraction";
 import { isObserved, type AgentLiveness } from "../agentLiveness";
 import {
   goalReading,
@@ -520,13 +529,45 @@ function readScrollbackTier(agentId: string): TierResult {
   return { text: raw };
 }
 
-/** Tier (b): the screen captured when the agent crossed into waiting/approval. */
-function readAttentionTier(agentId: string): TierResult {
+/**
+ * The captured ask-screen, with BOTH expiries applied — the one place either is asked, so tier (b)
+ * and `mayHaveMenu` cannot end up believing different things about the same snapshot.
+ *
+ * TWO EXPIRIES, BECAUSE ONE SIGNAL DOES NOT COVER THE POPULATION THIS TIER EXISTS FOR.
+ *
+ *   1. `runtimeStore.setStatus` drops the capture when the agent leaves the red tier (sparkle-99o9a).
+ *      That is the whole answer for an agent with a MOUNTED pane — but `runtimeStore.status` has
+ *      exactly one writer, `components/AgentPane`, so for an agent this window is not hosting the
+ *      status is a frozen last reading and no `setStatus` ever runs (engine/movementRetraction's
+ *      header states this at length). That is precisely the population that reaches tier (b) at all:
+ *      tier (a) is consulted first and is blind exactly when the pane is unmounted. So expiry 1 alone
+ *      would leave the capture immortal for every agent it actually matters for.
+ *   2. So the second expiry reads the signal that DOES exist for an unhosted agent: the movement
+ *      ledger `engine/movementRetraction` accumulates from `fleet_digest` — hook work events, session-
+ *      gated, high-water-marked per red episode. `movedSince` is the SAME predicate the concierge feed
+ *      uses to retract a frozen red from the UI, imported rather than restated: if it is enough to say
+ *      "that red is over", it is enough to say "the screen that red was raised on is over".
+ *
+ * Both fail toward SERVING the capture: an empty ledger (no feed built yet) and a status nobody has
+ * moved both leave it in place. For `mayHaveMenu` that is the fail-closed direction (it keeps
+ * refusing); for the read chain it is today's behaviour.
+ */
+function captureFor(agentId: string): TierResult {
   const raw = useRuntimeStore.getState().attentionScreen[agentId];
   if (!raw || raw.trim() === "") {
     return { why: "the agent hasn't stopped to ask anything, so no ask-screen was captured" };
   }
+  if (movedSince(windowRetractionLedger(), agentId)) {
+    return {
+      why: "the agent captured an ask-screen, but it has been seen working since — that screen describes a question it has already moved past",
+    };
+  }
   return { text: raw };
+}
+
+/** Tier (b): the screen captured when the agent crossed into waiting/approval. */
+function readAttentionTier(agentId: string): TierResult {
+  return captureFor(agentId);
 }
 
 /**
@@ -1066,7 +1107,7 @@ export const CONCIERGE_TERMINAL_TOOLS = [
   {
     name: "read_picker_options",
     description:
-      "Read the menu an agent is offering right now, as indexed options. Empty when there is no menu — a normal state, not an error. A PRESENT menu with an EMPTY `fingerprint` is different: the menu is there but its question could not be read, so it cannot be told apart from any other menu with the same options and is NOT answerable — relay it to the human rather than pressing anything. Read this BEFORE select_picker_option: that op requires you to echo back the `fingerprint` this returns, which covers the question AND the options — so a menu that re-rendered into a different ask is refused rather than answered.",
+      "Read the menu an agent is offering right now, as indexed options. Empty when there is no menu — a normal state, not an error. An empty read also says WHY in `blind`: `no-menu` (nothing on screen resolves to a menu — the agent is working, and this is the overwhelmingly common case), `pane-not-mounted` (this window cannot see that terminal at all), or `footer-without-options` (a dialog IS up and its options could not be read — relay that to the human, who can open the pane and answer it). `blind` is REPORTING, never permission: no value of it makes anything pressable. A PRESENT menu with an EMPTY `fingerprint` is different: the menu is there but its question could not be read, so it cannot be told apart from any other menu with the same options and is NOT answerable — relay it to the human rather than pressing anything. Read this BEFORE select_picker_option: that op requires you to echo back the `fingerprint` this returns, which covers the question AND the options — so a menu that re-rendered into a different ask is refused rather than answered.",
     write: false,
   },
   {
@@ -1138,16 +1179,37 @@ export interface PickerOptionsRead {
    *  global constant. `select_picker_option` refuses on an empty fingerprint rather than comparing
    *  it, so the two collapse to the same safe outcome and the caller never has to tell them apart. */
   fingerprint: string;
+  /** WHY there is nothing to press, when `present` is false. Absent when a menu WAS read.
+   *
+   *  REPORTING, NOT A DECISION. Nothing branches on this and nothing may: the refusal is unchanged
+   *  and does not soften for any value. It exists because an empty read used to be indistinguishable
+   *  from an agent that is simply working, so the concierge could not tell the human WHICH agent
+   *  needed a click and why — and no occurrence left a trace anyone could count afterwards, which is
+   *  why bead sparkle-99o9a took four hand-observed incidents to characterise. */
+  blind?: "pane-not-mounted" | PickerBlindness;
 }
 
 /** Read the options an agent is offering, so the caller can decide (or relay them to the human). */
 export function readPickerOptions(agentId: string): PickerOptionsRead {
   const live = liveOptionsFor(agentId);
+  if (live.length > 0) {
+    return {
+      agentId,
+      options: live.map((o, index) => ({ index, label: o.label })),
+      present: true,
+      fingerprint: pickerFingerprint(agentId, live),
+    };
+  }
+  // Empty. Say WHY — see `pickerParseDiagnosis`. The pane-not-mounted case is answered here rather
+  // than by the parser because the parser is handed `""` either way and cannot tell "the agent has
+  // no menu" from "this window cannot see that agent's terminal at all".
+  const scrollback = getAgentScrollback(agentId);
   return {
     agentId,
-    options: live.map((o, index) => ({ index, label: o.label })),
-    present: live.length > 0,
-    fingerprint: live.length > 0 ? pickerFingerprint(agentId, live) : "",
+    options: [],
+    present: false,
+    fingerprint: "",
+    blind: scrollback === null ? "pane-not-mounted" : pickerParseDiagnosis(scrollback),
   };
 }
 
@@ -1291,8 +1353,12 @@ const PICKER_DRIVING_KEYS = new Set<ControlKeyName>(["enter", "up", "down", "lef
  *
  * TIER (a) IS EXCLUSIVE WHEN IT IS READABLE. `liveOptionsFor` reads the live xterm buffer, which is
  * the present tense; `attentionScreen` is a SNAPSHOT taken when the agent crossed into
- * waiting/approval and is never cleared when it answers and resumes (runtimeStore drops it only on
- * close/reset). Consulting the snapshot while the live screen is readable and definitively clean
+ * waiting/approval. It is now BOUNDED — `captureFor` applies both expiries (sparkle-99o9a) — but
+ * bounded is not live, and the `isRedStatus` gate below STAYS: two safety properties, held in two
+ * places on purpose. A capture can still describe an ask this agent answered and re-entered within
+ * one red span, and neither expiry can see an agent that is unhosted AND absent from the digest.
+ *
+ * Consulting the snapshot while the live screen is readable and definitively clean
  * would refuse `enter` and the arrows FOREVER for any agent that has ever hit a picker — and
  * `select_picker_option` refuses there too (`no-picker`), so the refusal's own remedy is a dead end
  * and the concierge has no route at all. That is a deadlock, not a guard (roborev 55170). It also
@@ -1307,10 +1373,9 @@ const PICKER_DRIVING_KEYS = new Set<ControlKeyName>(["enter", "up", "down", "lef
  */
 function mayHaveMenu(agentId: string): boolean {
   if (getAgentScrollback(agentId) !== null) return liveOptionsFor(agentId).length > 0;
-  const { attentionScreen, status } = useRuntimeStore.getState();
-  if (!isRedStatus(status[agentId])) return false;
-  const captured = attentionScreen[agentId];
-  return typeof captured === "string" && detectTerminalPrompts(captured).length > 0;
+  if (!isRedStatus(useRuntimeStore.getState().status[agentId])) return false;
+  const captured = captureFor(agentId);
+  return hasText(captured) && detectTerminalPrompts(captured.text).length > 0;
 }
 
 /** The names, for the wire enum and for a caller listing what it may press. */

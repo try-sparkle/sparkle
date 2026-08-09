@@ -1,14 +1,16 @@
 import { describe, it, expect } from "vitest";
 import { snapshotScreen, type ScreenBufferLike } from "./screenSnapshot";
 
-// A fake xterm buffer: each string is one line; translateToString returns it verbatim.
+// A fake xterm buffer: each string is one UNWRAPPED row, so these cases read exactly as before the
+// rejoin landed (bead sparkle-99o9a). Wrapping has its own coverage in
+// `services/suggestions/wrappedPickerFooter.test.ts` and `engine/rejoinWrapped.test.ts`.
 function fakeBuffer(lines: string[]): ScreenBufferLike {
   return {
     length: lines.length,
     getLine: (i) => {
       if (i < 0 || i >= lines.length) return undefined;
       const text = lines[i] ?? "";
-      return { translateToString: () => text };
+      return { translateToString: () => text, isWrapped: false };
     },
   };
 }
@@ -27,7 +29,7 @@ describe("snapshotScreen", () => {
   it("renders a missing line as an empty string rather than crashing", () => {
     const buf: ScreenBufferLike = {
       length: 2,
-      getLine: (i) => (i === 0 ? { translateToString: () => "first" } : undefined),
+      getLine: (i) => (i === 0 ? { translateToString: () => "first", isWrapped: false } : undefined),
     };
     expect(snapshotScreen(buf, 2)).toBe("first\n");
   });

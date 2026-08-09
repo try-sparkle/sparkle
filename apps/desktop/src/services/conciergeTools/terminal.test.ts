@@ -51,6 +51,8 @@ import { PtyGoneError, submitPrompt, writePtyChainedStrict } from "../../pty";
 import { searchHistory } from "../history";
 import { useRuntimeStore, readPersistedOpenAgentIds } from "../../stores/runtimeStore";
 import { getAgentScrollback } from "../terminalScrollback";
+import { FOOTER_ONLY_SCREEN } from "../../engine/incidentScreens.fixture";
+import type { PickerOptionsRead } from "./terminal";
 import {
   CONTROL_KEYS,
   CONTROL_KEY_NAMES,
@@ -1331,6 +1333,113 @@ describe("read_picker_options", () => {
     scrollbackMock.mockReturnValue(MENU);
     expect(readPickerOptions(AGENT).fingerprint).toBe(readPickerOptions(AGENT).fingerprint);
   });
+
+  // ── WHY IT IS BLIND (bead sparkle-99o9a) ────────────────────────────────────────────────────
+  // An empty read used to be one undifferentiated answer, so "this agent is working" and "this
+  // agent has a dialog I could not parse" were the same result — which is why the incident needed
+  // four hand-observed occurrences before anyone could say what it was. These pin that the three
+  // causes are now told apart AT THE PRODUCTION ENTRY POINT, not in the parser alone.
+  //
+  // WHAT WOULD MAKE THESE VACUOUS: asserting `present === false`, which was already true for every
+  // one of them. The assertion is the `blind` value, and each fixture is a DIFFERENT screen.
+  describe("says why it is blind", () => {
+    it("distinguishes a pane this window cannot see from an agent with no menu", () => {
+      scrollbackMock.mockReturnValue(null);
+      expect(readPickerOptions(AGENT).blind).toBe("pane-not-mounted");
+
+      scrollbackMock.mockReturnValue("just some build output\nnothing to answer here");
+      expect(readPickerOptions(AGENT).blind).toBe("no-menu");
+    });
+
+    // THE ARM THAT WAS DELETED (roborev 61832). A numbered plan is indistinguishable from a
+    // footerless dialog, and it is far more common — so it must read as `no-menu`, never as
+    // "something needs a human". Without this fixture the weak predicate was never exercised
+    // against ordinary prose, which is exactly why it shipped.
+    it("does not escalate an agent that is merely printing a numbered list", () => {
+      scrollbackMock.mockReturnValue(
+        ["Here is the plan:", "  1. Read the file", "  2. Patch it", "  3. Run the tests"].join("\n"),
+      );
+      const read = readPickerOptions(AGENT);
+      expect(read.present).toBe(false);
+      expect(read.blind).toBe("no-menu");
+    });
+
+    // THE approvalDeadEnd SHAPE, pinned on that suite's own fixture so the taxonomy cannot drift
+    // from the incident it is supposed to let someone count (roborev 61832).
+    it("names the approvalDeadEnd screen as a footer whose options could not be read", () => {
+      // THE SHARED fixture, not a copy of its text (roborev 61842): a change to the incident's
+      // rendering must fail this suite and approvalDeadEnd's together, or the "cannot drift"
+      // claim above is decoration.
+      scrollbackMock.mockReturnValue(FOOTER_ONLY_SCREEN);
+      expect(readPickerOptions(AGENT).blind).toBe("footer-without-options");
+    });
+
+    it("names a footer whose option block did not parse", () => {
+      scrollbackMock.mockReturnValue(
+        ["I finished the rebase and pushed it.", "Enter to select \u00b7 Tab/Arrow keys to navigate \u00b7 Esc to cancel"].join("\n"),
+      );
+      const read = readPickerOptions(AGENT);
+      expect(read.present).toBe(false);
+      expect(read.blind).toBe("footer-without-options");
+    });
+
+    // The field is ABSENT on a successful read — a caller must not have to check both.
+    it("says nothing when a menu was read", () => {
+      scrollbackMock.mockReturnValue(MENU);
+      const read = readPickerOptions(AGENT);
+      expect(read.present).toBe(true);
+      expect(read.blind).toBeUndefined();
+    });
+
+    // ── THE DESCRIPTOR IS THE MODEL'S ONLY GUIDE, SO IT MUST MATCH THE UNION (roborev 61842) ──
+    // The prose was hand-edited to drop a value, and nothing tied it to `PickerBlindness`: the
+    // revert was un-guarded in both directions. A value added to the union would otherwise ship
+    // with a description telling the model it does not exist, so an unknown cause reaches the
+    // concierge with no guidance on whether it means "relay this to a human".
+    //
+    // `satisfies Record<…, true>` is what keeps this exhaustive at COMPILE time — adding a member
+    // to the union without adding it here is a typecheck error, not a silently-passing test.
+    it("describes every blindness cause it can return, and no cause it retired", () => {
+      // KEYED OFF THE RETURNED TYPE, not off `PickerBlindness` (roborev 61864). The field the
+      // descriptor documents is `PickerOptionsRead["blind"]`, which is WIDER — `pane-not-mounted`
+      // is added at the tool layer, not in `heuristics.ts`. Checking the narrower union and then
+      // splicing the tool-layer value in as a bare literal left the half that people actually
+      // extend unguarded: a second tool-layer cause would typecheck, keep this green, and ship a
+      // description telling the model it does not exist.
+      const CAUSES = {
+        "no-menu": true,
+        "footer-without-options": true,
+        "pane-not-mounted": true,
+      } satisfies Record<NonNullable<PickerOptionsRead["blind"]>, true>;
+      // Causes this branch RETIRED — exactly one. `cloud-agent` was in this list and was wrong
+      // (roborev 61881): it was never a blindness cause, so the assertion was true before the
+      // change and no regression in the thing under test could make it false — the vacuous shape
+      // AGENTS.md calls the #1 fleet finding. Worse, it is a LIVE term in a different taxonomy (a
+      // dispatch refusal reason, asserted further down this same file), so a legitimate future
+      // descriptor edit mentioning cloud agents would have redded this and the maintainer would
+      // have deleted an assertion that never guarded anything.
+      const RETIRED = ["no-footer"]; // deleted in e34b7e6ce: it could not tell a plan from a dialog
+      const descriptor = CONCIERGE_TERMINAL_TOOLS.find((t) => t.name === "read_picker_options");
+      const text = descriptor?.description ?? "";
+
+      for (const cause of Object.keys(CAUSES)) {
+        expect(text, `descriptor must document \`${cause}\``).toContain(cause);
+      }
+      for (const gone of RETIRED) {
+        expect(text, `descriptor must not still offer \`${gone}\``).not.toContain(gone);
+      }
+    });
+
+    // REPORTING, NOT PERMISSION. Every blind value still refuses the press.
+    it("does not make anything pressable", async () => {
+      scrollbackMock.mockReturnValue(
+        ["I finished the rebase and pushed it.", "Enter to select \u00b7 Tab/Arrow keys to navigate \u00b7 Esc to cancel"].join("\n"),
+      );
+      const r = await selectPickerOption(AGENT, 0, "anything", ALLOWED);
+      expect(r.ok).toBe(false);
+      expect(r.reason).toBe("no-picker");
+    });
+  });
 });
 
 describe("select_picker_option", () => {
@@ -1660,11 +1769,17 @@ describe("the control-key picker guard consults the captured screen too", () => 
 
 // THE GUARD MUST NOT OUTLIVE THE MENU (roborev 55170).
 //
-// attentionScreen is written on the transition into waiting/approval and cleared only by
-// close()/resetProgress() — nothing clears it when the agent answers and gets back to work. So a
-// guard that consults it unconditionally refuses the driving keys forever after an agent's FIRST
-// ask, and select_picker_option refuses in the same state: no route at all, which is a deadlock
-// rather than a guard.
+// attentionScreen is written on the transition into waiting/approval. When these cases were written
+// it was cleared only by close()/resetProgress() — nothing dropped it when the agent answered and
+// got back to work — so a guard that consults it unconditionally refuses the driving keys forever
+// after an agent's FIRST ask, and select_picker_option refuses in the same state: no route at all,
+// which is a deadlock rather than a guard.
+//
+// The capture now ALSO expires when the agent leaves the red tier (sparkle-99o9a,
+// runtimeStore.setStatus) — but these cases stay, and they stay driving a HAND-SEEDED store. That is
+// the point: this suite mocks the runtime store, so what it pins is that the guard is correct about
+// a stale capture it is HANDED, independently of who else is bounding that map. The expiry has its
+// own suite (terminal.attentionExpiry.test.ts) driving the real store.
 describe("a STALE captured menu does not outlive the pane that can see", () => {
   const MENU3 = ["Select an option:", "  1) Yes", "  2) No", "Enter your choice: "].join("\n");
 

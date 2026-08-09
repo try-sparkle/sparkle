@@ -2,7 +2,7 @@ import type { SuggestionButton } from "./types";
 // The picker-footer regex is owned by the engine's screenClassifier (the single retune point for
 // Claude Code TUI drift) and re-exported here for approvalClassifier, so the option detector, the
 // category classifier, and the red-vs-gray status check can never desync on what marks a picker.
-import { PICKER_FOOTER } from "../../engine/screenClassifier";
+import { PICKER_FOOTER, pickerFooterSpan } from "../../engine/screenClassifier";
 
 export { PICKER_FOOTER };
 
@@ -99,8 +99,13 @@ function truncateLabel(s: string): string {
 export interface PickerBounds {
   /** Index of the first option row (option "1"). */
   first: number;
-  /** Index of the footer line, which sits just below the last option row. */
+  /** Index of the footer's FIRST line, which sits just below the last option row. */
   footer: number;
+  /** Index of the footer's LAST line — the same as `footer` unless the footer wrapped onto a second
+   *  line (bead sparkle-99o9a). A caller asking what sits BELOW the footer must use this one, or it
+   *  reads the footer's own continuation as unrecognised content and calls the screen unanswerable
+   *  (roborev 61827). */
+  footerLast: number;
 }
 
 /** Where the last successful picker parse found its block, or null if there is no valid picker.
@@ -194,17 +199,27 @@ function parsePickerOptions(scrollback: string): { n: number; label: string }[] 
 function parsePickerOptionsWithBounds(scrollback: string): {
   opts: { n: number; label: string }[];
   bounds: PickerBounds | null;
+  /** Where the footer was, or -1. Reported even on a FAILED parse, because "there was a footer and
+   *  the option block did not parse" and "there was no footer at all" are different diagnoses and
+   *  `pickerParseDiagnosis` must not re-derive the answer with a second footer scan of its own. */
+  footerIdx: number;
 } {
   const lines = tail(scrollback, PICKER_WINDOW);
   // The LAST footer wins — an earlier, answered picker higher in the window is stale.
+  // `pickerFooterSpan` rather than `PICKER_FOOTER.test`, so a footer Ink split across two lines at a
+  // narrow pane width is still found — and `footerIdx` is the FIRST of those lines, which is what
+  // keeps the option block above it intact (bead sparkle-99o9a).
   let footerIdx = -1;
+  let footerSpan = 0;
   for (let i = lines.length - 1; i >= 0; i--) {
-    if (PICKER_FOOTER.test(lines[i] ?? "")) {
+    const span = pickerFooterSpan(lines, i);
+    if (span > 0) {
       footerIdx = i;
+      footerSpan = span;
       break;
     }
   }
-  if (footerIdx < 0) return { opts: [], bounds: null };
+  if (footerIdx < 0) return { opts: [], bounds: null, footerIdx };
 
   // Walk the block above the footer bottom-up, collecting options while the numbers count DOWN
   // to 1. Most wrapped description lines don't match PICKER_OPTION and are skipped; one that
@@ -228,8 +243,8 @@ function parsePickerOptionsWithBounds(scrollback: string): {
     if (n === 1) break;
     expected = n - 1;
   }
-  if (opts.length < 2 || opts[0]?.n !== 1) return { opts: [], bounds: null };
-  return { opts, bounds: { first: firstIdx, footer: footerIdx } };
+  if (opts.length < 2 || opts[0]?.n !== 1) return { opts: [], bounds: null, footerIdx };
+  return { opts, bounds: { first: firstIdx, footer: footerIdx, footerLast: footerIdx + footerSpan - 1 }, footerIdx };
 }
 
 /** Detect Claude Code's option picker; returns one button per option ("N · label" → "N\n"). */
@@ -289,4 +304,50 @@ export function detectTerminalPrompts(scrollback: string): SuggestionButton[] {
   }
 
   return [];
+}
+
+// ── WHY THERE IS NOTHING TO PRESS (bead sparkle-99o9a) ────────────────────────────────────────
+// `read_picker_options` used to answer an unreadable menu and an agent that is simply working with
+// the SAME `{options: [], present: false, fingerprint: ""}`. That is safe — it refuses either way —
+// but it is SILENT, and silence is what made the incident take four hand-observed occurrences to
+// characterise: the concierge could not say which agent needed a human and why, and nothing was
+// recorded for anyone to count afterwards.
+//
+// This does not decide anything and must never be used to decide anything. It reports.
+//
+// IT ASKS THE PARSER RATHER THAN RE-DERIVING. Every previous locator written alongside this parser
+// disagreed with it in some way (roborev 55166/55172/55195/55218), and a diagnosis that disagrees
+// with the parse it is explaining is worse than none — it would name the wrong cause confidently.
+// So the footer index comes back FROM the parse.
+
+/** Why a picker parse came back empty. Reported, never acted on. */
+export type PickerBlindness =
+  /** Nothing on screen resolves to a menu. The overwhelmingly common case: the agent is working. */
+  | "no-menu"
+  /** A footer IS there and the option block above it did not parse — the block scrolled out of
+   *  `PICKER_SPAN`, or the rows never matched. This is the `approvalDeadEnd` shape (its
+   *  `FOOTER_ONLY_SCREEN` fixture lands here, and a test pins that): a RED row with nothing
+   *  pressable, and the residual case the wrap fix does not cover. */
+  | "footer-without-options";
+
+/**
+ * Explain an empty picker parse. Only meaningful when the detector returned no options.
+ *
+ * TWO VALUES, NOT THREE (roborev 61832). There was a `no-footer` arm — "option rows are on screen
+ * and no footer closes them" — and it had to go, because nothing available here can tell that from
+ * an agent PRINTING A NUMBERED LIST. Its test was "two lines in the window match
+ * `RENDERED_OPTION_ROW`", which any plan or todo output satisfies; asking the parser's own
+ * question instead (a contiguous 1..N run) does not save it either, since `1. Read the file` /
+ * `2. Patch it` is exactly such a run. The detector needs a footer or a choice prompt to call
+ * something a menu precisely because the rows alone do not carry the answer.
+ *
+ * That mattered because of what the value CLAIMS: the tool description tells the model a
+ * non-`no-menu` cause means something is on screen that a human should be asked to answer. A
+ * numbered plan is the most common thing an agent prints, so the arm would have escalated calm
+ * agents to the founder far more often than it named a real dialog — the exact noise `blind` exists
+ * to remove. Reporting `no-menu` there is not a loss of signal; it is the honest answer.
+ */
+export function pickerParseDiagnosis(scrollback: string): PickerBlindness {
+  const { footerIdx } = parsePickerOptionsWithBounds(scrollback);
+  return footerIdx >= 0 ? "footer-without-options" : "no-menu";
 }

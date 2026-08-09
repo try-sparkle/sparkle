@@ -178,3 +178,55 @@ describe("screenOffersAnswer — a LIVE picker under Claude's real chrome tail",
     expect(screenOffersAnswer(screen)).toBe(true);
   });
 });
+
+// ── THE SIDE EFFECT OF `footerLast` (roborev 61836) ───────────────────────────────────────────
+// `bounds.footer` is the FIRST line of a wrapped footer. Passing it to
+// `nothingUnrecognizedBelowFooter` makes the footer's own continuation read as fresh agent output,
+// so the screen is judged unanswerable and the one-tap Approve relay is withheld — for exactly the
+// narrow-pane picker this work exists to fix. Reverting `footerLast` to `footer` must turn this
+// red; without it, that change was guarded by nothing.
+describe("a picker whose footer wrapped is still answerable", () => {
+  // The dialog is LONG on purpose. Arm 2 answers off a cursor inside `LIVE_TAIL_LINES` (12) and
+  // would rescue any short fixture, so a short one proves nothing about arm 1 — where `footerLast`
+  // lives. Verified: with a short dialog, reverting `footerLast` to `footer` leaves the suite GREEN.
+  const options = [
+    " \u276f 1. Push to our fork instead",
+    "     Push the rebased branch to drodio/tkmx-client under the same name.",
+    "     Eran's branch and PR #32 stay untouched.",
+    "   2. Force-push to erans' fork",
+    "     Proceed as originally instructed; maintainerCanModify is true.",
+    "     This rewrites 8 commits on Eran's branch.",
+    "   3. Hold \u2014 just show me the diff",
+    "     Push nothing. I report the resolution only.",
+    "     The branch stays local for you or Eran to act on.",
+    "   4. Type something.",
+    "   5. Chat about this",
+    "     Ask me anything about the two conflict hunks first.",
+  ];
+
+  it("does not read the footer's own continuation as output below it", () => {
+    const screen = [
+      " How do you want to handle this one?",
+      ...options,
+      " Enter to select \u00b7 Tab/Arrow keys to",
+      " navigate \u00b7 Esc to cancel",
+    ].join("\n");
+    expect(screenOffersAnswer(screen)).toBe(true);
+  });
+
+  // THE PAIRED NEGATIVE, so the test above cannot pass by simply ignoring everything below the
+  // footer: genuine output after the dialog still means it has been answered and moved on. The
+  // output has to run past `LIVE_TAIL_LINES`, or arm 2 rescues the screen on the cursor alone and
+  // the pair would prove nothing about arm 1 — which is the arm `footerLast` sits in.
+  it("still rejects the same screen once real output follows the dialog", () => {
+    const screen = [
+      " How do you want to handle this one?",
+      ...options,
+      " Enter to select \u00b7 Tab/Arrow keys to",
+      " navigate \u00b7 Esc to cancel",
+      "\u23fa Pushed to drodio/tkmx-client and opened PR #46.",
+      ...Array.from({ length: 14 }, (_, i) => `  rebasing commit ${i + 1} of 14 onto main`),
+    ].join("\n");
+    expect(screenOffersAnswer(screen)).toBe(false);
+  });
+});

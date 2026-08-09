@@ -249,3 +249,37 @@ describe("classifyApproval — captured Claude Code 2.1.220 screens", () => {
     expect(classifyApproval(ASK_USER_QUESTION_2_1_220)).toBeNull();
   });
 });
+
+// ── THE HEADER REGION SURVIVES A WRAPPED FOOTER (roborev 61836) ───────────────────────────────
+// `headerRegion` slices the lines just ABOVE the footer. With no footer found it falls back to the
+// whole tail window, so unrelated output higher up starts driving the category. Routing this
+// classifier through the pair-aware matcher is what keeps that from happening on a narrow pane —
+// and reverting it to the raw single-line `PICKER_FOOTER.test` must turn this red.
+describe("a permission dialog whose footer wrapped", () => {
+  // Scrolled-past output that would hijack the category via the `bash` rule ("command") if the
+  // footer were missed and the whole window were classified. The dialog itself is an EDIT.
+  //
+  // It has to sit further than PICKER_SPAN (30) above the footer, or `headerRegion` includes it on
+  // BOTH paths and the comparison proves nothing — which is exactly what the first version of this
+  // fixture did, and the test caught it.
+  const NOISE_ABOVE = [
+    "\u23fa I ran the command `git status` to check the tree first.",
+    ...Array.from({ length: 32 }, (_, i) => `  step ${i + 1}: reviewed a hunk`),
+  ];
+  const DIALOG = [
+    " Edit src/app/page.tsx?",
+    " \u276f 1. Yes",
+    "   2. Yes, and don't ask again",
+    "   3. No, and tell Claude what to do differently",
+  ];
+
+  it("classifies off the dialog's own header, not output scrolled above it", () => {
+    const split = [...NOISE_ABOVE, ...DIALOG, " Enter to select \u00b7 Tab/Arrow keys to", " navigate \u00b7 Esc to cancel"].join("\n");
+    const whole = [...NOISE_ABOVE, ...DIALOG, " Enter to select \u00b7 Tab/Arrow keys to navigate \u00b7 Esc to cancel"].join("\n");
+
+    // The unwrapped screen is the reference — this is what the founder sees on a wide pane.
+    expect(classifyApproval(whole)?.category).toBe("edit");
+    // Narrowing the pane must not change the answer.
+    expect(classifyApproval(split)?.category).toBe("edit");
+  });
+});

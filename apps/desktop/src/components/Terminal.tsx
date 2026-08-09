@@ -811,6 +811,15 @@ export function Terminal({
     // to decide red-vs-gray, so it must be created after the terminal exists.
     // For the two "ask" statuses (waiting/approval), capture the current screen FIRST so the
     // notification path can summarize WHAT the agent is asking; then forward to the real onStatus.
+    //
+    // ORDER IS LOAD-BEARING, and there is no matching clear here on purpose. The capture EXPIRES in
+    // runtimeStore's `setStatus`, which drops it whenever an agent's status leaves the red tier
+    // (sparkle-99o9a) — so it must be written BEFORE the status that keeps it, which is what this
+    // ordering does. Clearing it here instead would key the expiry on the SCREEN SCRAPER's emit,
+    // which the statusRouter suppresses outright once hook events own the status, while the guard
+    // that gates on the capture (`conciergeTools/terminal.mayHaveMenu`) reads the STORE's status —
+    // so the two would disagree about the same agent. See the comment on `setStatus`, and
+    // `captureFor` for the second expiry that covers agents whose status has no writer.
     const onStatusWithCapture = (s: AgentTabStatus): void => {
       if (s === "waiting" || s === "approval") {
         useRuntimeStore

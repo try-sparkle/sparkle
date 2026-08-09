@@ -697,7 +697,10 @@ interface RuntimeState {
   agentMovement: Record<string, MovementEvidence>;
   // agentId -> the terminal screen text captured the moment the agent entered an "ask" status
   // (waiting/approval), so the notification path can summarize WHAT it's asking. Live-only (never
-  // persisted, like `status`); cleared whenever `status` is cleared for an agent.
+  // persisted, like `status`); cleared whenever `status` is cleared for an agent — AND, since
+  // sparkle-99o9a, the moment that agent's status leaves the red tier. It is a snapshot of a
+  // question, so it may not outlive the question: see `setStatus` for why the expiry is keyed on
+  // this map's sibling `status` rather than on the Terminal seam that writes it.
   attentionScreen: Record<string, string>;
   // agentId -> how ask-like a FINISHED turn looked that we could NOT judge, because the AI backend
   // was unavailable (services/turnFollowup returns `unknown`). This is the neutral middle state
@@ -746,7 +749,9 @@ interface RuntimeState {
    *  its most recent reading. */
   setAgentMovement: (movement: Record<string, MovementEvidence>) => void;
   /** Store the terminal screen captured when an agent entered an "ask" status, for the notification
-   *  summarizer. Live-only (mirrors `status`). */
+   *  summarizer. Live-only (mirrors `status`), and EXPIRES with the ask: the next `setStatus` that
+   *  moves this agent out of the red tier drops it. Write it before you set the red status, not
+   *  after a non-red one. */
   setAttentionScreen: (agentId: string, text: string) => void;
   /** Mark this agent's finished turn as carrying a possible ask nobody could judge. */
   setUnjudgedAsk: (agentId: string, signal: FollowupSignal) => void;
@@ -912,7 +917,45 @@ export const useRuntimeStore = create<RuntimeState>()(
         // Skip the write when the value is unchanged (sparkle-f2uz): setStatus makes a NEW `status`
         // map ref, which every whole-map subscriber (sidebar/TopBar) re-renders on. A redundant tick
         // of the SAME status (e.g. repeated "working"/"listening"/"blocked") must not churn a render.
-        set((s) => (s.status[agentId] === status ? s : { status: { ...s.status, [agentId]: status } })),
+        set((s) => {
+          if (s.status[agentId] === status) return s;
+          const next: Pick<RuntimeState, "status"> & Partial<Pick<RuntimeState, "attentionScreen">> = {
+            status: { ...s.status, [agentId]: status },
+          };
+          // THE CAPTURE EXPIRES WITH THE ASK (sparkle-99o9a). `attentionScreen[agentId]` is the screen
+          // photographed the moment the agent went red, and it used to be cleared ONLY by
+          // close()/resetProgress() — so a menu snapshot outlived the menu by hours, or by the whole
+          // session, and every consumer read it as the present tense: `readAgentTerminal` tier (b)
+          // narrates it to the concierge as this agent's recent output, and the phone relay sends it
+          // as the body of "what it's asking". Leaving red is the moment that stops being true, so
+          // this is where it goes.
+          //
+          // KEYED ON THE STORE'S OWN STATUS, deliberately, and this is why the clear lives here rather
+          // than at the Terminal seam that WRITES the capture. Terminal only sees the screen scraper's
+          // emit, which the statusRouter may suppress entirely once hooks own the status — clearing
+          // there would key expiry on a status the consumers never see, while `mayHaveMenu`, the one
+          // consumer that gates the capture at all, gates it on `isRedStatus(status[agentId])` out of
+          // THIS map. One status, one predicate, one place (bead sparkle-07gjg is the bug class: a
+          // predicate split by name rather than by content). Every status writer — AgentPane's router,
+          // SparkleAgentPane, requery, improvementPass — funnels through here, so no path can resume
+          // an agent while leaving its ask-screen behind.
+          //
+          // BOUNDED BY "SOMEONE MOVES THIS AGENT'S STATUS", WHICH IS NOT EVERY AGENT. `status` has one
+          // writer, a MOUNTED AgentPane, so for an agent this window is not hosting it is a frozen
+          // last reading and nothing here ever runs — see engine/movementRetraction's header. That is
+          // exactly the population that reads the capture, so this clear is necessary and not
+          // sufficient: `conciergeTools/terminal.captureFor` carries the second expiry, off the
+          // movement ledger, for the unhosted case. Do not read this line as a guarantee.
+          //
+          // `isRedStatus` and not the narrower waiting|approval capture condition: red is what the
+          // consumers ask, and it keeps the snapshot through a waiting→blocked/errored slide, where
+          // the agent still needs you and nothing has recaptured a screen.
+          if (!isRedStatus(status) && agentId in s.attentionScreen) {
+            const { [agentId]: _scr, ...attentionScreen } = s.attentionScreen;
+            next.attentionScreen = attentionScreen;
+          }
+          return next;
+        }),
 
       setAgentMovement: (movement) =>
         // Same no-op guard `setStatus` uses, for the same reason: this map has whole-map subscribers

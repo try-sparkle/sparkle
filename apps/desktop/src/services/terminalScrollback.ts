@@ -5,11 +5,11 @@
 // The PTY stream isn't persisted anywhere else — this in-memory buffer (xterm's scrollback, while
 // the agent's terminal is mounted) is the only history that exists.
 
-// The minimal slice of @xterm/xterm's IBuffer we read.
-export interface ScrollbackBuffer {
-  readonly length: number;
-  getLine(index: number): { translateToString(trimRight?: boolean): string } | undefined;
-}
+import { rejoinWrapped, type WrappedBufferLike } from "../engine/rejoinWrapped";
+
+// The minimal slice of @xterm/xterm's IBuffer we read. `isWrapped` is part of it because a
+// physical row is not a line — see engine/rejoinWrapped (bead sparkle-99o9a).
+export type ScrollbackBuffer = WrappedBufferLike;
 
 // Cap the snapshot to the phone emulator's row budget (terminal.ts MAX_ROWS) — shipping more just
 // scrolls off the top on arrival.
@@ -22,12 +22,11 @@ export const SNAPSHOT_MAX_LINES = 300;
  * output uses CRLF; the snapshot must too.
  */
 export function serializeScrollback(buffer: ScrollbackBuffer): string {
+  // Rows, not lines: a soft-wrapped line occupies several rows and must be rejoined before anything
+  // line-anchored reads it (engine/rejoinWrapped). The budget stays in ROWS — it is a cap on how
+  // much of the buffer we walk, and rejoining can only reduce the line count from there.
   const start = Math.max(0, buffer.length - SNAPSHOT_MAX_LINES);
-  const lines: string[] = [];
-  for (let i = start; i < buffer.length; i++) {
-    const line = buffer.getLine(i);
-    lines.push(line ? line.translateToString(true) : "");
-  }
+  const lines = rejoinWrapped(buffer, start, buffer.length);
   let end = lines.length;
   while (end > 0 && lines[end - 1] === "") end--; // trim trailing blanks
   return lines.slice(0, end).join("\r\n");

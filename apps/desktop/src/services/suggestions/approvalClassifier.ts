@@ -7,7 +7,8 @@
 // but emits nothing except a bare option-number keystroke ("1\n") derived from an option the local
 // heuristic detector already parsed — never anything from the AI/learned tier. See the design spec:
 // docs/superpowers/specs/2026-07-10-sparkle-auto-approve-design.md §1.
-import { PICKER_FOOTER, detectClaudeCodePicker } from "./heuristics";
+import { detectClaudeCodePicker } from "./heuristics";
+import { pickerFooterAt } from "../../engine/screenClassifier";
 import type { SuggestionButton } from "./types";
 import type { ApprovalCategory } from "./approvalCategories";
 
@@ -66,7 +67,10 @@ function headerRegion(scrollback: string): string {
   const lines = tailLines(scrollback, PICKER_WINDOW);
   let footerIdx = -1;
   for (let i = lines.length - 1; i >= 0; i--) {
-    if (PICKER_FOOTER.test(lines[i] ?? "")) {
+    // The pair-aware form, so this classifier and the option detector cannot disagree about what
+    // marks a picker on a narrow pane — the desync heuristics.ts's import comment forbids
+    // (roborev 61827).
+    if (pickerFooterAt(lines, i)) {
       footerIdx = i;
       break;
     }

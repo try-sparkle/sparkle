@@ -101,8 +101,101 @@ const FOOTER_BAR =
 // (which rule 1 above would otherwise reject). `m` anchors FOOTER_BAR per line, so this works
 // identically on a whole snapshot and on the single line heuristics.ts feeds it.
 const FOOTER_LEGACY =
-  "enter to (select|confirm|submit)\\b.*(navigate|cancel)|\\besc to cancel\\b.*\\bctrl\\+e to explain\\b";
+  "enter to (?:select|confirm|submit)\\b.*(?:navigate|cancel)|\\besc to cancel\\b.*\\bctrl\\+e to explain\\b";
+// The same pairs, but WHOLE-LINE. Used only when testing a two-line JOIN — see `pickerFooterSpan`.
+const FOOTER_LEGACY_WHOLE_LINE =
+  `^(?![^\\n\\r]*\\bto interrupt\\b)[ \\t]*[│|┃]?[ \\t]*(?:${FOOTER_LEGACY})[ \\t]*[│|┃]?[ \\t\\r]*$`;
 export const PICKER_FOOTER = new RegExp(`${FOOTER_LEGACY}|${FOOTER_BAR}`, "im");
+
+// ── A FOOTER SPLIT ACROSS TWO LINES (bead sparkle-99o9a) ──────────────────────────────────────
+// `PICKER_FOOTER` is anchored to ONE rendered line, and the footer is 59 characters. In a narrow
+// agent column it does not fit, and the split arrives here by EITHER of two routes:
+//
+//   • the TERMINAL wrapped it — handled upstream now, because `engine/rejoinWrapped` puts the row
+//     run back together before any matcher sees it;
+//   • INK wrapped it, emitting a real newline of its own. There is no `isWrapped` to consult in
+//     that case, so the reader cannot help and the matcher has to.
+//
+// The two are indistinguishable from the rendered text — at 35 columns the break falls exactly at
+// the width AND at a word boundary — so this covers the second rather than guessing between them.
+//
+// ══ THE JOIN IS TESTED AGAINST THE ANCHORED ARM ONLY (roborev 61827) ═══════════════════════════
+// The first cut tested the join against the whole of `PICKER_FOOTER`, and that was unsafe in a way
+// worth recording. `FOOTER_LEGACY` is an UNANCHORED substring match, so a join can manufacture a
+// match neither line had, out of ordinary prose:
+//
+//   "Press Enter to select the model, then hit Esc to" + "cancel out of the dialog."
+//
+// Neither line matches (line 1's `.*` finds no `navigate|cancel`; line 2 has no `enter to select`).
+// The JOIN matches `FOOTER_LEGACY`. `parsePickerOptionsWithBounds` would then treat a prose line as
+// a footer and walk up for a 1…N run, and a numbered list in the agent's own output above it yields
+// a FABRICATED picker — which feeds `pickerBlockBounds` → `pickerFingerprint` → the
+// `verifiedPickerPress` exemption. That is the roborev 55245/55258 failure class exactly.
+//
+// So the join is tested against `FOOTER_BAR`, which is whole-line-anchored and requires every
+// segment to be a key hint. The legacy arm keeps matching a whole line and is never joined: it
+// exists for pre-2.1.220 builds, whose footers are single-line, so there is nothing to widen it for.
+//
+// ANCHORING, NOT ARM-DROPPING, IS WHAT MAKES THE JOIN SAFE. The obvious repair — test the join
+// against `FOOTER_BAR` alone — was tried and is WRONG, in a way only a test caught: the real
+// 2.1.220 footer does not match `FOOTER_BAR` at all. "Tab/Arrow keys to navigate" is not a key
+// hint by that grammar ("Arrow" and "keys" are not key atoms), so the live AskUserQuestion footer
+// matches ONLY through the legacy arm. Dropping that arm from the join would have left the feature
+// matching nothing while every negative test passed.
+//
+// So the join is tested against the bar OR a WHOLE-LINE legacy footer. Anchoring is what removes
+// the hazard: the prose above starts with "Press", so it can never satisfy `^…enter to select`.
+const FOOTER_JOINED = new RegExp(`${FOOTER_BAR}|${FOOTER_LEGACY_WHOLE_LINE}`, "im");
+// THERE IS NO "DOES IT LOOK UNFINISHED?" PREFILTER, and that is deliberate (roborev 61836). A
+// `\bto\s*$` test was tried twice and is wrong in BOTH directions: it rejects real footers (the
+// 2.1.220 bar wraps after "navigate", "navigate ·", "· Esc" and "Esc to" depending on width) while
+// still admitting prose that merely ends in "to". `FOOTER_JOINED` is fully anchored, so it is the
+// guard on its own and a prefilter can only subtract correctness.
+
+/**
+ * How many lines the picker footer starting at `lines[i]` occupies — 0 when there is none.
+ *
+ * THE SPAN, NOT A BOOLEAN, because a caller that finds a footer usually needs to know where it ENDS
+ * (roborev 61827): `screenAnswerable` asks whether anything unrecognised sits BELOW the footer, and
+ * given only the first of two lines it sees the footer's own continuation down there and calls the
+ * screen unanswerable — denying the one-tap Approve relay for exactly the narrow-pane picker this
+ * work exists to fix.
+ */
+export function pickerFooterSpan(lines: readonly string[], i: number): 0 | 1 | 2 {
+  const line = lines[i] ?? "";
+  const next = lines[i + 1];
+  // ══ THE JOIN IS TRIED FIRST, EVEN WHEN THE LINE MATCHES ALONE (roborev 61836) ═════════════════
+  // A self-match cannot be taken as "the footer ends here", because `FOOTER_LEGACY` is a SUBSTRING
+  // match: a PREFIX of the real 2.1.220 bar satisfies it the moment it reaches "navigate". Measured
+  // over the bar's word-wrap points, every Ink width from 44 to 58 produces a first row that
+  // self-matches ("…keys to navigate", "…navigate ·", "…navigate · Esc", "…navigate · Esc to"),
+  // stranding "· Esc to cancel" / "Esc to cancel" / "to cancel" / "cancel" BELOW `footerLast`.
+  // Those leftovers are not blank, not a border and not ambient chrome, so
+  // `nothingUnrecognizedBelowFooter` reads them as fresh output and denies the one-tap Approve
+  // relay — the precise symptom `footerLast` was added to fix, still broken for 15 of the 29 widths
+  // where the bar wraps at all. Returning 1 early was therefore only correct for widths 34-42.
+  //
+  // The `next` guard is what stops a join swallowing a line that stands on its own: if the line
+  // below is ITSELF a whole footer, these are two footers, not one wrapped one.
+  if (next !== undefined && !PICKER_FOOTER.test(next)) {
+    // Ink consumed a space when it wrapped, so the join restores one. Anchored forms only.
+    if (FOOTER_JOINED.test(`${line.trimEnd()} ${next.trimStart()}`)) return 2;
+  }
+  return PICKER_FOOTER.test(line) ? 1 : 0;
+}
+
+/** Does a picker footer START at `lines[i]` — either whole, or split onto the line below it? */
+export function pickerFooterAt(lines: readonly string[], i: number): boolean {
+  return pickerFooterSpan(lines, i) > 0;
+}
+
+/** Does any line of `text` start a picker footer? The multi-line twin of {@link pickerFooterAt}, so
+ *  `screenAwaitsInput` and the option detector cannot disagree about what marks a picker — the
+ *  desync `heuristics.ts`'s import comment says must never happen (roborev 61827). */
+export function textHasPickerFooter(text: string): boolean {
+  const lines = text.split("\n");
+  return lines.some((_, i) => pickerFooterSpan(lines, i) > 0);
+}
 
 // Classic shell / CLI prompts. These don't appear in Claude's prose, so they're safe to
 // match anywhere in the snapshot. The `/i` flag case-folds, so one delimiter-agnostic
@@ -357,6 +450,6 @@ export function screenAwaitsInput(snapshot: string): boolean {
   // cleared by the redraw when the menu is dismissed. A menu answered mid-turn also resumes the
   // spinner, which routes to `working` before settle re-checks the screen. Bias here is toward RED
   // (a blocked agent needs a human) — the founder-reported failure was the opposite, a false gray.
-  if (PICKER_FOOTER.test(snapshot)) return true;
+  if (textHasPickerFooter(snapshot)) return true;
   return SHELL_PROMPTS.some((re) => re.test(snapshot));
 }

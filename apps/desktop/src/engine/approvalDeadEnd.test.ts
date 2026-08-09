@@ -27,16 +27,13 @@ import { screenAwaitsInput } from "./screenClassifier";
 import { detectClaudeCodePicker } from "../services/suggestions/heuristics";
 import { classifyApproval } from "../services/suggestions/approvalClassifier";
 import type { AgentTabStatus } from "../types";
+import { FOOTER_ONLY_SCREEN } from "./incidentScreens.fixture";
 
-// A real permission dialog whose OPTION BLOCK has scrolled off the viewport, leaving only the
-// footer. The last content line is the founder's screenshot verbatim: the Recap agent's terminal
-// ended at "Called sparkle-control 2 times" with nothing beneath it.
-const FOOTER_ONLY_SCREEN = [
-  "⏺ Not blocked — research is done, I have a definitive root cause.",
-  "",
-  "  Called sparkle-control 2 times",
-  " Esc to cancel · Tab to amend · ctrl+e to explain",
-].join("\n");
+// FOOTER_ONLY_SCREEN — the dialog whose option block scrolled off — lives in
+// `incidentScreens.fixture.ts`, shared with the concierge terminal suite. Its provenance (a
+// RECONSTRUCTION from the founder's screenshot, not a PTY capture) travels with it there; it is
+// deliberately not in `capturedScreens.fixture.ts`, whose header promises every entry is a verbatim
+// capture (roborev 61864).
 
 // The control: the SAME dialog with its options still on screen. Every assertion below is paired
 // against this, or the test proves nothing about the missing options specifically.

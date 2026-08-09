@@ -7,13 +7,16 @@ import {
   type ScrollbackBuffer,
 } from "./terminalScrollback";
 
-// A fake xterm buffer over an array of line strings.
+// A fake xterm buffer over an array of UNWRAPPED rows, so these cases read exactly as they did
+// before the rejoin landed (bead sparkle-99o9a). Soft-wrapped rows have their own coverage in
+// `engine/rejoinWrapped.test.ts` and `services/suggestions/wrappedPickerFooter.test.ts`.
 function fakeBuffer(lines: string[]): ScrollbackBuffer {
   return {
     get length() {
       return lines.length;
     },
-    getLine: (i) => (i < lines.length ? { translateToString: () => lines[i] ?? "" } : undefined),
+    getLine: (i) =>
+      i < lines.length ? { translateToString: () => lines[i] ?? "", isWrapped: false } : undefined,
   };
 }
 

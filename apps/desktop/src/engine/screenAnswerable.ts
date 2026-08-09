@@ -111,7 +111,9 @@ export function screenOffersAnswer(snapshot: string): boolean {
     // allowance and so REJECTING a bordered dialog whose box closes beneath its footer (roborev
     // 59690). Sharing constants while rewriting the walk is not sharing the rule.
     if (
-      nothingUnrecognizedBelowFooter(lines, bounds.footer) &&
+      // `footerLast`, not `footer`: a footer that wrapped onto a second line would otherwise
+      // have its own continuation counted as unrecognised content below it (roborev 61827).
+      nothingUnrecognizedBelowFooter(lines, bounds.footerLast) &&
       (cursored || abutsFooter)
     )
       return true;

@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import { describe, it, expect } from "vitest";
-import { screenAwaitsInput, isSessionLimitPicker, PICKER_FOOTER } from "./screenClassifier";
+import { screenAwaitsInput, isSessionLimitPicker, PICKER_FOOTER, pickerFooterAt, pickerFooterSpan } from "./screenClassifier";
 import {
   MAX_OPTION_FOOTER_GAP,
   MAX_CHROME_BELOW_FOOTER,
@@ -792,5 +792,135 @@ describe("isSessionLimitPicker", () => {
       const window = lines.slice(Math.max(0, end - 60), end).join("\n");
       expect(isSessionLimitPicker(window), `viewport ending at line ${end} classifies as the picker`).toBe(false);
     }
+  });
+});
+
+// ── A FOOTER SPLIT ACROSS TWO LINES (bead sparkle-99o9a) ──────────────────────────────────────
+// The footer is 59 characters and an agent column can be 13 wide. When INK does the wrapping there
+// is no `isWrapped` for `engine/rejoinWrapped` to consult, so the matcher has to pair the lines
+// itself. The risk of that is obvious — a bar matcher that spans lines is how prose becomes a
+// picker — so the negatives below carry as much weight as the positive.
+describe("pickerFooterAt — a footer that wrapped onto the next line", () => {
+  it("matches a whole footer on one line, exactly as PICKER_FOOTER does", () => {
+    const lines = ["Enter to select \u00b7 Tab/Arrow keys to navigate \u00b7 Esc to cancel"];
+    expect(pickerFooterAt(lines, 0)).toBe(true);
+    expect(PICKER_FOOTER.test(lines[0]!)).toBe(true); // the two agree on the unsplit case
+  });
+
+  it("matches the pair when the bar is split after a dangling `to`", () => {
+    const lines = ["Enter to select \u00b7 Tab/Arrow keys to", "navigate \u00b7 Esc to cancel"];
+    expect(PICKER_FOOTER.test(lines[0]!)).toBe(false); // neither line alone is a footer
+    expect(PICKER_FOOTER.test(lines[1]!)).toBe(false);
+    expect(pickerFooterAt(lines, 0)).toBe(true); // the pair is
+  });
+
+  // The index it reports is the FIRST line of the footer, which is what keeps the option block
+  // above it intact for the upward walk.
+  it("does not claim the CONTINUATION line as a footer start", () => {
+    const lines = ["Enter to select \u00b7 Tab/Arrow keys to", "navigate \u00b7 Esc to cancel"];
+    expect(pickerFooterAt(lines, 1)).toBe(false);
+  });
+
+  it("refuses prose that merely ends in `to`", () => {
+    const lines = ["I am going to", "run the tests now."];
+    expect(pickerFooterAt(lines, 0)).toBe(false);
+  });
+
+  it("refuses a dangling `to` whose join is still not a hint bar", () => {
+    const lines = ["the file you asked me to", "delete is gone \u00b7 nothing else changed"];
+    expect(pickerFooterAt(lines, 0)).toBe(false);
+  });
+
+  // WHERE the bar happens to break is not a property of the footer, so it must not change the
+  // answer. This case used to be a NEGATIVE, encoding a `\bto\s*$` prefilter that has since been
+  // removed for rejecting real footers (roborev 61836).
+  it("joins wherever the bar broke, not only after a dangling `to`", () => {
+    expect(pickerFooterAt(["Enter to select", "\u00b7 Tab/Arrow keys to navigate \u00b7 Esc to cancel"], 0)).toBe(true);
+  });
+
+  // THE SPAN MUST NOT STOP AT A SELF-MATCHING FIRST ROW (roborev 61836). `FOOTER_LEGACY` is a
+  // SUBSTRING match, so a PREFIX of the bar satisfies it once it reaches "navigate" — true for
+  // every Ink width from 44 to 58. Reporting span 1 there strands the bar's tail below
+  // `footerLast`, which `screenAnswerable` then reads as fresh output.
+  it("reports span 2 at every width where the bar wraps, not just the narrow ones", () => {
+    const BAR = "Enter to select \u00b7 Tab/Arrow keys to navigate \u00b7 Esc to cancel";
+    const wordWrap = (text: string, cols: number) => {
+      const out: string[] = [];
+      let cur = "";
+      for (const word of text.split(" ")) {
+        if (cur && `${cur} ${word}`.length > cols) { out.push(cur); cur = word; } else cur = cur ? `${cur} ${word}` : word;
+      }
+      if (cur) out.push(cur);
+      return out;
+    };
+    // 35 is the incident width; 44/50/53 are widths whose FIRST row self-matches the legacy arm.
+    for (const cols of [35, 44, 50, 53, 57]) {
+      const rows = wordWrap(BAR, cols);
+      expect(rows.length, `width ${cols} must actually wrap`).toBeGreaterThan(1);
+      expect(pickerFooterSpan(rows, 0), `width ${cols}`).toBe(2);
+    }
+  });
+
+  it("keeps the `to interrupt` disqualifier across the join", () => {
+    const lines = ["\u2726 Working \u00b7 shift+tab to cycle \u00b7 esc to", "interrupt \u00b7 ctrl+b to background"];
+    expect(pickerFooterAt(lines, 0)).toBe(false);
+  });
+
+  it("is safe at the end of the array", () => {
+    expect(pickerFooterAt(["Enter to select \u00b7 Tab/Arrow keys to"], 0)).toBe(false);
+    expect(pickerFooterAt([], 0)).toBe(false);
+  });
+});
+
+// ── THE JOIN MUST NOT MANUFACTURE A FOOTER OUT OF PROSE (roborev 61827) ───────────────────────
+// `FOOTER_LEGACY` is an UNANCHORED substring match, so testing a two-line join against the whole of
+// `PICKER_FOOTER` let a join match what neither line matched. A fabricated footer is not cosmetic:
+// the parser walks UP from it for a 1…N run, so a numbered list in the agent's own output becomes a
+// picker, and that flows to `pickerFingerprint` and the `verifiedPickerPress` write exemption.
+describe("pickerFooterAt — the legacy arm is never joined", () => {
+  const PROSE = ["Press Enter to select the model, then hit Esc to", "cancel out of the dialog."];
+
+  it("refuses a join that only matches because the legacy arm is unanchored", () => {
+    // The regression, stated as the reviewer stated it: neither line is a footer...
+    expect(PICKER_FOOTER.test(PROSE[0]!)).toBe(false);
+    expect(PICKER_FOOTER.test(PROSE[1]!)).toBe(false);
+    // ...and the JOIN matches the legacy arm, which is exactly why the join is not tested against it.
+    expect(PICKER_FOOTER.test(`${PROSE[0]} ${PROSE[1]}`)).toBe(true);
+
+    expect(pickerFooterAt(PROSE, 0)).toBe(false);
+  });
+
+  it("still refuses prose ending in a bare `to`, with no key before it", () => {
+    expect(pickerFooterAt(["everything I needed to", "run the tests is in place \u00b7 nothing else to do"], 0)).toBe(false);
+  });
+
+  // A whole legacy footer on ONE line keeps matching — the arm is not weakened, only un-joined.
+  it("keeps matching a single-line legacy footer", () => {
+    expect(pickerFooterAt(["Esc to cancel \u00b7 Tab to amend \u00b7 ctrl+e to explain"], 0)).toBe(true);
+  });
+
+  it("reports the SPAN, so a caller knows where the footer ends", () => {
+    expect(pickerFooterSpan(["Enter to select \u00b7 Tab/Arrow keys to navigate \u00b7 Esc to cancel"], 0)).toBe(1);
+    expect(pickerFooterSpan(["Enter to select \u00b7 Tab/Arrow keys to", "navigate \u00b7 Esc to cancel"], 0)).toBe(2);
+    expect(pickerFooterSpan(PROSE, 0)).toBe(0);
+  });
+});
+
+// ── ALL THREE MATCHERS AGREE ON ONE SCREEN (roborev 61827) ────────────────────────────────────
+// `heuristics.ts`'s import comment says the option detector, the category classifier and this
+// status check "can never desync on what marks a picker". Teaching only the option detector about a
+// split footer broke that, and on the FALSE-GRAY side this file calls the worse direction: five
+// pressable buttons while the status read calm.
+describe("a split footer is a picker to every matcher, not just the option detector", () => {
+  const SPLIT_PICKER = [
+    "How do you want to handle this one?",
+    "\u276f 1. Push to our fork instead",
+    "  2. Force-push to erans' fork",
+    "Enter to select \u00b7 Tab/Arrow keys to",
+    "navigate \u00b7 Esc to cancel",
+  ].join("\n");
+
+  it("reads as awaiting input, not calm", () => {
+    expect(screenAwaitsInput(SPLIT_PICKER)).toBe(true);
   });
 });
