@@ -36,6 +36,28 @@ struct PtySession {
     /// `None` when the platform did not report one; such a session is skipped rather than reported
     /// at zero, since "no pid" is not the same fact as "using no memory".
     pid: Option<u32>,
+    /// WHICH LIFE OF THIS AGENT THIS PTY IS. Process-globally unique and minted per spawn (see
+    /// [`next_pty_epoch`]), so the `pty:exit` this session eventually emits can be told apart from
+    /// the one its PREDECESSOR emits — which is the whole point, because the session id is the
+    /// AGENT id and is therefore identical across a restart.
+    ///
+    /// Without it, a restart is indistinguishable from a death at the frontend. `sessions.insert`
+    /// replaces silently (see [`PtyManager::session_ids`]), so a re-spawn leaves the old reader
+    /// thread alive and still owing one `pty:exit`. That event arrives AFTER the new binding has
+    /// subscribed, on a global channel keyed only by agent id, and the new terminal reads it as its
+    /// OWN death — painting "Agent exited — Start again" over an agent that was just successfully
+    /// revived, where it sits until the resumed `claude` happens to emit a byte (a `--resume`
+    /// transcript redraw takes seconds; an idle resumed agent may emit nothing for minutes).
+    /// That is a death notice with no retraction path, and it is what this field closes.
+    epoch: u64,
+}
+
+/// Mint the next PTY epoch. Process-global and strictly increasing, so no two PTYs — for the same
+/// agent or different ones, in this app run — ever share one. Starts at 1: `0` is left free as a
+/// "no PTY has spawned yet" sentinel for callers that need one.
+fn next_pty_epoch() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Cooperative pause gate shared between a session's reader thread and `pty_set_paused`. The reader
@@ -278,6 +300,13 @@ struct PtyOutput {
 #[derive(Clone, Serialize)]
 struct PtyEnd {
     id: String,
+    /// The epoch of the PTY that ACTUALLY exited — see `PtySession::epoch`. `pty:exit` is a global
+    /// channel keyed only by agent id, and the id survives a restart, so without this a listener
+    /// cannot tell "my PTY died" from "the PTY I replaced finally finished dying". Non-optional on
+    /// purpose: every exit is emitted by a reader thread that owns exactly one session, so there is
+    /// always an answer, and an `Option` here would cross the wire as `null` and hand the frontend
+    /// an "unknown epoch" case with no correct handling.
+    epoch: u64,
 }
 
 /// Binaries `pty_spawn` is permitted to launch, by basename (defense-in-depth allowlist).
@@ -588,7 +617,13 @@ pub async fn pty_spawn(
     cwd: Option<String>,
     cols: u16,
     rows: u16,
-) -> Result<(), String> {
+) -> Result<u64, String> {
+    // WHICH LIFE OF THIS AGENT THIS IS. Minted before anything can fail so the value returned to the
+    // caller and the value the reader thread stamps on `pty:exit` are provably the same number, and
+    // handed back so the frontend's transport can bind to it — see `PtySession::epoch` for what goes
+    // wrong without it. Cheap enough to mint on a spawn that later fails: the counter is only ever
+    // compared for equality, never for density.
+    let epoch = next_pty_epoch();
     // Log the command and arg COUNT at info. The full args carry the built `zsh -c '…'` script,
     // which embeds the user's prompt/persona (and could in principle carry a secret passed as a
     // flag), so they're NEVER written to the shared daily log by default — even though our default
@@ -689,6 +724,7 @@ pub async fn pty_spawn(
                     pause: Arc::new(PauseState::new()),
                     inflight: Arc::new(InflightState::new()),
                     pid,
+                    epoch,
                 },
                 reader,
                 child,
@@ -862,10 +898,15 @@ pub async fn pty_spawn(
         // so a dead session left here would climb rungs forever and eventually escalate a terminal
         // that no longer exists.
         read_app.state::<crate::nudger::Observers>().detach(&read_id);
-        let _ = read_app.emit("pty:exit", PtyEnd { id: read_id.clone() });
+        // Stamped with THIS session's epoch, not with whatever is currently in the map under this
+        // id. By the time a replaced reader gets here the map may already hold its SUCCESSOR, and
+        // reporting the successor's epoch would be worse than reporting none: the new terminal would
+        // accept its predecessor's death as its own, which is the exact misreading the epoch exists
+        // to prevent.
+        let _ = read_app.emit("pty:exit", PtyEnd { id: read_id.clone(), epoch });
     });
 
-    Ok(())
+    Ok(epoch)
 }
 
 /// Clone out a session's per-session writer handle under a BRIEF hold of the global `sessions` lock,
@@ -1012,12 +1053,65 @@ pub fn pty_live_sessions(manager: State<PtyManager>) -> Vec<String> {
 }
 
 #[cfg(test)]
+mod epoch_tests {
+    use super::{next_pty_epoch, PtyEnd};
+
+    // THE ONE PROPERTY THE WHOLE MECHANISM RESTS ON: two PTYs never share an epoch. The session id
+    // IS the agent id, so a restart reuses it; the epoch is the only thing that separates a
+    // terminal's own death from its predecessor's, and an epoch handed out twice would let exactly
+    // the misreading this exists to prevent back in for the pair that collided.
+    #[test]
+    fn epochs_are_unique_and_increasing() {
+        let a = next_pty_epoch();
+        let b = next_pty_epoch();
+        let c = next_pty_epoch();
+        assert!(a < b && b < c, "epochs must strictly increase, got {a} {b} {c}");
+    }
+
+    // Concurrent spawns are the realistic case — the resurrection runner brings a cohort back at
+    // once, and `pty_spawn` mints before any lock is taken. A counter that raced would hand two
+    // simultaneously-revived agents the same epoch.
+    #[test]
+    fn concurrent_minting_never_collides() {
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 250;
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| std::thread::spawn(|| (0..PER_THREAD).map(|_| next_pty_epoch()).collect::<Vec<_>>()))
+            .collect();
+        let mut all: Vec<u64> = handles.into_iter().flat_map(|h| h.join().expect("thread")).collect();
+        let minted = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), minted, "every minted epoch must be distinct");
+    }
+
+    // 0 is reserved as the "no PTY has spawned yet" sentinel, so a real spawn must never mint it —
+    // otherwise a transport that has not spawned would match a real exit.
+    #[test]
+    fn zero_is_never_minted() {
+        assert!(next_pty_epoch() > 0);
+    }
+
+    // The exit event must actually CARRY the epoch over the wire. Serialized here rather than
+    // asserted on the struct because the frontend reads JSON: a field that stopped being emitted
+    // (a rename, a `skip_serializing_if`) would leave the TS filter comparing against `undefined`
+    // and silently forwarding every exit again — the original bug, with the Rust side still green.
+    #[test]
+    fn exit_payload_serializes_its_epoch() {
+        let json = serde_json::to_string(&PtyEnd { id: "agent-7".into(), epoch: 42 })
+            .expect("PtyEnd must serialize");
+        assert!(json.contains("\"epoch\":42"), "epoch missing from {json}");
+        assert!(json.contains("\"id\":\"agent-7\""), "id missing from {json}");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
-        acquire_writer, apply_heap_cap, guard_resize_size, guard_spawn_size, node_options_with_cap,
-        run_flusher, validate_spawn_inner, Credit, FlushBuf, InflightState, PauseState, PtyManager,
-        PtySession, MIN_PTY_COLS, MIN_PTY_ROWS, PTY_INFLIGHT_HIGH_WATER_BYTES,
-        SPAWN_FALLBACK_COLS, SPAWN_FALLBACK_ROWS,
+        acquire_writer, apply_heap_cap, guard_resize_size, guard_spawn_size, next_pty_epoch,
+        node_options_with_cap, run_flusher, validate_spawn_inner, Credit, FlushBuf, InflightState,
+        PauseState, PtyManager, PtyEnd, PtySession, MIN_PTY_COLS, MIN_PTY_ROWS,
+        PTY_INFLIGHT_HIGH_WATER_BYTES, SPAWN_FALLBACK_COLS, SPAWN_FALLBACK_ROWS,
     };
     use portable_pty::CommandBuilder;
     use std::collections::HashMap;
@@ -1396,6 +1490,7 @@ mod tests {
                 pause: Arc::new(PauseState::new()),
                 inflight: Arc::new(InflightState::new()),
                 pid,
+                epoch: next_pty_epoch(),
             },
         );
 
@@ -1463,6 +1558,7 @@ mod tests {
                 inflight: Arc::new(InflightState::new()),
                 // No pid yet — a spawn that has not finished reporting one.
                 pid: None,
+                epoch: next_pty_epoch(),
             },
         );
 
@@ -1510,6 +1606,7 @@ mod tests {
             pause: Arc::new(PauseState::new()),
             inflight: Arc::new(InflightState::new()),
             pid,
+            epoch: next_pty_epoch(),
         };
         let sessions: Mutex<HashMap<String, PtySession>> = Mutex::new(HashMap::new());
         sessions.lock().unwrap().insert("a".to_string(), session);

@@ -11,7 +11,12 @@
 //     fails in milliseconds instead of waiting out the clock. Promotion's equivalent needs a status
 //     poll for this because a sandbox is remote; a local PTY tells us directly.
 
-import { getTransport, deleteCloudSession, type AgentTransport } from "../agentTransport";
+import {
+  getTransport,
+  deleteCloudSession,
+  LocalTransport,
+  type AgentTransport,
+} from "../agentTransport";
 import { cloudApi, type CloudApi } from "../cloudAgents/api";
 import { useProjectStore } from "../../stores/projectStore";
 import { demotionLandBranch, demotionWriteTranscript } from "./rust";
@@ -37,7 +42,14 @@ export interface AwaitLocalFirstFrameOpts {
  * just proved was alive.
  */
 export function awaitLocalFirstFrameLive(opts: AwaitLocalFirstFrameOpts): Promise<void> {
-  const transport = opts.transport ?? getTransport({ id: opts.agentId, runtime: "local" });
+  // An OBSERVER, explicitly (`observeAnyEpoch`) — not `getTransport`, which hands back a transport
+  // that reports only the exit of a PTY IT spawned. This one spawns nothing, so under the default
+  // epoch filter its exit path would be permanently inert: the early-exit rejection below would
+  // never fire and the commonest demotion failure would present as a first-frame TIMEOUT blaming the
+  // deadline, holding the cloud sandbox open for the whole wait. Any life of this agent exiting
+  // before we saw a frame is the fact this wants, and it is exactly what an observer reports.
+  const transport =
+    opts.transport ?? new LocalTransport(opts.agentId, { observeAnyEpoch: true });
   const setTimer = opts.setTimer ?? ((fn, ms) => setTimeout(fn, ms));
   const clearTimer = opts.clearTimer ?? ((h) => clearTimeout(h as ReturnType<typeof setTimeout>));
 

@@ -1263,13 +1263,19 @@ export function Terminal({
       // 55120). It stops an UNMOUNTED effect's handler from running `onExit?.()` and
       // `setSpawnFail("exited")`, which is real and worth closing.
       //
-      // It does NOT close "Start again". That bumps `attempt`, an effect dep, so React runs the
-      // cleanup and re-runs the effect in this SAME mounted component; the new effect's `disposed`
-      // is false, and `LocalTransport.onExit` filters only on `e.id === this.id` with the agent id
-      // identical across attempts. The dead PTY's late exit is therefore delivered to the NEW
-      // handler and passes this check — still painting "Agent exited — Start again" over a healthy
-      // agent. Closing that needs a spawn epoch echoed back from Rust (see the note on AgentPane's
-      // onExit, roborev 55114). Do not read this guard as making the class safe.
+      // It does NOT close "Start again" BY ITSELF — that is the transport's job now, and it is done.
+      // "Start again" bumps `attempt`, an effect dep, so React runs the cleanup and re-runs the
+      // effect in this SAME mounted component; the new effect's `disposed` is false, so the dead
+      // PTY's late exit reached the NEW handler and passed this check, painting "Agent exited —
+      // Start again" over an agent that had just been successfully revived. It stayed there until
+      // the resumed `claude` emitted a byte, which for a `--resume` transcript redraw is seconds and
+      // for a resumed agent waiting on input can be minutes: a revived agent displaying its own
+      // death notice (bead sparkle-heb11, reported repeatedly as "the resume error is back").
+      //
+      // That is closed by the SPAWN EPOCH this comment used to ask for: pty.rs mints one per PTY and
+      // stamps it on `pty:exit`, and `LocalTransport.onExit` forwards only the exit carrying the
+      // epoch its own spawn returned. So an exit that reaches this handler is now this binding's
+      // own. `disposed` still guards the unmount case, which is a different one.
       if (disposed) return;
       engine.exit();
       onExit?.();

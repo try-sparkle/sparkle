@@ -104,13 +104,70 @@ export interface AgentTransport {
  * the output listener is registered BEFORE the PTY spawns (so no early output is dropped).
  */
 export class LocalTransport implements AgentTransport {
+  /** The agent id this transport is bound to — the id every pty.ts verb and both global event
+   *  channels are keyed by. */
+  private readonly id: string;
   /** Listener-registration promises `spawn` awaits, so listen-before-spawn ordering is preserved. */
   private readonly ready: Array<Promise<void>> = [];
   /** Serializes pause/resume so Rust sees them in issue order — a `false` can't overtake an earlier
    *  `true` and park the reader forever (the roborev nit on , kept here where it belongs). */
   private pauseChain: Promise<unknown> = Promise.resolve();
 
-  constructor(private readonly id: string) {}
+  /**
+   * THE EPOCH OF THE PTY THIS TRANSPORT OWNS — `null` until its own `spawn` resolves.
+   *
+   * A transport instance is created per Terminal binding (`getTransport` returns a fresh one per
+   * call), so this is what makes "my PTY exited" answerable at all. `pty:exit` is a global channel
+   * carrying only the AGENT id, and that id is identical across a restart, so the id filter alone
+   * cannot separate two consecutive lives of one agent.
+   *
+   * WHAT THAT COST, CONCRETELY. Tearing a binding down kills its PTY (`detach()` IS kill for a local
+   * transport) but the exit event arrives whenever the child actually finishes dying — routinely
+   * after the replacement binding has already subscribed. The replacement then read its
+   * predecessor's death as its own and painted "Agent exited — Start again" over an agent that had
+   * just been successfully revived, where it stayed until the resumed `claude` emitted a byte: a
+   * `--resume` transcript redraw takes seconds, and a resumed agent waiting on input may emit
+   * nothing for minutes. A revived agent displaying its own death notice, with no retraction path.
+   * `Terminal.tsx` carried this as a known-open defect and named this fix by name.
+   */
+  private epoch: number | null = null;
+  /** Resolves with the epoch once `spawn` succeeds, so an exit that races ahead of the spawn's own
+   *  resolution is JUDGED rather than dropped — a PTY that dies instantly is a real death and must
+   *  still surface. Never resolves when the binding is torn down before spawning, which is correct:
+   *  a transport with no PTY has no death to report. */
+  private epochKnown!: Promise<number>;
+  private markSpawned!: (epoch: number) => void;
+
+  /**
+   * OBSERVER MODE — this transport watches an agent whose PTY someone ELSE spawned.
+   *
+   * The epoch filter above answers "is this MY PTY's death", and it can only answer it for a
+   * transport that spawned. A pure observer never calls `spawn`, so its epoch would stay `null`
+   * forever and EVERY exit would sit deferred on a promise that never resolves — the exit silently
+   * unreportable rather than merely unattributable. That is not hypothetical: `awaitLocalFirstFrame`
+   * (agentDemotion/live.ts) exists to fail demotion in milliseconds when the local PTY dies before
+   * its first frame, and an inert exit path turns that into a full first-frame timeout blaming the
+   * deadline, holding a billing sandbox open for the wait.
+   *
+   * So an observer keeps the pre-epoch, id-only semantics DELIBERATELY: it has no life of its own to
+   * be confused about, and "some life of this agent exited" is exactly the fact it wants.
+   */
+  private readonly observeAnyEpoch: boolean;
+
+  constructor(id: string, opts: { observeAnyEpoch?: boolean } = {}) {
+    this.id = id;
+    this.observeAnyEpoch = opts.observeAnyEpoch === true;
+    this.armEpoch();
+  }
+
+  /** Fresh, unresolved `epochKnown` for the NEXT life. Called once at construction and again at the
+   *  head of every re-spawn, so a second `spawn` on one instance cannot be judged against the first
+   *  life's epoch (which would accept the predecessor's late exit — the very bug the epoch closes). */
+  private armEpoch(): void {
+    this.epochKnown = new Promise<number>((resolve) => {
+      this.markSpawned = resolve;
+    });
+  }
 
   onOutput(cb: (e: TransportOutput) => void): () => void {
     let un: (() => void) | null = null;
@@ -136,8 +193,30 @@ export class LocalTransport implements AgentTransport {
     let cancelled = false;
     // pty:exit is a GLOBAL channel (fires for every agent), so filter to this transport's id here —
     // Terminal used to do this check itself; the transport now owns it.
+    //
+    // AND FILTER ON THE EPOCH, NOT JUST THE ID. The id is the agent id and survives a restart, so an
+    // id-only filter forwards the PREDECESSOR's death to the successor's terminal — see the `epoch`
+    // field above for what that paints on a revived agent. An exit whose epoch is not ours is not
+    // our death and is dropped silently: some other binding owns it, or owned it.
     const p = onPtyExit((e) => {
-      if (e.id === this.id) cb({});
+      if (e.id !== this.id) return;
+      // An OBSERVER owns no PTY, so it has no epoch to compare and nothing to be confused about —
+      // see `observeAnyEpoch`. Judging it by the epoch would make its exit path permanently inert.
+      if (this.observeAnyEpoch) {
+        cb({});
+        return;
+      }
+      if (this.epoch !== null) {
+        if (e.epoch === this.epoch) cb({});
+        return;
+      }
+      // Our spawn has not resolved yet, so we cannot judge this exit — but it may still be OURS (a
+      // PTY that dies immediately can beat its own spawn's round-trip back to us). Defer the
+      // comparison instead of guessing; `cancelled` is re-checked because the unlisten may land
+      // while we wait, and a torn-down subscriber must not be called back.
+      void this.epochKnown.then((epoch) => {
+        if (!cancelled && e.epoch === epoch) cb({});
+      });
     }).then((u) => {
       // Same teardown-race guard as onOutput (sparkle-6csa): route the inner unlisten through
       // safeUnlisten so a late-resolving listen's raw unlisten can't leak an unhandled rejection.
@@ -155,9 +234,23 @@ export class LocalTransport implements AgentTransport {
   async spawn(cmd: TransportSpawn): Promise<void> {
     // Ensure any pending output/exit listeners are registered before the PTY starts, so its first
     // bytes can't race ahead of the subscription (the pre-seam `await onPtyOutput` then `spawnPty`).
+    // A RE-SPAWN starts a new life, so forget the old one SYNCHRONOUSLY — before the first `await`,
+    // not after it. The window in which a stale epoch can be matched opens the instant the caller
+    // calls `spawn`, so a reset placed after any await leaves the predecessor's late exit matching
+    // the epoch of the life we are replacing and reported as this one's death — the whole defect,
+    // reintroduced one instance down. (Pinned by "a re-spawn on the SAME transport…"; moving this
+    // below the await turns that test red.)
+    //
+    // Only on a re-spawn: on the FIRST spawn `epochKnown` may already carry deferred waiters (an
+    // exit that beat the spawn back to us), and re-arming would strand them on a promise that
+    // nothing ever resolves.
+    if (this.epoch !== null) {
+      this.epoch = null;
+      this.armEpoch();
+    }
     // Drain (splice) rather than re-read so a later re-spawn doesn't re-await already-settled ones.
     await Promise.all(this.ready.splice(0));
-    await spawnPty({
+    const epoch = await spawnPty({
       id: this.id,
       command: cmd.command,
       args: cmd.args,
@@ -165,6 +258,11 @@ export class LocalTransport implements AgentTransport {
       cols: cmd.cols,
       rows: cmd.rows,
     });
+    // BIND TO THE PTY WE JUST GOT. Everything after this point can tell our own exit from the exit
+    // of whatever session we replaced. Set before the promise is resolved so a subscriber woken by
+    // `epochKnown` reads the same value the synchronous path reads.
+    this.epoch = epoch;
+    this.markSpawned(epoch);
   }
 
   write(data: string): void {

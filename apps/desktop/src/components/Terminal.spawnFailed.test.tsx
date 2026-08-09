@@ -115,8 +115,8 @@ vi.mock("../pty", () => ({
   // NOTE the payload field is `id`, not `agentId`: agentTransport.onExit filters with
   // `e.id === this.id`, so a mock that emits the wrong key silently never invokes the handler and
   // any test built on it passes for the wrong reason (caught by mutation-checking this file).
-  onPtyExit: vi.fn((cb: (e: { id: string }) => void) => {
-    ptyHandlers.exit = () => cb({ id: "agent-1" });
+  onPtyExit: vi.fn((cb: (e: { id: string; epoch: number }) => void) => {
+    ptyHandlers.exit = () => cb({ id: "agent-1", epoch: 7 });
     return Promise.resolve(() => {});
   }),
   ignorePtyGone: vi.fn(),

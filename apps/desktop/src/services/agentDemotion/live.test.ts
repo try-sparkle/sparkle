@@ -6,6 +6,28 @@
 import { describe, it, expect, vi } from "vitest";
 import { awaitLocalFirstFrameLive } from "./live";
 
+// The PTY seam, mocked at the SAME layer the production default reaches — so the one test below
+// that omits `transport` exercises the real `new LocalTransport(id, { observeAnyEpoch: true })`.
+// Every other test here injects a fake transport, which is what let a change to the DEFAULT go
+// unnoticed: the line that supplies it was covered by nothing.
+const { exitRef } = vi.hoisted(() => ({
+  exitRef: { cb: null as null | ((e: { id: string; epoch: number }) => void) },
+}));
+vi.mock("../../pty", () => ({
+  spawnPty: vi.fn(() => Promise.resolve(1)),
+  writePty: vi.fn(() => Promise.resolve()),
+  resizePty: vi.fn(() => Promise.resolve()),
+  killPty: vi.fn(() => Promise.resolve()),
+  setPtyPaused: vi.fn(() => Promise.resolve()),
+  ptyAck: vi.fn(() => Promise.resolve()),
+  onPtyOutput: vi.fn(() => Promise.resolve(() => {})),
+  onPtyExit: vi.fn((cb: (e: { id: string; epoch: number }) => void) => {
+    exitRef.cb = cb;
+    return Promise.resolve(() => {});
+  }),
+  ignorePtyGone: vi.fn(),
+}));
+
 /** A transport whose output/exit can be driven, recording every unlisten. */
 function fakeTransport() {
   const outputs: Array<() => void> = [];
@@ -138,6 +160,25 @@ describe("awaitLocalFirstFrameLive", () => {
     timers.fireAll();
     t.emitOutput();
     await expect(p).rejects.toThrow();
+  });
+
+  // THE DEFAULT TRANSPORT, not an injected one. `pty:exit` carries the epoch of the PTY that died,
+  // and this gate spawns nothing — so a transport bound to its OWN spawn's epoch would defer this
+  // exit on a promise nothing resolves and never reject. The symptom would not be a crash: the wait
+  // would run out its full deadline and blame the timeout, holding a billing sandbox open for it.
+  it("rejects on the PTY's exit through its DEFAULT (uninjected) transport", async () => {
+    const timers = fakeTimers();
+    const p = awaitLocalFirstFrameLive({
+      agentId: "agent-1",
+      timeoutMs: 60_000,
+      setTimer: timers.setTimer,
+      clearTimer: timers.clearTimer,
+    });
+    // The listener registers over an async `listen()`; let it land before driving the channel.
+    await vi.waitFor(() => expect(exitRef.cb).not.toBeNull());
+    // An epoch this observer could not possibly have spawned — someone else's PTY, same agent.
+    exitRef.cb?.({ id: "agent-1", epoch: 4242 });
+    await expect(p).rejects.toThrow(/exited before it produced any output/);
   });
 
   it("never kills or detaches the transport it is watching", async () => {

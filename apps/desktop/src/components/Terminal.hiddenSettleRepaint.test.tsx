@@ -93,7 +93,7 @@ vi.mock("@xterm/addon-webgl", () => ({
 // The PTY seam. onPtyOutput captures the per-id handler so a test can emit output through the exact
 // path LocalTransport.onOutput subscribes to.
 vi.mock("../pty", () => ({
-  spawnPty: vi.fn(() => Promise.resolve()),
+  spawnPty: vi.fn(() => Promise.resolve(7)),
   writePty: vi.fn(() => Promise.resolve()),
   killPty: vi.fn(() => Promise.resolve()),
   resizePty: vi.fn(() => Promise.resolve()),

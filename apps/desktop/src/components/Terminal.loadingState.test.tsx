@@ -20,7 +20,7 @@ const { outputCbRef, exitCbRef } = vi.hoisted(() => ({
     cb: null as null | ((e: { id: string; chunk: string; bytes: number }) => void),
     id: null as null | string,
   },
-  exitCbRef: { cb: null as null | ((e: { id: string }) => void) },
+  exitCbRef: { cb: null as null | ((e: { id: string; epoch: number }) => void) },
 }));
 
 vi.mock("@xterm/xterm", () => {
@@ -84,7 +84,7 @@ vi.mock("@xterm/addon-webgl", () => ({
 }));
 
 vi.mock("../pty", () => ({
-  spawnPty: vi.fn(() => Promise.resolve()),
+  spawnPty: vi.fn(() => Promise.resolve(7)),
   writePty: vi.fn(() => Promise.resolve()),
   killPty: vi.fn(() => Promise.resolve()),
   resizePty: vi.fn(() => Promise.resolve()),
@@ -195,7 +195,7 @@ describe("Terminal loading state", () => {
     expect(screen.getByText(/^Starting…$/)).toBeTruthy();
 
     await act(async () => {
-      exitCbRef.cb?.({ id: "agent-1" });
+      exitCbRef.cb?.({ id: "agent-1", epoch: 7 });
     });
 
     expect(screen.queryByText(/^Starting…$/)).toBeNull();

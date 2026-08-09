@@ -20,14 +20,21 @@ const {
   onPtyExit,
   outRef,
   exitRef,
+  epochRef,
   outUnlisten,
 } = vi.hoisted(() => {
   const outRef = { id: null as string | null, cb: null as null | ((e: { chunk: string; bytes: number }) => void) };
-  const exitRef = { cb: null as null | ((e: { id: string }) => void) };
+  const exitRef = { cb: null as null | ((e: { id: string; epoch: number }) => void) };
+  // Hands out a fresh epoch per spawn, exactly like pty.rs `next_pty_epoch`. Tests read
+  // `epochRef.last` to learn the epoch the transport under test just bound to.
+  const epochRef = { next: 1, last: 0 };
   const outUnlisten = vi.fn();
   const exitUnlisten = vi.fn();
   return {
-    spawnPty: vi.fn(() => Promise.resolve()),
+    spawnPty: vi.fn(() => {
+      epochRef.last = epochRef.next++;
+      return Promise.resolve(epochRef.last);
+    }),
     writePty: vi.fn(() => Promise.resolve()),
     resizePty: vi.fn(() => Promise.resolve()),
     killPty: vi.fn(() => Promise.resolve()),
@@ -38,12 +45,13 @@ const {
       outRef.cb = cb;
       return Promise.resolve(outUnlisten);
     }),
-    onPtyExit: vi.fn((cb: (e: { id: string }) => void) => {
+    onPtyExit: vi.fn((cb: (e: { id: string; epoch: number }) => void) => {
       exitRef.cb = cb;
       return Promise.resolve(exitUnlisten);
     }),
     outRef,
     exitRef,
+    epochRef,
     outUnlisten,
     exitUnlisten,
   };
@@ -81,6 +89,8 @@ beforeEach(() => {
   outRef.id = null;
   outRef.cb = null;
   exitRef.cb = null;
+  epochRef.next = 1;
+  epochRef.last = 0;
 });
 afterEach(() => vi.clearAllMocks());
 
@@ -122,14 +132,152 @@ describe("LocalTransport delegation to pty.ts", () => {
     expect(seen).toEqual([{ chunk: "héllo", bytes: 6 }]);
   });
 
-  it("onExit fires ONLY for this agent's id (pty:exit is a global channel)", () => {
+  it("onExit fires ONLY for this agent's id (pty:exit is a global channel)", async () => {
     const t = new LocalTransport("agent-1");
     const exits: unknown[] = [];
     t.onExit((e) => exits.push(e));
-    exitRef.cb?.({ id: "other-agent" });
+    await t.spawn({ command: "claude", args: [], cols: 80, rows: 24 });
+    const mine = epochRef.last;
+    exitRef.cb?.({ id: "other-agent", epoch: mine });
     expect(exits).toHaveLength(0);
-    exitRef.cb?.({ id: "agent-1" });
+    exitRef.cb?.({ id: "agent-1", epoch: mine });
     expect(exits).toEqual([{}]);
+  });
+
+  // ══ A REVIVED AGENT MUST NOT INHERIT ITS PREDECESSOR'S DEATH ═══════════════════════════════════
+  //
+  // The bug this closes, end to end: an agent dies, its pane is restarted, and the OLD PTY's
+  // `pty:exit` — which arrives whenever the child actually finishes dying, routinely after the new
+  // binding has subscribed — was delivered to the NEW terminal, which read it as its own death and
+  // painted "Agent exited — Start again" over the agent it had just successfully revived. `pty:exit`
+  // carries the AGENT id, which is identical across a restart, so an id-only filter cannot tell the
+  // two lives apart. The epoch can.
+  //
+  // The founder hit this at least three times in one day and reported each as "the agent is dead /
+  // the resume error is back"; each time the agent was advancing with tool calls seconds old.
+  it("does not report the PREDECESSOR's exit as the revived binding's own death", async () => {
+    // Life 1: the agent that died.
+    const dead = new LocalTransport("agent-1");
+    dead.onExit(() => {});
+    await dead.spawn({ command: "claude", args: [], cols: 80, rows: 24 });
+    const deadEpoch = epochRef.last;
+
+    // Life 2: the pane is restarted. A fresh transport per binding, exactly as getTransport hands out.
+    const revived = new LocalTransport("agent-1");
+    const exits: unknown[] = [];
+    revived.onExit((e) => exits.push(e));
+    await revived.spawn({ command: "claude", args: [], cols: 80, rows: 24 });
+    expect(epochRef.last).not.toBe(deadEpoch);
+
+    // The corpse's exit finally lands, on the global channel, with the revived binding subscribed.
+    exitRef.cb?.({ id: "agent-1", epoch: deadEpoch });
+    await Promise.resolve();
+    expect(exits).toEqual([]);
+  });
+
+  // THE PAIRED POSITIVE. Without this, the test above is satisfied by a transport that simply never
+  // reports a death — which would trade a false "dead" for a false "alive" and hide every real exit.
+  it("still reports the revived binding's OWN exit", async () => {
+    const dead = new LocalTransport("agent-1");
+    dead.onExit(() => {});
+    await dead.spawn({ command: "claude", args: [], cols: 80, rows: 24 });
+
+    const revived = new LocalTransport("agent-1");
+    const exits: unknown[] = [];
+    revived.onExit((e) => exits.push(e));
+    await revived.spawn({ command: "claude", args: [], cols: 80, rows: 24 });
+
+    exitRef.cb?.({ id: "agent-1", epoch: epochRef.last });
+    expect(exits).toEqual([{}]);
+  });
+
+  // A PTY that dies immediately can beat its own spawn's round-trip back to us, so an exit arriving
+  // while `epoch` is still unknown must be JUDGED once the epoch lands, not dropped. Dropping it
+  // would hide exactly the failure the "Agent exited" affordance exists for: a spawn that never
+  // produced a byte.
+  it("judges an exit that arrives before its own spawn resolves", async () => {
+    const t = new LocalTransport("agent-1");
+    const exits: unknown[] = [];
+    t.onExit((e) => exits.push(e));
+    // The epoch this spawn WILL be given — driven before spawn() is awaited.
+    const pending = t.spawn({ command: "claude", args: [], cols: 80, rows: 24 });
+    exitRef.cb?.({ id: "agent-1", epoch: 1 });
+    expect(exits).toEqual([]); // cannot judge yet
+    await pending;
+    await Promise.resolve();
+    expect(exits).toEqual([{}]); // ours after all
+  });
+
+  it("drops a pre-spawn exit that turns out to belong to another life", async () => {
+    const dead = new LocalTransport("agent-1");
+    dead.onExit(() => {});
+    await dead.spawn({ command: "claude", args: [], cols: 80, rows: 24 });
+    const deadEpoch = epochRef.last;
+
+    const revived = new LocalTransport("agent-1");
+    const exits: unknown[] = [];
+    revived.onExit((e) => exits.push(e));
+    const pending = revived.spawn({ command: "claude", args: [], cols: 80, rows: 24 });
+    exitRef.cb?.({ id: "agent-1", epoch: deadEpoch });
+    await pending;
+    await Promise.resolve();
+    expect(exits).toEqual([]);
+  });
+
+  // A binding torn down before it ever spawned owns no PTY, so it has no death to report — and the
+  // deferred comparison must not call back a subscriber that has already unlistened.
+  it("never fires for a binding that was torn down before spawning", async () => {
+    const t = new LocalTransport("agent-1");
+    const exits: unknown[] = [];
+    const off = t.onExit((e) => exits.push(e));
+    exitRef.cb?.({ id: "agent-1", epoch: 1 });
+    off();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(exits).toEqual([]);
+  });
+
+  // A RE-SPAWN on ONE instance is a new life too. The epoch state must be re-armed at the head of
+  // the spawn, not left holding the previous life's number: during the spawn's round-trip the
+  // predecessor's late exit would otherwise match the STALE epoch and be accepted as this life's
+  // death — the exact misreading the epoch exists to prevent, reintroduced one instance down.
+  it("a re-spawn on the SAME transport does not accept the life it replaced", async () => {
+    const t = new LocalTransport("agent-1");
+    const exits: unknown[] = [];
+    t.onExit((e) => exits.push(e));
+    await t.spawn({ command: "claude", args: [], cols: 80, rows: 24 });
+    const firstLife = epochRef.last;
+
+    // Second life, still in flight — the window where the stale epoch used to match.
+    const pending = t.spawn({ command: "claude", args: [], cols: 80, rows: 24 });
+    exitRef.cb?.({ id: "agent-1", epoch: firstLife });
+    await pending;
+    await Promise.resolve();
+    expect(exits).toEqual([]);
+
+    // …and the paired positive: the SECOND life's own exit still reports.
+    exitRef.cb?.({ id: "agent-1", epoch: epochRef.last });
+    expect(exits).toEqual([{}]);
+  });
+
+  // An OBSERVER (agentDemotion's first-frame gate) watches a PTY it did not spawn, so it has no
+  // epoch of its own. Under the spawner's filter its exit path is not merely unattributable but
+  // permanently INERT — every exit defers on a promise nothing resolves — which turns "the local
+  // agent died before its first frame" into a full first-frame timeout blaming the deadline.
+  it("an observer transport reports an exit for a PTY it never spawned", () => {
+    const t = new LocalTransport("agent-1", { observeAnyEpoch: true });
+    const exits: unknown[] = [];
+    t.onExit((e) => exits.push(e));
+    exitRef.cb?.({ id: "agent-1", epoch: 4242 });
+    expect(exits).toEqual([{}]);
+  });
+
+  it("an observer transport still filters by agent id", () => {
+    const t = new LocalTransport("agent-1", { observeAnyEpoch: true });
+    const exits: unknown[] = [];
+    t.onExit((e) => exits.push(e));
+    exitRef.cb?.({ id: "other-agent", epoch: 4242 });
+    expect(exits).toEqual([]);
   });
 
   it("write / resize / kill / ack / setPaused delegate to the matching pty verb", async () => {

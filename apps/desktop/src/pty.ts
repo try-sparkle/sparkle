@@ -25,6 +25,13 @@ export interface PtyOutput {
 }
 export interface PtyExit {
   id: string;
+  /** WHICH LIFE OF THIS AGENT DIED — the epoch `spawnPty` returned for that PTY (pty.rs
+   *  `PtySession::epoch`). `pty:exit` is a global channel keyed only by agent id, and the id is the
+   *  AGENT id, so it is identical across a restart: without this, a listener cannot tell its own
+   *  PTY's death from the death of the PTY it replaced. Required, never optional — Rust always
+   *  knows which session is exiting, and an absent value would reintroduce an "unknown epoch" case
+   *  whose only safe handling is the wrong one. */
+  epoch: number;
 }
 
 export interface SpawnPtyOptions {
@@ -36,8 +43,12 @@ export interface SpawnPtyOptions {
   rows?: number;
 }
 
-/** Spawn a command in a local PTY. Output arrives via onPtyOutput. */
-export function spawnPty(opts: SpawnPtyOptions): Promise<void> {
+/** Spawn a command in a local PTY. Output arrives via onPtyOutput.
+ *
+ *  Resolves with this PTY's EPOCH — the id of this particular life of the agent. Hold it and compare
+ *  it against `PtyExit.epoch`, or a restart is indistinguishable from a death (see `PtyExit.epoch`
+ *  and pty.rs `PtySession::epoch`). */
+export function spawnPty(opts: SpawnPtyOptions): Promise<number> {
   return invoke("pty_spawn", {
     id: opts.id,
     command: opts.command,
