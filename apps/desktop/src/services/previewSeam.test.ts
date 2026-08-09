@@ -112,14 +112,103 @@ const STORE = fileURLToPath(new URL("../stores/previewStore.ts", import.meta.url
  * scan off the end of the enum into unrelated code. Stripping first is what makes the count mean
  * what it says.
  *
- * String literals are NOT modelled: a `//` inside a Rust string would blank the rest of that line.
- * The only strings in an enum body are attribute values (`#[serde(rename = "…")]`), and the failure
- * direction is a line that stops parsing — loud, not silent.
+ * AND STRING LITERALS ARE MODELLED, because once the pass runs source-wide a regex cannot be
+ * trusted to find a comment. `/\/\*[\s\S]*?\*\//` treats the `/*` inside ANY string as an opener,
+ * and a glob literal contains one: `"**\/*.tsx"` carries both halves. preview.rs already ships
+ * `"apps/*"` — harmless today only by accident, because it sits after the enum and the file happens
+ * to contain no later block-comment close. Add one glob above the enum plus any `*\/` below it and
+ * everything between is blanked, declaration included; `readEnum` then reports "no declaration" for
+ * a declaration sitting right there — the misdiagnosis its two-cause result exists to prevent, and a
+ * guard that reds on correct changes gets deleted (see `:81`).
+ *
+ * So: one left-to-right scan that knows what it is inside of. Strings (with `\` escapes), raw
+ * strings (`r"…"`, `r#"…"#`), and char literals pass through untouched; comments — which nest in
+ * Rust — are blanked to spaces with newlines preserved. A lone `'` is a LIFETIME, not a char
+ * literal, so `&'static str` is left alone rather than swallowing source to the next quote.
  */
+/** `r"`, `r##"`, `br"` … — sticky so it can be applied at an offset without slicing the source. */
+const RAW_PREFIX = /b?r(#*)"/y;
+
 function withoutRustComments(source: string): string {
-  return source
-    .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, " "))
-    .replace(/\/\/[^\n]*/g, (m) => " ".repeat(m.length));
+  const blank = (s: string) => s.replace(/[^\n]/g, " ");
+  const out: string[] = [];
+  let i = 0;
+  while (i < source.length) {
+    const two = source.slice(i, i + 2);
+
+    if (two === "//") {
+      const nl = source.indexOf("\n", i);
+      const stop = nl < 0 ? source.length : nl;
+      out.push(blank(source.slice(i, stop)));
+      i = stop;
+      continue;
+    }
+
+    if (two === "/*") {
+      const start = i;
+      let depth = 0;
+      while (i < source.length) {
+        if (source.slice(i, i + 2) === "/*") {
+          depth++;
+          i += 2;
+        } else if (source.slice(i, i + 2) === "*/") {
+          depth--;
+          i += 2;
+          if (depth === 0) break;
+        } else i++;
+      }
+      out.push(blank(source.slice(start, i)));
+      continue;
+    }
+
+    // Raw string: `r"…"`, `r##"…"##`, and the BYTE form `br"…"`. Only when the prefix starts a
+    // token, so `str` and `for` are safe. Two things here are deliberate, each a way an earlier
+    // draft got it wrong: the `b` is part of the prefix (rejecting it re-scanned `br"C:\"` as an
+    // ordinary escaped string, whose `\"` is not an escape at all in a raw literal, swallowing
+    // source past the literal's real end), and the match is STICKY rather than run against a fixed
+    // 16-char window, which silently failed to match beyond ~14 hashes.
+    //
+    // The terminator is `indexOf('"' + hashes)` — a quote followed by at least the opening hash
+    // count, which is the rule. A hand-rolled scan replaced this for one commit, credited with
+    // fixing a body containing its own `"#`; it was SEMANTICALLY IDENTICAL (same predicate, same
+    // stop offset), so it fixed nothing and no mutant could distinguish them. Reverted to the form
+    // with fewer moving parts rather than left in place with a claim attached.
+    RAW_PREFIX.lastIndex = i;
+    const raw = RAW_PREFIX.exec(source);
+    if (raw && !/[A-Za-z0-9_]/.test(source[i - 1] ?? " ")) {
+      const close = `"${raw[1]!}`;
+      const end = source.indexOf(close, i + raw[0].length);
+      const stop = end < 0 ? source.length : end + close.length;
+      out.push(source.slice(i, stop));
+      i = stop;
+      continue;
+    }
+
+    if (source[i] === '"') {
+      const start = i++;
+      while (i < source.length) {
+        if (source[i] === "\\") i += 2;
+        else if (source[i] === '"') {
+          i++;
+          break;
+        } else i++;
+      }
+      out.push(source.slice(start, i));
+      continue;
+    }
+
+    // A char literal is exactly `'x'` or `'\n'`; anything else beginning with `'` is a lifetime.
+    const ch = /^'(?:\\.|[^\\'])'/.exec(source.slice(i, i + 6));
+    if (ch) {
+      out.push(ch[0]);
+      i += ch[0].length;
+      continue;
+    }
+
+    out.push(source[i]!);
+    i++;
+  }
+  return out.join("");
 }
 
 /** Why an enum could not be read, so the two causes are not diagnosed as one. */
@@ -195,6 +284,125 @@ function readEnum(source: string, name: string): EnumRead {
   }
   return { ok: true, variants, unparsed };
 }
+
+// THE LEXER IS TESTED DIRECTLY, because the enum comparison is a weak and ambiguous detector of a
+// regression in it. A mis-lexed region that leaves a real comment un-blanked lets a brace in prose
+// move the enum boundary — which reds with a message accusing the SEAM, sending the reader to the
+// wrong file — and if the union happens to be stale for exactly the truncated tail, both sides agree
+// and it goes green. None of the shapes below appear in preview.rs today, which is the point: they
+// are what a lexer edit months from now would break, with nothing else in the repo watching.
+describe("withoutRustComments keeps code and blanks only comments", () => {
+  // ASSERT ON THE COMMENT AFTER THE TRICKY LITERAL, NOT ON THE DECLARATION SURVIVING. The first
+  // draft of these tests checked `toContain("pub enum …")`, which is VACUOUS for every literal
+  // shape: a mis-lexed literal does not delete what follows, it keeps it (string content passes
+  // through untouched), so the declaration is present either way and the test passes against the
+  // broken lexer. Mutation confirmed it — dropping the `b?` prefix and dropping the lifetime guard
+  // both stayed green. What a mis-lex actually costs is that the region gets treated as STRING, so
+  // a real comment inside it is never blanked — and an unbalanced brace in that comment is what
+  // moves the enum boundary. Each case therefore ends with a comment that must be gone.
+  const lexed = (src: string) => withoutRustComments(src);
+
+  it("does not read a glob literal's `/*` as a block-comment opener", () => {
+    // THE FIXTURE IS `"apps/*"`, WHICH IS THE ONE THAT SHIPS — and the choice is the whole test.
+    // The first draft used `"apps/**/*.tsx"`, which is VACUOUS against the regex this lexer
+    // replaced: a lazy `/\/\*[\s\S]*?\*\//` opens at the `/*` in `apps/**` and closes two
+    // characters later on the `*/` of `**/`, so the match is the 4-char `/**/`, nothing below is
+    // touched, and both assertions pass against the broken implementation. Only a glob with NO
+    // `*/` of its own — exactly the `"apps/*"` preview.rs carries at its packages fixture — makes
+    // the lazy match run down to the next `*/` below and swallow the declaration.
+    const out = lexed('let g = "apps/*";\npub enum PreviewState { A }\n/* later */\n');
+    expect(out, "a glob's `/*` must not open a comment that swallows the declaration").toContain(
+      "pub enum PreviewState { A }",
+    );
+    expect(out, "a real comment below it must still be blanked").not.toContain("later");
+  });
+
+  it("keeps a byte raw string whole rather than re-scanning it as an escaped string", () => {
+    // `br"C:\"` ends at that quote — `\` is not an escape in a RAW literal. Read as one, the string
+    // runs on and eats the comment after it, brace and all.
+    const out = lexed('let p = br"C:\\"; // swallowed {\npub enum PreviewState { A }\n');
+    expect(out).toContain("pub enum PreviewState { A }");
+    expect(out, "the comment after a byte raw string must still be blanked").not.toContain(
+      "swallowed",
+    );
+  });
+
+  it("ends a raw string on a quote followed by its hash count, not on the first quote", () => {
+    // RETITLED, because the previous name credited a distinction that does not exist: a body
+    // containing `"#` is handled identically by `indexOf('"##')` and by a hand-rolled hash scan —
+    // same predicate, same stop offset — so no mutant could separate them and the test could not
+    // fail for the reason its name gave. What IS a real property is that the closing quote must
+    // carry the hashes: terminate at the first bare quote and the literal ends inside its own body.
+    // (`toContain("inside")` was also dropped — an early-terminated literal leaves ` inside` as
+    // code, so it is present either way.)
+    // The body needs BOTH properties, and dropping either one loses a mutant:
+    //   * an ODD number of bare quotes — with an even count, terminating early re-lexes the
+    //     remainder into something that happens to re-align, the comment is blanked anyway, and a
+    //     different case catches the mutant instead;
+    //   * a `"#` sequence — without one, a close that counts the WRONG number of hashes (`'"#'`
+    //     instead of `'"##'`) still lands on the real terminator one hash short, leaves a stray `#`
+    //     as code, and goes green. This is the whole "followed by its hash count" half of the title.
+    // A previous fixture had the first without the second and pinned only half of its own name.
+    const out = lexed('let s = r##"a "# b"##; // swallowed {\nlet t = "x";\n');
+    expect(out, "a bare quote inside the body must not terminate an `r##` literal").not.toContain(
+      "swallowed",
+    );
+  });
+
+  it("handles more hashes than any fixed window", () => {
+    // The body must contain a QUOTE for this to be observable: a prefix matcher with a fixed
+    // lookahead window fails to match at 20 hashes, and then that inner quote opens a string that
+    // runs past the comment. Without the inner quote every mis-lex still blanks the comment and the
+    // test proves nothing — verified by mutation.
+    const h = "#".repeat(20);
+    const out = lexed(`let s = r${h}"a " b"${h}; // swallowed {\nlet t = "x";\n`);
+    expect(out, "the prefix scan must not be bounded by a fixed window").not.toContain("swallowed");
+  });
+
+  it("treats a lone quote as a lifetime and a real char literal as a literal", () => {
+    // ONE lifetime, then the comment — a lifetime read as a char literal consumes to the next quote
+    // in the file, and the comment in between is what stops being blanked. (Two lifetimes on one
+    // line make the mutant close on the second one and blank the comment anyway, which is how the
+    // first draft of this assertion passed against the broken lexer.)
+    const lt = lexed("fn f<'a>(s: &str) {}\n// swallowed {\nlet c = 'x';\n");
+    expect(lt, "a lifetime must not open a char literal").not.toContain("swallowed");
+    const chr = lexed("let c = '\"';\n// swallowed {\npub enum X { A }\n");
+    expect(chr, "a quote INSIDE a char literal must not open a string").not.toContain("swallowed");
+  });
+
+  it("leaves comment-shaped text INSIDE a string alone", () => {
+    // The other direction, and the only one that catches a lexer with no string tracking at all:
+    // every case above still blanks its comment when strings are ignored, because the mis-lex
+    // happens to close in time. This one does not — the text is only preserved if the scanner knows
+    // it is inside a string.
+    const out = lexed('let s = "keep /* this */ text";\npub enum X { A }\n');
+    expect(out, "a comment inside a string literal is not a comment").toContain(
+      "keep /* this */ text",
+    );
+
+    // …and an ESCAPED quote does not end the string early. Without escape handling the literal
+    // closes at `\"` and the rest is lexed as code, so the comment-shaped tail gets blanked.
+    const esc = lexed('let s = "a \\" /* still string */";\npub enum X { A }\n');
+    expect(esc, "an escaped quote must not close the string").toContain("/* still string */");
+  });
+
+  it("blanks comments — including nested ones — to spaces, preserving line count", () => {
+    const out = withoutRustComments("a /* x /* y */ z */ b\n// gone\nc\n");
+    expect(out).toBe("a                   b\n       \nc\n");
+    expect(out.split("\n")).toHaveLength(4);
+    // The whole point of blanking rather than deleting: offsets and line numbers still line up.
+    expect(out).not.toContain("x");
+    expect(out).not.toContain("gone");
+  });
+
+  it("still blanks a comment that FOLLOWS a string on the same line", () => {
+    // The mirror of every case above — a lexer that bails out of string tracking too eagerly would
+    // keep the comment, and a brace in that comment moves the enum boundary.
+    const code = 'let s = "x"; ';
+    const comment = "// note {";
+    expect(withoutRustComments(`${code}${comment}\n`)).toBe(`${code}${" ".repeat(comment.length)}\n`);
+  });
+});
 
 describe("Rust's PreviewState and the TypeScript union name the same states", () => {
   it("has one member per variant, lowercased", () => {
