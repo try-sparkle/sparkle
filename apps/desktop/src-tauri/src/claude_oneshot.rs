@@ -1596,15 +1596,31 @@ mod tests {
     /// are prefixes, not variable names, and every one already appears in the constant.
     #[test]
     fn the_secret_prefix_list_still_contains_the_families_it_was_built_for() {
+        // EVERY entry, not the subset the old literal fixture happened to cover: a partial pin
+        // leaves the unlisted families guarded by nothing, since the generated fixture above is
+        // tautological for all of them equally. None of these is a new emission — each already
+        // appears in the constant above, in this same exported file.
         for required in [
             "STRIPE_", "CLERK_", "DATABASE_URL", "POSTGRES_", "PG", "R2_", "KNOCK_", "POSTHOG_",
-            "GITHUB_SPARKLE_", "DEEPGRAM_API", "E2B_API", "SOCKET_IO_SECRET", "VERCEL_OIDC_TOKEN",
+            "GITHUB_SPARKLE_", "GOOGLE_OAUTH_SECRET", "EXPO_TOKEN", "CLOUDFLARE", "E2B_API",
+            "SOCKET_IO_SECRET", "DESKTOP_TOKEN_SECRET", "RESEND", "APPLE_SPARKLE_NOTARY",
+            "VERCEL_OIDC_TOKEN", "DEEPGRAM_API", "CHIEF_API", "VITE_CHIEF_PAT", "NEON_",
+            "BEADS_CREDENTIAL",
         ] {
             assert!(
                 SPARKLE_SECRET_ENV_PREFIXES.contains(&required),
                 "{required} dropped from the denylist — agents would inherit that family again"
             );
         }
+        // The tripwire that keeps the pin from going stale, which was the one real advantage the
+        // generated fixture had: a prefix added to the constant without being listed above would
+        // otherwise be covered by nothing. Red here means "add it to the list above", not "raise
+        // the number".
+        assert_eq!(
+            SPARKLE_SECRET_ENV_PREFIXES.len(),
+            23,
+            "a prefix was added or removed — pin it in the list above rather than editing this count"
+        );
     }
 
     /// `PG` is the shortest, most collision-prone entry, and it is `starts_with`-matched against
