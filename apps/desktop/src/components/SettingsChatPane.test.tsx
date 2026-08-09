@@ -72,7 +72,7 @@ const checkState = () => screen.getByTestId("chat-username-check").getAttribute(
 
 beforeEach(() => {
   // `visibilityConfirmed` too: it is store state that outlives a test, and leaking a `true` into
-  // the next one would silently hide the caveat every later test asserts on.
+  // the next one would make "a failed save confirms nothing" pass without the pane doing anything.
   useSocialStore.setState({ me: EMPTY_PROFILE, visibilityConfirmed: false });
   useAuthStore.setState({ me: null, tokenPresent: true, loading: false });
   vi.mocked(getUser).mockRejectedValue(new SocialApiError(404, null));
@@ -372,11 +372,13 @@ describe("SettingsChatPane — availability", () => {
     await waitFor(() => expect(useSocialStore.getState().me.visibility).toBe("unavailable"));
   });
 
+  // THE OPT-IN POSTURE, which is a RULE and not the copy that used to describe it. The explanatory
+  // line ("Sparkle starts everyone at Unavailable…") was cut on 2026-08-08; the default it
+  // described is `EMPTY_PROFILE.visibility === "unavailable"` and must still hold, or removing prose
+  // would have quietly removed a privacy default.
   it("offers the founder's three words, and starts everyone at Unavailable", () => {
     render(<SettingsChatPane />);
     const group = screen.getByRole("radiogroup", { name: "Availability" });
-    // Scoped to the group: "Unavailable" also appears in the copy above it, and an unscoped query
-    // would match both and fail on the ambiguity rather than on the thing being asserted.
     for (const label of ["Available: Public", "Available: Connections only", "Unavailable"]) {
       expect(within(group).getByText(label)).toBeTruthy();
     }
@@ -385,11 +387,12 @@ describe("SettingsChatPane — availability", () => {
     );
   });
 
-  // THE PATH THE COPY DIRECTS PEOPLE TO. The caveat says "choose again here to be sure", and the
-  // one option a returning user most wants to re-assert — Unavailable — is the one already checked
-  // in every un-hydrated session. A browser fires no `change` for a click on an already-checked
-  // radio, so before the onClick handler this instruction was a silent no-op: no request, no
-  // spinner, no confirmation, and nothing to distinguish it from a successful re-assert.
+  // A BEHAVIOUR THAT OUTLIVED THE COPY THAT POINTED AT IT. The caveat used to say "choose again
+  // here to be sure"; that sentence was cut on 2026-08-08, the silent-no-op bug it worked around
+  // was not. The one option a returning user most wants to re-assert — Unavailable — is the one
+  // already checked in every un-hydrated session, and a browser fires no `change` for a click on an
+  // already-checked radio, so without the onClick handler that click is no request, no spinner and
+  // no confirmation, indistinguishable from a successful save.
   it("re-asserting the ALREADY-SELECTED option still calls putVisibility", async () => {
     vi.mocked(putVisibility).mockResolvedValue({ visibility: "unavailable" });
     render(<SettingsChatPane />);
@@ -411,41 +414,27 @@ describe("SettingsChatPane — availability", () => {
     expect(putVisibility).toHaveBeenCalledTimes(1);
   });
 
-  // The caveat states something it can only know BEFORE a save. Afterwards `me.visibility` is the
-  // value the server accepted (it is written only on a 2xx), so leaving the line up would tell the
-  // user their setting had not landed at the exact moment it had.
-  it("drops the 'this Mac may not know' caveat once the server has confirmed a choice", async () => {
-    vi.mocked(putVisibility).mockResolvedValue({ visibility: "public" });
-    render(<SettingsChatPane />);
-    expect(screen.getByTestId("chat-visibility-unknown")).toBeTruthy();
-
-    fireEvent.click(screen.getByTestId("chat-visibility-public"));
-
-    await waitFor(() => expect(screen.queryByTestId("chat-visibility-unknown")).toBeNull());
-  });
-
-  // THE FLAG'S LIFETIME, which the four tests above cannot see because they render ONCE. The pane
-  // remounts on every rail click (SettingsDialog mounts only the active pane), so a component-local
-  // flag would reset while `me.visibility` — which lives in the store — would not, and the caveat
-  // would come back over a value the server confirmed a moment ago.
-  it("keeps the caveat down across a REMOUNT — the confirmation outlives the pane", async () => {
+  // THE CHOICE OUTLIVES THE PANE. The pane remounts on every rail click (SettingsDialog mounts only
+  // the active pane), so the selection has to come from the store rather than from component state
+  // — otherwise navigating away and back would show a returning user a different answer than the
+  // one the server just accepted.
+  it("keeps the confirmed choice across a REMOUNT", async () => {
     vi.mocked(putVisibility).mockResolvedValue({ visibility: "public" });
     render(<SettingsChatPane />);
     fireEvent.click(screen.getByTestId("chat-visibility-public"));
-    await waitFor(() => expect(screen.queryByTestId("chat-visibility-unknown")).toBeNull());
+    await waitFor(() => expect(useSocialStore.getState().me.visibility).toBe("public"));
 
     // Navigate away and back, which is exactly what the settings rail does to this pane.
     cleanup();
     render(<SettingsChatPane />);
 
-    expect(screen.queryByTestId("chat-visibility-unknown")).toBeNull();
     expect((screen.getByTestId("chat-visibility-public") as HTMLInputElement).checked).toBe(true);
   });
 
   // …and it must NOT outlive the HUMAN. Per-human state surviving a sign-out is a recurring leak in
-  // this app; here `reset()` is what prevents it, so the next account starts unconfirmed rather
-  // than inheriting the previous one's word for it.
-  it("drops the confirmation on reset(), so the next account starts unconfirmed", async () => {
+  // this app; here `reset()` is what prevents it, so the next account starts at the Unavailable
+  // default rather than inheriting the previous one's exposure.
+  it("drops the confirmed choice on reset(), so the next account starts Unavailable", async () => {
     vi.mocked(putVisibility).mockResolvedValue({ visibility: "public" });
     render(<SettingsChatPane />);
     fireEvent.click(screen.getByTestId("chat-visibility-public"));
@@ -454,17 +443,25 @@ describe("SettingsChatPane — availability", () => {
     act(() => useSocialStore.getState().reset());
 
     expect(useSocialStore.getState().visibilityConfirmed).toBe(false);
+    expect(useSocialStore.getState().me.visibility).toBe("unavailable");
     cleanup();
     render(<SettingsChatPane />);
-    expect(screen.getByTestId("chat-visibility-unknown")).toBeTruthy();
+    expect((screen.getByTestId("chat-visibility-unavailable") as HTMLInputElement).checked).toBe(
+      true,
+    );
   });
 
-  it("KEEPS the caveat when the save failed — nothing was confirmed", async () => {
+  // A FAILED SAVE CONFIRMS NOTHING. `confirmVisibility` is the only writer of both halves and runs
+  // only on a 2xx, so a transport failure must leave the store exactly where it was — the paired
+  // negative to "choosing Public reaches the store", without which that test is satisfied by a pane
+  // that writes the store unconditionally.
+  it("a FAILED save moves neither the value nor the confirmation", async () => {
     vi.mocked(putVisibility).mockRejectedValue(new SocialNetworkError());
     render(<SettingsChatPane />);
     fireEvent.click(screen.getByTestId("chat-visibility-public"));
     await waitFor(() => expect(screen.getByTestId("chat-visibility-note")).toBeTruthy());
-    expect(screen.getByTestId("chat-visibility-unknown")).toBeTruthy();
+    expect(useSocialStore.getState().me.visibility).toBe("unavailable");
+    expect(useSocialStore.getState().visibilityConfirmed).toBe(false);
   });
 
   it("choosing Public reaches the server and the store too (the opposite direction)", async () => {
@@ -502,19 +499,6 @@ describe("SettingsChatPane — what the user is shown", () => {
     ).toBe("offline");
   });
 
-  // BOTH CONTROLS READ AN UN-HYDRATED STORE, so both say which question they are answering. The
-  // availability one matters more: the dot under-claims REACHABILITY (fail-closed), but a radio
-  // stuck on `Unavailable` for a user the server lists as `public` under-claims EXPOSURE, which on
-  // a privacy control is the direction that actually harms someone (roborev 60415).
-  it("says out loud that both controls show what THIS MACHINE knows", () => {
-    render(<SettingsChatPane />);
-    expect(screen.getByTestId("chat-username-unknown").textContent).toContain(
-      "may not know it yet",
-    );
-    expect(screen.getByTestId("chat-visibility-unknown").textContent).toContain("this Mac");
-    expect(screen.getByTestId("chat-visibility-unknown").textContent).toContain("choose again");
-  });
-
   it("does not tell the user their availability is unchanged — it cannot know that", () => {
     render(<SettingsChatPane />);
     // The copy this replaces read "Nothing here changes until you choose it", which is true of the
@@ -522,11 +506,71 @@ describe("SettingsChatPane — what the user is shown", () => {
     expect(document.body.textContent).not.toContain("Nothing here changes until you choose it");
   });
 
-  it("STATES that messages are not end-to-end encrypted rather than implying it (§6)", () => {
+  // ── THE FOUNDER'S COPY CUT, PINNED ────────────────────────────────────────────────────────────
+  // On 2026-08-08 the founder removed four blocks of explanatory copy from this pane: it read as
+  // four paragraphs of caveats before he could do anything. This is a decision about his own
+  // product's copy, and the failure mode it guards against is specific — a later agent reads the
+  // rationale still recorded in the PRD and in roborev 60396/60415/60425 (all of which argued FOR
+  // this text on real grounds) and puts it back, believing it is restoring a fix.
+  //
+  // Deliberately asserted on the RENDERED DOCUMENT, not on the deleted testids: a `queryByTestId`
+  // returning null is satisfied by re-adding the copy under a different id, which is exactly how it
+  // would come back. The distinctive phrase from each block is enough to catch a paste-back.
+  it("does not re-add the four blocks of explanatory copy the founder cut", () => {
+    useSocialStore.setState({ me: EMPTY_PROFILE, visibilityConfirmed: false });
     render(<SettingsChatPane />);
-    expect(screen.getByTestId("chat-encryption-notice").textContent).toContain(
-      "not end-to-end encrypted",
+    const shown = document.body.textContent ?? "";
+
+    for (const phrase of [
+      "Pick the handle other people will use to find you", // 1 — username preamble
+      "Sparkle may not know it yet", // 2 — other-machine caveat
+      "Sparkle starts everyone at", // 3a — availability preamble
+      "choose again here to be sure", // 3b — un-hydrated availability caveat
+      "not end-to-end encrypted", // 4 — the BEFORE YOU START block
+      "Before you start",
+    ]) {
+      expect(shown).not.toContain(phrase);
+    }
+  });
+
+  // …AND THE RULES THOSE PARAGRAPHS DESCRIBED ARE STILL ENFORCED. The pair matters: the test above
+  // alone is satisfied by a pane that dropped the constraints along with the prose, which is the one
+  // outcome the founder did NOT ask for ("he is cutting the wall of text, not the guardrails").
+  // Each assertion here drives the real code path rather than reading a string.
+  it("keeps every rule the cut copy used to explain", async () => {
+    // (a) 3–30 characters, still enforced, still surfaced inline where it bites.
+    render(<SettingsChatPane />);
+    typeUsername("ab");
+    clickSave();
+    await waitFor(() => expect(checkState()).toBe("invalid"));
+    expect(screen.getByTestId("chat-username-check").textContent).toContain("At least 3");
+    expect(putUsername).not.toHaveBeenCalled();
+
+    typeUsername("a".repeat(31));
+    await waitFor(() =>
+      expect(screen.getByTestId("chat-username-check").textContent).toContain("At most 30"),
     );
+
+    // (b) Unavailable by default — the opt-in posture, read off the store the pane renders from.
+    expect((screen.getByTestId("chat-visibility-unavailable") as HTMLInputElement).checked).toBe(
+      true,
+    );
+
+    // (c) A handle claimed on ANOTHER machine is not overwritten: the server's 409 is surfaced and
+    //     the store stays empty.
+    vi.mocked(putUsername).mockRejectedValue(new SocialApiError(409, "username_immutable"));
+    typeUsername("ada_l");
+    clickSave();
+    await waitFor(() => expect(screen.getByTestId("chat-claim-note")).toBeTruthy());
+    expect(screen.getByTestId("chat-claim-note").textContent).toContain("can’t be changed");
+    expect(useSocialStore.getState().me.username).toBeNull();
+
+    // (d) Immutability: once a handle IS known there is no field to change it with.
+    cleanup();
+    useSocialStore.setState({ me: { ...EMPTY_PROFILE, username: "ada_l" } });
+    render(<SettingsChatPane />);
+    expect(screen.queryByTestId("chat-username-input")).toBeNull();
+    expect(screen.queryByTestId("chat-username-save")).toBeNull();
   });
 
   it("once a username is claimed it is shown as SETTLED — no field, no Save, no rename offer", () => {

@@ -191,12 +191,6 @@ const VISIBILITY_CHOICES: readonly { value: Visibility; label: string; hint: str
 export function SettingsChatPane() {
   const me = useSocialStore((s) => s.me);
   const setMyProfile = useSocialStore((s) => s.setMyProfile);
-  // FROM THE STORE, not from `useState`. This pane REMOUNTS on every rail click (`SettingsDialog`
-  // mounts only the active pane, and the dialog itself is conditionally rendered), so a local flag
-  // would reset while the value it qualifies — which lives in the store — would not, and the
-  // caveat below would come back over a server-confirmed setting. See the field's own docstring for
-  // the second, larger reason it belongs there (roborev 60432).
-  const visConfirmed = useSocialStore((s) => s.visibilityConfirmed);
   const confirmVisibility = useSocialStore((s) => s.confirmVisibility);
   const authMe = useAuthStore((s) => s.me);
 
@@ -228,10 +222,13 @@ export function SettingsChatPane() {
    *
    * That is why the claim form appearing is not a promise that the name is free: the probe can
    * report the user's OWN handle as taken, and Save answers `409 username_immutable`, which is
-   * exactly the remedy {@link claimRemedy} spells out rather than a generic failure. The copy below
-   * says so too, so a returning user reads a state rather than a contradiction. (roborev 60396,
-   * 60415; the fix is U1's `services/socialSync` hydrating `me` from `/me` on connect, which this
-   * file must not grow a second copy of.)
+   * exactly the remedy {@link claimRemedy} spells out rather than a generic failure. That remedy is
+   * now the ONLY place this is said — the standing caveat that used to sit above the field was cut
+   * on 2026-08-08 (founder's call on his own copy), so the honest answer reaches the user at the
+   * moment they hit it rather than as a preamble. Nothing about the mechanism changed: `save()`
+   * still never overwrites a claimed handle, and a refusal still leaves the store untouched.
+   * (roborev 60396, 60415; the fix is U1's `services/socialSync` hydrating `me` from `/me` on
+   * connect, which this file must not grow a second copy of.)
    */
   const settled = me.username != null;
 
@@ -406,18 +403,15 @@ export function SettingsChatPane() {
           </div>
         ) : (
           <>
-            <div style={{ ...bodyLine, marginBottom: 10 }}>
-              Pick the handle other people will use to find you. {USERNAME_MIN_LENGTH}–
-              {USERNAME_MAX_LENGTH} characters, letters a–z, digits and single underscores. You
-              can’t change it later.
-            </div>
-            {/* Said out loud, because the app cannot yet tell "you have no username" from "this
-                Mac hasn't been told yours". Without this line a returning user reads their own
-                handle being reported as taken as a contradiction rather than as a state. */}
-            <div style={{ ...bodyLine, marginBottom: 10 }} data-testid="chat-username-unknown">
-              If you already claimed one on another machine, Sparkle may not know it yet — saving
-              will tell you rather than overwrite it.
-            </div>
+            {/* NO EXPLANATORY PREAMBLE (founder's call, 2026-08-08). The rules it used to spell out
+                are NOT relaxed — they are enforced in code and surfaced by {@link CheckLine} at the
+                moment they bite, which is the only moment they are useful:
+                  • 3–30 characters / a–z / single underscores → `validateUsernameFormat`, painted
+                    per-rule by `rejectionText` under the field as you type and again on Save.
+                  • Immutable once claimed → the `settled` branch above replaces this whole form,
+                    and a server `409 username_immutable` has its own remedy in `claimRemedy`.
+                  • Already claimed on another machine → `save()` never overwrites; the server's
+                    `409` is what the user is told. The store is not touched on a refusal. */}
             <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
               <input
                 data-testid="chat-username-input"
@@ -469,30 +463,15 @@ export function SettingsChatPane() {
       {/* ── Availability ─────────────────────────────────────────────────────────────────────── */}
       <div>
         <div style={subLabel}>Availability</div>
-        <div style={{ ...bodyLine, marginBottom: 10 }}>
-          Sparkle starts everyone at <span style={{ color: C.cream }}>Unavailable</span>: chat is
-          opt-in, and nobody becomes discoverable just by installing an update.
-        </div>
-        {/* THE SAME CAVEAT AS THE USERNAME FIELD, AND IT MATTERS MORE HERE. The selected radio is
-            read from the same un-hydrated `me`, so a returning user the server holds as `public`
-            sees `Unavailable` checked. The dot under-claims REACHABILITY, which is the fail-closed
-            direction; this control would under-claim EXPOSURE, which on a privacy control is the
-            direction that actually harms someone — they would read "I am hidden" while the
-            directory still lists them. We cannot tell that state from a genuinely new account
-            (both look like an empty store, and for the new account `Unavailable` is the truth), so
-            the honest move is to say which question this is answering. (roborev 60415.)
+        {/* NO PREAMBLE AND NO STALENESS CAVEAT (founder's call, 2026-08-08). The opt-in POSTURE is
+            unchanged and is enforced where it belongs: `EMPTY_PROFILE.visibility` is
+            `"unavailable"`, so a store that has never been written reads Unavailable and nobody
+            becomes discoverable by installing an update. `me.visibility` still moves only on a 2xx.
 
-            GONE ONCE A SAVE LANDS IN THIS SESSION, because after one the line is FALSE:
-            `chooseVisibility` writes `me` only on a 2xx, so the value shown IS the one the server
-            accepted, and telling that user their setting has not landed is the same defect with the
-            sign flipped — plus it undercuts the confirmation they just earned (roborev 60425). */}
-        {!visConfirmed && (
-          <div style={{ ...bodyLine, marginBottom: 10 }} data-testid="chat-visibility-unknown">
-            This shows what <span style={{ color: C.cream }}>this Mac</span> knows. Sparkle can’t
-            yet re-read a setting you made on another machine, so choose again here to be sure —
-            picking the option that is already selected still saves it.
-          </div>
-        )}
+            The un-hydrated-store caveat this used to carry is gone with the rest of the prose, but
+            the BEHAVIOUR it directed people to is deliberately kept: re-asserting the option that
+            is already selected still writes (see the radio's `onClick` below), so a user who wants
+            to be sure can click Unavailable and get a real save rather than a silent no-op. */}
         <div role="radiogroup" aria-label="Availability" style={choiceStack}>
           {VISIBILITY_CHOICES.map((choice) => {
             const selected = me.visibility === choice.value;
@@ -506,15 +485,14 @@ export function SettingsChatPane() {
                   checked={selected}
                   disabled={visSaving !== null}
                   onChange={() => void chooseVisibility(choice.value)}
-                  // RE-ASSERTING THE ALREADY-SELECTED OPTION HAS TO WORK, because the copy above
-                  // tells the user to do exactly that, and a browser fires no `change` for a click
-                  // on a radio that is already checked. Without this, the person that line is
-                  // written for — someone who wants to be SURE they are hidden — clicks
-                  // "Unavailable", gets no request, no spinner and no confirmation, and walks away
-                  // believing they re-confirmed a setting the server may still hold as `public`.
-                  // That is the refusal-copy trap AGENTS.md names (bead sparkle-8bvh): a remedy
-                  // string is an instruction the user WILL follow, so it needs the same analysis as
-                  // the code path it replaces. (roborev 60425.)
+                  // RE-ASSERTING THE ALREADY-SELECTED OPTION HAS TO WORK. A browser fires no
+                  // `change` for a click on a radio that is already checked, and `Unavailable` is
+                  // the checked one in every un-hydrated session — so without this, the person who
+                  // most wants to be SURE they are hidden clicks "Unavailable", gets no request, no
+                  // spinner and no confirmation, and walks away believing they re-confirmed a
+                  // setting the server may still hold as `public`. This survived the copy cut on
+                  // purpose: the sentence that used to point at it is gone, the silent-no-op bug it
+                  // fixes is not. (roborev 60425.)
                   //
                   // No double-send. React's onChange for a radio is itself driven by the click and
                   // fires only when the checkedness actually changed, so the two are disjoint:
@@ -546,17 +524,6 @@ export function SettingsChatPane() {
             <span>{visNote.text}</span>
           </div>
         )}
-      </div>
-
-      {/* ── The honest limitation, STATED rather than implied (§6) ────────────────────────────── */}
-      <div>
-        <div style={subLabel}>Before you start</div>
-        <div style={bodyLine} data-testid="chat-encryption-notice">
-          Messages are <span style={{ color: C.cream }}>not end-to-end encrypted</span>. They are
-          stored on Sparkle’s server so your history follows you between machines, which means
-          Sparkle can read them in principle. Don’t send anything here you wouldn’t put in a support
-          ticket.
-        </div>
       </div>
     </div>
   );
