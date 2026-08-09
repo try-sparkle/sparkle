@@ -357,6 +357,33 @@ describe("SettingsChatPane — the server half may not be live yet", () => {
     expect(useSocialStore.getState().me.visibility).toBe("public");
     expect(putVisibility).toHaveBeenCalledTimes(1);
   });
+
+  // THE FOUNDER'S BUG, VERBATIM: "I tried to send my status to public, but I wouldn't save."
+  //
+  // The test above pins the pane-level banner, and it passed throughout the entire time the bug was
+  // live — because the banner is not what a person clicking a radio at the bottom of the pane reads.
+  // A failed write leaves `me` untouched, so the radio snaps back, and the ONLY explanation was ~90
+  // lines of JSX further up in calm styling. This asserts the note at the CONTROL, which is the
+  // thing that was missing; it fails against the pane as it shipped.
+  it("a 404 from the visibility write names the failure AT the control, not only in the pane banner", async () => {
+    // Seeded to the DEFAULT and clicking away from it, so the click is a real change that fires
+    // `onChange` — and so a pane that merely failed to repaint could not pass by accident.
+    useSocialStore.setState({ me: { ...EMPTY_PROFILE, visibility: "unavailable" } });
+    vi.mocked(putVisibility).mockRejectedValue(new SocialApiError(404, null));
+    render(<SettingsChatPane />);
+
+    fireEvent.click(screen.getByTestId("chat-visibility-public"));
+
+    await waitFor(() => expect(screen.getByTestId("chat-visibility-note")).toBeTruthy());
+    const note = screen.getByTestId("chat-visibility-note").textContent ?? "";
+    // It must say the save FAILED…
+    expect(note).toContain("didn’t save");
+    // …and what the setting is NOW, which is the fact a silent revert withholds.
+    expect(note).toContain("unchanged");
+    // The revert this note is explaining really did happen.
+    expect((screen.getByTestId("chat-visibility-public") as HTMLInputElement).checked).toBe(false);
+    expect(useSocialStore.getState().me.visibility).toBe("unavailable");
+  });
 });
 
 describe("SettingsChatPane — availability", () => {

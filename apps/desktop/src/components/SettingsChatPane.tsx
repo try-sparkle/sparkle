@@ -169,6 +169,26 @@ export function claimRemedy(err: unknown): { text: string; calm: boolean } {
   return { text: `The server refused that username (${err.status}).`, calm: false };
 }
 
+/**
+ * What the AVAILABILITY control itself says when its own write answers `404`.
+ *
+ * ══ WHY THIS EXISTS WHEN THE PANE BANNER ALREADY COVERS THE CASE ═══════════════════════════════
+ * A failed write never moves `me`, and the radios read `checked` from `me` — so the option the user
+ * just clicked SNAPS BACK. The only explanation rendered was {@link CHAT_NOT_LIVE_TEXT}, and it
+ * paints at the TOP of the pane, ~90 lines of JSX above the radio group, in calm styling. From the
+ * seat of someone who scrolled down to Availability, clicked, and watched it revert, that is a
+ * control refusing with no reason given — which is exactly how the founder reported it: "I tried to
+ * send my status to public, but I wouldn't save."
+ *
+ * So the failure is named a second time, AT the control that failed. Deliberately its OWN wording
+ * rather than a copy of the banner: the banner explains the FEATURE's state ("chat isn't on yet"),
+ * while this explains what happened to THIS CLICK and what the setting is NOW — the two facts a
+ * silent revert withholds. A save that cannot reach the server must say so where the save was made;
+ * a silent no-op is worse than a visible failure.
+ */
+export const VIS_NOT_SAVED_TEXT =
+  "That didn’t save — chat isn’t switched on for this account yet, so your availability is unchanged.";
+
 /** The founder's own three words for the availability choice (§1), mapped onto {@link Visibility}. */
 const VISIBILITY_CHOICES: readonly { value: Visibility; label: string; hint: string }[] = [
   {
@@ -337,8 +357,12 @@ export function SettingsChatPane() {
         // action for both halves so the value can never be stored while still marked unconfirmed.
         confirmVisibility(value);
       } catch (e) {
-        if (e instanceof SocialApiError && e.status === 404) setNotLiveYet(true);
-        else if (e instanceof SocialNetworkError) {
+        if (e instanceof SocialApiError && e.status === 404) {
+          setNotLiveYet(true);
+          // AND at the control — see {@link VIS_NOT_SAVED_TEXT}. Setting only the pane-level flag
+          // left the clicked radio reverting with its explanation off-screen above.
+          setVisNote({ text: VIS_NOT_SAVED_TEXT, calm: true });
+        } else if (e instanceof SocialNetworkError) {
           setVisNote({ text: "Sparkle couldn’t reach the server. Try again.", calm: true });
         } else if (e instanceof SocialApiError) {
           setVisNote({ text: `The server refused that change (${e.status}).`, calm: false });
