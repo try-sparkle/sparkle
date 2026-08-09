@@ -305,36 +305,40 @@ describe("escalatedStatus resolves agents by index, not by scanning", () => {
     // restated fact that went stale — it still said "three times" on the fourth round.)
     const AGENT_STEP = 30; // 60 - 30, the fleet-size increment measured above
 
-    // ── ONE LIVENESS PROBE, AND IT IS `find` (roborev 61308) ────────────────────────────────────
-    // This used to be a per-scan `calls >= n` check on `some` and `filter`, with a three-case prose
-    // taxonomy attached. Both were wrong, in the same way and for the third time:
+    // ── THE LIVENESS PROBE IS THE SUM, NOT ANY ONE COUNTER (roborev 61308, 61518) ───────────────
+    // This started as a per-scan `calls >= n` check with a three-case prose taxonomy, then became a
+    // single probe on `find`. Both were the same mistake in different clothes: keying liveness to a
+    // counter whose SUCCESS VALUE CAN LEGITIMATELY BE ZERO.
     //
-    //   · The taxonomy was written for `some`, whose success value IS zero, and then handed to
-    //     `filter`, whose success value is NOT — the header table records ~8 constant-count
-    //     `filter` calls at n=30. So the day sparkle-k3wab lands, `filter30.calls ≈ 8` fell into
-    //     the case whose text says "neither of those", actively excluding the bead-landed reading
-    //     for the very bead the message names.
-    //   · `some`'s success value being zero meant its liveness red and its delta red fired
-    //     together, printing "re-wire, the scan is untouched" beside "DELETE this block" — two
-    //     contradictory instructions in one output, one of which deletes a live pin.
+    //   · The taxonomy was written for `some` (success value 0) and then applied to `filter`, whose
+    //     success value is ~8 — so sparkle-k3wab landing fell into the case reading "neither of
+    //     those", excluding the bead-landed verdict for the bead the message names.
+    //   · `find` is no better: the header records its six remaining calls as UNRELATED render-path
+    //     call sites, and indexing those away is the natural continuation of the very change this
+    //     file pins (36 → 6 → 0). A probe on `find` alone would then red with "the overrides are
+    //     not being reached" while `some`/`filter` were plainly still counting — contradicted by
+    //     the same run's own log line. Their call sites are disjoint, so `find === 0` never implied
+    //     anything about the others in the first place.
     //
-    // The mistake both times was ENUMERATING cases in prose keyed to values the prose then got
-    // wrong. So the absolute per-scan checks are gone. Two facts are measured directly instead, and
-    // each assertion says only what its own number can support:
-    //
-    //   `find`  — a CONSTANT scan (6 calls at both sizes) over this same instrumented array, so it
-    //             answers "are the overrides reached at all", and nothing else.
-    //   delta   — (calls at 60) − (calls at 30). Subtracting cancels every constant-count scan, so
-    //             it isolates the PER-AGENT term whatever that scan's absolute baseline happens to
-    //             be. That is what makes it correct for `filter` and `some` alike.
+    // A dead instrument is not "some particular scan stopped". It is "the array never reached the
+    // component at all", and the only faithful expression of that is that NOTHING scanned it. The
+    // sum can only be zero in exactly that case, so this red cannot mis-narrate a landed fix: a
+    // zero `find` beside a live `some`/`filter` stays green here and the delta pins do the work.
     const instrumentAlive =
-      `INSTRUMENT: no 'find' scan was counted, so the counting overrides are not being reached at ` +
-      `all — something now hands this call site a DERIVED or COPIED array ([...project.agents], a ` +
-      `memoised copy, topLevelAgents(...)). Every other counter reads zero for THAT reason, not ` +
-      `because a scan was optimised away. RE-WIRE the instrument: do not delete anything, and do ` +
-      `not write "the scan is gone" into the header.`;
-    expect.soft(find30.calls, instrumentAlive).toBeGreaterThan(0);
-    expect.soft(find60.calls, instrumentAlive).toBeGreaterThan(0);
+      `INSTRUMENT: not a single scan of the agents array was counted, so the counting overrides ` +
+      `are not being reached at all — something now hands this call site a DERIVED or COPIED array ` +
+      `([...project.agents], a memoised copy, topLevelAgents(...)). Every counter reads zero for ` +
+      `THAT reason, not because a scan was optimised away. RE-WIRE the instrument: do not delete ` +
+      `anything, and do not write "the scan is gone" into the header. (This is the SUM across ` +
+      `find/some/filter on purpose — any individual counter reaching zero is a legitimate success ` +
+      `state for the scan it tracks, and reading one of those as a dead instrument is the exact ` +
+      `mis-narration this probe was rewritten twice to remove.)`;
+    expect.soft(find30.calls + some30.calls + filter30.calls, instrumentAlive).toBeGreaterThan(0);
+    expect.soft(find60.calls + some60.calls + filter60.calls, instrumentAlive).toBeGreaterThan(0);
+
+    // NOTE on the `find` constancy assertion further up: if those six call sites are ever indexed
+    // away it becomes 0 === 0 and passes trivially. That is acceptable — "the number of lookup
+    // scans does not grow with the fleet" is still true, and more true, of zero of them.
 
     /** What a maintainer must do when a per-agent term assertion goes red. */
     const delta = (scan: string, bead: string) =>
