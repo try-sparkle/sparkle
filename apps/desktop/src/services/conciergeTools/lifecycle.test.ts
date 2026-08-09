@@ -58,6 +58,21 @@ vi.mock("../workerSpawn", async (orig) => ({
   ...(await orig<typeof import("../workerSpawn")>()),
   spinDownWorker: (...a: unknown[]) => spinDownWorkerMock(...(a as [])),
 }));
+// THE LIVE GIT READ the spin-down guard now takes at the moment of the decision (bead
+// sparkle-plxhx). Mocked at the Tauri boundary rather than stubbing the guard itself, so these
+// tests drive the real `readWorkerWorktreeRisk` — including its gone-worktree and cache-fallback
+// arms. `undefined` (the default) means "no live read was configured": the mock rejects, which is
+// the shape a git failure takes, so a test that forgets to set it lands on the honest unknown path
+// instead of silently getting a clean reading.
+let liveBranchStatus: (() => Promise<BranchStatus>) | null = null;
+const agentBranchStatusMock = vi.fn(async () => {
+  if (!liveBranchStatus) throw new Error("no live reading configured for this test");
+  return liveBranchStatus();
+});
+vi.mock("../branchStatus", async (orig) => ({
+  ...(await orig<typeof import("../branchStatus")>()),
+  agentBranchStatus: (...a: unknown[]) => agentBranchStatusMock(...(a as [])),
+}));
 // The real spawn body runs by default (these tests assert the human path's exact sequence); a test
 // that needs the "project vanished mid-spawn" branch sets `spawnOverride`.
 let spawnOverride: (() => string | null) | null = null;
@@ -164,6 +179,8 @@ function seedShell(projectId: string): string {
 }
 
 beforeEach(() => {
+  liveBranchStatus = null;
+  agentBranchStatusMock.mockClear();
   useProjectStore.setState({ projects: [], selectedProjectId: null });
   useRuntimeStore.setState({ branchStatus: {}, workflowStage: {}, openAgentIds: [] });
   useSettingsStore.setState({
@@ -654,6 +671,36 @@ describe("previewClose", () => {
     expect(r.data.uncommittedChanges).toBe(true);
     expect(r.data.recommended).toBe("keep-open");
     expect(r.data.reason).toMatch(/uncommitted/i);
+  });
+
+  // THE FALSE REPORT (bead sparkle-plxhx). `preview_close` returned `uncommittedChanges: true`
+  // AND `statusUnknown: true` together for every deadlocked worker — and the first of those was
+  // simply untrue: the trees were `git status --porcelain` empty. Parking is an ATTRIBUTION fact
+  // ("whose dirt is this?"), and attribution is only ever a question about dirt that exists.
+  //
+  // `statusUnknown` deliberately STAYS true here: for a preview, "this tree is off its minted
+  // branch" is a real caveat worth showing. What it may not do is masquerade as uncommitted work.
+  it("does not report uncommitted changes for a parked worktree that is provably clean", () => {
+    const pid = seedProject();
+    const id = seedBuild(pid, { bs: { ...CLEAN, worktreeOnBranch: false } });
+    const r = previewClose(id);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.data.uncommittedChanges).toBe(false);
+    expect(r.data.statusUnknown).toBe(true);
+    expect(r.data.reason).not.toMatch(/uncommitted/i);
+  });
+
+  // The safety half, unchanged: a DIRTY parked tree still reports uncommitted work, because parking
+  // carries those files along and the teardown destroys them.
+  it("still reports uncommitted changes for a parked worktree that is dirty", () => {
+    const pid = seedProject();
+    const id = seedBuild(pid, { bs: { ...DIRTY, worktreeOnBranch: false } });
+    const r = previewClose(id);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.data.uncommittedChanges).toBe(true);
+    expect(r.data.recommended).toBe("keep-open");
   });
 
   it("never recommends DISCARD — that is only ever the human's explicit choice", () => {
@@ -1202,14 +1249,20 @@ describe("spinDownWorkerAgent", () => {
   // The teardown removes the checkout with --force, so "the branch is kept" does NOT cover
   // uncommitted files. Each case asserts the TEARDOWN DID NOT RUN — the refusal object alone would
   // pass even if the worktree had already been deleted underneath it.
+  //
+  // ONLY A POSITIVE DIRTY READING RAISES `uncommitted-work` (bead sparkle-plxhx). The parked-clean
+  // and no-reading cases used to be listed here too, and that is precisely what deadlocked the
+  // fleet — they are now `status-unknown` or a clean retire, covered below.
   it.each([
     ["a dirty worktree", DIRTY],
-    ["a worktree parked on another branch, which still holds the files", { ...CLEAN, worktreeOnBranch: false }],
-    ["no branch reading yet, which cannot rule the changes out", undefined],
+    // The case the parked gate was actually written for, and it is UNCHANGED: parking carries
+    // uncommitted files along, so a dirty parked tree still holds real work the teardown destroys.
+    ["a dirty worktree parked on another branch", { ...DIRTY, worktreeOnBranch: false }],
   ])("refuses to spin a worker down with %s", async (_label, bs) => {
     const pid = seedProject();
     const build = seedBuild(pid, { bs: CLEAN });
-    const worker = seedWorker(pid, build, undefined, bs);
+    const worker = seedWorker(pid, build, undefined, CLEAN);
+    liveBranchStatus = async () => bs;
     const r = await spinDownWorkerAgent(worker);
     expect(r.ok).toBe(false);
     if (r.ok) return;
@@ -1221,9 +1274,110 @@ describe("spinDownWorkerAgent", () => {
     const pid = seedProject();
     const build = seedBuild(pid, { bs: CLEAN });
     const worker = seedWorker(pid, build, undefined, DIRTY);
+    liveBranchStatus = async () => DIRTY;
     const r = await spinDownWorkerAgent(worker, { discardUncommitted: true });
     expect(r.ok).toBe(true);
     expect(spinDownWorkerMock).toHaveBeenCalledWith({ projectId: pid, workerId: worker });
+  });
+
+  // ══ THE DEADLOCK REGRESSION (bead sparkle-plxhx) ═══════════════════════════════════════════════
+  // On 2026-08-08 seven finished workers could not be retired on the founder's machine; capacity sat
+  // at 85 against a ceiling of 80 and no new agent could start. Every one of them was refused with
+  // "has uncommitted changes in its worktree" while `git status --porcelain` in that worktree
+  // returned ZERO lines. Six were parked on descriptively-named branches (`pr1380`, `sparkle-k-esc`)
+  // with the minted `sparkle/agent-<id>` ref still present, which is all `worktreeOnBranch: false`
+  // means; the seventh's worktree directory was already gone.
+  //
+  // Each of these asserts the TEARDOWN RAN, not merely that the result was ok.
+  it("retires a worker whose live tree is CLEAN but whose cached reading says parked", async () => {
+    const pid = seedProject();
+    const build = seedBuild(pid, { bs: CLEAN });
+    // The stale cache that produced the deadlock: parked, so the old guard called it dirty forever.
+    const worker = seedWorker(pid, build, undefined, { ...CLEAN, worktreeOnBranch: false });
+    // …and what git actually says right now: parked, and empty.
+    liveBranchStatus = async () => ({ ...CLEAN, worktreeOnBranch: false });
+    const r = await spinDownWorkerAgent(worker);
+    expect(r.ok).toBe(true);
+    expect(spinDownWorkerMock).toHaveBeenCalledWith({ projectId: pid, workerId: worker });
+  });
+
+  // The seventh worker. `runtimeStore` LATCHES a removed worktree into `deadWorktrees` and never
+  // polls it again, so its cached reading stays `undefined` for the app's lifetime — the refusal
+  // could never clear. A checkout that does not exist cannot lose uncommitted work.
+  it("retires a worker whose worktree is already gone", async () => {
+    const pid = seedProject();
+    const build = seedBuild(pid, { bs: CLEAN });
+    const worker = seedWorker(pid, build, undefined, undefined);
+    liveBranchStatus = async () => {
+      throw new Error("fatal: cannot change to '/wt/gone': No such file or directory");
+    };
+    const r = await spinDownWorkerAgent(worker);
+    expect(r.ok).toBe(true);
+    expect(spinDownWorkerMock).toHaveBeenCalledWith({ projectId: pid, workerId: worker });
+  });
+
+  // HONESTY. A tree we could not read is refused — but never with a sentence asserting that changes
+  // exist. That false claim is what made the deadlock undebuggable: the founder was told to have the
+  // workers commit, did so, and nothing changed, because there was nothing to commit.
+  it("refuses an unreadable worktree as status-unknown, never as uncommitted work", async () => {
+    const pid = seedProject();
+    const build = seedBuild(pid, { bs: CLEAN });
+    const worker = seedWorker(pid, build, undefined, undefined);
+    liveBranchStatus = async () => {
+      throw new Error("git index.lock exists");
+    };
+    const r = await spinDownWorkerAgent(worker);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toBe("status-unknown");
+    expect(r.message).not.toMatch(/has uncommitted changes/i);
+    expect(r.message).toMatch(/couldn't read/i);
+    expect(spinDownWorkerMock).not.toHaveBeenCalled();
+  });
+
+  // THE ESCAPE HATCH. An operator who can see the tree must be able to retire it without reaching
+  // for `discard_agent`, which deletes branches and worktrees outright.
+  it("retires an unreadable worktree when the operator passes allowUnknownStatus", async () => {
+    const pid = seedProject();
+    const build = seedBuild(pid, { bs: CLEAN });
+    const worker = seedWorker(pid, build, undefined, undefined);
+    liveBranchStatus = async () => {
+      throw new Error("git index.lock exists");
+    };
+    const r = await spinDownWorkerAgent(worker, { allowUnknownStatus: true });
+    expect(r.ok).toBe(true);
+    expect(spinDownWorkerMock).toHaveBeenCalledWith({ projectId: pid, workerId: worker });
+  });
+
+  // …AND IT IS STRICTLY NARROWER THAN A DISCARD. `allowUnknownStatus` says "I checked, it's fine",
+  // not "delete whatever is there" — so a POSITIVE dirty reading still wins. Without this, the
+  // escape hatch would quietly become a second, unlabelled discard flag.
+  it("allowUnknownStatus does not override a positively dirty tree", async () => {
+    const pid = seedProject();
+    const build = seedBuild(pid, { bs: CLEAN });
+    const worker = seedWorker(pid, build, undefined, CLEAN);
+    liveBranchStatus = async () => DIRTY;
+    const r = await spinDownWorkerAgent(worker, { allowUnknownStatus: true });
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toBe("uncommitted-work");
+    expect(spinDownWorkerMock).not.toHaveBeenCalled();
+  });
+
+  // THE READING IS LIVE, AND THAT IS THE POINT. A cache saying clean must not license a teardown of
+  // a tree that has become dirty since the last 30s poll — the guard would otherwise be as stale as
+  // the thing it replaced, just failing in the destructive direction instead of the blocking one.
+  it("refuses when the live read finds dirt the cached reading missed", async () => {
+    const pid = seedProject();
+    const build = seedBuild(pid, { bs: CLEAN });
+    const worker = seedWorker(pid, build, undefined, CLEAN);
+    liveBranchStatus = async () => DIRTY;
+    const r = await spinDownWorkerAgent(worker);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toBe("uncommitted-work");
+    expect(agentBranchStatusMock).toHaveBeenCalled();
+    expect(spinDownWorkerMock).not.toHaveBeenCalled();
   });
 
   // Committed work survives on the branch the teardown keeps, so `ahead` must not gate the

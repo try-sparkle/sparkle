@@ -63,7 +63,7 @@
 // dialog makes, with the same injected store deps. Nothing new is invented here.
 
 import { useProjectStore } from "../../stores/projectStore";
-import { useRuntimeStore } from "../../stores/runtimeStore";
+import { useRuntimeStore, isWorktreeGoneError } from "../../stores/runtimeStore";
 import { useAuthStore } from "../../stores/authStore";
 import { useCloudAuthStore } from "../../stores/cloudAuthStore";
 import { useUiStore } from "../../stores/uiStore";
@@ -76,7 +76,8 @@ import { projectRepoUrl } from "../cloudAgents/repoUrl";
 import { classifyStartError } from "../cloudAgents/startError";
 import type { CategoryId } from "../../stores/uiStore";
 import { localAgentCapacity, type CapacityReading } from "../agentCapacity";
-import { closeDecision } from "../../engine/closeAgent";
+import { closeDecision, worktreeRiskOf, type WorktreeRisk } from "../../engine/closeAgent";
+import { agentBranchStatus } from "../branchStatus";
 import { retroSettled } from "../../engine/retroReceiptTypes";
 import { cachedReceipt } from "../retroReceipts";
 import { resolveStage, stageIndex, type WorkflowStageId } from "../../engine/workflowStage";
@@ -215,7 +216,17 @@ export type LifecycleRefusalReason =
   //                            agent reported. The concierge must relay `message`, not retry.
   | "uncommitted-work" //       a worker spin-down would delete a dirty worktree; the branch is kept
   //                            but uncommitted files are NOT, so this is refused until they are
-  //                            committed (or the caller passes an explicit discard confirmation)
+  //                            committed (or the caller passes an explicit discard confirmation).
+  //                            RAISED ONLY ON A POSITIVE READING of uncommitted files — never on a
+  //                            failed or absent one; that is `status-unknown` below.
+  | "status-unknown" //         we could not READ the worker's worktree, so we cannot rule work out.
+  //                            Split from `uncommitted-work` for the reason bead sparkle-plxhx
+  //                            exists: claiming "X has uncommitted changes" about a provably clean
+  //                            tree is a false statement, and it made a fleet-wide deadlock
+  //                            undebuggable — the founder was staring at an empty `git status` while
+  //                            being told there were changes to commit. Unlike `uncommitted-work`
+  //                            this is ESCAPABLE without destroying anything: `allowUnknownStatus`
+  //                            retires the worker while still refusing a positively-dirty tree.
   | "intent-required" //        discard was called without a well-formed DiscardIntent
   | "intent-mismatch" //        the intent names a different agent than the one targeted
   | "unknown-model" //          a spawn named a model this app does not offer (never downgraded)
@@ -1107,12 +1118,19 @@ export function previewClose(agentId: string): LifecycleResult<ClosePreview> {
   });
   const wouldPrompt = decision === "work-at-risk-prompt";
   const retirementConfirm = decision === "retirement-confirm";
+  // `statusUnknown` keeps the parked arm: for a PREVIEW, "the tree is off its minted branch" is a
+  // real caveat a reader should see. What it must not do is masquerade as uncommitted work.
   const statusUnknown = !bs || bs.worktreeOnBranch === false;
   const commitsAhead = bs?.ahead ?? 0;
-  // A parked worktree still physically holds whatever was uncommitted when it was moved, so an
-  // unknown reading counts as "there may be uncommitted work" — the safety side of the same call
-  // shouldPromptOnClose makes.
-  const uncommittedChanges = bs ? bs.dirty || bs.worktreeOnBranch === false : false;
+  // A POSITIVE READING ONLY (bead sparkle-plxhx). This used to be
+  // `bs.dirty || bs.worktreeOnBranch === false`, which reported `uncommittedChanges: true` for every
+  // worker parked on a descriptively-named branch — including six whose worktrees were
+  // `git status --porcelain` EMPTY. Both flags then came back true at once, and the preview asserted
+  // changes existed while the operator was looking at a clean tree.
+  //
+  // `worktreeRiskOf` is the shared rule: parking cannot make an empty tree non-empty, and a dirty
+  // parked tree still answers "dirty" so the safety call the old comment defended is intact.
+  const uncommittedChanges = worktreeRiskOf(bs) === "dirty";
   const unmergedCommittedWork = commitsAhead > 0 && isUnmerged(stage);
   const { recommended, reason } = recommend({
     wouldPrompt,
@@ -1639,17 +1657,29 @@ export async function discardAgent(
  *  lossless operation, and for committed work it is — but the teardown removes the checkout with
  *  `--force`, so anything uncommitted (including files the worker never staged) is destroyed with
  *  no salvage ref and no undo. The caller is an orchestrator that cannot see the worktree, so it
- *  spins a worker down believing "branch kept" covers the work; it does not. The dirty reading is
- *  the SAME one the close flow already trusts (`runtimeStore.branchStatus`), and unknown counts as
- *  dirty for the same reason `shouldPromptOnClose` treats it that way: an unpolled or parked
- *  worktree cannot be ruled out, and the cost of being wrong is unrecoverable.
+ *  spins a worker down believing "branch kept" covers the work; it does not.
  *
- *  `discardUncommitted` is the explicit escape hatch, and it is deliberately shaped like the other
- *  destructive confirmations in this module: optional, so the REFUSAL (with its sentence naming what
- *  would be lost) is what an omitted flag produces, never a silent teardown. */
+ *  THE READING IS TAKEN LIVE, AT THE MOMENT OF THE DECISION — see `readWorkerWorktreeRisk`. It used
+ *  to come from the cached `runtimeStore.branchStatus` with unknown collapsed into dirty, and that
+ *  collapse is what bead sparkle-plxhx is about: a permanently-stale cache entry made the refusal
+ *  permanent, and phrasing it as "there are uncommitted changes" made it a false one. Unknown is now
+ *  its own answer with its own refusal and its own non-destructive override; only a POSITIVE dirty
+ *  reading raises `uncommitted-work`, and that guard is unchanged.
+ *
+ *  TWO escape hatches, because there are two different things to escape (bead sparkle-plxhx):
+ *   • `discardUncommitted` — "I know there are real files here and I accept losing them." The only
+ *     thing that overrides a POSITIVE dirty reading. Shaped like the other destructive confirmations
+ *     in this module: optional, so the REFUSAL naming what would be lost is what an omitted flag
+ *     produces, never a silent teardown.
+ *   • `allowUnknownStatus` — "I looked at the tree myself; retire it." Overrides only the UNKNOWN
+ *     case, and is NOT a discard: it cannot tear down a tree we positively read as dirty. It exists
+ *     because the unknown case used to be inescapable, which turned a fail-safe default into a
+ *     permanent deadlock whose only workaround was `discard_agent` — an operation that deletes
+ *     branches and worktrees outright and is far more dangerous than the loss being guarded against.
+ */
 export async function spinDownWorkerAgent(
   workerId: string,
-  opts: { discardUncommitted?: boolean } = {},
+  opts: { discardUncommitted?: boolean; allowUnknownStatus?: boolean } = {},
 ): Promise<LifecycleResult<ClosedAgents>> {
   const found = locate(workerId);
   if (!found) return refuse("spin_down_worker", "unknown-agent", unknownAgent(workerId));
@@ -1660,11 +1690,27 @@ export async function spinDownWorkerAgent(
       `“${found.agent.name}” is a ${found.agent.kind} agent, not a worker — closing it is a different operation with different consequences.`,
     );
   }
-  if (!opts.discardUncommitted && workerHasUncommittedWork(workerId)) {
+  const risk = await readWorkerWorktreeRisk(found.project, workerId);
+  if (risk === "dirty" && !opts.discardUncommitted) {
     return refuse(
       "spin_down_worker",
       "uncommitted-work",
       `“${found.agent.name}” has uncommitted changes in its worktree. Spinning it down keeps the branch but deletes the checkout, so those changes would be gone for good. Ask the worker to commit first, then spin it down.`,
+    );
+  }
+  // NOT folded into the branch above, and NOT phrased as a claim about uncommitted files. Saying
+  // "it has uncommitted changes" about a tree we could not read is the false statement this bead
+  // was filed over. `discardUncommitted` also clears this — a caller willing to lose real files is
+  // certainly willing to proceed past an unreadable tree.
+  if (risk === "unknown" && !opts.allowUnknownStatus && !opts.discardUncommitted) {
+    return refuse(
+      "spin_down_worker",
+      "status-unknown",
+      `I couldn't read “${found.agent.name}”'s worktree, so I can't tell whether it holds uncommitted ` +
+        `changes — this is NOT a report that it does. Spinning it down keeps the branch but deletes the ` +
+        `checkout, so I've stopped rather than guess. If you've checked the tree yourself (a clean ` +
+        `\`git status\` in it, or the directory is already gone), retry with allowUnknownStatus and I'll ` +
+        `retire it — that still refuses if the tree turns out to hold real uncommitted files.`,
     );
   }
   await spinDownWorker({ projectId: found.project.id, workerId });
@@ -1675,18 +1721,48 @@ export async function spinDownWorkerAgent(
   });
 }
 
-/** Does this worker's worktree hold changes that a spin-down would destroy?
+/**
+ * What a spin-down of this worker's checkout would destroy, read LIVE.
  *
- *  Reads the same live `branchStatus` the close flow reads, and answers with the same safety bias as
- *  `previewClose.uncommittedChanges` — but the DEFAULT is inverted, because the consequence is. No
- *  reading yet (`undefined`) means the poll hasn't landed, and a worktree parked on another branch
- *  still physically holds whatever was uncommitted when it was moved; in both cases we cannot rule
- *  out work at risk, and here the fallback for "cannot rule out" is deletion. So both count as
- *  dirty. `ahead` is NOT consulted: committed work survives on the branch, which the teardown keeps. */
-function workerHasUncommittedWork(workerId: string): boolean {
-  const bs = useRuntimeStore.getState().branchStatus[workerId];
-  if (!bs) return true;
-  return bs.dirty || bs.worktreeOnBranch === false;
+ * ── WHY THIS RE-READS INSTEAD OF TRUSTING THE STORE (bead sparkle-plxhx) ─────────────────────────
+ * `runtimeStore.branchStatus` is a 30-second poll, and it has two states that never recover on their
+ * own. A worker whose worktree was removed is LATCHED into `deadWorktrees` and never polled again, so
+ * its entry stays `undefined` for the app's lifetime; and a worker whose pane was never mounted may
+ * have no entry at all. Deciding an irreversible teardown from a cache that is permanently stale is
+ * how a fail-safe default became a fail-permanent one. So we ask git, now, at the moment of the
+ * decision — which is also the only reading that can honestly be called current.
+ *
+ * The live call deliberately BYPASSES the `deadWorktrees` latch (it invokes the Tauri command
+ * directly rather than going through `pollBranchStatus`), because the latched population is exactly
+ * the population that needs an answer here.
+ *
+ * ── FALLBACK ORDER, AND WHY A THROW IS NOT AUTOMATICALLY "UNKNOWN" ───────────────────────────────
+ * A gone worktree is the case the latch exists for, and it is not an ambiguity: there is no checkout
+ * left, so a teardown destroys nothing. `isWorktreeGoneError` already owns that signature, and
+ * answering `"clean"` for it is a statement about a directory that demonstrably is not there.
+ * Any OTHER failure is a genuine unknown, and rather than give up immediately we fall back to the
+ * cached reading — a stale-but-real observation beats no observation — and only then to `"unknown"`.
+ */
+async function readWorkerWorktreeRisk(
+  project: { id: string; rootPath: string; defaultBranch?: string | null },
+  workerId: string,
+): Promise<WorktreeRisk> {
+  const cached = useRuntimeStore.getState().branchStatus[workerId];
+  try {
+    const live = await agentBranchStatus(
+      project.rootPath,
+      project.id,
+      workerId,
+      project.defaultBranch ?? "",
+    );
+    // Keep the store honest too, so the sidebar stops rendering the stale reading the moment this
+    // op runs — the founder was looking at both surfaces while the fleet was wedged.
+    useRuntimeStore.getState().setBranchStatus(workerId, live);
+    return worktreeRiskOf(live);
+  } catch (e) {
+    if (isWorktreeGoneError(e)) return "clean";
+    return worktreeRiskOf(cached);
+  }
 }
 
 

@@ -118,6 +118,72 @@ export function closeDecision(
   return bs.ahead > 0 || bs.dirty ? "work-at-risk-prompt" : "silent";
 }
 
+/**
+ * What tearing down this agent's CHECKOUT would destroy, as three distinct answers.
+ *
+ * ── WHY THIS EXISTS: THE RETIREMENT DEADLOCK (bead sparkle-plxhx) ────────────────────────────────
+ * The worker teardown guard used to ask one boolean — "is there uncommitted work?" — and answered it
+ * with `bs.dirty || bs.worktreeOnBranch === false`, collapsing "we cannot tell" into "there is dirt".
+ * That is defensible as a DEFAULT and indefensible as a PERMANENT state, and on 2026-08-08 it
+ * deadlocked the founder's whole fleet: seven finished workers could not be retired, capacity sat at
+ * 85 against a ceiling of 80, and no new agent could start.
+ *
+ * Both halves of that expression were wrong for the population it caught:
+ *
+ *  - `worktreeOnBranch === false` is TRUE FOR EVERY WORKER THAT NAMED ITS BRANCH DESCRIPTIVELY.
+ *    `resolve_agent_branch` reports it whenever the minted `sparkle/agent-<id>` ref still exists
+ *    while the tree sits elsewhere — i.e. after the `git checkout -b <topic>` that AGENTS.md
+ *    actively encourages. Measured on the founder's machine: all six surviving deadlocked worktrees
+ *    were on names like `pr1380` and `sparkle-k-esc`, and all six were `git status --porcelain`
+ *    EMPTY. Nothing the worker could do would clear it — the founder restarted all seven and told
+ *    them to commit, and nothing changed, because there was nothing to commit.
+ *  - `!bs` (no reading at all) is PERMANENT once `runtimeStore`'s `deadWorktrees` latch fires: a
+ *    removed worktree is never polled again, so `branchStatus[id]` stays `undefined` for the app's
+ *    lifetime. The seventh worker was in exactly that state — its worktree directory was already
+ *    gone, so there was no checkout left to lose, and it was refused on the grounds that its
+ *    non-existent checkout might contain work.
+ *
+ * ── THE RULE, AND WHY `dirty === false` IS A POSITIVE READING ────────────────────────────────────
+ * `dirty` is a porcelain read of the DIRECTORY, not of the branch — `git status --porcelain` run
+ * inside the worktree. So `false` means "there are no uncommitted files in this directory", and that
+ * is true whichever branch happens to be checked out into it. Parking cannot make an empty tree
+ * non-empty. Crucially, a FAILED read can never present as `false`: `DirtyReading::read` propagates
+ * the git error with `?` and the whole status read becomes an `Err`, which reaches this layer as no
+ * reading at all (`undefined`) rather than as a clean one. A missing tree returns `dirty: false`
+ * deliberately — there is nothing there to hold anything.
+ *
+ * That is the same precedence `uncommittedWorkEvidence` (engine/workflowStage.ts) adopted on
+ * 2026-08-06 for the ATTRIBUTION question, for the same measured reason. This is the SAFETY twin it
+ * should have got at the same time; leaving the two apart is the widened-rule/silent-conflict shape
+ * where one copy of a rule is corrected and its sibling quietly keeps the old, narrow answer.
+ *
+ * ── WHAT IS DELIBERATELY UNCHANGED ───────────────────────────────────────────────────────────────
+ * `dirty === true` still answers `"dirty"` EVEN WHEN THE TREE IS PARKED. Parking carries uncommitted
+ * files along, so they are real, they are the user's, and the teardown's `--force` removal destroys
+ * them with no salvage ref and no undo. That is the guard this function exists to preserve, and no
+ * caller may retire past it without an explicit discard confirmation.
+ *
+ * The three answers, and who may act on them:
+ *  - `"dirty"`   — real files at risk. Refuse; only an explicit discard confirmation overrides.
+ *  - `"clean"`   — provably nothing at risk. Retire.
+ *  - `"unknown"` — we genuinely could not read it. Refuse, but SAY SO HONESTLY and let an operator
+ *                  who can see the tree override it. The old code reported this case as a false
+ *                  claim that changes existed, which is what made the deadlock undebuggable.
+ */
+export type WorktreeRisk = "dirty" | "clean" | "unknown";
+
+/** Classify a branch-status reading into {@link WorktreeRisk}. Pure; see the type for the reasoning. */
+export function worktreeRiskOf(bs: BranchStatus | undefined): WorktreeRisk {
+  // No reading at all — an unpolled agent, a latched-dead worktree, or a git read that errored.
+  // Genuinely unknown, and reported as such rather than dressed up as dirt.
+  if (bs === undefined) return "unknown";
+  // Real uncommitted files. Parked or not, they are destroyed by the teardown. The guard holds.
+  if (bs.dirty) return "dirty";
+  // A porcelain read of the directory came back empty. `worktreeOnBranch` is NOT consulted here:
+  // attribution ("whose dirt is this?") is only ever a question about dirt that exists.
+  return "clean";
+}
+
 /** Whether closing an agent should pop the Ship/Save/Discard choice.
  *
  *  Now a thin projection of `closeDecision` so the two can never disagree. Kept as its own export

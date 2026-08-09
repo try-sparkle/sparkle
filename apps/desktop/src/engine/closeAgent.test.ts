@@ -3,6 +3,7 @@ import {
   shouldPromptOnClose,
   closeDecision,
   selectionAfterClose,
+  worktreeRiskOf,
   type CloseSelectionAgent,
 } from "./closeAgent";
 import type { BranchStatus } from "../services/branchStatus";
@@ -245,5 +246,52 @@ describe("shouldPromptOnClose stays a faithful projection of closeDecision", () 
         }
       }
     }
+  });
+});
+
+// ══ THE RETIREMENT DEADLOCK RULE (bead sparkle-plxhx) ═════════════════════════════════════════════
+// `worktreeRiskOf` is the shared answer to "what would tearing this checkout down destroy?", split
+// three ways so that "we could not tell" stops being reported as "there is uncommitted work".
+//
+// NOTE the deliberate asymmetry with `closeDecision` above, which still PROMPTS on a parked tree.
+// They ask different questions: the prompt asks "should a human look at this row?", where a parked
+// tree is a legitimate caveat; this asks "are there files here that deletion would destroy?", which
+// an empty directory answers on its own regardless of which branch is checked out into it.
+describe("worktreeRiskOf", () => {
+  it("reports a positively dirty tree as dirty — the guard that must survive", () => {
+    expect(worktreeRiskOf(bs(0, true))).toBe("dirty");
+  });
+
+  // The case the parked gate was written for, and it is unchanged: parking CARRIES uncommitted
+  // files along, so they are real and the teardown destroys them.
+  it("reports a dirty PARKED tree as dirty", () => {
+    expect(worktreeRiskOf({ ...bs(0, true), worktreeOnBranch: false })).toBe("dirty");
+  });
+
+  // ── The bug. Six of the seven deadlocked workers were exactly this shape.
+  it("reports a clean PARKED tree as clean, not as dirt", () => {
+    expect(worktreeRiskOf({ ...bs(0), worktreeOnBranch: false })).toBe("clean");
+  });
+
+  it("reports a clean tree on its own branch as clean", () => {
+    expect(worktreeRiskOf(bs(0))).toBe("clean");
+  });
+
+  // Committed work survives on the branch a teardown keeps, so `ahead` says nothing about risk here.
+  it("ignores commits ahead — those survive on the branch", () => {
+    expect(worktreeRiskOf(bs(5))).toBe("clean");
+    expect(worktreeRiskOf({ ...bs(5), worktreeOnBranch: false })).toBe("clean");
+  });
+
+  // ── The honesty requirement. No reading is its own answer, never dirt.
+  it("reports an absent reading as unknown rather than as uncommitted work", () => {
+    expect(worktreeRiskOf(undefined)).toBe("unknown");
+  });
+
+  // `worktreeOnBranch` is optional (a Rust build predating the field deserializes it undefined) and
+  // must not tip a clean tree into either non-clean answer.
+  it("treats an undefined worktreeOnBranch as the ordinary case", () => {
+    expect(worktreeRiskOf({ ...bs(0), worktreeOnBranch: undefined })).toBe("clean");
+    expect(worktreeRiskOf({ ...bs(0, true), worktreeOnBranch: undefined })).toBe("dirty");
   });
 });

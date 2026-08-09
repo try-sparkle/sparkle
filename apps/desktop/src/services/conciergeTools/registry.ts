@@ -668,6 +668,12 @@ const spinDownArgs = z
      *  same reasoning as `confirmArg`: optional so the domain refuses (naming the loss) rather than
      *  this layer erroring on bad args, and absent can never read as consent. */
     discardUncommitted: confirmArg,
+    /** Proceed when the worktree's git state could NOT BE READ (`status-unknown`). Strictly weaker
+     *  than `discardUncommitted`: it does not consent to losing anything, and it still refuses a tree
+     *  we positively read as dirty. It exists because the unknown case was previously inescapable —
+     *  a permanently-stale cache entry deadlocked seven finished workers and the only workaround was
+     *  `discard_agent`, which destroys branches outright (bead sparkle-plxhx). */
+    allowUnknownStatus: confirmArg,
   })
   .strict();
 
@@ -729,7 +735,13 @@ const LIFECYCLE_ROUTES: Record<LifecycleOp, Handler> = {
   // confirmation the other destructive ops do — omitted reads as "no", and the DOMAIN produces the
   // refusal that names the uncommitted work rather than this layer inventing a sentence.
   spin_down_worker: route(spinDownArgs, async (a, ctx) =>
-    fromLifecycle(ctx, await spinDownWorkerAgent(a.agentId, { discardUncommitted: a.discardUncommitted })),
+    fromLifecycle(
+      ctx,
+      await spinDownWorkerAgent(a.agentId, {
+        discardUncommitted: a.discardUncommitted,
+        allowUnknownStatus: a.allowUnknownStatus,
+      }),
+    ),
   ),
   // `agentOnly` like the previews: both take just an id. The DOMAIN owns every refusal — unknown
   // agent, no pane, and the app-owned agent being mid-pass — so this layer invents no sentence.
