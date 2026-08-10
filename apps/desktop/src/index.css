@@ -311,8 +311,20 @@ body {
    dragged tab lands in the mirror image of the slot the user aimed at. `ProjectTabsBar` now passes
    `reversed={side === "left"}` down to `ProjectTabs` and into `resolveTabDrag`, which scans in
    visual order and maps the slot back to an array position (components/tabDrag.ts). If you change
-   this rule, change that flag with it — they are one mechanism. */
-.ptabstrip[data-side="left"] > [role="tablist"] {
+   this rule, change that flag with it — they are one mechanism.
+
+   TWO BOXES TO MIRROR, NOT ONE. `ProjectTabs` split its bar into an outer `.concierge-tabbar`
+   (surface, the "+", the top-right cluster) and an inner `role="tablist"` that is the SCROLL
+   CONTAINER for the tabs — the label floor added by bead sparkle-z24dl makes tabs unshrinkable past
+   a readable name, so a crowded strip has to scroll rather than squeeze. Both boxes reverse: the
+   outer so the "+" and the cluster land on the outer edge as they always did, the inner so the
+   tabs themselves read inward. This used to be a single `> [role="tablist"]` rule; that selector
+   stopped matching the moment the tablist became a grandchild, which is a silent un-mirroring.
+   `ProjectTabs.mirror.test.tsx` reads these selectors OUT of this file and runs them against the
+   rendered markup, so a rename or a re-nesting on either side reds a test instead of quietly
+   un-mirroring one half of the window. */
+.ptabstrip[data-side="left"] > .concierge-tabbar,
+.ptabstrip[data-side="left"] .concierge-tabbar > [role="tablist"] {
   flex-direction: row-reverse;
 }
 

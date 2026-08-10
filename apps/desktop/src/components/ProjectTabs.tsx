@@ -448,6 +448,130 @@ const STALE_TOOLTIP_Z = 54;
  *  aggressive shortening. */
 export const TAB_LABEL_MAX_WIDTH = 160;
 
+/**
+ * ── THE FLOOR: HOW NARROW A NAME MAY GET (bead sparkle-z24dl) ─────────────────────────────────
+ *
+ * There was no floor at all, and the result was a strip nobody could read. The pin, the ⚠ badge,
+ * the ● badge and the × are every one of them `flex: none`, so the LABEL is the only shrinkable
+ * thing in a tab — under crowding the flex line takes every pixel it needs from the name and from
+ * nothing else. The founder's bar showed one tab as "fo...", one as "t..", and the SELECTED tab
+ * with no name whatsoever: just ⚠155 and a close ×. The badges survived the squeeze; the identity
+ * did not, which is precisely backwards.
+ *
+ * ~6 characters for an inactive tab, ~14 for the ACTIVE one. The active tab is floored higher for
+ * two reasons: it is the tab whose name you most need (you are working in it), and it is the tab
+ * that loses its name FIRST, because it carries the widest chrome — an always-visible × plus, in
+ * the reported case, a four-glyph ⚠ badge.
+ *
+ * Past the floor the tabs stop shrinking and the strip SCROLLS instead. That is the deliberate
+ * trade: a name you can read on every tab, at the cost of a strip that may not show every tab at
+ * once. The selected tab is scrolled into view whenever it changes, so the one you are in is never
+ * the one off-screen.
+ */
+export const TAB_LABEL_MIN_WIDTH = 46;
+/** @see TAB_LABEL_MIN_WIDTH — the active tab's higher floor. */
+export const TAB_LABEL_MIN_WIDTH_ACTIVE = 104;
+
+/**
+ * The floor to actually apply to one label, given the width its text NATURALLY wants.
+ *
+ * CAPPED BY THE NAME'S OWN WIDTH, and that is the whole subtlety. `min-width` is a floor at every
+ * size, not merely under pressure — so a flat 104px on the active tab would pad a project called
+ * "atlas" out with ~50px of dead space whenever the bar is roomy, which is a second, quieter way of
+ * making the strip hard to read. Capping the floor at the natural width means a short name is never
+ * padded and a long one still refuses to vanish.
+ *
+ * `natural === 0` is "not measured yet" — the first paint, and every rect in jsdom. It yields NO
+ * floor, so the component fails open to its pre-floor behaviour rather than pinning every label to
+ * the floor width sight-unseen.
+ */
+export function labelMinWidth(natural: number, active: boolean): number {
+  if (natural <= 0) return 0;
+  return Math.min(active ? TAB_LABEL_MIN_WIDTH_ACTIVE : TAB_LABEL_MIN_WIDTH, natural);
+}
+
+/**
+ * The floor as the TAB's own `min-width` — chrome that cannot shrink, plus a readable name.
+ *
+ * ── WHY THIS IS ON THE TAB AND NOT ON THE LABEL, WHICH IS WHERE IT OBVIOUSLY BELONGS ──────────
+ *
+ * It WAS on the label — `min-width: 46px` on the name — and that is wrong in a way no unit test
+ * in this repo could have caught, because it needs a layout engine to see. `min-width` sets a
+ * FLOOR on a box; it does not cap that box's MIN-CONTENT CONTRIBUTION, which for `white-space:
+ * nowrap` text is the width of the whole string. So the label kept contributing its full 72px to
+ * the tab's automatic minimum size, the tab's minimum became "chrome + the entire name", and the
+ * flex line could not shrink ANY tab at all. Measured in Chrome at a 470px strip: six tabs, total
+ * 1091px, not one pixel of shrink — every name whole and four tabs parked off the end behind a
+ * scroll. That is a different bug from the founder's, and just as bad.
+ *
+ * (`overflow: hidden` zeroing a flex item's automatic minimum size is a real rule, and it is the
+ * one that makes this look like it should work. It applies to `min-width: auto` only — an explicit
+ * `min-width` replaces it, and neither has anything to do with min-content contribution.)
+ *
+ * An explicit `min-width` on the TAB does override the automatic minimum size, which is exactly the
+ * lever wanted: shrink this tab until its name is down to `labelMinWidth`, then stop. `chrome` is
+ * everything in the tab that is not the name — the pin, the badges, the ×, the padding and the gaps
+ * — and it is measurable as `tab.offsetWidth - label.offsetWidth` at ANY moment, because every one
+ * of those parts is `flex: none` and so keeps its width no matter how squeezed the tab is.
+ *
+ * Fails OPEN at zero: an unmeasured tab (first paint, and every element in jsdom) gets no minimum
+ * rather than an invented one.
+ */
+export function tabMinWidth(chrome: number, natural: number, active: boolean): number {
+  if (natural <= 0 || chrome <= 0) return 0;
+  return chrome + labelMinWidth(natural, active);
+}
+
+/**
+ * How long the pointer must rest on a tab before it expands.
+ *
+ * Long enough that sweeping the cursor across the strip on the way somewhere else does not pop
+ * every tab in turn; short enough to feel instant when you actually stop on one. Keyboard FOCUS
+ * bypasses it — focus is already a deliberate act, so there is no sweep to debounce.
+ */
+export const TAB_EXPAND_DELAY_MS = 120;
+
+/**
+ * The expanded tab's stacking order WITHIN THE STRIP — not a member of the `layers.ts` ladder.
+ *
+ * That ladder describes surfaces which compete at the ROOT stacking context; this one competes
+ * only with its own siblings. Every tab is `position: relative` with `z-index: auto`, so tabs paint
+ * in DOM order and a tab expanding leftward would otherwise slide UNDER its left-hand neighbour.
+ * Any positive value wins that contest; 2 keeps it obvious that the scope is local.
+ */
+const TAB_EXPANDED_Z = 2;
+
+/** The tab body's own padding and inter-item gap. Constants rather than literals because the chrome
+ *  measurement below has to add back exactly what the layout used — see `measureChrome`. */
+export const TAB_BODY_PAD_X = 12;
+export const TAB_BODY_GAP = 8;
+
+/**
+ * How much of a tab is NOT its name: the padding, the gaps, the pin, the badges and the ×.
+ *
+ * SUMMED FROM THE UNSHRINKABLE PARTS, not taken as `tab.offsetWidth - label.offsetWidth`. That
+ * subtraction is the obvious way and it is wrong in exactly the case the floor exists for. Before a
+ * floor is applied a tab can be squeezed NARROWER THAN ITS OWN CHROME — the label goes to zero and
+ * the pin and badges then overflow the tab's box — so the subtraction returns the squeezed box,
+ * which is smaller than the real chrome. The floor computed from it is correspondingly too small,
+ * and the name still disappears. Measured in Chrome at a 520px strip: labels at 0px, 16px and 43px
+ * against a 46px floor that was being honoured exactly as written.
+ *
+ * Every term here is `flex: none`, so each one reports the same width however hard the tab is
+ * squeezed, and the total is correct on the very first measuring pass — which is the one that
+ * matters, since it is taken before any floor exists.
+ */
+export function measureChrome(body: Element | undefined, label: Element | undefined): number {
+  if (!body || !label) return 0;
+  const kids = Array.from(body.children);
+  let sum = TAB_BODY_PAD_X * 2 + TAB_BODY_GAP * Math.max(0, kids.length - 1);
+  for (const k of kids) {
+    if (k === label) continue;
+    sum += (k as HTMLElement).offsetWidth ?? 0;
+  }
+  return sum;
+}
+
 // Pin hover-reveal + rotate is driven entirely by CSS (scoped to .concierge-tab so it can't leak to
 // other tab widgets) — NOT by inline opacity, which would override the non-!important :hover rule and
 // defeat the reveal. Injected ONCE into <head> rather than rendered per instance.
@@ -468,6 +592,14 @@ const TAB_STYLES = `
 .concierge-tab:focus-within .concierge-tab-close { opacity: .65; }
 .concierge-tab-close[data-active="true"] { opacity: .8; }
 .concierge-tab-close:hover, .concierge-tab-close:focus-visible { opacity: 1 !important; }
+/* The strip scrolls once the label floor stops the tabs shrinking (see TAB_LABEL_MIN_WIDTH), but
+   NOT with a visible scrollbar: the strip is ~34px tall and a persistent bar (which is what a Mac
+   set to "always show scroll bars" renders) would sit across the bottom edge of every tab. The
+   trackpad swipe and shift-wheel still work, and the selected tab is scrolled into view on every
+   selection change, so the tab you are in is never the one hidden off the end.
+   scrollbar-width:none covers Firefox and is set inline; this covers WebKit, which is what
+   actually ships here, and has no inline form. */
+.concierge-tab-strip::-webkit-scrollbar { display: none; }
 `;
 function ensureTabStyles(): void {
   if (typeof document === "undefined" || document.getElementById(STYLE_ID)) return;
@@ -477,14 +609,43 @@ function ensureTabStyles(): void {
   document.head.appendChild(el);
 }
 
+/**
+ * THE BAR IS NOW TWO BOXES, and the split is load-bearing rather than cosmetic.
+ *
+ * The outer box owns the surface, the rule under it, and the chrome that must never scroll away —
+ * the "+" and the top-right cluster. The inner box is the `role="tablist"` and is the SCROLL
+ * CONTAINER, because the label floor makes the tabs unshrinkable past a point and a crowded strip
+ * then has to overflow somewhere; overflowing into a scroll keeps every tab reachable, where
+ * overflowing the window does not. Keeping "+" outside that scroller is the reason for the split:
+ * inside it, the one control that opens a project scrolls off the end exactly when the bar is full.
+ *
+ * `role="tablist"` stays on the box that directly contains the `role="tab"` children — that
+ * parent/child relationship is required by ARIA, and moving the role outward to the wrapper would
+ * quietly break it. `index.css` mirrors both boxes for the left-hand pair (`.concierge-tabbar`).
+ */
 const barStyle: CSSProperties = {
   flex: "none",
   display: "flex",
   alignItems: "flex-end",
-  gap: 3,
-  padding: "8px 8px 0",
+  padding: "0 8px",
   background: C.barSurface,
   borderBottom: `1px solid ${C.muted}`,
+};
+
+const stripStyle: CSSProperties = {
+  display: "flex",
+  alignItems: "flex-end",
+  gap: 3,
+  paddingTop: 8,
+  // Takes the free space so the top-right cluster still sits flush right without an auto margin.
+  flex: "1 1 auto",
+  minWidth: 0,
+  overflowX: "auto",
+  // Without this the box would take `auto` on BOTH axes and a tab's alarm glow could raise a
+  // vertical scrollbar in a 34px-tall strip.
+  overflowY: "hidden",
+  // Firefox's half of the hidden scrollbar; WebKit's is in TAB_STYLES.
+  scrollbarWidth: "none",
 };
 
 function activateOnKey(e: KeyboardEvent, fn: () => void): void {
@@ -549,6 +710,168 @@ export function ProjectTabs({
   // stale project, not just the one clicked — see `staleTargetsFor`.
   const [stalePanelFor, setStalePanelFor] = useState<string | null>(null);
   const staleBadgeEls = useRef(new Map<string, HTMLButtonElement>());
+
+  // ── HOVER EXPANSION (bead sparkle-z24dl) ────────────────────────────────────────────────────
+  //
+  // Which tab is expanded, the in-flow width it had at the moment it expanded, and which edge it
+  // grows from. Freezing the width is what makes the expansion cost the strip NOTHING: the tab
+  // keeps the exact footprint the flex line already gave it and its chrome goes out of flow, so no
+  // sibling can move. A strip that reshuffles under the cursor is worse than truncation.
+  const [expanded, setExpanded] = useState<{
+    id: string;
+    width: number;
+    anchor: "left" | "right";
+  } | null>(null);
+  const hoverTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const labelEls = useRef(new Map<string, HTMLSpanElement>());
+  const bodyEls = useRef(new Map<string, HTMLDivElement>());
+  /** Per tab: what its name naturally wants, and how much of the tab is unshrinkable chrome. */
+  const [metrics, setMetrics] = useState<Record<string, { natural: number; chrome: number }>>({});
+
+  function clearHoverTimer(): void {
+    if (hoverTimer.current !== null) clearTimeout(hoverTimer.current);
+    hoverTimer.current = null;
+  }
+  useEffect(() => clearHoverTimer, []);
+
+  /**
+   * WHICH TAB THE POINTER IS ON RIGHT NOW — the thing the delay below settles on.
+   *
+   * A ref rather than state: it changes on every enter and leave, and re-rendering the strip on
+   * each of those would be both wasteful and, during the churn described next, wrong.
+   */
+  const wantId = useRef<string | null>(null);
+
+  /**
+   * Settle on whatever the pointer is on when the delay elapses.
+   *
+   * ── WHY A SETTLE AND NOT A PLAIN OPEN/CLOSE PAIR (found by the real-browser probe) ───────────
+   *
+   * The obvious shape — expand on `mouseenter` after a delay, collapse on `mouseleave` — is what
+   * this was, and it fails over one specific part of the tab: the ⚠ stale badge. Hovering the badge
+   * mounts its portaled explanation card, and the resulting churn dispatches a `mouseleave` on the
+   * tab immediately after the `mouseenter`, over and over, without the pointer moving at all.
+   * Measured: five enter/leave pairs in a second, cancelling the open timer every time, so the tab
+   * NEVER expanded while the pointer rested on its badge. Nothing in jsdom can see this — it needs
+   * hit testing and a real pointer.
+   *
+   * Settling makes the flicker irrelevant instead of trying to suppress it. One timer runs from the
+   * first transition; when it fires it reads where the pointer actually IS and applies that. An
+   * enter/leave storm that ends on the tab expands it; a genuine sweep across the strip ends
+   * somewhere else and collapses it. It also gives moving between two tabs the right answer for
+   * free, since `mouseleave` on the old tab and `mouseenter` on the new one collapse into one
+   * decision rather than racing.
+   */
+  function scheduleSettle(delay: number): void {
+    // One settle in flight is enough: re-arming it on every transition is what let the churn
+    // postpone the decision indefinitely.
+    if (hoverTimer.current !== null) return;
+    hoverTimer.current = setTimeout(() => settleNow(), delay);
+  }
+
+  function settleNow(): void {
+    hoverTimer.current = null;
+    const id = wantId.current;
+    if (!id) {
+      setExpanded(null);
+      return;
+    }
+    {
+      const el = tabEls.current.get(id);
+      if (!el) return;
+      const r = el.getBoundingClientRect();
+      const b = barRef.current?.getBoundingClientRect();
+      // GROW INWARD. A tab in the right half expands leftward and one in the left half expands
+      // rightward, so the expansion stays inside the strip instead of being clipped by its own
+      // scroll container. Decided from client rects, which means it is correct on the mirrored
+      // left-hand strip too — that one is `row-reverse`, so DOM order and visual order disagree
+      // and any decision made from the array index would come out backwards there.
+      const anchor = b && r.left + r.width / 2 > b.left + b.width / 2 ? "right" : "left";
+      setExpanded({ id, width: r.width, anchor });
+    }
+  }
+
+  /** The pointer is on `id`. `immediate` is the keyboard-focus path: focus is already a deliberate
+   *  act, so there is no sweep to debounce and nothing to settle. */
+  function beginExpand(id: string, immediate: boolean): void {
+    wantId.current = id;
+    if (immediate) {
+      clearHoverTimer();
+      settleNow();
+    } else {
+      scheduleSettle(TAB_EXPAND_DELAY_MS);
+    }
+  }
+
+  /** The pointer left `id`. Guarded on identity so a leave arriving AFTER the pointer has already
+   *  reached the next tab cannot cancel that one. */
+  function endExpand(id: string): void {
+    if (wantId.current === id) wantId.current = null;
+    scheduleSettle(TAB_EXPAND_DELAY_MS);
+  }
+
+  /** Collapse right now, whatever the pointer is doing — the drag path. */
+  function cancelExpand(): void {
+    clearHoverTimer();
+    wantId.current = null;
+    setExpanded(null);
+  }
+
+  /**
+   * Measure each tab's two floor inputs (see `tabMinWidth`).
+   *
+   *   natural  `scrollWidth` on a `nowrap` span: the full text width, still reported correctly
+   *            while the box is clipping it, which is what makes it the right instrument.
+   *   chrome   `tab.offsetWidth - label.offsetWidth`: everything in the tab that is not the name.
+   *            Valid at any moment, squeezed or not, because every other part of a tab is
+   *            `flex: none` and keeps its width however hard the tab is squeezed.
+   *
+   * RE-RUN ON THE BADGES, not only on a rename. `chrome` changes whenever a stale or count badge
+   * appears, disappears or gains a digit ("155" is wider than "5"), and a stale `chrome` is a floor
+   * that is quietly wrong for as long as the name happens to stay the same. Not run every render,
+   * though: these are forced layout reads and the strip re-renders at pointer rate during a drag.
+   *
+   * `expanded` is deliberately NOT in the key. An expanded tab's body is out of flow, so a
+   * `offsetWidth - offsetWidth` taken across that boundary is not a chrome measurement at all.
+   */
+  const metricsKey = projects
+    .map((p) => {
+      const c = countsByProject[p.id];
+      const b = tabBand(c);
+      return [
+        p.id,
+        p.name,
+        p.id === selectedProjectId ? "a" : "-",
+        b ? `${b}${c?.[b] ?? 0}` : "-",
+        stalenessByProject?.[p.id]?.behind ?? "-",
+        tornOutProjectIds?.has(p.id) ? "t" : "-",
+        onClose ? "x" : "-",
+      ].join(":");
+    })
+    .join("|");
+  useLayoutEffect(() => {
+    const next: Record<string, { natural: number; chrome: number }> = {};
+    let changed = Object.keys(metrics).length !== projects.length;
+    for (const p of projects) {
+      const labelEl = labelEls.current.get(p.id);
+      const natural = labelEl?.scrollWidth ?? 0;
+      const chrome = measureChrome(bodyEls.current.get(p.id), labelEl);
+      next[p.id] = { natural, chrome };
+      const was = metrics[p.id];
+      if (was?.natural !== natural || was?.chrome !== chrome) changed = true;
+    }
+    if (changed) setMetrics(next);
+    // `metrics` is deliberately NOT a dependency: it is what this effect writes, and reading it
+    // here is only the did-anything-change guard that stops the write from looping.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [metricsKey]);
+
+  /** Keep the selected tab on screen. Once the floor stops tabs shrinking, a crowded strip scrolls —
+   *  and the one tab that must never be the one scrolled out of sight is the one you are in. */
+  useEffect(() => {
+    if (!selectedProjectId) return;
+    tabEls.current.get(selectedProjectId)?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+  }, [selectedProjectId]);
 
   /**
    * Every stale checkout the panel should account for, THE CLICKED ONE FIRST.
@@ -676,6 +999,9 @@ export function ProjectTabs({
     g.lastScreen = { x: e.screenX, y: e.screenY };
     if (res.kind === "idle") return;
     g.dragging = true;
+    // A tab being dragged is its own size. Leaving it expanded would have the user dragging a
+    // widened tab whose in-flow slot — the thing the drop resolver measures — is somewhere else.
+    cancelExpand();
     setDrag({
       projectId: g.projectId,
       kind: res.kind,
@@ -711,7 +1037,14 @@ export function ProjectTabs({
   }
 
   return (
-    <div style={barStyle} role="tablist" aria-label="Projects" ref={barRef}>
+    <div className="concierge-tabbar" style={barStyle}>
+      <div
+        className="concierge-tab-strip"
+        style={stripStyle}
+        role="tablist"
+        aria-label="Projects"
+        ref={barRef}
+      >
       {projects.map((p) => {
         const active = p.id === selectedProjectId;
         const pinned = p.id === pinnedProjectId;
@@ -732,6 +1065,15 @@ export function ProjectTabs({
         const tornOut = tornOutProjectIds?.has(p.id) ?? false;
         const isDragged = drag?.projectId === p.id;
         const caret = drag?.kind === "reorder" && drag.beforeId === p.id;
+        const exp = expanded?.id === p.id ? expanded : null;
+        // Unmeasured until the layout effect below has run once — which means NO floor, not a
+        // guessed one. See `tabMinWidth`.
+        const m = metrics[p.id] ?? { natural: 0, chrome: 0 };
+        const label = tabTitle(p.name, {
+          hasSettings: !!onOpenSettings,
+          tornOut,
+          canTearOff: !!onTearOff,
+        });
         return (
           <Fragment key={p.id}>
           {caret && <DropCaret />}
@@ -763,7 +1105,22 @@ export function ProjectTabs({
             // activates it by firing this element's own onClick — so hint selection and mouse
             // selection are the same code path (see keyboardHints/hintTargets.ts).
             data-hint={PROJECT_TAB_HINT}
-            title={tabTitle(p.name, { hasSettings: !!onOpenSettings, tornOut, canTearOff: !!onTearOff })}
+            data-expanded={exp ? true : undefined}
+            title={label}
+            // THE NAME IS AN `aria-label`, NOT JUST A `title` — and the title alone was never
+            // enough. `disableNativeTooltips()` (wired at main.tsx) strips `title` app-wide on a
+            // capture-phase `mouseover`, rehoming it to `aria-label` ONLY for an element with no
+            // accessible name yet; a tab has visible text, so the attribute was removed with no
+            // replacement on every hover. That left the full project name reachable NOWHERE once
+            // the label was squeezed — not by tooltip, not by screen reader. Naming the tab
+            // explicitly is what gives keyboard and screen-reader users the same information the
+            // hover expansion gives the mouse, and it does not depend on the (clipped) text.
+            aria-label={label}
+            onMouseEnter={() => beginExpand(p.id, false)}
+            onMouseLeave={() => endExpand(p.id)}
+            // Focus expands with NO delay: reaching a tab by keyboard is already deliberate.
+            onFocus={() => beginExpand(p.id, true)}
+            onBlur={() => endExpand(p.id)}
             onClick={() => {
               // Consume the click a completed drag generated. Cleared here rather than on pointerup
               // so the very next real click still selects.
@@ -775,11 +1132,15 @@ export function ProjectTabs({
             }}
             onDoubleClick={() => onOpenSettings?.(p.id)}
             onKeyDown={(e) => activateOnKey(e, () => onSelect(p.id))}
+            // THE SLOT — this element is the tab's FOOTPRINT IN THE FLEX LINE and nothing else. It
+            // carries no padding, no background and no border; all of that is on the body below,
+            // which is the thing that expands. Splitting them is what makes an expansion free: the
+            // slot's width is frozen at whatever the line already gave it and the body leaves the
+            // flow, so no sibling tab can move.
             style={{
               display: "flex",
-              alignItems: "center",
-              gap: 8,
-              padding: "8px 12px",
+              position: "relative",
+              top: 1,
               // The tab being dragged fades so the caret (or the empty gap, when the drag has left
               // the strip) is what the eye follows.
               opacity: isDragged ? (drag?.kind === "tearoff" ? 0.35 : 0.55) : tornOut ? 0.6 : 1,
@@ -787,28 +1148,66 @@ export function ProjectTabs({
               // without it the project name highlights blue under the cursor mid-drag.
               userSelect: "none",
               WebkitUserSelect: "none",
-              // A flex item defaults to `min-width: auto`, which floors it at its content's
-              // min-content width. With the label now `nowrap`, that floor is the WHOLE label —
-              // so a bar full of long names would push past its container and squeeze the "+" and
-              // the top-right cluster instead of ellipsizing. `minWidth: 0` lets the tab shrink so
-              // the label's own `text-overflow` actually gets to do its job under crowding.
-              minWidth: 0,
-              borderRadius: "6px 6px 0 0",
               cursor: "pointer",
               fontSize: 12,
-              position: "relative",
-              top: 1,
-              color: active ? C.cream : C.muted,
-              background: active ? C.forest : "transparent",
-              // Longhand per edge: mixing the `border` shorthand with a `borderBottom` override
-              // makes React warn (and can style-bug) when only one of them changes on re-render.
-              borderTop: `1px solid ${active ? C.muted : "transparent"}`,
-              borderLeft: `1px solid ${active ? C.muted : "transparent"}`,
-              borderRight: `1px solid ${active ? C.muted : "transparent"}`,
-              borderBottom: "none",
-              boxShadow: glow,
+              // THE FREEZE. `0 0 <w>px` — no grow, no shrink, an explicit basis — pins the slot to
+              // the width it measured at the instant it expanded, so the flex line's arithmetic is
+              // identical before and after. Without it an out-of-flow body would leave the slot
+              // with nothing to size itself from and every other tab would slide over to fill it.
+              // THE FLOOR. An explicit `min-width` replaces the automatic minimum size, so the tab
+              // shrinks under crowding exactly as it always did and then STOPS with a readable name
+              // still showing. It has to live here rather than on the label — see `tabMinWidth`,
+              // which is also where the measured 0 fallback (no floor at all) is explained.
+              minWidth: tabMinWidth(m.chrome, m.natural, active),
+              ...(exp ? { flex: `0 0 ${exp.width}px`, zIndex: TAB_EXPANDED_Z } : {}),
             }}
           >
+            <div
+              data-testid={`tab-body-${p.id}`}
+              ref={(el) => {
+                // Same delete-on-unmount discipline as `tabEls`; the chrome measurement walks this
+                // element's children, so a dead node here would be measured as a live tab.
+                if (el) bodyEls.current.set(p.id, el);
+                else bodyEls.current.delete(p.id);
+              }}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: TAB_BODY_GAP,
+                padding: `8px ${TAB_BODY_PAD_X}px`,
+                borderRadius: "6px 6px 0 0",
+                color: active ? C.cream : C.muted,
+                // OPAQUE WHILE EXPANDED. An inactive tab is normally transparent over the bar, which
+                // is fine until it is floating over a NEIGHBOUR — then the covered tab's own label
+                // and badges read straight through it. `barSurface` is the bar's own colour, so the
+                // expansion reads as the tab having grown rather than as a card dropped on top.
+                background: active ? C.forest : exp ? C.barSurface : "transparent",
+                // Longhand per edge: mixing the `border` shorthand with a `borderBottom` override
+                // makes React warn (and can style-bug) when only one of them changes on re-render.
+                borderTop: `1px solid ${active || exp ? C.muted : "transparent"}`,
+                borderLeft: `1px solid ${active || exp ? C.muted : "transparent"}`,
+                borderRight: `1px solid ${active || exp ? C.muted : "transparent"}`,
+                borderBottom: "none",
+                boxShadow: glow,
+                ...(exp
+                  ? {
+                      // OUT OF FLOW — the half of the freeze that reveals the name. Sized by its
+                      // CONTENT (`max-content`) so the label is whole, but never narrower than the
+                      // slot it covers.
+                      position: "absolute",
+                      top: 0,
+                      bottom: 0,
+                      // Grows INWARD, away from the strip's nearer edge — see `beginExpand`.
+                      ...(exp.anchor === "right" ? { right: 0 } : { left: 0 }),
+                      width: "max-content",
+                      minWidth: "100%",
+                    }
+                  : // `minWidth: 0` so the body follows the slot down: the slot's own `min-width`
+                    // is what stops the shrinking, and a body that refused to shrink with it would
+                    // simply paint outside the tab and over its neighbour.
+                    { flex: "1 1 auto", minWidth: 0 }),
+              }}
+            >
             <button
               type="button"
               className="concierge-tab-pin"
@@ -835,13 +1234,25 @@ export function ProjectTabs({
             </button>
             <span
               data-testid={`tab-label-${p.id}`}
+              ref={(el) => {
+                // Same discipline as `tabEls`: delete on unmount, so a closed project cannot leave
+                // a dead node behind for the natural-width measurement to read.
+                if (el) labelEls.current.set(p.id, el);
+                else labelEls.current.delete(p.id);
+              }}
               style={{
                 // A long folder name must TRUNCATE, never wrap. Wrapping made that one tab two rows
                 // tall while its neighbours stayed one row, so the whole bar grew and the tabs no
                 // longer lined up — the ragged look the ellipsis exists to prevent. The tab's
-                // `title` already carries the full name, so nothing is lost to the truncation.
-                maxWidth: TAB_LABEL_MAX_WIDTH,
-                overflow: "hidden",
+                // accessible name carries the full string, and hovering reveals it.
+                maxWidth: exp ? "none" : TAB_LABEL_MAX_WIDTH,
+                // FREE TO SHRINK TO NOTHING, and that is correct even though the whole point is
+                // that it never has to: the thing that stops the squeeze is the SLOT's `min-width`
+                // above, and it stops it while there is still room for a readable name. A floor
+                // written here instead would not survive contact with a layout engine — see
+                // `tabMinWidth` for the measurement that proved it.
+                minWidth: 0,
+                overflow: exp ? "visible" : "hidden",
                 textOverflow: "ellipsis",
                 whiteSpace: "nowrap",
               }}
@@ -919,6 +1330,7 @@ export function ProjectTabs({
                 <FiX size={13} />
               </button>
             )}
+            </div>
           </div>
           </Fragment>
         );
@@ -926,6 +1338,9 @@ export function ProjectTabs({
       {/* Append-to-end caret. `beforeId === null` means "past every tab", which has no tab to
           precede — so it renders here rather than inside the map. */}
       {drag?.kind === "reorder" && drag.beforeId === null && <DropCaret />}
+      </div>
+      {/* OUTSIDE THE SCROLLER, deliberately. Inside it, the one control that opens a project would
+          scroll off the end exactly when the bar is too full to hold another tab. */}
       {onAddProject && (
         <button
           type="button"

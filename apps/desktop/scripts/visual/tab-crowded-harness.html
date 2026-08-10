@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Project tabs — crowded-strip layout probe</title>
+  </head>
+  <body>
+    <!--
+      A LAYOUT-ONLY PAGE, served by the app's own vite dev server so it renders the REAL ProjectTabs
+      with the REAL stylesheet and the REAL system font. It exists because the entire bug (bead
+      sparkle-z24dl) is a flex-layout one and jsdom has no layout engine: it cannot tell a label
+      floored at six characters from one squeezed to zero, and it cannot tell an expansion that
+      leaves its neighbours alone from one that shoves them along the bar. See tab-crowded-probe.mjs
+      for what is measured.
+    -->
+    <div id="root"></div>
+    <script type="module" src="./tab-crowded-harness.jsx"></script>
+  </body>
+</html>

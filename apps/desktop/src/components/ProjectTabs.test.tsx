@@ -301,10 +301,17 @@ describe("ProjectTabs — long names truncate rather than wrap", () => {
     expect(label.style.maxWidth).toBe(`${TAB_LABEL_MAX_WIDTH}px`);
   });
 
-  it("keeps the FULL name available on hover, so truncation loses nothing", () => {
+  it("keeps the FULL name available, so truncation loses nothing", () => {
+    // This used to assert `title` ALONE, and that assertion was worth nothing: `title` is stripped
+    // app-wide by `disableNativeTooltips()` on a capture-phase `mouseover`, and rehomed to
+    // `aria-label` only for an element that has no accessible name — which a tab, having visible
+    // text, does not. So the one thing this named as the consolation for truncating was dead on
+    // arrival, and stayed dead for as long as nothing checked it (bead sparkle-z24dl). The name is
+    // now an explicit `aria-label`, which the strip cannot take away, and the hover expansion in
+    // ProjectTabs.hoverExpand.test.tsx is the visible half.
     renderTabs({ projects: [{ id: "long", name: longName }] });
     expect(screen.getByTestId("tab-label-long").textContent).toBe(longName);
-    expect(screen.getByTestId("tab-long").getAttribute("title")).toContain(longName);
+    expect(screen.getByTestId("tab-long").getAttribute("aria-label")).toContain(longName);
   });
 
   it("applies the same clamp to short names, so every tab is exactly one row tall", () => {
@@ -399,12 +406,17 @@ describe("ProjectTabs — the active tab keeps its glow", () => {
       selectedProjectId: "sparkle",
       countsByProject: { sparkle: counts({ needs_you: 3 }) },
     });
-    const tab = screen.getByTestId("tab-sparkle");
-    expect(tab.style.boxShadow).not.toBe("");
+    // `tab-body-*`, not `tab-*`: a tab is two boxes since the hover expansion landed (bead
+    // sparkle-z24dl). The outer one is the FOOTPRINT in the flex line and carries no chrome at
+    // all; the body carries the padding, the background, the border and this glow, and is the box
+    // that leaves the flow to expand. Reading the outer's `boxShadow` finds "" no matter how loud
+    // the alarm is.
+    const body = screen.getByTestId("tab-body-sparkle");
+    expect(body.style.boxShadow).not.toBe("");
     // The same red the dots and chips use — one alarm vocabulary, not a bespoke tab colour.
     // Compared as HEX, not via `asRgb`: jsdom normalises `background` to rgb() but leaves
     // `boxShadow` as authored, and the glow appends an alpha suffix to the token.
-    expect(tab.style.boxShadow).toContain(bandColor("needs_you"));
+    expect(body.style.boxShadow).toContain(bandColor("needs_you"));
     // …and the badge really is suppressed, so the glow is genuinely carrying it alone.
     expect(screen.queryByTestId("count-sparkle")).toBeNull();
   });
@@ -414,7 +426,7 @@ describe("ProjectTabs — the active tab keeps its glow", () => {
       selectedProjectId: "sparkle",
       countsByProject: { sparkle: counts({ running: 3, done: 5 }) },
     });
-    expect(screen.getByTestId("tab-sparkle").style.boxShadow).toBe("");
+    expect(screen.getByTestId("tab-body-sparkle").style.boxShadow).toBe("");
   });
 });
 
