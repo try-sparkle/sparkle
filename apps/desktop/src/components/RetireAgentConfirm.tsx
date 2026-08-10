@@ -2,7 +2,7 @@ import { C, FONT_WEIGHT } from "../theme/colors";
 import { RADIUS, FONT_UI, FONT_MONO } from "../theme/scale";
 import { ModalShell } from "./ModalShell";
 import type { RetroReceipt } from "../engine/retroReceiptTypes";
-import { retroStanding, type FeedbackEvidence } from "../engine/retroEvidence";
+import { retroStanding, type FeedbackEvidence, type RetroStanding } from "../engine/retroEvidence";
 
 /**
  * THE HUMAN CONFIRM. Shown when closing a build agent whose work has LANDED
@@ -91,6 +91,21 @@ export function RetireAgentConfirm({
   dirty,
   /** `BranchStatus.dirtyCount` — the TRUE total. `dirtyFiles` is capped at 5. */
   dirtyCount,
+  /**
+   * The human said yes — HANDED THE STANDING THIS DIALOG DISPLAYED.
+   *
+   * ── WHY THE ARGUMENT EXISTS (roborev, on the sparkle-y2p4f commit) ─────────────────────────────
+   * `confirmRetire` re-reads the standing at click time, which is right for WITHDRAWING a write (the
+   * modal can sit open across polls) and wrong for INTRODUCING one. The beads read is unsubscribed
+   * — and a freshness-only `unknown`→`absent` transition changes no store state at all, since an
+   * unchanged poll advances the module-scope `polledAt` and deliberately leaves `byProject`
+   * identical — so this dialog can be showing "I won't record anything against this agent" under a
+   * plain "Retire it" while the fresh read has become `absent`. Without this argument the click
+   * writes the permanent, undeletable gap receipt the copy just promised it would not.
+   *
+   * So the writer takes the INTERSECTION: the caller may record a gap only if what was on screen
+   * said `absent` too. The re-read can still cancel; it can no longer surprise.
+   */
   onRetire,
   onCancel,
 }: {
@@ -101,7 +116,7 @@ export function RetireAgentConfirm({
   dirtyFiles?: readonly string[];
   dirty?: boolean;
   dirtyCount?: number;
-  onRetire: () => void;
+  onRetire: (shown: RetroStanding) => void;
   onCancel: () => void;
 }) {
   /** FOUR-WAY, not the old `receipt != null` boolean. `absent` — the only standing that may accuse
@@ -335,11 +350,14 @@ export function RetireAgentConfirm({
             Keyed on the SAME `standing.kind === "absent"` as the gap note above and as
             `mayRecordRetroGap` in the engine — if a fourth standing is ever added, all three move
             together or the button offers to record something the writer then declines to record. */}
+        {/* THE STANDING GOES WITH THE CLICK, so the writer cannot exceed the promise this button
+            just made — see `onRetire`'s own note. Passing `standing` (not a boolean) keeps the one
+            value that the label, the gap note above and `mayRecordRetroGap` are all keyed on. */}
         {hasUncommitted
           ? null
           : primaryBtn(
               standing.kind === "absent" ? "Retire anyway — record the gap" : "Retire it",
-              onRetire,
+              () => onRetire(standing),
               C.accent,
             )}
         {quietLink(

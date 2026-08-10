@@ -687,6 +687,43 @@ describe("AgentSidebar — a LANDED agent needs the human's confirm (bead sparkl
     expect(recordRetroOverridden).toHaveBeenCalledTimes(1);
   });
 
+  it("writes NO gap receipt when the backlog turns readable AFTER the dialog opened", async () => {
+    // ── THE RE-READ MAY ONLY CANCEL A WRITE, NEVER INTRODUCE ONE (roborev, on this commit) ───────
+    // `confirmRetire` re-reads the standing at click time — correct, since the modal sits open
+    // across polls. But the beads read is UNSUBSCRIBED, and the `unknown`→`absent` transition can
+    // be freshness-only (an unchanged poll advances the module-scope `polledAt` and deliberately
+    // leaves `byProject` identical), so no re-render is owed and none happens. That is exactly what
+    // this case reproduces: the dialog is showing "I won't record anything against this agent"
+    // under a plain "Retire it" while the fresh read has already become `absent`.
+    //
+    // Taking the fresh answer alone writes the permanent, undeletable gap receipt that copy just
+    // ruled out. The button's own promise is the ceiling.
+    useBeadsStore.setState({ byProject: {} } as never);
+    __setBeadsPolledAtForTest("p1", undefined);
+    landedProject();
+    clickClose();
+    // What the human is looking at, and the button they are about to press.
+    expect(screen.getByTestId("retire-unknown-note")).toBeTruthy();
+    const retire = screen.getByRole("button", { name: /^Retire it$/ });
+
+    // The poll lands. NOT wrapped in `act`, and not followed by a re-render: the whole point is
+    // that React is owed no update here, so the dialog on screen is now out of date.
+    useBeadsStore.setState({
+      byProject: {
+        p1: {
+          beads: [],
+          board: { backlog: [], blocked: [], inProgress: [], done: [], delivered: [] },
+          loadedAt: Date.now(),
+        },
+      },
+    } as never);
+    __setBeadsPolledAtForTest("p1", Date.now());
+
+    fireEvent.click(retire);
+    await waitFor(() => expect(agentsNow()).not.toContain("a1"));
+    expect(recordRetroOverridden).not.toHaveBeenCalled();
+  });
+
   it("BLOCKS the retire while the worktree holds uncommitted files (knightwatch probe 1)", () => {
     // Landed work is safe; the worktree's post-merge edits are not, and teardown force-removes it.
     // The dialog names the files and withdraws the action rather than destroying them behind a

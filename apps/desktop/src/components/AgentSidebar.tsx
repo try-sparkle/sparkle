@@ -66,6 +66,7 @@ import {
   retroStanding,
   mayRecordRetroGap,
   type FeedbackEvidence,
+  type RetroStanding,
 } from "../engine/retroEvidence";
 import { useBeadsStore, beadsPolledAt } from "../stores/beadsStore";
 import { canAnswerRetroPing } from "../engine/retirementReadiness";
@@ -1404,7 +1405,7 @@ export function AgentSidebar({
    *  A failed write does NOT block the retirement. The human has decided, and refusing to remove a
    *  row because we could not write a note about it would strand exactly the dead agents this path
    *  exists to clear — the failure mode the override was added to prevent. It is logged instead. */
-  const confirmRetire = async (id: string) => {
+  const confirmRetire = async (id: string, shown?: RetroStanding) => {
     if (!project) return void teardownAgent(id);
     // THE GATE ON THE PERMANENT MARK (bead `sparkle-y2p4f`). This used to be `!settled`, i.e. "no
     // receipt on file" — which is true of EVERY agent, because no production path writes a
@@ -1419,7 +1420,18 @@ export function AgentSidebar({
       retroSettled(cachedReceipt(project.id, id)),
       feedbackEvidenceFor(project.id, id),
     );
-    if (mayRecordRetroGap(standing)) {
+    // ── THE RE-READ MAY ONLY CANCEL THE WRITE, NEVER INTRODUCE ONE (roborev, on this commit) ─────
+    // `shown` is the standing the dialog actually had on screen. The beads read is UNSUBSCRIBED and
+    // a freshness-only `unknown`→`absent` transition mutates no store state at all (an unchanged
+    // poll advances the module-scope `polledAt` and deliberately leaves `byProject` identical), so
+    // between open and click the fresh answer can become `absent` while the human is still reading
+    // "I won't record anything against this agent either" under a plain "Retire it". Taking the
+    // fresh answer alone would write the permanent, undeletable gap receipt that copy just ruled
+    // out — the same false mark this whole path exists to stop, in a narrower window.
+    //
+    // So both must agree. A machine caller with no dialog behind it passes nothing and writes
+    // nothing: silence is not evidence, and this is the branch that cannot be undone.
+    if (mayRecordRetroGap(standing) && shown !== undefined && mayRecordRetroGap(shown)) {
       const rt = useRuntimeStore.getState();
       const bs = rt.branchStatus[id];
       const wrote = await recordRetroOverridden(project.id, id, {
@@ -3126,10 +3138,12 @@ export function AgentSidebar({
             status[retiringAgent.id],
             Boolean(quotaBlockForAgent(retiringAgent.id, Date.now())),
           )}
-          onRetire={() => {
+          // `shown` is what the dialog DISPLAYED. `confirmRetire` re-reads the standing (the modal
+          // can sit open across polls) and may only ever narrow it from here — see its own note.
+          onRetire={(shown) => {
             const id = retiringAgent.id;
             setRetireConfirmId(null);
-            void confirmRetire(id);
+            void confirmRetire(id, shown);
           }}
           onCancel={() => setRetireConfirmId(null)}
         />

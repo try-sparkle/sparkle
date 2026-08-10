@@ -39,6 +39,9 @@ import { openPreviewServer, PREVIEW_ALREADY_STARTING } from "../services/preview
 import { refreshAgentBranch } from "../services/branchStatus";
 import { cachedReceipt } from "../services/retroReceipts";
 import { retirementPill } from "../engine/retirementReadiness";
+// The FEEDBACK pill's count and the retire dialog's "it did report: N" read ONE predicate — see
+// `feedbackCount` below and `engine/retroEvidence` (bead `sparkle-y2p4f`).
+import { countAgentFeedbackBeads } from "../engine/retroEvidence";
 import { askFor, FOUNDER_ASK_LABEL, FOUNDER_ASK_DETAIL } from "../engine/founderAsk";
 import { beadLabel, epicForBuild, epicPillFor } from "../services/planView";
 import { type Bead } from "../services/beads";
@@ -160,10 +163,15 @@ export const AgentRow = memo(function AgentRow({
   // created or commented on. Drives the FEEDBACK pill below: shown only when the count is ≥1, and the
   // count itself is the pill's number. Computed from the raw beads list (not the bucketed board) so it
   // still counts feedback on auto-labeled/closed beads the board's own bucketing drops.
-  const feedbackCount =
-    a.kind === "build"
-      ? beads.filter((b) => b.labels.includes(`agent:${a.id}`)).length
-      : 0;
+  //
+  // ── ONE PREDICATE, SHARED WITH THE RETIRE DIALOG (bead `sparkle-y2p4f`) ────────────────────────
+  // This used to be a hand-written `labels.includes` here and a second one in `engine/retroEvidence`,
+  // whose doc claimed the two "cannot answer differently" while nothing enforced it. The bug that
+  // module exists to fix WAS two surfaces disagreeing about this exact number — the dialog saying
+  // nothing had been recorded while this pill read FEEDBACK 2 — so a second copy of the rule is the
+  // shape of the original defect, not a tidiness question. The `build` gate stays at the call site:
+  // it is about which rows get a pill, not about what counts as feedback.
+  const feedbackCount = a.kind === "build" ? countAgentFeedbackBeads(beads, a.id) : 0;
 
   const rowRef = useRef<HTMLDivElement>(null);
   const hideTimer = useRef<number | null>(null);

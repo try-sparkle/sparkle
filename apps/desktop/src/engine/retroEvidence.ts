@@ -109,9 +109,13 @@ export function feedbackEvidence({
 /**
  * How many beads carry this agent's feedback label.
  *
- * THE SAME PREDICATE THE ROW'S PILL USES (`components/AgentRow.tsx`), extracted so the dialog and the
- * pill cannot answer differently — the contradiction this whole module exists to remove was two
- * surfaces disagreeing, and a second hand-written `labels.includes` would be a third place to drift.
+ * THE SAME PREDICATE THE ROW'S PILL USES, and that is now a fact rather than an intention: this
+ * commit's first version asserted it here while `components/AgentRow.tsx` kept its own inline
+ * `beads.filter((b) => b.labels.includes(...))` (roborev). Two hand-written copies of the rule is
+ * the SHAPE OF THE ORIGINAL DEFECT — the contradiction this module exists to remove was two
+ * surfaces disagreeing about this exact number — so `AgentRow.feedbackCount` calls this, and a
+ * change to the rule now moves the pill and the dialog together or neither.
+ *
  * Counts the RAW list, not the bucketed board, so closed and auto-labelled beads still count: the
  * question is "did it report", not "is the report still open".
  */

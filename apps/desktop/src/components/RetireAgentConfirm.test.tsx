@@ -13,7 +13,7 @@
 //
 // These cases pin the four-way standing so the accusing sentence — and the permanent gap note the
 // button writes — can only reach an agent that demonstrably reported nothing.
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RetireAgentConfirm } from "./RetireAgentConfirm";
 import type { FeedbackEvidence } from "../engine/retroEvidence";
@@ -28,6 +28,7 @@ const GAP_BUTTON = /record the gap/i;
 function show(over: {
   feedback: FeedbackEvidence;
   receipt?: Parameters<typeof RetireAgentConfirm>[0]["receipt"];
+  onRetire?: Parameters<typeof RetireAgentConfirm>[0]["onRetire"];
 }) {
   return render(
     <RetireAgentConfirm
@@ -35,7 +36,7 @@ function show(over: {
       receipt={over.receipt ?? null}
       feedback={over.feedback}
       canAnswer={true}
-      onRetire={vi.fn()}
+      onRetire={over.onRetire ?? vi.fn()}
       onCancel={vi.fn()}
     />,
   );
@@ -127,6 +128,41 @@ describe("an agent that genuinely reported nothing", () => {
   it("still titles itself as missing the retro", () => {
     show({ feedback: { kind: "none" } });
     expect(screen.getByText(/without its retro/i)).toBeTruthy();
+  });
+});
+
+// ── THE CLICK CARRIES WHAT WAS ON SCREEN (roborev, on the sparkle-y2p4f commit) ──────────────────
+// `confirmRetire` re-reads the standing at click time, which is right for withdrawing a write and
+// wrong for introducing one: the beads read is unsubscribed, and a freshness-only `unknown`→`absent`
+// transition mutates no store state at all, so the fresh answer can become `absent` while the human
+// is still reading "I won't record anything against this agent". Handing the DISPLAYED standing to
+// `onRetire` is what lets the writer take the intersection. These pin the value, per standing.
+describe("the retire click reports the standing the human actually saw", () => {
+  for (const [feedback, expected] of [
+    [{ kind: "reported", count: 2 }, { kind: "reported", count: 2 }],
+    [{ kind: "unknown" }, { kind: "unknown" }],
+    [{ kind: "none" }, { kind: "absent" }],
+  ] as const) {
+    it(`hands back ${expected.kind} for a ${feedback.kind} backlog`, () => {
+      const onRetire = vi.fn();
+      show({ feedback, onRetire });
+      fireEvent.click(screen.getByRole("button", { name: /Retire/ }));
+      expect(onRetire).toHaveBeenCalledTimes(1);
+      expect(onRetire).toHaveBeenCalledWith(expected);
+    });
+  }
+
+  it("hands back settled when a receipt is on file", () => {
+    const onRetire = vi.fn();
+    show({
+      receipt: { state: "excused", at: 1, source: "agent-declared", reasonText: "no-changes" },
+      feedback: { kind: "none" },
+      onRetire,
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^Retire it$/ }));
+    // NOT `absent`: a settled receipt must not be able to authorise a second gap note against an
+    // agent that already has a record on file.
+    expect(onRetire).toHaveBeenCalledWith({ kind: "settled" });
   });
 });
 

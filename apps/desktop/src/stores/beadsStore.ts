@@ -494,6 +494,18 @@ export function beadsPolledAt(projectId: string): number | undefined {
  *  `setState({ byProject: {} })` looks like a full reset but leaves a project the previous case
  *  read still looking freshly-read, so a freshness-gated sweep silently skips it. Call in
  *  `beforeEach`. Not part of the store's runtime surface. */
+export function __resetBeadsRefreshInFlightForTest(): void {
+  refreshInFlight.clear();
+  staleSteals.clear();
+  // Freshness is module-scope too, so a case that polled project "p1" would otherwise leave the
+  // next case's "p1" looking already-fresh.
+  polledAt.clear();
+  // Likewise the blocked-id cache: a case that read a populated blocked set for "p1" would
+  // otherwise hand it to the next case, whose `bd blocked` mock is then never consulted — turning
+  // an assertion about the lane into an assertion about the previous test.
+  blockedCache.clear();
+}
+
 /** TEST-ONLY. Stamp (or clear) the freshness clock directly.
  *
  *  `polledAt` is written ONLY inside `refresh`'s success commit, so a case that seeds `byProject`
@@ -509,17 +521,6 @@ export function __setBeadsPolledAtForTest(projectId: string, at: number | undefi
   else polledAt.set(projectId, at);
 }
 
-export function __resetBeadsRefreshInFlightForTest(): void {
-  refreshInFlight.clear();
-  staleSteals.clear();
-  // Freshness is module-scope too, so a case that polled project "p1" would otherwise leave the
-  // next case's "p1" looking already-fresh.
-  polledAt.clear();
-  // Likewise the blocked-id cache: a case that read a populated blocked set for "p1" would
-  // otherwise hand it to the next case, whose `bd blocked` mock is then never consulted — turning
-  // an assertion about the lane into an assertion about the previous test.
-  blockedCache.clear();
-}
 /**
  * How many mounted viewers currently want each project polled.
  *
