@@ -73,13 +73,16 @@ vi.mock("./AgentSidebar", () => ({
   AgentSidebar: ({
     slotSide = "right",
     showSparkleRow,
+    showConciergeRow,
   }: {
     slotSide?: string;
     showSparkleRow?: boolean;
+    showConciergeRow?: boolean;
   }) => (
     <div
       data-testid={`sidebar-${slotSide}`}
       data-show-={showSparkleRow === undefined ? "unset" : String(showSparkleRow)}
+      data-show-concierge-row={showConciergeRow === undefined ? "unset" : String(showConciergeRow)}
     />
   ),
 }));
@@ -154,6 +157,8 @@ afterEach(() => {
 
 const sparkleRowFlag = (side: "left" | "right") =>
   screen.getByTestId(`sidebar-${side}`).getAttribute("data-show-");
+const conciergeRowFlag = (side: "left" | "right") =>
+  screen.getByTestId(`sidebar-${side}`).getAttribute("data-show-concierge-row");
 
 describe("Improve Sparkle appears in the RIGHT build column only", () => {
   it("suppresses the row on the left and keeps it on the right", () => {
@@ -175,6 +180,19 @@ describe("Improve Sparkle appears in the RIGHT build column only", () => {
     render(<Workspace />);
     expect(screen.getByTestId("sidebar-left")).toBeTruthy();
     expect(screen.getByTestId("sidebar-right")).toBeTruthy();
+  });
+
+  // CONCIERGE AGENTS RIDES THE SAME WIRING, and until now nothing pinned it (roborev 61724): the
+  // row's own suite hand-passed `showConciergeRow={false}`, which tests the PROP, not the fact that
+  // `Workspace` supplies it. Delete that one line from Workspace.tsx and the duplicate comes back —
+  // two rows, both polling `refreshResearch`, a duplicated DOM id, a shared `openTaskId` — with the
+  // whole suite green. This is the assertion that reds instead.
+  it("passes showConciergeRow=false to the left column and lets the right default it", () => {
+    render(<Workspace />);
+    expect(conciergeRowFlag("left")).toBe("false");
+    // Same both-sides rule as above: hiding it everywhere would satisfy the line above and remove
+    // the row the founder asked for. The right column must still be asking — by default.
+    expect(conciergeRowFlag("right")).not.toBe("false");
   });
 
   it("leaves the SINGLE-pair layout untouched — no left column, row still on the right", () => {

@@ -1842,6 +1842,8 @@ export function Workspace() {
               // same reason and so reproduces it exactly.
               covered={leftBoardActive || leftPreviewActive}
               showSparkleRow={false}
+              // Same reason, same bug (sparkle-x0pvw): one pinned row per WINDOW, not per sidebar.
+              showConciergeRow={false}
             />
             {/* NO `AgentPaneList` HERE. The panes are mounted once, elsewhere, and portalled in —
                 this stage contributes the destination (`ref`) and nothing else, which is what keeps

@@ -295,6 +295,18 @@ pub fn run() {
             // Watch for monitors being plugged/unplugged so a window spanned across displays can be
             // re-fitted instead of stranded at a geometry no remaining display can show.
             display_span::start_display_watch(app.handle().clone());
+            // Reconcile research tasks a previous launch left mid-flight. A task that was `queued`
+            // or `running` when the app exited keeps that status on disk forever — its control
+            // lived only in the old process — so without this the sidebar's `+[n]` is permanently
+            // inflated by every interrupted pass and nothing ever drains it (this module opts out
+            // of `retention::reap_inbox` deliberately, and cancel needs a human to notice). A deep
+            // pass runs up to 15 minutes, so a restart landing inside one is ordinary.
+            if let Ok(app_data) = crate::worktree::app_data_dir_pub(app.handle()) {
+                let n = research::reconcile_interrupted(&app_data);
+                if n > 0 {
+                    tracing::info!(count = n, "research: reconciled tasks interrupted by a restart");
+                }
+            }
             // Reclaim preview dev servers a previous launch left behind. This is the PRIMARY orphan
             // path, not a backstop: managed state leaks on the ordinary Cmd+Q path, so a hard kill
             // leaves the child running with nothing else that would ever stop it. It verifies the

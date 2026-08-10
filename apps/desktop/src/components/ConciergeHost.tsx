@@ -2757,9 +2757,31 @@ export function ConciergeHost({
   // preamble is `done`-only by design (`isUnread`), so without this a concierge that dispatched a
   // task would wait forever on an answer that was never coming. `observe` is idempotent per task —
   // it reports each id once — so a subscription that fires on every store write is safe.
+  // ── AND A POLL, WITHOUT WHICH THE WHOLE FEATURE IS INERT ────────────────────────────────────
+  //
+  // The store is written by the mount refresh and by the refresh that follows a claim — and a claim
+  // only happens for a finding ALREADY in the cache. Nothing re-listed while the window stayed open.
+  // So the primary scenario this bead exists for — the concierge dispatches research, it finishes
+  // minutes later, the next turn reports it — could never fire: the task stayed `running` with
+  // `findings: null`, `isUnread` was false, the preamble stayed empty, and `observe` never saw a
+  // terminal status so no `research_completed` was recorded either. The feature was dead for the
+  // whole session unless the window happened to remount after a task finished.
+  //
+  // A poll is the honest fix while the runner has no change event to listen on. THE POLL ITSELF NOW
+  // LIVES IN `ConciergeAgentsRow` — see the long comment on its mount effect. It was here first, and
+  // that was wrong in both directions: this component paints no row, and the row is rendered in
+  // windows where this component is not mounted at all (a torn-off satellite) — so those windows
+  // never refreshed while this one polled for a row it does not own (roborev 61724).
+  //
+  // What stays here is the DRAIN's view of the store. `observe` has to watch every task the cache
+  // learns about, whoever refreshed it, so it subscribes rather than polling; the mount refresh is
+  // kept so a host that opens before any row exists still sees what is already on disk.
   useEffect(() => {
     void refreshResearch();
-    return useResearchStore.subscribe((s) => researchDrain.observe(Object.values(s.byId)));
+    const unsubscribe = useResearchStore.subscribe((s) =>
+      researchDrain.observe(Object.values(s.byId)),
+    );
+    return unsubscribe;
   }, []);
 
   // Feed the trigger, and retract any push the state has moved past.

@@ -220,6 +220,7 @@ export function AgentSidebar({
   slotSide = "right",
   forcePairSide,
   showSparkleRow = true,
+  showConciergeRow = true,
   covered = false,
 }: {
   project: Project | null;
@@ -246,6 +247,16 @@ export function AgentSidebar({
    *  therefore offer to reveal MAIN's copy — a second pane on one PTY, which is the one thing the
    *  tear-off ownership split exists to prevent. Defaults to true so the main window is untouched. */
   showSparkleRow?: boolean;
+  /**
+   * Whether THIS sidebar renders the pinned "Concierge Agents" row.
+   *
+   * Its own flag rather than a reuse of `showSparkleRow`, which was the first attempt: those two
+   * rows are suppressed for the same STRUCTURAL reason (this component mounts twice when two pairs
+   * are open — bead `sparkle-x0pvw`) but they are not the same decision, and the existing tests set
+   * `showSparkleRow={false}` precisely to silence the Sparkle row while still exercising this one.
+   * Conflating them made those tests render no row at all.
+   */
+  showConciergeRow?: boolean;
   /** IS SOMETHING OPAQUE PAINTED OVER THIS WHOLE COLUMN? True while the pair's Plan board is up,
    *  which covers both columns (Workspace.PlanBoardSlot).
    *
@@ -3058,20 +3069,33 @@ export function AgentSidebar({
           improved sparkle called 'Concierge Agents'. it's just one row, like a build orchestrator
           with '+[n]' showing how many agents are running."
 
-          UNCONDITIONAL, where the row below it is behind `showSparkleRow`: "it's just one row" and
-          it is always present. A row that appeared only once work existed would leave the founder
-          with nowhere to look for work he had just asked for and no way to learn the surface exists
-          — and the `+0` it renders instead is a real answer, which is the whole reason `hydrated`
-          is passed separately from the count. */}
-      <ConciergeAgentsRow
-        status={conciergeStatus}
-        dotColor={conciergeRollupOverrides ? ROLLUP_DOT_COLOR[conciergeRollup] : undefined}
-        dotLabel={conciergeRollupOverrides ? rollupLabel(conciergeRollup) : undefined}
-        liveCount={conciergeLive.length}
-        hydrated={researchHydrated}
-        paneSide={pairSide}
-        jointOpen={jointOpen}
-      />
+          ALWAYS PRESENT — but "always" means once per WINDOW, not once per sidebar. A row that
+          appeared only when work existed would leave the founder with nowhere to look for work he
+          had just asked for and no way to learn the surface exists; the `+0` it renders instead is
+          a real answer, which is why `hydrated` is passed separately from the count.
+
+          IT IS GATED ON `showConciergeRow` — its OWN flag; see that prop's doc for why reusing
+          `showSparkleRow` was tried and abandoned. What the two flags share is the structural
+          reason a gate is needed at all: `AgentSidebar` mounts TWICE when two pairs are open
+          (Workspace.tsx, left and right), and a duplicated pinned row is a founder-reported bug —
+          bead `sparkle-x0pvw`, which is what put the Improve Sparkle row behind a flag in the first
+          place. Shipping this one unconditionally rebuilt that bug one row higher: two rows, both
+          polling `refreshResearch()`, a duplicated DOM id whose `aria-controls` resolved to the
+          wrong column's subtree, and — because `openTaskId` lives in the shared store while
+          `expanded` is local — opening a task in the right column silently opened it in the left
+          (roborev 61699). `Workspace.tsx` is what passes `false` to all but one sidebar, and
+          `Workspace.sparkleRowOneColumn.test.tsx` is what pins that wiring. */}
+      {showConciergeRow && (
+        <ConciergeAgentsRow
+          status={conciergeStatus}
+          dotColor={conciergeRollupOverrides ? ROLLUP_DOT_COLOR[conciergeRollup] : undefined}
+          dotLabel={conciergeRollupOverrides ? rollupLabel(conciergeRollup) : undefined}
+          liveCount={conciergeLive.length}
+          hydrated={researchHydrated}
+          paneSide={pairSide}
+          jointOpen={jointOpen}
+        />
+      )}
 
       {showSparkleRow && (
         <SparkleAgentRow

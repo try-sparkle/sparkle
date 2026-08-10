@@ -51,7 +51,7 @@
 // that is always present — so a live count of zero is a fact the row reports rather than a badge it
 // suppresses. `hydrated` is what separates that from "we have not looked yet": before the first
 // `listResearch()` lands, the row shows NO badge at all rather than claiming zero.
-import { memo, useCallback, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useId, useMemo, useState } from "react";
 import { C } from "../theme/colors";
 import { FONT_MONO, TYPE } from "../theme/scale";
 import { DOT_SIZE, DOT_SLOT_W, GLYPH_SLOT_H, DEPTH_INDENT } from "../engine/rowGeometry";
@@ -64,6 +64,7 @@ import type { AgentTabStatus } from "../types";
 import {
   cancelResearch,
   refreshResearch,
+  RESEARCH_POLL_INTERVAL_MS,
   sortedTasks,
   useResearchStore,
 } from "../services/research/store";
@@ -186,16 +187,41 @@ export const ConciergeAgentsRow = memo(function ConciergeAgentsRow({
   // "which task is the latest", which is the drift `sortedTasks` exists to prevent.
   const tasks = useMemo(() => sortedTasks(Object.values(byId)), [byId]);
 
-  // HYDRATE ON MOUNT. The store is a cache and the disk is the truth: the concierge that dispatched
-  // a task has usually exited by the time this window paints, so a row that trusted an empty store
-  // would report "+0" for work that is running right now. Failures are swallowed inside
-  // `refreshResearch` — a cache refresh must not turn a working column into a crashing one.
+  // HYDRATE ON MOUNT, THEN KEEP POLLING. The store is a cache and the disk is the truth: the
+  // concierge that dispatched a task has usually exited by the time this window paints, so a row
+  // that trusted an empty store would report "+0" for work that is running right now. Failures are
+  // swallowed inside `refreshResearch` — a cache refresh must not turn a working column into a
+  // crashing one.
+  //
+  // ══ THE POLL LIVES WITH THE ROW, NOT WITH THE CONCIERGE ═══════════════════════════════════════
+  //
+  // It was in `ConciergeHost` first, which paints no row — and `AgentSidebar` renders this one in
+  // windows where no `ConciergeHost` is mounted at all (a torn-off satellite), and in the main
+  // window whenever the host unmounts because no project is open. Those windows refreshed once at
+  // mount and never again: `+[n]` frozen, a finished task stuck on `running`, indefinitely
+  // (roborev 61724). A poll that outlives the thing it feeds is not a poll.
+  //
+  // ONE PER WINDOW is guaranteed one level up — `Workspace.tsx` passes `showConciergeRow={false}`
+  // to all but one sidebar (sparkle-x0pvw), so two columns cannot each start a timer.
+  //
+  // A poll rather than an event because the runner has no change channel: research completes on a
+  // wall clock of minutes, so this cadence is far finer than what it watches, and each tick is one
+  // directory read. Same posture as `BEADS_POLL_INTERVAL_MS` — a cache mirroring a file we do not own.
   useEffect(() => {
     void refreshResearch();
+    const timer = setInterval(() => {
+      void refreshResearch();
+    }, RESEARCH_POLL_INTERVAL_MS);
+    return () => clearInterval(timer);
   }, []);
 
   const rowBox = rowBoxFor({ paneSide, jointOpen, isActive: false, pinned: true });
-  const groupId = "concierge-agents-subtree";
+  // PER-INSTANCE, not a module constant. A module-level id is emitted once per mounted row, and
+  // this component can legitimately mount more than once across windows — a duplicated `id` is
+  // invalid HTML and, worse, silently resolves every header's `aria-controls` to the FIRST
+  // subtree in the document, so a screen reader following the second row lands on the wrong one
+  // (roborev 61699).
+  const groupId = useId();
 
   return (
     <>

@@ -44,6 +44,19 @@ export const RESEARCH_COMMANDS = {
   markRead: "research_mark_read",
 } as const;
 
+/**
+ * How often a window re-lists the research tasks from disk.
+ *
+ * WITHOUT A POLL THE FEATURE IS INERT (roborev 61698). Nothing else re-lists while a window stays
+ * open, so a task that completes mid-session is never observed: it stays `running` in the cache,
+ * `isUnread` stays false, the preamble stays empty, and the finding the founder asked for is never
+ * reported. That is the entire feature failing silently.
+ *
+ * Five seconds is deliberately far finer than what it watches (research completes on a wall clock of
+ * minutes) and each tick is one directory read, so the cadence is cheap relative to being wrong.
+ */
+export const RESEARCH_POLL_INTERVAL_MS = 5_000;
+
 export interface DispatchResearchInput {
   question: string;
   /** `null` when no project could be resolved — a real state the runner accepts. See types.ts. */

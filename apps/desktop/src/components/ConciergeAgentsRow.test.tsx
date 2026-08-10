@@ -86,7 +86,11 @@ import { useSettingsStore } from "../stores/settingsStore";
 import { useInteractionStore } from "../stores/interactionStore";
 import { useHelperPrefs } from "../helper/helperPrefs";
 import { allBandsVisible } from "../engine/buildSections";
-import { _resetResearchStoreForTests, useResearchStore } from "../services/research/store";
+import {
+  _resetResearchStoreForTests,
+  RESEARCH_POLL_INTERVAL_MS,
+  useResearchStore,
+} from "../services/research/store";
 import type { ResearchTask } from "../services/research/types";
 import type { AgentTab, AgentTabStatus, Project } from "../types";
 
@@ -375,6 +379,39 @@ describe("Concierge Agents — pinned directly above Improve Sparkle", () => {
   });
 });
 
+// ── 5b. THE POLL ───────────────────────────────────────────────────────────────────────────────
+//
+// THE POLL IS THE FIX FOR "THE FEATURE WAS INERT", AND NOTHING PINNED IT (roborev 61724).
+//
+// A task dispatched by a concierge that has since exited completes minutes later, and the row is the
+// only thing watching: without a poll it hydrated once at mount and then froze — `+[n]` stuck, a
+// finished task still rendering as `running`, for the life of the window. Deleting the `setInterval`
+// left every suite green, so the exact failure being repaired could return silently.
+//
+// The assertion is on the INVOKE COUNT, not on the constant existing: a test that read
+// `RESEARCH_POLL_INTERVAL_MS` would pass against a component that imports it and never uses it.
+describe("Concierge Agents — the row keeps polling while it is mounted", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it("refreshes again one interval after mount, and stops when unmounted", () => {
+    seedResearch([]);
+    const view = render(<AgentSidebar project={seed()} />);
+    expect(backend.refresh).toHaveBeenCalledTimes(1); // the hydrate-on-mount read
+
+    act(() => void vi.advanceTimersByTime(RESEARCH_POLL_INTERVAL_MS));
+    expect(backend.refresh).toHaveBeenCalledTimes(2);
+    act(() => void vi.advanceTimersByTime(RESEARCH_POLL_INTERVAL_MS));
+    expect(backend.refresh).toHaveBeenCalledTimes(3);
+
+    // …AND THE TIMER IS CLEARED. A poll that outlives its component leaks one interval per window
+    // open/close and keeps reading the disk for a row nobody is looking at.
+    view.unmount();
+    act(() => void vi.advanceTimersByTime(RESEARCH_POLL_INTERVAL_MS * 3));
+    expect(backend.refresh).toHaveBeenCalledTimes(3);
+  });
+});
+
 // ── 6. THE MEMO CONTRACT ───────────────────────────────────────────────────────────────────────
 //
 // `SparkleAgentRow` is `memo`'d with primitive props for a measured reason (sparkle-alrm.3): on a
@@ -385,6 +422,23 @@ describe("Concierge Agents — pinned directly above Improve Sparkle", () => {
 // `showSparkleRow={false}` so the counter's predicate ("pinned, no depthIndent") names exactly one
 // component. The guard case is what makes this test non-vacuous: a counter that never increments
 // would satisfy the first assertion trivially.
+describe("Concierge Agents — one row per window", () => {
+  // TWO SIDEBARS, ONE ROW. AgentSidebar mounts twice when two pairs are open (Workspace.tsx), and a
+  // duplicated pinned row is a founder-reported bug (sparkle-x0pvw) — it was rebuilt one row higher
+  // here: two rows, both polling, a duplicated DOM id whose aria-controls resolved to the wrong
+  // column, and a shared `openTaskId` that opened a task in both (roborev 61699).
+  it("renders exactly once across two sidebars, the way the window mounts them", () => {
+    seedResearch(FIXTURE);
+    render(
+      <>
+        <AgentSidebar project={seed({ a1: "idle" })} showSparkleRow={false} showConciergeRow={false} />
+        <AgentSidebar project={seed({ a1: "idle" })} showSparkleRow={false} />
+      </>,
+    );
+    expect(screen.getAllByText(/Concierge Agents/i)).toHaveLength(1);
+  });
+});
+
 describe("Concierge Agents — memo contract", () => {
   it("does not re-render when an unrelated project agent flips status", () => {
     seedResearch(FIXTURE);

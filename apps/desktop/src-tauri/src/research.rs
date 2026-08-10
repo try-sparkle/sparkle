@@ -279,14 +279,38 @@ fn update_task(
     id: &str,
     mutate: impl FnOnce(&mut ResearchTask),
 ) -> Result<ResearchTask, String> {
+    update_task_where(app_data, id, |t| !t.status.is_terminal(), mutate)
+}
+
+/// [`update_task`] with the write rule supplied, for the ONE caller that has a stronger claim than
+/// "first terminal write wins" — see [`finish`] and [`RECONCILED_ERROR`].
+fn update_task_where(
+    app_data: &Path,
+    id: &str,
+    may_write: impl FnOnce(&ResearchTask) -> bool,
+    mutate: impl FnOnce(&mut ResearchTask),
+) -> Result<ResearchTask, String> {
     let mut task = read_task(app_data, id)
         .ok_or_else(|| format!("research: no task with id {id}"))?;
-    if task.status.is_terminal() {
+    if !may_write(&task) {
         return Ok(task);
     }
     mutate(&mut task);
     write_task(app_data, &task)?;
     Ok(task)
+}
+
+/// The error a reconcile pass stamps on a record it believes a process exit orphaned.
+///
+/// It is a CONST rather than a literal because [`finish`] has to recognise it: a reconcile verdict
+/// is a GUESS about a process that is not here to ask, and the runner coming home with a real
+/// outcome is the ground truth that must be allowed to overwrite it — see [`reconcile_interrupted`].
+const RECONCILED_ERROR: &str = "Interrupted when Sparkle restarted.";
+
+/// Was this record terminated by a reconcile GUESS rather than by something that actually observed
+/// the child? Only such a record may be overwritten by a late `finish`.
+fn is_a_reconcile_guess(t: &ResearchTask) -> bool {
+    t.status == ResearchStatus::Failed && t.error.as_deref() == Some(RECONCILED_ERROR)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
@@ -449,7 +473,7 @@ fn acquire<'a>(pool: &Pool<'a>, max_wait: Duration, cancelled: &AtomicBool) -> R
 ///
 /// `--append-system-prompt`, unlike `claude_oneshot`'s `--system-prompt`: this child needs its
 /// normal tool-use instincts intact to actually read a repo. What it must NOT do is act, and the
-/// last two paragraphs are belt to the `--disallowedTools` braces — a model told only by a flag
+/// last two paragraphs are belt to the `--tools` braces — a model told only by a flag
 /// that it cannot write will spend its budget trying.
 const RESEARCH_PERSONA: &str = "\
 You are a READ-ONLY research assistant answering one question about this repository. \
@@ -471,11 +495,38 @@ you are about to do.";
 /// The allow-list of tools a research child may use. NOTE the deliberate difference from
 /// `claude_oneshot`, which passes `--tools ""` to remove ALL built-in tools: that is right for a
 /// pure-text judge and fatal here — a research pass that cannot read a file cannot research.
-const RESEARCH_ALLOWED_TOOLS: &str = "Read,Grep,Glob,Bash,WebFetch,WebSearch";
-
-/// The deny-list. `--allowedTools` is an allow-list against a still-present tool set (concierge.rs
-/// documents exactly this), so the write tools are named again here rather than assumed absent.
-const RESEARCH_DISALLOWED_TOOLS: &str = "Edit,Write,NotebookEdit";
+/// ══ `--tools` IS THE ONLY FLAG THAT RESTRICTS ANYTHING. MEASURED, NOT ASSUMED. ═════════════════
+///
+/// This module previously passed `--allowedTools` + `--disallowedTools` and documented them as the
+/// safety boundary. They are not. Probed against the installed CLI (Claude Code, 2026-08), headless
+/// `-p`, four runs:
+///
+///   1. `--allowedTools "Read,Grep,Glob"` + `--disallowedTools "Edit,Write,NotebookEdit"` +
+///      `--dangerously-skip-permissions`  → the child ran `echo … > file` via Bash. WROTE.
+///   2. the same WITHOUT `--dangerously-skip-permissions`                → WROTE.
+///   3. the same with `Bash` added to `--disallowedTools`                 → WROTE.
+///   4. `--tools "Read,Grep,Glob"`                                        → "I don't have a shell
+///      execution tool available to me." NOT WRITTEN.
+///
+/// So `--allowedTools` is a PRE-APPROVAL list, not a restriction — an absent tool is not removed,
+/// and `--disallowedTools` did not hold either. `concierge.rs` already records this for MCP tools
+/// ("⚠️ THIS FLAG DOES NOT GATE MCP TOOLS"); it is true of built-ins in `-p` too. Only `--tools`
+/// replaces the set, which is exactly what `claude_oneshot` relies on with `--tools ""`.
+///
+/// ══ AND SCOPED ENTRIES ARE SILENTLY DROPPED ════════════════════════════════════════════════════
+///
+/// A fifth probe passed `--tools "Read,Grep,Glob,Bash(git log:*)"` and the child reported having NO
+/// shell at all — the scoped form is not understood here and the entry vanishes rather than
+/// erroring. So `Bash(git log:*)` is not available as a middle ground: it is a full shell or none,
+/// and a version of this that "scoped" the shell would have shipped a research agent that silently
+/// could not run a single command.
+///
+/// THE FOUNDER CHOSE THE SHELL, with the trade stated plainly: the child needs `git log`/`blame`,
+/// log parsing and measurement, and none of that is reachable without one. So `Bash` is in the set,
+/// unrestricted, and this comment says so rather than implying a scoping that does not exist. The
+/// containment that IS real: the set below is closed (no Edit, no Write, no NotebookEdit), the
+/// child is bounded by wall clock, and every task is visible and cancellable in the sidebar row.
+const RESEARCH_TOOL_SET: &str = "Read,Grep,Glob,Bash,WebFetch,WebSearch";
 
 /// Build the argv for one research child. Pure, and every flag is load-bearing.
 ///
@@ -498,10 +549,11 @@ fn build_research_args(question: &str, model: &str, persona: &str) -> Vec<String
         // APPEND, not replace: the child needs its normal tool-use behaviour.
         "--append-system-prompt".to_string(),
         persona.to_string(),
-        "--allowedTools".to_string(),
-        RESEARCH_ALLOWED_TOOLS.to_string(),
-        "--disallowedTools".to_string(),
-        RESEARCH_DISALLOWED_TOOLS.to_string(),
+        // THE tool boundary — see RESEARCH_TOOL_SET. `--allowedTools`/`--disallowedTools` are
+        // deliberately NOT passed: both were measured inert here, and passing a flag that looks
+        // like a gate but is not is worse than passing nothing.
+        "--tools".to_string(),
+        RESEARCH_TOOL_SET.to_string(),
         // Nobody is at a keyboard to answer a permission prompt, and a prompt would hang the child
         // to its deadline. Safe here only BECAUSE of the two tool flags above.
         "--dangerously-skip-permissions".to_string(),
@@ -989,8 +1041,22 @@ fn run_to_completion(runner: &Runner, id: &str, req: SpawnRequest, ctl: &Control
     }
 }
 
-/// Stamp a terminal state. Goes through `update_task`, so it can never overwrite a state that is
-/// already terminal — a cancel that beat the runner home wins.
+/// Stamp a terminal state. First terminal write wins — a cancel that beat the runner home stands,
+/// and the runner does not relabel it as a failure.
+///
+/// ══ WITH ONE EXCEPTION: A RECONCILE GUESS YIELDS TO AN OBSERVED OUTCOME ═════════════════════════
+///
+/// `reconcile_interrupted` decides a task is orphaned from a PROCESS-LOCAL map, so its verdict is a
+/// guess about work it cannot see. If that guess is wrong — a second app instance reconciling the
+/// first instance's genuinely-running tasks (roborev 61731) — then under a plain first-write-wins
+/// rule the real runner's `finish` is silently DROPPED and a completed 15-minute Opus pass is lost
+/// permanently, with only a `tracing::warn` behind it.
+///
+/// So `finish` may overwrite exactly one kind of terminal record: one carrying [`RECONCILED_ERROR`].
+/// This does not weaken the cancel race — `Cancelled` is not that record, and a real `Failed` from
+/// an observed child is not either. The failure mode it trades INTO is a row that flips back from
+/// "interrupted" to its true outcome, which is a correction the founder wants to see; the one it
+/// trades OUT of is findings that no longer exist anywhere.
 fn finish(
     runner: &Runner,
     id: &str,
@@ -999,7 +1065,8 @@ fn finish(
     error: Option<String>,
 ) {
     let at = (runner.now)();
-    if let Err(e) = update_task(&runner.app_data, id, |t| {
+    let may_write = |t: &ResearchTask| !t.status.is_terminal() || is_a_reconcile_guess(t);
+    if let Err(e) = update_task_where(&runner.app_data, id, may_write, |t| {
         t.status = status;
         t.finished_at = Some(at);
         t.findings = findings;
@@ -1008,6 +1075,61 @@ fn finish(
         // Nothing further to do — the record is the only channel, and it is unreachable.
         tracing::warn!(error = %e, "research: could not record a terminal state");
     }
+}
+
+/// Reconcile records left non-terminal by a process exit. Call once at startup.
+///
+/// ══ WITHOUT THIS, AN INTERRUPTED PASS INFLATES THE ROW FOREVER ══════════════════════════════════
+///
+/// A task that is `queued` or `running` when the app quits — or crashes, or is killed — keeps that
+/// status ON DISK permanently. Its `Control` lived only in the process-local `live_controls()` map,
+/// so no thread will ever call `finish` for it, and `list_tasks` keeps returning it. The TS side
+/// counts `queued|running` for the row's `+[n]`, so every interrupted pass permanently inflates the
+/// badge, and nothing drains it: this module deliberately opts out of `retention::reap_inbox`, and
+/// `research_cancel` is the only other exit — which needs the founder to notice and click.
+///
+/// This is the COMMON case, not an edge one: a deep pass runs up to 15 minutes, so a restart landing
+/// inside one is ordinary.
+///
+/// ══ AND ITS VERDICT IS A GUESS, WHICH IS WHY `finish` MAY OVERTURN IT ═══════════════════════════
+///
+/// `live_controls()` is PROCESS-LOCAL, so "no live control" means "not dispatched by *this*
+/// process" — the same thing as "nothing is working on it" only while this is the sole process
+/// reading that `app_data`. Nothing here enforces that: there is no single-instance guard, and a
+/// second launch or an updater relaunch that overlaps the outgoing process would have this pass
+/// fail the OTHER instance's genuinely-running tasks (roborev 61731).
+///
+/// Proving the owning process dead needs a cross-process lease this module does not have. What it
+/// has instead is a rule that makes being wrong RECOVERABLE rather than destructive: the record is
+/// stamped with [`RECONCILED_ERROR`], and [`finish`] is allowed to overwrite exactly that. So a
+/// wrongly-reconciled task whose runner is still alive gets its real findings when the child comes
+/// home, instead of having them dropped by the first-terminal-write-wins rule and lost for good.
+pub fn reconcile_interrupted(app_data: &Path) -> usize {
+    let live = live_controls();
+    let mut reconciled = 0usize;
+    for task in list_tasks(app_data) {
+        if task.status.is_terminal() {
+            continue;
+        }
+        // FAIL CLOSED on a poisoned map. This branch is the one that protects live work, so an
+        // answer we could not read must mean "leave it alone", never "nothing is working on it".
+        let has_control = live
+            .lock()
+            .map(|m| m.contains_key(&task.id))
+            .unwrap_or(true);
+        if has_control {
+            continue;
+        }
+        let done = update_task(app_data, &task.id, |t| {
+            t.status = ResearchStatus::Failed;
+            t.finished_at = Some(now_ms());
+            t.error = Some(RECONCILED_ERROR.to_string());
+        });
+        if done.is_ok() {
+            reconciled += 1;
+        }
+    }
+    reconciled
 }
 
 /// Cancel a task. Idempotent, and safe for a task that is queued, running, or already finished.
@@ -1107,6 +1229,14 @@ fn resolve_root(project_root: Option<String>) -> Result<PathBuf, String> {
         );
     };
     let p = PathBuf::from(&root);
+    // ABSOLUTE ONLY. A relative path is resolved by the OS against the PROCESS cwd, which is the
+    // very thing the removed fallback got wrong — `is_dir()` would happily accept `src` or `.` and
+    // the child would run somewhere nobody named. The root is produced app-side from the project
+    // store, so a relative one means something upstream is broken; saying so beats researching an
+    // arbitrary directory and reporting the findings as if they were about the project.
+    if !p.is_absolute() {
+        return Err(format!("A project root must be an absolute path, got: {root}"));
+    }
     if !p.is_dir() {
         return Err(format!("That project root is not a directory: {root}"));
     }
@@ -1178,6 +1308,41 @@ mod tests {
     fn fixture_json() -> serde_json::Value {
         let bytes = std::fs::read(FIXTURE).expect("the shared fixture must be readable");
         serde_json::from_slice(&bytes).expect("the shared fixture must be valid JSON")
+    }
+
+    /// SERIALIZES THE TESTS THAT CONSUME REAL POOL PERMITS.
+    ///
+    /// `run_to_completion` always takes from the process-global research pool, whose cap is 2, and
+    /// `cargo test` runs this file's tests IN PARALLEL IN ONE BINARY. Two tests that each latch a
+    /// child therefore saturate the pool, and a third waiting on `wait_until` expires against a
+    /// bound that has nothing to do with what it is testing — a red that names the wrong thing and
+    /// comes and goes with scheduling (roborev 61696). It reproduces: this file passes under
+    /// `--test-threads=1` and fails under the default.
+    ///
+    /// A guard rather than an injected pool because the pool borrows `'static` counters; making it
+    /// injectable means owning them behind an `Arc`, which is a real refactor of production code to
+    /// fix a test-harness problem. Tests that take permits are genuinely not independent, and saying
+    /// so in one place is the honest encoding of that.
+    ///
+    /// ══ WHICH TESTS TAKE IT, AND WHY THAT RULE IS IN SOURCE ═════════════════════════════════════
+    ///
+    /// THE CRITERION IS SYNTACTIC, ON PURPOSE: a test takes this guard if it calls the production
+    /// dispatch entry point (`dispatch_with` / `run_to_completion`) or reads the production pool
+    /// (`research_pool()`). It is deliberately WIDER than "actually takes a permit" — a couple of
+    /// dispatch tests fail before any permit is acquired — because the narrow rule cannot be checked
+    /// mechanically and the wide one can. `every_test_that_touches_the_global_pool_takes_the_guard`
+    /// scans this module's own source and reds when a new test breaks it, which is the whole point:
+    /// the failure this repairs is INTERMITTENT, so a convention policed only by a doc comment is
+    /// policed by nothing (roborev 61741). A test built on a LOCAL `Pool { … }` over its own
+    /// counters touches no shared state and must NOT take it — that is why
+    /// `a_task_cancelled_while_queued_stops_waiting` and its two siblings are bare.
+    ///
+    /// `lock()` is deliberately unwrapped through a poison: a panicking test must not silently
+    /// convert every sibling into a second failure.
+    static POOL_GUARD: Mutex<()> = Mutex::new(());
+
+    fn pool_guard() -> std::sync::MutexGuard<'static, ()> {
+        POOL_GUARD.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn a_task(id: &str) -> ResearchTask {
@@ -1336,6 +1501,7 @@ mod tests {
     /// (reported in the commit message) rather than passing quietly.
     #[test]
     fn dispatch_returns_while_the_child_is_still_running() {
+        let _pool = pool_guard();
         let dir = tempfile::tempdir().unwrap();
         let entered = Arc::new(AtomicBool::new(false));
         let release = Arc::new(AtomicBool::new(false));
@@ -1427,6 +1593,7 @@ mod tests {
     /// that does not exist — and it must not leave a child running for it either.
     #[test]
     fn dispatch_fails_when_the_task_cannot_be_persisted() {
+        let _pool = pool_guard();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(research_dir(dir.path()), b"not a directory").unwrap();
         let entered = Arc::new(AtomicBool::new(false));
@@ -1499,6 +1666,7 @@ mod tests {
 
     #[test]
     fn cancel_stops_a_running_task_and_records_it_as_cancelled_not_failed() {
+        let _pool = pool_guard();
         let dir = tempfile::tempdir().unwrap();
         let entered = Arc::new(AtomicBool::new(false));
         let runner = Arc::new(Runner {
@@ -1671,6 +1839,7 @@ mod tests {
     /// hand-made `Pool` would keep passing if the production one were rewired.
     #[test]
     fn the_research_pool_uses_its_own_counters() {
+        let _pool = pool_guard();
         let pool = research_pool();
         assert!(
             std::ptr::eq(pool.inflight, &RESEARCH_INFLIGHT),
@@ -1728,6 +1897,67 @@ mod tests {
         );
     }
 
+    /// THE POOL GUARD IS ENFORCED IN SOURCE, NOT IN A DOC COMMENT.
+    ///
+    /// The defect `POOL_GUARD` repairs is INTERMITTENT — two permit-holding tests racing a third —
+    /// so its own regression test would otherwise be "it happened to pass," and the membership rule
+    /// would live only in prose. The next test to call `dispatch_with` (a store test, a claim test —
+    /// nothing that looks like a pool test) would reintroduce the saturation silently, and the red
+    /// would land on an unrelated test's `wait_until` bound (roborev 61741).
+    ///
+    /// So the rule is checked mechanically, in the same source-scanning idiom as
+    /// `research_never_borrows_the_claude_oneshot_pool` above. Two things make the scan honest:
+    /// comment lines are stripped, so a doc comment that MENTIONS a pool call cannot pass as one;
+    /// and this test excludes ITSELF by name, because the needles below appear verbatim in its own
+    /// body — the same self-satisfying trap its sibling records having shipped once.
+    #[test]
+    fn every_test_that_touches_the_global_pool_takes_the_guard() {
+        const SELF: &str = "every_test_that_touches_the_global_pool_takes_the_guard";
+        let whole = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/research.rs"))
+            .expect("this module's own source must be readable");
+        let (_, tests_src) = whole
+            .split_once("#[cfg(test)]")
+            .expect("this module must have a #[cfg(test)] block for the scan to be bounded");
+
+        let mut checked = 0usize;
+        for chunk in tests_src.split("#[test]").skip(1) {
+            let name = chunk
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("fn ").and_then(|r| r.split('(').next()))
+                .unwrap_or("<unnamed>");
+            if name == SELF {
+                continue;
+            }
+            // Strip every comment line: a `///` paragraph that names a pool call is prose, not a
+            // call, and counting it would make this scan report tests it cannot really see.
+            let body = chunk
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !["dispatch_with(", "run_to_completion(", "research_pool()"]
+                .iter()
+                .any(|needle| body.contains(needle))
+            {
+                continue;
+            }
+            checked += 1;
+            assert!(
+                body.contains("pool_guard()"),
+                "`{name}` reaches the process-global research pool but does not take \
+                 `pool_guard()`. Two such tests running in parallel saturate the cap-2 pool and a \
+                 THIRD then fails on a bound that has nothing to do with what it tests — a red that \
+                 names the wrong test and comes and goes with scheduling."
+            );
+        }
+        // …and the scan must actually have found them. A rename that made every needle miss would
+        // otherwise leave this test green while checking nothing at all.
+        assert!(
+            checked >= 5,
+            "the scan must reach the pool-touching tests; it found only {checked}"
+        );
+    }
+
     /// The waiting room absorbs a burst and only refuses at its FAR EDGE — the honest engineering
     /// of "no cap". Driven over the real `acquire` with a tiny pool so the far edge is reachable.
     #[test]
@@ -1775,6 +2005,9 @@ mod tests {
     /// then run a question the founder already killed.
     #[test]
     fn a_task_cancelled_while_queued_stops_waiting() {
+        // NO `pool_guard()`: this drives `acquire` over a LOCAL pool and never touches
+        // `RESEARCH_INFLIGHT`/`RESEARCH_WAITING`, so it is independent of every other test. Taking
+        // the guard here would teach the next reader the wrong rule — see POOL_GUARD's own doc.
         let inflight = AtomicUsize::new(1);
         let waiting = AtomicUsize::new(0);
         let pool = Pool { inflight: &inflight, waiting: &waiting, cap: 1, room: 4 };
@@ -1807,15 +2040,60 @@ mod tests {
     /// The tool flags are the whole safety story, and `--tools ""` — which `claude_oneshot` uses —
     /// would be FATAL here: it removes ALL built-in tools, so a research pass could not read a file.
     #[test]
-    fn the_child_can_read_but_cannot_write() {
+    fn the_tool_set_is_closed_and_uses_the_flag_that_actually_restricts() {
         let args = build_research_args("q", "m", "p");
         let at = |flag: &str| {
             args.iter().position(|a| a == flag).map(|i| args[i + 1].clone())
         };
-        assert_eq!(at("--allowedTools").as_deref(), Some("Read,Grep,Glob,Bash,WebFetch,WebSearch"));
-        assert_eq!(at("--disallowedTools").as_deref(), Some("Edit,Write,NotebookEdit"));
+        assert_eq!(at("--tools").as_deref(), Some(RESEARCH_TOOL_SET));
+
+        // THE FLAGS THAT LOOK LIKE A GATE AND ARE NOT. Both were measured inert in headless `-p`
+        // (see RESEARCH_TOOL_SET for the five probes): bash ran even with `Bash` explicitly in
+        // `--disallowedTools`. Passing them would restrict nothing while reading, to the next
+        // person, as the safety boundary — which is exactly how the previous version of this file
+        // came to document a guarantee it did not provide.
+        for inert in ["--allowedTools", "--disallowedTools"] {
+            assert!(
+                !args.iter().any(|a| a == inert),
+                "{inert} does not restrict anything in `-p` — passing it only misleads"
+            );
+        }
+
+        // ══ THE ASSERTION THAT CARRIES THE NAME OF THIS TEST ════════════════════════════════════
+        //
+        // The previous version compared the two flags to string literals and stopped. That passed
+        // while `Bash` was granted UNSCOPED next to `--dangerously-skip-permissions` in the
+        // founder's live repo — so the test asserted the flags were "what they are", and its name
+        // ("can read but cannot write") stated a guarantee the argv did not provide. A vacuous test
+        // for the single property that matters most (roborev 61696).
+        //
+        // A bare `Bash` token is the whole risk: with it, `--disallowedTools Edit,Write` is
+        // decorative (`bash -c 'echo > file'`, `git push`, `rm` all route around it). Every shell
+        // entry must therefore be scoped as `Bash(cmd:*)`.
+        // THE SET IS CLOSED, and these two absences are the containment that is actually real.
+        // A scoped `Bash(git log:*)` is NOT available as a middle ground — `--tools` drops the
+        // scoped form silently, leaving no shell at all — so the honest guarantee is "no write
+        // tools", not "a restricted shell".
+        let set = at("--tools").expect("--tools must be passed");
+        for forbidden in ["Edit", "Write", "NotebookEdit"] {
+            assert!(
+                !set.split(',').any(|t| t == forbidden),
+                "{forbidden} must not be in the research tool set"
+            );
+        }
         assert!(
-            !args.iter().any(|a| a == "--tools"),
+            set.split(',').any(|t| t == "Bash"),
+            "the shell is what makes git archaeology possible, and it cannot be scoped here"
+        );
+        assert!(
+            !set.contains("Bash("),
+            "a scoped Bash entry is silently DROPPED by --tools, leaving the child with no shell"
+        );
+        // `--tools` is passed, and its VALUE is what matters: an empty string would remove every
+        // built-in tool (what `claude_oneshot` wants for a pure-text judge, and fatal for a runner
+        // whose job is to read).
+        assert!(
+            !set.is_empty(),
             "`--tools \"\"` removes ALL built-in tools — fatal for a runner whose job is to read"
         );
         // APPEND, not replace: the child needs its normal tool-use behaviour intact.
@@ -1886,6 +2164,7 @@ mod tests {
     /// `done` with the error prose as its answer.
     #[test]
     fn a_cli_error_is_filed_as_a_failure_not_as_findings() {
+        let _pool = pool_guard();
         struct ErrorSpawner;
         impl ResearchSpawner for ErrorSpawner {
             fn kind(&self) -> &'static str {
@@ -1954,6 +2233,7 @@ mod tests {
 
     #[test]
     fn a_dispatch_with_no_question_is_refused() {
+        let _pool = pool_guard();
         let dir = tempfile::tempdir().unwrap();
         let runner = Arc::new(Runner {
             app_data: dir.path().to_path_buf(),
@@ -1986,5 +2266,137 @@ mod tests {
         // And an ABSENT root is refused too — this was the common case in production, because the
         // TS caller was not sending one at all.
         assert!(resolve_root(None).is_err(), "a missing root must be an error, not the cwd");
+
+        // A RELATIVE path is refused rather than resolved against the process cwd — the same
+        // failure the removed fallback had, arriving through a path that `is_dir()` accepts.
+        assert!(
+            resolve_root(Some("src".to_string())).is_err(),
+            "a relative root must be refused, not resolved against the process cwd"
+        );
+        assert!(resolve_root(Some(".".to_string())).is_err());
     }
+    /// A record left `running` by a process exit must be TERMINAL after a reconcile pass — otherwise
+    /// the sidebar's `+[n]` counts it forever and nothing ever drains it.
+    #[test]
+    fn a_task_interrupted_by_a_restart_is_reconciled_to_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = a_task("rsh_interrupted");
+        t.status = ResearchStatus::Running;
+        t.started_at = Some(1);
+        t.finished_at = None;
+        write_task(dir.path(), &t).expect("seed");
+
+        // Nothing holds a control for it — this is exactly the post-restart state.
+        let n = reconcile_interrupted(dir.path());
+        assert_eq!(n, 1, "the interrupted task must be reconciled");
+
+        let after = read_task(dir.path(), "rsh_interrupted").expect("still on disk");
+        assert!(after.status.is_terminal(), "it must not stay live forever");
+        assert_eq!(after.status, ResearchStatus::Failed);
+        assert!(after.finished_at.is_some(), "a terminal task has a finish time");
+        assert!(after.error.unwrap().contains("restarted"));
+    }
+
+    /// The `queued` half of the contract — a task that never got a permit before the exit.
+    #[test]
+    fn a_task_still_queued_at_the_exit_is_reconciled_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = a_task("rsh_queued");
+        t.status = ResearchStatus::Queued;
+        t.started_at = None;
+        write_task(dir.path(), &t).expect("seed");
+
+        assert_eq!(reconcile_interrupted(dir.path()), 1, "`queued` is non-terminal too");
+        let after = read_task(dir.path(), "rsh_queued").expect("still on disk");
+        assert_eq!(after.status, ResearchStatus::Failed);
+    }
+
+    /// THE BRANCH THAT PROTECTS LIVE WORK. A record whose `Control` is in `live_controls()` is being
+    /// worked on RIGHT NOW, and reconciling it would stamp a terminal state over a running pass.
+    ///
+    /// Nothing exercised this before (roborev 61731): both reconcile tests reached the no-control
+    /// path, so the skip could be deleted or inverted with the suite green — and `reconcile_interrupted`
+    /// is `pub`, with "call once at startup" stated only in a doc comment. The first caller to run it
+    /// mid-session would have failed every in-flight task.
+    #[test]
+    fn a_task_with_a_live_control_is_never_reconciled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = a_task("rsh_live");
+        t.status = ResearchStatus::Running;
+        t.started_at = Some(1);
+        write_task(dir.path(), &t).expect("seed");
+
+        live_controls().lock().unwrap().insert("rsh_live".to_string(), Arc::new(Control::new()));
+        let n = reconcile_interrupted(dir.path());
+        // Remove BEFORE asserting, so a failure cannot leak this entry into a sibling test.
+        live_controls().lock().unwrap().remove("rsh_live");
+
+        assert_eq!(n, 0, "a task something is working on must not be reconciled");
+        let after = read_task(dir.path(), "rsh_live").expect("still on disk");
+        assert_eq!(after.status, ResearchStatus::Running, "it must still be live");
+        assert_eq!(after.error, None);
+    }
+
+    /// A RECONCILE VERDICT IS A GUESS, AND AN OBSERVED OUTCOME OVERTURNS IT.
+    ///
+    /// The liveness test is process-local, so a second app instance can reconcile the first's
+    /// genuinely-running tasks. Under a plain first-terminal-write-wins rule the real runner's
+    /// `finish` was then silently dropped and a completed 15-minute pass was lost permanently
+    /// (roborev 61731). The findings must land instead.
+    #[test]
+    fn a_late_finish_overturns_a_reconcile_guess_but_never_a_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = Runner {
+            app_data: dir.path().to_path_buf(),
+            spawner: Arc::new(CliSpawner),
+            now: fixed_clock(500),
+        };
+
+        // Reconciled by a pass that could not see the runner…
+        let mut guessed = a_task("rsh_guessed");
+        guessed.status = ResearchStatus::Running;
+        write_task(dir.path(), &guessed).expect("seed");
+        assert_eq!(reconcile_interrupted(dir.path()), 1);
+        assert_eq!(
+            read_task(dir.path(), "rsh_guessed").unwrap().error.as_deref(),
+            Some(RECONCILED_ERROR),
+            "the guess must be stamped with the sentinel `finish` recognises"
+        );
+
+        // …and the child comes home with the real answer.
+        finish(&runner, "rsh_guessed", ResearchStatus::Done, Some("the answer".into()), None);
+        let settled = read_task(dir.path(), "rsh_guessed").unwrap();
+        assert_eq!(settled.status, ResearchStatus::Done, "the observed outcome must win");
+        assert_eq!(settled.findings.as_deref(), Some("the answer"));
+        assert_eq!(settled.error, None, "and the guess's error must be cleared");
+
+        // THE BOUNDARY. A cancellation is NOT a guess — something observed it, the founder pressed
+        // the button — so the same late `finish` must leave it exactly as it is.
+        let mut killed = a_task("rsh_killed");
+        killed.status = ResearchStatus::Cancelled;
+        killed.finished_at = Some(9);
+        write_task(dir.path(), &killed).expect("seed");
+        finish(&runner, "rsh_killed", ResearchStatus::Done, Some("too late".into()), None);
+        let after = read_task(dir.path(), "rsh_killed").unwrap();
+        assert_eq!(after.status, ResearchStatus::Cancelled, "a cancel still wins the race");
+        assert_eq!(after.findings, None);
+        assert_eq!(after.finished_at, Some(9), "…and is not re-stamped");
+    }
+
+    /// …and a task that is ALREADY terminal is left alone, so a reconcile pass cannot rewrite the
+    /// findings of work that really completed.
+    #[test]
+    fn reconciling_does_not_touch_a_task_that_already_finished() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = a_task("rsh_done");
+        t.status = ResearchStatus::Done;
+        t.findings = Some("the answer".to_string());
+        write_task(dir.path(), &t).expect("seed");
+
+        assert_eq!(reconcile_interrupted(dir.path()), 0);
+        let after = read_task(dir.path(), "rsh_done").expect("still on disk");
+        assert_eq!(after.status, ResearchStatus::Done);
+        assert_eq!(after.findings.as_deref(), Some("the answer"));
+    }
+
 }
