@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync, realpathSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 // Import the pure predicate straight from the shipped guard script.
-import { isInside, blocksKeychainCommand, isAllowlistedNoteDir, isAllowlistedScratchpad, callerWorktreeRoot } from "../../src-tauri/resources/worktree-guard.mjs";
+import { isInside, blocksKeychainCommand, isAllowlistedNoteDir, isAllowlistedScratchpad, callerWorktreeRoot, outsideWorktreeMessage } from "../../src-tauri/resources/worktree-guard.mjs";
 
 describe("isInside (lexical, no filesystem)", () => {
   const root = "/wt/proj/agent";
@@ -330,5 +330,46 @@ describe("callerWorktreeRoot (worktree-relative)", () => {
     expect(isInside(callerRoot, `${installRoot}/src/App.tsx`)).toBe(false);
     // A sibling worktree — denied.
     expect(isInside(callerRoot, "/wt/pool/agent-99/src/App.tsx")).toBe(false);
+  });
+});
+
+// The containment refusal's TEXT. The block itself was never in doubt; what the message says is, and
+// a refusal message is an instruction the reader will follow. The old text stated the rule ("Edit only
+// files inside your worktree") and named no destination, so an agent redirected into another repo
+// mid-task improvised: it committed the deliverable into whatever repo was writable, which had no
+// remote and so could not open a PR (bead sparkle-itohi, the inbox's highest-recurrence finding).
+//
+// Every assertion below is on a phrase the OLD one-line message did not contain, so this suite reds if
+// the message reverts. Asserting merely that the target and root appear would be vacuous — both were
+// already in the old string.
+describe("outsideWorktreeMessage (the refusal names a sanctioned hand-off)", () => {
+  const msg = () => outsideWorktreeMessage("/other/repo/deliverable.md", "/wt/pool/agent-7");
+
+  it("still says what was blocked and where the caller is confined", () => {
+    expect(msg()).toContain("/other/repo/deliverable.md");
+    expect(msg()).toContain("/wt/pool/agent-7");
+    expect(msg().startsWith("Blocked:")).toBe(true);
+  });
+
+  it("offers the session scratchpad as the staging area, and asking for a worktree as the PR path", () => {
+    expect(msg()).toContain("scratchpad");
+    expect(msg()).toMatch(/ask for a worktree/i);
+    expect(msg()).toMatch(/open a PR/i);
+  });
+
+  it("names the improvisation it exists to prevent — committing into another repo", () => {
+    expect(msg()).toMatch(/do NOT commit it into a repo it does not belong to/i);
+    expect(msg()).toMatch(/no remote/i);
+  });
+
+  // THE cross-check, and the reason this is more than a copy edit: a remedy has to be SAFE under the
+  // conditions that triggered the refusal, so the path shape the message tells the reader to use must
+  // be one this same guard actually admits. If the carve-out is ever tightened out from under the
+  // wording, this fails rather than leaving the message pointing at a path the guard now blocks.
+  it("recommends a path shape the guard's own scratchpad carve-out accepts", () => {
+    const recommended = "/tmp/claude-<uid>/<session>/<uuid>/scratchpad/";
+    expect(msg()).toContain(recommended);
+    // The same shape with the placeholders filled in is allow-listed.
+    expect(isAllowlistedScratchpad("/tmp/claude-501/some-session/some-uuid/scratchpad/deliverable.md")).toBe(true);
   });
 });

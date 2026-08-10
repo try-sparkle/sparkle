@@ -30,6 +30,10 @@ declare module "*/worktree-guard.mjs" {
   // which keeps sibling agent worktrees (also created under /private/tmp/claude-*) blocked. uid-scoped,
   // not session-scoped (see the .mjs docstring).
   export function isAllowlistedScratchpad(target: unknown): boolean;
+  // The stderr text for a containment refusal. Names the sanctioned hand-off (session scratchpad, or
+  // a worktree in the target repo) instead of stating the rule and stopping — an agent whose work was
+  // redirected into another repo mid-task otherwise improvises something worse (sparkle-itohi).
+  export function outsideWorktreeMessage(target: string, callerRoot: string): string;
   // Worktree-relative containment helper: the worktree the CALLER is actually operating in.
   // Derives the caller's worktree root from the tool call's `cwd` (via `resolveToplevel`, default
   // `git rev-parse --show-toplevel`), falling back to `installRoot` when cwd isn't in a git work tree.

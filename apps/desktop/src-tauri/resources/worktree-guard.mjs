@@ -702,6 +702,44 @@ function secretStagingMessage(verdict) {
   );
 }
 
+/** The stderr text for a containment refusal — the target resolves outside the caller's worktree.
+ *
+ *  WHY THIS IS NOT A ONE-LINER ANY MORE. The refusal itself is correct and stays: an agent must not
+ *  reach across into another checkout. But the message used to end at "Edit only files inside your
+ *  worktree", which states the rule and names no way to finish the job — and an agent whose work was
+ *  redirected mid-task into a DIFFERENT repo still has a deliverable in hand. With no sanctioned
+ *  destination offered, the improvised ones are all worse than the refusal: committing the file into
+ *  whatever repo happens to be writable (observed — the deliverable landed in the wrong repo, with a
+ *  follow-up chore filed to move it by hand, and that repo had no remote so no PR could carry it out),
+ *  or dropping the work entirely. That is bead `sparkle-itohi`, the highest-recurrence finding in the
+ *  agent-feedback inbox.
+ *
+ *  So this names the hand-off that ALREADY EXISTS in this same file: the session scratchpad is
+ *  allow-listed a few lines above (see {@link isAllowlistedScratchpad}), lives outside every repo, and
+ *  is exactly the staging area the finding asks for. The guard was already willing to accept the
+ *  write; nothing but the wording kept agents from finding it.
+ *
+ *  Per the repo's own rule that a remedy string is an instruction the reader WILL follow, each option
+ *  has to be safe under the conditions that triggered the refusal — so neither of them writes to the
+ *  other repo. Option 1 stages the bytes somewhere the human can apply them from; option 2 asks for a
+ *  worktree in the repo the work actually belongs to. Committing into a repo the work does not belong
+ *  to is called out explicitly because it is the improvisation that was actually observed, and it
+ *  looks locally reasonable at the moment an agent reaches for it. */
+export function outsideWorktreeMessage(target, callerRoot) {
+  return (
+    `Blocked: ${target} is outside this agent's worktree (${callerRoot}).\n` +
+    "Edit only files inside your worktree. If the file you are producing genuinely belongs somewhere\n" +
+    "else, hand it off rather than reaching across:\n" +
+    "  1. Stage it for the human — write it into your session scratchpad\n" +
+    "     (/tmp/claude-<uid>/<session>/<uuid>/scratchpad/, which this guard allows) and say in chat\n" +
+    "     where you put it and where it should go. Nothing is lost and nobody has to guess.\n" +
+    "  2. Ask for a worktree in the repo it belongs to, and do the work there — that is the only path\n" +
+    "     that can open a PR from that repo.\n" +
+    "Do NOT commit it into a repo it does not belong to just because that repo is writable: it buries\n" +
+    "the deliverable somewhere nobody is reviewing, and a checkout with no remote cannot ship it at all.\n"
+  );
+}
+
 /** True iff `target` resolves into a Claude Code SESSION SCRATCHPAD directory — the harness-sanctioned
  *  location the Claude Code system prompt designates for ALL temporary files (helper scripts, PR-body
  *  text, intermediate data). Its shape is `/private/tmp/claude-<uid>/<session>/<uuid>/scratchpad/...`
@@ -926,10 +964,7 @@ async function main() {
     allowedScratchpad = false;
   }
   if (allowedScratchpad) process.exit(0);
-  process.stderr.write(
-    `Blocked: ${target} is outside this agent's worktree (${callerRoot}). ` +
-      `Edit only files inside your worktree.\n`,
-  );
+  process.stderr.write(outsideWorktreeMessage(target, callerRoot));
   process.exit(2); // exit code 2 → Claude Code blocks the tool call
 }
 
