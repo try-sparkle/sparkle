@@ -466,7 +466,13 @@ fn validate_spawn_inner(
             _ => cmd_path.starts_with(managed_base),
         };
         if !under_managed {
-            return Err("pty_spawn: command is not an allowed binary".into());
+            // NAME THE BINARY. The refusal reaches the user verbatim (Terminal's spawn-failed
+            // overlay renders this string), and "not an allowed binary" without saying WHICH one
+            // is indistinguishable from every other launch failure. See the containment refusal
+            // below for the full reasoning.
+            return Err(format!(
+                "pty_spawn: command is not an allowed binary: {command}"
+            ));
         }
     }
     // Null cwd (the pre-worktree login flows): fall back to the managed app-data dir rather than
@@ -484,9 +490,23 @@ fn validate_spawn_inner(
     let base = worktrees_base
         .canonicalize()
         .map_err(|e| format!("pty_spawn: worktrees dir unavailable: {e}"))?;
-    let real = std::fs::canonicalize(cwd).map_err(|e| format!("pty_spawn: invalid cwd: {e}"))?;
+    let real = std::fs::canonicalize(cwd)
+        .map_err(|e| format!("pty_spawn: invalid cwd: {e}: {cwd}"))?;
     if !real.starts_with(&base) {
-        return Err("pty_spawn: cwd is outside the managed worktrees directory".into());
+        // NAME BOTH SIDES OF THE COMPARE. This refusal is 100% reproducible for a given cwd — a
+        // retry can never clear it — and it is rendered to the user verbatim by Terminal's
+        // spawn-failed overlay, so it is the ONLY thing standing between "the button is broken"
+        // and a diagnosis. Without the two paths it says a boundary was crossed but not by what,
+        // which is what made sparkle-mahbf (an `<app_data>/accounts/<id>` cwd, a SIBLING of
+        // `worktrees`) read as a mystery rather than an obvious one-line mismatch.
+        //
+        // The leading phrase is unchanged and load-bearing: `logger.ts` (BENIGN_REJECTION_SIGNATURES)
+        // and `terminalOverlay.ts` substring-match it, so detail may only ever be APPENDED.
+        return Err(format!(
+            "pty_spawn: cwd is outside the managed worktrees directory: {} is not under {}",
+            real.display(),
+            base.display()
+        ));
     }
     Ok(real)
 }
@@ -1630,6 +1650,66 @@ mod tests {
         assert_eq!(
             validate_spawn_inner(&base, &managed, "/bin/zsh", None).unwrap(),
             managed.canonicalize().unwrap()
+        );
+    }
+
+    /// A REFUSAL MUST NAME WHAT IT REFUSED — the second half of sparkle-s7wu6.
+    ///
+    /// PR #1635 made Terminal render this string instead of dropping it into `console.debug`, so
+    /// it is now the user-visible explanation for a permanently doomed spawn. A message that says
+    /// a boundary was crossed without naming either side leaves the reader exactly where the
+    /// swallowed log did. These assert the offending VALUE is present, not merely the phrase —
+    /// each one is red against the pre-change messages.
+    #[test]
+    fn containment_refusal_names_the_cwd_and_the_base() {
+        let base = worktrees_base();
+        let managed = managed_of(&base);
+        let account_dir = managed.join("accounts").join("602064ad688be368");
+        std::fs::create_dir_all(&account_dir).unwrap();
+        let err = validate_spawn_inner(&base, &managed, "/bin/zsh", account_dir.to_str())
+            .expect_err("an account config dir must not be accepted as a spawn cwd");
+        // The phrase every substring-matching frontend consumer keys on survives ahead of the detail.
+        assert!(
+            err.contains("outside the managed worktrees directory"),
+            "the matched prefix must not move: {err}"
+        );
+        let real_account = account_dir.canonicalize().unwrap();
+        assert!(
+            err.contains(&real_account.display().to_string()),
+            "the refusal must name the rejected cwd: {err}"
+        );
+        assert!(
+            err.contains(&base.canonicalize().unwrap().display().to_string()),
+            "the refusal must name the boundary it compared against: {err}"
+        );
+    }
+
+    #[test]
+    fn unresolvable_cwd_refusal_names_the_path() {
+        let base = worktrees_base();
+        let managed = managed_of(&base);
+        // A worktree that was pruned out from under a restart — the common runtime shape of this
+        // failure, and the one whose bare "No such file or directory (os error 2)" says nothing.
+        let gone = base.join("proj").join("deleted-agent");
+        let err = validate_spawn_inner(&base, &managed, "/bin/zsh", gone.to_str())
+            .expect_err("a nonexistent cwd must be refused");
+        assert!(err.contains("invalid cwd"), "expected the canonicalize refusal, got: {err}");
+        assert!(
+            err.contains(&gone.display().to_string()),
+            "the refusal must name the path that could not be resolved: {err}"
+        );
+    }
+
+    #[test]
+    fn binary_refusal_names_the_command() {
+        let base = worktrees_base();
+        let managed = managed_of(&base);
+        let cwd = base.join("proj").join("agent");
+        let err = validate_spawn_inner(&base, &managed, "/usr/bin/osascript", cwd.to_str())
+            .expect_err("a disallowed binary must be refused");
+        assert!(
+            err.contains("/usr/bin/osascript"),
+            "the refusal must name the binary it rejected: {err}"
         );
     }
 
