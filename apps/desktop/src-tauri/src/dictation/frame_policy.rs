@@ -164,8 +164,43 @@ pub(crate) fn frame_on_device_speech(cloud_active: bool, vad_detected: bool) -> 
 /// When the user tabs to another app every Sparkle window blurs, `focused` goes false, and we
 /// release the OS mic — so Sparkle never captures audio while you're looking at something else.
 /// Pure so the arm×focus matrix is unit-testable without an audio device or real windows.
-pub(crate) fn capture_should_be_live(armed: bool, focused: bool) -> bool {
-    armed && focused
+/// `hold_recent` is the THIRD condition, and it is what makes a short push-to-talk hold work at all.
+///
+/// ── THE MEASURED DEFECT (bead sparkle-0pto3) ────────────────────────────────────────────────────
+/// Push to talk RESTS at `setOff()` — `MicButton`'s own comment says so — which is
+/// `setEnabled(false)`, i.e. `armed = false`. So every release tore the CoreAudio capture down and
+/// every keydown built a fresh one. `Capture::start` measures **160-990 ms** (the type doc on
+/// `PREROLL_SAMPLES` records ~375-440 ms warm and ~1.17 s cold), against the founder's measured
+/// holds of **76-567 ms** on 2026-08-09. The microphone was therefore still opening when he let go:
+/// five consecutive holds at 22:55-22:56 sampled nothing at all, and he was told nothing.
+///
+/// No buffer can fix that, and one already tried: `PreRoll` exists to make leading-word loss
+/// "structurally impossible", but its own doc states the precondition — *"This only helps if the
+/// stream is open while at rest"* — and on this path the stream was never open at rest, so the ring
+/// was empty every time it was needed.
+///
+/// ── WHY THIS MIRRORS `af0c91a11` RATHER THAN INVENTING A POLICY ─────────────────────────────────
+/// That commit found the SAME defect one layer over and fixed only that layer: *"A release destroyed
+/// the socket. Push to talk RESTS at setOff(), so a release lands in stop_dictation"* — so it made
+/// the relay socket survive the release (warm window 8 s → 55 s). It warmed the socket and left the
+/// microphone cold, which is exactly why shipping it did not fix the complaint. This is the missing
+/// half: the capture gets the same treatment as the socket, for the same reason.
+///
+/// ── WHAT IS *NOT* RELAXED, WHICH IS THE PRIVACY PROPERTY ────────────────────────────────────────
+/// `focused` still gates everything, and it is deliberately the OUTER term: tab away and every
+/// Sparkle window blurs, so the OS mic is released whatever the warm window says. The guarantee
+/// "Sparkle never captures while you are looking at something else" is unchanged. What a warm
+/// capture adds is audio at rest *while Sparkle is focused*, and the only place that audio can go is
+/// `PreRoll`'s ring — RAM only, `PREROLL_SAMPLES` (2 s) and no more, never persisted, never
+/// transmitted until routing goes true. That is the same posture as the existing passive/wake-word
+/// mode (`MicButton::setMuted`, "on, waiting for the wake word"), which already holds the mic open.
+///
+/// The founder REVERSED himself on this axis once (`sparkle-u81cz`: "IT SHOULD NOT BE CAPTURING ANY
+/// WAVEFORM"), then re-accepted it for `PreRoll` on 2026-08-06 — so the caller keeps it behind a
+/// config flag rather than assuming. Passing `hold_recent: false` restores the old two-term
+/// behaviour exactly.
+pub(crate) fn capture_should_be_live(armed: bool, focused: bool, hold_recent: bool) -> bool {
+    focused && (armed || hold_recent)
 }
 
 /// The capture transition to make given the desired vs. actual state — factored out of the reconcile

@@ -349,7 +349,7 @@ pub(crate) fn note_build_failed(sess: &mut DictationSession) -> bool {
     // can escalate/retry.
     sess.build_started_at = None;
     let wants_capture = discard_needs_reissue(
-        capture_should_be_live(sess.armed, sess.focused),
+        capture_should_be_live(sess.armed, sess.focused, sess.capture_warm_now()),
         sess.capture.is_some(),
     );
     if !wants_capture || sess.build_failure_reissued {
@@ -1315,8 +1315,18 @@ pub struct DictationSession {
     armed: bool,
     /// Whether at least one Sparkle window is currently the focused/active OS window. Updated from
     /// the window-focus event (lib.rs) and polled at arm time. The cpal capture is live only while
-    /// `armed && focused` — so we never capture audio while the user is looking at another app.
+    /// focused — so we never capture audio while the user is looking at another app.
     focused: bool,
+    /// KEEP THE MICROPHONE WARM UNTIL THIS INSTANT, so the next push-to-talk hold does not pay
+    /// `Capture::start` (160-990 ms) inside a hold that may only last 76 ms.
+    ///
+    /// Stamped by `stop_dictation` on the disarm, read by `capture_should_be_live`'s `hold_recent`
+    /// term. `None` (or elapsed) = the old two-term behaviour, mic released on release.
+    ///
+    /// This is the CAPTURE half of what `af0c91a11` did for the relay socket — see
+    /// `frame_policy::capture_should_be_live` for the measurement and the privacy reasoning. `focused`
+    /// still gates it, so tabbing away releases the OS mic regardless of this stamp.
+    warm_capture_until: Option<std::time::Instant>,
     /// Monotonic counter bumped by every `stop_dictation`. `start_dictation` samples it BEFORE the
     /// slow, lock-free model load (~482MB on a fresh install) and re-checks it after acquiring the
     /// lock: if a stop landed during the load (the user muted mid-download), the sampled value is
@@ -1630,7 +1640,7 @@ impl DictationState {
         // landing inside the ~78 ms build window is one of the two ways the double-build was reached.
         let build_in_flight = build_suppresses_watch(sess.build_started_at.map(|t| t.elapsed()));
         let plan = plan_capture_for(
-            capture_should_be_live(sess.armed, sess.focused),
+            capture_should_be_live(sess.armed, sess.focused, sess.capture_warm_now()),
             sess.capture.is_some(),
             build_in_flight,
         );
@@ -1837,7 +1847,7 @@ impl DictationState {
         // "is this build still believable" rather than letting a second one drift away from it.
         let build_in_flight = build_suppresses_watch(sess.build_started_at.map(|t| t.elapsed()));
         let plan = plan_capture_for(
-            capture_should_be_live(sess.armed, sess.focused),
+            capture_should_be_live(sess.armed, sess.focused, sess.capture_warm_now()),
             sess.capture.is_some(),
             build_in_flight,
         );
@@ -1921,7 +1931,7 @@ impl DictationState {
                 .unwrap_or(0);
             sess.build_started_at = None;
             fate = classify_capture_fate(
-                capture_should_be_live(sess.armed, sess.focused),
+                capture_should_be_live(sess.armed, sess.focused, sess.capture_warm_now()),
                 sess.capture.is_none(),
                 sess.transcriber.as_ref().map(|t| Arc::ptr_eq(t, built_for)).unwrap_or(false),
             );
@@ -2022,7 +2032,7 @@ impl DictationState {
             // build it was suppressed behind.
             let sess = self.0.lock().unwrap_or_else(|p| p.into_inner());
             reissue = discard_needs_reissue(
-                capture_should_be_live(sess.armed, sess.focused),
+                capture_should_be_live(sess.armed, sess.focused, sess.capture_warm_now()),
                 sess.capture.is_some(),
             );
         }
@@ -2374,6 +2384,17 @@ use watchdog::{
 
 
 impl DictationSession {
+    /// Is the post-release warm window still open? The `hold_recent` term of
+    /// `capture_should_be_live` — see that function for why the capture is kept warm at all.
+    ///
+    /// `checked_duration_since` and NOT `saturating_duration_since` (memory: a saturating read
+    /// returns 0 on a backwards clock, so a future-stamped entry HITS and gets its life extended).
+    /// `Instant` is monotonic so the backwards case should be impossible, but this is a microphone
+    /// staying open — the failure direction to avoid is "warm forever", so read it the strict way.
+    fn capture_warm_now(&self) -> bool {
+        self.warm_capture_until.is_some_and(|until| until > std::time::Instant::now())
+    }
+
     /// Clear every per-capture audio-fault latch.
     ///
     /// BOTH latches, not just the report one (roborev 55277). Leaving `audio_reacquired` set would
@@ -2464,7 +2485,7 @@ impl DictationState {
         // Sample under the lock, then RELEASE before doing anything that emits or touches audio.
         let sampled = {
             let mut sess = self.0.lock().unwrap_or_else(|p| p.into_inner());
-            let should_be_live = capture_should_be_live(sess.armed, sess.focused);
+            let should_be_live = capture_should_be_live(sess.armed, sess.focused, sess.capture_warm_now());
             match sess.capture.as_ref() {
                 Some(c) => {
                     let health = assess_capture_health(
@@ -2687,7 +2708,7 @@ impl DictationState {
                 // that can fix it — plugging the microphone back in after a failed build must
                 // recover on its own rather than waiting for a user toggle (roborev 55286).
                 None => {
-                    let should_be_live = capture_should_be_live(sess.armed, sess.focused);
+                    let should_be_live = capture_should_be_live(sess.armed, sess.focused, sess.capture_warm_now());
                     drop(sess);
                     if should_be_live {
                         self.reacquire_capture(app);

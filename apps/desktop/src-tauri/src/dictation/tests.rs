@@ -1905,10 +1905,48 @@
     fn capture_is_live_only_when_armed_and_focused() {
         // The mic captures only when the user hasn't muted (armed) AND a Sparkle window is the
         // active OS window (focused). Tabbing to another app drops `focused` and releases the mic.
-        assert!(capture_should_be_live(true, true), "armed + focused → live");
-        assert!(!capture_should_be_live(true, false), "armed but unfocused → released");
-        assert!(!capture_should_be_live(false, true), "muted, even if focused → off");
-        assert!(!capture_should_be_live(false, false), "muted + unfocused → off");
+        // `hold_recent: false` throughout — this pins the behaviour with the warm window CLOSED, so
+        // the pre-existing matrix is unchanged by the third term (bead sparkle-0pto3).
+        assert!(capture_should_be_live(true, true, false), "armed + focused → live");
+        assert!(!capture_should_be_live(true, false, false), "armed but unfocused → released");
+        assert!(!capture_should_be_live(false, true, false), "muted, even if focused → off");
+        assert!(!capture_should_be_live(false, false, false), "muted + unfocused → off");
+    }
+
+    #[test]
+    fn a_recently_released_hold_keeps_the_microphone_warm_while_sparkle_is_focused() {
+        // ── WHY THE THIRD TERM EXISTS (bead sparkle-0pto3) ────────────────────────────────────────
+        // Push to talk RESTS at `setOff()` (`MicButton`'s own comment), i.e. `armed = false`, so
+        // every release tore the CoreAudio capture down and every keydown rebuilt it. `Capture::start`
+        // measures 160-990 ms against the founder's measured holds of 76-567 ms on 2026-08-09 — the
+        // mic was still opening when he let go, five times in a row, and nothing was sampled.
+        //
+        // Between two holds the state is exactly (armed=false, focused=true). That row USED to be
+        // "off", which is the defect; with the warm window open it must stay live.
+        assert!(
+            capture_should_be_live(false, true, true),
+            "between holds the mic must stay warm, or the next short hold pays CoreAudio's start \
+             cost again and samples nothing"
+        );
+    }
+
+    #[test]
+    fn a_warm_microphone_is_still_released_the_moment_sparkle_loses_focus() {
+        // THE PRIVACY INVARIANT, and the reason `focused` is the OUTER term rather than a third
+        // alternative. Warming the capture must not weaken "Sparkle never captures while you are
+        // looking at another app" — the guarantee `capture_should_be_live`'s doc has always made.
+        //
+        // PAIRED with the test above (AGENTS.md: a single test proving presence is ambiguous). One
+        // shows the warm window turning a dead row live; this shows it CANNOT turn the unfocused
+        // rows live, which is what stops the fix from becoming an always-on microphone.
+        assert!(
+            !capture_should_be_live(false, false, true),
+            "unfocused + warm must still release the OS mic"
+        );
+        assert!(
+            !capture_should_be_live(true, false, true),
+            "even an ARMED warm mic is released when Sparkle is not the active app"
+        );
     }
 
     #[test]
