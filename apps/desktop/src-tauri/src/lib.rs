@@ -147,6 +147,12 @@ pub fn run() {
     // `cmd_timing` compares against it to report whether a command body actually ran on the main
     // thread rather than inferring it from the macro's source — see that module's header.
     cmd_timing::note_main_thread();
+    // Which WebKit `WebContent` processes already existed BEFORE we made one. HERE, before the
+    // builder, because the only thing that separates our renderer from the nine other apps' — they
+    // all have `ppid=1` and a byte-identical command line — is that ours appears after this line.
+    // The watchdog takes the matching "after" snapshot on the webview's first heartbeat, so a hang
+    // capture can sample the process the heartbeat actually came from. See watchdog.rs.
+    watchdog::note_webcontent_baseline();
     if cmd_timing::init_from_env() {
         tracing::info!(target: "perf", "per-command main-thread timing armed (SPARKLE_CMD_TIMING)");
     }

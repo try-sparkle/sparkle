@@ -5,7 +5,9 @@
 //
 // - Rust code logs through `tracing` macros (info!/debug!/warn!/error!).
 // - The frontend forwards its console output + user actions through the
-//   `frontend_log` command (target: "ui"), so UI and backend interleave in time order.
+//   `frontend_log` command (target: "ui"), so UI and backend interleave in the same file,
+//   ordered by the timestamp `tracing` stamps on each event. That is NOT strict dispatch
+//   order for two frontend lines any more — see the note on `frontend_log`.
 // - Output goes to a daily-rolling file in the OS app-log dir
 //   (macOS: ~/Library/Logs/ai.sparkle.desktop/sparkle.log) and also to stderr in dev.
 //
@@ -185,11 +187,53 @@ pub struct FrontendLog {
     pub message: String,
 }
 
-/// Sink for frontend logs so UI activity lands in the same file, in time order, as the
-/// Rust backend. Levels map onto the matching `tracing` macro; everything is tagged
-/// `target: "ui"` and carries its `scope` so the file is greppable per-subsystem.
+/// Sink for frontend logs so UI activity lands in the same file as the Rust backend. Levels map
+/// onto the matching `tracing` macro; everything is tagged `target: "ui"` and carries its `scope`
+/// so the file is greppable per-subsystem.
+///
+/// ── WHY THIS IS `async` (bead sparkle-rfhu5) ──────────────────────────────────────────────────
+/// This is the highest-frequency `#[tauri::command]` in the app: `logger.ts` fires
+/// `void invoke("frontend_log", …)` for every frontend log line — roughly 90K-145K invokes a day
+/// (see the note in `perfTrace.ts`). As a plain `fn`, tauri-macros compiles it to `body_blocking`,
+/// so every one of those dispatched a full `tracing` event through BOTH sink layers
+/// (`redacting_writer` scrub + fmt + `write_all`) INLINE on the AppKit main thread. A
+/// `/usr/bin/sample` of the shipped 0.96.1 build during a real 10.2-second UI freeze caught the
+/// main thread in `tauri::ipc::protocol::get` for 24 samples, 18 of which were inside
+/// `tracing_core::event::Event::dispatch` — the app was freezing itself logging about itself.
+///
+/// ── ORDERING: WHAT CHANGED, AND WHY THAT IS ACCEPTED RATHER THAN FIXED ────────────────────────
+/// The header comment on this file used to claim UI and backend lines land "in time order"; it now
+/// says "ordered by the timestamp `tracing` stamps on each event", because that claim is no longer
+/// strictly true of two FRONTEND lines relative to each other. The emit now happens on a blocking
+/// pool worker, so two invokes dispatched in order can be stamped out of order — a window on the
+/// order of the scheduling hop (microseconds).
+///
+/// Capturing the timestamp "at command entry" would NOT fix this, which is why it is not done:
+/// tauri compiles an `async fn` command to `body_async`, which builds the future and hands it to
+/// `async_runtime::spawn`. Nothing in this body runs on the dispatching thread — the first
+/// statement already executes on a runtime worker, subject to exactly the same scheduler as the
+/// blocking task. The only construction that would restore a total order is a single-consumer FIFO
+/// (one dedicated writer thread behind a channel), which is a larger change than this defect calls
+/// for and buys ordering the log's consumers do not depend on: every line still carries its own
+/// `tracing` timestamp, and the interleave window is far below the resolution anyone reads the log
+/// at. UI-vs-backend interleaving — the property the header comment exists for — is unaffected.
+///
+/// ── LOSS ──────────────────────────────────────────────────────────────────────────────────────
+/// Dropping a `spawn_blocking` handle does not cancel the task, and this one is awaited anyway, so
+/// the line is emitted for any normal shutdown or backpressure. A `JoinError` means the dispatch
+/// genuinely never ran — that is logged rather than swallowed, so a lost UI line is never silent.
+/// The command still returns `()`: `logger.ts` ignores the promise, and this must not become an
+/// error the frontend has to handle.
 #[tauri::command]
-pub fn frontend_log(entry: FrontendLog) {
+pub async fn frontend_log(entry: FrontendLog) {
+    if let Err(e) = tauri::async_runtime::spawn_blocking(move || emit_frontend_log(entry)).await {
+        tracing::warn!(target: "ui", "frontend_log dispatch failed; one UI log line was lost: {e}");
+    }
+}
+
+/// Blocking core of [`frontend_log`]: the `tracing` dispatch itself. Split out so the conversion is
+/// a pure relocation of the work — the body is byte-for-byte the behaviour the sync command had.
+fn emit_frontend_log(entry: FrontendLog) {
     let scope = entry.scope.unwrap_or_else(|| "ui".to_string());
     let msg = entry.message;
     match entry.level.as_str() {

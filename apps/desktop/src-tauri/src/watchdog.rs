@@ -29,6 +29,30 @@
 //! false claims for the life of the process. That matters: this log is what the next person reads
 //! to diagnose a real hang.
 //!
+//! ── AND WHY THE CAPTURE HAS TO SAMPLE MORE THAN ONE PROCESS ───────────────────────────────────
+//! The paragraph above was written down and then not acted on, which cost the module most of its
+//! value for a year. The trigger is a WEBVIEW heartbeat going silent, and the webview's JS runs in
+//! a WebKit `WebContent` process — but `capture_stack_into` sampled `std::process::id()` and
+//! nothing else, because `sample(1)` takes exactly one pid. So the one process most likely to be
+//! frozen was never in the dump. Measured: 17 hang dumps on disk, NONE containing the frozen
+//! thread; in the one studied in detail (a real 10.2s freeze) the host main thread was 91% parked
+//! in `mach_msg`, which reads as "nothing was wrong" and sends the reader somewhere else entirely.
+//!
+//! Identifying OUR WebContent processes is the hard part, and no public API hands them over.
+//! Verified live on macOS 26.6: every WebContent process on the machine has `ppid=1` and a
+//! byte-identical command line
+//! (`…/WebKit.framework/…/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent`),
+//! and there were ten of them belonging to different apps. `pgrep`/`ps` therefore cannot tell you
+//! which are yours, and pid adjacency is a coincidence, not a rule.
+//!
+//! CHOSEN: a before/after set difference (`note_webcontent_baseline` + `maintain_renderer_tracking`),
+//! which uses no private API. REJECTED: an ObjC shim reading `[WKWebView _webProcessIdentifier]`.
+//! The shim is exact, and if the diff ever proves unreliable it is the fallback — but it is private
+//! API on an app that ships as a notarized DMG, and a diagnostic that can get the app rejected is a
+//! bad trade for a diagnostic. The diff's failure mode is bounded and stated: when it cannot
+//! attribute the new processes it records NONE of them, so the worst case is today's behaviour
+//! (host-only) rather than a stranger's renderer landing in a user's log directory.
+//!
 //! ── HOW IT TELLS A HANG FROM A SLEEPING MACHINE ───────────────────────────────────────────────
 //! This is the discrimination the webview cannot make (see the note above `startJankMonitor` in
 //! perfTrace.ts: on this platform `performance.now()` keeps advancing through App Nap and display
@@ -44,8 +68,11 @@
 //! is platform- and clock-specific, and that ambiguity is exactly what this has to resolve; the wall
 //! clock always advances, so "how much real time passed during our sleep" has one answer.
 
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tauri::{AppHandle, Runtime};
@@ -129,8 +156,281 @@ const MAX_HIDDEN_HANG_DUMPS: usize = 3;
 /// samples an hour, short enough that a real backgrounded wedge is still caught promptly.
 const HIDDEN_CAPTURE_MIN_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
+/// Minimum wall time between VISIBLE stack captures.
+///
+/// The visible path had NO limiter at all, on the argument that a visible episode is the evidence
+/// we most want. True, and it still produced duplicate captures of the same stall: of the 17 dumps
+/// on disk, twelve are six PAIRS whose members are 6, 7, 7, 11, 12 and 22 seconds apart. Those are
+/// not six episodes and six more; they are six stalls, each detected twice, because `HANG_AFTER` is
+/// 5s and a struggling app emits one beat and then stops again — which opens a genuinely NEW
+/// episode by every rule in `step`. Each duplicate then fires a full multi-second `sample(1)` at an
+/// app that is already in trouble, and evicts a real older stack to make room.
+///
+/// Thirty seconds, and the number is set by that measurement rather than by taste: the widest
+/// observed pair is 22s apart, so any floor shorter than that fails to collapse the very pairs it
+/// exists for. It is also longer than one capture takes to run (measured 15-23s of `sample` +
+/// symbolication, see `SAMPLE_INTERVAL_MS`), so two captures can no longer overlap — the condition
+/// that produced 23 files for `keep=20` (see `capture_stack_into`).
+///
+/// What this deliberately does NOT do is weaken `Effect::Restate { wants_stack }`. An episode that
+/// was REFUSED here still owes a stack and keeps asking on every restate, so a floor spent by a
+/// duplicate is re-offered to the next episode the moment it expires. The pure state machine's
+/// "a fresh episode is owed its own stack" is untouched; this bounds the I/O, not the policy.
+const VISIBLE_CAPTURE_MIN_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Epoch ms of the last hidden capture; `0` = none this launch.
 static LAST_HIDDEN_CAPTURE_MS: AtomicU64 = AtomicU64::new(0);
+/// Epoch ms of the last visible capture; `0` = none this launch.
+static LAST_VISIBLE_CAPTURE_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Sampling interval in ms handed to `sample(1)`. The default (1ms) is both expensive and a lie.
+///
+/// Measured 2026-08-09 against a live Sparkle host process (368 threads),
+/// `sample <pid> 5 <interval> -file <path>`, wall time from spawn to exit:
+///
+/// | interval | elapsed | file    | main-thread samples in the 5s window |
+/// |----------|---------|---------|--------------------------------------|
+/// | 1ms      | 59.3s   | 2.21 MB | 2066 of a requested 5000 (41%)       |
+/// | 10ms     | 23.1s   | 1.09 MB |  386 of a requested  500 (77%)       |
+/// | 25ms     | 15.5s   | 0.81 MB |                                      |
+/// | 50ms     | 15.8s   | 0.95 MB |                                      |
+///
+/// So the default is not merely costly, it is LESS FAITHFUL than a coarser ask: at 1ms the tool
+/// sustains 41% of the cadence it was told to use, at 10ms it sustains 77%. 10ms halves both the
+/// file and the wall time while still resolving a multi-second stall into hundreds of consecutive
+/// identical frames, which is the entire claim this instrument has to support. Going coarser buys
+/// only ~30% more, because what is left is symbolication rather than sampling — 25ms and 50ms cost
+/// the same wall time, and 50ms produced a LARGER file than 25ms.
+///
+/// This matters more now than it did: an episode spawns one `sample` per process, not one total.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const SAMPLE_INTERVAL_MS: &str = "10";
+
+/// The `sample(1)` duration, in seconds. Unchanged; named so both call sites cannot drift.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const SAMPLE_SECONDS: &str = "5";
+
+/// How many `sample(1)` children may exist at once, across every capture.
+///
+/// One episode now spawns 1 host + up to `MAX_OWN_WEBCONTENT` renderers. This cap is one more than
+/// that, so a single episode can always complete and a second episode's captures are refused rather
+/// than queued — which is the right direction, because the thing we are instrumenting is an app
+/// under load and `sample` attaches to it for 15-23s.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const MAX_CONCURRENT_SAMPLES: usize = MAX_OWN_WEBCONTENT + 2;
+
+/// `sample(1)` children currently running.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+static SAMPLES_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// The leaf name of the WebKit renderer executable, verified live on macOS 26.6.
+///
+/// Matched as a SUFFIX of `ps -o comm=` (which prints the full executable path) so a future change
+/// to the framework's internal directory layout does not silently stop matching.
+const WEBCONTENT_EXEC: &str = "com.apple.WebKit.WebContent";
+
+/// How many new WebContent processes this app may claim from the before/after diff.
+///
+/// Three, because three is how many webviews Sparkle has created by the time the first heartbeat
+/// arrives: the main window (declared in `tauri.conf.json`), the capture takeover window
+/// (`capture_window::init_capture_window`) and the floating helper island
+/// (`helper::init_helper_window`) — the latter two built synchronously in `setup`, i.e. before the
+/// main window's React app can send a beat. WebKit usually shares one content process across
+/// same-origin webviews, so the honest expectation is "one to three": the studied dump had two
+/// (host 93243, renderers 93246 and 93249).
+///
+/// FOUR OR MORE IS A REFUSAL, NOT A GUESS. The diff window spans app startup, so another app
+/// launching a browser in the same second contributes its renderer to the difference and there is
+/// nothing in `ps` that separates it from ours (identical argv, `ppid=1`). Sampling a stranger's
+/// renderer would write another application's page contents into this user's log directory — that
+/// is a privacy failure, not noise. So when the count cannot be attributed we record NOTHING and
+/// say so in the log; the capture then degrades to exactly today's host-only behaviour.
+const MAX_OWN_WEBCONTENT: usize = 3;
+
+/// What we know about this app's WebContent processes.
+///
+/// `baseline` is the set of WebContent pids that existed BEFORE our webview did; `arming_since_ms`
+/// is when that baseline was taken. The diff is only taken once a heartbeat NEWER than that instant
+/// has arrived, because the first beat is the only signal available from off the main thread that
+/// proves the renderer exists and is running our JS — and depending on Tauri's window-creation
+/// ordering relative to `setup` instead would make this module's correctness a function of a
+/// framework internal.
+#[derive(Debug)]
+struct RendererTracker {
+    baseline: BTreeSet<u32>,
+    /// `Some(t)` = waiting for a beat newer than `t` to take the diff.
+    arming_since_ms: Option<u64>,
+    /// This app's WebContent pids. Empty means "unknown", never "none exist".
+    pids: BTreeSet<u32>,
+    /// Epoch ms of the last liveness re-check; `0` = never.
+    last_recheck_ms: u64,
+}
+
+static RENDERERS: Mutex<RendererTracker> = Mutex::new(RendererTracker {
+    baseline: BTreeSet::new(),
+    arming_since_ms: None,
+    pids: BTreeSet::new(),
+    last_recheck_ms: 0,
+});
+
+/// How often the tick re-verifies that the recorded renderers are still alive.
+///
+/// NOT every tick. A recorded pid does go stale (WebKit respawns a crashed WebContent), but the
+/// check costs a `ps` fork/exec and the watchdog is the one thread in this app that must never
+/// become part of the load it is measuring — one process listing a second, forever, to notice an
+/// event that happens approximately never is the wrong trade. Thirty seconds is well inside the
+/// gap between captures (`VISIBLE_CAPTURE_MIN_INTERVAL`), and the capture path re-verifies
+/// unconditionally anyway (`live_renderer_pids`), so this cadence only governs how quickly the
+/// RE-ARM after a renderer crash begins — never whether a stale pid can be sampled.
+const RENDERER_RECHECK: Duration = Duration::from_secs(30);
+
+fn renderers() -> std::sync::MutexGuard<'static, RendererTracker> {
+    // Poison-tolerant: a panic in one capture must not permanently blind the watchdog.
+    RENDERERS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Record which WebContent processes existed before this app made one. Call ONCE, as early in
+/// `run()` as possible — the smaller the window between this and the first heartbeat, the less
+/// chance an unrelated app's renderer lands in the difference and forces a refusal.
+pub fn note_webcontent_baseline() {
+    let before = webcontent_pids_now();
+    let mut t = renderers();
+    t.baseline = before;
+    t.arming_since_ms = Some(now_ms());
+    t.pids.clear();
+}
+
+/// Every WebContent pid on the machine, right now. Empty off macOS and on any `ps` failure — both
+/// of which read as "we could not identify a renderer", which is the safe direction.
+#[cfg(target_os = "macos")]
+fn webcontent_pids_now() -> BTreeSet<u32> {
+    match Command::new("/bin/ps").args(["-axo", "pid=,comm="]).output() {
+        Ok(out) => parse_webcontent_pids(&String::from_utf8_lossy(&out.stdout)),
+        Err(e) => {
+            tracing::warn!(target: "watchdog", "could not list processes: {e}");
+            BTreeSet::new()
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn webcontent_pids_now() -> BTreeSet<u32> {
+    BTreeSet::new()
+}
+
+/// Pure parser over `ps -axo pid=,comm=` output, so the matching rule is assertable against real
+/// captured output without shelling out.
+fn parse_webcontent_pids(ps_output: &str) -> BTreeSet<u32> {
+    ps_output
+        .lines()
+        .filter_map(|line| {
+            let (pid, comm) = line.trim_start().split_once(char::is_whitespace)?;
+            if !comm.trim().ends_with(WEBCONTENT_EXEC) {
+                return None;
+            }
+            pid.parse::<u32>().ok()
+        })
+        .collect()
+}
+
+/// Which WebContent processes appeared while our webview was being created.
+///
+/// Pure, and the refusal is the point: more new pids than webviews we created means the difference
+/// contains something that is not ours and nothing in `ps` can say which. See `MAX_OWN_WEBCONTENT`.
+fn new_webcontent_pids(
+    before: &BTreeSet<u32>,
+    after: &BTreeSet<u32>,
+    max_expected: usize,
+) -> BTreeSet<u32> {
+    let new: BTreeSet<u32> = after.difference(before).copied().collect();
+    if new.len() > max_expected {
+        return BTreeSet::new();
+    }
+    new
+}
+
+/// Drop recorded pids that are no longer live WebContent processes.
+///
+/// Intersecting with a fresh `ps` snapshot checks BOTH facts at once, which matters: an exited
+/// renderer's pid can be recycled by an unrelated process, and a liveness-only check (`kill(pid,0)`)
+/// would happily hand that stranger to `sample`. Pure so the recycling case is testable.
+fn live_renderer_pids(recorded: &BTreeSet<u32>, live_webcontent: &BTreeSet<u32>) -> Vec<u32> {
+    recorded.intersection(live_webcontent).copied().collect()
+}
+
+/// Keep the recorded renderer set honest. Called once per tick, from the watchdog thread.
+///
+/// Deliberately makes NO call into `AppHandle` or any Tauri state. This module's one non-negotiable
+/// property is that nothing the main thread does can stop it running, and `AppHandle` accessors take
+/// locks the wedged main thread may be holding — so asking Tauri "how many webviews do you have"
+/// would trade the whole design away for a number that is already a compile-time constant here.
+fn maintain_renderer_tracking(last_beat_ms: u64, now_ms: u64) {
+    let mut t = renderers();
+    if let Some(armed_at) = t.arming_since_ms {
+        // A beat strictly newer than the baseline. On the re-arm path (below) beats from the DEAD
+        // renderer are still on record, and diffing against those would resolve instantly against a
+        // baseline that already contains the replacement.
+        if last_beat_ms <= armed_at {
+            return;
+        }
+        let after = webcontent_pids_now();
+        let new = new_webcontent_pids(&t.baseline, &after, MAX_OWN_WEBCONTENT);
+        // How many appeared during the window, BEFORE the baseline is dropped. `new` is empty for
+        // two different reasons — nothing appeared, or too much did — and this is what tells them
+        // apart in the log.
+        let candidates = after.difference(&t.baseline).count();
+        t.arming_since_ms = None;
+        t.baseline = BTreeSet::new();
+        if new.is_empty() {
+            tracing::info!(
+                target: "watchdog",
+                webcontent_total = after.len(),
+                candidates,
+                max_own = MAX_OWN_WEBCONTENT,
+                "could not attribute a WebContent process to this app; hang captures will be host-only"
+            );
+        } else {
+            tracing::info!(
+                target: "watchdog",
+                pids = ?new,
+                "identified this app's WebContent process(es); hang captures will include them"
+            );
+        }
+        t.pids = new;
+        return;
+    }
+    if t.pids.is_empty() || !may_capture(t.last_recheck_ms, now_ms, RENDERER_RECHECK.as_millis() as u64)
+    {
+        return;
+    }
+    t.last_recheck_ms = now_ms;
+    // WebKit respawns a crashed WebContent process, so a recorded pid goes stale on its own.
+    let live = webcontent_pids_now();
+    let before = t.pids.len();
+    t.pids = live_renderer_pids(&t.pids, &live).into_iter().collect();
+    if t.pids.len() == before {
+        return;
+    }
+    if t.pids.is_empty() {
+        // Re-snapshot and wait for the replacement's first beat. Honest caveat: WebKit can respawn
+        // faster than our 1s tick notices the death, in which case the replacement is already in
+        // this baseline, the next diff comes back empty, and we settle on host-only captures with
+        // the log line above. That is the safe direction — the alternative is claiming a process we
+        // cannot prove is ours.
+        t.baseline = live;
+        t.arming_since_ms = Some(now_ms);
+        tracing::info!(
+            target: "watchdog",
+            "this app's WebContent process(es) exited; re-arming renderer identification"
+        );
+    } else {
+        tracing::info!(
+            target: "watchdog",
+            pids = ?t.pids,
+            "a WebContent process of ours exited; dropped it from the capture set"
+        );
+    }
+}
 
 /// Milliseconds since the epoch of the last heartbeat from the webview. `0` = none yet.
 static LAST_BEAT_MS: AtomicU64 = AtomicU64::new(0);
@@ -239,7 +539,7 @@ fn is_reportable_evidence(hidden: bool) -> bool {
 /// the pool choice and the retention count were all only assertable as relations between constants —
 /// the exact vacuous shape this repo's own docs condemn. Dropping the join, or passing
 /// `MAX_HANG_DUMPS` to both pools, left every test green.
-fn dump_target(root: &std::path::Path, hidden: bool) -> (std::path::PathBuf, usize) {
+fn dump_target(root: &Path, hidden: bool) -> (PathBuf, usize) {
     if hidden {
         (root.join("hidden"), MAX_HIDDEN_HANG_DUMPS)
     } else {
@@ -247,7 +547,7 @@ fn dump_target(root: &std::path::Path, hidden: bool) -> (std::path::PathBuf, usi
     }
 }
 
-/// May we spend a HIDDEN stack capture now?
+/// May we spend a stack capture now? Shared by both pools; only the interval differs.
 ///
 /// The pool size bounds RETAINED FILES, not captures — a distinction that matters because the
 /// expensive part is not the file. `sample(1)` attaches to the process and walks every thread for
@@ -263,7 +563,11 @@ fn dump_target(root: &std::path::Path, hidden: bool) -> (std::path::PathBuf, usi
 /// ping (a no-op posted from this thread, captured only if it does not return), which would prove a
 /// blocked main thread independent of visibility — but that gives this module a live dependency on
 /// the very thread it exists to observe from outside, so it is deliberately not built here.
-fn may_capture_hidden(last_capture_ms: u64, now_ms: u64, min_interval_ms: u64) -> bool {
+///
+/// The VISIBLE path now uses this too, on a much shorter floor and for a different reason: not to
+/// bound a benign event's cost, but because one stall is routinely DETECTED TWICE. See
+/// `VISIBLE_CAPTURE_MIN_INTERVAL` for the measurement that sets that floor.
+fn may_capture(last_capture_ms: u64, now_ms: u64, min_interval_ms: u64) -> bool {
     last_capture_ms == 0 || now_ms.saturating_sub(last_capture_ms) >= min_interval_ms
 }
 
@@ -388,6 +692,11 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
                 hidden: HIDDEN.load(Ordering::Relaxed),
             };
 
+            // Identify (and keep identifying) this app's WebContent processes, so a capture can
+            // sample the process the heartbeat actually came from. Cheap in steady state: once the
+            // set is known this shells out at most once every `RENDERER_RECHECK`.
+            maintain_renderer_tracking(input.last_beat_ms, input.now_ms);
+
             match step(&mut state, input) {
                 Effect::Quiet => {}
                 effect @ Effect::Rebaseline { .. } => {
@@ -419,7 +728,13 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
                     // visible hang's stack and a backgrounded wedge is never left without evidence.
                     // Hidden captures are additionally rate-limited: the pool bounds files kept, not
                     // the five-second whole-process `sample` run itself. See `may_capture_hidden`.
-                    if try_capture(hangs_dir.as_deref(), hidden, after, &LAST_HIDDEN_CAPTURE_MS) {
+                    if try_capture(
+                        hangs_dir.as_deref(),
+                        hidden,
+                        after,
+                        &LAST_VISIBLE_CAPTURE_MS,
+                        &LAST_HIDDEN_CAPTURE_MS,
+                    ) {
                         note_captured(&mut state);
                     }
                 }
@@ -445,8 +760,19 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
                     // could spend the slot a real wedge needed and the wedge would end with an
                     // `info` line and no evidence. Persisting is precisely what a wedge does and a
                     // cmd-tab does not, so retrying here spends the budget on the right event.
+                    //
+                    // This is now load-bearing for VISIBLE episodes too, which is what keeps
+                    // `VISIBLE_CAPTURE_MIN_INTERVAL` from being a way to lose stacks: an episode
+                    // refused because a duplicate detection 10s earlier spent the floor keeps
+                    // asking, and gets its stack as soon as the floor expires.
                     if wants_stack
-                        && try_capture(hangs_dir.as_deref(), hidden, after, &LAST_HIDDEN_CAPTURE_MS)
+                        && try_capture(
+                        hangs_dir.as_deref(),
+                        hidden,
+                        after,
+                        &LAST_VISIBLE_CAPTURE_MS,
+                        &LAST_HIDDEN_CAPTURE_MS,
+                    )
                     {
                         note_captured(&mut state);
                     }
@@ -483,36 +809,52 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
 
 /// Capture a stack if policy allows it, returning whether one was actually taken.
 ///
-/// Visible episodes always capture. Hidden ones are rate-limited (`may_capture_hidden`), because the
-/// pool bounds files KEPT while the expensive part is the five-second whole-process `sample` run.
+/// BOTH pools are rate-limited now, on very different floors and for different reasons — 30 minutes
+/// for hidden (`HIDDEN_CAPTURE_MIN_INTERVAL`: bound the cost of a benign, frequent event) and 30
+/// seconds for visible (`VISIBLE_CAPTURE_MIN_INTERVAL`: collapse the second detection of one
+/// stall). The pool sizes bound files KEPT; these bound the `sample(1)` runs themselves, which is
+/// where the cost actually is.
+///
 /// The limiter is consumed only when a capture really happens, so a refused attempt leaves the slot
 /// for the next asker — which is what lets a persisting episode retry from `Restate`.
 fn try_capture(
-    dir: Option<&std::path::Path>,
+    dir: Option<&Path>,
     hidden: bool,
     now_ms: u64,
+    last_visible: &AtomicU64,
     last_hidden: &AtomicU64,
 ) -> bool {
+    try_capture_with(dir, hidden, now_ms, last_visible, last_hidden, &mut capture_stack_into)
+}
+
+/// `try_capture` with the actual capture injected, so a test can count captures without spawning
+/// `sample(1)`. Kept immediately beside its one production caller above, which is a two-line
+/// wrapper: the seam is the argument, not a defaulted field every test quietly replaces.
+fn try_capture_with(
+    dir: Option<&Path>,
+    hidden: bool,
+    now_ms: u64,
+    last_visible: &AtomicU64,
+    last_hidden: &AtomicU64,
+    capture: &mut dyn FnMut(&Path, u64, usize),
+) -> bool {
     let Some(dir) = dir else { return false };
-    if hidden
-        && !may_capture_hidden(
-            last_hidden.load(Ordering::Relaxed),
-            now_ms,
-            HIDDEN_CAPTURE_MIN_INTERVAL.as_millis() as u64,
-        )
-    {
+    let (limiter, min_interval) = if hidden {
+        (last_hidden, HIDDEN_CAPTURE_MIN_INTERVAL)
+    } else {
+        (last_visible, VISIBLE_CAPTURE_MIN_INTERVAL)
+    };
+    if !may_capture(limiter.load(Ordering::Relaxed), now_ms, min_interval.as_millis() as u64) {
         // STORE ONLY ON SUCCESS. Consuming the interval here instead would push the next allowed
         // capture out by a further full interval on every refusal, which defeats the `Restate`
         // retry this helper exists to enable — the episode would keep asking and keep being
-        // refused. Injected rather than reading the static directly so a test can assert exactly
+        // refused. Injected rather than reading the statics directly so a test can assert exactly
         // that: the pure predicate alone cannot distinguish the two.
         return false;
     }
-    if hidden {
-        last_hidden.store(now_ms, Ordering::Relaxed);
-    }
+    limiter.store(now_ms, Ordering::Relaxed);
     let (target, keep) = dump_target(dir, hidden);
-    capture_stack_into(&target, now_ms, keep);
+    capture(&target, now_ms, keep);
     true
 }
 
@@ -534,92 +876,199 @@ fn try_capture(
 const MAX_HANG_DUMP_BYTES: u64 = 24 * 1024 * 1024;
 
 #[cfg(target_os = "macos")]
-fn prune_hang_dumps(dir: &std::path::Path, keep: usize) {
+fn prune_hang_dumps(dir: &Path, keep: usize) {
     prune_hang_dumps_to(dir, keep, MAX_HANG_DUMP_BYTES)
 }
 
+/// The episode stamp a dump belongs to, or `None` if the file is not one of ours.
+///
+/// `hang-<stamp>.txt` and `hang-<stamp>.webcontent-<pid>.txt` both yield `<stamp>`. That shared key
+/// is the whole reason the renderer dump is named the way it is: the pairing has to be legible in a
+/// directory listing AND recoverable by the pruner, and one filename convention does both.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn dump_stamp(file_name: &str) -> Option<&str> {
+    let rest = file_name.strip_prefix("hang-")?;
+    let stamp = rest.split('.').next().unwrap_or(rest);
+    (!stamp.is_empty()).then_some(stamp)
+}
+
 #[cfg(target_os = "macos")]
-fn prune_hang_dumps_to(dir: &std::path::Path, keep: usize, max_bytes: u64) {
+fn prune_hang_dumps_to(dir: &Path, keep: usize, max_bytes: u64) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
-    let mut dumps: Vec<_> = entries
-        .flatten()
-        .filter(|e| e.file_name().to_string_lossy().starts_with("hang-"))
-        .filter_map(|e| {
-            let m = e.metadata().ok()?;
-            Some((m.modified().ok()?, m.len(), e.path()))
-        })
-        .collect();
-    dumps.sort_by_key(|(t, _, _)| *t); // oldest first
+    // Grouped BY EPISODE, not by file. An episode now writes a host dump plus one per WebContent
+    // process, and the halves are only useful together — a renderer stack whose host stack was
+    // evicted is a call graph with nothing to correlate against. Grouping also keeps `keep` meaning
+    // what it has always meant (episodes of history) instead of silently becoming
+    // `keep / files-per-episode` the moment renderers were added, which is exactly the way "add
+    // files without updating pruning" makes a cap stop binding.
+    let mut groups: std::collections::BTreeMap<String, (SystemTime, u64, Vec<PathBuf>)> =
+        std::collections::BTreeMap::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(stamp) = dump_stamp(&name) else { continue };
+        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(modified) = meta.modified() else { continue };
+        let group = groups
+            .entry(stamp.to_string())
+            .or_insert((modified, 0, Vec::new()));
+        // Age the group by its NEWEST member: the renderer dumps land seconds after the host one,
+        // and an episode is only old once all of it is.
+        if modified > group.0 {
+            group.0 = modified;
+        }
+        group.1 = group.1.saturating_add(meta.len());
+        group.2.push(entry.path());
+    }
+    let mut groups: Vec<_> = groups.into_values().collect();
+    groups.sort_by_key(|(t, _, _)| *t); // oldest first
 
     // Evict oldest-first until BOTH budgets are satisfied. Count first (cheap and exact), then
     // size over what survived it.
-    let over_count = dumps.len().saturating_sub(keep);
-    let mut total: u64 = dumps.iter().skip(over_count).map(|(_, len, _)| *len).sum();
+    let over_count = groups.len().saturating_sub(keep);
+    let mut total: u64 = groups.iter().skip(over_count).map(|(_, bytes, _)| *bytes).sum();
     let mut evict = over_count;
-    while evict < dumps.len() && total > max_bytes {
-        total = total.saturating_sub(dumps[evict].1);
+    while evict < groups.len() && total > max_bytes {
+        total = total.saturating_sub(groups[evict].1);
         evict += 1;
     }
-    for (_, _, path) in dumps.iter().take(evict) {
-        let _ = std::fs::remove_file(path);
+    for (_, _, paths) in groups.iter().take(evict) {
+        for path in paths {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
-/// Shell out to macOS `sample(1)` against our own pid, so a hang leaves a blocked-thread stack
-/// without the user having to know the command or reach a terminal before force-quitting.
+/// Where the HOST process's dump goes.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn host_dump_path(dir: &Path, stamp_ms: u64) -> PathBuf {
+    dir.join(format!("hang-{stamp_ms}.txt"))
+}
+
+/// Where one WebContent process's dump goes.
+///
+/// A SIBLING of the host dump, sharing its stamp, so the pairing is obvious in a directory listing
+/// and the pruner can recover it (`dump_stamp`). The host dump keeps its existing name unchanged —
+/// every tool, script and habit that reads `hang-<stamp>.txt` still finds exactly what it found
+/// before, and the new evidence arrives beside it rather than in place of it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn renderer_dump_path(dir: &Path, stamp_ms: u64, pid: u32) -> PathBuf {
+    dir.join(format!("hang-{stamp_ms}.webcontent-{pid}.txt"))
+}
+
+/// Shell out to macOS `sample(1)`, so a hang leaves a blocked-thread stack without the user having
+/// to know the command or reach a terminal before force-quitting.
+///
+/// ONE SAMPLE PER PROCESS. The trigger is a webview heartbeat and the webview's JS runs in a
+/// WebContent process, so sampling only `std::process::id()` — as this did until now — reliably
+/// missed the frozen thread; see the module header for the measurement. `sample` takes exactly one
+/// pid, so covering both means more than one child, which is why there is a concurrency cap.
 ///
 /// Best-effort by design: `sample` may be unavailable or refused, and a watchdog that panicked or
 /// blocked while trying to take a sample would be strictly worse than one that logged the WARN and
 /// moved on. The watchdog thread must also stay on its tick to keep restating an ongoing hang, so it
-/// never waits here — a short-lived helper thread reaps the child and reports what actually
+/// never waits here — a short-lived helper thread reaps each child and reports what actually
 /// happened. Reporting only the fork/exec succeeding would name a file that may hold nothing.
 #[cfg(target_os = "macos")]
-fn capture_stack_into(dir: &std::path::Path, stamp_ms: u64, keep: usize) {
+fn capture_stack_into(dir: &Path, stamp_ms: u64, keep: usize) {
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(target: "watchdog", "could not create dump dir {dir:?}, stack skipped: {e}");
         return;
     }
-    let path = dir.join(format!("hang-{stamp_ms}.txt"));
-    let pid = std::process::id().to_string();
-    // 5 seconds at the default interval: long enough to show whether the blocking frame persists
-    // rather than catching one unlucky instant, short enough to land while the hang is still on.
+    // The host process, exactly as before — this path must never capture LESS than it used to.
+    spawn_sample(std::process::id(), host_dump_path(dir, stamp_ms), dir, keep, "host");
+
+    // Then the renderer(s), re-verified against a live listing first: a recorded pid can be dead
+    // (WebKit respawned it) or, worse, recycled by an unrelated process.
+    let recorded = { renderers().pids.clone() };
+    if recorded.is_empty() {
+        return;
+    }
+    let live = live_renderer_pids(&recorded, &webcontent_pids_now());
+    if live.len() != recorded.len() {
+        tracing::info!(
+            target: "watchdog",
+            recorded = ?recorded,
+            live = ?live,
+            "some recorded WebContent pids are no longer live WebContent processes; skipping them"
+        );
+    }
+    for pid in live {
+        spawn_sample(pid, renderer_dump_path(dir, stamp_ms, pid), dir, keep, "webcontent");
+    }
+}
+
+/// Fork one `sample(1)`, bounded, and reap it off the watchdog's tick.
+#[cfg(target_os = "macos")]
+fn spawn_sample(pid: u32, path: PathBuf, dir: &Path, keep: usize, what: &'static str) {
+    // BOUNDED. An episode spawns up to `1 + MAX_OWN_WEBCONTENT` children, each attaching to a
+    // process for 15-23s (see `SAMPLE_INTERVAL_MS`), and the app it attaches to is by definition
+    // already struggling. Without a cap, a pathological sequence of episodes could stack samples
+    // until the instrument IS the outage. Refusing is the right failure: we already have a stack
+    // from moments ago.
+    if SAMPLES_IN_FLIGHT
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            (n < MAX_CONCURRENT_SAMPLES).then_some(n + 1)
+        })
+        .is_err()
+    {
+        tracing::warn!(
+            target: "watchdog",
+            pid, what, max = MAX_CONCURRENT_SAMPLES,
+            "sample(1) concurrency budget full; skipping this process for this episode"
+        );
+        return;
+    }
+    // Duration then interval, positionally: `sample <pid> [duration [samplingInterval]] [-file …]`.
+    // 5 seconds is long enough to show whether the blocking frame persists rather than catching one
+    // unlucky instant, and short enough to land while the hang is still on.
     let spawned = Command::new("/usr/bin/sample")
-        .args([&pid, "5", "-file"])
+        .arg(pid.to_string())
+        .args([SAMPLE_SECONDS, SAMPLE_INTERVAL_MS, "-file"])
         .arg(&path)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn();
     match spawned {
         Ok(mut child) => {
-            let path = path.clone();
             // Reaped on its own thread: an unwaited child stays a zombie for the life of the app,
             // and the exit status is the only thing that distinguishes a real capture from a file
             // that was never written.
             let prune_dir = dir.to_path_buf();
-            std::thread::spawn(move || match child.wait() {
-                Ok(status) if status.success() => {
-                    // PRUNE HERE, not before the spawn. `sample(1)` writes the file asynchronously,
-                    // so pruning up-front measured a population that did not yet include the dump
-                    // about to land — the budget was enforced against the wrong set and the pool
-                    // settled ABOVE `keep` (observed: 23 files for keep=20, because overlapping
-                    // captures each passed the pre-write check and then all wrote). Pruning once the
-                    // capture has actually landed makes `keep` the real ceiling and costs nothing:
-                    // we are already on a helper thread, off the watchdog's tick.
-                    prune_hang_dumps(&prune_dir, keep);
-                    tracing::warn!(target: "watchdog", path = %path.display(), "captured hang stack")
+            std::thread::spawn(move || {
+                let result = child.wait();
+                SAMPLES_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+                match result {
+                    Ok(status) if status.success() => {
+                        // PRUNE HERE, not before the spawn. `sample(1)` writes the file
+                        // asynchronously, so pruning up-front measured a population that did not yet
+                        // include the dump about to land — the budget was enforced against the wrong
+                        // set and the pool settled ABOVE `keep` (observed: 23 files for keep=20,
+                        // because overlapping captures each passed the pre-write check and then all
+                        // wrote). Pruning once the capture has actually landed makes `keep` the real
+                        // ceiling and costs nothing: we are already off the watchdog's tick. Every
+                        // child of one episode prunes, which is harmless — pruning is by episode
+                        // group and idempotent, and the last one to finish sees the full set.
+                        prune_hang_dumps(&prune_dir, keep);
+                        tracing::warn!(target: "watchdog", what, pid, path = %path.display(), "captured hang stack")
+                    }
+                    Ok(status) => {
+                        tracing::warn!(target: "watchdog", what, pid, ?status, "sample(1) exited non-zero; no stack captured")
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "watchdog", what, pid, "could not reap sample(1): {e}")
+                    }
                 }
-                Ok(status) => {
-                    tracing::warn!(target: "watchdog", ?status, "sample(1) exited non-zero; no stack captured")
-                }
-                Err(e) => tracing::warn!(target: "watchdog", "could not reap sample(1): {e}"),
             });
         }
-        Err(e) => tracing::warn!(target: "watchdog", "could not run sample(1): {e}"),
+        Err(e) => {
+            SAMPLES_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+            tracing::warn!(target: "watchdog", what, pid, "could not run sample(1): {e}");
+        }
     }
 }
 
 #[cfg(not(target_os = "macos"))]
-fn capture_stack_into(_dir: &std::path::Path, _stamp_ms: u64, _keep: usize) {}
+fn capture_stack_into(_dir: &Path, _stamp_ms: u64, _keep: usize) {}
 
 #[cfg(test)]
 mod tests {
@@ -858,31 +1307,89 @@ mod tests {
     // this test asserted `may_capture_hidden` — an unchanged pure predicate — so it passed against
     // the pre-commit tree and would still pass with the `store` moved above the refusal check.
     // These drive `try_capture` itself and assert the SIDE EFFECT on the injected limiter state.
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_refused_hidden_capture_leaves_the_interval_untouched() {
         let interval = HIDDEN_CAPTURE_MIN_INTERVAL.as_millis() as u64;
+        let vis = AtomicU64::new(0);
         let last = AtomicU64::new(1_000);
         // No dump dir: the capture cannot happen, so nothing may be consumed.
-        assert!(!try_capture(None, true, 1_000 + interval * 2, &last));
+        assert!(!try_capture_with(None, true, 1_000 + interval * 2, &vis, &last, &mut noop_capture()));
         assert_eq!(last.load(Ordering::Relaxed), 1_000, "a capture that did not happen consumed the slot");
 
         // Inside the window: refused, and the ORIGINAL spend must still govern — otherwise every
         // refused Restate retry would push the next allowed capture out another full interval and
         // the retry loop could never succeed.
-        let dir = std::env::temp_dir().join(format!("-{}", std::process::id()));
-        assert!(!try_capture(Some(&dir), true, 1_000 + interval / 2, &last));
+        let dir = std::path::Path::new("/logs/hangs");
+        assert!(!try_capture_with(
+            Some(dir),
+            true,
+            1_000 + interval / 2,
+            &vis,
+            &last,
+            &mut noop_capture()
+        ));
         assert_eq!(last.load(Ordering::Relaxed), 1_000, "a REFUSED attempt consumed the interval");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // A visible episode is never rate-limited, so it must not touch the hidden limiter at all.
-    #[cfg(target_os = "macos")]
+    // The two limiters are separate budgets: a visible capture must not spend the hidden slot (or
+    // the 30-minute hidden floor would be consumed by every ordinary foreground stall), and vice
+    // versa.
     #[test]
-    fn a_visible_capture_never_touches_the_hidden_limiter() {
-        let last = AtomicU64::new(1_000);
-        assert!(!try_capture(None, false, 99_000, &last), "no dir means no capture");
-        assert_eq!(last.load(Ordering::Relaxed), 1_000);
+    fn the_visible_and_hidden_limiters_are_separate_budgets() {
+        let dir = std::path::Path::new("/logs/hangs");
+        let vis = AtomicU64::new(0);
+        let hid = AtomicU64::new(0);
+
+        assert!(try_capture_with(Some(dir), false, 50_000, &vis, &hid, &mut noop_capture()));
+        assert_eq!(vis.load(Ordering::Relaxed), 50_000, "the visible capture spends the visible slot");
+        assert_eq!(hid.load(Ordering::Relaxed), 0, "and must not touch the hidden one");
+
+        // A hidden episode one second later is still allowed — its own budget is untouched.
+        assert!(
+            try_capture_with(Some(dir), true, 51_000, &vis, &hid, &mut noop_capture()),
+            "the visible floor must not gate the hidden pool"
+        );
+        assert_eq!(hid.load(Ordering::Relaxed), 51_000);
+        assert_eq!(vis.load(Ordering::Relaxed), 50_000, "and the hidden capture must not respend it");
+    }
+
+    // ── FIX 2: THE VISIBLE PATH IS RATE-LIMITED ────────────────────────────────────────────────
+    // The visible path had NO limiter, and of the 17 dumps on disk twelve were six PAIRS 6-22s
+    // apart: one stall detected twice, each detection firing a full multi-second `sample(1)` at an
+    // app already in trouble and evicting an older real stack to make room.
+    //
+    // This asserts the SIDE EFFECT — how many captures actually ran — not that a capture happened.
+    // With the limiter deleted the second call captures and the count is 3, so it goes red.
+    #[test]
+    fn one_stall_detected_twice_produces_one_visible_capture() {
+        let dir = std::path::Path::new("/logs/hangs");
+        let floor = VISIBLE_CAPTURE_MIN_INTERVAL.as_millis() as u64;
+        let mut captures: Vec<u64> = Vec::new();
+        {
+            let mut capture = |_: &Path, stamp: u64, _: usize| captures.push(stamp);
+            let vis = AtomicU64::new(0);
+            let hid = AtomicU64::new(0);
+
+            // The stall is detected. Capture.
+            assert!(try_capture_with(Some(dir), false, 100_000, &vis, &hid, &mut capture));
+            // The SAME stall is re-detected 12s later (the median observed pair gap). Refused.
+            assert!(!try_capture_with(Some(dir), false, 112_000, &vis, &hid, &mut capture));
+            // Even at the widest observed gap. Still refused — this is the case a shorter floor
+            // would have let through, which is why the floor is set from the measurement.
+            assert!(!try_capture_with(Some(dir), false, 122_000, &vis, &hid, &mut capture));
+            // A distinct later episode is still owed its own stack.
+            assert!(try_capture_with(Some(dir), false, 100_000 + floor, &vis, &hid, &mut capture));
+        }
+        assert_eq!(
+            captures,
+            vec![100_000, 100_000 + floor],
+            "the two re-detections must collapse onto the first capture, and only they"
+        );
+    }
+
+    /// A capture that does nothing, for tests asserting the limiter rather than the file.
+    fn noop_capture() -> impl FnMut(&Path, u64, usize) {
+        |_: &Path, _: u64, _: usize| {}
     }
 
     #[test]
@@ -925,18 +1432,33 @@ mod tests {
     #[test]
     fn hidden_captures_are_rate_limited_not_merely_pruned() {
         let interval = HIDDEN_CAPTURE_MIN_INTERVAL.as_millis() as u64;
-        assert!(may_capture_hidden(0, 1_000, interval), "the first one is always allowed");
+        assert!(may_capture(0, 1_000, interval), "the first one is always allowed");
         assert!(
-            !may_capture_hidden(1_000, 1_000 + interval - 1, interval),
+            !may_capture(1_000, 1_000 + interval - 1, interval),
             "a second cmd-tab inside the interval must not spawn another five-second sample"
         );
         assert!(
-            may_capture_hidden(1_000, 1_000 + interval, interval),
+            may_capture(1_000, 1_000 + interval, interval),
             "the boundary is inclusive, so the limiter cannot wedge shut"
         );
         // A backwards clock step must not permanently disable hidden captures.
-        assert!(!may_capture_hidden(10_000, 5_000, interval), "saturating: reads as no time passed");
-        assert!(may_capture_hidden(10_000, 10_000 + interval, interval), "and recovers after it");
+        assert!(!may_capture(10_000, 5_000, interval), "saturating: reads as no time passed");
+        assert!(may_capture(10_000, 10_000 + interval, interval), "and recovers after it");
+    }
+
+    // The floor is set by a measurement, not by taste: the widest observed duplicate-detection gap
+    // was 22s, so anything shorter fails to collapse the pairs it exists for. And it must stay well
+    // under the hidden floor, which is a bound on a benign event's cost rather than a de-duplicator.
+    #[test]
+    fn the_visible_floor_covers_the_widest_observed_duplicate_gap() {
+        assert!(
+            VISIBLE_CAPTURE_MIN_INTERVAL >= Duration::from_secs(22),
+            "observed duplicate detections of ONE stall were 6, 7, 7, 11, 12 and 22 seconds apart"
+        );
+        assert!(
+            VISIBLE_CAPTURE_MIN_INTERVAL < HIDDEN_CAPTURE_MIN_INTERVAL,
+            "a visible episode is the evidence we most want; it must not inherit the hidden floor"
+        );
     }
 
     // `prune_hang_dumps` gained a `keep` parameter and nothing asserted it was honoured — replacing
@@ -972,6 +1494,69 @@ mod tests {
         left.sort();
         assert_eq!(left, vec!["hang-3.txt", "hang-4.txt", "notes.txt"], "exactly the two newest");
         assert!(hidden.join("hang-9.txt").exists(), "the other pool must be untouched");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // RETENTION MUST COUNT THE RENDERER DUMPS. An episode used to write one file and now writes up
+    // to `1 + MAX_OWN_WEBCONTENT`. Add files without teaching the pruner about them and the caps
+    // silently stop binding — either the byte cap is blown (if the new names are unrecognised) or
+    // `keep` quietly becomes `keep / files-per-episode` (if they are counted as separate episodes).
+    // So this asserts both: whole episodes survive intact, and the total file count is bounded.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pruning_keeps_whole_episodes_including_their_renderer_dumps() {
+        use std::io::Write;
+        let root =
+            std::env::temp_dir().join(format!("sparkle-prune-renderers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Five episodes, each a host dump plus two renderer dumps: 15 files.
+        for stamp in 1..=5u64 {
+            for path in [
+                host_dump_path(&root, stamp),
+                renderer_dump_path(&root, stamp, 90_000 + stamp as u32),
+                renderer_dump_path(&root, stamp, 91_000 + stamp as u32),
+            ] {
+                let mut f = std::fs::File::create(&path).unwrap();
+                f.write_all(&[b'x'; 100]).unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 15, "precondition");
+
+        prune_hang_dumps_to(&root, 2, u64::MAX);
+
+        let mut left: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![
+                "hang-4.txt",
+                "hang-4.webcontent-90004.txt",
+                "hang-4.webcontent-91004.txt",
+                "hang-5.txt",
+                "hang-5.webcontent-90005.txt",
+                "hang-5.webcontent-91005.txt",
+            ],
+            "keep=2 must mean two whole EPISODES — not two files, and never a renderer stack whose \
+             host stack was evicted out from under it"
+        );
+
+        // And the size budget evicts by episode too: 300 bytes admits exactly one episode.
+        prune_hang_dumps_to(&root, 10, 300);
+        let total: u64 = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+            .sum();
+        assert_eq!(total, 300, "an episode's renderer dumps count toward the byte cap");
+        assert!(root.join("hang-5.txt").exists(), "and the newest episode is the survivor");
+        assert!(root.join("hang-5.webcontent-90005.txt").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1013,6 +1598,127 @@ mod tests {
             .sum();
         assert!(total <= 250, "surviving bytes must be within budget, got {total}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── FIX 1: IDENTIFYING THIS APP'S WEBCONTENT PROCESSES ─────────────────────────────────────
+    // The capture sampled only the host process while the trigger was a WEBVIEW heartbeat, so the
+    // process most likely to be frozen was never in the dump — 17 dumps on disk, none containing
+    // the frozen thread. Nothing in `ps` distinguishes our renderer from another app's (identical
+    // argv, `ppid=1`), so identification is a before/after set difference, and the interesting
+    // behaviour is the REFUSAL.
+
+    /// Real `ps -axo pid=,comm=` output shape, captured on macOS 26.6 (2026-08-09).
+    const PS_FIXTURE: &str = concat!(
+        "    1 /sbin/launchd\n",
+        " 1140 /System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent\n",
+        " 1161 /System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent\n",
+        " 1204 /System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.Networking.xpc/Contents/MacOS/com.apple.WebKit.Networking\n",
+        " 1205 /System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.GPU.xpc/Contents/MacOS/com.apple.WebKit.GPU\n",
+        "93243 /Applications/Sparkle.app/Contents/MacOS/Sparkle\n",
+    );
+
+    #[test]
+    fn the_ps_parser_takes_webcontent_and_nothing_that_merely_looks_like_it() {
+        let pids = parse_webcontent_pids(PS_FIXTURE);
+        assert_eq!(
+            pids,
+            BTreeSet::from([1140, 1161]),
+            "Networking and GPU are WebKit XPC services too and must NOT be sampled as renderers"
+        );
+        assert!(parse_webcontent_pids("").is_empty());
+        assert!(
+            parse_webcontent_pids("not a ps line at all\n").is_empty(),
+            "garbage must read as 'no renderer identified', never as a pid"
+        );
+    }
+
+    #[test]
+    fn the_diff_returns_exactly_the_processes_that_appeared() {
+        let before = BTreeSet::from([1140, 1161]);
+        let after = BTreeSet::from([1140, 1161, 93246, 93249]);
+        assert_eq!(
+            new_webcontent_pids(&before, &after, MAX_OWN_WEBCONTENT),
+            BTreeSet::from([93246, 93249]),
+            "the studied dump's host 93243 had renderers 93246 and 93249"
+        );
+    }
+
+    #[test]
+    fn a_diff_that_found_nothing_new_yields_nothing() {
+        let set = BTreeSet::from([1140, 1161]);
+        assert!(new_webcontent_pids(&set, &set, MAX_OWN_WEBCONTENT).is_empty());
+        // A renderer that EXITED during the window is not a renderer that appeared.
+        assert!(new_webcontent_pids(&set, &BTreeSet::from([1140]), MAX_OWN_WEBCONTENT).is_empty());
+    }
+
+    // The privacy case, and the one that must fail closed. The diff window spans app startup, so
+    // another app launching a browser in the same second contributes its renderer — and sampling a
+    // stranger's WebContent writes another application's page contents into this user's log
+    // directory. When the count cannot be attributed we take NOTHING, which degrades to exactly the
+    // old host-only behaviour.
+    #[test]
+    fn an_ambiguous_diff_captures_nothing_rather_than_a_strangers_renderer() {
+        let before = BTreeSet::from([1140]);
+        let after = BTreeSet::from([1140, 2, 3, 4, 5]); // four new — more than we created
+        assert!(
+            new_webcontent_pids(&before, &after, MAX_OWN_WEBCONTENT).is_empty(),
+            "more new renderers than webviews we created is unattributable, so claim none"
+        );
+        // The boundary: exactly as many as we could have created IS attributable.
+        let exact = BTreeSet::from([1140, 2, 3, 4]);
+        assert_eq!(
+            new_webcontent_pids(&before, &exact, MAX_OWN_WEBCONTENT).len(),
+            MAX_OWN_WEBCONTENT,
+            "refusing at the boundary would make the feature unreachable on a 3-webview startup"
+        );
+    }
+
+    // WebKit respawns a crashed WebContent process, so a recorded pid goes stale — and the pid can
+    // be RECYCLED by something else entirely. A liveness-only check would hand that stranger to
+    // `sample`, which is why re-verification intersects with a live WebContent listing instead.
+    #[test]
+    fn a_dead_or_recycled_renderer_pid_is_dropped_before_it_can_be_sampled() {
+        let recorded = BTreeSet::from([93246, 93249]);
+        // 93249 exited; 93246 is still a live WebContent.
+        assert_eq!(live_renderer_pids(&recorded, &BTreeSet::from([93246, 1140])), vec![93246]);
+        // 93249's pid was recycled by something that is NOT a WebContent process: it is absent from
+        // the live WebContent listing, so it is dropped even though the pid is alive.
+        assert_eq!(live_renderer_pids(&recorded, &BTreeSet::from([93246])), vec![93246]);
+        assert!(
+            live_renderer_pids(&recorded, &BTreeSet::new()).is_empty(),
+            "all gone means host-only, never 'sample whatever holds those pids now'"
+        );
+    }
+
+    // The pairing convention. The host dump keeps its existing name so everything that reads
+    // `hang-<stamp>.txt` is unaffected, and the renderer dump is a sibling sharing the stamp — which
+    // is also what lets the pruner treat one episode as one unit (`dump_stamp`).
+    #[test]
+    fn a_renderer_dump_is_a_distinct_sibling_that_pairs_with_the_host_dump_by_stamp() {
+        let dir = std::path::Path::new("/logs/hangs");
+        let host = host_dump_path(dir, 1786308408172);
+        let a = renderer_dump_path(dir, 1786308408172, 93246);
+        let b = renderer_dump_path(dir, 1786308408172, 93249);
+
+        let name_of = |p: &Path| p.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(name_of(&host), "hang-1786308408172.txt", "unchanged in shape");
+        assert_eq!(name_of(&a), "hang-1786308408172.webcontent-93246.txt");
+        assert_ne!(a, b, "two renderers of one episode must not overwrite each other");
+        assert_ne!(a, host);
+
+        // All three resolve to the SAME episode for retention purposes...
+        let stamp_of = |p: &Path| -> Option<String> {
+            let name = name_of(p);
+            dump_stamp(&name).map(str::to_string)
+        };
+        assert_eq!(stamp_of(&host), Some("1786308408172".to_string()));
+        assert_eq!(stamp_of(&a), stamp_of(&host));
+        assert_eq!(stamp_of(&b), stamp_of(&host));
+        // ...and a different episode does not.
+        assert_ne!(stamp_of(&host_dump_path(dir, 1786308408173)), stamp_of(&host));
+        // Files that are not ours stay invisible to the pruner.
+        assert_eq!(dump_stamp("notes.txt"), None);
+        assert_eq!(dump_stamp("sparkle.log"), None);
     }
 
     // The bar the High finding was about. At 60s every ordinary cmd-tab past a minute filed a hang

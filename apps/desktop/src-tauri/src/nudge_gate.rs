@@ -46,6 +46,8 @@ use std::sync::OnceLock;
 
 use regex::Regex;
 
+use crate::support::pattern;
+
 /// A rendered terminal screen, as this module needs to see it.
 pub struct Screen<'a> {
     /// The visible grid, one rendered row per `\n`, trailing spaces trimmed.
@@ -89,22 +91,21 @@ impl Refusal {
     }
 }
 
-/// Compile once. `support.rs` compiles its patterns per call and says so ("we avoid pulling in a
-/// lazy-init crate"); that is fine for a support-ticket redaction that runs once, and wrong for a
-/// gate that runs per agent per tick forever. `std::sync::OnceLock` is in std, so it costs no
-/// dependency.
-fn re(cell: &'static OnceLock<Regex>, pattern: &'static str) -> &'static Regex {
-    cell.get_or_init(|| Regex::new(pattern).expect("nudge_gate pattern must compile"))
-}
-
-macro_rules! pattern {
-    ($name:ident, $src:expr) => {
-        fn $name() -> &'static Regex {
-            static CELL: OnceLock<Regex> = OnceLock::new();
-            re(&CELL, $src)
-        }
-    };
-}
+// Compile once, via the ONE copy of that plumbing in this crate — `support::re` + `support::pattern`,
+// imported above.
+//
+// This module used to carry its own `re()` + `pattern!`, and justified the duplication like this:
+// "`support.rs` compiles its patterns per call and says so; that is fine for a support-ticket
+// redaction that runs once." The first clause was true and is not any more (support.rs caches now).
+// THE SECOND CLAUSE WAS NEVER TRUE, AND IT IS WHAT LET THE DEFECT SHIP: `redact_secrets` is not a
+// once-per-click cost. `logging.rs` wraps BOTH tracing sink layers in `RedactingMakeWriter` and
+// `redacting_writer.rs` calls it inside `Write::write`, so it runs twice per log line, on whatever
+// thread emitted the event — the main thread included. It was measured recompiling seven regexes
+// there during a 10.2s UI freeze. Sharing the helper is the structural fix for the reasoning error:
+// a caching change now cannot land on one side and miss the other.
+//
+// `footer_bar` below still builds its own cell inline: its pattern is ASSEMBLED at runtime from
+// `FOOTER_KEY_ATOM`, so it is not the `&'static str` the macro takes.
 
 // ── THE CLAUDE CODE TUI ───────────────────────────────────────────────────────────────────────
 // Ported from `engine/screenClassifier.ts`. Where a pattern below differs from its TS original the

@@ -17,8 +17,10 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::Duration;
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Runtime};
@@ -44,6 +46,48 @@ fn web_base_url() -> String {
         .unwrap_or_else(|_| DEFAULT_WEB_BASE_URL.to_string())
 }
 
+// ── Compile-once regex plumbing (shared with `nudge_gate.rs`) ───────────────────────────────────
+
+/// Compile a static pattern EXACTLY ONCE and hand out the cached `Regex` forever after.
+///
+/// `std::sync::OnceLock` is in std, so this costs no dependency. THE ONE COPY of this helper in the
+/// crate: `nudge_gate.rs` imports `pattern!` from here rather than keeping its own, so a fix to the
+/// caching strategy cannot land in one place and miss the other.
+///
+/// `expect` rather than a silent fallback: every caller passes a `&'static str` literal, so a bad
+/// pattern is a COMPILE-TIME CONSTANT that is wrong in the source — it cannot depend on input,
+/// runtime state, or the contents of a log line. It therefore fires on the first call after a bad
+/// edit (startup-ish, and deterministically in the unit tests below), never selectively in the
+/// field. That is the same trade `nudge_gate.rs` already made.
+pub(crate) fn re(cell: &'static OnceLock<Regex>, pattern: &'static str) -> &'static Regex {
+    cell.get_or_init(|| Regex::new(pattern).expect("static pattern must compile"))
+}
+
+/// Declare a cached-regex accessor. Two forms, one implementation:
+///   * `pattern!(name, r"…")` — the cell is anonymous, scoped inside the accessor. What
+///     `nudge_gate.rs` uses.
+///   * `pattern!(name, CELL, r"…")` — the cell is a module-level static under the given name, so a
+///     test can ask whether it has been INITIALISED YET without initialising it (which is how the
+///     "compiled once, not per call" test below observes the cache instead of asserting a timing).
+///
+/// Everything inside the expansion is absolutely-pathed so the macro works in any module regardless
+/// of what that module happens to have imported.
+macro_rules! pattern {
+    ($name:ident, $src:expr) => {
+        fn $name() -> &'static ::regex::Regex {
+            static CELL: ::std::sync::OnceLock<::regex::Regex> = ::std::sync::OnceLock::new();
+            $crate::support::re(&CELL, $src)
+        }
+    };
+    ($name:ident, $cell:ident, $src:expr) => {
+        static $cell: ::std::sync::OnceLock<::regex::Regex> = ::std::sync::OnceLock::new();
+        fn $name() -> &'static ::regex::Regex {
+            $crate::support::re(&$cell, $src)
+        }
+    };
+}
+pub(crate) use pattern;
+
 // ── Log tailing + redaction ─────────────────────────────────────────────────────────────────────
 
 const REDACTED: &str = "«redacted»";
@@ -64,81 +108,116 @@ const REDACTED: &str = "«redacted»";
 ///     mixed-case, single-case, and off-length hex tokens — while KEEPING dashed UUIDs and canonical
 ///     40/64-char git hashes so those stay legible for debugging
 pub fn redact_secrets(input: &str) -> String {
-    // Compiled per-call: redaction runs at most once per "open ticket" click, so the cost is
-    // irrelevant and we avoid pulling in a lazy-init crate. Each `Regex::new` here is over a
-    // static, known-valid pattern, so `.unwrap()` cannot fire in practice — but we fall back to
-    // the identity transform on the impossible error rather than panicking on a debug log.
-    fn sub(re: &str, rep: &str, s: &str) -> String {
-        match regex::Regex::new(re) {
-            Ok(r) => r.replace_all(s, rep).into_owned(),
-            Err(_) => s.to_string(),
-        }
-    }
-
     let mut out = input.to_string();
     // JWTs first (three base64url segments).
-    out = sub(r"eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}", REDACTED, &out);
-    // `Authorization: <value>` / `Authorization = <value>` — consume an optional AUTH SCHEME word
-    // (Bearer / Basic / Digest / Negotiate / …) plus the credential token, but STOP at whitespace so
-    // trailing correlation fields on the same line (`… requestId=abc worktree=<uuid>`) are preserved.
-    // The scheme is `\w+\s+` (not just `Bearer`) so a non-Bearer scheme's credential can't leak as a
-    // separate token. Runs BEFORE the Bearer rule and swallows the whole `<scheme> <token>`.
-    out = sub(
-        r"(?i)\bAuthorization\b\s*[:=]\s*(?:\w+\s+)?[^\s,]+",
-        "Authorization: «redacted»",
-        &out,
-    );
-    // Standalone `Bearer <token>` (keep the scheme word so the log still reads sensibly).
-    out = sub(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+", "Bearer «redacted»", &out);
-    // Provider secret keys.
-    out = sub(r"(?i)sk-[A-Za-z0-9_-]{16,}", REDACTED, &out);
-    // Secret assignments: NAME_(API|API_KEY|TOKEN|SECRET|PASSWORD|KEY) = value. Handles bare, quoted,
-    // AND JSON shapes — `KEY=v`, `key: "v"`, `"apiKey":"v"` — by allowing optional quotes around the
-    // name and an optional opening quote on the value (kept in the capture so it reads sensibly). The
-    // value stops at whitespace/quote/comma/brace so we redact just the secret, not the rest of a line.
-    out = sub(
-        r#"(?i)("?[A-Z0-9_]*(?:API(?:_KEY)?|TOKEN|SECRET|PASSWORD|KEY)"?\s*[:=]\s*"?)[^\s"',}]+"#,
-        "$1«redacted»",
-        &out,
-    );
-    // Credentials embedded in a URL userinfo: `scheme://user:secret@host` → keep everything up to and
-    // including `user:`, redact the password, keep `@host`. (A URL with no `user:…@` won't match, so
-    // ordinary links and `host:port` are untouched.)
-    out = sub(
-        r"(?i)([a-z][a-z0-9+.-]*://[^\s:/@]+:)[^\s@/]+@",
-        "$1«redacted»@",
-        &out,
-    );
-    // Leftover high-entropy blobs (unlabeled tokens with no `key=`/`Bearer`/`sk-` context). A closure
-    // decides per-match so we PRESERVE the identifiers a human needs while still catching secret
-    // shapes. We redact a dash-free, letters-AND-digits run of 40+ — which covers mixed-case,
-    // single-case (`ABCD12…`), and off-length hex tokens — but KEEP:
-    //   - dashed forms (UUID worktree/agent ids),
-    //   - canonical git-object hashes: exactly 40- or 64-char hex (SHA-1 / SHA-256),
-    //   - pure-digit or pure-letter runs (not token-shaped).
-    // Base64 tokens containing `+`/`/`/`=` are only partially covered (those chars split the run);
-    // in practice such secrets arrive labeled (JWT/Bearer/`sk-`/env), which the rules above catch.
-    out = match regex::Regex::new(r"[A-Za-z0-9_-]{40,}") {
-        Ok(r) => r
-            .replace_all(&out, |c: &regex::Captures| {
-                let t = &c[0];
-                let len = t.len();
-                let is_hex = t.bytes().all(|b| b.is_ascii_hexdigit());
-                let has_dash = t.contains('-');
-                let has_letter = t.bytes().any(|b| b.is_ascii_alphabetic());
-                let has_digit = t.bytes().any(|b| b.is_ascii_digit());
-                let is_canonical_git_hash = is_hex && (len == 40 || len == 64);
-                if !has_dash && has_letter && has_digit && !is_canonical_git_hash {
-                    REDACTED.to_string()
-                } else {
-                    t.to_string()
-                }
-            })
-            .into_owned(),
-        Err(_) => out,
-    };
+    out = jwt().replace_all(&out, REDACTED).into_owned();
+    out = authorization_header()
+        .replace_all(&out, "Authorization: «redacted»")
+        .into_owned();
+    out = bearer_token()
+        .replace_all(&out, "Bearer «redacted»")
+        .into_owned();
+    out = provider_key().replace_all(&out, REDACTED).into_owned();
+    out = secret_assignment()
+        .replace_all(&out, "$1«redacted»")
+        .into_owned();
+    out = url_userinfo()
+        .replace_all(&out, "$1«redacted»@")
+        .into_owned();
+    // The catch-all's closure decides per-match so we PRESERVE the identifiers a human needs while
+    // still catching secret shapes — see `high_entropy_blob` for which shapes survive and why.
+    out = high_entropy_blob()
+        .replace_all(&out, |c: &regex::Captures| {
+            let t = &c[0];
+            let len = t.len();
+            let is_hex = t.bytes().all(|b| b.is_ascii_hexdigit());
+            let has_dash = t.contains('-');
+            let has_letter = t.bytes().any(|b| b.is_ascii_alphabetic());
+            let has_digit = t.bytes().any(|b| b.is_ascii_digit());
+            let is_canonical_git_hash = is_hex && (len == 40 || len == 64);
+            if !has_dash && has_letter && has_digit && !is_canonical_git_hash {
+                REDACTED.to_string()
+            } else {
+                t.to_string()
+            }
+        })
+        .into_owned();
     out
 }
+
+// THE PATTERNS, COMPILED ONCE EACH — and this is a HOT PATH, not the once-per-click cost the old
+// comment here claimed.
+//
+// That claim ("redaction runs at most once per 'open ticket' click, so the cost is irrelevant") was
+// true when it was written and is now false: `logging.rs` wraps BOTH tracing sink layers (the
+// rolling file appender AND stderr) in `RedactingMakeWriter`, and `redacting_writer.rs` calls
+// `redact_secrets` inside `Write::write`. So this runs ONCE PER FORMATTED TRACING EVENT, PER LAYER —
+// twice per log line, at ~90-145K events/day, on whichever thread emitted the event, INCLUDING the
+// AppKit main thread during a Tauri IPC command. Recompiling seven regexes there was measured (a
+// `/usr/bin/sample` of shipped 0.96.1 during a 10.2s UI freeze) as main-thread time inside
+// `regex_automata`'s NFA/DFA compiler, reached through `Event::dispatch` → `RedactingWriter`.
+//
+// ORDER IS SECURITY-RELEVANT and is fixed by `redact_secrets` above, not by this list: JWT runs
+// before Authorization, which runs before Bearer, so the broader rule swallows the whole
+// `<scheme> <token>` and the narrower one cannot double-redact what is left.
+//
+// Each cell is named so the test below can ask whether it is INITIALISED without initialising it.
+
+pattern!(
+    jwt,
+    JWT_CELL,
+    r"eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}"
+);
+
+// `Authorization: <value>` / `Authorization = <value>` — consume an optional AUTH SCHEME word
+// (Bearer / Basic / Digest / Negotiate / …) plus the credential token, but STOP at whitespace so
+// trailing correlation fields on the same line (`… requestId=abc worktree=<uuid>`) are preserved.
+// The scheme is `\w+\s+` (not just `Bearer`) so a non-Bearer scheme's credential can't leak as a
+// separate token. Runs BEFORE the Bearer rule and swallows the whole `<scheme> <token>`.
+pattern!(
+    authorization_header,
+    AUTHORIZATION_HEADER_CELL,
+    r"(?i)\bAuthorization\b\s*[:=]\s*(?:\w+\s+)?[^\s,]+"
+);
+
+// Standalone `Bearer <token>` (keep the scheme word so the log still reads sensibly).
+pattern!(
+    bearer_token,
+    BEARER_TOKEN_CELL,
+    r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+"
+);
+
+// Provider secret keys.
+pattern!(provider_key, PROVIDER_KEY_CELL, r"(?i)sk-[A-Za-z0-9_-]{16,}");
+
+// Secret assignments: NAME_(API|API_KEY|TOKEN|SECRET|PASSWORD|KEY) = value. Handles bare, quoted,
+// AND JSON shapes — `KEY=v`, `key: "v"`, `"apiKey":"v"` — by allowing optional quotes around the
+// name and an optional opening quote on the value (kept in the capture so it reads sensibly). The
+// value stops at whitespace/quote/comma/brace so we redact just the secret, not the rest of a line.
+pattern!(
+    secret_assignment,
+    SECRET_ASSIGNMENT_CELL,
+    r#"(?i)("?[A-Z0-9_]*(?:API(?:_KEY)?|TOKEN|SECRET|PASSWORD|KEY)"?\s*[:=]\s*"?)[^\s"',}]+"#
+);
+
+// Credentials embedded in a URL userinfo: `scheme://user:secret@host` → keep everything up to and
+// including `user:`, redact the password, keep `@host`. (A URL with no `user:…@` won't match, so
+// ordinary links and `host:port` are untouched.)
+pattern!(
+    url_userinfo,
+    URL_USERINFO_CELL,
+    r"(?i)([a-z][a-z0-9+.-]*://[^\s:/@]+:)[^\s@/]+@"
+);
+
+// Leftover high-entropy blobs (unlabeled tokens with no `key=`/`Bearer`/`sk-` context). We redact a
+// dash-free, letters-AND-digits run of 40+ — which covers mixed-case, single-case (`ABCD12…`), and
+// off-length hex tokens — but KEEP:
+//   - dashed forms (UUID worktree/agent ids),
+//   - canonical git-object hashes: exactly 40- or 64-char hex (SHA-1 / SHA-256),
+//   - pure-digit or pure-letter runs (not token-shaped).
+// Base64 tokens containing `+`/`/`/`=` are only partially covered (those chars split the run);
+// in practice such secrets arrive labeled (JWT/Bearer/`sk-`/env), which the rules above catch.
+pattern!(high_entropy_blob, HIGH_ENTROPY_BLOB_CELL, r"[A-Za-z0-9_-]{40,}");
 
 /// Read up to `max` bytes from the END of a file, dropping a leading partial line so the tail
 /// starts on a clean record. UTF-8-lossy so a non-text byte in the log can't fail the whole read.
@@ -539,6 +618,92 @@ mod tests {
     fn read_recent_logs_stays_off_the_event_loop() {
         // Tailing + regex-redacting up to 200 KB of logs is blocking filesystem work.
         assert_async_command(read_recent_logs::<tauri::Wry>);
+    }
+
+    // ── The compile-once guard ──────────────────────────────────────────────────────────────────
+
+    /// Every pattern cell, paired with its name for a readable failure. Taking `&STATIC` does NOT
+    /// initialise a `OnceLock` — only `get_or_init` (i.e. an accessor call) does — so this list can
+    /// observe the cache without being the thing that fills it.
+    fn cells() -> Vec<(&'static str, &'static OnceLock<Regex>)> {
+        vec![
+            ("jwt", &JWT_CELL),
+            ("authorization_header", &AUTHORIZATION_HEADER_CELL),
+            ("bearer_token", &BEARER_TOKEN_CELL),
+            ("provider_key", &PROVIDER_KEY_CELL),
+            ("secret_assignment", &SECRET_ASSIGNMENT_CELL),
+            ("url_userinfo", &URL_USERINFO_CELL),
+            ("high_entropy_blob", &HIGH_ENTROPY_BLOB_CELL),
+        ]
+    }
+
+    /// `redact_secrets` must go through the CACHE, not `Regex::new`.
+    ///
+    /// This asserts the side effect of the fix rather than its timing (a timing assertion here would
+    /// be flaky and would not say WHY it was slow). The cells above are private to this module and
+    /// NOTHING initialises them except the seven accessors, which only `redact_secrets` calls — so
+    /// "every cell is populated after one call" is a direct statement about the code path that call
+    /// took. Revert the body to per-call `regex::Regex::new(...)` and every cell stays `None`,
+    /// whatever else the suite ran first, because the accessors are then dead code.
+    ///
+    /// The second half pins the consequence that matters on the hot path (`redacting_writer.rs`
+    /// calls this once per tracing event, per sink layer): a second call REUSES the same compiled
+    /// instances rather than building new ones.
+    #[test]
+    fn redact_secrets_compiles_each_pattern_once_not_per_call() {
+        // Exercise every rule in one string so no cell can stay cold for want of a match — though
+        // `replace_all` runs the matcher either way, so even a non-matching input must populate all
+        // seven.
+        //
+        // The URL userinfo goes through `shaped()` for the reason given above: spelled inline, a
+        // scheme followed by a colon-separated user/password pair and an `@` is a live match for the
+        // URL-credential rule in BOTH the DENY and SECRET_SCAN lists of scripts/publish-public.sh,
+        // which greps the exported SOURCE text. Gate 1 has no allowlist or path exemption, so
+        // inlining that shape here freezes the public mirror on merge to main. Keep the colon out of
+        // the format string; the runtime value is unchanged, so the rule is still exercised.
+        //
+        // This comment cannot spell the offending shape out either — gate 1 greps every line of the
+        // export, comments included, and an illustrative example here trips it exactly as the code
+        // did. Describe the shape; never write it.
+        let sample = format!(
+            "Authorization: Bearer eyJabc.defghijklmnop.qrstuvwx1234 KEY={} url postgres://{}@h ok",
+            shaped("sk-", "abcDEF123456789_ghiJKL"),
+            shaped("u:", "p")
+        );
+        let _ = redact_secrets(&sample);
+
+        let first: Vec<*const Regex> = cells()
+            .into_iter()
+            .map(|(name, cell)| {
+                let r = cell.get().unwrap_or_else(|| {
+                    panic!(
+                        "redact_secrets did not use the cached `{name}` regex — it is recompiling \
+                         patterns per call, on a path that runs twice per log line"
+                    )
+                });
+                r as *const Regex
+            })
+            .collect();
+
+        // A second call must reuse the very same compiled instances.
+        let _ = redact_secrets(&sample);
+        for ((name, cell), before) in cells().into_iter().zip(first) {
+            let after = cell.get().expect("cell emptied itself") as *const Regex;
+            assert!(
+                std::ptr::eq(before, after),
+                "`{name}` was recompiled between calls"
+            );
+        }
+    }
+
+    /// The shared helper `nudge_gate.rs` now imports. Pinned here so a change that makes `re()`
+    /// hand back a fresh `Regex` fails in the module that owns it, not only in the gate.
+    #[test]
+    fn re_returns_the_same_instance_every_time() {
+        static CELL: OnceLock<Regex> = OnceLock::new();
+        let a = re(&CELL, r"\d+");
+        let b = re(&CELL, r"\d+");
+        assert!(std::ptr::eq(a, b), "re() recompiled a cached pattern");
     }
 
     // Fixtures below assemble their fake, secret-SHAPED strings at runtime from split pieces, so no

@@ -269,7 +269,35 @@ mod main_thread_guard {
     /// are still counted, and skips intervening doc comments and further attributes so a documented
     /// command is not missed.
     fn command_is_async(src: &str, name: &str) -> Option<bool> {
+        for decl in command_decls(src) {
+            // `fn <name>(` / `fn <name><` — the paren/angle guards against `read_prd` matching
+            // `read_prd_impl`.
+            let is_this = decl.contains(&format!("fn {name}("))
+                || decl.contains(&format!("fn {name}<"));
+            if is_this {
+                return Some(decl.contains("async fn"));
+            }
+        }
+        None
+    }
+
+    /// The declaration line of every `#[tauri::command]` in `src`, in source order.
+    ///
+    /// This is the ONE walk behind both questions the guard asks — "is the command named `x`
+    /// async?" (`command_is_async`) and "which commands exist at all?" (`command_name_of` +
+    /// the sweep). Sharing it is the point: two separate parsers could disagree about what counts
+    /// as a command, and the sweep would then exempt a name the named guard cannot find, or miss a
+    /// command the named guard sees.
+    ///
+    /// Matches the attribute with `starts_with("#[tauri::command")` so the attribute-with-args
+    /// forms (`#[tauri::command(async)]`, `#[tauri::command(rename_all = ...)]`) still count, and
+    /// steps over intervening doc comments and further attributes so a documented command is not
+    /// missed. A `#[tauri::command]` appearing INSIDE a Rust string literal (this module's own
+    /// scanner fixtures do exactly that) is not matched, because the physical line it sits on
+    /// starts with the `let … = "` of the literal, not with the attribute.
+    fn command_decls(src: &str) -> Vec<&str> {
         let lines: Vec<&str> = src.lines().collect();
+        let mut out = Vec::new();
         for (i, line) in lines.iter().enumerate() {
             if !line.trim_start().starts_with("#[tauri::command") {
                 continue;
@@ -285,17 +313,217 @@ mod main_thread_guard {
                     break;
                 }
             }
-            let decl = *lines.get(j)?;
-            // `fn <name>(` / `fn <name><` — the paren/angle guards against `read_prd` matching
-            // `read_prd_impl`.
-            let is_this = decl.contains(&format!("fn {name}("))
-                || decl.contains(&format!("fn {name}<"));
-            if is_this {
-                return Some(decl.contains("async fn"));
+            if let Some(decl) = lines.get(j) {
+                out.push(*decl);
             }
         }
-        None
+        out
     }
+
+    /// The command's identifier, from a declaration line `command_decls` produced.
+    ///
+    /// `None` when the line has no `fn <ident>` at all — which means the attribute→declaration walk
+    /// landed somewhere unexpected, and the sweep must fail rather than quietly skip a command.
+    fn command_name_of(decl: &str) -> Option<&str> {
+        // `split("fn ")` is safe against a generic bound like `F: Fn(u8)`: that spells `Fn`, and
+        // this needle is lowercase.
+        let after = decl.split("fn ").nth(1)?;
+        let end = after
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(after.len());
+        let name = &after[..end];
+        if name.is_empty() {
+            None
+        } else {
+            Some(name)
+        }
+    }
+
+    /// Every `.rs` file under this crate's `src/`, recursively, sorted for a stable report.
+    ///
+    /// `std::fs` + a real directory walk rather than `include_str!`, which needs literal paths and
+    /// is therefore a hand-maintained list — the exact shape of the opt-in this sweep replaces.
+    /// Recursion is load-bearing: the dictation commands live in `dictation/commands.rs`, and the
+    /// `GUARDED` table below carries a comment about a file move that broke the old guard once.
+    /// A walk cannot be broken that way.
+    fn rust_sources() -> Vec<std::path::PathBuf> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let entries = std::fs::read_dir(dir)
+                .unwrap_or_else(|e| panic!("cmd sweep: cannot read {}: {e}", dir.display()));
+            for entry in entries {
+                let path = entry.expect("cmd sweep: unreadable dir entry").path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out = Vec::new();
+        walk(&root, &mut out);
+        out.sort();
+        out
+    }
+
+    /// Which `EXEMPT` entries have gone stale, given what the sweep actually found
+    /// (`seen`: command name -> is it async).
+    ///
+    /// Returns `(vanished, converted)`: names that match no command at all, and names whose
+    /// command is now async. Both are failures — an exemption that outlives the command it excused
+    /// is how the NEXT sync regression on that name gets waved through, and it is the exact shape
+    /// the `GUARDED` opt-in's `None => panic!` arm was protecting against.
+    ///
+    /// A free function over its inputs rather than a block inside the sweep, so it can be driven
+    /// with synthetic data and proved to fire — the sweep itself can only ever exercise the
+    /// all-clean case, since a real stale entry would red the build.
+    fn stale_exemptions<'a>(
+        exempt: &[&'a str],
+        seen: &std::collections::BTreeMap<String, bool>,
+    ) -> (Vec<&'a str>, Vec<&'a str>) {
+        let vanished = exempt.iter().copied().filter(|n| !seen.contains_key(*n)).collect();
+        let converted = exempt.iter().copied().filter(|n| seen.get(*n) == Some(&true)).collect();
+        (vanished, converted)
+    }
+
+    /// A path relative to `src/`, for messages a human has to act on.
+    fn rel(path: &std::path::Path) -> String {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        path.strip_prefix(&root).unwrap_or(path).to_string_lossy().into_owned()
+    }
+
+    /// ── SYNC-COMMAND DEBT, NOT A LIST OF APPROVALS ────────────────────────────────────────────
+    /// Every `#[tauri::command]` in this crate that still runs its body INLINE on the AppKit main
+    /// thread. The sweep below fails on any sync command NOT named here, so this list is the
+    /// complete, visible inventory of the `sparkle-rfhu5` debt rather than a set of commands
+    /// anyone decided were fine.
+    ///
+    /// It started at 100 entries the day it was written — out of 330 distinct commands in the
+    /// crate — and that size is the point: the guard it replaced was an 8-name OPT-IN, so a
+    /// command was covered only if someone remembered to add it. That is exactly how
+    /// `frontend_log`, the highest-frequency command in the app at 90K-145K invokes/day, sat sync
+    /// and unguarded while the guard reported green. Inverting it makes the debt countable and
+    /// makes every NEW sync command an argument someone has to make out loud.
+    ///
+    /// RULES:
+    ///   * Adding a name here is a deliberate act. Prefer converting the command to
+    ///     `pub async fn` + `tauri::async_runtime::spawn_blocking` — that is the fix, this is the
+    ///     acknowledgement that it has not been done yet.
+    ///   * REMOVING a name is what converting a command looks like. The sweep fails on a stale
+    ///     entry — one naming a command that is now async, or one naming no command at all — so an
+    ///     exemption cannot outlive the command it excused and go on hiding the next regression.
+    ///   * Keyed by NAME, never by file, so moving a command between files cannot silently break
+    ///     coverage the way it once broke `GUARDED`.
+    ///   * Sorted and deduplicated; the sweep asserts that, so entries land in a reviewable place
+    ///     instead of being appended wherever the diff was smallest.
+    ///
+    /// A handful here are permanently sync ON PURPOSE — `watchdog_heartbeat` is two relaxed atomic
+    /// stores and is documented as the cheapest possible command precisely so it can never
+    /// contribute to the stall it watches for. They are not distinguished from real debt, because
+    /// the sweep's job is to make every sync body visible, and a per-entry rationale field would
+    /// invite writing one for the ones that need converting too.
+    const EXEMPT: &[&str] = &[
+        "accounts_add",
+        "accounts_import_default",
+        "accounts_mark_exhausted",
+        "accounts_remove",
+        "accounts_set_nickname",
+        "app_version",
+        "append_concierge_guideline",
+        "append_note",
+        "chief_pat",
+        "chief_pat_secure_clear",
+        "chief_pat_secure_get",
+        "chief_pat_secure_set",
+        "claude_chat_cancel",
+        "clear_window_roster",
+        "concierge_cancel",
+        "concierge_guidelines_path",
+        "concierge_lint_log",
+        "config_file_paths",
+        "conflict_clear_flag",
+        "conflict_flags",
+        "conflict_probe_status",
+        "control_mcp_paths",
+        "control_respond",
+        "copy_capture_asset",
+        "desktop_bearer_token",
+        "desktop_begin_signin",
+        "desktop_has_token",
+        "desktop_sign_out",
+        "desktop_take_pending_deeplink",
+        "display_layout",
+        "fit_window_to_current_display",
+        "flush_crash_reports",
+        "get_audio_input_settings",
+        "get_config",
+        "get_frontmost",
+        "get_helper_vitals",
+        "get_roster",
+        "github_default_project_dir",
+        "hide_capture_window",
+        "hide_helper",
+        "is_capture_open",
+        "log_dir",
+        "notify_attention",
+        "notify_frontend_shown",
+        "nudger_clear_flag",
+        "nudger_flags",
+        "nudger_send_escape",
+        "orchestration_respond",
+        "orchestrator_mcp_paths",
+        "plugin_install_outcomes",
+        "pr_claim_release",
+        "pr_claim_set",
+        "pr_claims_list",
+        "pty_ack",
+        "pty_live_epoch",
+        "pty_live_sessions",
+        "pty_resize",
+        "pty_set_paused",
+        "pty_write",
+        "publish_helper_vitals",
+        "publish_window_roster",
+        "quit_app",
+        "read_concierge_guidelines",
+        "read_config_text",
+        "read_prd",
+        "recover_drag_paths",
+        "refresh_preflight",
+        "reset_config",
+        "reset_window_size",
+        "reveal_logs",
+        "set_allow_virtual_input",
+        "set_audio_input",
+        "set_config_value",
+        "set_config_values",
+        "set_helper_bounds",
+        "set_helper_menu_state",
+        "set_project_config_value",
+        "set_project_window_bounds",
+        "set_stage_definition",
+        "set_window_attention",
+        "show_capture_window",
+        "show_helper",
+        "show_main_window",
+        "span_window",
+        "sparkle_improve_cancel",
+        "sparkle_improve_run",
+        "start_concierge_control_bridge",
+        "start_control_bridge",
+        "start_orchestration_bridge",
+        "stop_control_bridge",
+        "stop_orchestration_bridge",
+        "support_metadata",
+        "trial_start",
+        "trial_status",
+        "unset_config_value",
+        "unset_project_config_value",
+        "watchdog_heartbeat",
+        "write_concierge_guidelines",
+        "write_config_text",
+        "write_prd",
+    ];
 
     /// Every command moved off the main thread, by the file that owns it. Adding a conversion?
     /// Add it here, or nothing stops the next refactor putting it back on the UI thread.
@@ -349,6 +577,120 @@ mod main_thread_guard {
             "every guarded command must have been positively verified"
         );
         assert!(checked >= 8, "expected at least the 8 converted commands, verified {checked}");
+    }
+
+    /// THE SWEEP. Every `#[tauri::command]` in `src/`, not a list someone remembered to extend.
+    ///
+    /// `GUARDED` above is an OPT-IN, and an opt-in guard only ever guards what it was told about.
+    /// It named 8 commands. The crate declares 341 `#[tauri::command]`s across 79 files — 330
+    /// distinct names, 100 of them still sync — so the opt-in covered 2.4% of the surface it was
+    /// written to protect. The command it did not cover included `frontend_log`, the single
+    /// hottest command in the app, which froze the UI on the main thread 90K-145K times a day
+    /// while this guard reported green for its entire existence. This test inverts the default:
+    /// sync is a FAILURE, and `EXEMPT` is the visible cost of the ones not yet fixed.
+    #[test]
+    fn every_tauri_command_is_async_or_explicitly_exempt() {
+        // The exemption list is reviewed by humans, so make it reviewable.
+        let mut sorted = EXEMPT.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(
+            EXEMPT,
+            sorted.as_slice(),
+            "EXEMPT must be sorted, so an addition lands where a reviewer expects it"
+        );
+        let mut deduped = sorted.clone();
+        deduped.dedup();
+        assert_eq!(
+            sorted.len(),
+            deduped.len(),
+            "EXEMPT has a duplicate entry — two exemptions for one command hide a removal"
+        );
+
+        // name -> is_async. A name declared in two files is async only if EVERY declaration is;
+        // an exemption is keyed by name, so the pessimistic fold is the safe one.
+        let mut seen: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
+        let mut offenders: Vec<String> = Vec::new();
+        let mut checked = 0usize;
+        let mut files_with_commands = 0usize;
+
+        for path in rust_sources() {
+            let src = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cmd sweep: cannot read {}: {e}", path.display()));
+            let decls = command_decls(&src);
+            if decls.is_empty() {
+                continue;
+            }
+            files_with_commands += 1;
+            for decl in decls {
+                let name = command_name_of(decl).unwrap_or_else(|| {
+                    panic!(
+                        "{}: a `#[tauri::command]` attribute is followed by `{}`, which has no \
+                         `fn <name>` — the sweep cannot tell what command that is, so it must not \
+                         pass. Fix the declaration or the walk in `command_decls`.",
+                        rel(&path),
+                        decl.trim()
+                    )
+                });
+                // Reuse the named scanner rather than reading asyncness off `decl` here: one
+                // answer, from one parser, for both halves of this guard.
+                let is_async = command_is_async(&src, name).unwrap_or_else(|| {
+                    panic!(
+                        "{}: `command_is_async` cannot find `{name}` that `command_decls` just \
+                         reported — the two halves of the scanner disagree.",
+                        rel(&path)
+                    )
+                });
+                checked += 1;
+                seen.entry(name.to_string())
+                    .and_modify(|a| *a &= is_async)
+                    .or_insert(is_async);
+                if !is_async && !EXEMPT.contains(&name) {
+                    offenders.push(format!("  {}: {name}", rel(&path)));
+                }
+            }
+        }
+
+        // ANTI-VACUITY. A walk that finds nothing — wrong root, a `read_dir` that stopped at the
+        // first subdirectory, an attribute spelling that stopped matching — must FAIL, not report
+        // a clean sweep. Floors rather than exact counts so ordinary churn does not red the build;
+        // both are far below the real figures (~330 commands across ~90 files) and far above zero.
+        assert!(
+            checked >= 200,
+            "the sweep found only {checked} `#[tauri::command]`s — this crate has ~330, so the \
+             walk or the attribute match is broken and every assertion below it is worthless"
+        );
+        assert!(
+            files_with_commands >= 10,
+            "the sweep found commands in only {files_with_commands} file(s) — the directory walk \
+             is not recursing"
+        );
+
+        // A stale exemption is how a converted command's excuse outlives it and goes on hiding the
+        // next regression, so both stale shapes are failures.
+        let (vanished, converted) = stale_exemptions(EXEMPT, &seen);
+        assert!(
+            vanished.is_empty(),
+            "EXEMPT names {} command(s) that no longer exist: {vanished:?}. They were renamed or \
+             removed, so those exemptions guard nothing — delete them.",
+            vanished.len()
+        );
+        assert!(
+            converted.is_empty(),
+            "EXEMPT names {} command(s) that are now ASYNC: {converted:?}. The debt was paid — \
+             remove them, or the exemption silently re-permits a revert to sync.",
+            converted.len()
+        );
+
+        assert!(
+            offenders.is_empty(),
+            "{} `#[tauri::command]`(s) are SYNC and not in EXEMPT, so their bodies run inline on \
+             the AppKit main thread and freeze the whole UI for their duration (bead \
+             sparkle-rfhu5):\n{}\n\nFix: make each `pub async fn` + \
+             `tauri::async_runtime::spawn_blocking`. If it genuinely must stay sync, add its name \
+             to EXEMPT — deliberately, and read that list's header comment first.",
+            offenders.len(),
+            offenders.join("\n")
+        );
     }
 
     /// `HistoryDb` is managed CONDITIONALLY — `lib.rs` skips `manage` when the DB fails to open,
@@ -414,6 +756,61 @@ mod main_thread_guard {
         let src = "#[tauri::command]\npub fn thing_sync(x: u8) {}\n";
         assert_eq!(command_is_async(src, "thing"), None, "`thing` must not match `thing_sync`");
         assert_eq!(command_is_async(src, "thing_sync"), Some(false));
+    }
+
+    /// ANTI-VACUITY FOR THE SWEEP'S NAME EXTRACTOR. The sweep can only ever assert the all-clean
+    /// case, so the piece that decides WHICH command a declaration is has to be pinned directly.
+    /// If this returned `None` for real declarations the sweep would panic rather than pass, but
+    /// if it returned the WRONG name it would exempt-match against a name nobody wrote and let a
+    /// sync command through silently.
+    #[test]
+    fn the_name_extractor_reads_the_command_identifier_off_a_declaration() {
+        assert_eq!(command_name_of("pub fn frontend_log(entry: FrontendLog) {"), Some("frontend_log"));
+        assert_eq!(command_name_of("pub async fn history_record(app: AppHandle) {"), Some("history_record"));
+        // Generic commands are the common shape in `logging.rs`; the angle bracket terminates the
+        // identifier just as the paren does.
+        assert_eq!(command_name_of("pub fn app_version<R: Runtime>(app: AppHandle<R>) -> String {"), Some("app_version"));
+        assert_eq!(command_name_of("pub(crate) async fn scoped_thing() {"), Some("scoped_thing"));
+        // `Fn` in a bound must not be mistaken for the `fn` keyword — the needle is lowercase.
+        assert_eq!(command_name_of("pub fn takes_a_closure<F: Fn(u8)>(f: F) {"), Some("takes_a_closure"));
+        // No `fn` at all: the walk landed somewhere unexpected and the sweep must fail, not skip.
+        assert_eq!(command_name_of("pub struct NotACommand {"), None);
+    }
+
+    /// ANTI-VACUITY FOR THE STALENESS RULE. This is the property the old `GUARDED` table bought
+    /// with its `None => panic!` arm, and the sweep would report it as green forever if the rule
+    /// were inverted or dropped — a clean EXEMPT list produces empty vectors either way.
+    #[test]
+    fn a_stale_exemption_is_reported_whether_the_command_vanished_or_was_converted() {
+        let seen = std::collections::BTreeMap::from([
+            ("still_sync".to_string(), false),
+            ("now_async".to_string(), true),
+        ]);
+        let (vanished, converted) =
+            stale_exemptions(&["gone_entirely", "now_async", "still_sync"], &seen);
+        assert_eq!(vanished, vec!["gone_entirely"], "a name matching no command must be reported");
+        assert_eq!(converted, vec!["now_async"], "an exemption for an async command must be reported");
+        // …and a genuinely-still-sync exemption must NOT be, or the sweep could never be green.
+        let (v, c) = stale_exemptions(&["still_sync"], &seen);
+        assert!(v.is_empty() && c.is_empty(), "a live exemption must not be flagged stale");
+    }
+
+    /// The sweep's whole reason for existing: `frontend_log` is the highest-frequency command in
+    /// the app (90K-145K invokes/day from `logger.ts`) and the 8-name opt-in never covered it.
+    /// Pin it by name so a revert to `pub fn` is named in the failure, not just counted.
+    #[test]
+    fn frontend_log_the_hottest_command_in_the_app_is_off_the_main_thread() {
+        assert_eq!(
+            command_is_async(include_str!("logging.rs"), "frontend_log"),
+            Some(true),
+            "`frontend_log` sinks every frontend log line; sync, it dispatches a full `tracing` \
+             event through both redacting sink layers INLINE on the AppKit main thread, tens of \
+             thousands of times a day (bead sparkle-rfhu5)"
+        );
+        assert!(
+            !EXEMPT.contains(&"frontend_log"),
+            "`frontend_log` must never be exempted — it is the command this sweep was built for"
+        );
     }
 
     /// Doc comments between the attribute and the declaration are the norm in this crate — every
