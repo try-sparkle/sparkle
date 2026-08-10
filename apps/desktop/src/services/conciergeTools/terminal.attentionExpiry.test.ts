@@ -123,11 +123,45 @@ function ledgerSeesWorkAfterTheAsk(raisedAtOffset: number, workedAtOffset: numbe
 
 beforeEach(() => {
   vi.clearAllMocks();
-  // Both are module singletons shared by every case in this file.
-  useRuntimeStore.setState({ status: {}, attentionScreen: {} });
+  // All three are module singletons shared by every case in this file.
+  //
+  // `attentionScreenAt` IS THE THIRD KEY FOR A REASON (roborev 61979). zustand's `setState` merges
+  // SHALLOWLY, so a reset naming only the first two leaves the stamp map carrying whatever the
+  // previous case put there — and that leak is permanent, because `setStatus`'s clear is gated on
+  // `agentId in s.attentionScreen` (runtimeStore.ts), which an orphaned stamp can never satisfy.
+  // Every assertion below about `attentionScreenAt` would then be judging cross-test residue
+  // instead of what its own case produced: the helper would red for reasons unrelated to the
+  // invariant, and the paired positive would pass even with the stamp write deleted, purely
+  // because of where it happens to sit in the file. Resetting all three is what makes the order of
+  // these cases irrelevant.
+  useRuntimeStore.setState({ status: {}, attentionScreen: {}, attentionScreenAt: {} });
   resetRetractionLedgerForTests();
   seedAgent();
 });
+
+/**
+ * THE LOCKSTEP INVARIANT, asserted GENERICALLY (roborev 61970).
+ *
+ * `attentionScreenAt`'s doc says it is written and cleared in lockstep with `attentionScreen` —
+ * every site that touches one touches the other — and `captureFor`'s `capturedAt === undefined`
+ * fallback DEPENDS on that. Nothing enforced it, and one of the three clear sites promptly did not
+ * obey: `setStatus` dropped the text and kept the stamp. Lint caught that particular shape (a dead
+ * rest binding) but covers only ONE of the two ways to reintroduce it — delete the destructure AND
+ * the assignment, or add a fourth clear site that forgets the stamp, and lint stays quiet too.
+ *
+ * An orphaned stamp is also behaviourally INVISIBLE: `captureFor` early-returns on empty text
+ * before it ever reads the stamp, so no assertion about what the concierge is handed can see one.
+ * It has to be asserted on the store directly.
+ *
+ * Subset rather than equality, deliberately: a capture with no stamp is the documented legacy case
+ * `captureFor` still handles, and it is SAFE (it falls back to the old comparison). A stamp with no
+ * capture is the leak, and it is the one direction that must never happen.
+ */
+function expectStampsTrackCaptures() {
+  const { attentionScreen, attentionScreenAt } = useRuntimeStore.getState();
+  const orphaned = Object.keys(attentionScreenAt).filter((id) => !(id in attentionScreen));
+  expect(orphaned, "attentionScreenAt holds stamps for agents with no capture").toEqual([]);
+}
 
 describe("the ask-screen capture expires when the agent stops asking", () => {
   // THE SIDE EFFECT, not the store field: what the concierge is actually handed.
@@ -148,6 +182,9 @@ describe("the ask-screen capture expires when the agent stops asking", () => {
     // …and it says it has nothing rather than mislabelling something else as the captured screen.
     expect(resumed.source).toBe("none");
     expect(resumed.attempts.find((a) => a.source === "attention-screen")?.ok).toBe(false);
+    // …and the stamp went with it. Invisible to every assertion above — see the helper.
+    expect(useRuntimeStore.getState().attentionScreenAt[AGENT]).toBeUndefined();
+    expectStampsTrackCaptures();
   });
 
   // THE PAIRED POSITIVE. Absence alone is ambiguous — a clear-on-every-transition would pass the
@@ -162,6 +199,10 @@ describe("the ask-screen capture expires when the agent stops asking", () => {
     const still = await readAgentTerminal(AGENT);
     expect(still.source).toBe("attention-screen");
     expect(still.text).toContain("Enter your choice:");
+    // THE PAIRED POSITIVE FOR THE STAMP TOO: absence in the case above must mean "cleared with the
+    // text", not "cleared on every transition" — which would pass there and gut the feature here.
+    expect(useRuntimeStore.getState().attentionScreenAt[AGENT]).toBeDefined();
+    expectStampsTrackCaptures();
   });
 
   // The same pairing at the far end of the red tier: an agent that slid from a question into
@@ -195,6 +236,7 @@ describe("the ask-screen capture expires when the agent stops asking", () => {
 
     // Answered, worked for hours, then died of something unrelated. `errored` captures no screen.
     useRuntimeStore.getState().setStatus(AGENT, "working");
+    expectStampsTrackCaptures();
     useRuntimeStore.getState().setStatus(AGENT, "errored");
 
     const afterwards = await sendControlKey(AGENT, "enter", ALLOWED);
@@ -216,6 +258,10 @@ describe("the ask-screen capture expires when the agent stops asking", () => {
     const neighbour = await readAgentTerminal(OTHER);
     expect(neighbour.source).toBe("attention-screen");
     expect(neighbour.text).toContain("Overwrite config.toml?");
+    // The NEIGHBOUR path is the one shape the helper's genericness exists for — a per-agent
+    // assertion about AGENT cannot see a stamp stranded under OTHER. It is also the case that used
+    // to seed the leak this suite's reset now prevents.
+    expectStampsTrackCaptures();
   });
 
   // ── THE SECOND EXPIRY: the agent whose status NOBODY WILL EVER MOVE ────────────────────────────
@@ -310,5 +356,9 @@ describe("the ask-screen capture expires when the agent stops asking", () => {
     useRuntimeStore.getState().setStatus(AGENT, "working");
     useRuntimeStore.getState().setStatus(AGENT, "working"); // no-op re-report
     expect((await readAgentTerminal(AGENT)).source).toBe("none");
+    // LAST CASE IN THE FILE, deliberately. An order-dependent helper fails HERE first, because
+    // every earlier case's residue has accumulated by this point. Its passing is the standing
+    // proof that the three-key reset above is doing its job.
+    expectStampsTrackCaptures();
   });
 });
