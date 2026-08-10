@@ -2,6 +2,7 @@ import { C, FONT_WEIGHT } from "../theme/colors";
 import { RADIUS, FONT_UI, FONT_MONO } from "../theme/scale";
 import { ModalShell } from "./ModalShell";
 import type { RetroReceipt } from "../engine/retroReceiptTypes";
+import { retroStanding, type FeedbackEvidence } from "../engine/retroEvidence";
 
 /**
  * THE HUMAN CONFIRM. Shown when closing a build agent whose work has LANDED
@@ -61,6 +62,18 @@ const SETTLED_LEDE_UNKNOWN = "Its work has landed, and its retro step is on file
 export function RetireAgentConfirm({
   agentName,
   receipt,
+  /**
+   * Whether this agent filed `agent:<id>` feedback beads — the SECOND source, and the one whose
+   * absence produced the contradiction in bead `sparkle-y2p4f`.
+   *
+   * The receipt store and the beads store are different stores, and only the beads store is written
+   * by the real retro pipeline. Without this the dialog told every agent that ever reported that
+   * "nothing has been recorded", because no production path writes a `captured` receipt at all.
+   *
+   * THREE-VALUED ON PURPOSE. `unknown` (a starved or disabled beads store) must not render as an
+   * accusation — see `engine/retroEvidence`.
+   */
+  feedback,
   /** False when the agent is dead, crashed or quota-blocked — see engine/retirementReadiness. */
   canAnswer,
   /**
@@ -83,6 +96,7 @@ export function RetireAgentConfirm({
 }: {
   agentName: string;
   receipt: RetroReceipt | null | undefined;
+  feedback: FeedbackEvidence;
   canAnswer: boolean;
   dirtyFiles?: readonly string[];
   dirty?: boolean;
@@ -90,6 +104,15 @@ export function RetireAgentConfirm({
   onRetire: () => void;
   onCancel: () => void;
 }) {
+  /** FOUR-WAY, not the old `receipt != null` boolean. `absent` — the only standing that may accuse
+   *  the agent or write a permanent gap note — now requires positive evidence that it reported
+   *  nothing, rather than merely the absence of a receipt nothing writes. */
+  const standing = retroStanding(receipt != null, feedback);
+  // `receipt != null`, NOT `standing.kind === "settled"`, even though the two are equivalent by
+  // construction (`retroStanding` returns `settled` for exactly this condition). TypeScript cannot
+  // narrow `receipt` through the standing's discriminant, so keying the JSX branch on the tag would
+  // make `receipt.state` below an error — and casting it away would drop the null check that the
+  // `SETTLED_LEDE_UNKNOWN` fallback exists to honour.
   const settled = receipt != null;
   // GATED ON THE SAFETY FIELD, NOT THE DISPLAY PREVIEW (roborev 59423). `dirtyFiles` is capped at
   // STATUS_DIRTY_FILES_CAP and `undefined` means "this build cannot tell you" — NOT "no files".
@@ -169,7 +192,12 @@ export function RetireAgentConfirm({
   return (
     <ModalShell width={470} zIndex={200} onCancel={onCancel}>
       <div style={{ fontSize: 17, fontWeight: FONT_WEIGHT.bold, marginBottom: 8 }}>
-        {settled ? `Retire “${agentName}”?` : `Retire “${agentName}” without its retro?`}
+        {/* "without its retro?" IS AN ACCUSATION, and it now requires evidence. It used to ride on
+            `receipt == null`, which is true of every agent in the fleet because nothing writes a
+            `captured` receipt — so it was asked about agents whose own row showed FEEDBACK 7. */}
+        {standing.kind === "absent"
+          ? `Retire “${agentName}” without its retro?`
+          : `Retire “${agentName}”?`}
       </div>
 
       <div style={{ color: C.muted, fontSize: 13, lineHeight: 1.5 }}>
@@ -178,6 +206,28 @@ export function RetireAgentConfirm({
             {SETTLED_LEDE[receipt.state] ?? SETTLED_LEDE_UNKNOWN} Retiring removes the row from your build list; the branch
             and whatever was recorded are kept.
           </>
+        ) : standing.kind === "reported" ? (
+          /* IT REPORTED. Credit it by COUNT, using the same number the row's pill shows, so the two
+             surfaces visibly agree — the founder's complaint was that they did not. What is missing
+             here is the app's own bookkeeping, and saying so precisely is the whole fix: the earlier
+             copy generalised a missing receipt into "nothing has been recorded about what it
+             learned", which was false about the agent and unfair to it. */
+          <span data-testid="retire-feedback-credit">
+            Its work has landed, and it did report:{" "}
+            {standing.count === 1
+              ? "1 piece of feedback is"
+              : `${standing.count} pieces of feedback are`}{" "}
+            on file from it, on your Plan board. The only thing missing is this app’s own retro
+            receipt, which the feedback pipeline doesn’t write.
+          </span>
+        ) : standing.kind === "unknown" ? (
+          /* WE COULD NOT LOOK. Distinct from "it reported nothing" — the beads store is shared and
+             routinely starved, so this is a normal condition, not an edge. Naming the cause keeps
+             the human from reading it as a verdict on the agent. */
+          <span data-testid="retire-unknown-note">
+            Its work has landed. I can’t tell whether it recorded anything — your backlog isn’t
+            readable right now, so I won’t record anything against this agent either.
+          </span>
         ) : (
           <>
             Its work has landed, but nothing has been recorded about what it learned.{" "}
@@ -254,7 +304,7 @@ export function RetireAgentConfirm({
 
           So it is keyed on `!hasUncommitted`, the same expression the primary button is keyed on.
           If a third gate is ever added to that button, add it here in the same commit. */}
-      {!settled && !hasUncommitted ? (
+      {standing.kind === "absent" && !hasUncommitted ? (
         <div
           data-testid="retire-gap-note"
           style={{ color: C.muted, fontSize: 12, lineHeight: 1.5, marginTop: 12 }}
@@ -281,10 +331,14 @@ export function RetireAgentConfirm({
             "could not be asked"; the probe-4 commit rewrote it to "no retro receipt on file at the
             time", which is true whether or not the agent was reachable. The false claim the button
             was withheld to avoid is already gone. */}
+        {/* THE BUTTON NAMES WHAT IT WRITES, so it may promise a gap only when one may be written.
+            Keyed on the SAME `standing.kind === "absent"` as the gap note above and as
+            `mayRecordRetroGap` in the engine — if a fourth standing is ever added, all three move
+            together or the button offers to record something the writer then declines to record. */}
         {hasUncommitted
           ? null
           : primaryBtn(
-              settled ? "Retire it" : "Retire anyway — record the gap",
+              standing.kind === "absent" ? "Retire anyway — record the gap" : "Retire it",
               onRetire,
               C.accent,
             )}

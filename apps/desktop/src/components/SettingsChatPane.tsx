@@ -12,6 +12,7 @@ import { FONT_UI, LABEL, RADIUS, TYPE, WEIGHT } from "../theme/scale";
 import {
   availabilityFromWire,
   isReservedUsername,
+  usernameKey,
   validateUsernameFormat,
   USERNAME_MAX_LENGTH,
   USERNAME_MIN_LENGTH,
@@ -148,8 +149,20 @@ export function rejectionText(reason: UsernameRejection): string {
  * `calm: true` means "this is not the user's fault and there is nothing to fix" — it paints as an
  * informational line rather than an error. Exported so a caller (and the test) reads the real
  * mapping instead of re-deriving it.
+ *
+ * ⚠️ `canRecase` EXISTS BECAUSE ONE REMEDY NAMES A CONTROL, and a remedy is an instruction the user
+ * will follow (AGENTS.md, bead `sparkle-8bvh`). The capitalization field is rendered ONLY by the
+ * `settled` branch, so telling an un-settled caller to use "the field above" points at a box that is
+ * not on their screen — and the un-settled caller is exactly who gets `409 username_immutable`, that
+ * being what the server answers when this Mac has not re-read a handle the account already holds.
+ * It defaults to FALSE, the direction that can only under-promise: forgetting to pass it costs the
+ * settled user one sentence, whereas defaulting the other way sends the un-settled one looking for
+ * a control that does not exist.
  */
-export function claimRemedy(err: unknown): { text: string; calm: boolean } {
+export function claimRemedy(
+  err: unknown,
+  opts?: { canRecase?: boolean },
+): { text: string; calm: boolean } {
   if (err instanceof SocialNetworkError) {
     return { text: "Sparkle couldn’t reach the server. Check your connection and try again.", calm: true };
   }
@@ -182,7 +195,9 @@ export function claimRemedy(err: unknown): { text: string; calm: boolean } {
     // the account — so a mapping on status alone would hand the second user unusable advice.
     if (err.code === "username_immutable") {
       return {
-        text: "Your username is already set. A username can’t be changed once it’s claimed.",
+        text: opts?.canRecase
+          ? "Your username is already set. The handle can’t be changed once it’s claimed — but its capitalization can, in the field above."
+          : "Your account already holds a username — it can’t be changed once it’s claimed, and this Mac hasn’t re-read it yet. Reopen these settings to see the one you have.",
         calm: false,
       };
     }
@@ -277,6 +292,15 @@ export function SettingsChatPane() {
   const [check, setCheck] = useState<UsernameCheckState>({ kind: "idle" });
   const [saving, setSaving] = useState(false);
   const [claimNote, setClaimNote] = useState<{ text: string; calm: boolean } | null>(null);
+  /**
+   * The capitalization editor, for a handle already held. NULL means "untouched", which is what
+   * lets the field show `me.username` and still track a late hydration: seeding `useState` with
+   * `me.username` would freeze the empty pre-hydration value into the box (this pane remounts on
+   * every rail click, and `me` is populated asynchronously — see `settled` below).
+   */
+  const [caseDraft, setCaseDraft] = useState<string | null>(null);
+  const [caseSaving, setCaseSaving] = useState(false);
+  const [caseNote, setCaseNote] = useState<{ text: string; calm: boolean } | null>(null);
   const [visSaving, setVisSaving] = useState<Visibility | null>(null);
   /** The same fact as {@link visSaving}, written SYNCHRONOUSLY so `chooseVisibility` can refuse a
    *  second dispatch that lands before React has re-rendered the first — state would still read
@@ -494,6 +518,56 @@ export function SettingsChatPane() {
     }
   }, [draft, setMyProfile]);
 
+  // ── The capitalization editor ─────────────────────────────────────────────────────────────────
+  //
+  // A handle's KEY is immutable; its CAPITALIZATION is not, and conflating the two is what left the
+  // settled state with no editable field at all. `drodio` and `DROdio` normalize to one key, so a
+  // re-case collides with nobody and releases nothing — the server applies it as a `recase`.
+  const currentName = me.username ?? "";
+  const caseValue = caseDraft ?? currentName;
+  const caseTrimmed = caseValue.trim();
+  // SAME KEY is the whole gate. Compared on the normalized key, never on the raw strings, because
+  // that IS the question: anything with a different key is a rename and the server will refuse it.
+  const caseIsSameHandle = usernameKey(caseTrimmed) === usernameKey(currentName);
+  const caseChanged = caseTrimmed !== currentName && caseTrimmed.length > 0;
+
+  const saveCase = useCallback(async () => {
+    const next = (caseDraft ?? "").trim();
+    if (!next || next === currentName) return;
+    if (usernameKey(next) !== usernameKey(currentName)) {
+      // Refused HERE rather than sent, because the server's `username_immutable` is a true statement
+      // that answers a question the user did not ask. They were editing capitalization; telling them
+      // "your username is already set" reads as a refusal of the thing they were allowed to do.
+      setCaseNote({
+        text: `That changes the handle itself, not how it’s written. @${currentName} stays @${currentName} — only the capitalization can change.`,
+        calm: false,
+      });
+      return;
+    }
+    setCaseSaving(true);
+    setCaseNote(null);
+    try {
+      const profile: PublicProfile | null = await putUsername(next);
+      // The server's echo when there is one — it is the row that was actually written, and trusting
+      // the local string instead is how a UI shows a change the database did not make.
+      const saved = profile?.username ?? next;
+      setMyProfile({
+        username: saved,
+        displayName: profile?.displayName ?? me.displayName ?? null,
+        socialId: profile?.socialId ?? me.socialId ?? null,
+      });
+      setCaseDraft(null); // back to tracking the stored value
+      setCaseNote({ text: `Saved — you’ll appear as @${saved}.`, calm: true });
+    } catch (e) {
+      if (e instanceof SocialApiError && e.status === 404) setNotLiveYet(true);
+      // `canRecase` — this IS the capitalization field, so "the field above" is the one the user is
+      // typing in. The claim form's call site below deliberately omits it.
+      else setCaseNote(claimRemedy(e, { canRecase: true }));
+    } finally {
+      setCaseSaving(false);
+    }
+  }, [caseDraft, currentName, me.displayName, me.socialId, setMyProfile]);
+
   const chooseVisibility = useCallback(
     async (value: Visibility) => {
       // THE HANDLER'S OWN GATE, and it is the real one — `disabled` on the input is the affordance.
@@ -597,11 +671,67 @@ export function SettingsChatPane() {
       <div>
         <div style={subLabel}>Username</div>
         {settled ? (
-          <div style={bodyLine} data-testid="chat-username-settled">
-            Your username is <span style={{ color: C.cream }}>@{me.username}</span>. Usernames are
-            permanent — Sparkle doesn’t offer renames, because a freed handle is exactly what an
-            impersonator needs.
-          </div>
+          <>
+            <div style={{ ...bodyLine, marginBottom: 10 }} data-testid="chat-username-settled">
+              Your username is <span style={{ color: C.cream }}>@{me.username}</span>. The handle
+              itself is permanent — Sparkle doesn’t offer renames, because a freed handle is exactly
+              what an impersonator needs. How it’s capitalized is yours to set, though: same name,
+              written the way you write it.
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+              <input
+                data-testid="chat-username-case-input"
+                aria-label="Username capitalization"
+                value={caseValue}
+                onChange={(e) => setCaseDraft(e.target.value)}
+                spellCheck={false}
+                // NOT autoCapitalize="none" — unlike the claim field, capitalization is the entire
+                // subject of this input, so suppressing it would fight the user's only edit.
+                autoCorrect="off"
+                style={field}
+              />
+              {/* Disabled only for "nothing to save" — never for a wrong-looking value. A different
+                  handle is refused by the handler with copy that explains WHY, which a dead button
+                  cannot do. Same reasoning as the claim button above. */}
+              <button
+                type="button"
+                data-testid="chat-username-case-save"
+                disabled={caseSaving || !caseChanged}
+                onClick={() => void saveCase()}
+                style={{
+                  ...saveButton,
+                  opacity: caseSaving || !caseChanged ? 0.5 : 1,
+                  cursor: caseSaving || !caseChanged ? "default" : "pointer",
+                }}
+              >
+                {caseSaving ? "Saving…" : "Save capitalization"}
+              </button>
+            </div>
+            {/* Live, before the round trip: a different handle is the one mistake this field invites,
+                and saying so as they type beats spending a request to be told no. */}
+            {caseChanged && !caseIsSameHandle && (
+              <div style={errorLine} data-testid="chat-username-case-differs">
+                <FiAlertCircle size={14} aria-hidden style={noteIcon} />
+                <span>
+                  That’s a different handle, not a different capitalization. Only the letters’ case
+                  can change.
+                </span>
+              </div>
+            )}
+            {caseNote && (
+              <div
+                data-testid="chat-username-case-note"
+                style={caseNote.calm ? calmLine : errorLine}
+              >
+                {caseNote.calm ? (
+                  <FiInfo size={14} aria-hidden style={noteIcon} />
+                ) : (
+                  <FiAlertCircle size={14} aria-hidden style={noteIcon} />
+                )}
+                <span>{caseNote.text}</span>
+              </div>
+            )}
+          </>
         ) : (
           <>
             {/* NO EXPLANATORY PREAMBLE (founder's call, 2026-08-08). The rules it used to spell out
@@ -609,8 +739,10 @@ export function SettingsChatPane() {
                 moment they bite, which is the only moment they are useful:
                   • 3–30 characters / a–z / single underscores → `validateUsernameFormat`, painted
                     per-rule by `rejectionText` under the field as you type and again on Save.
-                  • Immutable once claimed → the `settled` branch above replaces this whole form,
-                    and a server `409 username_immutable` has its own remedy in `claimRemedy`.
+                  • The KEY is immutable once claimed → the `settled` branch above replaces this
+                    whole form (with the capitalization editor, which is the one part that IS
+                    editable), and a server `409 username_immutable` has its own remedy in
+                    `claimRemedy`.
                   • Already claimed on another machine → `save()` never overwrites; the server's
                     `409` is what the user is told. The store is not touched on a refusal. */}
             <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>

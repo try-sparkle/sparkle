@@ -61,6 +61,13 @@ import { killPty } from "../pty";
 import { landAgentBranch } from "../services/branchStatus";
 import { closeDecision, selectionAfterClose } from "../engine/closeAgent";
 import { retroSettled } from "../engine/retroReceiptTypes";
+import {
+  feedbackEvidence,
+  retroStanding,
+  mayRecordRetroGap,
+  type FeedbackEvidence,
+} from "../engine/retroEvidence";
+import { useBeadsStore, beadsPolledAt } from "../stores/beadsStore";
 import { canAnswerRetroPing } from "../engine/retirementReadiness";
 import {
   cachedReceipt,
@@ -179,6 +186,32 @@ const NEW_AGENT_SLOT_STYLE: React.CSSProperties = {
   // cloud row from its block-reason line when one is shown.
   gap: 6,
 };
+
+/**
+ * Did this agent file feedback? — read from the beads snapshot the poller already fetched.
+ *
+ * ── IT NEVER SHELLS OUT, AND THAT IS DELIBERATE (bead `sparkle-y2p4f`) ───────────────────────────
+ * Both readers below are on the retire path, which ends in an irreversible teardown, so this must
+ * not be able to block: every input here is already in memory, there is no `bd` invocation and
+ * nothing to await. A retire dialog that hung waiting on the (routinely starved, shared, single-
+ * writer) beads store would be worse than one that was merely wrong.
+ *
+ * The cost of not blocking is that the answer can be MISSING, which is exactly why
+ * `feedbackEvidence` is three-valued: a snapshot we could not get resolves to `unknown`, never to
+ * "this agent reported nothing".
+ *
+ * `beadsPolledAt` — NOT `snapshot.loadedAt`. `loadedAt` records when the CONTENT last changed and
+ * deliberately stands still on a healthy-but-quiet backlog, so it cannot answer "is this data
+ * stale". `beadsPolledAt` is stamped only on a successful read, which is the freshness clock.
+ */
+function feedbackEvidenceFor(projectId: string, agentId: string): FeedbackEvidence {
+  return feedbackEvidence({
+    beads: useBeadsStore.getState().byProject[projectId]?.beads,
+    polledAt: beadsPolledAt(projectId),
+    agentId,
+    now: Date.now(),
+  });
+}
 
 export function AgentSidebar({
   project,
@@ -1335,8 +1368,20 @@ export function AgentSidebar({
    *  exists to clear — the failure mode the override was added to prevent. It is logged instead. */
   const confirmRetire = async (id: string) => {
     if (!project) return void teardownAgent(id);
-    const settled = retroSettled(cachedReceipt(project.id, id));
-    if (!settled) {
+    // THE GATE ON THE PERMANENT MARK (bead `sparkle-y2p4f`). This used to be `!settled`, i.e. "no
+    // receipt on file" — which is true of EVERY agent, because no production path writes a
+    // `captured` receipt. So the gap note was written on the absence of evidence rather than on
+    // evidence of absence, and 19 of the 29 receipts on disk when this was fixed were against
+    // agents that had filed 1–13 feedback beads apiece. A receipt has no delete path anywhere in
+    // the app, so each of those is permanent.
+    //
+    // Re-read here rather than trusting the dialog's prop: the modal can sit open across polls, and
+    // this is the call that writes.
+    const standing = retroStanding(
+      retroSettled(cachedReceipt(project.id, id)),
+      feedbackEvidenceFor(project.id, id),
+    );
+    if (mayRecordRetroGap(standing)) {
       const rt = useRuntimeStore.getState();
       const bs = rt.branchStatus[id];
       const wrote = await recordRetroOverridden(project.id, id, {
@@ -1347,9 +1392,14 @@ export function AgentSidebar({
         // unsettled here. Recording that as "never reported" would put a false gap in the one store
         // the whole feature exists to make trustworthy. The receipt survives the agent, so it says
         // only what the app actually knows.
+        // NOW A STRONGER, NARROWER CLAIM. The old text had to hedge — "none was recorded HERE — a
+        // retro filed through the merge hook is not visible to this store yet" — because the app
+        // genuinely could not see the beads store and was recording a gap it could not stand
+        // behind. It can see it now, and this line is only reached once BOTH stores have been read
+        // and both came back empty, so the receipt says what was actually checked.
         reasonText:
-          "Retired by the founder with no retro receipt on file at the time. That means none was " +
-          "recorded HERE — a retro filed through the merge hook is not visible to this store yet.",
+          "Retired by the founder with no retro receipt on file, and no agent-feedback beads " +
+          "attributed to this agent in a fresh read of the backlog at the time.",
         // Display-only evidence, captured while the row still exists — see RetroReceipt.branchEvidence.
         ...(bs ? { branchEvidence: `${bs.ahead} ahead, ${bs.dirty ? "dirty" : "clean"}` } : {}),
       });
@@ -3007,6 +3057,15 @@ export function AgentSidebar({
         <RetireAgentConfirm
           agentName={retiringAgent.name || "this agent"}
           receipt={project ? cachedReceipt(project.id, retiringAgent.id) : undefined}
+          // The SECOND source — the same `agent:<id>` beads the row's own FEEDBACK pill counts, so
+          // the dialog and the row can no longer contradict each other (bead `sparkle-y2p4f`).
+          // Read fresh from the store like the branch fields below, not from the render-scope maps.
+          // With no project we cannot look at all, which is `unknown` — never "reported nothing".
+          feedback={
+            project
+              ? feedbackEvidenceFor(project.id, retiringAgent.id)
+              : ({ kind: "unknown" } as const)
+          }
           // FRESH from the store, not from the render-scope maps: this dialog can sit open while the
           // 15s poll updates the tree underneath it, and the files it names are the ones retirement
           // would destroy (knightwatch probe 1).

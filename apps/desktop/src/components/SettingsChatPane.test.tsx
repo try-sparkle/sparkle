@@ -333,6 +333,31 @@ describe("SettingsChatPane — the server's answer wins", () => {
     expect(taken).not.toBe(immutable);
   });
 
+  // A REMEDY MAY NOT NAME A CONTROL THE READER CANNOT SEE (AGENTS.md; bead `sparkle-8bvh`). The
+  // capitalization box is rendered only by the `settled` branch, and `409 username_immutable` on the
+  // CLAIM form is by definition an un-settled screen — so "the field above" would send exactly the
+  // user who has no such field looking for one. Asserted on the RENDERED note rather than on
+  // `claimRemedy`'s argument, because the defect is what the user reads, and a call site that forgot
+  // to thread the flag would satisfy an argument-level assertion.
+  it("the immutability remedy points at the capitalization field ONLY where that field exists", async () => {
+    const fromClaimForm = await claimAndRead(new SocialApiError(409, "username_immutable"));
+    expect(fromClaimForm).not.toContain("field above");
+    expect(screen.queryByTestId("chat-username-case-input")).toBeNull();
+
+    // The paired positive: on the settled screen the field IS above the note, so the sentence is
+    // both true and followable. Without this half, deleting the clause everywhere would pass.
+    cleanup();
+    useSocialStore.setState({ me: { ...EMPTY_PROFILE, username: "drodio", socialId: "social-1" } });
+    vi.mocked(putUsername).mockRejectedValue(new SocialApiError(409, "username_immutable"));
+    render(<SettingsChatPane />);
+    fireEvent.change(screen.getByTestId("chat-username-case-input"), {
+      target: { value: "DROdio" },
+    });
+    fireEvent.click(screen.getByTestId("chat-username-case-save"));
+    await waitFor(() => expect(screen.getByTestId("chat-username-case-note")).toBeTruthy());
+    expect(screen.getByTestId("chat-username-case-note").textContent).toContain("field above");
+  });
+
   it("the three 400 codes each get their own remedy, branching on the CODE not the status", async () => {
     const reserved = await claimAndRead(new SocialApiError(400, "reserved"));
     cleanup();
@@ -652,20 +677,126 @@ describe("SettingsChatPane — what the user is shown", () => {
     expect(screen.getByTestId("chat-claim-note").textContent).toContain("can’t be changed");
     expect(useSocialStore.getState().me.username).toBeNull();
 
-    // (d) Immutability: once a handle IS known there is no field to change it with.
+    // (d) Immutability, stated precisely: what is immutable is the KEY, so once a handle is known
+    //     there is no field that can RENAME it. There IS one that can re-case it, and asserting only
+    //     the absence would read as "a settled pane offers no field", which a later agent could
+    //     satisfy by deleting the capitalization editor. Both halves, so neither reading survives.
     cleanup();
     useSocialStore.setState({ me: { ...EMPTY_PROFILE, username: "ada_l" } });
     render(<SettingsChatPane />);
     expect(screen.queryByTestId("chat-username-input")).toBeNull();
     expect(screen.queryByTestId("chat-username-save")).toBeNull();
+    expect(screen.getByTestId("chat-username-case-input")).toBeTruthy();
   });
 
-  it("once a username is claimed it is shown as SETTLED — no field, no Save, no rename offer", () => {
+  it("once a username is claimed the CLAIM form is gone — no rename offer", () => {
     useSocialStore.setState({ me: { ...EMPTY_PROFILE, username: "ada_l" } });
     render(<SettingsChatPane />);
     expect(screen.getByTestId("chat-username-settled").textContent).toContain("permanent");
+    // The claim field specifically. A settled user must not be offered a box that can only earn
+    // them a 409 — which is a different thing from being offered no box at all; see the
+    // capitalization suite below for the box they DO get.
     expect(screen.queryByTestId("chat-username-input")).toBeNull();
     expect(screen.queryByTestId("chat-username-save")).toBeNull();
+  });
+});
+
+// ── Capitalization: the one part of a settled handle that IS editable ────────────────────────────
+//
+// The settled state used to be a dead end — static copy saying "usernames are permanent", no field
+// of any kind. That read the immutability rule as covering the DISPLAY form, which it never did:
+// `drodio` and `DROdio` are one key, so re-casing collides with nobody and frees no handle. The
+// server applies it as a `recase`; these are the assertions that the UI can actually reach it.
+describe("SettingsChatPane — setting the capitalization of a claimed handle", () => {
+  const seedHandle = (username: string) =>
+    useSocialStore.setState({ me: { ...EMPTY_PROFILE, username, socialId: "social-1" } });
+
+  const caseInput = () => screen.getByTestId("chat-username-case-input") as HTMLInputElement;
+  const typeCase = (value: string) => fireEvent.change(caseInput(), { target: { value } });
+  const clickCaseSave = () => fireEvent.click(screen.getByTestId("chat-username-case-save"));
+
+  it("seeds the field with the handle as it stands", () => {
+    seedHandle("drodio");
+    render(<SettingsChatPane />);
+    expect(caseInput().value).toBe("drodio");
+  });
+
+  it("SENDS the re-cased handle and the STORE ends up holding the new capitalization", async () => {
+    // THE FOUNDER'S CASE, end to end through the pane. Both halves are asserted because either
+    // alone is passable by a broken pane: a request with no store write leaves every other surface
+    // painting the old form, and a store write with no request is a lie that dies on next launch.
+    seedHandle("drodio");
+    vi.mocked(putUsername).mockResolvedValue(profile("DROdio"));
+    render(<SettingsChatPane />);
+
+    typeCase("DROdio");
+    clickCaseSave();
+
+    await waitFor(() => expect(putUsername).toHaveBeenCalledWith("DROdio"));
+    await waitFor(() => expect(useSocialStore.getState().me.username).toBe("DROdio"));
+  });
+
+  it("takes the SERVER's echo, not the typed string, as what was saved", async () => {
+    // The pane must not paint a capitalization the database did not accept. Seeding the mock with a
+    // form that differs from the input is what makes echo-vs-local distinguishable — asserting on a
+    // matching pair would pass either way.
+    seedHandle("drodio");
+    vi.mocked(putUsername).mockResolvedValue(profile("DRodio"));
+    render(<SettingsChatPane />);
+
+    typeCase("DROdio");
+    clickCaseSave();
+
+    await waitFor(() => expect(useSocialStore.getState().me.username).toBe("DRodio"));
+  });
+
+  it("REFUSES a different handle locally — a re-case is not a rename, and it never hits the network", async () => {
+    seedHandle("drodio");
+    render(<SettingsChatPane />);
+
+    typeCase("dr0dio"); // a different KEY, however similar it looks
+    expect(screen.getByTestId("chat-username-case-differs").textContent).toContain(
+      "different handle",
+    );
+    clickCaseSave();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("chat-username-case-note").textContent).toContain("stays"),
+    );
+    expect(putUsername).not.toHaveBeenCalled();
+    // ...and the store is untouched: a refused edit must not repaint the app.
+    expect(useSocialStore.getState().me.username).toBe("drodio");
+  });
+
+  it("does not warn while the edit is still a pure re-case", () => {
+    seedHandle("drodio");
+    render(<SettingsChatPane />);
+    typeCase("DROdio");
+    // The negative half of the test above. Without it, a warning that fired on EVERY keystroke
+    // would satisfy the assertion there and still make the field unusable.
+    expect(screen.queryByTestId("chat-username-case-differs")).toBeNull();
+  });
+
+  it("keeps Save inert until something actually changed", () => {
+    seedHandle("drodio");
+    render(<SettingsChatPane />);
+    const button = screen.getByTestId("chat-username-case-save") as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+    typeCase("DROdio");
+    expect(button.disabled).toBe(false);
+  });
+
+  it("surfaces a server refusal instead of claiming success", async () => {
+    seedHandle("drodio");
+    vi.mocked(putUsername).mockRejectedValue(new SocialApiError(409, "taken"));
+    render(<SettingsChatPane />);
+
+    typeCase("DROdio");
+    clickCaseSave();
+
+    await waitFor(() => expect(screen.getByTestId("chat-username-case-note")).toBeTruthy());
+    // The store must still hold the OLD value — the write failed, so the app must not paint it.
+    expect(useSocialStore.getState().me.username).toBe("drodio");
   });
 });
 

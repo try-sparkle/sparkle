@@ -26,12 +26,16 @@ vi.mock("../pty", () => ({ killPty: vi.fn(() => Promise.resolve()) }));
 // in this file today. Routing it through a mock changes nothing about that and buys the one thing
 // the real module cannot give a test — a `captured` receipt, i.e. the pill's `ready` state, which
 // had no coverage at all while `retro-pending` had two (roborev 59545).
-const { cachedReceipt } = vi.hoisted(() => ({
+// `recordRetroOverridden` is HOISTED into a named const rather than left inline, because the gap
+// note it writes is permanent and undeletable — so whether it fires is itself the assertion (bead
+// `sparkle-y2p4f`), and an inline `vi.fn()` in the factory cannot be reset or inspected.
+const { cachedReceipt, recordRetroOverridden } = vi.hoisted(() => ({
   cachedReceipt: vi.fn((): import("../engine/retroReceiptTypes").RetroReceipt | undefined => undefined),
+  recordRetroOverridden: vi.fn(() => Promise.resolve(true)),
 }));
 vi.mock("../services/retroReceipts", async (orig) => ({
   ...(await orig<typeof import("../services/retroReceipts")>()),
-  recordRetroOverridden: vi.fn(() => Promise.resolve(true)),
+  recordRetroOverridden,
   cachedReceipt,
 }));
 
@@ -72,6 +76,7 @@ vi.mock("../services/beads", async (orig) => ({
 import { AgentSidebar } from "./AgentSidebar";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
+import { useBeadsStore, __setBeadsPolledAtForTest } from "../stores/beadsStore";
 import { useUiStore } from "../stores/uiStore";
 import type { AgentTab, Project } from "../types";
 
@@ -137,6 +142,28 @@ beforeEach(() => {
   // `mockReset()` would do it, but naming the value keeps the default readable — and this is a
   // block body, never an expression, so vitest cannot mistake the chainable mock for a teardown.
   cachedReceipt.mockReset().mockReturnValue(undefined);
+  recordRetroOverridden.mockReset().mockResolvedValue(true);
+  // ── THE RETIRE DIALOG READS THE BEADS STORE NOW (bead `sparkle-y2p4f`) ──────────────────────
+  // "No receipt on file" stopped being sufficient to say an agent reported nothing: the receipt
+  // store has no production writer for the success case, so the dialog was telling agents with
+  // FEEDBACK pills on their own row that nothing had been recorded about what they learned.
+  //
+  // Every case below means "this agent filed nothing", which is now a fact that must be READ
+  // rather than assumed. Seed it: a successful, fresh, empty backlog. Without this they would all
+  // resolve to `unknown` — the correct answer for a backlog we could not read, but not the case
+  // these tests are about, and the honest-gap copy they assert would (rightly) not appear.
+  useBeadsStore.setState({
+    byProject: {
+      p1: {
+        beads: [],
+        board: { backlog: [], blocked: [], inProgress: [], done: [], delivered: [] },
+        loadedAt: Date.now(),
+      },
+    },
+  } as never);
+  // `polledAt` is module-scope and written ONLY inside `refresh`'s success commit, so seeding
+  // `byProject` alone still reads as never-successfully-polled.
+  __setBeadsPolledAtForTest("p1", Date.now());
 });
 afterEach(cleanup);
 
@@ -592,6 +619,72 @@ describe("AgentSidebar — a LANDED agent needs the human's confirm (bead sparkl
     // The dialog SAYS the agent may answer, and still lets him finish — the two are not in tension.
     expect(screen.getByRole("button", { name: /^Retire/ })).toBeTruthy();
     expect(screen.getByText(/may still be reachable/)).toBeTruthy();
+  });
+
+  // ── THE FALSE-MARK GATE (bead `sparkle-y2p4f`) ──────────────────────────────────────────────
+  // The founder was offered "Retire anyway — record the gap" for an agent whose own row showed a
+  // FEEDBACK 2 pill. These pin the WRITER, not only the copy: the receipt is permanent — there is
+  // no delete path for one anywhere in the app — so the fact that matters is that none is written.
+  // 19 of the 29 receipts on disk when this was fixed were false marks of exactly this shape.
+  function seedFeedbackBeads(n: number) {
+    useBeadsStore.setState({
+      byProject: {
+        p1: {
+          beads: Array.from({ length: n }, (_, i) => ({
+            id: `b${i}`,
+            labels: ["agent-feedback", "agent:a1"],
+          })),
+          board: { backlog: [], blocked: [], inProgress: [], done: [], delivered: [] },
+          loadedAt: Date.now(),
+        },
+      },
+    } as never);
+    __setBeadsPolledAtForTest("p1", Date.now());
+  }
+
+  it("writes NO gap receipt against an agent that filed feedback", async () => {
+    seedFeedbackBeads(2);
+    landedProject();
+    clickClose();
+    expect(screen.queryByText(/nothing has been recorded/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /^Retire it$/ }));
+    await waitFor(() => expect(agentsNow()).not.toContain("a1"));
+    expect(recordRetroOverridden).not.toHaveBeenCalled();
+  });
+
+  it("credits that agent with the SAME count its row pill shows", () => {
+    // The two surfaces reading one predicate is the actual fix; a differing number would be the
+    // same contradiction with better manners.
+    seedFeedbackBeads(2);
+    landedProject();
+    clickClose();
+    expect(screen.getByTestId("retire-feedback-credit").textContent).toMatch(/\b2\b/);
+  });
+
+  it("writes NO gap receipt when the backlog could not be read at all", async () => {
+    // Absence of evidence. The beads store is shared and routinely starved, so this is the normal
+    // failure — and it must not be able to mint an accusation.
+    useBeadsStore.setState({ byProject: {} } as never);
+    __setBeadsPolledAtForTest("p1", undefined);
+    landedProject();
+    clickClose();
+    expect(screen.queryByText(/nothing has been recorded/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /^Retire it$/ }));
+    await waitFor(() => expect(agentsNow()).not.toContain("a1"));
+    expect(recordRetroOverridden).not.toHaveBeenCalled();
+  });
+
+  it("STILL writes the gap receipt when the agent genuinely reported nothing", async () => {
+    // THE PAIRED POSITIVE, and it is the load-bearing one. Without it every assertion above is
+    // satisfied by a writer that no longer fires at all — the feature would be silently dead and
+    // the suite would still be green. `beforeEach` seeds a fresh, successfully-read, empty backlog,
+    // which is the one state that earns the mark.
+    landedProject();
+    clickClose();
+    expect(screen.getByText(/nothing has been recorded/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /record the gap/ }));
+    await waitFor(() => expect(agentsNow()).not.toContain("a1"));
+    expect(recordRetroOverridden).toHaveBeenCalledTimes(1);
   });
 
   it("BLOCKS the retire while the worktree holds uncommitted files (knightwatch probe 1)", () => {

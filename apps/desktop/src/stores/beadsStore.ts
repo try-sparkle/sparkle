@@ -494,6 +494,21 @@ export function beadsPolledAt(projectId: string): number | undefined {
  *  `setState({ byProject: {} })` looks like a full reset but leaves a project the previous case
  *  read still looking freshly-read, so a freshness-gated sweep silently skips it. Call in
  *  `beforeEach`. Not part of the store's runtime surface. */
+/** TEST-ONLY. Stamp (or clear) the freshness clock directly.
+ *
+ *  `polledAt` is written ONLY inside `refresh`'s success commit, so a case that seeds `byProject`
+ *  imperatively — the normal way sidebar suites arrange a backlog — gets a snapshot that reads as
+ *  never-successfully-polled. Anything gated on freshness then sees `unknown` no matter what beads
+ *  it was handed. That is correct in production and useless in a test, so this is the seam.
+ *
+ *  It exists because the alternative was worse: without it, `engine/retroEvidence`'s honest
+ *  "this agent reported nothing" arm is unreachable from a component test, which would leave the
+ *  one branch that may write a PERMANENT gap receipt covered only at the unit level. */
+export function __setBeadsPolledAtForTest(projectId: string, at: number | undefined): void {
+  if (at === undefined) polledAt.delete(projectId);
+  else polledAt.set(projectId, at);
+}
+
 export function __resetBeadsRefreshInFlightForTest(): void {
   refreshInFlight.clear();
   staleSteals.clear();
