@@ -43,6 +43,10 @@ vi.mock("@tauri-apps/api/webview", () => ({
 }));
 vi.mock("../services/crossWindowSync", () => ({ subscribeToCrossWindowSync: () => () => {} }));
 vi.mock("../stores/presenceStore", () => ({ startPresenceTracking: () => () => {} }));
+// The per-window auto-continue/escalation runner. Spied so we can prove the satellite MOUNTS it —
+// before sparkle-l7bmm it ran only in App.tsx, so a torn-out project's agents were swept by no one.
+const goalRunnerSpy = vi.hoisted(() => vi.fn(() => () => {}));
+vi.mock("../services/goalContinuationRunner", () => ({ startGoalContinuationRunner: goalRunnerSpy }));
 
 // The pane records its own mount/unmount into a shared log, so "release happened after the panes
 // came down" is a real ordering assertion rather than an inference from a rendered DOM.
@@ -125,6 +129,17 @@ describe("SatelliteApp — arrival", () => {
     // Main normally wrote a PENDING claim before building this window; settling fills in the label.
     // Doing it from this side too is the self-heal for a window that outlived main's write.
     expect(readSatellites()).toEqual({ p1: "project-2" });
+  });
+
+  it("starts the goal-continuation runner so its own project's agents are swept (sparkle-l7bmm)", () => {
+    // The runner is per-window and gates each project through routeToOwningWindow, so mounting it
+    // here makes the owning satellite the ONE handler for its torn-out project — main defers to it.
+    // Mounted only in App.tsx before, the satellite ran nobody, so those agents were never
+    // auto-continued or escalated. Asserts the mount happened; the ownership gating is proven in
+    // windowOwnership's own tests.
+    goalRunnerSpy.mockClear();
+    render(<SatelliteApp projectId="p1" />);
+    expect(goalRunnerSpy).toHaveBeenCalled();
   });
 
   it("mounts only its own project's open agents", () => {

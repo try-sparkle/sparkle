@@ -47,6 +47,7 @@ import { ErrorBoundary, AgentPaneErrorCard } from "../components/ErrorBoundary";
 import { TERMINAL_STAGE_DND_TARGET } from "../services/dndTargets";
 import { subscribeToCrossWindowSync } from "../services/crossWindowSync";
 import { startPresenceTracking } from "../stores/presenceStore";
+import { startGoalContinuationRunner } from "../services/goalContinuationRunner";
 import { safeUnlisten } from "../services/safeUnlisten";
 import { setWindowProject, clearWindowProject } from "../services/windowRegistry";
 import { FONT_UI } from "../theme/scale";
@@ -158,6 +159,14 @@ export function SatelliteApp({ projectId }: { projectId: string }) {
   // Presence is fed by TERMINAL keystrokes as much as by the compose box, and this window is where
   // those keystrokes happen for a torn-out project. Ref-counted + idempotent disposer.
   useEffect(() => startPresenceTracking(), []);
+
+  // Auto-continue / escalation for a torn-out project's agents. The runner is per-window: it gates
+  // every project through routeToOwningWindow, so it acts only on projects THIS window owns. Mounted
+  // only in App.tsx before, a satellite-displayed project got main deferring ownership to the
+  // satellite while the satellite never ran the runner — nobody swept it, so no agent in a
+  // torn-off window was ever auto-continued or escalated (bead sparkle-l7bmm). Mounting it here
+  // makes the owning satellite the one handler; main still defers, so there is no double-sweep.
+  useEffect(() => startGoalContinuationRunner(), []);
 
   // Name the window after the project. Unlike the main window — which is titled "Sparkle" because
   // its tab strip already says which project you're on — a satellite has no tabs, and its title is
