@@ -519,6 +519,7 @@ describe("duty overdue", () => {
 describe("pr-conflicting", () => {
   const pr = (over: Partial<ConflictingPr> = {}): ConflictingPr => ({
     pr: 1091,
+    projectId: "project-alpha",
     branch: "sparkle/roborev-backlog-notice-collapse",
     ownerAgentId: null,
     kind: "conflicting",
@@ -677,6 +678,7 @@ describe("pr-conflicting owner naming", () => {
   it("distinguishes an unnamed roster agent from one this window cannot see", () => {
     const base: ConflictingPr = {
       pr: 900,
+      projectId: "project-alpha",
       branch: "sparkle/x",
       ownerAgentId: "nameless",
       kind: "conflicting",
@@ -706,6 +708,7 @@ describe("pr-conflicting evidence", () => {
   // the default in exactly one field — the one under test.
   const pr = (over: Partial<ConflictingPr> = {}): ConflictingPr => ({
     pr: 1091,
+    projectId: "project-alpha",
     branch: "sparkle/roborev-backlog-notice-collapse",
     ownerAgentId: null,
     kind: "conflicting",
@@ -847,6 +850,7 @@ describe("pr-conflicting citation safety", () => {
       [
         {
           pr: 12,
+          projectId: "project-alpha",
           branch: "sparkle/x",
           ownerAgentId: null,
           kind: "conflicting",
@@ -877,6 +881,7 @@ describe("pr-conflicting citation safety", () => {
 describe("the condition fingerprint", () => {
   const conflicting: ConflictingPr = {
     pr: 1091,
+    projectId: "project-alpha",
     branch: "sparkle/roborev-backlog-notice-collapse",
     ownerAgentId: null,
     kind: "conflicting",

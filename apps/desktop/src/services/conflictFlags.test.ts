@@ -29,6 +29,7 @@ import { useConflictStore } from "../stores/conflictStore";
 // as `null` for the same reason: this fixture backs the only end-to-end parse-to-store coverage.
 const raw = {
   pr: 1091,
+  projectId: "project-alpha",
   branch: "sparkle/roborev-backlog-notice-collapse",
   ownerAgentId: null,
   kind: "conflicting",
@@ -48,6 +49,7 @@ describe("parseConflictFlags", () => {
     expect(parseConflictFlags([raw])).toEqual([
       {
         pr: 1091,
+        projectId: "project-alpha",
         branch: "sparkle/roborev-backlog-notice-collapse",
         ownerAgentId: null,
         kind: "conflicting",
@@ -56,6 +58,24 @@ describe("parseConflictFlags", () => {
         evidence: "no-checks-ran",
       },
     ]);
+  });
+
+  // WHICH REPO the number belongs to. `#12` exists in every sibling project, so a row without this
+  // sends the consumer asking all of them and accepting whichever answers — a weaker answer than
+  // the producer already held. Absent and empty are both refused: the producer states it, and an
+  // empty string is its "not attributed yet", which is not an identity either.
+  it("refuses a row that does not say which project the PR is in", () => {
+    const { projectId: _dropped, ...noProject } = raw;
+    expect(parseConflictFlags([noProject])).toBeUndefined();
+    expect(parseConflictFlags([{ ...raw, projectId: "" }])).toBeUndefined();
+    expect(parseConflictFlags([{ ...raw, projectId: 7 }])).toBeUndefined();
+    // …and one good row alongside a bad one is still the whole payload refused.
+    expect(parseConflictFlags([raw, noProject])).toBeUndefined();
+  });
+
+  it("carries the project through, so a flag is verifiable against ONE repo", () => {
+    const [one] = parseConflictFlags([{ ...raw, projectId: "project-gamma" }])!;
+    expect(one!.projectId).toBe("project-gamma");
   });
 
   it("keeps a recorded owner and an optional hold reason", () => {
@@ -79,6 +99,7 @@ describe("parseConflictFlags", () => {
   it("accepts the null a Rust Option::None actually serialises to, not just an absent key", () => {
     const asRustSendsIt = {
       pr: 1124,
+      projectId: "project-alpha",
       branch: "sparkle/staleness-merge-vs-rebase",
       ownerAgentId: null,
       kind: "conflicting",

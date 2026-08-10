@@ -29,6 +29,7 @@ const NOW = 1_700_000_000_000;
 
 function conflict(over: Partial<ConflictingPr> & { pr: number }): ConflictingPr {
   return {
+    projectId: "project-alpha",
     branch: "feature",
     ownerAgentId: null,
     kind: "stale",

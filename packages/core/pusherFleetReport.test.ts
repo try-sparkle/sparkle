@@ -387,6 +387,7 @@ describe("standing duties reach the report", () => {
 describe("conflicting PRs reach the report", () => {
   const conflict: ConflictingPr = {
     pr: 1091,
+    projectId: "project-alpha",
     branch: "sparkle/roborev-backlog-notice-collapse",
     ownerAgentId: null,
     kind: "conflicting",
@@ -454,6 +455,7 @@ describe("growth is detectable for conditions with no agent", () => {
 
   const conflict = (over: Partial<ConflictingPr> = {}): ConflictingPr => ({
     pr: 1091,
+    projectId: "project-alpha",
     branch: "sparkle/roborev-backlog-notice-collapse",
     // THE MOTIVATING CASE, and the reason the old rule was dead: a descriptive branch resolves to no
     // owner, so this class's `agentIds` is empty for precisely the PRs it was built to report.

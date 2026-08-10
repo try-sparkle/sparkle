@@ -64,6 +64,11 @@ function parseOne(v: unknown): ConflictingPr | undefined {
   // would render as `-5` and get the whole report refused as `fabricated-citation`, silently.
   if (!Number.isSafeInteger(o["pr"]) || (o["pr"] as number) <= 0) return undefined;
   if (typeof o["branch"] !== "string") return undefined;
+  // MANDATORY AND NON-EMPTY. `project_id` is a Rust `String` with no `Option`, so an absent key is
+  // real drift — and an EMPTY one is the producer's "not attributed yet", which is not an identity
+  // either. Rejecting both keeps the alternative honest: a consumer that cannot name the repo must
+  // fall back to asking all of them, and it can only know to do that if this parse refuses.
+  if (typeof o["projectId"] !== "string" || o["projectId"] === "") return undefined;
   // `null` is the CONTRACT's "unresolved", so it is valid input and must survive the parse; an
   // absent key is not the same thing and is rejected, because the producer is required to state it.
   if (owner !== null && typeof owner !== "string") return undefined;
@@ -96,6 +101,7 @@ function parseOne(v: unknown): ConflictingPr | undefined {
   if (blockedBy !== undefined && blockedBy !== null && typeof blockedBy !== "string") return undefined;
   return {
     pr: o["pr"] as number,
+    projectId: o["projectId"],
     branch: o["branch"],
     ownerAgentId: owner,
     kind,

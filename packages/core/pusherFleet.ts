@@ -177,6 +177,15 @@ export type ConflictEvidence =
 export interface ConflictingPr {
   /** The PR number, as GitHub numbers it. Quoted in the report, so it is citable. */
   pr: number;
+  /**
+   * WHICH PROJECT the PR belongs to — the producer's own project id.
+   *
+   * A PR number is not an identity across repos: sibling projects both have a `#12`. Without this
+   * a consumer holding `pr: 12` had to ask every open repo and accept whichever answered, which is
+   * a weaker answer than the producer already had in hand. The producer states it, so nothing here
+   * has to infer it.
+   */
+  projectId: string;
   /** The head branch, VERBATIM — quoted, so `quotedNumbers` whitelists whatever digits it carries. */
   branch: string;
   /**

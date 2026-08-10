@@ -74,6 +74,7 @@ async function sweepTwice(deps: PusherRunnerDeps): Promise<PusherState> {
 }
 
 const conflict = (over: Partial<ConflictingPr> & { pr: number }): ConflictingPr => ({
+  projectId: "project-alpha",
   branch: "sparkle/some-work",
   ownerAgentId: null,
   kind: "stale",

@@ -984,6 +984,7 @@ describe("standing duties reach the report through the sweep", () => {
 describe("conflicting PRs reach the report through the sweep", () => {
   const conflict = {
     pr: 1091,
+    projectId: "project-alpha",
     branch: "sparkle/roborev-backlog-notice-collapse",
     ownerAgentId: null,
     kind: "conflicting" as const,

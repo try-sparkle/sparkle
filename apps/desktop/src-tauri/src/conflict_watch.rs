@@ -110,6 +110,19 @@ fn now_ms() -> u64 {
 #[serde(rename_all = "camelCase")]
 pub struct ConflictFlag {
     pub pr: u64,
+    /// WHICH PROJECT this PR belongs to — the same id [`Repo`] and `pr_owner` resolve against.
+    ///
+    /// A PR NUMBER ALONE IS NOT AN IDENTITY. Two sibling projects both have a `#12`, so a consumer
+    /// handed `pr: 12` could not tell which repo to verify it against, and had to ask every open
+    /// repo and accept whichever answered — a weaker answer than the producer already held. The
+    /// producer knew the project all along; it simply never said so (bead `sparkle-f0brd`).
+    ///
+    /// Note what this does NOT yet fix: [`ConflictFlags`] is still keyed by PR number alone, so a
+    /// cross-project collision is still resolved by SKIPPING the loser rather than by tracking
+    /// both. That skip is announced (see [`CollisionDigest`]). Stating the repo on the wire is the
+    /// half a consumer needs first — it makes every row verifiable — and it is the prerequisite for
+    /// re-keying the map on `(project, pr)`, which is the other half.
+    pub project_id: String,
     pub branch: String,
     /// The RECORDED owner. None means UNRESOLVED, never "no agent".
     pub owner_agent_id: Option<String>,
@@ -336,6 +349,14 @@ pub fn conflict_probe_status() -> ProbeStatus {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PrFacts {
     pub number: u64,
+    /// WHICH PROJECT this PR was read from. Empty from [`decode_pr_facts`] and by construction —
+    /// a `gh pr list` row says nothing about the repo it was listed from, so the sweep stamps it
+    /// with [`stamp_project`] the moment a read is attributed to a [`Repo`].
+    ///
+    /// It exists because a PR NUMBER is not an identity across repos: two sibling projects both
+    /// have a `#12`. Everything downstream — the flag row, and eventually the keying of
+    /// [`ConflictFlags`] itself — needs the pair, and this is where the repo half enters.
+    pub project_id: String,
     pub title: String,
     pub branch: String,
     pub head_oid: String,
@@ -400,6 +421,8 @@ fn decode_pr_facts(r: &Value) -> Option<PrFacts> {
     let merge_state = normalize_merge_state(&s("mergeStateStatus"));
     Some(PrFacts {
         number,
+        // A gh row cannot know which repo it was listed from. `stamp_project` fills it in.
+        project_id: String::new(),
         title: s("title"),
         branch: s("headRefName"),
         head_oid: s("headRefOid"),
@@ -418,6 +441,19 @@ fn decode_pr_facts(r: &Value) -> Option<PrFacts> {
         // A freshly decoded row is always first-hand; the carry is the driver's doing.
         carried_looks: 0,
     })
+}
+
+/// Attribute a repo's read to that repo. PURE, and separated from the sweep for the usual reason:
+/// the sweep needs `gh`, so anything only reachable inside it is untestable and drifts.
+///
+/// Applied to the WHOLE read at the point the rows are attributed to a [`Repo`], rather than at the
+/// one call site that happens to need it, so every path that carries facts onward — the tracked
+/// entry, [`blind_facts`], the flag — inherits the identity instead of each having to remember to
+/// re-attach it.
+fn stamp_project(prs: Vec<PrFacts>, project_id: &str) -> Vec<PrFacts> {
+    prs.into_iter()
+        .map(|f| PrFacts { project_id: project_id.to_string(), ..f })
+        .collect()
 }
 
 /// Pure decoder: `gh pr list --json …` → facts.
@@ -684,6 +720,9 @@ fn build_flag(
     let obs = observation(facts, decision.refusal);
     ConflictFlag {
         pr: facts.number,
+        // Carried from the facts rather than passed in beside them, so a row can never be built
+        // with a number from one project and an identity from another.
+        project_id: facts.project_id.clone(),
         branch: facts.branch.clone(),
         // NEVER a guess. `None` here means UNRESOLVED — a flag naming the WRONG agent is strictly
         // worse than one naming none, because the reader cannot tell until they have lost their
@@ -1141,7 +1180,9 @@ fn tick<R: Runtime>(app: &AppHandle<R>, watch: &mut Watch, now: u64) {
             Ok((dir, probed)) => {
                 probed_ok.insert(repo.project_id.clone());
                 let was_saturated = probed.saturated;
-                for f in probed.prs {
+                // Attribute the whole read to this repo BEFORE anything downstream copies it, so
+                // the identity rides along on every path a row can take from here.
+                for f in stamp_project(probed.prs, &repo.project_id) {
                     // The flag contract is keyed by PR NUMBER alone, so two projects' #12 would
                     // collide. First project (sorted) wins and the collision is LOGGED rather than
                     // silently merged — a visible degradation beats cross-project cross-talk.
@@ -1425,6 +1466,7 @@ mod tests {
     fn conflicting_facts() -> PrFacts {
         PrFacts {
             number: 1091,
+            project_id: "project-alpha".into(),
             title: "Collapse the backlog notice".into(),
             branch: "sparkle/jsdom-test-caveats".into(),
             head_oid: "a1b2c3d4e5f60718".into(),
@@ -2573,6 +2615,49 @@ mod tests {
         );
     }
 
+    /// A decoded row carries NO project, and the stamp is what supplies it.
+    ///
+    /// Both halves are asserted together on purpose: "the decoder leaves it empty" is the
+    /// precondition, and a test of it alone would pass against a build where the stamp does
+    /// nothing. The pair pins the actual effect — after stamping, every row names the repo.
+    #[test]
+    fn stamping_a_read_attributes_every_row_to_its_project() {
+        let raw = decode_open_prs(
+            r#"[{"number":12,"headRefName":"a","mergeStateStatus":"DIRTY"},
+                {"number":13,"headRefName":"b","mergeStateStatus":"CLEAN"}]"#,
+        )
+        .expect("decodes");
+        assert!(
+            raw.iter().all(|f| f.project_id.is_empty()),
+            "a gh row cannot know its repo; anything else means the decoder is guessing"
+        );
+
+        let stamped = stamp_project(raw, "project-beta");
+        assert_eq!(stamped.len(), 2, "stamping drops nothing");
+        assert!(stamped.iter().all(|f| f.project_id == "project-beta"));
+        // The rest of the row is untouched — the stamp attributes, it does not rewrite.
+        assert_eq!(stamped[0].number, 12);
+        assert_eq!(stamped[1].branch, "b");
+    }
+
+    /// The row a consumer receives names the repo, so `#12` is verifiable against ONE project
+    /// instead of being asked of every open repo (bead `sparkle-f0brd`).
+    #[test]
+    fn the_flag_carries_the_project_its_pr_was_read_from() {
+        let flags = ConflictFlags::default();
+        let facts = PrFacts { project_id: "project-gamma".into(), ..conflicting_facts() };
+        let (state, decision) = climb(&observation(&facts, None), 3);
+        assert!(apply_flags(&flags, &facts, None, &decision, &state).is_some(), "a flag stands");
+
+        let rows = flags.list();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].project_id, "project-gamma",
+            "a flag whose repo is unstated sends the consumer asking every project"
+        );
+        assert_eq!(rows[0].pr, facts.number, "and it is still the same PR");
+    }
+
     /// The flag is a FROZEN contract with its consumer, and it crosses the boundary as camelCase
     /// JSON. A rename on this side is invisible in Rust and silently blanks a field over there.
     #[test]
@@ -2589,6 +2674,7 @@ mod tests {
         .unwrap();
         for key in [
             "pr",
+            "projectId",
             "branch",
             "ownerAgentId",
             "kind",
