@@ -246,6 +246,16 @@ impl InflightState {
 #[derive(Default)]
 pub struct PtyManager {
     sessions: Mutex<HashMap<String, PtySession>>,
+    /// Spawns that have started their child but not yet reached the `sessions` map — the window in
+    /// which the child is running yet `kill_session` finds no row (bead sparkle-82vey). An entry is
+    /// created by [`PtyManager::begin_spawn`] at the top of `pty_spawn` and consumed by
+    /// [`PtyManager::insert_session`]; its `bool` is set true by [`PtyManager::mark_spawn_cancelled`]
+    /// when a kill arrives during that window. BOTH the mark and the consume happen while the
+    /// `sessions` lock is held (order: `sessions` → `pending_spawns`, never the reverse), so a kill
+    /// can never be reported successful and then have its spawn insert the child anyway. A kill for
+    /// an id with no in-flight spawn finds no entry and is a no-op here, so a later restart of the
+    /// same id is never cancelled by a stale flag.
+    pending_spawns: Mutex<HashMap<String, bool>>,
 }
 
 /// What a reader thread's reap found under its id — see [`PtyManager::reap`].
@@ -287,8 +297,55 @@ impl PtyManager {
     /// invariant rather than an assumption, because nothing can interleave between the two.
     /// The other half of that invariant is [`PtyManager::remove_if_epoch`]: an id-keyed REMOVAL
     /// would let a loser's reader thread delete the winner it never knew replaced it.
+    /// Register that a spawn for `id` is in flight, BEFORE its child is started. Pairs with
+    /// [`insert_session`], which consumes the entry, and with [`mark_spawn_cancelled`], which a
+    /// racing kill uses to cancel it. Called at the very top of `pty_spawn` so the whole
+    /// child-start → map-insert window is covered (bead sparkle-82vey). Overwrites any prior entry
+    /// for the id (a superseded concurrent spawn): whichever spawn reaches `insert_session` last
+    /// consumes it, matching the map's existing silent-replace semantics.
+    fn begin_spawn(&self, id: &str) {
+        self.pending_spawns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_string(), false);
+    }
+
+    /// A kill arrived for an id with no live session — flag its in-flight spawn (if any) so
+    /// [`insert_session`] refuses to insert the child. MUST be called while the `sessions` lock is
+    /// held (it is, from `kill_session`'s no-row branch), so this cannot interleave with the
+    /// check-and-insert in `insert_session`. A no-op when no spawn is in flight.
+    fn mark_spawn_cancelled(&self, id: &str) {
+        if let Some(c) = self
+            .pending_spawns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(id)
+        {
+            *c = true;
+        }
+    }
+
+    /// Returns the minted epoch on success, or [`NO_EPOCH`] when a kill cancelled this spawn while
+    /// it was setting up off-thread — the caller (`pty_spawn`) then kills the child it started. The
+    /// sentinel doubles cleanly: a cancelled spawn established no PTY, which is exactly what
+    /// `NO_EPOCH` means everywhere else, and `next_pty_epoch` never mints it, so a real insert can
+    /// never be mistaken for a cancel.
     fn insert_session(&self, id: String, mut session: PtySession) -> u64 {
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        // Consume this spawn's pending entry under the SAME `sessions` lock that `kill_session`
+        // holds when it marks a cancel — so "was I killed while spawning?" and "insert the child"
+        // are one atomic step. If the entry is cancelled, a kill already reported success against
+        // this id; inserting now would resurrect the child it believed dead (bead sparkle-82vey).
+        let cancelled = matches!(
+            self.pending_spawns
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id),
+            Some(true)
+        );
+        if cancelled {
+            return NO_EPOCH;
+        }
         let epoch = next_pty_epoch();
         session.epoch = epoch;
         sessions.insert(id, session);
@@ -777,6 +834,10 @@ pub async fn pty_spawn(
     // return the session pieces (+ reader/child) and finish the cheap wiring (map insert, thread
     // spawns) back on the async side.
     let spawn_app = app.clone();
+    // Register this spawn as in-flight BEFORE its child starts, so a `pty_kill` that lands while we
+    // set up off-thread can cancel it rather than succeed against an empty map and orphan the child
+    // (bead sparkle-82vey). Consumed by `insert_session` below.
+    app.state::<PtyManager>().begin_spawn(&id);
     // Read the configured per-agent heap cap once, on this side of the thread hop.
     let heap_mb = crate::config::current_effective().config.workers.agent_heap_mb;
     let (session, reader, child) = tauri::async_runtime::spawn_blocking(
@@ -891,6 +952,15 @@ pub async fn pty_spawn(
     // makes "the highest epoch minted for an id is the session that survived" TRUE rather than
     // merely likely, and the frontend's overlap rule depends on it.
     let epoch = app.state::<PtyManager>().insert_session(id.clone(), session);
+    if epoch == NO_EPOCH {
+        // A `pty_kill` for this id landed while we were setting up off-thread and already reported
+        // success. Honour it: kill and reap the child we just started so it does not keep running
+        // against the worktree, and wire up nothing (no reader/flusher/reaper threads). `reader`,
+        // `observer` and every clone above drop on return (bead sparkle-82vey).
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("pty_spawn: cancelled by a kill that raced the spawn".to_string());
+    }
 
     // Reap the child so it doesn't zombie.
     std::thread::spawn(move || {
@@ -1254,10 +1324,18 @@ pub async fn pty_kill(app: AppHandle, manager: State<'_, PtyManager>, id: String
 ///
 /// Returns whether a session was there to kill.
 fn kill_session(manager: &PtyManager, id: &str) -> bool {
-    let Some(mut session) = manager.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(id)
-    else {
+    let mut sessions = manager.sessions.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(mut session) = sessions.remove(id) else {
+        // No live session — but a spawn may be mid-flight, with its child already running and not
+        // yet in the map (bead sparkle-82vey). Flag it WHILE STILL HOLDING the `sessions` lock, so
+        // `insert_session` (which takes the same lock) cannot slip the child in after we return
+        // "killed". A no-op when nothing is spawning.
+        manager.mark_spawn_cancelled(id);
         return false;
     };
+    // Release the map lock before the kill itself — the original brief-hold shape — now that the
+    // removal (or cancel-mark) is done.
+    drop(sessions);
     // If the reader is parked (paused) it won't observe the kill's EOF and would never run its
     // teardown (reap + pty:exit). Resume it first so it wakes, reads EOF, and cleans up.
     session.pause.set(false);
@@ -2513,5 +2591,89 @@ mod tests {
             PTY_INFLIGHT_HIGH_WATER_BYTES <= 512 * 1024,
             "per-PTY credit must stay small — it multiplies by the agent count"
         );
+    }
+
+    /// The spawn/kill race (bead sparkle-82vey): a `pty_kill` that lands after the child has started
+    /// but before its session reaches the map must CANCEL the spawn, not succeed against an empty map
+    /// and leave the child running unowned. Also pins the two shapes a naive fix breaks: an
+    /// un-raced spawn still inserts, and a stale kill for an idle id does not cancel a later restart.
+    #[test]
+    fn a_kill_racing_an_in_flight_spawn_cancels_it_rather_than_orphaning() {
+        use portable_pty::{native_pty_system, Child, CommandBuilder, PtySize};
+        // Build a real PtySession backed by a trivial child. `None` when the environment has no pty
+        // (some CI sandboxes) — the test then skips rather than failing on infrastructure.
+        let mk = || -> Option<(PtySession, Box<dyn Child + Send + Sync>)> {
+            let sys = native_pty_system();
+            let size = PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
+            let pair = sys.openpty(size).ok()?;
+            let child = pair.slave.spawn_command(CommandBuilder::new("/bin/cat")).ok()?;
+            let killer = child.clone_killer();
+            let writer = pair.master.take_writer().ok()?;
+            Some((
+                PtySession {
+                    writer: Arc::new(Mutex::new(writer)),
+                    master: pair.master,
+                    killer,
+                    pause: Arc::new(PauseState::new()),
+                    inflight: Arc::new(InflightState::new()),
+                    pid: None,
+                    epoch: NO_EPOCH,
+                },
+                child,
+            ))
+        };
+
+        let mgr = PtyManager::default();
+        let mut cleanup: Vec<Box<dyn Child + Send + Sync>> = Vec::new();
+
+        // ── THE FIX: a kill during the spawn window cancels the insert ───────────────────────────
+        let Some((session, mut raced_child)) = mk() else { return };
+        mgr.begin_spawn("agent-race");
+        // The kill lands while the child runs but the session is not yet in the map.
+        assert!(
+            !kill_session(&mgr, "agent-race"),
+            "no live session yet, so kill_session returns false"
+        );
+        // The spawn now reaches insert_session — it must REFUSE (NO_EPOCH), so `pty_spawn` kills the
+        // child it holds instead of leaving it orphaned against the worktree.
+        assert_eq!(
+            mgr.insert_session("agent-race".to_string(), session),
+            NO_EPOCH,
+            "a spawn cancelled mid-flight must not insert"
+        );
+        assert!(
+            !mgr.session_ids().contains(&"agent-race".to_string()),
+            "a cancelled spawn leaves no row — nothing to orphan"
+        );
+        let _ = raced_child.kill();
+        let _ = raced_child.wait();
+
+        // ── NON-VACUOUS: with no racing kill, the same path inserts normally ─────────────────────
+        let Some((session, child)) = mk() else { return };
+        mgr.begin_spawn("agent-clean");
+        assert!(
+            mgr.insert_session("agent-clean".to_string(), session) > NO_EPOCH,
+            "an un-raced spawn mints a real epoch and inserts"
+        );
+        assert!(mgr.session_ids().contains(&"agent-clean".to_string()));
+        cleanup.push(child);
+
+        // ── SCOPING: a kill for an idle id (no session, no spawn) must not cancel a later restart ─
+        assert!(
+            !kill_session(&mgr, "agent-restart"),
+            "nothing live and nothing spawning — a plain no-op"
+        );
+        let Some((session, child)) = mk() else { return };
+        mgr.begin_spawn("agent-restart");
+        assert!(
+            mgr.insert_session("agent-restart".to_string(), session) > NO_EPOCH,
+            "a stale kill must not cancel a later restart of the same id"
+        );
+        cleanup.push(child);
+
+        for mut c in cleanup {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
     }
 }
