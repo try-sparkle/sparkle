@@ -40,7 +40,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 
-import { isSystemAuthoredPrompt } from "../engine/agentOriginated";
+import { isNudgePrompt, isSystemAuthoredPrompt } from "../engine/agentOriginated";
 
 /** Where an entry sits in the transcript set: which session file, and which record within it.
  *  Opaque to the UI — it round-trips back to Rust as the `before` bound when paging backwards. */
@@ -201,12 +201,29 @@ export async function fetchTranscriptTail(opts: {
  * Also drops entries with no renderable content: an `agent` record whose only blocks were
  * `thinking`, or a `human` record that was pure whitespace. An empty bubble is noise the founder
  * has to scroll past, and it carries nothing.
+ *
+ * ── ONE DELIBERATE EXCEPTION: THE NUDGE STAYS VISIBLE (bead sparkle-hpbkw) ───────────────────────
+ * `isSystemAuthoredPrompt` gained the nudge marker so the THRASH TALLY would stop scoring Sparkle's
+ * own automated ping as the agent's command. That is the right call for a tally and the wrong one
+ * here, and the two questions are genuinely different:
+ *
+ *   • the tally asks "does this text carry information about whether the AGENT is progressing?"
+ *     — no, for every marker, which is why they share one predicate there.
+ *   • the transcript asks "should a human SEE that this happened?" — and for a nudge the answer is
+ *     emphatically yes.
+ *
+ * A nudge bubble is the ONLY in-app evidence that SPARKLE, not the founder, opened that turn.
+ * Hiding it would delete exactly the evidence this bead exists to surface: the whole incident was
+ * an agent looping on our own pings being reported to him as though he were the blocker, and a
+ * transcript that shows the turns while hiding what started them makes that misreading harder to
+ * catch, not easier. The auto-resume and goal-expiry banners stay hidden because they are pure
+ * noise — a nudge is a record of an intervention.
  */
 export function filterSystemAuthored(entries: readonly TranscriptEntry[]): TranscriptEntry[] {
   return entries.filter((e) => {
     if (e.kind === "activity") return e.items.length > 0;
     if (e.text.trim() === "") return false;
-    if (e.kind === "human") return !isSystemAuthoredPrompt(e.text);
+    if (e.kind === "human") return !isSystemAuthoredPrompt(e.text) || isNudgePrompt(e.text);
     return true;
   });
 }

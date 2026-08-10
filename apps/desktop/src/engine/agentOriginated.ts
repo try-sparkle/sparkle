@@ -102,6 +102,38 @@ export const GOAL_EXPIRY_PROMPT_MARKER =
 export const TASK_NOTIFICATION_MARKER = "<task-notification>";
 
 /**
+ * The opening of a NUDGE — the Rust nudge ladder's automated ping (`nudge_ladder.rs::nudge_text`).
+ *
+ * ⚠️ THE ONE THAT WAS MISSING, and it cost the founder a fleet-wide loss of trust in the red dot
+ * (bead sparkle-hpbkw, 2026-08-09). Agent 6d644864 had submitted this line FOUR times in a row and
+ * was badged `repeating-command` for it — a verdict about the agent, earned entirely by Sparkle's
+ * own prose. The row then read as blocked-on-human and went into his needs-you list. Nothing was
+ * waiting on him; the nudger was arguing with itself and billing him for it.
+ *
+ * This marker is the WORST case of the three for the thrash tally, worse than the resume banner
+ * that motivated this module. The nudge text is a pure function of a counter and a duration, so
+ * consecutive pings are byte-identical BY CONSTRUCTION — and the ladder's whole job is to emit them
+ * repeatedly while the agent is not moving. `REPEAT_LIMIT` is 3. The detector was therefore
+ * GUARANTEED to condemn any agent the nudger worked on for more than two rungs, and the quieter the
+ * agent, the more certain the false verdict.
+ *
+ * PREFIX ONLY, stopping before the counter — everything after `#` varies per ping. Note the marker
+ * ends mid-token (`"[sparkle-nudge #"`), which is deliberate: it is the exact string Rust anchors
+ * its own `parse_reply` search on, so the two sides match on one literal rather than two renderings
+ * of one idea.
+ *
+ * ── THIS MARKER IS NOT ROUND-TRIPPABLE, SO IT IS PINNED INSTEAD ──────────────────────────────────
+ * `RESUME_PROMPT_MARKER` is safe because `continuePrompt` builds FROM it — one string, one language.
+ * The nudge is authored in Rust, so its literal and this one live in different languages and
+ * different test suites that cannot see each other. That is the seam AGENTS.md warns about at
+ * length: both suites green, the merge clean, the feature inert. `agentOriginated.test.ts` therefore
+ * READS `nudge_ladder.rs` and asserts the two literals are character-for-character identical, and
+ * separately that the fixed prefix of the real `nudge_text` format string still matches here. A
+ * reword on EITHER side fails a test instead of silently blinding the detector again.
+ */
+export const NUDGE_PROMPT_MARKER = "[sparkle-nudge #";
+
+/**
  * Every opening that means "Sparkle or the harness wrote this, not a person and not the agent".
  *
  * A LIST RATHER THAN A CHAIN OF `||`, so adding a class is a one-line change next to its constant
@@ -127,6 +159,7 @@ const SYSTEM_AUTHORED_MARKERS: readonly string[] = [
   RESUME_PROMPT_MARKER,
   GOAL_EXPIRY_PROMPT_MARKER,
   TASK_NOTIFICATION_MARKER,
+  NUDGE_PROMPT_MARKER,
 ];
 
 /**
@@ -144,4 +177,24 @@ const SYSTEM_AUTHORED_MARKERS: readonly string[] = [
 export function isSystemAuthoredPrompt(text: string): boolean {
   const start = text.trimStart();
   return SYSTEM_AUTHORED_MARKERS.some((marker) => start.startsWith(marker));
+}
+
+/**
+ * Is this specifically a NUDGE — Sparkle's automated ping — rather than any system-authored prompt?
+ *
+ * A NARROWER QUESTION THAN {@link isSystemAuthoredPrompt}, AND A DIFFERENT ONE. That predicate
+ * answers "must this be excluded from the tallies" and the answer is yes for all four markers. This
+ * one answers "is our own RECOVERY MECHANISM the thing that opened this turn", which only the nudge
+ * satisfies, and it is what lets `agentThrash` count a nudge loop as OUR failure instead of merely
+ * declining to blame the agent for it.
+ *
+ * Excluding the ping from the command tally was necessary but not sufficient: on its own it trades a
+ * false positive (`repeating-command`, the agent's fault) for a false NEGATIVE (silence about an
+ * agent that genuinely is not moving). The founder asked for neither — he asked that the loop be
+ * "detected and reported as a NUDGE FAILURE". Detecting it needs this predicate; the resume banner
+ * must NOT be folded in here, because auto-continue going around several times while an agent works
+ * is the healthy path, not a wedge.
+ */
+export function isNudgePrompt(text: string): boolean {
+  return text.trimStart().startsWith(NUDGE_PROMPT_MARKER);
 }

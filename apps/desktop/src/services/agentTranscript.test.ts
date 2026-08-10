@@ -72,6 +72,33 @@ describe("filterSystemAuthored", () => {
     expect(out).toEqual([kept]);
   });
 
+  // ── THE NUDGE IS THE EXCEPTION, AND IT IS DELIBERATE (bead sparkle-hpbkw) ──────────────────────
+  // `isSystemAuthoredPrompt` gained the nudge marker so the THRASH TALLY would stop scoring
+  // Sparkle's own ping as the agent's command. This filter shares that predicate, so the change
+  // would have silently emptied the transcript of every nudge bubble — a user-visible effect
+  // nobody asked for and nothing covered.
+  //
+  // Keeping them is the decision, and it is the opposite of incidental. A nudge bubble is the ONLY
+  // in-app evidence that SPARKLE, not the founder, opened that turn. The incident behind this bead
+  // is an agent looping on our own pings being reported to him as though he were the blocker;
+  // hiding the pings makes that misreading harder to catch. The banners stay hidden because they
+  // are noise — a nudge is a record of an intervention.
+  it("KEEPS a nudge — it is the only evidence Sparkle opened that turn, not the founder", () => {
+    const nudge = human(
+      "ping",
+      "[sparkle-nudge #3 · no output for 15m] Automated ping, not a new task. Resume your goal.",
+    );
+    const banner = human("banner", `${RESUME_PROMPT_MARKER} automatically.`);
+    const real = human("real", "try again");
+    // Paired with the banner ON PURPOSE: without it, "the nudge survived" would also pass for a
+    // change that stopped filtering anything at all.
+    expect(filterSystemAuthored([banner, nudge, real])).toEqual([nudge, real]);
+  });
+
+  it("still drops a nudge-shaped entry that is EMPTY — no content is no bubble", () => {
+    expect(filterSystemAuthored([human("blank", "   ")])).toEqual([]);
+  });
+
   it("drops the goal-expiry banner", () => {
     const out = filterSystemAuthored([
       human("expiry", `${GOAL_EXPIRY_PROMPT_MARKER} — nothing is coming to finish this on its own.`),

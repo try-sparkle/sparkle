@@ -120,6 +120,8 @@ import {
 import { attentionWorkersOf } from "../engine/workerExpansion";
 import { withDismissedAlerts, alertControlKind } from "../engine/alertDismissal";
 import { withUnmergedWork } from "../engine/unmergedAttention";
+import { withNudgeLoopCalm } from "../engine/nudgeLoopCalm";
+import { thrashReportFor } from "../engine/agentThrash";
 import { withDismissedStallAttention, withStallAttention } from "../engine/stallEscalation";
 import { processAliveFor } from "../services/goalContinuationRunner";
 // The never-idle overlay: three pure cores, read ALONGSIDE `status` (never folded into it — see the
@@ -400,7 +402,23 @@ export function AgentSidebar({
     [project, escalatedStatus, calmStatus],
   );
   const effectiveStatus = useMemo(
-    () => (project ? withDismissedAlerts(project.agents, presentedStatus) : status),
+    () =>
+      project
+        ? // LAST IN THE CHAIN: a row Sparkle has been pinging into silence stops asking (bead
+          // sparkle-hpbkw). This map is what the row COLOUR and the band FILTER read, so a nudge
+          // loop that was only calmed inside `composeRollup` would still be counted by the needs-you
+          // chip here — the surface the founder was actually reading when he asked why two agents
+          // that needed nothing were red.
+          //
+          // `Date.now()` needs no tick of its own: the `nudge-loop` verdict is a pure counter over
+          // the hook stream and does not decay with time, unlike the quota and compaction windows.
+          // It is passed only because `thrashReportFor` requires a clock for its other verdicts.
+          withNudgeLoopCalm(
+            project.agents,
+            withDismissedAlerts(project.agents, presentedStatus),
+            (id) => thrashReportFor(id, Date.now(), {}),
+          )
+        : status,
     [project, presentedStatus, status],
   );
   // Advance each agent's alert-episode record on every change to the overlaid (pre-dismissal) status

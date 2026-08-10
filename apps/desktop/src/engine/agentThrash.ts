@@ -40,7 +40,7 @@
 //
 // PURE REDUCER. `reduceThrash` is data-in-data-out over one event; the clock arrives on the event
 // (`ts`) or as a parameter. No timers, no I/O — so a four-compaction spiral is tested as arithmetic.
-import { isSystemAuthoredPrompt } from "./agentOriginated";
+import { isNudgePrompt, isSystemAuthoredPrompt } from "./agentOriginated";
 import type { HookEvent } from "./hookEvents";
 import { type QuotaBlock, isQuotaBlocked } from "./quotaBlock";
 
@@ -70,6 +70,18 @@ export const COMPACT_PRESSURE_LIMIT = 2;
  *  healthy session; two in ten minutes is a spiral. */
 export const COMPACT_WINDOW_MS = 10 * 60_000;
 
+/** Consecutive NUDGES that closed their turn having run no tool, before we call it a nudge loop.
+ *
+ *  Three, matching {@link REPEAT_LIMIT} and for the same reason: one unanswered ping is ordinary
+ *  (the ladder's whole design is to ping an agent that has gone quiet, and quiet agents often come
+ *  back), two is not yet a pattern, three consecutive pings that moved nothing is our recovery
+ *  mechanism failing. The founder measured FOUR on agent 6d644864 before anything noticed.
+ *
+ *  Deliberately NOT lower than the repeat limit. This verdict's cost is asymmetric in the founder's
+ *  favour — it makes a row calmer, never louder — but it also tells him automation has given up on
+ *  an agent, and saying that early about an agent that was merely slow is its own kind of noise. */
+export const NUDGE_LOOP_LIMIT = 3;
+
 /** Per-agent accumulator over the hook stream. Serializable by construction (plain data, bounded
  *  size) so it could be persisted later without a redesign; today it is window-local. */
 export interface ThrashState {
@@ -97,6 +109,24 @@ export interface ThrashState {
    * positive this module keeps re-learning (roborev 55259, 55314), reached through the resume door.
    */
   resumeTurn: boolean;
+  /**
+   * Was the turn currently open opened by a NUDGE specifically (not merely any system-authored
+   * prompt)? Read at `Stop`, which is the only place we can know whether that turn did any work.
+   *
+   * Separate from {@link resumeTurn} because the two mean different things about the SAME event: a
+   * nudge sets both, and an auto-resume sets only `resumeTurn`. Folding them together would count
+   * auto-continue's ordinary rounds as nudge failures — and auto-continue going around several
+   * times while an agent works is the healthy path this module has twice been fixed for condemning.
+   */
+  nudgeTurn: boolean;
+  /**
+   * Consecutive nudges whose turn closed having run no tool.
+   *
+   * THE COUNTER FOR OUR OWN FAILURE, not the agent's. Reset by any observed tool (the ping worked)
+   * and by any human or agent-originated prompt (somebody intervened, so whatever happens next is
+   * not our loop). It only ever grows on a turn we opened and that produced nothing.
+   */
+  nudgesWithoutProgress: number;
   /**
    * Has this accumulator observed a tool event at all, since it was created?
    *
@@ -143,6 +173,8 @@ export function initialThrashState(): ThrashState {
     turnOpen: false,
     lastTurnRanTool: false,
     resumeTurn: false,
+    nudgeTurn: false,
+    nudgesWithoutProgress: 0,
     sawToolEver: false,
     compactions: [],
   };
@@ -155,7 +187,12 @@ export type ThrashVerdict =
   | "repeating-command"
   | "no-progress"
   | "context-pressure"
-  | "quota-blocked";
+  | "quota-blocked"
+  // THE ONE VERDICT THAT IS NOT ABOUT THE AGENT. Every other member names something the agent is
+  // doing wrong; this one names SPARKLE's recovery mechanism failing, and it exists because
+  // reporting that as an agent fault is what put an agent nothing was waiting on into the founder's
+  // needs-you list (bead sparkle-hpbkw).
+  | "nudge-loop";
 
 export interface ThrashReport {
   verdict: ThrashVerdict;
@@ -166,6 +203,10 @@ export interface ThrashReport {
   repeatedCommand?: { text: string; count: number };
   /** Consecutive no-tool turns, whether or not it reached the limit. */
   turnsWithoutTool: number;
+  /** Consecutive nudges of ours that moved nothing, whether or not it reached the limit. Surfaced
+   *  even when healthy, for the same reason `recentCompactions` is: a reader can see our pings
+   *  starting to go unanswered before the verdict flips. */
+  nudgesWithoutProgress: number;
   /** Compactions inside the window, whether or not it reached the limit. Surfaced even when
    *  healthy, so a row can show pressure BUILDING rather than only pressure arrived. */
   recentCompactions: number;
@@ -232,8 +273,16 @@ export function reduceThrash(state: ThrashState, ev: HookEvent, now?: number): T
           ...state,
           turnOpen: true,
           resumeTurn: true,
+          // WHICH system-authored prompt this is, recorded so `Stop` can tell a nudge that went
+          // nowhere from an ordinary auto-continue. See `nudgeTurn`.
+          nudgeTurn: isNudgePrompt(text),
           lastTurnRanTool: state.toolInCurrentTurn || state.lastTurnRanTool,
           turnsWithoutTool: state.toolInCurrentTurn ? 0 : state.turnsWithoutTool,
+          // Work observed in the still-open turn is progress, and it clears our loop counter for the
+          // same reason it protects `lastTurnRanTool` above: the ping DID land, whatever the next
+          // turn does. Promoted here as well as at `Stop` because a turn can be interrupted and
+          // never close (roborev 55314) — the identical trap the two flags above are fixed for.
+          nudgesWithoutProgress: state.toolInCurrentTurn ? 0 : state.nudgesWithoutProgress,
           toolInCurrentTurn: false,
         };
       }
@@ -253,6 +302,12 @@ export function reduceThrash(state: ThrashState, ev: HookEvent, now?: number): T
         toolInCurrentTurn: false,
         lastTurnRanTool: false,
         resumeTurn: false,
+        nudgeTurn: false,
+        // SOMEBODY INTERVENED, SO OUR LOOP IS OVER. This arm is everything NOT system-authored — a
+        // human typing, an agent's own slash command — and either one means the next thing that
+        // happens is not Sparkle pinging into silence. Leaving the counter standing would let a row
+        // the founder had already unstuck keep reporting that automation had given up on it.
+        nudgesWithoutProgress: 0,
       };
     }
     // A NEW SESSION WIPES THE SLATE — BUT ONLY A GENUINELY NEW ONE.
@@ -317,8 +372,22 @@ export function reduceThrash(state: ThrashState, ev: HookEvent, now?: number): T
         // `repeating-command` (see `resumeTurn`).
         lastTurnRanTool:
           state.toolInCurrentTurn || (state.resumeTurn && state.lastTurnRanTool),
+        // THE ONLY PLACE THE NUDGE LOOP COUNTS UP, because this is the first moment we can say the
+        // turn produced nothing. Three arms, in this order:
+        //   • a tool ran        → 0. The ping worked; there is no loop, whoever opened the turn.
+        //   • a nudge opened it → +1. We pinged, and nothing came of it.
+        //   • anything else     → unchanged. An ordinary turn neither proves nor disproves our loop,
+        //                          and zeroing here would mean a single interleaved auto-resume
+        //                          erased the evidence — the same back-door reset `resumeTurn` and
+        //                          `lastTurnRanTool` were both fixed for (roborev 55259, 55314).
+        nudgesWithoutProgress: state.toolInCurrentTurn
+          ? 0
+          : state.nudgeTurn
+            ? state.nudgesWithoutProgress + 1
+            : state.nudgesWithoutProgress,
         toolInCurrentTurn: false,
         resumeTurn: false,
+        nudgeTurn: false,
       };
     }
     case "PreCompact":
@@ -434,6 +503,7 @@ export function thrashReport(state: ThrashState, now: number, ctx: ThrashContext
 
   const base = {
     turnsWithoutTool: state.turnsWithoutTool,
+    nudgesWithoutProgress: state.nudgesWithoutProgress,
     recentCompactions,
     ...(repeated ? { repeatedCommand: repeated } : {}),
   };
@@ -462,6 +532,36 @@ export function thrashReport(state: ThrashState, now: number, ctx: ThrashContext
         `minutes — it is running out of usable context` +
         (repeated ? ` and is now repeating "${repeated.text}"` : "") +
         `. Compaction is not buying it room; it needs a fresh session or a narrower task.`,
+    };
+  }
+  // OUR OWN RECOVERY MECHANISM HAS FAILED — reported ahead of `repeating-command` and `no-progress`
+  // on the same cause-not-symptom principle as the two arms above, and it is the arm the founder
+  // commissioned: *"an automated ping that loops should be detected and reported as a NUDGE FAILURE,
+  // never as 'needs you'."*
+  //
+  // WHY IT OUTRANKS THE TWO AGENT VERDICTS. A nudge opens a turn. So an agent we have pinged three
+  // times into silence has, by construction, three consecutive turns that ran no tools — which IS
+  // `no-progress`, reported as "it is producing output without doing anything" about an agent whose
+  // only turns were ones WE opened. That is the identical misattribution the marker fix removed from
+  // `repeating-command`, relocated one badge over, and relocating a bug is this module's recorded
+  // failure mode (see `sawToolEver`, and agentOriginated's header). Naming our own ping as the cause
+  // is what stops the reader debugging the agent.
+  //
+  // WHY IT YIELDS TO QUOTA AND CONTEXT PRESSURE. Those describe why the agent CANNOT move, and a
+  // nudge landing on an agent behind a quota wall or out of context was never going to work. They
+  // are the cause; this is what happened when we tried anyway.
+  if (state.nudgesWithoutProgress >= NUDGE_LOOP_LIMIT) {
+    return {
+      ...base,
+      verdict: "nudge-loop",
+      thrashing: true,
+      // WORDED AS OUR FAILURE, AND IT ENDS BY SAYING HE IS NOT THE BLOCKER — in those words, because
+      // the whole incident was this state being relayed to him as an ask. `nudge-loop` is not red
+      // and does not notify; this sentence is what a reader who opens the row anyway must find.
+      detail:
+        `Sparkle pinged this agent ${state.nudgesWithoutProgress} times and it did not move. That ` +
+        `is our automated nudge failing, not the agent asking for anything — nothing is waiting on ` +
+        `you. It needs a restart or a fresh brief, not an answer.`,
     };
   }
   if (repeated) {

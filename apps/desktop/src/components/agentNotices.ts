@@ -134,6 +134,15 @@ export const NOTICE_EXPLAINER: Record<string, string> = {
     "This agent has run the same command over and over without the result changing. That usually " +
     "means it is stuck on something it cannot see — a failing test it keeps re-running, or a file " +
     "it expects to exist. It will keep going until something changes, so it is worth interrupting.",
+  // NOT AN ASK, AND THE COPY LEADS WITH THAT. This explainer is read by someone who opened a row
+  // wondering why it stood out; the one thing he must not conclude is that he is holding it up. The
+  // remedy named here is deliberately something HE need not do — see the AGENTS.md rule that a
+  // remedy string is an instruction the user will follow.
+  "thrash:nudge-loop":
+    "Sparkle has been pinging this agent to get it moving again, and the pings are not working — " +
+    "it has taken several of them without doing anything. This is our automated nudge failing, " +
+    "not the agent asking you for something: nothing here is waiting on you. It needs a restart " +
+    "or a fresh brief rather than an answer.",
   "thrash:no-progress":
     "This agent has taken several turns in a row without using a single tool — no files read, " +
     "nothing run. It is talking rather than working, which usually means it is waiting on a " +

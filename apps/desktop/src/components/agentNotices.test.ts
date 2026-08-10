@@ -23,6 +23,7 @@ function thrashOf(verdict: ThrashReport["verdict"], detail = "d"): ThrashReport 
     verdict,
     thrashing: verdict !== "healthy",
     turnsWithoutTool: 0,
+    nudgesWithoutProgress: 0,
     recentCompactions: 0,
     detail,
   };

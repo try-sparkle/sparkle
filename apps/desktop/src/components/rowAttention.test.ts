@@ -325,6 +325,7 @@ describe("thrashChipLabel — undefined is not healthy", () => {
     verdict: "healthy",
     thrashing: false,
     turnsWithoutTool: 0,
+    nudgesWithoutProgress: 0,
     recentCompactions: 0,
     detail: "",
     ...over,

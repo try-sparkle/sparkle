@@ -69,6 +69,8 @@ import {
   type LastObservedMap,
 } from "./engine/workerAttention";
 import { resolveStage } from "./engine/workflowStage";
+import { withNudgeLoopCalm } from "./engine/nudgeLoopCalm";
+import { thrashReportFor, type ThrashReport } from "./engine/agentThrash";
 import type { AgentTab, AgentTabStatus } from "./types";
 import { projectNameForAgent } from "./services/creditProject";
 
@@ -117,6 +119,11 @@ export function publishedStatusFor(
   /** agentId → last terminal keystroke. Injected — see composeRollup. Defaults to the live store at
    *  this OUTERMOST boundary, so ordinary callers keep working and the pure core stays pure. */
   interaction: Record<string, number> = useInteractionStore.getState().lastAt,
+  /** agentId → thrash report, for the red contract's `nudge-loop` arm. Defaults to the live registry
+   *  at this OUTERMOST boundary, exactly as `interaction` does, so ordinary callers keep working
+   *  while `composeRollup` itself stays pure. */
+  thrashOf: (id: string) => ThrashReport | undefined = (id) =>
+    thrashReportFor(id, now ?? Date.now(), {}),
 ): StatusMap {
   const { published, dotOf } = composeRollup(
     agents,
@@ -126,6 +133,7 @@ export function publishedStatusFor(
     stageOf,
     now,
     interaction,
+    thrashOf,
   );
   return withWorkerRollupGreen(agents, published, dotOf, promoted);
 }
@@ -150,6 +158,11 @@ export function rollupViewFor(
   /** agentId → last terminal keystroke. Injected — see composeRollup. Defaults to the live store at
    *  this OUTERMOST boundary, so ordinary callers keep working and the pure core stays pure. */
   interaction: Record<string, number> = useInteractionStore.getState().lastAt,
+  /** See `publishedStatusFor`'s parameter of the same name. The Build column needs it too: `dotOf`
+   *  reads the CONTRACTED published map, so a column that skipped this would paint a worker red
+   *  under a head the rest of the app had already calmed. */
+  thrashOf: (id: string) => ThrashReport | undefined = (id) =>
+    thrashReportFor(id, now ?? Date.now(), {}),
 ): { own: StatusMap; dotOf: (id: string) => RollupDot } {
   const { own, dotOf } = composeRollup(
     agents,
@@ -159,6 +172,7 @@ export function rollupViewFor(
     stageOf,
     now,
     interaction,
+    thrashOf,
   );
   return { own, dotOf };
 }
@@ -181,6 +195,12 @@ function composeRollup(
    *  untestable through the feed except by mutating a module singleton (roborev 54771). Defaults to
    *  empty, i.e. "never touched", which is the pre-route-4 behaviour rather than a crash. */
   interaction: Record<string, number> = {},
+  /** agentId → its thrash report. INJECTED for the same reason `interaction` is: this composition is
+   *  consumed by `buildConciergeFeed`, which documents itself as pure, and `thrashReportFor` reads a
+   *  module-level registry. Defaults to "no report", i.e. NOT OBSERVED — never a healthy-looking
+   *  default, which is the distinction `thrashReportFor`'s own `undefined` arm exists to preserve.
+   *  Only step (5) reads it, and only for the `nudge-loop` verdict. */
+  thrashOf: (id: string) => ThrashReport | undefined = () => undefined,
 ): { published: StatusMap; own: StatusMap; dotOf: (id: string) => RollupDot } {
   // (0): a spawned-but-never-briefed agent is `new`, not red. FIRST, on the RAW map, so the two
   // bubbles below never carry a briefless agent's false red up to its orchestrator — a bubbled red
@@ -197,7 +217,26 @@ function composeRollup(
     withUnstartedWorkerAttention(agents, calm, openIds, lastObserved),
   );
   // (3)+(4) over the bubbled map: the published chain as it has always been.
-  const published = withDismissedAlerts(agents, withUnmergedWork(agents, bubbled, stageOf));
+  // (5): a row SPARKLE has been pinging into silence stops asking — see engine/nudgeLoopCalm.
+  //
+  // LAST, so it filters the map that is actually rendered rather than an intermediate nobody paints.
+  //
+  // IT CANNOT SWALLOW THE STALL ESCALATION, which is the one red it must not touch.
+  // `withStallAttention` escalates `human-verified-goal` to `blocked` — a goal whose stated check no
+  // agent may ever discharge, i.e. the one cause where the founder genuinely IS the only actor. That
+  // runs downstream of this, in AgentSidebar, and only ever on `idle`/`unmerged` rows
+  // (stallEscalation.ESCALATABLE), which are never in the `needs_you` band this pass looks at. The
+  // two operate on disjoint inputs by construction rather than by agreement.
+  //
+  // AND IT LEAVES EVERY WORKER BUBBLE ALONE. Demoting an inherited red was the OTHER half of bead
+  // sparkle-hpbkw (a finished head painted red by its stranded worker), and it is deliberately NOT
+  // done here: it contradicts `publishedRollupAgreement.test.ts`'s stated expectation that a head in
+  // motion with a WAITING worker still asks. That is the founder's call to make, not this file's.
+  const published = withNudgeLoopCalm(
+    agents,
+    withDismissedAlerts(agents, withUnmergedWork(agents, bubbled, stageOf)),
+    thrashOf,
+  );
   // The same chain with the worker bubbles left OUT. Without it the rollup reads a bubbled red as
   // the head's OWN red and returns early, which makes every mixed subtree unreachable (the trap
   // documented on rollupDotAccessor's `ownStatusOf`). Built from `calm`, not `status`: this is the

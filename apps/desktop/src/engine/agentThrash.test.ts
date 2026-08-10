@@ -4,6 +4,7 @@ import {
   COMPACT_PRESSURE_LIMIT,
   COMPACT_WINDOW_MS,
   NO_TOOL_TURN_LIMIT,
+  NUDGE_LOOP_LIMIT,
   REPEAT_LIMIT,
   forgetThrash,
   initialThrashState,
@@ -17,6 +18,13 @@ import {
 import { continuePrompt } from "./goalContinuation";
 
 const T0 = 1_700_000_000_000;
+
+/** A real nudge line at rung `n`. The text is a pure function of a counter and a duration, which is
+ *  exactly why consecutive ones are byte-identical — see engine/agentOriginated.NUDGE_PROMPT_MARKER. */
+const nudge = (n: number): string =>
+  `[sparkle-nudge #${n} · no output for ${n * 5}m] Automated ping, not a new task. Resume your ` +
+  `goal. If you are blocked, reply with ONE line: blocked-on-human | blocked-on-ci | ` +
+  `blocked-on-quota | not-blocked — <what you need>.`;
 
 /** Fold a whole event stream, as the hook watcher does. */
 function run(events: HookEvent[], from: ThrashState = initialThrashState()): ThrashState {
@@ -617,5 +625,105 @@ describe("the per-agent registry", () => {
     expect(thrashReportFor("a", T0, {})).toBeDefined();
     forgetThrash("a");
     expect(thrashReportFor("a", T0, {})).toBeUndefined();
+  });
+});
+
+// ── THE NUDGE LOOP (bead sparkle-hpbkw) ──────────────────────────────────────────────────────────
+//
+// The founder, 2026-08-09, on agent 6d644864 ("Typing Never Wedges"): status `waiting`, needsYou
+// TRUE, goal `met` — and thrash `repeating-command`, earned by submitting SPARKLE'S OWN AUTOMATED
+// PING four times in a row. The app nudged it, the nudge produced no progress, the app nudged
+// again, and the wedge was then reported to him as though he were the blocker.
+//
+// Excluding the ping from the command tally (engine/agentOriginated) fixes the false verdict but
+// must not make the loop INVISIBLE — that agent really was stuck. So the loop gets its own verdict,
+// worded as OUR machinery failing rather than the agent's behaviour. His instruction, verbatim:
+// *"an automated ping that loops should be detected and reported as a NUDGE FAILURE, never as
+// 'needs you'."*
+describe("the nudge loop — our own ping going nowhere is OUR failure, not the agent's", () => {
+  it("never calls a run of nudges `repeating-command` — that is us talking, not the agent", () => {
+    // The exact shape the founder measured: four pings, nothing in between.
+    const events = [1, 2, 3, 4].flatMap((n) => turn(nudge(n)));
+    const report = thrashReport(run(events), T0, {});
+    expect(report.verdict).not.toBe("repeating-command");
+    expect(report.repeatedCommand).toBeUndefined();
+  });
+
+  it("reports `nudge-loop` once our pings have gone nowhere NUDGE_LOOP_LIMIT times", () => {
+    const events = Array.from({ length: NUDGE_LOOP_LIMIT }, (_, i) => turn(nudge(i + 1))).flat();
+    const report = thrashReport(run(events), T0, {});
+    expect(report.verdict).toBe("nudge-loop");
+    expect(report.thrashing).toBe(true);
+    expect(report.nudgesWithoutProgress).toBe(NUDGE_LOOP_LIMIT);
+  });
+
+  it("says NOTHING IS WAITING ON YOU, in those words — the whole point of the state", () => {
+    const events = Array.from({ length: NUDGE_LOOP_LIMIT }, (_, i) => turn(nudge(i + 1))).flat();
+    const { detail } = thrashReport(run(events), T0, {});
+    // Names US as the actor that failed...
+    expect(detail).toContain("Sparkle");
+    // ...and says outright that he is not the blocker, so the sentence cannot be read as an ask.
+    expect(detail.toLowerCase()).toContain("nothing is waiting on you");
+    // ...and never blames the agent for looping, which is the verdict this replaces.
+    expect(detail.toLowerCase()).not.toContain("it is looping");
+  });
+
+  it("does NOT fire below the limit — one or two unanswered pings is not yet a loop", () => {
+    for (let n = 1; n < NUDGE_LOOP_LIMIT; n++) {
+      const events = Array.from({ length: n }, (_, i) => turn(nudge(i + 1))).flat();
+      expect(thrashReport(run(events), T0, {}).verdict).toBe("healthy");
+    }
+  });
+
+  it("REAL WORK between pings clears it — a slow agent is not a wedged one", () => {
+    // The false-positive guard, and the one that matters most: an agent that is genuinely working
+    // between our pings must never reach this verdict, however many pings it takes.
+    const events = [1, 2, 3, 4, 5].flatMap((n) => turn(nudge(n), ["Edit"]));
+    const report = thrashReport(run(events), T0, {});
+    expect(report.verdict).toBe("healthy");
+    expect(report.nudgesWithoutProgress).toBe(0);
+  });
+
+  it("a HUMAN typing resets it — he intervened, so the loop is over", () => {
+    const events = [
+      ...Array.from({ length: NUDGE_LOOP_LIMIT }, (_, i) => turn(nudge(i + 1))).flat(),
+      ...turn("try the other approach"),
+    ];
+    const report = thrashReport(run(events), T0, {});
+    expect(report.nudgesWithoutProgress).toBe(0);
+    expect(report.verdict).not.toBe("nudge-loop");
+  });
+
+  it("outranks `no-progress` — those tool-less turns are OUR pings, not the agent talking", () => {
+    // Without the priority the founder gets the identical misattribution one badge over: "it is
+    // producing output without doing anything" about an agent whose only turns were ones we opened.
+    const events = Array.from({ length: NUDGE_LOOP_LIMIT }, (_, i) => turn(nudge(i + 1))).flat();
+    const report = thrashReport(run(events), T0, {
+      goalOutstanding: true,
+    });
+    expect(report.turnsWithoutTool).toBeGreaterThanOrEqual(NO_TOOL_TURN_LIMIT);
+    expect(report.verdict).toBe("nudge-loop");
+  });
+
+  it("still yields to a quota wall and to context pressure — those are the real causes", () => {
+    const events = Array.from({ length: NUDGE_LOOP_LIMIT }, (_, i) => turn(nudge(i + 1))).flat();
+    const quota = thrashReport(run(events), T0, {
+      quotaBlock: {
+        message: "You've hit your usage limit",
+        at: T0,
+        resetAt: T0 + 3_600_000,
+        resetParsed: true,
+      },
+    });
+    expect(quota.verdict).toBe("quota-blocked");
+
+    const compacted = run([
+      ...events,
+      ...Array.from({ length: COMPACT_PRESSURE_LIMIT }, () => ({
+        event: "PreCompact" as const,
+        ts: T0,
+      })),
+    ]);
+    expect(thrashReport(compacted, T0, {}).verdict).toBe("context-pressure");
   });
 });

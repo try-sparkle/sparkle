@@ -233,6 +233,11 @@ export const THRASH_VERDICT_LABEL: Record<Exclude<ThrashVerdict, "healthy">, str
   "context-pressure": "Context exhausted",
   "repeating-command": "Looping",
   "no-progress": "No progress",
+  // "Nudge loop", NOT "Stuck" or "Looping". Every other label here names what the AGENT is doing;
+  // this one has to name what SPARKLE did, because the row it lands on is one the founder was told
+  // needed him when it did not (bead sparkle-hpbkw). "Looping" was the word that shipped that
+  // misreading — it is the `repeating-command` label one line up, and it says the agent is at fault.
+  "nudge-loop": "Nudge loop",
   // "Rate limited", not "Blocked": the row's STATUS already reads Blocked, and a chip that repeats
   // the band name spends the row's scarcest space saying nothing. This chip's job is to say WHY.
   "quota-blocked": "Rate limited",
