@@ -1,4 +1,10 @@
 import { useCallback, useEffect, useRef, useState, type RefObject } from "react";
+// AN AFFORDANCE IS A REACT-ICON, NEVER A CHARACTER THAT LOOKS LIKE ONE — the founder's standing
+// rule, enforced by the glyphIcons ratchet. A dingbat resolves through whatever face the element
+// inherits, so it shifts weight, baseline and optical size between platforms and between the UI and
+// mono faces; a Feather icon is geometry on a fixed grid. This file held four of the eight remaining
+// sites, so this change lowers the ceiling rather than merely staying under it.
+import { FiCheck, FiPlay, FiRefreshCw, FiSquare } from "react-icons/fi";
 import { Terminal as XTerm, type IMarker } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
@@ -55,7 +61,13 @@ import { matchesChord } from "../keyboardHints/keybindings";
 import { dismissibleSurfaceOpen } from "../engine/cable";
 import { noteTerminalInteraction } from "../services/terminalFocusIntent";
 import { noteTerminalEscape } from "../services/terminalEscapeRelease";
-import { isMeasuredSize, spawnSize, type TermSize } from "./terminalSize";
+import {
+  isMeasuredSize,
+  spawnSize,
+  implausibleFitWarning,
+  type FitContext,
+  type TermSize,
+} from "./terminalSize";
 import { PtyAckBatcher, PtyFlowController } from "./terminalFlow";
 import { SelectionPopup } from "./SelectionPopup";
 import {
@@ -116,6 +128,11 @@ const IDLE_SWEEP_MS = 500;
 // screenful of a default terminal.
 const IDLE_SWEEP_MIN_BYTES = 2048;
 
+// How long the restarted child must be QUIET before keystrokes typed at its dead predecessor are
+// replayed into it. Longer than the 80ms repaint settle on purpose: this one gates a WRITE, and
+// writing into a CLI that is still painting its banner is how the trailing Enter gets eaten.
+export const REPLAY_SETTLE_MS = 250;
+
 // Hand a link clicked in terminal output to the OS default browser. Shared by BOTH link paths —
 // WebLinksAddon (bare URLs in the output) and xterm core's OSC 8 handler (escape-sequence
 // hyperlinks) — because each ships a stock handler that dead-ends in the Tauri webview.
@@ -157,6 +174,19 @@ function openLinkFromTerminal(event: MouseEvent, uri: string): void {
 //
 // `sent` is per-PTY and MUST be reset when a new one is spawned (the mount effect does this), or a
 // restarted child would inherit the previous one's memo and never be told its real size.
+//
+// Per-PTY dedupe for the implausible-fit warning. Keyed by the `sent` ref (one per mounted
+// terminal, replaced on respawn) and WEAK so a torn-down pane's entry goes with it.
+const lastWarnedSize = new WeakMap<object, TermSize>();
+
+// The box a fit must agree with, for the RELATIVE half of the guard (terminalSize.ts). Read off
+// xterm itself so it describes the same instant the fit did.
+function fitContext(term: XTerm): FitContext | undefined {
+  const containerWidth = term.element?.clientWidth ?? 0;
+  const fontSize = term.options.fontSize ?? 0;
+  return containerWidth > 0 && fontSize > 0 ? { containerWidth, fontSize } : undefined;
+}
+
 function syncPtySize(
   transport: AgentTransport | null,
   term: XTerm,
@@ -164,9 +194,30 @@ function syncPtySize(
 ): void {
   const cols = term.cols;
   const rows = term.rows;
-  if (sent.current && sent.current.cols === cols && sent.current.rows === rows) return;
   const laidOut = !!term.element && term.element.clientWidth > 0;
-  if (!isMeasuredSize(laidOut, term)) return;
+  const ctx = fitContext(term);
+  // THE PLAUSIBILITY GATE MOVED ABOVE THE MEMO, AND THAT ORDER IS THE FIX (bead sparkle-l2xgf).
+  // With the memo first, a mismeasured fit LATCHED: `term.cols` stuck at 23, every later fit()
+  // recomputed 23, the memo said "already sent" and returned before anything could re-examine it —
+  // so the ResizeObserver, become-active and zoom paths that exist to heal this all ran and all
+  // no-opped, for the life of the session. Refusing an implausible size WITHOUT recording it keeps
+  // every one of those passes live, so the first fit that measures correctly is pushed through.
+  if (!isMeasuredSize(laidOut, term, ctx)) {
+    // Loud, but ONCE PER DISTINCT BAD SIZE — this path runs on every ResizeObserver tick, which a
+    // divider drag emits dozens of times a second, and a warning that floods is a warning nobody
+    // reads. Deduped against its OWN state, deliberately not against `sent` (which records only
+    // sizes actually PUSHED, so a refused size never lands there and would re-warn every frame).
+    const warning = implausibleFitWarning(term, ctx);
+    if (warning) {
+      const last = lastWarnedSize.get(sent);
+      if (!last || last.cols !== cols || last.rows !== rows) {
+        lastWarnedSize.set(sent, { cols, rows });
+        console.warn(warning);
+      }
+    }
+    return;
+  }
+  if (sent.current && sent.current.cols === cols && sent.current.rows === rows) return;
   transport?.resize(cols, rows);
   // Record only what we actually pushed. An unmeasured box returns above WITHOUT recording, so the
   // real size still gets sent once the pane is laid out.
@@ -366,6 +417,24 @@ export function Terminal({
   // nothing (see syncPtySize). Null means "the child has never been told" — reset to null whenever
   // a new PTY is spawned, so the memo can never outlive the child it describes.
   const sentPtySizeRef = useRef<TermSize | null>(null);
+  // This pane's PTY has exited. Distinct from `spawnFail`, which covers only a PTY that died having
+  // emitted NOTHING; this is the far commoner case the UI used to render as a live-looking terminal
+  // (bead sparkle-l2xgf). Drives the stopped footer AND the keystroke gate below.
+  const [ptyStopped, setPtyStopped] = useState(false);
+  // Read by xterm's onData handler, which is registered once per mount and must see the LATEST
+  // value without re-subscribing (re-registering it would drop keystrokes mid-session).
+  const ptyStoppedRef = useRef(false);
+  ptyStoppedRef.current = ptyStopped;
+  // Keystrokes typed into a stopped terminal, held for replay into the restarted PTY. The founder
+  // chose auto-restart-and-replay over swallowing, so nothing typed is lost.
+  const replayBufferRef = useRef("");
+  // True from the instant a restart is triggered until the replacement child has been fed. Holds the
+  // keystroke gate shut across the whole window — during which `ptyStopped` is already false (retry
+  // clears it) but no PTY exists yet, so a write would be discarded by `pty_write`'s "no such pty".
+  const restartPendingRef = useRef(false);
+  // `retry` reached from xterm's onData, which is registered once per mount. Held in a ref so the
+  // handler calls the current one without the mount effect depending on it.
+  const retryRef = useRef<(() => void) | null>(null);
   // Latest onRequestFocus, read by the (agentId-keyed) effect without re-subscribing.
   const onRequestFocusRef = useRef(onRequestFocus);
   onRequestFocusRef.current = onRequestFocus;
@@ -412,9 +481,11 @@ export function Terminal({
     gotOutputRef.current = false;
     setSpawnFail(null);
     setSpawnError(null);
+    setPtyStopped(false);
     setFirstOutput(false);
     setAttempt((a) => a + 1);
   }, []);
+  retryRef.current = retry;
 
   // Set true the instant the terminal is disposed (in the mount effect's cleanup). The mount effect
   // nulls termRef/fitRef/webglRef right after, so any LATE callback — a queued ResizeObserver tick,
@@ -662,6 +733,9 @@ export function Terminal({
     setFirstOutput(false);
     setSpawnFail(null);
     setSpawnError(null);
+    // A fresh PTY is not stopped. Without this the footer would survive the very restart it asks
+    // for, since `attempt` re-runs this effect rather than remounting the component.
+    setPtyStopped(false);
     // A fresh PTY has been told nothing yet. Clearing the memo here (rather than trusting the size
     // handed to spawn) keeps the post-spawn re-sync below unconditional, which is what preserves the
     // spawn-time width invariant: the child is always told its real size once the box is measured.
@@ -872,6 +946,26 @@ export function Terminal({
     // later recompute here cannot contradict them — see the registry note in terminalSubmit.
     const lineScan = registerLineScan(agentId);
     term.onData((d) => {
+      // TYPING INTO A DEAD TERMINAL RESTARTS IT AND KEEPS WHAT YOU TYPED (bead sparkle-l2xgf).
+      // Before this, `transport.write` handed the bytes to `pty_write`, which errored "no such pty",
+      // and BOTH `writePty` and `LocalTransport.write` substring-matched that error and discarded
+      // it — so the keystrokes vanished with nothing logged and nothing shown. Bail BEFORE the
+      // interaction/submit bookkeeping below: none of it is true of a process that isn't there, and
+      // counting a submit here would burn a trial prompt on a keystroke that reached no agent.
+      // The gate is "IS THERE A LIVE CHILD TO WRITE TO", not "is the footer showing", and the
+      // difference is load-bearing. A first draft latched on `ptyStopped` alone and dropped the ref
+      // synchronously to stop a paste spawning one PTY per character — which meant keystrokes 2..n
+      // of that same paste saw an open gate and were written to a PTY that did not exist yet, where
+      // `pty_write` discards them. `restartPendingRef` keeps the gate shut for the whole restart
+      // window, so the burst is buffered as one piece and replayed once the new child is up.
+      if (ptyStoppedRef.current || restartPendingRef.current) {
+        replayBufferRef.current += d;
+        if (!restartPendingRef.current) {
+          restartPendingRef.current = true;
+          retryRef.current?.();
+        }
+        return;
+      }
       useInteractionStore.getState().touch(agentId);
       // THE USER IS WORKING IN THIS TERMINAL. `onData` is the honest signal for that, and the only
       // one available: the pane parks the caret here automatically, and once this textarea is already
@@ -1176,6 +1270,34 @@ export function Terminal({
       poisonedRef.current = plan.poisoned;
     };
 
+    // Flush keystrokes that were typed into a STOPPED terminal into the restarted child.
+    //
+    // WHY THIS IS DEBOUNCED ON OUTPUT AND NOT ON SPAWN. `pty_spawn` returning means the child was
+    // FORKED, not that its TUI is up and reading — and replaying into that window is a documented
+    // way to lose work: the text lands in the CLI's input line while the trailing carriage return
+    // is swallowed, so the user sees their words sitting there un-submitted and believes the app
+    // dropped them. Re-arming this on every output chunk makes it fire only once the child has
+    // both spoken and gone quiet, which is the closest thing to "the prompt is ready" that is
+    // observable from here. The buffer is cleared BEFORE the write so a throw cannot replay twice.
+    let replayFlushTimer: number | null = null;
+    const scheduleReplayFlush = () => {
+      if (replayFlushTimer) window.clearTimeout(replayFlushTimer);
+      replayFlushTimer = window.setTimeout(() => {
+        const pending = replayBufferRef.current;
+        replayBufferRef.current = "";
+        // Reopen the keystroke gate here and NOWHERE ELSE: this is the one point at which a live
+        // child both exists and has been handed everything typed before it, so anything typed after
+        // can safely go straight through in order.
+        restartPendingRef.current = false;
+        if (!pending || disposed || disposedRef.current) return;
+        try {
+          transport.write(pending);
+        } catch (e) {
+          console.debug("replay of keystrokes into restarted PTY failed", agentId, e);
+        }
+      }, REPLAY_SETTLE_MS);
+    };
+
     // Repaint shortly after output stops arriving (debounced: streaming pays one repaint after it
     // settles, not one per chunk).
     let settleRepaintTimer: number | null = null;
@@ -1253,8 +1375,15 @@ export function Terminal({
       // "exited after output" (normal end) from "exited with no output" (show the retry state).
       gotOutputRef.current = true;
       setFirstOutput(true);
-      setSpawnFail(null);
-    setSpawnError(null); // output means it's alive — clear any prior failed/exited state
+      setSpawnFail(null); // output means it's alive — clear any prior failed/exited state
+      setSpawnError(null);
+      setPtyStopped(false); // …and so is the stopped footer: bytes are proof of a live child
+      // A restart that came from the user typing into a stopped terminal owes them their keystrokes.
+      // Re-armed on EVERY chunk so it fires once output goes quiet — see scheduleReplayFlush.
+      // Also armed when the buffer is EMPTY but a restart is pending, because this timer is the only
+      // thing that reopens the keystroke gate; without that, a restart nobody typed into (the
+      // Restart button) would buffer everything typed afterwards forever.
+      if (replayBufferRef.current || restartPendingRef.current) scheduleReplayFlush();
       // Flow control: register the chunk BEFORE writing, then release it when xterm finishes
       // parsing (the write callback). string length is a fine byte proxy for the watermarks.
       const chunkLen = e.chunk.length;
@@ -1296,6 +1425,11 @@ export function Terminal({
       if (disposed) return;
       engine.exit();
       onExit?.();
+      // THE PANE MUST SAY IT IS DEAD. Unconditional, and that is the fix (bead sparkle-l2xgf): the
+      // line below covers only the no-output case, so an agent that ran and then exited left the
+      // last frame — prompt chevron and block cursor included — on screen, indistinguishable from a
+      // terminal waiting for input, while every keystroke went to `pty_write`'s "no such pty" sink.
+      setPtyStopped(true);
       // If the process exited WITHOUT ever emitting output, don't leave a silent blank pane:
       // show an explicit "Agent exited — Start again" affordance (the spawnFail overlay) instead
       // of the lingering "Starting…". (If output streamed first, firstOutput already cleared the
@@ -1319,7 +1453,17 @@ export function Terminal({
         /* container not laid out yet */
       }
       const laidOut = !!term.element && term.element.clientWidth > 0;
-      const { cols, rows } = spawnSize(laidOut, term);
+      // `fitContext` adds the relative check: a boot-restore storm can hand a hidden-but-laid-out
+      // pane a fit of cols=23 in a box that holds ~43 (bead sparkle-l2xgf), and 23 clears the
+      // absolute floor. Refusing it here routes the spawn onto the SAFE FALLBACK path that already
+      // exists below — the child starts at 120x30, xterm is aligned to it by the `term.resize` two
+      // lines down, and the true size is pushed once the box measures correctly. That is strictly
+      // better than the old behaviour, which baked 23-column hard wraps into the scrollback
+      // permanently: the wraps are in the emitted bytes, so no later resize can un-wrap them.
+      const spawnCtx = fitContext(term);
+      const spawnWarning = implausibleFitWarning(term, spawnCtx);
+      if (spawnWarning) console.warn(`at spawn — ${spawnWarning}`);
+      const { cols, rows } = spawnSize(laidOut, term, spawnCtx);
       // KEEP XTERM AGREED WITH WHAT THE CHILD IS ABOUT TO BE TOLD (roborev 56083). When the box is
       // unmeasured, `fit.fit()` above no-ops (FitAddon proposes nothing for a 0-dimension box, so
       // xterm stays at its constructed 80×24) while spawnSize DELIBERATELY returns the 120×30
@@ -1365,6 +1509,11 @@ export function Terminal({
         // only success signal. Ready is now reported first, and the size sync — which is a
         // best-effort refinement, not a precondition — can fail without costing the signal.
         onReady?.();
+        // ARM THE REPLAY EVEN IF THE CHILD NEVER SPEAKS. Output re-arms this timer, pushing the
+        // flush out until the child goes quiet — which is the wanted behaviour and the common case.
+        // But a child that emits nothing at all would otherwise leave the keystroke gate shut
+        // forever, turning a restart into the very "typing does nothing" bug this fixes.
+        if (replayBufferRef.current || restartPendingRef.current) scheduleReplayFlush();
         try {
           syncPtySize(transport, term, sentPtySizeRef);
         } catch (e) {
@@ -1567,6 +1716,11 @@ export function Terminal({
       container.removeEventListener("mouseup", onMouseUp);
       container.removeEventListener("mousedown", onMouseDown);
       if (settleRepaintTimer) window.clearTimeout(settleRepaintTimer);
+      // NOT cleared: replayBufferRef. This cleanup runs on the "Start again" re-run of this very
+      // effect, which is exactly the path that owes the user their keystrokes — dropping the buffer
+      // here would discard what they typed at the moment we restart for them. The timer is per-PTY
+      // and must go; the pending text outlives it and is flushed by the new child's first quiet.
+      if (replayFlushTimer) window.clearTimeout(replayFlushTimer);
       if (idleSweepTimer) window.clearTimeout(idleSweepTimer);
       if (scrollRepaintTimer) window.clearTimeout(scrollRepaintTimer);
       if (copiedTimer.current) window.clearTimeout(copiedTimer.current);
@@ -1758,7 +1912,13 @@ export function Terminal({
 
   // What to paint over the blank xterm: a fail/exited affordance, a loading hint, or nothing once
   // output streams. Pure (see terminalOverlay.ts) so the "never a silent blank pane" rule is tested.
-  const overlay = resolveTerminalOverlay(spawnFail, firstOutput, resuming, spawnError ?? undefined);
+  const overlay = resolveTerminalOverlay(
+    spawnFail,
+    firstOutput,
+    resuming,
+    spawnError ?? undefined,
+    ptyStopped,
+  );
   // The pane's own inks. `--c-forest` follows a `data-theme` flip through CSS, but the terminal's
   // ink register has no CSS variable (see terminalChrome), so these resolve in JS. That is a
   // re-render on a theme flip and MUST NOT become a remount — an unmount kills this PTY. Nothing
@@ -1806,6 +1966,61 @@ export function Terminal({
           (a `claude --resume` redraw or a fresh banner leaves the pane empty for a few seconds;
           with the sidebar already showing a named, working agent, that blank reads as broken).
           Fail/exited: an explicit, retryable state instead of a silent blank. */}
+      {/* THE STOPPED FOOTER. A BAR, not a scrim, and that is the founder's call: the last output of
+          a dead session is the most useful thing on screen (his was a truncated error), so it stays
+          fully readable and scrollable and only the bottom strip — where the CLI's dead prompt and
+          block cursor sit — is claimed. That claim is the point: the fake cursor is covered by the
+          thing that says the terminal is stopped. */}
+      {overlay.kind === "stopped" ? (
+        <div
+          data-testid="terminal-stopped-footer"
+          style={{
+            position: "absolute",
+            left: 0,
+            right: 0,
+            bottom: 0,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 12,
+            padding: "8px 12px",
+            background: TERM_PLANE,
+            borderTop: `1px solid ${TERM_HAIRLINE}`,
+            fontFamily: TERM_UI,
+            fontSize: TERM_TYPE.body,
+            zIndex: 5,
+          }}
+        >
+          <span style={{ color: quietInk }}>
+            {/* A FILLED square, not a glyph that could read as a cursor — the whole defect was a
+                block cursor that looked alive, and xterm paints an UNFOCUSED block cursor as a
+                hollow outline, which is exactly what Feather's `rect` draws by default
+                (`fill: none`). `fill: currentColor` keeps this a solid block, so porting the
+                mechanism from a dingbat to an icon does not quietly restore the shape the footer
+                exists to disambiguate from. Decorative: the adjacent text carries the meaning. */}
+            <FiSquare
+              aria-hidden="true"
+              style={{ marginRight: 8, verticalAlign: "-0.125em", fill: "currentColor" }}
+            />
+            {overlay.message}
+          </span>
+          <button
+            onClick={retry}
+            style={{
+              all: "unset",
+              cursor: "pointer",
+              fontSize: TERM_TYPE.body,
+              color: ink,
+              border: `1px solid ${TERM_HAIRLINE}`,
+              borderRadius: TERM_RADIUS.input,
+              padding: "4px 12px",
+            }}
+          >
+            <FiRefreshCw aria-hidden="true" style={{ marginRight: 6, verticalAlign: "-0.125em" }} />
+            Restart
+          </button>
+        </div>
+      ) : null}
       {overlay.kind === "fail" ? (
         // Explicit failed/exited state — never a silent blank pane. Pointer events ON so the
         // "Start again" button is clickable (unlike the loading overlay below).
@@ -1869,7 +2084,8 @@ export function Terminal({
               padding: "6px 16px",
             }}
           >
-            ▶ Start again
+            <FiPlay aria-hidden="true" style={{ marginRight: 6, verticalAlign: "-0.125em" }} />
+            Start again
           </button>
         </div>
       ) : overlay.kind === "loading" ? (
@@ -1916,7 +2132,8 @@ export function Terminal({
           zIndex: 10,
         }}
       >
-        ✓ Copied to clipboard
+        <FiCheck aria-hidden="true" style={{ marginRight: 6, verticalAlign: "-0.125em" }} />
+        Copied to clipboard
       </div>
       {popup && (
         <SelectionPopup

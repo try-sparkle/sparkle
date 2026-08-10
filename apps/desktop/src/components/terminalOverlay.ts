@@ -6,7 +6,9 @@
 //              clearing to nothing, we say what happened and let the user retry.
 //   - loading: spawned, no output yet — the unavoidable gap before Claude's first byte / a
 //              `--resume` redraw. Reads as loading, not broken.
-//   - none:    output has streamed; the terminal itself is showing — no overlay.
+//   - stopped: the PTY ran, PRODUCED OUTPUT, and then exited. See below — this is the case that
+//              used to render nothing at all.
+//   - none:    output has streamed and the process is alive; the terminal itself is showing.
 export type SpawnFail = null | "failed" | "exited";
 
 /** Flatten an unknown thrown value into something showable. Local by convention — five other modules
@@ -25,9 +27,25 @@ export function errText(e: unknown): string {
 export type TerminalOverlay =
   | { kind: "none" }
   | { kind: "loading"; message: string }
+  | { kind: "stopped"; message: string; canRetry: true }
   /** `detail` is the underlying error, when we have one — see `reason` on resolveTerminalOverlay. */
   | { kind: "fail"; message: string; canRetry: true; detail?: string };
 
+/**
+ * `stopped` closes the hole this whole module was supposed to cover (bead sparkle-l2xgf).
+ *
+ * The "never a silent blank pane" rule was enforced only for a PTY that died having emitted
+ * NOTHING. An agent that ran, printed thousands of lines and then exited took the `none` branch —
+ * so the pane kept rendering the last frame of a dead session, INCLUDING the CLI's prompt chevron
+ * and its block cursor. That is not a blank pane, it is a worse one: it is indistinguishable from a
+ * terminal waiting for input, and every keystroke typed into it was silently swallowed by
+ * `pty_write`'s "no such pty" path. The founder typed into one and reasonably concluded the app was
+ * broken. The concierge's own copy ("…'s terminal has closed — Start it again and I'll pass it
+ * along") pointed at a Start again button that, in exactly this case, was never rendered.
+ *
+ * `fail` still wins over `stopped`: an agent that exited with no output at all is better described
+ * by "Agent exited." over a scrim than by a footer under an empty screen.
+ */
 export function resolveTerminalOverlay(
   spawnFail: SpawnFail,
   firstOutput: boolean,
@@ -41,6 +59,7 @@ export function resolveTerminalOverlay(
    *  only record of it was a `console.debug`. Blank/whitespace is treated as absent so we never paint
    *  an empty second line. */
   reason?: string,
+  ptyStopped = false,
 ): TerminalOverlay {
   // Failure takes precedence over the loading affordance even if output never set firstOutput.
   if (spawnFail) {
@@ -51,6 +70,11 @@ export function resolveTerminalOverlay(
       message: spawnFail === "failed" ? "Couldn't start the agent." : "Agent exited.",
       ...(detail ? { detail } : {}),
     };
+  }
+  // Before the loading hint: a PTY that stopped is stopped whether or not its first byte arrived,
+  // and "Starting…" over a dead process is the same lie in a different font.
+  if (ptyStopped) {
+    return { kind: "stopped", canRetry: true, message: "Terminal stopped" };
   }
   if (!firstOutput) {
     return { kind: "loading", message: resuming ? "Resuming conversation…" : "Starting…" };

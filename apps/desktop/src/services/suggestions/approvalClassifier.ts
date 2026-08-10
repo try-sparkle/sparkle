@@ -45,7 +45,13 @@ const CATEGORY_RULES: Array<[ApprovalCategory, RegExp]> = [
   ["skill", /\buse skill\b|\bskill\b/i],
   ["bash", /\bbash\b|\brun (?:this |the )?command\b|\bshell command\b|\bexecute\b|(?:^|\s)\$\s|\bcommand\b/i],
   ["edit", /\bedit\b|\bwrite\b|\bcreate file\b|\bapply this edit\b|\bmodify\b|\bupdate (?:the )?file\b/i],
-  ["mcp", /mcp__|\buse tool\b|\btool call\b|\bMCP\b/i],
+  // The last alternative is the DISPLAY form the picker actually renders — "sparkle-control -
+  // set_agent_activity(…)". Without it only the wire form (`mcp__server__tool`) counted as MCP, so
+  // every real on-screen MCP prompt fell through to `other`: the founder's `set_agent_activity`
+  // prompt was classified `other`, which means setting `mcp = "always"` would not have silenced it
+  // and nobody could have worked out why. The trailing "(" keys on a tool invocation specifically,
+  // so prose containing a spaced dash does not become an MCP prompt.
+  ["mcp", /mcp__|\buse tool\b|\btool call\b|\bMCP\b|\b[A-Za-z0-9_.-]+\s+-\s+[A-Za-z0-9_]+\s*\(/i],
   ["fetch", /\bweb\s?fetch\b|\bfetch\b|https?:\/\//i],
 ];
 
@@ -63,7 +69,7 @@ const OPTION_LINE = /^\s*(?:[❯›>]\s*)?\d{1,2}\.\s+/;
 /** The header/question region for the LATEST picker: the non-empty lines just above the last picker
  *  footer, with the numbered option lines removed (so option labels don't drive the category). Falls
  *  back to the whole tail window (minus option lines) when no footer is present. */
-function headerRegion(scrollback: string): string {
+export function headerRegion(scrollback: string): string {
   const lines = tailLines(scrollback, PICKER_WINDOW);
   let footerIdx = -1;
   for (let i = lines.length - 1; i >= 0; i--) {

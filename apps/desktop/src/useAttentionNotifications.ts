@@ -70,6 +70,7 @@ import {
 } from "./engine/workerAttention";
 import { resolveStage } from "./engine/workflowStage";
 import { withNudgeLoopCalm } from "./engine/nudgeLoopCalm";
+import { withFinishedHeadCalm } from "./engine/finishedHeadCalm";
 import { thrashReportFor, type ThrashReport } from "./engine/agentThrash";
 import type { AgentTab, AgentTabStatus } from "./types";
 import { projectNameForAgent } from "./services/creditProject";
@@ -124,6 +125,9 @@ export function publishedStatusFor(
    *  while `composeRollup` itself stays pure. */
   thrashOf: (id: string) => ThrashReport | undefined = (id) =>
     thrashReportFor(id, now ?? Date.now(), {}),
+  /** agentId → positively read as finished. Defaults to "unread" (demotes nothing), because this
+   *  file has no git state of its own — only the sidebar polls it. See composeRollup. */
+  isFinishedOf: (id: string) => boolean | undefined = () => undefined,
 ): StatusMap {
   const { published, dotOf } = composeRollup(
     agents,
@@ -134,6 +138,7 @@ export function publishedStatusFor(
     now,
     interaction,
     thrashOf,
+    isFinishedOf,
   );
   return withWorkerRollupGreen(agents, published, dotOf, promoted);
 }
@@ -163,6 +168,10 @@ export function rollupViewFor(
    *  under a head the rest of the app had already calmed. */
   thrashOf: (id: string) => ThrashReport | undefined = (id) =>
     thrashReportFor(id, now ?? Date.now(), {}),
+  /** See `publishedStatusFor`'s parameter of the same name. The Build column needs it too: `dotOf`
+   *  reads the finished-calmed published map, so a column that skipped it would keep painting a
+   *  finished head red while every other surface had calmed it. */
+  isFinishedOf: (id: string) => boolean | undefined = () => undefined,
 ): { own: StatusMap; dotOf: (id: string) => RollupDot } {
   const { own, dotOf } = composeRollup(
     agents,
@@ -173,6 +182,7 @@ export function rollupViewFor(
     now,
     interaction,
     thrashOf,
+    isFinishedOf,
   );
   return { own, dotOf };
 }
@@ -201,6 +211,12 @@ function composeRollup(
    *  default, which is the distinction `thrashReportFor`'s own `undefined` arm exists to preserve.
    *  Only step (5) reads it, and only for the `nudge-loop` verdict. */
   thrashOf: (id: string) => ThrashReport | undefined = () => undefined,
+  /** agentId → has this row been POSITIVELY READ as finished (engine/agentStall's `finished`
+   *  verdict)? `undefined` means "we did not look", which demotes nothing — see engine/
+   *  finishedHeadCalm. Injected for the same reason `thrashOf` is: the stall inputs are assembled
+   *  from git state the sidebar polls, and this composition documents itself as pure. Defaults to
+   *  "unread", i.e. exactly today's behaviour for any caller with no evidence to give. */
+  isFinishedOf: (id: string) => boolean | undefined = () => undefined,
 ): { published: StatusMap; own: StatusMap; dotOf: (id: string) => RollupDot } {
   // (0): a spawned-but-never-briefed agent is `new`, not red. FIRST, on the RAW map, so the two
   // bubbles below never carry a briefless agent's false red up to its orchestrator — a bubbled red
@@ -232,10 +248,27 @@ function composeRollup(
   // sparkle-hpbkw (a finished head painted red by its stranded worker), and it is deliberately NOT
   // done here: it contradicts `publishedRollupAgreement.test.ts`'s stated expectation that a head in
   // motion with a WAITING worker still asks. That is the founder's call to make, not this file's.
-  const published = withNudgeLoopCalm(
+  // (6): a head we have POSITIVELY READ as finished stops inheriting its worker's alarm — the other
+  // half of bead sparkle-hpbkw. `calm` is the OWN reference for the same reason it would be for any
+  // "is this the row's own ask" question: `bubbled` has by then made an inherited red
+  // indistinguishable from a real one, so feeding it that map collapses the rule to a no-op (the
+  // trap `rollupDotAccessor` documents on `ownStatusOf`).
+  //
+  // This is the NARROW rule, and narrow on purpose. The general form — `needsYou === false ⇒ never
+  // red` — turned seven pinned expectations red when it was wired, including
+  // `publishedRollupAgreement`'s stated "head in motion + WAITING worker still asks". This one
+  // cannot reach any of them: it fires only where the app has positively read the head as FINISHED,
+  // and a head with live workers under it is not resting. `undefined` (nobody polled) demotes
+  // nothing, so a caller with no evidence gets exactly today's behaviour.
+  const published = withFinishedHeadCalm(
     agents,
-    withDismissedAlerts(agents, withUnmergedWork(agents, bubbled, stageOf)),
-    thrashOf,
+    withNudgeLoopCalm(
+      agents,
+      withDismissedAlerts(agents, withUnmergedWork(agents, bubbled, stageOf)),
+      thrashOf,
+    ),
+    calm,
+    isFinishedOf,
   );
   // The same chain with the worker bubbles left OUT. Without it the rollup reads a bubbled red as
   // the head's OWN red and returns early, which makes every mixed subtree unreachable (the trap

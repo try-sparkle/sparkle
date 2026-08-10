@@ -214,3 +214,129 @@ describe("effectiveResumeRule", () => {
     expect(effectiveResumeRule(null)).toBe("summary");
   });
 });
+
+// ---------------------------------------------------------------------------------------------
+// PER-TOOL MCP POLICY, driven through the REAL entry point.
+//
+// mcpToolPolicy.test.ts pins the decision function in isolation. That is not sufficient on its own:
+// a policy module nobody calls is the "defaulted seam" vacuity AGENTS.md warns about — delete the
+// wiring in approvalsRuntime and those tests stay green while the behaviour is gone. These drive
+// maybeAutoApprove, so they fail if the call site is removed.
+const MCP_NARRATION_PROMPT = [
+  "sparkle-control - set_agent_activity(activity: \"Mapping the retro loop\")",
+  "Do you want to proceed?",
+  "❯ 1. Yes",
+  "  2. Yes, and don't ask again",
+  "  3. No, and tell Claude what to do differently",
+  "",
+  FOOTER,
+].join("\n");
+
+const MCP_LIFECYCLE_PROMPT = [
+  "sparkle-control - sparkle_lifecycle(op: \"discard_agent\", agentId: \"abc\")",
+  "Do you want to proceed?",
+  "❯ 1. Yes",
+  "  2. Yes, and don't ask again",
+  "  3. No, and tell Claude what to do differently",
+  "",
+  FOOTER,
+].join("\n");
+
+describe("maybeAutoApprove — per-tool MCP policy", () => {
+  // THE FOUNDER'S CASE. His config carries `bash = "always"` and NO mcp rule, which is exactly the
+  // beforeEach state, so this is his machine reproduced. Before the per-tool policy this returned
+  // null and he got the prompt — twice in one session, the second stalling the agent 4m08s.
+  it("auto-answers the narration prompt with bash-only config and no mcp rule", () => {
+    useSettingsStore.setState({ approvals: { bash: "always" } });
+    expect(maybeAutoApprove("a1", MCP_NARRATION_PROMPT, new Set())).toBe("mcp");
+    expect(writePty).toHaveBeenCalledWith("a1", "1\n");
+  });
+
+  // The safety half, and the one that must never regress: an explicit `mcp = "always"` is the most
+  // permissive thing the human can say, and it still must not discard an agent for them.
+  it("refuses a lifecycle discard even when mcp = always", () => {
+    useSettingsStore.setState({ approvals: { mcp: "always" } });
+    expect(maybeAutoApprove("a1", MCP_LIFECYCLE_PROMPT, new Set())).toBeNull();
+    expect(writePty).not.toHaveBeenCalled();
+  });
+
+  // PAIRED with the test above (AGENTS.md: one test proving absence is ambiguous). Same rule, same
+  // entry point, same prompt shape — only the tool differs — so a null result cannot be explained by
+  // the feature gate, the rule lookup, or the classifier failing to see a picker at all.
+  it("...while the same config still auto-answers an allowlisted tool", () => {
+    useSettingsStore.setState({ approvals: { mcp: "always" } });
+    expect(maybeAutoApprove("a1", MCP_NARRATION_PROMPT, new Set())).toBe("mcp");
+    expect(writePty).toHaveBeenCalledTimes(1);
+  });
+
+  it("still respects the master toggle", () => {
+    aiFeatureVisibleNow.mockReturnValue(false);
+    expect(maybeAutoApprove("a1", MCP_NARRATION_PROMPT, new Set())).toBeNull();
+    expect(writePty).not.toHaveBeenCalled();
+  });
+
+  // A never rule is the human saying "keep asking me". The allow list must not override that — it
+  // exists to spare them a prompt they never configured, not to overrule one they did.
+  it("does not auto-answer an allowlisted tool when the rule is 'never'", () => {
+    useSettingsStore.setState({ approvals: { mcp: "never" } });
+    expect(maybeAutoApprove("a1", MCP_NARRATION_PROMPT, new Set())).toBeNull();
+    expect(writePty).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// roborev 61990 (High), verified exploitable against the code before the fix.
+//
+// The tool name was parsed from the WHOLE scrollback with a first-match regex. A pane holding an
+// earlier, already-answered `set_agent_activity(…)` above a PENDING `sparkle_lifecycle` discard
+// therefore resolved to the ALLOWLISTED name — and auto-approved the discard. Measured before the
+// fix: mcpToolFromPrompt returned "set_agent_activity" for exactly this scrollback.
+//
+// Two independent guards now, because this is the one failure whose cost is unrecoverable: the
+// runtime reads only the picker's header region, and the parser takes the LAST match rather than
+// the first. This test exercises the real maybeAutoApprove, so it fails if either is undone.
+describe("maybeAutoApprove — the pending prompt decides, not an earlier one", () => {
+  const STALE_ABOVE_LIFECYCLE = [
+    'sparkle-control - set_agent_activity(activity: "answered ten minutes ago")',
+    "Do you want to proceed?",
+    "❯ 1. Yes",
+    "  2. No, and tell Claude what to do differently",
+    "",
+    FOOTER,
+    "...intervening agent output...",
+    'sparkle-control - sparkle_lifecycle(op: "discard_agent", agentId: "abc")',
+    "Do you want to proceed?",
+    "❯ 1. Yes",
+    "  2. No, and tell Claude what to do differently",
+    "",
+    FOOTER,
+  ].join("\n");
+
+  it("never auto-approves a discard because an allowlisted call sits above it", () => {
+    useSettingsStore.setState({ approvals: { bash: "always", mcp: "always" } });
+    expect(maybeAutoApprove("a1", STALE_ABOVE_LIFECYCLE, new Set())).toBeNull();
+    expect(writePty).not.toHaveBeenCalled();
+  });
+
+  // The mirror image, so the fix cannot be "return null whenever the scrollback is busy": an
+  // allowlisted tool as the PENDING prompt, with a denied one above it, must still auto-answer.
+  it("still auto-answers an allowlisted tool that is the pending prompt", () => {
+    const DENIED_ABOVE_ALLOWED = [
+      'sparkle-orchestrator - spawn_worker(task: "earlier, already answered")',
+      "Do you want to proceed?",
+      "❯ 1. Yes",
+      "  2. No, and tell Claude what to do differently",
+      "",
+      FOOTER,
+      "...intervening agent output...",
+      'sparkle-control - set_agent_activity(activity: "the pending one")',
+      "Do you want to proceed?",
+      "❯ 1. Yes",
+      "  2. No, and tell Claude what to do differently",
+      "",
+      FOOTER,
+    ].join("\n");
+    expect(maybeAutoApprove("a1", DENIED_ABOVE_ALLOWED, new Set())).toBe("mcp");
+    expect(writePty).toHaveBeenCalledTimes(1);
+  });
+});

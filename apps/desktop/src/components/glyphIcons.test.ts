@@ -21,8 +21,9 @@
 //     `PRD/sparkle/blueprint-type-scale.md` rather than guessed at here.
 //
 // A RATCHET, like the other guards on this branch: the remaining hits are in files other branches
-// own (Terminal, Workspace, AgentSidebar, AgentPane), so a hard zero would red the fleet for work in
-// flight. Lower the ceiling in the PR that lowers reality.
+// own (Workspace, AgentSidebar, AgentPane, AgentRow), so a hard zero would red the fleet for work in
+// flight. Lower the ceiling in the PR that lowers reality — and add the file you emptied to `SWEPT`,
+// because a ceiling alone lets the next branch put a glyph back there and pay for it elsewhere.
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -187,7 +188,11 @@ function hits(): string[] {
 }
 
 /** Reality when this branch swept its surfaces. Every survivor is in a file another branch owns. */
-const MAX_GLYPH_ICONS = 6;
+// Lowered 6 -> 4 by the terminal stopped-state PR (sparkle-l2xgf), which ported this file's four
+// sites — the stopped-footer square, its Restart, the failure overlay's Start again, and the
+// copy confirmation — to react-icons/fi. Per the ratchet's own rule: lower the ceiling in the PR
+// that lowers reality, so the ground reclaimed here cannot be quietly given back.
+const MAX_GLYPH_ICONS = 4;
 
 describe("affordances are react-icons, never characters", () => {
   it("the count of glyph-as-icon sites never rises", () => {
@@ -222,6 +227,11 @@ describe("affordances are react-icons, never characters", () => {
       "components/composer/TextPill.tsx",
       "components/composer/TextPillModal.tsx",
       "satellite/SatelliteApp.tsx",
+      // Emptied by the terminal stopped-state PR (sparkle-l2xgf). Lowering the ceiling 6 -> 4 was
+      // only half of it: `toBeLessThanOrEqual` would still let a branch reintroduce a glyph here
+      // and pay for it by removing one from Workspace, which is the precise trade this second test
+      // exists to forbid. Its surviving `→ ⇧ ⌘ ⌥` are all in `EXEMPT`, so this is a true zero.
+      "components/Terminal.tsx",
     ];
     const offenders = hits().filter((h) => SWEPT.some((s) => h.startsWith(s + ":")));
     expect(offenders, "a glyph icon came back to a swept surface:\n" + offenders.join("\n")).toEqual([]);

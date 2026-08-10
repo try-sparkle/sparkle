@@ -13,7 +13,8 @@ import { useSettingsStore } from "../../stores/settingsStore";
 import { useProjectStore } from "../../stores/projectStore";
 import { aiFeatureVisibleNow } from "../aiGate";
 import { writePtyChained } from "../../pty";
-import { classifyApproval } from "./approvalClassifier";
+import { classifyApproval, headerRegion } from "./approvalClassifier";
+import { mcpAutoAnswerable, mcpToolFromPrompt, isDeniedTool } from "./mcpToolPolicy";
 import { detectClaudeCodePicker, detectResumePrompt } from "./heuristics";
 import {
   toApprovalMap,
@@ -54,8 +55,44 @@ export function maybeAutoApprove(
   // spends no AI credits, so gating it on a positive balance would leave out-of-credit users blocked
   // by prompts forever. The on/off toggle (ai.auto_approve) is the sole gate here.
   if (!aiFeatureVisibleNow("autoApprove")) return null;
+  // ---------------------------------------------------------------------------------------------
+  // THE DENY VETO, deliberately ahead of the category branch and independent of it.
+  //
+  // Category is a REGEX GUESS, and a wrong guess must not be able to authorise a destructive tool.
+  // The concrete hole this closes: `sparkle-orchestrator - spawn_worker(task: "run the build
+  // command")` classifies as `bash` — the bash rule matches the word "command" inside the tool's own
+  // arguments, and bash is checked before mcp. A user with `bash = "always"` (the founder's exact
+  // config) would then have a worker spawned for them with no prompt, because a policy scoped to
+  // `category === "mcp"` never runs on a prompt that landed in `bash`.
+  //
+  // So the veto keys on the PROMPT NAMING A DENIED TOOL, not on where the classifier filed it. It
+  // can only ever add a prompt, never remove one.
+  // Scoped to the picker HEADER REGION, the same region classifyApproval reads, so the tool name
+  // comes from the prompt being decided rather than from anything earlier in the scrollback.
+  const promptRegion = headerRegion(scrollback);
+  const namedTool = mcpToolFromPrompt(promptRegion);
+  if (namedTool && isDeniedTool(namedTool)) {
+    log.info("approvals", "auto-approve vetoed (denied tool)", {
+      agentId,
+      category: classification.category,
+      tool: namedTool,
+    });
+    return null;
+  }
   const root = projectRootForAgent(agentId);
-  if (effectiveApprovalRule(root, classification.category) !== "always") return null;
+  const rule = effectiveApprovalRule(root, classification.category);
+  // MCP prompts are decided per TOOL, not per category (services/suggestions/mcpToolPolicy).
+  // `[approvals].mcp` is one bucket spanning `set_agent_activity` (writes a narration string) and
+  // `sparkle_lifecycle` (discards an agent), so a single always/ask rule cannot express what the
+  // human means. The policy narrows in BOTH directions: it auto-answers a short, individually
+  // verified read-only list even with no rule set — which is what stops the narration prompts the
+  // founder kept hitting — and it refuses anything that spawns, discards, merges, pushes, or speaks
+  // as him EVEN IF he set `mcp = "always"`. An unreadable tool name always asks.
+  if (classification.category === "mcp") {
+    if (mcpAutoAnswerable(promptRegion, rule) !== "auto") return null;
+  } else if (rule !== "always") {
+    return null;
+  }
   const sig = pickerSignature(scrollback);
   // Already answered THIS picker instance: keep the buttons suppressed + the note shown, but never
   // re-send the keystroke (a re-hash of the same settled screen must not double-answer).
@@ -63,7 +100,14 @@ export function maybeAutoApprove(
   handled.add(sig);
   // Chained: the option keystroke carries its own CR (see pty.writePtyChained).
   void writePtyChained(agentId, classification.approveOption);
-  log.info("approvals", "auto-approved", { agentId, category: classification.category });
+  // The audit trail for an answer the human never saw. `tool` is the load-bearing field: a bare
+  // category cannot distinguish a narration string that was auto-answered from a lifecycle op that
+  // was, which is the exact question anyone reviewing this after the fact will be asking.
+  log.info("approvals", "auto-approved", {
+    agentId,
+    category: classification.category,
+    tool: namedTool ?? undefined,
+  });
   return classification.category;
 }
 

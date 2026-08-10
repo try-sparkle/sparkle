@@ -128,6 +128,7 @@ import { attentionWorkersOf } from "../engine/workerExpansion";
 import { withDismissedAlerts, alertControlKind } from "../engine/alertDismissal";
 import { withUnmergedWork } from "../engine/unmergedAttention";
 import { withNudgeLoopCalm } from "../engine/nudgeLoopCalm";
+import { withFinishedHeadCalm } from "../engine/finishedHeadCalm";
 import { thrashReportFor } from "../engine/agentThrash";
 import { withDismissedStallAttention, withStallAttention } from "../engine/stallEscalation";
 import { processAliveFor } from "../services/goalContinuationRunner";
@@ -390,6 +391,36 @@ export function AgentSidebar({
     for (const a of project?.agents ?? NO_AGENTS) index.set(a.id, a);
     return index;
   }, [project?.agents]);
+  // THE STALL READING, HOISTED (bead sparkle-hpbkw). It used to be an anonymous callback inside the
+  // escalation memo below, which meant the only consumer of the verdict was that memo. `engine/
+  // finishedHeadCalm` needs the SAME verdict — a head is only calmed where the app has positively
+  // read it as `finished` — and the Build column's rollup needs it too, so it is named here and
+  // passed to all three. Re-deriving it in two places is how this subsystem has drifted before.
+  const stallReportOf = useCallback(
+    (id: string) => {
+      const agent = agentsById.get(id);
+      if (agent === undefined) return undefined;
+      return stallReport(
+        stallInputsFor(
+          calmStatus[id] ?? "stopped",
+          Date.now(),
+          agent.goal,
+          { bs: branchStatus[id], ws: workflowState[id], stageOverride: workflowStage[id] },
+          quotaBlockForAgent(id, Date.now()),
+        ),
+      );
+    },
+    [agentsById, calmStatus, branchStatus, workflowState, workflowStage],
+  );
+  /** Positively read as FINISHED, or `undefined` when the git state was never read. `undefined` is a
+   *  real answer and it demotes nothing — see engine/finishedHeadCalm. */
+  const isFinishedOf = useCallback(
+    (id: string) => {
+      const r = stallReportOf(id);
+      return r === undefined ? undefined : r.verdict === "finished";
+    },
+    [stallReportOf],
+  );
   const escalatedStatus = useMemo(() => {
     if (!project) return status;
     const escalated = withStallAttention(
@@ -446,13 +477,20 @@ export function AgentSidebar({
           // `Date.now()` needs no tick of its own: the `nudge-loop` verdict is a pure counter over
           // the hook stream and does not decay with time, unlike the quota and compaction windows.
           // It is passed only because `thrashReportFor` requires a clock for its other verdicts.
-          withNudgeLoopCalm(
+          withFinishedHeadCalm(
             project.agents,
-            withDismissedAlerts(project.agents, presentedStatus),
-            (id) => thrashReportFor(id, Date.now(), {}),
+            withNudgeLoopCalm(
+              project.agents,
+              withDismissedAlerts(project.agents, presentedStatus),
+              (id) => thrashReportFor(id, Date.now(), {}),
+            ),
+            // `calmStatus` is the pre-bubble map — the row's OWN status. Handing this the bubbled or
+            // presented map would make an inherited red read as the head's own and the rule a no-op.
+            calmStatus,
+            isFinishedOf,
           )
         : status,
-    [project, presentedStatus, status],
+    [project, presentedStatus, status, calmStatus, isFinishedOf],
   );
   // Advance each agent's alert-episode record on every change to the overlaid (pre-dismissal) status
   // — the input the "Dismiss Alert" feature reads. Declared HERE, below `escalatedStatus`, because a
@@ -2115,8 +2153,18 @@ export function AgentSidebar({
   // have made the column band differently from every other surface with no test failing.
   const { own: ownStatus, dotOf: rollupOf } = useMemo(
     () =>
-      rollupViewFor(project?.agents ?? [], liveStatus, new Set(openAgentIds), lastObserved, (id) =>
-        resolveStage(branchStatus[id], workflowStage[id]),
+      rollupViewFor(
+        project?.agents ?? [],
+        liveStatus,
+        new Set(openAgentIds),
+        lastObserved,
+        (id) => resolveStage(branchStatus[id], workflowStage[id]),
+        undefined,
+        undefined,
+        undefined,
+        // The column's disc must agree with every other surface about a finished head — otherwise
+        // the row reads red here and calm in the digest (bead sparkle-hpbkw).
+        isFinishedOf,
       ),
     // `graceTick` is deliberate: this memo runs step (0) with an internally-sampled clock, and for a
     // held `errored` agent none of the other deps ever change again — so the row's disc and its
@@ -2124,7 +2172,7 @@ export function AgentSidebar({
     // disagreeing inside one component is exactly what this shared tick exists to prevent
     // (roborev 54830).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [project?.agents, liveStatus, openAgentIds, lastObserved, branchStatus, workflowStage, graceTick],
+    [project?.agents, liveStatus, openAgentIds, lastObserved, branchStatus, workflowStage, graceTick, isFinishedOf],
   );
   const rowBandOf = useCallback((id: string) => bandOfRollup(rollupOf(id)), [rollupOf]);
 
