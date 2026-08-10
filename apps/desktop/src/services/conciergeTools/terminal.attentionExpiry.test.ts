@@ -60,6 +60,10 @@ const MENU = [
   "Enter your choice: ",
 ].join("\n");
 
+/** The shared time base for this suite: every ledger stamp is an offset from it, so the ledger and
+ *  the capture's own `Date.now()` stamp sit on ONE scale — see `ledgerSeesWorkAfterTheAsk`. */
+const BASE = Date.now();
+
 /** An authority that really did pass the policy gate. */
 const ALLOWED = conciergeToolAuthority("call-1", { tier: "allow" })!;
 
@@ -91,12 +95,21 @@ function agentAsksAMenu() {
  * Drive the movement ledger the way the app does: an episode is stamped from the status map, then
  * evidence folds in over SUCCESSIVE polls.
  *
+ * TIMES ARE OFFSETS FROM A SHARED `BASE`, NOT BARE LITERALS (bead sparkle-5wbhn). The capture now
+ * carries its own write time, stamped by `setAttentionScreen` from the real clock, and `captureFor`
+ * compares the ledger against THAT. In production both are epoch ms from the same clock — the
+ * ledger's come from `fleet_digest` — so a fixture using synthetic 1_000/2_000 epochs would put the
+ * two on incomparable scales and make every movement look older than every capture. Anchoring on
+ * `BASE` keeps the one property under test (ordering) while matching production's single time base.
+ *
  * Two `noteMovement` calls, not one, and that is the module's rule rather than padding: the first
  * evidence an episode sees only ADOPTS its `session_id` and is explicitly not counted as movement
  * (movementRetraction header 4b), so a single call would leave the ledger empty and this helper
  * would silently assert nothing.
  */
-function ledgerSeesWorkAfterTheAsk(raisedAt: number, workedAt: number) {
+function ledgerSeesWorkAfterTheAsk(raisedAtOffset: number, workedAtOffset: number) {
+  const raisedAt = BASE + raisedAtOffset;
+  const workedAt = BASE + workedAtOffset;
   const ledger = windowRetractionLedger();
   noteRedEpochs(ledger, { [AGENT]: "waiting" }, isRedStatus, raisedAt);
   const evidence: MovementEvidence = {
@@ -232,6 +245,39 @@ describe("the ask-screen capture expires when the agent stops asking", () => {
       // …and the frozen red no longer refuses the picker-driving keys on a dead menu either.
       const key = await sendControlKey(AGENT, "enter", ALLOWED);
       expect(key.ok).toBe(true);
+    });
+
+    // ── THE ASK-AGAIN CASE (bead sparkle-5wbhn, roborev 61856) ────────────────────────────────
+    // The case above is a capture the agent HAS moved past. This is its mirror and the one the
+    // first cut got wrong: a capture written AFTER the movement, which is the freshest evidence
+    // there is and was being thrown away.
+    //
+    // It needs no remount and no exotic timing. `noteRedEpochs` treats `waiting → approval` as ONE
+    // episode, so `redSince` survives — the agent asks, the human answers in the terminal, work
+    // events land, the agent asks AGAIN and photographs the new menu, all inside that one red. The
+    // old rule compared movement against the EPISODE's raise time, so it called that new capture
+    // stale; the fix compares against the CAPTURE's own write time.
+    //
+    // The consequence being pinned is the write path, not the read: `mayHaveMenu` fell back to a
+    // capture that had been discarded, returned false, and PERMITTED `enter` into a live unread
+    // picker — the fail-open direction of a guard whose header says it fails closed when blind.
+    it("keeps serving a capture written AFTER the movement, and still refuses the keys", async () => {
+      agentAsksAMenu();
+      // The human answers; the agent works. Movement is stamped inside the same red episode, and
+      // in the PAST relative to the capture written below — that ordering is the whole case, and
+      // it is why the offsets are negative while the case above uses positive ones.
+      ledgerSeesWorkAfterTheAsk(-4_000, -2_000);
+      // …and then it asks again, photographing the NEW menu. Still red throughout, so the store
+      // clear correctly does not fire.
+      useRuntimeStore.getState().setAttentionScreen(AGENT, MENU);
+
+      const after = await readAgentTerminal(AGENT);
+      expect(after.source).toBe("attention-screen");
+      expect(after.text).toContain("Enter your choice:");
+
+      // THE POINT: the picker-driving keys stay refused, because there IS a live menu.
+      const key = await sendControlKey(AGENT, "enter", ALLOWED);
+      expect(key.ok).toBe(false);
     });
 
     // THE PAIRED POSITIVE, and it pins the ORDERING rather than the mere presence of evidence: work

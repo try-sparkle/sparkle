@@ -80,7 +80,7 @@ import { agentTranscriptPath, agentTranscriptWorktree } from "../agentTranscript
 import { isRedStatus } from "../windowStatus";
 // The "has this agent acted since its red was raised" ledger, shared with the concierge feed's
 // stale-red retraction — see `captureFor` for why the ask-screen needs the same answer.
-import { movedSince, windowRetractionLedger } from "../../engine/movementRetraction";
+import { movedSince, movedSinceStamp, windowRetractionLedger } from "../../engine/movementRetraction";
 import { isObserved, type AgentLiveness } from "../agentLiveness";
 import {
   goalReading,
@@ -557,7 +557,19 @@ function captureFor(agentId: string): TierResult {
   if (!raw || raw.trim() === "") {
     return { why: "the agent hasn't stopped to ask anything, so no ask-screen was captured" };
   }
-  if (movedSince(windowRetractionLedger(), agentId)) {
+  // AGAINST THE CAPTURE'S OWN WRITE TIME when we have one (bead sparkle-5wbhn). `movedSince`
+  // compares against the red episode's RAISE time, and `waiting → approval` is one episode — so an
+  // agent that asks, is answered, and asks again inside it wrote a capture NEWER than the movement,
+  // and judging it episode-relative threw away the freshest evidence there is. That is not merely a
+  // stale read: `mayHaveMenu` then returns false and `sendControlKey` PERMITS `enter` into a live,
+  // unread picker. A capture with no stamp keeps the old comparison rather than being trusted
+  // blindly — absent evidence must not become permission.
+  const capturedAt = useRuntimeStore.getState().attentionScreenAt[agentId];
+  const stale =
+    capturedAt === undefined
+      ? movedSince(windowRetractionLedger(), agentId)
+      : movedSinceStamp(windowRetractionLedger(), agentId, capturedAt);
+  if (stale) {
     return {
       why: "the agent captured an ask-screen, but it has been seen working since — that screen describes a question it has already moved past",
     };

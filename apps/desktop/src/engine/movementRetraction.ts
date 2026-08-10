@@ -290,6 +290,23 @@ export function noteMovement(
  * take, and it matters more here than usual, because the thing being guessed away is a request for
  * the human's attention.
  */
+/**
+ * Has anything moved since `at` (epoch ms)?
+ *
+ * THE CAPTURE-RELATIVE TWIN of {@link movedSince}, and the difference is the whole of bead
+ * sparkle-5wbhn. `movedSince` compares movement against the RED EPISODE'S RAISE TIME, and
+ * `noteRedEpochs` treats `waiting → approval` as ONE episode — so an agent that asks, is answered,
+ * and asks again inside that episode has a `movedAt` newer than `redSince` but OLDER than the
+ * capture its second ask wrote. Judging that capture with `movedSince` discards the freshest
+ * evidence there is, and `mayHaveMenu` then permits a blind `enter` into a live picker.
+ *
+ * A caller holding a write time must therefore ask THIS, not that.
+ */
+export function movedSinceStamp(ledger: RetractionLedger, id: string, at: number): boolean {
+  const moved = ledger.movedAt.get(id);
+  return moved !== undefined && moved > at;
+}
+
 export function movedSince(ledger: RetractionLedger, id: string): boolean {
   const raisedAt = ledger.redSince.get(id);
   if (raisedAt === undefined) return false;

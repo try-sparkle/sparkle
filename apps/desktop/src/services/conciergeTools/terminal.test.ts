@@ -39,7 +39,8 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => "") }));
 // with the persisted copy), so the two liveness answers cannot diverge — both helpers are stubbed
 // here rather than left undefined.
 vi.mock("../../stores/runtimeStore", () => ({
-  useRuntimeStore: { getState: vi.fn(() => ({ attentionScreen: {}, status: {} })) },
+  useRuntimeStore: { getState: vi.fn(() => ({ attentionScreen: {},
+    attentionScreenAt: {}, status: {} })) },
   mergeOpenAgentIds: (inMemory: string[], persisted: string[]) => [
     ...new Set([...inMemory, ...persisted]),
   ],
@@ -117,6 +118,7 @@ function seedAgent(runtime: "local" | "cloud" = "local", status?: string) {
   });
   runtimeStateMock.mockReturnValue({
     attentionScreen: {},
+    attentionScreenAt: {},
     status: status ? { [AGENT]: status } : {},
   } as never);
 }
@@ -150,6 +152,7 @@ function seedFreshAgent(status?: string, over: Record<string, unknown> = {}) {
   });
   runtimeStateMock.mockReturnValue({
     attentionScreen: {},
+    attentionScreenAt: {},
     status: status ? { [AGENT]: status } : {},
   } as never);
 }
@@ -163,6 +166,7 @@ const NOW = Date.now();
 function seedRuntime(status: string | undefined, extra: Record<string, unknown>) {
   runtimeStateMock.mockReturnValue({
     attentionScreen: {},
+    attentionScreenAt: {},
     status: status ? { [AGENT]: status } : {},
     ...extra,
   } as never);
@@ -196,6 +200,8 @@ function seedGoalAgent(goal: Record<string, unknown>, status?: string) {
 function seedAttentionScreen(text: string, status = "waiting") {
   runtimeStateMock.mockReturnValue({
     attentionScreen: { [AGENT]: text },
+    // The stamp travels with the text — see runtimeStore.attentionScreenAt (sparkle-5wbhn).
+    attentionScreenAt: { [AGENT]: Date.now() },
     status: { [AGENT]: status },
   } as never);
 }
@@ -789,6 +795,7 @@ describe("getAgentStatus", () => {
     seedAgent("local");
     runtimeStateMock.mockReturnValue({
       attentionScreen: {},
+    attentionScreenAt: {},
       status: {},
       openAgentIds: [AGENT],
     } as never);
@@ -1103,6 +1110,7 @@ describe("the Improve Sparkle agent is addressable", () => {
     useProjectStore.setState({ projects: [] });
     runtimeStateMock.mockReturnValue({
       attentionScreen: {},
+    attentionScreenAt: {},
       status: { [SPARKLE_AGENT_ID]: status },
     } as never);
   }
@@ -1150,6 +1158,7 @@ describe("the Improve Sparkle agent is addressable", () => {
     const perWindow = `${SPARKLE_AGENT_ID}-win-abc`;
     runtimeStateMock.mockReturnValue({
       attentionScreen: {},
+    attentionScreenAt: {},
       status: { [perWindow]: "working" },
     } as never);
     expect(getAgentStatus(perWindow).known).toBe(true);
@@ -1161,7 +1170,8 @@ describe("the Improve Sparkle agent is addressable", () => {
   // addressable, and the report stays honest that the status is a default rather than a reading.
   it("stays addressable when its pane is open in another window", () => {
     useProjectStore.setState({ projects: [] });
-    runtimeStateMock.mockReturnValue({ attentionScreen: {}, status: {} } as never);
+    runtimeStateMock.mockReturnValue({ attentionScreen: {},
+    attentionScreenAt: {}, status: {} } as never);
     vi.mocked(readPersistedOpenAgentIds).mockReturnValue([SPARKLE_AGENT_ID]);
     const s = getAgentStatus(SPARKLE_AGENT_ID);
     expect(s.known).toBe(true);
@@ -1175,7 +1185,8 @@ describe("the Improve Sparkle agent is addressable", () => {
   // `unknown-agent` write gate keeps working for a Sparkle-shaped id that isn't running anywhere.
   it("still refuses a Sparkle-namespace id this window has never seen", async () => {
     useProjectStore.setState({ projects: [] });
-    runtimeStateMock.mockReturnValue({ attentionScreen: {}, status: {} } as never);
+    runtimeStateMock.mockReturnValue({ attentionScreen: {},
+    attentionScreenAt: {}, status: {} } as never);
     vi.mocked(readPersistedOpenAgentIds).mockReturnValue([]);
     const ghost = `${SPARKLE_AGENT_ID}-win-never-ran`;
     expect(getAgentStatus(ghost).known).toBe(false);
@@ -1253,6 +1264,7 @@ describe("get_agent_status — known and observed can never disagree", () => {
         useProjectStore.setState({ projects: [] });
         runtimeStateMock.mockReturnValue({
           attentionScreen: {},
+    attentionScreenAt: {},
           status: { [SPARKLE_AGENT_ID]: "working" },
         } as never);
         return SPARKLE_AGENT_ID;
@@ -1264,6 +1276,7 @@ describe("get_agent_status — known and observed can never disagree", () => {
         useProjectStore.setState({ projects: [] });
         runtimeStateMock.mockReturnValue({
           attentionScreen: {},
+    attentionScreenAt: {},
           status: { "orphan-1": "waiting" },
         } as never);
         return "orphan-1";

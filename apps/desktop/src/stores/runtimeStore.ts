@@ -702,6 +702,13 @@ interface RuntimeState {
   // question, so it may not outlive the question: see `setStatus` for why the expiry is keyed on
   // this map's sibling `status` rather than on the Terminal seam that writes it.
   attentionScreen: Record<string, string>;
+  /** When each `attentionScreen` entry was WRITTEN (epoch ms).
+   *
+   *  A SIBLING MAP RATHER THAN `{ text, at }` (bead sparkle-5wbhn): `attentionScreen` is read as a
+   *  bare string by `useAttentionNotifications` and the concierge read chain, and widening it would
+   *  touch every one of those call sites for a fact only the expiry needs. Written and cleared in
+   *  lockstep with `attentionScreen` — every site that touches one touches the other. */
+  attentionScreenAt: Record<string, number>;
   // agentId -> how ask-like a FINISHED turn looked that we could NOT judge, because the AI backend
   // was unavailable (services/turnFollowup returns `unknown`). This is the neutral middle state
   // between "the judge said this needs you" (red) and "the judge said it's done" (gray): we simply
@@ -808,6 +815,7 @@ export const useRuntimeStore = create<RuntimeState>()(
       lastObserved: {},
       agentMovement: {},
       attentionScreen: {},
+      attentionScreenAt: {},
       unjudgedAsk: {},
       openAgentIds: [],
       branchStatus: {},
@@ -845,6 +853,7 @@ export const useRuntimeStore = create<RuntimeState>()(
                   },
                 };
           const { [agentId]: _scr, ...attentionScreen } = s.attentionScreen;
+          const { [agentId]: _scrAt, ...attentionScreenAt } = s.attentionScreenAt;
           // Stripped with the rest of the live-only maps. Its doc says it is cleared with `status`,
           // and it must be: the marker claims an unanswered question about a turn that is gone once
           // the pane closes (and about the PREVIOUS occupant on a slot reuse). roborev, 54814.
@@ -869,6 +878,7 @@ export const useRuntimeStore = create<RuntimeState>()(
             status,
             lastObserved,
             attentionScreen,
+            attentionScreenAt,
             unjudgedAsk,
             branchStatus,
             workflowStage,
@@ -888,6 +898,7 @@ export const useRuntimeStore = create<RuntimeState>()(
           // new session repopulates a LIVE status within a tick regardless.
           const { [agentId]: _lo, ...lastObserved } = s.lastObserved;
           const { [agentId]: _scr, ...attentionScreen } = s.attentionScreen;
+          const { [agentId]: _scrAt, ...attentionScreenAt } = s.attentionScreenAt;
           // Stripped with the rest of the live-only maps. Its doc says it is cleared with `status`,
           // and it must be: the marker claims an unanswered question about a turn that is gone once
           // the pane closes (and about the PREVIOUS occupant on a slot reuse). roborev, 54814.
@@ -905,6 +916,7 @@ export const useRuntimeStore = create<RuntimeState>()(
             status,
             lastObserved,
             attentionScreen,
+            attentionScreenAt,
             unjudgedAsk,
             branchStatus,
             workflowStage,
@@ -919,7 +931,8 @@ export const useRuntimeStore = create<RuntimeState>()(
         // of the SAME status (e.g. repeated "working"/"listening"/"blocked") must not churn a render.
         set((s) => {
           if (s.status[agentId] === status) return s;
-          const next: Pick<RuntimeState, "status"> & Partial<Pick<RuntimeState, "attentionScreen">> = {
+          const next: Pick<RuntimeState, "status"> &
+            Partial<Pick<RuntimeState, "attentionScreen" | "attentionScreenAt">> = {
             status: { ...s.status, [agentId]: status },
           };
           // THE CAPTURE EXPIRES WITH THE ASK (sparkle-99o9a). `attentionScreen[agentId]` is the screen
@@ -952,7 +965,9 @@ export const useRuntimeStore = create<RuntimeState>()(
           // the agent still needs you and nothing has recaptured a screen.
           if (!isRedStatus(status) && agentId in s.attentionScreen) {
             const { [agentId]: _scr, ...attentionScreen } = s.attentionScreen;
+            const { [agentId]: _scrAt, ...attentionScreenAt } = s.attentionScreenAt;
             next.attentionScreen = attentionScreen;
+            next.attentionScreenAt = attentionScreenAt;
           }
           return next;
         }),
@@ -965,7 +980,13 @@ export const useRuntimeStore = create<RuntimeState>()(
         set((s) => (sameMovement(s.agentMovement, movement) ? s : { agentMovement: movement })),
 
       setAttentionScreen: (agentId, text) =>
-        set((s) => ({ attentionScreen: { ...s.attentionScreen, [agentId]: text } })),
+        // The stamp is written with the text, never separately: `captureFor` compares movement
+        // against THIS instant, and a capture with no stamp falls back to the old
+        // episode-relative comparison, which is the behaviour this fixes (bead sparkle-5wbhn).
+        set((s) => ({
+          attentionScreen: { ...s.attentionScreen, [agentId]: text },
+          attentionScreenAt: { ...s.attentionScreenAt, [agentId]: Date.now() },
+        })),
 
       setUnjudgedAsk: (agentId, signal) =>
         // Same no-op guard `setStatus` uses and for the same reason: this map has whole-map
