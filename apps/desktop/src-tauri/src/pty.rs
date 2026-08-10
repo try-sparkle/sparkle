@@ -793,6 +793,44 @@ fn finish_teardown(observers: &crate::nudger::Observers, id: &str, reap: Reap) {
 /// its own thread).
 type SpawnedPty = (PtySession, Box<dyn Read + Send>, Box<dyn Child + Send + Sync>);
 
+/// Insert `session` under `id` (minting its epoch under the sessions lock) and attach the nudger
+/// observer ONLY when the insert won the race. Returns `None` when a racing `pty_kill` cancelled the
+/// spawn — [`PtyManager::insert_session`] returned [`NO_EPOCH`] — and CRUCIALLY, on that path NO
+/// observer is attached, so a cancelled spawn can never strand one. `nudger::Observers::attach`
+/// records `id` in the observer map and only `detach` removes it (dropping the returned handle does
+/// NOT), and the nudger climbs its ladder off the live observer set (`observers.all()` in
+/// `nudger::tick`), so an observer left on a killed PTY would escalate a terminal that never ran
+/// (roborev 62075, HIGH). Keeping the insert and the conditional attach together here makes
+/// "cancelled ⇒ no observer" a single invariant a unit test can drive with a `PtyManager` and an
+/// `Observers` directly — `pty_spawn` itself needs a live `AppHandle` a test cannot build.
+///
+/// SCOPE — what this does and does NOT guarantee (roborev 62108): the attach runs AFTER
+/// `insert_session` releases the sessions lock, not under it. So only the CANCEL-path invariant
+/// above is closed. Two windows remain, both pre-existing (the prior attach-then-insert order
+/// admitted a symmetric interleaving) and both requiring two concurrent spawns of one id — which
+/// only the frontend restart path produces, since it does not yet sequence `killPty` before
+/// `spawnPty`: (1) a brief live-but-unobserved gap between the insert and the attach (a `pty_resize`
+/// landing there loses geometry until the next resize); (2) a stale-attach clobber where a loser
+/// spawn's late `attach` displaces the winner's observer, leaving the nudger judging a live agent
+/// off a blank screen. The durable fix is to attach under the sessions lock (or make the observer
+/// map epoch-aware so a lower-epoch attach cannot replace a higher-epoch entry) — that is the same
+/// causal-ordering redesign tracked in `sparkle-b6fdg`, deliberately out of scope for this HIGH fix.
+fn insert_or_cancel(
+    manager: &PtyManager,
+    observers: &crate::nudger::Observers,
+    id: &str,
+    session: PtySession,
+    cols: u16,
+    rows: u16,
+) -> Option<(u64, Arc<crate::nudger::PtyObserver>)> {
+    let epoch = manager.insert_session(id.to_string(), session);
+    if epoch == NO_EPOCH {
+        return None;
+    }
+    let observer = observers.attach(id, cols, rows);
+    Some((epoch, observer))
+}
+
 /// Spawn `command` in a PTY. Output streams to the frontend via the `pty:output`
 /// event; `pty:exit` fires when the process ends.
 // too_many_arguments: each arg is a distinct field of the frontend's invoke payload; bundling
@@ -941,26 +979,27 @@ pub async fn pty_spawn(
     let read_pause = session.pause.clone();
     let inflight = session.inflight.clone();
     let read_inflight = inflight.clone();
-    // Start observing this session for the deterministic nudger (nudger.rs). The handle is captured
-    // by the reader thread below so the hot path costs no map lookup per read. This is the ONLY
-    // record of PTY output that exists outside the WebView: `PtySession` retains nothing, and
-    // xterm's scrollback dies with the pane — which is precisely why the nudger could not read a
-    // screen before this.
-    let observer = app.state::<crate::nudger::Observers>().attach(&id, cols, rows);
-    let read_observer = observer.clone();
-    // MINT UNDER THE SAME LOCK AS THE INSERT — see `insert_session`. This is the only ordering that
-    // makes "the highest epoch minted for an id is the session that survived" TRUE rather than
-    // merely likely, and the frontend's overlap rule depends on it.
-    let epoch = app.state::<PtyManager>().insert_session(id.clone(), session);
-    if epoch == NO_EPOCH {
+    // Insert under the sessions lock and attach the nudger observer ONLY if the insert won the race
+    // — see `insert_or_cancel`, which keeps the two together so "a cancelled spawn attaches no
+    // observer" is a single unit-testable invariant rather than a source-order accident here. The
+    // epoch is minted under the same lock as the insert, which is what makes "the highest epoch
+    // minted for an id is the session that survived" TRUE rather than merely likely (the frontend's
+    // overlap rule depends on it).
+    let manager = app.state::<PtyManager>();
+    let observers = app.state::<crate::nudger::Observers>();
+    let Some((epoch, observer)) =
+        insert_or_cancel(manager.inner(), observers.inner(), &id, session, cols, rows)
+    else {
         // A `pty_kill` for this id landed while we were setting up off-thread and already reported
         // success. Honour it: kill and reap the child we just started so it does not keep running
-        // against the worktree, and wire up nothing (no reader/flusher/reaper threads). `reader`,
-        // `observer` and every clone above drop on return (bead sparkle-82vey).
+        // against the worktree, and wire up nothing — no reader/flusher/reaper threads, and (because
+        // `insert_or_cancel` never attached one on the cancel path) no observer. `reader` and every
+        // clone above drop on return (bead sparkle-82vey).
         let _ = child.kill();
         let _ = child.wait();
         return Err("pty_spawn: cancelled by a kill that raced the spawn".to_string());
-    }
+    };
+    let read_observer = observer.clone();
 
     // Reap the child so it doesn't zombie.
     std::thread::spawn(move || {
@@ -1438,7 +1477,8 @@ mod epoch_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_writer, apply_heap_cap, guard_resize_size, guard_spawn_size, next_pty_epoch,
+        acquire_writer, apply_heap_cap, guard_resize_size, guard_spawn_size, insert_or_cancel,
+        next_pty_epoch,
         node_options_with_cap, run_flusher, validate_spawn_inner, Credit, FlushBuf, InflightState,
         finish_teardown, kill_session, PauseState, PtyManager, PtyEnd, PtySession, Reap,
         MIN_PTY_COLS,
@@ -2670,6 +2710,89 @@ mod tests {
             "a stale kill must not cancel a later restart of the same id"
         );
         cleanup.push(child);
+
+        for mut c in cleanup {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+
+    /// GUARD for the roborev-62075 HIGH via the SIDE EFFECT, not a source-order proxy: after a spawn
+    /// that a racing `pty_kill` cancelled, `Observers` must hold NO entry for the id — a stranded
+    /// observer keeps the nudger's ladder climbing against an agent that never ran. This drives
+    /// `insert_or_cancel` (the extracted insert + conditional-attach) directly with a `PtyManager`
+    /// and an `Observers`, so the production decision is exercised without a live `AppHandle`. The
+    /// paired winning case pins the converse (a spawn that wins the race DOES attach its observer),
+    /// so the assertion cannot pass by a broken helper that attaches nothing in every case.
+    #[test]
+    fn a_cancelled_insert_attaches_no_observer_while_a_winning_one_does() {
+        use portable_pty::{native_pty_system, Child, CommandBuilder, PtySize};
+        // Build a real PtySession backed by a trivial child. `None` when the environment has no pty
+        // (some CI sandboxes) — the test then skips visibly rather than passing vacuously.
+        let mk = || -> Option<(PtySession, Box<dyn Child + Send + Sync>)> {
+            let sys = native_pty_system();
+            let size = PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
+            let pair = sys.openpty(size).ok()?;
+            let child = pair.slave.spawn_command(CommandBuilder::new("/bin/cat")).ok()?;
+            let killer = child.clone_killer();
+            let writer = pair.master.take_writer().ok()?;
+            Some((
+                PtySession {
+                    writer: Arc::new(Mutex::new(writer)),
+                    master: pair.master,
+                    killer,
+                    pause: Arc::new(PauseState::new()),
+                    inflight: Arc::new(InflightState::new()),
+                    pid: None,
+                    epoch: NO_EPOCH,
+                },
+                child,
+            ))
+        };
+
+        let mgr = PtyManager::default();
+        let observers = crate::nudger::Observers::default();
+        let mut cleanup: Vec<Box<dyn Child + Send + Sync>> = Vec::new();
+
+        // ── CANCELLED: a kill marked this in-flight spawn, so insert_or_cancel refuses to insert AND
+        //    attaches no observer. ──────────────────────────────────────────────────────────────────
+        let Some((session, child)) = mk() else {
+            eprintln!("SKIP a_cancelled_insert_…: no pty available in this environment");
+            return;
+        };
+        cleanup.push(child);
+        mgr.begin_spawn("agent-cancelled");
+        assert!(
+            !kill_session(&mgr, "agent-cancelled"),
+            "no live session yet, so kill_session returns false — but it marks the in-flight spawn"
+        );
+        let cancelled = insert_or_cancel(&mgr, &observers, "agent-cancelled", session, 80, 24);
+        assert!(cancelled.is_none(), "a cancelled spawn must not insert (epoch == NO_EPOCH)");
+        assert!(
+            observers.get("agent-cancelled").is_none(),
+            "THE SIDE EFFECT: a cancelled spawn must attach NO observer, or the nudger escalates a \
+             terminal that never ran (roborev 62075, HIGH)"
+        );
+
+        // ── WINNING: no kill, so insert_or_cancel inserts AND attaches the observer. Without this
+        //    case the assertion above would also pass on a broken helper that attaches nothing ever. ─
+        let Some((session, child)) = mk() else {
+            eprintln!("SKIP a_cancelled_insert_… (winning half): no pty available");
+            for mut c in cleanup {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+            return;
+        };
+        cleanup.push(child);
+        mgr.begin_spawn("agent-winning");
+        let (epoch, _observer) = insert_or_cancel(&mgr, &observers, "agent-winning", session, 80, 24)
+            .expect("an un-raced spawn must insert");
+        assert!(epoch > NO_EPOCH, "a winning insert mints a real epoch");
+        assert!(
+            observers.get("agent-winning").is_some(),
+            "a winning spawn attaches its observer so the nudger can read the live screen"
+        );
 
         for mut c in cleanup {
             let _ = c.kill();
