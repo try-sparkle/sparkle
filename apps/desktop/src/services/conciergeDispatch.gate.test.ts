@@ -29,11 +29,14 @@ import {
   DISPATCH_AUTHORITY_KINDS,
   conciergeToolAuthority,
   type DispatchAuthority,
+  type DispatchAuthorityKind,
 } from "./dispatchAuthority";
 
-/** One well-formed authority per kind, built from the union's OWN key list so a new arm added to
- *  `DispatchAuthority` shows up here as an undefined sample rather than as silent under-coverage. */
-const SAMPLES: Record<string, DispatchAuthority> = {
+/** One well-formed authority per kind. Keyed over `DispatchAuthorityKind` (not `string`) so a new
+ *  arm added to `DispatchAuthority` is a COMPILE error here — an omission the runtime walk below would
+ *  otherwise catch only in a full suite run — matching the `Record<DispatchAuthorityKind, …>`
+ *  exhaustiveness guard `AUTHORITY_EXTRA_CHECK` already uses in dispatchAuthority.ts. */
+const SAMPLES: Record<DispatchAuthorityKind, DispatchAuthority> = {
   mention: { kind: "mention", agentId: "a1" },
   approval: { kind: "approval", proposalId: "p1" },
   countdown: { kind: "countdown", intentId: "i1" },
