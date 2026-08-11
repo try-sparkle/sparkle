@@ -203,6 +203,51 @@ export function buildClaudeLoginExec(claudePath: string, opts: { configDir?: str
   return `${configExport}${ANTHROPIC_ENV_UNSET}export PATH="$HOME/.local/bin:$PATH"; exec ${shellQuote(claudePath)} ${CLAUDE_LOGIN_ARGV}`;
 }
 
+/** FNV-1a 32-bit, hex. Not a security hash — just a short, stable, collision-resistant token for a
+ *  path, so a PTY id can carry WHICH config dir it belongs to without embedding the path itself. */
+function pathToken(s: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16).padStart(8, "0");
+}
+
+/**
+ * The PTY session id for a `claude auth login` running against `configDir`.
+ *
+ * THE CONFIG DIR IS LOAD-BEARING IN THE ID, and its absence was a live credential-crossing bug
+ * (bead sparkle-znusx). The id used to be `claude-signin-<attempt>` — a retry counter and nothing
+ * else — so EVERY account's sign-in shared the id `claude-signin-0`.
+ *
+ * `PtyManager.sessions` is a `HashMap<String, PtySession>` keyed by exactly this id, and `pty_spawn`
+ * inserts with `sessions.insert`, which REPLACES silently. pty.rs says what that costs, in its own
+ * words: "a second spawn for the same id drops the first `PtySession` on the floor — its child keeps
+ * running … and is invisible to every surface in the app because nothing holds a handle to it any
+ * more."
+ *
+ * For a sign-in, that orphan is not merely a leak. The dropped child is a live `claude auth login`
+ * still holding `CLAUDE_CONFIG_DIR=<the PREVIOUS account's dir>` and still holding the loopback
+ * OAuth callback listener. The browser redirect therefore lands in the ORPHAN, and the credential
+ * the user just authorized is written into the account they signed in to LAST TIME.
+ *
+ * Measured on the founder's machine: every one of five accounts was registered with the correct
+ * login, then three of them silently drifted onto one identity. `account-identity-log.json` records
+ * "DROdio Gmail CHANGED-TO superadmin@storytell.ai" at the SAME SECOND that "FC SuperAdmin" was
+ * created — 13 seconds BEFORE FC SuperAdmin's own dir received it. The orphan won the callback.
+ *
+ * Keying the id on the config dir makes two concurrent sign-ins two distinct sessions, so neither
+ * can silently evict the other.
+ */
+export function claudeSignInPtyId(configDir: string | undefined, attempt: number): string {
+  // The DEFAULT account (no configDir) is its own namespace, exactly as it is in Claude Code's
+  // keychain: `T7()` hashes the config dir only when CLAUDE_CONFIG_DIR is set, and uses the bare
+  // service name when it is not. "default" mirrors that rather than inventing a third state.
+  const scope = configDir ? pathToken(configDir) : "default";
+  return `claude-signin-${scope}-${attempt}`;
+}
+
 /**
  * The Anthropic env overrides, unset before the login runs — mirroring the Rust-side scrub that
  * `accounts::claude_auth_status` applies to its probe (`claude_oneshot::ANTHROPIC_ENV_OVERRIDES`).

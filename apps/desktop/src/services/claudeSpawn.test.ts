@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   buildClaudeExec,
   buildClaudeLoginExec,
+  claudeSignInPtyId,
   CLAUDE_LOGIN_ARGV,
   CLAUDE_LOGIN_COMMAND,
   shellQuote,
@@ -423,5 +424,70 @@ describe("plan mode (--permission-mode)", () => {
         }),
       ).toThrow(/mutually exclusive/);
     }
+  });
+});
+
+// THE CREDENTIAL NAMESPACE IS THE RAW PATH STRING, so two spellings of one directory are two
+// different Claude logins (bead sparkle-znusx). Claude Code v2.1.226 builds its keychain service
+// name as `Claude Code-credentials-${sha256(CLAUDE_CONFIG_DIR).slice(0, 8)}` — over the path AS
+// GIVEN, with no realpath and no separator normalization. Measured on the founder's machine, same
+// directory, same second:
+//
+//     loggedIn=True    CLAUDE_CONFIG_DIR=…/accounts/5b0a0788de0c3754
+//     loggedIn=False   CLAUDE_CONFIG_DIR=…/accounts/5b0a0788de0c3754/     ← trailing slash
+//     loggedIn=False   CLAUDE_CONFIG_DIR=…/accounts/./5b0a0788de0c3754
+//
+// A trailing slash does not report an error. It reports NOT SIGNED IN — which the app reads as an
+// account that needs logging in again, and a fresh login there writes a SECOND credential the first
+// spelling can never see. So the invariant is not "the paths are equivalent" (the OS says they are;
+// the keychain does not). It is that every spawn path emits the SAME BYTES.
+describe("CLAUDE_CONFIG_DIR is emitted byte-identically by every spawn path", () => {
+  const DIR = "/Users/x/Library/Application Support/ai.sparkle.desktop/accounts/5b0a0788de0c3754";
+  // THROWS rather than returning undefined. A `\S+` capture here silently returned undefined for
+  // every real account path (they all contain "Application Support"), which made `expect(login)
+  // .toBe(spawn)` pass as undefined === undefined — a vacuous green over the exact assertion this
+  // suite exists to make. A non-match is a broken test, not a passing one.
+  const configExport = (cmd: string) => {
+    const m = /export CLAUDE_CONFIG_DIR=(.*?); /.exec(cmd);
+    if (!m) throw new Error(`no CLAUDE_CONFIG_DIR export in: ${cmd}`);
+    return m[1];
+  };
+
+  // The login WRITES the credential and the agent spawn READS it. If these two ever disagree by one
+  // byte, the account signs in successfully and every agent launched under it is logged out.
+  it("the login and the agent spawn target the same string", () => {
+    const login = configExport(buildClaudeLoginExec("/bin/claude", { configDir: DIR }));
+    const spawn = configExport(buildClaudeExec("/bin/claude", false, { configDir: DIR }));
+    expect(login).toBe(spawn);
+    expect(login).toBe(shellQuote(DIR));
+  });
+
+  // Neither builder may "tidy" the path — no trailing-slash trim, no `.` collapse, no realpath. A
+  // normalization that looks harmless here silently re-points the account at a different keychain
+  // entry, and the account reads as signed out with no error anywhere.
+  it("passes the caller's exact bytes through, including spellings that differ", () => {
+    for (const dir of [DIR, `${DIR}/`, "/a/./b", "/a//b", "/tmp/dir with spaces"]) {
+      for (const cmd of [
+        buildClaudeLoginExec("/bin/claude", { configDir: dir }),
+        buildClaudeExec("/bin/claude", false, { configDir: dir }),
+      ]) {
+        expect(configExport(cmd)).toBe(shellQuote(dir));
+      }
+    }
+  });
+
+  // The PTY session id is derived from that same string, so a sign-in can never be filed under an
+  // account other than the one its exec targets.
+  it("derives the sign-in PTY id from the same string, and never collides across accounts", () => {
+    expect(claudeSignInPtyId(DIR, 0)).toBe(claudeSignInPtyId(DIR, 0));
+    expect(claudeSignInPtyId(DIR, 0)).not.toBe(claudeSignInPtyId(DIR, 1));
+    expect(claudeSignInPtyId(DIR, 0)).not.toBe(claudeSignInPtyId(`${DIR}-other`, 0));
+    expect(claudeSignInPtyId(undefined, 0)).not.toBe(claudeSignInPtyId(DIR, 0));
+    // Two spellings ARE two credentials, so they must be two sessions too — collapsing them here
+    // would re-introduce the orphaned-PTY crossover through the back door.
+    expect(claudeSignInPtyId(DIR, 0)).not.toBe(claudeSignInPtyId(`${DIR}/`, 0));
+    // Usable as a session key and a React key: no separators, no quoting hazards.
+    expect(claudeSignInPtyId(DIR, 0)).toMatch(/^claude-signin-[0-9a-f]{8}-0$/);
+    expect(claudeSignInPtyId(undefined, 0)).toBe("claude-signin-default-0");
   });
 });

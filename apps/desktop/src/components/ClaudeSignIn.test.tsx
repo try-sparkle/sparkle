@@ -18,17 +18,32 @@ vi.mock("../preflight", () => ({
 
 // The PTY is the one thing we cannot run here. Expose its onExit so a test can fire the exact edge
 // the confirm window hangs off, and record the argv so the `auth login` fix is pinned end to end.
-let lastSpawn: { args: string[]; cwd?: string } | null = null;
+let lastSpawn: { args: string[]; cwd?: string; agentId: string } | null = null;
+/** Every PTY mounted during a test, in order — the agentId is the `PtyManager.sessions` KEY, so a
+ *  repeat here is a real session collision, not a cosmetic one. */
+let spawns: { agentId: string; args: string[] }[] = [];
 let fireExit: (() => void) | null = null;
 vi.mock("./Terminal", () => ({
-  Terminal: ({ args, cwd, onExit }: { args: string[]; cwd?: string; onExit?: () => void }) => {
-    lastSpawn = { args, cwd };
+  Terminal: ({
+    agentId,
+    args,
+    cwd,
+    onExit,
+  }: {
+    agentId: string;
+    args: string[];
+    cwd?: string;
+    onExit?: () => void;
+  }) => {
+    lastSpawn = { args, cwd, agentId };
+    spawns.push({ agentId, args });
     fireExit = onExit ?? null;
     return <div data-testid="pty" />;
   },
 }));
 
 import { ClaudeSignIn } from "./ClaudeSignIn";
+import { claudeSignInPtyId } from "../services/claudeSpawn";
 
 /** Mirrors CONFIRM_POLL_MS in the component. Kept local (the constant is not exported) but named so
  *  the timer advances below read as "several poll intervals", not as a magic number. */
@@ -45,6 +60,7 @@ const auth = (loggedIn: boolean, source: AuthStatusSource = "cli"): ClaudeAuthSt
 beforeEach(() => {
   vi.clearAllMocks();
   lastSpawn = null;
+  spawns = [];
   fireExit = null;
   checkClaude.mockResolvedValue({ installed: true, path: "/bin/claude", version: null });
 });
@@ -182,6 +198,50 @@ describe("ClaudeSignIn", () => {
   // The config dir is targeted by `CLAUDE_CONFIG_DIR` in the exec string (asserted above), never by
   // the cwd, so there is nothing to replace it with: a null cwd is the contract pty.rs documents for
   // "the pre-worktree `claude login` flows", and it falls back to the managed app-data dir.
+  // TWO ACCOUNTS' SIGN-INS MUST NOT SHARE ONE PTY SESSION (bead sparkle-znusx).
+  //
+  // The agentId IS the `PtyManager.sessions` key (`HashMap<String, PtySession>`), and `pty_spawn`
+  // inserts with `sessions.insert`, which REPLACES silently. pty.rs states the consequence: the
+  // first `PtySession` is "dropped on the floor — its child keeps running … and is invisible to
+  // every surface in the app". For a sign-in that orphan is a live `claude auth login` still holding
+  // the PREVIOUS account's CLAUDE_CONFIG_DIR *and* the loopback OAuth callback listener — so the
+  // browser redirect completes into the wrong account's config dir.
+  //
+  // This is not hypothetical. On the founder's machine all five accounts were registered with the
+  // right login and three then drifted onto one identity; `account-identity-log.json` shows "DROdio
+  // Gmail CHANGED-TO superadmin@storytell.ai" at the exact second "FC SuperAdmin" was created, 13
+  // seconds before FC SuperAdmin's own dir got it.
+  //
+  // Asserts the SIDE EFFECT (two distinct session keys exist at once), not the precondition. Against
+  // the pre-fix id — `claude-signin-${attempt}` — both mounts are `claude-signin-0` and this fails.
+  it("gives each account's sign-in its own PTY session id", async () => {
+    render(<ClaudeSignIn configDir="/acc/gmail" onSignedIn={vi.fn()} />);
+    render(<ClaudeSignIn configDir="/acc/superadmin" onSignedIn={vi.fn()} />);
+    await waitFor(() => expect(screen.getAllByTestId("pty")).toHaveLength(2));
+
+    const ids = spawns.map((s) => s.agentId);
+    expect(new Set(ids).size).toBe(ids.length);
+
+    // …and each id belongs to the dir its OWN exec targets. Pairing them is the point: two unique
+    // ids that were swapped between the accounts would satisfy the check above and still write each
+    // login into the other's dir.
+    for (const s of spawns) {
+      const dir = /CLAUDE_CONFIG_DIR='([^']+)'/.exec(s.args.at(-1) ?? "")?.[1];
+      expect(dir).toBeTruthy();
+      expect(s.agentId).toBe(claudeSignInPtyId(dir, 0));
+    }
+  });
+
+  // The default account (no configDir) is a namespace of its own, and must not collide with a named
+  // account either — it is the one config dir whose login is the machine-wide `~/.claude` one.
+  it("keeps the default account's sign-in distinct from a named account's", async () => {
+    render(<ClaudeSignIn onSignedIn={vi.fn()} />);
+    render(<ClaudeSignIn configDir="/acc/gmail" onSignedIn={vi.fn()} />);
+    await waitFor(() => expect(screen.getAllByTestId("pty")).toHaveLength(2));
+    const ids = spawns.map((s) => s.agentId);
+    expect(new Set(ids).size).toBe(2);
+  });
+
   it("never hands the account config dir to the PTY as its cwd", async () => {
     render(<ClaudeSignIn configDir="/acc/dir" onSignedIn={vi.fn()} />);
     await screen.findByTestId("pty");

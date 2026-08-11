@@ -21,7 +21,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { FiCheckCircle, FiLoader } from "react-icons/fi";
 import { C, FONT_WEIGHT } from "../theme/colors";
 import { RADIUS } from "../theme/scale";
-import { buildClaudeLoginExec, SHELL } from "../services/claudeSpawn";
+import { buildClaudeLoginExec, claudeSignInPtyId, SHELL } from "../services/claudeSpawn";
 import { checkClaude, checkClaudeAuthStatus } from "../preflight";
 import { Terminal } from "./Terminal";
 
@@ -192,6 +192,9 @@ export function ClaudeSignIn({
   }
 
   const exec = buildClaudeLoginExec(claudePath, configDir ? { configDir } : {});
+  // Derived from the SAME `configDir` the exec exports, so the session id and the credential
+  // namespace can never disagree about which account this sign-in belongs to.
+  const ptyId = claudeSignInPtyId(configDir, attempt);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 10, minHeight: 0, flex: 1 }}>
@@ -208,8 +211,14 @@ export function ClaudeSignIn({
       >
         <Terminal
           // `attempt` in the key remounts the PTY for a retry — an exited PTY can't be re-run.
-          key={`claude-signin-${attempt}`}
-          agentId={`claude-signin-${attempt}`}
+          // The CONFIG DIR is in the id too, and that half is a credential-safety property, not a
+          // naming nicety: the id is the `PtyManager.sessions` key, and a second spawn under an id
+          // that is already live silently orphans the first child — a `claude auth login` still
+          // holding the PREVIOUS account's CLAUDE_CONFIG_DIR and the loopback OAuth listener, which
+          // then receives the callback and writes the new login into the OLD account's dir. See
+          // `claudeSignInPtyId` for the measured case (bead sparkle-znusx).
+          key={ptyId}
+          agentId={ptyId}
           projectId="claude-signin"
           projectRootPath=""
           command={SHELL}
