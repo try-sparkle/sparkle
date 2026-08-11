@@ -9,12 +9,14 @@ import {
   PASS_HOLD_TEXT,
   buildFleetSnapshots,
   buildStandingDuties,
+  dirtyOf,
+  sessionEndedOf,
   snapshotOfAgent,
   unlandedWorkOf,
 } from "./pusherSnapshots";
-import { overdueDuties } from "@sparkle/core";
+import { diedHoldingWork, overdueDuties } from "@sparkle/core";
 import type { FleetSnapshotInput } from "./pusherSnapshots";
-import type { AgentTab, Project } from "../types";
+import type { AgentTab, AgentTabStatus, LastObserved, Project } from "../types";
 import type { BranchStatus } from "./branchStatus";
 
 const T0 = 1_700_000_000_000;
@@ -57,6 +59,9 @@ function input(over: Partial<FleetSnapshotInput> = {}): FleetSnapshotInput {
     // Default FALSE — the honest reading for an app with no captured-receipt producer yet, and the
     // one that keeps `retirableAgents` fail-closed unless a case opts in.
     retroSettledFor: () => false,
+    // Default UNDEFINED — "no pane in this window is watching", which is the honest reading for most
+    // of the fleet and the one that keeps `diedHoldingWork` fail-closed unless a case opts in.
+    sessionEndedFor: () => undefined,
     now: T0,
     ...over,
   };
@@ -93,6 +98,114 @@ describe("unlandedWorkOf — the fail-closed rule with teeth", () => {
   });
 });
 
+describe("sessionEndedOf — an absent status is not a running agent", () => {
+  const A = "a";
+  /** The three maps the mount passes, defaulted to "this window knows nothing about anyone". */
+  const ended = (
+    status: Record<string, AgentTabStatus> = {},
+    lastObserved: Record<string, LastObserved> = {},
+    open: string[] = [],
+  ) => sessionEndedOf(A, status, lastObserved, new Set(open));
+
+  // `runtimeStore.status` has ONE writer (a mounted pane), so no entry means nothing in this window
+  // is watching. Reading that as "still running" would silence the class; reading it as "ended"
+  // would report every unobserved agent as dead.
+  it("says UNKNOWN when no pane has ever reported a status and nothing was captured", () => {
+    expect(ended()).toBeUndefined();
+  });
+
+  // The projection of `hookEventToStatus({event:"SessionEnd"}) === "done"`, which that engine pins.
+  it("says ended for the status the SessionEnd hook produces", () => {
+    expect(ended({ a: "done" })).toBe(true);
+  });
+
+  it("says NOT ended for a live agent", () => {
+    expect(ended({ a: "working" })).toBe(false);
+    expect(ended({ a: "idle" })).toBe(false);
+  });
+
+  // The trap: `stopped` reads like a session end but is also the DEFAULT a roster substitutes for an
+  // agent it has no reading for, and what a closed red row is demoted to. A default may not stand in
+  // for an observation.
+  it("does not treat a live `stopped` as an observed session end", () => {
+    expect(ended({ a: "stopped" })).toBe(false);
+  });
+
+  // THE CLOSED-ROW CASE (roborev 61854). `close()` deletes the live entry AND removes the id from
+  // `openAgentIds`, and only a mounted pane writes a status — so a closed row's live reading is gone
+  // permanently, while the sidebar re-polls the CLOSED rows and puts `dirty` straight back. Reading
+  // the live map alone leaves this class permanently blind to the agent about to be retired.
+  it("still reports a session end for a row that was CLOSED after finishing", () => {
+    expect(ended({}, { a: { status: "done", at: T0 } })).toBe(true);
+  });
+
+  // THE FALSE POSITIVE THE LIVENESS GATE EXISTS TO STOP (roborev 61893). `lastObserved` is NOT
+  // cleared when a row is re-opened, and it is persisted — so a resumed agent keeps a stale `done`
+  // capture indefinitely. If a pane is open in ANOTHER window, this window cannot observe it, and
+  // trusting the capture would report a currently-working agent as having died holding work.
+  it("makes NO claim about a row that is open in another window, however stale the capture", () => {
+    expect(ended({}, { a: { status: "done", at: T0 } }, ["a"])).toBeUndefined();
+  });
+
+  // The control for the case above: the ONLY difference is whether a pane is open somewhere.
+  it("…and the open set is the only thing separating that from the closed-row answer", () => {
+    const captured = { a: { status: "done" as AgentTabStatus, at: T0 } };
+    expect(ended({}, captured, ["a"])).toBeUndefined();
+    expect(ended({}, captured, [])).toBe(true);
+  });
+
+  // A capture from a previous life must never outrank a pane that is live again.
+  it("prefers the LIVE reading over the captured one", () => {
+    expect(ended({ a: "working" }, { a: { status: "done", at: T0 } })).toBe(false);
+    expect(ended({ a: "done" }, { a: { status: "working", at: T0 } })).toBe(true);
+  });
+
+  // From a CAPTURE, a non-`done` value does not even earn `false`: closing a row mid-work captures
+  // `working`, and the close may have killed the PTY, so "still running" is an overclaim about a
+  // process nobody watched die. Live `working` is an observation and does say `false`.
+  it("says UNKNOWN — not `false` — for a non-done capture, where a LIVE reading says false", () => {
+    expect(ended({}, { a: { status: "working", at: T0 } })).toBeUndefined();
+    expect(ended({}, { a: { status: "stopped", at: T0 } })).toBeUndefined();
+    expect(ended({ a: "working" })).toBe(false);
+  });
+
+  // Another agent's capture must not answer for this one.
+  it("reads the capture keyed by the agent it was asked about", () => {
+    expect(ended({}, { b: { status: "done", at: T0 } })).toBeUndefined();
+  });
+});
+
+describe("dirtyOf — the SAFETY reading, which filters where unlandedWorkOf does not", () => {
+  it("says UNKNOWN when the branch was never polled", () => {
+    expect(dirtyOf(undefined)).toBeUndefined();
+  });
+
+  it("carries the raw dirty flag and the true count", () => {
+    expect(dirtyOf(branch({ dirty: true, dirtyCount: 3 }))).toEqual({ dirty: true, dirtyCount: 3 });
+  });
+
+  it("says clean on an affirmatively clean tree", () => {
+    expect(dirtyOf(branch())).toEqual({ dirty: false });
+  });
+
+  // A build predating `dirtyCount` sends `dirty: true` with no count. Absent must stay absent — the
+  // report says "did not record how many" rather than printing a 0 nobody measured.
+  it("omits the count rather than defaulting it to zero", () => {
+    expect(dirtyOf(branch({ dirty: true }))).toEqual({ dirty: true });
+    expect(dirtyOf(branch({ dirty: true })!)!.dirtyCount).toBeUndefined();
+  });
+
+  // THE DIVERGENCE FROM `unlandedWorkOf`, ASSERTED SIDE BY SIDE. Parking carries the uncommitted
+  // files along, so they are still on disk and a tear-down still destroys them — attribution
+  // declines to answer, safety must not. Both read the SAME BranchStatus here, so a "simplification"
+  // that routed one through the other would fail this.
+  it("still reports a parked worktree as dirty, where unlandedWorkOf declines to answer", () => {
+    const parked = branch({ dirty: true, dirtyCount: 2, worktreeOnBranch: false });
+    expect(unlandedWorkOf(parked)).toBeUndefined();
+    expect(dirtyOf(parked)).toEqual({ dirty: true, dirtyCount: 2 });
+  });
+});
+
 describe("the mapping", () => {
   it("omits every optional the app could not supply, rather than defaulting it", () => {
     const s = snapshotOfAgent(agent(), input(), PROJECT_ID);
@@ -101,6 +214,9 @@ describe("the mapping", () => {
     expect(s.escalation).toBeUndefined();
     expect(s.goalMetAt).toBeUndefined();
     expect(s.hasUnlandedWork).toBeUndefined();
+    expect(s.sessionEnded).toBeUndefined();
+    expect(s.dirty).toBeUndefined();
+    expect(s.dirtyCount).toBeUndefined();
   });
 
   it("carries the quota wall through verbatim, resetParsed included", () => {
@@ -145,6 +261,89 @@ describe("the mapping", () => {
       agent({ goal: { text: "x", setAt: T0, ttlMs: 1, metAt: T0 } } as Partial<AgentTab>),
       input(), PROJECT_ID);
     expect(s.goalMetAt).toBe(T0);
+  });
+
+  it("maps a dirty branch reading onto the uncommitted-work fields", () => {
+    const s = snapshotOfAgent(
+      agent(),
+      input({
+        branchStatus: { a: branch({ dirty: true, dirtyCount: 3 }) },
+        sessionEndedFor: () => true,
+      }),
+      PROJECT_ID,
+    );
+    expect(s.dirty).toBe(true);
+    expect(s.dirtyCount).toBe(3);
+    expect(s.sessionEnded).toBe(true);
+    // THE SIDE EFFECT, not the field: this exact mapping is what makes the core class fire. A
+    // snapshot whose fields are individually right but which the evaluator rejects would pass every
+    // assertion above and warn about nothing.
+    expect(diedHoldingWork([s]).map((x) => x.agentId)).toEqual(["a"]);
+  });
+
+  // THE FAIL-CLOSED SEAM. An unpolled branch must map to ABSENT, never to `false` — and never to a
+  // manufactured `true`, which would send the founder to rescue a worktree holding nothing.
+  it("maps an ABSENT branch reading to undefined rather than to either answer", () => {
+    const s = snapshotOfAgent(agent(), input({ sessionEndedFor: () => true }), PROJECT_ID);
+    expect(s.dirty).toBeUndefined();
+    expect(s.dirtyCount).toBeUndefined();
+    expect(diedHoldingWork([s])).toEqual([]);
+  });
+
+  // The other half of the same rule, one field over: no pane reporting is not "still running".
+  it("maps an unobserved session to undefined, so the class stays silent", () => {
+    const s = snapshotOfAgent(
+      agent(),
+      input({ branchStatus: { a: branch({ dirty: true, dirtyCount: 3 }) } }),
+      PROJECT_ID,
+    );
+    expect(s.sessionEnded).toBeUndefined();
+    expect(diedHoldingWork([s])).toEqual([]);
+  });
+
+  it("does not manufacture a count the branch reading did not carry", () => {
+    const s = snapshotOfAgent(
+      agent(),
+      input({ branchStatus: { a: branch({ dirty: true }) }, sessionEndedFor: () => true }),
+      PROJECT_ID,
+    );
+    expect(s.dirty).toBe(true);
+    expect(s.dirtyCount).toBeUndefined();
+    // Still actionable — the class fires and names the agent; only the number is unknown.
+    expect(diedHoldingWork([s]).map((x) => x.agentId)).toEqual(["a"]);
+  });
+
+  // THE SCENARIO THE FALLBACK EXISTS FOR, end to end: the row was closed (so the LIVE status is gone
+  // for good) but the sidebar's closed-row poll has put `dirty` back. Before the fallback this pair
+  // was permanently `sessionEnded: undefined` + `dirty: true` and the class said nothing — about the
+  // one agent somebody is about to retire.
+  it("warns about a CLOSED row whose branch poll still reports uncommitted work", () => {
+    const s = snapshotOfAgent(
+      agent(),
+      input({
+        branchStatus: { a: branch({ dirty: true, dirtyCount: 3 }) },
+        // What the mount passes once the live entry is gone: only the captured one is left.
+        sessionEndedFor: (id) =>
+          sessionEndedOf(id, {}, { [id]: { status: "done", at: T0 } }, new Set()),
+      }),
+      PROJECT_ID,
+    );
+    expect(s.sessionEnded).toBe(true);
+    expect(diedHoldingWork([s]).map((x) => x.agentId)).toEqual(["a"]);
+  });
+
+  it("asks about the agent it is mapping, not the first id it finds", () => {
+    const seen: string[] = [];
+    buildFleetSnapshots(
+      input({
+        projects: [project([agent({ id: "a" }), agent({ id: "b" })])],
+        sessionEndedFor: (id) => {
+          seen.push(id);
+          return undefined;
+        },
+      }),
+    );
+    expect(seen).toEqual(["a", "b"]);
   });
 
   it("uses the SHARED display-name rule, so the report names what the sidebar shows", () => {

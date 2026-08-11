@@ -79,6 +79,8 @@ export type FleetConditionId =
   | "quota-blocked"
   /** Several agents killed by ONE event — same error, same moment. N victims, not N failures. */
   | "shared-failure"
+  /** Its session ended with the goal unmet and uncommitted work still in the worktree. */
+  | "died-holding-work"
   /** Goals auto-continue gave up on. Reserved for the human by design, so a dead end until seen. */
   | "goals-escalated"
   /** A standing recurring duty that has silently stopped running. */
@@ -276,6 +278,43 @@ export interface FleetSnapshot {
   /** `goal.metAt`. Present means met, at any time. */
   goalMetAt?: number;
   /**
+   * Has this agent's SESSION ENDED — the `SessionEnd` hook landed, or its PTY exited?
+   *
+   * Three-valued like everything else here, and the ABSENT arm is the common one rather than the
+   * exceptional one. The producer projects TWO sources — the window's live status map, whose single
+   * writer is a mounted pane, and the PERSISTED capture `close()` takes of the entry it deletes —
+   * gated by `agentLiveness`. So `true` means one of them affirmatively said the session ended;
+   * `undefined` means nothing here can tell, which covers both an agent nobody has a pane for and an
+   * agent open in ANOTHER window (a capture from a previous life must not answer for a row that is
+   * running again). Neither absence is "still running", so {@link diedHoldingWork} requires an
+   * affirmative `true`.
+   *
+   * NO NEW VOCABULARY. `hookEventToStatus({event:"SessionEnd"})` already answers `done`, and that
+   * mapping is pinned by test; this field is the boolean projection of it, so a session-end stays
+   * one fact with one definition. The projection lives in the adapter (`pusherSnapshots`), because
+   * `@sparkle/core` is a leaf and cannot name an `AgentTabStatus`.
+   */
+  sessionEnded?: boolean;
+  /**
+   * Uncommitted changes in this agent's worktree — `BranchStatus.dirty`, the RAW reading.
+   *
+   * DELIBERATELY NOT THE SAME QUESTION AS {@link hasUnlandedWork}, which folds `ahead` in and
+   * declines to answer for a worktree parked off its own branch. `BranchStatus` states the split
+   * itself: an ATTRIBUTION consumer must suppress a parked tree's dirt, a SAFETY consumer must not,
+   * because parking carries the uncommitted files along and they are still on disk and still the
+   * user's. This one is the safety reading, so it never filters — see `pusherSnapshots.dirtyOf`.
+   */
+  dirty?: boolean;
+  /**
+   * How many uncommitted paths — `BranchStatus.dirtyCount`, the TRUE count rather than the capped
+   * `dirtyFiles` preview.
+   *
+   * Independently optional from {@link dirty}, because a Rust build predating the field sends
+   * `dirty: true` with no count at all. Absent means the number is unknown, never zero, and
+   * {@link diedHoldingWorkCondition} says so rather than printing a 0 nobody measured.
+   */
+  dirtyCount?: number;
+  /**
    * Whether this agent is holding work that has not landed.
    *
    * For the retire claim this must be affirmatively `false` — see {@link retirableAgents}. This is
@@ -389,6 +428,44 @@ export function isQuotaWalled(snap: FleetSnapshot, now: number): boolean {
 export function retirableAgents(snapshots: readonly FleetSnapshot[]): FleetSnapshot[] {
   return snapshots.filter(
     (s) => s.goalMetAt !== undefined && s.hasUnlandedWork === false && s.retroSettled === true,
+  );
+}
+
+/**
+ * Agents whose session ENDED with the goal unmet and uncommitted work still in the worktree.
+ *
+ * ── THE CASE THIS IS ────────────────────────────────────────────────────────────────────────────
+ * An agent was asked for ten homepage designs. It was spawned, it ran, and its session ended
+ * without a word. What it left behind was three research documents, uncommitted, and zero
+ * homepages — and nothing anywhere said so. The goal was never marked met, so no surface called it
+ * done; the agent was not errored, so no row went red; the work existed only as unstaged files in a
+ * worktree, so nothing in git could see it either. The founder found it the way he finds all of
+ * these: by looking.
+ *
+ * ── FAIL-CLOSED IN BOTH DIRECTIONS, WHICH IS NOT THE USUAL SHAPE ────────────────────────────────
+ * Every other condition here is fail-closed against SAYING TOO MUCH. This one is fail-closed
+ * against saying too much AND against saying nothing, and the two pull on different fields:
+ *
+ *   • `sessionEnded === true`. `undefined` is "nothing this window can read said the session ended"
+ *     — no pane reported a status AND no capture stands unopposed — which is the ordinary reading
+ *     for most of the fleet. Treating it as an ended session would report every unobserved agent as
+ *     dead. Note the producer will not answer `true` off a stale capture for a row that is open in
+ *     another window, so a resumed agent cannot arrive here looking finished.
+ *   • `goalMetAt === undefined`. A met goal means the session ending is the agent FINISHING, and
+ *     leftover files are then a tidy-up rather than lost work.
+ *   • `dirty === true`, AFFIRMATIVELY. This is the one worth stating, because the instinct here is
+ *     backwards: "we did not look" feels like the cautious moment to warn. It is not. `undefined`
+ *     means the branch poll did not answer — it is not weak evidence of uncommitted work, it is no
+ *     evidence at all — and a report that says work is at risk over missing data is the SAME defect
+ *     {@link retirableAgents} guards against from the opposite side. There, inventing `false` tells
+ *     the founder to discard an agent that is holding commits; here, inventing `true` sends him to
+ *     rescue a worktree that holds nothing. Both spend the credibility that makes this channel
+ *     worth reading, and a channel he stops reading is the failure this whole feature exists to
+ *     close. So the poll must have answered, and it must have said yes.
+ */
+export function diedHoldingWork(snapshots: readonly FleetSnapshot[]): FleetSnapshot[] {
+  return snapshots.filter(
+    (s) => s.sessionEnded === true && s.goalMetAt === undefined && s.dirty === true,
   );
 }
 
@@ -549,6 +626,38 @@ export function overdueDuties(
  * surface says they are the same event). Escalated follows: a dead end, but one that needs a
  * judgement per agent. Done-not-retired is last: waste, but nothing is stuck behind it.
  *
+ * ── WHERE `died-holding-work` SITS, AND WHY IT OUTRANKS EVERYTHING BELOW IT ──────────────────────
+ * Directly after `shared-failure`, ahead of `duty-overdue` and everything under it. One property
+ * decides it, and no other condition in this list has it: THE EVIDENCE IS DESTRUCTIBLE.
+ *
+ * Every other class describes work that cannot PROCEED. A quota wall lifts on its own clock and the
+ * agent's commits are still there when it does; an escalated goal is latched and no harder to clear
+ * tomorrow; a conflicting PR only gets more expensive; a stopped duty is a capability that is off.
+ * Wait a day on any of them and the thing you would have acted on is still there to act on. Wait a
+ * day on this one and the ordinary act of tidying up — retiring a finished-looking agent, tearing
+ * down its worktree — has deleted the very files the report was about. Uncommitted work is on no
+ * branch, so nothing in git is holding it: there is no reflog entry, no dangling commit, no rescue
+ * ref. It is the one condition where being told LATE is the same as never being told.
+ *
+ *   • BELOW quota and shared-failure, and that is a close call rather than an obvious one. Both of
+ *     those stop agents from executing at all, and shared-failure carries the larger saving (N
+ *     agents, one decision). What keeps them above is that neither is made worse by the delay,
+ *     while this one is — so the tie breaks on which loses more by being second, and second place
+ *     in a batched report costs a paragraph's distance, not four hours.
+ *   • ABOVE duty-overdue, which is the comparison this class has to win to be worth its position.
+ *     A stopped duty turns a promised capability off for all FUTURE work, which sounds larger. But
+ *     future work is recoverable by definition — restart the duty and it happens. These files are
+ *     not. A capability that is off can be switched on; a worktree that was torn down cannot be
+ *     untorn.
+ *   • ABOVE done-not-retired, and the two are near-inverses worth reading together. That class says
+ *     "met, clean, safe to retire"; this one says "unmet, dirty, retiring is what destroys it".
+ *     They are decided by the same two fields read the opposite way, which is exactly why they must
+ *     never be adjacent in the text — a reader who skims the wrong one acts destructively.
+ *
+ * The counter-argument, recorded because it is real: nothing here is BLOCKED, and one could rank a
+ * blocked fleet above a rescue. That is the trade quota and shared-failure already win. Below them,
+ * "this will still be there tomorrow" is true of every remaining class except this one.
+ *
  * ── WHERE `pr-conflicting` SITS, AND WHY ─────────────────────────────────────────────────────────
  * Between `duty-overdue` and `goals-escalated`. Three comparisons decide it:
  *
@@ -589,6 +698,11 @@ export function evaluateFleetConditions(
 
   const cohorts = sharedFailureCohorts(snapshots, now);
   if (cohorts.length > 0) out.push(sharedFailureCondition(cohorts, now));
+
+  // AHEAD OF EVERYTHING BELOW because this is the only class whose evidence a spin-down deletes —
+  // see the ordering note above.
+  const dead = diedHoldingWork(snapshots);
+  if (dead.length > 0) out.push(diedHoldingWorkCondition(dead));
 
   const overdue = overdueDuties(duties, now);
   if (overdue.length > 0) out.push(dutyCondition(overdue));
@@ -968,6 +1082,69 @@ function escalationCondition(escalated: readonly FleetSnapshot[]): FleetConditio
       `${n} ${plural} escalated. Auto-continue gave up and the concierge cannot re-arm an ` +
       `escalated goal — the app reserves it for you by design, so it stays a dead end until you ` +
       `clear it:\n${lines.join("\n")}`,
+  };
+}
+
+/**
+ * The uncommitted-file count as the report may quote it.
+ *
+ * CLAMPED AND TRUNCATED for exactly the reason `behindOf` is, and the failure is the same shape: a
+ * negative renders as `-3`, from which `numbersIn` reads `3` while `measured` holds `-3`. The two
+ * never match, so the gate refuses the WHOLE report as `fabricated-citation` — and a refusal
+ * presents as SILENCE, so one nonsensical field from the producer would mute the one condition
+ * whose evidence a spin-down deletes.
+ */
+function dirtyCountOf(snap: FleetSnapshot): number | undefined {
+  return snap.dirtyCount === undefined ? undefined : Math.max(0, Math.trunc(snap.dirtyCount));
+}
+
+/**
+ * Sessions that ended holding work nobody has committed.
+ *
+ * ── THE SENTENCE HAS TO NAME THE DECISION, NOT THE STATE ────────────────────────────────────────
+ * The reader is being asked to decide something before doing something else, so the text carries
+ * three things and drops none of them: WHICH agent, HOW MANY uncommitted files, and that the files
+ * are gone if the worktree is torn down. Nothing here reads as housekeeping — this is deliberately
+ * not phrased like `done-not-retired`, whose whole content is "safe to retire". Retiring one of
+ * THESE agents is the destructive act, and a sentence that let a hurried reader mistake one for the
+ * other would be worse than no sentence at all.
+ *
+ * ── THE COUNT IS NEVER INVENTED ─────────────────────────────────────────────────────────────────
+ * `dirtyCount` is independently optional from `dirty` (an older Rust build sends one without the
+ * other), and an absent count is UNKNOWN rather than zero. Printing a 0 there would say the exact
+ * opposite of the fact the line exists to carry, so the line says the number was not recorded and
+ * still names the agent — the founder can still go and look, which is the whole point.
+ */
+function diedHoldingWorkCondition(dead: readonly FleetSnapshot[]): FleetCondition {
+  const n = dead.length;
+  const counts = dead.map(dirtyCountOf);
+
+  const lines = dead.map((s, i) => {
+    const c = counts[i];
+    const files =
+      c === undefined
+        ? "uncommitted files (this build did not record how many)"
+        : `${c} uncommitted file${c === 1 ? "" : "s"}`;
+    return `  - ${nameOf(s)} — ${files}, committed to no branch. Its goal was never marked met.`;
+  });
+
+  const plural = n === 1 ? "agent's session ended" : "agents' sessions ended";
+  const those = n === 1 ? "that agent" : "those agents";
+  return {
+    id: "died-holding-work",
+    agentIds: dead.map((s) => s.agentId),
+    members: agentMembers(dead),
+    measured: [
+      String(n),
+      ...counts.filter((c): c is number => c !== undefined).map(String),
+      ...quotedNumbers(...dead.map((s) => s.label)),
+    ],
+    text:
+      `${n} ${plural} while the goal was still unmet, leaving uncommitted work that exists ` +
+      `nowhere but the worktree:\n${lines.join("\n")}\n` +
+      `Retiring ${those} — or tearing the worktree down — DELETES that work; it is on no branch, ` +
+      `so nothing else in git is holding it. Decide what to keep, and commit or copy it out, ` +
+      `before anything is torn down.`,
   };
 }
 

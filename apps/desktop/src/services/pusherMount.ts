@@ -59,7 +59,7 @@ import { startBabysitDispatcher } from "./babysitDispatcher";
 import { ownsProjectInThisWindow } from "./goalContinuationRunner";
 import { notifyConcierge } from "./conciergeNotifier";
 import { IMPROVEMENT_INTERVAL_MS } from "./improvementPass";
-import { buildFleetSnapshots, buildStandingDuties } from "./pusherSnapshots";
+import { buildFleetSnapshots, buildStandingDuties, sessionEndedOf } from "./pusherSnapshots";
 import { cachedReceipt, loadRetroReceipts } from "./retroReceipts";
 import { retroSettled } from "../engine/retroReceiptTypes";
 import { startPusherRunner, type PusherLogEntry, type PusherRunnerDeps } from "./pusherRunner";
@@ -253,6 +253,16 @@ export function buildPusherDeps(): PusherRunnerDeps {
         // and the confirm dialog read, so — once warmed above — the report and the row cannot
         // disagree about whether an agent's retro is on file (knightwatch 5204094441#5).
         retroSettledFor: (projectId, agentId) => retroSettled(cachedReceipt(projectId, agentId)),
+        // ALL THREE MAPS, projected by the adapter's own rule — this file supplies the values and
+        // decides nothing about them. `status` is live-only with a single writer (a mounted pane);
+        // `lastObserved` is what `close()` captured on its way to deleting that entry, and is
+        // PERSISTED; `openAgentIds` is what separates "closed, nobody is watching" from "open in
+        // another window", which is the difference between the capture being the last word and it
+        // being a stale reading about a running agent (roborev 61854, then 61893).
+        sessionEndedFor: (agentId) => {
+          const rt = useRuntimeStore.getState();
+          return sessionEndedOf(agentId, rt.status, rt.lastObserved, new Set(rt.openAgentIds));
+        },
         now: Date.now(),
       });
     },

@@ -11,6 +11,7 @@ import {
   SHARED_FAILURE_MIN_VICTIMS,
   SHARED_FAILURE_WINDOW_MINUTES,
   DUTY_OVERDUE_FACTOR,
+  diedHoldingWork,
   evaluateFleetConditions,
   overdueDuties,
   sharedFailureCohorts,
@@ -22,6 +23,10 @@ import {
   type FleetSnapshot,
 } from "./pusherFleet";
 import { checkCitations } from "./pusherGate";
+// The growth rule lives in the report engine, so the one `died-holding-work` case that is about the
+// cooldown is asserted through the real `decideFleetReport` rather than by reading `members`.
+import { decideFleetReport, emptyFleetMemory } from "./pusherFleetReport";
+import { resolvePusherPolicy } from "./pusherPolicy";
 
 const T0 = 1_700_000_000_000;
 const HOUR = 60 * 60 * 1000;
@@ -217,6 +222,206 @@ describe("done but not retired", () => {
     const settled = { agentId: "a", goalMetAt: T0, hasUnlandedWork: false, retroSettled: true };
     expect(retirableAgents([settled])).toEqual([settled]);
     expect(evaluateFleetConditions([settled], T0).map((c) => c.id)).toContain("done-not-retired");
+  });
+});
+
+describe("died holding work", () => {
+  /** The founder's case: spawned, ran, session ended, three research docs left uncommitted. */
+  const dead = (id: string, over: Partial<FleetSnapshot> = {}): FleetSnapshot => ({
+    agentId: id,
+    label: `Agent ${id}`,
+    sessionEnded: true,
+    dirty: true,
+    dirtyCount: 3,
+    ...over,
+  });
+
+  it("fires on ended + goal unmet + dirty, and names the agent, the count and the loss", () => {
+    const [c] = evaluateFleetConditions([dead("a", { label: "Homepage Designs" })], T0);
+    expect(c!.id).toBe("died-holding-work");
+    expect(c!.agentIds).toEqual(["a"]);
+    // The three things the founder has to decide with: WHICH agent, HOW MANY files, and that the
+    // work is destroyed by the tidy-up he would otherwise reach for.
+    expect(c!.text).toContain("Homepage Designs");
+    expect(c!.text).toContain("3 uncommitted files");
+    expect(c!.text).toMatch(/DELETES that work/);
+    expect(c!.text).toMatch(/Decide what to keep/);
+  });
+
+  // The near-inverse class one line down says "safe to retire". Retiring one of THESE is the
+  // destructive act, so the two must never be confusable by a reader skimming the batch.
+  it("never reads as housekeeping", () => {
+    const [c] = evaluateFleetConditions([dead("a")], T0);
+    expect(c!.text).not.toMatch(/safe to retire/i);
+    expect(c!.text).toMatch(/uncommitted/);
+  });
+
+  // THE FAIL-CLOSED CASE, and the one this class exists to get right. `undefined` is "the branch
+  // poll did not answer" — no evidence at all, not weak evidence — and warning over it sends the
+  // founder to rescue a worktree that holds nothing.
+  it("says nothing when the branch poll DID NOT ANSWER", () => {
+    const unread = dead("a", { dirty: undefined, dirtyCount: undefined });
+    expect(diedHoldingWork([unread])).toEqual([]);
+    expect(evaluateFleetConditions([unread], T0)).toEqual([]);
+  });
+
+  it("says nothing about a CLEAN tree", () => {
+    const clean = dead("a", { dirty: false, dirtyCount: 0 });
+    expect(diedHoldingWork([clean])).toEqual([]);
+    expect(evaluateFleetConditions([clean], T0)).toEqual([]);
+  });
+
+  it("says nothing when the goal was MARKED MET — the session ending is the agent finishing", () => {
+    const done = dead("a", { goalMetAt: T0 - HOUR });
+    expect(diedHoldingWork([done])).toEqual([]);
+    expect(evaluateFleetConditions([done], T0)).toEqual([]);
+  });
+
+  it("says nothing when no session end was OBSERVED, and nothing when one affirmatively did not", () => {
+    const unknown = dead("a", { sessionEnded: undefined });
+    const running = dead("a", { sessionEnded: false });
+    expect(diedHoldingWork([unknown])).toEqual([]);
+    expect(diedHoldingWork([running])).toEqual([]);
+    expect(evaluateFleetConditions([unknown], T0)).toEqual([]);
+    expect(evaluateFleetConditions([running], T0)).toEqual([]);
+  });
+
+  // THE CONTROL, and it is the half that makes the five negatives above mean anything. Each row is
+  // a disqualified snapshot plus the repair of the ONE field that disqualified it: silent before,
+  // firing after. Without this, a class deleted outright — or given an unsatisfiable predicate —
+  // passes every negative, and each negative on its own is equally satisfied by an unrelated gate
+  // upstream having short-circuited the whole evaluation.
+  it("…and fires the moment the ONE disqualifying field is repaired", () => {
+    const cases: Array<[string, Partial<FleetSnapshot>, Partial<FleetSnapshot>]> = [
+      ["the branch poll never answered", { dirty: undefined, dirtyCount: undefined }, { dirty: true }],
+      ["the tree is clean", { dirty: false, dirtyCount: 0 }, { dirty: true }],
+      ["the goal was marked met", { goalMetAt: T0 - HOUR }, { goalMetAt: undefined }],
+      ["no session end was observed", { sessionEnded: undefined }, { sessionEnded: true }],
+      ["the session has not ended", { sessionEnded: false }, { sessionEnded: true }],
+    ];
+    for (const [why, broken, repair] of cases) {
+      expect(diedHoldingWork([dead("a", broken)]), why).toEqual([]);
+      expect(diedHoldingWork([dead("a", { ...broken, ...repair })]).map((s) => s.agentId), why).toEqual(["a"]);
+    }
+  });
+
+  it("fingerprints by agent, so a SECOND agent joining re-opens the report", () => {
+    const one = [dead("a")];
+    const two = [dead("a"), dead("b")];
+    const [c] = evaluateFleetConditions(one, T0);
+    expect(c!.members).toEqual(["agent:a"]);
+
+    // Asserted through the real report engine rather than by reading `members`: the growth rule
+    // lives in `decideFleetReport`, and a fingerprint that is merely well-formed proves nothing
+    // about whether the founder actually hears about agent b inside the cooldown.
+    const reported = evaluateFleetConditions(one, T0);
+    const memoryAfterReporting = {
+      ...emptyFleetMemory(),
+      lastConditions: reported,
+      lastReported: {
+        "died-holding-work": {
+          at: T0,
+          agentIds: reported[0]!.agentIds,
+          members: reported[0]!.members,
+        },
+      },
+    };
+    const later = T0 + 60_000; // well inside REPEAT_COOLDOWN_MS
+
+    // The same single agent is the thing already said — it stays quiet.
+    const unchanged = decideFleetReport({
+      policy: resolvePusherPolicy({}),
+      snapshots: one,
+      memory: memoryAfterReporting,
+      duties: [],
+      conflicts: undefined,
+      inbox: { used: 0, capacity: 50 },
+      now: later,
+    });
+    expect(unchanged.action).toBe("quiet");
+    // The REASON matters: `all-conditions-cooled` is the cooldown doing its job. Any other quiet
+    // reason would mean this case never exercised the growth rule at all — it would be the
+    // two-observation rule, or an empty evaluation, silencing it for an unrelated cause.
+    if (unchanged.action !== "quiet") return;
+    expect(unchanged.reason).toBe("all-conditions-cooled");
+
+    // A second agent dying holding work is NEWS, inside the same cooldown.
+    const grown = decideFleetReport({
+      policy: resolvePusherPolicy({}),
+      snapshots: two,
+      memory: { ...memoryAfterReporting, lastConditions: evaluateFleetConditions(two, T0) },
+      duties: [],
+      conflicts: undefined,
+      inbox: { used: 0, capacity: 50 },
+      now: later,
+    });
+    expect(grown.action).toBe("send");
+    if (grown.action !== "send") return;
+    expect(grown.conditionIds).toContain("died-holding-work");
+    expect(grown.text).toContain("Agent b");
+    expect(grown.text).toContain("2 agents' sessions ended");
+  });
+
+  // THE ONE THAT CATCHES A MISSING `quotedNumbers`. A label's digits are quoted and never computed,
+  // and a `measured` that misses one gets the WHOLE report refused as `fabricated-citation` — which
+  // presents as silence, i.e. the exact failure this class was built to end.
+  it("passes the citation gate, including the digits in a label", () => {
+    const [c] = evaluateFleetConditions(
+      [dead("a", { label: "Homepage Designs 10", dirtyCount: 3 }), dead("b", { dirtyCount: 17 })],
+      T0,
+    );
+    expect(citable(c!.text, c!.measured)).toBe(true);
+    expect(c!.measured).toContain("10"); // quoted from the label, computed by nobody
+    expect(c!.measured).toContain("17"); // the second agent's real file count
+    expect(c!.measured).toContain("2"); // the count of agents
+  });
+
+  // An absent count is UNKNOWN, never zero — printing a 0 would say the opposite of the fact the
+  // line exists to carry. The agent is still named, so he can still go and look.
+  it("says the count was not recorded rather than printing a zero", () => {
+    const [c] = evaluateFleetConditions([dead("a", { dirtyCount: undefined })], T0);
+    expect(c!.text).toMatch(/did not record how many/);
+    expect(c!.text).toContain("Agent a");
+    expect(c!.text).not.toMatch(/\b0 uncommitted/);
+    expect(citable(c!.text, c!.measured)).toBe(true);
+  });
+
+  it("stays citable when the producer sends a nonsensical count", () => {
+    // Same trap `behindOf` clamps: `-4` renders as `-4`, from which `numbersIn` reads `4` while
+    // `measured` would hold `-4`. The mismatch refuses the whole report, i.e. silence.
+    const [c] = evaluateFleetConditions([dead("a", { dirtyCount: -4 })], T0);
+    expect(citable(c!.text, c!.measured)).toBe(true);
+    expect(c!.text).toContain("0 uncommitted files");
+  });
+
+  it("uses the singular for exactly one file", () => {
+    const [c] = evaluateFleetConditions([dead("a", { dirtyCount: 1 })], T0);
+    expect(c!.text).toContain("1 uncommitted file,");
+  });
+
+  // The ordering claim, and the reason for it: this is the only class whose evidence a spin-down
+  // deletes, so it outranks every class about work that merely cannot proceed.
+  it("ranks after shared-failure and ahead of duty-overdue and everything below", () => {
+    const ids = evaluateFleetConditions(
+      [
+        { agentId: "r", label: "R", goalMetAt: T0, hasUnlandedWork: false, retroSettled: true },
+        { agentId: "e", label: "E", escalation: { reason: "gave up" } },
+        { agentId: "f1", label: "F1", failure: { message: "API Error: ENOTFOUND", at: T0 - 60_000 } },
+        { agentId: "f2", label: "F2", failure: { message: "API Error: ENOTFOUND", at: T0 - 60_000 } },
+        dead("d"),
+        walled("q"),
+      ],
+      T0,
+      [{ name: "the hourly improvement pass", intervalMs: HOUR, lastRunAt: T0 - 9 * HOUR }],
+    ).map((c) => c.id);
+    expect(ids).toEqual([
+      "quota-blocked",
+      "shared-failure",
+      "died-holding-work",
+      "duty-overdue",
+      "goals-escalated",
+      "done-not-retired",
+    ]);
   });
 });
 
@@ -906,6 +1111,7 @@ describe("the condition fingerprint", () => {
         { agentId: "f2", label: "F2", failure: { message: "API Error: ENOTFOUND", at: T0 - 60_000 } },
         { agentId: "e1", label: "E1", escalation: { reason: "gave up" } },
         { agentId: "d1", label: "D1", goalMetAt: T0 - HOUR, hasUnlandedWork: false, retroSettled: true },
+        { agentId: "w1", label: "W1", sessionEnded: true, dirty: true, dirtyCount: 3 },
       ],
       T0,
       [hourly],
@@ -914,6 +1120,7 @@ describe("the condition fingerprint", () => {
     expect(conditions.map((c) => c.id)).toEqual([
       "quota-blocked",
       "shared-failure",
+      "died-holding-work",
       "duty-overdue",
       "pr-conflicting",
       "goals-escalated",

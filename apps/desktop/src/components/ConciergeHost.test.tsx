@@ -95,6 +95,18 @@ vi.mock("../services/openProjectTab", () => ({
   openProjectTab: h.openProjectTab,
   requestProjectTabFromOtherWindow: vi.fn(),
 }));
+// The two fire-and-forget bookkeeping calls on the dispatch path. Stubbed so these suites neither
+// touch `bd` nor the history DB, and so a case can make one THROW and assert the send survives —
+// see "still sends the message when history capture throws".
+vi.mock("../services/conciergeHistory", () => ({
+  recordConciergePrompt: vi.fn(),
+  recordConciergeReply: vi.fn(),
+}));
+vi.mock("../services/conciergeAskQueue", () => ({
+  captureAsksFrom: vi.fn(async () => ({ filed: [], bumped: [], reasked: [], dropped: 0 })),
+  openAsksNow: vi.fn(() => []),
+  startAskQueue: vi.fn(() => () => {}),
+}));
 vi.mock("../services/concierge", async (importOriginal) => ({
   // The REAL sentinels and the REAL matcher, not hand-copies: the host now filters error EVENTS by
   // detail (roborev 53460/53462), so a stubbed list or predicate would let the host and Rust drift
@@ -220,6 +232,8 @@ vi.mock("../stores/sparklePrefsStore", () => ({
 // string, and asserting the literal on each side is what pins that they stay shared. A hand-synced
 // copy here would turn a wording tweak into a red test for a non-bug (roborev 53044).
 import { ConciergeHost, TRIAL_SPENT_TEXT } from "./ConciergeHost";
+import { recordConciergePrompt } from "../services/conciergeHistory";
+import { captureAsksFrom } from "../services/conciergeAskQueue";
 import {
   _resetConciergeActivityForTests,
   noteConciergeToolCall,
@@ -583,6 +597,222 @@ describe("ConciergeHost", () => {
     // feature outright: this is its only call site in the app.
     fireEvent.click(screen.getByLabelText("Mute alerts about CI Hardening"));
     expect(h.setInterruptPreference).toHaveBeenCalledWith("ag1", "mute");
+  });
+
+  // ══ BOOKKEEPING MAY NEVER COST THE SEND (roborev 61903, and the regression it followed) ════════
+  // `recordConciergePrompt` and `captureAsksFrom` are fire-and-forget bookkeeping calls sitting on
+  // the dispatch path directly ahead of `startConciergeTurn`. A SYNCHRONOUS throw from either does
+  // not lose a history row or a bead — it aborts the send, and the founder's message is silently
+  // never delivered. That shipped once: an unguarded `crypto.randomUUID()` hung the queue-drain path.
+  //
+  // The module-local "capture does not throw" tests could not guard this. They assert the fix's
+  // CURRENT LOCATION, so moving the guard, or adding a third bookkeeping call beside these two,
+  // brings the regression back with a fully green suite — the vacuous shape AGENTS.md calls the #1
+  // fleet-wide finding. This asserts the SIDE EFFECT instead: the turn still starts.
+  it("still sends the message when history capture throws", async () => {
+    vi.mocked(recordConciergePrompt).mockImplementationOnce(() => {
+      throw new TypeError("randomUUID is not a function");
+    });
+    h.feed = feedWith("approval");
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "what needs me?" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    expect(h.startConciergeTurn).toHaveBeenCalledTimes(1);
+    expect(h.startConciergeTurn.mock.calls[0]![0]).toContain("what needs me?");
+  });
+
+  // A REJECTION, not a synchronous throw (roborev 61937). `captureAsksFrom` is `async` and catches
+  // its own body, so it can never throw synchronously — a test that made it do so would pin a shape
+  // the wire cannot produce, which is the same vacuity this file is otherwise careful about. The
+  // reachable failure is a rejected promise (or a throw from `postSparkle` inside the `.then`),
+  // and neither is caught by an enclosing `try`.
+  //
+  // ASSERT THE CONTAINMENT, NOT JUST THE SEND (roborev 61987). A rejection is ASYNCHRONOUS, so it
+  // never entered the old shared `try` and never interrupted the statement below it either: a row
+  // that only checks `startConciergeTurn` (or only the sibling history write) is green against the
+  // shape it claims to have replaced, which proves nothing about the fix. The one thing `bookkeep`'s
+  // promise arm actually adds is that the rejection is CAUGHT AND LOGGED instead of escaping as an
+  // unhandled rejection — so that warn line is what has to be asserted. Delete `void
+  // result.catch(warn)` and this row goes red; the `startConciergeTurn` count alone does not.
+  it("still sends the message when the ask queue REJECTS — and CONTAINS the rejection", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      vi.mocked(captureAsksFrom).mockRejectedValueOnce(new Error("bd is not available"));
+      h.feed = feedWith("approval");
+      render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: "what needs me?" } });
+      fireEvent.click(screen.getByText("Send"));
+      await settle();
+      expect(h.startConciergeTurn).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining("ask capture failed"),
+        expect.any(Error),
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  // The independence half — the history row survives a failing ask queue. NOTE what this row can and
+  // cannot prove (roborev 61987): the rejection is asynchronous, so a single shared `try` would ALSO
+  // have left `recordConciergePrompt` reachable. What makes it non-vacuous is the paired warn
+  // assertion: the ask-capture failure has to be OBSERVED (contained and logged) in the same turn
+  // that the history write lands, so a regression that drops the promise arm cannot pass by leaving
+  // the rejection unhandled and the sibling call incidentally intact.
+  it("a failing ask queue does not take the history write with it", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      vi.mocked(captureAsksFrom).mockRejectedValueOnce(new Error("bd is not available"));
+      h.feed = feedWith("approval");
+      render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: "what needs me?" } });
+      fireEvent.click(screen.getByText("Send"));
+      await settle();
+      expect(recordConciergePrompt).toHaveBeenCalledWith("what needs me?");
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining("ask capture failed"),
+        expect.any(Error),
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  // roborev 61961: both notices exist so the cap and the disagreement are NOT concealed, so one of
+  // them failing must not swallow the other. Grouped under a single guard, a throw from the
+  // `dropped` post skips every `reasked` line below it — concealment produced by the disclosure.
+  //
+  // THE DROPPED POST HAS TO ACTUALLY FAIL (roborev 61987). A resolved `{dropped: 2}` posts both
+  // notices happily, so asserting the re-ask line proves only that the happy path renders — green
+  // against the grouped shape this row exists to forbid. `dropped` is therefore a value that passes
+  // the `> 0` gate via `valueOf` and then THROWS from `toString`, which is where the notice's
+  // `String(out.dropped)` reads it: the failure lands inside the `dropped` guard and nowhere else.
+  it("a failing dropped-ask notice does not swallow the re-ask notices", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const explodingCount = {
+        valueOf: () => 2,
+        toString: () => {
+          throw new TypeError("the count cannot be rendered");
+        },
+      } as unknown as number;
+      vi.mocked(captureAsksFrom).mockResolvedValueOnce({
+        filed: [],
+        bumped: [],
+        reasked: [
+          {
+            closedBeadId: "sparkle-closed1",
+            beadId: "sparkle-fresh1",
+            ask: {
+              key: "ask-1",
+              sentence: "build ten homepage designs",
+              turnId: "t",
+              at: 1,
+            },
+          },
+        ],
+        dropped: explodingCount,
+      });
+      h.feed = feedWith("approval");
+      render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: "what needs me?" } });
+      fireEvent.click(screen.getByText("Send"));
+      await settle();
+      // The sibling notice really did fail — otherwise the row below proves only that both posts
+      // succeeded, which is the vacuity this comment is about.
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining("dropped-ask notice failed"),
+        expect.any(TypeError),
+      );
+      // …and the re-ask notice, which names the closed bead, survived it.
+      expect(inThread(/sparkle-closed1/)).toBeTruthy();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  // …AND THE SAME GUARD, ONE LEVEL DOWN (roborev 62016). The row above pins that `dropped` cannot
+  // swallow `reasked`, but it says nothing about whether the re-ask notices are guarded FROM EACH
+  // OTHER. `bookkeep("re-ask notice", …)` sits INSIDE `for (const r of out.reasked)` precisely so
+  // one unrenderable re-ask cannot take the rest of the list with it — and with a single
+  // always-succeeding entry, per-iteration wrapping and one guard around the whole loop are
+  // indistinguishable. So: TWO entries, the FIRST one throwing.
+  //
+  // The throw has to land inside that iteration's guard and nowhere else, which rules out an
+  // exploding `closedBeadId` — `plain()` stores it and `toString` would fire at RENDER, outside
+  // `bookkeep` entirely. `oneLine` (components/promptHistory.ts) is a bare `text.replace(…)`, so a
+  // `sentence` whose `replace` throws fails synchronously at the notice's own call site.
+  it("a failing re-ask notice does not swallow the re-ask notices after it", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const unrenderableSentence = {
+        replace: () => {
+          throw new TypeError("the sentence cannot be collapsed");
+        },
+      } as unknown as string;
+      vi.mocked(captureAsksFrom).mockResolvedValueOnce({
+        filed: [],
+        bumped: [],
+        reasked: [
+          {
+            closedBeadId: "sparkle-closed1",
+            beadId: "sparkle-fresh1",
+            ask: { key: "ask-1", sentence: unrenderableSentence, turnId: "t", at: 1 },
+          },
+          {
+            closedBeadId: "sparkle-closed2",
+            beadId: "sparkle-fresh2",
+            ask: { key: "ask-2", sentence: "build ten homepage designs", turnId: "t", at: 2 },
+          },
+        ],
+        dropped: 0,
+      });
+      h.feed = feedWith("approval");
+      render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: "what needs me?" } });
+      fireEvent.click(screen.getByText("Send"));
+      await settle();
+      // The FIRST notice really did fail, and `bookkeep` named the unit — a single `try` around the
+      // loop would log one generic failure instead, so the name is what distinguishes the shapes.
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining("re-ask notice failed"),
+        expect.any(TypeError),
+      );
+      // …and the SECOND iteration still ran. Hoisting the guard out of the loop turns this red.
+      expect(inThread(/sparkle-closed2/)).toBeTruthy();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  // …and the same, the other way round: the sync call is the one that CAN throw.
+  //
+  // `captureAsksFrom` is dispatched BEFORE the history write, so "it was called" holds under any
+  // guard shape and cannot by itself distinguish per-call wrapping from one shared `try` (roborev
+  // 61987). The warn TEXT is what does: a shared `try` logs one generic "bookkeeping failed" for
+  // whichever call died first, while `bookkeep` names the unit — so asserting "history capture
+  // failed" goes red the moment the calls are re-grouped under a single catch.
+  it("a failing history write does not take the ask capture with it", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      vi.mocked(recordConciergePrompt).mockImplementationOnce(() => {
+        throw new TypeError("randomUUID is not a function");
+      });
+      h.feed = feedWith("approval");
+      render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: "what needs me?" } });
+      fireEvent.click(screen.getByText("Send"));
+      await settle();
+      expect(captureAsksFrom).toHaveBeenCalled();
+      expect(h.startConciergeTurn).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining("history capture failed"),
+        expect.any(TypeError),
+      );
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("sending a message starts a brain turn with a grounded snapshot", async () => {

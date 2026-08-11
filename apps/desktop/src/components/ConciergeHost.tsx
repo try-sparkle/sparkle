@@ -106,6 +106,8 @@ import {
 } from "../services/conciergeFeed";
 import { agentToNudge, NUDGE_OPEN_ACTION } from "../engine/conciergeNudges";
 import { buildSnapshot } from "../engine/conciergeSnapshot";
+import { captureAsksFrom, openAsksNow, startAskQueue } from "../services/conciergeAskQueue";
+import { recordConciergePrompt, recordConciergeReply } from "../services/conciergeHistory";
 import { createResearchDrain, withResearchPreamble } from "../services/research/drain";
 import {
   allTasksNow as allResearchTasks,
@@ -391,6 +393,33 @@ const researchDrain = createResearchDrain({
   },
 });
 
+/**
+ * Run ONE fire-and-forget bookkeeping call so it can never cost the concierge send.
+ *
+ * ── WHY A HELPER AND NOT ONE `try` AROUND THE BLOCK (roborev 61937) ─────────────────────────────
+ * A single `try` wrapping several calls is not independence: the first failure jumps to the catch
+ * and every later call in the block is skipped. So a throwing ask-queue would silently take the
+ * history write with it — the same silent-drop class the guard exists to prevent, reintroduced by
+ * the guard's own shape. One call per invocation is what makes them actually independent.
+ *
+ * ── AND IT COVERS THE FAILURE THAT CAN ACTUALLY HAPPEN ──────────────────────────────────────────
+ * `captureAsksFrom` is `async` and catches its own body, so it CANNOT throw synchronously — a bare
+ * `try` around it guards a shape the wire never produces. Its reachable failure is a REJECTION, or a
+ * throw from `postSparkle` inside its `.then` callback (which does `setChat` + `announce`), and
+ * neither reaches an enclosing `try`. Hence the promise arm: sync throw and rejection both land in
+ * the same place, and a caller does not have to know which kind of function it is holding.
+ */
+function bookkeep(what: string, fn: () => void | Promise<unknown>): void {
+  const warn = (err: unknown) =>
+    console.warn(`concierge: ${what} failed; the send is unaffected`, err);
+  try {
+    const result = fn();
+    if (result instanceof Promise) void result.catch(warn);
+  } catch (err) {
+    warn(err);
+  }
+}
+
 export function ConciergeHost({
   feed,
   promptTarget = null,
@@ -432,6 +461,15 @@ export function ConciergeHost({
   const wired = useEffectiveWired();
   // Latest feed for the event handlers (send/nudge actions), which run after render.
   const feedRef = useRef(feed);
+  // THE ASK QUEUE (bead sparkle-yd1ud). Started here because this component is where the founder's
+  // messages arrive and where `buildSnapshot` composes the brain's context — the two seams the queue
+  // sits between. The module holds one queue per window; starting it twice is a no-op re-wire.
+  useEffect(() => {
+    return startAskQueue({
+      projects: () => useProjectStore.getState().projects,
+      pinnedProjectId: () => feedRef.current.pinnedProjectId,
+    });
+  }, []);
   // The thread's arrival ledger: which message ids have been seen, and in what order. A REF, not
   // state — it records history rather than driving a render, and the memo below reads it while
   // building. Assign-once semantics keep a digest that flickers (a group needs >= 2 agents, so it
@@ -2017,6 +2055,9 @@ export function ConciergeHost({
       // `markSettled` returns `prev` untouched for a turn with no bubble, so the other order would
       // silently never stamp it and every later reply would claim this one's questions.
       markSettled(held.turnId);
+      // Indexed here too — see the sibling call on the non-blocked path. A reply the founder read is
+      // a reply he may later ask about, whichever path produced it.
+      recordConciergeReply(text);
       // THE LEDGER READS WHAT THE USER WAS ACTUALLY TOLD. Running it at `done` on a reply that was
       // then replaced would record a promise out of text nobody ever saw — and the ledger's whole
       // value is that the founder can check it against what he read.
@@ -2462,6 +2503,11 @@ export function ConciergeHost({
       // reply for such a turn lives in `brainTextRef`. Reading only `e.text` silently skipped promise
       // DETECTION for every one of those turns, which is a promise the ledger can never later report.
       const replyText = e.text || brainTextRef.current[e.id] || "";
+      // Index the reply so `search_history` can answer questions about this conversation, not just
+      // about build-agent traffic (bead sparkle-yd1ud). Same seam as the promise ledger deliberately:
+      // both want THE TEXT THE FOUNDER WAS ACTUALLY SHOWN, including turns whose `done` carries no
+      // text of its own.
+      recordConciergeReply(replyText);
       try {
         for (const p of noteConciergeTurnForPromises({
           id: e.id,
@@ -3599,9 +3645,64 @@ export function ConciergeHost({
     // reads what the founder just said. `peek` stamps nothing: `readAt` is written in the `done`
     // handler below, because this turn can still be superseded and killed before it says a word —
     // and a finding claimed here would be gone with no residue and no retry.
+    // ══ WRITE IT DOWN BEFORE ANSWERING IT, AND NEVER AT THE COST OF THE SEND ══════════════════════
+    // Filing is a `bd` round-trip so the turn must not wait on it — but it is issued HERE rather
+    // than in the reply handler, because a turn that never completes is exactly the case where the
+    // request would otherwise be lost, which is the whole defect (bead sparkle-yd1ud).
+    //
+    // Everything here is fire-and-forget record-keeping running just before the send, and a failure
+    // in any of it must not ABORT the dispatch — that would leave his message silently undelivered,
+    // which shipped once from an unguarded `crypto.randomUUID()`. Each call is wrapped SEPARATELY by
+    // `bookkeep` (see its header): one shared `try` would let the first failure skip the rest, and
+    // it would guard only the synchronous shape while the reachable failure here is a rejection.
+    // The guard lives at this call site, not only inside each module (roborev 61903), because that
+    // is the invariant — nothing between here and `startConciergeTurn` may take the send down.
+    bookkeep("ask capture", () =>
+      captureAsksFrom(entry.text, String(latestTurnRef.current)).then((out) => {
+        // A CAP THAT SAYS NOTHING IS CONCEALMENT (docs/never-hide-actionable-rows.md). `asksIn`
+        // bounds one message to MAX_ASKS_PER_TURN so a long paste cannot bury the queue, and reports
+        // what it withheld precisely so the bound stays visible.
+        //
+        // EACH NOTICE IS GUARDED SEPARATELY (roborev 61961), for the reason the notices exist at
+        // all: they are the disclosures that keep the cap and the disagreement from being concealed,
+        // so one of them failing must not silently swallow the others. Grouped, a throw from the
+        // `dropped` post would skip every `reasked` line below it — concealment produced by the code
+        // whose whole job is to prevent it.
+        if (out.dropped > 0) {
+          bookkeep("dropped-ask notice", () =>
+            postSparkle(
+              line`That message had more asks than I file at once, so ${plain(String(out.dropped))} of them didn't make the list — say them again and I'll pick them up.`,
+            ),
+          );
+        }
+        // He asked for something we already marked done. Neither a silent re-open nor a duplicate:
+        // two parties disagree about whether the work happened, and that is his call to make.
+        for (const r of out.reasked) {
+          bookkeep("re-ask notice", () =>
+            postSparkle(
+              line`You've asked for ${plain(oneLine(r.ask.sentence))} again — ${plain(r.closedBeadId)} was already closed. I've filed it fresh rather than assume either of us was right.`,
+            ),
+          );
+        }
+      }),
+    );
+    // HIS RAW MESSAGE, not the composed prompt — `buildSnapshot` wraps it in a roster dump and the
+    // open-ask block, and indexing that would bury one sentence of his under a page of generated
+    // context that every search would match.
+    bookkeep("history capture", () => recordConciergePrompt(entry.text));
     const research = researchDrain.peek();
     void startConciergeTurn(
-      withResearchPreamble(research.preamble, buildSnapshot(feedRef.current, entry.text)),
+      // MERGE NOTE (sparkle-yd1ud × sparkle-s7rfc): both branches rewrote this call, and the two
+      // additions compose rather than compete — research findings are what CAME BACK, open asks are
+      // what is still OWED. Taking either side verbatim would have silently dropped the other's
+      // argument, which is the conflict git resolves cleanly and wrongly. `openAsksNow()` is read
+      // synchronously from the queue's cache, for the same reason the fleet picture is read at
+      // dispatch rather than at enqueue: the prompt should describe what is outstanding when the
+      // turn actually runs.
+      withResearchPreamble(
+        research.preamble,
+        buildSnapshot(feedRef.current, entry.text, openAsksNow()),
+      ),
     ).then(
       (id) => {
         const n = id !== null && /^\d+$/.test(id) ? Number(id) : null;
@@ -3726,7 +3827,14 @@ export function ConciergeHost({
         ]);
       },
     );
-  }, []);
+    // NAMED, NOT SUPPRESSED — and naming it costs nothing. The disclosure notices above are the
+    // first `postSparkle` calls inside this callback, so the array became non-exhaustive the moment
+    // they were added. `postSparkle` is `useCallback(…, [announce])` and `announce` is
+    // `useCallback(…, [])`, so it is stable for this component's lifetime: naming it cannot give
+    // `dispatchTurn` a new identity on any render, which is the same reasoning the brain-subscription
+    // array records for `noteMounted`. Leaving it out is not a style note — it is desktop lint
+    // warning number THIRTEEN against an `eslint src --max-warnings 12` ratchet, i.e. a red CI.
+  }, [postSparkle]);
   dispatchTurnRef.current = dispatchTurn;
   drainQueueRef.current = drainQueue;
 

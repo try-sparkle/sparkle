@@ -56,3 +56,7 @@ export * from "./pusherFleetReport";
 export * from "./pusherVerify";
 export * from "./pusherBlocker";
 export * from "./babysitDispatch";
+// The founder's ask queue — what he asked for, captured by code so a context ending cannot lose it.
+// Pure and model-free for the same reason every module above is: a detector for "did you drop
+// something" must not share a failure domain with the thing whose reliability is in question.
+export * from "./conciergeAsks";

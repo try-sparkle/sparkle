@@ -28,11 +28,15 @@
 // AFFIRMATIVE evidence of a clean tree, and `undefined` whenever the branch poll has not run.
 
 import type { FleetSnapshot, StandingDuty } from "@sparkle/core";
-import type { AgentTab, Project } from "../types";
+import type { AgentTab, LastObserved, Project } from "../types";
+import type { AgentTabStatus } from "@sparkle/ui";
 import type { BranchStatus } from "./branchStatus";
 import type { QuotaBlock } from "../engine/quotaBlock";
 import type { PassHoldReason } from "./improvementPass";
 import { agentDisplayName } from "../engine/agentDisplayName";
+// The codebase's SINGLE definition of "does this window actually know anything about this agent" —
+// reused rather than re-derived, which is the mistake its own header records being made twice.
+import { livenessOf } from "./agentLiveness";
 
 /** Everything the mapping reads. Supplied by the caller so this stays testable and pure. */
 export interface FleetSnapshotInput {
@@ -69,7 +73,128 @@ export interface FleetSnapshotInput {
    * the id is free here and a store search anywhere else.
    */
   retroSettledFor(projectId: string, agentId: string): boolean;
+  /**
+   * Has this agent's session ENDED?
+   * `sessionEndedOf(runtimeStore.status[agentId], runtimeStore.lastObserved[agentId])`.
+   *
+   * INJECTED for the same reason `quotaFor` and `failureFor` are — this module owns no store reads.
+   * Three-valued, and `undefined` is the ordinary reading rather than the exceptional one: the live
+   * status map has a single writer (a mounted pane), so most of the fleet has no entry at all. See
+   * {@link sessionEndedOf} for why an absent entry may never be read as either answer, and for why
+   * BOTH maps have to be consulted rather than just the live one.
+   */
+  sessionEndedFor(agentId: string): boolean | undefined;
   now: number;
+}
+
+/**
+ * Is this agent's session affirmatively OVER, affirmatively still going, or unknown?
+ *
+ * ── NO NEW VOCABULARY, AND NO NEW STATUS ────────────────────────────────────────────────────────
+ * `hookEventToStatus({event:"SessionEnd"})` already answers `done`, and `engine/hookEvents.test.ts`
+ * pins it. This is the boolean projection of that one mapping, so "the session ended" keeps a
+ * single definition; inventing an `AgentTabStatus` for it would be a second opinion about the same
+ * event, and a labelling change would then silently reclassify deaths.
+ *
+ * ── WHY AN ABSENT ENTRY IS `undefined` AND NOT `false` ──────────────────────────────────────────
+ * `runtimeStore.status` is live-only and written by a mounted `AgentPane`, so a missing entry is
+ * `agentLiveness`'s `unknown` / `other-window` — "nothing in this window is watching", never "still
+ * running". `livenessOf` is written on exactly that test (`status[id] !== undefined ⇒ "local"`), and
+ * `isObserved` is the predicate a caller is supposed to pass before treating a derived boolean as a
+ * fact. This is that predicate, inlined at the one place the value is produced.
+ *
+ * ── ...WHICH IS WHY THE CAPTURE IS CONSULTED, AND IT IS NOT A NICETY (roborev 61854) ────────────
+ * `runtimeStore.close()` DELETES the live `status` entry, and only a mounted pane ever writes one —
+ * so for a closed row the live map is empty from then on, permanently. Reading only the live map
+ * would therefore blind this class to exactly the agent it exists to protect: closing the row is the
+ * ordinary first step before retiring one, so the condition would fall silent at the precise moment
+ * the destructive act became imminent.
+ *
+ * The other half of the snapshot does NOT fall silent with it, which is what makes this worth fixing
+ * rather than accepting: `close()` drops `branchStatus` too, but the sidebar re-polls the CLOSED
+ * rows on its next tick (`pollProjectStatus` with the PR probe off) and puts `dirty` straight back.
+ * So without the capture the pair is permanently `sessionEnded: undefined` + `dirty: true` — one
+ * field missing, forever, for the one agent about to be torn down. `close()` writes the status it is
+ * deleting into the PERSISTED `lastObserved`, so the fact survives the close and a relaunch.
+ *
+ * ── BUT A CAPTURE IS ONLY THE LAST WORD WHEN NOBODY IS STILL WATCHING (roborev 61893) ───────────
+ * ABSENCE OF A LOCAL ENTRY IS NOT DEATH, and the difference is exactly what `agentLiveness` exists
+ * to name — so this routes through `livenessOf` rather than testing `status[id] === undefined`
+ * itself, which is the mistake that module's header says was made twice in two files:
+ *
+ *   • `local` — this window has a reading. It is authoritative; the capture is irrelevant.
+ *   • `other-window` — no local entry, but a pane is open SOMEWHERE (`openAgentIds` is persisted and
+ *     merged app-wide). This window cannot observe it, so it answers `undefined`. Using the capture
+ *     here is the false positive that matters: `lastObserved` is never cleared by re-opening a row
+ *     (only a confident no-session fresh start clears it), so a resumed agent keeps its stale `done`
+ *     indefinitely — and the sidebar's closed-row poll keeps `dirty` true. The report would then
+ *     tell the founder that a CURRENTLY WORKING agent died holding work and that retiring it
+ *     deletes the files. That is precisely the credibility spend `diedHoldingWork`'s own header
+ *     forbids, in the direction that is hardest to notice.
+ *   • `unknown` — no local entry and no open pane anywhere. Only here is the capture the last word.
+ *
+ * ── ONLY `done` IS EVER AFFIRMATIVE, AND FROM A CAPTURE NOTHING ELSE IS EVEN `false` ────────────
+ * `stopped` reads like a session end — "not running (persisted tab)" — which is the trap. It is also
+ * what `useRosterPublisher` substitutes for an agent it has NO reading for (`DEFAULT_STATUS`), and
+ * what `close()` DEMOTES a red-tier row to. Treating it as affirmative evidence would let a default
+ * stand in for an observation, which is the whole failure this file's header is about.
+ *
+ * On the CAPTURE path a non-`done` value does not even earn `false`: closing a row mid-work captures
+ * `working`, and the close may well have killed the PTY, so "still running" is an overclaim about a
+ * process nobody watched die. Live says `false` (a mounted pane really is observing it); a capture
+ * says `undefined`. `diedHoldingWork` tests `=== true` so both behave alike today — but the field is
+ * documented three-valued, and a future consumer reading `false` as "alive" would be reading a
+ * guess.
+ */
+export function sessionEndedOf(
+  agentId: string,
+  status: Readonly<Record<string, AgentTabStatus>>,
+  lastObserved: Readonly<Record<string, LastObserved>>,
+  openAgentIds: ReadonlySet<string>,
+): boolean | undefined {
+  switch (livenessOf(agentId, status, openAgentIds)) {
+    case "local":
+      return status[agentId] === "done";
+    // Open somewhere this window cannot see. No claim either way — see above.
+    case "other-window":
+      return undefined;
+    case "unknown": {
+      const captured = lastObserved[agentId];
+      // `done` is the only affirmative; everything else (including an absent capture) is UNKNOWN.
+      return captured?.status === "done" ? true : undefined;
+    }
+  }
+}
+
+/**
+ * The agent's UNCOMMITTED work as the safety reading — raw, never filtered by `worktreeOnBranch`.
+ *
+ * ── THE OPPOSITE FILTER FROM {@link unlandedWorkOf}, ON PURPOSE ─────────────────────────────────
+ * `BranchStatus` states the split in its own comments and it is worth restating rather than
+ * inferring, because the two consumers sit in this same file and want opposite things from one
+ * field. `unlandedWorkOf` is ATTRIBUTION — it feeds "safe to retire", so a parked tree's dirt
+ * belongs to whatever branch was checked out into it and must not be counted as this agent's, which
+ * is why it declines to answer. This is SAFETY: parking CARRIES the uncommitted files along, so
+ * they are still on disk and are still the user's, and a tear-down still destroys them. Suppressing
+ * `dirty` here would be suppressing the warning precisely for the tree somebody already moved.
+ *
+ * What the report does NOT do is name the FILES, which is the half of the parked-tree caveat that
+ * still binds — naming them would attribute another branch's work to this agent by name. It reports
+ * the agent and the count, and asks the founder to go and look.
+ *
+ * `undefined` in, `undefined` out: an unpolled branch is not evidence of a clean tree OR a dirty
+ * one, and `diedHoldingWork` requires an affirmative `true`.
+ */
+export function dirtyOf(
+  status: BranchStatus | undefined,
+): { dirty: boolean; dirtyCount?: number } | undefined {
+  if (status === undefined) return undefined;
+  return {
+    dirty: status.dirty,
+    // INDEPENDENTLY OPTIONAL. A Rust build predating `dirtyCount` sends `dirty: true` with no count,
+    // and the report says "did not record how many" rather than printing a 0 nobody measured.
+    ...(status.dirtyCount !== undefined ? { dirtyCount: status.dirtyCount } : {}),
+  };
 }
 
 /**
@@ -99,6 +224,8 @@ export function snapshotOfAgent(
   const branch = input.branchStatus[agent.id];
   const quota = input.quotaFor(agent.id, input.now);
   const failure = input.failureFor(agent.id);
+  const sessionEnded = input.sessionEndedFor(agent.id);
+  const uncommitted = dirtyOf(branch);
   const goal = agent.goal;
 
   return {
@@ -124,6 +251,13 @@ export function snapshotOfAgent(
       : {}),
     ...(goal?.metAt !== undefined ? { goalMetAt: goal.metAt } : {}),
     ...(unlandedWorkOf(branch) !== undefined ? { hasUnlandedWork: unlandedWorkOf(branch) } : {}),
+    // SPREAD CONDITIONALLY, like every reading above and unlike `retroSettled` below: an absent
+    // entry here is "nothing in this window is watching this agent", which `diedHoldingWork` must be
+    // able to tell apart from "it is still running".
+    ...(sessionEnded !== undefined ? { sessionEnded } : {}),
+    // The RAW dirty reading — see `dirtyOf` for why this one is deliberately not filtered the way
+    // `hasUnlandedWork` is, and for why `dirtyCount` rides along separately.
+    ...(uncommitted !== undefined ? uncommitted : {}),
     // ALWAYS SET, unlike the fields above — `retroSettled` is a total function of the cache, where
     // "no receipt" IS the answer `false` rather than a missing reading. Spreading it conditionally
     // would make an unsettled agent indistinguishable from one nobody asked, and `retirableAgents`
