@@ -34,6 +34,78 @@ export function getFreePort() {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
+ * In-page expression returning this page's resource timings as a JSON string.
+ *
+ * Serialised in the page rather than returned as objects because `PerformanceResourceTiming` is a
+ * host object: CDP's `returnByValue` renders it as `{}` and every field below would read
+ * `undefined`.
+ */
+export const RESOURCE_TIMING_EXPR = `JSON.stringify(
+  performance.getEntriesByType('resource').map((e) => ({
+    name: e.name,
+    initiatorType: e.initiatorType,
+    responseStatus: typeof e.responseStatus === 'number' ? e.responseStatus : null,
+    transferSize: e.transferSize,
+    encodedBodySize: e.encodedBodySize,
+    decodedBodySize: e.decodedBodySize,
+  }))
+)`;
+
+/**
+ * Which of a page's resource loads did not deliver a body, and why.
+ *
+ * WHY THIS EXISTS: a stylesheet (or module) that the dev server answers with a 500 does not raise a
+ * page error and does not log to the console — the request simply completes with no body. So the
+ * only symptom is that whatever the harness was waiting on never becomes true, and the probe dies
+ * with a bare 30s `waitForFunction` timeout. That reads as a slow machine, which is the wrong
+ * investigation entirely; the server was returning 500 for one URL the whole time.
+ *
+ * Two shapes count as a failure, and the second is deliberately narrow:
+ *   - an HTTP status >= 400 — unambiguous, and the case above;
+ *   - a *zero-byte* load (no transferred bytes and no decoded body), which is how a blocked,
+ *     aborted, or DNS-failed request appears. A cached 200 also transfers zero bytes but has a
+ *     non-zero `decodedBodySize`, so requiring BOTH to be zero keeps the cache out of the report.
+ *
+ * A cross-origin response without `Timing-Allow-Origin` is opaque (status 0, sizes 0) and would
+ * land in that second bucket. The harness serves everything from one local origin, so that does
+ * not arise here — and the reason string says "no bytes delivered" rather than asserting an error,
+ * so an opaque entry reads as the observation it is.
+ */
+export function resourceFailures(entries) {
+  if (!Array.isArray(entries)) return [];
+  return entries.flatMap((e) => {
+    if (!e || typeof e.name !== "string") return [];
+    if (typeof e.responseStatus === "number" && e.responseStatus >= 400) {
+      return [{ name: e.name, initiatorType: e.initiatorType, reason: `HTTP ${e.responseStatus}` }];
+    }
+    const zeroBytes =
+      (e.transferSize ?? 0) === 0 && (e.encodedBodySize ?? 0) === 0 && (e.decodedBodySize ?? 0) === 0;
+    if (zeroBytes) {
+      return [{ name: e.name, initiatorType: e.initiatorType, reason: "no bytes delivered" }];
+    }
+    return [];
+  });
+}
+
+/**
+ * Render {@link resourceFailures} as a suffix for an error message, or `""` when the page is clean.
+ *
+ * Empty-on-clean is the contract that lets callers concatenate this unconditionally: a healthy page
+ * must not gain a trailing "0 failed resources" line on an unrelated failure.
+ */
+export function describeResourceFailures(entries, { limit = 5 } = {}) {
+  const failures = resourceFailures(entries);
+  if (failures.length === 0) return "";
+  const shown = failures.slice(0, limit);
+  const lines = shown.map(
+    (f) => `  - ${f.reason}: ${f.name}${f.initiatorType ? ` (${f.initiatorType})` : ""}`,
+  );
+  const hidden = failures.length - shown.length;
+  if (hidden > 0) lines.push(`  - …and ${hidden} more`);
+  return `\n${failures.length} resource(s) failed to load — this is the likely cause:\n${lines.join("\n")}`;
+}
+
+/**
  * Flags chosen for BYTE-STABILITY, not speed. Anything that lets the machine's mood into the
  * raster — GPU rasterization, subpixel text positioning, hinting driven by display DPI, animations,
  * the background-network chatter that can repaint a surface mid-capture — is turned off here rather
@@ -279,6 +351,21 @@ export class Page {
     this.targetId = null;
   }
 
+  /**
+   * Ask the page which resources did not deliver a body, formatted for an error message.
+   *
+   * Never throws: this runs on a path that is already failing, so a broken diagnostic must not
+   * replace the caller's real error with its own.
+   */
+  async diagnoseResourceFailures() {
+    try {
+      const raw = await this.evaluate(RESOURCE_TIMING_EXPR);
+      return describeResourceFailures(JSON.parse(raw));
+    } catch {
+      return "";
+    }
+  }
+
   /** Poll a JS predicate. Polling beats a MutationObserver here: React commits in batches. */
   async waitForFunction(expression, { timeout = 30000, poll = 100 } = {}) {
     const deadline = Date.now() + timeout;
@@ -292,7 +379,8 @@ export class Page {
       }
       await sleep(poll);
     }
-    throw new Error(`waitForFunction timed out after ${timeout}ms: ${expression}`);
+    const resources = await this.diagnoseResourceFailures();
+    throw new Error(`waitForFunction timed out after ${timeout}ms: ${expression}${resources}`);
   }
 
   waitForSelector(selector, opts) {

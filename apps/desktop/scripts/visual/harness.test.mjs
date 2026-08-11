@@ -29,6 +29,7 @@ import { INIT_SCRIPTS, numericArg, parseArgs, surfaceUrl } from "./capture.mjs";
 import { CLEAR_STORAGE } from "./serve.mjs";
 import { MOCK_REL, mockChromeCss, resolveMock, viewportFromManifest } from "./compare.mjs";
 import { compareDirs, shouldKeep } from "./verify-stable.mjs";
+import { Page, RESOURCE_TIMING_EXPR, describeResourceFailures, resourceFailures } from "./cdp.mjs";
 import {
   channelDelta,
   parseArgs as probeArgs,
@@ -1663,5 +1664,203 @@ describe("the capture driver's init scripts", () => {
 
   it("does not throw when the origin has storage disabled", () => {
     expect(() => runInitScripts([CLEAR_STORAGE], { storageThrows: true })).not.toThrow();
+  });
+});
+
+describe("cdp resource-failure diagnosis", () => {
+  const ok = (name, extra = {}) => ({
+    name,
+    initiatorType: "script",
+    responseStatus: 200,
+    transferSize: 900,
+    encodedBodySize: 800,
+    decodedBodySize: 2000,
+    ...extra,
+  });
+
+  it("names a 5xx stylesheet, which is the failure that produces a bare readiness timeout", () => {
+    const out = resourceFailures([
+      ok("http://localhost:5173/main.js"),
+      ok("http://localhost:5173/index.css", {
+        initiatorType: "link",
+        responseStatus: 500,
+        transferSize: 0,
+        encodedBodySize: 0,
+        decodedBodySize: 0,
+      }),
+    ]);
+    expect(out).toEqual([
+      { name: "http://localhost:5173/index.css", initiatorType: "link", reason: "HTTP 500" },
+    ]);
+  });
+
+  it("flags a zero-byte load, the shape a blocked or aborted request takes", () => {
+    const out = resourceFailures([
+      ok("http://localhost:5173/font.woff2", {
+        initiatorType: "css",
+        responseStatus: 0,
+        transferSize: 0,
+        encodedBodySize: 0,
+        decodedBodySize: 0,
+      }),
+    ]);
+    expect(out).toEqual([
+      { name: "http://localhost:5173/font.woff2", initiatorType: "css", reason: "no bytes delivered" },
+    ]);
+  });
+
+  it("does NOT flag a cached 200 — zero transferred bytes but a real decoded body", () => {
+    expect(
+      resourceFailures([
+        ok("http://localhost:5173/main.js", { transferSize: 0, encodedBodySize: 0, decodedBodySize: 4096 }),
+      ]),
+    ).toEqual([]);
+  });
+
+  it("does NOT flag a page whose resources all delivered bodies", () => {
+    expect(resourceFailures([ok("http://localhost:5173/a.js"), ok("http://localhost:5173/b.css")])).toEqual([]);
+  });
+
+  it("survives a page that answered with something other than an array", () => {
+    expect(resourceFailures(undefined)).toEqual([]);
+    expect(resourceFailures([null, { initiatorType: "img" }])).toEqual([]);
+  });
+
+  it("describes failures as an appendable suffix naming the status and the URL", () => {
+    const text = describeResourceFailures([
+      ok("http://localhost:5173/main.js"),
+      ok("http://localhost:5173/index.css", {
+        initiatorType: "link",
+        responseStatus: 500,
+        transferSize: 0,
+        encodedBodySize: 0,
+        decodedBodySize: 0,
+      }),
+    ]);
+    expect(text).toContain("1 resource(s) failed to load");
+    expect(text).toContain("HTTP 500: http://localhost:5173/index.css (link)");
+    expect(text).not.toContain("main.js");
+    expect(text.startsWith("\n")).toBe(true);
+  });
+
+  it("returns an EMPTY string for a clean page, so callers can concatenate it unconditionally", () => {
+    expect(describeResourceFailures([ok("http://localhost:5173/a.js")])).toBe("");
+    expect(describeResourceFailures([])).toBe("");
+  });
+
+  it("caps the list and says how many it withheld", () => {
+    const bad = Array.from({ length: 9 }, (_, i) =>
+      ok(`http://localhost:5173/x${i}.js`, {
+        responseStatus: 500,
+        transferSize: 0,
+        encodedBodySize: 0,
+        decodedBodySize: 0,
+      }),
+    );
+    const text = describeResourceFailures(bad, { limit: 3 });
+    expect(text).toContain("9 resource(s) failed to load");
+    expect(text.match(/HTTP 500:/g)).toHaveLength(3);
+    expect(text).toContain("…and 6 more");
+  });
+
+  // The expression runs INSIDE the page, where PerformanceResourceTiming is a host object that CDP
+  // cannot return by value. Evaluating it against a stand-in `performance` proves it reads the
+  // fields resourceFailures() consumes — a mismatch here would leave every field undefined and
+  // silently report every resource as a zero-byte failure.
+  it("RESOURCE_TIMING_EXPR serialises the fields the analyzer reads", () => {
+    const ctx = createContext({
+      performance: {
+        getEntriesByType: (type) =>
+          type === "resource"
+            ? [
+                {
+                  name: "http://localhost:5173/index.css",
+                  initiatorType: "link",
+                  responseStatus: 500,
+                  transferSize: 0,
+                  encodedBodySize: 0,
+                  decodedBodySize: 0,
+                },
+              ]
+            : [],
+      },
+      JSON,
+    });
+    const parsed = JSON.parse(new Script(RESOURCE_TIMING_EXPR).runInContext(ctx));
+    expect(resourceFailures(parsed)).toEqual([
+      { name: "http://localhost:5173/index.css", initiatorType: "link", reason: "HTTP 500" },
+    ]);
+  });
+
+  it("RESOURCE_TIMING_EXPR nulls a responseStatus the browser does not expose", () => {
+    const ctx = createContext({
+      performance: {
+        getEntriesByType: () => [
+          { name: "http://localhost:5173/a.js", initiatorType: "script", transferSize: 10, encodedBodySize: 10, decodedBodySize: 20 },
+        ],
+      },
+      JSON,
+    });
+    const parsed = JSON.parse(new Script(RESOURCE_TIMING_EXPR).runInContext(ctx));
+    expect(parsed[0].responseStatus).toBeNull();
+    expect(resourceFailures(parsed)).toEqual([]);
+  });
+});
+
+// The production wiring, driven through the real `waitForFunction`. The pure functions above prove
+// the analysis; this proves a timing-out probe actually REACHES it — the seam that would otherwise
+// be untested by construction, leaving the bare timeout exactly as uninformative as before.
+describe("cdp waitForFunction timeout message", () => {
+  const pageAnswering = (timings) => {
+    const page = Object.create(Page.prototype);
+    page.send = async (method, params) => {
+      if (method !== "Runtime.evaluate") throw new Error(`unexpected ${method}`);
+      if (params.expression === RESOURCE_TIMING_EXPR) {
+        return { result: { value: JSON.stringify(timings) } };
+      }
+      return { result: { value: false } }; // the predicate never becomes true
+    };
+    return page;
+  };
+
+  const css500 = {
+    name: "http://localhost:5173/index.css",
+    initiatorType: "link",
+    responseStatus: 500,
+    transferSize: 0,
+    encodedBodySize: 0,
+    decodedBodySize: 0,
+  };
+
+  it("names the failed resource instead of dying as a bare timeout", async () => {
+    const page = pageAnswering([css500]);
+    await expect(page.waitForFunction("window.ready", { timeout: 1, poll: 1 })).rejects.toThrow(
+      /HTTP 500: http:\/\/localhost:5173\/index\.css/,
+    );
+  });
+
+  it("adds nothing when every resource loaded — the timeout message stays clean", async () => {
+    const page = pageAnswering([
+      {
+        name: "http://localhost:5173/main.js",
+        initiatorType: "script",
+        responseStatus: 200,
+        transferSize: 900,
+        encodedBodySize: 800,
+        decodedBodySize: 2000,
+      },
+    ]);
+    const err = await page.waitForFunction("window.ready", { timeout: 1, poll: 1 }).catch((e) => e);
+    expect(err.message).toBe("waitForFunction timed out after 1ms: window.ready");
+  });
+
+  it("still reports the timeout when the diagnostic itself fails", async () => {
+    const page = Object.create(Page.prototype);
+    page.send = async (_m, params) => {
+      if (params.expression === RESOURCE_TIMING_EXPR) throw new Error("target closed");
+      return { result: { value: false } };
+    };
+    const err = await page.waitForFunction("window.ready", { timeout: 1, poll: 1 }).catch((e) => e);
+    expect(err.message).toBe("waitForFunction timed out after 1ms: window.ready");
   });
 });
