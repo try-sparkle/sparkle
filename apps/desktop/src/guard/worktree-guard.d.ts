@@ -19,10 +19,13 @@ declare module "*/worktree-guard.mjs" {
   // .netrc/.npmrc/.pgpass, credentials.json/service-account*.json/…, .aws/credentials). Template
   // files (.env.example/.sample/.template/.dist) and the .pub half of a keypair are exempt.
   export function isSecretPath(p: unknown): boolean;
-  // Narrow allow-list predicate (item 1j): true iff target resolves into $HOME/.claude/plans/ or a
-  // $HOME/.claude/projects/<any>/memory/ dir, canonicalized through symlinks (both are append-only
-  // per-agent note dirs the guard permits even though they live outside the worktree).
-  export function isAllowlistedNoteDir(homeDir: string, target: string): boolean;
+  // Narrow allow-list predicate (item 1j): true iff target resolves into <config>/plans/ or a
+  // <config>/projects/<any>/memory/ dir, canonicalized through symlinks (both are append-only
+  // per-agent note dirs the guard permits even though they live outside the worktree). Checked
+  // against BOTH $HOME/.claude and `configDir` — the harness prefers $CLAUDE_CONFIG_DIR when set and
+  // Sparkle always sets it to the account dir, so a $HOME-only allow-list blocks an app-spawned
+  // agent's own plan file (sparkle-3moh0). An empty or relative `configDir` is ignored.
+  export function isAllowlistedNoteDir(homeDir: string, target: string, configDir?: string): boolean;
   // Session-scratchpad allow-list predicate: true iff target resolves into a per-session scratchpad
   // dir (`/private/tmp`|`/tmp`/claude-*/.../scratchpad), canonicalized through symlinks. The harness
   // designates this dir for all temp files; `scratchpad` is required at the documented depth parts[3]

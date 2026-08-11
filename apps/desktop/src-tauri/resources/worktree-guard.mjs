@@ -809,24 +809,13 @@ export function isAllowlistedScratchpad(target) {
   return false;
 }
 
-/** True iff target resolves into one of the two NARROW append-only per-agent note dirs we allow
- *  writes to even though they live outside every worktree by design (item 1j):
- *    - $HOME/.claude/plans/                  plan files, and
- *    - $HOME/.claude/projects/<any>/memory/  per-agent cross-session memory.
- *  These are append-only NOTES, not code, so allowing them does not undermine the guard job of
- *  stopping an agent editing another agent code, and the header above already states this is
- *  "NOT a security sandbox". Both checks canonicalize through symlinks via the same
- *  realResolve/isInside machinery the containment check uses, so a symlink planted inside an
- *  allow-listed dir that points elsewhere does NOT tunnel a write out: the RESOLVED target simply
- *  will not be inside the allow-listed root. Kept deliberately narrow: ONLY these two dir classes,
- *  never all of ~/.claude/. Fails closed (false) on any unresolvable path. */
-export function isAllowlistedNoteDir(homeDir, target) {
-  if (typeof homeDir !== "string" || homeDir.length === 0) return false;
-  if (typeof target !== "string" || target.length === 0) return false;
-  const claudeRoot = `${homeDir}${sep}.claude`;
-  // (1) Plan files: anywhere at/under $HOME/.claude/plans/ (reuse the symlink-safe isInside).
+/** True iff target resolves into one of the two NARROW append-only per-agent note-dir classes,
+ *  relative to ONE Claude config root: `<root>/plans/` and `<root>/projects/<any>/memory/`.
+ *  Shared by both roots isAllowlistedNoteDir consults; see that docstring for the rationale. */
+function isUnderNoteRoot(claudeRoot, target) {
+  // (1) Plan files: anywhere at/under <root>/plans/ (reuse the symlink-safe isInside).
   if (isInside(`${claudeRoot}${sep}plans`, target)) return true;
-  // (2) Per-agent memory: $HOME/.claude/projects/<anything>/memory/ and descendants. We cannot
+  // (2) Per-agent memory: <root>/projects/<anything>/memory/ and descendants. We cannot
   // express the <anything> wildcard through one isInside root, so canonicalize both the projects
   // root and the target, confirm the target is inside projects/, then require the resolved path to
   // be <projectId>/memory[/...]. Canonicalizing the target FIRST is what makes this symlink-safe:
@@ -839,6 +828,37 @@ export function isAllowlistedNoteDir(homeDir, target) {
   const parts = rel.split(sep);
   // parts[0] = the project id; the very next segment must be the memory dir itself.
   return parts.length >= 2 && parts[1] === "memory";
+}
+
+/** True iff target resolves into one of the two NARROW append-only per-agent note dirs we allow
+ *  writes to even though they live outside every worktree by design (item 1j):
+ *    - <config>/plans/                  plan files, and
+ *    - <config>/projects/<any>/memory/  per-agent cross-session memory.
+ *  These are append-only NOTES, not code, so allowing them does not undermine the guard job of
+ *  stopping an agent editing another agent code, and the header above already states this is
+ *  "NOT a security sandbox". Both checks canonicalize through symlinks via the same
+ *  realResolve/isInside machinery the containment check uses, so a symlink planted inside an
+ *  allow-listed dir that points elsewhere does NOT tunnel a write out: the RESOLVED target simply
+ *  will not be inside the allow-listed root. Kept deliberately narrow: ONLY these two dir classes,
+ *  never all of the config root. Fails closed (false) on any unresolvable path.
+ *
+ *  `<config>` is TWO roots, not one, and that is the whole point of `configDir` (sparkle-3moh0):
+ *  the harness reads `$CLAUDE_CONFIG_DIR` when it is set and only falls back to `$HOME/.claude`
+ *  otherwise — and Sparkle ALWAYS sets it, to the chosen account's dir (see claude.rs). So an
+ *  agent the app spawned is handed a plan path under the ACCOUNT dir, which a `$HOME/.claude`-only
+ *  allow-list blocks. That made plan mode unusable in an app-managed worktree: the one file plan
+ *  mode permits editing could not be written, so ExitPlanMode had nothing to show. We check both
+ *  roots because the fallback still applies whenever the variable is unset, and a hook process can
+ *  inherit an env that differs from the session that wrote the notes. An empty or relative
+ *  `configDir` is IGNORED (empty is the harness's own "unset" sentinel; a relative root would be
+ *  cwd-dependent, hence unpredictable), leaving the `$HOME/.claude` behaviour unchanged. */
+export function isAllowlistedNoteDir(homeDir, target, configDir) {
+  if (typeof homeDir !== "string" || homeDir.length === 0) return false;
+  if (typeof target !== "string" || target.length === 0) return false;
+  if (isUnderNoteRoot(`${homeDir}${sep}.claude`, target)) return true;
+  if (typeof configDir !== "string" || configDir.length === 0) return false;
+  if (!isAbsolute(configDir)) return false;
+  return isUnderNoteRoot(configDir, target);
 }
 
 /** Resolve the git worktree root that CONTAINS `dir`, via `git rev-parse --show-toplevel` run with
@@ -942,9 +962,12 @@ async function main() {
   // live OUTSIDE every worktree by design (plan files and cross-session memory) so an agent can
   // record what it learned for the next agent. Safe because these are notes, not code, and
   // isAllowlistedNoteDir canonicalizes through symlinks (same fail-closed machinery as above).
+  // `$CLAUDE_CONFIG_DIR` is passed because the harness honours it over `$HOME/.claude`, and Sparkle
+  // always sets it to the account dir — without it the app's own agents cannot write their assigned
+  // plan file at all (sparkle-3moh0). The hook inherits the variable from the `claude` process.
   let allowedNoteDir = false;
   try {
-    allowedNoteDir = isAllowlistedNoteDir(homedir(), target);
+    allowedNoteDir = isAllowlistedNoteDir(homedir(), target, process.env.CLAUDE_CONFIG_DIR);
   } catch {
     allowedNoteDir = false;
   }

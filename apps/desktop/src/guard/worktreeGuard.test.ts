@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, it, expect } from "vitest";
 import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 // Import the pure predicate straight from the shipped guard script.
 import { isInside, blocksKeychainCommand, isAllowlistedNoteDir, isAllowlistedScratchpad, callerWorktreeRoot, outsideWorktreeMessage } from "../../src-tauri/resources/worktree-guard.mjs";
 
@@ -195,6 +195,82 @@ describe("isAllowlistedNoteDir (real dirs on disk)", () => {
     mkdirSync(proj, { recursive: true });
     symlinkSync(outside, join(proj, "memory"));
     expect(isAllowlistedNoteDir(home, join(proj, "memory", "notes.md"))).toBe(false);
+  });
+});
+
+// sparkle-3moh0: the harness reads $CLAUDE_CONFIG_DIR when set and only falls back to $HOME/.claude,
+// and Sparkle ALWAYS sets it (to the chosen account's dir). So an app-spawned agent is handed a plan
+// path under the account dir, which a $HOME-only allow-list blocked — making plan mode unusable in an
+// app-managed worktree. Each allow assertion below is paired with the same path WITHOUT the configDir
+// argument, which is the state before this change: the pair is what proves the third argument is what
+// admits the path, rather than some pre-existing $HOME rule.
+describe("isAllowlistedNoteDir (a config root that is NOT $HOME/.claude)", () => {
+  let home: string;
+  let config: string;
+  let outside: string;
+  beforeEach(() => {
+    home = realpathSync(mkdtempSync(join(tmpdir(), "wtguard-home-")));
+    config = realpathSync(mkdtempSync(join(tmpdir(), "wtguard-cfg-")));
+    outside = realpathSync(mkdtempSync(join(tmpdir(), "wtguard-out-")));
+    writeFileSync(join(outside, "evil.md"), "x");
+  });
+  afterEach(() => {
+    for (const d of [home, config, outside]) rmSync(d, { recursive: true, force: true });
+  });
+
+  it("allows a plans path under the config root, which is blocked without it", () => {
+    const plansDir = join(config, "plans");
+    mkdirSync(plansDir, { recursive: true });
+    const plan = join(plansDir, "my-plan.md");
+    expect(isAllowlistedNoteDir(home, plan)).toBe(false);
+    expect(isAllowlistedNoteDir(home, plan, config)).toBe(true);
+    expect(isAllowlistedNoteDir(home, join(plansDir, "nested", "deep.md"), config)).toBe(true);
+  });
+
+  it("allows a memory path under the config root, which is blocked without it", () => {
+    const memDir = join(config, "projects", "proj-abc", "memory");
+    mkdirSync(memDir, { recursive: true });
+    const note = join(memDir, "notes.md");
+    expect(isAllowlistedNoteDir(home, note)).toBe(false);
+    expect(isAllowlistedNoteDir(home, note, config)).toBe(true);
+    expect(isAllowlistedNoteDir(home, memDir, config)).toBe(true);
+  });
+
+  it("keeps the $HOME/.claude root working when a config root is also supplied", () => {
+    const plansDir = join(home, ".claude", "plans");
+    mkdirSync(plansDir, { recursive: true });
+    expect(isAllowlistedNoteDir(home, join(plansDir, "p.md"), config)).toBe(true);
+  });
+
+  it("stays narrow under the config root: siblings and the root itself are blocked", () => {
+    mkdirSync(join(config, "commands"), { recursive: true });
+    mkdirSync(join(config, "projects", "proj-abc", "other"), { recursive: true });
+    expect(isAllowlistedNoteDir(home, join(config, "commands", "foo.md"), config)).toBe(false);
+    expect(isAllowlistedNoteDir(home, join(config, "projects", "proj-abc", "other", "x.md"), config)).toBe(false);
+    expect(isAllowlistedNoteDir(home, join(config, "projects", "proj-abc", "config.json"), config)).toBe(false);
+    expect(isAllowlistedNoteDir(home, join(config, "settings.json"), config)).toBe(false);
+  });
+
+  it("blocks a symlink-escape out of the config root's plans and memory dirs", () => {
+    const plansDir = join(config, "plans");
+    mkdirSync(plansDir, { recursive: true });
+    symlinkSync(outside, join(plansDir, "escape"));
+    expect(isAllowlistedNoteDir(home, join(plansDir, "escape", "evil.md"), config)).toBe(false);
+    const memDir = join(config, "projects", "proj-abc", "memory");
+    mkdirSync(memDir, { recursive: true });
+    symlinkSync(outside, join(memDir, "escape"));
+    expect(isAllowlistedNoteDir(home, join(memDir, "escape", "evil.md"), config)).toBe(false);
+  });
+
+  it("ignores an empty or relative config root rather than resolving it against cwd", () => {
+    const plansDir = join(config, "plans");
+    mkdirSync(plansDir, { recursive: true });
+    const plan = join(plansDir, "my-plan.md");
+    // "" is the harness's own "unset" sentinel; a relative root would be cwd-dependent.
+    expect(isAllowlistedNoteDir(home, plan, "")).toBe(false);
+    expect(isAllowlistedNoteDir(home, plan, relative(process.cwd(), config))).toBe(false);
+    // …and neither form may admit a relative-shaped plans path either.
+    expect(isAllowlistedNoteDir(home, plan, "plans")).toBe(false);
   });
 });
 
