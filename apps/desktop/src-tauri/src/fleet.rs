@@ -947,6 +947,19 @@ pub fn git_facts(worktree: &str, base: &str) -> GitFacts {
     git_facts_with(worktree, base, &RefTable::empty())
 }
 
+/// True for the EXPECTED "the diff base is not resolvable in this worktree" failure of
+/// `git diff <base>...HEAD` — almost always `base` (origin/main) simply not fetched here, so git
+/// exits with "ambiguous argument '<base>...HEAD': unknown revision or path". Reporting `None` there
+/// is by design; the point of classifying it is to log that common, harmless case quietly while a
+/// GENUINE diff failure still logs at debug (bead sparkle-3u0xr — the debug line otherwise fired
+/// ~800×/day and buried the rare real failure). Matches git's wording case-insensitively.
+fn diff_base_unresolvable(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("unknown revision or path")
+        || e.contains("ambiguous argument")
+        || e.contains("bad revision")
+}
+
 /// [`git_facts`] with the fleet-wide ref prepass available.
 ///
 /// Two spawns when `refs` has a row for this worktree (`status`, `diff`), four when it does not
@@ -972,7 +985,14 @@ fn git_facts_with(worktree: &str, base: &str, refs: &RefTable) -> GitFacts {
     // reader (and `find_conflicts`) can tell it apart from a branch that really changed nothing.
     let changed_files = git(worktree, &["diff", "--name-only", &format!("{base}...HEAD")])
         .map_err(|e| {
-            tracing::debug!(worktree, base, error = %e, "fleet: changed-file diff unavailable; reporting None");
+            // Classify the failure: the expected unfetched/unresolvable base is the ~800×/day common
+            // case (bead sparkle-3u0xr) and drops to trace; a genuine diff failure stays at debug so
+            // it is not buried by the noise.
+            if diff_base_unresolvable(&e) {
+                tracing::trace!(worktree, base, error = %e, "fleet: changed-file diff base unresolvable (unfetched?); reporting None");
+            } else {
+                tracing::debug!(worktree, base, error = %e, "fleet: changed-file diff unavailable; reporting None");
+            }
         })
         .ok()
         .map(|out| {
@@ -2393,6 +2413,27 @@ mod tests {
         assert_eq!(resolved.ahead, Some(1), "one commit past the base");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn diff_base_unresolvable_classifies_the_expected_unfetched_base_failure() {
+        // The expected, benign case — `origin/main...HEAD` where the base was never fetched — must
+        // be recognised so it logs at trace!, not debug!. git phrases it three ways depending on
+        // version and which side is missing; all are the same "you named a ref I can't resolve".
+        assert!(diff_base_unresolvable(
+            "fatal: ambiguous argument 'origin/main...HEAD': unknown revision or path not in the working tree."
+        ));
+        assert!(diff_base_unresolvable("fatal: bad revision 'origin/main...HEAD'"));
+        assert!(diff_base_unresolvable(
+            "fatal: bad revision 'origin/main'\nUse '--' to separate paths from revisions"
+        ));
+        // A genuine diff failure — a broken repo, a corrupt index — is NOT this case and must keep
+        // its debug! level so it stays visible. This is the assertion the fix exists to protect:
+        // if it ever returns true here, real failures get demoted to trace! and buried.
+        assert!(!diff_base_unresolvable("fatal: not a git repository (or any of the parent directories): .git"));
+        assert!(!diff_base_unresolvable("error: index file corrupt"));
+        assert!(!diff_base_unresolvable("fatal: unable to read tree object"));
+        assert!(!diff_base_unresolvable(""));
     }
 
     #[test]
