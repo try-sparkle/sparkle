@@ -143,6 +143,31 @@ pub(crate) fn apply_test_hook_isolation(cmd: &mut Command) {
     cmd.env("GIT_CONFIG_VALUE_0", "/dev/null/sparkle-hooks-disabled");
 }
 
+thread_local! {
+    /// Git subprocesses this thread has spawned. THREAD-local, not global, and that is what makes
+    /// it usable as an assertion: a `cargo test` process runs suites concurrently, so a global
+    /// counter would be moved by unrelated tests and the assertion would be flaky. Every spawn a
+    /// synchronous call makes happens on the calling thread, so a per-thread delta is exactly "how
+    /// many git children did that call fork".
+    ///
+    /// Deliberately NOT an injected seam. A `deps`-style counter that only tests pass would leave
+    /// the production call site untested by construction (`AGENTS.md`: "a defaulted seam every test
+    /// injects"); this counts the real `git()`, so the test drives the same code the app does.
+    /// Cost is one non-atomic TLS increment per `fork` — unmeasurable next to the spawn itself.
+    static GIT_SPAWNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Bump this thread's git-spawn counter. Called by every runner that forks a `git` child.
+fn note_git_spawn() {
+    GIT_SPAWNS.with(|c| c.set(c.get().saturating_add(1)));
+}
+
+/// Git subprocesses spawned by THIS thread so far. Read two of these around a call and the
+/// difference is that call's fork count — see `GIT_SPAWNS`.
+pub(crate) fn git_spawns_on_this_thread() -> u64 {
+    GIT_SPAWNS.with(|c| c.get())
+}
+
 /// carrying stderr (falling back to stdout) on failure.
 ///
 /// `pub(crate)` so `fleet.rs` reads its Level 0 git observations through the SAME runner: the
@@ -150,6 +175,7 @@ pub(crate) fn apply_test_hook_isolation(cmd: &mut Command) {
 /// a second git invocation elsewhere in the crate that forgot any one of those would hang the
 /// digest on a credential prompt instead of returning.
 pub(crate) fn git(cwd: &str, args: &[&str]) -> Result<String, String> {
+    note_git_spawn();
     let mut cmd = Command::new(crate::preflight::git_program());
     cmd.arg("-C").arg(cwd).args(args);
     apply_noninteractive(&mut cmd);
@@ -2880,6 +2906,10 @@ fn ref_contains(root: &str, target: &str, commit: &str) -> bool {
     if target.trim().is_empty() {
         return false;
     }
+    // Counted like `git()`'s children: this runner builds its own `Command` (it needs `.status()`
+    // with nulled stdio), so without this the spawn would be invisible to `git_spawns_on_this_thread`
+    // — and `ref_contains` is 4-6 of the forks on the poll path.
+    note_git_spawn();
     let mut cmd = Command::new(crate::preflight::git_program());
     cmd.arg("-C").arg(root).args(["merge-base", "--is-ancestor", commit, target]);
     // A missing target ref makes git print "fatal: Not a valid object name" to stderr; null the
@@ -2927,6 +2957,82 @@ fn branch_landed(root: &str, target: &str, branch: &str, tip: &str) -> bool {
     (!tip.is_empty() && (ref_contains(root, target, tip) || ref_contains(root, &origin_ref, tip)))
         || merge_adds_nothing(root, target, branch)
         || merge_adds_nothing(root, &origin_ref, branch)
+}
+
+/// One memoized [`branch_landed`] answer, plus the inputs that answer is only valid for.
+///
+/// `target_tips` is the batch's `"<local-target-tip>:<origin-target-tip>"` pair — the SAME string
+/// already built for [`StatusFingerprint::default_tip`], which is why consulting this cache costs
+/// zero extra subprocesses on the poll path.
+#[derive(Clone, PartialEq)]
+struct LandedMemo {
+    tip: String,
+    target_tips: String,
+    landed: bool,
+}
+
+/// Per-branch memo of the last [`branch_landed`] answer (bead `sparkle-4kh8w`).
+///
+/// WHY THIS EXISTS. `branch_landed` is the most expensive single item on the 15s status poll:
+/// two `git merge-tree --write-tree` runs — a FULL THREE-WAY MERGE each — plus their `rev-parse
+/// ^{tree}` companions and two `ref_contains`, so up to SIX subprocesses per agent per tick. At ~35
+/// live agents that alone is ~200 forks every 15s, and the cost is not the CPU: macOS's xzone
+/// allocator takes a PROCESS-WIDE lock around `fork`/`posix_spawn`, so every spawn blocks `malloc`
+/// for every other thread in this process — including the main thread, inside WebKit IPC decode and
+/// `CA::Layer::commit_if_needed`. A spindump of a live wedge measured 159 threads parked in
+/// `_xzm_fork_lock_wait`, 11.9 thread-equivalents, with the main thread's own blocked samples
+/// landing in the CoreAnimation commit. A blocked CA commit is a frozen screen.
+///
+/// WHY THE KEY IS COMPLETE. The answer is a pure function of the branch's tip and the two target
+/// tips: `ref_contains` asks ancestry (fixed by the tips) and `merge_adds_nothing` merges the two
+/// TREES (fixed by the tips). If neither the branch nor local/origin target has moved, the answer
+/// provably cannot have changed. Keyed per `(root, target, branch)` and OVERWRITTEN when the tips
+/// move, rather than keyed BY the tips — so the map is bounded by branch count instead of growing
+/// one entry per commit for the life of the session.
+///
+/// NOT used by the close-agent safe branch delete (`branch_landed` is still called directly there).
+/// That path deletes a branch on the strength of this answer, and a cache is the wrong trade when
+/// the failure mode is destroying work.
+fn landed_cache() -> &'static Mutex<HashMap<String, LandedMemo>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, LandedMemo>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// [`branch_landed`], memoized on `(tip, target_tips)` — see [`landed_cache`].
+///
+/// `target_tips: None` means the caller has no cheap tip pair in hand, and then this is EXACTLY
+/// `branch_landed` with no cache read and no cache write. Resolving the pair here would cost the
+/// two `rev-parse` calls the memo exists to save, so the off-poll callers simply don't participate.
+fn branch_landed_memo(
+    root: &str,
+    target: &str,
+    branch: &str,
+    tip: &str,
+    target_tips: Option<&str>,
+) -> bool {
+    let Some(target_tips) = target_tips else {
+        return branch_landed(root, target, branch, tip);
+    };
+    let key = format!("{root}\u{1}{target}\u{1}{branch}");
+    if let Ok(cache) = landed_cache().lock() {
+        if let Some(prev) = cache.get(&key) {
+            if prev.tip == tip && prev.target_tips == target_tips {
+                return prev.landed;
+            }
+        }
+    }
+    let landed = branch_landed(root, target, branch, tip);
+    if let Ok(mut cache) = landed_cache().lock() {
+        cache.insert(
+            key,
+            LandedMemo {
+                tip: tip.to_string(),
+                target_tips: target_tips.to_string(),
+                landed,
+            },
+        );
+    }
+    landed
 }
 
 /// Commits reachable from `branch` but not from `base` — i.e. what `branch` authored on top of it.
@@ -4449,7 +4555,18 @@ pub fn agent_workflow_state_in(
     // ONE implementation, shared with the batched project poll — see `workflow_state_shared`. These
     // two used to carry byte-identical copies of the whole derivation, which is how a fix applied to
     // one silently left the other (the path the sidebar actually polls) wrong.
-    Ok(workflow_state_shared(root, &branch, &parent_branch, &default_branch, has_origin, &tip))
+    // `None`: this is the single-agent, event-driven path (a pane opening, a Land/Refresh), not the
+    // 15s batch. It holds no precomputed target tips, and resolving them here would cost the two
+    // `rev-parse` calls the memo exists to save. Uncached is the same answer.
+    Ok(workflow_state_shared(
+        root,
+        &branch,
+        &parent_branch,
+        &default_branch,
+        has_origin,
+        &tip,
+        None,
+    ))
 }
 
 /// Live workflow stage signals for an agent: local-ref reachability + a best-effort GitHub PR
@@ -4536,6 +4653,45 @@ struct StatusFingerprint {
 /// tick always computes.
 fn status_cache() -> &'static Mutex<HashMap<String, StatusFingerprint>> {
     static CACHE: OnceLock<Mutex<HashMap<String, StatusFingerprint>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The part of [`StatusFingerprint`] the WORKFLOW half of the poll depends on: everything except
+/// `index_mtime_ms`. Every signal `workflow_state_shared` computes is derived from these three
+/// commit tips — ancestry into local/origin default, the merge-tree landed probe, commits-beyond,
+/// pushed, shipped. None of them can move while all three tips stand still.
+#[derive(Clone, PartialEq)]
+struct WorkflowIdentity {
+    tip: String,
+    base_tip: String,
+    default_tip: String,
+}
+
+/// Per-worktree-path memo of the last computed [`WorkflowState`] and the tips it was computed from
+/// (bead `sparkle-4kh8w`).
+///
+/// WHY. `StatusFingerprint` includes `index_mtime_ms`, so **touching a file invalidates the whole
+/// fingerprint** — and the recompute that follows re-runs `workflow_state_shared`, ~15 of the ~23
+/// git subprocesses this agent costs, to re-derive an answer that could not have changed. Editing
+/// without committing is what a live agent does most of the time, so this is the common case, not
+/// the corner: the index mtime moves every few seconds while the tips sit still for minutes. Under
+/// the fork-lock analysis in `PRD/sparkle/ui-freeze-spawn-storm.md` those forks are what block the
+/// main thread's `malloc` inside the CoreAnimation commit.
+///
+/// STALENESS — and why this adds none. `in_parent` is derived from the PARENT branch's tip, which
+/// is not in the identity, so a parent that moves while this agent only edits will not be picked up
+/// until one of the three tips moves. That is not a regression: the pre-existing fingerprint skip
+/// does not track the parent tip either, so an agent that is fully idle is *already* served an
+/// equally stale `in_parent` — and it is served it while doing no work at all. This path is
+/// strictly better than the skip it sits next to.
+///
+/// PR STATE IS NEVER SERVED FROM HERE. `pr_state`/`pr_number`/`pr_url` come from `gh`, a
+/// server-side fact that moves no git ref, and `sparkle-prpb` exists precisely because a git-keyed
+/// cache cannot speak for it. The caller consults this memo ONLY when the gh probe is not due; when
+/// it is due the full recompute runs, exactly as before.
+fn workflow_cache() -> &'static Mutex<HashMap<String, (WorkflowIdentity, WorkflowState)>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, (WorkflowIdentity, WorkflowState)>>> =
+        OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -4659,6 +4815,10 @@ fn workflow_state_shared(
     default_branch: &str,
     has_origin: bool,
     tip: &str,
+    // The batch's `"<local>:<origin>"` target-tip pair, threaded down purely so `branch_landed` can
+    // be memoized against it (see `landed_cache`). `None` = don't cache; behaviour is identical
+    // either way, only the subprocess count differs.
+    target_tips: Option<&str>,
 ) -> WorkflowState {
     if tip.trim().is_empty() {
         return WorkflowState::default();
@@ -4667,7 +4827,7 @@ fn workflow_state_shared(
     let origin_ref = format!("origin/{default_branch}");
     let in_origin_main = ref_contains(root, &origin_ref, tip);
     let in_parent = ref_contains(root, parent_branch, tip);
-    let landed = branch_landed(root, default_branch, &branch, tip);
+    let landed = branch_landed_memo(root, default_branch, &branch, tip, target_tips);
     // Live Pushed signal (sparkle-v7d0) — a pure local, offline-safe remote-tracking-ref lookup.
     let pushed = branch_pushed(root, &branch);
     // Commits the agent AUTHORED that aren't yet landed (0 once merged into the integration ref).
@@ -4862,6 +5022,11 @@ pub fn project_agents_status_at(
             .as_deref()
             .map(|d| worktree_index_mtime_ms(d, &a.agent_id))
             .unwrap_or(0);
+        let wf_identity = WorkflowIdentity {
+            tip: tip.clone(),
+            base_tip: base_tip.clone(),
+            default_tip: default_tip.clone(),
+        };
         let fp = StatusFingerprint {
             tip: tip.clone(),
             base_tip,
@@ -4878,19 +5043,23 @@ pub fn project_agents_status_at(
         // out-of-band PR open flips "Open Pull Request" → "Merge PR #N" within the TTL instead of
         // never. `has_origin` confines this to polls that would actually run gh; the local-only /
         // no-probe path is byte-for-byte unchanged.
+        // Hoisted out of the skip below because the WORKFLOW memo needs the same answer: a due gh
+        // probe is the one condition under which `workflow_state_shared` must really re-run, since
+        // it is the only source of `pr_state` and no git tip can stand in for it.
+        let gh_probe_due = has_origin && {
+            let last_pr_probe = pr_probe_cache().lock().ok().and_then(|m| m.get(&wt_key).copied());
+            pr_reprobe_due(last_pr_probe, now)
+        };
+
         if !a.force {
             let fp_match = status_cache()
                 .lock()
                 .ok()
                 .map(|c| c.get(&wt_key).map(|prev| *prev == fp).unwrap_or(false))
                 .unwrap_or(false);
-            if fp_match {
-                let last_pr_probe =
-                    pr_probe_cache().lock().ok().and_then(|m| m.get(&wt_key).copied());
-                if !(has_origin && pr_reprobe_due(last_pr_probe, now)) {
-                    out.push(skipped(&a.agent_id));
-                    continue;
-                }
+            if fp_match && !gh_probe_due {
+                out.push(skipped(&a.agent_id));
+                continue;
             }
         }
 
@@ -4926,12 +5095,51 @@ pub fn project_agents_status_at(
                 continue;
             }
         };
-        // A renamed ORCHESTRATOR would otherwise make every one of its workers read
-        // `inParent: false` — see `resolve_parent_branch`.
-        let parent_branch =
-            resolve_parent_branch(root, app_data, project_id, &a.parent_branch, &base_ref);
-        let workflow =
-            workflow_state_shared(root, &branch, &parent_branch, &default_branch, has_origin, &tip);
+        // THE INDEX-ONLY RECOMPUTE (bead `sparkle-4kh8w`). We are here because the fingerprint
+        // moved — but if only `index_mtime_ms` moved (the agent touched a file; its tip, its base
+        // and the default branch all stand still) then every signal `workflow_state_shared` derives
+        // is unchanged by construction, and re-deriving it costs ~15 git subprocesses per agent per
+        // tick for an answer already in hand. Reuse it, and pay only for `branch_status_with_base`
+        // above, which is the part an index change genuinely invalidates.
+        //
+        // Skipped entirely when the gh probe is due: `pr_state` is not a git fact and this memo
+        // must never speak for it (`sparkle-prpb`). `resolve_parent_branch` is inside the reuse
+        // too — it is 1-3 more subprocesses and only feeds `in_parent`, which is exactly what the
+        // memo is standing in for.
+        let cached_workflow = if gh_probe_due {
+            None
+        } else {
+            workflow_cache().lock().ok().and_then(|c| {
+                c.get(&wt_key)
+                    .filter(|(id, _)| *id == wf_identity)
+                    .map(|(_, w)| w.clone())
+            })
+        };
+        let workflow = match cached_workflow {
+            Some(w) => w,
+            None => {
+                // A renamed ORCHESTRATOR would otherwise make every one of its workers read
+                // `inParent: false` — see `resolve_parent_branch`.
+                let parent_branch =
+                    resolve_parent_branch(root, app_data, project_id, &a.parent_branch, &base_ref);
+                // `Some(&default_tip)`: the batch already built this pair once for the fingerprint,
+                // so the `branch_landed` memo is free here — and this is the caller that runs it
+                // ~35× every 15s, i.e. the whole reason that memo exists.
+                let w = workflow_state_shared(
+                    root,
+                    &branch,
+                    &parent_branch,
+                    &default_branch,
+                    has_origin,
+                    &tip,
+                    Some(&default_tip),
+                );
+                if let Ok(mut cache) = workflow_cache().lock() {
+                    cache.insert(wt_key.clone(), (wf_identity, w.clone()));
+                }
+                w
+            }
+        };
 
         if let Ok(mut cache) = status_cache().lock() {
             cache.insert(wt_key.clone(), fp);
@@ -5747,6 +5955,13 @@ pub fn remove_worktree_at(
     // Evict the PR-probe clock alongside the fingerprint so a reused worktree path re-probes
     // immediately on its first tick (sparkle-prpb).
     if let Ok(mut cache) = pr_probe_cache().lock() {
+        cache.remove(&wt_str);
+    }
+    // And the workflow memo, for the same reason and on the same key (sparkle-4kh8w). Leaving it
+    // would let a future agent that reused this worktree path be served the REMOVED agent's
+    // workflow state on its first tick — the identity is tips-only, so a fresh branch cut from the
+    // same base could match it.
+    if let Ok(mut cache) = workflow_cache().lock() {
         cache.remove(&wt_str);
     }
     // Serialize with the repo's other index/ref-mutating worktree ops — the case this lock's own
@@ -7177,6 +7392,101 @@ mod tests {
         git(root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok()
     }
 
+    /// A repo on `main` with an unmerged `feature` branch, plus the `"<local>:<origin>"` tip pair
+    /// the batch would hand the memo. Returns `(root, feature_tip, target_tips)`.
+    fn repo_with_unmerged_feature(tag: &str) -> (String, String, String) {
+        let r = init_repo(tag);
+        git(&r, &["checkout", "-q", "-b", "feature"]).unwrap();
+        git(&r, &["commit", "--allow-empty", "-m", "agent work"]).unwrap();
+        let tip = rev_parse_tip(&r, "feature");
+        // No origin in this fixture, so the origin half resolves empty — exactly what
+        // `project_agents_status_at` would build for a remoteless repo.
+        let tips = format!("{}:{}", rev_parse_tip(&r, "main"), rev_parse_tip(&r, "origin/main"));
+        (r, tip, tips)
+    }
+
+    /// The memo must ELIDE THE SUBPROCESSES, not merely return the same answer.
+    ///
+    /// Asserting only that two calls agree would pass against the un-memoized `branch_landed` as
+    /// well — the vacuous shape `AGENTS.md` warns about, where the assertion is already true before
+    /// the change. The subprocess count is the actual side effect the change exists to produce, so
+    /// that is what this asserts. The `after_first > before` line is the anti-vacuity guard: it
+    /// proves the cold call really forks, without which "the second forked nothing" would be
+    /// satisfied by a `branch_landed` that never forks at all.
+    #[test]
+    fn a_landed_memo_hit_forks_no_git_children() {
+        let (r, tip, tips) = repo_with_unmerged_feature("landed-memo-hit");
+
+        let before = git_spawns_on_this_thread();
+        let first = branch_landed_memo(&r, "main", "feature", &tip, Some(&tips));
+        let after_first = git_spawns_on_this_thread();
+        assert!(
+            after_first > before,
+            "PRECONDITION: the cold call must really shell out (forked {} children), \
+             otherwise the assertion below proves nothing",
+            after_first - before
+        );
+
+        let second = branch_landed_memo(&r, "main", "feature", &tip, Some(&tips));
+        assert_eq!(
+            git_spawns_on_this_thread(),
+            after_first,
+            "a memo HIT must fork ZERO git children — this is the entire point of the cache"
+        );
+        assert_eq!(first, second, "and it must still return the same answer");
+    }
+
+    /// The memo must not be a one-way latch. `main` advancing is precisely how a branch BECOMES
+    /// landed, so a cache that never re-ran on a moved target tip would freeze every agent's
+    /// "Merged" signal at whatever it read the first time — a worse bug than the cost it saves.
+    #[test]
+    fn a_moved_target_tip_invalidates_the_landed_memo() {
+        let (r, tip, tips) = repo_with_unmerged_feature("landed-memo-invalidate");
+
+        branch_landed_memo(&r, "main", "feature", &tip, Some(&tips));
+        let warm = git_spawns_on_this_thread();
+        branch_landed_memo(&r, "main", "feature", &tip, Some(&tips));
+        assert_eq!(git_spawns_on_this_thread(), warm, "sanity: the memo is warm");
+
+        // Land it: merge feature into main, which moves the LOCAL target tip.
+        git(&r, &["checkout", "-q", "main"]).unwrap();
+        git(&r, &["merge", "--no-ff", "-m", "land", "feature"]).unwrap();
+        let moved = format!("{}:{}", rev_parse_tip(&r, "main"), rev_parse_tip(&r, "origin/main"));
+        assert_ne!(moved, tips, "PRECONDITION: the merge must have moved the target tip");
+
+        let spawns_before = git_spawns_on_this_thread();
+        let landed = branch_landed_memo(&r, "main", "feature", &tip, Some(&moved));
+        assert!(
+            git_spawns_on_this_thread() > spawns_before,
+            "a changed target tip must force a real recompute, not serve the stale answer"
+        );
+        assert!(landed, "and the recomputed answer must see the branch as landed");
+    }
+
+    /// `target_tips: None` is the documented opt-out for the single-agent path. It must be a pure
+    /// pass-through — no cache read (which could serve a stale answer to a caller that asked for a
+    /// fresh one) and no cache write.
+    ///
+    /// TWO CONSECUTIVE `None` CALLS, and the repetition is the whole assertion. Warming with
+    /// `Some(tips)` and then calling `None` once proves nothing: the obvious wrong implementation
+    /// (`target_tips.unwrap_or("")`) ALSO forks there, because `""` simply fails to match the
+    /// stored pair. That version was written first and survived its own mutation. Calling `None`
+    /// twice is what separates the two: `unwrap_or("")` stores `""` on the first call and then
+    /// HITS on the second, while a true bypass forks both times.
+    #[test]
+    fn an_uncached_landed_call_always_forks() {
+        let (r, tip, _tips) = repo_with_unmerged_feature("landed-memo-none");
+
+        branch_landed_memo(&r, "main", "feature", &tip, None);
+        let after_first = git_spawns_on_this_thread();
+        branch_landed_memo(&r, "main", "feature", &tip, None);
+        assert!(
+            git_spawns_on_this_thread() > after_first,
+            "every None call must shell out — a second one served from cache means None is \
+             silently participating in the memo instead of bypassing it"
+        );
+    }
+
     // Regression: opening a project directory that is an ORPHANED git worktree — a `.git`
     // gitfile pointing at a `.git/worktrees/<name>` admin dir that has since been pruned — used to
     // dead-end with "git init failed: fatal: not a git repository: <gitdir>" because `git init`
@@ -8133,6 +8443,94 @@ mod tests {
         let after = project_agents_status_at(&r, "p1", &[input(false)], false, &app_data);
         assert!(after[0].changed, "a new commit re-evaluates");
         assert_eq!(after[0].branch.as_ref().unwrap().ahead, 2);
+    }
+
+    // sparkle-4kh8w: an agent that merely EDITS files bumps `index_mtime_ms`, which invalidates the
+    // whole `StatusFingerprint` and forces a full recompute — including `workflow_state_shared`,
+    // ~15 of the ~23 git subprocesses, re-deriving signals that cannot have moved because no tip
+    // moved. Editing without committing is what a live agent does most of the time, so this is the
+    // common tick, and those forks are what block the main thread's `malloc` (see
+    // `PRD/sparkle/ui-freeze-spawn-storm.md`).
+    //
+    // Asserted as a SUBPROCESS COUNT, not as "the answer is the same" — the answer is the same
+    // either way, so that assertion would hold against the un-memoized code and prove nothing.
+    #[test]
+    fn an_index_only_change_reuses_the_workflow_state_instead_of_reforking_it() {
+        let r = init_repo("batch-index-only");
+        let app_data = unique_root("batch-index-only-appdata");
+        let info = create_worktree_at(&r, "p1", "a1", "main", &app_data).unwrap();
+        let wt = info.path;
+        std::fs::write(format!("{wt}/w.txt"), "work").unwrap();
+        git(&wt, &["add", "."]).unwrap();
+        git(&wt, &["commit", "-q", "-m", "work"]).unwrap();
+
+        let input = || AgentStatusInput {
+            agent_id: "a1".into(),
+            base_branch: "main".into(),
+            parent_branch: String::new(),
+            kind: "build".into(),
+            force: false,
+        };
+
+        // Tick 1 — cold. Populates both caches.
+        let first = project_agents_status_at(&r, "p1", &[input()], false, &app_data);
+        assert!(first[0].changed, "first tick computes");
+        let workflow_before = first[0].workflow.as_ref().unwrap().in_local_main;
+
+        // An index-only tick: stage a file, never commit — no tip moves.
+        let stage_a_file = |n: u32| {
+            std::fs::write(format!("{wt}/dirty{n}.txt"), format!("uncommitted {n}")).unwrap();
+            git(&wt, &["add", "."]).unwrap();
+        };
+        // Measure one, returning (forks, result).
+        let mut tick = |n: u32| {
+            stage_a_file(n);
+            let before = git_spawns_on_this_thread();
+            let out = project_agents_status_at(&r, "p1", &[input()], false, &app_data);
+            (git_spawns_on_this_thread() - before, out)
+        };
+
+        // A — index-only, workflow memo AVAILABLE.
+        let (with_memo, a_out) = tick(1);
+
+        // B — index-only, workflow memo EVICTED. Everything else about the two ticks is identical:
+        // same shape, same repo, and in BOTH the tips stand still so the separate `branch_landed`
+        // memo hits either way and cancels out of the comparison. That is what makes this an A/B on
+        // the workflow memo alone. (An earlier draft compared an index tick against a TIP-moving
+        // tick and was VACUOUS: `branch_landed`'s memo already made the index tick cheaper, so the
+        // assertion passed with the workflow memo disabled.)
+        workflow_cache().lock().unwrap().clear();
+        let (without_memo, _) = tick(2);
+
+        // PRECONDITION, and the anti-vacuity guard. If the index change did NOT invalidate the
+        // fingerprint the agent is simply SKIPPED, its fork count is trivially tiny, and the
+        // comparison below would pass for a reason that has nothing to do with the memo.
+        assert!(
+            a_out[0].changed,
+            "PRECONDITION: staging a file must invalidate the fingerprint and force a recompute — \
+             otherwise this test proves nothing about the workflow memo"
+        );
+        assert!(
+            a_out[0].branch.as_ref().unwrap().dirty,
+            "PRECONDITION: the recompute must actually observe the staged file"
+        );
+
+        // Measured on this fixture when the memo landed: 15 forks with it, 24 with only
+        // `landed_cache` warm, 29 with neither — a ~48% cut on the tick a live agent spends most of
+        // its time in. Asserted as an inequality rather than against those constants so it tracks
+        // the property (the workflow half is skipped) and not one fixture's arithmetic.
+        assert!(
+            with_memo < without_memo,
+            "an index-only recompute must reuse the cached workflow state and so fork FEWER git \
+             children than the same tick with the memo evicted \
+             (with={with_memo}, without={without_memo})"
+        );
+        // And the reused state must be the state, not a default-constructed stand-in.
+        assert_eq!(
+            a_out[0].workflow.as_ref().unwrap().in_local_main,
+            workflow_before,
+            "the reused workflow state must carry the previously computed values"
+        );
     }
 
     // : a worktree whose directory SURVIVES but is no longer a git repo makes the batch's
