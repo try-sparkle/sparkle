@@ -10,7 +10,7 @@ import { describe, expect, it } from "vitest";
 import { deflateSync } from "node:zlib";
 import { Script, createContext } from "node:vm";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { CONCIERGE_DEFAULT_WIDTH, CONCIERGE_MIN_WIDTH } from "../../src/engine/columnResize.ts";
@@ -52,6 +52,27 @@ import {
   parseWidths as recapWidths,
   verdictFor as recapVerdict,
 } from "./recap-narrow-probe.mjs";
+// The two project-tab probes. Importing them is itself the coverage for their
+// `import.meta.url === argv[1]` main-guard: were that guard wrong, this import would try to launch
+// Chrome and the suite would hang rather than fail.
+import {
+  moved as tabMoved,
+  parseWidths as tabCrowdedWidths,
+  shrank as tabShrank,
+} from "./tab-crowded-probe.mjs";
+import {
+  CLICK_COMMIT_BUDGET,
+  CLICK_RESPONSE_BUDGET_MS,
+  CLICK_TAIL_BUDGET,
+  DEFAULT_WIDTHS as TAB_CLICK_DEFAULT_WIDTHS,
+  HOVER_RESPONSE_BUDGET_MS,
+  SETTLE_SLACK_MS,
+  TAB_EXPAND_DELAY_MS as PROBE_TAB_EXPAND_DELAY_MS,
+  gradeClick,
+  gradeHover,
+  parseArgs as tabClickArgs,
+  parseWidths as tabClickWidths,
+} from "./tab-click-probe.mjs";
 
 /** A tiny image with a known pixel at (x, y). */
 function img(width, height, fill = [0, 0, 0, 255]) {
@@ -1533,6 +1554,409 @@ describe("recap-narrow probe — the CLI contract", () => {
     // A bare `--widths` yields `true`, which `main()` must not treat as a width list — the guard
     // there is `args.widths ? … : DEFAULT_WIDTHS`, so this documents the shape it receives.
     expect(recapArgs(["--widths"])).toEqual({ widths: true });
+  });
+});
+
+// ── THE PROJECT-TAB PROBES ─────────────────────────────────────────────────────────────────────
+//
+// Bead sparkle-73imb: a click on a project tab blinked and often did not activate the tab. The
+// cause was the hovered tab's own box collapsing to ZERO HEIGHT — and the crowded-strip probe, which
+// owns the "expanding one tab must not move another" invariant, could not see it: it recorded
+// `left`/`width` only, on one axis, and skipped the expanded tab entirely. These pin the graders
+// that close both holes, against fabricated records so no browser is needed.
+describe("the crowded-strip probe watches BOTH axes", () => {
+  const tab = (id, over = {}) => ({ id, left: 0, width: 100, top: 10, height: 32, ...over });
+
+  it("reports a sibling that moved only on the CROSS axis — the half it used to be blind to", () => {
+    const before = [tab("a"), tab("b", { left: 100 })];
+    // `b` has not moved horizontally at all; its top edge has risen, which is what a shorter flex
+    // line looks like from a bottom-aligned sibling.
+    const after = [tab("a"), tab("b", { left: 100, top: 4, height: 26 })];
+    const out = tabMoved(before, after, "a");
+    expect(out.map((m) => m.id)).toEqual(["b"]);
+    expect(out[0].from.top).toBe(10);
+    expect(out[0].to.top).toBe(4);
+  });
+
+  it("still ignores sub-pixel drift and the tab that was deliberately expanded", () => {
+    const before = [tab("a"), tab("b", { left: 100 })];
+    const after = [tab("a", { height: 0 }), tab("b", { left: 100, top: 10.3 })];
+    expect(tabMoved(before, after, "a")).toEqual([]);
+  });
+
+  describe("shrank — the collapse of the EXPANDED tab, which moved() skips by construction", () => {
+    it("names the collapse that made the click miss", () => {
+      const before = [tab("a"), tab("b")];
+      const after = [tab("a", { height: 0 }), tab("b")];
+      expect(tabShrank(before, after, "a")).toEqual({ was: 32, now: 0 });
+    });
+
+    it("passes an unchanged height, sub-pixel noise, and a tab that grew", () => {
+      const before = [tab("a")];
+      expect(tabShrank(before, [tab("a")], "a")).toBeNull();
+      expect(tabShrank(before, [tab("a", { height: 31.7 })], "a")).toBeNull();
+      // An expansion is ALLOWED to be taller than the tab was; only losing height is the defect.
+      expect(tabShrank(before, [tab("a", { height: 48 })], "a")).toBeNull();
+    });
+
+    it("says nothing when the tab is missing from either side — that is moved()'s report to make", () => {
+      expect(tabShrank([], [tab("a")], "a")).toBeNull();
+      expect(tabShrank([tab("a")], [], "a")).toBeNull();
+    });
+  });
+});
+
+
+// ── THE PROBE'S OWN VERDICT LOGIC ──────────────────────────────────────────────────────────────
+//
+// Six review rounds on this probe, FOUR of them defects in exactly this grading — a negative
+// latency waved through as a pass, a contaminated origin, a negative folded into "over budget", a
+// floor graded against the wrong event. All four were found by a human reading the code, because
+// the grading lived inline behind a browser and a dev server. These are the rows that make the
+// next one cost a red test instead of a review round (roborev 62855).
+describe("the click probe's verdict logic", () => {
+  /** A healthy click: everything within budget and the selection landed. */
+  const OK_CLICK = {
+    commits: 3,
+    immediate: 3,
+    tail: 0,
+    responseMs: 2.7,
+    pressT: 100,
+    selected: "p3",
+    target: "p3",
+  };
+  /** A healthy hover: quiet, expanded the right tab, and took about one settle delay to do it. */
+  const OK_HOVER = {
+    commits: 1,
+    hoverTail: 0,
+    hoverResponseMs: 126,
+    firstMoveT: 100,
+    expandedT: 226,
+    expandedId: "p3",
+    target: "p3",
+  };
+
+  it("passes the measurements a healthy strip actually produces", () => {
+    expect(gradeClick(OK_CLICK)).toEqual([]);
+    expect(gradeHover(OK_HOVER)).toEqual([]);
+  });
+
+  describe("a MISSING measurement is never a pass", () => {
+    it("refuses a null click latency — as a measurement outcome, not as a wiring fault", () => {
+      const f = gradeClick({ ...OK_CLICK, responseMs: null });
+      expect(f).toHaveLength(1);
+      expect(f[0]).toContain("a missing measurement is not a pass");
+      expect(f[0]).not.toContain("was handed");
+    });
+
+    it("refuses a null hover latency the same way", () => {
+      const f = gradeHover({ ...OK_HOVER, hoverResponseMs: null });
+      expect(f).toHaveLength(1);
+      expect(f[0]).toContain("a missing measurement is not a pass");
+      expect(f[0]).not.toContain("was handed");
+    });
+
+    it("NAMES WHICH END was missing — a null latency has two causes that point at different code", () => {
+      // `responseMs` is null both when the click produced no commits and when the press stamp never
+      // landed; `hoverResponseMs` is null both when the pointer never moved and when the strip
+      // never expanded. A message printing only "responseMs=null" cannot tell a reader which, and
+      // the run's own output could not either (roborev 62885).
+      const noCommits = gradeClick({ ...OK_CLICK, commits: 0, immediate: 0, tail: 0, responseMs: null, pressT: 100 });
+      expect(noCommits.some((m) => m.includes("commits=0") && m.includes("__lastPressT=100"))).toBe(true);
+
+      const noStamp = gradeClick({ ...OK_CLICK, responseMs: null, pressT: null });
+      expect(noStamp.some((m) => m.includes("commits=3") && m.includes("__lastPressT=null"))).toBe(true);
+
+      const neverMoved = gradeHover({ ...OK_HOVER, hoverResponseMs: null, firstMoveT: null, expandedT: 226 });
+      expect(neverMoved.some((m) => m.includes("__firstMoveT=null") && m.includes("__expandedT=226"))).toBe(true);
+
+      const neverExpanded = gradeHover({ ...OK_HOVER, hoverResponseMs: null, firstMoveT: 100, expandedT: null });
+      expect(neverExpanded.some((m) => m.includes("__firstMoveT=100") && m.includes("__expandedT=null"))).toBe(true);
+    });
+
+    it("guards the REPORTING-only stamps too — a mis-wire there misnames the cause", () => {
+      // A dropped stamp key degrades the null-latency message to `__lastPressT=undefined`, which
+      // reads as "the harness never stamped the press" and sends the reader into the harness when
+      // the fault is the grader's own wiring. Guarding the two latencies and leaving the stamps was
+      // how "two of seven" came back as "three of ten" (roborev 62896).
+      for (const [grade, ok, key] of [
+        [gradeClick, OK_CLICK, "pressT"],
+        [gradeHover, OK_HOVER, "firstMoveT"],
+        [gradeHover, OK_HOVER, "expandedT"],
+      ]) {
+        const f = grade({ ...ok, [key]: undefined });
+        expect(f, `a missing ${key} was tolerated`).toHaveLength(1);
+        expect(f[0]).toContain(`${key}=undefined`);
+        expect(f[0]).toContain("was handed");
+      }
+      // …but an ABSENT stamp is a legitimate outcome, not a mis-wire: the browser simply never
+      // recorded one. Those must not be reported as the caller's fault.
+      expect(gradeClick({ ...OK_CLICK, responseMs: null, pressT: null })[0]).not.toContain(
+        "was handed",
+      );
+    });
+
+    it("pins the CALL SITES, which no test otherwise reaches", () => {
+      // `gradeClick`/`gradeHover` are called only from `measureWidth`, which is unexported and needs
+      // Chrome plus a dev server — so a dropped key there reds nothing. Read as source and check
+      // that each call literal names every key its signature destructures, the same way this file
+      // pins TAB_EXPAND_DELAY_MS against the component.
+      const src = readFileSync(new URL("./tab-click-probe.mjs", import.meta.url), "utf8");
+      for (const fn of ["gradeClick", "gradeHover"]) {
+        const sig = new RegExp(`export function ${fn}\\(\\{([^}]*)\\}`).exec(src);
+        expect(sig, `${fn} no longer takes a destructured object`).toBeTruthy();
+        const keys = sig[1]
+          .split(",")
+          .map((k) => k.split("=")[0].trim())
+          .filter(Boolean);
+        // ANCHORED ON THE SPREAD, which only a call site carries — `...gradeHover({` never appears
+        // in a declaration. The first version sliced the source at "const failures = [" and matched
+        // `gradeHover({`, which for the hover half landed on the DECLARATION (it sits after the
+        // slice point) and so asserted the signature contained its own keys: a tautology that
+        // passed however the real call was mangled. The ablation missed it because it only dropped
+        // a key from `gradeClick` — the half that worked. Check EACH site, not the change.
+        const call = new RegExp(`\\.\\.\\.${fn}\\(\\{([\\s\\S]*?)\\}\\)`).exec(src);
+        expect(call, `no call site found for ${fn}`).toBeTruthy();
+        // Belt and braces: whatever matched must not be the declaration.
+        expect(call[0], `${fn}'s "call site" is its declaration`).not.toContain("export function");
+        for (const k of keys) {
+          expect(call[1], `${fn}'s call site does not pass ${k}`).toContain(k);
+        }
+      }
+    });
+
+    it("treats a null COUNT as a wiring fault, since a count is never legitimately absent", () => {
+      // The asymmetry is deliberate: `measureWidth` computes counts from arrays it always has, so a
+      // null there can only mean the caller is wrong — whereas a null latency is the probe saying
+      // it declined to compute.
+      const f = gradeClick({ ...OK_CLICK, commits: null });
+      expect(f).toHaveLength(1);
+      expect(f[0]).toContain("commits=null");
+      expect(f[0]).toContain("was handed");
+    });
+
+    it("refuses an ABSENT one too — the mis-wire the object parameter made possible", () => {
+      // The guards key on `Number.isFinite`, not on `=== null`, and these are the rows that pin
+      // that. When the grading lived inline in `measureWidth`, a typo was a ReferenceError at the
+      // first run; passing an object means `gradeClick({ responseMs: responseMS })` or a caller
+      // that omits a key yields `undefined` — neither null, nor negative, nor over budget, so with
+      // a `=== null` guard it falls through every branch and grades as a PASS. Every other row in
+      // this table spells its keys correctly, so nothing else here can catch it.
+      const { responseMs: _dropped, ...clickMissingKey } = OK_CLICK;
+      const clickFailures = gradeClick(clickMissingKey);
+      expect(clickFailures).toHaveLength(1);
+      expect(clickFailures[0]).toContain("a missing measurement is not a pass");
+
+      const { hoverResponseMs: _also, ...hoverMissingKey } = OK_HOVER;
+      const hoverFailures = gradeHover(hoverMissingKey);
+      expect(hoverFailures).toHaveLength(1);
+      expect(hoverFailures[0]).toContain("a missing measurement is not a pass");
+    });
+
+    it("refuses NaN, and PRINTS it as NaN — not as null, which is a different cause", () => {
+      // `JSON.stringify(NaN)` is the string "null", so rendering the diagnostic that way made a
+      // NaN indistinguishable from a genuine null. They point at different code: a null means the
+      // probe DECLINED to compute because a stamp was missing; a NaN means the subtraction RAN, on
+      // something that was not a number (roborev 62873).
+      const c = gradeClick({ ...OK_CLICK, responseMs: NaN });
+      expect(c[0]).toContain("a missing measurement is not a pass");
+      expect(c[0]).toContain("responseMs=NaN");
+      const h = gradeHover({ ...OK_HOVER, hoverResponseMs: NaN });
+      expect(h[0]).toContain("hoverResponseMs=NaN");
+    });
+
+    it("refuses a missing COUNT as firmly as a missing latency — every numeric input, not two of them", () => {
+      // `undefined > BUDGET` is false for every budget in both graders, so an unguarded count key
+      // does not fail — it reports a strip that blinked twenty times as a clean pass. Guarding the
+      // two latencies and leaving the counts was two-sevenths of the wiring (roborev 62873).
+      for (const key of ["commits", "immediate", "tail"]) {
+        const { [key]: _dropped, ...missing } = OK_CLICK;
+        const f = gradeClick(missing);
+        expect(f, `gradeClick tolerated a missing ${key}`).toHaveLength(1);
+        expect(f[0]).toContain(`${key}=undefined`);
+      }
+      for (const key of ["commits", "hoverTail"]) {
+        const { [key]: _dropped, ...missing } = OK_HOVER;
+        const f = gradeHover(missing);
+        expect(f, `gradeHover tolerated a missing ${key}`).toHaveLength(1);
+        expect(f[0]).toContain(`${key}=undefined`);
+      }
+    });
+
+    it("says nothing ELSE when the wiring is broken — a partial verdict on bad input is a guess", () => {
+      // A blinking, non-landing strip whose `tail` key is mis-wired must report the wiring, not a
+      // half-graded verdict that a reader would act on.
+      const f = gradeClick({ ...OK_CLICK, tail: undefined, commits: 99, selected: "p1" });
+      expect(f).toHaveLength(1);
+      expect(f[0]).toContain("tail=undefined");
+    });
+  });
+
+  describe("a NEGATIVE latency is its own failure, never a pass and never 'over budget'", () => {
+    it("names the press for a click whose first commit preceded it", () => {
+      // THE REGRESSION THIS BRANCH SHIPPED ONCE. A release-origin latency went negative whenever
+      // anything committed on the press, and negative is neither null nor over budget — so the
+      // check reported OK while printing `respond=-8.0ms`.
+      const f = gradeClick({ ...OK_CLICK, responseMs: -8 });
+      expect(f).toHaveLength(1);
+      expect(f[0]).toContain("preceded the PRESS");
+      expect(f[0]).not.toContain("budget");
+    });
+
+    it("names the ORIGIN for a hover that 'expanded' before the settle delay could fire", () => {
+      const f = gradeHover({ ...OK_HOVER, hoverResponseMs: -14 });
+      expect(f).toHaveLength(1);
+      expect(f[0]).toContain("the ORIGIN of this measurement is wrong");
+      // The bug this replaced printed "the hover took -14.0ms … (budget 300ms)", which sends the
+      // reader after a slow strip when the truth is a broken measurement.
+      expect(f[0]).not.toContain("took -14.0ms");
+    });
+  });
+
+  describe("the settle floor and the budgets are separate verdicts on separate causes", () => {
+    it("reports a sub-floor hover as a wrong origin, not as a fast one", () => {
+      const f = gradeHover({
+        ...OK_HOVER,
+        hoverResponseMs: PROBE_TAB_EXPAND_DELAY_MS - SETTLE_SLACK_MS - 1,
+      });
+      expect(f).toHaveLength(1);
+      expect(f[0]).toContain("ORIGIN");
+    });
+
+    it("allows the slack immediately above the floor, for clock rounding", () => {
+      expect(
+        gradeHover({ ...OK_HOVER, hoverResponseMs: PROBE_TAB_EXPAND_DELAY_MS - SETTLE_SLACK_MS }),
+      ).toEqual([]);
+    });
+
+    it("reports a genuinely slow hover against the budget", () => {
+      const f = gradeHover({ ...OK_HOVER, hoverResponseMs: HOVER_RESPONSE_BUDGET_MS + 1 });
+      expect(f).toHaveLength(1);
+      expect(f[0]).toContain(`budget ${HOVER_RESPONSE_BUDGET_MS}ms`);
+      expect(f[0]).not.toContain("ORIGIN");
+    });
+
+    it("reports a genuinely slow click against its own budget", () => {
+      const f = gradeClick({ ...OK_CLICK, responseMs: CLICK_RESPONSE_BUDGET_MS + 1 });
+      expect(f).toHaveLength(1);
+      expect(f[0]).toContain(`budget ${CLICK_RESPONSE_BUDGET_MS}ms`);
+    });
+  });
+
+  describe("the two halves of the founder's report", () => {
+    it("fails a click that did not LAND, however cheap it was", () => {
+      // The dropped click. Cost is irrelevant if the tab never became active.
+      const f = gradeClick({ ...OK_CLICK, commits: 1, immediate: 1, selected: "p1" });
+      expect(f).toHaveLength(1);
+      expect(f[0]).toContain("the click did not land");
+    });
+
+    it("fails a hover that expanded NOTHING, which is what a zero tail otherwise rewards", () => {
+      // The vacuity guard: a tail budget of zero is satisfied perfectly by a hover that did
+      // nothing at all, which is precisely the broken state.
+      const f = gradeHover({ ...OK_HOVER, commits: 0, hoverTail: 0, expandedId: "" });
+      expect(f.some((m) => m.includes("never expanded p3"))).toBe(true);
+    });
+
+    // ── THE STATES `measureWidth` ACTUALLY EMITS ────────────────────────────────────────────────
+    //
+    // The two rows above each pair a broken field with a HEALTHY latency, which is a combination
+    // the probe cannot produce: `responseMs` is null exactly when the click produced no commits,
+    // and `hoverResponseMs` is null exactly when nothing ever expanded. So they passed while an
+    // early return on null was suppressing the very verdicts they claim to pin — a true FAIL
+    // wearing a message about the grader's wiring instead of about the strip (roborev 62885).
+    it("still names the DROPPED CLICK when the latency is null, as it is for a click with no commits", () => {
+      const f = gradeClick({
+        ...OK_CLICK,
+        commits: 0,
+        immediate: 0,
+        tail: 0,
+        responseMs: null,
+        selected: "p1",
+      });
+      expect(f.some((m) => m.includes("the click did not land"))).toBe(true);
+      expect(f.some((m) => m.includes("a missing measurement is not a pass"))).toBe(true);
+      // The reader must not be sent after the grader's wiring when the STRIP is what broke.
+      expect(f.some((m) => m.includes("was handed"))).toBe(false);
+    });
+
+    it("still names the DEAD HOVER when the latency is null, as it is when nothing expanded", () => {
+      const f = gradeHover({
+        ...OK_HOVER,
+        commits: 0,
+        hoverTail: 0,
+        hoverResponseMs: null,
+        expandedId: "",
+      });
+      expect(f.some((m) => m.includes("never expanded p3"))).toBe(true);
+      expect(f.some((m) => m.includes("a missing measurement is not a pass"))).toBe(true);
+      expect(f.some((m) => m.includes("was handed"))).toBe(false);
+    });
+
+    it("fails a click whose commits keep arriving — the blink, counted", () => {
+      const f = gradeClick({
+        ...OK_CLICK,
+        commits: CLICK_COMMIT_BUDGET + 3,
+        immediate: 1,
+        tail: CLICK_TAIL_BUDGET + 2,
+      });
+      expect(f.some((m) => m.includes("click cost"))).toBe(true);
+      expect(f.some((m) => m.includes("after the click's FIRST commit"))).toBe(true);
+    });
+
+    it("fails a STILL pointer that never stops committing — the oscillation", () => {
+      const f = gradeHover({ ...OK_HOVER, hoverTail: 2 });
+      expect(f).toHaveLength(1);
+      expect(f[0]).toContain("a STILL pointer produced 2 commits");
+    });
+  });
+});
+
+describe("the click probe's settle delay is a MIRROR, and mirrors have to be pinned", () => {
+  it("matches the component's own exported TAB_EXPAND_DELAY_MS", () => {
+    // Read as SOURCE rather than imported: pulling in ProjectTabs.tsx would drag the whole
+    // component tree into a suite that otherwise needs no DOM. A regex over the export is enough to
+    // make the two numbers fail together, which is the only property that matters here.
+    const src = readFileSync(
+      new URL("../../src/components/ProjectTabs.tsx", import.meta.url),
+      "utf8",
+    );
+    const m = /export const TAB_EXPAND_DELAY_MS = (\d+)/.exec(src);
+    expect(m, "ProjectTabs.tsx no longer exports TAB_EXPAND_DELAY_MS — the probe's mirror is now "
+      + "mirroring nothing").toBeTruthy();
+    expect(Number(m[1])).toBe(PROBE_TAB_EXPAND_DELAY_MS);
+  });
+
+  it("keeps the hover budget above the delay it is built on, with slack that cannot hide a bad origin", () => {
+    // The budget's own doc says the settle delay is most of it. If the component's delay ever grew
+    // past the budget, the probe would fail a perfectly healthy strip while its message still told
+    // the caller how much of the budget was settle delay.
+    expect(HOVER_RESPONSE_BUDGET_MS).toBeGreaterThan(PROBE_TAB_EXPAND_DELAY_MS);
+    // The floor's slack is for clock rounding. A wrong origin is off by a whole CDP round-trip, so
+    // slack anywhere near the delay itself would let one hide inside it.
+    expect(SETTLE_SLACK_MS).toBeLessThan(PROBE_TAB_EXPAND_DELAY_MS / 4);
+  });
+});
+
+describe("the tab probes' CLI contract", () => {
+  it("parses --widths and --json the way both probes' docs promise", () => {
+    expect(tabClickArgs(["--widths=760,520", "--json"])).toEqual({
+      widths: "760,520",
+      json: true,
+    });
+    expect(tabClickWidths(undefined)).toEqual(TAB_CLICK_DEFAULT_WIDTHS);
+    expect(tabClickWidths("760, 520")).toEqual([760, 520]);
+    expect(tabCrowdedWidths("380")).toEqual([380]);
+  });
+
+  it("REFUSES an unusable --widths rather than silently falling back to the default", () => {
+    // `null` is the signal `main()` turns into exit 2. Falling back to the defaults here would run
+    // a different measurement than the one that was asked for and report it as that one. A bare
+    // `--widths` (no value) arrives as `true`, which is the shape the flag parser produces.
+    for (const bad of [true, "wide", "0", "-1", "", "760,zero"]) {
+      expect(tabClickWidths(bad)).toBeNull();
+      expect(tabCrowdedWidths(bad)).toBeNull();
+    }
   });
 });
 

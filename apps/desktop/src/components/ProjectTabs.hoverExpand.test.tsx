@@ -36,6 +36,7 @@
 // a change that starts restyling the neighbours reds this file.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { Profiler } from "react";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { StatusBand } from "../engine/buildSections";
 import {
@@ -69,11 +70,27 @@ const SIX = [
  *  reports 0 for every rect, so the one tab under test is stubbed to a believable squeezed width. */
 const SQUEEZED_W = 90;
 
-function stubTabWidth(id: string, width: number): void {
+/** The height a tab has in a real browser — 8px padding either side of a 14px icon row plus the
+ *  border. Overridable per test so an assertion can name a height that appears NOWHERE in the
+ *  component, which is what makes "the frozen height was MEASURED" provable rather than assumed. */
+const TAB_H = 34;
+
+function stubTabWidth(id: string, width: number, height: number = TAB_H, left = 0): void {
   const el = screen.getByTestId(`tab-${id}`);
   el.getBoundingClientRect = () =>
     ({
-      x: 0, y: 0, width, height: 34, top: 0, left: 0, right: width, bottom: 34,
+      x: left, y: 0, width, height, top: 0, left, right: left + width, bottom: height,
+      toJSON: () => ({}),
+    }) as DOMRect;
+}
+
+/** The strip's own box. The expansion's ANCHOR is decided by comparing the tab's midpoint with
+ *  this one's, so a test about which edge a tab grows from has to pin it. */
+function stubBar(width: number): void {
+  const bar = document.querySelector('[role="tablist"]') as HTMLElement;
+  bar.getBoundingClientRect = () =>
+    ({
+      x: 0, y: 0, width, height: TAB_H, top: 0, left: 0, right: width, bottom: TAB_H,
       toJSON: () => ({}),
     }) as DOMRect;
 }
@@ -127,6 +144,38 @@ function renderTabs(overrides: Partial<Parameters<typeof ProjectTabs>[0]> = {}) 
     />,
   );
   return { onSelect, onTogglePin, onClose };
+}
+
+/**
+ * Render the strip inside a `Profiler` so a test can count the COMMITS an interaction costs.
+ *
+ * The counter is the instrument for the blinking half of bead sparkle-73imb: a settle that changes
+ * nothing must cost nothing. It is trustworthy here because nothing else in the hover path sets
+ * state — `wantId` is a ref — so a commit during a stationary-pointer storm has exactly one
+ * possible source, the hover-expand state itself.
+ */
+function renderCounted(overrides: Partial<Parameters<typeof ProjectTabs>[0]> = {}) {
+  const commits = { n: 0 };
+  render(
+    <Profiler
+      id="strip"
+      onRender={() => {
+        commits.n += 1;
+      }}
+    >
+      <ProjectTabs
+        projects={SIX}
+        selectedProjectId="sparkle"
+        pinnedProjectId={null}
+        countsByProject={{}}
+        onSelect={vi.fn()}
+        onTogglePin={vi.fn()}
+        onClose={vi.fn()}
+        {...overrides}
+      />
+    </Profiler>,
+  );
+  return commits;
 }
 
 /** Hover a tab and let the settle delay elapse. */
@@ -199,6 +248,177 @@ describe("hovering a crowded tab reveals its full name", () => {
     }
   });
 
+  it("freezes the slot's HEIGHT too, so an out-of-flow body cannot collapse it to zero", () => {
+    // THE BUG THE FOUNDER REPORTED (bead sparkle-73imb): *"when I click on a project tab, it just
+    // blinks a lot of times and oftentimes does not become the active tab."*
+    //
+    // The strip aligns its tabs `flex-end`, NOT `stretch`, so a slot is sized purely by its in-flow
+    // content — and the body asserted out of flow two tests up is the slot's ONLY in-flow child.
+    // Freezing the width alone therefore left the slot at ZERO HEIGHT the instant it expanded
+    // (measured in a real browser: h:32 → h:0). A zero-height tab is not under the pointer, so the
+    // browser fires `mouseout`, the strip collapses, the height returns and `mouseover` fires again
+    // — the oscillation is the blinking — and a press landing in a zero-height frame hit-tests to
+    // the strip BEHIND the tab, which is the dropped click.
+    //
+    // 41 is deliberate: it appears nowhere in the component, so the only way the slot can carry it
+    // is by having MEASURED this rect. A hard-coded height would fail this test.
+    renderTabs();
+    stubTabWidth("foundry", SQUEEZED_W, 41);
+
+    hover("foundry");
+
+    const tab = screen.getByTestId("tab-foundry");
+    // Asserted TOGETHER on purpose: the height matters precisely in the state where nothing in flow
+    // supplies one. Either half alone says nothing about the collapse.
+    expect(screen.getByTestId("tab-body-foundry").style.position).toBe("absolute");
+    expect(tab.style.height).toBe("41px");
+  });
+
+  it("refuses to expand a tab it could not MEASURE, rather than freezing a zero", () => {
+    // The freeze is self-confirming — a slot pinned at `height: 0px` measures that zero back
+    // forever — so an expansion captured before the strip has been laid out would be permanent.
+    // jsdom's all-zero rects are exactly that unmeasured case, so this needs no stub: it IS the
+    // condition. Failing open (no expansion) is the same doctrine `tabMinWidth` uses for a
+    // measured 0.
+    renderTabs();
+
+    hover("cinder");
+
+    const tab = screen.getByTestId("tab-cinder");
+    expect(tab.dataset.expanded).toBeUndefined();
+    expect(tab.style.height).toBe("");
+    expect(tab.style.flex).not.toContain("0px");
+  });
+
+  it("costs NO commit to re-settle on the tab that is already expanded", () => {
+    // The other half of the blinking, and the reason the state update is a functional, idempotent
+    // one. The ⚠ badge's portaled card makes the browser fire `mouseleave`/`mouseenter` on a tab
+    // with the pointer stationary — five pairs a second, measured. Each of those settles used to
+    // mint a fresh state object, and a fresh object re-renders the strip even though nothing about
+    // the expansion changed.
+    const commits = renderCounted();
+    stubTabWidth("foundry", SQUEEZED_W);
+    hover("foundry");
+    expect(screen.getByTestId("tab-foundry").dataset.expanded).toBe("true");
+
+    const before = commits.n;
+    const deltas: number[] = [];
+    // FIVE pairs — the rate the real-browser probe measured coming off the ⚠ badge in one second.
+    // The pointer never moves, so every one of these settles on the tab that is already expanded.
+    for (let i = 0; i < 5; i++) {
+      const round = commits.n;
+      fireEvent.mouseLeave(screen.getByTestId("tab-foundry"));
+      fireEvent.mouseEnter(screen.getByTestId("tab-foundry"));
+      settle();
+      deltas.push(commits.n - round);
+    }
+
+    expect(screen.getByTestId("tab-foundry").dataset.expanded).toBe("true");
+    // A STORM OF ANY LENGTH COSTS AT MOST ONE COMMIT. Before the functional update each pair minted
+    // a fresh state object and cost one commit apiece — five pairs, five commits, which is the
+    // flicker. The one commit still permitted is React's, not the strip's: the eager-state bailout
+    // needs the fiber to have no work left from the render that just expanded the tab, so the very
+    // first settle after an expansion re-renders once and discovers the state is identical. Every
+    // settle after that is free, which is what the per-round assertion below pins — a regression
+    // that reinstated per-settle churn would show as five ones, not one.
+    expect(commits.n - before).toBeLessThanOrEqual(1);
+    expect(deltas.slice(1)).toEqual([0, 0, 0, 0]);
+  });
+
+  it("refuses a tab with WIDTH but no HEIGHT — the half of the guard an all-zero rect cannot reach", () => {
+    // jsdom's rects are zero on both axes, so the test above is satisfied by the `r.width <= 0`
+    // term alone and says nothing about the `r.height <= 0` one — which is the term that matters,
+    // since a collapsed slot is exactly a box that still has its width (roborev 62807).
+    renderTabs();
+    stubTabWidth("foundry", SQUEEZED_W, 0);
+
+    hover("foundry");
+
+    const tab = screen.getByTestId("tab-foundry");
+    expect(tab.dataset.expanded).toBeUndefined();
+    expect(tab.style.height).toBe("");
+  });
+
+  it("RE-FREEZES when the tab's own width changes under it, rather than keeping a stale box", () => {
+    // The idempotency guard must not become "never update". The slot carries a `min-width` floor,
+    // so the width it ends up USING can exceed the basis that was frozen — and the only way the
+    // expansion converges on the real box is for the `width` term to notice and re-freeze
+    // (roborev 62807).
+    renderTabs();
+    stubTabWidth("foundry", SQUEEZED_W);
+    hover("foundry");
+    expect(screen.getByTestId("tab-foundry").style.flex).toBe(`0 0 ${SQUEEZED_W}px`);
+
+    // Same pointer, same tab; the box under it got wider.
+    stubTabWidth("foundry", SQUEEZED_W + 40);
+    fireEvent.mouseLeave(screen.getByTestId("tab-foundry"));
+    fireEvent.mouseEnter(screen.getByTestId("tab-foundry"));
+    settle();
+
+    expect(screen.getByTestId("tab-foundry").style.flex).toBe(`0 0 ${SQUEEZED_W + 40}px`);
+  });
+
+  it("RE-ANCHORS when the tab crosses the middle of the strip", () => {
+    // The other term of the same guard. A tab in the right half grows leftward and one in the left
+    // half grows rightward, so that the expansion stays inside the scroll container — and a strip
+    // that scrolled under a stationary pointer must be able to flip that decision.
+    renderTabs();
+    stubBar(400);
+    stubTabWidth("foundry", SQUEEZED_W, TAB_H, 10); // midpoint 55 — left half
+    hover("foundry");
+    expect(screen.getByTestId("tab-body-foundry").style.left).toBe("0px");
+
+    stubTabWidth("foundry", SQUEEZED_W, TAB_H, 300); // midpoint 345 — right half
+    fireEvent.mouseLeave(screen.getByTestId("tab-foundry"));
+    fireEvent.mouseEnter(screen.getByTestId("tab-foundry"));
+    settle();
+
+    const body = screen.getByTestId("tab-body-foundry");
+    expect(body.style.right).toBe("0px");
+    expect(body.style.left).toBe("");
+  });
+
+  it("costs NO commit to FOCUS the tab the pointer already expanded — the press half of a click", () => {
+    // Every ordinary mouse click takes this path: pressing a tab focuses it, focus takes the
+    // immediate (no-delay) expand path, and the pointer has necessarily been hovering that same tab
+    // already. Measured in Chrome, that no-op settle was one of the four commits a click cost.
+    const commits = renderCounted();
+    stubTabWidth("foundry", SQUEEZED_W);
+    hover("foundry");
+    expect(screen.getByTestId("tab-foundry").dataset.expanded).toBe("true");
+
+    const before = commits.n;
+    fireEvent.focus(screen.getByTestId("tab-foundry"));
+
+    expect(screen.getByTestId("tab-foundry").dataset.expanded).toBe("true");
+    expect(commits.n).toBe(before);
+  });
+
+  it("costs NO commit to press and release a tab without dragging it", () => {
+    // A RATCHET, and honest about it: this passes against today's code both with and without an
+    // idempotent `setDrag`, because React's eager-state bailout already drops the null-over-null
+    // write. It is here to keep it that way — a future press-time state write (a pressed style, a
+    // gesture object promoted from a ref) would repaint the whole strip under the user's finger on
+    // the one interaction the founder reported as blinking, and this is what would catch it.
+    // Measured from the SECOND press onward, for the same reason the storm test is: React's
+    // eager-state bailout needs an idle fiber, so the first write after any other work still costs
+    // one render however identical it is. What must not happen is a cost that repeats forever.
+    const commits = renderCounted({ onReorder: vi.fn(), onTearOff: vi.fn() });
+    const tab = screen.getByTestId("tab-foundry");
+    const press = () => {
+      fireEvent.pointerDown(tab, { pointerId: 1, button: 0, clientX: 10, clientY: 5 });
+      fireEvent.pointerUp(tab, { pointerId: 1, button: 0, clientX: 10, clientY: 5 });
+    };
+
+    press();
+    const before = commits.n;
+    press();
+    press();
+    press();
+
+    expect(commits.n).toBe(before);
+  });
+
   it("expands the SELECTED tab too — the one that shows no name at all today", () => {
     // The selected tab in the screenshot rendered as ⚠155 and an ×, with the project name gone
     // entirely. Its badges are the widest of any tab, so it is the FIRST to lose its label, not the
@@ -246,6 +466,10 @@ describe("hovering a crowded tab reveals its full name", () => {
     const tab = screen.getByTestId("tab-foundry");
     expect(tab.dataset.expanded).toBeUndefined();
     expect(tab.style.flex).not.toContain(`${SQUEEZED_W}px`);
+    // The height freeze is released with the width. Honest about what this proves: it is already
+    // true of the code that had no height freeze at all, so it is the negative half — a guard
+    // against the fix degenerating into "always pin a height" — not a falsifiable assertion.
+    expect(tab.style.height).toBe("");
     expect(screen.getByTestId("tab-body-foundry").style.position).not.toBe("absolute");
     expect(screen.getByTestId("tab-label-foundry").style.maxWidth).toBe(`${TAB_LABEL_MAX_WIDTH}px`);
   });

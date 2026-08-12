@@ -713,13 +713,25 @@ export function ProjectTabs({
 
   // ── HOVER EXPANSION (bead sparkle-z24dl) ────────────────────────────────────────────────────
   //
-  // Which tab is expanded, the in-flow width it had at the moment it expanded, and which edge it
-  // grows from. Freezing the width is what makes the expansion cost the strip NOTHING: the tab
+  // Which tab is expanded, the in-flow BOX it had at the moment it expanded, and which edge it
+  // grows from. Freezing that box is what makes the expansion cost the strip NOTHING: the tab
   // keeps the exact footprint the flex line already gave it and its chrome goes out of flow, so no
   // sibling can move. A strip that reshuffles under the cursor is worse than truncation.
+  //
+  // BOTH AXES, and the height is not symmetry for its own sake — it is load-bearing (bead
+  // sparkle-73imb). `stripStyle` aligns tabs `flex-end`, NOT `stretch`, so a slot is sized purely by
+  // its in-flow content. Taking the body out of flow therefore left the slot with no in-flow content
+  // at all and its height collapsed to ZERO — measured in a real browser: a tab went from
+  // `{h: 32}` to `{h: 0}` the instant it expanded. A zero-height tab is not under the pointer, so
+  // the browser fired `mouseout` and the strip collapsed the expansion, which restored the height,
+  // which fired `mouseover` again — an oscillation that never terminates with the pointer perfectly
+  // still. That is both halves of the founder's report at once: the repeated commits ARE the
+  // blinking, and a press landing while the tab is zero-height hit-tests to the strip BEHIND it, so
+  // the click is dropped and the tab never becomes active.
   const [expanded, setExpanded] = useState<{
     id: string;
     width: number;
+    height: number;
     anchor: "left" | "right";
   } | null>(null);
   const hoverTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -780,6 +792,18 @@ export function ProjectTabs({
       const el = tabEls.current.get(id);
       if (!el) return;
       const r = el.getBoundingClientRect();
+      // REFUSE TO FREEZE AN UNMEASURED BOX. The freeze is SELF-CONFIRMING: once the slot carries
+      // `height: 0px` (or `flex: 0 0 0px`), every later measurement reads that frozen zero back and
+      // agrees with it, so a bad capture is permanent and no comparison further down can ever
+      // notice. Capture time is therefore the only place it can be stopped. A rect of zero means
+      // the strip has not been laid out yet — a hidden pane, or a programmatic focus landing before
+      // first layout — and an expansion frozen there is exactly the collapsed tab this whole
+      // mechanism exists to prevent. Same doctrine as `tabMinWidth`: a measured 0 is not a
+      // measurement, so fail OPEN and simply do not expand.
+      if (r.width <= 0 || r.height <= 0) {
+        setExpanded(null);
+        return;
+      }
       const b = barRef.current?.getBoundingClientRect();
       // GROW INWARD. A tab in the right half expands leftward and one in the left half expands
       // rightward, so the expansion stays inside the strip instead of being clipped by its own
@@ -787,7 +811,30 @@ export function ProjectTabs({
       // left-hand strip too — that one is `row-reverse`, so DOM order and visual order disagree
       // and any decision made from the array index would come out backwards there.
       const anchor = b && r.left + r.width / 2 > b.left + b.width / 2 ? "right" : "left";
-      setExpanded({ id, width: r.width, anchor });
+      // IDEMPOTENT. Re-settling on the tab that is ALREADY expanded must not mint a fresh state
+      // object: an unchanged expansion would otherwise re-render the strip on every settle, which
+      // is the churn this component's own comment above describes arriving five times a second. The
+      // functional form is what makes the comparison safe — `settleNow` runs from a timer callback,
+      // so reading `expanded` from the enclosing scope would test a stale value.
+      //
+      // `width` is the term that does real work, and `height` is deliberately absent — they are not
+      // symmetric. The slot also carries `minWidth: tabMinWidth(...)`, so when the floor exceeds the
+      // frozen basis the USED width is the floor and `r.width` comes back LARGER than what was
+      // frozen; the guard falls through, re-freezes to the used width, and converges. The height has
+      // no such floor: while frozen the slot IS `height: prev.height`, so `r.height === prev.height`
+      // identically and the term could only ever be a tautology. Do not read its absence as a
+      // safety property — no comparison placed here could detect a stale height, which is precisely
+      // why the zero guard above (the one place a bad height can be refused) is load-bearing.
+      //
+      // Written as two statements rather than one ternary so each half is a line a mutation can be
+      // applied to: a commented-out fragment of a conditional expression does not parse, and
+      // `mutation-check.sh` has no syntax gate for TS — it would run the unparseable mutant, see
+      // red, and report the site as covered when nothing had been tested.
+      setExpanded((prev) => {
+        const unchanged =
+          prev !== null && prev.id === id && prev.width === r.width && prev.anchor === anchor;
+        return unchanged ? prev : { id, width: r.width, height: r.height, anchor };
+      });
     }
   }
 
@@ -797,6 +844,17 @@ export function ProjectTabs({
     wantId.current = id;
     if (immediate) {
       clearHoverTimer();
+      // ALREADY EXPANDED ON THIS TAB — there is nothing to settle, so do not settle.
+      //
+      // This costs a commit on every ordinary mouse CLICK, which is not obvious: pressing a tab
+      // focuses it, `onFocus` takes this immediate path, and the pointer has necessarily been
+      // hovering the same tab already — so the settle it runs is a no-op that re-derives the state
+      // it is already in. The functional update below returns `prev` for it, but React's
+      // eager-state bailout needs the fiber to be idle, and directly after the expansion render it
+      // is not, so the no-op still costs one render. Measured in Chrome: it was 1 of the 4 commits
+      // a single click cost. `expanded` is safe to read here — unlike in `settleNow`, this runs
+      // from an event handler, so the value is the current render's.
+      if (expanded?.id === id) return;
       settleNow();
     } else {
       scheduleSettle(TAB_EXPAND_DELAY_MS);
@@ -1012,6 +1070,9 @@ export function ProjectTabs({
   function endGesture(e: ReactPointerEvent<HTMLDivElement>, commit: boolean): void {
     const g = gesture.current;
     gesture.current = null;
+    // Unconditional, and measured to be free: this runs on every pointerup, but for a plain click
+    // `drag` is already null and React's eager-state bailout drops the write without rendering.
+    // An idempotent functional form was tried here and changed nothing in either jsdom or Chrome.
     setDrag(null);
     try {
       if (g && e.currentTarget.hasPointerCapture(g.pointerId)) {
@@ -1159,7 +1220,16 @@ export function ProjectTabs({
               // still showing. It has to live here rather than on the label — see `tabMinWidth`,
               // which is also where the measured 0 fallback (no floor at all) is explained.
               minWidth: tabMinWidth(m.chrome, m.natural, active),
-              ...(exp ? { flex: `0 0 ${exp.width}px`, zIndex: TAB_EXPANDED_Z } : {}),
+              // THE HEIGHT is the other half of the freeze, and without it the slot collapses to
+              // zero the moment the body below goes out of flow — see the `expanded` state's own
+              // comment for the measured oscillation and dropped click that causes.
+              ...(exp
+                ? {
+                    flex: `0 0 ${exp.width}px`,
+                    height: exp.height,
+                    zIndex: TAB_EXPANDED_Z,
+                  }
+                : {}),
             }}
           >
             <div

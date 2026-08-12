@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Project tabs — click responsiveness probe</title>
+  </head>
+  <body>
+    <!--
+      A REAL-BROWSER PAGE for counting what one click on a project tab costs (bead sparkle-73imb:
+      *"when I click on a project tab, it just blinks a lot of times and oftentimes does not become
+      the active tab"*).
+
+      It exists because jsdom UNDERCOUNTS this specific interaction, and undercounts it in the exact
+      places the bug is suspected to live. Every rect is zero there, so the hover-expand's measured
+      width never changes; `scrollWidth` is zero, so the strip's layout-effect metrics never change
+      and the re-render they would cause never happens; and `scrollIntoView` is not implemented at
+      all, so the scroll a selection triggers — which can move a tab out from under the pointer and
+      restart the whole hover cycle — is invisible. A jsdom count is therefore a LOWER BOUND on the
+      real one. See tab-click-probe.mjs.
+    -->
+    <div id="root"></div>
+    <script type="module" src="./tab-click-harness.jsx"></script>
+  </body>
+</html>

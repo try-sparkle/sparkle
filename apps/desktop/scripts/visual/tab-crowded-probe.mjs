@@ -119,8 +119,12 @@ const MEASURE = `(() => {
       id,
       active: t.getAttribute("aria-selected") === "true",
       expanded: t.getAttribute("data-expanded") === "true",
-      // The SLOT's box — what must not move when a sibling expands.
+      // The SLOT's box — what must not move when a sibling expands. BOTH AXES: this recorded
+      // left/width only, and the tab-click bug (bead sparkle-73imb) lived precisely in the axis it
+      // was not looking at — the expanding tab's own height collapsing to zero, which moved every
+      // bottom-aligned sibling's top edge and dropped the click that landed on it.
       left: r.left, width: r.width,
+      top: r.top, height: r.height,
       // The LABEL's rendered width vs the width its text actually needs. clientWidth < scrollWidth
       // is the definition of "this name is being clipped".
       labelWidth: lr.width,
@@ -169,11 +173,42 @@ export function moved(before, after, except) {
       out.push({ id: t.id, reason: "disappeared" });
       continue;
     }
-    if (Math.abs(was.left - t.left) > 0.5 || Math.abs(was.width - t.width) > 0.5) {
-      out.push({ id: t.id, from: { left: was.left, width: was.width }, to: { left: t.left, width: t.width } });
+    // BOTH AXES. A sibling's top edge moving is just as much a reflow as its left edge moving, and
+    // with `align-items: flex-end` it is what a change in the LINE's height looks like from here.
+    if (
+      Math.abs(was.left - t.left) > 0.5 ||
+      Math.abs(was.width - t.width) > 0.5 ||
+      Math.abs(was.top - t.top) > 0.5 ||
+      Math.abs(was.height - t.height) > 0.5
+    ) {
+      out.push({
+        id: t.id,
+        from: { left: was.left, width: was.width, top: was.top, height: was.height },
+        to: { left: t.left, width: t.width, top: t.top, height: t.height },
+      });
     }
   }
   return out;
+}
+
+/**
+ * Did the EXPANDED tab keep its own box height? — the one thing `moved()` cannot answer, because the
+ * expanded tab is exactly the tab it skips.
+ *
+ * This is the detector for bead sparkle-73imb. The expansion takes the tab's body out of flow, and
+ * the slot left behind has no in-flow content at all; if nothing restores its height it collapses to
+ * zero, the pointer is no longer over the tab, and the strip oscillates between expanded and
+ * collapsed while a click pressed into that gap hit-tests to the strip behind it. Returns `null`
+ * when the height held, or `{ was, now }` when it did not.
+ */
+export function shrank(before, after, id) {
+  const was = before.find((t) => t.id === id);
+  const now = after.find((t) => t.id === id);
+  if (!was || !now) return null;
+  // Half a pixel of slack, the same as `moved()`: this is about a collapse, not about sub-pixel
+  // rounding. GROWING is not a failure — an expansion is allowed to be taller if its content is.
+  if (now.height + 0.5 < was.height) return { was: was.height, now: now.height };
+  return null;
 }
 
 /** Did the expanded tab actually reveal its whole name? */
@@ -200,6 +235,14 @@ export function verdictFor(width, m) {
     if (!revealed(hovered)) {
       failures.push(
         `hovering ${probe.id} (${probe.which}) did not reveal its name: label ${hovered?.labelWidth?.toFixed(1)}px vs ${hovered?.labelNatural}px needed, expanded=${hovered?.expanded}`,
+      );
+    }
+    const collapsed = shrank(probe.before.tabs, probe.after.tabs, probe.id);
+    if (collapsed) {
+      failures.push(
+        `expanding ${probe.id} COLLAPSED its own box: ${collapsed.was.toFixed(1)}px tall -> ` +
+          `${collapsed.now.toFixed(1)}px. A tab with no height is not under the pointer, so the ` +
+          `hover oscillates and a click pressed onto it hit-tests to the strip behind (sparkle-73imb)`,
       );
     }
     const shifted = moved(probe.before.tabs, probe.after.tabs, probe.id);

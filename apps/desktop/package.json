@@ -20,6 +20,7 @@
     "visual:recap-narrow": "node scripts/visual/recap-narrow-probe.mjs",
     "visual:row-narrow": "node scripts/visual/row-narrow-probe.mjs",
     "visual:tab-crowded": "node scripts/visual/tab-crowded-probe.mjs",
+    "visual:tab-click": "node scripts/visual/tab-click-probe.mjs",
     "visual": "pnpm visual:capture && pnpm visual:compare",
     "lint": "eslint src --max-warnings 12",
     "typecheck": "tsc --noEmit",
