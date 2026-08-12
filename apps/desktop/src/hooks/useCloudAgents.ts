@@ -29,7 +29,12 @@ export function useCloudAgentsEnabled(): boolean {
  *  the Settings section to deep-link to for a self-serve fix. */
 export function useCloudGate(): CloudGate {
   const signedIn = useAuthStore((s) => s.tokenPresent);
-  const balanceCents = useAuthStore((s) => s.me?.balanceCents ?? 0);
+  // NULL, NOT ZERO — `?? 0` here stated as fact a balance nobody had fetched. `authStore.me` starts
+  // null and is filled only by an async `/me`, and it is persisted ONLY when entitled, so this hook
+  // renders at least one frame — and, for a funded non-entitled account or a failed probe, every
+  // frame — with no balance at all. See the credits check in `evaluateCloudGate` for why unknown
+  // must not refuse. A real zero still arrives as a number and still blocks.
+  const balanceCents = useAuthStore((s) => s.me?.balanceCents ?? null);
   // THE SERVER'S OWN FLOOR, TRANSPORTED — not a second copy of the rule. Without it this gate falls
   // back to CLOUD_MIN_START_CENTS (1¢, "obviously empty") while the cost line quotes the server's
   // real floor, so a 50¢ balance reads "You need $1.00 to start" under a LIVE Start button and the

@@ -874,7 +874,11 @@ async function readCloudGate() {
     // `POST /sessions/start` is the definitive check and refuses with the server's own reason.
     authConfigured:
       useCloudAuthStore.getState().method != null || !useCloudAuthStore.getState().loaded,
-    balanceCents: me?.balanceCents ?? 0,
+    // NULL, NOT ZERO. The `?? lastKnown` above covers a refresh that CLEARED a balance we once had;
+    // this covers never having had one (a cold, funded, non-entitled account persists no `me`), for
+    // which there is no last-known to fall back to. Both endings must be "we did not learn it",
+    // never "it is zero" — see the credits check in `evaluateCloudGate`.
+    balanceCents: me?.balanceCents ?? null,
     // The server's own start floor, transported — see the identical note in `useCloudGate`. The
     // concierge must refuse on the same number the dialog's cost line quotes, or "you need $1.00 to
     // start" and a tool that happily starts are two answers to one question. Absent falls back to

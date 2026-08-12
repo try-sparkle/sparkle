@@ -252,6 +252,37 @@ describe("NewAgentButtons — a COLD auth store is not evidence of missing auth"
     expect(cloudBtn().disabled).toBe(false);
   });
 
+  // THE SAME RULE, ON THE OTHER INPUT. The test above covers an unprobed CREDENTIAL; this covers an
+  // unprobed BALANCE, which is the arm that kept `?? 0` and so turned "we have not fetched /me" into
+  // "you are broke". It is specific to this control being ALWAYS RENDERED: the dialog that used to
+  // own this gate probed on open, so by the time anyone saw the block a balance existed.
+  //
+  // `me: null` with a token present is the ordinary first frame, and it is also the STEADY state for
+  // a funded non-entitled account — authStore persists `me` only when entitled, so nothing hydrates
+  // and a failed /me never retries.
+  it("an unfetched /me leaves the button USABLE rather than falsely broke", () => {
+    useAuthStore.setState({ me: null, tokenPresent: true });
+    useCloudAuthStore.setState({ method: "byok", loaded: true });
+
+    render(<NewAgentButtons onLocalClick={() => {}} projectId={PROJECT} />);
+
+    expect(cloudBtn().disabled).toBe(false);
+    expect(screen.queryByTestId("new-cloud-agent-reason")).toBeNull();
+  });
+
+  // THE PAIRED CASE, so the one above cannot pass for the wrong reason. If it went green because
+  // this surface had stopped blocking on credits at all, a MEASURED zero in the identical setup
+  // would go green too — and the empty-wallet deep-link would be gone for everyone.
+  it("...but a MEASURED zero in that same setup still blocks and deep-links", () => {
+    useAuthStore.setState({ me: me({ balanceCents: 0 }), tokenPresent: true });
+    useCloudAuthStore.setState({ method: "byok", loaded: true });
+
+    render(<NewAgentButtons onLocalClick={() => {}} projectId={PROJECT} />);
+
+    expect(cloudBtn().disabled).toBe(true);
+    expect(screen.getByTestId("new-cloud-agent-reason").textContent).toMatch(/credits/i);
+  });
+
   it("does NOT probe for a SIGNED-OUT user — the GET would be unauthenticated", async () => {
     // The probe used to also be gated on the advertised capability. That is gone, so signed-in is
     // the only condition left — and it is the one that mattered: without a bearer token the request

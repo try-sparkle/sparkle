@@ -189,6 +189,58 @@ describe("the credit floor is OBVIOUSLY-EMPTY only — the server owns the real 
   });
 });
 
+// A BALANCE NOBODY FETCHED IS NOT A BALANCE OF ZERO. This is the credits arm of the same rule the
+// auth arm already followed ("unprobed is unknown, and unknown is not 'no credential'"). It matters
+// because the gate moved onto an always-rendered control: it now runs on the first frame, before
+// any `/me`, so "absent reads as broke" is what an entitled user actually sees — and a `/me` that
+// FAILED never retries, so the block can last the whole sign-in.
+describe("an UNKNOWN balance does not refuse", () => {
+  it("passes the gate when the balance has not been looked up", () => {
+    expect(evaluateCloudGate({ signedIn: true, authConfigured: true, balanceCents: null })).toEqual({
+      ok: true,
+    });
+  });
+
+  // The server's floor is the number that would make a refusal *look* most justified, so pin that
+  // it is still not enough to refuse on a balance we never received.
+  it("passes even when the server stated a floor, since nothing was measured against it", () => {
+    expect(
+      evaluateCloudGate({
+        signedIn: true,
+        authConfigured: true,
+        balanceCents: null,
+        minStartCents: 1_000,
+      }),
+    ).toEqual({ ok: true });
+  });
+
+  // The whole value of unknown-≠-zero is that a REAL zero still blocks. If this passed too, the
+  // change would have bought a working button for the funded user by breaking the empty-wallet
+  // deep-link for everyone else.
+  it("still refuses a MEASURED zero — the distinction is the point", () => {
+    const g = evaluateCloudGate({ signedIn: true, authConfigured: true, balanceCents: 0 });
+    expect(g.ok).toBe(false);
+    if (!g.ok) expect(g.reason).toBe("insufficient_credits");
+  });
+
+  // ORDERING, not a blanket pass: an unknown balance skips only the credits check. A more
+  // fundamental block must still win, or "we haven't fetched /me" would silently paper over
+  // "you aren't signed in" and hand the user a button whose failure has no explanation.
+  it("does not let an unknown balance mask a more fundamental block", () => {
+    const out = evaluateCloudGate({
+      signedIn: false,
+      authConfigured: false,
+      balanceCents: null,
+    });
+    expect(out.ok).toBe(false);
+    if (!out.ok) expect(out.reason).toBe("signed_out");
+
+    const noAuth = evaluateCloudGate({ signedIn: true, authConfigured: false, balanceCents: null });
+    expect(noAuth.ok).toBe(false);
+    if (!noAuth.ok) expect(noAuth.reason).toBe("no_auth");
+  });
+});
+
 // THE AMOUNT, WHEN THE SERVER STATED ONE. Feeding this gate the server's floor also SUPPRESSES the
 // cost line that used to name it — the create dialog renders this block instead of the form — so a
 // generic sentence here would drop the one number the user needs to act on. With no server floor

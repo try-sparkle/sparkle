@@ -39,8 +39,14 @@ export interface CloudGateInput {
   signedIn: boolean;
   /** GET /claude-auth returned a method (a key/token is saved server-side). */
   authConfigured: boolean;
-  /** Current credit balance in cents (Me.balanceCents). */
-  balanceCents: number;
+  /**
+   * Current credit balance in cents (`Me.balanceCents`), or **null when nobody has looked it up
+   * yet** — `/me` has not resolved, or it resolved into a `me` this client does not hold.
+   *
+   * NULL IS NOT ZERO, and conflating the two is the bug this field's type exists to prevent. See
+   * the credits check in {@link evaluateCloudGate}.
+   */
+  balanceCents: number | null;
   /** Obviously-empty floor. Defaults to {@link CLOUD_MIN_START_CENTS} — deliberately NOT the
    *  server's real affordability rule; see that constant. */
   minStartCents?: number;
@@ -122,7 +128,25 @@ export function evaluateCloudGate(input: CloudGateInput): CloudGate {
       deepLink: "cloudauth",
     };
   }
-  if (input.balanceCents < minStart) {
+  // UNPROBED IS UNKNOWN, AND UNKNOWN IS NOT "BROKE" — the exact rule the `authConfigured` arm above
+  // already follows, applied to the other input that needed it. `me` is null in situations that are
+  // all evidence of *not having asked*, never of an empty wallet: `/me` is still in flight, it
+  // failed, or it succeeded for an account the store does not persist (only an ENTITLED `me` is
+  // cached, so a funded non-entitled user hydrates with nothing at all). Every caller used to spell
+  // this `me?.balanceCents ?? 0`, which converts all three into a definitive "you don't have enough
+  // credits" and deep-links a funded account to Credits it does not need.
+  //
+  // That was survivable while this gate only ran when a dialog was deliberately OPENED — the open
+  // effect had already probed. It stopped being survivable when the gate moved onto an
+  // always-rendered control, which renders on the first frame, before any probe: the block is what
+  // the user sees, and since a failed `/me` never retries, it can persist for the whole sign-in.
+  //
+  // So an unknown balance declines to decide and lets the check ORDER carry on. `POST
+  // /sessions/start` is the definitive gate (see this file's header) and refuses with the server's
+  // own reason and its own number, so the cost of guessing wrong here is one honest round-trip —
+  // against a permanently dead button for someone who can pay, which is the failure this whole
+  // module is written to avoid.
+  if (input.balanceCents !== null && input.balanceCents < minStart) {
     return {
       ok: false,
       reason: "insufficient_credits",
