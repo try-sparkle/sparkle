@@ -37,7 +37,6 @@ vi.mock("@tauri-apps/plugin-opener", () => ({
   revealItemInDir: vi.fn(() => Promise.resolve()),
 }));
 vi.mock("./LogoWaveform", () => ({ LogoWaveform: () => null }));
-vi.mock("./StatusBar", () => ({ StatusBar: () => null }));
 vi.mock("./HistorySearch", () => ({ HistorySearch: () => null }));
 
 // THE PROBE. Spread the real module — it also exports `AGENT_NAME_FONT_SIZE` and `rowTitleWeight`,

@@ -66,6 +66,28 @@ export interface ClaudeExecOpts {
    *  child process, never Sparkle's own env. Absent → claude uses its default (`~/.claude` or the
    *  inherited `$CLAUDE_CONFIG_DIR`), preserving today's behavior for users who never set this up. */
   configDir?: string;
+  /** Export `BD_READONLY=1` into the child so every `bd` (beads) call it makes is read-only — bd
+   *  refuses close/update/create/label with "operation '…' is not allowed in read-only mode" (exit
+   *  1) while `bd show`/`bd list` still work. Confined to the child, like the PATH/CLAUDE_CONFIG_DIR
+   *  exports — never leaked into Sparkle's own env.
+   *
+   *  CURRENTLY UNUSED IN PRODUCTION, DELIBERATELY. Do NOT set it for worker agents — that is what
+   *  this doc used to say, and it was wrong (roborev 62900, High; bead sparkle-x5xn0).
+   *
+   *  The motivation is sound: every worktree shares one Dolt beads DB, so an unrestricted worker CAN
+   *  close or supersede a bead another agent is working on. But "workers don't own bead state" is
+   *  false for two writes their own personas MANDATE, and this flag refuses both:
+   *    1. Retro filing — `workerPersona()` requires `file-retro-pain-point.sh` per pain point, which
+   *       writes via `retro-beads.sh` (`bd create`/`comment`/`update`). That script has no read-only
+   *       awareness, so a refusal reports `parked-create`/`unfiled:lost`, and the persona then tells
+   *       the worker those are DEFERRED and will be re-filed — false when every retry is refused.
+   *    2. Peer coordination — AGENTS.md names `bd comment <id> "taking <files>"` as THE cross-agent
+   *       channel, because SendMessage cannot reach a peer agent.
+   *
+   *  Carve those two writes out first (see sparkle-x5xn0), and land the re-enabling WITH the test
+   *  the design spec already mandates: spawn a worker, assert `BD_READONLY=1` is in its env,
+   *  mutation-checked to red when the flag is removed. */
+  beadsReadonly?: boolean;
 }
 
 /** Build the `exec …` string passed to `zsh -l -c`. Appends `--continue` only
@@ -154,7 +176,10 @@ export function buildClaudeExec(
   const configExport = opts.configDir
     ? `export CLAUDE_CONFIG_DIR=${shellQuote(opts.configDir)}; `
     : "";
-  return `${configExport}export PATH="$HOME/.local/bin:$PATH"; ${cmd}`;
+  // BD_READONLY confines the child's `bd` writes (worker sandboxes). Exported alongside PATH/config
+  // so it applies to the child `claude` and everything it shells out to, never to Sparkle's own env.
+  const beadsReadonlyExport = opts.beadsReadonly ? `export BD_READONLY=1; ` : "";
+  return `${configExport}${beadsReadonlyExport}export PATH="$HOME/.local/bin:$PATH"; ${cmd}`;
 }
 
 /**

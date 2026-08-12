@@ -30,7 +30,6 @@ vi.mock("@tauri-apps/plugin-opener", () => ({
   revealItemInDir: vi.fn(() => Promise.resolve()),
 }));
 vi.mock("./LogoWaveform", () => ({ LogoWaveform: () => null }));
-vi.mock("./StatusBar", () => ({ StatusBar: () => null }));
 // NOT stubbed to null like the other suites: this one asserts the sidebar stops MOUNTING it, and a
 // null stub renders nothing either way, so the test would pass before the change too. A marker
 // element makes the difference observable. The two helper exports are re-declared because

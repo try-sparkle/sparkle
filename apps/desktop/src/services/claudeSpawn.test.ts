@@ -282,6 +282,33 @@ describe("buildClaudeExec ()", () => {
     });
     expect(cmd).toBe(`${PATH_PREFIX}exec '/bin/claude' --model 'claude-sonnet-5' -- 'go'`);
   });
+
+  // BD_READONLY sandboxes a worker's beads writes: all worktrees share one Dolt beads DB, so an
+  // unrestricted worker could close/supersede a bead another agent owns. bd refuses writes (exit 1)
+  // under BD_READONLY while reads still work. Confined to the child, like the PATH/config exports.
+  it("exports BD_READONLY=1 before PATH when beadsReadonly is set (worker sandbox)", () => {
+    const cmd = buildClaudeExec("/bin/claude", false, { beadsReadonly: true });
+    expect(cmd).toBe(`export BD_READONLY=1; ${PATH_PREFIX}exec '/bin/claude'`);
+  });
+
+  it("omits the BD_READONLY export by default (Build/Think agents keep beads write access)", () => {
+    expect(buildClaudeExec("/bin/claude", false)).not.toContain("BD_READONLY");
+    expect(buildClaudeExec("/bin/claude", false, { beadsReadonly: false })).not.toContain("BD_READONLY");
+  });
+
+  it("orders BD_READONLY after CLAUDE_CONFIG_DIR and combines with the worker spawn shape", () => {
+    // The real worker spawn sets configDir + auto-approve + mission prompt alongside beadsReadonly;
+    // pin the whole exported prefix so a later reorder of the export block is caught.
+    const cmd = buildClaudeExec("/bin/claude", false, {
+      configDir: "/acc/dir",
+      beadsReadonly: true,
+      dangerouslySkipPermissions: true,
+      initialPrompt: "do the task",
+    });
+    expect(cmd).toBe(
+      `export CLAUDE_CONFIG_DIR='/acc/dir'; export BD_READONLY=1; ${PATH_PREFIX}exec '/bin/claude' --dangerously-skip-permissions -- 'do the task'`,
+    );
+  });
 });
 
 describe("buildClaudeExec --mcp-config (orchestrator launch)", () => {

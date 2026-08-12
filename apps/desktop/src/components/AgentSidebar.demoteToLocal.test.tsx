@@ -24,7 +24,6 @@ vi.mock("@tauri-apps/plugin-opener", () => ({
   revealItemInDir: vi.fn(() => Promise.resolve()),
 }));
 vi.mock("./LogoWaveform", () => ({ LogoWaveform: () => null }));
-vi.mock("./StatusBar", () => ({ StatusBar: () => null }));
 vi.mock("./HistorySearch", () => ({ HistorySearch: () => null }));
 // A MARKER, not a null stub: one test below asserts the column actually MOUNTS the dialog, and a
 // null stub renders nothing either way — the assertion would pass against a sidebar that never

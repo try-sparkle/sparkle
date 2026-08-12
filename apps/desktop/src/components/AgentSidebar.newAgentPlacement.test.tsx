@@ -12,7 +12,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn() }));
 vi.mock("./LogoWaveform", () => ({ LogoWaveform: () => null }));
-vi.mock("./StatusBar", () => ({ StatusBar: () => null }));
 vi.mock("../services/workerSpawn", () => ({ spawnWorker: vi.fn() }));
 
 import { AgentSidebar } from "./AgentSidebar";

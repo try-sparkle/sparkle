@@ -73,14 +73,15 @@
 //     module would otherwise collapse into a bare `y\r` keystroke.
 // A cloud agent's picker is answered in its own pane, where the person can read the question.
 
-import {
-  PASTE_END,
-  PASTE_START,
-  PtyGoneError,
-  stripPasteMarkers,
-  submitPrompt,
-  writePtyChainedStrict,
-} from "../pty";
+// The paste markers and their filter come from the LEAF `../pasteMarkers`, not from `../pty` which
+// merely re-exports them. `pty` is stubbed wholesale by ~44 suites, and a wholesale vi.mock factory
+// replaces the module's entire export surface — so reaching `stripPasteMarkers` THROUGH `pty` makes
+// it `undefined` inside every one of those suites, silently dropping the guard while the tests stay
+// green. Two of this module's own suites already work around that by rebuilding the three names from
+// `importOriginal`; the leaf import removes the need. Enforced by
+// `sparkle-security/no-reexported-security-helper`.
+import { PASTE_END, PASTE_START, stripPasteMarkers } from "../pasteMarkers";
+import { PtyGoneError, submitPrompt, writePtyChainedStrict } from "../pty";
 import {
   describeAuthority,
   isDispatchAuthority,

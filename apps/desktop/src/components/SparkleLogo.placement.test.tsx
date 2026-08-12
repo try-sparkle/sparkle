@@ -36,7 +36,6 @@ vi.mock("@tauri-apps/plugin-opener", () => ({
 vi.mock("./LogoWaveform", () => ({
   LogoWaveform: () => <div data-testid="logo-waveform" />,
 }));
-vi.mock("./StatusBar", () => ({ StatusBar: () => null }));
 vi.mock("./HistorySearch", () => ({ HistorySearch: () => null }));
 vi.mock("../services/branchStatus", () => ({
   refreshAgentBranch: vi.fn(() => Promise.resolve({ ok: true })),

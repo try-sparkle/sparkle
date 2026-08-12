@@ -52,7 +52,6 @@ vi.mock("./AgentSidebar", () => ({ AgentSidebar: () => null }));
 // to its subject (WHERE the banner mounts) and honors its own header: all Tauri IO stubbed. The
 // badge's placement and refresh-on-mount are covered in SparkleLogo.placement.test.
 vi.mock("./BalanceBadge", () => ({ BalanceBadge: () => null }));
-vi.mock("./TopBar", () => ({ TopBar: () => null }));
 vi.mock("./AgentPane", () => ({ AgentPane: () => null }));
 vi.mock("./SparkleAgentPane", () => ({ SparkleAgentPane: () => null }));
 vi.mock("./ProjectModal", () => ({ ProjectModal: () => null }));

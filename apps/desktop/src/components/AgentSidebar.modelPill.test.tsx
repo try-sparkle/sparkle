@@ -12,7 +12,6 @@ vi.mock("@tauri-apps/plugin-opener", () => ({
   revealItemInDir: vi.fn(() => Promise.resolve()),
 }));
 vi.mock("./LogoWaveform", () => ({ LogoWaveform: () => null }));
-vi.mock("./StatusBar", () => ({ StatusBar: () => null }));
 vi.mock("./HistorySearch", () => ({ HistorySearch: () => null }));
 // The live-delivery service is the assertion target — the PTY layer must not be touched here.
 vi.mock("../services/agentModel", () => ({

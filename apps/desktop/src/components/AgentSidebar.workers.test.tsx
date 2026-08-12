@@ -13,7 +13,6 @@ vi.mock("@tauri-apps/plugin-opener", () => ({
   revealItemInDir: vi.fn(() => Promise.resolve()),
 }));
 vi.mock("./LogoWaveform", () => ({ LogoWaveform: () => null }));
-vi.mock("./StatusBar", () => ({ StatusBar: () => null }));
 vi.mock("./HistorySearch", () => ({ HistorySearch: () => null }));
 // The branch ops are what the Status pills call — mock them so a click is observable (and so no real
 // Tauri command fires). Both resolve ok:true so the success path (pollBranchStatus) is exercised too.

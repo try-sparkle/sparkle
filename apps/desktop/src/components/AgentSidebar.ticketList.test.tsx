@@ -23,7 +23,6 @@ vi.mock("../services/supportApi", async (orig) => ({
   ]),
 }));
 vi.mock("./LogoWaveform", () => ({ LogoWaveform: () => null }));
-vi.mock("./StatusBar", () => ({ StatusBar: () => null }));
 vi.mock("./HistorySearch", () => ({ HistorySearch: () => null }));
 
 import { AgentSidebar } from "./AgentSidebar";

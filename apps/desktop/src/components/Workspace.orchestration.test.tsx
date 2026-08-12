@@ -62,7 +62,6 @@ vi.mock("../services/sparkleAgent", () => ({
 
 // --- child components: stub out so their own Tauri/API calls don't interfere ---
 vi.mock("./AgentSidebar", () => ({ AgentSidebar: () => null }));
-vi.mock("./TopBar", () => ({ TopBar: () => null }));
 vi.mock("./OfflineBanner", () => ({ OfflineBanner: () => null }));
 vi.mock("./AgentPane", () => ({ AgentPane: () => null }));
 vi.mock("./SparkleAgentPane", () => ({ SparkleAgentPane: () => null }));

@@ -21,7 +21,6 @@ vi.mock("@tauri-apps/plugin-opener", () => ({
   revealItemInDir: vi.fn(() => Promise.resolve()),
 }));
 vi.mock("./LogoWaveform", () => ({ LogoWaveform: () => null }));
-vi.mock("./StatusBar", () => ({ StatusBar: () => null }));
 vi.mock("./HistorySearch", () => ({ HistorySearch: () => null }));
 vi.mock("../services/openProjectTab", () => ({ openProjectTab: vi.fn() }));
 // The Build chevron's SECOND press spawns a build agent (≡ the + button), and that is the half of

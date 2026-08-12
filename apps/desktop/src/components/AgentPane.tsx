@@ -777,6 +777,24 @@ function AgentPaneInner({
           // Workers run unattended in an isolated worktree: auto-approve every tool call so an
           // approval prompt can't silently deadlock the worker (and its waiting orchestrator).
           dangerouslySkipPermissions: true,
+          // NOT `beadsReadonly: true` — see bead sparkle-x5xn0 (roborev 62900, High).
+          //
+          // The reasoning for it is half right: every worktree shares one Dolt beads DB, so an
+          // unrestricted worker CAN close or supersede a bead another agent is working on, and
+          // workers do not own the work graph. But "workers don't own bead state" is false for two
+          // writes their own personas MANDATE, and `BD_READONLY=1` refuses both:
+          //   1. Retro filing. `workerPersona()` embeds `retroEmissionProtocol()`, which requires
+          //      `scripts/file-retro-pain-point.sh` per pain point. That runs `bd create/comment/
+          //      update` via `scripts/lib/retro-beads.sh`, which has NO read-only awareness — a
+          //      refusal falls into the generic dropped/parked branch and reports `parked-create` /
+          //      `unfiled:lost`. The persona then tells the worker those are DEFERRED and will be
+          //      re-filed, which is false when every retry is refused too. Workers are a large share
+          //      of the fleet, so this silently drains the improvement loop's main input.
+          //   2. Peer coordination. AGENTS.md names `bd comment <id> "taking <files>"` as THE
+          //      cross-agent channel precisely because SendMessage cannot reach a peer agent, and
+          //      parallel workers are exactly who needs it.
+          // The `beadsReadonly` option on buildClaudeExec is kept and tested; only the worker call
+          // site is withheld until those writes are carved out.
         });
       } else if (agent.kind === "build") {
         // Autonomous orchestrator launch (Plan 2c): start the per-build-agent bridge FIRST (claude's

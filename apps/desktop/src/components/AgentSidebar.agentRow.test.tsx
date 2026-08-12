@@ -19,7 +19,6 @@ vi.mock("../services/branchStatus", async (orig) => ({
   refreshAgentBranch: vi.fn(async () => ({ ok: false as const, reason: "busy" as const })),
 }));
 vi.mock("./LogoWaveform", () => ({ LogoWaveform: () => null }));
-vi.mock("./StatusBar", () => ({ StatusBar: () => null }));
 // HistorySearch renders its own search <input>; mock it out so the only textbox on screen is the
 // rename field under test.
 vi.mock("./HistorySearch", () => ({ HistorySearch: () => null }));

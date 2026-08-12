@@ -96,7 +96,6 @@ vi.mock("./NewProjectDialog", () => ({ NewProjectDialog: () => null }));
 vi.mock("./StatusStrip", () => ({ StatusStrip: () => null }));
 vi.mock("./NewCloudAgentDialog", () => ({ NewCloudAgentDialog: () => null }));
 vi.mock("./LogoWaveform", () => ({ LogoWaveform: () => null }));
-vi.mock("./StatusBar", () => ({ StatusBar: () => null }));
 vi.mock("./HistorySearch", () => ({ HistorySearch: () => null }));
 
 import { Workspace } from "./Workspace";
