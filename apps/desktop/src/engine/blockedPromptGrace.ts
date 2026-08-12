@@ -453,8 +453,15 @@ export function notePromptEpisodes(
     // "same question, nothing to re-stamp" short-circuit. Doing it only at an episode OPEN missed
     // the ordinary case entirely: the outcome usually lands while the key is unchanged, so the open
     // path is not reached, and a later blank repaint then deleted the episode and took the only
-    // evidence with it. Compared against the CURRENT episode's start, so a stale outcome from an
-    // earlier ask records nothing.
+    // evidence with it.
+    //
+    // THE SCOPE IS THE ASK, NOT THE EPISODE, and the guarantee that buys is exactly this: an outcome
+    // that predates the agent ENTERING THIS ASK records nothing, because `askSince` is cleared when
+    // it leaves. It is deliberately NOT "predates the current question" — `askSince` is stamped once
+    // and never re-stamped while the ask continues, so within one ask an outcome for an earlier
+    // question does latch the give-up for a later one. That is the safe direction (an answerer that
+    // gave up on this ask has said something about the founder's involvement in it) and it is the
+    // whole reason the episode comparison was removed (roborev 62897/62903).
     if (!ledger.askSince.has(id)) ledger.askSince.set(id, ask?.at ?? now);
     const askedAt = ledger.askSince.get(id)!;
     const seen = ledger.outcome.get(id);

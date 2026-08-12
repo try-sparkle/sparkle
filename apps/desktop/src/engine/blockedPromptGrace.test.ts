@@ -318,8 +318,13 @@ describe("regressions the first draft shipped", () => {
     expect(tick(ledger, "approval", T0 + 400, { text: "   \n ", at: T0 + 400 })).toBe("approval");
     // … and only THEN does the answerer report it could not reach the pane.
     notePromptAnswerOutcome("a", "unreachable", T0 + 500, ledger);
-    // The question comes back readable. It must NOT be held again.
-    expect(tick(ledger, "approval", T0 + 600, { text: PROMPT, at: T0 + 600 })).toBe("approval");
+    // The question comes back readable — as a CHURNED redraw, which is the whole point. Re-using the
+    // identical text let the BURN SET decide the outcome (that key was burned by the first tick), so
+    // the case passed against the pre-fix code and guarded nothing (roborev 62903). Churned, nothing
+    // is burned for this key and the budget still has room, so only the give-up latch can refuse it.
+    expect(
+      tick(ledger, "approval", T0 + 600, { text: `${PROMPT}\n7 files`, at: T0 + 600 }),
+    ).toBe("approval");
   });
 
   it("MEDIUM: LEAVING the ask clears the give-up — it is sticky for the ask, not for the agent", () => {
