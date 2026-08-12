@@ -2403,14 +2403,15 @@ mod tests {
             "the slice swallowed the helper's own DEFINITION, so the call-site assertion below \
              cannot fail — re-scope it before trusting this guard"
         );
-        // Same self-check for the OTHER helper this guard now locates by name. `kill_session` holds
-        // the session removal that used to be inline here; if the slice ever swallowed its
-        // definition, `find("kill_session(")` would match the definition instead of the call and the
-        // ordering assertion below would be measuring nothing.
+        // Same self-check for the OTHER helper this guard now locates by name.
+        // `take_and_signal_session` holds the session removal + SIGHUP that used to be inline here;
+        // if the slice ever swallowed its definition, `find("take_and_signal_session(")` would match
+        // the definition instead of the call and the ordering assertion below would be measuring
+        // nothing.
         assert!(
-            !body.contains("fn kill_session"),
-            "the slice swallowed `kill_session`'s DEFINITION, so the ordering assertion below \
-             would match the definition rather than pty_kill's call — re-scope it"
+            !body.contains("fn take_and_signal_session"),
+            "the slice swallowed `take_and_signal_session`'s DEFINITION, so the ordering assertion \
+             below would match the definition rather than pty_kill's call — re-scope it"
         );
         let call = body.find("mark_stopped_before_kill(").unwrap_or_else(|| {
             panic!(
@@ -2422,13 +2423,20 @@ mod tests {
         // moving the mark below the session removal, leaves every test green while the record is
         // still read `Live` after the session has vanished: exactly the state
         // `reap_dead_sessions_at` seals as `process-gone`.
-        // The removal used to be inline here as `sessions.lock()…remove(&id)`; it now lives in
-        // `kill_session`, which `pty_kill` calls. The PROPERTY is unchanged — the mark must precede
-        // the kill — so this locates the kill by the call rather than by the lock it used to
-        // contain. Keyed on the call, not on the lock, precisely because the lock moving is an
-        // ordinary refactor and must not silently blind this guard (which is what it just did).
+        // The removal used to be inline here as `sessions.lock()…remove(&id)`, then moved to
+        // `kill_session`, and now — since the SessionEnd drain split the signal from the release
+        // (bead sparkle-8hrqe) — lives in `take_and_signal_session`, which is what `pty_kill` calls.
+        // The PROPERTY is unchanged across all three shapes: the mark must precede the moment the
+        // session leaves the map. This locates that moment by the call rather than by the lock or
+        // the old helper name it used to contain, precisely because those move under ordinary
+        // refactors and must not silently blind this guard (which is what the lock did once).
+        //
+        // `take_and_signal_session` is the right anchor rather than `drain_then_release`: the kill
+        // this ordering is about is the SIGHUP + map removal, and the drain that follows only
+        // delays the PTY's release. Anchoring on the drain would let the mark slip below the
+        // removal — the exact window `reap_dead_sessions_at` seals as `process-gone`.
         let kill = body
-            .find("kill_session(")
+            .find("take_and_signal_session(")
             .expect("pty_kill no longer kills the session — this guard's ordering has no subject");
         assert!(
             call < kill,

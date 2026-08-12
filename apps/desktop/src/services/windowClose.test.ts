@@ -45,6 +45,39 @@ describe("stopOpenProjectAgents", () => {
     expect(close).toHaveBeenCalledWith("a1");
     expect(close).toHaveBeenCalledWith("a2");
   });
+
+  // `pty_kill` now holds each PTY open until its SessionEnd hook line lands, bounded at 750ms — and
+  // a TIMEOUT is the ordinary shape for an agent whose Claude Code child already exited (it still
+  // has a hook log, so the Rust side waits out the full deadline for a line that never comes).
+  // Awaited one-at-a-time that is N × 750ms of a hung window with the prompt already dismissed.
+  //
+  // Asserted by START ORDER, not by elapsed time, so it is deterministic and clock-free: every kill
+  // must be IN FLIGHT before any of them is allowed to resolve. The sequential version reaches only
+  // the first, so it reds here rather than merely running slower.
+  it("kills the agents CONCURRENTLY, so a slow PTY drain does not multiply by agent count", async () => {
+    const started: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const kill = vi.fn(async (id: string) => {
+      started.push(id);
+      await gate;
+    });
+    const close = vi.fn();
+
+    const sweep = stopOpenProjectAgents(project, new Set(["a1", "a2"]), { kill, close }, live);
+    await Promise.resolve(); // let any microtask-deferred starts land
+
+    expect(started).toEqual(["a1", "a2"]);
+    // Nothing resolved yet, so this is genuinely "both in flight" rather than "both finished fast".
+    expect(close).not.toHaveBeenCalled();
+
+    release();
+    await sweep;
+    expect(close).toHaveBeenCalledWith("a1");
+    expect(close).toHaveBeenCalledWith("a2");
+  });
 });
 
 describe("planWindowClose", () => {

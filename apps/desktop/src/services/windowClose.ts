@@ -29,6 +29,24 @@ function realDeps(): KillDeps {
  *  - it does not `removeAgent`. That call tombstones the row, closes its workers and clears account
  *    pins, and leaves the agent's worktree orphaned (worktree cleanup is the caller's job and was
  *    never done here) — for a button whose copy is "stop them when you close this window".
+ *
+ * CONCURRENT ACROSS AGENTS, and that is now load-bearing (roborev 62743). `pty_kill` holds each
+ * PTY open until its `SessionEnd` hook line lands, bounded at 750ms — and a TIMEOUT is not the rare
+ * shape: any agent whose Claude Code child has already exited still HAS a hook log, so the Rust side
+ * waits out the full deadline for a line that will never come. Awaited one-at-a-time that is
+ * `N × 750ms` of a visibly hung window with the close prompt already dismissed — 15s for 20 agents.
+ * Run together, THIS PROJECT's sweep costs about one deadline.
+ *
+ * Scoped precisely, because the obvious over-claim is wrong (roborev 62786): that is one deadline
+ * per PROJECT, not one per quit. `killAllOpenAgents` below still awaits this function per project
+ * in sequence, and one window hosts every project as a tab — so a user with 5 projects holding open
+ * agents still waits ~3.75s. Lifting that too would mean overturning its deliberate "so a slow PTY
+ * kill can't race a later runtime write" sequencing, which is a separate decision from this one.
+ *
+ * The kills are independent by construction: distinct agent ids, distinct PTYs, and `deps.close`
+ * is a synchronous single-id store write, so interleaving two of them cannot tear a shared value.
+ * `isLive` is sampled up front, which is the same snapshot the sequential version took — no kill
+ * here can make a DIFFERENT agent's pane stop being live.
  */
 export async function stopOpenProjectAgents(
   project: Project,
@@ -36,14 +54,17 @@ export async function stopOpenProjectAgents(
   deps: KillDeps = realDeps(),
   isLive: (agentId: string) => boolean = defaultIsLive,
 ): Promise<void> {
-  for (const a of project.agents) {
-    if (!openIds.has(a.id)) continue;
+  const targets = project.agents.filter(
     // Never-mounted agents have nothing running: leave them in the open set so they resume
     // next launch untouched (roborev 46319).
-    if (!isLive(a.id)) continue;
-    await deps.kill(a.id).catch(() => {});
-    deps.close(a.id);
-  }
+    (a) => openIds.has(a.id) && isLive(a.id),
+  );
+  await Promise.all(
+    targets.map(async (a) => {
+      await deps.kill(a.id).catch(() => {});
+      deps.close(a.id);
+    }),
+  );
 }
 
 /**

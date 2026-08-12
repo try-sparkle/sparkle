@@ -247,7 +247,7 @@ impl InflightState {
 pub struct PtyManager {
     sessions: Mutex<HashMap<String, PtySession>>,
     /// Spawns that have started their child but not yet reached the `sessions` map — the window in
-    /// which the child is running yet `kill_session` finds no row (bead sparkle-82vey). An entry is
+    /// which the child is running yet `take_and_signal_session` finds no row (bead sparkle-82vey). An entry is
     /// created by [`PtyManager::begin_spawn`] at the top of `pty_spawn` and consumed by
     /// [`PtyManager::insert_session`]; its `bool` is set true by [`PtyManager::mark_spawn_cancelled`]
     /// when a kill arrives during that window. BOTH the mark and the consume happen while the
@@ -312,7 +312,7 @@ impl PtyManager {
 
     /// A kill arrived for an id with no live session — flag its in-flight spawn (if any) so
     /// [`insert_session`] refuses to insert the child. MUST be called while the `sessions` lock is
-    /// held (it is, from `kill_session`'s no-row branch), so this cannot interleave with the
+    /// held (it is, from `take_and_signal_session`'s no-row branch), so this cannot interleave with the
     /// check-and-insert in `insert_session`. A no-op when no spawn is in flight.
     fn mark_spawn_cancelled(&self, id: &str) {
         if let Some(c) = self
@@ -332,7 +332,7 @@ impl PtyManager {
     /// never be mistaken for a cancel.
     fn insert_session(&self, id: String, mut session: PtySession) -> u64 {
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        // Consume this spawn's pending entry under the SAME `sessions` lock that `kill_session`
+        // Consume this spawn's pending entry under the SAME `sessions` lock that `take_and_signal_session`
         // holds when it marks a cancel — so "was I killed while spawning?" and "insert the child"
         // are one atomic step. If the entry is cancelled, a kill already reported success against
         // this id; inserting now would resurrect the child it believed dead (bead sparkle-82vey).
@@ -1319,6 +1319,142 @@ fn mark_stopped_before_kill(app: &AppHandle, id: &str) {
     }
 }
 
+/// How long teardown will hold the PTY open waiting for Claude Code's `SessionEnd` hook to append
+/// its line. A CEILING, not a cost: the ordinary case returns as soon as the line lands (a node
+/// start plus an `appendFileSync`, typically well under 300ms), and an agent with no hook log at
+/// all skips the wait entirely.
+///
+/// Sized against the thing it must not break — the QUIT sweep. Do not read the ceiling as rare:
+/// an agent whose Claude Code child has already exited still HAS a hook log, so
+/// `session_end_drain_target` returns `Some` and the drain waits out the full deadline for a line
+/// that will never come. Only an agent with no log at all takes the fast path.
+///
+/// That made the per-agent cost multiply on quit, because `windowClose::stopOpenProjectAgents`
+/// awaited one `pty_kill` per agent IN SEQUENCE — 20 agents × 750ms is 15s of hung window with the
+/// close prompt already dismissed (roborev 62743). That sweep now runs its kills concurrently, and
+/// `kills the agents CONCURRENTLY…` in `windowClose.test.ts` pins it.
+///
+/// The cost model that survives, stated exactly, because this constant is what someone consults
+/// before changing it (roborev 62786): the quit costs about one deadline **PER PROJECT**, not one
+/// overall. `killAllOpenAgents` still awaits `stopOpenProjectAgents` per project IN SEQUENCE —
+/// deliberately, so a slow PTY kill can't race a later runtime write — and one window hosts every
+/// project as a tab. So this multiplies by the number of projects holding open agents (5 projects
+/// ≈ 3.75s), and raising it multiplies by P. Nothing pins that cross-project factor; only the
+/// within-project concurrency is tested.
+const SESSION_END_DRAIN: Duration = Duration::from_millis(750);
+/// Poll interval for [`await_session_end_flush`]. Short, because the whole point is to release the
+/// PTY as soon as the line is there; each poll is a seek plus a read of the bytes appended since.
+const SESSION_END_DRAIN_POLL: Duration = Duration::from_millis(15);
+
+/// The marker `sparkle-hook.mjs` writes for a session's last event. Matched as a substring of the
+/// appended bytes rather than parsed: the emitter writes one compact JSON object per line with no
+/// spaces around the colon (`resources/sparkle-hook.mjs`), and `engine/sparkleHook.test.ts`
+/// round-trips that exact shape, so the substring is pinned from both ends.
+const SESSION_END_MARKER: &str = "\"event\":\"SessionEnd\"";
+
+/// Has a `SessionEnd` line been appended to `log` PAST `from_offset`?
+///
+/// `from_offset` is the length of the log captured BEFORE the signal, and it is the whole
+/// correctness of this: an agent's log is APPEND-ONLY ACROSS LIVES (`<app_data>/hook-events/
+/// <agentId>.jsonl` is keyed by agent, not by session), so every restart leaves its predecessor's
+/// `SessionEnd` behind. Scanning the whole file would find one of those instantly and the drain
+/// would be a no-op that always reports success — the vacuous shape this function exists to avoid.
+///
+/// A partial trailing line is deliberately tolerated. `appendFileSync` of a sub-`PIPE_BUF` line is
+/// atomic in practice, but a torn read costs only one more 15ms poll, whereas requiring a trailing
+/// newline would spin out the whole deadline on the last line of a file that never gets another.
+fn session_end_flushed(log: &Path, from_offset: u64) -> bool {
+    use std::io::{Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(log) else { return false };
+    if f.seek(SeekFrom::Start(from_offset)).is_err() {
+        return false;
+    }
+    let mut tail = String::new();
+    // Lossy on purpose: the marker is ASCII, so a truncated multi-byte read can never fabricate or
+    // destroy a match, and refusing to look at non-UTF8 bytes would just stall the drain.
+    let mut buf = Vec::new();
+    if f.read_to_end(&mut buf).is_err() {
+        return false;
+    }
+    tail.push_str(&String::from_utf8_lossy(&buf));
+    tail.contains(SESSION_END_MARKER)
+}
+
+/// Block until a `SessionEnd` line lands past `from_offset`, or `deadline` elapses. Returns whether
+/// the line arrived.
+///
+/// BOUNDED BY CONSTRUCTION: a hook that never runs (no `node` on PATH, a settings file Claude never
+/// read, a child already gone) costs exactly `deadline` and then teardown proceeds. Losing the line
+/// is the status quo; hanging teardown on it would be worse than the defect.
+fn await_session_end_flush(log: &Path, from_offset: u64, deadline: Duration, poll: Duration) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if session_end_flushed(log, from_offset) {
+            return true;
+        }
+        if start.elapsed() >= deadline {
+            return false;
+        }
+        std::thread::sleep(poll.min(deadline.saturating_sub(start.elapsed())));
+    }
+}
+
+/// Where this agent's hook line will land, and how long the log is RIGHT NOW.
+///
+/// Resolved BEFORE the signal so the offset cannot include the very line we are about to wait for.
+/// `None` when there is no hook log to drain — a sign-in PTY, a cloud agent, an agent whose hooks
+/// never installed — and a `None` skips the wait rather than spending the deadline on it.
+fn session_end_drain_target(app: &AppHandle, id: &str) -> Option<(PathBuf, u64)> {
+    let log = crate::hooks::event_log_path(app, id).ok()?;
+    let len = std::fs::metadata(&log).ok()?.len();
+    Some((log, len))
+}
+
+/// What a drain ended up doing — enough to log the interesting case and nothing more.
+#[derive(Debug, PartialEq, Eq)]
+enum Drain {
+    /// No hook log to wait on, so the PTY was released immediately.
+    NothingToDrain,
+    /// The `SessionEnd` line landed; the PTY was held until it did.
+    Flushed,
+    /// The deadline elapsed first. The line is lost — the status quo — but teardown proceeds.
+    TimedOut,
+}
+
+/// Hold the PTY open until this session's `SessionEnd` line is on disk, then release it.
+///
+/// TAKES THE SESSION BY VALUE, which is the entire mechanism: dropping [`PtySession`] runs
+/// `UnixMasterWriter::drop`, which writes `\n` + termios `VEOF` into the pty — an **EOF on the
+/// child's stdin** that hurries Claude Code out, and with it the `SessionEnd` hook still writing.
+/// (It is NOT a hangup: the reader thread holds a dup of the master, so SIGHUP does not reach the
+/// foreground group until that dup closes too — see [`pty_kill`] for the full chain.) Because the
+/// value is moved in here and dropped at the end of this body, "release the PTY after the flush" is
+/// a fact about ownership that no caller can reverse, rather than a comment about ordering.
+///
+/// Split out of [`pty_kill`] so it is DRIVABLE: `pty_kill` is a `#[tauri::command]` taking an
+/// `AppHandle`, so a test cannot call it, and a test that instead re-performed take → wait → drop
+/// in its own body would be asserting an order it created itself — green even with the wait deleted
+/// from the command. This function is the whole of what `pty_kill` does after the signal, so
+/// driving it drives the real path.
+fn drain_then_release(
+    session: PtySession,
+    target: Option<(PathBuf, u64)>,
+    deadline: Duration,
+    poll: Duration,
+) -> Drain {
+    // Named binding, not `_`: `let _ = session` would drop it HERE, at the top, reopening the exact
+    // race this exists to close. It lives until the end of the body.
+    let _session = session;
+    let Some((log, from)) = target else {
+        return Drain::NothingToDrain;
+    };
+    if await_session_end_flush(&log, from, deadline, poll) {
+        Drain::Flushed
+    } else {
+        Drain::TimedOut
+    }
+}
+
 /// Kill a PTY the user deliberately stopped.
 ///
 /// `async` + `spawn_blocking` because the body does ledger I/O — see `mark_stopped_before_kill`.
@@ -1327,9 +1463,44 @@ fn mark_stopped_before_kill(app: &AppHandle, id: &str) {
 /// so the mark-then-kill order holds without a second round-trip. It is strictly better than doing
 /// the work in JS, because once dispatched this runs in the Rust process and a webview torn down
 /// mid-flight cannot cancel it.
+///
+/// ── THE SIGNAL AND THE RELEASE ARE TWO SEPARATE MOMENTS (bead sparkle-8hrqe) ──────────────────
+/// `killer.kill()` is portable-pty's `ProcessSignaller`, which on unix is `libc::kill(pid, SIGHUP)`
+/// — a request to shut down, not a `SIGKILL`. Claude Code answers it by running its `SessionEnd`
+/// hook, which spawns `node resources/sparkle-hook.mjs` to append one line to the agent's event
+/// log. The old shape signalled and released in the same breath, and raced its own hook.
+///
+/// WHAT THE RELEASE ACTUALLY DOES, precisely — the obvious story is wrong, and a wrong mechanism is
+/// how a future maintainer "optimises" this hold away (roborev 62743). Dropping [`PtySession`] does
+/// NOT hang up the slave's foreground process group, because it does not close the master: both
+/// `try_clone_reader` and `take_writer` **dup** the master fd (portable-pty 0.8.1
+/// `src/unix.rs:314`/`:321`), and the reader thread holds one of those dups for as long as it runs.
+/// SIGHUP reaches the foreground group only on the LAST close.
+///
+/// What the drop does do is run `UnixMasterWriter::drop` (`unix.rs:351`), which writes `\n` plus the
+/// termios `VEOF` byte into the pty — it feeds the foreground child an **EOF on its stdin**. That is
+/// what hurries Claude Code out. And once Claude Code exits, the slave closes, the reader thread
+/// sees EOF and drops ITS dup, and only then does the master's last fd close and SIGHUP reach
+/// whatever is still in the foreground group — a `node` hook that has not finished writing.
+///
+/// So the release does not kill the hook directly; it STARTS the chain that does. Deferring the drop
+/// defers that EOF, which is the fix. (Note `writer` is an `Arc<Mutex<..>>` that `pty_write` clones
+/// out briefly, so the EOF fires on the last reference, not necessarily on this drop.)
+///
+/// Measured on the founder's machine: 6,665 `SessionStart` lines against 6,286 `SessionEnd` — 379
+/// sessions (5.7%) that ended with no line, across 228 of 441 logs. A missing line is not cosmetic:
+/// `engine/deathRecord` reads `session-end-hook` as the evidence that an agent ended on purpose,
+/// and without it the death falls back to `pty-exit`/`unknown`.
+///
+/// So: capture the log length, mark, signal, then hold the session — the EOF not yet sent — until
+/// the line lands or [`SESSION_END_DRAIN`] elapses, and only then drop it. The drop is moved INTO
+/// the blocking hop, which is what makes "release the PTY after the flush" a fact about ownership
+/// rather than a comment about ordering.
 #[tauri::command]
 pub async fn pty_kill(app: AppHandle, manager: State<'_, PtyManager>, id: String) -> Result<(), String> {
     tracing::info!(%id, "pty_kill");
+    // Resolved BEFORE anything else touches the log, so the offset is a floor under our own signal.
+    let target = session_end_drain_target(&app, &id);
     // BEFORE the kill, so there is no window in which the session is gone and the record still
     // reads `Live` — the exact state `reap_dead_sessions_at` seals as `process-gone`.
     //
@@ -1343,17 +1514,41 @@ pub async fn pty_kill(app: AppHandle, manager: State<'_, PtyManager>, id: String
         mark_stopped_before_kill(&mark_app, &mark_id);
     })
     .await;
-    kill_session(&manager, &id);
+    // Signal on the async side (a mutex plus a signal, as before); the WAIT and the release go to a
+    // blocking thread, because the session is moved there and dropped there.
+    if let Some(session) = take_and_signal_session(&manager, &id) {
+        let _ = tauri::async_runtime::spawn_blocking(move || {
+            if drain_then_release(session, target, SESSION_END_DRAIN, SESSION_END_DRAIN_POLL)
+                == Drain::TimedOut
+            {
+                // DEBUG, not warn: a drained-out session is the ordinary shape for an agent whose
+                // hooks were never installed, and this fires once per such teardown.
+                tracing::debug!(target: "pty", %id, "no SessionEnd line before the drain deadline");
+            }
+        })
+        .await;
+    }
     Ok(())
 }
 
-/// Take the session out of the map and end its child — the whole of `pty_kill`'s effect on a live
-/// PTY, extracted so it can be DRIVEN by a test rather than hand-simulated in one.
+/// Take the session out of the map and signal its child — the whole of `pty_kill`'s effect on a
+/// live PTY EXCEPT closing the master, which is what dropping the returned [`PtySession`] does.
+///
+/// Extracted so it can be DRIVEN by a test rather than hand-simulated in one. It replaced a
+/// `kill_session` that did both halves in one breath; that wrapper is gone rather than kept for its
+/// callers, because once `pty_kill` stopped calling it the only code left calling it was tests —
+/// a function whose sole exerciser is the suite guarding it proves nothing about production.
 ///
 /// The REMOVAL BY ID is what makes `Reap::AlreadyGone` the ordinary case: the session leaves the
 /// map HERE, and the reader thread that later wakes on its child's EOF finds nothing under its id.
 /// A test that reproduces that by reaching into the map itself asserts a precondition it created —
 /// it stays green if this function stops removing by id at all. Driving this reds that.
+///
+/// Handing the session BACK is the other half of the point, and it is a fact about ownership rather
+/// than a comment about ordering: while the caller holds the value, the writer's `Drop` has not run,
+/// so the EOF that hurries Claude Code out has not been written into the pty and a `SessionEnd` hook
+/// still has time to finish. [`drain_then_release`] uses that window; a caller with no hook line to
+/// wait for just drops it.
 ///
 /// What no synchronous caller can observe is the order of the three statements BELOW against each
 /// other — by the time this returns, all of them have run. `kill_resumes_a_reader_parked_on_the_
@@ -1361,8 +1556,8 @@ pub async fn pty_kill(app: AppHandle, manager: State<'_, PtyManager>, id: String
 /// either reds it); the interleaving against `killer.kill()` is pinned by nothing, and claiming
 /// otherwise in a comment is how the last vacuous test here got written.
 ///
-/// Returns whether a session was there to kill.
-fn kill_session(manager: &PtyManager, id: &str) -> bool {
+/// Returns `None` when there was no live session to take.
+fn take_and_signal_session(manager: &PtyManager, id: &str) -> Option<PtySession> {
     let mut sessions = manager.sessions.lock().unwrap_or_else(|e| e.into_inner());
     let Some(mut session) = sessions.remove(id) else {
         // No live session — but a spawn may be mid-flight, with its child already running and not
@@ -1370,7 +1565,7 @@ fn kill_session(manager: &PtyManager, id: &str) -> bool {
         // `insert_session` (which takes the same lock) cannot slip the child in after we return
         // "killed". A no-op when nothing is spawning.
         manager.mark_spawn_cancelled(id);
-        return false;
+        return None;
     };
     // Release the map lock before the kill itself — the original brief-hold shape — now that the
     // removal (or cancel-mark) is done.
@@ -1382,7 +1577,7 @@ fn kill_session(manager: &PtyManager, id: &str) -> bool {
     // the terminal is gone. Close the credit gate so both proceed, drain, and tear down.
     session.inflight.close();
     let _ = session.killer.kill();
-    true
+    Some(session)
 }
 
 /// Every agent id with a live PTY session in THIS process.
@@ -1480,7 +1675,9 @@ mod tests {
         acquire_writer, apply_heap_cap, guard_resize_size, guard_spawn_size, insert_or_cancel,
         next_pty_epoch,
         node_options_with_cap, run_flusher, validate_spawn_inner, Credit, FlushBuf, InflightState,
-        finish_teardown, kill_session, PauseState, PtyManager, PtyEnd, PtySession, Reap,
+        finish_teardown, PauseState, PtyManager, PtyEnd, PtySession, Reap,
+        await_session_end_flush, drain_then_release, session_end_flushed, take_and_signal_session,
+        Drain,
         MIN_PTY_COLS,
         MIN_PTY_ROWS, NO_EPOCH,
         PTY_INFLIGHT_HIGH_WATER_BYTES, SPAWN_FALLBACK_COLS, SPAWN_FALLBACK_ROWS,
@@ -2100,13 +2297,13 @@ mod tests {
         // a precondition this test created: `reap` reads nothing but `sessions.get(id)`, so a
         // manually emptied map is byte-for-byte a map that never held the id, and the assertion
         // below would collapse into the `nonexistent` case another test already owns. Driving
-        // `kill_session` is what makes ONE regression red: the kill ceasing to remove by id (a
+        // `take_and_signal_session` is what makes ONE regression red: the kill ceasing to remove by id (a
         // `get_mut` in place of the `remove`) leaves the session under its own epoch, so the reap
         // below answers `RemovedOurs`. It does NOT pin the removal against `killer.kill()` — this
         // caller is synchronous, so both have run by the time `reap` is asked, and swapping the two
-        // statements inside `kill_session` stays green here. Only a reader racing a live kill could
+        // statements inside `take_and_signal_session` stays green here. Only a reader racing a live kill could
         // see that, and nothing in this suite does.
-        assert!(kill_session(&mgr, "agent-killed"), "control: the session was live before the kill");
+        assert!(take_and_signal_session(&mgr, "agent-killed").is_some(), "control: the session was live before the kill");
 
         // The reader wakes on EOF and reaps with ITS OWN epoch. Nothing owns the id, so this is
         // still its teardown to finish — not someone else's session to leave alone.
@@ -2403,7 +2600,7 @@ mod tests {
     /// DRIVEN, not restaged. This used to build its own `PauseState`, park a thread on it and call
     /// `pause.set(false)` itself under the comment "exactly what pty_kill does" — which made it a
     /// test of `PauseState`, green even with `session.pause.set(false)` deleted from the kill
-    /// outright. `kill_session` is callable now, so the real path is what runs and that deletion
+    /// outright. `take_and_signal_session` is callable now, so the real path is what runs and that deletion
     /// reds it. Both gates are asserted, since nothing else covers the `inflight.close()`.
     #[test]
     fn kill_resumes_a_reader_parked_on_the_pause_gate_and_closes_the_credit_gate() {
@@ -2444,7 +2641,7 @@ mod tests {
         assert!(!woke.load(Ordering::SeqCst), "control: a paused reader stays parked until the kill");
         assert!(!inflight.is_closed(), "control: the credit gate is open until the kill closes it");
 
-        assert!(kill_session(&mgr, "agent-paused"), "control: the session was live before the kill");
+        assert!(take_and_signal_session(&mgr, "agent-paused").is_some(), "control: the session was live before the kill");
 
         // Bounded wait, not a `join`: the regression this guards against is a thread that NEVER
         // wakes, and joining it would HANG the suite instead of failing it.
@@ -2466,6 +2663,351 @@ mod tests {
         let _ = reader.join();
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    // ── SessionEnd drain: the signal and the release are two separate moments ─────────────────
+    //
+    // `killer.kill()` is SIGHUP, so Claude Code answers it by running its `SessionEnd` hook —
+    // `node sparkle-hook.mjs`, appending one line to the agent's event log. Dropping `PtySession`
+    // runs `UnixMasterWriter::drop`, which writes `\n` + `VEOF` into the pty — an EOF on the
+    // child's stdin that hurries Claude Code out, taking the still-writing hook with it. (It is
+    // NOT a hangup; the reader thread's dup of the master keeps SIGHUP off the foreground group
+    // until it too closes. See `pty_kill` for the full chain.) Signalling and releasing in one
+    // breath therefore races the hook: 379 of 6,665 sessions on the founder's machine (5.7%,
+    // across 228 of 441 logs) ended with no line, which costs `engine/deathRecord` the
+    // `session-end-hook` evidence for a deliberate stop.
+
+    /// A scratch hook-event log, named per-process + per-tag so concurrent tests never collide.
+    fn drain_log_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("-drain-{}-{tag}.jsonl", std::process::id()))
+    }
+
+    /// One emitter line, in the exact shape `resources/sparkle-hook.mjs` writes.
+    fn hook_line(event: &str) -> String {
+        format!("{{\"ts\":1,\"event\":\"{event}\",\"session_id\":\"s\"}}\n")
+    }
+
+    /// THE FIX. Teardown must hold the PTY open until the hook's line is on disk.
+    ///
+    /// Driven through `drain_then_release` — the WHOLE of what `pty_kill` does after the signal —
+    /// with a live `openpty` session taken out of a real manager by `take_and_signal_session`. That
+    /// matters: a test that re-performed take → wait → drop in its own body would be asserting an
+    /// order it created itself, and would stay green with the wait deleted from the command. Here
+    /// the ordering under test belongs to the production function.
+    ///
+    /// Three assertions that can fail, all behavioural. It must report `Flushed` (not
+    /// `TimedOut`/`NothingToDrain`); it must not return BEFORE the line lands (it waited); and it
+    /// must not sit out the deadline AFTER it lands (it released promptly). Deleting the wait reds
+    /// the first two; replacing it with an unconditional sleep reds the third.
+    #[test]
+    fn teardown_holds_the_pty_open_until_the_session_end_line_is_flushed() {
+        use portable_pty::{native_pty_system, PtySize};
+        use std::io::Write as _;
+        let sys = native_pty_system();
+        let size = PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
+        let Ok(pair) = sys.openpty(size) else { return };
+        let Ok(mut child) = pair.slave.spawn_command(CommandBuilder::new("/bin/cat")) else {
+            return;
+        };
+        let killer = child.clone_killer();
+        let Ok(writer) = pair.master.take_writer() else { return };
+
+        // The log already carries a PREVIOUS life's SessionEnd — the ordinary case, since the log
+        // is keyed by agent and appended across restarts.
+        let log = drain_log_path("holds-open");
+        let _ = std::fs::remove_file(&log);
+        std::fs::write(&log, hook_line("SessionEnd")).expect("seed the log");
+        let from = std::fs::metadata(&log).expect("log length").len();
+
+        let mgr = PtyManager::default();
+        mgr.insert_session(
+            "agent-drain".to_string(),
+            PtySession {
+                writer: Arc::new(Mutex::new(writer)),
+                master: pair.master,
+                killer,
+                pause: Arc::new(PauseState::new()),
+                inflight: Arc::new(InflightState::new()),
+                pid: None,
+                epoch: NO_EPOCH,
+            },
+        );
+
+        // Stands in for the hook: it lands its line a beat AFTER the signal, which is exactly the
+        // window the old shape sent the writer's EOF in.
+        const HOOK_DELAY: Duration = Duration::from_millis(120);
+        let log_w = log.clone();
+        let hook = std::thread::spawn(move || {
+            std::thread::sleep(HOOK_DELAY);
+            let mut f = std::fs::OpenOptions::new().append(true).open(&log_w).expect("append");
+            f.write_all(hook_line("SessionEnd").as_bytes()).expect("write the hook line");
+        });
+
+        let started = std::time::Instant::now();
+        let session =
+            take_and_signal_session(&mgr, "agent-drain").expect("the session was live before the kill");
+        assert!(
+            !mgr.session_ids().contains(&"agent-drain".to_string()),
+            "control: the row leaves the map at the signal, not at the release"
+        );
+        // The production function owns the session from here: it holds the master open, waits, and
+        // drops it — the release happens INSIDE this call, after the line lands.
+        let outcome = drain_then_release(
+            session,
+            Some((log.clone(), from)),
+            Duration::from_secs(5),
+            Duration::from_millis(15),
+        );
+        let waited = started.elapsed();
+        let _ = hook.join();
+
+        assert_eq!(
+            outcome,
+            Drain::Flushed,
+            "teardown must observe the SessionEnd line the signal provoked; without it \
+             engine/deathRecord loses the `session-end-hook` evidence for a deliberate stop"
+        );
+        assert!(
+            waited >= HOOK_DELAY,
+            "teardown must WAIT for the line — it returned in {waited:?}, before the hook could \
+             have written at {HOOK_DELAY:?}, so the PTY was released mid-flush"
+        );
+        assert!(
+            waited < Duration::from_secs(2),
+            "teardown must release as soon as the line lands, not sit out the deadline; took {waited:?}"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&log);
+    }
+
+    /// The offset guard, and the reason the drain is not vacuous.
+    ///
+    /// The event log is APPEND-ONLY ACROSS LIVES — `<app_data>/hook-events/<agentId>.jsonl` is keyed
+    /// by agent, not by session — so every restart leaves its predecessor's `SessionEnd` in the
+    /// file. A drain that scanned the whole log would match one of those on its first poll and
+    /// report success without ever waiting for THIS session's line. Ignoring `from_offset` reds this.
+    #[test]
+    fn a_session_end_from_a_previous_life_does_not_satisfy_the_drain() {
+        let log = drain_log_path("stale");
+        let _ = std::fs::remove_file(&log);
+        std::fs::write(&log, hook_line("SessionEnd")).expect("seed a previous life's line");
+        let from = std::fs::metadata(&log).expect("log length").len();
+
+        let started = std::time::Instant::now();
+        let flushed =
+            await_session_end_flush(&log, from, Duration::from_millis(150), Duration::from_millis(15));
+        let waited = started.elapsed();
+
+        assert!(
+            !flushed,
+            "a SessionEnd below the captured offset belongs to a PREVIOUS session; accepting it \
+             makes the drain a no-op that always reports success"
+        );
+        assert!(
+            waited >= Duration::from_millis(150),
+            "the drain must actually wait out its deadline rather than short-circuit on the stale \
+             line; returned in {waited:?}"
+        );
+        let _ = std::fs::remove_file(&log);
+    }
+
+    /// BOUNDED. A hook that never runs — no `node`, hooks never installed, child already gone —
+    /// must cost the deadline and no more. Losing the line is the status quo; hanging teardown on
+    /// it would be worse than the defect this drain exists to fix.
+    #[test]
+    fn the_drain_is_bounded_when_no_hook_line_ever_lands() {
+        let log = drain_log_path("bounded");
+        let _ = std::fs::remove_file(&log);
+        std::fs::write(&log, hook_line("SessionStart")).expect("seed a log with no SessionEnd");
+        let from = 0; // even scanning the WHOLE file, there is no SessionEnd to find
+
+        let started = std::time::Instant::now();
+        let flushed =
+            await_session_end_flush(&log, from, Duration::from_millis(120), Duration::from_millis(15));
+        let waited = started.elapsed();
+
+        assert!(!flushed, "no SessionEnd was ever written, so the drain cannot report one");
+        assert!(
+            waited >= Duration::from_millis(120) && waited < Duration::from_secs(3),
+            "the drain must end AT its deadline; took {waited:?}"
+        );
+        let _ = std::fs::remove_file(&log);
+    }
+
+    /// A missing log is "nothing to drain", not "wait 750ms". Sign-in PTYs and agents whose hooks
+    /// never installed have no event log at all, and they are torn down on the same path — making
+    /// them pay the deadline would put 750ms into every one of those teardowns for no line.
+    #[test]
+    fn an_agent_with_no_hook_log_has_nothing_to_drain() {
+        use portable_pty::{native_pty_system, PtySize};
+        let missing = drain_log_path("absent");
+        let _ = std::fs::remove_file(&missing);
+        assert!(std::fs::metadata(&missing).is_err(), "control: the log really is absent");
+        assert!(
+            !session_end_flushed(&missing, 0),
+            "a log that does not exist cannot hold a flushed line"
+        );
+
+        // `session_end_drain_target` resolves to None for this shape (no metadata to read), and a
+        // None must SKIP the wait rather than spend the deadline on it. Driven with a real session
+        // so the release path is the production one.
+        let sys = native_pty_system();
+        let size = PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
+        let Ok(pair) = sys.openpty(size) else { return };
+        let Ok(mut child) = pair.slave.spawn_command(CommandBuilder::new("/bin/cat")) else {
+            return;
+        };
+        let killer = child.clone_killer();
+        let Ok(writer) = pair.master.take_writer() else { return };
+        let session = PtySession {
+            writer: Arc::new(Mutex::new(writer)),
+            master: pair.master,
+            killer,
+            pause: Arc::new(PauseState::new()),
+            inflight: Arc::new(InflightState::new()),
+            pid: None,
+            epoch: NO_EPOCH,
+        };
+
+        let started = std::time::Instant::now();
+        let outcome =
+            drain_then_release(session, None, Duration::from_secs(5), Duration::from_millis(15));
+        let waited = started.elapsed();
+
+        assert_eq!(
+            outcome,
+            Drain::NothingToDrain,
+            "an agent with no hook log has no line to wait for"
+        );
+        assert!(
+            waited < Duration::from_millis(500),
+            "a sign-in PTY or a hook-less agent must not pay the drain deadline; took {waited:?}"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// The seam itself: taking a session removes the row and hands the PTY BACK, so the caller —
+    /// not this function — decides when the writer's EOF is sent. An unknown id yields nothing to hold.
+    #[test]
+    fn taking_a_session_removes_the_row_and_hands_the_pty_to_the_caller() {
+        use portable_pty::{native_pty_system, PtySize};
+        let sys = native_pty_system();
+        let size = PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
+        let Ok(pair) = sys.openpty(size) else { return };
+        let Ok(mut child) = pair.slave.spawn_command(CommandBuilder::new("/bin/cat")) else {
+            return;
+        };
+        let killer = child.clone_killer();
+        let Ok(writer) = pair.master.take_writer() else { return };
+        let mgr = PtyManager::default();
+        mgr.insert_session(
+            "agent-taken".to_string(),
+            PtySession {
+                writer: Arc::new(Mutex::new(writer)),
+                master: pair.master,
+                killer,
+                pause: Arc::new(PauseState::new()),
+                inflight: Arc::new(InflightState::new()),
+                pid: None,
+                epoch: NO_EPOCH,
+            },
+        );
+
+        assert!(
+            take_and_signal_session(&mgr, "agent-unknown").is_none(),
+            "an id with no live session hands back nothing to hold"
+        );
+        let held = take_and_signal_session(&mgr, "agent-taken");
+        assert!(held.is_some(), "a live session is handed back so the caller can drain before release");
+        assert!(
+            !mgr.session_ids().contains(&"agent-taken".to_string()),
+            "the row must leave the map at the signal — a second kill must not find it"
+        );
+        assert!(
+            take_and_signal_session(&mgr, "agent-taken").is_none(),
+            "the take is once-only; a racing second teardown gets nothing"
+        );
+        drop(held);
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// `pty_kill`'s own body, sliced by its braces. Mirrors `agent_life.rs`'s `fn_body`, which
+    /// guards the mark-before-kill ordering in this same function.
+    fn pty_kill_body(src: &str) -> String {
+        let after = src
+            .split("pub async fn pty_kill")
+            .nth(1)
+            .expect("`pty_kill` not found — renamed, or no longer async");
+        let start = after.find('{').expect("pty_kill has no body");
+        let mut depth = 0usize;
+        for (i, ch) in after[start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return after[start..=start + i].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces after `pty_kill`");
+    }
+
+    /// THE WIRING, which no runtime test in this file can reach (roborev 62743).
+    ///
+    /// `pty_kill` is a `#[tauri::command]` taking an `AppHandle`, so every test above drives the
+    /// helpers instead. That leaves two defects invisible — the defaulted-seam shape AGENTS.md
+    /// flags as `sparkle-lgbwf`, where the one line supplying the real values is covered by nothing:
+    ///
+    /// 1. Reverting the command body to signal-and-release — deleting `drain_then_release` outright
+    ///    — leaves every drain test green, because they call the helper directly. The `agent_life`
+    ///    ordering guard stays green too: it is deliberately anchored on `take_and_signal_session(`.
+    /// 2. Moving `session_end_drain_target(` to AFTER the signal captures an offset that can already
+    ///    include this session's own `SessionEnd` line, turning every drain into a full timeout for
+    ///    a line it will never recognise. That is "the whole correctness" of the offset, and no
+    ///    runtime test observes where the capture happens.
+    ///
+    /// Source-text, therefore, and cheap. Both properties are ORDER, not presence, which is what a
+    /// `contains` check would miss.
+    #[test]
+    fn pty_kill_captures_the_drain_offset_before_it_signals_and_drains_before_it_releases() {
+        let body = pty_kill_body(include_str!("pty.rs"));
+        // Self-check, same idiom as `agent_life.rs`: if the slice ever swallowed a helper's own
+        // DEFINITION, the `find`s below would match that instead of `pty_kill`'s call and the
+        // ordering assertion could not fail.
+        for def in ["fn session_end_drain_target", "fn take_and_signal_session", "fn drain_then_release"] {
+            assert!(
+                !body.contains(def),
+                "the slice swallowed `{def}`'s DEFINITION, so the assertions below would measure \
+                 the definition rather than pty_kill's call — re-scope it"
+            );
+        }
+
+        let capture = body.find("session_end_drain_target(").expect(
+            "`pty_kill` no longer captures the hook-log offset before signalling, so the drain has \
+             no floor and a previous life's SessionEnd satisfies it instantly",
+        );
+        let signal = body.find("take_and_signal_session(").expect(
+            "`pty_kill` no longer takes the session, so there is nothing held open to drain against",
+        );
+        assert!(
+            capture < signal,
+            "the drain offset must be captured BEFORE the signal — captured after, it can already \
+             include this session's own SessionEnd line, and every drain becomes a full timeout"
+        );
+        assert!(
+            body.contains("drain_then_release("),
+            "`pty_kill` no longer drains before releasing the PTY, so the SessionEnd hook races the \
+             writer's EOF again — every test above stays green, because they drive the helper directly"
+        );
     }
 
     // ── IPC emit credit gate (inflight backpressure) ──────────────────────────────────────────
@@ -2671,8 +3213,8 @@ mod tests {
         mgr.begin_spawn("agent-race");
         // The kill lands while the child runs but the session is not yet in the map.
         assert!(
-            !kill_session(&mgr, "agent-race"),
-            "no live session yet, so kill_session returns false"
+            !take_and_signal_session(&mgr, "agent-race").is_some(),
+            "no live session yet, so take_and_signal_session returns None"
         );
         // The spawn now reaches insert_session — it must REFUSE (NO_EPOCH), so `pty_spawn` kills the
         // child it holds instead of leaving it orphaned against the worktree.
@@ -2700,7 +3242,7 @@ mod tests {
 
         // ── SCOPING: a kill for an idle id (no session, no spawn) must not cancel a later restart ─
         assert!(
-            !kill_session(&mgr, "agent-restart"),
+            !take_and_signal_session(&mgr, "agent-restart").is_some(),
             "nothing live and nothing spawning — a plain no-op"
         );
         let Some((session, child)) = mk() else { return };
@@ -2763,8 +3305,8 @@ mod tests {
         cleanup.push(child);
         mgr.begin_spawn("agent-cancelled");
         assert!(
-            !kill_session(&mgr, "agent-cancelled"),
-            "no live session yet, so kill_session returns false — but it marks the in-flight spawn"
+            !take_and_signal_session(&mgr, "agent-cancelled").is_some(),
+            "no live session yet, so take_and_signal_session returns None — but it marks the in-flight spawn"
         );
         let cancelled = insert_or_cancel(&mgr, &observers, "agent-cancelled", session, 80, 24);
         assert!(cancelled.is_none(), "a cancelled spawn must not insert (epoch == NO_EPOCH)");
