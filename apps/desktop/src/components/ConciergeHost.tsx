@@ -3479,8 +3479,15 @@ export function ConciergeHost({
   // it makes the module impossible to leave stale, where five hand-placed calls would be one
   // forgotten edit away from attributing a send to the wrong message. The commit-time delay is
   // immaterial: a turn's tool calls are network round-trips behind it.
+  //
+  // AND IT IS CLEARED ON UNMOUNT. `turnOrigin` is MODULE state, so without this the last bubble id
+  // this column ever awaited outlives the column itself — and a call that settles afterwards would
+  // be stamped with it. That is not merely stale: message ids survive rehydration, so a remounted
+  // thread can contain the very id left behind, and the receipt would mark a message whose turn
+  // ended long ago. Clearing is the same fail-closed rule the reader end follows.
   useEffect(() => {
     setConciergeTurnOrigin(awaitingId);
+    return () => setConciergeTurnOrigin(null);
   }, [awaitingId]);
 
   /** Start a Sparkle chat turn for `text`. Never fails visibly, so it reports no outcome.
@@ -3934,8 +3941,17 @@ export function ConciergeHost({
   // The subscription that does it. SEPARATE from the receipt-line effect above, deliberately: that
   // one calls `claimReceiptForDisplay` to stop a replayed receipt drawing a second line, and this
   // stamp must not be gated on winning that claim — they are different concerns and only one of them
-  // is about drawing a row. Replay is safe here on its own terms: a remount starts with no awaiting
-  // bubble, so there is nothing to stamp, and the guard above makes a repeat a no-op anyway.
+  // is about drawing a row.
+  //
+  // REPLAY IS STILL SAFE, BUT NOT FOR THE REASON THIS COMMENT USED TO GIVE. It said "a remount
+  // starts with no awaiting bubble, so there is nothing to stamp" — true only while the origin was
+  // read from a live ref at settle time. The origin now travels ON the receipt, so a replayed
+  // receipt arrives carrying a perfectly valid bubble id and CAN match a rehydrated message.
+  //
+  // What makes that harmless is the guard inside `stampRelayReceipt`: a bubble that already records
+  // this agent is returned untouched, so re-applying a receipt the thread already reflects is a
+  // no-op. That is now the whole of the argument, and it is a property of the guard rather than of
+  // the mount — so anything that weakens the guard has to re-answer replay too.
   useEffect(
     () =>
       onConciergeActionReceipt((receipt) => {

@@ -24,8 +24,14 @@
 // near-black column is the case where the answer is genuinely marginal, and it should be reported as
 // a number rather than argued about.
 //
-// Exit 0 = both themes captured. Exit 2 = the probe could not run (no Chrome, no dev server). It
-// never fails on the CONTRAST reading: that is a finding for the founder to rule on, not a gate.
+// Exit 0 = both themes captured, every element it claims to cover actually measured. Exit 2 = the
+// probe could not RUN (no Chrome, no dev server). Exit 3 = it ran, but the fixture no longer renders
+// something it measures — coverage retired by drift, which is distinct from a probe that never
+// started and must not be collapsed onto 2.
+//
+// It never fails on a CONTRAST reading: that is a finding for the founder to rule on, not a gate.
+// The distinction is deliberate — a number outside expectation is a design question, a MISSING
+// number is a broken instrument, and only the second one is the script's business.
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { launch } from "./cdp.mjs";
@@ -194,6 +200,19 @@ async function main() {
         const file = join(OUT, `sent-card-${theme}.png`);
         writeFileSync(file, png);
         report[theme] = { file, ...(await page.evaluate(MEASURE)) };
+        // THE GUARDS INSIDE `MEASURE` ONLY RETURN AN OBJECT — THIS IS WHAT MAKES THEM A FAILURE.
+        // Their `{ error }` is SPREAD into the reading above, so it lands beside a dozen healthy
+        // numbers and reads like one more field. Without this check the script printed the error and
+        // still exited 0, which is precisely the "coverage retired in silence" the guards were added
+        // to end (roborev 62787): a caller checking the exit status could not tell a fully-measured
+        // run from one that photographed nothing it claims to cover.
+        if (report[theme].error) {
+          console.error(`sent-card-shot: ${theme}: ${report[theme].error}`);
+          console.error(JSON.stringify(report, null, 2));
+          // 3, not 2: the probe RAN. 2 means it could not start (no Chrome, no dev server), and
+          // collapsing "measured nothing" onto it would send a reader after the wrong problem.
+          process.exitCode = 3;
+        }
       } finally {
         await page.close();
       }

@@ -644,8 +644,13 @@ export const CHAT_SENT_MUTED = BLUEPRINT.dark.muted;
 //     version of this block pinned `--c-deep-forest` on that mistaken basis: nothing in a card's
 //     subtree resolves it, so the pin was inert and the test asserting it was vacuous by
 //     construction — roborev 62750.)
-//   • `C.sienna` (TextPill's error branch) pairs with ON_BRAND_FILL rather than `cream`, so it is
-//     internally consistent at any theme; pinning it would break a pair that already works.
+//   • `C.sienna` is NOT IN THE SUBTREE AT ALL, which is a stronger reason than the one first given
+//     here (it was described as "TextPill's error branch" — TextPill has no error branch). It is the
+//     REMOVE BADGE on a pill or an attachment chip, drawn only when `onRemove` is passed, and
+//     `collapsedPayload` deliberately passes none: "a sent message is a record, and offering to
+//     delete half of one implies an edit the app cannot make". So it never paints inside a sent
+//     card. Were it ever drawn here it would still need no pin, since it carries ON_BRAND_FILL as
+//     its own ink rather than `cream` — but that is the second reason, not the first.
 //
 // chromeContrast.test.ts sweeps BOTH pinned inks against every fill that IS in the list.
 export const CHAT_SENT_FILL = BLUEPRINT.dark.bubble;

@@ -73,13 +73,21 @@ const MESSAGES = [
     // carries them. Without one of each, the probe photographs a card whose every pixel of text sits
     // directly on black — which is the easy case, and the one that was never broken.
     //
-    // A non-image attachment renders AttachmentStrip's CHIP form (no thumbnail), which fills with
-    // `--c-chat-bubble`; a collapsed paste renders TextPill's tile, which fills `--c-deep-forest`.
-    // Both were themed while the ink on them was pinned dark, so light mode put #dce8fc on a #e8f0fd
-    // chip — about 1.07:1, the label invisible inside its own tile — and no screenshot could show it
-    // because no fixture message had either. `dataUrl` is deliberately absent: it is what makes this
+    // THE CHIP IS THE ONE THAT FORCED THE PINNING. A non-image attachment renders AttachmentStrip's
+    // CHIP form (no thumbnail), which paints its OWN OPAQUE ground from `--c-chat-bubble` — themed,
+    // while the ink on it was pinned dark, so light mode put #dce8fc on a #e8f0fd chip at about
+    // 1.07:1 with the label invisible inside its own tile. No screenshot could show that, because no
+    // fixture message carried an attachment. `dataUrl` is deliberately absent: it is what makes this
     // the chip rather than a thumbnail, and AttachmentStrip's own comment calls the chip "the
     // designed steady state after a restart", so it is the common case and not an edge one.
+    //
+    // THE COLLAPSED PASTE IS THE CONTRAST CASE, and it needs no pin. `collapsedPayload` renders it
+    // as TextPill's **inline** pill, whose fill is a translucent teal mix that composites over
+    // whatever is behind it — here, the card's pinned black. (TextPill's `tile` arm, which fills
+    // `--c-deep-forest`, is the composer's dashed draft box and never appears in a transcript. An
+    // earlier version of this comment claimed otherwise and a pin was added on that basis; it was
+    // inert, and removing it took three other copies of the same wrong claim with it —
+    // roborev 62750/62787.) It is photographed anyway so the two behaviours sit side by side.
     attachments: [{ id: "a1", kind: "file", path: "/tmp/booking-spec.pdf", name: "booking-spec.pdf" }],
     collapsed: [
       { id: "c1", text: "field,required\nemail,yes\nlinkedin,no\n".repeat(40), lineCount: 120 },

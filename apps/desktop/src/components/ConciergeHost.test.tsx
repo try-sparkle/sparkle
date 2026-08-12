@@ -249,6 +249,7 @@ import { SENT_TO_AGENT_TESTID } from "./Concierge/SentToAgentRow";
 // The REAL seam the relay-stamp suite drives, rather than a mock of it: the production effect
 // subscribes to this module, so recording here is the same event the settler emits.
 import {
+  currentConciergeTurnOrigin,
   recordConciergeActionReceipt,
   type ConciergeActionReceipt,
 } from "../services/conciergeReceipts";
@@ -3487,6 +3488,17 @@ describe("ConciergeHost — the concierge relays a message, and says so ON the b
     const origin = await sendPlain();
     relay({ originBubbleId: origin, ...over });
     expect(card()).toBe("no");
+  });
+
+  it("clears the turn origin when the column unmounts, so it cannot outlive the thread", async () => {
+    // `turnOrigin` is MODULE state. Without an unmount cleanup the last bubble this column awaited
+    // survives the column, and a call settling afterwards is stamped with it — message ids survive
+    // rehydration, so a remounted thread can hold that very id and get marked for a turn that ended
+    // long ago. Asserted as set-then-cleared on one mount, so it cannot pass by never being set.
+    await sendPlain();
+    expect(currentConciergeTurnOrigin()).not.toBeNull();
+    cleanup();
+    expect(currentConciergeTurnOrigin()).toBeNull();
   });
 
   it("never overwrites an agent the USER addressed himself", async () => {

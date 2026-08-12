@@ -175,3 +175,66 @@ describe("conciergeReceipts", () => {
     expect(new Set(ids).size).toBe(50);
   });
 });
+
+// ══ THE PRODUCER HALF OF THE ORIGIN JOIN ════════════════════════════════════════════════════════
+// The consumer (the concierge host turning a receipt into a black "sent to an agent" card) is
+// covered in ConciergeHost.test.tsx. This is the half that had nothing (roborev 62756): the settler
+// attaching the origin, and the module state it reads from.
+//
+// It matters because the WHOLE POINT of carrying the origin is that it is captured at a different
+// moment from when it is used. A test that only drives the consumer proves the card renders for a
+// receipt that already has the field, and says nothing about whether anything ever puts it there.
+describe("the turn origin a receipt carries", () => {
+  afterEach(() => _resetConciergeReceiptsForTests());
+
+  it("is what the settler stamps, and it survives to the listener", async () => {
+    const { settleConciergeReceipt } = await import("./conciergeReceiptSettle");
+    const { setConciergeTurnOrigin } = await import("./conciergeReceipts");
+    const seen: ConciergeActionReceipt[] = [];
+    onConciergeActionReceipt((r) => void seen.push(r));
+    setConciergeTurnOrigin("bubble-7");
+    settleConciergeReceipt(
+      "terminal",
+      "send_to_agent_terminal",
+      { agentId: "a1", text: "hi" },
+      true,
+      { ok: true, agentId: "a1", agentName: "Left Pair" },
+      undefined,
+      undefined,
+      // Captured by the caller at CALL ENTRY — here, stated explicitly.
+      "bubble-7",
+    );
+    expect(seen.at(-1)?.originBubbleId).toBe("bubble-7");
+  });
+
+  it("is ABSENT when the caller does not know it — the fail-closed half", async () => {
+    const { settleConciergeReceipt } = await import("./conciergeReceiptSettle");
+    const seen: ConciergeActionReceipt[] = [];
+    onConciergeActionReceipt((r) => void seen.push(r));
+    // `conciergeApprovalResume` settles from a click handler and cannot know the bubble, so it
+    // passes nothing. The receipt must then carry nothing rather than picking up a stale value.
+    settleConciergeReceipt(
+      "terminal",
+      "send_to_agent_terminal",
+      { agentId: "a1", text: "hi" },
+      true,
+      { ok: true, agentId: "a1", agentName: "Left Pair" },
+      undefined,
+    );
+    expect(seen.at(-1)).toBeTruthy();
+    expect(seen.at(-1)?.originBubbleId).toBeUndefined();
+  });
+
+  it("reads back what was set, and clears to null — the unmount contract", async () => {
+    const { setConciergeTurnOrigin, currentConciergeTurnOrigin } = await import(
+      "./conciergeReceipts"
+    );
+    // The host clears this when it unmounts. Without that, the last bubble the column ever awaited
+    // outlives the column, and a call settling afterwards is stamped with it — message ids survive
+    // rehydration, so a remounted thread can contain that very id.
+    setConciergeTurnOrigin("bubble-9");
+    expect(currentConciergeTurnOrigin()).toBe("bubble-9");
+    setConciergeTurnOrigin(null);
+    expect(currentConciergeTurnOrigin()).toBeNull();
+  });
+});

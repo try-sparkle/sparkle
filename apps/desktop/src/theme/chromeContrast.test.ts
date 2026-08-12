@@ -858,7 +858,8 @@ describe("the black `sent to an agent` card", () => {
     //
     // This sweep is what stops the list going stale: add a fill a card descendant paints for itself,
     // add it here. Fills that need NO pin are listed in theme/colors beside CHAT_SENT_FILL, with the
-    // reason each is safe — the collapsed-paste pill is translucent, sienna carries its own ink.
+    // reason each is safe — the collapsed-paste pill is translucent, and sienna's remove badge never
+    // renders in a transcript at all.
     for (const [fillName, fill] of [["the attachment chip", CHAT_SENT_FILL]] as const) {
       for (const [inkName, ink] of [
         ["ink", CHAT_SENT_INK],
